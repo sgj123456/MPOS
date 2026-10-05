@@ -1350,24 +1350,21 @@ fn root_override() -> bool {
     true
 }
 
-/// What `inode`'s mode word means to the permission checks, and what they may
-/// conclude from it.
+/// The permission bits the checks may conclude from `inode`'s mode word.
 ///
-/// Three shapes carry no bits at all, and each says something different:
-///
-/// - a filesystem that keeps no modes (`keeps_modes()` false) is **not
-///   policed** - refusing would invent permissions nobody set;
-/// - a device node whose mode word *is* the type (`S_IFCHR | 0666`,
-///   devtmpfs' spelling) carries real triads in its low half; the mask
-///   leaves them, and an unmasked check would read `0666 | S_IFCHR` as "no
-///   execute" and deny root the very nodes the boot hands out;
-/// - a node whose stored mode is genuinely zero *is* `chmod 000`: every
-///   triad empty, nothing permitted - for root included, because Linux's
-///   `CAP_DAC_OVERRIDE` grants read/write only where some triad carries
-///   the bit and execute only where some execute bit exists.
+/// A filesystem that keeps modes stores the low twelve bits and nothing
+/// else - ext4 masks its on-disk word, devtmpfs' `NodePerms` holds a plain
+/// number - so a zero there *is* `chmod 000`: every triad empty, nothing
+/// permitted, root included, because Linux's `CAP_DAC_OVERRIDE` grants
+/// read/write only where some triad carries the bit and execute only where
+/// some execute bit exists. A filesystem that keeps no modes answers zero
+/// for a different reason - it has no permissions for a check to conclude
+/// anything about - and [`may_as`] passes those nodes untouched; refusing
+/// them would invent permissions nobody set. The tell is `keeps_modes()`,
+/// not the number: the same word means two things, and a check cannot tell
+/// them apart by looking at it.
 pub fn effective_mode(inode: &Arc<dyn Inode>) -> u32 {
-    let mask = if inode.keeps_modes() { 0o7777 } else { 0o77777 };
-    inode.mode() & mask
+    inode.mode()
 }
 
 /// Whether the process whose ids are `me` may do `want` to `node`.
@@ -1389,11 +1386,7 @@ pub fn may_as(me: (u32, u32), inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()
     // exists: a directory whose every bit of execute is missing stays denied
     // to root too, which is what the rule says. Asked for several kinds at
     // once (`may_create_in`'s write+search), it passes when *each* requested
-    // kind has its somewhere - the same sentence one bit at a time. A node
-    // that stores no bits at all - a filesystem that keeps none answers zero
-    // because it has no permissions for a check to conclude anything about -
-    // is passed through untouched; refusing it would deny root the
-    // directories the boot itself hands out.
+    // kind has its somewhere - the same sentence one bit at a time.
     let allowed = if me.0 == 0 && root_override() {
         let mode = effective_mode(inode);
         if mode == 0 {

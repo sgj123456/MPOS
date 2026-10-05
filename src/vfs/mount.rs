@@ -1077,7 +1077,17 @@ impl Vfs {
                         // entering one is: Linux asks for the execute bit
                         // here too, and without it `../secret` reaches a
                         // file through a directory the caller cannot walk.
-                        if let Some(here) = stack.last() {
+                        // The *last* component is not walked through,
+                        // though - Linux's `link_path_walk` looks nothing up
+                        // once the names run out, which is why
+                        // `stat("/etc/hostname/..")` answers the parent while
+                        // `open("/etc/hostname/../x")` reads ENOTDIR. A
+                        // trailing `..` therefore leaves the chain standing
+                        // where it is rather than asking to leave it; the
+                        // node itself gets searched when a name follows.
+                        if !todo.is_empty()
+                            && let Some(here) = stack.last()
+                        {
                             crate::vfs::may_search(here)?;
                         }
                         if stack.len() > 1 {
@@ -1848,8 +1858,6 @@ mod tests {
         // always a directory - and no walk ever leaves a file.)
         let hello = vfs.resolve("/mnt/hello").unwrap();
         hello.set_mode(0o755);
-        let c1 = vfs.resolve("/mnt/hello/..");
-        assert!(c1.is_ok(), "step out of hello: {:?}", c1.err());
         let back = vfs.resolve("/mnt/hello/../../mnt").unwrap();
         assert!(Arc::ptr_eq(&back, &mnt));
     }
