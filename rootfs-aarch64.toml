@@ -32,7 +32,12 @@ serial_port = "ttyAMA0"
 # `/etc/inittab`), musl and `apk-tools`. `alpine-base` pulls all of them; the
 # applet names themselves are made at first boot, not installed (a cross-arch
 # `apk` cannot run the post-install that makes them - see `aarch64.rs`).
-base_packages = ["alpine-base", "openrc"]
+# `openrc` is in the shared core list (`SHARED_BASE_PACKAGES`) that config.rs
+# folds into every machine's base, so it is deliberately absent here - naming
+# it would be naming the same package twice. Nothing else joins this file's
+# half: e2fsprogs/dosfstools are the first machine's because its guest makes
+# filesystems, and this one's root is laid by the build on the host.
+base_packages = []
 
 # On top of the base: the init system's own runlevel scripts are in `openrc`
 # above, and nothing else is needed to reach a login prompt. `e2fsprogs` and

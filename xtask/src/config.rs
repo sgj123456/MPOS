@@ -607,11 +607,22 @@ impl RootfsConfig {
                 .unwrap_or_else(|| "en_US.UTF-8".to_string()),
             dns: values.remove("dns").filter(|text| !text.trim().is_empty()),
             root_password: values.remove("root_password").unwrap_or_default(),
-            base_packages: parse_package_list(
-                values
-                    .remove("base_packages")
-                    .unwrap_or_else(|| "alpine-base,e2fsprogs,dosfstools".to_string()),
-            ),
+            // The shared core of both userlands (`rootfs::SHARED_BASE_PACKAGES`)
+            // is *added* rather than merely defaulted: the two tomls name their
+            // machine's own half, and a package that belongs in the base on both
+            // machines must land on both even when one file forgets it - which
+            // is exactly the drift (§13.19) this fold makes impossible. A name
+            // listed twice installs once; apk dedupes its own arguments.
+            base_packages: {
+                let mut packages = crate::rootfs::SHARED_BASE_PACKAGES
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>();
+                packages.extend(parse_package_list(
+                    values.remove("base_packages").unwrap_or_default(),
+                ));
+                packages
+            },
             extra_packages: parse_package_list(values.remove("extra_packages").unwrap_or_else(
                 || "openrc,alpine-release,ssl_client,ca-certificates,apk-tools".to_string(),
             )),
@@ -814,6 +825,59 @@ mod tests {
         // And the disk geometry stays there on purpose - changing it re-makes
         // the partitions, which is a rebuild this file should ask for.
         assert!(image_keys.contains_key("image_size") && image_keys.contains_key("esp_size"));
+    }
+
+    #[test]
+    fn both_machines_base_on_the_shared_core_list() {
+        // The pin for §13.19's package convergence: `SHARED_BASE_PACKAGES` is
+        // folded into *every* machine's base by the loader itself, so neither
+        // toml can forget it and no install path can skip it. What each file
+        // names are its own hardware facts - and the two files must not
+        // re-name what the core already carries, or the drift returns under a
+        // different spelling.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits under the repository root");
+        let x86 = RootfsConfig::load(&root.join("rootfs.toml")).unwrap();
+        let arm = RootfsConfig::load(&root.join("rootfs-aarch64.toml")).unwrap();
+
+        for config in [&x86, &arm] {
+            for shared in crate::rootfs::SHARED_BASE_PACKAGES {
+                assert!(
+                    config.base_packages.iter().any(|p| p == shared),
+                    "the base lost {shared} - the fold stopped folding"
+                );
+            }
+        }
+        // A name listed twice installs once (apk dedupes its arguments), but
+        // the tomls stay honest about who owns what: the core's names appear
+        // exactly once, from the fold alone.
+        for shared in crate::rootfs::SHARED_BASE_PACKAGES {
+            assert_eq!(
+                x86.base_packages
+                    .iter()
+                    .filter(|p| p.as_str() == *shared)
+                    .count(),
+                1,
+                "{shared} is named by the core list, not repeated in rootfs.toml"
+            );
+            assert_eq!(
+                arm.base_packages
+                    .iter()
+                    .filter(|p| p.as_str() == *shared)
+                    .count(),
+                1,
+                "{shared} is named by the core list, not repeated in rootfs-aarch64.toml"
+            );
+        }
+        // The halves that stayed per-machine, with their reasons written in
+        // the files themselves: e2fsprogs/dosfstools belong to the guest that
+        // makes filesystems; the second machine adds nothing to the core.
+        assert!(x86.base_packages.iter().any(|p| p == "e2fsprogs"));
+        assert!(!arm.base_packages.iter().any(|p| p == "e2fsprogs"));
+        // And openrc left the x86 extras when it entered the core - one name,
+        // one place, both machines.
+        assert!(!x86.extra_packages.iter().any(|p| p == "openrc"));
     }
 
     /// The machine a plain `cargo xtask test` boots: the one every selection

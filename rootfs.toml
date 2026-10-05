@@ -51,8 +51,14 @@ esp_size = "128M"
 # mkfs decides".
 mkfs_options = "^has_journal,^metadata_csum"
 
-# Base packages that are always installed (do not modify unless needed)
-base_packages = ["alpine-base", "e2fsprogs", "dosfstools"]
+# Base packages that are always installed (do not modify unless needed).
+# `alpine-base` and `openrc` arrive through the shared core list
+# (`SHARED_BASE_PACKAGES` in xtask/src/rootfs.rs, folded into every machine's
+# base by config.rs) - what is named here is only this machine's own half:
+# the filesystem tools a guest with disks and partitions needs to *make*
+# them. The second machine has no use for either inside its root (its image
+# is laid by the build on the host), so they stay out of the shared list.
+base_packages = ["e2fsprogs", "dosfstools"]
 
 # Additional packages to install in the rootfs, on top of the base ones.
 # `doas` is the privilege escalation tool this image ships - not sudo, which
@@ -75,7 +81,6 @@ base_packages = ["alpine-base", "e2fsprogs", "dosfstools"]
 # stock boot runlevel wants. Which of them the image actually starts is in
 # `xtask/src/rootfs.rs` (`SERVICES`), not here.
 extra_packages = [
-    "openrc",
     "busybox-openrc",
     "alpine-release",
     "ssl_client",

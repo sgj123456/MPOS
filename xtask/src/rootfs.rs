@@ -1014,6 +1014,19 @@ fn install_base(
     Ok(())
 }
 
+/// The packages **both** machines install as their base system - the shared
+/// core of the two userlands (§13.19). Each machine's `base_packages` is this
+/// list plus whatever only that machine has hardware for (`e2fsprogs` and
+/// `dosfstools` exist because the x86_64 image makes filesystems *in the
+/// guest*; the second machine's root is laid by this build on the host), so a
+/// package both use is one name in one place, and the drift §13.12 recorded -
+/// `openrc` in the second machine's base but sitting in the first's extras -
+/// cannot come back. A cross-arch install runs no post-install scripts, so a
+/// package whose scripts do real work (busybox's applet farm) is covered by
+/// the disk `/init` re-making them at first boot (`rootfs-aarch64/init`), and
+/// nothing joins this list that needs more than that.
+pub(crate) const SHARED_BASE_PACKAGES: &[&str] = &["alpine-base", "openrc"];
+
 /// The services a fresh image boots with, in the runlevel each starts from.
 ///
 /// This is what a stock Alpine turns on - `setup-alpine`, `setup-devd`'s
