@@ -187,12 +187,10 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // any name either writes.
     enable_services(&mount_dir)?;
     write_modules(&mount_dir)?;
-    merge_overlays(&root, "rootfs", &mount_dir)?;
-    // The stock answer on this machine: its consoles reach the screen (or the
-    // wire through the mux) and nothing extra is rendered. `render_inittab`
-    // runs *after* the overlays because the shared template lands with them -
-    // the placeholder only exists in the staged file, never in the repository.
-    render_inittab(&mount_dir, &config, false)?;
+    // The overlay pair, and the inittab rendered with it: `rootfs/` stays the
+    // authoritative last word on any name either writes, and the one file that
+    // lands as a template is resolved before anything reads it.
+    merge_overlays(&root, "rootfs", &mount_dir, &config, false)?;
     write_resolver(&mount_dir, &config)?;
 
     // Detached before the stamp, not after: the nbd server can still be
@@ -456,12 +454,27 @@ pub(crate) const CORE_OVERLAY: &str = "rootfs-core";
 /// repository root; a missing directory merges nothing (`merge_overlay`'s
 /// documented answer), which keeps the second machine's small tree honest
 /// without a special case here.
-pub(crate) fn merge_overlays(root: &Path, machine_tree: &str, mount_dir: &Path) -> Result<()> {
+///
+/// `/etc/inittab` is the one merged file that lands as a *template*: the
+/// placeholder line is rendered for this machine immediately after the merge,
+/// while the template is still what the tree holds. Every consumer therefore
+/// sees one shape - a staged or mounted tree never carries an unrendered
+/// placeholder - and no call site can forget its turn.
+pub(crate) fn merge_overlays(
+    root: &Path,
+    machine_tree: &str,
+    mount_dir: &Path,
+    config: &RootfsConfig,
+    serial_getty: bool,
+) -> Result<()> {
     utils::merge_overlay(&root.join(CORE_OVERLAY), mount_dir)?;
-    utils::merge_overlay(&root.join(machine_tree), mount_dir)
+    utils::merge_overlay(&root.join(machine_tree), mount_dir)?;
+    render_inittab(mount_dir, config, serial_getty)
 }
 
-/// Render the shared `/etc/inittab` for one machine.
+/// Render the shared `/etc/inittab` for one machine. Only called through
+/// [`merge_overlays`] - see the note there about why rendering rides with the
+/// merge rather than with the callers.
 ///
 /// `@SERIAL_GETTY@` is the template's only per-machine line, and its two
 /// answers are both facts about the *boot*, not the kernel: an x86_64 session
@@ -475,11 +488,7 @@ pub(crate) fn merge_overlays(root: &Path, machine_tree: &str, mount_dir: &Path) 
 /// Everything else in the file is one kernel's answer on both machines since
 /// §13.16 ported the vcmux: the virtual consoles carry their bytes to the
 /// serial wire everywhere, so the getty lines need no branch.
-pub(crate) fn render_inittab(
-    mount_dir: &Path,
-    config: &RootfsConfig,
-    serial_getty: bool,
-) -> Result<()> {
+fn render_inittab(mount_dir: &Path, config: &RootfsConfig, serial_getty: bool) -> Result<()> {
     // The placeholder's own blank line goes with an empty render, so the
     // stock answer keeps the file's spacing exactly as the old per-machine one
     // had it; a rendered getty keeps its surrounding blanks like any other entry.
@@ -1466,28 +1475,36 @@ mod tests {
         // because it gained a template. The aarch64 half pins the getty's
         // exact spelling, node name included, because that line is the whole
         // difference between the two machines' boots.
+        //
+        // Pure string work on purpose: every test here would otherwise share
+        // one staging directory name across parallel harness threads, and the
+        // renderer under test is exactly the function `merge_overlays` calls -
+        // so this reads the repository's template once and renders it twice.
         let config = load_config(
             "inittab",
             "[rootfs]\nserial_port = \"ttyAMA0\"\n[system]\nhostname = \"mpos\"\n",
         );
+        let stock = fs::read_to_string(
+            crate::utils::project_root()
+                .unwrap()
+                .join("rootfs-core/etc/inittab"),
+        )
+        .unwrap();
+
+        let render = |text: &str, serial_getty: bool| -> String {
+            let dir = staged_dir(&format!("render-{}", std::process::id()));
+            fs::write(dir.join("etc/inittab"), text).unwrap();
+            render_inittab(&dir, &config, serial_getty).unwrap();
+            let out = fs::read_to_string(dir.join("etc/inittab")).unwrap();
+            let _ = fs::remove_dir_all(&dir);
+            out
+        };
 
         for (name, serial_getty) in [("plain", false), ("serial", true)] {
-            let dir = staged_dir(name);
-            fs::write(
-                dir.join("etc/inittab"),
-                fs::read(
-                    crate::utils::project_root()
-                        .unwrap()
-                        .join("rootfs-core/etc/inittab"),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-            render_inittab(&dir, &config, serial_getty).unwrap();
-            let text = fs::read_to_string(dir.join("etc/inittab")).unwrap();
+            let text = render(&stock, serial_getty);
             assert!(
                 !text.contains("@SERIAL_GETTY@"),
-                "the placeholder never survives rendering"
+                "the placeholder never survives rendering ({name})"
             );
             for console in ["tty1", "tty2", "tty3", "tty4"] {
                 assert!(
@@ -1509,43 +1526,28 @@ mod tests {
                         .any(|l| l.contains("ttyAMA0") || l.contains("ttyS0")),
                     "the default answer carries no serial getty at all: {text}"
                 );
+                // The *configuration* half of the file - every non-comment,
+                // non-blank line, in order - must read exactly as the old
+                // per-machine x86_64 file did. The comment block and the blank
+                // spacing are allowed to differ (the prose now explains the
+                // rendering); a lost or reordered entry may not.
+                let body = |t: &str| -> Vec<String> {
+                    t.lines()
+                        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+                        .map(str::to_string)
+                        .collect()
+                };
+                // The original file's config lines, copied here so the pin does
+                // not depend on git history: what `rootfs/etc/inittab` said
+                // before §13.19 folded it into the shared template.
+                let old = "::sysinit:/sbin/openrc sysinit\n::sysinit:/sbin/openrc boot\n::wait:/sbin/openrc default\ntty1::respawn:/sbin/getty 38400 tty1\ntty2::respawn:/sbin/getty 38400 tty2\ntty3::respawn:/sbin/getty 38400 tty3\ntty4::respawn:/sbin/getty 38400 tty4\n::ctrlaltdel:/sbin/reboot\n::shutdown:/sbin/openrc shutdown\n";
+                assert_eq!(
+                    body(&text),
+                    body(old),
+                    "the stock answer cannot drift from the file it replaced"
+                );
             }
         }
-
-        let stock = fs::read_to_string(
-            crate::utils::project_root()
-                .unwrap()
-                .join("rootfs-core/etc/inittab"),
-        )
-        .unwrap();
-        let dir = staged_dir("plain");
-        fs::write(dir.join("etc/inittab"), &stock).unwrap();
-        render_inittab(&dir, &config, false).unwrap();
-        let rendered = fs::read_to_string(dir.join("etc/inittab")).unwrap();
-        // The *configuration* half of the file - every non-comment line - must
-        // read exactly as the old per-machine x86_64 file did. The comment
-        // block is allowed to differ (it now explains the rendering); a stray
-        // blank or a lost entry may not.
-        // The configuration half of the file - every non-comment, non-blank
-        // line, in order - must read exactly as the old per-machine x86_64
-        // file did. The comment block and the blank spacing are allowed to
-        // differ (the prose now explains the rendering); a lost or reordered
-        // entry may not.
-        let body = |t: &str| -> Vec<String> {
-            t.lines()
-                .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-                .map(str::to_string)
-                .collect()
-        };
-        // The original file's config lines, copied here so the pin does not
-        // depend on git history: what `rootfs/etc/inittab` said before
-        // §13.19 folded it into the shared template.
-        let old = "::sysinit:/sbin/openrc sysinit\n::sysinit:/sbin/openrc boot\n::wait:/sbin/openrc default\ntty1::respawn:/sbin/getty 38400 tty1\ntty2::respawn:/sbin/getty 38400 tty2\ntty3::respawn:/sbin/getty 38400 tty3\ntty4::respawn:/sbin/getty 38400 tty4\n::ctrlaltdel:/sbin/reboot\n::shutdown:/sbin/openrc shutdown\n";
-        assert_eq!(
-            body(&rendered),
-            body(old),
-            "the stock answer cannot drift from the file it replaced"
-        );
     }
 
     #[test]

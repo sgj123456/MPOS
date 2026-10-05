@@ -241,16 +241,6 @@ fn esp_dir(build_dir: &Path) -> PathBuf {
     build_dir.join("aarch64-esp")
 }
 
-/// The repository's overlay trees as one machine sees them: the shared core
-/// first, then that machine's own tree over it. Both aarch64 roots - the test
-/// staging and the Alpine install - take the same pair the x86_64 image takes,
-/// so `/etc/inittab` and everything else neutral is one file for both machines
-/// (`crate::rootfs::CORE_OVERLAY`, `rootfs-core/root/README`).
-fn merge_core_and_machine(root: &Path, machine_tree: &str, staging: &Path) -> Result<()> {
-    utils::merge_overlay(&root.join(crate::rootfs::CORE_OVERLAY), staging)?;
-    utils::merge_overlay(&root.join(machine_tree), staging)
-}
-
 /// Lay one payload file on a staging tree, creating any directory its name
 /// carries and marking it executable.
 ///
@@ -1001,13 +991,11 @@ fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
         &packages,
     )?;
 
-    merge_core_and_machine(&root, "rootfs-aarch64", &staging)?;
-    // The stock answer for the installed tree: the placeholder lands with the
-    // core template and must be rendered *after* the merge - the repository's
-    // file is a template, and an unrendered `@SERIAL_GETTY@` line in front of
-    // busybox init is one confused respawn entry per boot. A session re-renders
-    // this file against its own mode (`build_alpine_esp`).
-    crate::rootfs::render_inittab(&staging, &config, false)?;
+    // The overlay pair, and the inittab rendered with it (`merge_overlays`'s
+    // rule: a staged tree never carries an unrendered placeholder). The stock
+    // answer for the installed tree; a session re-renders against its own mode
+    // before laying the disk.
+    crate::rootfs::merge_overlays(&root, "rootfs-aarch64", &staging, &config, false)?;
     // The runlevels, from the same table the x86_64 image uses: a service whose
     // script this machine's package set does not carry is named and skipped, so
     // one list serves both machines. Without this the boot would hand pid 1 to a
@@ -1033,11 +1021,6 @@ fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
     // thing OpenRC silently refuses without. All pure file I/O - none of it
     // needs the image's binaries to run, which is the whole boundary (§13.19).
     crate::rootfs::write_shared_config(&staging, &config)?;
-    // One inittab, rendered per machine: the installed tree carries the stock
-    // answer (no serial getty); `run --arch aarch64` re-renders it against the
-    // session's mode before laying the disk, so `--mode terminal` finds the
-    // login on the wire without a reinstall.
-    crate::rootfs::render_inittab(&staging, &config, false)?;
     // The probe file the kernel's `check_fs` reads (see [`PROBE_FILE`]). It sits
     // at the root of a real Alpine tree because the check is about the *block
     // driver and the filesystem*, which the machine must prove on whichever root
@@ -1102,7 +1085,11 @@ fn build_alpine_esp(
     if mode == ModeChoice::Session {
         let config =
             crate::config::RootfsConfig::load(&utils::project_root()?.join("rootfs-aarch64.toml"))?;
-        crate::rootfs::render_inittab(
+        // The template is idempotent: re-merging the pair lands the same files,
+        // and the render inside `merge_overlays` answers this session's mode.
+        crate::rootfs::merge_overlays(
+            &utils::project_root()?,
+            "rootfs-aarch64",
             &alpine_root,
             &config,
             serial_getty_for(crate::rootfs::effective_mode()?),
@@ -1371,8 +1358,9 @@ fn build_esp_with_cmdline(
             for &(name, bytes) in entries {
                 stage_program(&staging, name, bytes)?;
             }
-            merge_core_and_machine(&crate::utils::project_root()?, "rootfs-aarch64", &staging)?;
-            crate::rootfs::render_inittab(
+            crate::rootfs::merge_overlays(
+                &crate::utils::project_root()?,
+                "rootfs-aarch64",
                 &staging,
                 &crate::config::RootfsConfig::load(
                     &crate::utils::project_root()?.join("rootfs-aarch64.toml"),
