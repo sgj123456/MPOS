@@ -8,7 +8,15 @@
 //! reading the file yields, stx_mode must say regular file, stx_ino must
 //! agree with newfstatat, an empty path stats the descriptor only under
 //! AT_EMPTY_PATH, a null buffer answers EFAULT, and a directory reports
-//! S_IFDIR. Timestamp fields are deliberately not pinned.
+//! S_IFDIR.
+//!
+//! The clocks are pinned too, against the same file's `newfstatat` answer, and
+//! so is the length of the write. Both were left out once, and that is exactly
+//! what let a misplaced clock live: `struct statx` holds four 16-byte
+//! timestamps at 64/80/96/112 where `struct stat` holds three 8-byte pairs at
+//! 72/88/104, so "the fields are there" is not a claim about *where* - and a
+//! write that stops at `stx_mnt_id` leaves the caller's own bytes in the rest of
+//! the 256-byte struct (`PLAN.md` §13.11).
 
 #![no_std]
 #![no_main]
@@ -47,13 +55,35 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     }
 
     let stx = &raw mut STX as *mut lin::Statx;
+    // Filled with a pattern first: the answer has to cover the whole 256-byte
+    // struct, so any byte the kernel did not write would still hold this.
+    unsafe {
+        let raw =
+            core::slice::from_raw_parts_mut(stx as *mut u8, core::mem::size_of::<lin::Statx>());
+        for byte in raw.iter_mut() {
+            *byte = 0x5a;
+        }
+    }
     let r = lin::statx(lin::AT_FDCWD, &MOTD, 0, lin::STATX_BASIC_STATS, stx);
     lin::check_eq(&mut failed, b"statx(/etc/motd) succeeds", r, 0);
     unsafe {
         lin::check_true(
             &mut failed,
+            b"and it wrote the whole struct, not a head of it",
+            core::slice::from_raw_parts(stx as *const u8, core::mem::size_of::<lin::Statx>())
+                [144..]
+                .iter()
+                .all(|&b| b == 0),
+        );
+        lin::check_true(
+            &mut failed,
             b"the mask reports type and size",
             (*stx).stx_mask & lin::STATX_TYPE != 0 && (*stx).stx_mask & lin::STATX_SIZE != 0,
+        );
+        lin::check_true(
+            &mut failed,
+            b"and does not claim a birth time this kernel cannot back",
+            (*stx).stx_mask & lin::STATX_BTIME == 0,
         );
         lin::check_true(
             &mut failed,
@@ -76,6 +106,25 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             &mut failed,
             b"stx_ino equals st_ino from newfstatat",
             (*stx).stx_ino == (*st).st_ino,
+        );
+        // The clocks. The two structs put them at *different* offsets, so these
+        // are the numbers that say the statx write landed where Linux puts it:
+        // a value at the wrong offset there reads the neighbouring timestamp or
+        // the `stx_rdev_*` pair, and one 32 bytes out reads zero.
+        lin::check_true(
+            &mut failed,
+            b"stx_atime equals st_atime from newfstatat",
+            (*stx).stx_atime.sec == (*st).st_atime,
+        );
+        lin::check_true(
+            &mut failed,
+            b"stx_mtime equals st_mtime from newfstatat",
+            (*stx).stx_mtime.sec == (*st).st_mtime,
+        );
+        lin::check_true(
+            &mut failed,
+            b"stx_ctime equals st_ctime from newfstatat",
+            (*stx).stx_ctime.sec == (*st).st_ctime,
         );
     }
 

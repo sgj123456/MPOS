@@ -777,15 +777,26 @@ pub fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     };
     // An empty path names the descriptor, but only when the caller said so:
     // Linux requires AT_EMPTY_PATH and answers ENOENT for the unannounced form.
-    let (meta, rdev, stored, nlink, owner, times) = if path.is_empty() {
+    let (meta, dev, rdev, stored, nlink, owner, times) = if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return err::ENOENT;
         }
         match crate::sched::current_fds().clone_at(dirfd) {
             Ok(file) => {
                 let inode = file.inode();
+                // The same ladder `fstat`/`fstatat` climb for `st_dev`: a
+                // descriptor that knows its device says so, one carrying a path
+                // is looked up by it, and one with neither is the root's.
+                let dev = match file.dev() {
+                    Some(dev) => dev,
+                    None => match file.label() {
+                        Some(path) => crate::vfs::mount::dev_of_path(&path),
+                        None => crate::vfs::mount::dev_of_inode(&inode),
+                    },
+                };
                 (
                     file.metadata(),
+                    dev,
                     inode.rdev(),
                     inode.mode(),
                     inode.nlink(),
@@ -812,9 +823,17 @@ pub fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         } else {
             crate::vfs::resolve_opt(&path, Some(base))
         };
+        // `stx_dev_major`/`minor` is the same `st_dev` `stat` answers with, so
+        // it is looked up the same way - by the path, against the table of
+        // mounts - and `statx` therefore agrees with `newfstatat` about a file
+        // reached by a `dirfd` exactly as far as `newfstatat` agrees with
+        // `stat`. Sharing that limit is the point: two answers to one question
+        // that disagree are worse than two that are both approximate.
+        let dev = crate::vfs::mount::dev_of_path(&absolute(&path));
         match resolved {
             Ok(inode) => (
                 inode.metadata(),
+                dev,
                 inode.rdev(),
                 inode.mode(),
                 inode.nlink(),
@@ -829,10 +848,11 @@ pub fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         }
     };
 
-    // The byte layout - zeroed head, field offsets, the `STATX_BASIC_STATS`
-    // mask answer - is the ABI, and lives in `abi` where the host tests can
-    // walk it field by field. This side only resolves what the struct says.
-    abi::write_statx(buf, mask, &meta, stored, rdev, nlink, owner, times)
+    // The byte layout - the zeroed struct, its field offsets, the
+    // `STATX_BASIC_STATS` mask answer - is the ABI, and lives in `abi` where the
+    // host tests can walk it field by field. This side only resolves what the
+    // struct says.
+    abi::write_statx(buf, mask, &meta, dev, stored, rdev, nlink, owner, times)
 }
 
 /// The `access` question, for all three spellings: may the process whose ids

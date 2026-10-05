@@ -454,6 +454,8 @@ pub const S_IFDIR: u32 = 0x4000;
 /// statx request mask bits.
 pub const STATX_TYPE: u32 = 0x1;
 pub const STATX_SIZE: u32 = 0x200;
+/// A birth time, which this kernel does not record and must not claim.
+pub const STATX_BTIME: u32 = 0x800;
 pub const STATX_BASIC_STATS: u32 = 0x7ff;
 
 /// the rseq signature glibc registers with.
@@ -512,8 +514,13 @@ pub struct StatxTimestamp {
     pub _pad: i32,
 }
 
-/// Linux `struct statx` through stx_mnt_id (152 bytes); callers pass a
-/// larger zeroed buffer.
+/// Linux `struct statx`: 256 bytes, the same layout on every machine.
+///
+/// The length is the struct and not a head of it: Linux zeroes all 256 bytes and
+/// copies them out, so a caller must hand over 256 - a kernel that writes only
+/// through `stx_mnt_id` leaves the caller's own bytes in the tail, and a program
+/// that reads a field out there reads its own memory. The fields after the
+/// direct-I/O alignments are the spares Linux keeps for future expansion.
 #[repr(C)]
 pub struct Statx {
     pub stx_mask: u32,             // 0
@@ -537,6 +544,9 @@ pub struct Statx {
     pub stx_dev_major: u32,        // 136
     pub stx_dev_minor: u32,        // 140
     pub stx_mnt_id: u64,           // 144
+    pub stx_dio_mem_align: u32,    // 152
+    pub stx_dio_offset_align: u32, // 156
+    pub _spare: [u64; 12],         // 160..256
 }
 
 /// `struct rlimit64`: soft limit, hard limit.

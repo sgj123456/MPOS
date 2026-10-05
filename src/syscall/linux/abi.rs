@@ -418,7 +418,7 @@ pub(crate) fn write_stat(
         // `stat`-reading program another field's value where it looks for the
         // file's mode/type (a regular file came back reporting `st_mode == 1`,
         // the `st_nlink`), so the type and permission bits are read wrong. The
-        // two blocks below are the two ABIs' field orders, unchanged for x86_64.
+        // two blocks below are the two ABIs' field orders.
         #[cfg(not(target_arch = "aarch64"))]
         {
             (at(16) as *mut u64).write_unaligned(nlink); // st_nlink
@@ -429,9 +429,6 @@ pub(crate) fn write_stat(
             (at(48) as *mut u64).write_unaligned(size); // st_size
             (at(56) as *mut u64).write_unaligned(512); // st_blksize
             (at(64) as *mut u64).write_unaligned(blocks); // st_blocks
-            (at(72) as *mut i64).write_unaligned(times.atime as i64); // st_atime
-            (at(80) as *mut i64).write_unaligned(times.mtime as i64); // st_mtime
-            (at(88) as *mut i64).write_unaligned(times.ctime as i64); // st_ctime
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -444,16 +441,19 @@ pub(crate) fn write_stat(
             (at(40) as *mut u64).write_unaligned(0u64); // the aarch64 pad before st_size
             (at(56) as *mut u32).write_unaligned(512u32); // st_blksize (4-byte)
             (at(64) as *mut u64).write_unaligned(blocks); // st_blocks
-            // The three clocks are 16-byte `struct timespec`s on aarch64, so the
-            // second-halves sit at 72 / 88 / 104 with the nanosecond slots (80,
-            // 96, 112) left zero - not the folded x86_64 spacing the other branch
-            // uses. This kernel's filesystems stamp atime/mtime/ctime to the same
-            // creation second, so the helper cannot tell the three apart by value;
-            // the sec offsets here follow Linux's aarch64 `struct stat` directly.
-            (at(72) as *mut i64).write_unaligned(times.atime as i64); // st_atim.tv_sec
-            (at(88) as *mut i64).write_unaligned(times.mtime as i64); // st_mtim.tv_sec
-            (at(104) as *mut i64).write_unaligned(times.ctime as i64); // st_ctim.tv_sec
         }
+        // The three clocks, at the three offsets *both* ABIs use: each is a
+        // 16-byte `struct timespec` whose seconds are at 72, 88 and 104, with the
+        // nanosecond halves at 80, 96 and 112 left zero (this kernel's
+        // filesystems keep whole seconds). The widths around them are what the
+        // two branches above disagree about - these three they do not, and
+        // writing them as three adjacent seconds instead put the mtime where
+        // x86_64's `st_atime_nsec` belongs and the ctime where its `st_mtime`
+        // does, so a program reading either clock read the next one along.
+        // `t-statx-agree` is what asks for them back.
+        (at(72) as *mut i64).write_unaligned(times.atime as i64); // st_atime
+        (at(88) as *mut i64).write_unaligned(times.mtime as i64); // st_mtime
+        (at(104) as *mut i64).write_unaligned(times.ctime as i64); // st_ctime
     }
     0
 }
@@ -510,21 +510,45 @@ pub(crate) fn write_statfs(
 }
 
 // ---------------------------------------------------------------------------
-// statx(2): the 152-byte struct statx head userland reads
+// statx(2): the 256-byte struct statx userland reads
 // ---------------------------------------------------------------------------
 
 /// `STATX_BASIC_STATS`: every bit a `stat(2)`-shaped answer fills.
 pub(super) const STATX_BASIC_STATS: u32 = 0x7ff;
-/// The bytes of `struct statx` this kernel writes through `stx_mnt_id`;
-/// fields the caller did not ask about read as absent.
-pub(super) const STATX_SIZE: usize = 152;
+/// `sizeof(struct statx)`: 256 bytes, the same layout on every machine.
+///
+/// This is the *written* length, not a head. Linux zeroes the struct and copies
+/// the whole of it out, so a field the mask does not claim - or one this kernel
+/// has nothing to put in - reads as zero rather than as whatever the caller left
+/// in the buffer. This used to be 152, "through `stx_mnt_id`", which left the
+/// caller's own bytes in the tail.
+pub(super) const STATX_SIZE: usize = 256;
 
 /// Write `struct statx` for `meta`, reporting the `STATX_BASIC_STATS` bits
 /// of `mask` as filled and everything else as absent.
+///
+/// The offsets are Linux's, and they are worth stating because they are neither
+/// `struct stat`'s order nor adjacent: the four 16-byte timestamps sit at 64
+/// (`stx_atime`), 80 (`stx_btime`), 96 (`stx_ctime`) and 112 (`stx_mtime`) -
+/// measured on the host against a file whose three clocks differ - with
+/// `stx_rdev_major`/`minor` after them at 128/132 and the device the file is on
+/// at 136/140.
+///
+/// That last pair is `struct stat`'s `st_dev` split into `maj:min`, which is the
+/// shape `/proc/self/mountinfo` reports it in and the inverse of this kernel's
+/// `uevent::makedev`. A `statx` caller and a `stat` caller have to see the same
+/// device for the same file, or a tool that groups files by device - `find
+/// -xdev`, `rm`'s "same filesystem?" test, `df`'s - gets an answer that depends
+/// on which call it made.
+///
+/// The nanosecond halves stay zero (no filesystem here keeps sub-second clocks)
+/// and `stx_blksize` is 512, the block size this kernel's `struct stat`
+/// reports - both named in `UAPI.md` rather than implied.
 pub(crate) fn write_statx(
     buf: usize,
     mask: u32,
     meta: &Metadata,
+    dev: u64,
     stored: u32,
     rdev: Option<(u32, u32)>,
     nlink: u64,
@@ -547,19 +571,20 @@ pub(crate) fn write_statx(
         (at(32) as *mut u64).write_unaligned(meta.ino); // stx_ino
         (at(40) as *mut u64).write_unaligned(meta.size); // stx_size
         (at(48) as *mut u64).write_unaligned(meta.size.div_ceil(512) as u64); // stx_blocks
-        if let Some((major, minor)) = rdev {
-            (at(72) as *mut u32).write_unaligned(major); // stx_rdev_major
-            (at(76) as *mut u32).write_unaligned(minor); // stx_rdev_minor
-        }
-        // stx_atime / stx_mtime / stx_ctime at 96, 112, 128 - each the value
-        // the filesystem kept for it, with a zero nanosecond half (ext2's
-        // on-disk inode has no sub-second clock).
-        (at(96) as *mut i64).write_unaligned(times.atime as i64); // stx_atime
-        (at(104) as *mut i32).write_unaligned(0); // stx_atime_nsec
+        // The three clocks, each at Linux's own slot with a zero nanosecond half
+        // (ext2's on-disk inode has no sub-second clock). `stx_btime` at 80 is
+        // left zero and `STATX_BASIC_STATS` does not claim one: a birth time is
+        // not something this kernel records, and a mask bit would be a claim it
+        // cannot back.
+        (at(64) as *mut i64).write_unaligned(times.atime as i64); // stx_atime
+        (at(96) as *mut i64).write_unaligned(times.ctime as i64); // stx_ctime
         (at(112) as *mut i64).write_unaligned(times.mtime as i64); // stx_mtime
-        (at(120) as *mut i32).write_unaligned(0); // stx_mtime_nsec
-        (at(128) as *mut i64).write_unaligned(times.ctime as i64); // stx_ctime
-        (at(136) as *mut i32).write_unaligned(0); // stx_ctime_nsec
+        if let Some((major, minor)) = rdev {
+            (at(128) as *mut u32).write_unaligned(major); // stx_rdev_major
+            (at(132) as *mut u32).write_unaligned(minor); // stx_rdev_minor
+        }
+        (at(136) as *mut u32).write_unaligned(crate::uevent::major_of(dev)); // stx_dev_major
+        (at(140) as *mut u32).write_unaligned(crate::uevent::minor_of(dev)); // stx_dev_minor
     }
     0
 }
@@ -2390,7 +2415,16 @@ mod tests {
 
     /// `stat(2)`: the x86_64 `struct stat` field offsets - st_dev at 0,
     /// st_ino at 8, st_nlink at 16, st_mode at 24, st_rdev at 40, st_size
-    /// at 48, st_blksize at 56, st_blocks at 64 - and 144 bytes in all.
+    /// at 48, st_blksize at 56, st_blocks at 64, and the three
+    /// `st_atime`/`st_atime_nsec` pairs at 72/80, 88/96 and 104/112 - and 144
+    /// bytes in all.
+    ///
+    /// The clocks are three *distinct* values on purpose, and this is the one
+    /// place they can be told apart: a filesystem here stamps a file's atime,
+    /// mtime and ctime from one clock, so a guest reading them back cannot see
+    /// which slot holds which. Written as three adjacent seconds instead (72,
+    /// 80, 88) - which is how this test used to assert them - the mtime lands in
+    /// `st_atime_nsec`, the ctime in `st_mtime`, and `st_ctime` reads zero.
     #[test]
     fn write_stat_lays_out_struct_stat_at_the_x86_64_offsets() {
         let mut buf = [0u8; 144];
@@ -2428,14 +2462,17 @@ mod tests {
         assert_eq!(word(48), 257); // st_size
         assert_eq!(word(56), 512); // st_blksize
         assert_eq!(word(64), 1); // st_blocks: ceil(257/512)
-        // Each clock carries its own value - not one collapsed into three -
-        // and the nanosecond halves stay zero.
+        // Each clock carries its own value in the seconds half of a 16-byte
+        // `timespec`, with the halves between them - the nanosecond slots - left
+        // zero. The spacing is the point: a pair written 8 bytes early is still
+        // "three times in the buffer", and a program reading any of them reads
+        // its neighbour.
         assert_eq!(word(72), 1_700_000_400); // st_atime
-        assert_eq!(word(80), 1_700_000_123); // st_mtime
-        assert_eq!(word(88), 1_700_000_200); // st_ctime
-        assert_eq!(&buf[76..80], &[0u8; 4]);
-        assert_eq!(&buf[84..88], &[0u8; 4]);
-        assert_eq!(&buf[92..96], &[0u8; 4]);
+        assert_eq!(word(80), 0); // st_atime_nsec: whole seconds, so zero
+        assert_eq!(word(88), 1_700_000_123); // st_mtime
+        assert_eq!(word(96), 0); // st_mtime_nsec
+        assert_eq!(word(104), 1_700_000_200); // st_ctime
+        assert_eq!(word(112), 0); // st_ctime_nsec
 
         // An untracked count (a filesystem that stores no `i_links_count`)
         // falls back to the kind's convention: two names for a directory, the
@@ -2502,16 +2539,29 @@ mod tests {
         assert!(buf[72..].iter().all(|&b| b == 0));
     }
 
-    /// `statx(2)`: the fields uutils reads - mask, nlink, mode, ino, size,
-    /// blocks, rdev - at their x86_64 offsets, with unasked fields absent.
+    /// `statx(2)`: Linux's `struct statx` offsets - the four 16-byte timestamps
+    /// at 64/80/96/112, `stx_rdev_*` after them at 128/132, the device the file
+    /// is on at 136/140 - with the whole 256-byte struct written and unasked
+    /// fields absent from the mask.
+    ///
+    /// The three clocks are three *distinct* values on purpose: this is the one
+    /// place they can be told apart. A filesystem here stamps a file's atime,
+    /// mtime and ctime from one clock, so a guest reading them back cannot see
+    /// which slot holds which - which is how `stx_atime` came to be written 32
+    /// bytes from where Linux puts it and `stx_rdev_*` another 56.
     #[test]
     fn write_statx_reports_only_the_basic_stats_the_mask_asked_for() {
-        let mut buf = [0u8; 152];
+        // Full of a pattern rather than zeroed, so a byte the kernel leaves
+        // alone is visible: the struct is the kernel's to write, all 256 of it.
+        let mut buf = [0x5a_u8; 256];
+        // Major and minor both non-zero, so a split that swapped them fails.
+        let dev = crate::uevent::makedev(254, 3);
         assert_eq!(
             write_statx(
                 buf.as_mut_ptr() as usize,
                 0x7ff,
                 &meta(NodeKind::File, 77, 1024),
+                dev,
                 0,
                 Some((1, 9)),
                 // A tracked count and three distinct clocks, as ext2 reports.
@@ -2526,9 +2576,10 @@ mod tests {
             0
         );
         let word = |at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
-        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0x7ff); // stx_mask
-        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), 512); // stx_blksize
-        assert_eq!(u32::from_le_bytes(buf[16..20].try_into().unwrap()), 5); // stx_nlink
+        let dword = |at: usize| u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        assert_eq!(dword(0), 0x7ff); // stx_mask
+        assert_eq!(dword(4), 512); // stx_blksize
+        assert_eq!(dword(16), 5); // stx_nlink
         assert_eq!(
             u16::from_le_bytes(buf[28..30].try_into().unwrap()),
             0o100_644
@@ -2536,23 +2587,29 @@ mod tests {
         assert_eq!(word(32), 77); // stx_ino
         assert_eq!(word(40), 1024); // stx_size
         assert_eq!(word(48), 2); // stx_blocks: ceil(1024/512)
-        assert_eq!(u32::from_le_bytes(buf[72..76].try_into().unwrap()), 1); // stx_rdev_major
-        assert_eq!(u32::from_le_bytes(buf[76..80].try_into().unwrap()), 9); // stx_rdev_minor
-        // Each clock carries its own seconds value, zero in the nanosecond
-        // half; the mount id beyond them stays absent.
-        assert_eq!(word(96), 1_700_000_400); // stx_atime
+        assert_eq!(word(64), 1_700_000_400); // stx_atime
+        assert_eq!(word(80), 0); // stx_btime: not recorded, and not claimed
+        assert_eq!(word(96), 1_700_000_200); // stx_ctime
         assert_eq!(word(112), 1_700_000_123); // stx_mtime
-        assert_eq!(word(128), 1_700_000_200); // stx_ctime
-        assert!(buf[144..].iter().all(|&b| b == 0));
+        assert_eq!(dword(128), 1); // stx_rdev_major
+        assert_eq!(dword(132), 9); // stx_rdev_minor
+        assert_eq!(dword(136), 254); // stx_dev_major
+        assert_eq!(dword(140), 3); // stx_dev_minor
+        assert!(
+            buf[56..64].iter().all(|&b| b == 0) && buf[144..].iter().all(|&b| b == 0),
+            "a byte this kernel does not fill kept the caller's pattern: {:?}",
+            &buf[144..160]
+        );
 
         // A mask wider than the basic stats is trimmed: only what is filled
         // is reported, so a caller does not read absent fields as present.
-        let mut buf2 = [0u8; 152];
+        let mut buf2 = [0x5a_u8; 256];
         assert_eq!(
             write_statx(
                 buf2.as_mut_ptr() as usize,
                 0xfff,
                 &meta(NodeKind::Dir, 1, 0),
+                dev,
                 0,
                 None,
                 0, // untracked -> the directory's two names
@@ -2561,8 +2618,10 @@ mod tests {
             ),
             0
         );
-        assert_eq!(u32::from_le_bytes(buf2[0..4].try_into().unwrap()), 0x7ff);
-        assert_eq!(u32::from_le_bytes(buf2[16..20].try_into().unwrap()), 2);
+        let dword2 = |at: usize| u32::from_le_bytes(buf2[at..at + 4].try_into().unwrap());
+        assert_eq!(dword2(0), 0x7ff);
+        assert_eq!(dword2(16), 2);
+        assert_eq!(dword2(128), 0); // no rdev: the pair stays zero
     }
 
     /// `getdents64(2)`: `d_type` in the `DT_*` numbering, `d_reclen` the
@@ -3607,7 +3666,8 @@ mod tests {
         assert_eq!(EFD_NONBLOCK, 0x800);
         // statx(2)
         assert_eq!(STATX_BASIC_STATS, 0x7ff);
-        assert_eq!(STATX_SIZE, 152);
+        // `sizeof(struct statx)`, which Linux fills whole - not a head of it.
+        assert_eq!(STATX_SIZE, 256);
         assert_eq!(SIGINFO_BYTES, 128);
         assert_eq!(RLIM_NLIMITS, 16);
         assert_eq!(RLIM_INFINITY, u64::MAX);

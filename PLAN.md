@@ -674,7 +674,7 @@ kernel and is answered (§9.1); next is the rest of stage 6, which is the ABI an
 the `AddressSpaceOps` that completes `hal` — not stage 5's drivers, which the
 same measurement puts behind `vfs` and so behind `hal` too)**
 - [ ] 9.1 aarch64 complete boot (stages 3-8 remain) · [ ] 9.2 RISC-V support
-- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.10 landed, 13.2 in progress (§13)**
+- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.11 landed, 13.2 in progress (§13)**
   - [x] 13.1 `hal` is arch-neutral: its 14 `target_arch` gates became capability flags
         (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`)
         declared per target in `.cargo/config.toml`; `src/hal` `target_arch` is now 0, both
@@ -865,6 +865,23 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         `SYS_fstat`/`SYS_newfstatat`; it reports two guard words written against the old length)
         and by `t-rmtree` (a flat and a nested non-empty tree removed with
         `std::fs::remove_dir_all`), both on **both** machines
+  - [x] 13.11 `statx` on Linux's layout: `struct statx` is 256 bytes and one layout on every
+        machine, and the writer filled 152 of them with its clocks at 96/112/128 and its rdev
+        pair at 72 — where Linux puts four 16-byte timestamps at 64/80/96/112, `stx_rdev_*` at
+        128/132 and the file's device at 136/140. Found by §13.10's fix and named there rather
+        than folded in: 152 bytes into a caller's 256 is an *under*-write, not a write past, so
+        it needed its own measurement. The clients that read those fields are the ones that
+        call `statx` explicitly — uutils' probes and musl's own wrapper — because Rust's `std`
+        has no `statx` on this libc and `rustix`'s `stat` family only reaches for it on 32-bit
+        targets. Pinned by a new `t-statx-agree` (one file's device, inode, mode, size, link
+        count and three clocks, read through `statx` **and** through `lstat`, which have to be
+        the same numbers) on **both** machines, and by the bare-metal `t-statx`, whose clocks
+        and struct length were the two things it had deliberately skipped — and that pin found a
+        second, older one on the way: x86_64's `struct stat` wrote `st_mtime` and `st_ctime` at
+        80 and 88, where Linux has `st_atime_nsec` and `st_mtime`, so a program reading either
+        clock read the next one along and `st_ctime` (104) read zero. The three clock seconds
+        sit at 72/88/104 in *both* ABIs, so they now come out of the per-machine branches and are
+        written once
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
@@ -8518,7 +8535,7 @@ numbering they write down, and the real thing is what the run above shows.
 
 ---
 
-## Phase 13: Machine-seam purity and aarch64 parity — **13.1 AND 13.3–13.10 LANDED, 13.2 IN PROGRESS**
+## Phase 13: Machine-seam purity and aarch64 parity — **13.1 AND 13.3–13.11 LANDED, 13.2 IN PROGRESS**
 
 Phase 9.1 leaves the second machine short of the first in three named places, and Phase 11.4
 closed the `hal` *seam* without closing the `hal` *file*. `crate::arch` is named by no module
@@ -8571,6 +8588,8 @@ and green alone — AGENTS §4 rule 7):
 
 | 13.10 | aarch64 `struct stat` is 128 bytes and the kernel filled 144: `write_stat`'s length becomes the ABI's own (`STAT_BYTES`, 128 on aarch64 and 144 on x86_64) for the bounds check and the zero-fill as well as for the field writes, so a caller's — or a libc's — 128-byte struct is not written past | `t-stat-buffer` hands the kernel a guarded `struct stat` through `SYS_fstat`/`SYS_newfstatat` and reports the canaries intact on **both** machines (against the old length it reports "2 guard words written"); `t-rmtree` removes a flat and a nested non-empty tree with `std::fs::remove_dir_all` (against the old length it dies at `pc 0`) | **landed** — found by §13.9's named gap, and the fault was not in the tree walk the name suggested: `pc 0` with `lr 0` and `ESR 0x82000006` is a return through a zeroed link register, and musl's `fdopendir` stats the descriptor *before* it reads anything. Whose memory the sixteenth byte past the struct lands on is the interesting part: musl's `stat`/`lstat`/`fstat` never hand the kernel the caller's struct — `__fstatat` makes the syscall into a `struct stat` of its own on the stack and copies the fields out, which is how it stays correct where the two layouts differ — so the extra bytes went into the frame past *musl's* buffer. That is why every program's own `stat` call had survived them, and what finally caught them was code that keeps a return address in the frame beside it: `fdopendir`'s. Measured both ways: with the old length a non-empty `std::fs::remove_dir_all` faults the process at `pc 0` and `t-stat-buffer` reports two guard words written, while the ABI's length passes both and leaves `MPOS_STAT_OK` and the x86_64 gate untouched. The std-side suite had no `stat` test at all, which is why nothing had ever asked the writer how long it was |
 
+| 13.11 | `struct statx` is one 256-byte layout on every machine: `write_statx` moves to Linux's offsets — `stx_atime`/`btime`/`ctime`/`mtime` at 64/80/96/112, `stx_rdev_major`/`minor` at 128/132, and the file's device split into `stx_dev_major`/`minor` at 136/140, which is the number `struct stat` carries packed as `st_dev` — and fills all 256 bytes rather than stopping at `stx_mnt_id` | one file, read through `statx` **and** through the `fstatat` family, must report the same device, inode, mode, size, link count and three clocks: `t-statx-agree` on **both** machines (its clocks set with `utimensat`, so a zero cannot pass for a time), plus the bare-metal `t-statx`, which now compares its clocks against `newfstatat`'s and checks that the whole struct was written | **landed** — the sibling §13.10 named and did not fold in, because 152 bytes into a caller's 256 is an under-write rather than the write-past that fix was about. Measured on the host before anything changed, against a file whose three clocks differ: atime 64, btime 80, ctime 96, mtime 112, rdev 128/132, dev 136/140, mnt_id 144, and every byte past 152 zero — where this kernel wrote its clocks at 96/112/128, its rdev pair at 72 (Linux's `stx_atime.tv_nsec`) and stopped the write at 152. Nothing had read those fields, and why is worth keeping: Rust's `std` does not call `statx` on this libc (its support is glibc-only, so `fs::metadata` is `fstatat`), and `rustix`'s `stat` family only reaches for `statx` on 32-bit targets — so the readers here are the programs that call it explicitly, like uutils' probes and musl's own wrapper. The device pair is information rather than a moved field: `statx` had none, so every file read through it reported `0:0`, which a tool grouping files by device reads as "all one filesystem". The same pin then failed for a second reason, which is the better argument for having written it: **x86_64's `struct stat` had its clocks in the wrong places too** — `st_mtime` at 80 and `st_ctime` at 88, where Linux has `st_atime_nsec` and `st_mtime`, so a program reading the mtime read the ctime and one reading `st_ctime` (104) read zero, which is what the pin said first (`1700000321 vs 0`). Both ABIs put the three `timespec` seconds at 72/88/104 with the nanosecond slots at 80/96/112, so the clocks are no longer inside the per-machine branches at all: they are written once at offsets the two shapes share, and the host `write_stat` test asserts each clock against the `_nsec` slot beside it. That divergence is older than this phase and was invisible for the same reason as the others — nothing read those two fields back, and the host test asserted the wrong offsets as if they were Linux's |
+
 **What the remaining 122 are, and why the count stops being the metric** (a
 `target_arch`-line count of `src/` outside `src/arch/`, measured 2026-10-04 after §13.1
 and §13.2's slices. The audit this table was built from was a *per-file* one taken at
@@ -8601,7 +8620,7 @@ shared file, not that a register frame becomes neutral.
 
 **Where this lands**: status in §9.1 (parity) and §11.4 (purity); `ARCHITECTURE.md` §2/§3 in the
 same commit as any new or moved edge (AGENTS §4 rule 5), *before* the edge, not after. **13.1 and
-13.3–13.10 have landed**, and 13.2 is in progress — the parity thread of this phase is complete: the
+13.3–13.11 have landed**, and 13.2 is in progress — the parity thread of this phase is complete: the
 second machine boots its own disk root, runs the same network stack and socket syscalls over its own
 adapter, and carries the `/bin` its spawn tests need, so the sweep is green on **everything it is
 supposed to serve** and `tests.toml`'s `aarch64` group is empty. What a red aarch64 sweep means is

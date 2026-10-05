@@ -23,12 +23,24 @@ contract. Here that is, concretely:
   previously made `st_mode` read the `st_nlink` value, and emitting the x86_64 *length* wrote
   sixteen bytes past every 128-byte struct — into whichever frame the libc's own stat buffer
   sits in, which is how a non-empty `std::fs::remove_dir_all` came to die at `pc 0`
-  (`PLAN.md` §13.10). Pin: `boot-aarch64` `MPOS_STAT_OK` (mode/type/`nlink`/`ino`/`blocks`/
+  (  `PLAN.md` §13.10). Pin: `boot-aarch64` `MPOS_STAT_OK` (mode/type/`nlink`/`ino`/`blocks`/
   `size` round-trip from a live musl process) and `t-stat-buffer` (a guarded `struct stat`
   handed to the kernel through `SYS_fstat`/`SYS_newfstatat`, on both machines — a caller's own
   `stat` cannot see the overflow, because musl's wrapper stats into a struct of its own and
-  copies the fields out). `statx`'s `struct statx`, by contrast, is a fixed arch-independent
-  layout and is not affected. `rt_sigframe`/`sigcontext` is per-ABI as well and lives with
+  copies the fields out). The three clock *seconds* are the one part the two ABIs share — 72, 88
+  and 104, each the seconds half of a 16-byte `timespec` whose nanosecond half follows at 80, 96
+  and 112 — and x86_64's writer used to pack them at 72/80/88, so `st_mtime` read the value
+  written into `st_atime_nsec` and `st_ctime` read zero (`PLAN.md` §13.11). `statx`'s `struct
+  statx` is one layout on every machine, and being arch-independent is not the same as being
+  right: it is 256 bytes and Linux zeroes and fills all of them, with
+  `stx_atime`/`btime`/`ctime`/`mtime` as 16-byte timestamps at 64/80/96/112, `stx_rdev_*` after
+  them at 128/132 and the file's device split into `stx_dev_major`/`minor` at 136/140. This
+  kernel wrote its clocks at 96/112/128, its rdev pair at 72, and stopped the write at 152 — and
+  no test read any of those fields back (`PLAN.md` §13.11). Pin: `t-statx-agree` (one file's
+  device, inode, mode, size, link count and three clocks, read through `statx` **and** through
+  the `fstatat` family, which have to be the same numbers) on both machines, and the bare-metal
+  suite's `t-statx` for the argument shape and the clocks it compares against `newfstatat` —
+  x86_64 only, that suite having no aarch64 port yet. `rt_sigframe`/`sigcontext` is per-ABI as well and lives with
   its machine since §13.2's Stage 2 — `src/arch/x86_64/signal.rs` and, since Stage 3b,
   `src/arch/aarch64/signal.rs`, both behind `hal::SignalFrame` — because `__restore_rt`
   reads the saved registers back at fixed offsets (and on aarch64 the frame's
@@ -176,7 +188,7 @@ back. This is the list, not the byte-by-byte record (that lives in the tests).
 
 | Layout | Consumer | Pin |
 |---|---|---|
-| `struct stat` / `statx` | every libc | `t-statx`, `t-fstat`, `t-stat-buffer` (the length, **both** machines), `t-rmtree` (the tree walk that felt it), host `abi` tests |
+| `struct stat` / `statx` | every libc | `t-statx`, `t-fstat`, `t-stat-buffer` (the length, **both** machines), `t-statx-agree` (the two stat families agreeing, **both** machines), `t-rmtree` (the tree walk that felt it), host `abi` tests |
 | `rt_sigframe` + `sigcontext` | `rt_sigreturn` | `t-signal-delivery`, `t-sa-restart` |
 | `siginfo_t` | signal handlers | `t-signal-delivery` |
 | `struct sched_attr` | `sched_setattr`/`getattr` | `t-priority` |
