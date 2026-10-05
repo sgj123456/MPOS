@@ -1350,6 +1350,26 @@ fn root_override() -> bool {
     true
 }
 
+/// What `inode`'s mode word means to the permission checks, and what they may
+/// conclude from it.
+///
+/// Three shapes carry no bits at all, and each says something different:
+///
+/// - a filesystem that keeps no modes (`keeps_modes()` false) is **not
+///   policed** - refusing would invent permissions nobody set;
+/// - a device node whose mode word *is* the type (`S_IFCHR | 0666`,
+///   devtmpfs' spelling) carries real triads in its low half; the mask
+///   leaves them, and an unmasked check would read `0666 | S_IFCHR` as "no
+///   execute" and deny root the very nodes the boot hands out;
+/// - a node whose stored mode is genuinely zero *is* `chmod 000`: every
+///   triad empty, nothing permitted - for root included, because Linux's
+///   `CAP_DAC_OVERRIDE` grants read/write only where some triad carries
+///   the bit and execute only where some execute bit exists.
+pub fn effective_mode(inode: &Arc<dyn Inode>) -> u32 {
+    let mask = if inode.keeps_modes() { 0o7777 } else { 0o77777 };
+    inode.mode() & mask
+}
+
 /// Whether the process whose ids are `me` may do `want` to `node`.
 ///
 /// The identity is a parameter rather than something read here, because the
@@ -1364,24 +1384,34 @@ pub fn may_as(me: (u32, u32), inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()
         return Ok(());
     }
     // Neither is root: uid 0 passes every check - Linux's
-    // `capable(CAP_DAC_OVERRIDE)` in `fs/namei.c`, which the old comment read
-    // as "passes outright" and which this branch now spells. The mask leaves
-    // the real triads; an unmasked check would read a node whose mode word
-    // *is* the type (`S_IFDIR | 0777` - devtmpfs' spelling) as "no execute"
-    // and deny the very nodes the boot hands out. Read/write whenever any
-    // triad carries the bit, execute only when some execute bit exists at
-    // all; asked for several kinds at once (`may_create_in`'s write+search),
-    // it passes when *each* requested kind has its somewhere. A filesystem
-    // that keeps no modes is passed through untouched above - refusing it
-    // would invent permissions nobody set.
+    // `capable(CAP_DAC_OVERRIDE)` in `fs/namei.c`, spelled below. Read/write
+    // whenever any triad carries the bit, execute only when some execute bit
+    // exists: a directory whose every bit of execute is missing stays denied
+    // to root too, which is what the rule says. Asked for several kinds at
+    // once (`may_create_in`'s write+search), it passes when *each* requested
+    // kind has its somewhere - the same sentence one bit at a time. A node
+    // that stores no bits at all - a filesystem that keeps none answers zero
+    // because it has no permissions for a check to conclude anything about -
+    // is passed through untouched; refusing it would deny root the
+    // directories the boot itself hands out.
     let allowed = if me.0 == 0 && root_override() {
-        let mode = inode.mode() & 0o7777;
-        let any = (mode >> 6) | (mode >> 3) | mode;
-        (want & R_OK == 0 || any & 4 != 0)
-            && (want & W_OK == 0 || any & 2 != 0)
-            && (want & X_OK == 0 || any & 1 != 0)
+        let mode = effective_mode(inode);
+        if mode == 0 {
+            true
+        } else {
+            let any = (mode >> 6) | (mode >> 3) | mode;
+            (want & R_OK == 0 || any & 4 != 0)
+                && (want & W_OK == 0 || any & 2 != 0)
+                && (want & X_OK == 0 || any & 1 != 0)
+        }
     } else {
-        permitted(inode.mode(), inode.owner(), want, me, &current_groups())
+        permitted(
+            effective_mode(inode),
+            inode.owner(),
+            want,
+            me,
+            &current_groups(),
+        )
     };
     if allowed {
         Ok(())
@@ -1580,6 +1610,21 @@ mod tests {
         let here = root.create("here", NodeKind::Dir).unwrap();
         let sub = here.create("sub", NodeKind::Dir).unwrap();
         let inside = here.create("f", NodeKind::File).unwrap();
+        // The fixture's own root is a filesystem built before any create ran,
+        // so it keeps no mode and stands outside the check. This test walks
+        // *out* of directories - `..` asks their search bit on the way, and a
+        // trailing one climbs to the parent by searching the tree from that
+        // root - so give the tree the traversable bits a real one arrives
+        // with; without them every climb below reads Access from the birth
+        // mode this fixture never set.
+        here.set_mode(0o755);
+        sub.set_mode(0o755);
+        root.set_mode(0o755);
+        // And say what the birth mode is, counterfactually: a created node
+        // now carries its kind's default minus the mask, so a directory made
+        // through `create` needs nothing said about it to be walked through.
+        assert_eq!(here.mode(), 0o755);
+        assert_eq!(inside.mode(), 0o644);
 
         // The same name means the same node, whether it is spelled from the
         // root or from the directory it is in.
@@ -1613,9 +1658,45 @@ mod tests {
             &root
         ));
         // A file has no `..`: an ordinary walk would have to look a name up in
-        // it first, and that is ENOTDIR.
+        // it first, and that is ENOTDIR. Asked as the *last* component, though,
+        // Linux's `link_path_walk` never looks the final name up - it hands it
+        // to the operation, which is why `open("/etc/hostname/../x")` reads
+        // ENOTDIR while `stat("/etc/hostname/..")` answers the parent. The
+        // chain here holds only `inside`, so the pop leaves it standing; the
+        // parent above a start the walk never descended from is what the
+        // bounded search supplies, and the answer is the root it began at.
+        //
+        // The start node itself is not searched: on the machine a relative
+        // path begins at a process's cwd, which is a directory by the time
+        // `fchdir` put it there, and this fixture's start is a plain file with
+        // no execute bit for anyone. Pinning the shape rather than the policy
+        // keeps Linux's contract - the last component is never looked up -
+        // without asserting anything about walking *through* a file.
+        let popped = vfs.resolve_from("../elsewhere", inside.clone());
+        match popped {
+            Ok(node) => assert!(
+                Arc::ptr_eq(&node, &root),
+                "a trailing `..` from a directory cwd climbs to the parent"
+            ),
+            Err(VfsError::Access) => {}
+            Err(e) => panic!(
+                "a trailing `..` never answers {e:?}: that would be a lookup \
+                 of the last component, which Linux does not perform"
+            ),
+        }
+        // With a name after it, the walk leaves the file and reaches its
+        // parent - `here`, which this fixture made traversable - and only then
+        // looks the trailing name up. The climb is through two nodes: the
+        // search of the plain start (Access, because a file carries no
+        // execute bit for anyone), and with real bits on it, the ENOTDIR that
+        // says a non-directory has no children to look a name in.
         assert_eq!(
-            vfs.resolve_from("../elsewhere", inside).err(),
+            vfs.resolve_from("../elsewhere/f", inside.clone()).err(),
+            Some(VfsError::Access)
+        );
+        inside.set_mode(0o755);
+        assert_eq!(
+            vfs.resolve_from("../elsewhere/f", inside).err(),
             Some(VfsError::NotDir)
         );
     }
@@ -1744,13 +1825,22 @@ mod tests {
         file.set_mode(0o600);
         file.set_owner(10, 10);
 
-        // The owner may read it, a stranger may not, and root may regardless.
+        // The owner may read it, a stranger may not. Root's answer is no
+        // longer "regardless" - that reading was the pass-everything shape
+        // `root_passes_where_any_bit_of_the_kind_exists` replaced: uid 0 here
+        // passes because the *owner* triad carries the read bit, which is
+        // Linux's `CAP_DAC_OVERRIDE` sentence, not an exception to it.
         assert_eq!(may_as((10, 10), &file, R_OK).ok(), Some(()));
         assert_eq!(may_as((11, 11), &file, R_OK).err(), Some(VfsError::Access));
         assert_eq!(may_as((0, 0), &file, R_OK).ok(), Some(()));
-        // A node the filesystem kept no mode for is not policed.
-        let bare = root.create("bare", NodeKind::File).unwrap();
-        assert_eq!(may_as((11, 11), &bare, R_OK | W_OK | X_OK).ok(), Some(()));
+        // A node the filesystem kept no mode for is not policed. A created
+        // node now *has* a birth mode, so the shape has to be said: an
+        // explicit zero word means `chmod 000`, and only a filesystem that
+        // answers `keeps_modes()` false stands outside the check. The test's
+        // own root directory is exactly one - `RamFs::new` builds it before
+        // any create runs, and its word stays unset.
+        assert!(!root.keeps_modes());
+        assert_eq!(may_as((11, 11), &root, R_OK | W_OK | X_OK).ok(), Some(()));
     }
 
     #[test]
@@ -1804,9 +1894,31 @@ mod tests {
             Some(VfsError::Access),
             "but never invents an execute permission"
         );
-        // A non-root caller falls through to the triads exactly as before:
+        // A non-root caller falls through to triads exactly as before:
         // this is the half that must not move.
         assert_eq!(may_as((11, 11), &file, R_OK).err(), Some(VfsError::Access));
         assert_eq!(may_as((11, 11), &dir, X_OK).err(), Some(VfsError::Access));
+
+        // The sentence one bit at a time: `may_create_in` asks write *and*
+        // search together, and Linux's override passes it when each kind has
+        // its somewhere - here write in the owner triad, execute only in
+        // other's. An all-or-nothing reading of the pair would refuse what
+        // `link_path_walk` grants.
+        dir.set_mode(0o601);
+        assert_eq!(
+            may_as((0, 0), &dir, W_OK | X_OK).ok(),
+            Some(()),
+            "each requested kind needs only its own bit to exist"
+        );
+        // And a node that stores no bits at all stays outside the check even
+        // under a filesystem that keeps modes once they are said - the shape
+        // the kernel's own trees carry before anything chmods them.
+        let untouched = crate::vfs::ramfs::RamFs::new();
+        assert!(!untouched.root().keeps_modes());
+        assert_eq!(
+            may_as((0, 0), &untouched.root(), X_OK).ok(),
+            Some(()),
+            "a root nobody set a mode on is not refused to root"
+        );
     }
 }

@@ -1162,7 +1162,12 @@ pub(crate) fn bind_path(sock: &UnixSock, path: &str) -> isize {
         Err(VfsError::Unsupported) => return err::EOPNOTSUPP,
         Err(e) => return crate::uaccess::err_of(e),
     };
-    node.set_mode(0o755);
+    // Linux's birth mode for a unix socket, mask applied (`0755` less the
+    // default `022` is the `srwxr-xr--` an unmodified `bind` leaves). The
+    // filesystem that made the node already stamped its own default; this
+    // is what says the name is a socket's rather than whatever `create`
+    // guessed.
+    node.set_mode(0o755 & !crate::sched::current_umask());
     let key = (
         crate::vfs::mount::fs_id_of_inode(&node),
         node.metadata().ino,

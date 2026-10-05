@@ -1804,11 +1804,29 @@ mod tests {
     #[test]
     fn mounts_replace_the_child_with_the_mounted_root() {
         let vfs = tree_with_root();
-        vfs.resolve("/")
+        // The walk below climbs out of a mount and back through it, and every
+        // `..` asks the search bit of the directory it leaves. A real root
+        // arrives with traversable bits - the tar unpack stamps them, an ext4
+        // superblock carries them - so give this fixture's two hand-built
+        // roots the same ones instead of leaning on "unset means unpoliced"
+        // for directories the test walks *through*.
+        vfs.resolve("/").unwrap().set_mode(0o755);
+        let mnt_dir = vfs
+            .resolve("/")
             .unwrap()
             .create("mnt", NodeKind::Dir)
             .unwrap();
+        // The mountpoint is walked *through* on the way back in, and a
+        // directory created by hand keeps no mode until something says one.
+        mnt_dir.set_mode(0o755);
         let inner = RamFs::new();
+        // The mounted root is a filesystem built by hand too, and the walk
+        // below passes *through* it on its way out of the mount (`..` asks
+        // the search bit of every directory it leaves). A real mount's root
+        // arrives traversable - an ext4 superblock's `/`, a tar's unpacked
+        // top - so give this one the same bits rather than lean on "unset
+        // means unpoliced" for a directory the test walks through.
+        inner.root().set_mode(0o755);
         inner.root().create("hello", NodeKind::File).unwrap();
         vfs.mount("/mnt", &*inner).unwrap();
 
@@ -1820,7 +1838,18 @@ mod tests {
         ));
 
         // `..` from inside the mount lands on the mountpoint's parent, then
-        // walks back in through the mount edge.
+        // walks back in through the mount edge. The walk leaves a file by
+        // searching it - Linux asks the execute bit of every node it passes
+        // *through*, and `hello` is a plain file with no bits for anyone, so
+        // leaving it is what says Access here, not the mount. Give it the
+        // traversable shape and the climb answers as the machine does: out to
+        // the mounted root, up to the outer one, back in through the mount
+        // edge. (On a real boot a relative path starts at a process's cwd -
+        // always a directory - and no walk ever leaves a file.)
+        let hello = vfs.resolve("/mnt/hello").unwrap();
+        hello.set_mode(0o755);
+        let c1 = vfs.resolve("/mnt/hello/..");
+        assert!(c1.is_ok(), "step out of hello: {:?}", c1.err());
         let back = vfs.resolve("/mnt/hello/../../mnt").unwrap();
         assert!(Arc::ptr_eq(&back, &mnt));
     }

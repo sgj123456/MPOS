@@ -540,6 +540,13 @@ struct RamSymlink {
     /// contents to rewrite, can have.
     mtime: u64,
     target: String,
+    /// Linux's birth mode (`0777` under `S_IFLNK`), stored rather than left
+    /// unset so `stat` of the link reads what an ext2 link carries and a
+    /// check that ever consults a link's word sees permission bits, not a
+    /// `chmod 000`. Nothing follows a link asking its mode; `chmod` on one
+    /// writes through to the target, as it does on Linux.
+    mode: Mutex<Cell<Option<u32>>>,
+    owner: Mutex<Cell<(u32, u32)>>,
 }
 
 impl Inode for RamSymlink {
@@ -549,6 +556,33 @@ impl Inode for RamSymlink {
             kind: NodeKind::Symlink,
             size: self.target.len() as u64,
         }
+    }
+
+    fn mode(&self) -> u32 {
+        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0)
+    }
+
+    fn set_mode(&self, mode: u32) {
+        critical_section::with(|cs| self.mode.borrow(cs).set(Some(mode)));
+    }
+
+    /// A mode is kept only once somebody set one - the same rule `RamFile`
+    /// states, and the reason `chmod 000` on a link stays distinguishable
+    /// from "a node born before this field had an answer".
+    fn keeps_modes(&self) -> bool {
+        critical_section::with(|cs| self.mode.borrow(cs).get()).is_some()
+    }
+
+    /// The creator's pair, which `stat` used to read as root's because no
+    /// link stored anything. Linux stamps a symlink like any other inode;
+    /// `lchown` on one is the call that would change it, and it now has a
+    /// place to land (`Inode::set_owner`'s default still keeps nothing).
+    fn owner(&self) -> (u32, u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).get())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).set((uid, gid)));
     }
 
     fn mtime(&self) -> u64 {
@@ -753,13 +787,35 @@ impl Inode for RamDir {
 
     fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
         let at = now();
+        // The birth mode, as every filesystem that stores modes gives one: a
+        // new node is born with the kind's default minus the caller's mask
+        // (`init_user_ns`'s umask for a kernel creation), so `mkdir(2)` and
+        // `open(O_CREAT)` answer success *and* leave a traversable directory
+        // behind. Without it the node keeps no mode - which `abi::mode_of`
+        // still reports as the kind's default, so `stat` looked right while
+        // `may_as` read zero triads and refused root the search of a
+        // directory the same kernel had just made. Measured on the sweep
+        // machine: `t-unix`'s bind under `/tmp/t_u/x/y`, where both
+        // directories came from this call, answered `EACCES` where Linux
+        // answers `ENOTDIR`.
+        //
+        // A device placeholder is the exception: its `keeps_modes` says "no
+        // mode kept", and stamping `Some(0)` would make that untrue - a
+        // stored zero *is* a `chmod 000`, not an absent word. Same reason
+        // `RamFs::new` leaves its own root unset.
+        let birth = match kind {
+            NodeKind::CharDev | NodeKind::BlockDev => None,
+            NodeKind::Dir => Some(0o755 & !crate::sched::current_umask()),
+            _ => Some(0o644 & !crate::sched::current_umask()),
+        };
+        let owner = crate::sched::current_owner();
         let node: Arc<dyn Inode> = match kind {
             NodeKind::File => Arc::new(RamFile {
                 fs: self.fs.clone(),
                 ino: fresh_ino(),
                 links: Mutex::new(Cell::new(1)),
-                mode: Mutex::new(Cell::new(None)),
-                owner: Mutex::new(Cell::new(crate::sched::current_owner())),
+                mode: Mutex::new(Cell::new(birth)),
+                owner: Mutex::new(Cell::new(owner)),
                 mtime: Mutex::new(Cell::new(at)),
                 flags: NodeFlags::new(),
                 data: Mutex::new(RefCell::new(Chunked::new())),
@@ -767,26 +823,30 @@ impl Inode for RamDir {
             NodeKind::Dir => Arc::new(RamDir {
                 fs: self.fs.clone(),
                 ino: fresh_ino(),
-                mode: Mutex::new(Cell::new(None)),
-                owner: Mutex::new(Cell::new(crate::sched::current_owner())),
+                mode: Mutex::new(Cell::new(birth)),
+                owner: Mutex::new(Cell::new(owner)),
                 mtime: Mutex::new(Cell::new(at)),
                 flags: NodeFlags::new(),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
             // A device node mknod made: a placeholder until a devtmpfs mount
-            // covers the directory with driver-backed devices.
+            // covers the directory with driver-backed devices. It keeps no
+            // mode - see `birth` above.
             NodeKind::CharDev | NodeKind::BlockDev => Arc::new(RamDev {
                 ino: fresh_ino(),
                 links: Mutex::new(Cell::new(1)),
             }),
             // A socket name, made by `bind` alone. Its clock is the bind;
-            // `connect` looks up the node's identity, never its bytes.
+            // `connect` looks up the node's identity, never its bytes. The
+            // mode is Linux's birth mode for a unix socket - `S_IFSOCK`
+            // `0755` less the creator's mask - because the DAC check reads
+            // the stored word, not `mode_of`'s default.
             NodeKind::Socket => Arc::new(RamSocket {
                 ino: fresh_ino(),
                 links: Mutex::new(Cell::new(1)),
                 mtime: now(),
-                mode: Mutex::new(Cell::new(None)),
-                owner: Mutex::new(Cell::new(crate::sched::current_owner())),
+                mode: Mutex::new(Cell::new(Some(0o755 & !crate::sched::current_umask()))),
+                owner: Mutex::new(Cell::new(owner)),
                 flags: NodeFlags::new(),
             }),
             // A link is made with `Inode::symlink`, which carries the one thing
@@ -806,11 +866,18 @@ impl Inode for RamDir {
 
     fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn Inode>> {
         let at = now();
+        // Linux's birth mode for a link (`S_IFLNK | 0777`, mask applied to the
+        // permission half): nothing consults a link's own bits - resolution
+        // follows it - but `stat` of the link itself reads them back, and an
+        // unset word there is a stored `chmod 000`, not "no mode". ext4's
+        // `new_inode` gives its links the same number.
         let node: Arc<dyn Inode> = Arc::new(RamSymlink {
             ino: fresh_ino(),
             links: Mutex::new(Cell::new(1)),
             mtime: at,
             target: String::from(target),
+            mode: Mutex::new(Cell::new(Some(0o777))),
+            owner: Mutex::new(Cell::new(crate::sched::current_owner())),
         });
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();
@@ -1467,11 +1534,13 @@ mod tests {
         let sock = root.create("x.sock", NodeKind::Socket).unwrap();
         assert_eq!(sock.metadata().kind, NodeKind::Socket);
         assert_ne!(sock.mtime(), 0, "the bind moment is the node's birthday");
-        assert_eq!(
-            sock.mode(),
-            0,
-            "no mode was said yet - stat fills the default"
-        );
+        // The birth mode, not an unset word: `create` stamps Linux's default
+        // minus the mask (host umask `022` → `0755`), because a stored zero
+        // *is* a `chmod 000` to the DAC check, and a socket nobody can even
+        // be looked up through is not what `bind` made. `bind_path` restates
+        // the same number after this call; here it is the filesystem's own
+        // answer that shows.
+        assert_eq!(sock.mode(), 0o755, "a socket node is born traversable");
         assert_eq!(
             sock.read_at(0, &mut [0u8; 4]).unwrap_err(),
             VfsError::NotConnected
