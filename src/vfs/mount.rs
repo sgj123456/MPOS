@@ -1461,6 +1461,31 @@ impl Vfs {
         Ok((parent, String::from(name)))
     }
 
+    /// [`resolve_parent`](Self::resolve_parent) with a caller-supplied start -
+    /// the same "the last component is a name, not a step" walk that `unlink`
+    /// needs through a process's cwd. Linux's `user_path_parent` resolves the
+    /// directory and hands the final name to the operation, so
+    /// `unlink("/etc/hostname/x")` answers ENOTDIR from the lookup of `x`
+    /// rather than EACCES from searching the plain file it walked through.
+    pub fn resolve_parent_from(
+        &self,
+        path: &str,
+        start: Arc<dyn Inode>,
+    ) -> VfsResult<(Arc<dyn Inode>, String)> {
+        let (parent_path, name) = split_last(path);
+        if name.is_empty() {
+            return Err(VfsError::Invalid);
+        }
+        // A trailing `.` or `..` names the directory itself, which is ordinary
+        // resolution (`unlink(".")` is what Linux refuses as EISDIR later).
+        if name == "." || name == ".." {
+            let dir = self.resolve_from(path, start)?;
+            return Ok((dir, String::from(name)));
+        }
+        let parent = self.resolve_from(parent_path, start)?;
+        Ok((parent, String::from(name)))
+    }
+
     /// Resolve `path` without following a symbolic link in its **last**
     /// component - what `lstat`, `readlink` and `symlink` need, and the one
     /// thing the ordinary walk cannot give them.
@@ -1718,6 +1743,13 @@ pub fn resolve(path: &str) -> VfsResult<Arc<dyn Inode>> {
 /// must, and a `..` at that root stays there rather than climbing out.
 pub fn resolve_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
     STATIC.resolve_walk(path, start, process_root().or_else(|| STATIC.root_opt()))
+}
+
+/// The directory `path` names its last component in, resolved through
+/// [`resolve_at`] so a `dirfd`-relative call sees the caller's tree. See
+/// [`Vfs::resolve_parent_from`] for why the walk stops before the name.
+pub fn resolve_parent_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<(Arc<dyn Inode>, String)> {
+    STATIC.resolve_parent_from(path, start)
 }
 
 /// The calling task's root, jailed absolute paths begin at. `None` off the

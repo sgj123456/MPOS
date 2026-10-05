@@ -1138,20 +1138,36 @@ pub(crate) fn bind_path(sock: &UnixSock, path: &str) -> isize {
     if sock.bound_key().is_some() {
         return err::EINVAL;
     }
-    let (parent_path, name) = match crate::vfs::split_parent(path) {
-        Ok(split) => split,
-        Err(_) => return err::EINVAL,
-    };
     let cwd = crate::sched::current_cwd();
-    let parent = match crate::vfs::resolve_opt(parent_path, Some(cwd)) {
-        Ok(dir) => dir,
+    // The last component is a name, not a step: Linux's `user_path_parent`
+    // resolves the directory and hands the final name to the operation, so a
+    // bind under a plain file answers ENOTDIR from that lookup - never EACCES
+    // from searching through something that cannot hold names.
+    let (parent, name) = match crate::vfs::resolve_parent_at(path, cwd) {
+        Ok(split) => split,
         Err(e) => return crate::uaccess::err_of(e),
     };
+    let name = name.as_str();
     // The last component must be free, whatever kind of thing occupies it
-    // (Linux refuses both a live socket and a plain file under the name);
-    // a name that is not even a single component is `EINVAL`.
-    if parent.lookup(name).is_ok() {
-        return err::EADDRINUSE;
+    // (Linux refuses both a live socket and a plain file under the name). A
+    // *stale* socket - one no descriptor holds any more - is retired first,
+    // exactly as Linux's `unix_bind` does, and the retirement is an `unlink`:
+    // write permission on the file being removed, not a search of the
+    // directory through it. Measured against this machine's own userland:
+    // asking the parent instead (`may_remove`'s shape) refused root's
+    // replacement of its own leftover `/var/run` names with EACCES.
+    if let Ok(existing) = parent.lookup(name) {
+        if existing.metadata().kind != NodeKind::Socket || is_held(&existing) {
+            return err::EADDRINUSE;
+        }
+        if let Err(e) = crate::vfs::may_write(&existing) {
+            return crate::uaccess::err_of(e);
+        }
+        unbind_node(&existing);
+        if let Err(e) = parent.unlink(name) {
+            return crate::uaccess::err_of(e);
+        }
+        crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_DELETE, name);
     }
     if let Err(e) = crate::vfs::may_create_in(&parent) {
         return crate::uaccess::err_of(e);
@@ -1178,6 +1194,27 @@ pub(crate) fn bind_path(sock: &UnixSock, path: &str) -> isize {
     // same report fs.rs makes for every other successful create.
     crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_CREATE, name);
     0
+}
+
+/// Whether a node is a socket name some live descriptor still holds - the
+/// difference between a bound name (`EADDRINUSE`) and a stale one `bind` may
+/// replace. The registry keys on `(fs id, ino)`, the same pair `unbind_node`
+/// retires: an entry whose socket has died is exactly what `live_listener`
+/// treats as no entry at all, so it holds nothing.
+fn is_held(node: &Arc<dyn Inode>) -> bool {
+    let key = (crate::vfs::mount::fs_id_of_inode(node), node.metadata().ino);
+    critical_section::with(|cs| {
+        let reg = UNIX.borrow(cs).borrow();
+        match reg.by_node.get(&key) {
+            Some(id) => reg
+                .slots
+                .get(*id - 1)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|slot| slot.socket.upgrade())
+                .is_some(),
+            None => false,
+        }
+    })
 }
 
 /// The bind record wants an `Arc` for the registry's weak self-reference; the

@@ -80,7 +80,9 @@ pub mod tty;
 pub mod vcmux;
 
 pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write};
-pub use mount::{global, mount, mount_root, pivot_root, resolve, resolve_at, unmount};
+pub use mount::{
+    global, mount, mount_root, pivot_root, resolve, resolve_at, resolve_parent_at, unmount,
+};
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -1271,6 +1273,18 @@ pub fn may_modify(inode: &Arc<dyn Inode>) -> VfsResult<()> {
     Ok(())
 }
 
+/// Whether the running process may write `inode`'s *contents*: Linux's
+/// `may_write` - the flag question first, then the triads' write bit. A
+/// caller that means "replace what this name holds" (`bind(2)` retiring a
+/// stale socket file, `truncate(2)` on an open descriptor) asks this and gets
+/// Linux's own order of refusal: `EACCES` from the bits, `EPERM` from the
+/// flags. The DAC half goes through [`may_as`], so root's override reads the
+/// stored mode exactly as every other check does.
+pub fn may_write(inode: &Arc<dyn Inode>) -> VfsResult<()> {
+    may_modify(inode)?;
+    may_as(crate::sched::current_owner(), inode, W_OK)
+}
+
 /// Whether the running process may change `inode`'s *extent*: cut it short or
 /// lengthen it, remove it, or give it another name.
 ///
@@ -1383,20 +1397,21 @@ pub fn may_as(me: (u32, u32), inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()
     // Neither is root: uid 0 passes every check - Linux's
     // `capable(CAP_DAC_OVERRIDE)` in `fs/namei.c`, spelled below. Read/write
     // whenever any triad carries the bit, execute only when some execute bit
-    // exists: a directory whose every bit of execute is missing stays denied
-    // to root too, which is what the rule says. Asked for several kinds at
-    // once (`may_create_in`'s write+search), it passes when *each* requested
-    // kind has its somewhere - the same sentence one bit at a time.
+    // exists: a node whose every bit of the requested kind is missing stays
+    // denied to root too, which is what the rule says - and a `chmod 000` file
+    // is exactly that, because a filesystem that keeps modes stores the twelve
+    // bits and nothing else, so its zero word means "no permission for
+    // anyone", not "no answer". Asked for several kinds at once
+    // (`may_create_in`'s write+search), it passes when *each* requested kind
+    // has its somewhere - the same sentence one bit at a time. The shape that
+    // genuinely carries no answer, a filesystem that keeps no modes, was
+    // returned from above rather than read as a zero here.
     let allowed = if me.0 == 0 && root_override() {
         let mode = effective_mode(inode);
-        if mode == 0 {
-            true
-        } else {
-            let any = (mode >> 6) | (mode >> 3) | mode;
-            (want & R_OK == 0 || any & 4 != 0)
-                && (want & W_OK == 0 || any & 2 != 0)
-                && (want & X_OK == 0 || any & 1 != 0)
-        }
+        let any = (mode >> 6) | (mode >> 3) | mode;
+        (want & R_OK == 0 || any & 4 != 0)
+            && (want & W_OK == 0 || any & 2 != 0)
+            && (want & X_OK == 0 || any & 1 != 0)
     } else {
         permitted(
             effective_mode(inode),
@@ -1493,11 +1508,18 @@ pub fn may_remove(parent: &Arc<dyn Inode>, target: &Arc<dyn Inode>) -> VfsResult
 }
 
 /// [`unlink_path`](fn.unlink_path.html) with a caller-supplied start.
+///
+/// The parent is resolved *without* walking through the name's own last
+/// component: `unlink("/etc/hostname/x")` must answer ENOTDIR from the lookup
+/// of `x`, not EACCES from searching the plain file it walked through. Linux's
+/// `user_path_parent` resolves the directory and hands the final name to the
+/// operation - `unlink` is an operation on the *name*, and a name is not a
+/// step - so the walk stops at the directory and [`may_remove`] asks about
+/// that directory alone.
 pub fn unlink_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
-    let (parent, name) = split_parent(path)?;
-    let dir = resolve_opt(parent, start)?;
-    may_remove(&dir, &dir.lookup(name)?)?;
-    dir.unlink(name)
+    let (dir, name) = resolve_parent_opt(path, start)?;
+    may_remove(&dir, &dir.lookup(&name)?)?;
+    dir.unlink(&name)
 }
 
 /// Remove the empty directory named by `path`.
@@ -1508,12 +1530,30 @@ pub fn rmdir_path(path: &str) -> VfsResult<()> {
     dir.rmdir(name)
 }
 
-/// [`rmdir_path`](fn.rmdir_path.html) with a caller-supplied start.
+/// [`rmdir_path`](fn.rmdir_path.html) with a caller-supplied start. See
+/// [`unlink_opt`]: the name is what is being removed, so it is looked up in
+/// its parent rather than walked through.
 pub fn rmdir_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
-    let (parent, name) = split_parent(path)?;
-    let dir = resolve_opt(parent, start)?;
-    may_remove(&dir, &dir.lookup(name)?)?;
-    dir.rmdir(name)
+    let (dir, name) = resolve_parent_opt(path, start)?;
+    may_remove(&dir, &dir.lookup(&name)?)?;
+    dir.rmdir(&name)
+}
+
+/// The directory `path` names its last component in, and that component's
+/// name - [`Vfs::resolve_parent`] with a caller-supplied start, which is what
+/// every syscall that takes a `dirfd` needs. See [`unlink_opt`] for why the
+/// last component is a name and not a step.
+pub fn resolve_parent_opt(
+    path: &str,
+    start: Option<Arc<dyn Inode>>,
+) -> VfsResult<(Arc<dyn Inode>, String)> {
+    match start {
+        Some(dir) => mount::resolve_parent_at(path, dir),
+        None => {
+            let (parent, name) = split_parent(path)?;
+            Ok((resolve(parent)?, String::from(name)))
+        }
+    }
 }
 
 #[cfg(all(test, not(target_os = "none")))]

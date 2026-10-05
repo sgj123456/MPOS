@@ -159,7 +159,13 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::ENOENT,
     );
 
-    // A bind whose parent is a plain file answers ENOTDIR.
+    // A bind whose parent is a plain file answers ENOTDIR. The name has to be
+    // *free* for the walk to reach that verdict, because `bind` retires a stale
+    // socket under the name first - and Linux's retirement is an `unlink`,
+    // which asks write permission on the file being removed (the owner triad's
+    // bit) rather than a search of the directory through it. The suite runs as
+    // root, so its own leftover is replaceable; make the node writable anyway,
+    // because the mode - not the uid - is what the answer turns on now.
     let parent = lin::openat(
         lin::AT_FDCWD,
         b"/tmp/t-unix-notdir\0",
@@ -172,10 +178,11 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         parent >= 0,
     );
     lin::close(parent);
+    let _ = lin::chmod(b"/tmp/t-unix-notdir\0", 0o666);
     let (notdir, dlen) = lin::SockAddrUn::new(b"/tmp/t-unix-notdir/s.sock");
     lin::check_eq(
         &mut failed,
-        b"bind under a plain file answers ENOTDIR",
+        "a bind under a plain file is ENOTDIR, whatever occupies its name".as_bytes(),
         lin::bind_un(fd2, &notdir, dlen),
         lin::ENOTDIR,
     );

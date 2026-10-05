@@ -17,6 +17,37 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+/// The twelve bits a mode word may hold. A filesystem that stores modes
+/// stores *only* these - the file-type half belongs to `Metadata::kind`,
+/// and `abi::mode_of` re-attaches it for `stat` - which is why "this node
+/// keeps no mode" (`None`) and "this node is `chmod 000`" (`Some(0)`) are
+/// different answers a permission check cannot tell apart by number alone.
+const MODE_BITS: u32 = 0o7777;
+
+/// The mode a node is born with, from the kind's default minus the creator's
+/// mask - Linux's `init_user_ns` umask for a kernel creation, the caller's
+/// `umask(2)` for a syscall one. `None` is the answer for a node that carries
+/// no metadata at all (a device placeholder), which is not the same thing as
+/// a stored zero.
+///
+/// A directory starts from *all* the permission bits (`S_IRWXUGO`, i.e.
+/// `0777`) rather than the file's `0644`: that is what `mkdir(2)` and
+/// `do_mkdir` hand to `vfs_mkmode` before the mask, and it is why `/tmp` -
+/// made by an initramfs `mkdir -p`, or by this kernel's own mount plumbing -
+/// is `0755` on a real system and traversable by everyone. Spelling the
+/// directory half as `0755 & ~umask` instead would have made every directory
+/// this filesystem creates unreadable below its owner's group, which is the
+/// shape `t-unix`'s bind under `/tmp/…` caught: the walk refused to search
+/// `/tmp` before it ever reached the plain file it was meant to report.
+fn birth_mode(kind: NodeKind) -> Option<u32> {
+    let base = match kind {
+        NodeKind::CharDev | NodeKind::BlockDev => return None,
+        NodeKind::Dir | NodeKind::Symlink | NodeKind::Socket => 0o777,
+        _ => 0o644,
+    };
+    Some(base & !crate::sched::current_umask() & MODE_BITS)
+}
+
 use critical_section::Mutex;
 
 use super::{FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
@@ -442,11 +473,13 @@ impl Inode for RamFile {
     }
 
     fn mode(&self) -> u32 {
-        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0)
+        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0) & MODE_BITS
     }
 
     fn set_mode(&self, mode: u32) {
-        critical_section::with(|cs| self.mode.borrow(cs).set(Some(mode)));
+        critical_section::with(|cs| {
+            self.mode.borrow(cs).set(Some(mode & MODE_BITS));
+        });
     }
 
     /// A mode is kept only once somebody set one: `chmod 000` and "nobody
@@ -559,11 +592,13 @@ impl Inode for RamSymlink {
     }
 
     fn mode(&self) -> u32 {
-        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0)
+        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0) & MODE_BITS
     }
 
     fn set_mode(&self, mode: u32) {
-        critical_section::with(|cs| self.mode.borrow(cs).set(Some(mode)));
+        critical_section::with(|cs| {
+            self.mode.borrow(cs).set(Some(mode & MODE_BITS));
+        });
     }
 
     /// A mode is kept only once somebody set one - the same rule `RamFile`
@@ -671,11 +706,13 @@ impl Inode for RamSocket {
     }
 
     fn mode(&self) -> u32 {
-        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0)
+        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0) & MODE_BITS
     }
 
     fn set_mode(&self, mode: u32) {
-        critical_section::with(|cs| self.mode.borrow(cs).set(Some(mode)));
+        critical_section::with(|cs| {
+            self.mode.borrow(cs).set(Some(mode & MODE_BITS));
+        });
     }
 
     fn keeps_modes(&self) -> bool {
@@ -744,11 +781,13 @@ impl Inode for RamDir {
     }
 
     fn mode(&self) -> u32 {
-        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0)
+        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0) & MODE_BITS
     }
 
     fn set_mode(&self, mode: u32) {
-        critical_section::with(|cs| self.mode.borrow(cs).set(Some(mode)));
+        critical_section::with(|cs| {
+            self.mode.borrow(cs).set(Some(mode & MODE_BITS));
+        });
     }
 
     /// A directory is in the same position as a file: the bits are kept once
@@ -797,17 +836,9 @@ impl Inode for RamDir {
         // directory the same kernel had just made. Measured on the sweep
         // machine: `t-unix`'s bind under `/tmp/t_u/x/y`, where both
         // directories came from this call, answered `EACCES` where Linux
-        // answers `ENOTDIR`.
-        //
-        // A device placeholder is the exception: its `keeps_modes` says "no
-        // mode kept", and stamping `Some(0)` would make that untrue - a
-        // stored zero *is* a `chmod 000`, not an absent word. Same reason
-        // `RamFs::new` leaves its own root unset.
-        let birth = match kind {
-            NodeKind::CharDev | NodeKind::BlockDev => None,
-            NodeKind::Dir => Some(0o755 & !crate::sched::current_umask()),
-            _ => Some(0o644 & !crate::sched::current_umask()),
-        };
+        // answers `ENOTDIR`. A device placeholder is the exception - see
+        // `birth_mode`.
+        let birth = birth_mode(kind);
         let owner = crate::sched::current_owner();
         let node: Arc<dyn Inode> = match kind {
             NodeKind::File => Arc::new(RamFile {
@@ -831,21 +862,20 @@ impl Inode for RamDir {
             }),
             // A device node mknod made: a placeholder until a devtmpfs mount
             // covers the directory with driver-backed devices. It keeps no
-            // mode - see `birth` above.
+            // mode - see `birth_mode`.
             NodeKind::CharDev | NodeKind::BlockDev => Arc::new(RamDev {
                 ino: fresh_ino(),
                 links: Mutex::new(Cell::new(1)),
             }),
             // A socket name, made by `bind` alone. Its clock is the bind;
             // `connect` looks up the node's identity, never its bytes. The
-            // mode is Linux's birth mode for a unix socket - `S_IFSOCK`
-            // `0755` less the creator's mask - because the DAC check reads
-            // the stored word, not `mode_of`'s default.
+            // mode is Linux's birth mode for a unix socket because the DAC
+            // check reads the stored word, not `mode_of`'s default.
             NodeKind::Socket => Arc::new(RamSocket {
                 ino: fresh_ino(),
                 links: Mutex::new(Cell::new(1)),
                 mtime: now(),
-                mode: Mutex::new(Cell::new(Some(0o755 & !crate::sched::current_umask()))),
+                mode: Mutex::new(Cell::new(birth)),
                 owner: Mutex::new(Cell::new(owner)),
                 flags: NodeFlags::new(),
             }),
@@ -876,7 +906,7 @@ impl Inode for RamDir {
             links: Mutex::new(Cell::new(1)),
             mtime: at,
             target: String::from(target),
-            mode: Mutex::new(Cell::new(Some(0o777))),
+            mode: Mutex::new(Cell::new(birth_mode(NodeKind::Symlink))),
             owner: Mutex::new(Cell::new(crate::sched::current_owner())),
         });
         critical_section::with(|cs| {
@@ -1030,7 +1060,7 @@ mod tests {
     use alloc::vec;
 
     use super::{CHUNK, Chunked, RamFs, Usage};
-    use crate::vfs::{FileSystem, NodeKind, VfsError};
+    use crate::vfs::{FileSystem, NodeKind, R_OK, VfsError, X_OK, may_as};
 
     /// The flags are kept, and a caller reads back what it set.
     ///
@@ -1522,6 +1552,40 @@ mod tests {
         // A symlink answers with its creation time; it has no write path.
         let link = root.symlink("l", "/f").unwrap();
         assert_ne!(link.mtime(), 0);
+    }
+
+    /// A directory is born traversable by everyone, and a file is not: the
+    /// two kinds start from different defaults, and only one of them is what
+    /// makes `/tmp` usable. Counterfactual both ways - give the directory the
+    /// file's `0644` and every name below it becomes unreachable for a caller
+    /// that is not its owner (measured on the sweep machine as `t-unix`'s bind
+    /// under `/tmp/…` answering EACCES before it reached the plain file it was
+    /// meant to report); give the *file* the directory's bits and an unpacked
+    /// tree arrives world-writable.
+    #[test]
+    fn a_directory_is_born_traversable_and_a_file_is_not() {
+        let fs = RamFs::new();
+        let root = fs.root();
+        let dir = root.create("d", NodeKind::Dir).unwrap();
+        let file = root.create("f", NodeKind::File).unwrap();
+        // Host umask is the default 022, so 0777 -> 0755 and 0644 unchanged.
+        assert_eq!(dir.mode(), 0o755, "mkdir(2)'s S_IALLUGO less the mask");
+        assert_eq!(file.mode(), 0o644, "a regular file keeps rw-r--r--");
+        // The consequence the numbers exist for: uid 1000 may search *and* list
+        // the directory - both are the other triad's bits, and `0644` would
+        // have neither. That is the difference between a `/tmp` names can be
+        // reached through and one they cannot.
+        assert_eq!(may_as((1000, 1000), &dir, X_OK | R_OK).ok(), Some(()));
+        // And the mask is honoured rather than hardcoded: at 0077 the same
+        // create leaves a directory nobody but its owner can walk into or list.
+        crate::sched::set_current_umask(0o077);
+        let private = root.create("p", NodeKind::Dir).unwrap();
+        crate::sched::set_current_umask(crate::abi::DEFAULT_UMASK);
+        assert_eq!(private.mode(), 0o700, "the creator's mask decides");
+        assert_eq!(
+            may_as((1000, 1000), &private, X_OK | R_OK).err(),
+            Some(VfsError::Access)
+        );
     }
 
     /// A socket node: the kind stat reports, the doors it refuses, and the
