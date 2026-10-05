@@ -13,7 +13,7 @@ A uniprocessor x86_64 operating system kernel in Rust, booted on UEFI by its own
 subsystem is proven correct before the next one is built — from the frame allocator to an
 interactive shell. Linux ABI compatible: musl-based binaries run unmodified.
 
-[Quick Start](#quick-start) · [Architecture](#architecture) · [Syscalls](#syscalls) · [Milestones](#milestone-checks) · [Building](#building) · [Testing](#testing) · [Docs](#documentation) · [中文](README.zh.md)
+[Quick Start](#quick-start) · [Architecture](#architecture) · [Syscalls](#syscalls) · [Milestones](#milestone-checks) · [Building](#building) · [Testing](#testing) · [Docs](#documentation) · [中文](docs/README.zh.md)
 
 </div>
 
@@ -58,7 +58,7 @@ behind `#[cfg(target_os = "none")]`, which is what keeps the host build free of 
 
 ## Architecture
 
-`ARCHITECTURE.md` has the full module graph, the measured dependency edges, the boot sequence
+`docs/ARCHITECTURE.md` has the full module graph, the measured dependency edges, the boot sequence
 diagram and the layering rules. This is the summary.
 
 ### System overview
@@ -599,11 +599,12 @@ mpos/
 ├── initramfs.toml           # what the early userspace contains
 ├── .cargo/config.toml       # targets, rustflags and the `cargo xtask` alias
 ├── rust-toolchain.toml      # nightly + the four targets
-├── README.md · README.zh.md · ARCHITECTURE.md · AGENTS.md · PLAN.md
+├── docs/                    # ARCHITECTURE.md · PLAN.md · UAPI.md · README.zh.md
+├── README.md · AGENTS.md
 └── LICENSE
 ```
 
-`ARCHITECTURE.md` has the same tree as a dependency graph, with the measured edges between
+`docs/ARCHITECTURE.md` has the same tree as a dependency graph, with the measured edges between
 layers; `AGENTS.md` is the short version for anyone (or anything) about to make a change.
 
 ---
@@ -647,11 +648,11 @@ layers; `AGENTS.md` is the short version for anyone (or anything) about to make 
 | File | What it is |
 |---|---|
 | `README.md` | This file: what MPOS is and how to build, run and test it |
-| `README.zh.md` | Chinese translation, kept in section-by-section correspondence with this file |
-| `ARCHITECTURE.md` | The dependency graphs, the boot and syscall sequences, per-layer ownership, the measured inter-module edges, and the layering violations |
 | `AGENTS.md` | The working guide: commands, conventions, recipes for adding a syscall or a test, known traps |
-| `PLAN.md` | The feature roadmap and status board, the measured performance work, and Phase 11 — the architecture-debt audit and its remediation plan |
-| `UAPI.md` | The userspace-visible surface as an inventory: syscalls, device ioctls, struct layouts and flag vocabularies, each with Linux's answer, this kernel's, and the pin — the working list of what is served, honestly refused, or a wrong shape |
+| `docs/README.zh.md` | Chinese translation, kept in section-by-section correspondence with this file |
+| `docs/ARCHITECTURE.md` | The dependency graphs, the boot and syscall sequences, per-layer ownership, the measured inter-module edges, and the layering violations |
+| `docs/PLAN.md` | The feature roadmap and status board, the measured performance work, and Phase 11 — the architecture-debt audit and its remediation plan |
+| `docs/UAPI.md` | The userspace-visible surface as an inventory: syscalls, device ioctls, struct layouts and flag vocabularies, each with Linux's answer, this kernel's, and the pin — the working list of what is served, honestly refused, or a wrong shape |
 | `xtask/README.md` | Every build/run command, flag and environment variable (bilingual) |
 | `fuzz/README.md` | What each fuzz target feeds on |
 
