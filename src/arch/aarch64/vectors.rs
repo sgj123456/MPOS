@@ -477,6 +477,12 @@ extern "C" fn irq() {
     let intid = gic::acknowledge();
     if intid == gic::TIMER_INTID {
         timer::tick();
+    } else if intid == gic::SERIAL_INTID {
+        // One line, two directions: a keystroke that arrived and a transmit
+        // queue that has room are the same wire on this machine, and both are
+        // answered by the one visit (see `pl011::handle_interrupt` for the order
+        // they are served in, and why it matters).
+        pl011::handle_interrupt();
     }
     if intid != gic::SPURIOUS {
         gic::end_of_interrupt(intid);

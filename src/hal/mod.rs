@@ -310,9 +310,13 @@ pub trait Paging {
 /// A baseline concern, not an optional capability, because every machine this
 /// kernel boots on has exactly one - on x86_64 the 16550 at COM1, on aarch64 the
 /// PL011. What is *not* universal is how the wire is made fast: an
-/// interrupt-driven transmit ring a task can queue into and sleep on is x86_64's
-/// arrangement (and a future aarch64 one), so that is the optional [`SerialRing`]
-/// beside this, while the polled write every machine can do lives here.
+/// interrupt-driven transmit ring a task can queue into and sleep on is one
+/// machine's arrangement rather than every machine's - it needs a transmitter
+/// with an interrupt *and* a controller that routes it - so that is the optional
+/// [`SerialRing`] beside this, while the polled write every machine can do lives
+/// here. Both machines have such a transmitter today (the 16550's line at IRQ4
+/// through the PIC, the PL011's SPI through the GIC), so both are `SerialRing`s
+/// and neither describes the other's wire.
 pub trait Console {
     /// Bring the sink up. Idempotent; the boot may already have poked the wire.
     fn init();
@@ -561,10 +565,13 @@ pub trait SignalFrame {
 ///
 /// A capability, not part of [`Console`], because it needs a machine that (1) has
 /// an interrupting transmitter and (2) has a wired controller and scheduler to
-/// park on. `virt`'s PL011 console at stage 4a is polled only - the GIC line
-/// routing that would make it a `SerialRing` is stage 5 - so aarch64 implements
-/// [`Console`] and simply is not a `SerialRing`; the console then always takes the
-/// polled path and never parks. x86_64 is a `SerialRing`.
+/// park on. Both machines do: x86_64's line reaches a pic, aarch64's its GIC's
+/// SPI 33 - and the queue both of them drain is written once above them
+/// (`crate::drivers::tx_ring`), so a `SerialRing` impl is a three-line answer to
+/// "will you take a byte" rather than a second copy of who sleeps for room.
+/// A machine with neither is not one at all, and says so by declaring no
+/// `mpos_serial_ring`: the console then always takes the polled path and never
+/// parks.
 pub trait SerialRing {
     /// How many bytes fit in the ring right now.
     fn tx_space() -> usize;

@@ -425,8 +425,10 @@ impl crate::hal::Console for crate::hal::Current {
 
 /// x86_64's 16550 has an interrupting transmitter and a ring the console parks
 /// on, so it implements the optional [`crate::hal::SerialRing`] over
-/// `drivers::serial`'s ring. A polled machine (aarch64 at stage 4a) is not a
-/// `SerialRing`; `crate::console` then never queues.
+/// `drivers::serial`'s ring: three operations on one I/O port. The queue itself
+/// is shared with the second machine (`crate::drivers::tx_ring`), whose PL011
+/// answers the same three questions through different registers; see that
+/// module for why the decisions live together rather than per machine.
 impl crate::hal::SerialRing for crate::hal::Current {
     #[inline]
     fn tx_space() -> usize {

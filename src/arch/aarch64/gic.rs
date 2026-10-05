@@ -143,10 +143,21 @@ pub fn is_enabled(intid: u32) -> bool {
 /// programs the same `0x7` (`GICC_CTLR_ENABLE_BITS`), which is what made the
 /// register value - rather than the group choice - the thing to suspect.
 pub fn init() {
+    // Both lines this kernel knows about are *configured* here and enabled by
+    // the driver that wants one - the timer immediately, because nothing in this
+    // machine runs without a clock, and the serial only later: its handler hands
+    // bytes to the console's tty, so a line the boot opened before that layer
+    // existed would interrupt into a panic. Group and priority are set now
+    // anyway, because changing a line's group while it could already be pending
+    // is exactly the ordering the disable-then-write above exists to protect.
     write(DIST, GICD_CTLR, 0);
-    // Group 1 is the group an IRQ delivers; group 0 is FIQ/secure.
     set_bit(DIST, GICD_IGROUPR, TIMER_INTID);
     set_priority(TIMER_INTID, 0x80);
+    set_bit(DIST, GICD_IGROUPR, SERIAL_INTID);
+    // The same priority as the clock: the console input a person typed is not
+    // worth less than a tick, and not worth more either - neither line can
+    // starve the other, which is what two equal priorities buy.
+    set_priority(SERIAL_INTID, 0x80);
     enable(TIMER_INTID);
     write(
         DIST,

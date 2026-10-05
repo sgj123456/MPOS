@@ -2490,6 +2490,24 @@ pub fn interrupts_enabled() -> bool {
     vectors::interrupts_enabled()
 }
 
+/// Let the console's UART interrupt, and let the console queue into it.
+///
+/// The aarch64 counterpart of x86_64's `drivers::serial::{enable_rx,enable_tx}`
+/// pair, and the reason this is one call rather than two: on that machine the
+/// 16550 is a driver above the machine layer and its two directions are two
+/// functions, while here the PL011 *is* the machine's console and both halves
+/// are its (`pl011::enable_interrupts`). What the two machines share is the
+/// queue the transmitter drains and the point in the boot at which the console
+/// starts using it, not the names either machine calls them by.
+///
+/// Called once, from the wiring layer, once a typed byte has somewhere to go:
+/// the handler hands one to the console's tty, so arming earlier would take an
+/// interrupt into a subsystem that does not exist yet.
+pub fn enable_console_interrupts() {
+    pl011::enable_interrupts();
+    crate::drivers::tx_ring::enable();
+}
+
 /// Let the core take interrupts.
 pub fn enable_interrupts() {
     vectors::enable_interrupts()
@@ -2922,11 +2940,13 @@ impl crate::hal::Contexts for crate::hal::Current {
     }
 }
 
-/// The console sink on this machine: the polled PL011 in the kernel-half device
-/// window. `crate::hal::Console`'s baseline half only - `virt`'s PL011 has an
-/// interrupting transmitter the GIC routes nowhere yet (stage 5), so this machine
-/// is *not* a [`crate::hal::SerialRing`] and `crate::console` never parks on it;
-/// every write is the polled one.
+/// The console sink on this machine: the PL011 in the kernel-half device window.
+///
+/// [`Console`](crate::hal::Console)'s baseline half is the polled write below,
+/// and it stays: it is what every line before the interrupt is armed goes out
+/// on, and what the panic path uses afterwards. The machine's PL011 also has an
+/// interrupting transmitter the GIC routes to INTID 33, so it is a
+/// [`SerialRing`](crate::hal::SerialRing) too - see below.
 impl crate::hal::Console for crate::hal::Current {
     #[inline]
     fn init() {
@@ -2948,9 +2968,43 @@ impl crate::hal::Console for crate::hal::Current {
 
     #[inline]
     fn interrupt_driven() -> bool {
-        // No transmit ring and no routed TX interrupt until stage 5. The honest
-        // `false`, so the console takes the polled path and never parks.
-        false
+        // `tx_ring` armed by [`enable_console_interrupts`], after which the
+        // console may queue rather than wait for the wire. Until then this is
+        // the honest `false`, so the console takes the polled path and no task
+        // ever parks on a queue nothing is draining.
+        crate::drivers::tx_ring::enabled()
+    }
+}
+
+/// This machine's console may queue its bytes and let the UART's own interrupt
+/// drain them - the optional [`crate::hal::SerialRing`] capability, which it is
+/// because the PL011 has an interrupting transmitter and the GIC has the SPI to
+/// carry it (`gic::SERIAL_INTID`, the tree's `interrupts = <0 1 4>`).
+///
+/// Every method is a forward to the queue. That is the point rather than an
+/// indirection: the room there is, who sleeps for it and what a visit from the
+/// transmitter does with it were written once, above both machines, so this
+/// machine's answer differs from x86_64's only in which three lines reach its
+/// UART.
+impl crate::hal::SerialRing for crate::hal::Current {
+    #[inline]
+    fn tx_space() -> usize {
+        crate::drivers::tx_ring::space()
+    }
+
+    #[inline]
+    fn tx_submit(bytes: &[u8]) -> usize {
+        crate::drivers::tx_ring::submit::<pl011::Pl011>(bytes)
+    }
+
+    #[inline]
+    fn tx_wait_now() {
+        crate::drivers::tx_ring::wait_now();
+    }
+
+    #[inline]
+    fn tx_stop_waiting() {
+        crate::drivers::tx_ring::stop_waiting();
     }
 }
 

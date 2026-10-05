@@ -71,6 +71,13 @@ pub use aarch64::print_args;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::halt;
 
+/// Arm the console's interrupt and let the console queue into it. See
+/// `aarch64::enable_console_interrupts`: the PL011 is this machine's own
+/// console rather than a driver above it, so the wiring asks here rather than
+/// naming `drivers::serial` as the x86_64 arm does.
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::enable_console_interrupts;
+
 /// How many `#BP` traps have been caught, for the M1 milestone check.
 ///
 /// A milestone instrument rather than a machine capability: it counts, and

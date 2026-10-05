@@ -30,6 +30,15 @@ pub mod qemu;
 pub mod rtc_dev;
 #[cfg(target_arch = "x86_64")]
 pub mod serial;
+/// The console's transmit queue - the one thing in `drivers` both machines use
+/// as-is. It is here rather than inside `serial` (x86_64's 16550) or beside
+/// `arch/aarch64/pl011.rs` (the second machine's UART) because both drain it
+/// through the same three operations and neither owns the reasoning over it:
+/// when to arm the transmitter, who sleeps for room, what one visit hands over.
+/// Present wherever a `hal::SerialRing` is (`mpos_serial_ring`), because a
+/// machine with no interrupting transmitter has no queue to drain.
+#[cfg(mpos_serial_ring)]
+pub mod tx_ring;
 #[cfg(target_arch = "x86_64")]
 pub mod uinput;
 #[cfg(target_arch = "x86_64")]

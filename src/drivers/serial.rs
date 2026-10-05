@@ -6,9 +6,10 @@
 //! terminal: the shells run on the pty-backed `/dev/tty1`..`tty6`, and
 //! `vcmux` moves their bytes over this port.
 //!
-//! Output is a plain write. Input is an interrupt: the receiver's data-ready
-//! line is IRQ4, and [`drain_into_tty`] is how the handler empties the FIFO
-//! and hands what it finds to the multiplexer.
+//! Output is a plain write when the writer cannot queue (before the interrupt
+//! is armed, from a handler, on the panic path). Input is an interrupt: the
+//! receiver's data-ready line is IRQ4, and [`drain_into_tty`] is how the handler
+//! empties the FIFO and hands what it finds to the multiplexer.
 //!
 //! # Why this module does not lock
 //!
@@ -25,25 +26,20 @@
 //! way out is the tty, which is written through `critical_section` and is
 //! safe to enter from anywhere because interrupts are already off by then.
 //!
-//! The transmit ring below does take a lock, and it is safe for the same
-//! reason read the other way: the borrow covers only the copy into the ring or
-//! out of it, never the wait for the hardware. That distinction is the whole
-//! point of the ring - see [`pump_tx`] and [`tx_submit`].
+//! The transmitter's half is not this module's any more. The queue the bytes
+//! wait in, who sleeps for room in it, and when to stop asking the UART for an
+//! interrupt are one answer rather than two, in `crate::drivers::tx_ring`, and
+//! this file implements [`Transmitter`] over the port - which is the whole of
+//! what distinguishes one console UART from the other.
 //!
 //! The interrupt stays masked until [`enable_rx`] asks for it, so nothing
 //! arrives while the kernel is still finding its feet.
 
-use alloc::collections::VecDeque;
-use alloc::vec::Vec;
-use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, Ordering};
-
-use critical_section::Mutex;
 use uart_16550::spec::registers::{FifoTriggerLevel, LSR};
 use uart_16550::{Config, Uart16550};
 use x86_64::instructions::port::Port;
 
-use crate::sched::policy::TaskId;
+use crate::drivers::tx_ring;
 
 /// IER bit 0: raise an interrupt whenever a byte is ready to be read.
 const IER_DATA_READY: u8 = 1 << 0;
@@ -59,23 +55,6 @@ const LSR_TX_READY: u8 = 1 << 5;
 /// next one. The FIFO holds 16, so this is never reached with working
 /// hardware; it exists so the handler cannot spin forever if it does.
 const MAX_DRAIN: usize = 64;
-/// The same bound on the way out. The hardware says when it has had enough by
-/// clearing its own status bit, so this only caps the handler against a
-/// transmitter that keeps claiming to be ready.
-const TX_BURST: usize = 256;
-
-/// How many bytes the transmit ring holds. Sized for a screenful of the
-/// heaviest thing the console carries - a `bat`-painted line of colour
-/// sequences - so a printing task parks on the ring rather than on the wire.
-const TX_RING: usize = 16 * 1024;
-
-/// The bytes waiting to go out, and who is waiting for room in them.
-static TX: Mutex<RefCell<VecDeque<u8>>> = Mutex::new(RefCell::new(VecDeque::new()));
-static TX_WAITERS: Mutex<RefCell<Vec<TaskId>>> = Mutex::new(RefCell::new(Vec::new()));
-/// Whether the ring is what the console writes through. Cleared until
-/// [`enable_tx`], because before the IDT and the PIC exist the only way to
-/// put a byte on the wire is to wait for the hardware right here.
-static TX_IRQ: AtomicBool = AtomicBool::new(false);
 
 /// One UART: the base I/O port, 0x3f8 for COM1.
 #[derive(Clone, Copy)]
@@ -193,6 +172,31 @@ impl Uart {
     }
 }
 
+/// COM1 as [`crate::drivers::tx_ring`]'s transmitter: the three answers that
+/// ring asks of any UART, and nothing about who waits for it or why.
+///
+/// Because `Uart` is a `Copy` wrapper over a port number rather than over the
+/// port's state, there is nothing for an instance to carry - [`COM1`] is a
+/// `const` and each op rebuilds the thin wrapper the crate needs, which is why
+/// the trait's methods take no `self`.
+impl crate::drivers::tx_ring::Transmitter for Uart {
+    fn tx_ready() -> bool {
+        // Deliberately not `Self::tx_ready(&COM1)`: the ring's trait is the
+        // answer for *the* console transmitter of whichever machine this is, and
+        // on this one there is exactly one - the same reason [`write_bytes`] has
+        // no port argument.
+        COM1.tx_ready()
+    }
+
+    fn tx_put(byte: u8) {
+        COM1.tx_put(byte);
+    }
+
+    fn tx_interrupt(on: bool) {
+        COM1.ier_set(IER_TX_READY, on);
+    }
+}
+
 /// The console's line settings: the default eight bits, no parity, one stop
 /// bit, with one change that matters for a person at a keyboard.
 ///
@@ -233,92 +237,49 @@ pub fn drain_into_tty() {
 
 /// Whether the console may queue its output rather than wait for the wire.
 pub fn interrupt_driven() -> bool {
-    TX_IRQ.load(Ordering::Relaxed)
+    tx_ring::enabled()
 }
 
 /// Start queueing: the IDT and the PIC are up, so the transmitter can be told
 /// to interrupt for what the ring holds. Called once, where the receiver is
 /// armed - before that, [`write_bytes`] is the only way a byte gets out.
 pub fn enable_tx() {
-    TX_IRQ.store(true, Ordering::Relaxed);
+    tx_ring::enable();
 }
 
 /// How many bytes the ring has room for.
 pub fn tx_space() -> usize {
-    critical_section::with(|cs| TX_RING - TX.borrow(cs).borrow().len())
+    tx_ring::space()
 }
 
 /// Queue what fits for the transmitter to send, and ask for the interrupt that
 /// does it. Returns how many bytes were taken; the rest is the caller's to
 /// offer again once room appears.
 ///
-/// The critical section covers the copy into the ring only. That is the point
-/// of the whole device: waiting for the hardware to empty its holding register
-/// used to happen with interrupts off, so a host that stopped draining the
-/// serial line stopped the clock, the keyboard and every task with them.
+/// The reasoning this used to carry - the bounded critical section, and why it
+/// must not cover a wait for the hardware - lives with the queue now
+/// (`tx_ring::submit`): it is the same reasoning either machine's console needs,
+/// and this is the 16550's half of it.
 pub fn tx_submit(bytes: &[u8]) -> usize {
-    let n = critical_section::with(|cs| {
-        let mut ring = TX.borrow(cs).borrow_mut();
-        let n = (TX_RING - ring.len()).min(bytes.len());
-        ring.extend(bytes[..n].iter().copied());
-        n
-    });
-    if n > 0 {
-        COM1.ier_set(IER_TX_READY, true);
-    }
-    n
+    tx_ring::submit::<Uart>(bytes)
 }
 
-/// The transmitter's interrupt: hand the ring to the hardware, and tell
-/// whoever was waiting for room that some has appeared.
+/// The transmitter's interrupt: hand the ring to the hardware, and tell whoever
+/// was waiting for room that some has appeared.
 ///
-/// Bounded by [`TX_BURST`], so a stream the host will not drain costs this
-/// interrupt one burst rather than the rest of the machine's time. The bytes
-/// that did not fit stay queued, and the next interrupt picks them up.
+/// Called from the serial handler alongside [`drain_into_tty`], because a 16550
+/// at IRQ4 has one line for both directions: the visit that took a keystroke is
+/// also the visit that must move the queue.
 pub fn pump_tx() {
-    let waiters = critical_section::with(|cs| {
-        let mut moved = 0usize;
-        {
-            let mut ring = TX.borrow(cs).borrow_mut();
-            while moved < TX_BURST && COM1.tx_ready() {
-                let Some(byte) = ring.pop_front() else { break };
-                COM1.tx_put(byte);
-                moved += 1;
-            }
-            if ring.is_empty() {
-                // Nothing left to send: ask no more, or the UART interrupts
-                // forever on an idle line.
-                COM1.ier_set(IER_TX_READY, false);
-            }
-        }
-        if moved > 0 {
-            Some(core::mem::take(&mut *TX_WAITERS.borrow(cs).borrow_mut()))
-        } else {
-            None
-        }
-    });
-    if let Some(waiters) = waiters {
-        for id in waiters {
-            crate::sched::wake(id);
-        }
-    }
+    tx_ring::pump::<Uart>();
 }
 
 /// Add the running task to the ring's wait list, before it parks on room.
 pub fn tx_wait_now() {
-    let me = crate::sched::current();
-    critical_section::with(|cs| {
-        let mut waiters = TX_WAITERS.borrow(cs).borrow_mut();
-        if !waiters.contains(&me) {
-            waiters.push(me);
-        }
-    });
+    tx_ring::wait_now();
 }
 
 /// Take the running task back off the list - the wait ended however it ended.
 pub fn tx_stop_waiting() {
-    let me = crate::sched::current();
-    critical_section::with(|cs| {
-        TX_WAITERS.borrow(cs).borrow_mut().retain(|w| *w != me);
-    });
+    tx_ring::stop_waiting();
 }

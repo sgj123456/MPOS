@@ -45,7 +45,12 @@
 //!   `arch::aarch64::paging::DEVICE_VIRT`, and it is not this module's), `logging` (the level vocabulary; the subscriber writes to the console, now present on both machines), `rand`, `sync`, `uevent`, and every `crates/*`
 //!   leaf. `hal` joined them at stage 6f (both machines implement the baseline
 //!   concerns; the optional `Msi`/`SerialRing`/`FpuTrap`/`SignalFrame` are gated
-//!   per capability, and both machines now declare `SignalFrame`),
+//!   per capability. `SignalFrame` is the only one both declare; `Msi` and
+//!   `FpuTrap` are the first machine's alone (its local APIC and x87 trap,
+//!   neither of which `-M virt` has), and aarch64 gained `SerialRing` when its
+//!   PL011's line was routed through the GIC - the second capability the two
+//!   machines share, and the one whose queue is written once in `drivers` for
+//!   both of them.
 //!   and `console` at stage 4a (the serial sink is reached through `hal::Console`,
 //!   and the framebuffer + interrupt-TX-ring + scheduler-parking arms are
 //!   `#[cfg]`-inert on aarch64, whose console is the polled PL011).
@@ -99,10 +104,11 @@ pub use mpos_blk as blk;
 pub mod boot;
 /// The log ring, serial, framebuffer switch and the six virtual consoles.
 /// Now compiled for both machines (stage 4a): the sink is reached through
-/// `crate::hal::Console` - the x86_64 16550/`SerialRing` and framebuffer paths and
-/// the scheduler-parking arm are `#[cfg]`-inert on aarch64, whose console is the
-/// polled PL011. A boot-observed aarch64 console marker waits on relocating the
-/// post-machine checks into `main` (`PLAN.md` §9.1's stage 4b gap).
+/// `crate::hal::Console`, and since §13.7 both machines queue-and-park on the
+/// same `SerialRing` as well - the queue is `drivers::tx_ring` and each machine
+/// supplies its three lines of it. What stays `#[cfg]`-inert on aarch64 is the
+/// framebuffer arm (`mpos_framebuffer_console`), which needs a GPU neither has
+/// given it.
 #[cfg(target_os = "none")]
 pub mod console;
 /// The process credential model: the four capability sets, the dumpable flag

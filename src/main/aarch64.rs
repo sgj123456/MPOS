@@ -109,25 +109,19 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
     // PL011 RX FIFO); route it into the tty the way x86_64's serial interrupt does
     // (`vcmux::route_input`) and read it back through the tty's own `read`. A
     // headless boot has no terminal, so the UART's own loopback injects the byte.
-    // Doing this *before* the pump task is spawned means the self-test is the only
-    // reader, so the injected bytes cannot be stolen.
+    // Doing this *before* the console's interrupt is armed means the self-test is
+    // the only reader of the receiver, so nothing can take its bytes from it.
     check_console_rx();
 
-    // The production input pump: poll the wire and hand any byte to the tty, so a
-    // shell reading `fd 0` gets typed input. Aarch64 has one console tty (no
-    // multi-VC mux yet - `vcmux` is x86_64-only), so this calls the tty's own
-    // `receive_byte` directly - the step `vcmux::route_input` performs for the
-    // active VC on x86_64. Polled at the tick rate for now; the GIC-routed RX
-    // interrupt that would let it park instead of poll is a later cut.
-    sched::spawn(
-        || loop {
-            match hal::console_poll_input() {
-                Some(byte) => vfs::tty::global().receive_byte(byte),
-                None => sched::sleep_ticks(1),
-            }
-        },
-        sched::Priority::NORMAL,
-    );
+    // Arm the console's interrupt, now that there is a tty for a typed byte to
+    // land in and a scheduler for a writer to park on. From here the console
+    // neither polls the receiver nor waits on the wire: `init_net` below and
+    // every line after it go through the queue the PL011's own interrupt
+    // drains, exactly as the first machine's do - the same `crate::console`
+    // code over the same `hal::SerialRing` capability, with this one arming
+    // call in front of it.
+    mpos::arch::enable_console_interrupts();
+    check_serial_tx();
 
     // Stage 8-net: the smoltcp stack over the MMIO adapter `check_net` opened and
     // published. The adapter is the machine's to find (a window the tree names)
@@ -442,6 +436,78 @@ fn switch_root() {
     mpos::println!(
         "M7_ROOT_OK: / is the disk rootfs, the ramfs moved to /oldroot, /dev re-mounted, /etc/inittab and /dev/urandom resolve"
     );
+}
+
+/// The interrupt-driven console: the machine queues what it writes and the
+/// UART's own interrupt hands it to the wire, rather than the writer waiting for
+/// the transmitter with interrupts masked.
+///
+/// The queue is not this machine's - it is `drivers::tx_ring`, which the first
+/// machine's 16550 drains through the same three operations this machine's PL011
+/// implements - so what is being pinned is narrower and more useful than "output
+/// appears": it is that *this* machine's transmitter answer reaches it, that the
+/// GIC delivers its line, and that a writer which offered more than one burst
+/// was parked and woken rather than spinning. The last of those is why the check
+/// asks for more than a line: [`check_console_rx`] covered a byte, and a queue
+/// that only ever held one line's worth would pass a test that small.
+///
+/// How it knows the difference. `stats()` counts what writers queued and what the
+/// *handler* handed over, and the second number can only rise inside an
+/// interrupt: a polled write moves no bytes through the queue at all, so a
+/// machine whose line never fired reports a queue that nothing drains. It is
+/// also the check that catches a transmitter asked to interrupt when it should
+/// not have been - an idle line asserting for ever would have shown up here as
+/// visits that moved nothing, and before there was a counter to ask, as nothing
+/// at all.
+fn check_serial_tx() {
+    const LINE: usize = 512;
+
+    let before = drivers::tx_ring::stats();
+    // The write goes through `crate::console` rather than straight to the wire,
+    // because that is the path every line above the machine layer takes - and
+    // because its parking half only engages for a caller that may sleep, which
+    // this task may.
+    let filler: alloc::string::String = core::iter::repeat_n('.', LINE).collect();
+    mpos::println!("serial tx: {LINE} bytes through the transmit ring{filler}");
+
+    // Wait for the handler to have handed them over. The wait is bounded, and
+    // the bound is ticks rather than a count of its own: a machine whose clock
+    // stopped is a machine nothing here can finish anyway.
+    let mut waited = 0;
+    loop {
+        if drivers::tx_ring::stats().moved >= before.moved + LINE {
+            break;
+        }
+        waited += 1;
+        if waited > 200 {
+            // Reported through the *machine's* polled writer, not `println!`:
+            // a failure here is by definition a queue that is not draining, and
+            // a report filed through that same queue is a report nobody reads.
+            let now = drivers::tx_ring::stats();
+            mpos::arch::print_args(format_args!(
+                "\nM5_SERIAL_TX_FAILED: {} bytes queued but only {} handed to the PL011 \
+                 ({waited} ticks, no progress)\n",
+                now.queued - before.queued,
+                now.moved - before.moved
+            ));
+            hal::halt()
+        }
+        sched::sleep_ticks(1);
+    }
+    let now = drivers::tx_ring::stats();
+    let moved = now.moved - before.moved;
+    let visits = now.visits - before.visits;
+    if visits == 0 {
+        mpos::arch::print_args(format_args!(
+            "\nM5_SERIAL_TX_FAILED: the bytes went out without a single interrupt\n"
+        ));
+        hal::halt()
+    }
+    mpos::println!(
+        "serial tx: {moved} bytes handed to the PL011 by {visits} interrupt(s), \
+         ({waited} ticks elapsed)"
+    );
+    mpos::println!("M5_SERIAL_TX_OK");
 }
 
 /// Stage 7b's evidence: the polled console input reaches a reader through the

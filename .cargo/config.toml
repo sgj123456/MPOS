@@ -58,9 +58,13 @@ rustflags = [
 # loaded it at. The loader places the segments itself now, so the image has to
 # be relocatable and this block matches the x86_64 one.
 #
-# This machine's capability set is three flags. Its PL011 receiver is polled (the
-# GIC RX line is a later cut), so `hal::ConsoleInput` is present here and absent
-# on x86_64. It has a compiled network stack (`mpos_net`, the same one the first
+# Its PL011's receiver is polled for the bring-up self-test (`hal::ConsoleInput`,
+# absent on x86_64, whose receiver interrupts into the console mux instead) *and*
+# its transmitter interrupts through the GIC's INTID 33 once the wiring arms it,
+# so this machine is a `SerialRing` as well - which is exactly the arrangement
+# the capability exists to describe: the polled write stayed, `crate::console`
+# learned nothing about either machine, and the second machine's difference is a
+# word in this file. It has a compiled network stack (`mpos_net`, the same one the first
 # machine declares): the seam landed with §13.4's device stage, so the socket
 # syscalls route into `net` here too, and its adapter is the MMIO window
 # `check_net` opens and `main` hands to `net::init`. And its own `rt_sigframe`
@@ -75,6 +79,7 @@ rustflags = [
     "-C", "link-arg=-ztext",
     "-C", "link-arg=-zmax-page-size=0x1000",
     "--cfg", "mpos_console_input",
+    "--cfg", "mpos_serial_ring",
     "--cfg", "mpos_net",
     "--cfg", "mpos_signal_frame",
 ]
