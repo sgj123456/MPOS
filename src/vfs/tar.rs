@@ -296,8 +296,13 @@ mod tests {
 
     #[test]
     fn unpack_creates_the_tree_it_is_given() {
-        let mut archive = member("etc/", b'5', b"");
-        archive.extend(member("etc/motd", b'0', b"hi\n"));
+        // Real modes, because the resolution walk now polices them: an
+        // archive's directory member carries 0755 (`tar` records what it
+        // statted), and a `member()` left that field zero the tree would be
+        // unreadable - which is Linux's answer for a `chmod 000` directory,
+        // but was this fixture inventing one nobody asked for.
+        let mut archive = member_mode("etc/", b'5', b"", 0o755);
+        archive.extend(member_mode("etc/motd", b'0', b"hi\n", 0o644));
 
         let vfs = tree();
         assert_eq!(super::unpack_into(&vfs, &archive).unwrap(), 2);
