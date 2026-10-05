@@ -5,9 +5,10 @@
 //! outside F_OK/R_OK/W_OK/X_OK is EINVAL), the flag word too (anything
 //! beyond AT_EACCESS and AT_SYMLINK_NOFOLLOW is EINVAL), X_OK answers
 //! from the mode bits the filesystem keeps - an executable answers 0, a
-//! plain non-executable file answers 0 for root (mpos drops Linux's one
-//! `CAP_DAC_OVERRIDE` execute exception), a directory traverses - and
-//! a name that is not there is still ENOENT, whatever was asked of it.
+//! plain non-executable file answers EACCES even for root (Linux's
+//! `CAP_DAC_OVERRIDE` grants execute only where some execute bit exists),
+//! a directory traverses - and a name that is not there is still ENOENT,
+//! whatever was asked of it.
 
 #![no_std]
 #![no_main]
@@ -47,8 +48,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
 
     // A plain file the kernel stores as a plain file: no execute bit anywhere
-    // in the mode. mpos drops Linux's `CAP_DAC_OVERRIDE` execute exception, so
-    // root's X_OK is granted even here.
+    // in the mode. Linux's `CAP_DAC_OVERRIDE` does not invent one, so root's
+    // X_OK is refused - the same answer every spelling of the call gives,
+    // which is what `t-faccessat` pins across the three.
     let fd = lin::openat(lin::AT_FDCWD, &OWN, lin::O_CREAT | lin::O_RDWR, 0o644) as i32;
     lin::check_true(&mut failed, b"the plain file is created", fd >= 0);
     let _ = lin::close(fd);
@@ -66,9 +68,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     lin::check_eq(
         &mut failed,
-        b"X_OK against a plain file answers 0 for root",
+        b"X_OK against a plain file answers EACCES even for root",
         lin::faccessat2(lin::AT_FDCWD, &OWN, lin::X_OK, 0),
-        0,
+        lin::EACCES,
     );
 
     // The validations, in the man page's order of refusal.

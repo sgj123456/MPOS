@@ -6,8 +6,9 @@
 //! the test splits in two.
 //!
 //! The failures are checked in-process, because those *do* return: a path that
-//! names nothing is ENOENT, and a real file that is not an ELF image is ENOEXEC
-//! rather than something the loader tries to execute.
+//! names nothing is ENOENT, and a real file with no execute bit anywhere is
+//! EACCES - the DAC check answers before the loader sees the bytes, root
+//! included, which is Linux's `CAP_DAC_OVERRIDE` sentence.
 //!
 //! The success is checked through a child. The child calls `execve` and the
 //! parent reaps it; if the call had returned in the child, the child would exit
@@ -54,12 +55,13 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::ENOENT,
     );
 
-    // A file that exists but is not marked executable: mpos drops Linux's one
-    // `CAP_DAC_OVERRIDE` exception, so root's execute gate opens and `execve`
-    // proceeds past the permission check. `/etc/motd` is plain data - not a
-    // program - so it is then refused by the loader as `ENOEXEC` rather than by
-    // the DAC check as `EACCES`. A non-root caller would still be refused with
-    // EACCES before the loader runs.
+    // A file that exists but is not marked executable: Linux's
+    // `CAP_DAC_OVERRIDE` grants root execute only where some execute bit
+    // exists, and `/etc/motd` has none for anyone, so the DAC check refuses
+    // it with `EACCES` before the loader ever runs - root included. The old
+    // outright pass for uid 0 let this reach the loader and answer `ENOEXEC`;
+    // that reading invented a permission nobody set, which is the shape a
+    // caller cannot fall back around.
     let r = lin::execve(
         MOTD.as_ptr(),
         &raw const ARGV as *const *const u8,
@@ -67,9 +69,9 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     lin::check_eq(
         &mut failed,
-        b"execve of non-executable data by root reaches the loader",
+        b"execve of non-executable data is EACCES even for root",
         r,
-        lin::ENOEXEC,
+        lin::EACCES,
     );
 
     // The success case, seen from the parent: the child becomes /bin/true and is

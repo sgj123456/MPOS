@@ -7,7 +7,11 @@
 //! the "failed to preserve <file>: permission" warnings that left every setuid
 //! helper unpacked wrong. They route through one `may_as`, so for uid 0 they
 //! must answer alike, and alike with `faccessat2` too - this pins that, on a
-//! mode (`0600`, then `0000`) that an unprivileged check would refuse.
+//! mode (`0600`, then `0000`) that an unprivileged check would refuse. The
+//! alike-answers now include the refusals: Linux's `CAP_DAC_OVERRIDE` grants
+//! root execute only where some execute bit exists, and read/write only where
+//! some triad carries the bit, so X_OK on `0600` and everything on `0000` are
+//! `EACCES` for all three spellings.
 
 #![no_std]
 #![no_main]
@@ -63,24 +67,28 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::faccessat2(lin::AT_FDCWD, name, W_OK, 0),
         0,
     );
-    // Execute on a file with no execute bit for anyone: mpos lets uid 0 pass
-    // (Linux's CAP_DAC_OVERRIDE would refuse, but this image drops it), so this
-    // is the difference the fix makes observable for a caller that is root.
+    // Execute on a file with no execute bit for anyone: Linux's
+    // `CAP_DAC_OVERRIDE` does not invent one - the override grants read/write
+    // where some triad carries the bit and execute only where some execute bit
+    // exists - so all three spellings agree on `EACCES` even for uid 0. The
+    // agreement is the point of this program; which way it agrees moved with
+    // the policy, and a caller that branches on `access(2)` now gets Linux's
+    // branch.
     lin::check_eq(
         &mut failed,
-        b"access(2) X_OK on 0600 is allowed for root",
+        b"access(2) X_OK on 0600 is EACCES for root",
         lin::access(name, X_OK),
-        0,
+        lin::EACCES,
     );
     lin::check_eq(
         &mut failed,
         b"faccessat(2) X_OK on 0600 matches access(2)",
         lin::faccessat(lin::AT_FDCWD, name, X_OK),
-        0,
+        lin::EACCES,
     );
 
-    // And a mode no one is granted at all: still reachable by root, still
-    // agreed by all three calls.
+    // And a mode no one is granted at all: every kind refused, still agreed by
+    // all three calls.
     lin::check_eq(
         &mut failed,
         b"chmod 0000 succeeds",
@@ -89,15 +97,15 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     lin::check_eq(
         &mut failed,
-        b"access(2) R_OK|W_OK|X_OK on 0000 is allowed for root",
+        b"access(2) R_OK|W_OK|X_OK on 0000 is EACCES for root",
         lin::access(name, R_OK | W_OK | X_OK),
-        0,
+        lin::EACCES,
     );
     lin::check_eq(
         &mut failed,
-        b"faccessat(2) R_OK|W_OK|X_OK on 0000 is allowed for root",
+        b"faccessat(2) R_OK|W_OK|X_OK on 0000 is EACCES for root",
         lin::faccessat(lin::AT_FDCWD, name, R_OK | W_OK | X_OK),
-        0,
+        lin::EACCES,
     );
 
     lin::unlinkat(lin::AT_FDCWD, name, 0);

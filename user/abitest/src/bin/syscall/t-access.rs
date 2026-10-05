@@ -1,12 +1,15 @@
 //! t-access - one test for access, which the strace shows the dynamic
 //! loader using to probe /etc/ld.so.preload (answered -1 ENOENT).
 //!
-//! Pinned to mpos's root policy: uid 0 (this suite's caller) passes every
-//! `access(2)` probe outright, so R_OK, W_OK, F_OK and even X_OK on a file with
-//! no execute bit all answer 0. mpos drops Linux's one `CAP_DAC_OVERRIDE`
-//! exception (which would refuse root's X_OK on a non-executable file), so a
-//! `0644` file is reachable for execute too. A directory is reachable for R_OK,
-//! and a missing path answers ENOENT, exactly the loader's expected outcome.
+//! Pinned to Linux's root policy: uid 0 (this suite's caller) is checked by
+//! `CAP_DAC_OVERRIDE`, so R_OK and W_OK on `/etc/motd` answer 0 because some
+//! triad carries those bits, while X_OK answers EACCES because no execute bit
+//! exists anywhere in its mode. This kernel used to drop that exception - an
+//! outright pass for uid 0 - and mpos now keeps it: a distribution's tree
+//! ships real modes, and answering success where Linux answers EACCES sends a
+//! caller that tests before it execs down a branch it was never meant to take.
+//! A directory is reachable for R_OK, and a missing path answers ENOENT,
+//! exactly the loader's expected outcome.
 
 #![no_std]
 #![no_main]
@@ -28,20 +31,22 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     let r = lin::access(&MOTD, lin::R_OK);
     lin::check_eq(&mut failed, b"an existing file is readable", r, 0);
 
-    // One user, no permission bits: every mode probes as reachable.
+    // The override reads the triads: write exists somewhere in the mode, so
+    // root may have it.
     let r = lin::access(&MOTD, lin::W_OK);
     lin::check_eq(&mut failed, b"an existing file answers W_OK", r, 0);
 
-    // mpos drops Linux's one `CAP_DAC_OVERRIDE` exception: uid 0 passes every
-    // check outright, so X_OK on a `0644` file with no execute bit for anyone is
-    // granted to root too (real Linux would answer `EACCES` here). `/etc/motd`
-    // is not runnable, yet as the sole root user of this image it is reachable.
+    // Linux's `CAP_DAC_OVERRIDE` sentence, kept: execute passes only when some
+    // execute bit exists at all, and `/etc/motd` is plain data with none for
+    // anyone. Real Linux answers EACCES here, and so does this kernel - the
+    // old outright pass answered 0, which is the shape a caller cannot fall
+    // back around.
     let r = lin::access(&MOTD, lin::X_OK);
     lin::check_eq(
         &mut failed,
-        "an existing non-executable file answers X_OK for root".as_bytes(),
+        "an existing non-executable file answers X_OK with EACCES even for root".as_bytes(),
         r,
-        0,
+        lin::EACCES,
     );
 
     let r = lin::access(&MOTD, lin::F_OK);
