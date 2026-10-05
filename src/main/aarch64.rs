@@ -131,16 +131,20 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
     init_net();
     register_exit_hooks();
 
-    // A ramfs root, then the initramfs unpacked into it. With no archive this is a
-    // diskless boot: there is nothing to hand the machine to, so stop honestly
-    // rather than invent an init.
-    let Some(archive) = archive else {
-        mpos::println!("initramfs: none - nothing to hand off to");
-        hal::halt()
-    };
-    let members =
-        vfs::tar::unpack_into(vfs::global(), archive).expect("the aarch64 initramfs was broken");
-    mpos::println!("initramfs: {members} members unpacked");
+    // A ramfs root, and the initramfs unpacked into it when there is one. An
+    // archive that is *missing* is no longer a diskless boot: the root switch
+    // below puts the machine on the disk, and the disk is where its init lives.
+    // That is the whole shape of the Alpine boot - its root carries `/init` and
+    // no test payload for a ramfs to hold, so it ships no archive at all - and
+    // `check_disk_root` has already refused a boot with no disk, so reaching here
+    // without one means the disk root *is* the userland the machine is handed.
+    if let Some(archive) = archive {
+        let members = vfs::tar::unpack_into(vfs::global(), archive)
+            .expect("the aarch64 initramfs was broken");
+        mpos::println!("initramfs: {members} members unpacked");
+    } else {
+        mpos::println!("initramfs: none - the disk root is the whole userland");
+    }
 
     // Stage 7's root switch: `/` becomes the disk, so the tree the machine runs
     // from is the one on the block device rather than the bootstrap ramfs. The
@@ -160,8 +164,20 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
     // typing (which `cargo xtask run --arch aarch64` provides live, via the stage-7b
     // input pump); at headless bring-up it lets boot-aarch64 prove the interactive
     // *read* path reaches a userspace program, not just the kernel.
-    for &byte in b"echo-test\n" {
-        vfs::tty::global().receive_byte(byte);
+    //
+    // Gated on `mpos.selftest`, because it is an *instrument* and not something a
+    // kernel does: injecting a line into the console is the one thing a real
+    // handoff must never do, and a real userland init (Alpine's) reads the same
+    // tty through getty - where the injected line would arrive as a spurious
+    // username attempt at the login prompt. The test boots carry the word; the
+    // Alpine boot does not, and gets an untouched console.
+    let selftest = mpos::boot::cmdline()
+        .split_whitespace()
+        .any(|word| word == "mpos.selftest");
+    if selftest {
+        for &byte in b"echo-test\n" {
+            vfs::tty::global().receive_byte(byte);
+        }
     }
 
     let pid = sched::spawn_init(&init, &argv, &[]).expect("the aarch64 init image loaded");

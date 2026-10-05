@@ -2082,10 +2082,12 @@ use super::abi::{
     MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_HUGETLB, MAP_SHARED, MREMAP_FIXED,
     MREMAP_MAYMOVE, PROT_EXEC, PROT_WRITE,
 };
-
-/// One past the highest address a process may map: the lower half of the
-/// canonical address space, which is where every user mapping lives.
-const USER_LIMIT: usize = 1 << 47;
+// One past the highest address a process may map: the *machine's* user span, not
+// a shared figure. The two machines' values and the reason for them are written
+// down in `mm::elf`, beside `MMAP_BASE`; this used to be a private `1 << 47`
+// here, and on aarch64 that made every `MAP_FIXED` mapping above bit 47 - the
+// mapping a dynamic loader makes for a shared library - answer `EINVAL`.
+use crate::mm::elf::USER_LIMIT;
 
 /// `mmap(addr, length, prot, flags, fd, offset)` — map memory, from a file or
 /// from nothing.

@@ -986,10 +986,13 @@ pub(crate) fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
 ///
 /// Gated with `procfs`'s own condition rather than a new `mpos_*` capability:
 /// the only caller is `/proc/net`, so this collector and the `NetRow` type it
-/// builds exist exactly where procfs does. procfs is still x86_64's and its port
-/// is its own cut (`PLAN.md` §13's port-progress ledger) - this reference goes
-/// with it instead of inventing a capability no other caller would declare.
-#[cfg(target_arch = "x86_64")]
+/// builds exist exactly where procfs does. That condition used to be "x86_64",
+/// because procfs was the first machine's alone; procfs is built on both
+/// machines now (`/proc` is what a real init - Alpine's openrc - reads, and the
+/// socket table it carries is the same stack on both), so the condition is
+/// "bare metal" and the collector comes with it instead of inventing a
+/// capability no other caller would declare.
+#[cfg(target_os = "none")]
 pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> {
     use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
     let zero = || IpEndpoint {

@@ -2652,6 +2652,14 @@ fn banner(record: usize, info: &BootInfo) {
         info.region_count,
         info.allocatable_bytes() / (1024 * 1024),
     );
+    // Recorded before it is printed, and recorded *here* because this is the one
+    // place the loader's command line is in hand. `/proc/cmdline` is where a
+    // userspace init reads it (Alpine's own reads `root=` through this same
+    // file), and the handoff reads its own instrument flag back out of it - the
+    // `mpos.selftest` word that says "this boot is a test", the same word the
+    // x86_64 boot gates its milestone checks on. Until this call the machine's
+    // command line was reachable nowhere but this print.
+    crate::boot::set_cmdline(info.cmdline);
     // The command line is the one field whose bytes the loader had to read out
     // of a file, so printing it is how a wrong one - an empty file, a truncated
     // copy - is visible at boot rather than at the first program that parses it.

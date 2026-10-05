@@ -85,16 +85,38 @@ pub struct Segment<'a> {
     pub flags: MapFlags,
 }
 
-/// First address past the lower half. A canonical address's bit 47 decides
-/// which half it is in, so a user image asking for anything at or above this
-/// line is asking for kernel territory, and no loader should honor it.
+/// First address past the user half: the bound every image placement and every
+/// `mmap`/`mremap` address is validated against. An address at or above it is
+/// kernel territory, and no loader or mapping should honour it.
 ///
-/// This is x86_64's bit-47 split. The aarch64 user span is `TTBR0`'s own size
-/// (`paging::USER_END`), which is narrower; taking the limit from the machine
-/// rather than a shared `1 << 47` is a named follow-on in `PLAN.md` §9.1. An
-/// aarch64 static binary places well below this line, so the guard is
-/// conservative here, not a wrong-but-passing check.
-const USER_LIMIT: usize = 1 << 47;
+/// It is the *machine's* span, and the two machines disagree - which is why it
+/// is declared here the same way [`MMAP_BASE`] is, one declaration per machine
+/// with the reason written down, rather than as one shared `1 << 47`:
+///
+/// - x86_64: bit 47 decides the half, so the canonical lower half ends at
+///   `1 << 47`.
+/// - aarch64: the user span is `TTBR0_EL1`'s own size, `1 << 48` (the
+///   machine's `paging::USER_END`), and a shared `1 << 47` is not conservative
+///   here - it is *wrong*, and measurably so: `MMAP_BASE` on this machine is
+///   `0xff00_0000_0000`, **above** `1 << 47`, so the `mmap` cursor hands out
+///   addresses this constant called kernel territory. `handle_mmap` then
+///   answered `EINVAL` to every `MAP_FIXED` mapping at such an address - which
+///   is exactly the mapping a dynamic loader makes for a shared library's
+///   segments, so the first `dlopen` on the second machine failed with "Error
+///   loading shared library librc.so.1: Invalid argument" while the statically
+///   linked programs, whose mappings are never fixed, ran fine. (`PLAN.md` §9.1
+///   named this follow-on when it wrote down that the value was still x86_64's.)
+/// - host: the x86_64 value, so the host-tested placement math matches x86.
+///
+/// `mm` declares it rather than reading it through `hal`: `mm`'s only edge is
+/// down to `boot`, and a new `mm -> hal` or `mm -> arch` edge would be a design
+/// change the modules do not otherwise need. The fact is one the mapping plan
+/// owns - [`MMAP_BASE`] sits beside it for the same reason - and `paging::USER_END`
+/// is the page tables' own copy of the same number.
+#[cfg(any(not(target_arch = "aarch64"), not(target_os = "none")))]
+pub const USER_LIMIT: usize = 1 << 47;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub const USER_LIMIT: usize = 1 << 48;
 
 /// The ceiling of the `mmap`/image ASLR band: `sched`'s `new_layout` stacks the
 /// `mmap` region, the interpreter and the program *below* this, and leaves the

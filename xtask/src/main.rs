@@ -94,6 +94,11 @@ enum Commands {
     /// under AAVMF. The second machine's own boot path, and stage 1e's
     /// instrument: it reads the verdict off the PL011 (`PLAN.md` §9.1)
     BootAarch64,
+    /// Install a real Alpine aarch64 userland into the second machine's disk
+    /// image and boot it headless, reporting how far it gets
+    /// (`PLAN.md` §9.1 stage 7). Unprivileged: the install runs under
+    /// `fakeroot`, so the tree keeps root ownership without taking root
+    AlpineAarch64,
     /// Remove the build and target directories
     Clean,
 }
@@ -110,6 +115,7 @@ impl Commands {
             Commands::Test => "test",
             Commands::Depgraph => "depgraph",
             Commands::BootAarch64 => "boot-aarch64",
+            Commands::AlpineAarch64 => "alpine-aarch64",
             Commands::Clean => "clean",
         }
     }
@@ -240,7 +246,8 @@ fn main() -> Result<()> {
         | Commands::Disk
         | Commands::Test
         | Commands::Depgraph
-        | Commands::BootAarch64 => false,
+        | Commands::BootAarch64
+        | Commands::AlpineAarch64 => false,
         Commands::Clean => utils::clean_needs_root(&build_dir),
         Commands::Initramfs | Commands::Rootfs | Commands::All => true,
         Commands::Run => run_needs_build,
@@ -407,6 +414,11 @@ fn dispatch(
         // one is the x86_64 kernel and the x86_64 loader, and this machine's
         // pair is a different target for each.
         Commands::BootAarch64 => aarch64::run(build_dir, profile),
+        // Also builds both binaries itself, and lays out its own ESP and disk.
+        // Unprivileged by construction: the Alpine install runs under
+        // `fakeroot`, so this command needs no sudo and is *not* in the
+        // `needs_root` list below.
+        Commands::AlpineAarch64 => aarch64::run_alpine(build_dir, profile),
         Commands::Clean => utils::clean(build_dir),
     }
 }

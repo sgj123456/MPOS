@@ -673,8 +673,13 @@ back — and now runs code at EL0 with an address space of its own, traps into t
 kernel and is answered (§9.1); next is the rest of stage 6, which is the ABI and
 the `AddressSpaceOps` that completes `hal` — not stage 5's drivers, which the
 same measurement puts behind `vfs` and so behind `hal` too)**
-- [ ] 9.1 aarch64 complete boot (stages 3-8 remain) · [ ] 9.2 RISC-V support
-- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.11 landed, 13.2 in progress (§13)**
+- [~] 9.1 aarch64 complete boot — **the machine boots a real Alpine `aarch64` userland to a login prompt**
+      (§13.12): `busybox` init on `/etc/inittab`, `openrc`'s runlevels, `getty`'s `localhost login:` on the
+      PL011, `/proc` and `/sys` mounted, dynamic linking working, and a `cargo xtask alpine-aarch64` verdict
+      that reads it. What remains is named: the virtual consoles (`tty1`..`tty4`) need the `vcmux` port, a
+      relative symlink's resolution answers `ELOOP`, and a handful of x86-only services/one hostname file
+      (§13.12's "named, not fixed") · [~] 9.2 RISC-V support
+- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.12 landed, 13.2 in progress (§13)**
   - [x] 13.1 `hal` is arch-neutral: its 14 `target_arch` gates became capability flags
         (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`)
         declared per target in `.cargo/config.toml`; `src/hal` `target_arch` is now 0, both
@@ -882,6 +887,32 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         clock read the next one along and `st_ctime` (104) read zero. The three clock seconds
         sit at 72/88/104 in *both* ABIs, so they now come out of the per-machine branches and are
         written once
+  - [x] 13.12 aarch64 real Alpine userland: **the second machine boots a genuine Alpine `aarch64`
+        installation to a login prompt**. `xtask/src/aarch64.rs` installs one (`apk --arch aarch64` under
+        `fakeroot`, so the build stays unprivileged *and* the image keeps root ownership - `mke2fs -d` must
+        run under the same `fakeroot` state or it writes a root filesystem owned by the build user, which is
+        what `login` reads `/etc/shadow` with), lays it on the machine's bare ext4, and boots it: `busybox`
+        init reads `/etc/inittab`, `openrc` runs its runlevels, and `getty` prints `localhost login:` on the
+        PL011. The new `cargo xtask alpine-aarch64` is the verdict. It carries **no initramfs** - the disk
+        root is the whole userland, and the kernel's root switch is what puts it in reach, so the handoff
+        learned to boot a disk root without one. The Alpine root's `/init` (the new `rootfs-aarch64/` overlay)
+        does the two things a cross-arch install cannot: it makes busybox's applet farm at first boot (the
+        post-install script is the *target's* binary) and mounts `/proc`, `/sys`, `/tmp`, `/run` and `devpts`.
+        **Three real defects came out of it, each fixed here** (see §13's table for the measurements): `USER_LIMIT`
+        was x86_64's `1<<47` on a machine whose `mmap` cursor starts at `MMAP_BASE = 0xff00_0000_0000`, so every
+        `MAP_FIXED` mapping a dynamic loader makes answered `EINVAL` and the first `dlopen` failed
+        (`librc.so.1: Invalid argument`); `/proc` and `/sys` were behind a module-level `target_arch` gate whose
+        deferral was over; and `boot::set_cmdline` was never called on this machine, so `/proc/cmdline` was
+        empty. Also landed: the console tty's node is the *machine's* serial name (`ttyAMA0` here, `ttyS0` on
+        x86_64 - one node, the name the psABI gives). Measured: `cargo xtask alpine-aarch64` exits 0 on
+        `localhost login:`, x86 gate `pass=151 fail=0`, host 511, `boot-aarch64` green, depgraph 9/9, fmt clean.
+        **Named, not fixed:** the virtual consoles (`tty1`..`tty4`) cannot reach the wire because this machine
+        has no console multiplexer, so exact parity there needs the `vcmux` port; `syslog` cannot start because
+        resolving the *relative* symlink `/usr/lib/libcap.so.2 -> libcap.so.2.78` answers `ELOOP` (its target
+        exists, and `/bin/sh`'s absolute target resolves - the first relative-link resolution anything has
+        exercised on this machine); `hwclock`/`modules` are x86-only services the shared runlevel table still
+        enables here (no `/dev/rtc`, no `/lib/modules`); and the install writes no `/etc/hostname`, so the
+        prompt says `localhost`
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
@@ -5941,11 +5972,24 @@ conf.d  doas.conf  fish  inittab  local.d  network  profile.d  resolv.conf  xdg
 
 Before §13.9 that session was one line long: `sh: debug err Bad address (os error 14)`,
 because the shell's first `read(0)` - into its `BufReader`'s heap buffer, allocated and
-unread - was refused as `EFAULT`, and it exited. What is still x86_64's is the *userland*
-around the shell: no Alpine root, no OpenRC, no getty, no `/proc`/`/sys`, and the small
-in-tree shell rather than busybox `ash`. This machine's `/init` is a program the kernel runs
-because it is in `/bin`, which is the same arrangement the first machine reaches through an
-initramfs script and a distribution.
+unread - was refused as `EFAULT`, and it exited. **The userland around that shell has since
+arrived** (§13.12): the machine installs and boots a real Alpine `aarch64` tree -
+`busybox` init on `/etc/inittab`, `openrc` running its runlevels, a `getty` printing
+`localhost login:` - with `/proc` and `/sys` mounted (the kernel serves both now; the mount
+factory's architecture gate named a deferral that was over), a dynamic loader that works
+(the machine's `USER_LIMIT`, not x86_64's, so a shared library's `MAP_FIXED` segments map),
+and its console tty published under its own serial name, `ttyAMA0`. `cargo xtask
+alpine-aarch64` is the verdict. What is still x86_64's is the *shape* of the console: the
+virtual consoles `tty1`..`tty4` need the `vcmux` port, so parity there is named and not yet
+claimed.
+
+**Named gap now closed on the way:** `USER_LIMIT` was the follow-on §9.1 wrote down here -
+"still x86_64's `1<<47`, aarch64's user span is `paging::USER_END`; taking the limit from the
+machine is a named follow-on" - and it was not conservative, it was wrong: `MMAP_BASE` on this
+machine (`0xff00_0000_0000`) sits **above** `1<<47`, so the first dynamically linked shared
+library any program loaded made `handle_mmap` answer `EINVAL` to its `MAP_FIXED` segments
+(`openrc`'s `librc.so.1: Invalid argument`). `mm::elf::USER_LIMIT` is now the machine's, and
+`syscall` reads that one rather than a private copy.
 
 **Stage 6D (execve) is DONE: `execve` transfers a running aarch64 program to a new
 image at EL0.** The handler's body was already arch-neutral - it reads the path and
@@ -8589,6 +8633,8 @@ and green alone — AGENTS §4 rule 7):
 | 13.10 | aarch64 `struct stat` is 128 bytes and the kernel filled 144: `write_stat`'s length becomes the ABI's own (`STAT_BYTES`, 128 on aarch64 and 144 on x86_64) for the bounds check and the zero-fill as well as for the field writes, so a caller's — or a libc's — 128-byte struct is not written past | `t-stat-buffer` hands the kernel a guarded `struct stat` through `SYS_fstat`/`SYS_newfstatat` and reports the canaries intact on **both** machines (against the old length it reports "2 guard words written"); `t-rmtree` removes a flat and a nested non-empty tree with `std::fs::remove_dir_all` (against the old length it dies at `pc 0`) | **landed** — found by §13.9's named gap, and the fault was not in the tree walk the name suggested: `pc 0` with `lr 0` and `ESR 0x82000006` is a return through a zeroed link register, and musl's `fdopendir` stats the descriptor *before* it reads anything. Whose memory the sixteenth byte past the struct lands on is the interesting part: musl's `stat`/`lstat`/`fstat` never hand the kernel the caller's struct — `__fstatat` makes the syscall into a `struct stat` of its own on the stack and copies the fields out, which is how it stays correct where the two layouts differ — so the extra bytes went into the frame past *musl's* buffer. That is why every program's own `stat` call had survived them, and what finally caught them was code that keeps a return address in the frame beside it: `fdopendir`'s. Measured both ways: with the old length a non-empty `std::fs::remove_dir_all` faults the process at `pc 0` and `t-stat-buffer` reports two guard words written, while the ABI's length passes both and leaves `MPOS_STAT_OK` and the x86_64 gate untouched. The std-side suite had no `stat` test at all, which is why nothing had ever asked the writer how long it was |
 
 | 13.11 | `struct statx` is one 256-byte layout on every machine: `write_statx` moves to Linux's offsets — `stx_atime`/`btime`/`ctime`/`mtime` at 64/80/96/112, `stx_rdev_major`/`minor` at 128/132, and the file's device split into `stx_dev_major`/`minor` at 136/140, which is the number `struct stat` carries packed as `st_dev` — and fills all 256 bytes rather than stopping at `stx_mnt_id` | one file, read through `statx` **and** through the `fstatat` family, must report the same device, inode, mode, size, link count and three clocks: `t-statx-agree` on **both** machines (its clocks set with `utimensat`, so a zero cannot pass for a time), plus the bare-metal `t-statx`, which now compares its clocks against `newfstatat`'s and checks that the whole struct was written | **landed** — the sibling §13.10 named and did not fold in, because 152 bytes into a caller's 256 is an under-write rather than the write-past that fix was about. Measured on the host before anything changed, against a file whose three clocks differ: atime 64, btime 80, ctime 96, mtime 112, rdev 128/132, dev 136/140, mnt_id 144, and every byte past 152 zero — where this kernel wrote its clocks at 96/112/128, its rdev pair at 72 (Linux's `stx_atime.tv_nsec`) and stopped the write at 152. Nothing had read those fields, and why is worth keeping: Rust's `std` does not call `statx` on this libc (its support is glibc-only, so `fs::metadata` is `fstatat`), and `rustix`'s `stat` family only reaches for `statx` on 32-bit targets — so the readers here are the programs that call it explicitly, like uutils' probes and musl's own wrapper. The device pair is information rather than a moved field: `statx` had none, so every file read through it reported `0:0`, which a tool grouping files by device reads as "all one filesystem". The same pin then failed for a second reason, which is the better argument for having written it: **x86_64's `struct stat` had its clocks in the wrong places too** — `st_mtime` at 80 and `st_ctime` at 88, where Linux has `st_atime_nsec` and `st_mtime`, so a program reading the mtime read the ctime and one reading `st_ctime` (104) read zero, which is what the pin said first (`1700000321 vs 0`). Both ABIs put the three `timespec` seconds at 72/88/104 with the nanosecond slots at 80/96/112, so the clocks are no longer inside the per-machine branches at all: they are written once at offsets the two shapes share, and the host `write_stat` test asserts each clock against the `_nsec` slot beside it. That divergence is older than this phase and was invisible for the same reason as the others — nothing read those two fields back, and the host test asserted the wrong offsets as if they were Linux's |
+
+| 13.12 | aarch64's **real Alpine userland**: `xtask` installs a genuine `aarch64` Alpine tree (`apk --arch aarch64` under `fakeroot`) into the machine's bare ext4, the new `rootfs-aarch64/` overlay carries the `/init` that mounts `/proc`, `/sys`, `/tmp`, `/run` and `devpts`, `enable_services` turns the same runlevels on, and `cargo xtask alpine-aarch64` boots it headless and reads the verdict off the PL011 | the boot reaches Alpine's own `getty` prompt (`login:`) — busybox init on `/etc/inittab`, openrc running its runlevels, both at EL0 on this kernel | **landed** — the machine boots a distribution, not a payload: `Welcome to Alpine Linux 3.25.0_alpha…` and `localhost login:` on the wire, `cargo xtask alpine-aarch64` exit 0. `apk --arch aarch64` installs the real tree (measured: `alpine-base`+`openrc`, 27 packages, 13.2 MiB — the host *can* unpack a foreign tree, it just cannot run the packages' post-install scripts, which is why `--no-scripts` and why busybox's applet farm is made at first boot by `rootfs-aarch64/init`). **Three real defects came out of it.** (1) **`USER_LIMIT` was x86_64's `1<<47` on a machine whose user span is `1<<48`** — the follow-on §9.1 had *named* and not taken: `MMAP_BASE` here is `0xff00_0000_0000`, which is **above** `1<<47`, so the `mmap` cursor hands out addresses `handle_mmap` then called kernel territory and answered every `MAP_FIXED` mapping at one with `EINVAL`. That is exactly the mapping a dynamic loader makes for a shared library's segments, so `openrc` died the moment it loaded `librc.so.1`: `Error loading shared library librc.so.1: Invalid argument` — while every *static* binary, whose mappings are never fixed, had run fine, which is why nothing had found it. The bound is now the machine's (`mm::elf::USER_LIMIT`, declared beside `MMAP_BASE` with both values and the reason). (2) **`/proc` and `/sys` were behind a module-level `target_arch` gate** (`vfs/mod.rs`) whose deferral was over — a real init mounts and reads both, and `mount -t proc` answered `ENODEV`; un-gating them cost **9** errors, all of them the two leaves that genuinely are x86_64's, now behind `mpos_pci_config` and `mpos_input_registry` capability flags (with `net::collect_net_sockets` moving to the same "both machines" condition its `procfs` caller now has). (3) **`boot::set_cmdline` was never called on this machine** — `/proc/cmdline` was empty, where a userspace init reads `root=`; and the handoff's console *injection* (the `echo-test` line its read/echo pin needs) was unconditional, which a real getty would read as a username. The command line is now recorded, and the injection is gated on a `mpos.selftest` word the test boots carry and the Alpine boot does not. Also: the console tty's node is the **machine's** serial name (`ttyAMA0` here, `ttyS0` on x86_64 — one node either way, named the way the psABI names the port; `/dev/ttyS0` on a machine whose serial port is a PL011 was the wrong spelling). And the Alpine boot carries **no initramfs** at all — the disk root is the whole userland — so the handoff learned that a missing archive is a disk-root boot (it had halted: "nothing to hand off to") while still refusing a machine with no root. Two build facts, both measured: `fakeroot` must wrap **`mkfs.ext4` as well as `apk`** (`mke2fs -d` stats each file, so an unwrapped `mkfs` writes a root filesystem owned by the build uid — the first image's `/etc/shadow` was `mp mp`, and a login that cannot read its own password file is what that becomes), and a stale `qemu-system-aarch64` holds a **write lock** on the raw images (the aarch64 wiring did not pass the `file.locking=off` the x86_64 one does, so an interrupted run made the *next* boot die at once with an empty serial log — a machine that never started, read as a machine that hung). Measured final: `cargo xtask alpine-aarch64` exit 0 on `localhost login:`; x86 gate `pass=151 fail=0 (151 built)` exit 0; aarch64 sweep `pass=21 fail=0` exit 0; `boot-aarch64` green through `INIT_EXITED`; host 511; depgraph 9/9 within ratchet; fmt clean; clippy 0 errors on `x86_64-unknown-none`/`aarch64-unknown-none`/`mpos-xtask`/the aarch64 loader. **Named, not fixed:** `tty1`..`tty4` cannot reach the wire — this machine has no console multiplexer, so the x86_64 `/etc/inittab`'s virtual-console gettys start and print nowhere, and exact parity there is the `vcmux` port (`vfs/vcmux.rs` names `drivers::{video::render,drm}`, so it waits on a display path too); `syslog` cannot start because resolving the **relative** symlink `/usr/lib/libcap.so.2 -> libcap.so.2.78` answers `ELOOP` (`open` of the link, whose target exists — `/bin/sh`'s *absolute* target resolves, and this is the first relative-link *resolution* anything has exercised: `vfs::ext4`'s host tests read relative links back with `readlink` but never walk them); `hwclock` and `modules` are x86-only services the shared `SERVICES` table still enables here (no `/dev/rtc` on this machine, no `/lib/modules`); the install writes no `/etc/hostname` from `rootfs-aarch64.toml`, so the prompt says `localhost`; and the machine's `net` is up but its `/proc/net` rows are the same table the first machine's is |
 
 **What the remaining 122 are, and why the count stops being the metric** (a
 `target_arch`-line count of `src/` outside `src/arch/`, measured 2026-10-04 after §13.1

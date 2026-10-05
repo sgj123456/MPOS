@@ -740,7 +740,11 @@ fn announce_block(name: &str) {
 /// invented name is an event it cannot place.
 fn subsystem_of(name: &str) -> &'static str {
     match name {
-        "tty" | "console" | "ttyS0" => "tty",
+        // Both serial names, because this table is asked by *name* about a node
+        // that is the console tty on whichever machine published it: `ttyS0` is
+        // x86_64's spelling of the first serial port and `ttyAMA0` aarch64's, and
+        // `drivers::devices::standard_devfs` registers exactly one of them.
+        "tty" | "console" | "ttyS0" | "ttyAMA0" => "tty",
         "null" | "zero" | "random" | "urandom" => "mem",
         _ => "misc",
     }

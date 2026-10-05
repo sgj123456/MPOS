@@ -178,4 +178,6 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(mpos_dynamic_mmio_window)",
     "cfg(mpos_net)",
     "cfg(mpos_console_input)",
+    "cfg(mpos_pci_config)",
+    "cfg(mpos_input_registry)",
 ] }

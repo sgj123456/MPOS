@@ -965,7 +965,13 @@ const SERVICES: &[(&str, &[&str])] = &[
 /// packages the image carries is the config's decision, and a runlevel entry
 /// pointing at a script that is not there would be an OpenRC complaint on
 /// every boot.
-fn enable_services(mount_dir: &Path) -> Result<()> {
+///
+/// `pub(crate)` because the aarch64 image's install (`aarch64::install_alpine_root`)
+/// turns the same runlevels on: the second machine boots the same Alpine
+/// userland, so which services start is one decision and not two. A service
+/// whose script is not installed is named and skipped there too, which is what
+/// lets the two machines share one list while carrying different packages.
+pub(crate) fn enable_services(mount_dir: &Path) -> Result<()> {
     let mut enabled = 0usize;
     for (runlevel, services) in SERVICES {
         let dir = mount_dir.join("etc/runlevels").join(runlevel);

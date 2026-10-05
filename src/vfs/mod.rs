@@ -38,16 +38,26 @@ pub mod mount;
 pub mod p9;
 pub mod path;
 pub mod pipe;
-/// `/proc`: reads `crate::net`'s socket table and `crate::drivers::pci` config.
-/// Built by the gated `syscall`/`drivers`, never by core vfs. Deferred with them.
-#[cfg(target_arch = "x86_64")]
+/// `/proc`: the process tree, `/proc/net`'s socket table (built from
+/// `crate::net`, which both machines have) and `/proc/bus/pci`.
+///
+/// Built on both machines since `/proc` became something the second machine
+/// needs: a real init reads it (`openrc` mounts and reads it on every boot), and
+/// nothing in the filesystem's own logic is x86_64's. The parts that *are*
+/// machine-specific sit behind capability flags rather than an architecture
+/// gate - the PCI config-space read/write pair behind `mpos_pci_config`, since a
+/// machine may truthfully have no PCI bus - so a machine without one builds the
+/// tree from the neutral `crate::pci` model (empty on aarch64) and never reaches
+/// the absent method.
 pub mod procfs;
 pub mod pty;
 pub mod ramfs;
 pub mod signalfd;
-/// `/sys`: reads `crate::drivers::pci` and the virtio input registry. Same
-/// deferral as `procfs` - a driver-integration surface, not a filesystem fact.
-#[cfg(target_arch = "x86_64")]
+/// `/sys`: the device tree `udev` and every `/sys/class` reader walk. Same
+/// machine arrangement as `procfs`: the class directories are shared, and the
+/// leaves that are x86_64's - the PCI config pair and the evdev registry
+/// `/sys/class/input` enumerates - sit behind `mpos_pci_config` and
+/// `mpos_input_registry`.
 pub mod sysfs;
 pub mod tar;
 pub mod termios;

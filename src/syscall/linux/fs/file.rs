@@ -1864,10 +1864,14 @@ fn mount_new(
                 Err(_) => return err::EINVAL,
             }
         }
-        // The kernel's own trees, by name.
-        #[cfg(not(target_arch = "aarch64"))]
+        // The kernel's own trees, by name. Both machines have these now: a real
+        // init mounts `/proc` and `/sys` on either one (Alpine's openrc does it
+        // on every boot), and the filesystems themselves build for both, with
+        // their machine-specific leaves behind capability flags. The gate that
+        // used to be here named the architecture for a *deferral*, and the
+        // deferral is over - an arm that answered `ENODEV` for a filesystem the
+        // kernel has is the "wrong shape" answer these are supposed to avoid.
         "proc" => crate::vfs::procfs::ProcFs::new(),
-        #[cfg(not(target_arch = "aarch64"))]
         "sysfs" => crate::vfs::sysfs::SysFs::new(),
         // A host share, served over 9p: the *source* is the mount tag the
         // host exported the share under - `mount -t 9p hostshare /mnt`

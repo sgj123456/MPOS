@@ -42,6 +42,21 @@ rustflags = [
     "--cfg", "mpos_framebuffer_console",
     "--cfg", "mpos_dynamic_mmio_window",
     "--cfg", "mpos_net",
+    # Two more of the same kind, declared here because the machine is where the
+    # difference lives. `mpos_pci_config` is "this machine has a PCI bus whose
+    # configuration space can be read and written" - the `/proc/bus/pci` and
+    # `/sys/bus/pci` config nodes' read/write halves, which go through port I/O
+    # here and have no aarch64 counterpart (a `virt` machine has no PCI on the
+    # MMIO path this port drives). The *tree* is built from the machine-neutral
+    # `crate::pci` model on both machines; on a machine without the capability
+    # the enumeration is empty, so no such node is built and the absent method is
+    # unreachable rather than faked. `mpos_input_registry` is "this machine
+    # publishes an evdev registry that `/sys/class/input` can enumerate" - this
+    # machine's virtio-PCI input driver's, whose nodes `udev` and `libinput` read
+    # to classify a keyboard. aarch64 opens a virtio-input over MMIO but keeps no
+    # such registry, so its class directory is honestly empty.
+    "--cfg", "mpos_pci_config",
+    "--cfg", "mpos_input_registry",
 ]
 
 # The aarch64 kernel, built the way the x86_64 one is and for the same reason:

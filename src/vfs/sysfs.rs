@@ -179,14 +179,14 @@ impl Inode for SysConfig {
         }
     }
 
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", mpos_pci_config))]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         Ok(crate::drivers::pci::config_read(
             self.bus, self.dev, self.func, offset, buf,
         ))
     }
 
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", mpos_pci_config))]
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
         Ok(crate::drivers::pci::config_write(
             self.bus, self.dev, self.func, offset, buf,
@@ -426,7 +426,7 @@ impl SysFs {
         // where they really live.
         let mut devnodes: Vec<(&'static str, String, u32, u32)> = Vec::new();
         next = build_block(&numbering, &block, &block_root, next, &mut devnodes);
-        #[cfg(target_os = "none")]
+        #[cfg(all(target_os = "none", mpos_input_registry))]
         {
             next = build_input(&class, &virtual_root, next, &mut devnodes);
         }
@@ -563,7 +563,7 @@ fn build_block(
     next
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", mpos_input_registry))]
 fn build_input(
     class: &Arc<SysDir>,
     virtual_root: &Arc<SysDir>,

@@ -203,18 +203,29 @@ pub fn standard_devfs() -> Arc<DevFs> {
     let dev = DevFs::new();
     // The console names are doors into the console tty: a getty's `TIOCSCTTY`,
     // a shell's `TCGETS` and every `isatty` ask the node itself, and a bare
-    // character-device wrapper cannot answer any of them. `ttyS0` is the
-    // serial port's name - the kernel log's wire, and the kernel's own
-    // standard descriptors. `console` stays a bare device - writes go out,
-    // nothing comes back. `tty` is the odd one: not a device at all but the
-    // opening process's controlling terminal, which is what the name has
-    // meant since Unix had job control. Every open of it resolves through the
-    // caller's own `TIOCSCTTY` binding, and a process that has acquired none
-    // is refused with `ENXIO` rather than handed someone else's terminal -
-    // which is what keeps a shell's job-control probe honest about whether it
-    // is in the foreground.
+    // character-device wrapper cannot answer any of them. `console` stays a bare
+    // device - writes go out, nothing comes back. `tty` is the odd one: not a
+    // device at all but the opening process's controlling terminal, which is what
+    // the name has meant since Unix had job control. Every open of it resolves
+    // through the caller's own `TIOCSCTTY` binding, and a process that has
+    // acquired none is refused with `ENXIO` rather than handed someone else's
+    // terminal - which is what keeps a shell's job-control probe honest about
+    // whether it is in the foreground.
+    //
+    // The console tty's name is the *machine's*, and the two differ: the psABI
+    // calls the first serial port `ttyS0` on x86_64 and `ttyAMA0` on aarch64 -
+    // the same name `boot::console_list` reads out of a `console=` word. It is
+    // one node either way (the console tty, where the kernel's log goes and which
+    // the kernel's own standard descriptors are), so publishing it under this
+    // machine's name is what lets an `/etc/inittab` name the port Linux names:
+    // a getty on `ttyAMA0` on a machine whose serial port is a PL011, and on
+    // `ttyS0` where it is a 16550. One name, not two - a second spelling for the
+    // same node is the private dialect these devices avoid.
     let tty = crate::vfs::tty::global();
+    #[cfg(target_arch = "x86_64")]
     dev.register_node("ttyS0", tty.clone());
+    #[cfg(target_arch = "aarch64")]
+    dev.register_node("ttyAMA0", tty.clone());
     dev.register_node("tty", Arc::new(crate::vfs::tty::ControllingTty));
     // `/dev/tty0` - "the current VT", the name a seat manager opens to ask
     // the console as a whole about its VT state and switch it. It carries

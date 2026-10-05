@@ -318,6 +318,15 @@ the commit bodies), and each moved its pin in the same commit.
 - **`devfs` birth modes.** Devices are born `0666 root:root`; `devtmpfs` births `0600`
   and lets udev widen it. Needs per-class birth modes and group-name resolution, not a new
   mechanism (`PLAN.md` §3.4).
+- **The console tty is published under the machine's own serial name.** `/dev/ttyS0` on
+  x86_64, `/dev/ttyAMA0` on aarch64 - one node (the console tty, where the kernel log goes
+  and which the kernel's standard descriptors are) under the name the psABI gives that
+  machine's first serial port, which is also the name `console=` spells. `mount -t proc` and
+  `mount -t sysfs` are served on **both** machines (a real init mounts and reads them); the
+  parts that are x86_64's - PCI config-space read/write, the evdev registry `/sys/class/input`
+  enumerates - sit behind the `mpos_pci_config`/`mpos_input_registry` capability flags, so a
+  machine without one builds the tree from the neutral model (empty on aarch64) instead of
+  refusing the filesystem.
 - **The `DRM_VIRTGPU_*` family (`0x41..=0x4b`) is served, 2D and 3D both.** All eleven
   requests are dispatched, and each answers per card shape, as Linux's does
   (`user/staging/virtgpu-probe/` is the no-3D measurement; the GL card's own answers -

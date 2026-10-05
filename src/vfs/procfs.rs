@@ -1399,14 +1399,14 @@ impl Inode for ProcConfig {
         }
     }
 
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", mpos_pci_config))]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         Ok(crate::drivers::pci::config_read(
             self.bus, self.dev, self.func, offset, buf,
         ))
     }
 
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", mpos_pci_config))]
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
         Ok(crate::drivers::pci::config_write(
             self.bus, self.dev, self.func, offset, buf,

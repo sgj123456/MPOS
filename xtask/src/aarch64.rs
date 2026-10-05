@@ -43,18 +43,59 @@ const LOADER_TARGET: &str = "aarch64-unknown-uefi";
 /// The command line the loader copies into the handoff record, and the kernel
 /// prints back.
 ///
-/// Nothing parses it at this stage - `boot::console_list` is shared and has no
-/// aarch64 caller yet - and it is here for two reasons that are worth the file:
-/// the loader reads three files off the volume, and a record whose command line
-/// came back empty would not tell a reader whether the file was missing or the
-/// read was broken. `ttyAMA0` is what this machine's console is called
-/// everywhere else, so the day something does parse it, the name is already
-/// right.
-const CMDLINE: &str = "console=ttyAMA0\n";
+/// Two readers now, and both are real. The kernel records it for
+/// `/proc/cmdline` (an init reads `root=` through that file), and the handoff
+/// reads `mpos.selftest` back out of it to decide whether this boot is a test -
+/// the word that lets it inject the console line its read/echo pin needs, and
+/// the word a real userland boot must not carry (see [`ALPINE_CMDLINE`]).
+/// `ttyAMA0` is what this machine's console is called everywhere else, and the
+/// day the shared `boot::console_list` is parsed here, the name is already right.
+const CMDLINE: &str = "console=ttyAMA0 mpos.selftest\n";
+
+/// The command line the *Alpine* boot carries: the wire, and nothing else.
+///
+/// The difference from [`CMDLINE`] is the whole of it. `mpos.selftest` is what
+/// the kernel's aarch64 handoff reads to decide whether it may inject a line of
+/// console input before starting `/init` - an instrument the verdict and sweep
+/// boots need and a real userland must never see. An Alpine boot's getty reads
+/// the same tty; a boot that injected `echo-test` there would hand it to the
+/// login prompt as a username. So this boot keeps the console untouched, and the
+/// only word on the line is the one the kernel needs to know where its log goes.
+const ALPINE_CMDLINE: &str = "console=ttyAMA0\n";
+
+/// The file every aarch64 disk root carries, and the bytes it carries.
+///
+/// The kernel's `check_fs` mounts the root's ext4 over the MMIO virtio-blk device
+/// and reads *this* file, comparing what it got against these bytes. The name and
+/// the content are the two halves of that contract (the kernel side spells the
+/// same string in `arch::aarch64::check_fs`), and the point of checking content
+/// rather than existence is that a filesystem which merely *mounts* cannot pass.
+/// Both roots carry it - the test staging writes it directly, and the Alpine
+/// install writes it beside the tree - so the check is the same check on every
+/// aarch64 boot.
+const PROBE_FILE: &str = "hello";
+const PROBE_BYTES: &[u8] = b"mpos reads from ext4 over virtio-MMIO\n";
 
 /// How long the boot is given before it is called stuck. Generous: AAVMF's own
 /// startup is most of it, and the kernel's checks are milliseconds.
 const DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long the Alpine boot is given before it is called stuck. Much longer than
+/// [`DEADLINE`], and for a reason the boot itself explains: this one runs a real
+/// userland - busybox init forks openrc, whose `sysinit`/`boot`/`default`
+/// runlevels start a dozen services - where the marker boot's checks are
+/// milliseconds. Measured on an unwarmed TCG machine, the prompt is well inside
+/// this; the slack is so that a *slow* boot is not reported as a stuck one.
+const ALPINE_DEADLINE: Duration = Duration::from_secs(240);
+
+/// What ends the Alpine boot's log read: a login prompt, or a stop that says the
+/// machine will not reach one.
+///
+/// Unlike [`TERMINATORS`] this list is not the machine's marker chain - this boot
+/// prints no `M*_OK` for it to key on (those are the kernel's own checks, run
+/// before the handoff on every aarch64 boot) - but the *userland's* own words:
+/// `login:` from getty, and the kernel's two stops.
+const ALPINE_TERMINATORS: [&str; 3] = ["login:", "KERNEL PANIC", "EXCEPTION:"];
 
 /// The ext4 image `build_esp` lays the aarch64 disk from. `boot-aarch64`'s
 /// payload is three small images plus the `rootfs/` tree; the test sweep also
@@ -68,6 +109,13 @@ const SWEEP_DISK_BYTES: u64 = 64 * 1024 * 1024;
 /// `boot-aarch64`'s, because the two boots carry different payloads and a size
 /// that fits one is not evidence about the other.
 const INTERACTIVE_DISK_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The Alpine root image's size. A cross-arch `alpine-base` + `openrc` tree is
+/// ~15 MiB on disk (measured), and `mkfs.ext4 -d` lays a filesystem whose used
+/// blocks are the tree's; the slack is for the `/var` a running openrc writes as
+/// it boots and for the log files a session will grow. It is the one disk here
+/// whose size is a *userland's* choice rather than a payload's.
+const ALPINE_DISK_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Lines that mean the machine has finished saying something. The poll below
 /// stops on the first of them, which is what keeps a run from waiting out the
@@ -237,10 +285,11 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
             ("musl", musl.as_slice()),
         ],
         DISK_BYTES,
+        None,
     )?;
     println!("esp:    {}", esp.display());
 
-    let log = boot(build_dir, &esp, &TERMINATORS)?;
+    let log = boot(build_dir, &esp, &TERMINATORS, DEADLINE)?;
     print!("{log}");
 
     // Every marker the kernel prints, in the order it prints them:
@@ -657,10 +706,17 @@ pub fn run_sweep(build_dir: &Path, profile: &str) -> Result<()> {
     for (name, bytes) in &tests {
         entries.push((name.as_str(), bytes.as_slice()));
     }
-    let esp = build_esp(build_dir, &kernel, &loader, &entries, SWEEP_DISK_BYTES)?;
+    let esp = build_esp(
+        build_dir,
+        &kernel,
+        &loader,
+        &entries,
+        SWEEP_DISK_BYTES,
+        None,
+    )?;
     println!("esp:    {}", esp.display());
 
-    let log = boot(build_dir, &esp, &["=== END"])?;
+    let log = boot(build_dir, &esp, &["=== END"], DEADLINE)?;
     print!("{log}");
     let staged: Vec<&str> = tests.iter().map(|(name, _)| name.as_str()).collect();
     report_sweep(build_dir, &staged, skipped.len(), &log)
@@ -828,7 +884,156 @@ fn report_sweep(build_dir: &Path, staged: &[&str], left_out: usize, log: &str) -
     Ok(())
 }
 
-/// Build the kernel and its loader for this machine.
+/// Install the second machine's real Alpine userland into a staging tree and
+/// return it.
+///
+/// This is the one place the two machines' *userlands* differ, and the reason is
+/// a fact about each machine rather than a taste: x86_64 boots a desktop
+/// (`rootfs.toml`: weston, mesa, DRM, seatd), while this machine has no GPU, no
+/// DRM and no PCI bus to hang the card on, so its Alpine tree is the smallest one
+/// that boots to a login prompt - `alpine-base` and `openrc`, the packages
+/// `rootfs-aarch64.toml` names. What is *not* duplicated is the install: the
+/// repositories text, the keys, the mirror and the apk lookup are the x86_64
+/// path's own helpers (`utils::repositories_text`, `utils::install_apk_keys`,
+/// `utils::find_apk_tool`), and only the tree they are pointed at differs.
+///
+/// Two choices are load-bearing and both are measured:
+///
+///   * **`fakeroot`, not `--usermode`.** A cross-arch `apk` cannot run the
+///     packages' post-install scripts - they are the *target's* binaries and the
+///     host cannot exec them (`execve: Exec format error`, measured) - so
+///     `--no-scripts` is required, and the applet farm such a script would build
+///     is made at first boot instead (see `rootfs-aarch64/init`). But `--usermode`
+///     writes every file owned by whoever ran the build, and `/etc/shadow` mode
+///     0600 owned by a uid that is not root is a login that cannot read its own
+///     password file. `fakeroot` gives the tree root ownership without taking
+///     root, so this command - like `boot-aarch64` and the sweep - stays
+///     unprivileged.
+///   * **the overlay is `rootfs-aarch64/`, not `rootfs/`.** The two machines'
+///     overlays differ where the machines do: this one carries the `/init` that
+///     mounts the pseudo-filesystems a real init expects. The x86_64 side does
+///     that from its initramfs script; this machine pivots in the *kernel*, so its
+///     disk `/init` is where that work lives.
+fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
+    let root = utils::project_root()?;
+    let config = crate::config::RootfsConfig::load(&root.join("rootfs-aarch64.toml"))?;
+    let staging = build_dir.join("aarch64-alpine-root");
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging)
+        .with_context(|| format!("Failed to create {}", staging.display()))?;
+
+    // Repositories and keys first, the way `install_base` does it: apk decides a
+    // repository index is trusted by finding a key whose filename matches the
+    // name in the index's signature, and without them every package answers
+    // `UNTRUSTED signature` and then `no such package`.
+    fs::create_dir_all(staging.join("etc/apk/keys"))?;
+    fs::write(
+        staging.join("etc/apk/repositories"),
+        utils::repositories_text(&config.mirror, &config.branch, &config.repos),
+    )?;
+    utils::install_apk_keys(&staging.join("etc/apk/keys"))?;
+
+    let apk = utils::find_apk_tool(build_dir, &config.mirror, &config.branch)?;
+    let mut packages = config.base_packages.clone();
+    packages.extend(config.extra_packages.iter().cloned());
+    utils::run_status(
+        Command::new("fakeroot")
+            .arg("--")
+            .arg(&apk)
+            .args(["--no-progress", "add"])
+            .arg("--root")
+            .arg(&staging)
+            .args([
+                "--arch",
+                config.arch.as_str(),
+                "--update-cache",
+                "--initdb",
+                "--no-scripts",
+            ])
+            .args(&packages),
+        "apk install the aarch64 Alpine userland",
+    )?;
+
+    copy_tree(&root.join("rootfs-aarch64"), &staging)?;
+    // The runlevels, from the same table the x86_64 image uses: a service whose
+    // script this machine's package set does not carry is named and skipped, so
+    // one list serves both machines. Without this the boot would hand pid 1 to a
+    // busybox init whose `::sysinit:/sbin/openrc sysinit` lines run against empty
+    // runlevel directories - an Alpine userland that starts no service at all.
+    crate::rootfs::enable_services(&staging)?;
+    // The probe file the kernel's `check_fs` reads (see [`PROBE_FILE`]). It sits
+    // at the root of a real Alpine tree because the check is about the *block
+    // driver and the filesystem*, which the machine must prove on whichever root
+    // it boots - and the proof is the file's known bytes, not a name it happens to
+    // have. Written here rather than in `rootfs-aarch64/` so the two roots' copies
+    // come from one constant and cannot drift.
+    fs::write(staging.join(PROBE_FILE), PROBE_BYTES)
+        .with_context(|| format!("Failed to lay the probe file on {}", staging.display()))?;
+    println!(
+        "alpine: {} packages installed into {} for {}",
+        packages.len(),
+        staging.display(),
+        config.arch
+    );
+    Ok(staging)
+}
+
+/// The Alpine root image's ESP: the loader, the kernel, an *empty* initramfs and
+/// the real Alpine tree on the disk.
+///
+/// The initramfs is empty on purpose. The kernel unpacks it into the ramfs it
+/// boots on and then switches `/` onto the disk, so the archive's only job here
+/// is to exist - the machine's init is the disk's own `/init`, which is what the
+/// root switch is for. The `entries` a test boot fills it with are the payload
+/// those boots have and this one does not.
+fn build_alpine_esp(build_dir: &Path, kernel: &Path, loader: &Path) -> Result<PathBuf> {
+    let alpine_root = install_alpine_root(build_dir)?;
+    build_esp(
+        build_dir,
+        kernel,
+        loader,
+        &[],
+        ALPINE_DISK_BYTES,
+        Some(&alpine_root),
+    )
+}
+
+/// Boot the second machine into its real Alpine userland: busybox init reading
+/// `/etc/inittab`, openrc's runlevels, and a getty on a virtual console.
+///
+/// This is the boot the machine was being built for. It is headless and bounded -
+/// the PL011 goes to a log file and the run ends when the log shows the login
+/// prompt or a panic, or when the deadline passes - because the point of this
+/// command is the *verdict*: how far a real, unmodified aarch64 Alpine tree gets
+/// on this kernel. The interactive session a person types at is `run --arch
+/// aarch64` once this boot is green.
+pub fn run_alpine(build_dir: &Path, profile: &str) -> Result<()> {
+    let (kernel, loader) = build(profile)?;
+    println!("kernel: {} ({:.1} KB)", kernel.display(), kib(&kernel)?);
+    println!("loader: {} ({:.1} KB)", loader.display(), kib(&loader)?);
+    let esp = build_alpine_esp(build_dir, &kernel, &loader)?;
+    println!("esp:    {}", esp.display());
+
+    let log = boot(build_dir, &esp, &ALPINE_TERMINATORS, ALPINE_DEADLINE)?;
+    print!("{log}");
+
+    // The verdict. `login:` is what busybox `getty` has printed once it has run
+    // `login(1)` on a console - the whole chain of this kernel serving a real
+    // Alpine userland, in one word. Its absence is not a failure to *report* but a
+    // result to *read*: the log above says how far the machine got, and naming
+    // that is the point of the command. So a run that does not reach the prompt
+    // returns the log and an honest non-zero, never a fabricated success.
+    if log.contains("login:") {
+        println!("alpine: the aarch64 machine reached a login prompt");
+        return Ok(());
+    }
+    bail!(
+        "the aarch64 Alpine boot did not reach a login prompt within {ALPINE_DEADLINE:?}; \
+         the serial log above says how far it got"
+    )
+}
+
+/// Boot the kernel and its loader for this machine.
 fn build(profile: &str) -> Result<(PathBuf, PathBuf)> {
     let root = utils::project_root()?;
     let release = profile == "release";
@@ -892,6 +1097,7 @@ fn build_esp(
     loader: &Path,
     entries: &[(&str, &[u8])],
     disk_bytes: u64,
+    alpine_root: Option<&Path>,
 ) -> Result<PathBuf> {
     let esp = esp_dir(build_dir);
     if esp.exists() {
@@ -904,7 +1110,16 @@ fn build_esp(
         .with_context(|| format!("Failed to install {}", loader.display()))?;
     fs::copy(kernel, esp.join("mpos.elf"))
         .with_context(|| format!("Failed to install {}", kernel.display()))?;
-    fs::write(esp.join("mpos.cmdline"), CMDLINE)?;
+    // The command line the kernel records and reads back. A boot that carries an
+    // Alpine root is not a test and says so by *leaving the word off* - see
+    // `ALPINE_CMDLINE` for why that one word is the difference between a console
+    // an init may use and one a test has written to.
+    let cmdline = if alpine_root.is_some() {
+        ALPINE_CMDLINE
+    } else {
+        CMDLINE
+    };
+    fs::write(esp.join("mpos.cmdline"), cmdline)?;
 
     // The third file is a real aarch64 initramfs - which programs it holds is the
     // caller's choice, passed as `entries` (the headless verdict packs the exec
@@ -915,15 +1130,24 @@ fn build_esp(
     // its address and length in the handoff, so this proves a file crosses the
     // firmware's protocols and lands in the direct map. The kernel unpacks it into
     // a ramfs and runs `/init` (PLAN.md §9.1 stages 6D/6E/7d/7e).
-    let initramfs = build_dir.join("aarch64-initramfs.tar");
-    crate::aarch64_init::write_initramfs_entries(entries, build_dir, &initramfs)?;
-    fs::copy(&initramfs, esp.join("initramfs.tar"))
-        .with_context(|| format!("Failed to install {}", initramfs.display()))?;
-    println!(
-        "initramfs: aarch64 {} -> {}",
-        names_of(entries),
-        initramfs.display()
-    );
+    //
+    // An Alpine boot carries **no** initramfs at all, and that is the honest
+    // shape rather than an omission: the archive exists so a test root has a
+    // userland to run before the disk is reached, while the Alpine root *is* the
+    // userland - its `/init` is on the disk, and the kernel's root switch is what
+    // puts it in reach. The loader passes a null archive for a missing file and
+    // the handoff boots a disk root without one.
+    if alpine_root.is_none() {
+        let initramfs = build_dir.join("aarch64-initramfs.tar");
+        crate::aarch64_init::write_initramfs_entries(entries, build_dir, &initramfs)?;
+        fs::copy(&initramfs, esp.join("initramfs.tar"))
+            .with_context(|| format!("Failed to install {}", initramfs.display()))?;
+        println!(
+            "initramfs: aarch64 {} -> {}",
+            names_of(entries),
+            initramfs.display()
+        );
+    }
 
     // A raw block image, attached below as a virtio-blk **MMIO** transport so
     // `check_blk` can read sector 0 and *verify* it against a known pattern - the
@@ -935,50 +1159,82 @@ fn build_esp(
     fs::write(&blk_img, &pattern)
         .with_context(|| format!("Failed to write {}", blk_img.display()))?;
 
-    // A second block image, an ext4 filesystem carrying one file, built WITHOUT a
-    // mount: `mkfs.ext4 -d <dir>` lays the filesystem down from a directory at
-    // create time, so `boot-aarch64` still runs unprivileged (e2fsprogs is now a
-    // prereq of this command). The in-tree ext4 driver refuses `has_journal` (no
-    // journal replay lives here) and `metadata_csum` (writes would leave a checksum
-    // it cannot recompute) - the same two features the x86_64 root switches off - so
-    // `check_fs` can mount this over the memory-mapped block and prove the
-    // block-driver -> filesystem path on the second machine (`PLAN.md` §9.1).
-    let staging = build_dir.join("aarch64-ext4-staging");
-    let _ = fs::remove_dir_all(&staging);
-    fs::create_dir_all(&staging)
-        .with_context(|| format!("Failed to create {}", staging.display()))?;
-    fs::write(
-        staging.join("hello"),
-        b"mpos reads from ext4 over virtio-MMIO\n",
-    )?;
-    // The disk carries a *root tree*, not one test file. Two things go in beside
-    // `hello`: the three member images the initramfs also carries (so the disk
-    // has an init to hand pid 1 when the root switch lands), and the in-tree
-    // `rootfs/` overlay - the files `rootfs.toml`'s packages are layered under
-    // (AGENTS.md §5). Copying the tree rather than naming files keeps the image a
-    // function of the repository: the kernel's `check_disk_root` reads
-    // `/mnt/etc/inittab` out of it and reports the length, which this command
-    // checks against the file in the tree.
-    for &(name, bytes) in entries {
-        stage_program(&staging, name, bytes)?;
-    }
-    copy_tree(&crate::utils::project_root()?.join("rootfs"), &staging)?;
+    // A second block image: the machine's root filesystem, which is a bare ext4
+    // attached as a virtio-MMIO block and mounted by the kernel's `check_fs`.
+    //
+    // Two trees become it. The *test* roots are the in-tree payload - `hello`,
+    // the member images the initramfs also carries (so the disk has an init to
+    // hand pid 1 when the root switch lands), and the repository's `rootfs/`
+    // overlay, the files `rootfs.toml`'s packages are layered under (AGENTS.md
+    // §5). The *Alpine* root is a whole tree `apk` installed (see
+    // [`install_alpine_root`]) - the second machine's real userland. Whichever it
+    // is, `mkfs.ext4 -d` lays a filesystem down from the directory without a
+    // mount, so this command needs no privilege to write a root only the guest
+    // will read.
+    let staging;
+    let tree: &Path = match alpine_root {
+        Some(root) => root,
+        None => {
+            staging = build_dir.join("aarch64-ext4-staging");
+            let _ = fs::remove_dir_all(&staging);
+            fs::create_dir_all(&staging)
+                .with_context(|| format!("Failed to create {}", staging.display()))?;
+            fs::write(staging.join(PROBE_FILE), PROBE_BYTES)?;
+            for &(name, bytes) in entries {
+                stage_program(&staging, name, bytes)?;
+            }
+            copy_tree(&crate::utils::project_root()?.join("rootfs"), &staging)?;
+            &staging
+        }
+    };
+    lay_ext4(build_dir, tree, disk_bytes, alpine_root.is_some())?;
+
+    Ok(esp)
+}
+
+/// Lay `tree` onto a bare ext4 image at `build/aarch64-ext4.img`.
+///
+/// The features the in-tree driver cannot honour are switched off at creation,
+/// not left to be discovered at mount: `has_journal` (nothing here replays a
+/// journal, so a crash would leave the filesystem asking for a recovery this
+/// kernel cannot do) and `metadata_csum` (every write would leave a checksum it
+/// cannot recompute) - the same two the x86_64 root turns off.
+///
+/// `fakeroot` is for the Alpine tree, and it is not optional there: `mke2fs -d`
+/// records each file's owner by *stat`ing it, and the tree was installed under
+/// `fakeroot` - so its files are really owned by whoever ran the build and only
+/// *appear* root-owned inside a fakeroot session. Running `mke2fs` outside one
+/// therefore wrote a root filesystem owned by a uid that is not root, which is
+/// wrong in a way that shows up as "login cannot read /etc/shadow": measured,
+/// the first Alpine boot's `/lib/librc.so.1` was `mp mp`. Inside a fakeroot
+/// session every `stat` answers `0:0` (measured), so the image comes out the way
+/// `apk` intended. The test payloads need none of this - their files are the
+/// build's own and nobody reads a permission bit off them.
+fn lay_ext4(build_dir: &Path, tree: &Path, disk_bytes: u64, fakeroot: bool) -> Result<()> {
     let ext4 = build_dir.join("aarch64-ext4.img");
     let file =
         fs::File::create(&ext4).with_context(|| format!("Failed to create {}", ext4.display()))?;
     file.set_len(disk_bytes)?;
     drop(file);
-    utils::run_status(
-        Command::new("mkfs.ext4")
-            .args(["-F", "-q", "-d"])
-            .arg(&staging)
+
+    // The same `mkfs.ext4` either way; under `fakeroot` it is that program's
+    // child rather than this process's, which is the whole of the difference.
+    let mkfs = |cmd: &mut Command| {
+        cmd.args(["-F", "-q", "-d"])
+            .arg(tree)
             .args(["-O", "^has_journal,^metadata_csum"])
             .args(["-b", "4096"])
-            .arg(&ext4),
-        "mkfs.ext4 the aarch64 filesystem image",
-    )?;
-
-    Ok(esp)
+            .arg(&ext4);
+    };
+    let mut cmd = if fakeroot {
+        let mut c = Command::new("fakeroot");
+        c.arg("--").arg("mkfs.ext4");
+        c
+    } else {
+        Command::new("mkfs.ext4")
+    };
+    mkfs(&mut cmd);
+    utils::run_status(&mut cmd, "mkfs.ext4 the aarch64 filesystem image")
 }
 
 /// The ramfs names in `entries`, for the log line (so a reader sees which files
@@ -1100,7 +1356,7 @@ fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str) -> Command {
         .args([
             "-drive",
             &format!(
-                "file={},format=raw,if=none,id=blk0",
+                "file={},format=raw,if=none,id=blk0,file.locking=off",
                 esp.parent().unwrap().join("aarch64-blk.img").display()
             ),
         ])
@@ -1110,10 +1366,18 @@ fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str) -> Command {
         // filesystem mounts over the memory-mapped transport (PLAN.md §9.1's disk
         // root). Two virtio-blk-device instances, so the port picks the right one by
         // content rather than by the slot QEMU happened to give it.
+        //
+        // `file.locking=off` on both raw images, which is what the x86_64 wiring
+        // already asks for and for a measured reason: with the default locking, a
+        // `qemu-system-aarch64` that outlived the command that started it (a boot
+        // killed at its deadline, an interrupted run) holds a write lock on these
+        // files, and the *next* boot dies at once with "Failed to get write lock"
+        // and an empty serial log - a machine that never started, read as a machine
+        // that hung. Nothing else opens these files, so there is no lock to keep.
         .args([
             "-drive",
             &format!(
-                "file={},format=raw,if=none,id=blk1",
+                "file={},format=raw,if=none,id=blk1,file.locking=off",
                 esp.parent().unwrap().join("aarch64-ext4.img").display()
             ),
         ])
@@ -1184,6 +1448,7 @@ pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
         &loader,
         &entries,
         INTERACTIVE_DISK_BYTES,
+        None,
     )?;
     let (code, vars_src) = firmware()?;
     let vars = vars_path(build_dir);
@@ -1216,7 +1481,7 @@ pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
 /// prints a marker the kernel's own handoff produces, while the test sweep's
 /// runner prints the harness protocol's `=== END` instead - the two boots end on
 /// different lines, so which one stops the read is the caller's to say.
-fn boot(build_dir: &Path, esp: &Path, terminators: &[&str]) -> Result<String> {
+fn boot(build_dir: &Path, esp: &Path, terminators: &[&str], deadline: Duration) -> Result<String> {
     let (code, vars_src) = firmware()?;
     let vars = vars_path(build_dir);
     fs::copy(&vars_src, &vars).with_context(|| {
@@ -1231,7 +1496,12 @@ fn boot(build_dir: &Path, esp: &Path, terminators: &[&str]) -> Result<String> {
     let _ = fs::remove_file(&log);
 
     let mut qemu = aarch64_qemu(esp, &code, &vars, &format!("file:{}", log.display()));
-    qemu.stdout(Stdio::null()).stderr(Stdio::piped());
+    // QEMU's own stderr goes to this process's, not to a pipe nobody reads. A
+    // QEMU that refuses to start - a missing firmware, an image it cannot open -
+    // says so there and nowhere else, and the serial log it never wrote is
+    // indistinguishable from a machine that hung; that is exactly the failure
+    // this used to hide.
+    qemu.stdout(Stdio::null()).stderr(Stdio::inherit());
     let mut child = qemu
         .spawn()
         .context("Failed to start qemu-system-aarch64")?;
@@ -1247,8 +1517,8 @@ fn boot(build_dir: &Path, esp: &Path, terminators: &[&str]) -> Result<String> {
             eprintln!("qemu-system-aarch64 exited on its own: {status}");
             break;
         }
-        if started.elapsed() > DEADLINE {
-            eprintln!("qemu-system-aarch64 was still running after {DEADLINE:?}; stopping it");
+        if started.elapsed() > deadline {
+            eprintln!("qemu-system-aarch64 was still running after {deadline:?}; stopping it");
             break;
         }
         sleep(Duration::from_millis(100));

@@ -1,0 +1,50 @@
+# rootfs-aarch64.toml - what the *second* machine's image contains.
+#
+# The twin of `rootfs.toml`, and separate from it for a reason about the two
+# machines rather than about tidiness: the x86_64 tree is a desktop (`weston`,
+# `mesa`, the DRM stack, `seatd`), and this machine has no GPU, no DRM and no
+# PCI bus to hang the card on. Its userland is the smallest one that boots to a
+# login prompt. A package list that is right for one machine is wrong for the
+# other, and one file cannot hold both without a per-architecture split the tiny
+# parser deliberately does not have.
+#
+# The keys are the same vocabulary `rootfs.toml` uses, read by the same
+# `RootfsConfig::load`, so nothing here is a dialect. `image_size`, `esp_size`
+# and the partition geometry `rootfs.toml` names are absent on purpose: this
+# machine's firmware boots from a bare FAT volume and its root is a bare ext4
+# image attached as a virtio-MMIO block, so there is no partition table for a
+# size to describe (`PLAN.md` §13.3's deviation, unchanged).
+
+[rootfs]
+mirror = "https://mirrors.tuna.tsinghua.edu.cn/alpine"
+branch = "edge"
+arch = "aarch64"
+repos = ["main", "community"]
+filesystem = "ext4"
+# The root is the whole disk device, not a partition: this machine has no
+# partition table (see above). Kept for the shape the parser expects.
+root_device = "/dev/vda"
+# The PL011 - the name this machine's console is called everywhere else.
+serial_port = "ttyAMA0"
+
+# The base system: busybox (init, getty, login, `sh` and every applet),
+# `alpine-baselayout` (the directory tree, `/etc/passwd`, `/etc/shadow`,
+# `/etc/inittab`), musl and `apk-tools`. `alpine-base` pulls all of them; the
+# applet names themselves are made at first boot, not installed (a cross-arch
+# `apk` cannot run the post-install that makes them - see `aarch64.rs`).
+base_packages = ["alpine-base", "openrc"]
+
+# On top of the base: the init system's own runlevel scripts are in `openrc`
+# above, and nothing else is needed to reach a login prompt. `e2fsprogs` and
+# `dosfstools` (the x86_64 base) are absent because this machine's userland does
+# not make filesystems - the build does, on the host.
+extra_packages = ["alpine-conf", "busybox-suid"]
+
+# The machine the guest is: its name, its clock and its logins.
+[system]
+hostname = "mpos"
+timezone = "UTC"
+locale = "en_US.UTF-8"
+# Nothing to type at the login prompt, which is what a serial console with no
+# keyboard wants.
+root_password = ""
