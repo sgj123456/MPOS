@@ -63,12 +63,20 @@ pub mod tar;
 pub mod termios;
 pub mod timerfd;
 pub mod tty;
-/// The console multiplexer: the DRM/screen handover a seat manager drives.
-/// Names `crate::drivers::{video::render,drm}` throughout, so it is bare-metal
-/// x86_64's until the aarch64 display driver lands (`PLAN.md` §9.1); `tty`'s
-/// KD/VT ioctl arms that reach it fall to `ENOTTY` on aarch64 (refuse, not fake).
-/// Kept out of the host build as before (it has no non-driver surface to test).
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+/// The console multiplexer: one serial wire, six terminals, and the switch a seat
+/// manager drives between them.
+///
+/// Both machines since `PLAN.md` §13.16. It names no driver: what it needs from
+/// the display - wake the render task, who holds the card, hand the card over - is
+/// asked through `crate::console`'s `display_*` seams, which answer "nothing to do"
+/// on a machine with no framebuffer. Those seven references to
+/// `drivers::{video::render,drm}` were the whole of what kept it x86_64's, and with
+/// them gone the second machine's `/dev/tty1`..`tty6` - which have always existed,
+/// as pty-backed slaves - are terminals a login can reach over the wire.
+///
+/// Kept out of the host build as before (its non-driver half, the handover table,
+/// is the `term` crate's `vtmode` and is host-tested there).
+#[cfg(target_os = "none")]
 pub mod vcmux;
 
 pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write};

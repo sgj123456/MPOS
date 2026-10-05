@@ -679,10 +679,13 @@ same measurement puts behind `vfs` and so behind `hal` too)**
       that reads it - **with its logger running**: `syslog` starts and every service after it logs *through*
       it (§13.14) - and **with no failing service at all**: `/dev/rtc0` exists so `hwclock` sets the system
       clock, and `/lib/modules/<release>` exists so the `modules` service's `modprobe` is answered rather
-      than warned through (§13.15). Every line of the boot's runlevel output is `[ ok ]`; the whole of
-      §13.12's "named, not fixed" list is closed except the virtual consoles (`tty1`..`tty4`), which need
-      the `vcmux` port and a display path · [~] 9.2 RISC-V support
-- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.15 landed, 13.2 in progress (§13)**
+      than warned through (§13.15) - and **with its shape the same as the first machine's**: the virtual
+      consoles (`tty1`..`tty4`) reach the wire through the console multiplexer, which is both machines'
+      since §13.16, so a getty on `tty1` prints to the serial port a login reads. Every line of the boot's
+      runlevel output is `[ ok ]`, and of §13.12's "named, not fixed" list only the two prose-level gaps
+      remain (the install writes no `/etc/hostname`, so the prompt says `localhost`, and the machine's
+      `/proc/net` rows are the same table the first machine's is) · [~] 9.2 RISC-V support
+- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.16 landed, 13.2 in progress (§13)**
   - [x] 13.1 `hal` is arch-neutral: its 14 `target_arch` gates became capability flags
         (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`)
         declared per target in `.cargo/config.toml`; `src/hal` `target_arch` is now 0, both
@@ -910,9 +913,10 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         x86_64 - one node, the name the psABI gives). Measured: `cargo xtask alpine-aarch64` exits 0 on
         `localhost login:`, x86 gate `pass=151 fail=0`, host 511, `boot-aarch64` green, depgraph 9/9, fmt clean.
         **Named, not fixed:** the virtual consoles (`tty1`..`tty4`) cannot reach the wire because this machine
-        has no console multiplexer, so exact parity there needs the `vcmux` port; `hwclock`/`modules` are
-        x86-only services the shared runlevel table still enables here (no `/dev/rtc`, no `/lib/modules`);
-        and the install writes no `/etc/hostname`, so the prompt says `localhost`. (Its third named gap -
+        has no console multiplexer, so exact parity there needs the `vcmux` port - **closed by §13.16**;
+        `hwclock`/`modules` are x86-only services the shared runlevel table still enables here (no
+        `/dev/rtc`, no `/lib/modules`) - **closed by §13.15**; and the install writes no
+        `/etc/hostname`, so the prompt says `localhost`, which still stands. (Its third named gap -
         `syslog` unable to start - was **not** a filesystem fact at all and is fixed by 13.13: the kernel's
         `open(2)` flag numbers were x86_64's, so arm64's `O_LARGEFILE` was read as `O_NOFOLLOW`.)
   - [x] 13.13 `open(2)`'s flag **numbers** are the machine's: arm64's `asm/fcntl.h`
@@ -971,10 +975,13 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         depgraph 9/9, fmt clean, clippy 0 errors
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
-  - [ ] 13.16 the second machine's virtual consoles (`tty1`..`tty4`) need the `vcmux` port -
-        **written and building, not landed: it trips a crash whose cause is a separate bug.**
-        Measured before anything was written: un-gating `vfs::vcmux` costs exactly **7** errors and
-        all seven are `drivers::{video::render,drm}`, so the port is that seam and nothing else.
+  - [x] 13.16 the second machine's virtual consoles (`tty1`..`tty4` - the four the shared
+        `/etc/inittab` starts, of the six `term::vc::VC_COUNT` mints) - the `vcmux` port, and the
+        assembler bug it was blocked on.
+        **The port.** Measured before anything was written: un-gating `vfs::vcmux` costs exactly
+        **7** errors and all seven are `drivers::{video::render,drm}` - seven references in all: four
+        `render::notify` calls, `drm::master_held`, and the `revoke_now`/`grant_and_resent` pair - so
+        the port is that seam and nothing else.
         Written: the display half moved to four `crate::console` seams (`display_notify`,
         `display_master_held`, `display_handover`, `display_card_grabbed`), each with the
         `#[cfg(mpos_framebuffer_console)]` / `#[cfg(not(..))]` pair whose no-machine body is a no-op
@@ -984,22 +991,51 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         `Tty::{vt,kd}_ioctl` un-gated to `target_os = "none"`; `pl011::drain_input` calls
         `vcmux::route_input` instead of the console tty (the 16550's handler's exact shape); and
         `vcmux::init()` goes up before the console interrupt is armed, the order x86_64's boot uses.
-        Both kernels and the loader build; fmt clean. **What blocks it:** with the port in, the
-        aarch64 sweep dies in the stage-2 context check - `EXCEPTION: synchronous`, `EC 0x21` (an
-        instruction abort at the *same* EL), `ELR_EL1 = FAR_EL1 = 0xffffffff80113780`. Disassembly of
-        the target says it holds *code* (`stp x29, x30, [sp, #-128]!`) - and it sits inside the
-        `.rodata` *segment*, which the kernel's W^X plan maps `r--`, so the fetch is refused. That is
-        the whole finding: **the image's executable content is not confined to `[.., __text_end)`**,
-        which is what `mm::vm::kernel_mappings` assumes (this build: `.text` ends `0x1099a4`,
-        `__text_end` `0x10a000`, and the code is at `0x113780`). It is *not* the port's code: the
-        crash is at stage 2, before anything the port added runs - proven by reverting the two
-        runtime wirings (`vcmux::init`, `drain_input`) with no change - so the trigger is the image
-        *size*, and HEAD (whose `.text` ended `0x10a900`) has the same code inside its own `.text`.
-        Next experiment, in order: disassemble the blob at the target to name the function; ask why
-        the linker put a function in the `.rodata` output section (its own `SHF_EXECINSTR` is
-        *clear*, so either an orphan-section placement or a mis-sized `__text_end` - the plan's
-        assumption, not the mapping); and the cheap probe, at HEAD with ~10 KB of padding, to confirm
-        that size alone reproduces it. A WIP stash holds the whole port plus 13.17's fix.
+        Both kernels and the loader build; fmt clean. Pinned by `user/tests/src/bin/t-vt.rs` on both
+        machines: the ioctl words are read out of the shipped headers, the mode and keyboard-mode
+        families are round trips over `/dev/tty1`, the `VT_*` family runs over `/dev/tty0` (a serial
+        tty answers `ENOTTY` to it, which is what the harness hands the program), the switch is
+        driven with `VT_ACTIVATE`/`VT_WAITACTIVE` and *seen* on the wire, and the test leaves the
+        machine on the console it found (`VT_GETSTATE` is printed rather than asserted on - see
+        13.18).
+        **The blocker, and what it actually was.** With the port in, the aarch64 stage-2 context
+        check died at the same address on every run - `EXCEPTION: synchronous`,
+        `ESR_EL1 0x8600000f` (EC 0x21, an instruction abort at the *same* EL),
+        `ELR_EL1 = FAR_EL1 = 0xffffffff80110380`, deterministic over three boots. That address is
+        `KERNEL_VIRT_BASE + mpos_context_round_trip`, and the linker's own map (from
+        `-C link-arg=-Map=`) says why it was not executable: the `global_asm!` block that defines the
+        EL0 test program (`arch/aarch64/mod.rs`) opens `.section .rodata.el0_program, "a"` and never
+        switches back, and every `global_asm!` in a crate is emitted into *one* assembly unit - so
+        the three code blocks in `arch/aarch64/context.rs`, which name no section at all, were
+        assembled into that data section. The map's input section `.rodata.el0_program` is `0x284`
+        bytes and holds `__aarch64_el0_program` and then `mpos_enter_frame`,
+        `mpos_context_round_trip`, `mpos_context_switch` and `mpos_task_trampoline`: the program is
+        `0x28` of them and the routines the other `0x25c`. `.rodata` is mapped read-only (the W^X
+        plan), so the first **call** to one was an instruction abort.
+        So the earlier reading of this crash was right about the bytes and wrong about the cause. The
+        fault address *did* hold a function's prologue (`stp x29, x30, [sp, #-128]!` is
+        `mpos_context_round_trip`'s first instruction) - that is exactly what a call into a
+        non-executable page looks like: the routine itself, not a return address overwritten by a
+        stolen stack (13.17's bug is real and is a different one). And the trigger is not the port's
+        code either: nothing the port adds runs before stage 2, and what decides the placement is
+        which blocks share an assembly unit, which the port perturbed only by changing how much code
+        there is to partition. At HEAD the same writing happened to land in `.text`, which is what
+        made this latent rather than already broken - the search for a "size" threshold was looking
+        for the wrong variable.
+        **Fixed** in `arch/aarch64/{mod,context}.rs` - the data block enters its section with
+        `.pushsection` and leaves it with `.popsection`, so it cannot move anything assembled after
+        it, and every code block names `.section .text.context, "ax"` so its placement cannot depend
+        on emission order at all - and **pinned in `arch/aarch64/linker.ld`**, which now asserts each
+        of the four asm code symbols is inside `__text_start..__text_end`: measured, the assertion
+        fails the *link* against the old sources and names all four, which is where the mistake was
+        made rather than two layers later at boot. Measured after: `boot-aarch64` exit 0
+        (`ABABABABABABAM2_CONTEXT_OK: 13 hand-overs`, chain through `INIT_EXITED`); the aarch64 sweep
+        `pass=25 fail=0` exit 0 with `t-vt` staged and passing (was 24); the x86 gate
+        `pass=155 fail=0 (155 built)` (was 154 - `t-vt` runs on both machines); `alpine-aarch64`
+        exit 0 on `localhost login:`, its getty reporting `Kernel 0.1.0 on aarch64 (/dev/tty1)` and
+        no `[ !! ]`; host 512; xtask 55; depgraph 9/9 within the ratchet (`vfs/mod.rs -> drivers|net`
+        fell to 0, which the ratchet allows); fmt clean; clippy 0 errors on `x86_64-unknown-none`,
+        `aarch64-unknown-none` and the aarch64 loader.
   - [ ] 13.17 found on the way, and a bug in its own right: **the loader offers the kernel its own
         boot stack as allocatable memory.** The record's regions *are* the frame allocator's zones
         (`mm::pframe::init` builds a zone per allocatable region), and `mpos-boot` allocates the boot
@@ -1009,10 +1045,27 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         region; carving it out (the loader splitting the containing region three ways, `Reserved`
         between) makes it `region[4] 0x442c4000..0x44304000 kind Reserved`, and the record's parser
         (`boot::handoff::collect`) now refuses a record that offers the stack by name. **Not landed
-        yet**, for two honest reasons: it does *not* fix 13.16's crash (so it is not that crash's
-        cause), and the record's allocatable total moved 205 MiB -> 181 MiB when the carve went in -
-        a 24 MiB discrepancy the stack's 256 KiB does not explain, unresolved, possibly the
-        firmware's own map varying between runs. Fix and pin are in the same WIP stash.
+        yet**, for one remaining honest reason: the record's allocatable total moved 205 MiB -> 181
+        MiB when the carve went in - a 24 MiB discrepancy the stack's 256 KiB does not explain,
+        unresolved, possibly the firmware's own map varying between runs. It was held back for a
+        second reason that has now dissolved: it did *not* fix 13.16's crash, and 13.16 explains that
+        crash as an assembler section holding code, not a stack - so the carve stands on its own
+        measurement and its own pin. The WIP's comments used to attribute 13.16's instruction abort to
+        an overwritten return address on the boot stack; that is wrong - the fault was the *call*
+        into `mpos_context_round_trip`, whose entry was in `.rodata` - and they are corrected in the
+        stash, whose label now says what is left to settle. One thing remains before it lands: the
+        24 MiB wants explaining before the number is quoted anywhere.
+  - [ ] 13.18 `VT_GETSTATE`'s layout is not Linux's. Linux's `struct vt_stat` is
+        `{ v_active, v_signal, v_state }`; this kernel writes `{ v_mode, v_num, v_state }` - the
+        *video mode* where Linux has the console that is on the screen, and the console number where
+        Linux leaves `v_signal` alone (its use is `SIGIO` delivery, which this kernel does not do);
+        the third short is Linux's, `1 << (console - 1)`. Found while writing `t-vt`, which therefore
+        prints the three shorts and asserts only that the call succeeds - a test that asserted this
+        kernel's answer would be pinning the divergence. `user/abitest/src/bin/integration/t-seat.rs`
+        *does* pin it (`stat_shorts(&st, 0)` is asserted to be the graphics mode after `KDSETMODE`),
+        so a fix moves that test with it. Small, and written down rather than quietly fixed because
+        the shape is published ABI: a seat manager reading `v_active` from a kernel that answers with
+        a mode has a bug with no symptom until something switches consoles.
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
       dispatcher, the aarch64 linker script that does not exist (§11.2 Step A)
 - [x] 11.E leaf crates: the seven pure, downward-only leaves (`err`, `pci`, `date`, `binfmt`,
@@ -6077,9 +6130,9 @@ arrived** (§13.12): the machine installs and boots a real Alpine `aarch64` tree
 factory's architecture gate named a deferral that was over), a dynamic loader that works
 (the machine's `USER_LIMIT`, not x86_64's, so a shared library's `MAP_FIXED` segments map),
 and its console tty published under its own serial name, `ttyAMA0`. `cargo xtask
-alpine-aarch64` is the verdict. What is still x86_64's is the *shape* of the console: the
-virtual consoles `tty1`..`tty4` need the `vcmux` port, so parity there is named and not yet
-claimed.
+alpine-aarch64` is the verdict. What was still x86_64's was the *shape* of the console: the
+virtual consoles `tty1`..`tty4` needed the `vcmux` port, and **§13.16 landed it** - the mux is
+both machines', so a getty on `tty1` prints where a login can read it.
 
 **Named gap now closed on the way:** `USER_LIMIT` was the follow-on §9.1 wrote down here -
 "still x86_64's `1<<47`, aarch64's user span is `paging::USER_END`; taking the limit from the

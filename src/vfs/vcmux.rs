@@ -1,11 +1,20 @@
 //! The console multiplexer: one serial wire, six terminals.
 //!
-//! The machine has one wire to the world - COM1, `ttyS0`, where the kernel's
-//! `tracing` log goes. The shells do not run there; they run on the virtual
-//! consoles `/dev/tty1`..`tty6`, the slave ends of pty pairs. Something has to
-//! stand in between, and this is it: it carries what the active console's
-//! shell prints out to the serial wire, and it carries what is typed on the
-//! serial wire in to that shell. Six terminals, one wire, in turn.
+//! The machine has one wire to the world - `ttyS0` on x86_64, `ttyAMA0` on
+//! aarch64 - where the kernel's log goes. The shells do not run there; they run on
+//! the virtual consoles `/dev/tty1`..`/dev/tty6`, the slave ends of pty pairs.
+//! Something has to stand in between, and this is it: it carries what the active
+//! console's shell prints out to the serial wire, and it carries what is typed on
+//! the serial wire in to that shell. Six terminals, one wire, in turn.
+//!
+//! Both machines and not one, since `PLAN.md` §13.16: what this module needs from
+//! the world is the wire ([`crate::console`], which reaches it through `hal` on
+//! either machine) and the *display* - the render task to wake and the card to
+//! hand over - and the display half is asked for through `crate::console`'s
+//! `display_*` seams, which are no-ops on a machine with no framebuffer. That was
+//! the whole of what kept it off the second machine, and it was never really a
+//! display dependency: a headless boot is a case this module already handles, by
+//! narrating its switches on the wire (`switch_to`).
 //!
 //! # Switching
 //!
@@ -96,7 +105,7 @@ pub fn set_kd_mode(vc: u32, mode: u32) -> bool {
             // Taking the screen back is a change the render task has to notice
             // even though no console was switched: the framebuffer holds
             // whatever the compositor last drew, so the whole grid goes stale.
-            crate::drivers::video::render::notify();
+            crate::console::display_notify();
             true
         }
         None => false,
@@ -237,7 +246,7 @@ pub fn set_vt_mode(vc: u32, mode: VtMode, pid: u32) -> Result<(), Option<vtmode:
         None => Err(None),
         Some(result) => {
             if result.is_ok() {
-                crate::drivers::video::render::notify();
+                crate::console::display_notify();
             }
             result
         }
@@ -446,7 +455,7 @@ fn send_promise(promise: vtmode::Promise) -> bool {
 fn reset_console(vc: u32) {
     if vt_with(|t| t.reset(vc)).unwrap_or(false) {
         set_kd_mode(vc, KD_TEXT);
-        crate::drivers::video::render::notify();
+        crate::console::display_notify();
         wake_waiters();
     }
 }
@@ -465,7 +474,7 @@ fn reset_console(vc: u32) {
 /// (no controlling terminal, which is what a test program has) keeps its input,
 /// because it has no screen to lose either.
 pub fn session_active() -> bool {
-    !crate::drivers::drm::master_held() || master_holds_screen()
+    !crate::console::display_master_held() || master_holds_screen()
 }
 
 /// The console on the screen, once a negotiation has ended by any route: the
@@ -606,7 +615,7 @@ pub fn init() {
     // `tty1` and a host that sees one serial port are only reconcilable if
     // somebody says how.
     crate::console::write_bytes(
-        b"console mux: shells on tty1..tty6 (pty-backed); ^A 1..6 switches; VT_PROCESS promises belong to the process that wrote them; #DF runs on an IST stack\n",
+        b"console mux: shells on tty1..tty6 (pty-backed); ^A 1..6 switches; VT_PROCESS promises belong to the process that wrote them\n",
     );
 }
 
@@ -731,7 +740,7 @@ fn switch(to: u32) {
     // all (headless, or a serial console before any framebuffer) has nothing to
     // wake, and its switch is narrated on the wire below instead.
     if crate::console::grids_live() {
-        crate::drivers::video::render::notify();
+        crate::console::display_notify();
     }
     // The screen has moved, and with it the DRM master's right to drive it. Two
     // directions, each the complement of the other, mirroring Linux where the VT
@@ -744,8 +753,7 @@ fn switch(to: u32) {
     //     its own input - a mouse move - and would otherwise leave the desktop
     //     hidden behind the text that filled the screen while it was away. The
     //     switch back is visible on the frame that switched, not on the next event.
-    crate::drivers::drm::revoke_now();
-    crate::drivers::drm::grant_and_resent();
+    crate::console::display_handover();
     // On the shared serial wire a word in the kernel's own voice tells the eye
     // which console the next bytes belong to. Where a framebuffer is drawing the
     // consoles it is not needed - each console is its own screen, and the switch

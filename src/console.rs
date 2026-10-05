@@ -290,6 +290,97 @@ fn active_grid() -> usize {
     crate::term::vc::active() as usize
 }
 
+// The console multiplexer's three questions about the *display*, answered here
+// rather than in the mux.
+//
+// `vfs::vcmux` owns which virtual console the machine is showing and drives the
+// switch, but the screen itself is this module's - it is the one that paints
+// grids and holds the render task - so the operations that reach the framebuffer
+// belong beside [`paint_grids_if_live`], and the mux asks for them by name. That
+// is what lets the mux compile on a machine with no display at all: on such a
+// machine these are no-ops with the answers that machine would give, and the mux
+// narrates its switches on the wire instead (see `vcmux::switch_to`, which asks
+// [`grids_live`] exactly that question).
+//
+// The capability is `mpos_framebuffer_console` - "this machine's console can
+// paint an image, and a compositor may take it away" - which is one machine's,
+// so the flag names the machine without naming an architecture (`AGENTS.md` §4).
+// The mux's `drivers::*` references were the whole of what kept it off the second
+// machine (`PLAN.md` §13.16).
+
+/// Tell the render task the screen changed and it has to draw again.
+///
+/// Called for a mode change as well as a switch: `KDSETMODE` out of
+/// `KD_GRAPHICS` leaves the scanout holding whatever the compositor last drew,
+/// and nothing else will tell the renderer it may have it back.
+#[cfg(mpos_framebuffer_console)]
+pub fn display_notify() {
+    crate::drivers::video::render::notify();
+}
+
+/// Nothing to tell: no framebuffer means no render task, and [`grids_live`] is
+/// never true on this machine anyway.
+#[cfg(not(mpos_framebuffer_console))]
+pub fn display_notify() {}
+
+/// Whether a session holds the screen - a DRM master owns the card, so the
+/// console on it is not the text screen's to write.
+///
+/// The mux asks this to decide where a keyboard's bytes go: `false` means the
+/// screen has been handed to a compositor and input belongs to it. A machine
+/// with no card answers `false` - nobody holds a screen that does not exist -
+/// which is the answer that keeps input flowing to the text console.
+#[cfg(mpos_framebuffer_console)]
+pub fn display_master_held() -> bool {
+    crate::drivers::drm::master_held()
+}
+
+/// No card, so no master: nothing holds the screen.
+#[cfg(not(mpos_framebuffer_console))]
+pub fn display_master_held() -> bool {
+    false
+}
+
+/// Hand the card over as the visible console changes: stop the outgoing
+/// session's pixels landing and hang up its card fd, then clear that hang-up and
+/// re-present the incoming session's committed framebuffer.
+///
+/// Both directions in one word because they are complements that happen
+/// together, exactly as the mux calls them - mirroring Linux, where the virtual
+/// console switch itself hands the card over and the compositor is not trusted
+/// to notice. The re-presentation matters as much as the revocation: a
+/// compositor re-commits only on its own input, so a switch back would otherwise
+/// leave the desktop hidden behind the text that filled the screen.
+#[cfg(mpos_framebuffer_console)]
+pub fn display_handover() {
+    crate::drivers::drm::revoke_now();
+    crate::drivers::drm::grant_and_resent();
+}
+
+/// Nothing to hand over on a machine with no card.
+#[cfg(not(mpos_framebuffer_console))]
+pub fn display_handover() {}
+
+/// Whether the *calling task* holds the DRM card - the authority `KDSETMODE` and
+/// `KDSKBMODE` are refused without, and a different question from
+/// [`display_master_held`] (that one is "does anyone hold it", this one is "is it
+/// you").
+///
+/// Asked here rather than in the `'K'` ioctl handler for the reason the card edge
+/// is asked above the VFS at all: the tty that answers the rest of that family
+/// must not name a driver. A machine with no card answers `false`, and only
+/// [`crate::sched::current_is_root`] gets past the check there.
+#[cfg(mpos_framebuffer_console)]
+pub fn display_card_grabbed() -> bool {
+    crate::drivers::drm::card_grabbed_by_current()
+}
+
+/// No card to hold.
+#[cfg(not(mpos_framebuffer_console))]
+pub fn display_card_grabbed() -> bool {
+    false
+}
+
 /// How far back the replayed boot log reaches. A screen is 25 rows; a few
 /// kilobytes covers the banner, the memory map and the milestone lines.
 const LOG_CAP: usize = 8 * 1024;

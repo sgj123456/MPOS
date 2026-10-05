@@ -304,8 +304,16 @@ pub fn handle_interrupt() {
     }
 }
 
-/// Every byte the receiver is holding goes to the console's input path, as the
-/// 16550's handler hands its FIFO to the console's mux.
+/// Every byte the receiver is holding goes to the console's input path, exactly
+/// as the 16550's handler hands its FIFO to the console's mux - the same function
+/// over the same kind of wire, so a keystroke means the same thing on both
+/// machines ([`crate::vfs::vcmux::route_input`]).
+///
+/// That function is also what decides *which* terminal a byte belongs to: the
+/// active virtual console once the mux is up, and the console tty itself before
+/// it is. Which is why this is one call and not the tty's own `receive_byte`, and
+/// why the boot's console checks - which run *before* the mux, deliberately - go
+/// on reading bytes from the console tty directly.
 ///
 /// Called from an interrupt, so it neither locks nor prints - the same contract
 /// `drivers::serial::drain` carries, and for the same reason there: an interrupt
@@ -317,7 +325,7 @@ fn drain_input() {
             break;
         }
         let byte = (read(DR) & 0xff) as u8;
-        crate::vfs::tty::global().receive_byte(byte);
+        crate::vfs::vcmux::route_input(byte);
     }
 }
 

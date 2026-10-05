@@ -335,6 +335,25 @@ the commit bodies), and each moved its pin in the same commit.
    field, `RTC_SET_TIME` served, `EINVAL` for a month no calendar carries, `ENOTTY` for
    the alarm half and for the family on another descriptor). Closes `PLAN.md` §13.15.
 
+9. **A virtual console is a terminal on the second machine too.** `/dev/tty1`..`/dev/tty6` have
+   always been minted on both machines - they are the slave ends of the pty pairs the devfs
+   builds - but the console multiplexer that reads their masters was x86_64's, because it
+   named `drivers::{video::render,drm}` itself (four `render::notify` calls, `master_held`, and
+   the `revoke_now`/`grant_and_resent` pair - measured by un-gating the module and counting:
+   exactly 7 errors, all of them that seam). So on aarch64 a getty on `tty1` printed into a pty
+   nobody drained, and the `'V'`/`'K'` families answered `ENOTTY`. The display half now goes
+   through four `crate::console` seams (`display_notify`, `display_master_held`,
+   `display_handover`, `display_card_grabbed`), whose no-framebuffer bodies are the no-op or the
+   answer a machine with no card owes, and the machine's receiver hands its bytes to
+   `vcmux::route_input` - one function over the same kind of wire as the 16550's. Owner:
+   `src/vfs/vcmux.rs`, `src/console.rs`, `src/arch/aarch64/pl011.rs`, `src/main/aarch64.rs`,
+   `src/syscall/linux/fs/ioctl.rs`. Pin: `t-vt` on **both** machines (the ioctl words read out
+   of the shipped headers rather than recalled, the mode families as round trips over
+   `/dev/tty1` with the mode put back, the `VT_*` family over `/dev/tty0` where a serial tty is
+   `ENOTTY`, the switch driven by `VT_ACTIVATE`/`VT_WAITACTIVE` and seen on the wire, and the
+   refusals Linux gives). One divergence the pin names rather than asserts: `VT_GETSTATE`'s
+   layout is not Linux's (`PLAN.md` §13.18). Closes `PLAN.md` §13.16.
+
 ### 5.2 Small, measured, and not yet landed
 
 - **`FIONREAD` on a regular file and on a pipe.** Linux answers `0` and the bytes

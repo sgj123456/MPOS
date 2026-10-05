@@ -57,9 +57,9 @@ use crate::sched::signal::{SIGINT, SIGQUIT, SIGTSTP, SIGWINCH};
 use crate::term::cursor::Cursor;
 use crate::term::vc::VC_COUNT;
 /// The KD/K video+keyboard mode words are named only by `tty`'s `kd_ioctl` /
-/// `vt_ioctl`, which are x86_64-only (they drive `vcmux`, deferred to the aarch64
-/// display driver) - so the imports go with them.
-#[cfg(target_arch = "x86_64")]
+/// `vt_ioctl`, so the imports go with them - which is every machine now that the
+/// console mux is both machines' (`PLAN.md` §13.16).
+#[cfg(target_os = "none")]
 use crate::term::vc::{K_MEDIUMRAW, K_OFF, K_RAW, K_UNICODE, K_XLATE, KD_GRAPHICS, KD_TEXT};
 
 const LF: u8 = b'\n';
@@ -1790,11 +1790,13 @@ impl Tty {
     /// `KDGKBTYPE` serving, byte-for-byte the answers the switchboard gave, and
     /// V-4 will carry it when the console moves out of the VFS into a driver.
     ///
-    /// x86_64's for now: every arm but `KDGKBTYPE` reaches into `vfs::vcmux`,
-    /// which is deferred to the aarch64 display driver (`PLAN.md` §9.1). The only
-    /// caller is the gated console-ioctl dispatch in `syscall`, so aarch64 simply
-    /// has no KD family until that pair lands - a named gap, not a faked success.
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    /// Both machines since `PLAN.md` §13.16. Every arm but `KDGKBTYPE` reaches
+    /// into `vfs::vcmux`, which used to be x86_64's because it named
+    /// `drivers::{video::render,drm}` itself; it now asks `crate::console`'s
+    /// `display_*` seams, so the family is served wherever `target_os` is `none`
+    /// and the only thing a machine with no card changes is the answer to "do you
+    /// hold the screen" - `owns_card`, which is `false` there rather than absent.
+    #[cfg(target_os = "none")]
     pub fn kd_ioctl(
         &self,
         vc: u32,
@@ -1921,10 +1923,10 @@ impl Tty {
     /// switchboard (`ARCHITECTURE.md` V-2, the same move the `'K'` and `'E'`
     /// families took).
     ///
-    /// x86_64's for now: the `VT_*` handover drives `vfs::vcmux`, deferred to the
-    /// aarch64 display driver; its only caller is the gated console-ioctl dispatch,
-    /// so aarch64 has no VT family until that pair lands (a named gap, not a fake).
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    /// Both machines since `PLAN.md` §13.16: the `VT_*` handover drives
+    /// `vfs::vcmux`, which was x86_64's for naming `drivers` directly and now
+    /// reaches the display through `crate::console`'s `display_*` seams.
+    #[cfg(target_os = "none")]
     pub fn vt_ioctl(&self, caller: VtCaller, request: u32, buf: usize, from_user: bool) -> isize {
         use crate::err;
         use crate::uaccess::buffer_ok;

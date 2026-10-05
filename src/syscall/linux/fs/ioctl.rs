@@ -953,9 +953,9 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // (`'K'`-typed KD*) ioctls, which a seat manager drives the line
         // through when it takes a terminal away from the text console and
         // hands it to a compositor.
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_os = "none")]
         request if family_nr(request, b'V').is_some() => vt_ioctl(fd, request, buf, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_os = "none")]
         request if family_nr(request, b'K').is_some() => kd_ioctl(fd, request, buf, from_user),
         // The inode attribute word: `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`,
         // the two requests `lsattr` and `chattr` are made of. The `'f'` family,
@@ -1076,7 +1076,7 @@ fn family_nr(request: u32, magic: u8) -> Option<u32> {
 /// conversation between the session that holds the screen and the one that
 /// wants it, rather than anything holding a `/dev/tty` fd being able to silence
 /// a compositor's `relsig`, or to answer it.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_os = "none")]
 fn vt_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     if (request >> 8) & 0xff != b'V' as u32 {
         return err::ENOTTY;
@@ -1202,7 +1202,7 @@ fn fs_flags_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_os = "none")]
 fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     if (request >> 8) & 0xff != b'K' as u32 {
         return err::ENOTTY;
@@ -1224,11 +1224,13 @@ fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     };
     // Whether the caller holds the DRM card is the one question the console
     // cannot answer for itself: the card driver sits above the VFS and the
-    // console device must not reach up into it, so the syscall layer - which may
-    // name `drivers` - asks it here and hands the answer down. Every other
+    // console device must not reach up into it, so it is asked above the VFS and
+    // the answer handed down - `crate::console`, which is where the framebuffer
+    // edge already lives (it is the module that paints grids and holds the render
+    // task), and which answers `false` on a machine with no card. Every other
     // decision in the `K` family is the console's own to make, in `Tty::kd_ioctl`
-    // - the ioctl-to-device move (V-2), with the DRM edge kept on this side.
-    let owns_card = crate::drivers::drm::card_grabbed_by_current();
+    // - the ioctl-to-device move (V-2), with the display edge kept above the tty.
+    let owns_card = crate::console::display_card_grabbed();
     tty.kd_ioctl(vc, request, buf, from_user, owns_card)
 }
 

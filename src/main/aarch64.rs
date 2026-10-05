@@ -120,6 +120,14 @@ fn init_handoff(initramfs: *const u8, len: usize) -> ! {
     // drains, exactly as the first machine's do - the same `crate::console`
     // code over the same `hal::SerialRing` capability, with this one arming
     // call in front of it.
+    //
+    // The console mux goes up first, and the order is the same one and the same
+    // reason as x86_64's `vcmux::init(); serial::enable_rx()`: from here the
+    // typed bytes belong to the *active virtual console*, not to the console tty,
+    // and the wire is where the consoles' own output goes back out. A receiver
+    // armed before the mux would deliver its first keystroke to a tty whose
+    // session is not the one the machine is showing (`PLAN.md` §13.16).
+    vfs::vcmux::init();
     mpos::arch::enable_console_interrupts();
     check_serial_tx();
 
