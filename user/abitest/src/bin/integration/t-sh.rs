@@ -1,5 +1,6 @@
 //! t-sh - diagnostic: an interactive busybox ash, exec'd straight onto the
-//! console terminal (/dev/ttyS0), with the test as its parent ghost.
+//! console terminal (the machine's own serial node), with the test as its
+//! parent ghost.
 //!
 //! What this pins down is where an interactive shell stops before its first
 //! prompt. The child's standard descriptors are the console tty, so the
@@ -16,7 +17,15 @@ mod lin;
 
 use core::panic::PanicInfo;
 
+// The console node is the machine's psABI name for its first serial port -
+// `ttyS0` on a 16550, `ttyAMA0` on the PL011 - which is exactly what the
+// kernel registers it as (`src/drivers/devices.rs`, one node either way). A
+// hardcoded `/dev/ttyS0` here would open nothing on the second machine, and
+// this program is in no group: the default sweep builds it for both.
+#[cfg(target_arch = "x86_64")]
 static TTY: [u8; 11] = *b"/dev/ttyS0\0";
+#[cfg(target_arch = "aarch64")]
+static TTY: [u8; 13] = *b"/dev/ttyAMA0\0";
 static BUSYBOX: [u8; 13] = *b"/bin/busybox\0";
 static ARGV0: [u8; 8] = *b"busybox\0";
 static ARGV1: [u8; 3] = *b"sh\0";
@@ -78,7 +87,7 @@ fn state_letter(bytes: &[u8]) -> u8 {
 
 #[unsafe(no_mangle)]
 extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
-    lin::puts(b"t-sh: spawning an interactive ash on /dev/ttyS0\n");
+    lin::puts(b"t-sh: spawning an interactive ash on the console tty\n");
     let mut failed = false;
 
     let tty = lin::openat(lin::AT_FDCWD, &TTY, lin::O_RDWR, 0);
