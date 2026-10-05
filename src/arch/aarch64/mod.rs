@@ -2190,8 +2190,17 @@ fn check_paging_ops() {
     }
 
     // The copy-on-write marker is invisible to the CPU's walk and visible to this
-    // one - and marking a page copy-on-write makes it read-only, so the same page
-    // stops being writable to uaccess at the exact moment it becomes a COW page.
+    // one. Marking a page copy-on-write makes it read-only *in the tables*, and
+    // the distinction that matters is that this is not the same thing as taking
+    // the write away from the process: the store is answered by the fault handler,
+    // which splits the page, so uaccess must still call it writable. This check
+    // used to assert the opposite - that a COW page stops being writable - and
+    // that expectation was the bug's other half: it is exactly what made the
+    // second machine's range check refuse a buffer a `fork` child reads into, and
+    // the first machine has always answered the other way (`write_user_u32` and
+    // `user_accessible` in `arch/x86_64/paging.rs`, both of which read
+    // `is_cow_page`). Measured: a shell's `read` in a fork child answered `EFAULT`
+    // on this machine and does not on x86_64 (`PLAN.md` §13.9).
     if paging::is_cow_page(PG_VA_A) {
         fail!("a freshly mapped page reports itself copy-on-write");
     }
@@ -2199,8 +2208,11 @@ fn check_paging_ops() {
     if !paging::is_cow_page(PG_VA_A) {
         fail!("a page marked copy-on-write is not reported as one");
     }
-    if paging::user_accessible(PG_VA_A, PAGE_SIZE, true) {
-        fail!("a copy-on-write (read-only) page is still reported writable");
+    if !paging::user_accessible(PG_VA_A, PAGE_SIZE, true) {
+        fail!(
+            "a copy-on-write page is reported unwritable, but its write is the fault \
+             the handler resolves"
+        );
     }
     space.protect(PG_VA_A, PAGE_SIZE, user);
     if paging::is_cow_page(PG_VA_A) {

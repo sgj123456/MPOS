@@ -9,7 +9,10 @@
 //!   which is how a pipeline is built without the shell ever touching the data;
 //! * `File` standing in for stdout - which is what `>` is;
 //! * `env::set_current_dir` / `current_dir` - the `cd` and `pwd` builtins;
-//! * an exit status that is not success, read the way a shell reads `$?`.
+//! * an exit status that is not success, read the way a shell reads `$?`;
+//! * `/bin/ls`, the command a session is explored with, and `sh` reading its
+//!   commands from a *pipe* rather than from `-c` - the standard-input arm the
+//!   interactive loop is built on.
 //!
 //! Underneath, `std::process::Command` is `posix_spawn`, which musl implements as
 //! `clone(CLONE_VM|CLONE_VFORK)`. Every check below is therefore also a check on
@@ -170,6 +173,125 @@ fn main() {
             failed = true;
         }
     }
+
+    // 7. `/bin/ls`, listed the way a shell session uses it. The *names* are what
+    //    is checked, not the formatting: this program is busybox's `ls` on the
+    //    first machine and this repository's own applet on the second, and the
+    //    one thing both owe a caller is the directory's names, one per line. A
+    //    directory made here rather than a system one also pins that the listing
+    //    is of the path it was given and not of the current directory.
+    let lsdir = "/tmp/stdspawn-ls";
+    let _ = std::fs::remove_dir_all(lsdir);
+    let made = std::fs::create_dir(lsdir)
+        .and_then(|()| std::fs::write(format!("{lsdir}/alpha"), b""))
+        .and_then(|()| std::fs::write(format!("{lsdir}/beta"), b""));
+    match made.and_then(|()| Command::new("/bin/ls").arg(lsdir).output()) {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let names: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect();
+            if names == ["alpha", "beta"] {
+                println!("ok:   /bin/ls listed the directory's names");
+            } else {
+                println!("FAIL: ls {lsdir} listed {names:?}");
+                failed = true;
+            }
+        }
+        Ok(out) => {
+            println!("FAIL: ls exited {}", out.status);
+            failed = true;
+        }
+        Err(e) => {
+            println!("FAIL: ls could not be spawned: {e}");
+            failed = true;
+        }
+    }
+    // The scratch tree is emptied and removed *by hand* rather than with
+    // `std::fs::remove_dir_all`, and that is a named gap rather than tidiness.
+    // The first version of this check cleaned up with `remove_dir_all`, and the
+    // second machine faulted the process at `pc 0` inside the call - reproduced
+    // three times, always with the `ok:` line above as the log's last line and
+    // the marker written immediately before `remove_dir_all` never reached. A
+    // *non-empty* `remove_dir_all` had never run on that machine before, so what
+    // it exercises and the three calls below do not - the recursive
+    // open/`getdents64` chain and the empty-name `unlinkat(fd, "",
+    // AT_REMOVEDIR)` it finishes with - is not served there yet. It is named in
+    // `PLAN.md` §13.9 with this reproduction rather than papered over, and the
+    // hand-rolled equivalent below is what this check uses because its subject
+    // is `ls`, not deleting a tree.
+    if let Ok(entries) = std::fs::read_dir(lsdir) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(lsdir);
+
+    // 8. `sh` reading its commands from standard input rather than from `-c`.
+    //    This is the arm an interactive session is built on - the terminal case
+    //    of the same loop reads a line and runs it - and it is the arm a rewrite
+    //    of the shell is most likely to break, because the reader used to slurp
+    //    standard input to end-of-file. A script arriving on a pipe still has to
+    //    run every command, in order, with no prompt written for a reader that
+    //    is not a terminal.
+    let scripted = Command::new("/bin/sh")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            {
+                use std::io::Write;
+                let stdin = child.stdin.as_mut().expect("piped stdin");
+                stdin.write_all(b"echo stdin-first\necho stdin-second\n")?;
+            }
+            child.wait_with_output()
+        });
+    match scripted {
+        Ok(out) if out.status.success() && out.stdout == b"stdin-first\nstdin-second\n" => {
+            println!("ok:   sh ran a script fed on standard input");
+        }
+        Ok(out) => {
+            println!(
+                "FAIL: sh on a pipe gave {} out={:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout)
+            );
+            failed = true;
+        }
+        Err(e) => {
+            println!("FAIL: sh on a pipe could not be run: {e}");
+            failed = true;
+        }
+    }
+
+    // 9. `cat FILE` - the *file* argument, not only the standard input the
+    //    pipeline above feeds it. A `cat` that copied nothing but its input would
+    //    sit on the terminal instead of failing, and this machine's `/bin` is a
+    //    shell's whole toolset, so a session with no way to read a file is a
+    //    session with no way to read the disk.
+    let catfile = "/tmp/stdspawn-cat.txt";
+    match std::fs::write(catfile, b"cat-from-a-file\n")
+        .and_then(|()| Command::new("/bin/cat").arg(catfile).output())
+    {
+        Ok(out) if out.status.success() && out.stdout == b"cat-from-a-file\n" => {
+            println!("ok:   /bin/cat read the file it was named");
+        }
+        Ok(out) => {
+            println!(
+                "FAIL: cat {catfile} gave {} out={:?}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout)
+            );
+            failed = true;
+        }
+        Err(e) => {
+            println!("FAIL: cat could not be run: {e}");
+            failed = true;
+        }
+    }
+    let _ = std::fs::remove_file(catfile);
 
     if failed {
         println!("FAILED");

@@ -1,13 +1,18 @@
-//! The second machine's `/bin`: the programs the user tests start.
+//! The second machine's `/bin`: the programs the user tests start, and the shell
+//! an interactive boot runs.
 //!
-//! `t-stdspawn` and `t-socketpair` are tests *about other programs*: the first
-//! runs `/bin/true`, `/bin/echo`, `/bin/cat`, `/bin/false` and `/bin/sh -c`, the
-//! second runs `/bin/cat`. The x86_64 harness has those because its test root is
-//! an initramfs with busybox in `/bin`; the second machine's root is the ext4
-//! disk the sweep builds, which carried no `/bin` at all - so both programs sat
-//! in `tests.toml`'s `aarch64` group, a gap in the harness rather than in the
-//! kernel's spawn path (which every program in the payload already exercises,
-//! since the runner starts each one through `posix_spawn`).
+//! Two callers, one payload. `t-stdspawn` and `t-socketpair` are tests *about
+//! other programs*: the first runs `/bin/true`, `/bin/echo`, `/bin/cat`,
+//! `/bin/false` and `/bin/sh -c`, the second runs `/bin/cat`. The x86_64 harness
+//! has those because its test root is an initramfs with busybox in `/bin`; the
+//! second machine's root is the ext4 disk the sweep builds, which carried no
+//! `/bin` at all - so both programs sat in `tests.toml`'s `aarch64` group, a gap
+//! in the harness rather than in the kernel's spawn path (which every program in
+//! the payload already exercises, since the runner starts each one through
+//! `posix_spawn`). And [`crate::aarch64::run_interactive`] stages the same image
+//! as the machine's shell, because the `sh` applet below *is* the shell: what was
+//! missing from that boot was a program, not a payload, so the fix is to stage
+//! this one and let pid 1 exec it rather than to write a second interpreter.
 //!
 //! # Why these are built in-tree rather than fetched
 //!
@@ -47,42 +52,45 @@ const EM_AARCH64: u16 = 183;
 /// The names the tools are staged under, in `/bin`. A program that asks for one
 /// of them runs the same image with that name as its `argv[0]`, which is what
 /// the image dispatches on - busybox's arrangement, and the reason there is one
-/// build here and not five.
-pub const APPLETS: [&str; 5] = ["true", "false", "echo", "cat", "sh"];
+/// build here and not six.
+pub const APPLETS: [&str; 6] = ["true", "false", "echo", "cat", "ls", "sh"];
 
-/// The five applets, as one program.
+/// The six applets, as one program.
 ///
 /// Deliberately small programs, so every byte of behaviour is here to be read:
 /// `true` and `false` are their exit status, `echo` joins its arguments with
-/// spaces and a newline, `cat` copies standard input to standard output, and
-/// `sh` runs a command string.
+/// spaces and a newline, `cat` copies standard input or the files it is named,
+/// `ls` lists the names in a directory, and `sh` runs a command string or, on a
+/// terminal, the commands it is typed.
 ///
 /// No file, directory or descriptor the kernel owns is touched except through
 /// libc calls every one of which this machine has already been asked to serve
 /// by the sweep's other programs (`read`, `write`, `dup`, `dup2`, `close`, the
 /// `open`/`execve`/`wait4` behind `std::process::Command`).
-pub const TOOLS_SRC: &str = r#"
-//! Five programs in one image, dispatched on the name it was run as.
+pub const TOOLS_SRC: &str = r##"
+//! Six programs in one image, dispatched on the name it was run as.
 //!
 //! `true` and `false` are their exit status; `echo` writes its arguments and a
-//! newline to standard output; `cat` copies standard input to standard output;
-//! `sh` is the small shell its own comment describes. Every one of them is
-//! reached by the name in `/bin`, which is how a multi-call binary works and
-//! how busybox's own applets do - this image is not busybox, it is these five.
+//! newline to standard output; `cat` copies standard input - or the files it is
+//! named - to standard output; `ls` lists a directory's names; `sh` is the small
+//! shell its own comment describes. Every one of them is reached by the name in
+//! `/bin`, which is how a multi-call binary works and how busybox's own applets
+//! do - this image is not busybox, it is these six.
 
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::fd::IntoRawFd;
 use std::os::unix::fs::PermissionsExt;
 
-// The three libc calls this program makes that `std` does not expose: the shell
+// The libc calls this program makes that `std` does not expose: the shell
 // redirects with the *real* descriptors, so a builtin and a child process see
-// the same thing. Reading and writing need no declaration - `std::io`'s
-// `stdin`/`stdout` are fd 0 and fd 1, and a `dup2` onto either moves them with
-// the descriptor.
+// the same thing, and its prompt reports the identity it is really running as.
+// Reading and writing need no declaration - `std::io`'s `stdin`/`stdout` are
+// fd 0 and fd 1, and a `dup2` onto either moves them with the descriptor.
 unsafe extern "C" {
     fn dup(fd: i32) -> i32;
     fn dup2(old: i32, new: i32) -> i32;
     fn close(fd: i32) -> i32;
+    fn geteuid() -> u32;
 }
 
 fn main() {
@@ -94,11 +102,12 @@ fn main() {
         "true" => 0,
         "false" => 1,
         "echo" => applet_echo(&rest),
-        "cat" => applet_cat(),
+        "cat" => applet_cat(&rest),
+        "ls" => applet_ls(&rest),
         "sh" => applet_sh(&rest),
         other => {
             eprintln!(
-                "{other}: not an applet of this multi-call binary (true, false, echo, cat, sh)"
+                "{other}: not an applet of this multi-call binary (true, false, echo, cat, ls, sh)"
             );
             127
         }
@@ -126,12 +135,41 @@ fn write_stdout(bytes: &[u8]) -> i32 {
     }
 }
 
-/// `cat`: standard input to standard output, a buffer at a time, until the
-/// reader sees the end of the stream. Streaming rather than slurping is what
-/// makes it usable as the far end of a pipe, which is the shape both tests use
-/// it in.
-fn applet_cat() -> i32 {
-    let mut input = std::io::stdin().lock();
+/// `cat`: with no argument, standard input to standard output; with arguments,
+/// each named file in turn. A buffer at a time and streamed rather than slurped,
+/// which is what makes it usable as the far end of a pipe - the shape both tests
+/// use it in.
+///
+/// The file arguments are not decoration. This image is a shell's whole toolset,
+/// so a `cat` that could only echo its input would leave a session with no way to
+/// read a file, and the failure is not an error message: the program sits on the
+/// terminal waiting for a line the person has already typed. Measured exactly
+/// that on the machine - `cat /etc/inittab` blocked until the next keystroke and
+/// then printed *that* - which is how a shell's first real command turned into a
+/// hang.
+fn applet_cat(args: &[String]) -> i32 {
+    if args.is_empty() {
+        return copy_to_stdout(&mut std::io::stdin().lock());
+    }
+    let mut status = 0;
+    for name in args {
+        match std::fs::File::open(name) {
+            Ok(mut file) => {
+                if copy_to_stdout(&mut file) != 0 {
+                    status = 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("cat: {name}: {e}");
+                status = 1;
+            }
+        }
+    }
+    status
+}
+
+/// Every byte of `input` on standard output, or a failure status.
+fn copy_to_stdout(input: &mut impl Read) -> i32 {
     let mut out = std::io::stdout().lock();
     let mut buf = [0u8; 8192];
     loop {
@@ -142,6 +180,7 @@ fn applet_cat() -> i32 {
                     return 1;
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return 1,
         }
     }
@@ -149,6 +188,50 @@ fn applet_cat() -> i32 {
         return 1;
     }
     0
+}
+
+/// `ls`: the names in each directory argument, or in the current directory when
+/// none is given, one per line. Several arguments are headed with the name they
+/// came from, which is the shape `ls dir1 dir2` has and the reason a bare list
+/// is not one.
+///
+/// Deliberately not `ls -l`: the options a real `ls` carries are a program of
+/// their own, and what a shell session needs first is to see what is there.
+/// `std::fs::read_dir` is `getdents64` and the name comes from the dirent, so
+/// this is the same call the shell's own completion would use.
+fn applet_ls(args: &[String]) -> i32 {
+    let dirs: Vec<&str> = if args.is_empty() {
+        vec!["."]
+    } else {
+        args.iter().map(String::as_str).collect()
+    };
+    let headed = dirs.len() > 1;
+    let mut status = 0;
+    for (i, dir) in dirs.iter().enumerate() {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!("ls: {dir}: {e}");
+                status = 1;
+                continue;
+            }
+        };
+        if headed {
+            if i > 0 {
+                println!();
+            }
+            println!("{dir}:");
+        }
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for name in names {
+            println!("{name}");
+        }
+    }
+    status
 }
 
 /// `sh`: a small shell, and only what this comment says it is.
@@ -167,6 +250,11 @@ fn applet_cat() -> i32 {
 /// to put the first line on standard output and the second on standard error,
 /// which is why the redirection moves the real descriptor instead of being
 /// modelled inside this program.
+///
+/// Both shapes a shell is used in are the same loop over [`run_script`], and the
+/// difference is only where the script comes from: `-c` takes it as an argument,
+/// and no argument reads it a line at a time from standard input - see
+/// [`repl`], which is also where the interactive boot's prompt comes from.
 fn applet_sh(args: &[String]) -> i32 {
     let mut i = 0;
     while i < args.len() {
@@ -179,11 +267,57 @@ fn applet_sh(args: &[String]) -> i32 {
         }
         i += 1;
     }
-    let mut text = String::new();
-    if std::io::stdin().read_to_string(&mut text).is_err() {
-        return 2;
+    repl()
+}
+
+/// Read commands a line at a time and run each as it arrives.
+///
+/// One loop covers both shapes a shell reads a script in. With a terminal it
+/// prompts and runs what a person types; without one it runs a file or a pipe,
+/// silently. A prompt is written only when the input is a terminal
+/// ([`IsTerminal`], i.e. `ioctl(TCGETS)`), which is `ash`'s rule and the reason a
+/// script fed on standard input does not get its output interleaved with
+/// prompting.
+///
+/// A line at a time rather than to end-of-file is what makes the terminal case
+/// work at all: a canonical read returns as soon as the line is complete, so a
+/// command runs when Enter is pressed instead of waiting for `Ctrl-D`. It also
+/// means the two cases agree on semantics - [`run_script`] splits on newlines
+/// and `;` either way, so a piped script runs the same commands in the same
+/// order.
+///
+/// The prompt reports the identity the shell is really running as, the way every
+/// shell's does: `#` for root, `$` otherwise. It goes to standard *error*, which
+/// is where a diagnostic belongs and what keeps it out of a redirected command's
+/// output.
+fn repl() -> i32 {
+    let interactive = std::io::stdin().is_terminal();
+    let prompt = if unsafe { geteuid() } == 0 { "# " } else { "$ " };
+    let mut status = 0;
+    let mut line = String::new();
+    loop {
+        if interactive {
+            eprint!("{prompt}");
+        }
+        line.clear();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => status = run_script(&line),
+            // A signal that ended the read is not the end of the session; the
+            // shell is the process the console's `Ctrl-C` lands on, and a shell
+            // that exited on one would take the session with it.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                eprintln!("sh: read: {e}");
+                return 2;
+            }
+        }
     }
-    run_script(&text)
+    if interactive {
+        // A shell leaving a terminal owes it a fresh line; a pipe does not care.
+        eprintln!();
+    }
+    status
 }
 
 /// Run a whole script: `;` inside a line, and a newline between lines. The
@@ -442,7 +576,7 @@ fn split_words(line: &str) -> Vec<String> {
     }
     words
 }
-"#;
+"##;
 
 /// Build the multi-call binary and answer its bytes.
 ///
@@ -494,8 +628,9 @@ mod tests {
     /// The applet list and the dispatcher have to agree: a name staged in `/bin`
     /// whose arm is missing runs the image and gets "not an applet", which reads
     /// as a broken program rather than a broken payload. The names are also the
-    /// tests' - `t-stdspawn` runs true/false/echo/cat/sh - so this is the list the
-    /// two programs that used to sit in `tests.toml`'s `aarch64` group needed.
+    /// tests' - `t-stdspawn` runs true/false/echo/cat/sh - and the interactive
+    /// boot's, where `sh` is pid 1 and `ls` is how a person sees the disk - so
+    /// this is the list one shell session and two spawn tests need.
     #[test]
     fn every_staged_name_is_an_applet_the_dispatcher_knows() {
         for applet in APPLETS {
@@ -504,19 +639,22 @@ mod tests {
                 "APPLETS names {applet} but the dispatcher never matches it"
             );
         }
-        for required in ["true", "false", "echo", "cat", "sh"] {
+        for required in ["true", "false", "echo", "cat", "ls", "sh"] {
             assert!(APPLETS.contains(&required), "the tools lost {required}");
         }
     }
 
-    /// The shell has to answer `-c` and it has to move a *real* descriptor for
-    /// `>&2`: `t-stdspawn` asserts the child put `captured-err` on standard error,
-    /// so a shell that printed both lines to standard output would fail it while
-    /// looking like it had run the script. Cheap checks, but they are the three
-    /// pieces a rewrite of the shell must keep - the real pin is the program that
-    /// runs it.
+    /// The shell has to answer `-c`, it has to move a *real* descriptor for
+    /// `>&2`, and it has to keep the interactive loop. `t-stdspawn` asserts the
+    /// child put `captured-err` on standard error, so a shell that printed both
+    /// lines to standard output would fail it while looking like it had run the
+    /// script. The last of the three is what `run --arch aarch64` is: a shell
+    /// that slurped standard input to end-of-file instead of reading a line at a
+    /// time would still pass every spawn test and never give a prompt. Cheap
+    /// checks, but they are the pieces a rewrite of the shell must keep - the
+    /// real pin is the program that runs it.
     #[test]
-    fn the_shell_keeps_the_c_prompt_and_a_real_redirection() {
+    fn the_shell_keeps_the_c_prompt_a_real_redirection_and_a_repl() {
         assert!(TOOLS_SRC.contains("\"-c\""), "the `-c` form has no arm");
         assert!(
             TOOLS_SRC.contains("dup2(fd, 1)"),
@@ -525,6 +663,10 @@ mod tests {
         assert!(
             TOOLS_SRC.contains("starts_with(\">&\")"),
             "the `>&N` form has no parser"
+        );
+        assert!(
+            TOOLS_SRC.contains("read_line(&mut line)") && TOOLS_SRC.contains("is_terminal()"),
+            "the interactive loop is gone: a shell that reads to end-of-file never prompts"
         );
     }
 }

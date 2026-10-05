@@ -68,6 +68,12 @@ const EC_SVC_FROM_AARCH64: u64 = 0x15;
 /// only have been a write, and bit 6 is set while bit 7 is clear.)
 const EC_DATA_ABORT_EL0: u64 = 0x24;
 const EC_INSTR_ABORT_EL0: u64 = 0x20;
+/// `ESR_EL1.EC` for a Data Abort taken *without* a change of exception level -
+/// the kernel's own reference to a page that is not there. The kernel reaches
+/// user memory through the same tables the program does, so a syscall filling a
+/// caller's buffer takes this one, exactly as the program's own write would take
+/// the EL0 class above. See [`sync`] for why it is resolvable rather than fatal.
+const EC_DATA_ABORT_EL1: u64 = 0x25;
 
 /// `exit_group`'s number on this machine, which is not the number the x86_64
 /// table gives it (231, against 94 here).
@@ -188,7 +194,46 @@ __aarch64_vectors:
     .text
     .balign 16
 __vec_sync:
-    b {synchronous}
+    /* A trap at EL1: the kernel's own, and almost always a bug - but not quite
+       always. A data abort on a *user* address is the kernel doing what the
+       program asked: `read(2)` writes into the caller's buffer through the
+       caller's pages, so the first write to a page the process mapped and never
+       touched, or to a page a `fork` left copy-on-write, faults here rather than
+       at EL0. `sync` resolves those two and returns; anything else is fatal and
+       does not come back. See it for the reasoning and for the measured fault
+       that made this entry necessary.
+
+       The save below is the call's, not the machine's: `bl` clobbers x0-x18 and
+       x30, and the instruction being retried belongs to a function that may be
+       holding its return address in x30 with live values either side. The
+       condition flags need no saving - `eret` reloads PSTATE from `SPSR_EL1`,
+       which nothing here writes. 160 bytes keeps SP 16-byte aligned. */
+    sub sp, sp, #160
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x15, [sp, #112]
+    stp x16, x17, [sp, #128]
+    str x18, [sp, #144]
+    str x30, [sp, #152]
+    bl {sync}
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldr x18, [sp, #144]
+    ldr x30, [sp, #152]
+    add sp, sp, #160
+    eret
 __vec_unexpected:
     b {unexpected}
 __vec_irq:
@@ -442,7 +487,7 @@ __vec_el0_sync:
 __vec_el0_leave:
     eret
     "#,
-    synchronous = sym synchronous,
+    sync = sym sync,
     irq = sym irq,
     unexpected = sym unexpected,
     el0_sync = sym el0_sync,
@@ -506,7 +551,54 @@ fn system_register(name: &str) -> u64 {
     value
 }
 
-/// A synchronous exception this kernel does not handle.
+/// A synchronous exception taken at EL1, which is the kernel's own fault - and
+/// the one case of it that is not a bug.
+///
+/// The kernel reaches user memory through the caller's own tables, so a syscall
+/// that fills a user buffer - `read`, `uname`, `getrandom`, the `CLONE_CHILD_TID`
+/// write - faults exactly where the program's own access would: the first write
+/// to a page the process mapped and never touched, or a write to a page a `fork`
+/// left copy-on-write. Refusing those would take the machine down over an
+/// operation Linux performs without a second thought, which is the same reasoning
+/// the x86_64 `page_fault` states where it resolves a COW split "whoever made it".
+///
+/// This entry only became reachable when `user_accessible` started *accepting* a
+/// page the tables do not describe yet (`PLAN.md` §13.9): before that the check
+/// refused every absent page, so the kernel never copied into one, so a syscall
+/// could only ever touch present memory. On x86_64 the two halves landed together
+/// and the fault path was always there.
+///
+/// Everything else is fatal and [`synchronous`] says so: an instruction abort
+/// here, a data abort at a kernel address (`far` in `TTBR1`'s half - the
+/// resolvers are answers about a *process's* space), or a user address no VMA
+/// backs. The `rip` analogue x86_64 uses to keep a kernel bug from being
+/// reported as a user fault is `far`'s half rather than the program counter's,
+/// because on this machine the resolvers *are* the space's own: an address the
+/// process never mapped has no VMA and is refused either way.
+extern "C" fn sync() {
+    let esr = system_register("esr");
+    if esr >> 26 == EC_DATA_ABORT_EL1 {
+        let addr = system_register("far") as usize;
+        // `TTBR0`'s half. A kernel address is a bug to report, not a page to
+        // populate - and `resolve_anon_fault` would happily walk the active
+        // space for one.
+        if addr >> (usize::BITS - 1) == 0 {
+            let is_write = (esr >> 6) & 1 != 0;
+            // The order is the EL0 entry's, and for the same reason: a write to
+            // a present copy-on-write page is the split, and a page that gets
+            // past it is absent, so its answer is the VMA table's.
+            if crate::sched::started()
+                && ((is_write && crate::sched::resolve_cow_fault(addr))
+                    || crate::sched::resolve_anon_fault(addr, is_write))
+            {
+                return; // The instruction retries and succeeds.
+            }
+        }
+    }
+    synchronous()
+}
+
+/// A synchronous exception this kernel does not handle or could not resolve.
 ///
 /// There is nothing to return to: by the time one of these arrives the fault is
 /// a fact about the machine (a bad page table, an unaligned access) or about a

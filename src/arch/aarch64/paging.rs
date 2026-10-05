@@ -409,9 +409,33 @@ pub fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
 /// (and `WRITE` when `write` is set). A range that runs off the top of the low
 /// half into the kernel's is rejected whole, because a user pointer is a `TTBR0`
 /// address by definition.
+///
+/// The policy here is `arch/x86_64/paging.rs`'s, and deliberately a second copy
+/// rather than a shared one: it needs two things no lower layer may name - the
+/// machine's own table walk and `sched`'s VMA table - so a single home for it
+/// would be an edge the module graph forbids (`hal` may depend on nothing, `mm`
+/// on `boot`). What is shared is the *answer*; a port that writes this again
+/// writes these three rules with it, and each is a measurement rather than a
+/// reading of the architecture:
+///
+/// 1. **An absent page is not an unmapped one.** A mapping the process has made
+///    and not touched has no table entry yet, so the live VMA table decides. This
+///    is not a nicety: a `BufReader`'s heap buffer is allocated and unread when
+///    the first `read` asks for its whole capacity, so refusing the absent half
+///    answers `EFAULT` to a perfectly valid buffer - measured on the second
+///    machine, where a shell's very first `read(0)` died with it (`PLAN.md`
+///    §13.9). Only anonymous ranges qualify; see `sched::kernel_lazy_accessible`
+///    for why a frame-backed one must be present first.
+/// 2. **A copy-on-write page is writable.** It is mapped read-only on purpose:
+///    the write it catches is answered by the fault handler, not refused. Reading
+///    the bit and stopping there turns every syscall that fills a user buffer
+///    into an `EFAULT` for any process that has forked.
+/// 3. **A zero-length range is accessible.** `read(fd, buf, 0)` is a valid call
+///    whatever `buf` holds - Linux answers 0 - and the length bound all three
+///    callers share is the real gate.
 pub fn user_accessible(start: usize, len: usize, write: bool) -> bool {
     if len == 0 {
-        return false;
+        return true;
     }
     let end = match start.checked_add(len) {
         Some(end) => end,
@@ -427,11 +451,24 @@ pub fn user_accessible(start: usize, len: usize, write: bool) -> bool {
             return false;
         }
         match translate(page) {
-            Some((_, flags, _))
-                if flags.contains(MapFlags::USER)
-                    && flags.contains(MapFlags::READ)
-                    && (!write || flags.contains(MapFlags::WRITE)) => {}
-            _ => return false,
+            Some((_, flags, _)) => {
+                if !flags.contains(MapFlags::USER) || !flags.contains(MapFlags::READ) {
+                    return false;
+                }
+                if write && !flags.contains(MapFlags::WRITE) && !is_cow_page(page) {
+                    return false;
+                }
+            }
+            // Rule 1: a mapping with no table entry yet is the VMA table's to
+            // answer, and a page with no VMA behind it is still refused - that is
+            // a pointer the process never mapped. `write` is passed through
+            // because wanting to write a read-only VMA is a refusal, not a fault
+            // a handler would resolve.
+            None => {
+                if !crate::sched::kernel_lazy_accessible(page, write) {
+                    return false;
+                }
+            }
         }
         if page + PAGE_SIZE >= end {
             return true;

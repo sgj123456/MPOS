@@ -674,7 +674,7 @@ kernel and is answered (§9.1); next is the rest of stage 6, which is the ABI an
 the `AddressSpaceOps` that completes `hal` — not stage 5's drivers, which the
 same measurement puts behind `vfs` and so behind `hal` too)**
 - [ ] 9.1 aarch64 complete boot (stages 3-8 remain) · [ ] 9.2 RISC-V support
-- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.6 landed, 13.2 in progress (§13)**
+- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.9 landed, 13.2 in progress (§13)**
   - [x] 13.1 `hal` is arch-neutral: its 14 `target_arch` gates became capability flags
         (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`)
         declared per target in `.cargo/config.toml`; `src/hal` `target_arch` is now 0, both
@@ -831,6 +831,27 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         is **empty** and stays as an empty group - the mechanism is what names a gap, and the
         day a call cannot be served is the day a name goes back in. What remains outside the
         machine is `external`, and its reason is the internet
+  - [x] 13.7 aarch64 `SerialRing`: the PL011's line (SPI 33) is routed through the GIC and the
+        second machine queues its console output instead of waiting on the wire — with the queue
+        itself lifted out of `drivers/serial.rs` into `drivers::tx_ring`, behind a three-method
+        `Transmitter` both machines implement. `M5_SERIAL_TX_OK` counts what writers queued against
+        what the *handler* handed over, so a polled write (or a line that never fired) fails rather
+        than passing; x86_64's sweep is unchanged
+  - [x] 13.8 aarch64 interactive shell: `run --arch aarch64` stops booting a hand-encoded read/echo
+        loop and hands pid 1 to the machine's real shell — an in-tree `/init` that makes `/tmp` and
+        `execve`s `/bin/sh`, with the `sh` applet reading a line at a time (prompt on a terminal,
+        silent on a pipe) and `ls` added to the `/bin` image. The superseded `looping_init_elf` is
+        deleted rather than left as dead code, and both new behaviours are pinned by `t-stdspawn`
+        on **both** machines
+  - [x] 13.9 aarch64 `uaccess`: the range check accepts a page the tables do not describe yet
+        (the live VMA table answers for an absent page, a copy-on-write page counts as writable,
+        `len == 0` is accessible — the three rules x86_64 has always had), and the **EL1**
+        synchronous entry resolves the data aborts that fallback makes reachable, because the
+        kernel fills a caller's buffer through the caller's own tables. Pinned by a new
+        `t-lazy-buffer` (a 1 MiB `mmap` read into whole, and a `fork` child reading into a page
+        its parent wrote) on both machines; both failed with `EFAULT` before. It also found a
+        **named gap**: a non-empty `std::fs::remove_dir_all` faults at `pc 0` on this machine,
+        which nothing in either suite had exercised
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
@@ -5864,6 +5885,38 @@ scheduler-run userspace program that read a typed line, echoed it, parked, and d
 again. That is the objective's "reaches init/shell on the serial console" in the
 minimal genuine form: a persistent interactive userspace loop on the second machine.
 
+**And the loop is now a shell (§13.8/§13.9).** The REPL stand-in is gone.
+`cargo xtask run --arch aarch64` builds an in-tree `/init`
+(`aarch64_init::build_shell_init`) that makes `/tmp` and `execve`s `/bin/sh`, stages the same
+multi-call `/bin` the sweep uses (`aarch64_bin`, now six applets), and drops the machine at a
+prompt on the serial console. Three things had to land with it and none is cosmetic: the `sh`
+applet became a line-at-a-time reader with a prompt (`is_terminal`, so a piped script stays
+silent and an interactive session does not wait for `Ctrl-D`); `cat` gained its file
+arguments, because a `cat` that copies nothing but standard input does not fail on a
+terminal - it *blocks* on it, which is how a shell's first real command turned into a hang;
+and the second machine's `uaccess` learned what the first machine's had always known, that a
+buffer the process has *mapped* is a valid one even before the tables describe it, with the
+EL1 fault entry that the copy then needs (§13.9). Measured, with the shell's own lines fed to
+it over the serial line:
+
+```
+mpos: init handing over to /bin/sh
+#
+sh: echo-test: not found        <- the line the handoff queued, run as a command
+# echo hello-from-guest
+hello-from-guest
+# ls /etc
+conf.d  doas.conf  fish  inittab  local.d  network  profile.d  resolv.conf  xdg
+```
+
+Before §13.9 that session was one line long: `sh: debug err Bad address (os error 14)`,
+because the shell's first `read(0)` - into its `BufReader`'s heap buffer, allocated and
+unread - was refused as `EFAULT`, and it exited. What is still x86_64's is the *userland*
+around the shell: no Alpine root, no OpenRC, no getty, no `/proc`/`/sys`, and the small
+in-tree shell rather than busybox `ash`. This machine's `/init` is a program the kernel runs
+because it is in `/bin`, which is the same arrangement the first machine reaches through an
+initramfs script and a distribution.
+
 **Stage 6D (execve) is DONE: `execve` transfers a running aarch64 program to a new
 image at EL0.** The handler's body was already arch-neutral - it reads the path and
 `argv`/`envp` through `uaccess`, checks `X_OK`, resolves any `#!` interpreter, honours
@@ -8452,7 +8505,7 @@ numbering they write down, and the real thing is what the run above shows.
 
 ---
 
-## Phase 13: Machine-seam purity and aarch64 parity — **13.1 AND 13.3–13.7 LANDED, 13.2 IN PROGRESS**
+## Phase 13: Machine-seam purity and aarch64 parity — **13.1 AND 13.3–13.9 LANDED, 13.2 IN PROGRESS**
 
 Phase 9.1 leaves the second machine short of the first in three named places, and Phase 11.4
 closed the `hal` *seam* without closing the `hal` *file*. `crate::arch` is named by no module
@@ -8500,6 +8553,8 @@ and green alone — AGENTS §4 rule 7):
 | 13.6 | aarch64 `/bin`: the programs `t-stdspawn`/`t-socketpair` start, built **in-tree** as five applets of one multi-call binary (`xtask/src/aarch64_bin.rs`) rather than installed from a distribution | both names leave `tests.toml`'s `aarch64` group and `cargo xtask test --arch aarch64` stays green; x86 unchanged | *landed* — the gap was the harness's, not the ABI's: `t-stdspawn` runs `/bin/{true,false,echo,cat,sh}` and `t-socketpair` runs `/bin/cat`, and this machine's ext4 root carried no `/bin` (the payload's own programs sit flat at `/`). **The choice that matters is build-or-fetch**: installing busybox — the x86 harness's answer, from Alpine — would put a network fetch *inside* the aarch64 gate, so a mirror outage would read as a broken kernel; the `rustc`/`aarch64-unknown-linux-musl` path the sweep's runner and musl helper already require builds these with no new prerequisite. `sh` is a small shell whose own comment states its subset (`;`/newline separation, `'`/`"`/`\` quoting, `<`/`>`/`>>`/`>&N`, the `echo`/`exit`/`cd`/`pwd` builtins, external programs by path or `PATH`) — honestly *not* busybox — and it moves **real descriptors** rather than modelling them, because `t-stdspawn` asserts the child put `captured-err` on stderr and reads both pipes. Two staging facts came out of it: a payload name may carry a directory (the kernel's `vfs::tar::unpack_into` creates missing parents on demand, so the archive needs no directory member) and every file the staging step lays down is mode **0755**, which `mkfs.ext4 -d` preserves — without it `/bin` lands 0644 and `execve` answers `EACCES`, a failure that reads as a broken program. **Measured: `=== SUMMARY pass=12 fail=0`** (12 of the 14 aarch64-built programs staged; the two left out, `t-stdresolve` and `t-udp`, are `external` for the internet's reason rather than this machine's), `t-stdspawn`'s `output() captured both of the child's streams` and `t-socketpair`'s `read back what the pair carried` among the passes, with x86 unchanged at `pass=142 fail=0`. The `aarch64` group is **empty** and stays as an empty group: the mechanism is what names a gap, and the day a call cannot be served is the day a name goes back in |
 
 | 13.7 | aarch64 `SerialRing`: the PL011's line (SPI 33, the tree's `interrupts = <0 1 4>`) configured group 1 / priority 0x80 in `gic::init`, armed by the wiring once a tty exists, and served by the same visit that drains the receiver; the machine declares `mpos_serial_ring` and `crate::console` takes its queue-and-park path with **no edit above `arch`** | `M5_SERIAL_TX_OK` in `boot-aarch64`: bytes *queued* by a writer and *moved* by an **interrupt**, counted separately, with more than one line's worth so a queue that only ever held a line could not pass; x86_64's sweep unchanged | **landed** — the queue both machines drain was lifted out of `drivers/serial.rs` first (`drivers::tx_ring`, behind a three-method `Transmitter` trait), because the alternative was a second copy of "who sleeps for room, and when to stop asking the transmitter" written against the PL011's one shared `IMSC` register - the exact duplication the machine seam exists to prevent. What the pin measures is the difference a print cannot: `stats()` counts what writers queued against what the *handler* handed over, so a polled write (or a line that never fired) reports a queue nothing drains instead of passing. Three facts fell out of it. (1) The register carries *both* directions, so every mask write is a read-modify-write. (2) Writing `ICR` with every bit - the obvious "clear anything stale before arming" - **hung about half of all boots**, silently, at the first queued line: `TXIC` clears the transmitter's *latched* event, and a level-triggered transmitter that has lost its latch asserts nothing until the next byte leaves it, which is the thing the interrupt was going to do. Whether a given boot hung depended on whether the previous poll-written line's bytes had finished leaving when `ICR` was written, which is why a loop of runs found it and one run did not; `enable_interrupts` now clears everything except `TXIC`, and the fix is the difference between 5/5 hung and 10/10 green. (3) It is a race rather than a state, so the check had to be able to speak: its failure marker goes out through the machine's *polled* writer, because a report filed through a queue that is not draining is a report nobody reads. The polled `ConsoleInput` receiver stayed (the self-test that has no terminal to type on), and with the RX interrupt live the tick-rate input pump task left the boot entirely |
+| 13.8 | aarch64 interactive shell: `run --arch aarch64` stops booting a hand-encoded read/echo loop and hands pid 1 to the machine's real shell — an in-tree `/init` (`aarch64_init::build_shell_init`) that makes `/tmp` and `execve`s `/bin/sh`, with the `sh` applet reading a line at a time (a prompt on a terminal, silence on a pipe), `ls` added to the `/bin` image and `cat` taught its file arguments; the superseded `looping_init_elf` is deleted rather than left as dead code | a scripted `run --arch aarch64` drops to a prompt and runs commands; `t-stdspawn` pins `/bin/ls`, `sh` fed a script on a pipe, and `cat FILE` on **both** machines | **landed** — the payload is the same multi-call `/bin` the sweep stages, so the program a person types at is the program the spawn tests run. Measured: `cargo xtask run --arch aarch64` with `echo hello-from-guest`, `ls /etc` and `cat /etc/inittab` fed to it prints `# `, `hello-from-guest`, `conf.d doas.conf fish inittab local.d network profile.d resolv.conf xdg`, and then the file. Two things fell out of doing it: `cat` had no file arguments at all (it copies standard input), which on a terminal is not an error but a *hang* — the shell's first real command blocked until the next keystroke and then printed that — and the shell's very first `read(0)` was the `EFAULT` §13.9 is about |
+| 13.9 | aarch64 `uaccess`: the range check accepts a page the tables do not describe yet — an absent page is the live VMA table's to answer, a copy-on-write page counts as writable (its write is the fault the handler splits), and `len == 0` is accessible, which are the three rules `arch/x86_64/paging.rs` has always had; and the **EL1** synchronous entry resolves the two data aborts that fallback makes reachable, because the kernel reaches user memory through the caller's own tables | a program that fills memory nothing has touched: `t-lazy-buffer` (a 1 MiB `mmap` read into whole, and a `fork` child reading into a page its parent wrote) passes on **both** machines, and fails on the old kernel with `EFAULT`; `cargo xtask run --arch aarch64` reaches a working shell | **landed** — the second machine's `user_accessible` required every touched page to be *present*, so a `BufReader`'s 8 KiB heap buffer — allocated and unread, its second page with no table entry yet — was refused as `EFAULT`, and that is the shell's very first `read(0)`. Measured, and it is how the bug was found: `sh: debug err Bad address (os error 14)` was the whole of the interactive boot's failure. The same check refused a `fork` child's buffer, because a shared page is copy-on-write and therefore read-only; `arch/x86_64/paging.rs` reads `is_cow_page` in exactly that place and has since the fork path landed. The boot's own `M6_PAGING` check then went **red** on the corrected rule — it asserted that marking a page copy-on-write stops it being writable to uaccess, which is the divergence written down as a contract — so the check was corrected with the evidence rather than the fix backed out: a COW page's write is answered by the handler on both machines. Fixing the check alone is not enough and the second half is the interesting one: with the VMA fallback the kernel now *copies into* an absent page, and on aarch64 that is an EL1 data abort, which the vector table sent straight to the fatal dump. `__vec_sync` now calls `sync`, which resolves a data abort at a user address through the same `resolve_cow_fault`/`resolve_anon_fault` the EL0 entry uses and `eret`s back to retry the instruction; a fault at a kernel address, an instruction abort, or a user address no VMA backs is still the machine stopping with a dump. The stub saves x0–x18 and x30 around the call (`bl` clobbers them and the retried instruction belongs to a function that may hold its return address in x30); the condition flags need no saving because `eret` reloads PSTATE from `SPSR_EL1`. Measured: aarch64 sweep `=== SUMMARY pass=18 fail=0`, x86_64 gate green, `cargo xtask boot-aarch64` green, host lib 511. **Named gap found on the way, not fixed:** a *non-empty* `std::fs::remove_dir_all` faults the calling process at `pc 0` (ESR `0x82000006`, a level-2 translation fault at address 0) on this machine — reproduced three times, always with the check's own `ok:` line as the log's last and a marker written immediately before the call never reached. Nothing else in either suite removes a tree recursively, so this had never run there; the same removal by hand (`read_dir` + `remove_file` + `remove_dir`) works, which is what `t-stdspawn` now does, so the suspicion is the empty-name `unlinkat(fd, "", AT_REMOVEDIR)` that ends Rust's implementation. It is a pre-existing gap in this machine's ABI surface, orthogonal to §13.8/§13.9, and it is named here rather than left to be rediscovered |
 
 **What the remaining 122 are, and why the count stops being the metric** (a
 `target_arch`-line count of `src/` outside `src/arch/`, measured 2026-10-04 after §13.1
@@ -8531,7 +8586,7 @@ shared file, not that a register frame becomes neutral.
 
 **Where this lands**: status in §9.1 (parity) and §11.4 (purity); `ARCHITECTURE.md` §2/§3 in the
 same commit as any new or moved edge (AGENTS §4 rule 5), *before* the edge, not after. **13.1 and
-13.3–13.7 have landed**, and 13.2 is in progress — the parity thread of this phase is complete: the
+13.3–13.9 have landed**, and 13.2 is in progress — the parity thread of this phase is complete: the
 second machine boots its own disk root, runs the same network stack and socket syscalls over its own
 adapter, and carries the `/bin` its spawn tests need, so the sweep is green on **everything it is
 supposed to serve** and `tests.toml`'s `aarch64` group is empty. What a red aarch64 sweep means is

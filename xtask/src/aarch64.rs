@@ -62,6 +62,12 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// than making every boot allocate room for the sweep.
 const DISK_BYTES: u64 = 8 * 1024 * 1024;
 const SWEEP_DISK_BYTES: u64 = 64 * 1024 * 1024;
+/// The interactive boot's disk. Smaller than the sweep's, because its payload is
+/// the init plus the six `/bin` names of one multi-call image rather than the
+/// musl test programs - and its own constant rather than shared with
+/// `boot-aarch64`'s, because the two boots carry different payloads and a size
+/// that fits one is not evidence about the other.
+const INTERACTIVE_DISK_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Lines that mean the machine has finished saying something. The poll below
 /// stops on the first of them, which is what keeps a run from waiting out the
@@ -1141,18 +1147,43 @@ fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str) -> Command {
 /// attached until the guest exits or the user detaches. This is the interactive
 /// twin of `boot` (which captures the PL011 to a file and stops at a marker):
 /// same ESP, same firmware, same `qemu-system-aarch64`, only the serial goes to
-/// stdio and no kill follows. The machine currently boots to a one-shot `/init`
-/// that halts after `exit_group`; a persistent interactive shell needs the
-/// drivers stage (serial RX + the idle/park path, `PLAN.md` §9.1 stage 7).
+/// stdio and no kill follows.
+///
+/// What it boots into is the machine's shell, not a stand-in for one. The payload
+/// is an `/init` that makes `/tmp` and `execve`s `/bin/sh`, and the same
+/// multi-call `/bin` image the sweep stages ([`crate::aarch64_bin`]) - so the
+/// program the person types at is the program `t-stdspawn` runs, with the disk
+/// root, the mounted `/dev`, the interrupt-driven console and the network stack
+/// the rest of the boot already brought up. It used to run a hand-encoded
+/// read/echo loop (`aarch64_init::looping_init_elf`), which was honest while the
+/// machine had no shell and became the gap the moment it had one.
+///
+/// The session ends the way a machine with no init left ends: the shell's `exit`
+/// is pid 1's `exit_group`, the scheduler prints `INIT_EXITED` and halts. That is
+/// what the shell is, not a missing feature - a respawning init is a getty's job
+/// and this machine has no userland for one yet.
 pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
     let (kernel, loader) = build(profile)?;
-    let loop_init = crate::aarch64_init::looping_init_elf();
+    let init = crate::aarch64_init::build_shell_init(build_dir)?;
+    // One build, staged under every name it answers to, exactly as the sweep does
+    // it: the shell an interactive session gets is the `sh` applet of the tools
+    // its own commands run, because `/bin` holds one image rather than one
+    // program per name.
+    let tools = crate::aarch64_bin::build(build_dir)?;
+    let tool_paths: Vec<String> = crate::aarch64_bin::APPLETS
+        .iter()
+        .map(|applet| format!("bin/{applet}"))
+        .collect();
+    let mut entries: Vec<(&str, &[u8])> = vec![("init", init.as_slice())];
+    for path in &tool_paths {
+        entries.push((path.as_str(), tools.as_slice()));
+    }
     let esp = build_esp(
         build_dir,
         &kernel,
         &loader,
-        &[("init", loop_init.as_slice())],
-        DISK_BYTES,
+        &entries,
+        INTERACTIVE_DISK_BYTES,
     )?;
     let (code, vars_src) = firmware()?;
     let vars = vars_path(build_dir);
@@ -1165,8 +1196,9 @@ pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
     })?;
 
     println!(
-        "booting aarch64 interactively: a read/echo loop on the serial console \
-         (type a line, it echoes back prefixed R:; Ctrl-A x to exit QEMU)"
+        "booting aarch64 interactively: /init hands pid 1 to /bin/sh on the serial \
+         console (type a line and press Enter; `exit` halts the machine; Ctrl-A x \
+         exits QEMU)"
     );
     let mut qemu = aarch64_qemu(&esp, &code, &vars, "mon:stdio");
     let status = qemu

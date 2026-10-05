@@ -909,6 +909,14 @@ fn pages_of(virt: usize, len: usize) -> core::ops::Range<usize> {
 /// address from user mode walks every page it touches and refuses the ones
 /// that are unmapped or kernel-half. It runs inside the syscall gate, where
 /// the active tables are still the caller's.
+///
+/// `arch/aarch64/paging.rs`'s `user_accessible` is the same policy over that
+/// machine's descriptors - including the absent-page fallback below and the
+/// copy-on-write writable exception, both of which it lacked until a shell's
+/// first `read` on the second machine answered `EFAULT` (`PLAN.md` §13.9). The
+/// two copies exist because the policy needs the machine's table walk and
+/// `sched`'s VMA table, which no layer below `arch` may name; a third port
+/// writes the same three rules again.
 pub fn user_accessible(start: usize, len: usize, write: bool) -> bool {
     if len == 0 {
         return true;

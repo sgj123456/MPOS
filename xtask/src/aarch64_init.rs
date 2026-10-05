@@ -3,18 +3,16 @@
 //! Stage 6/7's image prerequisite. The kernel's ELF loader (`src/mm/elf.rs`) was
 //! taught `EM_AARCH64` in 6g, and `spawn_init`/`load_user` map the segments and
 //! jump to `e_entry` - but something must *produce* an aarch64 binary for the
-//! initramfs. This file does.
+//! initramfs. This file does, in the two ways the payloads need.
 //!
-//! It is deliberately hand-encoded rather than built with a cross compiler. Two
-//! reasons, both the house's: a build step that shells out to `clang` plus a
-//! rustup-internal `ld.lld` path would add a fragile host prerequisite to the boot
-//! path and make the artifact non-hermetic (a test that has to run the compiler to
-//! know the answer tests the compiler, not the image). And the programs are a couple
-//! dozen straight-line instructions, so each fits in a page and every byte is pinned
-//! here against `llvm-objdump`'s own decoding of the built image (encode, then
-//! disassemble, then confirm), not a hand-guess at the bit layout.
-//!
-//! Two images, one assembler:
+//! The *hand-encoded* images are the headless verdict's, and they are hand-encoded
+//! on purpose: a build step that shells out to `clang` plus a rustup-internal
+//! `ld.lld` path would add a fragile host prerequisite to the boot path and make
+//! the artifact non-hermetic (a test that has to run the compiler to know the
+//! answer tests the compiler, not the image). Each is a couple dozen straight-line
+//! instructions, so it fits in a page and every byte is pinned here against
+//! `llvm-objdump`'s own decoding of the built image (encode, then disassemble,
+//! then confirm), not a hand-guess at the bit layout:
 //!
 //! - [`exec_launcher_init_elf`] (the headless verdict's `/init`) echoes the queued
 //!   line - writes back what it read prefixed with `R:` (the tty's own echo of the
@@ -31,16 +29,22 @@
 //!   so their appearance proves `execve` transferred to a *second* image that ran at
 //!   EL0 and that `clone` started a *third* process (stage 6D).
 //!
-//! - [`looping_init_elf`] (the interactive `run --arch aarch64`'s) is the echo body
-//!   with the exit replaced by a branch back to the top, so it is a read/echo
-//!   *forever* - a REPL stand-in a person can type into. It never exits, which is
-//!   exactly why it must not be the headless verdict's image: with nobody to type,
-//!   its second `read(0)` parks (the tty wakes it only when a line lands,
-//!   `read_wait`'s canonical `UntilInput`) and `INIT_EXITED` never comes. A real
-//!   shell (busybox `ash`) is this loop plus `execve` of the shell binary; the
-//!   `execve`/`clone`/`wait4` paths and an unmodified static-musl ELF running at EL0
-//!   are all built and pinned by the verdict's `MPOS_MUSL_OK` (stages 6D + the
-//!   demand-paging handler).
+//! The *rustc-built* programs are the ones that do real work, where hand-encoding
+//! would be a toy of the thing rather than a smaller version of it: the sweep's
+//! runner ([`build_sweep_init`], which runs every `/t-*`), the unmodified-musl
+//! probe ([`build_static_musl_helper`]) and the interactive boot's init
+//! ([`build_shell_init`]). All three are static `aarch64-unknown-linux-musl`
+//! binaries and share [`build_static_musl`], because the flags that make such a
+//! binary - `+crt-static`, `rust-lld`, stripped, `-O` - are one answer and not
+//! three.
+//!
+//! The interactive `/init` used to be a third hand-encoded image here
+//! (`looping_init_elf`): the echo body with the exit replaced by a branch to the
+//! top, a read/echo REPL stand-in written while the machine had no shell. It is
+//! gone. The shell it stood in for is a real program in the payload
+//! (`crate::aarch64_bin`'s `sh` applet), so the boot execs *that* - a hand-coded
+//! interpreter that can only echo was the gap, and answering it with a second
+//! interpreter would have been the same gap twice.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -90,17 +94,6 @@ fn svc() -> u32 {
 /// `MOV Xd, Xm` (the `ORR Xd, XZR, Xm` alias).
 fn movreg(rd: u32, rm: u32) -> u32 {
     0xaa00_03e0u32 | (rm << 16) | rd
-}
-
-/// An unconditional branch back to the first instruction of a block `n_words`
-/// long, from the last word in it. `B` encodes a signed offset in instruction
-/// units; from word `n_words-1` the top (word 0) is `-(n_words-1)` away, stored
-/// as the `imm26` two's complement. Self-derived from the length so the loop and
-/// its layout cannot disagree.
-fn branch_to_start(n_words: usize) -> u32 {
-    let back = (n_words - 1) as u32;
-    let imm26 = ((1u32 << 26) - back) & 0x03ff_ffff;
-    0x1400_0000u32 | imm26
 }
 
 /// `CBNZ X0, label` - branch to `label` if `x0` is non-zero, given the branch's
@@ -181,35 +174,6 @@ fn assemble_with(code: &[u32], data: &[u8]) -> Vec<u8> {
     let data_off = CODE_OFF + code.len() * 4;
     out[data_off..].copy_from_slice(data);
     out
-}
-
-/// The echo body's data blob: a zero `READ_LEN` scratch buffer then `PREFIX`.
-fn assemble(code: &[u32]) -> Vec<u8> {
-    let mut data = vec![0u8; READ_LEN as usize];
-    data.extend_from_slice(PREFIX);
-    assemble_with(code, &data)
-}
-
-/// The addresses the echo body loads for a block of `n_code` instructions: the
-/// scratch buffer and the prefix, laid out after the code by `assemble`.
-fn data_addrs(n_code: usize) -> (u64, u64) {
-    let buf_off = CODE_OFF + n_code * 4;
-    let prefix_off = buf_off + READ_LEN as usize;
-    (VADDR + buf_off as u64, VADDR + prefix_off as u64)
-}
-
-/// The interactive `/init` `run --arch aarch64` runs: echo in a loop, forever.
-/// Same body as the exec launcher's echo, with `exit_group`/`b .` replaced by a
-/// branch back to the top, so a typed line is read and echoed, then the next is
-/// waited for. See the module header.
-pub fn looping_init_elf() -> Vec<u8> {
-    let body_len = echo_body(0, 0).len();
-    let n = body_len + 1; // the body plus the single backward branch
-    let (buf_addr, prefix_addr) = data_addrs(n);
-    let mut code = echo_body(buf_addr, prefix_addr);
-    code.push(branch_to_start(n));
-    debug_assert_eq!(code.len(), n);
-    assemble(&code)
 }
 
 /// `aarch64` asm-generic syscall numbers used below (Linux's, from `nr.rs`'s
@@ -434,6 +398,104 @@ pub fn write_initramfs_entries(
     Ok(())
 }
 
+/// Compile one static `aarch64-unknown-linux-musl` program and answer its bytes.
+///
+/// `stem` is the name under `build/` both the source and the binary take; `what`
+/// names the program in the failure messages a reader sees when `rustc` is
+/// missing its target. One function rather than one per program because the flags
+/// *are* the definition of such a binary - static, no dynamic loader to find at
+/// `execve`, stripped, optimized - and three copies of them would be three places
+/// for that definition to drift.
+///
+/// The `aarch64-unknown-linux-musl` target is a prerequisite the aarch64 commands
+/// already have (the sweep's runner and the musl helper are built this way); a
+/// missing one is an error naming the install command rather than a silent skip,
+/// because a sweep that quietly runs nothing is the one failure this must not
+/// have.
+fn build_static_musl(build_dir: &Path, stem: &str, src: &str, what: &str) -> Result<Vec<u8>> {
+    let path = build_dir.join(format!("{stem}.rs"));
+    let out = build_dir.join(stem);
+    std::fs::write(&path, src).with_context(|| format!("Failed to write {}", path.display()))?;
+
+    let status = Command::new("rustc")
+        .arg("--target")
+        .arg("aarch64-unknown-linux-musl")
+        .args(["-C", "target-feature=+crt-static"])
+        .args(["-C", "linker=rust-lld"])
+        .args(["-C", "strip=symbols"])
+        .arg("-O")
+        .arg(&path)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .with_context(|| format!("Failed to run rustc for {what}"))?;
+    if !status.success() {
+        anyhow::bail!(
+            "rustc failed building {what} ({status}); the \
+             aarch64-unknown-linux-musl target must be installed: \
+             `rustup target add aarch64-unknown-linux-musl`"
+        );
+    }
+    let bytes = std::fs::read(&out).with_context(|| format!("Failed to read {}", out.display()))?;
+    // Sanity: it really is a static EM_AARCH64 ELF the loader will accept. The
+    // loader matches on the machine, so a host build that leaked through here
+    // would be a payload the machine refuses rather than a program that fails.
+    if bytes.len() < 20
+        || &bytes[0..4] != b"\x7fELF"
+        || u16::from_le_bytes([bytes[18], bytes[19]]) != EM_AARCH64
+    {
+        anyhow::bail!("{what} is not an EM_AARCH64 ELF");
+    }
+    Ok(bytes)
+}
+
+/// The interactive `run --arch aarch64`'s `/init`: the machine setup a shell
+/// session needs, then `execve("/bin/sh")` so the shell *is* pid 1.
+///
+/// It replaces the hand-encoded read/echo loop that stood in for a shell while
+/// the second machine had none (see the module header). Its own job is the two
+/// lines the x86 `/init` script does for the shell before starting it: make
+/// `/tmp`, and hand over. `exec` rather than spawn keeps the shell on pid 1, which
+/// is what the kernel's handoff expects and what makes the session's `exit` the
+/// machine's `INIT_EXITED` - the honest end for a machine whose init left.
+///
+/// `/tmp` is a plain directory here, not the tmpfs the *sweep's* runner mounts:
+/// that one is a tmpfs because the subject of a test it stages is an `AF_UNIX`
+/// name, and an ext4 directory cannot hold a socket node. Nothing the interactive
+/// shell is asked to do needs a name the disk cannot hold, so it does not take a
+/// mount for it.
+///
+/// `/proc`, `/sys` and `/dev` are not mounted: `/dev` is already there (the kernel
+/// mounts its own set before handing over), and the other two are named gaps on
+/// this machine (`PLAN.md` §9.1 - `procfs`/`sysfs` read the first machine's PCI
+/// tree and vcmux), which an init must not fake with an empty directory.
+pub fn build_shell_init(build_dir: &Path) -> Result<Vec<u8>> {
+    const SRC: &str = r#"use std::os::unix::process::CommandExt;
+
+fn main() {
+    match std::fs::create_dir("/tmp") {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => eprintln!("init: /tmp: {e}"),
+    }
+    println!("mpos: init handing over to /bin/sh");
+    // The shell replaces this image, so it runs as pid 1 with the console as
+    // fd 0/1/2 - the descriptors the kernel installed for the init. `exec` only
+    // returns if it failed, and then the honest answer is to say why and stop
+    // rather than loop: an init that cannot start its shell has nothing to run.
+    let error = std::process::Command::new("/bin/sh").exec();
+    eprintln!("init: exec /bin/sh: {error}");
+    std::process::exit(1);
+}
+"#;
+    build_static_musl(
+        build_dir,
+        "aarch64-shell-init",
+        SRC,
+        "the aarch64 interactive init",
+    )
+}
+
 /// The aarch64 sweep's `/init`: an ordinary `std` program that runs every `/t-*`
 /// the payload staged and prints the same verdict protocol the x86 test `/init`
 /// does, so the harness parses both machines with one reader.
@@ -600,37 +662,12 @@ fn main() {
     println!("=== END");
 }
 "#;
-    let src = build_dir.join("aarch64-sweep-init.rs");
-    let out = build_dir.join("aarch64-sweep-init");
-    std::fs::write(&src, SRC).with_context(|| format!("Failed to write {}", src.display()))?;
-
-    let status = Command::new("rustc")
-        .arg("--target")
-        .arg("aarch64-unknown-linux-musl")
-        .args(["-C", "target-feature=+crt-static"])
-        .args(["-C", "linker=rust-lld"])
-        .args(["-C", "strip=symbols"])
-        .arg("-O")
-        .arg(&src)
-        .arg("-o")
-        .arg(&out)
-        .status()
-        .context("Failed to run rustc for the aarch64 sweep init")?;
-    if !status.success() {
-        anyhow::bail!(
-            "rustc failed building the aarch64 sweep init ({status}); the \
-             aarch64-unknown-linux-musl target must be installed: \
-             `rustup target add aarch64-unknown-linux-musl`"
-        );
-    }
-    let bytes = std::fs::read(&out).with_context(|| format!("Failed to read {}", out.display()))?;
-    if bytes.len() < 20
-        || &bytes[0..4] != b"\x7fELF"
-        || u16::from_le_bytes([bytes[18], bytes[19]]) != EM_AARCH64
-    {
-        anyhow::bail!("the aarch64 sweep init is not an EM_AARCH64 ELF");
-    }
-    Ok(bytes)
+    build_static_musl(
+        build_dir,
+        "aarch64-sweep-init",
+        SRC,
+        "the aarch64 sweep init",
+    )
 }
 
 /// An *unmodified* Rust `std` program compiled to a statically-linked
@@ -824,47 +861,19 @@ pub fn build_static_musl_helper(build_dir: &Path) -> Result<Vec<u8>> {
         "    if sok { println!(\"MPOS_STAT_OK\"); } else { println!(\"MPOS_STAT_FAILED\"); }\n",
         "}\n",
     );
-    let src = build_dir.join("aarch64-musl-helper.rs");
-    let out = build_dir.join("aarch64-musl-helper");
-    std::fs::write(&src, SRC).with_context(|| format!("Failed to write {}", src.display()))?;
-
-    let status = Command::new("rustc")
-        .arg("--target")
-        .arg("aarch64-unknown-linux-musl")
-        .args(["-C", "target-feature=+crt-static"])
-        .args(["-C", "linker=rust-lld"])
-        .args(["-C", "strip=symbols"])
-        .arg("-O")
-        .arg(&src)
-        .arg("-o")
-        .arg(&out)
-        .status()
-        .context("Failed to run rustc for the aarch64 musl helper")?;
-    if !status.success() {
-        anyhow::bail!(
-            "rustc failed building the aarch64 musl helper ({status}); the \
-             aarch64-unknown-linux-musl target must be installed: \
-             `rustup target add aarch64-unknown-linux-musl`"
-        );
-    }
-    let bytes = std::fs::read(&out).with_context(|| format!("Failed to read {}", out.display()))?;
-    // Sanity: it really is a static EM_AARCH64 ELF the loader will accept.
-    if bytes.len() < 20
-        || &bytes[0..4] != b"\x7fELF"
-        || u16::from_le_bytes([bytes[18], bytes[19]]) != EM_AARCH64
-    {
-        anyhow::bail!("the aarch64 musl helper is not an EM_AARCH64 ELF");
-    }
-    Ok(bytes)
+    build_static_musl(
+        build_dir,
+        "aarch64-musl-helper",
+        SRC,
+        "the aarch64 musl helper",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The pinned instruction counts the tests assert the built code has, which
-    /// also pin that the loop's backward branch spans exactly the body.
-    const LOOP_WORDS: usize = 20;
+    /// The pinned instruction counts the tests assert the built code has.
     const LAUNCHER_WORDS: usize = 39;
     const TARGET_WORDS: usize = 43;
 
@@ -996,36 +1005,5 @@ mod tests {
             musl_path_addr.to_le_bytes(),
             "argv[0] points at the /musl path"
         );
-    }
-
-    /// The loop image is the same body but ends in a branch back to the top, not
-    /// an exit: word 0 is still `mov x8,#63`, the last word is `B` with a signed
-    /// offset that lands on word 0 (`-(LOOP_WORDS-1)` instructions), and there is
-    /// no `exit_group` in it.
-    #[test]
-    fn the_loop_echoes_forever() {
-        let e = looping_init_elf();
-        assert_loadable(&e);
-        let words = words_of(&e, LOOP_WORDS);
-        assert_eq!(words.len(), LOOP_WORDS);
-        assert_eq!(words[0], 0xd28007e8, "mov x8,#63 (read)");
-        assert_eq!(words[6], 0xaa0003e9, "mov x9,x0 (stash n)");
-        assert!(
-            !words.contains(&0xd2800bc8),
-            "the loop has no exit_group - it never leaves"
-        );
-
-        // The final word decodes as an unconditional branch whose offset, from the
-        // last instruction, points back at the first.
-        let last = words[LOOP_WORDS - 1];
-        assert_eq!(last >> 26, 0x05, "opcode 0x14000000 is B");
-        let imm26 = last & 0x03ff_ffff;
-        // Reinterpret the 26-bit field as signed; it must equal -(n_words-1).
-        let signed = if imm26 & (1 << 25) != 0 {
-            (imm26 as i64) - (1i64 << 26)
-        } else {
-            imm26 as i64
-        };
-        assert_eq!(signed, -(LOOP_WORDS as i64) + 1, "branch targets word 0");
     }
 }

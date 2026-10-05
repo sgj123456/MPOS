@@ -89,7 +89,7 @@ cargo xtask [global flags] <command>
 | 构建目录 | `--build-dir <PATH>` | 默认 `$MPOS_BUILD_DIR`，再默认 `build/` | default `$MPOS_BUILD_DIR`, else `build/` |
 | 构建档 | `--profile <NAME>` | 默认 `$PROFILE`，再默认 `debug`；发布用 `--profile release` | default `$PROFILE`, else `debug`; use `--profile release` |
 | 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror`（默认取 `machine.toml` 的 `[qemu] mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror` (defaults to `[qemu] mode` in `machine.toml`, else `mirror`) |
-| 机器 | `--arch <ARCH>` | 全局：`x86_64`（默认）或 `aarch64`。两条路都真的启动那台机器：`run` 让第二台机器跑交互式「读一行、回显」的 `/init`，`test` 走它自己的 sweep（见下）| global: `x86_64` (default) or `aarch64`. Both arms really boot that machine: `run` leaves the second one on an interactive read-a-line/echo `/init`, and `test` takes its own sweep (below) |
+| 机器 | `--arch <ARCH>` | 全局：`x86_64`（默认）或 `aarch64`。两条路都真的启动那台机器：`run` 让第二台机器把 pid 1 交给它自己的 shell（`/init` 建好 `/tmp` 后 `execve("/bin/sh")`，`/bin` 是仓库内建的多调用二进制，见下），`test` 走它自己的 sweep（见下）| global: `x86_64` (default) or `aarch64`. Both arms really boot that machine: `run` hands the second one's pid 1 to its own shell (`/init` makes `/tmp` and `execve`s `/bin/sh`; `/bin` is the repository's multi-call binary — see below), and `test` takes its own sweep (below) |
 | 测试分组 | `--groups <A,B>` | 仅 `test`：除分组外的测试之外再跑这些分组（取代 `tests.toml` 的 `default`）| `test` only: run these groups *in addition* to the ungrouped tests (replaces the file's `default`) |
 | 全部分组 | `--all-groups` | 仅 `test`：连非默认分组一起跑 | `test` only: run every group, including the ones left out by default |
 
