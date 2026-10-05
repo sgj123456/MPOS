@@ -413,6 +413,18 @@ global_asm!(
     // inverse of the trap's save: a frame the vector wrote is a frame this reads
     // back, and a drift between the two would show up here, not as a corrupt
     // register on some later resume.
+    //
+    // The section is *named* rather than left to the assembler, and that is not
+    // decoration. One `global_asm!` per crate is emitted into one assembly unit,
+    // so a block that names no section lands wherever the last `.section`
+    // directive left it - and this file's neighbours include one that switches to
+    // a *data* section (`mod.rs`'s EL0 program). Measured: these routines were
+    // once assembled into `.rodata.el0_program` that way, and since the kernel
+    // maps `.rodata` read-only the first call to `mpos_context_round_trip` was an
+    // instruction abort with the fault address inside the image. Code that names
+    // its own section cannot be moved by the order its block happens to be
+    // emitted in; `linker.ld` asserts the result.
+    ".section .text.context, \"ax\"",
     ".globl mpos_enter_frame",
     ".p2align 4",
     "mpos_enter_frame:",
@@ -497,6 +509,8 @@ pub unsafe fn set_kernel_stack(_top: usize) {}
 
 global_asm!(
     // x0: the context being suspended (written). x1: the one being resumed.
+    // The section is named for the reason `mpos_enter_frame` above names it.
+    ".section .text.context, \"ax\"",
     ".globl mpos_context_switch",
     ".p2align 4",
     "mpos_context_switch:",
@@ -785,6 +799,8 @@ global_asm!(
     // needed cannot be written from Rust at all: `x19` is reserved as an inline
     // asm operand. A `global_asm!` routine has neither problem, because it is
     // the function the ABI describes rather than a block inside one.
+    // The section is named for the reason `mpos_enter_frame` above names it.
+    ".section .text.context, \"ax\"",
     ".globl mpos_context_round_trip",
     ".p2align 4",
     "mpos_context_round_trip:",

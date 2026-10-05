@@ -1320,8 +1320,24 @@ static INITRAMFS_LEN: AtomicUsize = AtomicUsize::new(0);
 // The kernel's text is EL1-only and read-only, and mapping *that* page into a
 // user space would hand a program the kernel's code; a loader copies bytes into
 // a fresh frame, and there is no reason for a check to do anything else.
+//
+// It has a section of its own because it is *data*: bytes the kernel never
+// executes where they are linked, which is why the W^X plan need not give them
+// execute permission. The section is entered with `.pushsection` and left with
+// `.popsection`, and that is load-bearing rather than tidiness. Every
+// `global_asm!` in this crate is emitted into one assembly unit, and a block
+// that names no section lands in whatever directive was last in effect - so a
+// block that *changes* the section without changing it back moves every block
+// assembled after it into its section, silently and with no diagnostic. Measured:
+// with `.section` here and no restore, `context.rs`'s three code blocks
+// (`mpos_enter_frame`, `mpos_context_switch` with `mpos_task_trampoline`, and
+// `mpos_context_round_trip`) were assembled into `.rodata.el0_program`, the
+// kernel therefore mapped them read-only, and the first call to one - stage 2's
+// context check - was an instruction abort whose fault address was inside the
+// image. `linker.ld` now asserts the placement so the next such leak fails the
+// link instead of the boot.
 global_asm!(
-    ".section .rodata.el0_program, \"a\"",
+    ".pushsection .rodata.el0_program, \"a\"",
     ".balign 4",
     ".globl __aarch64_el0_program",
     "__aarch64_el0_program:",
@@ -1337,6 +1353,7 @@ global_asm!(
     "1:  b 1b",
     ".globl __aarch64_el0_program_end",
     "__aarch64_el0_program_end:",
+    ".popsection",
     answer = const ANSWER_VA as u64,
     exit_group = const 94u64,
 );

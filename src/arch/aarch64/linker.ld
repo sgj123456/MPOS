@@ -79,6 +79,31 @@ SECTIONS
 
     kernel_end = .;
 
+    /* Every code symbol this kernel defines in assembly must land in the
+       executable range. These four are all of them: the rest of the kernel's
+       code is Rust functions, which name their own section, and
+       `__aarch64_el0_program` is deliberately *not* here because it is data -
+       code the kernel never runs where it is linked, so it belongs in `.rodata`
+       and the W^X plan is right to map it read-only.
+
+       They are checked here because where they land is decided by the `.section`
+       directive last in effect in the assembly unit they are emitted into, which
+       this script does not control; an assertion is the only place that sees the
+       answer. Measured, when one of those blocks switched to a data section and
+       did not switch back: `mpos_context_round_trip` was assembled into
+       `.rodata`, the kernel mapped it read-only, and the first call to it - stage
+       2's context check - was an instruction abort whose fault address was inside
+       the image, two layers away from the placement that caused it. A link-time
+       failure that names the symbol is the same mistake caught where it is made. */
+    ASSERT(mpos_enter_frame >= __text_start && mpos_enter_frame < __text_end,
+        "mpos_enter_frame was assembled outside the executable section")
+    ASSERT(mpos_context_switch >= __text_start && mpos_context_switch < __text_end,
+        "mpos_context_switch was assembled outside the executable section")
+    ASSERT(mpos_context_round_trip >= __text_start && mpos_context_round_trip < __text_end,
+        "mpos_context_round_trip was assembled outside the executable section")
+    ASSERT(mpos_task_trampoline >= __text_start && mpos_task_trampoline < __text_end,
+        "mpos_task_trampoline was assembled outside the executable section")
+
     /DISCARD/ : {
         *(.eh_frame*)
         *(.note .note.*)
