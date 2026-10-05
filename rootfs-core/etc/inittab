@@ -1,0 +1,44 @@
+# /etc/inittab - mpos: shells on the virtual consoles, kernel log on the serial line
+#
+# The one inittab both machines get. It is shared because everything below it
+# is one kernel's answer on both machines since §13.16 ported the console
+# multiplexer here: `tty1`..`tty4` are real pty-backed terminals everywhere,
+# the vcmux carries each console's bytes over the serial wire on *both*, and
+# `^A 1`..`^A 4` switches between them. A per-machine copy of this file used to
+# be a fact about the second machine having no mux; that fact is gone, so the
+# file is one.
+#
+# The respawn entries below name the virtual consoles `tty1`..`tty4`. The
+# serial port itself carries only the kernel's log, which is why nothing here
+# puts a getty on it.
+#
+# The build renders exactly one line of this file per machine, and the rule
+# that decides it is a fact about the *boot*, not the kernel: an x86_64 session
+# gets a graphical window, so its consoles reach the screen through the
+# framebuffer and nothing extra is rendered. The second machine's interactive
+# `run` attaches no window at all - its wire *is* the console - so there the
+# build replaces the marker line below with a getty on the machine's own serial
+# node, named from `[rootfs] serial_port`, because the psABI name is the
+# machine's (`ttyAMA0` on the PL011, `ttyS0` on the 16550). The renderer
+# replaces the whole marker line, never a word inside one - keep the marker
+# alone on its line, and never spell it out in prose above.
+#
+# This file is the configuration - add a fifth console by adding a line, not by
+# editing the build.
+
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+tty1::respawn:/sbin/getty 38400 tty1
+tty2::respawn:/sbin/getty 38400 tty2
+tty3::respawn:/sbin/getty 38400 tty3
+tty4::respawn:/sbin/getty 38400 tty4
+
+@SERIAL_GETTY@
+
+# Stuff to do for the 3-finger salute
+::ctrlaltdel:/sbin/reboot
+
+# Stuff to do before rebooting
+::shutdown:/sbin/openrc shutdown

@@ -1,7 +1,7 @@
 # The root filesystem overlay
 
 Whatever is in this directory is merged into the root filesystem the image is
-built with: the *contents* map to that system's root, so `rootfs/etc/inittab`
+built with: the *contents* map to that system's root, so `rootfs-core/etc/inittab`
 becomes `/etc/inittab` and replaces what the packages put there. Directories are
 merged; files and symlinks overwrite.
 
@@ -9,17 +9,33 @@ It is applied on every rootfs build - a boot-files update included - and after
 everything generated from `rootfs.toml`, so a file here is the authority over
 anything the build writes.
 
+## Core and machine trees
+
+This tree is the **shared** half of both machines' userlands: one copy of each
+file, installed onto the x86_64 image and the aarch64 image alike. The
+per-machine overlays (`rootfs/`, `rootfs-aarch64/`) merge *after* it, so a
+machine may still replace anything here - but the place to put a file both
+machines want is this one, and the only reason to put it elsewhere is a real
+hardware absence (no GPU, no PCI) or a genuine psABI difference.
+
+`etc/inittab` carries the one rendered line: `@SERIAL_GETTY@` becomes nothing
+by default, or a getty on the machine's own serial node when an interactive
+boot needs the login on the wire rather than on the virtual consoles. The
+substitution happens in `xtask/src/rootfs.rs` (`render_inittab`).
+
 ## What is configured here rather than in rootfs.toml
 
 | File | Is |
 |------|-----|
-| `etc/inittab` | what runs at boot, and how many consoles get a getty |
-| `etc/network/interfaces` | the network: interfaces, addressing, the hook lines |
+| `etc/inittab` | what runs at boot, and how many consoles get a getty (shared: the vcmux carries each virtual console to the wire on both machines since §13.16) |
+| `etc/network/interfaces` | the network: interfaces, addressing, the hook lines - virtio-net is a device on both machines |
 | `etc/resolv.conf` | the resolver - QEMU's user-mode forwarder at 10.0.2.3 |
 | `etc/doas.conf` | who may escalate: `wheel`, no password |
-| `etc/profile.d/xdg-runtime.sh` | `XDG_RUNTIME_DIR` for the login shells |
-| `etc/fish/conf.d/xdg-runtime.fish` | the same for the `fish` shells |
-| `etc/local.d/xdg-runtime.start` | makes `/run/user/<uid>` at boot (see below) |
+
+The Wayland session's pieces stay in `rootfs/`: `etc/profile.d/xdg-runtime.sh`,
+`etc/fish/conf.d/xdg-runtime.fish` and `etc/local.d/xdg-runtime.start` exist for
+a compositor this machine has no GPU for, so they are the first machine's
+overlay, not the core's.
 
 `rootfs.toml` is for the values the build has to interpolate - the hostname, the
 accounts and their passwords, the package list, the mirror, the disk layout -
@@ -45,10 +61,11 @@ cgroups) does not create one.
 
 ## Adding something
 
-Drop it in: `rootfs/etc/init.d/custom-service` becomes
-`/etc/init.d/custom-service` on the image, and the next `cargo xtask rootfs`
-copies it in - no reinstall, no package list to change. To have it *started*,
-name it in `SERVICES` in `xtask/src/rootfs.rs`.
+Drop it in: `rootfs-core/etc/init.d/custom-service` becomes
+`/etc/init.d/custom-service` on **both** images (or `rootfs/...` for one
+machine's own), and the next `cargo xtask rootfs` copies it in - no reinstall,
+no package list to change. To have it *started*, name it in `SERVICES` in
+`xtask/src/rootfs.rs` - that table is already both machines'.
 
 A service script has to be executable for OpenRC to start it:
 

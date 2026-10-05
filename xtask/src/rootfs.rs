@@ -183,7 +183,7 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // any name either writes.
     enable_services(&mount_dir)?;
     write_modules(&mount_dir)?;
-    utils::merge_overlay(&root.join("rootfs"), &mount_dir)?;
+    merge_overlays(&root, "rootfs", &mount_dir)?;
     write_resolver(&mount_dir, &config)?;
 
     // Detached before the stamp, not after: the nbd server can still be
@@ -255,10 +255,13 @@ pub fn needs_rebuild(build_dir: &Path, profile: &str) -> Result<bool> {
         }
     }
 
-    // The overlay is a tree rather than a file: a file added under `rootfs/`
-    // is an input the stamp knows nothing about until it is written, so the
-    // tree's own contents are what say it changed.
-    utils::dir_newer_than(&root.join("rootfs"), utils::file_mtime(&stamp)?)
+    // The overlay is two trees rather than one - the shared core and this
+    // machine's own - and a tree is not a file: a file added under either is an
+    // input the stamp knows nothing about until it is written, so the trees'
+    // own contents are what say they changed.
+    let stamp_time = utils::file_mtime(&stamp)?;
+    Ok(utils::dir_newer_than(&root.join(CORE_OVERLAY), stamp_time)?
+        || utils::dir_newer_than(&root.join("rootfs"), stamp_time)?)
 }
 
 /// `/etc/fstab`: the root filesystem by UUID, which is the one name for it
@@ -429,6 +432,84 @@ pub(crate) fn write_resolver(mount_dir: &Path, config: &RootfsConfig) -> Result<
             "# Written from `[system] dns` in rootfs.toml; the guest asks this\n# server directly, carried over QEMU's user-mode network.\nnameserver {dns}\n"
         ),
     )?;
+    Ok(())
+}
+
+/// The repository's machine-neutral overlay: one copy of each file, merged into
+/// **both** images before their per-machine trees. A file belongs here when both
+/// machines want the same answer and nothing about the hardware says otherwise;
+/// `rootfs-core/root/README` is the inventory and the rule.
+pub(crate) const CORE_OVERLAY: &str = "rootfs-core";
+
+/// Merge the shared core first, then the machine's own tree over it - so a
+/// machine may still replace anything the core carries, and the pair is applied
+/// by every install path on both machines. `src` names are resolved against the
+/// repository root; a missing directory merges nothing (`merge_overlay`'s
+/// documented answer), which keeps the second machine's small tree honest
+/// without a special case here.
+pub(crate) fn merge_overlays(root: &Path, machine_tree: &str, mount_dir: &Path) -> Result<()> {
+    utils::merge_overlay(&root.join(CORE_OVERLAY), mount_dir)?;
+    utils::merge_overlay(&root.join(machine_tree), mount_dir)
+}
+
+/// Render the shared `/etc/inittab` for one machine.
+///
+/// `@SERIAL_GETTY@` is the template's only per-machine line, and its two
+/// answers are both facts about the *boot*, not the kernel: an x86_64 session
+/// gets a window, so its consoles reach the screen through the framebuffer and
+/// the placeholder becomes empty (the stock file's shape). The second
+/// machine's interactive `run` attaches no window at all - its wire *is* the
+/// console - so there the placeholder becomes a getty on the machine's own
+/// serial node, named from `[rootfs] serial_port` because the psABI name is
+/// the machine's (`ttyAMA0` on the PL011, `ttyS0` on the 16550).
+///
+/// Everything else in the file is one kernel's answer on both machines since
+/// §13.16 ported the vcmux: the virtual consoles carry their bytes to the
+/// serial wire everywhere, so the getty lines need no branch.
+pub(crate) fn render_inittab(
+    mount_dir: &Path,
+    config: &RootfsConfig,
+    serial_getty: bool,
+) -> Result<()> {
+    let path = mount_dir.join("etc/inittab");
+    let text = fs::read_to_string(&path)?;
+    if !text.lines().any(|l| l.trim() == "@SERIAL_GETTY@") {
+        anyhow::bail!(
+            "rootfs: the shared inittab has no @SERIAL_GETTY@ line to render - \
+             the template drifted from what `render_inittab` reads"
+        );
+    }
+    // A whole-line replacement, never a bare word substitution: the comment
+    // block explains the rendering *with* the placeholder token in it, and a
+    // word-level replace would render that prose too.
+    let line = if serial_getty {
+        format!(
+            "{port}::respawn:/sbin/getty -L 38400 {port} vt100",
+            port = config.serial_port
+        )
+    } else {
+        String::new()
+    };
+    let rendered: Vec<&str> = text
+        .lines()
+        .map(|l| {
+            if l.trim() == "@SERIAL_GETTY@" {
+                line.as_str()
+            } else {
+                l
+            }
+        })
+        .collect();
+    // The placeholder's own blank line goes with an empty render, so the
+    // stock answer keeps the file's spacing exactly as the old per-machine one
+    // had it; a rendered getty keeps its surrounding blanks like any other entry.
+    let mut out = if line.is_empty() {
+        rendered.join("\n").replace("\n\n", "\n")
+    } else {
+        rendered.join("\n")
+    };
+    out.push('\n');
+    fs::write(&path, out)?;
     Ok(())
 }
 
@@ -1337,6 +1418,130 @@ mod tests {
         );
         let locale = fs::read_to_string(dir.join("etc/profile.d/locale.sh")).unwrap();
         assert!(locale.contains("export LANG=C.UTF-8"), "{locale}");
+    }
+
+    #[test]
+    fn the_shared_inittab_renders_one_getty_line_per_machine() {
+        // The two answers `render_inittab` may give, and the shape each must
+        // leave behind. The x86_64 half is a regression pin: it asserts the
+        // rendered file is *byte-identical* to what the repository's own tree
+        // carried before the core split - the placeholder and its blank line
+        // vanish together, so the stock image's inittab cannot drift just
+        // because it gained a template. The aarch64 half pins the getty's
+        // exact spelling, node name included, because that line is the whole
+        // difference between the two machines' boots.
+        let config = load_config(
+            "inittab",
+            "[rootfs]\nserial_port = \"ttyAMA0\"\n[system]\nhostname = \"mpos\"\n",
+        );
+
+        for (name, serial_getty) in [("plain", false), ("serial", true)] {
+            let dir = staged_dir(name);
+            fs::write(
+                dir.join("etc/inittab"),
+                fs::read(
+                    crate::utils::project_root()
+                        .unwrap()
+                        .join("rootfs-core/etc/inittab"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            render_inittab(&dir, &config, serial_getty).unwrap();
+            let text = fs::read_to_string(dir.join("etc/inittab")).unwrap();
+            assert!(
+                !text.contains("@SERIAL_GETTY@"),
+                "the placeholder never survives rendering"
+            );
+            for console in ["tty1", "tty2", "tty3", "tty4"] {
+                assert!(
+                    text.contains(&format!("{console}::respawn:/sbin/getty 38400 {console}")),
+                    "{console}'s getty is on both machines"
+                );
+            }
+            if serial_getty {
+                assert!(
+                    text.contains("ttyAMA0::respawn:/sbin/getty -L 38400 ttyAMA0 vt100\n"),
+                    "the interactive second machine logs in on its own serial node: {text}"
+                );
+            } else {
+                let config_lines: Vec<&str> =
+                    text.lines().filter(|l| !l.starts_with('#')).collect();
+                assert!(
+                    !config_lines
+                        .iter()
+                        .any(|l| l.contains("ttyAMA0") || l.contains("ttyS0")),
+                    "the default answer carries no serial getty at all: {text}"
+                );
+            }
+        }
+
+        let stock = fs::read_to_string(
+            crate::utils::project_root()
+                .unwrap()
+                .join("rootfs-core/etc/inittab"),
+        )
+        .unwrap();
+        let dir = staged_dir("plain");
+        fs::write(dir.join("etc/inittab"), &stock).unwrap();
+        render_inittab(&dir, &config, false).unwrap();
+        let rendered = fs::read_to_string(dir.join("etc/inittab")).unwrap();
+        // The *configuration* half of the file - every non-comment line - must
+        // read exactly as the old per-machine x86_64 file did. The comment
+        // block is allowed to differ (it now explains the rendering); a stray
+        // blank or a lost entry may not.
+        // The configuration half of the file - every non-comment, non-blank
+        // line, in order - must read exactly as the old per-machine x86_64
+        // file did. The comment block and the blank spacing are allowed to
+        // differ (the prose now explains the rendering); a lost or reordered
+        // entry may not.
+        let body = |t: &str| -> Vec<String> {
+            t.lines()
+                .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        // The original file's config lines, copied here so the pin does not
+        // depend on git history: what `rootfs/etc/inittab` said before
+        // §13.19 folded it into the shared template.
+        let old = "::sysinit:/sbin/openrc sysinit\n::sysinit:/sbin/openrc boot\n::wait:/sbin/openrc default\ntty1::respawn:/sbin/getty 38400 tty1\ntty2::respawn:/sbin/getty 38400 tty2\ntty3::respawn:/sbin/getty 38400 tty3\ntty4::respawn:/sbin/getty 38400 tty4\n::ctrlaltdel:/sbin/reboot\n::shutdown:/sbin/openrc shutdown\n";
+        assert_eq!(
+            body(&rendered),
+            body(old),
+            "the stock answer cannot drift from the file it replaced"
+        );
+    }
+
+    #[test]
+    fn the_core_tree_carries_the_files_both_machines_share() {
+        // The inventory `rootfs-core/root/README` claims, checked against the
+        // tree itself: these are the files the convergence moved out of
+        // `rootfs/`, and a drift back (or a GPU-only file sneaking in) fails
+        // here rather than silently re-splitting the userlands.
+        let root = crate::utils::project_root().unwrap();
+        for path in [
+            "rootfs-core/etc/inittab",
+            "rootfs-core/etc/network/interfaces",
+            "rootfs-core/etc/resolv.conf",
+            "rootfs-core/etc/doas.conf",
+            "rootfs-core/root/README",
+        ] {
+            assert!(
+                root.join(path).is_file(),
+                "the shared overlay must carry {path}"
+            );
+        }
+        // And the halves that stayed per-machine, because they are hardware
+        // facts: the Wayland session's pieces live only in `rootfs/`.
+        assert!(root.join("rootfs/etc/profile.d/xdg-runtime.sh").is_file());
+        assert!(
+            !root
+                .join("rootfs-core/etc/profile.d/xdg-runtime.sh")
+                .exists()
+        );
+        // One inittab now exists in the repository, not two.
+        assert!(!root.join("rootfs/etc/inittab").exists());
+        assert!(!root.join("rootfs-aarch64/etc/inittab").exists());
     }
 
     #[test]

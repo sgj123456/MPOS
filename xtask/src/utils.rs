@@ -734,6 +734,32 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_in_the_overlay_lands_as_a_symlink() {
+        // The counterfactual for the second machine's install moving from its
+        // local `copy_tree` (which dereferences: `fs::copy` follows the link)
+        // onto this one merge path. A core file that is a symlink - a timezone
+        // link, an applet alias - must stay a link on both images, or the two
+        // machines' trees would mean different things by the same name.
+        let dir = scratch("overlay-symlink");
+        let src = dir.join("rootfs-core");
+        let dst = dir.join("target");
+        fs::create_dir_all(src.join("usr/share/zoneinfo")).unwrap();
+        fs::write(src.join("usr/share/zoneinfo/UTC"), "tz data").unwrap();
+        fs::create_dir_all(src.join("etc")).unwrap();
+        std::os::unix::fs::symlink("../usr/share/zoneinfo/UTC", src.join("etc/localtime")).unwrap();
+
+        merge_overlay(&src, &dst).unwrap();
+
+        let link = fs::symlink_metadata(dst.join("etc/localtime")).unwrap();
+        assert!(link.file_type().is_symlink(), "landed as: {link:?}");
+        assert_eq!(
+            fs::read_link(dst.join("etc/localtime")).unwrap(),
+            PathBuf::from("../usr/share/zoneinfo/UTC")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_directory_in_the_overlay_replaces_a_file_of_the_same_name() {
         let dir = scratch("overlay-dir");
         let src = dir.join("rootfs");
