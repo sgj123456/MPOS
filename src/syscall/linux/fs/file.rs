@@ -2949,11 +2949,13 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
     count
 }
 
-// The 144-byte `struct stat` writer lives in `abi`: the field offsets are
-// the ABI, and they are pinned there by host tests that read the struct
-// back field by field - an off-by-one word here is invisible to every
-// caller that only reads `st_mode`, and silently answers "empty file" to
-// the ones that ask for `st_size`.
+// The `struct stat` writer lives in `abi`: the field offsets *and the length*
+// are the ABI's - 144 bytes on x86_64, 128 on aarch64 - and both are pinned
+// where they live (host tests for the offsets, `t-stat-buffer` for the length
+// on each machine). An off-by-one word is invisible to every caller that only
+// reads `st_mode`, and silently answers "empty file" to the ones that ask for
+// `st_size`; a length too long is worse, because the bytes past the struct
+// belong to whoever handed the buffer over.
 
 /// Write the 120-byte Linux x86_64 `struct statfs` for the filesystem `name`
 /// spells. Same rule as `stat`: the offsets are the ABI, and every

@@ -210,18 +210,15 @@ fn main() {
         }
     }
     // The scratch tree is emptied and removed *by hand* rather than with
-    // `std::fs::remove_dir_all`, and that is a named gap rather than tidiness.
-    // The first version of this check cleaned up with `remove_dir_all`, and the
-    // second machine faulted the process at `pc 0` inside the call - reproduced
-    // three times, always with the `ok:` line above as the log's last line and
-    // the marker written immediately before `remove_dir_all` never reached. A
-    // *non-empty* `remove_dir_all` had never run on that machine before, so what
-    // it exercises and the three calls below do not - the recursive
-    // open/`getdents64` chain and the empty-name `unlinkat(fd, "",
-    // AT_REMOVEDIR)` it finishes with - is not served there yet. It is named in
-    // `PLAN.md` §13.9 with this reproduction rather than papered over, and the
-    // hand-rolled equivalent below is what this check uses because its subject
-    // is `ls`, not deleting a tree.
+    // `std::fs::remove_dir_all`, because this check's subject is `ls` and not
+    // deleting a tree - the tree's own test is `t-rmtree`. One line of history
+    // is worth keeping, because it is why the by-hand version is here at all:
+    // the first version of this check cleaned up with `remove_dir_all`, and the
+    // second machine faulted the process at `pc 0` inside the call. That was not
+    // the tree walk: this machine's `struct stat` is 128 bytes and the kernel
+    // was filling 144, so the extra bytes landed in a frame musl's `fdopendir`
+    // needed - fixed and pinned in `PLAN.md` §13.10, with `t-stat-buffer` for
+    // the length and `t-rmtree` for the recursive removal.
     if let Ok(entries) = std::fs::read_dir(lsdir) {
         for entry in entries.flatten() {
             let _ = std::fs::remove_file(entry.path());

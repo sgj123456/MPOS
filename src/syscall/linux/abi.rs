@@ -314,8 +314,34 @@ pub(crate) fn mode_of(meta: &Metadata, stored: u32) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// stat(2): the 144-byte struct stat of the x86_64 ABI
+// stat(2): the `struct stat` of the calling machine's ABI
 // ---------------------------------------------------------------------------
+
+/// The ABI's own `struct stat` size, in bytes: 144 on x86_64, 128 on aarch64.
+///
+/// This is a length about the *caller*, not about this writer, and getting it
+/// wrong is not a tidiness problem: the bytes past the struct's end are somebody
+/// else's memory. Measured, and the reason this constant exists - writing the
+/// x86_64 144 on aarch64 put sixteen bytes past every `stat` the kernel was
+/// handed, and a non-empty `std::fs::remove_dir_all` died of it with `pc 0` and
+/// `lr 0` (`ESR 0x82000006`, a translation fault at address 0: a return through
+/// a zeroed link register).
+///
+/// What those bytes land on is the caller's to decide. A program that makes the
+/// syscall itself keeps the buffer in its own frame; a libc's
+/// `stat`/`lstat`/`fstat` do not hand the kernel the caller's buffer at all -
+/// musl's wrapper makes the syscall into a `struct stat` of its own and copies
+/// the fields out, which is how it stays correct where the two layouts differ -
+/// so the overflow is the libc's frame to survive, and most calls do. The one
+/// that did not was `fdopendir`'s.
+///
+/// aarch64's struct is the smaller one because its three clocks are 16-byte
+/// `timespec`s ending at 120 where x86_64's are three 8-byte pairs ending at 96.
+/// The field writes below are the two ABIs' own orders.
+#[cfg(target_arch = "aarch64")]
+const STAT_BYTES: usize = 128;
+#[cfg(not(target_arch = "aarch64"))]
+const STAT_BYTES: usize = 144;
 
 /// The three clocks `struct stat` and `struct statx` report. A filesystem that
 /// keeps them separately (ext2) hands back three distinct values; one that
@@ -342,12 +368,16 @@ pub(crate) fn nlink_of(meta: &Metadata, tracked: u64) -> u64 {
     }
 }
 
-/// Write the 144-byte Linux x86_64 `struct stat` for `meta`.
+/// Write the calling ABI's `struct stat` for `meta` - [`STAT_BYTES`] bytes of
+/// it, and not one byte more.
 ///
 /// The field offsets are the ABI, so they are spelled as the byte offsets of
 /// the struct rather than as indices into a `u64` view - an off-by-one word
 /// here is invisible to every caller that only reads `st_mode`, and silently
-/// answers "empty file" to the ones that ask for `st_size`.
+/// answers "empty file" to the ones that ask for `st_size`. The *length* is the
+/// ABI's too, and for the same reason: the zero-fill below covers the fields no
+/// branch writes (aarch64's `__unused4`/`__unused5`) and stops at the struct's
+/// end, because whatever the caller parked past it is the caller's.
 pub(crate) fn write_stat(
     buf: usize,
     meta: &Metadata,
@@ -358,7 +388,7 @@ pub(crate) fn write_stat(
     owner: (u32, u32),
     times: StatTimes,
 ) -> isize {
-    if !buffer_ok(buf, 144, true, true) {
+    if !buffer_ok(buf, STAT_BYTES, true, true) {
         return err::EFAULT;
     }
     let nlink = nlink_of(meta, nlink);
@@ -372,7 +402,7 @@ pub(crate) fn write_stat(
     };
 
     unsafe {
-        core::ptr::write_bytes(buf as *mut u8, 0, 144);
+        core::ptr::write_bytes(buf as *mut u8, 0, STAT_BYTES);
         let at = |offset: usize| (buf + offset) as *mut u8;
         // st_dev names the *filesystem*, not the file: two files on one
         // filesystem share it, and a file on another has its own. That is

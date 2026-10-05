@@ -15,13 +15,19 @@ contract. Here that is, concretely:
 - **Device `ioctl` request words** — one word per promise, dispatched in
   `src/syscall/linux/fs.rs` and served by the device's own module.
 - **Structure layouts crossing the boundary** — `struct stat`, `rt_sigframe`, `edid`,
-  `sockaddr_ll`, `struct sched_attr`, … `struct stat` is per-ABI: aarch64 uses Linux's
-  asm-generic field order (`st_mode` u32 at 16, `st_nlink` u32 at 20, `st_rdev` u64 at 32,
-  the `timespec` seconds at 72/88/104), which differs from x86_64's (`st_nlink` u64 at 16,
-  `st_mode` at 24). `abi::write_stat` now branches the layout on `target_arch`; emitting
-  the x86_64 order on aarch64 previously made `st_mode` read the `st_nlink` value. Pin:
-  `boot-aarch64` `MPOS_STAT_OK` (mode/type/`nlink`/`ino`/`blocks`/`size` round-trip from a
-  live musl process). `statx`'s `struct statx`, by contrast, is a fixed arch-independent
+  `sockaddr_ll`, `struct sched_attr`, … `struct stat` is per-ABI in both layout and
+  *length*: aarch64's is 128 bytes, with Linux's asm-generic field order (`st_mode` u32 at
+  16, `st_nlink` u32 at 20, `st_rdev` u64 at 32, the `timespec` seconds at 72/88/104), where
+  x86_64's is 144 (`st_nlink` u64 at 16, `st_mode` at 24). `abi::write_stat` branches both on
+  `target_arch` (the field order, and `STAT_BYTES`): emitting the x86_64 order on aarch64
+  previously made `st_mode` read the `st_nlink` value, and emitting the x86_64 *length* wrote
+  sixteen bytes past every 128-byte struct — into whichever frame the libc's own stat buffer
+  sits in, which is how a non-empty `std::fs::remove_dir_all` came to die at `pc 0`
+  (`PLAN.md` §13.10). Pin: `boot-aarch64` `MPOS_STAT_OK` (mode/type/`nlink`/`ino`/`blocks`/
+  `size` round-trip from a live musl process) and `t-stat-buffer` (a guarded `struct stat`
+  handed to the kernel through `SYS_fstat`/`SYS_newfstatat`, on both machines — a caller's own
+  `stat` cannot see the overflow, because musl's wrapper stats into a struct of its own and
+  copies the fields out). `statx`'s `struct statx`, by contrast, is a fixed arch-independent
   layout and is not affected. `rt_sigframe`/`sigcontext` is per-ABI as well and lives with
   its machine since §13.2's Stage 2 — `src/arch/x86_64/signal.rs` and, since Stage 3b,
   `src/arch/aarch64/signal.rs`, both behind `hal::SignalFrame` — because `__restore_rt`
@@ -170,7 +176,7 @@ back. This is the list, not the byte-by-byte record (that lives in the tests).
 
 | Layout | Consumer | Pin |
 |---|---|---|
-| `struct stat` / `statx` | every libc | `t-statx`, `t-fstat`, host `abi` tests |
+| `struct stat` / `statx` | every libc | `t-statx`, `t-fstat`, `t-stat-buffer` (the length, **both** machines), `t-rmtree` (the tree walk that felt it), host `abi` tests |
 | `rt_sigframe` + `sigcontext` | `rt_sigreturn` | `t-signal-delivery`, `t-sa-restart` |
 | `siginfo_t` | signal handlers | `t-signal-delivery` |
 | `struct sched_attr` | `sched_setattr`/`getattr` | `t-priority` |
