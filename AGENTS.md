@@ -10,12 +10,7 @@ per promise. This file is only **how to work here**, and points at those rather 
 
 ## 1. What this is
 
-A uniprocessor x86_64 kernel in Rust (`no_std`, edition 2024), binary-compatible with the Linux
-x86_64 ABI, so unmodified musl binaries (busybox, `apk`, weston) run on it. It boots on UEFI via its
-own loader (`mpos-boot`). The central split: the kernel is a **library** that also compiles for the
-host (so arch-independent logic is unit-testable with `cargo test`), plus a thin binary holding only
-what must run on the machine. Everything is driven by `cargo xtask`, and every behaviour is meant to
-be pinned — host unit test, a program booted in QEMU, or both.
+See `README.md` — what MPOS *is* belongs there; this file is only how to work here.
 
 ---
 
