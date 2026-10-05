@@ -2336,18 +2336,32 @@ pub fn resolve_script(
         rewritten.extend(argv.iter().skip(1).cloned());
         argv = rewritten;
         script_path = interp.clone();
-        bytes = match start.as_ref() {
+        let read = match start.as_ref() {
             Some(dir) => crate::vfs::read_file_opt(&script_path, Some(dir.clone())),
             None => crate::vfs::read_file(&script_path),
-        }
-        .map_err(|_| SpawnError::NoInterpreter)?;
+        };
+        bytes = read.map_err(|_| SpawnError::NoInterpreter)?;
     }
     Ok((bytes, argv))
 }
 
 pub fn spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<TaskId, SpawnError> {
     let path = argv.first().cloned().unwrap_or_default();
-    let (bytes, argv) = resolve_script(bytes.to_vec(), argv.to_vec(), None, &path)?;
+    // The kernel's own first spawn resolves a shebang against the *machine's*
+    // tree, not a task's. `resolve_at` jails an absolute path to
+    // `process_root()`, and before init exists that is the boot task's - empty,
+    // so it falls back to the global root, which is right for x86_64 (initramfs
+    // root, no switch) but stale on this machine: pid 1 is resolved after
+    // `pivot_root` has replaced the global root, and a `#!/bin/sh` init would
+    // look for its interpreter in the ramfs the switch just moved to
+    // `/oldroot` - `NoEntry`, and an init that cannot be spawned ends the
+    // machine. The explicit start is the switched tree itself.
+    let start = if current() == TaskId(BOOT_SLOT) {
+        Some(crate::vfs::global().root_inode())
+    } else {
+        None
+    };
+    let (bytes, argv) = resolve_script(bytes.to_vec(), argv.to_vec(), start, &path)?;
     let id = try_spawn_init(&bytes, &argv, env)?;
     assert_eq!(id, INIT_PID, "init did not land on pid 1");
     Ok(id)
