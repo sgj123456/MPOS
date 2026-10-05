@@ -1,7 +1,6 @@
-//! The second machine's `/bin`: the programs the user tests start, and the shell
-//! an interactive boot runs.
+//! The second machine's `/bin`: the programs the user tests start.
 //!
-//! Two callers, one payload. `t-stdspawn` and `t-socketpair` are tests *about
+//! One caller, one payload. `t-stdspawn` and `t-socketpair` are tests *about
 //! other programs*: the first runs `/bin/true`, `/bin/echo`, `/bin/cat`,
 //! `/bin/false` and `/bin/sh -c`, the second runs `/bin/cat`. The x86_64 harness
 //! has those because its test root is an initramfs with busybox in `/bin`; the
@@ -9,10 +8,11 @@
 //! `/bin` at all - so both programs sat in `tests.toml`'s `aarch64` group, a gap
 //! in the harness rather than in the kernel's spawn path (which every program in
 //! the payload already exercises, since the runner starts each one through
-//! `posix_spawn`). And [`crate::aarch64::run_interactive`] stages the same image
-//! as the machine's shell, because the `sh` applet below *is* the shell: what was
-//! missing from that boot was a program, not a payload, so the fix is to stage
-//! this one and let pid 1 exec it rather than to write a second interpreter.
+//! `posix_spawn`). The interactive boot used to stage this same image as its
+//! shell; since §13.19 it boots the real Alpine tree instead, whose busybox is
+//! the multi-call `/bin` of a distribution rather than one built here. What
+//! stays is the sweep's need: a gate that fetches nothing answers for the
+//! kernel alone.
 //!
 //! # Why these are built in-tree rather than fetched
 //!

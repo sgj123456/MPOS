@@ -151,12 +151,6 @@ const ALPINE_TERMINATORS: [&str; 3] = ["login:", "KERNEL PANIC", "EXCEPTION:"];
 /// rather than making every boot allocate room for the sweep.
 const DISK_BYTES: u64 = 8 * 1024 * 1024;
 const SWEEP_DISK_BYTES: u64 = 64 * 1024 * 1024;
-/// The interactive boot's disk. Smaller than the sweep's, because its payload is
-/// the init plus the six `/bin` names of one multi-call image rather than the
-/// musl test programs - and its own constant rather than shared with
-/// `boot-aarch64`'s, because the two boots carry different payloads and a size
-/// that fits one is not evidence about the other.
-const INTERACTIVE_DISK_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The Alpine root image's size. A cross-arch `alpine-base` + `openrc` tree is
 /// ~15 MiB on disk (measured), and `mkfs.ext4 -d` lays a filesystem whose used
@@ -1614,43 +1608,25 @@ fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str) -> Command {
 /// same ESP, same firmware, same `qemu-system-aarch64`, only the serial goes to
 /// stdio and no kill follows.
 ///
-/// What it boots into is the machine's shell, not a stand-in for one. The payload
-/// is an `/init` that makes `/tmp` and `execve`s `/bin/sh`, and the same
-/// multi-call `/bin` image the sweep stages ([`crate::aarch64_bin`]) - so the
-/// program the person types at is the program `t-stdspawn` runs, with the disk
-/// root, the mounted `/dev`, the interrupt-driven console and the network stack
-/// the rest of the boot already brought up. It used to run a hand-encoded
-/// read/echo loop (`aarch64_init::looping_init_elf`), which was honest while the
-/// machine had no shell and became the gap the moment it had one.
+/// What it boots into is the machine's *distribution*: the real Alpine tree
+/// `install_alpine_root` lays - pid 1 the disk's `/init`, busybox init reading
+/// `/etc/inittab`, openrc's runlevels, getties respawning on the virtual
+/// consoles. That is what makes this symmetric with `cargo xtask run` on the
+/// first machine: both sessions are the same userland shape, and §13.12–13.16
+/// built the second one specifically so this could stop being a stand-in. The
+/// in-tree shell `/init` (`aarch64_init::build_shell_init`) that ran here
+/// before is deleted rather than left as an escape hatch: a respawning init is
+/// a getty's job, and the machine has the userland for one now.
 ///
-/// The session ends the way a machine with no init left ends: the shell's `exit`
-/// is pid 1's `exit_group`, the scheduler prints `INIT_EXITED` and halts. That is
-/// what the shell is, not a missing feature - a respawning init is a getty's job
-/// and this machine has no userland for one yet.
+/// Two things change with it, both said by the boot itself. `exit` at a prompt
+/// logs the session out - getty respawns it; Ctrl-A x is how the machine
+/// stops. And the console list follows the run mode exactly as the first
+/// machine's does (`alpine_cmdline`): `--mode terminal` renders the login onto
+/// the serial node itself, `mirror`/`gui` keep it on the virtual consoles the
+/// vcmux carries to the wire.
 pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
     let (kernel, loader) = build(profile)?;
-    let init = crate::aarch64_init::build_shell_init(build_dir)?;
-    // One build, staged under every name it answers to, exactly as the sweep does
-    // it: the shell an interactive session gets is the `sh` applet of the tools
-    // its own commands run, because `/bin` holds one image rather than one
-    // program per name.
-    let tools = crate::aarch64_bin::build(build_dir)?;
-    let tool_paths: Vec<String> = crate::aarch64_bin::APPLETS
-        .iter()
-        .map(|applet| format!("bin/{applet}"))
-        .collect();
-    let mut entries: Vec<(&str, &[u8])> = vec![("init", init.as_slice())];
-    for path in &tool_paths {
-        entries.push((path.as_str(), tools.as_slice()));
-    }
-    let esp = build_esp(
-        build_dir,
-        &kernel,
-        &loader,
-        &entries,
-        INTERACTIVE_DISK_BYTES,
-        None,
-    )?;
+    let esp = build_alpine_esp(build_dir, &kernel, &loader, ModeChoice::Session)?;
     let (code, vars_src) = firmware()?;
     let vars = vars_path(build_dir);
     fs::copy(&vars_src, &vars).with_context(|| {
@@ -1662,9 +1638,9 @@ pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
     })?;
 
     println!(
-        "booting aarch64 interactively: /init hands pid 1 to /bin/sh on the serial \
-         console (type a line and press Enter; `exit` halts the machine; Ctrl-A x \
-         exits QEMU)"
+        "booting aarch64 interactively: the Alpine root, pid 1 = /init -> openrc -> \
+         getty (log in as root, no password; Ctrl-A x exits QEMU; `--mode terminal` \
+         puts the login on the serial line itself)"
     );
     let mut qemu = aarch64_qemu(&esp, &code, &vars, "mon:stdio");
     let status = qemu

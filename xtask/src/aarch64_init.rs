@@ -31,20 +31,20 @@
 //!
 //! The *rustc-built* programs are the ones that do real work, where hand-encoding
 //! would be a toy of the thing rather than a smaller version of it: the sweep's
-//! runner ([`build_sweep_init`], which runs every `/t-*`), the unmodified-musl
-//! probe ([`build_static_musl_helper`]) and the interactive boot's init
-//! ([`build_shell_init`]). All three are static `aarch64-unknown-linux-musl`
-//! binaries and share [`build_static_musl`], because the flags that make such a
-//! binary - `+crt-static`, `rust-lld`, stripped, `-O` - are one answer and not
-//! three.
+//! runner ([`build_sweep_init`], which runs every `/t-*`) and the
+//! unmodified-musl probe ([`build_static_musl_helper`]). Both are static
+//! `aarch64-unknown-linux-musl` binaries and share [`build_static_musl`],
+//! because the flags that make such a binary - `+crt-static`, `rust-lld`,
+//! stripped, `-O` - are one answer and not three.
 //!
-//! The interactive `/init` used to be a third hand-encoded image here
-//! (`looping_init_elf`): the echo body with the exit replaced by a branch to the
-//! top, a read/echo REPL stand-in written while the machine had no shell. It is
-//! gone. The shell it stood in for is a real program in the payload
-//! (`crate::aarch64_bin`'s `sh` applet), so the boot execs *that* - a hand-coded
-//! interpreter that can only echo was the gap, and answering it with a second
-//! interpreter would have been the same gap twice.
+//! Two stand-ins have been retired from this module rather than left dead. The
+//! interactive `/init` was once a third hand-encoded image (`looping_init_elf`:
+//! an echo loop with no exit), then a musl program that made `/tmp` and execed
+//! the payload's `sh` (`build_shell_init`). Both existed while the machine had
+//! no userland to boot; since §13.19 `run --arch aarch64` boots the real Alpine
+//! tree - pid 1 is the disk's own `/init`, getties respawn - so neither name
+//! survives here. A hand-coded interpreter that can only echo was the gap, and
+//! answering it with a second interpreter was the same gap twice.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -447,53 +447,6 @@ fn build_static_musl(build_dir: &Path, stem: &str, src: &str, what: &str) -> Res
         anyhow::bail!("{what} is not an EM_AARCH64 ELF");
     }
     Ok(bytes)
-}
-
-/// The interactive `run --arch aarch64`'s `/init`: the machine setup a shell
-/// session needs, then `execve("/bin/sh")` so the shell *is* pid 1.
-///
-/// It replaces the hand-encoded read/echo loop that stood in for a shell while
-/// the second machine had none (see the module header). Its own job is the two
-/// lines the x86 `/init` script does for the shell before starting it: make
-/// `/tmp`, and hand over. `exec` rather than spawn keeps the shell on pid 1, which
-/// is what the kernel's handoff expects and what makes the session's `exit` the
-/// machine's `INIT_EXITED` - the honest end for a machine whose init left.
-///
-/// `/tmp` is a plain directory here, not the tmpfs the *sweep's* runner mounts:
-/// that one is a tmpfs because the subject of a test it stages is an `AF_UNIX`
-/// name, and an ext4 directory cannot hold a socket node. Nothing the interactive
-/// shell is asked to do needs a name the disk cannot hold, so it does not take a
-/// mount for it.
-///
-/// `/proc`, `/sys` and `/dev` are not mounted: `/dev` is already there (the kernel
-/// mounts its own set before handing over), and the other two are named gaps on
-/// this machine (`PLAN.md` §9.1 - `procfs`/`sysfs` read the first machine's PCI
-/// tree and vcmux), which an init must not fake with an empty directory.
-pub fn build_shell_init(build_dir: &Path) -> Result<Vec<u8>> {
-    const SRC: &str = r#"use std::os::unix::process::CommandExt;
-
-fn main() {
-    match std::fs::create_dir("/tmp") {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => eprintln!("init: /tmp: {e}"),
-    }
-    println!("mpos: init handing over to /bin/sh");
-    // The shell replaces this image, so it runs as pid 1 with the console as
-    // fd 0/1/2 - the descriptors the kernel installed for the init. `exec` only
-    // returns if it failed, and then the honest answer is to say why and stop
-    // rather than loop: an init that cannot start its shell has nothing to run.
-    let error = std::process::Command::new("/bin/sh").exec();
-    eprintln!("init: exec /bin/sh: {error}");
-    std::process::exit(1);
-}
-"#;
-    build_static_musl(
-        build_dir,
-        "aarch64-shell-init",
-        SRC,
-        "the aarch64 interactive init",
-    )
 }
 
 /// The aarch64 sweep's `/init`: an ordinary `std` program that runs every `/t-*`

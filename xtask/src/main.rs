@@ -166,10 +166,26 @@ fn main() -> Result<()> {
     }
 
     // `run --arch aarch64` is the second machine's own path: `run_interactive`
-    // builds the aarch64 kernel and loader and lays out its AAVMF ESP itself, so
-    // it needs none of the x86_64 disk / rootfs / mode / sudo machinery below.
-    // Take it before any of that runs.
+    // builds the aarch64 kernel and loader, lays out its AAVMF ESP with the real
+    // Alpine root on the disk (§13.19), and reads the run mode through
+    // `MPOS_XTASK_MODE` / `machine.toml` itself - the same sources the x86_64
+    // half below consults - so it needs none of that disk / rootfs / sudo
+    // machinery. Take it before any of it runs.
     if matches!(cli.command, Commands::Run) && cli.arch == "aarch64" {
+        // Validate and export the desired mode *before* taking the arm, so a
+        // bad `--mode` word fails here exactly as it does for x86_64 (the
+        // aarch64 session reads it back through `rootfs::effective_mode`, the
+        // same single source both machines share).
+        let mode = match cli.mode.as_deref() {
+            Some(text) => Some(config::RunMode::parse_strict(text)?),
+            None => Some(config::QemuConfig::load_default()?.run_mode()?),
+        };
+        if let Some(mode) = mode {
+            // SAFETY: single-threaded here (cargo has not spawned any of our
+            // threads), and no other code reads the environment concurrently
+            // in this process.
+            unsafe { env::set_var("MPOS_XTASK_MODE", mode.name()) };
+        }
         return aarch64::run_interactive(&build_dir, &profile);
     }
 
