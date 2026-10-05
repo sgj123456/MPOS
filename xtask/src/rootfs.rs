@@ -279,8 +279,8 @@ fn write_fstab(mount_dir: &Path, config: &RootfsConfig, root_uuid: &str) -> Resu
     Ok(())
 }
 
-/// The machine's own configuration: its name, its clock, the login the console
-/// starts from, and the two directories the network hooks live in.
+/// The machine's own configuration: the shared half (below), plus the two
+/// steps that need the image's own userland to be *runnable*.
 ///
 /// This runs on both build paths - the full install and the boot-files update -
 /// because none of it needs `apk`, all of it is cheap, and a change to the
@@ -289,6 +289,33 @@ fn write_fstab(mount_dir: &Path, config: &RootfsConfig, root_uuid: &str) -> Resu
 /// overlay instead (`inittab`, `interfaces`, `resolv.conf`, `doas.conf`), which
 /// is applied after this and so wins over anything written here.
 fn write_system_config(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
+    write_shared_config(mount_dir, config)?;
+
+    // Hashing a password is `crypt(3)`, and creating an account is busybox's
+    // `adduser` - both run in the chroot, so both need an image this host can
+    // *exec*. That is the x86_64 install's answer only: the second machine's
+    // tree is installed cross-arch with `--no-scripts`, and its root cannot be
+    // chrooted into from an x86_64 host. Everything above is pure file I/O and
+    // therefore shared; everything here is not.
+    if !config.root_password.is_empty() {
+        set_password(mount_dir, "root", &config.root_password)?;
+    }
+    if !config.user.name.is_empty() {
+        set_password(mount_dir, &config.user.name, &config.user.password)?;
+    }
+    Ok(())
+}
+
+/// The half of the machine's configuration that is pure file I/O, and so the
+/// half **both** machines' installs run.
+///
+/// Extracted from [`write_system_config`] when the second machine's Alpine
+/// install started consuming the same layer (`PLAN.md` §13.19): its name, its
+/// clock, its locale, the network hook directories, and the two cleanups the
+/// generated files need. A cross-arch install cannot chroot the target's
+/// userland, so what this writes with `fs::write` alone is exactly the boundary
+/// between the one shared layer and the x86-only executable half above.
+pub(crate) fn write_shared_config(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
     // The name the prompt, `hostname` and the DHCP client report. Written
     // rather than left to alpine-baselayout's `localhost`, so that
     // `[system] hostname` is the one place it is decided.
@@ -342,10 +369,12 @@ fn write_system_config(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
     )?;
 
     // The console is a serial line with no keyboard worth typing a password on,
-    // which is why the default for both accounts is none at all.
-    set_password(mount_dir, "root", &config.root_password)?;
+    // which is why the default for both accounts is none at all. Clearing the
+    // shadow field is pure file I/O - the *setting* half of `set_password`
+    // needs chroot and stays in [`write_system_config`].
+    set_password(mount_dir, "root", "")?;
     if !config.user.name.is_empty() {
-        set_password(mount_dir, &config.user.name, &config.user.password)?;
+        set_password(mount_dir, &config.user.name, "")?;
     }
 
     // These directories exist because `interfaces` names them in its post-up
@@ -385,7 +414,7 @@ fn write_system_config(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
 /// What a build *can* do is name a real server here: slirp carries the
 /// guest's UDP to any address the host can reach, so the guest asks that
 /// server directly.
-fn write_resolver(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
+pub(crate) fn write_resolver(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
     let Some(dns) = config
         .dns
         .as_deref()
@@ -1074,7 +1103,16 @@ const APK_ADD_ATTEMPTS: usize = 4;
 /// plain re-run finishes the packages the failed attempt dropped. `sync` before
 /// each retry flushes the queued writeback to the image before the device is
 /// touched again.
-fn apk_add(apk: &str, mount_dir: &Path, preflags: &[&str], packages: &[String]) -> Result<()> {
+///
+/// The second machine's install shares this retry (`aarch64::install_alpine_root`):
+/// its failure mode is not NBD I/O but the mirror fetch, and a re-run that
+/// resumes from what `apk` already recorded is the same finish-the-job answer.
+pub(crate) fn apk_add(
+    apk: &str,
+    mount_dir: &Path,
+    preflags: &[&str],
+    packages: &[String],
+) -> Result<()> {
     for attempt in 1..=APK_ADD_ATTEMPTS {
         let status = Command::new(apk)
             .args(["--no-progress", "add"])
@@ -1231,6 +1269,51 @@ mod tests {
         assert!(
             !dir.join("etc/securetty").exists(),
             "securetty lists tty names ttyname(2) cannot answer yet"
+        );
+    }
+
+    #[test]
+    fn the_shared_half_clears_the_login_without_the_chroot_half_running() {
+        // The counterfactual for the extraction: the second machine's install
+        // calls *only* this function, on a tree whose userland its host cannot
+        // exec. So the whole passwordless shape - shadow cleared, securetty
+        // gone, name/locale landed - must come out of `write_shared_config`
+        // alone. If any of it ever moves back into the chroot half, this fails
+        // and the cross-arch install silently loses the login again.
+        let dir = staged_dir("shared-config");
+        let config = load_config(
+            "shared-config",
+            "[system]\nhostname = \"mpos\"\n[user]\nname = \"mpos\"\npassword = \"hunter2\"\n",
+        );
+        write_shared_config(&dir, &config).unwrap();
+
+        let shadow = fs::read_to_string(dir.join("etc/shadow")).unwrap();
+        let field = |name: &str| {
+            shadow
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}:")))
+                .map(|line| line.split(':').nth(1).unwrap().to_string())
+        };
+        assert_eq!(field("root").as_deref(), Some(""), "root's hash is cleared");
+        assert_eq!(
+            field("mpos").as_deref(),
+            Some(""),
+            "and so is the account's, whatever its configured password says - \
+             setting that one needs the image's own crypt(3)"
+        );
+        assert!(
+            !dir.join("etc/securetty").exists(),
+            "the securetty cleanup is in the shared half"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("etc/hostname")).unwrap(),
+            "mpos\n",
+            "so is the name - without it the prompt says localhost"
+        );
+        assert!(
+            dir.join("etc/network/if-post-up.d").is_dir()
+                && dir.join("etc/network/if-post-down.d").is_dir(),
+            "the hook directories `interfaces` names exist before the overlay lands"
         );
     }
 
