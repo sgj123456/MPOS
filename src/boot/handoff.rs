@@ -167,6 +167,41 @@ pub unsafe fn collect(at: *const Handoff) -> BootInfo {
         info.cmdline = core::str::from_utf8(bytes).expect("the boot command line is not UTF-8");
     }
 
+    // The kernel must never be offered the stack it is running on. The record's
+    // allocatable regions *are* the frame allocator's zones, so a record that
+    // listed the boot stack as allocatable would hand it straight back: the first
+    // allocation of that order lands on the stack and overwrites whatever is on
+    // it, and the stacks the kernel takes while it is still on that one - the
+    // stage-2 context check's sixteen pages, a spawned task's - are exactly that
+    // order.
+    //
+    // The property holds today, and the reason belongs here rather than being
+    // left implicit in two other files: `mpos-boot` allocates the stack as UEFI
+    // `LOADER_DATA`, and `MemKind::is_allocatable` admits only `Usable` -
+    // `BootloaderReclaimable` is excluded *because* it holds the stack the kernel
+    // is running on. Measured on the second machine (PLAN.md §13.17): the boot
+    // stack at `0x44f07000` lies in a region of kind `BootloaderReclaimable`
+    // whose `is_allocatable()` is false, and `mm::pframe` builds its five zones
+    // from the record's five `Usable` regions.
+    //
+    // So this is not a check that the loader carves anything out - it does not,
+    // and carving would not change what the allocator sees. It is the contract
+    // the kernel is relying on, asked where the record is read: a loader that
+    // described the stack as `Usable` stops here, by name, rather than as a
+    // mystery inside a boot check later on.
+    if info.boot_stack_base != 0 {
+        let stack_phys = info.boot_stack_base - info.hhdm_offset;
+        let offered = info
+            .regions()
+            .iter()
+            .any(|r| r.kind.is_allocatable() && r.base <= stack_phys && stack_phys < r.end());
+        assert!(
+            !offered,
+            "the handoff offers the boot stack at {stack_phys:#x} as allocatable memory: \
+             the kernel would hand back the stack it is running on"
+        );
+    }
+
     info
 }
 
@@ -377,6 +412,57 @@ mod tests {
             ..zeroed()
         };
         assert_eq!(unsafe { collect(&raw) }.dtb, None);
+    }
+
+    /// The shape the loader actually produces: the boot stack inside a
+    /// `BootloaderReclaimable` region, which the kernel will not allocate from -
+    /// so the record is read and the stack stays where it is. This is the half of
+    /// the pair below that says *why* the check is not vacuous rather than merely
+    /// that it exists (`PLAN.md` §13.17).
+    #[test]
+    fn a_record_that_keeps_its_boot_stack_unallocatable_is_read() {
+        let mut raw = Handoff {
+            magic: HANDOFF_MAGIC,
+            hhdm_offset: 0,
+            boot_stack_base: 0x4200_0000,
+            region_count: 1,
+            ..zeroed()
+        };
+        raw.regions[0] = AbiRegion {
+            base: 0x4000_0000,
+            length: 0x1000_0000,
+            kind: KIND_BOOTLOADER_RECLAIMABLE,
+            reserved: 0,
+        };
+
+        let info = unsafe { collect(&raw) };
+        assert!(!info.regions()[0].kind.is_allocatable());
+        assert_eq!(info.boot_stack_base, 0x4200_0000);
+    }
+
+    /// A record that lists the boot stack as *allocatable* memory is refused.
+    ///
+    /// The loader is the only party that knows where its stack is and the kernel
+    /// is the only party that knows which kinds it may allocate from, so a
+    /// disagreement between them lands here - by name, before the frame allocator
+    /// has a zone over the stack the kernel is running on.
+    #[test]
+    #[should_panic(expected = "offers the boot stack")]
+    fn a_record_that_offers_the_boot_stack_is_refused() {
+        let mut raw = Handoff {
+            magic: HANDOFF_MAGIC,
+            hhdm_offset: 0,
+            boot_stack_base: 0x4200_0000,
+            region_count: 1,
+            ..zeroed()
+        };
+        raw.regions[0] = AbiRegion {
+            base: 0x4000_0000,
+            length: 0x1000_0000,
+            kind: KIND_USABLE,
+            reserved: 0,
+        };
+        let _ = unsafe { collect(&raw) };
     }
 
     /// The loader defaults the record to zeroes, so `Handoff` cannot carry

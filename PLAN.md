@@ -1016,7 +1016,8 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         fault address *did* hold a function's prologue (`stp x29, x30, [sp, #-128]!` is
         `mpos_context_round_trip`'s first instruction) - that is exactly what a call into a
         non-executable page looks like: the routine itself, not a return address overwritten by a
-        stolen stack (13.17's bug is real and is a different one). And the trigger is not the port's
+        stolen stack (the boot-stack concern recorded as §13.17 is not a bug - the kernel already
+        refuses that region, and 13.17 says so). And the trigger is not the port's
         code either: nothing the port adds runs before stage 2, and what decides the placement is
         which blocks share an assembly unit, which the port perturbed only by changing how much code
         there is to partition. At HEAD the same writing happened to land in `.text`, which is what
@@ -1036,25 +1037,35 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         no `[ !! ]`; host 512; xtask 55; depgraph 9/9 within the ratchet (`vfs/mod.rs -> drivers|net`
         fell to 0, which the ratchet allows); fmt clean; clippy 0 errors on `x86_64-unknown-none`,
         `aarch64-unknown-none` and the aarch64 loader.
-  - [ ] 13.17 found on the way, and a bug in its own right: **the loader offers the kernel its own
-        boot stack as allocatable memory.** The record's regions *are* the frame allocator's zones
-        (`mm::pframe::init` builds a zone per allocatable region), and `mpos-boot` allocates the boot
-        stack with UEFI `LOADER_DATA`, which `kind_of` reports as `BootloaderReclaimable` - so the
-        first allocation of that size can land on the stack the kernel is running on. Measured:
-        printed the record, and the 64-page stack at physical `0x442c4000` sat inside a reclaimable
-        region; carving it out (the loader splitting the containing region three ways, `Reserved`
-        between) makes it `region[4] 0x442c4000..0x44304000 kind Reserved`, and the record's parser
-        (`boot::handoff::collect`) now refuses a record that offers the stack by name. **Not landed
-        yet**, for one remaining honest reason: the record's allocatable total moved 205 MiB -> 181
-        MiB when the carve went in - a 24 MiB discrepancy the stack's 256 KiB does not explain,
-        unresolved, possibly the firmware's own map varying between runs. It was held back for a
-        second reason that has now dissolved: it did *not* fix 13.16's crash, and 13.16 explains that
-        crash as an assembler section holding code, not a stack - so the carve stands on its own
-        measurement and its own pin. The WIP's comments used to attribute 13.16's instruction abort to
-        an overwritten return address on the boot stack; that is wrong - the fault was the *call*
-        into `mpos_context_round_trip`, whose entry was in `.rodata` - and they are corrected in the
-        stash, whose label now says what is left to settle. One thing remains before it lands: the
-        24 MiB wants explaining before the number is quoted anywhere.
+  - [x] 13.17 **not a bug**: the kernel does not hand back its own boot stack, and the record was
+        never offering it. Found on the way as "the loader offers the kernel the stack it is running
+        on", and the first half of that is true - the record's regions *are* the frame allocator's
+        zones, and the 64-page boot stack does sit inside one of them. What was missed is the *kind*,
+        and `MemKind::is_allocatable` answers it in its own doc comment: only `Usable` is
+        allocatable, and `BootloaderReclaimable` - the kind the stack's region has, `mpos-boot`
+        allocating it as UEFI `LOADER_DATA` - is excluded *because* it holds the stack the kernel is
+        still running on. Measured by printing the record at boot: `stack 0x44f07000 in region
+        0x44d9d000..0x456d1000 kind BootloaderReclaimable allocatable false`, and `pmm: 5 zones`
+        built out of the record's five `Usable` regions.
+        **The tell was in the work itself.** The "24 MiB discrepancy" that held the fix back is not a
+        discrepancy: the carve changes nothing the allocator sees. With it and without it,
+        `test --arch aarch64` reports `181 MiB` / `46345 frames` and `boot-aarch64` reports `205 MiB`
+        / `52575 frames` - the only movement is the record's region count, `16` against `14`, which is
+        the three-way split and nothing else. The two *totals* are two different boots: the sweep's
+        initramfs is `12890 KiB` against `boot-aarch64`'s `420 KiB`, and the loader pays for it out of
+        the same `Usable` regions. A number that moves for a reason nobody can name is evidence that
+        the change does nothing, not noise to file away - and here it was the only signal that said
+        so, because the change was otherwise plausible and its stated premise was half right.
+        **What lands instead** is the invariant the whole thing was about, asked where the record is
+        read: `boot::handoff::collect` refuses a record that lists the boot stack as allocatable
+        memory, by name and with the address. Measured against the counterfactual of admitting
+        `BootloaderReclaimable` to `is_allocatable`: `KERNEL PANIC: the handoff offers the boot stack
+        at 0x44eef000 as allocatable memory: the kernel would hand back the stack it is running on` -
+        so the check is not vacuous, it is what stands between the kernel and a loader that describes
+        the stack as `Usable`. The loader is left alone: carving a `Reserved` hole in a region the
+        allocator never touches buys nothing. The two WIP stashes that hold that carve are therefore
+        dead - their other half is the landed port, and the carve is the correction above - so
+        `git stash drop` on both is safe whenever someone wants the list tidy.
   - [ ] 13.18 `VT_GETSTATE`'s layout is not Linux's. Linux's `struct vt_stat` is
         `{ v_active, v_signal, v_state }`; this kernel writes `{ v_mode, v_num, v_state }` - the
         *video mode* where Linux has the console that is on the screen, and the console number where

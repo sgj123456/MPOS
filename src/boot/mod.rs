@@ -56,6 +56,12 @@ impl MemKind {
     /// Its page tables were in there too, but M3 replaced those with the kernel's
     /// own; the stack lasts until M4 gives every task one of its own.
     /// `AcpiReclaimable` holds tables we have not parsed yet.
+    ///
+    /// That exclusion is load-bearing rather than merely conservative, and it is
+    /// not left to be inferred: `handoff::collect` refuses a record that offers
+    /// the boot stack as allocatable memory (`PLAN.md` §13.17), so a loader that
+    /// disagreed about it stops by name instead of handing the kernel the stack it
+    /// is standing on.
     pub fn is_allocatable(self) -> bool {
         matches!(self, MemKind::Usable)
     }
