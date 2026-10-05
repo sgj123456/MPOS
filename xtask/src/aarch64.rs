@@ -52,16 +52,64 @@ const LOADER_TARGET: &str = "aarch64-unknown-uefi";
 /// day the shared `boot::console_list` is parsed here, the name is already right.
 const CMDLINE: &str = "console=ttyAMA0 mpos.selftest\n";
 
-/// The command line the *Alpine* boot carries: the wire, and nothing else.
+/// The command line the *Alpine* boot carries: the machine's consoles, and
+/// nothing else.
 ///
-/// The difference from [`CMDLINE`] is the whole of it. `mpos.selftest` is what
-/// the kernel's aarch64 handoff reads to decide whether it may inject a line of
-/// console input before starting `/init` - an instrument the verdict and sweep
-/// boots need and a real userland must never see. An Alpine boot's getty reads
-/// the same tty; a boot that injected `echo-test` there would hand it to the
-/// login prompt as a username. So this boot keeps the console untouched, and the
-/// only word on the line is the one the kernel needs to know where its log goes.
+/// The difference from [`CMDLINE`] is one word of policy and one of shape.
+/// `mpos.selftest` is what the kernel's aarch64 handoff reads to decide whether
+/// it may inject a line of console input before starting `/init` - an instrument
+/// the verdict and sweep boots need and a real userland must never see. An
+/// Alpine boot's getty reads the same tty; a boot that injected `echo-test`
+/// there would hand it to the login prompt as a username. So this boot keeps
+/// the console untouched by the test half.
+///
+/// The console *list* is the x86_64 path's own answer, read from the same
+/// sources (`machine.toml`'s `[qemu] mode`, or `MPOS_XTASK_MODE` when
+/// `run --mode X` hands the desired mode down): `RunMode::cmdline_consoles`
+/// spells `console=ttyAMA0 [console=tty0]` for terminal/mirror/gui, and since
+/// §13.16 the vcmux carries each virtual console's bytes over the wire on this
+/// machine too, so the list means exactly what it means on x86_64. The headless
+/// verdicts have no mode to honour - they are not sessions - and pass
+/// [`ModeChoice::Verdicts`], which keeps the single serial word they always had.
 const ALPINE_CMDLINE: &str = "console=ttyAMA0\n";
+
+/// Which consoles an Alpine-layout boot should carry: the session's own mode,
+/// or the verdict's fixed serial line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModeChoice {
+    /// `alpine-aarch64`: the scripted gate. No window exists to prefer, and its
+    /// `login:` verdict must not depend on what `machine.toml` happens to say.
+    Verdicts,
+    /// `run --arch aarch64`: the interactive session, booted with the same
+    /// console list `cargo xtask run` bakes for the first machine.
+    Session,
+}
+
+/// The command line an Alpine boot carries, given the caller's mode choice.
+/// Always exactly one trailing newline: `mpos.cmdline` is read whole by the
+/// loader and recorded verbatim by the kernel.
+fn alpine_cmdline(choice: ModeChoice) -> Result<String> {
+    let mode = match choice {
+        ModeChoice::Verdicts => return Ok(ALPINE_CMDLINE.to_string()),
+        ModeChoice::Session => crate::rootfs::effective_mode()?,
+    };
+    Ok(format!("{}\n", mode.cmdline_consoles(SERIAL_PORT)))
+}
+
+/// This machine's serial console, spelled the way its psABI names the PL011.
+const SERIAL_PORT: &str = "ttyAMA0";
+
+/// Whether an interactive aarch64 session puts a getty on the serial node.
+///
+/// One rule, and it is the x86_64 image's own: the login answers on the
+/// framebuffer when there *is* one (`gui`, `mirror` - their consoles reach the
+/// screen, and the vcmux still carries the virtual consoles to the wire), and
+/// on the serial node when the session has no window at all (`terminal`).
+/// The headless verdicts render nothing: their gate reads `login:` off the
+/// wire, which the mux delivers from tty1 either way.
+pub(crate) fn serial_getty_for(mode: crate::config::RunMode) -> bool {
+    !mode.has_window()
+}
 
 /// The file every aarch64 disk root carries, and the bytes it carries.
 ///
@@ -98,9 +146,9 @@ const ALPINE_DEADLINE: Duration = Duration::from_secs(240);
 const ALPINE_TERMINATORS: [&str; 3] = ["login:", "KERNEL PANIC", "EXCEPTION:"];
 
 /// The ext4 image `build_esp` lays the aarch64 disk from. `boot-aarch64`'s
-/// payload is three small images plus the `rootfs/` tree; the test sweep also
-/// carries the musl test programs (~5.6 MB), so it asks for its own size rather
-/// than making every boot allocate room for the sweep.
+/// payload is three small images plus the shared overlay trees; the test sweep
+/// also carries the musl test programs (~5.6 MB), so it asks for its own size
+/// rather than making every boot allocate room for the sweep.
 const DISK_BYTES: u64 = 8 * 1024 * 1024;
 const SWEEP_DISK_BYTES: u64 = 64 * 1024 * 1024;
 /// The interactive boot's disk. Smaller than the sweep's, because its payload is
@@ -199,25 +247,14 @@ fn esp_dir(build_dir: &Path) -> PathBuf {
     build_dir.join("aarch64-esp")
 }
 
-/// Copy `from`'s tree into `to`, making directories as it goes.
-///
-/// Deliberately small: the one caller is the aarch64 disk's staging directory,
-/// which takes the repository's `rootfs/` overlay - a handful of files. A
-/// symlink is copied as the file it names (`fs::copy` follows it), which is what
-/// laying an overlay onto a filesystem means.
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    fs::create_dir_all(to).with_context(|| format!("Failed to create {}", to.display()))?;
-    for entry in fs::read_dir(from).with_context(|| format!("Failed to read {}", from.display()))? {
-        let entry = entry?;
-        let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else {
-            fs::copy(entry.path(), &target)
-                .with_context(|| format!("Failed to copy {}", entry.path().display()))?;
-        }
-    }
-    Ok(())
+/// The repository's overlay trees as one machine sees them: the shared core
+/// first, then that machine's own tree over it. Both aarch64 roots - the test
+/// staging and the Alpine install - take the same pair the x86_64 image takes,
+/// so `/etc/inittab` and everything else neutral is one file for both machines
+/// (`crate::rootfs::CORE_OVERLAY`, `rootfs-core/root/README`).
+fn merge_core_and_machine(root: &Path, machine_tree: &str, staging: &Path) -> Result<()> {
+    utils::merge_overlay(&root.join(crate::rootfs::CORE_OVERLAY), staging)?;
+    utils::merge_overlay(&root.join(machine_tree), staging)
 }
 
 /// Lay one payload file on a staging tree, creating any directory its name
@@ -377,17 +414,28 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         .filter(|(marker, _)| !log.contains(marker))
         .map(|(_, what)| *what)
         .collect();
-    // The disk's root tree is the repository's `rootfs/` overlay, so the length
-    // the kernel reports for `/mnt/etc/inittab` is the length of the file in the
-    // tree. A copy that dropped, truncated or replaced that file cannot print the
-    // number below, which is what makes the marker a check rather than a claim.
-    let inittab = fs::read(crate::utils::project_root()?.join("rootfs/etc/inittab"))?;
-    let want = format!("{} bytes", inittab.len());
+    // The disk's root tree is the shared overlay pair this machine installs
+    // from, so the length the kernel reports for `/mnt/etc/inittab` is the
+    // length of the file *as staged*: core + machine merged, placeholder
+    // rendered. A copy that dropped, truncated or replaced that file cannot
+    // print the number below, which is what makes the marker a check rather
+    // than a claim - and after §13.19 folded the two inittabs into one
+    // template, reading the repository file raw would pin a byte count no
+    // image ever carries.
+    let staging = build_dir.join("aarch64-ext4-staging");
+    let laid = fs::read(staging.join("etc/inittab")).with_context(|| {
+        format!(
+            "the boot verdict cannot pin the disk tree: {} was not staged - \
+             `build_esp_with_cmdline` lays it before every test boot",
+            staging.join("etc/inittab").display()
+        )
+    })?;
+    let want = format!("{} bytes", laid.len());
     if !log.contains(&want) {
         bail!(
             "the aarch64 disk root did not serve the rootfs tree: the log has no \
-             \"{want}\" for /mnt/etc/inittab, and the file is {} bytes in rootfs/",
-            inittab.len()
+             \"{want}\" for /mnt/etc/inittab, and the staged file is {} bytes",
+            laid.len()
         );
     }
     // The init reads a line from `fd 0` (the handoff queued "echo-test\n" on the
@@ -909,11 +957,15 @@ fn report_sweep(build_dir: &Path, staged: &[&str], left_out: usize, log: &str) -
 ///     password file. `fakeroot` gives the tree root ownership without taking
 ///     root, so this command - like `boot-aarch64` and the sweep - stays
 ///     unprivileged.
-///   * **the overlay is `rootfs-aarch64/`, not `rootfs/`.** The two machines'
-///     overlays differ where the machines do: this one carries the `/init` that
-///     mounts the pseudo-filesystems a real init expects. The x86_64 side does
-///     that from its initramfs script; this machine pivots in the *kernel*, so its
-///     disk `/init` is where that work lives.
+///   * **the overlay is core + `rootfs-aarch64/`, not `rootfs/`.** The shared
+///     half of both userlands lives in `rootfs-core/` (`inittab`, the network,
+///     the resolver, doas); what stays machine's own is the `/init` that mounts
+///     the pseudo-filesystems a real init expects. The x86_64 side does that
+///     from its initramfs script; this machine pivots in the *kernel*, so its
+///     disk `/init` is where that work lives. After the trees merge, the same
+///     generated layer the first install runs - hostname, locale, the securetty
+///     cleanup, the resolver - lands here too: it is pure file I/O, and §13.12's
+///     prompt said `localhost` precisely because this path skipped it.
 fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
     let root = utils::project_root()?;
     let config = crate::config::RootfsConfig::load(&root.join("rootfs-aarch64.toml"))?;
@@ -936,25 +988,32 @@ fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
     let apk = utils::find_apk_tool(build_dir, &config.mirror, &config.branch)?;
     let mut packages = config.base_packages.clone();
     packages.extend(config.extra_packages.iter().cloned());
-    utils::run_status(
-        Command::new("fakeroot")
-            .arg("--")
-            .arg(&apk)
-            .args(["--no-progress", "add"])
-            .arg("--root")
-            .arg(&staging)
-            .args([
-                "--arch",
-                config.arch.as_str(),
-                "--update-cache",
-                "--initdb",
-                "--no-scripts",
-            ])
-            .args(&packages),
-        "apk install the aarch64 Alpine userland",
+    // The same retry the x86_64 install wraps its `apk add` in. Its reason was
+    // NBD I/O errors under heavy write load; this tree has no nbd device, but
+    // the failure it guards is the mirror fetch mid-install, and "apk records
+    // what it did manage to install, so a plain re-run finishes the job" is the
+    // answer for either producer. `fakeroot` rides in through the preflags, so
+    // the command shape is unchanged.
+    crate::rootfs::apk_add(
+        &["fakeroot", "--", apk.as_str()],
+        &staging,
+        &[
+            "--arch",
+            config.arch.as_str(),
+            "--update-cache",
+            "--initdb",
+            "--no-scripts",
+        ],
+        &packages,
     )?;
 
-    copy_tree(&root.join("rootfs-aarch64"), &staging)?;
+    merge_core_and_machine(&root, "rootfs-aarch64", &staging)?;
+    // The stock answer for the installed tree: the placeholder lands with the
+    // core template and must be rendered *after* the merge - the repository's
+    // file is a template, and an unrendered `@SERIAL_GETTY@` line in front of
+    // busybox init is one confused respawn entry per boot. A session re-renders
+    // this file against its own mode (`build_alpine_esp`).
+    crate::rootfs::render_inittab(&staging, &config, false)?;
     // The runlevels, from the same table the x86_64 image uses: a service whose
     // script this machine's package set does not carry is named and skipped, so
     // one list serves both machines. Without this the boot would hand pid 1 to a
@@ -971,6 +1030,20 @@ fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
     // machines because they are one kernel's code, and the directory is named for
     // the release both machines report (`uname -r` is one number).
     crate::rootfs::write_modules(&staging)?;
+    // The generated system layer, now that the cross-arch install can consume
+    // it: `[system] hostname` becomes `/etc/hostname` (without it the prompt
+    // says `localhost`, which §13.12 had to name rather than fix), the locale
+    // export lands in `/etc/profile.d`, the passwordless shadow clearing makes
+    // the login actually work, the securetty cleanup keeps `login` from calling
+    // an empty password a wrong one, and the init.d chmod sweep is the one
+    // thing OpenRC silently refuses without. All pure file I/O - none of it
+    // needs the image's binaries to run, which is the whole boundary (§13.19).
+    crate::rootfs::write_shared_config(&staging, &config)?;
+    // One inittab, rendered per machine: the installed tree carries the stock
+    // answer (no serial getty); `run --arch aarch64` re-renders it against the
+    // session's mode before laying the disk, so `--mode terminal` finds the
+    // login on the wire without a reinstall.
+    crate::rootfs::render_inittab(&staging, &config, false)?;
     // The probe file the kernel's `check_fs` reads (see [`PROBE_FILE`]). It sits
     // at the root of a real Alpine tree because the check is about the *block
     // driver and the filesystem*, which the machine must prove on whichever root
@@ -979,6 +1052,13 @@ fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
     // come from one constant and cannot drift.
     fs::write(staging.join(PROBE_FILE), PROBE_BYTES)
         .with_context(|| format!("Failed to lay the probe file on {}", staging.display()))?;
+    // The resolver, after the trees and the generated layer - the one file
+    // that beats a file in the tree, which is what makes `[system] dns` the
+    // answer it is (rootfs.rs's `write_resolver` carries the full story; it is
+    // one slirp fact for both machines). Without this call the guest rides
+    // QEMU's forwarder into the host's loopback stub and every `apk` fetch
+    // from the *running* machine asks a question nothing answers.
+    crate::rootfs::write_resolver(&staging, &config)?;
     println!(
         "alpine: {} packages installed into {} for {}",
         packages.len(),
@@ -996,16 +1076,98 @@ fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
 /// is to exist - the machine's init is the disk's own `/init`, which is what the
 /// root switch is for. The `entries` a test boot fills it with are the payload
 /// those boots have and this one does not.
-fn build_alpine_esp(build_dir: &Path, kernel: &Path, loader: &Path) -> Result<PathBuf> {
-    let alpine_root = install_alpine_root(build_dir)?;
-    build_esp(
+///
+/// `mode` decides the command line ([`alpine_cmdline`]) and, for a session,
+/// whether the installed inittab carries the serial getty. The install itself
+/// is stamped ([`alpine_root_is_current`]): a fresh kernel re-lays the disk
+/// from the existing staging tree without touching the network, exactly the
+/// way x86_64's `run` updates boot files without reinstalling Alpine.
+fn build_alpine_esp(
+    build_dir: &Path,
+    kernel: &Path,
+    loader: &Path,
+    mode: ModeChoice,
+) -> Result<PathBuf> {
+    ensure_alpine_root(build_dir)?;
+    let alpine_root = alpine_staging(build_dir);
+    let esp = build_esp_with_cmdline(
         build_dir,
         kernel,
         loader,
         &[],
         ALPINE_DISK_BYTES,
         Some(&alpine_root),
-    )
+        &alpine_cmdline(mode)?,
+    )?;
+    // A session's getty choice is re-asserted on the staging tree *after* the
+    // install stamp has had its way with it: `run --mode terminal` must find
+    // the login on the wire even when the tree was installed under a windowed
+    // default, and the refresh is one file rather than a reinstall. The
+    // verdicts keep the installed answer - their gate reads `login:` through
+    // the mux either way.
+    if mode == ModeChoice::Session {
+        let config =
+            crate::config::RootfsConfig::load(&utils::project_root()?.join("rootfs-aarch64.toml"))?;
+        crate::rootfs::render_inittab(
+            &alpine_root,
+            &config,
+            serial_getty_for(crate::rootfs::effective_mode()?),
+        )?;
+    }
+    Ok(esp)
+}
+
+/// Where the Alpine staging tree lives, whether or not it is installed yet.
+fn alpine_staging(build_dir: &Path) -> PathBuf {
+    build_dir.join("aarch64-alpine-root")
+}
+
+/// The stamp that records what the Alpine tree was installed *from*.
+fn alpine_stamp(build_dir: &Path) -> PathBuf {
+    build_dir.join("aarch64-alpine-root.stamp")
+}
+
+/// True when the staging tree predates something it is built from: the toml,
+/// either overlay tree, or the kernel whose release name `/lib/modules/<re>`
+/// carries (`write_modules`' directory outlives a version bump otherwise).
+/// A missing tree is stale by definition - there is nothing to reuse.
+fn alpine_root_is_stale(build_dir: &Path) -> Result<bool> {
+    let root = utils::project_root()?;
+    let staging = alpine_staging(build_dir);
+    let stamp = alpine_stamp(build_dir);
+    if !staging.exists() || !stamp.exists() {
+        return Ok(true);
+    }
+    let since = utils::file_mtime(&stamp)?;
+    for input in [
+        root.join("rootfs-aarch64.toml"),
+        root.join(crate::rootfs::CORE_OVERLAY),
+        root.join("rootfs-aarch64"),
+    ] {
+        if utils::dir_newer_than(&input, since)? || utils::newer(&input, &stamp)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Install the Alpine tree unless the stamp says the staging directory already
+/// holds the current one - then write the stamp. The re-lay of the ext4 image
+/// happens on *every* ESP build regardless; this stamp only decides whether the
+/// network-backed `apk` install runs. That is what makes `run --arch aarch64`
+/// after a kernel change cost seconds instead of a package fetch, and it is the
+/// same split x86_64 draws between its boot-file update and its full install.
+pub(crate) fn ensure_alpine_root(build_dir: &Path) -> Result<()> {
+    if alpine_root_is_stale(build_dir)? {
+        install_alpine_root(build_dir)?;
+    } else {
+        println!(
+            "alpine: {} is up to date (reinstall inputs unchanged)",
+            alpine_staging(build_dir).display()
+        );
+    }
+    fs::write(alpine_stamp(build_dir), "alpine: staged tree\n")?;
+    Ok(())
 }
 
 /// Boot the second machine into its real Alpine userland: busybox init reading
@@ -1021,7 +1183,7 @@ pub fn run_alpine(build_dir: &Path, profile: &str) -> Result<()> {
     let (kernel, loader) = build(profile)?;
     println!("kernel: {} ({:.1} KB)", kernel.display(), kib(&kernel)?);
     println!("loader: {} ({:.1} KB)", loader.display(), kib(&loader)?);
-    let esp = build_alpine_esp(build_dir, &kernel, &loader)?;
+    let esp = build_alpine_esp(build_dir, &kernel, &loader, ModeChoice::Verdicts)?;
     println!("esp:    {}", esp.display());
 
     let log = boot(build_dir, &esp, &ALPINE_TERMINATORS, ALPINE_DEADLINE)?;
@@ -1109,6 +1271,32 @@ fn build_esp(
     disk_bytes: u64,
     alpine_root: Option<&Path>,
 ) -> Result<PathBuf> {
+    // A test boot carries the fixed selftest line; an Alpine boot's caller
+    // says which consoles it wants (`alpine_cmdline`), because a session and a
+    // scripted verdict are different machines' worth of console.
+    let cmdline = CMDLINE.to_string();
+    build_esp_with_cmdline(
+        build_dir,
+        kernel,
+        loader,
+        entries,
+        disk_bytes,
+        alpine_root,
+        &cmdline,
+    )
+}
+
+/// The volume a UEFI firmware reads, with the command line written by the
+/// caller rather than chosen here. See [`build_esp`] for everything else.
+fn build_esp_with_cmdline(
+    build_dir: &Path,
+    kernel: &Path,
+    loader: &Path,
+    entries: &[(&str, &[u8])],
+    disk_bytes: u64,
+    alpine_root: Option<&Path>,
+    cmdline: &str,
+) -> Result<PathBuf> {
     let esp = esp_dir(build_dir);
     if esp.exists() {
         fs::remove_dir_all(&esp).with_context(|| format!("Failed to clear {}", esp.display()))?;
@@ -1124,11 +1312,6 @@ fn build_esp(
     // Alpine root is not a test and says so by *leaving the word off* - see
     // `ALPINE_CMDLINE` for why that one word is the difference between a console
     // an init may use and one a test has written to.
-    let cmdline = if alpine_root.is_some() {
-        ALPINE_CMDLINE
-    } else {
-        CMDLINE
-    };
     fs::write(esp.join("mpos.cmdline"), cmdline)?;
 
     // The third file is a real aarch64 initramfs - which programs it holds is the
@@ -1174,13 +1357,14 @@ fn build_esp(
     //
     // Two trees become it. The *test* roots are the in-tree payload - `hello`,
     // the member images the initramfs also carries (so the disk has an init to
-    // hand pid 1 when the root switch lands), and the repository's `rootfs/`
-    // overlay, the files `rootfs.toml`'s packages are layered under (AGENTS.md
-    // §5). The *Alpine* root is a whole tree `apk` installed (see
-    // [`install_alpine_root`]) - the second machine's real userland. Whichever it
-    // is, `mkfs.ext4 -d` lays a filesystem down from the directory without a
-    // mount, so this command needs no privilege to write a root only the guest
-    // will read.
+    // hand pid 1 when the root switch lands), and the repository's shared
+    // overlay pair (`rootfs-core/` + `rootfs-aarch64/`, exactly what the Alpine
+    // install merges, so the file `check_fs` reads through the VFS is one file
+    // for both machines' paths). The *Alpine* root is a whole tree `apk`
+    // installed (see [`install_alpine_root`]) - the second machine's real
+    // userland. Whichever it is, `mkfs.ext4 -d` lays a filesystem down from the
+    // directory without a mount, so this command needs no privilege to write a
+    // root only the guest will read.
     let staging;
     let tree: &Path = match alpine_root {
         Some(root) => root,
@@ -1193,7 +1377,14 @@ fn build_esp(
             for &(name, bytes) in entries {
                 stage_program(&staging, name, bytes)?;
             }
-            copy_tree(&crate::utils::project_root()?.join("rootfs"), &staging)?;
+            merge_core_and_machine(&crate::utils::project_root()?, "rootfs-aarch64", &staging)?;
+            crate::rootfs::render_inittab(
+                &staging,
+                &crate::config::RootfsConfig::load(
+                    &crate::utils::project_root()?.join("rootfs-aarch64.toml"),
+                )?,
+                false,
+            )?;
             &staging
         }
     };
@@ -1546,7 +1737,120 @@ fn kib(path: &Path) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Machine, TestConfig};
+    use crate::config::{Machine, RunMode, TestConfig};
+
+    #[test]
+    fn alpine_boot_consoles_follow_the_run_mode() {
+        // The session's console list is the x86_64 path's own answer - one
+        // `RunMode`, three lists (`config.rs`'s `cmdline_consoles`) - spelled
+        // with this machine's serial name. The two spellings of that name are
+        // pinned to each other here: `[rootfs] serial_port` in
+        // `rootfs-aarch64.toml` (which `render_inittab` writes into the getty
+        // line) and `SERIAL_PORT` (which the boot bakes into `console=`), plus
+        // the kernel node at `src/drivers/devices.rs`. If they ever disagree,
+        // the login answers on a node the wire never names.
+        for (mode, want) in [
+            (RunMode::Terminal, "console=ttyAMA0"),
+            (RunMode::Mirror, "console=ttyAMA0 console=tty0"),
+            (RunMode::Gui, "console=tty0"),
+        ] {
+            unsafe { std::env::set_var("MPOS_XTASK_MODE", mode.name()) };
+            // The written file always ends in exactly one newline: the loader
+            // reads `mpos.cmdline` whole and the kernel records it verbatim.
+            assert_eq!(
+                alpine_cmdline(ModeChoice::Session).unwrap(),
+                format!("{want}\n")
+            );
+        }
+        unsafe { std::env::remove_var("MPOS_XTASK_MODE") };
+
+        let config = crate::config::RootfsConfig::load(
+            &utils::project_root().unwrap().join("rootfs-aarch64.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.serial_port, SERIAL_PORT,
+            "the toml's serial port and the boot wiring must name one node"
+        );
+
+        // The verdict's fixed line carries no selftest word and no framebuffer:
+        // its gate reads `login:` off the wire alone.
+        assert_eq!(
+            alpine_cmdline(ModeChoice::Verdicts).unwrap(),
+            ALPINE_CMDLINE
+        );
+
+        // And the getty rule is the window rule: only a session with no screen
+        // to log into needs the login on the serial node.
+        assert!(serial_getty_for(RunMode::Terminal));
+        assert!(!serial_getty_for(RunMode::Mirror));
+        assert!(!serial_getty_for(RunMode::Gui));
+    }
+
+    #[test]
+    fn the_alpine_install_stamp_keys_on_the_trees_it_installs_from() {
+        // The counterfactual for `run --arch aarch64` after every kernel edit:
+        // a fresh build re-lays the disk from the staged tree without touching
+        // the network, so the stamp may *not* list the kernel or the loader.
+        // What it must list is everything `install_alpine_root` reads: the
+        // toml and both overlay trees.
+        let inputs = [
+            "rootfs-aarch64.toml",
+            crate::rootfs::CORE_OVERLAY,
+            "rootfs-aarch64",
+        ];
+        for name in inputs {
+            assert!(
+                utils::project_root().unwrap().join(name).exists(),
+                "the install reads {name}, so the stamp must too"
+            );
+        }
+        // A file touched inside the core tree makes the installed tree stale -
+        // the check `alpine_root_is_stale` runs against a real stamp.
+        let dir = std::env::temp_dir().join("mpos-aarch64-stamp-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("build")).unwrap();
+        fs::create_dir_all(dir.join("root/core")).unwrap();
+        fs::write(dir.join("root/core/f"), "x").unwrap();
+        fs::write(dir.join("root/toml"), "x").unwrap();
+        fs::create_dir_all(dir.join("build/aarch64-alpine-root")).unwrap();
+        fs::write(dir.join("build/aarch64-alpine-root.stamp"), "old").unwrap();
+        // Backdate the stamp, then touch a core file: stale.
+        let older = std::time::SystemTime::now() - Duration::from_secs(60);
+        let f = fs::File::options()
+            .write(true)
+            .open(dir.join("build/aarch64-alpine-root.stamp"))
+            .unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(older))
+            .unwrap();
+        drop(f);
+        filetime_touch(&dir.join("root/core/f")).unwrap();
+        assert!(
+            newer_check(
+                &dir.join("root/core"),
+                &dir.join("build/aarch64-alpine-root.stamp")
+            ),
+            "a file added under the core tree is an input the stamp knows"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `utils::dir_newer_than` through a stamp, the way `alpine_root_is_stale`
+    /// uses it - factored out so the test above checks the same predicate the
+    /// build runs, not a copy of it.
+    fn newer_check(tree: &Path, stamp: &Path) -> bool {
+        utils::dir_newer_than(tree, utils::file_mtime(stamp).unwrap()).unwrap()
+    }
+
+    fn filetime_touch(path: &Path) -> Result<()> {
+        let now = std::time::SystemTime::now();
+        let f = fs::File::options()
+            .write(true)
+            .open(path)
+            .context("touch")?;
+        f.set_times(std::fs::FileTimes::new().set_modified(now))?;
+        Ok(())
+    }
 
     /// A gap whose program the payload does not build is a claim nothing in the
     /// sweep can check: there is no program to leave out, so the entry would sit

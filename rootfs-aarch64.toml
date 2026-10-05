@@ -45,6 +45,11 @@ extra_packages = ["alpine-conf", "busybox-suid"]
 hostname = "mpos"
 timezone = "UTC"
 locale = "en_US.UTF-8"
+# The same upstream the first machine asks: slirp carries this guest's UDP to
+# any address the host reaches, and QEMU's own forwarder would hand queries to
+# a host 127.0.0.53 stub that cannot answer them (`rootfs.toml`'s comment on
+# the key is the full story - it is one kernel-wide fact, not a machine's).
+dns = "223.5.5.5"
 # Nothing to type at the login prompt, which is what a serial console with no
 # keyboard wants.
 root_password = ""

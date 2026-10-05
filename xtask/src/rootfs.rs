@@ -26,7 +26,11 @@ use crate::utils;
 /// A word neither source recognises is an error rather than the default, in both
 /// halves: this is the step that writes `mpos.cmdline`, so a silent fallback would
 /// put consoles the user never asked for inside the image.
-fn effective_mode() -> Result<RunMode> {
+///
+/// `pub(crate)` because the second machine's interactive boot asks the same
+/// question of the same sources (`aarch64::alpine_cmdline`): a session is a
+/// session on either machine, and `--mode` means one answer across both.
+pub(crate) fn effective_mode() -> Result<RunMode> {
     if let Ok(text) = std::env::var("MPOS_XTASK_MODE") {
         return RunMode::parse_strict(&text);
     }
@@ -184,6 +188,11 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     enable_services(&mount_dir)?;
     write_modules(&mount_dir)?;
     merge_overlays(&root, "rootfs", &mount_dir)?;
+    // The stock answer on this machine: its consoles reach the screen (or the
+    // wire through the mux) and nothing extra is rendered. `render_inittab`
+    // runs *after* the overlays because the shared template lands with them -
+    // the placeholder only exists in the staged file, never in the repository.
+    render_inittab(&mount_dir, &config, false)?;
     write_resolver(&mount_dir, &config)?;
 
     // Detached before the stamp, not after: the nbd server can still be
@@ -471,6 +480,25 @@ pub(crate) fn render_inittab(
     config: &RootfsConfig,
     serial_getty: bool,
 ) -> Result<()> {
+    // The placeholder's own blank line goes with an empty render, so the
+    // stock answer keeps the file's spacing exactly as the old per-machine one
+    // had it; a rendered getty keeps its surrounding blanks like any other entry.
+    let line = if serial_getty {
+        format!(
+            "{port}::respawn:/sbin/getty -L 38400 {port} vt100",
+            port = config.serial_port
+        )
+    } else {
+        String::new()
+    };
+    // The serial port's name is this machine's psABI spelling (`ttyAMA0` on the
+    // PL011, `ttyS0` on the 16550), and it is *read* from the machine's own
+    // toml rather than shared with the boot wiring: `[rootfs] serial_port` is
+    // an install input on both machines, while the `console=` word stays the
+    // launcher's business (x86_64 bakes it via `install_boot_files`, aarch64
+    // via `aarch64::alpine_cmdline`). The two spellings of one node are pinned
+    // to each other per machine - here by `rootfs-aarch64.toml`'s value and
+    // `aarch64::SERIAL_PORT`, in config.rs's tests.
     let path = mount_dir.join("etc/inittab");
     let text = fs::read_to_string(&path)?;
     if !text.lines().any(|l| l.trim() == "@SERIAL_GETTY@") {
@@ -482,14 +510,6 @@ pub(crate) fn render_inittab(
     // A whole-line replacement, never a bare word substitution: the comment
     // block explains the rendering *with* the placeholder token in it, and a
     // word-level replace would render that prose too.
-    let line = if serial_getty {
-        format!(
-            "{port}::respawn:/sbin/getty -L 38400 {port} vt100",
-            port = config.serial_port
-        )
-    } else {
-        String::new()
-    };
     let rendered: Vec<&str> = text
         .lines()
         .map(|l| {
@@ -500,9 +520,6 @@ pub(crate) fn render_inittab(
             }
         })
         .collect();
-    // The placeholder's own blank line goes with an empty render, so the
-    // stock answer keeps the file's spacing exactly as the old per-machine one
-    // had it; a rendered getty keeps its surrounding blanks like any other entry.
     let mut out = if line.is_empty() {
         rendered.join("\n").replace("\n\n", "\n")
     } else {
@@ -973,7 +990,7 @@ fn install_base(
     utils::install_apk_keys(&mount_dir.join("etc/apk/keys"))?;
 
     let status_ok = apk_add(
-        &apk,
+        &[&apk],
         mount_dir,
         &["--arch", config.arch.as_str(), "--update-cache", "--initdb"],
         &config.base_packages,
@@ -986,7 +1003,7 @@ fn install_base(
 
     if !config.extra_packages.is_empty() {
         println!("Installing additional packages");
-        apk_add(&apk, mount_dir, &[], &config.extra_packages)
+        apk_add(&[&apk], mount_dir, &[], &config.extra_packages)
             .context("Failed to install the additional packages")?;
     }
 
@@ -1178,24 +1195,30 @@ pub(crate) fn write_modules(mount_dir: &Path) -> Result<()> {
 /// heavy write load rather than a real fault the retry can't clear.
 const APK_ADD_ATTEMPTS: usize = 4;
 
-/// `apk --no-progress add --root <mount_dir> <preflags...> <packages...>`,
-/// retried. A `qemu-nbd`-attached image intermittently fails its biggest
-/// writes with an I/O error; `apk` records what it did manage to install, so a
-/// plain re-run finishes the packages the failed attempt dropped. `sync` before
-/// each retry flushes the queued writeback to the image before the device is
-/// touched again.
+/// `<wrapper...> <apk> --no-progress add --root <mount_dir> <preflags...>
+/// <packages...>`, retried. A `qemu-nbd`-attached image intermittently fails
+/// its biggest writes with an I/O error; `apk` records what it did manage to
+/// install, so a plain re-run finishes the packages the failed attempt dropped.
+/// `sync` before each retry flushes the queued writeback to the image before
+/// the device is touched again.
 ///
 /// The second machine's install shares this retry (`aarch64::install_alpine_root`):
 /// its failure mode is not NBD I/O but the mirror fetch, and a re-run that
 /// resumes from what `apk` already recorded is the same finish-the-job answer.
+/// Its wrapper is `fakeroot --` (the tree must land root-owned without the
+/// build taking root), which is why the command is a slice rather than one
+/// path: `[]` runs apk directly, `[apk]` runs it bare, `[fakeroot, "--", apk]`
+/// wraps it.
 pub(crate) fn apk_add(
-    apk: &str,
+    cmd: &[&str],
     mount_dir: &Path,
     preflags: &[&str],
     packages: &[String],
 ) -> Result<()> {
+    let (program, rest) = cmd.split_first().context("apk_add: an empty command")?;
     for attempt in 1..=APK_ADD_ATTEMPTS {
-        let status = Command::new(apk)
+        let status = Command::new(program)
+            .args(rest)
             .args(["--no-progress", "add"])
             .arg("--root")
             .arg(mount_dir)
