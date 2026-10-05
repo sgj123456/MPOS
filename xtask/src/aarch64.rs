@@ -961,6 +961,16 @@ fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
     // busybox init whose `::sysinit:/sbin/openrc sysinit` lines run against empty
     // runlevel directories - an Alpine userland that starts no service at all.
     crate::rootfs::enable_services(&staging)?;
+    // And the module index, for the same reason and from the same helper the
+    // x86_64 install uses: the `modules` service this table turns on reads
+    // `/etc/modules` - `af_packet` and `ipv6` here - and asks `modprobe` for each
+    // name, so without `/lib/modules/<release>` the boot prints "can't change
+    // directory to '/lib/modules'" for every line. `modules.builtin` is how a
+    // machine with no loadable modules answers that honestly: a hit means "already
+    // loaded", exit 0, nothing printed. The names are the same ones on both
+    // machines because they are one kernel's code, and the directory is named for
+    // the release both machines report (`uname -r` is one number).
+    crate::rootfs::write_modules(&staging)?;
     // The probe file the kernel's `check_fs` reads (see [`PROBE_FILE`]). It sits
     // at the root of a real Alpine tree because the check is about the *block
     // driver and the filesystem*, which the machine must prove on whichever root

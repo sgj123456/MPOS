@@ -1033,7 +1033,17 @@ pub(crate) fn enable_services(mount_dir: &Path) -> Result<()> {
 /// empty resolution table, since nothing in it needs resolving. The directory
 /// is named for the version the running kernel will report; see
 /// [`utils::kernel_release`].
-fn write_modules(mount_dir: &Path) -> Result<()> {
+///
+/// `pub(crate)` because the second machine's install (`aarch64::install_alpine_root`)
+/// calls it too, and the reason is the same statement of fact: mpos has no loadable
+/// modules on either machine, so `modprobe` on either machine has to be told that.
+/// Without it the second machine's `modules` service - which reads `/etc/modules`
+/// and asks for `af_packet` and `ipv6` - found no `/lib/modules` at all and printed
+/// `modprobe: can't change directory to '/lib/modules'` twice on every boot
+/// (`PLAN.md` §13.15). [`utils::kernel_release`] is the same string on both
+/// machines (`uname -r` is one number, from the root `Cargo.toml`), so one
+/// directory name serves both.
+pub(crate) fn write_modules(mount_dir: &Path) -> Result<()> {
     let release = utils::kernel_release()?;
     let dir = mount_dir.join("lib/modules").join(&release);
     fs::create_dir_all(&dir).with_context(|| format!("Failed to create {dir:?}"))?;

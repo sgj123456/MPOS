@@ -2302,11 +2302,37 @@ fn check_wallclock() {
         fail!("the counter went backwards from the boot anchor");
     }
 
-    // No writable persistent clock: the trait's own contract is that `false` means
-    // there is none, and this machine's `RTC_DR` is host-derived, not stored. A
-    // `true` here would be a write the device ignores reported as a success.
-    if pl031::write_epoch(0x1234_5678) {
-        fail!("write_epoch claimed to persist an epoch on a read-only counter");
+    // The counter is a *writable* clock, which is what `/dev/rtc0`'s `RTC_SET_TIME`
+    // and `hwclock -w` need. It is written to a value no boot would read (1979) so
+    // that "the write landed" cannot be satisfied by what was already there, read
+    // back *from the device*, and put back - the same leave-it-as-you-found-it rule
+    // the software anchor above follows, and the reason the restore is checked: a
+    // check that left this counter at 1979 would hand the machine a wrong clock,
+    // which is exactly the defect this check's neighbours were found through.
+    // `landed` allows the counter to have ticked between the load and the read
+    // (the load sets what `DR` reads now, and the clock does not stop for it) -
+    // a second of slack, against writes that differ from what was there by
+    // decades, so nothing can be hidden by it.
+    let landed = |got: u64, want: u64| got == want || got == want + 1;
+    let wanted: u64 = 0x1234_5678;
+    if !pl031::write_epoch(wanted) {
+        fail!("write_epoch({wanted:#x}) refused a value the 32-bit counter can hold");
+    }
+    if !landed(pl031::read_epoch(), wanted) {
+        fail!(
+            "the counter reads {:#x} after write_epoch({wanted:#x})",
+            pl031::read_epoch()
+        );
+    }
+    let past_the_end: u64 = u32::MAX as u64 + 1;
+    if pl031::write_epoch(past_the_end) {
+        fail!("write_epoch({past_the_end:#x}) claimed a value the counter cannot hold");
+    }
+    if !pl031::write_epoch(anchored) || !landed(pl031::read_epoch(), anchored) {
+        fail!(
+            "the counter was not put back: {:#x}, expected {anchored:#x}",
+            pl031::read_epoch()
+        );
     }
 
     // The in-memory anchor still moves, the way `settimeofday` does on both
@@ -2346,8 +2372,8 @@ fn check_wallclock() {
     let _ = writeln!(
         out,
         "wallclock: PL031 reached at {:#x} through the kernel half; boot anchored to \
-         a live UTC epoch ({anchored:#x}); the counter read-only, so write_epoch \
-         refuses; the software anchor moves on set_boot_epoch",
+         a live UTC epoch ({anchored:#x}); the counter loads and reads back, so \
+         write_epoch persists; the software anchor moves on set_boot_epoch",
         pl031::BASE
     );
     let _ = writeln!(out, "M6_WALL_OK");

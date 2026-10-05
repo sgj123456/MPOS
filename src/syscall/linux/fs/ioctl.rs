@@ -841,20 +841,47 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
         }
         // The RTC ioctls `hwclock(8)` speaks, answered on the clock's device
-        // number. Both directions read and write the kernel's wall clock -
-        // one clock, so `date` and `hwclock -r` cannot disagree - and
-        // `RTC_SET_TIME` additionally stores it in the CMOS, where it waits
-        // for the next boot's anchor. The alarm/interrupt requests are the
-        // family's own ENOTTY, as they are for hardware without them.
+        // number. The read answers from the kernel's own wall clock - one
+        // clock, so `date` and `hwclock -r` cannot disagree - and
+        // `RTC_SET_TIME` additionally stores the value in the hardware clock,
+        // where it waits for the next boot's anchor. Which hardware that is
+        // belongs to the machine (`crate::hal::WallClock`): the CMOS on x86_64,
+        // the PL031 on aarch64. The alarm/interrupt requests are the family's
+        // own ENOTTY, as they are for hardware without them.
         //
-        // The family is accepted under two magic bytes. The kernel's own
-        // header spells the RTC ioctls `'t'`, but the `linux/rtc.h` busybox
-        // was built against carries the older `'p'` - the byte the mc146818
-        // driver used before the subsystem moved - and Alpine's hwclock
-        // therefore asks with `0x80247009`/`0x4024700a`. Only those two
-        // commands cross over: `'p'` is also PPP's family, and a stray PPP
-        // request must stay as unknown here as it would be on any machine.
-        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // One consequence of that first sentence is worth naming, because it is
+        // a divergence a caller can see: the write leaves the *kernel's* clock
+        // alone (as Linux's does), while the read answers the kernel's clock
+        // rather than the registers - so a set followed by a read reports the
+        // kernel's time and not the value written. That is the price of the
+        // property the read exists for ("one clock, so `date` and `hwclock -r`
+        // cannot disagree"), it is on both machines, and it is older than the
+        // second machine's node.
+        //
+        // The family is two commands, and `linux/rtc.h` spells both with the
+        // `'p'` magic byte - measured from the shipped header, which defines
+        // `RTC_RD_TIME` as `_IOR('p', 0x09, struct rtc_time)` and `RTC_SET_TIME`
+        // as `_IOW('p', 0x0a, struct rtc_time)`, i.e. `0x80247009`/`0x4024700a`
+        // with the struct thirty-six bytes. Those are the two numbers Alpine's
+        // `hwclock` sends, and the only two that cross over: `'p'` is also PPP's
+        // family, and a stray PPP request must stay as unknown here as it would
+        // be on any machine.
+        //
+        // The arm also accepts the `'t'` magic, and what that is deserves saying
+        // because this comment used to claim the opposite: nothing in this host's
+        // header tree spells these commands with `'t'` (24 `'p'` spellings,
+        // none of `'t'`). So it is tolerance for a spelling seen once rather than
+        // a second dialect, and it cannot mislead a caller - a request matching
+        // only by that magic and no sub-command falls to the `_ => ENOTTY` below,
+        // which is what the default arm answers anything unknown.
+        //
+        // Served on **both** machines, and the gate that made it x86_64's was the
+        // only machine-shaped thing here: what this arm is keyed on is the device
+        // number the RTC node carries (`10,135`), and that node is registered on
+        // both (`drivers/devices.rs`). Which hardware answers is `crate::hal`'s
+        // business - the CMOS on x86_64, the PL031 on aarch64 - and both can be
+        // written now, which is what `RTC_SET_TIME` needs (`PLAN.md` §13.15).
+        #[cfg(target_os = "none")]
         request
             if family_nr(request, b't').is_some()
                 || matches!(request, 0x8024_7009 | 0x4024_700A) =>

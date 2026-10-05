@@ -143,7 +143,7 @@ drain (`'R'` nr 4) and OpenRC's `seedrng` failed to seed the boot (`PLAN.md` §1
 | `'b'` (0x62) | dma-buf | `src/syscall/linux/fs.rs` | Served (`SYNC` as the documented coherent-memory no-op, `SET_NAME` a debug label) |
 | `'d'` (0x64) | `/dev/dri/card0`, `renderD128` | `src/drivers/drm.rs`, `crates/gpu/src/virtgpu.rs`, `crates/gpu/src/*.rs` | Served across the compositor surface, and **the `DRM_VIRTGPU_*` family with it, 2D and 3D both**: all eleven requests are dispatched, and each answers per card shape, as Linux's does (measured; instrument in `user/staging/virtgpu-probe/`, and the GL card's own answers in `PLAN.md` §7.4). On a card with no 3D — `GETPARAM` (`3D_FEATURES` 0, `CAPSET_QUERY_FIX` 1, unknown parameter `EINVAL`, the write four bytes wide as Linux's is), `RESOURCE_CREATE` (a real device resource, made across the mailbox to the render task), and `RESOURCE_INFO`/`MAP`/`WAIT`/`TRANSFER_TO_HOST` for the handle it returns; `GET_CAPS`/`EXECBUFFER`/`TRANSFER_FROM_HOST` `ENOSYS`, `CONTEXT_INIT`/`RESOURCE_CREATE_BLOB`/a 3D `RESOURCE_CREATE` `EINVAL`. On a GL card the same requests answer as Linux's GL card does: `VIRGL` and `CONTEXT_INIT` are negotiated (`3D_FEATURES` 1, `SUPPORTED_CAPSET_IDs` 6), `CONTEXT_INIT` is `EEXIST` because the context is created implicitly on the first resource, a 3D `RESOURCE_CREATE`, `EXECBUFFER` and `TRANSFER_FROM_HOST` complete, and the two advertised cap sets are fetched and cached. `RESOURCE_CREATE_BLOB` stays `EINVAL` on both shapes, which is Linux's answer on both too. **Three named divergences**: `RESOURCE_INFO`'s `res_handle` is 0 for a plain dumb buffer (on Linux one *is* a device resource), `TRANSFER_TO_HOST` on one is `EINVAL` where Linux completes it, and a transfer whose rectangle does not fit the backing the device was given is refused where Linux would read past it. The first two have a single fix, recorded in `PLAN.md` §7.4: make `CREATE_DUMB` create a device resource too, as Linux's does. A framebuffer belongs to the open file description that made it and is released with it (Linux's `drm_file_free` → `drm_fb_release`), so `GETRESOURCES`'s `count_fbs` is a list of live framebuffers rather than a list of ids a dead session left behind. The cursor plane publishes `SRC_X`/`SRC_Y`/`SRC_W`/`SRC_H` and `CRTC_W`/`CRTC_H` beside `type`/`FB_ID`/`CRTC_ID`/`CRTC_X`/`CRTC_Y`/`IN_FORMATS`, because a compositor adds them to every plane's atomic state and one the plane does not have reaches the card as property 0 and refuses the whole commit; this cursor cannot scale or crop, so the identity rectangle is the only one a commit may name and any other is `EINVAL`. Other §7.4 gaps: timeline syncobj behaviour, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` |
 | `'P'` (0x50) | `/dev/dsp` | `src/drivers/virtio/sound.rs` | Served; the family's rate/channels/format belong to the writer |
-| `'t'` (0x74) + `0x8024_7009`/`0x4024_700A` | `/dev/rtc0` | `src/drivers/rtc_dev.rs` | Served (`RTC_RD_TIME`/`RTC_SET_TIME`); alarm/interrupt requests `ENOTTY` |
+| `'p'` (0x70) + `0x8024_7009`/`0x4024_700A` | `/dev/rtc0`, `/dev/rtc` | `src/drivers/rtc_dev.rs` | Served on **both** machines (`RTC_RD_TIME`/`RTC_SET_TIME`); alarm/interrupt requests `ENOTTY`, and so is the family aimed at any other descriptor. The readiness asked for is `'p'`, which is what the shipped `linux/rtc.h` spells all twenty-four of its commands with (measured: no `'t'` spelling exists in that header tree) and what Alpine's `hwclock` sends; the arm also tolerates a `'t'` magic never seen, and a request matching only by it reaches the same `ENOTTY` tail (§5.1) |
 | `0x12` (block) | `/dev/vda`, `/dev/sda` | `src/blk/`, `src/syscall/linux/fs.rs` | Served; the size trio's buffer direction was the sole outlier and is fixed (§5.1) |
 | `'f'` (0x66) | any file an `open` names | `src/syscall/linux/fs.rs` `fs_flags_ioctl` + `src/vfs/ext4/`, `src/vfs/ramfs.rs` | Served: `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS`, the inode attribute word `lsattr`/`chattr` are made of; the rest of the family `ENOTTY`; a bit this kernel cannot keep `EOPNOTSUPP` and *not stored*; `IMMUTABLE`/`APPEND` need `CAP_LINUX_IMMUTABLE` (§5.1) |
 | `0x89xx` (`SIOC*`) | `eth0` | `src/net/rtnl.rs` (dispatched in `fs.rs`) | Served (`SIOCGIFFLAGS`/`SIOCSIFFLAGS`/`SIOCSIFMTU`/`SIOCGIFINDEX`/`SIOCGIFTXQLEN`/`SIOCGIFHWADDR`) |
@@ -317,6 +317,23 @@ the commit bodies), and each moved its pin in the same commit.
    ranged, the timestamp's length measured through `asctime`'s own format, then the real
    `asctime_r` call) — the first test either suite has had for the calendar. Closes
    `PLAN.md` §13.14.
+
+8. **`/dev/rtc0` is a device of the machine's clock, not of x86's CMOS - so it exists
+   outside x86_64 too, and the clock behind it writes.** The node, its two names and the
+   `RTC_*` ioctls were gated `target_arch = "x86_64"` while everything they touch was
+   already `crate::hal::WallClock`; the second machine's OpenRC `hwclock` service
+   therefore found no `/dev/rtc`, could not set the system clock, and reported `[ !! ]`
+   on every boot. The second half was a recorded measurement the machine refutes: this
+   tree's PL031 module carried "a programmatic write does not stick" and answered
+   `write_epoch` with `false`, and the write that had been tried was `RTC_DR` - the
+   counter's read door. Measured on the machine before the change: loading `RTC_LR`
+   (`0x08`) with `0x6ac360c7` left `DR` reading `0x6ac360c7`. `write_epoch` now loads the
+   counter and reads it back (a dropped write is still `false`), which is what
+   `RTC_SET_TIME` needed. Owner: `src/drivers/{mod,devices,rtc_dev}.rs`,
+   `src/arch/aarch64/pl031.rs`, `src/syscall/linux/fs/ioctl.rs`. Pin: `t-rtc` on **both**
+   machines (`RTC_RD_TIME` agreeing with `clock_gettime` and with `gmtime_r` field for
+   field, `RTC_SET_TIME` served, `EINVAL` for a month no calendar carries, `ENOTTY` for
+   the alarm half and for the family on another descriptor). Closes `PLAN.md` §13.15.
 
 ### 5.2 Small, measured, and not yet landed
 

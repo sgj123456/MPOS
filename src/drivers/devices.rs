@@ -298,12 +298,21 @@ pub fn standard_devfs() -> Arc<DevFs> {
     if let Some(rng) = crate::drivers::virtio::mmio::global() {
         dev.register("hwrng", Arc::new(HwrngDev(rng)));
     }
-    // The CMOS clock, on its Linux misc-device number (10,135 - the number
+    // The real-time clock, on its Linux misc-device number (10,135 - the number
     // `hwclock` and the `RTC_*` ioctls are keyed on). `rtc0` is the name the
     // class gives it; `rtc` is the alias every busybox `hwclock` tries when
     // the numbered one is missing, and registering both is cheaper than
     // trusting which list the shipped binary walks.
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    //
+    // Both machines and not one: what the node reads is `crate::hal`, not a
+    // register, so the machine behind it is the CMOS on x86_64 and the PL031
+    // here, and the only x86-shaped thing about this was the gate. The node was
+    // registered on x86_64 alone, which meant the second machine's `hwclock`
+    // service found no `/dev/rtc` on any of the three names it walks, could not
+    // set the system clock, and reported `[ !! ]` on every boot (`PLAN.md`
+    // §13.15). The `modprobe rtc-cmos`/`rtc`/`genrtc` loop that noise came from
+    // is guarded by the same `rtc_exists` test, so the node silences it too.
+    #[cfg(target_os = "none")]
     {
         dev.register_id("rtc0", Arc::new(crate::drivers::rtc_dev::RtcDev), 10, 135);
         dev.register_id("rtc", Arc::new(crate::drivers::rtc_dev::RtcDev), 10, 135);

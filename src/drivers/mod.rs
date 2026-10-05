@@ -26,7 +26,13 @@ pub mod drm;
 pub mod pci;
 #[cfg(target_arch = "x86_64")]
 pub mod qemu;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+/// The real-time clock's device node - `/dev/rtc0`, and the `RTC_*` ioctls'
+/// conversion between a Unix second and the nine fields `struct rtc_time` spells.
+/// Machine-neutral, and the only thing that was not was the `target_arch` gate
+/// here: what the node reads and writes is `crate::hal::WallClock`, which both
+/// machines implement (the CMOS and the PL031), so it is compiled wherever there
+/// is a machine (`PLAN.md` §13.15).
+#[cfg(target_os = "none")]
 pub mod rtc_dev;
 #[cfg(target_arch = "x86_64")]
 pub mod serial;
