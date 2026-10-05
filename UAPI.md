@@ -302,6 +302,22 @@ the commit bodies), and each moved its pin in the same commit.
    Owner: `src/vfs/mount.rs`. Pin: `t-mountinfo` (the `-`-field line for `/`,
    and its device against `stat("/")`).
 
+7. **`clock_gettime(CLOCK_REALTIME)` answers a live wall time for the whole boot, not
+   only until the first milestone check.** The value this kernel promised was right; a
+   *boot check* changed it. `check_wallclock` (`M6_WALL_OK`) proves `set_boot_epoch`
+   moves the anchor by setting it to `1 << 40` and had never restored it, so on aarch64
+   — where the milestone checks run on every boot, in front of the sweep and in front of
+   a distribution's `init` — every program after the check read a year of **36812**.
+   Measured on this host's Linux before the change: the same `localtime_r` → `asctime_r`
+   path yields a 25-character timestamp and a live year, and musl's `asctime_r` reaches
+   `a_crash()` (a store through NULL) when a timestamp will not fit its 26-byte buffer —
+   which is how the wrong clock became a dead `syslogd` rather than a wrong log line.
+   Owner: `src/arch/aarch64/mod.rs` (+ `pl031`). Pin: `t-localtime` on **both** machines
+   (the anchor read back as `CLOCK_REALTIME - CLOCK_MONOTONIC`, every `struct tm` field
+   ranged, the timestamp's length measured through `asctime`'s own format, then the real
+   `asctime_r` call) — the first test either suite has had for the calendar. Closes
+   `PLAN.md` §13.14.
+
 ### 5.2 Small, measured, and not yet landed
 
 - **`FIONREAD` on a regular file and on a pipe.** Linux answers `0` and the bytes

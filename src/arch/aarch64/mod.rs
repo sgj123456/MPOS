@@ -2310,12 +2310,35 @@ fn check_wallclock() {
     }
 
     // The in-memory anchor still moves, the way `settimeofday` does on both
-    // machines, and that is what `boot_epoch` answers from.
+    // machines, and that is what `boot_epoch` answers from. It is moved to a
+    // value that is *not* a plausible epoch (`1 << 40` seconds into it, a year
+    // past thirty-one thousand) so that "the setter moved it" cannot be
+    // satisfied by the value that was already there - and then it is put
+    // **back**, because this check runs on every aarch64 boot, in front of
+    // whatever the machine is about to run: the test sweep, or a distribution's
+    // own `init`. A check that leaves the clock anchored at `1 << 40` breaks the
+    // thing it is proving works.
+    //
+    // Measured, and how this was found: the Alpine boot's `syslogd` died at EL0
+    // in musl's `asctime_r` - the branch musl implements as `a_crash()` -
+    // because the timestamp it formatted was `36812-02-20`, and that year is
+    // exactly this constant read back as seconds since the epoch. `t-localtime`
+    // reads the same value on both boot shapes.
     let anchor: u64 = 0x0000_0100_0000_0000;
     pl031::set_boot_epoch(anchor);
     if pl031::boot_epoch() != anchor {
         fail!(
             "boot_epoch() is {:#x} after set_boot_epoch({anchor:#x})",
+            pl031::boot_epoch()
+        );
+    }
+    // Back to the epoch the counter really reads, and checked rather than
+    // assumed: a restore that silently failed would be the same damage with a
+    // quieter cause.
+    pl031::set_boot_epoch(anchored);
+    if pl031::boot_epoch() != anchored {
+        fail!(
+            "the boot anchor was not restored: {:#x}, expected {anchored:#x}",
             pl031::boot_epoch()
         );
     }
