@@ -971,6 +971,48 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         depgraph 9/9, fmt clean, clippy 0 errors
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
+  - [ ] 13.16 the second machine's virtual consoles (`tty1`..`tty4`) need the `vcmux` port -
+        **written and building, not landed: it trips a crash whose cause is a separate bug.**
+        Measured before anything was written: un-gating `vfs::vcmux` costs exactly **7** errors and
+        all seven are `drivers::{video::render,drm}`, so the port is that seam and nothing else.
+        Written: the display half moved to four `crate::console` seams (`display_notify`,
+        `display_master_held`, `display_handover`, `display_card_grabbed`), each with the
+        `#[cfg(mpos_framebuffer_console)]` / `#[cfg(not(..))]` pair whose no-machine body is a no-op
+        or the answer a machine with no card owes - which is the pattern `console`'s
+        `paint_grids_if_live` already used, and the mux keeps the headless case it always had
+        (`grids_live` narrates a switch on the wire as `[ttyN]`); the `'V'`/`'K'` ioctl arms and
+        `Tty::{vt,kd}_ioctl` un-gated to `target_os = "none"`; `pl011::drain_input` calls
+        `vcmux::route_input` instead of the console tty (the 16550's handler's exact shape); and
+        `vcmux::init()` goes up before the console interrupt is armed, the order x86_64's boot uses.
+        Both kernels and the loader build; fmt clean. **What blocks it:** with the port in, the
+        aarch64 sweep dies in the stage-2 context check - `EXCEPTION: synchronous`, `EC 0x21` (an
+        instruction abort at the *same* EL), `ELR_EL1 = FAR_EL1 = 0xffffffff80113780`. Disassembly of
+        the target says it holds *code* (`stp x29, x30, [sp, #-128]!`) - and it sits inside the
+        `.rodata` *segment*, which the kernel's W^X plan maps `r--`, so the fetch is refused. That is
+        the whole finding: **the image's executable content is not confined to `[.., __text_end)`**,
+        which is what `mm::vm::kernel_mappings` assumes (this build: `.text` ends `0x1099a4`,
+        `__text_end` `0x10a000`, and the code is at `0x113780`). It is *not* the port's code: the
+        crash is at stage 2, before anything the port added runs - proven by reverting the two
+        runtime wirings (`vcmux::init`, `drain_input`) with no change - so the trigger is the image
+        *size*, and HEAD (whose `.text` ended `0x10a900`) has the same code inside its own `.text`.
+        Next experiment, in order: disassemble the blob at the target to name the function; ask why
+        the linker put a function in the `.rodata` output section (its own `SHF_EXECINSTR` is
+        *clear*, so either an orphan-section placement or a mis-sized `__text_end` - the plan's
+        assumption, not the mapping); and the cheap probe, at HEAD with ~10 KB of padding, to confirm
+        that size alone reproduces it. A WIP stash holds the whole port plus 13.17's fix.
+  - [ ] 13.17 found on the way, and a bug in its own right: **the loader offers the kernel its own
+        boot stack as allocatable memory.** The record's regions *are* the frame allocator's zones
+        (`mm::pframe::init` builds a zone per allocatable region), and `mpos-boot` allocates the boot
+        stack with UEFI `LOADER_DATA`, which `kind_of` reports as `BootloaderReclaimable` - so the
+        first allocation of that size can land on the stack the kernel is running on. Measured:
+        printed the record, and the 64-page stack at physical `0x442c4000` sat inside a reclaimable
+        region; carving it out (the loader splitting the containing region three ways, `Reserved`
+        between) makes it `region[4] 0x442c4000..0x44304000 kind Reserved`, and the record's parser
+        (`boot::handoff::collect`) now refuses a record that offers the stack by name. **Not landed
+        yet**, for two honest reasons: it does *not* fix 13.16's crash (so it is not that crash's
+        cause), and the record's allocatable total moved 205 MiB -> 181 MiB when the carve went in -
+        a 24 MiB discrepancy the stack's 256 KiB does not explain, unresolved, possibly the
+        firmware's own map varying between runs. Fix and pin are in the same WIP stash.
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
       dispatcher, the aarch64 linker script that does not exist (§11.2 Step A)
 - [x] 11.E leaf crates: the seven pure, downward-only leaves (`err`, `pci`, `date`, `binfmt`,
