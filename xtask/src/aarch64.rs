@@ -1355,9 +1355,18 @@ fn build_esp_with_cmdline(
             fs::create_dir_all(&staging)
                 .with_context(|| format!("Failed to create {}", staging.display()))?;
             fs::write(staging.join(PROBE_FILE), PROBE_BYTES)?;
-            for &(name, bytes) in entries {
-                stage_program(&staging, name, bytes)?;
-            }
+            // The overlay pair first, the payload *after* it. Order is the
+            // contract: `rootfs-aarch64/` carries the Alpine disk's `/init` -
+            // a `#!/bin/sh` script busybox init reads - while this tree's
+            // verdict needs the hand-encoded launcher at the same path (the
+            // echo/execve program whose `R:echo-test`, `MPOS_EXEC_OK` and
+            // `INIT_EXITED` lines *are* the boot's verdict). Merging after
+            // staging let the script overwrite the launcher, and the kernel's
+            // shebang resolution then failed on a disk with no interpreter at
+            // all: `NoInterpreter`, measured. So the payload lands last and
+            // wins; the overlay's remaining files (`etc/inittab`, which the
+            // byte-length pin below reads through the mounted root) still
+            // arrive, because nothing in the payload names them.
             crate::rootfs::merge_overlays(
                 &crate::utils::project_root()?,
                 "rootfs-aarch64",
@@ -1367,6 +1376,9 @@ fn build_esp_with_cmdline(
                 )?,
                 false,
             )?;
+            for &(name, bytes) in entries {
+                stage_program(&staging, name, bytes)?;
+            }
             &staging
         }
     };
