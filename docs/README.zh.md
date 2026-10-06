@@ -335,7 +335,7 @@ cargo xtask run --mode gui           # 在窗口里看这台机器
 
 | 命令 | 作用 | 需要 root？ |
 |---|---|---|
-| `cargo xtask build` | 内核 + UEFI 引导加载器 | 否 |
+| `cargo xtask build` [`--arch x86_64\|aarch64`] | 内核 + UEFI 引导加载器，`--arch` 指定哪台机器（它同时决定两个 `--target`） | 否 |
 | `cargo xtask initramfs` | 构建 initramfs 归档 | 是 |
 | `cargo xtask disk` | 创建空白 GPT 镜像 | 是 |
 | `cargo xtask rootfs` | 把 Alpine 安装进镜像（会刷新 initramfs） | 是 |

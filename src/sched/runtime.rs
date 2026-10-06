@@ -1270,6 +1270,23 @@ struct Task {
     /// instruction - hands over one reference instead of cloning every string.
     /// `execve` replaces the whole vector, which drops the old one.
     argv: alloc::sync::Arc<alloc::vec::Vec<alloc::string::String>>,
+    /// The environment the process was entered with, one `KEY=VALUE` per
+    /// element - what `/proc/<pid>/environ` reads through.
+    ///
+    /// Kept for exactly the reasons `argv` is, and kept *only* here for the
+    /// same reason: the block `execve` laid on the process's own stack is the
+    /// program's to overwrite the moment it runs, so this vector is the one
+    /// record of what it started with. Shared with `fork`, replaced (and the
+    /// old one dropped) by `execve`.
+    ///
+    /// The file it feeds is not decoration. Read back as NUL-separated bytes it
+    /// is how a program asks "what was I started with", and one that does is
+    /// OpenRC: its `init.sh` decides whether `/proc` still needs mounting by
+    /// reading `/proc/self/environ` twice under different `VAR=` values and
+    /// comparing the digests. With the file absent the `[ -e ]` fails, so it
+    /// concluded "not mounted" and mounted over a live procfs - `mount:
+    /// mounting proc on /proc failed: Resource busy` on the Alpine boot.
+    env: alloc::sync::Arc<alloc::vec::Vec<alloc::string::String>>,
     /// Where a child created by `clone(CLONE_CHILD_SETTID)` writes its own tid
     /// before it first runs. Zero when nothing was asked for.
     child_tid: usize,
@@ -1496,6 +1513,10 @@ impl Task {
             stack_top: USER_STACK_TOP,
             exe: alloc::string::String::new(),
             argv: alloc::sync::Arc::new(alloc::vec::Vec::new()),
+            // A kernel task or the boot task: no image, so nothing was handed
+            // to it and `/proc/<pid>/environ` reads empty - the honest answer
+            // for a thread that was never exec'd.
+            env: alloc::sync::Arc::new(alloc::vec::Vec::new()),
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
@@ -2009,6 +2030,10 @@ impl Table {
             stack_top: USER_STACK_TOP,
             exe: alloc::string::String::new(),
             argv: alloc::sync::Arc::new(alloc::vec::Vec::new()),
+            // A kernel task or the boot task: no image, so nothing was handed
+            // to it and `/proc/<pid>/environ` reads empty - the honest answer
+            // for a thread that was never exec'd.
+            env: alloc::sync::Arc::new(alloc::vec::Vec::new()),
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
@@ -2472,6 +2497,10 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             // `ps` both read it back, and an empty one reads as a process
             // that has no name at all.
             argv: alloc::sync::Arc::new(argv.to_vec()),
+            // Init's environment, likewise the one record: `/proc/1/environ`
+            // is what a service manager asks before deciding whether it was
+            // started with the variables it expects.
+            env: alloc::sync::Arc::new(env.to_vec()),
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
@@ -2620,6 +2649,7 @@ pub fn try_spawn_user(
             stack_top: loaded.stack_top,
             exe: alloc::string::String::from(exe),
             argv: alloc::sync::Arc::new(argv.to_vec()),
+            env: alloc::sync::Arc::new(env.to_vec()),
             child_tid: 0,
             tls: 0,
             itimers: [None; 3],
@@ -6068,6 +6098,8 @@ pub struct TaskSnapshot {
     /// reader only reads it, and a whole process's command line is not worth
     /// copying for a `ps`.
     pub argv: alloc::sync::Arc<alloc::vec::Vec<alloc::string::String>>,
+    /// The environment it was entered with. Shared for the reason `argv` is.
+    pub env: alloc::sync::Arc<alloc::vec::Vec<alloc::string::String>>,
     /// The directory relative paths are resolved from, as the caller spelled
     /// it. `/` for a process that never moved.
     pub cwd: alloc::string::String,
@@ -6108,6 +6140,7 @@ fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         comm: comm_of(task),
         exe: task.exe.clone(),
         argv: alloc::sync::Arc::clone(&task.argv),
+        env: alloc::sync::Arc::clone(&task.env),
         cwd: task
             .cwd_path
             .clone()
@@ -7393,6 +7426,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         parent_root,
         parent_exe,
         parent_argv,
+        parent_env,
         parent_brk_base,
         parent_brk_pages,
         parent_mmap_cursor,
@@ -7411,6 +7445,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         let parent_root = parent.root.clone();
         let parent_exe = parent.exe.clone();
         let parent_argv = alloc::sync::Arc::clone(&parent.argv);
+        let parent_env = alloc::sync::Arc::clone(&parent.env);
         let parent_brk_base = parent.brk_base;
         let parent_brk_pages = parent.brk_pages;
         let parent_mmap_cursor = parent.mmap_cursor;
@@ -7446,6 +7481,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             parent_root,
             parent_exe,
             parent_argv,
+            parent_env,
             parent_brk_base,
             parent_brk_pages,
             parent_mmap_cursor,
@@ -7634,6 +7670,11 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             stack_top: t.task(parent_id).stack_top,
             exe: parent_exe,
             argv: parent_argv,
+            // The child inherits the parent's environment, one reference
+            // rather than a copy, exactly as it inherits `argv`: the two are
+            // one block on the stack the child shares, and a `fork` that
+            // cloned them would be copying what the next `execve` throws away.
+            env: parent_env,
             // `CLONE_CHILD_SETTID` parks the child's tid where the child can
             // read it; without the flag there is nothing to record.
             child_tid: if request.flags & crate::abi::CLONE_CHILD_SETTID != 0 {
@@ -7812,6 +7853,11 @@ pub fn exec_replace(
         // pid with a new name, and `/proc/<pid>/cmdline` has to say the new
         // one from here on.
         task.argv = alloc::sync::Arc::new(argv.to_vec());
+        // And the environment goes with it, for the same reason and in the
+        // same breath: the old image's block is gone with its stack, so the
+        // vector replaced here is the only record `/proc/<pid>/environ` can
+        // answer from. The old `Arc` drops unless a `fork` still holds it.
+        task.env = alloc::sync::Arc::new(env.to_vec());
 
         // Reset signal dispositions to SIG_DFL (POSIX requirement).
         task.dispositions = signal::Actions::default();
@@ -8141,6 +8187,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         let stack_top = parent.stack_top;
         let exe = parent.exe.clone();
         let argv = alloc::sync::Arc::clone(&parent.argv);
+        let env = alloc::sync::Arc::clone(&parent.env);
         // The creator's *live* base, not its record: see `running_tls`.
         let parent_tls = running_tls(parent);
 
@@ -8225,6 +8272,9 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             stack_top,
             exe,
             argv,
+            // A thread shares its process's environment, one reference as for
+            // `argv`: the two live on the one stack the whole group is running.
+            env,
             child_tid: if request.flags & crate::abi::CLONE_CHILD_SETTID != 0 {
                 request.child_tid
             } else {

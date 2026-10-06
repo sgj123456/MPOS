@@ -21,8 +21,6 @@ use crate::boot::BootInfo;
 #[cfg(target_os = "none")]
 use core::cell::RefCell;
 #[cfg(target_os = "none")]
-use core::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(target_os = "none")]
 use critical_section::Mutex;
 
 /// The physical memory manager. A `static` because it must exist before the heap
@@ -31,84 +29,39 @@ use critical_section::Mutex;
 #[cfg(target_os = "none")]
 pub static PMM: Mutex<RefCell<Pmm>> = Mutex::new(RefCell::new(Pmm::empty()));
 
-/// Offset the bootloader told us to add to a physical address to reach it.
-#[cfg(target_os = "none")]
-static HHDM: AtomicUsize = AtomicUsize::new(0);
+// The direct map the bootloader built lives in `hal` (`crate::hal::phys_to_virt`
+// and friends), because the machine layer's own page-table code needs it and
+// `arch` cannot name `mm` after it becomes a crate of its own. This module keeps
+// no second copy: `init` hands the record's offset to `hal`, and the three
+// helpers below are forwards.
 
 #[cfg(target_os = "none")]
 #[global_allocator]
 static ALLOCATOR: heap::KernelHeap = heap::KernelHeap::empty();
 
-#[cfg(target_os = "none")]
-/// Where a device's registers get mapped.
-///
-/// The two machines agree about the address, and that is a hole the *kernel half*
-/// has room for in both four-level formats: immediately below the image at
-/// `0xffff_ffff_8000_0000`. What they do with it differs, and the difference is
-/// the honest part. x86_64 reaches it by walking a BAR and asking
-/// `hal::map_mmio` for one mapping per device; aarch64 maps its whole fixed
-/// device window there at boot and translates by offset
-/// (`arch::aarch64::paging::device_virt`), which is what its kernel is compiled
-/// against.
-///
-/// So the dynamic half is a *capability*: the build declares
-/// `mpos_dynamic_mmio_window` for a machine that reaches a device by
-/// allocating one mapping per BAR (x86_64), and does not for one whose device
-/// window is a fixed range the boot maps whole (aarch64, which translates by
-/// offset in `arch::aarch64::paging::device_virt`). A machine that declares it
-/// must also be one whose `hal::Paging::map_mmio` exists - the two are the same
-/// arrangement, and `hal` is what the call goes through.
-#[cfg(mpos_dynamic_mmio_window)]
-pub const MMIO_BASE: usize = 0xffff_ffff_4000_0000;
-/// One past the end of the window: 1 GiB of address space, which is room for
-/// every BAR a machine could plausibly have.
-#[cfg(mpos_dynamic_mmio_window)]
-const MMIO_LIMIT: usize = 0xffff_ffff_8000_0000;
-
-/// The next free byte in that window.
-#[cfg(mpos_dynamic_mmio_window)]
-static MMIO_NEXT: AtomicUsize = AtomicUsize::new(MMIO_BASE);
-
-/// Map a device's registers into the kernel half and return the address they
-/// can be reached through.
-///
-/// Called once per BAR, at the moment a driver decides it wants the device.
-#[cfg(mpos_dynamic_mmio_window)]
-pub fn map_mmio(phys: usize, len: usize) -> usize {
-    let len = pframe::align_up(len, PAGE_SIZE);
-    let virt = MMIO_NEXT.fetch_add(len, Ordering::Relaxed);
-    assert!(
-        virt + len <= MMIO_LIMIT,
-        "out of room for device registers: {len} bytes at {phys:#x}"
-    );
-    crate::hal::map_mmio(virt, phys, len);
-    virt
-}
+// The per-BAR MMIO window allocator used to live here. It is the *machine's*
+// answer to `hal::Paging::map_mmio_window` - "a PCIe BAR has no fixed address,
+// so give it a fresh kernel-half mapping and remember where the next one goes"
+// - and it moved to `arch/x86_64/mmio.rs` with the rest of that machine's page
+// table code. What is left at this seam is one name, `hal::map_mmio_window`,
+// which a driver calls and does not have to know which of the two mechanisms
+// answers it.
 
 #[cfg(target_os = "none")]
 pub fn phys_to_virt(phys: usize) -> usize {
-    phys + HHDM.load(Ordering::Relaxed)
+    crate::hal::phys_to_virt(phys)
 }
 
 /// The offset [`phys_to_virt`] adds, for callers that need it directly rather
 /// than the address it produces.
 #[cfg(target_os = "none")]
 pub fn hhdm_offset() -> usize {
-    HHDM.load(Ordering::Relaxed)
+    crate::hal::direct_map_offset()
 }
 
 #[cfg(target_os = "none")]
 pub fn virt_to_phys(virt: usize) -> usize {
-    let hhdm = HHDM.load(Ordering::Relaxed);
-    // Named rather than left to the subtraction: the only way to get here with
-    // a smaller address is a caller handing back something that never came
-    // from `alloc_pages` - a physical frame, or a user address - and which one
-    // it is says where the mistake is.
-    assert!(
-        virt >= hhdm,
-        "virt_to_phys({virt:#x}): not an address from the direct map (hhdm {hhdm:#x})"
-    );
-    virt - hhdm
+    crate::hal::virt_to_phys(virt)
 }
 
 /// Allocate `2^order` contiguous physical frames, aligned to their own size.
@@ -270,7 +223,7 @@ pub fn heap_stats() -> heap::HeapStats {
 /// `info` must describe live memory mapped at `info.hhdm_offset`.
 #[cfg(target_os = "none")]
 pub unsafe fn init(info: &BootInfo) -> FrameStats {
-    HHDM.store(info.hhdm_offset, Ordering::Relaxed);
+    crate::hal::set_direct_map_offset(info.hhdm_offset);
     critical_section::with(|cs| unsafe { PMM.borrow(cs).borrow_mut().init(info) });
 
     let stats = frame_stats();

@@ -31,7 +31,6 @@ build = "build.rs"
 
 # The binaries are named `t-<syscall>`, one per syscall family, so the test
 # run's output says which one is missing.
-[lints.cargo]
 
 # `lib/lin.rs` `#[path]`-includes the kernel's `src/syscall/linux/nr.rs` so the
 # tests speak the kernel's own numbers. `nr.rs` re-exports the `clone` flag bits
@@ -160,6 +159,10 @@ path = "src/bin/integration/t-udev-worker.rs"
 [[bin]]
 name = "t-uevent"
 path = "src/bin/integration/t-uevent.rs"
+
+[[bin]]
+name = "t-9p"
+path = "src/bin/syscall/t-9p.rs"
 
 [[bin]]
 name = "t-access"
@@ -592,3 +595,6 @@ path = "src/bin/syscall/t-writev.rs"
 [[bin]]
 name = "t-xattr"
 path = "src/bin/syscall/t-xattr.rs"
+
+[lints]
+workspace = true

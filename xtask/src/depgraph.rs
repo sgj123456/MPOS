@@ -82,7 +82,27 @@ use anyhow::{Context, Result, bail};
 /// register-file snapshot read against a table only the syscall layer had - went
 /// with it. The edge is the one the leaf crate was built to empty; this is the
 /// last reference that was keeping it.
-const BASELINE_MUTUAL_PAIRS: usize = 9;
+///
+/// **8 now**, after the machine layer became its own crate (`PLAN.md` §14 S4).
+/// Two pairs left in that step and one arrived unannounced, so the count is
+/// worth spelling out rather than just updating:
+///
+/// - `hal ↔ mm` went with the move: `hal` is `mpos-arch::hal` now and its one
+///   `crate::mm` reference - the re-exported mapping vocabulary - is a leaf-crate
+///   path. `mm → hal` remains (the direct map is a HAL fact), and that is a
+///   one-way edge, which is what a pair collapsing to means.
+/// - `drivers ↔ rand` *arrived* in the same cut and had to be removed by hand.
+///   Folding the virtio-rng into `rand`'s seed, which is what let the machine
+///   layer stop naming a driver, made `rand → drivers` - and `drivers →
+///   rand` already existed (`/dev/urandom` reads the pool). The two cancelled
+///   the `hal ↔ mm` removal exactly, so the count stayed 9 while a *new
+///   cycle took an old one's place* - the blind spot this number has, and the
+///   reason the entries above name what removed each one. The fix is the
+///   project's usual one: the source is injected (`rand::set_device_entropy`,
+///   called from `main/<arch>.rs`), so `rand` names no driver.
+///
+/// 9 -> 8, and both members of the list moved.
+const BASELINE_MUTUAL_PAIRS: usize = 8;
 
 /// References to `crate::drivers::`/`crate::net::` from `src/vfs/mod.rs`.
 ///
@@ -173,18 +193,24 @@ impl Graph {
 
 /// Modules allowed to name `crate::arch::`.
 ///
-/// **The door the HAL exists to shut, and it is shut.** After stage 4 of
-/// `PLAN.md` §11.4 every reference to `crate::arch::` outside these three is
-/// zero - `sched` and `syscall`, the last two, went when the saved context, the
-/// FPU state and the user frame moved behind `crate::hal::Contexts`. The list is
-/// an allow-list rather than a table of ceilings so that a *new* module reaching
-/// for the machine layer fails immediately, not only a growing one.
+/// **The door the HAL exists to shut, and it is shut and welded.** After stage 4
+/// of `PLAN.md` §11.4 every reference to `crate::arch::` outside these was zero -
+/// `sched` and `syscall`, the last two, went when the saved context, the FPU
+/// state and the user frame moved behind `crate::hal::Contexts`. After `PLAN.md`
+/// §14 S4 there are only two names left for a reason that has nothing to do with
+/// discipline: `arch` is `mpos-arch::arch` now, a crate the kernel depends on,
+/// and the path still resolves here only because `src/lib.rs` re-exports it. So
+/// the rule stopped being "the machine layer may name itself" - there is no
+/// machine layer left in this crate to name itself - and became "only the crate
+/// root and the wiring may reach for the machine at all".
 ///
-/// `arch` is the machine layer itself and `hal` implements the traits for it;
-/// `main` is the wiring, which reaches the machine before a HAL call can exist
-/// (the boot tables and the milestone checks). `lib` is the crate root, which
-/// declares the modules.
-const ARCH_EXEMPT: &[&str] = &["arch", "hal", "main", "lib"];
+/// The list is an allow-list rather than a table of ceilings so that a *new*
+/// module reaching for the machine layer fails immediately, not only a growing
+/// one. `main` is the wiring, which reaches the machine before a HAL call can
+/// exist - it starts it (`arch::boot`), arms its console interrupts and reads
+/// its breakpoint counter. `lib` is the crate root, which re-exports the two
+/// modules and nothing else.
+const ARCH_EXEMPT: &[&str] = &["main", "lib"];
 
 /// Everything the ratchet looks at, measured once.
 pub struct Report {

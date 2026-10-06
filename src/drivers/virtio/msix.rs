@@ -119,7 +119,9 @@ fn bar_address(func: &pci::Func, bir: u8) -> Option<usize> {
 /// back. `span` covers the case of a structure that starts near the end of
 /// its page.
 fn map_structure(at: usize, span: usize) -> usize {
-    crate::mm::map_mmio(at & !(crate::mm::PAGE_SIZE - 1), span) + at % crate::mm::PAGE_SIZE
+    let page = at & !(crate::mm::PAGE_SIZE - 1);
+    crate::hal::map_mmio_window(page, span).expect("out of room for device registers")
+        + at % crate::mm::PAGE_SIZE
 }
 
 /// The MMIO window of the vendor capability whose `cfg_type` is `want`, or

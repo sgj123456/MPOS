@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use crate::arch::Arch;
 use crate::qemu;
 use crate::utils;
 
@@ -55,7 +56,10 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: Selection) -> Resul
     run_unit_tests()?;
     println!();
 
-    utils::build_kernel(profile)?;
+    // The x86_64 sweep: its own initramfs on the QEMU wiring in `machine.toml`.
+    // Named rather than left to the workspace default, so the machine this
+    // sweep boots and the machine it builds are the same value.
+    utils::build_kernel(profile, Arch::X86_64)?;
     println!();
 
     let built = build_user_tests()?;
@@ -155,6 +159,36 @@ fn check_target_gates() -> Result<()> {
 /// The arch-independent kernel, tested on the host. `--target` is explicit
 /// because the root `.cargo/config.toml` defaults every cargo command to the
 /// bare-metal target, and the host tests are the opposite of that.
+/// Every leaf crate under `crates/`, by package name.
+///
+/// The host unit tests are run one `-p` at a time because the root
+/// `.cargo/config.toml` defaults every cargo command to a bare-metal target, and
+/// `--workspace` would try to build the kernel for the host too. That makes this
+/// list a place a test can disappear into: a leaf crate added without a line
+/// here is compiled, but its tests never run, and the gate keeps reporting a
+/// green number that silently means less than it did. `mpos-fdt` was in exactly
+/// that state - eight tests, never run. [`tests::every_leaf_crate_is_tested`]
+/// pins the list against the directory, so this is the last time.
+const LEAF_CRATES: &[&str] = &[
+    "mpos-err",
+    "mpos-bootinfo",
+    "mpos-vm",
+    "mpos-abi",
+    "mpos-date",
+    "mpos-binfmt",
+    "mpos-cred",
+    "mpos-uts",
+    "mpos-seccomp",
+    "mpos-blk",
+    "mpos-pci",
+    "mpos-term",
+    "mpos-ahci",
+    "mpos-gpu",
+    "mpos-evdev",
+    "mpos-uinput",
+    "mpos-fdt",
+];
+
 fn run_unit_tests() -> Result<()> {
     let root = utils::project_root()?;
 
@@ -167,36 +201,11 @@ fn run_unit_tests() -> Result<()> {
         "x86_64-unknown-linux-gnu",
         "-p",
         "mpos",
-        "-p",
-        "mpos-err",
-        "-p",
-        "mpos-abi",
-        "-p",
-        "mpos-date",
-        "-p",
-        "mpos-binfmt",
-        "-p",
-        "mpos-cred",
-        "-p",
-        "mpos-uts",
-        "-p",
-        "mpos-seccomp",
-        "-p",
-        "mpos-blk",
-        "-p",
-        "mpos-pci",
-        "-p",
-        "mpos-term",
-        "-p",
-        "mpos-ahci",
-        "-p",
-        "mpos-gpu",
-        "-p",
-        "mpos-evdev",
-        "-p",
-        "mpos-uinput",
-    ])
-    .current_dir(&root);
+    ]);
+    for crate_name in LEAF_CRATES {
+        cmd.arg("-p").arg(crate_name);
+    }
+    cmd.current_dir(&root);
     utils::run_status(&mut cmd, "the kernel's host unit tests")?;
 
     println!("Unit tests: xtask");
@@ -476,10 +485,13 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     }
     fs::create_dir_all(esp.join("EFI/BOOT"))?;
     fs::copy(
-        utils::loader_path(profile)?,
+        utils::loader_path(profile, Arch::X86_64)?,
         esp.join("EFI/BOOT/BOOTX64.EFI"),
     )?;
-    fs::copy(utils::kernel_path(profile)?, esp.join("mpos.elf"))?;
+    fs::copy(
+        utils::kernel_path(profile, Arch::X86_64)?,
+        esp.join("mpos.elf"),
+    )?;
     fs::copy(tar, esp.join("initramfs.tar"))?;
     // Two words, both load-bearing. `console=ttyS0` makes the serial wire the
     // test boot's only console, so every line the harness reads is the whole of
@@ -519,8 +531,10 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     // `machine_args` binds `console.sock` inside this dir and exports it over
     // 9p, and a second QEMU (a live `cargo xtask run`) already holds those -
     // the bind would fail before the guest boots.
-    let share = build_dir.join("test-9p-share");
-    fs::create_dir_all(&share)?;
+    // The share carries the 9p probe file too, so a test can mount it and read
+    // the bytes back - the pin for the first machine's share, which used to be
+    // exported and never reachable (`PLAN.md` §13.29).
+    let share = utils::lay_p9_share(&build_dir.join("test-9p-share"))?;
     let mut config = crate::config::QemuConfig::load_default()?;
     // A test boot never needs the host vsock bus, and claiming `guest-cid=3`
     // collides with any VM already running on this host (a concurrent
@@ -673,6 +687,11 @@ fn report(tests: &[UserTest], built: usize, log: &Path, status: Option<i32>) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use super::LEAF_CRATES;
+
     /// The aarch64 user programs are built by cargo (rather than by the
     /// hand-driven `rustc` that builds `boot-aarch64`'s `/musl` helper), so the
     /// two facts the loader insists on have to be in the root `.cargo/config.toml`
@@ -710,6 +729,50 @@ mod tests {
             block.contains("linker=rust-lld"),
             "the aarch64 link must name rust-lld: the host `ld` rejects the \
              `--fix-cortex-a53-843419` rustc passes for this target.\n{block}"
+        );
+    }
+
+    /// A leaf crate whose tests nothing runs.
+    ///
+    /// The counterfactual is not hypothetical: `mpos-fdt` sat with eight tests
+    /// that no gate had ever executed, because `run_unit_tests` names every
+    /// crate by hand and a new one is a line nobody remembers to add. The
+    /// failure mode is the one this front end is built to refuse - a run that
+    /// reports a green number while sweeping less than it says - so the list is
+    /// pinned against the directory it is supposed to mirror.
+    #[test]
+    fn every_leaf_crate_is_tested() {
+        // `CARGO_MANIFEST_DIR` is this crate's directory at compile time, so the
+        // walk needs no working-directory assumption the way `utils` does.
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask has a parent directory")
+            .join("crates");
+
+        let mut on_disk: Vec<String> = fs::read_dir(&crates)
+            .expect("the crates directory must be readable")
+            .map(|entry| entry.expect("a crates entry must be readable").path())
+            .map(|dir| fs::read_to_string(dir.join("Cargo.toml")).expect("a leaf Cargo.toml"))
+            .map(|toml| {
+                toml.lines()
+                    .find_map(|line| line.strip_prefix("name = "))
+                    .expect("a leaf Cargo.toml names its package")
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .collect();
+        on_disk.sort();
+
+        let mut listed: Vec<&str> = LEAF_CRATES.to_vec();
+        listed.sort();
+
+        assert_eq!(
+            listed,
+            on_disk,
+            "the host unit tests name {} crates but {} exist under crates/: a \
+             leaf crate left out of `LEAF_CRATES` is compiled and never tested",
+            listed.len(),
+            on_disk.len()
         );
     }
 }

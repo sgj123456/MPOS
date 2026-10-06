@@ -31,14 +31,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use crate::arch::Arch;
 use crate::utils;
-
-/// The machines this command builds for. The kernel target is the same one the
-/// `-kernel` bring-up used; the loader's is stage 1e's addition, and it is the
-/// aarch64 twin of `x86_64-unknown-uefi` - a PE32+ EFI application, which is a
-/// different object format from the kernel's ELF.
-const KERNEL_TARGET: &str = "aarch64-unknown-none";
-const LOADER_TARGET: &str = "aarch64-unknown-uefi";
 
 /// The command line the loader copies into the handoff record, and the kernel
 /// prints back.
@@ -50,7 +44,7 @@ const LOADER_TARGET: &str = "aarch64-unknown-uefi";
 /// the word a real userland boot must not carry (see [`ALPINE_CMDLINE`]).
 /// `ttyAMA0` is what this machine's console is called everywhere else, and the
 /// day the shared `boot::console_list` is parsed here, the name is already right.
-const CMDLINE: &str = "console=ttyAMA0 mpos.selftest\n";
+const CMDLINE: &str = "console=ttyAMA0 mpos.selftest root=/dev/vda rootfstype=ext4\n";
 
 /// The command line the *Alpine* boot carries: the machine's consoles, and
 /// nothing else.
@@ -71,7 +65,7 @@ const CMDLINE: &str = "console=ttyAMA0 mpos.selftest\n";
 /// machine too, so the list means exactly what it means on x86_64. The headless
 /// verdicts have no mode to honour - they are not sessions - and pass
 /// [`ModeChoice::Verdicts`], which keeps the single serial word they always had.
-const ALPINE_CMDLINE: &str = "console=ttyAMA0\n";
+const ALPINE_CMDLINE: &str = "console=ttyAMA0 root=/dev/vda rootfstype=ext4\n";
 
 /// Which consoles an Alpine-layout boot should carry: the session's own mode,
 /// or the verdict's fixed serial line.
@@ -88,12 +82,22 @@ pub(crate) enum ModeChoice {
 /// The command line an Alpine boot carries, given the caller's mode choice.
 /// Always exactly one trailing newline: `mpos.cmdline` is read whole by the
 /// loader and recorded verbatim by the kernel.
+///
+/// `root=` rides on both answers since §15.6: this machine's root switch moved
+/// from the kernel into its initramfs script, and a script with no `root=` sits
+/// in the ramfs instead ("staying here"), so the disk it booted would be the
+/// disk the boot never reaches. The x86_64 image spells the same key through
+/// `rootfstype=` and a partition number; here the ext4 is the whole
+/// (unpartitioned) virtio disk, which the block layer names `/dev/vda`.
 fn alpine_cmdline(choice: ModeChoice) -> Result<String> {
     let mode = match choice {
         ModeChoice::Verdicts => return Ok(ALPINE_CMDLINE.to_string()),
         ModeChoice::Session => crate::rootfs::effective_mode()?,
     };
-    Ok(format!("{}\n", mode.cmdline_consoles(SERIAL_PORT)))
+    Ok(format!(
+        "{} root=/dev/vda rootfstype=ext4\n",
+        mode.cmdline_consoles(SERIAL_PORT)
+    ))
 }
 
 /// This machine's serial console, spelled the way its psABI names the PL011.
@@ -207,9 +211,30 @@ const ALPINE_DISK_BYTES: u64 = 256 * 1024 * 1024;
 /// `M7_RNG_FAILED` is - the same rule as the other pre-EL0 checks. Stage 7's block
 /// check runs right after the rng one, so `M7_BLK_OK` is not a terminator and
 /// `M7_BLK_FAILED` is. Stage 8's net check runs right after the block one, so
-/// `M8_NET_OK` is not a terminator and `M8_NET_FAILED` is.
-const TERMINATORS: [&str; 24] = [
+/// `M8_NET_OK` is not a terminator and `M8_NET_FAILED` is. The input class's
+/// success marker is printed later still - the registry it pins is read back
+/// through a `/dev` that only exists after `check_dev` has mounted it - so
+/// `M8_INPUT_OK` is not a terminator either, while `M8_INPUT_FAILED` is, at both
+/// the point the window opens and the point the registry is read back (§15.2).
+/// The console class is the same shape one device later: its marker is printed
+/// after `check_dev` too (the `/dev/hvc0` it names is resolved through the
+/// mounted `/dev`), so `M8_CONSOLE_OK` is not a terminator and
+/// `M8_CONSOLE_FAILED` is (§13.25). The GPU class is the same again, one device
+/// later still: `M8_GPU_OK` is read back through the mounted `/dev` as well, so
+/// it is not a terminator and `M8_GPU_FAILED` is (§13.26). The sound class is
+/// the same again - `M8_SOUND_OK` is printed after `check_dev` too - so it is
+/// not a terminator and `M8_SOUND_FAILED` is (§13.27). The vsock class is the one
+/// whose success marker is *conditional*: its device is attached only on a host
+/// that carries `/dev/vhost-vsock` (vsock is the one virtio device QEMU does not
+/// emulate in userspace), so `M8_VSOCK_OK` is required only there - and the skip
+/// is printed, never silent - while `M8_VSOCK_FAILED`, a window that exists and
+/// will not open, is the terminator (§13.28). The 9p class is the sound class's
+/// shape one device later: its marker is read back through the mounted share
+/// after the root switch, so `M8_P9_OK` is not a terminator and `M8_P9_FAILED`
+/// is (§13.29).
+const TERMINATORS: [&str; 28] = [
     "INIT_EXITED",
+    "MPOS_SWITCH_ROOT_FAILED",
     "M6_EL0_FAILED",
     "M6_AS_FAILED",
     "M6_PAGING_FAILED",
@@ -221,11 +246,14 @@ const TERMINATORS: [&str; 24] = [
     "M7_RNG_FAILED",
     "M7_BLK_FAILED",
     "M7_FS_FAILED",
-    "M7_DISK_FAILED",
-    "M7_ROOT_FAILED",
     "M7_DEV_FAILED",
     "M8_NET_FAILED",
     "M8_INPUT_FAILED",
+    "M8_CONSOLE_FAILED",
+    "M8_GPU_FAILED",
+    "M8_SOUND_FAILED",
+    "M8_VSOCK_FAILED",
+    "M8_P9_FAILED",
     "M2_CONTEXT_FAILED",
     "M1_TIMER_FAILED",
     "M3_TABLES_FAILED",
@@ -249,10 +277,7 @@ fn esp_dir(build_dir: &Path) -> PathBuf {
 /// `/bin`. And the mode is set *here* because `mkfs.ext4 -d` copies what it
 /// finds: a file written mode 0644 lands on the disk non-executable, and
 /// `/bin/true` would then answer `EACCES` at `execve` - a failure that reads as
-/// a broken program rather than a staging step that forgot. The initramfs side
-/// records the same 0755 through `tar` (`aarch64_init::write_initramfs_entries`);
-/// the runner's own chmod of the `/t-*` it starts is older than both and stays
-/// as the belt it was written as.
+/// a broken program rather than a staging step that forgot.
 fn stage_program(root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let path = root.join(name);
     if let Some(parent) = path.parent() {
@@ -284,11 +309,23 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     println!("kernel: {} ({:.1} KB)", kernel.display(), kib(&kernel)?);
     println!("loader: {} ({:.1} KB)", loader.display(), kib(&loader)?);
 
-    // The headless verdict's initramfs: `/init` is the exec launcher (echo, then
-    // `execve("/t")`), `/t` the fixed-marker target. A green verdict then shows
-    // the launcher's `R:echo-test`, the target's `MPOS_EXEC_OK`, and `INIT_EXITED`
-    // - proving aarch64 `execve` replaced the running image with a second one that
-    // then ran at EL0 (PLAN.md §9.1 stage 6D).
+    // The headless verdict's disk payload: `/init` is the launcher that stands
+    // as pid 1 on this disk, `/t` the fixed-marker target it execs, `/musl` the
+    // unmodified static-musl binary. Since §15.6 the chain that reaches them
+    // starts in the boot's own early userspace: the initramfs script mounts
+    // `/dev/vda`, promotes it into `/` (`MPOS_SWITCH_ROOT_OK`) and `switch_root`s
+    // into the disk's `/init`, which `execve`s `/t`, whose parent then `execve`s
+    // `/musl`. A green verdict shows that switch line, the target's
+    // `MPOS_EXEC_OK`/`MPOS_FORK_OK`, the musl run's markers, and `INIT_EXITED` -
+    // proving aarch64 `execve` replaced the running image with a second one that
+    // then ran at EL0 (PLAN.md §9.1 stage 6D) *through the same pivot flow the
+    // first machine's initramfs script runs*.
+    //
+    // `/init` is a program rather than a script because this disk has no
+    // interpreter to serve one: it is the build's own payload, so it carries no
+    // busybox, and the overlay's `rootfs-aarch64/init` - which *is* the Alpine
+    // disk's pid 1 - names a `/bin/sh` that is not here (see
+    // `aarch64_init::exec_launcher_init_elf` for the measured failure).
     let launcher = crate::aarch64_init::exec_launcher_init_elf();
     let target = crate::aarch64_init::marker_target_elf();
     // The exec target's parent execve's `/musl`, an *unmodified* statically-linked
@@ -343,11 +380,20 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
     // `FR.RXFE`/`DR`), `M6_TLS_OK` says the
     // scheduler's thread-pointer write reaches `TPIDR_EL0` and reads back through
     // the `hal::Cpu` capability, `M6_EL0_OK` says the kernel ran a program at
-    // EL0 and answered the call it made, and `M6_INIT_OK` says the scheduler
+    // EL0 and answered the call it made, `M6_OK`/`M7_OK`/`M8_IPC_OK` are the
+    // shared check families this machine runs alongside the first one (the
+    // syscall gate, ramfs root, mounts and device files; multi-task file I/O
+    // through the fd table; pipes, the tty line discipline and signals), and
+    // `M6_INIT_OK` says the scheduler
     // started, the loader's aarch64 `/init` was loaded and run to completion, and
     // its `exit_group` was routed through the shared syscall table and reaped - the
     // first real userspace program on this machine.
-    let markers = [
+    //
+    // One of them is conditional: `M8_VSOCK_OK` is required only when the host
+    // could back the device (`vsock_available`), because a host without
+    // `/dev/vhost-vsock` cannot start a machine carrying one at all. The skip is
+    // printed below rather than taken silently.
+    let mut markers: Vec<(&str, &str)> = vec![
         ("M4_CONSOLE_OK", "console service"),
         ("M4_DEVICES_OK", "devices"),
         ("M3_TABLES_OK", "page tables"),
@@ -359,12 +405,12 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         ),
         ("M7_FS_OK", "ext4 mounted over the MMIO block"),
         (
-            "M7_DISK_OK",
-            "disk root: /dev/vda mounted at /mnt, a rootfs/ tree file read through the VFS",
-        ),
-        (
-            "M7_ROOT_OK",
-            "root switch: / is the disk rootfs, /dev re-mounted on it",
+            "MPOS_SWITCH_ROOT_OK",
+            "root switch: the initramfs script mounted /dev/vda and promoted it \
+             into / - the same flow the first machine's script runs (§15.6). It is \
+             printed by *userspace*, which is what makes the marker the proof that \
+             a program ran on the switched tree, not merely that the kernel could \
+             pivot one",
         ),
         ("M7_DEV_OK", "/dev device set builds and reads entropy"),
         (
@@ -378,8 +424,43 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         ),
         (
             "M8_INPUT_OK",
-            "virtio-input over MMIO negotiated + read device identity",
+            "the machine's virtio-input is in the shared evdev registry and \
+             /dev/input/event0 resolves through the mounted /dev at evdev's 13:64",
         ),
+        (
+            "M8_CONSOLE_OK",
+            "the machine's virtio-console port is installed over MMIO and \
+             /dev/hvc0 resolves through the mounted /dev",
+        ),
+        (
+            "M8_GPU_OK",
+            "the machine's virtio-gpu card is installed over MMIO, /dev/fb0 \
+             resolves through the mounted /dev and the render task owns the device",
+        ),
+        (
+            "M8_SOUND_OK",
+            "the machine's virtio-sound card is installed over MMIO, /dev/dsp \
+             resolves through the mounted /dev and the stream took a silent burst",
+        ),
+        (
+            "M8_P9_OK",
+            "the machine's 9p share is installed over MMIO, mounted at /mnt/share \
+             and a file the host laid there reads back through the VFS",
+        ),
+    ];
+    if vsock_available() {
+        markers.push((
+            "M8_VSOCK_OK",
+            "the machine's virtio-vsock device is the AF_VSOCK family's wire over \
+             MMIO (the family answers the device's own guest CID)",
+        ));
+    } else {
+        println!(
+            "vsock:   the host has no /dev/vhost-vsock, so this boot attaches no vsock \
+             device and M8_VSOCK_OK is not required"
+        );
+    }
+    markers.extend([
         ("M1_TIMER_OK", "timer"),
         ("M2_CONTEXT_OK", "contexts"),
         ("M6_AS_OK", "user address space"),
@@ -390,22 +471,40 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         ("M6_TLS_OK", "thread pointer"),
         ("M6_EL0_OK", "EL0"),
         ("M6_CONSOLE_RX_OK", "console receive path"),
+        // The two shared families this machine now runs as well, after the
+        // kernel's own interrupt stub was taught to keep the resume state of the
+        // context it preempted (`PLAN.md` §13.22): with either wired and that
+        // missing, the boot took an instruction abort at EL1 on the next
+        // preemption, so these three markers are the assertion that the gate
+        // stayed in place.
+        (
+            "M6_OK",
+            "syscall gate + fd table, ramfs root, a mounted tree, device files",
+        ),
+        ("M7_OK", "multi-task file I/O through the fd table"),
+        (
+            "M8_IPC_OK",
+            "pipes, the tty line discipline, signal delivery",
+        ),
         ("M6_INIT_OK", "init handed to pid 1"),
         ("INIT_EXITED", "init ran and exited via the scheduler"),
-    ];
+    ]);
     let missing: Vec<&str> = markers
         .iter()
         .filter(|(marker, _)| !log.contains(marker))
         .map(|(_, what)| *what)
         .collect();
     // The disk's root tree is the shared overlay pair this machine installs
-    // from, so the length the kernel reports for `/mnt/etc/inittab` is the
-    // length of the file *as staged*: core + machine merged, placeholder
-    // rendered. A copy that dropped, truncated or replaced that file cannot
-    // print the number below, which is what makes the marker a check rather
-    // than a claim - and after §13.19 folded the two inittabs into one
-    // template, reading the repository file raw would pin a byte count no
-    // image ever carries.
+    // from, and since §15.6 it is *read by userspace*: the staged `/t` execs
+    // `/etc/inittab` through libc (`open` + `read`) after its fork round trip,
+    // and prints what came back as a byte count. That number is the length of
+    // the file *as staged* - core + machine merged, placeholder rendered - so a
+    // copy that dropped, truncated or replaced it cannot print the line below,
+    // which is what makes the marker a check rather than a claim (and after
+    // §13.19 folded the two inittabs into one template, reading the repository
+    // file raw would pin a byte count no image ever carries). It is also the
+    // disk root's own proof: the read only succeeds on the switched tree, after
+    // the script's pivot moved the ext4 into `/`.
     let staging = build_dir.join("aarch64-ext4-staging");
     let laid = fs::read(staging.join("etc/inittab")).with_context(|| {
         format!(
@@ -414,51 +513,57 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
             staging.join("etc/inittab").display()
         )
     })?;
-    let want = format!("{} bytes", laid.len());
+    let want = format!("MPOS_INITTAB_OK bytes={:04}", laid.len());
     if !log.contains(&want) {
         bail!(
             "the aarch64 disk root did not serve the rootfs tree: the log has no \
-             \"{want}\" for /mnt/etc/inittab, and the staged file is {} bytes",
+             \"{want}\" from /t's read of /etc/inittab, and the staged file is {} bytes",
             laid.len()
         );
     }
-    // The init reads a line from `fd 0` (the handoff queued "echo-test\n" on the
-    // tty) and echoes it back prefixed with "R:" - so `R:echo-test` on the wire is
-    // the init's OWN output (the tty's canonical echo of the same line carries no
-    // "R:"). Its presence proves a scheduler-run userspace program read console
-    // input and wrote the bytes it read, through `syscall::dispatch`.
+    // A real console line reaches a userspace program through the whole chain:
+    // the kernel queued "echo-test\n" on the tty at handoff, the initramfs
+    // script's `cat /dev/console` read it back (its canonical echo shows the
+    // same bytes without the prefix), and the prefixed form on the wire is the
+    // *program's* output - proof that a scheduler-run EL0 process read console
+    // input and wrote the bytes it read, through `syscall::dispatch`, on the
+    // ramfs root, before the pivot.
     if !log.contains("R:echo-test") {
         bail!(
             "the aarch64 init never echoed the input it read: the R:echo-test \
-             line is absent (read(0)/write(1) round trip did not complete)"
+             line is absent (the initramfs script's read/echo round trip on the \
+             console did not complete)"
         );
     }
-    // The launcher's very first act pushes `sp` a page below the mapped stack and
+    // The target's very first act pushes `sp` a page below the mapped stack and
     // stores there; that store only survives if the kernel's aarch64 EL0 fault
     // handler demand-pages it, and `MPOS_FAULT_OK` is written immediately after.
     // Its presence proves user page faults are serviced (the prerequisite for any
     // real, larger program - including a static-musl binary - to run at EL0).
     if !log.contains("MPOS_FAULT_OK") {
         bail!(
-            "the aarch64 launcher's demand-paging store did not survive: the \
+            "the aarch64 exec target's demand-paging store did not survive: the \
              MPOS_FAULT_OK line is absent (el0_sync did not take the stack page)"
         );
     }
-    // The launcher's last act is `execve("/t", ...)`. `/t` writes `MPOS_EXEC_OK`,
-    // which nothing else prints - so its presence proves aarch64 `execve` replaced
-    // the running image with a *second* program and that program then ran at EL0
-    // through the same trap/dispatch path. `INIT_EXITED` after it is `/t`'s own
-    // `exit_group`, reaped from pid 1 (execve keeps the pid).
+    // The disk's pid 1 exec'd `/t`: the marker prints before anything else `/t`
+    // does, so its presence proves the *switched* root served a pid-1 program
+    // and that `execve` on the disk replaced it (`INIT_EXITED` at the end of it
+    // all is `/musl`'s own `exit_group`, reaped from pid 1's subtree - execve
+    // keeps the pid).
     if !log.contains("MPOS_EXEC_OK") {
         bail!(
-            "the aarch64 launcher never reached its exec target: the \
-             MPOS_EXEC_OK line is absent (execve did not transfer to /t)"
+            "the aarch64 init chain never reached its exec target: the \
+             MPOS_EXEC_OK line is absent (the disk's /init did not exec /t)"
         );
     }
     // `/t` then forks (aarch64 has no `fork` syscall; `clone(SIGCHLD)` is the
-    // real path). Its child writes `MPOS_FORK_OK` and the parent `wait4`s before
-    // exiting, so the child's line is on the wire. Its presence proves aarch64
-    // `clone` started a distinct running process that reached EL0 (stage 6D).
+    // real path), reads `/etc/inittab` through libc, and its child writes
+    // `MPOS_FORK_OK`. The parent `wait4`s before moving on, so the child's line
+    // is on the wire. Their presence proves aarch64 `clone` started a distinct
+    // running process that reached EL0 (stage 6D) *and* that the switched root
+    // answers a userspace `open`/`read` of a repository file (the inittab pin
+    // above reads the byte count back).
     if !log.contains("MPOS_FORK_OK") {
         bail!(
             "the aarch64 exec target never forked a running child: the \
@@ -608,22 +713,51 @@ pub fn run(build_dir: &Path, profile: &str) -> Result<()> {
         );
     }
     if missing.is_empty() {
+        // The summary must not claim the vsock class on a host that could not back
+        // it: its marker is required only when the device was attached, so the
+        // parts of the sentence describing it are built from the same decision.
+        let vsock_marker = if vsock_available() {
+            "M8_VSOCK_OK, "
+        } else {
+            ""
+        };
+        let device_count = if vsock_available() { "nine" } else { "eight" };
+        let vsock_device = if vsock_available() {
+            ", and a virtio-vsock device the AF_VSOCK family is brought up over - \
+             answering the same guest CID the first machine's own probe answers"
+        } else {
+            ""
+        };
         println!();
         println!(
             "aarch64 boot: M4_CONSOLE_OK, M4_DEVICES_OK, M3_TABLES_OK, M5_VIRTIO_OK, \
-             M7_RNG_OK, M7_BLK_OK, M7_FS_OK, M7_DEV_OK, M8_NET_OK, M8_NET_STACK_OK, M8_INPUT_OK, M1_TIMER_OK, M2_CONTEXT_OK, \
+             M7_RNG_OK, M7_BLK_OK, M7_FS_OK, M7_DEV_OK, M8_NET_OK, M8_NET_STACK_OK, M8_INPUT_OK, \
+             M8_CONSOLE_OK, M8_GPU_OK, M8_SOUND_OK, {vsock_marker}M8_P9_OK, M1_TIMER_OK, M2_CONTEXT_OK, \
              M6_AS_OK, \
              M6_PAGING_OK, M6_WALL_OK, M6_CPU_OK, \
              M6_SERIAL_RX_OK, M6_TLS_OK, M6_EL0_OK, M6_CONSOLE_RX_OK, M6_INIT_OK, the \
-             demand-paged stack store (MPOS_FAULT_OK), the init's echoed input \
-             (R:echo-test), the exec target (MPOS_EXEC_OK), its fork child (MPOS_FORK_OK), \
+             initramfs script's echoed input (R:echo-test) and its root switch \
+             (MPOS_SWITCH_ROOT_OK), the demand-paged stack store (MPOS_FAULT_OK), \
+             the exec target (MPOS_EXEC_OK), its fork child (MPOS_FORK_OK) and its \
+             read of the switched root's inittab (MPOS_INITTAB_OK), \
              the unmodified musl binary (MPOS_MUSL_OK), and INIT_EXITED - the machine \
-             drives three devices over the memory-mapped virtio transport (rng, blk with a \
-             verified sector read and a written sector round-tripped, and net whose TX virtqueue accepted a frame over MMIO \
+             drives {device_count} devices over the memory-mapped virtio transport (rng, blk with a \
+             verified sector read and a written sector round-tripped, net whose TX virtqueue accepted a frame over MMIO \
              and which the smoltcp stack is then initialized over, the same \
-             net::init + spawn_service pair the first machine boots with) and mounts an ext4 filesystem \
-             over the block (the disk root), and a scheduler-run program that demand-paged, \
-             read, echoed, execve'd, cloned, waited, then ran a real static-musl ELF at EL0 \
+             net::init + spawn_service pair the first machine boots with, input, which it hands to the \
+             shared evdev registry the first machine has had since §13.4 - so /dev/input/event0 is this \
+             machine's own keyboard, named by the registry and resolving at evdev's 13:64, a \
+             virtio-console port, installed through the same shared driver the first machine opens on its PCI \
+             bus and resolving as /dev/hvc0, a virtio-gpu card whose framebuffer is /dev/fb0, \
+             owned by the shared render task, a virtio-sound card driving /dev/dsp{vsock_device}, \
+             and the host's 9p share mounted at /mnt/share with a file it laid there read back \
+             through the VFS) \
+             and mounts an ext4 filesystem \
+             over the block (the disk root), and a boot whose init chain - the \
+             script that echoed and switched root, then the disk's own `/init` \
+             exec'ing a program that demand-paged, cloned, waited, read \
+             /etc/inittab and ran a \
+             real static-musl ELF at EL0 \
              which opened the mounted /dev through libc file I/O (MPOS_DEV_URANDOM_OK, \
              MPOS_DEV_CONSOLE_OK), traversed it (MPOS_DEV_GETDENTS_OK, MPOS_DEV_STAT_OK), \
              and ran a full file lifecycle on the root (MPOS_FILE_OPS_OK) and \
@@ -725,12 +859,18 @@ pub fn run_sweep(build_dir: &Path, profile: &str) -> Result<()> {
     }
     println!();
 
-    // The runner is `/init` on the disk (which is what the boot reads and spawns
-    // as pid 1) *and* in the initramfs, and the programs sit beside it - the
-    // tests flat at the root, the `/bin` tools under their own directory. One
-    // payload, both places: the ramfs is where they are before the root switch
-    // and the ext4 is where they are after it, and the same list is a correct
-    // answer on either side of that.
+    // The runner is `/init` on the disk: the initramfs script switches into the
+    // disk, the disk's own chain (`/sbin/init` from the applet farm) execs it,
+    // and it runs every `/t-*` staged beside it - the same handoff an Alpine boot
+    // gets, with a test payload instead of a distribution under it. The programs
+    // sit flat at the root and the `/bin` tools under their own directory; the
+    // initramfs carries no copy of them any more (§15.6 unified the flow onto the
+    // script pivot, so the ramfs holds busybox and the script alone).
+    //
+    // The overlay pair lands *before* this payload inside `build_esp_with_cmdline`,
+    // so the disk's own post-switch `/init` (the pid-1 chain the Alpine image
+    // ships) is overwritten by the runner here - the two name one path and the
+    // payload wins, which is the order that function documents.
     let mut entries: Vec<(&str, &[u8])> = vec![("init", init.as_slice())];
     for path in &tool_paths {
         entries.push((path.as_str(), tools.as_slice()));
@@ -1170,6 +1310,21 @@ pub fn run_alpine(build_dir: &Path, profile: &str) -> Result<()> {
     let log = boot(build_dir, &esp, &ALPINE_TERMINATORS, ALPINE_DEADLINE)?;
     print!("{log}");
 
+    // openrc's own verdict, which is a stricter answer than `login:`. A service
+    // that fails still prints `[ !! ]` and the runlevel carries on, so the
+    // prompt is reached either way - and that is exactly how the fourth such
+    // failure hid: `mount: mounting proc on /proc failed: Resource busy`, from
+    // a procfs missing `/proc/<pid>/environ`, sat in the log while this command
+    // reported success. The three §13.12/§13.14/§13.15 chased down (`hwclock`,
+    // `modprobe`, `syslog`) all read the same way, so the marker is named here
+    // rather than left to whoever reads the log next.
+    if let Some(detail) = openrc_failure(&log) {
+        bail!(
+            "an openrc service failed on the Alpine boot: {detail} \
+             (the `[ !! ]` marker is in the log above)"
+        );
+    }
+
     // The verdict. `login:` is what busybox `getty` has printed once it has run
     // `login(1)` on a console - the whole chain of this kernel serving a real
     // Alpine userland, in one word. Its absence is not a failure to *report* but a
@@ -1186,64 +1341,88 @@ pub fn run_alpine(build_dir: &Path, profile: &str) -> Result<()> {
     )
 }
 
+/// The first openrc service failure in `log`, named by the line that explains
+/// it - or `None` when every service came up.
+///
+/// openrc marks the result of each service with `[ ok ]` or `[ !! ]`, wrapped in
+/// the terminal escapes that make the marker coloured, and it prints the
+/// service's own message on the line *above* the marker. So the search is: strip
+/// the escapes, find the marker, and walk back to the last line with anything on
+/// it - for the failure that motivated this that is `mount: mounting proc on
+/// /proc failed: Resource busy`, and for a failure that prints nothing it is the
+/// marker's own line.
+///
+/// Kept as a function rather than inlined because it is the whole of the check
+/// and the only way to test it is against a captured log; the case it was
+/// written for is a unit test below.
+fn openrc_failure(log: &str) -> Option<String> {
+    let plain = without_ansi(log);
+    let lines: Vec<&str> = plain.lines().collect();
+    let at = lines.iter().position(|line| line.contains("!!"))?;
+    lines[..at]
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .or_else(|| lines.get(at))
+        .map(|line| line.trim().to_string())
+}
+
+/// The log with openrc's terminal escapes removed.
+///
+/// A failure marker arrives wrapped in colour and cursor codes -
+/// `ESC[1mESC[31m !! ESC[1mESC[34m]` - so the service's own message, which is
+/// what a person needs, is two lines above a marker no `grep` will show. This
+/// strips `ESC [ ... letter` sequences and carriage returns so the line can be
+/// quoted in an error message as it was written.
+fn without_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => {
+                // Only CSI is used by openrc's output; anything else is left
+                // in place rather than guessed at.
+                if chars.next() == Some('[') {
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            }
+            '\r' => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Boot the kernel and its loader for this machine.
+///
+/// The build itself is `build_kernel` with [`Arch::Aarch64`] - the same call
+/// every command makes, so the pair of binaries and the targets they were
+/// compiled for cannot drift apart between `cargo xtask build --arch aarch64`
+/// and this command. What stays here is what is genuinely this machine's: the
+/// paths those two binaries land on.
 fn build(profile: &str) -> Result<(PathBuf, PathBuf)> {
-    let root = utils::project_root()?;
-    let release = profile == "release";
-
-    let mut kernel = Command::new("cargo");
-    kernel
-        .arg("build")
-        .args(["-p", "mpos"])
-        .args(["--target", KERNEL_TARGET]);
-    if release {
-        kernel.arg("--release");
-    }
-    run_cargo(kernel, &root, "the aarch64 kernel")?;
-
-    // The loader's target is passed here rather than left to
-    // `boot/.cargo/config.toml`, whose `[build] target` names the x86_64 one:
-    // a config file cannot know which machine this invocation is for, and
-    // guessing there would break the plain `cargo build` inside `boot/`.
-    let mut loader = Command::new("cargo");
-    loader
-        .arg("build")
-        .args(["-p", "mpos-boot"])
-        .args(["--target", LOADER_TARGET]);
-    if release {
-        loader.arg("--release");
-    }
-    run_cargo(loader, &root, "the aarch64 loader")?;
-
-    let target = utils::target_dir()?;
+    utils::build_kernel(profile, Arch::Aarch64)?;
     Ok((
-        target.join(KERNEL_TARGET).join(profile).join("mpos"),
-        target
-            .join(LOADER_TARGET)
-            .join(profile)
-            .join("mpos-boot.efi"),
+        utils::kernel_path(profile, Arch::Aarch64)?,
+        utils::loader_path(profile, Arch::Aarch64)?,
     ))
 }
 
-fn run_cargo(mut command: Command, root: &Path, what: &str) -> Result<()> {
-    let status = command
-        .current_dir(root)
-        .status()
-        .with_context(|| format!("Failed to run cargo for {what}"))?;
-    if !status.success() {
-        bail!("{what} did not build");
-    }
-    Ok(())
-}
-
-/// The volume a UEFI firmware reads: the loader where the firmware looks for it
-/// by default, and the three files the loader expects beside it.
+/// The volume a UEFI firmware reads.
 ///
-/// `\\EFI\\BOOT\\BOOTAA64.EFI` is the aarch64 name in the removable-media
-/// fallback path, the twin of the `BOOTX64.EFI` the x86_64 image carries. The
-/// three root files are the loader's `KERNEL_PATH`, `INITRAMFS_PATH` and
-/// `CMDLINE_PATH`, and they are at the volume's root rather than under `EFI/`
-/// because that is where `boot/src/main.rs` reads them.
+/// `entries` are the *disk* payload - the programs a test boot's `/init` chain
+/// execs (`/t`, `/musl`, the sweep runner and its `/bin` tools) - staged onto
+/// the root tree after the overlay pair, so they win any name the distribution
+/// files also carry. The initramfs is no longer one of the caller's choices:
+/// since §15.6 every aarch64 boot carries the same real early userspace (the
+/// busybox archive `aarch64_initramfs` builds), because the root switch that
+/// used to live in the kernel for a test boot and in the disk script for an
+/// Alpine one now lives in the *script* on both - which is what makes this
+/// machine's boot the first machine's flow rather than its shape-alike.
 fn build_esp(
     build_dir: &Path,
     kernel: &Path,
@@ -1295,33 +1474,17 @@ fn build_esp_with_cmdline(
     // an init may use and one a test has written to.
     fs::write(esp.join("mpos.cmdline"), cmdline)?;
 
-    // The third file is a real aarch64 initramfs - which programs it holds is the
-    // caller's choice, passed as `entries` (the headless verdict packs the exec
-    // launcher as `init` plus its target as `t`, so the run reaches a *second*
-    // image via `execve`; the interactive `run` packs the looping REPL as `init`
-    // alone). `aarch64_init` hand-encodes each static `EM_AARCH64` `ET_EXEC` and
-    // tar writes them ustar. The loader copies the archive into frames and records
-    // its address and length in the handoff, so this proves a file crosses the
-    // firmware's protocols and lands in the direct map. The kernel unpacks it into
-    // a ramfs and runs `/init` (PLAN.md §9.1 stages 6D/6E/7d/7e).
-    //
-    // An Alpine boot carries **no** initramfs at all, and that is the honest
-    // shape rather than an omission: the archive exists so a test root has a
-    // userland to run before the disk is reached, while the Alpine root *is* the
-    // userland - its `/init` is on the disk, and the kernel's root switch is what
-    // puts it in reach. The loader passes a null archive for a missing file and
-    // the handoff boots a disk root without one.
-    if alpine_root.is_none() {
-        let initramfs = build_dir.join("aarch64-initramfs.tar");
-        crate::aarch64_init::write_initramfs_entries(entries, build_dir, &initramfs)?;
-        fs::copy(&initramfs, esp.join("initramfs.tar"))
-            .with_context(|| format!("Failed to install {}", initramfs.display()))?;
-        println!(
-            "initramfs: aarch64 {} -> {}",
-            names_of(entries),
-            initramfs.display()
-        );
-    }
+    // The third file is the real aarch64 initramfs - busybox, the applet farm
+    // and the pivot script - installed on *every* boot's volume, the Alpine one
+    // included: the archive exists so the machine has a userland to run before
+    // the disk is reached, and reaching the disk *is* running that userland's
+    // `/init`. The loader copies the archive into frames and records its address
+    // and length in the handoff; the kernel unpacks it into a ramfs and runs its
+    // `/init` (PLAN.md §9.1 stages 6D/6E, §15.6 for the flow's one shape).
+    let initramfs = crate::aarch64_initramfs::ensure_path(build_dir)?;
+    fs::copy(&initramfs, esp.join("initramfs.tar"))
+        .with_context(|| format!("Failed to install {}", initramfs.display()))?;
+    println!("initramfs: aarch64 {} -> ESP", initramfs.display());
 
     // A raw block image, attached below as a virtio-blk **MMIO** transport so
     // `check_blk` can read sector 0 and *verify* it against a known pattern - the
@@ -1337,15 +1500,14 @@ fn build_esp_with_cmdline(
     // attached as a virtio-MMIO block and mounted by the kernel's `check_fs`.
     //
     // Two trees become it. The *test* roots are the in-tree payload - `hello`,
-    // the member images the initramfs also carries (so the disk has an init to
-    // hand pid 1 when the root switch lands), and the repository's shared
-    // overlay pair (`rootfs-core/` + `rootfs-aarch64/`, exactly what the Alpine
-    // install merges, so the file `check_fs` reads through the VFS is one file
-    // for both machines' paths). The *Alpine* root is a whole tree `apk`
-    // installed (see [`install_alpine_root`]) - the second machine's real
-    // userland. Whichever it is, `mkfs.ext4 -d` lays a filesystem down from the
-    // directory without a mount, so this command needs no privilege to write a
-    // root only the guest will read.
+    // the programs a test `/init` execs (staged after the overlay, below), and
+    // the repository's shared overlay pair (`rootfs-core/` + `rootfs-aarch64/`,
+    // exactly what the Alpine install merges, so the file `check_fs` reads
+    // through the VFS is one file for both machines' paths). The *Alpine* root
+    // is a whole tree `apk` installed (see [`install_alpine_root`]) - the second
+    // machine's real userland. Whichever it is, `mkfs.ext4 -d` lays a filesystem
+    // down from the directory without a mount, so this command needs no privilege
+    // to write a root only the guest will read.
     let staging;
     let tree: &Path = match alpine_root {
         Some(root) => root,
@@ -1356,16 +1518,12 @@ fn build_esp_with_cmdline(
                 .with_context(|| format!("Failed to create {}", staging.display()))?;
             fs::write(staging.join(PROBE_FILE), PROBE_BYTES)?;
             // The overlay pair first, the payload *after* it. Order is the
-            // contract: `rootfs-aarch64/` carries the Alpine disk's `/init` -
-            // a `#!/bin/sh` script busybox init reads - while this tree's
-            // verdict needs the hand-encoded launcher at the same path (the
-            // echo/execve program whose `R:echo-test`, `MPOS_EXEC_OK` and
-            // `INIT_EXITED` lines *are* the boot's verdict). Merging after
-            // staging let the script overwrite the launcher, and the kernel's
-            // shebang resolution then failed on a disk with no interpreter at
-            // all: `NoInterpreter`, measured. So the payload lands last and
-            // wins; the overlay's remaining files (`etc/inittab`, which the
-            // byte-length pin below reads through the mounted root) still
+            // contract: `rootfs-aarch64/` carries the disk's `/init` - the
+            // post-switch pid-1 chain (applet farm, mounts, `exec /sbin/init`) -
+            // while a test boot's payload names some of the same paths with its
+            // own programs. The payload landing last is what lets `/t` stand
+            // beside the script rather than under it; the overlay's remaining
+            // files (`etc/inittab`, which the boot's own read pins) still
             // arrive, because nothing in the payload names them.
             crate::rootfs::merge_overlays(
                 &crate::utils::project_root()?,
@@ -1376,7 +1534,7 @@ fn build_esp_with_cmdline(
                 )?,
                 false,
             )?;
-            for &(name, bytes) in entries {
+            for (name, bytes) in entries {
                 stage_program(&staging, name, bytes)?;
             }
             &staging
@@ -1432,13 +1590,6 @@ fn lay_ext4(build_dir: &Path, tree: &Path, disk_bytes: u64, fakeroot: bool) -> R
     utils::run_status(&mut cmd, "mkfs.ext4 the aarch64 filesystem image")
 }
 
-/// The ramfs names in `entries`, for the log line (so a reader sees which files
-/// the archive holds, not just that it was built).
-fn names_of(entries: &[(&str, &[u8])]) -> String {
-    let parts: Vec<String> = entries.iter().map(|(name, _)| format!("/{name}")).collect();
-    parts.join(" + ")
-}
-
 /// The firmware's two flash images, from whichever package the host has.
 ///
 /// AAVMF is EDK2 built for `virt`. Distributions put it in one of a handful of
@@ -1471,12 +1622,26 @@ fn firmware() -> Result<(PathBuf, PathBuf)> {
     )
 }
 
+/// Whether this host can back a virtio-vsock device.
+///
+/// vsock is the one class the aarch64 boot drives that QEMU does not emulate in
+/// userspace: `vhost-vsock-*` is a host kernel backend, and QEMU *refuses to
+/// start* a machine that names the device when `/dev/vhost-vsock` is absent. So
+/// the device is attached only where the host can carry it, and the boot verdict
+/// prints which case it took instead of quietly running one check fewer
+/// (`PLAN.md` §13.28). The device's own CID is `4` rather than the first
+/// machine's `3`, because the two machines' boots can be up at once and a second
+/// guest claiming a live CID aborts QEMU before the guest starts.
+fn vsock_available() -> bool {
+    Path::new("/dev/vhost-vsock").exists()
+}
+
 /// The full `qemu-system-aarch64` command for this machine, with the serial line
 /// sent wherever `serial` says (`file:…` for the marker-polling boot, `mon:stdio`
 /// for an interactive `run`). Every flag here is a measured machine choice, so
 /// boot-aarch64 and `run --arch aarch64` share one definition rather than two
 /// lists that could drift into booting different machines.
-fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str) -> Command {
+fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str, share: &Path) -> Command {
     let mut qemu = Command::new("qemu-system-aarch64");
     // `acpi=off` is what makes this firmware describe the machine the way this
     // port reads it, and it is a measured difference rather than a preference:
@@ -1590,15 +1755,75 @@ fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str) -> Command {
         // negotiate the transport headless (the milestone is the transport reaching
         // the class, not any event arriving).
         .args(["-device", "virtio-keyboard-device"])
-        // And the transports have to be the *modern* ones, which on this machine
-        // is a choice somebody has to make: measured, `virt`'s `virtio-mmio`
-        // transports answer `Version` 1 - the legacy register layout - unless
-        // this says otherwise, and version 2 is the only layout this kernel's
-        // driver crate reads. The alternative to selecting it is a kernel that
-        // either drives the legacy layout (a second register map, a second
-        // feature-negotiation order) or refuses devices on its own machine, and
-        // neither is what stage 5 is for.
-        .args(["-global", "virtio-mmio.force-legacy=false"]);
+        // A host-driven console port - the fifth class (`check_console`,
+        // `M8_CONSOLE_OK`): a `virtio-serial-device` carrying one `virtconsole`,
+        // the same shape the first machine attaches on its PCI bus. Its far end
+        // is a host socket nothing has to be listening on (`wait=off`), so the
+        // port opens and a write lands in the socket instead of blocking a
+        // machine that has nobody reading it yet.
+        .args([
+            "-chardev",
+            &format!(
+                "socket,id=console0,path={},server=on,wait=off",
+                esp.parent().unwrap().join("aarch64-console.sock").display()
+            ),
+        ])
+        .args(["-device", "virtio-serial-device"])
+        .args(["-device", "virtconsole,chardev=console0"])
+        // And the display adapter - the sixth class (`check_gpu`, `M8_GPU_OK`).
+        // `virtio-gpu-device` is the MMIO form of the card the first machine
+        // attaches as `virtio-gpu-pci`, so the driver, the render task and the
+        // DRM layer above them are one copy on both machines. A test boot has no
+        // `-display`, so the host reports no monitor and the driver builds its
+        // headless fallback shape; the scanout is set either way, which is what
+        // `/dev/fb0` reads and the framebuffer console paints on.
+        .args(["-device", "virtio-gpu-device"])
+        // A sound card - the seventh class (`check_sound`, `M8_SOUND_OK`), the
+        // same shape the first machine attaches as `virtio-sound-pci`. The
+        // backend is `none`: it consumes the stream and plays silence, so the
+        // driver is exercised end to end without asking the host for speakers -
+        // and the boot's own probe writes silence through it, which is what
+        // `M8_SOUND_OK` asserts.
+        .args(["-audiodev", "none,id=snd0"])
+        .args(["-device", "virtio-sound-device,audiodev=snd0"]);
+    // And the eighth class (`check_vsock`, `M8_VSOCK_OK`) - but only on a host
+    // that can back it. vsock is the one virtio device QEMU does not emulate in
+    // userspace: `vhost-vsock-device` is served by the host's vhost kernel
+    // module, and a machine naming it without `/dev/vhost-vsock` does not start
+    // at all. Attaching it only when the host has one keeps this machine's boot
+    // honest on a bare host - the kernel prints the absence and answers
+    // `EAFNOSUPPORT` - while a host that has it runs the class for real
+    // (`PLAN.md` §13.28).
+    if vsock_available() {
+        qemu.args(["-device", "vhost-vsock-device,guest-cid=4"]);
+    }
+    // The ninth class (`check_p9`, `M8_P9_OK`): the host share, the same
+    // arrangement the first machine's `-virtfs` makes. `-fsdev` is the backend -
+    // the host directory QEMU's 9p server exports, with `security_model=none` so
+    // the host's own permissions decide - and `virtio-9p-device` is the transport
+    // the guest opens over MMIO. `mount_tag=hostshare` is the name
+    // `mount -t 9p hostshare /mnt` is pointed at, and the probe file `lay_p9_share`
+    // laid in `share` is what a boot reads back to prove the share serves.
+    qemu.args([
+        "-fsdev",
+        &format!(
+            "local,id=fsdev0,path={},security_model=none",
+            share.display()
+        ),
+    ]);
+    qemu.args([
+        "-device",
+        "virtio-9p-device,fsdev=fsdev0,mount_tag=hostshare",
+    ]);
+    // And the transports have to be the *modern* ones, which on this machine
+    // is a choice somebody has to make: measured, `virt`'s `virtio-mmio`
+    // transports answer `Version` 1 - the legacy register layout - unless
+    // this says otherwise, and version 2 is the only layout this kernel's
+    // driver crate reads. The alternative to selecting it is a kernel that
+    // either drives the legacy layout (a second register map, a second
+    // feature-negotiation order) or refuses devices on its own machine, and
+    // neither is what stage 5 is for.
+    qemu.args(["-global", "virtio-mmio.force-legacy=false"]);
     qemu
 }
 
@@ -1642,7 +1867,8 @@ pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
          getty (log in as root, no password; Ctrl-A x exits QEMU; `--mode terminal` \
          puts the login on the serial line itself)"
     );
-    let mut qemu = aarch64_qemu(&esp, &code, &vars, "mon:stdio");
+    let share = utils::lay_p9_share(&build_dir.join("aarch64-9p-share"))?;
+    let mut qemu = aarch64_qemu(&esp, &code, &vars, "mon:stdio", &share);
     let status = qemu
         .status()
         .context("Failed to start qemu-system-aarch64")?;
@@ -1672,7 +1898,14 @@ fn boot(build_dir: &Path, esp: &Path, terminators: &[&str], deadline: Duration) 
     let log = log_path(build_dir);
     let _ = fs::remove_file(&log);
 
-    let mut qemu = aarch64_qemu(esp, &code, &vars, &format!("file:{}", log.display()));
+    let share = utils::lay_p9_share(&build_dir.join("aarch64-9p-share"))?;
+    let mut qemu = aarch64_qemu(
+        esp,
+        &code,
+        &vars,
+        &format!("file:{}", log.display()),
+        &share,
+    );
     // QEMU's own stderr goes to this process's, not to a pipe nobody reads. A
     // QEMU that refuses to start - a missing firmware, an image it cannot open -
     // says so there and nowhere else, and the serial log it never wrote is
@@ -1715,6 +1948,44 @@ mod tests {
     use super::*;
     use crate::config::{Machine, RunMode, TestConfig};
 
+    /// The byte-for-byte block the Alpine boot printed while this kernel's
+    /// procfs had no `/proc/<pid>/environ`, copied out of a captured log.
+    ///
+    /// It is here rather than paraphrased because the escapes *are* the case:
+    /// openrc writes the service's message, then moves the cursor back to the
+    /// start of the line and overwrites it with the coloured marker, so a
+    /// checker that searched the raw text for the mount error would find
+    /// nothing on the marker's line and a checker that searched for `!!` in the
+    /// raw text would still have to know it is the failure colour and not the
+    /// success one.
+    const FAILING_PROC_MOUNT: &str = " \x1b[1m\x1b[32m*\x1b[m Mounting /proc\x1b[K ...\r\r\n\
+         mount: mounting proc on /proc failed: Resource busy\r\r\n\
+         \x1b[A\x1b[153C \x1b[1m\x1b[34m[\x1b[1m\x1b[31m !! \x1b[1m\x1b[34m]\x1b[m\r\r\n";
+
+    #[test]
+    fn an_openrc_service_failure_is_named_by_its_own_message() {
+        assert_eq!(
+            openrc_failure(FAILING_PROC_MOUNT).as_deref(),
+            Some("mount: mounting proc on /proc failed: Resource busy")
+        );
+
+        // A healthy runlevel is `None`, and the success marker shares the
+        // marker's brackets - which is the whole reason the check looks for the
+        // failure colour's text and not for a bracket.
+        let healthy = " \x1b[1m\x1b[32m*\x1b[m Starting local\x1b[K ...\r\r\n\
+             \x1b[A\x1b[153C \x1b[1m\x1b[34m[\x1b[1m\x1b[32m ok \x1b[1m\x1b[34m]\x1b[m\r\r\n\
+             Welcome to Alpine Linux 3.25.0\r\r\nmpos login: ";
+        assert_eq!(openrc_failure(healthy), None);
+
+        // And the escapes really are stripped for the message a person reads,
+        // rather than merely skipped over.
+        assert_eq!(
+            without_ansi("a\x1b[1mb\x1b[0m\r\nc"),
+            "ab\nc",
+            "CSI sequences and carriage returns go, everything else stays"
+        );
+    }
+
     #[test]
     fn alpine_boot_consoles_follow_the_run_mode() {
         // The session's console list is the x86_64 path's own answer - one
@@ -1733,9 +2004,12 @@ mod tests {
             unsafe { std::env::set_var("MPOS_XTASK_MODE", mode.name()) };
             // The written file always ends in exactly one newline: the loader
             // reads `mpos.cmdline` whole and the kernel records it verbatim.
+            // And every session line carries the root the script pivots to -
+            // without `root=` the initramfs stays on the ramfs and the disk is
+            // never reached (§15.6), so the consoles are only half the answer.
             assert_eq!(
                 alpine_cmdline(ModeChoice::Session).unwrap(),
-                format!("{want}\n")
+                format!("{want} root=/dev/vda rootfstype=ext4\n")
             );
         }
         unsafe { std::env::remove_var("MPOS_XTASK_MODE") };

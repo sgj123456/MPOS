@@ -220,6 +220,24 @@ dependencies = [
  "bitflags 2.13.2",
  "critical-section",
  "elf",
+ "mpos-abi",
+ "mpos-ahci",
+ "mpos-arch",
+ "mpos-binfmt",
+ "mpos-blk",
+ "mpos-bootinfo",
+ "mpos-cred",
+ "mpos-date",
+ "mpos-err",
+ "mpos-evdev",
+ "mpos-fdt",
+ "mpos-gpu",
+ "mpos-pci",
+ "mpos-seccomp",
+ "mpos-term",
+ "mpos-uinput",
+ "mpos-uts",
+ "mpos-vm",
  "rand_chacha",
  "rand_core",
  "smoltcp",
@@ -231,12 +249,123 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpos-abi"
+version = "0.1.0"
+dependencies = [
+ "mpos-err",
+]
+
+[[package]]
+name = "mpos-ahci"
+version = "0.1.0"
+
+[[package]]
+name = "mpos-arch"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "mpos-bootinfo",
+ "mpos-date",
+ "mpos-err",
+ "mpos-fdt",
+ "mpos-vm",
+ "spin",
+ "uart_16550",
+ "x86_64",
+]
+
+[[package]]
+name = "mpos-binfmt"
+version = "0.1.0"
+
+[[package]]
+name = "mpos-blk"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+]
+
+[[package]]
+name = "mpos-bootinfo"
+version = "0.1.0"
+
+[[package]]
+name = "mpos-cred"
+version = "0.1.0"
+
+[[package]]
+name = "mpos-date"
+version = "0.1.0"
+
+[[package]]
+name = "mpos-err"
+version = "0.1.0"
+
+[[package]]
+name = "mpos-evdev"
+version = "0.1.0"
+
+[[package]]
+name = "mpos-fdt"
+version = "0.1.0"
+
+[[package]]
 name = "mpos-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
  "libfuzzer-sys",
  "mpos",
+]
+
+[[package]]
+name = "mpos-gpu"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "critical-section",
+ "mpos-err",
+ "virtio-drivers",
+]
+
+[[package]]
+name = "mpos-pci"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+]
+
+[[package]]
+name = "mpos-seccomp"
+version = "0.1.0"
+
+[[package]]
+name = "mpos-term"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+]
+
+[[package]]
+name = "mpos-uinput"
+version = "0.1.0"
+dependencies = [
+ "mpos-evdev",
+]
+
+[[package]]
+name = "mpos-uts"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+]
+
+[[package]]
+name = "mpos-vm"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "mpos-bootinfo",
 ]
 
 [[package]]

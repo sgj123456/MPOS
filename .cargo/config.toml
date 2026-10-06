@@ -20,18 +20,23 @@ target = "x86_64-unknown-none"
 # not accept it through -Ctarget-feature.
 #
 # The `mpos_*` flags are the capabilities this machine declares to `crate::hal`
-# (`src/hal/mod.rs`): the local APIC's message-signalled delivery, the 16550's
+# (`arch/src/hal/mod.rs`): the local APIC's message-signalled delivery, the 16550's
 # interrupting transmit ring, the x87 lazy-FPU trap, the `rt_sigframe` a handler
-# runs on, a framebuffer console to paint the virtual-console grids on, a
-# per-BAR dynamic MMIO window for device registers, and a compiled network
-# stack.
+# runs on, a framebuffer console to paint the virtual-console grids on, and a
+# compiled network stack.
 # `hal` forwards each under `#[cfg(mpos_…)]` and names no architecture; the
 # machine-to-capability mapping lives here, beside the linker-script path that
 # is this file's other per-machine fact. A port declares its own set in its own
 # `[target.…]` block, which it already needs for its script.
+#
+# There used to be an `mpos_dynamic_mmio_window` here, for "this machine reaches
+# a device by allocating one mapping per BAR". It is gone because it described a
+# *mechanism* rather than a capability: a BAR's window is now what
+# `hal::Paging::map_mmio_window` answers, and which mechanism answers it is the
+# machine's own business (`arch/x86_64/mmio.rs`, `PLAN.md` §14.3).
 rustflags = [
     "-C", "relocation-model=pic",
-    "-C", "link-arg=--script=src/arch/x86_64/linker.ld",
+    "-C", "link-arg=--script=arch/src/arch/x86_64/linker.ld",
     "-C", "link-arg=-pie",
     "-C", "link-arg=-ztext",
     "-C", "link-arg=-zmax-page-size=0x1000",
@@ -40,8 +45,13 @@ rustflags = [
     "--cfg", "mpos_fpu_trap",
     "--cfg", "mpos_signal_frame",
     "--cfg", "mpos_framebuffer_console",
-    "--cfg", "mpos_dynamic_mmio_window",
     "--cfg", "mpos_net",
+    # The debug-exit device: this machine can be told to terminate the emulator
+    # it runs under, which is how a test run ends with a real exit status
+    # (`hal::exit_qemu`). The port is QEMU's `isa-debug-exit`; a machine without
+    # it declares no such flag and `exit_qemu` halts instead of writing to a
+    # port nothing answers.
+    "--cfg", "mpos_qemu_debug_exit",
     # Two more of the same kind, declared here because the machine is where the
     # difference lives. `mpos_pci_config` is "this machine has a PCI bus whose
     # configuration space can be read and written" - the `/proc/bus/pci` and
@@ -52,9 +62,10 @@ rustflags = [
     # the enumeration is empty, so no such node is built and the absent method is
     # unreachable rather than faked. `mpos_input_registry` is "this machine
     # publishes an evdev registry that `/sys/class/input` can enumerate" - this
-    # machine's virtio-PCI input driver's, whose nodes `udev` and `libinput` read
-    # to classify a keyboard. aarch64 opens a virtio-input over MMIO but keeps no
-    # such registry, so its class directory is honestly empty.
+    # machine's input stack's, whose nodes `udev` and `libinput` read to classify
+    # a keyboard. aarch64 declares it too since §15.2 - it reaches the same
+    # registry through the `InputDevice` contract, opening its own virtio-input
+    # over MMIO - so the class directory means the same thing on both machines.
     "--cfg", "mpos_pci_config",
     "--cfg", "mpos_input_registry",
 ]
@@ -86,10 +97,17 @@ rustflags = [
 # (`sigcontext`, the `fpsimd_context` record, `rt_sigreturn`) since §13.2's Stage
 # 3b, so `mpos_signal_frame` is declared here too. It has no MSI controller and
 # no lazy FPU trap, so it declares none of the other x86_64 flags.
+#
+# `mpos_input_registry` is here since §15.2: the machine opens its
+# `virtio-keyboard-device` over the MMIO transport and hands it to the shared
+# evdev registry, so `/dev/input/event0`, `/sys/class/input` and the uinput door
+# mean on this machine exactly what they mean on the first one. What the
+# capability gates did not move - they were flipped from `target_arch` to this
+# word in §13.23, which is what made the port one flag rather than four edits.
 [target.aarch64-unknown-none]
 rustflags = [
     "-C", "relocation-model=pic",
-    "-C", "link-arg=--script=src/arch/aarch64/linker.ld",
+    "-C", "link-arg=--script=arch/src/arch/aarch64/linker.ld",
     "-C", "link-arg=-pie",
     "-C", "link-arg=-ztext",
     "-C", "link-arg=-zmax-page-size=0x1000",
@@ -97,6 +115,8 @@ rustflags = [
     "--cfg", "mpos_serial_ring",
     "--cfg", "mpos_net",
     "--cfg", "mpos_signal_frame",
+    "--cfg", "mpos_input_registry",
+    "--cfg", "mpos_framebuffer_console",
 ]
 
 # The user programs: ordinary Rust binaries for musl, which is the libc this

@@ -1251,17 +1251,34 @@ const RB_MAGIC2B: usize = 0x0511_1996;
 /// words first, since a call that does not name them is refused before its
 /// command is even looked at, then the command itself.
 ///
+/// **Each word is read as the 32 bits Linux narrows it to.** Linux's entry
+/// point is `reboot(int magic1, int magic2, unsigned int cmd, void *arg)`, and
+/// those parameter types are the contract: on a 64-bit machine the trap hands
+/// the kernel 64-bit registers and the kernel truncates each one before
+/// comparing it. That is not a detail a caller can avoid having an opinion
+/// about, because it is the *libc's* prototype that decides what lands in the
+/// register - musl declares `reboot(int type)` and supplies the magics itself,
+/// so every command word at or above `2^31` arrives **sign-extended**:
+/// `0x89abcdef` reaches the kernel as `0xffffffff89abcdef`. Comparing the full
+/// word read that extension as a different command, and the answer was `EINVAL`
+/// where Linux serves it. Measured: `reboot(LINUX_REBOOT_CMD_CAD_ON)` answered
+/// `EINVAL` on both machines while `CAD_OFF` (zero, which no extension changes)
+/// was served - and `CAD_ON`, `ENABLE_CAD` and `HALT_SYSTEM` are three of the
+/// five words, so busybox `init`'s shutdown half and `halt -f` were among the
+/// callers being refused. `t-reboot-libc` is the pin.
+///
 /// `Ok(RebootCmd::Unknown)` is a call that named the magic and asked for
 /// something no kernel knows: that is `EINVAL` too, and it is the one a
 /// program sees when *it* passes a bad word rather than when we mislaid one.
 pub(crate) fn reboot_command(args: [usize; crate::syscall::ARG_COUNT]) -> Result<RebootCmd, isize> {
-    if args[0] != RB_MAGIC1 {
+    let (magic1, magic2, cmd) = (args[0] as u32, args[1] as u32, args[2] as u32);
+    if magic1 != RB_MAGIC1 as u32 {
         return Err(err::EINVAL);
     }
-    if args[1] != RB_MAGIC2 && args[1] != RB_MAGIC2A && args[1] != RB_MAGIC2B {
+    if magic2 != RB_MAGIC2 as u32 && magic2 != RB_MAGIC2A as u32 && magic2 != RB_MAGIC2B as u32 {
         return Err(err::EINVAL);
     }
-    match reboot_classify(args[2]) {
+    match reboot_classify(cmd as usize) {
         RebootCmd::Unknown => Err(err::EINVAL),
         other => Ok(other),
     }
@@ -3026,6 +3043,77 @@ mod tests {
         assert_eq!(
             reboot_command(call(RB_MAGIC1, 0x0511_1996, RB_AUTOBOOT)),
             Ok(RebootCmd::Stop)
+        );
+    }
+
+    /// `reboot(2)`'s words are 32 bits wide, because Linux's own entry point
+    /// declares them that way: `reboot(int magic1, int magic2, unsigned int
+    /// cmd, void *arg)`. A 64-bit trap hands the kernel 64-bit registers, and
+    /// what the *libc* puts in them is decided by its prototype - musl's is
+    /// `reboot(int type)`, so every word at or above `2^31` arrives
+    /// sign-extended. Reading the full word turned that extension into a
+    /// different command: measured on both machines, `CAD_OFF` (zero) was
+    /// served and `CAD_ON` (`0x89abcdef`) was `EINVAL`, which is half of what
+    /// busybox `init` asks for and all of what `halt -f` asks for.
+    #[test]
+    fn reboot_reads_its_words_as_linux_narrows_them() {
+        let call = |magic: usize, magic2: usize, cmd: usize| [magic, magic2, cmd, 0, 0, 0];
+        /// A word above `2^31` as a libc's `int` parameter lands in the
+        /// register: the low 32 bits, sign-extended.
+        fn as_a_signed_int_reaches(word: usize) -> usize {
+            (word as u32 as i32 as i64) as usize
+        }
+
+        // The extension is real for the three words that have it - otherwise
+        // this test would pass on an implementation that narrows nothing.
+        for word in [RB_ENABLE_CAD, RB_HALT_SYSTEM] {
+            assert_ne!(
+                as_a_signed_int_reaches(word),
+                word,
+                "word {word:#x} is above 2^31, so its sign extension differs"
+            );
+        }
+
+        assert_eq!(
+            reboot_command(call(
+                RB_MAGIC1,
+                RB_MAGIC2,
+                as_a_signed_int_reaches(RB_ENABLE_CAD)
+            )),
+            Ok(RebootCmd::Policy)
+        );
+        assert_eq!(
+            reboot_command(call(
+                RB_MAGIC1,
+                RB_MAGIC2,
+                as_a_signed_int_reaches(RB_HALT_SYSTEM)
+            )),
+            Ok(RebootCmd::Stop)
+        );
+        // `poweroff -f`'s word is below `2^31`, so it arrives unextended and
+        // must keep working - the narrowing must not break the common case.
+        assert_eq!(
+            reboot_command(call(RB_MAGIC1, RB_MAGIC2, RB_POWER_OFF)),
+            Ok(RebootCmd::Stop)
+        );
+        // The magic words are narrowed the same way: a caller that passes them
+        // through an `int` reaches the same classification.
+        assert_eq!(
+            reboot_command(call(
+                as_a_signed_int_reaches(RB_MAGIC1),
+                as_a_signed_int_reaches(RB_MAGIC2),
+                RB_AUTOBOOT
+            )),
+            Ok(RebootCmd::Stop)
+        );
+        // A word nobody knows is still `EINVAL`, extension or not.
+        assert_eq!(
+            reboot_command(call(
+                RB_MAGIC1,
+                RB_MAGIC2,
+                as_a_signed_int_reaches(0xdead_beef)
+            )),
+            Err(err::EINVAL)
         );
     }
 

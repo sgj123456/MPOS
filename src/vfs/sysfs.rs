@@ -1756,9 +1756,9 @@ mod tests {
     fn resolve(fs: &Arc<SysFs>, path: &str) -> Arc<dyn Inode> {
         let vfs = crate::vfs::mount::Vfs::new();
         let root = crate::vfs::ramfs::RamFs::new();
-        vfs.mount_root(&*root);
+        vfs.mount_root(root.clone());
         root.root().create("sys", NodeKind::Dir).unwrap();
-        vfs.mount("/sys", &**fs).unwrap();
+        vfs.mount("/sys", fs.clone()).unwrap();
         vfs.resolve(path)
             .unwrap_or_else(|e| panic!("{path} did not resolve: {e:?}"))
     }
@@ -1773,14 +1773,14 @@ mod tests {
     fn resolve_on_a_full_root(fs: &Arc<SysFs>, path: &str, fillers: usize) -> Arc<dyn Inode> {
         let vfs = crate::vfs::mount::Vfs::new();
         let root = crate::vfs::ramfs::RamFs::new();
-        vfs.mount_root(&*root);
+        vfs.mount_root(root.clone());
         root.root().create("sys", NodeKind::Dir).unwrap();
         for i in 0..fillers {
             root.root()
                 .create(&alloc::format!("d{i:04}"), NodeKind::Dir)
                 .unwrap();
         }
-        vfs.mount("/sys", &**fs).unwrap();
+        vfs.mount("/sys", fs.clone()).unwrap();
         vfs.resolve(path)
             .unwrap_or_else(|e| panic!("{path} did not resolve: {e:?}"))
     }

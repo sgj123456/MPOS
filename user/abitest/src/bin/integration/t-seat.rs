@@ -111,9 +111,17 @@ fn vt_mode_bytes(mode: u8, waitv: u8, rel: u8, acq: u8, fr: u8) -> [u8; 8] {
     [mode, waitv, rel, acq, fr, 0, 0, 0]
 }
 
-/// `struct vt_stat`'s `v_mode`, `v_num`, `v_state` - three shorts.
+/// `struct vt_stat`'s `v_active`, `v_signal`, `v_state` - three shorts, indexed
+/// as *fields*: the argument is the field number, so the byte offset is twice it.
+///
+/// Measured: an earlier version read `buf[at]`/`buf[at + 1]`, which for the
+/// second field straddled `v_active`'s high byte and `v_signal`'s low one, and
+/// for the third read `v_signal` and called it `v_state`. A kernel that wrote
+/// exactly what Linux writes came back as two failures - `v_state` without its
+/// always-open bit and a `v_signal` that had "changed" - which is a test
+/// reporting its own bug as the kernel's.
 fn stat_shorts(buf: &[u8], at: usize) -> u16 {
-    u16::from_ne_bytes([buf[at], buf[at + 1]])
+    u16::from_ne_bytes([buf[at * 2], buf[at * 2 + 1]])
 }
 
 #[unsafe(no_mangle)]
@@ -128,18 +136,47 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // tty, and fd 0 is exactly that tty.)
     let tty = 0;
 
-    // VT_GETSTATE -> struct vt_stat: the console it is on, in text mode. The
-    // number is the console's own, so it is read rather than asserted: which
-    // console a test was started on is the harness's business.
-    let mut st = [0u8; 6];
+    // VT_GETSTATE -> struct vt_stat { v_active, v_signal, v_state }. Linux writes
+    // exactly two of the three shorts: `v_active` is the console on the screen
+    // (1-based), `v_state` is the bit mask of the consoles in use with bit 0
+    // always set - its own comment is "/dev/tty0 is always open" - and `v_signal`
+    // is *left alone*. The buffer starts at a sentinel rather than zeroed, because
+    // that is the only way "never written" is a fact: zeroed, a kernel that wrote
+    // 0 there would pass.
+    //
+    // Which console a test was started on is the harness's business, so the number
+    // is read rather than asserted.
+    let mut st = [0xAAu8; 6];
     let r = lin::ioctl(tty, ior(VT, NR_VT_GETSTATE, 6), st.as_mut_ptr() as usize);
     lin::check_eq(&mut failed, b"VT_GETSTATE succeeds", r, 0);
-    let first = stat_shorts(&st, 2);
-    lin::check_true(&mut failed, b"VT_GETSTATE names a console", first >= 1);
+    let active = stat_shorts(&st, 0);
+    lin::check_true(
+        &mut failed,
+        b"VT_GETSTATE names the active console",
+        active >= 1,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"v_state always carries /dev/tty0's bit",
+        (stat_shorts(&st, 2) & 1) as isize,
+        1,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"VT_GETSTATE leaves v_signal untouched (Linux never writes it)",
+        stat_shorts(&st, 1) as isize,
+        0xAAAA,
+    );
+
+    // And the console's *mode*, through the door that answers it: `struct vt_stat`
+    // has no mode field on Linux, so a console's text mode is `KDGETMODE`'s.
+    let mut kdmode = [0u8; 4];
+    let r = lin::ioctl(tty, io(KD, NR_KDGETMODE), kdmode.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"KDGETMODE succeeds on a fresh console", r, 0);
     lin::check_eq(
         &mut failed,
         b"a console starts in text mode",
-        stat_shorts(&st, 0) as isize,
+        i32::from_ne_bytes(kdmode) as isize,
         KD_TEXT as isize,
     );
 
@@ -266,13 +303,13 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(
         &mut failed,
         b"VT_ACTIVATE on the current console succeeds",
-        lin::ioctl(tty, io(VT, NR_VT_ACTIVATE), first as usize),
+        lin::ioctl(tty, io(VT, NR_VT_ACTIVATE), active as usize),
         0,
     );
     lin::check_eq(
         &mut failed,
         b"VT_WAITACTIVE on the current console returns",
-        lin::ioctl(tty, io(VT, NR_VT_WAITACTIVE), first as usize),
+        lin::ioctl(tty, io(VT, NR_VT_WAITACTIVE), active as usize),
         0,
     );
     // A console number the machine does not have is refused, not swallowed:
@@ -309,7 +346,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     lin::check_eq(
         &mut failed,
         b"VT_WAITUNTIL on the active console returns",
-        lin::ioctl(tty, io(VT, NR_VT_WAITUNTIL), first as usize),
+        lin::ioctl(tty, io(VT, NR_VT_WAITUNTIL), active as usize),
         0,
     );
 
@@ -332,14 +369,37 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         i32::from_ne_bytes([kd[0], kd[1], kd[2], kd[3]]) as isize,
         KD_GRAPHICS as isize,
     );
-    // `VT_GETSTATE`'s `v_mode` is the same fact in the other door's shape.
+    // `VT_GETSTATE` is *not* where a mode is read - on Linux it never was; that is
+    // the `KDGETMODE` answer above. What it says here is the console on the screen,
+    // unchanged by the mode and keyboard dance, and a `v_state` that agrees with the
+    // other door: `VT_OPENQRY` names the lowest console nobody has claimed, so every
+    // console below it is in use (bit set) and it itself is free (bit clear). Two
+    // answers, one predicate, asked back to back so nothing can move between them -
+    // which is what makes this a pin of the mask's numbering rather than of itself.
+    let mut free_q = [0u8; 4];
+    let r = lin::ioctl(tty, io(VT, NR_VT_OPENQRY), free_q.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"VT_OPENQRY succeeds again", r, 0);
+    let free = i32::from_ne_bytes(free_q) as u16;
     let r = lin::ioctl(tty, ior(VT, NR_VT_GETSTATE, 6), st.as_mut_ptr() as usize);
     lin::check_eq(&mut failed, b"VT_GETSTATE succeeds again", r, 0);
     lin::check_eq(
         &mut failed,
-        b"VT_GETSTATE reports the graphics mode",
+        b"VT_GETSTATE still names the same console",
         stat_shorts(&st, 0) as isize,
-        KD_GRAPHICS as isize,
+        active as isize,
+    );
+    let below = (1u16 << free) - 1;
+    lin::check_eq(
+        &mut failed,
+        b"v_state marks every console below the free one as in use",
+        (stat_shorts(&st, 2) & below) as isize,
+        below as isize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"and leaves the free console's own bit clear",
+        ((stat_shorts(&st, 2) >> free) & 1) as isize,
+        0,
     );
 
     // A mode that is neither is Linux's EINVAL, not a success that did nothing.

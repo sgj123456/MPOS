@@ -593,9 +593,32 @@ fn begin_activate(to: u32) {
 /// one nobody has read from is still free for a seat manager to point a second
 /// session at.
 pub fn free_console() -> Option<u32> {
-    (1..=VC_COUNT).find(|vc| {
-        crate::vfs::pty::lookup(*vc).is_none_or(|pty| pty.slave().foreground().is_none())
-    })
+    (1..=VC_COUNT).find(|vc| !in_use(*vc))
+}
+
+/// Whether a session has taken `vc` over as its terminal - the negation of
+/// [`free_console`]'s predicate, asked of the console's own reader.
+fn in_use(vc: u32) -> bool {
+    crate::vfs::pty::lookup(vc).is_some_and(|pty| pty.slave().foreground().is_some())
+}
+
+/// `VT_GETSTATE`'s `v_state`: the bit mask of the consoles in use, in Linux's
+/// own numbering.
+///
+/// Linux's `vt_ioctl` builds it as `state = 1` - its comment is "/dev/tty0 is
+/// always open" - and then sets `mask = 2 << i` for every `VT_IS_IN_USE(i)`, so
+/// bit 0 is the always-open alias and bit `c` is console `c`, in a `short` that
+/// cannot describe more than sixteen consoles. Measured on Linux 7.2.8: `v_state`
+/// 67 (`0b100_0011`) with consoles 1 and 6 in use and bit 0 set. This machine has
+/// [`VC_COUNT`] consoles, so nothing is truncated here.
+pub fn state_mask() -> u16 {
+    let mut state = 1u16; // /dev/tty0 is always open
+    for vc in 1..=VC_COUNT {
+        if in_use(vc) {
+            state |= 1 << vc;
+        }
+    }
+    state
 }
 
 /// Spawn the pump task. Called once, at handoff: before init runs there is no

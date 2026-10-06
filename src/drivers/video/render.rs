@@ -17,6 +17,7 @@
 //! that needs the write-through promise takes the same route by handing a
 //! request to this task and parking until the frame left.
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -24,7 +25,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use crate::drivers::virtio::gpu_ctrl::Gpu;
+use crate::drivers::virtio::gpu_ctrl::GpuDevice;
 use critical_section::Mutex;
 
 use crate::drivers::virtio::gpu::VirtioGpuDev;
@@ -41,7 +42,7 @@ const FRAME_TICKS: u64 = 8;
 
 /// The device, parked here for the task to take at its start. After the take
 /// nothing else can reach it, which is what keeps `flush` single-caller.
-static DEVICE: Mutex<RefCell<Option<Gpu>>> = Mutex::new(RefCell::new(None));
+static DEVICE: Mutex<RefCell<Option<Box<dyn GpuDevice>>>> = Mutex::new(RefCell::new(None));
 static VIEW: Mutex<RefCell<Option<Arc<VirtioGpuDev>>>> = Mutex::new(RefCell::new(None));
 static RENDER_PID: AtomicU32 = AtomicU32::new(0);
 
@@ -244,7 +245,7 @@ fn jobs_pending() -> bool {
 }
 
 /// Perform every queued job, in order, and wake whoever asked.
-fn drain_jobs(device: &mut Gpu) {
+fn drain_jobs(device: &mut dyn GpuDevice) {
     loop {
         let Some(pending) = critical_section::with(|cs| JOBS.borrow(cs).borrow_mut().pop_front())
         else {
@@ -269,7 +270,7 @@ fn drain_jobs(device: &mut Gpu) {
 /// A `CREATE` is two commands and both must land, which is why they are one job
 /// rather than two: a resource created and never backed is a resource the device
 /// will read from nowhere the moment anything is transferred to it.
-fn perform(device: &mut Gpu, kind: &Job) -> isize {
+fn perform(device: &mut dyn GpuDevice, kind: &Job) -> isize {
     let done = match kind {
         Job::Create2d {
             id,
@@ -334,7 +335,7 @@ fn perform(device: &mut Gpu, kind: &Job) -> isize {
 /// This runs before anything paints, so the two control-queue round trips per set
 /// are paid once at boot rather than on a `GET_CAPS` a compositor makes on every
 /// startup.
-fn publish_card(device: &mut Gpu) {
+fn publish_card(device: &mut dyn GpuDevice) {
     use crate::gpu::virtgpu::{Capset, Card};
 
     let features = device.features();
@@ -458,9 +459,9 @@ pub fn running() -> bool {
 /// does not decide any of it: the framebuffer console's being one of the
 /// consoles is what moves the kernel's log onto it, and a session claiming the
 /// card is what brings the grids up for a screen somebody else is driving.
-pub fn spawn(device: Gpu, view: Arc<VirtioGpuDev>) {
+pub fn spawn(device: impl GpuDevice + 'static, view: Arc<VirtioGpuDev>) {
     critical_section::with(|cs| {
-        *DEVICE.borrow(cs).borrow_mut() = Some(device);
+        *DEVICE.borrow(cs).borrow_mut() = Some(Box::new(device));
         *VIEW.borrow(cs).borrow_mut() = Some(view);
     });
     let id = crate::sched::spawn_permanent(task, crate::sched::Priority::NORMAL);
@@ -483,7 +484,7 @@ fn task() {
     };
     // Before anything paints: what the device negotiated, and the cap sets it
     // offers. A compositor's first `GETPARAM` is what this answers.
-    publish_card(&mut device);
+    publish_card(&mut *device);
 
     let mut fb_w = view.dims().0 as usize;
     let mut fb_h = view.dims().1 as usize;
@@ -570,7 +571,7 @@ fn task() {
         // beat above coalesces repaints - work nobody asked for - rather than
         // requests. The jobs are resource commands and touch no scanout, so their
         // place relative to the resize and the probe is a latency question only.
-        drain_jobs(&mut device);
+        drain_jobs(&mut *device);
 
         // The host's display changed shape, taken after the beat so a drag's
         // stream of events costs one re-query per frame. This is a *probe*: it
@@ -578,7 +579,7 @@ fn task() {
         // nothing here rebuilds the screen. The screen follows only when a
         // compositor, having read the new advertised mode, commits it below.
         if PROBE.swap(false, Ordering::Relaxed) {
-            probe_display(&mut device, &view);
+            probe_display(&mut *device, &view);
         }
 
         // A modeset committed a size the scanout does not yet drive and parked in
@@ -589,7 +590,7 @@ fn task() {
         if target != 0 {
             let width = (target >> 32) as u32;
             let height = target as u32;
-            let ok = resize_to(&mut device, &view, width, height);
+            let ok = resize_to(&mut *device, &view, width, height);
             RESIZE_OK.store(ok, Ordering::Relaxed);
             RESIZE_ACK.store(RESIZE_SEQ.load(Ordering::Relaxed), Ordering::Relaxed);
             let waiters = critical_section::with(|cs| {
@@ -725,7 +726,7 @@ fn task() {
 /// A zero size means no display is attached (a headless QEMU answers every query
 /// with nothing, which is not a request for an empty screen) and is ignored; so
 /// is a QEMU window *move*, which sends the event with an unchanged size.
-fn probe_display(device: &mut Gpu, view: &Arc<VirtioGpuDev>) {
+fn probe_display(device: &mut dyn GpuDevice, view: &Arc<VirtioGpuDev>) {
     let (width, height) = match device.resolution() {
         Ok((width, height)) if width > 0 && height > 0 => (width, height),
         _ => return,
@@ -755,7 +756,12 @@ fn probe_display(device: &mut Gpu, view: &Arc<VirtioGpuDev>) {
 /// Returns `true` when the scanout now drives the requested size (including the
 /// no-op case where it already did), `false` when the host refused and the
 /// screen was restored.
-fn resize_to(device: &mut Gpu, view: &Arc<VirtioGpuDev>, width: u32, height: u32) -> bool {
+fn resize_to(
+    device: &mut dyn GpuDevice,
+    view: &Arc<VirtioGpuDev>,
+    width: u32,
+    height: u32,
+) -> bool {
     let (old_w, old_h) = view.dims();
     if (width, height) == (old_w, old_h) {
         return true;

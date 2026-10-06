@@ -685,7 +685,7 @@ same measurement puts behind `vfs` and so behind `hal` too)**
       runlevel output is `[ ok ]`, and of §13.12's "named, not fixed" list only the two prose-level gaps
       remain (the install writes no `/etc/hostname`, so the prompt says `localhost`, and the machine's
       `/proc/net` rows are the same table the first machine's is) · [~] 9.2 RISC-V support
-- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.16 landed, 13.2 in progress (§13)**
+- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.17 landed, 13.19–13.30 landed, 13.18 open, 13.2 in progress (§13); the boot-side half is Phase 15 (§15)**
   - [x] 13.1 `hal` is arch-neutral: its 14 `target_arch` gates became capability flags
         (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`)
         declared per target in `.cargo/config.toml`; `src/hal` `target_arch` is now 0, both
@@ -751,7 +751,7 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         took `procfs`'s own gate, not a new capability name. `mmio::MmioNet` is the MMIO
         adapter as a `NetDevice` (persistent, like `MmioBlk`: the ring it posts stays posted),
         `check_net` opens it once, asserts the MAC and the TX queue **through that handle** and
-        publishes it, `main/aarch64.rs`'s `init_net` hands it to `net::init` +
+        publishes it, `board/aarch64.rs`'s `init_net` hands it to `net::init` +
         `net::spawn_service` (`M8_NET_STACK_OK`), and `lib.rs`'s gate is `target_os = "none"`
         with `mpos_net` declared by both machines. Measured: the aarch64 sweep stages 10 of
         the 14 std-side programs and passes **10/10** - including a TCP
@@ -1086,6 +1086,632 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         so a fix moves that test with it. Small, and written down rather than quietly fixed because
         the shape is published ABI: a seat manager reading `v_active` from a kernel that answers with
         a mode has a bug with no symptom until something switches consoles.
+  - [x] 13.21 the neutral checks become **one copy**, and the second machine's clock is measured against
+        them. Phase 15's first stages, landed here because each found a *machine* fact rather than a
+        refactor.
+        **What moved.** `check_mm`, `check_sched` (with its five scenarios and the run record),
+        `check_vfs`, `check_ipc` and `ensure_child` left the x86_64 body for
+        `src/board/checks/{mm,sched,vfs,ipc}.rs`, called by both bodies. The dispatch helper they share
+        (`linkat`-shaped: one entry into `syscall::linux_dispatch` from kernel context) lost its
+        `#[cfg(target_arch = "x86_64")]` with the move - another stale gate: it was written when only
+        the first machine had a table to dispatch into. The init seam became **one signature**,
+        `fn(&BootInfo) -> !`: the aarch64 machine layer no longer copies the archive's pointer and
+        length into two statics (`INITRAMFS_PTR`/`INITRAMFS_LEN` are gone) but stashes the address of
+        `boot`'s own `BootInfo` local - the same value the first machine's body is handed, whose
+        slices point into the direct map and whose frame never returns - so both machines read
+        `info.initramfs`. A misattached doc comment (the x86_64 handoff's prose sitting above
+        `check_mm`) went back onto `handoff_to_init`. Measured: x86 gate `pass=157 fail=0 (157 built)`
+        exit 33, aarch64 sweep `pass=27 fail=0`, host 512, both bare-metal clippy 0 errors, depgraph
+        8/8 within the ratchet, fmt clean - the x86_64 numbers *identical* to the run before the
+        move, which is what makes it a move.
+        **What adopting them on aarch64 cost, and what it found.** `checks::mm` and `checks::sched`
+        run green there (`M0_OK`, `M2_OK`, `M4_OK`, and the `pmm`/`hhdm`/slab/alternation lines), and
+        the second of them found a defect the machine had carried since its scheduler landed: **the
+        clock never preempted.** x86_64's timer handler does three things - `tick`, `charge_cpu`,
+        `preempt`, with EOI between the last two - and the aarch64 IRQ path did only the first, so a
+        task that never yielded kept the core for ever. Wiring the twin the same way made
+        `checks::sched`'s `preempted` scenario pass ("a task that never yielded was preempted for 10
+        ticks"), and then killed every EL0 program on the machine: the sweep's first test took a
+        level-3 translation fault at `0x221af0`, and the verdict's `/musl` helper never printed its
+        line. **That second failure is the real find.** A trap from EL0 leaves the program's resume
+        state in `SP_EL0`/`ELR_EL1`/`SPSR_EL1` - *system registers*, not on the stack - and the EL0
+        **interrupt** stub, unlike the sync one, saved none of them: it saved x0..x18/x29/x30 and the
+        FP state and returned. That is sound only while an IRQ always returns to the context it
+        interrupted, which is what it was; the moment the clock can preempt, the task is switched
+        out, another task's traps overwrite those three registers, and this task's `eret` resumes
+        into whatever they hold - i.e. into another address space's idea of a program counter. Fixed
+        in the stub (three words saved after the FP block and written back before the `eret`, with
+        the same "scratch registers before the register file" ordering the FP state needs, `#736`
+        frame, and `TRAP_IRQ_STATUS_OFFSET` asserted beside the other layout constants). With it in,
+        the sweep is `pass=27 fail=0` with preemption live, and the verdict's `/musl` helper runs.
+        **What preemption then cost the verdict, and the second fix.** `M6_INIT_OK` was printed after
+        the handoff, under the words "it has not run yet" - true only while nothing could preempt the
+        boot task on the way. With the clock live, a tick between the spawn and the print lets a
+        short init run to completion, and pid 1 leaving prints `INIT_EXITED` and **halts** the
+        machine: measured, the marker the verdict polls for was simply absent while the init had
+        clearly run. The spawn and the two lines now happen inside one interrupt-masked window, and
+        the lines go out through the machine's *polled* writer because `println!`'s queue can park a
+        writer and parking with interrupts off is a deadlock - the same rule the failure reports
+        beside it already followed.
+        **`checks::vfs`/`checks::ipc` on aarch64: shipped, once the stub below was fixed.** Both
+        reach their own markers on this machine (`M6_OK`, `M7_OK`, `M8_IPC_OK` - the syscall gate,
+        the ramfs root, a mounted tree, two tasks on one fd, the device set, pipes, the tty line
+        discipline and signals), and `cargo xtask boot-aarch64` is green with them wired. The
+        **verdict's** boot was not: it took an instruction abort at EL1 on the next preemption after
+        them - `EC 0x21`, `ELR_EL1 == FAR_EL1` at a direct-mapped address (`0xffff800043e4f000`),
+        which is where the inference in this paragraph went wrong. It read "the machine resumes into
+        a page-table frame", and the sweep's address (`0xffff80004309c000`) was one; the verdict's is
+        the *console's 559-byte transmit buffer*, a heap allocation. What the fault actually was is
+        §13.22: the kernel's own interrupt stub did not keep the resume state of the context it
+        preempted, so the task the clock took the core from resumed at whatever the last trap on the
+        core had left in `ELR_EL1`/`SPSR_EL1`. Both families therefore went back into the aarch64
+        body after that fix, which is why this entry's "measured after" lists their markers - and the
+        payload-shape correlation (the sweep's 34 initramfs members against the verdict's 3) is a
+        statement about *where the buffer landed and which task was preempted*, not about the checks'
+        assertions.
+        Measured after: `boot-aarch64` exit 0 through the full marker chain - the machine's own
+        `M4_CONSOLE_OK` … `M6_INIT_OK`, `INIT_EXITED` and the init program's `MPOS_*` lines, plus the
+        shared `M0_OK`, `M2_OK`, `M4_OK`, `M6_OK`, `M7_OK`, `M8_IPC_OK`; aarch64 sweep
+        `pass=27 fail=0` exit 0; x86 gate `pass=157 fail=0 (157 built)` exit 0; host 512; depgraph
+        8/8 within the ratchet; fmt clean; clippy 0 errors on both bare-metal targets.
+  - [x] 13.22 the kernel's own interrupt stub keeps the resume state it interrupted - the EL1 half of
+        §13.21's EL0 finding, and the abort that held two check families out.
+        **What was seen.** `EXCEPTION: synchronous`, `ESR_EL1 0x000000008600000f` (EC 0x21, an
+        instruction abort at the same EL), `ELR_EL1 == FAR_EL1`, at a page-aligned direct-map address
+        just after `check_serial_tx` had put its 512-byte line on the wire:
+        `0xffff800043e4f000` on the verdict's boot, `0xffff80004309c000` on the sweep's. It needed the
+        two shared check families wired (§13.21) to appear at all, which is what made it read like a
+        bug *in* them.
+        **How it was localized.** Three measurements, none of them a guess:
+        1. *QEMU's exception log* (`-d int`) showed the last two `eret`s before the abort both
+           returning to `0xffffffff80108048` - the task trampoline's `mov x0, x19`, one instruction
+           after it enables interrupts - with no exception in between. A `ret`/`br` into a data page
+           would have shown as a fetch with no eret before it; an `eret` to a stale address shows
+           exactly this.
+        2. *The registers at the abort*, caught at its vector entry under `gdb` (`hbreak` on the EL1
+           sync vector, `-S` so the breakpoint is armed before the kernel image exists): `x19 = 0x22f`
+           (559), `x20 = 0xffff800043e4f000` (the console's transmit buffer), `x30 =
+           mpos_task_trampoline + 16`. The CPU was executing the trampoline's `blr x20` with a *copy
+           loop's* scratch registers - i.e. a context that had no business being in the trampoline at
+           all.
+        3. *The stack*, read upward from `SP_EL1` while the machine sat in the halt loop: the EL1 sync
+           stub's 160-byte frame and its `bl sync` return address are where the faulting context's
+           `x0..x18`/`x30` are, which is how the interrupted register file above was attributed to the
+           boot task inside `check_serial_tx` (its `x1`/`x2`/`x10` all point into the 559-byte buffer).
+        **The mechanism.** An exception from EL1 does not put the interrupted `PC` and `PSTATE` on the
+        interrupted stack - the CPU writes them to `ELR_EL1`/`SPSR_EL1`, one pair per core - and the
+        EL1 IRQ stub called `irq`, which ends in `preempt`, which *switches tasks*. Saving `x0..x18`,
+        `x29` and `x30` is the call ABI's answer and it is not enough: the incoming task's own traps
+        overwrite the pair, so a preempted kernel context's `eret` returned to whatever the last trap
+        on the core had recorded. Measured consequence: the boot task, preempted mid-`check_serial_tx`,
+        resumed into the task trampoline that another task's dispatch had left in `ELR_EL1`, ran its
+        `blr x20` with the copy loop's `x20`, and fetched instructions from a heap buffer. §13.21 fixed
+        the EL0 twin of this (three words: `SP_EL0`, `ELR_EL1`, `SPSR_EL1`) and the EL0 stub's own
+        comment already argued the rule; the EL1 stub needed two words of the same shape and kept
+        none.
+        **The fix.** `arch/aarch64/vectors.rs`'s `__vec_irq` saves `ELR_EL1`/`SPSR_EL1` at
+        `TRAP_EL1_IRQ_STATUS_OFFSET` (176, after the 176 bytes of registers it already saved; frame
+        192, asserted beside the other layout constants) and writes them back through `x9`/`x10`
+        before the register restore, which is the only window they can be used in. The EL1 **sync**
+        stub deliberately still saves none, and it now says why: nothing on that path switches tasks
+        (two resolvers that allocate and copy), and a resolver taught to block would need the pair.
+        **Pins.** The boot-level counterfactual, measured: with the two families wired and this stub
+        unfixed, `boot-aarch64` fails 3 runs out of 3 at `check_serial_tx` with the abort above; with
+        the fix it is exit 0 end to end - and `xtask`'s verdict now *requires* `M6_OK`, `M7_OK` and
+        `M8_IPC_OK` in the chain, so the wiring that reaches the preempting path cannot be dropped
+        silently. What is *not* pinned is the stub itself: the natural clobber is a valid kernel text
+        address (another task's own interrupted `PC`), so a non-fatal corruption is invisible, and a
+        sharp pin would need an instrument that writes `ELR_EL1` - a machine register no kernel
+        operation writes - which `AGENTS.md` §3 rule 4 does not buy. That gap is the reason the
+        measurement above is written down with its addresses rather than summarized.
+        Measured after: `boot-aarch64` exit 0 with the full chain plus `M6_OK`/`M7_OK`/`M8_IPC_OK`;
+        aarch64 sweep `pass=27 fail=0` exit 0; `alpine-aarch64` exit 0 on `localhost login:`
+        (the machine's own userland, checks off); x86 gate `pass=157 fail=0 (157 built)` exit 33; host
+        512; depgraph 8/8 within the ratchet; fmt clean; clippy 0 errors on `x86_64-unknown-none`,
+        `aarch64-unknown-none`, the aarch64 loader and xtask.
+  - [x] 13.23 the boot's reporting, its exit hooks and its log sink become one copy each - Phase 15's
+        stages 15.4 and 15.5, and the first capability gates the input stack's own switch.
+        **What moved, and what was measured before it.** Five functions that were x86_64's alone:
+        `banner`, `check_boot_stack`, `park` (`hal::halt` on the second machine instead),
+        `report_stack_use` and `panic_context` (an empty `fn {}` on the second machine). Every line in
+        them is a function of `BootInfo`, the scheduler, or a register read, so they are now
+        `src/board/report.rs`, called by both bodies; the one machine question left in them -
+        "which register holds the stack pointer" - became `hal::Cpu::stack_pointer` (`rsp` / `sp`), so
+        the walk itself is not machine code. The panic walk also stopped carrying a *base constant*:
+        it recognizes return addresses inside `arch::kernel_sections().text`, which is the exact
+        answer rather than x86_64's `0xffff_ffff_8000_0000` floor, and one a port cannot get wrong.
+        The boot-stack canary was spelled **twice** - once in `mpos-boot`, once in
+        `board/x86_64.rs` - each with a comment claiming there was "no crate between" the two sides;
+        the leaf both already import (`crates/bootinfo`, which carries `HANDOFF_MAGIC`) has it now, so
+        the two ends cannot drift into a canary that reports a misspelling as an overflow. The second
+        machine gains the check itself: measured on the verdict's boot, `boot stack: intact after the
+        self-tests` and `boot stack: intact under hand_to_init` - the same two checkpoints, reading
+        the same word the loader wrote through the same `boot_stack_base` field.
+        **One exit-hook registry.** `steps::register_exit_hooks` is now the one list, in the one order
+        (locks, then the state keyed by the open file description: socket, inotify watch, evdev node,
+        uinput device), with the two input hooks under `mpos_input_registry`. Before it, x86_64
+        registered five hooks plus two `FD_CLOEXEC` ones and aarch64 one - the socket's - so the
+        second machine released a dying process's record locks and inotify watches never, and a
+        `FD_CLOEXEC` evdev position could not exist there to be told about. The *stack's* gates moved
+        with it: `drivers::virtio::input`, `drivers::uinput` and the `/dev/input` + `/dev/uinput`
+        block in `drivers/devices.rs` were `#[cfg(target_arch = "x86_64")]` and are now
+        `#[cfg(mpos_input_registry)]` - the capability the boot, sysfs' `build_input` and these hooks
+        all ask, so a port that lands the input stack flips one switch instead of editing four files.
+        **The net bring-up.** `net::init` + `net::spawn_service` + the "up at 10.0.2.15/24 …
+        MAC" line were written in both bodies; they are `steps::bring_up_net(dev)` now, and each
+        machine keeps only "find the adapter" (PCI bus vs device-tree MMIO window) and its own honest
+        line when there is none. x86_64's line had no MAC and aarch64's did; the shared one prints it
+        on both. The `mpos.selftest` question was the same story at one line's scale - a closure in
+        one body, an `.any(..)` in the other - and it is `boot::cmdline_has(word)` now, next to
+        `boot::cmdline` whose grammar it is: two boots that read the word differently are two boots
+        that run different boot sequences for one command line.
+        **The log sink, and a gate whose premise had expired.** `src/logging.rs`'s subscriber - the
+        whole `tracing` sink - was `#[cfg(all(target_os = "none", target_arch = "x86_64"))]` with the
+        reason written beside it: "aarch64 has neither [console nor clock] until its console (stage 4)
+        and clock (stage 1c) land". Both landed stages ago and the gate stayed, so the second machine
+        had **no sink at all** and every `tracing` line in shared code was silently dropped there. It
+        is `#[cfg(target_os = "none")]` now - one subscriber, one level vocabulary, both machines -
+        and the honest measurement is that this buys parity rather than output: the kernel has **0**
+        `tracing`/`log` call sites on *either* machine, so nothing emits into the sink yet. The
+        aarch64 kernel grows by it (1817 → 1843 KiB), and "the kernel's logging story is
+        unbuilt" is the gap that leaves, named here rather than papered over by the flip.
+        Measured after: `boot-aarch64` exit 0 with the full chain, the two `boot stack: intact` lines
+        and the banner (`hhdm offset`, `memory map (16 regions)`, `allocatable: 205 MiB`) on the
+        second machine's wire; aarch64 sweep `pass=27 fail=0` exit 0; `alpine-aarch64` exit 0 at
+        `mpos login:` (its own userland, checks off, banner and canary check included); x86 gate
+        `pass=157 fail=0 (157 built)` exit 33 with host 512 - and the x86_64 boot still printing
+        `boot stack: intact after the self-tests` / `under spawn_init` from the shared function; both
+        bare-metal targets and the aarch64 loader build; depgraph 8/8 within the ratchet; fmt clean;
+        clippy 0 errors on `x86_64-unknown-none`, `aarch64-unknown-none`, the aarch64 loader and
+        xtask.
+  - [x] 13.24 the second machine's input stack is the **same registry**, and the port's flip is one
+        error - Phase 15's stage 15.2, first class (the input registry).
+        **Measured before the seam was designed** (§13.4's rule: measure the flip before designing the
+        seam). Declaring `mpos_input_registry` for `[target.aarch64-unknown-none]` and building costs
+        exactly **one** error: `E0432: unresolved import super::hal::transport_all` at
+        `drivers/virtio/input.rs:40`, whose item is `#[cfg(target_arch = "x86_64")]` in
+        `drivers/virtio/hal.rs`. The plan predicted **four** (three more in `vfs::sysfs::build_input`);
+        those are gone because §13.23 flipped that block, the devfs block and the exit hooks from
+        `target_arch` to the capability - so the flip is one word in `.cargo/config.toml` and one
+        import, which is what the capability was introduced to mean. Everything else the second
+        machine gains by declaring it (`drivers::uinput`, `/dev/input` + `/dev/uinput`,
+        `/sys/class/input`) already compiles the moment the word is there.
+        **The contract.** `drivers::virtio::InputDevice` is what the registry holds: the device's name,
+        `ev_bits`, `abs_info`, `prop_bits` and `ids` - the capability picture a reader asks for before
+        any event - and `pop_pending_event`. `VirtioInputDev<T: Transport>` is the one implementation
+        of those six over the crate's `VirtIOInput`, so a second transport supplies a `T` and no second
+        copy of them; `input.rs`'s registry, `read_caps` and `service` traded
+        `VirtIOInput<HalImpl, PciTransport>` for `Arc<dyn InputDevice>`. The one door in is
+        `input::register(devices)`, which takes the contract. `input::init()` - the PCI enumeration -
+        remains the first machine's way in and is `#[cfg(target_arch = "x86_64")]`;
+        `mmio::input_device(virt, size)` is the second's.
+        **The device stays open.** `mmio::probe_input` opened the window, negotiated, read the device's
+        configuration-space identity and dropped it - a proof that the transport reached the class,
+        and nothing anyone could read. It is `mmio::input_device` now: the live handle goes to the
+        registry, and from there it *is* the machine's keyboard. `check_input` (still in `devices()`,
+        where the device tree is read and before there is a `/dev`) opens it and registers it, and the
+        aarch64 boot's wire carries `virtio-input: event0: QEMU Virtio Keyboard`.
+        **The marker moved, and why.** `M8_INPUT_OK` used to be printed by the transport probe. The pin
+        this class can carry is the registry's own - event flow needs a keystroke and the harness is
+        headless - and reading the registry *through a path* needs a mounted `/dev`, which exists only
+        after `check_dev`. So the class's marker is `check_input_registry()`'s now, and it asserts three
+        things: the registry is not empty, `/dev/input/event0` resolves through the mounted `/dev`, and
+        the node reports `rdev() == (13, 64)` - evdev's own pair, the one udev keys its database by and
+        libinput finds the device through, which a node reporting `0,0` fails on a machine that looks
+        healthy everywhere else. `M8_INPUT_FAILED` is unchanged and still the terminator, used by both
+        failure points (a window that will not open, a registry that reads back wrong).
+        **The pump.** The task that harvests the device rings was wholly x86_64's (`spawn_service`),
+        because it also drove `net::vsock` and the GPU's `VIRTIO_GPU_EVENT_DISPLAY`. It is gated on
+        `mpos_input_registry` now, with those two halves `#[cfg(target_arch = "x86_64")]` where their
+        drivers live - so both machines run one shared task's input half and the second machine does not
+        grow a second copy of the loop. The aarch64 body starts it beside `init_net`, which is where a
+        scheduler exists for it to park in.
+        Measured after: `boot-aarch64` exit 0 with
+        `M8_INPUT_OK: the evdev registry holds 1 device(s), /dev/input/event0 resolves as (13, 64)`,
+        no `EXCEPTION`; aarch64 sweep `pass=27 fail=0` exit 0; `alpine-aarch64` exit 0 at `mpos
+        login:` carrying the same two input lines (its checks run on every boot); x86 gate
+        `pass=157 fail=0 (157 built)` exit 33 with host 512; depgraph 8/8 within the ratchet; fmt
+        clean; clippy 0 errors on `x86_64-unknown-none`, `aarch64-unknown-none`, the aarch64 loader
+        and xtask.
+  - [x] 13.25 the second machine's host-driven console is the same `/dev/hvc0` - Phase 15's stage
+        15.2, second class (virtio-console).
+        **Measured before the seam was designed** (§13.4's rule). Un-gating
+        `drivers/virtio/console.rs` for aarch64 costs **one** error: `E0432: unresolved import
+        super::hal::transport`, the PCI probe helper the module's `init` reaches for. Nothing else in
+        it is x86_64's - the `CharDevice` face, the blocking read and the write-through are pure
+        policy over the crate's driver. The device side was measured too, because a class nobody can
+        attach is not a class: `qemu-system-aarch64 -device help` answers `virtio-serial-device` (bus
+        `virtio-bus`, i.e. the MMIO transport) and `virtconsole`, so the second machine can carry the
+        same shape the first machine attaches on PCI (`virtio-serial-pci` + `virtconsole`).
+        **The contract.** `drivers::virtio::ConsolePort` is what the kernel holds: `size`, `drain`,
+        `send` - the three things `/dev/hvc0`'s stream face and the boot's own probe ask. The crate
+        supports one port and fixes its queues at 0 and 1, so `virtio-serial-device` carrying a single
+        `virtconsole` is exactly its shape. `VirtioHvc<T: Transport>` is the one implementation of
+        the three over the one crate driver - so the second transport supplies a `T`, not a second
+        copy - and it lives here rather than in `mod.rs` because this module is compiled on both
+        machines, which `input` is not (it is capability-gated, and that is why its adapter is beside
+        its contract). The global is `Arc<dyn ConsolePort>` now, `console::install(port)` is the one
+        door, and `init_global()` - the PCI probe - is `#[cfg(target_arch = "x86_64")]`.
+        **The machine.** `mmio::console_device(virt, size)` opens the window the device tree named as
+        the same `VirtIOConsole` over `MmioTransport`. `check_console` (in `devices()`) finds the
+        window whose `DeviceID` is `3`, opens it, installs it, and exercises the write face with a
+        probe line the port's queue has to take - which claims nothing about a reader, because the far
+        end is a host socket. `check_console_dev()` runs after `check_dev` and resolves both names the
+        port answers to, `/dev/hvc0` and the `hvc` alias Linux keeps for "the first one", through the
+        *mounted* `/dev`. The devfs gate went with the transport: the `#[cfg(target_arch = "x86_64")]`
+        on the `hvc0` registration is deleted, so the node is published by whichever machine opened
+        the port - absent, not faked, on a machine whose window never opened.
+        **The marker.** `M8_CONSOLE_OK` is not a terminator and `M8_CONSOLE_FAILED` is;
+        `xtask/src/aarch64.rs`'s `TERMINATORS` grew by that one line (24 → 25), and `aarch64_qemu`
+        attaches the device: `-chardev socket,id=console0,path=build/aarch64-console.sock,server=on,wait=off`
+        beside `-device virtio-serial-device -device virtconsole,chardev=console0`. The socket is the
+        first machine's arrangement (`build/…/console.sock`): `wait=off` keeps a machine with no
+        reader from blocking on the port it just opened.
+        **Named, not fixed.** `/dev/hvc0`'s device number is `(0, 0)` on **both** machines, because
+        `DevFs::register` gives a `CharDevice` no number - Linux's `hvc0` is `229:0`, and
+        `register_id` is the door for a real one. The verdict therefore asserts the two names resolve
+        and not a number, since there is no number to pin; fixing it would change the first machine's
+        node too and belongs with whichever class next touches the tty numbering, not here.
+        Measured after: `boot-aarch64` exit 0 with `virtio-console: up at /dev/hvc0` and
+        `M8_CONSOLE_OK`, no `EXCEPTION`; aarch64 sweep `pass=27 fail=0` exit 0; `alpine-aarch64` exit
+        0 at `mpos login:` carrying the same two console lines; x86 gate `pass=157 fail=0 (157 built)`
+        exit 33 with host 512; depgraph 8/8 within the ratchet; fmt clean; clippy 0 errors on
+        `x86_64-unknown-none`, `aarch64-unknown-none`, the aarch64 loader and xtask.
+  - [x] 13.26 the second machine's display is the **same card and the same render task** - Phase 15's
+        stage 15.2, third class (virtio-gpu + framebuffer console), and the one class whose seam was
+        not one helper.
+        **Measured before the seam was designed** (§13.4's rule), and the measurement was two-sided
+        in a way the first two classes were not. Un-gating `virtio/gpu.rs` + `gpu_ctrl.rs` + `video/`
+        + `drm/` and declaring `mpos_framebuffer_console` for aarch64 costs **3 errors**, all PCI-only
+        hal helpers inside `gpu.rs`'s `init` (`transport`, `super::hal::device_config`,
+        `super::hal::claim_drm_card`) - a number that reads like `net`'s and is not. The great majority
+        of the stack needed nothing: **one** `pci::` reference in the whole 7.6 kLoC of `gpu.rs`,
+        `gpu_ctrl.rs`, `drm.rs` (6680 lines) and `video/render.rs` (946), and `src/console.rs`'s
+        framebuffer arm already had `#[cfg(not(mpos_framebuffer_console))]` no-ops on the other side.
+        What the number hid is that **`virtio-drivers`' `Transport` is not object-safe** -
+        `begin_init<F: Flags + BitAnd + Debug>` is a generic method and `VirtQueue::new`/`add_notify_wait_pop`
+        take `&mut T where T: Transport` - so there is no `Box<dyn Transport>` shortcut and the type
+        had to be erased somewhere else.
+        **Where it was erased.** `gpu_ctrl.rs`'s `Gpu` became `Gpu<T: Transport>`, and the new
+        `GpuDevice` trait names exactly the sixteen commands `video::render` sends (and nothing else:
+        a method no caller has is a promise nothing keeps) with `impl<T: Transport + Send> GpuDevice
+        for Gpu<T>` delegating to the inherent ones. `render.rs` - which owns the one device in a
+        `static` and is the only context that may call `flush` - holds `Box<dyn GpuDevice>` and passes
+        `&mut dyn GpuDevice` to its helpers, so the render task, the DRM/KMS layer above it and the
+        framebuffer below it are one copy on both machines. That is the whole of the refactor: no
+        command, no order and no default changed, which is what `t-fb` and `t-drm` in the x86_64
+        sweep are the evidence for.
+        **The machine's half.** `VirtioGpuDev::install(device, config)` is the one door - it takes the
+        *device*, asks the host's resolution, builds the resource and pins the frames, so both
+        machines share it. `gpu.rs::init_global()` stays the first machine's: it probes the PCI bus,
+        records the function's device-configuration window (`super::hal::device_config`) and *claims*
+        the function as the card's home for `sysfs` (`super::hal::claim_drm_card`). The second
+        machine's is `mmio::gpu_device(virt, size)`: it opens the window the tree named, and its
+        configuration window is one constant offset - `virt + 0x100`, the virtio-mmio device-specific
+        space - where PCI has to walk capabilities to find the same bytes. `check_gpu` (in `init`,
+        before `check_dev`) finds the window whose `DeviceID` is `16`, opens it, and spawns the render
+        task; it stands there rather than in `devices()` because the task needs the scheduler
+        `steps::start_scheduler` started, and before `check_dev` because that call is what publishes
+        `/dev/fb0`. `check_gpu_dev()` runs after it and asserts three things: the card is installed,
+        `/dev/fb0` resolves through the *mounted* `/dev`, and one row of pixels (`width * 4` bytes)
+        reads back whole - a node whose length was a claim rather than a mapping short-reads there.
+        It also asserts the render task is running, which is the part a class with no compositor
+        could otherwise fake: `write(2)` to this node parks until that task has flushed, so a card
+        installed without it is a node a writer blocks on for ever. A pixel *value* is deliberately
+        not asserted - the buffer holds whatever the host last put there, and a boot has no way to
+        say what that is; the write path is `t-fb`'s, and the sweep runs it on this machine.
+        **The framebuffer console came with it.** `mpos_framebuffer_console` is declared for aarch64,
+        so `src/console.rs`'s framebuffer arm is live there - the grids paint into the scanout and
+        `grids_live()` still decides whether the kernel's log goes to the screen, so a boot whose
+        console list names the wire alone is unaffected (which is why the verdict and Alpine boots
+        read identically before and after).
+        **Named, not fixed.** The second machine has no `/dev/dri/card0` and no `/sys/class/drm`: both
+        hang off a *PCI function*, which only the first machine has, and `sysfs`'s `build_drm` finds
+        its card through that mark. The card itself is the same device - `t-drm`'s subject - so this
+        is a statement about the bus and the sysfs tree, not about the display. The DRM device node
+        is the next class's problem if it is one at all.
+        Measured after: `boot-aarch64` exit 0 with `virtio-gpu: 1280x800, 4000 KiB at /dev/fb0` (the
+        host's own preferred mode, followed rather than assumed) and `M8_GPU_OK`, no `EXCEPTION`;
+        aarch64 sweep `pass=27 fail=0` exit 0; `alpine-aarch64` exit 0 at `mpos login:` carrying the
+        same card lines; x86 gate `pass=157 fail=0 (157 built)` exit 33 with host 512 and `t-fb`/
+        `t-drm` green; depgraph 8/8 within the ratchet; fmt clean; clippy 0 errors on
+        `x86_64-unknown-none`, `aarch64-unknown-none`, the aarch64 loader and xtask; warning counts
+        unchanged on both machines (aarch64 lib 47, x86_64 lib 1) - 7.6 kLoC of graphics code joined
+        the second machine's build and added no lint.
+  - [x] 13.27 the second machine's `/dev/dsp` is the same sound card - Phase 15's stage 15.2, fourth
+        class (virtio-sound).
+        **Measured before the seam was designed** (§13.4's rule). Un-gating
+        `drivers/virtio/sound.rs` for aarch64 costs **one** error: `E0432: unresolved import
+        super::hal::transport` - the same single helper `console` cost, and for the same reason (the
+        PCI probe is the only machine-specific line in the module). The device side was measured too:
+        `qemu-system-aarch64 -device help` answers `virtio-sound-device` (bus `virtio-bus`, the MMIO
+        transport), and the audio backend the first machine already uses (`-audiodev none,id=snd0` - a
+        backend that consumes the stream and plays silence) is QEMU's, not the machine's.
+        **The contract.** `drivers::virtio::SoundCard` is the three methods the device face and the
+        boot actually ask for: `format`, `configure`, `play`. `VirtioSnd<T: Transport>` is the one
+        implementation, so the card's whole OSS face - the parameter ioctls, the rate rounding, the
+        period-sized staging buffer, the blocking hand-off - is one copy, and a second transport
+        supplies only a `T`. `sound::install` is the one door; `install_probed` holds the probe's
+        absent-vs-refused distinction (a machine with no card is a quieter boot, a card that answered
+        and would not play is worth a line); `init_global()` - the PCI probe - is
+        `#[cfg(target_arch = "x86_64")]`. The `Probe` enum became `pub` because `VirtioSnd::new` now
+        returns it, which is the one API change the split needed.
+        **The machine and the pin.** `mmio::sound_device(virt, size)` opens the window the tree named
+        and hands it to `install_probed`, so the stream listing, the rate intersection, the format
+        check and the initial `SET_PARAMS`/`prepare`/`start` are the first machine's code running over
+        the second machine's transport. `check_sound` (in `devices()`) finds the window whose
+        `DeviceID` is `25` and prints the same `44100 Hz, 2 channels` line the first machine prints;
+        `check_sound_dev()` runs after `check_dev` and asserts the card is installed, `/dev/dsp`
+        resolves through the *mounted* `/dev`, and the stream takes a 512-byte burst in full. That
+        last one is the data path - `pcm_xfer` through the crate, into the host's `none` backend - and
+        not just the config space, which is the one thing a node that merely resolves could otherwise
+        fake. The burst is silence on purpose: the backend plays nothing, and a machine whose backend
+        did play would still be asked for silence rather than noise.
+        **Named gap, in this class's own coverage.** The OSS *parameter* face
+        (`SNDCTL_DSP_SPEED`/`CHANNELS`/`SETFMT` and their cousins) is exercised by `user/abitest`'s
+        `t-dsp`, which the aarch64 sweep does not carry - and `check_sound_dev` deliberately does not
+        move the stream's rate, because a boot check that rebuilt the running stream would be changing
+        the machine it is checking (§13.14's rule). So this class's marker says the card is there and
+        moves bytes; it does not say the ioctls work on this machine.
+        **One flake, measured and not believed.** The first x86_64 gate run after this change reported
+        `FAIL t-clock-gettime` on its monotonicity line ("two reads never go backwards": two successive
+        `CLOCK_REALTIME` reads, where the wall clock is the CMOS second plus a tick-derived fraction
+        sampled around it). Nothing in this class touches the clock, and the re-run is
+        `pass=157 fail=0 (157 built)` exit 33 - so it is a wall-clock flake, recorded rather than
+        fixed: it is neither this class's subject nor new (the same shape as the `rand` flake
+        `AGENTS.md` §5 already names).
+        Measured after: `boot-aarch64` exit 0 with `virtio-sound: 44100 Hz, 2 channels at /dev/dsp`
+        and `M8_SOUND_OK`, no `EXCEPTION`; aarch64 sweep `pass=27 fail=0` exit 0; `alpine-aarch64`
+        exit 0 at `mpos login:` carrying the same card lines; x86 gate `pass=157 fail=0 (157 built)`
+        exit 33 with host 512; depgraph 8/8 within the ratchet; fmt clean; clippy 0 errors on
+        `x86_64-unknown-none`, `aarch64-unknown-none`, the aarch64 loader and xtask; warning counts
+        unchanged on both machines.
+  - [x] 13.28 the second machine's `AF_VSOCK` is the same family over the same kind of device - Phase
+        15's stage 15.2, fifth class (virtio-vsock), and the one class whose device the host cannot
+        always provide.
+        **Measured before the seam was designed** (§13.4's rule). Un-gating `drivers/virtio/vsock.rs`
+        for aarch64 costs **one** error: `E0432: unresolved import super::hal::transport` - the same
+        single helper `console` and `sound` each cost. And, as with the input registry, the number hid
+        the design: `VirtioVsock` held `PciTransport` *inside* its own struct (the trap `AGENTS.md` §5
+        names), so the module could not compile for a second machine until the type was erased. The
+        device side was measured too: `qemu-system-aarch64 -device help` answers `vhost-vsock-device`
+        (bus `virtio-bus`, the MMIO transport) beside the PCI form, and the crate's
+        `DeviceType::Socket` is `19` - the `DeviceID` an MMIO window answers.
+        **The contract.** `drivers::virtio::VsockDevice` was already there (it is what
+        `src/net/vsock.rs` holds), so this class needed no new contract: `VirtioVsock` became
+        `VirtioVsock<T: Transport>` - the crate's `VirtIOSocket` over whatever `Transport` a machine
+        opened - and its ten methods, which the family's phases, ports and accept queue all sit on,
+        are one implementation over the one crate driver. The PCI probe became `init_global()` (a free
+        function answering `Arc<dyn VsockDevice>`, `#[cfg(target_arch = "x86_64")]`), the module lost
+        its `#[cfg(target_arch = "x86_64")]`, and `net::vsock::init(dev)` is handed the contract
+        rather than a bus, so nothing above `drivers` learns which machine it is on.
+        **The machine and the pin.** `mmio::vsock_device(virt, size)` opens the window the tree named
+        and hands the device to `net::vsock::init`; the board's `check_vsock` (in `devices()`) finds
+        the window whose `DeviceID` is `19`, prints the same `virtio-vsock: guest cid N answers on
+        AF_VSOCK` line the first machine prints, brings the family up and asserts it answers the
+        device's own CID - the one claim `getsockname` rests on - then prints `M8_VSOCK_OK`. The pump
+        was already shared: `virtio::spawn_service`'s vsock half lost its `#[cfg(target_arch =
+        "x86_64")]` and is now the contract's, like the input half before it (a machine whose device
+        never probed has no family, and `net::vsock::service` returns without touching one).
+        **The class no host can always provide, and the loud skip.** vsock is the one class this phase
+        has driven whose device QEMU does **not** emulate in userspace: `vhost-vsock-*` is backed by
+        the host's vhost kernel module, and QEMU *refuses to start* a machine naming the device without
+        `/dev/vhost-vsock`. Attaching it unconditionally would stop `boot-aarch64` booting on a bare
+        host - the trade `machine.toml` already refuses for the first machine ("a boot that never
+        starts is worse than a machine with no vsock"). So xtask attaches
+        `vhost-vsock-device,guest-cid=4` only when `/dev/vhost-vsock` exists (CID `4`, not the first
+        machine's `3`, so the two machines' boots can be up at once without colliding), requires
+        `M8_VSOCK_OK` only then, and otherwise prints which case it took - "the host has no
+        /dev/vhost-vsock, so this boot attaches no vsock device and M8_VSOCK_OK is not required" - and
+        its one-line summary says "seven devices" rather than "eight". The skip is never silent: the
+        kernel says the absence in its own voice too (`virtio-vsock: no device on the tree; AF_VSOCK
+        answers EAFNOSUPPORT`). `M8_VSOCK_FAILED` (a window that exists and will not open) is a
+        terminator, `M8_VSOCK_OK` is not (`TERMINATORS` 27 → 28).
+        **A correction found in passing.** `virtio::spawn_service` also drove the GPU's
+        `VIRTIO_GPU_EVENT_DISPLAY` poll under the same `#[cfg(target_arch = "x86_64")]`, and its
+        comment still said the second machine had "no GPU driver yet" - false since §13.26. That gate
+        went with the vsock one, so the shared task now polls everything both machines have, and the
+        poll is honest with no card (`CONFIG` is 0, so it answers `false` and costs one read a tick).
+        Measured after: `boot-aarch64` exit 0 with `virtio-vsock: guest cid 4 answers on AF_VSOCK` and
+        `M8_VSOCK_OK`, no `EXCEPTION`; the skip path was measured too (the host check forced false for
+        one run): exit 0, the kernel's absence line, xtask's skip line, and a summary claiming seven
+        devices and no `M8_VSOCK_OK`; aarch64 sweep `pass=27 fail=0` exit 0; `alpine-aarch64` exit 0 at
+        `mpos login:` carrying the same vsock line; x86 gate `pass=157 fail=0 (157 built)` exit 33 with
+        host 512; depgraph 8/8 within the ratchet; fmt clean; clippy 0 errors on
+        `x86_64-unknown-none`, `aarch64-unknown-none`, the aarch64 loader and xtask; warning counts
+        unchanged on both machines (aarch64 lib 47, x86_64 lib 1).
+  - [x] 13.29 the second machine's `/mnt/share` is the same host share - Phase 15's stage 15.2, sixth
+        class (virtio-9p), and the one that cost three separate findings, two of them defects the
+        first machine had carried all along.
+        **Measured before the seam was designed** (§13.4's rule). Un-gating `drivers/virtio/fs9p.rs`
+        *and* `vfs/p9.rs` for aarch64 costs **one** error: `E0432: unresolved import
+        super::hal::transport_all` - the same single helper `console`/`sound`/`vsock` each cost. The
+        design cost the number hid was the usual one: `Virtio9p` held `PciTransport` inside its own
+        struct and `vfs/p9.rs` named `Arc<Virtio9p>`, so the type had to be erased again. The device
+        side was measured too: `qemu-system-aarch64 -device help` answers `virtio-9p-device` (bus
+        `virtio-bus`, the MMIO transport) beside the PCI form, and the crate's `DeviceType::_9P` is
+        `9` - the `DeviceID` an MMIO window answers.
+        **Finding 1: the probe had no caller.** `fs9p::init_global()` - the only function that fills
+        the `DEVICES` registry - was called from nowhere in the tree. So `fs9p::devices()` was always
+        empty, `mount_share()` printed `virtio-9p: no share on the bus` on **every** boot of **both**
+        machines, and `/mnt/share` was never mounted - while QEMU exported `-virtfs
+        ...,mount_tag=hostshare` on each of them. Measured in the logs (`build/serial.log` line 61,
+        `build/test-serial.log` line 101) and by history (`git log -S 'fs9p::init_global'` never
+        found the string, so the call never existed - the mount was written against a registry
+        nothing filled). PLAN had the *symptom* on record - §6's DRM block already notes "the boot
+        prints `virtio-9p: no share on the bus`, so there is no file channel into the guest" - as an
+        instrument note, with no remediation. The driver, the client and the `mount -t 9p` dispatch
+        were all complete and host-tested, and none of them had ever run.
+        **Finding 2: the client speaks a dialect this host's QEMU refuses.** With the probe wired, the
+        mount failed with `Unsupported`. Measured, in one boot, by asking for each dialect in turn:
+        QEMU 11.1.1 answers `"unknown"` to a plain `9P2000` `Tversion`, and `9P2000.u` to a `9P2000.u`
+        request (and `9P2000.L` to `.L`). So the plain dialect the client asked for is one no modern
+        server serves - a second, independent reason the share was unreachable. The client now speaks
+        **9P2000.u**: the version string, `n_uname` on `Tattach`, the `extension`/`n_uid`/`n_gid`/
+        `n_muid` tail on `Twstat`'s `statu` record. Everything else on the wire is unchanged - walk,
+        open, read, write, clunk, remove and `Ropen`/`Rcreate`'s `iounit` are the same in both
+        dialects - and `parse_stat` reads only up to `name`, so `.u`'s tail is stepped over rather
+        than parsed. `Rerror` still carries the prose `ename` the client maps by phrase; `.u`'s
+        `ecode` is deliberately unused (the phrase mapping is what the host tests pin, and QEMU sends
+        usable prose).
+        **The seam.** `drivers::virtio::P9Device` is the two methods the client and the mount table
+        ask for (`mount_tag`, `request`); `Virtio9p<T: Transport>` is the one implementation, so the
+        fid table, the `Twalk`/`Tread` encoding and the `Inode` mapping above it are one copy whichever
+        bus answered. `fs9p::install(devices)` is the one door; `init_global()` (the PCI probe) stays
+        the first machine's; `mmio::p9_device(virt, size)` is the second's; `vfs/p9.rs` holds
+        `Arc<dyn P9Device>`; and the `mount -t 9p` dispatch arm lost its `#[cfg(not(target_arch =
+        "aarch64"))]`. `mount_share()` moved out of `board/x86_64.rs` into the shared
+        `board/steps.rs`, and that move is what made the second machine's share possible at all: it
+        was the *probe* that was missing there, not the mount, and a mount written twice would have
+        hidden which.
+        **The pins, one per machine's convention.** The second machine's is `check_p9` (in `devices()`
+        - find every `DeviceID` 9 window, open it, `fs9p::install` the lot) plus `check_p9_dev()`
+        after `switch_root()` - `/mnt/share` resolves and `mpos-9p-probe`, a file xtask writes into
+        the exported directory (`utils::lay_p9_share`), reads back through the VFS: the bytes travel
+        host -> 9P2000.u -> `vfs::p9` -> the mount table, so a share that merely mounted fails there.
+        The first machine's is `user/abitest`'s `t-9p`: the boot's own `/mnt/share` serves the probe,
+        a program's own `mount -t 9p hostshare /mnt/t-9p` reaches the same bytes over the syscall
+        path, and an unexported tag answers `ENOENT`. It runs on the first machine only - the aarch64
+        sweep stages the `std`-side suite, not `abitest` - and it is the program that fails, loudly,
+        if the probe call is ever dropped again.
+        **And the parser joins `fuzz/`.** `parse_stat` walks a record whose own length word decides
+        where it ends, over bytes a server chose, and the listing reader steps by the count it
+        answers - so it is now driven directly by `fuzz/fuzz_targets/p9_stat.rs`, asserting that a
+        placed record lies inside its buffer. It is `pub` for that; `Stat` is `pub` with private
+        fields to keep the interface honest (AGENTS §3 rule 2 - the p9 wire half had no target
+        before, which this closes).
+        Measured after: `boot-aarch64` exit 0 with `virtio-9p: "hostshare" exported over MMIO`,
+        `"hostshare" mounted at /mnt/share` and `M8_P9_OK: /mnt/share is the host share over MMIO,
+        mpos-9p-probe read back (39 bytes)`, no `EXCEPTION`; aarch64 sweep `pass=27 fail=0` exit 0;
+        `alpine-aarch64` exit 0 at `mpos login:` carrying the same three lines; x86 gate `pass=158
+        fail=0 (158 built)` exit 33 with host 513 (was 512; `t-9p` is the 158th) and the test boot's
+        log carrying `virtio-9p: "hostshare" mounted at /mnt/share` and `=== PASS t-9p`; depgraph 8/8
+        within the ratchet; fmt clean; clippy 0 errors on `x86_64-unknown-none`,
+        `aarch64-unknown-none`, the aarch64 loader and xtask; warning counts unchanged on both
+        machines (aarch64 lib 47, x86_64 lib 1); the new fuzz target compiles
+        (`cargo check --bin p9_stat --target x86_64-unknown-linux-gnu`). `TERMINATORS` 28 → 29.
+  - [x] 13.30 a procfs without `/proc/<pid>/environ` made OpenRC mount over a live `/proc` - the
+        fourth `[ !! ]` the Alpine boot hid, and the first one to hide behind a *passing* verdict.
+        OpenRC's `init.sh` decides whether `/proc` still needs mounting by reading
+        `/proc/self/environ` twice under two different values of a variable it sets on the command
+        line (`VAR=a md5sum /proc/self/environ` against `VAR=b md5sum ...`) and treating two
+        *different* digests as proof that a live procfs is already there; identical digests mean the
+        path is stale cruft in the root filesystem, which is the case the test exists to catch. This
+        kernel answered `ENOENT` at that name, so `[ -e /proc/self/environ ]` failed, the check never
+        ran, and OpenRC concluded "not mounted" and mounted over the procfs the disk `/init` had
+        already mounted: `mount: mounting proc on /proc failed: Resource busy`, the `/proc` service
+        reporting `[ !! ]` - while `cargo xtask alpine-aarch64` still reported success, because it
+        keys on `login:` and the runlevel carries on past a failed service either way. The gap was in
+        the *ABI*, not the boot: `Task` already carried `argv` for `/proc/<pid>/cmdline` and had no
+        `env` to carry the environment beside it, so `execve`'s `envp` laid the block on the initial
+        stack and was then dropped. `Task` and `TaskSnapshot` now hold `env` - set by `spawn_init`,
+        `try_spawn_user` and `exec_replace`, inherited by `fork` and by `CLONE_THREAD` - and
+        `/proc/<pid>/environ` and `/proc/<tid>/environ` read it back NUL-separated, present but empty
+        for a task that was never exec'd, which is Linux's own shape. The verdict grew the pin that
+        was missing: `openrc_failure` scans the log for openrc's marker (stripping the escapes that
+        make it coloured) and names the service by its own line, so a failed service now fails the
+        command rather than sitting in a log nobody greps. Measured after: the same boot prints
+        `* /proc is already mounted`, carries **no** `[ !! ]` line anywhere, and reaches `mpos login:`
+        in 13 s, exit 0; `boot-aarch64` unchanged (full chain, `INIT_EXITED`); aarch64 sweep
+        `pass=27 fail=0`; x86 gate `pass=158 fail=0 (158 built)` exit 33; the new xtask unit test
+        `an_openrc_service_failure_is_named_by_its_own_message` pins the checker against the captured
+        failing block, escapes and all; fmt clean.
+  - [x] 13.19 `reboot(2)` answers Linux's shape on **both** machines - two mechanisms behind one
+        symptom, and the symptom was on every aarch64 boot.
+        **What was seen.** `mpos: syscall 142 -> ENOSYS`, once, between the kernel's handoff and the
+        login prompt of the second machine's Alpine boot. `142` is `__NR_reboot` on arm64 (it is
+        `sched_setparam` on x86_64), and the caller is busybox `init`, which asks for
+        `LINUX_REBOOT_CMD_CAD_OFF` about a second into its startup - the call that takes
+        Ctrl-Alt-Del for the `::ctrlaltdel:` line of `/etc/inittab`. The kernel's own comment beside
+        the handler had already measured that caller ("the first thing that ran after the handover -
+        busybox init - asked for all of them within a second of starting"), and on x86_64 it is
+        served.
+        **Mechanism 1: a stale gate.** The dispatch arm and the handler were both
+        `#[cfg(not(target_arch = "aarch64"))]`, written when a *stop* word ended at the x86_64
+        `isa-debug-exit` port. That port is a `hal` capability now (`hal::exit_qemu`, which a machine
+        without `mpos_qemu_debug_exit` answers by halting), and §14.3's S2 record says in as many
+        words that this is what the second machine's `reboot` path should get "rather than a second
+        body of code" - so the gate was a marker left behind by the capability, and nothing in the
+        handler names a register, a port or a machine. Both gates deleted.
+        **Mechanism 2: the words are 32 bits wide.** The pin written for mechanism 1 then failed on
+        *both* machines, and not vacuously: `reboot(LINUX_REBOOT_CMD_CAD_ON)` was `EINVAL` while
+        `CAD_OFF` (zero) was served. Linux's entry point is
+        `reboot(int magic1, int magic2, unsigned int cmd, void *arg)`, so the kernel narrows each
+        word to its low 32 bits - and it is the *libc's* prototype that decides what lands in the
+        64-bit register: musl declares `reboot(int type)`, so every word at or above `2^31` arrives
+        **sign-extended** (`0x89abcdef` reaches the kernel as `0xffffffff89abcdef`), which the
+        full-word comparison read as a command no kernel knows. Three of the five words are up there -
+        `CAD_ON`, `ENABLE_CAD` and `HALT_SYSTEM` - so busybox `init`'s shutdown half and `halt -f`
+        were among the callers being refused, on x86_64 too, since the handler was written.
+        `abi::reboot_command` now reads the three words as `u32`.
+        **Pins.** `user/tests/src/bin/t-reboot-libc.rs` on both machines: it drives `libc::reboot`
+        (the entry point a C program reaches, with musl supplying the magics), asserts both policy
+        words are served, and asserts an unknown command is `EINVAL` rather than `ENOSYS` - the
+        difference between "no such word" and "no such call". It never touches a stop word, and it
+        skips as a non-root caller (see the named divergence below). Host-side,
+        `abi::reboot_reads_its_words_as_linux_narrows_them` pins the narrowing itself, with the
+        extension asserted to be *real* for the two words that have it, so the test cannot pass
+        against a kernel that narrows nothing.
+        **Named, not fixed:** the handler does not ask who is calling. Linux requires `CAP_SYS_BOOT`
+        and answers `EPERM` to an unprivileged caller; this kernel answers `0` to anyone, on both
+        machines. That is a capability check this kernel does not model, it is older than this entry,
+        and the pin says so in its own header rather than asserting the divergence.
+        Measured after: aarch64 sweep `pass=27 fail=0` exit 0 (`t-reboot-libc` staged and passing, was
+        26); x86 gate `pass=157 fail=0 (157 built)` exit 33; host 512; depgraph 8/8 mutual pairs
+        within the ratchet; fmt clean; clippy 0 errors on `x86_64-unknown-none` and
+        `aarch64-unknown-none`.
+  - [x] 13.20 the root slot knows its filesystem - the invariant a whole class of answers rests on,
+        and the bug that broke the second machine's package manager.
+        **What was seen.** On the aarch64 Alpine tree, every `apk update` answered
+        `WARNING: updating and opening https://…/APKINDEX.tar.gz: Cross-device link` for both
+        repositories and then `2 unavailable, 0 stale; 27 distinct packages available`: the index was
+        fetched, could not be given its name, and was therefore re-fetched on every run. `apk`'s
+        index write (`apk-tools`' `apk_ostream_to_file_safe`) is four steps -
+        `openat(cache_fd, ".", O_RDWR|O_TMPFILE|O_CLOEXEC, 0644)`, write,
+        `linkat(AT_FDCWD, "/proc/self/fd/N", cache_fd, "…tmp.PID", AT_SYMLINK_FOLLOW)`, then
+        `renameat` into place - and the `EXDEV` is the kernel's answer to step 3, about an inode born
+        in the very directory it was being linked into.
+        **How it was localised, in three runs.** (1) `user/tests/src/bin/t-tmpfile-link.rs` drives
+        those four steps as a program; its first aarch64 run was red with **errno 2** - not the bug,
+        but the *harness*: the aarch64 sweep's runner mounts only `/tmp`, so `/proc/self/fd/N` did not
+        resolve (the x86_64 harness's `/init` mounts `/proc` with busybox, and a real boot has one
+        already). The test now mounts a procfs of its own when the payload has none, and says which
+        it used. (2) With `/proc` present the run was red with **errno 18**, reproducing the report
+        exactly. (3) One temporary `print!` in `handle_linkat` gave the whole answer in one line:
+        `via_desc=true served=(false,false)` - the descriptor path *was* taken, and **both**
+        `fs_serving_inode` calls returned `None`, which the identity test reads as "different
+        filesystems". `fs_serving_inode` answers a mount's own root by that mount, and *anything
+        else* by `root_fs` - so the root slot was empty.
+        **Two omissions, one shape.** `Vfs::mount_root` recorded the root's type, device and mount id
+        but never the filesystem itself; and the aarch64 boot attaches its disk through `Vfs::mount`,
+        which recorded `fs: None` - a *name* attachment with no instance behind it - which
+        `pivot_root` then promoted into the root slot. The first machine never hit it because its
+        root is attached by **userland**: the initramfs's `mount -t ext4` goes through the `mount(2)`
+        handler, which records the instance, and busybox `switch_root` promotes that with `MS_MOVE`.
+        So the two machines' roots differed in exactly the way the report's instinct said they
+        might - the second one assembles its root in the kernel, along a path the first machine's
+        boot never takes.
+        **Fix.** `Mount::fs` is an `Arc<dyn FileSystem>` rather than an `Option`: a mount record
+        always names the filesystem it attaches, and the type is the invariant. `Vfs::mount_root` and
+        `Vfs::mount` take the instance (every caller updated, including the host tests), `pivot_root`'s
+        parked old-root entry carries the instance the replaced tree was served by, `bind_mount`
+        borrows the serving instance or refuses (`NoRoot`), and the aarch64 board attaches its ext4 as
+        `Arc<dyn FileSystem>` - the same shape the `mount(2)` handler builds.
+        **The same root cause, two more symptoms on that machine, fixed with it.** `statfs("/")`'s
+        block numbers and `mount -o remount,rw /` both read the root slot (the id-0 arm of
+        `fs_serving_path`, and `Vfs::remount`), so both answered "no filesystem" there - the first as
+        the syscall layer's fabricate-a-filesystem fallback, the second as a silent no-op. OpenRC's
+        `root` service asks for the second on every boot.
+        **Pin.** `t-tmpfile-link` runs on both machines: on aarch64 its root is the ext4 disk, so it
+        drives all four steps for real and was red with `EXDEV` before the fix; on the x86_64 gate,
+        whose root is the initramfs's ramfs, `O_TMPFILE` answers `EOPNOTSUPP` and the test drives
+        `apk`'s own named-temporary fallback instead - and *says so*, because the ext4 half is the pin
+        and the ramfs half is only the honest path that machine can run. That asymmetry is named here
+        rather than hidden: the x86_64 gate has no ext4 root to test the `O_TMPFILE` half on.
+        Measured after: aarch64 sweep `pass=27 fail=0` exit 0 (was 25, with this test red); x86 gate
+        `pass=157 fail=0 (157 built)` exit 33; host 512; depgraph within the ratchet
+        (`vfs/mod.rs -> drivers|net` 0/0, 8/8 mutual pairs); fmt clean; clippy 0 errors on both
+        bare-metal targets.
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
       dispatcher, the aarch64 linker script that does not exist (§11.2 Step A)
 - [x] 11.E leaf crates: the seven pure, downward-only leaves (`err`, `pci`, `date`, `binfmt`,
@@ -5798,7 +6424,7 @@ map coming back `rw` is the same plan that gives x86_64's `rw`.
 The `-kernel` bring-up of 1b-1d is **deleted**, not left beside this: the
 `aarch64-unknown-none` block is `relocation-model=pic` + `-pie` like the x86_64
 one, the linker script has no base address and no `.stack`, and
-`src/main/aarch64.rs` is an `extern "C" fn _start(x0)` with no assembly stub.
+`src/board/aarch64.rs` is an `extern "C" fn _start(x0)` with no assembly stub.
 Nothing above `arch` is ported yet; `src/lib.rs`'s header carries the stage
 ledger, which is the record of which module un-gates when.
 
@@ -5896,7 +6522,7 @@ x86-only `hal::SerialRing`), cfg-partitioned the framebuffer/park arms, and un-g
 ring and parking arms stay x86-only by `#[cfg]`. **Stage 4b then closed the one pin
 4a left open** - a boot-observed `M4_CONSOLE_OK`. It did *not* need to relocate the
 milestone checks: `arch::aarch64::boot` gained a `milestone: fn()` argument it calls
-once the PL011 is up, and `main/aarch64.rs` hands in a function that writes through
+once the PL011 is up, and `board/aarch64.rs` hands in a function that writes through
 `crate::console` (`init` + two `println!`) - so `arch` only invokes a pointer and the
 `console` name stays on the `main` side of the seam (no `arch -> console` edge). It is
 the first log bytes this machine sends through the console service rather than the
@@ -6065,7 +6691,7 @@ the read up behind the designed seam. `hal` gains an optional `ConsoleInput` cap
 (`poll_input() -> Option<u8>`, `inject_input` for the bring-up hook), implemented for aarch64's
 `Current` over `pl011` and *not* for x86_64 (its serial receiver is interrupt-driven and hands
 bytes straight to the tty, so it has no polled input to expose - refuse-don't-fake, the
-capability is simply absent). `main/aarch64.rs` runs `check_console_rx`: inject a line through
+capability is simply absent). `board/aarch64.rs` runs `check_console_rx`: inject a line through
 loopback, pull each byte back through `hal::console_poll_input`, hand it to
 `vfs::tty::global().receive_byte` (the step `vcmux::route_input` does on x86_64, which is
 x86-only here), and read it back through `tty.read` - proving a userspace-visible read of
@@ -6400,8 +7026,8 @@ Named gaps the port carries rather than hides, each with its home:
   the MMIO adapter is `mmio::MmioNet` - the same shape as `MmioBlk`, a device that
   *stays open* so the receive ring it posts is the one the stack's frames arrive
   on - `check_net` opens it once and **publishes** it (`mmio::init_net_global`),
-  `main/aarch64.rs`'s `init_net` hands it to `net::init` and calls
-  `net::spawn_service()` (byte-for-byte the pair `main/x86_64.rs` boots with), and
+  `board/aarch64.rs`'s `init_net` hands it to `net::init` and calls
+  `net::spawn_service()` (byte-for-byte the pair `board/x86_64.rs` boots with), and
   `net` is now gated by `target_os = "none"` with `mpos_net` declared by both
   machines. `M8_NET_STACK_OK` prints when that wiring reached both interfaces and
   the service task - a narrow claim on purpose, because the round trip is pinned by
@@ -7556,7 +8182,7 @@ port nobody has started, and this step is subtraction.
 #### 11.1.9 — V-10: the handoff ABI is written twice (severity: accepted)
 
 `boot/src/handoff.rs` and `src/boot/handoff.rs` are separate definitions of one record, and
-`BOOT_STACK_CANARY` is spelled out in `src/main.rs` as well as in the loader. This is deliberate
+`BOOT_STACK_CANARY` is spelled out in `src/board/x86_64.rs` as well as in the loader. This is deliberate
 — the loader is a UEFI application on a different target and cannot link the kernel crate — and
 it is documented on both sides. Recorded so it reads as a decision rather than an oversight.
 
@@ -8780,7 +9406,7 @@ numbering they write down, and the real thing is what the run above shows.
 
 ---
 
-## Phase 13: Machine-seam purity and aarch64 parity — **13.1 AND 13.3–13.15 LANDED, 13.2 IN PROGRESS**
+## Phase 13: Machine-seam purity and aarch64 parity — **13.1 AND 13.3–13.17 LANDED, 13.19–13.29 LANDED, 13.18 OPEN, 13.2 IN PROGRESS**
 
 Phase 9.1 leaves the second machine short of the first in three named places, and Phase 11.4
 closed the `hal` *seam* without closing the `hal` *file*. `crate::arch` is named by no module
@@ -8823,7 +9449,7 @@ and green alone — AGENTS §3 rule 7):
 | 13.1 | `hal` becomes arch-neutral: the optional-capability forwards (`Msi`, `SerialRing`, `FpuTrap`, `Segments`) and the aarch64 `ConsoleInput` forward stop being `#[cfg(target_arch)]`-gated in `src/hal/mod.rs`. The gate is a capability flag the build declares per target (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`, in `.cargo/config.toml`'s `[target.…]` blocks beside each machine's linker script, listed for `check-cfg` in `Cargo.toml`), so the file names no architecture and a machine without a capability still does not get a faked method (rule 4) | **landed** — `src/hal` `target_arch` 14 → 0; both bare-metal clippy targets clean; host lib `511 passed`; depgraph `11/11` | *landed* |
 | 13.2 | The callers stop spelling the architecture: `console.rs`, `sched/runtime.rs`, `logging.rs`, `rand.rs`, `mm/{elf,heap}.rs` and the `syscall/**` gates express the machine difference through `hal`/capability flags or the ABI layer instead of `target_arch`. The per-arch register/struct ABI facts (`user_regs_struct`, `struct stat`, the signal frame) move to their `arch/<arch>/` home — the §11.4 boundary, kept, not erased | host tests + full QEMU gate (trap/fault/context paths) | *in progress* — landed `console.rs` (10), `uevent.rs` (4), `mm/mod.rs` (4), the `sched` FPU-trap protocol (8), `syscall`'s socket legs (22) and `rand.rs` (2, via a new baseline `hal::Entropy`), on `mpos_framebuffer_console`/`mpos_serial_ring`, `mpos_net`, `mpos_dynamic_mmio_window` and `mpos_fpu_trap`, plus six more deleted rather than flagged - the `ifreq` link ioctls and the unix-socket nonblocking push, gated when `net` was the first machine's alone and stale the moment §13.4 gave the second machine the stack (`fs/ioctl.rs` 22 → 18, `fs/mod.rs` 4 → 2); the `169 sites outside src/arch` figure is the measurement *before* those six, and before `hal::Gate` took the exec return and the user ip out of the ABI layer (`proc.rs` 23 → 20); and `sched`'s whole ptrace/stop block stopped being architecture-gated (`sched/runtime.rs` 22 → 0, `sched/mod.rs` 1 → 0, so **`src/sched/` names no architecture at all**), because that gate was never about the machine: the block carries a register file *by value* and read its width from the x86 `user_regs_struct` (`abi::uregs::COUNT` = 27) and its protocol words from `syscall::linux::abi`. The width is now the machine's (`hal::Contexts::ABI_REG_COUNT`: 27 on x86_64, 34 on aarch64, each defined beside the layout it describes) and `PTRACE_O_*`/`PTRACE_EVENT_*`/`SYSCALL_TRAP` moved to the `abi` leaf beside the clone flags — so `sched -> syscall` is **0** and the `sched <-> syscall` mutual pair went with it (10 → 9, the ratchet tightened to match). Nothing is faked: a machine whose syscall layer has no `ptrace` handler never sets a tracer, so the un-gated block answers "no" honestly, and the `PTRACE_SETOPTIONS` mask moved into `abi.rs` so the rule is host-tested and the eight option names have a reader on both machines. Measured: x86 gate `pass=143 fail=0`, aarch64 sweep `pass=13 fail=0`, `boot-aarch64` green, `target_arch` outside `src/arch/` 171 → 148, aarch64 warnings 108 → 94; and the survey for that stage turned up two more **stale** gates of the `ifreq` kind - `process_vm_readv`/`writev` were `not(aarch64)` along with `ptrace`, although nothing in them is the first machine's: they walk the two iovec arrays (`transfer_iovs`, always ungated and therefore dead code on aarch64 until now), ask `sched::space_root_of` and `sched::may_inspect`, and reach the target through `read_user_of`/`write_user_of`. The aarch64 number table had named 270/271 for them all along, so both gates and both dispatch arms are gone and the second machine now serves the calls (`proc.rs` 20 → 18, `syscall/linux/mod.rs` 11 → 9). **Nothing drove them on either machine, so the cut adds the pin**: `user/tests/src/bin/t-process-vm-libc.rs` - the `-libc` suffix follows `t-unix-rustix`, since `rustix` binds neither call and they go through `libc::syscall` with the number from `libc::SYS_*`, a maintained per-arch table, which is exactly what that crate's `rustix` rule is for. It runs on **both** machines and outputs byte-for-byte identical lines, including a forked child whose memory the parent reads and overwrites while it is parked (the write that proves the two address spaces really are two). Its own assertions were checked against real Linux on the host first - 31/31 - because a pin's assertions are the first thing that can be wrong. Measured: x86 gate `pass=144 fail=0`, aarch64 sweep `pass=14 fail=0`, `boot-aarch64` green, `target_arch` outside `src/arch/` 148 → 144, aarch64 warnings 94 → 91. **The third stale-gate finding was `rt_sigtimedwait`**, gated with `ptrace` although the `siginfo_t` it fills is the generic 128-byte `kernel_siginfo` (`si_signo`/`si_errno`/`si_code` at 0/4/8, `si_pid`/`si_uid` at 16/20, the `union sigval` at 24, the same on both machines) and the aarch64 table had named 137 all along (`proc.rs` 18 → 17, `syscall/linux/mod.rs` 9 → 8). Writing its pin found two **real** divergences, not only the stale gate, and both are fixed: a NULL set pointer was read as "the empty set" and answered `EAGAIN`, where Linux copies the set in and answers `EFAULT`; and `sched::exit` queued a child's `SIGCHLD` only when the parent had a *handler*, so a parent that blocked `SIGCHLD` and waited for it with `sigtimedwait`/`sigwait`/`signalfd` slept for ever - Linux's `sig_ignored()` discards a generated signal only if it is unblocked and ignored, and says a blocked signal is never ignored (measured on Linux 7.2.8: a handler-less process that blocks `SIGCHLD`, forks and calls `sigtimedwait` gets `rc=17`, `si_code=CLD_EXITED`, `si_pid` the child). The pin `user/tests/src/bin/t-rt-sigtimedwait.rs` runs on both machines, std-side, through `libc::syscall` (16/16 on real Linux first). Measured: x86 gate `pass=145 fail=0`, aarch64 sweep `pass=15 fail=0`, `boot-aarch64` green, `target_arch` outside `src/arch/` 144 → 142. **The syscall half's register-ABI Stage 1 landed** (§13.2's own next step): `hal::Gate` grew four ops - `user_context` (the ring-3 frame a fork/clone child resumes with, one op for both machines), `capture_user_regs`/`restore_user_regs` (the gate frame read out as, and written back from, the ABI's register file, with the thread pointer passed in and any new value handed back because installing it is the scheduler's), and `syscall_args` (the six argument registers in ABI order, re-read *after* a tracer's stop so a rewritten argument reaches the call) - plus `hal::ABI_REG_COUNT`/`hal::AbiRegs` at the crate level, so `sched` and the syscall layer share one definition of the file's width. The x86 bodies moved into `arch/x86_64/syscall.rs` over the entry stub's own `Regs` (`arch/x86_64/context.rs`'s `uregs` gained the `r11`/`rcx`/`orig_rax` slots the frame needs), the aarch64 `user_context` twin and the identity register-file ops into `arch/aarch64/mod.rs`, and `proc.rs`'s `capture_frame`/`apply_frame` became forwards. The now-neutral sites un-gated: `syscall_entry_stop`, `syscall_exit_stop`, `tell_tracer_of_child`, the exec-trap block, `handle_fork` (and the `nr::FORK|VFORK` arm), and `handle_clone_impl`'s announcement. `struct RegsFrame` is **kept** for the signal family (`build_frame`/`handle_rt_sigreturn`/`deliver_signal`), which is Stage 2's subject. `hal::Segments` is now superseded - the gate ops read the selectors from `gdt` - and is removed as its own follow-up (**landed** immediately after Stage 2, at the end of this cell). Measured: x86 gate `pass=145 fail=0`, aarch64 sweep `pass=15 fail=0`, `boot-aarch64` green, clippy 0 on `x86_64-unknown-none`/`aarch64-unknown-none`/host lib/aarch64 loader, fmt clean, depgraph 9/9 within ratchet and **no `arch -> sched` edge**, `target_arch` outside `src/arch/` 142 → 129. **The syscall half's signal frame followed, and it is Stage 2**: `hal::SignalFrame` is the capability a machine lays a handler's frame out behind - `enter` (the frame bytes *and* the register file that enters the handler) and `exit` (the frame read back, and the mask it restores) over a `SignalDelivery`/`SignalInfo` value shape, so `hal` still names no layer above it. The x86 `rt_sigframe`/`sigcontext` layout - the `sc` offsets, the three part offsets, the put/get words and the register shuffling - moved out of `proc.rs` into `src/arch/x86_64/signal.rs`, the `SIGFRAME_*`/`UCONTEXT_*` constants left `sched::signal` for good, and `proc.rs`'s `build_frame`/`handle_rt_sigreturn` became policy plus `hal` plus the two scheduler calls the machine cannot make (`sched::write_user`/`read_user`, `set_current_blocked`) - so `struct RegsFrame` is deleted, and with it the last place the ABI layer spelled the x86 gate frame. The gate is the build's (`mpos_signal_frame`, declared by the x86_64 machine alone), so the four signal-family gates and their three call sites are `#[cfg(mpos_signal_frame)]` and name no architecture; a port without the capability is *not delivered a handler* rather than handed a frame it cannot lay out (rule 4). `handle_rt_sigreturn` now reads the whole frame back (one `read_user` instead of a mandatory `sc` read plus a best-effort mask read), and the `ioctl` restart verdict's request word comes from `hal::syscall_args`. Measured: x86 gate `pass=145 fail=0`, aarch64 sweep `pass=15 fail=0`, `boot-aarch64` green, host unit tests 511, clippy 0 errors on `x86_64-unknown-none`/`aarch64-unknown-none`/host lib/aarch64 loader, fmt clean, depgraph 9/9 within ratchet and **no `arch -> sched` edge**, `target_arch` outside `src/arch/` 129 → 122 (`proc.rs` 7 → 3, `syscall/linux/mod.rs` 7 → 5, `syscall/mod.rs` 1 → 0). **Then `hal::Segments` went**, as that follow-up: the trait, its `user_segments` forward and the x86_64 impl read the GDT for a `cs`/`ss` pair that `hal::Gate`'s `capture_user_regs`/`user_context` already fill from the same place, so the capability was superseded rather than merely unused, and only its plumbing left to delete (`mpos_segments` from `.cargo/config.toml`'s x86_64 block and `Cargo.toml`'s `check-cfg` list, plus the docs that listed it among the current capability set). Measured: x86 gate `pass=145 fail=0`, aarch64 sweep `pass=15 fail=0`, `boot-aarch64` green, clippy 0 errors on the same four targets, fmt clean, depgraph 9/9 - and `target_arch` outside `src/arch/` stays **122**, because a capability flag was never one of its sites. **The register-ABI relocation's Stage 3 began with a measurement that is not a frame at all — this machine's EL0 trap did not give a program its registers back.** `user/tests/src/bin/t-regs-across-syscall.rs` (std, both machines) stamps the callee-saved integer registers and every SIMD/FP register with a pattern, does one `getpid` in the same `asm!` block, and compares: 41 registers on aarch64, 20 on x86_64 (the reserved ones - `x19`, `rbx`, the frame pointers - cannot be inline-asm operands at all, which the file says). **Red on aarch64 before the fix, and the log is one line: `FAIL: the trap did not give back 1 of 41 registers: v0 came back 0x0000000000000000`.** The reason is the one the context switch's header already states: this kernel is built for `aarch64-unknown-none`, whose baseline includes NEON, so LLVM keeps its own values in `q0..q31` — and unlike x86_64's `+soft-float` build there is nothing to remove them with. Building *this crate* with `-C target-feature=-neon` is not enough, and that was measured rather than assumed: the binary still carried **420** references to `q`/`v` registers, and the reachable ones are `core`'s (`Formatter::pad`, `pad_integral`, `do_count_chars` — every `println!` — plus `memset`); only `-Zbuild-std` with the flag left the 32 in `mpos_context_switch` and nothing else. So the fix is the trap stubs, where the machine owns the registers: `__vec_el0_sync` and a new `__vec_el0_irq` (the EL0 IRQ entry used to share the kernel's stub) each carry the interrupted 528 bytes - `q0..q31`, `FPCR`, `FPSR` - in their own frame. On the trap's own stack rather than in the task's record, and that is not a style: a task parked in `read` is switched out and back while the trap is open, and the context switch writes the kernel's live scratch into the record as it goes past. The pin's own first version had a real bug worth recording, because the counterfactual is the point: restoring the FP *after* the register file handed the program an `FPCR` in `x9`/`x10`, and **6 of the 16 sweep programs** took a wild pointer (`user fault at 0x19`, an `EFAULT` out of `recvfrom`) because a `rustix` block had kept a live value there across the `svc`. Cost, stated rather than hidden: 20 instructions to save and 20 to restore on every EL0 trap, which is the price of a kernel that uses the vector registers at all. Measured after: x86 gate `pass=146 fail=0`, aarch64 sweep `pass=16 fail=0`, `boot-aarch64` green through `M6_INIT_OK`/`INIT_EXITED`, host unit tests green. **Stage 3b is the frame itself, and the second machine now delivers handlers.** `src/arch/aarch64/signal.rs` lays out arm64's `rt_sigframe` behind the same `hal::SignalFrame` the x86 twin implements, and `mpos_signal_frame` is declared for the target - so the four signal-family gates in `proc.rs` and their call sites, which were the *only* reason the family was off, turn on with no change of their own (the aarch64 number table had named `rt_sigaction`/`rt_sigprocmask`/`rt_sigreturn` 134/135/139 all along). Three facts about the layout came off `arch/arm64/kernel/signal.c` and the two uapi headers rather than out of the plan, and two of them correct it: **the restorer is in `x30`, not a word on the stack** (`setup_return` puts `sa_restorer` there), so `rt_sigreturn` is handed a stack pointer that *is* the frame - `SignalFrame::frame_at` is the identity here and `sp - 8` on x86_64, which is the one *shape* the two machines disagree about; **there is a 16-byte `struct frame_record` above the frame** holding the interrupted `x29`/`x30` with the handler's `x29` aimed at it, so a backtrace started inside a handler walks into the code the signal interrupted; and **`uc_mcontext` is at 176, not the 168 the field widths add up to**, because `struct sigcontext` contains a 16-byte-aligned member and the compiler pads `ucontext` up to it (the libc pads the same way, which is what makes the handler's `ucontext` and the kernel's agree). The floating-point half is the machine's own trap frame rather than its task record - the record is what the context switch writes the kernel's scratch into, so the interrupted `q0..q31`/`FPCR`/`FPSR` are copied into the frame's `fpsimd_context` record from where Stage 3a put them, and `rt_sigreturn` writes them back there for the trap's own exit to load. **Three real defects came out of writing the pin, and each is fixed here:** `apply_frame` seeded the thread pointer with a zero it expected the machine to overwrite - x86_64's register file has `fs_base` and does, aarch64's `user_pt_regs` does not, so the first handler delivered on the second machine left its task's `TPIDR_EL0` at 0 and the very next `println!` faulted reading musl's `errno` at `0x58` (NULL plus the libc's offset); the aarch64 gate wrote the dispatch's return value into `x0` *after* the delivery, so every handler ran with `x0 = 0` where the signal number belongs - `x0` is the result slot *and* the first argument, so the write moved into `hal::Gate::set_result` where it happens before a handler is entered (x86_64's `rax` is a plain scratch register and the stub still writes the same value after, so its behaviour is unchanged); and `SA_RESTART`'s rewind needs the interrupted call's *first argument*, which the result slot no longer holds by the time a signal is delivered - the trap stub keeps it beside the frame as `orig_x0`, exactly the word arm64's `pt_regs` keeps after `user_pt_regs`. `hal::SignalFrame`'s two operations became `unsafe fn` (clippy's `not_unsafe_ptr_arg_deref`, the same finding Stage 1 made for `linux_dispatch`): they take the machine's own gate frame. The pin is `user/tests/src/bin/t-signal-frame.rs`, and it runs on **both** machines: a sibling process raises `SIGUSR1` while the program is parked in a `read` it made from its own inline assembly, and it holds `x0`'s signal number, the `siginfo_t`'s `si_code`/`si_pid`/`si_uid`, `uc_mcontext.pc` naming the trapped instruction (`svc`+4, or the `svc` itself when the call is rewound), every callee-saved register and all thirty-two vector registers coming back, `SA_RESTART` really re-running the `read` with its own arguments (the second execution reads the bytes the sibling writes afterwards), and a child that dies of `SIGABRT`/`SIGSEGV` reported to its parent as `WIFSIGNALED` with that `WTERMSIG`. Its aarch64-only half reads the frame record the handler's `x29` points at and the `fpsimd_context` record, both *inside* the handler - the only moment those words are the frame's, since the frame lives below `sp` and the program is entitled to that stack again the moment the handler returns (measured: the record is right in the handler and holds something else by the time `main` looks). **That half is aarch64-only for a named reason**: x86_64's `uc_mcontext` has a null `fpstate` pointer and no record chain, so its `rt_sigreturn` does not restore the vector registers a handler clobbered - a pre-existing gap this pin now measures, and its own piece of work. Measured: x86 gate `pass=147 fail=0 (147 built)` with QEMU exit 33, aarch64 sweep `pass=17 fail=0`, `boot-aarch64` green through `M6_INIT_OK`/`INIT_EXITED`, host unit tests green, clippy 0 errors on `x86_64-unknown-none`/`aarch64-unknown-none`, fmt clean, `cargo xtask depgraph` `9/9` within the ratchet with no new `arch -> sched` edge. |
 | 13.3 | aarch64 disk root: the MMIO virtio-blk already read/write-verified (`M7_BLK_OK`) and the ext4 it mounts (`M7_FS_OK`) become the machine's root; `xtask` assembles the aarch64 disk from `rootfs.toml`'s geometry and the `rootfs/` tree | a boot marker that a rootfs *file* was read, not merely that an ext4 mounted | **landed** — the ext4 is registered as `vda`; `xtask` lays the `rootfs/` overlay and the init images on it; the machine pivots its root onto the disk (`/` = ext4, ramfs at `/oldroot`), re-mounts `/dev` and runs the disk's `/init` as pid 1 (`M7_DISK_OK`, `M7_ROOT_OK`), with the init's file lifecycle now running on ext4 |
-| 13.4 | aarch64 `net`: smoltcp over the `MmioTransport` whose MAC and TX are already proven (`M8_NET_OK`); RX via GIC line routing, or an honest polled note | a transmit/receive round trip on the second machine | *landed* — flipping `net`'s gate had cost **24** errors (16 the missing `smoltcp` dependency, 8 the PCI NIC, the PCI vsock device and the four `/proc/net` rows), which is why the cut was the seam first: `drivers::virtio` now carries the transport-neutral contracts `NetDevice`/`VsockDevice`, `net`/`net::vsock` hold `Arc<dyn …>` and name no transport, `VSOCK_PER_CONNECTION_BUFFER` moved beside the contract, and the `/proc/net` collector took `procfs`'s own gate rather than a new capability (with the gate opened by hand that was **0 errors**, was 8). The live path then landed with it: `mmio::MmioNet` is the MMIO adapter as a persistent `NetDevice` (the ring it posts stays posted, unlike the probe helpers it replaces), `check_net` opens it once and publishes it (`mmio::init_net_global`), `main/aarch64.rs`'s `init_net` hands that handle to `net::init` + `net::spawn_service` - the same pair x86_64 boots with - and prints `M8_NET_STACK_OK`, `lib.rs`'s gate is `target_os = "none"`, and both machines declare `mpos_net`. **Measured: the aarch64 sweep passes 10/10 staged programs**, including a TCP connect/accept/read-write round trip, UDP over the loopback and an `AF_UNIX` name - the round trip pinned by real EL0 programs (this job's pin), not a kernel hook. The flip also found three stale "`net` is x86_64's" gates in shared code (`close(2)`'s `close_last_socket` - a measured port leak: `t-socket`'s 34567 still held when `t-tcp` bound it - `unlink`'s `unix::unbind_node`, and `ioctl`'s two `ifreq_*` helpers, whose aarch64 arms answered `None` and made every interface ioctl `ENODEV`), and the harness's `/tmp` had to become a tmpfs like x86_64's, because an ext4 directory cannot hold a socket node (`t-unix-rustix`'s `bind` answered `EOPNOTSUPP` until it was). RX is polled, honestly: the service task's tick drives the device and nothing routes its GIC line yet |
+| 13.4 | aarch64 `net`: smoltcp over the `MmioTransport` whose MAC and TX are already proven (`M8_NET_OK`); RX via GIC line routing, or an honest polled note | a transmit/receive round trip on the second machine | *landed* — flipping `net`'s gate had cost **24** errors (16 the missing `smoltcp` dependency, 8 the PCI NIC, the PCI vsock device and the four `/proc/net` rows), which is why the cut was the seam first: `drivers::virtio` now carries the transport-neutral contracts `NetDevice`/`VsockDevice`, `net`/`net::vsock` hold `Arc<dyn …>` and name no transport, `VSOCK_PER_CONNECTION_BUFFER` moved beside the contract, and the `/proc/net` collector took `procfs`'s own gate rather than a new capability (with the gate opened by hand that was **0 errors**, was 8). The live path then landed with it: `mmio::MmioNet` is the MMIO adapter as a persistent `NetDevice` (the ring it posts stays posted, unlike the probe helpers it replaces), `check_net` opens it once and publishes it (`mmio::init_net_global`), `board/aarch64.rs`'s `init_net` hands that handle to `net::init` + `net::spawn_service` - the same pair x86_64 boots with - and prints `M8_NET_STACK_OK`, `lib.rs`'s gate is `target_os = "none"`, and both machines declare `mpos_net`. **Measured: the aarch64 sweep passes 10/10 staged programs**, including a TCP connect/accept/read-write round trip, UDP over the loopback and an `AF_UNIX` name - the round trip pinned by real EL0 programs (this job's pin), not a kernel hook. The flip also found three stale "`net` is x86_64's" gates in shared code (`close(2)`'s `close_last_socket` - a measured port leak: `t-socket`'s 34567 still held when `t-tcp` bound it - `unlink`'s `unix::unbind_node`, and `ioctl`'s two `ifreq_*` helpers, whose aarch64 arms answered `None` and made every interface ioctl `ENODEV`), and the harness's `/tmp` had to become a tmpfs like x86_64's, because an ext4 directory cannot hold a socket node (`t-unix-rustix`'s `bind` answered `EOPNOTSUPP` until it was). RX is polled, honestly: the service task's tick drives the device and nothing routes its GIC line yet |
 | 13.5 | `cargo xtask test --arch aarch64`: the sweep boots the second machine and reads its own `=== RUN/PASS/FAIL/SUMMARY`/`END` and `M*_OK` chain with x86's verdict (summary + QEMU exit). An unsupported `--arch` is an explicit error, never a silent run of the other machine | `cargo xtask test --arch aarch64` prints a green summary; x86 unchanged; `xtask` unit tests green | *landed, with its gaps named* — the silent wrong-run is closed: `test --arch aarch64` now refuses in `test_sweep_machine` (pinned by an `mpos-xtask` unit test) instead of falling through to `selftest::run_tests` and printing an x86_64 verdict under an aarch64 banner. The aarch64 sweep itself — the user programs built for aarch64, packed with a generated `/init` that runs `/bin/t-*`, booted under AAVMF and parsed by the same `=== RUN/PASS/FAIL/SUMMARY`/`END` reader — is the next cut, and its first prerequisite has landed: the musl user programs build for aarch64 under cargo at all now (`.cargo/config.toml` names `rust-lld` for `aarch64-unknown-linux-musl`; without it the host `ld` rejects the `--fix-cortex-a53-843419` rustc passes for the target, measured — 28 programs, static `ET_EXEC`, ~5.6 MB). **And the sweep itself is wired**: `test --arch aarch64` builds the second machine, packs a musl runner (`aarch64_init::build_sweep_init`) as `/init` beside those 28 programs, boots under AAVMF and reads the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol. Its first run is **red, with the reason located**: the runner's `posix_spawn` path takes an EL0 **write** fault (ESR `0x9200004f`, level-3 permission; address `0x3fadafe0`) at `pc 0x272d90`, which is inside the runner's own R+X segment — so the fault is in musl's spawn, not in a test — and the machine then loses its init (`INIT_EXITED`), so no summary is printed. **That fault is fixed**: the handler read `WnR` from `ESR_EL1` bit 7, but a Data Abort's `WnR` is bit 6 — so every fault looked like a *read*, and `resolve_cow_fault` (guarded by `is_write`) was never reached: an EL0 write to a copy-on-write page always ended in SIGSEGV. The evidence is the run's own fault line, `ESR 0x9200004f` (`DFSC 0xF`, level-3 permission) on a page the tables call `r--u` and `is_cow_page` calls copy-on-write, 16 bytes below `sp` — a `clone` child's first write. It survived this long because the machine's own fork check has its child only *read* its marker string and let the kernel do the writing, so no child ever wrote to a shared page. With bit 6 the run passes that point and reaches the next gap: two faults in the runner — a write to `0xffffffffffffff5c` (translation fault, level 1) and a read of `0x58` (level 2) — which is where the aarch64 ABI is still short. **Both were fixed, and the run now completes.** The second was the same class of omission: `prepare` reinstalled `task.tls` on every dispatch but never captured the outgoing task's *live* value — and aarch64's musl installs its TLS base with a direct `msr tpidr_el0`, with no syscall for the kernel to see, so the record went stale and the base was reset to 0 by the first context switch after a spawn (the runner faulted at `0xffffffffffffff5c`, NULL minus musl's `errno`/canary slot). Capturing on switch-out is what arm64 Linux does; x86_64 is unaffected because its base is an MSR only the kernel writes. **Measured now: all 14 programs run, `=== SUMMARY pass=0 fail=14`, `=== END`** — the *instrument* is whole, and what is left is the ABI itself. (A harness bug came with it: cargo's `.d` dep-info files start with `t-` and were staged as programs, reporting `exit=127`; the payload now requires the ELF magic, which is why the count is 14 and not 28.) **The same class struck again in the copy**: `spawn_copy`/`spawn_thread` inherited the *record* (`Task::tls`) instead of the base the parent was running with, so the sweep's first `posix_spawn` child — its parent having set its own base after its last dispatch, the record still saying 0 — ran with `TPIDR_EL0 = 0` and faulted at the same NULL-minus-`errno` address. arm64 Linux's `copy_thread` hands the child the parent's live `tp_value` when `CLONE_SETTLS` is absent, and both sites now ask the register instead (`running_tls`); measured, `t-rename` and `t-stdspawn` — the two that faulted — reach their own code and fail on the harness's missing `/tmp` rather than on the kernel. **The classification is done and the arm is green on what this machine can serve**: 3 of the 14 std-side programs run and pass (`t-rename`, `t-rmdir`, `t-stdargs` — `=== SUMMARY pass=3 fail=0`, exit 0) and the other 11 are named in `tests.toml`'s new `aarch64` group with their reasons. The file gained the rule that makes that honest rather than a global exclusion wearing a machine's name: **a group named after a machine belongs to that machine**, invisible to the other's sweep, so all 11 still run in x86_64's default sweep (pinned by a `mpos-xtask` unit test). Ten are the socket family (`socket`/`socketpair` answer ENOSYS here — measured: syscall 198/199, §13.4's flip is what closes them) and `t-stdspawn` is a harness gap (`/bin/true|echo|cat|false|sh`; the x86 harness has them from busybox, this machine's disk root has no `/bin`, while the kernel's spawn path is exercised by the runner on every program). Reaching three needed the machine setup the x86 `/init` does with busybox — the runner makes `/tmp` and passes `t-stdargs` the argv the x86 PATH lookup passes it — and a `=== SETUP_FAIL` line now refuses the verdict instead of letting an unprepared machine read as failing tests. `--groups`/`--all-groups` remain refused for this arm: the file's vocabulary also names the `no_std` raw-syscall suite, which has no aarch64 port |
 | 13.6 | aarch64 `/bin`: the programs `t-stdspawn`/`t-socketpair` start, built **in-tree** as five applets of one multi-call binary (`xtask/src/aarch64_bin.rs`) rather than installed from a distribution | both names leave `tests.toml`'s `aarch64` group and `cargo xtask test --arch aarch64` stays green; x86 unchanged | *landed* — the gap was the harness's, not the ABI's: `t-stdspawn` runs `/bin/{true,false,echo,cat,sh}` and `t-socketpair` runs `/bin/cat`, and this machine's ext4 root carried no `/bin` (the payload's own programs sit flat at `/`). **The choice that matters is build-or-fetch**: installing busybox — the x86 harness's answer, from Alpine — would put a network fetch *inside* the aarch64 gate, so a mirror outage would read as a broken kernel; the `rustc`/`aarch64-unknown-linux-musl` path the sweep's runner and musl helper already require builds these with no new prerequisite. `sh` is a small shell whose own comment states its subset (`;`/newline separation, `'`/`"`/`\` quoting, `<`/`>`/`>>`/`>&N`, the `echo`/`exit`/`cd`/`pwd` builtins, external programs by path or `PATH`) — honestly *not* busybox — and it moves **real descriptors** rather than modelling them, because `t-stdspawn` asserts the child put `captured-err` on stderr and reads both pipes. Two staging facts came out of it: a payload name may carry a directory (the kernel's `vfs::tar::unpack_into` creates missing parents on demand, so the archive needs no directory member) and every file the staging step lays down is mode **0755**, which `mkfs.ext4 -d` preserves — without it `/bin` lands 0644 and `execve` answers `EACCES`, a failure that reads as a broken program. **Measured: `=== SUMMARY pass=12 fail=0`** (12 of the 14 aarch64-built programs staged; the two left out, `t-stdresolve` and `t-udp`, are `external` for the internet's reason rather than this machine's), `t-stdspawn`'s `output() captured both of the child's streams` and `t-socketpair`'s `read back what the pair carried` among the passes, with x86 unchanged at `pass=142 fail=0`. The `aarch64` group is **empty** and stays as an empty group: the mechanism is what names a gap, and the day a call cannot be served is the day a name goes back in |
 
@@ -8877,6 +9503,656 @@ adapter, and carries the `/bin` its spawn tests need, so the sweep is green on *
 supposed to serve** and `tests.toml`'s `aarch64` group is empty. What a red aarch64 sweep means is
 now entirely the kernel's. The board's `9.1` line above is stale where it says "stages 3-8 remain" —
 §9.1's own status list is the truth.
+
+---
+
+## Phase 14: `arch` becomes a crate — the machine seam, enforced by the compiler
+
+**Goal** (one sentence): `--arch x86_64|aarch64` switches the machine; `arch` and the HAL are one
+crate `mpos-arch` that depends on nothing in the kernel; every other module is written once.
+
+**Why a crate and not the ratchet we already have.** `cargo xtask depgraph` (§11.4) already fails
+on a module outside `arch`/`hal`/`main`/`lib` naming `crate::arch::`, and `src/hal` already carries
+zero `target_arch` gates (§13.1). Both are *measured by a tool this repository wrote*. A crate
+boundary is the same rule enforced by rustc, and it is the only version of it a port cannot
+accidentally edit around. Everything below is the work of getting to that boundary; none of it
+changes what the HAL abstracts.
+
+### 14.0 What was already true, and the one gap that was not
+
+| Claim | State |
+|---|---|
+| `--arch` selects the machine | **Was not true.** The switch reached `run`, `test` and `boot-aarch64` only; `cargo xtask build --arch aarch64` compiled the x86_64 kernel and reported success, because `utils::build_kernel` never passed `--target` and the loader's target came from `boot/.cargo/config.toml`'s `[build] target`. `boot-aarch64` carried its own copy of both triples for exactly that reason. **Fixed** (S0 below). |
+| `hal` is architecture-neutral | True since §13.1: capability traits, `mpos_*` cfg flags, no `dyn` on the downward path. |
+| A new port writes `arch/<arch>/` and edits no shared file | True in practice for both ports. |
+
+### 14.1 The whole obstacle: 128 upward references out of `src/arch/**`
+
+Measured (`crate::` in `src/arch/**`, excluding `crate::hal`/`crate::arch`, comments excluded), after
+S1a. A crate boundary turns every one of these into a compile error, so each is either **moved down**
+(a leaf crate both sides depend on), **moved out** (the caller belongs above the machine layer), or
+**inverted** (the machine declares the service and the kernel registers it).
+
+| Kind | Sites | Disposition |
+|---|---|---|
+| `sched` (fault resolvers, `exit`, `preempt`, `current`, signals) | ~30 | **invert** — hook table |
+| `println!` / logging | 23 | **invert** — hook table (a log line), or move the checking code out |
+| `mm` (`KernelSections`, `MapFlags`, `Mapping`, `PageTaken`, `PAGE_SIZE`, frame allocation, `map_mmio`) | ~25 | **move down** the four vocabulary types; **invert** frame allocation and the dynamic MMIO window |
+| `drivers` (`serial` 9, `tx_ring` 8, `virtio` 2, `qemu` 4) | 23 | **invert** — the console sink and the transmit ring are kernel services; `qemu`'s debug exit is a hook |
+| `boot` (`BootInfo` 5, `handoff` 2, `set_cmdline` 1) | 8 | **move down** the record (and it is the same record `boot/src/handoff.rs` duplicates — S3 closes that too); `set_cmdline` inverted |
+| `err`, `date`, `fdt` | 5 | **already leaf crates** — `mpos-arch` depends on them directly, no work |
+| `syscall::linux_dispatch`, `vfs::vcmux`, `net::irq_service`, `console::force_serial` | 5 | **invert** — hook table |
+
+### 14.2 The inversion: a static hook table, upward only
+
+`mpos-arch` declares the kernel services it needs as one trait (or an equivalent struct of
+`fn` pointers) and the kernel registers its implementation once at boot. The *downward* direction —
+generic code asking the machine — stays exactly as it is today: capability traits, one `impl`, no
+`dyn`, monomorphised. That asymmetry is deliberate and is the reason this is a table and not a
+generic parameter:
+
+- every upward call is on a slow path (a fault, a tick, a log line, a page-table frame), so an
+  indirect call costs nothing measurable;
+- `Machine<K: Kernel>` would have to thread `K` through every arch type, and the exception entry
+  points reached from `global_asm!` **cannot be generic** — each would need a `#[no_mangle]` shim
+  the kernel defines and the arch crate's assembly branches to, i.e. a symbol the machine layer
+  references but does not own.
+
+### 14.3 Stages
+
+- [x] **S0 — `--arch` is one switch.** `xtask/src/arch.rs`: `Arch` carries the target triples, and
+      `Arch::parse` refuses a machine this front end does not build. `build_kernel(profile, arch)`
+      passes both `--target`s; `boot-aarch64`'s private kernel/loader build (and its two target
+      constants) are gone. The `--arch` word now also crosses the sudo boundary, since the
+      privileged half re-parses it. `initramfs`/`disk`/`rootfs`/`all` refuse `--arch aarch64` by
+      name — they assemble *the x86_64 disk*, and the second machine's disk is laid out by
+      `boot-aarch64` / `alpine-aarch64` / `run --arch aarch64`; building an x86_64 root under an
+      aarch64 banner is the silent-wrong-machine failure `AGENTS.md` §3 refuses.
+      Measured: `cargo xtask build` -> `target/x86_64-unknown-none`, `--arch aarch64` ->
+      `target/aarch64-unknown-none` + `aarch64-unknown-uefi`; `cargo xtask boot-aarch64` still
+      green through the shared builder (full marker chain, `INIT_EXITED`).
+- [x] **S1a — aarch64 device discovery moves to `main`.** The virtio-MMIO identity constants,
+      `read_device`, `virtio_device_windows` and the six device probes (`check_virtio`, `check_rng`,
+      `check_blk`, `check_fs`, `check_net`, `check_input`) — 566 lines — moved from
+      `src/arch/aarch64/mod.rs` to `src/board/aarch64.rs`, reached through one more pointer `boot`
+      is handed (`devices: fn(&BootInfo)`), exactly as `milestone: fn()` already is. Opening a
+      window as a virtio device, mounting a filesystem over it and registering it with the block
+      layer is driver/filesystem/block work; a machine crate cannot name any of them. The one
+      machine question in the moved code — *where is this physical window* — became
+      **`hal::map_mmio_window`**, which on this machine is `paging::device_virt` and on the other is
+      a fresh kernel-half mapping: the probes are now architecture-neutral code.
+      Measured: upward refs 140 -> 128, `boot-aarch64` green with the identical marker chain.
+- [ ] **S1b — the remaining `check_*` milestone probes.** `check_context`, `check_paging`,
+      `check_timer`, `check_wallclock`, `check_cpu`, `check_serial_rx`, `check_tls`,
+      `check_user_memory`, `check_paging_ops` (~1900 lines) still call `sched`/`mm`/`println!` from
+      inside `arch`. **They can stay**: they are "does this machine's HAL work" checks and after S3
+      they reach the scheduler through the hook table like everything else in `arch`. Moving them
+      is optional tidiness, not a prerequisite — `check_el0` and `el0_returned` in particular own
+      the EL0 entry and the handoff to `init`, and extracting those from the machine layer is a
+      design job of its own. The reason S1a *was* a prerequisite is the opposite one: those probes
+      were not testing the machine, they were driving devices.
+- [x] **S2 — move the shared vocabulary down.** Two new leaves, both pure data and
+      host-tested, both re-exported by the kernel under the names they already had so
+      no caller changes:
+      - `crates/mpos-bootinfo`: `BootInfo`, `MemRegion`, `MemKind`, `MAX_MEM_REGIONS`, and the
+        wire record `Handoff`/`AbiRegion`/`KIND_*`/`HANDOFF_MAGIC`. `boot::handoff::collect`
+        — the translation, which is the part that decides what a region *means* — stays in
+        the kernel. `src/boot/mod.rs` and `src/boot/handoff.rs` re-export.
+      - `crates/mpos-vm`: `Mapping`, `MapFlags`, `PageTaken`, `KernelSections`, the page
+        arithmetic (`PAGE_SIZE`/`PAGE_SHIFT`/`align_up`/`align_down`) and the
+        machine-independent `kernel_mappings` plan. `src/mm/vm.rs` and `src/mm/pframe.rs`
+        re-export; the five tests that pin the plan moved with it.
+
+      `err`/`date`/`fdt` were already leaves, so `mpos-arch` depends on them directly with
+      no work. The two-places-to-sync problem with `boot/src/handoff.rs` is *not* closed
+      here — the loader still carries its own copy of the record, and making it depend on
+      `mpos-bootinfo` is a separate, self-contained cut (§14.3 S2-follow).
+
+      **A gate hole this surfaced**: `run_unit_tests` named every leaf crate by hand, and
+      `mpos-fdt` had never been added — eight tests, never run by any gate. The list is a
+      const now and `selftest::tests::every_leaf_crate_is_tested` pins it against
+      `crates/`, so a leaf added without a line there fails the xtask tests instead of
+      quietly shrinking the sweep. Measured: the host count went 515 -> 510 + 5 (`mpos-vm`)
+      + 8 (`mpos-fdt`), i.e. the same tests, now all inside the gate.
+- [x] **S3 — build the hook table.** `src/hal/kernel.rs` declares [`Kernel`] — the
+      services a machine's trap entry needs: `started`, `current`, the three fault
+      resolvers, `kernel_lazy_accessible`, `send_signal`/`disposition_is_default`,
+      `exit`, `preempt`, `charge_cpu`, `device_not_available`, `dispatch_syscall` —
+      with one forward per method, so a handler reads `hal::kernel::resolve_cow_fault(addr)`
+      and never names `sched`. `main/<arch>.rs` implements it and calls
+      `hal::kernel::register` before the machine's vectors/IDT go in.
+
+      **Slice 1 landed**: every `crate::sched::*` and `crate::syscall::*` site in
+      `src/arch/**` (37 of them) now goes through it, on both machines. Upward refs
+      **128 -> 89**. Measured: `boot-aarch64` green with the identical marker chain,
+      `test --arch aarch64` 25/25, and the x86_64 sweep unchanged at 154/155 — the
+      `#PF`, timer and syscall paths it converted are the ones that sweep leans on
+      hardest, so that number is the evidence the indirection costs nothing.
+
+      `device_not_available` is gated on `mpos_fpu_trap` inside the trait, the way
+      every other optional capability is: aarch64 has no `#NM` to fault on, so the
+      method does not exist for it rather than being a stub it must fake.
+
+      **Slice 2 landed — the machine layer now names no kernel module at all.**
+      Measured: `crate::` references in `src/arch/**` *and* `src/hal/**` that are
+      neither `crate::hal` nor `crate::arch` are **89 -> 0**. What that took, by
+      kind, and what each answer actually was:
+
+      - **48 sites that were never hooks.** `mm::phys_to_virt` and `mm::hhdm_offset`
+        are the loader's *direct map*, not a kernel service: the loader chose the
+        offset and the loader mapped physical memory at it. They are now
+        `hal::phys_to_virt` / `hal::direct_map_offset` / `hal::virt_to_phys`, backed
+        by one `hal` static that `mm::init` fills from the boot record. This is a
+        *downward* call — no `dyn`, no indirect branch — so the forty-odd page-table
+        walks pay nothing for the move. `mm`'s three helpers stayed as forwards.
+      - **The hook table's second half.** `print_line` (+ a `kprintln!` macro),
+        `force_serial`, `route_console_input`, `service_network`, `set_cmdline`,
+        `boot_info`, `start_memory`, `alloc_frames`/`free_frames`/`frames_free`, and
+        `wake`. The batch's one trap: the macro's newline delimiter cannot be a
+        `concat!`, because an implicit named argument (`"{rsp:#x}"`, which dozens of
+        the fault reports use) is only captured from a *string literal* and
+        `concat!`'s expansion is a macro call. `format_args!("{}\n", format_args!(…))`
+        is the nested form that works.
+      - **Three relocations, because the call was not an inversion.** `tx_ring` (the
+        console's transmit queue) is machine-*neutral* — parameterised by a
+        `Transmitter` and knowing no register — so it moved to
+        `src/hal/tx_ring.rs`, beside the `SerialRing` trait it implements. `serial`
+        (the 16550) and `qemu` (the `isa-debug-exit` port) are one machine's own
+        hardware and moved to `src/arch/x86_64/`. `drivers/` no longer declares any
+        of the three.
+      - **`qemu` became a capability, not a path.** `hal::TestExit` +
+        `mpos_qemu_debug_exit` + `hal::exit_qemu(code)`, with `TEST_EXIT_OK` /
+        `TEST_EXIT_PANIC` beside it because those codes are the *harness's*
+        contract. A machine without the flag halts instead — which is what the
+        second machine's `reboot(2)` stop path now gets, honestly, rather than a
+        second body of code.
+      - **The per-BAR MMIO window moved out of `mm`.** `mm::map_mmio` (the x86
+        bump allocator behind `hal::map_mmio_window`) is `arch/x86_64/mmio.rs`; the
+        `mpos_dynamic_mmio_window` flag is **deleted**, because it described a
+        *mechanism* and a mechanism is exactly what a capability flag must not name.
+        `ahci`, `virtio::msix` and the local APIC now call `hal::map_mmio_window`.
+      - **`virtio-rng` left the machine layer.** Both machines' `Entropy::mix_into`
+        folded in the rng device; the device is a driver the kernel enumerates, not
+        an answer the machine gives, so `virtio::entropy()` names the transport and
+        `crate::rand` folds it in. aarch64's `mix_into` is now *empty* and says so,
+        which is the honest answer for a core with no `RDRAND`.
+      - **One name for both machines' console arming.** `board/x86_64.rs` no longer
+        names `drivers::serial`: `arch::enable_console_interrupts` is now the
+        x86_64 twin of the aarch64 re-export of the same name.
+
+      Measured: both kernels build warning-free (for what this change touched),
+      `boot-aarch64` green with the identical marker chain, module graph within the
+      ratchet (no edge appeared, no count grew, 9/9 mutual pairs).
+
+      [`Kernel`]: ../src/hal/kernel.rs
+- [x] **S4 — the move itself.** `arch/` is a workspace-root crate (`mpos-arch`, **not** under
+      `crates/` - that directory means "host-testable leaf" and `xtask`'s
+      `every_leaf_crate_is_tested` pins it against the host sweep, which a crate of `cli`/`sti`,
+      MSRs and descriptor tables can never join). `src/hal/` and `src/arch/` moved to
+      `arch/src/{hal,arch}/`, so the module paths *inside* are exactly what they were
+      (`crate::hal::…`, `crate::arch::x86_64::…`) and the whole body moved unchanged.
+      `src/arch` and `src/hal` are gone.
+
+      **The kernel kept its names.** `src/lib.rs` has `pub use mpos_arch::{arch, hal};` - the same
+      treatment the leaf crates got in S2. That is what makes the thousands of words of commentary
+      above every `crate::hal::` call site still true rather than merely nearby, and it is why this
+      step is a move and not a 139-site rename. What the crate boundary bought is not a different
+      spelling in `mpos`; it is that `mpos-arch` has no `crate::sched`, `crate::mm` or
+      `crate::println!` *in scope*, so the machine layer's independence is cargo's business now.
+
+      Three things followed the code, and one did not:
+
+      - `.cargo/config.toml`'s two `-C link-arg=--script=` paths point at
+        `arch/src/arch/<arch>/linker.ld`. (They are passed to every crate built for the target and
+        ignored by the ones with no link step; only the kernel binary links.)
+      - `feature(abi_x86_interrupt)` went to `arch/src/lib.rs` with the `extern "x86-interrupt"`
+        handlers it exists for, and the kernel's crate root dropped it - "declared but not used" was
+        the warning that said the last machine body had left.
+      - The `mpos_*` capability vocabulary became `[workspace.lints.rust]` with `[lints] workspace =
+        true` in every member, because a cargo lint table is per-package and the second copy - the
+        one `mpos-arch` needs - is the copy whose staleness would silently stop a warning.
+        (`missing_lints_inheritance` then fires once per manifest that does not opt in, which is why
+        every member opts in; two members had an empty `[lints.cargo]` placeholder that cargo
+        rejects alongside `workspace = true` and that did nothing, so they are gone.)
+      - The capability *flags* stayed global: `.cargo/config.toml`'s `[target.…]` blocks are
+        per-target, not per-package, and the kernel reads `mpos_net`, `mpos_signal_frame`,
+        `mpos_framebuffer_console` and `mpos_serial_ring` itself.
+      - And the *dependencies* found their own places, because cargo reports `unused dependency`
+        per target: `mpos-fdt` and `mpos-err` are aarch64's (the device tree, and the errno an
+        unhandled `svc` answers with), `mpos-date` is x86_64's (the CMOS clock's calendar
+        arithmetic), and only `mpos-vm`, `mpos-bootinfo` and `critical-section` are the seam's own.
+        Written as one flat list first - which is what a move that just wants to compile produces -
+        and then told apart by the tool.
+
+      **The ratchet had to change two things, and one of them was a bug.** `ARCH_EXEMPT` drops to
+      `["main", "lib"]`: `arch` no longer exists as a module of this crate, so the rule stopped
+      being "the machine layer may name itself" and became "only the crate root and the wiring may
+      reach for the machine at all". And the mutual-pair count went **9 → 8** - but not by the one
+      that was expected:
+
+      - `hal ↔ mm` collapsed with the move, as it should (the mapping vocabulary is a leaf path
+        now, so `hal → mm` is zero while `mm → hal` remains, one-way).
+      - `drivers ↔ rand` **arrived in the previous slice** (`PLAN.md` §14.3 S3, slice 2) and was
+        *cancelling* that removal exactly. Folding the virtio-rng into `rand`'s seed is what let the
+        machine layer stop naming a driver - but `rand → drivers` closed a cycle with `drivers →
+        rand` (`/dev/urandom` reads the pool), so one pair left and another took its place while the
+        count stood still. That is the plainest demonstration of what this ratchet cannot see, and
+        the fix is the project's usual one: the source is now *injected*
+        (`rand::set_device_entropy`, called from `main/<arch>.rs`), so `rand` names no driver.
+
+      A fourth thing was found on the way and is filed here rather than fixed quietly:
+      `rand::tests::a_reseed_re_keys_the_generator` was **flaky** - five tests over one global
+      generator, run on several threads, so a neighbour's re-key made "a passive read must not
+      advance the key" false. Measured 1 failure in 4 parallel runs, 0 in 4 serial ones; the tests
+      now take a lock for the length of each body (0 in 6 after). It predates this step, and it is
+      here because the gate runs it: a quarter of runs red is how a suite stops being believed.
+- [x] **S5 — verify both machines.** Measured after S4: `cargo xtask boot-aarch64` green with the
+      identical marker chain and `INIT_EXITED` (which is the evidence that `global_asm!`'s vector
+      table and `critical-section`'s `set_impl!` survive being linked out of an rlib);
+      `cargo xtask test --arch aarch64` **25/25**; `cargo xtask test` **154/155**, the one failure
+      being `t-unix`, which was red before this work began and is not this work's; host unit tests
+      **510**; `cargo xtask depgraph` within the ratchet with `mutual pairs 8/8`; xtask's own
+      **65**.
+
+### 14.4 What deliberately does not move
+
+The Linux register ABI (`user_regs_struct`/`user_pt_regs`, the signal frame, the syscall gate) stays
+in `arch/<arch>/`: it *is* the machine's register layout, and wrapping it in a neutral type would be
+the private dialect `AGENTS.md` §4 rule 3 forbids. "No leakage" means a port writes `arch/<arch>/`
+and edits no shared file — not that a register frame becomes architecture-neutral.
+
+### 14.5 Reading the paths in this document
+
+Every section above (and the stage ledgers in §9.1, and `ARCHITECTURE.md`) names the files as they
+stood *when it was written*, and S4 moved two directories without rewriting them. The translation,
+for every path that starts with one of these prefixes:
+
+| Written as | Means, after S4 |
+|---|---|
+| `src/hal/…` | `arch/src/hal/…` |
+| `src/arch/…` | `arch/src/arch/…` |
+| `src/arch/x86_64/serial.rs`, `qemu.rs`, `mmio.rs` | the same under `arch/src/`, and the first two came from `src/drivers/` in S3 |
+
+The history is left as history on purpose: a stage ledger that has been rewritten to match the tree
+can no longer be used to tell what a stage actually did. This note is the single place the mapping
+is stated, so a reader has one hop to make instead of a search.
+
+### 14.6 The loader's half of the machine layer
+
+`mpos-boot` was the last thing in the tree that named an architecture - 20 `target_arch` sites in
+three groups, which its own file header listed:
+
+| What | Was | Now |
+|---|---|---|
+| the progress lines' wire | `main.rs`'s `mod serial`, one `imp` per machine | `mpos_arch::early::{serial_init, serial_write}` |
+| the page-table descriptor | `boot/src/vm/{x86_64,aarch64}.rs` | `mpos_arch::early::{PageTables, Frames}` |
+| the last instruction | two `unsafe fn enter` bodies in `main.rs` | `mpos_arch::early::enter` |
+
+**Criterion, measured**: `grep -r target_arch boot/src/` is **0**, and `boot → mpos` (the kernel)
+is still absent from `cargo xtask depgraph`. The only machine-dependent thing left in the loader is
+the target triple its files are compiled for.
+
+**One deviation from §14.3's plan, and why.** The stage list said `arch/src/arch/<arch>/early.rs`.
+It landed at `arch/src/early/{mod,x86_64,aarch64}.rs` instead, one level up, because
+`arch/src/arch/**` is the *kernel's* machine layer and is gated `#[cfg(target_os = "none")]` while
+the loader is `{x86_64,aarch64}-unknown-uefi`. Putting `early` inside that tree would have meant
+gating most of `arch/mod.rs`'s re-exports on the target's operating system, which is a larger and
+more fragile change than the one this stage is. So the loader's machine code is a sibling tree -
+`arch/src/early/` beside `arch/src/{arch,hal}/` - and `arch/src/lib.rs` gains the crate's only
+`#[cfg(target_os = "uefi")]`. When the kernel becomes a UEFI stub itself (item 5 of
+`docs/TEST-AND-BOOT-REFACTOR.md`) that gate widens to `any(…)` and nothing else moves.
+
+**`Frames`: who decides what.** The loader decides where frames come from - one contiguous
+`LOADER_DATA` allocation, sized from RAM before the first frame is taken, never returned - and
+`early` decides what is written into them. That seam is a one-method trait, `PageTables<F: Frames>`,
+implemented by the loader's own `Pool`. Monomorphised, so the narrowing costs nothing at run time
+and needs no `dyn`; and the builder *cannot* allocate anything the loader did not hand it, which is
+a property the old arrangement could only state in prose.
+
+**`set_log`: who owns the format.** The loader owns the text (`mpos-boot: ` and a newline) and
+`early` owns the wire, so `early` registers a sink (`mpos_arch::early::set_log`) and its own two
+lines - the device window it maps, and the configuration-table GUIDs when no tree is found - come
+out through the loader's formatter. Same shape as `hal::kernel`'s registration, same reason: the
+layer with the facts is not the layer that owns the presentation.
+
+**Two things deliberately did *not* go down**, and the distinction is the point:
+
+- `copy_device_tree` stays in `boot`. Reading the firmware's configuration table, taking the tree's
+  self-declared length and copying the bytes into frames is UEFI work, not machine work - and it is
+  the same code on both machines. The machine answers one boolean, `FIRMWARE_PUBLISHES_DEVICE_TREE`
+  (false on x86_64, whose firmware describes it with ACPI), and the loader asks it by name instead
+  of hiding the branch in a `#[cfg]`. That is also why `DTB_GUID`/`FDT_MAGIC`/`FDT_MAX_BYTES` are
+  now unconditional constants: they were never per-architecture facts, they just happened to be
+  compiled on one machine.
+- `Pool`, the three ranges, `merge` and `pool_bytes_for` stay in `boot/src/vm.rs`, which now
+  contains no `cfg` at all: the *plan* is architecture-free, and only the encoding is the machine's.
+
+**A dependency that had to move with the code**: `mpos-arch`'s `critical-section` became a
+`[target.'cfg(target_os = "none")'.dependencies]` entry. `hal::tx_ring` is its only user and `hal`
+is not built for the loader, so leaving it unconditional made cargo report `unused dependency` for
+both UEFI targets. An unused dependency is a dependency that will be wrong without anyone noticing,
+which is exactly what that lint is for.
+
+**Verification** (each of these is a command that was run):
+
+| Gate | Result |
+|---|---|
+| `cargo build -p mpos-boot --target {x86_64,aarch64}-unknown-uefi` | both build, zero warnings |
+| `cargo build -p mpos-arch --target {x86_64,aarch64}-unknown-uefi` | both build, zero warnings |
+| `cargo xtask boot-aarch64` | full marker chain + `INIT_EXITED`, and the loader's own eleven progress lines byte-identical, including `device window 0x8000000..0xc000000 …` |
+| `cargo xtask test` / `cargo xtask test --arch aarch64` | x86_64 155/155, aarch64 25/25 |
+| `cargo xtask depgraph` | inside the ratchet, mutual pairs 8/8, no new edge |
+| host unit tests | `mpos` 511 + every leaf crate |
+
+`boot-aarch64` is the load-bearing one of those: it is the only gate that runs the loader's page
+tables, its PL011 writer and its `enter()` as relocated code inside another crate, and the marker
+chain it prints is unchanged character for character.
+
+### 14.7 The loader becomes a crate, and the record one definition
+
+Two smaller things landed before §14.8, and both are prerequisites of it.
+
+`boot/` became a **library plus a thin `#[entry]` binary**: `boot/src/lib.rs` holds the whole
+sequence as `mpos_boot::run()` and `boot/src/main.rs` is fifteen lines that call it. That is the
+shape a second caller needs - and the kernel is the intended second caller (§14.8's successor is
+item 5 of `docs/TEST-AND-BOOT-REFACTOR.md`, where the kernel takes the loader's place).
+
+`boot/src/handoff.rs` was **deleted**. The loader now depends on the `mpos-bootinfo` leaf and reads
+the same `Handoff` the kernel does, which closes risk **V-10** (`docs/ARCHITECTURE.md`): the two
+copies kept honest by a magic number are one definition, read by both sides of the seam. Two type
+aliases (`AbiRegion as Region`, `HANDOFF_MAGIC as MAGIC`) left every call site untouched.
+
+| Gate | Result |
+|---|---|
+| `cargo build -p mpos-boot --target {x86_64,aarch64}-unknown-uefi` | both build, zero warnings |
+| `cargo xtask boot-aarch64` | full marker chain, the loader's eleven progress lines byte-identical |
+| `cargo test -p mpos-bootinfo --target x86_64-unknown-linux-gnu` | passes |
+
+### 14.8 The kernel's entry is one file, and the machine's half goes down
+
+**What was wrong.** `src/main.rs` was a 34-line dispatcher whose whole body was a `#[path]` choice
+between two bodies, and each of those bodies re-stated the *machine's* half of the boot - the entry
+register, SSE, the record, physical memory, the descriptor tables, the page tables, the wire -
+before getting to the kernel's. Worse, the same seam already existed for one machine and not the
+other: aarch64 had been given `mpos_arch::arch::aarch64::boot(handoff, milestone, devices, init)`,
+and x86_64 inlined the equivalent. So the architecture-independent part of the entry was written
+twice, and the machine layer's own entry point was written once.
+
+**What changed.**
+
+| File | What |
+|---|---|
+| `src/main.rs` | now the one entry and the one panic handler. `_start` takes the record in the platform's first argument register (`RDI` vs `x0` is the compiler's business, not this file's), registers the kernel services, and hands `board::start` the record; `panic` writes one line through `mpos_arch::arch::print_args`, calls the machine's context dump, and stops. **No `#[cfg]`, no `#[path]`** |
+| `src/board/mod.rs` | **new**: picks the machine's body in one place - exactly the arrangement `arch/src/arch/mod.rs` uses for the library - and exports `start` and `panic_context` |
+| `src/board/x86_64.rs` | was `src/main/x86_64.rs`. Keeps the acceptance checks, the bus enumeration (`devices`), the console and banner (`milestone`), the kernel's own boot (`init`) and the panic context dump; loses the entry, `init_arch` and the panic handler |
+| `src/board/aarch64.rs` | was `src/main/aarch64.rs`. Keeps the device probes, the EL0 handoff and its checks; loses the entry and the panic handler |
+| `arch/src/arch/x86_64/mod.rs` | gains `boot(handoff, milestone, devices, init)` and `print_args`: the x86_64 half of the seam, symmetric to the aarch64 one and built on the `hal::kernel` table §14.2 already put there |
+| `arch/src/arch/mod.rs` | exports both under one name each, so `mpos_arch::arch::{boot, print_args}` resolve on either machine and the call site has no architecture in it |
+| `arch/src/arch/aarch64/mod.rs` | `milestone` now takes the record: the command line in it decides *where* the kernel log goes (`console=`), which is why the first machine's counterpart reads it too |
+
+**What moved down, and what could not.** The entry, SSE for user processes, the record, physical
+memory, the descriptor tables, the kernel's page tables and the wire that reports them are now
+`mpos-arch`'s on both machines - which is what "the machine layer is one crate" has to mean.
+Everything else stayed in the kernel, and by construction rather than by taste: the milestone
+checks, the device bring-up and the handoff all name `vfs`, `blk`, `net`, `drivers` or `sched`, and
+those are names that do not exist in `mpos-arch` (§14's whole point). So the kernel-side per-machine
+code is `src/board/<arch>.rs` - a body, not a second `main`.
+
+**The one thing deliberately not unified, and why.** The two machines' boot *sequences* remain their
+own, and so do their check suites. A shared sequence would have to reorder aarch64's milestones,
+which are load-bearing and were each a bug once: `check_dev` must run after `vfs::tty::init`,
+`check_console_rx` before the receiver is armed, `check_serial_tx` after it. Unifying the two suites
+into one capability-driven one is a real change with a real payoff, but it changes what aarch64
+*accepts*, so it belongs in its own stage rather than in the one that makes the entry one file.
+
+**A log-order note.** The banner is now the kernel callback's first line (`milestone`), which runs
+after the machine has read the record - so the three machine lines (`pmm:`, `image:`,
+`page tables:`) precede it where they used to follow it. Nothing parses the order; the self-test
+protocol reads `=== RUN/PASS/FAIL/SUMMARY`.
+
+**Verification** (each of these is a command that was run):
+
+| Gate | Result |
+|---|---|
+| `cargo build -p mpos --target x86_64-unknown-none` | builds; the two warnings are the pre-existing drift in `net/packet.rs` and `seccomp` |
+| `cargo build -p mpos --target aarch64-unknown-none --release` | builds; only the pre-existing lib drift |
+| `cargo build -p mpos-arch --target {x86_64,aarch64}-unknown-none` | both build |
+| `cargo xtask test` | `=== SUMMARY pass=156 fail=0 (156 built)`, exit 33 |
+| `cargo xtask boot-aarch64` | full marker chain, all twenty-two markers, `INIT_EXITED` |
+| `cargo xtask depgraph` | inside the ratchet, mutual pairs 8/8, no new edge |
+| host unit tests | `mpos` 511 passed |
+| stale-path sweep | `grep -rn 'main/x86_64\.rs\|main/aarch64\.rs\|src/main/'` over `AGENTS.md docs/ src/ arch/` finds none |
+
+`boot-aarch64` is the load-bearing one again: it is the only gate that runs the second machine's
+`arch::boot` with three function pointers crossing the seam, and every marker it prints is
+unchanged character for character.
+
+### 14.9 The steps every machine's `init` runs are stated once
+
+**What was wrong.** `board/x86_64.rs` and `board/aarch64.rs` each end in an `init` that hands the
+machine to `/init`, and each one re-stated the same five steps. Some of the statements were
+byte-identical - `vfs::file::init_standard(vfs::tty::init())`, the ramfs root over it, and
+`assert_eq!(pid, sched::INIT_PID, "the first process must be pid 1")` - and two more carried the
+same *ordering contract* written twice: the console mux goes up before the receiver is armed, and
+the first program must be pid 1. One of the two copies said so explicitly ("the order is the same
+one and the same reason as x86_64's `vcmux::init(); serial::enable_rx()`"), which is the comment
+that says the two should have been one function.
+
+**What changed.**
+
+| File | What |
+|---|---|
+| `src/board/steps.rs` | **new**: the five steps - `start_scheduler`, `mount_ramfs_root`, `unpack`, `arm_console`, `hand_to_init` - each carrying its contract in its own doc, and the module saying why the two `init`s are still two |
+| `src/board/x86_64.rs` | `init` and `handoff_to_init` call the steps; the one-line `init_sched` wrapper is gone. `handoff_to_init` keeps what is its own: the boot-stack check at the deepest point, the exit-code discard, and the wait for the shell's child |
+| `src/board/aarch64.rs` | `init` calls the steps in its own order; the read/`argv`/spawn trio it had inline is now one call |
+| `src/board/mod.rs` | declares `mod steps;`; its doc says which half of a body is not the machine's |
+
+**Why the steps are in the wiring crate and not the library.** `arm_console` is half machine
+wiring - arming the receiver is `crate::arch::enable_console_interrupts` - and `ARCH_EXEMPT` in
+`xtask/src/depgraph.rs` allows only `main`/`lib` to reach the machine layer, naming that very call
+("arms its console interrupts") as wiring. The library's `boot` module was tried first and the
+depgraph refused it for a second, independent reason: the steps need `crate::sched` and
+`crate::vfs`, and `vfs` already names `boot` once (the command line behind `/proc/cmdline`), so
+`boot` reaching back closed the graph's ninth mutual pair. The wiring crate sits above both, names
+the machine by right, and adds no edge the ratchet can see.
+
+**Why still not one function.** Only the five steps are shared; their *placement* is not. x86_64
+arms the console after the spawn - nothing reads the wire until the shell is up - while aarch64 arms
+it before `check_serial_tx`, which is a check *of* the armed path; x86_64 unpacks inside its
+filesystem bring-up while aarch64 unpacks after its devices and switches root after that. A single
+`run()` would have to take a list of hooks and reorder them, which is the two sequences wearing one
+hat (§14.8's argument, still standing).
+
+**Verification** (each of these was run, after the change):
+
+| Gate | Result |
+|---|---|
+| `cargo xtask test` | `=== SUMMARY pass=156 fail=0 (156 built)`, exit 33 |
+| `cargo xtask boot-aarch64` | all twenty-two markers, `INIT_EXITED` |
+| `cargo xtask depgraph` | inside the ratchet, mutual pairs 8/8, no new edge |
+| host unit tests | `mpos` 511, `mpos-xtask` 65 |
+| both kernel targets | `x86_64-unknown-none` and `aarch64-unknown-none --release` build; warning counts unchanged from before the change |
+
+The depgraph shaped this stage rather than merely checking it: the first placement of these steps
+(`boot::init`) was rejected by it, and the rejection was right on both counts.
+
+---
+
+## Phase 15: One boot flow — aarch64 to the first machine's level
+
+**Status: 15.1–15.6 landed, all four of 15.6's pins green. 15.1, 15.3, 15.4 and 15.5 and the init
+seam unified - all four check families run on both machines, the reporting/exit-hook/net/cmdline/log-sink
+copies are one each, and 15.2's six device classes have all landed (the input registry §13.24, the
+host-driven console §13.25, the display adapter + framebuffer console §13.26, the sound card §13.27,
+the vsock device §13.28, and the host share §13.29). 15.6, the initramfs flow, is landed:
+`boot-aarch64` full chain + `INIT_EXITED`, `test --arch aarch64` `pass=27 fail=0`,
+`cargo xtask test` `pass=158 fail=0 (158 built)` exit 33, `alpine-aarch64` reaching
+`mpos login:` in 16 s, and `depgraph` within the ratchet. `### 15.6` below records what it cost.
+The last named difference this machine carried from the first - `init_net` +
+`virtio::spawn_service` behind `mpos.selftest` - is also closed, measured the same day.
+Measured 2026-10-07.**
+
+Phase 13 closed the *ABI* gap (13.3–13.16) and §13.19/§13.20 closed two of its consequences. What
+is left is the *boot*: the second machine reaches the same userspace surface as the first, but it
+gets there along its own path, and the parts of that path which are not about a bus, a UART or a
+page-table format are written twice - once in `src/board/x86_64.rs`, once in `src/board/aarch64.rs`.
+The goal of this phase is that the machine-independent half of the boot has **one** copy, so that
+"which machine is this?" is answered by the machine layer and by nothing else.
+
+### What is measured today
+
+| What | x86_64 | aarch64 | Where it is answered |
+|---|---|---|---|
+| `check_mm` (allocator, frames, buddy merge, slab classes, heap/frame cross-check) | `board/checks/mm.rs` | **same** | machine-independent: `mm` is one module |
+| `check_sched` + its five scenarios and helpers | `board/checks/sched.rs` | **same** | machine-independent: `sched` is one module |
+| `check_vfs` (dispatch, ramfs, a mounted tree crossing, two tasks on one fd) | `board/checks/vfs.rs` | **same** | machine-independent |
+| `check_ipc` (pipe, tty line discipline, signals) | `board/checks/ipc.rs` | **same** | machine-independent |
+| `banner`, `park`, `check_boot_stack`, `report_stack_use`, `panic_context` | `board/report.rs` | **same** | machine-independent: `BootInfo`/`hal`/`sched`, with the stack pointer read through `hal::Cpu::stack_pointer` and the text range from `arch::kernel_sections` (§13.23, 15.4) |
+| the `init` callback's signature | `fn(&BootInfo) -> !` | `fn(*const u8, usize) -> !` (the archive is stashed *before* the address-space switch) | a fork in `mpos_arch::arch::boot`'s own seam |
+| the root switch | **userland**: the initramfs's `/init` mounts `root=` and `switch_root`s | **kernel**: `check_disk_root` mounts the disk at `/mnt`, `switch_root` pivots, `/init` runs from the disk | the largest duplication: the first machine's flow is a script the second machine has no copy of |
+| `M0`–`M8` milestone checks | the boot's verdict | a different set, and they run on **every** boot (in front of a distribution's `init`) | §13.14's rule applies: a check that changes shared state damages the machine it checks |
+| capabilities (`.cargo/config.toml`) | `mpos_msi`, `mpos_serial_ring`, `mpos_fpu_trap`, `mpos_signal_frame`, `mpos_framebuffer_console`, `mpos_net`, `mpos_qemu_debug_exit`, `mpos_pci_config`, `mpos_input_registry` | `mpos_console_input`, `mpos_serial_ring`, `mpos_net`, `mpos_signal_frame`, `mpos_input_registry`, `mpos_framebuffer_console` | the seam works; four of the first machine's nine are missing here (`mpos_msi`, `mpos_fpu_trap`, `mpos_qemu_debug_exit`, `mpos_pci_config`), and `mpos_input_registry` + `mpos_framebuffer_console` moved across in §13.24/§13.26 |
+| device discovery | PCI enumeration | device tree + virtio-MMIO windows | genuinely the machine's; both answer `hal::map_mmio_window` |
+
+Of the four missing capabilities, three are hardware absence on this port and one is port work:
+`mpos_msi` and `mpos_fpu_trap` have no counterpart here (a `virt` machine with a GIC and no `#NM` -
+both honest "absent", not stubs), and `mpos_qemu_debug_exit` is an emulator exit port AAVMF does not
+answer. `mpos_pci_config` is *not*: the bus is there, but it is not the bus this port drives its
+devices over - the device tree is. The three that *have* crossed over are the ones whose device was
+already reachable over that tree: `mpos_input_registry` (§13.24), the console (§13.25) and
+`mpos_framebuffer_console` (§13.26, on the `virtio-gpu` card the same MMIO transports carry) - each
+by handing the same device to the shared driver instead of opening it, reading its identity and
+dropping it.
+
+### The target shape
+
+1. **One home for the neutral checks.** `src/board/checks/{mm,sched,vfs,ipc,report}.rs`, under the
+   wiring crate for the reasons `board/steps.rs` already records (the depgraph lets the wiring name
+   the machine and both libraries; `boot` would close a mutual pair with `vfs`). A body keeps a
+   private `devices()` and a private `arch_checks()`; everything else is called from one place.
+2. **One `init` seam.** `mpos_arch::arch::boot`'s `init` callback becomes `fn(&BootInfo) -> !` for
+   both machines. This is what makes "the same sequence, both machines" expressible at all: the
+   aarch64 fork exists only because it stashes the archive before the switch, and *that* is a
+   consequence of (3).
+3. **One root-switch flow: the second machine gets an initramfs `/init`, like the first.** The
+   kernel unpacks the archive and hands the machine to `/init` on both machines; the *script* mounts
+   `/proc`, `/sys`, `/dev`, `root=` and pivots. That is Linux's own model, it is what
+   `docs/ARCHITECTURE.md` §4 and `AGENTS.md` §4 rule 1 require ("a kernel that assembles them first
+   leaves pieces the owner of the system cannot unmount"), and it deletes `check_disk_root`'s mount
+   half and `switch_root` outright. The alternative - moving the pivot into the kernel for *both*
+   machines - is the same line count with more risk: it re-implements the script's `root=`/
+   `rootfstype=`/`rootflags=` loop in Rust, breaks `cargo xtask run`'s "no `root=` → drop to a shell
+   in the initramfs" behaviour, and contradicts §4. Cost of the chosen direction: one
+   `initramfs-aarch64/` tree plus its toml, a busybox in it (`mount`, `pivot_root`), and `M7_ROOT_OK`
+   moving from a kernel marker to a script-printed one - which moves `xtask/src/aarch64.rs`'s
+   `TERMINATORS` in the same commit (AGENTS §5's trap: a wrong terminator kills the boot seconds in,
+   indistinguishable from a hang).
+4. **Nothing machine-independent stays in a body.** After this, `board/<arch>.rs` holds: the entry's
+   three callbacks, `devices()`, the machine's own checks (the paging/IDT proof, the UART's TX/RX
+   proof, the MMIO transport probes), and the ordering its own milestones need - and every one of
+   those is machine work by definition.
+
+### Stages
+
+Each is one commit and green alone (AGENTS §3 rule 7). Only stage 0 is measurement.
+
+| Stage | Contents | Pin | Risk |
+|---|---|---|---|
+| 15.0 | the inventory above becomes a §13.16-adjacent measurement, with the numbers `grep`-able | — | none |
+| 15.1 | extract `check_mm`, `check_sched` (+ helpers), `check_vfs`, `check_ipc` into `board/checks/**`, x86_64 calling them at the same points | `cargo xtask test` prints the same `pass=157 fail=0 (157 built)` + exit 33; `depgraph` unchanged (the wiring is exempt); **both** bare-metal targets build (the modules are cfg-free, so aarch64 compiles them while not yet calling them) | **landed (§13.21)** — identical x86_64 numbers before and after the move |
+| 15.2 | aarch64 device parity, one class per commit: the input registry (`mpos_input_registry` + `input::close_at_exit`), virtio-console, virtio-gpu + framebuffer console (`mpos_framebuffer_console`), virtio-sound, vsock, 9p | per class: `boot-aarch64` with the new `M*_OK` **and** its failure marker added to `TERMINATORS`; `test --arch aarch64` stays green; `machine.toml` gains the `-device` | **all six classes landed: the input-registry (§13.24), console (§13.25), virtio-gpu + framebuffer-console (§13.26), virtio-sound (§13.27), vsock (§13.28) and 9p (§13.29)** (§13.4's rule: measure the flip before designing the seam). The input registry's flip was re-measured for this cut and costs **1 error** - `E0432: unresolved import super::hal::transport_all` at `drivers/virtio/input.rs:40`, where the item is gated in `drivers/virtio/hal.rs` - against the **4** recorded here before, because three of those were in `src/vfs/sysfs.rs`'s `build_input` and §13.23's capability flip made them resolve. The design cost the number did not show was real and is now paid: `EvdevNode` was monomorphic over `VirtIOInput<HalImpl, PciTransport>` through `read_caps`, `service`'s harvest and `init`'s enumeration, so the class became a transport-neutral contract (`drivers::virtio::InputDevice`, with the crate-backed `VirtioInputDev<T>` as the one implementation of its six methods), the MMIO side opens its own window and hands the live device to `input::register`, and the board carries `check_input` + `check_input_registry`. The marker moved with the pin: `M8_INPUT_OK` is printed after `check_dev`, where the registry can be read back through a mounted `/dev` - `input::nodes()` non-empty *and* `/dev/input/event0` resolving at evdev's `13:64`, because event flow needs a keypress and the harness is headless (the `/sys/class/input` half is the same capability's, and appears when sysfs is mounted). The console class (§13.25) then cost the same **1** error (`E0432: unresolved import super::hal::transport`) for the same reason and paid the same kind of design debt: a `ConsolePort` contract, one `VirtioHvc<T>` over the crate's driver, `mmio::console_device` opening the window, the devfs `#[cfg(target_arch = "x86_64")]` on `/dev/hvc0` deleted, and the marker resolved through the mounted `/dev`. The virtio-gpu class (§13.26) was measured the same way and cost the same **3** errors - but they hid a *type-erasure* refactor rather than a one-helper seam, which is the one place this phase's "measure the flip first" rule under-reported: the crate's `Transport` is not object-safe, so `Gpu` became `Gpu<T: Transport>` and the render task had to hold a `Box<dyn GpuDevice>` (a 16-method trait) to keep one copy of it. The rest of the stack needed nothing (one `pci::` reference in 7.6 kLoC). The sound class (§13.27) then cost the same **1** error and was the console class's shape exactly - a three-method `SoundCard` contract, one `VirtioSnd<T>` over the crate's driver, `mmio::sound_device` opening the window, the devfs gate deleted, and a marker that resolves the node and moves a silent burst through the data path (the OSS *parameter* face is `abitest`'s `t-dsp`, which this machine's sweep does not carry - a named gap). The vsock class (§13.28) was the console class's shape again - the same **1** error (`E0432: unresolved import super::hal::transport`) and the same one-contract/one-generic-driver design (`VirtioVsock<T: Transport>`, `mmio::vsock_device`, the module's `#[cfg(target_arch = "x86_64")]` deleted, `spawn_service`'s vsock half moved to the contract) - but it is the one class whose device this host cannot always provide: QEMU does not emulate vsock in userspace, so `vhost-vsock-device` needs `/dev/vhost-vsock`, and the aarch64 boot attaches it only when the host has one, requiring `M8_VSOCK_OK` only then and printing the skip otherwise (never silently, and with a one-line summary that then claims seven devices rather than eight). The 9p class (§13.29) cost the same **1** error and turned up two defects the machine had carried all along: the PCI probe (`fs9p::init_global`) had **no caller at all**, so `devices()` was always empty and `/mnt/share` was never mounted on *either* machine, and the client spoke plain `9P2000`, which QEMU 11 answers `"unknown"` to (measured: `.u` and `.L` are what it serves). The client now speaks `9P2000.u`, `mount_share` moved out of the first machine's body into the shared steps, and the class is pinned twice - the aarch64 boot's `M8_P9_OK` (the mounted share serves a 39-byte file back) and `abitest`'s `t-9p` on the first machine (the boot's mount, a program's own `mount -t 9p` over the dispatch, an unexported tag's `ENOENT`) - with `parse_stat` newly driven by a `fuzz/` target |
+| 15.3 | aarch64 adopts the shared checks, in an order its own markers permit | `boot-aarch64` full chain + `INIT_EXITED`; `test --arch aarch64` green; `alpine-aarch64` still reaches `localhost login:` | **landed** (§13.21 + §13.22): all four families run on both machines, and adopting them found three defects the machine had carried since its scheduler landed - the clock never preempted, the EL0 interrupt stub never saved the interrupted program's resume state, and the EL1 one never saved the kernel's (the abort that held `checks::vfs`/`checks::ipc` out until it was fixed). They run **under `mpos.selftest` on both machines** (§13.14's rule: the Alpine boot must not pay for or be damaged by them) |
+| 15.4 | shared reporting: `banner` on both, `check_boot_stack` on both (measure the loader's canary first), `park` instead of `halt`, a real `panic_context` | `boot-aarch64`, both sweeps, host tests | **landed** (§13.23): `src/board/report.rs`, one copy for both bodies, with `hal::Cpu::stack_pointer` as the one machine question and the boot-stack canary moved into `crates/bootinfo` so the loader and both kernels read one definition |
+| 15.5 | one exit-hook registry instead of two bodies (`register_exit_hooks`: five hooks + two cloexec on x86_64, one on aarch64) | `t-tcp`/`t-tcp-listen` (they measured the socket hook's absence as `EADDRINUSE`), both sweeps | **landed** (§13.23): `steps::register_exit_hooks`, one list in the one order, the two input hooks under `mpos_input_registry` - which also became the gate for the input modules and their `/dev` block, replacing four `target_arch` gates |
+| 15.6 | the initramfs flow: `initramfs-aarch64/` + toml, `alpine-aarch64` stages it, the script pivots, `switch_root`/`check_disk_root`'s mount half deleted, the `init` seam unified to `fn(&BootInfo) -> !` | `alpine-aarch64` → `localhost login:`; `boot-aarch64`; both sweeps; `depgraph` | **landed, all four pins green.** `boot-aarch64` full chain + `INIT_EXITED`; `test --arch aarch64` `pass=27 fail=0`; `cargo xtask test` `pass=158 fail=0 (158 built)` exit 33; `alpine-aarch64` reaches `mpos login:` in 16 s; `depgraph` within the ratchet. Cost seven defects, all recorded below - and the risk was real: §13.20's bug lived on this exact path, and six more had hidden behind it |
+
+### 15.6 The initramfs flow — **LANDED**, all but the Alpine login pin
+
+The stage's whole point was that the second machine stops being the exception: the kernel unpacks
+`initramfs-aarch64/`, hands the machine to the script, and the *script* mounts `/dev/vda`, promotes
+it into `/` and `switch_root`s into the disk's own `/init` - the flow `AGENTS.md` §4 rule 1 and
+`docs/ARCHITECTURE.md` §4 require, and the one the first machine has always run. `check_disk_root`'s
+mount half became `steps::mount_disk_root` (called from `init` exactly where x86_64's `init_blk`
+calls it, with the wrapper deleted outright), `M7_ROOT_OK` stopped being a kernel marker, and the
+`init` seam is one signature (`fn(&BootInfo) -> !`) on both machines.
+
+**What the path cost: six defects, each measured, and only the first was the one §13.20 predicted.**
+
+| # | Defect | The measurement |
+|---|---|---|
+| 1 | `enter_probe` published its save-area address as `sp - 8` in Rust while the prologue stamped `[ret, sp]` at `sp - 16`, so `eret` aimed at the saved *stack* - non-executable - and the first EL0 program to ask to leave died on an instruction permission fault | `EC 0x21`, `IFSC 0b001111`, `ELR_EL1 == FAR_EL1` inside the stack the program was running on |
+| 2 | the return stub landed on the caller's `x30` directly, skipping `enter_probe`'s own epilogue - so the caller came back with `sp` 80 bytes *below* where its frame expected it, and every `[sp, #imm]` store in `check_el0` afterwards wrote into its own locals | probe-in/probe-out `sp`, `fp` and `addr_of!(space)` all identical while `word_via_at` read a different value every run: the *memory* had moved, not the pointer |
+| 3 | `mpos_enter_frame` reloads all of `x0..x30` from the frame, and the leave path runs no epilogue, so callee-saved registers did not survive an ordinary call | the first instruction after the landing read `[x20, #0x8a8]` with `x20` holding a length, and faulted at `0x906`; the save area now carries `x19..x29` + `q8..q15` |
+| 4 | the *test* disk's `/init` was the overlay's `rootfs-aarch64/init` - a `#!/bin/sh` script whose interpreter the disk does not have, because the test disk is the build's own payload and carries no busybox | `switch_root: can't execute '/init': No such file or directory` with every `/t` marker absent; `aarch64_init::exec_launcher_init_elf` is the answer, and it is the shape `run_sweep`'s runner already had |
+| 5 | the script read the console from `/dev/console` *after* `mount --move /dev /sysroot/dev` - the wrong device (this kernel's `/dev/console` answers `read` with end of input; the queued line is on **fd 0**) and the wrong moment (`/dev` was gone) | `cat: can't open '/dev/console': No such file or directory`, then `R:` with nothing after it. `read line` from stdin, gated on `mpos.selftest` - `cat` would block forever on the second read |
+| 6 | the §15.6 inittab probe never ran, so four of its hand-encoded instructions had never been executed once: `udiv` without bits 15..10 (`0b000010`) is not a divide, `msub` without bit 15 is `madd`, `strb` built on `0x3E000000` is a SIMD store at a register offset, and `cmp` built on `0xB100001F` is `cmn`. Syscall 56 is `openat` on aarch64, not `open` (`nr_aarch64.rs` records `OPEN` as an unreachable 64000), so the path was in `x0` where `dirfd` belongs | an unknown-reason exception mid-print; then `MPOS_INITTAB_OK` absent with the open having answered a negative errno. `aarch64_init`'s tests now pin every one of these words against `llvm-mc -show-encoding`, which is the check the module's header had claimed since it was written |
+
+**The pins, measured 2026-10-07.** `boot-aarch64`: the full chain through `MPOS_SWITCH_ROOT_OK`,
+`R:echo-test`, `MPOS_FAULT_OK`/`MPOS_EXEC_OK`/`MPOS_FORK_OK`, `MPOS_INITTAB_OK bytes=1957`,
+`MPOS_MUSL_OK` and the whole `MPOS_DEV_*`/`MPOS_FILE_OPS_OK` set, ending `INIT_EXITED`.
+`test --arch aarch64`: `pass=27 fail=0`. `cargo xtask test`: `pass=158 fail=0 (158 built)`, exit 33.
+`depgraph`: within the ratchet, no edge appeared and no count grew.
+
+**The open pin, now closed.** `alpine-aarch64` boots a real openrc runlevel - clock, local
+filesystems, hostname, syslog, crond, `local` all `[ ok ]` - and reaches the prompt:
+`Welcome to Alpine Linux 3.25.0_alpha20260805 (edge) / Kernel 0.1.0 on aarch64 (/dev/tty1)` then
+`mpos login:`. It cost one line's placement. `steps::arm_console` was inside aarch64's
+`if mpos.selftest` arm while x86_64 calls it in `handoff_to_init` on every boot, so a boot without
+the test word had **no console mux at all**: the getty busybox init spawns is on `/dev/tty1`, a pty
+whose master only the mux reads, so its output had nowhere to go and the log simply stopped after
+`Starting local ... [ ok ]`. The arming moved out of the gate; `check_serial_tx` - the check *of* the
+armed path - stayed in it. Measured: the same boot now prints the prompt in **16 s**, against the
+240 s deadline it used to exhaust.
+
+**And the prompt is not the whole verdict.** A failed openrc service prints `[ !! ]` and the runlevel
+carries on, so `login:` appears whether or not every service came up - which is how §13.30's
+`mount: mounting proc on /proc failed: Resource busy` sat in a log this command called green. The
+command now fails on openrc's own failure marker, and the boot that reaches `mpos login:` carries no
+`[ !! ]` line at all.
+
+**The last named difference is closed.** `init_net` + `virtio::spawn_service` sat behind
+`mpos.selftest` in `board/aarch64.rs`, read as §13.14's rule ("a service that did not assemble an
+interface must not be handed one"). That reading was wrong, and the measurement says so: those two
+calls are *bring-up*, not checks, and the first machine has always run both unconditionally
+(`init_net` straight out of its PCI enumeration, `spawn_service` at the end of `init_virtio`).
+This machine's adapter is assembled before either call regardless of the gate - `check_net` is part
+of `devices()`, which `arch::boot` runs on every boot in front of the unpack, and the window it
+opens is what `net_device()` picks up - so a boot that reached the gate had already proven a
+virtio-net window exists (`check_net` halts the machine otherwise). Gating the bring-up changed
+nothing about what the tree carried and only decided whether the stack above it was polled:
+measured, the Alpine boot ran with a published adapter and a dead `net` task, and `run --arch
+aarch64` - a session boot, so it carries `ALPINE_CMDLINE` and not the test word - never started the
+input pump, which is the same task. With the gate removed the Alpine boot prints
+`M8_NET_STACK_OK` on the way to `mpos login:` (13 s), `boot-aarch64` keeps its full chain, and the
+sweep is `pass=27 fail=0`.
+
+After this, no line in the boot flow is written twice for a reason that is not a bus, a UART or a
+page-table format. What each body holds is the shape §"The target shape" item 4 names: the entry's
+callbacks, `devices()`, the machine's own device discovery and checks, and the ordering its own
+milestones need.
+
+
+### What stays the machine's, by design
+
+PCI vs device tree; MSI vs GIC line routing; the lazy-FPU trap (no `#NM` on arm64); the two UARTs;
+the page-table/IDT proofs (`check_arch`); the console arming order (`steps::arm_console` is *called*
+at different points on purpose). None of these is duplication to remove; the phase's rule is the one
+`board/mod.rs` already states - a body holds only what would have to be answered differently on a
+different machine.
+
+### Known traps for this phase
+
+- **The aarch64 sweep's payload is not the x86_64 harness's machine.** Measured while writing
+  §13.20's pin: the x86_64 test `/init` mounts `/proc`, `/sys`, `/dev`, `/tmp`, `devpts` with
+  busybox; the aarch64 runner mounts only `/tmp`. A test that needs `/proc` therefore behaves
+  differently per machine, and one that does (this phase's shared checks will) must either mount what
+  it needs or be honest about the difference. Closing *that* gap is itself part of stage 15.1's
+  argument.
+- **`TERMINATORS`** holds a check's success marker only if no later check runs after it, plus every
+  check's failure marker.
+- **A check that mutates shared state damages the machine it checks** (§13.14, §13.15).
+- **A marker chain that gains a check must gain it in `xtask` too**, or `boot-aarch64` reads a
+  healthy boot as a hang.
 
 ---
 

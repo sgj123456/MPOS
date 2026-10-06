@@ -16,6 +16,20 @@ edition = "2024"
 # Neither survives `exit_boot_services`, which is why every allocation this
 # loader makes happens before that call - see the ordering note in `main.rs`.
 [dependencies]
+# The boot record itself, as the leaf the kernel also reads it through. It was
+# duplicated here field-for-field until this dependency existed, kept in step by
+# a magic number and a comment; now the loader and the kernel name one
+# definition, and the record cannot drift out of step with itself. The leaf is
+# `#![no_std]` plain data with no dependencies, so it compiles for the firmware
+# target as readily as for the kernel's.
+mpos-bootinfo = { path = "../crates/bootinfo" }
+# The machine layer, for the three things this loader needs from the machine:
+# the page-table descriptor format, the progress wire, and the last instruction
+# (`mpos_arch::early`). The dependency is what makes "this loader names no
+# architecture" a fact cargo enforces rather than a convention - the crate it
+# depends on is the one that holds the machines, and there is nothing else in
+# the graph that does (`PLAN.md` §14.6).
+mpos-arch = { path = "../arch" }
 uefi = { version = "0.36", default-features = false, features = [
     "alloc",
     "global_allocator",
@@ -24,3 +38,14 @@ uefi = { version = "0.36", default-features = false, features = [
 [[bin]]
 name = "mpos-boot"
 path = "src/main.rs"
+
+# The loader's body, as a library. `src/main.rs` is the `#[entry]` that calls
+# it; the kernel, once it becomes the UEFI application itself (`PLAN.md` §14.7),
+# will be the second caller. Naming it here rather than letting cargo infer it
+# keeps the two halves of one crate symmetric on the page.
+[lib]
+name = "mpos_boot"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

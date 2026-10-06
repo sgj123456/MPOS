@@ -70,10 +70,12 @@
 //! build does not compile *yet*, not one it compiles differently.
 
 #![no_std]
-#![cfg_attr(
-    all(target_os = "none", target_arch = "x86_64"),
-    feature(abi_x86_interrupt)
-)]
+// The one crate-level nightly feature this kernel used to need,
+// `feature(abi_x86_interrupt)`, went with the code that needed it: every
+// `extern "x86-interrupt"` handler is an IDT entry, and the IDT is
+// `arch/src/arch/x86_64/idt.rs`, which is `mpos-arch`'s now. Declaring a
+// feature nothing uses is a warning, and the warning is right - it would mean
+// the kernel still had a machine body in it.
 
 extern crate alloc;
 
@@ -89,8 +91,17 @@ pub use mpos_abi as abi;
 /// be tested on a machine. `pci` beside `drivers::pci` is the same split, and
 /// `mpos-pci` is the same kind of crate.
 pub use mpos_ahci as ahci;
+/// The machine layer as its own crate: the HAL and the two ports behind it.
+///
+/// Re-exported rather than declared here, so every `crate::arch::…` path in
+/// this kernel still resolves to the module it always did while the code itself
+/// lives in `mpos-arch` - a crate that cannot name `crate::sched`, `crate::mm`
+/// or `crate::println!` at all, which is the whole point of the split
+/// (`PLAN.md` §14 S4). What crosses is the facade and nothing else:
+/// `arch/x86_64` and `arch/aarch64` are `pub(crate)` inside that crate, so the
+/// re-exports in its `mod.rs` are the whole of what the wiring layer may name.
 #[cfg(target_os = "none")]
-pub mod arch;
+pub use mpos_arch::arch;
 /// Binary formats: how the kernel decides what runs a file. Its own leaf crate
 /// (reading a `#!` line is pure); re-exported so `crate::binfmt` still resolves.
 pub use mpos_binfmt as binfmt;
@@ -130,34 +141,26 @@ pub use mpos_date as date;
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub mod drivers;
+/// The hardware abstraction layer: capability traits, one forward per
+/// capability, and the table of kernel services the machine layer asks back
+/// for. Re-exported from `mpos-arch` for the same reason `arch` is: the paths
+/// in this kernel are unchanged, and the crate boundary is what makes the
+/// machine layer's independence something cargo enforces rather than something
+/// a reviewer has to notice.
+///
+/// The shape is argued in the module's own documentation: one trait per concern
+/// rather than one `Arch` blob, so an architecture-specific *type* has nowhere
+/// to cross (`PLAN.md` §14.2), and the optional capabilities (`Msi`, `SerialRing`,
+/// `FpuTrap`, `SignalFrame`, `ConsoleInput`, `TestExit`) carry the ways one
+/// machine does something another has no hardware for - declared by an `mpos_*`
+/// flag in `.cargo/config.toml`, never by an architecture name, so this module
+/// itself knows no machine.
+#[cfg(target_os = "none")]
+pub use mpos_arch::hal;
 /// The errno table: the numbers every layer answers "no" with. Its own leaf
 /// crate, re-exported here so `crate::err` keeps resolving for every caller,
 /// while the crate itself cannot name the kernel and so cannot reach back up.
 pub use mpos_err as err;
-/// The hardware abstraction layer: the capability traits a machine implements
-/// and the forwards everything above asks it through (`src/hal/mod.rs`). Machine
-/// only, like `arch` itself - it exists so that nothing outside `arch`/`hal`
-/// names an architecture.
-///
-/// x86_64-only for now, and by construction rather than by choice: the forwards
-/// at the bottom of `hal/mod.rs` name all six traits, so the module can only be
-/// compiled for a machine that implements all six. The aarch64 impls land with
-/// their stages - `Cpu`/`Interrupts` at 1c, `Contexts` at 2 (and its `UserFrame`
-/// at 6a), and `Paging` split: 1f gave it the table-building half (`install`,
-/// `translate`), 6a a user space that can be built, mapped, switched to and
-/// walked, and 6b that space's *operations* - `unmap`, `protect`,
-/// `walk_user_pages`, the copy-on-write half and the `Drop` built out of them,
-/// written to `AddressSpaceOps`' shapes so that the impl is delegation when
-/// `hal` reaches this machine. Both machines now compile it: x86_64 implements the
-/// baseline concerns plus the optional capabilities its hardware has
-/// (`Msi`/`FpuTrap`/`SignalFrame`), and aarch64 - which has no MSI controller and no
-/// lazy FPU trap, but has had its own `rt_sigframe` since §13.2's Stage 3b -
-/// implements the baseline plus `SignalFrame`, which is what the split into
-/// optional capability traits exists to allow. The aarch64 impls landed
-/// with the stages that built their bodies: the `Paging` running-process methods and
-/// the PL031 `WallClock` (`PLAN.md` §9.1).
-#[cfg(target_os = "none")]
-pub mod hal;
 /// evdev's record window and its clients: which reader sees which event, and
 /// what a grab does to the answer. Its own leaf crate - the driver that fills
 /// the window needs a virtio ring and a clock, but the policy over it is
@@ -181,6 +184,12 @@ pub use mpos_gpu as gpu;
 /// Kernel logging: `tracing` events, formatted onto the serial console.
 /// Ungated so the level names and the command-line parsing stay testable on
 /// the host; only the subscriber that writes to COM1 is machine-specific.
+/// The machine layer's hook table, implemented: the kernel services `arch`
+/// asks for through `hal::kernel` (`PLAN.md` §14.2). One impl for every
+/// machine - the table was written twice only because it looked
+/// machine-shaped, and it never was.
+#[cfg(target_os = "none")]
+pub mod kernel_services;
 pub mod logging;
 pub mod mm;
 /// The network stack, and the socket syscalls over it. Host builds skip it:
@@ -188,8 +197,8 @@ pub mod mm;
 ///
 /// Ungated on both machines since §13.4's device seam landed and the second one
 /// got an adapter. `net` holds `Arc<dyn drivers::virtio::NetDevice>` and names no
-/// transport; the machine that owns the card opens it - `main/x86_64.rs` over the
-/// PCI bus, `main/aarch64.rs` over the MMIO window its `check_net` found and
+/// transport; the machine that owns the card opens it - `board/x86_64.rs` over the
+/// PCI bus, `board/aarch64.rs` over the MMIO window its `check_net` found and
 /// published - and hands it to `net::init`, so the stack above the seam is the
 /// same code on both and a machine with no card hands over nothing (the honest
 /// `ENETDOWN`, not a device that pretends to answer). The one reference still

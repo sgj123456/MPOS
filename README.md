@@ -350,7 +350,7 @@ Chinese. In short:
 
 | Command | What it does | Root? |
 |---|---|---|
-| `cargo xtask build` | Kernel + UEFI loader | no |
+| `cargo xtask build` [`--arch x86_64\|aarch64`] | Kernel + UEFI loader, for the machine `--arch` names (it drives both `--target`s) | no |
 | `cargo xtask initramfs` | Build the initramfs archive | yes |
 | `cargo xtask disk` | Create the empty GPT image | yes |
 | `cargo xtask rootfs` | Install Alpine into the image (refreshes the initramfs) | yes |

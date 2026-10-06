@@ -1,0 +1,28 @@
+# The mapping vocabulary - what a mapping *is*, as opposed to how a machine
+# makes one - as a leaf.
+#
+# Its own crate because `hal::Paging` and `hal::AddressSpaceOps` are written in
+# it: `Mapping`, `MapFlags`, `PageTaken` and `KernelSections` cross the machine
+# seam in both directions, so once the machine layer is `mpos-arch` neither the
+# kernel nor that crate can own them (`PLAN.md` §14 S2b). The page arithmetic
+# and `kernel_mappings` - the machine-independent *plan* - came with them,
+# because a `Mapping` is not page-granular without `PAGE_SIZE` and a port
+# consumes the plan as its input.
+[package]
+name = "mpos-vm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# `BootInfo` is what `kernel_mappings` turns into mappings, so the record is
+# this crate's only kernel-side dependency - and it is a leaf too.
+mpos-bootinfo = { path = "../bootinfo" }
+
+[dependencies.bitflags]
+version = "2.13"
+# `no_std`: the bitflags macros need nothing from `std`, and this crate is
+# compiled for bare metal.
+default-features = false
+
+[lints]
+workspace = true

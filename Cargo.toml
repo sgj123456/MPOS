@@ -5,7 +5,7 @@
 # without it would build the user programs for the host too, and they are
 # built for musl.
 [workspace]
-members = ["user", "user/tests", "user/abitest", "boot", "xtask", "crates/*"]
+members = ["arch", "user", "user/tests", "user/abitest", "boot", "xtask", "crates/*"]
 # "." is the kernel - the root package, which is a member without being
 # listed in `members`.
 default-members = ["."]
@@ -25,6 +25,17 @@ edition = "2024"
 # V-14). Re-exported by `src/lib.rs` as `crate::err`, so every caller's path is
 # unchanged; the crate itself cannot name the kernel.
 mpos-err = { path = "crates/err" }
+# The boot record (`Handoff`) and the kernel's view of it (`BootInfo`), as a
+# leaf: the machine layer names both - `hal::Paging::install` takes a `BootInfo`
+# and the aarch64 entry is handed a `Handoff` - so neither the kernel nor the
+# machine crate can own them (`PLAN.md` §14 S2a). `src/boot` re-exports them
+# under their old names.
+mpos-bootinfo = { path = "crates/bootinfo" }
+# The mapping vocabulary the same way: `Mapping`, `MapFlags`, `PageTaken`,
+# `KernelSections`, the page arithmetic and the machine-independent
+# `kernel_mappings` plan, all of which `hal::Paging` is written in
+# (`PLAN.md` §14 S2b). `src/mm/vm.rs` and `src/mm/pframe.rs` re-export them.
+mpos-vm = { path = "crates/vm" }
 # The arch-neutral Linux ABI facts (`clone` flags, default umask, the rlimit
 # model) as a leaf, so `sched` names them without an edge up into `syscall`'s
 # dispatch. `syscall`'s `nr`/`abi` re-export these rather than redefining them.
@@ -107,6 +118,16 @@ mpos-pci = { path = "crates/pci", features = ["test-helpers"] }
 [target.'cfg(target_os = "none")'.dependencies]
 critical-section = { version = "1.2", features = ["restore-state-bool"] }
 
+# The machine layer, as a crate of its own: the HAL (`mpos_arch::hal`) and the
+# two ports (`mpos_arch::arch::{x86_64,aarch64}`). `src/lib.rs` re-exports both
+# under the names they already had, so no call site or its commentary moved -
+# but the boundary is a crate boundary now, which is what makes the machine
+# layer's independence cargo's business rather than a convention's
+# (`PLAN.md` §14 S4). Machine-only: it is `cli`/`sti`, MSRs and descriptor
+# tables, so the host build does not compile it and this block is where that is
+# said.
+mpos-arch = { path = "arch" }
+
 # The host test build compiles the VFS too, which locks; `std` picks the stock
 # critical section for hosted targets.
 [target.'cfg(not(target_os = "none"))'.dependencies]
@@ -163,21 +184,30 @@ lto = "thin"
 strip = true
 
 # The capability flags `crate::hal` gates its optional forwards on
-# (`src/hal/mod.rs`). Each machine declares the set it has in its own
+# (`arch/src/hal/mod.rs`). Each machine declares the set it has in its own
 # `[target.…]` block in `.cargo/config.toml`, so `hal` names no architecture -
 # it asks whether the build has a capability. Declaring them here is what keeps
 # `--cfg mpos_…` from tripping the `unexpected_cfgs` lint, and it is the one
 # place the full vocabulary is listed.
-[lints.rust]
+#
+# A workspace table rather than a package one because two packages speak it: the
+# kernel and `mpos-arch`, the machine layer it now lives beside. A cargo lint
+# table is per-package, so the list written twice is a list whose stale copy is
+# the one that stops warning; `[lints] workspace = true` in each package is the
+# opt-in. The other members declare no such flags and do not opt in.
+[workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(mpos_msi)",
     "cfg(mpos_serial_ring)",
     "cfg(mpos_fpu_trap)",
     "cfg(mpos_signal_frame)",
     "cfg(mpos_framebuffer_console)",
-    "cfg(mpos_dynamic_mmio_window)",
+    "cfg(mpos_qemu_debug_exit)",
     "cfg(mpos_net)",
     "cfg(mpos_console_input)",
     "cfg(mpos_pci_config)",
     "cfg(mpos_input_registry)",
 ] }
+
+[lints]
+workspace = true

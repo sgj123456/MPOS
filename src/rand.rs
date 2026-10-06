@@ -35,6 +35,27 @@ pub fn init() {
     });
 }
 
+/// A machine's rng device, as something to call: `None` when this machine has
+/// none, or has not been wired yet.
+type DeviceEntropy = fn() -> Option<[u8; 32]>;
+
+/// The machine's rng device, registered by the wiring layer.
+///
+/// *Injected* rather than named, for the same reason `gpu::sync::Waker` and
+/// `evdev`'s waiter numbers are: the alternative is this module - a kernel
+/// service - naming `crate::drivers`, which closes a cycle with the edge that
+/// already runs the other way (`drivers::devices` fills `/dev/urandom` from
+/// here). `cargo xtask depgraph` counts that as a new mutual pair, and it is
+/// right to: which device a machine has is the wiring layer's fact, and
+/// `main/<arch>.rs` is where it is said (`PLAN.md` §14.3).
+static DEVICE_SOURCE: Mutex<RefCell<Option<DeviceEntropy>>> = Mutex::new(RefCell::new(None));
+
+/// Register the machine's rng device. Called once, from `main/<arch>.rs`,
+/// before anything can draw from this generator.
+pub fn set_device_entropy(source: DeviceEntropy) {
+    critical_section::with(|cs| *DEVICE_SOURCE.borrow(cs).borrow_mut() = Some(source));
+}
+
 /// Fill `out` with random bytes.
 ///
 /// Seeds on first use if [`init`] was never called: a syscall or a device read
@@ -107,6 +128,23 @@ fn seed() -> [u8; 32] {
 
     crate::hal::mix_entropy(&mut seed);
 
+    // The rng *device*, on a machine that has one, through the source the
+    // wiring layer registered. Deliberately not part of `hal::Entropy`: that
+    // trait is the machine's own sources - the CPU's `RDRAND` - while a
+    // virtio-rng is a driver the kernel enumerates, so folding it in here is
+    // what keeps the machine layer from having to name a driver
+    // (`PLAN.md` §14.3). Taken out of the lock before it is called: reading the
+    // device is not this module's business and must not happen inside a
+    // critical section it holds.
+    let source = critical_section::with(|cs| *DEVICE_SOURCE.borrow(cs).borrow());
+    if let Some(source) = source {
+        if let Some(device) = source() {
+            for (byte, host) in seed.iter_mut().zip(device) {
+                *byte ^= host;
+            }
+        }
+    }
+
     // The boot instant and the tick counter, mixed one byte at a time so a
     // zero-filled stretch above is not left as zeroes.
     let epoch = crate::hal::boot_epoch();
@@ -145,10 +183,32 @@ pub fn fingerprint() -> [u8; 32] {
 
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
+    extern crate std;
+
+    use std::sync::{Mutex, MutexGuard};
+
     use super::{fill, fingerprint, reseed};
+
+    /// The generator this module tests is a `static`, and `cargo test` runs
+    /// these on several threads at once. Two interleaved makes
+    /// `a_reseed_re_keys_the_generator`'s "a passive read must not advance the
+    /// key" false - the other thread re-keyed in between - which is a property
+    /// of the runner's scheduling and not of the generator. Held for the length
+    /// of every test that draws from it, so what fails is the code.
+    static GENERATOR: Mutex<()> = Mutex::new(());
+
+    /// The lock, taken in a way that survives a neighbour's panic: a test that
+    /// failed while holding it has already said what is wrong, and poisoning
+    /// the rest of the module would replace that report with a second one.
+    fn exclusive() -> MutexGuard<'static, ()> {
+        GENERATOR
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn two_fills_do_not_repeat() {
+        let _guard = exclusive();
         // The bug this module exists to fix: the old source re-seeded from the
         // tick on every call, so two calls in one tick returned the same bytes.
         let mut first = [0u8; 32];
@@ -160,6 +220,7 @@ mod tests {
 
     #[test]
     fn a_fill_actually_changes_the_buffer() {
+        let _guard = exclusive();
         let mut bytes = [0u8; 64];
         fill(&mut bytes);
         assert!(bytes.iter().any(|&b| b != 0));
@@ -167,6 +228,7 @@ mod tests {
 
     #[test]
     fn a_stream_keeps_going_across_calls() {
+        let _guard = exclusive();
         // Two halves read as one stream must not repeat either: this is what a
         // caller reading `/dev/urandom` in chunks depends on.
         let mut a = [0u8; 16];
@@ -178,6 +240,7 @@ mod tests {
 
     #[test]
     fn a_reseed_re_keys_the_generator() {
+        let _guard = exclusive();
         // `RNDRESEEDCRNG` has to leave the generator in a state no earlier
         // output predicts. The fingerprint reads from a *clone*, so it does not
         // advance the stream itself, and two fingerprints taken without a
@@ -200,6 +263,7 @@ mod tests {
 
     #[test]
     fn a_rekeyed_generator_still_produces_bytes() {
+        let _guard = exclusive();
         reseed();
         let mut a = [0u8; 16];
         let mut b = [0u8; 16];

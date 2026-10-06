@@ -17,3 +17,6 @@ critical-section = { version = "1.2", features = ["restore-state-bool"] }
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
 critical-section = { version = "1.2", features = ["std"] }
+
+[lints]
+workspace = true

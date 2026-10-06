@@ -13,9 +13,10 @@ at those rather than repeating them.
 
 | Path | What lives there |
 |---|---|
-| `src/` | kernel crate `mpos`: `lib.rs` (host-testable) + `main.rs`, a thin arch dispatcher over `src/main/<arch>.rs`, which holds that machine's boot entry, milestone checks and panic handler |
-| `crates/` | downward-only leaf crates (§3): `err`/`abi`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu`/`evdev`/`uinput`/`blk` |
-| `boot/` | `mpos-boot`, the UEFI loader — separate target (`-unknown-uefi`), no kernel dep, one hand-written handoff record shared by both machines; one file per concern, one arm per machine |
+| `src/` | kernel crate `mpos`: `lib.rs` (host-testable) + `main.rs`, the one architecture-independent entry and panic handler, over `src/board/`, which holds that machine's boot wiring, its devices and its milestone checks — one body per machine (`src/board/<arch>.rs`, chosen in one place) plus the shared half both bodies call: `src/board/steps.rs` (the five steps every body's `init` runs: scheduler, ramfs root, unpack, console arming, pid-1 handoff, plus the one exit-hook registry and the net bring-up), `src/board/report.rs` (the boot banner, the boot-stack canary check, `park`, the stack-use report and the panic walk) and `src/board/checks/` (the neutral milestone checks, `PLAN.md` §13.21/§13.23). The bodies live here and not in `mpos-arch` because what is left in them names `vfs`/`blk`/`net`/`drivers`, and the shared half lives here rather than in the library because arming the console and reading `kernel_sections` name `crate::arch::`, which only the wiring may do |
+| `arch/` | `mpos-arch`, the machine layer: `hal/` (the capability traits, their forwards, and `hal::kernel`'s table of kernel services), `arch/{x86_64,aarch64}/` (the two ports, their linker scripts, and everything that *is* the machine), and `early/` (the same two machines as the *bootloader* sees them — descriptors, wire, jump — the one tree compiled for `-unknown-uefi` rather than `-unknown-none`, `PLAN.md` §14.6). A crate so that the machine layer cannot name the kernel at all (§3); `src/lib.rs` re-exports `{arch, hal}` so the kernel's paths are unchanged. Deliberately not under `crates/` — that directory means "host-testable leaf" and this one cannot be compiled for the host |
+| `crates/` | downward-only leaf crates (§3): `err`/`abi`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu`/`evdev`/`uinput`/`blk`/`fdt`/`bootinfo`/`vm` |
+| `boot/` | `mpos-boot`, the UEFI loader — its own target (`-unknown-uefi`), no kernel dep, no architecture in it at all (the three machine things it needs are `mpos-arch`'s `early/`). Since 2026-10-06 it is a **library plus a thin `#[entry]` binary**: `src/lib.rs` (`mpos_boot::run`) holds the whole sequence and `src/main.rs` is the firmware entry that calls it, so the kernel can become the second caller (`PLAN.md` §14.7). The handoff record is one definition in the `crates/bootinfo` leaf, read by both machines and both sides of the seam |
 | `xtask/` | `mpos-xtask`, the build/run/test front-end; `xtask/README.md` documents every command |
 | `user/` | `mpos-user` (ordinary `std` programs); `user/abitest/` = the `no_std` conformance suite (`src/bin/syscall/` one family, `src/bin/integration/` end-to-end); `user/tests/` = `std`-side tests; `user/staging/` = scratch, wired into no build |
 | `fuzz/` | `mpos-fuzz`, **its own workspace**: libFuzzer targets over the kernel's parsers |
@@ -42,8 +43,8 @@ the network; `alpine-aarch64` also needs `fakeroot`.
 
 | Command | What it does | Root? |
 |---|---|---|
-| `cargo xtask build` | kernel + UEFI loader | no |
-| `cargo xtask all` | kernel, initramfs, disk image, root filesystem | yes |
+| `cargo xtask build` [`--arch x86_64\|aarch64`] | kernel + UEFI loader, **for the machine `--arch` names** — the switch drives both `--target`s (`x86_64\|aarch64-unknown-none` and `-unknown-uefi`), not just which image gets booted | no |
+| `cargo xtask all` | kernel, initramfs, disk image, root filesystem. **x86_64 only**: these assemble *that machine's* GPT disk, so `--arch aarch64` is refused by name rather than built as the other machine; the second machine's disk is laid out by `boot-aarch64`/`alpine-aarch64`/`run --arch aarch64` | yes |
 | `cargo xtask run` [`--mode terminal\|gui\|mirror`] [`--arch x86_64\|aarch64`] | boot in QEMU, rebuilding stale bits. `--mode` picks the window backend and the guest's `console=` list together. `--arch aarch64` boots the second machine to its **own shell** on the serial console — pid 1 is an in-tree `/init` that makes `/tmp` and `execve`s `/bin/sh` (the multi-call `/bin` image `xtask/src/aarch64_bin.rs` builds) | when needed |
 | `cargo xtask test` | **the gate**: host unit tests, then every user test program booted in QEMU. `--arch aarch64` is the second machine's own arm, read with the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol; its program set is `tests.toml`'s `aarch64` group's answer, and the arm prints every one by group and name — a green summary means "every program this machine was supposed to run passed", never a silent skip. Neither arm can silently run the other machine | no |
 | `cargo xtask depgraph` | measure the module graph against the Phase-11 ratchet; fails when an edge appears or a count grows | no |
@@ -58,7 +59,7 @@ cargo fmt --check
 cargo clippy --target x86_64-unknown-none            # kernel, bare metal
 cargo clippy --target x86_64-unknown-linux-gnu       # kernel, host
 cargo clippy -p mpos-xtask --target x86_64-unknown-linux-gnu
-cargo clippy --target aarch64-unknown-none           # everything under src/arch/aarch64/ is
+cargo clippy --target aarch64-unknown-none           # everything under arch/src/arch/aarch64/ is
 (cd boot && cargo clippy --target aarch64-unknown-uefi)   # #[cfg]-ed out of every x86 target above
 ```
 
@@ -228,10 +229,13 @@ which consoles it has and nothing about how it was launched.
 not only `apk` — `mke2fs -d` stats each file, so an unwrapped `mkfs` writes a root filesystem owned
 by the build user.
 
-**Touch the boot handoff.** The `Handoff` record is written twice — `boot/src/handoff.rs` (loader)
-and `src/boot/handoff.rs` (kernel) — plus `BOOT_STACK_CANARY` in `src/main.rs`. No shared crate by
-design. Change all three, and keep the loader's "allocate everything before `exit_boot_services`"
-ordering intact.
+**Touch the boot handoff.** The `Handoff` record is one definition now —
+`crates/bootinfo` — read by both the loader (`mpos-boot` depends on it) and the
+kernel (`src/boot/handoff.rs` re-exports it). Changing a field changes the ABI
+an older `mpos.elf` on a partition is read with, so bump `HANDOFF_MAGIC` unless
+the change is append-only. Keep `BOOT_STACK_CANARY` in `crates/bootinfo` — the one
+definition the loader and both kernels read now (§13.23) — and the loader's
+"allocate everything before `exit_boot_services`" ordering intact.
 
 ---
 
@@ -246,17 +250,25 @@ ordering intact.
 | A flag or struct constant looks shared but the machines disagree | It is the machine's. `open(2)`'s `O_*` words differ on arm64 and the overlap bit the session-costing `ELOOP` bug (§13.13); `struct stat`/`statx` and the signal frame were the same class. Read **the machine's** uapi and pin both machines (`t-open-flags`) |
 | `cargo xtask run` prints no milestone markers | By design — `M*_OK` checks run only under `mpos.selftest`. The aarch64 machine's own marker chain is its boot's verdict and comes from `boot-aarch64`; its full meaning is `docs/PLAN.md` §9.1 |
 | `cargo xtask test` stage 1 goes red in `rand` and nowhere else | A **flake** — re-run before believing it and quote the green run. Measurement, mechanism and fix directions: `docs/PLAN.md` §12.4a |
+| Stage 2 goes red on `t-clock-gettime`'s "two reads never go backwards" | A **flake** of the same kind, in the wall clock rather than in a service: `CLOCK_REALTIME` is the CMOS second plus a tick-derived fraction sampled around it, so two successive reads can step back. Re-run before believing it; the measurement and why it is not this class's subject are in `docs/PLAN.md` §13.27 |
 | A recorded measurement is about the machine that made it | A number already written down is not a measurement of *this* question. The tell is a claim that made a refusal permanent without saying which register, program or run — re-measure before building on it (§13.15) |
+| A driver holds the transport *inside* its device struct | The crate's `Transport` is **not object-safe** (`begin_init<F: Flags>` is a generic method and `VirtQueue::new`/`add_notify_wait_pop` take `&mut impl Transport`), so `Box<dyn Transport>` does not exist and such a device cannot be one concrete `static`-held type shared by two machines. Two shapes work, and the error count does not tell them apart: open the device inside the driver module and hand the rest only a contract (`NetDevice`, `ConsolePort`, `InputDevice`), or make the device generic and let its *consumer* hold a `Box<dyn YourDevice>` (`Gpu`/`GpuDevice`, §13.26 — 3 errors either way). |
+| A machine declares a capability and still has no device behind it | A capability flag makes a port cheap to complete **only if everything behind it is gated on the capability and not on the architecture**. Declaring `mpos_input_registry` for aarch64 cost **1** error once the modules, the `/dev` block and the exit hooks asked it (§13.23); it cost **4** while a `#[cfg(target_arch = "x86_64")]` module gate hid behind it, and the stale figure sat in the plan until it was re-measured (§13.24). The other half of the same trap: opening a device, proving the transport and dropping it is a milestone, not a driver — such a port has no device to read, only a proof that one answered (§13.24) |
 | An aarch64 `M*_OK` check runs in front of the machine's own `init` | The checks run on every aarch64 boot, including `alpine-aarch64`. A check that changes shared state must put it back or it damages the machine it is checking (§13.14: a wall-clock check left the year 36812 and killed `syslogd`) |
 | `TERMINATORS` in `xtask/src/aarch64.rs` is a list of *last* markers | It holds the last check's success marker and every check's failure marker — never the success marker of a check another check comes after. A wrong one kills the boot seconds in, indistinguishable from a hang. Full history and the elapsed-time tell: `docs/PLAN.md` §9.1 |
 | A `static` with a zero initializer and no writer lands in `.rodata` | Read-only, on a machine whose page tables enforce it — and it bites whatever intended to write it (stage 1d's arena, stage 2's task stack). The fix is frames from the allocator, not a section attribute; `-zmax-page-size` will not save you (`docs/PLAN.md` §9.1 row 1d) |
 | An assembly block that switches section switches it for every later block | Every `global_asm!` in a crate is one assembly unit; a block that changes section without restoring moves everything assembled after it, visibly only in the linker map. The symptom is a faulting fetch on a prologue that reads as "code in `.rodata`". Three defences (`.pushsection`/`.popsection`, naming the section in every code block, the linker `ASSERT`s) and the measurement: `docs/PLAN.md` §13.16 |
+| An aarch64 exception entry that can switch tasks does not save `ELR_EL1`/`SPSR_EL1` | AArch64 does not push the interrupted `PC`/`PSTATE` on the interrupted stack the way x86 pushes its return frame: they go to `ELR_EL1`/`SPSR_EL1`, one pair per core, and any other task's trap overwrites them. The kernel's IRQ stub calls `preempt`, so it switches by construction; a trap from EL0 needs `SP_EL0` as well. Both stubs save their resume state on their own stack because of this, and the symptom of forgetting is the kernel resuming into another context's `PC` — measured as an instruction abort on a data address: `docs/PLAN.md` §13.21/§13.22 |
 | No cross-architecture build | aarch64 boots the way x86_64 does — firmware, ESP, higher half, its own tables, EL0 address spaces — and the two arms share nothing but source layout. What compiles where, the three measured boot choices (`acpi=off`, `force-legacy=false`, device RAM cost) and the port's current reach: `docs/PLAN.md` §9.1/§13 |
 | `fuzz/` won't build from the root | It is its own workspace; run `cargo fuzz` from inside `fuzz/` |
 | A `net/*` host test never runs | `src/lib.rs` gates the whole `net` module on `target_os = "none"`; a host test inside it is unreachable |
 | `user/staging/` looks like a missing test | Deliberate scratch — check `user/abitest` and `user/tests` for the live version first |
 | Two `cargo xtask test` runs in one tree report nonsense | They share `build/test-*` artefacts and one reads a log the other is writing. Trust the log's own summary + `=== END`, re-run alone |
 | The test machine ≠ the run machine | `xtask test` boots an initramfs on its own QEMU wiring; `xtask run` boots the disk image on `machine.toml`'s. A device only one has is a shape no test sees — name a driver's "controller with nothing on it" behaviour on the machine that has one before calling it measured (§7.3's 28 s empty-controller boot) |
+| A device class needs a *host* backend, not just a QEMU device | vsock is the one virtio device QEMU does not emulate in userspace: `vhost-vsock-*` is a host kernel module, and a machine naming it without `/dev/vhost-vsock` refuses to start. So such a device is attached only where the host can back it, its success marker is required only there, and the skip is **printed** - a verdict that quietly ran one check fewer is the failure `tests.toml`'s groups exist to prevent. Give the device a CID distinct from every other machine's (the aarch64 boot takes `4`, the run machine `3`): a second guest claiming a live CID aborts QEMU before the guest starts (§13.28) |
+| An `M*_OK` marker's own summary can outlive the class's condition | the prose `xtask` prints when every required marker was seen is a *claim*, and a conditional marker makes it a conditional claim: §13.28's summary line is built from the same `vsock_available()` decision that picks the marker, so it says "seven devices" and omits `M8_VSOCK_OK` on a host that could not back the device. A summary hard-coded to the host that wrote it is a lie on the host that reads it |
+| A driver compiles, is host-tested, and **nothing calls it** | the shape that hid the 9p share for months: `fs9p::init_global` filled the registry every mount reads and was called from nowhere, so `devices()` was always empty and every boot printed "no share on the bus" while QEMU exported one. A probe nothing invokes is not a working feature, and a *complete* driver plus a green host test is exactly what hides it - the tests pin the parser, not the wiring. The tell is a boot log line that never changes: grep for the line a device is supposed to print and check whether any commit ever changed it (§13.29) |
+| A wire client that has never run against a real server | the 9p client implemented plain 9P2000, which this host's QEMU 11 answers `"unknown"` to - so even with the probe wired it could never attach, and its host tests (against hand-built records) could not know. A protocol client's *own* fixtures are not a measurement of the server it talks to: ask the real one. The measurement is one boot printing the dialect each side agrees on, and the fix is a dialect the server serves, not a negotiation loop that hides which one it got (§13.29) |
 
 ---
 

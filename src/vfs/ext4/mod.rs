@@ -2329,7 +2329,7 @@ mod tests {
     fn an_apk_style_symlink_commit_resolves() {
         let fs = mounted(Arc::new(format()));
         let vfs = alloc::sync::Arc::new(crate::vfs::mount::Vfs::new());
-        vfs.mount_root(&fs);
+        vfs.mount_root(alloc::sync::Arc::new(fs));
 
         let root = vfs.resolve("/").expect("root");
         root.create("usr", NodeKind::Dir).expect("usr");

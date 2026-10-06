@@ -1,4 +1,4 @@
-//! 9P2000, the protocol, and the filesystem it mounts as over virtio.
+//! 9P2000.u, the protocol, and the filesystem it mounts as over virtio.
 //!
 //! A 9p share is a directory tree the *host* keeps: QEMU serves one from a
 //! path it was handed on its command line, and the guest reaches in with a
@@ -9,14 +9,19 @@
 //! the [`Inode`] contract, which is the same mapping every other filesystem
 //! in this tree already answers.
 //!
-//! The dialect is plain 9P2000, the one QEMU serves without negotiation:
-//! no `.u` extensions, no `.L`. What that costs is named rather than
-//! hidden: symlinks and hard links have no message to build from
-//! ([`Inode::symlink`]/[`Inode::link`] answer `Unsupported`, which is what
-//! Linux's v9fs answers for them on a 9P2000 server), and `rename(2)` has
-//! no atomic form - it answers `EXDEV`, the same answer a cross-filesystem
-//! rename gives, so a caller falls back to the copy-and-delete every
-//! cross-device move already needs.
+//! The dialect is **9P2000.u**, and that is measured rather than chosen
+//! (`PLAN.md` §13.29): QEMU 11.1.1's virtfs answers `"unknown"` to a plain
+//! `9P2000` `Tversion` and `9P2000.u` to this one, so the plain dialect this
+//! client used to ask for is one no modern server serves. `.u` is 9P2000 plus
+//! the numeric ids (attach's `n_uname`, a stat's `n_uid`/`n_gid`/`n_muid`) and
+//! the `extension` string a stat carries; every other message is unchanged.
+//! What the dialect family still costs is named rather than hidden: symlinks and
+//! hard links have no message to build from ([`Inode::symlink`]/[`Inode::link`]
+//! answer `Unsupported`, which is what Linux's v9fs answers for them on a 9P2000
+//! server), and `rename(2)` has no atomic form - it answers `EXDEV`, the same
+//! answer a cross-filesystem rename gives, so a caller falls back to the
+//! copy-and-delete every cross-device move already needs. Both are messages
+//! 9P2000*L* adds and this dialect does not have.
 //!
 //! # Fids and write-through
 //!
@@ -57,6 +62,17 @@ use critical_section::Mutex;
 // half and takes and returns plain bytes.
 // ---------------------------------------------------------------------------
 
+/// The dialect this client speaks.
+///
+/// **9P2000.u**, and that is measured rather than preferred (`PLAN.md` §13.29):
+/// QEMU 11.1.1's virtfs answers `"unknown"` to a plain `9P2000` `Tversion` and
+/// `9P2000.u` to this one, so the plain dialect the client used to ask for is
+/// one no modern server serves. `.u` is `9P2000` plus the numeric ids
+/// (`n_uname` on attach, `n_uid`/`n_gid`/`n_muid` in a stat) and the `extension`
+/// string a stat carries; everything else on the wire - walk, open, read, write,
+/// clunk, remove - is the same message with the same encoding.
+const DIALECT: &str = "9P2000.u";
+
 const T_VERSION: u8 = 100;
 const R_VERSION: u8 = 101;
 const T_ATTACH: u8 = 104;
@@ -93,7 +109,13 @@ const O_READ: u8 = 0;
 const O_RDWR: u8 = 2;
 
 /// A file's facts as one `Rstat` carries them, decoded.
-struct Stat {
+///
+/// `pub` and not `pub(crate)` because [`parse_stat`] hands it out, and
+/// `parse_stat` is `pub` so the fuzz target can drive it
+/// (`fuzz/fuzz_targets/p9_stat.rs`). Its fields stay private: what callers - and
+/// the fuzzer - need is that a record is placed inside the buffer it came in,
+/// not the individual words.
+pub struct Stat {
     kind: NodeKind,
     /// The qid's path - the identity the *server* keeps for the file, which
     /// is the closest thing a 9p share has to an inode number.
@@ -106,21 +128,30 @@ struct Stat {
     name: String,
 }
 
-/// Decode one `stat` record out of a directory read or an `Rstat`.
+/// Decode one `statu` record out of a directory read or an `Rstat`.
 ///
 /// The record is its own length word followed by that many bytes, which is
 /// how the readdir stream can be walked without knowing anything about
 /// what follows. A buffer that ends mid-record is a broken server; `None`
 /// is the answer, and the caller treats it as damage rather than
 /// truncating the listing silently.
-fn parse_stat(bytes: &[u8]) -> Option<(Stat, usize)> {
+///
+/// The layout is `.u`'s `statu`: `type[2] dev[4] qid[13] mode[4] atime[4]
+/// mtime[4] length[8] name[s] uid[s] gid[s] muid[s] extension[s] n_uid[4]
+/// n_gid[4] n_muid[4]`. This reader stops after `name`, the last field it uses -
+/// the numeric ids and the `extension` are the server's business - and `used` is
+/// the whole record either way, so nothing here depends on them. It is `pub`
+/// because it is the wire half's one parser and the fuzz target drives it
+/// directly (`fuzz/fuzz_targets/p9_stat.rs`).
+pub fn parse_stat(bytes: &[u8]) -> Option<(Stat, usize)> {
     let mut at = 0usize;
     let total = take_u16(bytes, &mut at)? as usize;
     let record = bytes.get(at..at.checked_add(total)?)?;
     at += total;
 
     // Inside the record: type[2] dev[4] qid[13] mode[4] atime[4]
-    // mtime[4] length[8] name[s] uid[s] gid[s] muid[s].
+    // mtime[4] length[8] name[s] uid[s] gid[s] muid[s] extension[s]
+    // n_uid[4] n_gid[4] n_muid[4]. Only the fields up to `name` are read.
     let mut in_rec = 0usize;
     let _type = take_u16(record, &mut in_rec)?;
     let _dev = take_u32(record, &mut in_rec)?;
@@ -253,7 +284,7 @@ mod device {
     const HEADER: usize = 7;
 
     pub struct P9fs {
-        dev: Arc<crate::drivers::virtio::fs9p::Virtio9p>,
+        dev: Arc<dyn crate::drivers::virtio::P9Device>,
         /// The message size the handshake settled on: ours, or the host's
         /// smaller answer.
         msize: Mutex<RefCell<u32>>,
@@ -370,17 +401,21 @@ mod device {
         /// `Tversion`: agree the dialect and the message size. The host is
         /// allowed to answer with a smaller `msize` than was asked for, and
         /// that answer is the size every later message obeys.
+        ///
+        /// A server that answers any dialect but [`DIALECT`] is refused rather
+        /// than parsed as if it were: plain `9P2000` lacks the fields `.u` adds,
+        /// and `.L` is a different message set entirely.
         fn version(&self) -> VfsResult<()> {
             let mut body = Vec::new();
             put_u32(&mut body, MSIZE);
-            put_str(&mut body, b"9P2000");
+            put_str(&mut body, DIALECT.as_bytes());
             let answer = self.call(T_VERSION, &body, R_VERSION)?;
             let mut at = HEADER;
             let msize = take_u32(&answer, &mut at).ok_or(VfsError::Corrupt)?;
             let dialect = take_str(&answer, &mut at).ok_or(VfsError::Corrupt)?;
-            if dialect != "9P2000" {
-                // The server speaks something else - usually `.u` or `.L`,
-                // which this client did not ask for and does not parse.
+            if dialect != DIALECT {
+                // Plain `9P2000`, or `.L` - whose message set is a different
+                // protocol this client did not ask for and does not parse.
                 return Err(VfsError::Unsupported);
             }
             critical_section::with(|cs| {
@@ -393,12 +428,18 @@ mod device {
         /// a formality this host ignores; the `aname` is not - QEMU routes
         /// the attach by the export's tag, and the tag the device itself
         /// reported is the one the export answers to.
+        ///
+        /// The trailing `n_uname` is `.u`'s addition and is the numeric half of
+        /// the same formality: `0` names the same principal `uname` does, and
+        /// with the share exported `security_model=none` the host decides access
+        /// from its own process identity, so no uid mapping is asked for.
         fn attach(&self) -> VfsResult<()> {
             let mut body = Vec::new();
             put_u32(&mut body, 0); // fid
             put_u32(&mut body, u32::MAX); // afid: NOFID
             put_str(&mut body, b"root");
             put_str(&mut body, self.dev.mount_tag().as_bytes());
+            put_u32(&mut body, 0); // n_uname: the numeric half of uname
             self.call(T_ATTACH, &body, R_ATTACH)?;
             Ok(())
         }
@@ -530,6 +571,12 @@ mod device {
         /// `Twstat`: change what a caller asked to change and mark the rest
         /// "leave alone" - every field has a dont-care spelling, which is
         /// what keeps a `truncate` from also rewriting the times.
+        ///
+        /// The record is `.u`'s `statu`: the plain `stat` fields followed by
+        /// `extension[s]` and the three numeric ids, each with its own dont-care
+        /// (`""` for the string, `u32::MAX` for the ids). They have to be present
+        /// even when nothing is being changed, because the server parses the
+        /// record whole.
         fn wstat(
             &self,
             fid: u32,
@@ -553,6 +600,10 @@ mod device {
             put_str(&mut record, b""); // uid
             put_str(&mut record, b""); // gid
             put_str(&mut record, b""); // muid
+            put_str(&mut record, b""); // extension: none
+            put_u32(&mut record, u32::MAX); // n_uid: keep
+            put_u32(&mut record, u32::MAX); // n_gid
+            put_u32(&mut record, u32::MAX); // n_muid
 
             let mut body = Vec::new();
             put_u32(&mut body, fid);
@@ -949,8 +1000,9 @@ pub fn mount(tag: &str) -> VfsResult<Arc<P9fs>> {
 mod tests {
     use super::*;
 
-    /// One well-formed stat record, in the layout `Rstat` delivers: a u16
-    /// size, then type, dev, qid, mode, times, length and the four strings.
+    /// One well-formed `statu` record, in the layout `Rstat` delivers: a u16
+    /// size, then type, dev, qid, mode, times, length, the four strings, the
+    /// `extension` and the three numeric ids `.u` appends.
     fn stat_bytes(mode: u32, length: u64, name: &str) -> Vec<u8> {
         let mut record = Vec::new();
         record.extend_from_slice(&0u16.to_le_bytes()); // type
@@ -964,11 +1016,45 @@ mod tests {
         put_str(&mut record, b"root");
         put_str(&mut record, b"root");
         put_str(&mut record, b"root");
+        // `.u`'s tail: the parser stops before it, but a real record carries it,
+        // so the fixture has to as well or the tests would pin a shape no server
+        // sends.
+        put_str(&mut record, b"");
+        put_u32(&mut record, 0); // n_uid
+        put_u32(&mut record, 0); // n_gid
+        put_u32(&mut record, 0); // n_muid
 
         let mut out = Vec::new();
         out.extend_from_slice(&(record.len() as u16).to_le_bytes());
         out.extend_from_slice(&record);
         out
+    }
+
+    #[test]
+    fn a_statu_records_numeric_tail_is_stepped_over_rather_than_parsed() {
+        // `.u`'s `extension` and ids are the server's business; the point of the
+        // test is that a record carrying them is consumed *whole*, so a readdir
+        // stream of such records walks to its end instead of stalling on the
+        // first one.
+        let bytes = stat_bytes(0o644, 7, "tail");
+        let (stat, used) = parse_stat(&bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(stat.name, "tail");
+        assert_eq!(stat.size, 7);
+
+        // And the reader does not *depend* on the tail: a record whose length
+        // word covers only the plain fields - what a plain-9P2000 server sends -
+        // parses just the same, which is what lets this client step over either
+        // shape. Fourteen bytes come off (the empty `extension`, 2, and the
+        // three ids, 12) and the leading length word is rewritten to match.
+        const TAIL: usize = 2 + 4 + 4 + 4;
+        let mut short = bytes[..bytes.len() - TAIL].to_vec();
+        let total = (short.len() - 2) as u16;
+        short[..2].copy_from_slice(&total.to_le_bytes());
+        let (stat, used) = parse_stat(&short).unwrap();
+        assert_eq!(used, short.len());
+        assert_eq!(stat.name, "tail");
+        assert_eq!(stat.size, 7);
     }
 
     #[test]

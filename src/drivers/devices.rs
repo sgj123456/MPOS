@@ -279,17 +279,22 @@ pub fn standard_devfs() -> Arc<DevFs> {
     dev.register_id("random", Arc::new(RandomDev), 1, 8);
     dev.register_id("urandom", Arc::new(RandomDev), 1, 9);
 
-    // The virtio devices the boot probed, each under the name Linux gives
-    // its kind - registered only when the device answered, because a node
-    // for a machine this kernel does not have is a lie an open would trip
-    // over. The adapters wrap the driver's own handle: the device behind
-    // /dev/hwrng is the entropy pipe, the one behind /dev/hvc0 is the
-    // console port, /dev/dsp is the sound card's stream.
-    // driver's own handle: the device behind /dev/hwrng is the entropy pipe,
-    // the one behind /dev/hvc0 is the console port, /dev/dsp is the sound card's
-    // stream. Each of these virtio-PCI drivers is x86_64's machine; aarch64 has
-    // no MMIO path for them yet, so the nodes are gated with their drivers and
-    // `/dev` simply has fewer doors on the machine that lacks the devices.
+    // The virtio devices the boot probed, each under the name Linux gives its
+    // kind - registered only when the device answered, because a node for a
+    // machine this kernel does not have is a lie an open would trip over. The
+    // adapters wrap the driver's own handle: the device behind `/dev/hwrng` is
+    // the entropy pipe, the one behind `/dev/hvc0` is the console port,
+    // `/dev/dsp` is the sound card's stream.
+    //
+    // The *name* is the interface, so each node is registered by whichever
+    // machine opened the device and under the same name on both. All five of
+    // these virtio nodes are that way now: the entropy source has a PCI and an
+    // MMIO arm over two globals, and the console port, the framebuffer and the
+    // sound card each have one implementation over either transport
+    // (`PLAN.md` §13.25-§13.27). What still has no door here is the DRM card
+    // (`/dev/dri/card0`): it hangs off a *PCI function*, which only the first
+    // machine has, so its absence on the second is a fact about the bus and not
+    // about the display (`PLAN.md` §13.26).
     #[cfg(target_arch = "x86_64")]
     if let Some(rng) = crate::drivers::virtio::rng::global() {
         dev.register("hwrng", Arc::new(HwrngDev(rng)));
@@ -317,7 +322,6 @@ pub fn standard_devfs() -> Arc<DevFs> {
         dev.register_id("rtc0", Arc::new(crate::drivers::rtc_dev::RtcDev), 10, 135);
         dev.register_id("rtc", Arc::new(crate::drivers::rtc_dev::RtcDev), 10, 135);
     }
-    #[cfg(target_arch = "x86_64")]
     if let Some(hvc) = crate::drivers::virtio::console::global() {
         let device = Arc::new(crate::drivers::virtio::console::HvcDev::new(hvc));
         // The name of a hypervisor console is `hvc0`; `hvc` is the alias
@@ -326,7 +330,6 @@ pub fn standard_devfs() -> Arc<DevFs> {
         dev.register("hvc0", device.clone());
         dev.register("hvc", device);
     }
-    #[cfg(target_arch = "x86_64")]
     if let Some(snd) = crate::drivers::virtio::sound::global() {
         dev.register(
             "dsp",
@@ -335,8 +338,11 @@ pub fn standard_devfs() -> Arc<DevFs> {
     }
     // The framebuffer is a node with more than a stream face - `mmap` of
     // the pixels, the `FBIOGET_*` ioctls - so it registers as the inode
-    // it is, through the door the tty uses for the same reason.
-    #[cfg(target_arch = "x86_64")]
+    // it is, through the door the tty uses for the same reason. The node is
+    // published by whichever machine opened the card (`PLAN.md` §13.26): what
+    // the DRM layer adds on top - `/dev/dri/card0` and the sysfs tree - stays
+    // the first machine's, because it hangs off a *PCI function* that only
+    // that machine has, and a machine with no bus has none to hang it from.
     if let Some(gpu) = crate::drivers::virtio::gpu::global() {
         dev.register_node(
             "fb0",
@@ -353,11 +359,16 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // appears when the machine happens to have a keyboard is a directory a
     // program cannot depend on.
     //
-    // x86_64's machine for now: it drives the virtio-PCI input bus and `uinput`,
-    // neither of which aarch64 has an MMIO path for. Aarch64's `/dev` therefore
-    // has no `/dev/input` and no `uinput` - a named gap, not a stub: the doors
-    // are absent rather than opening onto nothing.
-    #[cfg(target_arch = "x86_64")]
+    // The gate is the *capability* rather than the architecture: what a machine
+    // needs for this block is a registry of input devices and a `uinput` door for
+    // userland to add its own, which is what `mpos_input_registry` says. Both
+    // machines declare it now (`PLAN.md` §15.2): the first drives the virtio-PCI
+    // input bus, the second opens a `virtio-input` over its MMIO window and hands
+    // it to the same registry - so this block, the exit hooks, the service task
+    // and sysfs' `/sys/class/input` are one copy over the `InputDevice` contract,
+    // and a port that lands the input stack declares the capability to get them
+    // all.
+    #[cfg(mpos_input_registry)]
     {
         let input_dir = dev.register_dir("input");
         let evdevs = crate::drivers::virtio::input::nodes();

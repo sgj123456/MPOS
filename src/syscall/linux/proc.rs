@@ -1804,11 +1804,21 @@ pub(super) fn handle_getpgid(args: [usize; ARG_COUNT]) -> isize {
 ///
 /// The two policy words (ctrl-alt-del's disposition) are recorded nowhere and
 /// answered with success, because this kernel has no console keyboard to wire
-/// them to and nobody else reads them back. The three stop words end the
-/// machine: QEMU's debug exit is the closest thing to a reset this
-/// environment has, and `-no-reboot` turns it into a clean shutdown either
-/// way. Anything else is refused, as Linux refuses it.
-#[cfg(not(target_arch = "aarch64"))]
+/// them to and nobody else reads them back. They are also the words a boot
+/// actually sends: busybox `init` asks for `RB_DISABLE_CAD` a second into its
+/// startup, so a machine that refuses the call prints a missing-call line on
+/// every boot. The three stop words end the machine: QEMU's debug exit is the
+/// closest thing to a reset this environment has, and `-no-reboot` turns it
+/// into a clean shutdown either way. Anything else is refused, as Linux refuses
+/// it.
+///
+/// Served on both machines. Its gate was the stale kind the entries around it
+/// had: it was written when a stop word ended at the x86_64 `isa-debug-exit`
+/// port, and that port is a `hal` capability now - a machine without
+/// `mpos_qemu_debug_exit` halts, which is what `reboot` means on a machine with
+/// no reset device. Nothing here reads a register frame, so there was never a
+/// second body of code for the second machine to need, only a marker left
+/// behind when the capability took the port's place.
 pub(super) fn handle_reboot(args: [usize; ARG_COUNT]) -> isize {
     // `reboot(magic, magic2, cmd, arg)`: the magic words come first and the
     // command is the third argument. Reading `args[0]` as the command reads
@@ -1820,7 +1830,10 @@ pub(super) fn handle_reboot(args: [usize; ARG_COUNT]) -> isize {
         Ok(abi::RebootCmd::Stop) => {
             let cmd = args[2];
             crate::println!("mpos: reboot(0x{cmd:x}) - handing the machine back");
-            crate::drivers::qemu::exit(crate::drivers::qemu::EXIT_SUCCESS);
+            // The harness's test status, not an errno and not a machine: a run
+            // that ends here reached its end, and the exit code is how the gate
+            // reads that. Without a debug-exit device this halts.
+            crate::hal::exit_qemu(crate::hal::TEST_EXIT_OK);
         }
         // A command no kernel knows, whether or not it came with the magic.
         Ok(abi::RebootCmd::Unknown) => err::EINVAL,

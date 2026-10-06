@@ -15,11 +15,12 @@
 //! never a tree node - so it names neither `crate::boot` nor `crate::fdt`.
 //!
 //! The devices driven here are the ones a *stack* holds rather than a check
-//! reads: the entropy source, the block device a filesystem mounts, and the
-//! network adapter the smoltcp stack sends and receives through. Each gets the
-//! same two answers its PCI counterpart has - a handle the caller owns, behind
-//! the usual kernel lock - and the checks drive them through those handles, so
-//! what a milestone proves and what the subsystem later uses are one device.
+//! reads: the entropy source, the block device a filesystem mounts, the network
+//! adapter the smoltcp stack sends and receives through, and the input device
+//! the evdev registry publishes and pumps. Each gets the same two answers its
+//! PCI counterpart has - a handle the caller owns, behind the usual kernel lock
+//! - and the checks drive them through those handles, so what a milestone proves
+//! and what the subsystem later uses are one device.
 //!
 //! The block and net devices are also published where the wiring layer can reach
 //! them ([`blockdev`] is handed to `Ext4Fs::mount` by the disk-root step,
@@ -34,15 +35,27 @@ use core::ptr::NonNull;
 
 use critical_section::Mutex;
 use virtio_drivers::device::blk::VirtIOBlk;
+use virtio_drivers::device::console::VirtIOConsole;
 use virtio_drivers::device::input::VirtIOInput;
 use virtio_drivers::device::net::VirtIONet;
 use virtio_drivers::device::rng::VirtIORng;
+use virtio_drivers::device::socket::VirtIOSocket;
+use virtio_drivers::device::sound::VirtIOSound;
+use virtio_drivers::device::virtio_9p::VirtIO9p;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 use crate::blk::BlockDev;
 
-use super::NetDevice;
+use super::console::VirtioHvc;
+use super::fs9p::Virtio9p;
+use super::gpu::VirtioGpuDev;
+use super::gpu_ctrl::Gpu;
 use super::hal::HalImpl;
+use super::sound::{Probe, install_probed};
+use super::vsock::VirtioVsock;
+use super::{
+    ConsolePort, InputDevice, NetDevice, P9Device, SoundCard, VirtioInputDev, VsockDevice,
+};
 
 /// The virtio-blk reached over MMIO, shaped as a [`BlockDev`] so the filesystem
 /// layer can mount it exactly as it mounts the PCI block device on x86_64 - the
@@ -252,30 +265,159 @@ pub fn net_device() -> Option<Arc<dyn NetDevice>> {
     Some(dev)
 }
 
-/// Report whether the memory-mapped transport at `virt` (spanning `size`)
-/// negotiates as a virtio-input device. This runs the same MMIO open + queue
-/// setup + feature negotiation the rng/blk/net milestones use against a *fourth*
-/// device class - so the aarch64 virtio transport is proven to reach input, not
-/// just the three devices already driven. It deliberately claims nothing about
-/// events arriving (that is the input stack, a later cut); `true` means only that
-/// the device answered the input probe and opened its queues over MMIO.
-pub fn probe_input(virt: usize, size: usize) -> bool {
+/// The device-specific configuration window inside a virtio-mmio register
+/// block: everything from here up is the *device's* config, and below it is the
+/// transport's. One constant, because a virtio-mmio window is one register
+/// block - where PCI has to walk a function's capabilities to find the same
+/// space (`PLAN.md` §13.26).
+const DEVICE_CONFIG_OFFSET: usize = 0x100;
+
+/// Open the memory-mapped transport at `virt` (spanning `size`) as this
+/// machine's virtio-gpu card, or `None` if it does not open as one.
+///
+/// The caller gets the buffer view `/dev/fb0` reads through *and* the device,
+/// which the render task owns - the same pair the first machine's PCI probe
+/// hands back, so everything above this line is one copy. The configuration
+/// window is recorded on the way, because the display's own events
+/// (`VIRTIO_GPU_EVENT_DISPLAY`, a window resize) arrive there and nothing else
+/// in the kernel can see one.
+pub fn gpu_device(
+    virt: usize,
+    size: usize,
+) -> Option<(Arc<VirtioGpuDev>, Gpu<MmioTransport<'static>>)> {
+    // SAFETY: as in [`read_blocks`] - `virt` is inside the mapped, non-executable
+    // device window, `size` is the tree-reported register block, and the window
+    // outlives this borrow. The `'static` is the machine's promise, not a
+    // borrow.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let device = Gpu::new(transport).ok()?;
+    VirtioGpuDev::install(device, Some(virt + DEVICE_CONFIG_OFFSET))
+}
+
+/// Open the memory-mapped transport at `virt` (spanning `size`) as this
+/// machine's sound card, and answer it - or `None` if the window does not open
+/// as one, or as a card that will play.
+///
+/// The same crate driver the first machine opens on its PCI bus, brought up
+/// through the same `VirtioSnd::new`: the stream listing, the rate intersection,
+/// the format check, the initial `SET_PARAMS`/`prepare`/`start` and the whole OSS
+/// face above them are one copy (`PLAN.md` §13.27). `Probe::Absent` is a window
+/// that is not a sound card at all, which is a quieter boot rather than a failed
+/// one; the caller gets `None` for both and no line.
+pub fn sound_device(virt: usize, size: usize) -> Option<Arc<dyn SoundCard>> {
     // SAFETY: as in [`read_blocks`] - `virt` is inside the mapped, non-executable
     // device window, `size` is the tree-reported register block, and the window
     // outlives this borrow.
     let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
     let Ok(transport) = (unsafe { MmioTransport::new(header, size) }) else {
-        return false;
+        return None;
     };
-    let Ok(mut net) = (VirtIOInput::<HalImpl, _>::new(transport)) else {
-        return false;
-    };
-    // Negotiated. Now read the device's configuration-space identity (`ids()`
-    // reads the fixed-size virtio-input `bustype/vendor/product/version`). That is
-    // a data read across the mapped transport - the same class of proof the net
-    // milestone made by reading the MAC - so the milestone says the MMIO path
-    // *moves config bytes* for this device class, not merely opens it.
-    net.ids().is_ok()
+    let opened = VirtIOSound::<HalImpl, _>::new(transport).map_err(|_| Probe::Init);
+    install_probed(opened)
+}
+
+/// Open the memory-mapped transport at `virt` (spanning `size`) as this
+/// machine's virtio console port, or `None` if it does not open as one.
+///
+/// The caller hands the result to `console::install`, and from there it is the
+/// machine's `/dev/hvc0`: the devfs builder publishes it, the stream face reads
+/// and writes through it. This is the same `VirtIOConsole` the first machine
+/// opens on its PCI bus - only the transport underneath differs, which is the
+/// whole of what this function adds (`PLAN.md` §13.25).
+///
+/// `None` is an honest refusal: a block the crate will not accept as a
+/// transport, or a transport that is not a console device. A machine whose
+/// window never opened then has no `/dev/hvc0` rather than a node whose reads
+/// and writes go nowhere.
+pub fn console_device(virt: usize, size: usize) -> Option<Arc<dyn ConsolePort>> {
+    // SAFETY: as in [`read_blocks`] - `virt` is inside the mapped, non-executable
+    // device window, `size` is the tree-reported register block, and the window
+    // outlives this borrow. The `'static` is the machine's promise, not a
+    // borrow.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let device = VirtIOConsole::<HalImpl, _>::new(transport).ok()?;
+    Some(Arc::new(VirtioHvc::new(device)))
+}
+
+/// Open the memory-mapped transport at `virt` (spanning `size`) as this
+/// machine's virtio-vsock device, or `None` if it does not open as one.
+///
+/// The device is *handed over*, not probed: its caller gives it to
+/// `net::vsock::init`, and from there it is the wire underneath `AF_VSOCK` - the
+/// family's phases, its ports and its accept queue are `src/net/vsock.rs`'s, and
+/// the pump that keeps its events moving is the shared one. This is the same
+/// `VirtIOSocket` the first machine probes on its PCI bus and wraps in the same
+/// [`VirtioVsock`] - only the transport underneath differs, which is the whole of
+/// what this function adds (`PLAN.md` §13.28).
+///
+/// `None` is an honest refusal - a block the crate will not accept as a
+/// transport, or a transport that is not a socket device - and a machine with no
+/// window behind it leaves the family down, so `socket(AF_VSOCK)` answers the
+/// `EAFNOSUPPORT` a family the kernel does not speak gives.
+pub fn vsock_device(virt: usize, size: usize) -> Option<Arc<dyn VsockDevice>> {
+    // SAFETY: as in [`read_blocks`] - `virt` is inside the mapped, non-executable
+    // device window, `size` is the tree-reported register block, and the window
+    // outlives this borrow. The `'static` is the machine's promise, not a
+    // borrow.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let driver = VirtIOSocket::<HalImpl, _>::new(transport).ok()?;
+    Some(Arc::new(VirtioVsock::new(driver)))
+}
+
+/// Open the memory-mapped transport at `virt` (spanning `size`) as this
+/// machine's virtio-9p device, or `None` if it does not open as one.
+///
+/// The device is *handed over*, not probed: the caller gives it to
+/// `fs9p::install`, and from there it is a host share the mount table and
+/// `mount -t 9p` can name - the fid table, the `Twalk`/`Tread` encoding and the
+/// `Inode` mapping above it are `src/vfs/p9.rs`'s one copy (`PLAN.md` §13.29).
+/// This is the same `VirtIO9p` the first machine probes on its PCI bus and wraps
+/// in the same [`Virtio9p`], only the transport underneath differing.
+///
+/// `None` is an honest refusal - a block the crate will not accept as a
+/// transport, or a transport that is not a 9p device. A window that is not one
+/// is skipped by the caller, and a machine with no window has no share to mount
+/// rather than a mount that answers nothing.
+pub fn p9_device(virt: usize, size: usize) -> Option<Arc<dyn P9Device>> {
+    // SAFETY: as in [`read_blocks`] - `virt` is inside the mapped, non-executable
+    // device window, `size` is the tree-reported register block, and the window
+    // outlives this borrow. The `'static` is the machine's promise, not a
+    // borrow.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let device = VirtIO9p::<HalImpl, _>::new(transport).ok()?;
+    Some(Arc::new(Virtio9p::new(device)))
+}
+
+/// Open the memory-mapped transport at `virt` (spanning `size`) as this
+/// machine's virtio-input device, or `None` if it does not open as one.
+///
+/// The device is *handed over*, not probed. Its caller gives it to
+/// `input::register`, and from there it is the machine's keyboard: the evdev
+/// registry holds it, the devfs build publishes `/dev/input/eventN` for it and
+/// the service task drains its ring. The procedure the earlier milestone used -
+/// open the window, negotiate, read the device's configuration-space identity,
+/// drop it - still happens, but as `register`'s first act, because
+/// `register` cannot build a node without the capability picture that read
+/// produces. What was a proof that the transport reaches the class is now the
+/// class itself (`PLAN.md` §15.2).
+///
+/// `None` is an honest refusal - a block the crate will not accept as a
+/// transport, or a transport that is not an input device - and a machine whose
+/// window never opened has an honestly empty `/dev/input` rather than a node
+/// that opens onto nothing.
+pub fn input_device(virt: usize, size: usize) -> Option<Arc<dyn InputDevice>> {
+    // SAFETY: as in [`read_blocks`] - `virt` is inside the mapped, non-executable
+    // device window, `size` is the tree-reported register block, and the window
+    // outlives this borrow. The `'static` is the machine's promise, not a
+    // borrow.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let device = VirtIOInput::<HalImpl, _>::new(transport).ok()?;
+    Some(Arc::new(VirtioInputDev::new(device)))
 }
 
 /// Read the first `out.len() / 512` sectors of the virtio-blk device whose

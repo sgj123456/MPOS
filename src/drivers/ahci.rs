@@ -49,7 +49,7 @@ use critical_section::Mutex;
 
 use crate::ahci::{PortStatus, signature_is_atapi};
 use crate::blk::BlockDev;
-use crate::mm::{PAGE_SIZE, alloc_frames, free_frames, map_mmio, phys_to_virt};
+use crate::mm::{PAGE_SIZE, alloc_frames, free_frames, phys_to_virt};
 
 /// The driver name `lspci -k` prints, and what a device claim records.
 pub const PCI_DRIVER: &str = "ahci";
@@ -598,7 +598,9 @@ fn bring_up_controller(device: &crate::pci::Device) -> Option<Arc<dyn BlockDev>>
     if bar.base == 0 || bar.size == 0 {
         return None;
     }
-    let base = map_mmio(bar.base as usize, bar.size as usize);
+    // The BAR's registers, reached through the seam: which machine answers this
+    // and how is not this driver's question (`PLAN.md` §14.3).
+    let base = crate::hal::map_mmio_window(bar.base as usize, bar.size as usize)?;
 
     // Into AHCI mode, and reset, so every port starts from one known state
     // whatever the firmware left behind.

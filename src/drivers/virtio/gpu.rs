@@ -32,10 +32,19 @@ use critical_section::Mutex;
 use crate::mm::{self, PAGE_SIZE};
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsResult};
 
+use virtio_drivers::transport::Transport;
+#[cfg(target_arch = "x86_64")]
+use virtio_drivers::transport::pci::PciTransport;
+
 use super::gpu_ctrl::Gpu;
+#[cfg(target_arch = "x86_64")]
 use super::hal::transport;
 
-/// The modern device ID; virtio-gpu never had a legacy form.
+/// The modern device ID; virtio-gpu never had a legacy form. It names the PCI
+/// vendor's ID range, so it is the first machine's: the second finds the same
+/// device by the `virtio,mmio` window its device tree names, whose `DeviceID` is
+/// `16` (`VIRTIO_ID_GPU`).
+#[cfg(target_arch = "x86_64")]
 const DEVICE_GPU: &[u16] = &[0x1050];
 
 /// The resolution a headless machine gets: the one every framebuffer
@@ -217,28 +226,29 @@ impl VirtioGpuDev {
         });
     }
 
-    /// Probe the PCI bus and bring up the first virtio-gpu device: ask the
-    /// host what its display is, fall back to the headless shape, and build
+    /// Build the buffer view over a device the machine has already opened: ask
+    /// the host what its display is, fall back to the headless shape, and build
     /// the resource at that size.
+    ///
+    /// The one door in, and it takes the *device* rather than a bus - the first
+    /// machine opens the card on its PCI bus ([`init_global`]), the second on
+    /// its MMIO window (`super::mmio::gpu_device`), and everything here - the
+    /// resolution, the resource, the pinning, the view `/dev/fb0` shares - is
+    /// the same on both. `config` is the window the host reports its own display
+    /// events in, which only a machine can name; `None` is a machine that cannot
+    /// name one, and then the display size is whatever it was at boot, for good.
     ///
     /// Returns the buffer view (which `/dev/fb0` and the page pins share) *and*
     /// the device itself, moved out - the render task is its sole owner, and
     /// the only thing that may call `flush` on it.
-    pub fn init() -> Option<(Arc<Self>, Gpu)> {
-        // The window the host reports its own events in, taken now because the
-        // transport that could name it is consumed below. Without it the
-        // display size is whatever it was at boot, for good.
-        if let Some(config) = super::hal::device_config(DEVICE_GPU) {
+    pub fn install<T: Transport>(
+        mut device: Gpu<T>,
+        config: Option<usize>,
+    ) -> Option<(Arc<Self>, Gpu<T>)> {
+        // Recorded before the transport is consumed into the device above.
+        if let Some(config) = config {
             CONFIG.store(config, Ordering::Relaxed);
         }
-
-        let mut device = Gpu::new(transport(DEVICE_GPU)?).ok()?;
-
-        // The card's home is this function. Declared by the driver that made the
-        // device - not inferred by `sysfs` from the class code, which would also
-        // match the firmware's own display adapter on a q35 machine and hang the
-        // DRM nodes off the wrong function (`PLAN.md` §7.4).
-        super::hal::claim_drm_card(DEVICE_GPU);
 
         let dims = match device.resolution() {
             Ok((width, height)) if width > 0 && height > 0 => (width, height),
@@ -268,6 +278,13 @@ impl VirtioGpuDev {
         // any one of which would otherwise recycle a page the device is
         // still drawing the screen out of.
         mm::pin_frames(fb_phys, pages * PAGE_SIZE);
+
+        // The view the devfs builder publishes as `/dev/fb0`, recorded here
+        // because there is one card per machine and this is the call that built
+        // it - whichever bus it arrived on.
+        critical_section::with(|cs| {
+            *GLOBAL.borrow(cs).borrow_mut() = Some(dev.clone());
+        });
 
         Some((dev, device))
     }
@@ -311,14 +328,22 @@ pub fn take_display_event() -> bool {
 /// render task holds the live device; this is what `/dev/fb0` reaches.
 static GLOBAL: Mutex<RefCell<Option<Arc<VirtioGpuDev>>>> = Mutex::new(RefCell::new(None));
 
-/// Probe for the card, record the buffer view under the name userland opens,
-/// and hand back both the view and the device for the render task to own.
-pub fn init_global() -> Option<(Arc<VirtioGpuDev>, Gpu)> {
-    let (dev, device) = VirtioGpuDev::init()?;
-    critical_section::with(|cs| {
-        *GLOBAL.borrow(cs).borrow_mut() = Some(dev.clone());
-    });
-    Some((dev, device))
+/// Probe the PCI bus for the card and bring it up - the first machine's door
+/// into [`VirtioGpuDev::install`].
+///
+/// The card's home is this function, and that is *declared* here rather than
+/// inferred by `sysfs` from the class code, which would also match the
+/// firmware's own display adapter on a q35 machine and hang the DRM nodes off
+/// the wrong function (`PLAN.md` §7.4). A machine with no PCI bus has no
+/// function to declare, so it has no `/sys/class/drm` card - a named gap, and
+/// not a claim about the card: the device is the same one over its own
+/// transport (`PLAN.md` §13.26).
+#[cfg(target_arch = "x86_64")]
+pub fn init_global() -> Option<(Arc<VirtioGpuDev>, Gpu<PciTransport>)> {
+    let config = super::hal::device_config(DEVICE_GPU);
+    let device = Gpu::new(transport(DEVICE_GPU)?).ok()?;
+    super::hal::claim_drm_card(DEVICE_GPU);
+    VirtioGpuDev::install(device, config)
 }
 
 /// The card, if the machine has one.

@@ -832,7 +832,7 @@ mod tests {
     fn the_fd_table_reuses_the_lowest_free_slot_and_reports_bad_fds() {
         // The one test here that uses the global tree and table; the mount is
         // first-come and nothing else in this module competes for either.
-        crate::vfs::mount_root(&*RamFs::new());
+        crate::vfs::mount_root(RamFs::new());
         crate::vfs::resolve("/")
             .unwrap()
             .create("f", NodeKind::File)

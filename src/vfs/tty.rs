@@ -2002,20 +2002,32 @@ impl Tty {
                 }
             }
             0x03 => {
-                // VT_GETSTATE -> struct vt_stat { v_mode, v_num, v_state } (shorts).
-                // The console on the screen, the mode it is in, and the bit of
-                // itself: what a session reads back to know where it has landed, so
-                // it has to be the console that is actually shown rather than a
-                // constant that happens to be right until something switches.
+                // VT_GETSTATE -> struct vt_stat { v_active, v_signal, v_state }
+                // (three shorts), and Linux writes exactly two of them.
+                // `v_active` is the console on the screen - what a session reads
+                // back to know where it has landed, so it is the console actually
+                // shown rather than a constant that happens to be right until
+                // something switches - and `v_state` is the bit mask of the
+                // consoles in use, bit 0 always set because `/dev/tty0` is always
+                // open. `v_signal` is **not written**: it is the `SIGIO` number a
+                // console promises to send when it loses the screen, which this
+                // kernel does not deliver, and Linux leaves the caller's word
+                // alone. Measured on Linux 7.2.8 with all three shorts pre-filled
+                // `0xAAAA`: `v_signal` came back `0xAAAA`, `v_active` 1 and
+                // `v_state` 67 (`PLAN.md` §13.18).
+                //
+                // This arm used to write the *video mode* in the first short and
+                // the console number in the second, so a seat manager reading
+                // `v_active` got a mode and one reading `v_signal` got a console.
                 if !buffer_ok(buf, size_of::<[u16; 3]>(), true, from_user) {
                     return err::EFAULT;
                 }
                 let shown = crate::term::vc::active();
                 unsafe {
                     let p = buf as *mut u16;
-                    p.write_unaligned(crate::vfs::vcmux::kd_mode(shown) as u16);
-                    p.add(1).write_unaligned(shown as u16);
-                    p.add(2).write_unaligned(1u16 << (shown - 1).min(15));
+                    p.write_unaligned(shown as u16);
+                    // `p.add(1)` - `v_signal` - deliberately untouched.
+                    p.add(2).write_unaligned(crate::vfs::vcmux::state_mask());
                 }
                 0
             }

@@ -8,6 +8,8 @@
 mod aarch64;
 mod aarch64_bin;
 mod aarch64_init;
+mod aarch64_initramfs;
+mod arch;
 mod config;
 mod depgraph;
 mod disk;
@@ -25,6 +27,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+
+use crate::arch::Arch;
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "Build and management tools for mpos")]
@@ -47,10 +51,15 @@ struct Cli {
     #[arg(long, value_name = "MODE", global = true)]
     mode: Option<String>,
 
-    /// `run`: which machine to boot. `x86_64` (default) boots the disk image on
-    /// the QEMU wiring in `machine.toml`; `aarch64` builds the second machine's
-    /// kernel and UEFI loader, lays out its ESP, and boots it under AAVMF with
-    /// the serial line on the terminal. Global for the same reason `--mode` is.
+    /// Which machine to build, boot and sweep: `x86_64` (default) or `aarch64`.
+    /// Global so `cargo xtask run --arch aarch64` accepts it after the
+    /// subcommand, where a plain parent flag would be rejected.
+    ///
+    /// It is the *whole* switch, not a hint to `run` and `test`: `build`,
+    /// `rootfs` and `all` compile for the machine it names too, so the pair of
+    /// binaries every command then picks up is the pair that machine boots
+    /// (`AGENTS.md` §2). Parsed once, up front, into an `Arch`, so no command
+    /// downstream compares this string again.
     #[arg(long, value_name = "ARCH", global = true, default_value = "x86_64")]
     arch: String,
 
@@ -76,6 +85,9 @@ enum Commands {
     Build,
     /// Build the initramfs
     Initramfs,
+    /// Build the second machine's initramfs - busybox, the applet farm and the
+    /// pivot script both machines switch root from (`PLAN.md` §15.6)
+    Aarch64Initramfs,
     /// Install the root filesystem into the disk image
     Rootfs,
     /// Create the (empty) disk image
@@ -108,6 +120,7 @@ impl Commands {
         match self {
             Commands::Build => "build",
             Commands::Initramfs => "initramfs",
+            Commands::Aarch64Initramfs => "aarch64-initramfs",
             Commands::Rootfs => "rootfs",
             Commands::Disk => "disk",
             Commands::Run => "run",
@@ -121,47 +134,36 @@ impl Commands {
     }
 }
 
-/// The machine a `test` run sweeps, named by `--arch`.
-#[derive(Debug)]
-enum Sweep {
-    X86_64,
-    Aarch64,
-}
-
-/// Which machine's sweep `test` runs.
-///
-/// The two are separate paths rather than one parameterised sweep: x86_64 boots
-/// a test initramfs on the QEMU wiring in `machine.toml` and the guest ends the
-/// machine with a debug exit, while aarch64 packs a musl runner and the test
-/// programs onto its own ESP and disk and ends on `=== END`. What they share is
-/// the verdict: the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol, read by the
-/// same shape of check. Anything that is neither is refused here rather than
-/// falling through to one of them - a sweep that prints a verdict for a machine
-/// it never booted is the one failure this must not have (`AGENTS.md` §3).
-fn test_sweep_machine(arch: &str) -> Result<Sweep> {
-    match arch {
-        "x86_64" => Ok(Sweep::X86_64),
-        "aarch64" => Ok(Sweep::Aarch64),
-        other => anyhow::bail!(
-            "test --arch {other}: this front end sweeps x86_64 and aarch64 only, \
-             and a verdict for a machine nothing booted is the one failure it \
-             must not have (PLAN.md §13.5)"
-        ),
-    }
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let build_dir = utils::resolve_build_dir(cli.build_dir.as_deref())?;
     let profile = utils::resolve_profile(cli.profile.as_deref());
 
-    // The only machines this front end boots. An unrecognised `--arch` is an
-    // error, not a silent fall-through to x86_64: a sweep that quietly boots the
-    // wrong machine is the one failure this must not have.
-    if cli.arch != "x86_64" && cli.arch != "aarch64" {
+    // The only machines this front end builds. An unrecognised `--arch` is an
+    // error, not a silent fall-through to x86_64: a build that quietly compiles
+    // one machine while reporting another is the one failure this must not
+    // have. Parsing it here - before any command - is what makes it the switch
+    // for all of them rather than a hint two of them read.
+    let arch = Arch::parse(&cli.arch)?;
+
+    // `initramfs`, `disk`, `rootfs` and `all` assemble *the x86_64 disk image*
+    // - a GPT disk with an Alpine root on it - and the second machine's disk is
+    // not that: it is laid out by `boot-aarch64` / `alpine-aarch64` and by
+    // `run --arch aarch64`. So `--arch aarch64` here would build an x86_64
+    // root filesystem under an aarch64 banner, which is the silent
+    // wrong-machine failure `AGENTS.md` §3 refuses. Name the machine's own
+    // command in the refusal rather than doing the other machine's work.
+    if arch == Arch::Aarch64
+        && matches!(
+            cli.command,
+            Commands::Initramfs | Commands::Disk | Commands::Rootfs | Commands::All
+        )
+    {
         anyhow::bail!(
-            "--arch {}: this xtask builds and boots x86_64 and aarch64 only",
-            cli.arch
+            "--arch aarch64 with `{}`: the image commands build the x86_64 disk. \
+             The second machine's disk is laid out by `cargo xtask boot-aarch64`, \
+             `cargo xtask alpine-aarch64` and `cargo xtask run --arch aarch64`",
+            cli.command.name()
         );
     }
 
@@ -171,7 +173,7 @@ fn main() -> Result<()> {
     // `MPOS_XTASK_MODE` / `machine.toml` itself - the same sources the x86_64
     // half below consults - so it needs none of that disk / rootfs / sudo
     // machinery. Take it before any of it runs.
-    if matches!(cli.command, Commands::Run) && cli.arch == "aarch64" {
+    if matches!(cli.command, Commands::Run) && arch == Arch::Aarch64 {
         // Validate and export the desired mode *before* taking the arm, so a
         // bad `--mode` word fails here exactly as it does for x86_64 (the
         // aarch64 session reads it back through `rootfs::effective_mode`, the
@@ -206,7 +208,7 @@ fn main() -> Result<()> {
     // `run` must rebuild the image, not boot the old code.
     let mut kernel_built = artefacts_ready;
     if matches!(cli.command, Commands::Run) && !kernel_built {
-        utils::build_kernel(&profile)?;
+        utils::build_kernel(&profile, arch)?;
         kernel_built = true;
     }
 
@@ -263,6 +265,9 @@ fn main() -> Result<()> {
         | Commands::Test
         | Commands::Depgraph
         | Commands::BootAarch64
+        // Unprivileged by construction: apk only writes files into the staging
+        // tree, and `tar` reads it - no device, no mount, no chroot.
+        | Commands::Aarch64Initramfs
         | Commands::AlpineAarch64 => false,
         Commands::Clean => utils::clean_needs_root(&build_dir),
         Commands::Initramfs | Commands::Rootfs | Commands::All => true,
@@ -275,7 +280,7 @@ fn main() -> Result<()> {
         // cannot write into again - the state a build that re-execs first ends
         // in.
         if !kernel_built && needs_kernel(cli.command, run_needs_build) {
-            utils::build_kernel(&profile)?;
+            utils::build_kernel(&profile, arch)?;
         }
         if matches!(cli.command, Commands::Run) {
             // Build in a child, and wait: this process still has to boot the
@@ -283,7 +288,7 @@ fn main() -> Result<()> {
             // could - which is why `run` used to end by asking to be run again.
             // The child is handed the same `--mode` so it recomputes the same
             // switch decision (and bakes it) rather than booting.
-            build_under_sudo(cli.command, run_mode, &build_dir, &profile)?;
+            build_under_sudo(cli.command, run_mode, &build_dir, &profile, arch)?;
             if qemu::needs_build(&build_dir, &profile)? {
                 anyhow::bail!(
                     "The image is still out of date after building it; the output above says why."
@@ -291,7 +296,7 @@ fn main() -> Result<()> {
             }
             run_needs_build = false;
         } else {
-            escalate(cli.command, run_mode, &build_dir, &profile)?;
+            escalate(cli.command, run_mode, &build_dir, &profile, arch)?;
         }
     }
 
@@ -307,7 +312,7 @@ fn main() -> Result<()> {
 
     let result = dispatch(
         cli.command,
-        &cli.arch,
+        arch,
         &build_dir,
         &profile,
         artefacts_ready,
@@ -378,7 +383,7 @@ fn needs_kernel(command: Commands, run_needs_build: bool) -> bool {
 
 fn dispatch(
     command: Commands,
-    arch: &str,
+    arch: Arch,
     build_dir: &Path,
     profile: &str,
     artefacts_ready: bool,
@@ -387,12 +392,12 @@ fn dispatch(
     tests: selftest::Selection,
 ) -> Result<()> {
     match command {
-        Commands::Build => utils::build_kernel(profile),
+        Commands::Build => utils::build_kernel(profile, arch),
         Commands::Initramfs => initramfs::build_initramfs(build_dir, profile),
         Commands::Disk => disk::build_disk(build_dir, profile),
         Commands::Rootfs => {
             if !artefacts_ready {
-                utils::build_kernel(profile)?;
+                utils::build_kernel(profile, arch)?;
             }
             // `build_rootfs` brings the initramfs up to date itself: it is one
             // of the inputs the image is assembled from.
@@ -400,15 +405,22 @@ fn dispatch(
         }
         Commands::All => {
             if !artefacts_ready {
-                utils::build_kernel(profile)?;
+                utils::build_kernel(profile, arch)?;
             }
             disk::ensure(build_dir, profile)?;
             rootfs::ensure(build_dir, profile)
         }
         Commands::Run => qemu::run_qemu(build_dir, profile, artefacts_ready, run_needs_build, mode),
-        Commands::Test => match test_sweep_machine(arch)? {
-            Sweep::X86_64 => selftest::run_tests(build_dir, profile, tests),
-            Sweep::Aarch64 => {
+        // The two sweeps are separate paths rather than one parameterised
+        // sweep: x86_64 boots a test initramfs on the QEMU wiring in
+        // `machine.toml` and the guest ends the machine with a debug exit,
+        // while aarch64 packs a musl runner and the test programs onto its own
+        // ESP and disk and ends on `=== END`. What they share is the verdict:
+        // the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol, read by the same
+        // shape of check.
+        Commands::Test => match arch {
+            Arch::X86_64 => selftest::run_tests(build_dir, profile, tests),
+            Arch::Aarch64 => {
                 // The aarch64 payload is every aarch64 program that builds; the
                 // group vocabulary in `tests.toml` names the x86_64 suites'
                 // membership (and the bare-metal conformance suite has no
@@ -426,9 +438,13 @@ fn dispatch(
             }
         },
         Commands::Depgraph => depgraph::run(&utils::project_root()?),
-        // Builds both binaries itself rather than through `build_kernel`: that
-        // one is the x86_64 kernel and the x86_64 loader, and this machine's
-        // pair is a different target for each.
+        // The second machine's early userspace, on its own: the archive every
+        // aarch64 boot installs (§15.6). Unprivileged - apk only writes files.
+        Commands::Aarch64Initramfs => aarch64_initramfs::ensure(build_dir),
+        // The second machine's own boot path: it builds this machine's kernel
+        // and loader pair through `build_kernel(.., Arch::Aarch64)` like every
+        // other command does now, then lays out the ESP and disk that are its
+        // own - which is the half `build_kernel` cannot know.
         Commands::BootAarch64 => aarch64::run(build_dir, profile),
         // Also builds both binaries itself, and lays out its own ESP and disk.
         // Unprivileged by construction: the Alpine install runs under
@@ -453,6 +469,7 @@ fn build_under_sudo(
     mode: Option<config::RunMode>,
     build_dir: &Path,
     profile: &str,
+    arch: Arch,
 ) -> Result<()> {
     let exe = env::current_exe().context("Failed to find the xtask executable")?;
     let home = env::var("HOME").unwrap_or_default();
@@ -479,6 +496,12 @@ fn build_under_sudo(
         .arg(build_dir)
         .arg("--profile")
         .arg(profile)
+        // Carried across the boundary for the same reason `--build-dir` is:
+        // the privileged half re-parses `--arch` from scratch, so omitting it
+        // would hand the child the *default* machine however this one was
+        // invoked - a switch that survives everything but sudo is not a switch.
+        .arg("--arch")
+        .arg(arch.name())
         .arg(command.name());
     if let Some(mode) = mode {
         sudo.arg("--mode").arg(mode.name());
@@ -499,6 +522,7 @@ fn escalate(
     mode: Option<config::RunMode>,
     build_dir: &Path,
     profile: &str,
+    arch: Arch,
 ) -> Result<()> {
     let exe = env::current_exe().context("Failed to find the xtask executable")?;
     let home = env::var("HOME").unwrap_or_default();
@@ -521,6 +545,8 @@ fn escalate(
         .arg(build_dir)
         .arg("--profile")
         .arg(profile)
+        .arg("--arch")
+        .arg(arch.name())
         .arg(command.name());
     if let Some(mode) = mode {
         sudo.arg("--mode").arg(mode.name());
@@ -532,23 +558,26 @@ fn escalate(
 
 #[cfg(test)]
 mod tests {
-    use super::{Sweep, test_sweep_machine};
+    use super::Arch;
 
     /// The counterfactual for the silent wrong-run: `--arch aarch64` used to
-    /// reach `selftest::run_tests` unchanged and print an x86_64 verdict under an
-    /// aarch64 banner. Each machine now gets its own arm, and a machine this
-    /// front end does not sweep is refused by name rather than run as another.
+    /// reach `selftest::run_tests` unchanged and print an x86_64 verdict under
+    /// an aarch64 banner - and to leave `build` compiling the x86_64 kernel
+    /// whatever the switch said, because the string never reached cargo. Each
+    /// machine now gets its own arm, a machine this front end does not build is
+    /// refused by name, and the target the compiler is handed comes from the
+    /// same value.
     #[test]
-    fn the_sweep_never_runs_a_machine_it_was_not_asked_for() {
-        assert!(matches!(test_sweep_machine("x86_64"), Ok(Sweep::X86_64)));
-        assert!(matches!(test_sweep_machine("aarch64"), Ok(Sweep::Aarch64)));
-        let refusal = test_sweep_machine("riscv64")
-            .expect_err("a machine this front end does not sweep must be refused")
+    fn a_machine_this_front_end_does_not_build_is_refused_by_name() {
+        assert_eq!(Arch::parse("x86_64").unwrap(), Arch::X86_64);
+        assert_eq!(Arch::parse("aarch64").unwrap(), Arch::Aarch64);
+        let refusal = Arch::parse("riscv64")
+            .expect_err("a machine this front end does not build must be refused")
             .to_string();
         assert!(
             refusal.contains("riscv64") && refusal.contains("x86_64"),
             "the refusal must name the machine asked for and the ones that are \
-             swept: {refusal}"
+             built: {refusal}"
         );
     }
 }

@@ -147,10 +147,15 @@ struct Mount {
     /// Whether `mount -o ro` was asked for. The flag is reported in
     /// /proc/mounts and passed on to the filesystem, which enforces it.
     read_only: bool,
-    /// The filesystem itself, when the caller had one to give. `remount`
-    /// needs it: changing the read-only state is a request to the filesystem,
-    /// not a note in this table.
-    fs: Option<Arc<dyn FileSystem>>,
+    /// The filesystem this record attaches - and it is an `Arc` rather than an
+    /// `Option` because everything downstream asks *which* filesystem serves a
+    /// node: `statfs`'s numbers, `remount`'s read-only promise, and the
+    /// identity test `linkat`'s `EXDEV` is decided by. A record that attached a
+    /// filesystem without keeping it (this field used to be `None` for the
+    /// kernel's own attaches) left every one of those questions unanswerable,
+    /// so `mount_root` and `mount` now take the instance rather than borrowing
+    /// it.
+    fs: Arc<dyn FileSystem>,
     /// Whether this record is a bind alias rather than an attached
     /// filesystem: `root` is a node that another record - or the root slot -
     /// already serves, and the `id`, `fs` and `fstype` below are *borrowed*
@@ -231,7 +236,19 @@ impl Vfs {
     }
 
     /// Install the root filesystem. Once, at boot: a second call is a bug.
-    pub fn mount_root(&self, fs: &dyn FileSystem) {
+    ///
+    /// The *filesystem itself* is recorded, not only its name and its device
+    /// number, because the root slot is where a machine's every later question
+    /// about "which filesystem serves this node" lands: `fs_serving_inode`
+    /// answers with `root_fs` for anything that is not some mount's own root -
+    /// which is every file, every directory and every `O_TMPFILE` inode on the
+    /// machine - so a root recorded without one turns `statfs(2)`,
+    /// `remount,rw /` and `linkat`'s `EXDEV` identity into "no filesystem" for
+    /// the whole tree. The second machine shipped that way: its own boot
+    /// attached the disk through the name-only form below and then promoted it
+    /// to `/`, and every `apk update` on it answered `EXDEV` about two inodes
+    /// of one ext4.
+    pub fn mount_root(&self, fs: Arc<dyn FileSystem>) {
         // Drawn before the lock is taken: they are their own counters, and
         // numbers minted under this section would be two more things nested
         // inside it.
@@ -246,6 +263,7 @@ impl Vfs {
             // unless the tree it stands in answers ramfs/tmpfs magic.
             *self.root_fstype.borrow(cs).borrow_mut() =
                 Some(alloc::string::String::from(fs.name()));
+            *self.root_fs.borrow(cs).borrow_mut() = Some(fs);
             *self.root_dev.borrow(cs).borrow_mut() = dev;
             *self.root_mount_id.borrow(cs).borrow_mut() = mount_id;
         });
@@ -302,7 +320,12 @@ impl Vfs {
     /// The mountpoint is found through its parent, not by resolving `path`
     /// outright: resolving would walk through whatever is already mounted
     /// there and lose the directory that is supposed to be mounted on.
-    pub fn mount(&self, path: &str, fs: &dyn FileSystem) -> VfsResult<()> {
+    ///
+    /// The filesystem instance is kept (§ [`Mount::fs`]), which is why this
+    /// takes an `Arc` rather than a borrow: a caller that has one to give must
+    /// not lose it, and a caller's borrowed `&dyn FileSystem` has no answer to
+    /// the questions above at all.
+    pub fn mount(&self, path: &str, fs: Arc<dyn FileSystem>) -> VfsResult<()> {
         if critical_section::with(|cs| self.root.borrow(cs).borrow().is_none()) {
             return Err(VfsError::NoRoot);
         }
@@ -340,7 +363,7 @@ impl Vfs {
                 mount_id,
                 dev,
                 read_only: false,
-                fs: None,
+                fs,
                 bind: false,
             });
             Ok(())
@@ -486,7 +509,7 @@ impl Vfs {
                     .borrow()
                     .iter()
                     .find(|m| m.id == id)
-                    .and_then(|m| m.fs.clone())
+                    .map(|m| m.fs.clone())
             }
         })
     }
@@ -504,7 +527,7 @@ impl Vfs {
                 .borrow()
                 .iter()
                 .find(|m| alloc::sync::Arc::ptr_eq(&m.root, inode))
-                .and_then(|m| m.fs.clone())
+                .map(|m| m.fs.clone())
                 .or_else(|| self.root_fs.borrow(cs).borrow().clone())
         })
     }
@@ -554,7 +577,7 @@ impl Vfs {
             // The promoted filesystem keeps its own promise about writes: an
             // init that mounted its root read-only hands a read-only root on,
             // and the `root` service's later remount,rw is what lifts it.
-            *self.root_fs.borrow(cs).borrow_mut() = m.fs.clone();
+            *self.root_fs.borrow(cs).borrow_mut() = Some(m.fs.clone());
             *self.root_read_only.borrow(cs).borrow_mut() = m.read_only;
             // And its device number travels with it for the same reason: `/` is
             // the ext4 partition the init mounted, so this is where the root's
@@ -655,7 +678,7 @@ impl Vfs {
                 mount_id,
                 dev,
                 read_only,
-                fs: Some(fs),
+                fs,
                 bind: false,
             });
             Ok(())
@@ -702,7 +725,10 @@ impl Vfs {
         // storage mounted twice, so they answer one `st_dev` - which is exactly
         // how a tool that lists mounts tells a second name from a second device.
         let dev = self.dev_of_path(source_path);
-        let fs = self.fs_serving_path(source_path);
+        // A bind borrows the serving instance, so a source path with no
+        // filesystem behind it has nothing to alias. That is only reachable
+        // before `mount_root`, which is not a state this table serves.
+        let fs = self.fs_serving_path(source_path).ok_or(VfsError::NoRoot)?;
         let serving_read_only = critical_section::with(|cs| {
             if id == 0 {
                 *self.root_read_only.borrow(cs).borrow()
@@ -778,9 +804,7 @@ impl Vfs {
                 // Either name is the same filesystem to remount.
                 .find(|m| Arc::ptr_eq(&m.at, at) || Arc::ptr_eq(&m.root, at))
                 .ok_or(VfsError::NoEntry)?;
-            if let Some(fs) = entry.fs.clone() {
-                fs.set_read_only(read_only);
-            }
+            entry.fs.set_read_only(read_only);
             entry.read_only = read_only;
             Ok(())
         })
@@ -912,6 +936,14 @@ impl Vfs {
             return Err(VfsError::NotDir);
         }
 
+        // What the tree being replaced is served by, read before the promotion
+        // below overwrites the slot: the entry parked at `put_old` stands for
+        // exactly that tree, so it carries this instance. `mount_root` is what
+        // puts one there, and a pivot with no root filesystem is a pivot with
+        // nothing to park.
+        let demoted_fs = critical_section::with(|cs| self.root_fs.borrow(cs).borrow().clone())
+            .ok_or(VfsError::NoRoot)?;
+
         critical_section::with(|cs| {
             let mut mounts = self.mounts.borrow(cs).borrow_mut();
             // The root's own identity comes from the mount that made
@@ -938,12 +970,11 @@ impl Vfs {
                 *self.root_fstype.borrow(cs).borrow_mut() = Some(entry.0);
                 *self.root_source.borrow(cs).borrow_mut() = Some(entry.1);
                 *self.root_read_only.borrow(cs).borrow_mut() = entry.2;
-                *self.root_fs.borrow(cs).borrow_mut() = entry.3;
+                *self.root_fs.borrow(cs).borrow_mut() = Some(entry.3);
                 *self.root_dev.borrow(cs).borrow_mut() = entry.4;
                 *self.root_mount_id.borrow(cs).borrow_mut() = entry.5;
             }
-            // Every mount in the table was attached somewhere in the old tree -
-            // /dev, /tmp, the new root itself - and none of them can be reached
+            // Every mount in the table was attached somewhere in the old tree -            // /dev, /tmp, the new root itself - and none of them can be reached
             // once the root is replaced. Keeping them would leave entries
             // anchored at nodes nothing resolves to, holding whole filesystems
             // alive for good. The new tree starts with the one mount below plus
@@ -961,7 +992,7 @@ impl Vfs {
                 mount_id,
                 dev,
                 read_only: false,
-                fs: None,
+                fs: demoted_fs.clone(),
                 bind: false,
             });
             *self.root.borrow(cs).borrow_mut() = Some(new_root_inode);
@@ -1458,6 +1489,10 @@ impl Vfs {
             return Err(VfsError::Invalid);
         }
         let parent = self.resolve(parent_path)?;
+        // A name cannot be made or removed in something that is not a
+        // directory, and the answer is the tree's rather than the caller's -
+        // see [`require_directory`](crate::vfs::require_directory).
+        crate::vfs::require_directory(&parent)?;
         Ok((parent, String::from(name)))
     }
 
@@ -1483,6 +1518,10 @@ impl Vfs {
             return Ok((dir, String::from(name)));
         }
         let parent = self.resolve_from(parent_path, start)?;
+        // The directory the name will land in, checked to *be* one: a bind or
+        // an unlink under a plain file is `ENOTDIR` from here, never the
+        // `EACCES` a search through a file's absent execute bit would give.
+        crate::vfs::require_directory(&parent)?;
         Ok((parent, String::from(name)))
     }
 
@@ -1543,12 +1582,15 @@ pub fn global() -> &'static Vfs {
 }
 
 /// Install the kernel's root filesystem. Once, at boot.
-pub fn mount_root(fs: &dyn FileSystem) {
+///
+/// The instance travels, not just a borrow of it: see [`Vfs::mount_root`] for
+/// what a root recorded without one costs.
+pub fn mount_root(fs: Arc<dyn FileSystem>) {
     STATIC.mount_root(fs);
 }
 
 /// Mount `fs` at the directory named by `path` in the kernel's tree.
-pub fn mount(path: &str, fs: &dyn FileSystem) -> VfsResult<()> {
+pub fn mount(path: &str, fs: Arc<dyn FileSystem>) -> VfsResult<()> {
     STATIC.mount(path, fs)
 }
 
@@ -1777,7 +1819,7 @@ mod tests {
 
     fn tree_with_root() -> Arc<Vfs> {
         let vfs = Arc::new(Vfs::new());
-        vfs.mount_root(&*RamFs::new());
+        vfs.mount_root(RamFs::new());
         vfs
     }
 
@@ -1870,7 +1912,7 @@ mod tests {
         // means unpoliced" for a directory the test walks through.
         inner.root().set_mode(0o755);
         inner.root().create("hello", NodeKind::File).unwrap();
-        vfs.mount("/mnt", &*inner).unwrap();
+        vfs.mount("/mnt", inner.clone()).unwrap();
 
         let mnt = vfs.resolve("/mnt").unwrap();
         assert!(Arc::ptr_eq(&mnt, &inner.root()));
@@ -1913,7 +1955,7 @@ mod tests {
         under.create("stale", NodeKind::File).unwrap();
         let live = RamFs::new();
         live.root().create("openrc", NodeKind::Dir).unwrap();
-        vfs.mount("/run", &*live).unwrap();
+        vfs.mount("/run", live.clone()).unwrap();
         vfs.resolve("/")
             .unwrap()
             .create("b", NodeKind::Dir)
@@ -1950,16 +1992,19 @@ mod tests {
             .unwrap();
         let inner = RamFs::new();
 
-        vfs.mount("/d", &*inner).unwrap();
-        assert_eq!(vfs.mount("/d", &*inner).unwrap_err(), VfsError::Busy);
-        assert_eq!(vfs.mount("/f", &*inner).unwrap_err(), VfsError::NotDir);
+        vfs.mount("/d", inner.clone()).unwrap();
+        assert_eq!(vfs.mount("/d", inner.clone()).unwrap_err(), VfsError::Busy);
+        assert_eq!(
+            vfs.mount("/f", inner.clone()).unwrap_err(),
+            VfsError::NotDir
+        );
     }
 
     #[test]
     fn resolving_before_a_root_exists_is_noroot() {
         let vfs = Vfs::new();
         assert_eq!(vfs.resolve("/").err(), Some(VfsError::NoRoot));
-        assert_eq!(vfs.mount("/", &*RamFs::new()).err(), Some(VfsError::NoRoot));
+        assert_eq!(vfs.mount("/", RamFs::new()).err(), Some(VfsError::NoRoot));
     }
     /// Build `/bin/busybox` as a file and `/bin/ls`, `/bin/sh` as links to it -
     /// the shape a busybox rootfs is made of.
@@ -2030,6 +2075,30 @@ mod tests {
         assert_eq!(link.readlink().unwrap(), "/bin/busybox");
     }
 
+    /// The directory a name is made or removed in has to *be* a directory.
+    ///
+    /// The counterfactual is the one the guest sweep found: `bind` under a
+    /// plain file reached `may_create_in` first and answered `EACCES` - the
+    /// search of a file carrying no execute bit - where Linux answers
+    /// `ENOTDIR`. The walk refuses a component that cannot hold children
+    /// *before* any permission is asked, and this pins that order for the
+    /// split every make-or-remove goes through.
+    #[test]
+    fn a_parent_that_is_not_a_directory_is_not_dir() {
+        let vfs = tree_with_root();
+        let root = vfs.resolve("/").unwrap();
+        root.create("plain", NodeKind::File).unwrap();
+        // Absolute resolution, the door `bind` and `unlink` come through.
+        assert_eq!(vfs.resolve_parent("/plain/x").err(), Some(VfsError::NotDir));
+        // And the cwd-relative door a `dirfd` call uses, which resolves the
+        // parent from the caller's directory rather than the root.
+        assert_eq!(
+            vfs.resolve_parent_from("/plain/x", root.clone()).err(),
+            Some(VfsError::NotDir),
+            "a name cannot be made inside a plain file"
+        );
+    }
+
     #[test]
     fn readlink_on_a_file_that_is_not_a_link_is_an_error() {
         let vfs = tree_with_busybox();
@@ -2062,12 +2131,12 @@ mod tests {
         let vfs = tree_with_root();
         let root = vfs.resolve("/").unwrap();
         root.create("mnt", NodeKind::Dir).unwrap();
-        vfs.mount("/mnt", &*RamFs::new()).unwrap();
+        vfs.mount("/mnt", RamFs::new()).unwrap();
         // `usb` is made *inside* the mount, which is the only place it can be
         // seen once the filesystem is on top of `/mnt`.
         let mnt = vfs.resolve("/mnt").unwrap();
         mnt.create("usb", NodeKind::Dir).unwrap();
-        vfs.mount("/mnt/usb", &*RamFs::new()).unwrap();
+        vfs.mount("/mnt/usb", RamFs::new()).unwrap();
 
         // Ids are handed out in mount order, and 0 is the root's.
         assert_eq!(vfs.fs_of_path("/mnt/usb/f").0, 2);
@@ -2086,7 +2155,7 @@ mod tests {
         let root = vfs.resolve("/").unwrap();
         root.create("mnt", NodeKind::Dir).unwrap();
         root.create("mntx", NodeKind::Dir).unwrap();
-        vfs.mount("/mnt", &*RamFs::new()).unwrap();
+        vfs.mount("/mnt", RamFs::new()).unwrap();
 
         assert_eq!(vfs.fs_of_path("/mnt").0, 1);
         assert_eq!(vfs.fs_of_path("/mnt/f").0, 1);
@@ -2103,7 +2172,7 @@ mod tests {
         let vfs = tree_with_root();
         let root = vfs.resolve("/").unwrap();
         root.create("mnt", NodeKind::Dir).unwrap();
-        vfs.mount("/mnt", &*RamFs::new()).unwrap();
+        vfs.mount("/mnt", RamFs::new()).unwrap();
 
         for spelling in [
             "/mnt/f",
@@ -2322,7 +2391,7 @@ mod cwd_tests {
     #[test]
     fn a_relative_path_starts_at_the_given_node() {
         let vfs = Arc::new(Vfs::new());
-        vfs.mount_root(&*RamFs::new());
+        vfs.mount_root(RamFs::new());
         vfs.resolve("/")
             .unwrap()
             .create("bin", NodeKind::Dir)

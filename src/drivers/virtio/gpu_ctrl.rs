@@ -27,7 +27,6 @@ use core::ptr::NonNull;
 
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::Transport;
-use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::{BufferDirection, Error, Hal};
 
 use crate::drivers::virtio::hal::HalImpl;
@@ -103,9 +102,92 @@ impl Drop for Frames {
 // DMA block; this is that block, allocated the same way.
 unsafe impl Send for Frames {}
 
+/// The command surface the render task drives, over whichever transport the
+/// device arrived on.
+///
+/// This is where the device's type is erased, and it exists for one reason: the
+/// crate's `Transport` is not object-safe, so `Gpu<T>` cannot be boxed as a
+/// *device* and `video::render` - which owns the one device in a `static` and is
+/// the only context that may call `flush` - could not hold both machines' cards
+/// without this. The trait names exactly the commands that task sends (and
+/// nothing else: a method no caller has is a promise nothing keeps) and
+/// [`Gpu<T>`] implements it once, so the transport stops here and the render
+/// task, the DRM layer above it, the framebuffer below it and `drivers::video`
+/// are one copy on both machines (`PLAN.md` §13.26).
+///
+/// `Send` because the device is moved into the render task.
+pub trait GpuDevice: Send {
+    /// How many cap sets the device's configuration says it has.
+    fn num_capsets(&self) -> u32;
+
+    /// The features the transport actually agreed to - what every 3D answer
+    /// above this is gated on.
+    fn features(&self) -> abi::Features;
+
+    /// What resolution the host's display has, or a device with no display.
+    fn resolution(&mut self) -> Result<(u32, u32), Error>;
+
+    /// Build the scanout's resource at `width` x `height` and point the scanout
+    /// at it, handing back the pixels.
+    fn change_resolution(&mut self, width: u32, height: u32) -> Result<&mut [u8], Error>;
+
+    /// Put the current scanout's rectangle on the host's display.
+    fn flush(&mut self) -> Result<(), Error>;
+
+    /// Attach a resource's backing store: `(address, length)` pairs of guest
+    /// memory the device may read for that resource.
+    fn attach_backing(&mut self, id: u32, entries: &[(u64, u32)]) -> Result<(), Error>;
+
+    /// Release a resource.
+    fn unref(&mut self, id: u32) -> Result<(), Error>;
+
+    /// Make a 2D resource `width` x `height` - the scanout's own kind.
+    fn create_2d(&mut self, id: u32, width: u32, height: u32) -> Result<(), Error>;
+
+    /// Make a 3D resource from the caller's request - what a render server
+    /// allocates for a client.
+    fn create_3d(&mut self, request: &abi::ResourceCreate3d) -> Result<(), Error>;
+
+    /// Copy a rectangle of a resource from guest memory to the device.
+    fn transfer_to_host_2d(&mut self, id: u32, width: u32, height: u32) -> Result<(), Error>;
+
+    /// Make a 3D context - the render server's per-client door.
+    fn ctx_create(&mut self, id: u32, context_init: u32, name: &[u8]) -> Result<(), Error>;
+
+    /// Bind a resource to a context, so the context's commands may name it.
+    fn ctx_attach_resource(&mut self, ctx: u32, resource: u32) -> Result<(), Error>;
+
+    /// Move a resource between guest memory and the device, in either
+    /// direction.
+    fn transfer_host_3d(
+        &mut self,
+        to_host: bool,
+        ctx: u32,
+        request: &abi::TransferHost3d,
+    ) -> Result<(), Error>;
+
+    /// Submit one command stream to a context, under a fence the caller names.
+    fn submit_3d(&mut self, ctx: u32, ring_idx: u8, fence: u64, stream: &[u8])
+    -> Result<(), Error>;
+
+    /// What the device's cap set at `index` is - the walk that builds the DRM
+    /// layer's table.
+    fn get_capset_info(&mut self, index: u32) -> Result<abi::RespCapsetInfo, Error>;
+
+    /// One cap set's bytes, by id and version.
+    fn get_capset(&mut self, id: u32, version: u32, out: &mut [u8]) -> Result<usize, Error>;
+}
+
 /// The device: one transport, one control queue, and the scanout's memory.
-pub struct Gpu {
-    transport: PciTransport,
+///
+/// Generic over the transport, because the crate's `Transport` is not
+/// object-safe (`begin_init<F: Flags>` is a generic method, and `VirtQueue::new`
+/// takes `&mut T where T: Transport`), so a `Box<dyn Transport>` is not a device
+/// this driver could be built over. Which transport it is remains the machine's
+/// fact; everything above it reaches the device through [`GpuDevice`], which is
+/// where the type is erased (`PLAN.md` §13.26).
+pub struct Gpu<T: Transport> {
+    transport: T,
     control: VirtQueue<HalImpl, QUEUE_SIZE>,
     /// The feature word the transport actually agreed to, kept rather than
     /// discarded once the queue is built.
@@ -159,7 +241,7 @@ pub struct Gpu {
     num_capsets: u32,
 }
 
-impl Gpu {
+impl<T: Transport> Gpu<T> {
     /// Bring up the device: negotiate features, configure the control queue,
     /// and set the driver-status to OK.
     ///
@@ -169,7 +251,7 @@ impl Gpu {
     /// queue layout depends on: indirect descriptors and the event index are
     /// queue features, and asking `VirtQueue::new` for a layout the device did
     /// not agree to would build a ring it cannot read.
-    pub fn new(mut transport: PciTransport) -> Result<Self, Error> {
+    pub fn new(mut transport: T) -> Result<Self, Error> {
         let agreed = transport.begin_init(abi::WANTED_FEATURES);
         let control = VirtQueue::new(
             &mut transport,
@@ -763,5 +845,86 @@ impl Gpu {
             scanout_id,
             resource_id,
         })
+    }
+}
+
+/// The erase point: every method is the inherent one above, so the render task
+/// names the *contract* and never a transport. `T: Send` is what the task needs
+/// to hold the device across a spawn, and it is the whole of what the type
+/// parameter adds here.
+impl<T: Transport + Send> GpuDevice for Gpu<T> {
+    fn num_capsets(&self) -> u32 {
+        self.num_capsets()
+    }
+
+    fn features(&self) -> abi::Features {
+        self.features()
+    }
+
+    fn resolution(&mut self) -> Result<(u32, u32), Error> {
+        self.resolution()
+    }
+
+    fn change_resolution(&mut self, width: u32, height: u32) -> Result<&mut [u8], Error> {
+        self.change_resolution(width, height)
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        self.flush()
+    }
+
+    fn attach_backing(&mut self, id: u32, entries: &[(u64, u32)]) -> Result<(), Error> {
+        self.attach_backing(id, entries)
+    }
+
+    fn unref(&mut self, id: u32) -> Result<(), Error> {
+        self.unref(id)
+    }
+
+    fn create_2d(&mut self, id: u32, width: u32, height: u32) -> Result<(), Error> {
+        self.create_2d(id, width, height)
+    }
+
+    fn create_3d(&mut self, request: &abi::ResourceCreate3d) -> Result<(), Error> {
+        self.create_3d(request)
+    }
+
+    fn transfer_to_host_2d(&mut self, id: u32, width: u32, height: u32) -> Result<(), Error> {
+        self.transfer_to_host_2d(id, width, height)
+    }
+
+    fn ctx_create(&mut self, id: u32, context_init: u32, name: &[u8]) -> Result<(), Error> {
+        self.ctx_create(id, context_init, name)
+    }
+
+    fn ctx_attach_resource(&mut self, ctx: u32, resource: u32) -> Result<(), Error> {
+        self.ctx_attach_resource(ctx, resource)
+    }
+
+    fn transfer_host_3d(
+        &mut self,
+        to_host: bool,
+        ctx: u32,
+        request: &abi::TransferHost3d,
+    ) -> Result<(), Error> {
+        self.transfer_host_3d(to_host, ctx, request)
+    }
+
+    fn submit_3d(
+        &mut self,
+        ctx: u32,
+        ring_idx: u8,
+        fence: u64,
+        stream: &[u8],
+    ) -> Result<(), Error> {
+        self.submit_3d(ctx, ring_idx, fence, stream)
+    }
+
+    fn get_capset_info(&mut self, index: u32) -> Result<abi::RespCapsetInfo, Error> {
+        self.get_capset_info(index)
+    }
+
+    fn get_capset(&mut self, id: u32, version: u32, out: &mut [u8]) -> Result<usize, Error> {
+        self.get_capset(id, version, out)
     }
 }

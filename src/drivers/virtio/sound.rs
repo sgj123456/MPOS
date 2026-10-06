@@ -1,7 +1,8 @@
 //! virtio-sound, through the `virtio-drivers` crate.
 //!
-//! The device is QEMU's `virtio-sound-pci` with an audio backend behind
-//! it. The crate speaks the control queue - the jack and stream listings,
+//! The device is QEMU's `virtio-sound` with an audio backend behind it - a PCI
+//! function on the first machine, an MMIO window on the second, and the same
+//! crate driver either way. The crate speaks the control queue - the jack and stream listings,
 //! the parameter negotiation, the PCM commands - and hands over one
 //! blocking call that moves bytes to the output stream. What is left here
 //! is the stream face userland gets: `/dev/dsp`, the OSS name, fed with
@@ -23,6 +24,12 @@
 //! Reads answer end of input: the crate drives playback only, and a device
 //! that cannot record should not pretend to have a silence it did not
 //! capture.
+//!
+//! What the card is built *over* is the machine's and nothing above it names
+//! one: [`VirtioSnd<T>`] takes the crate's `VirtIOSound` over whatever transport
+//! the machine opened it on, and everything above - the OSS ioctls, the staging
+//! buffer, the devfs node - is one copy reached through the [`SoundCard`]
+//! contract (`PLAN.md` §13.27).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -30,9 +37,12 @@ use core::cell::RefCell;
 
 use critical_section::Mutex;
 use virtio_drivers::device::sound::{PcmFormat, PcmRate, VirtIOSound};
-use virtio_drivers::transport::pci::PciTransport;
+use virtio_drivers::transport::Transport;
 
-use super::hal::{HalImpl, transport};
+use super::SoundCard;
+use super::hal::HalImpl;
+#[cfg(target_arch = "x86_64")]
+use super::hal::transport;
 use crate::syscall::linux::abi::{
     AFMT_S16_LE, SNDCTL_DSP_CHANNELS, SNDCTL_DSP_GETBLKSIZE, SNDCTL_DSP_GETFMTS,
     SNDCTL_DSP_GETISPACE, SNDCTL_DSP_GETOSPACE, SNDCTL_DSP_NONBLOCK, SNDCTL_DSP_POST,
@@ -54,6 +64,11 @@ use crate::syscall::linux::abi::{
 /// `ENOENT`/`EBADF` and the whole of `t-dsp` went red while the driver itself was
 /// fine. A wrong ID on the *absent* branch is invisible by construction: the
 /// bug's only trace is the device that never appears.
+///
+/// It names the PCI vendor's ID range, so it is the first machine's: the second
+/// finds the same card by the `virtio,mmio` window its device tree names, whose
+/// `DeviceID` is `25` (`VIRTIO_ID_SOUND`).
+#[cfg(target_arch = "x86_64")]
 const DEVICE_SOUND: &[u16] = &[0x1059];
 
 /// One period of audio, and the buffer the device holds behind the stream.
@@ -83,10 +98,12 @@ const ALL_RATES: [PcmRate; 14] = [
     PcmRate::Rate384000,
 ];
 
-pub struct VirtioSnd {
+pub struct VirtioSnd<T: Transport> {
     /// The device, behind a lock: every operation the crate offers takes
-    /// `&mut`, and one stream serves however many writers `/dev/dsp` has.
-    device: Mutex<RefCell<VirtIOSound<HalImpl, PciTransport>>>,
+    /// `&mut`, and one stream serves however many writers `/dev/dsp` has. Which
+    /// transport it arrived on is the type parameter and nothing else - see
+    /// [`SoundCard`] for why the card is erased above this line.
+    device: Mutex<RefCell<VirtIOSound<HalImpl, T>>>,
     /// The output stream the parameters are set on.
     stream: u32,
     /// The rates, in Hz, the device offered at probe - what a requested
@@ -119,7 +136,7 @@ pub struct VirtioSnd {
     stage: Mutex<RefCell<Vec<u8>>>,
 }
 
-impl VirtioSnd {
+impl<T: Transport> VirtioSnd<T> {
     /// Hand `buf` to the output stream, in period-sized pieces, and return
     /// once the device has consumed all of it. A refusal is a short write:
     /// the `CharDevice` contract counts bytes, and a caller that sent ten
@@ -205,28 +222,17 @@ impl VirtioSnd {
         })
     }
 
-    /// Probe the PCI bus and bring up the first virtio-sound device, with
-    /// its first output stream armed. `None` when there is no card, or the
-    /// card has no stream to play through - a machine with no sound is a
-    /// quieter boot, not a failed one.
-    pub fn init() -> Option<Arc<Self>> {
-        match VirtioSnd::probe() {
-            Ok(dev) => Some(dev),
-            // A card answered on the bus and then refused the questions -
-            // that is worth a line, because "no /dev/dsp" with a device
-            // present is a bug's footprint, not a machine's absence.
-            Err(Probe::Absent) => None,
-            Err(other) => {
-                crate::println!("virtio-sound: {other}");
-                None
-            }
-        }
-    }
-
-    fn probe() -> Result<Arc<Self>, Probe> {
-        let transport = transport(DEVICE_SOUND).ok_or(Probe::Absent)?;
-        let mut device = VirtIOSound::<HalImpl, _>::new(transport).map_err(|_| Probe::Init)?;
-
+    /// Bring up a card the machine has already opened: its first output stream,
+    /// the rates and channel range it answers with, and the boot-default
+    /// parameters.
+    ///
+    /// The machine's half is the `VirtIOSound` and how it was opened - a PCI
+    /// function on the first machine, an MMIO window on the second
+    /// (`super::mmio::sound_device`); everything below is the driver's and is the
+    /// same on both. `Err` is a card that answered and then refused a question,
+    /// which is worth a line: "no /dev/dsp" with a device present is a bug's
+    /// footprint, not a machine's absence.
+    pub fn new(mut device: VirtIOSound<HalImpl, T>) -> Result<Arc<Self>, Probe> {
         let stream = device
             .output_streams()
             .ok()
@@ -294,6 +300,24 @@ impl VirtioSnd {
     }
 }
 
+/// The erase point: each method is the inherent one above, so the devfs node,
+/// the OSS ioctls and the boot's probe line name the *contract* and never a
+/// transport. `T: Send` is what the card's `Arc` needs to be shareable, and it
+/// is the whole of what the type parameter adds here.
+impl<T: Transport + Send> SoundCard for VirtioSnd<T> {
+    fn format(&self) -> (u32, u8) {
+        self.format()
+    }
+
+    fn configure(&self, rate: u32, channels: u8) -> Result<(u32, u8), isize> {
+        self.configure(rate, channels)
+    }
+
+    fn play(&self, buf: &[u8]) -> usize {
+        self.play(buf)
+    }
+}
+
 /// The `PcmRate` a frequency names - the inverse of [`rate_hz`], because the
 /// ioctl hands back a rounding of a number the caller wrote, and re-issuing
 /// parameters needs the wire form of it again.
@@ -305,7 +329,7 @@ fn hz_to_rate(hz: u32) -> Option<PcmRate> {
 /// machine with no sound at all - silent, as a quieter boot should be; the
 /// rest name a device that was found and then refused, which is a bug worth
 /// the one log line it costs.
-enum Probe {
+pub enum Probe {
     Absent,
     Init,
     NoStream,
@@ -353,29 +377,61 @@ fn rate_hz(rate: PcmRate) -> u32 {
 }
 
 /// The device the boot found, if it found one.
-static GLOBAL: Mutex<RefCell<Option<Arc<VirtioSnd>>>> = Mutex::new(RefCell::new(None));
+static GLOBAL: Mutex<RefCell<Option<Arc<dyn SoundCard>>>> = Mutex::new(RefCell::new(None));
 
-/// Probe for the card and record it under the name userland will open.
-pub fn init_global() -> Option<Arc<VirtioSnd>> {
-    let dev = VirtioSnd::init()?;
+/// Make `card` the machine's sound card, and hand it back.
+///
+/// The one door in: the first machine arrives through [`init_global`], the
+/// second with the card its MMIO window opened, and everything above - the devfs
+/// node, the OSS ioctls, the boot's line - is the same either way.
+pub fn install(card: Arc<dyn SoundCard>) -> Arc<dyn SoundCard> {
     critical_section::with(|cs| {
-        let mut slot = GLOBAL.borrow(cs).borrow_mut();
-        *slot = Some(dev.clone());
+        *GLOBAL.borrow(cs).borrow_mut() = Some(card.clone());
     });
-    Some(dev)
+    card
+}
+
+/// Bring up the card a machine opened, record it under the name userland will
+/// open, and answer it - or say why the machine has none.
+///
+/// `opened` is the crate's device as the machine's bus handed it back, or the
+/// reason there is none: `Err(Probe::Absent)` is no card at all, which is a
+/// quieter boot rather than a failed one, while any other refusal is a card that
+/// answered and then would not play, which is worth a line.
+pub fn install_probed<T: Transport + Send + 'static>(
+    opened: Result<VirtIOSound<HalImpl, T>, Probe>,
+) -> Option<Arc<dyn SoundCard>> {
+    match opened.and_then(VirtioSnd::new) {
+        Ok(card) => Some(install(card)),
+        Err(Probe::Absent) => None,
+        Err(other) => {
+            crate::println!("virtio-sound: {other}");
+            None
+        }
+    }
+}
+
+/// The first machine's door: probe the PCI bus for the card and bring it up.
+#[cfg(target_arch = "x86_64")]
+pub fn init_global() -> Option<Arc<dyn SoundCard>> {
+    let opened = match transport(DEVICE_SOUND) {
+        Some(transport) => VirtIOSound::<HalImpl, _>::new(transport).map_err(|_| Probe::Init),
+        None => Err(Probe::Absent),
+    };
+    install_probed(opened)
 }
 
 /// The card, if the machine has one.
-pub fn global() -> Option<Arc<VirtioSnd>> {
+pub fn global() -> Option<Arc<dyn SoundCard>> {
     critical_section::with(|cs| GLOBAL.borrow(cs).borrow().clone())
 }
 
 /// The `CharDevice` face of the stream, for the devfs builder: writes play,
 /// and a read is end of input - the crate drives playback only.
-pub struct DspDev(Arc<VirtioSnd>);
+pub struct DspDev(Arc<dyn SoundCard>);
 
 impl DspDev {
-    pub fn new(dev: Arc<VirtioSnd>) -> Self {
+    pub fn new(dev: Arc<dyn SoundCard>) -> Self {
         DspDev(dev)
     }
 }

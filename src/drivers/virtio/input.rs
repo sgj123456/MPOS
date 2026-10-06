@@ -6,6 +6,12 @@
 //! is missing is the two things evdev adds around them: a timestamp, and a
 //! reader's ABI. Both are added here.
 //!
+//! What the registry holds is [`InputDevice`], not a transport. The crate's
+//! driver is opened over `PciTransport` on the first machine ([`init`]) and over
+//! the MMIO transport on the second (`super::mmio`), and both hand the registry
+//! the same contract - so the nodes, the ioctl vocabulary, the record window and
+//! the service task below are one copy on both machines (`PLAN.md` §15.2).
+//!
 //! The reader's ABI is `/dev/input/event0`, the node an evdev reader opens,
 //! and the record it expects is `struct input_event`: a `timeval`, then the
 //! event's type, code and value - twenty-four bytes on x86_64, a whole
@@ -32,17 +38,28 @@ use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use critical_section::Mutex;
-use virtio_drivers::device::input::{AbsInfo, VirtIOInput};
-use virtio_drivers::transport::pci::PciTransport;
+use virtio_drivers::device::input::AbsInfo;
+#[cfg(target_arch = "x86_64")]
+use virtio_drivers::device::input::VirtIOInput;
 
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 
+use super::InputDevice;
+#[cfg(target_arch = "x86_64")]
+use super::VirtioInputDev;
+#[cfg(target_arch = "x86_64")]
 use super::hal::{HalImpl, transport_all};
 
 /// The modern device ID; virtio-input never had a legacy form. Every input
 /// device - the keyboard, the tablet, the mouse - answers the same one,
 /// which is why the driver probes for *all* of them and names a node per
 /// device rather than one node for the first it happened to find.
+///
+/// It names the PCI vendor's ID range, so it is the first machine's: aarch64
+/// finds the same device by the `virtio,mmio` window its device tree names
+/// (`super::mmio`), and both arrive at [`register`] holding the same
+/// [`InputDevice`].
+#[cfg(target_arch = "x86_64")]
 const DEVICE_INPUT: &[u16] = &[0x1052];
 
 // One `struct input_event`, and the window of them a device keeps, live in
@@ -50,16 +67,16 @@ const DEVICE_INPUT: &[u16] = &[0x1052];
 // This module is the device, the ioctl surface, and the encoding.
 use crate::evdev::{RECORD, Records};
 
-/// One virtio input device paired with the node its events queue into.
-type Devices = Vec<(Arc<Dev>, Arc<EvdevNode>)>;
+/// One input device paired with the node its events queue into.
+///
+/// The device is the *contract*, not a transport: which bus answered it is the
+/// machine's fact and the registry never asks, so `EvdevNode`, the record
+/// window behind it and the service task below are one copy on both machines
+/// (`PLAN.md` §15.2).
+type Devices = Vec<(Arc<dyn InputDevice>, Arc<EvdevNode>)>;
 
 /// The devices the boot found, in the order the bus answered them.
 static DEVICES: Mutex<RefCell<Devices>> = Mutex::new(RefCell::new(Vec::new()));
-
-/// One virtio input device behind its evdev node.
-struct Dev {
-    device: Mutex<RefCell<VirtIOInput<HalImpl, PciTransport>>>,
-}
 
 /// The device kinds the evdev ABI names by number, as far as the capability
 /// bitmap is walked. `EV_KEY`..`EV_FF_STATUS` sit in the low byte; 32 slots
@@ -129,13 +146,12 @@ impl EvdevCaps {
 /// Query the device's whole capability picture. Every `ev_bits`/`abs_info`
 /// call walks the virtio config space; a device that does not answer one is
 /// simply missing that entry, which is the honest, conservative picture.
-fn read_caps(device: &mut VirtIOInput<HalImpl, PciTransport>) -> EvdevCaps {
+fn read_caps(device: &dyn InputDevice) -> EvdevCaps {
     let mut caps = EvdevCaps::default();
     for t in 0..0x20u8 {
-        if let Ok(bits) = device.ev_bits(t)
-            && !bits.is_empty()
-        {
-            caps.code_bits[t as usize] = bits.into_vec();
+        let bits = device.ev_bits(t);
+        if !bits.is_empty() {
+            caps.code_bits[t as usize] = bits;
             caps.type_bits[(t / 8) as usize] |= 1 << (t % 8);
         }
     }
@@ -151,15 +167,15 @@ fn read_caps(device: &mut VirtIOInput<HalImpl, PciTransport>) -> EvdevCaps {
         if abs_map[code / 8] & (1u8 << (code % 8)) == 0 {
             continue;
         }
-        if let Ok(info) = device.abs_info(code as u8) {
+        if let Some(info) = device.abs_info(code as u8) {
             caps.abs.push((code as u8, info));
         }
     }
-    if let Ok(prop) = device.prop_bits() {
-        caps.prop_bits = prop.into_vec();
-    }
-    if let Ok(ids) = device.ids() {
-        caps.id = [ids.bustype, ids.vendor, ids.product, ids.version];
+    // A device that answers no property bitmap leaves the default empty one,
+    // which is the same picture the ABI reports for it.
+    caps.prop_bits = device.prop_bits();
+    if let Some(id) = device.ids() {
+        caps.id = id;
     }
     caps
 }
@@ -947,36 +963,57 @@ pub fn close_at_exit(files: &[Arc<crate::vfs::file::File>], _owner: u32) {
     });
 }
 
-/// Probe the PCI bus for every virtio input device and build a node for
-/// each. The pairs are what the devfs builder registers as
-/// `/dev/input/event0`, `event1`, ... and what the service task polls.
-pub fn init() -> Vec<(Arc<EvdevNode>, String)> {
+/// Build the evdev registry from a machine's input devices, one node per device
+/// in the order given, and hand back the node names for the boot to print.
+///
+/// This is the one door into the registry, and it takes the *contract* rather
+/// than a bus. Each machine opens its own transport - [`init`] below enumerates
+/// virtio-PCI, `super::mmio` opens the window its device tree named - and every
+/// line here is the same on both: the capability picture read once at init, the
+/// `event0`, `event1`, ... numbering, the pairs the devfs builder publishes as
+/// `/dev/input/eventN` and the service task drains.
+pub fn register(devices: Vec<Arc<dyn InputDevice>>) -> Vec<(Arc<EvdevNode>, String)> {
     let mut nodes = Vec::new();
-    let mut devices = Vec::new();
-    for transport in transport_all(DEVICE_INPUT) {
-        let Ok(mut device) = VirtIOInput::<HalImpl, _>::new(transport) else {
-            continue;
-        };
+    let mut table = Vec::new();
+    for device in devices {
+        // The name and the whole capability picture are read here, before the
+        // device is parked behind the service table - libinput asks for both at
+        // open time, with no event having arrived yet.
         let name = device
             .name()
-            .unwrap_or_else(|_| String::from("virtio_input"));
-        // Read the whole capability picture before the device is parked
-        // behind the service table - libinput asks for it at open time.
-        let caps = read_caps(&mut device);
+            .unwrap_or_else(|| String::from("virtio_input"));
+        let caps = read_caps(&*device);
         let node = EvdevNode::new(name.clone(), nodes.len(), caps);
-        devices.push((
-            Arc::new(Dev {
-                device: Mutex::new(RefCell::new(device)),
-            }),
-            node.clone(),
-        ));
+        table.push((device, node.clone()));
         nodes.push((node, name));
     }
     critical_section::with(|cs| {
-        let mut table = DEVICES.borrow(cs).borrow_mut();
-        table.extend(devices);
+        let mut devices = DEVICES.borrow(cs).borrow_mut();
+        devices.extend(table);
     });
     nodes
+}
+
+/// Probe the PCI bus for every virtio input device and build a node for each.
+/// The pairs are what the devfs builder registers as `/dev/input/event0`,
+/// `event1`, ... and what the service task polls.
+///
+/// The first machine's door into [`register`]. The devices it walks for are the
+/// virtio-PCI functions answering [`DEVICE_INPUT`], each of which becomes a
+/// [`VirtioInputDev`] over its own `PciTransport` - so the transport stops here
+/// and everything above is the contract. A function that does not open as an
+/// input device is skipped rather than guessed at, which is why a machine whose
+/// bus answered with none gets an empty list and an honestly empty `/dev/input`.
+#[cfg(target_arch = "x86_64")]
+pub fn init() -> Vec<(Arc<EvdevNode>, String)> {
+    let devices: Vec<Arc<dyn InputDevice>> = transport_all(DEVICE_INPUT)
+        .into_iter()
+        .filter_map(|transport| {
+            let device = VirtIOInput::<HalImpl, _>::new(transport).ok()?;
+            Some(Arc::new(VirtioInputDev::new(device)) as Arc<dyn InputDevice>)
+        })
+        .collect();
+    register(devices)
 }
 
 /// Every evdev node the boot built, in bus order - what the devfs builder
@@ -1050,7 +1087,6 @@ pub fn service() {
         let devices = DEVICES.borrow(cs).borrow();
         let mut keymap = KEYMAP.borrow(cs).borrow_mut();
         for (dev, node) in devices.iter() {
-            let mut device = dev.device.borrow(cs).borrow_mut();
             // A grabbed device belongs to whoever grabbed it. libinput takes
             // the grab the moment it opens an evdev node, and this check is
             // what that means here: the keystrokes stop being *also* console
@@ -1111,7 +1147,7 @@ pub fn service() {
             // the mux consumes the latch asynchronously and the whole escape
             // sequence normally arrives within this one batch.
             let mux_wants = crate::vfs::vcmux::mux_wants();
-            while let Some(event) = device.pop_pending_event() {
+            while let Some(event) = dev.pop_pending_event() {
                 // The node is fed first and independently of the console, so a
                 // mouse (`EV_REL`) event is never lost to the console-routing
                 // check below - only keyboard events are ever routed to a shell.

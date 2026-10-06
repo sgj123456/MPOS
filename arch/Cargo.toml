@@ -1,0 +1,78 @@
+# The machine layer, as a crate: the hardware abstraction layer and the two
+# ports behind it.
+#
+# It was `src/hal/` and `src/arch/` inside the kernel, and it is separate now
+# because a module boundary could not stop the machine layer reaching up into
+# the kernel while a crate boundary can: nothing below depends on `mpos`, so
+# `crate::sched` and `crate::mm` are names that do not exist here rather than
+# names a convention says not to use (`PLAN.md` §14).
+#
+# **Not under `crates/`.** That directory is the *host-testable leaves* -
+# `xtask`'s `every_leaf_crate_is_tested` pins its contents against the list of
+# crates the host unit-test sweep builds, and this one cannot be built for the
+# host at all: it is `cli`/`sti`, descriptor tables and MSRs. A crate that
+# cannot be host-tested must not sit in the directory whose meaning is "these
+# can be".
+[package]
+name = "mpos-arch"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# The kernel re-exports `mpos_arch::{arch, hal}`, so the module paths inside
+# here are the same ones the kernel has always spelled (`crate::hal::…`,
+# `crate::arch::x86_64::…`). See the crate documentation for why the facade is
+# deliberate rather than incidental.
+path = "src/lib.rs"
+
+# The `mpos_*` capability vocabulary, declared once in the workspace manifest.
+# This package is half of why it is a workspace table rather than a package one:
+# `hal` is where the flags are read and the kernel is where the same flags are
+# read for the code that sits above the seam.
+[lints]
+workspace = true
+
+[dependencies]
+# The leaves *both* halves of the seam are written in: the mapping vocabulary
+# `hal::Paging` is expressed with, and the boot record `hal::Paging::install`
+# receives (and the aarch64 entry is handed). The three leaves only one machine
+# needs are in that machine's block below - cargo reports an unused dependency
+# per target, which is how the split was found.
+mpos-vm = { path = "../crates/vm" }
+mpos-bootinfo = { path = "../crates/bootinfo" }
+
+# The interrupt-masking critical section: `hal::tx_ring` locks with it and each
+# port implements it (`arch/<arch>/critical.rs`). `restore-state-bool` is the
+# shape both ports use - "were interrupts on when this section began" - and it
+# is named here rather than inherited from the kernel's own block because a
+# crate declares its own features; the two unify to one answer.
+#
+# Gated to the kernel's targets rather than unconditional, because the only user
+# is `hal::tx_ring` and `hal` is not built for the loader. Cargo says so itself
+# - an ungated entry reports `unused dependency` for `x86_64-unknown-uefi`, and
+# an unused dependency is a dependency that will be wrong without anyone
+# noticing.
+[target.'cfg(target_os = "none")'.dependencies.critical-section]
+version = "1.2"
+features = ["restore-state-bool"]
+
+# x86_64's own machine: the interrupt-descriptor and selector-table crates, the
+# 16550 crate's register definitions, `spin::Once` for the two tables that are
+# built exactly once, and the civil-calendar arithmetic the CMOS clock converts
+# through. aarch64 ports the same capabilities by hand - its vectors are
+# `global_asm!` and its PL011 is volatile reads - so it needs none of these.
+[target.'cfg(all(target_os = "none", target_arch = "x86_64"))'.dependencies]
+mpos-date = { path = "../crates/date" }
+uart_16550 = "0.8"
+spin = { version = "0.12", default-features = false, features = ["once", "lazy"] }
+x86_64 = { version = "0.15", default-features = false, features = [
+    "instructions",
+    "abi_x86_interrupt",
+] }
+
+# aarch64's own: the device tree reader (this is the machine whose firmware
+# describes it with one) and the errno the `svc` gate answers an unhandled call
+# with. Neither is built for x86_64, which is why they are here and not above.
+[target.'cfg(all(target_os = "none", target_arch = "aarch64"))'.dependencies]
+mpos-fdt = { path = "../crates/fdt" }
+mpos-err = { path = "../crates/err" }

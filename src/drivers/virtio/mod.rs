@@ -21,20 +21,34 @@
 //! `net` over MMIO come as the drivers stage proceeds, so `rng` is gated to
 //! x86_64 until its MMIO path exists.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::cell::RefCell;
+
+use critical_section::Mutex;
+use virtio_drivers::device::input::{AbsInfo, InputEvent, VirtIOInput};
 use virtio_drivers::device::socket::{VsockAddr, VsockEvent};
+use virtio_drivers::transport::Transport;
+
+use self::hal::HalImpl;
 
 #[cfg(target_arch = "x86_64")]
 pub mod blk;
-#[cfg(target_arch = "x86_64")]
 pub mod console;
-#[cfg(target_arch = "x86_64")]
 pub mod fs9p;
-#[cfg(target_arch = "x86_64")]
 pub mod gpu;
-#[cfg(target_arch = "x86_64")]
 pub mod gpu_ctrl;
 pub mod hal;
-#[cfg(target_arch = "x86_64")]
+/// The evdev registry, and the input device nodes it publishes. Gated on the
+/// *capability* rather than on the architecture, which is the difference between
+/// a switch a port can flip and one it has to edit: `mpos_input_registry` says
+/// "this machine has a registry of input devices and nodes for them", and both
+/// machines' sysfs, exit hooks and boot wiring read it. The module is written
+/// over [`InputDevice`] and never over a transport, so a machine reaches the
+/// registry with whatever its own bus answered: `input::init` enumerates
+/// virtio-PCI, and the MMIO side hands over the window it opened (`PLAN.md`
+/// §15.2).
+#[cfg(mpos_input_registry)]
 pub mod input;
 /// The memory-mapped virtio transport, this machine's path to its devices. Only
 /// aarch64 has its virtio behind fixed MMIO windows; x86_64 reaches the same
@@ -48,10 +62,27 @@ pub mod msix;
 pub mod net;
 #[cfg(target_arch = "x86_64")]
 pub mod rng;
-#[cfg(target_arch = "x86_64")]
 pub mod sound;
-#[cfg(target_arch = "x86_64")]
 pub mod vsock;
+
+/// Bytes from this machine's virtio-rng device, or `None` when it has none.
+///
+/// The device is the same one on both machines; the *wire* it arrives on is not,
+/// and each transport module owns its own read: x86_64 enumerates it on the PCI
+/// bus, aarch64 finds it in its fixed MMIO window. Naming the transport here is
+/// what keeps the caller machine-blind, which is why this exists rather than a
+/// `#[cfg]` at the call site. `crate::rand` folds in "the machine's rng device"
+/// and does not learn which machine it is on (`PLAN.md` §14.3).
+pub fn entropy() -> Option<[u8; 32]> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        mmio::entropy()
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        rng::entropy()
+    }
+}
 
 /// The name a virtio function's driver has in `/sys`, and the one `lspci -k`
 /// prints as "Kernel driver in use".
@@ -150,6 +181,31 @@ pub trait VsockDevice: Send + Sync {
     fn force_close(&self, peer: VsockAddr, port: u32) -> bool;
 }
 
+/// The virtio 9p device, as the host share's filesystem sees it.
+///
+/// The same split as the four above. The family is one - 9P2000 over the crate's
+/// request/answer wire - and everything above the transport is one copy already:
+/// the fid table, the `Twalk`/`Tread` encoding and the mapping onto the `Inode`
+/// contract are `src/vfs/p9.rs`'s whichever bus the device answered on. What a
+/// machine supplies is the transport the crate's driver was built over, so the
+/// device's type is erased here and the mount table, the boot's own mount and the
+/// `mount -t 9p` factory are the same on both machines (`PLAN.md` §13.29).
+///
+/// Two methods, because they are the two the protocol client and the mount table
+/// ask for. A machine with no share has no device to hand `p9::mount`, which
+/// answers `ENOENT` through the same path a named-but-absent tag does.
+pub trait P9Device: Send + Sync {
+    /// The tag the host exported this share under - the name `mount -t 9p` is
+    /// pointed at, and the `aname` a client that wants the host to take it
+    /// seriously attaches with.
+    fn mount_tag(&self) -> &str;
+
+    /// One round trip: send `req`, wait, and answer how many bytes of `resp` the
+    /// answer filled. The caller sizes `resp` for the largest answer it can
+    /// accept, which is the whole of the flow control this transport has.
+    fn request(&self, req: &[u8], resp: &mut [u8]) -> bool;
+}
+
 /// How much receive room this kernel advertises per vsock connection. The peer
 /// may not send more than this before waiting for a credit update, so the number
 /// is a window - and the device holds a buffer of the same size per connection,
@@ -161,15 +217,200 @@ pub trait VsockDevice: Send + Sync {
 /// device.
 pub const VSOCK_PER_CONNECTION_BUFFER: u32 = 8 * 1024;
 
+/// The host-driven console port, as the kernel's `/dev/hvc0` sees it.
+///
+/// The same split as the three above. The family is one - a virtio console
+/// port, a second serial line whose far end is whatever the host wired it to -
+/// and everything above the transport is one copy already: the blocking read
+/// that polls until bytes arrive, the write-through, and the device node the
+/// devfs builder publishes are the same code whichever bus the port answered
+/// on. The crate's own driver is the same one too; what a machine supplies is
+/// its `Transport`.
+///
+/// A port whose far end has no reader is still a port: the host's socket
+/// accepts bytes whether or not anyone is connected, and answers nothing
+/// until somebody writes. That is the honest `send`, not a failure.
+pub trait ConsolePort: Send + Sync {
+    /// The port's size in characters - columns and rows - when the host's far
+    /// end reports a shape. `None` is a port the host did not describe.
+    fn size(&self) -> Option<(u16, u16)>;
+
+    /// Drain whatever the host has written into the port, up to `buf`'s length,
+    /// answering how many bytes landed. Zero is "nothing yet", not end of file:
+    /// a console port has no end while the host holds it open.
+    fn drain(&self, buf: &mut [u8]) -> usize;
+
+    /// Hand `buf` to the host, answering whether the device took it - the
+    /// queue's answer, not a reader's.
+    fn send(&self, buf: &[u8]) -> bool;
+}
+
+/// The sound card, as `/dev/dsp` sees it: the stream userland writes PCM frames
+/// into, and the parameters that shape them.
+///
+/// The same split as the console port and for the same reason. The family is one
+/// - virtio-sound - and everything above the transport is one copy already: the
+/// OSS parameter ioctls, the period-sized staging buffer, the blocking hand-off
+/// to the device. What a machine supplies is the transport the crate's driver is
+/// built over, so the card's own type is erased here and the devfs node, the
+/// ioctl vocabulary and the boot's probe line are the same on both
+/// (`PLAN.md` §13.27).
+///
+/// Three methods, because they are the three the device face and the boot
+/// actually ask for. The rest of the card - which rates it lists, which formats,
+/// its channel range - is its own bookkeeping and stays behind them.
+pub trait SoundCard: Send + Sync {
+    /// What the stream is running at right now: `(rate Hz, channels)`. The
+    /// sample format is always little-endian S16 - the one the driver requires
+    /// at probe - so it needs no half here.
+    fn format(&self) -> (u32, u8);
+
+    /// Rebuild the stream at `rate` Hz and `channels`, rounding the rate onto
+    /// the device's own list, and answer with what it actually settled on - the
+    /// OSS contract, which reports rather than promises. `Err` is an errno.
+    fn configure(&self, rate: u32, channels: u8) -> Result<(u32, u8), isize>;
+
+    /// Hand `buf` to the output stream in period-sized pieces, answering how
+    /// many bytes the device took. A short answer is a full ring, not a
+    /// failure: the caller tries again for the rest.
+    fn play(&self, buf: &[u8]) -> usize;
+}
+
+/// The virtio input device, as the evdev registry sees it: the capability
+/// picture a reader asks for before any event has arrived, and the events
+/// themselves.
+///
+/// The same split as [`NetDevice`] and [`VsockDevice`], and for the same
+/// reason. The family is one - virtio-input, whose events are already Linux's
+/// own input numbering - and everything above the transport is one copy
+/// already: the `EvdevNode`s, the `/dev/input/eventN` numbering, the ioctl
+/// vocabulary and the service task that harvests the rings are the same code
+/// on a machine whose keyboard arrives over an MMIO window as on one whose
+/// keyboard arrives over a BAR. What differs is only which bus answered, and a
+/// driver says so by implementing this over its own transport rather than by
+/// the registry naming one.
+///
+/// A question the device cannot answer - it reports no name, no property bits,
+/// an axis it does not have - answers `None` or empty rather than inventing
+/// one, which is the conservative picture the evdev ABI is written against.
+pub trait InputDevice: Send + Sync {
+    /// The device's own name, as `EVIOCGNAME` reports it.
+    fn name(&self) -> Option<String>;
+
+    /// `EVIOCGBIT(t)`: the supported-code bitmap for event type `t`, empty when
+    /// the device does not answer for that type.
+    fn ev_bits(&self, event_type: u8) -> Vec<u8>;
+
+    /// `EVIOCGABS(axis)`: the geometry of one absolute axis, when the device has
+    /// it.
+    fn abs_info(&self, axis: u8) -> Option<AbsInfo>;
+
+    /// `EVIOCGPROP`: the `INPUT_PROP_*` bitmap.
+    fn prop_bits(&self) -> Vec<u8>;
+
+    /// `EVIOCGID`: bus / vendor / product / version, in the struct's order.
+    fn ids(&self) -> Option<[u16; 4]>;
+
+    /// Take one event the device has reported, if it has one - `None` when its
+    /// ring is empty, never a claim of an event that is not there.
+    fn pop_pending_event(&self) -> Option<InputEvent>;
+}
+
+/// A `virtio-input` device behind the kernel's lock, generic over the transport
+/// the crate's driver was built on - `PciTransport` on x86_64, the MMIO
+/// transport on aarch64.
+///
+/// The crate's every method needs `&mut self` and the registry holds its devices
+/// by `Arc`, so the lock is what turns the two into the `&self` methods
+/// [`InputDevice`] promises. The six of them are one implementation over the one
+/// crate driver, which is the point: a second transport does not get a second
+/// copy of them, it gets its own `Transport` and nothing else. A machine's
+/// driver module opens its transport, builds one of these, and the registry
+/// above never learns which one it was.
+///
+/// `T: Send` is the whole of what the two `unsafe impl`s in the crate require
+/// for the device to be shareable (`VirtQueue` is `Send + Sync` whatever the
+/// `Hal`), which is what lets `VirtioInputDev<T>` satisfy the contract's own
+/// `Send + Sync`.
+pub struct VirtioInputDev<T: Transport> {
+    device: Mutex<RefCell<VirtIOInput<HalImpl, T>>>,
+}
+
+impl<T: Transport> VirtioInputDev<T> {
+    /// The device, parked behind the lock the contract's methods take.
+    pub fn new(device: VirtIOInput<HalImpl, T>) -> Self {
+        VirtioInputDev {
+            device: Mutex::new(RefCell::new(device)),
+        }
+    }
+}
+
+impl<T: Transport + Send> InputDevice for VirtioInputDev<T> {
+    fn name(&self) -> Option<String> {
+        critical_section::with(|cs| self.device.borrow(cs).borrow_mut().name().ok())
+    }
+
+    fn ev_bits(&self, event_type: u8) -> Vec<u8> {
+        critical_section::with(|cs| {
+            self.device
+                .borrow(cs)
+                .borrow_mut()
+                .ev_bits(event_type)
+                .map(|bits| bits.into_vec())
+                .unwrap_or_default()
+        })
+    }
+
+    fn abs_info(&self, axis: u8) -> Option<AbsInfo> {
+        critical_section::with(|cs| self.device.borrow(cs).borrow_mut().abs_info(axis).ok())
+    }
+
+    fn prop_bits(&self) -> Vec<u8> {
+        critical_section::with(|cs| {
+            self.device
+                .borrow(cs)
+                .borrow_mut()
+                .prop_bits()
+                .map(|bits| bits.into_vec())
+                .unwrap_or_default()
+        })
+    }
+
+    fn ids(&self) -> Option<[u16; 4]> {
+        critical_section::with(|cs| {
+            self.device
+                .borrow(cs)
+                .borrow_mut()
+                .ids()
+                .ok()
+                .map(|ids| [ids.bustype, ids.vendor, ids.product, ids.version])
+        })
+    }
+
+    fn pop_pending_event(&self) -> Option<InputEvent> {
+        critical_section::with(|cs| self.device.borrow(cs).borrow_mut().pop_pending_event())
+    }
+}
+
 /// The task that keeps the polled devices moving between userland calls.
 ///
-/// Two families need it: the input devices, whose events arrive whether
-/// or not anyone is reading, and the vsock family, whose handshakes and
-/// buffers advance while nobody is parked on them. One task polls both
-/// once a tick - the same arrangement the network stack's service task
-/// keeps with its interface - because a reader blocked on either is
-/// waiting on a device nobody else is going to ask.
-#[cfg(target_arch = "x86_64")]
+/// The input devices need it - their events arrive whether or not anyone is
+/// reading - and so do the vsock family, whose handshakes and buffers advance
+/// while nobody is parked on them, and the display's own events. One task polls
+/// them once a tick - the same arrangement the network stack's service task keeps
+/// with its interface - because a reader blocked on any of them is waiting on a
+/// device nobody else is going to ask.
+///
+/// All three halves are the *contract's*, not a machine's: a machine that declares
+/// `mpos_input_registry` has input devices and needs this pump, and both machines
+/// have had a vsock device and a GPU card since §13.28/§13.26 - whichever bus they
+/// arrived on. So this function is gated on the capability rather than on an
+/// architecture, and each half is honest when its device is absent: `input::service`
+/// walks an empty registry, `net::vsock::service` finds no family and returns, and
+/// `gpu::take_display_event` finds no configuration window (`CONFIG` is 0) and
+/// answers `false`. A machine with none of the three pays one predicate per tick
+/// and nothing else.
+#[cfg(mpos_input_registry)]
 pub fn spawn_service() {
     // Permanent: a listener parked in `accept` and a reader waiting on an
     // input event both depend on this task for as long as the machine runs.
@@ -179,6 +420,9 @@ pub fn spawn_service() {
     crate::sched::spawn_permanent(
         || loop {
             input::service();
+            // The vsock family's half. A machine whose vsock device never probed
+            // has no family to poll and this returns without touching a device -
+            // the same honesty the input half keeps on an empty registry.
             crate::net::vsock::service();
             // The host's own events for the display. A window resize or a
             // fullscreen toggle arrives as `VIRTIO_GPU_EVENT_DISPLAY` in the

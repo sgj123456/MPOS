@@ -611,6 +611,7 @@ pub struct Process {
     pub comm: String,
     pub exe: String,
     pub argv: alloc::sync::Arc<Vec<String>>,
+    pub env: alloc::sync::Arc<Vec<String>>,
     pub cwd: String,
     pub state: char,
     pub pid: usize,
@@ -927,6 +928,34 @@ fn cmdline_of(pid: usize) -> Option<String> {
     Some(out)
 }
 
+/// `/proc/<pid>/environ`: the environment, NUL-separated, with a NUL after the
+/// last `KEY=VALUE`.
+///
+/// Empty - not absent - for a process that was entered without one, which is
+/// what Linux reports for a kernel thread and what a reader must be able to
+/// tell from a missing file.
+///
+/// The file is not decoration, and the boot that lacked it says so. OpenRC's
+/// `init.sh` decides whether `/proc` still needs mounting by reading *this*
+/// file twice under two different values of a variable it sets on the command
+/// line - `VAR=a md5sum /proc/self/environ` against `VAR=b md5sum ...` - and
+/// treating two *different* digests as proof that a live procfs is already
+/// there (identical digests mean the path is stale cruft in the root
+/// filesystem, which is the case the test exists to catch). With the name
+/// absent, `[ -e /proc/self/environ ]` fails, so the check never runs, OpenRC
+/// concludes "not mounted" and mounts over the procfs our disk `/init` had
+/// already mounted: `mount: mounting proc on /proc failed: Resource busy`,
+/// with the `/proc` service reporting `[ !! ]` on the Alpine boot.
+fn environ_of(pid: usize) -> Option<String> {
+    let task = task(pid)?;
+    let mut out = String::new();
+    for var in task.env.iter() {
+        out.push_str(var);
+        out.push('\0');
+    }
+    Some(out)
+}
+
 /// `/proc/<pid>/status`: the same facts `stat` carries, in the long form a
 /// human or a `top` reads.
 fn status_of(pid: usize) -> Option<String> {
@@ -1086,6 +1115,13 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
         NodeKind::File,
         maybe_file(move || cmdline_of(tid)),
     );
+    // Same file as the process's, under the thread's own name - a thread
+    // shares its process's environment, and Linux answers it here too.
+    node.add(
+        "environ",
+        NodeKind::File,
+        maybe_file(move || environ_of(tid)),
+    );
     node.add("status", NodeKind::File, maybe_file(move || status_of(tid)));
     node.add(
         "children",
@@ -1191,6 +1227,13 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
         "cmdline",
         NodeKind::File,
         maybe_file(move || cmdline_of(pid)),
+    );
+    // The environment beside the command line, because they are one block on
+    // one stack and a program that reads the second usually reads the first.
+    node.add(
+        "environ",
+        NodeKind::File,
+        maybe_file(move || environ_of(pid)),
     );
     node.add("status", NodeKind::File, maybe_file(move || status_of(pid)));
     // `/proc/<pid>/oom_score_adj` - the OOM-killer's score adjustment, which

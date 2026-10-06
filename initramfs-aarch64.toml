@@ -1,0 +1,27 @@
+# initramfs-aarch64.toml - what the second machine's early userspace contains.
+#
+# Read by `cargo xtask aarch64-initramfs` (and by every aarch64 boot through
+# `xtask/src/aarch64_initramfs.rs::ensure`). The archive is the same shape as
+# the x86_64 side's - a shell, the tools to mount with, and `/init` - because
+# since PLAN.md §15.6 both machines switch root from their initramfs's script
+# rather than one of them doing it in the kernel. The package set is pinned in
+# code (busybox + alpine-baselayout); what this file carries is where they come
+# from, and `extra_packages` for anything a bring-up needs to add without
+# editing Rust.
+
+[initramfs]
+# Alpine mirror URL
+mirror = "https://mirrors.tuna.tsinghua.edu.cn/alpine"
+# Alpine branch
+branch = "edge"
+# Architecture. This is the *package* architecture apk resolves against -
+# genuinely this machine's, unlike the loader and kernel targets which xtask
+# picks from its own `--arch`.
+arch = "aarch64"
+# The repository components to fetch, in the order apk should look in them.
+repos = ["main", "community"]
+
+# Additional packages on top of the pinned pair. A name here costs the archive
+# a file; the boot scripts need none, so this stays empty unless a test adds a
+# tool its payload execs.
+extra_packages = []

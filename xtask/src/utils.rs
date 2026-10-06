@@ -14,6 +14,8 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
+use crate::arch::Arch;
+
 /// The user a build's outputs belong to: whoever ran `cargo xtask`, even when
 /// the privileged half of the build runs under sudo.
 ///
@@ -152,16 +154,16 @@ pub fn target_dir() -> Result<PathBuf> {
     }
 }
 
-pub fn kernel_path(profile: &str) -> Result<PathBuf> {
+pub fn kernel_path(profile: &str, arch: Arch) -> Result<PathBuf> {
     Ok(target_dir()?
-        .join("x86_64-unknown-none")
+        .join(arch.kernel_target())
         .join(profile)
         .join("mpos"))
 }
 
-pub fn loader_path(profile: &str) -> Result<PathBuf> {
+pub fn loader_path(profile: &str, arch: Arch) -> Result<PathBuf> {
     Ok(target_dir()?
-        .join("x86_64-unknown-uefi")
+        .join(arch.loader_target())
         .join(profile)
         .join("mpos-boot.efi"))
 }
@@ -220,6 +222,34 @@ pub fn dir_newer_than(dir: &Path, after: SystemTime) -> Result<bool> {
     Ok(false)
 }
 
+/// The line `lay_p9_share` writes into every exported share, and the line a boot
+/// reads back to prove the share *serves* rather than merely mounted.
+///
+/// Written literally in the kernel's `check_p9_dev` too (`board/aarch64.rs`).
+/// A fixture both sides have to agree on has two copies, and the check's job is
+/// to notice if they drift; the disk image's `i as u8` pattern sector is the
+/// same arrangement (`PLAN.md` §13.29).
+pub const P9_PROBE: &[u8] = b"mpos reads from the host share over 9p\n";
+
+/// The file name that line is written under, in every exported share.
+pub const P9_PROBE_NAME: &str = "mpos-9p-probe";
+
+/// Create `dir`, lay the 9p probe file in it, and hand the directory back.
+///
+/// Every boot that exports a host share lays it through here, so a machine can
+/// prove the share reads and not just that a device answered: the kernel's own
+/// mount + read and the `t-9p` program both look for exactly this file. The
+/// directory is created even when it exists, because an *empty* share is a
+/// share that lists empty rather than a failed boot.
+pub fn lay_p9_share(dir: &Path) -> Result<PathBuf> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to make the 9p share at {}", dir.display()))?;
+    let probe = dir.join(P9_PROBE_NAME);
+    fs::write(&probe, P9_PROBE)
+        .with_context(|| format!("Failed to write the 9p probe at {}", probe.display()))?;
+    Ok(dir.to_path_buf())
+}
+
 /// True when the image on disk does not reflect the sources: it is missing, it
 /// was never assembled, or anything it was assembled from has changed since.
 ///
@@ -239,16 +269,30 @@ pub fn image_stale(build_dir: &Path, profile: &str) -> Result<bool> {
     crate::rootfs::needs_rebuild(build_dir, profile)
 }
 
-pub fn build_kernel(profile: &str) -> Result<()> {
+/// Build the kernel and its UEFI loader *for `arch`*.
+///
+/// Both targets are named rather than left to the configuration: the kernel's
+/// is the workspace default (`x86_64-unknown-none`, pinned in
+/// `.cargo/config.toml`) and the loader's is `boot/.cargo/config.toml`'s, so a
+/// build that named neither compiled the first machine's pair whatever `--arch`
+/// said. That was the switch's one real gap - `cargo xtask build --arch
+/// aarch64` produced an x86_64 kernel and reported success - and passing both
+/// targets here is what closes it.
+pub fn build_kernel(profile: &str, arch: Arch) -> Result<()> {
     let root = project_root()?;
-    println!("Building the kernel ({profile})");
+    println!("Building the {arch} kernel ({profile})", arch = arch.name());
 
     let mut kernel_build = Command::new("cargo");
     kernel_build.arg("build");
     if profile == "release" {
         kernel_build.arg("--release");
     }
-    kernel_build.arg("-p").arg("mpos").current_dir(&root);
+    kernel_build
+        .arg("-p")
+        .arg("mpos")
+        .arg("--target")
+        .arg(arch.kernel_target())
+        .current_dir(&root);
     let status = kernel_build
         .status()
         .context("Failed to run `cargo build` for the kernel")?;
@@ -256,7 +300,10 @@ pub fn build_kernel(profile: &str) -> Result<()> {
         anyhow::bail!("The kernel did not build");
     }
 
-    println!("Building the EFI loader ({profile})");
+    println!(
+        "Building the {arch} EFI loader ({profile})",
+        arch = arch.name()
+    );
     let mut loader_build = Command::new("cargo");
     loader_build.arg("build");
     if profile == "release" {
@@ -266,7 +313,7 @@ pub fn build_kernel(profile: &str) -> Result<()> {
         .arg("-p")
         .arg("mpos-boot")
         .arg("--target")
-        .arg("x86_64-unknown-uefi")
+        .arg(arch.loader_target())
         .current_dir(&root);
     let status = loader_build
         .status()
@@ -275,8 +322,8 @@ pub fn build_kernel(profile: &str) -> Result<()> {
         anyhow::bail!("The EFI loader did not build");
     }
 
-    let kernel = kernel_path(profile)?;
-    let loader = loader_path(profile)?;
+    let kernel = kernel_path(profile, arch)?;
+    let loader = loader_path(profile, arch)?;
     if !kernel.exists() {
         anyhow::bail!("Expected the kernel at {}", kernel.display());
     }
@@ -565,7 +612,7 @@ pub fn find_apk_tool(build_dir: &Path, mirror: &str, branch: &str) -> Result<Str
     Ok(apk_static.to_string_lossy().to_string())
 }
 
-fn wget(url: &str, dest: &Path) -> Result<bool> {
+pub(crate) fn wget(url: &str, dest: &Path) -> Result<bool> {
     let status = Command::new("wget")
         .args(["-T", "60", "--no-verbose", "-O"])
         .arg(dest)

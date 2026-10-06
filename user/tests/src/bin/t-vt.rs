@@ -221,20 +221,48 @@ fn main() {
         rc == 0 && (1..=VC_COUNT as i32).contains(&free),
     );
 
-    // VT_GETSTATE, printed rather than asserted on: its layout is a named
-    // divergence (`PLAN.md` §13.18) - this kernel writes the *video mode* in the
-    // first short and the console number in the second, where Linux's
-    // `struct vt_stat` has `v_active` first and leaves `v_signal` alone - and a
-    // test that asserted this kernel's answer would be pinning that shape rather
-    // than Linux's.
-    let mut st = [0u16; 3];
+    // VT_GETSTATE's `struct vt_stat { v_active, v_signal, v_state }`, and Linux
+    // writes exactly two of the three shorts (`PLAN.md` §13.18). `v_active` is the
+    // console on the screen (1-based); `v_state` is the bit mask of the consoles in
+    // use, with bit 0 always set because "/dev/tty0 is always open"; and
+    // `v_signal` - the SIGIO number a console promises to send when it loses the
+    // screen - is *never written*. The buffer starts at a sentinel, because that is
+    // the only way "never written" is observable: zeroed, a kernel that wrote 0
+    // there would pass.
+    //
+    // This block used to print the three shorts and assert only that the call
+    // succeeded, because the kernel's answer was not Linux's. It is now, so the
+    // shape is asserted rather than described.
+    // every short, not every byte: `0xAAu16` is `0x00AA`, so an array of them is
+    // three shorts of 170 - and the assertion below would then be comparing the
+    // kernel's answer against a sentinel it never wrote. `t-seat` spells the same
+    // fill as `[0xAAu8; 6]`, which is the shape that actually reads back 0xAAAA.
+    let mut st = [0xAAAAu16; 3];
     let (rc, err) = ioctl(console, VT_GETSTATE, st.as_mut_ptr() as usize);
     r.check(
         &format!("VT_GETSTATE succeeds (got rc {rc}, errno {err})"),
         rc == 0,
     );
+    r.check(
+        &format!("v_active names a console (got {}, of {VC_COUNT})", st[0]),
+        (1..=VC_COUNT as u16).contains(&st[0]),
+    );
+    r.check(
+        &format!(
+            "v_state carries /dev/tty0's always-open bit (got {:#06x})",
+            st[2]
+        ),
+        st[2] & 1 == 1,
+    );
+    r.check(
+        &format!(
+            "v_signal is left untouched, as Linux leaves it (got {:#06x}, expected 0xaaaa)",
+            st[1]
+        ),
+        st[1] == 0xAAAA,
+    );
     println!(
-        "     VT_GETSTATE -> shorts [{}, {}, {}] (this kernel's layout)",
+        "     VT_GETSTATE -> v_active {}, v_signal {:#06x}, v_state {:#06x}",
         st[0], st[1], st[2]
     );
 

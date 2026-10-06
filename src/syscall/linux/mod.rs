@@ -296,13 +296,22 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
         // the generic `siginfo_t`, and `process_vm_*` reaches the target's
         // memory through the scheduler. `ptrace` itself is still the first
         // machine's - its request numbers and the structure `PTRACE_GETREGS`
-        // fills are x86_64's - and `reboot`'s debug-exit port with it.
+        // fills are x86_64's.
         #[cfg(not(target_arch = "aarch64"))]
         nr::PTRACE => proc::handle_ptrace(args, from_user),
         nr::PROCESS_VM_READV => proc::handle_process_vm_readv(args, from_user),
         nr::PROCESS_VM_WRITEV => proc::handle_process_vm_writev(args, from_user),
         nr::RT_SIGTIMEDWAIT => proc::handle_rt_sigtimedwait(args, from_user),
-        #[cfg(not(target_arch = "aarch64"))]
+        // `reboot` runs on both machines, and its gate used to be the stale
+        // kind: it was written when the stop words ended at the x86_64
+        // machine's `isa-debug-exit` port, and that port is a `hal` capability
+        // now (`hal::exit_qemu`, which a machine without the flag answers by
+        // halting). Nothing in the handler names a register or a port, so the
+        // second machine serves it as it is - and the marker that said
+        // otherwise was visible on its very first real userland: busybox
+        // `init` calls `reboot(RB_DISABLE_CAD)` a second into its startup, and
+        // on aarch64 that answered `mpos: syscall 142 -> ENOSYS` on every
+        // boot. `t-reboot-libc` pins the policy words on both machines.
         nr::REBOOT => proc::handle_reboot(args),
         // The hostname is kept, not just accepted: `uname -n`, `hostname`
         // and `/proc/sys/kernel/hostname` all read it, and an init's

@@ -88,10 +88,11 @@ Two notes on the graph, then the leaf crates.
 
 **`mpos-boot` does not depend on `mpos`.** They are separate compilations that agree on a
 hand-written ABI: a `#[repr(C)]` record in `RDI` at `_start`, with its magic number and the
-boot-stack canary spelled out twice — once in `boot/src/handoff.rs`, once in `src/boot/handoff.rs`
-and `src/main.rs`. There is no crate between them on purpose (the loader cannot link a
-`no_std` kernel crate that is built for a different target), and the duplication is the price.
-Changing the record means changing both sides.
+boot-stack canary. The record itself is one definition — the `mpos-bootinfo` leaf, which both
+`mpos-boot` and the kernel depend on — so its layout is written once and checked by
+`HANDOFF_MAGIC`. There is still no crate between the two *binaries* (the loader cannot link the
+`no_std` kernel, built for a different target), and the canary in `src/board/x86_64.rs` is still spelled
+on both sides; the record is not.
 
 **`mpos-user-abi` reaches into kernel source.** Each test program does
 `#[path = "../../../lib/lin.rs"]`, and `lin.rs` in turn does
@@ -219,21 +220,21 @@ Read it as "may call", not "calls on every path": `net` names `sched` because bl
 socket calls park in the scheduler, and `drivers` names `sched` because a driver's service
 task is a scheduler task.
 
-**`hal` is the machine seam.** `src/hal/mod.rs` declares the capability traits every machine
+**`hal` is the machine seam.** `arch/src/hal/mod.rs` declares the capability traits every machine
 implements (`Clock`, `WallClock`, `Cpu`, `Interrupts`, `Paging`, `Contexts`, the last three with
 associated types), an `Entropy` concern for the machine's seed sources, the platform tag `Current`, and a handful of *optional capability* traits
 (`Msi`, `FpuTrap`, `SignalFrame`) for the ways one machine does something another has no hardware
 for — message-signalled delivery, the x87 lazy-FPU `#NM` trap protocol, segment selectors. Each
-`src/arch/<arch>/mod.rs` implements the six baseline concerns *for* `Current`, and only the
+`arch/src/arch/<arch>/mod.rs` implements the six baseline concerns *for* `Current`, and only the
 capabilities its hardware actually has, so `arch → hal` is the only arrow between the two and
 everything above the machine layer calls `crate::hal`'s forwards rather than naming `arch` — which
-makes `src/arch/mod.rs` a facade of four items and its submodules `pub(crate)`. An absent
+makes `arch/src/arch/mod.rs` a facade of four items and its submodules `pub(crate)`. An absent
 capability is *absent* (the aarch64 `Current` simply is not an `Msi`/`FpuTrap`; it is a
 `SignalFrame` since §13.2's Stage 3b, with its own `rt_sigframe`), not a
 method every machine must fake an answer for (`AGENTS.md` §3 rule 4). Which capabilities a build has is
 a `mpos_*` flag declared per target in `.cargo/config.toml` (beside each machine's linker script, listed
 for `check-cfg` in `Cargo.toml`), so the forwards' `#[cfg]` gates name the capability and never the
-architecture — `src/hal/mod.rs` contains no machine name at all (`PLAN.md` §13.1). The register ABI — the
+architecture — `arch/src/hal/mod.rs` contains no machine name at all (`PLAN.md` §13.1). The register ABI — the
 `syscall` gate, the trap frame, `user_regs_struct` — is per-arch *by definition* and stays in
 `arch/`; wrapping it in a neutral type would be the private dialect rule 3 forbids, so a port writes
 `arch/<arch>/` and edits no shared file (`PLAN.md` §9.1).
@@ -257,9 +258,10 @@ they are cross-crate edges.
 
 | Layer | Module | Owns | Must not |
 |---|---|---|---|
-| Entry | `src/main.rs` | The boot sequence, the `mpos.selftest` milestone checks, the panic handler, the boot-stack canary check | Contain reusable logic — everything reusable lives in the lib so the host can test it |
-| Machine | `src/arch/x86_64/` | GDT/IDT/TSS, PIC and LAPIC, 4-level paging, context switch, the `syscall`/`sysret` gate, the PIT, port I/O | Be named from outside `arch::`/`hal::` — the submodules are `pub(crate)` behind `arch/mod.rs`'s four-item facade, and the depgraph fails on any module but `arch`/`hal`/`main`/`lib` naming it. The register ABI the syscall gate and trap frame carry is per-arch by definition and stays here |
-| HAL | `src/hal/` | The capability traits every machine implements (`Clock`, `WallClock`, `Cpu`, `Interrupts`, `Paging`, `Contexts`, `Console`, `Entropy`) with their associated types, the optional capability traits only some machines have (`Msi`, `SerialRing`, `FpuTrap`, `SignalFrame`), the platform tag `Current`, and the one-line forwards everything above calls | Hold machine logic: the `impl`s live in `arch/<arch>/`, so a port adds them there without editing a shared file. It is not `drivers::virtio::hal` (that is `virtio_drivers`' own `Hal`), and it is one trait per concern — not one per function — the baseline concerns every machine has plus optional capabilities a machine implements only if its hardware has them (`PLAN.md` §11.3) |
+| Entry | `src/main.rs` | The one architecture-independent entry (`_start`, which takes the loader's record in the platform's first argument register and hands the machine its callbacks) and the one panic handler (the machine's wire, the machine's context dump, stop). Established a machine by `mpos_arch::arch::boot` on x86_64 and aarch64 alike | Contain reusable logic — everything reusable lives in the lib so the host can test it. Name no machine: the bring-up is `arch`'s, so nothing here is `#[cfg]`-ed |
+| Board | `src/board/<arch>.rs` | What only a machine can answer: its boot wiring (`milestone`, `devices`, `init`), its devices, its milestone checks, the boot-stack canary check on x86_64, and the panic context dump | Be entered by more than one path — `src/board/mod.rs` picks the body in one place, exactly as `arch/src/arch/mod.rs` does for the library. Nothing here is machine *layer*: the entry, tables, pages and wire are `mpos-arch`'s (`PLAN.md` §14.8) |
+| Machine | `arch/src/arch/x86_64/` | GDT/IDT/TSS, PIC and LAPIC, 4-level paging, context switch, the `syscall`/`sysret` gate, the PIT, port I/O | Be named from outside `arch::`/`hal::` — the submodules are `pub(crate)` behind `arch/mod.rs`'s four-item facade, and the depgraph fails on any module but `arch`/`hal`/`main`/`lib` naming it. The register ABI the syscall gate and trap frame carry is per-arch by definition and stays here |
+| HAL | `arch/src/hal/` | The capability traits every machine implements (`Clock`, `WallClock`, `Cpu`, `Interrupts`, `Paging`, `Contexts`, `Console`, `Entropy`) with their associated types, the optional capability traits only some machines have (`Msi`, `SerialRing`, `FpuTrap`, `SignalFrame`), the platform tag `Current`, and the one-line forwards everything above calls | Hold machine logic: the `impl`s live in `arch/<arch>/`, so a port adds them there without editing a shared file. It is not `drivers::virtio::hal` (that is `virtio_drivers`' own `Hal`), and it is one trait per concern — not one per function — the baseline concerns every machine has plus optional capabilities a machine implements only if its hardware has them (`PLAN.md` §11.3) |
 | Memory | `src/mm/` | Buddy frame allocator (order 0–12), slab heap (16–2048 B), mapping plans, the ELF64 loader | Know about files, tasks or devices |
 | Scheduler | `src/sched/` | The 64-slot task table, priority bands + round-robin, sleep/block deadlines, signal state, futex | Be the place where a subsystem's per-process cleanup lives (see V-3) |
 | VFS | `src/vfs/` | The `Inode`/`FileSystem` traits, mounts and path resolution, the fd table, every filesystem (ramfs, ext2/ext4, procfs, sysfs, devfs, devpts, p9, tmpfs), pipes, epoll, timerfd, eventfd, signalfd, inotify, locks, memfd/dmabuf | Contain the terminal emulator — that is the `term` leaf crate now, and the VC vocabulary/`vtmode`/active-console number moved there too (V-4 closed); the console mux stays here with the pty/tty nodes it orchestrates |
@@ -323,7 +325,7 @@ Details worth knowing:
   `pivot_root` are all done by the initramfs's `/init`, because a kernel that assembles them
   first leaves the pieces an owner of the system cannot unmount. See `initramfs/init`.
 - **The boot stack has a canary.** The loader plants one, and `check_boot_stack()` in
-  `src/main.rs` verifies it twice — before the handoff and again after `spawn_init`, which is
+  `src/board/x86_64.rs` verifies it twice — before the handoff and again after `spawn_init`, which is
   the deepest call the boot task ever makes.
 - **Boot words on the command line** (`mpos.cmdline`, or QEMU-generated): `mpos.selftest`
   runs the milestone checks, and `console=` names the consoles the kernel's log goes to —
@@ -577,7 +579,7 @@ Phase 11 D (**closed**; D.2b rejected) |
 | V-7 | Dead and duplicate machine modules | `arch/x86_64/serial.rs` and `arch/x86_64/qemu.rs` were not declared in `arch/x86_64/mod.rs` at all; `qemu.rs` was byte-identical to `drivers/qemu.rs`. Three PCI modules existed (`arch/x86_64/pci.rs` was a stale earlier copy of `drivers/pci.rs`), two RTC, two serial | **Done** (Phase 11 A) — all three deleted, `drivers/rtc` renamed `drivers/rtc_dev` |
 | V-8 | Cross-architecture config pointed at a missing file | `.cargo/config.toml` set `link-arg=--script=arch/aarch64/linker.ld`; only `arch/x86_64/linker.ld` exists, so the `aarch64-unknown-none` build could not link | **Done** (Phase 11 A) — the profile is gone, and `PLAN.md` §9.1 keeps what a port needs |
 | V-9 | The network layer validates user pointers with the syscall layer's helper | **Closed by B3.** `buffer_ok`/`user_accessible`/`MAX_IO`/`err_of` moved to the crate-root leaf `src/uaccess.rs`; the 99 below-`syscall` call-sites in `net/{socket,unix,packet,vsock}.rs` and `drivers/drm.rs` now name `crate::uaccess::*`, so no layer below `syscall` reaches up for a page walk or an errno mapping. `syscall` re-exports the same names for its own handlers, and the bare-metal build is green (the `cfg(target_os = "none")` split of `err_of`/`user_accessible` moved intact — V-11's lesson held) | **Done** (Phase 11 B3) |
-| V-10 | `handoff` ABI is hand-duplicated across two crates with no shared definition | `boot/src/handoff.rs` vs `src/boot/handoff.rs` + the canary constant in `src/main.rs` | Accepted by design; document only |
+| V-10 | `handoff` ABI is hand-duplicated across two crates with no shared definition | `boot/src/handoff.rs` vs `src/boot/handoff.rs` + the canary constant in `src/main.rs` | **Closed for the record** — `boot/src/handoff.rs` is gone and both sides read the one definition in the `mpos-bootinfo` leaf; the canary constant in `src/main.rs` is still spelled on both sides |
 | V-11 | A host test module sits behind a module that is never host-compiled | `src/net/socket.rs` was `#[cfg(all(test, not(target_os = "none")))]` while `src/lib.rs` gated `pub mod net` on `target_os = "none"`; 3 tests never ran. **Closed by Step F**: the module was deleted (its three claims are pinned by `user/tests/src/bin/t-sockmsg.rs`, which boots), the criterion is written down (`src/lib.rs`, `AGENTS.md` §3), and `xtask/src/gates.rs::dead_host_tests` — run at the head of `cargo xtask test` — now fails on the shape | **Done** (Phase 11 F) |
 | V-12 | The tree was mid-refactor and did not build for the host | The uncommitted work renamed `user/abitest/src/bin/t-*.rs` into `syscall/`+`integration/` and edited `vfs/ext4/*`, `vfs/tty.rs`; `cargo test --lib --target x86_64-unknown-linux-gnu` failed to compile | **Resolved** — finished and committed; the gate is green (`PLAN.md` §11.1.12) |
 | V-13 | Memory knows about files: `mm` calls up into `vfs` | `src/mm/vma.rs` used to do `use crate::vfs::Inode;` (a frame-backed VMA named an inode), committed in eb4b337 after this audit. **Closed**: the trait it needed is `mm::vma::MappedObject` — three questions, no files — and the VFS answers it for its inodes through `vfs::MappedInode`. `mm`'s node for a mapping is now an object it can ask, and the merge rule (two adjacent mappings of one object become one maps line) is asked of the object rather than compared by `Arc` address, which a trait object cannot do without a downcast; for the four node types that are frame-backed - a `memfd`, a dma-buf, the framebuffer, a DRM dumb buffer - identity is unique per object, so it is the same answer as a value | **Done** (Phase 11, with Step C) |

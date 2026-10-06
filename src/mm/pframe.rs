@@ -23,8 +23,13 @@
 
 use crate::boot::{BootInfo, MemRegion};
 
-pub const PAGE_SHIFT: usize = 12;
-pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
+// Re-exported from the `mpos-vm` leaf rather than declared here: page size and
+// the alignment arithmetic are part of what a `Mapping` *is*, so the machine
+// layer - which is becoming a crate that cannot depend on this one - has to be
+// able to name them (`PLAN.md` §14 S2b). The paths every caller already uses
+// are unchanged.
+pub use mpos_vm::{PAGE_SHIFT, PAGE_SIZE};
+pub(crate) use mpos_vm::{align_down, align_up};
 
 /// Largest block handed out, as a power of two in pages: 2^14 pages = 64 MiB.
 /// Big enough that the kernel heap arena, a page-table pool, and a whole user
@@ -44,15 +49,6 @@ const HEAD_BYTES: usize = ORDERS * size_of::<u32>();
 const META_ALIGN: usize = 64;
 const NIL: u32 = u32::MAX;
 
-pub(crate) const fn align_up(value: usize, align: usize) -> usize {
-    (value + align - 1) & !(align - 1)
-}
-
-pub(crate) const fn align_down(value: usize, align: usize) -> usize {
-    value & !(align - 1)
-}
-
-/// Where a zone's per-frame state bytes begin, relative to `meta`.
 const STATE_OFF: usize = align_up(HEAD_BYTES, META_ALIGN);
 
 /// Where a zone's per-frame reference counts begin, relative to `meta`. The

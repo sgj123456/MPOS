@@ -1877,8 +1877,9 @@ fn mount_new(
         // host exported the share under - `mount -t 9p hostshare /mnt`
         // opens the device QEMU was told `-virtfs ...,mount_tag=hostshare`
         // for. An empty source takes the only share the bus has, which is
-        // the same call the boot's own mount makes.
-        #[cfg(not(target_arch = "aarch64"))]
+        // the same call the boot's own mount makes. Both machines have the
+        // device now (`PLAN.md` §13.29), so the arm is the filesystem's
+        // rather than one machine's.
         "9p" => match crate::vfs::p9::mount(source) {
             Ok(fs) => fs,
             Err(e) => return err_of(e),

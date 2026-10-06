@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::arch::Arch;
 use crate::config::{QemuConfig, RootfsConfig, RunMode, UserConfig};
 use crate::utils;
 
@@ -67,8 +68,8 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
         return Ok(());
     }
 
-    let kernel = utils::kernel_path(profile)?;
-    let loader = utils::loader_path(profile)?;
+    let kernel = utils::kernel_path(profile, Arch::X86_64)?;
+    let loader = utils::loader_path(profile, Arch::X86_64)?;
     let initramfs = utils::initramfs_path(build_dir);
     for (what, path, command) in [
         ("kernel", &kernel, "build"),
@@ -242,8 +243,8 @@ pub fn ensure(build_dir: &Path, profile: &str) -> Result<()> {
 fn stamp_inputs(root: &Path, build_dir: &Path, profile: &str) -> Result<Vec<PathBuf>> {
     Ok(vec![
         root.join("rootfs.toml"),
-        utils::kernel_path(profile)?,
-        utils::loader_path(profile)?,
+        utils::kernel_path(profile, Arch::X86_64)?,
+        utils::loader_path(profile, Arch::X86_64)?,
         utils::initramfs_path(build_dir),
     ])
 }
@@ -1325,11 +1326,11 @@ mod tests {
             "the initramfs is an input"
         );
         assert!(
-            inputs.contains(&utils::kernel_path("debug").unwrap()),
+            inputs.contains(&utils::kernel_path("debug", Arch::X86_64).unwrap()),
             "the kernel is an input"
         );
         assert!(
-            inputs.contains(&utils::loader_path("debug").unwrap()),
+            inputs.contains(&utils::loader_path("debug", Arch::X86_64).unwrap()),
             "the loader is an input"
         );
         assert_eq!(inputs.len(), 4, "and that is the whole list");

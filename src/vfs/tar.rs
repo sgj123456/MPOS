@@ -244,7 +244,7 @@ mod tests {
 
     fn tree() -> Vfs {
         let vfs = Vfs::new();
-        vfs.mount_root(&*RamFs::new());
+        vfs.mount_root(RamFs::new());
         vfs
     }
 

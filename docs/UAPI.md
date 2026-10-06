@@ -41,8 +41,8 @@ contract. Here that is, concretely:
   the `fstatat` family, which have to be the same numbers) on both machines, and the bare-metal
   suite's `t-statx` for the argument shape and the clocks it compares against `newfstatat` —
   x86_64 only, that suite having no aarch64 port yet. `rt_sigframe`/`sigcontext` is per-ABI as well and lives with
-  its machine since §13.2's Stage 2 — `src/arch/x86_64/signal.rs` and, since Stage 3b,
-  `src/arch/aarch64/signal.rs`, both behind `hal::SignalFrame` — because `__restore_rt`
+  its machine since §13.2's Stage 2 — `arch/src/arch/x86_64/signal.rs` and, since Stage 3b,
+  `arch/src/arch/aarch64/signal.rs`, both behind `hal::SignalFrame` — because `__restore_rt`
   reads the saved registers back at fixed offsets (and on aarch64 the frame's
   `fpsimd_context` record is where a handler's floating-point image comes from).
 - **Flag words and closed vocabularies** — `mmap`'s `MAP_*`, `madvise`'s advices,
@@ -312,7 +312,7 @@ the commit bodies), and each moved its pin in the same commit.
    path yields a 25-character timestamp and a live year, and musl's `asctime_r` reaches
    `a_crash()` (a store through NULL) when a timestamp will not fit its 26-byte buffer —
    which is how the wrong clock became a dead `syslogd` rather than a wrong log line.
-   Owner: `src/arch/aarch64/mod.rs` (+ `pl031`). Pin: `t-localtime` on **both** machines
+   Owner: `arch/src/arch/aarch64/mod.rs` (+ `pl031`). Pin: `t-localtime` on **both** machines
    (the anchor read back as `CLOCK_REALTIME - CLOCK_MONOTONIC`, every `struct tm` field
    ranged, the timestamp's length measured through `asctime`'s own format, then the real
    `asctime_r` call) — the first test either suite has had for the calendar. Closes
@@ -330,7 +330,7 @@ the commit bodies), and each moved its pin in the same commit.
    (`0x08`) with `0x6ac360c7` left `DR` reading `0x6ac360c7`. `write_epoch` now loads the
    counter and reads it back (a dropped write is still `false`), which is what
    `RTC_SET_TIME` needed. Owner: `src/drivers/{mod,devices,rtc_dev}.rs`,
-   `src/arch/aarch64/pl031.rs`, `src/syscall/linux/fs/ioctl.rs`. Pin: `t-rtc` on **both**
+   `arch/src/arch/aarch64/pl031.rs`, `src/syscall/linux/fs/ioctl.rs`. Pin: `t-rtc` on **both**
    machines (`RTC_RD_TIME` agreeing with `clock_gettime` and with `gmtime_r` field for
    field, `RTC_SET_TIME` served, `EINVAL` for a month no calendar carries, `ENOTTY` for
    the alarm half and for the family on another descriptor). Closes `PLAN.md` §13.15.
@@ -346,7 +346,7 @@ the commit bodies), and each moved its pin in the same commit.
    `display_handover`, `display_card_grabbed`), whose no-framebuffer bodies are the no-op or the
    answer a machine with no card owes, and the machine's receiver hands its bytes to
    `vcmux::route_input` - one function over the same kind of wire as the 16550's. Owner:
-   `src/vfs/vcmux.rs`, `src/console.rs`, `src/arch/aarch64/pl011.rs`, `src/main/aarch64.rs`,
+   `src/vfs/vcmux.rs`, `src/console.rs`, `arch/src/arch/aarch64/pl011.rs`, `src/board/aarch64.rs`,
    `src/syscall/linux/fs/ioctl.rs`. Pin: `t-vt` on **both** machines (the ioctl words read out
    of the shipped headers rather than recalled, the mode families as round trips over
    `/dev/tty1` with the mode put back, the `VT_*` family over `/dev/tty0` where a serial tty is

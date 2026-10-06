@@ -96,6 +96,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "p9_stat"
+path = "fuzz_targets/p9_stat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "partition_table"
 path = "fuzz_targets/partition_table.rs"
 test = false

@@ -25,44 +25,44 @@
 //!   they were loaded at and the address they were linked for, then jumps to the
 //!   second, which is what makes dropping the identity map safe.
 //!
+//! * **The device window**, on the machine that has one, laid on top
+//!   (`mpos_arch::early::map_extra`).
+//!
 //! Everything here runs with the firmware's identity map still active, so a page
 //! table is addressed by its physical address and written directly.
 //!
-//! # Two machines, one plan, one format each
+//! # The plan here, the format in `mpos-arch`
 //!
 //! The ranges above are the *plan*, and it does not differ between x86_64 and
 //! aarch64 - both machines want a direct map, an identity window and a
-//! higher-half alias, at the same two addresses. What differs is the descriptor
-//! each machine writes to say so, and that is the whole of the split: [`Pool`],
-//! [`map_physical_memory`], [`map_kernel_image`], [`is_ram`], [`merge`] and
-//! [`pool_bytes_for`] are shared, while [`PageTables`] has one body per machine
-//! under `vm/`. The kernel's own `arch/<arch>/paging.rs` is divided the same way
-//! and for the same reason.
+//! higher-half alias, at the same two addresses. So the plan is here, in the
+//! loader, and it is architecture-free: this file contains no `cfg`, no
+//! descriptor bit and no register name.
+//!
+//! What differs between the machines is the descriptor each one writes to say
+//! so. That lives in `mpos_arch::early`, beside the other two things the loader
+//! needs from the machine (the progress wire and the jump), because it *is* the
+//! machine - see that module for why it is a separate tree from the kernel's own
+//! `mpos_arch::arch`, and `PLAN.md` §14.6 for the move.
+//!
+//! # Where frames come from
+//!
+//! [`Pool`] is this file's, not the machine's: the loader decides how big the
+//! pool is (from the size of RAM, before the first frame is taken), where it
+//! comes from (`LOADER_DATA`, which the kernel's frame allocator never hands
+//! out) and that it is never returned. The machine decides only what gets
+//! written into the frames, which is what [`Frames`] narrows the interface to -
+//! the builder cannot allocate anything the loader did not give it, and the
+//! trait is monomorphised onto `Pool`, so the narrowing costs nothing.
 
 use alloc::vec::Vec;
 
+use mpos_arch::early::Frames;
+
 use crate::elf::{PAGE_SIZE, Range};
-use crate::handoff::Region;
+use mpos_bootinfo::AbiRegion as Region;
 
-#[cfg(target_arch = "aarch64")]
-#[path = "vm/aarch64.rs"]
-mod arch;
-#[cfg(target_arch = "x86_64")]
-#[path = "vm/x86_64.rs"]
-mod arch;
-
-pub use arch::PageTables;
-
-/// The registers [`enter`] programs before it branches into the higher half.
-///
-/// They live in the aarch64 arm because they are that machine's format - one
-/// `MAIR_EL1` field per `AttrIndx`, one `TCR_EL1` for both address halves - and
-/// they are re-exported here because `main.rs`'s `enter` is the one caller and
-/// it should not have to know which module wrote them.
-///
-/// [`enter`]: crate::enter
-#[cfg(target_arch = "aarch64")]
-pub use arch::{MAIR, SCTLR_ENABLE, TCR};
+pub use mpos_arch::early::PageTables;
 
 /// Add to a physical address to reach it through the direct map.
 ///
@@ -108,12 +108,19 @@ impl Pool {
         }
     }
 
-    /// A zeroed page.
-    ///
-    /// Zeroed because an empty page-table entry is an absent one: a frame
-    /// straight from the firmware still holds whatever the last user left in it,
-    /// and any of those bytes with bit 0 set would read as a mapping.
-    fn frame(&mut self) -> u64 {
+    /// How many pages have been taken, for the boot log.
+    pub fn pages_taken(&self) -> u64 {
+        (self.next - self.base) / PAGE_SIZE
+    }
+}
+
+/// The machine's side of [`Pool`]: one zeroed frame at a time.
+///
+/// Zeroed because an empty page-table entry is an absent one: a frame straight
+/// from the firmware still holds whatever the last user left in it, and any of
+/// those bytes with bit 0 set would read as a mapping.
+impl Frames for Pool {
+    fn zeroed_frame(&mut self) -> u64 {
         assert!(
             self.next + PAGE_SIZE <= self.end,
             "the page-table pool is exhausted"
@@ -122,11 +129,6 @@ impl Pool {
         self.next += PAGE_SIZE;
         unsafe { core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize) };
         frame
-    }
-
-    /// How many pages have been taken, for the boot log.
-    pub fn pages_taken(&self) -> u64 {
-        (self.next - self.base) / PAGE_SIZE
     }
 }
 
@@ -137,10 +139,10 @@ impl Pool {
 /// absent memory and mapping it is merely useless, while a device's registers
 /// are a range that answers to hardware and mapping it into the kernel's direct
 /// map would put a driver's writes wherever the firmware's own driver had put
-/// them. The kernel reaches devices through `mm::map_mmio` and a BAR, which is
-/// the only place that knows what it is talking to.
+/// them. The kernel reaches devices through `hal::Paging::map_mmio_window` and a
+/// BAR, which is the only place that knows what it is talking to.
 pub fn is_ram(kind: u32) -> bool {
-    use crate::handoff::*;
+    use mpos_bootinfo::*;
     matches!(
         kind,
         KIND_USABLE
@@ -152,7 +154,7 @@ pub fn is_ram(kind: u32) -> bool {
 }
 
 /// Map every RAM region at its own address and again through the direct map.
-pub fn map_physical_memory(tables: &mut PageTables, regions: &[Region]) -> u64 {
+pub fn map_physical_memory<F: Frames>(tables: &mut PageTables<F>, regions: &[Region]) -> u64 {
     let mut bytes = 0;
     for region in regions.iter().filter(|r| is_ram(r.kind)) {
         let start = region.base;
@@ -175,8 +177,8 @@ pub fn map_physical_memory(tables: &mut PageTables, regions: &[Region]) -> u64 {
 /// the loader copies the file into is, by contrast, mapped writable and
 /// executable: the loader has no symbols for the sections it is writing, and the
 /// window in which that mapping exists ends at the jump.
-pub fn map_kernel_image(
-    tables: &mut PageTables,
+pub fn map_kernel_image<F: Frames>(
+    tables: &mut PageTables<F>,
     phys_base: u64,
     text: Range,
     rodata: Range,
@@ -202,74 +204,6 @@ pub fn map_kernel_image(
     map((text_start, text_end), false, true);
     map((rodata_start, rodata_end), false, false);
     map((data_start, data_end), true, false);
-}
-
-/// The device window the aarch64 loader maps on top of RAM, or `None` on a
-/// machine that maps none.
-///
-/// x86_64's loader deliberately maps no device range: its kernel reaches MMIO
-/// through `mm::map_mmio`, which walks a BAR and a plan, and the loader has no
-/// business guessing where a device is. aarch64 has no such path yet - stage 5's
-/// device tree is what finds the PL011 and the GIC - so the kernel reaches them
-/// at the fixed addresses QEMU's `virt` machine puts them at, and they have to
-/// be mapped as Device or the first store to a register is a translation fault
-/// the moment the firmware's identity map is replaced.
-///
-/// The range starts at 0x0800_0000 and not at zero: the low 128 MiB of `virt` is
-/// flash and the machine's own vectors, and a null pointer that silently works
-/// is the one thing x86_64's own `check_arch` asserts cannot happen.
-#[cfg(target_arch = "aarch64")]
-pub const DEVICE_BASE: u64 = 0x0800_0000;
-/// See [`DEVICE_BASE`]. 64 MiB, from the GIC's distributor to past the
-/// virtio-MMIO frames: everything this stage and stage 1c touch.
-#[cfg(target_arch = "aarch64")]
-pub const DEVICE_WINDOW: u64 = 0x0400_0000;
-
-/// Where the *kernel* half reaches those registers.
-///
-/// The address x86_64's `mm::MMIO_BASE` names, and for the same reason: a hole
-/// the kernel half has room for, immediately below the image at
-/// `0xffff_ffff_8000_0000`. Until stage 5b the window was mapped only at its
-/// physical address, in `TTBR0` - the half a process will own - which is a
-/// collision waiting to happen rather than an arrangement; the kernel has a
-/// device window in its own half now, and the low half holds nothing at all.
-///
-/// The loader maps the window at **both** addresses, and that is not
-/// redundancy: this loader's own console writes to the physical one (it runs on
-/// the firmware's identity map before its own tables exist, and the firmware
-/// brought that UART up there), while the kernel is compiled against the alias
-/// from its very first instruction - which runs while the loader's tables are
-/// still the machine's. A window only `install` mapped would leave the kernel's
-/// own banner unmapped.
-#[cfg(target_arch = "aarch64")]
-pub const DEVICE_VIRT: u64 = 0xffff_ffff_4000_0000;
-
-/// Map the machine's device window, Device and never executable: at the physical
-/// address, which this loader's console is reached through, and at the
-/// kernel-half alias, which is where the kernel reaches it.
-#[cfg(target_arch = "aarch64")]
-pub fn map_device_window(tables: &mut PageTables) {
-    tables.map_device(DEVICE_BASE, DEVICE_BASE, DEVICE_WINDOW);
-    tables.map_device(DEVICE_VIRT, DEVICE_BASE, DEVICE_WINDOW);
-}
-
-/// Bytes this machine's loader maps beyond RAM, so the page-table pool is sized
-/// for everything that will be mapped rather than for RAM alone.
-///
-/// A device window costs a page table per 2 MiB whether it is RAM or not, and
-/// the pool is allocated before the first one is taken - which is why the window
-/// is counted *twice* on aarch64: `map_device_window` maps it at its physical
-/// address and again at the kernel-half alias, and a pool sized for one of them
-/// runs out of frames partway through the second.
-pub fn extra_mapped_bytes() -> u64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        2 * DEVICE_WINDOW
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        0
-    }
 }
 
 fn align_down(value: u64) -> u64 {

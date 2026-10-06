@@ -12,20 +12,20 @@
 /// it), so it compiles on both, and the aarch64 MMIO transport is added there.
 /// `devices` is the other exception, for the same reason and by the same method:
 /// the `devfs` it builds is what `mount -t devtmpfs /dev` hands a real init, so
-/// it must exist on aarch64 - and it does, because the x86_64-only device nodes
-/// (the virtio-PCI `hwrng`/`hvc`/`dsp`/`fb0`, `/dev/input`, `uinput` and the DRM
-/// card) are `#[cfg]`-ed out inside it, leaving the generic set (the ttys,
-/// `console`, `null`/`zero`/`full`, the entropy pair, `kmsg`, the `/proc` links
-/// and the disks) that every machine has.
+/// it must exist on aarch64 - and it does, because the nodes that are still one
+/// machine's alone (the virtio-PCI `dsp`/`fb0` and the DRM card) are `#[cfg]`-ed
+/// out inside it, on top of the generic set (the ttys, `console`,
+/// `null`/`zero`/`full`, the entropy pair, `kmsg`, the `/proc` links and the
+/// disks) that every machine has. `/dev/hwrng`, `/dev/hvc0` and the input nodes
+/// are *not* gated any more: each is published by whichever machine opened the
+/// device, through the driver module the two machines share (`PLAN.md`
+/// §13.24/§13.25).
 #[cfg(target_arch = "x86_64")]
 pub mod ahci;
 pub mod devices;
-#[cfg(target_arch = "x86_64")]
 pub mod drm;
 #[cfg(target_arch = "x86_64")]
 pub mod pci;
-#[cfg(target_arch = "x86_64")]
-pub mod qemu;
 /// The real-time clock's device node - `/dev/rtc0`, and the `RTC_*` ioctls'
 /// conversion between a Unix second and the nine fields `struct rtc_time` spells.
 /// Machine-neutral, and the only thing that was not was the `target_arch` gate
@@ -34,19 +34,14 @@ pub mod qemu;
 /// is a machine (`PLAN.md` §13.15).
 #[cfg(target_os = "none")]
 pub mod rtc_dev;
-#[cfg(target_arch = "x86_64")]
-pub mod serial;
-/// The console's transmit queue - the one thing in `drivers` both machines use
-/// as-is. It is here rather than inside `serial` (x86_64's 16550) or beside
-/// `arch/aarch64/pl011.rs` (the second machine's UART) because both drain it
-/// through the same three operations and neither owns the reasoning over it:
-/// when to arm the transmitter, who sleeps for room, what one visit hands over.
-/// Present wherever a `hal::SerialRing` is (`mpos_serial_ring`), because a
-/// machine with no interrupting transmitter has no queue to drain.
-#[cfg(mpos_serial_ring)]
-pub mod tx_ring;
-#[cfg(target_arch = "x86_64")]
+/// The userspace input-device interface: a program that opens `/dev/uinput`
+/// creates virtual devices, and they land in the evdev registry beside the real
+/// ones. Gated on the *capability* rather than the architecture, like the
+/// registry it feeds (`drivers::virtio::input`, which this module names for
+/// `EvdevNode`): a machine with no registry has nowhere for a created device to
+/// go, so the two are one switch - and uinput's exit hook is the same switch
+/// (`board::steps::register_exit_hooks`).
+#[cfg(mpos_input_registry)]
 pub mod uinput;
-#[cfg(target_arch = "x86_64")]
 pub mod video;
 pub mod virtio;

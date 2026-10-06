@@ -31,10 +31,10 @@ pub mod locks;
 #[cfg(target_os = "none")]
 pub mod memfd;
 pub mod mount;
-/// 9P client. Reached only through `drivers::virtio::fs9p`, which is x86_64's
-/// until the aarch64 drivers land (`PLAN.md` §9.1), and mounted by the gated
-/// `mount -t 9p` factory in `syscall` - no core vfs module constructs it.
-#[cfg(target_arch = "x86_64")]
+/// 9P client. Reached only through `drivers::virtio::fs9p`, which carries the
+/// `P9Device` contract whichever bus opened the device (`PLAN.md` §13.29), and
+/// mounted by the `mount -t 9p` factory in `syscall` - no core vfs module
+/// constructs it.
 pub mod p9;
 pub mod path;
 pub mod pipe;
@@ -1551,9 +1551,34 @@ pub fn resolve_parent_opt(
         Some(dir) => mount::resolve_parent_at(path, dir),
         None => {
             let (parent, name) = split_parent(path)?;
-            Ok((resolve(parent)?, String::from(name)))
+            let parent = resolve(parent)?;
+            require_directory(&parent)?;
+            Ok((parent, String::from(name)))
         }
     }
+}
+
+/// A name lives *in* a directory, so the directory a make-or-remove is about
+/// to act in has to be one.
+///
+/// Linux's walk refuses a component that cannot hold children with `ENOTDIR`
+/// (`walk_component`'s `d_can_lookup`), and it asks that *before* any
+/// permission - which is the whole point of the order. Without this check,
+/// `bind("/etc/hostname/x")` reached `may_create_in` first and answered the
+/// `EACCES` of a search through a plain file carrying no execute bit, where
+/// Linux answers `ENOTDIR`: a non-directory has no children to make a name
+/// among, and that is a fact about the tree rather than about the caller.
+///
+/// The resolver already gives `NotDir` for a non-directory in the *middle* of
+/// a path; this is the same fact for the component that ends it. It is one
+/// function rather than a check at each door so that every make-or-remove -
+/// `unlink`, `rmdir`, `bind`, `mkdirat`, `symlink` - refuses together, the
+/// way [`may_remove`] does for the permission half.
+pub(crate) fn require_directory(dir: &Arc<dyn Inode>) -> VfsResult<()> {
+    if dir.metadata().kind != NodeKind::Dir {
+        return Err(VfsError::NotDir);
+    }
+    Ok(())
 }
 
 #[cfg(all(test, not(target_os = "none")))]
@@ -1638,7 +1663,7 @@ mod tests {
     fn a_relative_path_resolves_from_the_directory_it_is_given() {
         let vfs = Vfs::new();
         let fs = crate::vfs::ramfs::RamFs::new();
-        vfs.mount_root(&*fs);
+        vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
         let here = root.create("here", NodeKind::Dir).unwrap();
         let sub = here.create("sub", NodeKind::Dir).unwrap();
@@ -1741,7 +1766,7 @@ mod tests {
         // directory itself rather than refuse.
         let vfs = Vfs::new();
         let fs = crate::vfs::ramfs::RamFs::new();
-        vfs.mount_root(&*fs);
+        vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
         let here = root.create("here", NodeKind::Dir).unwrap();
         here.create("f", NodeKind::File).unwrap();
@@ -1808,7 +1833,7 @@ mod tests {
     fn a_relative_link_deep_in_an_absolute_path_resolves_to_its_target() {
         let vfs = Vfs::new();
         let fs = crate::vfs::ramfs::RamFs::new();
-        vfs.mount_root(&*fs);
+        vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
         let usr = root.create("usr", NodeKind::Dir).unwrap();
         let lib = usr.create("lib", NodeKind::Dir).unwrap();
@@ -1852,7 +1877,7 @@ mod tests {
     fn may_as_answers_for_the_node_and_the_identity_it_is_given() {
         let vfs = Vfs::new();
         let fs = crate::vfs::ramfs::RamFs::new();
-        vfs.mount_root(&*fs);
+        vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
         let file = root.create("f", NodeKind::File).unwrap();
         file.set_mode(0o600);
@@ -1893,7 +1918,7 @@ mod tests {
         // where Linux says no.
         let vfs = Vfs::new();
         let fs = crate::vfs::ramfs::RamFs::new();
-        vfs.mount_root(&*fs);
+        vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
 
         let dir = root.create("d", NodeKind::Dir).unwrap();

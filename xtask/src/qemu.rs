@@ -15,6 +15,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+use crate::arch::Arch;
 use crate::config::{QemuConfig, RunMode};
 use crate::utils;
 
@@ -380,7 +381,11 @@ pub fn run_qemu(
     if needs_build {
         println!("run: the image is missing or out of date; building it");
         if !artefacts_ready {
-            utils::build_kernel(profile)?;
+            // `run_qemu` is reached only for the x86_64 machine: `run --arch
+            // aarch64` takes its own arm before the image machinery runs. So
+            // the kernel it builds here is that machine's, named rather than
+            // left to the workspace default.
+            utils::build_kernel(profile, Arch::X86_64)?;
         }
         crate::disk::ensure(build_dir, profile)?;
         // The rootfs step brings the initramfs up to date itself, so there is
@@ -401,7 +406,10 @@ pub fn run_qemu(
     // An image older than the kernel or the loader it was built from boots the
     // *previous* code and says nothing about it, which reads exactly like a fix
     // that changed nothing. `run.sh` warns and boots anyway; so does this.
-    for artifact in [utils::kernel_path(profile)?, utils::loader_path(profile)?] {
+    for artifact in [
+        utils::kernel_path(profile, Arch::X86_64)?,
+        utils::loader_path(profile, Arch::X86_64)?,
+    ] {
         if utils::newer(&artifact, &image)? {
             eprintln!(
                 "run: warning: {} predates {}",

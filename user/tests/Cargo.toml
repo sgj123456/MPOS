@@ -38,4 +38,6 @@ libc = "0.2"
 
 # The binaries are named `t-<syscall>`, one per syscall family, so the test
 # run's output says which one is missing.
-[lints.cargo]
+[lints]
+workspace = true
+

@@ -1,38 +1,37 @@
-//! The aarch64 `/init`: the smallest real userspace programs, built in pure Rust.
+//! The aarch64 verdict's payload: the smallest real userspace programs, built
+//! in pure Rust.
 //!
 //! Stage 6/7's image prerequisite. The kernel's ELF loader (`src/mm/elf.rs`) was
 //! taught `EM_AARCH64` in 6g, and `spawn_init`/`load_user` map the segments and
 //! jump to `e_entry` - but something must *produce* an aarch64 binary for the
-//! initramfs. This file does, in the two ways the payloads need.
+//! payload. This file does, in the two ways the payloads need.
 //!
-//! The *hand-encoded* images are the headless verdict's, and they are hand-encoded
-//! on purpose: a build step that shells out to `clang` plus a rustup-internal
+//! The *hand-encoded* image is the verdict's exec target, hand-encoded on
+//! purpose: a build step that shells out to `clang` plus a rustup-internal
 //! `ld.lld` path would add a fragile host prerequisite to the boot path and make
 //! the artifact non-hermetic (a test that has to run the compiler to know the
-//! answer tests the compiler, not the image). Each is a couple dozen straight-line
+//! answer tests the compiler, not the image). It is a few dozen straight-line
 //! instructions, so it fits in a page and every byte is pinned here against
 //! `llvm-objdump`'s own decoding of the built image (encode, then disassemble,
 //! then confirm), not a hand-guess at the bit layout:
 //!
-//! - [`exec_launcher_init_elf`] (the headless verdict's `/init`) echoes the queued
-//!   line - writes back what it read prefixed with `R:` (the tty's own echo of the
-//!   same line carries no `R:`), so `R:echo-test` on the wire is unambiguous proof a
-//!   scheduler-run program read console input and echoed it through
-//!   `syscall::dispatch` - then its last act is `execve("/t", ...)`. If aarch64
-//!   `execve` works the image is replaced and the launcher's own `exit_group`
-//!   fallback (which `boot-aarch64` can stop polling on) is never reached; `/t` is
-//!   [`marker_target_elf`].
-//!
-//! - [`marker_target_elf`] (the verdict's `/t`) writes `MPOS_EXEC_OK`, then forks
-//!   via `clone` and `wait4`: the child writes `MPOS_FORK_OK` and the parent waits,
-//!   so the child's line lands before the halt. Nothing else prints either string,
-//!   so their appearance proves `execve` transferred to a *second* image that ran at
-//!   EL0 and that `clone` started a *third* process (stage 6D).
+//! - [`marker_target_elf`] (the verdict's `/t`, exec'd by the payload's own
+//!   pid 1 - [`exec_launcher_init_elf`] - which the initramfs script promotes
+//!   into `/` before handing over)
+//!   demand-pages its stack (`MPOS_FAULT_OK` only if the store survived - the
+//!   pin any real, larger program needs), writes `MPOS_EXEC_OK`, forks via
+//!   `clone` and `wait4`s, reads `/etc/inittab` through raw syscalls and prints
+//!   its length (the switched root serving a userspace open/read/close whose
+//!   byte count the command pins), and its parent then `execve`s `/musl` - an
+//!   *unmodified* statically-linked musl/Rust binary that prints `MPOS_MUSL_OK` -
+//!   so the wire proves `execve`, `clone`/`wait4`, demand paging, a real file
+//!   read on the disk root, AND running a real musl binary at EL0 (the
+//!   demand-paging handler services its larger stack/anon pages).
 //!
 //! The *rustc-built* programs are the ones that do real work, where hand-encoding
 //! would be a toy of the thing rather than a smaller version of it: the sweep's
-//! runner ([`build_sweep_init`], which runs every `/t-*`) and the
-//! unmodified-musl probe ([`build_static_musl_helper`]). Both are static
+//! runner ([`build_sweep_init`]) and the unmodified-musl probe
+//! ([`build_static_musl_helper`]). Both are static
 //! `aarch64-unknown-linux-musl` binaries and share [`build_static_musl`],
 //! because the flags that make such a binary - `+crt-static`, `rust-lld`,
 //! stripped, `-O` - are one answer and not three.
@@ -40,13 +39,21 @@
 //! Two stand-ins have been retired from this module rather than left dead. The
 //! interactive `/init` was once a third hand-encoded image (`looping_init_elf`:
 //! an echo loop with no exit), then a musl program that made `/tmp` and execed
-//! the payload's `sh` (`build_shell_init`). Both existed while the machine had
-//! no userland to boot; since §13.19 `run --arch aarch64` boots the real Alpine
-//! tree - pid 1 is the disk's own `/init`, getties respawn - so neither name
-//! survives here. A hand-coded interpreter that can only echo was the gap, and
-//! answering it with a second interpreter was the same gap twice.
+//! the payload's `sh` (`build_shell_init`); both existed while the machine had
+//! no userland to boot, and since §13.19 `run --arch aarch64` boots the real
+//! Alpine tree instead. The archive packer (`write_initramfs_entries`) went the
+//! same way - the initramfs is a real busybox tree now
+//! (`xtask/src/aarch64_initramfs.rs`), not a tar of hand-encoded members.
+//!
+//! The verdict's launcher ([`exec_launcher_init_elf`]) is *not* one of those,
+//! though §15.6 briefly made it look like one. That change moved the boot onto
+//! the initramfs script's pivot and with it the `R:` echo the launcher had been
+//! doing - correctly, since the script is the process that reads the console
+//! first. What it also assumed was that the disk's pid 1 could then be a script.
+//! It cannot: the test disk has no interpreter to name, and the boot died at
+//! `switch_root: can't execute '/init'`. The launcher is back as what it always
+//! was - the payload's own pid 1 - and the echo stays with the script.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -60,19 +67,13 @@ const ET_EXEC: u16 = 2;
 /// `PT_LOAD`.
 const PT_LOAD: u32 = 1;
 /// `PF_R | PF_W | PF_X` - the one mapped segment holds headers, code, the read
-/// scratch buffer and the prefix string; `W` so the loader maps it writable (the
+/// scratch buffer and the strings; `W` so the loader maps it writable (the
 /// `read` lands in the scratch buffer).
 const PF_R_W_X: u32 = 7;
 
 /// Where the image is mapped: the low text address a static aarch64 executable
 /// uses, comfortably inside the user span and below `USER_LIMIT`.
 const VADDR: u64 = 0x40_0000;
-
-/// The prefix the program writes before echoing the bytes it read, so its output
-/// is distinguishable from the tty's own echo of the same input.
-const PREFIX: &[u8] = b"R:";
-/// How many bytes the `read` asks for (and the scratch buffer's size).
-const READ_LEN: u32 = 64;
 
 const HEADER_LEN: usize = 64;
 const PHDR_LEN: usize = 56;
@@ -86,6 +87,12 @@ fn movz(rd: u32, imm: u32) -> u32 {
 /// `MOVK Xd, #imm16, LSL #16` - the upper half of a two-word address load.
 fn movk(rd: u32, imm: u32) -> u32 {
     0xf280_0000u32 | (1 << 21) | ((imm & 0xffff) << 5) | rd
+}
+/// `MOVN Xd, #imm16` - the complement form, for the negated immediates the
+/// syscall ABI carries (`AT_FDCWD` is `-100`, which no `MOVZ` can name because
+/// `MOVZ` zero-extends its immediate).
+fn movn(rd: u32, imm: u32) -> u32 {
+    0x9280_0000u32 | ((imm & 0xffff) << 5) | rd
 }
 /// `SVC #0`.
 fn svc() -> u32 {
@@ -106,42 +113,55 @@ fn cbnz_x0(from_word: usize, to_word: usize) -> u32 {
     0xb500_0000u32 | (imm19 << 5)
 }
 
-/// The shared body: `read(0, buf, 64)`, stash the count in `x9`, `write(1, "R:",
-/// 2)`, `write(1, buf, n)`. The caller decides what follows - `exit_group` (the
-/// one-shot) or a branch back to the top (the loop). `buf_addr` and `prefix_addr`
-/// are the addresses the data lands at, which depend on how many words the body
-/// is, so the caller passes them in.
-fn echo_body(buf_addr: u64, prefix_addr: u64) -> Vec<u32> {
-    let load = |rd: u32, addr: u64| {
-        [
-            movz(rd, (addr & 0xffff) as u32),
-            movk(rd, ((addr >> 16) & 0xffff) as u32),
-        ]
-    };
-    let mut code = Vec::new();
-    // read(0, buf, READ_LEN): x8=63, x0=0, x1=&buf, x2=READ_LEN, svc.
-    code.extend([movz(8, 63), movz(0, 0)]);
-    code.extend(load(1, buf_addr));
-    code.extend([movz(2, READ_LEN), svc()]);
-    // n is now in x0; keep it across the writes, which clobber x0/x1/x2.
-    code.push(movreg(9, 0));
-    // write(1, PREFIX, len): x8=64, x0=1, x1=&prefix, x2=len, svc.
-    code.extend([movz(8, 64), movz(0, 1)]);
-    code.extend(load(1, prefix_addr));
-    code.extend([movz(2, PREFIX.len() as u32), svc()]);
-    // write(1, buf, n): x8=64, x0=1, x1=&buf, x2=n (from x9), svc.
-    code.extend([movz(8, 64), movz(0, 1)]);
-    code.extend(load(1, buf_addr));
-    code.push(movreg(2, 9));
-    code.push(svc());
-    code
+/// `SUBS XZR, Xn, #imm` - compare against an immediate without writing a
+/// destination: `0xF100001F | (imm12<<10) | (Rn<<5)`.
+///
+/// `SUBS`, not `ADDS`: `0xB100001F` has the same N-flag behaviour for a zero
+/// immediate (which is the only immediate used here) but decodes as `cmn`, and a
+/// helper named `cmp_imm` that assembles `cmn` is a trap set for the next
+/// reader. Measured with `llvm-mc -show-encoding`.
+fn cmp_imm(rn: u32, imm: u32) -> u32 {
+    0xf100_001fu32 | ((imm & 0xfff) << 10) | (rn << 5)
 }
 
-/// Assemble a hand-written instruction list plus a data blob into the loadable
-/// `ET_EXEC` `EM_AARCH64` image: header, one RWX `PT_LOAD` spanning the whole
-/// file from offset 0, the code at `CODE_OFF`, then `data` immediately after the
-/// code. The data addresses are derived from the code length, so a caller that
-/// changes the word count cannot desync the pointers its code loads into the blob.
+/// `B.LT label` - branch when the N-flag says "less than":
+/// `0x54000000 | (imm19 << 5) | 0b1011`. The target uses it to walk out of the
+/// inittab probe when a syscall answered a negative errno.
+fn b_lt(from_word: usize, to_word: usize) -> u32 {
+    let d = ((to_word - from_word) as i32) & 0x7ffff;
+    0x5400_0000u32 | ((d as u32) << 5) | 0b1011
+}
+
+/// `ADD Xd, Xm, #imm12` (unsigned offset, no shift).
+fn add_imm(rd: u32, rm: u32, imm: u32) -> u32 {
+    0x9100_0000u32 | ((imm & 0xfff) << 10) | (rm << 5) | rd
+}
+
+/// `STRB Wt, [Xn]` - byte store at an un-offset register address. The unsigned
+/// immediate form with `imm12 = 0` (`0x39000000`), not the `0x3E000000` that
+/// reads like "size 00, byte" and is in fact a SIMD store against a register
+/// offset - which is what an earlier version of this helper assembled, storing
+/// `b2` at `[x21 + x0]` and faulting instead of printing the digit.
+fn strb_at(rt: u32, rn: u32) -> u32 {
+    0x3900_0000u32 | (rn << 5) | rt
+}
+
+/// `UDIV Xd, Xn, Xm` - unsigned divide. The odd-looking `0x800` is the
+/// instruction's own opcode field (bits 15..10 = `0b000010`); without it the
+/// word is not a divide at all, and the CPU took an unknown-reason exception in
+/// the middle of the digit print - measured, and the reason every helper here
+/// now has a pinned encoding in the tests below.
+fn udiv(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x9ac0_0800u32 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `MSUB Xd, Xn, Xm, Xa` - `Xd = Xa - Xn*Xm`, the remainder half of a
+/// divide-and-mod pair. `0x9b00_8000`, not `0x9b00_0000`: bit 15 is MSUB's
+/// `o0 = 1`, and leaving it clear assembles `MADD` - the *reverse* of the
+/// operation wanted, which would have printed `bytes=` followed by a quotient.
+fn msub(rd: u32, rn: u32, rm: u32, ra: u32) -> u32 {
+    0x9b00_8000u32 | (rm << 16) | (ra << 10) | (rn << 5) | rd
+}
 fn assemble_with(code: &[u32], data: &[u8]) -> Vec<u8> {
     let file_len = CODE_OFF + code.len() * 4 + data.len();
 
@@ -175,21 +195,38 @@ fn assemble_with(code: &[u32], data: &[u8]) -> Vec<u8> {
     out[data_off..].copy_from_slice(data);
     out
 }
-
 /// `aarch64` asm-generic syscall numbers used below (Linux's, from `nr.rs`'s
-/// aarch64 table): `execve`, `clone`, `wait4`, and `exit_group`. `read`/`write`
-/// (63/64) are in [`echo_body`]. `SIGCHLD` is the `clone` exit signal so the
-/// parent's `wait4` reaps the child.
+/// aarch64 table): `open`, `close`, `read`, `write`, `execve`, `clone`, `wait4`
+/// and `exit_group`. `SIGCHLD` is the `clone` exit signal so the parent's
+/// `wait4` reaps the child.
+///
+/// `NR_OPENAT`, not `open`: aarch64's asm-generic table has no `open` at all -
+/// the number `nr_aarch64.rs` records for it (`64000`) is a sentinel that is
+/// deliberately unreachable - and 56 is `openat`. Measured: the inittab probe
+/// below asked for 56 with the *path* in `x0`, which is `openat`'s `dirfd`, so
+/// the call answered a negative errno, the probe skipped its print, and
+/// `boot-aarch64` failed on `MPOS_INITTAB_OK` never appearing.
+const NR_OPENAT: u32 = 56;
+const NR_CLOSE: u32 = 57;
+const NR_READ: u32 = 63;
+const NR_WRITE: u32 = 64;
 const NR_EXECVE: u32 = 221;
 const NR_CLONE: u32 = 220;
 const NR_WAIT4: u32 = 260;
 const NR_EXIT_GROUP: u32 = 94;
 const SIGCHLD: u32 = 17;
+/// `AT_FDCWD` (`-100`), which `openat` takes in `x0` to mean "resolve the path
+/// from the caller's cwd". A negative immediate, so it is materialised with
+/// `movn` - and `movn` writes the *complement* of its immediate, so what is
+/// stored here is that complement and not the value. Written as the expression
+/// rather than as a bare `99` so a reader can connect it back to the name; the
+/// alternative is a magic number in the code stream.
+const AT_FDCWD: u32 = (!(-100i32)) as u32 & 0xffff;
 
 /// The string the exec target writes when it runs - proof aarch64 `execve`
 /// replaced the image and the new program ran at EL0. Nothing else prints it.
 const EXEC_MARKER: &[u8] = b"MPOS_EXEC_OK\n";
-/// The string the launcher writes only after its deliberately-far `str` to a
+/// The string the target writes only after its deliberately-far `str` to a
 /// never-mapped stack page survives - i.e. only if the kernel's aarch64 EL0
 /// fault handler demand-paged it. Without the handler that store is a fatal data
 /// abort and this line never appears. Nothing else prints it.
@@ -202,32 +239,56 @@ const STR_X19_SP: u32 = 0xf900_03f3;
 /// The string the fork target's *child* writes - proof aarch64 `clone` (the
 /// arch's real `fork`) started a second running program. Nothing else prints it.
 const FORK_MARKER: &[u8] = b"MPOS_FORK_OK\n";
-/// The path the launcher `execve`s, and the ramfs name the target is packed as.
-const EXEC_PATH: &[u8] = b"/t\0";
-
-/// The exec target: writes `MPOS_EXEC_OK` (proving aarch64 `execve` transferred
-/// control here and ran at EL0), then forks. The child writes `MPOS_FORK_OK` and
-/// exits; the parent `wait4`s for it. The parent then `execve`s `/musl` - an
-/// *unmodified* statically-linked musl/Rust binary that prints `MPOS_MUSL_OK` - so
-/// the wire proves `execve`, `clone`/`wait4`, AND running a real musl binary at EL0
-/// (the demand-paging handler services its larger stack/anon pages). The parent's
-/// `exit_group` is only a fallback if that `execve` fails. Word layout (entry = 0):
-///   0..5   write(1, "MPOS_EXEC_OK\n", 13)
-///   6..12  clone(SIGCHLD, 0,0,0,0) -> x0 = child pid (parent) or 0 (child)
-///   13     cbnz x0, 24   (parent jumps; child falls through)
-///   14..23 child: write(1, "MPOS_FORK_OK\n", 13); exit_group(0); b .
-///   24..30 parent: wait4(0, &status, 0, NULL)
-///   31..38 parent: execve("/musl", ["/musl", NULL], [NULL])
-///   39..42 parent: exit_group(0); b .  (fallback only)
+/// The path the target reads through raw syscalls after its fork round trip -
+/// the switched root's own file, staged by the overlay pair. Its byte count is
+/// what `boot-aarch64` pins against the staging tree, so the read proves the
+/// disk serves the repository's tree to a userspace `open`/`read`, not merely
+/// that a filesystem mounted (§15.6 moved this pin from the kernel's `/mnt`
+/// read here, where the same claim is made about the *switched* root).
+const INITTAB_PATH: &[u8] = b"/etc/inittab\0";
+/// The prefix of the line the target prints with the length it read back.
+const INITTAB_MARKER: &[u8] = b"MPOS_INITTAB_OK bytes=";
+/// How many bytes the inittab read asks for. The staged file is a few hundred,
+/// so one ask either returns the whole thing or says the tree is different from
+/// the one the pin expects; a negative errno skips the print entirely, which is
+/// the honest failure (a missing marker, not a wrong number).
+const INITTAB_LEN: u32 = 4096;
+/// The exec target: demand-pages its stack (`sub sp` + `str`, then
+/// `MPOS_FAULT_OK` only if the store survived), writes `MPOS_EXEC_OK` (proving
+/// aarch64 `execve` transferred control here and ran at EL0), then forks. The
+/// child writes `MPOS_FORK_OK` and exits; the parent `wait4`s for it,
+/// `openat`s `/etc/inittab`, reads it, closes it and prints
+/// `MPOS_INITTAB_OK bytes=<n>` - the switched root serving a userspace file
+/// read whose length the command pins - and finally `execve`s `/musl`, an
+/// *unmodified* statically-linked musl/Rust binary that prints `MPOS_MUSL_OK`.
+/// The wire therefore proves `execve`, `clone`/`wait4`, demand paging, a real
+/// `openat`/read/close on the disk root, AND running a real musl binary at EL0.
+/// The parent's `exit_group` is only a fallback if that `execve` fails. Word
+/// layout (entry = 0):
+///   0..7   demand-paging store, then write(1, "MPOS_FAULT_OK\n", 14)
+///   8..13  write(1, "MPOS_EXEC_OK\n", 13)
+///   14..20 clone(SIGCHLD, 0,0,0,0) -> x0 = child pid (parent) or 0 (child)
+///   21     cbnz x0, 32   (parent jumps; child falls through)
+///   22..31 child: write(1, "MPOS_FORK_OK\n", 13); exit_group(0); b .
+///   32..38 parent: wait4(0, &status, 0, NULL)
+///   39..45 parent: openat(AT_FDCWD, "/etc/inittab", O_RDONLY=0, 0)
+///   46..47 cmp x0,#0 ; b.lt 95   (a failed openat skips the probe, honestly)
+///   48     mov x19, x0 (fd)
+///   49..54 read(fd, buf, 4096) -> n in x0
+///   55..56 cmp x0,#0 ; b.lt 95   (a failed read likewise)
+///   57     mov x20, x0 (n)
+///   58..60 close(fd)
+///   61..66 write(1, "MPOS_INITTAB_OK bytes=", 22)
+///   67..68 x21 = digit_base
+///   69..73 place 1000: UDIV / MSUB / ADD 48 / STRB
+///   74..79 place 100 (advance x21 first)
+///   80..85 place 10
+///   86..88 place 1: the remainder stored directly
+///   89..94 write(1, digit_base, 4)
+///   95..100 write(1, "\n", 1)
+///   101..108 execve("/musl", ["/musl", NULL], [NULL])
+///   109..112 exit_group(0); b .  (fallback only)
 pub fn marker_target_elf() -> Vec<u8> {
-    let n = 43usize;
-    let data_base = VADDR + (CODE_OFF + n * 4) as u64;
-    let exec_addr = data_base;
-    let fork_addr = data_base + 13;
-    let musl_path_addr = data_base + 26;
-    let status_addr = data_base + 32;
-    let argv_addr = data_base + 40;
-    let envp_addr = data_base + 56;
     let load = |rd: u32, addr: u64| {
         [
             movz(rd, (addr & 0xffff) as u32),
@@ -235,11 +296,56 @@ pub fn marker_target_elf() -> Vec<u8> {
         ]
     };
 
+    // The code length is fixed by the block below; the blob addresses depend on
+    // it, and the debug_assert at the end is what keeps them honest.
+    let n = 113usize;
+    let data_base = VADDR + (CODE_OFF + n * 4) as u64;
+    // Blob offsets from `data_base`:
+    //   0..14   "MPOS_FAULT_OK\n"
+    //   14..27  "MPOS_EXEC_OK\n"
+    //   27..40  "MPOS_FORK_OK\n"
+    //   40..46  "/musl\0"
+    //   46..56  pad
+    //   56..64  argv[0] = &"/musl"
+    //   64..72  envp = [NULL]
+    //   72..80  wait4 status word
+    //   80..94  "/etc/inittab\0" (+pad)
+    //   94..116 "MPOS_INITTAB_OK bytes="
+    //   116..117 "\n"
+    //   117..128 pad
+    //   128..   the read scratch buffer (INITTAB_LEN bytes); the four digit
+    //           bytes land at its very end (offsets LEN-4 .. LEN).
+    let fault_addr = data_base;
+    let exec_addr = data_base + 14;
+    let fork_addr = data_base + 27;
+    let musl_path_addr = data_base + 40;
+    let argv_addr = data_base + 56;
+    let envp_addr = data_base + 64;
+    let status_addr = data_base + 72;
+    let inittab_addr = data_base + 80;
+    let ittab_marker_addr = data_base + 94;
+    let newline_addr = data_base + 116;
+    let buf_addr = data_base + 128;
+    // The digits go at the tail of the scratch buffer: the read fills at most
+    // `n` bytes from the front, and every inittab this repository stages is far
+    // shorter than 4 KiB minus 4, so the two uses cannot collide. A >4092-byte
+    // inittab would make the *pin* fail first (the read caps at 4096 and the
+    // expected byte count stops matching), which is the loud direction.
+    let digit_base = buf_addr + (INITTAB_LEN as u64 - 4);
+
     let mut code: Vec<u32> = Vec::new();
+    // Demand-paging probe first: `sp -= 0x1000` lands one page below the mapped
+    // stack; `str x19,[sp]` faults there. If `el0_sync`'s handler demand-pages
+    // it, the store succeeds and we fall through to the write; otherwise it is
+    // SIGSEGV and `MPOS_FAULT_OK` never appears.
+    code.extend([SUB_SP_PAGE, STR_X19_SP]);
+    code.extend([movz(8, NR_WRITE), movz(0, 1)]);
+    code.extend(load(1, fault_addr));
+    code.extend([movz(2, FAULT_MARKER.len() as u32), svc()]); // 0..7
     // write(1, exec_marker, 13) - the exec confirmation, run once before forking.
-    code.extend([movz(8, 64), movz(0, 1)]);
+    code.extend([movz(8, NR_WRITE), movz(0, 1)]);
     code.extend(load(1, exec_addr));
-    code.extend([movz(2, EXEC_MARKER.len() as u32), svc()]); // 0..5
+    code.extend([movz(2, EXEC_MARKER.len() as u32), svc()]); // 8..13
     // clone(SIGCHLD, child_stack=0, ptid=0, ctid=0, tls=0): the aarch64 `fork`.
     code.extend([
         movz(8, NR_CLONE),
@@ -249,46 +355,145 @@ pub fn marker_target_elf() -> Vec<u8> {
         movz(3, 0),
         movz(4, 0),
         svc(),
-    ]); // 6..12
-    code.push(cbnz_x0(13, 24)); // 13 - parent (x0 != 0) jumps to 24
+    ]); // 14..20
+    code.push(cbnz_x0(21, 32)); // 21 - parent (x0 != 0) jumps to 32
     // child: write(1, fork_marker, 13); exit_group(0); b .
-    code.extend([movz(8, 64), movz(0, 1)]);
+    code.extend([movz(8, NR_WRITE), movz(0, 1)]);
     code.extend(load(1, fork_addr));
-    code.extend([movz(2, FORK_MARKER.len() as u32), svc()]); // 14..19
-    code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]); // 20..23
+    code.extend([movz(2, FORK_MARKER.len() as u32), svc()]); // 22..27
+    code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]); // 28..31
     // parent: wait4(pid=0, &status, options=0, rusage=NULL).
-    code.extend([movz(8, NR_WAIT4), movz(0, 0)]); // 24..25
-    code.extend(load(1, status_addr)); // 26..27
-    code.extend([movz(2, 0), movz(3, 0), svc()]); // 28..30
-    // parent: execve("/musl", argv=["/musl",NULL], envp=[NULL]) - the real binary.
-    code.extend([movz(8, NR_EXECVE)]); // 31
-    code.extend(load(0, musl_path_addr)); // 32..33
-    code.extend(load(1, argv_addr)); // 34..35
-    code.extend(load(2, envp_addr)); // 36..37
-    code.push(svc()); // 38
+    code.extend([movz(8, NR_WAIT4), movz(0, 0)]); // 32..33
+    code.extend(load(1, status_addr)); // 34..35
+    code.extend([movz(2, 0), movz(3, 0), svc()]); // 36..38
+    // parent: open("/etc/inittab", O_RDONLY=0, mode=0). A negative fd (ENOENT,
+    // EACCES, ...) must not reach `read`, and must not print a fake length:
+    // branch out to the newline write when the sign says errno, so the marker
+    // line never appears rather than appearing with a wrong number.
+    // `openat(AT_FDCWD, "/etc/inittab", O_RDONLY, 0)`: x8=nr, x0=dirfd, x1=path,
+    // x2=flags, x3=mode. `openat` and not `open` because aarch64 has no `open`
+    // (see `NR_OPENAT`), and `AT_FDCWD` and not the path in `x0` for the same
+    // reason - the measurement that put these words here is the same one.
+    code.extend([movz(8, NR_OPENAT)]); // 39
+    code.extend([movn(0, AT_FDCWD)]); // 40  mov x0, #-100
+    code.extend(load(1, inittab_addr)); // 41..42
+    code.extend([movz(2, 0), movz(3, 0), svc()]); // 43..45
+    code.extend([cmp_imm(0, 0), b_lt(46, 95)]); // 46..47
+    code.push(movreg(19, 0)); // 48  mov x19, x0 (fd)
+    // read(fd, buf, INITTAB_LEN): x0=fd, x1=&buf, x2=len.
+    code.extend([movz(8, NR_READ)]); // 49
+    code.push(movreg(0, 19)); // 50
+    code.extend(load(1, buf_addr)); // 51..52
+    code.extend([movz(2, INITTAB_LEN), svc()]); // 53..54
+    code.extend([cmp_imm(0, 0), b_lt(55, 95)]); // 55..56
+    code.push(movreg(20, 0)); // 57  mov x20, x0 (n)
+    // close(fd).
+    code.extend([movz(8, NR_CLOSE)]); // 58
+    code.push(movreg(0, 19)); // 59
+    code.push(svc()); // 60
+    // write(1, "MPOS_INITTAB_OK bytes=", 22).
+    code.extend([movz(8, NR_WRITE), movz(0, 1)]); // 61..62
+    code.extend(load(1, ittab_marker_addr)); // 63..64
+    code.extend([movz(2, INITTAB_MARKER.len() as u32), svc()]); // 65..66
+    // Decimal of n (<= 4096) as exactly four ASCII digits, thousands first,
+    // written at the scratch tail. Each place divides the running value by its
+    // weight (`UDIV`), multiplies back and subtracts (`MSUB`) to keep the
+    // remainder, turns the quotient into a character (`ADD #48`) and stores it
+    // (`STRB`). The last place stores the remainder itself - nothing left to
+    // divide. Leading zeros are printed (`bytes=0042`): the pin compares the
+    // same fixed width the command formats, so no parsing rule is invented here.
+    code.extend(load(21, digit_base)); // 67..68
+    // place 1000:
+    code.extend([
+        movz(1, 1000),
+        udiv(2, 20, 1),
+        msub(20, 2, 1, 20),
+        add_imm(2, 2, 48),
+        strb_at(2, 21),
+    ]); // 69..73
+    // place 100:
+    code.extend([
+        add_imm(21, 21, 1),
+        movz(1, 100),
+        udiv(2, 20, 1),
+        msub(20, 2, 1, 20),
+        add_imm(2, 2, 48),
+        strb_at(2, 21),
+    ]); // 74..79
+    // place 10:
+    code.extend([
+        add_imm(21, 21, 1),
+        movz(1, 10),
+        udiv(2, 20, 1),
+        msub(20, 2, 1, 20),
+        add_imm(2, 2, 48),
+        strb_at(2, 21),
+    ]); // 80..85
+    // place 1: the remainder is the last digit.
+    code.extend([add_imm(21, 21, 1), add_imm(2, 20, 48), strb_at(2, 21)]); // 86..88
+    // write(1, digit_base, 4).
+    code.extend([movz(8, NR_WRITE), movz(0, 1)]); // 89..90
+    code.extend(load(1, digit_base)); // 91..92
+    code.extend([movz(2, 4), svc()]); // 93..94
+    // write(1, "\n", 1) - also where a failed openat/read jumped to: printing
+    // the newline alone leaves the line prefix absent, which is what the pin
+    // reads as "no answer", never as a zero-length file.
+    code.extend([movz(8, NR_WRITE), movz(0, 1)]); // 95..96
+    code.extend(load(1, newline_addr)); // 97..98
+    code.extend([movz(2, 1), svc()]); // 99..100
+    // execve("/musl", argv=["/musl",NULL], envp=[NULL]) - the real binary.
+    code.extend([movz(8, NR_EXECVE)]); // 101
+    code.extend(load(0, musl_path_addr)); // 102..103
+    code.extend(load(1, argv_addr)); // 104..105
+    code.extend(load(2, envp_addr)); // 106..107
+    code.push(svc()); // 108
     // Fallback if that execve failed: exit_group(0); b .
-    code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]); // 39..42
+    code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]); // 109..112
     debug_assert_eq!(code.len(), n, "fork target word count must match");
 
-    // Data blob: the two markers, the "/musl" path, the wait4 status word, then the
-    // argv/envp pointer arrays.
-    let mut data = vec![0u8; 64];
-    data[0..EXEC_MARKER.len()].copy_from_slice(EXEC_MARKER);
-    data[13..13 + FORK_MARKER.len()].copy_from_slice(FORK_MARKER);
-    data[26..32].copy_from_slice(b"/musl\0");
-    data[40..48].copy_from_slice(&musl_path_addr.to_le_bytes()); // argv[0] = &"/musl"
-    // argv[1], envp[0], status stay zero.
+    // Data blob: the markers, the paths, the wait4 status word, the pointer
+    // arrays, and the read scratch. The digit tail stays zero until the run
+    // fills it.
+    let mut data = vec![0u8; 128 + INITTAB_LEN as usize];
+    data[0..FAULT_MARKER.len()].copy_from_slice(FAULT_MARKER);
+    data[14..14 + EXEC_MARKER.len()].copy_from_slice(EXEC_MARKER);
+    data[27..27 + FORK_MARKER.len()].copy_from_slice(FORK_MARKER);
+    data[40..46].copy_from_slice(b"/musl\0");
+    data[56..64].copy_from_slice(&musl_path_addr.to_le_bytes()); // argv[0] = &"/musl"
+    data[80..80 + INITTAB_PATH.len()].copy_from_slice(INITTAB_PATH);
+    data[94..94 + INITTAB_MARKER.len()].copy_from_slice(INITTAB_MARKER);
+    data[116] = b'\n';
     assemble_with(&code, &data)
 }
 
-/// The headless verdict's `/init`: first it proves aarch64 EL0 demand paging by
-/// pushing `sp` a page below what the loader mapped and storing there - a fault
-/// that is fatal unless the kernel's fault handler takes the page - then writes
-/// `MPOS_FAULT_OK` only if that store survived. It then echoes the queued line (so
-/// `boot-aarch64` still shows `R:echo-test`) and `execve("/t", ...)`. If `execve`
-/// works the image becomes the target and `MPOS_EXEC_OK`/`MPOS_FORK_OK` reach the
-/// wire; the launcher's `exit_group` fallback runs only if `execve` fails - honest,
-/// so a broken `execve` is a missing marker, not a hang.
+/// The verdict's disk `/init`: the smallest program that can stand as pid 1 on
+/// the *test* disk, `execve`-ing [`marker_target_elf`] as `/t` so the target
+/// runs as the image that replaced it.
+///
+/// A program, not the `#!/bin/sh` script the Alpine disk carries, and for a
+/// reason that is about the disk rather than about style: the test disk is the
+/// build's own payload, so it has no package manager and therefore no busybox -
+/// an interpreter is a file that disk simply does not have, and pid 1 cannot be
+/// a script whose interpreter is absent. Measured: leaving the overlay's
+/// `rootfs-aarch64/init` (the Alpine chain: applet farm, mounts, `exec
+/// /sbin/init`) to stand as the test disk's `/init` made the pivot die at
+/// `switch_root: can't execute '/init': No such file or directory` - the
+/// `ENOENT` of a missing `/bin/sh`, reported against the script's own name -
+/// after which `/t` never ran and every marker the verdict polls was absent.
+/// The sweep's runner ([`build_sweep_init`]) stages a program as `/init` for
+/// the same reason; this is that shape reduced to the one thing the verdict's
+/// chain needs, an `execve`.
+///
+/// Nothing else lives here. The console echo the verdict pins is the initramfs
+/// script's now (`initramfs-aarch64/init`), which runs on the ramfs *before*
+/// this program is reached; a second reader here would race it for the one line
+/// the handoff queued.
+///
+/// Word layout (entry = 0), data blob at `data_base`:
+///   0..3   "/t\0"
+///   4..8   padding, so the pointer table is 8-aligned
+///   8..24  argv = [&"/t", NULL]
+///   24..32 envp = [NULL]
 pub fn exec_launcher_init_elf() -> Vec<u8> {
     let load = |rd: u32, addr: u64| {
         [
@@ -296,122 +501,31 @@ pub fn exec_launcher_init_elf() -> Vec<u8> {
             movk(rd, ((addr >> 16) & 0xffff) as u32),
         ]
     };
-    // 8 demand-paging words (sub/str/write/svc) + 19 echo + 8 execve + 4 fallback = 39.
-    let body_len = echo_body(0, 0).len();
-    let n = 8 + body_len + 8 + 4;
+    // 1 + 2 + 2 + 2 + 1 + 4 = 12 words: the execve, its three operands, the
+    // `svc`, and the exit_group fallback for the case where it returned.
+    let n = 12usize;
     let data_base = VADDR + (CODE_OFF + n * 4) as u64;
-    // Blob offsets from `data_base`:
-    //   0..64   read scratch (buf)
-    //   64..66  "R:" (prefix)
-    //   66..69  "/t\0" (exec path)
-    //   69..72  padding to 8
-    //   72..88  argv = [&"/t", NULL]
-    //   88..96  envp = [NULL]
-    //   96..    "MPOS_FAULT_OK\n"
-    let buf_addr = data_base;
-    let prefix_addr = data_base + 64;
-    let path_addr = data_base + 66;
-    let argv_addr = data_base + 72;
-    let envp_addr = data_base + 88;
-    let fault_addr = data_base + 96;
+    let path_addr = data_base;
+    let argv_addr = data_base + 8;
+    let envp_addr = data_base + 24;
 
-    // Demand-paging probe: `sp -= 0x1000` lands one page below the mapped stack;
-    // `str x19,[sp]` faults there. If `el0_sync`'s handler demand-pages it, the
-    // store succeeds and we fall through to the write; otherwise it is SIGSEGV and
-    // `MPOS_FAULT_OK` never appears.
-    let mut code = vec![SUB_SP_PAGE, STR_X19_SP];
-    code.extend([movz(8, 64), movz(0, 1)]);
-    code.extend(load(1, fault_addr));
-    code.extend([movz(2, FAULT_MARKER.len() as u32), svc()]); // 0..7
-    code.extend(echo_body(buf_addr, prefix_addr));
-    // execve(path, argv, envp): x8=221, x0=&"/t", x1=&argv, x2=&envp, svc.
-    code.extend([movz(8, NR_EXECVE)]);
+    let mut code: Vec<u32> = vec![movz(8, NR_EXECVE)];
     code.extend(load(0, path_addr));
     code.extend(load(1, argv_addr));
     code.extend(load(2, envp_addr));
     code.push(svc());
-    // Fallback if execve returns (i.e. failed): exit_group(0) so the verdict
-    // still terminates, and `b .`.
+    // Fallback if that `execve` failed: leave through `exit_group`, so the
+    // verdict still terminates on `INIT_EXITED` instead of spinning.
     code.extend([movz(8, NR_EXIT_GROUP), movz(0, 0), svc(), 0x1400_0000]);
-    debug_assert_eq!(code.len(), n);
+    debug_assert_eq!(code.len(), n, "launcher word count must match");
 
-    // Build the data blob with the pointers written as LE u64 into it.
-    let mut data = vec![0u8; 96 + FAULT_MARKER.len()];
-    data[64..66].copy_from_slice(PREFIX);
-    data[66..66 + EXEC_PATH.len()].copy_from_slice(EXEC_PATH);
-    data[72..80].copy_from_slice(&path_addr.to_le_bytes()); // argv[0] = &"/t"
-    // argv[1] = NULL (0) and envp[0] = NULL (0): the zero-init already covers them.
-    data[96..].copy_from_slice(FAULT_MARKER);
+    let mut data = vec![0u8; 32];
+    data[0..3].copy_from_slice(b"/t\0");
+    data[8..16].copy_from_slice(&path_addr.to_le_bytes()); // argv[0] = &"/t"
+    // argv[1] and envp[0] are the zero-init above: NULL terminates both arrays.
     assemble_with(&code, &data)
 }
 
-/// Pack a set of `(name, bytes)` files into a ustar `initramfs.tar` at `out`, the
-/// way `xtask/src/initramfs.rs` does for the x86 image. The kernel unpacks it with
-/// `vfs::tar::unpack_into` and execs `/init` from the ramfs root it fills; the
-/// exec-pin packs `/init` and `/t` together so the launcher can reach the target.
-pub fn write_initramfs_entries(
-    entries: &[(&str, &[u8])],
-    staging_parent: &Path,
-    out: &Path,
-) -> Result<()> {
-    let stage = staging_parent.join("aarch64-init-stage");
-    let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage)
-        .with_context(|| format!("Failed to create {}", stage.display()))?;
-    let mut names = Vec::new();
-    for (name, bytes) in entries {
-        let path = stage.join(name);
-        // A name may carry a directory: the payload's own programs sit flat at
-        // the archive root, but the tools the tests run live in `/bin`, and both
-        // cross as one list. The kernel's unpacker creates missing parents on
-        // demand (`vfs::tar::unpack_into`), so the archive needs no separate
-        // directory member - only the staging tree does.
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
-        }
-        std::fs::write(&path, bytes)
-            .with_context(|| format!("Failed to write {}/{}", stage.display(), name))?;
-        // Mark it executable. The kernel's ramfs keeps the mode the archive
-        // records, and `execve` (and the loader's read of `/init`) reach it: even
-        // root is denied execute when no x bit is set, so a 0644 `/t` makes the
-        // launcher's `execve` fail with `EACCES` rather than transfer.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("Failed to chmod +x {}", path.display()))?;
-        names.push(name.to_string());
-    }
-
-    let mut cmd = Command::new("tar");
-    cmd.arg("--format=ustar")
-        .args(["-C", &stage.display().to_string()])
-        .args(["-cf", &out.display().to_string()]);
-    for name in &names {
-        cmd.arg(name);
-    }
-    let status = cmd
-        .status()
-        .context("Failed to start tar to build the aarch64 initramfs")?;
-    if !status.success() {
-        anyhow::bail!("tar failed building the aarch64 initramfs: {status}");
-    }
-    let _ = std::fs::remove_dir_all(&stage);
-    Ok(())
-}
-
-/// Compile one static `aarch64-unknown-linux-musl` program and answer its bytes.
-///
-/// `stem` is the name under `build/` both the source and the binary take; `what`
-/// names the program in the failure messages a reader sees when `rustc` is
-/// missing its target. One function rather than one per program because the flags
-/// *are* the definition of such a binary - static, no dynamic loader to find at
-/// `execve`, stripped, optimized - and three copies of them would be three places
-/// for that definition to drift.
-///
-/// The `aarch64-unknown-linux-musl` target is a prerequisite the aarch64 commands
-/// already have (the sweep's runner and the musl helper are built this way); a
-/// missing one is an error naming the install command rather than a silent skip,
-/// because a sweep that quietly runs nothing is the one failure this must not
-/// have.
 fn build_static_musl(build_dir: &Path, stem: &str, src: &str, what: &str) -> Result<Vec<u8>> {
     let path = build_dir.join(format!("{stem}.rs"));
     let out = build_dir.join(stem);
@@ -826,9 +940,12 @@ pub fn build_static_musl_helper(build_dir: &Path) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// The pinned instruction counts the tests assert the built code has.
-    const LAUNCHER_WORDS: usize = 39;
-    const TARGET_WORDS: usize = 43;
+    /// The pinned instruction count the test asserts the built code has - the
+    /// same number `marker_target_elf`'s own `debug_assert_eq!` checks, written
+    /// down twice on purpose: the blob's addresses are derived from it, so a
+    /// drift between the function and its pin is exactly the failure this file
+    /// exists to catch (a hand-encoded image whose pointers moved under it).
+    const TARGET_WORDS: usize = 113;
 
     /// Shared structural checks for any assembled image: the ELF identity, the
     /// single RWX `PT_LOAD` covering the whole file from offset 0, and the entry
@@ -864,99 +981,138 @@ mod tests {
             .collect()
     }
 
-    /// The exec launcher is a loadable image that first takes a demand-paging
-    /// fault (`sub sp` + `str`), writes `MPOS_FAULT_OK` if it survives, echoes,
-    /// then calls `execve`. Words: [0]=`sub sp`, [1]=`str x19,[sp]`, [2]=`mov
-    /// x8,#64` (the fault write), [8]=`mov x8,#63` (read), [14]=stash,
-    /// [27]=`mov x8,#221` (execve), [35]=`mov x8,#94` (fallback exit_group), last
-    /// `b .`. Its data blob carries the `/t\0` path, `argv[0]` = that path's
-    /// address, NULL-terminated `argv`/`envp`, then `MPOS_FAULT_OK`.
+    /// Every hand-encoded instruction, pinned to the encoding the *assembler*
+    /// produces - so a helper whose bit pattern is wrong fails here rather than
+    /// three minutes later on the wire, where it reads as "the program died".
+    ///
+    /// The expected words were taken from `llvm-mc --triple=aarch64
+    /// -show-encoding` over the same mnemonics. Each one below is a bug that
+    /// this file shipped and this test would have caught:
+    ///
+    /// * `udiv` without bits 15..10 = `0b000010` is not a divide at all, and the
+    ///   CPU answered an unknown-reason exception mid-print;
+    /// * `msub` without bit 15 assembles `madd` - the reverse operation;
+    /// * `strb` built on `0x3E000000` is a *SIMD* store at a register offset, so
+    ///   it wrote `b2` to `[x21 + x0]` instead of the digit to `[x21]`;
+    /// * `cmp` built on `0xB100001F` decodes as `cmn`.
     #[test]
-    fn the_launcher_pages_then_echoes_then_execs() {
-        let e = exec_launcher_init_elf();
+    fn every_hand_encoded_instruction_is_what_the_assembler_emits() {
+        assert_eq!(udiv(2, 20, 1), 0x9ac1_0a82, "udiv x2, x20, x1");
+        assert_eq!(msub(20, 2, 1, 20), 0x9b01_d054, "msub x20, x2, x1, x20");
+        assert_eq!(strb_at(2, 21), 0x3900_02a2, "strb w2, [x21]");
+        assert_eq!(cmp_imm(0, 0), 0xf100_001f, "cmp x0, #0");
+        assert_eq!(add_imm(2, 20, 48), 0x9100_c282, "add x2, x20, #48");
+        assert_eq!(movz(8, 64), 0xd280_0808, "movz x8, #64");
+        assert_eq!(movk(1, 64), 0xf2a0_0801, "movk x1, #64, lsl #16");
+        assert_eq!(movn(0, 99), 0x9280_0c60, "movn x0, #99");
+        assert_eq!(
+            movn(0, AT_FDCWD),
+            0x9280_0c60,
+            "the AT_FDCWD materialisation is `mov x0, #-100`"
+        );
+        assert_eq!(movreg(19, 0), 0xaa00_03f3, "mov x19, x0");
+        assert_eq!(svc(), 0xd400_0001, "svc #0");
+        assert_eq!(SUB_SP_PAGE, 0xd140_07ff, "sub sp, sp, #0x1000");
+        assert_eq!(STR_X19_SP, 0xf900_03f3, "str x19, [sp]");
+    }
+
+    /// The target writes the fault marker after its demand-paging store, the
+    /// exec marker, forks (`clone`), and its parent reads `/etc/inittab`, prints
+    /// the byte count, then execve's `/musl`. Words: [0]=`sub sp`, [1]=`str
+    /// x19,[sp]`, [2]=`mov x8,#64` (the fault write), [8+6]=`mov x8,#220`
+    /// (clone), the `cbnz` splits parent from child, the parent's probe starts
+    /// with `mov x8,#56` (`openat`, with `AT_FDCWD` in `x0`), and the last word
+    /// is `b .`. Its data carries the three markers, the `/musl` path with
+    /// `argv[0]` pointing at it, the `/etc/inittab` path and the inittab line's
+    /// prefix.
+    #[test]
+    fn the_target_pages_then_writes_then_forks_then_reads() {
+        let e = marker_target_elf();
         assert_loadable(&e);
-        let words = words_of(&e, LAUNCHER_WORDS);
-        assert_eq!(words.len(), LAUNCHER_WORDS);
+        let words = words_of(&e, TARGET_WORDS);
+        assert_eq!(words.len(), TARGET_WORDS);
         assert_eq!(words[0], 0xd14007ff, "sub sp,sp,#0x1000");
         assert_eq!(
             words[1], 0xf90003f3,
             "str x19,[sp] (the demand-paging fault)"
         );
         assert_eq!(words[2], 0xd2800808, "mov x8,#64 (fault-marker write)");
-        assert_eq!(words[8], 0xd28007e8, "mov x8,#63 (read)");
-        assert_eq!(words[14], 0xaa0003e9, "mov x9,x0 (stash n)");
-        assert_eq!(words[27], 0xd2801ba8, "mov x8,#221 (execve)");
-        assert_eq!(words[34], 0xd4000001, "svc (the execve)");
-        assert_eq!(words[35], 0xd2800bc8, "mov x8,#94 (exit_group fallback)");
-        assert_eq!(words[LAUNCHER_WORDS - 1], 0x14000000, "b . (park)");
-
-        let data_file_off = CODE_OFF + LAUNCHER_WORDS * 4;
+        // clone at word 14: `mov x8,#220`.
+        assert_eq!(words[14], movz(8, NR_CLONE), "mov x8,#220 (clone)");
+        // The parent/child split at word 21 jumps to the wait4 at 32.
+        assert_eq!(words[21], cbnz_x0(21, 32), "cbnz x0 -> word 32 (parent)");
+        // The probe's open: `mov x8,#56` is `openat` on aarch64, and the dirfd
+        // it is handed is `AT_FDCWD` - not the path, which is what a reader
+        // written against x86_64's `open` would put there (the bug this pins).
         assert_eq!(
-            &e[data_file_off + 66..data_file_off + 69],
-            b"/t\0",
-            "the exec path"
+            words[39],
+            movz(8, NR_OPENAT),
+            "mov x8,#56 (openat, not open)"
         );
-        let path_addr = VADDR + (data_file_off + 66) as u64;
+        assert_eq!(words[40], movn(0, AT_FDCWD), "mov x0,#-100 (AT_FDCWD)");
         assert_eq!(
-            &e[data_file_off + 72..data_file_off + 80],
-            path_addr.to_le_bytes(),
-            "argv[0] points at the /t path"
+            words[41],
+            movz(
+                1,
+                (VADDR + (CODE_OFF + TARGET_WORDS * 4) as u64 + 80) as u32 & 0xffff
+            ),
+            "movz x1, #lo(&/etc/inittab) - the path is the second argument"
         );
-        assert_eq!(
-            &e[data_file_off + 80..data_file_off + 88],
-            &[0u8; 8],
-            "argv is NULL-terminated"
-        );
-        assert_eq!(
-            &e[data_file_off + 88..data_file_off + 96],
-            &[0u8; 8],
-            "envp is a lone NULL"
-        );
-        assert_eq!(
-            &e[data_file_off + 96..],
-            FAULT_MARKER,
-            "the fault marker the demand-paged store writes"
-        );
-    }
-
-    /// The target writes the exec marker, forks (`clone`), and its parent `execve`s
-    /// `/musl`: word 0 is the write, word 6 is `mov x8,#220` (clone), word 13 is the
-    /// `cbnz` to the parent at word 24 (`imm19 = 11`), word 31 is `mov x8,#221`
-    /// (execve), the last is `b .`. Its data carries `MPOS_EXEC_OK`, `MPOS_FORK_OK`,
-    /// and the `/musl` path with `argv[0]` pointing at it.
-    #[test]
-    fn the_target_writes_then_forks() {
-        let e = marker_target_elf();
-        assert_loadable(&e);
-        let words = words_of(&e, TARGET_WORDS);
-        assert_eq!(words.len(), TARGET_WORDS);
-        assert_eq!(words[0], 0xd2800808, "mov x8,#64 (write exec marker)");
-        assert_eq!(words[6], 0xd2801b88, "mov x8,#220 (clone)");
-        assert_eq!(words[13], 0xb5000160, "cbnz x0 -> word 24 (parent)");
-        assert_eq!(words[31], 0xd2801ba8, "mov x8,#221 (execve /musl)");
-        assert_eq!(words[TARGET_WORDS - 1], 0x14000000, "b . (parent park)");
+        // The openat guard: `cmp x0,#0` then `b.lt` to the newline write at 95.
+        assert_eq!(words[46], cmp_imm(0, 0), "cmp x0,#0 (the fd sign test)");
+        assert_eq!(words[47], b_lt(46, 95), "b.lt -> word 95 (skip the probe)");
+        // The read guard branches to the same place.
+        assert_eq!(words[55], cmp_imm(0, 0), "cmp x0,#0 (the length sign test)");
+        assert_eq!(words[56], b_lt(55, 95), "b.lt -> word 95");
+        // A digit place: word 69 loads the weight 1000 into x1.
+        assert_eq!(words[69], movz(1, 1000), "movz x1,#1000 (thousands)");
+        // The last word is the fallback park.
+        assert_eq!(words[TARGET_WORDS - 1], 0x1400_0000, "b . (parent park)");
 
         let data_file_off = CODE_OFF + TARGET_WORDS * 4;
         assert_eq!(
-            &e[data_file_off..data_file_off + EXEC_MARKER.len()],
-            EXEC_MARKER,
-            "the exec marker at the first write's x1"
+            &e[data_file_off..data_file_off + FAULT_MARKER.len()],
+            FAULT_MARKER,
+            "the fault marker at the first write's x1"
         );
         assert_eq!(
-            &e[data_file_off + 13..data_file_off + 13 + FORK_MARKER.len()],
+            &e[data_file_off + 14..data_file_off + 14 + EXEC_MARKER.len()],
+            EXEC_MARKER,
+            "the exec marker at the second write's x1"
+        );
+        assert_eq!(
+            &e[data_file_off + 27..data_file_off + 27 + FORK_MARKER.len()],
             FORK_MARKER,
             "the fork marker at the child write's x1"
         );
         assert_eq!(
-            &e[data_file_off + 26..data_file_off + 32],
+            &e[data_file_off + 40..data_file_off + 46],
             b"/musl\0",
             "the execve path in the parent's tail"
         );
-        let musl_path_addr = VADDR + (data_file_off + 26) as u64;
+        let musl_path_addr = VADDR + (data_file_off + 40) as u64;
         assert_eq!(
-            &e[data_file_off + 40..data_file_off + 48],
+            &e[data_file_off + 56..data_file_off + 64],
             musl_path_addr.to_le_bytes(),
             "argv[0] points at the /musl path"
+        );
+        assert_eq!(
+            &e[data_file_off + 80..data_file_off + 80 + INITTAB_PATH.len()],
+            INITTAB_PATH,
+            "the inittab path the probe opens"
+        );
+        assert_eq!(
+            &e[data_file_off + 94..data_file_off + 94 + INITTAB_MARKER.len()],
+            INITTAB_MARKER,
+            "the inittab line's prefix"
+        );
+        assert_eq!(e[data_file_off + 116], b'\n', "the line terminator");
+        // The scratch buffer reaches to the end of the blob, and the digits land
+        // at its last four bytes - inside the mapped segment, not past it.
+        assert_eq!(
+            e.len() - data_file_off,
+            128 + INITTAB_LEN as usize,
+            "the blob is the pad plus the full scratch"
         );
     }
 }
