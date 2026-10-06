@@ -685,7 +685,7 @@ same measurement puts behind `vfs` and so behind `hal` too)**
       runlevel output is `[ ok ]`, and of §13.12's "named, not fixed" list only the two prose-level gaps
       remain (the install writes no `/etc/hostname`, so the prompt says `localhost`, and the machine's
       `/proc/net` rows are the same table the first machine's is) · [~] 9.2 RISC-V support
-- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.17 landed, 13.19–13.30 landed, 13.18 open, 13.2 in progress (§13); the boot-side half is Phase 15 (§15)**
+- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.17 landed, 13.19–13.31 landed, 13.18 open, 13.2 in progress (§13); the boot-side half is Phase 15 (§15)**
   - [x] 13.1 `hal` is arch-neutral: its 14 `target_arch` gates became capability flags
         (`mpos_msi`/`mpos_serial_ring`/`mpos_fpu_trap`/`mpos_segments`/`mpos_console_input`)
         declared per target in `.cargo/config.toml`; `src/hal` `target_arch` is now 0, both
@@ -1616,6 +1616,47 @@ same measurement puts behind `vfs` and so behind `hal` too)**
         `pass=27 fail=0`; x86 gate `pass=158 fail=0 (158 built)` exit 33; the new xtask unit test
         `an_openrc_service_failure_is_named_by_its_own_message` pins the checker against the captured
         failing block, escapes and all; fmt clean.
+  - [x] 13.31 `ptrace` on the second machine, and the two defects that hid behind the gate - the
+        third of Phase 15's named differences, and the one a user found by hand. `dispatch` carried
+        `#[cfg(not(target_arch = "aarch64"))] nr::PTRACE` and `handle_ptrace` the same attribute,
+        read as "the request numbers and `user_regs_struct` are x86_64's". Half true: the request
+        *words* are one protocol (the same numbers in `abi`'s table on both machines), and what is
+        really the machine's is **which slot of the register file a role lives in** - so `abi::uregs`
+        now has two columns (27 words of `user_regs_struct`, 34 of `user_pt_regs`), the handler reads
+        roles rather than names (`RESULT`/`IP`/`STACK` in place of `RAX`/`RIP`/`RSP`),
+        `FPREGS_BYTES` is 512 with the `fxsave` image on one machine and 528 with the
+        `fpsr`/`fpcr` pair swapped on the other, and `AUDIT_ARCH` is the machine's - `strace` refuses
+        a `GET_SYSCALL_INFO` answer whose `arch` is not the one it was built for. The three
+        remaining x86-only names (`UREGS_COUNT`, `uregs_by_name`, and the x86 column itself) are
+        `cfg`-gated with the boot check that reads them.
+        **Two defects came out of the new test, both older than the port.** (1) `PTRACE_PEEKTEXT`/
+        `PEEKDATA` and `PEEKUSER` wrote the word *through* `data` as if it were a buffer, where Linux
+        answers it as the call's result - so `ptrace(PEEKDATA, pid, addr, 0)`, which is the form every
+        libc makes, hit `buffer_ok(0, 8, ...)` and answered `EFAULT`. (2) On aarch64 the syscall
+        **entry** stop's register round-trip put the call's number into the ABI's result slot, and on
+        this machine that slot is `x0` - the call's first argument, not a number register (the number
+        is in `x8`). Because the gate re-reads the arguments out of the frame after the stop, the
+        tracee made its call with the number as `arg0`. Measured: the first syscall after
+        `PTRACE_TRACEME` - a traced `write(2, ...)` - wrote to descriptor 94, and the `_exit` that
+        followed became `exit_group(94)`, so the tracee vanished with its own syscall number as its
+        exit status. The fix is a `Gate` operation that asks the question the slot actually poses
+        (`syscall_entry_result_slot`): the number on x86_64, where `syscall` left it in `rax`, and
+        the frame's own `x0` on aarch64.
+        **Pin.** `user/tests/src/bin/t-ptrace.rs`, on **both** machines - `TRACEME` and the stop it
+        produces, `GET_SYSCALL_INFO` at a signal stop (`NONE`, the machine's `arch`, the tracee's own
+        `ip`/`sp`, which is what `strace`'s startup probe reads and rejects the whole structure over),
+        `SETOPTIONS` and its refusal of an unknown bit, `GETREGSET`/`NT_PRSTATUS` with the `iovec`'s
+        length written back, `PEEKDATA`/`PEEKUSER` answering a word, `SYSCALL` to a boundary stop
+        whose `ENTRY` names the call and whose `EXIT` reports its return value, `CONT` and the
+        tracee's own exit. `strace` itself ships in the second machine's image
+        (`rootfs-aarch64.toml`) and was read back on it: `strace -f -e trace=openat ls /` printed
+        `openat(AT_FDCWD, "/", O_RDONLY|O_LARGEFILE|O_CLOEXEC|O_DIRECTORY) = 3` and `-c` printed its
+        summary table. Also fixed: `t-clone`'s thread wrote its release word (`THREAD_WROTE`) before
+        the two values the reader then reads - a race in the test, invisible until this cut's extra
+        test shifted the timing, and already right in `t-futex`.
+        Measured after: `boot-aarch64` full chain + `INIT_EXITED`; aarch64 sweep `pass=28 fail=0`;
+        x86 gate `pass=159 fail=0 (159 built)` exit 33; `alpine-aarch64` exit 0 at `mpos login:`
+        with no `[ !! ]` line; `depgraph` within the ratchet; fmt clean.
   - [x] 13.19 `reboot(2)` answers Linux's shape on **both** machines - two mechanisms behind one
         symptom, and the symptom was on every aarch64 boot.
         **What was seen.** `mpos: syscall 142 -> ENOSYS`, once, between the kernel's handoff and the

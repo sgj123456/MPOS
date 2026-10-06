@@ -338,6 +338,13 @@ impl crate::hal::Gate for crate::hal::Current {
         [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9]
     }
 
+    unsafe fn syscall_entry_result_slot(_frame: *mut (), nr: usize) -> usize {
+        // The number, which is what this machine's `syscall` instruction left in
+        // the result slot and what a tracer reads there. See the trait's note
+        // for why the other machine cannot answer this way.
+        nr
+    }
+
     unsafe fn set_result(frame: *mut (), value: isize) {
         if frame.is_null() {
             return;

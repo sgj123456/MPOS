@@ -47,9 +47,15 @@ static mut THREAD_PID: i32 = 0;
 /// with `exit`, which ends the thread and not the process.
 extern "C" fn thread_body(_arg: usize) -> ! {
     unsafe {
-        THREAD_WROTE = 42;
+        // The order is the synchronization, not a style: the caller spins on
+        // `THREAD_WROTE`, so it has to be the *last* word written. Measured -
+        // with it first, the caller could leave its spin and read `THREAD_PID`
+        // before this thread reached it, and report `got 0, want <pid>` about a
+        // kernel that had answered correctly (`t-futex` writes its flag last
+        // for the same reason).
         THREAD_TID = lin::gettid() as i32;
         THREAD_PID = lin::getpid() as i32;
+        THREAD_WROTE = 42;
     }
     lin::exit(0)
 }

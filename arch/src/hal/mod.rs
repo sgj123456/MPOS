@@ -702,8 +702,13 @@ pub trait Gate {
     /// As [`Gate::user_ip`].
     unsafe fn user_context(frame: *mut (), rax: usize) -> Option<UserFrame>;
 
-    /// The gate frame read out as the ABI's register file, `rax` in the result
-    /// slot and `tls` as the thread pointer.
+    /// The gate frame read out as the ABI's register file, `result` in the
+    /// result slot and `tls` as the thread pointer.
+    ///
+    /// `result` is what the slot must *show*, which is not one value: at a
+    /// syscall exit it is the call's return value, and at an entry it is
+    /// whatever [`Gate::syscall_entry_result_slot`] answers for the machine.
+    /// The caller decides, because only it knows which moment it is capturing.
     ///
     /// The words are the ones [`UserFrameOps::to_user_regs`] writes, but read
     /// from the frame's own layout rather than through a [`UserFrame`] - which
@@ -716,7 +721,7 @@ pub trait Gate {
     /// As [`Gate::user_ip`], and `out` must be [`ABI_REG_COUNT`] words long.
     ///
     /// [`ABI_REG_COUNT`]: Contexts::ABI_REG_COUNT
-    unsafe fn capture_user_regs(frame: *mut (), rax: usize, tls: usize, out: &mut [u64]);
+    unsafe fn capture_user_regs(frame: *mut (), result: usize, tls: usize, out: &mut [u64]);
 
     /// The inverse of [`Gate::capture_user_regs`]: write a register file back
     /// into the gate frame, and answer the value the gate should return to
@@ -752,6 +757,33 @@ pub trait Gate {
     /// # Safety
     /// As [`Gate::user_ip`].
     unsafe fn syscall_args(frame: *mut ()) -> [usize; 6];
+
+    /// What the ABI's result slot holds at a syscall *entry* stop.
+    ///
+    /// The one place the two machines' register files disagree about a slot a
+    /// tracer reads, and the answer is not a number to write *into* a slot - it
+    /// is what the slot already holds. x86_64's `syscall` instruction leaves the
+    /// call's *number* in `rax`, which is also the result slot, so a tracer
+    /// reading the file at an entry stop finds the number there and this answers
+    /// `nr`. aarch64 carries the number in `x8` instead, and its result slot is
+    /// `x0` - the call's *first argument*. Answering `nr` there would not fill a
+    /// slot with the number, it would replace a live argument, and because the
+    /// gate re-reads the arguments out of the frame after the stop, the tracee
+    /// would make its call with the number as `arg0`.
+    ///
+    /// So a machine whose result slot is not the number register answers what
+    /// the frame already holds, which is why this is handed the frame rather
+    /// than being a constant.
+    ///
+    /// Measured on the second machine: with the number written into `x0`, the
+    /// first traced syscall after `PTRACE_TRACEME` - the test's own `write(2,
+    /// ...)` - became a write to descriptor 94, and the `_exit` that followed
+    /// became `exit_group(94)`, so the tracee vanished with its own syscall
+    /// number as its exit status.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`], for a frame that may be null.
+    unsafe fn syscall_entry_result_slot(frame: *mut (), nr: usize) -> usize;
 
     /// Put a call's result in the frame's result slot.
     ///
@@ -1445,6 +1477,17 @@ pub unsafe fn restore_user_regs(frame: *mut (), regs: &[u64], tls: &mut usize) -
 #[inline]
 pub unsafe fn syscall_args(frame: *mut ()) -> [usize; 6] {
     unsafe { <Current as Gate>::syscall_args(frame) }
+}
+
+/// What the ABI's result slot holds at a syscall entry stop. See
+/// [`Gate::syscall_entry_result_slot`] - the answer is what the slot already
+/// holds on a machine whose number register is somewhere else.
+///
+/// # Safety
+/// As [`Gate::user_ip`], for a frame that may be null.
+#[inline]
+pub unsafe fn syscall_entry_result_slot(frame: *mut (), nr: usize) -> usize {
+    unsafe { <Current as Gate>::syscall_entry_result_slot(frame, nr) }
 }
 
 /// Put a call's result in the frame's result slot. See [`Gate::set_result`].

@@ -815,11 +815,16 @@ pub(crate) fn stop_status(sig: u8, event: u32) -> i32 {
 /// The status word `WIFCONTINUED` decodes: all ones.
 pub(crate) const CONTINUED_STATUS: i32 = 0xffff;
 
-/// `struct user_regs_struct` on x86_64, as `PTRACE_GETREGS` fills it.
+/// The register file `PTRACE_GETREGS` fills, x86_64 column: `struct
+/// user_regs_struct`.
 ///
 /// The order is the ABI's, not a choice: the structure is what `strace` and
 /// `gdb` read `rip`, `rsp` and `orig_rax` out of by offset, and a field in
 /// the wrong slot is a debugger looking at the wrong register.
+///
+/// The machine keeps its own copy of this table (`arch/x86_64/context.rs`, bare
+/// metal only); [`uregs_by_name`] is what lets the boot prove the two agree.
+#[cfg(not(target_arch = "aarch64"))]
 pub(crate) mod uregs {
     pub const R15: usize = 0;
     pub const R14: usize = 1;
@@ -850,11 +855,63 @@ pub(crate) mod uregs {
     pub const GS: usize = 26;
     pub const COUNT: usize = 27;
     pub const BYTES: usize = COUNT * 8;
+
+    /// The syscall's result: the slot a tracer rewrites to make a call return
+    /// something else, and the one `PTRACE_GET_SYSCALL_INFO` reads an exit
+    /// stop's return value out of.
+    pub const RESULT: usize = RAX;
+    /// The address of the instruction the task runs next.
+    pub const IP: usize = RIP;
+    /// The task's stack pointer.
+    pub const STACK: usize = RSP;
+}
+
+/// The register file `PTRACE_GETREGS` fills, aarch64 column: `struct
+/// user_pt_regs`.
+///
+/// Thirty-one `x` registers, then `sp`, `pc` and `pstate` - which is the trap
+/// frame this machine's vector saves, field for field, so
+/// `hal::Contexts::ABI_REG_COUNT` is 34 here and the conversion between the
+/// frame and this structure is an identity rather than a rearrangement.
+///
+/// Named at this end for the same reason the x86_64 column is: the ptrace
+/// *handler* is compiled for whatever machine it is built for and reads slots
+/// by role, and this table is what says which slot a role names. The array is
+/// positional and the ABI calls its elements `x0`..`x30`, so only the ends of
+/// the numbered run are worth spelling; the three named registers after it are
+/// not optional, because `pc` and `sp` are what the two role names below need.
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod uregs {
+    pub const X0: usize = 0;
+    pub const X30: usize = 30;
+    pub const SP: usize = 31;
+    pub const PC: usize = 32;
+    pub const PSTATE: usize = 33;
+    pub const COUNT: usize = 34;
+    pub const BYTES: usize = COUNT * 8;
+
+    /// The syscall's result. `x0` here rather than a dedicated register: this
+    /// ABI returns in the first argument register, and `PTRACE_SETREGS`'s idea
+    /// of "make the call answer something else" is the same word the trap gate
+    /// reads its result out of.
+    pub const RESULT: usize = X0;
+    /// The address of the instruction the task runs next.
+    pub const IP: usize = PC;
+    /// The task's stack pointer.
+    pub const STACK: usize = SP;
 }
 
 /// The ABI's register-file size, for the boot check that the machine's copy of
 /// the field order agrees with this one. See
 /// [`uregs_by_name`](self::uregs_by_name) for why the two are duplicated.
+///
+/// x86_64's alone, like [`uregs_by_name`]: the check that reads both is that
+/// machine's, because that is the machine whose field order is a *choice*
+/// (`user_regs_struct` is not the trap frame). On aarch64 the structure and the
+/// frame are the same 34 words in the same order, and what keeps that true is
+/// the offset/size assertion in `arch/aarch64/context.rs` rather than a
+/// comparison against a second table.
+#[cfg(not(target_arch = "aarch64"))]
 pub const UREGS_COUNT: usize = uregs::COUNT;
 
 /// The index `name` occupies in `user_regs_struct`, for the boot check in
@@ -864,6 +921,7 @@ pub const UREGS_COUNT: usize = uregs::COUNT;
 /// The two tables cannot share a definition - this one is host-compiled (its
 /// tests are host tests) and the machine's is bare-metal only - so the check is
 /// what keeps them from drifting, rather than a claim that duplication is free.
+#[cfg(not(target_arch = "aarch64"))]
 pub fn uregs_by_name(name: &str) -> Option<usize> {
     Some(match name {
         "R15" => uregs::R15,
@@ -915,7 +973,7 @@ pub(crate) fn read_user_regs(at: usize) -> [u64; uregs::COUNT] {
     regs
 }
 
-/// `sizeof(struct user_fpregs_struct)` on x86_64: the floating-point register
+/// `sizeof(struct user_fpregs_struct)` on x86_64 - the floating-point register
 /// file `PTRACE_GETFPREGS` and `PTRACE_SETFPREGS` move.
 ///
 /// It is 512 rather than "some sensible size" because on this architecture the
@@ -923,24 +981,102 @@ pub(crate) fn read_user_regs(at: usize) -> [u64; uregs::COUNT] {
 /// eight x87 registers, `MXCSR` and the sixteen XMM registers, in the order the
 /// instruction writes them. That is what lets a tracer's buffer be filled
 /// straight from, and stored straight into, the block a task carries.
+#[cfg(not(target_arch = "aarch64"))]
 pub(crate) const FPREGS_BYTES: usize = 512;
+
+/// `sizeof(struct user_fpsimd_state)` on aarch64 - the same file by another
+/// name.
+///
+/// ```text
+///    0  __uint128_t vregs[32]   512 bytes: the 32 SIMD/FP registers
+///  512  __u32 fpsr
+///  516  __u32 fpcr
+///  520  __u32 __reserved[2]
+/// ```
+///
+/// The size is the *same* 528 the context switch moves, which is why the buffer
+/// can be one size on both sides of the conversion - but the tail is not the
+/// same: the switch's block keeps `FPCR` first (`arch/aarch64/context.rs`
+/// writes it at 512 and `FPSR` at 520), while this structure keeps `FPSR`
+/// first and then two reserved words. So the conversion below is a copy of the
+/// 512 register bytes and a *swap* of the pair, not a copy of the whole block -
+/// the same relationship the signal frame already has with the switch's block
+/// (`arch/aarch64/signal.rs`'s `preserve_fpsimd`/`restore_fpsimd`, written for
+/// the identical reason).
+#[cfg(target_arch = "aarch64")]
+pub(crate) const FPREGS_BYTES: usize = 528;
+
+/// Where the two named registers sit in the block the context switch moves.
+#[cfg(target_arch = "aarch64")]
+const FPCR_IN_SAVED: usize = 512;
+#[cfg(target_arch = "aarch64")]
+const FPSR_IN_SAVED: usize = 520;
+/// And where they sit in the ABI's structure.
+#[cfg(target_arch = "aarch64")]
+const FPSR_IN_ABI: usize = 512;
+#[cfg(target_arch = "aarch64")]
+const FPCR_IN_ABI: usize = 516;
+/// The ABI's two `__u32 __reserved` words, which are padding and have no
+/// counterpart in the block the switch moves.
+#[cfg(target_arch = "aarch64")]
+const FPREGS_ABI_TAIL: usize = FPCR_IN_ABI + 4;
 
 /// The floating-point image, for a tracer to read. Word at a time and unaligned
 /// for the same reason the register file is: the buffer belongs to the tracer,
 /// and its alignment is whatever the tracer chose.
 pub(crate) fn write_user_fpregs(at: usize, bytes: &[u8; FPREGS_BYTES]) {
+    #[cfg(not(target_arch = "aarch64"))]
     for (word, chunk) in bytes.chunks_exact(8).enumerate() {
         let value = u64::from_le_bytes(chunk.try_into().unwrap());
         unsafe { ((at + word * 8) as *mut u64).write_unaligned(value) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // The registers themselves are the same 512 bytes in the same order on
+        // both sides - `vregs[i]` and `q[i]` are one register under two names.
+        for (word, chunk) in bytes[..512].chunks_exact(8).enumerate() {
+            let value = u64::from_le_bytes(chunk.try_into().unwrap());
+            unsafe { ((at + word * 8) as *mut u64).write_unaligned(value) };
+        }
+        // The pair at the end is not, and neither is the tail: the structure
+        // has `fpcr` after `fpsr` and eight bytes of reserved after both, so
+        // the words the caller's buffer already held there must be cleared
+        // rather than left as a copy of the switch's block.
+        let fpcr = u32::from_le_bytes(bytes[FPCR_IN_SAVED..FPCR_IN_SAVED + 4].try_into().unwrap());
+        let fpsr = u32::from_le_bytes(bytes[FPSR_IN_SAVED..FPSR_IN_SAVED + 4].try_into().unwrap());
+        unsafe {
+            ((at + FPSR_IN_ABI) as *mut u32).write_unaligned(fpsr);
+            ((at + FPCR_IN_ABI) as *mut u32).write_unaligned(fpcr);
+            core::ptr::write_bytes(
+                (at + FPREGS_ABI_TAIL) as *mut u8,
+                0,
+                FPREGS_BYTES - FPREGS_ABI_TAIL,
+            );
+        }
     }
 }
 
 /// And the reading half. The caller has checked the buffer is readable.
 pub(crate) fn read_user_fpregs(at: usize) -> [u8; FPREGS_BYTES] {
     let mut bytes = [0u8; FPREGS_BYTES];
+    #[cfg(not(target_arch = "aarch64"))]
     for (word, chunk) in bytes.chunks_exact_mut(8).enumerate() {
         let value = unsafe { ((at + word * 8) as *const u64).read_unaligned() };
         chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        for (word, chunk) in bytes[..512].chunks_exact_mut(8).enumerate() {
+            let value = unsafe { ((at + word * 8) as *const u64).read_unaligned() };
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        // Back into the switch's order, where `FPCR` comes first. The eight
+        // reserved bytes are not read at all: they are the ABI's padding, and
+        // the block has nothing for them to mean.
+        let fpsr = unsafe { ((at + FPSR_IN_ABI) as *const u32).read_unaligned() };
+        let fpcr = unsafe { ((at + FPCR_IN_ABI) as *const u32).read_unaligned() };
+        bytes[FPCR_IN_SAVED..FPCR_IN_SAVED + 4].copy_from_slice(&fpcr.to_le_bytes());
+        bytes[FPSR_IN_SAVED..FPSR_IN_SAVED + 4].copy_from_slice(&fpsr.to_le_bytes());
     }
     bytes
 }
@@ -951,7 +1087,7 @@ pub(crate) fn read_user_fpregs(at: usize) -> [u8; FPREGS_BYTES] {
 /// ```text
 ///   0  __u8  op                  1 = entry, 2 = exit
 ///   1  __u8  pad[3]
-///   4  __u32 arch                AUDIT_ARCH_X86_64
+///   4  __u32 arch                AUDIT_ARCH_* (the machine's, [`AUDIT_ARCH`])
 ///   8  __u64 instruction_pointer
 ///  16  __u64 stack_pointer
 ///  24  union {
@@ -970,9 +1106,18 @@ pub(crate) const SYSCALL_INFO_BYTES: usize = 80;
 pub(crate) const SYSCALL_INFO_NONE: u8 = 0;
 pub(crate) const SYSCALL_INFO_ENTRY: u8 = 1;
 pub(crate) const SYSCALL_INFO_EXIT: u8 = 2;
-/// `AUDIT_ARCH_X86_64` - what `syscall_get_arch()` answers on this machine,
-/// and what the `arch` field carries.
-pub(crate) const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+/// `AUDIT_ARCH_X86_64` / `AUDIT_ARCH_AARCH64` - what `syscall_get_arch()`
+/// answers on the machine, and what the `arch` field of the structure carries.
+///
+/// It is the machine's, not a constant of the protocol: a tracer reads it to
+/// decide whether the syscall numbers in front of it are its own, and `strace`
+/// refuses a `GET_SYSCALL_INFO` answer whose `arch` is not the one it was built
+/// for. Both values are `EM_* | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE` out of
+/// `linux/audit.h` - `EM_X86_64` is 62 and `EM_AARCH64` is 183.
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const AUDIT_ARCH: u32 = 0xC000_003E;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const AUDIT_ARCH: u32 = 0xC000_00B7;
 
 /// Write the `struct ptrace_syscall_info` describing a syscall boundary.
 ///
@@ -996,7 +1141,7 @@ pub(crate) fn write_syscall_info(
         } else {
             SYSCALL_INFO_EXIT
         });
-        ((at + 4) as *mut u32).write_unaligned(AUDIT_ARCH_X86_64);
+        ((at + 4) as *mut u32).write_unaligned(AUDIT_ARCH);
         ((at + 8) as *mut u64).write_unaligned(ip);
         ((at + 16) as *mut u64).write_unaligned(sp);
         if entry {
@@ -3994,7 +4139,10 @@ mod tests {
     #[test]
     fn ptrace_syscall_info_has_the_layout_the_header_declares() {
         assert_eq!(SYSCALL_INFO_BYTES, 80);
-        assert_eq!(AUDIT_ARCH_X86_64, 0xC000_003E);
+        // The machine's own arch word - `AUDIT_ARCH_X86_64` is what this test
+        // binary was built for, and the value `strace` reads to decide whether
+        // the numbers in front of it are its own.
+        assert_eq!(AUDIT_ARCH, 0xC000_003E);
 
         let mut buffer = [0u8; SYSCALL_INFO_BYTES + 3];
         let base = buffer.as_mut_ptr() as usize + 3;
@@ -4012,7 +4160,7 @@ mod tests {
         assert_eq!(buffer[3], SYSCALL_INFO_ENTRY);
         assert_eq!(
             u32::from_le_bytes(buffer[3 + 4..3 + 8].try_into().unwrap()),
-            AUDIT_ARCH_X86_64
+            AUDIT_ARCH
         );
         assert_eq!(
             u64::from_le_bytes(buffer[3 + 8..3 + 16].try_into().unwrap()),

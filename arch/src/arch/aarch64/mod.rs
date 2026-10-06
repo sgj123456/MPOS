@@ -2634,6 +2634,20 @@ impl crate::hal::Gate for crate::hal::Current {
         ]
     }
 
+    unsafe fn syscall_entry_result_slot(frame: *mut (), _nr: usize) -> usize {
+        if frame.is_null() {
+            return 0;
+        }
+        // SAFETY: the caller's contract.
+        let frame = unsafe { &*(frame as *const context::UserFrame) };
+        // `x0`, unchanged: it is this call's first argument, and the number the
+        // trait's `nr` names is in `x8` - a register this file already carries,
+        // so there is nothing to inject. Writing `nr` here would replace a live
+        // argument and the discharge below re-reads the arguments out of the
+        // frame, so the tracee would make its call with the number as `arg0`.
+        frame.x[0] as usize
+    }
+
     unsafe fn set_result(frame: *mut (), value: isize) {
         if frame.is_null() {
             return;

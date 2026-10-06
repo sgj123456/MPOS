@@ -43,7 +43,19 @@ base_packages = []
 # above, and nothing else is needed to reach a login prompt. `e2fsprogs` and
 # `dosfstools` (the x86_64 base) are absent because this machine's userland does
 # not make filesystems - the build does, on the host.
-extra_packages = ["alpine-conf", "busybox-suid"]
+#
+# `strace` is here because it is the tool this machine's ABI was measured with
+# and the one that found what was missing: `ptrace` answers on the second
+# machine since §13.31, and a tracer is what proves it from the syscall side
+# rather than from a test that could agree with the kernel about a wrong shape.
+# Read back on the machine through this image:
+#
+#     strace -f -e trace=openat ls /
+#     openat(AT_FDCWD, "/", O_RDONLY|O_LARGEFILE|O_CLOEXEC|O_DIRECTORY) = 3
+#
+# It is a debugging tool rather than part of the boot - no service needs it, and
+# the boot reaches `login:` without it. It weighs 1.3 MiB in a 256 MiB image.
+extra_packages = ["alpine-conf", "busybox-suid", "strace"]
 
 # The machine the guest is: its name, its clock and its logins.
 [system]

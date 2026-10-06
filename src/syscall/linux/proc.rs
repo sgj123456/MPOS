@@ -488,21 +488,24 @@ fn finish_wait(id: TaskId, code: isize, status: usize, from_user: bool) -> isize
 /// `hal`, which is the only layer that knows which slot of the gate frame
 /// holds which register.
 ///
-/// `rax` is passed in rather than read: at a syscall entry the frame's `rax`
-/// slot holds the call's number, and at an exit it holds that *same* number,
-/// because the gate writes the result into the slot only after the dispatch
-/// has returned. The caller is the only one that knows which value belongs in
-/// the result slot.
+/// `result` is passed in rather than read: it is the value the ABI's result
+/// slot must *show* at the stop being taken. At a syscall exit that is the
+/// call's return value, which the gate has not written into the frame yet; at
+/// an entry it is whatever the machine answers for that moment
+/// ([`crate::hal::syscall_entry_result_slot`]) - the call's number on x86_64,
+/// where `syscall` left it in `rax`, and the first argument on aarch64, where
+/// the number is in `x8` and the slot was never the number's to begin with.
+/// The caller is the only one that knows which of those it is holding.
 ///
 /// The file is written into a zeroed buffer, so the slots the machine leaves
 /// alone - the segment registers long mode ignores, and the user GS base this
 /// kernel never sets - read as the zero the CPU would ignore anyway.
-fn capture_frame(regs_ptr: *mut (), rax: usize) -> AbiRegs {
+fn capture_frame(regs_ptr: *mut (), result: usize) -> AbiRegs {
     let mut regs = [0u64; crate::hal::ABI_REG_COUNT];
     // SAFETY: the caller hands the gate's own frame for this task, which is the
     // contract `hal::capture_user_regs` documents.
     unsafe {
-        crate::hal::capture_user_regs(regs_ptr, rax, crate::sched::current_tls(), &mut regs);
+        crate::hal::capture_user_regs(regs_ptr, result, crate::sched::current_tls(), &mut regs);
     }
     regs
 }
@@ -558,7 +561,14 @@ pub(crate) fn syscall_entry_stop(
         return args;
     };
     let (ip, sp) = (ctx.ip() as u64, ctx.sp() as u64);
-    let mut regs = capture_frame(regs_ptr, nr as usize);
+    // What the ABI's result slot must read at *this* moment, which is not the
+    // number on both machines: see `Gate::syscall_entry_result_slot`. Asking the
+    // machine rather than writing `nr` here is what keeps the tracee's first
+    // argument - the same slot on aarch64 - from being replaced by the call's
+    // number, a substitution the discharge below would then make the call with.
+    // SAFETY: the same gate frame `ctx` came from.
+    let slot = unsafe { crate::hal::syscall_entry_result_slot(regs_ptr, nr as usize) };
+    let mut regs = capture_frame(regs_ptr, slot);
     let wide = args.map(|arg| arg as u64);
     crate::sched::stop_at_syscall(true, &mut regs, nr, &wide, ip, sp);
     apply_frame(regs_ptr, &regs);
@@ -616,8 +626,17 @@ fn read_iovec(at: usize) -> Option<(usize, usize)> {
 /// call, `PTRACE_ATTACH` writes it from here and stops the target, and from then
 /// on every syscall boundary and every signal in the tracee's life arrives here
 /// as a `wait(2)` event.
+///
+/// Served on both machines, and the gate it used to carry was the stale kind.
+/// What the request words name is one protocol (`abi`'s table is the same
+/// numbers on both), and the only part that is really the machine's is *which
+/// slot of the register file a role lives in* - the result, the instruction
+/// pointer, the stack pointer - which `abi::uregs` answers per column
+/// (`RESULT`/`IP`/`STACK`). Everything else here reads the target through the
+/// scheduler (`trace_regs`, `set_trace_regs`, `read_user_of`), and both machines
+/// implement `hal::capture_user_regs`/`restore_user_regs`, so nothing below
+/// names a register.
 #[allow(clippy::too_many_lines)]
-#[cfg(not(target_arch = "aarch64"))]
 pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (request, pid, addr, data) = (args[0], args[1] as isize, args[2], args[3]);
     let me = crate::sched::current();
@@ -679,19 +698,26 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         // A word out of the tracee's memory. `PEEKTEXT` and `PEEKDATA` are the
         // same request to a machine without separate I and D spaces, which is
         // every machine this kernel runs on.
+        //
+        // The word *is* the return value. `data` is not a buffer this call
+        // fills, which is why a tracer's `ptrace` binding has a variadic shape
+        // and why a caller reads the result rather than passing somewhere to put
+        // it: measured, the version that wrote to `*(u64 *)data` answered
+        // `EFAULT` to the `ptrace(PEEKDATA, pid, addr, 0)` every libc actually
+        // makes, because zero is not a writable address.
         abi::PTRACE_PEEKTEXT | abi::PTRACE_PEEKDATA => {
             let Some(root) = crate::sched::space_root_of(id) else {
                 return err::ESRCH;
             };
-            if !buffer_ok(data, 8, true, from_user) {
-                return err::EFAULT;
-            }
             let mut word = [0u8; 8];
             if !crate::sched::read_user_of(root, addr, &mut word) {
                 return err::EIO;
             }
-            unsafe { (data as *mut u64).write_unaligned(u64::from_le_bytes(word)) };
-            0
+            // Signed, because that is the width the ABI answers with and the
+            // dispatcher carries; a word whose top bit is set is a negative
+            // `long` to the caller, which is Linux's own behaviour and why a
+            // tracer checks `errno` rather than the sign.
+            i64::from_le_bytes(word) as isize
         }
         // And the writing half. The value arrives in `data` by value, not
         // through a pointer - one of the few places `ptrace`'s arguments do not
@@ -706,8 +732,9 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             0
         }
         // The `user` structure's register area. `addr` is a *byte offset* into
-        // it, and on x86_64 the registers are its first member, so an offset
-        // inside the register file is the only one that names anything here.
+        // it, and on both machines the register file is that structure's first
+        // member (`user_regs_struct` here, `user_pt_regs` there), so an offset
+        // inside the register file is the only one that names anything.
         abi::PTRACE_PEEKUSER | abi::PTRACE_POKEUSER => {
             // `addr` is a caller-supplied byte offset; adding the 8-byte word
             // length must not wrap, or a huge offset slips past the bound here
@@ -723,11 +750,9 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
                 return err::ESRCH;
             };
             if request == abi::PTRACE_PEEKUSER {
-                if !buffer_ok(data, 8, true, from_user) {
-                    return err::EFAULT;
-                }
-                unsafe { (data as *mut u64).write_unaligned(regs[addr / 8]) };
-                return 0;
+                // And this one answers the same way `PEEKDATA` does: the word is
+                // the result, not a value written through a pointer.
+                return regs[addr / 8] as isize;
             }
             regs[addr / 8] = data as u64;
             if crate::sched::set_trace_regs(id, &regs) {
@@ -767,31 +792,39 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             let Some((base, len)) = read_iovec(data) else {
                 return err::EFAULT;
             };
-            let room = len.min(abi::uregs::BYTES);
-            if room < abi::uregs::BYTES {
+            if len < abi::uregs::BYTES {
                 // A short buffer is not a request for a short answer: the
                 // register set is one structure, and half of it is a tracer
-                // acting on registers it did not read.
+                // acting on registers it did not read. (Linux truncates to what
+                // the caller offered; refusing is the stricter reading of the
+                // same rule and the one a tracer cannot mistake.)
                 return err::EIO;
             }
             if request == abi::PTRACE_GETREGSET {
                 let Some(regs) = crate::sched::trace_regs(id) else {
                     return err::ESRCH;
                 };
-                if !buffer_ok(base, room, true, from_user) {
+                if !buffer_ok(base, abi::uregs::BYTES, true, from_user) {
                     return err::EFAULT;
                 }
                 abi::write_user_regs(base, &regs);
-                return 0;
+            } else {
+                if !buffer_ok(base, abi::uregs::BYTES, false, from_user) {
+                    return err::EFAULT;
+                }
+                if !crate::sched::set_trace_regs(id, &abi::read_user_regs(base)) {
+                    return err::ESRCH;
+                }
             }
-            if !buffer_ok(base, room, false, from_user) {
+            // The length that was actually moved goes back into the caller's
+            // `iovec`, the way Linux leaves it: it is how a tracer tells a full
+            // answer from a truncated one, and a kernel that left the field
+            // untouched would be answering a question the caller cannot read.
+            if !buffer_ok(data, 16, true, from_user) {
                 return err::EFAULT;
             }
-            if crate::sched::set_trace_regs(id, &abi::read_user_regs(base)) {
-                0
-            } else {
-                err::ESRCH
-            }
+            unsafe { ((data + 8) as *mut u64).write_unaligned(abi::uregs::BYTES as u64) };
+            0
         }
         // The syscall this stop is a boundary of. `addr` is the size of the
         // buffer at `data` and not an address - the other place `ptrace`'s
@@ -810,9 +843,9 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
                 Some((entry, nr, call_args, ip, sp)) => {
                     // At an exit stop the result is in the saved register file,
                     // where `syscall_exit_stop` put it - so a tracer that
-                    // rewrote `rax` sees its own value here too.
+                    // rewrote the result slot sees its own value here too.
                     let ret = crate::sched::trace_regs(id)
-                        .map_or(0, |regs| regs[abi::uregs::RAX] as i64)
+                        .map_or(0, |regs| regs[abi::uregs::RESULT] as i64)
                         as isize;
                     abi::write_syscall_info(
                         data,
@@ -847,7 +880,7 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
                     // stop away from reporting every return value as the *next*
                     // call's number - which is exactly what it did.
                     let (ip, sp) = crate::sched::trace_regs(id).map_or((0, 0), |regs| {
-                        (regs[abi::uregs::RIP], regs[abi::uregs::RSP])
+                        (regs[abi::uregs::IP], regs[abi::uregs::STACK])
                     });
                     abi::write_syscall_info(data, true, 0, &[0; 6], ip, sp, 0);
                     unsafe { (data as *mut u8).write_unaligned(abi::SYSCALL_INFO_NONE) };
@@ -979,9 +1012,11 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         }
         // The floating-point register file. The state exists per task like the
         // integer one does - it has to, or two programs would share one physical
-        // register file - and on x86_64 the ABI's `user_fpregs_struct` *is* the
-        // 512-byte `fxsave` image, so what a tracer gets here is the same block
-        // the context switch moves.
+        // register file - and what a tracer gets here is the same block the
+        // context switch moves, spelled the way each machine's ABI spells it:
+        // on x86_64 `user_fpregs_struct` *is* the 512-byte `fxsave` image, while
+        // aarch64's `user_fpsimd_state` is the switch's 528 bytes with the
+        // `fpsr`/`fpcr` pair in the other order (`abi`'s conversion says where).
         //
         // The size is not a parameter the way it is for `GET_SYSCALL_INFO`: that
         // structure has a union in it whose length the caller chooses, while

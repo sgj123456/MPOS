@@ -290,14 +290,16 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
         nr::TKILL => proc::handle_kill(args),
         // `ptrace` and its bulk-memory relatives: one task observing another.
         // They are in `proc` because everything they need - the task table, the
-        // register frames, the stops - is the process machinery's. The bulk
-        // pair and the signal wait run on both machines: none of them consults
-        // a register frame, so `rt_sigtimedwait` needs only the pending set and
-        // the generic `siginfo_t`, and `process_vm_*` reaches the target's
-        // memory through the scheduler. `ptrace` itself is still the first
-        // machine's - its request numbers and the structure `PTRACE_GETREGS`
-        // fills are x86_64's.
-        #[cfg(not(target_arch = "aarch64"))]
+        // register frames, the stops - is the process machinery's. All of them
+        // run on both machines. The bulk pair and the signal wait never
+        // consulted a register frame (`rt_sigtimedwait` needs only the pending
+        // set and the generic `siginfo_t`, `process_vm_*` reaches the target's
+        // memory through the scheduler), and `ptrace` itself no longer names one
+        // either: the request words are one protocol, and which *slot* a role
+        // lives in is `abi::uregs`'s per-column answer
+        // (`RESULT`/`IP`/`STACK`). Un-gating it is what makes `strace` work on
+        // the second machine - its very first act is `PTRACE_TRACEME`, which
+        // used to answer `ENOSYS` here.
         nr::PTRACE => proc::handle_ptrace(args, from_user),
         nr::PROCESS_VM_READV => proc::handle_process_vm_readv(args, from_user),
         nr::PROCESS_VM_WRITEV => proc::handle_process_vm_writev(args, from_user),
