@@ -212,7 +212,9 @@ and `F_GETLK`, which `rustix` binds nowhere, `fcntl_lock` being `F_SETLK`/`F_SET
 (`t-filelock`); a call whose
 wrapper is *not* the syscall the ABI promises (or throws its result away) — `rustix::io::dup2`
 substituting `dup3` on aarch64, `rustix::io::close` returning nothing (`t-dup2`, and `t-filelock`
-for the same clause); and a call whose wrapper binds
+for the same clause), and musl's `fstat`, which is not a passthrough for a buffer the kernel would
+refuse (it faults in userspace where the raw call answers `EFAULT`, so `t-fstat` goes raw for that
+one claim); and a call whose wrapper binds
 the right syscall but whose *shape* cannot express the claim — `rustix::io::dup3` takes its target as
 a non-aliasing `&mut OwnedFd` (so `oldfd == newfd` is unreachable through it) and returns `()` rather
 than the new number, which is what sends `t-dup3` to `libc::dup3`; the same shape again,

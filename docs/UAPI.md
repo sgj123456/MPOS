@@ -399,6 +399,17 @@ the commit bodies), and each moved its pin in the same commit.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **An absolute path does not make the `*at` family ignore its dirfd.** Linux's rule is that
+  when the path is absolute the dirfd is not used at all, and it is the *dirfd* that stops
+  being a question rather than the path: measured here, `newfstatat(77, "/tmp", buf, 0)` with
+  `77` not open answers `0`, errno `0`. This kernel resolves the dirfd first whatever the path
+  looks like — one `base_of` does it for the whole family — so the same call answers `EBADF`.
+  Not a §3.2 defect (an honest refusal rather than a wrong number), but a caller holding a
+  stale dirfd and an absolute path takes its fallback where Linux succeeded, and the *same*
+  difference is reachable through `openat`, `unlinkat`, `linkat` and the rest. Owner:
+  `src/syscall/linux/fs/file.rs`'s `base_of` and its twenty call sites. `t-newfstatat`'s
+  bad-dirfd claim therefore names its path *relatively*, which is `EBADF` on both machines,
+  and does not pin this either way (S6 batch 12). `PLAN.md` §15.17.
 - **`F_GETFL` reports no access mode.** Linux ORs the descriptor's access mode into the word
   `fcntl(F_GETFL)` returns, so a descriptor opened `O_WRONLY` reports `1` (measured on a
   current host); this kernel reports the description's stored status word, whose access bits

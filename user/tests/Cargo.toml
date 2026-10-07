@@ -72,7 +72,20 @@
 # and `t-openat2` takes its flags and mode from `rustix::fs` for the same
 # reason. The number still comes from a maintained per-machine table.
 #
-# All three keep the purpose of the rule above: the number, the call and its shape
+# There is one more way to reach the raw call, and it is a measurement rather
+# than a preference: a wrapper that is not a passthrough *for the argument the
+# claim is about*. `t-fstat`'s null-buffer `EFAULT` claim is the case, and both
+# wrappers fail it for different reasons - `rustix::fs::fstat` owns its buffer,
+# so the caller's address is outside it, and musl's own `fstat`, handed a buffer
+# the kernel would refuse, faults in userspace instead of answering: NULL and
+# `0x1` both killed the process with SIGSEGV, run in child processes so that one
+# crash could not hide the next, while the raw call answered `EFAULT` for both
+# and 0 for the caller's own buffer (`size_of::<libc::stat>()` is 144, so the
+# declared type is the right one). That claim is `libc::syscall(libc::SYS_fstat,
+# ..)`, with the number still from `libc`'s per-machine table - 5 on the first
+# machine and 80 on the second.
+#
+# All of them keep the purpose of the rule above: the number, the call and its shape
 # come from a maintained per-machine table rather than from this repository's
 # memory of them. It is still not a second interface for calls `rustix` names
 # *and* answers the way the ABI says.

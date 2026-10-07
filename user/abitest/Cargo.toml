@@ -215,10 +215,6 @@ name = "t-fork"
 path = "src/bin/syscall/t-fork.rs"
 
 [[bin]]
-name = "t-fstat"
-path = "src/bin/syscall/t-fstat.rs"
-
-[[bin]]
 name = "t-futex"
 path = "src/bin/syscall/t-futex.rs"
 
@@ -281,10 +277,6 @@ path = "src/bin/syscall/t-munmap.rs"
 [[bin]]
 name = "t-nanosleep"
 path = "src/bin/syscall/t-nanosleep.rs"
-
-[[bin]]
-name = "t-newfstatat"
-path = "src/bin/syscall/t-newfstatat.rs"
 
 [[bin]]
 name = "t-ns-uts"
