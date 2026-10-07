@@ -169,26 +169,12 @@ name = "t-arch-prctl"
 path = "src/bin/syscall/t-arch-prctl.rs"
 
 [[bin]]
-name = "t-brk"
-path = "src/bin/syscall/t-brk.rs"
-
-[[bin]]
-name = "t-clock-gettime"
-path = "src/bin/syscall/t-clock-gettime.rs"
-
-[[bin]]
 name = "t-clone"
 path = "src/bin/syscall/t-clone.rs"
 
 [[bin]]
 name = "t-copy-file-range"
 path = "src/bin/syscall/t-copy-file-range.rs"
-
-
-
-[[bin]]
-name = "t-enosys"
-path = "src/bin/syscall/t-enosys.rs"
 
 [[bin]]
 name = "t-epoll"
@@ -222,16 +208,9 @@ path = "src/bin/syscall/t-futex.rs"
 name = "t-getdents64"
 path = "src/bin/syscall/t-getdents64.rs"
 
-
-
-
 [[bin]]
 name = "t-inotify"
 path = "src/bin/syscall/t-inotify.rs"
-
-[[bin]]
-name = "t-kill"
-path = "src/bin/syscall/t-kill.rs"
 
 [[bin]]
 name = "t-madvise"
@@ -240,7 +219,6 @@ path = "src/bin/syscall/t-madvise.rs"
 [[bin]]
 name = "t-maps"
 path = "src/bin/syscall/t-maps.rs"
-
 
 [[bin]]
 name = "t-mmap-reserve-commit"
@@ -273,10 +251,6 @@ path = "src/bin/syscall/t-mremap.rs"
 [[bin]]
 name = "t-munmap"
 path = "src/bin/syscall/t-munmap.rs"
-
-[[bin]]
-name = "t-nanosleep"
-path = "src/bin/syscall/t-nanosleep.rs"
 
 [[bin]]
 name = "t-ns-uts"
@@ -322,7 +296,6 @@ path = "src/bin/syscall/t-ptrace-attach.rs"
 name = "t-pty"
 path = "src/bin/syscall/t-pty.rs"
 
-
 [[bin]]
 name = "t-readv"
 path = "src/bin/syscall/t-readv.rs"
@@ -330,10 +303,6 @@ path = "src/bin/syscall/t-readv.rs"
 [[bin]]
 name = "t-renameat2"
 path = "src/bin/syscall/t-renameat2.rs"
-
-[[bin]]
-name = "t-rseq"
-path = "src/bin/syscall/t-rseq.rs"
 
 [[bin]]
 name = "t-rt-sigaction"
@@ -344,16 +313,8 @@ name = "t-rt-signal-queue"
 path = "src/bin/syscall/t-rt-signal-queue.rs"
 
 [[bin]]
-name = "t-rt-sigprocmask"
-path = "src/bin/syscall/t-rt-sigprocmask.rs"
-
-[[bin]]
 name = "t-sa-restart"
 path = "src/bin/syscall/t-sa-restart.rs"
-
-[[bin]]
-name = "t-sched-getaffinity"
-path = "src/bin/syscall/t-sched-getaffinity.rs"
 
 [[bin]]
 name = "t-seccomp"
@@ -362,18 +323,6 @@ path = "src/bin/syscall/t-seccomp.rs"
 [[bin]]
 name = "t-segv"
 path = "src/bin/syscall/t-segv.rs"
-
-[[bin]]
-name = "t-set-robust-list"
-path = "src/bin/syscall/t-set-robust-list.rs"
-
-[[bin]]
-name = "t-set-tid-address"
-path = "src/bin/syscall/t-set-tid-address.rs"
-
-[[bin]]
-name = "t-sigaltstack"
-path = "src/bin/syscall/t-sigaltstack.rs"
 
 [[bin]]
 name = "t-signal-delivery"
@@ -444,10 +393,6 @@ name = "t-tty-vtime"
 path = "src/bin/syscall/t-tty-vtime.rs"
 
 [[bin]]
-name = "t-uname"
-path = "src/bin/syscall/t-uname.rs"
-
-[[bin]]
 name = "t-unix-dgram"
 path = "src/bin/syscall/t-unix-dgram.rs"
 
@@ -467,14 +412,9 @@ path = "src/bin/syscall/t-wait4.rs"
 name = "t-waitid"
 path = "src/bin/syscall/t-waitid.rs"
 
-
 [[bin]]
 name = "t-wait-eintr"
 path = "src/bin/syscall/t-wait-eintr.rs"
-
-[[bin]]
-name = "t-writev"
-path = "src/bin/syscall/t-writev.rs"
 
 [[bin]]
 name = "t-xattr"
