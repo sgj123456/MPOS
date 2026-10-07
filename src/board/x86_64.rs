@@ -263,13 +263,10 @@ fn init_blk() {
         // said once where the driver is brought up: a virtio disk is `vda` under
         // major 254 in the virtio tree, a SATA disk is `sda` under major 8 in the
         // SATA one. Everything that names a disk to userland reads them from
-        // there rather than deciding for itself (`uevent::Numbering`).
-        blk::add_disk(
-            "vda",
-            mpos::uevent::VIRTIO_BLK_MAJOR,
-            "/devices/virtio/block",
-            dev,
-        );
+        // there rather than deciding for itself (`uevent::Numbering`) - and the
+        // virtio one is a single call because both machines register the same
+        // disk and only the transport differs.
+        drivers::virtio::register_block_disk(dev);
     }
     if let Some(dev) = drivers::ahci::init() {
         let sectors = dev.capacity_sectors();

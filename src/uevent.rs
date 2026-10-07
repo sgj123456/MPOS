@@ -648,6 +648,17 @@ pub struct BlockEntry {
 /// Major used for virtio block devices, as Linux assigns it.
 pub const VIRTIO_BLK_MAJOR: u32 = 254;
 
+/// Where a virtio block device hangs in the device tree, without the name.
+///
+/// `/sys/devices/virtio/block/vda`, and the `DEVPATH` every uevent about that
+/// disk carries. It lives here beside [`VIRTIO_BLK_MAJOR`] because the two are
+/// the same kind of fact - the disk's, not the transport's - and it is a constant
+/// because it was written twice and the second copy was wrong: the second machine
+/// registered its own virtio disk with `/dev/vda` as its tree position, so a
+/// reader that followed `/sys/class/block/vda`, or matched on `DEVPATH`, was
+/// handed a path that is not a device path at all (`PLAN.md` §15.10).
+pub const VIRTIO_BLK_DEVPATH: &str = "/devices/virtio/block";
+
 /// Major used for SCSI and SATA disks, as Linux assigns it.
 ///
 /// A SATA disk is `sda` and *not* `vda`, and the major is half of why: two disks
@@ -817,6 +828,33 @@ pub(crate) mod test_bus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A virtio disk's number and tree position come from the one place that
+    /// defines them, and both machines register their disk through the driver.
+    ///
+    /// The counterfactual is the second machine's old bring-up: it registered
+    /// the same disk with `254` written out and `/dev/vda` where this constant
+    /// is, so `/sys/class/block/vda` followed a link into a tree position no
+    /// device has and every event about the disk announced
+    /// `DEVPATH=/dev/vda/vda` (`PLAN.md` §15.10).
+    #[test]
+    fn a_virtio_disk_is_numbered_and_filed_where_its_driver_says() {
+        assert_eq!(VIRTIO_BLK_MAJOR, 254, "Linux's number for virtio-blk");
+        assert_eq!(VIRTIO_BLK_DEVPATH, "/devices/virtio/block");
+        assert!(
+            VIRTIO_BLK_DEVPATH.starts_with("/devices/"),
+            "a device-tree position, not a /dev node name"
+        );
+
+        let entries = BlockEntry::of_disk("vda", VIRTIO_BLK_MAJOR, VIRTIO_BLK_DEVPATH, 4096, &[]);
+        assert_eq!(entries[0].major, VIRTIO_BLK_MAJOR);
+        assert_eq!(entries[0].devpath, VIRTIO_BLK_DEVPATH);
+        // The shape a reader resolves: `/sys/devices/virtio/block/vda`.
+        assert_eq!(
+            alloc::format!("{}/{}", entries[0].devpath, entries[0].name),
+            "/devices/virtio/block/vda"
+        );
+    }
 
     /// A disk with nothing on it is still a disk, and it must still have a name.
     ///

@@ -84,6 +84,29 @@ pub fn entropy() -> Option<[u8; 32]> {
     }
 }
 
+/// Register a virtio block device as the kernel's boot disk.
+///
+/// The name, the number and the tree position are the *device's* facts, not the
+/// transport's: a virtio-blk disk is `vda` under major 254 hanging in the virtio
+/// tree whichever bus carried it, and a program that follows `/sys/class/block/vda`
+/// or matches an event's `DEVPATH` has to land in the same place on either
+/// machine. Saying it here rather than at each machine's bring-up is what makes
+/// that so, and it is a fix rather than a tidy-up: the second machine registered
+/// the same disk with `/dev/vda` where the first writes
+/// [`crate::uevent::VIRTIO_BLK_DEVPATH`], so its events announced a `DEVPATH`
+/// that is not a device path at all (`PLAN.md` §15.10).
+///
+/// The boot disk, singular: a machine brings up one, and [`crate::blk::add_disk`]
+/// refuses a second under the same name rather than letting two devices share it.
+pub fn register_block_disk(dev: alloc::sync::Arc<dyn crate::blk::BlockDev>) {
+    crate::blk::add_disk(
+        "vda",
+        crate::uevent::VIRTIO_BLK_MAJOR,
+        crate::uevent::VIRTIO_BLK_DEVPATH,
+        dev,
+    );
+}
+
 /// The name a virtio function's driver has in `/sys`, and the one `lspci -k`
 /// prints as "Kernel driver in use".
 ///

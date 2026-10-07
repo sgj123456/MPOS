@@ -848,9 +848,15 @@ fn check_fs(info: &BootInfo) {
         // the name. That registration is what makes the device a kernel disk:
         // the devfs build publishes `/dev/vda` from `blk::disks()`, and the init
         // handoff mounts this same device through the VFS (`PLAN.md` §13.3's disk
-        // root). The major is Linux's for virtio-blk, so `/proc/partitions` and
-        // `lsblk`-shaped readers see the name they expect.
-        mpos::blk::add_disk("vda", 254, "/dev/vda", dev);
+        // root).
+        //
+        // Through the *driver's* registration - the same call the first machine's
+        // bring-up makes - because the name, the major and the sysfs tree position
+        // are one device's facts, and writing them out here is how the two copies
+        // drifted: this machine used to file its disk under `/dev/vda`, so a
+        // reader that followed `/sys/class/block/vda`, or matched on `DEVPATH`,
+        // was handed a path that is not a device path (`PLAN.md` §15.10).
+        mpos::drivers::virtio::register_block_disk(dev);
         // Read the one file the image carries, back through the block driver.
         let Ok(hello) = fs.root().lookup("hello") else {
             fail!("ext4 mounted but /hello was not found through it");
