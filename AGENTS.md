@@ -201,13 +201,17 @@ falls to `_ => ENOSYS` (§3). (5) a conformance program + its `[[bin]]` entry (n
 (6) update `docs/PLAN.md` ("Remaining ABI support" + TODO board) and `docs/UAPI.md` — a call moving
 between served / refused / wrong-shape belongs in both.
 
-**Add a user test program.** `no_std` raw-syscall → `user/abitest/src/bin/syscall/t-<name>.rs`, or
-`.../integration/t-<name>.rs` if it needs a device, the net, another process image, or is a timing
-instrument. **Add an explicit `[[bin]]` block to `user/abitest/Cargo.toml`** — Cargo does not
-auto-discover `src/bin/<subdir>/*.rs`. `std`/`rustix` → `user/tests/src/bin/t-<name>.rs` (flat,
-auto-discovered). Print `ok:`/`FAIL:` per check and a final `PASS`/`FAILED`. The harness is
-`user/abitest/lib/lin.rs`. Keep the `t-` name (the test `/init` globs `/bin/t-*`). Decide its group
-in `tests.toml`.
+**Add a user test program.** `std`/`rustix` → `user/tests/src/bin/t-<name>.rs` (flat,
+auto-discovered) — the shape a new test belongs in, because it runs on **both** machines and takes
+its per-claim printing and exit status from the crate's own `Report` (`user/tests/src/lib.rs`)
+instead of a local copy. `no_std` raw-syscall → `user/abitest/src/bin/{syscall,integration}/t-<name>.rs`,
+which is where the *unmigrated* half of the ABI suite lives: `PLAN.md` §15.11 moves it to the std side
+a batch at a time, so a new test does not belong there. **Add an explicit `[[bin]]` block to
+`user/abitest/Cargo.toml`** — Cargo does not auto-discover `src/bin/<subdir>/*.rs`; the std side needs
+none. Print `ok:`/`FAIL:` per check and a final `PASS`/`FAILED` (`Report::finish` does both). The
+no_std harness is `user/abitest/lib/lin.rs`. Keep the `t-` name (the test `/init` globs `/bin/t-*`).
+Decide its group in `tests.toml` — and a name in a machine's own group must be a program that machine
+actually builds (§5's trap).
 
 **Add a kernel unit test.** A `#[cfg(test)] mod tests` at the bottom of the file it tests, with the
 parent module compiled for the host (§3). Assert on the contract (value, errno, count), not a log

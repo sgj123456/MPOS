@@ -280,17 +280,8 @@ path = "src/bin/syscall/t-getcwd.rs"
 name = "t-getdents64"
 path = "src/bin/syscall/t-getdents64.rs"
 
-[[bin]]
-name = "t-getpid"
-path = "src/bin/syscall/t-getpid.rs"
 
-[[bin]]
-name = "t-getrandom"
-path = "src/bin/syscall/t-getrandom.rs"
 
-[[bin]]
-name = "t-getuid"
-path = "src/bin/syscall/t-getuid.rs"
 
 [[bin]]
 name = "t-inotify"
