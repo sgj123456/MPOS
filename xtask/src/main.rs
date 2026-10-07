@@ -181,7 +181,7 @@ fn main() -> Result<()> {
         // same single source both machines share).
         let mode = match cli.mode.as_deref() {
             Some(text) => Some(config::RunMode::parse_strict(text)?),
-            None => Some(config::QemuConfig::load_default()?.run_mode()?),
+            None => Some(config::QemuConfig::load_default(arch)?.run_mode()?),
         };
         if let Some(mode) = mode {
             // SAFETY: single-threaded here (cargo has not spawned any of our
@@ -234,7 +234,7 @@ fn main() -> Result<()> {
         // the modes, so booting the default instead would be a machine nobody asked
         // for. `test` never reaches this and so never fails on it.
         None if matches!(cli.command, Commands::Run) => {
-            Some(config::QemuConfig::load_default()?.run_mode()?)
+            Some(config::QemuConfig::load_default(arch)?.run_mode()?)
         }
         None => None,
     };

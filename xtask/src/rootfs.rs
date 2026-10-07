@@ -35,7 +35,12 @@ pub(crate) fn effective_mode() -> Result<RunMode> {
     if let Ok(text) = std::env::var("MPOS_XTASK_MODE") {
         return RunMode::parse_strict(&text);
     }
-    QemuConfig::load_default()?.run_mode()
+    // The standing mode is the file's plain key: `mode` is a word about *this*
+    // image, whose command line this build writes. A machine's own override is
+    // read where the machine is known (`QemuConfig::load_default(arch)`), and a
+    // session on the second machine reads it back through `MPOS_XTASK_MODE`,
+    // which `main` sets from its own view of the file before this is reached.
+    QemuConfig::load_default(crate::arch::Arch::X86_64)?.run_mode()
 }
 
 pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {

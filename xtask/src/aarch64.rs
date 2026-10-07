@@ -26,8 +26,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -1580,241 +1579,24 @@ fn lay_ext4(build_dir: &Path, tree: &Path, disk_bytes: u64, fakeroot: bool) -> R
     utils::run_status(&mut cmd, "mkfs.ext4 the aarch64 filesystem image")
 }
 
-/// The firmware's two flash images, from whichever package the host has.
-///
-/// AAVMF is EDK2 built for `virt`. Distributions put it in one of a handful of
-/// places and name the variable store differently from the code, so both are
-/// looked up together rather than guessed from one path.
-fn firmware() -> Result<(PathBuf, PathBuf)> {
-    const PLACES: [(&str, &str); 3] = [
-        (
-            "/usr/share/AAVMF/AAVMF_CODE.fd",
-            "/usr/share/AAVMF/AAVMF_VARS.fd",
-        ),
-        (
-            "/usr/share/edk2/aarch64/QEMU_EFI.fd",
-            "/usr/share/edk2/aarch64/QEMU_VARS.fd",
-        ),
-        (
-            "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
-            "/usr/share/qemu-efi-aarch64/QEMU_VARS.fd",
-        ),
-    ];
-    for (code, vars) in PLACES {
-        let (code, vars) = (Path::new(code), Path::new(vars));
-        if code.exists() && vars.exists() {
-            return Ok((code.to_path_buf(), vars.to_path_buf()));
-        }
-    }
-    bail!(
-        "No aarch64 UEFI firmware found; looked for AAVMF_CODE.fd + AAVMF_VARS.fd in \
-         /usr/share/AAVMF, /usr/share/edk2/aarch64 and /usr/share/qemu-efi-aarch64"
-    )
-}
-
 /// Whether this host can back a virtio-vsock device.
+///
+/// The *verdict* asks, which is why this stays here while the command line that
+/// acts on the same question moved to `xtask/src/qemu.rs::aarch64_machine_args`:
+/// attaching the device and requiring its marker are two different claims, and
+/// the second must not be made out of the first (a summary hard-coded to the
+/// host that wrote it is a lie on the host that reads it, `PLAN.md` §13.28).
 ///
 /// vsock is the one class the aarch64 boot drives that QEMU does not emulate in
 /// userspace: `vhost-vsock-*` is a host kernel backend, and QEMU *refuses to
 /// start* a machine that names the device when `/dev/vhost-vsock` is absent. So
-/// the device is attached only where the host can carry it, and the boot verdict
-/// prints which case it took instead of quietly running one check fewer
-/// (`PLAN.md` §13.28). The device's own CID is `4` rather than the first
-/// machine's `3`, because the two machines' boots can be up at once and a second
-/// guest claiming a live CID aborts QEMU before the guest starts.
+/// the device is attached only where the host can carry it, and the verdict says
+/// which case it took instead of quietly running one check fewer. The device's
+/// own CID is `4` rather than the first machine's `3`, because the two machines'
+/// boots can be up at once and a second guest claiming a live CID aborts QEMU
+/// before the guest starts.
 fn vsock_available() -> bool {
     Path::new("/dev/vhost-vsock").exists()
-}
-
-/// The full `qemu-system-aarch64` command for this machine, with the serial line
-/// sent wherever `serial` says (`file:…` for the marker-polling boot, `mon:stdio`
-/// for an interactive `run`). Every flag here is a measured machine choice, so
-/// boot-aarch64 and `run --arch aarch64` share one definition rather than two
-/// lists that could drift into booting different machines.
-fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str, share: &Path) -> Command {
-    let mut qemu = Command::new("qemu-system-aarch64");
-    // `acpi=off` is what makes this firmware describe the machine the way this
-    // port reads it, and it is a measured difference rather than a preference:
-    // with ACPI left on - the default - AAVMF advertises ACPI 2.0 in its
-    // configuration table and publishes **no device tree at all**, which is
-    // `PLAN.md` §9.1's assumption corrected (it said `virt` + AAVMF passes a
-    // tree). A tree and a set of ACPI tables are two ways to say the same
-    // things; this port reads the first, because that is the one an embedded
-    // machine has, and the second is named as a gap rather than half-read.
-    qemu.args(["-machine", "virt,gic-version=2,acpi=off"])
-        // A named CPU rather than `max`, because the kernel's interrupt
-        // controller is a GICv2 and its clock is the EL1 physical timer: both
-        // are things a `max` CPU is free to configure differently, and a
-        // difference there reads as a broken driver.
-        .args(["-cpu", "cortex-a57"])
-        // TCG and never KVM, on any host: `detect_accel` answers with the
-        // *host's* accelerator, and a host that is not aarch64 cannot run this
-        // machine on it. The x86_64 commands are welcome to it.
-        .args(["-accel", "tcg"])
-        .args(["-m", "256"])
-        .args(["-display", "none"])
-        .args(["-monitor", "none"])
-        .args(["-no-reboot"])
-        .args(["-serial", serial])
-        // Two flash banks, the way EDK2 expects to find itself: the code bank
-        // read-only at the address the machine boots from, and a writable
-        // variable store the firmware updates as it goes.
-        .args([
-            "-drive",
-            &format!(
-                "if=pflash,format=raw,unit=0,readonly=on,file={}",
-                code.display()
-            ),
-        ])
-        .args([
-            "-drive",
-            &format!("if=pflash,format=raw,unit=1,file={}", vars.display()),
-        ])
-        // The ESP itself, as a bare FAT volume on a virtio disk rather than a
-        // partitioned image: EDK2's partition driver hands a volume with no
-        // partition table to the FAT driver as a whole, which is how a USB
-        // stick with no MBR boots. Read-only, because the loader only reads.
-        .args([
-            "-drive",
-            &format!(
-                "file=fat:{},format=raw,if=none,id=hd0,readonly=on",
-                esp.display()
-            ),
-        ])
-        .args(["-device", "virtio-blk-pci,drive=hd0"])
-        // One device on a virtio-**MMIO** transport, which is what stage 5b's
-        // check reads back. `virt` publishes its thirty-two `virtio,mmio` nodes
-        // whether or not anything is behind them (measured: the decompiled tree
-        // with and without this flag differs only in the firmware's own random
-        // seeds), so without a device every window answers `DeviceID` 0 and the
-        // check could only say "these look like transports". With one attached,
-        // it reads a `DeviceID` the machine did not have to be told and names it.
-        //
-        // The MMIO variant on purpose, and not `-pci`: the ESP's own disk is a
-        // `virtio-blk-pci` behind the PCIe bridge, which is a *different*
-        // discovery path (configuration space, not a fixed window), and a check
-        // that a PCI device answered would not say anything about the window the
-        // tree describes.
-        .args(["-device", "virtio-rng-device"])
-        // A second MMIO device, a block one, on a raw image the ESP step lays
-        // down. This is what `check_blk` drives: it opens the window whose
-        // `DeviceID` is 2 and reads sector 0 back against the pattern the image
-        // carries, so the marker proves a verified MMIO block read - the drivers
-        // stage's second device, not a mounted root yet. It sits on the same
-        // fixed-window MMIO path the rng does, and the `-global` below makes it
-        // the modern (version 2) layout the crate reads.
-        .args([
-            "-drive",
-            &format!(
-                "file={},format=raw,if=none,id=blk0,file.locking=off",
-                esp.parent().unwrap().join("aarch64-blk.img").display()
-            ),
-        ])
-        .args(["-device", "virtio-blk-device,drive=blk0"])
-        // The second block device: the ext4 image `build_esp` laid down. `check_fs`
-        // opens the block windows, tries each as an ext4, and finds this one - so a
-        // filesystem mounts over the memory-mapped transport (PLAN.md §9.1's disk
-        // root). Two virtio-blk-device instances, so the port picks the right one by
-        // content rather than by the slot QEMU happened to give it.
-        //
-        // `file.locking=off` on both raw images, which is what the x86_64 wiring
-        // already asks for and for a measured reason: with the default locking, a
-        // `qemu-system-aarch64` that outlived the command that started it (a boot
-        // killed at its deadline, an interrupted run) holds a write lock on these
-        // files, and the *next* boot dies at once with "Failed to get write lock"
-        // and an empty serial log - a machine that never started, read as a machine
-        // that hung. Nothing else opens these files, so there is no lock to keep.
-        .args([
-            "-drive",
-            &format!(
-                "file={},format=raw,if=none,id=blk1,file.locking=off",
-                esp.parent().unwrap().join("aarch64-ext4.img").display()
-            ),
-        ])
-        .args(["-device", "virtio-blk-device,drive=blk1"])
-        // A third MMIO device, a network adapter on a user-mode (SLIRP) backend,
-        // so `check_net` can open it the same way and read its MAC - the net
-        // stage's transport proof on this machine (`PLAN.md` §9.1). No socket
-        // leaves the machine; the check reads config, it does not send traffic.
-        .args(["-netdev", "user,id=n0"])
-        .args(["-device", "virtio-net-device,netdev=n0"])
-        // A virtio-input device too - the fourth class the aarch64 MMIO virtio path
-        // has to reach (`check_input`, `M8_INPUT_OK`). The keyboard backend is chosen
-        // because it is a self-contained virtio-input device: it presents its event
-        // queue and config with no external chardev/socket, so the boot can open and
-        // negotiate the transport headless (the milestone is the transport reaching
-        // the class, not any event arriving).
-        .args(["-device", "virtio-keyboard-device"])
-        // A host-driven console port - the fifth class (`check_console`,
-        // `M8_CONSOLE_OK`): a `virtio-serial-device` carrying one `virtconsole`,
-        // the same shape the first machine attaches on its PCI bus. Its far end
-        // is a host socket nothing has to be listening on (`wait=off`), so the
-        // port opens and a write lands in the socket instead of blocking a
-        // machine that has nobody reading it yet.
-        .args([
-            "-chardev",
-            &format!(
-                "socket,id=console0,path={},server=on,wait=off",
-                esp.parent().unwrap().join("aarch64-console.sock").display()
-            ),
-        ])
-        .args(["-device", "virtio-serial-device"])
-        .args(["-device", "virtconsole,chardev=console0"])
-        // And the display adapter - the sixth class (`check_gpu`, `M8_GPU_OK`).
-        // `virtio-gpu-device` is the MMIO form of the card the first machine
-        // attaches as `virtio-gpu-pci`, so the driver, the render task and the
-        // DRM layer above them are one copy on both machines. A test boot has no
-        // `-display`, so the host reports no monitor and the driver builds its
-        // headless fallback shape; the scanout is set either way, which is what
-        // `/dev/fb0` reads and the framebuffer console paints on.
-        .args(["-device", "virtio-gpu-device"])
-        // A sound card - the seventh class (`check_sound`, `M8_SOUND_OK`), the
-        // same shape the first machine attaches as `virtio-sound-pci`. The
-        // backend is `none`: it consumes the stream and plays silence, so the
-        // driver is exercised end to end without asking the host for speakers -
-        // and the boot's own probe writes silence through it, which is what
-        // `M8_SOUND_OK` asserts.
-        .args(["-audiodev", "none,id=snd0"])
-        .args(["-device", "virtio-sound-device,audiodev=snd0"]);
-    // And the eighth class (`check_vsock`, `M8_VSOCK_OK`) - but only on a host
-    // that can back it. vsock is the one virtio device QEMU does not emulate in
-    // userspace: `vhost-vsock-device` is served by the host's vhost kernel
-    // module, and a machine naming it without `/dev/vhost-vsock` does not start
-    // at all. Attaching it only when the host has one keeps this machine's boot
-    // honest on a bare host - the kernel prints the absence and answers
-    // `EAFNOSUPPORT` - while a host that has it runs the class for real
-    // (`PLAN.md` §13.28).
-    if vsock_available() {
-        qemu.args(["-device", "vhost-vsock-device,guest-cid=4"]);
-    }
-    // The ninth class (`check_p9`, `M8_P9_OK`): the host share, the same
-    // arrangement the first machine's `-virtfs` makes. `-fsdev` is the backend -
-    // the host directory QEMU's 9p server exports, with `security_model=none` so
-    // the host's own permissions decide - and `virtio-9p-device` is the transport
-    // the guest opens over MMIO. `mount_tag=hostshare` is the name
-    // `mount -t 9p hostshare /mnt` is pointed at, and the probe file `lay_p9_share`
-    // laid in `share` is what a boot reads back to prove the share serves.
-    qemu.args([
-        "-fsdev",
-        &format!(
-            "local,id=fsdev0,path={},security_model=none",
-            share.display()
-        ),
-    ]);
-    qemu.args([
-        "-device",
-        "virtio-9p-device,fsdev=fsdev0,mount_tag=hostshare",
-    ]);
-    // And the transports have to be the *modern* ones, which on this machine
-    // is a choice somebody has to make: measured, `virt`'s `virtio-mmio`
-    // transports answer `Version` 1 - the legacy register layout - unless
-    // this says otherwise, and version 2 is the only layout this kernel's
-    // driver crate reads. The alternative to selecting it is a kernel that
-    // either drives the legacy layout (a second register map, a second
-    // feature-negotiation order) or refuses devices on its own machine, and
-    // neither is what stage 5 is for.
-    qemu.args(["-global", "virtio-mmio.force-legacy=false"]);
-    qemu
 }
 
 /// Boot the aarch64 machine and hand its serial line to the terminal, staying
@@ -1842,15 +1624,7 @@ fn aarch64_qemu(esp: &Path, code: &Path, vars: &Path, serial: &str, share: &Path
 pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
     let (kernel, loader) = build(profile)?;
     let esp = build_alpine_esp(build_dir, &kernel, &loader, ModeChoice::Session)?;
-    let (code, vars_src) = firmware()?;
-    let vars = vars_path(build_dir);
-    fs::copy(&vars_src, &vars).with_context(|| {
-        format!(
-            "Failed to copy {} to {}",
-            vars_src.display(),
-            vars.display()
-        )
-    })?;
+    let (firmware, vars) = write_firmware_vars(build_dir)?;
 
     println!(
         "booting aarch64 interactively: the Alpine root, pid 1 = /init -> openrc -> \
@@ -1858,14 +1632,60 @@ pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
          puts the login on the serial line itself)"
     );
     let share = utils::lay_p9_share(&build_dir.join("aarch64-9p-share"))?;
-    let mut qemu = aarch64_qemu(&esp, &code, &vars, "mon:stdio", &share);
+    // The same command line `boot` runs, with the serial on stdio and no kill
+    // after it: a session is the same machine, held open.
+    let args = machine_args(&firmware, &vars, &esp, "mon:stdio", &share)?;
+    eprintln!("+ qemu-system-aarch64 {}", args.join(" "));
+    let mut qemu = Command::new("qemu-system-aarch64");
     let status = qemu
+        .args(&args)
         .status()
         .context("Failed to start qemu-system-aarch64")?;
     if !status.success() {
         eprintln!("qemu-system-aarch64 exited {status}");
     }
     Ok(())
+}
+
+/// This machine's command line, from `machine.toml` and the shared builder.
+///
+/// The three call sites - the marker boot, the sweep and the session - differ
+/// only in where the serial line goes, so that is the one parameter. Everything
+/// else (the firmware, the ESP, the share, this machine's own block images) is
+/// the same machine either way, and `xtask/src/qemu.rs::aarch64_machine_args`
+/// holds it beside the first machine's own list.
+fn machine_args(
+    firmware: &crate::qemu::Firmware,
+    vars: &Path,
+    esp: &Path,
+    serial: &str,
+    share: &Path,
+) -> Result<Vec<String>> {
+    let config = crate::config::QemuConfig::load_default(crate::arch::Arch::Aarch64)?;
+    Ok(crate::qemu::aarch64_machine_args(
+        &config, firmware, vars, esp, serial, share,
+    ))
+}
+
+/// The firmware pair and this machine's copy of the variable store.
+///
+/// The variables half is copied fresh on every boot rather than written to in
+/// place: the firmware writes to it, and this machine's variables are not worth
+/// keeping - a disk that has never booted has no boot entry written down, which
+/// is the state the loader is built for. The first machine's wiring makes the
+/// same copy for the same reason.
+fn write_firmware_vars(build_dir: &Path) -> Result<(crate::qemu::Firmware, PathBuf)> {
+    let firmware = crate::qemu::find_firmware(crate::arch::Arch::Aarch64)?;
+    let vars = vars_path(build_dir);
+    fs::create_dir_all(build_dir)?;
+    fs::copy(&firmware.vars, &vars).with_context(|| {
+        format!(
+            "Failed to copy {} to {}",
+            firmware.vars.display(),
+            vars.display()
+        )
+    })?;
+    Ok((firmware, vars))
 }
 
 /// Boot the ESP under AAVMF and return what the serial line said.
@@ -1875,58 +1695,44 @@ pub fn run_interactive(build_dir: &Path, profile: &str) -> Result<()> {
 /// runner prints the harness protocol's `=== END` instead - the two boots end on
 /// different lines, so which one stops the read is the caller's to say.
 fn boot(build_dir: &Path, esp: &Path, terminators: &[&str], deadline: Duration) -> Result<String> {
-    let (code, vars_src) = firmware()?;
-    let vars = vars_path(build_dir);
-    fs::copy(&vars_src, &vars).with_context(|| {
-        format!(
-            "Failed to copy {} to {}",
-            vars_src.display(),
-            vars.display()
-        )
-    })?;
+    let (firmware, vars) = write_firmware_vars(build_dir)?;
 
     let log = log_path(build_dir);
     let _ = fs::remove_file(&log);
 
     let share = utils::lay_p9_share(&build_dir.join("aarch64-9p-share"))?;
-    let mut qemu = aarch64_qemu(
-        esp,
-        &code,
+    let args = machine_args(
+        &firmware,
         &vars,
+        esp,
         &format!("file:{}", log.display()),
         &share,
-    );
+    )?;
+    eprintln!("+ qemu-system-aarch64 {}", args.join(" "));
+    let mut qemu = Command::new("qemu-system-aarch64");
+    qemu.args(&args);
     // QEMU's own stderr goes to this process's, not to a pipe nobody reads. A
     // QEMU that refuses to start - a missing firmware, an image it cannot open -
     // says so there and nowhere else, and the serial log it never wrote is
     // indistinguishable from a machine that hung; that is exactly the failure
     // this used to hide.
     qemu.stdout(Stdio::null()).stderr(Stdio::inherit());
-    let mut child = qemu
-        .spawn()
-        .context("Failed to start qemu-system-aarch64")?;
 
-    let started = Instant::now();
-    loop {
-        if let Ok(text) = fs::read_to_string(&log)
-            && terminators.iter().any(|marker| text.contains(marker))
-        {
-            break;
-        }
-        if let Some(status) = child.try_wait()? {
-            eprintln!("qemu-system-aarch64 exited on its own: {status}");
-            break;
-        }
-        if started.elapsed() > deadline {
-            eprintln!("qemu-system-aarch64 was still running after {deadline:?}; stopping it");
-            break;
-        }
-        sleep(Duration::from_millis(100));
+    // The loop is `qemu::capture`'s - one loop for both machines - and what this
+    // call adds is what only this machine knows: which markers end its boot.
+    let captured = crate::qemu::capture(qemu, &log, terminators, deadline)?;
+    if captured.timed_out {
+        // Not an error here, and that is deliberate: the caller reads the log
+        // back and its own report says a run that never reached its last marker
+        // did not finish. What is worth saying on the way past is that the
+        // deadline, not the machine, ended this.
+        eprintln!(
+            "aarch64: the machine did not reach {} within {}s; reading what it said",
+            terminators.join(" / "),
+            deadline.as_secs()
+        );
     }
-    let _ = child.kill();
-    let _ = child.wait();
-
-    fs::read_to_string(&log).with_context(|| format!("Failed to read {}", log.display()))
+    Ok(captured.log)
 }
 
 fn kib(path: &Path) -> Result<f64> {

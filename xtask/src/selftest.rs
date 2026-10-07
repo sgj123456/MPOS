@@ -19,7 +19,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -435,7 +435,7 @@ echo "=== END"
 /// of the captured serial log. The boot disk is QEMU's virtual FAT: the
 /// loader, kernel and test initramfs are served out of a plain directory, so
 /// no image needs creating and no privilege is needed to write it.
-fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32>, PathBuf)> {
+fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32>, String)> {
     println!("User tests: booting the test machine");
 
     let esp = build_dir.join("test-esp");
@@ -473,10 +473,10 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
         file.set_len(SATA_TEST_BYTES)?;
     }
 
-    let ovmf_dir = qemu::find_ovmf()?;
+    let firmware = qemu::find_firmware(Arch::X86_64)?;
     let vars = utils::ovmf_vars_path(build_dir);
     fs::create_dir_all(build_dir)?;
-    fs::copy(ovmf_dir.join("OVMF_VARS.4m.fd"), &vars)?;
+    fs::copy(&firmware.vars, &vars)?;
 
     let log = build_dir.join("test-serial.log");
     let esp = esp.canonicalize()?;
@@ -494,7 +494,7 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     // the bytes back - the pin for the first machine's share, which used to be
     // exported and never reachable (`PLAN.md` §13.29).
     let share = utils::lay_p9_share(&build_dir.join("test-9p-share"))?;
-    let mut config = crate::config::QemuConfig::load_default()?;
+    let mut config = crate::config::QemuConfig::load_default(Arch::X86_64)?;
     // A test boot never needs the host vsock bus, and claiming `guest-cid=3`
     // collides with any VM already running on this host (a concurrent
     // `cargo xtask run`, say) - which would abort QEMU before the guest boots
@@ -502,7 +502,7 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     config.vsock = false;
     let args = qemu::machine_args(
         &config,
-        &ovmf_dir,
+        &firmware.code,
         &vars,
         qemu::Boot::Esp(esp.clone()),
         qemu::Console::File(log_path.clone()),
@@ -512,40 +512,29 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     // every machine `machine_args` builds.
 
     eprintln!("+ qemu-system-x86_64 {}", args.join(" "));
-    let mut child = Command::new("qemu-system-x86_64")
-        .args(&args)
-        .spawn()
-        .context("Failed to start QEMU")?;
+    let mut command = Command::new("qemu-system-x86_64");
+    command.args(&args);
 
+    // The loop is `qemu::capture`'s - one loop for both machines. What this call
+    // does not pass is terminators: this machine's boot ends when its kernel
+    // writes the debug exit, so the process leaving *is* the end of the run, and
+    // there is no marker to stop on earlier.
     let timeout = Duration::from_secs(test_timeout_secs());
-    let started = Instant::now();
-    let mut status: Option<std::process::ExitStatus> = None;
-    while started.elapsed() < timeout {
-        match child.try_wait()? {
-            Some(finished) => {
-                status = Some(finished);
-                break;
-            }
-            None => std::thread::sleep(Duration::from_millis(500)),
-        }
-    }
-    if status.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
+    let captured = qemu::capture(command, &log, &[], timeout)?;
+    if captured.timed_out {
         bail!(
             "The test machine did not finish within {}s; its serial output is at {}",
             timeout.as_secs(),
             log.display()
         );
     }
-    let status = status.unwrap();
-    if !status.success() && status.code() != Some(33) {
+    if captured.status != Some(33) {
         eprintln!(
             "test: note: QEMU exited with {} (33 is the clean debug exit)",
-            status.code().unwrap_or(-1)
+            captured.status.unwrap_or(-1)
         );
     }
-    Ok((status.code(), log))
+    Ok((captured.status, captured.log))
 }
 
 fn test_timeout_secs() -> u64 {
@@ -560,14 +549,11 @@ fn test_timeout_secs() -> u64 {
 /// crashed, hung or never ran. `built` is what the crate produced, so the line
 /// can say how much of it the configuration left out - a sweep that quietly
 /// runs less than it used to is the failure this number is here to catch.
-fn report(tests: &[&UserTest], built: usize, log: &Path, status: Option<i32>) -> Result<()> {
-    let text = fs::read_to_string(log)
-        .with_context(|| format!("Failed to read the serial log at {}", log.display()))?;
-
+fn report(tests: &[&UserTest], built: usize, text: &str, status: Option<i32>) -> Result<()> {
     // The protocol is `sweep`'s - one parser for both runners - and what this
     // arm does with it is its own, because its claim is: every staged program
     // printed `=== PASS`, and the machine ended on the debug exit.
-    let verdict = sweep::verdict(&text);
+    let verdict = sweep::verdict(text);
     let missing: Vec<&str> = tests
         .iter()
         .filter(|test| !verdict.passed.contains(&test.name.as_str()))

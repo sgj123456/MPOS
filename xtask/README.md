@@ -175,7 +175,7 @@ reinstalled, so nothing that is not part of the image lives there.
 | 文件 | file | 内容 | contents |
 | --- | --- | --- | --- |
 | `rootfs.toml` | | **镜像里装什么**：`[rootfs]`（镜像站/分支/架构、`repos`、文件系统、磁盘几何 `image_size`/`esp_size`、包列表）、`[system]`（主机名、时区、语言、`dns`、`root_password`）、`[user]` | **what the image contains**: Alpine source, repositories, filesystem, disk geometry, package lists, hostname/timezone/locale/dns/root password, the extra account |
-| `machine.toml` | | **拿什么启动它**：`[qemu]` 的 `memory`、`cpus`、`vsock`、`audio`、`display`、`extra_args`、`mode` | **what it is booted on**: memory, cpus, vsock, audio, window backend, extra QEMU args, the standing run mode |
+| `machine.toml` | | **拿什么启动它**：`[qemu]` 的 `memory`、`cpus`、`vsock`、`audio`、`display`、`extra_args`、`mode`。第二台机器不共享的值以 `aarch64_` 前缀写在同一个文件里（`aarch64_memory = "256"` 胜过 `memory`），第一台机器看不到它们——一台机器一个值的，一处写一次。**设备的传输形态不在这里**：第二台机器全部走 virtio-MMIO，因为它靠自己的设备树找设备，那是机器的事实而不是设置（`xtask/src/qemu.rs::aarch64_machine_args`） | **what it is booted on**: memory, cpus, vsock, audio, window backend, extra QEMU args, the standing run mode. A value the second machine does not share is written in the same file with its own name in front (`aarch64_memory = "256"` beats `memory`) and is invisible to the first — one value per machine, written once. **The device *transports* are not here**: the second machine drives every device over virtio-MMIO, because it finds them by walking its own device tree — that is a machine fact, not a setting (`xtask/src/qemu.rs::aarch64_machine_args`) |
 
 两个键跨在线上，都是**读过去**而不是各写一份：`[system] hostname` 也用作 QEMU DHCP
 告诉客机的名字，`[rootfs] serial_port` 同时是引导控制台与镜像里 getty 的名字——它们存

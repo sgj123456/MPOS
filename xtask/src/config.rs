@@ -10,6 +10,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::arch::Arch;
+
 /// How `cargo xtask run` boots the whole machine: one word that decides the
 /// QEMU wiring *and* the consoles the guest is told to use, because a machine
 /// that shows its console in two places has to have agreed on that in both.
@@ -293,7 +295,7 @@ impl QemuConfig {
     /// image, and a kernel test run must not need the files that describe one.
     /// A missing `machine.toml` therefore gets the default machine, and a
     /// missing `rootfs.toml` the default name.
-    pub fn load(machine_path: &Path, rootfs_path: &Path) -> Result<Self> {
+    pub fn load(machine_path: &Path, rootfs_path: &Path, arch: Arch) -> Result<Self> {
         let mut values = match std::fs::read_to_string(machine_path) {
             Ok(content) => parse_simple_toml(&content)?,
             Err(_) => HashMap::new(),
@@ -303,43 +305,60 @@ impl QemuConfig {
             .and_then(|content| parse_simple_toml(&content).ok())
             .and_then(|mut image| image.remove("hostname"))
             .unwrap_or_else(default_hostname);
-        Ok(Self::from_values(&mut values, hostname))
+        Ok(Self::from_values(&mut values, hostname, arch))
     }
 
     /// Both files resolved from the repository root, which is what every caller
     /// wants: `machine.toml` for the machine, `rootfs.toml` for the name.
-    pub fn load_default() -> Result<Self> {
+    pub fn load_default(arch: Arch) -> Result<Self> {
         let root = crate::utils::project_root()?;
-        Self::load(&root.join("machine.toml"), &root.join("rootfs.toml"))
+        Self::load(&root.join("machine.toml"), &root.join("rootfs.toml"), arch)
     }
 
-    fn from_values(values: &mut HashMap<String, String>, hostname: String) -> Self {
+    /// The values `arch` reads: the plain keys, with that machine's own
+    /// override winning.
+    ///
+    /// `machine.toml` carries one set of keys for the machine an image is booted
+    /// on, and the two machines do not want the same values for all of them - the
+    /// second is booted with less memory and never with a window, and its vsock
+    /// device is conditional on the host. Rather than a second file (whose
+    /// staleness would have to be tracked, and which would split "what the
+    /// machine is booted on" across two homes) or a nested section (the parser is
+    /// deliberately flat: keys are unique across the headers these files use), the
+    /// machine's own value is written beside the shared one with the machine's
+    /// name in front of it:
+    ///
+    /// ```toml
+    /// [qemu]
+    /// memory = "2048"
+    /// aarch64_memory = "256"
+    /// ```
+    ///
+    /// A key with no override is simply the shared one - which is the state a
+    /// machine keeps where the two agree, so the file says only what actually
+    /// differs.
+    fn from_values(values: &mut HashMap<String, String>, hostname: String, arch: Arch) -> Self {
+        // `MEM` still wins over everything: it is what a one-off `MEM=2048 cargo
+        // xtask run` reaches for, and the file is the standing answer.
+        let memory = std::env::var("MEM")
+            .ok()
+            .or_else(|| take_for(values, "memory", arch));
         Self {
-            // `MEM` still wins: it is what a one-off `MEM=2048 cargo xtask
-            // run` reaches for, and the file is the standing answer.
-            memory: std::env::var("MEM").unwrap_or_else(|_| {
-                values
-                    .remove("memory")
-                    .unwrap_or_else(|| "1024".to_string())
-            }),
-            cpus: values
-                .remove("cpus")
+            memory: memory.unwrap_or_else(|| "1024".to_string()),
+            cpus: take_for(values, "cpus", arch)
                 .and_then(|text| text.trim().parse().ok())
                 .unwrap_or(1),
             hostname,
-            extra_args: take_list(values, "extra_args", &[]),
-            vsock: take_flag(values, "vsock"),
-            audio: take_flag(values, "audio"),
-            display: values
-                .remove("display")
-                .filter(|text| !text.trim().is_empty()),
+            extra_args: take_list_for(values, "extra_args", arch),
+            vsock: take_flag_for(values, "vsock", arch),
+            audio: take_flag_for(values, "audio", arch),
+            display: take_for(values, "display", arch).filter(|text| !text.trim().is_empty()),
             // The 2D scanout is the default because it is what every boot
             // before this key had, and because it is the one that needs nothing
             // of the host. A blank value is the same as an absent one: a key
             // written and left empty is a mistake, not a request for a device
             // named "".
-            gpu: values
-                .remove("gpu")
+            gpu: take_for(values, "gpu", arch)
                 .map(|text| text.trim().to_string())
                 .filter(|text| !text.is_empty())
                 .unwrap_or_else(|| "virtio-gpu-pci".to_string()),
@@ -347,7 +366,7 @@ impl QemuConfig {
             // shared with `test` — which boots no window at all and must not fail
             // on a mode name it never uses. The mode is resolved at the two places
             // that actually boot a window, in [`Self::run_mode`].
-            mode_text: values.remove("mode"),
+            mode_text: take_for(values, "mode", arch),
         }
     }
 
@@ -530,13 +549,41 @@ impl TestConfig {
     }
 }
 
-/// Read a `key = true`-style boolean. Anything but an explicit `true` -
-/// absent, empty, any other word - is false: a device that needs the host's
-/// cooperation defaults to off, and the file says so in one word.
-fn take_flag(values: &mut HashMap<String, String>, key: &str) -> bool {
-    values
-        .remove(key)
-        .is_some_and(|text| text.trim().eq_ignore_ascii_case("true"))
+/// The prefix a machine's own `[qemu]` values carry.
+///
+/// The first machine's values *are* the plain keys, because the file was written
+/// for it, so it has no prefix and every shared key keeps the meaning it already
+/// had. The second machine writes `aarch64_memory` beside `memory` for the values
+/// it does not share, which is what lets one `machine.toml` describe two machines
+/// without a second file whose staleness would have to be tracked separately.
+fn override_prefix(arch: Arch) -> &'static str {
+    match arch {
+        Arch::X86_64 => "",
+        Arch::Aarch64 => "aarch64_",
+    }
+}
+
+/// Take `key` for `arch`: its own override if the file has one, else the shared
+/// key. Taking it here rather than in each caller is what makes "the machine's
+/// value wins" one rule instead of one per key.
+fn take_for(values: &mut HashMap<String, String>, key: &str, arch: Arch) -> Option<String> {
+    let own = format!("{}{key}", override_prefix(arch));
+    if own != key
+        && let Some(value) = values.remove(&own)
+    {
+        return Some(value);
+    }
+    values.remove(key)
+}
+
+fn take_flag_for(values: &mut HashMap<String, String>, key: &str, arch: Arch) -> bool {
+    take_for(values, key, arch).is_some_and(|text| text.trim().eq_ignore_ascii_case("true"))
+}
+
+fn take_list_for(values: &mut HashMap<String, String>, key: &str, arch: Arch) -> Vec<String> {
+    take_for(values, key, arch)
+        .map(parse_package_list)
+        .unwrap_or_default()
 }
 
 fn default_hostname() -> String {
@@ -770,6 +817,31 @@ mod tests {
         );
     }
 
+    /// One `machine.toml`, two machines: a value the second does not share is
+    /// written with its own name in front, wins over the shared one, and is not
+    /// visible to the first - which is what keeps the second machine's
+    /// differences in the file that describes machines instead of in the code
+    /// that boots them.
+    #[test]
+    fn a_machines_own_value_wins_and_the_other_machine_never_sees_it() {
+        let mut values = parse_simple_toml(
+            "memory = \"2048\"\naarch64_memory = \"256\"\naudio = false\naarch64_audio = true\n",
+        )
+        .unwrap();
+        let x86 = QemuConfig::from_values(&mut values.clone(), "probe".to_string(), Arch::X86_64);
+        let aarch64 = QemuConfig::from_values(&mut values, "probe".to_string(), Arch::Aarch64);
+
+        assert_eq!(x86.memory, "2048", "the shared key is the first machine's");
+        assert_eq!(aarch64.memory, "256", "the second machine's own value wins");
+        assert!(!x86.audio, "the second machine's key is not the first's");
+        assert!(aarch64.audio);
+
+        // A key with no override is the shared one on both - so the file says
+        // only what actually differs.
+        assert_eq!(x86.gpu, aarch64.gpu);
+        assert_eq!(x86.cpus, aarch64.cpus);
+    }
+
     #[test]
     fn the_machine_and_the_image_keep_their_own_keys() {
         // The repository's own two files, read through the parser the build
@@ -784,6 +856,25 @@ mod tests {
         let image = std::fs::read_to_string(root.join("rootfs.toml")).expect("rootfs.toml");
         let machine_keys = parse_simple_toml(&machine).unwrap();
         let image_keys = parse_simple_toml(&image).unwrap();
+
+        // The second machine's own values, which exist only here. They are
+        // required rather than merely allowed: a file that lost them would still
+        // boot - the shared keys would answer - but it would boot the first
+        // machine's memory and window, which is the drift this test is about
+        // (`aarch64_memory = "256"` against the 2048 above).
+        for key in [
+            "aarch64_memory",
+            "aarch64_display",
+            "aarch64_vsock",
+            "aarch64_audio",
+            "aarch64_extra_args",
+        ] {
+            assert!(machine_keys.contains_key(key), "machine.toml lost {key}");
+            assert!(
+                !image_keys.contains_key(key),
+                "{key} drifted into rootfs.toml, whose mtime reinstalls Alpine"
+            );
+        }
 
         // The machine half is all there...
         for key in [
@@ -1086,13 +1177,17 @@ mod tests {
         std::fs::write(&machine, "[qemu]\nmemory = \"512\"\ncpus = 2\n").unwrap();
         std::fs::write(&image, "[system]\nhostname = \"probe\"\n").unwrap();
 
-        let config = QemuConfig::load(&machine, &image).unwrap();
+        let config = QemuConfig::load(&machine, &image, Arch::X86_64).unwrap();
         assert_eq!(config.memory, "512");
         assert_eq!(config.cpus, 2);
         assert_eq!(config.hostname, "probe");
         // A missing machine file is the default machine, not an error: `test`
         // booting must not need either file to exist.
-        let absent = QemuConfig::load(&dir.join("nowhere.toml"), &dir.join("nowhere.toml"));
+        let absent = QemuConfig::load(
+            &dir.join("nowhere.toml"),
+            &dir.join("nowhere.toml"),
+            Arch::X86_64,
+        );
         assert_eq!(absent.unwrap().hostname, "mpos");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1110,7 +1205,7 @@ mod tests {
         for word in ["weston", "compositor"] {
             let mut values = HashMap::new();
             values.insert("mode".to_string(), word.to_string());
-            let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+            let config = QemuConfig::from_values(&mut values, "mpos".to_string(), Arch::X86_64);
             assert!(values.is_empty(), "the `mode` key was not consumed");
             let error = config.run_mode().unwrap_err().to_string();
             assert!(
@@ -1123,8 +1218,12 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask sits under the repository root");
-        let machine = QemuConfig::load(&root.join("machine.toml"), &root.join("rootfs.toml"))
-            .expect("machine.toml parses");
+        let machine = QemuConfig::load(
+            &root.join("machine.toml"),
+            &root.join("rootfs.toml"),
+            Arch::X86_64,
+        )
+        .expect("machine.toml parses");
         assert_eq!(
             machine.run_mode().unwrap(),
             RunMode::Gui,
@@ -1137,11 +1236,11 @@ mod tests {
         // The `[qemu]` block may not name `mode` at all; the default must be
         // the pre-split behaviour (window + serial mirror), not an error.
         let mut values = HashMap::new();
-        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string(), Arch::X86_64);
         assert_eq!(config.run_mode().unwrap(), RunMode::Mirror);
         // A blank value is the same absence, the way a blank `display` is.
         values.insert("mode".to_string(), "   ".to_string());
-        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string(), Arch::X86_64);
         assert_eq!(config.run_mode().unwrap(), RunMode::Mirror);
     }
 
@@ -1151,7 +1250,7 @@ mod tests {
         // must keep exactly that machine - and the GL card is opt-in, because
         // it asks the host for a renderer the plain one does not.
         let mut values = HashMap::new();
-        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string(), Arch::X86_64);
         assert_eq!(config.gpu, "virtio-gpu-pci");
 
         // A key written and left empty is a mistake, not a request for a device
@@ -1159,7 +1258,7 @@ mod tests {
         // boot later and a layer away from the typo.
         let mut values = HashMap::new();
         values.insert("gpu".to_string(), "   ".to_string());
-        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string(), Arch::X86_64);
         assert_eq!(config.gpu, "virtio-gpu-pci");
 
         // A named card is taken as written, and the key is consumed: a value
@@ -1167,7 +1266,7 @@ mod tests {
         // downstream would ever notice.
         let mut values = HashMap::new();
         values.insert("gpu".to_string(), " virtio-gpu-gl-pci ".to_string());
-        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string(), Arch::X86_64);
         assert_eq!(config.gpu, "virtio-gpu-gl-pci");
         assert!(values.is_empty(), "the `gpu` key was not consumed");
     }
@@ -1239,7 +1338,7 @@ mod tests {
             "memory = \"2048\"\ncpus = 4\nextra_args = [\"-enable-kvm\", \"-cpu host\"]\n",
         )
         .unwrap();
-        let config = QemuConfig::from_values(&mut values, "mpos".to_string());
+        let config = QemuConfig::from_values(&mut values, "mpos".to_string(), Arch::X86_64);
         assert_eq!(config.cpus, 4);
         assert_eq!(config.extra_args, vec!["-enable-kvm", "-cpu host"]);
         assert_eq!(config.hostname, "mpos");
@@ -1250,7 +1349,10 @@ mod tests {
         // The alternative is a build that stops on a typo in a field whose
         // wrong value is also its default.
         let mut values = parse_simple_toml("cpus = \"four\"\n").unwrap();
-        assert_eq!(QemuConfig::from_values(&mut values, "mpos".into()).cpus, 1);
+        assert_eq!(
+            QemuConfig::from_values(&mut values, "mpos".into(), Arch::X86_64).cpus,
+            1
+        );
     }
 
     #[test]

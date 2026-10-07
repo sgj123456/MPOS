@@ -134,3 +134,39 @@ gpu = "virtio-gpu-pci"
 # the command line inside the image: `weston` baked `console=ttyS0`, which today's
 # `gui` replaces with `console=tty0`.
 mode = "gui"
+
+# The second machine's own values, where they differ from the ones above.
+#
+# One file, two machines: a key prefixed `aarch64_` is that machine's value and
+# wins over the shared one of the same name (`xtask/src/config.rs`'s
+# `take_for`), so nothing has to be said twice and a value that agrees stays a
+# single line. The header below is for the reader - this file's parser is flat
+# and treats `[...]` as decoration.
+#
+# What is *not* here is as deliberate as what is: the second machine's device
+# transports (its `virtio-*-device` MMIO forms, its PL011, its `-machine virt`)
+# are how that kernel finds its devices at all, not choices - a `virtio-gpu-pci`
+# there would attach a card the machine cannot reach, because it discovers
+# devices by walking its own device tree. Those stay in
+# `xtask/src/qemu.rs::aarch64_machine_args`, next to the first machine's own
+# list, with the reason on each line.
+#
+# 256 MiB, not the 2048 above: this machine boots a disk root and a shell, and
+# the figure was measured down rather than chosen (`PLAN.md` §9.1's device RAM
+# cost). `MEM=` still overrides both.
+aarch64_memory = "256"
+# Serial only. This machine's `run --arch aarch64` has no window backend: the
+# session is the PL011, and the kernel's framebuffer console is painted on a
+# scanout nobody is looking at.
+aarch64_display = "none"
+# The vsock device, as above - and with one extra condition the first machine
+# does not carry: this machine's wiring asks the *host* for `/dev/vhost-vsock`
+# before attaching it, because the check it backs prints a skip rather than
+# failing when the host cannot carry the device (`PLAN.md` §13.28).
+aarch64_vsock = true
+# The sound card, `-audiodev none` + the MMIO form.
+aarch64_audio = true
+# Explicitly empty, and it has to be: this key falls back to the shared one when
+# absent, and `-vga none` above is an x86-only option that a `-machine virt` boot
+# refuses outright.
+aarch64_extra_args = []
