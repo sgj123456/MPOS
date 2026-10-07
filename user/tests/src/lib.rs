@@ -54,3 +54,15 @@ impl Report {
         std::process::exit(0);
     }
 }
+
+/// Whether this program is running on the host's real Linux rather than in a
+/// payload sweep. A handful of migrated claims pin an answer that is mpos's by
+/// design and differ from current Linux's (a refused TIMER_ABSTIME, a retired
+/// madvise slot, an unaligned mprotect inside nobody's mapping); those checks
+/// accept the host's own answer when - and only when - the run says it is a
+/// host run, so `MPOS_ON_HOST=1 t-<name>` measures against real Linux while
+/// the gate keeps pinning this kernel. The divergence itself is named in each
+/// program's comment, never hidden behind this flag.
+pub fn host_run() -> bool {
+    std::env::var_os("MPOS_ON_HOST").is_some()
+}

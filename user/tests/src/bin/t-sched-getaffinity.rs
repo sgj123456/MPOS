@@ -62,7 +62,7 @@ fn main() {
             .skip(1)
             .take(width.saturating_sub(1))
             .all(|&b| b == 0)
-            || cfg!(target_env = "musl") && std::env::var_os("MPOS_ON_HOST").is_some(),
+            || cfg!(target_env = "musl") && mpos_user_tests::host_run(),
     );
 
     // The pid argument does not steer anything here: -1 answers just like 0

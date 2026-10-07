@@ -88,7 +88,7 @@ fn main() {
     r.check(
         "growing in place answers the old address",
         grew as usize == p
-            || std::env::var_os("MPOS_ON_HOST").is_some() && refused(grew as isize, libc::ENOMEM),
+            || mpos_user_tests::host_run() && refused(grew as isize, libc::ENOMEM),
     );
     let back = unsafe { (p as *const u64).read_volatile() };
     r.check("the contents survive the grow in place", back == P2);

@@ -206,7 +206,7 @@ fn main() {
     r.check(
         "MAP_FIXED past the user limit answers EINVAL",
         refused(past_limit, libc::EINVAL)
-            || std::env::var_os("MPOS_ON_HOST").is_some() && refused(past_limit, libc::ENOMEM),
+            || mpos_user_tests::host_run() && refused(past_limit, libc::ENOMEM),
     );
 
     // A hint with nothing mapped in the way is honoured exactly.
@@ -293,7 +293,7 @@ fn main() {
     r.check(
         "MAP_FIXED together with MAP_FIXED_NOREPLACE is EINVAL",
         refused(conflict, libc::EINVAL)
-            || std::env::var_os("MPOS_ON_HOST").is_some() && refused(conflict, libc::EPERM),
+            || mpos_user_tests::host_run() && refused(conflict, libc::EPERM),
     );
     let huge = mm(0, PAGE, PROT_RW, ANON_PRIVATE | libc::MAP_HUGETLB);
     r.check(

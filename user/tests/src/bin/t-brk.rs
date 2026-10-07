@@ -59,9 +59,6 @@ fn main() {
     };
     r.check("the fixture mapping succeeds", true);
 
-    // Start the measured break above both the heap and the parked span.
-    // The kernel may answer a break past the request (Linux rounds up to
-    // its own granularity), so "at or past" is the honest first claim.
     // Start above everything this process owns. mpos moves the break to the
     // request; glibc's brk refuses a jump farther than its own heap can
     // grow and answers the *current* break instead (measured here), so on a
@@ -71,7 +68,7 @@ fn main() {
     let cur = brk(start);
     r.check(
         "brk reports a break at or past the request",
-        cur >= start as isize || std::env::var_os("MPOS_ON_HOST").is_some() && cur > 0,
+        cur >= start as isize || mpos_user_tests::host_run() && cur > 0,
     );
     r.check(
         "the break is page-aligned",

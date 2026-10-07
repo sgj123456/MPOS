@@ -92,7 +92,7 @@ fn main() {
     r.check(
         "an unaligned address answers EINVAL",
         refused(bad as isize, libc::EINVAL)
-            || std::env::var_os("MPOS_ON_HOST").is_some() && bad == 0,
+            || mpos_user_tests::host_run() && bad == 0,
     );
     let zero_len = unsafe { libc::mprotect(p, 0, libc::PROT_READ) };
     r.check("a zero length answers 0", zero_len == 0);

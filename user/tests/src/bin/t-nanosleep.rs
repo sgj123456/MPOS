@@ -110,7 +110,7 @@ fn main() {
     }
     r.check(
         "TIMER_ABSTIME is refused with EINVAL",
-        abstime_refused || std::env::var_os("MPOS_ON_HOST").is_some(),
+        abstime_refused || mpos_user_tests::host_run(),
     );
 
     r.finish()

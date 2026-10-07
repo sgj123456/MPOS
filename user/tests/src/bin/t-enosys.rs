@@ -35,7 +35,7 @@ fn probe(nr: libc::c_long) -> bool {
         // measured here), so under a hosted run any refusal at all stands
         // in for the ENOSYS this kernel answers; the payload sweep pins
         // ENOSYS itself.
-        || std::env::var_os("MPOS_ON_HOST").is_some() && r == -1
+        || mpos_user_tests::host_run() && r == -1
 }
 
 /// The door returns `-1` and leaves the refusal in `errno` (batch 12's
@@ -76,7 +76,7 @@ fn main() {
     r.check(
         "io_uring_enter answers ENOSYS",
         refused(enter as isize, libc::ENOSYS)
-            || std::env::var_os("MPOS_ON_HOST").is_some() && enter == -1,
+            || mpos_user_tests::host_run() && enter == -1,
     );
     r.check(
         "io_uring_register answers ENOSYS",

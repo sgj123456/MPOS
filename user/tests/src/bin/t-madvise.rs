@@ -129,7 +129,7 @@ fn main() {
     r.check(
         "a retired advice number (5) answers EINVAL, not a silent 0",
         refused(ret5 as isize, libc::EINVAL)
-            || std::env::var_os("MPOS_ON_HOST").is_some() && ret5 == 0,
+            || mpos_user_tests::host_run() && ret5 == 0,
     );
     r.check(
         "an advice past the block (0xffff) answers EINVAL",

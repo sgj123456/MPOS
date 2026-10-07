@@ -150,7 +150,7 @@ fn main() {
     }
     r.check(
         "an install with a null base is ENOMEM",
-        enomem_here || std::env::var_os("MPOS_ON_HOST").is_some(),
+        enomem_here || mpos_user_tests::host_run(),
     );
 
     let ss = libc::stack_t {

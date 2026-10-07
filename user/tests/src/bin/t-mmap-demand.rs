@@ -125,7 +125,7 @@ fn main() {
     // mpos faults exactly one page per touch; Linux reads a faulting
     // neighbourhood in around the fault (measured here: the adjacent page
     // comes back resident too). The payload sweep pins the exact shape.
-    let neighbours_clear = if std::env::var_os("MPOS_ON_HOST").is_some() {
+    let neighbours_clear = if mpos_user_tests::host_run() {
         true
     } else {
         second == 0 && last == 0
