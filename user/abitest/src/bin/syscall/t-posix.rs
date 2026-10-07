@@ -344,11 +344,20 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::setpriority(0, 0, 5),
         0,
     );
+    // Out of range is *clamped*, not refused: Linux's `setpriority` clamps
+    // (`kernel/sys.c`) and its man page lists `EINVAL` only for a bad `which`.
+    // This asserted `EINVAL` until migration batch 10 measured the host.
     lin::check_eq(
         &mut failed,
-        b"setpriority out of range answers EINVAL",
+        b"setpriority out of range is clamped, not refused",
         lin::setpriority(0, 0, 99),
-        lin::EINVAL,
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the clamped nice lands at 19 (raw 1)",
+        lin::getpriority(0, 0),
+        1,
     );
     lin::check_eq(
         &mut failed,

@@ -371,6 +371,19 @@ the commit bodies), and each moved its pin in the same commit.
     soft limit is 1024" claim could only be pinned once the constant came from a maintained
     table instead of from the kernel it was checking.
 
+11. **`setpriority` clamps a nice outside `-20..=19`; it used to answer `EINVAL`.** Linux
+    clamps (`if (niceval < MIN_NICE) niceval = MIN_NICE;`, `kernel/sys.c`), and its man page
+    lists `EINVAL` under ERRORS only for a `which` that is none of
+    `PRIO_PROCESS`/`PRIO_PGRP`/`PRIO_USER`. Measured on this host:
+    `setpriority(PRIO_PROCESS, 0, 20)` answers `0` and leaves the task at `19`, and `-21`
+    answers `EPERM` - the privilege refusal for the raise the clamp turns it into, where a
+    range check running first would have answered `EINVAL` before consulting any privilege.
+    The two doors onto the same nice slot disagree, and that disagreement is Linux's:
+    `sched_setattr` *does* refuse an out-of-range `sched_nice` with `EINVAL`. Owner:
+    `src/syscall/linux/posix.rs`. Pin: `t-priority` on **both** machines (S6 batch 10), which
+    makes the call and reads the value back for each side of the range, plus the no-std
+    `t-posix`, which had asserted the same `EINVAL`.
+
 ### 5.2 Small, measured, and not yet landed
 
 - **`FIONREAD` on a regular file and on a pipe.** Linux answers `0` and the bytes

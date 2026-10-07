@@ -736,9 +736,19 @@ pub fn handle_getpriority(args: [usize; ARG_COUNT]) -> isize {
 /// weight effect here - a named sub-gap), but the call is no longer a
 /// accept-and-drop: over `PRIO_PROCESS` it targets the caller (or the named
 /// process, `ESRCH` if it is gone), and over `PRIO_PGRP`/`PRIO_USER` it applies
-/// to every member, `ESRCH` when the set is empty. The `-20..19` range and the
-/// `which` validation are Linux's; the unprivileged-lowering rule is moot for
-/// this single-rooted kernel, which accepts the whole range.
+/// to every member, `ESRCH` when the set is empty. The `which` validation is
+/// Linux's; the unprivileged-lowering rule is moot for this single-rooted
+/// kernel, which accepts the whole range.
+///
+/// The nice is **clamped** to `-20..=19`, not refused: Linux's `setpriority`
+/// clamps (`if (niceval < MIN_NICE) niceval = MIN_NICE;`, `kernel/sys.c`), and
+/// its man page lists `EINVAL` only for a `which` that is none of the three.
+/// Measured on a current host, where `setpriority(PRIO_PROCESS, 0, 20)` answers
+/// `0` and leaves the task at `19`, and `-21` answers `EPERM` - a *privilege*
+/// refusal for the raise the clamp turns it into, which a range check running
+/// first would have answered `EINVAL`. This returned `EINVAL` for both, which is
+/// a refusal Linux does not make, and the one program that pinned it had written
+/// `EINVAL` down too (`t-priority`, migration batch 10).
 pub fn handle_setpriority(args: [usize; ARG_COUNT]) -> isize {
     const PRIO_PROCESS: usize = 0;
     const PRIO_PGRP: usize = 1;
@@ -747,10 +757,7 @@ pub fn handle_setpriority(args: [usize; ARG_COUNT]) -> isize {
     if !matches!(which, PRIO_PROCESS | PRIO_PGRP | PRIO_USER) {
         return err::EINVAL;
     }
-    if !(-20..=19).contains(&prio) {
-        return err::EINVAL;
-    }
-    let prio = prio as i32;
+    let prio = prio.clamp(-20, 19) as i32;
     match which {
         PRIO_PROCESS => {
             let pid = if who == 0 {

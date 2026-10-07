@@ -320,10 +320,6 @@ name = "t-posix"
 path = "src/bin/syscall/t-posix.rs"
 
 [[bin]]
-name = "t-priority"
-path = "src/bin/syscall/t-priority.rs"
-
-[[bin]]
 name = "t-times"
 path = "src/bin/syscall/t-times.rs"
 
@@ -334,10 +330,6 @@ path = "src/bin/syscall/t-prctl.rs"
 [[bin]]
 name = "t-preadv2"
 path = "src/bin/syscall/t-preadv2.rs"
-
-[[bin]]
-name = "t-prlimit64"
-path = "src/bin/syscall/t-prlimit64.rs"
 
 [[bin]]
 name = "t-process-vm"
@@ -471,10 +463,6 @@ path = "src/bin/integration/t-dhcp.rs"
 [[bin]]
 name = "t-tty-vtime"
 path = "src/bin/syscall/t-tty-vtime.rs"
-
-[[bin]]
-name = "t-umask"
-path = "src/bin/syscall/t-umask.rs"
 
 [[bin]]
 name = "t-uname"
