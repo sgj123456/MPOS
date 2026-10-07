@@ -251,10 +251,6 @@ name = "t-kill"
 path = "src/bin/syscall/t-kill.rs"
 
 [[bin]]
-name = "t-link"
-path = "src/bin/syscall/t-link.rs"
-
-[[bin]]
 name = "t-madvise"
 path = "src/bin/syscall/t-madvise.rs"
 
@@ -355,10 +351,6 @@ path = "src/bin/syscall/t-ptrace-attach.rs"
 name = "t-pty"
 path = "src/bin/syscall/t-pty.rs"
 
-
-[[bin]]
-name = "t-readlink"
-path = "src/bin/syscall/t-readlink.rs"
 
 [[bin]]
 name = "t-readv"
@@ -499,10 +491,6 @@ path = "src/bin/syscall/t-unix-scm.rs"
 [[bin]]
 name = "t-unix"
 path = "src/bin/syscall/t-unix.rs"
-
-[[bin]]
-name = "t-unlinkat"
-path = "src/bin/syscall/t-unlinkat.rs"
 
 [[bin]]
 name = "t-wait4"
