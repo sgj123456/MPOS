@@ -96,6 +96,14 @@ diagnostic = ["t-sh"]
 #     was already a prerequisite of this sweep whereas installing busybox would
 #     have put a network fetch inside the gate.
 #
+# One name sits here now, and its reason is the architecture rather than a
+# missing handler:
+#
+#   t-arch-prctl  `arch_prctl` is x86_64's own call (arm64 has no number for
+#                it - TLS goes through other doors there). The program builds
+#                on both machines and says "skipped" on the second; naming it
+#                here keeps the sweep's question honest on both.
+#
 # What is left outside the machine is `external` above, and its reason is the
 # internet rather than this machine.
-aarch64 = []
+aarch64 = ["t-arch-prctl"]

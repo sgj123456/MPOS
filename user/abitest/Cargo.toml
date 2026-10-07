@@ -165,10 +165,6 @@ name = "t-9p"
 path = "src/bin/syscall/t-9p.rs"
 
 [[bin]]
-name = "t-arch-prctl"
-path = "src/bin/syscall/t-arch-prctl.rs"
-
-[[bin]]
 name = "t-clone"
 path = "src/bin/syscall/t-clone.rs"
 
@@ -213,44 +209,16 @@ name = "t-inotify"
 path = "src/bin/syscall/t-inotify.rs"
 
 [[bin]]
-name = "t-madvise"
-path = "src/bin/syscall/t-madvise.rs"
-
-[[bin]]
 name = "t-maps"
 path = "src/bin/syscall/t-maps.rs"
-
-[[bin]]
-name = "t-mmap-reserve-commit"
-path = "src/bin/syscall/t-mmap-reserve-commit.rs"
 
 [[bin]]
 name = "t-mmap-shared-fork"
 path = "src/bin/syscall/t-mmap-shared-fork.rs"
 
 [[bin]]
-name = "t-mmap"
-path = "src/bin/syscall/t-mmap.rs"
-
-[[bin]]
-name = "t-mmap-demand"
-path = "src/bin/syscall/t-mmap-demand.rs"
-
-[[bin]]
 name = "t-mount"
 path = "src/bin/syscall/t-mount.rs"
-
-[[bin]]
-name = "t-mprotect"
-path = "src/bin/syscall/t-mprotect.rs"
-
-[[bin]]
-name = "t-mremap"
-path = "src/bin/syscall/t-mremap.rs"
-
-[[bin]]
-name = "t-munmap"
-path = "src/bin/syscall/t-munmap.rs"
 
 [[bin]]
 name = "t-ns-uts"
@@ -319,10 +287,6 @@ path = "src/bin/syscall/t-sa-restart.rs"
 [[bin]]
 name = "t-seccomp"
 path = "src/bin/syscall/t-seccomp.rs"
-
-[[bin]]
-name = "t-segv"
-path = "src/bin/syscall/t-segv.rs"
 
 [[bin]]
 name = "t-signal-delivery"
