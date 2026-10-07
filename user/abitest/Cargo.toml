@@ -405,9 +405,6 @@ path = "src/bin/syscall/t-ptrace-attach.rs"
 name = "t-pty"
 path = "src/bin/syscall/t-pty.rs"
 
-[[bin]]
-name = "t-read"
-path = "src/bin/syscall/t-read.rs"
 
 [[bin]]
 name = "t-readlink"
@@ -565,9 +562,6 @@ path = "src/bin/syscall/t-wait4.rs"
 name = "t-waitid"
 path = "src/bin/syscall/t-waitid.rs"
 
-[[bin]]
-name = "t-write"
-path = "src/bin/syscall/t-write.rs"
 
 [[bin]]
 name = "t-wait-eintr"
