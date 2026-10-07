@@ -87,8 +87,7 @@ fn main() {
     let grew = unsafe { libc::mremap(p as *mut _, PAGE, 8192, 0, 0) };
     r.check(
         "growing in place answers the old address",
-        grew as usize == p
-            || mpos_user_tests::host_run() && refused(grew as isize, libc::ENOMEM),
+        grew as usize == p || mpos_user_tests::host_run() && refused(grew as isize, libc::ENOMEM),
     );
     let back = unsafe { (p as *const u64).read_volatile() };
     r.check("the contents survive the grow in place", back == P2);

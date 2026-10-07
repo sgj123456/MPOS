@@ -128,8 +128,7 @@ fn main() {
     let ret5 = unsafe { libc::madvise(span as *mut _, PAGE, 5) };
     r.check(
         "a retired advice number (5) answers EINVAL, not a silent 0",
-        refused(ret5 as isize, libc::EINVAL)
-            || mpos_user_tests::host_run() && ret5 == 0,
+        refused(ret5 as isize, libc::EINVAL) || mpos_user_tests::host_run() && ret5 == 0,
     );
     r.check(
         "an advice past the block (0xffff) answers EINVAL",

@@ -169,16 +169,8 @@ name = "t-clone"
 path = "src/bin/syscall/t-clone.rs"
 
 [[bin]]
-name = "t-copy-file-range"
-path = "src/bin/syscall/t-copy-file-range.rs"
-
-[[bin]]
 name = "t-epoll"
 path = "src/bin/syscall/t-epoll.rs"
-
-[[bin]]
-name = "t-eventfd"
-path = "src/bin/syscall/t-eventfd.rs"
 
 [[bin]]
 name = "t-execve"
@@ -187,10 +179,6 @@ path = "src/bin/syscall/t-execve.rs"
 [[bin]]
 name = "t-exit-group"
 path = "src/bin/syscall/t-exit-group.rs"
-
-[[bin]]
-name = "t-fchmodat2"
-path = "src/bin/syscall/t-fchmodat2.rs"
 
 [[bin]]
 name = "t-fork"
@@ -203,10 +191,6 @@ path = "src/bin/syscall/t-futex.rs"
 [[bin]]
 name = "t-getdents64"
 path = "src/bin/syscall/t-getdents64.rs"
-
-[[bin]]
-name = "t-inotify"
-path = "src/bin/syscall/t-inotify.rs"
 
 [[bin]]
 name = "t-maps"
@@ -229,10 +213,6 @@ name = "t-chroot"
 path = "src/bin/syscall/t-chroot.rs"
 
 [[bin]]
-name = "t-pipe2"
-path = "src/bin/syscall/t-pipe2.rs"
-
-[[bin]]
 name = "t-poll"
 path = "src/bin/syscall/t-poll.rs"
 
@@ -249,10 +229,6 @@ name = "t-prctl"
 path = "src/bin/syscall/t-prctl.rs"
 
 [[bin]]
-name = "t-preadv2"
-path = "src/bin/syscall/t-preadv2.rs"
-
-[[bin]]
 name = "t-process-vm"
 path = "src/bin/syscall/t-process-vm.rs"
 
@@ -263,14 +239,6 @@ path = "src/bin/syscall/t-ptrace-attach.rs"
 [[bin]]
 name = "t-pty"
 path = "src/bin/syscall/t-pty.rs"
-
-[[bin]]
-name = "t-readv"
-path = "src/bin/syscall/t-readv.rs"
-
-[[bin]]
-name = "t-renameat2"
-path = "src/bin/syscall/t-renameat2.rs"
 
 [[bin]]
 name = "t-rt-sigaction"
@@ -297,10 +265,6 @@ name = "t-signalfd"
 path = "src/bin/syscall/t-signalfd.rs"
 
 [[bin]]
-name = "t-splice"
-path = "src/bin/syscall/t-splice.rs"
-
-[[bin]]
 name = "t-statfs"
 path = "src/bin/syscall/t-statfs.rs"
 
@@ -313,24 +277,12 @@ name = "t-statx"
 path = "src/bin/syscall/t-statx.rs"
 
 [[bin]]
-name = "t-sync"
-path = "src/bin/syscall/t-sync.rs"
-
-[[bin]]
 name = "t-syslog"
 path = "src/bin/syscall/t-syslog.rs"
 
 [[bin]]
 name = "t-timer-create"
 path = "src/bin/syscall/t-timer-create.rs"
-
-[[bin]]
-name = "t-timerfd"
-path = "src/bin/syscall/t-timerfd.rs"
-
-[[bin]]
-name = "t-truncate"
-path = "src/bin/syscall/t-truncate.rs"
 
 [[bin]]
 name = "t-tty-eintr"
@@ -343,10 +295,6 @@ path = "src/bin/syscall/t-tty-nonblock.rs"
 [[bin]]
 name = "t-tty-query"
 path = "src/bin/syscall/t-tty-query.rs"
-
-[[bin]]
-name = "t-dsp"
-path = "src/bin/syscall/t-dsp.rs"
 
 [[bin]]
 name = "t-dhcp"
@@ -379,10 +327,6 @@ path = "src/bin/syscall/t-waitid.rs"
 [[bin]]
 name = "t-wait-eintr"
 path = "src/bin/syscall/t-wait-eintr.rs"
-
-[[bin]]
-name = "t-xattr"
-path = "src/bin/syscall/t-xattr.rs"
 
 [lints]
 workspace = true

@@ -75,8 +75,7 @@ fn main() {
     };
     r.check(
         "io_uring_enter answers ENOSYS",
-        refused(enter as isize, libc::ENOSYS)
-            || mpos_user_tests::host_run() && enter == -1,
+        refused(enter as isize, libc::ENOSYS) || mpos_user_tests::host_run() && enter == -1,
     );
     r.check(
         "io_uring_register answers ENOSYS",
