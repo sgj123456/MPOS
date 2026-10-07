@@ -256,9 +256,6 @@ path = "src/bin/syscall/t-fcntl.rs"
 name = "t-filelock"
 path = "src/bin/syscall/t-filelock.rs"
 
-[[bin]]
-name = "t-fionbio"
-path = "src/bin/syscall/t-fionbio.rs"
 
 [[bin]]
 name = "t-fork"
@@ -307,9 +304,6 @@ path = "src/bin/syscall/t-madvise.rs"
 name = "t-maps"
 path = "src/bin/syscall/t-maps.rs"
 
-[[bin]]
-name = "t-mkdirat"
-path = "src/bin/syscall/t-mkdirat.rs"
 
 [[bin]]
 name = "t-mmap-reserve-commit"
