@@ -20,13 +20,14 @@
 //! the measurement: "a name `tests.toml` declares must be a program this arm
 //! built" has two scopes, because the two arms do not build the same file.
 //!
-//! So this module is that half. A sweep adapter (`selftest::run_tests`,
-//! `aarch64::run_sweep`) keeps only what only it can answer: which target to
-//! build, how to carry the programs to the machine, which firmware to boot under
-//! and when the run is over. Its *verdict wording* stays there too, because the
-//! two arms make different claims - one of them has a debug exit to check and
-//! the other asserts an exact count instead - and a shared sentence would have
-//! to be vague enough to cover both.
+//! So this module is that half. The run itself is one body now - x86_64's
+//! `selftest::run_tests` and the second machine's `selftest::run_disk_sweep`
+//! both end up in a disk sweep the machine parameterises - so what an adapter
+//! still keeps is what only its own arm can answer: which target to build,
+//! which firmware to boot under, and when the run is over. Its *verdict
+//! wording* stays there too, because the two arms make different claims - one
+//! of them has a debug exit to check and the other asserts an exact count
+//! instead - and a shared sentence would have to be vague enough to cover both.
 
 use anyhow::{Result, bail};
 

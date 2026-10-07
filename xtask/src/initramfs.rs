@@ -145,6 +145,13 @@ const AARCH64: Machine = Machine {
 /// missing from the farm is a boot that dies on `ENOENT` mid-script, so this list
 /// is part of the contract with `initramfs-aarch64/init` and `rootfs-aarch64/init`
 /// - [`tests::the_farm_covers_the_scripts_vocabulary`] is what holds it there.
+///
+/// `true`, `false` and `ls` are here for a *test*, not a script: `t-stdspawn`
+/// runs `/bin/{true,false,echo,cat,sh,ls}` to prove a program can start other
+/// programs, and this farm is the only `/bin` a disk root gets - the archive is
+/// what the disk is unpacked from. They used to come from a hand-written
+/// multi-call binary staged beside the payload (`xtask/src/aarch64_bin.rs`);
+/// one applet list for both machines' roots is why that file is gone.
 const AARCH64_APPLETS: &[&str] = &[
     "sh",
     "mount",
@@ -154,6 +161,9 @@ const AARCH64_APPLETS: &[&str] = &[
     "mkdir",
     "cat",
     "echo",
+    "ls",
+    "true",
+    "false",
 ];
 
 /// The machine's archive description.
@@ -312,21 +322,42 @@ fn lay_farm(machine: &Machine, staging: &Path) -> Result<()> {
             }
             Ok(())
         }
-        Farm::ByHand(applets) => {
-            // Absolute targets, because the guest resolves a symlink relative to
-            // the tree it stands in and `busybox` sits at `/bin/busybox`.
-            fs::create_dir_all(staging.join("bin"))?;
-            for applet in applets {
-                let path = staging.join(format!("bin/{applet}"));
-                if path.symlink_metadata().is_ok() {
-                    continue;
-                }
-                std::os::unix::fs::symlink("/bin/busybox", &path)
-                    .with_context(|| format!("Failed to link /bin/{applet} into the initramfs"))?;
-            }
-            Ok(())
-        }
+        Farm::ByHand(applets) => link_applets(staging, applets),
     }
+}
+
+/// Link this machine's applet farm into a tree of the caller's own.
+///
+/// A boot disk's root is the archive unpacked ([`unpack_into`]) plus whatever
+/// is staged over it, and the applets a *test* execs are not something the
+/// archive's own scripts happen to name - `t-stdspawn` runs `/bin/true` and
+/// `/bin/ls`, which no boot script mentions. So the disk links the same list
+/// rather than inheriting whatever the ramfs half needed, and the list stays a
+/// property of the machine instead of a second copy in the staging code.
+///
+/// Idempotent: a name already present (because the archive carried it) is left
+/// alone. The first machine's farm is laid by `busybox --install -s` inside its
+/// chroot, so there is nothing to add for it.
+pub fn link_farm(staging: &Path, arch: Arch) -> Result<()> {
+    match machine(arch).farm {
+        Farm::ByHand(applets) => link_applets(staging, applets),
+        Farm::Chroot => Ok(()),
+    }
+}
+
+fn link_applets(staging: &Path, applets: &[&str]) -> Result<()> {
+    // Absolute targets, because the guest resolves a symlink relative to
+    // the tree it stands in and `busybox` sits at `/bin/busybox`.
+    fs::create_dir_all(staging.join("bin"))?;
+    for applet in applets {
+        let path = staging.join(format!("bin/{applet}"));
+        if path.symlink_metadata().is_ok() {
+            continue;
+        }
+        std::os::unix::fs::symlink("/bin/busybox", &path)
+            .with_context(|| format!("Failed to link /bin/{applet} into the initramfs"))?;
+    }
+    Ok(())
 }
 
 /// Pack the staging tree as the archive both kernels' `vfs::tar` reads.
@@ -366,6 +397,34 @@ pub fn ensure(build_dir: &Path, arch: Arch) -> Result<()> {
 pub fn ensure_path(build_dir: &Path, arch: Arch) -> Result<PathBuf> {
     ensure(build_dir, arch)?;
     Ok(machine(arch).tar_path(build_dir))
+}
+
+/// The archive, unpacked into `dest`.
+///
+/// A boot disk's root and an early userspace are the same tree: the one that
+/// pivots and the one it pivots *onto* both want a shell, the applet farm and
+/// the directories a mount lands on, and those are exactly what the archive
+/// carries. So the second machine's disk is laid from this archive with its
+/// overlays and payload merged over the top, which is the same arrangement the
+/// first machine's test boot builds by hand (`selftest`'s unpack-then-stage
+/// step) rather than a second tree maintained alongside this one.
+pub fn unpack_into(build_dir: &Path, arch: Arch, dest: &Path) -> Result<()> {
+    let tar = ensure_path(build_dir, arch)?;
+    fs::create_dir_all(dest)?;
+    let unpacked = Command::new("tar")
+        .arg("-xf")
+        .arg(&tar)
+        .arg("-C")
+        .arg(dest)
+        // The archive is packed `--owner=0`; unpacking as an ordinary user
+        // must not try to *become* root to write it.
+        .arg("--no-same-owner")
+        .status()
+        .with_context(|| format!("Failed to unpack {}", tar.display()))?;
+    if !unpacked.success() {
+        anyhow::bail!("The initramfs did not unpack into {}", dest.display());
+    }
+    Ok(())
 }
 
 /// True when the archive is missing or older than what it is built from: the

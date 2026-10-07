@@ -158,7 +158,7 @@ const BASELINE_LOWER_LAYER_TO_SYSCALL: &[(&str, usize)] = &[
 /// this preserves that: it is a *second* list, not a merge. The `drivers ↔ sched`
 /// pair is gone with the last edge, and closing it is the precondition for
 /// un-gating `sched` for aarch64 (`PLAN.md` §9.1).
-
+///
 /// The measured graph: module-level edges, weighted by how many references
 /// carry them.
 pub struct Graph {

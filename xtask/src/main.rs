@@ -6,12 +6,11 @@
 //! that user afterwards.
 
 mod aarch64;
-mod aarch64_bin;
-mod aarch64_init;
 mod arch;
 mod config;
 mod depgraph;
 mod disk;
+mod fat;
 mod gates;
 mod initramfs;
 mod qemu;
@@ -99,13 +98,13 @@ enum Commands {
     /// Measure the kernel's module graph and check it against the ratchet
     /// (PLAN.md §11.2 Step G), so the cycle count cannot grow back
     Depgraph,
-    /// Build the aarch64 kernel and its UEFI loader, lay out an ESP and boot it
-    /// under AAVMF. The second machine's own boot path, and stage 1e's
-    /// instrument: it reads the verdict off the PL011 (`PLAN.md` §9.1)
+    /// Build the aarch64 kernel and its UEFI loader, lay out the same GPT boot
+    /// disk the first machine boots off, and boot it under AAVMF, reading the
+    /// verdict off the PL011 marker chain (`PLAN.md` §9.1)
     BootAarch64,
     /// Install a real Alpine aarch64 userland into the second machine's disk
     /// image and boot it headless, reporting how far it gets
-    /// (`PLAN.md` §9.1 stage 7). Unprivileged: the install runs under
+    /// (`PLAN.md` §13.12). Unprivileged: the install runs under
     /// `fakeroot`, so the tree keeps root ownership without taking root
     AlpineAarch64,
     /// Remove the build and target directories
@@ -318,12 +317,14 @@ fn main() -> Result<()> {
 
     let result = dispatch(
         cli.command,
-        arch,
-        &build_dir,
-        &profile,
-        artefacts_ready,
-        run_needs_build,
-        boot_mode,
+        Invocation {
+            arch,
+            build_dir: &build_dir,
+            profile: &profile,
+            artefacts_ready,
+            run_needs_build,
+            mode: boot_mode,
+        },
         sweep::Selection {
             groups: cli.groups.clone(),
             all: cli.all_groups,
@@ -387,16 +388,37 @@ fn needs_kernel(command: Commands, run_needs_build: bool) -> bool {
     }
 }
 
-fn dispatch(
-    command: Commands,
+/// What every command's dispatch needs to know about *this* invocation: the
+/// machine, where the build lands, which profile it uses, and the facts the
+/// pre-dispatch steps in [`main`] worked out (which artefacts are already
+/// current, and which mode the emulator should boot with).
+///
+/// A struct rather than seven arguments because these travel together as one
+/// thing - they are the resolved command line - and because it keeps the
+/// `match` below readable: each arm names only the fields it actually reads.
+struct Invocation<'a> {
     arch: Arch,
-    build_dir: &Path,
-    profile: &str,
+    build_dir: &'a Path,
+    profile: &'a str,
+    /// Set when the kernel and loader are known to be current, so a command
+    /// that would otherwise rebuild them can skip it.
     artefacts_ready: bool,
+    /// Set when `run` has to build before it boots.
     run_needs_build: bool,
+    /// The mode the emulator should boot with, already resolved from
+    /// `--mode`/`machine.toml`/the image's own marker.
     mode: config::RunMode,
-    tests: sweep::Selection,
-) -> Result<()> {
+}
+
+fn dispatch(command: Commands, invocation: Invocation<'_>, tests: sweep::Selection) -> Result<()> {
+    let Invocation {
+        arch,
+        build_dir,
+        profile,
+        artefacts_ready,
+        run_needs_build,
+        mode,
+    } = invocation;
     match command {
         Commands::Build => utils::build_kernel(profile, arch),
         Commands::Initramfs => initramfs::build_initramfs(build_dir, arch),
@@ -417,22 +439,17 @@ fn dispatch(
             rootfs::ensure(build_dir, profile)
         }
         Commands::Run => qemu::run_qemu(build_dir, profile, artefacts_ready, run_needs_build, mode),
-        // The two sweeps are separate paths rather than one parameterised
-        // sweep: x86_64 boots a test initramfs on the QEMU wiring in
-        // `machine.toml` and the guest ends the machine with a debug exit,
-        // while aarch64 packs a musl runner and the test programs onto its own
-        // ESP and disk and ends on `=== END`. What they share is the verdict:
-        // the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol, read by the same
-        // shape of check.
+        // Both machines run the same sweep now: a disk with the test payload
+        // staged on its root, the shared `TEST_INIT` walking `/bin/t-*`, and
+        // the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol read off the
+        // serial line (`selftest::run_disk_sweep`). What still differs is the
+        // *selection*: x86_64's programs are named by `tests.toml`'s groups,
+        // and aarch64's group vocabulary does not exist yet, so this arm
+        // refuses a selection it cannot honour rather than running a different
+        // set than was asked for.
         Commands::Test => match arch {
             Arch::X86_64 => selftest::run_tests(build_dir, profile, tests),
             Arch::Aarch64 => {
-                // The aarch64 payload is every aarch64 program that builds; the
-                // group vocabulary in `tests.toml` names the x86_64 suites'
-                // membership (and the bare-metal conformance suite has no
-                // aarch64 port yet), so honouring `--groups` here would be a
-                // selection this arm cannot make. Refuse rather than run a
-                // different set than asked for.
                 if !tests.groups.is_empty() || tests.all {
                     anyhow::bail!(
                         "--groups/--all-groups select among x86_64's programs today; \
@@ -440,16 +457,15 @@ fn dispatch(
                          (PLAN.md §13.5)"
                     );
                 }
-                aarch64::run_sweep(build_dir, profile)
+                selftest::run_disk_sweep(build_dir, profile, arch)
             }
         },
         Commands::Depgraph => depgraph::run(&utils::project_root()?),
-        // The second machine's own boot path: it builds this machine's kernel
-        // and loader pair through `build_kernel(.., Arch::Aarch64)` like every
-        // other command does now, then lays out the ESP and disk that are its
-        // own - which is the half `build_kernel` cannot know.
+        // The second machine's own entry points. Each builds this machine's
+        // kernel and loader pair through `build_kernel(.., Arch::Aarch64)` like
+        // every other command, then lays the disk that is its own payload's -
+        // which is the half the shared build cannot know.
         Commands::BootAarch64 => aarch64::run(build_dir, profile),
-        // Also builds both binaries itself, and lays out its own ESP and disk.
         // Unprivileged by construction: the Alpine install runs under
         // `fakeroot`, so this command needs no sudo and is *not* in the
         // `needs_root` list below.

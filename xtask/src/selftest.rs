@@ -364,7 +364,7 @@ fn build_test_initramfs(build_dir: &Path, tests: &[&UserTest]) -> Result<PathBuf
     Ok(tar)
 }
 
-/// The `/init` of the test initramfs. busybox is driven by absolute path
+/// ... of the test initramfs. busybox is driven by absolute path
 /// because the archive's applet links are the only ones it has; every program
 /// matching `/bin/t-*` is a test, and `poweroff -f` is what ends the run -
 /// the kernel answers `reboot(RB_POWER_OFF)` with QEMU's debug exit.
@@ -372,7 +372,13 @@ fn build_test_initramfs(build_dir: &Path, tests: &[&UserTest]) -> Result<PathBuf
 /// Which programs are in `/bin` at all *is* the test selection: the guest has
 /// no opinion about which tests it runs, it runs what it was given, so
 /// `tests.toml` decides the sweep simply by deciding what is staged here.
-const TEST_INIT: &str = r#"#!/bin/sh
+///
+/// Both machines run this one script. The second machine stages the same
+/// programs onto its *disk* rather than into the archive (its boot pivots onto
+/// a root filesystem, so that is where a payload has to sit), but the runner,
+/// the protocol and the selection are one implementation - which is why this
+/// constant is readable from `disk` rather than private to this file.
+pub(crate) const TEST_INIT: &str = r#"#!/bin/sh
 # mpos self-test: run every test program in /bin, then end the machine.
 
 /bin/busybox mount -t proc     proc     /proc
@@ -620,12 +626,360 @@ fn report(tests: &[&UserTest], built: usize, text: &str, status: Option<i32>) ->
     }
 }
 
+// ---------------------------------------------------------------------------
+// The sweep whose payload rides on the disk.
+//
+// The first machine's boot runs its payload out of the boot archive (there is
+// no disk to pivot onto), so its programs are packed into the initramfs above.
+// A machine that switches root - which is what `steps.rs`'s shared five steps
+// do - has to have them on the tree it switches *to*: the runner is `/init` on
+// the disk root, and the programs sit beside it under the same `/bin/t-*` names
+// the shared runner script walks. Everything else - the selection, the
+// protocol, the report - is the implementation above.
+// ---------------------------------------------------------------------------
+
+/// The image size a disk sweep asks for. The payload is every std-side program
+/// built for the machine (~5.6 MB), so this is its number rather than one every
+/// boot pays for.
+const SWEEP_DISK_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Run the sweep for a machine whose boot pivots onto a disk root.
+///
+/// `arch` is the machine, and it is the only thing this needs to know: the musl
+/// target its programs are compiled for, the node its console is called, and the
+/// boot media `crate::disk` lays for it. The verdict is the shared
+/// `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol, read by [`crate::sweep`].
+///
+/// `=== END` is what ends the poll: unlike the first machine's sweep there is no
+/// debug exit to wait for - the runner ends the machine itself, so the harness's
+/// own last line is the terminator.
+pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
+    // The kernel this sweep boots has to be the current one, and it is this
+    // arm's own build: the first machine's is done by `run_tests`, and `main`
+    // does not build for `test` on either machine.
+    utils::build_kernel(profile, arch)?;
+    println!();
+    let (kernel, loader) = (
+        utils::kernel_path(profile, arch)?,
+        utils::loader_path(profile, arch)?,
+    );
+    let built = build_std_tests(arch)?;
+    println!("user tests: {} {} programs built", arch.name(), built.len());
+
+    // The check below is what keeps the naming honest, and it is this arm's own
+    // rather than `sweep`'s: it is about *this machine's* group specifically, and
+    // what it refuses is a gap declared here that this payload does not build. A
+    // gap has to be a program this machine was asked about and could not serve; a
+    // name in its group that this payload never builds is a claim about the ABI
+    // that nothing in the sweep can check - the other arm stages the name (it
+    // builds every program), and this one has nothing to leave out - so it would
+    // sit in the file looking like a measured gap for ever.
+    let config = sweep::load_config()?;
+    let machine = crate::config::Machine::Aarch64;
+    let built_names: Vec<String> = built.iter().map(|(name, _)| name.clone()).collect();
+    let unbuilt = gaps_without_programs(&config, machine, &built_names);
+    if !unbuilt.is_empty() {
+        bail!(
+            "tests.toml names {}, as gaps for this machine, which its payload \
+             does not build: a gap nobody can check is not a gap",
+            unbuilt.join(", ")
+        );
+    }
+
+    // The selection is `sweep`'s - the same questions about `tests.toml` the
+    // other arm asks - and the flags are empty because `main` refuses
+    // `--groups` on this arm before it gets here (this payload's group
+    // vocabulary is the first machine's suites' membership).
+    let plan = sweep::select(machine, &config, &built, &sweep::Selection::default())?;
+    let tests = &plan.staged;
+
+    // The runner is the *shared* one: the same `#!/bin/sh` script the first
+    // machine's test boot is handed, because what a sweep is does not change
+    // with the machine - a program is exec'd, its exit status becomes a
+    // `=== PASS`/`=== FAIL` line, and the run ends with `poweroff -f`. What is
+    // this machine's own is only *where the payload sits*.
+    //
+    // No in-tree applet farm: the disk's root is the archive the shared
+    // `initramfs` pipeline builds, so `/bin/busybox`, the shell and the
+    // directories a mount lands on are the ones that pipeline installs for this
+    // machine - the same ones the *ramfs* half runs - instead of a second,
+    // hand-written multi-call binary maintained beside them.
+    let mut entries: Vec<(&str, &[u8])> = vec![("init", TEST_INIT.as_bytes())];
+    let paths: Vec<String> = plan
+        .staged
+        .iter()
+        .map(|(name, _)| format!("bin/{name}"))
+        .collect();
+    for (path, (_, bytes)) in paths.iter().zip(plan.staged.iter()) {
+        entries.push((path.as_str(), bytes.as_slice()));
+    }
+    let cmdline = format!(
+        "console={} mpos.selftest root=/dev/vda2 rootfstype=ext4\n",
+        arch.console()
+    );
+    let esp = crate::disk::boot_media(
+        build_dir,
+        arch,
+        &crate::disk::Boot {
+            kernel: &kernel,
+            loader: &loader,
+            entries: &entries,
+            disk_bytes: SWEEP_DISK_BYTES,
+            root: None,
+            cmdline: &cmdline,
+        },
+    )?;
+    println!("esp:    {}", esp.display());
+
+    // How long the guest may run before the harness gives up on it: the shared
+    // `MPOS_TEST_TIMEOUT` answer, because a sweep that is slower on this machine
+    // than on the first one is a fact about TCG and not about the deadline.
+    let log = qemu::boot(
+        build_dir,
+        arch,
+        &esp,
+        &["=== END"],
+        Duration::from_secs(test_timeout_secs()),
+    )?;
+    print!("{log}");
+    let staged: Vec<&str> = tests.iter().map(|(name, _)| name.as_str()).collect();
+    report_disk_sweep(build_dir, arch, &staged, plan.skipped.len(), &log)
+}
+
+/// The names in `machine`'s own `tests.toml` groups that `built` does not carry.
+///
+/// Empty is the healthy answer, and the caller refuses the run when it is not:
+/// see the comment at its call site for why a gap has to be a program.
+fn gaps_without_programs(
+    config: &crate::config::TestConfig,
+    machine: crate::config::Machine,
+    built: &[String],
+) -> Vec<String> {
+    missing_programs(&config.machine_tests(machine), built)
+}
+
+/// The gap names among `gaps` that `built` does not carry.
+///
+/// Split from the `TestConfig` lookup so the rule can be tested without a file:
+/// the shipped file's own group is empty today, and a rule that can only be
+/// exercised by a non-empty file would have no test on the day the file is right.
+fn missing_programs(gaps: &[(&str, &str)], built: &[String]) -> Vec<String> {
+    gaps.iter()
+        .filter(|(_, test)| !built.iter().any(|name| name == test))
+        .map(|(_, test)| test.to_string())
+        .collect()
+}
+
+/// The std-side user test programs for `arch`, built by cargo for its musl
+/// target and read back as bytes.
+///
+/// The files cross as *data* rather than as paths: this arm's payload is a disk
+/// laid out by name, not a tar the guest unpacks.
+///
+/// Zero programs is an error, not an empty green run - a sweep that quietly runs
+/// fewer tests than asked is the one failure this must not have.
+fn build_std_tests(arch: Arch) -> Result<Vec<(String, Vec<u8>)>> {
+    let root = utils::project_root()?;
+    println!(
+        "User tests: the std-side suite for {} (mpos-user-tests)",
+        arch.name()
+    );
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "mpos-user-tests",
+            "--target",
+            arch.musl_target(),
+        ])
+        .current_dir(&root)
+        .status()
+        .context("Failed to run cargo for the user tests")?;
+    if !status.success() {
+        bail!("the {} std-side user tests did not build", arch.name());
+    }
+
+    let dir = utils::target_dir()?.join(format!("{}/release", arch.musl_target()));
+    let mut tests = Vec::new();
+    for entry in fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !name.starts_with("t-") || !path.is_file() {
+            continue;
+        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+        // Cargo writes a `.d` dep-info file beside every binary, and its name
+        // starts with `t-` too. Staging one makes the runner exec a text file
+        // and report `exit=127`, which reads like a broken program rather than a
+        // broken payload - so the payload is the ELF magic, not the name.
+        if !bytes.starts_with(b"\x7fELF") {
+            continue;
+        }
+        tests.push((name, bytes));
+    }
+    tests.sort_by(|a, b| a.0.cmp(&b.0));
+    if tests.is_empty() {
+        bail!(
+            "no {} test program was built under {} - the sweep would have \
+             reported a green zero",
+            arch.name(),
+            dir.display()
+        );
+    }
+    Ok(tests)
+}
+
+/// This arm stages *bytes*: the binary is read here and laid on the ext4 image
+/// by name, because the payload is a disk the guest does not unpack. The name is
+/// the only part `sweep` needs.
+impl sweep::TestProgram for (String, Vec<u8>) {
+    fn name(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Read a disk sweep's verdict out of the log.
+///
+/// Three facts have to agree, and each is a different way for the run to be
+/// less than it looks: every program that was staged has to appear (a log that
+/// stops early still contains the passes it got through), no program may have
+/// failed, and the runner's own summary line has to be there - the same shape
+/// [`report`] checks, because both are claims about a machine someone has to be
+/// able to quote.
+///
+/// `staged` is the programs this run asked the machine about and `left_out` how
+/// many `tests.toml` named instead - the latter counted, never hidden: a green
+/// here means "every program this machine was supposed to be able to run
+/// passed", and the names and reasons of the ones it was not are in that file,
+/// printed by the caller above.
+fn report_disk_sweep(
+    build_dir: &Path,
+    arch: Arch,
+    staged: &[&str],
+    left_out: usize,
+    log: &str,
+) -> Result<()> {
+    // The protocol is `sweep`'s - one parser for both runners. What this arm
+    // does with it is its own, because its claim differs from the first
+    // machine's: there is no debug exit to read here, so instead of quoting a
+    // status it asserts an exact count - every staged program must have left a
+    // verdict, and "some of them passed" is not a partial pass.
+    let verdict = sweep::verdict(log);
+    // The runner sets the machine up before it runs anything (it makes `/tmp`),
+    // and a setup that failed makes every "failure" below a statement about the
+    // harness rather than the kernel. So this is checked first and refuses the
+    // run outright - the one line here that is not about the programs.
+    if let Some(line) = verdict.setup_failed {
+        bail!(
+            "the {} sweep's runner could not set the machine up: {line}; \
+             nothing the programs did is evidence about the kernel until that \
+             works",
+            arch.name()
+        );
+    }
+
+    println!();
+    let Some(summary) = verdict.summary else {
+        bail!(
+            "the {} sweep never printed a summary: the run did not reach the \
+             end of the {} staged program(s); {} says how far it got",
+            arch.name(),
+            staged.len(),
+            qemu::serial_log(build_dir, arch).display()
+        );
+    };
+    println!("self-test ({}): {summary}", arch.name());
+
+    if !verdict.failed.is_empty() {
+        let mut names: Vec<&str> = verdict
+            .failed
+            .iter()
+            .map(|name| name.split_whitespace().next().unwrap_or(name))
+            .collect();
+        names.sort_unstable();
+        for name in &names {
+            println!("  FAILED {name}");
+        }
+        bail!(
+            "self-test ({}) failed: {} of {} programs did not pass: {}",
+            arch.name(),
+            names.len(),
+            staged.len(),
+            names.join(", ")
+        );
+    }
+    if verdict.passed.len() != staged.len() {
+        bail!(
+            "the {} sweep staged {} program(s) but the log carries {} verdict(s): \
+             the payload and the run disagree, which is not a partial pass",
+            arch.name(),
+            staged.len(),
+            verdict.passed.len()
+        );
+    }
+    println!(
+        "self-test ({}): all {} staged user tests passed ({} left out by \
+         tests.toml - the groups above name every one of them, with the reason \
+         in that file)",
+        arch.name(),
+        staged.len(),
+        left_out
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::Path;
 
     use super::LEAF_CRATES;
+
+    /// A gap whose program the payload does not build is a claim nothing in the
+    /// sweep can check: there is no program to leave out, so the entry would sit
+    /// in the file looking measured for ever. The rule is exercised on a list
+    /// that *has* gaps, because the shipped file's own list is empty - the state
+    /// the harness cut left it in - and a test must not need the file to be
+    /// wrong to run.
+    #[test]
+    fn a_named_gap_has_to_be_a_program_the_payload_builds() {
+        let gaps = [("aarch64", "t-gone"), ("aarch64", "t-here")];
+        let built = ["t-here".to_string(), "t-openat".to_string()];
+        assert_eq!(
+            super::missing_programs(&gaps, &built),
+            vec!["t-gone".to_string()]
+        );
+        assert!(
+            super::missing_programs(&gaps, &["t-here".to_string(), "t-gone".to_string()])
+                .is_empty()
+        );
+
+        // And the repository's own file: the group exists and every gap it names
+        // is a program the payload carries. The payload is what `cargo` builds,
+        // which a unit test does not run; what it can check is that the arm's
+        // validation is consistent with the file it reads, and empty - the
+        // healthy answer - is a state this asserts as a property, not a count.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits under the repository root");
+        let config = crate::config::TestConfig::load(&root.join("tests.toml")).unwrap();
+        let machine = crate::config::Machine::Aarch64;
+        assert!(
+            config.group_names(machine).contains(&"aarch64"),
+            "the second machine's gap group is gone rather than empty"
+        );
+        let gaps: Vec<String> = config
+            .machine_tests(machine)
+            .into_iter()
+            .map(|(_, test)| test.to_string())
+            .collect();
+        assert!(super::gaps_without_programs(&config, machine, &gaps).is_empty());
+    }
 
     /// The aarch64 user programs are built by cargo (rather than by the
     /// hand-driven `rustc` that builds `boot-aarch64`'s `/musl` helper), so the

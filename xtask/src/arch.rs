@@ -11,8 +11,10 @@
 //! to carry its own copy of both target triples for exactly that reason.
 //!
 //! What is *not* here is what each machine's boot needs: the ESP layout, the
-//! firmware, the disk. Those live in `aarch64.rs` and `qemu.rs`, which is where
-//! the two machines' paths genuinely diverge.
+//! firmware, the disk. Those live in `disk.rs` and `qemu.rs`, both of which
+//! take an [`Arch`] and answer per-machine from it - which is the whole point
+//! of this module: the two machines' boot paths are *one* body parameterised by
+//! this type, not two bodies (`PLAN.md` §15.18).
 
 use anyhow::Result;
 
@@ -62,6 +64,18 @@ impl Arch {
         }
     }
 
+    /// The target triple the *user programs* a sweep runs are compiled for.
+    ///
+    /// Static musl on both machines: the loader execs these with no dynamic
+    /// linker to find, and the same crate builds them - so a sweep's programs
+    /// are one `cargo build` whose target is this machine's answer.
+    pub const fn musl_target(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "x86_64-unknown-linux-musl",
+            Arch::Aarch64 => "aarch64-unknown-linux-musl",
+        }
+    }
+
     /// The target triple the UEFI *loader* is compiled for.
     ///
     /// Always passed to cargo rather than left to `boot/.cargo/config.toml`,
@@ -72,6 +86,83 @@ impl Arch {
         match self {
             Arch::X86_64 => "x86_64-unknown-uefi",
             Arch::Aarch64 => "aarch64-unknown-uefi",
+        }
+    }
+
+    /// The QEMU system emulator that runs this machine.
+    ///
+    /// The one name a boot cannot derive from the target triple: it is the
+    /// emulator's own, and `qemu-system-aarch64` on an aarch64 *host* would be
+    /// a different machine than the one this front end builds.
+    pub const fn qemu_binary(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "qemu-system-x86_64",
+            Arch::Aarch64 => "qemu-system-aarch64",
+        }
+    }
+
+    /// The UEFI variable store's file name under `build/`, per machine.
+    ///
+    /// Each machine's firmware ships its own - OVMF's is the 4 MiB build,
+    /// AAVMF's is not - so the copy a boot writes has to be the one that
+    /// firmware can read, and a shared name would hand the second machine the
+    /// first one's variables.
+    pub const fn firmware_vars(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "OVMF_VARS.4m.fd",
+            Arch::Aarch64 => "AAVMF_VARS.fd",
+        }
+    }
+
+    /// The name this machine's console has on the kernel command line and in
+    /// `/dev`.
+    ///
+    /// `ttyS0` is the 16550 the PC machine carries; `ttyAMA0` is the PL011 the
+    /// `virt` machine's device tree describes. Every place that writes a
+    /// `console=` or an `/etc/inittab` line has to agree with the driver that
+    /// answers, and asking here is what keeps them from disagreeing.
+    pub const fn console(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "ttyS0",
+            Arch::Aarch64 => "ttyAMA0",
+        }
+    }
+
+    /// The file name the firmware looks for in `EFI/BOOT/` on the ESP.
+    ///
+    /// Fixed by the UEFI specification per machine, not chosen: a loader
+    /// installed under any other name is not bootable, and the failure is a
+    /// firmware message about no bootable device rather than anything naming
+    /// the file.
+    pub fn uefi_boot_file(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "BOOTX64.EFI",
+            Arch::Aarch64 => "BOOTAA64.EFI",
+        }
+    }
+
+    /// The one disk image this machine boots, under `build/`.
+    ///
+    /// Both are the same thing now - a GPT carrying an ESP and an ext4 root -
+    /// and the names are historic rather than meaningful, so they are kept:
+    /// the first machine's is what `rootfs` and `disk` have always written,
+    /// and renaming it would invalidate every stamp on disk.
+    pub fn disk_image(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "mpos-uefi-x86_64.img",
+            Arch::Aarch64 => "aarch64-disk.img",
+        }
+    }
+
+    /// The overlay tree that carries this machine's half of a root filesystem:
+    /// its `/init`, its `etc/`, whatever only this machine needs.
+    ///
+    /// `rootfs-core/` is shared and is merged before it by
+    /// `rootfs::merge_overlays`; this is the per-machine tree merged after.
+    pub fn root_overlay(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "rootfs",
+            Arch::Aarch64 => "rootfs-aarch64",
         }
     }
 }

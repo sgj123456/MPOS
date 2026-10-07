@@ -1305,9 +1305,291 @@ fn install_boot_files(
     Ok(())
 }
 
+/// Install a real Alpine userland for `arch` into a staging tree and return it.
+///
+/// This is the one place the two machines' *userlands* differ, and the reason is
+/// a fact about each machine rather than a taste: x86_64 boots a desktop
+/// (`rootfs.toml`: weston, mesa, DRM, seatd), while the second machine has no
+/// GPU, no DRM and no PCI bus to hang the card on, so its Alpine tree is the
+/// smallest one that boots to a login prompt - `alpine-base` and `openrc`, the
+/// packages `rootfs.toml`'s `[aarch64]` half names. What is *not* duplicated is
+/// the install: the repositories text, the keys, the mirror and the apk lookup
+/// are this file's own helpers, and only the tree they are pointed at differs.
+///
+/// Two choices are load-bearing and both are measured:
+///
+///   * **`fakeroot`, not `--usermode`.** A cross-arch `apk` cannot run the
+///     packages' post-install scripts - they are the *target's* binaries and the
+///     host cannot exec them (`execve: Exec format error`, measured) - so
+///     `--no-scripts` is required, and the applet farm such a script would build
+///     is made at first boot instead (see that machine's overlay `init`). But
+///     `--usermode` writes every file owned by whoever ran the build, and
+///     `/etc/shadow` mode 0600 owned by a uid that is not root is a login that
+///     cannot read its own password file. `fakeroot` gives the tree root
+///     ownership without taking root, so this command stays unprivileged.
+///   * **the overlay is core + the machine's own tree, not `rootfs/`.** The
+///     shared half of both userlands lives in `rootfs-core/` (`inittab`, the
+///     network, the resolver, doas); what stays the machine's own is the `/init`
+///     that mounts the pseudo-filesystems a real init expects. The x86_64 side
+///     does that from its initramfs script; the second machine's disk `/init` is
+///     where that work lives. After the trees merge, the same generated layer
+///     the first install runs - hostname, locale, the securetty cleanup, the
+///     resolver - lands here too: it is pure file I/O, and §13.12's prompt said
+///     `localhost` precisely because this path skipped it.
+pub fn install_alpine_root(build_dir: &Path, arch: Arch) -> Result<PathBuf> {
+    let root = utils::project_root()?;
+    let config = RootfsConfig::load(&root.join("rootfs.toml"), arch)?;
+    let staging = alpine_staging(build_dir, arch);
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging)
+        .with_context(|| format!("Failed to create {}", staging.display()))?;
+
+    // Repositories and keys first, the way `install_base` does it: apk decides a
+    // repository index is trusted by finding a key whose filename matches the
+    // name in the index's signature, and without them every package answers
+    // `UNTRUSTED signature` and then `no such package`.
+    fs::create_dir_all(staging.join("etc/apk/keys"))?;
+    fs::write(
+        staging.join("etc/apk/repositories"),
+        utils::repositories_text(&config.mirror, &config.branch, &config.repos),
+    )?;
+    utils::install_apk_keys(&staging.join("etc/apk/keys"))?;
+
+    let apk = utils::find_apk_tool(build_dir, &config.mirror, &config.branch)?;
+    let mut packages = config.base_packages.clone();
+    packages.extend(config.extra_packages.iter().cloned());
+    // The same retry the x86_64 install wraps its `apk add` in. Its reason was
+    // NBD I/O errors under heavy write load; a cross-arch tree has no nbd
+    // device, but the failure it guards is the mirror fetch mid-install, and
+    // "apk records what it did manage to install, so a plain re-run finishes the
+    // job" is the answer for either producer. `fakeroot` rides in through the
+    // preflags, so the command shape is unchanged.
+    apk_add(
+        &["fakeroot", "--", apk.as_str()],
+        &staging,
+        &[
+            "--arch",
+            config.arch.as_str(),
+            "--update-cache",
+            "--initdb",
+            "--no-scripts",
+        ],
+        &packages,
+    )?;
+
+    // The overlay pair, and the inittab rendered with it (`merge_overlays`'s
+    // rule: a staged tree never carries an unrendered placeholder). The stock
+    // answer for the installed tree; a session re-renders against its own mode
+    // before laying the disk.
+    merge_overlays(&root, arch.root_overlay(), &staging, &config, false)?;
+    // The runlevels, from the same table the x86_64 image uses: a service whose
+    // script a machine's package set does not carry is named and skipped, so one
+    // list serves both machines. Without this the boot would hand pid 1 to a
+    // busybox init whose `::sysinit:/sbin/openrc sysinit` lines run against empty
+    // runlevel directories - an Alpine userland that starts no service at all.
+    enable_services(&staging)?;
+    // And the module index, for the same reason and from the same helper the
+    // x86_64 install uses: the `modules` service this table turns on reads
+    // `/etc/modules` - `af_packet` and `ipv6` here - and asks `modprobe` for each
+    // name, so without `/lib/modules/<release>` the boot prints "can't change
+    // directory to '/lib/modules'" for every line. `modules.builtin` is how a
+    // machine with no loadable modules answers that honestly: a hit means "already
+    // loaded", exit 0, nothing printed. The names are the same ones on both
+    // machines because they are one kernel's code, and the directory is named for
+    // the release both machines report (`uname -r` is one number).
+    write_modules(&staging)?;
+    // The generated system layer, now that the cross-arch install can consume
+    // it: `system.hostname` becomes `/etc/hostname` (without it the prompt
+    // says `localhost`, which §13.12 had to name rather than fix), the locale
+    // export lands in `/etc/profile.d`, the passwordless shadow clearing makes
+    // the login actually work, the securetty cleanup keeps `login` from calling
+    // an empty password a wrong one, and the init.d chmod sweep is the one
+    // thing OpenRC silently refuses without. All pure file I/O - none of it
+    // needs the image's binaries to run, which is the whole boundary (§13.19).
+    write_shared_config(&staging, &config)?;
+    // The probe file the kernel's filesystem check reads (see
+    // [`crate::disk::PROBE_FILE`]). It sits at the root of a real Alpine tree
+    // because the check is about the *block driver and the filesystem*, which
+    // the machine must prove on whichever root it boots - and the proof is the
+    // file's known bytes, not a name it happens to have. Written here rather
+    // than in a machine's overlay so the two roots' copies come from one
+    // constant and cannot drift.
+    fs::write(
+        staging.join(crate::disk::PROBE_FILE),
+        crate::disk::PROBE_BYTES,
+    )
+    .with_context(|| format!("Failed to lay the probe file on {}", staging.display()))?;
+    // The resolver, after the trees and the generated layer - the one file
+    // that beats a file in the tree, which is what makes `system.dns` the
+    // answer it is (`write_resolver` carries the full story; it is one slirp
+    // fact for both machines). Without this call the guest rides QEMU's
+    // forwarder into the host's loopback stub and every `apk` fetch from the
+    // *running* machine asks a question nothing answers.
+    write_resolver(&staging, &config)?;
+    println!(
+        "alpine: {} packages installed into {} for {}",
+        packages.len(),
+        staging.display(),
+        config.arch
+    );
+    Ok(staging)
+}
+
+/// Where `arch`'s Alpine staging tree lives, whether or not it is installed yet.
+pub fn alpine_staging(build_dir: &Path, arch: Arch) -> PathBuf {
+    build_dir.join(format!("{}-alpine-root", arch.name()))
+}
+
+/// The stamp that records what `arch`'s Alpine tree was installed *from*.
+fn alpine_stamp(build_dir: &Path, arch: Arch) -> PathBuf {
+    build_dir.join(format!("{}-alpine-root.stamp", arch.name()))
+}
+
+/// True when the staging tree predates something it is built from: the toml,
+/// either overlay tree, or the kernel whose release name `/lib/modules/<release>`
+/// carries (`write_modules`' directory outlives a version bump otherwise).
+/// A missing tree is stale by definition - there is nothing to reuse.
+fn alpine_root_is_stale(build_dir: &Path, arch: Arch) -> Result<bool> {
+    let root = utils::project_root()?;
+    let staging = alpine_staging(build_dir, arch);
+    let stamp = alpine_stamp(build_dir, arch);
+    if !staging.exists() || !stamp.exists() {
+        return Ok(true);
+    }
+    let since = utils::file_mtime(&stamp)?;
+    for input in [
+        // The one rootfs.toml now holds both machines' halves, so this stamp is
+        // invalidated by an edit to the *other* machine's section too. That is
+        // the price of one file describing both, and the same price the first
+        // machine's stamp pays.
+        root.join("rootfs.toml"),
+        root.join(CORE_OVERLAY),
+        root.join(arch.root_overlay()),
+    ] {
+        if utils::dir_newer_than(&input, since)? || utils::newer(&input, &stamp)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Install `arch`'s Alpine tree unless the stamp says the staging directory
+/// already holds the current one - then write the stamp. The re-lay of the ext4
+/// image happens on *every* boot-media build regardless; this stamp only decides
+/// whether the network-backed `apk` install runs. That is what makes a boot after
+/// a kernel change cost seconds instead of a package fetch, and it is the same
+/// split the first machine draws between its boot-file update and its full
+/// install.
+pub fn ensure_alpine_root(build_dir: &Path, arch: Arch) -> Result<()> {
+    if alpine_root_is_stale(build_dir, arch)? {
+        install_alpine_root(build_dir, arch)?;
+    } else {
+        println!(
+            "alpine: {} is up to date (reinstall inputs unchanged)",
+            alpine_staging(build_dir, arch).display()
+        );
+    }
+    fs::write(alpine_stamp(build_dir, arch), "alpine: staged tree\n")?;
+    Ok(())
+}
+
+/// The first openrc service failure in `log`, named by the line that explains
+/// it - or `None` when every service came up.
+///
+/// openrc marks the result of each service with `[ ok ]` or `[ !! ]`, wrapped in
+/// the terminal escapes that make the marker coloured, and it prints the
+/// service's own message on the line *above* the marker. So the search is: strip
+/// the escapes, find the marker, and walk back to the last line with anything on
+/// it - for the failure that motivated this that is `mount: mounting proc on
+/// /proc failed: Resource busy`, and for a failure that prints nothing it is the
+/// marker's own line.
+///
+/// Kept as a function rather than inlined because it is the whole of the check
+/// and the only way to test it is against a captured log; the case it was
+/// written for is a unit test below.
+pub fn openrc_failure(log: &str) -> Option<String> {
+    let plain = without_ansi(log);
+    let lines: Vec<&str> = plain.lines().collect();
+    let at = lines.iter().position(|line| line.contains("!!"))?;
+    lines[..at]
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .or_else(|| lines.get(at))
+        .map(|line| line.trim().to_string())
+}
+
+/// The log with openrc's terminal escapes removed.
+///
+/// A failure marker arrives wrapped in colour and cursor codes -
+/// `ESC[1mESC[31m !! ESC[1mESC[34m]` - so the service's own message, which is
+/// what a person needs, is two lines above a marker no `grep` will show. This
+/// strips `ESC [ ... letter` sequences and carriage returns so the line can be
+/// quoted in an error message as it was written.
+pub fn without_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => {
+                // Only CSI is used by openrc's output; anything else is left
+                // in place rather than guessed at.
+                if chars.next() == Some('[') {
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            }
+            '\r' => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The byte-for-byte block the Alpine boot printed while this kernel's
+    /// procfs had no `/proc/<pid>/environ`, copied out of a captured log.
+    ///
+    /// It is here rather than paraphrased because the escapes *are* the case:
+    /// openrc writes the service's message, then moves the cursor back to the
+    /// start of the line and overwrites it with the coloured marker, so a
+    /// checker that searched the raw text for the mount error would find
+    /// nothing on the marker's line and a checker that searched for `!!` in the
+    /// raw text would still have to know it is the failure colour and not the
+    /// success one.
+    const FAILING_PROC_MOUNT: &str = " \x1b[1m\x1b[32m*\x1b[m Mounting /proc\x1b[K ...\r\r\n\
+         mount: mounting proc on /proc failed: Resource busy\r\r\n\
+         \x1b[A\x1b[153C \x1b[1m\x1b[34m[\x1b[1m\x1b[31m !! \x1b[1m\x1b[34m]\x1b[m\r\r\n";
+
+    #[test]
+    fn an_openrc_service_failure_is_named_by_its_own_message() {
+        assert_eq!(
+            openrc_failure(FAILING_PROC_MOUNT).as_deref(),
+            Some("mount: mounting proc on /proc failed: Resource busy")
+        );
+
+        // A healthy runlevel is `None`, and the success marker shares the
+        // marker's brackets - which is the whole reason the check looks for the
+        // failure colour's text and not for a bracket.
+        let healthy = " \x1b[1m\x1b[32m*\x1b[m Starting local\x1b[K ...\r\r\n\
+             \x1b[A\x1b[153C \x1b[1m\x1b[34m[\x1b[1m\x1b[32m ok \x1b[1m\x1b[34m]\x1b[m\r\r\n\
+             Welcome to Alpine Linux 3.25.0\r\r\nmpos login: ";
+        assert_eq!(openrc_failure(healthy), None);
+
+        // And the escapes really are stripped for the message a person reads,
+        // rather than merely skipped over.
+        assert_eq!(
+            without_ansi("a\x1b[1mb\x1b[0m\r\nc"),
+            "ab\nc",
+            "CSI sequences and carriage returns go, everything else stays"
+        );
+    }
 
     #[test]
     fn the_image_is_not_an_input_to_its_own_stamp() {
