@@ -481,7 +481,7 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     let log = build_dir.join("test-serial.log");
     let esp = esp.canonicalize()?;
     let log_path = log.display().to_string();
-    // The same command line `run` boots with, from `[qemu]` in rootfs.toml -
+    // The same command line `run` boots with, from `qemu.*` in machine.toml -
     // except that the disk is this run's ESP and the serial line goes to a
     // file, because a test reads its verdict back out of it. The share and
     // the console socket live under the build directory the same way, made

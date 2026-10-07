@@ -11,11 +11,12 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+use crate::arch::Arch;
 use crate::config::RootfsConfig;
 use crate::utils::{image_path, project_root};
 
 pub fn build_disk(build_dir: &Path, _profile: &str) -> Result<()> {
-    let config = RootfsConfig::load(&project_root()?.join("rootfs.toml"))?;
+    let config = RootfsConfig::load(&project_root()?.join("rootfs.toml"), Arch::X86_64)?;
     let image = image_path(build_dir);
 
     if image.exists() {

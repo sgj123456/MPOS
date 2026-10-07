@@ -88,7 +88,7 @@ cargo xtask [global flags] <command>
 | --- | --- | --- | --- |
 | 构建目录 | `--build-dir <PATH>` | 默认 `$MPOS_BUILD_DIR`，再默认 `build/` | default `$MPOS_BUILD_DIR`, else `build/` |
 | 构建档 | `--profile <NAME>` | 默认 `$PROFILE`，再默认 `debug`；发布用 `--profile release` | default `$PROFILE`, else `debug`; use `--profile release` |
-| 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror`（默认取 `machine.toml` 的 `[qemu] mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror` (defaults to `[qemu] mode` in `machine.toml`, else `mirror`) |
+| 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror`（默认取 `machine.toml` 的 `qemu.mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror` (defaults to `qemu.mode` in `machine.toml`, else `mirror`) |
 | 机器 | `--arch <ARCH>` | 全局：`x86_64`（默认）或 `aarch64`。三条路都真的处理那台机器：`run` 让第二台机器把 pid 1 交给它自己的 shell（`/init` 建好 `/tmp` 后 `execve("/bin/sh")`，`/bin` 是仓库内建的多调用二进制，见下），`test` 走它自己的 sweep（见下），`initramfs` 建那台机器的归档（见下）。`disk`/`rootfs`/`all` 组装的是 x86_64 的磁盘镜像，`--arch aarch64` 按名拒绝 | global: `x86_64` (default) or `aarch64`. Three commands really handle that machine: `run` hands the second one's pid 1 to its own shell (`/init` makes `/tmp` and `execve`s `/bin/sh`; `/bin` is the repository's multi-call binary — see below), `test` takes its own sweep (below), and `initramfs` builds that machine's archive (below). `disk`/`rootfs`/`all` assemble the x86_64 disk image, so `--arch aarch64` is refused by name |
 | 测试分组 | `--groups <A,B>` | 仅 `test`：除分组外的测试之外再跑这些分组（取代 `tests.toml` 的 `default`）| `test` only: run these groups *in addition* to the ungrouped tests (replaces the file's `default`) |
 | 全部分组 | `--all-groups` | 仅 `test`：连非默认分组一起跑 | `test` only: run every group, including the ones left out by default |
@@ -112,7 +112,7 @@ cargo xtask [global flags] <command>
 
 | 变量 | variable | 作用 | meaning |
 | --- | --- | --- | --- |
-| `MEM` | `MEM=2048` | 覆盖本次启动的内存(MB)，优先于 `machine.toml` 的 `[qemu] memory` | one-off memory override, wins over `[qemu] memory` in `machine.toml` |
+| `MEM` | `MEM=2048` | 覆盖本次启动的内存(MB)，优先于 `machine.toml` 的 `qemu.memory` | one-off memory override, wins over `qemu.memory` in `machine.toml` |
 | `ACCEL` | `ACCEL=kvm` / `tcg` | 强制 QEMU 加速器，否则自动探测 | force the accelerator, else autodetected |
 | `MPOS_TEST_TIMEOUT` | 秒 seconds | `test` 里虚拟机最长运行时间（默认 900） | per-VM timeout for `test` (default 900s) |
 | `MPOS_BUILD_DIR` | path | 默认构建目录 | default build directory |
@@ -166,41 +166,45 @@ code rather than a stale image.
 ## 配置：`rootfs.toml` 与 `machine.toml`（仓库根目录 | repo root）
 
 配置分成两个文件，分界不是按大小而是按**代价**：`rootfs.toml` 的 mtime 决定要不要重装
-Alpine 全树（三十多个包，走网络），`machine.toml` 里改任何东西都不会动镜像。
+Alpine 全树（三十多个包，走网络），`machine.toml` 里改任何东西都不会动镜像。每份配置
+都只有一个文件、同时描述**两台**机器，用三个段：`[default]` 是共享基线，`[x86_64]` /
+`[aarch64]` 各自覆盖它——键名自带前缀（`qemu.memory`、`rootfs.arch`、`system.hostname`）。
 
 The configuration is two files, and the line between them is cost rather than
 tidiness: `rootfs.toml`'s mtime is what decides whether the Alpine tree is
-reinstalled, so nothing that is not part of the image lives there.
+reinstalled, so nothing that is not part of the image lives there. Each file
+describes **both** machines in three sections — `[default]` is the shared baseline
+and `[x86_64]`/`[aarch64]` override it — with keys dotted by what they belong to.
 
 | 文件 | file | 内容 | contents |
 | --- | --- | --- | --- |
-| `rootfs.toml` | | **镜像里装什么**：`[rootfs]`（镜像站/分支/架构、`repos`、文件系统、磁盘几何 `image_size`/`esp_size`、包列表）、`[system]`（主机名、时区、语言、`dns`、`root_password`）、`[user]` | **what the image contains**: Alpine source, repositories, filesystem, disk geometry, package lists, hostname/timezone/locale/dns/root password, the extra account |
-| `machine.toml` | | **拿什么启动它**：`[qemu]` 的 `memory`、`cpus`、`vsock`、`audio`、`display`、`extra_args`、`mode`。第二台机器不共享的值以 `aarch64_` 前缀写在同一个文件里（`aarch64_memory = "256"` 胜过 `memory`），第一台机器看不到它们——一台机器一个值的，一处写一次。**设备的传输形态不在这里**：第二台机器全部走 virtio-MMIO，因为它靠自己的设备树找设备，那是机器的事实而不是设置（`xtask/src/qemu.rs::aarch64_machine_args`） | **what it is booted on**: memory, cpus, vsock, audio, window backend, extra QEMU args, the standing run mode. A value the second machine does not share is written in the same file with its own name in front (`aarch64_memory = "256"` beats `memory`) and is invisible to the first — one value per machine, written once. **The device *transports* are not here**: the second machine drives every device over virtio-MMIO, because it finds them by walking its own device tree — that is a machine fact, not a setting (`xtask/src/qemu.rs::aarch64_machine_args`) |
+| `rootfs.toml` | | **镜像里装什么**：`rootfs.*`（镜像站/分支/架构、`repos`、文件系统、磁盘几何 `image_size`/`esp_size`、包列表）、`system.*`（主机名、时区、语言、`dns`、`root_password`）、`user.*` | **what the image contains**: Alpine source, repositories, filesystem, disk geometry, package lists, hostname/timezone/locale/dns/root password, the extra account |
+| `machine.toml` | | **拿什么启动它**：`qemu.*` 的 `memory`、`cpus`、`vsock`、`audio`、`display`、`extra_args`、`mode`。第二台机器不共享的值写在它自己的 `[aarch64]` 段里（`qemu.memory = "256"` 胜过基线），第一台机器看不到它们——一台机器一个值的，一处写一次。**设备的传输形态不在这里**：第二台机器全部走 virtio-MMIO，因为它靠自己的设备树找设备，那是机器的事实而不是设置（`xtask/src/qemu.rs::aarch64_machine_args`） | **what it is booted on**: memory, cpus, vsock, audio, window backend, extra QEMU args, the standing run mode. A value the second machine does not share is written in its own `[aarch64]` section (`qemu.memory = "256"` beats the baseline) and is invisible to the first — one value per machine, written once. **The device *transports* are not here**: the second machine drives every device over virtio-MMIO, because it finds them by walking its own device tree — that is a machine fact, not a setting (`xtask/src/qemu.rs::aarch64_machine_args`) |
 
-两个键跨在线上，都是**读过去**而不是各写一份：`[system] hostname` 也用作 QEMU DHCP
-告诉客机的名字，`[rootfs] serial_port` 同时是引导控制台与镜像里 getty 的名字——它们存
+两个键跨在线上，都是**读过去**而不是各写一份：`system.hostname` 也用作 QEMU DHCP
+告诉客机的名字，`rootfs.serial_port` 同时是引导控制台与镜像里 getty 的名字——它们存
 在镜像那侧（是写进镜像的），`machine.toml` 那侧读它。
 
 Two keys cross the line and both are read *through* rather than duplicated:
-`[system] hostname` is also the name QEMU's DHCP server is told, and
-`[rootfs] serial_port` names both the boot console and the image's getty. They are
+`system.hostname` is also the name QEMU's DHCP server is told, and
+`rootfs.serial_port` names both the boot console and the image's getty. They are
 stored with the image, which is where they are written, and the machine half reads
-them from there. `image_size`/`esp_size` stay with the image because changing
+them from there. `rootfs.image_size`/`esp_size` stay with the image because changing
 either re-makes the partitions and their filesystems — a rebuild that file should
 ask for.
 
 > 需要写进根文件系统的具体文件（`/etc/inittab`、`/etc/network/interfaces`、
 > `/etc/resolv.conf`、`/etc/doas.conf` 等）作为真实文件放在 `rootfs/` 目录树里；
 > 它们会在 toml 写入的内容之后被叠加，**所以目录树里的文件优先**（唯一例外是
-> `[system] dns` 会在叠加之后重写 `resolv.conf`）。
+> `system.dns` 会在叠加之后重写 `resolv.conf`）。
 > Concrete files go in the `rootfs/` tree and are overlaid *after* anything written
-> from the toml, so the tree wins (the one exception is `[system] dns`, which
+> from the toml, so the tree wins (the one exception is `system.dns`, which
 > rewrites `resolv.conf` afterwards).
 
-`[qemu] display` 控制交互式 `run` 的窗口后端：缺省为 `sdl`；可填 `gtk` 等，或
+`qemu.display` 控制交互式 `run` 的窗口后端：缺省为 `sdl`；可填 `gtk` 等，或
 `none` 只看串口日志（但控制台已迁到 framebuffer，`none` 下串口就没有画面了）。
 `test` 永远以 headless 方式跑，忽略此项。
-`[qemu] display` picks the window backend for `run` (default `sdl`); use `none` to
+`qemu.display` picks the window backend for `run` (default `sdl`); use `none` to
 watch only the serial log — though the console now renders to the framebuffer, so
 `none` shows no picture. `test` always boots headless and ignores it.
 
@@ -247,7 +251,7 @@ are both said out loud.
 ## `run` 的三种运行模式 | The three `run` modes
 
 `cargo xtask run` 用 `--mode` 一次决定整机怎么启动（缺省取 `machine.toml` 里的
-`[qemu] mode`，再缺省为 `mirror`）。窗口和串口怎么接线是启动方的事；客机只被告知
+`qemu.mode`，再缺省为 `mirror`）。窗口和串口怎么接线是启动方的事；客机只被告知
 一件事——它有哪些控制台——而这件事用的是 Linux 自己的参数 `console=`：
 
 | 模式 | mode | 画面 | QEMU 接线 | 客机引导参数 |
@@ -287,7 +291,7 @@ banner 也在写、panic 的 `force_serial` 报告只会走这条线，所以宿
 是 `console=ttyS0`，刷新会真的把命令行改写成今日 `gui` 的 `console=tty0`。
 
 `cargo xtask run` picks the whole machine with `--mode` (default from
-`machine.toml`'s `[qemu] mode`, else `mirror`). How the window and the serial line
+`machine.toml`'s `qemu.mode`, else `mirror`). How the window and the serial line
 are wired is the launcher's business; the guest is told exactly one thing - which
 consoles it has - and that is said in Linux's own word, `console=`:
 

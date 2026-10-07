@@ -57,7 +57,7 @@ const CMDLINE: &str = "console=ttyAMA0 mpos.selftest root=/dev/vda rootfstype=ex
 /// the console untouched by the test half.
 ///
 /// The console *list* is the x86_64 path's own answer, read from the same
-/// sources (`machine.toml`'s `[qemu] mode`, or `MPOS_XTASK_MODE` when
+/// sources (`machine.toml`'s `qemu.mode`, or `MPOS_XTASK_MODE` when
 /// `run --mode X` hands the desired mode down): `RunMode::cmdline_consoles`
 /// spells `console=ttyAMA0 [console=tty0]` for terminal/mirror/gui, and since
 /// §13.16 the vcmux carries each virtual console's bytes over the wire on this
@@ -1052,7 +1052,7 @@ fn report_sweep(build_dir: &Path, staged: &[&str], left_out: usize, log: &str) -
 /// (`rootfs.toml`: weston, mesa, DRM, seatd), while this machine has no GPU, no
 /// DRM and no PCI bus to hang the card on, so its Alpine tree is the smallest one
 /// that boots to a login prompt - `alpine-base` and `openrc`, the packages
-/// `rootfs-aarch64.toml` names. What is *not* duplicated is the install: the
+/// `rootfs.toml`'s `[aarch64]` half names. What is *not* duplicated is the install: the
 /// repositories text, the keys, the mirror and the apk lookup are the x86_64
 /// path's own helpers (`utils::repositories_text`, `utils::install_apk_keys`,
 /// `utils::find_apk_tool`), and only the tree they are pointed at differs.
@@ -1080,7 +1080,8 @@ fn report_sweep(build_dir: &Path, staged: &[&str], left_out: usize, log: &str) -
 ///     prompt said `localhost` precisely because this path skipped it.
 fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
     let root = utils::project_root()?;
-    let config = crate::config::RootfsConfig::load(&root.join("rootfs-aarch64.toml"))?;
+    let config =
+        crate::config::RootfsConfig::load(&root.join("rootfs.toml"), crate::arch::Arch::Aarch64)?;
     let staging = build_dir.join("aarch64-alpine-root");
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)
@@ -1141,7 +1142,7 @@ fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
     // the release both machines report (`uname -r` is one number).
     crate::rootfs::write_modules(&staging)?;
     // The generated system layer, now that the cross-arch install can consume
-    // it: `[system] hostname` becomes `/etc/hostname` (without it the prompt
+    // it: `system.hostname` becomes `/etc/hostname` (without it the prompt
     // says `localhost`, which §13.12 had to name rather than fix), the locale
     // export lands in `/etc/profile.d`, the passwordless shadow clearing makes
     // the login actually work, the securetty cleanup keeps `login` from calling
@@ -1158,7 +1159,7 @@ fn install_alpine_root(build_dir: &Path) -> Result<PathBuf> {
     fs::write(staging.join(PROBE_FILE), PROBE_BYTES)
         .with_context(|| format!("Failed to lay the probe file on {}", staging.display()))?;
     // The resolver, after the trees and the generated layer - the one file
-    // that beats a file in the tree, which is what makes `[system] dns` the
+    // that beats a file in the tree, which is what makes `system.dns` the
     // answer it is (rootfs.rs's `write_resolver` carries the full story; it is
     // one slirp fact for both machines). Without this call the guest rides
     // QEMU's forwarder into the host's loopback stub and every `apk` fetch
@@ -1211,8 +1212,10 @@ fn build_alpine_esp(
     // verdicts keep the installed answer - their gate reads `login:` through
     // the mux either way.
     if mode == ModeChoice::Session {
-        let config =
-            crate::config::RootfsConfig::load(&utils::project_root()?.join("rootfs-aarch64.toml"))?;
+        let config = crate::config::RootfsConfig::load(
+            &utils::project_root()?.join("rootfs.toml"),
+            crate::arch::Arch::Aarch64,
+        )?;
         // The template is idempotent: re-merging the pair lands the same files,
         // and the render inside `merge_overlays` answers this session's mode.
         crate::rootfs::merge_overlays(
@@ -1249,7 +1252,11 @@ fn alpine_root_is_stale(build_dir: &Path) -> Result<bool> {
     }
     let since = utils::file_mtime(&stamp)?;
     for input in [
-        root.join("rootfs-aarch64.toml"),
+        // The one rootfs.toml now holds both machines' halves, so this stamp is
+        // invalidated by an edit to the *first* machine's section too. That is
+        // the price of one file describing both, and the same price the first
+        // machine's stamp pays.
+        root.join("rootfs.toml"),
         root.join(crate::rootfs::CORE_OVERLAY),
         root.join("rootfs-aarch64"),
     ] {
@@ -1519,7 +1526,8 @@ fn build_esp_with_cmdline(
                 "rootfs-aarch64",
                 &staging,
                 &crate::config::RootfsConfig::load(
-                    &crate::utils::project_root()?.join("rootfs-aarch64.toml"),
+                    &crate::utils::project_root()?.join("rootfs.toml"),
+                    crate::arch::Arch::Aarch64,
                 )?,
                 false,
             )?;
@@ -1787,8 +1795,8 @@ mod tests {
         // The session's console list is the x86_64 path's own answer - one
         // `RunMode`, three lists (`config.rs`'s `cmdline_consoles`) - spelled
         // with this machine's serial name. The two spellings of that name are
-        // pinned to each other here: `[rootfs] serial_port` in
-        // `rootfs-aarch64.toml` (which `render_inittab` writes into the getty
+        // pinned to each other here: `rootfs.serial_port` in
+        // `rootfs.toml`'s `[aarch64]` half (which `render_inittab` writes into the getty
         // line) and `SERIAL_PORT` (which the boot bakes into `console=`), plus
         // the kernel node at `src/drivers/devices.rs`. If they ever disagree,
         // the login answers on a node the wire never names.
@@ -1811,7 +1819,8 @@ mod tests {
         unsafe { std::env::remove_var("MPOS_XTASK_MODE") };
 
         let config = crate::config::RootfsConfig::load(
-            &utils::project_root().unwrap().join("rootfs-aarch64.toml"),
+            &utils::project_root().unwrap().join("rootfs.toml"),
+            crate::arch::Arch::Aarch64,
         )
         .unwrap();
         assert_eq!(
@@ -1840,11 +1849,7 @@ mod tests {
         // the network, so the stamp may *not* list the kernel or the loader.
         // What it must list is everything `install_alpine_root` reads: the
         // toml and both overlay trees.
-        let inputs = [
-            "rootfs-aarch64.toml",
-            crate::rootfs::CORE_OVERLAY,
-            "rootfs-aarch64",
-        ];
+        let inputs = ["rootfs.toml", crate::rootfs::CORE_OVERLAY, "rootfs-aarch64"];
         for name in inputs {
             assert!(
                 utils::project_root().unwrap().join(name).exists(),

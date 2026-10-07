@@ -123,7 +123,9 @@ const X86_64: Machine = Machine {
 
 const AARCH64: Machine = Machine {
     arch: Arch::Aarch64,
-    config: "initramfs-aarch64.toml",
+    // One file for both machines now: which half is read is `[default]` plus
+    // `[aarch64]`, resolved by `config::parse_sectioned_toml`.
+    config: "initramfs.toml",
     overlay: "initramfs-aarch64",
     staging: "aarch64-initramfs",
     dirs: &["etc/apk/keys"],
@@ -174,7 +176,7 @@ pub fn build_initramfs(build_dir: &Path, arch: Arch) -> Result<()> {
     let machine = machine(arch);
     let root = utils::project_root()?;
     let config_path = root.join(machine.config);
-    let config = InitramfsConfig::load(&config_path)?;
+    let config = InitramfsConfig::load(&config_path, arch)?;
 
     let staging = build_dir.join(machine.staging);
     let tar = machine.tar_path(build_dir);
@@ -458,12 +460,23 @@ mod tests {
     /// The two archives are read by two kernels and neither may find the other's
     /// bytes: the staging trees and the archive names are distinct, and so is
     /// everything a boot derives from them.
+    ///
+    /// The *config* is the one thing they now share. One `initramfs.toml` holds
+    /// both machines' halves, and which half is read is the machine's own section
+    /// (`config::parse_sectioned_toml`) - so what keeps the two archives apart is
+    /// asserted where it now lives, and `config.rs`'s
+    /// `the_shipped_files_answer_each_machine_its_own_values` is the pin that the
+    /// two sections really do answer different values.
     #[test]
     fn the_two_machines_archives_cannot_be_mistaken_for_each_other() {
         assert_ne!(X86_64.tar, AARCH64.tar);
         assert_ne!(X86_64.staging, AARCH64.staging);
-        assert_ne!(X86_64.config, AARCH64.config);
         assert_ne!(X86_64.overlay, AARCH64.overlay);
+        assert_eq!(
+            X86_64.config, AARCH64.config,
+            "one file holds both machines' halves now; the section is what differs"
+        );
+        assert_eq!(X86_64.config, "initramfs.toml");
     }
 
     /// The first machine's archive is the one `utils::initramfs_path` names, so

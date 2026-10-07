@@ -389,7 +389,10 @@ for `cargo xtask test`, which boots a directory QEMU synthesizes as virtual FAT.
 `rootfs.toml` decides the packages, the filesystem, the sizes, the hostname, DNS and the user
 account; `machine.toml` decides what the image is booted on (memory, cpus, devices, the window,
 the standing run mode), which is a separate file so that tuning the machine cannot invalidate
-the image; `initramfs.toml` does the same for the early userspace. Concrete
+the image; `initramfs.toml` does the same for the early userspace. All three are one file each for
+*both* machines, in three sections: `[default]` is the baseline both read, and `[x86_64]`/`[aarch64]`
+are each machine's own half — so a value the second machine does not share is written once, under its
+own name, and the first machine never sees it. Concrete
 files live as real files under `rootfs/` and `initramfs/`, overlaid *after* anything written
 from the toml — so a file in the tree wins, which is how `/etc/inittab`, `/etc/network/interfaces`
 and `/init` are edited.

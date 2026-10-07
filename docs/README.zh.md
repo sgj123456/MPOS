@@ -373,6 +373,9 @@ QEMU 在 OVMF 下直接引导它：没有 ISO，没有光驱，没有 loop 设�
 `rootfs.toml` 决定软件包、文件系统、大小、主机名、DNS 和用户账户；`machine.toml`
 决定这个镜像被引导在什么样的机器上（内存、CPU、设备、窗口、常驻运行模式），
 它是单独的文件，这样调机器不会让镜像失效；`initramfs.toml` 对早期用户空间做同样的事。
+三份配置都各只有一个文件、同时描述**两台**机器，用三个段：`[default]` 是两台共享的基线，
+`[x86_64]` / `[aarch64]` 是各自那一半——第二台不共享的值只在它自己的段里写一次，
+第一台看不到。键名带前缀（`rootfs.mirror`、`system.hostname`、`user.name`）。
 具体的文件以真实文件的形式放在 `rootfs/` 和 `initramfs/` 之下，在从 toml 写入的任何内容
 *之后*叠加上去——所以目录树里的文件说了算，`/etc/inittab`、`/etc/network/interfaces`
 和 `/init` 就是这样被修改的。

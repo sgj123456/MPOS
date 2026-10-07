@@ -41,7 +41,7 @@ struct Cli {
     #[arg(long)]
     profile: Option<String>,
 
-    /// How to boot the machine (default: `[qemu] mode` in `machine.toml`, or
+    /// How to boot the machine (default: `qemu.mode` in `machine.toml`, or
     /// mirror): `terminal` (serial only, no window), `gui` (the whole machine in
     /// the window — a window with every device behind it and the text console
     /// shown there, the serial line copied to `build/serial.log` so the host

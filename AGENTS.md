@@ -20,9 +20,9 @@ at those rather than repeating them.
 | `xtask/` | `mpos-xtask`, the build/run/test front-end; `xtask/README.md` documents every command |
 | `user/` | `mpos-user` (ordinary `std` programs); `user/abitest/` = the `no_std` conformance suite (`src/bin/syscall/` one family, `src/bin/integration/` end-to-end); `user/tests/` = `std`-side tests; `user/staging/` = scratch, wired into no build |
 | `fuzz/` | `mpos-fuzz`, **its own workspace**: libFuzzer targets over the kernel's parsers |
-| `rootfs/`, `rootfs.toml` | the x86_64 guest image tree and its packages/disk geometry; `rootfs-aarch64.toml` + `rootfs-aarch64/` are the second machine's pair — same parser, different userland and its own `/init` overlay |
-| `initramfs/`, `initramfs.toml` | the early-userspace tree the x86_64 boot unpacks as its first root, and its packages; `initramfs-aarch64.toml` + `initramfs-aarch64/` are the second machine's pair, built by the **same pipeline** (`xtask/src/initramfs.rs`) — the machine picks the toml, the overlay and the applet farm, and nothing else |
-| `machine.toml` | what the image is *booted* on — memory, cpus, devices, run mode, and the second machine's own values under an `aarch64_` prefix in the same file. Host-side only, so editing it never reinstalls |
+| `rootfs/`, `rootfs.toml` | the guest image's contents, for both machines: `rootfs.toml` is one file in three sections (`[default]` is the baseline both read, `[x86_64]`/`[aarch64]` are each machine's own half), and `rootfs/` + `rootfs-aarch64/` are the two overlay trees — the second machine's carries its own `/init` |
+| `initramfs/`, `initramfs.toml` | the early-userspace tree the x86_64 boot unpacks as its first root, and its packages — one sectioned `initramfs.toml` for both machines; `initramfs-aarch64/` is the second machine's overlay, built by the **same pipeline** (`xtask/src/initramfs.rs`) — the machine picks the overlay and the applet farm (its arch comes from its section), and nothing else |
+| `machine.toml` | what the image is *booted* on — memory, cpus, devices, run mode — in the **same three sections**. Host-side only, so editing it never reinstalls |
 | `tests.toml` | which test programs the sweep runs by default, and its groups |
 | `build/`, `target/`, `build-test/` | build output and scratch. Never edit, never commit |
 
@@ -226,7 +226,9 @@ parent module compiled for the host (§3). Assert on the contract (value, errno,
 line; prefer a test that would fail if the policy differed.
 
 **Change the guest image.** A file that must exist → the `rootfs/` (or `initramfs/`) tree (overlays
-apply *after* anything the toml writes). A package → `rootfs.toml`/`initramfs.toml`. Partition /
+apply *after* anything the toml writes). A package → `rootfs.toml`/`initramfs.toml`, under the section
+of the machine it is for: `[default]` where both want it, `[x86_64]`/`[aarch64]` where only one does —
+and a key is dotted by what it belongs to (`rootfs.mirror`, `system.hostname`, `user.name`). Partition /
 fs-type / image-size / hostname / DNS → `rootfs.toml`. Anything about the *machine* (memory, cpus,
 `vsock`, `audio`, window backend, run mode, extra QEMU args) → `machine.toml`, **never**
 `rootfs.toml` — `rootfs.toml`'s mtime decides whether the Alpine tree is reinstalled, so a machine
@@ -235,8 +237,9 @@ key there charges a full package install for a memory size (`xtask/src/config.rs
 (`mpos.selftest`, the `console=` list) is read via `src/boot/console_list.rs`; the kernel is told
 which consoles it has and nothing about how it was launched.
 
-**The second machine's userland is its own pair** (`rootfs-aarch64.toml` + `rootfs-aarch64/`;
-`docs/PLAN.md` §13.12): a package goes in the toml, a file in the overlay, both installed by
+**The second machine's userland is its own half** (`rootfs.toml`'s `[aarch64]` section + the
+`rootfs-aarch64/` overlay;
+`docs/PLAN.md` §13.12): a package goes in the section, a file in the overlay, both installed by
 `cargo xtask alpine-aarch64`. One caveat worth repeating: `fakeroot` must wrap **`mkfs.ext4` too**,
 not only `apk` — `mke2fs -d` stats each file, so an unwrapped `mkfs` writes a root filesystem owned
 by the build user.

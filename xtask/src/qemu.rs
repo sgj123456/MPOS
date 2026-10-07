@@ -93,7 +93,9 @@ pub fn needs_mode_switch(build_dir: &Path, desired: RunMode) -> bool {
 /// One builder, because the two differed only in what they put on the disk and
 /// where the serial line went - and the rest (the firmware, the machine type,
 /// the network) drifting apart between them is a difference nobody asked for.
-/// The sizes and the name come from `[qemu]` in `rootfs.toml`.
+/// The sizes and the name come from `qemu.*` in `machine.toml`, and the name
+/// again from `system.hostname` in `rootfs.toml` (which is where the guest is
+/// told it).
 ///
 /// `firmware_code` and `vars` are the two flash banks: the read-only code the
 /// machine boots from ([`find_firmware`] answered where it is) and the writable
@@ -197,7 +199,7 @@ pub fn machine_args(
     // and `t-dns` both name - not an upstream to forward to: the forwarding
     // behind it always follows the host's own resolver, and moving the
     // address strands every query the guest sends. Naming a different server
-    // is `[system] dns` in rootfs.toml, which the rootfs build writes into
+    // is `system.dns` in rootfs.toml, which the rootfs build writes into
     // the guest's resolv.conf instead.
     let netdev = format!("user,id=n0,hostname={}", config.hostname);
     args.extend([
@@ -260,9 +262,9 @@ pub fn machine_args(
     ]);
 
     // The two devices that depend on the host having something to give.
-    // Both are opt-in through `[qemu]` because a host without what they
-    // need refuses to start QEMU outright - and a machine that never boots
-    // is worse than a machine with no vsock and no sound.
+    // Both are opt-in through `qemu.vsock`/`qemu.audio` because a host without
+    // what they need refuses to start QEMU outright - and a machine that never
+    // boots is worse than a machine with no vsock and no sound.
     if config.vsock {
         // `guest-cid=3` is the guest's address on the host's vsock bus; the
         // host itself answers on CID 2. The device's QEMU name is
@@ -1182,7 +1184,7 @@ mod tests {
         // renames the address slirp answers DNS at (the 10.0.2.3 the guest's
         // resolv.conf and `t-dns` name) rather than choosing an upstream,
         // which strands every query the guest sends. Choosing a server is
-        // `[system] dns` in rootfs.toml, which the rootfs build writes into
+        // `system.dns` in rootfs.toml, which the rootfs build writes into
         // the guest's own resolv.conf.
         assert!(!netdev.contains("dns="), "{netdev}");
         assert_eq!(

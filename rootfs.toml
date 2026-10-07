@@ -1,55 +1,80 @@
 # rootfs.toml - what the guest image *contains*.
 #
-# Read by `cargo xtask disk`, `rootfs`, `initramfs` and `run`. The parser is a
-# small one: `key = value`, one array per key (which may be written across
-# several lines), and the section headers are for the reader - the keys are what
-# the build looks up, and each one appears once in this file.
+# Read by `cargo xtask disk`, `rootfs`, `initramfs` and `run`, for both machines.
+# The parser is a small one: `key = value`, one array per key (which may be
+# written across several lines), and three sections. `[default]` is the baseline
+# both machines read, `[x86_64]` and `[aarch64]` are each machine's own half, and
+# a machine's key wins over the baseline's. A key carries the name of the thing
+# it belongs to (`rootfs.mirror`, `system.hostname`, `user.name`).
+#
+# One file describes two userlands that share almost nothing at the top and
+# everything at the bottom. The first machine is a desktop - weston, mesa, the
+# DRM stack, seatd - and the second is the smallest tree that reaches a login
+# prompt; a package list that is right for one is wrong for the other, so each
+# writes its own half under its own name. What the two agree on (the mirror, the
+# repositories, the filesystem, the timezone and the resolver) is written once,
+# in the baseline.
 #
 # How the image is *booted* is `machine.toml` beside this file, and that is a
 # cost decision rather than a tidy one: this file's mtime is what decides whether
 # the Alpine tree is reinstalled, so a key that has nothing to do with the
 # image's contents (a memory size, a window backend, the standing run mode)
 # would charge a full package install for a change it has nothing to do with.
-# The two keys here that are neither contents nor geometry - `hostname` and
-# `serial_port` - stay because they are written into the image; `machine.toml`
-# reads them through rather than naming them a second time.
+# The two keys here that are neither contents nor geometry - `system.hostname`
+# and `rootfs.serial_port` - stay because they are written into the image;
+# `machine.toml` reads them through rather than naming them a second time.
+#
+# One consequence of one file per kind, now that both machines read this one:
+# both stamps compare against it, so editing the second machine's half
+# re-installs the first machine's tree too (and the other way round). That is the
+# price of one file, and it is a price the shared half already charged.
 #
 # A file that does not need a value from here lives in `rootfs/` as a real file
 # instead: /etc/inittab, /etc/network/interfaces, /etc/resolv.conf and
 # /etc/doas.conf are all editable there, and everything written from this file
 # is applied before the overlay - so a file in the tree wins. One exception is
-# under [system] below: a set `dns` rewrites /etc/resolv.conf after the overlay.
+# `system.dns` below: a set value rewrites /etc/resolv.conf after the overlay.
 
-[rootfs]
+[default]
 # Alpine mirror URL
-mirror = "https://mirrors.tuna.tsinghua.edu.cn/alpine"
+rootfs.mirror = "https://mirrors.tuna.tsinghua.edu.cn/alpine"
 # Alpine branch
-branch = "edge"
-# Architecture
-arch = "x86_64"
+rootfs.branch = "edge"
+# Architecture. This is the *package* architecture apk resolves against, so it
+# is genuinely the machine's and each half names its own - unlike the loader and
+# kernel targets, which xtask picks from its own `--arch`.
+rootfs.arch = "x86_64"
 # The repository components to fetch, in this order: apk takes a package from
 # the first repository that has it, so `main` before `community` is what keeps a
 # package that exists in both coming from the one it belongs to.
-repos = ["main", "community"]
+rootfs.repos = ["main", "community"]
 # Filesystem for the root partition. This kernel routes ext2, ext3 and ext4 to
 # the same driver, so any of the three boots; ext4 is what the image ships.
-filesystem = "ext4"
-# How the guest sees the root device (virtio disk in QEMU)
-root_device = "/dev/vda2"
+rootfs.filesystem = "ext4"
+# How the guest sees the root device (virtio disk in QEMU). The second machine's
+# own half names the whole disk rather than a partition: its firmware boots from
+# a bare FAT volume and its root is a bare ext4 attached as a virtio-MMIO block,
+# so there is no partition table to describe (`PLAN.md` §13.3's deviation).
+rootfs.root_device = "/dev/vda2"
 # Serial port the kernel's console goes to, named on the kernel command line as
-# `console=ttyS0`. It is the same name the image's getty runs on.
-serial_port = "ttyS0"
+# `console=ttyS0`. It is the same name the image's getty runs on. The second
+# machine's console is a PL011, so its half names `ttyAMA0` - one node either
+# way, named the way the machine's psABI names the port.
+rootfs.serial_port = "ttyS0"
 # Disk image size
-image_size = "2G"
+rootfs.image_size = "2G"
 # EFI System Partition size. It holds the loader, the kernel and the initramfs
-# and nothing else, so it only has to grow if those do.
-esp_size = "128M"
+# and nothing else, so it only has to grow if those do. Neither this nor
+# `image_size` is read for the second machine, whose partitions the build lays
+# itself: the values are the baseline's because the first machine is the one
+# with a partition table, and the second's half says nothing about them.
+rootfs.esp_size = "128M"
 # `mke2fs -O` features, comma-separated. The driver cannot honour two of the
 # defaults: a journal (nothing here replays one, and a crash would leave the
 # filesystem asking for a recovery this kernel cannot do) and metadata checksums
 # (every write would leave a stale one behind). An empty list means "whatever
 # mkfs decides".
-mkfs_options = "^has_journal,^metadata_csum"
+rootfs.mkfs_options = "^has_journal,^metadata_csum"
 
 # Base packages that are always installed (do not modify unless needed).
 # `alpine-base` and `openrc` arrive through the shared core list
@@ -57,8 +82,8 @@ mkfs_options = "^has_journal,^metadata_csum"
 # base by config.rs) - what is named here is only this machine's own half:
 # the filesystem tools a guest with disks and partitions needs to *make*
 # them. The second machine has no use for either inside its root (its image
-# is laid by the build on the host), so they stay out of the shared list.
-base_packages = ["e2fsprogs", "dosfstools"]
+# is laid by the build on the host), so its half empties this list.
+rootfs.base_packages = ["e2fsprogs", "dosfstools"]
 
 # Additional packages to install in the rootfs, on top of the base ones.
 # `doas` is the privilege escalation tool this image ships - not sudo, which
@@ -80,7 +105,10 @@ base_packages = ["e2fsprogs", "dosfstools"]
 # enables it); `busybox-openrc` carries the syslog and crond scripts the
 # stock boot runlevel wants. Which of them the image actually starts is in
 # `xtask/src/rootfs.rs` (`SERVICES`), not here.
-extra_packages = [
+#
+# The second machine's half replaces this list whole: it is a different
+# userland, not a shorter one.
+rootfs.extra_packages = [
     "busybox-openrc",
     "alpine-release",
     "ssl_client",
@@ -142,17 +170,18 @@ extra_packages = [
     "fish"
 ]
 
-# The machine the guest is: its name, its clock and its logins.
-[system]
+# The machine the guest is: its name, its clock and its logins. Both machines
+# are the same guest in every one of these, so they are the baseline's.
+#
 # Hostname, written to /etc/hostname and /etc/hosts - and the name the guest
 # reports to QEMU's DHCP server.
-hostname = "mpos"
+system.hostname = "mpos"
 # Timezone. `UTC` costs nothing and needs no package; any other zone wants a
 # symlink to /usr/share/zoneinfo/<zone>, which needs `tzdata` in the list above.
-timezone = "UTC"
+system.timezone = "UTC"
 # Locale, exported from /etc/profile.d/locale.sh. musl takes it from the
 # environment rather than from a generated table, so there is nothing else to do.
-locale = "en_US.UTF-8"
+system.locale = "en_US.UTF-8"
 # The nameserver the guest's own resolver asks, written into /etc/resolv.conf
 # over the stock `10.0.2.3` the tree ships. Unset, QEMU's user-mode network
 # answers 10.0.2.3 itself - by forwarding to whatever the host's own
@@ -160,25 +189,74 @@ locale = "en_US.UTF-8"
 # loopback stub, and which no QEMU option can redirect (its `dns=` renames the
 # address slirp answers at; it does not name an upstream, which is why the
 # build never passes it). Set, the guest asks this server directly: slirp
-# carries the queries to any address the host can reach.
-dns = "223.5.5.5"
+# carries the queries to any address the host can reach. One kernel-wide fact,
+# which is why both machines read this one line.
+system.dns = "223.5.5.5"
 # Root's password. Empty means "nothing to type", which is what a serial console
 # with no keyboard needs; anything else is set with chpasswd.
-root_password = ""
+system.root_password = ""
 
 # The account created in the guest, besides root. An empty `name` skips the
-# whole thing and leaves an image that only ever logs in as root.
-[user]
-name = "mpos"
+# whole thing and leaves an image that only ever logs in as root - which is the
+# second machine's shape, so its half empties the name rather than inheriting
+# this one's.
+user.name = "mpos"
 # Groups to add it to. `wheel` is the one /etc/doas.conf grants escalation to;
 # `seat` is the group the seatd service hands its socket to, so an account
 # that is not root can still start a compositor (seatd's own package makes
 # the group, and root is let through regardless).
-groups = ["mpos", "wheel", "seat"]
-shell = "/usr/bin/fish"
+user.groups = ["mpos", "wheel", "seat"]
+user.shell = "/usr/bin/fish"
 # Empty means the account has no password to type, like root above. Anything
 # else is set with chpasswd.
-password = ""
+user.password = ""
+
+# The first machine's own half - every value it reads is one of the baseline's,
+# because the baseline was written from this machine. A value that stops being
+# shared moves up into the baseline only if both machines want it; one that only
+# this machine wants belongs here.
+[x86_64]
+
+# The second machine's own half: the smallest tree that boots to a login prompt.
+#
+# The keys are the same vocabulary the baseline uses, read by the same
+# `RootfsConfig::load`, so nothing here is a dialect. What is absent is as
+# deliberate as what is present: this machine has no GPU, no DRM and no PCI bus
+# to hang a card on, and its image is laid by the build on the host rather than
+# by a guest with filesystem tools.
+[aarch64]
+rootfs.arch = "aarch64"
+# The root is the whole disk device, not a partition: this machine has no
+# partition table (see `rootfs.root_device` above).
+rootfs.root_device = "/dev/vda"
+# The PL011 - the name this machine's console is called everywhere else.
+rootfs.serial_port = "ttyAMA0"
+# Empty, and it has to be said: the baseline's list is the first machine's, and
+# a guest that does not make filesystems has no use for e2fsprogs/dosfstools
+# inside its root. An empty list is a value; an absent key would inherit theirs.
+rootfs.base_packages = []
+
+# On top of the base: the init system's own runlevel scripts are in the shared
+# core list, and nothing else is needed to reach a login prompt.
+#
+# `strace` is here because it is the tool this machine's ABI was measured with
+# and the one that found what was missing: `ptrace` answers on the second
+# machine since §13.31, and a tracer is what proves it from the syscall side
+# rather than from a test that could agree with the kernel about a wrong shape.
+# Read back on the machine through this image:
+#
+#     strace -f -e trace=openat ls /
+#     openat(AT_FDCWD, "/", O_RDONLY|O_LARGEFILE|O_CLOEXEC|O_DIRECTORY) = 3
+#
+# It is a debugging tool rather than part of the boot - no service needs it, and
+# the boot reaches `login:` without it. It weighs 1.3 MiB in a 256 MiB image.
+rootfs.extra_packages = ["alpine-conf", "busybox-suid", "strace"]
+
+# No account beyond root: the desktop's `mpos` login is the first machine's, so
+# the baseline's `user.name` is emptied rather than inherited. The `wheel` group
+# and `/bin/sh` that the user half defaults to describe an account that is never
+# made, and the image's `/etc/inittab` logs in as root.
+user.name = ""
 
 # How the image is *booted* - the window, the memory, the devices and the
 # standing run mode - is `machine.toml` beside this file. It is a separate

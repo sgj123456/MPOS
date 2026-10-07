@@ -18,7 +18,7 @@ use crate::utils;
 
 /// The mode to bake into the image: an explicit `MPOS_XTASK_MODE`
 /// (what `cargo xtask run --mode X` hands the privileged build) wins over
-/// `[qemu] mode` in `machine.toml`, which itself defaults to mirror.
+/// `qemu.mode` in `machine.toml`, which itself defaults to mirror.
 ///
 /// Reading it from the machine's own file is what makes a mode change cheap:
 /// the key is not in `rootfs.toml`, so it cannot mark the image stale, and the
@@ -46,7 +46,7 @@ pub(crate) fn effective_mode() -> Result<RunMode> {
 pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     let root = utils::project_root()?;
     let config_path = root.join("rootfs.toml");
-    let config = RootfsConfig::load(&config_path)?;
+    let config = RootfsConfig::load(&config_path, Arch::X86_64)?;
 
     let image = utils::image_path(build_dir);
     if !image.exists() {
@@ -334,7 +334,7 @@ fn write_system_config(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
 pub(crate) fn write_shared_config(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
     // The name the prompt, `hostname` and the DHCP client report. Written
     // rather than left to alpine-baselayout's `localhost`, so that
-    // `[system] hostname` is the one place it is decided.
+    // `system.hostname` is the one place it is decided.
     fs::write(
         mount_dir.join("etc/hostname"),
         format!("{}\n", config.hostname),
@@ -379,7 +379,7 @@ pub(crate) fn write_shared_config(mount_dir: &Path, config: &RootfsConfig) -> Re
     fs::write(
         mount_dir.join("etc/profile.d/locale.sh"),
         format!(
-            "# Written from `[system] locale` in rootfs.toml.\nexport LANG={locale}\nexport LC_ALL={locale}\n",
+            "# Written from `system.locale` in rootfs.toml.\nexport LANG={locale}\nexport LC_ALL={locale}\n",
             locale = config.locale
         ),
     )?;
@@ -416,7 +416,7 @@ pub(crate) fn write_shared_config(mount_dir: &Path, config: &RootfsConfig) -> Re
     Ok(())
 }
 
-/// The guest's resolver, when `[system] dns` names a server. Written after
+/// The guest's resolver, when `system.dns` names a server. Written after
 /// the overlay - the one generated file that beats a file in the tree, which
 /// is what makes the key the answer it is.
 ///
@@ -442,7 +442,7 @@ pub(crate) fn write_resolver(mount_dir: &Path, config: &RootfsConfig) -> Result<
     fs::write(
         mount_dir.join("etc/resolv.conf"),
         format!(
-            "# Written from `[system] dns` in rootfs.toml; the guest asks this\n# server directly, carried over QEMU's user-mode network.\nnameserver {dns}\n"
+            "# Written from `system.dns` in rootfs.toml; the guest asks this\n# server directly, carried over QEMU's user-mode network.\nnameserver {dns}\n"
         ),
     )?;
     Ok(())
@@ -488,7 +488,7 @@ pub(crate) fn merge_overlays(
 /// the placeholder becomes empty (the stock file's shape). The second
 /// machine's interactive `run` attaches no window at all - its wire *is* the
 /// console - so there the placeholder becomes a getty on the machine's own
-/// serial node, named from `[rootfs] serial_port` because the psABI name is
+/// serial node, named from `rootfs.serial_port` because the psABI name is
 /// the machine's (`ttyAMA0` on the PL011, `ttyS0` on the 16550).
 ///
 /// Everything else in the file is one kernel's answer on both machines since
@@ -508,11 +508,11 @@ fn render_inittab(mount_dir: &Path, config: &RootfsConfig, serial_getty: bool) -
     };
     // The serial port's name is this machine's psABI spelling (`ttyAMA0` on the
     // PL011, `ttyS0` on the 16550), and it is *read* from the machine's own
-    // toml rather than shared with the boot wiring: `[rootfs] serial_port` is
+    // toml rather than shared with the boot wiring: `rootfs.serial_port` is
     // an install input on both machines, while the `console=` word stays the
     // launcher's business (x86_64 bakes it via `install_boot_files`, aarch64
     // via `aarch64::alpine_cmdline`). The two spellings of one node are pinned
-    // to each other per machine - here by `rootfs-aarch64.toml`'s value and
+    // to each other per machine - here by `rootfs.toml`'s `[aarch64]` value and
     // `aarch64::SERIAL_PORT`, in config.rs's tests.
     let path = mount_dir.join("etc/inittab");
     let text = fs::read_to_string(&path)?;
@@ -1365,10 +1365,14 @@ mod tests {
     /// the keys and the defaults are then the ones the build gets, not a
     /// hand-built struct that can drift from them. `name` keys the file as
     /// well, because the tests run in parallel and share a temp directory.
+    ///
+    /// The file a test writes is sectioned like the shipped one, and read for
+    /// the first machine: these tests are about what the *rootfs* half does, and
+    /// a machine fact is what the machine's own section is for.
     fn load_config(name: &str, toml: &str) -> RootfsConfig {
         let path = std::env::temp_dir().join(format!("mpos-rootfs-test-{name}.toml"));
         fs::write(&path, toml).unwrap();
-        RootfsConfig::load(&path).unwrap()
+        RootfsConfig::load(&path, Arch::X86_64).unwrap()
     }
 
     #[test]
@@ -1376,7 +1380,7 @@ mod tests {
         let dir = staged_dir("shadow");
         let config = load_config(
             "shadow",
-            "[system]\nhostname = \"mpos\"\n[user]\nname = \"mpos\"\npassword = \"\"\n",
+            "[default]\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\nuser.password = \"\"\n",
         );
         write_system_config(&dir, &config).unwrap();
 
@@ -1415,7 +1419,7 @@ mod tests {
         let dir = staged_dir("shared-config");
         let config = load_config(
             "shared-config",
-            "[system]\nhostname = \"mpos\"\n[user]\nname = \"mpos\"\npassword = \"hunter2\"\n",
+            "[default]\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\nuser.password = \"hunter2\"\n",
         );
         write_shared_config(&dir, &config).unwrap();
 
@@ -1454,7 +1458,7 @@ mod tests {
         let dir = staged_dir("system");
         let config = load_config(
             "system",
-            "[system]\nhostname = \"probe\"\nlocale = \"C.UTF-8\"\n[user]\nname = \"\"\n",
+            "[default]\nsystem.hostname = \"probe\"\nsystem.locale = \"C.UTF-8\"\nuser.name = \"\"\n",
         );
         write_system_config(&dir, &config).unwrap();
 
@@ -1488,7 +1492,7 @@ mod tests {
         // so this reads the repository's template once and renders it twice.
         let config = load_config(
             "inittab",
-            "[rootfs]\nserial_port = \"ttyAMA0\"\n[system]\nhostname = \"mpos\"\n",
+            "[default]\nrootfs.serial_port = \"ttyAMA0\"\nsystem.hostname = \"mpos\"\n",
         );
         let stock = fs::read_to_string(
             crate::utils::project_root()
@@ -1591,7 +1595,7 @@ mod tests {
     #[test]
     fn fstab_names_the_root_by_uuid_and_the_configured_filesystem() {
         let dir = staged_dir("fstab");
-        let config = load_config("fstab", "[rootfs]\nfilesystem = \"ext4\"\n");
+        let config = load_config("fstab", "[default]\nrootfs.filesystem = \"ext4\"\n");
         write_fstab(&dir, &config, "1234-abcd").unwrap();
 
         let fstab = fs::read_to_string(dir.join("etc/fstab")).unwrap();
@@ -1615,14 +1619,14 @@ mod tests {
         // choosing the guest's upstream.
         let dir = staged_dir("resolver-set");
         fs::write(dir.join("etc/resolv.conf"), "nameserver 10.0.2.3\n").unwrap();
-        let config = load_config("resolver-set", "[system]\ndns = \"223.5.5.5\"\n");
+        let config = load_config("resolver-set", "[default]\nsystem.dns = \"223.5.5.5\"\n");
         write_resolver(&dir, &config).unwrap();
         let text = fs::read_to_string(dir.join("etc/resolv.conf")).unwrap();
         assert!(text.contains("nameserver 223.5.5.5"), "{text}");
 
         let dir = staged_dir("resolver-unset");
         fs::write(dir.join("etc/resolv.conf"), "nameserver 10.0.2.3\n").unwrap();
-        let config = load_config("resolver-unset", "[system]\n");
+        let config = load_config("resolver-unset", "[default]\n");
         write_resolver(&dir, &config).unwrap();
         let text = fs::read_to_string(dir.join("etc/resolv.conf")).unwrap();
         assert!(text.contains("nameserver 10.0.2.3"), "{text}");
