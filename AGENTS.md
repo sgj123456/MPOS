@@ -204,7 +204,11 @@ between served / refused / wrong-shape belongs in both.
 **Add a user test program.** `std`/`rustix` → `user/tests/src/bin/t-<name>.rs` (flat,
 auto-discovered) — the shape a new test belongs in, because it runs on **both** machines and takes
 its per-claim printing and exit status from the crate's own `Report` (`user/tests/src/lib.rs`)
-instead of a local copy. `no_std` raw-syscall → `user/abitest/src/bin/{syscall,integration}/t-<name>.rs`,
+instead of a local copy. `rustix` first, `libc` only where the crate's `Cargo.toml` rule allows it —
+and that rule has two measured clauses now, not one: a call `rustix` does not bind, and a call whose
+wrapper is *not* the syscall the ABI promises (or throws its result away), which is how the no-std
+migration found `rustix::io::dup2` substituting `dup3` on aarch64 and `rustix::io::close` returning
+nothing. `no_std` raw-syscall → `user/abitest/src/bin/{syscall,integration}/t-<name>.rs`,
 which is where the *unmigrated* half of the ABI suite lives: `PLAN.md` §15.11 moves it to the std side
 a batch at a time, so a new test does not belong there. **Add an explicit `[[bin]]` block to
 `user/abitest/Cargo.toml`** — Cargo does not auto-discover `src/bin/<subdir>/*.rs`; the std side needs

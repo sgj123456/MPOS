@@ -17,13 +17,28 @@
 # that says "this is EAFNOSUPPORT" is a claim about the ABI, not about the
 # author's memory of it.
 #
-# `libc` is here for the calls `rustix` does not bind at all - today
-# `process_vm_readv`/`writev` and `rt_sigtimedwait`, which
-# `t-process-vm-libc`/`t-rt-sigtimedwait` drive through
-# `libc::syscall` with the number from `libc::SYS_*`. That keeps the rule
-# above: the number comes from a maintained per-arch table rather than from
-# this repository's memory of it. It is not a second interface for calls
-# `rustix` already names.
+# `libc` is here for the calls `rustix` cannot be *relied on* to bind, and the
+# migration of the no-std suite has measured two shapes of that:
+#
+#   * a call it does not bind at all - `process_vm_readv`/`writev` and
+#     `rt_sigtimedwait`, driven through `libc::syscall` with the number from
+#     `libc::SYS_*`;
+#   * a call whose wrapper is not the syscall the ABI promises on every machine,
+#     or throws away the result the ABI promises. Measured, not guessed:
+#     `rustix::io::dup2` substitutes `dup3(fd, new, DupFlags::empty())` under
+#     `cfg(target_arch = "aarch64")` - its own source says so, and for a good
+#     reason, since `new` is `&mut OwnedFd` there and so `oldfd == newfd` is
+#     unreachable through it. But that case is *the POSIX no-op this kernel
+#     must answer with the descriptor*, and `dup3(fd, fd, 0)` is EINVAL, so a
+#     test written against the wrapper would pin a different call on one
+#     machine than the other. `t-dup2` calls `libc::dup2`. The same shape, one
+#     step milder: `rustix::io::close` takes a raw fd and returns nothing, so
+#     "close answers 0" cannot be expressed through it at all.
+#
+# Both keep the purpose of the rule above: the number, the call and its shape
+# come from a maintained per-machine table rather than from this repository's
+# memory of them. It is still not a second interface for calls `rustix` names
+# *and* answers the way the ABI says.
 [package]
 name = "mpos-user-tests"
 version = "0.1.0"

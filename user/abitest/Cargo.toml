@@ -192,13 +192,7 @@ path = "src/bin/syscall/t-clone.rs"
 name = "t-copy-file-range"
 path = "src/bin/syscall/t-copy-file-range.rs"
 
-[[bin]]
-name = "t-dup"
-path = "src/bin/syscall/t-dup.rs"
 
-[[bin]]
-name = "t-dup2"
-path = "src/bin/syscall/t-dup2.rs"
 
 [[bin]]
 name = "t-dup3"
