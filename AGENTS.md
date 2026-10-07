@@ -206,16 +206,24 @@ auto-discovered) — the shape a new test belongs in, because it runs on **both*
 its per-claim printing and exit status from the crate's own `Report` (`user/tests/src/lib.rs`)
 instead of a local copy. `rustix` first, `libc` only where the crate's `Cargo.toml` rule allows it —
 and that rule has three measured clauses now, not one: a call `rustix` does not bind — including
-`faccessat2`, which it reaches only through `accessat` *with* a flag word; a call whose
+`faccessat2`, which it reaches only through `accessat` *with* a flag word; `F_DUPFD`, whose only
+`rustix` spelling carries `FD_CLOEXEC` (the plain `fcntl_dupfd` is `#[cfg(target_os = "espidf")]`);
+and `F_GETLK`, which `rustix` binds nowhere, `fcntl_lock` being `F_SETLK`/`F_SETLKW` only
+(`t-filelock`); a call whose
 wrapper is *not* the syscall the ABI promises (or throws its result away) — `rustix::io::dup2`
-substituting `dup3` on aarch64, `rustix::io::close` returning nothing; and a call whose wrapper binds
+substituting `dup3` on aarch64, `rustix::io::close` returning nothing (`t-dup2`, and `t-filelock`
+for the same clause); and a call whose wrapper binds
 the right syscall but whose *shape* cannot express the claim — `rustix::io::dup3` takes its target as
 a non-aliasing `&mut OwnedFd` (so `oldfd == newfd` is unreachable through it) and returns `()` rather
 than the new number, which is what sends `t-dup3` to `libc::dup3`; the same shape again,
 `rustix::process::getcwd` takes a `Vec` and returns a `CString` (growing on ERANGE), so
 `t-getcwd`/`t-chdir` use `libc::getcwd` for the buffer-size contract; and a third time,
 `rustix::fs::openat2` writes `size_of::<open_how>()` itself, so `t-openat2` drives
-`libc::syscall` + `SYS_openat2` for the size word. Two shapes that look alike are *not*, and the
+`libc::syscall` + `SYS_openat2` for the size word; and a fourth time, `fcntl`'s *command number* —
+`rustix` makes `fcntl` type-safe by splitting it into one function per command, so a command the
+kernel has no meaning for (`t-fcntl`'s `999`) has no spelling in it at all, and one step down the
+same clause is the descriptor `-1` its `AsFd` cannot name (`t-fcntl`, where `t-write` uses `999`).
+Two shapes that look alike are *not*, and the
 difference decides which library a new test uses: a rustix **bitflags** type carries `const _ = !0`
 (bitflags' unnamed flag), so an unnamed *bit* is expressible through `from_bits_retain` and is not on
 its own a reason to leave `rustix`; a rustix **plain enum** (`SeekFrom`, `Advice`) has no such escape,

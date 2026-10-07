@@ -211,19 +211,6 @@ name = "t-fchmodat2"
 path = "src/bin/syscall/t-fchmodat2.rs"
 
 [[bin]]
-name = "t-fd-list"
-path = "src/bin/syscall/t-fd-list.rs"
-
-[[bin]]
-name = "t-fcntl"
-path = "src/bin/syscall/t-fcntl.rs"
-
-[[bin]]
-name = "t-filelock"
-path = "src/bin/syscall/t-filelock.rs"
-
-
-[[bin]]
 name = "t-fork"
 path = "src/bin/syscall/t-fork.rs"
 

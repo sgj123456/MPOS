@@ -2217,15 +2217,19 @@ pub fn fcntl(args: [usize; ARG_COUNT]) -> isize {
             Ok(flags) => flags as isize,
             Err(e) => err_of(e),
         },
-        F_SETFD => {
-            if arg & !(FD_CLOEXEC as usize) != 0 {
-                return err::EINVAL;
-            }
-            match crate::sched::current_fds().fd_flags_set(fd, arg as u32) {
-                Ok(()) => 0,
-                Err(e) => err_of(e),
-            }
-        }
+        // POSIX stores the descriptor's flag word; Linux's `set_close_on_exec`
+        // reads `arg & FD_CLOEXEC`, so a word with other bits in it is *masked*
+        // to the one bit it names and succeeds. Measured on a current host
+        // through the raw syscall: `F_SETFD(1, 0xFFFFFFFF)` answers 0 and
+        // `F_GETFD` then reads 1, while `F_SETFD(1, 0xFFFFFFFE)` answers 0 and
+        // clears it. This arm answered `EINVAL` for such a word until migration
+        // batch 11, which is a shape a caller that builds the word from a
+        // variable cannot recover from the way the ABI's answer lets it -
+        // `t-fcntl` pins both halves now.
+        F_SETFD => match crate::sched::current_fds().fd_flags_set(fd, (arg as u32) & FD_CLOEXEC) {
+            Ok(()) => 0,
+            Err(e) => err_of(e),
+        },
         // `F_GETFL` reports the open flag word the description carries -
         // which, since sockets arrived, is where `O_NONBLOCK` lives, and a
         // DNS resolver reads it back to know how its sockets will behave.

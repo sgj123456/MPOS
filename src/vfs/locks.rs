@@ -298,9 +298,20 @@ pub fn set(
 /// * every **record** lock the *process* holds on this file goes - POSIX's rule
 ///   and the one that surprises people, since a lock taken through one fd is
 ///   lost by closing an unrelated fd to the same file;
-/// * the **whole-file** lock goes only if it was this open file description's,
-///   so a second `open()` of the same file keeps its `flock` when the first is
-///   closed, and `dup`ed descriptors drop it only with the last of them.
+/// * the **whole-file** lock goes if it was this open file description's, so a
+///   second `open()` of the same file keeps its `flock` when the first is
+///   closed.
+///
+/// The second half is **not** yet Linux's, and the difference is named rather
+/// than left in the code: Linux drops the description's `flock` with the *last*
+/// descriptor referring to it, so closing one of several `dup`s leaves the lock
+/// in force - measured on a current host, where `flock(a, LOCK_EX)`,
+/// `close(dup_of_a)` and then a fresh `open()` of the file still answers
+/// `EWOULDBLOCK`. Here any close naming that description drops it, because the
+/// caller passes the description's identity and nothing about how many
+/// descriptors still hold it. `docs/PLAN.md` §15.16 carries the measurement, and
+/// `user/tests/src/bin/t-filelock.rs` records why no claim of its own fails on
+/// it.
 #[cfg(target_os = "none")]
 pub fn release_on_close(dev: u64, ino: u64, pid: u32, ofd: u64) {
     critical_section::with(|cs| {

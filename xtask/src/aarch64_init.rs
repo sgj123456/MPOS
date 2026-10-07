@@ -628,10 +628,16 @@ unsafe extern "C" {
 /// the tests' own failures: a machine that was not set up is not evidence about
 /// the kernel, and a verdict that read those ENOENTs as the tests' would be
 /// blaming them for the harness. The reader refuses to report anything else when
-/// the line is there. Nothing else is mounted and no interface is brought up:
-/// this payload reaches neither /proc, /sys nor the network, and the tests that
-/// want a live wire are the socket ones - which this sweep stages, because the
-/// stack `check_net` publishes and `main` initializes is what serves them.
+/// the line is there. Nothing **here** mounts anything else and no interface is
+/// brought up here - but this file is not the whole payload, and this comment
+/// used to say the machine "reaches neither /proc, /sys nor the network", which
+/// is wrong about `/proc` and `/sys` and was measured wrong in S6 batch 11: the
+/// disk's own chain runs first (`rootfs-aarch64/init` mounts `/proc`, `/sys`,
+/// `/tmp`, `/run` and `devpts`), so a test may find a `/proc` this file never
+/// made - `t-fd-list` and `t-tmpfile-link` both report "the payload's own
+/// /proc" on this machine. The tests that want a live wire are the socket ones -
+/// which this sweep stages, because the stack `check_net` publishes and `main`
+/// initializes is what serves them.
 fn set_up_machine() {
     // The mountpoint has to exist before anything hangs on it - Linux requires
     // it and so does this kernel's `mount` (`ENOTDIR` otherwise).

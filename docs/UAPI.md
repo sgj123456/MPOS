@@ -384,7 +384,44 @@ the commit bodies), and each moved its pin in the same commit.
     makes the call and reads the value back for each side of the range, plus the no-std
     `t-posix`, which had asserted the same `EINVAL`.
 
+12. **`F_SETFD` masks its word to `FD_CLOEXEC`; it used to answer `EINVAL` for anything else.**
+    POSIX says `F_SETFD` sets the descriptor's flags, and Linux's `set_close_on_exec` reads
+    `arg & FD_CLOEXEC` — so a word with other bits in it is *taken*, and the one bit it names
+    is what the descriptor keeps. Measured on a current host **through the raw syscall**, so
+    no libc's masking can be mistaken for the kernel's:
+    `fcntl(1, F_SETFD, 0xFFFFFFFF)` answers `0` and `fcntl(1, F_GETFD)` then reads `1`, while
+    `fcntl(1, F_SETFD, 0xFFFFFFFE)` answers `0` and clears it. This kernel refused such a word
+    with `EINVAL` and stored nothing, which is the shape a caller that builds the word from a
+    variable cannot recover from the way Linux's answer lets it. Owner:
+    `src/syscall/linux/fs/file.rs`'s `F_SETFD` arm. Pin: `t-fcntl` on **both** machines (S6
+    batch 11), which reads the stored word back and so tells the three possible answers apart
+    — refused, stored whole (`0xFFFF_FFFF`), and masked to `1`.
+
 ### 5.2 Small, measured, and not yet landed
+
+- **`F_GETFL` reports no access mode.** Linux ORs the descriptor's access mode into the word
+  `fcntl(F_GETFL)` returns, so a descriptor opened `O_WRONLY` reports `1` (measured on a
+  current host); this kernel reports the description's stored status word, whose access bits
+  are always zero, and keeps the mode separately (`src/vfs/file.rs`'s `ACC_*`, which the
+  read/write `EBADF` refusal reads). A caller that reads `F_GETFL` to learn which way a
+  descriptor opens is told `O_RDONLY` for every one of them. Not a §3.2 defect — the answer
+  is a zero rather than a wrong number — but a divergence a program can see, and `t-fcntl`
+  pins the current answer on **both** machines (S6 batch 11). Closing it means folding the
+  access bits into the reported word, which has its own blast radius: `rustix::fs::Dir`
+  reuses an `F_GETFL` word for the `openat(fd, ".")` it opens a directory's descriptor with.
+  Owner: `src/syscall/linux/fs/file.rs`'s `F_GETFL` arm + the `access` field already there.
+  `PLAN.md` §15.16.
+- **A `flock` dies on *any* close of its description, not the last.** Linux releases the
+  description's `flock` when the last descriptor referring to it closes, so closing one of
+  several `dup`s leaves the lock in force — measured on a current host: `flock(a, LOCK_EX)`,
+  `close(dup_of_a)`, then a fresh `open()` of the file still answers `EWOULDBLOCK`. This
+  kernel releases it on any close naming that description, because the close path passes the
+  description's identity and nothing about how many descriptors still hold it — so a process
+  that dups its lock descriptor and closes the dup silently loses its lock, and a second
+  process can take it. `src/vfs/locks.rs`'s own `release_on_close` record already states the
+  Linux rule, so the code and its documentation disagree. Owner: `src/syscall/linux/fs/file.rs`'s
+  close path (which already tests `Arc::strong_count` after the close for the evdev half) and
+  `src/vfs/locks.rs`. `PLAN.md` §15.16.
 
 - **`FIONREAD` on a regular file and on a pipe.** Linux answers `0` and the bytes
   remaining/queued; this kernel answers `ENOTTY` for everything that is not the entropy
