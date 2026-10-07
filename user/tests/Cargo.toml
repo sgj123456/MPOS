@@ -40,7 +40,12 @@
 #     non-aliasing `&mut OwnedFd` (so `oldfd == newfd` is unreachable through
 #     it), and takes its flags as a typed bitset that cannot hold an invalid
 #     word - which is all three of the things `t-dup3` pins. `libc::dup3` takes
-#     and returns the raw numbers and the raw flag word the syscall does.
+#     and returns the raw numbers and the raw flag word the syscall does. The
+#     same clause a second time: `rustix::process::getcwd` takes a `Vec<u8>` and
+#     returns a `CString`, growing it on ERANGE until the path fits - so the
+#     *size the caller chose* (and its EINVAL and ERANGE answers) and the
+#     *address the syscall returns* are both outside it, which is what
+#     `t-getcwd` and `t-chdir` pin through `libc::getcwd`.
 #
 # All three keep the purpose of the rule above: the number, the call and its shape
 # come from a maintained per-machine table rather than from this repository's

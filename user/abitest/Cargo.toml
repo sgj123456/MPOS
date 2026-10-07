@@ -173,10 +173,6 @@ name = "t-brk"
 path = "src/bin/syscall/t-brk.rs"
 
 [[bin]]
-name = "t-chdir"
-path = "src/bin/syscall/t-chdir.rs"
-
-[[bin]]
 name = "t-clock-gettime"
 path = "src/bin/syscall/t-clock-gettime.rs"
 
@@ -254,10 +250,6 @@ path = "src/bin/syscall/t-fstat.rs"
 [[bin]]
 name = "t-futex"
 path = "src/bin/syscall/t-futex.rs"
-
-[[bin]]
-name = "t-getcwd"
-path = "src/bin/syscall/t-getcwd.rs"
 
 [[bin]]
 name = "t-getdents64"
