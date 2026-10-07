@@ -161,10 +161,6 @@ name = "t-uevent"
 path = "src/bin/integration/t-uevent.rs"
 
 [[bin]]
-name = "t-9p"
-path = "src/bin/syscall/t-9p.rs"
-
-[[bin]]
 name = "t-clone"
 path = "src/bin/syscall/t-clone.rs"
 
@@ -199,18 +195,6 @@ path = "src/bin/syscall/t-maps.rs"
 [[bin]]
 name = "t-mmap-shared-fork"
 path = "src/bin/syscall/t-mmap-shared-fork.rs"
-
-[[bin]]
-name = "t-mount"
-path = "src/bin/syscall/t-mount.rs"
-
-[[bin]]
-name = "t-ns-uts"
-path = "src/bin/syscall/t-ns-uts.rs"
-
-[[bin]]
-name = "t-chroot"
-path = "src/bin/syscall/t-chroot.rs"
 
 [[bin]]
 name = "t-poll"
@@ -263,18 +247,6 @@ path = "src/bin/syscall/t-signal-delivery.rs"
 [[bin]]
 name = "t-signalfd"
 path = "src/bin/syscall/t-signalfd.rs"
-
-[[bin]]
-name = "t-statfs"
-path = "src/bin/syscall/t-statfs.rs"
-
-[[bin]]
-name = "t-stat-consistency"
-path = "src/bin/syscall/t-stat-consistency.rs"
-
-[[bin]]
-name = "t-statx"
-path = "src/bin/syscall/t-statx.rs"
 
 [[bin]]
 name = "t-syslog"
