@@ -18,7 +18,7 @@
 # author's memory of it.
 #
 # `libc` is here for the calls `rustix` cannot be *relied on* to bind, and the
-# migration of the no-std suite has measured two shapes of that:
+# migration of the no-std suite has measured three shapes of that:
 #
 #   * a call it does not bind at all - `process_vm_readv`/`writev` and
 #     `rt_sigtimedwait`, driven through `libc::syscall` with the number from
@@ -34,8 +34,15 @@
 #     machine than the other. `t-dup2` calls `libc::dup2`. The same shape, one
 #     step milder: `rustix::io::close` takes a raw fd and returns nothing, so
 #     "close answers 0" cannot be expressed through it at all.
+#   * a call whose wrapper binds the right syscall but whose *shape* cannot
+#     express the claim. Measured: `rustix::io::dup3(fd, &mut OwnedFd, DupFlags)`
+#     returns `()` rather than the new number, takes its target as a
+#     non-aliasing `&mut OwnedFd` (so `oldfd == newfd` is unreachable through
+#     it), and takes its flags as a typed bitset that cannot hold an invalid
+#     word - which is all three of the things `t-dup3` pins. `libc::dup3` takes
+#     and returns the raw numbers and the raw flag word the syscall does.
 #
-# Both keep the purpose of the rule above: the number, the call and its shape
+# All three keep the purpose of the rule above: the number, the call and its shape
 # come from a maintained per-machine table rather than from this repository's
 # memory of them. It is still not a second interface for calls `rustix` names
 # *and* answers the way the ABI says.

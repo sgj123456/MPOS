@@ -205,17 +205,19 @@ between served / refused / wrong-shape belongs in both.
 auto-discovered) — the shape a new test belongs in, because it runs on **both** machines and takes
 its per-claim printing and exit status from the crate's own `Report` (`user/tests/src/lib.rs`)
 instead of a local copy. `rustix` first, `libc` only where the crate's `Cargo.toml` rule allows it —
-and that rule has two measured clauses now, not one: a call `rustix` does not bind, and a call whose
-wrapper is *not* the syscall the ABI promises (or throws its result away), which is how the no-std
-migration found `rustix::io::dup2` substituting `dup3` on aarch64 and `rustix::io::close` returning
-nothing. `no_std` raw-syscall → `user/abitest/src/bin/{syscall,integration}/t-<name>.rs`,
-which is where the *unmigrated* half of the ABI suite lives: `PLAN.md` §15.11 moves it to the std side
-a batch at a time, so a new test does not belong there. **Add an explicit `[[bin]]` block to
-`user/abitest/Cargo.toml`** — Cargo does not auto-discover `src/bin/<subdir>/*.rs`; the std side needs
-none. Print `ok:`/`FAIL:` per check and a final `PASS`/`FAILED` (`Report::finish` does both). The
-no_std harness is `user/abitest/lib/lin.rs`. Keep the `t-` name (the test `/init` globs `/bin/t-*`).
-Decide its group in `tests.toml` — and a name in a machine's own group must be a program that machine
-actually builds (§5's trap).
+and that rule has three measured clauses now, not one: a call `rustix` does not bind; a call whose
+wrapper is *not* the syscall the ABI promises (or throws its result away) — `rustix::io::dup2`
+substituting `dup3` on aarch64, `rustix::io::close` returning nothing; and a call whose wrapper binds
+the right syscall but whose *shape* cannot express the claim — `rustix::io::dup3` returns `()` and
+takes a typed `DupFlags`, so `t-dup3` uses `libc::dup3` for the new number, the `oldfd == newfd`
+EINVAL and the invalid-flag-word EINVAL. `no_std` raw-syscall →
+`user/abitest/src/bin/{syscall,integration}/t-<name>.rs`, which is where the *unmigrated* half of the
+ABI suite lives: `PLAN.md` §15.11 moves it to the std side a batch at a time, so a new test does not
+belong there. **Add an explicit `[[bin]]` block to `user/abitest/Cargo.toml`** — Cargo does not
+auto-discover `src/bin/<subdir>/*.rs`; the std side needs none. Print `ok:`/`FAIL:` per check and a
+final `PASS`/`FAILED` (`Report::finish` does both). The no_std harness is `user/abitest/lib/lin.rs`.
+Keep the `t-` name (the test `/init` globs `/bin/t-*`). Decide its group in `tests.toml` — and a name
+in a machine's own group must be a program that machine actually builds (§5's trap).
 
 **Add a kernel unit test.** A `#[cfg(test)] mod tests` at the bottom of the file it tests, with the
 parent module compiled for the host (§3). Assert on the contract (value, errno, count), not a log
@@ -272,7 +274,7 @@ definition the loader and both kernels read now (§13.23) — and the loader's
 | A `net/*` host test never runs | `src/lib.rs` gates the whole `net` module on `target_os = "none"`; a host test inside it is unreachable |
 | `user/staging/` looks like a missing test | Deliberate scratch — check `user/abitest` and `user/tests` for the live version first |
 | Two `cargo xtask test` runs in one tree report nonsense | They share `build/test-*` artefacts and one reads a log the other is writing. Trust the log's own summary + `=== END`, re-run alone |
-| The two sweeps do not build the same programs | x86_64's arm builds **both** suites (169: the bare-metal `user/abitest` plus `user/tests`) and aarch64's builds **only** the std suite (30). So "every name `tests.toml` declares must be a program this arm built" has two scopes, and `tests.toml`'s `external`/`slow`/`diagnostic` groups name programs only the first machine carries. Sharing the check refuses every aarch64 sweep - measured, on exactly `t-sh, t-dns, t-rawicmp, t-tcp-close, t-fill-ramfs, t-forkcost, t-netlat, t-pipecost`. Each arm asks its own question (`xtask/src/sweep.rs`'s `select` records why) |
+| The two sweeps do not build the same programs | x86_64's arm builds **both** suites (169: the bare-metal `user/abitest` plus `user/tests`) and aarch64's builds **only** the std suite (42 today, as §15.11's migration moves programs across). So "every name `tests.toml` declares must be a program this arm built" has two scopes, and `tests.toml`'s `external`/`slow`/`diagnostic` groups name programs only the first machine carries. Sharing the check refuses every aarch64 sweep - measured, on exactly `t-sh, t-dns, t-rawicmp, t-tcp-close, t-fill-ramfs, t-forkcost, t-netlat, t-pipecost`. Each arm asks its own question (`xtask/src/sweep.rs`'s `select` records why) |
 | The test machine ≠ the run machine | `xtask test` boots an initramfs on its own QEMU wiring; `xtask run` boots the disk image on `machine.toml`'s. A device only one has is a shape no test sees — name a driver's "controller with nothing on it" behaviour on the machine that has one before calling it measured (§7.3's 28 s empty-controller boot) |
 | A device class needs a *host* backend, not just a QEMU device | vsock is the one virtio device QEMU does not emulate in userspace: `vhost-vsock-*` is a host kernel module, and a machine naming it without `/dev/vhost-vsock` refuses to start. So such a device is attached only where the host can back it, its success marker is required only there, and the skip is **printed** - a verdict that quietly ran one check fewer is the failure `tests.toml`'s groups exist to prevent. Give the device a CID distinct from every other machine's (the aarch64 boot takes `4`, the run machine `3`): a second guest claiming a live CID aborts QEMU before the guest starts (§13.28) |
 | An `M*_OK` marker's own summary can outlive the class's condition | the prose `xtask` prints when every required marker was seen is a *claim*, and a conditional marker makes it a conditional claim: §13.28's summary line is built from the same `vsock_available()` decision that picks the marker, so it says "seven devices" and omits `M8_VSOCK_OK` on a host that could not back the device. A summary hard-coded to the host that wrote it is a lie on the host that reads it |

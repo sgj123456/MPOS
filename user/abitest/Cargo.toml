@@ -165,10 +165,6 @@ name = "t-9p"
 path = "src/bin/syscall/t-9p.rs"
 
 [[bin]]
-name = "t-access"
-path = "src/bin/syscall/t-access.rs"
-
-[[bin]]
 name = "t-arch-prctl"
 path = "src/bin/syscall/t-arch-prctl.rs"
 
@@ -193,10 +189,6 @@ name = "t-copy-file-range"
 path = "src/bin/syscall/t-copy-file-range.rs"
 
 
-
-[[bin]]
-name = "t-dup3"
-path = "src/bin/syscall/t-dup3.rs"
 
 [[bin]]
 name = "t-enosys"
@@ -346,10 +338,6 @@ path = "src/bin/syscall/t-ns-uts.rs"
 [[bin]]
 name = "t-chroot"
 path = "src/bin/syscall/t-chroot.rs"
-
-[[bin]]
-name = "t-openat"
-path = "src/bin/syscall/t-openat.rs"
 
 [[bin]]
 name = "t-openat2"
