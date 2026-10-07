@@ -205,14 +205,18 @@ between served / refused / wrong-shape belongs in both.
 auto-discovered) — the shape a new test belongs in, because it runs on **both** machines and takes
 its per-claim printing and exit status from the crate's own `Report` (`user/tests/src/lib.rs`)
 instead of a local copy. `rustix` first, `libc` only where the crate's `Cargo.toml` rule allows it —
-and that rule has three measured clauses now, not one: a call `rustix` does not bind; a call whose
+and that rule has three measured clauses now, not one: a call `rustix` does not bind — including
+`faccessat2`, which it reaches only through `accessat` *with* a flag word; a call whose
 wrapper is *not* the syscall the ABI promises (or throws its result away) — `rustix::io::dup2`
 substituting `dup3` on aarch64, `rustix::io::close` returning nothing; and a call whose wrapper binds
 the right syscall but whose *shape* cannot express the claim — `rustix::io::dup3` returns `()` and
 takes a typed `DupFlags`, so `t-dup3` uses `libc::dup3` for the new number, the `oldfd == newfd`
 EINVAL and the invalid-flag-word EINVAL; and the same shape again, `rustix::process::getcwd` takes a
 `Vec` and returns a `CString` (growing on ERANGE), so `t-getcwd`/`t-chdir` use `libc::getcwd` for the
-buffer-size contract. `no_std` raw-syscall →
+buffer-size contract; and a third time, `rustix::fs::openat2` writes `size_of::<open_how>()` itself
+and takes a typed `ResolveFlags`, so `t-openat2` drives `libc::syscall` + `SYS_openat2` for the size
+word. A `libc::syscall` call still takes its numbers from `rustix`'s tables where `libc` has none
+(`AT_EACCESS` is absent for linux-musl). `no_std` raw-syscall →
 `user/abitest/src/bin/{syscall,integration}/t-<name>.rs`, which is where the *unmigrated* half of the
 ABI suite lives: `PLAN.md` §15.11 moves it to the std side a batch at a time, so a new test does not
 belong there. **Add an explicit `[[bin]]` block to `user/abitest/Cargo.toml`** — Cargo does not

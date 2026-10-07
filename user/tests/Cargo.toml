@@ -22,7 +22,9 @@
 #
 #   * a call it does not bind at all - `process_vm_readv`/`writev` and
 #     `rt_sigtimedwait`, driven through `libc::syscall` with the number from
-#     `libc::SYS_*`;
+#     `libc::SYS_*`; and `faccessat2`, which `rustix` reaches only through
+#     `accessat` *with* a flag word, so the no-flag spelling two programs pin
+#     has no binding to call (`t-faccessat`, `t-faccessat2`);
 #   * a call whose wrapper is not the syscall the ABI promises on every machine,
 #     or throws away the result the ABI promises. Measured, not guessed:
 #     `rustix::io::dup2` substitutes `dup3(fd, new, DupFlags::empty())` under
@@ -45,7 +47,18 @@
 #     returns a `CString`, growing it on ERANGE until the path fits - so the
 #     *size the caller chose* (and its EINVAL and ERANGE answers) and the
 #     *address the syscall returns* are both outside it, which is what
-#     `t-getcwd` and `t-chdir` pin through `libc::getcwd`.
+#     `t-getcwd` and `t-chdir` pin through `libc::getcwd`. The same clause a
+#     third time: `rustix::fs::openat2` writes `size_of::<open_how>()` itself,
+#     so 23 and 25 - the two halves of the version handshake that *are*
+#     `t-openat2`'s subject - are unreachable through it, and its `ResolveFlags`
+#     cannot hold an unknown bit either.
+#
+# Driving a call through `libc::syscall` does not mean spelling its numbers by
+# hand: `t-faccessat2` takes `AT_EACCESS` from `rustix::fs::AtFlags` because
+# `libc` 0.2.189 does not define it for linux-musl at all (measured - it is in
+# the crate for fuchsia, the BSDs, Hurd and AIX, and in no `linux_like` file),
+# and `t-openat2` takes its flags and mode from `rustix::fs` for the same
+# reason. The number still comes from a maintained per-machine table.
 #
 # All three keep the purpose of the rule above: the number, the call and its shape
 # come from a maintained per-machine table rather than from this repository's
