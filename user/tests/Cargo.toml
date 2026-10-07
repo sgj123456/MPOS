@@ -38,20 +38,32 @@
 #     "close answers 0" cannot be expressed through it at all.
 #   * a call whose wrapper binds the right syscall but whose *shape* cannot
 #     express the claim. Measured: `rustix::io::dup3(fd, &mut OwnedFd, DupFlags)`
-#     returns `()` rather than the new number, takes its target as a
-#     non-aliasing `&mut OwnedFd` (so `oldfd == newfd` is unreachable through
-#     it), and takes its flags as a typed bitset that cannot hold an invalid
-#     word - which is all three of the things `t-dup3` pins. `libc::dup3` takes
-#     and returns the raw numbers and the raw flag word the syscall does. The
-#     same clause a second time: `rustix::process::getcwd` takes a `Vec<u8>` and
-#     returns a `CString`, growing it on ERANGE until the path fits - so the
-#     *size the caller chose* (and its EINVAL and ERANGE answers) and the
-#     *address the syscall returns* are both outside it, which is what
-#     `t-getcwd` and `t-chdir` pin through `libc::getcwd`. The same clause a
-#     third time: `rustix::fs::openat2` writes `size_of::<open_how>()` itself,
-#     so 23 and 25 - the two halves of the version handshake that *are*
-#     `t-openat2`'s subject - are unreachable through it, and its `ResolveFlags`
-#     cannot hold an unknown bit either.
+#     returns `()` rather than the new number, and takes its target as a
+#     non-aliasing `&mut OwnedFd`, so `oldfd == newfd` - the one case where dup3
+#     differs from dup2 - is unreachable through it. Those two are what send
+#     `t-dup3` to `libc::dup3`, which takes and returns the raw numbers the
+#     syscall does; the program's third claim (a flag word with bits beyond
+#     `O_CLOEXEC`) rides along rather than forcing the choice. The same clause a
+#     second time: `rustix::process::getcwd` takes a `Vec<u8>` and returns a
+#     `CString`, growing it on ERANGE until the path fits - so the *size the
+#     caller chose* (and its EINVAL and ERANGE answers) and the *address the
+#     syscall returns* are both outside it, which is what `t-getcwd` and
+#     `t-chdir` pin through `libc::getcwd`. The same clause a third time:
+#     `rustix::fs::openat2` writes `size_of::<open_how>()` itself, so 23 and 25 -
+#     the two halves of the version handshake that *are* `t-openat2`'s subject -
+#     are unreachable through it.
+#
+# Two ways of "cannot express it" look alike and are not, and only the second is
+# a reason to leave `rustix`. A rustix **bitflags** type carries bitflags'
+# unnamed flag (`const _ = !0` - bitflags' "mask of all bits the external source
+# may ever set"), and every bitflags type generates `from_bits_retain`. So an
+# unnamed *bit* is expressible: `DupFlags::from_bits_retain(!0)` is a legal call
+# that holds every bit, and a mode word from a kernel newer than this one has a
+# place to go through it. A claim
+# about a bit is therefore *not* on its own a reason to reach for `libc`. A
+# rustix **plain enum** (`SeekFrom`, `Advice`) has no such escape - the
+# out-of-vocabulary word has nowhere to go at all - and that is a real reason: a
+# bogus `whence`, an advice nothing names, is what forces `libc`.
 #
 # Driving a call through `libc::syscall` does not mean spelling its numbers by
 # hand: `t-faccessat2` takes `AT_EACCESS` from `rustix::fs::AtFlags` because

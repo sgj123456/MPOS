@@ -9,17 +9,25 @@
 //! # Why this program calls `libc` and not `rustix`
 //!
 //! `rustix::io::dup3` does bind the syscall, but its *shape* cannot express the
-//! three things this test is about. It takes the target as a `&mut OwnedFd`, which
-//! by construction cannot be the descriptor it is duplicating *from* - so
-//! `oldfd == newfd`, the case where dup3 differs from dup2, is unreachable through
-//! it. It returns `()` rather than the new number, so "dup3(stdout, 5, 0) returns
-//! 5" cannot be written against it. And its flags are a typed bitset
-//! (`DupFlags`), which cannot hold an *invalid* word - so "bits beyond O_CLOEXEC
-//! answer EINVAL", a claim about what the kernel does with a bad argument, cannot
-//! be made through it at all. `libc::dup3` takes and returns the raw numbers and
-//! the raw flag word the syscall does. That is the third shape `user/tests/
-//! Cargo.toml`'s `libc` rule names, beside a call `rustix` does not bind and one
-//! whose wrapper is not the syscall the ABI promises.
+//! two things this test is about most directly. It takes the target as a
+//! `&mut OwnedFd`, which by construction cannot be the descriptor it is
+//! duplicating *from* - so `oldfd == newfd`, the case where dup3 differs from
+//! dup2, is unreachable through it. And it returns `()` rather than the new
+//! number, so "dup3(stdout, 5, 0) returns 5" cannot be written against it. Those
+//! two are what send this program to `libc::dup3`, which takes and returns the
+//! raw numbers the syscall does; the third claim - a flag word with bits beyond
+//! `O_CLOEXEC` - rides along with them rather than forcing the choice.
+//!
+//! That third one is worth being exact about, because the obvious reason for it
+//! is wrong: `DupFlags` is a bitflags type, and rustix's flag types carry
+//! bitflags' unnamed flag (`const _ = !0`), so `from_bits_retain` holds *any*
+//! word - `DupFlags::from_bits_retain(!0)` is a legal call. An invalid flag word
+//! is therefore expressible through `rustix`, and it is the return value and the
+//! aliasing target that make `libc::dup3` the right call here. A rustix *plain
+//! enum* has no such escape, and that is a real reason.
+//! Either way the shape is the third one `user/tests/Cargo.toml`'s `libc` rule
+//! names, beside a call `rustix` does not bind and one whose wrapper is not the
+//! syscall the ABI promises.
 //!
 //! # What this pins on each machine
 //!

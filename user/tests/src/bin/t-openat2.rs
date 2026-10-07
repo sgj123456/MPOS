@@ -21,11 +21,17 @@
 //!
 //! The size word *is* this call's subject, and `rustix::fs::openat2` cannot
 //! express it: the wrapper writes `size_of::<open_how>()` itself, so 23 and 25
-//! are unreachable through it - and its `ResolveFlags` is a typed bitset, which
-//! cannot hold the unknown bit either. That is the `libc` rule's clause (c) - a
+//! are unreachable through it. That alone is the `libc` rule's clause (c) - a
 //! wrapper that binds the right syscall but whose *shape* cannot express the
-//! claim (`user/tests/Cargo.toml`) - so the call is made through `libc::syscall`
-//! with the number from `libc::SYS_openat2` and a local `#[repr(C)]` `OpenHow`.
+//! claim (`user/tests/Cargo.toml`) - and the program is `libc::syscall` with the
+//! number from `libc::SYS_openat2` and a local `#[repr(C)]` `OpenHow`, the
+//! resolve-bit claims riding along rather than forcing the choice.
+//!
+//! The resolve bit is *not* the reason, and it is worth saying so because the
+//! obvious version of it is wrong: `ResolveFlags` is a bitflags type, and
+//! rustix's flag types carry bitflags' unnamed flag (`const _ = !0`), so
+//! `ResolveFlags::from_bits_retain` holds any word at all. An unnamed bit is
+//! expressible through `rustix`; the size word is what is not.
 //!
 //! What still comes from `rustix` is every number the flag word and the mode
 //! are spelled with (`OFlags`, `Mode`, `ResolveFlags`), so the words this

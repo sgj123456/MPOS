@@ -209,14 +209,19 @@ and that rule has three measured clauses now, not one: a call `rustix` does not 
 `faccessat2`, which it reaches only through `accessat` *with* a flag word; a call whose
 wrapper is *not* the syscall the ABI promises (or throws its result away) — `rustix::io::dup2`
 substituting `dup3` on aarch64, `rustix::io::close` returning nothing; and a call whose wrapper binds
-the right syscall but whose *shape* cannot express the claim — `rustix::io::dup3` returns `()` and
-takes a typed `DupFlags`, so `t-dup3` uses `libc::dup3` for the new number, the `oldfd == newfd`
-EINVAL and the invalid-flag-word EINVAL; and the same shape again, `rustix::process::getcwd` takes a
-`Vec` and returns a `CString` (growing on ERANGE), so `t-getcwd`/`t-chdir` use `libc::getcwd` for the
-buffer-size contract; and a third time, `rustix::fs::openat2` writes `size_of::<open_how>()` itself
-and takes a typed `ResolveFlags`, so `t-openat2` drives `libc::syscall` + `SYS_openat2` for the size
-word. A `libc::syscall` call still takes its numbers from `rustix`'s tables where `libc` has none
-(`AT_EACCESS` is absent for linux-musl). `no_std` raw-syscall →
+the right syscall but whose *shape* cannot express the claim — `rustix::io::dup3` takes its target as
+a non-aliasing `&mut OwnedFd` (so `oldfd == newfd` is unreachable through it) and returns `()` rather
+than the new number, which is what sends `t-dup3` to `libc::dup3`; the same shape again,
+`rustix::process::getcwd` takes a `Vec` and returns a `CString` (growing on ERANGE), so
+`t-getcwd`/`t-chdir` use `libc::getcwd` for the buffer-size contract; and a third time,
+`rustix::fs::openat2` writes `size_of::<open_how>()` itself, so `t-openat2` drives
+`libc::syscall` + `SYS_openat2` for the size word. Two shapes that look alike are *not*, and the
+difference decides which library a new test uses: a rustix **bitflags** type carries `const _ = !0`
+(bitflags' unnamed flag), so an unnamed *bit* is expressible through `from_bits_retain` and is not on
+its own a reason to leave `rustix`; a rustix **plain enum** (`SeekFrom`, `Advice`) has no such escape,
+so an out-of-vocabulary *word* genuinely has nowhere to go. A `libc::syscall` call still takes its
+numbers from `rustix`'s tables where `libc` has none (`AT_EACCESS` is absent for linux-musl). `no_std`
+raw-syscall →
 `user/abitest/src/bin/{syscall,integration}/t-<name>.rs`, which is where the *unmigrated* half of the
 ABI suite lives: `PLAN.md` §15.11 moves it to the std side a batch at a time, so a new test does not
 belong there. **Add an explicit `[[bin]]` block to `user/abitest/Cargo.toml`** — Cargo does not
