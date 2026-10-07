@@ -263,7 +263,7 @@ pub fn image_stale(build_dir: &Path, profile: &str) -> Result<bool> {
     if !image_path(build_dir).exists() {
         return Ok(true);
     }
-    if crate::initramfs::needs_rebuild(build_dir)? {
+    if crate::initramfs::needs_rebuild(build_dir, Arch::X86_64)? {
         return Ok(true);
     }
     crate::rootfs::needs_rebuild(build_dir, profile)

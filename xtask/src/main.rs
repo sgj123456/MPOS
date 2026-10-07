@@ -8,7 +8,6 @@
 mod aarch64;
 mod aarch64_bin;
 mod aarch64_init;
-mod aarch64_initramfs;
 mod arch;
 mod config;
 mod depgraph;
@@ -85,9 +84,6 @@ enum Commands {
     Build,
     /// Build the initramfs
     Initramfs,
-    /// Build the second machine's initramfs - busybox, the applet farm and the
-    /// pivot script both machines switch root from (`PLAN.md` §15.6)
-    Aarch64Initramfs,
     /// Install the root filesystem into the disk image
     Rootfs,
     /// Create the (empty) disk image
@@ -120,7 +116,6 @@ impl Commands {
         match self {
             Commands::Build => "build",
             Commands::Initramfs => "initramfs",
-            Commands::Aarch64Initramfs => "aarch64-initramfs",
             Commands::Rootfs => "rootfs",
             Commands::Disk => "disk",
             Commands::Run => "run",
@@ -146,17 +141,22 @@ fn main() -> Result<()> {
     // for all of them rather than a hint two of them read.
     let arch = Arch::parse(&cli.arch)?;
 
-    // `initramfs`, `disk`, `rootfs` and `all` assemble *the x86_64 disk image*
-    // - a GPT disk with an Alpine root on it - and the second machine's disk is
-    // not that: it is laid out by `boot-aarch64` / `alpine-aarch64` and by
-    // `run --arch aarch64`. So `--arch aarch64` here would build an x86_64
-    // root filesystem under an aarch64 banner, which is the silent
-    // wrong-machine failure `AGENTS.md` §3 refuses. Name the machine's own
-    // command in the refusal rather than doing the other machine's work.
+    // `disk`, `rootfs` and `all` assemble *the x86_64 disk image* - a GPT disk
+    // with an Alpine root on it - and the second machine's disk is not that: it
+    // is laid out by `boot-aarch64` / `alpine-aarch64` and by `run --arch
+    // aarch64`. So `--arch aarch64` here would build an x86_64 root filesystem
+    // under an aarch64 banner, which is the silent wrong-machine failure `AGENTS.md`
+    // §3 refuses. Name the machine's own command in the refusal rather than doing
+    // the other machine's work.
+    //
+    // `initramfs` is *not* in that set any more: both machines unpack an archive
+    // and switch root from its script, the pipeline is one copy
+    // (`xtask/src/initramfs.rs`), and the machine only picks which toml, overlay
+    // and applet farm it uses - so it builds the machine it was asked for.
     if arch == Arch::Aarch64
         && matches!(
             cli.command,
-            Commands::Initramfs | Commands::Disk | Commands::Rootfs | Commands::All
+            Commands::Disk | Commands::Rootfs | Commands::All
         )
     {
         anyhow::bail!(
@@ -265,12 +265,17 @@ fn main() -> Result<()> {
         | Commands::Test
         | Commands::Depgraph
         | Commands::BootAarch64
-        // Unprivileged by construction: apk only writes files into the staging
-        // tree, and `tar` reads it - no device, no mount, no chroot.
-        | Commands::Aarch64Initramfs
         | Commands::AlpineAarch64 => false,
         Commands::Clean => utils::clean_needs_root(&build_dir),
-        Commands::Initramfs | Commands::Rootfs | Commands::All => true,
+        // Root only where the pipeline needs to *exec* the tree it just laid:
+        // the first machine's applet farm is `chroot <staging> /bin/busybox
+        // --install -s`, and a chroot is root. The second machine cannot run its
+        // cross-arch busybox at all, so it links its farm by hand and installs
+        // its packages with apk's `--usermode` - a command that only writes
+        // files, which is why the retired `aarch64-initramfs` needed no root
+        // either.
+        Commands::Initramfs => arch == Arch::X86_64,
+        Commands::Rootfs | Commands::All => true,
         Commands::Run => run_needs_build,
     };
 
@@ -393,7 +398,7 @@ fn dispatch(
 ) -> Result<()> {
     match command {
         Commands::Build => utils::build_kernel(profile, arch),
-        Commands::Initramfs => initramfs::build_initramfs(build_dir, profile),
+        Commands::Initramfs => initramfs::build_initramfs(build_dir, arch),
         Commands::Disk => disk::build_disk(build_dir, profile),
         Commands::Rootfs => {
             if !artefacts_ready {
@@ -438,9 +443,6 @@ fn dispatch(
             }
         },
         Commands::Depgraph => depgraph::run(&utils::project_root()?),
-        // The second machine's early userspace, on its own: the archive every
-        // aarch64 boot installs (§15.6). Unprivileged - apk only writes files.
-        Commands::Aarch64Initramfs => aarch64_initramfs::ensure(build_dir),
         // The second machine's own boot path: it builds this machine's kernel
         // and loader pair through `build_kernel(.., Arch::Aarch64)` like every
         // other command does now, then lays out the ESP and disk that are its

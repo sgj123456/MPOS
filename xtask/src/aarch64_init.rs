@@ -42,8 +42,8 @@
 //! the payload's `sh` (`build_shell_init`); both existed while the machine had
 //! no userland to boot, and since §13.19 `run --arch aarch64` boots the real
 //! Alpine tree instead. The archive packer (`write_initramfs_entries`) went the
-//! same way - the initramfs is a real busybox tree now
-//! (`xtask/src/aarch64_initramfs.rs`), not a tar of hand-encoded members.
+//! same way - the initramfs is a real busybox tree now (the shared pipeline in
+//! `xtask/src/initramfs.rs`), not a tar of hand-encoded members.
 //!
 //! The verdict's launcher ([`exec_launcher_init_elf`]) is *not* one of those,
 //! though §15.6 briefly made it look like one. That change moved the boot onto

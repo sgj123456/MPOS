@@ -21,7 +21,7 @@ at those rather than repeating them.
 | `user/` | `mpos-user` (ordinary `std` programs); `user/abitest/` = the `no_std` conformance suite (`src/bin/syscall/` one family, `src/bin/integration/` end-to-end); `user/tests/` = `std`-side tests; `user/staging/` = scratch, wired into no build |
 | `fuzz/` | `mpos-fuzz`, **its own workspace**: libFuzzer targets over the kernel's parsers |
 | `rootfs/`, `rootfs.toml` | the x86_64 guest image tree and its packages/disk geometry; `rootfs-aarch64.toml` + `rootfs-aarch64/` are the second machine's pair — same parser, different userland and its own `/init` overlay |
-| `initramfs/`, `initramfs.toml` | the early-userspace tree the x86_64 boot unpacks as its first root, and its packages |
+| `initramfs/`, `initramfs.toml` | the early-userspace tree the x86_64 boot unpacks as its first root, and its packages; `initramfs-aarch64.toml` + `initramfs-aarch64/` are the second machine's pair, built by the **same pipeline** (`xtask/src/initramfs.rs`) — the machine picks the toml, the overlay and the applet farm, and nothing else |
 | `machine.toml` | what the image is *booted* on — memory, cpus, devices, run mode. Host-side only, so editing it never reinstalls |
 | `tests.toml` | which test programs the sweep runs by default, and its groups |
 | `build/`, `target/`, `build-test/` | build output and scratch. Never edit, never commit |

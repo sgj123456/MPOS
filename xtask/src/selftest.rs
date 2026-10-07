@@ -335,7 +335,7 @@ fn build_test_initramfs(build_dir: &Path, tests: &[UserTest]) -> Result<PathBuf>
     // is actually out of date - that command takes root for its `chroot` step,
     // and a fresh archive needs no such thing. Building it unconditionally
     // would demand a password even when there is nothing to rebuild.
-    if crate::initramfs::needs_rebuild(build_dir)? {
+    if crate::initramfs::needs_rebuild(build_dir, Arch::X86_64)? {
         let status = Command::new(&self_exe)
             .arg("initramfs")
             .status()

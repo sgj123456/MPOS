@@ -55,7 +55,7 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // is brought up to date here rather than assumed: a stale archive carries an
     // old mtime, which would read as "the rootfs is newer than this" and skip
     // the rebuild the new archive needs.
-    crate::initramfs::ensure(build_dir, profile)?;
+    crate::initramfs::ensure(build_dir, crate::arch::Arch::X86_64)?;
 
     // The mode to bake. It is a boot-file change, not a package change, so it
     // forces the (fast) boot-file refresh on its own even when nothing else

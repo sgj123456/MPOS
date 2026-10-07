@@ -1419,7 +1419,8 @@ fn build(profile: &str) -> Result<(PathBuf, PathBuf)> {
 /// the root tree after the overlay pair, so they win any name the distribution
 /// files also carry. The initramfs is no longer one of the caller's choices:
 /// since §15.6 every aarch64 boot carries the same real early userspace (the
-/// busybox archive `aarch64_initramfs` builds), because the root switch that
+/// busybox archive the shared `initramfs` pipeline builds for this machine),
+/// because the root switch that
 /// used to live in the kernel for a test boot and in the disk script for an
 /// Alpine one now lives in the *script* on both - which is what makes this
 /// machine's boot the first machine's flow rather than its shape-alike.
@@ -1481,7 +1482,7 @@ fn build_esp_with_cmdline(
     // `/init`. The loader copies the archive into frames and records its address
     // and length in the handoff; the kernel unpacks it into a ramfs and runs its
     // `/init` (PLAN.md §9.1 stages 6D/6E, §15.6 for the flow's one shape).
-    let initramfs = crate::aarch64_initramfs::ensure_path(build_dir)?;
+    let initramfs = crate::initramfs::ensure_path(build_dir, crate::arch::Arch::Aarch64)?;
     fs::copy(&initramfs, esp.join("initramfs.tar"))
         .with_context(|| format!("Failed to install {}", initramfs.display()))?;
     println!("initramfs: aarch64 {} -> ESP", initramfs.display());

@@ -70,8 +70,8 @@ rustup target add x86_64-unknown-none x86_64-unknown-uefi x86_64-unknown-linux-m
 - AAVMF 固件 | AAVMF firmware（`/usr/share/AAVMF/AAVMF_CODE.fd` + `AAVMF_VARS.fd`，
   或 `/usr/share/edk2/aarch64/QEMU_EFI.fd` + `QEMU_VARS.fd`）
 
-> `build`、`test` 和 `boot-aarch64` 全程**不需要** root。
-> `build`, `test` and `boot-aarch64` never need root.
+> `build`、`test`、`boot-aarch64` 和 `initramfs --arch aarch64` 全程**不需要** root。
+> `build`, `test`, `boot-aarch64` and `initramfs --arch aarch64` never need root.
 
 ---
 
@@ -89,7 +89,7 @@ cargo xtask [global flags] <command>
 | 构建目录 | `--build-dir <PATH>` | 默认 `$MPOS_BUILD_DIR`，再默认 `build/` | default `$MPOS_BUILD_DIR`, else `build/` |
 | 构建档 | `--profile <NAME>` | 默认 `$PROFILE`，再默认 `debug`；发布用 `--profile release` | default `$PROFILE`, else `debug`; use `--profile release` |
 | 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror`（默认取 `machine.toml` 的 `[qemu] mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror` (defaults to `[qemu] mode` in `machine.toml`, else `mirror`) |
-| 机器 | `--arch <ARCH>` | 全局：`x86_64`（默认）或 `aarch64`。两条路都真的启动那台机器：`run` 让第二台机器把 pid 1 交给它自己的 shell（`/init` 建好 `/tmp` 后 `execve("/bin/sh")`，`/bin` 是仓库内建的多调用二进制，见下），`test` 走它自己的 sweep（见下）| global: `x86_64` (default) or `aarch64`. Both arms really boot that machine: `run` hands the second one's pid 1 to its own shell (`/init` makes `/tmp` and `execve`s `/bin/sh`; `/bin` is the repository's multi-call binary — see below), and `test` takes its own sweep (below) |
+| 机器 | `--arch <ARCH>` | 全局：`x86_64`（默认）或 `aarch64`。三条路都真的处理那台机器：`run` 让第二台机器把 pid 1 交给它自己的 shell（`/init` 建好 `/tmp` 后 `execve("/bin/sh")`，`/bin` 是仓库内建的多调用二进制，见下），`test` 走它自己的 sweep（见下），`initramfs` 建那台机器的归档（见下）。`disk`/`rootfs`/`all` 组装的是 x86_64 的磁盘镜像，`--arch aarch64` 按名拒绝 | global: `x86_64` (default) or `aarch64`. Three commands really handle that machine: `run` hands the second one's pid 1 to its own shell (`/init` makes `/tmp` and `execve`s `/bin/sh`; `/bin` is the repository's multi-call binary — see below), `test` takes its own sweep (below), and `initramfs` builds that machine's archive (below). `disk`/`rootfs`/`all` assemble the x86_64 disk image, so `--arch aarch64` is refused by name |
 | 测试分组 | `--groups <A,B>` | 仅 `test`：除分组外的测试之外再跑这些分组（取代 `tests.toml` 的 `default`）| `test` only: run these groups *in addition* to the ungrouped tests (replaces the file's `default`) |
 | 全部分组 | `--all-groups` | 仅 `test`：连非默认分组一起跑 | `test` only: run every group, including the ones left out by default |
 
@@ -98,7 +98,7 @@ cargo xtask [global flags] <command>
 | 命令 | command | 作用 | what it does | root? |
 | --- | --- | --- | --- | --- |
 | `build` | build | 编译内核与 EFI loader（产物在 `target/…`） | build the kernel and the EFI loader | 否 no |
-| `initramfs` | initramfs | 构建 initramfs | build the initramfs | 是 yes |
+| `initramfs` | initramfs | 构建 initramfs；`--arch` 选机器——两条路都真的建那台机器的归档，走同一条管线。第二台机器不用 root（它的 busybox 跨架构不能 exec，所以 farm 是手搓的符号链接、apk 走 `--usermode`），第一台机器要（它的 farm 是 `chroot … busybox --install -s`） | build the initramfs; `--arch` picks the machine — both really build that machine's archive, from one pipeline. The second machine needs no root (its cross-arch busybox cannot be execed, so the farm is linked by hand and apk runs with `--usermode`); the first does (its farm is `chroot … busybox --install -s`) | 见说明 see note |
 | `disk` | disk | 创建空的磁盘镜像 `build/mpos-uefi-x86_64.img`（分区 + 文件系统） | create the empty disk image (partitions + filesystems) | 是 yes |
 | `rootfs` | rootfs | 把 Alpine 根文件系统装进镜像（会顺带更新 initramfs） | install the root filesystem into the image (refreshes the initramfs too) | 是 yes |
 | `run` | run | 在 QEMU 中启动镜像；若产物过期会先自动重建 | boot the image in QEMU, rebuilding first if stale | 视情况 when needed |

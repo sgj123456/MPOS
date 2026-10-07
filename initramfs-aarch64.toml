@@ -1,7 +1,7 @@
 # initramfs-aarch64.toml - what the second machine's early userspace contains.
 #
-# Read by `cargo xtask aarch64-initramfs` (and by every aarch64 boot through
-# `xtask/src/aarch64_initramfs.rs::ensure`). The archive is the same shape as
+# Read by `cargo xtask initramfs --arch aarch64` (and by every aarch64 boot
+# through `xtask/src/initramfs.rs`'s `ensure_path`). The archive is the same shape as
 # the x86_64 side's - a shell, the tools to mount with, and `/init` - because
 # since PLAN.md §15.6 both machines switch root from their initramfs's script
 # rather than one of them doing it in the kernel. The package set is pinned in
