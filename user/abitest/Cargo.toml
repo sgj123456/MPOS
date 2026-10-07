@@ -207,14 +207,6 @@ name = "t-exit-group"
 path = "src/bin/syscall/t-exit-group.rs"
 
 [[bin]]
-name = "t-fadvise"
-path = "src/bin/syscall/t-fadvise.rs"
-
-[[bin]]
-name = "t-fallocate"
-path = "src/bin/syscall/t-fallocate.rs"
-
-[[bin]]
 name = "t-fchmodat2"
 path = "src/bin/syscall/t-fchmodat2.rs"
 
@@ -261,10 +253,6 @@ path = "src/bin/syscall/t-kill.rs"
 [[bin]]
 name = "t-link"
 path = "src/bin/syscall/t-link.rs"
-
-[[bin]]
-name = "t-lseek"
-path = "src/bin/syscall/t-lseek.rs"
 
 [[bin]]
 name = "t-madvise"

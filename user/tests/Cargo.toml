@@ -58,12 +58,12 @@
 # unnamed flag (`const _ = !0` - bitflags' "mask of all bits the external source
 # may ever set"), and every bitflags type generates `from_bits_retain`. So an
 # unnamed *bit* is expressible: `DupFlags::from_bits_retain(!0)` is a legal call
-# that holds every bit, and a mode word from a kernel newer than this one has a
-# place to go through it. A claim
-# about a bit is therefore *not* on its own a reason to reach for `libc`. A
-# rustix **plain enum** (`SeekFrom`, `Advice`) has no such escape - the
-# out-of-vocabulary word has nowhere to go at all - and that is a real reason: a
-# bogus `whence`, an advice nothing names, is what forces `libc`.
+# that holds every bit, and a mode word from a kernel newer than this one has
+# somewhere to go (`t-fallocate` puts one there). A claim about a bit is
+# therefore *not* on its own a reason to reach for `libc`. A rustix **plain enum**
+# (`SeekFrom`, `Advice`) has no such escape - the out-of-vocabulary word has
+# nowhere to go at all - and that is a real reason: a bogus `whence`
+# (`t-lseek`), an advice nothing names (`t-fadvise`), is what forces `libc`.
 #
 # Driving a call through `libc::syscall` does not mean spelling its numbers by
 # hand: `t-faccessat2` takes `AT_EACCESS` from `rustix::fs::AtFlags` because
