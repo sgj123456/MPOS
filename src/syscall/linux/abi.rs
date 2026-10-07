@@ -3559,13 +3559,13 @@ mod tests {
         buf = [0u8; 16];
         assert_eq!(pair(3, buf.as_mut_ptr() as usize), (0, 0));
         assert_eq!(words(&buf), (8 * 1024 * 1024, 8 * 1024 * 1024));
-        // RLIMIT_NOFILE (5): 1024 soft, 1048576 hard.
-        buf = [0u8; 16];
-        assert_eq!(pair(5, buf.as_mut_ptr() as usize), (0, 0));
-        assert_eq!(words(&buf), (1024, 1048576));
-        // RLIMIT_NPROC (7): 4096 both ways.
+        // RLIMIT_NOFILE (7): 1024 soft, 1048576 hard.
         buf = [0u8; 16];
         assert_eq!(pair(7, buf.as_mut_ptr() as usize), (0, 0));
+        assert_eq!(words(&buf), (1024, 1048576));
+        // RLIMIT_NPROC (6): 4096 both ways.
+        buf = [0u8; 16];
+        assert_eq!(pair(6, buf.as_mut_ptr() as usize), (0, 0));
         assert_eq!(words(&buf), (4096, 4096));
         // An unlisted resource reports RLIM_INFINITY both ways.
         buf = [0u8; 16];
@@ -3654,10 +3654,11 @@ mod tests {
             )
             .is_ok()
         );
-        // The startup table: an 8 MiB stack, a 1024/1M descriptor ceiling.
+        // The startup table: an 8 MiB stack, and a 1024/1M descriptor ceiling
+        // at RLIMIT_NOFILE's own number (7).
         let d = default_rlimits();
         assert_eq!((d[3].cur, d[3].max), (8 * 1024 * 1024, 8 * 1024 * 1024));
-        assert_eq!((d[5].cur, d[5].max), (1024, 1_048_576));
+        assert_eq!((d[7].cur, d[7].max), (1024, 1_048_576));
         assert_eq!((d[0].cur, d[0].max), (u64::MAX, u64::MAX));
     }
 

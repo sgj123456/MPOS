@@ -352,9 +352,11 @@ pub fn set_current_rlimit(resource: usize, new: Rlimit, is_root: bool) -> Result
         match rlimit_admit(old, new, is_root) {
             Ok(v) => {
                 t.task_mut(cur).rlimits[resource] = v;
-                // RLIMIT_NOFILE also caps the descriptor table: keep the two in
-                // step so an fd allocation refuses at the new ceiling.
-                if resource == 5 {
+                // RLIMIT_NOFILE (7 in `asm-generic/resource.h`, which is the
+                // numbering a caller's `setrlimit` speaks) also caps the
+                // descriptor table: keep the two in step so an fd allocation
+                // refuses at the new ceiling.
+                if resource == 7 {
                     let fds = t.task(cur).fds.clone();
                     fds.set_nofile(v.cur);
                 }

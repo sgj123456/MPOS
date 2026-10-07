@@ -354,6 +354,23 @@ the commit bodies), and each moved its pin in the same commit.
    refusals Linux gives). One divergence the pin names rather than asserts: `VT_GETSTATE`'s
    layout is not Linux's (`PLAN.md` §13.18). Closes `PLAN.md` §13.16.
 
+10. **`RLIMIT_NOFILE` is 7, not 5 — the resource table was indexed by this kernel's own
+    numbering.** `getrlimit`/`setrlimit`/`prlimit64` speak `asm-generic/resource.h`'s numbers:
+    CPU 0, FSIZE 1, DATA 2, STACK 3, CORE 4, **RSS 5, NPROC 6, NOFILE 7**, MEMLOCK 8, AS 9,
+    LOCKS 10, SIGPENDING 11, MSGQUEUE 12, NICE 13, RTPRIO 14, RTTIME 15. `crates/abi`'s
+    `default_rlimits` held the descriptor ceiling on row 5 (Linux's `RLIMIT_RSS`) and the
+    process count on row 7 (Linux's `RLIMIT_NOFILE`), so a caller asking for the descriptor
+    ceiling read the process count, and `setrlimit(RLIMIT_NOFILE)` wrote a row nothing
+    enforced. Measured against this host's own `/proc/self/limits`, which prints Linux's
+    sixteen rows in `RLIMIT` order; the label table in `src/vfs/procfs.rs` had fourteen and
+    was shifted by the same slip, so `ulimit` read the wrong names as well. Owner:
+    `crates/abi/src/lib.rs`, `src/sched/runtime.rs` (the `resource == 7` fd-ceiling sync),
+    `src/vfs/procfs.rs`. Pin: `crates/abi`'s `default_rlimits_budgets_stack_nofile_and_nproc`
+    (which now also asserts that row 5 is unbudgeted), `src/syscall/linux/abi.rs`'s prlimit64
+    test, and `t-prlimit64` on **both** machines (S6 batch 10) - whose "the `RLIMIT_NOFILE`
+    soft limit is 1024" claim could only be pinned once the constant came from a maintained
+    table instead of from the kernel it was checking.
+
 ### 5.2 Small, measured, and not yet landed
 
 - **`FIONREAD` on a regular file and on a pipe.** Linux answers `0` and the bytes

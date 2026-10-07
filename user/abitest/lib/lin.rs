@@ -441,9 +441,13 @@ pub const MADV_DONTNEED: usize = 4;
 pub const FUTEX_WAIT: usize = 0;
 pub const FUTEX_WAKE: usize = 1;
 
-/// prlimit64 resources.
+/// prlimit64 resources: `asm-generic/resource.h`'s numbers, which is what a
+/// caller's `prlimit64` speaks. `RLIMIT_NOFILE` is 7, not the 5 it was written
+/// as here - 5 is `RLIMIT_RSS`, and the table used to hold the descriptor
+/// ceiling on that row (fixed with the table; see `crates/abi`'s
+/// `default_rlimits`).
 pub const RLIMIT_STACK: i32 = 3;
-pub const RLIMIT_NOFILE: i32 = 5;
+pub const RLIMIT_NOFILE: i32 = 7;
 pub const RLIM64_INFINITY: u64 = u64::MAX;
 
 /// file type bits of st_mode / stx_mode.

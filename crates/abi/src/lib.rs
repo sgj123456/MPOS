@@ -163,7 +163,12 @@ pub mod unwatched_events {
 
 /// How many resource limits a process carries. The rows are indexed by the
 /// `RLIMIT_*` numbers, which are the same on x86_64 and aarch64 (asm-generic):
-/// `3` stack, `5` descriptor table, `7` process count.
+/// `3` stack, `6` process count, `7` descriptor table. The two rows between them
+/// are `4` core file and `5` resident set. A table that put the descriptor
+/// ceiling at `5` - which this one did until S6's batch 10 read the numbering
+/// off a maintained table instead of off the kernel - answered
+/// `getrlimit(RLIMIT_NOFILE)` with the process-count budget and `RLIMIT_RSS`
+/// with the descriptor one.
 pub const RLIM_NLIMITS: usize = 16;
 /// `RLIM_INFINITY`: what an unlimited limit reads as.
 pub const RLIM_INFINITY: u64 = u64::MAX;
@@ -179,6 +184,13 @@ pub struct Rlimit {
 /// The limits a fresh process starts with: an 8 MiB stack, a descriptor
 /// ceiling, a process count, and infinity for the rows nothing budgets. Every
 /// other resource reads these until `setrlimit` says otherwise.
+///
+/// The three rows are `RLIMIT_STACK` (3), `RLIMIT_NPROC` (6) and
+/// `RLIMIT_NOFILE` (7) - the numbers `asm-generic/resource.h` gives, and so the
+/// ones a caller's `getrlimit`/`setrlimit`/`prlimit64` speaks. They were written
+/// at `5` and `7` (Linux's `RLIMIT_RSS` and `RLIMIT_NPROC` rows), which made a
+/// caller asking for the descriptor ceiling read the process count and left the
+/// real `RLIMIT_NOFILE` row holding it.
 pub fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
     let mut t = [Rlimit {
         cur: RLIM_INFINITY,
@@ -188,14 +200,14 @@ pub fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
         cur: 8 * 1024 * 1024,
         max: 8 * 1024 * 1024,
     }; // RLIMIT_STACK
-    t[5] = Rlimit {
-        cur: 1024,
-        max: 1_048_576,
-    }; // RLIMIT_NOFILE
-    t[7] = Rlimit {
+    t[6] = Rlimit {
         cur: 4096,
         max: 4096,
     }; // RLIMIT_NPROC
+    t[7] = Rlimit {
+        cur: 1024,
+        max: 1_048_576,
+    }; // RLIMIT_NOFILE
     t
 }
 
@@ -290,7 +302,9 @@ mod tests {
         let t = default_rlimits();
         assert_eq!(t.len(), RLIM_NLIMITS);
         // The three rows that are finite are the ones a static musl binary
-        // needs to start; everything else reads infinity.
+        // needs to start; everything else reads infinity. Which three they are
+        // is the point: `asm-generic/resource.h`'s numbers, so that a caller
+        // asking for RLIMIT_NOFILE gets the descriptor ceiling.
         assert_eq!(
             t[3],
             Rlimit {
@@ -299,17 +313,27 @@ mod tests {
             }
         );
         assert_eq!(
-            t[5],
+            t[6],
             Rlimit {
-                cur: 1024,
-                max: 1_048_576
+                cur: 4096,
+                max: 4096
             }
         );
         assert_eq!(
             t[7],
             Rlimit {
-                cur: 4096,
-                max: 4096
+                cur: 1024,
+                max: 1_048_576
+            }
+        );
+        // `RLIMIT_RSS` (5) is the row the descriptor ceiling used to sit on, and
+        // nothing budgets it - the assertion that keeps the two from swapping
+        // back.
+        assert_eq!(
+            t[5],
+            Rlimit {
+                cur: RLIM_INFINITY,
+                max: RLIM_INFINITY
             }
         );
         assert_eq!(
