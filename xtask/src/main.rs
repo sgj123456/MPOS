@@ -17,6 +17,7 @@ mod initramfs;
 mod qemu;
 mod rootfs;
 mod selftest;
+mod sweep;
 mod utils;
 
 use std::env;
@@ -323,7 +324,7 @@ fn main() -> Result<()> {
         artefacts_ready,
         run_needs_build,
         boot_mode,
-        selftest::Selection {
+        sweep::Selection {
             groups: cli.groups.clone(),
             all: cli.all_groups,
         },
@@ -394,7 +395,7 @@ fn dispatch(
     artefacts_ready: bool,
     run_needs_build: bool,
     mode: config::RunMode,
-    tests: selftest::Selection,
+    tests: sweep::Selection,
 ) -> Result<()> {
     match command {
         Commands::Build => utils::build_kernel(profile, arch),

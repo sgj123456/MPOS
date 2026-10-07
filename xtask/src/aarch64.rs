@@ -811,13 +811,15 @@ pub fn run_sweep(build_dir: &Path, profile: &str) -> Result<()> {
         crate::aarch64_bin::APPLETS.join(",")
     );
 
-    // The check below is what keeps the naming honest. A gap has to be a program
-    // this machine was asked about and could not serve; a name in its group that
-    // this payload never builds is a claim about the ABI that nothing in the
-    // sweep can check - the x86_64 arm stages the name (it builds every
-    // program), and this one has nothing to leave out - so it would sit in the
-    // file looking like a measured gap for ever.
-    let config = crate::config::TestConfig::load(&utils::project_root()?.join("tests.toml"))?;
+    // The check below is what keeps the naming honest, and it is this arm's own
+    // rather than `sweep`'s: it is about *this machine's* group specifically, and
+    // what it refuses is a gap declared here that this payload does not build. A
+    // gap has to be a program this machine was asked about and could not serve; a
+    // name in its group that this payload never builds is a claim about the ABI
+    // that nothing in the sweep can check - the x86_64 arm stages the name (it
+    // builds every program), and this one has nothing to leave out - so it would
+    // sit in the file looking like a measured gap for ever.
+    let config = crate::sweep::load_config()?;
     let machine = crate::config::Machine::Aarch64;
     let built_names: Vec<String> = built.iter().map(|(name, _)| name.clone()).collect();
     let unbuilt = gaps_without_programs(&config, machine, &built_names);
@@ -829,35 +831,17 @@ pub fn run_sweep(build_dir: &Path, profile: &str) -> Result<()> {
         );
     }
 
-    let selected = config.selection(&[], false);
-    let tests: Vec<(String, Vec<u8>)> = built
-        .iter()
-        .filter(|(name, _)| config.runs(name, &selected, machine))
-        .cloned()
-        .collect();
-    let skipped: Vec<&(String, Vec<u8>)> = built
-        .iter()
-        .filter(|(name, _)| !config.runs(name, &selected, machine))
-        .collect();
-    println!(
-        "user tests: {} staged, {} left out by tests.toml",
-        tests.len(),
-        skipped.len()
-    );
-    // Group by group, like the x86_64 arm's report and for the same reason: the
-    // group is the reason, and a reader has to be able to see at a glance that
-    // what this machine left out are the things it is supposed to be missing.
-    for group in config.group_names(machine) {
-        let left: Vec<&str> = skipped
-            .iter()
-            .filter(|(name, _)| config.groups_of(name, machine).contains(&group))
-            .map(|(name, _)| name.as_str())
-            .collect();
-        if !left.is_empty() {
-            println!("  {group:11} {}", left.join(", "));
-        }
-    }
-    println!();
+    // The selection is `sweep`'s - the same questions about `tests.toml` the
+    // first machine's arm asks - and the flags are empty because `main` refuses
+    // `--groups` on this arm before it gets here (this payload's group
+    // vocabulary is the x86_64 suites' membership).
+    let plan = crate::sweep::select(
+        machine,
+        &config,
+        &built,
+        &crate::sweep::Selection::default(),
+    )?;
+    let tests = &plan.staged;
 
     // The runner is `/init` on the disk: the initramfs script switches into the
     // disk, the disk's own chain (`/sbin/init` from the applet farm) execs it,
@@ -875,7 +859,7 @@ pub fn run_sweep(build_dir: &Path, profile: &str) -> Result<()> {
     for path in &tool_paths {
         entries.push((path.as_str(), tools.as_slice()));
     }
-    for (name, bytes) in &tests {
+    for (name, bytes) in plan.staged.iter() {
         entries.push((name.as_str(), bytes.as_slice()));
     }
     let esp = build_esp(
@@ -891,7 +875,7 @@ pub fn run_sweep(build_dir: &Path, profile: &str) -> Result<()> {
     let log = boot(build_dir, &esp, &["=== END"], DEADLINE)?;
     print!("{log}");
     let staged: Vec<&str> = tests.iter().map(|(name, _)| name.as_str()).collect();
-    report_sweep(build_dir, &staged, skipped.len(), &log)
+    report_sweep(build_dir, &staged, plan.skipped.len(), &log)
 }
 
 /// The names in `machine`'s own `tests.toml` groups that `built` does not carry.
@@ -973,6 +957,15 @@ fn build_user_tests_for_aarch64() -> Result<Vec<(String, Vec<u8>)>> {
     Ok(tests)
 }
 
+/// This machine stages *bytes*: the binary is read here and laid on the ext4
+/// image by name, because the payload is an ESP and a disk the guest does not
+/// unpack. The name is the only part `sweep` needs.
+impl crate::sweep::TestProgram for (String, Vec<u8>) {
+    fn name(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Read the sweep's verdict out of the log.
 ///
 /// Three facts have to agree, and each is a different way for the run to be
@@ -988,31 +981,26 @@ fn build_user_tests_for_aarch64() -> Result<Vec<(String, Vec<u8>)>> {
 /// and the names and reasons of the ones it was not are in that file, printed by
 /// the caller above.
 fn report_sweep(build_dir: &Path, staged: &[&str], left_out: usize, log: &str) -> Result<()> {
+    // The protocol is `sweep`'s - one parser for both runners. What this arm
+    // does with it is its own, because its claim differs from the first
+    // machine's: there is no debug exit to read here, so instead of quoting a
+    // status it asserts an exact count - every staged program must have left a
+    // verdict, and "some of them passed" is not a partial pass.
+    let verdict = crate::sweep::verdict(log);
     // The runner sets the machine up before it runs anything (it makes `/tmp`),
     // and a setup that failed makes every "failure" below a statement about the
     // harness rather than the kernel. So this is checked first and refuses the
     // run outright - the one line here that is not about the programs.
-    if let Some(line) = log.lines().find(|line| line.starts_with("=== SETUP_FAIL")) {
+    if let Some(line) = verdict.setup_failed {
         anyhow::bail!(
             "the aarch64 sweep's runner could not set the machine up: {line}; \
              nothing the programs did is evidence about the kernel until that \
              works"
         );
     }
-    let mut passed: Vec<&str> = Vec::new();
-    let mut failed: Vec<&str> = Vec::new();
-    for line in log.lines() {
-        let line = line.trim_end();
-        if let Some(name) = line.strip_prefix("=== PASS ") {
-            passed.push(name);
-        } else if let Some(name) = line.strip_prefix("=== FAIL ") {
-            failed.push(name);
-        }
-    }
-    let summary = log.lines().find(|line| line.starts_with("=== SUMMARY"));
 
     println!();
-    let Some(summary) = summary else {
+    let Some(summary) = verdict.summary else {
         anyhow::bail!(
             "the aarch64 sweep never printed a summary: the run did not reach the \
              end of the {} staged program(s); {} says how far it got",
@@ -1022,8 +1010,9 @@ fn report_sweep(build_dir: &Path, staged: &[&str], left_out: usize, log: &str) -
     };
     println!("self-test (aarch64): {summary}");
 
-    if !failed.is_empty() {
-        let mut names: Vec<&str> = failed
+    if !verdict.failed.is_empty() {
+        let mut names: Vec<&str> = verdict
+            .failed
             .iter()
             .map(|name| name.split_whitespace().next().unwrap_or(name))
             .collect();
@@ -1038,12 +1027,12 @@ fn report_sweep(build_dir: &Path, staged: &[&str], left_out: usize, log: &str) -
             names.join(", ")
         );
     }
-    if passed.len() != staged.len() {
+    if verdict.passed.len() != staged.len() {
         anyhow::bail!(
             "the aarch64 sweep staged {} program(s) but the log carries {} verdict(s): \
              the payload and the run disagree, which is not a partial pass",
             staged.len(),
-            passed.len()
+            verdict.passed.len()
         );
     }
     println!(

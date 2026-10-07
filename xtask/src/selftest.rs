@@ -25,6 +25,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::arch::Arch;
 use crate::qemu;
+use crate::sweep;
 use crate::utils;
 
 /// The SATA disk the test machine is given, and how big it is. Named here and
@@ -33,25 +34,11 @@ use crate::utils;
 pub const SATA_TEST_IMAGE: &str = "test-sata.img";
 pub const SATA_TEST_BYTES: u64 = 4 * 1024 * 1024;
 
-/// The verdict lines the test `/init` prints around every program, and the
-/// summary line the parse below counts on. The markers are deliberately
-/// shaped so a test's own output cannot forge a verdict: no test prints
-/// `=== PASS` itself.
-const SUMMARY_MARKER: &str = "=== SUMMARY";
-
 /// How long the guest may run before the harness gives up on it. TCG is slow;
 /// KVM is not. `MPOS_TEST_TIMEOUT` overrides, in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
-/// What the caller asked `test` to run: the groups named on the command line
-/// (`--groups external,slow`) and whether every group was asked for
-/// (`--all-groups`). Neither means the `default` list in `tests.toml`.
-pub struct Selection {
-    pub groups: Vec<String>,
-    pub all: bool,
-}
-
-pub fn run_tests(build_dir: &Path, profile: &str, selection: Selection) -> Result<()> {
+pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -> Result<()> {
     check_target_gates()?;
     run_unit_tests()?;
     println!();
@@ -65,25 +52,15 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: Selection) -> Resul
     let built = build_user_tests()?;
     println!("user tests: {} programs built", built.len());
 
-    // Which of them this run boots is the configuration's answer, and the two
-    // refusals below are the ones that keep it honest: a group name nobody
-    // defined, and a name in the file that no program answers to. Both would
-    // otherwise show up only as a smaller number in a summary line.
-    let config = crate::config::TestConfig::load(&utils::project_root()?.join("tests.toml"))?;
-    let machine = crate::config::Machine::X86_64;
-    let unknown = config.unknown(&selection.groups);
-    if !unknown.is_empty() {
-        let known = config.group_names(machine);
-        bail!(
-            "unknown test group(s) {}; tests.toml defines {}",
-            unknown.join(", "),
-            if known.is_empty() {
-                "none".to_string()
-            } else {
-                known.join(", ")
-            }
-        );
-    }
+    // Which of them this run boots is the configuration's answer; the group
+    // refusal, the selection and the two lines under it are `sweep`'s, because
+    // they are questions about `tests.toml` rather than about this machine.
+    let config = sweep::load_config()?;
+    // The declared-name check, and *this* arm's scope: it builds both suites
+    // (169 programs, the bare-metal conformance suite among them), so a name in
+    // the file that no program answers to is a stale entry. The second machine
+    // builds only the std suite and asks the narrower question; `sweep::select`
+    // records why the two cannot share one scope.
     let names: Vec<String> = built.iter().map(|test| test.name.clone()).collect();
     let unmatched = config.unmatched(&names);
     if !unmatched.is_empty() {
@@ -92,41 +69,14 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: Selection) -> Resul
             unmatched.join(", ")
         );
     }
+    let plan = sweep::select(crate::config::Machine::X86_64, &config, &built, &selection)?;
 
-    let selected = config.selection(&selection.groups, selection.all);
-    let tests: Vec<UserTest> = built
-        .iter()
-        .filter(|test| config.runs(&test.name, &selected, machine))
-        .cloned()
-        .collect();
-    let skipped: Vec<&UserTest> = built
-        .iter()
-        .filter(|test| !config.runs(&test.name, &selected, machine))
-        .collect();
-    println!(
-        "user tests: {} staged, {} left out by tests.toml",
-        tests.len(),
-        skipped.len()
-    );
-    // Printed group by group rather than as a list of names, because the reason
-    // is the group: a reader has to be able to see at a glance whether the tests
-    // this run left out are the ones it meant to.
-    for group in config.group_names(machine) {
-        let left: Vec<&str> = skipped
-            .iter()
-            .filter(|test| config.groups_of(&test.name, machine).contains(&group))
-            .map(|test| test.name.as_str())
-            .collect();
-        if !left.is_empty() {
-            println!("  {group:11} {}", left.join(", "));
-        }
-    }
-    println!();
-
-    let tar = build_test_initramfs(build_dir, &tests)?;
+    // What is left is this arm's own: the throwaway initramfs, the QEMU wiring
+    // in `machine.toml`, and a verdict that can quote an exit status.
+    let tar = build_test_initramfs(build_dir, &plan.staged)?;
     let (status, log) = boot_tests(build_dir, profile, &tar)?;
 
-    report(&tests, built.len(), &log, status)
+    report(&plan.staged, plan.built, &log, status)
 }
 
 /// The structural check that belongs ahead of the compiler: a `#[cfg(test)]`
@@ -231,6 +181,15 @@ struct UserTest {
     binary: PathBuf,
 }
 
+/// This machine stages a *path*: the binary is copied into the test initramfs
+/// from where cargo left it. The name is the only part `sweep` needs, which is
+/// what lets the choice of programs be one implementation.
+impl sweep::TestProgram for UserTest {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// Builds both user test crates and returns what they produced.
 ///
 /// The std-side crate builds like any musl program. The ABI suite must not
@@ -327,7 +286,7 @@ fn target_dir() -> Result<PathBuf> {
 /// subprocess of this executable, because that command knows how to take root
 /// for its chroot step and hand the tree back; from here the archive is
 /// unpacked as an ordinary user.
-fn build_test_initramfs(build_dir: &Path, tests: &[UserTest]) -> Result<PathBuf> {
+fn build_test_initramfs(build_dir: &Path, tests: &[&UserTest]) -> Result<PathBuf> {
     println!("User tests: packing the test initramfs");
 
     let self_exe = std::env::current_exe().context("Failed to find the xtask executable")?;
@@ -601,31 +560,21 @@ fn test_timeout_secs() -> u64 {
 /// crashed, hung or never ran. `built` is what the crate produced, so the line
 /// can say how much of it the configuration left out - a sweep that quietly
 /// runs less than it used to is the failure this number is here to catch.
-fn report(tests: &[UserTest], built: usize, log: &Path, status: Option<i32>) -> Result<()> {
+fn report(tests: &[&UserTest], built: usize, log: &Path, status: Option<i32>) -> Result<()> {
     let text = fs::read_to_string(log)
         .with_context(|| format!("Failed to read the serial log at {}", log.display()))?;
 
-    let mut passed: Vec<&str> = Vec::new();
-    let mut failed: Vec<&str> = Vec::new();
-    for line in text.lines() {
-        if let Some(name) = line.strip_prefix("=== PASS ") {
-            passed.push(name.trim());
-        } else if let Some(rest) = line.strip_prefix("=== FAIL ") {
-            failed.push(rest.split_whitespace().next().unwrap_or(""));
-        }
-    }
-
-    let summary = text
-        .lines()
-        .rev()
-        .find(|line| line.starts_with(SUMMARY_MARKER));
-    let clean = status == Some(33) && summary.is_some();
-
+    // The protocol is `sweep`'s - one parser for both runners - and what this
+    // arm does with it is its own, because its claim is: every staged program
+    // printed `=== PASS`, and the machine ended on the debug exit.
+    let verdict = sweep::verdict(&text);
     let missing: Vec<&str> = tests
         .iter()
-        .filter(|test| !passed.contains(&test.name.as_str()))
+        .filter(|test| !verdict.passed.contains(&test.name.as_str()))
         .map(|test| test.name.as_str())
         .collect();
+    let summary = verdict.summary;
+    let clean = status == Some(33) && summary.is_some();
 
     println!();
     if let Some(summary) = summary {
