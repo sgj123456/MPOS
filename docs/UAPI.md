@@ -468,6 +468,30 @@ the commit bodies), and each moved its pin in the same commit.
   and "may it be given a disposition" (only when `act != 0`). `t-rt-sigaction`
   pins this kernel's answer on **both** machines. `PLAN.md` §15.11 (batch 20).
 
+- **`signalfd(2)` and `SIGCHLD`: one death, two records, and the wrong code.**
+  Three divergences, each measured on a current host, all of them on the path the
+  compositor-shaped caller this descriptor exists for walks. (a) A child's exit
+  lives in one table (`sched::read_sigchld`) and a generated `SIGCHLD` is *also*
+  queued when the caller has it blocked (`sched::runtime`'s `wants_sigchld`), so
+  a descriptor whose mask names `SIGCHLD` hands over **two** records for one
+  death: the queued copy first, then the exit record. Linux's pending queue is
+  the one table, so one death is one record. (b) That queued copy's `ssi_code`
+  is `SI_USER` (`SigInfo::user`), where Linux's record for a child's exit is
+  `CLD_EXITED`, with the status beside it — the divergence `sched::runtime`'s own
+  comment measured (`si_code=1`) without implementing. (c) An *unblocked*
+  `SIGCHLD` is discarded by Linux (`sig_ignored()`, and `SIGCHLD`'s default
+  action is the ignoring one), so a `signalfd` watching it sees nothing until the
+  caller blocks it — measured with the pair one child's exit makes: unblocked the
+  read answers `-1`/`EAGAIN` (errno 11), blocked it answers the 128-byte record.
+  This kernel reports the exit whatever the mask says, which is what let the
+  no-std version pass without blocking anything. Owner: `src/sched/runtime.rs`'s
+  `queue_signal` call (the record's code, and the second table) with
+  `src/vfs/signalfd.rs`'s `take_signal` (which source wins). `t-signalfd` blocks
+  `SIGCHLD` the way its own contract says, claims the *count* of records with
+  this kernel's answer on the payload and Linux's under `MPOS_ON_HOST`, and pins
+  the exit record's `CLD_EXITED` and pid on **both** machines. `PLAN.md` §15.11
+  (batch 21).
+
 - **`FIONREAD` on a regular file and on a pipe.** Linux answers `0` and the bytes
   remaining/queued; this kernel answers `ENOTTY` for everything that is not the entropy
   pair. The `ENOTTY` is an honest "this descriptor has no queue-length story here" rather

@@ -201,16 +201,8 @@ name = "t-pty"
 path = "src/bin/syscall/t-pty.rs"
 
 [[bin]]
-name = "t-sa-restart"
-path = "src/bin/syscall/t-sa-restart.rs"
-
-[[bin]]
 name = "t-seccomp"
 path = "src/bin/syscall/t-seccomp.rs"
-
-[[bin]]
-name = "t-signalfd"
-path = "src/bin/syscall/t-signalfd.rs"
 
 [[bin]]
 name = "t-syslog"
