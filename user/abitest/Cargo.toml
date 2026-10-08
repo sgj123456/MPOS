@@ -165,10 +165,6 @@ name = "t-clone"
 path = "src/bin/syscall/t-clone.rs"
 
 [[bin]]
-name = "t-execve"
-path = "src/bin/syscall/t-execve.rs"
-
-[[bin]]
 name = "t-futex"
 path = "src/bin/syscall/t-futex.rs"
 
@@ -179,10 +175,6 @@ path = "src/bin/syscall/t-getdents64.rs"
 [[bin]]
 name = "t-maps"
 path = "src/bin/syscall/t-maps.rs"
-
-[[bin]]
-name = "t-mmap-shared-fork"
-path = "src/bin/syscall/t-mmap-shared-fork.rs"
 
 [[bin]]
 name = "t-posix"
