@@ -201,24 +201,12 @@ name = "t-pty"
 path = "src/bin/syscall/t-pty.rs"
 
 [[bin]]
-name = "t-rt-sigaction"
-path = "src/bin/syscall/t-rt-sigaction.rs"
-
-[[bin]]
-name = "t-rt-signal-queue"
-path = "src/bin/syscall/t-rt-signal-queue.rs"
-
-[[bin]]
 name = "t-sa-restart"
 path = "src/bin/syscall/t-sa-restart.rs"
 
 [[bin]]
 name = "t-seccomp"
 path = "src/bin/syscall/t-seccomp.rs"
-
-[[bin]]
-name = "t-signal-delivery"
-path = "src/bin/syscall/t-signal-delivery.rs"
 
 [[bin]]
 name = "t-signalfd"
