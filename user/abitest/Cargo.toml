@@ -165,10 +165,6 @@ name = "t-clone"
 path = "src/bin/syscall/t-clone.rs"
 
 [[bin]]
-name = "t-epoll"
-path = "src/bin/syscall/t-epoll.rs"
-
-[[bin]]
 name = "t-execve"
 path = "src/bin/syscall/t-execve.rs"
 
@@ -195,10 +191,6 @@ path = "src/bin/syscall/t-maps.rs"
 [[bin]]
 name = "t-mmap-shared-fork"
 path = "src/bin/syscall/t-mmap-shared-fork.rs"
-
-[[bin]]
-name = "t-poll"
-path = "src/bin/syscall/t-poll.rs"
 
 [[bin]]
 name = "t-posix"
@@ -283,10 +275,6 @@ path = "src/bin/syscall/t-unix-dgram.rs"
 [[bin]]
 name = "t-unix-scm"
 path = "src/bin/syscall/t-unix-scm.rs"
-
-[[bin]]
-name = "t-unix"
-path = "src/bin/syscall/t-unix.rs"
 
 [[bin]]
 name = "t-wait4"
