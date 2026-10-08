@@ -1076,9 +1076,15 @@ qemu.gpu = \"c\"
             (x86.serial_port.as_str(), arm.serial_port.as_str()),
             ("ttyS0", "ttyAMA0")
         );
+        // The root device is one value for both now, because both disks are the
+        // same shape: a GPT whose second partition is the ext4 root. The second
+        // machine's half stopped naming the whole disk when its image became a
+        // partitioned one (`PLAN.md` §15.18), and a `root=` naming the whole disk
+        // would send its initramfs script at a partition table instead of a
+        // filesystem.
         assert_eq!(
             (x86.root_device.as_str(), arm.root_device.as_str()),
-            ("/dev/vda2", "/dev/vda")
+            ("/dev/vda2", "/dev/vda2")
         );
         // The desktop's base packages are not the second machine's, and the
         // second machine's extra list is not the desktop's.

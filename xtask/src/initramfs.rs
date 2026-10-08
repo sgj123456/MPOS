@@ -392,11 +392,20 @@ pub fn ensure(build_dir: &Path, arch: Arch) -> Result<()> {
     build_initramfs(build_dir, arch)
 }
 
+/// Where `arch`'s packed archive lives, whether or not it is built yet.
+///
+/// The name is the machine's (`Machine::tar`), so the two archives cannot be
+/// mistaken for each other: they are read by two kernels with two different
+/// userlands in them.
+pub fn archive_path(build_dir: &Path, arch: Arch) -> PathBuf {
+    machine(arch).tar_path(build_dir)
+}
+
 /// The packed archive, built if needed - the path a boot installs onto its ESP
 /// as `initramfs.tar`.
 pub fn ensure_path(build_dir: &Path, arch: Arch) -> Result<PathBuf> {
     ensure(build_dir, arch)?;
-    Ok(machine(arch).tar_path(build_dir))
+    Ok(archive_path(build_dir, arch))
 }
 
 /// The archive, unpacked into `dest`.
@@ -538,16 +547,17 @@ mod tests {
         assert_eq!(X86_64.config, "initramfs.toml");
     }
 
-    /// The first machine's archive is the one `utils::initramfs_path` names, so
-    /// the three x86_64 callers that go through that helper and this module
-    /// cannot drift onto two different files.
+    /// The two machines' archives are two files, and each machine's boot reads
+    /// its own: one archive carries one userland, and a boot that read the
+    /// other's would be a machine running the wrong machine's `/init`.
     #[test]
-    fn the_first_machines_archive_is_the_path_the_rest_of_the_crate_names() {
+    fn each_machines_archive_is_a_file_of_its_own() {
         let build = Path::new("/tmp/mpos-build");
-        assert_eq!(
-            X86_64.tar_path(build),
-            utils::initramfs_path(build),
-            "the x86_64 initramfs moved out from under `utils::initramfs_path`"
+        assert_eq!(archive_path(build, Arch::X86_64), X86_64.tar_path(build));
+        assert_eq!(archive_path(build, Arch::Aarch64), AARCH64.tar_path(build));
+        assert_ne!(
+            archive_path(build, Arch::X86_64),
+            archive_path(build, Arch::Aarch64)
         );
     }
 }

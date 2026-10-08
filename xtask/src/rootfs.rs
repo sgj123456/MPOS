@@ -28,31 +28,34 @@ use crate::utils;
 /// halves: this is the step that writes `mpos.cmdline`, so a silent fallback would
 /// put consoles the user never asked for inside the image.
 ///
-/// `pub(crate)` because the second machine's interactive boot asks the same
-/// question of the same sources (`aarch64::alpine_cmdline`): a session is a
-/// session on either machine, and `--mode` means one answer across both.
-pub(crate) fn effective_mode() -> Result<RunMode> {
+/// `pub(crate)` because the same question is asked outside a build:
+/// `qemu::needs_mode_switch` compares the answer with what the image already
+/// carries, and that comparison is what tells `run` whether it has to take root
+/// at all.
+pub(crate) fn effective_mode(arch: Arch) -> Result<RunMode> {
     if let Ok(text) = std::env::var("MPOS_XTASK_MODE") {
         return RunMode::parse_strict(&text);
     }
-    // The standing mode is the file's plain key: `mode` is a word about *this*
-    // image, whose command line this build writes. A machine's own override is
-    // read where the machine is known (`QemuConfig::load_default(arch)`), and a
-    // session on the second machine reads it back through `MPOS_XTASK_MODE`,
-    // which `main` sets from its own view of the file before this is reached.
-    QemuConfig::load_default(crate::arch::Arch::X86_64)?.run_mode()
+    // The standing mode is the machine's own key: `mode` is a word about *this*
+    // image, whose command line this build writes. `main` reads the same source
+    // and exports it through `MPOS_XTASK_MODE`, so both halves of the decision
+    // (`run` deciding whether a refresh is needed, and the refresh itself) answer
+    // with one value.
+    QemuConfig::load_default(arch)?.run_mode()
 }
 
-pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
+pub fn build_rootfs(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
     let root = utils::project_root()?;
     let config_path = root.join("rootfs.toml");
-    let config = RootfsConfig::load(&config_path, Arch::X86_64)?;
+    let config = RootfsConfig::load(&config_path, arch)?;
 
-    let image = utils::image_path(build_dir);
+    let image = utils::image_path(build_dir, arch);
     if !image.exists() {
         anyhow::bail!(
-            "The disk image does not exist at {}; run `cargo xtask disk` first",
-            image.display()
+            "The {} disk image does not exist at {}; run `cargo xtask disk --arch {}` first",
+            arch.name(),
+            image.display(),
+            arch.name()
         );
     }
 
@@ -60,22 +63,24 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // is brought up to date here rather than assumed: a stale archive carries an
     // old mtime, which would read as "the rootfs is newer than this" and skip
     // the rebuild the new archive needs.
-    crate::initramfs::ensure(build_dir, crate::arch::Arch::X86_64)?;
+    crate::initramfs::ensure(build_dir, arch)?;
 
     // The mode to bake. It is a boot-file change, not a package change, so it
     // forces the (fast) boot-file refresh on its own even when nothing else
     // moved - that is how `cargo xtask run --mode X` re-points an existing image
     // without reinstalling Alpine.
-    let mode = effective_mode()?;
+    let mode = effective_mode(arch)?;
 
-    if !needs_rebuild(build_dir, profile)? && crate::qemu::baked_mode(build_dir) == Some(mode) {
+    if !needs_rebuild(build_dir, profile, arch)?
+        && crate::qemu::baked_mode(build_dir, arch) == Some(mode)
+    {
         println!("rootfs: up to date");
         return Ok(());
     }
 
-    let kernel = utils::kernel_path(profile, Arch::X86_64)?;
-    let loader = utils::loader_path(profile, Arch::X86_64)?;
-    let initramfs = utils::initramfs_path(build_dir);
+    let kernel = utils::kernel_path(profile, arch)?;
+    let loader = utils::loader_path(profile, arch)?;
+    let initramfs = crate::initramfs::archive_path(build_dir, arch);
     for (what, path, command) in [
         ("kernel", &kernel, "build"),
         ("EFI loader", &loader, "build"),
@@ -95,7 +100,7 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // turns into minutes, so the base install runs only when the thing that
     // decides what is installed - the configuration - has changed, or when
     // there is no image to update.
-    let full_install = needs_full_install(build_dir)?;
+    let full_install = needs_full_install(build_dir, arch)?;
     println!(
         "{}",
         if full_install {
@@ -174,17 +179,19 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     )?;
 
     if full_install {
-        install_base(build_dir, &mount_dir, &config, &root_dev)?;
+        install_base(build_dir, &mount_dir, &config, &root_dev, arch)?;
     }
 
-    install_boot_files(&mount_dir, &config, &kernel, &loader, &initramfs, mode)?;
+    install_boot_files(
+        &mount_dir, &config, &kernel, &loader, &initramfs, mode, arch,
+    )?;
 
     // The machine's own configuration, then the overlay. Both run on every
     // build path - a change to the hostname or to a file under `rootfs/` should
     // take effect on the next boot, not on the next reinstall - and the overlay
     // goes last, so a file there is the authority over anything generated. The
     // resolver is the one file that may still change after it.
-    write_system_config(&mount_dir, &config)?;
+    write_system_config(&mount_dir, &config, arch)?;
     // The runlevels and the module index are re-asserted on *every* build,
     // not only on a full install - they are the build's policy, and policy
     // that only lands on a reinstall quietly rots (a `rc-update add` inside
@@ -193,10 +200,10 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // any name either writes.
     enable_services(&mount_dir)?;
     write_modules(&mount_dir)?;
-    // The overlay pair, and the inittab rendered with it: `rootfs/` stays the
-    // authoritative last word on any name either writes, and the one file that
-    // lands as a template is resolved before anything reads it.
-    merge_overlays(&root, "rootfs", &mount_dir, &config, false)?;
+    // The overlay pair, applied last: `rootfs-core/` is the half both machines
+    // share and the machine's own tree wins over it, so `rootfs/` stays the
+    // authoritative last word on any name either writes.
+    merge_overlays(&root, arch.root_overlay(), &mount_dir)?;
     write_resolver(&mount_dir, &config)?;
 
     // Detached before the stamp, not after: the nbd server can still be
@@ -206,20 +213,20 @@ pub fn build_rootfs(build_dir: &Path, profile: &str) -> Result<()> {
     // build wrote.
     drop(_guard);
     fs::write(
-        utils::rootfs_stamp(build_dir),
+        utils::rootfs_stamp(build_dir, arch),
         format!("image: {}\n", image.display()),
     )?;
     // Record the mode now baked into `mpos.cmdline`, so the next `run`
     // can tell cheaply whether the image already says what the user asked for.
-    crate::qemu::set_baked_mode(build_dir, mode)?;
+    crate::qemu::set_baked_mode(build_dir, arch, mode)?;
     println!("rootfs: completed");
     Ok(())
 }
 
 /// Builds the root filesystem unless the stamp says the image already holds the
 /// current one.
-pub fn ensure(build_dir: &Path, profile: &str) -> Result<()> {
-    build_rootfs(build_dir, profile)
+pub fn ensure(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
+    build_rootfs(build_dir, profile, arch)
 }
 
 /// True when the image does not hold the current root filesystem: it is
@@ -245,24 +252,24 @@ pub fn ensure(build_dir: &Path, profile: &str) -> Result<()> {
 /// and nothing it is built *into*.
 ///
 /// The image is what [`needs_rebuild`] leaves out, on purpose.
-fn stamp_inputs(root: &Path, build_dir: &Path, profile: &str) -> Result<Vec<PathBuf>> {
+fn stamp_inputs(root: &Path, build_dir: &Path, profile: &str, arch: Arch) -> Result<Vec<PathBuf>> {
     Ok(vec![
         root.join("rootfs.toml"),
-        utils::kernel_path(profile, Arch::X86_64)?,
-        utils::loader_path(profile, Arch::X86_64)?,
-        utils::initramfs_path(build_dir),
+        utils::kernel_path(profile, arch)?,
+        utils::loader_path(profile, arch)?,
+        crate::initramfs::archive_path(build_dir, arch),
     ])
 }
 
-pub fn needs_rebuild(build_dir: &Path, profile: &str) -> Result<bool> {
+pub fn needs_rebuild(build_dir: &Path, profile: &str, arch: Arch) -> Result<bool> {
     let root = utils::project_root()?;
-    let image = utils::image_path(build_dir);
-    let stamp = utils::rootfs_stamp(build_dir);
+    let image = utils::image_path(build_dir, arch);
+    let stamp = utils::rootfs_stamp(build_dir, arch);
     if !image.exists() || !stamp.exists() {
         return Ok(true);
     }
 
-    for input in stamp_inputs(&root, build_dir, profile)? {
+    for input in stamp_inputs(&root, build_dir, profile, arch)? {
         if utils::newer(&input, &stamp)? {
             return Ok(true);
         }
@@ -274,7 +281,7 @@ pub fn needs_rebuild(build_dir: &Path, profile: &str) -> Result<bool> {
     // own contents are what say they changed.
     let stamp_time = utils::file_mtime(&stamp)?;
     Ok(utils::dir_newer_than(&root.join(CORE_OVERLAY), stamp_time)?
-        || utils::dir_newer_than(&root.join("rootfs"), stamp_time)?)
+        || utils::dir_newer_than(&root.join(arch.root_overlay()), stamp_time)?)
 }
 
 /// `/etc/fstab`: the root filesystem by UUID, which is the one name for it
@@ -304,15 +311,32 @@ fn write_fstab(mount_dir: &Path, config: &RootfsConfig, root_uuid: &str) -> Resu
 /// reinstall. Everything whose content is a constant moved to the `rootfs/`
 /// overlay instead (`inittab`, `interfaces`, `resolv.conf`, `doas.conf`), which
 /// is applied after this and so wins over anything written here.
-fn write_system_config(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
+fn write_system_config(mount_dir: &Path, config: &RootfsConfig, arch: Arch) -> Result<()> {
     write_shared_config(mount_dir, config)?;
 
     // Hashing a password is `crypt(3)`, and creating an account is busybox's
     // `adduser` - both run in the chroot, so both need an image this host can
-    // *exec*. That is the x86_64 install's answer only: the second machine's
-    // tree is installed cross-arch with `--no-scripts`, and its root cannot be
-    // chrooted into from an x86_64 host. Everything above is pure file I/O and
-    // therefore shared; everything here is not.
+    // *exec*. That is the first machine's answer only: a tree installed for the
+    // other architecture cannot be chrooted into from this host, which is the
+    // same boundary `Arch::host_runs_guest_userland` draws for the package
+    // install. Everything above is pure file I/O and therefore shared;
+    // everything here is not - and a machine whose `user.name`/`root_password`
+    // are set would be asking for something this build cannot do, which is worth
+    // refusing here rather than meeting as an `Exec format error` from chroot.
+    if !arch.host_runs_guest_userland() {
+        if !config.root_password.is_empty() || !config.user.name.is_empty() {
+            anyhow::bail!(
+                "rootfs: {} asks for an account password, which is set by running the \
+                 image's own chpasswd - and this host cannot run {} binaries. Leave the \
+                 password empty (the console is a serial line with no keyboard) or build \
+                 on that machine",
+                arch.name(),
+                arch.name()
+            );
+        }
+        return Ok(());
+    }
+
     if !config.root_password.is_empty() {
         set_password(mount_dir, "root", &config.root_password)?;
     }
@@ -461,87 +485,16 @@ pub(crate) const CORE_OVERLAY: &str = "rootfs-core";
 /// documented answer), which keeps the second machine's small tree honest
 /// without a special case here.
 ///
-/// `/etc/inittab` is the one merged file that lands as a *template*: the
-/// placeholder line is rendered for this machine immediately after the merge,
-/// while the template is still what the tree holds. Every consumer therefore
-/// sees one shape - a staged or mounted tree never carries an unrendered
-/// placeholder - and no call site can forget its turn.
-pub(crate) fn merge_overlays(
-    root: &Path,
-    machine_tree: &str,
-    mount_dir: &Path,
-    config: &RootfsConfig,
-    serial_getty: bool,
-) -> Result<()> {
+/// Nothing is *rendered* afterwards any more. `/etc/inittab` used to land as a
+/// template whose one placeholder line the first machine rendered empty and the
+/// second machine rendered as a getty on its serial node; the measurement that
+/// retired it is in that file's own header - the vcmux carries the current
+/// virtual console's bytes to the wire on both machines, so the windowless
+/// session reaches its login prompt without a getty on the wire, and the second
+/// login was one line nothing needed.
+pub(crate) fn merge_overlays(root: &Path, machine_tree: &str, mount_dir: &Path) -> Result<()> {
     utils::merge_overlay(&root.join(CORE_OVERLAY), mount_dir)?;
     utils::merge_overlay(&root.join(machine_tree), mount_dir)?;
-    render_inittab(mount_dir, config, serial_getty)
-}
-
-/// Render the shared `/etc/inittab` for one machine. Only called through
-/// [`merge_overlays`] - see the note there about why rendering rides with the
-/// merge rather than with the callers.
-///
-/// `@SERIAL_GETTY@` is the template's only per-machine line, and its two
-/// answers are both facts about the *boot*, not the kernel: an x86_64 session
-/// gets a window, so its consoles reach the screen through the framebuffer and
-/// the placeholder becomes empty (the stock file's shape). The second
-/// machine's interactive `run` attaches no window at all - its wire *is* the
-/// console - so there the placeholder becomes a getty on the machine's own
-/// serial node, named from `rootfs.serial_port` because the psABI name is
-/// the machine's (`ttyAMA0` on the PL011, `ttyS0` on the 16550).
-///
-/// Everything else in the file is one kernel's answer on both machines since
-/// §13.16 ported the vcmux: the virtual consoles carry their bytes to the
-/// serial wire everywhere, so the getty lines need no branch.
-fn render_inittab(mount_dir: &Path, config: &RootfsConfig, serial_getty: bool) -> Result<()> {
-    // The placeholder's own blank line goes with an empty render, so the
-    // stock answer keeps the file's spacing exactly as the old per-machine one
-    // had it; a rendered getty keeps its surrounding blanks like any other entry.
-    let line = if serial_getty {
-        format!(
-            "{port}::respawn:/sbin/getty -L 38400 {port} vt100",
-            port = config.serial_port
-        )
-    } else {
-        String::new()
-    };
-    // The serial port's name is this machine's psABI spelling (`ttyAMA0` on the
-    // PL011, `ttyS0` on the 16550), and it is *read* from the machine's own
-    // toml rather than shared with the boot wiring: `rootfs.serial_port` is
-    // an install input on both machines, while the `console=` word stays the
-    // launcher's business (x86_64 bakes it via `install_boot_files`, aarch64
-    // via `aarch64::alpine_cmdline`). The two spellings of one node are pinned
-    // to each other per machine - here by `rootfs.toml`'s `[aarch64]` value and
-    // `aarch64::SERIAL_PORT`, in config.rs's tests.
-    let path = mount_dir.join("etc/inittab");
-    let text = fs::read_to_string(&path)?;
-    if !text.lines().any(|l| l.trim() == "@SERIAL_GETTY@") {
-        anyhow::bail!(
-            "rootfs: the shared inittab has no @SERIAL_GETTY@ line to render - \
-             the template drifted from what `render_inittab` reads"
-        );
-    }
-    // A whole-line replacement, never a bare word substitution: the comment
-    // block explains the rendering *with* the placeholder token in it, and a
-    // word-level replace would render that prose too.
-    let rendered: Vec<&str> = text
-        .lines()
-        .map(|l| {
-            if l.trim() == "@SERIAL_GETTY@" {
-                line.as_str()
-            } else {
-                l
-            }
-        })
-        .collect();
-    let mut out = if line.is_empty() {
-        rendered.join("\n").replace("\n\n", "\n")
-    } else {
-        rendered.join("\n")
-    };
-    out.push('\n');
-    fs::write(&path, out)?;
     Ok(())
 }
 
@@ -915,10 +868,10 @@ const NBD_LEASE: &str = ".nbd-device";
 /// or an image with no root filesystem in it - is what makes the install run.
 /// Everything else the image contains is either already there or is a file on
 /// the ESP.
-pub fn needs_full_install(build_dir: &Path) -> Result<bool> {
+pub fn needs_full_install(build_dir: &Path, arch: Arch) -> Result<bool> {
     let root = utils::project_root()?;
-    let stamp = utils::rootfs_stamp(build_dir);
-    if !utils::image_path(build_dir).exists() || !stamp.exists() {
+    let stamp = utils::rootfs_stamp(build_dir, arch);
+    if !utils::image_path(build_dir, arch).exists() || !stamp.exists() {
         return Ok(true);
     }
     utils::newer(&root.join("rootfs.toml"), &stamp)
@@ -995,6 +948,7 @@ fn install_base(
     mount_dir: &Path,
     config: &RootfsConfig,
     root_dev: &str,
+    arch: Arch,
 ) -> Result<()> {
     let apk = utils::find_apk_tool(build_dir, &config.mirror, &config.branch)?;
 
@@ -1004,27 +958,65 @@ fn install_base(
     fs::write(mount_dir.join("etc/apk/repositories"), repositories)?;
     utils::install_apk_keys(&mount_dir.join("etc/apk/keys"))?;
 
-    let status_ok = apk_add(
-        &[&apk],
-        mount_dir,
-        &["--arch", config.arch.as_str(), "--update-cache", "--initdb"],
-        &config.base_packages,
-    );
-    status_ok.context("Failed to install the Alpine base system")?;
+    // Two flags differ between the machines, and both are about what an install
+    // can *run*:
+    //
+    // * `--arch` is the package architecture, which is the machine's own word
+    //   (`rootfs.arch`, from that machine's own half of the configuration) - the
+    //   one difference no amount of shared code can wish away, because a mirror
+    //   serves each architecture's packages separately.
+    // * `--no-scripts` where the host cannot exec the target's binaries. A
+    //   package's post-install script is the *guest's* program, and a cross-arch
+    //   `execve` is `Exec format error` (measured): apk would fail the install
+    //   rather than skip it. What such a script would have done is done by the
+    //   machine's own `/init` at first boot instead - busybox's applet farm, for
+    //   one, which `rootfs-aarch64/init` builds on the machine that can run it.
+    let no_scripts: &[&str] = if arch.host_runs_guest_userland() {
+        &[]
+    } else {
+        &["--no-scripts"]
+    };
+    let mut base_flags = vec!["--arch", config.arch.as_str(), "--update-cache", "--initdb"];
+    base_flags.extend_from_slice(no_scripts);
 
-    prepare_chroot(mount_dir)?;
+    apk_add(&[&apk], mount_dir, &base_flags, &config.base_packages)
+        .context("Failed to install the Alpine base system")?;
+
+    // The half of an install that runs the image's own userland: apk's scripts as
+    // they need `/proc`, `/dev` and `/sys`, and - below - the account, whose
+    // password is hashed by the image's own `crypt(3)` and made by its own
+    // `adduser`. A host that cannot exec the tree does neither, which is the one
+    // thing `Arch::host_runs_guest_userland` answers.
+    if arch.host_runs_guest_userland() {
+        prepare_chroot(mount_dir)?;
+    }
 
     write_fstab(mount_dir, config, &blk_uuid(root_dev)?)?;
 
     if !config.extra_packages.is_empty() {
         println!("Installing additional packages");
-        apk_add(&[&apk], mount_dir, &[], &config.extra_packages)
+        // The same `--arch`/`--no-scripts` answer as the base set: these are the
+        // same packages' siblings, installed by the same apk for the same machine.
+        apk_add(&[&apk], mount_dir, no_scripts, &config.extra_packages)
             .context("Failed to install the additional packages")?;
+    }
+
+    // The file this machine's kernel reads back off the root it just booted
+    // (`Arch::kernel_reads_root_probe`): its filesystem check mounts the
+    // partition and looks for exactly these bytes, so "the disk mounted and
+    // served a file" is a line on the wire rather than the absence of an error.
+    // Written last, so nothing above can hide it.
+    if arch.kernel_reads_root_probe() {
+        let probe = mount_dir.join(crate::disk::PROBE_FILE);
+        fs::write(&probe, crate::disk::PROBE_BYTES)
+            .with_context(|| format!("Failed to lay the probe file at {}", probe.display()))?;
     }
 
     // After the packages, so a shell the config names is one that is installed
     // by the time the account points at it.
-    create_user(mount_dir, &config.user)?;
+    if arch.host_runs_guest_userland() {
+        create_user(mount_dir, &config.user)?;
+    }
 
     Ok(())
 }
@@ -1121,11 +1113,11 @@ const SERVICES: &[(&str, &[&str])] = &[
 /// pointing at a script that is not there would be an OpenRC complaint on
 /// every boot.
 ///
-/// `pub(crate)` because the aarch64 image's install (`aarch64::install_alpine_root`)
-/// turns the same runlevels on: the second machine boots the same Alpine
-/// userland, so which services start is one decision and not two. A service
-/// whose script is not installed is named and skipped there too, which is what
-/// lets the two machines share one list while carrying different packages.
+/// The second machine's install runs this too, because both machines boot the
+/// same Alpine userland: which services start is one decision and not two. A
+/// service whose script a machine's package set does not carry is named and
+/// skipped, which is what lets the two machines share one list while carrying
+/// different packages.
 pub(crate) fn enable_services(mount_dir: &Path) -> Result<()> {
     let mut enabled = 0usize;
     for (runlevel, services) in SERVICES {
@@ -1189,9 +1181,9 @@ pub(crate) fn enable_services(mount_dir: &Path) -> Result<()> {
 /// is named for the version the running kernel will report; see
 /// [`utils::kernel_release`].
 ///
-/// `pub(crate)` because the second machine's install (`aarch64::install_alpine_root`)
-/// calls it too, and the reason is the same statement of fact: mpos has no loadable
-/// modules on either machine, so `modprobe` on either machine has to be told that.
+/// The second machine's install calls it too, and the reason is the same
+/// statement of fact: mpos has no loadable modules on either machine, so
+/// `modprobe` on either machine has to be told that.
 /// Without it the second machine's `modules` service - which reads `/etc/modules`
 /// and asks for `af_packet` and `ipv6` - found no `/lib/modules` at all and printed
 /// `modprobe: can't change directory to '/lib/modules'` twice on every boot
@@ -1230,13 +1222,14 @@ const APK_ADD_ATTEMPTS: usize = 4;
 /// `sync` before each retry flushes the queued writeback to the image before
 /// the device is touched again.
 ///
-/// The second machine's install shares this retry (`aarch64::install_alpine_root`):
-/// its failure mode is not NBD I/O but the mirror fetch, and a re-run that
-/// resumes from what `apk` already recorded is the same finish-the-job answer.
-/// Its wrapper is `fakeroot --` (the tree must land root-owned without the
-/// build taking root), which is why the command is a slice rather than one
-/// path: `[]` runs apk directly, `[apk]` runs it bare, `[fakeroot, "--", apk]`
-/// wraps it.
+/// Both machines' installs share it, because both install Alpine packages into
+/// a tree this build lays: the first machine's failure mode is the NBD device
+/// under heavy write load, the second's is the mirror fetch mid-install, and
+/// "apk records what it did manage to install, so a plain re-run finishes the
+/// job" is the answer for either producer. The command is a slice rather than
+/// one path because an install running *inside* another program - the initramfs
+/// pipeline's `--usermode` fetch has no wrapper, an Alpine tree laid under
+/// `fakeroot` has one - spells its wrapper here.
 pub(crate) fn apk_add(
     cmd: &[&str],
     mount_dir: &Path,
@@ -1272,9 +1265,15 @@ pub(crate) fn apk_add(
 /// The three files Alpine's `linux-virt` and `mkinitfs` would put on the ESP,
 /// and the command line the loader hands the kernel.
 ///
-/// `BOOTX64.EFI` under `EFI/BOOT` is where a UEFI firmware falls back when
-/// nothing has written a boot entry into its non-volatile memory, which is
-/// exactly the state of a machine that has never booted this disk.
+/// `BOOTX64.EFI`/`BOOTAA64.EFI` under `EFI/BOOT` is where a UEFI firmware falls
+/// back when nothing has written a boot entry into its non-volatile memory, which
+/// is exactly the state of a machine that has never booted this disk - and which
+/// of the two names it looks for is the machine's own (`Arch::uefi_boot_file`),
+/// fixed by the UEFI specification rather than chosen.
+///
+/// The loader's three paths are the ESP's root on both machines, which is why
+/// this one function writes both: the loader is one crate with one set of paths
+/// in it, mounted here as `/boot` (the ESP) on either machine.
 fn install_boot_files(
     mount_dir: &Path,
     config: &RootfsConfig,
@@ -1282,9 +1281,13 @@ fn install_boot_files(
     loader: &Path,
     initramfs: &Path,
     mode: crate::config::RunMode,
+    arch: Arch,
 ) -> Result<()> {
     fs::create_dir_all(mount_dir.join("boot/EFI/BOOT"))?;
-    install_file(loader, &mount_dir.join("boot/EFI/BOOT/BOOTX64.EFI"))?;
+    install_file(
+        loader,
+        &mount_dir.join("boot/EFI/BOOT").join(arch.uefi_boot_file()),
+    )?;
     install_file(kernel, &mount_dir.join("boot/mpos.elf"))?;
     install_file(initramfs, &mount_dir.join("boot/initramfs.tar"))?;
     fs::write(
@@ -1305,291 +1308,9 @@ fn install_boot_files(
     Ok(())
 }
 
-/// Install a real Alpine userland for `arch` into a staging tree and return it.
-///
-/// This is the one place the two machines' *userlands* differ, and the reason is
-/// a fact about each machine rather than a taste: x86_64 boots a desktop
-/// (`rootfs.toml`: weston, mesa, DRM, seatd), while the second machine has no
-/// GPU, no DRM and no PCI bus to hang the card on, so its Alpine tree is the
-/// smallest one that boots to a login prompt - `alpine-base` and `openrc`, the
-/// packages `rootfs.toml`'s `[aarch64]` half names. What is *not* duplicated is
-/// the install: the repositories text, the keys, the mirror and the apk lookup
-/// are this file's own helpers, and only the tree they are pointed at differs.
-///
-/// Two choices are load-bearing and both are measured:
-///
-///   * **`fakeroot`, not `--usermode`.** A cross-arch `apk` cannot run the
-///     packages' post-install scripts - they are the *target's* binaries and the
-///     host cannot exec them (`execve: Exec format error`, measured) - so
-///     `--no-scripts` is required, and the applet farm such a script would build
-///     is made at first boot instead (see that machine's overlay `init`). But
-///     `--usermode` writes every file owned by whoever ran the build, and
-///     `/etc/shadow` mode 0600 owned by a uid that is not root is a login that
-///     cannot read its own password file. `fakeroot` gives the tree root
-///     ownership without taking root, so this command stays unprivileged.
-///   * **the overlay is core + the machine's own tree, not `rootfs/`.** The
-///     shared half of both userlands lives in `rootfs-core/` (`inittab`, the
-///     network, the resolver, doas); what stays the machine's own is the `/init`
-///     that mounts the pseudo-filesystems a real init expects. The x86_64 side
-///     does that from its initramfs script; the second machine's disk `/init` is
-///     where that work lives. After the trees merge, the same generated layer
-///     the first install runs - hostname, locale, the securetty cleanup, the
-///     resolver - lands here too: it is pure file I/O, and §13.12's prompt said
-///     `localhost` precisely because this path skipped it.
-pub fn install_alpine_root(build_dir: &Path, arch: Arch) -> Result<PathBuf> {
-    let root = utils::project_root()?;
-    let config = RootfsConfig::load(&root.join("rootfs.toml"), arch)?;
-    let staging = alpine_staging(build_dir, arch);
-    let _ = fs::remove_dir_all(&staging);
-    fs::create_dir_all(&staging)
-        .with_context(|| format!("Failed to create {}", staging.display()))?;
-
-    // Repositories and keys first, the way `install_base` does it: apk decides a
-    // repository index is trusted by finding a key whose filename matches the
-    // name in the index's signature, and without them every package answers
-    // `UNTRUSTED signature` and then `no such package`.
-    fs::create_dir_all(staging.join("etc/apk/keys"))?;
-    fs::write(
-        staging.join("etc/apk/repositories"),
-        utils::repositories_text(&config.mirror, &config.branch, &config.repos),
-    )?;
-    utils::install_apk_keys(&staging.join("etc/apk/keys"))?;
-
-    let apk = utils::find_apk_tool(build_dir, &config.mirror, &config.branch)?;
-    let mut packages = config.base_packages.clone();
-    packages.extend(config.extra_packages.iter().cloned());
-    // The same retry the x86_64 install wraps its `apk add` in. Its reason was
-    // NBD I/O errors under heavy write load; a cross-arch tree has no nbd
-    // device, but the failure it guards is the mirror fetch mid-install, and
-    // "apk records what it did manage to install, so a plain re-run finishes the
-    // job" is the answer for either producer. `fakeroot` rides in through the
-    // preflags, so the command shape is unchanged.
-    apk_add(
-        &["fakeroot", "--", apk.as_str()],
-        &staging,
-        &[
-            "--arch",
-            config.arch.as_str(),
-            "--update-cache",
-            "--initdb",
-            "--no-scripts",
-        ],
-        &packages,
-    )?;
-
-    // The overlay pair, and the inittab rendered with it (`merge_overlays`'s
-    // rule: a staged tree never carries an unrendered placeholder). The stock
-    // answer for the installed tree; a session re-renders against its own mode
-    // before laying the disk.
-    merge_overlays(&root, arch.root_overlay(), &staging, &config, false)?;
-    // The runlevels, from the same table the x86_64 image uses: a service whose
-    // script a machine's package set does not carry is named and skipped, so one
-    // list serves both machines. Without this the boot would hand pid 1 to a
-    // busybox init whose `::sysinit:/sbin/openrc sysinit` lines run against empty
-    // runlevel directories - an Alpine userland that starts no service at all.
-    enable_services(&staging)?;
-    // And the module index, for the same reason and from the same helper the
-    // x86_64 install uses: the `modules` service this table turns on reads
-    // `/etc/modules` - `af_packet` and `ipv6` here - and asks `modprobe` for each
-    // name, so without `/lib/modules/<release>` the boot prints "can't change
-    // directory to '/lib/modules'" for every line. `modules.builtin` is how a
-    // machine with no loadable modules answers that honestly: a hit means "already
-    // loaded", exit 0, nothing printed. The names are the same ones on both
-    // machines because they are one kernel's code, and the directory is named for
-    // the release both machines report (`uname -r` is one number).
-    write_modules(&staging)?;
-    // The generated system layer, now that the cross-arch install can consume
-    // it: `system.hostname` becomes `/etc/hostname` (without it the prompt
-    // says `localhost`, which §13.12 had to name rather than fix), the locale
-    // export lands in `/etc/profile.d`, the passwordless shadow clearing makes
-    // the login actually work, the securetty cleanup keeps `login` from calling
-    // an empty password a wrong one, and the init.d chmod sweep is the one
-    // thing OpenRC silently refuses without. All pure file I/O - none of it
-    // needs the image's binaries to run, which is the whole boundary (§13.19).
-    write_shared_config(&staging, &config)?;
-    // The probe file the kernel's filesystem check reads (see
-    // [`crate::disk::PROBE_FILE`]). It sits at the root of a real Alpine tree
-    // because the check is about the *block driver and the filesystem*, which
-    // the machine must prove on whichever root it boots - and the proof is the
-    // file's known bytes, not a name it happens to have. Written here rather
-    // than in a machine's overlay so the two roots' copies come from one
-    // constant and cannot drift.
-    fs::write(
-        staging.join(crate::disk::PROBE_FILE),
-        crate::disk::PROBE_BYTES,
-    )
-    .with_context(|| format!("Failed to lay the probe file on {}", staging.display()))?;
-    // The resolver, after the trees and the generated layer - the one file
-    // that beats a file in the tree, which is what makes `system.dns` the
-    // answer it is (`write_resolver` carries the full story; it is one slirp
-    // fact for both machines). Without this call the guest rides QEMU's
-    // forwarder into the host's loopback stub and every `apk` fetch from the
-    // *running* machine asks a question nothing answers.
-    write_resolver(&staging, &config)?;
-    println!(
-        "alpine: {} packages installed into {} for {}",
-        packages.len(),
-        staging.display(),
-        config.arch
-    );
-    Ok(staging)
-}
-
-/// Where `arch`'s Alpine staging tree lives, whether or not it is installed yet.
-pub fn alpine_staging(build_dir: &Path, arch: Arch) -> PathBuf {
-    build_dir.join(format!("{}-alpine-root", arch.name()))
-}
-
-/// The stamp that records what `arch`'s Alpine tree was installed *from*.
-fn alpine_stamp(build_dir: &Path, arch: Arch) -> PathBuf {
-    build_dir.join(format!("{}-alpine-root.stamp", arch.name()))
-}
-
-/// True when the staging tree predates something it is built from: the toml,
-/// either overlay tree, or the kernel whose release name `/lib/modules/<release>`
-/// carries (`write_modules`' directory outlives a version bump otherwise).
-/// A missing tree is stale by definition - there is nothing to reuse.
-fn alpine_root_is_stale(build_dir: &Path, arch: Arch) -> Result<bool> {
-    let root = utils::project_root()?;
-    let staging = alpine_staging(build_dir, arch);
-    let stamp = alpine_stamp(build_dir, arch);
-    if !staging.exists() || !stamp.exists() {
-        return Ok(true);
-    }
-    let since = utils::file_mtime(&stamp)?;
-    for input in [
-        // The one rootfs.toml now holds both machines' halves, so this stamp is
-        // invalidated by an edit to the *other* machine's section too. That is
-        // the price of one file describing both, and the same price the first
-        // machine's stamp pays.
-        root.join("rootfs.toml"),
-        root.join(CORE_OVERLAY),
-        root.join(arch.root_overlay()),
-    ] {
-        if utils::dir_newer_than(&input, since)? || utils::newer(&input, &stamp)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Install `arch`'s Alpine tree unless the stamp says the staging directory
-/// already holds the current one - then write the stamp. The re-lay of the ext4
-/// image happens on *every* boot-media build regardless; this stamp only decides
-/// whether the network-backed `apk` install runs. That is what makes a boot after
-/// a kernel change cost seconds instead of a package fetch, and it is the same
-/// split the first machine draws between its boot-file update and its full
-/// install.
-pub fn ensure_alpine_root(build_dir: &Path, arch: Arch) -> Result<()> {
-    if alpine_root_is_stale(build_dir, arch)? {
-        install_alpine_root(build_dir, arch)?;
-    } else {
-        println!(
-            "alpine: {} is up to date (reinstall inputs unchanged)",
-            alpine_staging(build_dir, arch).display()
-        );
-    }
-    fs::write(alpine_stamp(build_dir, arch), "alpine: staged tree\n")?;
-    Ok(())
-}
-
-/// The first openrc service failure in `log`, named by the line that explains
-/// it - or `None` when every service came up.
-///
-/// openrc marks the result of each service with `[ ok ]` or `[ !! ]`, wrapped in
-/// the terminal escapes that make the marker coloured, and it prints the
-/// service's own message on the line *above* the marker. So the search is: strip
-/// the escapes, find the marker, and walk back to the last line with anything on
-/// it - for the failure that motivated this that is `mount: mounting proc on
-/// /proc failed: Resource busy`, and for a failure that prints nothing it is the
-/// marker's own line.
-///
-/// Kept as a function rather than inlined because it is the whole of the check
-/// and the only way to test it is against a captured log; the case it was
-/// written for is a unit test below.
-pub fn openrc_failure(log: &str) -> Option<String> {
-    let plain = without_ansi(log);
-    let lines: Vec<&str> = plain.lines().collect();
-    let at = lines.iter().position(|line| line.contains("!!"))?;
-    lines[..at]
-        .iter()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .or_else(|| lines.get(at))
-        .map(|line| line.trim().to_string())
-}
-
-/// The log with openrc's terminal escapes removed.
-///
-/// A failure marker arrives wrapped in colour and cursor codes -
-/// `ESC[1mESC[31m !! ESC[1mESC[34m]` - so the service's own message, which is
-/// what a person needs, is two lines above a marker no `grep` will show. This
-/// strips `ESC [ ... letter` sequences and carriage returns so the line can be
-/// quoted in an error message as it was written.
-pub fn without_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\u{1b}' => {
-                // Only CSI is used by openrc's output; anything else is left
-                // in place rather than guessed at.
-                if chars.next() == Some('[') {
-                    for c in chars.by_ref() {
-                        if c.is_ascii_alphabetic() {
-                            break;
-                        }
-                    }
-                }
-            }
-            '\r' => {}
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The byte-for-byte block the Alpine boot printed while this kernel's
-    /// procfs had no `/proc/<pid>/environ`, copied out of a captured log.
-    ///
-    /// It is here rather than paraphrased because the escapes *are* the case:
-    /// openrc writes the service's message, then moves the cursor back to the
-    /// start of the line and overwrites it with the coloured marker, so a
-    /// checker that searched the raw text for the mount error would find
-    /// nothing on the marker's line and a checker that searched for `!!` in the
-    /// raw text would still have to know it is the failure colour and not the
-    /// success one.
-    const FAILING_PROC_MOUNT: &str = " \x1b[1m\x1b[32m*\x1b[m Mounting /proc\x1b[K ...\r\r\n\
-         mount: mounting proc on /proc failed: Resource busy\r\r\n\
-         \x1b[A\x1b[153C \x1b[1m\x1b[34m[\x1b[1m\x1b[31m !! \x1b[1m\x1b[34m]\x1b[m\r\r\n";
-
-    #[test]
-    fn an_openrc_service_failure_is_named_by_its_own_message() {
-        assert_eq!(
-            openrc_failure(FAILING_PROC_MOUNT).as_deref(),
-            Some("mount: mounting proc on /proc failed: Resource busy")
-        );
-
-        // A healthy runlevel is `None`, and the success marker shares the
-        // marker's brackets - which is the whole reason the check looks for the
-        // failure colour's text and not for a bracket.
-        let healthy = " \x1b[1m\x1b[32m*\x1b[m Starting local\x1b[K ...\r\r\n\
-             \x1b[A\x1b[153C \x1b[1m\x1b[34m[\x1b[1m\x1b[32m ok \x1b[1m\x1b[34m]\x1b[m\r\r\n\
-             Welcome to Alpine Linux 3.25.0\r\r\nmpos login: ";
-        assert_eq!(openrc_failure(healthy), None);
-
-        // And the escapes really are stripped for the message a person reads,
-        // rather than merely skipped over.
-        assert_eq!(
-            without_ansi("a\x1b[1mb\x1b[0m\r\nc"),
-            "ab\nc",
-            "CSI sequences and carriage returns go, everything else stays"
-        );
-    }
 
     #[test]
     fn the_image_is_not_an_input_to_its_own_stamp() {
@@ -1602,28 +1323,42 @@ mod tests {
         // built successfully.
         let root = utils::project_root().expect("the project root is there");
         let build_dir = Path::new("/mpos-a-build-dir-that-does-not-exist");
-        let inputs = stamp_inputs(&root, build_dir, "debug").expect("the paths resolve");
+        // Both machines, because the stamp's list is the same list with the
+        // machine's own kernel, loader and archive in it.
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            let inputs = stamp_inputs(&root, build_dir, "debug", arch).expect("the paths resolve");
 
-        assert!(
-            inputs.contains(&root.join("rootfs.toml")),
-            "the configuration is an input"
+            assert!(
+                inputs.contains(&root.join("rootfs.toml")),
+                "the configuration is an input"
+            );
+            assert!(
+                inputs.contains(&crate::initramfs::archive_path(build_dir, arch)),
+                "this machine's initramfs is an input"
+            );
+            assert!(
+                inputs.contains(&utils::kernel_path("debug", arch).unwrap()),
+                "this machine's kernel is an input"
+            );
+            assert!(
+                inputs.contains(&utils::loader_path("debug", arch).unwrap()),
+                "this machine's loader is an input"
+            );
+            assert_eq!(inputs.len(), 4, "and that is the whole list");
+            assert!(
+                !inputs.contains(&utils::image_path(build_dir, arch)),
+                "the image is built, not built from"
+            );
+        }
+        // And the two machines' lists really are two lists: a shared stamp would
+        // let one machine's build answer for the other's image.
+        assert_ne!(
+            stamp_inputs(&root, build_dir, "debug", Arch::X86_64).unwrap(),
+            stamp_inputs(&root, build_dir, "debug", Arch::Aarch64).unwrap()
         );
-        assert!(
-            inputs.contains(&utils::initramfs_path(build_dir)),
-            "the initramfs is an input"
-        );
-        assert!(
-            inputs.contains(&utils::kernel_path("debug", Arch::X86_64).unwrap()),
-            "the kernel is an input"
-        );
-        assert!(
-            inputs.contains(&utils::loader_path("debug", Arch::X86_64).unwrap()),
-            "the loader is an input"
-        );
-        assert_eq!(inputs.len(), 4, "and that is the whole list");
-        assert!(
-            !inputs.contains(&utils::image_path(build_dir)),
-            "the image is built, not built from"
+        assert_ne!(
+            utils::rootfs_stamp(build_dir, Arch::X86_64),
+            utils::rootfs_stamp(build_dir, Arch::Aarch64)
         );
     }
 
@@ -1664,7 +1399,7 @@ mod tests {
             "shadow",
             "[default]\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\nuser.password = \"\"\n",
         );
-        write_system_config(&dir, &config).unwrap();
+        write_system_config(&dir, &config, Arch::X86_64).unwrap();
 
         let shadow = fs::read_to_string(dir.join("etc/shadow")).unwrap();
         let field = |name: &str| {
@@ -1742,7 +1477,7 @@ mod tests {
             "system",
             "[default]\nsystem.hostname = \"probe\"\nsystem.locale = \"C.UTF-8\"\nuser.name = \"\"\n",
         );
-        write_system_config(&dir, &config).unwrap();
+        write_system_config(&dir, &config, Arch::X86_64).unwrap();
 
         assert_eq!(
             fs::read_to_string(dir.join("etc/hostname")).unwrap(),
@@ -1757,88 +1492,69 @@ mod tests {
         assert!(locale.contains("export LANG=C.UTF-8"), "{locale}");
     }
 
+    /// The shipped `/etc/inittab` is what both images get, verbatim.
+    ///
+    /// It is one file with no placeholder any more: the template's single
+    /// per-machine line used to render as a getty on the second machine's serial
+    /// node, and the measurement that retired it (`rootfs-core/etc/inittab`'s own
+    /// header) is that the vcmux already carries the current virtual console to
+    /// the wire - so a windowless session reaches its login prompt without a
+    /// second getty beside the one busybox init respawns. What this pins is that
+    /// the file the overlay carries is the file the image gets, and that its
+    /// configuration half is the stock answer: a lost or reordered entry, or a
+    /// getty creeping back onto the serial node, fails here rather than at a
+    /// login prompt nobody sees.
     #[test]
-    fn the_shared_inittab_renders_one_getty_line_per_machine() {
-        // The two answers `render_inittab` may give, and the shape each must
-        // leave behind. The x86_64 half is a regression pin: it asserts the
-        // rendered file is *byte-identical* to what the repository's own tree
-        // carried before the core split - the placeholder and its blank line
-        // vanish together, so the stock image's inittab cannot drift just
-        // because it gained a template. The aarch64 half pins the getty's
-        // exact spelling, node name included, because that line is the whole
-        // difference between the two machines' boots.
-        //
-        // Pure string work on purpose: every test here would otherwise share
-        // one staging directory name across parallel harness threads, and the
-        // renderer under test is exactly the function `merge_overlays` calls -
-        // so this reads the repository's template once and renders it twice.
-        let config = load_config(
-            "inittab",
-            "[default]\nrootfs.serial_port = \"ttyAMA0\"\nsystem.hostname = \"mpos\"\n",
+    fn the_shared_inittab_is_the_one_both_images_get() {
+        let root = crate::utils::project_root().unwrap();
+        let stock = fs::read_to_string(root.join("rootfs-core/etc/inittab")).unwrap();
+        assert!(
+            !stock.contains("@SERIAL_GETTY@"),
+            "the placeholder is gone from the file and from the build"
         );
-        let stock = fs::read_to_string(
-            crate::utils::project_root()
-                .unwrap()
-                .join("rootfs-core/etc/inittab"),
-        )
-        .unwrap();
 
-        let render = |text: &str, serial_getty: bool| -> String {
-            let dir = staged_dir(&format!("render-{}", std::process::id()));
-            fs::write(dir.join("etc/inittab"), text).unwrap();
-            render_inittab(&dir, &config, serial_getty).unwrap();
-            let out = fs::read_to_string(dir.join("etc/inittab")).unwrap();
-            let _ = fs::remove_dir_all(&dir);
-            out
-        };
+        let config_lines: Vec<&str> = stock
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .collect();
+        // The stock answer, copied here so the pin does not depend on git
+        // history: the three openrc runlevels, the four virtual consoles, and no
+        // getty on the serial node.
+        assert_eq!(
+            config_lines,
+            vec![
+                "::sysinit:/sbin/openrc sysinit",
+                "::sysinit:/sbin/openrc boot",
+                "::wait:/sbin/openrc default",
+                "tty1::respawn:/sbin/getty 38400 tty1",
+                "tty2::respawn:/sbin/getty 38400 tty2",
+                "tty3::respawn:/sbin/getty 38400 tty3",
+                "tty4::respawn:/sbin/getty 38400 tty4",
+                "::ctrlaltdel:/sbin/reboot",
+                "::shutdown:/sbin/openrc shutdown",
+            ],
+            "the inittab's configuration half may not drift"
+        );
+        assert!(
+            !config_lines
+                .iter()
+                .any(|line| line.contains("ttyS0") || line.contains("ttyAMA0")),
+            "a getty on the serial node is back"
+        );
 
-        for (name, serial_getty) in [("plain", false), ("serial", true)] {
-            let text = render(&stock, serial_getty);
-            assert!(
-                !text.contains("@SERIAL_GETTY@"),
-                "the placeholder never survives rendering ({name})"
+        // And the merge lands it byte for byte on either machine: the file the
+        // tree carries is the file the image gets.
+        for (arch, machine_tree) in [(Arch::X86_64, "rootfs"), (Arch::Aarch64, "rootfs-aarch64")] {
+            let dir = staged_dir(&format!("inittab-{}", arch.name()));
+            merge_overlays(&root, machine_tree, &dir).unwrap();
+            assert_eq!(
+                fs::read_to_string(dir.join("etc/inittab")).unwrap(),
+                stock,
+                "the {} image's inittab is not the shared file",
+                arch.name()
             );
-            for console in ["tty1", "tty2", "tty3", "tty4"] {
-                assert!(
-                    text.contains(&format!("{console}::respawn:/sbin/getty 38400 {console}")),
-                    "{console}'s getty is on both machines"
-                );
-            }
-            if serial_getty {
-                assert!(
-                    text.contains("ttyAMA0::respawn:/sbin/getty -L 38400 ttyAMA0 vt100\n"),
-                    "the interactive second machine logs in on its own serial node: {text}"
-                );
-            } else {
-                let config_lines: Vec<&str> =
-                    text.lines().filter(|l| !l.starts_with('#')).collect();
-                assert!(
-                    !config_lines
-                        .iter()
-                        .any(|l| l.contains("ttyAMA0") || l.contains("ttyS0")),
-                    "the default answer carries no serial getty at all: {text}"
-                );
-                // The *configuration* half of the file - every non-comment,
-                // non-blank line, in order - must read exactly as the old
-                // per-machine x86_64 file did. The comment block and the blank
-                // spacing are allowed to differ (the prose now explains the
-                // rendering); a lost or reordered entry may not.
-                let body = |t: &str| -> Vec<String> {
-                    t.lines()
-                        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-                        .map(str::to_string)
-                        .collect()
-                };
-                // The original file's config lines, copied here so the pin does
-                // not depend on git history: what `rootfs/etc/inittab` said
-                // before §13.19 folded it into the shared template.
-                let old = "::sysinit:/sbin/openrc sysinit\n::sysinit:/sbin/openrc boot\n::wait:/sbin/openrc default\ntty1::respawn:/sbin/getty 38400 tty1\ntty2::respawn:/sbin/getty 38400 tty2\ntty3::respawn:/sbin/getty 38400 tty3\ntty4::respawn:/sbin/getty 38400 tty4\n::ctrlaltdel:/sbin/reboot\n::shutdown:/sbin/openrc shutdown\n";
-                assert_eq!(
-                    body(&text),
-                    body(old),
-                    "the stock answer cannot drift from the file it replaced"
-                );
-            }
+            let _ = fs::remove_dir_all(&dir);
         }
     }
 

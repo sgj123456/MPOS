@@ -36,14 +36,10 @@ pub enum Console {
     /// An interactive `run`, laid out per [`RunMode`]: which of the window, the
     /// serial terminal and the serial log file actually shows the console.
     Run(RunMode),
-    /// A file, which is what a test run reads its verdict out of. Always
-    /// headless: no window, the whole console on the wire to the log.
+    /// A file, which is what a boot whose verdict is read out of the transcript
+    /// uses. Always headless: no window, the whole console on the wire to the
+    /// log.
     File(String),
-    /// Wherever the caller says, already spelled the way `-serial` wants it:
-    /// `file:<path>`, `mon:stdio`, a socket. Used by the boot that runs one
-    /// command line for both machines, which has already decided where the
-    /// wire goes and needs no display policy from here.
-    Raw(String),
 }
 
 /// Where this crate records which [`RunMode`] is baked into the image's
@@ -51,12 +47,12 @@ pub enum Console {
 /// lives inside the disk image; the marker lets `run` decide, without mounting
 /// anything as root, whether the image already says what the user asked for.
 ///
-/// The file is still named `console.mode` from before the option was `--console`.
-/// It is a cache, not an interface: renaming it would read as "nothing baked" and
-/// make every existing image look as if it needed a root rebuild to say what it
-/// already does.
-fn mode_marker_path(build_dir: &Path) -> PathBuf {
-    build_dir.join("console.mode")
+/// One marker per machine, with the first machine keeping the historic
+/// `console.mode` name: it is a cache, not an interface, and a new name would
+/// read as "nothing baked" and make every existing image look as if it needed a
+/// root rebuild to say what it already does (`Arch::mode_marker`).
+fn mode_marker_path(build_dir: &Path, arch: Arch) -> PathBuf {
+    build_dir.join(arch.mode_marker())
 }
 
 /// The mode last baked into the image, or `None` for an image that carries no
@@ -74,14 +70,14 @@ fn mode_marker_path(build_dir: &Path) -> PathBuf {
 /// absorbed and that today's `gui` (`console=tty0`) replaces, so the refresh
 /// moves the guest's console onto the screen rather than only renaming the
 /// marker.
-pub fn baked_mode(build_dir: &Path) -> Option<RunMode> {
-    fs::read_to_string(mode_marker_path(build_dir))
+pub fn baked_mode(build_dir: &Path, arch: Arch) -> Option<RunMode> {
+    fs::read_to_string(mode_marker_path(build_dir, arch))
         .ok()
         .and_then(|text| RunMode::parse(&text))
 }
 
-pub fn set_baked_mode(build_dir: &Path, mode: RunMode) -> Result<()> {
-    fs::write(mode_marker_path(build_dir), mode.name())
+pub fn set_baked_mode(build_dir: &Path, arch: Arch, mode: RunMode) -> Result<()> {
+    fs::write(mode_marker_path(build_dir, arch), mode.name())
         .with_context(|| format!("Failed to record the baked mode in {}", build_dir.display()))
 }
 
@@ -89,8 +85,75 @@ pub fn set_baked_mode(build_dir: &Path, mode: RunMode) -> Result<()> {
 /// take root to rewrite `mpos.cmdline` before booting. No image means nothing to
 /// switch (the build that makes it will bake `desired` anyway), and an image with
 /// no marker at all differs from every mode - its line predates the console list.
-pub fn needs_mode_switch(build_dir: &Path, desired: RunMode) -> bool {
-    utils::image_path(build_dir).exists() && baked_mode(build_dir) != Some(desired)
+pub fn needs_mode_switch(build_dir: &Path, arch: Arch, desired: RunMode) -> bool {
+    utils::image_path(build_dir, arch).exists() && baked_mode(build_dir, arch) != Some(desired)
+}
+
+/// Where one boot's console goes on the host: the `-display` backend and the
+/// serial line's sink.
+///
+/// One decision for both machines, because it answers one question - is the
+/// window showing the console - and QEMU spells the answer the same way for
+/// either. What is per-machine is which `-device` list the answer is attached
+/// to, and that is the builders' business.
+struct Wiring {
+    /// The `-display` argument's value.
+    display: String,
+    /// Where the wire is read.
+    serial: SerialSink,
+}
+
+/// Where a boot's serial line is read from.
+enum SerialSink {
+    /// The launcher's terminal, through a chardev with `mux=off` so the guest
+    /// owns `Ctrl-A` (the kernel's own console switching) rather than QEMU's
+    /// escape, and `signal=off` so `Ctrl-C` reaches the guest's line discipline.
+    Stdio,
+    /// A file, which is what a boot whose verdict is read out of the transcript
+    /// uses.
+    File(PathBuf),
+}
+
+/// The wiring `console` asks for, given the machine's configured display.
+///
+/// `gui` moves the wire into a log file because the window *is* the console in
+/// that mode - and that is exactly why the move is conditional on a window
+/// actually being drawn: a machine whose `qemu.display` is `none` has no window
+/// to be the console, so its wire stays on the launcher's terminal in every mode
+/// (`machine.toml`'s `[aarch64]` names no window backend at all, and the PL011
+/// session is what a person watches).
+fn wiring(console: &Console, config: &QemuConfig, build_dir: &Path) -> Wiring {
+    // A missing `display` is `sdl` for a mode that wants a window - the
+    // interactive default - and `none` for a boot that renders nowhere.
+    let configured = config.display.clone().unwrap_or_else(|| "sdl".to_string());
+    match console {
+        Console::Run(mode) => {
+            let display = if mode.has_window() {
+                configured
+            } else {
+                "none".to_string()
+            };
+            let window_shows_the_console = *mode == RunMode::Gui && display != "none";
+            let serial = if window_shows_the_console {
+                // The wire still goes somewhere, and nowhere visible would be the
+                // old `gui` that dropped the kernel log with the port: the UEFI
+                // loader prints to the port unconditionally, the kernel's banner
+                // precedes the command-line parse, and a panic's `force_serial`
+                // report reaches no screen. The log lives beside the share, not
+                // inside it - the share is exported over 9p, and a host-side
+                // transcript has no business appearing in the guest's
+                // `/mnt/share`.
+                SerialSink::File(build_dir.join("serial.log"))
+            } else {
+                SerialSink::Stdio
+            };
+            Wiring { display, serial }
+        }
+        Console::File(log) => Wiring {
+            display: config.display.clone().unwrap_or_else(|| "none".to_string()),
+            serial: SerialSink::File(PathBuf::from(log)),
+        },
+    }
 }
 
 /// The QEMU command line both `run` and `test` boot with.
@@ -115,7 +178,7 @@ pub fn machine_args(
     firmware_code: &Path,
     vars: &Path,
     boot: Boot,
-    console: Console,
+    console: &Console,
     share_dir: &Path,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
@@ -289,79 +352,29 @@ pub fn machine_args(
         ]);
     }
 
-    match console {
-        // `mux=off` is what the guest's own console keys are for. QEMU's
-        // default for a serial line shared with stdio is to claim `Ctrl-A` as
-        // its own escape between the monitor and the port, and the byte never
-        // reaches the machine - so `^A 1..6`, the virtual-console switch the
-        // kernel's mux and `/etc/inittab` both advertise, would sit unheard
-        // while every other keystroke went through. `signal=off` keeps
-        // `Ctrl-C` an ordinary character for the guest's line discipline
-        // rather than a request to quit the emulator.
-        Console::Run(mode) => {
-            // The window only when the mode asks for one. A terminal boot
-            // renders nowhere: `-display none`, the whole console on the wire.
-            let display = if mode.has_window() {
-                config.display.clone().unwrap_or_else(|| "sdl".to_string())
-            } else {
-                "none".to_string()
-            };
-            args.extend(["-display".into(), display]);
-            if mode == RunMode::Gui {
-                // The window is the console here, so the launcher's terminal
-                // goes quiet: the wire is read from a file, not stdio. The
-                // guest's own list omits ttyS0 and the kernel never writes to
-                // the port — but the UEFI loader prints to COM1 unconditionally,
-                // the kernel's banner precedes the command-line parse, and a
-                // panic's `force_serial` report reaches no screen, so the port
-                // stays tapped. Tapping it into a file keeps the witness while
-                // the terminal shows nothing; discarding it was the old `gui`,
-                // and the modes collapsed away from that precisely because a
-                // mode that dropped the wire dropped the kernel log with it.
-                //
-                // The log lives beside the share, not inside it: `share_dir`
-                // is exported over 9p, and a host-side transcript has no
-                // business appearing in the guest's `/mnt/hostshare`.
-                let log = share_dir
-                    .parent()
-                    .expect("the share lives under the build directory")
-                    .join("serial.log");
-                args.extend(["-serial".into(), format!("file:{}", log.display())]);
-            } else {
-                args.extend([
-                    "-chardev".into(),
-                    "stdio,id=stdio0,mux=off,signal=off".into(),
-                    "-serial".into(),
-                    "chardev:stdio0".into(),
-                ]);
-            }
-        }
-        Console::File(log) => {
-            // A test boot renders nowhere *unless the machine names a display*,
-            // and the exception is not decoration: a `virtio-gpu-gl-pci` device
-            // refuses `-display none` outright - QEMU answers "OpenGL is not
-            // supported by display backend 'none'" and never starts - so
-            // hardcoding it here would make a GL machine untestable, and the GL
-            // half of `DRM_VIRTGPU_*` is exactly the half the default machine
-            // cannot reach. The console stays on the wire either way: the test
-            // image's command line names `ttyS0`, so the transcript is still the
-            // file below, and the display is only somewhere for the device to
-            // draw.
-            let display = config.display.clone().unwrap_or_else(|| "none".to_string());
-            args.extend([
-                "-display".into(),
-                display,
-                "-serial".into(),
-                format!("file:{log}"),
-            ]);
-        }
-        // The caller's own `-serial` spelling, and the display the file says:
-        // a boot that has already chosen where the wire goes has nothing to
-        // decide here, and a machine with a GPU still needs somewhere to draw.
-        Console::Raw(serial) => {
-            let display = config.display.clone().unwrap_or_else(|| "none".to_string());
-            args.extend(["-display".into(), display, "-serial".into(), serial.clone()]);
-        }
+    // The display and the wire, from the one decision both machines share
+    // (`wiring`). A boot that renders nowhere still gets a display argument: a
+    // `virtio-gpu-gl-pci` device refuses `-display none` outright - QEMU answers
+    // "OpenGL is not supported by display backend 'none'" and never starts - so
+    // hardcoding `none` here would make a GL machine untestable, and the GL half
+    // of `DRM_VIRTGPU_*` is exactly the half the default machine cannot reach.
+    // The console stays on the wire either way.
+    let wiring = wiring(
+        console,
+        config,
+        share_dir
+            .parent()
+            .expect("the share lives under the build directory"),
+    );
+    args.extend(["-display".into(), wiring.display]);
+    match wiring.serial {
+        SerialSink::Stdio => args.extend([
+            "-chardev".into(),
+            "stdio,id=stdio0,mux=off,signal=off".into(),
+            "-serial".into(),
+            "chardev:stdio0".into(),
+        ]),
+        SerialSink::File(log) => args.extend(["-serial".into(), format!("file:{}", log.display())]),
     }
 
     // The guest's own way out. `reboot(2)` with a stop command ends at
@@ -386,48 +399,64 @@ pub fn machine_args(
 /// `run` asks this before it decides anything. A kernel rebuilt after the last
 /// image has to trigger the rebuild - otherwise the boot is of code that is no
 /// longer on disk, and it reads exactly like a fix that changed nothing.
-pub fn needs_build(build_dir: &Path, profile: &str) -> Result<bool> {
-    utils::image_stale(build_dir, profile)
+pub fn needs_build(build_dir: &Path, profile: &str, arch: Arch) -> Result<bool> {
+    utils::image_stale(build_dir, profile, arch)
 }
 
+/// Boot `arch`'s image: build it first when it is stale, then hand the machine
+/// to the emulator with its serial line on this terminal.
+///
+/// One body for both machines, because a session is the same thing on either:
+/// the disk `disk`/`rootfs` installed, the firmware that machine boots under,
+/// and the mode the caller asked for deciding both the window and the consoles
+/// the guest is told about. What is per-machine is answered by `arch` (`Arch`'s
+/// name, firmware and console) and by [`boot_args`]'s two arms - the transports
+/// the two kernels can find.
 pub fn run_qemu(
     build_dir: &Path,
     profile: &str,
+    arch: Arch,
     artefacts_ready: bool,
     needs_build: bool,
     mode: RunMode,
 ) -> Result<()> {
     if needs_build {
-        println!("run: the image is missing or out of date; building it");
+        println!(
+            "run: the {} image is missing or out of date; building it",
+            arch.name()
+        );
         if !artefacts_ready {
-            // `run_qemu` is reached only for the x86_64 machine: `run --arch
-            // aarch64` takes its own arm before the image machinery runs. So
-            // the kernel it builds here is that machine's, named rather than
-            // left to the workspace default.
-            utils::build_kernel(profile, Arch::X86_64)?;
+            // The kernel this build boots, named rather than left to the
+            // workspace default - `--arch` is the switch for the whole command,
+            // and the images below are assembled *from* these two binaries.
+            utils::build_kernel(profile, arch)?;
         }
-        crate::disk::ensure(build_dir, profile)?;
+        crate::disk::ensure(build_dir, profile, arch)?;
         // The rootfs step brings the initramfs up to date itself, so there is
         // no separate call here to report it twice.
-        crate::rootfs::ensure(build_dir, profile)?;
+        crate::rootfs::ensure(build_dir, profile, arch)?;
         // When `artefacts_ready` is set this is the sudo half, and its parent
         // is waiting to boot what was just built. Only a `run` that is the
         // whole command has to be told to come back.
         if !artefacts_ready {
             println!();
-            println!("run: the image is built; run this command again to boot it");
+            println!(
+                "run: the image is built; run this command again to boot it \
+                 (`cargo xtask run --arch {}` for the interactive boot)",
+                arch.name()
+            );
         }
         return Ok(());
     }
 
-    let image = utils::image_path(build_dir);
+    let image = utils::image_path(build_dir, arch);
 
     // An image older than the kernel or the loader it was built from boots the
     // *previous* code and says nothing about it, which reads exactly like a fix
     // that changed nothing. `run.sh` warns and boots anyway; so does this.
     for artifact in [
-        utils::kernel_path(profile, Arch::X86_64)?,
-        utils::loader_path(profile, Arch::X86_64)?,
+        utils::kernel_path(profile, arch)?,
+        utils::loader_path(profile, arch)?,
     ] {
         if utils::newer(&artifact, &image)? {
             eprintln!(
@@ -437,56 +466,43 @@ pub fn run_qemu(
             );
             eprintln!("run:          it boots the code from before that build, which will");
             eprintln!("run:          look like a fix that changed nothing. Rebuild first:");
-            eprintln!("run:            cargo xtask all");
+            eprintln!("run:            cargo xtask all --arch {}", arch.name());
             eprintln!();
         }
     }
 
-    // The firmware two halves are separate files, and the variables half is
-    // copied fresh on every run rather than written to in place: the firmware
-    // writes to it, and this machine's variables are not worth keeping - a disk
-    // that has never booted has no boot entry written down, which is exactly the
-    // state the loader is built for. The 4 MiB build is the one that matters:
-    // the smaller 2 MiB one cannot map the kernel and the initramfs at the
-    // addresses the loader asks for.
-    let firmware = find_firmware(Arch::X86_64)?;
-    let vars = utils::ovmf_vars_path(build_dir);
-    fs::create_dir_all(build_dir)?;
-    let src = firmware.vars.clone();
-    fs::copy(&src, &vars).with_context(|| {
-        format!(
-            "cannot write {}; {} is not writable",
-            vars.display(),
-            build_dir.display()
-        )
-    })?;
+    // The firmware's variables half is copied fresh on every run rather than
+    // written to in place: the firmware writes to it, and a disk that has never
+    // booted has no boot entry written down, which is exactly the state the
+    // loader is built for.
+    let (firmware, vars) = write_firmware_vars(build_dir, arch)?;
 
     // The share the 9p device exports and the console port's socket both
     // live under the build directory, and the devices they belong to start
     // only if their host-side files do - so they exist before QEMU is
     // asked for them.
-    let share = build_dir.join("9p-share");
-    fs::create_dir_all(&share)?;
+    let share = utils::lay_p9_share(&build_dir.join(format!("{}-9p-share", arch.name())))?;
 
     // The machine's own settings: memory, processors, the name the guest
     // reports, and whatever `extra_args` adds. They come from `machine.toml`
     // rather than the image's config, so tuning the machine never reinstalls
     // the image.
-    let config = QemuConfig::load_default(Arch::X86_64)?;
+    let config = QemuConfig::load_default(arch)?;
     // The host wiring follows the mode the caller asked for, so the window, the
     // serial line and the guest's own console policy always agree.
-    let args = machine_args(
+    let args = boot_args(
+        arch,
         &config,
-        &firmware.code,
+        &firmware,
         &vars,
-        Boot::Image(image.clone()),
-        Console::Run(mode),
+        &image,
+        &Console::Run(mode),
         &share,
-    );
+    )?;
 
     // Printed because a boot that goes wrong is usually read off this line.
-    eprintln!("+ qemu-system-x86_64 {}", args.join(" "));
-    let err = Command::new("qemu-system-x86_64").args(&args).exec();
+    eprintln!("+ {} {}", arch.qemu_binary(), args.join(" "));
+    let err = Command::new(arch.qemu_binary()).args(&args).exec();
     anyhow::bail!("Failed to start QEMU: {err}");
 }
 
@@ -577,7 +593,8 @@ pub fn find_firmware(arch: Arch) -> Result<Firmware> {
 
 /// The `qemu-system-aarch64` command line, as data.
 ///
-/// Here rather than in `aarch64.rs` for the same reason [`machine_args`] is here:
+/// Here rather than beside the commands that boot it, for the same reason
+/// [`machine_args`] is here:
 /// the two machines' wiring is one question - how this build boots a machine -
 /// and the values both read come from one `machine.toml`. What does *not* come
 /// from that file is the device list below, and that is deliberate: every
@@ -593,11 +610,11 @@ pub fn virt_machine_args(
     config: &QemuConfig,
     firmware: &Firmware,
     vars: &Path,
-    esp: &Path,
-    serial: &str,
+    image: &Path,
+    blk: &Path,
+    console: &Console,
     share: &Path,
 ) -> Vec<String> {
-    let work = esp.parent().expect("the ESP path has a directory");
     let mut args: Vec<String> = vec![
         // `acpi=off` is what makes this firmware describe the machine the way
         // this port reads it, and it is a measured difference rather than a
@@ -621,14 +638,11 @@ pub fn virt_machine_args(
         "tcg".into(),
         "-m".into(),
         config.memory.clone(),
-        "-display".into(),
-        config.display.clone().unwrap_or_else(|| "none".to_string()),
         "-monitor".into(),
         "none".into(),
         "-no-reboot".into(),
-        "-serial".into(),
-        serial.to_string(),
         // Two flash banks, the way EDK2 expects to find itself: the code bank
+
         // read-only at the address the machine boots from, and a writable
         // variable store the firmware updates as it goes.
         "-drive".into(),
@@ -654,7 +668,7 @@ pub fn virt_machine_args(
         "-drive".into(),
         format!(
             "file={},format=raw,if=none,id=hd0,file.locking=off",
-            work.join("aarch64-disk.img").display()
+            image.display()
         ),
         "-device".into(),
         "virtio-blk-device,drive=hd0".into(),
@@ -696,7 +710,7 @@ pub fn virt_machine_args(
         "-drive".into(),
         format!(
             "file={},format=raw,if=none,id=blk0,file.locking=off",
-            work.join("aarch64-blk.img").display()
+            blk.display()
         ),
         "-device".into(),
         "virtio-blk-device,drive=blk0".into(),
@@ -720,7 +734,7 @@ pub fn virt_machine_args(
         "-chardev".into(),
         format!(
             "socket,id=console0,path={},server=on,wait=off",
-            work.join("aarch64-console.sock").display()
+            share.join("console.sock").display()
         ),
         "-device".into(),
         "virtio-serial-device".into(),
@@ -738,6 +752,31 @@ pub fn virt_machine_args(
         "-device".into(),
         "virtio-gpu-device".into(),
     ];
+
+    // The display and the wire, from the one decision both machines share
+    // (`wiring`). This machine names its window backend in its own half of
+    // `machine.toml` (`none`: the session is the PL011, and the kernel's
+    // framebuffer console is painted on a scanout nobody is looking at), so a
+    // mode that asks for a window still draws none - and the wire therefore
+    // stays on the launcher's terminal in every mode, which is what keeps the
+    // session watchable.
+    let wiring = wiring(
+        console,
+        config,
+        share
+            .parent()
+            .expect("the share lives under the build directory"),
+    );
+    args.extend(["-display".into(), wiring.display]);
+    match wiring.serial {
+        SerialSink::Stdio => args.extend([
+            "-chardev".into(),
+            "stdio,id=stdio0,mux=off,signal=off".into(),
+            "-serial".into(),
+            "chardev:stdio0".into(),
+        ]),
+        SerialSink::File(log) => args.extend(["-serial".into(), format!("file:{}", log.display())]),
+    }
 
     if config.audio {
         // The seventh class (`M8_SOUND_OK`), the same shape the first machine
@@ -821,8 +860,8 @@ pub fn boot_args(
     config: &QemuConfig,
     firmware: &Firmware,
     vars: &Path,
-    esp: &Path,
-    serial: &str,
+    image: &Path,
+    console: &Console,
     share: &Path,
 ) -> Result<Vec<String>> {
     match arch {
@@ -830,12 +869,21 @@ pub fn boot_args(
             config,
             &firmware.code,
             vars,
-            Boot::Image(esp.to_path_buf()),
-            Console::Raw(serial.to_string()),
+            Boot::Image(image.to_path_buf()),
+            console,
             share,
         )),
         Arch::Aarch64 => Ok(virt_machine_args(
-            config, firmware, vars, esp, serial, share,
+            config,
+            firmware,
+            vars,
+            image,
+            // The raw pattern the block check reads by content. It lives beside
+            // the image and is the same fixture for every boot of this machine
+            // (`disk::blk_image`), so a sweep and a session share it.
+            &crate::disk::blk_image(image.parent().expect("the image has a directory"), arch),
+            console,
+            share,
         )),
     }
 }
@@ -874,16 +922,17 @@ pub fn write_firmware_vars(build_dir: &Path, arch: Arch) -> Result<(Firmware, Pa
     Ok((firmware, vars))
 }
 
-/// Boot `arch`'s machine off `esp` and return what its serial line said.
+/// Boot `arch`'s machine off `image` and return what its serial line said.
 ///
-/// `terminators` is what ends the poll: each of the second machine's `M*_OK`
-/// checks prints a marker the kernel's own handoff produces, while a test
-/// sweep's runner prints the harness protocol's `=== END` instead - two boots
-/// end on different lines, so which one stops the read is the caller's to say.
+/// This is the headless boot an evidence-producing command uses: the wire goes
+/// to a file and the poll stops on the first of `terminators` - a test sweep's
+/// runner prints the harness protocol's `=== END`, so what ends the read is the
+/// caller's to say. A session a person types at is [`run_qemu`], which hands the
+/// wire to the terminal instead.
 pub fn boot(
     build_dir: &Path,
     arch: Arch,
-    esp: &Path,
+    image: &Path,
     terminators: &[&str],
     deadline: Duration,
 ) -> Result<String> {
@@ -897,8 +946,8 @@ pub fn boot(
         &config,
         &firmware,
         &vars,
-        esp,
-        &format!("file:{}", log.display()),
+        image,
+        &Console::File(log.display().to_string()),
         &share,
     )?;
     eprintln!("+ {} {}", arch.qemu_binary(), args.join(" "));
@@ -924,44 +973,6 @@ pub fn boot(
         );
     }
     Ok(captured.log)
-}
-
-/// Boot the machine and hand its serial line to the terminal, staying attached
-/// until the guest exits or the user detaches. The interactive twin of [`boot`]:
-/// same disk, same firmware, same emulator, only the serial goes to stdio and no
-/// kill follows.
-pub fn run_interactive(build_dir: &Path, arch: Arch, esp: &Path) -> Result<()> {
-    let (firmware, vars) = write_firmware_vars(build_dir, arch)?;
-    let share = utils::lay_p9_share(&build_dir.join(format!("{}-9p-share", arch.name())))?;
-    let config = QemuConfig::load_default(arch)?;
-    let args = boot_args(arch, &config, &firmware, &vars, esp, "mon:stdio", &share)?;
-    eprintln!("+ {} {}", arch.qemu_binary(), args.join(" "));
-    let status = Command::new(arch.qemu_binary())
-        .args(&args)
-        .status()
-        .with_context(|| format!("Failed to start {}", arch.qemu_binary()))?;
-    if !status.success() {
-        eprintln!("{} exited {status}", arch.qemu_binary());
-    }
-    Ok(())
-}
-
-/// Whether this host can back a virtio-vsock device.
-///
-/// The *verdict* asks, which is why this is here while the command line that
-/// acts on the same question is answered in [`virt_machine_args`]: attaching
-/// the device and requiring its marker are two different claims, and the
-/// second must not be made out of the first (a summary hard-coded to the host
-/// that wrote it is a lie on the host that reads it, `PLAN.md` §13.28).
-///
-/// vsock is the one class the second machine's boot drives that QEMU does not
-/// emulate in userspace: `vhost-vsock-*` is a host kernel backend, and QEMU
-/// *refuses to start* a machine that names the device when
-/// `/dev/vhost-vsock` is absent. So the device is attached only where the host
-/// can carry it, and the verdict says which case it took instead of quietly
-/// running one check fewer.
-pub fn vsock_available() -> bool {
-    Path::new("/dev/vhost-vsock").exists()
 }
 
 /// Runs a machine whose serial line goes to `log`, and returns when it stops
@@ -1110,7 +1121,7 @@ mod tests {
             Path::new("/ovmf/OVMF_CODE.4m.fd"),
             Path::new("/build/OVMF_VARS.4m.fd"),
             boot,
-            Console::Run(RunMode::Mirror),
+            &Console::Run(RunMode::Mirror),
             Path::new("/build/9p-share"),
         )
     }
@@ -1130,13 +1141,16 @@ mod tests {
         }
     }
 
+    /// The second machine's line, as a *headless* boot builds it: the wire to a
+    /// file, which is the shape every evidence-producing boot has.
     fn aarch64_args(config: &QemuConfig) -> Vec<String> {
         virt_machine_args(
             config,
             &firmware(),
             Path::new("/build/AAVMF_VARS.fd"),
-            Path::new("/build/aarch64-esp"),
-            "file:/build/aarch64-serial.log",
+            Path::new("/build/aarch64-disk.img"),
+            Path::new("/build/aarch64-blk.img"),
+            &Console::File("/build/aarch64-serial.log".to_string()),
             Path::new("/build/aarch64-9p-share"),
         )
     }
@@ -1404,7 +1418,7 @@ mod tests {
             Path::new("/ovmf"),
             Path::new("/build/OVMF_VARS.4m.fd"),
             Boot::Image(PathBuf::from("/build/mpos.img")),
-            Console::File("/build/test-serial.log".to_string()),
+            &Console::File("/build/test-serial.log".to_string()),
             Path::new("/build/9p-share"),
         );
         assert_eq!(after(&file, "-display").as_deref(), Some("none"));
@@ -1419,7 +1433,7 @@ mod tests {
             Path::new("/ovmf"),
             Path::new("/build/OVMF_VARS.4m.fd"),
             Boot::Image(PathBuf::from("/build/mpos.img")),
-            Console::File("/build/test-serial.log".to_string()),
+            &Console::File("/build/test-serial.log".to_string()),
             Path::new("/build/9p-share"),
         );
         assert_eq!(after(&gl_file, "-display").as_deref(), Some("gtk"));
@@ -1498,7 +1512,7 @@ mod tests {
             Path::new("/ovmf"),
             Path::new("/build/OVMF_VARS.4m.fd"),
             Boot::Image(PathBuf::from("/build/mpos.img")),
-            Console::Run(mode),
+            &Console::Run(mode),
             Path::new("/build/9p-share"),
         )
     }

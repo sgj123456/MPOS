@@ -23,8 +23,11 @@ contract. Here that is, concretely:
   previously made `st_mode` read the `st_nlink` value, and emitting the x86_64 *length* wrote
   sixteen bytes past every 128-byte struct — into whichever frame the libc's own stat buffer
   sits in, which is how a non-empty `std::fs::remove_dir_all` came to die at `pc 0`
-  (  `PLAN.md` §13.10). Pin: `boot-aarch64` `MPOS_STAT_OK` (mode/type/`nlink`/`ino`/`blocks`/
-  `size` round-trip from a live musl process) and `t-stat-buffer` (a guarded `struct stat`
+  (  `PLAN.md` §13.10). Pin: `t-fstat`/`t-newfstatat` on both machines (mode/type/`nlink`/`ino`/
+  `blocks`/`size` read back through each machine's own `Stat` — the claim the retired aarch64
+  payload's `MPOS_STAT_OK` carried, and why the `no_std` suite's hard-coded x86_64 `lin::Stat` had
+  to go: a program that writes one machine's layout down cannot see the other's) and
+  `t-stat-buffer` (a guarded `struct stat`
   handed to the kernel through `SYS_fstat`/`SYS_newfstatat`, on both machines — a caller's own
   `stat` cannot see the overflow, because musl's wrapper stats into a struct of its own and
   copies the fields out). The three clock *seconds* are the one part the two ABIs share — 72, 88

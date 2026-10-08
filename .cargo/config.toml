@@ -133,22 +133,20 @@ rustflags = [
     "-C", "link-arg=-Wl,-z,norelro",
 ]
 
-# The second machine's user programs, reached by cargo rather than by the
-# hand-driven `rustc` that builds `boot-aarch64`'s `/musl` helper - same static
-# ET_EXEC shape, and one flag the x86_64 block does not need: the linker.
+# The second machine's user programs: the same static ET_EXEC shape, built by
+# the same cargo invocation as the first machine's (`selftest::build_std_tests`,
+# whose target comes from `Arch::musl_target`), and one flag this block needs and
+# the x86_64 one does not: the linker.
 #
 # Rustc passes `--fix-cortex-a53-843419` for this target - the erratum workaround
 # every aarch64 link gets - and the host's `ld` is not an aarch64 linker and
 # rejects the option outright (`unrecognized option '--fix-cortex-a53-843419'`,
-# measured: a cargo build of any aarch64 musl crate dies at the link step). The
-# helper build names `rust-lld` itself
-# (`aarch64_init::build_static_musl_helper`), which is why it links where cargo
-# did not; naming it here is the same decision made once for the target instead
-# of once per program.
+# measured: a cargo build of any aarch64 musl crate dies at the link step), so
+# `rust-lld` is named here rather than left to the default.
 #
-# `relocation-model=static`/`-no-pie` are left to the target default, which the
-# helper already relies on: `aarch64-unknown-linux-musl` is non-PIE, and the
-# loader accepts only the ET_EXEC shape.
+# `relocation-model=static`/`-no-pie` are left to the target default:
+# `aarch64-unknown-linux-musl` is non-PIE, and the loader accepts only the
+# ET_EXEC shape.
 [target.aarch64-unknown-linux-musl]
 rustflags = [
     "-C", "target-feature=+crt-static",

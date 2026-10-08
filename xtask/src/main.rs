@@ -5,7 +5,6 @@
 //! for the steps that need it, and everything root writes is handed back to
 //! that user afterwards.
 
-mod aarch64;
 mod arch;
 mod config;
 mod depgraph;
@@ -54,11 +53,13 @@ struct Cli {
     /// Global so `cargo xtask run --arch aarch64` accepts it after the
     /// subcommand, where a plain parent flag would be rejected.
     ///
-    /// It is the *whole* switch, not a hint to `run` and `test`: `build`,
-    /// `rootfs` and `all` compile for the machine it names too, so the pair of
-    /// binaries every command then picks up is the pair that machine boots
-    /// (`AGENTS.md` §2). Parsed once, up front, into an `Arch`, so no command
-    /// downstream compares this string again.
+    /// It is the *whole* switch, not a hint to `run` and `test`: every command
+    /// handles the machine it names - `build` compiles that machine's kernel and
+    /// loader, `disk`/`rootfs`/`all` lay and install *its* disk image, `run`
+    /// boots it - so no command can quietly do the other machine's work
+    /// (`AGENTS.md` §2). Parsed once, up front, into an `Arch`, so nothing
+    /// downstream compares this string again; what differs between the machines
+    /// is `Arch`'s own answers and each file's `[aarch64]` section.
     #[arg(long, value_name = "ARCH", global = true, default_value = "x86_64")]
     arch: String,
 
@@ -98,15 +99,6 @@ enum Commands {
     /// Measure the kernel's module graph and check it against the ratchet
     /// (PLAN.md §11.2 Step G), so the cycle count cannot grow back
     Depgraph,
-    /// Build the aarch64 kernel and its UEFI loader, lay out the same GPT boot
-    /// disk the first machine boots off, and boot it under AAVMF, reading the
-    /// verdict off the PL011 marker chain (`PLAN.md` §9.1)
-    BootAarch64,
-    /// Install a real Alpine aarch64 userland into the second machine's disk
-    /// image and boot it headless, reporting how far it gets
-    /// (`PLAN.md` §13.12). Unprivileged: the install runs under
-    /// `fakeroot`, so the tree keeps root ownership without taking root
-    AlpineAarch64,
     /// Remove the build and target directories
     Clean,
 }
@@ -122,8 +114,6 @@ impl Commands {
             Commands::All => "all",
             Commands::Test => "test",
             Commands::Depgraph => "depgraph",
-            Commands::BootAarch64 => "boot-aarch64",
-            Commands::AlpineAarch64 => "alpine-aarch64",
             Commands::Clean => "clean",
         }
     }
@@ -140,56 +130,6 @@ fn main() -> Result<()> {
     // have. Parsing it here - before any command - is what makes it the switch
     // for all of them rather than a hint two of them read.
     let arch = Arch::parse(&cli.arch)?;
-
-    // `disk`, `rootfs` and `all` assemble *the x86_64 disk image* - a GPT disk
-    // with an Alpine root on it - and the second machine's disk is not that: it
-    // is laid out by `boot-aarch64` / `alpine-aarch64` and by `run --arch
-    // aarch64`. So `--arch aarch64` here would build an x86_64 root filesystem
-    // under an aarch64 banner, which is the silent wrong-machine failure `AGENTS.md`
-    // §3 refuses. Name the machine's own command in the refusal rather than doing
-    // the other machine's work.
-    //
-    // `initramfs` is *not* in that set any more: both machines unpack an archive
-    // and switch root from its script, the pipeline is one copy
-    // (`xtask/src/initramfs.rs`), and the machine only picks which toml, overlay
-    // and applet farm it uses - so it builds the machine it was asked for.
-    if arch == Arch::Aarch64
-        && matches!(
-            cli.command,
-            Commands::Disk | Commands::Rootfs | Commands::All
-        )
-    {
-        anyhow::bail!(
-            "--arch aarch64 with `{}`: the image commands build the x86_64 disk. \
-             The second machine's disk is laid out by `cargo xtask boot-aarch64`, \
-             `cargo xtask alpine-aarch64` and `cargo xtask run --arch aarch64`",
-            cli.command.name()
-        );
-    }
-
-    // `run --arch aarch64` is the second machine's own path: `run_interactive`
-    // builds the aarch64 kernel and loader, lays out its AAVMF ESP with the real
-    // Alpine root on the disk (§13.19), and reads the run mode through
-    // `MPOS_XTASK_MODE` / `machine.toml` itself - the same sources the x86_64
-    // half below consults - so it needs none of that disk / rootfs / sudo
-    // machinery. Take it before any of it runs.
-    if matches!(cli.command, Commands::Run) && arch == Arch::Aarch64 {
-        // Validate and export the desired mode *before* taking the arm, so a
-        // bad `--mode` word fails here exactly as it does for x86_64 (the
-        // aarch64 session reads it back through `rootfs::effective_mode`, the
-        // same single source both machines share).
-        let mode = match cli.mode.as_deref() {
-            Some(text) => Some(config::RunMode::parse_strict(text)?),
-            None => Some(config::QemuConfig::load_default(arch)?.run_mode()?),
-        };
-        if let Some(mode) = mode {
-            // SAFETY: single-threaded here (cargo has not spawned any of our
-            // threads), and no other code reads the environment concurrently
-            // in this process.
-            unsafe { env::set_var("MPOS_XTASK_MODE", mode.name()) };
-        }
-        return aarch64::run_interactive(&build_dir, &profile);
-    }
 
     // A build from before this command knew about ownership can leave a
     // root-owned `build/` or `target/` behind, and cargo cannot write into a
@@ -253,27 +193,21 @@ fn main() -> Result<()> {
     // belongs to the user, not to root.
     let mut run_needs_build = match cli.command {
         Commands::Run => {
-            qemu::needs_build(&build_dir, &profile)?
-                || run_mode.is_some_and(|mode| qemu::needs_mode_switch(&build_dir, mode))
+            qemu::needs_build(&build_dir, &profile, arch)?
+                || run_mode.is_some_and(|mode| qemu::needs_mode_switch(&build_dir, arch, mode))
         }
         _ => false,
     };
 
     let needs_root = match cli.command {
-        Commands::Build
-        | Commands::Disk
-        | Commands::Test
-        | Commands::Depgraph
-        | Commands::BootAarch64
-        | Commands::AlpineAarch64 => false,
+        Commands::Build | Commands::Disk | Commands::Test | Commands::Depgraph => false,
         Commands::Clean => utils::clean_needs_root(&build_dir),
         // Root only where the pipeline needs to *exec* the tree it just laid:
         // the first machine's applet farm is `chroot <staging> /bin/busybox
         // --install -s`, and a chroot is root. The second machine cannot run its
         // cross-arch busybox at all, so it links its farm by hand and installs
         // its packages with apk's `--usermode` - a command that only writes
-        // files, which is why the retired `aarch64-initramfs` needed no root
-        // either.
+        // files, which is why its archive needs no root.
         Commands::Initramfs => arch == Arch::X86_64,
         Commands::Rootfs | Commands::All => true,
         Commands::Run => run_needs_build,
@@ -294,7 +228,7 @@ fn main() -> Result<()> {
             // The child is handed the same `--mode` so it recomputes the same
             // switch decision (and bakes it) rather than booting.
             build_under_sudo(cli.command, run_mode, &build_dir, &profile, arch)?;
-            if qemu::needs_build(&build_dir, &profile)? {
+            if qemu::needs_build(&build_dir, &profile, arch)? {
                 anyhow::bail!(
                     "The image is still out of date after building it; the output above says why."
                 );
@@ -312,7 +246,7 @@ fn main() -> Result<()> {
     // is true for one whatever mode was asked for), so the fallback is only
     // read on a build that is about to happen anyway.
     let boot_mode = run_mode
-        .or_else(|| qemu::baked_mode(&build_dir))
+        .or_else(|| qemu::baked_mode(&build_dir, arch))
         .unwrap_or(config::RunMode::Mirror);
 
     let result = dispatch(
@@ -422,23 +356,30 @@ fn dispatch(command: Commands, invocation: Invocation<'_>, tests: sweep::Selecti
     match command {
         Commands::Build => utils::build_kernel(profile, arch),
         Commands::Initramfs => initramfs::build_initramfs(build_dir, arch),
-        Commands::Disk => disk::build_disk(build_dir, profile),
+        Commands::Disk => disk::build_disk(build_dir, profile, arch),
         Commands::Rootfs => {
             if !artefacts_ready {
                 utils::build_kernel(profile, arch)?;
             }
             // `build_rootfs` brings the initramfs up to date itself: it is one
             // of the inputs the image is assembled from.
-            rootfs::build_rootfs(build_dir, profile)
+            rootfs::build_rootfs(build_dir, profile, arch)
         }
         Commands::All => {
             if !artefacts_ready {
                 utils::build_kernel(profile, arch)?;
             }
-            disk::ensure(build_dir, profile)?;
-            rootfs::ensure(build_dir, profile)
+            disk::ensure(build_dir, profile, arch)?;
+            rootfs::ensure(build_dir, profile, arch)
         }
-        Commands::Run => qemu::run_qemu(build_dir, profile, artefacts_ready, run_needs_build, mode),
+        Commands::Run => qemu::run_qemu(
+            build_dir,
+            profile,
+            arch,
+            artefacts_ready,
+            run_needs_build,
+            mode,
+        ),
         // Both machines run the same sweep now: a disk with the test payload
         // staged on its root, the shared `TEST_INIT` walking `/bin/t-*`, and
         // the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol read off the
@@ -461,15 +402,6 @@ fn dispatch(command: Commands, invocation: Invocation<'_>, tests: sweep::Selecti
             }
         },
         Commands::Depgraph => depgraph::run(&utils::project_root()?),
-        // The second machine's own entry points. Each builds this machine's
-        // kernel and loader pair through `build_kernel(.., Arch::Aarch64)` like
-        // every other command, then lays the disk that is its own payload's -
-        // which is the half the shared build cannot know.
-        Commands::BootAarch64 => aarch64::run(build_dir, profile),
-        // Unprivileged by construction: the Alpine install runs under
-        // `fakeroot`, so this command needs no sudo and is *not* in the
-        // `needs_root` list below.
-        Commands::AlpineAarch64 => aarch64::run_alpine(build_dir, profile),
         Commands::Clean => utils::clean(build_dir),
     }
 }

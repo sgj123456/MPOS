@@ -314,7 +314,7 @@ fn build_test_initramfs(build_dir: &Path, tests: &[&UserTest]) -> Result<PathBuf
 
     let unpacked = Command::new("tar")
         .arg("-xf")
-        .arg(utils::initramfs_path(build_dir))
+        .arg(crate::initramfs::archive_path(build_dir, Arch::X86_64))
         .arg("-C")
         .arg(&staging)
         .arg("--no-same-owner")
@@ -479,10 +479,7 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
         file.set_len(SATA_TEST_BYTES)?;
     }
 
-    let firmware = qemu::find_firmware(Arch::X86_64)?;
-    let vars = utils::ovmf_vars_path(build_dir);
-    fs::create_dir_all(build_dir)?;
-    fs::copy(&firmware.vars, &vars)?;
+    let (firmware, vars) = qemu::write_firmware_vars(build_dir, Arch::X86_64)?;
 
     let log = build_dir.join("test-serial.log");
     let esp = esp.canonicalize()?;
@@ -511,7 +508,7 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
         &firmware.code,
         &vars,
         qemu::Boot::Esp(esp.clone()),
-        qemu::Console::File(log_path.clone()),
+        &qemu::Console::File(log_path.clone()),
         &share,
     );
     // `isa-debug-exit` - the port the kernel writes its verdict to - comes with
@@ -713,11 +710,17 @@ pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()>
     for (path, (_, bytes)) in paths.iter().zip(plan.staged.iter()) {
         entries.push((path.as_str(), bytes.as_slice()));
     }
+    // The root the kernel is told to switch to, and the consoles it is told it
+    // has: both come from the machine's own configuration (`rootfs.root_device`,
+    // `rootfs.serial_port`), because the disk the sweep boots is the same GPT
+    // shape the install writes and its partition carries the same name.
+    let rootfs =
+        crate::config::RootfsConfig::load(&utils::project_root()?.join("rootfs.toml"), arch)?;
     let cmdline = format!(
-        "console={} mpos.selftest root=/dev/vda2 rootfstype=ext4\n",
-        arch.console()
+        "console={} mpos.selftest root={} rootfstype={}\n",
+        rootfs.serial_port, rootfs.root_device, rootfs.filesystem
     );
-    let esp = crate::disk::boot_media(
+    let disk = crate::disk::sweep_medium(
         build_dir,
         arch,
         &crate::disk::Boot {
@@ -725,11 +728,10 @@ pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()>
             loader: &loader,
             entries: &entries,
             disk_bytes: SWEEP_DISK_BYTES,
-            root: None,
             cmdline: &cmdline,
         },
     )?;
-    println!("esp:    {}", esp.display());
+    println!("disk:   {}", disk.display());
 
     // How long the guest may run before the harness gives up on it: the shared
     // `MPOS_TEST_TIMEOUT` answer, because a sweep that is slower on this machine
@@ -737,7 +739,7 @@ pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()>
     let log = qemu::boot(
         build_dir,
         arch,
-        &esp,
+        &disk,
         &["=== END"],
         Duration::from_secs(test_timeout_secs()),
     )?;
@@ -981,9 +983,8 @@ mod tests {
         assert!(super::gaps_without_programs(&config, machine, &gaps).is_empty());
     }
 
-    /// The aarch64 user programs are built by cargo (rather than by the
-    /// hand-driven `rustc` that builds `boot-aarch64`'s `/musl` helper), so the
-    /// two facts the loader insists on have to be in the root `.cargo/config.toml`
+    /// The aarch64 user programs are built by cargo, so the two facts the loader
+    /// insists on have to be in the root `.cargo/config.toml`
     /// for that target, and neither shows up as a compile error when it is
     /// missing - a static flag dropped links a program the loader refuses, and a
     /// linker dropped fails at the link step with an option the host `ld` does not

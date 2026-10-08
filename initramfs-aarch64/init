@@ -6,10 +6,10 @@
 # it exists on this machine for the same reason (`PLAN.md` §15.6): a kernel that
 # assembles the real root first leaves pieces the owner of the system cannot
 # unmount, so the switch belongs to pid 1 - on both machines. What differs is
-# only the verdict line: `MPOS_SWITCH_ROOT_OK` is what `cargo xtask
-# boot-aarch64` polls where the first machine prints nothing at all, because
-# this machine's marker chain is its boot's verdict and the pivot moved from the
-# kernel into this script with it.
+# the one line it prints: `MPOS_SWITCH_ROOT_OK` says which device became `/`,
+# where the first machine's script prints nothing at all. The pivot moved from
+# the kernel into this script, so the line is the evidence that a userspace
+# program - not the kernel - did the switch (`PLAN.md` §15.7).
 
 export PATH=/sbin:/usr/sbin:/bin:/usr/bin
 

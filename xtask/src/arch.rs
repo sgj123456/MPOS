@@ -7,8 +7,9 @@
 //! the switch used to reach only `run` and `test`, while `build` silently
 //! compiled the x86_64 kernel no matter what `--arch` said, because the string
 //! never travelled as far as the `cargo` invocation. A target is a property of
-//! the machine, so it is answered here and nowhere else - `boot-aarch64` used
-//! to carry its own copy of both target triples for exactly that reason.
+//! the machine, so it is answered here and nowhere else - the retired
+//! `boot-aarch64` used to carry its own copy of both target triples for exactly
+//! that reason.
 //!
 //! What is *not* here is what each machine's boot needs: the ESP layout, the
 //! firmware, the disk. Those live in `disk.rs` and `qemu.rs`, both of which
@@ -114,20 +115,6 @@ impl Arch {
         }
     }
 
-    /// The name this machine's console has on the kernel command line and in
-    /// `/dev`.
-    ///
-    /// `ttyS0` is the 16550 the PC machine carries; `ttyAMA0` is the PL011 the
-    /// `virt` machine's device tree describes. Every place that writes a
-    /// `console=` or an `/etc/inittab` line has to agree with the driver that
-    /// answers, and asking here is what keeps them from disagreeing.
-    pub const fn console(self) -> &'static str {
-        match self {
-            Arch::X86_64 => "ttyS0",
-            Arch::Aarch64 => "ttyAMA0",
-        }
-    }
-
     /// The file name the firmware looks for in `EFI/BOOT/` on the ESP.
     ///
     /// Fixed by the UEFI specification per machine, not chosen: a loader
@@ -163,6 +150,74 @@ impl Arch {
         match self {
             Arch::X86_64 => "rootfs",
             Arch::Aarch64 => "rootfs-aarch64",
+        }
+    }
+
+    /// Whether this build's host can run *this machine's* userland.
+    ///
+    /// It decides how much of an install runs the image's own programs, and it
+    /// is a fact about the pair (host, machine) rather than a preference: an
+    /// `apk` that installs another architecture's packages cannot run their
+    /// post-install scripts at all (`execve: Exec format error`, measured), and
+    /// a password or an account is set by the image's own `crypt(3)`/`adduser`
+    /// in a chroot. So the first machine's install may do all of it and the
+    /// second machine's is the file-writing half alone - which is why
+    /// `rootfs::install_base` asks this question instead of naming an
+    /// architecture.
+    pub fn host_runs_guest_userland(self) -> bool {
+        match self {
+            Arch::X86_64 => true,
+            Arch::Aarch64 => false,
+        }
+    }
+
+    /// Whether this machine's *kernel* reads a probe file off its root
+    /// partition, which is what makes that file part of the image.
+    ///
+    /// The second machine's `check_fs` mounts the root's filesystem at boot and
+    /// reads `/hello` back through the block driver (`PLAN.md` §9.1, the
+    /// `M7_FS_OK` check - it runs on every boot, not only under `mpos.selftest`,
+    /// and it halts the machine when the file is not there), so the file has to
+    /// be in the image that machine boots. The first machine's filesystem check
+    /// is its initramfs script's `mount`, which needs no known file, so writing
+    /// the probe there would be a file nothing reads.
+    pub fn kernel_reads_root_probe(self) -> bool {
+        match self {
+            Arch::X86_64 => false,
+            Arch::Aarch64 => true,
+        }
+    }
+
+    /// The stamp that records what this machine's root filesystem was built
+    /// from, under `build/`.
+    ///
+    /// One name per machine because one image holds one machine's install, and a
+    /// shared stamp would answer for the wrong image: the two are built from the
+    /// same `rootfs.toml` and the same overlay trees, so whichever machine built
+    /// last would look as if it had built the other one too.
+    ///
+    /// The first machine keeps the name it has always had. Renaming it would
+    /// read as "no stamp at all" and charge a full Alpine package install - over
+    /// the network, thirty-odd packages - for a rename.
+    pub fn rootfs_stamp(self) -> &'static str {
+        match self {
+            Arch::X86_64 => ".rootfs.stamp",
+            Arch::Aarch64 => ".rootfs-aarch64.stamp",
+        }
+    }
+
+    /// The marker file recording which run mode is baked into this machine's
+    /// image, under `build/`.
+    ///
+    /// A cache of what `mpos.cmdline` already says, so one name per machine for
+    /// the same reason [`Arch::rootfs_stamp`] has one - and the first machine
+    /// keeps its historic name for the same reason too: a new name would read as
+    /// "nothing baked" and cost a root refresh of the boot files to say nothing
+    /// changed.
+    pub fn mode_marker(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "console.mode",
+            Arch::Aarch64 => "aarch64-console.mode",
         }
     }
 }

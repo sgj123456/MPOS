@@ -10204,11 +10204,89 @@ different machine.
   differently per machine, and one that does (this phase's shared checks will) must either mount what
   it needs or be honest about the difference. Closing *that* gap is itself part of stage 15.1's
   argument.
-- **`TERMINATORS`** holds a check's success marker only if no later check runs after it, plus every
-  check's failure marker.
+- **The marker chain is no longer asserted by a command of its own** (§15.7). The checks still
+  print their `M*_OK`/`M*_FAILED` markers on every boot and a failure still halts the machine, so a
+  red boot is readable off the wire - but nothing parses the chain any more: what a boot's verdict
+  is, on either machine, is the sweep's `=== RUN/PASS/FAIL/SUMMARY`/`END`.
 - **A check that mutates shared state damages the machine it checks** (§13.14, §13.15).
-- **A marker chain that gains a check must gain it in `xtask` too**, or `boot-aarch64` reads a
-  healthy boot as a hang.
+- **A device check runs on every aarch64 boot, a session included**, and halts the machine when it
+  fails: `check_blk` needs the 1 MiB pattern image beside the disk, `check_fs` needs the root
+  partition to carry `/hello`. Both are therefore inputs of *any* aarch64 image, not only a test's
+  (`disk::blk_image`, `Arch::kernel_reads_root_probe`).
+
+---
+
+### 15.7 The front end: one path for two machines, and an image that is reused
+
+**Landed 2026-10-08.** `xtask/src/aarch64.rs` is deleted (812 lines), `boot-aarch64` and
+`alpine-aarch64` are retired, and every command now handles the machine `--arch` names: `build`,
+`initramfs`, `disk`, `rootfs`, `all`, `run`, `test`. The second machine's three entry points had
+become copies of the first machine's steps - its own command line, terminator list, marker list,
+ESP layout, disk lay-out, staleness rule and `getty` decision - and what was left in that file was
+the scaffolding around those steps rather than a second machine's own work. The whole of the
+deletion, and what replaced each piece:
+
+| Deleted | Replaced by |
+|---|---|
+| the two commands | the same commands with `--arch aarch64`, which now really build, install and boot that machine |
+| the aarch64 verdict boot (its `CMDLINE`, `DEADLINE`, `TERMINATORS`, `M*` marker list, `R:echo-test` pin) | nothing: the marker chain is what a boot's wire *says*, and the sweep is the verdict on both machines |
+| `alpine-aarch64` (staging tree + `fakeroot` + `mkfs.ext4 -d`) | `rootfs --arch aarch64`: one install through the block layer, `apk add --arch aarch64 --no-scripts`, as root, into the mounted partition - which is also what makes ownership right without `fakeroot` |
+| `build_alpine_esp`, `run_interactive`, `ModeChoice`, `alpine_cmdline` | `disk`/`rootfs`/`run` parameterised by `Arch`, one mode word for both machines (`mode.cmdline_consoles`) |
+| `install_alpine_root`, `ensure_alpine_root`, `alpine_staging`, `alpine_stamp`, `alpine_root_is_stale` | `rootfs::install_base` + the rootfs/`disk` stamps, per machine (`Arch::rootfs_stamp`) |
+| `openrc_failure`/`without_ansi` | nothing: they read the retired Alpine verdict's log |
+| `Arch::console`, `qemu::vsock_available` | the config's `rootfs.serial_port` (one source for `console=` and the inittab) and `virt_machine_args`' own `/dev/vhost-vsock` check |
+| `@SERIAL_GETTY@` and `render_inittab` | nothing, and the measurement is why: see below |
+| `disk::boot_media`'s installed-root branch | `disk::sweep_medium`, which is now only a *sweep*'s medium - it lays a complete GPT out of files without root, and it writes its own `build/aarch64-sweep.img` so it can no longer overwrite the image `run` installed |
+
+**The bug the request started from, and its fix.** `dir_newer_than` followed symlinks
+(`fs::metadata`), and an installed Alpine tree carries *absolute* ones - `/etc/init.d/functions.sh
+-> /usr/libexec/rc/sh/functions.sh`, which dangles on the host that installed it. Measured on the
+second `cargo xtask alpine-aarch64` in a row: `Failed to get metadata for
+build/aarch64-alpine-root/etc/init.d/functions.sh`, the command exiting non-zero *before* it
+booted. Every run before that had hidden it by rebuilding: the fingerprint of the boot's command
+line differed between the verdict and the sweep, so the staleness check short-circuited on the
+fingerprint and never reached the tree. The walk reads `symlink_metadata` now
+(`utils::tests::a_dangling_symlink_in_a_tree_does_not_fail_the_walk`), and the aarch64 image is
+reused by the same rule as the first machine's: a stamp per image, a *boot-file refresh* when only
+the kernel, loader or initramfs moved, and a package install only when `rootfs.toml` did.
+
+**A divergence the measurement retired.** The template's `@SERIAL_GETTY@` line rendered a getty on
+the second machine's serial node whenever the session had no window. Measured with the whole
+rendering removed: the windowless boot still reaches `mpos login:` on the wire, and `root` (empty
+password) logs in and runs `id` - because the vcmux carries the current virtual console's output
+*to* the wire and routes the typed bytes back to it, which is also exactly how the first machine's
+`--mode terminal` session has always worked. So the getty was a second login prompt next to the one
+busybox init respawns, and the placeholder, the renderer and the per-machine rule are gone; the
+inittab is one file both images get verbatim (`rootfs::merge_overlays` no longer renders anything).
+
+**Measured (2026-10-08), after the change:**
+
+| Gate | Result |
+|---|---|
+| `cargo xtask all --arch aarch64` | exit 0: 2 GiB image created, GPT laid, ext4 formatted, **34 packages** installed into the mounted root partition, boot files written, `rootfs: completed` |
+| `cargo xtask run --arch aarch64 --mode terminal` | the image is *reused* (no rootfs step at all when nothing moved), boots to `mpos login:`, `root` + `id` answers `uid=0(root)` on the wire |
+| … after `touch target/aarch64-unknown-none/release/mpos` | `Updating the image (boot files only)` - no package install - then a boot whose cmdline is `root=/dev/vda2 rootfstype=ext4 rootflags=rw console=ttyAMA0` and whose script prints `MPOS_SWITCH_ROOT_OK: / is /dev/vda2 (ext4)` |
+| `cargo xtask test --arch aarch64` | `=== SUMMARY pass=94 fail=10` - **the same ten names** as the pre-refactor baseline (`t-9p, t-brk, t-dsp, t-eventfd, t-inotify, t-mmap, t-mprotect, t-mremap, t-preadv2, t-statfs`), so the extraction cost no regressions; those ten are the in-flight ABI work's. Re-run once more with `build/aarch64-blk.img` deleted first, so the sweep had to lay its own block-check fixture: same summary, same names |
+| `cargo xtask test` (first machine) | **stage 1 is red in this tree, and not here**: `cargo test -p mpos --lib` fails on `mm::vma::tests::mmap_placement_rules_over_a_lazy_arena` (`assertion left == right failed: no gap within one page of the cursor`), a test the *uncommitted* kernel work in this tree adds (`git diff src/mm/vma.rs` introduces it), so stage 2 never ran. The parts of the first machine's path this change touches were measured on their own: the full install below, and the boot-file refresh |
+| `cargo xtask run --mode terminal` (first machine) | full install (`OK: 549.9 MiB in 164 packages`, `create_user` and the chroot half included), boots, `root` + `id` answers `uid=0(root)` |
+| `cargo test -p mpos-xtask --target x86_64-unknown-linux-gnu` | 88 passed |
+| `cargo clippy -p mpos-xtask --target x86_64-unknown-linux-gnu --all-targets` | clean |
+
+**Gaps this change names rather than closes.**
+
+- **The kernel's aarch64 comments still name `cargo xtask boot-aarch64`** (`src/board/aarch64.rs`,
+  five sites; `arch/src/arch/aarch64/mod.rs`, one). They belong to the files carrying in-flight
+  work in this tree, so they are updated with that work rather than from an unrelated commit; the
+  sentences are about *why* a failed check halts the machine, which is unchanged.
+- **Nothing asserts the `M*` chain any more.** The checks run and print, and a failure halts the
+  machine - so the evidence is on the wire for a person or a log reader - but a check that
+  *silently* stopped running would no longer be caught by a gate. The sweep reads the test protocol
+  only. Re-pinning the chain means deciding what it should be a verdict *of* on a machine whose
+  userland is a distribution (`tests.toml`'s groups are the current answer to "what must run").
+- **The aarch64 sweep still stages its payload on a disk** rather than into an initramfs the way the
+  first machine's sweep does. That is not decoration: the aarch64 kernel's `check_blk`/`check_fs`
+  run on every boot and halt the machine without a pattern image and a partitioned ext4 root, so a
+  diskless test boot is a kernel change, not an `xtask` one.
 
 ---
 

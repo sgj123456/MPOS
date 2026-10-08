@@ -11,7 +11,7 @@
 | 3 | 修复 `FAIL t-unix` | **已修复并验证**（`=== SUMMARY pass=155 fail=0`） |
 | 4 | `main` 架构无关 | **切片 1 已落地**（hook 表实现合一，−263 行）；切片 2–4 已给出方案 |
 | 1 | no_std 用户测试 → std + rustix | 已给出范围清单、测试集合与迁移机制 |
-| 2 | xtask `run`/`test` 共用逻辑 | 已给出共用边界与抽取形状 |
+| 2 | xtask `run`/`test` 共用逻辑 | **已落地**（2026-10-08；形状比本节设想更彻底，见 §2.5 与 `PLAN.md` §15.7） |
 | 5 | boot 由可执行文件改为 crate，内核成为 UEFI 存根 | 已给出改动点与依赖顺序 |
 | 6 | boot 架构无关，架构码下沉 arch crate | 已给出改动点与依赖顺序 |
 
@@ -132,6 +132,25 @@ xtask/src/sweep.rs              新文件
 1. `cargo test -p mpos-xtask --target x86_64-unknown-linux-gnu`（现有 65 条 + 为 `plan()`/`report()` 补的纯函数测试；这两块本来就是纯逻辑，天然可宿主测试）。
 2. `cargo xtask test` 与 `cargo xtask test --arch aarch64` 的**输出行**（`user tests: N staged, M left out`、分组清单、`FAIL …` 文案）必须与重构前逐字一致——这是"共用没有改变语义"的唯一硬证据。
 3. `cargo xtask test --groups slow` 仍被 aarch64 分支按名拒绝；`--groups nosuch` 仍被两机拒绝。
+
+### 2.5 实际落地（2026-10-08）：共用走到了比本节设想更彻底的一步
+
+本节原本设想的是"抽出一个 `trait Boot`，两台机器各给一份载荷 + 启动实现"。落地时发现，
+`run`/`test` 之外还有**第三**条重复：第二台机器为自己的三个入口（`boot-aarch64`、
+`alpine-aarch64`、`run --arch aarch64`）各留了一套命令行走廊、终止词表、marker 词表、ESP
+布局、铺盘逻辑与 staleness 规则——而其中真正的机器差异只有"包是哪一架构的""引导文件名是哪
+个""overlay 是哪棵树"。所以最终做的是更大的删除，而不是参数化两种启动器：
+
+| 原设想 | 实际做法 |
+|---|---|
+| 抽出 `sweep.rs` 的 `plan()`/`report()` 参数化 | 已按原样落地（`xtask/src/sweep.rs`，两台机器同一套选择与判定） |
+| `X86InitramfsBoot` / `Aarch64EspBoot` 两个 `Boot` 实现 | 不需要：`cargo xtask run` 对两台机器就是**同一个函数**（`qemu::run_qemu`），`disk`/`rootfs`/`all` 同样按 `--arch` 走同一条安装路径 |
+| 保留两个 aarch64 判定命令 | **删除**：`cargo xtask boot-aarch64`、`alpine-aarch64` 退役，第二台机器的门禁与第一台机器同形（`build`/`disk`/`rootfs`/`all`/`run`/`test` + `--arch`），marker 链不再由命令断言 |
+| 第二台机器的安装继续走 staging 树 + `fakeroot` + `mkfs -d` | 改为与第一台机器同一路：`qemu-nbd` 挂载 + `apk add --arch aarch64 --no-scripts`（以 root 运行，所以属主天然正确，也无需 `fakeroot`） |
+
+改动清单、逐条替换关系与实测结果见 `docs/PLAN.md` §15.7；本节只在方案层面记录"为什么不按
+原计划做"。原计划里"#1 之后形状才收敛"的判断仍然成立——用户程序迁到 std 套件后才有了今天这条
+单一路径。
 
 ---
 

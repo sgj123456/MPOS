@@ -37,7 +37,7 @@ and then runs it.
 | `x86_64-unknown-uefi` | EFI loader (`mpos-boot`) | the UEFI boot loader |
 | `x86_64-unknown-linux-musl` | 静态用户程序 | the static user programs |
 | `x86_64-unknown-linux-gnu` | 宿主单元测试 + xtask 自身 | host unit tests + xtask itself |
-| `aarch64-unknown-none` | 第二台机器的内核（`boot-aarch64`） | the second machine's kernel |
+| `aarch64-unknown-none` | 第二台机器的内核（`--arch aarch64`） | the second machine's kernel |
 | `aarch64-unknown-uefi` | 第二台机器的 loader | its loader |
 
 ```
@@ -64,14 +64,21 @@ rustup target add x86_64-unknown-none x86_64-unknown-uefi x86_64-unknown-linux-m
   the Alpine rootfs is fetched over the network (a host `apk` is used if present,
   otherwise `apk.static` is downloaded)
 
-**第二台机器 | the second machine**（只 `boot-aarch64` 用到 | only `boot-aarch64`）：
+**第二台机器 | the second machine**（`--arch aarch64` 用得到它 | needed by `--arch aarch64`）：
 
-- `qemu-system-aarch64`
+- `qemu-system-aarch64`（`run`/`test --arch aarch64`）
 - AAVMF 固件 | AAVMF firmware（`/usr/share/AAVMF/AAVMF_CODE.fd` + `AAVMF_VARS.fd`，
   或 `/usr/share/edk2/aarch64/QEMU_EFI.fd` + `QEMU_VARS.fd`）
 
-> `build`、`test`、`boot-aarch64` 和 `initramfs --arch aarch64` 全程**不需要** root。
-> `build`, `test`, `boot-aarch64` and `initramfs --arch aarch64` never need root.
+> 两台机器走**同一条**命令与同一条构建路径，`--arch` 只是选机器：`build`、`test`、
+> `depgraph` 和 `initramfs --arch aarch64` 全程**不需要** root；`disk`/`rootfs`/`all`
+> 需要（它们经块设备挂载镜像来装根文件系统），需要重建镜像的 `run` 也一样——两条机器
+> 的规则现在完全相同。
+> Both machines take the **same** commands and the same build path; `--arch` only picks
+> the machine. `build`, `test`, `depgraph` and `initramfs --arch aarch64` never need
+> root; `disk`/`rootfs`/`all` do (they mount the image through the block layer to
+> install a root filesystem), and so does a `run` that has to rebuild — one rule for
+> both machines.
 
 ---
 
@@ -89,7 +96,7 @@ cargo xtask [global flags] <command>
 | 构建目录 | `--build-dir <PATH>` | 默认 `$MPOS_BUILD_DIR`，再默认 `build/` | default `$MPOS_BUILD_DIR`, else `build/` |
 | 构建档 | `--profile <NAME>` | 默认 `$PROFILE`，再默认 `debug`；发布用 `--profile release` | default `$PROFILE`, else `debug`; use `--profile release` |
 | 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror`（默认取 `machine.toml` 的 `qemu.mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror` (defaults to `qemu.mode` in `machine.toml`, else `mirror`) |
-| 机器 | `--arch <ARCH>` | 全局：`x86_64`（默认）或 `aarch64`。三条路都真的处理那台机器：`run` 启动第二台机器装好的 Alpine 根（pid 1 是盘上的 `/init`，busybox init 读 `/etc/inittab`），把串口线交给它的 `getty`；`test` 走同一套盘上 sweep（见下，唯一还分机器的是选哪些程序）；`initramfs` 建那台机器的归档（见下）。`disk`/`rootfs`/`all` 组装的是 x86_64 的磁盘镜像，`--arch aarch64` 按名拒绝 | global: `x86_64` (default) or `aarch64`. Three commands really handle that machine: `run` boots the second one's installed Alpine root (pid 1 is the disk's own `/init`, busybox init reading `/etc/inittab`) and hands the serial line to its `getty`; `test` takes the same on-disk sweep (below — only the program selection still differs), and `initramfs` builds that machine's archive (below). `disk`/`rootfs`/`all` assemble the x86_64 disk image, so `--arch aarch64` is refused by name |
+| 机器 | `--arch <ARCH>` | 全局：`x86_64`（默认）或 `aarch64`。**每条命令都真的处理那台机器**：`build` 编它的内核与 loader，`disk`/`rootfs`/`all` 铺并安装**它自己的**磁盘镜像（`mpos-uefi-x86_64.img` / `aarch64-disk.img`，各带自己的 stamp），`run` 启动它（第二台机器 pid 1 同样是盘上的 `/init`，busybox init 读 `/etc/inittab`），`test` 走同一套盘上 sweep（唯一还分机器的是选哪些程序），`initramfs` 建那台机器的归档。两台机器之间只剩真事实的差别，都在 `Arch` 与各配置文件的 `[aarch64]` 段里 | global: `x86_64` (default) or `aarch64`. **Every command really handles that machine**: `build` compiles its kernel and loader, `disk`/`rootfs`/`all` lay and install **its own** disk image (`mpos-uefi-x86_64.img` / `aarch64-disk.img`, each with its own stamp), `run` boots it (the second machine's pid 1 is likewise the disk's own `/init`, busybox init reading `/etc/inittab`), `test` takes the same on-disk sweep (only the program selection still differs) and `initramfs` builds that machine's archive. What is left between the machines is only real differences, held in `Arch` and in each file's `[aarch64]` section |
 | 测试分组 | `--groups <A,B>` | 仅 `test`：除分组外的测试之外再跑这些分组（取代 `tests.toml` 的 `default`）| `test` only: run these groups *in addition* to the ungrouped tests (replaces the file's `default`) |
 | 全部分组 | `--all-groups` | 仅 `test`：连非默认分组一起跑 | `test` only: run every group, including the ones left out by default |
 
@@ -99,13 +106,12 @@ cargo xtask [global flags] <command>
 | --- | --- | --- | --- | --- |
 | `build` | build | 编译内核与 EFI loader（产物在 `target/…`） | build the kernel and the EFI loader | 否 no |
 | `initramfs` | initramfs | 构建 initramfs；`--arch` 选机器——两条路都真的建那台机器的归档，走同一条管线。第二台机器不用 root（它的 busybox 跨架构不能 exec，所以 farm 是手搓的符号链接、apk 走 `--usermode`），第一台机器要（它的 farm 是 `chroot … busybox --install -s`） | build the initramfs; `--arch` picks the machine — both really build that machine's archive, from one pipeline. The second machine needs no root (its cross-arch busybox cannot be execed, so the farm is linked by hand and apk runs with `--usermode`); the first does (its farm is `chroot … busybox --install -s`) | 见说明 see note |
-| `disk` | disk | 创建空的磁盘镜像 `build/mpos-uefi-x86_64.img`（分区 + 文件系统） | create the empty disk image (partitions + filesystems) | 是 yes |
-| `rootfs` | rootfs | 把 Alpine 根文件系统装进镜像（会顺带更新 initramfs） | install the root filesystem into the image (refreshes the initramfs too) | 是 yes |
-| `run` | run | 在 QEMU 中启动镜像；若产物过期会先自动重建 | boot the image in QEMU, rebuilding first if stale | 视情况 when needed |
+| `disk` | disk | 创建**该机器**的空磁盘镜像（`build/mpos-uefi-x86_64.img` 或 `build/aarch64-disk.img`：GPT + 文件系统） | create that machine's empty disk image (a GPT: partitions + filesystems) | 是 yes |
+| `rootfs` | rootfs | 把该机器要的 Alpine 根文件系统装进它的镜像（会顺带更新 initramfs）。按包安装：`--arch x86_64`/`aarch64` 各自解析自己的包，跨架构那台加 `--no-scripts` 并跳过需要跑镜像内程序的 chroot 半区 | install that machine's Alpine root into its image (refreshes the initramfs too). Per package: each machine resolves its own `--arch`, and the cross-arch one adds `--no-scripts` and skips the chroot half that runs the image's own programs | 是 yes |
+| `run` | run | 在 QEMU 中启动该机器的镜像；若产物过期会先自动重建（只改了内核/loader/initramfs → 只刷新引导文件，不重装包） | boot that machine's image in QEMU, rebuilding first if stale (a kernel/loader/initramfs change refreshes the boot files alone — no package install) | 视情况 when needed |
 | `all` | all | 一次做完：内核、initramfs、镜像、根文件系统 | build everything in one go | 是 yes |
 | `test` | test | 自测：宿主单元测试 + 在 QEMU 里跑 `tests.toml` 选中的用户测试程序并解析结果。**两台机器现在走同一条盘上 sweep**（`selftest::run_disk_sweep`）：测试载荷装在根分区上，共享的 `TEST_INIT` 遍历 `/bin/t-*`，同一套 `=== RUN/PASS/FAIL/SUMMARY`/`END` 协议读结论。唯一还分机器的是**选哪些程序**——`tests.toml` 的分组以 x86_64 的程序命名，所以 `--arch aarch64` 会按名拒绝 `--groups`/`--all-groups`，而不是跑一份和你要的不一样的集合；两台机器都不可能静默跑另一台 | self-test sweep: host unit tests + the user test programs `tests.toml` selects, booted in QEMU. **Both machines now take the same on-disk sweep** (`selftest::run_disk_sweep`): the payload rides on the root partition, the shared `TEST_INIT` walks `/bin/t-*`, and the same `=== RUN/PASS/FAIL/SUMMARY`/`END` reader reads the verdict. What still differs is the *selection* — `tests.toml`'s groups name x86_64's programs, so `--arch aarch64` refuses `--groups`/`--all-groups` by name rather than running a different set than was asked for. Neither arm can silently boot the other machine | 否 no |
 | `depgraph` | depgraph | 重新测量内核模块图并对照 Phase 11 的棘轮：任何新增的向上依赖或增长的计数都会让命令失败（它同时是一个宿主测试，`cargo xtask test` 会跑到） | re-measure the kernel's module graph against the Phase-11 ratchet; fails when an upward edge appears or a count grows (also a host test, so `test` runs it) | 否 no |
-| `boot-aarch64` | boot-aarch64 | **第二台机器**：编译 aarch64 内核与它的 UEFI loader，铺一块和第一台机器相同的 GPT 启动盘（p1 = ESP，p2 = ext4 根），用 AAVMF 启动，再从 PL011 日志读结论（从 `M4_CONSOLE_OK` 到 `login:` 的整条 marker 链，含磁盘根、各 MMIO virtio 设备与它自己的 net 栈；`PLAN.md` §9.1、§15.18） | **the second machine**: build the aarch64 kernel and its UEFI loader, lay out the same GPT boot disk the first machine boots off (p1 = ESP, p2 = ext4 root), boot it under AAVMF, and read the verdict off the PL011 log (the whole marker chain, `M4_CONSOLE_OK` through `login:`, including the disk root, the MMIO virtio devices and its own network stack; `PLAN.md` §9.1, §15.18) | 否 no |
 | `clean` | clean | 删除 `build/` 与 `target/` | remove the build and target directories | 视情况 when needed |
 
 ### 环境变量 | Environment variables
@@ -142,9 +148,11 @@ cargo xtask test        # 宿主单测 + 虚拟机内的用户测试程序
 # 看模块依赖有没有长回去 | check the module graph has not grown back
 cargo xtask depgraph    # 打印模块边与互指模块对，越过棘轮就失败
 
-# 第二台机器：走的是和 x86_64 一样的启动路径（固件 → ESP → loader → 高半区）
-# the second machine, along the same boot path x86_64 takes
-cargo xtask boot-aarch64            # 日志在 build/aarch64-serial.log
+# 第二台机器：同一条命令、同一条路径（固件 → ESP → loader → 高半区），只换 --arch
+# the second machine: the same command and the same boot path, with another --arch
+cargo xtask all --arch aarch64      # 建镜像 + 装它的根文件系统 (需要 sudo)
+cargo xtask run --arch aarch64      # 交互式：登录提示在串口线上（root，无密码）
+cargo xtask test --arch aarch64     # 它的用户测试扫描：=== SUMMARY pass=N fail=M
 
 
 # 发布版 | release build
@@ -259,6 +267,16 @@ are both said out loud.
 | 终端 | `terminal` | 只有串口终端，无窗口 | `-display none` + 串口走 stdio | `console=ttyS0` |
 | 图形 | `gui` | 整机进窗口：文本 tty（启动日志、虚拟终端、登录、shell）全显示在窗口里，宿主机终端静默 | `-display <后端>` + 串口接到 `build/serial.log` | `console=tty0` |
 | 镜像 | `mirror` | 窗口为主，串口尽力跟一份 | `-display <后端>` + 串口走 stdio | `console=ttyS0 console=tty0` |
+
+表中 `console=` 的串口名是**那台机器**的（`rootfs.serial_port`：x86_64 是 `ttyS0`，
+第二台是 `ttyAMA0`），模式本身只决定窗口、framebuffer 与串口的组合。第二台机器的
+`qemu.display` 是 `none`（没有可看的窗口后端），所以它的每条模式都把串口留在终端上——
+窗口不存在时把串口丢进日志文件，就等于把整台机器藏起来。
+The serial name in that table is **the machine's** (`rootfs.serial_port`: `ttyS0` on
+x86_64, `ttyAMA0` on the second machine); the mode itself only picks the combination of
+window, framebuffer and wire. The second machine's `qemu.display` is `none` (it has no
+window backend to look at), so every mode leaves its wire on the terminal — moving it
+into a log file while no window exists would hide the whole machine.
 
 只有两个问题要回答——有没有窗口、framebuffer 算不算客机的控制台——所以模式只有三个，
 且三个各有一条自己的 `console=` 列表。把窗口让给合成器是运行时的事实（weston 会
@@ -382,11 +400,11 @@ as `weston` has a marker nothing reads any more; each costs the one refresh, and
 | --- | --- | --- | --- |
 | 内核 | kernel | `target/x86_64-unknown-none/<profile>/mpos` | |
 | EFI loader | loader | `target/x86_64-unknown-uefi/<profile>/mpos-boot.efi` | |
-| 磁盘镜像 | disk image | `build/mpos-uefi-x86_64.img` | |
-| initramfs | initramfs | `build/initramfs.tar` | |
-| OVMF 变量副本 | OVMF vars | `build/OVMF_VARS.4m.fd` | |
-| 测试串口日志 | test serial log | `build/test-serial.log`（`test` 时生成） | written by `test` |
-| aarch64 内核 | aarch64 kernel | `target/aarch64-unknown-none/<profile>/mpos`（`boot-aarch64`） | |
-| aarch64 loader | aarch64 loader | `target/aarch64-unknown-uefi/<profile>/mpos-boot.efi` | |
-| aarch64 磁盘 | aarch64 disk | `build/aarch64-disk.img`（GPT：p1 = ESP，p2 = ext4 根，和第一台机器同一形状） | the GPT disk `boot-aarch64` boots off (p1 = ESP, p2 = ext4 root) |
-| aarch64 串口日志 | aarch64 serial log | `build/aarch64-serial.log`（`boot-aarch64` 时生成，结论就从这里读） | the log `boot-aarch64` reads its verdict from |
+| 磁盘镜像 | disk image | `build/mpos-uefi-x86_64.img`（`--arch aarch64` 是 `build/aarch64-disk.img`：GPT，p1 = ESP，p2 = ext4 根，同一形状） | `--arch aarch64` gets `build/aarch64-disk.img`, the same GPT shape (p1 = ESP, p2 = ext4 root) |
+| 根文件系统 stamp | rootfs stamp | `build/.rootfs.stamp` / `build/.rootfs-aarch64.stamp`——每个镜像一份，决定要不要重装包还是只刷新引导文件 | one per image; decides package install against boot-file refresh |
+| 烘焙的运行模式 | baked run mode | `build/console.mode` / `build/aarch64-console.mode`——缓存镜像里 `mpos.cmdline` 说的是哪个模式，好让 `run` 不必提权去读 | a cache of the mode `mpos.cmdline` already carries, so `run` need not take root to look |
+| initramfs | initramfs | `build/initramfs.tar`（`--arch aarch64` 是 `build/aarch64-initramfs.tar`） | `--arch aarch64` gets `build/aarch64-initramfs.tar` |
+| 固件变量副本 | firmware vars | `build/OVMF_VARS.4m.fd` / `build/AAVMF_VARS.fd` | per machine |
+| 测试串口日志 | test serial log | `build/test-serial.log`（x86_64 扫描）、`build/aarch64-serial.log`（aarch64 扫描与任何 headless 启动） | `build/test-serial.log` (x86_64 sweep), `build/aarch64-serial.log` (aarch64 sweep and any headless boot) |
+| 扫描启动盘 | sweep medium | `build/aarch64-sweep.img` + `build/aarch64-sweep.stamp`——`test --arch aarch64` 自己的盘（载荷铺在根分区上），与 `run` 装好的镜像分开，互相不覆盖 | `test --arch aarch64`'s own disk (its payload staged on the root partition), separate from the image `run` installs |
+| aarch64 内核与 loader | aarch64 kernel + loader | `target/aarch64-unknown-none/<profile>/mpos`、`target/aarch64-unknown-uefi/<profile>/mpos-boot.efi`（`build`/`all`/`run`/`test --arch aarch64`） | built by `build`/`all`/`run`/`test --arch aarch64` |

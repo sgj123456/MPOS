@@ -51,23 +51,25 @@ rootfs.repos = ["main", "community"]
 # Filesystem for the root partition. This kernel routes ext2, ext3 and ext4 to
 # the same driver, so any of the three boots; ext4 is what the image ships.
 rootfs.filesystem = "ext4"
-# How the guest sees the root device (virtio disk in QEMU). The second machine's
-# own half names the whole disk rather than a partition: its firmware boots from
-# a bare FAT volume and its root is a bare ext4 attached as a virtio-MMIO block,
-# so there is no partition table to describe (`PLAN.md` §13.3's deviation).
+# How the guest sees the root device (virtio disk in QEMU). Both machines boot
+# the same shape - a GPT whose first partition is the ESP and whose second is
+# the ext4 root - so both name `/dev/vda2`, the second block device's second
+# partition (`PLAN.md` §15.18; the second machine's bare-image deviation is
+# gone).
 rootfs.root_device = "/dev/vda2"
 # Serial port the kernel's console goes to, named on the kernel command line as
 # `console=ttyS0`. It is the same name the image's getty runs on. The second
 # machine's console is a PL011, so its half names `ttyAMA0` - one node either
 # way, named the way the machine's psABI names the port.
 rootfs.serial_port = "ttyS0"
-# Disk image size
+# Disk image size. Read for **both** machines: each has its own image file
+# (`mpos-uefi-x86_64.img`, `aarch64-disk.img`) created at this size, and the
+# second machine's is a GPT of the same shape rather than the bare filesystems
+# it used to carry.
 rootfs.image_size = "2G"
 # EFI System Partition size. It holds the loader, the kernel and the initramfs
-# and nothing else, so it only has to grow if those do. Neither this nor
-# `image_size` is read for the second machine, whose partitions the build lays
-# itself: the values are the baseline's because the first machine is the one
-# with a partition table, and the second's half says nothing about them.
+# and nothing else, so it only has to grow if those do. Read for both machines
+# for the same reason `image_size` is.
 rootfs.esp_size = "128M"
 # `mke2fs -O` features, comma-separated. The driver cannot honour two of the
 # defaults: a journal (nothing here replays one, and a crash would leave the
@@ -221,15 +223,16 @@ user.password = ""
 #
 # The keys are the same vocabulary the baseline uses, read by the same
 # `RootfsConfig::load`, so nothing here is a dialect. What is absent is as
-# deliberate as what is present: this machine has no GPU, no DRM and no PCI bus
-# to hang a card on, and its image is laid by the build on the host rather than
-# by a guest with filesystem tools.
+# deliberate as what is present: this machine has no GPU and no DRM, so it has no
+# use for the desktop's graphics stack, and the packages a guest with disks needs
+# to *make* filesystems are the first machine's alone (its image is laid by the
+# build, through the block layer, exactly like the first's).
 [aarch64]
 rootfs.arch = "aarch64"
-# The root is the whole disk device, not a partition: this machine has no
-# partition table (see `rootfs.root_device` above).
-rootfs.root_device = "/dev/vda"
-# The PL011 - the name this machine's console is called everywhere else.
+# The PL011 - the name this machine's console is called everywhere else, on the
+# `console=` word the image is booted with and on the getty line its inittab
+# renders. `rootfs.root_device` is the baseline's: both machines' roots are the
+# second partition of their own GPT disk.
 rootfs.serial_port = "ttyAMA0"
 # Empty, and it has to be said: the baseline's list is the first machine's, and
 # a guest that does not make filesystems has no use for e2fsprogs/dosfstools

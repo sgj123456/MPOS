@@ -168,24 +168,26 @@ pub fn loader_path(profile: &str, arch: Arch) -> Result<PathBuf> {
         .join("mpos-boot.efi"))
 }
 
-pub fn initramfs_path(build_dir: &Path) -> PathBuf {
-    build_dir.join("initramfs.tar")
-}
-
-pub fn image_path(build_dir: &Path) -> PathBuf {
-    build_dir.join("mpos-uefi-x86_64.img")
+/// The disk image `arch`'s machine boots, under the build directory.
+///
+/// The name is the machine's (`Arch::disk_image`) and the two are different
+/// files: one machine's image holds its own root filesystem and its own boot
+/// files, so an image built for one is not the other's - which is also what
+/// keeps the two rootfs stamps meaningful.
+pub fn image_path(build_dir: &Path, arch: Arch) -> PathBuf {
+    build_dir.join(arch.disk_image())
 }
 
 /// Marks a disk image whose root filesystem has been installed. The image's
 /// own mtime cannot say that - `disk` creating the file makes it newer than
 /// the configuration, which would read as "the rootfs was built after the last
 /// change" and skip the build entirely.
-pub fn rootfs_stamp(build_dir: &Path) -> PathBuf {
-    build_dir.join(".rootfs.stamp")
-}
-
-pub fn ovmf_vars_path(build_dir: &Path) -> PathBuf {
-    build_dir.join("OVMF_VARS.4m.fd")
+///
+/// One stamp per machine (`Arch::rootfs_stamp`): the two images are built from
+/// the same configuration and the same overlay trees, so a shared name would let
+/// the machine that built last answer for the other one.
+pub fn rootfs_stamp(build_dir: &Path, arch: Arch) -> PathBuf {
+    build_dir.join(arch.rootfs_stamp())
 }
 
 pub fn file_mtime(path: &Path) -> Result<SystemTime> {
@@ -205,17 +207,32 @@ pub fn newer(candidate: &Path, reference: &Path) -> Result<bool> {
     Ok(candidate_time > reference_time)
 }
 
+/// True when any file under `dir` was modified after `after`.
+///
+/// Read through `symlink_metadata`, so a link is *the entry* the walk compares
+/// rather than whatever it points at. That is not a detail: an installed Alpine
+/// tree carries absolute links (`/etc/init.d/functions.sh ->
+/// /usr/libexec/rc/sh/functions.sh`), which dangle on the host that installed it,
+/// and a walk that followed them failed outright - "Failed to get metadata" -
+/// which took the whole command down with it rather than answering the question
+/// it was asked. A dangling link is an entry like any other here; its own mtime
+/// is what says whether the tree moved.
 pub fn dir_newer_than(dir: &Path, after: SystemTime) -> Result<bool> {
     if !dir.is_dir() {
         return Ok(false);
     }
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.is_dir() {
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.is_dir() {
             if dir_newer_than(&path, after)? {
                 return Ok(true);
             }
-        } else if file_mtime(&path)? > after {
+        } else if meta
+            .modified()
+            .with_context(|| format!("Failed to get modification time for {}", path.display()))?
+            > after
+        {
             return Ok(true);
         }
     }
@@ -250,8 +267,8 @@ pub fn lay_p9_share(dir: &Path) -> Result<PathBuf> {
     Ok(dir.to_path_buf())
 }
 
-/// True when the image on disk does not reflect the sources: it is missing, it
-/// was never assembled, or anything it was assembled from has changed since.
+/// True when `arch`'s image on disk does not reflect the sources: it is missing,
+/// it was never assembled, or anything it was assembled from has changed since.
 ///
 /// The image is the last of three stages - the kernel and its loader, the
 /// initramfs archive, the root filesystem - and it depends on all of them, so
@@ -259,14 +276,19 @@ pub fn lay_p9_share(dir: &Path) -> Result<PathBuf> {
 /// itself rather than this function keeping a second copy of the rules: a
 /// kernel rebuilt after the last image has to trigger the rebuild, or `run`
 /// boots code that is no longer on disk and calls it a fix that did nothing.
-pub fn image_stale(build_dir: &Path, profile: &str) -> Result<bool> {
-    if !image_path(build_dir).exists() {
+///
+/// The three stages are `arch`'s, so both machines ask this one question. What
+/// the answer costs differs by how far the staleness reaches: a kernel change is
+/// boot files, and a configuration change is the packages
+/// (`rootfs::needs_full_install`).
+pub fn image_stale(build_dir: &Path, profile: &str, arch: Arch) -> Result<bool> {
+    if !image_path(build_dir, arch).exists() {
         return Ok(true);
     }
-    if crate::initramfs::needs_rebuild(build_dir, Arch::X86_64)? {
+    if crate::initramfs::needs_rebuild(build_dir, arch)? {
         return Ok(true);
     }
-    crate::rootfs::needs_rebuild(build_dir, profile)
+    crate::rootfs::needs_rebuild(build_dir, profile, arch)
 }
 
 /// Build the kernel and its UEFI loader *for `arch`*.
@@ -826,6 +848,40 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The walk answers the question it is asked even when the tree carries a
+    /// link it cannot follow.
+    ///
+    /// The counterfactual is a real one: an installed Alpine tree's links are
+    /// absolute (`/etc/init.d/functions.sh -> /usr/libexec/rc/sh/functions.sh`)
+    /// and dangle on the host that installed it, and a walk that followed them
+    /// answered `Failed to get metadata ...: No such file or directory` instead of
+    /// `false` - which is what took a whole aarch64 boot down with it, since the
+    /// staleness check is asked before every boot.
+    #[test]
+    fn a_dangling_symlink_in_a_tree_does_not_fail_the_walk() {
+        let dir = scratch("dir-newer-dangling");
+        let tree = dir.join("tree");
+        fs::create_dir_all(tree.join("etc")).unwrap();
+        fs::write(tree.join("etc/real"), "x").unwrap();
+        std::os::unix::fs::symlink("/nowhere/at/all", tree.join("etc/dangling")).unwrap();
+
+        let after = SystemTime::now() + std::time::Duration::from_secs(60);
+        assert!(
+            !dir_newer_than(&tree, after).unwrap(),
+            "nothing in the tree is newer than a time in the future"
+        );
+
+        // And the link is still an entry the walk compares: touching it *is* a
+        // change to the tree, which is what keeps a link the tree carries from
+        // being invisible to the stamp that reads it.
+        let old = SystemTime::now() - std::time::Duration::from_secs(600);
+        std::os::unix::fs::symlink("/nowhere/at/all", dir.join("fresh")).unwrap();
+        fs::remove_file(tree.join("etc/dangling")).unwrap();
+        fs::rename(dir.join("fresh"), tree.join("etc/dangling")).unwrap();
+        assert!(dir_newer_than(&tree, old).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_rebuilt_kernel_makes_the_image_stale() {
         let dir = scratch("stale");
@@ -837,9 +893,9 @@ mod tests {
 
         let kernel = target.join("x86_64-unknown-none/debug/mpos");
         let loader = target.join("x86_64-unknown-uefi/debug/mpos-boot.efi");
-        let tar = initramfs_path(&build);
-        let image = image_path(&build);
-        let stamp = rootfs_stamp(&build);
+        let tar = crate::initramfs::archive_path(&build, Arch::X86_64);
+        let image = image_path(&build, Arch::X86_64);
+        let stamp = rootfs_stamp(&build, Arch::X86_64);
 
         // The tree as it is just after a build: every input older than the
         // stamp, and the stamp the newest thing in it.
@@ -858,7 +914,7 @@ mod tests {
         unsafe { env::set_var("CARGO_TARGET_DIR", &target) };
 
         assert!(
-            !image_stale(&build, "debug").unwrap(),
+            !image_stale(&build, "debug", Arch::X86_64).unwrap(),
             "an image newer than everything it was built from is not stale"
         );
 
@@ -868,8 +924,16 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(&kernel, "rebuilt").unwrap();
         assert!(
-            image_stale(&build, "debug").unwrap(),
+            image_stale(&build, "debug", Arch::X86_64).unwrap(),
             "a kernel rebuilt after the image has to trigger the rebuild"
+        );
+
+        // And the two machines' images are two images: the second machine's is
+        // missing at this point, which is stale for a reason that has nothing to
+        // do with the kernel above.
+        assert!(
+            image_stale(&build, "debug", Arch::Aarch64).unwrap(),
+            "one machine's image is not the other's"
         );
 
         match previous {
