@@ -169,14 +169,6 @@ name = "t-execve"
 path = "src/bin/syscall/t-execve.rs"
 
 [[bin]]
-name = "t-exit-group"
-path = "src/bin/syscall/t-exit-group.rs"
-
-[[bin]]
-name = "t-fork"
-path = "src/bin/syscall/t-fork.rs"
-
-[[bin]]
 name = "t-futex"
 path = "src/bin/syscall/t-futex.rs"
 
@@ -275,14 +267,6 @@ path = "src/bin/syscall/t-unix-dgram.rs"
 [[bin]]
 name = "t-unix-scm"
 path = "src/bin/syscall/t-unix-scm.rs"
-
-[[bin]]
-name = "t-wait4"
-path = "src/bin/syscall/t-wait4.rs"
-
-[[bin]]
-name = "t-waitid"
-path = "src/bin/syscall/t-waitid.rs"
 
 [[bin]]
 name = "t-wait-eintr"

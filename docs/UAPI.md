@@ -436,6 +436,23 @@ the commit bodies), and each moved its pin in the same commit.
   Linux rule, so the code and its documentation disagree. Owner: `src/syscall/linux/fs/file.rs`'s
   close path (which already tests `Arc::strong_count` after the close for the evdev half) and
   `src/vfs/locks.rs`. `PLAN.md` §15.16.
+- **`waitid(2)` ignores its `id`, serves two of Linux's four idtypes, and calls
+  "no event asked for" a success.** Three divergences, each measured on a
+  current host. (a) The `id` argument is not used: `P_PID` does not name the
+  child waited for, so a caller naming one child is handed whichever child
+  finishes first (`wait4` *does* honour its pid, which is what makes this
+  `waitid`'s own). (b) `P_ALL` and `P_PID` are served and `P_PGID` (2) and
+  `P_PIDFD` (3) are answered `EINVAL`, where Linux serves `P_PGID`: measured,
+  `idtype = 2` with `id = 0` is accepted and a childless caller is answered
+  `ECHILD` (errno 10). (c) A call whose `options` asks for none of
+  `WEXITED`/`WSTOPPED`/`WCONTINUED` is answered `0` with the record cleared,
+  where Linux clears the record and then refuses with `EINVAL` (errno 22) —
+  measured, and the *zeroing* is the half both machines agree on; (c) is the
+  §3.2 shape in the milder direction, a success where Linux refuses, rather
+  than a wrong number. Owner: `src/syscall/linux/proc.rs`'s `handle_waitid` (the
+  `_id` binding, the `idtype` check, and the `options & WEXITED == 0` arm).
+  `t-waitid` pins this kernel's answers on **both** machines and names each
+  host answer beside it under `MPOS_ON_HOST`. `PLAN.md` §15.11 (batch 18).
 
 - **`FIONREAD` on a regular file and on a pipe.** Linux answers `0` and the bytes
   remaining/queued; this kernel answers `ENOTTY` for everything that is not the entropy
