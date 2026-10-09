@@ -1690,7 +1690,7 @@ fn init_net() {
 /// visits that moved nothing, and before there was a counter to ask, as nothing
 /// at all.
 #[cfg(feature = "selftest")]
-fn check_serial_tx() {
+pub(crate) fn check_serial_tx(_info: &BootInfo) -> Result<(), String> {
     const LINE: usize = 512;
 
     let before = hal::tx_ring::stats();
@@ -1711,17 +1711,22 @@ fn check_serial_tx() {
         }
         waited += 1;
         if waited > 200 {
-            // Reported through the *machine's* polled writer, not `println!`:
-            // a failure here is by definition a queue that is not draining, and
-            // a report filed through that same queue is a report nobody reads.
+            // The detail goes through the *machine's* polled writer, not
+            // `println!`: a failure here is by definition a queue that is not
+            // draining, and a report filed through that same queue is a report
+            // nobody reads. The harness's own line carries the short version.
             let now = hal::tx_ring::stats();
             mpos::arch::print_args(format_args!(
-                "\nM5_SERIAL_TX_FAILED: {} bytes queued but only {} handed to the PL011 \
+                "\nserial tx: {} bytes queued but only {} handed to the PL011 \
                  ({waited} ticks, no progress)\n",
                 now.queued - before.queued,
                 now.moved - before.moved
             ));
-            hal::halt()
+            return Err(alloc::format!(
+                "{} bytes queued but only {} handed to the PL011 after {waited} ticks",
+                now.queued - before.queued,
+                now.moved - before.moved
+            ));
         }
         sched::sleep_ticks(1);
     }
@@ -1730,32 +1735,16 @@ fn check_serial_tx() {
     let visits = now.visits - before.visits;
     if visits == 0 {
         mpos::arch::print_args(format_args!(
-            "\nM5_SERIAL_TX_FAILED: the bytes went out without a single interrupt\n"
+            "\nserial tx: {moved} bytes went out without a single interrupt\n"
         ));
-        hal::halt()
+        return Err(alloc::format!(
+            "{moved} bytes went out without a single interrupt"
+        ));
     }
     mpos::println!(
         "serial tx: {moved} bytes handed to the PL011 by {visits} interrupt(s), \
          ({waited} ticks elapsed)"
     );
-    mpos::println!("M5_SERIAL_TX_OK");
-}
-
-/// `check_serial_tx`, as the harness's case.
-///
-/// An adapter rather than a rewrite: the body still answers by panicking, and the
-/// harness's contract is to answer a reason (`src/board/kunit.rs` argues why the
-/// kernel cannot catch a panic, which is what makes this the next slice's work).
-#[cfg(feature = "selftest")]
-pub(crate) fn suite_console_tx(_info: &BootInfo) -> Result<(), String> {
-    check_serial_tx();
-    Ok(())
-}
-
-/// `check_console_rx`, as the harness's case. See [`suite_console_tx`].
-#[cfg(feature = "selftest")]
-pub(crate) fn suite_console_input(_info: &BootInfo) -> Result<(), String> {
-    check_console_rx();
     Ok(())
 }
 
@@ -1770,7 +1759,7 @@ pub(crate) fn suite_console_input(_info: &BootInfo) -> Result<(), String> {
 /// loopback so a headless boot can exercise it. Runs before the pump task is
 /// spawned, so the poll here is the only consumer of the injected bytes.
 #[cfg(feature = "selftest")]
-fn check_console_rx() {
+pub(crate) fn check_console_rx(_info: &BootInfo) -> Result<(), String> {
     // Feed a line: a probe byte and a newline, each injected into the receiver and
     // pulled back out through the capability forward - the exact moves the pump
     // makes at runtime, driven here by loopback so a headless boot can exercise it.
@@ -1782,10 +1771,9 @@ fn check_console_rx() {
         match hal::console_poll_input() {
             Some(got) if got == byte => tty.receive_byte(got),
             other => {
-                mpos::println!(
-                    "M6_CONSOLE_RX_FAILED: poll after inject gave {other:?}, not {byte:#04x}"
-                );
-                hal::halt()
+                return Err(alloc::format!(
+                    "the poll after injecting {byte:#04x} gave {other:?}"
+                ));
             }
         }
     }
@@ -1794,11 +1782,13 @@ fn check_console_rx() {
     // tty returns a whole line once the newline has landed.
     let mut line = [0u8; 8];
     match tty.read(&mut line) {
-        Ok(n) if &line[..n] == b"Z\n" => mpos::println!("M6_CONSOLE_RX_OK"),
-        other => {
-            mpos::println!("M6_CONSOLE_RX_FAILED: tty read gave {other:?}, expected \"Z\\n\"");
-            hal::halt()
+        Ok(n) if &line[..n] == b"Z\n" => {
+            mpos::println!("console rx: the injected line read back through the tty");
+            Ok(())
         }
+        other => Err(alloc::format!(
+            "the tty read gave {other:?}, not the injected \"Z\\n\""
+        )),
     }
 }
 

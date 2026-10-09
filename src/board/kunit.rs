@@ -49,10 +49,16 @@ pub(crate) const SUITES: &[Suite] = &[
     Suite {
         name: "arch",
         phase: Phase::Arch,
-        cases: &[Case {
-            name: "clock_tables_address_spaces",
-            run: super::x86_64::suite_arch,
-        }],
+        cases: &[
+            Case {
+                name: "clock_breaks_registers",
+                run: super::x86_64::check_arch_clock,
+            },
+            Case {
+                name: "page_tables_and_spaces",
+                run: super::x86_64::check_arch_pages,
+            },
+        ],
     },
     #[cfg(target_arch = "aarch64")]
     Suite {
@@ -60,7 +66,7 @@ pub(crate) const SUITES: &[Suite] = &[
         phase: Phase::ConsoleInput,
         cases: &[Case {
             name: "console_receive",
-            run: super::aarch64::suite_console_input,
+            run: super::aarch64::check_console_rx,
         }],
     },
     #[cfg(target_arch = "aarch64")]
@@ -69,7 +75,7 @@ pub(crate) const SUITES: &[Suite] = &[
         phase: Phase::ConsoleTx,
         cases: &[Case {
             name: "console_transmit",
-            run: super::aarch64::suite_console_tx,
+            run: super::aarch64::check_serial_tx,
         }],
     },
 ];

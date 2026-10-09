@@ -58,6 +58,8 @@ use core::ptr;
 #[cfg(feature = "selftest")]
 use mpos::arch;
 #[cfg(feature = "selftest")]
+use mpos::case_check;
+#[cfg(feature = "selftest")]
 use mpos::hal;
 #[cfg(feature = "selftest")]
 use mpos::mm::{MapFlags, Mapping, PAGE_SIZE};
@@ -324,26 +326,15 @@ fn init_blk() {
 
 // ---- arch: interrupts, timer, paging, address spaces ---------------------
 
-/// `check_arch`, as the harness's case.
+/// The arch suite's first case: the clock ticks at the rate it declares, a
+/// breakpoint is catchable, and the machine's register-file table agrees with the
+/// host-built ABI table.
 ///
-/// An adapter rather than a rewrite: the body still answers by panicking, and the
-/// harness's contract is to answer a reason (`src/board/kunit.rs` argues why the
-/// kernel cannot catch a panic, which is what makes this the next slice's work).
+/// Compiled only into a test build: it costs half a second of busy-waiting, and
+/// nothing outside the suite registry calls it.
 #[cfg(feature = "selftest")]
-pub(crate) fn suite_arch(info: &BootInfo) -> Result<(), String> {
-    check_arch(info);
-    Ok(())
-}
-
-/// Prove the clock works, exceptions are catchable, the kernel runs on its
-/// own page tables with correct permissions, and processes get isolated
-/// address spaces.
-///
-/// Compiled only into a test build: it costs half a second of busy-waiting on
-/// every call, and nothing outside the suite registry calls it (`suite_arch`).
-#[cfg(feature = "selftest")]
-fn check_arch(info: &BootInfo) {
-    // M1: clock interrupts and breakpoint exception.
+pub(crate) fn check_arch_clock(_info: &BootInfo) -> Result<(), String> {
+    // The clock, and a breakpoint exception.
     {
         let before = hal::ticks();
         hal::busy_wait_ms(500);
@@ -354,16 +345,20 @@ fn check_arch(info: &BootInfo) {
         // silently turn a working clock into a failed assertion.
         let half = hal::TICK_HZ as u64 / 2;
         let tol = hal::TICK_HZ as u64 / 10;
-        assert!(
+        case_check!(
             (half - tol..=half + tol).contains(&elapsed),
-            "timer tick rate is wrong"
+            "the clock ticked {elapsed} times in ~500 ms, not the {half}±{tol} that {} Hz promises",
+            hal::TICK_HZ
         );
-
         #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!("int3")
         };
-        assert_eq!(arch::breakpoints_caught(), 1, "#BP was not caught");
+        case_check!(
+            arch::breakpoints_caught() == 1,
+            "#BP was not caught: {} breakpoints recorded",
+            arch::breakpoints_caught()
+        );
         println!("breakpoint caught and returned from");
 
         // The machine's copy of the Linux register-file field order must agree
@@ -372,32 +367,40 @@ fn check_arch(info: &BootInfo) {
         // other's module - and this is what keeps the duplication honest rather
         // than hoped-for (`arch/x86_64/context.rs`, `syscall/linux/abi.rs`).
         for (name, index) in arch::ABI_REG_INDEX {
-            assert_eq!(
-                syscall::linux::abi::uregs_by_name(name),
-                Some(index),
-                "the machine's {name} disagrees with user_regs_struct"
+            case_check!(
+                syscall::linux::abi::uregs_by_name(name) == Some(index),
+                "the machine puts {name} at {index} and user_regs_struct puts it at {:?}",
+                syscall::linux::abi::uregs_by_name(name)
             );
         }
-        assert_eq!(
+        case_check!(
+            syscall::linux::abi::UREGS_COUNT == arch::ABI_REG_COUNT,
+            "the register file is {} fields on one side and {} on the other",
             syscall::linux::abi::UREGS_COUNT,
-            arch::ABI_REG_COUNT,
-            "the register file is a different size on the two sides"
+            arch::ABI_REG_COUNT
         );
         println!("register file field order agrees with the ABI");
-
-        println!("M1_OK");
     }
+    Ok(())
+}
 
-    // M3: kernel page tables, W^X, user address spaces.
+/// The arch suite's second case: the kernel runs on its own page tables with the
+/// permissions it meant, the direct map is usable, and processes get isolated
+/// address spaces.
+///
+/// Compiled only into a test build, like the case above.
+#[cfg(feature = "selftest")]
+pub(crate) fn check_arch_pages(info: &BootInfo) -> Result<(), String> {
+    // The kernel's own page tables, W^X, and user address spaces.
     {
         let sections = arch::kernel_sections();
 
         // Direct map works after the switch.
         let mut proof: Vec<u8> = Vec::new();
         proof.resize(64 * 1024, 0x3c);
-        assert!(
+        case_check!(
             proof.iter().all(|&byte| byte == 0x3c),
-            "the direct map is broken after the switch"
+            "the direct map is broken after the switch: a 64 KiB buffer did not read back"
         );
         println!("64 KiB allocated and written after the switch");
 
@@ -411,15 +414,15 @@ fn check_arch(info: &BootInfo) {
             let mut virt = range.start;
             while virt < range.end {
                 let (phys, flags) = hal::translate(virt)
-                    .unwrap_or_else(|| panic!("{name} at {virt:#x} is not mapped"));
-                assert_eq!(
-                    flags, expect,
-                    "{name} at {virt:#x} has the wrong permissions"
+                    .ok_or_else(|| alloc::format!("{name} at {virt:#x} is not mapped"))?;
+                case_check!(
+                    flags == expect,
+                    "{name} at {virt:#x} is {flags:?}, not the {expect:?} it was mapped with"
                 );
-                assert_eq!(
-                    virt - phys,
-                    image_offset,
-                    "{name} at {virt:#x} does not point at the image"
+                case_check!(
+                    virt - phys == image_offset,
+                    "{name} at {virt:#x} points at offset {:#x}, not the image's {image_offset:#x}",
+                    virt - phys
                 );
                 virt += PAGE_SIZE;
             }
@@ -430,11 +433,17 @@ fn check_arch(info: &BootInfo) {
         let frame = mm::alloc_frames(0).expect("out of frames");
         let (back, flags) = hal::translate(info.phys_to_virt(frame))
             .expect("the direct map is missing a frame the kernel owns");
-        assert_eq!(back, frame, "the direct map translates to the wrong frame");
-        assert_eq!(flags, MapFlags::READ | MapFlags::WRITE);
+        case_check!(
+            back == frame,
+            "the direct map translates frame {frame:#x} to {back:#x}"
+        );
+        case_check!(
+            flags == MapFlags::READ | MapFlags::WRITE,
+            "the direct map is {flags:?}, not read-write"
+        );
         mm::free_frames(frame, 0);
 
-        assert!(hal::translate(0).is_none(), "the null page is mapped");
+        case_check!(hal::translate(0).is_none(), "the null page is mapped");
         println!("direct map writable and non-executable, null page unmapped");
 
         // Kernel stack is not reclaimable.
@@ -444,8 +453,8 @@ fn check_arch(info: &BootInfo) {
             .regions()
             .iter()
             .find(|r| r.base <= stack && stack < r.end())
-            .unwrap_or_else(|| panic!("the stack at {stack:#x} is in no memory-map region"));
-        assert!(
+            .ok_or_else(|| alloc::format!("the stack at {stack:#x} is in no memory-map region"))?;
+        case_check!(
             !region.kind.is_allocatable(),
             "the kernel stack sits in {region:?}, which the frame allocator hands out"
         );
@@ -469,12 +478,12 @@ fn check_arch(info: &BootInfo) {
         let empty = hal::AddressSpace::new();
         let empty_cost = before_empty - mm::frame_stats().free;
 
-        assert_eq!(
-            mapped_cost, 4,
+        case_check!(
+            mapped_cost == 4,
             "a single user page needed {mapped_cost} tables"
         );
-        assert_eq!(
-            empty_cost, 1,
+        case_check!(
+            empty_cost == 1,
             "an empty address space needed {empty_cost} tables"
         );
 
@@ -486,59 +495,85 @@ fn check_arch(info: &BootInfo) {
         // holding interrupts off for the block is just the truth about what
         // it needs. exec_replace has the same shape and is already safe: it
         // records the task's new space before pointing CR3 at it.
-        critical_section::with(|_| {
+        //
+        // The answer comes *out* of the block rather than returning from inside
+        // it, and the kernel's own tables come back on every path: a case that
+        // left CR3 on a process's space would take the rest of the boot down with
+        // it, which is the mistake §13.14/§13.15 are the record of.
+        let in_user_space = critical_section::with(|_| -> Result<(), String> {
             space.switch();
-            assert_eq!(hal::active_root(), space.root(), "switch() did not switch");
+            case_check!(
+                hal::active_root() == space.root(),
+                "switch() did not switch: the active root is {:#x}, not {:#x}",
+                hal::active_root(),
+                space.root()
+            );
 
             let (back, flags) = hal::translate(virt).expect("the user page is not mapped");
-            assert_eq!(back, frame, "the user page points at the wrong frame");
-            assert_eq!(flags, MapFlags::READ | MapFlags::WRITE | MapFlags::USER);
+            case_check!(
+                back == frame,
+                "the user page points at {back:#x}, not {frame:#x}"
+            );
+            case_check!(
+                flags == MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+                "the user page is {flags:?}, not read-write-user"
+            );
             unsafe {
                 ptr::write_bytes(virt as *mut u8, 0x77, PAGE_SIZE);
-                assert_eq!(*(virt as *const u8), 0x77);
-                assert_eq!(*((virt + PAGE_SIZE - 1) as *const u8), 0x77);
+                case_check!(
+                    *(virt as *const u8) == 0x77 && *((virt + PAGE_SIZE - 1) as *const u8) == 0x77,
+                    "a write through the user page did not land at both ends of it"
+                );
             }
             println!("user page at {virt:#x} mapped rwu and written through");
 
             let mut shared: Vec<u8> = Vec::new();
             shared.resize(8 * 1024, 0x11);
-            assert!(
+            case_check!(
                 shared.iter().all(|&byte| byte == 0x11),
                 "the heap stopped working in a process address space"
             );
             drop(shared);
 
             empty.switch();
-            assert!(
+            case_check!(
                 hal::translate(virt).is_none(),
                 "a user page leaked between address spaces"
             );
             let text = arch::kernel_sections().text.start;
-            assert!(
+            case_check!(
                 hal::translate(text).is_some(),
                 "the kernel half was not shared with the new address space"
             );
             println!("second address space: kernel half shared, user half empty");
 
             hal::switch_to_kernel();
+            Ok(())
         });
+        case_check!(
+            hal::active_root() == hal::kernel_root(),
+            "the machine came out of the user space on {:#x}, not the kernel's own root {:#x}",
+            hal::active_root(),
+            hal::kernel_root()
+        );
+        in_user_space?;
 
         let before_teardown = mm::frame_stats().free;
         drop(empty);
         drop(space);
-        assert_eq!(
-            mm::frame_stats().free,
-            before_teardown + mapped_cost + empty_cost,
-            "an address space did not give back every table it took"
+        case_check!(
+            mm::frame_stats().free == before_teardown + mapped_cost + empty_cost,
+            "an address space did not give back every table it took: {} frames came back, {} went out",
+            mm::frame_stats().free - before_teardown,
+            mapped_cost + empty_cost
         );
         mm::free_frames(frame, 0);
         println!(
             "both address spaces torn down, {} frames returned",
             mapped_cost + empty_cost
         );
-
-        println!("M3_OK");
     }
+    Ok(())
 }
 
 // ---- sched: context switch, round-robin, preemption, sleep, priority -----
