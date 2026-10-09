@@ -323,7 +323,7 @@ fn init(info: &BootInfo) -> ! {
     // the print can let a short init run to completion - and pid 1 leaving the
     // machine prints `INIT_EXITED` and halts it, so the marker the verdict polls
     // for is never written. Measured: that is exactly what the sweep's boot did
-    // once `checks::sched`'s preemption fix landed. The lines go out through the
+    // once `sched`'s suite and its preemption case landed. The lines go out through the
     // machine's *polled* writer for the same reason the failure reports next door
     // do: `println!`'s queue can park a writer, and parking with interrupts off
     // is a deadlock.

@@ -645,9 +645,9 @@ pub fn table() -> u64 {
 /// `timer` handler does exactly this trio (`x86_64/idt.rs`), and for a while
 /// this one did only the first: nothing in the second machine's own checks
 /// noticed, because they never spawned a task that refused to yield. The shared
-/// check does (`checks::sched`'s `preempted`), and it found it on the first boot
-/// it ran here - `[0, 1, 1, 1]` where the same kernel on x86_64 records
-/// `[1, 1, 1, 0]`, i.e. a spinner that kept the core to itself for ever.
+/// check does (the kernel's `sched` suite, `preempted`), and it found it on the
+/// first boot it ran here - `[0, 1, 1, 1]` where the same kernel on x86_64
+/// records `[1, 1, 1, 0]`, i.e. a spinner that kept the core to itself for ever.
 ///
 /// `in_user` comes from the interrupted state the CPU left in `SPSR_EL1`: the
 /// mode field is `EL0t` (0) when the tick landed on a program, and anything else

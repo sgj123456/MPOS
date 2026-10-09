@@ -20,8 +20,8 @@ deliberate - a `#[cfg]` on every item inside one file would be two bodies wearin
 holds only what would have to be answered differently on a different machine: its bus or device
 tree, its UART paths, its own milestone order.
 
-The shared half is three modules, and they are separate because they answer three different kinds of
-duplication:
+The shared half is two modules and the harness, and they are separate because they answer different
+kinds of duplication:
 
 - `steps.rs` is the shared *work*. Five steps every port's `init` takes - `start_scheduler`,
   `mount_ramfs_root`, `unpack`, `arm_console`, `hand_to_init` - each carrying an ordering contract
@@ -37,9 +37,12 @@ duplication:
   `steps` because the duplication is a different kind: nothing in a report is a machine's to answer
   differently, so the whole module is one copy of functions of `BootInfo`, the scheduler and a `hal`
   register read.
-- `checks/` is the *neutral milestone checks* - the M0/M2 allocator checks, the M4 scheduler
-  scenarios, the M6/M7 dispatch-and-VFS checks and the M8 IPC checks. None of them is any machine's,
-  so they are one copy both bodies call (`NOTES.md` §13.21/§13.23).
+- `kunit.rs` is the *harness*, and the only thing here behind `--features selftest`: `SUITES` is the
+  one list of what a self-test boot checks, and `reached(phase, info)` runs the suites whose phase it
+  is. The suites themselves sit beside the modules they test - `mm`'s, `sched`'s, `vfs`'s,
+  `syscall`'s two, and the boot's own in `report` - which is what lets one read that module's private
+  state, and it is where the neutral milestone checks went (`NOTES.md` §15.19-§15.23). `checks/` no
+  longer exists.
 
 What deliberately does **not** live here: the entry, the descriptor tables, the page tables, the wire
 and the device description - those are `mpos-arch` (`NOTES.md` §14.8); the architecture-independent
@@ -54,12 +57,8 @@ the `mpos-bootinfo` leaf the loader and the kernel share (see [boot](boot.md)).
 | `src/board/x86_64.rs` | The x86_64 body: `start`, the `milestone`/`devices`/`init` callbacks, `init_mm`/`init_vfs`/`init_blk`/`init_net`/`init_virtio`, `check_arch` (M1/M3), and `handoff_to_init` (M8) |
 | `src/board/aarch64.rs` | The aarch64 body: `start`, the same three callbacks, the virtio-MMIO device discovery and its `check_*` family, `MachineWriter`, `init_net`, and the console/device verdicts (`check_dev`, `check_console_rx`, `check_serial_tx`, `check_input_registry`, `check_console_dev`, `check_gpu_dev`, `check_sound_dev`, `check_p9_dev`) |
 | `src/board/steps.rs` | The five shared steps and their ordering contracts, plus `bring_up_net`, `mount_share`, `mount_disk_root` and `register_exit_hooks` |
-| `src/board/report.rs` | `banner`, `check_boot_stack`, `park`, `report_stack_use`, `panic_context` |
-| `src/board/checks/mod.rs` | The neutral check modules' declaration and the reason they are here rather than in the library |
-| `src/board/checks/mm.rs` | `run` - the M0/M2 allocator, frame and heap checks |
-| `src/board/checks/sched.rs` | `run` and its five scenarios - the M4 scheduler checks |
-| `src/board/checks/vfs.rs` | `run` - the M6/M7 dispatch, ramfs, mount and fd-table checks |
-| `src/board/checks/ipc.rs` | `run` - the M8 pipe, tty and signal checks |
+| `src/board/report.rs` | `banner`, `check_boot_stack`, `park`, `report_stack_use`, `panic_context`, and the boot's own suite (`SUITE`: `boot.stack_depth`) |
+| `src/board/kunit.rs` | The harness for a test build: `SUITES`, the one place that lists the suites, and `reached`, which a body calls at each phase it reaches |
 
 ## Contracts
 
@@ -103,19 +102,19 @@ plumbing; `NOTES.md` §7.1c).
 
 `src/board/` contains **no `#[cfg(test)] mod tests`** - verified by reading every file under it, and
 by grepping the directory for `cfg(test)`. It is the one module whose truth is only observable on a
-booted machine, so its real pins are the milestone checks the bodies and `checks/` run:
+booted machine, so its real pins are the milestone checks the bodies and the suites run:
 
 | Pin | What it would catch |
 |---|---|
-| `docs`-neutral `checks::mm::run` → `M0_OK`, `M2_OK` | allocator, frame, buddy-merge and heap contracts |
-| `checks::sched::run` → `M4_OK` | round-robin, preemption, sleep, idle wake and priority (asserted on a run record, not a log) |
-| `checks::vfs::run` → `M6_OK`, `M7_OK` | the dispatch gate, ramfs root, a crossed mount, two tasks on one fd |
-| `checks::ipc::run` → `M8_IPC_OK` | pipes, tty line discipline, signal delivery |
+| `mm`'s suite (`frames`, `large_block`, `heap`) → `M0_OK`, `M2_OK` | allocator, frame, buddy-merge and heap contracts |
+| `sched`'s suite (`alternating` … `stacks_returned`) → `M4_OK` | round-robin, preemption, sleep, idle wake and priority (asserted on a run record, not a log) |
+| `vfs`'s suite and `syscall`'s gate cases → `M6_OK`, `M7_OK` | the dispatch gate, ramfs root, a crossed mount, two tasks on one fd |
+| `ipc`'s suite (in `src/syscall/kunit.rs`) → `M8_IPC_OK` | pipes, tty line discipline, signal delivery |
+| `report`'s suite (`stack_depth`) | the boot stack's canary once the boot's own work is done; the two production calls in the bodies cover the handoff |
 | x86_64 `check_arch` → `M1_OK`, `M3_OK` | clock/`int3`, the register-file ABI agreement, W^X and user address spaces |
 | x86_64 `handoff_to_init` → `M8_OK` | `/init` runs as pid 1, forks, execs a shell |
 | aarch64 `check_virtio`/`check_rng`/`check_blk`/`check_fs`/`check_net`/`check_input`/`check_console`/`check_sound`/`check_vsock`/`check_p9` → `M5_*`/`M7_*`/`M8_*` | the MMIO device classes, each failing by name and halting |
 | aarch64 `check_dev`/`check_console_rx`/`check_serial_tx`/`check_input_registry`/`check_console_dev`/`check_gpu_dev`/`check_sound_dev`/`check_p9_dev` | the mounted `/dev`, the console RX/TX paths, the registry and the device nodes - and the two console ones are *test-build-only* now (`#[cfg(feature = "selftest")]`), because the harness was their only caller |
-| `report::check_boot_stack` | the boot stack's canary at the two deepest points |
 
 Two honest caveats, both from the code. First, whether a machine runs its checks at all is now
 decided by which *image* was built (`--features selftest`, `src/board/kunit.rs`) rather than by a word
