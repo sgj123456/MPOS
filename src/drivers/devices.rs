@@ -293,9 +293,8 @@ pub fn standard_devfs() -> Arc<DevFs> {
     // *name* is the interface - `/dev/hwrng` is the entropy pipe on either bus -
     // and a driver that never came up is simply not in the list, so a node for a
     // device this machine does not have is never created.
-    let publishers = critical_section::with(|cs| -> Vec<Publisher> {
-        PUBLISHERS.borrow(cs).borrow().to_vec()
-    });
+    let publishers =
+        critical_section::with(|cs| -> Vec<Publisher> { PUBLISHERS.borrow(cs).borrow().to_vec() });
     for publisher in publishers {
         (publisher.nodes)(&dev);
     }

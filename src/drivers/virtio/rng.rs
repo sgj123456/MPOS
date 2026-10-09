@@ -30,10 +30,10 @@ use virtio_drivers::transport::Transport;
 
 use super::EntropySource;
 use super::hal::HalImpl;
-use crate::vfs::VfsResult;
-use crate::vfs::devfs::{CharDevice, DevFs};
 #[cfg(target_arch = "x86_64")]
 use super::hal::transport;
+use crate::vfs::VfsResult;
+use crate::vfs::devfs::{CharDevice, DevFs};
 
 /// The transitional device ID; a modern-only device answers 0x1045 instead.
 /// It names the PCI vendor's ID range, so it is read only by the first
