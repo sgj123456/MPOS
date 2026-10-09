@@ -131,11 +131,18 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
       driver — so a new device does not edit the builder and a probe's answer, not the builder's
       guess, decides whether a node exists (§7.5)
 
-- [~] configuration space over MMIO (ECAM/MMCONFIG) with the 0xcf8/0xcfc pair as the
-      fallback: the ACPI reader is in (`crates/acpi`), the loader hands the kernel the root
-      pointer, and the boot now reports the window it found — `0xe0000000`, buses 0..=255 on
-      this host. What is left is the switch itself: a per-bus mapping rather than 256 MiB at
-      once, and the check that both mechanisms agree (§7.6)
+- [x] configuration space over MMIO (ECAM/MMCONFIG), the 0xcf8/0xcfc pair as the fallback:
+      `crates/acpi` reads what the firmware names, the loader hands the kernel the root
+      pointer, and `drivers::pci` maps the window one bus at a time and reads the bus
+      through it — but only after walking the bus *both* ways and comparing the two
+      snapshots function by function, so a window this machine's ports disagree with is
+      refused and the ports stay (§7.6a)
+
+- [ ] **the window's other 3840 bytes**: a function's configuration space is 4 KiB and this
+      kernel still publishes 256 — the port mechanism's reach, `CFG_SIZE` — so PCIe extended
+      capabilities are outside every reader. Not joined to the item above on purpose: it
+      changes the size of a `/sys` file, and the window is what makes it *possible* rather
+      than what makes it right (§7.6a)
 
 **Wayland compositor (weston) support** — the cross-cutting work a rootful
 compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of

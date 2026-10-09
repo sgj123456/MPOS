@@ -3637,7 +3637,7 @@ the `drivers` module. The aarch64 boot check that resolves `/dev/hwrng` and `/de
 mounted tree (`check_dev`, `M7_DEV_OK`) is the end-to-end evidence that the driver-published nodes
 are the ones userland sees.
 
-### 7.6 Configuration space over MMIO: what the firmware names, and the reserved word that hid it — **DISCOVERY LANDED**
+### 7.6 Configuration space over MMIO: what the firmware names, and the reserved word that hid it — **LANDED**
 
 x86_64 reads configuration space through the 0xcf8/0xcfc port pair (mechanism 1), which
 reaches 256 bytes per function - the address register has eight bits of offset - so a
@@ -3680,13 +3680,96 @@ checksum is over the whole table - so `crates/acpi` grew a `declared_length` doo
 says what the header claims *without* validating it, and `pci::read_table` reads the
 length, then the table, then validates the whole of it.
 
-**What is deliberately not done, and why it is a step with a size.** The window is *named*
-and not yet *used*. Switching reads to it means mapping it, and this machine's MCFG covers
-256 buses - **256 MiB of address space**. Mapping that eagerly, for a walk that touches two
-or three buses, is the wrong trade; the next step is a per-bus mapping (1 MiB on demand),
-an equivalence check that ECAM and mechanism 1 answer the same for the same function before
-the switch is trusted, and mechanism 1 kept as the fallback for a machine whose firmware
-names no window at all.
+**What was deliberately left for the next slice, and why it was a step with a size.** With
+the tables read, the window was *named* and not yet *used*. Switching reads to it means
+mapping it, and this machine's MCFG covers 256 buses - **256 MiB of address space**. Mapping
+that eagerly, for a walk that touches two or three buses, is the wrong trade; the next step
+was a per-bus mapping (1 MiB on demand), an equivalence check that ECAM and mechanism 1
+answer the same for the same function before the switch is trusted, and mechanism 1 kept as
+the fallback for a machine whose firmware names no window at all. It is §7.6a, immediately
+below.
+
+### 7.6a The switch itself: mapped a bus at a time, and trusted only after both mechanisms agreed — **LANDED**
+
+The three pieces the paragraph above named are in, and the shape they took is worth
+recording because two of them are not the obvious ones.
+
+**One address, two mechanisms.** `drivers::pci`'s six accessors (`read8`/`read16`/`read32`
+and their writers) are now a dispatch rather than a port pair: they ask a window for the
+register's kernel-half address and fall back to the ports when there is none
+(`window_byte` → `slice`). The port bodies are the same code they were, renamed
+(`port_read32`/`port_write32`/…), and every caller above - `config_read`/`config_write`,
+`Func`, `read_function`, `read_bars`, `scan_bus`, and through them `virtio`'s
+`PciTransport` and the `config` files under `/sys` and `/proc` - is unchanged, because the
+mechanism is not its business. The masks are load-bearing and identical either way:
+`off & 0xfc` for a dword, `& 0xfe` for a word, nothing for a byte, so "which mechanism read
+this" cannot change which bytes were touched.
+
+**A bus at a time.** `slice(bus)` maps that bus's mebibyte on the first access to it, into
+this machine's MMIO window (`hal::map_mmio_window`), and remembers where in a table indexed
+by bus number - `[usize; 256]`, with zero meaning "not yet mapped", which is unambiguous
+rather than a convention because no mapping this machine hands out is ever at address zero.
+A slice is never handed back: the bus is walked for the machine's life and a driver probing
+an hour later asks for the same one. The map itself happens *outside* the critical section
+that reads the table, because mapping allocates frames and writes page tables and that is
+not work to do with interrupts off. The two steps cannot disagree: `slice` is the only
+writer of a window's `slices`, `use_window` and `use_ports` run at most once each and only
+at boot, and a task preempted between them could only find the entry still zero and map the
+same bytes a second time. A window that does not cover a bus, or a machine with no room left
+for a mapping, answers `None` and that access goes through the ports - the honest refusal
+rather than an address nothing answers for.
+
+**The check, and why it is a check rather than a preference.** `init` walks the bus over the
+ports *first* - the mechanism that asks nothing of the firmware, and therefore the one known
+to work - and, if the firmware named a window, walks it again through the window and
+compares the two `Vec<Device>`s, which compare element for element because the model already
+derives `PartialEq` (`crates/pci`). Equal: the window is kept, and from then on discovery
+and the `config` files read memory. Different: `first_difference` names the first function
+the two walks disagreed about (or says that they did not even find the same *number* of
+them), the ports are put back, and the boot log says so. A window that starts above bus 0 is
+refused for a sharper reason than "it cannot serve the walk": the check would be *vacuous*.
+`enumerate` walks from bus 0, so every access on it would fall back to the ports, the two
+snapshots would agree by construction, and the boot would claim a window it never read a byte
+through - the one failure mode a check like this must not have. That is also why
+the `Ecam` struct this module used to keep is **gone**: `discover_ecam` now returns
+`crate::acpi::EcamRange` itself, so "does the window cover this bus" and "where is that bus's
+slice" are answered by the host-tested crate instead of by a kernel-side copy of the same
+four fields.
+
+Making the layout one definition rather than two is `crates/acpi`'s new `function_offset`
+(device and function bits inside a bus's mebibyte), which `EcamRange::offset` is now the bus
+term plus - so a kernel mapping one bus at a time and a reader walking the whole window
+cannot drift, and a window that does not start at bus zero is the case that would have
+shown it. Host test: `a_bus_slice_and_a_whole_window_are_the_same_layout`; the fuzz target
+reaches it through `EcamRange::offset`.
+
+**Measured.** On the sweep's own machine, in its boot log:
+
+    pci: MCFG names ECAM at 0xe0000000, segment 0, buses 0..=255, 256 MiB
+    pci: ECAM and the port pair agree on all 14 functions; configuration space is over MMIO
+    pci: 14 functions enumerated
+
+and then the whole sweep through the switched mechanism: x86_64 `cargo xtask test`
+`=== SUMMARY pass=160 fail=0 (160 built)` with QEMU exit 33 - which is the evidence that
+matters, because every driver in it (virtio over `PciTransport`, AHCI, the GPU and its
+DRM card) probed its device through the window. aarch64 is untouched: `drivers::pci` is
+x86_64's module, and that arm's `pass=143 fail=0` stands. Host tests `mpos-acpi` 14 → 15.
+`cargo xtask depgraph` within the ratchet (the switch adds no module edge: `drivers::pci`
+already called `hal` and `acpi`).
+
+**A rustfmt catch-up rode along, and it is named rather than hidden.** `cargo fmt --check`
+was red at `HEAD`: the two previous commits had landed unformatted code
+(`EcamRange::offset`'s over-long signature line, and two spots in `drivers::devices`'s new
+`Publisher` drain and `virtio/rng.rs`'s import order). The first two are in files this slice
+touches anyway; the last two are their own commit, because a formatter pass and a mechanism
+switch have no common *why* (`AGENTS.md` §3's one-intent rule).
+
+**What is still open, and it is a size rather than a smell.** A function's configuration
+space is 4 KiB and this kernel still publishes `CFG_SIZE` = 256 - the *port* mechanism's
+reach - so PCIe extended capabilities are outside every reader even now that the window
+could reach them. Deliberately not joined to this one: a `/sys/.../config` file's size would
+start depending on which mechanism the firmware named, and "the window makes it possible" is
+not "the window makes it right". It is a `docs/ROADMAP.md` item of its own.
 
 ## Phase 8: Security Hardening (Low Priority)
 

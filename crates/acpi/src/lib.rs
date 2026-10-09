@@ -15,7 +15,10 @@
 //! (or MMCONFIG) and prefers it, because mechanism 1's address register has
 //! eight bits of offset - 256 bytes per function, no PCIe extended
 //! capabilities - while a memory window reaches all 4 KiB. Reading MCFG is
-//! therefore what "enumerate over MMIO, ports as the fallback" starts with.
+//! therefore what "enumerate over MMIO, ports as the fallback" starts with, and
+//! [`function_offset`] is the layout both spellings of "where is this function"
+//! are computed from: the window-relative one ([`EcamRange::offset`]) and the
+//! bus-relative one a kernel needs when it maps the window a bus at a time.
 //!
 //! Why this is its own crate: nothing in it can fail at boot for a reason a
 //! host test cannot reproduce. Every question it answers - is this a root
@@ -143,12 +146,13 @@ pub struct SdtHeader {
 ///
 /// This exists because of the order a reader has to work in when the table is in
 /// memory it cannot read at once: the header says how long the table is, and the
-/// rest of the header's validation - the checksum, the length against the buffer
-/// - cannot happen until that many bytes are in hand. [`parse_header`] is the
-/// validating door and this is not: a caller reads the first
-/// [`SDT_HEADER_LEN`] bytes, asks this how much more there is, reads that much,
-/// and then calls [`parse_header`] on the whole of it. A caller that trusted
-/// this instead of validating would be believing a number the firmware wrote.
+/// rest of the header's validation - the checksum, and the length against the
+/// buffer that arrived - cannot happen until that many bytes are in hand.
+/// [`parse_header`] is the validating door and this is not: a caller reads the
+/// first [`SDT_HEADER_LEN`] bytes, asks this how much more there is, reads that
+/// much, and then calls [`parse_header`] on the whole of it. A caller that
+/// trusted this instead of validating would be believing a number the firmware
+/// wrote.
 pub fn declared_length(bytes: &[u8]) -> Option<u32> {
     if bytes.len() < SDT_HEADER_LEN {
         return None;
@@ -203,6 +207,23 @@ pub fn table_entries(body: &[u8], wide: bool) -> Vec<u64> {
     out
 }
 
+/// Where one function's 4 KiB of configuration space starts inside *one bus's*
+/// mebibyte of a window.
+///
+/// The layout is ECAM's and nothing else: 15 bits of device (its five, shifted
+/// past the function's three), then three of function, then the 12-bit register
+/// offset a caller adds. It is a door of its own rather than a piece of
+/// [`EcamRange::offset`] because a kernel maps the window a bus at a time and so
+/// needs the *within-bus* half without a bus term - and writing the layout down
+/// twice is how the two spellings would drift. [`EcamRange::offset`] is the bus
+/// term plus this.
+pub fn function_offset(device: u8, function: u8) -> Option<u64> {
+    if device > 31 || function > 7 {
+        return None;
+    }
+    Some(((device as u64) << 15) | ((function as u64) << 12))
+}
+
 /// One memory-mapped configuration window, as MCFG describes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EcamRange {
@@ -231,19 +252,14 @@ impl EcamRange {
     /// Where one function's 4 KiB of configuration space starts, inside the
     /// window - or `None` for a bus the window does not cover.
     ///
-    /// The arithmetic is the ECAM layout and nothing else: 20 bits of bus, then
-    /// three of device, then three of function, then the 12-bit register offset
-    /// a caller adds.
+    /// The arithmetic is the ECAM layout and nothing else: the bus's place in the
+    /// window, then [`function_offset`]'s device and function bits, then the
+    /// 12-bit register offset a caller adds.
     pub fn offset(&self, bus: u8, device: u8, function: u8) -> Option<u64> {
-        if self.is_empty() || bus < self.start_bus || bus > self.end_bus || device > 31 || function > 7
-        {
+        if self.is_empty() || bus < self.start_bus || bus > self.end_bus {
             return None;
         }
-        Some(
-            ((bus - self.start_bus) as u64) << 20
-                | (device as u64) << 15
-                | (function as u64) << 12,
-        )
+        Some(((bus - self.start_bus) as u64) << 20 | function_offset(device, function)?)
     }
 }
 
@@ -332,7 +348,9 @@ mod tests {
         out[16..20].copy_from_slice(&rsdt.to_le_bytes());
         out[20..24].copy_from_slice(&(RSDP_V2_LEN as u32).to_le_bytes());
         out[24..32].copy_from_slice(&xsdt.to_le_bytes());
-        let sum = out[..RSDP_V1_LEN].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+        let sum = out[..RSDP_V1_LEN]
+            .iter()
+            .fold(0u8, |a, b| a.wrapping_add(*b));
         out[8] = 0u8.wrapping_sub(sum);
         let sum = out.iter().fold(0u8, |a, b| a.wrapping_add(*b));
         out[32] = 0u8.wrapping_sub(sum);
@@ -380,7 +398,10 @@ mod tests {
         // The first 36 bytes are enough for the length and not enough for the
         // checksum over the whole table - which is exactly the staged read a
         // caller does, and why this door does not validate.
-        assert_eq!(declared_length(&bytes[..SDT_HEADER_LEN]), Some(bytes.len() as u32));
+        assert_eq!(
+            declared_length(&bytes[..SDT_HEADER_LEN]),
+            Some(bytes.len() as u32)
+        );
         assert!(parse_header(&bytes[..SDT_HEADER_LEN]).is_none());
         assert_eq!(declared_length(&[0u8; 8]), None);
     }
@@ -437,7 +458,10 @@ mod tests {
     /// "base 0, buses 0..=224".
     #[test]
     fn the_reserved_word_is_not_read_as_an_entry() {
-        let bytes = table(MCFG_SIGNATURE, &mcfg_body(&[mcfg_entry(0xe000_0000, 0, 0, 255)]));
+        let bytes = table(
+            MCFG_SIGNATURE,
+            &mcfg_body(&[mcfg_entry(0xe000_0000, 0, 0, 255)]),
+        );
         let ranges = parse_mcfg(&bytes);
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].base, 0xe000_0000);
@@ -457,7 +481,10 @@ mod tests {
         assert_eq!(range.offset(0, 0, 0), Some(0));
         assert_eq!(range.offset(0, 1, 0), Some(0x8000));
         assert_eq!(range.offset(1, 0, 0), Some(ECAM_BUS_BYTES));
-        assert_eq!(range.offset(2, 3, 4), Some(2 * ECAM_BUS_BYTES + 3 * 0x8000 + 4 * 0x1000));
+        assert_eq!(
+            range.offset(2, 3, 4),
+            Some(2 * ECAM_BUS_BYTES + 3 * 0x8000 + 4 * 0x1000)
+        );
         // A bus the window does not cover has no offset inside it, and neither
         // does a device or function number the layout cannot spell.
         assert_eq!(range.offset(255, 31, 7).map(|_| ()), Some(()));
@@ -472,6 +499,38 @@ mod tests {
         assert_eq!(narrow.offset(3, 0, 0), None, "below the window");
         assert_eq!(narrow.offset(8, 0, 0), None, "above the window");
         assert_eq!(narrow.offset(4, 0, 0), Some(0));
+    }
+
+    /// The within-bus spelling and the whole-window one are one layout, which is
+    /// the whole reason `function_offset` exists: a kernel that maps one bus at a
+    /// time computes `slice + function_offset(dev, func) + register` where a
+    /// reader that mapped the whole window computes `range.offset(bus, dev, func)
+    /// + register`, and the two must be the same address.
+    #[test]
+    fn a_bus_slice_and_a_whole_window_are_the_same_layout() {
+        assert_eq!(function_offset(0, 0), Some(0));
+        assert_eq!(function_offset(1, 0), Some(0x8000), "a device is 32 KiB");
+        assert_eq!(function_offset(0, 1), Some(0x1000), "a function is 4 KiB");
+        assert_eq!(function_offset(3, 4), Some(3 * 0x8000 + 4 * 0x1000));
+        assert_eq!(function_offset(32, 0), None, "no such device");
+        assert_eq!(function_offset(0, 8), None, "no such function");
+        // A window that does not start at bus zero is where the two spellings
+        // would drift if the bus term were written down in two places.
+        let range = EcamRange {
+            base: 0xb000_0000,
+            segment: 0,
+            start_bus: 3,
+            end_bus: 5,
+        };
+        for bus in range.start_bus..=range.end_bus {
+            assert_eq!(
+                range.offset(bus, 31, 7),
+                Some(
+                    (bus - range.start_bus) as u64 * ECAM_BUS_BYTES
+                        + function_offset(31, 7).expect("the last function")
+                )
+            );
+        }
     }
 
     #[test]
@@ -492,7 +551,10 @@ mod tests {
         body[0..8].copy_from_slice(&0x1000u64.to_le_bytes());
         body[8..16].copy_from_slice(&0x1_0000_0000_0000u64.to_le_bytes());
         body[16..24].copy_from_slice(&0x3000u64.to_le_bytes());
-        assert_eq!(table_entries(&body, true), vec![0x1000, 0x1_0000_0000_0000, 0x3000]);
+        assert_eq!(
+            table_entries(&body, true),
+            vec![0x1000, 0x1_0000_0000_0000, 0x3000]
+        );
         // The 32-bit root is the same body read four bytes at a time, which is
         // why the width is a parameter and not a second function - and why the
         // width *matters*: the address above 4 GiB is not representable there,

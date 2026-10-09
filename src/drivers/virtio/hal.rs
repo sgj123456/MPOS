@@ -88,12 +88,14 @@ mod pci_transport {
 
     use crate::drivers::pci;
 
-    /// PCI configuration space, through the I/O ports this kernel already speaks.
+    /// PCI configuration space, through whatever mechanism the kernel chose.
     ///
     /// The crate ships an MMIO implementation for the enhanced configuration
-    /// mechanism, and none for the port-based one that every x86_64 machine has
-    /// and that this kernel's PCI layer was already built on - so this is the
-    /// dozen lines that let the crate's PCI transport use it.
+    /// mechanism, and none for the port-based one that every x86_64 machine has -
+    /// so this is the dozen lines that let the crate's PCI transport use it, over
+    /// `drivers::pci`'s four accessors. Which of the two mechanisms those reach is
+    /// `drivers::pci`'s decision, made once at boot and checked against the other
+    /// one there (`docs/NOTES.md` §7.6); nothing here learns which answered.
     pub struct IoCam;
 
     impl ConfigurationAccess for IoCam {

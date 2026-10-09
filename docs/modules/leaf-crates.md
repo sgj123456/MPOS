@@ -57,7 +57,7 @@ and the same shape for the others), so the extraction moved no call site's spell
 | `gpu/` | `mpos-gpu` | the GPU's pure half: the virtio-gpu wire ABI, the two DRM blobs (`blob.rs`), the cursor blend, the sync-object state machine and `sync::Waker` | `err`, `bitflags`, `virtio-drivers`, `critical-section` |
 | `evdev/` | `mpos-evdev` | the evdev record window and its clients — who reads which record, and what a grab hides; the waiter is an opaque `WaiterId` | — |
 | `uinput/` | `mpos-uinput` | `/dev/uinput`'s ABI: the request vocabulary (`nr_of`), the bitmap rules, the `struct uinput_setup` layout | `evdev` |
-| `mpos-acpi` | ACPI tables: the root pointer (both checksums), an SDT header validated against the bytes that arrived, the RSDT/XSDT walk, and MCFG's memory-mapped configuration windows down to the per-function offset. Fourteen host tests; `fuzz/acpi_tables`. Read by `drivers::pci` to find the ECAM window |
+| `acpi/` | `mpos-acpi` | ACPI tables: the root pointer (both checksums), an SDT header validated against the bytes that arrived, the RSDT/XSDT walk, and MCFG's memory-mapped configuration windows — the window-relative offset (`EcamRange::offset`) and the bus-relative half a kernel needs when it maps the window a bus at a time (`function_offset`), from one definition of the layout. `fuzz/acpi_tables`. Read by `drivers::pci`, first to find the window and then to read the bus through it | — |
 | `fdt/` | `mpos-fdt` | flattened device trees: a blob in, names and numbers out — a walk over the caller's bytes | — |
 
 The intra-directory edges are the whole set the leaves are allowed: `abi → err`,
