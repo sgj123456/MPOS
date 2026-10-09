@@ -4108,7 +4108,21 @@ fn set_object_prop(st: &mut DrmState, obj: u32, prop_id: u32, value: u64) -> isi
             }
             st.crtc_active = value != 0
         }
-        (CRTC_ID, PROP_MODE_ID) => st.crtc_mode_id = value as u32,
+        // The CRTC's mode, as a blob id - and the value is judged by the *same*
+        // test the commit path judges it by ([`mode_fits`], at the top of
+        // `mode_atomic`), so the two doors cannot disagree about what a mode is.
+        // They did: a commit naming a blob that holds no mode is `EINVAL`, while
+        // this door recorded any number at all, so a caller could write an id
+        // naming nothing and then read it back as the CRTC's current mode - a
+        // value the card had just called its own state and one `GETPROPBLOB`
+        // answers `EINVAL` for (`SETPROPERTY` and `OBJ_SETPROPERTY` being one
+        // handler is not enough; sharing the *test* is what makes them agree).
+        (CRTC_ID, PROP_MODE_ID) => {
+            if value != 0 && !mode_fits(st, value as u32) {
+                return libc_einval();
+            }
+            st.crtc_mode_id = value as u32
+        }
         // The one connector property that is settable and has a range. A value
         // the range does not hold is refused rather than accepted, which is
         // what makes the one-value range mean something: `max bpc` 16 here is

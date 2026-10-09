@@ -3521,7 +3521,19 @@ reports.
 > construction - which makes the value state rather than a mode, the same honesty
 > `DPMS` and `ACTIVE` have.
 >
-> Pinned by `t-drm-props`. One doc-only fix rides with it: `DRM_CAP_CURSOR_WIDTH`'s
+> The same audit found the two *doors* disagreeing about one property: `MODE_ID`
+> is a blob id, and the commit path has always refused one this card cannot show
+> (`mode_fits`) - while `SETPROPERTY`/`OBJ_SETPROPERTY` recorded any number at all,
+> so a caller could write an id naming nothing and read it back as the CRTC's
+> current mode. That is the shape this file already warns about in the other
+> direction ("a property settable through one and refused by the other is a client
+> that read the property list and still cannot write what it read"), and the fix is
+> not to share the handler - that was already true - but to share the *test*: the
+> write arm now asks `mode_fits`.
+>
+> All three are pinned by `t-drm-props` - which reads the card's own mode from
+> `GETCONNECTOR` and stores it as the blob `MODE_ID` names rather than assuming what
+> a mode is. One doc-only fix rides with them: `DRM_CAP_CURSOR_WIDTH`'s
 > note said "this card has no cursor plane, so nothing here consumes the size",
 > which the cursor plane's landing had made false - and a stale premise is worse
 > than a stale number, because it is the sentence a reader trusts. The cap and the

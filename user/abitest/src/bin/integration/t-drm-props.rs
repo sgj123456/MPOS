@@ -36,6 +36,7 @@ const NR_SET_CLIENT_CAP: usize = 0x0d;
 const NR_GETCONNECTOR: usize = 0xa7;
 const NR_GETPROPERTY: usize = 0xaa;
 const NR_GETPROPBLOB: usize = 0xac;
+const NR_CREATE_BLOB: usize = 0xbd;
 const NR_DESTROY_BLOB: usize = 0xbe;
 const NR_GETPLANE: usize = 0xb6;
 const NR_MODE_CURSOR2: usize = 0xbb;
@@ -719,6 +720,97 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize);
         }
         None => lin::check_true(&mut failed, b"the CRTC has ACTIVE", false),
+    }
+
+    // --- MODE_ID, and the two doors agreeing about what a mode is ----------------------
+    // `MODE_ID` is a blob id, and the *commit* path refuses one this card cannot
+    // show (the same `mode_fits` the write path now uses). This door recorded any
+    // number at all, so a caller could write an id naming nothing and read it back
+    // as the CRTC's current mode - a value the card had just called its own state,
+    // and one `GETPROPBLOB` answers `EINVAL` for.
+    //
+    // The mode to name is the card's *own*, read rather than assumed: a real
+    // card's `MODE_ID` is a blob holding the mode its connector advertises.
+    let mut mode = [0u8; 68];
+    let mut conn_mode = [0u8; 80];
+    put64(&mut conn_mode, 8, mode.as_mut_ptr() as usize as u64);
+    put32(&mut conn_mode, 32, 1);
+    put32(&mut conn_mode, 48, CONNECTOR_ID);
+    lin::check_eq(
+        &mut failed,
+        b"the connector hands back its mode",
+        lin::ioctl(
+            fd,
+            ioc_d(NR_GETCONNECTOR, 80),
+            conn_mode.as_mut_ptr() as usize,
+        ),
+        0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"one mode, which the blob below is made of",
+        get32(&conn_mode, 32) as isize,
+        1,
+    );
+    let mut blob_arg = [0u8; 24];
+    put64(&mut blob_arg, 0, mode.as_ptr() as usize as u64);
+    put32(&mut blob_arg, 8, 68);
+    lin::check_eq(
+        &mut failed,
+        b"and it can be stored as a blob",
+        lin::ioctl(
+            fd,
+            ioc_d(NR_CREATE_BLOB, 24),
+            blob_arg.as_mut_ptr() as usize,
+        ),
+        0,
+    );
+    let mode_blob = get32(&blob_arg, 12);
+    lin::check_true(&mut failed, b"with an id", mode_blob != 0);
+
+    match property_id(fd, CRTC_ID, OBJECT_CRTC, b"MODE_ID") {
+        Some((id, _)) => {
+            let mut arg = [0u8; 24];
+            put32(&mut arg, 8, id);
+            put32(&mut arg, 12, CRTC_ID);
+            put32(&mut arg, 16, OBJECT_CRTC);
+            // An id naming nothing: what the commit path already refuses, and so
+            // what this door must refuse too.
+            put64(&mut arg, 0, 0xdead_beef);
+            lin::check_eq(
+                &mut failed,
+                b"a mode id naming no blob is refused",
+                lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize),
+                EINVAL,
+            );
+            // The card's own mode, which it has just handed out.
+            put64(&mut arg, 0, mode_blob as u64);
+            lin::check_eq(
+                &mut failed,
+                b"while the card's own mode is taken",
+                lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize),
+                0,
+            );
+            let (_, back) = property_id(fd, CRTC_ID, OBJECT_CRTC, b"MODE_ID")
+                .expect("the property is still in the CRTC's list");
+            lin::check_eq(
+                &mut failed,
+                b"and reads back as that id",
+                back as isize,
+                mode_blob as isize,
+            );
+            // 0 is "no mode", which is always allowed - the shape `FB_ID` 0 has
+            // on the cursor plane, and what a CRTC that has been turned off
+            // reports.
+            put64(&mut arg, 0, 0);
+            lin::check_eq(
+                &mut failed,
+                b"as is 0, which is no mode at all",
+                lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize),
+                0,
+            );
+        }
+        None => lin::check_true(&mut failed, b"the CRTC has MODE_ID", false),
     }
 
     // --- the cursor plane's type, and where the pointer is -----------------------------
