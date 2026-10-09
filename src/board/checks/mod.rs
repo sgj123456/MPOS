@@ -13,13 +13,14 @@
 //! device probes for its bus.
 
 pub(crate) mod ipc;
-pub(crate) mod mm;
 pub(crate) mod sched;
 pub(crate) mod vfs;
 
 // ---------------------------------------------------------------------------
 // The families, as the harness's cases
 // ---------------------------------------------------------------------------
+
+use alloc::string::String;
 
 use mpos::boot::BootInfo;
 
@@ -33,29 +34,24 @@ use super::report;
 /// panic ends the machine and hides every case after it (`src/board/kunit.rs`
 /// argues both halves). Until then a failing family still takes the boot down
 /// with the `assert!` that failed in the log, which is what it did before.
-pub(crate) fn case_mm(info: &BootInfo) -> Result<(), &'static str> {
-    mm::run(info);
-    Ok(())
-}
-
-pub(crate) fn case_sched(_info: &BootInfo) -> Result<(), &'static str> {
+pub(crate) fn case_sched(_info: &BootInfo) -> Result<(), String> {
     sched::run();
     Ok(())
 }
 
-pub(crate) fn case_vfs(_info: &BootInfo) -> Result<(), &'static str> {
+pub(crate) fn case_vfs(_info: &BootInfo) -> Result<(), String> {
     vfs::run();
     Ok(())
 }
 
-pub(crate) fn case_ipc(_info: &BootInfo) -> Result<(), &'static str> {
+pub(crate) fn case_ipc(_info: &BootInfo) -> Result<(), String> {
     ipc::run();
     Ok(())
 }
 
 /// The boot stack's canary, which is a check *of the boot* rather than of a
 /// subsystem: it is the deepest the boot stack ever gets that is measured here.
-pub(crate) fn case_boot_stack(info: &BootInfo) -> Result<(), &'static str> {
+pub(crate) fn case_boot_stack(info: &BootInfo) -> Result<(), String> {
     report::check_boot_stack(info, "after the self-tests");
     Ok(())
 }

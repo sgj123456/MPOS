@@ -195,6 +195,16 @@ pub use mpos_gpu as gpu;
 /// machine-shaped, and it never was.
 #[cfg(target_os = "none")]
 pub mod kernel_services;
+/// The vocabulary the boot's self-tests are written in: [`kunit::Phase`],
+/// [`kunit::Suite`], [`kunit::Case`], and the `case_check!` a case answers through.
+///
+/// It lives in the library because both sides need it - the suites are `const`s
+/// beside the modules they test (so `mm`'s can read `mm`'s private state), and the
+/// harness that runs them is in the wiring layer - and it is compiled only into a
+/// test build (`--features selftest`), so a production kernel has neither this nor
+/// any suite (`docs/NOTES.md` §15.20).
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub mod kunit;
 pub mod logging;
 pub mod mm;
 /// The network stack, and the socket syscalls over it. Host builds skip it:

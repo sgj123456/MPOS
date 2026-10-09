@@ -24,6 +24,10 @@
 //! came back zeroed. The loader does both of those now, which is why x86_64's
 //! entry has neither and why this one no longer does.
 
+// The two console suites are the only thing here that answers a `String`, and
+// they are in the test build alone - so the import is too.
+#[cfg(feature = "selftest")]
+use alloc::string::String;
 use core::fmt;
 
 use super::report;
@@ -1743,14 +1747,14 @@ fn check_serial_tx() {
 /// harness's contract is to answer a reason (`src/board/kunit.rs` argues why the
 /// kernel cannot catch a panic, which is what makes this the next slice's work).
 #[cfg(feature = "selftest")]
-pub(crate) fn suite_console_tx(_info: &BootInfo) -> Result<(), &'static str> {
+pub(crate) fn suite_console_tx(_info: &BootInfo) -> Result<(), String> {
     check_serial_tx();
     Ok(())
 }
 
 /// `check_console_rx`, as the harness's case. See [`suite_console_tx`].
 #[cfg(feature = "selftest")]
-pub(crate) fn suite_console_input(_info: &BootInfo) -> Result<(), &'static str> {
+pub(crate) fn suite_console_input(_info: &BootInfo) -> Result<(), String> {
     check_console_rx();
     Ok(())
 }

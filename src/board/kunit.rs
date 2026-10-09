@@ -1,102 +1,46 @@
-//! The boot's self-tests, as suites of named cases.
+//! The harness that runs the boot's self-tests, and the one place that lists them.
 //!
-//! This is the harness the boot calls into, and it exists only in a test build:
-//! the module is behind `--features selftest`, and so is every call site in the
-//! two bodies. A production kernel compiles none of it and contains none of the
-//! check code it names - which is the property the whole arrangement is for, and
-//! the one a `--cfg` could not have expressed here (setting `RUSTFLAGS` replaces
-//! `.cargo/config.toml`'s `[target.*] rustflags` rather than adding to them, so a
-//! test build carrying a `--cfg` would lose the linker script and every `mpos_*`
-//! capability flag; measured, and `docs/NOTES.md` §15.19 records it).
+//! The *vocabulary* is the library's (`mpos::kunit`): a suite is a `const` beside
+//! the module it tests, so that `mm`'s can read `mm`'s private state, and this file
+//! only assembles the list and drives it. That split is what let the suites move
+//! into their modules without a registry: a `Suite` is a name, a phase and a slice
+//! of cases, so `SUITES` below can name another module's `const` directly.
 //!
-//! # Why a case is a value and not a panic
+//! This whole module exists only in a test build. The module is behind
+//! `--features selftest`, and so is every call site in the two bodies, so a kernel
+//! that ships compiles neither the suites nor this (`docs/NOTES.md` §15.20 says why
+//! the switch is a cargo feature rather than a `--cfg`).
 //!
-//! A case answers `Result<(), &'static str>`. That is not style: the kernel is
-//! `panic = "abort"`, so a case that asserted would end the machine and hide
-//! every case after it - and the first thing a test system has to be able to do
-//! is report *all* of what is broken. The cases that still panic are the ones not
-//! yet split: each of the four families below is one chain of assertions today,
-//! and turning that chain into named cases is the next slice's work rather than
-//! this one's.
-//!
-//! # Why the boot says *when*
-//!
-//! A suite runs at the boot step it needs, and the name of the step is the
-//! prerequisite rather than a position: `checks::mm` runs after the heap comes up
-//! on one machine and before the scheduler starts on the other, and both are
-//! [`Phase::Heap`] because that is what the suite needs. The alternative - run
-//! everything at one point just before the handoff - is what a unit-test suite
-//! usually does, and it is not open here: `checks::mm` asserts increments on a
-//! *fresh* heap and `checks::vfs` needs the bootstrap root mounted, so moving them
-//! later would mean re-measuring every assertion against a machine that has
-//! already been used. That is a test redesign, not a refactor, and it belongs to
-//! whoever decides the assertions should be weaker than they are.
+//! A failing case does **not** stop the boot. The kernel's suites and the user
+//! programs the sweep runs afterwards are the two halves of one gate, and ending
+//! the machine at the first bad case would trade the second half's evidence - a
+//! hundred programs' worth - for a tidier log. The harness's own line is the
+//! verdict, and `xtask` asserts it beside the sweep's summary
+//! (`xtask/src/selftest.rs`).
 
 use mpos::boot::BootInfo;
+// Re-exported so a body's call site reads `kunit::reached(kunit::Phase::Heap, …)`
+// and names the harness it is talking to, rather than reaching past it into the
+// library for the vocabulary.
+pub(crate) use mpos::kunit::{Case, Phase, Suite};
 use mpos::println;
 
 use super::checks;
 
-/// The boot step a suite needs to have happened.
-///
-/// The two machine-specific variants are declared where their machine's checks
-/// are, rather than both everywhere: a phase with no suite in it is a name
-/// nothing constructs, which the compiler would report and which would be the
-/// right report - this machine has no such step to reach.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Phase {
-    /// The frame allocator and the slab heap are up.
-    Heap,
-    /// The machine's own page tables, interrupts and clock are up.
-    #[cfg(target_arch = "x86_64")]
-    Arch,
-    /// The scheduler has adopted the boot context.
-    Scheduler,
-    /// The console's *polled* receiver can be read, and nothing else reads it.
-    #[cfg(target_arch = "aarch64")]
-    ConsoleInput,
-    /// The console's transmit ring is armed and an interrupt drains it.
-    #[cfg(target_arch = "aarch64")]
-    ConsoleTx,
-    /// The bootstrap root is mounted and the archive unpacked.
-    Vfs,
-    /// The tty table and the signal path are up.
-    Ipc,
-    /// No suite runs here: the harness reports what the phases above found.
-    Done,
-}
-
-/// One test: a name, and a body that answers a reason rather than panicking.
-pub(crate) struct Case {
-    /// The case's own name. The log spells it `<suite>.<case>`, which is what a
-    /// reader greps for and what `xtask` counts.
-    pub(crate) name: &'static str,
-    pub(crate) run: fn(&BootInfo) -> Result<(), &'static str>,
-}
-
-/// The cases that run at one phase, under one name.
-pub(crate) struct Suite {
-    pub(crate) name: &'static str,
-    pub(crate) phase: Phase,
-    pub(crate) cases: &'static [Case],
-}
-
 /// Every suite, in the one place that names them.
 ///
 /// A list rather than a linker-section registry: the kernel has no
-/// `distributed_slice`-shaped dependency and adding one for four suites would be
-/// a mechanism larger than what it carries. This is also the file a reader opens
-/// to answer "what does a test boot actually check", which a registry assembled
-/// at link time would not give them.
+/// `distributed_slice`-shaped dependency, and adding one to carry a dozen entries
+/// would be a mechanism larger than what it carries. This is also the file a
+/// reader opens to answer "what does a test boot actually check", which a registry
+/// assembled at link time would not give them.
 pub(crate) const SUITES: &[Suite] = &[
-    Suite {
-        name: "mm",
-        phase: Phase::Heap,
-        cases: &[Case {
-            name: "allocators",
-            run: checks::case_mm,
-        }],
-    },
+    mpos::mm::kunit::SUITE,
+    // The three families still checked from this layer. Each is one case whose
+    // body answers by panicking, and each moves into its own module next - `sched`
+    // to `mpos::sched::kunit`, `vfs` to `mpos::vfs::kunit`, and the syscall gate,
+    // the tty and the signal path to `mpos::syscall::kunit`, which is where the
+    // cross-subsystem half belongs (`docs/NOTES.md` §15.20).
     Suite {
         name: "sched",
         phase: Phase::Scheduler,
@@ -165,13 +109,6 @@ static TALLY: critical_section::Mutex<core::cell::RefCell<(usize, usize)>> =
 /// Called by the machine's own `init` at the boot steps it knows about, because
 /// the prerequisite is the machine's knowledge: this function is told *when*, and
 /// decides only *what*.
-///
-/// A failing case does **not** stop the boot. The kernel's suites and the user
-/// programs the sweep runs afterwards are the two halves of one gate, and ending
-/// the machine at the first bad case would trade the second half's evidence - a
-/// hundred programs' worth - for a tidier log. The harness's own line is the
-/// verdict, and `xtask` asserts it beside the sweep's summary (`xtask/src/
-/// selftest.rs`).
 pub(crate) fn reached(phase: Phase, info: &BootInfo) {
     for suite in SUITES.iter().filter(|suite| suite.phase == phase) {
         for case in suite.cases {
@@ -208,8 +145,8 @@ fn count(passed: bool) {
 /// The harness's own verdict, in the shape `xtask` asserts on.
 ///
 /// One line, and it is the line that makes "the suites all ran" a claim rather
-/// than a hope: a suite that silently never ran leaves its cases out of the
-/// count, and the count is asserted from outside.
+/// than a hope: a suite that silently never ran leaves its cases out of the count,
+/// and the count is asserted from outside.
 fn finish() {
     let (passed, failed) = critical_section::with(|cs| *TALLY.borrow(cs).borrow());
     println!("mpos-kunit: {passed} passed, {failed} failed");

@@ -330,7 +330,7 @@ fn init_blk() {
 /// harness's contract is to answer a reason (`src/board/kunit.rs` argues why the
 /// kernel cannot catch a panic, which is what makes this the next slice's work).
 #[cfg(feature = "selftest")]
-pub(crate) fn suite_arch(info: &BootInfo) -> Result<(), &'static str> {
+pub(crate) fn suite_arch(info: &BootInfo) -> Result<(), String> {
     check_arch(info);
     Ok(())
 }

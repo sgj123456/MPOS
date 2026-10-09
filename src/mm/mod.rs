@@ -12,6 +12,13 @@ pub mod vma;
 #[cfg(target_os = "none")]
 pub mod heap;
 
+/// This module's suite for a test build: the allocators' own checks, written as a
+/// child so they read this module's state rather than through doors added for
+/// them (`docs/NOTES.md` §15.20). One `pub const SUITE`, listed by the wiring
+/// layer's harness (`src/board/kunit.rs`).
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub mod kunit;
+
 pub use pframe::{Buddy, MAX_ORDER, PAGE_SHIFT, PAGE_SIZE, Pmm};
 pub use vm::{KernelSections, MapFlags, Mapping};
 pub use vma::{Vma, VmaKind, VmaTable};
