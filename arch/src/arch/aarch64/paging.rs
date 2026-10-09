@@ -426,7 +426,7 @@ pub fn user_phys_for_virt_of(root: usize, virt: usize) -> Option<usize> {
 ///    is not a nicety: a `BufReader`'s heap buffer is allocated and unread when
 ///    the first `read` asks for its whole capacity, so refusing the absent half
 ///    answers `EFAULT` to a perfectly valid buffer - measured on the second
-///    machine, where a shell's very first `read(0)` died with it (`PLAN.md`
+///    machine, where a shell's very first `read(0)` died with it (`NOTES.md`
 ///    §13.9). Only anonymous ranges qualify; see `sched::kernel_lazy_accessible`
 ///    for why a frame-backed one must be present first.
 /// 2. **A copy-on-write page is writable.** It is mapped read-only on purpose:
@@ -514,7 +514,7 @@ pub fn write_user_u32(root: usize, at: usize, value: u32) -> bool {
 /// the address the caller named and does nothing - which is correct for a machine
 /// whose devices are a firmware-described range - and panics on a window outside
 /// it. A PCIe aarch64 server that hands out BARs to map dynamically is a named
-/// gap in `PLAN.md` §9.1, not something to half-implement here.
+/// gap in `NOTES.md` §9.1, not something to half-implement here.
 pub fn map_mmio(virt: usize, phys: usize, len: usize) {
     if device_virt(phys, len) != Some(virt) {
         panic!(

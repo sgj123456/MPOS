@@ -17,7 +17,7 @@
 //! Every expected value below is a measurement, not a reading of the spec: the
 //! numbers in [`tests`] are what a `q35` machine's own SATA controller at
 //! `00:1f.2` returned on a port that claims a device and has none, taken with
-//! the register printout described in `PLAN.md` §7.3.
+//! the register printout described in `NOTES.md` §7.3.
 
 extern crate alloc;
 

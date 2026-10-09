@@ -9,7 +9,7 @@
 //! that walks off the end of its chunk - and a slice that panics instead of
 //! answering `None` takes the machine down when a share answers something odd.
 //! Neither is reachable through the message framing in the well-behaved case,
-//! which is exactly why the parser is fuzzed directly (`PLAN.md` §13.29).
+//! which is exactly why the parser is fuzzed directly (`NOTES.md` §13.29).
 
 use libfuzzer_sys::fuzz_target;
 use mpos::vfs::p9::parse_stat;

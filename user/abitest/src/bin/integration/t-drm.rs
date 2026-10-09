@@ -759,7 +759,7 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     // The name is the *driver's*, as Linux answers it: `virtio_gpu` for the
     // card this machine has, not a private spelling. Mesa's renderer choice is
-    // keyed on this string (`PLAN.md` §7.4), so a name no caller's table has is
+    // keyed on this string (`NOTES.md` §7.4), so a name no caller's table has is
     // a card a compositor has no driver for.
     lin::check_true(
         &mut failed,

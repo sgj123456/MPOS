@@ -10,7 +10,7 @@
 //! driver is opened over `PciTransport` on the first machine ([`init`]) and over
 //! the MMIO transport on the second (`super::mmio`), and both hand the registry
 //! the same contract - so the nodes, the ioctl vocabulary, the record window and
-//! the service task below are one copy on both machines (`PLAN.md` §15.2).
+//! the service task below are one copy on both machines (`NOTES.md` §15.2).
 //!
 //! The reader's ABI is `/dev/input/event0`, the node an evdev reader opens,
 //! and the record it expects is `struct input_event`: a `timeval`, then the
@@ -72,7 +72,7 @@ use crate::evdev::{RECORD, Records};
 /// The device is the *contract*, not a transport: which bus answered it is the
 /// machine's fact and the registry never asks, so `EvdevNode`, the record
 /// window behind it and the service task below are one copy on both machines
-/// (`PLAN.md` §15.2).
+/// (`NOTES.md` §15.2).
 type Devices = Vec<(Arc<dyn InputDevice>, Arc<EvdevNode>)>;
 
 /// The devices the boot found, in the order the bus answered them.
@@ -991,7 +991,68 @@ pub fn register(devices: Vec<Arc<dyn InputDevice>>) -> Vec<(Arc<EvdevNode>, Stri
         let mut devices = DEVICES.borrow(cs).borrow_mut();
         devices.extend(table);
     });
+    // The nodes are this driver's to publish: the registry is up, so the device
+    // set userland is handed should carry them. `devices::publish` states the
+    // arrangement; this is the input half of it.
+    crate::drivers::devices::publish("virtio-input", publish_nodes);
     nodes
+}
+
+/// Publish `/dev/input/eventN` and the `/dev/uinput` door for a device set
+/// built after the registry came up.
+///
+/// `/dev/input` exists whether or not the bus answered with a device: it is
+/// where `uinput` puts the devices userland makes, and a directory that only
+/// appears when the machine happens to have a keyboard is a directory a program
+/// cannot depend on. Each node is also announced with `SUBSYSTEM=input` and
+/// DEVNAME pointing at the `/dev/input` path it actually lives under, because
+/// udev and libinput find a device by the pair of its sysfs `dev` number and
+/// this node.
+fn publish_nodes(dev: &crate::vfs::devfs::DevFs) {
+    let input_dir = dev.register_dir("input");
+    let evdevs = nodes();
+    for (index, node) in evdevs.iter().enumerate() {
+        let name = alloc::format!("event{index}");
+        let major = INPUT_MAJOR;
+        let minor = input_minor(index);
+        input_dir.insert(&name, node.clone());
+        // The event node's own path, not the input device it reports through.
+        // Linux's uevent for `/dev/input/event0` is
+        // `DEVPATH=.../input0/event0` beside `DEVNAME=input/event0`, and udev
+        // keys its database entry by the syspath the event names - so
+        // announcing the parent with the child's devnum stores an entry that
+        // neither `udevadm info` on the event node nor libinput can find. The
+        // device is then never tagged `ID_INPUT`, libinput's seat enumeration
+        // passes every one of them by, and weston comes up with a screen and
+        // "no input devices found".
+        crate::uevent::publish(&crate::uevent::Event {
+            action: "add",
+            devpath: alloc::format!("/devices/virtual/input/input{index}/{name}"),
+            subsystem: "input",
+            devname: alloc::format!("input/{name}"),
+            major,
+            minor,
+            extra: &[],
+        });
+    }
+
+    // `/dev/uinput`: the interface a program makes an input device of its own
+    // through. It hands the created devices' nodes into the same `/dev/input`,
+    // and takes the next number after the ones the bus answered with, so a
+    // synthetic device is `event2` on a machine with a keyboard and a tablet.
+    dev.register_node(
+        "uinput",
+        crate::drivers::uinput::Uinput::new(input_dir, evdevs.len()),
+    );
+    crate::uevent::publish(&crate::uevent::Event {
+        action: "add",
+        devpath: alloc::string::String::from("/devices/virtual/misc/uinput"),
+        subsystem: "misc",
+        devname: alloc::string::String::from("uinput"),
+        major: crate::uinput::MAJOR,
+        minor: crate::uinput::MINOR,
+        extra: &[],
+    });
 }
 
 /// Probe the PCI bus for every virtio input device and build a node for each.

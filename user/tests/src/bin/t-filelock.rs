@@ -32,7 +32,7 @@
 //! answers 0 under either reading - Linux converts the description's shared lock
 //! to exclusive, this kernel has nothing left to convert - so the difference is
 //! a gap in the code rather than in this program's verdict, and
-//! `docs/PLAN.md` §15.16 names it with its measurement instead of a claim
+//! `docs/NOTES.md` §15.16 names it with its measurement instead of a claim
 //! pinning it that no program would fail.
 //!
 //! # Which library each door comes from

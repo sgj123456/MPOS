@@ -3,13 +3,13 @@
 # mount the root the kernel command line names, and hand the machine over.
 #
 # This is the same script the x86_64 machine runs as its initramfs `/init`, and
-# it exists on this machine for the same reason (`PLAN.md` §15.6): a kernel that
+# it exists on this machine for the same reason (`NOTES.md` §15.6): a kernel that
 # assembles the real root first leaves pieces the owner of the system cannot
 # unmount, so the switch belongs to pid 1 - on both machines. What differs is
 # the one line it prints: `MPOS_SWITCH_ROOT_OK` says which device became `/`,
 # where the first machine's script prints nothing at all. The pivot moved from
 # the kernel into this script, so the line is the evidence that a userspace
-# program - not the kernel - did the switch (`PLAN.md` §15.7).
+# program - not the kernel - did the switch (`NOTES.md` §15.7).
 
 export PATH=/sbin:/usr/sbin:/bin:/usr/bin
 
@@ -92,6 +92,23 @@ mount --move /dev /sysroot/dev
 # on it, every openpty - sudo's "unable to allocate pty", a nested ssh - dies
 # opening /dev/pts/<n> with ENOENT.
 mount -t devpts devpts /sysroot/dev/pts
+
+# The host share, mounted *again* on the tree that becomes `/`. The kernel's
+# own mount of it (`steps::mount_share`) hangs on the bootstrap root's `/mnt`,
+# and this switch deletes that root - so a payload running under the switched
+# tree would find `/mnt/share` an ordinary empty directory. (It is not merely a
+# name the walk cannot reach: the disk mounted over `/mnt` *covers* it, which is
+# what happens to any mount a later one is hung in front of.) Mounting it again
+# is the same rule the pseudo-filesystems above follow - what is mounted on the
+# new root survives the pivot.
+#
+# No tag is written here. The host chooses the tag (`-virtfs
+# ...,mount_tag=...`), and an empty source is this kernel's spelling for "the
+# share the bus exported" - the same call `steps::mount_share` makes, without
+# this script keeping a second copy of the host's choice. A boot with no share
+# has nothing to mount and says so rather than failing.
+mkdir -p /sysroot/mnt/share
+mount -t 9p '' /sysroot/mnt/share || echo "initramfs: no host share to re-mount"
 
 # The verdict line, *before* the exec: `switch_root` deletes the ramfs it stood
 # in, and with it any chance of printing after the promotion. Its presence on

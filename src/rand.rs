@@ -47,7 +47,7 @@ type DeviceEntropy = fn() -> Option<[u8; 32]>;
 /// already runs the other way (`drivers::devices` fills `/dev/urandom` from
 /// here). `cargo xtask depgraph` counts that as a new mutual pair, and it is
 /// right to: which device a machine has is the wiring layer's fact, and
-/// `main/<arch>.rs` is where it is said (`PLAN.md` §14.3).
+/// `main/<arch>.rs` is where it is said (`NOTES.md` §14.3).
 static DEVICE_SOURCE: Mutex<RefCell<Option<DeviceEntropy>>> = Mutex::new(RefCell::new(None));
 
 /// Register the machine's rng device. Called once, from `main/<arch>.rs`,
@@ -133,7 +133,7 @@ fn seed() -> [u8; 32] {
     // trait is the machine's own sources - the CPU's `RDRAND` - while a
     // virtio-rng is a driver the kernel enumerates, so folding it in here is
     // what keeps the machine layer from having to name a driver
-    // (`PLAN.md` §14.3). Taken out of the lock before it is called: reading the
+    // (`NOTES.md` §14.3). Taken out of the lock before it is called: reading the
     // device is not this module's business and must not happen inside a
     // critical section it holds.
     let source = critical_section::with(|cs| *DEVICE_SOURCE.borrow(cs).borrow());

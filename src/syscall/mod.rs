@@ -30,7 +30,7 @@ pub mod linux;
 /// Defined per-architecture in `crate::mm` (an address-space layout fact, not a
 /// dispatch one); re-exported here so the mmap handlers' `crate::syscall::MMAP_BASE`
 /// paths keep resolving while `sched` names `crate::mm` directly (the edge that
-/// used to run through this layer, `PLAN.md` §9.1).
+/// used to run through this layer, `NOTES.md` §9.1).
 pub use crate::mm::elf::MMAP_BASE;
 
 /// The errno values [`linux::dispatch`] returns, already negated for `rax`.

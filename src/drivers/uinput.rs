@@ -226,7 +226,7 @@ impl Uinput {
     /// crate's and stays there, host-tested. What lives here is the dispatch
     /// over this device's own state and the errno each request owes, which is
     /// the same split the `'E'` family took into `EvdevNode::ioctl` and the
-    /// `'K'` family into `Tty::kd_ioctl` (`PLAN.md` §11.2 Step B2). The syscall
+    /// `'K'` family into `Tty::kd_ioctl` (`NOTES.md` §11.2 Step B2). The syscall
     /// layer still resolves the descriptor (`uinput_ioctl` in
     /// `syscall/linux/fs.rs`): the bad-fd `EBADF` and the not-a-uinput-node
     /// `ENOTTY` are the user boundary's to give.

@@ -4,7 +4,7 @@
 //! `vfs::tty`, but neither is a filesystem fact: how many consoles the machine
 //! mints, and what "text" versus "graphics" video mode and "xlate" versus "off"
 //! keyboard mode *mean*, are console facts that the pty and tty nodes happened
-//! to be the first to need. This is `PLAN.md` §11.2 Step D's shared vocabulary —
+//! to be the first to need. This is `NOTES.md` §11.2 Step D's shared vocabulary —
 //! the words `vfs::tty`/`vfs::pty`/`vfs::vcmux` and the drivers all reach for.
 //!
 //! Living in the `term` leaf makes that reach downward instead of sideways. The
@@ -12,7 +12,7 @@
 //! and `vfs` now agree on one definition here rather than some of them naming
 //! whichever module happened to hold it — which is the prerequisite for moving
 //! `vcmux` out of the VFS without re-creating the `vfs ↔ console` pair
-//! (`PLAN.md` §11.1.4, V-4). A behaviour-preserving relocation: these are the
+//! (`NOTES.md` §11.1.4, V-4). A behaviour-preserving relocation: these are the
 //! same `u32` values, unchanged, with the rationale that travelled with them.
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -42,7 +42,7 @@ pub const K_OFF: u32 = 0x04;
 /// not a filesystem one: which console is showing is exactly what the leaf that
 /// owns the grid also owns (`crates/term/src/lib.rs`). The console mux writes it
 /// when a switch completes; `console`, the drivers and the VFS all read it, so
-/// none of them names another module for the answer (`PLAN.md` §11.2 D.2a closes
+/// none of them names another module for the answer (`NOTES.md` §11.2 D.2a closes
 /// the `vfs <-> console` pair by moving this one number here).
 static ACTIVE: AtomicU32 = AtomicU32::new(1);
 

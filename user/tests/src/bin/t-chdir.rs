@@ -11,7 +11,7 @@
 //!
 //! The no-std version chdir'd to `/etc`, opened `motd` relatively, and used
 //! `/etc/motd` for the ENOTDIR pair. The second machine's payload carries no motd
-//! (`PLAN.md` §15.11), so this version owns its file under `/tmp` - the claim is
+//! (`NOTES.md` §15.11), so this version owns its file under `/tmp` - the claim is
 //! about where `chdir` puts the process, not about which file is read through the
 //! new cwd - and it chdirs to `/tmp`, whose `..` is `/` and which both payloads
 //! carry, before the relative step into `/bin`.

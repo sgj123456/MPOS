@@ -203,7 +203,7 @@ pub struct QemuConfig {
     /// virgl 3D renderer behind it. `virtio-gpu-pci` is the 2D scanout every
     /// boot has used; `virtio-gpu-gl-pci` is the same device with the host's
     /// `virglrenderer` behind it, and it is the one thing that makes a
-    /// compositor refusing a *software* EGL device able to run (`PLAN.md`
+    /// compositor refusing a *software* EGL device able to run (`NOTES.md`
     /// §7.4).
     ///
     /// Named as QEMU names it rather than as a boolean, for the same reason
@@ -1079,7 +1079,7 @@ qemu.gpu = \"c\"
         // The root device is one value for both now, because both disks are the
         // same shape: a GPT whose second partition is the ext4 root. The second
         // machine's half stopped naming the whole disk when its image became a
-        // partitioned one (`PLAN.md` §15.18), and a `root=` naming the whole disk
+        // partitioned one (`NOTES.md` §15.18), and a `root=` naming the whole disk
         // would send its initramfs script at a partition table instead of a
         // filesystem.
         assert_eq!(

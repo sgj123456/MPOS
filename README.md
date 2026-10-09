@@ -232,7 +232,7 @@ graph LR
 
 `src/syscall/linux/nr.rs` names **252 Linux x86_64 syscall numbers**; every one of them is
 routed by the dispatch table in `src/syscall/linux/mod.rs`, and roughly 234 do real work — the
-handful that do not answer `ENOSYS`, which `PLAN.md` tracks as the remaining ABI gap
+handful that do not answer `ENOSYS`, which `NOTES.md` tracks as the remaining ABI gap
 (`fanotify`, `keyctl`, `userfaultfd`, real-time signals 33–64, `io_uring`). The POSIX interval
 timers (`timer_create` 222 … `timer_delete` 226) joined that set with the five numbers they are;
 `SIGRTMIN` (32) is queued, masked and waited for — the one real-time number musl's
@@ -243,7 +243,7 @@ Where the handlers live, and why the files are as big as they are:
 
 | Handler module | Numbers | What it answers |
 |---|---:|---|
-| `syscall/linux/fs/file.rs` + `fs/ioctl.rs` | 135 | Everything that carries a path or drives a file descriptor: `open`/`openat`/`openat2`, `stat`/`statx`, `getdents64`, `renameat2`, `splice`, `mount`, `fcntl`, pipes, `sendfile`, `fallocate`, `statfs` — in `file.rs`; the device-`ioctl` entry point in `ioctl.rs`. The old single `fs.rs` split along that seam at PLAN.md §11.2 Step E |
+| `syscall/linux/fs/file.rs` + `fs/ioctl.rs` | 135 | Everything that carries a path or drives a file descriptor: `open`/`openat`/`openat2`, `stat`/`statx`, `getdents64`, `renameat2`, `splice`, `mount`, `fcntl`, pipes, `sendfile`, `fallocate`, `statfs` — in `file.rs`; the device-`ioctl` entry point in `ioctl.rs`. The old single `fs.rs` split along that seam at NOTES.md §11.2 Step E |
 | `syscall/linux/proc.rs` | 50 | Memory and process machinery: `mmap`/`munmap`/`mremap`/`brk`/`mprotect`, `fork`/`clone`/`vfork`, `execve`, `exit_group`, `wait4`/`waitid`, `ptrace`, `process_vm_readv`/`writev`, `nanosleep`, `clock_gettime`, `gettimeofday` |
 | `syscall/linux/posix.rs` | 50 | The POSIX completion set: the identity family (`setreuid`, `getresuid`, `capget`…), capabilities, `sched_*`, `getpriority`/`setpriority`, memory advice (`msync`, `madvise`, `mlock`), the wall-clock setters, self-directed signals |
 | `syscall/linux/abi.rs` | 12 | Pure ABI facts — flag values, struct layouts, argument validation, encodings — host-compiled so the man-page contract is unit-testable |
@@ -251,11 +251,11 @@ Where the handlers live, and why the files are as big as they are:
 
 `ioctl` deserves a note: its request-number families for fbdev, DRM, RTC, uinput, evdev, TTY and
 block devices are parsed in `syscall/linux/fs/ioctl.rs` — the old single `fs.rs` grew past 6 300 lines
-holding that switchboard alongside the path/file calls, so PLAN.md §11.2 Step E split the file along
-that seam (the switchboard itself is unchanged). `PLAN.md` Phase 11 (Step B) is the plan to give each
+holding that switchboard alongside the path/file calls, so NOTES.md §11.2 Step E split the file along
+that seam (the switchboard itself is unchanged). `NOTES.md` Phase 11 (Step B) is the plan to give each
 driver its own contract back.
 
-Deliberate divergences from Linux are collected per subsystem in `PLAN.md` — for example
+Deliberate divergences from Linux are collected per subsystem in `NOTES.md` — for example
 `listen(2)` on IPv4 is `EOPNOTSUPP` (the stack is outbound-only), `SO_LINGER{on,0}` is left
 orderly rather than faked, `unshare`/`setns` validate and then refuse, and `seccomp` speaks
 `STRICT` but not `FILTER`. They are recorded there rather than hidden here.
@@ -282,7 +282,7 @@ half-second clock wait and the scheduler sleeps these checks need.
 | `M8_OK` | Init handoff | `/init` runs as PID 1, forks, execs a shell, and stays alive |
 
 There is no M5, and nothing above M8 — the checks stop where the milestone numbering had a gap,
-and the numbering is kept as it is because the CI logs and `PLAN.md` refer to it. The `M0`–`M14`
+and the numbering is kept as it is because the CI logs and `NOTES.md` refer to it. The `M0`–`M14`
 pipeline that earlier revisions of this README described never existed in this form; the
 authoritative record of what is proven is the test suite, not the markers.
 
@@ -402,8 +402,8 @@ and `/init` are edited.
 Not available, and the configuration no longer pretends otherwise: there is no
 `aarch64-unknown-none` profile in `.cargo/config.toml` and no such target in
 `rust-toolchain.toml`, because the profile that used to sit there named
-`arch/aarch64/linker.ld` and no such script has ever existed (`PLAN.md` Phase 11
-Step A removed it). `PLAN.md` §9.1 lists what a real aarch64 port needs - the
+`arch/aarch64/linker.ld` and no such script has ever existed (`NOTES.md` Phase 11
+Step A removed it). `NOTES.md` §9.1 lists what a real aarch64 port needs - the
 exception vectors, the GIC, the page tables, PSCI, the generic timer, a UART -
 and none of it is written.
 
@@ -602,7 +602,7 @@ mpos/
 ├── initramfs.toml           # what the early userspace contains
 ├── .cargo/config.toml       # targets, rustflags and the `cargo xtask` alias
 ├── rust-toolchain.toml      # nightly + the four targets
-├── docs/                    # ARCHITECTURE.md · PLAN.md · UAPI.md · README.zh.md
+├── docs/                    # ROADMAP.md · NOTES.md · ARCHITECTURE.md · UAPI.md · README.zh.md
 ├── README.md · AGENTS.md
 └── LICENSE
 ```
@@ -625,8 +625,8 @@ layers; `AGENTS.md` is the short version for anyone (or anything) about to make 
 - **Every wake is an event, not a tick.** A blocking call parks on the thing it is waiting for
   and is woken by the arrival, not by the next clock interrupt. This single discipline is what
   took loopback `ping` from 7.5 ms to 0.3 ms and a two-process pipe handover from 7 MiB/s to
-  10 168 MiB/s (`PLAN.md` §10.1, §10.4).
-- **Nothing is claimed without a number.** Performance changes in `PLAN.md` carry before/after
+  10 168 MiB/s (`NOTES.md` §10.1, §10.4).
+- **Nothing is claimed without a number.** Performance changes in `NOTES.md` carry before/after
   measurements from an instrument that runs in the suite — `t-forkcost`, `t-pipecost`,
   `t-netlat`, or a host test that counts device reads.
 - **Divergences are recorded, not hidden.** Where MPOS deliberately differs from Linux, the
@@ -642,7 +642,7 @@ layers; `AGENTS.md` is the short version for anyone (or anything) about to make 
 | **Signals** | Delivered through a real `rt_sigframe`, so a handler is called and `rt_sigreturn` resumes the interrupted code. `SIGKILL` and `SIGSTOP` cannot be blocked |
 | **ASLR** | An `ET_DYN` image, its interpreter, the stack top and the `mmap` region are all drawn per `exec`; an `ET_EXEC` image keeps the address it was linked at, because that is what a fixed address means |
 | **Slab allocation and large requests** | Requests over 2048 B bypass the slab and take frames directly; the heap keeps freed slots cached, which is why "free" memory in `/proc/meminfo` is not the whole story |
-| **Kernel panics end the machine** | `panic = "abort"` and a panic handler that dumps a stack scan and exits QEMU with `35`. The global allocator's failure path is still a panic — an open item in `PLAN.md` §8.0 |
+| **Kernel panics end the machine** | `panic = "abort"` and a panic handler that dumps a stack scan and exits QEMU with `35`. The global allocator's failure path is still a panic — an open item in `NOTES.md` §8.0 |
 
 ---
 
@@ -654,7 +654,8 @@ layers; `AGENTS.md` is the short version for anyone (or anything) about to make 
 | `AGENTS.md` | The working guide: commands, conventions, recipes for adding a syscall or a test, known traps |
 | `docs/README.zh.md` | Chinese translation, kept in section-by-section correspondence with this file |
 | `docs/ARCHITECTURE.md` | The dependency graphs, the boot and syscall sequences, per-layer ownership, the measured inter-module edges, and the layering violations |
-| `docs/PLAN.md` | The feature roadmap and status board, the measured performance work, and Phase 11 — the architecture-debt audit and its remediation plan |
+| `docs/ROADMAP.md` | The plan: the feature roadmap and status board, the remaining work per phase, the priority summary |
+| `docs/NOTES.md` | The evidence: every measurement, gate run, lesson and trap — the measured performance work, and Phase 11's architecture-debt audit and remediation plan |
 | `docs/UAPI.md` | The userspace-visible surface as an inventory: syscalls, device ioctls, struct layouts and flag vocabularies, each with Linux's answer, this kernel's, and the pin — the working list of what is served, honestly refused, or a wrong shape |
 | `xtask/README.md` | Every build/run command, flag and environment variable (bilingual) |
 | `fuzz/README.md` | What each fuzz target feeds on |

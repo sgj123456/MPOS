@@ -10,7 +10,7 @@
 //!
 //! Half of this family was already served on the second machine while the
 //! other half answered `ENOTTY`, because the arms that *change* a link were
-//! gated off when the stack was the first machine's alone (`PLAN.md` §13.4).
+//! gated off when the stack was the first machine's alone (`NOTES.md` §13.4).
 //! A test that names both halves is what keeps that from happening again: the
 //! read arms and the write arms have to agree about which machine they are on,
 //! and the only way to see that they do is to drive one from the other.

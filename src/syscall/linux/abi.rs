@@ -752,7 +752,7 @@ pub(crate) const PTRACE_GET_SYSCALL_INFO: usize = 0x420E;
 // the arch-neutral leaf (`crate::abi`), beside the `clone` flags: they carry
 // the same number on both machines, and `sched`'s stop block reads them without
 // naming this module - which is what took the `sched -> syscall` edge to 0
-// (`PLAN.md` §13). Only the option bits are named here, because only they have
+// (`NOTES.md` §13). Only the option bits are named here, because only they have
 // a reader on both machines (the mask below); the event words are read by the
 // scheduler and by the tests here.
 //
@@ -1727,7 +1727,14 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     const PR_SET_DUMPABLE: usize = 4;
     const PR_GET_DUMPABLE: usize = 3;
     const PR_SET_KEEPCAPS: usize = 8;
-    const PR_GET_KEEPCAPS: usize = 9;
+    // Linux's `PR_GET_KEEPCAPS` is 7, not 9: `linux/prctl.h` puts `PR_GET_FPEMU`
+    // at 9, and on this machine 9 is not an option anyone serves. The pair used
+    // to be written down as 8/9 - the shape a reader expects from "the getter is
+    // the setter plus one" - and the no-std suite had the same 9 in `lin.rs`, so
+    // the two agreed on a number no Linux program sends. A caller using the real
+    // `PR_GET_KEEPCAPS` was refused `EINVAL`. `rustix::thread::get_keep_capabilities`
+    // sends 7 and is what the migrated test now reaches for.
+    const PR_GET_KEEPCAPS: usize = 7;
     const PR_CAPBSET_READ: usize = 23;
     const PR_CAPBSET_DROP: usize = 24;
     // `TASK_COMM_LEN`: the fixed slot both name options speak of.
@@ -2157,7 +2164,7 @@ pub(crate) fn handle_sched_setaffinity(args: [usize; crate::syscall::ARG_COUNT])
 /// the size to `sizeof(struct robust_list_head)` = 24, rejecting anything else.
 /// What is *not* yet done is walking the list to release held futexes when the
 /// thread leaves - that is the feature `set` arms on Linux, and it is a named gap
-/// (`PLAN.md` §12.2 B3); storing the head is what makes the registration +
+/// (`NOTES.md` §12.2 B3); storing the head is what makes the registration +
 /// `get` pair truthful rather than a `set` that claims a list it cannot return.
 pub(crate) fn handle_set_robust_list(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     let (head, len) = (args[0], args[1]);

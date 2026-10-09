@@ -28,7 +28,7 @@ mpos-bootinfo = { path = "../crates/bootinfo" }
 # (`mpos_arch::early`). The dependency is what makes "this loader names no
 # architecture" a fact cargo enforces rather than a convention - the crate it
 # depends on is the one that holds the machines, and there is nothing else in
-# the graph that does (`PLAN.md` §14.6).
+# the graph that does (`NOTES.md` §14.6).
 mpos-arch = { path = "../arch" }
 uefi = { version = "0.36", default-features = false, features = [
     "alloc",
@@ -40,7 +40,7 @@ name = "mpos-boot"
 path = "src/main.rs"
 
 # The loader's body, as a library. `src/main.rs` is the `#[entry]` that calls
-# it; the kernel, once it becomes the UEFI application itself (`PLAN.md` §14.7),
+# it; the kernel, once it becomes the UEFI application itself (`NOTES.md` §14.7),
 # will be the second caller. Naming it here rather than letting cargo infer it
 # keeps the two halves of one crate symmetric on the page.
 [lib]

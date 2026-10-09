@@ -65,7 +65,7 @@
 //!   sequence with no user address space to enter - the shape this port refuses.
 //!   Stage 6a is where both arrived, and it is the first moment either *could*:
 //!   `UserFrame` is `user_pt_regs` field for field, and the space `enter_user`
-//!   enters is one stage 6a also builds (`paging::UserSpace`). `PLAN.md` §9.1's
+//!   enters is one stage 6a also builds (`paging::UserSpace`). `NOTES.md` §9.1's
 //!   stage table carries that split, which is why this file's stage number is 2
 //!   and the register file's is 6.
 

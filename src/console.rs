@@ -306,7 +306,7 @@ fn active_grid() -> usize {
 // paint an image, and a compositor may take it away" - which is one machine's,
 // so the flag names the machine without naming an architecture (`AGENTS.md` §4).
 // The mux's `drivers::*` references were the whole of what kept it off the second
-// machine (`PLAN.md` §13.16).
+// machine (`NOTES.md` §13.16).
 
 /// Tell the render task the screen changed and it has to draw again.
 ///

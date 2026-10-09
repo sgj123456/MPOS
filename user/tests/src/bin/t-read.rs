@@ -11,7 +11,7 @@
 //! The file is one this test writes itself under `/tmp`, not `/etc/motd` as the
 //! no-std version used: the claim is about what `read` does, not about which
 //! file it is doing it to, and the second machine's test payload carries `/tmp`
-//! and not a motd (`PLAN.md` §15.11). The unreadable buffer is a `PROT_NONE`
+//! and not a motd (`NOTES.md` §15.11). The unreadable buffer is a `PROT_NONE`
 //! mapping at an address the kernel chooses, and it is probed with a descriptor
 //! this test *knows* is open, so the answer cannot be confused with `EBADF`.
 

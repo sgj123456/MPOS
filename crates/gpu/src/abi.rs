@@ -11,7 +11,7 @@
 //! not have. That crate's GPU device stops at `GET_EDID`; the 3D family
 //! (`CTX_CREATE`, `RESOURCE_CREATE_3D`, `SUBMIT_3D`, the capset queries) is not
 //! in it, and its control queue has no accessor, so a driver that needs those
-//! commands has to own the queue - and therefore the encoding. `PLAN.md` §7.4
+//! commands has to own the queue - and therefore the encoding. `NOTES.md` §7.4
 //! carries the measurement this work started from and the reason the crate was
 //! not simply vendored.
 //!
@@ -21,7 +21,7 @@
 //! of one, with no implicit padding - the sizes asserted at the bottom of this
 //! file are the wire's, and a field added carelessly would fail them rather than
 //! silently shift every field after it. The header spells its integers
-//! `__le32`/`__le64`; this kernel is x86_64-only (`PLAN.md` §9.1 lists what a
+//! `__le32`/`__le64`; this kernel is x86_64-only (`NOTES.md` §9.1 lists what a
 //! port would need) and x86_64 is little-endian, so the native types *are* the
 //! wire types here. A big-endian port would have to byte-swap in `as_bytes` and
 //! `read_struct`, which is the only two places that would change.

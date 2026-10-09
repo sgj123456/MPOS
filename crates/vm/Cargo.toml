@@ -4,7 +4,7 @@
 # Its own crate because `hal::Paging` and `hal::AddressSpaceOps` are written in
 # it: `Mapping`, `MapFlags`, `PageTaken` and `KernelSections` cross the machine
 # seam in both directions, so once the machine layer is `mpos-arch` neither the
-# kernel nor that crate can own them (`PLAN.md` §14 S2b). The page arithmetic
+# kernel nor that crate can own them (`NOTES.md` §14 S2b). The page arithmetic
 # and `kernel_mappings` - the machine-independent *plan* - came with them,
 # because a `Mapping` is not page-granular without `PAGE_SIZE` and a port
 # consumes the plan as its input.

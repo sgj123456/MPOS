@@ -142,7 +142,7 @@ const ONE_TICK_NS: i64 = 4_000_000;
 /// A woken task must resume on a scheduler turn and not on the clock: `wait4`
 /// returning to the parent is the child having exited and the picker having
 /// chosen the parent, which is microseconds of work. Before the boot task
-/// stopped halting the core while staying runnable (PLAN.md §10.2) both rows
+/// stopped halting the core while staying runnable (NOTES.md §10.2) both rows
 /// read ~8 ms - *two* ticks on a task that had already been woken - and no
 /// amount of work removed from the syscall moved it. The bound is a tick
 /// because that is what the broken figure was quantized to: a wait that ends on

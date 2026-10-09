@@ -16,7 +16,7 @@
 //! 64/80/96/112 where `struct stat` holds three 8-byte pairs at 72/88/104, so
 //! "the fields are there" is not a claim about *where* - and a write that
 //! stops at `stx_mnt_id` leaves the caller's own bytes in the rest of the
-//! 256-byte struct (`PLAN.md` §13.11).
+//! 256-byte struct (`NOTES.md` §13.11).
 //!
 //! # Why the raw door carries most of this program
 //!

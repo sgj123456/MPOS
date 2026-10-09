@@ -22,7 +22,7 @@
 //! so the claim below was reading the process-count budget. The table and this
 //! constant agreed with each other - the no-std version had `RLIMIT_NOFILE = 5`
 //! written into it - which is why neither could catch it. Both are fixed
-//! (`PLAN.md` §15.13), and the claim now means what it says.
+//! (`NOTES.md` §15.13), and the claim now means what it says.
 //!
 //! # Why the calls are raw
 //!

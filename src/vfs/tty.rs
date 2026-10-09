@@ -58,7 +58,7 @@ use crate::term::cursor::Cursor;
 use crate::term::vc::VC_COUNT;
 /// The KD/K video+keyboard mode words are named only by `tty`'s `kd_ioctl` /
 /// `vt_ioctl`, so the imports go with them - which is every machine now that the
-/// console mux is both machines' (`PLAN.md` §13.16).
+/// console mux is both machines' (`NOTES.md` §13.16).
 #[cfg(target_os = "none")]
 use crate::term::vc::{K_MEDIUMRAW, K_OFF, K_RAW, K_UNICODE, K_XLATE, KD_GRAPHICS, KD_TEXT};
 
@@ -302,7 +302,7 @@ pub struct LineDiscipline {
     /// on a completed read: one partial byte does not satisfy `VMIN`, so the
     /// wake that re-anchors the inter-byte clock would otherwise be swallowed by
     /// `block_until_deadline`'s condition loop and the read would sleep forever.
-    /// See the read-path note in `PLAN.md` §12.4a.
+    /// See the read-path note in `NOTES.md` §12.4a.
     input_count: u64,
 }
 
@@ -1641,7 +1641,7 @@ impl Tty {
                         // re-offers that one input byte, whose carriage return is
                         // written twice - which renders identically, where the
                         // alternative (counting the byte) would lose the line
-                        // feed. `PLAN.md` §2.5 records it.
+                        // feed. `NOTES.md` §2.5 records it.
                         Ok(input_prefix(input, taken))
                     }
                 }
@@ -1790,7 +1790,7 @@ impl Tty {
     /// `KDGKBTYPE` serving, byte-for-byte the answers the switchboard gave, and
     /// V-4 will carry it when the console moves out of the VFS into a driver.
     ///
-    /// Both machines since `PLAN.md` §13.16. Every arm but `KDGKBTYPE` reaches
+    /// Both machines since `NOTES.md` §13.16. Every arm but `KDGKBTYPE` reaches
     /// into `vfs::vcmux`, which used to be x86_64's because it named
     /// `drivers::{video::render,drm}` itself; it now asks `crate::console`'s
     /// `display_*` seams, so the family is served wherever `target_os` is `none`
@@ -1923,7 +1923,7 @@ impl Tty {
     /// switchboard (`ARCHITECTURE.md` V-2, the same move the `'K'` and `'E'`
     /// families took).
     ///
-    /// Both machines since `PLAN.md` §13.16: the `VT_*` handover drives
+    /// Both machines since `NOTES.md` §13.16: the `VT_*` handover drives
     /// `vfs::vcmux`, which was x86_64's for naming `drivers` directly and now
     /// reaches the display through `crate::console`'s `display_*` seams.
     #[cfg(target_os = "none")]
@@ -2014,7 +2014,7 @@ impl Tty {
                 // kernel does not deliver, and Linux leaves the caller's word
                 // alone. Measured on Linux 7.2.8 with all three shorts pre-filled
                 // `0xAAAA`: `v_signal` came back `0xAAAA`, `v_active` 1 and
-                // `v_state` 67 (`PLAN.md` §13.18).
+                // `v_state` 67 (`NOTES.md` §13.18).
                 //
                 // This arm used to write the *video mode* in the first short and
                 // the console number in the second, so a seat manager reading
@@ -2242,7 +2242,7 @@ impl Tty {
                 // swallowed by `block_until_deadline`'s condition loop and the
                 // read would sleep past its own deadline. `None` keeps the
                 // completed-read wake for canonical and `VTIME == 0` reads. See
-                // `PLAN.md` §12.4a.
+                // `NOTES.md` §12.4a.
                 let base = if ld.byte_restarts_clock() {
                     Some(ld.input_count())
                 } else {

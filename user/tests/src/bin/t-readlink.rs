@@ -41,7 +41,7 @@
 //!
 //! The "not a symlink" fixture is a file this test writes itself under `/tmp`,
 //! not the no-std version's `/etc/motd`: the second machine's sweep disk carries
-//! no motd (`PLAN.md` §15.11), and the claim is about the kind of the name, not
+//! no motd (`NOTES.md` §15.11), and the claim is about the kind of the name, not
 //! about which file has it.
 
 use mpos_user_tests::Report;

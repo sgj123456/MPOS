@@ -8,7 +8,7 @@
 //! initial umask, budgets its rlimits, decodes a `clone` flag word to decide
 //! what a child shares, and decides from these `PTRACE_*` bits what a traced
 //! task does at a stop. Naming `crate::syscall` for those values is what made
-//! `sched` unbuildable without the x86_64 ABI layer (`PLAN.md` §11.2, the
+//! `sched` unbuildable without the x86_64 ABI layer (`NOTES.md` §11.2, the
 //! `sched -> syscall` row); the ptrace protocol was the last reference to
 //! leave, and moving it here took that row to 0. The values themselves are
 //! shared across architectures - these `CLONE_*` bits, `PTRACE_*` words and
@@ -20,7 +20,7 @@
 //! x86_64 `user_regs_struct`, which is why `PTRACE_GETREGS` stays there too),
 //! and the per-arch `MMAP_BASE`, which follows each architecture's
 //! address-space layout and is decided with the aarch64 process-running stage
-//! (`PLAN.md` §9.1's stage 6/7).
+//! (`NOTES.md` §9.1's stage 6/7).
 //!
 //! This is the single source for each fact. `syscall::linux::nr` and
 //! `syscall::linux::abi` re-export these rather than redefining them, so the

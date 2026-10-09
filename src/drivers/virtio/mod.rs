@@ -17,7 +17,7 @@
 
 //! Every driver here except `hal` reaches its device over PCI today, so the
 //! PCI-only ones are x86_64's. `hal` is the machine-neutral `Hal` impl the
-//! aarch64 MMIO transport builds on (`PLAN.md` §9.1); the aarch64 `rng`/`blk`/
+//! aarch64 MMIO transport builds on (`NOTES.md` §9.1); the aarch64 `rng`/`blk`/
 //! `net` over MMIO come as the drivers stage proceeds, so `rng` is gated to
 //! x86_64 until its MMIO path exists.
 
@@ -46,42 +46,32 @@ pub mod hal;
 /// machines' sysfs, exit hooks and boot wiring read it. The module is written
 /// over [`InputDevice`] and never over a transport, so a machine reaches the
 /// registry with whatever its own bus answered: `input::init` enumerates
-/// virtio-PCI, and the MMIO side hands over the window it opened (`PLAN.md`
+/// virtio-PCI, and the MMIO side hands over the window it opened (`NOTES.md`
 /// §15.2).
 #[cfg(mpos_input_registry)]
 pub mod input;
 /// The memory-mapped virtio transport, this machine's path to its devices. Only
 /// aarch64 has its virtio behind fixed MMIO windows; x86_64 reaches the same
 /// devices over a PCI BAR, so this is gated to aarch64 and is where its first
-/// driven device (virtio-rng, `PLAN.md` §9.1 stage 7) is opened.
+/// driven device (virtio-rng, `NOTES.md` §9.1 stage 7) is opened.
 #[cfg(target_arch = "aarch64")]
 pub mod mmio;
 #[cfg(target_arch = "x86_64")]
 pub mod msix;
 #[cfg(target_arch = "x86_64")]
 pub mod net;
-#[cfg(target_arch = "x86_64")]
 pub mod rng;
 pub mod sound;
 pub mod vsock;
 
 /// Bytes from this machine's virtio-rng device, or `None` when it has none.
 ///
-/// The device is the same one on both machines; the *wire* it arrives on is not,
-/// and each transport module owns its own read: x86_64 enumerates it on the PCI
-/// bus, aarch64 finds it in its fixed MMIO window. Naming the transport here is
-/// what keeps the caller machine-blind, which is why this exists rather than a
-/// `#[cfg]` at the call site. `crate::rand` folds in "the machine's rng device"
-/// and does not learn which machine it is on (`PLAN.md` §14.3).
+/// One global now holds the source whichever transport installed it, so this
+/// is a straight read rather than a per-machine fork (`NOTES.md` §15.2).
+/// `crate::rand` folds in "the machine's rng device" and does not learn which
+/// machine it is on (`NOTES.md` §14.3).
 pub fn entropy() -> Option<[u8; 32]> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        mmio::entropy()
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        rng::entropy()
-    }
+    rng::entropy()
 }
 
 /// Register a virtio block device as the kernel's boot disk.
@@ -94,7 +84,7 @@ pub fn entropy() -> Option<[u8; 32]> {
 /// that so, and it is a fix rather than a tidy-up: the second machine registered
 /// the same disk with `/dev/vda` where the first writes
 /// [`crate::uevent::VIRTIO_BLK_DEVPATH`], so its events announced a `DEVPATH`
-/// that is not a device path at all (`PLAN.md` §15.10).
+/// that is not a device path at all (`NOTES.md` §15.10).
 ///
 /// The boot disk, singular: a machine brings up one, and [`crate::blk::add_disk`]
 /// refuses a second under the same name rather than letting two devices share it.
@@ -212,7 +202,7 @@ pub trait VsockDevice: Send + Sync {
 /// contract are `src/vfs/p9.rs`'s whichever bus the device answered on. What a
 /// machine supplies is the transport the crate's driver was built over, so the
 /// device's type is erased here and the mount table, the boot's own mount and the
-/// `mount -t 9p` factory are the same on both machines (`PLAN.md` §13.29).
+/// `mount -t 9p` factory are the same on both machines (`NOTES.md` §13.29).
 ///
 /// Two methods, because they are the two the protocol client and the mount table
 /// ask for. A machine with no share has no device to hand `p9::mount`, which
@@ -268,6 +258,23 @@ pub trait ConsolePort: Send + Sync {
     fn send(&self, buf: &[u8]) -> bool;
 }
 
+/// The entropy pipe, as `/dev/hwrng` and the kernel seed see it: a request
+/// for bytes and the device's answer of how many landed.
+///
+/// The same split as the console port and the sound card, and for the same
+/// reason. The family is one - virtio-rng - and everything above the
+/// transport was written twice: two wrapper types, two globals, two `fill`
+/// bodies, two `entropy()` reads and two devfs node definitions that differed
+/// only in which handle they closed over. What a machine supplies is the
+/// transport the crate's driver is built over, so the device's type is erased
+/// here and one copy of each of those answers serves both buses
+/// (`NOTES.md` §15.2).
+pub trait EntropySource: Send + Sync {
+    /// Fill `out` with bytes the host generated, answering how many landed -
+    /// the whole buffer for a healthy device, fewer or none for a quiet one.
+    fn fill(&self, out: &mut [u8]) -> usize;
+}
+
 /// The sound card, as `/dev/dsp` sees it: the stream userland writes PCM frames
 /// into, and the parameters that shape them.
 ///
@@ -277,7 +284,7 @@ pub trait ConsolePort: Send + Sync {
 /// to the device. What a machine supplies is the transport the crate's driver is
 /// built over, so the card's own type is erased here and the devfs node, the
 /// ioctl vocabulary and the boot's probe line are the same on both
-/// (`PLAN.md` §13.27).
+/// (`NOTES.md` §13.27).
 ///
 /// Three methods, because they are the three the device face and the boot
 /// actually ask for. The rest of the card - which rates it lists, which formats,

@@ -133,7 +133,7 @@ struct DevNode {
     /// permission checks read. Devices are born `0666 root:root` here - the
     /// mode `stat` already reported for them before any of this existed, and
     /// the number udev's rules then tighten or hand out by group. The named
-    /// gap in `PLAN.md` keeps Linux's *devtmpfs* birth (`0600` until udev);
+    /// gap in `NOTES.md` keeps Linux's *devtmpfs* birth (`0600` until udev);
     /// what this commit ends is the silence, not that difference.
     perms: NodePerms,
 }

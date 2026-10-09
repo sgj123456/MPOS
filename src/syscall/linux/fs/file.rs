@@ -28,18 +28,19 @@ use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X
 // it is the layer that knows which request belongs to which device - and it is
 // exactly what the VFS stopped doing: `Inode` carries no method per device type
 // any more, so a caller asks the node for its concrete type through
-// `dyn Inode::as_any` instead (`PLAN.md` §11.2 Step B1, V-1). Gated with the
+// `dyn Inode::as_any` instead (`NOTES.md` §11.2 Step B1, V-1). Gated with the
 // modules they come from, which the host build does not compile.
-// `drivers` is a machine module, and its node types exist only on the machine
-// that carries the hardware. aarch64 has not been given that hardware yet (the
-// driver stage comes after the syscall stage), so these concrete types are
-// deferred here too; every use site below is gated the same way, and the socket
-// and device side effects fall to an honest no-op rather than a fake device.
-#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+// `drivers` is a machine module, and its node types are named here so the
+// syscall layer can hand a device its own side effects (an evdev client's read
+// position, a seat grab released on close, a uinput device unmade with its
+// description). The hardware those types reach is on both machines now - the
+// second one's input registry and GPU came up with its port - so the gate is
+// `target_os = "none"` alone: the host build still cannot compile `drivers`.
+#[cfg(target_os = "none")]
 use crate::drivers::drm::DrmCard;
-#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+#[cfg(target_os = "none")]
 use crate::drivers::uinput::Uinput;
-#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+#[cfg(target_os = "none")]
 use crate::drivers::virtio::input::EvdevNode;
 
 /// The file a `linkat` source name leads to, with `AT_SYMLINK_FOLLOW`.
@@ -212,7 +213,10 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             }
             created = true;
             if let Some((dir, name)) = parent_for_news {
-                crate::vfs::inotify::emit(&dir, crate::vfs::inotify::IN_CREATE, &name);
+                // `create_file_opt` makes a file, so this name's create event
+                // carries no `IN_ISDIR` - and the bit has to come from the
+                // child rather than from the directory the name landed in.
+                crate::vfs::inotify::emit_child(&dir, crate::vfs::inotify::IN_CREATE, &name, false);
             }
             // A file born through `open(O_CREAT, mode)` carries that mode, and
             // this is how a package is unpacked: `apk` writes every extracted
@@ -332,7 +336,7 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                 // description that will do the reading: Linux hands a client
                 // its own event buffer at `open`, so an event that arrives
                 // before the first read is still that client's to read.
-                #[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+                #[cfg(target_os = "none")]
                 if let Some(ev) = file.inode().as_any().downcast_ref::<EvdevNode>() {
                     ev.opened(file.ofd());
                 }
@@ -1274,7 +1278,14 @@ pub fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
                 if child.metadata().kind == crate::vfs::NodeKind::Socket {
                     crate::net::unix::unbind_node(&child);
                 }
-                crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_DELETE, &name);
+                // The victim's own kind decides `IN_ISDIR`, not the
+                // directory's: the name that left is the event's subject.
+                crate::vfs::inotify::emit_child(
+                    &parent,
+                    crate::vfs::inotify::IN_DELETE,
+                    &name,
+                    child.metadata().kind == crate::vfs::NodeKind::Dir,
+                );
                 crate::vfs::inotify::notify_deleted(&child);
             }
             0
@@ -1309,7 +1320,15 @@ pub fn rmdir(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     match crate::vfs::rmdir_opt(&path, Some(cwd.clone())) {
         Ok(()) => {
             if let Some((parent, name, child)) = news {
-                crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_DELETE, &name);
+                // The removed directory is the subject, so `IN_ISDIR` comes
+                // from it - which for `rmdir` is always set, but the question
+                // is asked of the child rather than assumed.
+                crate::vfs::inotify::emit_child(
+                    &parent,
+                    crate::vfs::inotify::IN_DELETE,
+                    &name,
+                    child.metadata().kind == crate::vfs::NodeKind::Dir,
+                );
                 crate::vfs::inotify::notify_deleted(&child);
             }
             0
@@ -1358,7 +1377,8 @@ pub fn mkdirat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     match parent.create(name, NodeKind::Dir) {
         Ok(created) => {
             created.set_mode(masked_mode(args[2] as u32));
-            crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_CREATE, name);
+            let is_dir = created.metadata().kind == crate::vfs::NodeKind::Dir;
+            crate::vfs::inotify::emit_child(&parent, crate::vfs::inotify::IN_CREATE, name, is_dir);
             let _ = created;
             0
         }
@@ -1678,7 +1698,9 @@ pub fn symlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     }
     match parent.symlink(name, &target) {
         Ok(_) => {
-            crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_CREATE, name);
+            // The new name is a symlink, so its create event is never an
+            // `IN_ISDIR` one.
+            crate::vfs::inotify::emit_child(&parent, crate::vfs::inotify::IN_CREATE, name, false);
             0
         }
         Err(e) => err_of(e),
@@ -1878,7 +1900,7 @@ fn mount_new(
         // opens the device QEMU was told `-virtfs ...,mount_tag=hostshare`
         // for. An empty source takes the only share the bus has, which is
         // the same call the boot's own mount makes. Both machines have the
-        // device now (`PLAN.md` §13.29), so the arm is the filesystem's
+        // device now (`NOTES.md` §13.29), so the arm is the filesystem's
         // rather than one machine's.
         "9p" => match crate::vfs::p9::mount(source) {
             Ok(fs) => fs,
@@ -2147,6 +2169,11 @@ pub fn next_anon_ino() -> crate::vfs::Ino {
 /// implementation is the confined case, and a named divergence that it does not
 /// mimic Linux's unconfined one).
 pub fn handle_chroot(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    // `CAP_SYS_CHROOT` first, as Linux asks it - before the path is even
+    // looked at (a root-less caller answers `EPERM` whatever the path names).
+    if !crate::sched::current_credentials().has_effective(crate::cred::CAP_SYS_CHROOT) {
+        return err::EPERM;
+    }
     let path = match cstr_arg(args[0], true) {
         Ok(p) => p,
         Err(e) => return e,
@@ -3144,7 +3171,7 @@ pub fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         // which is what lets a compositor that was killed (or a test that closed
         // the device) leave the keyboard claimable instead of grabbing it from
         // beyond its own grave.
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_os = "none")]
         if let Some(ev) = file.inode().as_any().downcast_ref::<EvdevNode>() {
             ev.set_grab(false, file.ofd());
         }
@@ -3172,7 +3199,7 @@ pub fn handle_close(args: [usize; ARG_COUNT]) -> isize {
     // is asked *after* the close, where "last" is knowable: a `dup` is the same
     // reader and has to keep its place, so only the descriptor that took the
     // final reference forgets it.
-    #[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+    #[cfg(target_os = "none")]
     if Arc::strong_count(&file) == 1 {
         if let Some(ev) = file.inode().as_any().downcast_ref::<EvdevNode>() {
             ev.forget(file.ofd());
@@ -3718,8 +3745,19 @@ pub fn handle_pwrite64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// `preadv(fd, iov, iovcnt, offset)` / `pwritev`: the vectored pair at a
 /// position. Same position discipline as the scalar pair, same loop as
 /// `readv`/`writev` - the offset is the only thing added.
-fn io_at_position(args: [usize; ARG_COUNT], from_user: bool, writing: bool) -> isize {
-    let (fd, offset) = (args[0] as i32, args[3] as i64);
+///
+/// The offset arrives already read, because the two machines spell it
+/// differently and the reading is [`position_offset`]'s job: passing the raw
+/// arguments down to the closure is right (the loop needs `iov`/`iovcnt`),
+/// but reading the *position* from them here would read one machine's shape
+/// on both.
+fn io_at_position(
+    fd: i32,
+    offset: i64,
+    args: [usize; ARG_COUNT],
+    from_user: bool,
+    writing: bool,
+) -> isize {
     if offset < 0 {
         return err::EINVAL;
     }
@@ -3737,12 +3775,18 @@ fn io_at_position(args: [usize; ARG_COUNT], from_user: bool, writing: bool) -> i
 
 /// `preadv(2)` — vectored read at a position.
 pub fn handle_preadv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    io_at_position(args, from_user, false)
+    io_at_position(
+        args[0] as i32,
+        position_offset(args),
+        args,
+        from_user,
+        false,
+    )
 }
 
 /// `pwritev(2)` — vectored write at a position.
 pub fn handle_pwritev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    io_at_position(args, from_user, true)
+    io_at_position(args[0] as i32, position_offset(args), args, from_user, true)
 }
 
 /// `fsync(fd)` / `fdatasync(fd)` — flush a descriptor to its storage.
@@ -4126,9 +4170,16 @@ pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     match parent.link(name, &old) {
         Ok(()) => {
             // A second name is a new entry in the destination directory -
-            // the create event belongs to it, with the watched inode's own
-            // `IN_ATTRIB`-style news left to a later hook family.
-            crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_CREATE, name);
+            // the create event belongs to it, and `IN_ISDIR` describes the
+            // inode the name now points at rather than the directory, with
+            // the watched inode's own `IN_ATTRIB`-style news left to a later
+            // hook family.
+            crate::vfs::inotify::emit_child(
+                &parent,
+                crate::vfs::inotify::IN_CREATE,
+                name,
+                old.metadata().kind == crate::vfs::NodeKind::Dir,
+            );
             0
         }
         Err(e) => err_of(e),
@@ -4952,6 +5003,55 @@ pub fn handle_pwritev2(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     vectored_at_position(args, from_user, true)
 }
 
+/// The position and the advice word of a `preadv2`/`pwritev2` call, read the
+/// way *this* machine's ABI spells them.
+///
+/// The two machines do not agree on the shape, and the difference is the
+/// 32-bit `off_t` x86_64 carries for its own historical reasons: there the
+/// position arrives as two halves (`pos_l`, `pos_h`) and the advice word is
+/// the *sixth* argument, while asm-generic - aarch64 - passes the whole
+/// 64-bit position as the fourth and the advice word fifth
+/// (`preadv2(fd, iov, iovcnt, pos, flags)`, which is what musl emits on
+/// arm64). Reading one shape on both machines is wrong on one of them: the
+/// generic read on x86_64 takes the high half of the position for the flags
+/// and truncates the position to its low 32 bits, so a negative position
+/// becomes a huge positive one, the cursor spelling (`-1`) is not
+/// recognised, and every advice bit in the sixth slot is invisible - the
+/// seven claims `t-preadv2` makes about exactly those words.
+#[cfg(target_arch = "x86_64")]
+fn position_and_flags(args: [usize; ARG_COUNT]) -> (i64, usize) {
+    (position_offset(args), args[5])
+}
+
+/// The asm-generic reading: see [`position_and_flags`]'s note on the two
+/// machines.
+#[cfg(not(target_arch = "x86_64"))]
+fn position_and_flags(args: [usize; ARG_COUNT]) -> (i64, usize) {
+    (position_offset(args), args[4])
+}
+
+/// The position a `preadv`/`pwritev`/`preadv2`/`pwritev2` call names, which
+/// is the half of the argument shape the four calls share - only the advice
+/// word on the end differs between the `*v2` pair and the plain one, so the
+/// reading of the position lives here once.
+///
+/// x86_64 splits the 64-bit position across two 32-bit words (`pos_l` then
+/// `pos_h`) and asm-generic passes it whole; `-1` arrives as `0xffff_ffff`
+/// in each half there, and the all-ones pair *is* the offset the cursor
+/// spelling means, so the halves have to be rejoined before anything asks
+/// whether the position is negative.
+#[cfg(target_arch = "x86_64")]
+fn position_offset(args: [usize; ARG_COUNT]) -> i64 {
+    (args[3] as u32 as u64 | (args[4] as u64) << 32) as i64
+}
+
+/// The asm-generic position: one 64-bit argument, with the fourth slot left
+/// to `flags` where the `*v2` calls have one.
+#[cfg(not(target_arch = "x86_64"))]
+fn position_offset(args: [usize; ARG_COUNT]) -> i64 {
+    args[3] as i64
+}
+
 fn vectored_at_position(args: [usize; ARG_COUNT], from_user: bool, writing: bool) -> isize {
     const RWF_HIPRI: usize = 0x1;
     const RWF_DSYNC: usize = 0x2;
@@ -4970,7 +5070,7 @@ fn vectored_at_position(args: [usize; ARG_COUNT], from_user: bool, writing: bool
         | RWF_ATOMIC
         | RWF_DONTCACHE;
 
-    let (fd, offset, flags) = (args[0] as i32, args[3] as i64, args[4]);
+    let (fd, (offset, flags)) = (args[0] as i32, position_and_flags(args));
     if flags & !KNOWN != 0 || flags & RWF_ATOMIC != 0 {
         // Unknown advice is the man page's EOPNOTSUPP; ATOMIC is known but
         // asks for a torn-write guarantee no storage here can make.
@@ -4997,11 +5097,7 @@ fn vectored_at_position(args: [usize; ARG_COUNT], from_user: bool, writing: bool
             handle_readv(args, from_user)
         };
     }
-    io_at_position(
-        [args[0], args[1], args[2], offset as usize, 0, 0],
-        from_user,
-        writing,
-    )
+    io_at_position(fd, offset, args, from_user, writing)
 }
 
 // ---------------------------------------------------------------------------
@@ -5257,7 +5353,8 @@ pub fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     match parent.create(name, kind) {
         Ok(created) => {
             created.set_mode(masked_mode(args[2] as u32));
-            crate::vfs::inotify::emit(&parent, crate::vfs::inotify::IN_CREATE, name);
+            let is_dir = created.metadata().kind == crate::vfs::NodeKind::Dir;
+            crate::vfs::inotify::emit_child(&parent, crate::vfs::inotify::IN_CREATE, name, is_dir);
             let _ = created;
             0
         }
@@ -5525,6 +5622,14 @@ pub fn handle_syncfs(args: [usize; ARG_COUNT]) -> isize {
 /// are accepted: this kernel has one loglevel — everything — and one
 /// user.
 pub fn handle_syslog(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    // The capability gate Linux puts *before everything*: a caller without
+    // `CAP_SYSLOG` answers `EPERM` even for a type it would otherwise refuse
+    // (host-measured: the container's unknown type 99 came back `EPERM`, not
+    // `EINVAL`, `NOTES.md` §15.11 batch 29). The check is first for exactly
+    // that ordering.
+    if !crate::sched::current_credentials().has_effective(crate::cred::CAP_SYSLOG) {
+        return err::EPERM;
+    }
     const READ: usize = 2;
     const READ_ALL: usize = 3;
     const READ_CLEAR: usize = 4;

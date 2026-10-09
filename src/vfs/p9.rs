@@ -10,7 +10,7 @@
 //! in this tree already answers.
 //!
 //! The dialect is **9P2000.u**, and that is measured rather than chosen
-//! (`PLAN.md` §13.29): QEMU 11.1.1's virtfs answers `"unknown"` to a plain
+//! (`NOTES.md` §13.29): QEMU 11.1.1's virtfs answers `"unknown"` to a plain
 //! `9P2000` `Tversion` and `9P2000.u` to this one, so the plain dialect this
 //! client used to ask for is one no modern server serves. `.u` is 9P2000 plus
 //! the numeric ids (attach's `n_uname`, a stat's `n_uid`/`n_gid`/`n_muid`) and
@@ -64,7 +64,7 @@ use critical_section::Mutex;
 
 /// The dialect this client speaks.
 ///
-/// **9P2000.u**, and that is measured rather than preferred (`PLAN.md` §13.29):
+/// **9P2000.u**, and that is measured rather than preferred (`NOTES.md` §13.29):
 /// QEMU 11.1.1's virtfs answers `"unknown"` to a plain `9P2000` `Tversion` and
 /// `9P2000.u` to this one, so the plain dialect the client used to ask for is
 /// one no modern server serves. `.u` is `9P2000` plus the numeric ids

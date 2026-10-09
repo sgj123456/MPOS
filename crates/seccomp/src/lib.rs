@@ -483,7 +483,7 @@ pub fn action_data(ret: u32) -> u32 {
 /// `seccomp(2)`'s availability probe.
 ///
 /// Every constant below appears because the gate does what Linux does with it,
-/// and each of those was measured rather than assumed (PLAN.md §8.2 holds the
+/// and each of those was measured rather than assumed (NOTES.md §8.2 holds the
 /// observations). Two kinds of word are refused:
 ///
 /// * an action this kernel does not implement - which today is only

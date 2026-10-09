@@ -3,7 +3,7 @@
 //! The contract pinned here is the round-trip, which the kernel used to fail:
 //! `setpriority` accepted any in-range value and dropped it, and `getpriority`
 //! answered a constant `20` (the raw encoding of nice 0) whatever had been set.
-//! That is the silent-success `PLAN.md` §4 forbids - a caller that set a nice
+//! That is the silent-success `NOTES.md` §4 forbids - a caller that set a nice
 //! and read it back to decide what to do next was handed a number that had
 //! nothing behind it.
 //!

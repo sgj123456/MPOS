@@ -30,7 +30,7 @@
 //! implementation over the one crate driver. So everything above the transport -
 //! the family's phases, ports and accept queue in `src/net/vsock.rs`, and the
 //! pump that keeps its events moving - is one copy on both machines, and the only
-//! lines that name a bus are the two probes that open it (`PLAN.md` §13.28).
+//! lines that name a bus are the two probes that open it (`NOTES.md` §13.28).
 
 #[cfg(target_arch = "x86_64")]
 use alloc::sync::Arc;
@@ -72,7 +72,7 @@ impl<T: Transport> VirtioVsock<T> {
     /// Wrap the crate's driver as the family's device.
     ///
     /// The CID the host assigned this guest is read once, here, because the
-    /// manager owns the driver from this point on (`PLAN.md` §13.28). The
+    /// manager owns the driver from this point on (`NOTES.md` §13.28). The
     /// connection manager is built with this kernel's receive window, which is
     /// the only tuning the protocol leaves to the guest.
     pub fn new(driver: VirtIOSocket<HalImpl, T>) -> Self {

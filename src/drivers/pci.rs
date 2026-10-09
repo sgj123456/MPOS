@@ -537,7 +537,7 @@ pub fn claim(func: &Func, driver: &'static str) {
 }
 
 /// Declare `func` to be the home of the DRM/KMS card, so `vfs::sysfs` hangs the
-/// card's nodes off it (`crate::pci::mark_drm_card`, `PLAN.md` §7.4).
+/// card's nodes off it (`crate::pci::mark_drm_card`, `NOTES.md` §7.4).
 pub fn mark_drm_card(func: &Func) {
     let (bus, dev, function) = func.bdf();
     crate::pci::mark_drm_card(bus, dev, function);

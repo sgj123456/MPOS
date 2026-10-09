@@ -709,7 +709,7 @@ fn system_register(name: &str) -> u64 {
 /// the x86_64 `page_fault` states where it resolves a COW split "whoever made it".
 ///
 /// This entry only became reachable when `user_accessible` started *accepting* a
-/// page the tables do not describe yet (`PLAN.md` §13.9): before that the check
+/// page the tables do not describe yet (`NOTES.md` §13.9): before that the check
 /// refused every absent page, so the kernel never copied into one, so a syscall
 /// could only ever touch present memory. On x86_64 the two halves landed together
 /// and the fault path was always there.

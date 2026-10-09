@@ -104,7 +104,7 @@ pub struct Segment<'a> {
 ///   is exactly the mapping a dynamic loader makes for a shared library's
 ///   segments, so the first `dlopen` on the second machine failed with "Error
 ///   loading shared library librc.so.1: Invalid argument" while the statically
-///   linked programs, whose mappings are never fixed, ran fine. (`PLAN.md` §9.1
+///   linked programs, whose mappings are never fixed, ran fine. (`NOTES.md` §9.1
 ///   named this follow-on when it wrote down that the value was still x86_64's.)
 /// - host: the x86_64 value, so the host-tested placement math matches x86.
 ///
@@ -125,7 +125,7 @@ pub const USER_LIMIT: usize = 1 << 48;
 /// (which owns the mapping plan and `USER_LIMIT` above) and not in `syscall`,
 /// whose dispatch it has nothing to do with; naming `crate::syscall::MMAP_BASE`
 /// from `sched` was a recorded `sched -> syscall` edge blocking the aarch64
-/// un-gate (`PLAN.md` §9.1, §11.2).
+/// un-gate (`NOTES.md` §9.1, §11.2).
 ///
 /// - x86_64: `0x7f00_0000_0000`, the classical Linux mmap base, below the
 ///   `1 << 47` canonical line with a terabyte of stack headroom above it.

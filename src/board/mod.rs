@@ -20,7 +20,7 @@
 //! The half of a body that is *not* this machine's - the steps every port's
 //! `init` runs, and the ordering contracts in them - is [`steps`], next to the
 //! bodies that call it, so a body here holds only what would have to be answered
-//! differently on a different machine (`PLAN.md` §14.9).
+//! differently on a different machine (`NOTES.md` §14.9).
 
 mod checks;
 mod report;
@@ -58,9 +58,9 @@ pub use aarch64::start;
 pub use report::panic_context;
 
 /// A machine with no body fails to link rather than silently building an image
-/// whose entry point cannot run - the same loud failure `PLAN.md` §9.1 asks for.
+/// whose entry point cannot run - the same loud failure `NOTES.md` §9.1 asks for.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!(
     "no kernel body for this target: add src/board/<arch>.rs and a `mod` arm here, \
-     and see PLAN.md §9.1 for what a port needs"
+     and see NOTES.md §9.1 for what a port needs"
 );

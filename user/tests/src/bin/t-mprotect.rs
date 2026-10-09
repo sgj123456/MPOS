@@ -18,7 +18,7 @@
 //! `mprotect` takes typed flags and owns nothing here that this program
 //! claims). The unaligned probe addresses live in a PROT_NONE arena the test
 //! maps first, so the refusal is about alignment rather than about whose
-//! page happens to be there (`PLAN.md` §15.11 batch 14's fixture rule).
+//! page happens to be there (`NOTES.md` §15.11 batch 14's fixture rule).
 
 use mpos_user_tests::Report;
 
@@ -78,20 +78,29 @@ fn main() {
 
     // The refusal set: only the address's alignment is validated. The probe
     // sits at an unaligned address inside nobody's mapping (arena base +
-    // 0x123), so the answer is about alignment alone.
+    // 0x123), so the answer is about alignment alone - and it goes through
+    // `libc::syscall`, because the *wrapper* never carries an unaligned
+    // address to the kernel at all: musl's `mprotect` rounds the range out to
+    // whole pages (`start & -PAGE_SIZE`, `end` rounded up) the way POSIX says
+    // a caller may ask, so `libc::mprotect` on the same address answers 0
+    // having asked about the enclosing pages - measured here, and it is why
+    // this claim reads the raw door (the same reason `t-rtc`, `t-vt` and
+    // `t-dsp` do).
     let bad = unsafe {
-        libc::mprotect(
-            arena.cast::<u8>().add(0x123) as *mut _,
+        libc::syscall(
+            libc::SYS_mprotect,
+            arena as usize + 0x123,
             PAGE,
             libc::PROT_READ,
-        )
+        ) as isize
     };
-    // On real Linux an aligned hole inside an unmapped region is skipped
-    // silently (answer 0, measured here); mpos validates the address itself
-    // and answers EINVAL whatever lives there. The payload pins EINVAL.
+    // On real Linux an unaligned address is EINVAL from the kernel and
+    // silently rounded by the wrapper (measured here); mpos validates the
+    // address itself and answers EINVAL to whichever door asked. The payload
+    // pins EINVAL.
     r.check(
         "an unaligned address answers EINVAL",
-        refused(bad as isize, libc::EINVAL) || mpos_user_tests::host_run() && bad == 0,
+        refused(bad, libc::EINVAL) || mpos_user_tests::host_run() && bad == 0,
     );
     let zero_len = unsafe { libc::mprotect(p, 0, libc::PROT_READ) };
     r.check("a zero length answers 0", zero_len == 0);

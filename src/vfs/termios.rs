@@ -17,6 +17,27 @@ pub const NCCS: usize = 32;
 /// The size of the `struct termios` glibc lays out - four flag words, a line
 /// discipline byte, the control characters, and two speeds.
 pub const SIZE: usize = 60;
+/// Control characters a *wire* structure carries: Linux's `NCCS`, from
+/// `asm-generic/termbits.h` - the seventeen POSIX indices plus `VEOL2` and one
+/// spare. A libc's own `struct termios` may pad `c_cc` out to more slots for
+/// its own use, which is why [`NCCS`] (the array this module keeps) and the
+/// count exchanged with userspace are not the same number.
+const WIRE_NCCS: usize = 19;
+/// `sizeof(struct termios2)`: the shape Linux's `TCGETS2`/`TCSETS2` exchange,
+/// and the one a maintained binding reaches for. It is [`SIZE`]'s first 36
+/// bytes - four flag words, `c_line`, and [`WIRE_NCCS`] control characters,
+/// with no padding - followed by `c_ispeed` and `c_ospeed`.
+///
+/// The two shapes are why `TCGETS2` had to be served rather than left to
+/// `ENOTTY`. `rustix::termios::tcgetattr` asks for `TCGETS2` first and falls
+/// back to `TCGETS`; its buffer is a `struct termios2`, 44 bytes. Answered
+/// `ENOTTY`, it fell back, and the 60-byte [`SIZE`] write overran that buffer
+/// by sixteen bytes - whose last eight are the two 38400 speeds, landing on
+/// the caller's saved return address. On x86_64 that clobbered a stack slot
+/// (the test's slave descriptor went `EBADF` for one call); on aarch64 it
+/// became the return address itself, and the program died fetching an
+/// instruction at `0x960000009600`.
+pub const TERMIOS2_SIZE: usize = 44;
 
 // --- c_iflag: what happens to input on the way in. ---
 pub const IGNBRK: u32 = 0x0001;
@@ -153,6 +174,11 @@ const OFF_CC: usize = 17;
 const OFF_ISPEED: usize = 52;
 const OFF_OSPEED: usize = 56;
 
+// The `termios2` layout: the same head, then the two speeds at the first
+// four-byte boundary after the 19 control characters.
+const OFF_ISPEED2: usize = 36;
+const OFF_OSPEED2: usize = 40;
+
 /// Read a flag word from a userspace buffer that may not be aligned.
 ///
 /// # Safety
@@ -208,11 +234,51 @@ impl Termios {
             write_u32(ptr, OFF_OSPEED, self.ospeed);
         }
     }
+
+    /// Lay the structure out as `struct termios2` - the head [`SIZE`] carries,
+    /// with the 19 control characters rather than the padded 32, and the two
+    /// speeds written out where a `TCGETS2` caller has room for them.
+    ///
+    /// # Safety
+    /// `ptr` must point to at least `TERMIOS2_SIZE` writable bytes.
+    pub unsafe fn store_to2(&self, ptr: *mut u8) {
+        unsafe {
+            write_u32(ptr, OFF_IFLAG, self.iflag);
+            write_u32(ptr, OFF_OFLAG, self.oflag);
+            write_u32(ptr, OFF_CFLAG, self.cflag);
+            write_u32(ptr, OFF_LFLAG, self.lflag);
+            *ptr.add(OFF_LINE) = self.line;
+            core::ptr::copy_nonoverlapping(self.cc.as_ptr(), ptr.add(OFF_CC), WIRE_NCCS);
+            write_u32(ptr, OFF_ISPEED2, self.ispeed);
+            write_u32(ptr, OFF_OSPEED2, self.ospeed);
+        }
+    }
+
+    /// Parse the `struct termios2` a `TCSETS2` caller handed the kernel.
+    ///
+    /// # Safety
+    /// `ptr` must point to at least `TERMIOS2_SIZE` readable bytes.
+    pub unsafe fn from_ptr2(ptr: *const u8) -> Termios {
+        let mut cc = [0u8; NCCS];
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr.add(OFF_CC), cc.as_mut_ptr(), WIRE_NCCS);
+        }
+        Termios {
+            iflag: unsafe { read_u32(ptr, OFF_IFLAG) },
+            oflag: unsafe { read_u32(ptr, OFF_OFLAG) },
+            cflag: unsafe { read_u32(ptr, OFF_CFLAG) },
+            lflag: unsafe { read_u32(ptr, OFF_LFLAG) },
+            line: unsafe { *ptr.add(OFF_LINE) },
+            cc,
+            ispeed: unsafe { read_u32(ptr, OFF_ISPEED2) },
+            ospeed: unsafe { read_u32(ptr, OFF_OSPEED2) },
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ECHO, ICANON, NCCS, SIZE, Termios};
+    use super::{ECHO, ICANON, NCCS, SIZE, TERMIOS2_SIZE, Termios};
 
     #[test]
     fn a_stored_termios_reads_back_as_itself() {
@@ -222,6 +288,27 @@ mod tests {
         let back = unsafe { Termios::from_ptr(buf.as_ptr()) };
         assert_eq!(back, tio);
         assert_eq!(back.cc.len(), NCCS);
+    }
+
+    /// `termios2` is the `TCGETS2` shape, and its two speeds sit where Linux
+    /// puts them: the first four-byte boundary after the nineteen control
+    /// characters, at 36 and 40 of a 44-byte structure. A binding sizes its
+    /// buffer by that number, so the layout - not just the round trip - is
+    /// what has to hold: getting it wrong is what wrote past the caller.
+    #[test]
+    fn a_termios2_carries_its_speeds_at_the_end_of_forty_four_bytes() {
+        let mut buf = [0u8; TERMIOS2_SIZE];
+        let tio = Termios::console_default();
+        unsafe { tio.store_to2(buf.as_mut_ptr()) };
+        assert_eq!(&buf[36..40], &tio.ispeed.to_ne_bytes());
+        assert_eq!(&buf[40..44], &tio.ospeed.to_ne_bytes());
+        let back = unsafe { Termios::from_ptr2(buf.as_ptr()) };
+        assert_eq!(back, tio);
+        // The head both shapes share: the flags, the line discipline, and the
+        // first nineteen control characters, at the same offsets either way.
+        let mut short = [0u8; SIZE];
+        unsafe { tio.store_to(short.as_mut_ptr()) };
+        assert_eq!(&short[..36], &buf[..36]);
     }
 
     #[test]

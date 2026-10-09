@@ -20,7 +20,7 @@
 //! same numbers. The clocks are why the test exists - they used to be written
 //! 32 bytes from where Linux puts them and nothing failed, because this kernel's
 //! filesystems stamp a file's three clocks from one source and no test read them
-//! back (`PLAN.md` §13.11).
+//! back (`NOTES.md` §13.11).
 
 use rustix::fs::{AtFlags, CWD, StatxFlags, Timespec, Timestamps};
 use std::ffi::CString;

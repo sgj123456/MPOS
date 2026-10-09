@@ -1,7 +1,7 @@
 //! t-drm-props - the connector and plane properties a compositor reads *before*
 //! it decides it can drive this card, and the two blobs they point at.
 //!
-//! `PLAN.md` §7.4 lists the property families a second compositor family looks
+//! `NOTES.md` §7.4 lists the property families a second compositor family looks
 //! up by name. This card publishes the four its hardware can back - `EDID`,
 //! `non-desktop`, `max bpc`, `vrr_capable` on the connector, `IN_FORMATS` on the
 //! plane - and the shapes here are Linux's as *measured* (`modetest -c -p`

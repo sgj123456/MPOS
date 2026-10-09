@@ -18,7 +18,7 @@
 //! frame past musl's own. That is also why the overflow outlived every
 //! program's own `stat` calls, and why what it finally broke was somewhere else
 //! entirely: a non-empty `std::fs::remove_dir_all` jumped to `pc 0` inside the
-//! `fdopendir` that musl's tree walk is built on (`PLAN.md` §13.10, and
+//! `fdopendir` that musl's tree walk is built on (`NOTES.md` §13.10, and
 //! `t-rmtree` for that end of it).
 //!
 //! So the claim pinned here is the *length* - canaries on both sides of a real

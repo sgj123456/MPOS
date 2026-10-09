@@ -15,7 +15,7 @@
 //! descriptor before it reads anything, keeps a `struct stat` inside the frame
 //! it needs its return address in. A non-empty `remove_dir_all` is where that
 //! was found: the second machine jumped to `pc 0` with `lr 0` inside the call,
-//! and the flat case is the shape it died of (`PLAN.md` §13.10, and
+//! and the flat case is the shape it died of (`NOTES.md` §13.10, and
 //! `t-stat-buffer` for the length itself).
 //!
 //! The refusals are pinned too, because they are the difference between taking

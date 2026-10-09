@@ -245,7 +245,7 @@ pub fn dir_newer_than(dir: &Path, after: SystemTime) -> Result<bool> {
 /// Written literally in the kernel's `check_p9_dev` too (`board/aarch64.rs`).
 /// A fixture both sides have to agree on has two copies, and the check's job is
 /// to notice if they drift; the disk image's `i as u8` pattern sector is the
-/// same arrangement (`PLAN.md` §13.29).
+/// same arrangement (`NOTES.md` §13.29).
 pub const P9_PROBE: &[u8] = b"mpos reads from the host share over 9p\n";
 
 /// The file name that line is written under, in every exported share.

@@ -26,7 +26,7 @@ use crate::boot::{BootInfo, MemRegion};
 // Re-exported from the `mpos-vm` leaf rather than declared here: page size and
 // the alignment arithmetic are part of what a `Mapping` *is*, so the machine
 // layer - which is becoming a crate that cannot depend on this one - has to be
-// able to name them (`PLAN.md` §14 S2b). The paths every caller already uses
+// able to name them (`NOTES.md` §14 S2b). The paths every caller already uses
 // are unchanged.
 pub use mpos_vm::{PAGE_SHIFT, PAGE_SIZE};
 pub(crate) use mpos_vm::{align_down, align_up};

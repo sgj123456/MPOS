@@ -8,7 +8,7 @@
 //! stays with the caller. This kernel used to refuse the family outright
 //! (`EAFNOSUPPORT`), which left the address configuration to a boot-time
 //! default nobody in userland could re-negotiate: the DHCP-shaped hole
-//! recorded in `PLAN.md`.
+//! recorded in `NOTES.md`.
 //!
 //! What is implemented here is the honest subset a DHCP client needs, with
 //! the refusals Linux would give beyond it:

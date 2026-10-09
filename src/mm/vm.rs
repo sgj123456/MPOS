@@ -8,7 +8,7 @@
 //! The vocabulary itself is the `mpos-vm` leaf now, re-exported under the names
 //! it has always had so every `crate::mm::vm::` caller is unchanged. It moved
 //! out because `hal::Paging` is written in it and the machine layer is becoming
-//! its own crate, which cannot depend on the kernel (`PLAN.md` §14 S2b) - and
+//! its own crate, which cannot depend on the kernel (`NOTES.md` §14 S2b) - and
 //! that is also why the tests that pin the plan went with it rather than
 //! staying here to test a re-export.
 

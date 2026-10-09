@@ -726,7 +726,7 @@ impl Stack {
     /// `SO_REUSEADDR` or did not.
     ///
     /// Linux's rule, measured on this host's kernel before it was written
-    /// (`PLAN.md` §4.3.3 carries the table). One clause decides every row:
+    /// (`NOTES.md` §4.3.3 carries the table). One clause decides every row:
     ///
     /// > a holder that is **listening** always keeps its name; any other
     /// > holder gives it up to a caller that set `SO_REUSEADDR` *and* whose
@@ -916,7 +916,7 @@ fn names_overlap(a: IpEndpoint, b: IpEndpoint) -> bool {
 /// (`0.0.0.0`), a port-0 bind and an unbound socket all land on eth0 - which is
 /// where Linux's wildcard listener lives too, and the one place this diverges
 /// is that a wildcard listener here does not also answer a loopback client
-/// (there is no second socket to answer it with; see `PLAN.md` §4.3).
+/// (there is no second socket to answer it with; see `NOTES.md` §4.3).
 pub(crate) fn home_of(addr: IpAddress) -> Home {
     match addr {
         IpAddress::Ipv4(v4) => match v4.octets() {

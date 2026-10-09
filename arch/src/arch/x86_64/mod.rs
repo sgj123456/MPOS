@@ -242,7 +242,7 @@ pub fn idle() {
 ///
 /// The binding lives here rather than in `hal` because its bodies name this
 /// module's `timer`/`rtc`/`idt` - a new architecture adds its own impls in its
-/// own module and edits no shared file (`PLAN.md` §9.1). Everything below is a
+/// own module and edits no shared file (`NOTES.md` §9.1). Everything below is a
 /// one-line static dispatch, so `crate::hal::ticks()` is exactly the
 /// `timer::ticks()` it replaced once monomorphised.
 impl crate::hal::Clock for crate::hal::Current {
@@ -602,7 +602,7 @@ impl crate::hal::SerialRing for crate::hal::Current {
 /// guess, and a CPU without it folds in nothing - the clock mix in `crate::rand`
 /// is the floor, not a claim of entropy. The rng *device* is deliberately not
 /// here: `virtio-rng` is a driver the kernel enumerates, not an answer this
-/// machine gives, and `crate::rand` folds it in itself (`PLAN.md` §14.3). That
+/// machine gives, and `crate::rand` folds it in itself (`NOTES.md` §14.3). That
 /// split is also why this trait can stay a machine trait.
 impl crate::hal::Entropy for crate::hal::Current {
     fn mix_into(seed: &mut [u8; 32]) {

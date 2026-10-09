@@ -839,7 +839,7 @@ pub fn format_maps(lines: &[MapLine]) -> String {
 /// `inode` when the pages are a *copy* of a file rather than the file's own
 /// pages. This kernel reads such a file in rather than paging it, so there is
 /// no object left to name - the mapping gets the file's name and zeroes for the
-/// two columns, and `PLAN.md` §7.4 records the gap.
+/// two columns, and `NOTES.md` §7.4 records the gap.
 #[cfg(target_os = "none")]
 fn maps_of(pid: usize) -> Option<String> {
     use crate::mm::vma::{Vma, VmaKind};

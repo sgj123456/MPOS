@@ -81,7 +81,7 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
 
 /// The structural check that belongs ahead of the compiler: a `#[cfg(test)]`
 /// module whose file only a `target_os = "none"` build reaches has never run,
-/// and nothing else in this pipeline would ever say so (`PLAN.md` §11.2 Step F,
+/// and nothing else in this pipeline would ever say so (`NOTES.md` §11.2 Step F,
 /// the V-11 class). Cheap enough to run on every sweep - it reads `src/*.rs`
 /// and matches attributes - and loud when it fires, because the alternative is
 /// a test count that looks like coverage.
@@ -101,7 +101,7 @@ fn check_target_gates() -> Result<()> {
     }
     bail!(
         "{} test module(s) can never run; host-compile the file or move the pins \
-         to a program that boots (PLAN.md §11.2 Step F)",
+         to a program that boots (NOTES.md §11.2 Step F)",
         dead.len()
     );
 }
@@ -137,6 +137,7 @@ const LEAF_CRATES: &[&str] = &[
     "mpos-evdev",
     "mpos-uinput",
     "mpos-fdt",
+    "mpos-acpi",
 ];
 
 fn run_unit_tests() -> Result<()> {
@@ -471,7 +472,7 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     // through the AHCI controller the `Boot::Esp` arm attaches. It is what
     // `t-ahci` reads, writes and reads back, which is the only way a driver
     // whose every line is a volatile register access gets pinned at all
-    // (`PLAN.md` §7.3). Sparse and small: the test writes one sector and reads
+    // (`NOTES.md` §7.3). Sparse and small: the test writes one sector and reads
     // it back, and nothing else in the suite touches it.
     let sata = build_dir.join(SATA_TEST_IMAGE);
     if sata.metadata().map(|m| m.len()).unwrap_or(0) != SATA_TEST_BYTES {
@@ -495,7 +496,7 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     // the bind would fail before the guest boots.
     // The share carries the 9p probe file too, so a test can mount it and read
     // the bytes back - the pin for the first machine's share, which used to be
-    // exported and never reachable (`PLAN.md` §13.29).
+    // exported and never reachable (`NOTES.md` §13.29).
     let share = utils::lay_p9_share(&build_dir.join("test-9p-share"))?;
     let mut config = crate::config::QemuConfig::load_default(Arch::X86_64)?;
     // A test boot never needs the host vsock bus, and claiming `guest-cid=3`
@@ -990,7 +991,7 @@ mod tests {
     /// linker dropped fails at the link step with an option the host `ld` does not
     /// know. The x86_64 block carries the same shape for the same reason; this
     /// pins the aarch64 one until the sweep that builds these programs is the
-    /// thing that would notice (`PLAN.md` §13.5).
+    /// thing that would notice (`NOTES.md` §13.5).
     #[test]
     fn the_aarch64_user_programs_are_declared_static_and_linked_by_rust_lld() {
         const HEADER: &str = "[target.aarch64-unknown-linux-musl]";

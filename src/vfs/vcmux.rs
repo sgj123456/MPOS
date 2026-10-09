@@ -7,7 +7,7 @@
 //! console's shell prints out to the serial wire, and it carries what is typed on
 //! the serial wire in to that shell. Six terminals, one wire, in turn.
 //!
-//! Both machines and not one, since `PLAN.md` §13.16: what this module needs from
+//! Both machines and not one, since `NOTES.md` §13.16: what this module needs from
 //! the world is the wire ([`crate::console`], which reaches it through `hal` on
 //! either machine) and the *display* - the render task to wake and the card to
 //! hand over - and the display half is asked for through `crate::console`'s

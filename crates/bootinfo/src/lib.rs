@@ -6,7 +6,7 @@
 //! can own it. `mpos-arch`'s `Paging::install` takes a [`BootInfo`] and its
 //! aarch64 entry takes a [`Handoff`], which is exactly why these two cannot
 //! live inside the kernel once the machine layer is its own crate
-//! (`PLAN.md` §14).
+//! (`NOTES.md` §14).
 //!
 //! # The two halves, and why only one of them is an ABI
 //!
@@ -166,7 +166,7 @@ impl MemKind {
     ///
     /// That exclusion is load-bearing rather than merely conservative, and it is
     /// not left to be inferred: `handoff::collect` refuses a record that offers
-    /// the boot stack as allocatable memory (`PLAN.md` §13.17), so a loader that
+    /// the boot stack as allocatable memory (`NOTES.md` §13.17), so a loader that
     /// disagreed about it stops by name instead of handing the kernel the stack it
     /// is standing on.
     pub fn is_allocatable(self) -> bool {

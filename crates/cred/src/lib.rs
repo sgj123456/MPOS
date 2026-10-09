@@ -42,7 +42,7 @@
 //! which is Linux's `set_dumpable(mm, suid_dumpable)`: the sysctl behind it
 //! defaults to 0, and the machine this was measured on had it set to 2, which
 //! is the one place these measurements disagree with the default this kernel
-//! implements. `PLAN.md` records the sysctl as the gap.
+//! implements. `NOTES.md` records the sysctl as the gap.
 
 /// The last capability number x86_64 Linux names. `CAP_BPF` is 39 and
 /// `CAP_CHECKPOINT_RESTORE` is 40, which is where the kernel's own
@@ -64,6 +64,18 @@ pub const CAP_SETPCAP: u32 = 8;
 /// requires - `FS_IOC_SETFLAGS`' own gate, and the one `chattr(1)` names in its
 /// errors.
 pub const CAP_LINUX_IMMUTABLE: u32 = 9;
+/// `CAP_SYS_CHROOT`, which `chroot(2)` requires.
+pub const CAP_SYS_CHROOT: u32 = 18;
+/// `CAP_SYS_ADMIN`, which the namespace `unshare`/`setns` family requires.
+pub const CAP_SYS_ADMIN: u32 = 21;
+/// `CAP_SYS_BOOT`, which `reboot(2)` requires.
+pub const CAP_SYS_BOOT: u32 = 22;
+/// `CAP_SYS_TTY_CONFIG`, which `vhangup(2)` requires.
+pub const CAP_SYS_TTY_CONFIG: u32 = 26;
+/// `CAP_SYSLOG`, which every `syslog(2)` type requires - the gate Linux
+/// checks *before* the type, so even an unknown type answers `EPERM` from a
+/// caller without it.
+pub const CAP_SYSLOG: u32 = 34;
 
 /// `SUID_DUMP_DISABLE`: nobody may inspect the process without a capability.
 pub const SUID_DUMP_DISABLE: u8 = 0;

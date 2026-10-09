@@ -31,7 +31,7 @@ pub use runtime::{
     current_pgid, current_real_owner, current_rlimit, current_root, current_stack_range,
     current_tgid, current_tls, current_umask, current_uts, deliver_pending_signal,
     descriptor_numbers, descriptors_of, detach_traced, discard_exit_code, exec_replace, exit,
-    exit_code, exit_group, fork, get_mmap_cursor, group_members, has_children,
+    exit_code, exit_group, fork, frames_range_free, get_mmap_cursor, group_members, has_children,
     has_deliverable_signal, has_live_child, has_seccomp_filter, has_tracer, init, insert_vma,
     is_child, is_running, is_stopped, itimer_snapshot, itimer_swap, kernel_lazy_accessible,
     madvise_dontneed, map_anon, map_facts, map_frames, may_inspect, membarrier_registrations,
@@ -52,12 +52,12 @@ pub use runtime::{
     take_signal_in_set, take_stop_report, take_vmas, task_count, thread_snapshots, timer_alloc,
     timer_arm, timer_overrun, timer_remove, timer_state, tls_of, trace_options, trace_syscall,
     tracer_of, try_spawn_user, uid_members, unmap_user, unshare_uts, user_frame_at, user_mapped,
-    user_range_free, vfork, vma_gaps, vma_prot_at, wait_any_child, wait_any_child_event,
+    vfork, vma_gaps, vma_prot_at, vma_range_free, wait_any_child, wait_any_child_event,
     wait_for_interrupt, wake, with_current_credentials, write_user, write_user_of, yield_now,
 };
 
 /// The stop accessors and the register-file snapshot are the machine's to build
-/// (`PLAN.md` §13): their `runtime` definitions carry a register file sized by
+/// (`NOTES.md` §13): their `runtime` definitions carry a register file sized by
 /// `hal::Contexts::ABI_REG_COUNT` and never look inside it - which register a
 /// value is in stays the machine's conversion. So they build on both machines;
 /// what is still x86_64's is the *syscall handler* that drives them, because

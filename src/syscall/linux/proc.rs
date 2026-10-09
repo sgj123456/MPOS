@@ -1860,20 +1860,26 @@ pub(super) fn handle_reboot(args: [usize; ARG_COUNT]) -> isize {
     // `LINUX_REBOOT_MAGIC1` instead, classifies it as unknown and refuses -
     // which is a `poweroff -f` that prints "Invalid argument" and leaves the
     // machine up, and a test run that never reaches its end.
-    match abi::reboot_command(args) {
-        Ok(abi::RebootCmd::Policy) => 0,
-        Ok(abi::RebootCmd::Stop) => {
-            let cmd = args[2];
-            crate::println!("mpos: reboot(0x{cmd:x}) - handing the machine back");
-            // The harness's test status, not an errno and not a machine: a run
-            // that ends here reached its end, and the exit code is how the gate
-            // reads that. Without a debug-exit device this halts.
-            crate::hal::exit_qemu(crate::hal::TEST_EXIT_OK);
-        }
+    let cmd = match abi::reboot_command(args) {
         // A command no kernel knows, whether or not it came with the magic.
-        Ok(abi::RebootCmd::Unknown) => err::EINVAL,
-        Err(e) => e,
+        Ok(abi::RebootCmd::Unknown) => return err::EINVAL,
+        Ok(cmd) => cmd,
+        Err(e) => return e,
+    };
+    // Linux's gate, after the magic and before the command (`CAP_SYS_BOOT`):
+    // a caller without it answers `EPERM` for every command, the CAD policy
+    // included. Everything in this image that reboots is root and holds it.
+    if !crate::sched::current_credentials().has_effective(crate::cred::CAP_SYS_BOOT) {
+        return err::EPERM;
     }
+    if let abi::RebootCmd::Policy = cmd {
+        return 0;
+    }
+    // The harness's test status, not an errno and not a machine: a run that
+    // ends here reached its end, and the exit code is how the gate reads
+    // that. Without a debug-exit device this halts.
+    crate::println!("mpos: reboot(0x{:x}) - handing the machine back", args[2]);
+    crate::hal::exit_qemu(crate::hal::TEST_EXIT_OK)
 }
 
 /// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — wait for one signal
@@ -2167,8 +2173,16 @@ use crate::mm::elf::USER_LIMIT;
 ///   depends on this: it claims the guard page of its heap by mapping
 ///   `PROT_NONE` over the first page of a range it has just grown with `brk`.
 ///   A kernel that refuses - or worse, asserts - breaks every musl program.
-/// * Without `MAP_FIXED` the address is only a hint, and a hint that is still
-///   in use is simply not taken: the mapping goes wherever there is room.
+/// * Without `MAP_FIXED` the address is only a hint, and one that is still
+///   *mapped* (a frame behind it) is simply not taken: the mapping goes
+///   wherever there is room. Linux's actual rule for a plain hint is finer
+///   than that, and now pinned here too: an unmapped hint whose range merely
+///   overlaps an existing VMA - even a lazily-mapped hole inside it - is
+///   refused with `EINVAL`, and only a range no VMA describes at all is
+///   honoured exactly (`NOTES.md` §15.18). This matters because the same
+///   overlap makes `brk(mm_brk)` answer `EINVAL` afterwards, which is how a
+///   libc that wants a fixed-address region recovers: try the break, get the
+///   refusal, map with `MAP_FIXED_NOREPLACE` instead.
 ///
 /// `PROT_NONE` maps a range the process may not reach rather than leaving it
 /// unmapped, so a later `mprotect` can hand it back with its permissions
@@ -2254,15 +2268,35 @@ fn handle_mmap_impl(args: [usize; ARG_COUNT]) -> isize {
         // mapping landing anywhere else - so an in-use address must not be
         // silently moved to a free run below.
         (false, Some(addr)) if no_replace => {
-            if crate::sched::user_range_free(addr, len) {
+            if crate::sched::vma_range_free(addr, len) {
                 addr
             } else {
                 return err::EEXIST;
             }
         }
-        // Without `MAP_FIXED` the address is only a hint, and one that is
-        // already in use is simply not taken.
-        (false, Some(addr)) if crate::sched::user_range_free(addr, len) => addr,
+        // Without `MAP_FIXED` the address is a hint, and Linux takes it
+        // exactly only when no VMA describes any part of the range: a hint
+        // over anything that is somebody's address is *declined and
+        // relocated*, not refused. What the hint answers to is the
+        // descriptions, not the frames - a lazily-mapped span whose pages
+        // have never arrived is as much in the way as a populated one - and
+        // that is the measurement `NOTES.md` §15.18 exists for: a frame-only
+        // check took a busy hint's answer for the whole rule, while real
+        // Linux relocates a hint inside a lazy `PROT_NONE` span exactly as it
+        // relocates one over a live mapping (re-measured on the run machine:
+        // both answer a fresh page elsewhere, neither answers `EINVAL`).
+        (false, Some(addr)) if !crate::sched::vma_range_free(addr, len) => {
+            match free_range(len, crate::sched::get_mmap_cursor()) {
+                Some((base, new_cursor)) => {
+                    crate::sched::set_mmap_cursor(new_cursor);
+                    base
+                }
+                None => return err::ENOMEM,
+            }
+        }
+        // A hint with nothing in the way is taken exactly: free of
+        // descriptions, and therefore free of frames too.
+        (false, Some(addr)) => addr,
         _ => match free_range(len, crate::sched::get_mmap_cursor()) {
             Some((base, new_cursor)) => {
                 crate::sched::set_mmap_cursor(new_cursor);
@@ -2439,21 +2473,21 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
     // asked separately - the frame travels if there is one, and the VMA travels
     // either way, so an untouched page of the old range becomes an untouched
     // page of the new one rather than an `EFAULT`. Whether each page is
-    // *reachable from ring 3* is kept, so a `PROT_NONE` page stays one.
+    // *reachable from ring 3* travels with it, and the VMA's permission word
+    // is the record of that: `handle_mmap` stores exactly the caller's prot
+    // into it (`PROT_NONE` is the absence of `USER`), every fault populates
+    // from the VMA's own flags, and `mprotect` rewrites both halves together.
+    // Reading the live PTE as well would disagree with the VMA for a lazily
+    // mapped page - no entry exists yet to read - and refusing such a page on
+    // its absent bits was this loop's bug (`NOTES.md` §15.18).
     let mut frames = alloc::vec::Vec::new();
     for page in (old_addr..old_addr + old).step_by(PAGE_SIZE) {
         if !crate::sched::user_mapped(page) {
             return err::EFAULT;
         }
         let frame = crate::sched::user_frame_at(page);
-        let reachable = match frame {
-            Some(_) => crate::hal::user_accessible(page, PAGE_SIZE, false),
-            // No page to read the bits from, so the VMA is what says whether
-            // the address was the process's to reach.
-            None => {
-                crate::sched::vma_prot_at(page).is_some_and(|prot| prot.contains(MapFlags::USER))
-            }
-        };
+        let reachable =
+            crate::sched::vma_prot_at(page).is_some_and(|prot| prot.contains(MapFlags::USER));
         frames.push((frame, reachable));
     }
 
@@ -2463,7 +2497,12 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
             crate::sched::munmap_user(old_addr + new, old - new);
             return old_addr as isize;
         }
-        if crate::sched::user_range_free(old_addr + old, new - old) {
+        // Linux grows only into pages its VMA says are free; the same
+        // description check as the plain hint above. A grow over untouched
+        // space inside an existing mapping is `ENOMEM` without MAYMOVE - what
+        // musl's `pthread_getattr_np` reads as "still inside the mapping"
+        // (`NOTES.md` §15.18).
+        if crate::sched::vma_range_free(old_addr + old, new - old) {
             // The grown tail is fresh anonymous memory: the range is claimed
             // and its pages arrive as they are touched, which is the same
             // zeros the eager mapping used to hand over.
@@ -2546,13 +2585,21 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
     dest as isize
 }
 
-/// The first run of `len` bytes, page-aligned and below the mmap base, that
-/// this process has nothing mapped in.
+/// The first run of `len` bytes at or below `cursor` that no VMA describes,
+/// page-aligned, with the cursor to store back for the next placement.
 ///
 /// The search runs downward and the cursor is the *bottom* of the last mapping
 /// placed: the next anonymous mapping goes just below the previous one, which
 /// is the direction Linux's mmap region grows in. `cursor` is the per-process
 /// mmap cursor; the returned value is the updated cursor to store back.
+///
+/// The question is asked of the *descriptions*, not the frames (§15.18): a
+/// lazily-mapped hole has no pages yet and is still somebody's address, and a
+/// placement into it would leave two VMAs over one range - the fault then
+/// resolves against whichever description comes first, and a `PROT_NONE` one
+/// wins an access its neighbour was granted. A frame-only walk did exactly
+/// that, and every arena test whose fixture is a lazy `PROT_NONE` mapping read
+/// the collision as a wrong address or a `SIGSEGV`.
 fn free_range(len: usize, cursor: usize) -> Option<(usize, usize)> {
     use crate::mm::pframe::PAGE_SIZE;
 
@@ -2560,11 +2607,19 @@ fn free_range(len: usize, cursor: usize) -> Option<(usize, usize)> {
     // clamp keeps the first placement of every process at the top.
     let mut top = cursor.min(MMAP_BASE);
     loop {
-        let bottom = top.checked_sub(len)? & !(PAGE_SIZE - 1);
-        if crate::sched::user_range_free(bottom, len) {
-            return Some((bottom, bottom));
+        let floor = top.checked_sub(len)? & !(PAGE_SIZE - 1);
+        // One window: everything from `floor` up to the *starting* cursor.
+        // Asking only the current step's slice would clip a hole that begins
+        // inside it and runs past its bottom edge - which is exactly the
+        // shape §15.18's arena has: a lazy `PROT_NONE` span whose upper half
+        // no description covers. The walk takes the highest run that fits.
+        for (hole_start, hole_end) in crate::sched::vma_gaps(floor, cursor.saturating_sub(floor)) {
+            let start = hole_start.next_multiple_of(PAGE_SIZE);
+            if start.checked_add(len).is_some_and(|end| end <= hole_end) {
+                return Some((start, start));
+            }
         }
-        top = bottom;
+        top = floor;
     }
 }
 
@@ -2591,6 +2646,11 @@ pub(super) fn handle_mprotect(args: [usize; ARG_COUNT]) -> isize {
     use crate::mm::pframe::PAGE_SIZE;
 
     let (addr, len, prot) = (args[0], args[1], args[2]);
+    // The address itself is validated here, before anything is protected: a
+    // caller that asked about a range starting mid-page gets `EINVAL` rather
+    // than a silently rounded one. (musl's own `mprotect` *does* round, so a
+    // program that wants the refusal has to ask through the raw door - which
+    // is what `t-mprotect` does.)
     if !addr.is_multiple_of(PAGE_SIZE) {
         return err::EINVAL;
     }
@@ -3405,10 +3465,20 @@ pub(super) fn handle_times(args: [usize; ARG_COUNT]) -> isize {
 /// plausible number. `RUSAGE_CHILDREN` reports the CPU of children already waited
 /// for, which the reap folded into this process's child totals.
 pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
-    const RUSAGE_SELF: usize = 0;
-    const RUSAGE_CHILDREN: usize = -1isize as usize;
+    // `RUSAGE_*` are `int`s in the uapi, and Linux's generated syscall wrapper
+    // reads the argument as one: the register's low 32 bits, sign-extended. So
+    // `RUSAGE_CHILDREN` reaches a kernel as either `0x0000_0000_ffff_ffff` - what
+    // a caller that wrote a 32-bit `-1` puts there, which is every compiled call
+    // and every `syscall(2)` vararg - or `0xffff_ffff_ffff_ffff` for a caller
+    // that sign-extended it itself. Comparing the whole 64-bit word accepts only
+    // the second, so a libc's ordinary `getrusage(RUSAGE_CHILDREN, ..)` was
+    // refused `EINVAL` here; the no-std suite spelled the sign-extended form and
+    // so never saw it. Truncating to the `int` the ABI names accepts both, which
+    // is what the migrated `t-times` pins.
+    const RUSAGE_SELF: i32 = 0;
+    const RUSAGE_CHILDREN: i32 = -1;
     const RUSAGE_SIZE: usize = 144; // 2 timevals + 14 longs
-    let (who, usage) = (args[0], args[1]);
+    let (who, usage) = (args[0] as u32 as i32, args[1]);
     if who != RUSAGE_SELF && who != RUSAGE_CHILDREN {
         return err::EINVAL;
     }

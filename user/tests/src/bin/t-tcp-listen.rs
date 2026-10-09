@@ -417,7 +417,7 @@ fn main() {
     drop(server);
 
     // `SO_REUSEADDR`, and the single exemption it gates. Every answer below was
-    // measured on a real kernel first (`PLAN.md` §4.3.3 has the table), and the
+    // measured on a real kernel first (`NOTES.md` §4.3.3 has the table), and the
     // rule they add up to is not the one the man page suggests:
     //
     //   a holder that is *listening* keeps its name; any other holder yields it

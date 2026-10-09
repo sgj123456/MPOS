@@ -855,7 +855,7 @@ fn build_drm(
         // parent three questions: `vendor`, `device`, and - resolved, not
         // read - `subsystem`, which is how it learns *which bus* it is
         // looking at before it parses anything else. Measured on a working
-        // card and recorded in `PLAN.md` §7.4: libdrm's device parse reads
+        // card and recorded in `NOTES.md` §7.4: libdrm's device parse reads
         // exactly those three, then the parent's `drm/` listing and its
         // `uevent`. A card hung from `/sys/devices/virtual/virtio-gpu` - a
         // directory with no attributes at all - answers none of them,
@@ -1132,7 +1132,7 @@ fn build_pci(
         //
         // So the fact is carried, not inferred: the virtio-gpu driver marks its
         // own function in `pci` - `crate::pci::mark_drm_card`, landed as
-        // `PLAN.md` §7.4 - and this builder reads that. The driver reaches
+        // `NOTES.md` §7.4 - and this builder reads that. The driver reaches
         // `pci` and `vfs` reads `pci`, so neither reaches into the other: the
         // honest shape an earlier version of this comment named as the part
         // still to do.
@@ -1226,7 +1226,7 @@ fn add_pci_attributes(
     // `subsystem` - which bus the device is on. This is not advice for a
     // reader: libdrm resolves this link to learn which bus it is looking at
     // *before* it parses the bus-specific attributes, and gives up when it is
-    // missing. Measured on a working card (`PLAN.md` §7.4): it answers
+    // missing. Measured on a working card (`NOTES.md` §7.4): it answers
     // `../../../../bus/pci`, and a DRM node whose parent has no such link is a
     // device no caller can classify.
     dir.add(
@@ -1636,7 +1636,7 @@ mod tests {
     /// could not tell apart: it took the first display function that had a
     /// driver, so it hung the card off `other`. The card's real home is the
     /// function its own driver declared (`crate::pci::mark_drm_card`,
-    /// `PLAN.md` §7.4), and only that one carries `drm_card`.
+    /// `NOTES.md` §7.4), and only that one carries `drm_card`.
     fn declared_card_fs() -> Arc<SysFs> {
         let mut other = a_function(0, 1, 0);
         other.vendor = 0x10de;
@@ -1669,7 +1669,7 @@ mod tests {
     #[test]
     fn a_card_hangs_off_the_function_that_drives_it() {
         // What libdrm's device parse reads, measured on a working card and
-        // recorded in `PLAN.md` §7.4: given the descriptor it holds, `vendor`
+        // recorded in `NOTES.md` §7.4: given the descriptor it holds, `vendor`
         // and `device` off the node's *parent*, the `subsystem` link resolved
         // to learn which bus it is looking at, the parent's `drm/` listing,
         // and the parent's `uevent`. This tree carried all of it except the
@@ -2052,7 +2052,7 @@ mod tests {
         // class-and-driver (`device.driver.is_some()`) would hang the card off
         // it; choosing by the driver's own declaration (`drm_card`,
         // `crate::pci::mark_drm_card`) hangs it off the virtio-gpu. This is red
-        // against the kernel that guessed - the counterfactual `PLAN.md` §7.4
+        // against the kernel that guessed - the counterfactual `NOTES.md` §7.4
         // asked for.
         let fs = declared_card_fs();
         for number in ["226:0", "226:128"] {

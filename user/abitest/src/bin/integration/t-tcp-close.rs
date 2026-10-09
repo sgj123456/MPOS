@@ -11,7 +11,7 @@
 //!
 //! With nothing listening - which is the normal state of a test run - the
 //! connect fails and every check is skipped. The test is a probe, not a gate:
-//! the host side decides what happened, and `PLAN.md` §4.3 says how to run it.
+//! the host side decides what happened, and `NOTES.md` §4.3 says how to run it.
 
 #![no_std]
 #![no_main]

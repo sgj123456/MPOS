@@ -43,7 +43,7 @@
 //! so. That lives in `mpos_arch::early`, beside the other two things the loader
 //! needs from the machine (the progress wire and the jump), because it *is* the
 //! machine - see that module for why it is a separate tree from the kernel's own
-//! `mpos_arch::arch`, and `PLAN.md` §14.6 for the move.
+//! `mpos_arch::arch`, and `NOTES.md` §14.6 for the move.
 //!
 //! # Where frames come from
 //!

@@ -16,7 +16,7 @@
 //! The file is one this test writes itself under `/tmp`, not the no-std version's
 //! `/etc/motd`: the claim is about the policy `access` answers *with*, not about
 //! which file's mode it reads, and the second machine's payload carries `/tmp`
-//! and no motd at all (`PLAN.md` §15.11). `/bin` is a directory on both machines.
+//! and no motd at all (`NOTES.md` §15.11). `/bin` is a directory on both machines.
 //!
 //! Writing the file is what makes the mode part of the test rather than of the
 //! image: the old file is removed first so the create always produces `0666 &

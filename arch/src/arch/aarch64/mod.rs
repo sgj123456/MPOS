@@ -2,7 +2,7 @@
 //!
 //! Everything in here may touch aarch64 specifics; nothing outside `arch::` may.
 //!
-//! This is the second machine (`PLAN.md` §9.1). Stage 1a landed the build
+//! This is the second machine (`NOTES.md` §9.1). Stage 1a landed the build
 //! plumbing and a body that links; 1b the PL011 and the entry; 1c the exception
 //! vectors, a GICv2 and the generic timer; 1d a page-table builder for the
 //! `-kernel` bring-up; 1e replaced that bring-up with the real boot path, so a
@@ -168,7 +168,7 @@ pub unsafe fn boot(
     // vector table and GIC are configured for EL1 as well; a machine that
     // started this image at EL2 would fault or, worse, arm a timer nothing
     // ever reads. Which level the entry arrives at is the firmware's decision
-    // (`PLAN.md` §9.1's risk list), so it is checked rather than assumed - and
+    // (`NOTES.md` §9.1's risk list), so it is checked rather than assumed - and
     // the check is here, before the machine is configured, rather than in the
     // banner's printout alone.
     let level = current_el();
@@ -1657,7 +1657,7 @@ fn check_paging_ops() {
     // the first machine has always answered the other way (`write_user_u32` and
     // `user_accessible` in `arch/x86_64/paging.rs`, both of which read
     // `is_cow_page`). Measured: a shell's `read` in a fork child answered `EFAULT`
-    // on this machine and does not on x86_64 (`PLAN.md` §13.9).
+    // on this machine and does not on x86_64 (`NOTES.md` §13.9).
     if paging::is_cow_page(PG_VA_A) {
         fail!("a freshly mapped page reports itself copy-on-write");
     }
@@ -2182,7 +2182,7 @@ fn banner(record: usize, info: &BootInfo) {
 /// Read rather than assumed, and read *now* rather than when it matters: which
 /// level the entry arrives at depends on the firmware and the `-cpu`, and a
 /// paging or timer path that assumed EL1 would be wrong on a machine that
-/// starts at EL2 (`PLAN.md` §9.1's risk list). Printing it here is the cheapest
+/// starts at EL2 (`NOTES.md` §9.1's risk list). Printing it here is the cheapest
 /// way to keep that assumption from being made.
 fn current_el() -> u64 {
     let current: u64;
@@ -2214,7 +2214,7 @@ pub fn halt() -> ! {
 // module that actually holds the body - `timer`/`pl031`/`vectors`/`gic`/`paging`/
 // `context` - so `crate::hal::ticks()` is exactly the `timer::ticks()` a caller
 // above the seam wants, monomorphised, with no architecture named above `arch`
-// (`AGENTS.md` §4, `PLAN.md` §9.1). x86_64's `mod.rs` is the shape template; the
+// (`AGENTS.md` §4, `NOTES.md` §9.1). x86_64's `mod.rs` is the shape template; the
 // optional capabilities it has (`Msi`, `FpuTrap`, `SignalFrame`) are absent
 // here because this machine has no MSI controller, no lazy-FPU trap, and no
 // `rt_sigframe` - so they are *not implemented*, which is the whole point of
@@ -2555,7 +2555,7 @@ impl crate::hal::ConsoleInput for crate::hal::Current {
 /// MMIO virtio-rng, which the boot's `check_rng` installs before `rand::init`
 /// runs - and which is *not* folded in here, because the device is a driver the
 /// kernel owns rather than an answer the machine gives. `crate::rand` folds it
-/// in after this returns (`PLAN.md` §14.3), so a machine with no rng window
+/// in after this returns (`NOTES.md` §14.3), so a machine with no rng window
 /// still leaves the clock mix as the floor.
 impl crate::hal::Entropy for crate::hal::Current {
     fn mix_into(_seed: &mut [u8; 32]) {}

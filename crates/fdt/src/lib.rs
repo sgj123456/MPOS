@@ -7,7 +7,7 @@
 //! big-endian words. On `virt` the firmware passes one to the loader, and from
 //! stage 5 the loader hands it to the kernel - so the addresses the kernel
 //! probes stop being constants it was compiled with and become answers it read
-//! (`PLAN.md` §9.1).
+//! (`NOTES.md` §9.1).
 //!
 //! Why this is its own crate: nothing in it can fail at boot for a reason a
 //! host test cannot reproduce. Every question it answers - is this blob a

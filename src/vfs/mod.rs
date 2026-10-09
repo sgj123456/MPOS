@@ -32,7 +32,7 @@ pub mod locks;
 pub mod memfd;
 pub mod mount;
 /// 9P client. Reached only through `drivers::virtio::fs9p`, which carries the
-/// `P9Device` contract whichever bus opened the device (`PLAN.md` §13.29), and
+/// `P9Device` contract whichever bus opened the device (`NOTES.md` §13.29), and
 /// mounted by the `mount -t 9p` factory in `syscall` - no core vfs module
 /// constructs it.
 pub mod p9;
@@ -66,7 +66,7 @@ pub mod tty;
 /// The console multiplexer: one serial wire, six terminals, and the switch a seat
 /// manager drives between them.
 ///
-/// Both machines since `PLAN.md` §13.16. It names no driver: what it needs from
+/// Both machines since `NOTES.md` §13.16. It names no driver: what it needs from
 /// the display - wake the render task, who holds the card, hand the card over - is
 /// asked through `crate::console`'s `display_*` seams, which answer "nothing to do"
 /// on a machine with no framebuffer. Those seven references to
@@ -266,7 +266,7 @@ pub type VfsResult<T> = Result<T, VfsError>;
 /// whole of Phase 11 B1: before it, the trait carried a method per concrete
 /// device and socket type, so it could not be compiled without naming every
 /// driver, and a seventh device type meant editing the filesystem layer
-/// (`PLAN.md` §11.1.1, V-1).
+/// (`NOTES.md` §11.1.1, V-1).
 impl dyn Inode {
     pub fn as_any(&self) -> &dyn core::any::Any {
         self

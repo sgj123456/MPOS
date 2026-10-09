@@ -13,7 +13,7 @@
 //! scheduler, or a `hal` register read. Before this module existed, all five lived
 //! in `board/x86_64.rs` and the second machine had none of them (an empty
 //! `panic_context`) or a machine-shaped substitute (`hal::halt` where the first
-//! machine parked). `PLAN.md` §13.23 and Phase 15's stages 15.4/15.5 are where
+//! machine parked). `NOTES.md` §13.23 and Phase 15's stages 15.4/15.5 are where
 //! that came from.
 //!
 //! What is *not* here: which console the lines go to (the console service, above
@@ -105,7 +105,7 @@ pub fn check_boot_stack(info: &BootInfo, when: &str) {
 /// at this build's 250 Hz, on every blocking call in the system. Parking in the
 /// scheduler instead leaves the idle halt where the rest of the kernel already
 /// assumes it is - in the scheduler's own loop, where a wake is followed by a turn
-/// and not by a tick (`PLAN.md` §10.2 measured the first machine before and after).
+/// and not by a tick (`NOTES.md` §10.2 measured the first machine before and after).
 pub fn park() -> ! {
     loop {
         sched::block_until(|| false);

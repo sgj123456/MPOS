@@ -97,7 +97,7 @@ enum Commands {
     /// `tests.toml` selects, booted in QEMU from a test initramfs
     Test,
     /// Measure the kernel's module graph and check it against the ratchet
-    /// (PLAN.md §11.2 Step G), so the cycle count cannot grow back
+    /// (NOTES.md §11.2 Step G), so the cycle count cannot grow back
     Depgraph,
     /// Remove the build and target directories
     Clean,
@@ -395,7 +395,7 @@ fn dispatch(command: Commands, invocation: Invocation<'_>, tests: sweep::Selecti
                     anyhow::bail!(
                         "--groups/--all-groups select among x86_64's programs today; \
                          the aarch64 sweep runs every aarch64 program it built \
-                         (PLAN.md §13.5)"
+                         (NOTES.md §13.5)"
                     );
                 }
                 selftest::run_disk_sweep(build_dir, profile, arch)

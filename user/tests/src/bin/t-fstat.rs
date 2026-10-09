@@ -10,7 +10,7 @@
 //! # The fixture is this test's own file now
 //!
 //! The no-std version statted `/etc/motd`, and the second machine's payload has
-//! no motd at all (`PLAN.md` §15.11, measured with `debugfs`), so this test
+//! no motd at all (`NOTES.md` §15.11, measured with `debugfs`), so this test
 //! writes its own file under `/tmp` and stats that. The `/bin` claims stay: it
 //! is the one directory both payloads carry, and it is a directory with no
 //! subdirectory on either - which is what makes its `nlink` 2.

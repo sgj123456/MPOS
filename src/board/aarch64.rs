@@ -93,7 +93,7 @@ fn init(info: &BootInfo) -> ! {
     // keeps (`arch/aarch64/mod.rs` argues the lifetime). Every boot of this
     // machine now carries a real initramfs - busybox, `/bin/sh` and the pivot
     // script - because the root switch is the *script's* job on both machines
-    // (`PLAN.md` §15.6), not the kernel's.
+    // (`NOTES.md` §15.6), not the kernel's.
     let archive: Option<&[u8]> = info.initramfs;
 
     // The log sink, as the first act - the same call the first machine makes at
@@ -145,7 +145,7 @@ fn init(info: &BootInfo) -> ! {
     // machine and its entropy node reads back. It runs here, after
     // `vfs::tty::init()` has populated the tty table (the console tty is what
     // `standard_devfs()` is built from), not as an early boot milestone - which
-    // is the ordering lesson behind the `/dev` note in `PLAN.md` §9.1.
+    // is the ordering lesson behind the `/dev` note in `NOTES.md` §9.1.
     // Stage 8-gpu: the card, opened and handed to the render task. It stands
     // before `check_dev` because that call is what publishes `/dev/fb0`, and it
     // stands in `init` rather than with the device checks because the task that
@@ -163,17 +163,15 @@ fn init(info: &BootInfo) -> ! {
     check_gpu_dev();
     check_sound_dev();
 
-    // The host share, on the ramfs `/mnt` - mounted *before* the disk is hung
-    // there, so the 9p mount is a child of the bootstrap root in the table and
-    // not of whatever the disk's own tree happens to hold. That order is the
-    // whole difference: with the disk already at `/mnt`, the step's `/mnt`
-    // lookup resolves into the ext4, and mounting `share` under it asks a
-    // read-only image for a directory it does not have - measured as
-    // `"hostshare" did not mount: NoEntry`, and then `M8_P9_FAILED`.
-    // `resolve_walk`'s longest-prefix rule keeps the earlier mount reachable as
-    // `/mnt/share` after the script promotes the disk into `/`, which is what
-    // lets the verdict read the same path the first machine's boot reads
-    // (§15.6).
+    // The host share, on the bootstrap root's `/mnt` - mounted *before* the disk
+    // is hung there, because `steps::mount_share` makes its mountpoint through
+    // the root inode and then lets `mount(2)`'s own walk find it: with the disk
+    // already at `/mnt` that walk crosses into the disk, where no `share` name
+    // exists, and the mount is refused `NoEntry` (measured). What the payload
+    // sees after this machine's root switch is a *second* mount of the same tag
+    // made by the init script on the tree that becomes `/` - this mount is the
+    // kernel's own read of the share (`check_p9_dev`'s `M8_P9_OK` below) and,
+    // on a boot that never switches, the payload's (`NOTES.md` §13.29).
     steps::mount_share();
     check_p9_dev();
 
@@ -209,7 +207,7 @@ fn init(info: &BootInfo) -> ! {
     // first machine's do - the same `crate::console` code over the same
     // `hal::SerialRing` capability, with this one arming call in front of it.
     // `steps::arm_console` carries the mux-first ordering contract, which is
-    // the same one and the same reason on both machines (`PLAN.md` §13.16).
+    // the same one and the same reason on both machines (`NOTES.md` §13.16).
     //
     // **Not gated on `mpos.selftest`**, and that is the point rather than a
     // detail: this is the step that puts the console mux up, and without the mux
@@ -394,7 +392,7 @@ fn devices(info: &BootInfo) {
     // `rand` folds into its seed. Registered here rather than named from
     // `rand`: which device this machine has is this layer's fact, and `rand`
     // naming `crate::drivers` would close a cycle with the edge that already
-    // runs the other way (`PLAN.md` §14.3).
+    // runs the other way (`NOTES.md` §14.3).
     mpos::rand::set_device_entropy(drivers::virtio::entropy);
     check_blk(info);
     check_fs(info);
@@ -437,31 +435,31 @@ const VIRTIO_VERSION_MODERN: u32 = 2;
 /// is the same 4, so `VirtIORng::new` accepts the window this selects.
 const VIRTIO_ID_RNG: u32 = 4;
 /// `DeviceID` for the block device (`VIRTIO_ID_BLOCK`), the second device driven
-/// over MMIO - the disk root the drivers stage names (`PLAN.md` §9.1).
+/// over MMIO - the disk root the drivers stage names (`NOTES.md` §9.1).
 const VIRTIO_ID_BLOCK: u32 = 2;
 /// `DeviceID` for the network adapter (`VIRTIO_ID_NET`), the third device driven
-/// over MMIO - the `net` stage's transport proof on this machine (`PLAN.md` §9.1).
+/// over MMIO - the `net` stage's transport proof on this machine (`NOTES.md` §9.1).
 const VIRTIO_ID_NET: u32 = 1;
 /// `DeviceID` for an input device (`VIRTIO_ID_INPUT`), the fourth transport the
-/// aarch64 MMIO virtio path is proven to reach (`PLAN.md` §9.1).
+/// aarch64 MMIO virtio path is proven to reach (`NOTES.md` §9.1).
 const VIRTIO_ID_INPUT: u32 = 18;
 /// `DeviceID` for a console port (`VIRTIO_ID_CONSOLE`), the fifth device class
 /// this machine drives over MMIO - the host-driven second serial line the first
-/// machine has as `/dev/hvc0` (`PLAN.md` §13.25).
+/// machine has as `/dev/hvc0` (`NOTES.md` §13.25).
 const VIRTIO_ID_CONSOLE: u32 = 3;
 /// `DeviceID` for a display adapter (`VIRTIO_ID_GPU`), the sixth device class
 /// this machine drives over MMIO - the card behind `/dev/fb0` and the
-/// framebuffer console (`PLAN.md` §13.26).
+/// framebuffer console (`NOTES.md` §13.26).
 const VIRTIO_ID_GPU: u32 = 16;
 /// `DeviceID` for a sound card (`VIRTIO_ID_SOUND`), the seventh device class this
-/// machine drives over MMIO - the card behind `/dev/dsp` (`PLAN.md` §13.27).
+/// machine drives over MMIO - the card behind `/dev/dsp` (`NOTES.md` §13.27).
 const VIRTIO_ID_SOUND: u32 = 25;
 /// `DeviceID` for a socket device (`VIRTIO_ID_VSOCK`), the eighth device class
 /// this machine drives over MMIO - the wire underneath the `AF_VSOCK` family
-/// (`PLAN.md` §13.28).
+/// (`NOTES.md` §13.28).
 const VIRTIO_ID_VSOCK: u32 = 19;
 /// `DeviceID` for a 9p device (`VIRTIO_ID_9P`), the ninth device class this
-/// machine drives over MMIO - the host share behind `/mnt/share` (`PLAN.md`
+/// machine drives over MMIO - the host share behind `/mnt/share` (`NOTES.md`
 /// §13.29).
 const VIRTIO_ID_9P: u32 = 9;
 
@@ -607,7 +605,7 @@ fn check_virtio(info: &BootInfo) {
 /// and that they answer as transports; this opens the one window the tree says
 /// carries an entropy device (`DeviceID` 4) as a *real virtio device* over MMIO
 /// and asks it for bytes - the drivers stage's first device driven to a marker
-/// (`PLAN.md` §9.1). The window is handed to the driver as a kernel-virtual
+/// (`NOTES.md` §9.1). The window is handed to the driver as a kernel-virtual
 /// address, so `drivers::virtio::mmio` names neither the tree nor the boot
 /// record: discovery is the machine layer's job, the driver's job is a register
 /// block it is given. Success is 32 host-generated bytes back; a window that is
@@ -671,7 +669,7 @@ fn check_rng(info: &BootInfo) {
     // bytes (the boot calls `rand::init` next, which reads this global). A window
     // that maps but does not open as a virtio-rng is a named failure, not a silent
     // fall-through to a weaker seed.
-    let Some(dev) = mpos::drivers::virtio::mmio::init_global(virt, size) else {
+    let Some(dev) = mpos::drivers::virtio::mmio::rng_device(virt, size) else {
         fail!("the window at {virt:#x} mapped but did not open as a virtio-rng transport");
     };
     let mut buf = [0u8; 32];
@@ -811,7 +809,7 @@ fn check_blk(info: &BootInfo) {
 /// reads the superblock and group descriptors through the `BlockDev`, and only the
 /// image that is actually an ext4 mounts. A filesystem that mounts is the disk root
 /// the drivers stage names - reading a file through it and booting a root from it
-/// are the task-context follow-on (`PLAN.md` §9.1). `M7_FS_FAILED` if none mounts.
+/// are the task-context follow-on (`NOTES.md` §9.1). `M7_FS_FAILED` if none mounts.
 fn check_fs(info: &BootInfo) {
     use fmt::Write;
 
@@ -838,24 +836,42 @@ fn check_fs(info: &BootInfo) {
         let Some(dev) = mpos::drivers::virtio::mmio::blockdev(virt, size) else {
             continue;
         };
-        // `mount` only returns Ok for the window whose bytes are an ext4 the driver
-        // can open; the raw pattern image is a clean `Err` and is skipped.
-        let Ok(fs) = mpos::vfs::ext4::Ext4Fs::mount(dev.clone()) else {
+        // The root lives *inside* the disk, and where is the partition table's
+        // answer rather than this check's. `find_filesystem` reads the same two
+        // shapes the first machine's disk arrives in: a bare ext4 (a superblock
+        // at byte zero - what this machine used to be handed) mounts as the
+        // whole device, and a real disk mounts the window its ext4 partition
+        // lies in. So this is one call for both, and it is what makes the second
+        // machine's root reachable through a GPT rather than only through a bare
+        // image (`NOTES.md` §15.18).
+        //
+        // The pattern image is a clean `None` here: its sector 0 is `i as u8`,
+        // never a superblock, and its protective entry list is empty, so it is
+        // skipped the same way a non-ext4 window was before.
+        let Some(root) = mpos::blk::part::find_filesystem(dev.clone()) else {
+            continue;
+        };
+        // `mount` only returns Ok for the device whose bytes are an ext4 the
+        // driver can open.
+        let Ok(fs) = mpos::vfs::ext4::Ext4Fs::mount(root.clone()) else {
             continue;
         };
         // The disk is registered with the block layer *after* the mount proved
         // the bytes, so the raw pattern image and any non-ext4 window cannot take
         // the name. That registration is what makes the device a kernel disk:
-        // the devfs build publishes `/dev/vda` from `blk::disks()`, and the init
-        // handoff mounts this same device through the VFS (`PLAN.md` §13.3's disk
-        // root).
+        // the devfs build publishes `/dev/vda` from `blk::disks()` - and, beside
+        // it, one `/dev/vdaN` per partition `blk::part::partitions` finds - and
+        // the init handoff mounts one of those through the VFS (`NOTES.md`
+        // §13.3's disk root). The *whole* device is registered, never the window
+        // the mount used: the disk is the device, and its partitions are facts
+        // the devfs builder re-derives from it (`src/drivers/devices.rs`).
         //
         // Through the *driver's* registration - the same call the first machine's
         // bring-up makes - because the name, the major and the sysfs tree position
         // are one device's facts, and writing them out here is how the two copies
         // drifted: this machine used to file its disk under `/dev/vda`, so a
         // reader that followed `/sys/class/block/vda`, or matched on `DEVPATH`,
-        // was handed a path that is not a device path (`PLAN.md` §15.10).
+        // was handed a path that is not a device path (`NOTES.md` §15.10).
         mpos::drivers::virtio::register_block_disk(dev);
         // Read the one file the image carries, back through the block driver.
         let Ok(hello) = fs.root().lookup("hello") else {
@@ -964,7 +980,7 @@ fn check_net(info: &BootInfo) {
 /// `/dev/input/event0`, the exit hooks release its readers and the service task
 /// harvests its ring, all of which are the shared input stack the first machine
 /// has had since §13.4 - reached here through the [`InputDevice`] contract
-/// rather than through a second copy of it (`PLAN.md` §15.2).
+/// rather than through a second copy of it (`NOTES.md` §15.2).
 ///
 /// The *marker* is deliberately not printed here. `M8_INPUT_OK` belongs to
 /// [`check_input_registry`], which reads the registry back through the mounted
@@ -993,20 +1009,30 @@ fn check_input(info: &BootInfo) {
     if windows.is_empty() {
         fail!("the tree describes no virtio-input (device {VIRTIO_ID_INPUT}) window");
     }
+    // Every window that opens is collected before any of them is registered,
+    // because `register` numbers the nodes by their place *in the call*: two
+    // calls of one device each would hand both of them `event0` and the same
+    // minor, and the second `/dev/input/eventN` would not exist to be opened.
+    // The first machine never sees this shape - its `input::init` walks the PCI
+    // bus and registers what it found in one call - but this machine's tree
+    // carries two input devices (a keyboard and a tablet, as `xtask` attaches
+    // them) and used to register only the first, `return`ing out of the loop.
+    let mut opened = alloc::vec::Vec::new();
     for &(virt, size) in &windows {
-        let Some(device) = mpos::drivers::virtio::mmio::input_device(virt, size) else {
-            continue;
-        };
-        let nodes = mpos::drivers::virtio::input::register(alloc::vec![device]);
-        // The same line the first machine's `init_virtio` prints for each of its
-        // bus's devices: one node per device, named for its place in the input
-        // layer.
-        for (index, (_node, name)) in nodes.iter().enumerate() {
-            let _ = writeln!(out, "virtio-input: event{index}: {name}");
+        if let Some(device) = mpos::drivers::virtio::mmio::input_device(virt, size) {
+            opened.push(device);
         }
-        return;
     }
-    fail!("no virtio-input window opened and negotiated as an MMIO transport");
+    if opened.is_empty() {
+        fail!("no virtio-input window opened and negotiated as an MMIO transport");
+    }
+    let nodes = mpos::drivers::virtio::input::register(opened);
+    // The same line the first machine's `init_virtio` prints for each of its
+    // bus's devices: one node per device, named for its place in the input
+    // layer.
+    for (index, (_node, name)) in nodes.iter().enumerate() {
+        let _ = writeln!(out, "virtio-input: event{index}: {name}");
+    }
 }
 
 /// The seventh MMIO device class: the machine's sound card, opened over the
@@ -1015,7 +1041,7 @@ fn check_input(info: &BootInfo) {
 /// The device xtask attaches is a `virtio-sound-device` with an `audiodev`
 /// behind it - the same crate driver, the same stream listing, the same OSS
 /// parameter face the first machine has, reached through the [`SoundCard`]
-/// contract rather than through a second copy of any of it (`PLAN.md` §13.27).
+/// contract rather than through a second copy of any of it (`NOTES.md` §13.27).
 /// This finds the window by `DeviceID`, opens it and hands it to
 /// `sound::install_probed`, which is where the stream is brought up.
 ///
@@ -1117,7 +1143,7 @@ fn check_sound_dev() {
 /// `net::vsock::init`, so from here `socket(AF_VSOCK)`, `listen`, `accept` and
 /// the rest are the first machine's family over the second machine's transport -
 /// the same shared code the pump in `virtio::spawn_service` keeps moving
-/// (`PLAN.md` §13.28). The family answering the same CID the device reported is
+/// (`NOTES.md` §13.28). The family answering the same CID the device reported is
 /// the whole claim `getsockname` rests on, so it is checked rather than assumed.
 fn check_vsock(info: &BootInfo) {
     use fmt::Write;
@@ -1172,7 +1198,7 @@ fn check_vsock(info: &BootInfo) {
 /// The device xtask attaches is a `virtio-9p-device` on a `-fsdev` backend - the
 /// same crate driver, the same 9P2000 client and the same `mount -t 9p` face the
 /// first machine has, reached through the [`P9Device`] contract rather than
-/// through a second copy of any of it (`PLAN.md` §13.29). This finds every window
+/// through a second copy of any of it (`NOTES.md` §13.29). This finds every window
 /// whose `DeviceID` is `9` and hands what opens to `fs9p::install`, so from here
 /// the shares are in the one registry `by_tag` and `mount_share` read - both
 /// machines' shares are the same registry, filled by whatever bus answered.
@@ -1231,7 +1257,7 @@ fn check_p9(info: &BootInfo) {
 /// called from `devices()` right after `check_p9` filled the registry, so the
 /// share hangs under the ramfs `/mnt` that the disk is then mounted *onto*, and
 /// the longest-prefix walk reaches it as `/mnt/share` on either side of the
-/// script's root switch (`PLAN.md` §15.6). What this adds is the read:
+/// script's root switch (`NOTES.md` §15.6). What this adds is the read:
 /// `/mnt/share/mpos-9p-probe` is a file xtask writes into the exported directory,
 /// so the bytes that come back travelled host -> 9P2000 wire -> `vfs::p9` -> the
 /// mount table -> this read. A mount that succeeded but served nothing (`Twalk`
@@ -1271,7 +1297,7 @@ fn check_p9_dev() {
 /// The sixth MMIO device class: the machine's virtio-gpu card, opened over the
 /// memory-mapped transport and handed to the render task.
 ///
-/// This is the class whose seam was *not* one helper (`PLAN.md` §13.26): the
+/// This is the class whose seam was *not* one helper (`NOTES.md` §13.26): the
 /// crate's `Transport` is not object-safe, so `Gpu` became generic over it and
 /// `video::render` - which owns the one device and is the only context that may
 /// call `flush` - holds it as a `Box<dyn GpuDevice>`. What is left for this
@@ -1378,8 +1404,23 @@ fn check_gpu_dev() {
             hal::halt()
         }
     }
+    // The DRM node, which is how a compositor reaches the same card a
+    // framebuffer program opens as `/dev/fb0`. It used to be built on the
+    // first machine alone, and the second machine's card - published into
+    // `drivers::drm` by the render task above, and reachable through the
+    // `'d'` ioctl family - had no node to be reached by. Checking it here is
+    // what makes that gate a fact rather than a compilation.
+    let Ok(card) = vfs::resolve("/dev/dri/card0") else {
+        mpos::println!("M8_GPU_FAILED: /dev/dri/card0 does not resolve through the mounted /dev");
+        hal::halt()
+    };
+    if card.rdev().is_none() {
+        mpos::println!("M8_GPU_FAILED: /dev/dri/card0 is not a device node");
+        hal::halt()
+    }
     mpos::println!(
-        "M8_GPU_OK: the MMIO virtio-gpu card drives /dev/fb0 at {width}x{height} ({} KiB) and the render task owns it",
+        "M8_GPU_OK: the MMIO virtio-gpu card drives /dev/fb0 at {width}x{height} ({} KiB), \
+         /dev/dri/card0 reaches it, and the render task owns it",
         view.fb_len() / 1024
     );
 }
@@ -1457,7 +1498,7 @@ fn check_console(info: &BootInfo) {
 /// exists only once the boot has mounted the filesystem that carries it. What it
 /// deliberately does *not* assert is the node's device number: `DevFs::register`
 /// gives a `CharDevice` `(0, 0)`, on both machines, so there is no number here to
-/// pin - named in `PLAN.md` §13.25 rather than papered over with an assertion
+/// pin - named in `NOTES.md` §13.25 rather than papered over with an assertion
 /// that would pass by accident.
 fn check_console_dev() {
     if mpos::drivers::virtio::console::global().is_none() {
@@ -1528,7 +1569,7 @@ fn check_input_registry() {
 /// from the console tty, so it can only run once `vfs::tty::init()` has filled
 /// the tty table. That is why it is here rather than an early boot milestone: a
 /// check that reached for the tty before init registered it panicked in
-/// `tty::global()` (the measured `PLAN.md` §9.1 `/dev` finding).
+/// `tty::global()` (the measured `NOTES.md` §9.1 `/dev` finding).
 ///
 /// It reads two nodes through the trait surface (`root -> lookup -> read_at`), the
 /// same moves an `open`/`read` make: `/dev/urandom` (the pool `rand` seeded from
@@ -1537,7 +1578,7 @@ fn check_input_registry() {
 /// on this machine. The virtio-PCI `hvc`/`dsp`/`fb0` and the DRM card are gated
 /// out here (the machine has no path to them yet), so the set is the honest
 /// subset, not a stub of the full x86_64 tree; `/dev/input` and `uinput` are in
-/// it now, because the machine has the registry behind them (`PLAN.md` §15.2).
+/// it now, because the machine has the registry behind them (`NOTES.md` §15.2).
 fn check_dev() {
     let dev = mpos::drivers::devices::standard_devfs();
     // Mount it. This mirrors what Linux's `CONFIG_DEVTMPFS_MOUNT` does: the

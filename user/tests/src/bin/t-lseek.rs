@@ -35,7 +35,7 @@
 //!
 //! The file is one this test writes itself under `/tmp`, not the no-std
 //! version's `/etc/motd` - the second machine's sweep disk carries no motd
-//! (`PLAN.md` §15.11), and the claim is about where `lseek` puts the cursor, not
+//! (`NOTES.md` §15.11), and the claim is about where `lseek` puts the cursor, not
 //! about which file the cursor is in. The size the claims are stated against is
 //! the one the test *drains* out of the file rather than a constant it also
 //! wrote down, so the numbers stay the file's.

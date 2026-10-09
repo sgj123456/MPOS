@@ -309,7 +309,7 @@ pub fn set(
 /// `close(dup_of_a)` and then a fresh `open()` of the file still answers
 /// `EWOULDBLOCK`. Here any close naming that description drops it, because the
 /// caller passes the description's identity and nothing about how many
-/// descriptors still hold it. `docs/PLAN.md` §15.16 carries the measurement, and
+/// descriptors still hold it. `docs/NOTES.md` §15.16 carries the measurement, and
 /// `user/tests/src/bin/t-filelock.rs` records why no claim of its own fails on
 /// it.
 #[cfg(target_os = "none")]
@@ -350,7 +350,7 @@ pub fn release_process(dev: u64, ino: u64, pid: u32) {
 /// Where [`release_process`] is the rule for one inode, this walks the batch the
 /// teardown hands over - which is why it lives here rather than in `sched`: the
 /// teardown owns *tasks*, and "which of these descriptors names an inode this
-/// process still holds a lock on" is a locking question (`PLAN.md` §11.1.3).
+/// process still holds a lock on" is a locking question (`NOTES.md` §11.1.3).
 /// Registered by the boot sequence, so the order it runs in among the other
 /// hooks is the registration order (`sched::exit`).
 #[cfg(target_os = "none")]

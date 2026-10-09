@@ -50,8 +50,23 @@ const SNDCTL_DSP_NONBLOCK: libc::c_ulong = ioc(0, 0, 14);
 const AFMT_S16_LE: i32 = 0x0000_0010;
 const AFMT_MU_LAW: i32 = 0x0000_0001;
 
+/// One `ioctl`, and the answer the *caller* sees.
+///
+/// Through `libc::ioctl`, which is a `syscall`-based wrapper in musl: it
+/// reports a refusal the way C does, as `-1` with the errno left behind, and
+/// **not** as the raw `-errno` the kernel returned. The claims below that
+/// expect a refusal therefore compare through [`refused`] rather than against
+/// `-(libc::EINVAL as isize)` - a raw comparison can never be true through
+/// this door, and it read as six device refusals failing when the device was
+/// refusing correctly all along (`t-rtc`/`t-vt` reach ioctl through
+/// `libc::syscall` and read errno on `rc < 0` for the same reason).
 fn io(fd: i32, req: libc::c_ulong, arg: usize) -> isize {
     unsafe { libc::ioctl(fd, req as _, arg) as isize }
+}
+
+/// Whether a call came back refused with exactly `want`.
+fn refused(ret: isize, want: i32) -> bool {
+    ret == -1 && std::io::Error::last_os_error().raw_os_error() == Some(want)
 }
 
 fn main() {
@@ -111,7 +126,7 @@ fn main() {
     let rr = io(raw, SNDCTL_DSP_SETFMT, &raw mut fmt as usize);
     r.check(
         "a format the stream does not run is EINVAL, not a yes",
-        rr == -(libc::EINVAL as isize),
+        refused(rr, libc::EINVAL),
     );
 
     let mut mask: i32 = 0;
@@ -141,7 +156,7 @@ fn main() {
     let rr = io(raw, SNDCTL_DSP_CHANNELS, &raw mut bogus as usize);
     r.check(
         "a channel count outside the device is EINVAL",
-        rr == -(libc::EINVAL as isize),
+        refused(rr, libc::EINVAL),
     );
 
     // --- the geometry the writers pace against ---
@@ -159,17 +174,13 @@ fn main() {
     );
 
     // --- the refusals ---
-    let mut refused: i32 = (4096) | (8 << 16);
-    let rr = io(raw, SNDCTL_DSP_SETFRAGMENT, &raw mut refused as usize);
-    r.check(
-        "SETFRAGMENT is refused honestly",
-        rr == -(libc::EINVAL as isize),
-    );
+    // The fragment word is `size | count << 16`; the driver takes the request
+    // and refuses the change, which is what the claim is about.
+    let mut frag: i32 = (4096) | (8 << 16);
+    let rr = io(raw, SNDCTL_DSP_SETFRAGMENT, &raw mut frag as usize);
+    r.check("SETFRAGMENT is refused honestly", refused(rr, libc::EINVAL));
     let rr = io(raw, SNDCTL_DSP_NONBLOCK, 0);
-    r.check(
-        "NONBLOCK is refused honestly",
-        rr == -(libc::EINVAL as isize),
-    );
+    r.check("NONBLOCK is refused honestly", refused(rr, libc::EINVAL));
 
     // --- the no-argument trio ---
     r.check("RESET answers 0", io(raw, SNDCTL_DSP_RESET, 0) == 0);
@@ -190,7 +201,7 @@ fn main() {
     if let Ok(n) = &null {
         let mut v: i32 = 0;
         let rr = io(n.as_raw_fd(), SNDCTL_DSP_SPEED, &raw mut v as usize);
-        r.check("and SPEED on it is ENOTTY", rr == -(libc::ENOTTY as isize));
+        r.check("and SPEED on it is ENOTTY", refused(rr, libc::ENOTTY));
     } else {
         r.check("and SPEED on it is ENOTTY", false);
     }
@@ -204,7 +215,7 @@ fn main() {
         let rr = io(i.as_raw_fd(), SNDCTL_DSP_SPEED, &raw mut v as usize);
         r.check(
             "and SPEED on a regular file is ENOTTY",
-            rr == -(libc::ENOTTY as isize),
+            refused(rr, libc::ENOTTY),
         );
     } else {
         r.check("and SPEED on a regular file is ENOTTY", false);

@@ -3,7 +3,7 @@
 //! `hal::kernel` is the seam's other direction. `arch/**` has to ask the kernel
 //! whether a faulting page is one to populate, where a `svc` goes, what a line of
 //! console input means, and it asks through a trait *this* crate implements - so
-//! the machine layer never names `sched`, `syscall` or `mm` (`PLAN.md` §14.2).
+//! the machine layer never names `sched`, `syscall` or `mm` (`NOTES.md` §14.2).
 //!
 //! The table is **one** table. It used to be written twice, once in each
 //! machine's boot wiring (`src/board/<arch>.rs`, then `src/main/<arch>.rs`), and
@@ -139,7 +139,7 @@ impl Kernel for Services {
     /// able to hand it over. Gated on `mpos_fpu_trap` like the hook itself - the
     /// machine that has no such trap declares no such capability, so the method
     /// does not exist for it rather than being a stub it must fake
-    /// (`PLAN.md` §14.2).
+    /// (`NOTES.md` §14.2).
     #[cfg(mpos_fpu_trap)]
     fn device_not_available(&self) {
         sched::device_not_available()

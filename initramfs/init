@@ -60,4 +60,21 @@ mount --move /dev /sysroot/dev
 # the start; the real one somehow never did.
 mount -t devpts devpts /sysroot/dev/pts
 
+# The host share, mounted *again* on the tree that becomes `/`. The kernel's
+# own mount of it (`steps::mount_share`) hangs on the bootstrap root's `/mnt`,
+# and this switch deletes that root - so a payload running under the switched
+# tree would find `/mnt/share` an ordinary empty directory. (It is not merely a
+# name the walk cannot reach: the disk mounted over `/mnt` *covers* it, which is
+# what happens to any mount a later one is hung in front of.) Mounting it again
+# is the same rule the pseudo-filesystems above follow - what is mounted on the
+# new root survives the pivot.
+#
+# No tag is written here. The host chooses the tag (`-virtfs
+# ...,mount_tag=...`), and an empty source is this kernel's spelling for "the
+# share the bus exported" - the same call `steps::mount_share` makes, without
+# this script keeping a second copy of the host's choice. A boot with no share
+# has nothing to mount and says so rather than failing.
+mkdir -p /sysroot/mnt/share
+mount -t 9p '' /sysroot/mnt/share || echo "initramfs: no host share to re-mount"
+
 exec switch_root /sysroot /sbin/init

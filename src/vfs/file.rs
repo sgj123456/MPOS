@@ -106,7 +106,7 @@ pub struct File {
     /// `wayland-backend` does on `wayland-N.lock`) compares exactly these two
     /// answers, so a disagreement is not a wrong number but a retry that never
     /// converges. Recording the number where the path *is* known fixes it at
-    /// the source. See `PLAN.md` §7.4.
+    /// the source. See `NOTES.md` §7.4.
     dev: core::sync::atomic::AtomicU64,
 }
 

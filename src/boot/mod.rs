@@ -32,7 +32,7 @@ pub mod console_list;
 // `crate::boot::` caller is unchanged. They moved out because the machine layer
 // names both: `hal::Paging::install` takes a `BootInfo` and the aarch64 entry
 // takes a `Handoff`, and a machine crate cannot depend on the kernel
-// (`PLAN.md` §14 S2a). What stays here is what the kernel *does* with them:
+// (`NOTES.md` §14 S2a). What stays here is what the kernel *does* with them:
 // translating the record (`handoff`), reading the command line, and the console
 // list.
 pub use mpos_bootinfo::{BootInfo, MAX_MEM_REGIONS, MemKind, MemRegion};

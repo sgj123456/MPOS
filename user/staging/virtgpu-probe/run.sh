@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the probe and boot it on a real Linux, twice: once on a virtio-gpu card
 # with no 3D behind it, once on the GL card. The output is the measurement the
-# kernel's DRM_VIRTGPU_* family is designed from (PLAN.md §7.4).
+# kernel's DRM_VIRTGPU_* family is designed from (NOTES.md §7.4).
 #
 # Not part of `cargo xtask`: it measures Linux, not this kernel, and it wants
 # the network and a Linux guest. Run it by hand when the answers are needed.

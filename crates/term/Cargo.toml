@@ -4,7 +4,7 @@
 # hardware, no clock - so it is its own leaf crate and a host test can feed it a
 # byte stream and read the screen back. The monitor it is painted onto, the
 # line discipline that decides what to forward and the console multiplexer stay
-# in the kernel: what a cell *is* is not a filesystem fact (PLAN.md §11.1.4), and
+# in the kernel: what a cell *is* is not a filesystem fact (NOTES.md §11.1.4), and
 # separating the pure half is what stops `console` and `drivers/video` from
 # reaching into `vfs` for a grid.
 [package]

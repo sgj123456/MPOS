@@ -20,7 +20,7 @@
 //! the machine's answer to a machine question, and because it is what
 //! `impl hal::Paging for Current`'s `map_mmio_window` returns - a body that must
 //! not reach up into the kernel once `arch` is a crate of its own
-//! (`PLAN.md` §14.3).
+//! (`NOTES.md` §14.3).
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 

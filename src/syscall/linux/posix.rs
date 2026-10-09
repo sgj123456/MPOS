@@ -973,11 +973,17 @@ pub fn handle_personality(args: [usize; ARG_COUNT]) -> isize {
 /// the §4.2 "silently did the thing you didn't do" this batch exists to remove;
 /// a refusal tells a logout/getty the truth - it then tears the terminal down by
 /// closing its own descriptors, which is what it does next regardless. The
-/// hang-up itself is `PLAN.md` §12.2 B4, a tty-layer feature. This branch is
+/// hang-up itself is `NOTES.md` §12.2 B4, a tty-layer feature. This branch is
 /// reached only by a caller that has acquired a terminal, which no headless
 /// self-test program does, so it is not gate-exercised - but a fake `0` is not
 /// made honest by being untested.
 pub fn handle_vhangup(_args: [usize; ARG_COUNT]) -> isize {
+    // The capability gate Linux puts first: without `CAP_SYS_TTY_CONFIG` the
+    // answer is `EPERM`, reached before the no-terminal `ENOTTY` the man page
+    // spends its words on (host-measured, `NOTES.md` §15.11 batch 32).
+    if !crate::sched::current_credentials().has_effective(crate::cred::CAP_SYS_TTY_CONFIG) {
+        return err::EPERM;
+    }
     match crate::sched::controlling_tty_of_current() {
         None => err::ENOTTY,
         Some(_) => err::EOPNOTSUPP,
@@ -1092,7 +1098,7 @@ pub fn handle_clock_settime(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 /// have siblings the two answers part company: Linux refuses with `EINVAL`
 /// because the resource really is shared, and this kernel still answers `0`
 /// because splitting a descriptor table or a handler table off from one's
-/// siblings is not modelled — a named gap (`PLAN.md` §6.3), not an answer this
+/// siblings is not modelled — a named gap (`NOTES.md` §6.3), not an answer this
 /// call pretends to have.
 ///
 /// One more gap rides with the call rather than the namespace:
@@ -1103,10 +1109,12 @@ pub fn handle_clock_settime(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 /// space) and it wants its own measurement, so it is named here rather than
 /// half-built.
 pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
-    // `CAP_SYS_ADMIN` is the gate on every privileged namespace kind, and the
-    // test for it is the effective-uid one the entropy ioctls already use for
-    // the same capability: a namespace is not a thing a setuid bit should buy.
-    let privileged = crate::sched::current_identity().euid == 0;
+    // `CAP_SYS_ADMIN` is the gate on every privileged namespace kind, asked
+    // of the caller's *effective capability set* - the question the credential
+    // model exists to answer, not the crude `euid == 0` it replaced (a caller
+    // that has dropped the capability is refused like Linux's, whatever its
+    // identity says).
+    let privileged = crate::sched::current_credentials().has_effective(crate::cred::CAP_SYS_ADMIN);
     match super::abi::unshare_verdict(args[0], privileged) {
         Err(e) => e,
         Ok(bits) => {

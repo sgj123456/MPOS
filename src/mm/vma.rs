@@ -141,7 +141,7 @@ impl VmaKind {
 /// `/proc/<pid>/maps` looks. What that reader loses is the difference between
 /// a mapping whose pages are the file's and one that is a copy of it, and a
 /// file-backed mapping's `offset` and `inode` - none of which this kernel's
-/// file mappings keep anywhere. That is a named gap in `PLAN.md` §7.4, not a
+/// file mappings keep anywhere. That is a named gap in `NOTES.md` §7.4, not a
 /// hidden one.
 #[derive(Clone)]
 pub struct MappedRange {
@@ -336,9 +336,67 @@ impl VmaTable {
         self.tidy();
     }
 
+    /// Claim a run of pages the caller has just *placed* - mapped eagerly or
+    /// re-mapped after a move - next to descriptions that may still be lazy.
+    ///
+    /// [`insert`] is `MAP_FIXED`'s take-the-range semantics: folding a new run
+    /// into an adjacent existing one goes through [`VmaTable::split_out`],
+    /// which takes the old VMA out and puts it back, and the page-table half
+    /// of that re-insert path frees every page inside the old description's
+    /// range first. For a lazily-mapped neighbour whose frames have never
+    /// arrived there is nothing in the tables to free and no frame to give
+    /// anybody - but the *description* would be rewritten by the merge, and a
+    /// caller like `brk`'s growth loop cannot tell "the hole beside me" from
+    /// "somebody else's untouched mapping" without learning the machine's
+    /// page-table internals (`NOTES.md` §15.18's measurement). So this appends
+    /// without touching anything already in the table, and sorts; two plain
+    /// anonymous runs that abut are still folded, because for `Anon` the
+    /// merge is a statement about identity and not about placement.
+    pub fn insert_present(&mut self, vma: Vma) {
+        if !matches!(vma.kind, VmaKind::Anon) {
+            self.vmas.push(vma);
+            self.vmas.sort_unstable_by_key(|v| v.start);
+            return;
+        }
+        self.vmas.push(vma);
+        self.tidy();
+    }
+
     /// Drop every VMA (or every part of one) inside `[start, end)`.
     pub fn remove_range(&mut self, start: usize, end: usize) {
         self.split_out(start, end);
+    }
+
+    /// Take the VMAs inside `[start, end)` out and hand them back, clipped to
+    /// the range, **without** disturbing their pages.
+    ///
+    /// [`VmaTable::take_range`] is what `munmap`-style paths use, where the
+    /// descriptions leaving the table also lose their frames. `mremap`'s move
+    /// needs the other half only: the pages travel with the mapping and are
+    /// un-mapped explicitly afterwards, so a description being lifted out must
+    /// not free what it describes - a `PROT_NONE` page taken this way was
+    /// previously handed back to the allocator while its PTE stayed live,
+    /// which is exactly the shape §15.18 found on the stack region.
+    pub fn lift_range(&mut self, start: usize, end: usize) -> Vec<Vma> {
+        if start >= end {
+            return Vec::new();
+        }
+        let mut lifted = Vec::new();
+        let mut kept = Vec::with_capacity(self.vmas.len() + 1);
+        for vma in self.vmas.drain(..) {
+            if let Some(left) = vma.sliced(vma.start, start) {
+                kept.push(left);
+            }
+            if let Some(middle) = vma.sliced(start.max(vma.start), end.min(vma.end)) {
+                lifted.push(middle);
+            }
+            if let Some(right) = vma.sliced(end, vma.end) {
+                kept.push(right);
+            }
+        }
+        self.vmas = kept;
+        lifted.sort_unstable_by_key(|v| v.start);
+        lifted
     }
 
     /// Take the VMAs inside `[start, end)` out and hand them back, clipped to
@@ -367,10 +425,24 @@ impl VmaTable {
     /// This is what a heap growth asks before it extends: a page inside the
     /// range that something else already owns - musl's `PROT_NONE` guard over
     /// the first page of a fresh heap - must not be claimed by the growth.
+    ///
+    /// The scan assumes the table is sorted, and *makes* it sorted rather than
+    /// trusting it: [`tidy`] and [`insert_present`] put every list back in
+    /// address order, but an unsorted table breaks the sweep below rather than
+    /// merely slowing it - a VMA that starts above `at` yet ends below it pulls
+    /// `at` backwards, and the next pass reports the same hole again. That is
+    /// how one mmap placement came to claim its gap twice with two overlapping
+    /// descriptions (`NOTES.md` §15.18).
     pub fn gaps(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
+        let mut vmas: Vec<&Vma> = self
+            .vmas
+            .iter()
+            .filter(|v| v.end > start && v.start < end)
+            .collect();
+        vmas.sort_unstable_by_key(|v| v.start);
         let mut gaps = Vec::new();
         let mut at = start;
-        for vma in self.vmas.iter().filter(|v| v.end > start && v.start < end) {
+        for vma in vmas {
             if vma.start > at {
                 gaps.push((at, vma.start.min(end)));
             }
@@ -428,6 +500,9 @@ impl VmaTable {
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use super::*;
+    // The host build's `MMAP_BASE` is the x86_64 one, which is what the
+    // placement arithmetic below is measured against (`mm::elf`'s doc).
+    use crate::mm::elf::MMAP_BASE;
 
     /// A stand-in backing object.
     ///
@@ -709,5 +784,130 @@ mod tests {
         );
         assert_eq!(table.gaps(0x0000, 0x2000), alloc::vec![(0x0000, 0x1000)]);
         assert!(table.gaps(0x1000, 0x2000).is_empty());
+    }
+
+    #[test]
+    fn gaps_are_one_hole_per_hole_whatever_order_the_table_holds() {
+        // The sweep below walks the table in address order and moves its cursor
+        // forward only. A table out of that order - which `insert_present` can
+        // leave behind when a *file-backed* run is claimed beside an existing
+        // one whose pages were just placed - must not report the same hole
+        // twice: a caller that claims every gap it is handed would then place
+        // two overlapping descriptions over one range (`NOTES.md` §15.18).
+        let object = fake(7);
+        let mut table = VmaTable::new();
+        // Out-of-order on purpose: the later address first.
+        table.vmas.push(frames(0x3000, 0x4000, RW, &object, 0));
+        table.vmas.push(anon(0x1000, 0x2000, RW));
+
+        assert_eq!(
+            table.gaps(0x1000, 0x4000),
+            alloc::vec![(0x2000, 0x3000)],
+            "one hole, reported once, from a table that was not sorted"
+        );
+    }
+
+    /// The first placement `free_range` makes for a process whose mmap cursor
+    /// still sits at the base: downward from `MMAP_BASE`, one page, taking the
+    /// highest run that fits below it. This is that walk, verbatim - the loop
+    /// lives beside it in `src/syscall/linux/proc.rs::free_range`, and replaying
+    /// it here (rather than re-deriving its arithmetic) is what lets a test pin
+    /// the *answer* instead of a transcription of it (`NOTES.md` §15.18).
+    ///
+    /// Verbatim in the two places the step is easy to get wrong, both of them
+    /// the difference between this and a walk that never leaves the page under
+    /// the cursor. The clamp opens it: a cursor above the base descends from the
+    /// base. And each pass asks for the whole of `floor..cursor`, not
+    /// `floor..floor + len` - `sched::vma_gaps(virt, len)` takes a *length* and
+    /// asks `Mm::vma_gaps(virt, virt + len)`, so a length handed to
+    /// [`VmaTable::gaps`], whose second argument is an end, would ask about
+    /// `floor..len`, an address range of a few pages near zero.
+    fn free_range_walk(table: &VmaTable, len: usize, cursor: usize) -> Option<usize> {
+        let page = 0x1000usize;
+        let mut top = cursor.min(MMAP_BASE);
+        loop {
+            let floor = top.checked_sub(len)? & !(page - 1);
+            let window = table.gaps(floor, floor + cursor.saturating_sub(floor));
+            for (hole_start, hole_end) in window {
+                let start = hole_start.next_multiple_of(page);
+                if start.checked_add(len).is_some_and(|end| end <= hole_end) {
+                    return Some(start);
+                }
+            }
+            top = floor;
+        }
+    }
+
+    /// `src/syscall/linux/proc.rs::handle_mmap_impl`'s placement rules,
+    /// replayed against the real table for the sequence `t-mmap` runs: the
+    /// arena's lazy `PROT_NONE` span, then a hint over an address the arena
+    /// already describes, and a `MAP_FIXED_NOREPLACE` onto one. Each rule is
+    /// one arm of that match; this pins what the arms answer, so a
+    /// kernel-side change to either predicate says so here rather than in a
+    /// guest log (`NOTES.md` §15.18).
+    #[test]
+    fn mmap_placement_rules_over_a_lazy_arena() {
+        let page = 0x1000usize;
+        // The arena `t-mmap` reserves, put where the kernel really puts it: the
+        // walk places every fresh mapping *below* the base, so a 2 MiB arena is
+        // at `MMAP_BASE - 2 MiB` and the very first placement is made on top of
+        // it.
+        let arena = MMAP_BASE - 0x20_0000;
+        let mut table = VmaTable::new();
+        // The fixture: a private PROT_NONE span nobody has touched. Every
+        // address in it is claimed by a description with no frames behind it.
+        table.insert(Vma::new(arena, MMAP_BASE, MapFlags::empty(), VmaKind::Anon));
+
+        // A hint inside the arena is not free of descriptions, so
+        // `handle_mmap_impl` declines it and relocates - `vma_range_free` is
+        // false over this range, which is the only thing the arm asks. The
+        // *walk* is the arena's other half: a lazy hole has no frames either,
+        // and the span is skipped because of the descriptions, not the pages
+        // (measured against real Linux: a hint inside a lazily-mapped span is
+        // relocated, exactly as one over a populated page is).
+        let hint = arena + 0x2_00;
+        assert!(table.covers(hint));
+        assert!(table.gaps(hint, hint + page).is_empty());
+
+        // `t-mmap`'s busy-hint fixture: a page taken `MAP_FIXED` inside the
+        // arena, exactly as the test's owner does. The hint itself stays a
+        // description-only claim, because `MAP_FIXED` takes the range and
+        // records it fresh - what a hint over it answers is the relocation
+        // above, not an error.
+        table.insert(Vma::named(
+            Vma::new(arena + 0x22_00, arena + 0x23_00, RW, VmaKind::Anon),
+            None::<alloc::sync::Arc<str>>,
+        ));
+        assert!(table.covers(arena + 0x22_00));
+
+        // NOREPLACE's gate is the same description question the hint asks:
+        // the second half of the arena is still covered, even untouched.
+        assert!(table.covers(arena + 0x30_00));
+
+        // The relocation walk, replayed faithfully against this table. The
+        // cursor a fresh process brings is the base itself, and the page under
+        // it is the top of the arena: described, and with no frame behind it.
+        assert!(
+            table.gaps(MMAP_BASE - page, MMAP_BASE).is_empty(),
+            "no gap within one page of the cursor"
+        );
+        // So the walk is turned away by the descriptions alone, and the whole
+        // span - 512 pages of nothing but `PROT_NONE` claims - is skipped: the
+        // first placement lands below the arena rather than inside it. A walk
+        // that asked the *frames* would have answered `MMAP_BASE - page`, the
+        // arena's own top page, and that is the collision §15.18 measured
+        // (`NOTES.md` §15.18).
+        assert_eq!(
+            free_range_walk(&table, page, MMAP_BASE),
+            Some(arena - page),
+            "the first placement goes below the untouched arena, not into it"
+        );
+        // And the cursor follows it down: the next placement continues from the
+        // bottom of the last one, which is the direction the region grows in.
+        assert_eq!(
+            free_range_walk(&table, page, arena - page),
+            Some(arena - 2 * page),
+            "the next placement goes just below the previous one"
+        );
     }
 }

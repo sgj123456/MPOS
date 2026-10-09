@@ -23,7 +23,7 @@
 //! same [`Virtio9p`] - whose two methods are one implementation over the one crate
 //! driver. So the mount table, the boot's own mount and `mount -t 9p` above it are
 //! one copy on both machines, and the only lines that name a bus are the two
-//! probes that open it (`PLAN.md` §13.29).
+//! probes that open it (`NOTES.md` §13.29).
 
 use alloc::string::String;
 use alloc::sync::Arc;

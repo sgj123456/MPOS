@@ -48,7 +48,7 @@ use crate::sched::signal;
 // `to_user_regs`/`from_user_regs` decide which slot holds which register. The
 // protocol words it decides with come from the arch-neutral `crate::abi` leaf,
 // beside the clone flags - which is what keeps this block from naming the
-// syscall layer at all, and took `sched -> syscall` to 0 (`PLAN.md` §13).
+// syscall layer at all, and took `sched -> syscall` to 0 (`NOTES.md` §13).
 use crate::abi::{
     PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_NONE,
     PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEEXEC, PTRACE_O_TRACEFORK,
@@ -629,8 +629,19 @@ pub struct ItimerSnapshot {
 pub const TIMER_SLOTS: usize = 8;
 
 /// The `sigev_notify` values `timer_create` accepts, as the ABI numbers them.
-pub const SIGEV_NONE: u32 = 0;
-pub const SIGEV_SIGNAL: u32 = 1;
+///
+/// `SIGEV_SIGNAL` is **0** and `SIGEV_NONE` is **1** - the order `linux/signal.h`
+/// gives them, and the order `libc`'s linux table carries. The pair used to be
+/// written the other way round here, and `abitest/lib/lin.rs` had the same
+/// swap, so the two agreed with each other and disagreed with every libc: a
+/// caller sending the real `SIGEV_NONE` (1) was read as `SIGEV_SIGNAL` and
+/// refused `EINVAL` when its signo was left 0 (which is what a silent timer
+/// does), and a caller sending the real `SIGEV_SIGNAL` (0) got a timer that
+/// never fired. The migrated `t-timer-create` sends `libc::SIGEV_*` and found
+/// it; the claim that 1 is the silent one and 0 the signalled one is pinned
+/// beside the create.
+pub const SIGEV_SIGNAL: u32 = 0;
+pub const SIGEV_NONE: u32 = 1;
 pub const SIGEV_THREAD_ID: u32 = 4;
 
 /// `TIMER_ABSTIME`: `timer_settime`'s flag that names a deadline on the clock
@@ -763,7 +774,7 @@ pub struct Mm {
     /// and the `Arc`-shared `Mm` is what a process is here: every thread's ticks
     /// land in the same two counters. Aggregating *reaped children* into
     /// `cutime`/`cstime` (and `RUSAGE_CHILDREN`) is a separate named gap -
-    /// `PLAN.md` §12.2 B6.
+    /// `NOTES.md` §12.2 B6.
     cpu_utime: core::sync::atomic::AtomicU64,
     cpu_stime: core::sync::atomic::AtomicU64,
     /// The CPU of this process's *reaped* children, accumulated by
@@ -874,6 +885,14 @@ impl Mm {
         critical_section::with(|cs| self.vmas.borrow(cs).borrow_mut().insert(vma));
     }
 
+    /// Claim a run whose pages the caller has just placed, beside descriptions
+    /// it must not rewrite. See [`VmaTable::insert_present`].
+    fn vma_insert_present(&self, vma: Vma) {
+        critical_section::with(|cs| {
+            self.vmas.borrow(cs).borrow_mut().insert_present(vma);
+        });
+    }
+
     fn vma_remove_range(&self, start: usize, end: usize) {
         critical_section::with(|cs| self.vmas.borrow(cs).borrow_mut().remove_range(start, end));
     }
@@ -882,12 +901,31 @@ impl Mm {
         critical_section::with(|cs| self.vmas.borrow(cs).borrow_mut().take_range(start, end))
     }
 
+    /// Lift the descriptions out without touching their pages. See
+    /// [`VmaTable::lift_range`].
+    fn vma_lift_range(&self, start: usize, end: usize) -> Vec<Vma> {
+        critical_section::with(|cs| self.vmas.borrow(cs).borrow_mut().lift_range(start, end))
+    }
+
     fn vma_set_prot(&self, start: usize, end: usize, prot: MapFlags) {
         critical_section::with(|cs| self.vmas.borrow(cs).borrow_mut().set_prot(start, end, prot));
     }
 
     fn vma_gaps(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
         critical_section::with(|cs| self.vmas.borrow(cs).borrow().gaps(start, end))
+    }
+
+    /// Whether no VMA describes any part of `start..end`.
+    ///
+    /// `gaps` answers the whole question in one call, which is the reason this
+    /// is a predicate over descriptions rather than a loop over pages: a range
+    /// nothing describes is *exactly one* hole, and that hole is the whole of
+    /// the range. A range a lazily-mapped VMA covers is not free even though it
+    /// has no frames in it - it is still somebody's address, and a second
+    /// description over it is what `NOTES.md` §15.18 measured.
+    fn vma_range_free(&self, start: usize, end: usize) -> bool {
+        let gaps = self.vma_gaps(start, end);
+        gaps.len() == 1 && gaps[0] == (start, end)
     }
 
     /// The `membarrier` registrations this group has made. See
@@ -1223,7 +1261,7 @@ struct Task {
     /// schedules by: the scheduler's priority *bands* are its policy and a
     /// caller cannot move a task between them, so the nice has no weight effect
     /// here (a named sub-gap) - but a program that set it and read it back must
-    /// see what it set, or the call is the silent-success `PLAN.md` §4 forbids.
+    /// see what it set, or the call is the silent-success `NOTES.md` §4 forbids.
     /// Inherited across `fork`, kept across `exec`, as Linux keeps it.
     nice: i32,
     /// The process's resource limits, the `RLIMIT_*` table `getrlimit`/
@@ -2147,7 +2185,7 @@ impl Table {
                     // `drivers::virtio::input` and `drivers::uinput` one after
                     // another, which is what made the scheduler unbuildable
                     // without the VFS, the network and the drivers
-                    // (`PLAN.md` §11.1.3, V-3, and `sched::exit` for the rule
+                    // (`NOTES.md` §11.1.3, V-3, and `sched::exit` for the rule
                     // that the order is the registration order).
                     crate::sched::exit::run(&files, task.tgid.0 as u32);
                     queue_release(files);
@@ -3306,7 +3344,7 @@ fn block_until_on(cond: impl Fn(&Table) -> bool) {
 /// table borrow it also checks `table_has_deliverable`, so a trapped signal
 /// wakes the caller with [`WaitEnd::Interrupted`] instead of being swallowed and
 /// re-slept - which is exactly what makes `wait4`/`waitid` interruptible the way
-/// the pipe/futex/nanosleep waits already are (`PLAN.md` §2.5; measured on a real
+/// the pipe/futex/nanosleep waits already are (`NOTES.md` §2.5; measured on a real
 /// Linux: `wait4` interrupted by a caught non-`SA_RESTART` signal returns `EINTR`,
 /// and `SA_RESTART` restarts it). The deliverable signal is left pending, not
 /// consumed, so the syscall gate can build the handler's frame on the way out.
@@ -6423,18 +6461,41 @@ pub fn user_frame_at(virt: usize) -> Option<usize> {
     })
 }
 
-/// Whether every page of `virt..virt + len` is still unclaimed in the current
-/// task's address space.
+/// Whether no VMA describes any part of `virt..virt + len`.
 ///
-/// This is what decides whether an `mmap` address is a hint worth taking, and
-/// whether a `MAP_FIXED` request has anything to replace. A page counts as
-/// taken when a VMA covers it even if no frame is there yet: a lazily-mapped
-/// range *is* the process's, and placing a second mapping over it would leave
-/// two VMAs describing one address.
-pub fn user_range_free(virt: usize, len: usize) -> bool {
+/// This asks the question a range claim needs: that nothing belongs to the
+/// process inside it - not even a lazily-mapped hole whose pages have never
+/// arrived. Linux's `get_unmapped_area` checks the descriptions rather than
+/// the frames, and both `mmap`'s plain hint and `brk`'s grow are gated on
+/// this (measured, `NOTES.md` §15.18).
+///
+/// The answer comes from [`Mm::vma_range_free`], which is the same predicate
+/// over a table the caller already holds - the `brk` growth loop asks it that
+/// way, because `current_mm()` from inside a `with_table` closure would take
+/// the table twice.
+pub fn vma_range_free(virt: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    current_mm().vma_range_free(virt, virt.saturating_add(len))
+}
+
+/// Whether every page of `virt..virt + len` has no *frame* behind it yet.
+///
+/// The frame-wise counterpart of [`vma_range_free`], and deliberately not the
+/// question any *placement* decision asks: a lazily-mapped VMA with no pages
+/// yet is still somebody's address, and placing a second description over it
+/// is the shape `NOTES.md` §15.18 refused. It is kept as the mm seam's
+/// page-level question - a range whose description exists and whose frames do
+/// not is exactly what "lazily mapped" means, and it is what a reader that
+/// wants to know whether a hint is *busy* in the old frame-backed sense asks.
+/// Nothing in the kernel gates a placement on it any more: measured against
+/// real Linux, a hint over a lazy span and a hint over a busy one get the same
+/// answer (relocated), so the distinction has no caller to serve.
+pub fn frames_range_free(virt: usize, len: usize) -> bool {
     (0..len)
         .step_by(crate::mm::pframe::PAGE_SIZE)
-        .all(|offset| !user_mapped(virt + offset))
+        .all(|offset| user_frame_at(virt + offset).is_none())
 }
 
 /// Take the mappings covering `virt..virt + len` away from the current task,
@@ -6801,15 +6862,19 @@ pub fn vma_prot_at(virt: usize) -> Option<MapFlags> {
 }
 
 /// The VMAs covering `virt..virt + len` in the current process, clipped to the
-/// range, with the table left empty there.
+/// range, with the table left empty there - and their pages *left alone*.
 ///
 /// `mremap` takes a mapping's backing out of one place and puts it in another,
-/// and the VMAs are what remember which backing that is.
+/// and the VMAs are what remember which backing that is. The frames travel
+/// with the mapping and the old ones come away explicitly afterwards, so this
+/// must not free them on the way out: lifting a `PROT_NONE` description through
+/// the page-table half used to hand its untouched pages to the allocator while
+/// the PTE stayed live (`NOTES.md` §15.18).
 pub fn take_vmas(virt: usize, len: usize) -> Vec<Vma> {
     if len == 0 {
         return Vec::new();
     }
-    current_mm().vma_take_range(virt, virt.saturating_add(len))
+    current_mm().vma_lift_range(virt, virt.saturating_add(len))
 }
 
 /// The parts of `virt..virt + len` the current process has not already claimed.
@@ -6821,20 +6886,26 @@ pub fn vma_gaps(virt: usize, len: usize) -> Vec<(usize, usize)> {
 }
 
 /// Put a VMA back, backing and all - how `mremap` completes a move.
+///
+/// The caller has just re-placed every page of the range at its destination,
+/// so this is [`VmaTable::insert_present`]'s case: the description may fold
+/// into an abutting neighbour, but the merge must not go through the path
+/// that frees pages beside it (`NOTES.md` §15.18).
 pub fn insert_vma(virt: usize, end: usize, flags: MapFlags, kind: VmaKind) {
     if virt >= end {
         return;
     }
-    current_mm().vma_insert(Vma::new(virt, end, flags, kind));
+    current_mm().vma_insert_present(Vma::new(virt, end, flags, kind));
 }
 
 /// Claim `virt..virt + len` for anonymous memory without disturbing what is
 /// already there: the shape a heap growth wants, where a guard page a libc
-/// mapped inside the range must survive.
+/// mapped inside the range must survive. The claim is append-only
+/// ([`VmaTable::insert_present`]) for the same reason `brk`'s own tail is.
 pub fn claim_anon_gaps(virt: usize, len: usize, flags: MapFlags) {
     let mm = current_mm();
     for (start, end) in mm.vma_gaps(virt, virt.saturating_add(len)) {
-        mm.vma_insert(Vma::new(start, end, flags, VmaKind::Anon));
+        mm.vma_insert_present(Vma::new(start, end, flags, VmaKind::Anon));
     }
 }
 
@@ -6884,7 +6955,27 @@ pub fn brk(addr: usize) -> isize {
         if frontier >= crate::mm::elf::MMAP_BASE {
             return crate::err::ENOMEM;
         }
-        let grown_to = task.brk_base + task.brk_pages * PAGE_SIZE;
+        // Growing over a range a VMA already describes is refused the way
+        // Linux refuses it, with `EINVAL` and the break left where it was
+        // (`brk(mm_brk)` after a `PROT_NONE` mapping inside the gap, measured
+        // on real Linux - `NOTES.md` §15.18). The page-wise question would
+        // answer "free" for such a range, because a lazily-mapped VMA has no
+        // frames in it yet, and claiming it anyway would split somebody
+        // else's description. A libc that hits this reads `EINVAL` as "my
+        // own mapping is in the way", backs off, and falls back to `mmap`,
+        // which is exactly what glibc does before it ever asks again.
+        //
+        // Only a range some description covers is refused: an ordinary
+        // growth walks into empty address space, which is one hole from the
+        // old break to the new one, so asking whether the growth range is
+        // *free* is the question - an inverted predicate that refused every
+        // range with a hole in it turned `t-brk` and `t-maps` red on both
+        // machines.
+        let grown = task.brk_base + task.brk_pages * PAGE_SIZE;
+        if needed_pages > task.brk_pages && !task.mm.vma_range_free(grown, frontier) {
+            return crate::err::EINVAL;
+        }
+        let grown_to = grown;
         if frontier < grown_to {
             // The description goes with the pages: a heap that shrank is no
             // longer the process's past the new break, so `munmap`/`madvise`
@@ -6947,10 +7038,15 @@ pub fn brk(addr: usize) -> isize {
         // already is: a libc is free to have mapped inside the space the break
         // is about to grow into - musl's mallocng puts a `PROT_NONE` guard over
         // the first page of a fresh heap - and that mapping is its own, not the
-        // break's.
+        // break's. A gap here is a hole in the *descriptions*, which every
+        // frame inside it the growth loop just placed; claiming it with
+        // [`VmaTable::insert_present`] folds it into whatever abuts it without
+        // re-inserting that neighbour, whose untouched lazy pages must stay
+        // somebody's address even though they are nobody's frame yet
+        // (`NOTES.md` §15.18).
         if frontier > grown_to {
             for (start, end) in task.mm.vma_gaps(grown_to, frontier) {
-                task.mm.vma_insert(Vma::new(
+                task.mm.vma_insert_present(Vma::new(
                     start,
                     end,
                     MapFlags::READ | MapFlags::WRITE | MapFlags::USER,

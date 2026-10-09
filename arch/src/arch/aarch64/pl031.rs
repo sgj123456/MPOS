@@ -2,7 +2,7 @@
 //!
 //! This is `crate::hal::WallClock`'s hardware end on the second machine - the
 //! missing trait that, with stage 6c's paging methods, is all that stood between
-//! `hal` and compiling here (`PLAN.md` §9.1). The generic contract is "the Unix
+//! `hal` and compiling here (`NOTES.md` §9.1). The generic contract is "the Unix
 //! epoch the boot anchored wall time at", the offset `clock_gettime(CLOCK_REALTIME)`
 //! adds to uptime.
 //!

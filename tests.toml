@@ -71,7 +71,7 @@ diagnostic = ["t-sh"]
 # changes is the aarch64 arm, which leaves these out and prints them by name
 # rather than reporting them as failures or skipping them silently. The way to
 # shrink this group is to make the call work, not to edit a list of things nobody
-# runs (`PLAN.md` §13.4/§13.5).
+# runs (`NOTES.md` §13.4/§13.5).
 #
 # It is empty, and empty is the state to keep it in rather than a reason to delete
 # the group: the mechanism stays because the day a call cannot be served is the day

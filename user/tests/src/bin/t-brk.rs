@@ -17,10 +17,13 @@
 //! The no-std version grew *the program break* from vaddr-zero. Under musl
 //! the break is Rust's own heap, and writing through addresses the allocator
 //! also owns would corrupt it - so the migrated version first **moves the
-//! break out of the way**: `sbrk(0)` records where the heap ended, a private
-//! anonymous mapping holds the pages the write claims exercise, and every
-//! brk claim runs against an address above both. The claims themselves are
-//! unchanged: alignment, the returned end, writes taken, the shrink answer.
+//! break out of the way**: `sbrk(0)` records where the heap ended, and every
+//! brk claim runs against an address above it, in the gap between the heap and
+//! the mmap region (see the fixture in `main`: the first draft asked for a
+//! break above a mapping made at the top of the mmap region, which no kernel
+//! can grant - a heap may not walk into the mmap region). The claims
+//! themselves are unchanged: alignment, the returned end, writes taken, the
+//! shrink answer.
 //!
 //! The raw call is clause (c) in its plainest form: `libc::brk` does not
 //! exist on linux-musl (measured), only `sbrk`, whose increment shape cannot
@@ -29,7 +32,6 @@
 //! which agree with this kernel's own tables at the same values.
 
 use mpos_user_tests::Report;
-use rustix::mm::{MapFlags, ProtFlags, mmap_anonymous};
 
 fn brk(addr: usize) -> isize {
     unsafe { libc::syscall(libc::SYS_brk, addr) as isize }
@@ -39,32 +41,25 @@ fn main() {
     println!("t-brk");
     let mut r = Report::new();
 
-    // Move the break clear of the heap: park the heap's own growth behind a
-    // private map, then run every claim above everything this process owns.
+    // Move the break clear of the heap: the request goes to the next 64 KiB
+    // boundary above whatever `sbrk(0)` reports, which is the *gap* between
+    // the program's own heap (low, where the loader put the image) and the
+    // mmap region (whose base is the highest address this kernel hands out).
+    //
+    // The gap is the only place the request can live. A break that reached the
+    // mmap region is refused - Linux refuses it too, because a heap that walked
+    // into it would collide with every mapping the program makes - so asking
+    // for one *above* a fixture mapped at the top of the mmap region (which is
+    // where a fresh `mmap` lands, the region growing down from its base) is a
+    // request no kernel could grant. That is what this fixture used to do, and
+    // the refusal then read as a broken `brk` (`NOTES.md` §15.18).
+    //
+    // mpos moves the break to the request; glibc's brk refuses a jump farther
+    // than its own heap can grow and answers the *current* break instead
+    // (measured here), so on a hosted run the fallback answer is accepted and
+    // named. The payload sweep pins that the request is granted.
     let heap_end = unsafe { libc::sbrk(0) } as usize;
-    const SPAN: usize = 3 * 4096;
-    let base = match unsafe {
-        mmap_anonymous(
-            std::ptr::null_mut(),
-            SPAN,
-            ProtFlags::READ | ProtFlags::WRITE,
-            MapFlags::PRIVATE,
-        )
-    } {
-        Ok(p) => p as usize,
-        Err(_) => {
-            r.check("the fixture mapping succeeds", false);
-            r.finish()
-        }
-    };
-    r.check("the fixture mapping succeeds", true);
-
-    // Start above everything this process owns. mpos moves the break to the
-    // request; glibc's brk refuses a jump farther than its own heap can
-    // grow and answers the *current* break instead (measured here), so on a
-    // hosted run the fallback answer is accepted and named. The payload
-    // sweep pins that the request is granted.
-    let start = (heap_end.max(base + SPAN) + 0xFFFFF) & !0xFFFFF;
+    let start = (heap_end + 0x1_0000 + 0xFFFF) & !0xFFFF;
     let cur = brk(start);
     r.check(
         "brk reports a break at or past the request",

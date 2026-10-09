@@ -8,7 +8,7 @@
 //! not indirection - there is one implementation and no `dyn`, so every call
 //! monomorphises to the direct one it replaced - but that a second
 //! architecture is a *new* `arch/<arch>/` implementing these traits, with no
-//! edit to the modules that use them (`PLAN.md` §9.1).
+//! edit to the modules that use them (`NOTES.md` §9.1).
 //!
 //! # Why capability traits and not one `Arch` blob
 //!
@@ -19,7 +19,7 @@
 //! is what lets each trait name the types it needs and no more, so an
 //! architecture-specific type has nowhere to cross. A single trait carrying
 //! every method would be the same leak with one import instead of a blob, which is
-//! the failure `PLAN.md` §11.3 warned about when it rejected a "generic HAL
+//! the failure `NOTES.md` §11.3 warned about when it rejected a "generic HAL
 //! trait forest" - this is deliberately a trait per concern, not one trait per
 //! function. The *baseline* concerns (`Clock`, `WallClock`, `Cpu`, `Interrupts`,
 //! `Paging`, `Contexts`, `Console`) are what every machine this kernel boots on
@@ -54,7 +54,7 @@
 /// and its home is `mpos-vm`, beside [`Mapping`] - a leaf both this module and
 /// the kernel depend on, named directly because this module travels into
 /// `mpos-arch` with the machine code and may not reach up into the kernel for
-/// it (`PLAN.md` §14.2).
+/// it (`NOTES.md` §14.2).
 pub use mpos_vm::PageTaken;
 use mpos_vm::{KernelSections, MapFlags, Mapping};
 
@@ -65,7 +65,7 @@ use mpos_vm::{KernelSections, MapFlags, Mapping};
 /// is one to populate, and a `svc` needs the syscall table - and it is the last
 /// thing that keeps `arch` inside the kernel crate. It lives inside `hal`
 /// because it is the same boundary, and it travels into `mpos-arch` with the
-/// rest of this module (`PLAN.md` §14.2).
+/// rest of this module (`NOTES.md` §14.2).
 pub mod kernel;
 
 /// The console's transmit queue: the implementation behind [`SerialRing`].
@@ -296,7 +296,7 @@ pub trait Paging {
     /// (`paging::device_virt`). `None` means this machine cannot map that
     /// physical range - the honest refusal a caller reads, not a bogus address.
     ///
-    /// This is the seam `PLAN.md` §9.1 names as the first unit of the aarch64
+    /// This is the seam `NOTES.md` §9.1 names as the first unit of the aarch64
     /// `drivers` stage: it lets `drivers::virtio` reach a device's registers
     /// through `crate::hal` (the one machine-call route every layer above `arch`
     /// is allowed) instead of naming a per-machine window allocator.
@@ -519,7 +519,7 @@ pub struct SignalFrameEntry {
 /// unwrap one, so it declares no `mpos_signal_frame` and the ABI layer delivers
 /// no handler there. That is why the signal family in `syscall` is gated on
 /// this flag and not on an architecture: an absent capability is absent, not a
-/// stub (`PLAN.md` §13.2).
+/// stub (`NOTES.md` §13.2).
 ///
 /// What is *not* here is policy - which stack, which mask, which restorer - and
 /// the two scheduler calls a delivery needs (writing the frame into the

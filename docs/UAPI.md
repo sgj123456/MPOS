@@ -1,6 +1,6 @@
 # MPOS UAPI — the userspace-visible surface, and what is left
 
-`PLAN.md` is a phase roadmap: each section narrates one landing, in order, with its
+`NOTES.md` is a phase roadmap: each section narrates one landing, in order, with its
 measurements beside it. This file is the other view of the same truth — an **inventory**,
 one row per promise the kernel makes to a binary it did not compile, so that the review
 question every change here gets asked can be asked of the whole surface at once:
@@ -23,7 +23,7 @@ contract. Here that is, concretely:
   previously made `st_mode` read the `st_nlink` value, and emitting the x86_64 *length* wrote
   sixteen bytes past every 128-byte struct — into whichever frame the libc's own stat buffer
   sits in, which is how a non-empty `std::fs::remove_dir_all` came to die at `pc 0`
-  (  `PLAN.md` §13.10). Pin: `t-fstat`/`t-newfstatat` on both machines (mode/type/`nlink`/`ino`/
+  (  `NOTES.md` §13.10). Pin: `t-fstat`/`t-newfstatat` on both machines (mode/type/`nlink`/`ino`/
   `blocks`/`size` read back through each machine's own `Stat` — the claim the retired aarch64
   payload's `MPOS_STAT_OK` carried, and why the `no_std` suite's hard-coded x86_64 `lin::Stat` had
   to go: a program that writes one machine's layout down cannot see the other's) and
@@ -33,13 +33,13 @@ contract. Here that is, concretely:
   copies the fields out). The three clock *seconds* are the one part the two ABIs share — 72, 88
   and 104, each the seconds half of a 16-byte `timespec` whose nanosecond half follows at 80, 96
   and 112 — and x86_64's writer used to pack them at 72/80/88, so `st_mtime` read the value
-  written into `st_atime_nsec` and `st_ctime` read zero (`PLAN.md` §13.11). `statx`'s `struct
+  written into `st_atime_nsec` and `st_ctime` read zero (`NOTES.md` §13.11). `statx`'s `struct
   statx` is one layout on every machine, and being arch-independent is not the same as being
   right: it is 256 bytes and Linux zeroes and fills all of them, with
   `stx_atime`/`btime`/`ctime`/`mtime` as 16-byte timestamps at 64/80/96/112, `stx_rdev_*` after
   them at 128/132 and the file's device split into `stx_dev_major`/`minor` at 136/140. This
   kernel wrote its clocks at 96/112/128, its rdev pair at 72, and stopped the write at 152 — and
-  no test read any of those fields back (`PLAN.md` §13.11). Pin: `t-statx-agree` (one file's
+  no test read any of those fields back (`NOTES.md` §13.11). Pin: `t-statx-agree` (one file's
   device, inode, mode, size, link count and three clocks, read through `statx` **and** through
   the `fstatat` family, which have to be the same numbers) on both machines, and the bare-metal
   suite's `t-statx` for the argument shape and the clocks it compares against `newfstatat` —
@@ -97,7 +97,7 @@ note printed once per number (`note_enosys`):
 | `io_uring_enter` | 426 | " | " |
 | `io_uring_register` | 427 | " | " |
 
-> The numbers for `fanotify` above are the header's (`300`/`301`), and `PLAN.md`'s board
+> The numbers for `fanotify` above are the header's (`300`/`301`), and `NOTES.md`'s board
 > entry that says `302`/`303` is a typo for them — `t-enosys` pins `300`/`301`, which is
 > what a caller sends.
 
@@ -106,7 +106,7 @@ note printed once per number (`note_enosys`):
 the caller's block. §3.2 ranks that shape worst, so the arm was removed; the number stays
 named (append-only) and `t-rseq` pins `ENOSYS`. Serving it needs a per-thread registration
 whose `cpu_id`/`node_id`/`mm_cid` are maintained across preemption, plus
-`RSEQ_FLAG_UNREGISTER` — a scheduler feature (`PLAN.md` A6).
+`RSEQ_FLAG_UNREGISTER` — a scheduler feature (`NOTES.md` A6).
 
 ### 1.2 Served with a named sub-gap
 
@@ -115,18 +115,18 @@ contract is not. Each is tracked in its phase section; the list is here so it is
 
 | Syscall | Sub-gap | Where |
 |---|---|---|
-| `rt_sigqueueinfo` / `sigqueue` | real-time signals `32..=64` are now fully queued (stage C: every copy delivered FIFO with its own `si_value`); the one divergence is overflow — a full per-task ring drops the extra copy silently, where Linux's per-user `RLIMIT_SIGPENDING` makes `sigqueue` return `EAGAIN` | `PLAN.md` §2.3 |
+| `rt_sigqueueinfo` / `sigqueue` | real-time signals `32..=64` are now fully queued (stage C: every copy delivered FIFO with its own `si_value`); the one divergence is overflow — a full per-task ring drops the extra copy silently, where Linux's per-user `RLIMIT_SIGPENDING` makes `sigqueue` return `EAGAIN` | `NOTES.md` §2.3 |
 | `mmap` | `MAP_HUGETLB` is `ENOMEM` (an honest refusal); `MAP_HUGETLB` backing is the missing half | §3 below |
-| `madvise` | `MADV_FREE` and a shared mapping's cross-process drop are deliberate no-ops | `PLAN.md` §5.2 |
-| `posix_fadvise` | recognised advices are accepted as the no-ops they are (this kernel prefetches nothing) | `PLAN.md` §12.1 |
-| `vhangup` | with a controlling terminal it answers `EOPNOTSUPP`: the tty re-init + `EIO` hang-up is not implemented | `PLAN.md` §12.2 B4 |
-| `getpriority` / `setpriority` / `sched_setattr` | the `nice` round-trips truthfully but carries no scheduling-weight effect | `PLAN.md` §12.2 B5/B5b |
-| `setxattr` family | arguments validated, then `EOPNOTSUPP`: no filesystem here stores xattrs | `PLAN.md` Remaining ABI |
-| `ptrace` | `PTRACE_EVENT_SECCOMP` refused (no tracer stop); `PTRACE_SETSIGINFO` validates then `EOPNOTSUPP` (no siginfo carried through a stop) | `PLAN.md` §8.2, §12.1 A7 |
-| `unshare` / `setns` | UTS served; MNT/PID/NET (and USER/IPC/CGROUP/TIME) refused `EOPNOTSUPP`; `setns` cannot name a namespace by descriptor | `PLAN.md` §6.3 |
-| `pivot_root` | `chroot(2)` is now per-process — the task carries its own root and the path walk jails to it (`t-chroot`); `pivot_root(2)` and `MS_MOVE` still act on the single global mount table, which *is* Linux's answer with one mount namespace, and only become per-process with `unshare(CLONE_NEWNS)` | `PLAN.md` §6.3 |
+| `madvise` | `MADV_FREE` and a shared mapping's cross-process drop are deliberate no-ops | `NOTES.md` §5.2 |
+| `posix_fadvise` | recognised advices are accepted as the no-ops they are (this kernel prefetches nothing) | `NOTES.md` §12.1 |
+| `vhangup` | with a controlling terminal it answers `EOPNOTSUPP`: the tty re-init + `EIO` hang-up is not implemented | `NOTES.md` §12.2 B4 |
+| `getpriority` / `setpriority` / `sched_setattr` | the `nice` round-trips truthfully but carries no scheduling-weight effect | `NOTES.md` §12.2 B5/B5b |
+| `setxattr` family | arguments validated, then `EOPNOTSUPP`: no filesystem here stores xattrs | `NOTES.md` Remaining ABI |
+| `ptrace` | `PTRACE_EVENT_SECCOMP` refused (no tracer stop); `PTRACE_SETSIGINFO` validates then `EOPNOTSUPP` (no siginfo carried through a stop) | `NOTES.md` §8.2, §12.1 A7 |
+| `unshare` / `setns` | UTS served; MNT/PID/NET (and USER/IPC/CGROUP/TIME) refused `EOPNOTSUPP`; `setns` cannot name a namespace by descriptor | `NOTES.md` §6.3 |
+| `pivot_root` | `chroot(2)` is now per-process — the task carries its own root and the path walk jails to it (`t-chroot`); `pivot_root(2)` and `MS_MOVE` still act on the single global mount table, which *is* Linux's answer with one mount namespace, and only become per-process with `unshare(CLONE_NEWNS)` | `NOTES.md` §6.3 |
 | `process_vm_readv` / `writev` | served for the address transfer, and now gated by `ptrace_may_access` — a caller must share a uid with the target (or hold `CAP_SYS_PTRACE`) and the target must be dumpable. Linux's group-id comparison and its LSM hook are not modelled | §5.1 |
-| `/proc/<pid>/maps` | served; an image's and a private file mapping's line carries no `offset`/`inode`; `smaps`/`numa_maps` are not written | `PLAN.md` §7.4 |
+| `/proc/<pid>/maps` | served; an image's and a private file mapping's line carries no `offset`/`inode`; `smaps`/`numa_maps` are not written | `NOTES.md` §7.4 |
 
 ---
 
@@ -134,7 +134,7 @@ contract is not. Each is tracked in its phase section; the list is here so it is
 
 Dispatched on the whole request word (magic byte plus command), never on the command byte
 alone — the one time that was done wrong, `RNDADDENTROPY` (`'R'` nr 3) was answered as the
-drain (`'R'` nr 4) and OpenRC's `seedrng` failed to seed the boot (`PLAN.md` §12.1 A8).
+drain (`'R'` nr 4) and OpenRC's `seedrng` failed to seed the boot (`NOTES.md` §12.1 A8).
 
 | Family | Device(s) | Owner module | Verdict |
 |---|---|---|---|
@@ -142,9 +142,9 @@ drain (`'R'` nr 4) and OpenRC's `seedrng` failed to seed the boot (`PLAN.md` §1
 | `'E'` (0x45) | `/dev/input/eventN` | `crates/evdev` | Served, measured: `EVIOCREVOKE` one-way NULL-arg, `EVIOCGPHYS`/`UNIQ` `ENOENT` for an absent string, `EVIOCSFF`/`RMFF` `ENOSYS`, keycodes `EINVAL`, `REP` stored gated on `EV_REP`, `GKEY/LED/SND/SW` return counts |
 | `'U'` (0x55) | `/dev/uinput` | `drivers/uinput.rs` (`Uinput::ioctl`), vocabulary in `crates/uinput` | Served; gaps: no `UI_ABS_SETUP`, no force feedback, no `/sys/class/input` entry (sysfs is built once at boot) |
 | `'V'` (0x56) | virtual consoles | `vfs/tty.rs` (`Tty::vt_ioctl`), state in `vfs/vcmux.rs`+`vfs/vtmode.rs` | Served: `VT_SETMODE`/`VT_PROCESS` negotiation, `VT_ACTIVATE` non-blocking, `VT_WAITACTIVE` sleeping, `VT_SENDSIG` → `ENOTTY` (measured) |
-| `'K'` (0x4B) | virtual consoles | `vfs/tty.rs` (`Tty::kd_ioctl`) | **Refused as a closed set**: five requests served (`KDSETMODE`/`KDGETMODE`/`KDSKBMODE`/`KDGKBMODE`/`KDGKBTYPE`), the rest of the block `EOPNOTSUPP`, outside it `ENOTTY`. Per-device *serve* from live console state is the Phase-11 B2 move (`PLAN.md` §12.1 A2) |
+| `'K'` (0x4B) | virtual consoles | `vfs/tty.rs` (`Tty::kd_ioctl`) | **Refused as a closed set**: five requests served (`KDSETMODE`/`KDGETMODE`/`KDSKBMODE`/`KDGKBMODE`/`KDGKBTYPE`), the rest of the block `EOPNOTSUPP`, outside it `ENOTTY`. Per-device *serve* from live console state is the Phase-11 B2 move (`NOTES.md` §12.1 A2) |
 | `'b'` (0x62) | dma-buf | `src/syscall/linux/fs.rs` | Served (`SYNC` as the documented coherent-memory no-op, `SET_NAME` a debug label) |
-| `'d'` (0x64) | `/dev/dri/card0`, `renderD128` | `src/drivers/drm.rs`, `crates/gpu/src/virtgpu.rs`, `crates/gpu/src/*.rs` | Served across the compositor surface, and **the `DRM_VIRTGPU_*` family with it, 2D and 3D both**: all eleven requests are dispatched, and each answers per card shape, as Linux's does (measured; instrument in `user/staging/virtgpu-probe/`, and the GL card's own answers in `PLAN.md` §7.4). On a card with no 3D — `GETPARAM` (`3D_FEATURES` 0, `CAPSET_QUERY_FIX` 1, unknown parameter `EINVAL`, the write four bytes wide as Linux's is), `RESOURCE_CREATE` (a real device resource, made across the mailbox to the render task), and `RESOURCE_INFO`/`MAP`/`WAIT`/`TRANSFER_TO_HOST` for the handle it returns; `GET_CAPS`/`EXECBUFFER`/`TRANSFER_FROM_HOST` `ENOSYS`, `CONTEXT_INIT`/`RESOURCE_CREATE_BLOB`/a 3D `RESOURCE_CREATE` `EINVAL`. On a GL card the same requests answer as Linux's GL card does: `VIRGL` and `CONTEXT_INIT` are negotiated (`3D_FEATURES` 1, `SUPPORTED_CAPSET_IDs` 6), `CONTEXT_INIT` is `EEXIST` because the context is created implicitly on the first resource, a 3D `RESOURCE_CREATE`, `EXECBUFFER` and `TRANSFER_FROM_HOST` complete, and the two advertised cap sets are fetched and cached. `RESOURCE_CREATE_BLOB` stays `EINVAL` on both shapes, which is Linux's answer on both too. **Three named divergences**: `RESOURCE_INFO`'s `res_handle` is 0 for a plain dumb buffer (on Linux one *is* a device resource), `TRANSFER_TO_HOST` on one is `EINVAL` where Linux completes it, and a transfer whose rectangle does not fit the backing the device was given is refused where Linux would read past it. The first two have a single fix, recorded in `PLAN.md` §7.4: make `CREATE_DUMB` create a device resource too, as Linux's does. A framebuffer belongs to the open file description that made it and is released with it (Linux's `drm_file_free` → `drm_fb_release`), so `GETRESOURCES`'s `count_fbs` is a list of live framebuffers rather than a list of ids a dead session left behind. The cursor plane publishes `SRC_X`/`SRC_Y`/`SRC_W`/`SRC_H` and `CRTC_W`/`CRTC_H` beside `type`/`FB_ID`/`CRTC_ID`/`CRTC_X`/`CRTC_Y`/`IN_FORMATS`, because a compositor adds them to every plane's atomic state and one the plane does not have reaches the card as property 0 and refuses the whole commit; this cursor cannot scale or crop, so the identity rectangle is the only one a commit may name and any other is `EINVAL`. Other §7.4 gaps: timeline syncobj behaviour, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` |
+| `'d'` (0x64) | `/dev/dri/card0`, `renderD128` | `src/drivers/drm.rs`, `crates/gpu/src/virtgpu.rs`, `crates/gpu/src/*.rs` | Served across the compositor surface, and **the `DRM_VIRTGPU_*` family with it, 2D and 3D both**: all eleven requests are dispatched, and each answers per card shape, as Linux's does (measured; instrument in `user/staging/virtgpu-probe/`, and the GL card's own answers in `NOTES.md` §7.4). On a card with no 3D — `GETPARAM` (`3D_FEATURES` 0, `CAPSET_QUERY_FIX` 1, unknown parameter `EINVAL`, the write four bytes wide as Linux's is), `RESOURCE_CREATE` (a real device resource, made across the mailbox to the render task), and `RESOURCE_INFO`/`MAP`/`WAIT`/`TRANSFER_TO_HOST` for the handle it returns; `GET_CAPS`/`EXECBUFFER`/`TRANSFER_FROM_HOST` `ENOSYS`, `CONTEXT_INIT`/`RESOURCE_CREATE_BLOB`/a 3D `RESOURCE_CREATE` `EINVAL`. On a GL card the same requests answer as Linux's GL card does: `VIRGL` and `CONTEXT_INIT` are negotiated (`3D_FEATURES` 1, `SUPPORTED_CAPSET_IDs` 6), `CONTEXT_INIT` is `EEXIST` because the context is created implicitly on the first resource, a 3D `RESOURCE_CREATE`, `EXECBUFFER` and `TRANSFER_FROM_HOST` complete, and the two advertised cap sets are fetched and cached. `RESOURCE_CREATE_BLOB` stays `EINVAL` on both shapes, which is Linux's answer on both too. **Three named divergences**: `RESOURCE_INFO`'s `res_handle` is 0 for a plain dumb buffer (on Linux one *is* a device resource), `TRANSFER_TO_HOST` on one is `EINVAL` where Linux completes it, and a transfer whose rectangle does not fit the backing the device was given is refused where Linux would read past it. The first two have a single fix, recorded in `NOTES.md` §7.4: make `CREATE_DUMB` create a device resource too, as Linux's does. A framebuffer belongs to the open file description that made it and is released with it (Linux's `drm_file_free` → `drm_fb_release`), so `GETRESOURCES`'s `count_fbs` is a list of live framebuffers rather than a list of ids a dead session left behind. The cursor plane publishes `SRC_X`/`SRC_Y`/`SRC_W`/`SRC_H` and `CRTC_W`/`CRTC_H` beside `type`/`FB_ID`/`CRTC_ID`/`CRTC_X`/`CRTC_Y`/`IN_FORMATS`, because a compositor adds them to every plane's atomic state and one the plane does not have reaches the card as property 0 and refuses the whole commit; this cursor cannot scale or crop, so the identity rectangle is the only one a commit may name and any other is `EINVAL`. Other §7.4 gaps: timeline syncobj behaviour, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` |
 | `'P'` (0x50) | `/dev/dsp` | `src/drivers/virtio/sound.rs` | Served; the family's rate/channels/format belong to the writer |
 | `'p'` (0x70) + `0x8024_7009`/`0x4024_700A` | `/dev/rtc0`, `/dev/rtc` | `src/drivers/rtc_dev.rs` | Served on **both** machines (`RTC_RD_TIME`/`RTC_SET_TIME`); alarm/interrupt requests `ENOTTY`, and so is the family aimed at any other descriptor. The readiness asked for is `'p'`, which is what the shipped `linux/rtc.h` spells all twenty-four of its commands with (measured: no `'t'` spelling exists in that header tree) and what Alpine's `hwclock` sends; the arm also tolerates a `'t'` magic never seen, and a request matching only by it reaches the same `ENOTTY` tail (§5.1) |
 | `0x12` (block) | `/dev/vda`, `/dev/sda` | `src/blk/`, `src/syscall/linux/fs.rs` | Served; the size trio's buffer direction was the sole outlier and is fixed (§5.1) |
@@ -160,7 +160,7 @@ a device does not implement.
 
 ## 3. Flag words and closed vocabularies
 
-`PLAN.md` §12.1 records a swept pass over these, one landing per vocabulary. A flag the
+`NOTES.md` §12.1 records a swept pass over these, one landing per vocabulary. A flag the
 kernel accepts and drops is a promise not kept, and a *number* it accepts and ignores is the
 same failure in a different type.
 
@@ -225,7 +225,7 @@ the commit bodies), and each moved its pin in the same commit.
    in this image sends exactly one ioctl, the `RNDADDENTROPY` credit, and takes its seed
    length from `/proc/sys/kernel/random/poolsize`. Owner: `src/syscall/linux/fs.rs`.
    Pin: `t-ioctl` (the `EINVAL` line is the counterfactual against the old 512).
-   Closes `PLAN.md` §12.1 A8 correction (ii).
+   Closes `NOTES.md` §12.1 A8 correction (ii).
 
 2. **`RNDRESEEDCRNG` re-keys the generator for real and answers `0` for root.**
    This generator was seeded once and never re-keyed, so the arm answered `EOPNOTSUPP`;
@@ -233,7 +233,7 @@ the commit bodies), and each moved its pin in the same commit.
    `rand.rs` gains a reseed that re-rolls the ChaCha key from fresh seed material mixed
    with the current stream, so it is never a fixed point. Owner: `src/rand.rs` +
    `src/syscall/linux/fs.rs`. Pin: a host test on the key change, `t-ioctl` (root `0`,
-   unprivileged `EPERM`). Closes `PLAN.md` §12.1 A8 correction (i).
+   unprivileged `EPERM`). Closes `NOTES.md` §12.1 A8 correction (i).
    `RNDZAPENTCNT`/`RNDCLEARPOOL` stay `EOPNOTSUPP` for root: there is still no drainable
    count, and answering `0` would be the fake that `RNDGETENTCNT` contradicts.
 
@@ -246,7 +246,7 @@ the commit bodies), and each moved its pin in the same commit.
    image boots with no block node, and the host `user_accessible` stub answers accessible
    in both directions — so this is the one landed item that is verified by the change
    alone; the `t-ioctl` `PROT_READ`-buffer pin lands when a block node enters the test
-   image (`PLAN.md` §12.1 A9).
+   image (`NOTES.md` §12.1 A9).
 
 4. **A per-process credential model, and the four `prctl` options it makes honest.**
    `src/cred.rs` holds the four capability sets, the dumpable tri-state and `KEEPCAPS`;
@@ -270,20 +270,20 @@ the commit bodies), and each moved its pin in the same commit.
    is not cosmetic: a lock-and-verify caller (lock the file, confirm the name still
    names the inode you locked, retry if not — what `wayland-backend` does on
    `wayland-N.lock`) compares exactly these two answers, so a disagreement is a retry
-   that never converges. It is what `niri` was spinning on (`PLAN.md` §7.4). Owner:
+   that never converges. It is what `niri` was spinning on (`NOTES.md` §7.4). Owner:
    `src/vfs/file.rs` + `src/syscall/linux/fs.rs`. Pin: `t-stat-consistency`, which
    checks both doors on `/tmp` and on `/run/user/0`, in the order the protocol uses.
 
 4. **`lsattr`'s `Not a tty` was an unimplemented ioctl family, and the file it
    reads did something worse than not exist.** The four commands measured in
-   `PLAN.md` §12.4b turned out to be busybox applets, three of them asking for a
+   `NOTES.md` §12.4b turned out to be busybox applets, three of them asking for a
    file or directory this kernel did not have (`/proc/modules`,
    `/proc/self/mountinfo`, `/sys/bus/usb/devices`, `/sys/block`) and one asking
    for a word the `'f'` family never answered. Owners:
    `src/vfs/procfs.rs`, `src/vfs/sysfs.rs`, `src/syscall/linux/fs.rs`,
    `src/vfs/ext4/`, `src/vfs/ramfs.rs`. Pins: `t-mountinfo` and `t-fsflags` on
    the machine, plus host tests for the renderings and the refusals. Closes
-   `PLAN.md` §12.4b.
+   `NOTES.md` §12.4b.
 
 5. **`/proc/self/mountinfo`'s third field is now the same number `stat` reports,
    and it had to be.** The column `lsblk` fills by matching it against
@@ -319,7 +319,7 @@ the commit bodies), and each moved its pin in the same commit.
    (the anchor read back as `CLOCK_REALTIME - CLOCK_MONOTONIC`, every `struct tm` field
    ranged, the timestamp's length measured through `asctime`'s own format, then the real
    `asctime_r` call) — the first test either suite has had for the calendar. Closes
-   `PLAN.md` §13.14.
+   `NOTES.md` §13.14.
 
 8. **`/dev/rtc0` is a device of the machine's clock, not of x86's CMOS - so it exists
    outside x86_64 too, and the clock behind it writes.** The node, its two names and the
@@ -336,7 +336,7 @@ the commit bodies), and each moved its pin in the same commit.
    `arch/src/arch/aarch64/pl031.rs`, `src/syscall/linux/fs/ioctl.rs`. Pin: `t-rtc` on **both**
    machines (`RTC_RD_TIME` agreeing with `clock_gettime` and with `gmtime_r` field for
    field, `RTC_SET_TIME` served, `EINVAL` for a month no calendar carries, `ENOTTY` for
-   the alarm half and for the family on another descriptor). Closes `PLAN.md` §13.15.
+   the alarm half and for the family on another descriptor). Closes `NOTES.md` §13.15.
 
 9. **A virtual console is a terminal on the second machine too.** `/dev/tty1`..`/dev/tty6` have
    always been minted on both machines - they are the slave ends of the pty pairs the devfs
@@ -355,7 +355,7 @@ the commit bodies), and each moved its pin in the same commit.
    `/dev/tty1` with the mode put back, the `VT_*` family over `/dev/tty0` where a serial tty is
    `ENOTTY`, the switch driven by `VT_ACTIVATE`/`VT_WAITACTIVE` and seen on the wire, and the
    refusals Linux gives). One divergence the pin names rather than asserts: `VT_GETSTATE`'s
-   layout is not Linux's (`PLAN.md` §13.18). Closes `PLAN.md` §13.16.
+   layout is not Linux's (`NOTES.md` §13.18). Closes `NOTES.md` §13.16.
 
 10. **`RLIMIT_NOFILE` is 7, not 5 — the resource table was indexed by this kernel's own
     numbering.** `getrlimit`/`setrlimit`/`prlimit64` speak `asm-generic/resource.h`'s numbers:
@@ -412,7 +412,7 @@ the commit bodies), and each moved its pin in the same commit.
   difference is reachable through `openat`, `unlinkat`, `linkat` and the rest. Owner:
   `src/syscall/linux/fs/file.rs`'s `base_of` and its twenty call sites. `t-newfstatat`'s
   bad-dirfd claim therefore names its path *relatively*, which is `EBADF` on both machines,
-  and does not pin this either way (S6 batch 12). `PLAN.md` §15.17.
+  and does not pin this either way (S6 batch 12). `NOTES.md` §15.17.
 - **`F_GETFL` reports no access mode.** Linux ORs the descriptor's access mode into the word
   `fcntl(F_GETFL)` returns, so a descriptor opened `O_WRONLY` reports `1` (measured on a
   current host); this kernel reports the description's stored status word, whose access bits
@@ -424,7 +424,7 @@ the commit bodies), and each moved its pin in the same commit.
   access bits into the reported word, which has its own blast radius: `rustix::fs::Dir`
   reuses an `F_GETFL` word for the `openat(fd, ".")` it opens a directory's descriptor with.
   Owner: `src/syscall/linux/fs/file.rs`'s `F_GETFL` arm + the `access` field already there.
-  `PLAN.md` §15.16.
+  `NOTES.md` §15.16.
 - **A `flock` dies on *any* close of its description, not the last.** Linux releases the
   description's `flock` when the last descriptor referring to it closes, so closing one of
   several `dup`s leaves the lock in force — measured on a current host: `flock(a, LOCK_EX)`,
@@ -435,7 +435,7 @@ the commit bodies), and each moved its pin in the same commit.
   process can take it. `src/vfs/locks.rs`'s own `release_on_close` record already states the
   Linux rule, so the code and its documentation disagree. Owner: `src/syscall/linux/fs/file.rs`'s
   close path (which already tests `Arc::strong_count` after the close for the evdev half) and
-  `src/vfs/locks.rs`. `PLAN.md` §15.16.
+  `src/vfs/locks.rs`. `NOTES.md` §15.16.
 - **`waitid(2)` ignores its `id`, serves two of Linux's four idtypes, and calls
   "no event asked for" a success.** Three divergences, each measured on a
   current host. (a) The `id` argument is not used: `P_PID` does not name the
@@ -452,7 +452,7 @@ the commit bodies), and each moved its pin in the same commit.
   than a wrong number. Owner: `src/syscall/linux/proc.rs`'s `handle_waitid` (the
   `_id` binding, the `idtype` check, and the `options & WEXITED == 0` arm).
   `t-waitid` pins this kernel's answers on **both** machines and names each
-  host answer beside it under `MPOS_ON_HOST`. `PLAN.md` §15.11 (batch 18).
+  host answer beside it under `MPOS_ON_HOST`. `NOTES.md` §15.11 (batch 18).
 
 - **`rt_sigaction` refuses a bare *query* of `SIGKILL`/`SIGSTOP`.** Linux's rule
   is `act && sig_kernel_only(sig)` — a disposition cannot be *set* for either,
@@ -466,7 +466,7 @@ the commit bodies), and each moved its pin in the same commit.
   fallback it did not need. Owner: `src/syscall/linux/mod.rs`'s `sigaction`,
   where the `catchable` check would split into "is this a signal" (unconditional)
   and "may it be given a disposition" (only when `act != 0`). `t-rt-sigaction`
-  pins this kernel's answer on **both** machines. `PLAN.md` §15.11 (batch 20).
+  pins this kernel's answer on **both** machines. `NOTES.md` §15.11 (batch 20).
 
 - **`signalfd(2)` and `SIGCHLD`: one death, two records, and the wrong code.**
   Three divergences, each measured on a current host, all of them on the path the
@@ -489,8 +489,38 @@ the commit bodies), and each moved its pin in the same commit.
   `src/vfs/signalfd.rs`'s `take_signal` (which source wins). `t-signalfd` blocks
   `SIGCHLD` the way its own contract says, claims the *count* of records with
   this kernel's answer on the payload and Linux's under `MPOS_ON_HOST`, and pins
-  the exit record's `CLD_EXITED` and pid on **both** machines. `PLAN.md` §15.11
+  the exit record's `CLD_EXITED` and pid on **both** machines. `NOTES.md` §15.11
   (batch 21).
+
+- **A terminal's foreground group, and a pty's number: two conventions this kernel
+  answers its own way.** (a) *Whose signals a terminal carries.* Linux keeps a
+  terminal's foreground group strictly as session state: it is set when a session
+  leader makes the tty its controlling terminal (`__proc_set_tty`) or by
+  `TIOCSPGRP` from that session, and a terminal no session holds has none -
+  measured on a current host, `TIOCSWINSZ` on a fresh pair's master runs no
+  handler at all (five setups probed: nothing claimed, `tcsetpgrp` without a
+  session, a read first, and a session leader with the slave as its ctty - only
+  the last two deliver, and the third only on this kernel), `TIOCGPGRP` on its
+  slave answers `-1`/`ENOTTY` (errno 25) and `tcsetpgrp(slave, getpgrp())` is
+  refused with the same number. This kernel answers "the reader": `Tty::read`
+  records the reading task's group as the terminal's foreground
+  (`src/vfs/tty.rs`, "the same answer for a program that never asks"), and
+  `TIOCGPGRP` reports zero rather than refusing when nobody owns the terminal
+  (`src/syscall/linux/fs/ioctl.rs`'s `0x540F`/`0x5410` arm). A program that reads
+  a tty it never claimed therefore *receives* the typed `SIGINT` and the resize
+  `SIGWINCH` here, where Linux would aim at nobody, and a supervisor asking
+  `tcgetpgrp` on a pair no session holds reads `0` here and an error there.
+  Owner: `src/vfs/tty.rs`'s `read`/`foreground` and `src/sched/runtime.rs`'s ctty
+  bookkeeping. `t-pty` pins the *delivery* on **both** machines by giving the pair
+  a session the ABI's way - a getty's `setsid` + open + `TIOCSCTTY` - and names
+  this rule in its comment instead of pinning it. (b) *The number `TIOCGPTN`
+  mints.* This kernel numbers its pairs past the six virtual consoles
+  (`src/vfs/pty.rs`'s counter starts at `VC_COUNT + 1`); Linux's `devpts` numbers
+  from 0 - measured on a current host, which answered 5. Both name a real slave,
+  so no caller is misled, but a program that hard-codes a first number does not
+  meet it here. `t-pty` pins this kernel's answer on the payload and accepts the
+  host's under `MPOS_ON_HOST`, printing what the host said. `NOTES.md` §15.11
+  (batch 22).
 
 - **`FIONREAD` on a regular file and on a pipe.** Linux answers `0` and the bytes
   remaining/queued; this kernel answers `ENOTTY` for everything that is not the entropy
@@ -505,7 +535,7 @@ the commit bodies), and each moved its pin in the same commit.
   two siblings are unwritten. Owner: `src/vfs/procfs.rs`.
 - **`devfs` birth modes.** Devices are born `0666 root:root`; `devtmpfs` births `0600`
   and lets udev widen it. Needs per-class birth modes and group-name resolution, not a new
-  mechanism (`PLAN.md` §3.4).
+  mechanism (`NOTES.md` §3.4).
 - **The console tty is published under the machine's own serial name.** `/dev/ttyS0` on
   x86_64, `/dev/ttyAMA0` on aarch64 - one node (the console tty, where the kernel log goes
   and which the kernel's standard descriptors are) under the name the psABI gives that
@@ -531,7 +561,7 @@ the commit bodies), and each moved its pin in the same commit.
 - **The `DRM_VIRTGPU_*` family (`0x41..=0x4b`) is served, 2D and 3D both.** All eleven
   requests are dispatched, and each answers per card shape, as Linux's does
   (`user/staging/virtgpu-probe/` is the no-3D measurement; the GL card's own answers -
-  `virgl=1 context_init=1 capsets=2 cached=2 mask=0x6` - are in `PLAN.md` §7.4), with
+  `virgl=1 context_init=1 capsets=2 cached=2 mask=0x6` - are in `NOTES.md` §7.4), with
   three named divergences in the `'d'` row above. The **mailbox** (`render::job` - an
   ioctl describes a device command and parks, because the control queue belongs to the
   render task) and a **device resource** behind a GEM handle (`Dumb.resource` in
@@ -546,7 +576,7 @@ the commit bodies), and each moved its pin in the same commit.
   because the DRM device's parent chain carries no bus identity, so `drmGetDevices2`
   finds no card and every EGL platform falls back to `llvmpipe` - measured, with the
   sysfs attributes and the two interpositions that ruled other explanations out, in
-  `PLAN.md` §7.4. **And one fix the 2D half already owes**: `CREATE_DUMB` should create a
+  `NOTES.md` §7.4. **And one fix the 2D half already owes**: `CREATE_DUMB` should create a
   device resource as Linux's does, which would remove two of the three divergences above.
   It is not done because it would make every dumb buffer eagerly backed and add a device
   round trip to the path the console, weston and `/dev/fb0` all allocate through.
@@ -555,21 +585,21 @@ the commit bodies), and each moved its pin in the same commit.
 
 - **Real-time signals `33..=64`.** `SIGRTMIN` (32) is queueable, maskable and waitable; the
   rest have no queueable number and no disposition storage. Prerequisite: a 64-bit
-  disposition table and a queued-signal list per task (`PLAN.md` §2.3).
+  disposition table and a queued-signal list per task (`NOTES.md` §2.3).
 - **`rseq`** (§1.1) — a per-thread registration maintained across preemption.
 - **`PTRACE_EVENT_SECCOMP`** — carrying a `siginfo_t` through a stop/resume, which the
-  stop model does not have (`PLAN.md` §8.2).
+  stop model does not have (`NOTES.md` §8.2).
 - **Real `MSG_PEEK` over TCP/UDP.** Refused `EOPNOTSUPP` today (honest); serving it needs
-  peek-preserving delivery in the stack (`PLAN.md` §12.2 B2).
+  peek-preserving delivery in the stack (`NOTES.md` §12.2 B2).
 - **`SO_LINGER{on, 0}` and per-socket buffer sizes.** Both are record-only; the first needs
   an unsolicited reset on egress, the second needs buffers not sized once at set
-  construction (`PLAN.md` §4.3.3/§4.3.4).
+  construction (`NOTES.md` §4.3.3/§4.3.4).
 - **`AF_PACKET` `SOCK_RAW`** (frames with their header) — `EOPNOTSUPP`; needs the header
-  passed through untouched (`PLAN.md` §4.5).
+  passed through untouched (`NOTES.md` §4.5).
 - **A named `SOCK_SEQPACKET` `AF_UNIX` connection** carries no message boundaries — served
-  as the byte stream this family has (`PLAN.md` §4.1).
+  as the byte stream this family has (`NOTES.md` §4.1).
 - **Console gaps:** `console=ttyN` pinning is refused rather than approximated, and
-  `/dev/console` has no preferred-console plumbing (`PLAN.md` §7.1c).
+  `/dev/console` has no preferred-console plumbing (`NOTES.md` §7.1c).
 - **The `console` serial transmit wait** is fatal-signal-only, like `wait4` (§1.2).
 
 ### 5.4 The structural work, parked with Phase 11
@@ -579,10 +609,10 @@ grows, and each is named so it is not rediscovered as a shape.
 
 - **B2 — each device's `ioctl` contract moves down to its driver.** The `syscall/linux/fs.rs`
   switchboard is the V-2 edge the architecture audit flags, and the `'K'`/`'E'` families
-  that are refused "until B2" are refused *because* of it (`PLAN.md` §11.2, §12.1 A2/A3).
+  that are refused "until B2" are refused *because* of it (`NOTES.md` §11.2, §12.1 A2/A3).
 - **The `net` module's `target_os = "none"` gate** means `AF_PACKET`'s parsers and the
   `sockaddr_ll` decode have no host test and no fuzz target. Closing it moves the
-  wire-format halves to an ungated pure module (`PLAN.md` §4.5, `ARCHITECTURE.md` V-9/V-11).
+  wire-format halves to an ungated pure module (`NOTES.md` §4.5, `ARCHITECTURE.md` V-9/V-11).
 
 ---
 
@@ -600,5 +630,5 @@ grows, and each is named so it is not rediscovered as a shape.
   rule is that a test which cannot work is deleted or made to work, never `#[ignore]`d
   (`AGENTS.md` §3).
 
-The gate's latest measured state is quoted from its own summary line in `PLAN.md` §12.4a;
+The gate's latest measured state is quoted from its own summary line in `NOTES.md` §12.4a;
 this file deliberately carries no counts of its own.

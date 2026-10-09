@@ -12,7 +12,7 @@
 //! `KIND_*` constants and `HANDOFF_MAGIC` are re-exported from here, so every
 //! `crate::boot::handoff::` caller is unchanged. They moved because the machine
 //! layer names `Handoff` too: the aarch64 entry is handed one, and a machine
-//! crate cannot depend on the kernel (`PLAN.md` §14 S2a). What stays here is
+//! crate cannot depend on the kernel (`NOTES.md` §14 S2a). What stays here is
 //! [`collect`], the translation, which is the kernel's: it is the code that
 //! decides what a region *means*.
 //!
@@ -111,7 +111,7 @@ pub unsafe fn collect(at: *const Handoff) -> BootInfo {
     // left implicit in two other files: `mpos-boot` allocates the stack as UEFI
     // `LOADER_DATA`, and `MemKind::is_allocatable` admits only `Usable` -
     // `BootloaderReclaimable` is excluded *because* it holds the stack the kernel
-    // is running on. Measured on the second machine (PLAN.md §13.17): the boot
+    // is running on. Measured on the second machine (NOTES.md §13.17): the boot
     // stack at `0x44f07000` lies in a region of kind `BootloaderReclaimable`
     // whose `is_allocatable()` is false, and `mm::pframe` builds its five zones
     // from the record's five `Usable` regions.
@@ -351,7 +351,7 @@ mod tests {
     /// `BootloaderReclaimable` region, which the kernel will not allocate from -
     /// so the record is read and the stack stays where it is. This is the half of
     /// the pair below that says *why* the check is not vacuous rather than merely
-    /// that it exists (`PLAN.md` §13.17).
+    /// that it exists (`NOTES.md` §13.17).
     #[test]
     fn a_record_that_keeps_its_boot_stack_unallocatable_is_read() {
         let mut raw = Handoff {

@@ -15,7 +15,7 @@
 //! firmware, the disk. Those live in `disk.rs` and `qemu.rs`, both of which
 //! take an [`Arch`] and answer per-machine from it - which is the whole point
 //! of this module: the two machines' boot paths are *one* body parameterised by
-//! this type, not two bodies (`PLAN.md` §15.18).
+//! this type, not two bodies (`NOTES.md` §15.18).
 
 use anyhow::Result;
 
@@ -48,7 +48,7 @@ impl Arch {
             other => anyhow::bail!(
                 "--arch {other}: this front end builds and boots x86_64 and aarch64 only, \
                  and a verdict for a machine nothing booted is the one failure it must not \
-                 have (PLAN.md §13.5)"
+                 have (NOTES.md §13.5)"
             ),
         }
     }
@@ -175,7 +175,7 @@ impl Arch {
     /// partition, which is what makes that file part of the image.
     ///
     /// The second machine's `check_fs` mounts the root's filesystem at boot and
-    /// reads `/hello` back through the block driver (`PLAN.md` §9.1, the
+    /// reads `/hello` back through the block driver (`NOTES.md` §9.1, the
     /// `M7_FS_OK` check - it runs on every boot, not only under `mpos.selftest`,
     /// and it halts the machine when the file is not there), so the file has to
     /// be in the image that machine boots. The first machine's filesystem check

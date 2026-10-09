@@ -30,7 +30,7 @@
 //! `*-unknown-none`. So `crate::hal` and `crate::arch` are gated on
 //! `target_os = "none"` and this module is gated on `target_os = "uefi"`: a
 //! loader build compiles the machine code it needs and none of the kernel's.
-//! When the kernel becomes a UEFI stub of its own (`PLAN.md` §14.6, item 5) the
+//! When the kernel becomes a UEFI stub of its own (`NOTES.md` §14.6, item 5) the
 //! kernel gate widens to `any(…)` and this sentence changes with it - which is
 //! the one place in this crate where that is true.
 //!

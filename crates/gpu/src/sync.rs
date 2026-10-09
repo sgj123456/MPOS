@@ -6,7 +6,7 @@
 //! and booting is the right instrument for it. The sync objects are not that: a
 //! request's *answer* here is a decision about three fields, and the decisions
 //! are exactly where the authorities disagree. The upstream sources treat a sync
-//! object with no fence as already signaled; the real card refuses it. `PLAN.md`
+//! object with no fence as already signaled; the real card refuses it. `NOTES.md`
 //! §7.4 records which of the two was measured, and the rules encoded below are
 //! that measurement, line for line.
 //!

@@ -38,7 +38,7 @@
 //! duplicating.
 //!
 //! The file is one this test writes itself under `/tmp`, not the no-std version's
-//! `/etc/motd` (which the second machine's payload does not carry, `PLAN.md`
+//! `/etc/motd` (which the second machine's payload does not carry, `NOTES.md`
 //! §15.11): the claim is about what `dup3` does to a descriptor, not about which
 //! file that descriptor happens to name.
 

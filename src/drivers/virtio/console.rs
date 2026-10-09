@@ -116,7 +116,22 @@ pub fn install(port: Arc<dyn ConsolePort>) -> Arc<dyn ConsolePort> {
     critical_section::with(|cs| {
         *GLOBAL.borrow(cs).borrow_mut() = Some(port.clone());
     });
+    crate::drivers::devices::publish("virtio-console", publish_nodes);
     port
+}
+
+/// Publish `/dev/hvc0` and its alias for a device set built after this driver
+/// came up - registered by [`install`], not named by `devices::standard_devfs`.
+///
+/// The name of a hypervisor console is `hvc0`; `hvc` is the alias Linux keeps
+/// for "the first one" - a getty that asks for either spelling finds the same
+/// port.
+fn publish_nodes(dev: &crate::vfs::devfs::DevFs) {
+    if let Some(hvc) = global() {
+        let device = Arc::new(HvcDev::new(hvc));
+        dev.register("hvc0", device.clone());
+        dev.register("hvc", device);
+    }
 }
 
 /// The port, if the machine has one.

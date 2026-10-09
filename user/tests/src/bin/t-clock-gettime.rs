@@ -26,7 +26,7 @@
 //!
 //! "Two reads never go backwards" can fail on this kernel: CLOCK_REALTIME is
 //! the CMOS second plus a tick-derived fraction sampled around it, so two
-//! successive reads can step back (`PLAN.md` §13.27, AGENTS.md §5's named
+//! successive reads can step back (`NOTES.md` §13.27, AGENTS.md §5's named
 //! flake). It is a property of the wall clock, not of the dispatch this
 //! migration touches, and the sweep re-runs before believing it.
 //!

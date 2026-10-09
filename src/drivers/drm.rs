@@ -129,7 +129,7 @@ const PROP_IN_FORMATS: u32 = 94;
 /// commit writes back a fence descriptor for the frame it just committed.
 ///
 /// It is the other half of `IN_FENCE_FD`, and the half this card was missing
-/// entirely - the list in `PLAN.md` §7.4 has it absent, because amdgpu does not
+/// entirely - the list in `NOTES.md` §7.4 has it absent, because amdgpu does not
 /// publish one either. The measured shape on a card that does is a range whose
 /// two ends are 0 and the whole 64-bit span, since the value is an address and
 /// not a number with a meaning of its own.
@@ -201,7 +201,7 @@ const NR_PAGE_FLIP: u32 = 0xb0;
 /// The four requests §7.4's list names that this card answers by *refusing*
 /// rather than by falling off the end of the dispatch `match`, plus `GETFB2`.
 /// Naming them is the difference between "not implemented" and "deliberately
-/// not this card's": a caller is owed the second, and `PLAN.md` §7.4 owes the
+/// not this card's": a caller is owed the second, and `NOTES.md` §7.4 owes the
 /// reason beside it. See `gamma_refused` and `sequence_refused`.
 const NR_MODE_GETGAMMA: u32 = 0xa4;
 const NR_MODE_SETGAMMA: u32 = 0xa5;
@@ -1962,7 +1962,7 @@ fn virtgpu_wait(arg: usize) -> isize {
 /// A handle with no device resource - a plain dumb buffer - is also `EINVAL`.
 /// Linux completes that request; here there is no device-side resource to copy
 /// into, and the honest answer is that this command does not apply to that
-/// handle. It is named in `PLAN.md` §7.4 with the divergence above rather than
+/// handle. It is named in `NOTES.md` §7.4 with the divergence above rather than
 /// answered `0`, because a transfer that did nothing while reporting success is
 /// the false success this repository forbids.
 ///
@@ -2063,7 +2063,7 @@ fn virtgpu_transfer_to_host(arg: usize, ofd: u64) -> isize {
     // them and into whatever the allocator put next. Linux makes no such check
     // and would over-read; this refuses the request instead. It is a divergence
     // that can only turn a broken caller's garbage into an error, which is the
-    // direction `PLAN.md` §4's worst-case rule asks for.
+    // direction `NOTES.md` §4's worst-case rule asks for.
     if width as u64 * height as u64 * 4 > size {
         return libc_einval();
     }
@@ -5120,7 +5120,7 @@ fn get_fb2(arg: usize) -> isize {
 /// table never gets to. The *number* is from Linux's `drivers/gpu/drm/drm_crtc.c`
 /// rather than from a measurement on this machine, because no card here has a
 /// CRTC without a gamma table to measure: the amdgpu CRTC next door reports
-/// `GAMMA_LUT_SIZE` 4096. It is recorded as such in `PLAN.md` §7.4.
+/// `GAMMA_LUT_SIZE` 4096. It is recorded as such in `NOTES.md` §7.4.
 ///
 /// A refusal rather than an accepted no-op, because `OK` from `MODE_SETGAMMA`
 /// is a compositor believing it applied a colour transformation no pixel will
@@ -5382,7 +5382,7 @@ const MAX_SYNCOBJS: usize = 256;
 const MAX_SYNC_WAIT: usize = 4096;
 
 /// The sync objects' state machine, in the one place a host test can reach it.
-/// What it means is documented there and measured in `PLAN.md` §7.4.
+/// What it means is documented there and measured in `NOTES.md` §7.4.
 ///
 /// The descriptor `SYNCOBJ_HANDLE_TO_FD` with `flags == 0` answers: an anonymous
 /// file that *is* the sync object, so a second description that takes it in
@@ -5661,7 +5661,7 @@ fn fire_sync_events(rec: &mut SyncObjRec) {
 /// `DRM_SYNCOBJ_CREATE_SIGNALED` is the difference between an object every
 /// request about a fence will refuse and one with a fence already behind it -
 /// measured, and the opposite reading from the upstream sources, which treat
-/// *both* as signaled. `PLAN.md` §7.4 has the measurement.
+/// *both* as signaled. `NOTES.md` §7.4 has the measurement.
 fn syncobj_create(owner: u64, arg: usize) -> isize {
     // struct drm_syncobj_create: handle@0, flags@4.
     let flags = unsafe { ((arg + 4) as *const u32).read_unaligned() };

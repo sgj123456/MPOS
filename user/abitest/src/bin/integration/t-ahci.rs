@@ -7,7 +7,7 @@
 //! a PRDT the controller reads by physical address, and a task file that reports
 //! failure *after* the command has retired. Every line of it is a volatile
 //! access to hardware, so no host test can reach any of it - this program is the
-//! pin, which is what `PLAN.md` §7.3 says it would be.
+//! pin, which is what `NOTES.md` §7.3 says it would be.
 //!
 //! What it checks is the part a wrong driver cannot fake. A driver with a wrong
 //! command FIS reads the wrong sector; one with a wrong PRDT moves the wrong

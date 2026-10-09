@@ -343,7 +343,7 @@ pub struct Device {
     /// reason it is a field rather than an inference: `sysfs` hangs the card's
     /// nodes off the function that carries the card, and the machine can put a
     /// second display-class function - the firmware's own VGA - beside it.
-    /// Choosing by class code alone hung the card off the VGA (`PLAN.md` §7.4).
+    /// Choosing by class code alone hung the card off the VGA (`NOTES.md` §7.4).
     /// The driver names its function instead; `sysfs` reads this and stops
     /// guessing.
     pub drm_card: bool,
@@ -595,7 +595,7 @@ pub fn claim(bus: u8, dev: u8, func: u8, driver: &'static str) {
 /// Declare that the function at `(bus, dev, func)` is the home of the DRM/KMS
 /// card, so the tree builder hangs the card's `card0`/`renderD128` nodes off it.
 ///
-/// The honest half of `PLAN.md` §7.4, and the reason it lives here rather than
+/// The honest half of `NOTES.md` §7.4, and the reason it lives here rather than
 /// as an inference in `sysfs`: a card belongs to the function whose driver made
 /// it, which is a fact only that driver owns. It reaches the tree builder
 /// through this [`Device`] record - the driver writes `pci`, `vfs::sysfs` reads

@@ -119,7 +119,15 @@ const SCM_CREDENTIALS: i32 = 2;
 /// kernel's two signals about a delivery that did not fit - `MSG_CTRUNC` for
 /// control data dropped for want of room, `MSG_TRUNC` for a datagram cut short
 /// of the caller's buffer.
-const MSG_CMSG_CLOEXEC: usize = 0x10000;
+///
+/// The value is `linux/socket.h`'s: `MSG_CMSG_CLOEXEC` is `0x40000000`. It used
+/// to be `0x10000` here, which on Linux is `MSG_WAITFORONE` - the bit
+/// `recvmmsg` reads for something else entirely, and the bit this file's own
+/// `recvmmsg` already honours (below). A test that spelled the flag out of
+/// *this* table rather than out of `linux/socket.h` passed either way, which is
+/// how two meanings sat on one bit unnoticed; the std-side `t-unix-scm` spells
+/// it from `libc` and caught it.
+const MSG_CMSG_CLOEXEC: usize = 0x40000000;
 const MSG_CTRUNC: i32 = 0x8;
 const MSG_TRUNC: i32 = 0x20;
 /// One `cmsghdr` on x86_64: a `size_t` length then two `int`s, padded to a
@@ -206,9 +214,9 @@ fn uevent_handle_of_fd(fd: i32) -> Option<usize> {
 }
 
 /// `recv(2)`'s "do not sleep" flag, as `linux/socket.h` spells it:
-/// `MSG_DONTWAIT` is `0x40`. (`0x4000` is `MSG_CMSG_CLOEXEC`/`MSG_NOSIGNAL`'s
-/// bit - a test that sends that and waits for `EAGAIN` hangs, which is how
-/// this got double-checked.)
+/// `MSG_DONTWAIT` is `0x40`. (`0x4000` is `MSG_NOSIGNAL`'s bit - a test that
+/// sends that and waits for `EAGAIN` hangs, which is how this got
+/// double-checked.)
 const MSG_DONTWAIT: usize = 0x40;
 /// `recv(2)`'s "look without taking" flag.
 const MSG_PEEK: usize = 0x02;
@@ -994,7 +1002,7 @@ pub(crate) fn close_last_socket(file: &Arc<crate::vfs::File>) {
 /// fds. A socket goes only when the batch holds *all* of its references.
 ///
 /// Registered with `sched::exit` by the boot sequence rather than called by name
-/// from the teardown, so the scheduler stops naming this module (`PLAN.md`
+/// from the teardown, so the scheduler stops naming this module (`NOTES.md`
 /// §11.1.3). The exiting thread group is ignored: a socket belongs to the
 /// descriptor table it is in, not to an identity.
 pub fn close_sockets_at_exit(files: &[Arc<crate::vfs::File>], _owner: u32) {
@@ -4230,7 +4238,7 @@ fn first_iovec(iov: usize, iovlen: usize, from_user: bool) -> Option<(usize, usi
 // No `#[cfg(test)]` module here, unlike the files beside it: this one is only
 // ever compiled for the machine (`src/lib.rs` gates `net` on `target_os =
 // "none"`), so a test written in it would never run - which is exactly what the
-// three that used to end this file did (PLAN.md §11.1.10, ARCHITECTURE.md §9
+// three that used to end this file did (NOTES.md §11.1.10, ARCHITECTURE.md §9
 // V-11). What they pinned - `send`/`recv` and the `sendmsg`/`recvmsg` shapes on
 // a `socketpair`, and its refusals (`EISCONN`, `MSG_DONTWAIT`/`EAGAIN`) - is
 // pinned by `user/tests/src/bin/t-sockmsg.rs`, which boots. `xtask`'s

@@ -12,7 +12,7 @@
 //! The ids come from `rustix::process` rather than from a number written down
 //! here, so what is compared is this machine's libc and this kernel - the two
 //! things that have to agree - and the test runs unchanged on both machines
-//! (`PLAN.md` §15.11).
+//! (`NOTES.md` §15.11).
 
 use mpos_user_tests::Report;
 

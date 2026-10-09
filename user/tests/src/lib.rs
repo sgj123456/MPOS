@@ -16,7 +16,7 @@
 //! `lin::check_true`/`lin::check_eq`/`lin::done` and the same exit codes. This is
 //! the std side's half of one protocol - which is what makes the two suites
 //! able to run under the same reader, and what let the suite move from one to the
-//! other (`PLAN.md` §15.11).
+//! other (`NOTES.md` §15.11).
 
 /// The claims one test has made, and whether any of them failed.
 pub struct Report {

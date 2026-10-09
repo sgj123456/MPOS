@@ -5,7 +5,7 @@
 //! record, physical memory, the descriptor tables, the kernel's own page tables
 //! and the wire that reports them - is `mpos_arch::arch::x86_64::boot`, because
 //! that is the machine layer's business and a machine crate is the only place
-//! that may touch it (`PLAN.md` §14.8). What is left here is the kernel's own
+//! that may touch it (`NOTES.md` §14.8). What is left here is the kernel's own
 //! boot: the subsystems on top of that machine, the devices on its bus, and the
 //! milestone checks. None of it could live in `mpos-arch`, because all of it
 //! names `vfs`, `blk`, `net` and `drivers`, which sit above the machine layer.
@@ -183,7 +183,7 @@ fn init(info: &BootInfo) -> ! {
 
     // The machine's rng device, if the PCI enumeration found one, before the
     // generator seeds: `rand` folds in "this machine's rng device" and is not
-    // allowed to know what that is or which bus carried it (`PLAN.md` §14.3).
+    // allowed to know what that is or which bus carried it (`NOTES.md` §14.3).
     mpos::rand::set_device_entropy(drivers::virtio::entropy);
     mpos::rand::init();
 
@@ -250,7 +250,7 @@ fn init_blk() {
     // The boot disk, from whichever controller has one. Both are tried rather
     // than either: a machine can have the paravirtual disk the image builder
     // attaches *and* a real SATA controller, and then it has two disks under two
-    // names (`PLAN.md` §7.3). The first one brought up is the boot disk, whose
+    // names (`NOTES.md` §7.3). The first one brought up is the boot disk, whose
     // partitions the early userland mounts.
     if let Some(dev) = drivers::virtio::blk::VirtioBlk::init() {
         let sectors = dev.capacity_sectors();
@@ -593,7 +593,7 @@ fn init_virtio() {
     // The host share's device, probed *before* the mount. This call is the one
     // this machine was missing: `mount_share` read `fs9p::devices()`, nothing
     // ever filled it, so every boot printed "no share on the bus" and no share
-    // was reachable even though QEMU exports one (`PLAN.md` §13.29).
+    // was reachable even though QEMU exports one (`NOTES.md` §13.29).
     mpos::drivers::virtio::fs9p::init_global();
     steps::mount_share();
 

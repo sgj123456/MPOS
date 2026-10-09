@@ -13,7 +13,7 @@
 //!
 //! The "existing file" is one this test writes itself under `/tmp`, not the
 //! no-std version's `/etc/motd`: the second machine's payload carries `/tmp` and
-//! no motd at all (`PLAN.md` §15.11), and the claim is about `openat`, not about
+//! no motd at all (`NOTES.md` §15.11), and the claim is about `openat`, not about
 //! which file it is opening. `/bin/sh` is the one path this test reads that it
 //! does not create itself, and both machines carry it as a static executable -
 //! measured on the second machine's disk with `debugfs` before the move (479176

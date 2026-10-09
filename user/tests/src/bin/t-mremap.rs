@@ -76,14 +76,21 @@ fn main() {
 
     // (b) Grow one page to two where the pages above are free: the mapping
     // stays put and its contents survive.
-    let p = map_at(0x2_0000, PAGE);
-    r.check("the page to grow maps fixed", p == base + 0x2_0000);
+    //
+    // The fixture has to make that page *free*, which is more than asking the
+    // arena for two pages: everything inside the arena is a `PROT_NONE`
+    // reservation this process owns, so the page above the probe is a
+    // description like any other and a grow into it is refused (`ENOMEM` -
+    // the same answer Linux gives, measured here: without MAYMOVE a grow over
+    // a mapped neighbour fails). So the probe is mapped two pages wide and
+    // the upper half is handed back, which leaves exactly the hole this claim
+    // is about (`NOTES.md` §15.18).
+    let p = map_at(0x2_0000, 2 * PAGE);
+    r.check("the two pages to grow map fixed", p == base + 0x2_0000);
+    let dropped = unsafe { libc::munmap((p + PAGE) as *mut _, PAGE) };
+    r.check("and the page above the probe is freed again", dropped == 0);
     const P2: u64 = 0x5d00_5d00_5d00_0002;
     unsafe { (p as *mut u64).write_volatile(P2) };
-    // Linux grows only into pages that are already *mapped* above the range
-    // (measured here: without MAYMOVE a grow over untouched space is
-    // ENOMEM); mpos keeps the mapping in place when the neighbourhood is
-    // free. The payload pins the in-place answer.
     let grew = unsafe { libc::mremap(p as *mut _, PAGE, 8192, 0, 0) };
     r.check(
         "growing in place answers the old address",

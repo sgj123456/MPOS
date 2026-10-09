@@ -1,6 +1,6 @@
 //! The device-`ioctl` entry point: `handle_ioctl` and its per-family routers.
 //!
-//! Split out of the old `fs.rs` (PLAN.md §11.2 Step E). This is the one job the
+//! Split out of the old `fs.rs` (NOTES.md §11.2 Step E). This is the one job the
 //! VFS-traversing half of `fs` did not share: a `request` word decoded by its
 //! `_IOC_TYPE` magic (`family_nr`) and dispatched to the console/DRM/evdev/uinput/
 //! fb/rtc/netlink/ioctl families. The path-carrying handlers live in `super::file`;
@@ -16,13 +16,13 @@ use crate::syscall::{ARG_COUNT, buffer_ok, err, err_of};
 // it is the layer that knows which request belongs to which device - and it is
 // exactly what the VFS stopped doing: `Inode` carries no method per device type
 // any more, so a caller asks the node for its concrete type through
-// `dyn Inode::as_any` instead (`PLAN.md` §11.2 Step B1, V-1). Gated with the
+// `dyn Inode::as_any` instead (`NOTES.md` §11.2 Step B1, V-1). Gated with the
 // modules they come from, which the host build does not compile.
-#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+#[cfg(target_os = "none")]
 use crate::drivers::uinput::Uinput;
-#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+#[cfg(target_os = "none")]
 use crate::drivers::virtio::gpu::FbDev;
-#[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+#[cfg(target_os = "none")]
 use crate::drivers::virtio::input::EvdevNode;
 
 /// `ioctl(fd, request, arg)` — terminal settings and queries, stub the rest.
@@ -293,6 +293,30 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             unsafe { tty.termios().store_to(buf as *mut u8) };
             0
         }
+        0x802C542A => {
+            // TCGETS2: the same question asked with room for the speeds. This
+            // is the request a maintained binding uses - `rustix`'s
+            // `tcgetattr` sends it *first* and only falls back to `TCGETS` on
+            // `ENOTTY`. Left unserved, that fallback ran, and `TCGETS`'s
+            // 60-byte structure overran the 44-byte `termios2` the caller had
+            // handed it: the last eight bytes written are the two speeds, so
+            // the caller's saved return address became `0x960000009600` and
+            // the program died on its next instruction (aarch64) or had a
+            // stack slot quietly clobbered under it (x86_64).
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            let inode = file.inode();
+            let Some(tty) = inode.as_tty() else {
+                return err::ENOTTY;
+            };
+            if !buffer_ok(buf, crate::vfs::termios::TERMIOS2_SIZE, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe { tty.termios().store_to2(buf as *mut u8) };
+            0
+        }
         // TCSETS, TCSETSW, TCSETSF: the difference between them is when they
         // take effect, which is about draining an output queue this tty does
         // not have - a byte written is already gone.
@@ -309,6 +333,26 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 return err::EFAULT;
             }
             let tio = unsafe { crate::vfs::termios::Termios::from_ptr(buf as *const u8) };
+            tty.set_termios(tio);
+            0
+        }
+        // TCSETS2, TCSETSW2, TCSETSF2: the `termios2` shape of the same three
+        // writes, again the pairing of the requests above - a binding that
+        // asked `TCGETS2` sets with `TCSETS2`, and leaving this unserved would
+        // have it fall back and hand us a buffer it sized for `termios2`.
+        0x402C542B..=0x402C542D => {
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            let inode = file.inode();
+            let Some(tty) = inode.as_tty() else {
+                return err::ENOTTY;
+            };
+            if !buffer_ok(buf, crate::vfs::termios::TERMIOS2_SIZE, false, from_user) {
+                return err::EFAULT;
+            }
+            let tio = unsafe { crate::vfs::termios::Termios::from_ptr2(buf as *const u8) };
             tty.set_termios(tio);
             0
         }
@@ -518,7 +562,6 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             0
         }
-        #[cfg(not(target_arch = "aarch64"))]
         0x4600 => {
             // FBIOGET_VSCREENLINFO: the framebuffer's own description, in
             // `struct fb_var_screeninfo` - the resolution a program sizes
@@ -567,7 +610,6 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             0
         }
-        #[cfg(not(target_arch = "aarch64"))]
         0x4601 => {
             // FBIOPUT_VSCREENLINFO: a request to reshape the framebuffer.
             // Refused rather than faked: changing the resolution tears down
@@ -585,7 +627,6 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             err::EOPNOTSUPP
         }
-        #[cfg(not(target_arch = "aarch64"))]
         0x4602 => {
             // FBIOGET_FSCREENINFO: the fixed half of the pair - where the
             // pixel buffer physically is and how long a row is, the numbers
@@ -624,7 +665,6 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
             0
         }
-        #[cfg(not(target_arch = "aarch64"))]
         0x4603 => {
             // FBIOPAN_DISPLAY: accept a page-flip request. This framebuffer
             // is a single scanout (`yres_virtual == yres`), so a compositor
@@ -646,7 +686,6 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             crate::drivers::video::render::request_flush_blocking();
             0
         }
-        #[cfg(not(target_arch = "aarch64"))]
         0x4622 => {
             // FBIO_WAITFORVSYNC: a frame-pacing wait, which this now genuinely
             // is - it sleeps until the next frame the render task *presents*.
@@ -812,7 +851,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                     // full - contradicted one moment later. §4.4: an action this
                     // machine cannot perform is refused, not quietly reported
                     // done. It would take a count to say otherwise, and that is
-                    // the named gap in `PLAN.md`.
+                    // the named gap in `NOTES.md`.
                     if !privileged {
                         return err::EPERM;
                     }
@@ -880,7 +919,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // number the RTC node carries (`10,135`), and that node is registered on
         // both (`drivers/devices.rs`). Which hardware answers is `crate::hal`'s
         // business - the CMOS on x86_64, the PL031 on aarch64 - and both can be
-        // written now, which is what `RTC_SET_TIME` needs (`PLAN.md` §13.15).
+        // written now, which is what `RTC_SET_TIME` needs (`NOTES.md` §13.15).
         #[cfg(target_os = "none")]
         request
             if family_nr(request, b't').is_some()
@@ -941,13 +980,11 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 _ => err::ENOTTY,
             }
         }
-        #[cfg(not(target_arch = "aarch64"))]
         request if family_nr(request, b'E').is_some() => evdev_ioctl(fd, request, buf, from_user),
         // uinput (`'U'`-typed): how a program makes an input device of its own.
         // The descriptor *is* the device, so every request here is about the one
         // this open file description owns.
         #[cfg(target_os = "none")]
-        #[cfg(not(target_arch = "aarch64"))]
         request if family_nr(request, b'U').is_some() => uinput_ioctl(fd, request, buf, from_user),
         // Console-ownership (`'V'`-typed VT_*) and keyboard/video-mode
         // (`'K'`-typed KD*) ioctls, which a seat manager drives the line
@@ -988,9 +1025,10 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             }
         }
         // DRM/KMS ioctls (`'d'`-typed), routed to the card handler with the
-        // command number already decoded out of the request word. Deferred off
-        // aarch64 with the DRM driver itself: there is no card to reach.
-        #[cfg(all(target_os = "none", not(target_arch = "aarch64")))]
+        // command number already decoded out of the request word. Both machines
+        // reach the same card: the render task publishes it into `drivers::drm`
+        // whichever virtio transport brought the GPU up.
+        #[cfg(target_os = "none")]
         request if family_nr(request, b'd').is_some() => match family_nr(request, b'd') {
             Some(nr) => crate::drivers::drm::drm_ioctl(fd, nr, buf),
             None => err::ENOTTY,
@@ -1252,8 +1290,8 @@ fn kd_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
 /// `EBADF` and a node that is not a uinput device is `ENOTTY`, which are the
 /// syscall layer's answers to give - and the request itself is the device's to
 /// judge (`Uinput::ioctl`, the same split the `'E'` and `'K'` families took:
-/// `PLAN.md` §11.2 Step B2).
-#[cfg(not(target_arch = "aarch64"))]
+/// `NOTES.md` §11.2 Step B2).
+#[cfg(target_os = "none")]
 fn uinput_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     let file = match crate::sched::current_fds().clone_at(fd) {
         Ok(f) => f,
@@ -1266,7 +1304,7 @@ fn uinput_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     dev.ioctl(file.ofd(), request, buf, from_user)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_os = "none")]
 fn evdev_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
     // Resolve the descriptor to its evdev node here, at the user boundary - the
     // bad-fd `EBADF` and the not-an-evdev-node `ENOTTY` are the syscall layer's
@@ -1303,7 +1341,7 @@ fn ifreq_index(buf: usize) -> Option<u32> {
 
 /// Whether a parsed interface name resolves to a link index. The loopback is
 /// the always-present index 1; the ethernet is 2, but only once the net stack
-/// knows that name. Both machines have a stack now (`PLAN.md` §13.4), so the
+/// knows that name. Both machines have a stack now (`NOTES.md` §13.4), so the
 /// lookup reaches `crate::net::link_facts` on either of them - it is the same
 /// call the already-ungated `SIOCGIFFLAGS` arm uses. A machine whose adapter
 /// never probed has no stack and answers `None`, which the interface ioctls

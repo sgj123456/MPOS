@@ -25,7 +25,7 @@
 //!   ones, and only `rt_sigreturn` reading the record back into the trap frame
 //!   returns them. (x86_64's frame carries no floating-point image at all - its
 //!   `fpstate` is a pointer this kernel leaves null - so that half is checked
-//!   on the second machine only, and the gap is named in `PLAN.md`.)
+//!   on the second machine only, and the gap is named in `NOTES.md`.)
 //! * **`SA_RESTART` really rewinds the call**: the same `read`, with a handler
 //!   installed with the flag, is interrupted and then *runs again* - the second
 //!   execution reads the bytes the sibling writes afterwards, which it can only

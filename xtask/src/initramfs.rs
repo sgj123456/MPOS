@@ -3,7 +3,7 @@
 //!
 //! The kernel does not mount the disk itself. It unpacks this archive over a
 //! ramfs, runs `/init` out of it, and that script mounts the real root
-//! filesystem and pivots into it (`PLAN.md` §15.6). So the tree needs exactly
+//! filesystem and pivots into it (`NOTES.md` §15.6). So the tree needs exactly
 //! three things: a shell, the tools to mount with, and the script.
 //!
 //! # One pipeline, two machines

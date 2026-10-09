@@ -28,13 +28,13 @@ mpos-err = { path = "crates/err" }
 # The boot record (`Handoff`) and the kernel's view of it (`BootInfo`), as a
 # leaf: the machine layer names both - `hal::Paging::install` takes a `BootInfo`
 # and the aarch64 entry is handed a `Handoff` - so neither the kernel nor the
-# machine crate can own them (`PLAN.md` §14 S2a). `src/boot` re-exports them
+# machine crate can own them (`NOTES.md` §14 S2a). `src/boot` re-exports them
 # under their old names.
 mpos-bootinfo = { path = "crates/bootinfo" }
 # The mapping vocabulary the same way: `Mapping`, `MapFlags`, `PageTaken`,
 # `KernelSections`, the page arithmetic and the machine-independent
 # `kernel_mappings` plan, all of which `hal::Paging` is written in
-# (`PLAN.md` §14 S2b). `src/mm/vm.rs` and `src/mm/pframe.rs` re-export them.
+# (`NOTES.md` §14 S2b). `src/mm/vm.rs` and `src/mm/pframe.rs` re-export them.
 mpos-vm = { path = "crates/vm" }
 # The arch-neutral Linux ABI facts (`clone` flags, default umask, the rlimit
 # model) as a leaf, so `sched` names them without an edge up into `syscall`'s
@@ -56,7 +56,7 @@ mpos-pci = { path = "crates/pci" }
 # naming the kernel it serves.
 mpos-blk = { path = "crates/blk" }
 # Two more leaves of the same kind, extracted after the seven above: the terminal
-# emulator (a cell grid is not a filesystem fact, PLAN.md §11.1.4) and the AHCI
+# emulator (a cell grid is not a filesystem fact, NOTES.md §11.1.4) and the AHCI
 # port decode (arithmetic on three `u32`s whose only reader is machine-only).
 mpos-term = { path = "crates/term" }
 mpos-ahci = { path = "crates/ahci" }
@@ -73,7 +73,7 @@ mpos-uinput = { path = "crates/uinput" }
 # The device tree reader: the second machine's description of itself, read as
 # bytes. Pure - a blob in, names and numbers out - so the part that can be wrong
 # in a way only a boot would show is the part a host test can pin. Stage 5's
-# first piece; see `PLAN.md` §9.1.
+# first piece; see `NOTES.md` §9.1.
 mpos-fdt = { path = "crates/fdt" }
 
 # Used by the arch-agnostic mapping plan, so deliberately not target-gated.
@@ -123,7 +123,7 @@ critical-section = { version = "1.2", features = ["restore-state-bool"] }
 # under the names they already had, so no call site or its commentary moved -
 # but the boundary is a crate boundary now, which is what makes the machine
 # layer's independence cargo's business rather than a convention's
-# (`PLAN.md` §14 S4). Machine-only: it is `cli`/`sti`, MSRs and descriptor
+# (`NOTES.md` §14 S4). Machine-only: it is `cli`/`sti`, MSRs and descriptor
 # tables, so the host build does not compile it and this block is where that is
 # said.
 mpos-arch = { path = "arch" }

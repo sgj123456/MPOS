@@ -10,7 +10,7 @@
 //! upstream sources describe: an object with no fence behind it is **refused**
 //! rather than treated as already signaled, a timeline is something an object
 //! *becomes*, and the two descriptors the family hands out are told apart by the
-//! request that takes them back. `PLAN.md` §7.4 records the measurement this was
+//! request that takes them back. `NOTES.md` §7.4 records the measurement this was
 //! written from, and `src/gpu/sync.rs` holds the rules with a host test each.
 //!
 //! The waits are the interesting half: `WAIT_FOR_SUBMIT` is the only form that
@@ -509,8 +509,15 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::exit(0);
     }
     // Two seconds of budget against a 50 ms nap: the wait ends when the fence
-    // arrives, and if the wake were lost this would be the clock instead.
-    let (r, _) = wait_one(fd, plain, 2_000_000_000, WAIT_FOR_SUBMIT);
+    // arrives, and if the wake were lost this would be the clock instead. The
+    // deadline is *absolute* - the ABI's `timeout_nsec` is a `CLOCK_MONOTONIC`
+    // instant, not a duration - so it is "now + 2 s" through the helper the
+    // `SA_RESTART` checks below already use. A bare `2_000_000_000` here read as
+    // "two seconds after boot", which is in the past by the time this program
+    // runs, so the wait answered `ETIME` before the child could ever signal:
+    // the check passed only while the sweep reached it inside the machine's
+    // first two seconds, and stopped passing once the sweep grew past that.
+    let (r, _) = wait_one(fd, plain, deadline_ms_ahead(2_000), WAIT_FOR_SUBMIT);
     lin::check_eq(
         &mut failed,
         b"a WAIT_FOR_SUBMIT is woken by another task's SIGNAL",

@@ -12,7 +12,7 @@
 //! callers - `reboot(2)`'s stop path and the panic handler - name
 //! `hal::exit_qemu` and not this module, so a machine with no debug-exit device
 //! is a build without the capability rather than a second body of code
-//! (`PLAN.md` §14.3).
+//! (`NOTES.md` §14.3).
 
 use x86_64::instructions::port::Port;
 

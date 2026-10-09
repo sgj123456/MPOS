@@ -10,7 +10,7 @@
 //! Measured on the second machine, where both halves were missing: a shell's very
 //! first `read(0)`, into its `BufReader`'s 8 KiB heap buffer, answered `EFAULT` -
 //! the second page of a freshly allocated buffer has no table entry yet, and the
-//! check refused it (`PLAN.md` §13.9). The same check then refused the buffer a
+//! check refused it (`NOTES.md` §13.9). The same check then refused the buffer a
 //! `fork` child reads into, because a shared page is copy-on-write and therefore
 //! mapped read-only.
 //!

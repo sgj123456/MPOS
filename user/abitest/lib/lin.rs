@@ -1349,8 +1349,12 @@ pub const SIGRTMIN: i32 = 32;
 /// The `sigev_notify` values `timer_create` accepts. `SIGEV_THREAD` (2) is a
 /// libc invention - it never reaches the kernel, which sees the
 /// `SIGEV_THREAD_ID` timer the libc built underneath it.
-pub const SIGEV_NONE: i32 = 0;
-pub const SIGEV_SIGNAL: i32 = 1;
+///
+/// `SIGEV_SIGNAL` is **0** and `SIGEV_NONE` is **1** in `linux/signal.h`; this
+/// file had them swapped, and so did the kernel's own table, so the two agreed
+/// with each other and with no libc. See `t-timer-create`'s migration.
+pub const SIGEV_SIGNAL: i32 = 0;
+pub const SIGEV_NONE: i32 = 1;
 pub const SIGEV_THREAD_ID: i32 = 4;
 
 /// `TIMER_ABSTIME`: `timer_settime`'s absolute-deadline flag.
@@ -2540,10 +2544,15 @@ pub const SCM_RIGHTS: i32 = 1;
 pub const SCM_CREDENTIALS: i32 = 2;
 pub const SO_PASSCRED: usize = 16;
 pub const SO_PEERCRED: usize = 17;
-pub const MSG_CMSG_CLOEXEC: usize = 0x10000;
+/// `MSG_CMSG_CLOEXEC` as the Linux uapi spells it - `0x40000000`. It was
+/// written here as `0x10000`, which is Linux's `MSG_WAITFORONE`; the kernel
+/// carried the same wrong number in its own table, so a program that read the
+/// bit from either one agreed with the other and the mistake stayed invisible
+/// until the std-side `t-unix-scm` wrote it from `libc` (`NOTES.md` §15.11).
+pub const MSG_CMSG_CLOEXEC: usize = 0x40000000;
 pub const MSG_CTRUNC: usize = 0x8;
 /// `MSG_DONTWAIT` as the Linux uapi spells it - `0x40`. (`0x4000` is
-/// `MSG_CMSG_CLOEXEC` on this arch; the values are easy to swap by eye.)
+/// `MSG_NOSIGNAL`; the values are easy to swap by eye.)
 pub const MSG_DONTWAIT: usize = 0x40;
 pub const MSG_PEEK: usize = 0x2;
 
@@ -3206,7 +3215,10 @@ pub const PR_SET_SECCOMP: usize = 22;
 pub const PR_GET_DUMPABLE: usize = 3;
 pub const PR_SET_DUMPABLE: usize = 4;
 pub const PR_SET_KEEPCAPS: usize = 8;
-pub const PR_GET_KEEPCAPS: usize = 9;
+/// `PR_GET_KEEPCAPS` is 7 in `linux/prctl.h`, not the setter's 8 plus one: 9 is
+/// `PR_GET_FPEMU`. The wrong 9 was here and in the kernel's table at once, so
+/// they agreed and the divergence hid until the std-side port sent the real 7.
+pub const PR_GET_KEEPCAPS: usize = 7;
 pub const PR_CAPBSET_READ: usize = 23;
 pub const PR_CAPBSET_DROP: usize = 24;
 /// `CAP_LAST_CAP` on x86_64: `CAP_CHECKPOINT_RESTORE` is the last one named.

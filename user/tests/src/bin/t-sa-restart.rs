@@ -36,15 +36,16 @@
 //! request, so the *remainder* - which is one of this program's claims - has
 //! nowhere to go through it.
 //!
-//! Two numbers here come from no maintained table. `ITIMER_REAL` is not
-//! defined for any machine this crate builds for (measured: this libc defines
-//! it under fuchsia, hurd, aix and nto and in no `linux_like` file), and
-//! `TIOCGPTN`/`TIOCSPTLCK` are named by no libc at all - they are computed the
-//! way `asm-generic/ioctls.h` computes them (`_IOR('T', 0x30, unsigned int)`
-//! and `_IOW('T', 0x31, int)`) and were checked against a compiled probe on
-//! this host. The ioctl itself goes through `libc::syscall` for `t-vt`'s
+//! The two request words the fixture uses are `libc`'s own (measured for both
+//! of this suite's targets: `linux/arch/generic/mod.rs` names `TIOCGPTN` and
+//! `TIOCSPTLCK` as `Ioctl`, which is `c_int` on musl and `c_ulong` on gnu - a
+//! batch 21 note that said no libc names them was wrong, and batch 22 corrected
+//! it). The ioctl itself goes through `libc::syscall` for `t-vt`'s
 //! reason: `libc::ioctl`'s request parameter is `c_int` in the musl bindings
-//! and `c_ulong` in the gnu ones, and a request is neither.
+//! and `c_ulong` in the gnu ones, and a request is neither. `ITIMER_REAL` is
+//! the one number here no table carries (this libc defines it for fuchsia,
+//! hurd, aix and nto and in no `linux_like` file), so it is written in the
+//! program.
 //!
 //! One wrapper difference is named rather than hidden: musl's `nanosleep` is
 //! **not** a binding of `nanosleep` - the crate's own `libc.a` shows it calling
@@ -76,15 +77,9 @@ use std::time::Instant;
 
 /// `ITIMER_REAL`: the wall-clock timer `alarm(2)` is a shortcut for. This libc
 /// names it for fuchsia, hurd, aix and nto and in no `linux_like` file
-/// (measured), so it is written here - with the request words below, the only
-/// numbers in this program no maintained table carries.
+/// (measured), so it is written here - the one number in this program no
+/// maintained table carries.
 const ITIMER_REAL: libc::c_int = 0;
-
-/// `asm-generic/ioctls.h`'s two pty requests, checked against a compiled probe
-/// on this host: `TIOCGPTN` is `_IOR('T', 0x30, unsigned int)` and
-/// `TIOCSPTLCK` is `_IOW('T', 0x31, int)`.
-const TIOCGPTN: libc::c_ulong = 0x8004_5430;
-const TIOCSPTLCK: libc::c_ulong = 0x4004_5431;
 
 /// How many times the handler ran, and the signal it saw. Atomics because
 /// nothing on the main line "touches" the handler, and a plain static would let
@@ -141,7 +136,7 @@ fn fresh_pair() -> (OwnedFd, OwnedFd) {
     let mut number: u32 = 0;
     let (rc, err) = ioctl(
         master.as_fd().as_raw_fd(),
-        TIOCGPTN,
+        libc::TIOCGPTN as libc::c_ulong,
         &mut number as *mut u32 as usize,
     );
     if rc != 0 {
@@ -150,7 +145,7 @@ fn fresh_pair() -> (OwnedFd, OwnedFd) {
     let unlocked: i32 = 0;
     let (rc, err) = ioctl(
         master.as_fd().as_raw_fd(),
-        TIOCSPTLCK,
+        libc::TIOCSPTLCK as libc::c_ulong,
         &unlocked as *const i32 as usize,
     );
     if rc != 0 {

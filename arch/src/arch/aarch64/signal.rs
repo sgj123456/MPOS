@@ -254,7 +254,7 @@ impl SignalFrame for Current {
 
         // The handler returns through `x30`, and on Linux that is the
         // disposition's `sa_restorer` when it set `SA_RESTORER` and the vDSO's
-        // trampoline otherwise. This kernel has no vDSO - `PLAN.md` records that
+        // trampoline otherwise. This kernel has no vDSO - `NOTES.md` records that
         // as a decision rather than an omission - so a disposition that names no
         // restorer has nothing to return into and there is no frame to write.
         // The caller has already folded the flag and a zero address into this

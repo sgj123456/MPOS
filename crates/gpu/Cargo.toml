@@ -5,7 +5,7 @@
 # be checked from there. Its own crate for that reason, and for the enforcement
 # every leaf here gets: this crate cannot name the kernel, which is what keeps a
 # decision about a command number from quietly acquiring a dependency on a task
-# table (`PLAN.md` §7.4, §11 Step E).
+# table (`NOTES.md` §7.4, §11 Step E).
 [package]
 name = "mpos-gpu"
 version = "0.1.0"

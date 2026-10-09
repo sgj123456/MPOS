@@ -350,7 +350,7 @@ fn write_system_config(mount_dir: &Path, config: &RootfsConfig, arch: Arch) -> R
 /// half **both** machines' installs run.
 ///
 /// Extracted from [`write_system_config`] when the second machine's Alpine
-/// install started consuming the same layer (`PLAN.md` §13.19): its name, its
+/// install started consuming the same layer (`NOTES.md` §13.19): its name, its
 /// clock, its locale, the network hook directories, and the two cleanups the
 /// generated files need. A cross-arch install cannot chroot the target's
 /// userland, so what this writes with `fs::write` alone is exactly the boundary
@@ -1187,7 +1187,7 @@ pub(crate) fn enable_services(mount_dir: &Path) -> Result<()> {
 /// Without it the second machine's `modules` service - which reads `/etc/modules`
 /// and asks for `af_packet` and `ipv6` - found no `/lib/modules` at all and printed
 /// `modprobe: can't change directory to '/lib/modules'` twice on every boot
-/// (`PLAN.md` §13.15). [`utils::kernel_release`] is the same string on both
+/// (`NOTES.md` §13.15). [`utils::kernel_release`] is the same string on both
 /// machines (`uname -r` is one number, from the root `Cargo.toml`), so one
 /// directory name serves both.
 pub(crate) fn write_modules(mount_dir: &Path) -> Result<()> {

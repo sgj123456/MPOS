@@ -54,7 +54,7 @@ rootfs.filesystem = "ext4"
 # How the guest sees the root device (virtio disk in QEMU). Both machines boot
 # the same shape - a GPT whose first partition is the ESP and whose second is
 # the ext4 root - so both name `/dev/vda2`, the second block device's second
-# partition (`PLAN.md` §15.18; the second machine's bare-image deviation is
+# partition (`NOTES.md` §15.18; the second machine's bare-image deviation is
 # gone).
 rootfs.root_device = "/dev/vda2"
 # Serial port the kernel's console goes to, named on the kernel command line as

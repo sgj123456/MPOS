@@ -33,7 +33,7 @@ target = "x86_64-unknown-none"
 # a device by allocating one mapping per BAR". It is gone because it described a
 # *mechanism* rather than a capability: a BAR's window is now what
 # `hal::Paging::map_mmio_window` answers, and which mechanism answers it is the
-# machine's own business (`arch/x86_64/mmio.rs`, `PLAN.md` §14.3).
+# machine's own business (`arch/x86_64/mmio.rs`, `NOTES.md` §14.3).
 rustflags = [
     "-C", "relocation-model=pic",
     "-C", "link-arg=--script=arch/src/arch/x86_64/linker.ld",
@@ -78,7 +78,7 @@ rustflags = [
 #
 # There used to be a `[target.aarch64-unknown-none]` block here naming a script
 # that had never existed, so it described a target that could not link and was
-# removed (PLAN.md §9.1, V-8). It came back at stage 1a with the script, and at
+# removed (NOTES.md §9.1, V-8). It came back at stage 1a with the script, and at
 # stage 1e it stopped being `relocation-model=static`: that model belonged to
 # the `-kernel` bring-up, which linked the image at the fixed address QEMU
 # loaded it at. The loader places the segments itself now, so the image has to

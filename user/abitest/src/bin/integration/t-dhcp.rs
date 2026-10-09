@@ -1,7 +1,7 @@
 //! t-dhcp - the link layer as a socket: an `AF_PACKET` client gets a DHCP
 //! answer with the machine still having no address of its own.
 //!
-//! This is the *mechanism* half of the plan recorded in `PLAN.md`: the
+//! This is the *mechanism* half of the plan recorded in `NOTES.md`: the
 //! kernel stopped being the one that decides the machine's address, and
 //! started offering the door through which a userland client can ask for
 //! one. The test plays that client by hand - a DHCPDISCOVER built octet by

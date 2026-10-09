@@ -1,4 +1,4 @@
-//! The target gate as a rule rather than a habit (PLAN.md §11.2 Step F).
+//! The target gate as a rule rather than a habit (NOTES.md §11.2 Step F).
 //!
 //! `src/lib.rs` decides which modules the host build compiles, and that
 //! decision is a per-module judgement: a module belongs on the host when its
@@ -347,7 +347,7 @@ mod tests {
             dead.is_empty(),
             "a `#[cfg(test)]` module the host never compiles: {dead:#?}\n\
              Either host-compile the file, or move the pins to a program that runs \
-             (PLAN.md §11.2 Step F)."
+             (NOTES.md §11.2 Step F)."
         );
     }
 }

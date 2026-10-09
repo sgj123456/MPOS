@@ -42,7 +42,7 @@
 //! the same*; putting the access mode into the word is a design change with its
 //! own blast radius (`rustix::fs::Dir` reuses an `F_GETFL` word for the
 //! `openat(fd, ".")` it takes a directory's descriptor with), so
-//! `docs/PLAN.md` §15.16 names it with the measurement instead of this program
+//! `docs/NOTES.md` §15.16 names it with the measurement instead of this program
 //! pinning either reading.
 //!
 //! # Why two of the ten claims go through `libc`

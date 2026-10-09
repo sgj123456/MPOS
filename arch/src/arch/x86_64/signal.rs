@@ -8,7 +8,7 @@
 //! those same offsets. So the field order of `struct sigcontext`, the offsets
 //! of the three parts of the frame and the register shuffling are this
 //! machine's ABI, and they live here rather than in the syscall layer
-//! (`PLAN.md` §13.2).
+//! (`NOTES.md` §13.2).
 //!
 //! What does *not* live here is policy: which stack the frame goes on (the
 //! disposition's `SA_ONSTACK`), which mask is restored, where the bytes are

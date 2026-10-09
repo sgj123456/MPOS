@@ -13,7 +13,7 @@
 //! machine layer *declares* what it needs ([`Kernel`]), the kernel implements it
 //! once and registers it at boot, and everything below goes through the
 //! forwards. After `arch` becomes its own crate this module - and the forwards
-//! at the bottom - are the only names it has for any of it (`PLAN.md` §14.2).
+//! at the bottom - are the only names it has for any of it (`NOTES.md` §14.2).
 //!
 //! # Why a table and not a generic parameter
 //!

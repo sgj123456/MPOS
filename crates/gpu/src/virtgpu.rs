@@ -59,7 +59,7 @@
 //!    that handle" rather than `0`, because a transfer that did nothing while
 //!    reporting success is the false success this repository forbids.
 //!
-//! The fix for 2 and 3 is one change and is recorded in `PLAN.md` §7.4: make
+//! The fix for 2 and 3 is one change and is recorded in `NOTES.md` §7.4: make
 //! `CREATE_DUMB` create a device resource too, as Linux's does. It is not here
 //! because it would make every dumb buffer eagerly backed and add a device round
 //! trip to a path the console, weston and the fbdev node all allocate through.
@@ -160,7 +160,7 @@ impl Card {
 /// this kernel has no command for any of the three. A `1` here would advertise
 /// a path with nothing behind it. The measured card agrees (`0`, `0`, `0`) for
 /// its own reason - QEMU offers no blob feature on this machine - and
-/// `PLAN.md` §7.4 records that blobs are out of the work.
+/// `NOTES.md` §7.4 records that blobs are out of the work.
 ///
 /// A parameter outside the table is `EINVAL` (measured: `0`, `9` and `100` all
 /// answer it on a real card). `BLOB_ALIGNMENT` is 9 in newer headers and is

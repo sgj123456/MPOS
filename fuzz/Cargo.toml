@@ -23,6 +23,12 @@ libfuzzer-sys = "0.4"
 # encoding. Raw bytes stay the input for the parsers that read a format.
 arbitrary = { version = "1", features = ["derive"] }
 
+# The ACPI table reader, as its own leaf: the kernel reaches it through this
+# dependency rather than through `mpos`, because the crate is host-buildable on
+# its own and the target below is a test of the *parser*, not of the kernel.
+[dependencies.mpos-acpi]
+path = "../crates/acpi"
+
 # The kernel library, built for the host. Everything reachable here is what
 # `src/lib.rs` leaves un-gated for a `target_os = "none"`-free build: the
 # parsers that decide what the kernel trusts from bytes - ELF, ustar, the
@@ -31,6 +37,13 @@ arbitrary = { version = "1", features = ["derive"] }
 [dependencies.mpos]
 path = ".."
 default-features = false
+
+[[bin]]
+name = "acpi_tables"
+path = "fuzz_targets/acpi_tables.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "binfmt_shebang"

@@ -7,7 +7,7 @@
 /// Every driver below `virtio` is x86_64's machine: port I/O, `uart_16550`,
 /// PCI enumeration, AHCI, DRM. On aarch64 they are `#[cfg]`-ed out - a no-op
 /// there, exactly as `virtio::pci` and the console `vcmux` already were
-/// (`PLAN.md` §9.1's prep shape). `virtio` is the exception: its `Hal` impl is
+/// (`NOTES.md` §9.1's prep shape). `virtio` is the exception: its `Hal` impl is
 /// machine-neutral (the MMIO-mapping seam took the last x86_64-only call out of
 /// it), so it compiles on both, and the aarch64 MMIO transport is added there.
 /// `devices` is the other exception, for the same reason and by the same method:
@@ -18,7 +18,7 @@
 /// `null`/`zero`/`full`, the entropy pair, `kmsg`, the `/proc` links and the
 /// disks) that every machine has. `/dev/hwrng`, `/dev/hvc0` and the input nodes
 /// are *not* gated any more: each is published by whichever machine opened the
-/// device, through the driver module the two machines share (`PLAN.md`
+/// device, through the driver module the two machines share (`NOTES.md`
 /// §13.24/§13.25).
 #[cfg(target_arch = "x86_64")]
 pub mod ahci;
@@ -31,7 +31,7 @@ pub mod pci;
 /// Machine-neutral, and the only thing that was not was the `target_arch` gate
 /// here: what the node reads and writes is `crate::hal::WallClock`, which both
 /// machines implement (the CMOS and the PL031), so it is compiled wherever there
-/// is a machine (`PLAN.md` §13.15).
+/// is a machine (`NOTES.md` §13.15).
 #[cfg(target_os = "none")]
 pub mod rtc_dev;
 /// The userspace input-device interface: a program that opens `/dev/uinput`

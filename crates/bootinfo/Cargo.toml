@@ -3,7 +3,7 @@
 # Its own crate because a machine layer that is becoming `mpos-arch` names both
 # of them - `Paging::install` takes a `BootInfo`, the aarch64 entry takes a
 # `Handoff` - and so does every layer above it. Neither side can own a type the
-# other has to spell, so the pair lives below both (`PLAN.md` §14 S2a).
+# other has to spell, so the pair lives below both (`NOTES.md` §14 S2a).
 #
 # No dependencies: the record is `#[repr(C)]` integers and `BootInfo` is plain
 # data, so there is nothing here for a crate to depend on and nothing for a host

@@ -124,7 +124,7 @@ impl Visit for FieldCollector {
 /// expired, leaving the second machine's kernel log with no sink at all, so every
 /// `tracing` line in shared code was silently dropped there. Flipping it prints
 /// the *same* events through the *same* subscriber on both machines; there was
-/// never a second implementation to write (`PLAN.md` §13.23).
+/// never a second implementation to write (`NOTES.md` §13.23).
 #[cfg(target_os = "none")]
 static MAX_LEVEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(3);
 

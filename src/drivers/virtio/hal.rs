@@ -16,7 +16,7 @@
 //! device could reach, would have real work to do in those two. This one does
 //! not, and pretending otherwise would only add a layer that cannot fail.
 //!
-//! [`HalImpl`] is machine-neutral: after the MMIO-mapping seam (`PLAN.md` §9.1)
+//! [`HalImpl`] is machine-neutral: after the MMIO-mapping seam (`NOTES.md` §9.1)
 //! its one x86_64-only call - `crate::mm::map_mmio` - became
 //! `crate::hal::map_mmio_window`, so `HalImpl` compiles on aarch64 too and the
 //! aarch64 MMIO devices build on it. The PCI probe-and-open helpers below it are
@@ -58,7 +58,7 @@ unsafe impl Hal for HalImpl {
         // *machine* answers the kernel-virtual address through `crate::hal` -
         // not `crate::mm::map_mmio` directly, which is x86_64-only - so this
         // module reaches a device's registers the one way every layer above the
-        // machine layer is allowed to (`PLAN.md` §9.1's drivers-stage seam).
+        // machine layer is allowed to (`NOTES.md` §9.1's drivers-stage seam).
         let virt = crate::hal::map_mmio_window(paddr as usize, size)
             .expect("a mapped MMIO window is never null");
         NonNull::new(virt as *mut u8).expect("an MMIO window is never null")
@@ -178,7 +178,7 @@ mod pci_transport {
     /// carries the card. The fact is written into the shared `pci` record
     /// (`crate::pci::mark_drm_card`), which `vfs::sysfs` reads - the two never
     /// reach into each other, and the machine's q35 firmware VGA, which no driver
-    /// marks, is not mistaken for the card (`PLAN.md` §7.4).
+    /// marks, is not mistaken for the card (`NOTES.md` §7.4).
     pub fn claim_drm_card(device_ids: &[u16]) {
         if let Some(func) = pci::find_any(VENDOR_VIRTIO, device_ids).into_iter().next() {
             pci::mark_drm_card(&func);

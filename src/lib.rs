@@ -12,7 +12,7 @@
 //! # Which half a module belongs in
 //!
 //! The gate below is a judgement made per module, so the criterion it is made
-//! with is written down here (`PLAN.md` §11.2 Step F):
+//! with is written down here (`NOTES.md` §11.2 Step F):
 //!
 //! > A module is host-compiled when its logic touches no hardware, no port I/O,
 //! > no virtio ring and no real clock — and then *its dependencies must be
@@ -32,7 +32,7 @@
 //! is true for aarch64 as well as x86_64, so every module the second machine
 //! cannot yet compile needs `target_arch = "x86_64"` spelled out too - and the
 //! compiler will not say so until someone builds for aarch64, which is exactly
-//! why the list is written down here rather than discovered (`PLAN.md` §9.1).
+//! why the list is written down here rather than discovered (`NOTES.md` §9.1).
 //!
 //! A port is not one diff: the machine layer is stage 1, and the subsystems
 //! above it un-gate one stage at a time, each landing with the trait or the
@@ -97,7 +97,7 @@ pub use mpos_ahci as ahci;
 /// this kernel still resolves to the module it always did while the code itself
 /// lives in `mpos-arch` - a crate that cannot name `crate::sched`, `crate::mm`
 /// or `crate::println!` at all, which is the whole point of the split
-/// (`PLAN.md` §14 S4). What crosses is the facade and nothing else:
+/// (`NOTES.md` §14 S4). What crosses is the facade and nothing else:
 /// `arch/x86_64` and `arch/aarch64` are `pub(crate)` inside that crate, so the
 /// re-exports in its `mod.rs` are the whole of what the wiring layer may name.
 #[cfg(target_os = "none")]
@@ -134,7 +134,7 @@ pub use mpos_date as date;
 /// every submodule is x86_64's (port I/O, `uart_16550`, PCI, AHCI, DRM): they
 /// carry their own `#[cfg(target_arch = "x86_64")]` gates inside
 /// `src/drivers/mod.rs`, so on aarch64 only the machine-neutral virtio `Hal`
-/// and the new MMIO transport compile. This is `PLAN.md` §9.1's drivers-stage
+/// and the new MMIO transport compile. This is `NOTES.md` §9.1's drivers-stage
 /// prep - the same shape stage 6A used for `syscall`.
 #[cfg(all(
     target_os = "none",
@@ -150,7 +150,7 @@ pub mod drivers;
 ///
 /// The shape is argued in the module's own documentation: one trait per concern
 /// rather than one `Arch` blob, so an architecture-specific *type* has nowhere
-/// to cross (`PLAN.md` §14.2), and the optional capabilities (`Msi`, `SerialRing`,
+/// to cross (`NOTES.md` §14.2), and the optional capabilities (`Msi`, `SerialRing`,
 /// `FpuTrap`, `SignalFrame`, `ConsoleInput`, `TestExit`) carry the ways one
 /// machine does something another has no hardware for - declared by an `mpos_*`
 /// flag in `.cargo/config.toml`, never by an architecture name, so this module
@@ -185,7 +185,7 @@ pub use mpos_gpu as gpu;
 /// Ungated so the level names and the command-line parsing stay testable on
 /// the host; only the subscriber that writes to COM1 is machine-specific.
 /// The machine layer's hook table, implemented: the kernel services `arch`
-/// asks for through `hal::kernel` (`PLAN.md` §14.2). One impl for every
+/// asks for through `hal::kernel` (`NOTES.md` §14.2). One impl for every
 /// machine - the table was written twice only because it looked
 /// machine-shaped, and it never was.
 #[cfg(target_os = "none")]
@@ -204,7 +204,7 @@ pub mod mm;
 /// `ENETDOWN`, not a device that pretends to answer). The one reference still
 /// x86_64's is `collect_net_sockets`, the four `/proc/net` rows, gated with
 /// procfs's *own* condition: its only caller is procfs, which the second machine
-/// has not been given yet (`PLAN.md` §13's port-progress ledger).
+/// has not been given yet (`NOTES.md` §13's port-progress ledger).
 #[cfg(target_os = "none")]
 pub mod net;
 /// The PCI devices the machine has, and the files `/sys` and `/proc` describe
@@ -256,7 +256,7 @@ pub mod syscall;
 /// The terminal emulator: the cell grid a byte stream is painted into, the
 /// cursor it moves, the blitter that turns cells into pixels and the keystroke
 /// map. Its own leaf crate - a terminal emulator is not a filesystem fact
-/// (`PLAN.md` §11.1.4) - so `console`, `drivers/video` and `vfs::tty` come here
+/// (`NOTES.md` §11.1.4) - so `console`, `drivers/video` and `vfs::tty` come here
 /// for a grid rather than reaching into `vfs` for one.
 pub use mpos_term as term;
 /// The userland-boundary primitives - validate a caller's pointer, and turn a

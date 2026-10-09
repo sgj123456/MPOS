@@ -1,0 +1,13 @@
+# ACPI tables: the machine's own description, as bytes. Pure - a table in,
+# names and numbers out - so it is its own leaf crate, and the machine that
+# reads the tables is not the only thing that can be tested. No external
+# dependency.
+[package]
+name = "mpos-acpi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[lints]
+workspace = true

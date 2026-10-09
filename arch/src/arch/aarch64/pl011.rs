@@ -4,7 +4,7 @@
 //! is deliberately the *machine's* rather than the kernel's: `mpos::console` is
 //! the x86 mux (a framebuffer, six virtual consoles and the `term` grid behind
 //! them), and none of that exists here yet. Stage 4 puts the real console above
-//! this; until then `arch/aarch64` owns the wire, which `PLAN.md` §9.1 lists as
+//! this; until then `arch/aarch64` owns the wire, which `NOTES.md` §9.1 lists as
 //! a named gap rather than hiding behind a stub.
 //!
 //! Where the address comes from. `0x0900_0000` is where QEMU's `virt` machine

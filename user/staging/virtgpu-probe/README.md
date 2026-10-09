@@ -1,6 +1,6 @@
 # virtgpu-probe — what a real Linux virtio-gpu card answers
 
-The instrument `PLAN.md` §7.4's `DRM_VIRTGPU_*` work is designed from, and the
+The instrument `NOTES.md` §7.4's `DRM_VIRTGPU_*` work is designed from, and the
 numbers it produced. It measures a **real Linux kernel**, not this one: the
 guest is Alpine's netboot `virt` kernel in a throwaway initramfs, booted twice
 on the same host QEMU — once on a card with no 3D behind it and once on the GL

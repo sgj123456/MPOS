@@ -4,7 +4,7 @@
 //! compositor hands *part* of a display to somebody else: the objects it names
 //! become a card descriptor of their own, and everything outside the list is
 //! refused on it. wlroots asks for a lease when it reopens a node after a
-//! hand-over, which is why `PLAN.md` §7.4 counts these requests as the price of
+//! hand-over, which is why `NOTES.md` §7.4 counts these requests as the price of
 //! a second compositor family - and why it matters that the answer here is a
 //! real subset rather than a second name for the whole card.
 //!

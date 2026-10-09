@@ -31,7 +31,7 @@
 //! what a display of those pixels would be at a nominal 96 dpi. That is the same
 //! number a compositor computes for itself when a display reports no size at
 //! all, which is why it is better than the zero it replaces - and it says so in
-//! `PLAN.md` §7.4 rather than passing itself off as a measurement.
+//! `NOTES.md` §7.4 rather than passing itself off as a measurement.
 
 use alloc::vec::Vec;
 

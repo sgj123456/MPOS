@@ -209,9 +209,25 @@ fn main() {
             || mpos_user_tests::host_run() && refused(past_limit, libc::ENOMEM),
     );
 
-    // A hint with nothing mapped in the way is honoured exactly.
-    let hint_at = unsafe { ARENA_BASE as usize + 0x20_0000 };
-    let hinted = mm(off!(hint_at), PAGE, PROT_RW, ANON_PRIVATE);
+    // A hint with nothing mapped in the way is honoured exactly - and "nothing
+    // in the way" is a narrower neighbourhood than it looks: every byte
+    // *inside* the arena is a claim this process made, the run above the arena
+    // is the stack's (the layout puts the stack at the top of the mmap region,
+    // so the arena was placed underneath it), and the walk the kernel places
+    // fresh mappings with leaves the previous mapping directly below the next
+    // one. So the test makes its own hole: two pages are taken where the walk
+    // puts them and the upper one is handed straight back, which leaves
+    // exactly one page no VMA describes.
+    let two = mm(0, 2 * PAGE, PROT_RW, ANON_PRIVATE);
+    r.check(
+        "the two pages for the hint map",
+        two > 0 && (two as usize).is_multiple_of(PAGE),
+    );
+    let hint_at = two as usize + PAGE;
+    let freed = unsafe { libc::munmap(hint_at as *mut _, PAGE) };
+    r.check("and the page above them is freed again", freed == 0);
+    let hinted =
+        unsafe { libc::mmap(hint_at as *mut _, PAGE, PROT_RW, ANON_PRIVATE, -1, 0) as isize };
     r.check(
         "a free hint is honoured exactly",
         hinted == hint_at as isize,

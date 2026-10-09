@@ -15,7 +15,7 @@ pub mod abi;
 
 /// The path-carrying calls in Linux argument shapes (`fs::file`), and the
 /// device-`ioctl` entry point (`fs::ioctl`) — split along that seam at
-/// PLAN.md §11.2 Step E; `fs::mod` re-exports the handlers so dispatch below
+/// NOTES.md §11.2 Step E; `fs::mod` re-exports the handlers so dispatch below
 /// still names `fs::<handler>` as when it was one file.
 #[cfg(target_os = "none")]
 pub mod fs;
@@ -49,7 +49,7 @@ pub(crate) mod posix;
 /// frame's layout, and the `rt_sigreturn` that unwraps it, are the machine's
 /// ABI. A port without one is not delivered a handler at all - the call site in
 /// `linux_dispatch` is gated to match - rather than handed a frame the machine
-/// would have to guess at (`PLAN.md` §13.2).
+/// would have to guess at (`NOTES.md` §13.2).
 #[cfg(mpos_signal_frame)]
 pub fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
     proc::deliver_signal(regs_ptr, nr, ret)
@@ -85,10 +85,15 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
     // read off the man page, because three of them are not what the man page
     // sounds like; §8.2 holds the numbers and the two drafts that were wrong.
     //
-    // Deferred off aarch64 with the rest of the `seccomp(2)` handler: no filter
-    // can be installed there until that syscall is ported. STRICT mode above
-    // still runs on both machines; only BPF filtering waits.
-    #[cfg(not(target_arch = "aarch64"))]
+    // Both machines enforce filters now. This block used to be `cfg`'d off
+    // aarch64 because no filter could be *installed* there until `seccomp(2)`
+    // was ported - and that syscall has since moved into `posix`, which is
+    // compiled for both. The stale gate was invisible for as long as the
+    // conformance suite ran on one machine: the no-std `t-seccomp` installs a
+    // filter and reads the answer back, and on aarch64 both of those looked
+    // right, because installing *did* work and nothing ever judged a call. The
+    // migrated test found it - the judged call came back with its real answer
+    // (a pid) instead of the filter's - and the fix is to stop deferring.
     if crate::seccomp::any_installed() {
         let mut data_args = [0u64; 6];
         for (slot, arg) in data_args.iter_mut().zip(args) {
@@ -332,7 +337,11 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
         // aarch64 `fork` path - aarch64 has no `fork` syscall number, `fork()` is
         // `clone(SIGCHLD)` - so a shell can spawn a child here. The post-`clone`
         // tracer announcement is a no-op where no tracer is attached.
-        nr::CLONE => proc::handle_clone(args, regs_ptr),
+        //
+        // The one part of the *request* that is not arch-neutral is the order of
+        // its last two arguments, and `clone_arguments` is where that is
+        // reconciled; the handler reads one order only.
+        nr::CLONE => proc::handle_clone(clone_arguments(args), regs_ptr),
         // `fork`/`vfork` have no aarch64 number at all (the table marks them
         // unreachable rather than absent), so the arm compiles there and can
         // never be matched; the handler itself is arch-neutral now.
@@ -418,7 +427,7 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
         // puts in the caller's block; §4.2 forbids that, and the caller it was
         // written for (glibc) registers at length 33/alignment 64 on a current
         // kernel, a shape that arm rejected anyway, so it honoured neither.
-        // Doing `rseq` for real is a named gap. See `PLAN.md` A6.
+        // Doing `rseq` for real is a named gap. See `NOTES.md` A6.
         nr::CLEANUP_AFTER_KTHREAD => 0,
 
         // --- the calls an ordinary libc reaches for ---
@@ -620,6 +629,44 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
         }
     }
     ret
+}
+
+#[cfg(target_os = "none")]
+/// The order `clone` takes its last two arguments in, reconciled to the one
+/// order the handler reasons in.
+///
+/// Linux's raw `clone` is the syscall whose argument list is *not* the same on
+/// every machine, and the difference has a name in the kernel: `CLONE_BACKWARDS`.
+/// x86-64's `sys_clone` is `(flags, stack, parent_tid, child_tid, tls)`; arm64's
+/// is `(flags, stack, parent_tid, tls, child_tid)`, and glibc's arm64 `__clone`
+/// carries the comment saying so ("X0:flags, x1:newsp, x2:parenttidptr,
+/// x3:newtls, x4:childtid") - it moves `tls` from the C argument's `x5` into the
+/// syscall's `x3`. So a libc on the second machine sends the thread pointer in
+/// the fourth slot, and the handler must be handed the word the other way round.
+///
+/// This is not a wrong number when it is missing, it is a *thread that does not
+/// work*: with the two words swapped, `CLONE_SETTLS` gives the child a thread
+/// pointer that is really the address of its tid word, and
+/// `CLONE_CHILD_SETTID`/`CLEARTID` park the tid at the TLS base. Measured on the
+/// second machine before this existed: `t-clone`'s `CLONE_CHILD_SETTID` claim
+/// was refused `EINVAL` (there was no tid pointer where the handler looked), the
+/// musl thread it then made faulted at `pc 0x3` on its way out - its exit path
+/// walked a TLS block that was never one - and the sweep never reached its end,
+/// because the word `pthread_join` waits on was never woken.
+///
+/// The first machine needs no swap - its order *is* the one the handler speaks -
+/// so the gate is `target_arch = "aarch64"` and not a table of machines.
+fn clone_arguments(args: [usize; 6]) -> [usize; 6] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut swapped = args;
+        swapped.swap(3, 4);
+        swapped
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        args
+    }
 }
 
 #[cfg(target_os = "none")]

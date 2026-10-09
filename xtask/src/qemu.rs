@@ -237,7 +237,7 @@ pub fn machine_args(
     // And a *second* disk on a real controller, which the self-test machine
     // always gets: the ESP above arrives through virtio, and this one arrives
     // through an AHCI controller, so the machine the `t-ahci` pins run on has
-    // two disks from two drivers (`PLAN.md` §7.3). The image lives beside the
+    // two disks from two drivers (`NOTES.md` §7.3). The image lives beside the
     // ESP, because `Boot::Esp` carries the ESP's own path and nothing else -
     // its directory is the one fact both ends already agree on.
     //
@@ -285,7 +285,7 @@ pub fn machine_args(
     // The GPU is the machine's choice rather than this function's: the 2D
     // `virtio-gpu-pci` is the default and needs nothing of the host, while the
     // GL card named in `machine.toml` is what puts a 3D context within reach
-    // (`PLAN.md` §7.4). Which one it is changes only this word, so the rest of
+    // (`NOTES.md` §7.4). Which one it is changes only this word, so the rest of
     // the machine - and the kernel's own device probe - is the same either way.
     args.extend([
         "-device".into(),
@@ -620,7 +620,7 @@ pub fn virt_machine_args(
         // this port reads it, and it is a measured difference rather than a
         // preference: with ACPI left on - the default - AAVMF advertises ACPI
         // 2.0 in its configuration table and publishes **no device tree at
-        // all**, which is `PLAN.md` §9.1's assumption corrected (it said `virt`
+        // all**, which is `NOTES.md` §9.1's assumption corrected (it said `virt`
         // + AAVMF passes a tree). A tree and a set of ACPI tables are two ways
         // to say the same things; this port reads the first, because that is
         // the one an embedded machine has, and the second is named as a gap
@@ -662,7 +662,7 @@ pub fn virt_machine_args(
         // disk is not in that tree - it would be invisible there and the boot
         // would fail at `M7_FS_FAILED`. MMIO is the one transport both can use,
         // and AAVMF reads it: measured, it loads the loader from
-        // `VenHw(837DCA9E-…)`, the virtio-mmio device path (`PLAN.md` §15.18).
+        // `VenHw(837DCA9E-…)`, the virtio-mmio device path (`NOTES.md` §15.18).
         //
         // `file.locking=off`, for the reason the images below ask for it too.
         "-drive".into(),
@@ -716,7 +716,7 @@ pub fn virt_machine_args(
         "virtio-blk-device,drive=blk0".into(),
         // The network adapter, on a user-mode (SLIRP) backend, which `check_net`
         // opens and reads the MAC of - the net stage's transport proof on this
-        // machine (`PLAN.md` §9.1). No socket leaves the machine.
+        // machine (`NOTES.md` §9.1). No socket leaves the machine.
         "-netdev".into(),
         format!("user,id=n0,hostname={}", config.hostname),
         "-device".into(),
@@ -727,6 +727,15 @@ pub fn virt_machine_args(
         // boot opens and negotiates the transport headless.
         "-device".into(),
         "virtio-keyboard-device".into(),
+        // The tablet, for the same reason the first machine attaches one: the
+        // keyboard above is a *relative* device in the sense that matters here -
+        // it carries key events and no position - and an absolute pointer is a
+        // second input class a compositor is written against. It is the second
+        // node in `/sys/class/input` on the first machine and was simply absent
+        // here, which is a gap in what this machine offered rather than in the
+        // driver: the MMIO input path reaches either device the same way.
+        "-device".into(),
+        "virtio-tablet-device".into(),
         // A host-driven console port - the fifth class (`M8_CONSOLE_OK`). Its
         // far end is a host socket nothing has to be listening on (`wait=off`),
         // so the port opens and a write lands in the socket instead of blocking
@@ -797,7 +806,7 @@ pub fn virt_machine_args(
     // machine naming it without `/dev/vhost-vsock` does not start at all.
     // Attaching it only then keeps this machine's boot honest on a bare host -
     // the kernel prints the absence and answers `EAFNOSUPPORT` - while a host
-    // that has it runs the class for real (`PLAN.md` §13.28). The check is here
+    // that has it runs the class for real (`NOTES.md` §13.28). The check is here
     // as well as in the file because the file cannot see the host; the first
     // machine's arm has no such check, which is why its `vsock` key is
     // documented as "off unless the host has the module".

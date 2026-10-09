@@ -4,7 +4,7 @@
 //! say: Linux queues real-time signals, so N copies of `SIGRTMIN+k` all arrive,
 //! first-in-first-out, each carrying its own `si_value` - whether they came from
 //! `sigqueue` or from N plain `kill`s. A coalescing kernel delivers one copy and
-//! the caller silently loses the rest. This is the behaviour PLAN.md §2.3 stage C
+//! the caller silently loses the rest. This is the behaviour NOTES.md §2.3 stage C
 //! adds; it is measured against Linux (7.2.7: three `sigqueue`s of one number all
 //! come back with their own values; two `kill`s of an RT number yield two pending;
 //! the queue is bounded per-user and a full `sigqueue` is `EAGAIN`).

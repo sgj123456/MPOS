@@ -28,7 +28,7 @@
 //! console always writes to the one wire and the VT that is on screen. Answering
 //! the word while doing something else is the silent approximation this repository
 //! refuses; those values are reported as unknown here and recorded as named gaps in
-//! `PLAN.md` instead. Recognising only the console the boot actually uses is the
+//! `NOTES.md` instead. Recognising only the console the boot actually uses is the
 //! rule on both machines.
 //!
 //! The parse is allocation-free on purpose: it runs at the top of the boot task,

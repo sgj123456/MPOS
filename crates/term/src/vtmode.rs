@@ -196,7 +196,7 @@ impl VtMode {
         }
         // Linux refuses neither of these; this kernel does, for the reason in
         // the variant's own note - one keeper cannot be told two opposite things
-        // by the same number. Named as a deviation in `PLAN.md`.
+        // by the same number. Named as a deviation in `NOTES.md`.
         if self.relsig != 0 && self.relsig == self.acqsig {
             return Err(ModeError::SameSignal);
         }
@@ -212,7 +212,7 @@ impl VtMode {
 /// `tmp.mode != VT_AUTO && tmp.mode != VT_PROCESS` and nothing else about the
 /// four signal bytes. The other two are this kernel refusing a call Linux would
 /// accept, kept because both describe a promise that cannot be kept - and named
-/// as a deviation in `PLAN.md` rather than left to be discovered as a surprise.
+/// as a deviation in `NOTES.md` rather than left to be discovered as a surprise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModeError {
     /// `mode` is neither `VT_AUTO` nor `VT_PROCESS`. Linux's `EINVAL`.
@@ -263,7 +263,7 @@ pub struct Promise {
     /// The thread group that wrote `VT_SETMODE` - the only thing `sig` may be
     /// sent to. Linux holds a refcounted `struct pid`; this kernel has the slot
     /// number, which a later process can be given after the keeper dies (see the
-    /// named gap in `PLAN.md`).
+    /// named gap in `NOTES.md`).
     pub pid: u32,
 }
 

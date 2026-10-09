@@ -8,7 +8,7 @@
 //! crates depend on - and against nothing else. There is no `crate::sched`,
 //! no `crate::mm`, no `crate::println!`: those names are not in scope, so a
 //! machine that reaches for one does not link rather than merely offending a
-//! convention (`PLAN.md` §14).
+//! convention (`NOTES.md` §14).
 //!
 //! # The seam, in one paragraph
 //!
@@ -20,7 +20,7 @@
 //! *upward* face: the questions a trap entry has to ask the kernel ("is this
 //! page one to populate?", "charge this tick"), declared here and answered by
 //! the kernel through one registered `&'static dyn Kernel`. The asymmetry is
-//! deliberate and argued in that module (`PLAN.md` §14.2): the downward path is
+//! deliberate and argued in that module (`NOTES.md` §14.2): the downward path is
 //! hot and stays monomorphised, the upward path is a fault, a tick or a log
 //! line and can afford one indirect call.
 //!
@@ -63,7 +63,7 @@ pub mod arch;
 /// target's operating system is not `target_os = "none"`. The loader is a UEFI
 /// application and the kernel is not, so this is the machine code a loader
 /// build needs and `arch` and `hal` are what a kernel build needs; see the
-/// module's own documentation for why the two must not be merged, and `PLAN.md`
+/// module's own documentation for why the two must not be merged, and `NOTES.md`
 /// §14.6 for the change to that gate when the kernel becomes a UEFI stub itself.
 #[cfg(target_os = "uefi")]
 pub mod early;

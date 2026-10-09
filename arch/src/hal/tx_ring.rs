@@ -10,7 +10,7 @@
 //! a slow console was a machine that had stopped scheduling. The reason it is
 //! *here*, above either machine, is that the alternative to sharing it is two
 //! copies of that reasoning with one line of registers between them, and the
-//! second copy is where this kind of bug survives a port (`PLAN.md` §13).
+//! second copy is where this kind of bug survives a port (`NOTES.md` §13).
 //!
 //! [`Transmitter`] is the whole of what differs. Everything a caller above the
 //! seam asks - how much room there is, who is waiting for some, whether the
@@ -42,7 +42,7 @@ use critical_section::Mutex;
 /// Three answers, and none of them a *decision*: the machine says whether its
 /// transmitter will take a byte, takes one, and arms or disarms the interrupt
 /// that says it will take another. Whether to arm it, and what happens while a
-/// writer waits for room, are this module's (`PLAN.md` §13.1: a port implements
+/// writer waits for room, are this module's (`NOTES.md` §13.1: a port implements
 /// a capability, it does not re-derive one).
 pub trait Transmitter {
     /// Whether the transmitter will take another byte right now.

@@ -4,10 +4,10 @@
 //! state. It does not own sockets, watches, evdev clients, uinput devices or
 //! record locks - and before this module existed it named every one of them on
 //! the exit path, which is what made `sched` unbuildable without `net`, `vfs`
-//! and `drivers` (`PLAN.md` §11.1.3, V-3). Each of those is a *per-open-file
+//! and `drivers` (`NOTES.md` §11.1.3, V-3). Each of those is a *per-open-file
 //! resource*: state that lives exactly as long as some process holds the
 //! descriptor, and that has to be given up at the moment the last reference goes
-//! - `do_exit`'s moment, not the reaper's (`PLAN.md` Phase 6).
+//! - `do_exit`'s moment, not the reaper's (`NOTES.md` Phase 6).
 //!
 //! So the ownership is inverted here: a subsystem that has such state registers
 //! a hook, and the teardown walks the list without knowing what is on it. The
@@ -33,7 +33,7 @@
 //! with a "why am I being called" flag would hide that distinction in a boolean; two
 //! named lists say it in the type. The `execve` list is the inversion that lets
 //! `sched` stop naming `drivers` for the `FD_CLOEXEC` pass - the last `sched ->
-//! drivers` edge (`PLAN.md` §11.1.3, V-3).
+//! drivers` edge (`NOTES.md` §11.1.3, V-3).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

@@ -12,7 +12,7 @@
 # half names its own - unlike the loader and kernel targets, which xtask picks
 # from its own `--arch`.
 #
-# Since `PLAN.md` §15.6 both machines switch root from their initramfs's script
+# Since `NOTES.md` §15.6 both machines switch root from their initramfs's script
 # rather than one of them doing it in the kernel, so the archive is the same
 # shape on both: a shell, the tools to mount with, and `/init`. What differs is
 # where the packages come from and which set of them is needed - the second

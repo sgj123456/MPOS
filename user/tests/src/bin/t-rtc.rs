@@ -5,7 +5,7 @@
 //! `/dev/rtc` and `/dev/rtc[0-9]*`, so a machine with neither cannot set its system
 //! clock and says `[ !! ]` on every boot. That was the second machine, whose node
 //! was gated `target_arch = "x86_64"` while the thing behind the node - the wall
-//! clock - was already `crate::hal`'s, implemented by both (`PLAN.md` §13.15).
+//! clock - was already `crate::hal`'s, implemented by both (`NOTES.md` §13.15).
 //!
 //! What is pinned here is the node's *contract*, not a machine's register:
 //!

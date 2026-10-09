@@ -12,9 +12,22 @@
 //! and two claims live outside any wrapper anyway: the `-1` cursor-spelling
 //! and the unknown advice bit. So every call here is
 //! `libc::syscall(SYS_preadv2 / SYS_pwritev2, ..)` with libc's per-machine
-//! numbers (311/179 and 312/180); the iovec array is the machine's own
-//! `libc::iovec`, which rustix's `IoSliceMut` layout matches on both
-//! machines.
+//! numbers (327/286 and 328/287 - the same values this kernel's own
+//! `src/syscall/linux/nr_x86_64.rs` and `nr_aarch64.rs` pin); the iovec array
+//! is the machine's own `libc::iovec`, which rustix's `IoSliceMut` layout
+//! matches on both machines.
+//!
+//! # The position's shape is per-machine too
+//!
+//! The number is not the only thing that differs: x86_64 splits the 64-bit
+//! position into two 32-bit halves and puts the advice word sixth
+//! (`preadv2(fd, iov, iovcnt, pos_l, pos_h, flags)`, glibc's own spelling),
+//! while arm64 passes it whole with the advice word fifth - the asm-generic
+//! shape musl emits there. [`preadv2`]/[`pwritev2`] below are written once per
+//! machine for that reason: handing the pair to arm64 puts the position's
+//! high half where the kernel reads flags, which turns `-1` into a huge
+//! positive position, hides the real flags, and made seven claims here fail
+//! on a kernel that was reading the shape it should.
 
 use mpos_user_tests::Report;
 use rustix::fs::SeekFrom;
@@ -28,6 +41,17 @@ fn refused(ret: isize, want: i32) -> bool {
 }
 
 const PATH: &str = "/tmp/t-preadv2";
+
+/// The advice vocabulary, as `linux/fs.h` numbers it - the same bits
+/// `src/syscall/linux/fs/file.rs` masks `flags` against, so a claim that names
+/// one of them really sends that one. (The first draft of this file sent
+/// `2 /* RWF_NOWAIT */` and `4 /* RWF_APPEND */`, which are `RWF_DSYNC` and
+/// `RWF_SYNC`: both are bits the kernel *knows*, so it accepted them without a
+/// word and the append claim then read the cursor-moving path instead of the
+/// append - a claim that passed for the wrong reason while the two claims
+/// about where the bytes landed failed.)
+const RWF_NOWAIT: u64 = 0x8;
+const RWF_APPEND: u64 = 0x10;
 
 fn main() {
     println!("t-preadv2");
@@ -109,7 +133,7 @@ fn main() {
     let mut iov = mk_iov(&mut a, &mut b);
     r.check(
         "RWF_NOWAIT on an eager read is accepted",
-        preadv2(raw, &mut iov, 0, 2 /* RWF_NOWAIT */) == 7,
+        preadv2(raw, &mut iov, 0, RWF_NOWAIT) == 7,
     );
     let mut iov = mk_iov(&mut a, &mut b);
     r.check(
@@ -126,7 +150,7 @@ fn main() {
     }];
     // The append write names no position: both halves are the cursor's own
     // -1, which is what makes RWF_APPEND mean "wherever the end is".
-    let n = pwritev2(raw, &mut wiov, -1, 4 /* RWF_APPEND */);
+    let n = pwritev2(raw, &mut wiov, -1, RWF_APPEND);
     // The append lands at the end only if the kernel really grew the file;
     // on this host tmpfs answers the write and refuses the growth (measured:
     // ret=3 with the size unchanged), so the tail check reads *what the
@@ -160,9 +184,13 @@ fn main() {
     r.finish()
 }
 
-/// `preadv2(fd, iov, iovcnt, pos_lo, pos_hi, flags)` - the offset travels as
-/// two 32-bit halves through the varargs door, exactly as glibc's own
-/// wrapper splits it; -1 becomes the all-ones pair the cursor spelling is.
+/// `preadv2`, spelled the way *this* machine's ABI defines it.
+///
+/// x86_64 keeps its 32-bit `off_t` heritage: the position travels as two
+/// 32-bit halves through the varargs door, exactly as glibc's own wrapper
+/// splits it, and the advice word is the *sixth* argument. -1 becomes the
+/// all-ones pair the cursor spelling is.
+#[cfg(target_arch = "x86_64")]
 fn preadv2(fd: i32, iov: &mut [libc::iovec], pos: i64, flags: u64) -> isize {
     let lo = pos as libc::c_long;
     let hi = (pos >> 32) as libc::c_long;
@@ -179,7 +207,29 @@ fn preadv2(fd: i32, iov: &mut [libc::iovec], pos: i64, flags: u64) -> isize {
     }
 }
 
-/// `pwritev2(fd, iov, iovcnt, pos_lo, pos_hi, flags)`.
+/// `preadv2(fd, iov, iovcnt, pos, flags)` - the asm-generic shape arm64 uses,
+/// and the one musl emits there: one 64-bit position, the advice word fifth.
+/// Sending the x86_64 pair instead puts the position's high half where the
+/// kernel reads flags (so a negative position reads as a huge positive one
+/// and `-1` stops being the cursor spelling) and hides the real advice word
+/// in a slot nothing looks at.
+#[cfg(not(target_arch = "x86_64"))]
+fn preadv2(fd: i32, iov: &mut [libc::iovec], pos: i64, flags: u64) -> isize {
+    unsafe {
+        libc::syscall(
+            libc::SYS_preadv2,
+            fd,
+            iov.as_mut_ptr() as usize,
+            iov.len(),
+            pos as libc::c_long,
+            flags,
+        ) as isize
+    }
+}
+
+/// `pwritev2` - the write's half of [`preadv2`], with the same per-machine
+/// argument shape.
+#[cfg(target_arch = "x86_64")]
 fn pwritev2(fd: i32, iov: &mut [libc::iovec], pos: i64, flags: u64) -> isize {
     let lo = pos as libc::c_long;
     let hi = (pos >> 32) as libc::c_long;
@@ -191,6 +241,20 @@ fn pwritev2(fd: i32, iov: &mut [libc::iovec], pos: i64, flags: u64) -> isize {
             iov.len(),
             lo,
             hi,
+            flags,
+        ) as isize
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn pwritev2(fd: i32, iov: &mut [libc::iovec], pos: i64, flags: u64) -> isize {
+    unsafe {
+        libc::syscall(
+            libc::SYS_pwritev2,
+            fd,
+            iov.as_mut_ptr() as usize,
+            iov.len(),
+            pos as libc::c_long,
             flags,
         ) as isize
     }

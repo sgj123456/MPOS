@@ -78,7 +78,10 @@ fn main() {
     }
 
     // The boot's own mount, at the name `steps::mount_share` gives it. This is
-    // the half that fails when the probe has no caller.
+    // the half that fails when the probe has no caller. On the second machine
+    // the name is served by the init script's own mount of the same export (the
+    // kernel's hangs on the ramfs the switch deletes), so what this pins is
+    // that *the boot* served the share there - either half is the boot's.
     read_probe(&mut r, "the boot's share serves its probe file", PROBE);
 
     // And the syscall path: a program's own `mount -t 9p hostshare <dir>`. A

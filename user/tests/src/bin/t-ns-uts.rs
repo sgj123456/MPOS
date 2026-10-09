@@ -1,7 +1,7 @@
 //! t-ns-uts - a name that belongs to a *task*, not to the machine.
 //!
 //! `uname(2)`'s `nodename` and `domainname` are the first namespace this kernel
-//! serves (`PLAN.md` §6.3, step 1 of UTS → MNT → PID → NET). What makes a
+//! serves (`NOTES.md` §6.3, step 1 of UTS → MNT → PID → NET). What makes a
 //! namespace a namespace is not that a call sets a name - `sethostname(2)`
 //! always did that - but that the name is *somebody's*: a task that asks for its
 //! own gets a copy, keeps reporting what it reported, and can then change it

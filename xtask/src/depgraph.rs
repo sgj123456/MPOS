@@ -1,4 +1,4 @@
-//! The module graph, measured and ratcheted (PLAN.md §11.2 Step G).
+//! The module graph, measured and ratcheted (NOTES.md §11.2 Step G).
 //!
 //! Phase 11 opens with a measurement rather than an opinion: "bad architecture"
 //! is not a finding until something counts it, and §11.0's count is that the
@@ -60,7 +60,7 @@ use anyhow::{Context, Result, bail};
 /// and `mm` asks the HAL to program the window it hands out. A change that
 /// lowers the count must still lower this constant.
 ///
-/// **12 now**, after stage 4 of the HAL (`PLAN.md` §11.4): with the saved
+/// **12 now**, after stage 4 of the HAL (`NOTES.md` §11.4): with the saved
 /// context, the FPU state and the user frame behind `crate::hal::Contexts`,
 /// `sched → arch` and `syscall → arch` both fell to zero and the last two
 /// `arch ↔ …` pairs went with them (`arch ↔ sched`, `arch ↔ syscall`). Was 14
@@ -68,7 +68,7 @@ use anyhow::{Context, Result, bail};
 /// before S1 - worth having here: each number names what removed it, so a
 /// regression has a step to point at.
 ///
-/// **11**, after the `FD_CLOEXEC` registry (`PLAN.md` §9.1 stage 6h-adjacent
+/// **11**, after the `FD_CLOEXEC` registry (`NOTES.md` §9.1 stage 6h-adjacent
 /// un-gate work, closing V-3): `execve`'s cloexec pass stopped naming
 /// `drivers::{virtio::input,uinput}::close_at_exit` and walks `sched::exit`'s
 /// second list instead, so `sched → drivers` went from 2 to 0 and the
@@ -77,13 +77,13 @@ use anyhow::{Context, Result, bail};
 /// it gives the second event the same inversion the first already had.
 ///
 /// **9 now**, after the ptrace protocol constants moved to the `abi` leaf
-/// (`PLAN.md` §13): `sched/runtime.rs` stopped naming `syscall::linux::abi`, so
+/// (`NOTES.md` §13): `sched/runtime.rs` stopped naming `syscall::linux::abi`, so
 /// `sched → syscall` is 0 and the `sched ↔ syscall` pair - the scheduler's
 /// register-file snapshot read against a table only the syscall layer had - went
 /// with it. The edge is the one the leaf crate was built to empty; this is the
 /// last reference that was keeping it.
 ///
-/// **8 now**, after the machine layer became its own crate (`PLAN.md` §14 S4).
+/// **8 now**, after the machine layer became its own crate (`NOTES.md` §14 S4).
 /// Two pairs left in that step and one arrived unannounced, so the count is
 /// worth spelling out rather than just updating:
 ///
@@ -144,7 +144,7 @@ const BASELINE_LOWER_LAYER_TO_SYSCALL: &[(&str, usize)] = &[
     // the default umask went before them (and `MMAP_BASE` to `crate::mm`, an
     // address-space layout fact rather than a dispatch one). Together those
     // drops took this edge from its recorded 10 to 0, and with it the
-    // `sched <-> syscall` mutual pair (`PLAN.md` §13).
+    // `sched <-> syscall` mutual pair (`NOTES.md` §13).
     ("sched", 0),
 ];
 
@@ -157,7 +157,7 @@ const BASELINE_LOWER_LAYER_TO_SYSCALL: &[(&str, usize)] = &[
 /// apart - a different event with a different pair of subsystems to tell - and
 /// this preserves that: it is a *second* list, not a merge. The `drivers ↔ sched`
 /// pair is gone with the last edge, and closing it is the precondition for
-/// un-gating `sched` for aarch64 (`PLAN.md` §9.1).
+/// un-gating `sched` for aarch64 (`NOTES.md` §9.1).
 ///
 /// The measured graph: module-level edges, weighted by how many references
 /// carry them.
@@ -194,9 +194,9 @@ impl Graph {
 /// Modules allowed to name `crate::arch::`.
 ///
 /// **The door the HAL exists to shut, and it is shut and welded.** After stage 4
-/// of `PLAN.md` §11.4 every reference to `crate::arch::` outside these was zero -
+/// of `NOTES.md` §11.4 every reference to `crate::arch::` outside these was zero -
 /// `sched` and `syscall`, the last two, went when the saved context, the FPU
-/// state and the user frame moved behind `crate::hal::Contexts`. After `PLAN.md`
+/// state and the user frame moved behind `crate::hal::Contexts`. After `NOTES.md`
 /// §14 S4 there are only two names left for a reason that has nothing to do with
 /// discipline: `arch` is `mpos-arch::arch` now, a crate the kernel depends on,
 /// and the path still resolves here only because `src/lib.rs` re-exports it. So
@@ -574,7 +574,7 @@ mod tests {
             violations.is_empty(),
             "the module graph grew past its ratchet: {violations:#?}\n\
              Reduce the edge, or raise the constant next to the rule in \
-             xtask/src/depgraph.rs with the date and the reason (PLAN.md §11.2 Step G)."
+             xtask/src/depgraph.rs with the date and the reason (NOTES.md §11.2 Step G)."
         );
     }
 }

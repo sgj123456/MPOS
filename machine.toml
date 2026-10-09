@@ -38,7 +38,7 @@
 # QEMU memory, in MiB. The first machine is a desktop with a compositor and a
 # graphics stack behind it, so it spends the host's memory; the second boots a
 # disk root and a shell, and its own figure was measured down rather than chosen
-# (`PLAN.md` §9.1's device RAM cost) - it is in `[aarch64]` below.
+# (`NOTES.md` §9.1's device RAM cost) - it is in `[aarch64]` below.
 qemu.memory = "2048"
 # Processors. One is QEMU's default; a second one is what exercises the kernel's
 # bring-up of another processor, which is why the option is here.
@@ -66,7 +66,7 @@ qemu.extra_args = ["-vga", "none"]
 # device, because QEMU refuses to start a machine that names it without
 # `/dev/vhost-vsock` - a host that cannot carry it gets a machine that boots and
 # a kernel that answers `EAFNOSUPPORT`, not a machine that never starts
-# (`PLAN.md` §13.28). That condition is the wiring's rather than a key's
+# (`NOTES.md` §13.28). That condition is the wiring's rather than a key's
 # (`xtask/src/qemu.rs::virt_machine_args`), so nothing here is said twice.
 qemu.vsock = true
 # The virtio-sound card, with an audio backend that plays nowhere: the guest
@@ -78,7 +78,7 @@ qemu.audio = true
 # boots, "measured" here rather than chosen: a GL boot needs `virtio-gpu-gl-pci`
 # (the same device with the host's `virglrenderer` behind it - the one thing
 # that makes a compositor refusing a *software* EGL device able to run at all,
-# `PLAN.md` §7.4), and this host's QEMU 11.1.1 has no OpenGL to give it:
+# `NOTES.md` §7.4), and this host's QEMU 11.1.1 has no OpenGL to give it:
 #   `-display gtk,gl=on`  -> "OpenGL is not supported by display backend 'gtk'"
 #   `-display egl-headless,gl=on` -> "egl: no drm render node available"
 #   `-display none`        -> "The display backend does not have OpenGL support
@@ -181,7 +181,7 @@ qemu.mode = "gui"
 # list, with the reason on each line.
 [aarch64]
 # 256 MiB, not the 2048 above: this machine boots a disk root and a shell, and
-# the figure was measured down rather than chosen (`PLAN.md` §9.1's device RAM
+# the figure was measured down rather than chosen (`NOTES.md` §9.1's device RAM
 # cost). `MEM=` still overrides both.
 qemu.memory = "256"
 # Serial only. This machine's `run --arch aarch64` has no window backend: the

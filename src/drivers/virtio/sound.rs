@@ -18,7 +18,7 @@
 //! (stop, `SET_PARAMS`, start) and read back what the device settled on.
 //! A parameter the stream cannot be rebuilt with answers `EINVAL`, and
 //! `SNDCTL_DSP_SETFRAGMENT`, `SUBDIVIDE` and `NONBLOCK` answer it today,
-//! named in `PLAN.md` - the honest refusal the caller's own fallback
+//! named in `NOTES.md` - the honest refusal the caller's own fallback
 //! reads, rather than a success that changed nothing.
 //!
 //! Reads answer end of input: the crate drives playback only, and a device
@@ -29,7 +29,7 @@
 //! one: [`VirtioSnd<T>`] takes the crate's `VirtIOSound` over whatever transport
 //! the machine opened it on, and everything above - the OSS ioctls, the staging
 //! buffer, the devfs node - is one copy reached through the [`SoundCard`]
-//! contract (`PLAN.md` §13.27).
+//! contract (`NOTES.md` §13.27).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -388,7 +388,16 @@ pub fn install(card: Arc<dyn SoundCard>) -> Arc<dyn SoundCard> {
     critical_section::with(|cs| {
         *GLOBAL.borrow(cs).borrow_mut() = Some(card.clone());
     });
+    crate::drivers::devices::publish("virtio-sound", publish_nodes);
     card
+}
+
+/// Publish `/dev/dsp` for a device set built after this driver came up -
+/// registered by [`install`], not named by `devices::standard_devfs`.
+fn publish_nodes(dev: &crate::vfs::devfs::DevFs) {
+    if let Some(snd) = global() {
+        dev.register("dsp", Arc::new(DspDev::new(snd)));
+    }
 }
 
 /// Bring up the card a machine opened, record it under the name userland will
@@ -473,7 +482,7 @@ impl crate::vfs::devfs::CharDevice for DspDev {
             // "non-blocking" would promise a write shape the device's
             // blocking hand-off does not have. EINVAL is the refusal the
             // family itself reserves for a parameter it will not take, and
-            // each is named in `PLAN.md` with what it would need.
+            // each is named in `NOTES.md` with what it would need.
             SNDCTL_DSP_SUBDIVIDE | SNDCTL_DSP_SETFRAGMENT | SNDCTL_DSP_NONBLOCK => {
                 Some(crate::err::EINVAL)
             }

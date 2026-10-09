@@ -39,7 +39,7 @@
 //! `/proc/cmdline`), so `boot` reaching back would close the graph's ninth mutual
 //! pair. Putting them in the wiring crate - which sits above both, and is the
 //! layer allowed to name the machine at all - adds no edge the ratchet can see
-//! and no cycle (`PLAN.md` §14.9).
+//! and no cycle (`NOTES.md` §14.9).
 //!
 //! Where each step goes is *not* the same on both machines, and that is why this
 //! is a set of steps rather than one `run()`: x86_64 arms the console after the
@@ -106,7 +106,7 @@ pub fn unpack(archive: &[u8]) {
 /// so that from the moment the receiver can deliver a byte the byte belongs to
 /// the *active virtual console* rather than to the console tty. A receiver armed
 /// before the mux delivers its first keystroke to a tty whose session is not the
-/// one the machine is showing (`PLAN.md` §13.16).
+/// one the machine is showing (`NOTES.md` §13.16).
 ///
 /// Where a machine calls it is its own business: from here the console stops
 /// polling its receiver and starts queueing into a ring the interrupt drains, so
@@ -159,7 +159,7 @@ pub fn bring_up_net(dev: alloc::sync::Arc<dyn mpos::drivers::virtio::NetDevice>)
 /// skips the step with a line, which is a quieter boot rather than a failed one.
 ///
 /// The step was the first machine's private function until the second machine
-/// grew the device (`PLAN.md` §13.29), and moving it here is what made the second
+/// grew the device (`NOTES.md` §13.29), and moving it here is what made the second
 /// machine's share possible at all: it was the *probe* that was missing there,
 /// not the mount, and a mount written twice would have hidden that.
 pub fn mount_share() {
@@ -200,11 +200,17 @@ pub fn mount_share() {
         mpos::println!("virtio-9p: /mnt/share could not be made: {e:?}");
         return;
     }
+    // The share is named by its *tag* rather than left as "none": the tag is
+    // what a second mount of the same export needs, and the second machine's
+    // init reads it out of `/proc/mounts` to serve the share inside the root it
+    // is about to switch to (`initramfs-aarch64/init`, and the payload's
+    // `t-9p` reads the boot's share through that name).
+    //
     // The filesystem is held by `Arc` - its inodes hold it by `Weak`, so a
     // share that outlives its mount is answered rather than crashed - and the
     // mount API takes that same instance, so the record keeps the share alive
     // for as long as the name does and can answer which filesystem serves it.
-    match mpos::vfs::mount("/mnt/share", fs.clone()) {
+    match mpos::vfs::mount::mount_at("/mnt/share", fs.clone(), "9p", tag, None) {
         Ok(()) => mpos::println!("virtio-9p: \"{tag}\" mounted at /mnt/share"),
         Err(e) => mpos::println!("virtio-9p: \"{tag}\" did not mount: {e:?}"),
     }
@@ -217,7 +223,7 @@ pub fn mount_share() {
 /// payload reads seed files through this tree, and on the second machine the
 /// disk root is what the initramfs script switches into. What is deliberately
 /// not here is any root switch: pivoting `/` onto this mount is the early
-/// userland's job on both machines (`PLAN.md` §15.6), because a kernel that
+/// userland's job on both machines (`NOTES.md` §15.6), because a kernel that
 /// assembles the real root first leaves pieces the owner of the system cannot
 /// unmount.
 ///
@@ -231,7 +237,22 @@ pub fn mount_disk_root() {
         mpos::println!("disk: no device was registered with the block layer");
         return;
     };
-    let fs = match mpos::vfs::ext4::Ext4Fs::mount(disk.dev.clone()) {
+    // The root is a *partition*, and which one is the partition table's answer
+    // rather than this function's: `find_filesystem` finds the one ext2/ext4
+    // partition on the disk, and hands the whole device back for a disk that
+    // carries a filesystem with no table around it. So a bare image and a real
+    // GPT disk mount through the same line, and neither machine's bring-up has
+    // to know which shape its boot medium is (`NOTES.md` §15.18).
+    //
+    // Not `find_rootfs`: that one names partition 3, which is where the root
+    // sits in a three-partition layout (ESP, boot, rootfs). A two-partition
+    // disk - ESP and root, which is what the second machine boots - has its
+    // root in partition 2, and asking for a third would find nothing.
+    let Some(partition) = mpos::blk::part::find_filesystem(disk.dev.clone()) else {
+        mpos::println!("disk: {} carries no ext2/ext4 partition", disk.name);
+        return;
+    };
+    let fs = match mpos::vfs::ext4::Ext4Fs::mount(partition.clone()) {
         Ok(fs) => fs,
         Err(e) => {
             mpos::println!("disk: {} did not mount as ext4: {e:?}", disk.name);
@@ -290,7 +311,7 @@ pub fn mount_disk_root() {
 /// courtesy: with the stack live and the hook unregistered, `t-tcp`'s bind of
 /// 34567 answered `EADDRINUSE` on a machine that had just booted, because a
 /// socket a dying process left in the stack's set keeps its local port reserved
-/// for ever (`PLAN.md` §13.4). A machine whose adapter never probed still has
+/// for ever (`NOTES.md` §13.4). A machine whose adapter never probed still has
 /// `AF_UNIX` and `AF_VSOCK` sockets, so the hook belongs to the descriptor and
 /// not to the device.
 ///

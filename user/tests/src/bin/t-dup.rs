@@ -15,7 +15,7 @@
 //! The fixture is one this test writes under `/tmp` rather than the no-std
 //! version's `/etc/motd`: the claim is about descriptor semantics, not about
 //! which file they are exercised on, and the second machine's payload carries
-//! `/tmp` and no motd (`PLAN.md` §15.11).
+//! `/tmp` and no motd (`NOTES.md` §15.11).
 
 use mpos_user_tests::Report;
 use rustix::fd::{AsRawFd, BorrowedFd, IntoRawFd};

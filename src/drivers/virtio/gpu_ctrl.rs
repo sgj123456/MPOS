@@ -6,7 +6,7 @@
 //! crate's command set stops at `GET_EDID`, and the queue it owns has no
 //! accessor - so a driver that must send `CTX_CREATE`, `RESOURCE_CREATE_3D` or
 //! `SUBMIT_3D` has to own the queue, and therefore the encoding with it.
-//! `PLAN.md` §7.4 records the measurement this started from and why the crate
+//! `NOTES.md` §7.4 records the measurement this started from and why the crate
 //! was not vendored instead.
 //!
 //! What is left is small because of what the kernel actually asked the crate
@@ -113,7 +113,7 @@ unsafe impl Send for Frames {}
 /// nothing else: a method no caller has is a promise nothing keeps) and
 /// [`Gpu<T>`] implements it once, so the transport stops here and the render
 /// task, the DRM layer above it, the framebuffer below it and `drivers::video`
-/// are one copy on both machines (`PLAN.md` §13.26).
+/// are one copy on both machines (`NOTES.md` §13.26).
 ///
 /// `Send` because the device is moved into the render task.
 pub trait GpuDevice: Send {
@@ -185,7 +185,7 @@ pub trait GpuDevice: Send {
 /// takes `&mut T where T: Transport`), so a `Box<dyn Transport>` is not a device
 /// this driver could be built over. Which transport it is remains the machine's
 /// fact; everything above it reaches the device through [`GpuDevice`], which is
-/// where the type is erased (`PLAN.md` §13.26).
+/// where the type is erased (`NOTES.md` §13.26).
 pub struct Gpu<T: Transport> {
     transport: T,
     control: VirtQueue<HalImpl, QUEUE_SIZE>,

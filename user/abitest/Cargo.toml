@@ -41,10 +41,6 @@ build = "build.rs"
 mpos-abi = { path = "../../crates/abi" }
 
 [[bin]]
-name = "t-aslr"
-path = "src/bin/integration/t-aslr.rs"
-
-[[bin]]
 name = "t-dns"
 path = "src/bin/integration/t-dns.rs"
 
@@ -77,10 +73,6 @@ name = "t-ahci"
 path = "src/bin/integration/t-ahci.rs"
 
 [[bin]]
-name = "t-epoll-socket"
-path = "src/bin/integration/t-epoll-socket.rs"
-
-[[bin]]
 name = "t-evdev"
 path = "src/bin/integration/t-evdev.rs"
 
@@ -97,24 +89,12 @@ name = "t-forkcost"
 path = "src/bin/integration/t-forkcost.rs"
 
 [[bin]]
-name = "t-fpu-across-switch"
-path = "src/bin/integration/t-fpu-across-switch.rs"
-
-[[bin]]
 name = "t-ioctl"
 path = "src/bin/integration/t-ioctl.rs"
 
 [[bin]]
 name = "t-fsflags"
 path = "src/bin/integration/t-fsflags.rs"
-
-[[bin]]
-name = "t-mountinfo"
-path = "src/bin/integration/t-mountinfo.rs"
-
-[[bin]]
-name = "t-memfd-shm"
-path = "src/bin/integration/t-memfd-shm.rs"
 
 [[bin]]
 name = "t-netlat"
@@ -145,10 +125,6 @@ name = "t-sh"
 path = "src/bin/integration/t-sh.rs"
 
 [[bin]]
-name = "t-sock-flags"
-path = "src/bin/integration/t-sock-flags.rs"
-
-[[bin]]
 name = "t-tcp-close"
 path = "src/bin/integration/t-tcp-close.rs"
 
@@ -157,92 +133,8 @@ name = "t-udev-worker"
 path = "src/bin/integration/t-udev-worker.rs"
 
 [[bin]]
-name = "t-uevent"
-path = "src/bin/integration/t-uevent.rs"
-
-[[bin]]
-name = "t-clone"
-path = "src/bin/syscall/t-clone.rs"
-
-[[bin]]
-name = "t-futex"
-path = "src/bin/syscall/t-futex.rs"
-
-[[bin]]
-name = "t-getdents64"
-path = "src/bin/syscall/t-getdents64.rs"
-
-[[bin]]
-name = "t-maps"
-path = "src/bin/syscall/t-maps.rs"
-
-[[bin]]
-name = "t-posix"
-path = "src/bin/syscall/t-posix.rs"
-
-[[bin]]
-name = "t-times"
-path = "src/bin/syscall/t-times.rs"
-
-[[bin]]
-name = "t-prctl"
-path = "src/bin/syscall/t-prctl.rs"
-
-[[bin]]
-name = "t-process-vm"
-path = "src/bin/syscall/t-process-vm.rs"
-
-[[bin]]
-name = "t-ptrace-attach"
-path = "src/bin/syscall/t-ptrace-attach.rs"
-
-[[bin]]
-name = "t-pty"
-path = "src/bin/syscall/t-pty.rs"
-
-[[bin]]
-name = "t-seccomp"
-path = "src/bin/syscall/t-seccomp.rs"
-
-[[bin]]
-name = "t-syslog"
-path = "src/bin/syscall/t-syslog.rs"
-
-[[bin]]
-name = "t-timer-create"
-path = "src/bin/syscall/t-timer-create.rs"
-
-[[bin]]
-name = "t-tty-eintr"
-path = "src/bin/syscall/t-tty-eintr.rs"
-
-[[bin]]
-name = "t-tty-nonblock"
-path = "src/bin/syscall/t-tty-nonblock.rs"
-
-[[bin]]
-name = "t-tty-query"
-path = "src/bin/syscall/t-tty-query.rs"
-
-[[bin]]
 name = "t-dhcp"
 path = "src/bin/integration/t-dhcp.rs"
-
-[[bin]]
-name = "t-tty-vtime"
-path = "src/bin/syscall/t-tty-vtime.rs"
-
-[[bin]]
-name = "t-unix-dgram"
-path = "src/bin/syscall/t-unix-dgram.rs"
-
-[[bin]]
-name = "t-unix-scm"
-path = "src/bin/syscall/t-unix-scm.rs"
-
-[[bin]]
-name = "t-wait-eintr"
-path = "src/bin/syscall/t-wait-eintr.rs"
 
 [lints]
 workspace = true

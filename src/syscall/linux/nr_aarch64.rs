@@ -173,7 +173,11 @@ pub const LREMOVEXATTR: u64 = 15; // 198 on x86_64
 pub const FREMOVEXATTR: u64 = 16; // 199 on x86_64
 pub const SIGNALFD: u64 = 64024; // no arm64 number; unreachable on aarch64
 pub const SIGNALFD4: u64 = 74; // 289 on x86_64
-pub const EVENTFD: u64 = 64025; // no arm64 number; unreachable on aarch64
+// The name carries `eventfd2`'s number on both machines - x86_64's 290 is that
+// spelling, not the legacy 284 - because the flags-taking form is the one every
+// libc emits and the one `handle_eventfd` reads (`args[1]` is the flags). arm64
+// has no legacy `eventfd` at all, so 19 is the whole family here.
+pub const EVENTFD: u64 = 19; // 290 on x86_64
 pub const MEMFD_CREATE: u64 = 279; // 319 on x86_64
 pub const LINK: u64 = 64026; // no arm64 number; unreachable on aarch64
 pub const LINKAT: u64 = 37; // 265 on x86_64

@@ -27,7 +27,7 @@
 //! # The fixture moved, and so did one call
 //!
 //! The no-std version opened `/etc/motd`; the second machine's payload has no
-//! motd (`PLAN.md` §15.11), so the root-filesystem file this test needs is its
+//! motd (`NOTES.md` §15.11), so the root-filesystem file this test needs is its
 //! own `/tmp` file - which also makes the named divergence checkable on both
 //! machines, because the two descriptors now differ only in the inode they
 //! hold.
@@ -49,6 +49,10 @@ use rustix::io::Errno;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
 const RAMFS_MAGIC: u64 = 0x8584_58f6;
 const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
+/// The first machine's root is the kernel's initramfs, the second machine's
+/// is the ext2/ext4 root partition of its own disk - see the root claim in
+/// the body for why the two differ.
+const EXT4_SUPER_MAGIC: u64 = 0x0000_ef53;
 
 /// The scratch file this test owns, in place of the no-std version's
 /// `/etc/motd`: a regular file the *root* filesystem really holds.
@@ -154,22 +158,36 @@ fn main() {
                 }
             }
 
-            // The root filesystem names itself ramfs on this kernel's own
-            // initramfs boot - the magic a file the root really holds
-            // reports. A host's root is whatever the machine was installed
-            // on, so the exact magic is the payload's answer and the host
-            // escape names that difference.
+            // The root filesystem answers the magic *its machine's boot*
+            // mounts there, which is not the same filesystem on the two
+            // machines: the first machine's sweep keeps the kernel's own
+            // initramfs as `/` (a ramfs, the magic a file the root really
+            // holds reports), while the second machine's payload rides the
+            // ext2/ext4 root partition of its own disk and `/` is that
+            // filesystem (`disk::sweep_medium`; the boot's own
+            // `MPOS_SWITCH_ROOT_OK: / is /dev/vda2 (ext4)` line is the same
+            // fact from the other side). A host's root is whatever the
+            // machine was installed on, so the host escape names that third
+            // case.
+            const EXPECTED_ROOT_MAGIC: u64 = if cfg!(target_arch = "x86_64") {
+                RAMFS_MAGIC
+            } else {
+                EXT4_SUPER_MAGIC
+            };
             match statfs("/") {
                 Ok(root) => {
                     r.check("statfs on the root succeeds", true);
                     r.check(
-                        "the root filesystem reports the ramfs magic",
-                        host || magic_of(&root) == RAMFS_MAGIC,
+                        "the root filesystem reports the magic its boot mounted",
+                        host || magic_of(&root) == EXPECTED_ROOT_MAGIC,
                     );
                 }
                 Err(_) => {
                     r.check("statfs on the root succeeds", false);
-                    r.check("the root filesystem reports the ramfs magic", false);
+                    r.check(
+                        "the root filesystem reports the magic its boot mounted",
+                        false,
+                    );
                 }
             }
 

@@ -7,7 +7,7 @@
 //! its own and failure modes of its own, on hardware QEMU presents with a single
 //! `-device ich9-ahci`.
 //!
-//! What it is *not* is on any compositor's critical path - `PLAN.md` §7.3 is
+//! What it is *not* is on any compositor's critical path - `NOTES.md` §7.3 is
 //! explicit that this is the stretch item - and the scope says so: one
 //! controller, one port, `IDENTIFY`, `READ DMA EXT`, `WRITE DMA EXT` and
 //! `FLUSH CACHE EXT`. NCQ, ATAPI, port multipliers, hotplug and 28-bit LBA are
@@ -599,7 +599,7 @@ fn bring_up_controller(device: &crate::pci::Device) -> Option<Arc<dyn BlockDev>>
         return None;
     }
     // The BAR's registers, reached through the seam: which machine answers this
-    // and how is not this driver's question (`PLAN.md` §14.3).
+    // and how is not this driver's question (`NOTES.md` §14.3).
     let base = crate::hal::map_mmio_window(bar.base as usize, bar.size as usize)?;
 
     // Into AHCI mode, and reset, so every port starts from one known state

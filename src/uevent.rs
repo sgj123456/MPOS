@@ -656,7 +656,7 @@ pub const VIRTIO_BLK_MAJOR: u32 = 254;
 /// because it was written twice and the second copy was wrong: the second machine
 /// registered its own virtio disk with `/dev/vda` as its tree position, so a
 /// reader that followed `/sys/class/block/vda`, or matched on `DEVPATH`, was
-/// handed a path that is not a device path at all (`PLAN.md` §15.10).
+/// handed a path that is not a device path at all (`NOTES.md` §15.10).
 pub const VIRTIO_BLK_DEVPATH: &str = "/devices/virtio/block";
 
 /// Major used for SCSI and SATA disks, as Linux assigns it.
@@ -836,7 +836,7 @@ mod tests {
     /// the same disk with `254` written out and `/dev/vda` where this constant
     /// is, so `/sys/class/block/vda` followed a link into a tree position no
     /// device has and every event about the disk announced
-    /// `DEVPATH=/dev/vda/vda` (`PLAN.md` §15.10).
+    /// `DEVPATH=/dev/vda/vda` (`NOTES.md` §15.10).
     #[test]
     fn a_virtio_disk_is_numbered_and_filed_where_its_driver_says() {
         assert_eq!(VIRTIO_BLK_MAJOR, 254, "Linux's number for virtio-blk");

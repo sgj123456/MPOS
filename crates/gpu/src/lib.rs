@@ -6,7 +6,7 @@
 //!
 //! Its own crate as of Phase 11 Step E, for the reason every leaf there was
 //! split out: the body of the work is arithmetic over numbers a real card
-//! produced (`PLAN.md` §7.4), and everything that reads it is machine-only. A
+//! produced (`NOTES.md` §7.4), and everything that reads it is machine-only. A
 //! decision that can only be exercised by booting is a decision nobody checks
 //! - which is how a KMS driver came to advertise a property with no value and a
 //! sync object came to answer as "ready" for a fence that did not exist.
@@ -44,7 +44,7 @@ pub mod cursor;
 /// the one place a host test can reach it. The driver next to it is never
 /// compiled off the machine, and this is the family where the authorities
 /// disagree - the upstream sources read a sync object with no fence as already
-/// signaled and the real card refuses it (`PLAN.md` §7.4) - so the decisions are
+/// signaled and the real card refuses it (`NOTES.md` §7.4) - so the decisions are
 /// written down here with a test per rule instead of being buried in a `match`
 /// only a boot can exercise. It is also where the crate's one seam lives:
 /// [`sync::Waker`].

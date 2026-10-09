@@ -8,7 +8,7 @@
 //! from acquiring a dependency on a scheduler or a virtio ring. The waiter
 //! numbers are opaque here for the same reason ([`WaiterId`]): who to wake is
 //! the driver's business, which is why it hands the numbers to a caller that
-//! can name a task (`PLAN.md` §7.2, §11.1.3).
+//! can name a task (`NOTES.md` §7.2, §11.1.3).
 //!
 
 //! The input driver is bare metal: it needs a virtio ring, the PCI bus and the

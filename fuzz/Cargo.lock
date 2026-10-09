@@ -256,6 +256,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mpos-acpi"
+version = "0.1.0"
+
+[[package]]
 name = "mpos-ahci"
 version = "0.1.0"
 
@@ -316,6 +320,7 @@ dependencies = [
  "arbitrary",
  "libfuzzer-sys",
  "mpos",
+ "mpos-acpi",
 ]
 
 [[package]]

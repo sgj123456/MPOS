@@ -722,6 +722,22 @@ pub fn emit(inode: &Arc<dyn Inode>, mask: u32, name: &str) {
     emit_rec(key_of(inode), mask, name, 0, is_dir);
 }
 
+/// Report news about a *name inside* a watched directory: `IN_CREATE` and
+/// `IN_DELETE`, whose subject is the child rather than the directory holding
+/// the watch.
+///
+/// `child_is_dir` is the *child's* kind, and that is what `IN_ISDIR` means:
+/// the bit describes the subject of the event, so a file's `IN_DELETE` is a
+/// bare `IN_DELETE` even though the inode carrying the watch is a directory.
+/// Taking the kind from the watched directory instead - which is what
+/// [`emit`] does with the inode it is handed - makes every create and every
+/// delete inside a directory watch an `IN_ISDIR` event, and a reader that
+/// matches records on their mask (`inotifywait`, `t-inotify`'s six-event
+/// life) then loses the record without ever seeing the wrong bit.
+pub fn emit_child(dir: &Arc<dyn Inode>, mask: u32, name: &str, child_is_dir: bool) {
+    emit_rec(key_of(dir), mask, name, 0, child_is_dir);
+}
+
 /// Report a data change with the inode's own key already in hand - the
 /// `File::write` chokepoint has the inode, and taking its key is the whole
 /// cost.
@@ -797,7 +813,7 @@ pub fn close_last(file: &Arc<crate::vfs::file::File>) {
 }
 
 /// Batch form of [`close_last`] for process exit, registered as a hook with
-/// `sched::exit` rather than called by name from the teardown (`PLAN.md`
+/// `sched::exit` rather than called by name from the teardown (`NOTES.md`
 /// §11.1.3).
 ///
 /// The `owner` is the exiting thread group, and a watch is not owned by one, so

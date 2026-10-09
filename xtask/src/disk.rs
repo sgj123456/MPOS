@@ -67,7 +67,7 @@ pub fn build_disk(build_dir: &Path, _profile: &str, arch: Arch) -> Result<()> {
 /// the second machine reads it - the raw pattern image its block check verifies.
 ///
 /// The pattern belongs to the *boot*, not to the image: the check that reads it
-/// is the second machine's device probe (`check_blk`, `PLAN.md` §9.1), which
+/// is the second machine's device probe (`check_blk`, `NOTES.md` §9.1), which
 /// halts the machine when no block window carries the known sector, and the
 /// first machine has no such check. It is written here rather than by each
 /// caller because it is one 1 MiB file of a known content that both a sweep and
@@ -106,7 +106,7 @@ const BACKUP_ROOM: u64 = 2048;
 /// `rootfs.rs`'s `create_gpt`, which is handed a block device and runs under
 /// `sudo` because it mounts what it made; a sweep's medium does not have to pay
 /// for that, and this is the shape both machines' boot media take
-/// (`PLAN.md` §15.18).
+/// (`NOTES.md` §15.18).
 ///
 /// The partition *types* are `U` (EFI System) and `L` (Linux), the two `sfdisk`
 /// names, and the ESP is marked bootable - which is what makes a firmware that
@@ -496,7 +496,7 @@ fn digest(bytes: &[u8]) -> u64 {
 ///
 /// This program is an input too, and it is the one entry that is not something
 /// the image is made *of*: [`crate::fat`] writes the ESP's long filenames by
-/// hand and learned three of their rules the hard way (`PLAN.md` §15.18), and a
+/// hand and learned three of their rules the hard way (`NOTES.md` §15.18), and a
 /// change there changes the bytes on the disk while leaving every input above
 /// untouched.
 fn medium_is_stale(

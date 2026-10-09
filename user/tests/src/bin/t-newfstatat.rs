@@ -12,7 +12,7 @@
 //! # The fixture is this test's own file now
 //!
 //! The no-std version statted `/etc/motd`, and the second machine's payload has
-//! no motd (`PLAN.md` §15.11, measured with `debugfs`), so this test writes its
+//! no motd (`NOTES.md` §15.11, measured with `debugfs`), so this test writes its
 //! own file under `/tmp`. `/bin` and `/bin/sh` stay: they are the directory and
 //! the program both payloads carry - measured, on the second machine's staging
 //! tree, as a flat `/bin` of six regular files and a 479176-byte static ELF.
@@ -48,7 +48,7 @@
 //! on both, and the absolute-path behaviour is a divergence of this kernel's -
 //! the same thing would happen through `openat`, `unlinkat` and the rest of the
 //! family, because one `base_of` resolves the dirfd for all of them - named in
-//! `PLAN.md` §15.17 rather than pinned here. Fixing it is not this batch's: it
+//! `NOTES.md` §15.17 rather than pinned here. Fixing it is not this batch's: it
 //! is twenty call sites and every one of them would need its own answer.
 
 use mpos_user_tests::Report;
@@ -191,7 +191,7 @@ fn main() {
     // measured, `newfstatat(77, "/tmp", ..)` answers 0 with errno 0 - so an
     // absolute path would make this claim about the path and not about the
     // dirfd. This kernel answers EBADF either way, which is a divergence of its
-    // own, named in `PLAN.md` §15.17 rather than pinned here.
+    // own, named in `NOTES.md` §15.17 rather than pinned here.
     // SAFETY: a descriptor number nothing is open on - the kernel answers EBADF,
     // which is the claim.
     let missing = unsafe { BorrowedFd::borrow_raw(BAD_DIRFD) };

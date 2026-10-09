@@ -6,7 +6,7 @@
 //! filesystem fact. `vfs` owns `/dev/tty*` and `/dev/pts/*` as nodes, and the
 //! line discipline as their behaviour; how a cell is painted, which of the six
 //! virtual consoles is active and what a keystroke means are not the VFS's
-//! business (`PLAN.md` §11.1.4). Living here makes the boundary a compile error
+//! business (`NOTES.md` §11.1.4). Living here makes the boundary a compile error
 //! rather than a convention, too: this crate cannot name the kernel, so
 //! `console`, `drivers/video` and `vfs::tty` come *here* for a grid instead of
 //! each reaching into whichever module happened to hold one.

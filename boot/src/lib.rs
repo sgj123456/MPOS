@@ -41,7 +41,7 @@
 //! wire, the page-table descriptor, and the last instruction - and none of them
 //! is in this crate. They are `mpos_arch::early`, one arm per machine and
 //! nothing in between; this file names no architecture, and what it knows of the
-//! machine it learns from three constants and a boolean. `PLAN.md` §14.6 is the
+//! machine it learns from three constants and a boolean. `NOTES.md` §14.6 is the
 //! move that put them there, and `arch/src/early/mod.rs` argues why they are a
 //! tree of their own rather than part of the kernel's machine layer.
 //!
@@ -202,7 +202,7 @@ const EMPTY_HANDOFF: Handoff = Handoff {
 /// progress line to the jump that never returns.
 ///
 /// This is a library function rather than the `#[entry]` itself so that the
-/// sequence can be named - and, as `PLAN.md` §14.7 schedules, later *called* -
+/// sequence can be named - and, as `NOTES.md` §14.7 schedules, later *called* -
 /// from a binary this crate does not own. `src/main.rs` is the `#[entry]` that
 /// currently calls it; the shape is what makes "the loader is a crate" true
 /// rather than "the loader is a program that happens to have one function".

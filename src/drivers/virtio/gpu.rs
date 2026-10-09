@@ -286,6 +286,8 @@ impl VirtioGpuDev {
             *GLOBAL.borrow(cs).borrow_mut() = Some(dev.clone());
         });
 
+        crate::drivers::devices::publish("virtio-gpu", publish_nodes);
+
         Some((dev, device))
     }
 }
@@ -334,10 +336,10 @@ static GLOBAL: Mutex<RefCell<Option<Arc<VirtioGpuDev>>>> = Mutex::new(RefCell::n
 /// The card's home is this function, and that is *declared* here rather than
 /// inferred by `sysfs` from the class code, which would also match the
 /// firmware's own display adapter on a q35 machine and hang the DRM nodes off
-/// the wrong function (`PLAN.md` §7.4). A machine with no PCI bus has no
+/// the wrong function (`NOTES.md` §7.4). A machine with no PCI bus has no
 /// function to declare, so it has no `/sys/class/drm` card - a named gap, and
 /// not a claim about the card: the device is the same one over its own
-/// transport (`PLAN.md` §13.26).
+/// transport (`NOTES.md` §13.26).
 #[cfg(target_arch = "x86_64")]
 pub fn init_global() -> Option<(Arc<VirtioGpuDev>, Gpu<PciTransport>)> {
     let config = super::hal::device_config(DEVICE_GPU);
@@ -347,6 +349,19 @@ pub fn init_global() -> Option<(Arc<VirtioGpuDev>, Gpu<PciTransport>)> {
 }
 
 /// The card, if the machine has one.
+/// Publish `/dev/fb0` for a device set built after this driver came up -
+/// registered by [`VirtioGpuDev::install`], not named by
+/// `devices::standard_devfs`.
+///
+/// The node has more than a stream face (`mmap` of the pixels, the `FBIOGET_*`
+/// ioctls), so it is registered as the inode it is, through the door the tty
+/// uses for the same reason.
+fn publish_nodes(dev: &crate::vfs::devfs::DevFs) {
+    if let Some(gpu) = global() {
+        dev.register_node("fb0", Arc::new(FbDev::new(gpu)));
+    }
+}
+
 pub fn global() -> Option<Arc<VirtioGpuDev>> {
     critical_section::with(|cs| GLOBAL.borrow(cs).borrow().clone())
 }

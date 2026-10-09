@@ -217,7 +217,7 @@ fn main() {
     // second machine faulted the process at `pc 0` inside the call. That was not
     // the tree walk: this machine's `struct stat` is 128 bytes and the kernel
     // was filling 144, so the extra bytes landed in a frame musl's `fdopendir`
-    // needed - fixed and pinned in `PLAN.md` §13.10, with `t-stat-buffer` for
+    // needed - fixed and pinned in `NOTES.md` §13.10, with `t-stat-buffer` for
     // the length and `t-rmtree` for the recursive removal.
     if let Ok(entries) = std::fs::read_dir(lsdir) {
         for entry in entries.flatten() {

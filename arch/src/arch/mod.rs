@@ -9,7 +9,7 @@
 //! the register-file table the M1 check asserts against the ABI's. Everything
 //! else the kernel does with the machine goes through `crate::hal`, and
 //! `cargo xtask depgraph` fails on any module but `arch`/`hal`/`main`/`lib`
-//! naming this one (`PLAN.md` §11.4).
+//! naming this one (`NOTES.md` §11.4).
 //!
 //! Keeping the facade this small is the point: a new caller cannot reach
 //! `arch::aarch64::pl011` by accident, because it is not public. That is
@@ -18,7 +18,7 @@
 //!
 //! # Two machines, one facade
 //!
-//! The port (`PLAN.md` §9.1) adds a body rather than a branch: `arch/aarch64/`
+//! The port (`NOTES.md` §9.1) adds a body rather than a branch: `arch/aarch64/`
 //! is to aarch64 what `arch/x86_64/` is to x86_64, and the `#[cfg]`s here are
 //! the *seam* - which of the two bodies exists for this build - not the machine
 //! code itself. Every item is gated to the architecture whose module defines
@@ -27,7 +27,7 @@
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_64;
 
-/// The aarch64 machine body. Stages 1a-1e of `PLAN.md` §9.1 land in here:
+/// The aarch64 machine body. Stages 1a-1e of `NOTES.md` §9.1 land in here:
 /// PL011 and the entry first, then the exception vectors and GIC, then the
 /// page tables and the loader's arm.
 #[cfg(target_arch = "aarch64")]

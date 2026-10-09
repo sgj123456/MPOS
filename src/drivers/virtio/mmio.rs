@@ -54,7 +54,8 @@ use super::hal::HalImpl;
 use super::sound::{Probe, install_probed};
 use super::vsock::VirtioVsock;
 use super::{
-    ConsolePort, InputDevice, NetDevice, P9Device, SoundCard, VirtioInputDev, VsockDevice,
+    ConsolePort, EntropySource, InputDevice, NetDevice, P9Device, SoundCard, VirtioInputDev,
+    VsockDevice,
 };
 
 /// The virtio-blk reached over MMIO, shaped as a [`BlockDev`] so the filesystem
@@ -101,7 +102,7 @@ impl BlockDev for MmioBlk {
 
 /// Open the virtio-blk window at `virt` as a [`BlockDev`], or `None` if it is not
 /// a block device. The boot hands this to `Ext4Fs::mount` so a filesystem reads
-/// through the memory-mapped transport end to end (`PLAN.md` §9.1's disk root).
+/// through the memory-mapped transport end to end (`NOTES.md` §9.1's disk root).
 pub fn blockdev(virt: usize, size: usize) -> Option<Arc<dyn BlockDev>> {
     // SAFETY: `virt` is inside the mapped, non-executable device window and `size`
     // is the tree-reported register block; the window outlives the handle.
@@ -269,7 +270,7 @@ pub fn net_device() -> Option<Arc<dyn NetDevice>> {
 /// block: everything from here up is the *device's* config, and below it is the
 /// transport's. One constant, because a virtio-mmio window is one register
 /// block - where PCI has to walk a function's capabilities to find the same
-/// space (`PLAN.md` §13.26).
+/// space (`NOTES.md` §13.26).
 const DEVICE_CONFIG_OFFSET: usize = 0x100;
 
 /// Open the memory-mapped transport at `virt` (spanning `size`) as this
@@ -302,7 +303,7 @@ pub fn gpu_device(
 /// The same crate driver the first machine opens on its PCI bus, brought up
 /// through the same `VirtioSnd::new`: the stream listing, the rate intersection,
 /// the format check, the initial `SET_PARAMS`/`prepare`/`start` and the whole OSS
-/// face above them are one copy (`PLAN.md` §13.27). `Probe::Absent` is a window
+/// face above them are one copy (`NOTES.md` §13.27). `Probe::Absent` is a window
 /// that is not a sound card at all, which is a quieter boot rather than a failed
 /// one; the caller gets `None` for both and no line.
 pub fn sound_device(virt: usize, size: usize) -> Option<Arc<dyn SoundCard>> {
@@ -324,7 +325,7 @@ pub fn sound_device(virt: usize, size: usize) -> Option<Arc<dyn SoundCard>> {
 /// machine's `/dev/hvc0`: the devfs builder publishes it, the stream face reads
 /// and writes through it. This is the same `VirtIOConsole` the first machine
 /// opens on its PCI bus - only the transport underneath differs, which is the
-/// whole of what this function adds (`PLAN.md` §13.25).
+/// whole of what this function adds (`NOTES.md` §13.25).
 ///
 /// `None` is an honest refusal: a block the crate will not accept as a
 /// transport, or a transport that is not a console device. A machine whose
@@ -350,7 +351,7 @@ pub fn console_device(virt: usize, size: usize) -> Option<Arc<dyn ConsolePort>> 
 /// the pump that keeps its events moving is the shared one. This is the same
 /// `VirtIOSocket` the first machine probes on its PCI bus and wraps in the same
 /// [`VirtioVsock`] - only the transport underneath differs, which is the whole of
-/// what this function adds (`PLAN.md` §13.28).
+/// what this function adds (`NOTES.md` §13.28).
 ///
 /// `None` is an honest refusal - a block the crate will not accept as a
 /// transport, or a transport that is not a socket device - and a machine with no
@@ -373,7 +374,7 @@ pub fn vsock_device(virt: usize, size: usize) -> Option<Arc<dyn VsockDevice>> {
 /// The device is *handed over*, not probed: the caller gives it to
 /// `fs9p::install`, and from there it is a host share the mount table and
 /// `mount -t 9p` can name - the fid table, the `Twalk`/`Tread` encoding and the
-/// `Inode` mapping above it are `src/vfs/p9.rs`'s one copy (`PLAN.md` §13.29).
+/// `Inode` mapping above it are `src/vfs/p9.rs`'s one copy (`NOTES.md` §13.29).
 /// This is the same `VirtIO9p` the first machine probes on its PCI bus and wraps
 /// in the same [`Virtio9p`], only the transport underneath differing.
 ///
@@ -403,7 +404,7 @@ pub fn p9_device(virt: usize, size: usize) -> Option<Arc<dyn P9Device>> {
 /// drop it - still happens, but as `register`'s first act, because
 /// `register` cannot build a node without the capability picture that read
 /// produces. What was a proof that the transport reaches the class is now the
-/// class itself (`PLAN.md` §15.2).
+/// class itself (`NOTES.md` §15.2).
 ///
 /// `None` is an honest refusal - a block the crate will not accept as a
 /// transport, or a transport that is not an input device - and a machine whose
@@ -494,75 +495,26 @@ pub fn write_readback(virt: usize, size: usize, start: usize, data: &[u8]) -> Op
     (out == data).then_some(())
 }
 
-/// The virtio-rng, reached over MMIO instead of a BAR.
+/// Open the virtio-rng whose register block is mapped at kernel-virtual
+/// address `virt` and spans `size` bytes, install it as the machine's entropy
+/// source, and return it. `None` if the window does not open as one - a block
+/// the crate will not accept as a transport, or a transport that is not an
+/// entropy device - which leaves [`super::rng::entropy`] answering `None` too,
+/// and `seed` treats that as a machine with no hardware source: the honest
+/// skip, not a failure.
 ///
-/// A request needs the crate's `&mut`, so the device sits behind the usual
-/// kernel lock; the entropy stream is shared with every reader (`crate::rand`'s
-/// seed today, `/dev/hwrng` once the aarch64 devfs lands).
-pub struct MmioRng {
-    device: Mutex<RefCell<VirtIORng<HalImpl, MmioTransport<'static>>>>,
-}
-
-impl MmioRng {
-    /// Open the entropy device whose register block is mapped at kernel-virtual
-    /// address `virt` and spans `size` bytes.
-    ///
-    /// `virt` is what the caller got from the MMIO-mapping capability for a
-    /// `virtio,mmio` window the tree reported; `size` is that window's register
-    /// block. `None` is an honest refusal - a block the crate will not accept as
-    /// a transport, or a transport that is not an entropy device.
-    fn open(virt: usize, size: usize) -> Option<Self> {
-        // SAFETY: `virt` is an address inside the fixed device window the boot
-        // mapped whole as Device-nGnRnE and never executable (`device_virt` only
-        // answers for a range wholly inside it), `size` is the register block the
-        // tree reports, and the header is volatile device memory the transport
-        // reads. The `'static` is the machine's promise, not a borrow: the window
-        // outlives every use of this handle.
-        let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
-        let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
-        let device = VirtIORng::<HalImpl, _>::new(transport).ok()?;
-        Some(MmioRng {
-            device: Mutex::new(RefCell::new(device)),
-        })
-    }
-
-    /// Fill `out` with bytes the host generated, answering how many landed - the
-    /// whole buffer for a healthy device, fewer or none for a quiet one.
-    pub fn fill(&self, out: &mut [u8]) -> usize {
-        critical_section::with(|cs| {
-            let mut device = self.device.borrow(cs).borrow_mut();
-            device.request_entropy(out).unwrap_or(0)
-        })
-    }
-}
-
-/// The device the boot found, if it found one. Set once by [`init_global`]; read
-/// by the random seed (and, once the aarch64 devfs exists, `/dev/hwrng`).
-static GLOBAL: Mutex<RefCell<Option<Arc<MmioRng>>>> = Mutex::new(RefCell::new(None));
-
-/// Install the entropy device at the mapped window `[virt, virt + size)` as the
-/// machine's random source, and return it. `None` if the window does not open as
-/// a virtio-rng; a `None` leaves [`entropy`] answering `None` too, which `seed`
-/// treats as a machine with no hardware source - the honest skip, not a failure.
-pub fn init_global(virt: usize, size: usize) -> Option<Arc<MmioRng>> {
-    let dev = Arc::new(MmioRng::open(virt, size)?);
-    critical_section::with(|cs| {
-        *GLOBAL.borrow(cs).borrow_mut() = Some(dev.clone());
-    });
-    Some(dev)
-}
-
-/// The device, if the machine has one.
-pub fn global() -> Option<Arc<MmioRng>> {
-    critical_section::with(|cs| GLOBAL.borrow(cs).borrow().clone())
-}
-
-/// Thirty-two bytes of hardware entropy, or `None` on a machine without the
-/// device - the seed mixer treats the absence exactly as a refusal. A short
-/// answer is `None` too: a seed half-filled with the machine's own bytes is what
-/// the clock mix beside it already covers.
-pub fn entropy() -> Option<[u8; 32]> {
-    let dev = global()?;
-    let mut bytes = [0u8; 32];
-    (dev.fill(&mut bytes) == bytes.len()).then_some(bytes)
+/// The same `VirtioRng<T>` the first machine builds over its PCI function;
+/// only the transport underneath differs, and the contract above it
+/// ([`super::EntropySource`]) is one copy (`NOTES.md` §15.2).
+pub fn rng_device(virt: usize, size: usize) -> Option<Arc<dyn EntropySource>> {
+    // SAFETY: `virt` is an address inside the fixed device window the boot
+    // mapped whole as Device-nGnRnE and never executable (`device_virt` only
+    // answers for a range wholly inside it), `size` is the register block the
+    // tree reports, and the header is volatile device memory the transport
+    // reads. The `'static` is the machine's promise, not a borrow: the window
+    // outlives every use of this handle.
+    let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
+    let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
+    let device = VirtIORng::<HalImpl, _>::new(transport).ok()?;
+    super::rng::install_probed(Some(device))
 }

@@ -9,7 +9,7 @@
 //! [`PageTaken`] and [`KernelSections`] are the vocabulary `hal::Paging` and
 //! `hal::AddressSpaceOps` are written in. The kernel owns what a mapping *is*
 //! and the machine owns how one is made, so once the machine layer is a crate of
-//! its own this vocabulary has to be below both of them (`PLAN.md` §14 S2b).
+//! its own this vocabulary has to be below both of them (`NOTES.md` §14 S2b).
 //! The page arithmetic goes with it rather than staying with the frame
 //! allocator: `PAGE_SIZE` is what makes a [`Mapping`] page-granular, and a
 //! caller cannot check one without it.

@@ -5,7 +5,7 @@
 //! console's output to the one serial wire and routes the wire's typed bytes back
 //! to it, with `^A 1`..`6` (or a session's `VT_ACTIVATE`) choosing which console
 //! that is. The nodes have always existed on both machines; the mux was x86_64's
-//! until `PLAN.md` §13.16, so on the second machine a getty on `tty1` printed into
+//! until `NOTES.md` §13.16, so on the second machine a getty on `tty1` printed into
 //! a pty nobody drained and the `'V'`/`'K'` ioctls answered `ENOTTY`.
 //!
 //! What this pins is that the family is *served* on both machines and that its
@@ -222,7 +222,7 @@ fn main() {
     );
 
     // VT_GETSTATE's `struct vt_stat { v_active, v_signal, v_state }`, and Linux
-    // writes exactly two of the three shorts (`PLAN.md` §13.18). `v_active` is the
+    // writes exactly two of the three shorts (`NOTES.md` §13.18). `v_active` is the
     // console on the screen (1-based); `v_state` is the bit mask of the consoles in
     // use, with bit 0 always set because "/dev/tty0 is always open"; and
     // `v_signal` - the SIGIO number a console promises to send when it loses the

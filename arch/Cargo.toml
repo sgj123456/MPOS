@@ -5,7 +5,7 @@
 # because a module boundary could not stop the machine layer reaching up into
 # the kernel while a crate boundary can: nothing below depends on `mpos`, so
 # `crate::sched` and `crate::mm` are names that do not exist here rather than
-# names a convention says not to use (`PLAN.md` §14).
+# names a convention says not to use (`NOTES.md` §14).
 #
 # **Not under `crates/`.** That directory is the *host-testable leaves* -
 # `xtask`'s `every_leaf_crate_is_tested` pins its contents against the list of
