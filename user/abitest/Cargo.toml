@@ -81,18 +81,6 @@ name = "t-fill-ramfs"
 path = "src/bin/integration/t-fill-ramfs.rs"
 
 [[bin]]
-name = "t-forkcost"
-path = "src/bin/integration/t-forkcost.rs"
-
-[[bin]]
-name = "t-netlat"
-path = "src/bin/integration/t-netlat.rs"
-
-[[bin]]
-name = "t-pipecost"
-path = "src/bin/integration/t-pipecost.rs"
-
-[[bin]]
 name = "t-prime"
 path = "src/bin/integration/t-prime.rs"
 
