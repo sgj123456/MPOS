@@ -7,7 +7,7 @@ use mpos::sched::{self, Priority};
 use mpos::syscall::{self, err, linux::nr as lnr};
 use mpos::vfs::{self, FileSystem, Inode, NodeKind};
 
-use super::sched::drain;
+use mpos::sched::kunit::drain;
 
 /// The kernel's checks were written against a root filesystem of their own
 /// making, where every name they wanted was free. Alpine's tree is not obliged

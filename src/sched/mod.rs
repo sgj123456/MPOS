@@ -13,6 +13,12 @@ pub mod signal;
 #[cfg(target_os = "none")]
 mod runtime;
 
+/// The scheduler's suite for a test build: its cases live beside the module they
+/// test, and the wiring layer's harness lists this `const` with the others
+/// (`docs/NOTES.md` §15.21). Nothing in a shipping kernel compiles it.
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub mod kunit;
+
 pub use policy::{ARGS_BYTES_MAX, ARGV_MAX, Priority, TaskId};
 #[cfg(target_os = "none")]
 pub use runtime::spawn_init;

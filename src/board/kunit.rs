@@ -36,19 +36,12 @@ use super::checks;
 /// assembled at link time would not give them.
 pub(crate) const SUITES: &[Suite] = &[
     mpos::mm::kunit::SUITE,
-    // The three families still checked from this layer. Each is one case whose
-    // body answers by panicking, and each moves into its own module next - `sched`
-    // to `mpos::sched::kunit`, `vfs` to `mpos::vfs::kunit`, and the syscall gate,
-    // the tty and the signal path to `mpos::syscall::kunit`, which is where the
-    // cross-subsystem half belongs (`docs/NOTES.md` §15.20).
-    Suite {
-        name: "sched",
-        phase: Phase::Scheduler,
-        cases: &[Case {
-            name: "tasks",
-            run: checks::case_sched,
-        }],
-    },
+    mpos::sched::kunit::SUITE,
+    // The two families still checked from this layer. Each is one case whose body
+    // answers by panicking, and each moves into its own module next - `vfs` to
+    // `mpos::vfs::kunit`, and the syscall gate with the tty and the signal path to
+    // `mpos::syscall::kunit`, which is where that cross-subsystem half belongs
+    // (`docs/NOTES.md` §15.20, §15.21).
     Suite {
         name: "vfs",
         phase: Phase::Vfs,

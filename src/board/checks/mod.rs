@@ -13,7 +13,6 @@
 //! device probes for its bus.
 
 pub(crate) mod ipc;
-pub(crate) mod sched;
 pub(crate) mod vfs;
 
 // ---------------------------------------------------------------------------
@@ -34,11 +33,6 @@ use super::report;
 /// panic ends the machine and hides every case after it (`src/board/kunit.rs`
 /// argues both halves). Until then a failing family still takes the boot down
 /// with the `assert!` that failed in the log, which is what it did before.
-pub(crate) fn case_sched(_info: &BootInfo) -> Result<(), String> {
-    sched::run();
-    Ok(())
-}
-
 pub(crate) fn case_vfs(_info: &BootInfo) -> Result<(), String> {
     vfs::run();
     Ok(())
