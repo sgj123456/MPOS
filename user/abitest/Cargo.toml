@@ -85,10 +85,6 @@ name = "t-forkcost"
 path = "src/bin/integration/t-forkcost.rs"
 
 [[bin]]
-name = "t-ioctl"
-path = "src/bin/integration/t-ioctl.rs"
-
-[[bin]]
 name = "t-netlat"
 path = "src/bin/integration/t-netlat.rs"
 
