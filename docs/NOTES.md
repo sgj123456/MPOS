@@ -3158,6 +3158,56 @@ item in this section.
 > after one command cannot be measured through, which is why the boot-time
 > instrument above exists.
 
+> **Update, measured against a real machine (2026-10-09): the `uevent` surface now
+> says what Linux says, and the DRM nodes carry the word their rules match on.**
+> The block above named the next measurement - the guest's udev database entry,
+> set beside Linux's - because "nothing in the device model changes until that dump
+> is in hand". It is still not in hand: reading it needs a boot of the *desktop*
+> rootfs, and this build directory has never held one (no Alpine root, no disk
+> image), so the run that would produce it is a full rootfs install plus a GL boot
+> rather than a measurement. What *was* in hand is the other half of that
+> comparison, and it does not need a guest at all: the accepting host's own card.
+>
+> Dumped side by side, `/sys/class/drm/*/uevent` and `/run/udev/data/c226:*` on a
+> working card say three things this tree did not:
+>
+> - **Every DRM *node* carries `DEVTYPE=drm_minor`** - `card1` and `renderD128`
+>   alike - and a connector directory carries `DEVTYPE=drm_connector`; the class's
+>   `card1-DP-1` and the like have no `MAJOR`/`MINOR`/`DEVNAME` at all, because
+>   they are not device nodes. This is the word the record already flagged as
+>   absent from our node's `uevent`, and it is the one udev's own rules key on:
+>   the host's database entry has `ID_PATH=pci-0000:65:00.0`, `ID_PATH_TAG`,
+>   `ID_FOR_SEAT=drm-pci-0000_65_00_0` and the tags `seat`, `master-of-seat` and
+>   `uaccess` on the **primary card**, `ID_PATH`/`ID_PATH_TAG` and no groups at
+>   all on the render node, and a `by-path` symlink beside the node. Only the
+>   primary gets a seat, which is worth knowing before wiring anything to the
+>   render node.
+> - **The `uevent` *file* is not the netlink message.** `ACTION`, `DEVPATH` and
+>   `SUBSYSTEM` are the message's prologue and appear in no `uevent` file on the
+>   machine: the card's is four lines (`MAJOR`, `MINOR`, `DEVNAME`,
+>   `DEVTYPE`), a PCI function's is its six `DRIVER`/`PCI_*` keys, an input node's
+>   is `MAJOR`/`MINOR`/`DEVNAME` with no `DEVTYPE` at all. Ours printed exactly the
+>   three words Linux keeps for the wire, and dropped `Event::extra` - so
+>   `DEVTYPE` could not have appeared in it however the node were built.
+> - **A device with no node announces no node number.** Our message carried
+>   `MAJOR=0 MINOR=0` for a PCI function, which is not a missing answer but an
+>   answer: it is the `DEVNAME` mistake, in the other two keys.
+>
+> Built: the file is now the device number plus the subsystem's own keys (the
+> extras the message already had), the DRM nodes carry `DEVTYPE=drm_minor`, and
+> the block nodes carry `DEVTYPE=disk`/`partition` - which this builder already
+> knew as `entry.whole`, and which the host's block nodes all have, beside a
+> `DISKSEQ` this card has no source for and so does not invent. Pinned by three
+> host tests, one per bullet, the first asserting the card's file *key for key*
+> rather than by substring.
+>
+> **What this does not claim.** Whether it is enough for Mesa is *not* measured:
+> the gate boots an initramfs, so what it proves is that nothing moved, and the
+> `eglinfo` run is still the bar this section has been unable to clear. What is
+> now true is narrower and worth having: the inputs the working card's udev rules
+> match on are present, where before the card was a DRM node that no seat rule
+> could match at all.
+
 > **Update, landed: the two dumb-buffer divergences are closed lazily.** The table
 > below measured three answers this card gave that Linux's does not, and two of them
 > had one fix: `RESOURCE_INFO`'s `res_handle` was 0 for a plain dumb buffer where

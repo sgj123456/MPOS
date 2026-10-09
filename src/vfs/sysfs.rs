@@ -281,16 +281,32 @@ impl Inode for SysEventAttr {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        // The keys a listener reads, in the spelling Linux prints them.
-        let content = alloc::format!(
-            "ACTION={}\nDEVPATH={}\nSUBSYSTEM={}\nDEVNAME={}\nMAJOR={}\nMINOR={}\n",
-            self.event.action,
-            self.event.devpath,
-            self.event.subsystem,
-            self.event.devname,
-            self.event.major,
-            self.event.minor,
-        );
+        // What Linux prints in this file - which is **not** what it broadcasts.
+        // The netlink message carries `ACTION`/`DEVPATH`/`SUBSYSTEM` as its
+        // prologue and the `uevent` file carries them nowhere: a real file is the
+        // device number, its name under `/dev`, and the keys the device's own
+        // subsystem adds. Measured on this host rather than read off a source:
+        // `/sys/class/drm/card1/uevent` is four lines ending
+        // `DEVTYPE=drm_minor`, a PCI function's is its six `PCI_*` keys, and an
+        // input node's is `MAJOR`/`MINOR`/`DEVNAME` with no `DEVTYPE` at all - so
+        // which keys a node has is the subsystem's business, and the only thing
+        // this attribute decides is the shape. This file used to print the three
+        // broadcast words and drop [`Event::extra`] entirely, which is the shape
+        // backwards: the words were the ones Linux never puts here, and the
+        // dropped ones - `DEVTYPE` among them - are what the udev rules that give
+        // a card its seat and its `by-path` link match on.
+        let mut content = alloc::string::String::new();
+        if !self.event.devname.is_empty() {
+            content.push_str(&alloc::format!(
+                "MAJOR={}\nMINOR={}\nDEVNAME={}\n",
+                self.event.major,
+                self.event.minor,
+                self.event.devname,
+            ));
+        }
+        for &(name, value) in self.event.extra {
+            content.push_str(&alloc::format!("{}={}\n", name, value));
+        }
         let bytes = content.as_bytes();
         let start = (offset as usize).min(bytes.len());
         let n = buf.len().min(bytes.len() - start);
@@ -554,7 +570,18 @@ fn build_block(
                     devname: name.clone(),
                     major: entry.major,
                     minor: entry.minor,
-                    extra: &[],
+                    // `DEVTYPE=disk` for the whole disk and `partition` for
+                    // what lives inside it - the distinction this loop already
+                    // carries as `entry.whole`, and the word udev's own rules
+                    // key the two apart by (measured on this host: every
+                    // `/sys/class/block/*/uevent` here has one or the other,
+                    // beside a `DISKSEQ` this card has no source for and so does
+                    // not invent).
+                    extra: if entry.whole {
+                        &[("DEVTYPE", "disk")]
+                    } else {
+                        &[("DEVTYPE", "partition")]
+                    },
                 },
             }),
         );
@@ -931,7 +958,17 @@ fn build_drm(
                         devname: String::from(devnode),
                         major: 226,
                         minor,
-                        extra: &[],
+                        // `DEVTYPE=drm_minor`, which every DRM *node* carries and
+                        // a connector does not (measured: `card1`, `renderD128`
+                        // and every connector on this host, each with the value
+                        // its kind has). It is not decoration either - the udev
+                        // rules that hand a card its seat and its `by-path` link
+                        // match on the subsystem *and* this word, so a node
+                        // without it is a card nothing assigns to a seat. That is
+                        // the shape §7.4's chain of measurements was walking
+                        // towards: libdrm could not describe the card, and what
+                        // udev was told about it is the layer underneath.
+                        extra: &[("DEVTYPE", "drm_minor")],
                     },
                 }),
             );
@@ -1495,6 +1532,78 @@ mod tests {
         // An action the kernel does not speak is refused, and nothing goes out.
         assert!(uevent.write_at(0, b"frobnicate").is_err());
         assert!(!crate::uevent::ready(watcher));
+        crate::uevent::close(watcher);
+    }
+
+    /// A DRM node's `uevent` **file** says what Linux's says - key for key, and
+    /// this is the file rather than the message. `ACTION`, `DEVPATH` and
+    /// `SUBSYSTEM` are the netlink prologue and appear in no `uevent` file on a
+    /// real machine; measured on this host, `/sys/class/drm/card1/uevent` is
+    /// `MAJOR`, `MINOR`, `DEVNAME` and `DEVTYPE=drm_minor` - four lines - while a
+    /// PCI function's is its six `PCI_*` keys. The subsystem decides which keys a
+    /// node has; what this attribute used to decide was the shape, and it had it
+    /// backwards: the three words Linux never puts here were printed and
+    /// `Event::extra` was dropped.
+    #[test]
+    fn a_drm_nodes_uevent_file_is_what_linux_prints_and_not_what_it_broadcasts() {
+        let fs = fs();
+        assert_eq!(
+            at(&fs, "/sys/class/drm/card0/uevent"),
+            "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n"
+        );
+        // The render node is a node of the same kind and says so the same way.
+        assert_eq!(
+            at(&fs, "/sys/class/drm/renderD128/uevent"),
+            "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n"
+        );
+        // And the three words that must *not* be here.
+        let text = at(&fs, "/sys/class/drm/card0/uevent");
+        for word in ["ACTION=", "DEVPATH=", "SUBSYSTEM="] {
+            assert!(!text.contains(word), "{word} is netlink-only: {text}");
+        }
+    }
+
+    /// `DEVTYPE` is the half of that file that matters beyond its shape: it is
+    /// what the udev rules giving a card its seat and its `by-path` link match
+    /// on. The block half is the same word with the tree's own answer, which this
+    /// builder already carries as `entry.whole`.
+    #[test]
+    fn a_nodes_uevent_file_carries_the_devtype_its_subsystem_has() {
+        let fs = fs();
+        let disk = at(&fs, "/sys/class/block/vda/uevent");
+        assert!(disk.ends_with("DEVTYPE=disk\n"), "{disk}");
+        let part = at(&fs, "/sys/class/block/vda/vda1/uevent");
+        assert!(part.ends_with("DEVTYPE=partition\n"), "{part}");
+        // No assertion for the third kind, and the reason is worth the line: an
+        // input node on the measured host carries `MAJOR`/`MINOR`/`DEVNAME` and
+        // **no** `DEVTYPE` at all, so this key is the subsystem's business rather
+        // than one every node grows - which is why it comes from `Event::extra`
+        // and a node that adds none cannot acquire one.
+    }
+
+    /// A device with no `/dev` node has no device number to announce either, and
+    /// `MAJOR=0 MINOR=0` is not a missing answer: it is a listener creating
+    /// something at a number that is nobody's - the same mistake the PCI test
+    /// above refuses for an empty `DEVNAME`, in the other two keys.
+    #[test]
+    fn an_event_for_a_device_without_a_node_claims_no_node_number() {
+        let _bus = crate::uevent::test_bus::take();
+        let fs = pci_fs();
+        let watcher = crate::uevent::open();
+        crate::uevent::bind(watcher, 0, 1, 0).expect("a fresh socket binds");
+        let uevent = resolve(&fs, "/sys/bus/pci/devices/0000:00:03.0/uevent");
+        assert_eq!(uevent.write_at(0, b"add").unwrap(), 3);
+
+        let event = crate::uevent::recv(watcher)
+            .expect("the re-announcement")
+            .bytes;
+        let text = String::from_utf8(event.to_vec()).unwrap();
+        for key in ["DEVNAME=", "MAJOR=", "MINOR="] {
+            assert!(!text.contains(key), "{key} on a node-less device: {text}");
+        }
+        // And the shape it *does* have is the broadcast's own.
+        assert!(text.contains("ACTION=add"), "{text}");
+        assert!(text.contains("SUBSYSTEM=pci"), "{text}");
         crate::uevent::close(watcher);
     }
 

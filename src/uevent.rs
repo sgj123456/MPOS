@@ -139,11 +139,18 @@ impl Event {
         key("ACTION", self.action);
         key("DEVPATH", &self.devpath);
         key("SUBSYSTEM", self.subsystem);
+        // The three fields that describe a *device node*, and only when there is
+        // one. A PCI function has none, and Linux omits all three for it (measured
+        // on this host: `/sys/bus/pci/devices/0000:65:00.0/uevent` is its six
+        // `DRIVER`/`PCI_*` keys and nothing else). `MAJOR=0 MINOR=0` is not a
+        // missing answer, it is an answer: a listener that takes it for a node
+        // number creates something at a number that is nobody's - the same
+        // mistake the PCI test below refuses for an empty `DEVNAME`.
         if !self.devname.is_empty() {
             key("DEVNAME", &self.devname);
+            key("MAJOR", &alloc::format!("{}", self.major));
+            key("MINOR", &alloc::format!("{}", self.minor));
         }
-        key("MAJOR", &alloc::format!("{}", self.major));
-        key("MINOR", &alloc::format!("{}", self.minor));
         // The subsystem's own words, before the sequence number: Linux appends
         // its extras in the same place, and `SEQNUM` is last there too.
         for &(name, value) in self.extra {
