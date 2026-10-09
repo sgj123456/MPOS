@@ -307,7 +307,6 @@ fn reaping(_info: &crate::boot::BootInfo) -> Result<(), String> {
         permanent_tasks()
     );
     println!("every task reaped");
-    println!("M4_OK");
     Ok(())
 }
 

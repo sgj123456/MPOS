@@ -35,7 +35,7 @@ use mpos::{arch, hal, println, sched};
 ///
 /// It goes through `println!` like every other boot line, and deliberately not
 /// through `arch::print_args`: by the time a body's `init` runs, the console
-/// service is up on both machines (`M4_CONSOLE_OK` is printed before it), so the
+/// service is up on both machines (the console came up before it), so the
 /// banner is a console line and not a wire write.
 pub fn banner(info: &BootInfo) {
     const MIB: usize = 1024 * 1024;

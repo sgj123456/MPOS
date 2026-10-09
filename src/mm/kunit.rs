@@ -51,8 +51,6 @@ const MIB: usize = 1024 * 1024;
 /// The buddy allocator: zones exist, a frame survives a write through the direct
 /// map, and a freed order-1 block is handed back as the same block.
 fn frames(info: &BootInfo) -> Result<(), String> {
-    println!("M0_OK");
-
     let stats = frame_stats();
     println!(
         "pmm: {} of {} frames free ({} MiB)",
@@ -209,7 +207,6 @@ fn heap(_info: &BootInfo) -> Result<(), String> {
         frames.total
     );
 
-    println!("M2_OK");
     Ok(())
 }
 

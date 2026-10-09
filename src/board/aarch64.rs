@@ -108,7 +108,7 @@ fn init(info: &BootInfo) -> ! {
     // The log sink, as the first act - the same call the first machine makes at
     // the same point, over the same subscriber (`src/logging.rs`, one copy now
     // that its gate no longer claims this machine has no console or clock). The
-    // console service is already up here - `milestone` printed `M4_CONSOLE_OK`
+    // console service is already up here - `milestone` put it up before this ran
     // before this ran - so a `tracing` line from anything below reaches the wire
     // instead of being dropped on a machine with no subscriber at all.
     mpos::logging::init();
@@ -144,7 +144,7 @@ fn init(info: &BootInfo) -> ! {
     // tree, which is still this ramfs until the script pivots).
     let Some(archive) = archive else {
         mpos::println!(
-            "M7_ROOT_FAILED: the boot carries no initramfs - this machine's root switch lives in its script"
+            "root: the boot carries no initramfs - this machine's root switch lives in its script"
         );
         hal::halt()
     };
@@ -179,7 +179,7 @@ fn init(info: &BootInfo) -> ! {
     // exists, and the mount is refused `NoEntry` (measured). What the payload
     // sees after this machine's root switch is a *second* mount of the same tag
     // made by the init script on the tree that becomes `/` - this mount is the
-    // kernel's own read of the share (`check_p9_dev`'s `M8_P9_OK` below) and,
+    // kernel's own read of the share (`check_p9_dev`'s read-back below) and,
     // on a boot that never switches, the payload's (`NOTES.md` §13.29).
     steps::mount_share();
     check_p9_dev();
@@ -190,9 +190,9 @@ fn init(info: &BootInfo) -> ! {
     // and the initramfs script promotes the same instance into `/` without
     // re-opening the device. What the kernel does *not* do any more is switch
     // `/`: that is the script's half of the flow both machines share (§15.6) -
-    // `M7_DISK_OK`/`M7_ROOT_OK` are no longer kernel markers, and the boot's
-    // verdict for the switched tree is the script's own `MPOS_SWITCH_ROOT_OK`
-    // line. The step itself is the shared `steps::mount_disk_root`, called
+    // the kernel prints no line of its own for the switched tree, and the boot's
+    // verdict for it is the script's own `MPOS_SWITCH_ROOT_OK` line. The step
+    // itself is the shared `steps::mount_disk_root`, called
     // exactly where x86_64's `init_blk` calls it; there is no machine-specific
     // wrapper left around it.
     // It comes second so the share above stays a child of the bootstrap root.
@@ -316,21 +316,24 @@ fn init(info: &BootInfo) -> ! {
     // real init.
     //
     // The spawn and this verdict's two lines happen with interrupts masked, and
-    // that window is what preemption cost: `M6_INIT_OK` used to be printed after
-    // the handoff with the words "it has not run yet" holding by themselves,
-    // because nothing could preempt the boot task on the way. The clock preempts
-    // now (`arch/aarch64/vectors.rs`), so a tick landing between the spawn and
-    // the print can let a short init run to completion - and pid 1 leaving the
-    // machine prints `INIT_EXITED` and halts it, so the marker the verdict polls
-    // for is never written. Measured: that is exactly what the sweep's boot did
-    // once `sched`'s suite and its preemption case landed. The lines go out through the
-    // machine's *polled* writer for the same reason the failure reports next door
-    // do: `println!`'s queue can park a writer, and parking with interrupts off
-    // is a deadlock.
+    // that window is what preemption cost: the second line used to be printed
+    // after the handoff, with the words "it has not run yet" holding by
+    // themselves because nothing could preempt the boot task on the way. The
+    // clock preempts now (`arch/aarch64/vectors.rs`), so a tick landing between
+    // the spawn and the print can let a short init run to completion - and pid 1
+    // leaving the machine prints `INIT_EXITED` and halts it, so the verdict the
+    // sweep polls for would never be written. Measured: that is exactly what the
+    // sweep's boot did once `sched`'s suite and its preemption case landed. The
+    // lines go out through the machine's *polled* writer for the same reason the
+    // failure reports next door do: `println!`'s queue can park a writer, and
+    // parking with interrupts off is a deadlock.
     let pid = critical_section::with(|_| {
         let pid = steps::hand_to_init();
         mpos::arch::print_args(format_args!("mpos: aarch64 machine handed to /init\n"));
-        mpos::arch::print_args(format_args!("M6_INIT_OK\n"));
+        mpos::arch::print_args(format_args!(
+            "mpos: init is pid {}, not yet dispatched\n",
+            pid.0
+        ));
         pid
     });
 
@@ -344,10 +347,11 @@ fn init(info: &BootInfo) -> ! {
     // machines give it the same way: a test boot's init runs to completion and
     // leaves (`INIT_EXITED` from the exit path is the terminal proof the verdict
     // polls), while a real boot's init forks and stays - so waiting for a child
-    // under it is the first machine's "the shell is up" signal, printed as its
-    // `M8_OK`. This is the one place where the test build's *behaviour* differs
-    // rather than merely carrying extra code, which is why it is a `#[cfg]` pair
-    // and not a check: no test can make a payload run to completion.
+    // under it is the first machine's "the shell is up" signal, and the line it
+    // prints is the same on both machines. This is the one place where the test
+    // build's *behaviour* differs rather than merely carrying extra code, which
+    // is why it is a `#[cfg]` pair and not a check: no test can make a payload
+    // run to completion.
     #[cfg(feature = "selftest")]
     while sched::is_running(pid) {
         sched::sleep_ticks(1);
@@ -357,7 +361,7 @@ fn init(info: &BootInfo) -> ! {
         while !sched::has_live_child(pid) {
             sched::sleep_ticks(1);
         }
-        mpos::println!("M8_OK");
+        mpos::println!("mpos: /init is up; a child is running under it");
     }
     report::park()
 }
@@ -512,7 +516,7 @@ fn check_virtio(info: &BootInfo) {
     /// `xtask boot-aarch64` polls for.
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M5_VIRTIO_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "virtio: {}", format_args!($($arg)*));
             hal::halt();
         }};
     }
@@ -605,7 +609,6 @@ fn check_virtio(info: &BootInfo) {
             "virtio: the first is at {address:#x}, device {device}, vendor {vendor:#x}"
         );
     }
-    let _ = writeln!(out, "M5_VIRTIO_OK");
 }
 
 /// Stage 7's first driven device: virtio-rng over the memory-mapped transport.
@@ -619,7 +622,7 @@ fn check_virtio(info: &BootInfo) {
 /// record: discovery is the machine layer's job, the driver's job is a register
 /// block it is given. Success is 32 host-generated bytes back; a window that is
 /// not an RNG, a device that answers short, or none at all is a named
-/// `M7_RNG_FAILED` - never a zeroed buffer reported as entropy.
+/// `virtio-rng:` failure - never a zeroed buffer reported as entropy.
 fn check_rng(info: &BootInfo) {
     use fmt::Write;
 
@@ -629,7 +632,7 @@ fn check_rng(info: &BootInfo) {
     /// polls for, as `check_virtio` does.
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M7_RNG_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "virtio-rng: {}", format_args!($($arg)*));
             hal::halt();
         }};
     }
@@ -697,7 +700,6 @@ fn check_rng(info: &BootInfo) {
         out,
         "virtio-rng over MMIO installed, returned 32 bytes (sum {sum})"
     );
-    let _ = writeln!(out, "M7_RNG_OK");
 }
 
 /// Every `virtio,mmio` window this machine maps whose `DeviceID` is `want`, as
@@ -751,7 +753,7 @@ fn check_blk(info: &BootInfo) {
     /// polls for.
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M7_BLK_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "virtio-blk: {}", format_args!($($arg)*));
             hal::halt();
         }};
     }
@@ -806,7 +808,6 @@ fn check_blk(info: &BootInfo) {
         fail!("the virtio-blk MMIO write path did not round-trip a sector");
     }
     let _ = writeln!(out, "virtio-blk over MMIO wrote and read back a sector");
-    let _ = writeln!(out, "M7_BLK_OK");
 }
 
 /// Stage 7's disk-root primitive: a filesystem mounted over the MMIO block.
@@ -818,7 +819,8 @@ fn check_blk(info: &BootInfo) {
 /// reads the superblock and group descriptors through the `BlockDev`, and only the
 /// image that is actually an ext4 mounts. A filesystem that mounts is the disk root
 /// the drivers stage names - reading a file through it and booting a root from it
-/// are the task-context follow-on (`NOTES.md` §9.1). `M7_FS_FAILED` if none mounts.
+/// are the task-context follow-on (`NOTES.md` §9.1). An `ext4:` failure if none
+/// mounts.
 fn check_fs(info: &BootInfo) {
     use fmt::Write;
 
@@ -826,7 +828,7 @@ fn check_fs(info: &BootInfo) {
 
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M7_FS_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "ext4: {}", format_args!($($arg)*));
             hal::halt();
         }};
     }
@@ -904,7 +906,6 @@ fn check_fs(info: &BootInfo) {
         out,
         "ext4 mounted over the MMIO virtio-blk device, read /hello (36 bytes)"
     );
-    let _ = writeln!(out, "M7_FS_OK");
 }
 
 /// Stage 8's net device: virtio-net over the memory-mapped transport, opened as
@@ -933,7 +934,7 @@ fn check_net(info: &BootInfo) {
 
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M8_NET_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "virtio-net: {}", format_args!($($arg)*));
             hal::halt();
         }};
     }
@@ -976,7 +977,6 @@ fn check_net(info: &BootInfo) {
         fail!("the virtio-net TX queue did not accept a frame over MMIO at {virt:#x}");
     }
     let _ = writeln!(out, "virtio-net TX virtqueue accepted a frame over MMIO");
-    let _ = writeln!(out, "M8_NET_OK");
 }
 
 /// The fourth MMIO device class: the aarch64 virtio transport reaches a
@@ -991,12 +991,12 @@ fn check_net(info: &BootInfo) {
 /// has had since §13.4 - reached here through the [`InputDevice`] contract
 /// rather than through a second copy of it (`NOTES.md` §15.2).
 ///
-/// The *marker* is deliberately not printed here. `M8_INPUT_OK` belongs to
+/// The *success line* is deliberately not printed here: it belongs to
 /// [`check_input_registry`], which reads the registry back through the mounted
 /// `/dev` - the pin this class carries - and this runs in `devices()`, before
-/// there is a `/dev` to read anything through. A window that will not open is
-/// still `M8_INPUT_FAILED` (a terminator) and stops the boot honestly, so the
-/// failure is reported at the point it happens rather than one stage later.
+/// there is a `/dev` to read anything through. A window that will not open still
+/// stops the boot honestly, so the failure is reported at the point it happens
+/// rather than one stage later.
 ///
 /// [`InputDevice`]: mpos::drivers::virtio::InputDevice
 fn check_input(info: &BootInfo) {
@@ -1006,7 +1006,7 @@ fn check_input(info: &BootInfo) {
 
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M8_INPUT_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "virtio-input: {}", format_args!($($arg)*));
             hal::halt();
         }};
     }
@@ -1054,9 +1054,9 @@ fn check_input(info: &BootInfo) {
 /// This finds the window by `DeviceID`, opens it and hands it to
 /// `sound::install_probed`, which is where the stream is brought up.
 ///
-/// The *marker* is [`check_sound_dev`]'s, which reads the node back through the
-/// mounted `/dev`; a card that is not there, or answers and will not play, is
-/// `M8_SOUND_FAILED` here.
+/// The *success line* is [`check_sound_dev`]'s, which reads the node back through
+/// the mounted `/dev`; a card that is not there, or answers and will not play, is
+/// a `virtio-sound:` failure here.
 ///
 /// [`SoundCard`]: mpos::drivers::virtio::SoundCard
 fn check_sound(info: &BootInfo) {
@@ -1066,7 +1066,7 @@ fn check_sound(info: &BootInfo) {
 
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M8_SOUND_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "virtio-sound: {}", format_args!($($arg)*));
             hal::halt();
         }};
     }
@@ -1112,25 +1112,25 @@ fn check_sound(info: &BootInfo) {
 /// a named gap in this class's coverage, not a claim that the ioctls work.
 fn check_sound_dev() {
     let Some(card) = mpos::drivers::virtio::sound::global() else {
-        mpos::println!("M8_SOUND_FAILED: no virtio-sound card was installed");
+        mpos::println!("virtio-sound: no card was installed");
         hal::halt()
     };
     if vfs::resolve("/dev/dsp").is_err() {
-        mpos::println!("M8_SOUND_FAILED: /dev/dsp does not resolve through the mounted /dev");
+        mpos::println!("virtio-sound: /dev/dsp does not resolve through the mounted /dev");
         hal::halt()
     }
     let burst = [0u8; 512];
     let took = mpos::drivers::virtio::SoundCard::play(&*card, &burst);
     if took != burst.len() {
         mpos::println!(
-            "M8_SOUND_FAILED: the stream took {took} of {} bytes of silence",
+            "virtio-sound: the stream took {took} of {} bytes of silence",
             burst.len()
         );
         hal::halt()
     }
     let (rate, channels) = mpos::drivers::virtio::SoundCard::format(&*card);
     mpos::println!(
-        "M8_SOUND_OK: /dev/dsp resolves, the MMIO card runs {rate} Hz / {channels} channels and took a {} byte burst",
+        "virtio-sound: /dev/dsp resolves, the MMIO card runs {rate} Hz / {channels} channels and took a {} byte burst",
         burst.len()
     );
 }
@@ -1146,7 +1146,7 @@ fn check_sound_dev() {
 /// failure - the family then answers `EAFNOSUPPORT`, which is exactly the refusal
 /// the first machine gives when its own PCI probe finds nothing. What is a
 /// failure is a window that *does* claim to be a vsock device and will not open,
-/// which is `M8_VSOCK_FAILED` and stops the boot honestly.
+/// which stops the boot honestly, naming the device.
 ///
 /// This finds the window by `DeviceID`, opens it and hands it to
 /// `net::vsock::init`, so from here `socket(AF_VSOCK)`, `listen`, `accept` and
@@ -1161,7 +1161,7 @@ fn check_vsock(info: &BootInfo) {
 
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M8_VSOCK_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "virtio-vsock: {}", format_args!($($arg)*));
             hal::halt();
         }};
     }
@@ -1194,7 +1194,7 @@ fn check_vsock(info: &BootInfo) {
         }
         let _ = writeln!(
             out,
-            "M8_VSOCK_OK: the MMIO virtio-vsock device is the AF_VSOCK family's wire (guest cid {cid})"
+            "virtio-vsock: the MMIO device is the AF_VSOCK family's wire (guest cid {cid})"
         );
         return;
     }
@@ -1212,11 +1212,11 @@ fn check_vsock(info: &BootInfo) {
 /// the shares are in the one registry `by_tag` and `mount_share` read - both
 /// machines' shares are the same registry, filled by whatever bus answered.
 ///
-/// The *marker* belongs to [`check_p9_dev`], which reads the mounted share back
-/// after the root switch; a window that will not open is `M8_P9_FAILED` here. A
-/// machine with no window is a line and not a failure: a share is the host's to
-/// offer, and a boot without one is a quieter boot rather than a broken one -
-/// the same shape the first machine prints.
+/// The *success line* belongs to [`check_p9_dev`], which reads the mounted share
+/// back after the root switch; a window that will not open is a `9p:` failure
+/// here. A machine with no window is a line and not a failure: a share is the
+/// host's to offer, and a boot without one is a quieter boot rather than a broken
+/// one - the same shape the first machine prints.
 ///
 /// [`P9Device`]: mpos::drivers::virtio::P9Device
 fn check_p9(info: &BootInfo) {
@@ -1226,7 +1226,7 @@ fn check_p9(info: &BootInfo) {
 
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M8_P9_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "9p: {}", format_args!($($arg)*));
             hal::halt();
         }};
     }
@@ -1285,20 +1285,20 @@ fn check_p9_dev() {
     let probe = match vfs::read_file("/mnt/share/mpos-9p-probe") {
         Ok(bytes) => bytes,
         Err(e) => {
-            mpos::println!("M8_P9_FAILED: /mnt/share/mpos-9p-probe did not read: {e:?}");
+            mpos::println!("9p: /mnt/share/mpos-9p-probe did not read: {e:?}");
             hal::halt()
         }
     };
     if probe != PROBE.as_bytes() {
         mpos::println!(
-            "M8_P9_FAILED: the share served {} bytes of mpos-9p-probe, not the {} the host laid",
+            "9p: the share served {} bytes of mpos-9p-probe, not the {} the host laid",
             probe.len(),
             PROBE.len()
         );
         hal::halt()
     }
     mpos::println!(
-        "M8_P9_OK: /mnt/share is the host share over MMIO, mpos-9p-probe read back ({} bytes)",
+        "9p: /mnt/share is the host share over MMIO, mpos-9p-probe read back ({} bytes)",
         probe.len()
     );
 }
@@ -1321,8 +1321,9 @@ fn check_p9_dev() {
 /// Installing before `check_dev` is also what puts `/dev/fb0` in the device set
 /// that call builds.
 ///
-/// The marker belongs to [`check_gpu_dev`], which reads the node back through
-/// the mounted `/dev`; a window that will not open is `M8_GPU_FAILED` here.
+/// The success line belongs to [`check_gpu_dev`], which reads the node back
+/// through the mounted `/dev`; a window that will not open is a `virtio-gpu:`
+/// failure here.
 fn check_gpu(info: &BootInfo) {
     use fmt::Write;
 
@@ -1330,7 +1331,7 @@ fn check_gpu(info: &BootInfo) {
 
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M8_GPU_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "virtio-gpu: {}", format_args!($($arg)*));
             hal::halt();
         }};
     }
@@ -1380,16 +1381,16 @@ fn check_gpu(info: &BootInfo) {
 /// say what that is.
 fn check_gpu_dev() {
     let Some(view) = mpos::drivers::virtio::gpu::global() else {
-        mpos::println!("M8_GPU_FAILED: no virtio-gpu card was installed");
+        mpos::println!("virtio-gpu: no card was installed");
         hal::halt()
     };
     let Ok(fb) = vfs::resolve("/dev/fb0") else {
-        mpos::println!("M8_GPU_FAILED: /dev/fb0 does not resolve through the mounted /dev");
+        mpos::println!("virtio-gpu: /dev/fb0 does not resolve through the mounted /dev");
         hal::halt()
     };
     if !mpos::drivers::video::render::running() {
         mpos::println!(
-            "M8_GPU_FAILED: the render task is not running, so a write to /dev/fb0 could never be flushed"
+            "virtio-gpu: the render task is not running, so a write to /dev/fb0 could never be flushed"
         );
         hal::halt()
     }
@@ -1397,7 +1398,7 @@ fn check_gpu_dev() {
     let frame = (width as usize) * (height as usize) * 4;
     if width == 0 || height == 0 || view.fb_len() < frame {
         mpos::println!(
-            "M8_GPU_FAILED: the card reports {width}x{height} in {} bytes, which cannot hold one frame",
+            "virtio-gpu: the card reports {width}x{height} in {} bytes, which cannot hold one frame",
             view.fb_len()
         );
         hal::halt()
@@ -1407,7 +1408,7 @@ fn check_gpu_dev() {
         Ok(n) if n == row.len() => {}
         other => {
             mpos::println!(
-                "M8_GPU_FAILED: reading one row of /dev/fb0 gave {other:?}, expected {} bytes",
+                "virtio-gpu: reading one row of /dev/fb0 gave {other:?}, expected {} bytes",
                 row.len()
             );
             hal::halt()
@@ -1420,15 +1421,15 @@ fn check_gpu_dev() {
     // `'d'` ioctl family - had no node to be reached by. Checking it here is
     // what makes that gate a fact rather than a compilation.
     let Ok(card) = vfs::resolve("/dev/dri/card0") else {
-        mpos::println!("M8_GPU_FAILED: /dev/dri/card0 does not resolve through the mounted /dev");
+        mpos::println!("virtio-gpu: /dev/dri/card0 does not resolve through the mounted /dev");
         hal::halt()
     };
     if card.rdev().is_none() {
-        mpos::println!("M8_GPU_FAILED: /dev/dri/card0 is not a device node");
+        mpos::println!("virtio-gpu: /dev/dri/card0 is not a device node");
         hal::halt()
     }
     mpos::println!(
-        "M8_GPU_OK: the MMIO virtio-gpu card drives /dev/fb0 at {width}x{height} ({} KiB), \
+        "virtio-gpu: /dev/fb0 is driven at {width}x{height} ({} KiB), \
          /dev/dri/card0 reaches it, and the render task owns it",
         view.fb_len() / 1024
     );
@@ -1447,11 +1448,11 @@ fn check_gpu_dev() {
 /// take; that claims nothing about a reader, because a socket nobody has
 /// connected to takes bytes the way a port with no reader does.
 ///
-/// The *marker* is deliberately not printed here. `M8_CONSOLE_OK` belongs to
+/// The *success line* is deliberately not printed here: it belongs to
 /// [`check_console_dev`], which resolves the node through the mounted `/dev` -
 /// and this runs in `devices()`, before there is a `/dev` to resolve anything
-/// through. A window that will not open is `M8_CONSOLE_FAILED` (a terminator)
-/// and stops the boot honestly, at the point it happens.
+/// through. A window that will not open stops the boot honestly, at the point it
+/// happens.
 fn check_console(info: &BootInfo) {
     use fmt::Write;
 
@@ -1459,7 +1460,7 @@ fn check_console(info: &BootInfo) {
 
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M8_CONSOLE_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "virtio-console: {}", format_args!($($arg)*));
             hal::halt();
         }};
     }
@@ -1511,16 +1512,16 @@ fn check_console(info: &BootInfo) {
 /// that would pass by accident.
 fn check_console_dev() {
     if mpos::drivers::virtio::console::global().is_none() {
-        mpos::println!("M8_CONSOLE_FAILED: no virtio-console port was installed");
+        mpos::println!("virtio-console: no virtio-console port was installed");
         hal::halt()
     }
     for path in ["/dev/hvc0", "/dev/hvc"] {
         if vfs::resolve(path).is_err() {
-            mpos::println!("M8_CONSOLE_FAILED: {path} does not resolve through the mounted /dev");
+            mpos::println!("virtio-console: {path} does not resolve through the mounted /dev");
             hal::halt()
         }
     }
-    mpos::println!("M8_CONSOLE_OK: the MMIO console port is installed, /dev/hvc0 resolves");
+    mpos::println!("virtio-console: the MMIO console port is installed, /dev/hvc0 resolves");
 }
 
 /// Stage 8-input's verdict: the registry [`check_input`] filled is the machine's
@@ -1543,13 +1544,11 @@ fn check_console_dev() {
 fn check_input_registry() {
     let nodes = mpos::drivers::virtio::input::nodes();
     if nodes.is_empty() {
-        mpos::println!("M8_INPUT_FAILED: the evdev registry holds no device");
+        mpos::println!("virtio-input: the evdev registry holds no device");
         hal::halt()
     }
     let Ok(event0) = vfs::resolve("/dev/input/event0") else {
-        mpos::println!(
-            "M8_INPUT_FAILED: /dev/input/event0 does not resolve through the mounted /dev"
-        );
+        mpos::println!("virtio-input: /dev/input/event0 does not resolve through the mounted /dev");
         hal::halt()
     };
     let want = (
@@ -1560,13 +1559,13 @@ fn check_input_registry() {
         Some(rdev) if rdev == want => {}
         other => {
             mpos::println!(
-                "M8_INPUT_FAILED: /dev/input/event0 reports {other:?}, expected evdev's {want:?}"
+                "virtio-input: /dev/input/event0 reports {other:?}, expected evdev's {want:?}"
             );
             hal::halt()
         }
     }
     mpos::println!(
-        "M8_INPUT_OK: the evdev registry holds {} device(s), /dev/input/event0 resolves as {want:?}",
+        "virtio-input: the evdev registry holds {} device(s), /dev/input/event0 resolves as {want:?}",
         nodes.len()
     );
 }
@@ -1599,7 +1598,7 @@ fn check_dev() {
     let vfs = mpos::vfs::global();
     let _ = vfs.root_inode().create("dev", mpos::vfs::NodeKind::Dir);
     if let Err(e) = vfs::mount("/dev", dev.clone()) {
-        mpos::println!("M7_DEV_FAILED: mounting devfs at /dev gave {e:?}");
+        mpos::println!("devfs: mounting at /dev gave {e:?}");
         hal::halt()
     }
 
@@ -1609,14 +1608,14 @@ fn check_dev() {
     // whole buffer (it neither blocks nor short-reads), so a 16-byte ask must
     // come back with 16 bytes.
     let Ok(urandom) = vfs::resolve("/dev/urandom") else {
-        mpos::println!("M7_DEV_FAILED: /dev/urandom does not resolve through the mount table");
+        mpos::println!("devfs: /dev/urandom does not resolve through the mount table");
         hal::halt()
     };
     let mut buf = [0u8; 16];
     match urandom.read_at(0, &mut buf) {
         Ok(n) if n == buf.len() => {}
         other => {
-            mpos::println!("M7_DEV_FAILED: reading /dev/urandom gave {other:?}, expected 16 bytes");
+            mpos::println!("devfs: reading /dev/urandom gave {other:?}, expected 16 bytes");
             hal::halt()
         }
     }
@@ -1625,14 +1624,18 @@ fn check_dev() {
     // with the whole buffer, so an 8-byte ask must come back with 8 host-generated
     // bytes. Both resolve and read through the mounted tree, not the devfs root.
     let Ok(hwrng) = vfs::resolve("/dev/hwrng") else {
-        mpos::println!("M7_DEV_FAILED: /dev/hwrng does not resolve through the mount table");
+        mpos::println!("devfs: /dev/hwrng does not resolve through the mount table");
         hal::halt()
     };
     let mut hbuf = [0u8; 8];
     match hwrng.read_at(0, &mut hbuf) {
-        Ok(n) if n == hbuf.len() => mpos::println!("M7_DEV_OK"),
+        Ok(n) if n == hbuf.len() => {
+            mpos::println!(
+                "devfs: /dev/urandom and /dev/hwrng resolve and read through the mounted tree"
+            )
+        }
         other => {
-            mpos::println!("M7_DEV_FAILED: reading /dev/hwrng gave {other:?}, expected 8 bytes");
+            mpos::println!("devfs: reading /dev/hwrng gave {other:?}, expected 8 bytes");
             hal::halt()
         }
     }
@@ -1665,7 +1668,6 @@ fn init_net() {
         return;
     };
     steps::bring_up_net(dev);
-    mpos::println!("M8_NET_STACK_OK");
 }
 
 /// The interrupt-driven console: the machine queues what it writes and the
@@ -1808,7 +1810,6 @@ fn milestone(info: &BootInfo) {
     // `println!` anywhere above the machine layer will use.
     mpos::console::init();
     mpos::println!("console: kernel log reached the PL011 through crate::console");
-    mpos::println!("M4_CONSOLE_OK");
     // And the record, on the same wire and at the same point the first machine
     // prints it: the shared banner, one line per fact the loader handed over,
     // before anything below acts on any of them (`board::report`).

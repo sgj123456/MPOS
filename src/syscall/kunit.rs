@@ -189,7 +189,6 @@ fn dispatch_in_task(_info: &crate::boot::BootInfo) -> Result<(), String> {
     // made - asserting the alive count again would compare `drain`'s own
     // postcondition with itself.
     take_verdict(VERDICT_SLOT, "the dispatch task")?;
-    println!("M6_OK");
     Ok(())
 }
 
@@ -454,10 +453,5 @@ fn signals(_info: &crate::boot::BootInfo) -> Result<(), String> {
         "a signal number past _NSIG was not EINVAL"
     );
     println!("signals: SIGTERM, SIGKILL, and the kill(0) probe behave");
-
-    // NB: this is not M8_OK. The M8 marker belongs to the init handoff, which is
-    // the real "the machine is up" event. This family's marker is its own, so a
-    // harness that asserts on M8_OK is asserting on init, not on the IPC paths.
-    println!("M8_IPC_OK");
     Ok(())
 }

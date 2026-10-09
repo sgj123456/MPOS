@@ -16,17 +16,18 @@
 //!
 //! # Boot flow
 //!
-//! 1. **Initialization** — `init_mm → init_sched → init_vfs → init_blk →
-//!    init_net → init_virtio → init_rand`. Each sets up a subsystem without
-//!    running tests. (The machine's own bring-up, `init_arch`'s
+//! 1. **Initialization** — `init_mm → steps::start_scheduler → init_vfs →
+//!    init_blk → init_net → init_virtio → rand::init`. Each sets up a subsystem
+//!    without running tests. (The machine's own bring-up, `init_arch`'s
 //!    interrupt/page-table half, is what `arch::boot` has already done by the
-//!    time this file runs.) After all inits complete, the system is ready.
+//!    time this file runs.) After all the inits complete, the system is ready.
 //!
-//! 2. **Milestone pre-checks** — `check_mm → check_arch → check_sched →
-//!    check_vfs → check_ipc`. Each validates the corresponding subsystem.
-//!    Groups are ordered by dependency and print `M*_OK` markers the CI
-//!    harness asserts on. (`check_blk_process` and `check_shell` are covered
-//!    by the block layer's own checks and by the init handoff respectively.)
+//! 2. **The self-tests** — the suites, and only in a *test* build
+//!    (`--features selftest`): each runs at the boot step it declares, and the
+//!    harness prints one `mpos-kunit: <suite>.<case> OK` line per case plus a
+//!    tally (`src/board/kunit.rs`). A production kernel carries neither the
+//!    suites nor that harness, so this is not a branch here at all - it is the
+//!    handful of `#[cfg]`-gated `kunit::reached` calls between the inits above.
 //!
 //! 3. **Init handoff** — `handoff_to_init` spawns `/sbin/init` and parks the
 //!    boot task.
@@ -713,6 +714,6 @@ fn handoff_to_init(info: &BootInfo) -> ! {
     while !sched::has_live_child(pid) {
         sched::sleep_ticks(1);
     }
-    println!("M8_OK");
+    println!("mpos: /init is up; a child is running under it");
     report::park()
 }

@@ -17,7 +17,6 @@ use alloc::sync::Arc;
 
 use crate::case_check;
 use crate::kunit::{Case, Phase, Suite, record_verdict, take_verdict};
-use crate::println;
 use crate::sched::{self, Priority};
 use crate::vfs::{self, FileSystem, Inode, NodeKind};
 
@@ -189,6 +188,5 @@ fn mounted_tree_multi_task(_info: &crate::boot::BootInfo) -> Result<(), String> 
 
     take_verdict(WRITER_SLOT, "the writer task")?;
     take_verdict(READER_SLOT, "the reader task")?;
-    println!("M7_OK");
     Ok(())
 }
