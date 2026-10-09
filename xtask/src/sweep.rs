@@ -92,7 +92,8 @@ pub fn load_config() -> Result<TestConfig> {
 /// The "a declared name must be a program this arm builds" check. It looks like
 /// one rule and is two, measured: the first machine's arm builds both suites, so
 /// every name in the file has to be answerable there; the second's builds only
-/// the std-side suite (30 programs against the first's 169), so the names in
+/// the std-side suite (153 programs against the first's 170 today - §15.11 moves
+/// the rest across a batch at a time), so the names in
 /// `external`/`slow`/`diagnostic` that belong to the bare-metal conformance
 /// suite legitimately have no program on that machine. Sharing one scope would
 /// either refuse every aarch64 sweep or stop checking the first machine
@@ -119,13 +120,39 @@ pub fn select<'a, T: TestProgram>(
     }
 
     let selected = config.selection(&selection.groups, selection.all);
-    let staged: Vec<&'a T> = built
-        .iter()
-        .filter(|test| config.runs(test.name(), &selected, machine))
-        .collect();
+    // The reason-groups (`external`, `slow`, `diagnostic`) are x86_64's
+    // vocabulary: they name programs that need *that* machine's harness - the
+    // internet through its QEMU wiring, a host listener on its 127.0.0.1 - or
+    // measure against its clock. On the second machine the same-named program is
+    // a different instrument (`t-netlat` measures this kernel's own loopback
+    // fabric, not the internet), and §13.5's contract for this arm is that it
+    // runs **every program it built** except the ones its own group names as
+    // gaps. So here a *reason* never leaves a program out; only this machine's
+    // own gap list does. A machine-named group keeps meaning "not me" everywhere
+    // else, unchanged.
+    let staged: Vec<&'a T> = if machine == Machine::X86_64 {
+        built
+            .iter()
+            .filter(|test| config.runs(test.name(), &selected, machine))
+            .collect()
+    } else {
+        built
+            .iter()
+            .filter(|test| {
+                !config
+                    .groups_of(test.name(), machine)
+                    .iter()
+                    .any(|group| config.owns_a_machine(group))
+            })
+            .collect()
+    };
     let skipped: Vec<&'a T> = built
         .iter()
-        .filter(|test| !config.runs(test.name(), &selected, machine))
+        .filter(|test| {
+            !staged
+                .iter()
+                .any(|staged_test| staged_test.name() == test.name())
+        })
         .collect();
     println!(
         "user tests: {} staged, {} left out by tests.toml",
@@ -358,10 +385,40 @@ aarch64 = ["t-drm"]
         let aarch64 = select(Machine::Aarch64, &config, &built, &Selection::default()).unwrap();
         assert_eq!(
             aarch64.staged.iter().map(|p| p.name()).collect::<Vec<_>>(),
-            vec!["t-tcp"],
-            "this machine's own group is one of its groups, so `t-drm` is left out"
+            vec!["t-tcp", "t-dns", "t-udp", "t-forkcost"],
+            "this machine's own group is one of its groups, so `t-drm` is left \
+             out - and the *reason* groups are x86_64's vocabulary: they name \
+             that harness's needs, while this arm stages every program it built \
+             (§13.5), so `external` and `slow` leave nothing out here"
         );
-        assert_eq!(aarch64.skipped.len(), 4);
+        assert_eq!(aarch64.skipped.len(), 1);
+    }
+
+    /// The rule §13.5 wrote for this arm, measured on the day the std side first
+    /// carried the instruments: moving `t-forkcost`, `t-netlat` and `t-pipecost`
+    /// across made them *build* on aarch64, and the shared `runs()` still read
+    /// their `slow` membership as an exclusion there - so three programs sat in
+    /// the payload built, selected out, and run by neither arm's default sweep.
+    /// A reason-group's membership is a statement about the x86_64 harness; the
+    /// second machine's contract is its whole payload minus its own gap list.
+    #[test]
+    fn a_reason_group_never_leaves_a_built_program_out_of_the_second_machine() {
+        let config = config("reason-groups-do-not-bind-aarch64");
+        let built = built();
+        let plan = select(Machine::Aarch64, &config, &built, &Selection::default()).unwrap();
+        let staged: Vec<&str> = plan.staged.iter().map(|p| p.name()).collect();
+        for program in ["t-dns", "t-udp", "t-forkcost"] {
+            assert!(
+                staged.contains(&program),
+                "{program} is built for this machine but a reason-group hid it \
+                 from the sweep"
+            );
+        }
+        // And the first machine keeps its gate exactly as before: the same
+        // programs are the ones a plain sweep leaves out there.
+        let x86 = select(Machine::X86_64, &config, &built, &Selection::default()).unwrap();
+        let left_out: Vec<&str> = x86.skipped.iter().map(|p| p.name()).collect();
+        assert_eq!(left_out, vec!["t-dns", "t-udp", "t-forkcost"]);
     }
 
     /// The parser reads what both runners print, and beats the two cheaper

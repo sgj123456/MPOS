@@ -458,6 +458,15 @@ fn visible(group: &str, machine: Machine) -> bool {
 }
 
 impl TestConfig {
+    /// Whether `group` names *any* machine - a list of what that machine cannot
+    /// serve - rather than a reason (`external`, `slow`, `diagnostic`) shared by
+    /// both. `sweep::select` needs this distinction: a reason-group's membership
+    /// is an x86_64 harness fact, while a machine group is the exclusion its own
+    /// sweep asks for.
+    pub fn owns_a_machine(&self, group: &str) -> bool {
+        MACHINE_GROUPS.iter().any(|(name, _)| *name == group)
+    }
+
     /// Read the file. A missing one is **no exclusions**, not an error.
     ///
     /// The opposite default is the dangerous one: a sweep that silently skips
