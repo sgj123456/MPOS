@@ -259,6 +259,32 @@ fn put_str(out: &mut Vec<u8>, s: &[u8]) {
 }
 
 /// Append a `u32` in the wire's little-endian.
+/// A `Tcreate` body: the fid to create in, the name, the permission word and the
+/// open mode, followed by `9P2000.u`'s `extension[s]`.
+///
+/// The last field is the point of this being a function rather than three lines
+/// inside the client: it is a field the *server* unmarshals, so a body that stops
+/// short at `mode` is one the server cannot decode **at all** - not one it decodes
+/// and refuses - which means the caller waits for an answer that never comes.
+/// A missing field is therefore not a wrong answer to be checked for but a
+/// *hang*, and the only way to catch one cheaply is to pin the bytes.
+///
+/// Measured, which is what makes the field load-bearing rather than decorative: a
+/// guest creating a file through the host share wedged with
+/// `qemu-system-x86_64: Failed to decode VirtFS request type 114` on the host's
+/// side (114 being `Tcreate`) and no reply on the guest's, while every *read*
+/// through the same share worked - which is why `t-9p`, whose subject was the
+/// read half, stayed green.
+fn create_body(dir_fid: u32, name: &str, perm: u32, mode: u8) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_u32(&mut body, dir_fid);
+    put_str(&mut body, name.as_bytes());
+    put_u32(&mut body, perm);
+    body.push(mode);
+    put_str(&mut body, b"");
+    body
+}
+
 fn put_u32(out: &mut Vec<u8>, word: u32) {
     out.extend_from_slice(&word.to_le_bytes());
 }
@@ -619,11 +645,7 @@ mod device {
         /// word carries the DM_DIR bit for a directory, exactly as on the
         /// wire.
         fn create(&self, dir_fid: u32, name: &str, perm: u32, mode: u8) -> VfsResult<(u8, u32)> {
-            let mut body = Vec::new();
-            put_u32(&mut body, dir_fid);
-            put_str(&mut body, name.as_bytes());
-            put_u32(&mut body, perm);
-            body.push(mode);
+            let body = create_body(dir_fid, name, perm, mode);
             let answer = self.call(T_CREATE, &body, R_CREATE)?;
             let qid_type = *answer.get(HEADER).ok_or(VfsError::Corrupt)?;
             let iounit = take_u32(&answer, &mut { HEADER + 13 }).ok_or(VfsError::Corrupt)?;
@@ -1083,6 +1105,34 @@ mod tests {
     fn a_truncated_stat_is_refused_rather_than_guessed() {
         let bytes = stat_bytes(0o644, 1, "half");
         assert!(parse_stat(&bytes[..bytes.len() - 3]).is_none());
+    }
+
+    /// `Tcreate`'s body, field for field, including the one it used to stop
+    /// short of.
+    ///
+    /// A test that cannot be written as an assertion about *behaviour*, and the
+    /// reason is the defect: the server's unmarshal reads the dialect's trailing
+    /// `extension[s]`, so a body without it is not refused, it is *undecodable* -
+    /// and an undecodable request is answered by silence, so the observable
+    /// behaviour is a hang rather than a wrong result. The bytes are the only
+    /// cheap pin there is.
+    #[test]
+    fn a_create_body_ends_with_the_dialects_extension() {
+        let body = create_body(7, "scratch", 0o644, 0);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&7u32.to_le_bytes()); // fid
+        expected.extend_from_slice(&7u16.to_le_bytes()); // name, as a 9P string
+        expected.extend_from_slice(b"scratch");
+        expected.extend_from_slice(&0o644u32.to_le_bytes()); // perm
+        expected.push(0); // mode
+        expected.extend_from_slice(&0u16.to_le_bytes()); // extension: empty, but *present*
+        assert_eq!(body, expected);
+
+        // And the field is a string like any other rather than a byte: a
+        // non-empty extension would be length-prefixed the same way, which is
+        // what makes "empty" a value of the field rather than its absence.
+        assert_eq!(&body[body.len() - 2..], &[0, 0]);
     }
 
     #[test]
