@@ -137,6 +137,22 @@ pub struct Handoff {
     /// field it did not write reads as absent.
     pub dtb_phys: u64,
     pub dtb_len: u64,
+    /// Physical address of the ACPI root pointer (`RSDP`), or zero when the
+    /// firmware published none - which is every aarch64 boot, whose machine
+    /// describes itself with a device tree instead.
+    ///
+    /// Kept as the address the firmware named rather than copied, unlike the
+    /// device tree above: the root pointer and everything it names live in the
+    /// firmware's ACPI tables, which the memory map reports as
+    /// `AcpiReclaimable` - memory the frame allocator never hands out
+    /// ([`MemKind::is_allocatable`]) - so the kernel reads them through the
+    /// direct map whenever it likes. A copy would be a second version of what
+    /// the firmware already published, to be kept in step with nothing.
+    ///
+    /// Appended for the same reason the two fields above it are: a loader from
+    /// before this field writes nothing here, and that reads as "no tables"
+    /// rather than as a stale address, so [`HANDOFF_MAGIC`] does not move.
+    pub rsdp_phys: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +240,14 @@ pub struct BootInfo {
     /// every x86_64 boot - so a caller that *needs* one asks for it by name
     /// rather than treating the absence as an empty machine.
     pub dtb: Option<&'static [u8]>,
+    /// Physical address of the ACPI root pointer, or zero.
+    ///
+    /// Not a slice, because what it names is a tree rather than a blob: the root
+    /// pointer names a table, that table names others, and each carries its own
+    /// length (`crates/acpi`). A caller reads the bytes through
+    /// [`BootInfo::phys_to_virt`] and walks them; the kernel's first caller is
+    /// `drivers::pci`, looking for MCFG's memory-mapped configuration window.
+    pub rsdp_phys: usize,
     /// The lowest word of the boot stack, where the loader left its canary, or
     /// zero when the loader planted none. `check_boot_stack` reads it; nothing
     /// else needs it, and nothing may write through it.

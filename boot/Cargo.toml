@@ -23,6 +23,11 @@ edition = "2024"
 # `#![no_std]` plain data with no dependencies, so it compiles for the firmware
 # target as readily as for the kernel's.
 mpos-bootinfo = { path = "../crates/bootinfo" }
+# The ACPI table reader, as the leaf the kernel also reads tables through. The
+# loader's half is one question - which address the firmware's root pointer is
+# at - and validating the pointer before handing it on; the walk belongs to the
+# kernel, which is the side that lives long enough to want the tables.
+mpos-acpi = { path = "../crates/acpi" }
 # The machine layer, for the three things this loader needs from the machine:
 # the page-table descriptor format, the progress wire, and the last instruction
 # (`mpos_arch::early`). The dependency is what makes "this loader names no

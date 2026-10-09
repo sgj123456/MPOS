@@ -115,12 +115,14 @@ fn milestone(info: &BootInfo) {
 /// `drivers::pci::claim`, so `lspci -k` names a driver that really did bind rather
 /// than one that merely matches.
 ///
-/// The record goes unused here, and that is this machine's fact rather than an
-/// oversight: its firmware publishes no description of it, so the bus is the only
-/// description there is. The second machine's counterpart reads its device tree in
-/// this same slot, which is what makes the seam one shape instead of two.
-fn devices(_info: &BootInfo) {
-    let count = drivers::pci::init();
+/// The record is used for one thing here, and it is the same thing the second
+/// machine reads its device tree for: where the firmware wrote down what it
+/// knows. This machine's firmware describes itself with ACPI, so the record
+/// carries the physical address of the root pointer, and the bus walk asks it
+/// where the memory-mapped configuration window is before falling back to the
+/// port mechanism.
+fn devices(info: &BootInfo) {
+    let count = drivers::pci::init(info);
     println!("pci: {count} functions enumerated");
 }
 

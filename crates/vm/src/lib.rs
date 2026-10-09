@@ -249,8 +249,10 @@ mod tests {
             // The host has no loader, so no boot stack and no canary to point
             // at. Zero is how the handoff spells "the loader planted none".
             boot_stack_base: 0,
-            // And no firmware to publish a device tree.
+            // And no firmware to publish a device tree, nor an ACPI root
+            // pointer for one to be found through.
             dtb: None,
+            rsdp_phys: 0,
             regions: [MemRegion {
                 base: 0,
                 length: 0,

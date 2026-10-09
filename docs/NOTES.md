@@ -3637,6 +3637,57 @@ the `drivers` module. The aarch64 boot check that resolves `/dev/hwrng` and `/de
 mounted tree (`check_dev`, `M7_DEV_OK`) is the end-to-end evidence that the driver-published nodes
 are the ones userland sees.
 
+### 7.6 Configuration space over MMIO: what the firmware names, and the reserved word that hid it — **DISCOVERY LANDED**
+
+x86_64 reads configuration space through the 0xcf8/0xcfc port pair (mechanism 1), which
+reaches 256 bytes per function - the address register has eight bits of offset - so a
+device's PCIe extended capabilities are outside it. A PCIe machine may instead decode
+configuration space as *memory* (ECAM, or MMCONFIG: one 4 KiB page per function, one
+1 MiB window per bus) and say where in ACPI's MCFG table. Enumerating over MMIO with the
+port pair as the fallback starts with reading that table.
+
+Neither prerequisite existed. The kernel had **no ACPI support at all** - the machine that
+describes itself with tables was the one whose description the kernel ignored - and the
+loader's configuration-table walk knew only the device-tree GUID. Both are in now:
+
+- `crates/acpi`: the root pointer (both checksums, and the extended one is a condition on
+  using a revision-2 pointer), an SDT header validated against the bytes that arrived, the
+  RSDT/XSDT walk, and MCFG's windows down to the per-function offset. Fourteen host tests,
+  and `fuzz/acpi_tables` (3.4M executions clean).
+- the loader finds the root pointer in the firmware's configuration table (the ACPI 2.0
+  GUID first, the 1.0 one second) and validates it *there*, while the firmware's memory is
+  certainly still mapped, before writing `rsdp_phys` into the record. The field is appended
+  after the device-tree pair for the reason that field's own note gives. The tables are not
+  copied, unlike the device tree: the memory map reports them ACPI-reclaimable, which the
+  frame allocator never hands out, so the kernel reads them through the direct map.
+- `drivers::pci` walks them and says what it found. On this host, in the sweep's own boot:
+  `pci: MCFG names ECAM at 0xe0000000, segment 0, buses 0..=255, 256 MiB`.
+
+**The first version of the parser was wrong, and the boot is what caught it.** MCFG keeps
+**eight reserved bytes** between its header and its first entry. A reader that starts the
+entry loop at the header's end reads the reserved word as an entry's base, the entry's base
+as its *segment*, and the entry's end bus as its own - and the answer that produces is not
+a machine, it is a plausible-looking one: `base 0x0, buses 0..=224` where the window is
+really `0xe0000000, 0..=255`. The host tests agreed with the bug because their fixtures
+were built the same way, which is the lesson worth keeping: a fixture that encodes the
+same mistake as the code proves nothing about the format. Both are fixed, and the wrong
+shape is a test of its own now (`the_reserved_word_is_not_read_as_an_entry`).
+
+A second, smaller one was the same class: the first walk validated the root table from a
+36-byte read, so the table's own declared length looked like an overrun and every table
+was refused. Reading a table is necessarily staged - the length is in the header and the
+checksum is over the whole table - so `crates/acpi` grew a `declared_length` door that
+says what the header claims *without* validating it, and `pci::read_table` reads the
+length, then the table, then validates the whole of it.
+
+**What is deliberately not done, and why it is a step with a size.** The window is *named*
+and not yet *used*. Switching reads to it means mapping it, and this machine's MCFG covers
+256 buses - **256 MiB of address space**. Mapping that eagerly, for a walk that touches two
+or three buses, is the wrong trade; the next step is a per-bus mapping (1 MiB on demand),
+an equivalence check that ECAM and mechanism 1 answer the same for the same function before
+the switch is trusted, and mechanism 1 kept as the fallback for a machine whose firmware
+names no window at all.
+
 ## Phase 8: Security Hardening (Low Priority)
 
 ### 8.0 A userspace process could panic the kernel — **fixed: a file is not one buffer**

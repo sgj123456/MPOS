@@ -121,6 +121,21 @@ pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
 /// the same on both machines, and one of them finds nothing.
 const DTB_GUID: Guid = guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
 
+/// The two GUIDs a UEFI firmware publishes its ACPI tables under:
+/// `EFI_ACPI_20_TABLE_GUID` (the revision-2 root pointer, which names a 64-bit
+/// table root) and `EFI_ACPI_TABLE_GUID` (the 1.0 one). Both are searched
+/// because a machine may publish either, and the extended one is preferred.
+///
+/// Unlike the device tree, what these point at is not copied out: the root
+/// pointer names tables the firmware keeps in memory it reports as
+/// ACPI-reclaimable, which the kernel's frame allocator never hands out, so they
+/// stay where the firmware put them and are read through the direct map. The
+/// loader's part is only to say *where* the root pointer is, and to refuse one
+/// that does not validate - which it can do while the firmware's memory is
+/// certainly still mapped.
+const ACPI20_GUID: Guid = guid!("8868e871-e4f1-11d3-bc22-0080c73c8881");
+const ACPI_GUID: Guid = guid!("eb9d2d30-2d88-11d3-9a16-0090273fc14c");
+
 /// The first two words of a device tree header: its magic, and the size it
 /// claims for itself.
 ///
@@ -196,6 +211,7 @@ const EMPTY_HANDOFF: Handoff = Handoff {
     }; MAX_MEM_REGIONS],
     dtb_phys: 0,
     dtb_len: 0,
+    rsdp_phys: 0,
 };
 
 /// The firmware entry point's body: everything the loader does, from the first
@@ -292,6 +308,16 @@ pub fn run() -> Status {
     } else {
         (0u64, 0u64)
     };
+    // The same machine fact from the other side: a machine that does not
+    // describe itself with a tree describes itself with ACPI, and the root
+    // pointer is the one thing about that the kernel cannot find for itself -
+    // the configuration table is firmware data, and the kernel never has the
+    // firmware's services.
+    let rsdp_phys = if early::FIRMWARE_PUBLISHES_DEVICE_TREE {
+        0
+    } else {
+        find_rsdp()
+    };
 
     unsafe { core::ptr::write_bytes(root_frame as *mut u8, 0, PAGE_SIZE as usize) };
     unsafe { kernel.load(image_mem as *mut u8, vm::KERNEL_VIRT_BASE) };
@@ -356,6 +382,7 @@ pub fn run() -> Status {
         stack,
         dtb_phys,
         dtb_len,
+        rsdp_phys,
     );
     drop(after);
 
@@ -394,6 +421,7 @@ fn write_handoff(
     stack_phys_base: u64,
     dtb_phys: u64,
     dtb_len: u64,
+    rsdp_phys: u64,
 ) {
     let mut record = EMPTY_HANDOFF;
     let mut count = 0usize;
@@ -437,6 +465,7 @@ fn write_handoff(
     record.region_count = count as u64;
     record.dtb_phys = dtb_phys;
     record.dtb_len = dtb_len;
+    record.rsdp_phys = rsdp_phys;
 
     // The one write to the static, after everything in it is final: the kernel
     // reads this record on a machine where boot services and this function no
@@ -472,6 +501,36 @@ fn copy_to_frames(bytes: &[u8], what: &str) -> u64 {
 /// this reads the first two words and takes `totalsize` bytes. QEMU's blob
 /// claims a megabyte around eight kilobytes of meaning, which is why the number
 /// is read rather than assumed.
+/// Find the firmware's ACPI root pointer and hand back its physical address, or
+/// zero when the firmware published none.
+///
+/// The pointer's own bytes are validated here and nothing else is read: while
+/// the firmware's services are still up its memory is certainly mapped, so a
+/// root pointer that does not validate is a firmware fact worth a log line
+/// rather than a boot failure. What it names is the kernel's to walk, after the
+/// record says where it is.
+fn find_rsdp() -> u64 {
+    let found = with_config_table(|entries| {
+        entries
+            .iter()
+            .find(|entry| entry.guid == ACPI20_GUID || entry.guid == ACPI_GUID)
+            .map(|entry| entry.address as u64)
+    });
+    let Some(at) = found else {
+        log("the firmware published no ACPI tables");
+        return 0;
+    };
+    // SAFETY: the firmware named this address as its ACPI root pointer and boot
+    // services have not been exited, so the memory is mapped and still its own.
+    let bytes = unsafe { core::slice::from_raw_parts(at as *const u8, mpos_acpi::RSDP_V2_LEN) };
+    if mpos_acpi::parse_rsdp(bytes).is_none() {
+        log(&format!("ACPI root pointer at {at:#x} did not validate"));
+        return 0;
+    }
+    log(&format!("ACPI tables at phys {at:#x}"));
+    at
+}
+
 fn copy_device_tree() -> (u64, u64) {
     let (found, published) = with_config_table(|entries| {
         let found = entries

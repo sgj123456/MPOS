@@ -25,6 +25,11 @@ edition = "2024"
 # V-14). Re-exported by `src/lib.rs` as `crate::err`, so every caller's path is
 # unchanged; the crate itself cannot name the kernel.
 mpos-err = { path = "crates/err" }
+# The ACPI table reader (`crates/acpi`): the root pointer, the RSDT/XSDT walk and
+# MCFG's memory-mapped configuration windows. Re-exported below as
+# `crate::acpi`, and used by `drivers::pci` to find the window this machine
+# enumerates configuration space over.
+mpos-acpi = { path = "crates/acpi" }
 # The boot record (`Handoff`) and the kernel's view of it (`BootInfo`), as a
 # leaf: the machine layer names both - `hal::Paging::install` takes a `BootInfo`
 # and the aarch64 entry is handed a `Handoff` - so neither the kernel nor the

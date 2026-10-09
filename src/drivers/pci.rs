@@ -19,6 +19,7 @@
 use alloc::vec::Vec;
 use x86_64::instructions::port::Port;
 
+use crate::boot::BootInfo;
 use crate::pci::{
     Bar, CFG_SIZE, Device, PCI_ERROR_RESPONSE, PCI_ROM_ADDRESS_MASK, ROM_INDEX, bar_flags,
     bar_range, rom_bar,
@@ -543,10 +544,185 @@ pub fn mark_drm_card(func: &Func) {
     crate::pci::mark_drm_card(bus, dev, function);
 }
 
+/// The memory-mapped configuration window ACPI's MCFG names, when this machine
+/// has one.
+///
+/// Recorded, and deliberately not yet used: reading configuration space through
+/// the window instead of the 0xcf8/0xcfc port pair is the next step, and it is a
+/// step with a size attached - a window may cover buses 0..=255, which is 256
+/// MiB of address space to map, one mebibyte per bus - so the number belongs
+/// beside the decision rather than being discovered inside it. What this stores
+/// is what the firmware said.
+#[derive(Clone, Copy, Debug)]
+pub struct Ecam {
+    /// Physical address of the window's first byte.
+    pub base: u64,
+    /// The PCI segment group it decodes.
+    pub segment: u16,
+    /// The first and last bus numbers it covers.
+    pub start_bus: u8,
+    pub end_bus: u8,
+}
+
+impl Ecam {
+    /// How much address space the window spans: one mebibyte per bus.
+    pub fn bytes(&self) -> u64 {
+        crate::acpi::ECAM_BUS_BYTES * (self.end_bus as u64 + 1 - self.start_bus as u64)
+    }
+}
+
+/// The largest root table, and the largest single table, this walk will read.
+///
+/// A length is a number the firmware wrote, so it is checked before anything is
+/// walked with it: these are the caps that keep a lie from becoming a read past
+/// the end of the direct map, and both are far above what a real firmware
+/// publishes - an XSDT is kilobytes and an MCFG is under a hundred bytes.
+const MAX_ROOT_TABLE: usize = 64 * 1024;
+const MAX_TABLE: usize = 64 * 1024;
+
+/// Read one ACPI table through the direct map: its declared length first, then
+/// the whole of it, and only then validate it.
+///
+/// The order is forced by what is knowable when. A table's length lives in its
+/// header, and the header's own validation - the checksum over the table, the
+/// length against the buffer that arrived - needs the table. So the first
+/// [`crate::acpi::SDT_HEADER_LEN`] bytes are read to learn how much there is, the
+/// bytes are read, and [`crate::acpi::parse_header`] then decides whether any of
+/// it may be used. `cap` bounds how much a single table can claim, because the
+/// number came from the firmware.
+fn read_table(info: &BootInfo, phys: u64, cap: usize) -> Option<&'static [u8]> {
+    // SAFETY: as `discover_ecam` states - the tables belong to the firmware and
+    // the frame allocator never hands their memory out, so they stay readable.
+    let head = unsafe {
+        core::slice::from_raw_parts(
+            info.phys_to_virt(phys as usize) as *const u8,
+            crate::acpi::SDT_HEADER_LEN,
+        )
+    };
+    let length = (crate::acpi::declared_length(head)? as usize).min(cap);
+    if length < crate::acpi::SDT_HEADER_LEN {
+        return None;
+    }
+    // SAFETY: as above, and `length` is bounded by `cap` rather than trusted.
+    let table = unsafe {
+        core::slice::from_raw_parts(info.phys_to_virt(phys as usize) as *const u8, length)
+    };
+    crate::acpi::parse_header(table)?;
+    Some(table)
+}
+
+/// Ask the firmware's ACPI tables for a memory-mapped configuration window.
+///
+/// The root pointer's *address* came from the loader (`BootInfo::rsdp_phys`),
+/// because the firmware's configuration table is the one place it is written
+/// down and the kernel has no way to ask for it. Everything below the pointer is
+/// read here, through the direct map: the memory map reports the tables as
+/// ACPI-reclaimable, which the frame allocator never hands out, so they are still
+/// where the firmware left them.
+///
+/// `None` is an honest absence - no root pointer, no MCFG among the tables, a
+/// checksum that does not hold, or a length that runs past what this walk reads.
+/// The caller falls back to the port mechanism, which is what a machine with no
+/// window uses.
+fn discover_ecam(info: &BootInfo) -> Option<Ecam> {
+    if info.rsdp_phys == 0 {
+        crate::println!("pci: the boot record carries no ACPI root pointer");
+        return None;
+    }
+    // SAFETY: the loader named this address as the firmware's root pointer, and
+    // the memory it and everything it names lives in belongs to the firmware
+    // (ACPI-reclaimable, never handed out by the frame allocator), so it stays
+    // readable for as long as the machine runs. Every length is checked against
+    // the caps above before it is used.
+    let bytes = |phys: u64, len: usize| unsafe {
+        core::slice::from_raw_parts(info.phys_to_virt(phys as usize) as *const u8, len)
+    };
+
+    let Some(root) = crate::acpi::parse_rsdp(bytes(info.rsdp_phys as u64, crate::acpi::RSDP_V2_LEN))
+    else {
+        crate::println!(
+            "pci: the ACPI root pointer at {:#x} did not validate",
+            info.rsdp_phys
+        );
+        return None;
+    };
+    let (root_phys, wide) = if root.has_xsdt() {
+        (root.xsdt, true)
+    } else {
+        (root.rsdt as u64, false)
+    };
+    if root_phys == 0 {
+        return None;
+    }
+    let Some(root_table) = read_table(info, root_phys, MAX_ROOT_TABLE) else {
+        crate::println!("pci: the ACPI root table at {root_phys:#x} did not validate");
+        return None;
+    };
+    // What the firmware *did* publish, for the same reason the loader lists the
+    // configuration table it walked: a machine whose description is under
+    // another name is one line away from this log and an afternoon away from the
+    // words "no window" on their own.
+    let mut published: Vec<[u8; 4]> = Vec::new();
+    for address in crate::acpi::table_entries(&root_table[crate::acpi::SDT_HEADER_LEN..], wide) {
+        if address == 0 {
+            continue;
+        }
+        let Some(table) = read_table(info, address, MAX_TABLE) else {
+            continue;
+        };
+        let signature = [table[0], table[1], table[2], table[3]];
+        published.push(signature);
+        if signature != *crate::acpi::MCFG_SIGNATURE {
+            continue;
+        }
+        let ranges = crate::acpi::parse_mcfg(table);
+        if ranges.is_empty() {
+            crate::println!("pci: MCFG at {address:#x} names no window");
+        }
+        for range in ranges {
+            // Segment zero is the one the enumeration is written for: the
+            // snapshot's `Device` carries a domain, but every driver that reads
+            // the bus names bus 0 of segment 0.
+            if range.segment == 0 && !range.is_empty() {
+                return Some(Ecam {
+                    base: range.base,
+                    segment: range.segment,
+                    start_bus: range.start_bus,
+                    end_bus: range.end_bus,
+                });
+            }
+        }
+    }
+    if published.is_empty() {
+        crate::println!("pci: the ACPI root table names no tables");
+    } else {
+        crate::print!("pci: tables:");
+        for signature in &published {
+            crate::print!(" {}{}{}{}", signature[0] as char, signature[1] as char, signature[2] as char, signature[3] as char);
+        }
+        crate::println!();
+    }
+    None
+}
+
 /// Take the bus snapshot, once, and publish it for `/sys` and `/proc`.
 ///
-/// Returns how many functions were found, for the boot's own log line.
-pub fn init() -> usize {
+/// Returns how many functions were found, for the boot's own log line. The
+/// memory-mapped configuration window the firmware names - if it names one - is
+/// reported here and not yet used; the port mechanism below is still what reads
+/// configuration space.
+pub fn init(info: &BootInfo) -> usize {
+    match discover_ecam(info) {
+        Some(ecam) => crate::println!(
+            "pci: MCFG names ECAM at {:#x}, segment {}, buses {}..={}, {} MiB (ports still in use)",
+            ecam.base,
+            ecam.segment,
+            ecam.start_bus,
+            ecam.end_bus,
+            ecam.bytes() / (1024 * 1024)
+        ),
+        None => crate::println!("pci: no MCFG window; configuration space is over ports 0xcf8/0xcfc"),
+    }
     let devices = enumerate();
     let count = devices.len();
     crate::pci::publish(devices);

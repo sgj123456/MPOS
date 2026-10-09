@@ -694,6 +694,9 @@ mod tests {
             // Nor a firmware handing over a device tree: that is a fact about a
             // machine, and this test builds its own memory map instead.
             dtb: None,
+            // Nor an ACPI root pointer, for the same reason: the host has no
+            // firmware configuration table to find one in.
+            rsdp_phys: 0,
             regions: [MemRegion {
                 base: 0,
                 length: 0,

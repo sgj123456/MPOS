@@ -73,6 +73,7 @@ pub unsafe fn collect(at: *const Handoff) -> BootInfo {
         cmdline: "",
         boot_stack_base: raw.boot_stack_base as usize,
         dtb: unsafe { slice(raw.dtb_phys, raw.dtb_len, hhdm_offset) },
+        rsdp_phys: raw.rsdp_phys as usize,
     };
 
     for (slot, region) in info.regions[..info.region_count]
@@ -205,6 +206,13 @@ mod tests {
         assert_eq!(
             offset_of!(Handoff, dtb_len),
             88 + MAX_MEM_REGIONS * size_of::<AbiRegion>()
+        );
+        // The ACPI root pointer is appended after them for the same reason, so
+        // an older loader's record reads it as zero - "no tables" - and every
+        // offset above is untouched.
+        assert_eq!(
+            offset_of!(Handoff, rsdp_phys),
+            96 + MAX_MEM_REGIONS * size_of::<AbiRegion>()
         );
 
         // The loader zero-fills one page and writes the record into it, so a

@@ -131,6 +131,12 @@ Legend: `[x]` done · `[~]` partial · `[ ]` todo · *(blocked: …)* = needs a 
       driver — so a new device does not edit the builder and a probe's answer, not the builder's
       guess, decides whether a node exists (§7.5)
 
+- [~] configuration space over MMIO (ECAM/MMCONFIG) with the 0xcf8/0xcfc pair as the
+      fallback: the ACPI reader is in (`crates/acpi`), the loader hands the kernel the root
+      pointer, and the boot now reports the window it found — `0xe0000000`, buses 0..=255 on
+      this host. What is left is the switch itself: a per-bus mapping rather than 256 MiB at
+      once, and the check that both mechanisms agree (§7.6)
+
 **Wayland compositor (weston) support** — the cross-cutting work a rootful
 compositor needs, all verified by `t-*` (GUI end-to-end is the operator's run of
 `cargo xtask run --mode gui`):

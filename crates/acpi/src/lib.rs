@@ -54,6 +54,19 @@ pub const SDT_HEADER_LEN: usize = 36;
 /// The memory-mapped configuration table's signature.
 pub const MCFG_SIGNATURE: &[u8; 4] = b"MCFG";
 
+/// The eight reserved bytes MCFG keeps between its header and its first
+/// configuration-space entry.
+///
+/// Not padding this reader may skip by assuming: the bytes are *there*, and a
+/// reader that started its entry loop at the header's end would read the
+/// reserved word as an entry's base address, the entry's base as its segment, and
+/// the entry's end bus as its own - which is not a window any machine has, but is
+/// a perfectly plausible-looking answer (`base 0`, `buses 0..=224` was what the
+/// first version of this parser produced on a machine whose window is really
+/// `0xe000_0000`, buses 0..=255). The reserved field exists because the table was
+/// published before the entry format was, and a parser has to know.
+pub const MCFG_RESERVED_LEN: usize = 8;
+
 /// One bus's worth of configuration space in an ECAM window: 32 devices × 8
 /// functions × 4 KiB.
 pub const ECAM_BUS_BYTES: u64 = 1 << 20;
@@ -124,6 +137,23 @@ pub struct SdtHeader {
     pub signature: [u8; 4],
     pub length: u32,
     pub revision: u8,
+}
+
+/// The length a table claims for itself, without validating anything.
+///
+/// This exists because of the order a reader has to work in when the table is in
+/// memory it cannot read at once: the header says how long the table is, and the
+/// rest of the header's validation - the checksum, the length against the buffer
+/// - cannot happen until that many bytes are in hand. [`parse_header`] is the
+/// validating door and this is not: a caller reads the first
+/// [`SDT_HEADER_LEN`] bytes, asks this how much more there is, reads that much,
+/// and then calls [`parse_header`] on the whole of it. A caller that trusted
+/// this instead of validating would be believing a number the firmware wrote.
+pub fn declared_length(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < SDT_HEADER_LEN {
+        return None;
+    }
+    Some(u32::from_le_bytes(bytes[4..8].try_into().ok()?))
 }
 
 /// Validate one table's header against the bytes that arrived.
@@ -219,10 +249,11 @@ impl EcamRange {
 
 /// Every window an MCFG table names, in the table's order.
 ///
-/// The body is the whole table, header included. A table with no room for even
-/// one entry is an empty answer rather than a refusal - the header is a
-/// well-formed table that describes no window, which is a fact about a machine
-/// rather than a corrupt table.
+/// The body is the whole table, header included, and the entries begin after
+/// [`MCFG_RESERVED_LEN`] reserved bytes rather than at the header's end. A table
+/// with no room for even one entry is an empty answer rather than a refusal - the
+/// header is a well-formed table that describes no window, which is a fact about
+/// a machine rather than a corrupt table.
 pub fn parse_mcfg(bytes: &[u8]) -> Vec<EcamRange> {
     let Some(header) = parse_header(bytes) else {
         return Vec::new();
@@ -230,7 +261,7 @@ pub fn parse_mcfg(bytes: &[u8]) -> Vec<EcamRange> {
     if header.signature != *MCFG_SIGNATURE {
         return Vec::new();
     }
-    let body_start = SDT_HEADER_LEN;
+    let body_start = SDT_HEADER_LEN + MCFG_RESERVED_LEN;
     let end = header.length as usize;
     let mut out = Vec::new();
     let mut at = body_start;
@@ -270,6 +301,19 @@ mod tests {
         let sum = out.iter().fold(0u8, |a, b| a.wrapping_add(*b));
         out[9] = 0u8.wrapping_sub(sum);
         out
+    }
+
+    /// An MCFG body: the eight reserved bytes the table keeps after its header,
+    /// then one entry per window. The reserved word is written as itself rather
+    /// than assumed away - a parser that skipped it by *not* accounting for it
+    /// was this test's first version, and both agreed with each other and with no
+    /// machine (`MCFG_RESERVED_LEN` says what that produced).
+    fn mcfg_body(entries: &[[u8; 16]]) -> Vec<u8> {
+        let mut body = vec![0u8; MCFG_RESERVED_LEN];
+        for entry in entries {
+            body.extend_from_slice(entry);
+        }
+        body
     }
 
     fn mcfg_entry(base: u64, segment: u16, start: u8, end: u8) -> [u8; 16] {
@@ -331,6 +375,17 @@ mod tests {
     }
 
     #[test]
+    fn the_declared_length_is_read_before_there_are_bytes_to_validate() {
+        let bytes = table(MCFG_SIGNATURE, &[0u8; 16]);
+        // The first 36 bytes are enough for the length and not enough for the
+        // checksum over the whole table - which is exactly the staged read a
+        // caller does, and why this door does not validate.
+        assert_eq!(declared_length(&bytes[..SDT_HEADER_LEN]), Some(bytes.len() as u32));
+        assert!(parse_header(&bytes[..SDT_HEADER_LEN]).is_none());
+        assert_eq!(declared_length(&[0u8; 8]), None);
+    }
+
+    #[test]
     fn a_table_whose_length_overruns_its_buffer_is_refused() {
         // A header that claims a kilobyte while only forty bytes arrived: the
         // length is what every later reader strides by, so it cannot be
@@ -342,10 +397,11 @@ mod tests {
     }
 
     #[test]
-    fn the_windows_an_mcfg_names_are_read_in_order() {
-        let mut body = vec![0u8; 32];
-        body[0..16].copy_from_slice(&mcfg_entry(0xb000_0000, 0, 0, 255));
-        body[16..32].copy_from_slice(&mcfg_entry(0xc000_0000, 1, 0, 15));
+    fn the_windows_an_mcfg_names_are_read_after_the_reserved_word() {
+        let body = mcfg_body(&[
+            mcfg_entry(0xb000_0000, 0, 0, 255),
+            mcfg_entry(0xc000_0000, 1, 0, 15),
+        ]);
         let bytes = table(MCFG_SIGNATURE, &body);
         let ranges = parse_mcfg(&bytes);
         assert_eq!(ranges.len(), 2);
@@ -364,7 +420,8 @@ mod tests {
 
     #[test]
     fn an_mcfg_with_no_room_for_an_entry_names_no_window() {
-        let bytes = table(MCFG_SIGNATURE, &[0u8; 8]);
+        // The reserved word alone: a well-formed table that describes nothing.
+        let bytes = table(MCFG_SIGNATURE, &[0u8; MCFG_RESERVED_LEN]);
         assert!(parse_mcfg(&bytes).is_empty());
     }
 
@@ -372,6 +429,20 @@ mod tests {
     fn another_tables_signature_is_not_read_as_mcfg() {
         let bytes = table(b"APIC", &mcfg_entry(0xb000_0000, 0, 0, 0xff));
         assert!(parse_mcfg(&bytes).is_empty());
+    }
+
+    /// The shape the first version of this parser got wrong, kept as a test
+    /// because the wrong answer looked like a machine: reading the reserved word
+    /// as an entry turns a window at `0xe000_0000` covering buses 0..=255 into
+    /// "base 0, buses 0..=224".
+    #[test]
+    fn the_reserved_word_is_not_read_as_an_entry() {
+        let bytes = table(MCFG_SIGNATURE, &mcfg_body(&[mcfg_entry(0xe000_0000, 0, 0, 255)]));
+        let ranges = parse_mcfg(&bytes);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].base, 0xe000_0000);
+        assert_eq!(ranges[0].end_bus, 255);
+        assert_eq!(ranges[0].start_bus, 0);
     }
 
     #[test]

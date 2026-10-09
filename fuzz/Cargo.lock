@@ -221,6 +221,7 @@ dependencies = [
  "critical-section",
  "elf",
  "mpos-abi",
+ "mpos-acpi",
  "mpos-ahci",
  "mpos-arch",
  "mpos-binfmt",

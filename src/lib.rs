@@ -84,6 +84,11 @@ extern crate alloc;
 /// downward edge, not up into `syscall`; `syscall::linux::{nr,abi}` re-export
 /// these instead of redefining them, so there is one table.
 pub use mpos_abi as abi;
+/// The ACPI table reader, as a leaf (`crates/acpi`): the root pointer, the
+/// table walk, and MCFG's memory-mapped configuration windows, down to the
+/// per-function offset. Host-testable and fuzzed, because every question it
+/// answers is arithmetic on bytes the firmware supplied.
+pub use mpos_acpi as acpi;
 /// The AHCI port's own answers, as bits rather than as bus cycles: what a
 /// status word means, and when waiting on one has to stop. Its own leaf crate -
 /// the decode is arithmetic on three `u32`s and the machine half

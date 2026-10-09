@@ -282,6 +282,7 @@ dependencies = [
  "critical-section",
  "elf",
  "mpos-abi",
+ "mpos-acpi",
  "mpos-ahci",
  "mpos-arch",
  "mpos-binfmt",
@@ -354,6 +355,7 @@ dependencies = [
 name = "mpos-boot"
 version = "0.1.0"
 dependencies = [
+ "mpos-acpi",
  "mpos-arch",
  "mpos-bootinfo",
  "uefi",
