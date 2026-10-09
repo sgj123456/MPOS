@@ -69,6 +69,12 @@ const DRM_CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
 const CREATE_SIGNALED: u32 = 1 << 0;
 const H2F_EXPORT_SYNC_FILE: u32 = 1 << 0;
 const F2H_IMPORT_SYNC_FILE: u32 = 1 << 0;
+/// `DRM_SYNCOBJ_*_FLAGS_TIMELINE`: what makes the request's `point` a *timeline*
+/// point rather than a number the operation may ignore. Both directions spell it
+/// `1 << 1`, which is the header's own number - the flags are pinned below
+/// against their behaviour rather than against a copy of this file's constant.
+const H2F_TIMELINE: u32 = 1 << 1;
+const F2H_TIMELINE: u32 = 1 << 1;
 const WAIT_ALL: u32 = 1 << 0;
 const WAIT_FOR_SUBMIT: u32 = 1 << 1;
 const WAIT_AVAILABLE: u32 = 1 << 2;
@@ -188,18 +194,27 @@ fn handle_to_fd(fd: i32, handle: u32, flags: u32, point: u64) -> (isize, i32) {
     (r, get32(&buf, 8) as i32)
 }
 
-/// `SYNCOBJ_FD_TO_HANDLE`, answering the handle it made.
+/// `SYNCOBJ_FD_TO_HANDLE`, answering the handle it made. The `point` field is
+/// left as [`fd_to_handle_at`]'s zero, which is every call but the ones about
+/// the field itself.
 fn fd_to_handle(fd: i32, target: u32, flags: u32, dfd: i32) -> (isize, u32) {
+    fd_to_handle_at(fd, target, flags, dfd, 0)
+}
+
+/// The same request with the `point` field named - the field the two
+/// `*_FLAGS_TIMELINE` flags are about.
+fn fd_to_handle_at(fd: i32, target: u32, flags: u32, dfd: i32, point: u64) -> (isize, u32) {
     let mut buf = [0u8; 24];
     put32(&mut buf, 0, target);
     put32(&mut buf, 4, flags);
     put32(&mut buf, 8, dfd as u32);
+    put64(&mut buf, 16, point);
     let r = lin::ioctl(
         fd,
         ioc_d(NR_SYNCOBJ_FD_TO_HANDLE, 24),
         buf.as_mut_ptr() as usize,
     );
-    (r, get32(&buf, 0))
+    (r, get32(&mut buf, 0))
 }
 
 /// Whether a descriptor polls readable, which is what a `sync_file` says.
@@ -768,6 +783,122 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     );
     let (r, _) = handle_to_fd(fd, fenced, 0x8000, 0);
     lin::check_eq(&mut failed, b"HANDLE_TO_FD with an unknown flag", r, EINVAL);
+
+    // --- the `point` field, and the flag that makes it a timeline point --------
+    // All of this is measured on the real card (§7.4), because the sources say
+    // nothing about `point` at all and the note beside the kernel's constant
+    // used to call the flag a no-op. Three rules on this side, each of which
+    // this card answered differently before:
+    //
+    //   * a non-zero point needs `EXPORT_SYNC_FILE`, the only form whose
+    //     descriptor can carry one;
+    //   * with `TIMELINE` the point is a *timeline* point, so the object must
+    //     have reached it;
+    //   * without `TIMELINE` the point is not read at all.
+    let (r, _) = handle_to_fd(fd, fenced, 0, 5);
+    lin::check_eq(
+        &mut failed,
+        b"a point with no EXPORT_SYNC_FILE is refused",
+        r,
+        EINVAL,
+    );
+    let (r, _) = handle_to_fd(fd, fenced, H2F_TIMELINE, 5);
+    lin::check_eq(
+        &mut failed,
+        b"and TIMELINE alone does not make it legal",
+        r,
+        EINVAL,
+    );
+    // The object for the next pair has to be a *fresh* one: `CREATE` has no
+    // timeline flag, so a new object has no point at all - where the object
+    // above has been a timeline since a point was submitted to it through the
+    // other handle, and would answer this request rather than refusing it.
+    let (r, binary) = create(fd, CREATE_SIGNALED);
+    lin::check_eq(
+        &mut failed,
+        b"a fresh object for the point rule is made",
+        r,
+        0,
+    );
+    let (r, _) = handle_to_fd(fd, binary, H2F_EXPORT_SYNC_FILE | H2F_TIMELINE, 5);
+    lin::check_eq(
+        &mut failed,
+        b"a timeline point on an object that is not a timeline is refused",
+        r,
+        EINVAL,
+    );
+    // The control for the rule above, and the reason it is a control: the *same*
+    // request on the *same* object with one flag fewer is taken, which is what
+    // says the flag is what makes the number a point rather than the number by
+    // itself.
+    let (r, plain_sf) = handle_to_fd(fd, binary, H2F_EXPORT_SYNC_FILE, 5);
+    lin::check_eq(
+        &mut failed,
+        b"while without TIMELINE the same point is not read at all",
+        r,
+        0,
+    );
+    if plain_sf >= 0 {
+        lin::close(plain_sf);
+    }
+    // On a timeline, the point has to be one the object has *reached*, and the
+    // pair that settles it is 5 against 6: "the object is a timeline" alone
+    // would take both.
+    let (r, tl) = create(fd, 0);
+    lin::check_eq(&mut failed, b"an object for the point rules is made", r, 0);
+    lin::check_eq(
+        &mut failed,
+        b"and given a point of 5",
+        timeline_signal(fd, tl, 5),
+        0,
+    );
+    let (r, at5) = handle_to_fd(fd, tl, H2F_EXPORT_SYNC_FILE | H2F_TIMELINE, 5);
+    lin::check_eq(
+        &mut failed,
+        b"the point the object has reached is answered",
+        r,
+        0,
+    );
+    if at5 >= 0 {
+        lin::close(at5);
+    }
+    let (r, below) = handle_to_fd(fd, tl, H2F_EXPORT_SYNC_FILE | H2F_TIMELINE, 3);
+    lin::check_eq(&mut failed, b"and so is a point below it", r, 0);
+    if below >= 0 {
+        lin::close(below);
+    }
+    let (r, _) = handle_to_fd(fd, tl, H2F_EXPORT_SYNC_FILE | H2F_TIMELINE, 6);
+    lin::check_eq(&mut failed, b"but not one above it", r, EINVAL);
+
+    // The import side's half: a non-zero point is the import form's to name, for
+    // the same reason it is the export form's on the other side.
+    let (r, objfd) = handle_to_fd(fd, fenced, 0, 0);
+    lin::check_eq(
+        &mut failed,
+        b"a plain object exports the descriptor the import rules are about",
+        r,
+        0,
+    );
+    if objfd >= 0 {
+        let (r, _) = fd_to_handle_at(fd, 0, 0, objfd, 5);
+        lin::check_eq(
+            &mut failed,
+            b"an import-side point with no IMPORT_SYNC_FILE is refused",
+            r,
+            EINVAL,
+        );
+        let (r, _) = fd_to_handle_at(fd, 0, F2H_TIMELINE, objfd, 5);
+        lin::check_eq(
+            &mut failed,
+            b"and TIMELINE alone does not make it legal",
+            r,
+            EINVAL,
+        );
+        let (r, second) = fd_to_handle_at(fd, 0, 0, objfd, 0);
+        lin::check_eq(&mut failed, b"while point 0 is taken", r, 0);
+        lin::check_true(&mut failed, b"as another handle", second != 0);
+        lin::close(objfd);
+    }
 
     // --- TRANSFER needs one live fence between its two ends ---
     let (r, dst) = create(fd, 0);

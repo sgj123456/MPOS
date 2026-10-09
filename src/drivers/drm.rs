@@ -321,8 +321,17 @@ const SYNCOBJ_CREATE_SIGNALED: u32 = 1 << 0;
 const SYNCOBJ_EXPORT_SYNC_FILE: u32 = 1 << 0;
 const SYNCOBJ_IMPORT_SYNC_FILE: u32 = 1 << 0;
 /// `DRM_SYNCOBJ_*_FLAGS_TIMELINE` on both directions. This host's header has it
-/// and the older upstream one does not; the measured card accepts it and does
-/// not require it, so it is accepted here and changes nothing.
+/// and the older upstream one does not.
+///
+/// The note here used to read "the measured card accepts it and does not
+/// require it, so it is accepted and changes nothing", from an instrument that
+/// sent the flag with a `point` of zero. Measured again with every combination
+/// of flags and points (§7.4), that is half right and misses the half the flag
+/// is *for*: it is what makes the request's `point` a **timeline** point rather
+/// than a number the operation may ignore, and the two directions read it
+/// differently. Both are honoured below - the export side in full, the import
+/// side as far as this card's fence can carry it, with the rest named at the
+/// one place it stops.
 const SYNCOBJ_FLAGS_TIMELINE: u32 = 1 << 1;
 /// The wait flags. `ALL` and `FOR_SUBMIT` are the two with behaviour;
 /// `AVAILABLE` and `DEADLINE` are accepted and mean nothing to a card with no
@@ -6028,7 +6037,29 @@ fn syncobj_handle_to_fd(owner: u64, arg: usize) -> isize {
     // struct drm_syncobj_handle: handle@0, flags@4, fd@8, pad@12, point@16.
     let handle = unsafe { (arg as *const u32).read_unaligned() };
     let flags = unsafe { ((arg + 4) as *const u32).read_unaligned() };
+    let point = unsafe { ((arg + 16) as *const u64).read_unaligned() };
     if flags & !(SYNCOBJ_EXPORT_SYNC_FILE | SYNCOBJ_FLAGS_TIMELINE | DRM_CLOEXEC) != 0 {
+        return libc_einval();
+    }
+    // What `point` means, measured on the real card for every combination of
+    // flags and points (§7.4) rather than read off the sources, which say
+    // nothing about it:
+    //
+    //   * **A non-zero point needs `EXPORT_SYNC_FILE`.** That is the only form
+    //     whose descriptor can carry one: `flags = 0` and `TIMELINE` alone with
+    //     point 5 are both `EINVAL`, while `EXPORT_SYNC_FILE` with the same
+    //     point on the same object succeeds.
+    //   * **With `TIMELINE` the point is a *timeline* point**, so it must be one
+    //     the object has reached: a binary object - which has no timeline and so
+    //     no point at all - refuses any non-zero point, and an object at 5
+    //     answers 0, 1, 3 and 5 and refuses 6 and 100. That last pair is the
+    //     part worth having measured: the rule is `point <= the object's`, not
+    //     merely "the object is a timeline".
+    //   * **Without `TIMELINE` the point is not read at all.** `EXPORT_SYNC_FILE`
+    //     with point 5 on a *binary* object succeeds, which is what says the flag
+    //     is what turns the number into a timeline point rather than the number
+    //     by itself.
+    if point != 0 && flags & SYNCOBJ_EXPORT_SYNC_FILE == 0 {
         return libc_einval();
     }
     let obj = critical_section::with(|cs| {
@@ -6038,6 +6069,12 @@ fn syncobj_handle_to_fd(owner: u64, arg: usize) -> isize {
     let Some(obj) = obj else {
         return -2; // ENOENT
     };
+    if point != 0
+        && flags & SYNCOBJ_FLAGS_TIMELINE != 0
+        && !(obj.is_timeline() && point <= obj.point())
+    {
+        return libc_einval();
+    }
     let want_file = flags & SYNCOBJ_EXPORT_SYNC_FILE != 0;
     let inode: Arc<dyn Inode> = if want_file {
         match obj.fence() {
@@ -6075,7 +6112,16 @@ fn syncobj_fd_to_handle(owner: u64, arg: usize) -> isize {
     let handle = unsafe { (arg as *const u32).read_unaligned() };
     let flags = unsafe { ((arg + 4) as *const u32).read_unaligned() };
     let fd = unsafe { ((arg + 8) as *const i32).read_unaligned() };
+    let point = unsafe { ((arg + 16) as *const u64).read_unaligned() };
     if flags & !(SYNCOBJ_IMPORT_SYNC_FILE | SYNCOBJ_FLAGS_TIMELINE) != 0 {
+        return libc_einval();
+    }
+    // The other half of the export side's first rule, and measured the same way:
+    // a non-zero point is the *import* form's to name, and with `flags = 0` or
+    // `TIMELINE` alone it is refused - importing a plain object with point 5 is
+    // `EINVAL` where point 0 succeeds. What the import form does with the point
+    // is the gap named below.
+    if point != 0 && flags & SYNCOBJ_IMPORT_SYNC_FILE == 0 {
         return libc_einval();
     }
     let file = match crate::sched::current_fds().clone_at(fd) {
@@ -6095,6 +6141,20 @@ fn syncobj_fd_to_handle(owner: u64, arg: usize) -> isize {
         let Some(sync_file) = inode.as_any().downcast_ref::<SyncFileFd>() else {
             return libc_einval();
         };
+        // The fence is handed on and the destination's *point* is not set from
+        // it, which is where this is still narrower than the measured card -
+        // and the measurement is the part worth having, because it says the flag
+        // is not the no-op the constant's old note called it (§7.4). Importing
+        // the `sync_file` of a timeline at 9 into an object at 4 leaves that
+        // object at **9**; adding `TIMELINE` to the same request leaves it at
+        // the caller's **7** instead. So the flag's meaning on this side is
+        // "the point in *this request* is the point to land on, rather than the
+        // one the fence was made at", and this card cannot express either yet: a
+        // [`Fence`] here is a retired flag with no point to inherit
+        // (`crates/gpu/src/sync.rs`), so `submit` with `None` leaves the
+        // destination where it was. Closing it means giving a fence the point it
+        // was made at, which is the change this note is here to make cheap for
+        // whoever measures the rest of the matrix.
         target.submit(sync_file.fence(), None, &mut SchedWaker);
         critical_section::with(|cs| {
             let mut st = STATE.borrow(cs).borrow_mut();
