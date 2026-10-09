@@ -382,14 +382,18 @@ const PRIME_CAPS: u64 = 0x3;
 const CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
 /// `DRM_CAP_CURSOR_WIDTH` / `_HEIGHT`: the largest cursor the hardware takes.
 ///
-/// This card has no cursor plane, so nothing here consumes the size - but a
-/// cap query that answers *success* with value 0 reads to weston as "the
-/// cursor is zero pixels wide" (`device->cursor_width = cap`), and 64 is the
-/// size the kernel itself falls back to. The honest answer is the one a
-/// cursor plane would have, not a zero that would size a buffer to nothing.
+/// This card has a cursor plane, and the size is *consumed*: a framebuffer
+/// larger than [`CURSOR_SIZE`] in either direction cannot be bound to that plane
+/// ([`cursor_fb_ok`]) and a `MODE_CURSOR2` image past it is refused as well, so
+/// the cap answers the same number the checks enforce rather than a fallback.
+/// The note here used to say "this card has no cursor plane, so nothing here
+/// consumes the size" - true when it was written and false from the moment the
+/// plane landed, which makes it worse than a stale number: it is the sentence a
+/// reader trusts.
 const CAP_CURSOR_WIDTH: u64 = 0x8;
 const CAP_CURSOR_HEIGHT: u64 = 0x9;
-/// The cursor a compositor would be handed if it asked for one.
+/// The cursor's largest size in each direction: what the cap answers, and what
+/// the two checks that take a cursor image enforce.
 const CURSOR_SIZE: u64 = 64;
 /// `DRM_CAP_CRTC_IN_VBLANK_EVENT`: the flip and vblank events carry the CRTC
 /// they happened on.
@@ -537,6 +541,17 @@ const PLANE_TYPE_CURSOR: u64 = 2;
 /// pre-multiplied alpha, and straight "coverage" alpha.
 const BLEND_PREMULT: u64 = 0;
 const BLEND_COVERAGE: u64 = 1;
+/// The values `DPMS` and `ACTIVE` carry, in *one* list, because two readers
+/// need the same answer: [`get_property`] advertises it and the write path
+/// refuses what it does not hold.
+///
+/// A property whose range advertises 0..3 and whose write path records 9 is
+/// advertising a shape it does not keep to, and the read-back then hands the
+/// caller a value its own enum has no name for - the same self-contradiction
+/// `max bpc` refuses a 16 over, which is the precedent this follows rather than
+/// a new rule.
+const DPMS_MODES: &[u64] = &[0, 1, 2, 3];
+const ACTIVE_VALUES: &[u64] = &[0, 1];
 
 /// `DRM_MODE_ATOMIC_*`: the commit is a rehearsal (`TEST_ONLY`), a commit that
 /// must be allowed to change the mode (`ALLOW_MODESET`), or one that may
@@ -828,6 +843,11 @@ struct DrmState {
     plane_crtc: u32,
     plane_dst: (u32, u32, u32, u32),
     plane_src: (u32, u32, u32, u32),
+    /// The plane's `pixel blend mode`, as written. It steers nothing - the
+    /// scanout is the compositor's finished frame, so the pixels are already
+    /// pre-multiplied - but it is state a caller may write and read back, which
+    /// is what every other field here is and what this one was not.
+    plane_blend: u64,
     /// The cursor plane: the framebuffer bound to it, the CRTC it serves, where
     /// its hotspot sits on the scanout, and how far into the image that hotspot
     /// is (what `MODE_CURSOR2`'s `hot_x`/`hot_y` carry, and 0,0 for the older
@@ -932,6 +952,7 @@ static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
     plane_crtc: CRTC_ID,
     plane_dst: (0, 0, 0, 0),
     plane_src: (0, 0, 0, 0),
+    plane_blend: BLEND_PREMULT,
     cursor_fb: 0,
     cursor_crtc: CRTC_ID,
     cursor_pos: (0, 0),
@@ -3925,10 +3946,10 @@ fn get_property(arg: usize) -> isize {
         PROP_DPMS => (
             "DPMS",
             PROP_ENUM,
-            &[0, 1, 2, 3],
+            DPMS_MODES,
             &[("On", 0), ("Standby", 1), ("Suspend", 2), ("Off", 3)],
         ),
-        PROP_ACTIVE => ("ACTIVE", PROP_RANGE, &[0, 1], &[]),
+        PROP_ACTIVE => ("ACTIVE", PROP_RANGE, ACTIVE_VALUES, &[]),
         // The plane's class, and the one value it carries here: this is the
         // primary surface, the plane a compositor looks for by name.
         PROP_TYPE => (
@@ -4071,8 +4092,22 @@ fn get_property(arg: usize) -> isize {
 fn set_object_prop(st: &mut DrmState, obj: u32, prop_id: u32, value: u64) -> isize {
     match (obj, prop_id) {
         (CONNECTOR_ID, PROP_CRTC_ID) => st.conn_crtc = value as u32,
-        (CONNECTOR_ID, PROP_DPMS) => st.dpms = value as u32,
-        (CRTC_ID, PROP_ACTIVE) => st.crtc_active = value != 0,
+        // The two enum-shaped properties that are *recorded* and read back, so a
+        // write outside the values their own list advertises is refused rather
+        // than stored: storing it would hand the caller back a number its enum
+        // has no name for, which is a property contradicting itself.
+        (CONNECTOR_ID, PROP_DPMS) => {
+            if !DPMS_MODES.contains(&value) {
+                return libc_einval();
+            }
+            st.dpms = value as u32
+        }
+        (CRTC_ID, PROP_ACTIVE) => {
+            if !ACTIVE_VALUES.contains(&value) {
+                return libc_einval();
+            }
+            st.crtc_active = value != 0
+        }
         (CRTC_ID, PROP_MODE_ID) => st.crtc_mode_id = value as u32,
         // The one connector property that is settable and has a range. A value
         // the range does not hold is refused rather than accepted, which is
@@ -4130,10 +4165,22 @@ fn set_object_prop(st: &mut DrmState, obj: u32, prop_id: u32, value: u64) -> isi
         | (CURSOR_PLANE_ID, PROP_SRC_H)
         | (CURSOR_PLANE_ID, PROP_CRTC_W)
         | (CURSOR_PLANE_ID, PROP_CRTC_H) => {}
-        // Pre-multiplied or coverage alpha: the scanout carries the
-        // compositor's finished frame, so the answer is recorded nowhere -
-        // there is nothing below it to blend against.
-        (PLANE_ID, PROP_BLEND) => {}
+        // Pre-multiplied or coverage alpha. Nothing here *composites* - the
+        // scanout carries the compositor's finished frame, so there is nothing
+        // below it to blend against and the pixels are pre-multiplied by
+        // construction - but the value is still **recorded**, which it was not:
+        // the write used to be dropped while the read path answered
+        // `Pre-multiplied` unconditionally, so a caller that wrote `Coverage`
+        // was told the write succeeded and then read its own answer contradicted.
+        // That is a worse shape than ignoring the write, and it made the sentence
+        // on [`set_object_prop`] - "every property here is state a compositor
+        // reads back" - false of the one property it was written for.
+        (PLANE_ID, PROP_BLEND) => {
+            if value != BLEND_PREMULT && value != BLEND_COVERAGE {
+                return libc_einval();
+            }
+            st.plane_blend = value
+        }
         // The two fence properties are not values to *record* anywhere: a
         // commit that carries one acts on it - the in-fence is waited for before
         // the copy, the out-fence pointer is written back after the flush - and
@@ -5018,7 +5065,7 @@ fn obj_get_properties(arg: usize, ofd: u64) -> isize {
                         dy as u64,
                         dw as u64,
                         dh as u64,
-                        BLEND_PREMULT,
+                        st.plane_blend,
                         -1i64 as u64,
                         // The plane's format-and-modifier list, as a blob id.
                         DRIVER_BLOB_IN_FORMATS as u64,

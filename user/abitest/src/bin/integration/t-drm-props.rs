@@ -44,11 +44,15 @@ const NR_OBJ_GETPROPERTIES: usize = 0xb9;
 const NR_OBJ_SETPROPERTY: usize = 0xba;
 const NR_CREATE_DUMB: usize = 0xb2;
 
-/// The connector and plane this card has, and the object-type tags.
+/// The connector, CRTC and planes this card has, and the object-type tags.
 const CONNECTOR_ID: u32 = 35;
 const PLANE_ID: u32 = 36;
 /// The cursor plane, the card's second one.
 const CURSOR_PLANE_ID: u32 = 37;
+/// The one CRTC - named here for the same reason the others are: the write
+/// checks below name an object, and a bare `34` in an argument tells a reader
+/// nothing about which door it is aimed at.
+const CRTC_ID: u32 = 34;
 const OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 const OBJECT_CRTC: u32 = 0xcccc_cccc;
 const OBJECT_PLANE: u32 = 0xeeee_eeee;
@@ -604,6 +608,117 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             );
         }
         None => lin::check_true(&mut failed, b"the connector has max bpc", false),
+    }
+
+    // --- a write is what the read-back says --------------------------------------------
+    // `max bpc` above refuses a value its range does not hold, and the rule that
+    // makes that worth doing applies to every property that advertises a shape:
+    // a write outside it is refused, and an accepted one is what a caller reading
+    // the property back is told. Two properties broke the second half in
+    // different ways before this.
+    match property_id(fd, PLANE_ID, OBJECT_PLANE, b"pixel blend mode") {
+        Some((id, value)) => {
+            lin::check_eq(
+                &mut failed,
+                b"pixel blend mode starts pre-multiplied",
+                value as isize,
+                0,
+            );
+            let mut arg = [0u8; 24];
+            put64(&mut arg, 0, 1); // Coverage
+            put32(&mut arg, 8, id);
+            put32(&mut arg, 12, PLANE_ID);
+            put32(&mut arg, 16, OBJECT_PLANE);
+            lin::check_eq(
+                &mut failed,
+                b"writing Coverage succeeds",
+                lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize),
+                0,
+            );
+            let (_, back) = property_id(fd, PLANE_ID, OBJECT_PLANE, b"pixel blend mode")
+                .expect("the property is still in the plane's list");
+            lin::check_eq(
+                &mut failed,
+                b"and the read-back says Coverage, not the constant it used to",
+                back as isize,
+                1,
+            );
+            put64(&mut arg, 0, 2); // neither value the enum advertises
+            lin::check_eq(
+                &mut failed,
+                b"while a value the enum does not have is refused",
+                lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize),
+                EINVAL,
+            );
+            // Put it back, so the state the rest of this file reads is the one it
+            // started with.
+            put64(&mut arg, 0, 0);
+            lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize);
+        }
+        None => lin::check_true(&mut failed, b"the plane has pixel blend mode", false),
+    }
+
+    // The other way: a value the property's own enum has no name for used to be
+    // *recorded and handed back*, which is a property contradicting itself rather
+    // than merely ignoring the write.
+    match property_id(fd, CONNECTOR_ID, OBJECT_CONNECTOR, b"DPMS") {
+        Some((id, value)) => {
+            lin::check_eq(&mut failed, b"DPMS starts On", value as isize, 0);
+            let mut arg = [0u8; 24];
+            put64(&mut arg, 0, 9);
+            put32(&mut arg, 8, id);
+            put32(&mut arg, 12, CONNECTOR_ID);
+            put32(&mut arg, 16, OBJECT_CONNECTOR);
+            lin::check_eq(
+                &mut failed,
+                b"a mode the enum does not have is refused",
+                lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize),
+                EINVAL,
+            );
+            put64(&mut arg, 0, 3); // Off
+            lin::check_eq(
+                &mut failed,
+                b"while Off, which it does have, is taken",
+                lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize),
+                0,
+            );
+            let (_, back) = property_id(fd, CONNECTOR_ID, OBJECT_CONNECTOR, b"DPMS")
+                .expect("the property is still in the connector's list");
+            lin::check_eq(&mut failed, b"and reads back as Off", back as isize, 3);
+            put64(&mut arg, 0, 0);
+            lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize);
+        }
+        None => lin::check_true(&mut failed, b"the connector has DPMS", false),
+    }
+
+    // And the CRTC's own one-bit range, which took any number at all.
+    match property_id(fd, CRTC_ID, OBJECT_CRTC, b"ACTIVE") {
+        Some((id, _)) => {
+            let mut arg = [0u8; 24];
+            put64(&mut arg, 0, 2);
+            put32(&mut arg, 8, id);
+            put32(&mut arg, 12, CRTC_ID);
+            put32(&mut arg, 16, OBJECT_CRTC);
+            lin::check_eq(
+                &mut failed,
+                b"ACTIVE outside its two values is refused",
+                lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize),
+                EINVAL,
+            );
+            put64(&mut arg, 0, 0);
+            lin::check_eq(
+                &mut failed,
+                b"while 0 is taken",
+                lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize),
+                0,
+            );
+            let (_, back) = property_id(fd, CRTC_ID, OBJECT_CRTC, b"ACTIVE")
+                .expect("the property is still in the CRTC's list");
+            lin::check_eq(&mut failed, b"and reads back as 0", back as isize, 0);
+            put64(&mut arg, 0, 1);
+            lin::ioctl(fd, ioc_d(NR_OBJ_SETPROPERTY, 24), arg.as_mut_ptr() as usize);
+        }
+        None => lin::check_true(&mut failed, b"the CRTC has ACTIVE", false),
     }
 
     // --- the cursor plane's type, and where the pointer is -----------------------------

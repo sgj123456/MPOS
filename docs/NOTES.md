@@ -3501,6 +3501,32 @@ fields times ten (the relation the measurement found: 30 cm and 19 cm reported
 as 300x190), and `subpixel` is written as the 0 a real connected connector
 reports.
 
+> **Update (2026-10-09): the rule the `max bpc` row carries applies to every
+> property that advertises a shape, and two of them were not keeping it.** A write
+> outside the range or enum a property publishes is `EINVAL`, and an *accepted*
+> write is what a caller reading the property back is told. So `DPMS` 9 and
+> `ACTIVE` 2 are refused now rather than recorded and handed back as numbers their
+> own enums have no name for - and each shares *one* value list with the read path
+> (`DPMS_MODES`, `ACTIVE_VALUES`), so the shape advertised and the shape a write
+> must match cannot drift.
+>
+> `pixel blend mode` was the other way round and worse: the write was dropped
+> while the read path answered `Pre-multiplied` unconditionally, so a caller that
+> wrote `Coverage` was told the write succeeded and then read its own answer
+> contradicted - a property disagreeing with itself rather than merely ignoring
+> the write, and it made `set_object_prop`'s own sentence ("every property here is
+> state a compositor reads back") false of the one property that sentence was
+> written for. It records the value now. Nothing here *composites* - the scanout
+> is the compositor's finished frame, so the pixels are pre-multiplied by
+> construction - which makes the value state rather than a mode, the same honesty
+> `DPMS` and `ACTIVE` have.
+>
+> Pinned by `t-drm-props`. One doc-only fix rides with it: `DRM_CAP_CURSOR_WIDTH`'s
+> note said "this card has no cursor plane, so nothing here consumes the size",
+> which the cursor plane's landing had made false - and a stale premise is worse
+> than a stale number, because it is the sentence a reader trusts. The cap and the
+> two checks that take a cursor image now name the same `CURSOR_SIZE`.
+
 `DRM_CAP_ADDFB2_MODIFIERS` is answered 1 *and* made true: `ADDFB2` takes
 `DRM_MODE_FB_MODIFIERS` with `DRM_FORMAT_MOD_LINEAR` and refuses any other
 modifier with `EINVAL` - which is the `IN_FORMATS` list saying the same thing in
