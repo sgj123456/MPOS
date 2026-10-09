@@ -2820,6 +2820,42 @@ is again read off its source rather than measured, and it is the renderer below.
 > by it - a change nothing yet asks for (niri sets the cap), so it is written
 > down here rather than half-done.
 >
+> **Update, measured (2026-10-09, three `libdrm` probes against the host's own
+> card): the rule above is right, and narrower than the sentence sounds.** Run on
+> two open file descriptions of `/dev/dri/card1` so the cap's *scope* is measured
+> rather than assumed:
+>
+> - **The list is filtered, per open file description.** A CRTC lists **6**
+>   properties on a client that has not set the cap and **9** on one that has -
+>   `ACTIVE`, `MODE_ID` and `OUT_FENCE_PTR` appear only for the capped client, each
+>   carrying the `ATOMIC` flag - and the uncapped descriptor still lists 6 after the
+>   capped one set the cap, so the state is the *file's*.
+> - **Asking by id is not filtered.** `drmModeGetProperty` answers for an atomic
+>   property's id on the uncapped client and reports the flag: what Linux gates is
+>   the *enumeration*, not the door. That is the half a reader gets wrong from the
+>   sentence above, and it is why the fix belongs in the list builder rather than in
+>   `GETPROPERTY`.
+> - **Which properties carry it**: on a plane `FB_ID` and `CRTC_ID` are
+>   `ATOMIC | OBJECT`, and so are `SRC_X`/`SRC_Y`/`SRC_W`/`SRC_H` and
+>   `CRTC_X`/`CRTC_Y`/`CRTC_W`/`CRTC_H` (with `IN_FENCE_FD`, `FB_DAMAGE_CLIPS`),
+>   while `type`, `IN_FORMATS`, `IN_FORMATS_ASYNC`, `zpos`, `rotation`,
+>   `COLOR_ENCODING` and `COLOR_RANGE` are **not**; on a connector only `CRTC_ID`
+>   is, and `EDID`, `DPMS`, `non-desktop`, `max bpc` and `vrr_capable` are not. So
+>   this card's object-typed properties, the plane's position/size family and the
+>   CRTC's `ACTIVE`/`MODE_ID` are exactly the set to mark.
+> - **One property is unmeasured**: this kernel's `pixel blend mode`. The host's
+>   plane lists no blend property at all, so it stays unmarked and says so rather
+>   than being marked because the shape looks like its neighbours.
+>
+> The change that follows is five pieces: `PROP_ATOMIC` (`1 << 31`, `drm_mode.h`'s
+> number); a per-open-file-description cap keyed on the same `ofd` the framebuffers
+> already carry as `owner` (`set_client_cap` takes it; the release path prunes it
+> beside `release_framebuffers`); the flag on the properties above; a filter in
+> `obj_get_properties` (`OBJ_GETPROPERTIES`) that skips them for a client without the
+> cap; and a pin in `t-drm-props` - the plane's `FB_ID` absent from the list before
+> the cap and present with the flag after it, on the same descriptor, with a second
+> descriptor as the control that the state is the file's.
+>
 > One instrument note for whoever takes it: `strace -f niri` ended *two* earlier
 > boots in `KERNEL PANIC: #GP` from ring 0 (err `0x0`, `rip 0xffffffff8004b01f`,
 > with `0xffffffff8013aede` at `rsp+0x0c0`), while `strace /bin/true` in this
