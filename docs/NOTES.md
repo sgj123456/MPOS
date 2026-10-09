@@ -1488,7 +1488,17 @@ card fd announces it - but there is no vertical blank and no `WAIT_VBLANK`; dumb
 offset encoding rather than a DRM VMA manager; leasing is a restricted
 descriptor but `DRM_MODE_SEAL_ALL` and `LEASE_IMMUTABLE` are recorded and not
 enforced, so a sealed lease can still be revoked and a sealed object still
-accepts a mode change; and `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` and
+accepts a mode change - and the *values* of those two flags are not defined by
+any header on the development machine either, which is why the enforcement has
+never been written: they are the one thing in `drivers/drm.rs` accepted on a
+shape argument rather than a measurement. That is worth naming next to the
+`NR_MODE_CREATE_LEASE` mistake three paragraphs above, because the two failures
+look alike and do not behave alike: a wrong **request number** reaches the
+dispatch catch-all and answers `ENOTTY`, loudly, while a wrong **flag** sits
+inside the accepted mask, stores something, and hands the caller back what it
+asked for; and `MODE_CREATE_LEASE` is the master's, so the accepting host's card
+cannot supply the values either. If a header with them turns up, this is the
+place to start; and `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` and
 the colour-pipeline cap are refused `EOPNOTSUPP`, the first of which the
 virtualized drivers are the ones that ask for.
 

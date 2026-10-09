@@ -238,9 +238,23 @@ const NR_MODE_REVOKE_LEASE: u32 = 0xc9;
 const NR_MODE_GET_LEASE: u32 = 0xc8;
 /// `DRM_MODE_LEASE_IMMUTABLE`: the lessor promises not to revoke. Recorded and
 /// reported, *not* enforced below - see [`LeaseSet`].
+///
+/// Both this value and [`LEASE_SEAL_ALL`] are worth a second look for a reason
+/// that is not about this card: **no header on the machine this was written on
+/// defines either name**. The request numbers beside them were once written down
+/// thirteen too high and every caller reached the dispatch catch-all as a result
+/// (§7.4) - and that mistake was *loud*, because a request this card does not
+/// serve answers `ENOTTY`. A wrong **flag** is quiet: the value is inside the
+/// accepted mask, something is stored, and a caller reads back what it asked for.
+/// So these two are accepted on a shape argument rather than a measurement, and
+/// they are the last thing in this file that is. Enforcing them - which is what
+/// would make `IMMUTABLE` mean anything - needs the values first, and this card
+/// cannot supply them: `MODE_CREATE_LEASE` is the master's (`EACCES` otherwise),
+/// so the accepting host's card is out of reach.
 const LEASE_IMMUTABLE: u32 = 1;
 /// `DRM_MODE_SEAL_ALL`: seal every sealing option there is. Same honesty: the
 /// flag is stored so a caller reads back what it asked for, and nothing more.
+/// See [`LEASE_IMMUTABLE`] for why the value itself is unverifiable here.
 const LEASE_SEAL_ALL: u32 = 4;
 const NR_CREATE_DUMB: u32 = 0xb2;
 const NR_MAP_DUMB: u32 = 0xb3;
