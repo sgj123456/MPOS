@@ -58,12 +58,14 @@ are committed. `ext4_write` reuses `ext4_image`'s images - the same disk, read
 by one and written by the other.
 
 `virtgpu_capset` 的种子是**例外**：它不是抓下来的制品，而是按实测形状拼出来的
-——响应码是 `RESP_OK_CAPSET`，载荷长度是 `user/staging/virtgpu-probe/` 测到的两个
+——响应码是 `RESP_OK_CAPSET`，载荷长度是 `user/staging/virtgpu-probe/`（已删除，表在
+`docs/NOTES.md` §7.4）测到的两个
 capset 大小（VIRGL 308、VIRGL2 1408）。真实的是码与长度这两个事实，载荷字节本身
 是零。种子在这里的作用只是把 fuzzer 领进载荷分支：`resp_capset_payload` 要求前
 四个字节正好是那个响应码，纯字节 fuzzer 几乎撞不到。`virtgpu_capset`'s seeds are
 the exception: not a captured artefact but the measured *shape* - the response
-code, and the two cap set sizes `user/staging/virtgpu-probe/` recorded (VIRGL
+code, and the two cap set sizes `user/staging/virtgpu-probe/` recorded (now
+deleted; its table is in `docs/NOTES.md` §7.4) (VIRGL
 308, VIRGL2 1408). The code and the lengths are the real facts; the payload
 bytes are zeroes. All the seeds do is lead the fuzzer into the payload branch,
 which needs those first four bytes to be exactly that code.

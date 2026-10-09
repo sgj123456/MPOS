@@ -3070,7 +3070,9 @@ item in this section.
 The family is written from an observation rather than from the UAPI header,
 because the part worth knowing is not in the header at all: **which requests a
 card with no 3D refuses, and with which errno.** The instrument and the full
-table live in `user/staging/virtgpu-probe/` - Alpine's netboot `virt` kernel in
+table lived in `user/staging/virtgpu-probe/` - that scratch tree is deleted, so
+what remains of the instrument is this paragraph and the table below: Alpine's
+netboot `virt` kernel in
 a twenty-line initramfs, booted on `virtio-gpu-pci` and then on
 `virtio-gpu-gl-pci` + `-display egl-headless,gl=on`. (`virt` and not `lts` for a
 measured reason: the `virt` netboot initramfs already carries `virtio-gpu.ko`,

@@ -559,7 +559,8 @@ struct Resource {
     /// Not `width * height * 4`, and that is Linux's shape rather than a
     /// simplification: `virtio_gpu_resource_create_ioctl` takes `params.size`
     /// from the request and substitutes `PAGE_SIZE` when it is zero, which is
-    /// why the instrument in `user/staging/virtgpu-probe/` measured a 64x64
+    /// why the probe instrument `user/staging/virtgpu-probe/` (now deleted; its
+    /// table is in `docs/NOTES.md` §7.4) measured a 64x64
     /// resource answering `size = 4096`. It is the guest backing's size, and for
     /// a 3D resource it is a placeholder while the device owns the real storage.
     size: u64,

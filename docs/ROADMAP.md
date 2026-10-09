@@ -307,7 +307,7 @@ it - so the entries say which they are:
       `RESOURCE_CREATE` makes a real device resource across the new mailbox to
       the render task, the GL card negotiates `VIRGL` and the driver says so in
       its own words — `virtio-gpu: virgl=1 context_init=1 capsets=2 cached=2
-      mask=0x6`, every number `user/staging/virtgpu-probe/` measured on Linux —
+      mask=0x6`, every number the deleted `user/staging/virtgpu-probe/` measured on Linux —
       and `t-virtgpu` pins the lot, its 3D branch included, on the GL machine
       (`[qemu] gpu` names the card). Both forks §7.4 argued are settled and
       landed — the GPU driver is this kernel's rather than the crate's, and a
