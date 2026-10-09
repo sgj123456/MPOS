@@ -69,12 +69,16 @@ without that yields binaries the loader rejects. (3) **The aarch64 target links 
 only**: a debug build fails with `relocation R_AARCH64_ABS64 …` from the *sysroot's* `liballoc`, and
 no gate notices — anything hand-verifying an aarch64 change must pass `--release`.
 
-**The self-test protocol.** Stage 1 = host unit tests. Stage 2 = builds both test suites, packs
-them into a throwaway initramfs with a generated `/init`, boots it headless with `mpos.selftest`,
-and parses the serial log for `=== RUN/PASS/FAIL t-name` / `=== SUMMARY pass=N fail=N` / `=== END`.
-The run must end with a summary **and** QEMU exit code 33 (`isa-debug-exit`). A test that hangs,
-crashes or never prints `=== PASS` counts as failed — no `#[ignore]` escape hatch; a test that
-cannot work is deleted or made to pass.
+**The self-test protocol.** Stage 1 = host unit tests. Stage 2 = builds the *test* kernel
+(`--features selftest`, copied out of the shared target dir by `utils::build_test_kernel` — a
+production build carries neither the boot's check families nor the harness that runs them,
+`docs/NOTES.md` §15.19), packs both user suites into a throwaway initramfs with a generated `/init`,
+and parses the serial log for the kernel's own `mpos-kunit: N passed, M failed` line plus
+`=== RUN/PASS/FAIL t-name` / `=== SUMMARY pass=N fail=N` / `=== END`. **Both** halves are asserted:
+the sweep must end with a summary **and** QEMU exit code 33 (`isa-debug-exit`), and the kernel's line
+must be there and say zero failed — a suite that silently never ran leaves its cases out of the
+count. A test that hangs, crashes or never prints `=== PASS` counts as failed — no `#[ignore]`
+escape hatch; a test that cannot work is deleted or made to pass.
 
 Both machines read the same protocol from the same `TEST_INIT` runner; what differs is where the
 payload sits. The first machine's boot keeps the initramfs as its root, so its programs ride in that
@@ -259,8 +263,9 @@ fs-type / image-size / hostname / DNS → `rootfs.toml`. Anything about the *mac
 `rootfs.toml` — `rootfs.toml`'s mtime decides whether the Alpine tree is reinstalled, so a machine
 key there charges a full package install for a memory size (`xtask/src/config.rs`'s
 `the_machine_and_the_image_keep_their_own_keys` fails if one drifts back). Boot wiring
-(`mpos.selftest`, the `console=` list) is read via `src/boot/console_list.rs`; the kernel is told
-which consoles it has and nothing about how it was launched.
+(`console=`'s list) is read via `src/boot/console_list.rs`; the kernel is told which consoles it
+has and nothing about how it was launched. It used to read a second word, `mpos.selftest`, to decide
+whether to run its own checks — that is a *build* now, so no boot word decides it (§15.19).
 
 **The second machine's userland is its own half** (`rootfs.toml`'s `[aarch64]` section + the
 `rootfs-aarch64/` overlay; `docs/NOTES.md` §13.12): a package goes in the section, a file in the
@@ -290,7 +295,7 @@ definition the loader and both kernels read now (§13.23) — and the loader's
 | A `src/` file nothing declares looks real | A `mod` declaration makes a file part of the build; missing ones left duplicate serial/RTC drivers for months (V-7). Check for the declared one before writing a new file |
 | A module has a host body and a machine body | **Both move, or it does not build.** Run the bare-metal target on every pass (V-11: the host suite was green while `x86_64-unknown-none` failed on a non-exhaustive `#[cfg]` arm) |
 | A flag or struct constant looks shared but the machines disagree | It is the machine's. `open(2)`'s `O_*` words differ on arm64 and the overlap bit the session-costing `ELOOP` bug (§13.13); `struct stat`/`statx` and the signal frame were the same class. Read **the machine's** uapi and pin both machines (`t-open-flags`) |
-| `cargo xtask run` prints no milestone markers | By design — `M*_OK` checks run only under `mpos.selftest`, which a test/sweep boot carries and a session does not. What a session's wire shows is the machine's own boot log; the checks' meaning and every stage's measurement are `docs/NOTES.md` §9.1 and §13 |
+| `cargo xtask run` prints no `M*_OK` markers and no `mpos-kunit` lines | By design — the boot's checks are in the *test* build alone (`--features selftest`, which `cargo xtask test` builds and `build`/`run`/`disk` do not), so a session's kernel carries none of them. What a session's wire shows is the machine's own boot log; the checks' meaning and every stage's measurement are `docs/NOTES.md` §9.1, §13 and §15.19 |
 | `cargo xtask test` stage 1 goes red in `rand` and nowhere else | A **flake** — re-run before believing it and quote the green run. Measurement, mechanism and fix directions: `docs/NOTES.md` §12.4a |
 | Stage 2 goes red on `t-clock-gettime`'s "two reads never go backwards" | A **flake** of the same kind, in the wall clock rather than in a service: `CLOCK_REALTIME` is the CMOS second plus a tick-derived fraction sampled around it, so two successive reads can step back. Re-run before believing it; the measurement and why it is not this class's subject are in `docs/NOTES.md` §13.27 |
 | A recorded measurement is about the machine that made it | A number already written down is not a measurement of *this* question. The tell is a claim that made a refusal permanent without saying which register, program or run — re-measure before building on it (§13.15) |

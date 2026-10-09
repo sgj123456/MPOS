@@ -7,7 +7,7 @@
 //! the one a `--cfg` could not have expressed here (setting `RUSTFLAGS` replaces
 //! `.cargo/config.toml`'s `[target.*] rustflags` rather than adding to them, so a
 //! test build carrying a `--cfg` would lose the linker script and every `mpos_*`
-//! capability flag; measured, and `docs/NOTES.md` §7.7 records it).
+//! capability flag; measured, and `docs/NOTES.md` §15.19 records it).
 //!
 //! # Why a case is a value and not a panic
 //!

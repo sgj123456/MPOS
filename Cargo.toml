@@ -28,7 +28,7 @@ edition = "2024"
 # extending it, taking the linker script and all nine capability flags with it
 # (measured: four errors in `mpos-arch`) - so the additive form of the switch is
 # the only one that works, and it is also the shape of the thing it imitates
-# (`CONFIG_KUNIT=y`). `docs/NOTES.md` §7.7.
+# (`CONFIG_KUNIT=y`). `docs/NOTES.md` §15.19.
 [features]
 selftest = []
 

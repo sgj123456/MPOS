@@ -114,12 +114,14 @@ booted machine, so its real pins are the milestone checks the bodies and `checks
 | x86_64 `check_arch` → `M1_OK`, `M3_OK` | clock/`int3`, the register-file ABI agreement, W^X and user address spaces |
 | x86_64 `handoff_to_init` → `M8_OK` | `/init` runs as pid 1, forks, execs a shell |
 | aarch64 `check_virtio`/`check_rng`/`check_blk`/`check_fs`/`check_net`/`check_input`/`check_console`/`check_sound`/`check_vsock`/`check_p9` → `M5_*`/`M7_*`/`M8_*` | the MMIO device classes, each failing by name and halting |
-| aarch64 `check_dev`/`check_console_rx`/`check_serial_tx`/`check_input_registry`/`check_console_dev`/`check_gpu_dev`/`check_sound_dev`/`check_p9_dev` | the mounted `/dev`, the console RX/TX paths, the registry and the device nodes |
+| aarch64 `check_dev`/`check_console_rx`/`check_serial_tx`/`check_input_registry`/`check_console_dev`/`check_gpu_dev`/`check_sound_dev`/`check_p9_dev` | the mounted `/dev`, the console RX/TX paths, the registry and the device nodes - and the two console ones are *test-build-only* now (`#[cfg(feature = "selftest")]`), because the harness was their only caller |
 | `report::check_boot_stack` | the boot stack's canary at the two deepest points |
 
-Two honest caveats, both from the code. First, the checks are gated on the `mpos.selftest` word
-(`boot::cmdline_has`) so an ordinary boot pays none of them - a pin only runs when the sweep or a
-verdict boot carries the word. Second, `NOTES.md` §15.6/§15.7 record that the `M*_OK` chain is no
+Two honest caveats, both from the code. First, whether a machine runs its checks at all is now
+decided by which *image* was built (`--features selftest`, `src/board/kunit.rs`) rather than by a word
+on the command line: a kernel from `build`/`run`/`disk` carries neither the families nor the harness,
+and the `mpos.selftest` word the kernel used to parse for that decision is gone from it
+(`NOTES.md` §15.19). Second, `NOTES.md` §15.6/§15.7 record that the `M*_OK` chain is no
 longer parsed by a command of its own: the checks still print their markers and a failure still halts
 the machine, but a boot's verdict is now the sweep's `=== RUN/PASS/FAIL/SUMMARY/END`.
 

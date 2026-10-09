@@ -44,8 +44,8 @@ out of the serial log.
 | `src/initramfs.rs` | the `initramfs` command: one pipeline, two machines — repos, apk, busybox applet farm, overlay, ustar |
 | `src/rootfs.rs` | the `rootfs` command: install the Alpine tree into the disk image through the block layer, refresh the boot files |
 | `src/qemu.rs` | the `run` command: the QEMU wiring, `--mode`/`console=` selection, the accelerator and `machine.toml` |
-| `src/selftest.rs` | the `test` command: stage 1 host unit tests, the two user suites, the throwaway test initramfs (`TEST_INIT`) and the verdict reader; `run_disk_sweep` for aarch64 |
-| `src/sweep.rs` | the half of a sweep that is not the machine: what `tests.toml` means, `select`/`Selection`, the `=== RUN/PASS/FAIL/SUMMARY/END` protocol |
+| `src/selftest.rs` | the `test` command: stage 1 host unit tests, the test kernel (`utils::build_test_kernel`, `--features selftest`, copied out of the shared target directory), the two user suites, the throwaway test initramfs (`TEST_INIT`) and the verdict reader - which asserts the kernel's own `mpos-kunit: N passed, M failed` line beside the sweep's summary; `run_disk_sweep` for aarch64 |
+| `src/sweep.rs` | the half of a sweep that is not the machine: what `tests.toml` means, `select`/`Selection`, the `=== RUN/PASS/FAIL/SUMMARY/END` protocol, and `kunit()` - the kernel's own `mpos-kunit: N passed, M failed` line, which is the other half of the verdict |
 | `src/gates.rs` | the target-gate check run ahead of stage 1: a `#[cfg(test)]` module behind a `target_os = "none"` parent is a test that has never run |
 | `src/depgraph.rs` | the module-graph measurement and ratchet behind `cargo xtask depgraph` |
 | `src/utils.rs` | `build_kernel`, build-dir/profile resolution, ownership repair, `run_status` and the filesystem/process helpers every command shares |

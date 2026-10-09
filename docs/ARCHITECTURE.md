@@ -327,14 +327,17 @@ Details worth knowing:
 - **The boot stack has a canary.** The loader plants one, and `check_boot_stack()` in
   `src/board/x86_64.rs` verifies it twice — before the handoff and again after `spawn_init`, which is
   the deepest call the boot task ever makes.
-- **Boot words on the command line** (`mpos.cmdline`, or QEMU-generated): `mpos.selftest`
-  runs the milestone checks, and `console=` names the consoles the kernel's log goes to —
+- **Boot words on the command line** (`mpos.cmdline`, or QEMU-generated): `console=` names the
+  consoles the kernel's log goes to —
   `console=ttyS0` the serial wire, `console=tty0` the virtual console on the framebuffer. The
   parameter may be repeated, output goes to every console named, and the last is the preferred
   one; a value naming a console this kernel does not have is reported and ignored. There is no
   word for *how the machine was launched*, because that is not a fact about the machine: a
   QEMU booted without a window still has a virtio-gpu and still reports a display mode, so
-  only the command line can say whether the framebuffer console is one of the consoles.
+  only the command line can say whether the framebuffer console is one of the consoles. The word
+  the kernel used to read to decide whether to run its own checks (`mpos.selftest`) is gone from it:
+  that is a build now, so the kernel reads `console=` and nothing about how it was launched
+  (`docs/NOTES.md` §15.19).
   `cargo xtask run --mode terminal|gui|mirror` picks the list — one word per machine:
   the wire alone, the framebuffer alone (`gui`: the text console shows in the window and
   the launcher reads the wire from `build/serial.log` instead of stdio), or the two with

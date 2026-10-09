@@ -30,7 +30,7 @@
 /// instead of a command-line word the kernel parsed on every boot. The flag is a
 /// cargo feature rather than a `--cfg` for a measured reason - a `--cfg` cannot be
 /// *added* to this build, because `RUSTFLAGS` replaces the machine's flags in
-/// `.cargo/config.toml` rather than extending them (`docs/NOTES.md` §7.7).
+/// `.cargo/config.toml` rather than extending them (`docs/NOTES.md` §15.19).
 #[cfg(feature = "selftest")]
 mod checks;
 #[cfg(feature = "selftest")]
