@@ -900,6 +900,151 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
         lin::close(objfd);
     }
 
+    // --- what an import *lands* on ------------------------------------------------------
+    // The other half of the flag, and the half this card answered wrongly in both
+    // directions before (§7.4). Measured on the real card, and the two shapes are
+    // two rules rather than one with a variant:
+    //
+    //   * with `TIMELINE` the request names the point, and it *raises* like every
+    //     other point writer - a destination at 4 asked for 2 stays at 4, and one
+    //     asked for 6 goes to 6;
+    //   * without it the *fence's* own point lands, exactly - a timeline's
+    //     `sync_file` lands its point (9 in the measurement, even when the export
+    //     named 5), and a plain object's lands 0, which is a point going
+    //     backwards through the one door that may do that.
+    //
+    // Both shapes leave the destination a timeline, which is why the pairs below
+    // ask `TIMELINE_WAIT` and not only for the point: an object that reads 0 is
+    // either one that never had a point or one that has just been given point 0,
+    // and only the wait tells them apart.
+    let (r, plain_obj) = create(fd, CREATE_SIGNALED);
+    lin::check_eq(&mut failed, b"a plain object with a fence to export", r, 0);
+    let (r, sf_plain) = handle_to_fd(fd, plain_obj, H2F_EXPORT_SYNC_FILE, 0);
+    lin::check_eq(
+        &mut failed,
+        b"and its sync_file, which carries no point",
+        r,
+        0,
+    );
+    let (r, tl9) = create(fd, 0);
+    lin::check_eq(&mut failed, b"a second object for the timeline side", r, 0);
+    lin::check_eq(&mut failed, b"at point 9", timeline_signal(fd, tl9, 9), 0);
+    let (r, sf9) = handle_to_fd(fd, tl9, H2F_EXPORT_SYNC_FILE, 0);
+    lin::check_eq(&mut failed, b"whose sync_file is exported", r, 0);
+    // The export *at* a point, which the measurement says does not change what a
+    // later import lands on.
+    let (r, sf_at5) = handle_to_fd(fd, tl9, H2F_EXPORT_SYNC_FILE | H2F_TIMELINE, 5);
+    lin::check_eq(
+        &mut failed,
+        b"and one asked for at point 5, which is the third descriptor",
+        r,
+        0,
+    );
+    if sf_plain >= 0 && sf9 >= 0 && sf_at5 >= 0 {
+        // A plain object's fence: no point to carry, so the destination lands on
+        // 0 - below where it was, which no other door here allows.
+        let (_, dst) = create(fd, 0);
+        lin::check_eq(
+            &mut failed,
+            b"a destination at point 4",
+            timeline_signal(fd, dst, 4),
+            0,
+        );
+        let (r, _) = fd_to_handle(fd, dst, F2H_IMPORT_SYNC_FILE, sf_plain);
+        lin::check_eq(&mut failed, b"importing a plain object's sync_file", r, 0);
+        let (_, landed) = query(fd, dst);
+        lin::check_eq(
+            &mut failed,
+            b"lands the fence's own point, 0, below the one it had",
+            landed as isize,
+            0,
+        );
+        lin::check_eq(
+            &mut failed,
+            b"and leaves it a timeline from point 0",
+            timeline_wait_one(fd, dst, 0, 0, 0),
+            0,
+        );
+
+        // A timeline's fence: the point it was made at lands, not the 4 that was
+        // there and not anything the request said.
+        let (_, dst) = create(fd, 0);
+        timeline_signal(fd, dst, 4);
+        let (r, _) = fd_to_handle(fd, dst, F2H_IMPORT_SYNC_FILE, sf9);
+        lin::check_eq(&mut failed, b"importing a timeline's sync_file", r, 0);
+        let (_, landed) = query(fd, dst);
+        lin::check_eq(
+            &mut failed,
+            b"lands that timeline's point, 9",
+            landed as isize,
+            9,
+        );
+
+        // The export *named* a point and it does not matter, which is the check
+        // that separates "the fence's point" from "the request's".
+        let (_, dst) = create(fd, 0);
+        timeline_signal(fd, dst, 4);
+        let (r, _) = fd_to_handle(fd, dst, F2H_IMPORT_SYNC_FILE, sf_at5);
+        lin::check_eq(
+            &mut failed,
+            b"importing the sync_file an export asked for at point 5",
+            r,
+            0,
+        );
+        let (_, landed) = query(fd, dst);
+        lin::check_eq(
+            &mut failed,
+            b"lands the object's own point, 9, and not the 5",
+            landed as isize,
+            9,
+        );
+
+        // The `TIMELINE` half: the request names the point, and it raises.
+        let (_, below) = create(fd, 0);
+        timeline_signal(fd, below, 4);
+        let (r, _) = fd_to_handle_at(fd, below, F2H_IMPORT_SYNC_FILE | F2H_TIMELINE, sf9, 2);
+        lin::check_eq(&mut failed, b"a TIMELINE import is taken", r, 0);
+        let (_, landed) = query(fd, below);
+        lin::check_eq(
+            &mut failed,
+            b"and a point below the destination's leaves it where it was",
+            landed as isize,
+            4,
+        );
+        let (_, above) = create(fd, 0);
+        timeline_signal(fd, above, 4);
+        let (r, _) = fd_to_handle_at(fd, above, F2H_IMPORT_SYNC_FILE | F2H_TIMELINE, sf9, 6);
+        lin::check_eq(&mut failed, b"a second TIMELINE import", r, 0);
+        let (_, landed) = query(fd, above);
+        lin::check_eq(
+            &mut failed,
+            b"with a point above it moves it",
+            landed as isize,
+            6,
+        );
+
+        // And the shape that says a plain object is *made* a timeline by an
+        // import: it refuses `TIMELINE_WAIT` first, and answers it afterwards.
+        let (_, fresh) = create(fd, 0);
+        lin::check_eq(
+            &mut failed,
+            b"a fresh object refuses TIMELINE_WAIT",
+            timeline_wait_one(fd, fresh, 0, 0, 0),
+            EINVAL,
+        );
+        let (r, _) = fd_to_handle(fd, fresh, F2H_IMPORT_SYNC_FILE, sf_plain);
+        lin::check_eq(&mut failed, b"an import into it is taken", r, 0);
+        lin::check_eq(
+            &mut failed,
+            b"and leaves it a timeline from point 0",
+            timeline_wait_one(fd, fresh, 0, 0, 0),
+            0,
+        );
+        for fd_ in [sf_plain, sf9, sf_at5] {
+            lin::close(fd_);
+        }
+    }
+
     // --- TRANSFER needs one live fence between its two ends ---
     let (r, dst) = create(fd, 0);
     lin::check_eq(&mut failed, b"a destination object is made", r, 0);

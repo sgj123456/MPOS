@@ -3697,15 +3697,35 @@ it is the same absence as `DRM_CAP_ASYNC_PAGE_FLIP` being 0.
 > pinned by `t-drm-sync`, whose new checks include the 5-against-6 pair that
 > separates "the object is a timeline" from "the object has reached *this* point".
 >
-> **The third bullet is not built, and is now the family's honest residual** in
-> place of the vague "no `TIMELINE`-flag behaviour" this section used to carry. It
-> cannot be, without a change one level down: a `Fence` here is a retired flag with
-> no point to inherit (`crates/gpu/src/sync.rs`), so an import has nothing to set
-> the destination's point *from* - today it leaves the destination where it was,
-> which the measurement above says is wrong in both directions. Closing it means
-> giving a fence the point it was made at, which is a change to that shape rather
-> than to the ioctl, and it is named at the exact line it stops on in
-> `syncobj_fd_to_handle`.
+> **The third bullet was built too, one measurement later, and the further
+> measurement is what made it possible.** The paragraph above left it open because
+> an import then had nothing to set the destination's point *from*: a `Fence` here
+> is a retired flag with no point to inherit. Three more probes on the same card
+> answered the questions that had to come first, and each answer is a rule rather
+> than a detail:
+>
+> - **The two import shapes are two rules, not one with a variant.** With
+>   `TIMELINE` the request names the point and it *raises*, like every other point
+>   writer here - a destination at 4 imported at 2 stays at **4**, and at 6 goes to
+>   **6**. Without the flag the *fence's* own point lands and it is **set**, not
+>   raised: importing a plain object's `sync_file` into an object at 4 leaves it at
+>   **0**, which is the one door in this family that may move a point backwards.
+> - **The fence's point is the exporting object's, snapshotted at export.** An
+>   export *asked for* `point = 5` from an object at 9 lands a later import on
+>   **9** - so the number the request named is not the number that travels. That is
+>   why the descriptor carries the point rather than a reference to the object: the
+>   object may move on, and a descriptor already handed out does not.
+> - **An import makes the destination a timeline, point 0 included.** A plain
+>   object refuses `TIMELINE_WAIT`; after an import of a *plain* object's
+>   `sync_file` it answers it from point 0. That is what makes the first bullet
+>   observable at all, and it is why "reads 0" cannot be read as "never a
+>   timeline": the two shapes read the same and answer differently.
+>
+> Built as `SyncObj::replace` in `crates/gpu/src/sync.rs` - one method, two host
+> tests, one per half - and `SyncFileFd`'s `point` field in `drivers/drm.rs`.
+> Pinned by `t-drm-sync`, whose new checks ask `TIMELINE_WAIT` as well as reading
+> the point back, because reading 0 alone cannot tell "never had a point" from
+> "just been given point 0".
 
 **Gate, quoted from its own summary**: host `615 passed`; `mpos-xtask 36 passed`;
 guest `=== SUMMARY pass=131 fail=0 (131 built)`, QEMU exit 33, `9 of 140 user

@@ -247,6 +247,39 @@ impl SyncObj {
         });
     }
 
+    /// Replace this object's fence and land it on **exactly** `point`.
+    ///
+    /// One caller: `FD_TO_HANDLE` with `IMPORT_SYNC_FILE` and *without* the
+    /// `TIMELINE` flag, where the point that lands is the imported fence's own
+    /// rather than one the request named. It is measured on the real card rather
+    /// than inferred (§7.4), because it is the opposite of every other writer
+    /// here in both of its halves:
+    ///
+    ///   * **The point is *set*, not raised.** An object at 4 imported from a
+    ///     plain object's `sync_file` reads **0** afterwards, and one imported
+    ///     from a timeline's reads that timeline's point (9 in the measurement) -
+    ///     so a point may go *backwards* through this door, which
+    ///     [`SyncObj::submit_point`]'s high-water mark exists to prevent
+    ///     everywhere else.
+    ///   * **The object becomes a timeline either way**, including when the point
+    ///     lands on 0 - so `timeline` is set here rather than left to whether the
+    ///     landed point is non-zero. That is what makes the first bullet
+    ///     observable at all: a plain object refuses `TIMELINE_WAIT`, and one
+    ///     that has been imported *into* answers it from point 0 onwards.
+    ///
+    /// The `TIMELINE`-flagged import is the other half of the same request and
+    /// does *not* come here - it names its point and raises, like every other
+    /// writer, which is [`SyncObj::submit`]'s `Some(p)`.
+    pub fn replace(&self, fence: Arc<Fence>, point: u64, waker: &mut dyn Waker) {
+        critical_section::with(|cs| {
+            let mut inner = self.inner.borrow(cs).borrow_mut();
+            inner.fence = Some(fence);
+            inner.timeline = true;
+            inner.point = point;
+        });
+        self.wake_waiters(waker);
+    }
+
     /// Register a task to be woken when a fence is submitted here.
     pub fn subscribe(&self, id: WaiterId) {
         critical_section::with(|cs| {
@@ -417,6 +450,44 @@ mod tests {
         assert_eq!(dst.point(), 3);
         assert!(dst.ready(Some(3), false));
         assert!(!dst.ready(Some(4), false));
+    }
+
+    #[test]
+    fn an_import_lands_the_point_exactly_and_makes_the_object_a_timeline() {
+        // The two halves of `replace`, each of which is the opposite of the
+        // other point writers here, and each measured on the real card (§7.4).
+        let obj = SyncObj::new(false);
+        assert!(!obj.is_timeline());
+
+        // A destination already *above* the imported point, so "set" and "raise"
+        // are distinguishable - `submit_point` would leave this at 4.
+        obj.submit(Fence::retired(), Some(4), &mut Recorder::default());
+        obj.replace(Fence::retired(), 0, &mut Recorder::default());
+        assert_eq!(obj.point(), 0, "the point is set, not raised");
+        assert!(obj.has_fence());
+        // And it is a timeline even though the point landed on 0, which is what
+        // makes the line above meaningful rather than a reset by another name.
+        assert!(obj.is_timeline());
+        assert!(obj.ready(Some(0), false));
+
+        // The other direction: a point above the destination appears too.
+        obj.replace(Fence::retired(), 9, &mut Recorder::default());
+        assert_eq!(obj.point(), 9);
+        assert!(obj.ready(Some(9), false));
+        assert!(!obj.ready(Some(10), false));
+    }
+
+    #[test]
+    fn a_plain_object_imported_into_is_a_timeline_from_point_zero() {
+        // A fresh object refuses `TIMELINE_WAIT`; one that a fence has been
+        // imported into answers it from point 0 onwards. Measured: importing a
+        // plain object's `sync_file` into a fresh object leaves it a timeline
+        // whose point reads 0 - a shape the sources have no word for.
+        let obj = SyncObj::new(false);
+        assert!(!obj.ready(Some(0), false));
+        obj.replace(Fence::retired(), 0, &mut Recorder::default());
+        assert!(obj.is_timeline());
+        assert!(obj.ready(Some(0), false));
     }
 
     #[test]

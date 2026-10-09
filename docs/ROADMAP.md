@@ -297,15 +297,18 @@ it - so the entries say which they are:
       ready. `crates/gpu/src/sync.rs` holds the state machine with nine host tests,
       `t-drm-sync` pins 103 checks including a waiter woken by another task, and
       `IN_FENCE_FD` is now waited for rather than stored and ignored.
-      `DRM_CAP_SYNCOBJ` and `DRM_CAP_SYNCOBJ_TIMELINE` are `1`; the gaps left
-      are named in §7.4 (an out-fence that is already through, and the two
-      `TIMELINE` flags' *`point`*) - the flags turned out not to be the no-op
-      they were written down as: a non-zero `point` needs the sync_file form, and
-      with `TIMELINE` it must be one the object has reached, both now refused as
-      the card refuses them and pinned by `t-drm-sync`. The third rule the same
-      measurement found - that an *import* lands the destination on the fence's
-      point, or on the caller's with the flag - is **not** built, because a fence
-      here carries no point to land on; §7.4 says so at the line it stops on
+      `DRM_CAP_SYNCOBJ` and `DRM_CAP_SYNCOBJ_TIMELINE` are `1`; the one gap left
+      is named in §7.4 (an out-fence that is already through) - and the two
+      `TIMELINE` flags are no longer one of them: the flags turned out not to be
+      the no-op they were written down as, and three rounds of measurement on the
+      card ended with all of it built. A non-zero `point` needs the sync_file
+      form; with `TIMELINE` the export point must be one the object has reached;
+      and an *import* lands the destination on the fence's own point - snapshotted
+      at export - or on the caller's with the flag, which *raises* where the first
+      *sets* and may even move a point backwards. Both import shapes leave the
+      destination a timeline, point 0 included. Pinned by `t-drm-sync`, whose new
+      checks ask `TIMELINE_WAIT` as well as reading the point back, since reading
+      0 alone cannot tell "never had a point" from "just been given point 0"
 - [~] `DRM_VIRTGPU_*` 3D — the only path that makes `is_software()` false, and so
       the only one that lets niri, which rejects software EGL outright, run at
       all; virgl and venus are both built on it (§7.4). **The family is served

@@ -329,9 +329,10 @@ const SYNCOBJ_IMPORT_SYNC_FILE: u32 = 1 << 0;
 /// of flags and points (§7.4), that is half right and misses the half the flag
 /// is *for*: it is what makes the request's `point` a **timeline** point rather
 /// than a number the operation may ignore, and the two directions read it
-/// differently. Both are honoured below - the export side in full, the import
-/// side as far as this card's fence can carry it, with the rest named at the
-/// one place it stops.
+/// differently. Both are honoured below, and on the import side the flag is what
+/// chooses between two rules rather than one - "the request names the point, and
+/// it raises" against "the fence's own point lands, exactly". `SyncFileFd`'s
+/// `point` field is what carries the second.
 const SYNCOBJ_FLAGS_TIMELINE: u32 = 1 << 1;
 /// The wait flags. `ALL` and `FOR_SUBMIT` are the two with behaviour;
 /// `AVAILABLE` and `DEADLINE` are accepted and mean nothing to a card with no
@@ -5738,14 +5739,34 @@ impl Inode for SyncObjFd {
 pub struct SyncFileFd {
     ino: u64,
     fence: Arc<crate::gpu::sync::Fence>,
+    /// The timeline point the fence was made at, snapshotted when this
+    /// descriptor was made - 0 for a fence that has no point, which is every
+    /// fence this card makes for a *frame*.
+    ///
+    /// It is a snapshot rather than a reference to the object it came from
+    /// because that is what the measurement says it is: exporting a timeline
+    /// object's `sync_file` and then importing it lands the destination on the
+    /// point the object had *when it was exported*, which is the same fact
+    /// Linux keeps in the exported fence's own sequence number. A later signal
+    /// on the source does not move a descriptor already handed out.
+    point: u64,
 }
 
 impl SyncFileFd {
+    /// A `sync_file` over a fence with no timeline point - the shape every fence
+    /// this card makes for a frame is, because there is no engine here to have a
+    /// sequence number.
     fn new(fence: Arc<crate::gpu::sync::Fence>) -> Arc<SyncFileFd> {
+        SyncFileFd::at(fence, 0)
+    }
+
+    /// A `sync_file` over a fence *and* the point it was made at.
+    fn at(fence: Arc<crate::gpu::sync::Fence>, point: u64) -> Arc<SyncFileFd> {
         static NEXT: AtomicU64 = AtomicU64::new(0x9300);
         Arc::new(SyncFileFd {
             ino: NEXT.fetch_add(1, Ordering::Relaxed),
             fence,
+            point,
         })
     }
 
@@ -5753,6 +5774,12 @@ impl SyncFileFd {
     /// `IMPORT_SYNC_FILE`.
     pub fn fence(&self) -> Arc<crate::gpu::sync::Fence> {
         self.fence.clone()
+    }
+
+    /// The point that fence was made at - what an import *without* the
+    /// `TIMELINE` flag lands its destination on.
+    pub fn point(&self) -> u64 {
+        self.point
     }
 }
 
@@ -6078,7 +6105,13 @@ fn syncobj_handle_to_fd(owner: u64, arg: usize) -> isize {
     let want_file = flags & SYNCOBJ_EXPORT_SYNC_FILE != 0;
     let inode: Arc<dyn Inode> = if want_file {
         match obj.fence() {
-            Some(fence) => SyncFileFd::new(fence),
+            // The descriptor carries the point the object has *now*, and the
+            // measurement is what says so rather than the request's `point`: an
+            // export asked for at point 5 from an object at 9 lands a later
+            // import on **9** (§7.4). It is also what makes the point a snapshot
+            // instead of a reference - the object may move on, and the fence a
+            // caller is holding does not.
+            Some(fence) => SyncFileFd::at(fence, obj.point()),
             None => return libc_einval(),
         }
     } else {
@@ -6141,21 +6174,24 @@ fn syncobj_fd_to_handle(owner: u64, arg: usize) -> isize {
         let Some(sync_file) = inode.as_any().downcast_ref::<SyncFileFd>() else {
             return libc_einval();
         };
-        // The fence is handed on and the destination's *point* is not set from
-        // it, which is where this is still narrower than the measured card -
-        // and the measurement is the part worth having, because it says the flag
-        // is not the no-op the constant's old note called it (§7.4). Importing
-        // the `sync_file` of a timeline at 9 into an object at 4 leaves that
-        // object at **9**; adding `TIMELINE` to the same request leaves it at
-        // the caller's **7** instead. So the flag's meaning on this side is
-        // "the point in *this request* is the point to land on, rather than the
-        // one the fence was made at", and this card cannot express either yet: a
-        // [`Fence`] here is a retired flag with no point to inherit
-        // (`crates/gpu/src/sync.rs`), so `submit` with `None` leaves the
-        // destination where it was. Closing it means giving a fence the point it
-        // was made at, which is the change this note is here to make cheap for
-        // whoever measures the rest of the matrix.
-        target.submit(sync_file.fence(), None, &mut SchedWaker);
+        // Which point lands, and it is the flag that decides - measured both
+        // ways on the real card (§7.4), because the two are not variants of one
+        // rule but two rules:
+        //
+        //   * **With `TIMELINE` the request names it**, and the bookkeeping is
+        //     every other point writer's: it *raises*, so a destination at 4
+        //     asked for 2 stays at 4 and one asked for 6 goes to 6.
+        //   * **Without it the fence's own point lands, exactly.** Importing the
+        //     `sync_file` of a timeline at 9 into an object at 4 leaves that
+        //     object at **9**; importing a plain object's leaves it at **0**,
+        //     which is a point going *backwards* - the one door here that may do
+        //     that. Both shapes leave the destination a timeline, which is
+        //     `replace`'s other half.
+        if flags & SYNCOBJ_FLAGS_TIMELINE != 0 {
+            target.submit(sync_file.fence(), Some(point), &mut SchedWaker);
+        } else {
+            target.replace(sync_file.fence(), sync_file.point(), &mut SchedWaker);
+        }
         critical_section::with(|cs| {
             let mut st = STATE.borrow(cs).borrow_mut();
             sync_events_left(&mut st, owner, handle);
