@@ -3065,6 +3065,27 @@ item in this section.
 > after one command cannot be measured through, which is why the boot-time
 > instrument above exists.
 
+> **Update, landed: the two dumb-buffer divergences are closed lazily.** The table
+> below measured three answers this card gave that Linux's does not, and two of them
+> had one fix: `RESOURCE_INFO`'s `res_handle` was 0 for a plain dumb buffer where
+> Linux names a resource, and `TRANSFER_TO_HOST` on one was `EINVAL` where Linux
+> completes the copy. The reason the fix was deferred is in `crates/gpu/src/
+> virtgpu.rs`'s header - making `CREATE_DUMB` create the device resource, as Linux's
+> `virtio_gpu_mode_dumb_create` does, "would make every dumb buffer eagerly backed and
+> add a device round trip to a path the console, weston and the fbdev node all
+> allocate through". So the resource is made **lazily** instead, on the first request
+> that addresses the handle as one (`drivers/drm.rs`'s `back_dumb_with_a_resource`):
+> `RESOURCE_INFO` and `TRANSFER_TO_HOST` answer as Linux's do, and a caller that never
+> asks pays neither the eager backing nor the round trip. That is a difference in this
+> implementation and not in the ABI - the id is opaque and no request reports whether
+> a resource exists without asking about it - and the pages materialised are the ones
+> the scanout has been reading, so the transfer copies the pixels the caller drew.
+> Pinned by `t-drm`, which now asserts a dumb buffer's `RESOURCE_INFO` is non-zero,
+> that asking twice names the same resource, that the transfer completes, and that a
+> handle this card never made is still `ENOENT`. The third divergence - a transfer
+> whose rectangle does not fit the backing the device was given is refused where Linux
+> would read past it - stays, and is a refusal rather than a different answer.
+
 #### Measured: what Linux's card answers, request by request
 
 The family is written from an observation rather than from the UAPI header,

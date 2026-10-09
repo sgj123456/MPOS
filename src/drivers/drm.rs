@@ -554,7 +554,10 @@ struct Resource {
     /// and so does this), and it starts above the scanout's own framebuffer,
     /// which is `virtgpu_abi::RESOURCE_FB` and is not in this table.
     id: u32,
-    /// The size the *caller* asked for, or a page when it asked for zero.
+    /// The size the *caller* asked for, or a page when it asked for zero - and
+    /// the buffer's own `pitch * height` when the resource was made for a dumb
+    /// buffer, which is the size Linux's `virtio_gpu_mode_dumb_create` gives the
+    /// object it creates.
     ///
     /// Not `width * height * 4`, and that is Linux's shape rather than a
     /// simplification: `virtio_gpu_resource_create_ioctl` takes `params.size`
@@ -635,15 +638,6 @@ impl Dumb {
 
     fn size(&self) -> u64 {
         self.pitch as u64 * self.height as u64
-    }
-
-    /// The size `RESOURCE_INFO` reports: the resource's when this is one, and
-    /// the buffer's own geometry otherwise.
-    fn info_size(&self) -> u64 {
-        match &self.resource {
-            Some(r) => r.size,
-            None => self.size(),
-        }
     }
 
     /// Grow to cover page `idx`, returning its frame (0 if the cap or memory
@@ -1866,33 +1860,152 @@ fn virtgpu_resource_create(arg: usize, ofd: u64) -> isize {
     0
 }
 
+/// Back a plain dumb buffer with the `DRM_VIRTGPU_*` device resource Linux's
+/// `CREATE_DUMB` would have made for it, the first time a caller addresses the
+/// handle as one.
+///
+/// On Linux there is no such thing as "a dumb buffer that is not a resource":
+/// `virtio_gpu_mode_dumb_create` goes through `virtio_gpu_object_create`, the
+/// same object creation `RESOURCE_CREATE` uses, so `RESOURCE_INFO` names it and
+/// `TRANSFER_TO_HOST` completes. Here a dumb buffer has been the card's own
+/// pages and nothing else - the scanout copy reads them directly and the device
+/// was never told - and the two answers that produced are named in
+/// `crates/gpu/src/virtgpu.rs`'s header.
+///
+/// **The backing is made here rather than in `CREATE_DUMB`, and that is a
+/// difference in this implementation and not in the ABI.** Every dumb buffer
+/// would otherwise be eagerly backed and cost a device round trip at creation -
+/// and the console, weston and the fbdev node all allocate through exactly that
+/// path while none of them ever asks this question. A caller that asks gets
+/// Linux's answer; a caller that does not pays nothing. What a client can
+/// observe is the same either way: the id is opaque, and no request reports
+/// whether a resource exists without asking about it.
+///
+/// The pages are materialised before the device is told, because the command
+/// names their addresses as the backing and cannot be handed a page that does
+/// not exist yet - the same reason `Dumb::resource` takes its frames already
+/// made. The list is grown through `ensure_page`, so the frames stay the ones
+/// the scanout and the fbdev node have been reading: the device's copy is a
+/// *second* view of the same pixels, and a transfer is what moves them.
+///
+/// Answers `(the resource's id, its size)`, or `ENOENT` for a handle this card
+/// never made. Idempotent: a buffer that already has one answers with it, which
+/// is also what a second caller finds if two race.
+fn back_dumb_with_a_resource(handle: usize) -> Result<(u32, u64), isize> {
+    let existing = critical_section::with(|cs| -> Result<Option<(u32, u64)>, isize> {
+        let st = STATE.borrow(cs).borrow();
+        let Some(d) = st
+            .dumb
+            .get(handle.wrapping_sub(1))
+            .and_then(|slot| slot.as_ref())
+        else {
+            return Err(-2); // ENOENT
+        };
+        Ok(d.resource.as_ref().map(|r| (r.id, r.size)))
+    })?;
+    if let Some(found) = existing {
+        return Ok(found);
+    }
+
+    // Everything under the lock is arithmetic and `Vec` growth; the device round
+    // trip below happens with no lock held, because the task that answers it is
+    // the render task and a caller parked holding this lock would be waiting for
+    // something it is itself preventing (`RESOURCE_CREATE` says the same).
+    let prepared = critical_section::with(|cs| -> Result<Option<_>, isize> {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        let Some(d) = st
+            .dumb
+            .get_mut(handle.wrapping_sub(1))
+            .and_then(|s| s.as_mut())
+        else {
+            return Err(-2); // ENOENT
+        };
+        if d.resource.is_some() {
+            return Ok(None); // another caller got there first
+        }
+        let pages = (d.size() as usize).div_ceil(PAGE_SIZE);
+        for page in 0..pages {
+            if d.ensure_page(page) == 0 {
+                // The pages made so far stay: they are this buffer's own, and
+                // `DESTROY_DUMB` releases them whether a resource was made or
+                // not.
+                return Err(-12); // ENOMEM
+            }
+        }
+        let entries: Vec<(u64, u32)> = d
+            .frames
+            .iter()
+            .take(pages)
+            .map(|&p| (p as u64, PAGE_SIZE as u32))
+            .collect();
+        Ok(Some((d.width, d.height, entries, d.size())))
+    });
+    let Some((width, height, entries, size)) = (match prepared {
+        Ok(found) => found,
+        Err(errno) => return Err(errno),
+    }) else {
+        // The race above: whoever won has recorded the resource, so its id is
+        // there to answer with.
+        return back_dumb_with_a_resource(handle);
+    };
+
+    // The id is taken only once a command is really going to be sent, so a
+    // caller that failed above leaves no gap in the sequence. The device never
+    // hears an id it was not told about either way.
+    let id = critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        let id = st.next_res_id;
+        st.next_res_id = st.next_res_id.wrapping_add(1);
+        id
+    });
+
+    let made = crate::drivers::video::render::job(crate::drivers::video::render::Job::Create2d {
+        id,
+        width,
+        height,
+        entries,
+    });
+    if made != 0 {
+        return Err(made);
+    }
+
+    critical_section::with(|cs| {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        if let Some(d) = st
+            .dumb
+            .get_mut(handle.wrapping_sub(1))
+            .and_then(|s| s.as_mut())
+            && d.resource.is_none()
+        {
+            d.resource = Some(Resource {
+                id,
+                size,
+                virgl: false,
+            });
+        }
+    });
+    Ok((id, size))
+}
+
 /// `DRM_VIRTGPU_RESOURCE_INFO`: what a handle names.
 ///
 /// The handle has to be one this card made - anything else is `ENOENT`, which is
 /// Linux's answer from `drm_gem_object_lookup` - and the size is the resource's
-/// own when the handle is one. `res_handle` is the device's id for a resource
-/// and **zero for a plain dumb buffer**, which is a difference from Linux worth
-/// naming: there, `CREATE_DUMB` goes through the same object creation as a
-/// resource and a dumb buffer *is* a device resource. Here it is not - this
-/// card's scanout copy reads the frames directly and the device is never told
-/// about a dumb buffer at all - and zero is the protocol's own spelling for "no
-/// resource" (`SET_SCANOUT` uses it the same way), so the field says what is
-/// true rather than inventing an id.
+/// own when the handle is one.
+///
+/// A plain dumb buffer gets its resource made here, on this request, because
+/// that is what Linux's `CREATE_DUMB` would have done at creation: see
+/// [`back_dumb_with_a_resource`] for why this card makes it on the request that
+/// asks rather than on the one that allocates, and for why the answer a caller
+/// reads is Linux's either way.
 fn virtgpu_resource_info(arg: usize) -> isize {
     let handle = unsafe { (arg as *const u32).read_unaligned() } as usize;
-    let found = critical_section::with(|cs| {
-        let st = STATE.borrow(cs).borrow();
-        let d = st
-            .dumb
-            .get(handle.wrapping_sub(1))
-            .and_then(|slot| slot.as_ref())?;
-        Some((d.resource.as_ref().map(|r| r.id), d.info_size()))
-    });
-    let Some((res_id, size)) = found else {
-        return -2; // ENOENT
+    let (id, size) = match back_dumb_with_a_resource(handle) {
+        Ok(found) => found,
+        Err(errno) => return errno,
     };
     unsafe {
-        ((arg + 4) as *mut u32).write_unaligned(res_id.unwrap_or(0));
+        ((arg + 4) as *mut u32).write_unaligned(id);
         ((arg + 8) as *mut u32).write_unaligned(size as u32);
         ((arg + 12) as *mut u32).write_unaligned(0); // blob_mem: no blobs here
     }
@@ -1960,12 +2073,13 @@ fn virtgpu_wait(arg: usize) -> isize {
 /// so a caller asking for anything else is asking about a shape the resource
 /// does not have and is refused `EINVAL`.
 ///
-/// A handle with no device resource - a plain dumb buffer - is also `EINVAL`.
-/// Linux completes that request; here there is no device-side resource to copy
-/// into, and the honest answer is that this command does not apply to that
-/// handle. It is named in `NOTES.md` §7.4 with the divergence above rather than
-/// answered `0`, because a transfer that did nothing while reporting success is
-/// the false success this repository forbids.
+/// A plain dumb buffer is a device resource on Linux, and it is one here now:
+/// the first transfer against such a handle makes the resource and copies into
+/// it, which is the answer Linux gives. Before that this was `EINVAL` - "this
+/// command does not apply to that handle" - which was honest about this card and
+/// was not Linux's; [`back_dumb_with_a_resource`] records what changed and why
+/// the backing is made on the request that wants it rather than at
+/// `CREATE_DUMB`.
 ///
 /// **Two routes, chosen by the resource rather than by this request**, because
 /// one struct carries both and cannot say which it means. A 3D resource goes
@@ -2001,8 +2115,16 @@ fn virtgpu_transfer_to_host(arg: usize, ofd: u64) -> isize {
     let Some(res) = found else {
         return -2; // ENOENT
     };
-    let Some((id, size, virgl)) = res else {
-        return libc_einval(); // a dumb buffer is not a device resource
+    // A plain dumb buffer is a device resource on Linux, so the first transfer
+    // against one has it made here and then takes the 2D path below: the
+    // resource's pages are the ones the scanout has been reading, so the copy
+    // this request sends is of the pixels the caller drew.
+    let (id, size, virgl) = match res {
+        Some(resource) => resource,
+        None => match back_dumb_with_a_resource(handle) {
+            Ok((id, size)) => (id, size, false),
+            Err(errno) => return errno,
+        },
     };
 
     if virgl {

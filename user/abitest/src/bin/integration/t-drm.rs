@@ -54,6 +54,12 @@ const NR_MAP_DUMB: usize = 0xb3;
 /// the version handshake, the auth pair, and the handle release.
 const NR_GETFB: usize = 0xad;
 const NR_GETFB2: usize = 0xce;
+/// The `DRM_VIRTGPU_*` pair a dumb buffer has to answer as Linux's does: the
+/// resource it names, and the copy into the device that this request makes.
+/// Both are refused for a handle this card never made, and both answer for a
+/// dumb buffer now.
+const NR_RESOURCE_INFO: usize = 0x45;
+const NR_TRANSFER_TO_HOST: usize = 0x47;
 const NR_GETPLANE: usize = 0xb6;
 const NR_MODE_CURSOR: usize = 0xa3;
 const NR_MODE_CURSOR2: usize = 0xbb;
@@ -237,6 +243,82 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
             back == 0xdead_beef,
         );
     }
+
+    // RESOURCE_INFO on it: on Linux a dumb buffer *is* a device resource
+    // (`virtio_gpu_mode_dumb_create` goes through the same object creation a
+    // RESOURCE_CREATE does), so `res_handle` names one and the size is the
+    // buffer's own. This kernel used to answer 0 here and `EINVAL` for the
+    // transfer below, which were the two divergences named in
+    // `crates/gpu/src/virtgpu.rs`'s header; both are Linux's answers now, and
+    // the resource is made on the first request that asks for it rather than at
+    // CREATE_DUMB (that function's own reasoning says why).
+    let mut info = [0u8; 16];
+    info[0..4].copy_from_slice(&handle.to_ne_bytes()); // bo_handle
+    let r = lin::ioctl(fd, ioc_d(NR_RESOURCE_INFO, 16), info.as_mut_ptr() as usize);
+    lin::check_eq(
+        &mut failed,
+        b"RESOURCE_INFO succeeds for a dumb buffer",
+        r,
+        0,
+    );
+    let res_handle = u32::from_ne_bytes([info[4], info[5], info[6], info[7]]);
+    lin::check_true(
+        &mut failed,
+        b"a dumb buffer names a device resource",
+        res_handle != 0,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"the resource size is the dumb buffer's own",
+        u64_at(&info, 8) as isize,
+        size as isize,
+    );
+    // Asking twice answers the same resource: it is made once, not per request.
+    let mut info2 = [0u8; 16];
+    info2[0..4].copy_from_slice(&handle.to_ne_bytes());
+    let r = lin::ioctl(fd, ioc_d(NR_RESOURCE_INFO, 16), info2.as_mut_ptr() as usize);
+    lin::check_eq(&mut failed, b"RESOURCE_INFO is idempotent", r, 0);
+    lin::check_true(
+        &mut failed,
+        b"and names the same resource twice",
+        u32::from_ne_bytes([info2[4], info2[5], info2[6], info2[7]]) == res_handle,
+    );
+
+    // TRANSFER_TO_HOST of the whole buffer: Linux completes it, and so does this
+    // now. The box is the identity rectangle because a 2D resource has one
+    // layer and no mips - a caller asking for another shape is asking about
+    // something the resource does not have.
+    let mut xfer = [0u8; 44];
+    xfer[0..4].copy_from_slice(&handle.to_ne_bytes()); // bo_handle
+    xfer[16..20].copy_from_slice(&64u32.to_ne_bytes()); // box.w
+    xfer[20..24].copy_from_slice(&64u32.to_ne_bytes()); // box.h
+    xfer[24..28].copy_from_slice(&1u32.to_ne_bytes()); // box.d: one layer
+    let r = lin::ioctl(
+        fd,
+        ioc_d(NR_TRANSFER_TO_HOST, 44),
+        xfer.as_mut_ptr() as usize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"TRANSFER_TO_HOST completes for a dumb buffer",
+        r,
+        0,
+    );
+    // And an unknown handle is still ENOENT rather than a resource conjured for
+    // it - the answer the lookup gives before any device work.
+    let mut unknown = [0u8; 16];
+    unknown[0..4].copy_from_slice(&0xffff_ff00u32.to_ne_bytes());
+    let r = lin::ioctl(
+        fd,
+        ioc_d(NR_RESOURCE_INFO, 16),
+        unknown.as_mut_ptr() as usize,
+    );
+    lin::check_eq(
+        &mut failed,
+        b"RESOURCE_INFO refuses a handle this card never made",
+        r,
+        -2,
+    );
 
     // ADDFB the buffer: fb_cmd width@4,height@8,pitch@12,bpp@16,handle@24 -> fb_id@0.
     let mut fb = [0u8; 28];

@@ -45,24 +45,34 @@
 //! rather than the old one.
 //!
 //! Three things are this card's rather than Linux's, and each is named where it
-//! happens rather than left to be found:
+//! happens rather than left to be found - two of them closed since this header
+//! was written:
 //!
 //! 1. **`TRANSFER_FROM_HOST` is `ENOSYS` here and on Linux alike** - that one is
 //!    the measurement, not a divergence: the only command that reads a resource
 //!    back is the 3D transfer.
-//! 2. **`RESOURCE_INFO`'s `res_handle` is 0 for a plain dumb buffer.** On Linux a
-//!    dumb buffer *is* a device resource and the field names it; here one is the
-//!    card's own pages and the device was never told about it, so the field says
-//!    the protocol's own "no resource" (`SET_SCANOUT` spells it the same way).
-//! 3. **`TRANSFER_TO_HOST` on a plain dumb buffer is `EINVAL`** where Linux
-//!    completes it - same reason, and answered as "this command does not apply to
-//!    that handle" rather than `0`, because a transfer that did nothing while
-//!    reporting success is the false success this repository forbids.
+//! 2. **`RESOURCE_INFO`'s `res_handle` was 0 for a plain dumb buffer.** On Linux
+//!    a dumb buffer *is* a device resource and the field names it; here one is
+//!    the card's own pages and the device was never told about it, so the field
+//!    said the protocol's own "no resource" (`SET_SCANOUT` spells it the same
+//!    way). **Closed**: `drivers/drm.rs`'s `back_dumb_with_a_resource` makes the
+//!    resource on the first request that addresses the handle as one, so a
+//!    client reads Linux's answer and a client that never asks - the console,
+//!    weston and the fbdev node all allocate through `CREATE_DUMB` and none of
+//!    them asks - pays neither the eager backing nor the device round trip that
+//!    deferred the fix.
+//! 3. **`TRANSFER_TO_HOST` on a plain dumb buffer was `EINVAL`** where Linux
+//!    completes it - same cause, and it was answered as "this command does not
+//!    apply to that handle" rather than `0`, because a transfer that did nothing
+//!    while reporting success is the false success this repository forbids.
+//!    **Closed with 2**: the first transfer against such a handle makes the
+//!    resource and then takes the 2D path, which is the copy Linux makes.
 //!
-//! The fix for 2 and 3 is one change and is recorded in `NOTES.md` §7.4: make
-//! `CREATE_DUMB` create a device resource too, as Linux's does. It is not here
-//! because it would make every dumb buffer eagerly backed and add a device round
-//! trip to a path the console, weston and the fbdev node all allocate through.
+//! What is left is a *refusal* rather than a different answer: a transfer whose
+//! rectangle does not fit the backing the device was given is refused where
+//! Linux would read past it, and `RESOURCE_CREATE_BLOB` is `EINVAL` on both
+//! shapes because there are no blobs here. `NOTES.md` §7.4 keeps the measurement
+//! of all of them.
 //!
 //! Nothing here is `cfg`-gated, for the same reason `drm_sync.rs` and
 //! `drm_blob.rs` are not: these are decisions about numbers, and a decision
