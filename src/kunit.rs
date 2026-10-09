@@ -80,6 +80,44 @@ pub struct Suite {
     pub cases: &'static [Case],
 }
 
+/// How many task verdicts can be in flight at once.
+///
+/// Four, because each suite that spawns a task takes a slot of its own rather than
+/// sharing one: a task cannot return a value to the case that spawned it, so it
+/// stores its answer here and the case reads it out - and two suites' tasks must
+/// not be able to overwrite each other's (`docs/NOTES.md` §15.22).
+const VERDICT_SLOTS: usize = 4;
+
+/// What a spawned task found, one slot per suite.
+static VERDICTS: critical_section::Mutex<
+    core::cell::RefCell<[Option<Result<(), String>>; VERDICT_SLOTS]>,
+> = critical_section::Mutex::new(core::cell::RefCell::new([None, None, None, None]));
+
+/// Store what a task found, for the case that spawned it.
+///
+/// A task's half of a case cannot answer through `case_check!`: there is no case
+/// to return to inside a task, and an `assert!` there would end the machine
+/// instead of naming what broke. Storing the verdict is how a task's claim
+/// becomes part of its case's answer.
+pub fn record_verdict(slot: usize, what: Result<(), String>) {
+    critical_section::with(|cs| VERDICTS.borrow(cs).borrow_mut()[slot] = Some(what));
+}
+
+/// Take the verdict the task in `slot` stored, or fail because it never stored
+/// one.
+///
+/// A slot still empty after the task has been reaped is a failure of its own: it
+/// means the task left without reaching its verdict, so the half of the case it
+/// owned was never checked at all.
+pub fn take_verdict(slot: usize, who: &str) -> Result<(), String> {
+    let answer = critical_section::with(|cs| VERDICTS.borrow(cs).borrow_mut()[slot].take());
+    answer.unwrap_or_else(|| {
+        Err(alloc::format!(
+            "{who} was reaped without reaching a verdict, so its half was never checked"
+        ))
+    })
+}
+
 /// A check that answers the failed case's message.
 ///
 /// A macro rather than a function because the body has to *return* from the case,

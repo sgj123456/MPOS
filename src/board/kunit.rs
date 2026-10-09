@@ -37,19 +37,12 @@ use super::checks;
 pub(crate) const SUITES: &[Suite] = &[
     mpos::mm::kunit::SUITE,
     mpos::sched::kunit::SUITE,
-    // The two families still checked from this layer. Each is one case whose body
-    // answers by panicking, and each moves into its own module next - `vfs` to
-    // `mpos::vfs::kunit`, and the syscall gate with the tty and the signal path to
-    // `mpos::syscall::kunit`, which is where that cross-subsystem half belongs
-    // (`docs/NOTES.md` §15.20, §15.21).
-    Suite {
-        name: "vfs",
-        phase: Phase::Vfs,
-        cases: &[Case {
-            name: "mounts",
-            run: checks::case_vfs,
-        }],
-    },
+    mpos::vfs::kunit::SUITE,
+    mpos::syscall::kunit::SUITE,
+    // The one family still checked from this layer. It is one case whose body
+    // answers by panicking, and it moves into `mpos::syscall::kunit` next - the
+    // tty and the signal path with the syscall gate's own cases, which
+    // `mpos::vfs::kunit` carries until then (`docs/NOTES.md` §15.22).
     Suite {
         name: "ipc",
         phase: Phase::Ipc,

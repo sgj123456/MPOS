@@ -179,6 +179,11 @@ pub const INIT_PID: TaskId = TaskId(1);
 
 /// Permanent tasks: the boot task and the scheduler. Anything above this count
 /// is a task the tests started and have not finished reaping.
+/// The two tasks that are alive from the beginning: the boot task and the
+/// scheduler. Only [`permanent_tasks`] reads it, and that is a test-build door -
+/// so this is a test-build constant, and nothing in a shipping kernel counts
+/// permanent tasks at all (`docs/NOTES.md` §15.22).
+#[cfg(feature = "selftest")]
 const PERMANENT_TASKS: usize = 2;
 
 /// Tasks started as permanent since boot - see [`spawn_permanent`]. Kept apart
@@ -7171,6 +7176,7 @@ fn child_alive(t: &Table, parent: TaskId) -> bool {
 /// The count has to move, not be a constant: the network service is a task that
 /// never exits and is started at a time of the boot code's choosing, and a
 /// `drain` that kept the old figure would wait on it forever.
+#[cfg(feature = "selftest")]
 pub fn permanent_tasks() -> usize {
     PERMANENT_TASKS + PERMANENT_EXTRA.load(Ordering::Relaxed)
 }

@@ -27,6 +27,12 @@ pub mod eventfd;
 pub mod ext4;
 pub mod file;
 pub mod inotify;
+/// The filesystem layer's suite for a test build: the bootstrap ramfs, a mounted
+/// tree and two tasks sharing one file, with the syscall gate's cases beside them
+/// until they follow the tty-and-signals half to `mpos::syscall::kunit`
+/// (`docs/NOTES.md` §15.22). Listed by the wiring layer's harness.
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub mod kunit;
 pub mod locks;
 #[cfg(target_os = "none")]
 pub mod memfd;

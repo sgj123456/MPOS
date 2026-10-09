@@ -5,8 +5,8 @@ use mpos::sched::{self, Priority};
 use mpos::syscall::{err, linux::nr as lnr};
 use mpos::vfs;
 
-use super::vfs::syscall;
 use mpos::sched::kunit::{drain, wait_for_code};
+use mpos::syscall::kunit::syscall;
 
 // ---- ipc: pipes, TTY line discipline, signals ---------------------------
 

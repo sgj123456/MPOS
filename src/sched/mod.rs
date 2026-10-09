@@ -20,6 +20,16 @@ mod runtime;
 pub mod kunit;
 
 pub use policy::{ARGS_BYTES_MAX, ARGV_MAX, Priority, TaskId};
+/// How many tasks are alive forever, which is what [`kunit`]'s wait-for-the-other
+/// tasks helper compares against.
+///
+/// Gated on the test build, and that is the finding this step ended at: with the
+/// `vfs` suite no longer waiting on the task count, every reader of this function
+/// is inside `sched::kunit` - so it is not part of the kernel's surface and not
+/// even part of a shipping kernel's code. It was a hook, and it is now gone from
+/// production rather than merely `pub(crate)` (`docs/NOTES.md` §15.22).
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub(crate) use runtime::permanent_tasks;
 #[cfg(target_os = "none")]
 pub use runtime::spawn_init;
 #[cfg(target_os = "none")]
@@ -41,8 +51,8 @@ pub use runtime::{
     has_deliverable_signal, has_live_child, has_seccomp_filter, has_tracer, init, insert_vma,
     is_child, is_running, is_stopped, itimer_snapshot, itimer_swap, kernel_lazy_accessible,
     madvise_dontneed, map_anon, map_facts, map_frames, may_inspect, membarrier_registrations,
-    move_user_page, munmap_user, nice_of, oom_score_adj_of, parent_of, pause, permanent_tasks,
-    pgid_of, poll_any_child, poll_any_child_event, populate_user_page_at, preempt, process_members,
+    move_user_page, munmap_user, nice_of, oom_score_adj_of, parent_of, pause, pgid_of,
+    poll_any_child, poll_any_child_event, populate_user_page_at, preempt, process_members,
     protect_user, protect_user_range, read_sigchld, read_user, read_user_of, record_eager_range,
     register_membarrier, release_user_frames, reset_disposition, resolve_anon_fault,
     resolve_cow_fault, resolve_script, resolve_stack_growth, resume_traced, rlimits_of,

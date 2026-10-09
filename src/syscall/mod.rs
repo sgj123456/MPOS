@@ -16,6 +16,13 @@
 //! struct offset reads as a red test instead of a mystery on the machine.
 
 /// Linux x86_64 syscall number mapping and POSIX handlers.
+/// The syscall layer's suite for a test build: the dispatch gate, entered from a
+/// task and from the kernel, with the tty and the signal cases to follow when the
+/// last family leaves the wiring layer's checks directory. Listed by the harness
+/// (`src/board/kunit.rs`); `docs/NOTES.md` §15.22 records why the gate's cases
+/// could not stay in `vfs`'s suite.
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub mod kunit;
 pub mod linux;
 
 /// Base address for user mmap: where every process's mmap cursor starts.
