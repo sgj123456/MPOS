@@ -32,7 +32,7 @@ use crate::config::RootfsConfig;
 use crate::utils::{image_path, project_root};
 
 pub fn build_disk(build_dir: &Path, _profile: &str, arch: Arch) -> Result<()> {
-    let config = RootfsConfig::load(&project_root()?.join("rootfs.toml"), arch)?;
+    let config = RootfsConfig::load(&project_root()?.join(crate::paths::ROOTFS_CONFIG), arch)?;
     let image = image_path(build_dir, arch);
 
     if image.exists() {
@@ -535,7 +535,7 @@ fn medium_is_stale(
     }
     let project = crate::utils::project_root()?;
     for input in [
-        project.join("rootfs.toml"),
+        project.join(crate::paths::ROOTFS_CONFIG),
         project.join(crate::rootfs::CORE_OVERLAY),
         project.join(arch.root_overlay()),
     ] {

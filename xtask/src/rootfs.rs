@@ -46,7 +46,7 @@ pub(crate) fn effective_mode(arch: Arch) -> Result<RunMode> {
 
 pub fn build_rootfs(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
     let root = utils::project_root()?;
-    let config_path = root.join("rootfs.toml");
+    let config_path = root.join(crate::paths::ROOTFS_CONFIG);
     let config = RootfsConfig::load(&config_path, arch)?;
 
     let image = utils::image_path(build_dir, arch);
@@ -254,7 +254,7 @@ pub fn ensure(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
 /// The image is what [`needs_rebuild`] leaves out, on purpose.
 fn stamp_inputs(root: &Path, build_dir: &Path, profile: &str, arch: Arch) -> Result<Vec<PathBuf>> {
     Ok(vec![
-        root.join("rootfs.toml"),
+        root.join(crate::paths::ROOTFS_CONFIG),
         utils::kernel_path(profile, arch)?,
         utils::loader_path(profile, arch)?,
         crate::initramfs::archive_path(build_dir, arch),
@@ -476,7 +476,7 @@ pub(crate) fn write_resolver(mount_dir: &Path, config: &RootfsConfig) -> Result<
 /// **both** images before their per-machine trees. A file belongs here when both
 /// machines want the same answer and nothing about the hardware says otherwise;
 /// `rootfs-core/root/README` is the inventory and the rule.
-pub(crate) const CORE_OVERLAY: &str = "rootfs-core";
+pub(crate) const CORE_OVERLAY: &str = crate::paths::ROOTFS_CORE;
 
 /// Merge the shared core first, then the machine's own tree over it - so a
 /// machine may still replace anything the core carries, and the pair is applied
@@ -874,7 +874,7 @@ pub fn needs_full_install(build_dir: &Path, arch: Arch) -> Result<bool> {
     if !utils::image_path(build_dir, arch).exists() || !stamp.exists() {
         return Ok(true);
     }
-    utils::newer(&root.join("rootfs.toml"), &stamp)
+    utils::newer(&root.join(crate::paths::ROOTFS_CONFIG), &stamp)
 }
 
 /// Undoes what a run that was killed left behind.
@@ -1329,7 +1329,7 @@ mod tests {
             let inputs = stamp_inputs(&root, build_dir, "debug", arch).expect("the paths resolve");
 
             assert!(
-                inputs.contains(&root.join("rootfs.toml")),
+                inputs.contains(&root.join(crate::paths::ROOTFS_CONFIG)),
                 "the configuration is an input"
             );
             assert!(
@@ -1507,7 +1507,8 @@ mod tests {
     #[test]
     fn the_shared_inittab_is_the_one_both_images_get() {
         let root = crate::utils::project_root().unwrap();
-        let stock = fs::read_to_string(root.join("rootfs-core/etc/inittab")).unwrap();
+        let stock =
+            fs::read_to_string(root.join(crate::paths::ROOTFS_CORE).join("etc/inittab")).unwrap();
         assert!(
             !stock.contains("@SERIAL_GETTY@"),
             "the placeholder is gone from the file and from the build"
@@ -1545,7 +1546,10 @@ mod tests {
 
         // And the merge lands it byte for byte on either machine: the file the
         // tree carries is the file the image gets.
-        for (arch, machine_tree) in [(Arch::X86_64, "rootfs"), (Arch::Aarch64, "rootfs-aarch64")] {
+        for (arch, machine_tree) in [
+            (Arch::X86_64, crate::paths::ROOTFS_OVERLAY_X86_64),
+            (Arch::Aarch64, crate::paths::ROOTFS_OVERLAY_AARCH64),
+        ] {
             let dir = staged_dir(&format!("inittab-{}", arch.name()));
             merge_overlays(&root, machine_tree, &dir).unwrap();
             assert_eq!(
@@ -1566,28 +1570,43 @@ mod tests {
         // here rather than silently re-splitting the userlands.
         let root = crate::utils::project_root().unwrap();
         for path in [
-            "rootfs-core/etc/inittab",
-            "rootfs-core/etc/network/interfaces",
-            "rootfs-core/etc/resolv.conf",
-            "rootfs-core/etc/doas.conf",
-            "rootfs-core/root/README",
+            "etc/inittab",
+            "etc/network/interfaces",
+            "etc/resolv.conf",
+            "etc/doas.conf",
+            "root/README",
         ] {
             assert!(
-                root.join(path).is_file(),
-                "the shared overlay must carry {path}"
+                root.join(crate::paths::ROOTFS_CORE).join(path).is_file(),
+                "the shared overlay must carry rootfs-core/{path}"
             );
         }
         // And the halves that stayed per-machine, because they are hardware
         // facts: the Wayland session's pieces live only in `rootfs/`.
-        assert!(root.join("rootfs/etc/profile.d/xdg-runtime.sh").is_file());
+        assert!(
+            root.join(crate::paths::ROOTFS_OVERLAY_X86_64)
+                .join("etc/profile.d/xdg-runtime.sh")
+                .is_file()
+        );
         assert!(
             !root
-                .join("rootfs-core/etc/profile.d/xdg-runtime.sh")
+                .join(crate::paths::ROOTFS_CORE)
+                .join("etc/profile.d/xdg-runtime.sh")
                 .exists()
         );
         // One inittab now exists in the repository, not two.
-        assert!(!root.join("rootfs/etc/inittab").exists());
-        assert!(!root.join("rootfs-aarch64/etc/inittab").exists());
+        assert!(
+            !root
+                .join(crate::paths::ROOTFS_OVERLAY_X86_64)
+                .join("etc/inittab")
+                .exists()
+        );
+        assert!(
+            !root
+                .join(crate::paths::ROOTFS_OVERLAY_AARCH64)
+                .join("etc/inittab")
+                .exists()
+        );
     }
 
     #[test]

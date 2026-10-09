@@ -852,7 +852,7 @@ mod tests {
     #[test]
     fn an_overlay_lands_at_the_target_root_and_overwrites() {
         let dir = scratch("overlay");
-        let src = dir.join("rootfs");
+        let src = dir.join(crate::paths::ROOTFS_OVERLAY_X86_64);
         let dst = dir.join("target");
         fs::create_dir_all(src.join("etc/init.d")).unwrap();
         fs::write(src.join("etc/abc"), "from the overlay").unwrap();
@@ -869,7 +869,7 @@ mod tests {
             "the overlay has to replace what the base system put there"
         );
         assert!(
-            !dst.join("rootfs").exists(),
+            !dst.join(crate::paths::ROOTFS_OVERLAY_X86_64).exists(),
             "the overlay is not a directory in the target"
         );
         assert!(dst.join("etc/init.d").is_dir(), "directories are merged");
@@ -884,7 +884,7 @@ mod tests {
         // link, an applet alias - must stay a link on both images, or the two
         // machines' trees would mean different things by the same name.
         let dir = scratch("overlay-symlink");
-        let src = dir.join("rootfs-core");
+        let src = dir.join(crate::paths::ROOTFS_CORE);
         let dst = dir.join("target");
         fs::create_dir_all(src.join("usr/share/zoneinfo")).unwrap();
         fs::write(src.join("usr/share/zoneinfo/UTC"), "tz data").unwrap();
@@ -905,7 +905,7 @@ mod tests {
     #[test]
     fn a_directory_in_the_overlay_replaces_a_file_of_the_same_name() {
         let dir = scratch("overlay-dir");
-        let src = dir.join("rootfs");
+        let src = dir.join(crate::paths::ROOTFS_OVERLAY_X86_64);
         let dst = dir.join("target");
         fs::create_dir_all(src.join("etc/abc")).unwrap();
         fs::write(src.join("etc/abc/inner"), "x").unwrap();

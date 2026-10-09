@@ -148,8 +148,8 @@ impl Arch {
     /// `rootfs::merge_overlays`; this is the per-machine tree merged after.
     pub fn root_overlay(self) -> &'static str {
         match self {
-            Arch::X86_64 => "rootfs",
-            Arch::Aarch64 => "rootfs-aarch64",
+            Arch::X86_64 => crate::paths::ROOTFS_OVERLAY_X86_64,
+            Arch::Aarch64 => crate::paths::ROOTFS_OVERLAY_AARCH64,
         }
     }
 

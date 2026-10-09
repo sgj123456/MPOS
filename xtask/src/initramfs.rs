@@ -110,8 +110,8 @@ struct Machine {
 
 const X86_64: Machine = Machine {
     arch: Arch::X86_64,
-    config: "initramfs.toml",
-    overlay: "initramfs",
+    config: crate::paths::INITRAMFS_CONFIG,
+    overlay: crate::paths::INITRAMFS_OVERLAY_X86_64,
     staging: "initramfs",
     dirs: &["etc/apk/keys", "proc", "sys", "dev", "sysroot"],
     tar: "initramfs.tar",
@@ -125,8 +125,8 @@ const AARCH64: Machine = Machine {
     arch: Arch::Aarch64,
     // One file for both machines now: which half is read is `[default]` plus
     // `[aarch64]`, resolved by `config::parse_sectioned_toml`.
-    config: "initramfs.toml",
-    overlay: "initramfs-aarch64",
+    config: crate::paths::INITRAMFS_CONFIG,
+    overlay: crate::paths::INITRAMFS_OVERLAY_AARCH64,
     staging: "aarch64-initramfs",
     dirs: &["etc/apk/keys"],
     tar: "aarch64-initramfs.tar",
@@ -512,7 +512,11 @@ mod tests {
     #[test]
     fn the_farm_covers_the_scripts_vocabulary() {
         let root = utils::project_root().unwrap();
-        let text = std::fs::read_to_string(root.join("initramfs-aarch64/init")).unwrap();
+        let text = std::fs::read_to_string(
+            root.join(crate::paths::INITRAMFS_OVERLAY_AARCH64)
+                .join("init"),
+        )
+        .unwrap();
         let line = text
             .lines()
             .find(|l| l.starts_with("@vocabulary:"))
@@ -544,7 +548,7 @@ mod tests {
             X86_64.config, AARCH64.config,
             "one file holds both machines' halves now; the section is what differs"
         );
-        assert_eq!(X86_64.config, "initramfs.toml");
+        assert_eq!(X86_64.config, crate::paths::INITRAMFS_CONFIG);
     }
 
     /// The two machines' archives are two files, and each machine's boot reads

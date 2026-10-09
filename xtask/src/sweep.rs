@@ -74,7 +74,7 @@ pub struct Plan<'a, T> {
 /// Loaded here rather than by each arm so the file's path is one fact. A missing
 /// file is an empty configuration, which is `TestConfig::load`'s own rule.
 pub fn load_config() -> Result<TestConfig> {
-    TestConfig::load(&utils::project_root()?.join("tests.toml"))
+    TestConfig::load(&utils::project_root()?.join(crate::paths::TESTS_CONFIG))
 }
 
 /// Choose what this run boots, refusing a group nobody defined.
@@ -265,8 +265,8 @@ aarch64 = ["t-drm"]
         // suite runs in parallel and a shared path is a race - a test that goes
         // red one run in ten is the kind this repository refuses.
         let dir = std::env::temp_dir().join(format!("mpos-sweep-tests-{name}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("tests.toml");
+        std::fs::create_dir_all(dir.join(crate::paths::TESTS_CONFIG).parent().unwrap()).unwrap();
+        let path = dir.join(crate::paths::TESTS_CONFIG);
         std::fs::write(&path, TOML).unwrap();
         TestConfig::load(&path).unwrap()
     }

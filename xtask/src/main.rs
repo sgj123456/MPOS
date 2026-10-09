@@ -12,6 +12,7 @@ mod disk;
 mod fat;
 mod gates;
 mod initramfs;
+mod paths;
 mod qemu;
 mod rootfs;
 mod selftest;

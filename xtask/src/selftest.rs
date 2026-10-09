@@ -772,8 +772,10 @@ pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()>
     // has: both come from the machine's own configuration (`rootfs.root_device`,
     // `rootfs.serial_port`), because the disk the sweep boots is the same GPT
     // shape the install writes and its partition carries the same name.
-    let rootfs =
-        crate::config::RootfsConfig::load(&utils::project_root()?.join("rootfs.toml"), arch)?;
+    let rootfs = crate::config::RootfsConfig::load(
+        &utils::project_root()?.join(crate::paths::ROOTFS_CONFIG),
+        arch,
+    )?;
     let cmdline = format!(
         "console={} mpos.selftest root={} rootfstype={}\n",
         rootfs.serial_port, rootfs.root_device, rootfs.filesystem
@@ -1057,7 +1059,8 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask sits under the repository root");
-        let config = crate::config::TestConfig::load(&root.join("tests.toml")).unwrap();
+        let config =
+            crate::config::TestConfig::load(&root.join(crate::paths::TESTS_CONFIG)).unwrap();
         let machine = crate::config::Machine::Aarch64;
         assert!(
             config.group_names(machine).contains(&"aarch64"),

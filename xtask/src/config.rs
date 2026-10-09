@@ -328,7 +328,11 @@ impl QemuConfig {
     /// wants: `machine.toml` for the machine, `rootfs.toml` for the name.
     pub fn load_default(arch: Arch) -> Result<Self> {
         let root = crate::utils::project_root()?;
-        Self::load(&root.join("machine.toml"), &root.join("rootfs.toml"), arch)
+        Self::load(
+            &root.join(crate::paths::MACHINE_CONFIG),
+            &root.join(crate::paths::ROOTFS_CONFIG),
+            arch,
+        )
     }
 
     /// The values one machine's half of `machine.toml` carries, keyed by their
@@ -990,9 +994,10 @@ qemu.gpu = \"c\"
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask sits under the repository root");
-        let machine = std::fs::read_to_string(root.join("machine.toml"))
+        let machine = std::fs::read_to_string(root.join(crate::paths::MACHINE_CONFIG))
             .expect("machine.toml is the machine half of the configuration");
-        let image = std::fs::read_to_string(root.join("rootfs.toml")).expect("rootfs.toml");
+        let image =
+            std::fs::read_to_string(root.join(crate::paths::ROOTFS_CONFIG)).expect("rootfs.toml");
 
         for arch in [Arch::X86_64, Arch::Aarch64] {
             let machine_keys = parse_sectioned_toml(&machine, arch).unwrap();
@@ -1038,7 +1043,7 @@ qemu.gpu = \"c\"
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask sits under the repository root");
-        let machine = std::fs::read_to_string(root.join("machine.toml")).unwrap();
+        let machine = std::fs::read_to_string(root.join(crate::paths::MACHINE_CONFIG)).unwrap();
         let x86_map = parse_sectioned_toml(&machine, Arch::X86_64).unwrap();
         let arm_map = parse_sectioned_toml(&machine, Arch::Aarch64).unwrap();
 
@@ -1064,8 +1069,10 @@ qemu.gpu = \"c\"
         assert_eq!(x86_qemu.audio, arm_qemu.audio);
         assert_eq!(x86_qemu.gpu, "virtio-gpu-pci");
 
-        let x86 = RootfsConfig::load(&root.join("rootfs.toml"), Arch::X86_64).unwrap();
-        let arm = RootfsConfig::load(&root.join("rootfs.toml"), Arch::Aarch64).unwrap();
+        let x86 =
+            RootfsConfig::load(&root.join(crate::paths::ROOTFS_CONFIG), Arch::X86_64).unwrap();
+        let arm =
+            RootfsConfig::load(&root.join(crate::paths::ROOTFS_CONFIG), Arch::Aarch64).unwrap();
         // The package architecture, the serial port and the root device are
         // machine facts, and each half names its own.
         assert_eq!(
@@ -1107,8 +1114,10 @@ qemu.gpu = \"c\"
         assert_eq!(x86.filesystem, arm.filesystem);
         assert_eq!(x86.repos, arm.repos);
 
-        let x86 = InitramfsConfig::load(&root.join("initramfs.toml"), Arch::X86_64).unwrap();
-        let arm = InitramfsConfig::load(&root.join("initramfs.toml"), Arch::Aarch64).unwrap();
+        let x86 = InitramfsConfig::load(&root.join(crate::paths::INITRAMFS_CONFIG), Arch::X86_64)
+            .unwrap();
+        let arm = InitramfsConfig::load(&root.join(crate::paths::INITRAMFS_CONFIG), Arch::Aarch64)
+            .unwrap();
         assert_eq!(
             (x86.arch.as_str(), arm.arch.as_str()),
             ("x86_64", "aarch64")
@@ -1128,8 +1137,10 @@ qemu.gpu = \"c\"
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask sits under the repository root");
-        let x86 = RootfsConfig::load(&root.join("rootfs.toml"), Arch::X86_64).unwrap();
-        let arm = RootfsConfig::load(&root.join("rootfs.toml"), Arch::Aarch64).unwrap();
+        let x86 =
+            RootfsConfig::load(&root.join(crate::paths::ROOTFS_CONFIG), Arch::X86_64).unwrap();
+        let arm =
+            RootfsConfig::load(&root.join(crate::paths::ROOTFS_CONFIG), Arch::Aarch64).unwrap();
 
         for config in [&x86, &arm] {
             for shared in crate::rootfs::SHARED_BASE_PACKAGES {
@@ -1300,7 +1311,7 @@ qemu.gpu = \"c\"
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask sits under the repository root");
-        let config = TestConfig::load(&root.join("tests.toml")).unwrap();
+        let config = TestConfig::load(&root.join(crate::paths::TESTS_CONFIG)).unwrap();
 
         let default = config.selection(&[], false);
         assert!(
@@ -1370,9 +1381,9 @@ qemu.gpu = \"c\"
         // is written into the image and read here, so the guest's own name and
         // the name QEMU's DHCP server is told cannot drift apart.
         let dir = std::env::temp_dir().join(format!("mpos-config-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let machine = dir.join("machine.toml");
-        let image = dir.join("rootfs.toml");
+        std::fs::create_dir_all(dir.join(crate::paths::ROOTFS_CONFIG).parent().unwrap()).unwrap();
+        let machine = dir.join(crate::paths::MACHINE_CONFIG);
+        let image = dir.join(crate::paths::ROOTFS_CONFIG);
         std::fs::write(
             &machine,
             "[default]\nqemu.memory = \"512\"\nqemu.cpus = 2\n",
@@ -1422,8 +1433,8 @@ qemu.gpu = \"c\"
             .parent()
             .expect("xtask sits under the repository root");
         let machine = QemuConfig::load(
-            &root.join("machine.toml"),
-            &root.join("rootfs.toml"),
+            &root.join(crate::paths::MACHINE_CONFIG),
+            &root.join(crate::paths::ROOTFS_CONFIG),
             Arch::X86_64,
         )
         .expect("machine.toml parses");
