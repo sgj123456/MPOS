@@ -9,7 +9,7 @@
 //! The page-table encoding is written to be the same encoding
 //! `crate::arch::aarch64::paging` uses: the kernel's own tables decode what this
 //! file writes (`paging::translate`, `flags_of`), and the two spellings drifting
-//! apart would turn a working mapping into a `M3_TABLES_FAILED` that names a
+//! apart would turn a working mapping into a `tables:` failure that names a
 //! permission nobody set.
 //!
 //! # One root, two base registers

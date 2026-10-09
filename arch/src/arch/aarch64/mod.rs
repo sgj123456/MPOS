@@ -281,7 +281,7 @@ fn check_devices(info: &BootInfo) {
     /// ends the run rather than waiting out the deadline.
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M4_DEVICES_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "devices: {}", format_args!($($arg)*));
             halt();
         }};
     }
@@ -485,7 +485,6 @@ fn check_devices(info: &BootInfo) {
         paging::DEVICE_PHYS,
         paging::DEVICE_PHYS + paging::DEVICE_WINDOW,
     );
-    let _ = writeln!(out, "M4_DEVICES_OK");
 }
 
 /// Stage 2's evidence: two kernel tasks alternate, and each one's registers are
@@ -506,15 +505,12 @@ fn check_context() {
         Ok(hand_overs) => {
             let _ = writeln!(
                 out,
-                "M2_CONTEXT_OK: {hand_overs} hand-overs, both directions, every \
+                "context: {hand_overs} hand-overs, both directions, every \
                  callee-saved register and v31 back where its task left it",
             );
         }
         Err(bad) => {
-            let _ = writeln!(
-                out,
-                "M2_CONTEXT_FAILED: {bad} registers did not survive a hand-over"
-            );
+            let _ = writeln!(out, "context: {bad} registers did not survive a hand-over");
             halt();
         }
     }
@@ -553,7 +549,7 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
     );
 
     if !paging::enabled() {
-        let _ = writeln!(out, "M3_TABLES_FAILED: SCTLR_EL1.M is clear");
+        let _ = writeln!(out, "tables: SCTLR_EL1.M is clear");
         halt();
     }
 
@@ -575,7 +571,7 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
                 other => {
                     let _ = writeln!(
                         out,
-                        "M3_TABLES_FAILED: {page:#x} translates to {other:?}, but the plan \
+                        "tables: {page:#x} translates to {other:?}, but the plan \
                          says {:?} -> {want:#x}",
                         mapping.flags
                     );
@@ -607,7 +603,7 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
     // mapping bug and was a *check* bug. Taking a frame from the allocator is the
     // only way to know a page is nobody else's.
     let Some(scratch_phys) = crate::hal::kernel::alloc_frames(0) else {
-        let _ = writeln!(out, "M3_TABLES_FAILED: the frame allocator is exhausted");
+        let _ = writeln!(out, "tables: the frame allocator is exhausted");
         halt();
     };
     let scratch = crate::hal::phys_to_virt(scratch_phys);
@@ -622,7 +618,7 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
             unsafe {
                 core::ptr::write_volatile(scratch as *mut u8, 0xa5);
                 if core::ptr::read_volatile(scratch as *const u8) != 0xa5 {
-                    let _ = writeln!(out, "M3_TABLES_FAILED: the direct map did not store 0xa5");
+                    let _ = writeln!(out, "tables: the direct map did not store 0xa5");
                     halt();
                 }
             }
@@ -634,7 +630,7 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
         other => {
             let _ = writeln!(
                 out,
-                "M3_TABLES_FAILED: the direct map at {scratch:#x} translates to {other:?}, \
+                "tables: the direct map at {scratch:#x} translates to {other:?}, \
                  expected {scratch_phys:#x} as READ|WRITE Normal"
             );
             halt();
@@ -653,7 +649,7 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
         other => {
             let _ = writeln!(
                 out,
-                "M3_TABLES_FAILED: the PL011 at {:#x} translates to {other:?}, \
+                "tables: the PL011 at {:#x} translates to {other:?}, \
                  expected {:#x} as READ|WRITE Device",
                 pl011::BASE,
                 pl011::PHYS
@@ -670,7 +666,7 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
     );
 
     if paging::translate(0).is_some() {
-        let _ = writeln!(out, "M3_TABLES_FAILED: the null page is mapped");
+        let _ = writeln!(out, "tables: the null page is mapped");
         halt();
     }
 
@@ -684,7 +680,7 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
     if let Some((phys, flags, _)) = paging::translate(info.kernel_phys_base) {
         let _ = writeln!(
             out,
-            "M3_TABLES_FAILED: {:#x} is still mapped identity ({flags:?} -> {phys:#x}); \
+            "tables: {:#x} is still mapped identity ({flags:?} -> {phys:#x}); \
              the kernel's tables should have kept the low half empty",
             info.kernel_phys_base
         );
@@ -693,7 +689,7 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
     if let Some((phys, flags, _)) = paging::translate(pl011::PHYS) {
         let _ = writeln!(
             out,
-            "M3_TABLES_FAILED: the device window's own address {:#x} is still mapped \
+            "tables: the device window's own address {:#x} is still mapped \
              ({flags:?} -> {phys:#x}); it belongs in the kernel half now",
             pl011::PHYS
         );
@@ -706,8 +702,6 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
         info.kernel_phys_base,
         paging::DEVICE_PHYS,
     );
-
-    let _ = writeln!(out, "M3_TABLES_OK");
 }
 
 /// Where the EL0 check's three pages go, in the low half - the half a process
@@ -827,7 +821,7 @@ fn check_el0() {
     let mut out = pl011::Writer;
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M6_EL0_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "el0: {}", format_args!($($arg)*));
             halt();
         }};
     }
@@ -1002,7 +996,7 @@ fn el0_returned(status: u64) {
     let mut out = pl011::Writer;
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M6_EL0_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "el0: {}", format_args!($($arg)*));
             halt();
         }};
     }
@@ -1041,7 +1035,6 @@ fn el0_returned(status: u64) {
         "EL0: the program wrote {own:#x}, called a number no system call has, read \
          {replied:#x} back and left with status {status}",
     );
-    let _ = writeln!(out, "M6_EL0_OK");
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,7 +1119,7 @@ fn check_user_memory() {
     let mut out = pl011::Writer;
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M6_AS_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "space: {}", format_args!($($arg)*));
             halt();
         }};
     }
@@ -1537,7 +1530,6 @@ fn check_user_memory() {
         "space: dropping an active space gave back all {tables} frames its tables took, \
          and the page it mapped not among them",
     );
-    let _ = writeln!(out, "M6_AS_OK");
 }
 
 // ---------------------------------------------------------------------------
@@ -1567,7 +1559,7 @@ fn check_paging_ops() {
     let mut out = pl011::Writer;
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M6_PAGING_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "paging: {}", format_args!($($arg)*));
             halt();
         }};
     }
@@ -1718,7 +1710,6 @@ fn check_paging_ops() {
          root and read back from its frame {b:#x}; leaving to the kernel and \
          re-installing",
     );
-    let _ = writeln!(out, "M6_PAGING_OK");
 }
 
 /// Stage 6d's evidence: the machine has a persistent clock, and this kernel
@@ -1740,7 +1731,7 @@ fn check_wallclock() {
     let mut out = pl011::Writer;
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M6_WALL_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "wall clock: {}", format_args!($($arg)*));
             halt();
         }};
     }
@@ -1833,7 +1824,6 @@ fn check_wallclock() {
          write_epoch persists; the software anchor moves on set_boot_epoch",
         pl031::BASE
     );
-    let _ = writeln!(out, "M6_WALL_OK");
 }
 
 /// Stage 6e's evidence: the CPU and interrupt-controller primitives `hal::Cpu`
@@ -1847,7 +1837,7 @@ fn check_cpu() {
     let mut out = pl011::Writer;
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M6_CPU_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "cpu: {}", format_args!($($arg)*));
             halt();
         }};
     }
@@ -1895,7 +1885,6 @@ fn check_cpu() {
          {before} -> {}) and returning with interrupts off",
         timer::ticks()
     );
-    let _ = writeln!(out, "M6_CPU_OK");
 }
 
 /// Stage 7's first evidence: the console's *receive* half actually reads.
@@ -1916,12 +1905,11 @@ fn check_serial_rx() {
     if !pl011::loopback_echoes(probe) {
         let _ = writeln!(
             out,
-            "M6_SERIAL_RX_FAILED: loopback probe {probe:#04x} did not read back through RX"
+            "serial rx: loopback probe {probe:#04x} did not read back through RX"
         );
         halt();
     }
     let _ = writeln!(out, "serial rx: loopback echoed the probe through RXFE/DR");
-    let _ = writeln!(out, "M6_SERIAL_RX_OK");
 }
 
 /// Stage 6h's evidence: the scheduler's thread-pointer write reaches the
@@ -1947,7 +1935,7 @@ fn check_tls() {
     let mut out = pl011::Writer;
     macro_rules! fail {
         ($($arg:tt)*) => {{
-            let _ = writeln!(out, "M6_TLS_FAILED: {}", format_args!($($arg)*));
+            let _ = writeln!(out, "tls: {}", format_args!($($arg)*));
             halt();
         }};
     }
@@ -1973,7 +1961,6 @@ fn check_tls() {
         "tls: set_thread_pointer({SENTINEL:#x}) read back through thread_pointer(); \
          cleared to 0"
     );
-    let _ = writeln!(out, "M6_TLS_OK");
 }
 
 /// Bring the machine's interrupts up: the vector table, then the controller,
@@ -2059,7 +2046,7 @@ fn check_timer() {
 
     enable_interrupts();
     if !interrupts_enabled() {
-        let _ = writeln!(out, "M1_TIMER_FAILED: DAIF.I is still set after enabling");
+        let _ = writeln!(out, "timer: DAIF.I is still set after enabling");
         halt();
     }
 
@@ -2082,7 +2069,7 @@ fn check_timer() {
         let gic = gic::state();
         let _ = writeln!(
             out,
-            "M1_TIMER_FAILED: {got} interrupts in {WINDOW_MS} ms, expected ~{expected} \
+            "timer: {got} interrupts in {WINDOW_MS} ms, expected ~{expected} \
              at {} Hz",
             timer::TICK_HZ
         );
@@ -2105,7 +2092,7 @@ fn check_timer() {
 
     let _ = writeln!(
         out,
-        "M1_TIMER_OK: {got} interrupts in {WINDOW_MS} ms (~{expected} at {} Hz), \
+        "timer: {got} interrupts in {WINDOW_MS} ms (~{expected} at {} Hz), \
          {} ns of counter",
         timer::TICK_HZ,
         timer::since_boot_nanos()

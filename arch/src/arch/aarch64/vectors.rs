@@ -894,8 +894,8 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
     // The probe is therefore served here inline: it answers `exit_group` (leaving
     // is the one thing a refusal cannot express, and the check's program ends on
     // it) and refuses every other number with `ENOSYS`. That is the same honest
-    // answer the shared table's `_ => ENOSYS` gives, so `M6_EL0_OK` still reads
-    // `-ENOSYS` back for its unassigned number.
+    // answer the shared table's `_ => ENOSYS` gives, so the EL0 check still
+    // reads `-ENOSYS` back for its unassigned number.
     if !crate::hal::kernel::started() {
         if number == NR_EXIT_GROUP {
             let code = frame.x[0];
