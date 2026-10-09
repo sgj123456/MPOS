@@ -254,6 +254,18 @@ in a machine's own group must be a program that machine actually builds (§5's t
 parent module compiled for the host (§3). Assert on the contract (value, errno, count), not a log
 line; prefer a test that would fail if the policy differed.
 
+**Add a boot self-test.** Something that can only be checked on a booted machine goes in a suite
+beside the module it tests: `#[cfg(all(target_os = "none", feature = "selftest"))] pub mod kunit;` in
+that module, a `pub const SUITE` naming its phase and its cases, and one line in the wiring layer's
+`SUITES` (`src/board/kunit.rs`) — the only place that lists them. Being a child of the module is the
+point: it reads the module's private state, so no accessor is added to `mm`/`sched`/`vfs` for a
+test's sake. A case **answers** `Result<(), String>` through `case_check!` rather than asserting —
+`panic = "abort"` means an `assert!` would end the machine and hide every case after it — and it
+declares the [`Phase`] it needs (the boot step, not a position), because a suite that runs too early
+asserts against a machine that is not ready. `cargo xtask test` is the only thing that builds them
+(`--features selftest`) and the only thing that asserts the harness's own `mpos-kunit` line
+(`docs/NOTES.md` §15.19 for the mechanism, §15.20 for a suite that already moved).
+
 **Change the guest image.** A file that must exist → the `rootfs/` (or `initramfs/`) tree (overlays
 apply *after* anything the toml writes). A package → `rootfs.toml`/`initramfs.toml`, under the section
 of the machine it is for: `[default]` where both want it, `[x86_64]`/`[aarch64]` where only one does —
