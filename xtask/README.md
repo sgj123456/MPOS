@@ -171,7 +171,7 @@ code rather than a stale image.
 
 ---
 
-## 配置：`rootfs.toml` 与 `machine.toml`（仓库根目录 | repo root）
+## 配置：`rootfs.toml` 与 `machine.toml`（在 `assets/configs/` | under `assets/configs/`）
 
 配置分成两个文件，分界不是按大小而是按**代价**：`rootfs.toml` 的 mtime 决定要不要重装
 Alpine 全树（三十多个包，走网络），`machine.toml` 里改任何东西都不会动镜像。每份配置
@@ -202,10 +202,10 @@ either re-makes the partitions and their filesystems — a rebuild that file sho
 ask for.
 
 > 需要写进根文件系统的具体文件（`/etc/inittab`、`/etc/network/interfaces`、
-> `/etc/resolv.conf`、`/etc/doas.conf` 等）作为真实文件放在 `rootfs/` 目录树里；
+> `/etc/resolv.conf`、`/etc/doas.conf` 等）作为真实文件放在 `assets/rootfs/<machine>/` 目录树里；
 > 它们会在 toml 写入的内容之后被叠加，**所以目录树里的文件优先**（唯一例外是
 > `system.dns` 会在叠加之后重写 `resolv.conf`）。
-> Concrete files go in the `rootfs/` tree and are overlaid *after* anything written
+> Concrete files go in the `assets/rootfs/<machine>/` tree and are overlaid *after* anything written
 > from the toml, so the tree wins (the one exception is `system.dns`, which
 > rewrites `resolv.conf` afterwards).
 

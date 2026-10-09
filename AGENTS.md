@@ -21,10 +21,10 @@ at those rather than repeating them.
 | `xtask/` | `mpos-xtask`, the build/run/test front-end; `xtask/README.md` documents every command |
 | `user/` | `mpos-user` (ordinary `std` programs); `user/abitest/` = the `no_std` conformance suite (`src/bin/syscall/` one family, `src/bin/integration/` end-to-end); `user/tests/` = `std`-side tests; `user/staging/` = scratch, wired into no build |
 | `fuzz/` | `mpos-fuzz`, **its own workspace**: libFuzzer targets over the kernel's parsers |
-| `rootfs/`, `rootfs.toml` | the guest image's contents, for both machines: `rootfs.toml` is one file in three sections (`[default]` is the baseline both read, `[x86_64]`/`[aarch64]` are each machine's own half), and `rootfs/` + `rootfs-aarch64/` are the two overlay trees — the second machine's carries its own `/init` |
-| `initramfs/`, `initramfs.toml` | the early-userspace tree the x86_64 boot unpacks as its first root, and its packages — one sectioned `initramfs.toml` for both machines; `initramfs-aarch64/` is the second machine's overlay, built by the **same pipeline** (`xtask/src/initramfs.rs`) — the machine picks the overlay and the applet farm (its arch comes from its section), and nothing else |
-| `machine.toml` | what the image is *booted* on — memory, cpus, devices, run mode — in the **same three sections**. Host-side only, so editing it never reinstalls |
-| `tests.toml` | which test programs the sweep runs by default, and its groups |
+| `assets/rootfs/`, `assets/configs/rootfs.toml` | the guest image's contents, for both machines: `rootfs.toml` is one file in three sections (`[default]` is the baseline both read, `[x86_64]`/`[aarch64]` are each machine's own half), and `assets/rootfs/x86_64/` + `assets/rootfs/aarch64/` are the two overlay trees — the second machine's carries its own `/init`; `assets/rootfs/core/` is the shared half merged before either |
+| `assets/initramfs/`, `assets/configs/initramfs.toml` | the early-userspace tree the x86_64 boot unpacks as its first root, and its packages — one sectioned `initramfs.toml` for both machines; `assets/initramfs/aarch64/` is the second machine's overlay, built by the **same pipeline** (`xtask/src/initramfs.rs`) — the machine picks the overlay and the applet farm (its arch comes from its section), and nothing else |
+| `assets/configs/machine.toml` | what the image is *booted* on — memory, cpus, devices, run mode — in the **same three sections**. Host-side only, so editing it never reinstalls |
+| `assets/configs/tests.toml` | which test programs the sweep runs by default, and its groups |
 | `build/`, `target/`, `build-test/` | build output and scratch. Never edit, never commit |
 
 Root `Cargo.toml`: `default-members = ["."]` is load-bearing — without it a plain `cargo build`
@@ -266,8 +266,9 @@ asserts against a machine that is not ready. `cargo xtask test` is the only thin
 (`--features selftest`) and the only thing that asserts the harness's own `mpos-kunit` line
 (`docs/NOTES.md` §15.19 for the mechanism, §15.20 for a suite that already moved).
 
-**Change the guest image.** A file that must exist → the `rootfs/` (or `initramfs/`) tree (overlays
-apply *after* anything the toml writes). A package → `rootfs.toml`/`initramfs.toml`, under the section
+**Change the guest image.** A file that must exist → the `assets/rootfs/<machine>/` (or `assets/initramfs/<machine>/`) tree (overlays
+apply *after* anything the toml writes). A package → `rootfs.toml`/`initramfs.toml` (under
+`assets/configs/`), under the section
 of the machine it is for: `[default]` where both want it, `[x86_64]`/`[aarch64]` where only one does —
 and a key is dotted by what it belongs to (`rootfs.mirror`, `system.hostname`, `user.name`). Partition /
 fs-type / image-size / hostname / DNS → `rootfs.toml`. Anything about the *machine* (memory, cpus,
@@ -280,13 +281,13 @@ has and nothing about how it was launched. It used to read a second word, `mpos.
 whether to run its own checks — that is a *build* now, so no boot word decides it (§15.19).
 
 **The second machine's userland is its own half** (`rootfs.toml`'s `[aarch64]` section + the
-`rootfs-aarch64/` overlay; `docs/NOTES.md` §13.12): a package goes in the section, a file in the
+`assets/rootfs/aarch64/` overlay; `docs/NOTES.md` §13.12): a package goes in the section, a file in the
 overlay, and `cargo xtask rootfs --arch aarch64` (or `all --arch aarch64`, or a `run --arch aarch64`
 that had to rebuild) installs it — the first machine's own command, the same block-layer install,
 with the machine's `--arch` for apk. The one thing that is *not* shared is the half of an install
 that runs the image's userland: `Arch::host_runs_guest_userland` is false there, so apk is asked for
 `--no-scripts`, the chroot steps are skipped, and the applet farm such a script would build is made
-by that machine's own `/init` at first boot (`rootfs-aarch64/init`).
+by that machine's own `/init` at first boot (`assets/rootfs/aarch64/init`).
 
 **Touch the boot handoff.** The `Handoff` record is one definition now —
 `crates/bootinfo` — read by both the loader (`mpos-boot` depends on it) and the
