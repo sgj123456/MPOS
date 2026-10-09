@@ -3208,6 +3208,61 @@ item in this section.
 > match on are present, where before the card was a DRM node that no seat rule
 > could match at all.
 
+> **Update, measured in the guest (2026-10-09, the same day): the first bar is
+> still not cleared, and the run that would not clear it also says why.** The
+> GL-card acceptance this section has been unable to take has now been taken -
+> desktop rootfs, `virtio-gpu-gl-pci`, `-display egl-headless,gl=on` (which QEMU
+> accepts on this host: measured, by it running), and a boot-time hook streaming
+> its findings out `ttyS0`. What it says:
+>
+> - **The renderer is still `llvmpipe`, and Mesa names its own fallback**:
+>   `EGL driver name: kms_swrast`, with `MESA-EGL: warning: egl: failed to create
+>   dri2 screen` and `DRI2: failed to create screen` above it on both the
+>   surfaceless and the GBM platform. So `is_software()` is true, niri still
+>   cannot run here, and the section's first bar is *unmet* rather than
+>   unverified - which is the difference this run was for.
+> - **The chain the earlier sessions built is right, seen from inside**: both
+>   nodes carry `DEVTYPE=drm_minor` in their `uevent` files (the change above,
+>   confirmed in the guest rather than by a host test), the card's `device` link
+>   reaches `/sys/devices/pci0000:00/0000:00:04.0`, and that directory carries
+>   `vendor`, `device`, `subsystem_vendor`, `subsystem_device`, `subsystem`,
+>   `uevent` and a `MODALIAS` reading `pci:v00001AF4d00001050...` - the PCI
+>   identity a loader asks for, answered.
+> - **And two things are still not right, which is the part worth having.** First,
+>   **udev never started**: the boot runlevel brings up syslog, crond, dbus and
+>   seatd, and no udev, and udev's database has *no entry at all* for `c226:0` or
+>   `c226:128` - `cat /run/udev/data/...` is silent. That is the layer libdrm's
+>   device information comes from, and on this boot it does not exist; the earlier
+>   note that "a *stock* boot reports no udev at all" now has the dump beside it.
+>   Second, **the node says it is virtual**: `udevadm info -q all` reports
+>   `DEVPATH=/devices/virtual/drm/card0`, where a working card's devpath runs
+>   through its PCI function. The `device` *link* is right and the node's own
+>   *position* is not - and udev's path rules walk the devpath rather than the
+>   link, so no `ID_PATH`, `ID_FOR_SEAT` or seat tag can be produced however
+>   correct the link is. That is the "device model rather than the command queue"
+>   direction this section predicted, now with the one field to change named.
+>
+> **The next step is therefore specific**, and still two parts: give the DRM node
+> its home *under* the device it belongs to, so `DEVPATH` is the bus path, and
+> make this image actually start udev. Then re-run this probe - whose technique is
+> worth keeping, because it cost four boots to find: `cargo xtask all` builds the
+> desktop image (`build/mpos-uefi-x86_64.img`, which name is why the first search
+> for it came up empty), a temporary `/etc/local.d/zz-probe.start` streaming to
+> `tee /root/probe.txt /dev/ttyS0` is the instrument, `qemu.gpu` and
+> `qemu.display` are the two keys that make the card GL and headless, and
+> `cargo xtask run --mode mirror` is the mode - because a `gui` boot makes `tty0`
+> the *only* console and leaves the wire quiet, so the first probe was painted
+> where no host could read it.
+>
+> **And one defect found on the way, named rather than fixed**: the first version
+> of that hook wrote through the 9p share, and the guest wedged with QEMU
+> answering `qemu-system-x86_64: Failed to decode VirtFS request type 114`. The
+> request is `Tcreate` in this client's own `9P2000.u` numbering, so the dialect is
+> agreed and the *body* is what the server cannot parse - a guest writing through
+> this kernel's 9p client does not survive, and a boot script that ends with such a
+> write never returns. It is its own item, and it is why the share is not the
+> instrument this section uses.
+
 > **Update, landed: the two dumb-buffer divergences are closed lazily.** The table
 > below measured three answers this card gave that Linux's does not, and two of them
 > had one fix: `RESOURCE_INFO`'s `res_handle` was 0 for a plain dumb buffer where
