@@ -660,7 +660,7 @@ pub fn virt_machine_args(
         // partition 1 to find `BOOTAA64.EFI`; the kernel's `check_fs` finds its
         // root by walking the device tree's `virtio,mmio` windows, and a PCI
         // disk is not in that tree - it would be invisible there and the boot
-        // would fail at `M7_FS_FAILED`. MMIO is the one transport both can use,
+        // would fail in `check_fs`. MMIO is the one transport both can use,
         // and AAVMF reads it: measured, it loads the loader from
         // `VenHw(837DCA9E-…)`, the virtio-mmio device path (`NOTES.md` §15.18).
         //
@@ -722,7 +722,7 @@ pub fn virt_machine_args(
         "-device".into(),
         "virtio-net-device,netdev=n0".into(),
         // A virtio-input device - the fourth class the MMIO virtio path has to
-        // reach (`M8_INPUT_OK`). The keyboard backend is self-contained: it
+        // reach (`check_input_registry`). The keyboard backend is self-contained: it
         // presents its event queue and config with no external chardev, so the
         // boot opens and negotiates the transport headless.
         "-device".into(),
@@ -736,7 +736,7 @@ pub fn virt_machine_args(
         // driver: the MMIO input path reaches either device the same way.
         "-device".into(),
         "virtio-tablet-device".into(),
-        // A host-driven console port - the fifth class (`M8_CONSOLE_OK`). Its
+        // A host-driven console port - the fifth class (`check_console_dev`). Its
         // far end is a host socket nothing has to be listening on (`wait=off`),
         // so the port opens and a write lands in the socket instead of blocking
         // a machine that has nobody reading it yet.
@@ -749,7 +749,7 @@ pub fn virt_machine_args(
         "virtio-serial-device".into(),
         "-device".into(),
         "virtconsole,chardev=console0".into(),
-        // The display adapter - the sixth class (`M8_GPU_OK`). The MMIO form of
+        // The display adapter - the sixth class (`check_gpu_dev`). The MMIO form of
         // the card the first machine attaches as `virtio-gpu-pci`, so the
         // driver, the render task and the DRM layer above them are one copy on
         // both machines.
@@ -788,7 +788,7 @@ pub fn virt_machine_args(
     }
 
     if config.audio {
-        // The seventh class (`M8_SOUND_OK`), the same shape the first machine
+        // The seventh class (`check_sound_dev`), the same shape the first machine
         // attaches as `virtio-sound-pci`. The backend is `none`: it consumes the
         // stream and plays silence, so the driver is exercised end to end
         // without asking the host for speakers.
@@ -800,7 +800,7 @@ pub fn virt_machine_args(
         ]);
     }
 
-    // The eighth class (`M8_VSOCK_OK`) - but only where the host can back it.
+    // The eighth class (`check_vsock`) - but only where the host can back it.
     // vsock is the one virtio device QEMU does not emulate in userspace:
     // `vhost-vsock-device` is served by the host's vhost kernel module, and a
     // machine naming it without `/dev/vhost-vsock` does not start at all.
@@ -814,7 +814,7 @@ pub fn virt_machine_args(
         args.extend(["-device".into(), "vhost-vsock-device,guest-cid=4".into()]);
     }
 
-    // The ninth class (`M8_P9_OK`): the host share, the same arrangement the
+    // The ninth class (`check_p9_dev`): the host share, the same arrangement the
     // first machine's `-virtfs` makes. `-fsdev` is the backend - the host
     // directory QEMU's 9p server exports, with `security_model=none` so the
     // host's own permissions decide - and `virtio-9p-device` is the transport

@@ -264,27 +264,34 @@ orderly rather than faked, `unshare`/`setns` validate and then refuse, and `secc
 
 ## Milestone checks
 
-Each subsystem is proven before the next is built, and the on-machine half of that proof prints
-markers to the serial log. They run **only** when the command line carries `mpos.selftest` —
-which `cargo xtask test` sets and an ordinary boot does not — so a normal boot pays none of the
-half-second clock wait and the scheduler sleeps these checks need.
+Each subsystem is proven before the next is built. The on-machine half of that proof is the
+kernel's own suites: one `mpos-kunit: <suite>.<case> OK` line per case and a tally at the end,
+and they run **only** in a *test* build — the one `cargo xtask test` builds with `--features
+selftest`. A production kernel carries neither the suites nor the harness that runs them, so an
+ordinary boot pays none of the half-second clock wait and the scheduler sleeps these cases need.
 
-| Marker | Subsystem | What is verified |
-|:------:|-----------|------------------|
-| `M0_OK` | Allocator | The global allocator works end to end (`Vec`, `String`) |
-| `M1_OK` | Interrupts | The PIT ticks at the expected rate; a breakpoint exception is catchable and returns |
-| `M2_OK` | Frames & heap | Buddy blocks are disjoint and coalesce; every slab size class holds its contract; heap and frame allocator agree on what was handed out |
-| `M3_OK` | Paging | The kernel runs on its own page tables; `text` is `r-x`, `rodata` `r--`, `data` `rw-` across the whole image; user address spaces are isolated with a shared kernel half; both are torn down without leaking a frame |
-| `M4_OK` | Scheduler | Round-robin, preemption, sleep, idle wake-up, priority-based core stealing; every task reaped, every stack returned |
-| `M6_OK` | Syscalls | The dispatch gate answers correctly from inside a task; `exit_group` through dispatch ends it |
-| `M7_OK` | VFS | ramfs root, a mount crossed by resolution, two tasks reading and writing one file through the fd table |
-| `M8_IPC_OK` | Pipes, TTY, signals | Bytes cross a pipe between two tasks; `EPIPE` with no reader; line editing, echo and `Ctrl-D`; `SIGTERM`/`SIGKILL` land; the `kill(0)` probe answers |
-| `M8_OK` | Init handoff | `/init` runs as PID 1, forks, execs a shell, and stays alive |
+| Case | What is verified |
+|------|------------------|
+| `mm.frames`, `mm.large_block`, `mm.heap` | The zones exist and a block survives the direct map; buddy blocks are disjoint and coalesce; every slab size class holds its contract; heap and frame allocator agree on what was handed out |
+| `arch.clock_breaks_registers` | The clock ticks at the rate it declares; a breakpoint exception is catchable and returns; the machine's register-file table agrees with the host-built ABI table, field by field |
+| `arch.page_tables_and_spaces` | The kernel runs on its own page tables; `text` is `r-x`, `rodata` `r--`, `data` `rw-` across the whole image; user address spaces are isolated with a shared kernel half; both are torn down without leaking a frame |
+| `sched.alternating` … `sched.stacks_returned` (seven cases) | Round-robin, preemption, sleep, idle wake-up and priority-based core stealing; then that every task was reaped and every stack returned |
+| `vfs.ramfs_file`, `vfs.mounted_tree_multi_task` | ramfs root, a mount crossed by resolution, two tasks reading and writing one file through the fd table |
+| `syscall.gate`, `syscall.dispatch_in_task` | The dispatch gate answers correctly from the kernel and from inside a task; `exit_group` through dispatch ends it |
+| `ipc.pipes`, `ipc.tty`, `ipc.signals` | Bytes cross a pipe between two tasks, and `EPIPE` with no reader; line editing, echo and `Ctrl-D`; `SIGTERM`/`SIGKILL` land and the `kill(0)` probe answers |
+| `boot.stack_depth` | The loader's canary at the bottom of the boot stack is intact once everything above has run |
 
-There is no M5, and nothing above M8 — the checks stop where the milestone numbering had a gap,
-and the numbering is kept as it is because the CI logs and `NOTES.md` refer to it. The `M0`–`M14`
-pipeline that earlier revisions of this README described never existed in this form; the
-authoritative record of what is proven is the test suite, not the markers.
+The second machine answers the cases it can answer — `arch.console_receive` and
+`arch.console_transmit` where the first has its two paging cases — and prints the same kind of
+tally.
+
+**The boot's own checks are not tests, and they run on every boot.** A device the machine was
+configured with, a filesystem it must read, the devfs it must publish: those are asserted on the
+way past, and a failure halts the machine with a line that names the subsystem (`virtio-blk: …`,
+`9p: …`, `devfs: …`). They are why an aarch64 image whose root partition carries no `/hello`
+cannot boot at all. The kernel prints no milestone markers any more: nothing parsed them once the
+sweep's own `=== SUMMARY` line and the harness's tally became the gate (`docs/NOTES.md` §15.19,
+§15.24).
 
 **The real gate is the self-test.** `cargo xtask test` runs the host unit tests and then boots
 the user test programs `tests.toml` selects — every program that is not in a group — requiring

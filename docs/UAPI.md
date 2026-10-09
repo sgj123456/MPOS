@@ -307,7 +307,7 @@ the commit bodies), and each moved its pin in the same commit.
 
 7. **`clock_gettime(CLOCK_REALTIME)` answers a live wall time for the whole boot, not
    only until the first milestone check.** The value this kernel promised was right; a
-   *boot check* changed it. `check_wallclock` (`M6_WALL_OK`) proves `set_boot_epoch`
+   *boot check* changed it. `check_wallclock` proves `set_boot_epoch`
    moves the anchor by setting it to `1 << 40` and had never restored it, so on aarch64
    — where the milestone checks run on every boot, in front of the sweep and in front of
    a distribution's `init` — every program after the check read a year of **36812**.

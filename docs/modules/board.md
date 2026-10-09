@@ -106,23 +106,24 @@ booted machine, so its real pins are the milestone checks the bodies and the sui
 
 | Pin | What it would catch |
 |---|---|
-| `mm`'s suite (`frames`, `large_block`, `heap`) → `M0_OK`, `M2_OK` | allocator, frame, buddy-merge and heap contracts |
-| `sched`'s suite (`alternating` … `stacks_returned`) → `M4_OK` | round-robin, preemption, sleep, idle wake and priority (asserted on a run record, not a log) |
-| `vfs`'s suite and `syscall`'s gate cases → `M6_OK`, `M7_OK` | the dispatch gate, ramfs root, a crossed mount, two tasks on one fd |
-| `ipc`'s suite (in `src/syscall/kunit.rs`) → `M8_IPC_OK` | pipes, tty line discipline, signal delivery |
+| `mm`'s suite (`frames`, `large_block`, `heap`) | allocator, frame, buddy-merge and heap contracts |
+| `sched`'s suite (`alternating` … `stacks_returned`) | round-robin, preemption, sleep, idle wake and priority (asserted on a run record, not a log) |
+| `vfs`'s suite and `syscall`'s gate cases | the dispatch gate, ramfs root, a crossed mount, two tasks on one fd |
+| `ipc`'s suite (in `src/syscall/kunit.rs`) | pipes, tty line discipline, signal delivery |
 | `report`'s suite (`stack_depth`) | the boot stack's canary once the boot's own work is done; the two production calls in the bodies cover the handoff |
-| x86_64 `check_arch` → `M1_OK`, `M3_OK` | clock/`int3`, the register-file ABI agreement, W^X and user address spaces |
-| x86_64 `handoff_to_init` → `M8_OK` | `/init` runs as pid 1, forks, execs a shell |
-| aarch64 `check_virtio`/`check_rng`/`check_blk`/`check_fs`/`check_net`/`check_input`/`check_console`/`check_sound`/`check_vsock`/`check_p9` → `M5_*`/`M7_*`/`M8_*` | the MMIO device classes, each failing by name and halting |
+| x86_64's two arm cases (`clock_breaks_registers`, `page_tables_and_spaces`) | clock/`int3`, the register-file ABI agreement, W^X and user address spaces |
+| x86_64 `handoff_to_init` | `/init` runs as pid 1, forks, execs a shell |
+| aarch64 `check_virtio`/`check_rng`/`check_blk`/`check_fs`/`check_net`/`check_input`/`check_console`/`check_sound`/`check_vsock`/`check_p9` | the MMIO device classes, each failing by name (a line that names the subsystem) and halting |
 | aarch64 `check_dev`/`check_console_rx`/`check_serial_tx`/`check_input_registry`/`check_console_dev`/`check_gpu_dev`/`check_sound_dev`/`check_p9_dev` | the mounted `/dev`, the console RX/TX paths, the registry and the device nodes - and the two console ones are *test-build-only* now (`#[cfg(feature = "selftest")]`), because the harness was their only caller |
 
 Two honest caveats, both from the code. First, whether a machine runs its checks at all is now
 decided by which *image* was built (`--features selftest`, `src/board/kunit.rs`) rather than by a word
-on the command line: a kernel from `build`/`run`/`disk` carries neither the families nor the harness,
+on the command line: a kernel from `build`/`run`/`disk` carries neither the suites nor the harness,
 and the `mpos.selftest` word the kernel used to parse for that decision is gone from it
-(`NOTES.md` §15.19). Second, `NOTES.md` §15.6/§15.7 record that the `M*_OK` chain is no
-longer parsed by a command of its own: the checks still print their markers and a failure still halts
-the machine, but a boot's verdict is now the sweep's `=== RUN/PASS/FAIL/SUMMARY/END`.
+(`NOTES.md` §15.19). Second, a boot's verdict is the sweep's
+`=== RUN/PASS/FAIL/SUMMARY/END` plus the harness's own tally, and the `M*`-shaped markers the checks
+used to print are gone - nothing had parsed them since §15.6/§15.7 retired the command that did, and
+a marker a reader cannot tell from a mechanism is worse than a sentence (`NOTES.md` §15.24).
 
 No `t-*` program pins this module directly, and none names it: grepping `user/` for `\bboard\b`
 finds nothing (the earlier substring matches are all `keyboard`). The closest adjacent pin - and it

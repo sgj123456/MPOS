@@ -444,7 +444,7 @@ same measurement puts behind `vfs` and so behind `hal` too)**
       runlevel output is `[ ok ]`, and of §13.12's "named, not fixed" list only the two prose-level gaps
       remain (the install writes no `/etc/hostname`, so the prompt says `localhost`, and the machine's
       `/proc/net` rows are the same table the first machine's is) · [~] 9.2 RISC-V support
-- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.17 landed, 13.19–13.31 landed, 13.18 open, 13.2 in progress (§13); the boot-side half is Phase 15 (§15), where 15.19 puts the boot's self-tests in a test build (§15)**
+- [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.17 landed, 13.19–13.31 landed, 13.18 open, 13.2 in progress (§13); the boot-side half is Phase 15 (§15), where 15.19–15.24 put the boot's self-tests in a test build, move every check family into a suite beside the module it tests, and take the `M*` marker vocabulary out of the boot log (§15)**
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the

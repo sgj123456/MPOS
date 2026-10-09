@@ -3,8 +3,9 @@
 //! Every log line a daemon writes starts with a timestamp, and on musl that
 //! timestamp is `localtime_r` filling a `struct tm` which `asctime_r` (or the
 //! program's own `snprintf`) then formats. Nothing in either suite had ever
-//! called one: the clock was pinned (`M6_WALL_OK`, `t-*`'s `clock_gettime`),
-//! but nothing had turned the number into a calendar date.
+//! called one: the clock was pinned (`t-*`'s `clock_gettime`, and the machine
+//! layer's own wall-clock check on aarch64), but nothing had turned the number
+//! into a calendar date.
 //!
 //! That is where this test comes from - a real Alpine boot in which busybox
 //! `syslogd` died before it could log anything, at EL0, on

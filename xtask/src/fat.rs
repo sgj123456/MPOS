@@ -14,9 +14,9 @@
 //! stem and `mpos.cmdline` a seven-character extension, and a firmware matching
 //! on 8.3 alone sees `INITRAM.TAR` and no `mpos.cmdline` at all - the loader
 //! reads the command line it was given and finds an empty initramfs, which is a
-//! boot that gets as far as `M3_TABLES_OK` and no further. So every name that is
-//! not 8.3 is written as a long-name entry chain over a generated short name,
-//! and that is the whole of the difficulty here (`NOTES.md` §15.18).
+//! boot that never reaches the kernel's own device probes at all. So every name
+//! that is not 8.3 is written as a long-name entry chain over a generated short
+//! name, and that is the whole of the difficulty here (`NOTES.md` §15.18).
 
 use std::fs;
 use std::path::Path;
