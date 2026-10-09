@@ -63,10 +63,10 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
     // they are questions about `tests.toml` rather than about this machine.
     let config = sweep::load_config()?;
     // The declared-name check, and *this* arm's scope: it builds both suites
-    // (169 programs, the bare-metal conformance suite among them), so a name in
-    // the file that no program answers to is a stale entry. The second machine
-    // builds only the std suite and asks the narrower question; `sweep::select`
-    // records why the two cannot share one scope.
+    // (170 programs today, the bare-metal conformance suite among them), so a
+    // name in the file that no program answers to is a stale entry. The second
+    // machine builds only the std suite and asks the narrower question;
+    // `sweep::select` records why the two cannot share one scope.
     let names: Vec<String> = built.iter().map(|test| test.name.clone()).collect();
     let unmatched = config.unmatched(&names);
     if !unmatched.is_empty() {
@@ -337,54 +337,25 @@ fn build_test_initramfs(build_dir: &Path, tests: &[&UserTest]) -> Result<PathBuf
         println!("User tests: the base initramfs is up to date; not rebuilding");
     }
 
-    let staging = build_dir.join("test-initramfs.d");
-    if staging.exists() {
-        fs::remove_dir_all(&staging)?;
-    }
-    fs::create_dir_all(&staging)?;
-
-    let unpacked = Command::new("tar")
-        .arg("-xf")
-        .arg(crate::initramfs::archive_path(build_dir, Arch::X86_64))
-        .arg("-C")
-        .arg(&staging)
-        .arg("--no-same-owner")
-        .status()
-        .context("Failed to unpack the initramfs")?;
-    if !unpacked.success() {
-        bail!("The initramfs did not unpack");
-    }
-
-    let bin = staging.join("bin");
-    fs::create_dir_all(&bin)?;
-    for test in tests {
-        let dst = bin.join(&test.name);
-        fs::copy(&test.binary, &dst).with_context(|| format!("Failed to stage {}", test.name))?;
-        utils::set_mode(&dst, 0o755)?;
-    }
-
-    fs::write(staging.join("init"), TEST_INIT)?;
-    utils::set_mode(&staging.join("init"), 0o755)?;
-
+    // The programs ride the archive's *tail*, not a repacked copy of the Alpine
+    // tree: each staged binary is appended as its own ustar member after the
+    // base archive's terminator. A second copy of the whole base would be paid
+    // twice - once in host bytes, once in the guest's ramfs charge, whose limit
+    // is a quarter of its RAM (§10.4) - and the x86_64 sweep's 2 GiB leaves
+    // room for neither a doubled 70 MB nor the file `t-fill-ramfs` fills with.
+    // The boot's tar reader recognizes a member by its `ustar` magic and stops
+    // at anything else (`src/vfs/tar.rs`), so a tail written after the base's
+    // data - with the base's zero-block terminator removed - is one stream to
+    // it; the appended members carry the same `ustar` format and numeric-zero
+    // owner/group the pack below always did. The runner
+    // script still rides as its own member, written here rather than copied
+    // from a staging tree.
     let tar = build_dir.join("test-initramfs.tar");
-    let packed = Command::new("tar")
-        .args([
-            "--format=ustar",
-            "--owner=0",
-            "--group=0",
-            "--numeric-owner",
-            "-cf",
-        ])
-        .arg(&tar)
-        .arg("-C")
-        .arg(&staging)
-        .arg(".")
-        .status()
-        .context("Failed to pack the test initramfs")?;
-    if !packed.success() {
-        bail!("The test initramfs did not pack");
-    }
-    fs::remove_dir_all(&staging)?;
+    append_test_members(
+        &crate::initramfs::archive_path(build_dir, Arch::X86_64),
+        &tar,
+        tests,
+    )?;
 
     let size = fs::metadata(&tar)?.len();
     println!(
@@ -393,6 +364,178 @@ fn build_test_initramfs(build_dir: &Path, tests: &[&UserTest]) -> Result<PathBuf
         size as f64 / 1048576.0
     );
     Ok(tar)
+}
+
+/// One ustar header block: the shape `src/vfs/tar.rs` parses, spelled here
+/// because the writer and the reader must agree on it byte for byte.
+fn ustar_header(name: &str, mode: u32, size: u64) -> [u8; 512] {
+    let mut h = [0u8; 512];
+    // The name fits - every test program is `/bin/t-<word>` - but refuse to
+    // silently truncate it rather than mis-stage a payload.
+    assert!(name.len() < 100, "member name too long for ustar: {name}");
+    // A plain fn item borrows the buffer mutably on each call and gives the
+    // borrow back; a closure captured one borrow for its whole life, which is
+    // how the first draft built a header whose every field was zero.
+    fn field<const N: usize>(h: &mut [u8; N], at: usize, text: &str) {
+        let bytes = text.as_bytes();
+        h[at..at + bytes.len()].copy_from_slice(bytes);
+        // Fixed-width octal fields are zero-padded by their format below; text
+        // fields get a NUL terminator and nothing else, which every reader
+        // accepts.
+        h[at + bytes.len()] = b'\0';
+    }
+    field(&mut h, 0, name);
+    let mode_text = format!("{mode:07o}");
+    field(&mut h, 100, &mode_text);
+    field(&mut h, 108, "0000000"); // uid
+    field(&mut h, 116, "0000000"); // gid
+    let size_text = format!("{size:011o}");
+    field(&mut h, 124, &size_text);
+    field(&mut h, 136, "00000000000"); // mtime 0
+    field(&mut h, 148, ""); // chksum placeholder: eight spaces below
+    h[148..156].fill(b' ');
+    // typeflag: regular file.
+    h[156] = b'0';
+    field(&mut h, 157, ""); // linkname
+    field(&mut h, 257, "ustar");
+    h[262] = b'\0';
+    field(&mut h, 263, "00"); // version
+    write_checksum(&mut h);
+    h
+}
+
+/// Fill a header block's chksum field the way every tar reader verifies it:
+/// the sum of the whole block *with the eight checksum bytes themselves read
+/// as spaces*. Shared by the writer above and the rename below, because a
+/// checksum computed over the old field is wrong in exactly one byte-group
+/// and GNU tar calls the result "does not look like a tar archive".
+fn write_checksum(block: &mut [u8]) {
+    block[148..156].fill(b' ');
+    let sum: u32 = block.iter().map(|&b| b as u32).sum();
+    let digits = format!("{sum:07o}\0");
+    block[148..156].copy_from_slice(digits.as_bytes());
+}
+
+/// One tar octal field: ASCII-octal digits, terminated by NUL or whitespace,
+/// accepted left-padded or not. `src/vfs/tar.rs`'s rule, copied verbatim so the
+/// writer here and the reader in the kernel agree on every byte they parse.
+fn octal(field: &[u8]) -> Option<u64> {
+    let text = core::str::from_utf8(field).ok()?;
+    let text = text.trim_end_matches(|c: char| c == '\0' || c.is_ascii_whitespace());
+    let text = text.trim_start();
+    if text.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(text, 8).ok()
+}
+
+/// Walk `bytes` as a ustar stream, calling `at_header` with each header block.
+///
+/// The same walk `src/vfs/tar.rs` makes: a header block, then its data rounded
+/// up to 512; two all-zero blocks end it; a block that is neither parses no
+/// further. Shared by the rename below and by any future tail edit so the two
+/// readers of this format cannot drift from each other.
+fn for_each_header(bytes: &mut [u8], mut at_header: impl FnMut(&mut [u8]) -> bool) {
+    let mut at = 0usize;
+    while at + 512 <= bytes.len() {
+        let header = &mut bytes[at..at + 512];
+        if header.iter().all(|&b| b == 0) {
+            return; // the terminator
+        }
+
+        // A member whose size field cannot be parsed stops the walk rather
+        // than letting it land mid-data and read a payload block as a header.
+        let Some(size) = octal(&header[124..136]) else {
+            return;
+        };
+        let done = at_header(header);
+        if done {
+            return;
+        }
+        // The reader's own rule (`src/vfs/tar.rs`): the data is `size` bytes,
+        // rounded up to a block.
+        at += 512 + (size as usize).div_ceil(512) * 512;
+    }
+}
+
+/// Rewrite the base archive's `./init` header's name field to `./init.boot`.
+///
+/// A name-only edit: the checksum covers the header with its chksum field read
+/// as spaces, so recomputing it here is the whole of the work. Anything that
+/// parses the result - GNU `tar`, this kernel's reader - sees the same bytes
+/// under a different name. Answers whether the rename happened.
+fn rename_root_init(bytes: &mut [u8]) -> bool {
+    let mut renamed = false;
+    for_each_header(bytes, |header| {
+        if header[156] != b'0' {
+            return false; // keep walking; only regular files can collide
+        }
+        // The name is a C string: byte-for-byte the six characters and their
+        // terminator, which a `starts_with` would answer for `./initial` too.
+        if header[..7] == *b"./init\0" {
+            // "./init.boot" is eleven bytes and the field holds a hundred, so
+            // one copy does it - writing byte 11 by hand left byte 10's `t`
+            // out of place and renamed nothing while claiming it did.
+            header[0..11].copy_from_slice(b"./init.boot");
+            header[11] = 0;
+            write_checksum(header);
+            renamed = true;
+            return true; // one /init; stop the walk
+        }
+        false
+    });
+    renamed
+}
+
+/// Write `base` plus one ustar member per staged program into `out`.
+///
+/// The base archive is copied unchanged and its trailing zero blocks are kept:
+/// `src/vfs/tar.rs` stops at two consecutive all-zero blocks, so the appended
+/// members simply continue the walk. Two final zero blocks close the stream,
+/// which is also what a GNU `tar -tvf` answers when asked to list the result.
+fn append_test_members(base: &Path, out: &Path, tests: &[&UserTest]) -> Result<()> {
+    use std::io::{BufWriter, Write};
+    let mut w = BufWriter::new(
+        fs::File::create(out).with_context(|| format!("Failed to create {}", out.display()))?,
+    );
+    let mut base_bytes =
+        fs::read(base).with_context(|| format!("Failed to read {}", base.display()))?;
+    if !rename_root_init(&mut base_bytes) {
+        bail!(
+            "the base initramfs carries no ./init to move aside; rebuild it \
+             (`cargo xtask initramfs`) before staging programs"
+        );
+    }
+    // The base's own end-of-archive pair is dropped: the tail continues the
+    // same member stream, and one terminator closes the whole thing below.
+    while base_bytes.ends_with(&[0u8; 512]) {
+        base_bytes.truncate(base_bytes.len() - 512);
+    }
+    w.write_all(&base_bytes)?;
+    // The base's own `/init` - the switch-root script the *session* boot runs -
+    // is moved aside in the copy below, because `src/vfs/tar.rs` refuses a
+    // second regular file of the same name outright (`Exists` stops the unpack,
+    // and the boot treats a stopped unpack as a broken archive). Renaming it to
+    // `init.boot` keeps it inspectable on the payload while leaving `/init` free
+    // for the runner, which is the one member whose bytes changed since the old
+    // staging tree overwrote it. Programs ride after both.
+    let init = TEST_INIT.as_bytes();
+    let header = ustar_header("./init", 0o755, init.len() as u64);
+    w.write_all(&header)?;
+    w.write_all(init)?;
+    w.write_all(&vec![0u8; (512 - init.len() % 512) % 512])?;
+    for test in tests {
+        let bytes =
+            fs::read(&test.binary).with_context(|| format!("Failed to stage {}", test.name))?;
+        let header = ustar_header(&format!("./bin/{}", test.name), 0o755, bytes.len() as u64);
+        w.write_all(&header)?;
+        w.write_all(&bytes)?;
+        let pad = (512 - bytes.len() % 512) % 512;
+        w.write_all(&vec![0u8; pad])?;
+    }
+    w.write_all(&[0u8; 1024])?;
+    w.flush()?;
+    Ok(())
 }
 
 /// ... of the test initramfs. busybox is driven by absolute path
@@ -695,10 +838,14 @@ fn report(tests: &[&UserTest], built: usize, text: &str, status: Option<i32>) ->
 // protocol, the report - is the implementation above.
 // ---------------------------------------------------------------------------
 
-/// The image size a disk sweep asks for. The payload is every std-side program
-/// built for the machine (~5.6 MB), so this is its number rather than one every
-/// boot pays for.
-const SWEEP_DISK_BYTES: u64 = 64 * 1024 * 1024;
+/// The image size a disk sweep asks for. It is not a fixed number because the
+/// payload moves: the std-side programs are ~57 MB today (measured: `mkfs.ext4`
+/// answering `无法为 ext2 文件系统分配块` at 64 MiB once §15.11's migration put
+/// the instruments on this machine too), and the tree also carries the archive's
+/// own busybox/applet farm under `/bin`. This is its number plus room, rather
+/// than one every boot pays for - a sweep that overflows its root reads as a
+/// build failure, not as a full disk.
+const SWEEP_DISK_BYTES: u64 = 96 * 1024 * 1024;
 
 /// Run the sweep for a machine whose boot pivots onto a disk root.
 ///
@@ -1030,8 +1177,73 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::LEAF_CRATES;
+    use super::{LEAF_CRATES, UserTest, append_test_members, ustar_header};
 
+    /// The tail-staging writer's own format claims, against the host `tar`:
+    /// the checksum rule both readers enforce ("sum with the chksum field read
+    /// as spaces"), the rename that moves the base's `/init` aside so the
+    /// runner can take the name back without the unpack's duplicate-file
+    /// refusal, and the stream GNU tar lists as exactly the members the boot
+    /// will unpack - the moved-aside script, the runner, the staged program,
+    /// once each. Pinned through `append_test_members` itself rather than its
+    /// parts, because the parts agreeing with each other is how the first
+    /// draft shipped a header every byte of which was zero.
+    #[test]
+    fn the_tail_staging_writes_a_stream_both_readers_agree_on() {
+        let dir = std::env::temp_dir().join("mpos-tail-staging-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // A base archive of one `/init` member plus its terminator - the shape
+        // the pipeline's output has in miniature.
+        let mut base = Vec::new();
+        base.extend_from_slice(&ustar_header("./init", 0o755, 4));
+        base.extend_from_slice(b"boot");
+        base.resize(base.len().div_ceil(512) * 512, 0);
+        base.extend_from_slice(&[0u8; 1024]);
+        let base_path = dir.join("base.tar");
+        fs::write(&base_path, &base).unwrap();
+
+        let program = dir.join("t-one");
+        fs::write(&program, b"ELF-bytes").unwrap();
+        let staged = [UserTest {
+            name: "t-one".to_string(),
+            binary: program,
+        }];
+        let tests: Vec<&UserTest> = staged.iter().collect();
+
+        let out = dir.join("tail.tar");
+        append_test_members(&base_path, &out, &tests).unwrap();
+
+        let listed = std::process::Command::new("tar")
+            .args(["-tvf"])
+            .arg(&out)
+            .output()
+            .expect("tar -tvf");
+        assert!(
+            listed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let text = String::from_utf8(listed.stdout).unwrap();
+        assert!(
+            text.contains("./init.boot"),
+            "the moved-aside init lists under its new name: {text}"
+        );
+        assert!(
+            text.contains("./init"),
+            "the runner takes the name back: {text}"
+        );
+        assert!(text.contains("./bin/t-one"), "the staged program: {text}");
+        assert_eq!(
+            text.matches("./init.boot").count(),
+            1,
+            "exactly one rename, not a loop over the stream: {text}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A gap whose program the payload does not build
     /// A gap whose program the payload does not build is a claim nothing in the
     /// sweep can check: there is no program to leave out, so the entry would sit
     /// in the file looking measured for ever. The rule is exercised on a list
