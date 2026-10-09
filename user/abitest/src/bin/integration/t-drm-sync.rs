@@ -37,6 +37,12 @@ const fn ioc_d(nr: usize, size: usize) -> usize {
 }
 
 const NR_GET_CAP: usize = 0x0c;
+const NR_SET_CLIENT_CAP: usize = 0x0d;
+/// `DRM_CLIENT_CAP_ATOMIC`: the cap that decides which properties a client is
+/// *shown*. `OUT_FENCE_PTR` and `IN_FENCE_FD`, which this file reads below, are
+/// both flagged atomic, so a client that has not set it does not find them in
+/// the plane's list at all.
+const CLIENT_CAP_ATOMIC: u64 = 3;
 const NR_GETPROPERTY: usize = 0xaa;
 const NR_OBJ_GETPROPERTIES: usize = 0xb9;
 const NR_OBJ_SETPROPERTY: usize = 0xba;
@@ -215,6 +221,16 @@ fn cap(fd: i32, which: u64) -> (isize, u64) {
     (r, get64(&buf, 8))
 }
 
+/// Set `DRM_CLIENT_CAP_ATOMIC` on a descriptor. See the constant: the two fence
+/// properties this file reads below are atomic ones, and the plane's list does
+/// not carry them for a client that has not asked.
+fn set_atomic(fd: i32) -> isize {
+    let mut buf = [0u8; 16];
+    put64(&mut buf, 0, CLIENT_CAP_ATOMIC);
+    put64(&mut buf, 8, 1);
+    lin::ioctl(fd, ioc_d(NR_SET_CLIENT_CAP, 16), buf.as_mut_ptr() as usize)
+}
+
 /// The id of a property, by name, out of one object's list.
 ///
 /// The name is the ABI and the id is this card's numbering, so a test that
@@ -350,6 +366,17 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     if fd < 0 {
         lin::done(failed);
     }
+
+    // The cap a compositor sets before it reads a property. Set here and not
+    // only asserted, because the plane's property list lower down is read the way
+    // a compositor reads it - and `OUT_FENCE_PTR`/`IN_FENCE_FD` are atomic
+    // properties, which a client that has not asked for them is not shown.
+    lin::check_eq(
+        &mut failed,
+        b"DRM_CLIENT_CAP_ATOMIC is accepted on the render node",
+        set_atomic(fd),
+        0,
+    );
 
     // The two capabilities Smithay asks before it will expose the explicit-sync
     // protocol at all. Answering 1 is a promise the rest of this file is the

@@ -32,6 +32,7 @@ const fn ioc_d(nr: usize, size: usize) -> usize {
 }
 
 const NR_GET_CAP: usize = 0x0c;
+const NR_SET_CLIENT_CAP: usize = 0x0d;
 const NR_GETCONNECTOR: usize = 0xa7;
 const NR_GETPROPERTY: usize = 0xaa;
 const NR_GETPROPBLOB: usize = 0xac;
@@ -64,6 +65,18 @@ const PROP_BLOB: u32 = 1 << 4;
 const PROP_IMMUTABLE: u32 = 1 << 2;
 /// `DRM_MODE_PROP_OBJECT` (`DRM_MODE_PROP_TYPE(n) = n << 6` with n = 1).
 const PROP_OBJECT: u32 = 1 << 6;
+/// `DRM_MODE_PROP_ATOMIC`: the flag that says a property belongs to an atomic
+/// commit - and the one that decides who may *see* it, since a client that has
+/// not set `DRM_CLIENT_CAP_ATOMIC` is not shown the flagged properties in a list.
+const PROP_ATOMIC: u32 = 1 << 31;
+/// `DRM_CLIENT_CAP_ATOMIC`, the capability number in `drm.h`.
+const CLIENT_CAP_ATOMIC: u64 = 3;
+/// `PROP_PLANE_FB_ID` and `PROP_CRTC_ID`: this card's numbering for the two
+/// atomic properties the pin below looks for (`src/drivers/drm.rs`). The *name*
+/// is the ABI and the id is this card's, so each is used only after the
+/// assertion that the list's id and the name lookup's id are the same one.
+const PROP_PLANE_FB_ID: u32 = 75;
+const PROP_CRTC_ID: u32 = 70;
 /// `DRM_MODE_FB_MODIFIERS`, which enables the `modifier[]` array of an `ADDFB2`.
 const FB_MODIFIERS: u32 = 1 << 1;
 /// `DRM_FORMAT_XRGB8888`, the layout the guest test's dumb buffer is in.
@@ -156,6 +169,29 @@ fn property_id(fd: i32, obj_id: u32, obj_type: u32, want: &[u8]) -> Option<(u32,
     None
 }
 
+/// The property ids one object reports through `OBJ_GETPROPERTIES`, and how
+/// many - the *list* door, as against [`property`]'s and [`property_id`]'s
+/// by-id door. The cap below changes what exactly one of the two answers, which
+/// is why the pin has to look through this one.
+fn prop_list(fd: i32, obj_id: u32, obj_type: u32, ids: &mut [u32]) -> usize {
+    let mut arg = [0u8; 32];
+    let mut values = [0u64; 32];
+    put64(&mut arg, 0, ids.as_mut_ptr() as usize as u64);
+    put64(&mut arg, 8, values.as_mut_ptr() as usize as u64);
+    put32(&mut arg, 16, ids.len() as u32);
+    put32(&mut arg, 20, obj_id);
+    put32(&mut arg, 24, obj_type);
+    if lin::ioctl(
+        fd,
+        ioc_d(NR_OBJ_GETPROPERTIES, 32),
+        arg.as_mut_ptr() as usize,
+    ) != 0
+    {
+        return 0;
+    }
+    get32(&arg, 16) as usize
+}
+
 /// Read a blob whole, answering its bytes.
 fn blob(fd: i32, id: u32) -> Option<[u8; 256]> {
     let mut arg = [0u8; 16];
@@ -195,6 +231,141 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     // session that has taken the card on a boot with nothing on the framebuffer
     // is bound to a console that does not hold the screen, so every write below
     // would come back `EACCES` before reaching the handler this file is about.
+
+    // --- the cap decides what the list carries -----------------------------------------
+    // `DRM_CLIENT_CAP_ATOMIC` is not only a promise about the client. Linux sets
+    // `DRM_MODE_PROP_ATOMIC` on the properties an atomic commit is made of and
+    // leaves those out of the lists `GETCONNECTOR` and `OBJ_GETPROPERTIES` build
+    // for a client that has not asked for them, while `GETPROPERTY` keeps
+    // answering for one of them *by id* - what is gated is the enumeration, not
+    // the door.
+    //
+    // All of that is measured on the host's card before it was written here
+    // (§7.4): a CRTC reports 6 properties to a description without the cap and 9
+    // to one with it, a connector 17 and 18, the difference being the CRTC_ID a
+    // compositor binds an output by - and a *second descriptor* of the same card
+    // kept its own answer, which is what makes the state the file's.
+    //
+    // The pin is those facts on this card. It has to run before the cap is set
+    // for the rest of the file, because everything below reads the card the way a
+    // compositor does - weston 16 has no legacy path left and sets this cap
+    // before it looks at a single property.
+    let fd2 = lin::openat(lin::AT_FDCWD, b"/dev/dri/card0\0", O_RDWR, 0);
+    lin::check_true(
+        &mut failed,
+        b"a second descriptor of the card opens",
+        fd2 >= 0,
+    );
+    let fd2 = fd2 as i32;
+
+    let mut uncapped_ids = [0u32; 16];
+    let uncapped_count = prop_list(fd, PLANE_ID, OBJECT_PLANE, &mut uncapped_ids);
+    lin::check_true(
+        &mut failed,
+        b"an uncapped client is not shown the plane's FB_ID at all",
+        !uncapped_ids[..uncapped_count.min(16)].contains(&PROP_PLANE_FB_ID),
+    );
+    // It is not *gone*, though: the same id is still answered, and the flag it
+    // comes back with is the reason it was missing from the list. This is the
+    // half a reader gets wrong from the sentence alone, and why the filter sits
+    // in the list builders rather than in the by-id door.
+    match property(fd, PROP_PLANE_FB_ID) {
+        Some(prop) => {
+            let end = prop.name.iter().position(|b| *b == 0).unwrap_or(32);
+            lin::check_true(
+                &mut failed,
+                b"and by id it is still answered, flagged ATOMIC",
+                &prop.name[..end] == b"FB_ID" && prop.flags & PROP_ATOMIC != 0,
+            );
+        }
+        None => lin::check_true(
+            &mut failed,
+            b"the plane's FB_ID answers GETPROPERTY by id",
+            false,
+        ),
+    }
+
+    let mut cap = [0u8; 16];
+    put64(&mut cap, 0, CLIENT_CAP_ATOMIC);
+    put64(&mut cap, 8, 1);
+    lin::check_eq(
+        &mut failed,
+        b"DRM_CLIENT_CAP_ATOMIC is accepted",
+        lin::ioctl(fd, ioc_d(NR_SET_CLIENT_CAP, 16), cap.as_mut_ptr() as usize),
+        0,
+    );
+
+    let mut capped_ids = [0u32; 16];
+    let capped_count = prop_list(fd, PLANE_ID, OBJECT_PLANE, &mut capped_ids);
+    lin::check_true(
+        &mut failed,
+        b"and now the plane's FB_ID is in the list",
+        capped_ids[..capped_count.min(16)].contains(&PROP_PLANE_FB_ID),
+    );
+    // The id the list carries and the id the *name* lookup gives are the same
+    // one, which is what lets the assertions above and below use the number at
+    // all: the name is the ABI and the number is this card's.
+    lin::check_true(
+        &mut failed,
+        b"by the same id the name lookup finds",
+        property_id(fd, PLANE_ID, OBJECT_PLANE, b"FB_ID").map(|(id, _)| id)
+            == Some(PROP_PLANE_FB_ID),
+    );
+    // The change is exactly the atomic properties, in both directions: nothing
+    // the uncapped list had is missing, and everything it gained is flagged.
+    lin::check_true(
+        &mut failed,
+        b"the cap takes nothing away from what was already listed",
+        uncapped_ids[..uncapped_count.min(16)]
+            .iter()
+            .all(|id| capped_ids[..capped_count.min(16)].contains(id)),
+    );
+    let mut gained = 0;
+    let mut gained_all_atomic = true;
+    for &id in capped_ids[..capped_count.min(16)].iter() {
+        if uncapped_ids[..uncapped_count.min(16)].contains(&id) {
+            continue;
+        }
+        gained += 1;
+        match property(fd, id) {
+            Some(prop) => {
+                if prop.flags & PROP_ATOMIC == 0 {
+                    gained_all_atomic = false;
+                }
+            }
+            None => gained_all_atomic = false,
+        }
+    }
+    lin::check_true(
+        &mut failed,
+        b"and everything it gained is flagged DRM_MODE_PROP_ATOMIC",
+        gained > 0 && gained_all_atomic,
+    );
+
+    // The control: a second descriptor of the same card, which never set the cap,
+    // sees what the first one saw before it did.
+    let mut control_ids = [0u32; 16];
+    let control_count = prop_list(fd2, PLANE_ID, OBJECT_PLANE, &mut control_ids);
+    lin::check_true(
+        &mut failed,
+        b"while a second descriptor of the same card is unaffected",
+        !control_ids[..control_count.min(16)].contains(&PROP_PLANE_FB_ID),
+    );
+    // And on the connector, where the property the cap hides is `CRTC_ID` - so a
+    // card that kept it from a *capped* client would be a compositor with no
+    // output, and one that showed it to an uncapped client would be a list that
+    // does not match Linux's.
+    let mut conn_capped = [0u32; 16];
+    let conn_capped_count = prop_list(fd, CONNECTOR_ID, OBJECT_CONNECTOR, &mut conn_capped);
+    let mut conn_uncapped = [0u32; 16];
+    let conn_uncapped_count = prop_list(fd2, CONNECTOR_ID, OBJECT_CONNECTOR, &mut conn_uncapped);
+    lin::check_true(
+        &mut failed,
+        b"the capped client sees the connector's CRTC_ID and the uncapped one does not",
+        conn_capped[..conn_capped_count.min(16)].contains(&PROP_CRTC_ID)
+            && !conn_uncapped[..conn_uncapped_count.min(16)].contains(&PROP_CRTC_ID),
+    );
+    lin::close(fd2);
 
     // --- the connector's property list -------------------------------------------------
     //

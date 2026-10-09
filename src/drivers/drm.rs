@@ -474,6 +474,50 @@ const PROP_ENUM: u32 = 1 << 3;
 const PROP_BLOB: u32 = 1 << 4;
 const PROP_OBJECT: u32 = 1 << 6;
 const PROP_SIGNED_RANGE: u32 = 1 << 7;
+/// `DRM_MODE_PROP_ATOMIC`: not a *type* like the bits above, but a statement
+/// about who may see the property. Linux sets it on the properties an atomic
+/// commit is made of and leaves those out of the lists it answers a client that
+/// has not set `DRM_CLIENT_CAP_ATOMIC` - so the flag `GETPROPERTY` reports and
+/// the skip the two list doors make are one fact, and [`ATOMIC_PROPS`] is where
+/// this file keeps it.
+const PROP_ATOMIC: u32 = 1 << 31;
+/// The properties this card flags `ATOMIC`, in one place, because two readers
+/// need the same answer: `GETPROPERTY` (which reports the flag and must answer
+/// for a property the client cannot *see*) and `GETCONNECTOR`/
+/// `OBJ_GETPROPERTIES` (which leave the properties out of their lists).
+///
+/// The list is a *measurement*, not a reading of `<drm_mode.h>`, and it was
+/// taken on this host's card across two open file descriptions of it (§7.4):
+/// every property of every connector, CRTC and plane with its flags, on a
+/// descriptor that had set the cap. What it says is that `ATOMIC` marks exactly
+/// the object-typed properties (`CRTC_ID` on the connector, `FB_ID`/`CRTC_ID` on
+/// the planes), the plane's two rectangles and its two fences, and the CRTC's
+/// `ACTIVE`/`MODE_ID`/`OUT_FENCE_PTR` - while `type`, `IN_FORMATS`, `EDID`,
+/// `DPMS`, `non-desktop`, `max bpc`, `vrr_capable`, `TILE` and the colour
+/// properties are not marked and are shown to every client.
+///
+/// One property of this card is deliberately absent from the list: `pixel blend
+/// mode` is not measurable on the host at all - its planes carry no blend
+/// property, so nothing there says whether Linux would mark it - and marking a
+/// property because its neighbours are marked is the guess this file refuses
+/// elsewhere.
+const ATOMIC_PROPS: [u32; 15] = [
+    PROP_CRTC_ID,
+    PROP_ACTIVE,
+    PROP_MODE_ID,
+    PROP_PLANE_FB_ID,
+    PROP_PLANE_CRTC_ID,
+    PROP_SRC_X,
+    PROP_SRC_Y,
+    PROP_SRC_W,
+    PROP_SRC_H,
+    PROP_CRTC_X,
+    PROP_CRTC_Y,
+    PROP_CRTC_W,
+    PROP_CRTC_H,
+    PROP_IN_FENCE_FD,
+    PROP_OUT_FENCE_PTR,
+];
 /// `DRM_PLANE_TYPE_PRIMARY`: the one plane is the CRTC's primary surface.
 const PLANE_TYPE_PRIMARY: u64 = 1;
 /// `DRM_PLANE_TYPE_CURSOR`, the `type` value that makes the second plane the
@@ -824,6 +868,22 @@ struct DrmState {
     /// while a `SYNCOBJ_HANDLE_TO_FD` descriptor names it, which is the sharing
     /// the descriptor exists for.
     syncobjs: Vec<Option<SyncObjRec>>,
+    /// The open file descriptions that have set `DRM_CLIENT_CAP_ATOMIC`.
+    ///
+    /// The cap is the *file's*, not the card's: Linux records it on `struct
+    /// drm_file`, and the measurement behind [`ATOMIC_PROPS`] settled that this
+    /// is the scope a client observes rather than an assumption - on two
+    /// descriptions of one card, one setting the cap changed what only *that*
+    /// one was shown, on the connector and on the CRTC alike. The key is
+    /// therefore the same `ofd` the framebuffers already carry as `owner`, which
+    /// is this kernel's `struct drm_file`.
+    ///
+    /// It is the only cap kept. The others this card accepts - `STEREO_3D`,
+    /// `UNIVERSAL_PLANES`, `ASPECT_RATIO`, `WRITEBACK_CONNECTORS` - are promises
+    /// about which fields of a reply the *client* will read, and this card
+    /// answers every one of them the same either way; storing them would be
+    /// state with no reader. This one has a reader: the list doors.
+    atomic_ofds: Vec<u64>,
 }
 
 mod drm_event {
@@ -875,6 +935,7 @@ static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
     seq: 0,
     events: VecDeque::new(),
     syncobjs: Vec::new(),
+    atomic_ofds: Vec::new(),
 }));
 
 /// The `drm_version` answer: the KMS ABI version this kernel speaks (4.0), and
@@ -1023,7 +1084,7 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
     match nr {
         NR_VERSION => fill_version(arg),
         NR_GET_CAP => get_cap(arg),
-        NR_SET_CLIENT_CAP => set_client_cap(arg),
+        NR_SET_CLIENT_CAP => set_client_cap(arg, ofd),
         NR_GET_MAGIC => take_magic(minor, ofd, arg),
         // `struct drm_auth { drm_magic_t magic; }` again, read this way round:
         // the token the *other* client was given, spent by the master.
@@ -1042,7 +1103,7 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_GETCRTC => get_crtc(arg),
         NR_SETCRTC => set_crtc(arg, card.lease()),
         NR_GETENCODER => get_encoder(arg),
-        NR_GETCONNECTOR => get_connector(arg),
+        NR_GETCONNECTOR => get_connector(arg, ofd),
         NR_GETPLANERESOURCES => {
             // struct drm_mode_get_plane_res { u64 plane_id_ptr@0;
             // u32 count_planes@8; } - the pointer *first*, like every other
@@ -1070,7 +1131,7 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_GETPLANE => get_plane(arg),
         NR_GETPROPERTY => get_property(arg),
         NR_SETPROPERTY => set_property(arg),
-        NR_OBJ_GETPROPERTIES => obj_get_properties(arg),
+        NR_OBJ_GETPROPERTIES => obj_get_properties(arg, ofd),
         NR_OBJ_SETPROPERTY => obj_set_property(arg),
         NR_MODE_ATOMIC => mode_atomic(arg),
         NR_CREATE_BLOB => create_blob(arg),
@@ -2853,15 +2914,22 @@ pub fn master_closed(ofd: u64) {
         REVOKED.store(false, Ordering::Relaxed);
         crate::vfs::vcmux::set_master_vc(0);
     }
-    // And the sync objects it made. A handle is per *description*, so a
-    // description that is gone has nobody left who could name one - and the
-    // objects themselves are not dropped here: a `SYNCOBJ_HANDLE_TO_FD`
-    // descriptor that outlived the client still holds the one it names, which is
-    // the whole reason that descriptor exists.
+    // And what it holds by *description* rather than by any object: the sync
+    // objects it made, and the `DRM_CLIENT_CAP_ATOMIC` it set. A handle is per
+    // description, so a description that is gone has nobody left who could name
+    // one - and the objects themselves are not dropped here: a
+    // `SYNCOBJ_HANDLE_TO_FD` descriptor that outlived the client still holds the
+    // one it names, which is the whole reason that descriptor exists. The cap is
+    // the same shape, and forgetting it here is not a leak of pixels but a
+    // descriptor number that a *later* file could be given: an `ofd` left in the
+    // list would hand some other client the atomic properties it never asked
+    // for, which is the use-after-free of `master_closed`'s own header, one
+    // table over.
     critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         st.syncobjs
             .retain(|rec| rec.as_ref().is_none_or(|rec| rec.owner != ofd));
+        st.atomic_ofds.retain(|&owner| owner != ofd);
     });
     release_framebuffers(ofd);
 }
@@ -3099,7 +3167,15 @@ fn get_cap(arg: usize) -> isize {
 /// hotspot, because there is no `HOTSPOT_X`/`HOTSPOT_Y` plane property for it to
 /// be about - which is what a real card's cursor planes measure as well, and a
 /// different question from whether the card has a cursor at all.
-fn set_client_cap(arg: usize) -> isize {
+///
+/// `ATOMIC` is also the one cap this card *records* rather than merely accepts,
+/// because it is the one whose answer changes what the card reports: the
+/// properties in [`ATOMIC_PROPS`] appear in `GETCONNECTOR`'s and
+/// `OBJ_GETPROPERTIES`'s lists only for a description that has set it. Recording
+/// it is what makes the second half of the cap true - before this, the flag was
+/// absent and every client was shown the atomic properties, which is the
+/// "accepted and stored nowhere" the §7.4 record named as the honest gap.
+fn set_client_cap(arg: usize, ofd: u64) -> isize {
     // struct drm_set_client_cap { u64 capability; u64 value; }
     let capability = unsafe { (arg as *const u64).read_unaligned() };
     let value = unsafe { ((arg + 8) as *const u64).read_unaligned() };
@@ -3125,9 +3201,23 @@ fn set_client_cap(arg: usize) -> isize {
         // `init_kms_caps` - that something failed that did not.
         CLIENT_CAP_STEREO_3D
         | CLIENT_CAP_UNIVERSAL_PLANES
-        | CLIENT_CAP_ATOMIC
         | CLIENT_CAP_ASPECT_RATIO
         | CLIENT_CAP_WRITEBACK_CONNECTORS => 0,
+        // The one cap with a reader: recorded per description, so that the two
+        // list doors can leave the atomic properties out for a client that has
+        // not asked for them. A `value` of 0 is an *un*set - the same request
+        // weston makes on teardown - and takes the description out again, which
+        // is why this pushes rather than only inserting.
+        CLIENT_CAP_ATOMIC => {
+            critical_section::with(|cs| {
+                let mut st = STATE.borrow(cs).borrow_mut();
+                st.atomic_ofds.retain(|&owner| owner != ofd);
+                if value == 1 {
+                    st.atomic_ofds.push(ofd);
+                }
+            });
+            0
+        }
         // Refused because the object behind them does not exist here: no
         // plane with a color pipeline, and no `HOTSPOT_X`/`HOTSPOT_Y` plane
         // property for the cursor cap to be about. That last one is the
@@ -3637,7 +3727,7 @@ fn get_encoder(arg: usize) -> isize {
     0
 }
 
-fn get_connector(arg: usize) -> isize {
+fn get_connector(arg: usize, ofd: u64) -> isize {
     // struct drm_mode_get_connector:
     // encoders_ptr@0, modes_ptr@8, props_ptr@16, prop_values_ptr@24 (u64);
     // count_modes@32, count_props@36, count_encoders@40, encoder_id@44,
@@ -3653,10 +3743,14 @@ fn get_connector(arg: usize) -> isize {
     // `drmModeGetConnector`. The EDID's *bytes* are built here too, so that a
     // client which reads the property and then fetches the blob finds it; the
     // immutable ones report the one value they have.
-    let (crtc_value, dpms_value) = critical_section::with(|cs| {
+    let (crtc_value, dpms_value, atomic) = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         let _ = edid_blob_bytes(&mut st);
-        (st.conn_crtc as u64, st.dpms as u64)
+        (
+            st.conn_crtc as u64,
+            st.dpms as u64,
+            st.atomic_ofds.contains(&ofd),
+        )
     });
     let connector_values: [u64; 6] = [
         crtc_value,
@@ -3666,6 +3760,21 @@ fn get_connector(arg: usize) -> isize {
         BPC_HERE,
         0, // vrr_capable: the refresh rate cannot vary
     ];
+    // The connector's list, less the properties an un-atomic client is not shown
+    // - the `CRTC_ID` this card is bound by, which is in [`ATOMIC_PROPS`] for the
+    // same reason the planes' is. `OBJ_GETPROPERTIES` answers the same object
+    // through `without_atomic` over the same table, so the two doors cannot hand
+    // the same client two different connectors; the measurement that fixed the
+    // set (§7.4) saw exactly this on a connector: seventeen properties to a
+    // description without the cap, eighteen with it, and per *description*.
+    let all = CONNECTOR_PROPS.len();
+    let mut visible_props = CONNECTOR_PROPS;
+    let mut visible_values = connector_values;
+    let visible = if atomic {
+        all
+    } else {
+        without_atomic(&mut visible_props, &mut visible_values, all)
+    };
     unsafe {
         let p = arg as *mut u8;
         // Fill a single mode into modes_ptr if the caller asked for it.
@@ -3675,24 +3784,26 @@ fn get_connector(arg: usize) -> isize {
             write_mode(modes_ptr, (w * h * 60) / 1000, w, h);
         }
         (p.add(32) as *mut u32).write_unaligned(1); // count_modes
-        // The property ids and values, when the caller has room for them.
+        // The property ids and values, when the caller has room for them. The
+        // count is the *visible* one, so a client is told how long the list it
+        // can read is and never a longer one than it will receive.
         let count_props = (p.add(36) as *const u32).read_unaligned();
-        (p.add(36) as *mut u32).write_unaligned(CONNECTOR_PROPS.len() as u32);
+        (p.add(36) as *mut u32).write_unaligned(visible as u32);
         let props_ptr = ((p.add(16) as *const u64).read_unaligned()) as *mut u32;
-        if count_props >= CONNECTOR_PROPS.len() as u32
+        if count_props >= visible as u32
             && !props_ptr.is_null()
-            && user_array(props_ptr as usize, CONNECTOR_PROPS.len(), 4, true)
+            && user_array(props_ptr as usize, visible, 4, true)
         {
-            for (index, prop) in CONNECTOR_PROPS.iter().enumerate() {
+            for (index, prop) in visible_props.iter().take(visible).enumerate() {
                 props_ptr.add(index).write_unaligned(*prop);
             }
         }
         let values_ptr = ((p.add(24) as *const u64).read_unaligned()) as *mut u64;
-        if count_props >= CONNECTOR_PROPS.len() as u32
+        if count_props >= visible as u32
             && !values_ptr.is_null()
-            && user_array(values_ptr as usize, CONNECTOR_PROPS.len(), 8, true)
+            && user_array(values_ptr as usize, visible, 8, true)
         {
-            for (index, value) in connector_values.iter().enumerate() {
+            for (index, value) in visible_values.iter().take(visible).enumerate() {
                 values_ptr.add(index).write_unaligned(*value);
             }
         }
@@ -3884,6 +3995,22 @@ fn get_property(arg: usize) -> isize {
         // builds: one linear modifier over every format the plane reports.
         PROP_IN_FORMATS => ("IN_FORMATS", PROP_BLOB | PROP_IMMUTABLE, &[], &[]),
         _ => return libc_einval(),
+    };
+    // `DRM_MODE_PROP_ATOMIC` is not one of the *type* bits the arms above choose
+    // between, so it is not written there: which clients may see a property is a
+    // separate fact from what the property is, and [`ATOMIC_PROPS`] is the one
+    // place this file keeps it - the same list the two list doors filter by.
+    //
+    // It is reported even to a client that cannot see the property in a list,
+    // and that is deliberate rather than an oversight: Linux lets a caller ask
+    // by id for a property it was not shown, and answers with the flag, so a
+    // caller that kept an id from a previous capped session can find out why it
+    // is gone. Measured on this host's card, on the description that had *not*
+    // set the cap, before this was written.
+    let flags = if ATOMIC_PROPS.contains(&prop_id) {
+        flags | PROP_ATOMIC
+    } else {
+        flags
     };
     unsafe {
         // The name, NUL-padded into its 32-byte field.
@@ -4720,10 +4847,40 @@ fn destroy_blob(arg: usize) -> isize {
     })
 }
 
+/// The properties of a list a client without `DRM_CLIENT_CAP_ATOMIC` is shown:
+/// the ones in [`ATOMIC_PROPS`] are taken out, in place, and the count comes
+/// back with them. `values` runs parallel to `ids` and is compacted the same
+/// way, because a caller reads the two as pairs.
+///
+/// The filter sits over an already-built list rather than inside every arm that
+/// builds one, because an object's *contents* and who may see them are two
+/// facts and only the second is what the cap changes. It is also the same skip
+/// `GETCONNECTOR` makes over its own list, from the same table - the two must
+/// agree, since a client reading a connector from one door and the other would
+/// otherwise be handed two different connectors.
+fn without_atomic(ids: &mut [u32], values: &mut [u64], count: usize) -> usize {
+    let mut kept = 0;
+    for index in 0..count {
+        if ATOMIC_PROPS.contains(&ids[index]) {
+            continue;
+        }
+        ids[kept] = ids[index];
+        values[kept] = values[index];
+        kept += 1;
+    }
+    kept
+}
+
 /// `OBJ_GETPROPERTIES`: the property ids and values one KMS object carries -
 /// the two-call list shape again, over the same facts `GETCONNECTOR`
 /// reports for the connector.
-fn obj_get_properties(arg: usize) -> isize {
+///
+/// What it reports depends on who asks: the properties in [`ATOMIC_PROPS`] are
+/// left out for a description that has not set `DRM_CLIENT_CAP_ATOMIC`. Asking
+/// for one of them *by id* is still answered, and still reports the flag - see
+/// [`get_property`], which is the whole of Linux's rule and the half the §7.4
+/// sentence gets wrong: the cap gates the *enumeration*, not the door.
+fn obj_get_properties(arg: usize, ofd: u64) -> isize {
     // struct drm_mode_obj_get_properties: props_ptr@0, prop_values_ptr@8,
     // count_props@16, obj_id@20, obj_type@24.
     let obj_id = unsafe { ((arg + 20) as *const u32).read_unaligned() };
@@ -4733,7 +4890,7 @@ fn obj_get_properties(arg: usize) -> isize {
     // here carries, and the count is what says how much of it is real.
     let Some((ids, values, count)) = critical_section::with(|cs| {
         let st = STATE.borrow(cs).borrow();
-        match (obj_type, obj_id) {
+        let list = match (obj_type, obj_id) {
             (OBJECT_CONNECTOR, CONNECTOR_ID) => Some((
                 [
                     PROP_CRTC_ID,
@@ -4935,7 +5092,21 @@ fn obj_get_properties(arg: usize) -> isize {
                 ))
             }
             _ => None,
-        }
+        };
+        let (mut ids, mut values, count) = list?;
+        // What this client is shown. A description that has not set
+        // `DRM_CLIENT_CAP_ATOMIC` is not shown the atomic properties *at all* -
+        // not a smaller list of values, but a shorter list of ids - which is
+        // what the measurement on this host's card found on a CRTC (six
+        // properties uncapped, nine capped) and on a connector (seventeen and
+        // eighteen, the difference being `CRTC_ID`). Asking for one by id is a
+        // different door and is not filtered here; see [`get_property`].
+        let count = if st.atomic_ofds.contains(&ofd) {
+            count
+        } else {
+            without_atomic(&mut ids, &mut values, count)
+        };
+        Some((ids, values, count))
     }) else {
         return libc_einval();
     };

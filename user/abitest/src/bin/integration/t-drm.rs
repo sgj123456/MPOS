@@ -41,6 +41,12 @@ const fn ioc_d(nr: usize, size: usize) -> usize {
     (3 << 30) | (size << 16) | ((b'd' as usize) << 8) | nr
 }
 const NR_GET_CAP: usize = 0x0c;
+const NR_SET_CLIENT_CAP: usize = 0x0d;
+/// `DRM_CLIENT_CAP_ATOMIC`. Set below rather than only asserted: a client that
+/// has not set it is not shown the atomic properties in a list, and the reads
+/// further down this file are the reads a *compositor* makes - weston 16 has no
+/// legacy path left and must set this cap before it can read a single one.
+const CLIENT_CAP_ATOMIC: u64 = 3;
 const NR_GETRESOURCES: usize = 0xa0;
 const NR_GETPLANERESOURCES: usize = 0xb5;
 const NR_SETCRTC: usize = 0xa2;
@@ -106,6 +112,24 @@ extern "C" fn mpos_user_main(_argc: usize, _argv: *const *const u8) -> ! {
     if fd < 0 {
         lin::done(failed);
     }
+
+    // The cap a compositor sets before it reads anything. This file reads the
+    // connector's and the plane's property lists further down - and the
+    // connector's `CRTC_ID` and the plane's `FB_ID`/`SRC_W` are properties only a
+    // capped client is shown - so the cap belongs here, where a compositor puts
+    // it, rather than at each read. What the cap *gates* is pinned in
+    // `t-drm-props`, which is the file about the property lists.
+    let mut client_cap = [CLIENT_CAP_ATOMIC, 1u64];
+    lin::check_eq(
+        &mut failed,
+        b"DRM_CLIENT_CAP_ATOMIC is accepted",
+        lin::ioctl(
+            fd,
+            ioc_d(NR_SET_CLIENT_CAP, 16),
+            client_cap.as_mut_ptr() as usize,
+        ),
+        0,
+    );
 
     // GET_CAP(DUMB_BUFFER) -> value 1.
     let mut cap = [1u64, 0u64];

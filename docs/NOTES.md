@@ -2866,6 +2866,53 @@ is again read off its source rather than measured, and it is the renderer below.
 > `error spawning "waybar": Os { code: 12, kind: OutOfMemory }`, which is not
 > what a missing binary answers (`ENOENT`) and is worth a look of its own.
 
+> **Update, landed (2026-10-09): the five pieces are in, and the probe that wrote
+> them settled two things the sentence above did not say.** A second instrument on
+> the host's card - every property of every connector, CRTC and plane with its
+> flags, on a descriptor that had set the cap, beside one that had not - answers
+> both questions the five-piece list left open:
+>
+> - **The connector door filters too.** `drmModeGetConnector` reported **17**
+>   properties to the uncapped descriptor and **18** to the capped one, on the same
+>   card, with `CRTC_ID` the difference - the CRTC's 6-and-9 above is the same rule
+>   seen through `OBJ_GETPROPERTIES`. So the skip belongs in *both* list builders,
+>   which is also what this file's own comment demands of `CONNECTOR_PROPS`: a
+>   client that read a connector from one door and not the other would otherwise be
+>   handed two different connectors.
+> - **`IN_FENCE_FD` and `OUT_FENCE_PTR` are atomic properties**, which the sentence
+>   above left ambiguous by naming them only in a parenthetical. Measured: the
+>   plane's `IN_FENCE_FD` reports `0x80000080` (`ATOMIC | SIGNED_RANGE`) and the
+>   CRTC's `OUT_FENCE_PTR` `0x80000002` (`ATOMIC | RANGE`). Both are marked.
+>
+> What landed (`drivers/drm.rs`): `PROP_ATOMIC` (`1 << 31`) beside one `ATOMIC_PROPS`
+> list that *both* the reported flag and the two filters read, so the shape a caller
+> sees and the set the cap hides cannot drift apart; `DrmState::atomic_ofds`, keyed
+> on the same `ofd` the framebuffers carry as `owner`, written by `set_client_cap`
+> (a value of 0 *un*sets it, which is the request weston makes on teardown) and
+> pruned in `master_closed` beside `release_framebuffers`; the skip applied through
+> one `without_atomic` that compacts the ids and their parallel values in place, in
+> `get_connector` and in `obj_get_properties` alike; and `get_property` left
+> deliberately *un*filtered, so a caller that asks for an atomic property's id on an
+> uncapped descriptor is still answered, and still told the flag. Pinned by
+> `t-drm-props`, which reads both doors on one descriptor with a second descriptor
+> as the control and asserts the change is *exactly* the atomic set - nothing the
+> uncapped list had is missing from the capped one, and everything it gained is
+> flagged. `t-drm` and `t-drm-sync` now set the cap before they read an atomic
+> property by name or by index, which is what a compositor does: weston 16 has no
+> legacy path left and could not read its own frame properties without it.
+>
+> **Two things this deliberately did not do.** `MODE_ATOMIC` itself is not gated on
+> the cap here, and whether Linux gates it is **unmeasured** - the probe that would
+> have asked got `EACCES` from *both* descriptors, because a compositor holds the
+> master on the development host and the master check answers first; settling it
+> needs a card with nothing on it, and taking the master off a live desktop is not a
+> thing to do to one. And `pixel blend mode` stays unmarked, for the reason the list
+> above gives: the host's planes carry no blend property at all, so there is no
+> measurement to follow rather than a shape to copy. One older difference is named
+> here rather than changed: Linux spells `CRTC_X`/`CRTC_Y` `SIGNED_RANGE` (`0x80`)
+> where this card spells them `RANGE`, which is about the property's *shape* and not
+> its visibility, and is older than this change.
+
 niri's TTY backend is `GpuManager<GbmGlesBackend<GlesRenderer>>` and nothing
 else - there is no pixman renderer in it - and, worse for this kernel, it
 *rejects* the renderer that is available:
