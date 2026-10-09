@@ -22,17 +22,18 @@
 //! bodies that call it, so a body here holds only what would have to be answered
 //! differently on a different machine (`NOTES.md` §14.9).
 
-/// The boot's self-tests, and the harness that runs them.
+/// The harness that runs the boot's self-tests, and the one place that lists them.
 ///
-/// Both are behind `--features selftest`, so a production kernel compiles
-/// neither: that is what "no test openings in shipped code" means here, and it is
-/// what let the boot path's test branches become five `#[cfg]`-gated calls
-/// instead of a command-line word the kernel parsed on every boot. The flag is a
-/// cargo feature rather than a `--cfg` for a measured reason - a `--cfg` cannot be
-/// *added* to this build, because `RUSTFLAGS` replaces the machine's flags in
-/// `.cargo/config.toml` rather than extending them (`docs/NOTES.md` §15.19).
-#[cfg(feature = "selftest")]
-mod checks;
+/// The suites themselves are elsewhere - each beside the module it tests, which
+/// is what lets one read that module's private state, and the boot's own in
+/// [`report`] - so this module is behind `--features selftest` and a production
+/// kernel compiles none of them: that is what "no test openings in shipped code"
+/// means here, and it is what let the boot path's test branches become five
+/// `#[cfg]`-gated calls instead of a command-line word the kernel parsed on every
+/// boot. The flag is a cargo feature rather than a `--cfg` for a measured reason -
+/// a `--cfg` cannot be *added* to this build, because `RUSTFLAGS` replaces the
+/// machine's flags in `.cargo/config.toml` rather than extending them
+/// (`docs/NOTES.md` §15.19).
 #[cfg(feature = "selftest")]
 mod kunit;
 mod report;

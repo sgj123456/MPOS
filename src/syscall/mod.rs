@@ -15,14 +15,16 @@
 //! man-page contract is unit-tested, and where a change to a flag bit or a
 //! struct offset reads as a red test instead of a mystery on the machine.
 
-/// Linux x86_64 syscall number mapping and POSIX handlers.
-/// The syscall layer's suite for a test build: the dispatch gate, entered from a
-/// task and from the kernel, with the tty and the signal cases to follow when the
-/// last family leaves the wiring layer's checks directory. Listed by the harness
-/// (`src/board/kunit.rs`); `docs/NOTES.md` §15.22 records why the gate's cases
-/// could not stay in `vfs`'s suite.
+/// The two suites this layer carries for a test build: the dispatch gate, entered
+/// from a task and from the kernel, and the pipes/tty/signals family that goes
+/// through it. The gate's cases run at `Phase::Vfs` and the family's at
+/// `Phase::Ipc`, and the harness (`src/board/kunit.rs`) lists both.
+/// `docs/NOTES.md` §15.22 records why the gate's cases could not stay in `vfs`'s
+/// suite, §15.23 why the family is here rather than beside `vfs` or `sched`.
 #[cfg(all(target_os = "none", feature = "selftest"))]
 pub mod kunit;
+
+/// Linux x86_64 syscall number mapping and POSIX handlers.
 pub mod linux;
 
 /// Base address for user mmap: where every process's mmap cursor starts.

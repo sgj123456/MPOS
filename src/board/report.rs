@@ -22,8 +22,13 @@
 //! handler itself, which is `src/main.rs`'s - architecture-independent, and it
 //! calls the one function below.
 
+#[cfg(feature = "selftest")]
+use alloc::string::String;
+
 use mpos::boot::BootInfo;
 use mpos::boot::handoff::BOOT_STACK_CANARY;
+#[cfg(feature = "selftest")]
+use mpos::kunit::{Case, Phase, Suite};
 use mpos::{arch, hal, println, sched};
 
 /// One line per fact the loader's record carries, before anything acts on it.
@@ -92,6 +97,34 @@ pub fn check_boot_stack(info: &BootInfo, when: &str) {
          machine that cannot report it."
     );
     println!("boot stack: intact {when}");
+}
+
+/// The boot's own case in the self-test harness: the canary at the bottom of the
+/// boot stack, measured once the boot has been through everything a test build
+/// runs.
+///
+/// It is a suite in *this* module because the check it drives is this module's: a
+/// boot stack is the boot's, not a subsystem's, so there is no subsystem suite for
+/// it to live in and the wiring layer is the only place that can name `report`
+/// (`docs/NOTES.md` §15.23). `Phase::Ipc` is the last phase the boot does work in,
+/// so this is the deepest the boot stack is measured from a suite - the deepest
+/// point of all, the handoff nesting an ELF parse and an address space on top of
+/// every step, is what the two production calls in the bodies measure.
+#[cfg(feature = "selftest")]
+pub const SUITE: Suite = Suite {
+    name: "boot",
+    phase: Phase::Ipc,
+    cases: &[Case {
+        name: "stack_depth",
+        run: stack_depth,
+    }],
+};
+
+/// [`check_boot_stack`], in the shape a case answers.
+#[cfg(feature = "selftest")]
+fn stack_depth(info: &BootInfo) -> Result<(), String> {
+    check_boot_stack(info, "after the self-tests");
+    Ok(())
 }
 
 /// Where the boot task spends the rest of the machine's life.

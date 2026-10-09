@@ -25,7 +25,7 @@ use mpos::boot::BootInfo;
 pub(crate) use mpos::kunit::{Case, Phase, Suite};
 use mpos::println;
 
-use super::checks;
+use super::report;
 
 /// Every suite, in the one place that names them.
 ///
@@ -39,24 +39,12 @@ pub(crate) const SUITES: &[Suite] = &[
     mpos::sched::kunit::SUITE,
     mpos::vfs::kunit::SUITE,
     mpos::syscall::kunit::SUITE,
-    // The one family still checked from this layer. It is one case whose body
-    // answers by panicking, and it moves into `mpos::syscall::kunit` next - the
-    // tty and the signal path with the syscall gate's own cases, which
-    // `mpos::vfs::kunit` carries until then (`docs/NOTES.md` §15.22).
-    Suite {
-        name: "ipc",
-        phase: Phase::Ipc,
-        cases: &[
-            Case {
-                name: "pipes_tty_signals",
-                run: checks::case_ipc,
-            },
-            Case {
-                name: "boot_stack_depth",
-                run: checks::case_boot_stack,
-            },
-        ],
-    },
+    mpos::syscall::kunit::IPC_SUITE,
+    // The boot's own, and the last: the canary at the bottom of the boot stack,
+    // which no subsystem's suite can carry because the check it drives is the
+    // wiring layer's own (`src/board/report.rs`), and which wants to run once
+    // everything above it has been through the stack.
+    report::SUITE,
     #[cfg(target_arch = "x86_64")]
     Suite {
         name: "arch",
