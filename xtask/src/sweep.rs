@@ -171,6 +171,43 @@ pub struct Verdict<'a> {
     /// evidence about the kernel yet. The aarch64 runner is the one that prints
     /// this; the first machine's setup failing shows up as a missing summary.
     pub setup_failed: Option<&'a str>,
+    /// The *kernel's* own suites, which ran before any program did.
+    pub kunit: Option<Kunit>,
+}
+
+/// What the test kernel's suites found, as `mpos-kunit: N passed, M failed`.
+///
+/// A separate verdict from the sweep's, because it is a separate half of the
+/// gate: the harness prints one line, the payload prints `=== ` lines, and the
+/// two say different things. It is also what makes "the suites ran" a claim
+/// rather than a hope - a suite that silently never ran leaves its cases out of
+/// the count, and the count is asserted below rather than trusted (`src/board/
+/// kunit.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Kunit {
+    pub passed: usize,
+    pub failed: usize,
+}
+
+/// The harness's line, if the boot printed one.
+///
+/// Absent is a *failure* everywhere it is used, not a neutral answer: a test
+/// kernel that does not report its suites has not told us they ran, and this
+/// repository's rule for a gate is that it must not be able to pass quietly
+/// with less than it claims.
+pub fn kunit(log: &str) -> Option<Kunit> {
+    log.lines()
+        .rev()
+        .find_map(|line| line.trim_end().strip_prefix("mpos-kunit: "))
+        .and_then(|rest| {
+            let mut words = rest.split_whitespace();
+            let passed = words.next()?.parse().ok()?;
+            // "passed," / "failed" - the middle word is the comma.
+            words.next()?;
+            let failed = words.next()?.parse().ok()?;
+            words.next()?;
+            Some(Kunit { passed, failed })
+        })
 }
 
 pub fn verdict(log: &str) -> Verdict<'_> {
@@ -198,6 +235,7 @@ pub fn verdict(log: &str) -> Verdict<'_> {
         failed,
         summary,
         setup_failed,
+        kunit: kunit(log),
     }
 }
 

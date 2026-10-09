@@ -33,25 +33,36 @@
 
 extern crate alloc;
 
-use core::ptr;
-
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::checks;
 use super::report;
 use super::steps;
-use mpos::arch;
 use mpos::blk;
 use mpos::boot::console_list::ConsoleList;
 use mpos::boot::{self, BootInfo};
 use mpos::drivers;
-use mpos::hal;
-use mpos::mm::{self, MapFlags, Mapping, PAGE_SIZE};
+use mpos::mm;
 use mpos::println;
 use mpos::sched::{self};
-use mpos::syscall::{self};
 use mpos::vfs::{self, NodeKind};
+
+// What only the test build's suites reach for. A `use` is not a cost, but an
+// unused one is a warning, and the warning is the *right* one here: it is the
+// compiler saying that this name left the shipping kernel with the check that
+// needed it (`src/board/mod.rs` says where the checks went).
+#[cfg(feature = "selftest")]
+use super::kunit;
+#[cfg(feature = "selftest")]
+use core::ptr;
+#[cfg(feature = "selftest")]
+use mpos::arch;
+#[cfg(feature = "selftest")]
+use mpos::hal;
+#[cfg(feature = "selftest")]
+use mpos::mm::{MapFlags, Mapping, PAGE_SIZE};
+#[cfg(feature = "selftest")]
+use mpos::syscall::{self};
 
 const MIB: usize = 1024 * 1024;
 
@@ -148,35 +159,30 @@ fn init(info: &BootInfo) -> ! {
     // line. Everything after this point is worth being able to turn on or off.
     mpos::logging::init();
 
-    // The milestone checks prove each subsystem in isolation, but they are pure
-    // probes: `check_arch` busy-waits half a second and `check_sched` sleeps out
-    // several more ticks, so on an ordinary boot they are nothing but latency
-    // and serial chatter between the real initialisation and init. They run only
-    // when the command line carries `mpos.selftest` - which `cargo xtask test`
-    // adds and the real rootfs boot does not - so a normal boot pays none of it.
-    let selftest = boot::cmdline_has("mpos.selftest");
-
+    // The self-tests are a *build* rather than a word on the command line: this
+    // kernel carries them only when it was built for them (`--features selftest`,
+    // which `cargo xtask test` passes), so a kernel that ships has no test branch
+    // here to pay for and none left open for one. What the build still has to say
+    // is *when* each suite runs - the boot step it needs - which is what the
+    // `Phase` names (`src/board/kunit.rs`), and why each marker below stands
+    // directly after the step it depends on rather than all of them at the end.
     init_mm();
-    if selftest {
-        checks::mm::run(info);
-    }
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Heap, info);
 
     // The machine's interrupts, descriptor tables and page tables are already up
-    // - `arch::boot` installed them before calling here - so this runs the arch
-    // check on its own rather than behind an `init_arch`.
-    if selftest {
-        check_arch(info);
-    }
+    // - `arch::boot` installed them before calling here - so what the arch suite
+    // proves needs no `init_arch` in front of it.
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Arch, info);
 
     steps::start_scheduler();
-    if selftest {
-        checks::sched::run();
-    }
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Scheduler, info);
 
     init_vfs(info);
-    if selftest {
-        checks::vfs::run();
-    }
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Vfs, info);
 
     init_blk();
     init_net();
@@ -189,10 +195,10 @@ fn init(info: &BootInfo) -> ! {
     mpos::rand::set_device_entropy(drivers::virtio::entropy);
     mpos::rand::init();
 
-    if selftest {
-        checks::ipc::run();
-        report::check_boot_stack(info, "after the self-tests");
-    }
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Ipc, info);
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Done, info);
 
     println!("All ready!");
 
@@ -318,9 +324,24 @@ fn init_blk() {
 
 // ---- arch: interrupts, timer, paging, address spaces ---------------------
 
+/// `check_arch`, as the harness's case.
+///
+/// An adapter rather than a rewrite: the body still answers by panicking, and the
+/// harness's contract is to answer a reason (`src/board/kunit.rs` argues why the
+/// kernel cannot catch a panic, which is what makes this the next slice's work).
+#[cfg(feature = "selftest")]
+pub(crate) fn suite_arch(info: &BootInfo) -> Result<(), &'static str> {
+    check_arch(info);
+    Ok(())
+}
+
 /// Prove the clock works, exceptions are catchable, the kernel runs on its
 /// own page tables with correct permissions, and processes get isolated
 /// address spaces.
+///
+/// Compiled only into a test build: it costs half a second of busy-waiting on
+/// every call, and nothing outside the suite registry calls it (`suite_arch`).
+#[cfg(feature = "selftest")]
 fn check_arch(info: &BootInfo) {
     // M1: clock interrupts and breakpoint exception.
     {

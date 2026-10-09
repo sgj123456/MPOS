@@ -15,6 +15,23 @@ name = "mpos"
 version = "0.1.0"
 edition = "2024"
 
+# The kernel's one build-time switch, and it is the test build: with `selftest`
+# off - every ordinary build, and the only shape that ships - the wiring layer
+# compiles neither the boot's check families nor the harness that runs them, so
+# "does the production kernel contain test code" is answered by the compiler
+# rather than by a reviewer.
+#
+# A cargo feature rather than a `--cfg`: the `mpos_*` words in
+# `.cargo/config.toml` are *machine* facts and belong unconditionally in their
+# target's block, while this is a fact about the *build*. Adding a `--cfg` there
+# is not possible - setting `RUSTFLAGS` **replaces** that block rather than
+# extending it, taking the linker script and all nine capability flags with it
+# (measured: four errors in `mpos-arch`) - so the additive form of the switch is
+# the only one that works, and it is also the shape of the thing it imitates
+# (`CONFIG_KUNIT=y`). `docs/NOTES.md` §7.7.
+[features]
+selftest = []
+
 # Machine-dependent crates are gated behind `target_os = "none"`. That keeps the
 # host build (cargo test --lib --target x86_64-unknown-linux-gnu) free of
 # bootloader, port-I/O and locking crates, and makes the arch-agnostic core of the

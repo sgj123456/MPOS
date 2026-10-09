@@ -26,11 +26,16 @@
 
 use core::fmt;
 
-use super::checks;
 use super::report;
 use super::steps;
 use mpos::boot::handoff::Handoff;
 use mpos::{drivers, fdt, hal, sched, vfs};
+
+// The harness the test build's suites are run through. A production kernel
+// compiles no such module and has none of the call sites either (`src/board/
+// mod.rs` says where the checks went and why the switch is a feature).
+#[cfg(feature = "selftest")]
+use super::kunit;
 
 /// The record `boot` hands the device probes: the machine as the loader
 /// described it, which is where the device tree a probe walks comes from.
@@ -104,28 +109,28 @@ fn init(info: &BootInfo) -> ! {
     // instead of being dropped on a machine with no subscriber at all.
     mpos::logging::init();
 
-    // The milestone checks prove each subsystem in isolation, and they run under
-    // the same word the first machine's do - `mpos.selftest`, which the verdict
-    // and sweep boots carry and the Alpine boot does not. That gate is the point,
-    // not a convenience: on this machine the checks used to *be* the boot's
-    // verdict, so they ran in front of a distribution's `init`, and §13.14 is the
-    // measurement of what that costs (a wall-clock check left the year 36812 and
-    // killed `syslogd`). A machine that is being tested runs them; a machine that
-    // is being used does not.
-    let selftest = mpos::boot::cmdline_has("mpos.selftest");
+    // The self-tests are a *build* rather than a word on the command line: this
+    // kernel carries them only when it was built for them (`--features selftest`,
+    // which `cargo xtask test` passes), and the word is gone from the kernel
+    // entirely. The gate mattered here more than on the other machine and still
+    // does - these checks used to *be* the boot's verdict, so they ran in front of
+    // a distribution's `init`, and §13.14 is the measurement of what that cost (a
+    // wall-clock check left the year 36812 behind it and killed `syslogd`) - but
+    // the question "is this machine being tested" is now answered where it belongs,
+    // by which image was built, instead of by a word an ordinary boot has to
+    // parse and reject. What the build still says is *when* each suite runs
+    // (`src/board/kunit.rs`'s `Phase`).
 
     // The scheduler adopts the running context (the boot stack) as task 0, and
     // the bootstrap root comes up under it. Both are steps every machine takes
     // and both carry an ordering contract, so they are stated once in
     // `board::steps` instead of once per port.
-    if selftest {
-        checks::mm::run(info);
-    }
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Heap, info);
 
     steps::start_scheduler();
-    if selftest {
-        checks::sched::run();
-    }
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Scheduler, info);
     steps::mount_ramfs_root();
 
     // The unpack, where the first machine's sits: the ramfs becomes the whole
@@ -196,9 +201,8 @@ fn init(info: &BootInfo) -> ! {
     // headless boot has no terminal, so the UART's own loopback injects the byte.
     // Doing this *before* the console's interrupt is armed means the self-test is
     // the only reader of the receiver, so nothing can take its bytes from it.
-    if selftest {
-        check_console_rx();
-    }
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::ConsoleInput, info);
 
     // Arm the console's interrupt, now that there is a tty for a typed byte to
     // land in and a scheduler for a writer to park on. From here the console
@@ -224,9 +228,8 @@ fn init(info: &BootInfo) -> ! {
     // which is why the step is shared and the placement is not.
     steps::arm_console();
 
-    if selftest {
-        check_serial_tx();
-    }
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::ConsoleTx, info);
 
     // Stage 8-net: the smoltcp stack over the MMIO adapter `check_net` opened and
     // published. The adapter is the machine's to find (a window the tree names)
@@ -280,11 +283,12 @@ fn init(info: &BootInfo) -> ! {
     // They run after the unpack and the disk mount, which is the state the first
     // machine's checks run in: a bootstrap ramfs carrying the boot archive, with
     // `/dev` and the tty table already up.
-    if selftest {
-        checks::vfs::run();
-        checks::ipc::run();
-        report::check_boot_stack(info, "after the self-tests");
-    }
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Vfs, info);
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Ipc, info);
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Done, info);
 
     // Queue a line on the tty before the init starts reading, so its `read(0,...)`
     // returns real console input instead of blocking. This stands in for a person
@@ -292,16 +296,14 @@ fn init(info: &BootInfo) -> ! {
     // input pump); at headless bring-up it lets boot-aarch64 prove the interactive
     // *read* path reaches a userspace program, not just the kernel.
     //
-    // Gated on `mpos.selftest`, because it is an *instrument* and not something a
+    // Gated on the test *build*, because it is an *instrument* and not something a
     // kernel does: injecting a line into the console is the one thing a real
     // handoff must never do, and a real userland init (Alpine's) reads the same
     // tty through getty - where the injected line would arrive as a spurious
-    // username attempt at the login prompt. The test boots carry the word; the
-    // Alpine boot does not, and gets an untouched console.
-    if selftest {
-        for &byte in b"echo-test\n" {
-            vfs::tty::global().receive_byte(byte);
-        }
+    // username attempt at the login prompt.
+    #[cfg(feature = "selftest")]
+    for &byte in b"echo-test\n" {
+        vfs::tty::global().receive_byte(byte);
     }
 
     // `/init` is read from the ramfs root and loaded as a task; it lands on
@@ -339,12 +341,15 @@ fn init(info: &BootInfo) -> ! {
     // leaves (`INIT_EXITED` from the exit path is the terminal proof the verdict
     // polls), while a real boot's init forks and stays - so waiting for a child
     // under it is the first machine's "the shell is up" signal, printed as its
-    // `M8_OK`.
-    if selftest {
-        while sched::is_running(pid) {
-            sched::sleep_ticks(1);
-        }
-    } else {
+    // `M8_OK`. This is the one place where the test build's *behaviour* differs
+    // rather than merely carrying extra code, which is why it is a `#[cfg]` pair
+    // and not a check: no test can make a payload run to completion.
+    #[cfg(feature = "selftest")]
+    while sched::is_running(pid) {
+        sched::sleep_ticks(1);
+    }
+    #[cfg(not(feature = "selftest"))]
+    {
         while !sched::has_live_child(pid) {
             sched::sleep_ticks(1);
         }
@@ -1680,6 +1685,7 @@ fn init_net() {
 /// not have been - an idle line asserting for ever would have shown up here as
 /// visits that moved nothing, and before there was a counter to ask, as nothing
 /// at all.
+#[cfg(feature = "selftest")]
 fn check_serial_tx() {
     const LINE: usize = 512;
 
@@ -1731,6 +1737,24 @@ fn check_serial_tx() {
     mpos::println!("M5_SERIAL_TX_OK");
 }
 
+/// `check_serial_tx`, as the harness's case.
+///
+/// An adapter rather than a rewrite: the body still answers by panicking, and the
+/// harness's contract is to answer a reason (`src/board/kunit.rs` argues why the
+/// kernel cannot catch a panic, which is what makes this the next slice's work).
+#[cfg(feature = "selftest")]
+pub(crate) fn suite_console_tx(_info: &BootInfo) -> Result<(), &'static str> {
+    check_serial_tx();
+    Ok(())
+}
+
+/// `check_console_rx`, as the harness's case. See [`suite_console_tx`].
+#[cfg(feature = "selftest")]
+pub(crate) fn suite_console_input(_info: &BootInfo) -> Result<(), &'static str> {
+    check_console_rx();
+    Ok(())
+}
+
 /// Stage 7b's evidence: the polled console input reaches a reader through the
 /// `hal::ConsoleInput` capability, not just the raw UART.
 ///
@@ -1741,6 +1765,7 @@ fn check_serial_tx() {
 /// tty's own `read` - the exact moves the pump makes at runtime, driven here by
 /// loopback so a headless boot can exercise it. Runs before the pump task is
 /// spawned, so the poll here is the only consumer of the injected bytes.
+#[cfg(feature = "selftest")]
 fn check_console_rx() {
     // Feed a line: a probe byte and a newline, each injected into the receiver and
     // pulled back out through the capability forward - the exact moves the pump

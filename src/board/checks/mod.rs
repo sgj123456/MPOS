@@ -16,3 +16,46 @@ pub(crate) mod ipc;
 pub(crate) mod mm;
 pub(crate) mod sched;
 pub(crate) mod vfs;
+
+// ---------------------------------------------------------------------------
+// The families, as the harness's cases
+// ---------------------------------------------------------------------------
+
+use mpos::boot::BootInfo;
+
+use super::report;
+
+/// One case per family, and each body still answers by panicking.
+///
+/// That is the next slice's work rather than a shape worth keeping: a family is
+/// one chain of `assert!`s today, and splitting a chain into named cases requires
+/// its assertions to answer a value first, because `panic = "abort"` means a
+/// panic ends the machine and hides every case after it (`src/board/kunit.rs`
+/// argues both halves). Until then a failing family still takes the boot down
+/// with the `assert!` that failed in the log, which is what it did before.
+pub(crate) fn case_mm(info: &BootInfo) -> Result<(), &'static str> {
+    mm::run(info);
+    Ok(())
+}
+
+pub(crate) fn case_sched(_info: &BootInfo) -> Result<(), &'static str> {
+    sched::run();
+    Ok(())
+}
+
+pub(crate) fn case_vfs(_info: &BootInfo) -> Result<(), &'static str> {
+    vfs::run();
+    Ok(())
+}
+
+pub(crate) fn case_ipc(_info: &BootInfo) -> Result<(), &'static str> {
+    ipc::run();
+    Ok(())
+}
+
+/// The boot stack's canary, which is a check *of the boot* rather than of a
+/// subsystem: it is the deepest the boot stack ever gets that is measured here.
+pub(crate) fn case_boot_stack(info: &BootInfo) -> Result<(), &'static str> {
+    report::check_boot_stack(info, "after the self-tests");
+    Ok(())
+}

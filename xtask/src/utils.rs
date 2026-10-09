@@ -322,6 +322,92 @@ pub fn build_kernel(profile: &str, arch: Arch) -> Result<()> {
         anyhow::bail!("The kernel did not build");
     }
 
+    build_loader(profile, arch)?;
+
+    let kernel = kernel_path(profile, arch)?;
+    let loader = loader_path(profile, arch)?;
+    if !kernel.exists() {
+        anyhow::bail!("Expected the kernel at {}", kernel.display());
+    }
+    if !loader.exists() {
+        anyhow::bail!("Expected the EFI loader at {}", loader.display());
+    }
+
+    println!("kernel: {} ({:.1} KB)", kernel.display(), kib(&kernel)?);
+    println!("loader: {} ({:.1} KB)", loader.display(), kib(&loader)?);
+    Ok(())
+}
+
+/// Build the kernel the way a **test** build is built, and answer where its image
+/// landed.
+///
+/// `--features selftest` is what puts the boot's check suites and their harness
+/// into the kernel. Without it the wiring layer compiles neither (`src/board/
+/// mod.rs` says where they went, and the kernel's own manifest why the switch is
+/// a cargo feature rather than a `--cfg …`), so a kernel built by
+/// [`build_kernel`] carries no test code at all and no way to run any.
+///
+/// The image is **copied** out of the target directory rather than left there.
+/// Cargo holds one `mpos` per target and profile: a production build after a test
+/// build - or the reverse, which is what `cargo xtask test` then `cargo xtask run`
+/// does - replaces the other's binary, and the ESP assembled a moment later would
+/// stage whichever one happened to be there. The copy is what makes "the test
+/// machine booted the test kernel" a fact rather than an assumption, and it is
+/// also why this returns a path instead of nothing.
+///
+/// What it costs: the shared target directory means alternating the two builds
+/// recompiles the kernel crate, because the feature set changed. Measured at a
+/// few seconds either way, against a second target directory's order of a full
+/// rebuild and a second copy of every dependency.
+pub fn build_test_kernel(build_dir: &Path, profile: &str, arch: Arch) -> Result<PathBuf> {
+    let root = project_root()?;
+    println!(
+        "Building the {arch} kernel for the self-test ({profile})",
+        arch = arch.name()
+    );
+
+    let mut kernel_build = Command::new("cargo");
+    kernel_build.arg("build");
+    if profile == "release" {
+        kernel_build.arg("--release");
+    }
+    kernel_build
+        .arg("-p")
+        .arg("mpos")
+        .arg("--features")
+        .arg("selftest")
+        .arg("--target")
+        .arg(arch.kernel_target())
+        .current_dir(&root);
+    let status = kernel_build
+        .status()
+        .context("Failed to run `cargo build` for the test kernel")?;
+    if !status.success() {
+        anyhow::bail!("The test kernel did not build");
+    }
+
+    // The loader is the same program in both builds - it loads an ELF and does
+    // not know what is in it - so this is the ordinary build of it.
+    build_loader(profile, arch)?;
+
+    let source = kernel_path(profile, arch)?;
+    let dir = build_dir.join(format!("{}-test-kernel", arch.name()));
+    fs::create_dir_all(&dir)?;
+    let image = dir.join("mpos");
+    fs::copy(&source, &image)
+        .with_context(|| format!("Failed to copy {} to {}", source.display(), image.display()))?;
+
+    println!(
+        "self-test kernel: {} ({:.1} KB)",
+        image.display(),
+        kib(&image)?
+    );
+    Ok(image)
+}
+
+/// Build the EFI loader, which is the same program for both kernel builds.
+fn build_loader(profile: &str, arch: Arch) -> Result<()> {
+    let root = project_root()?;
     println!(
         "Building the {arch} EFI loader ({profile})",
         arch = arch.name()
@@ -343,18 +429,6 @@ pub fn build_kernel(profile: &str, arch: Arch) -> Result<()> {
     if !status.success() {
         anyhow::bail!("The EFI loader did not build");
     }
-
-    let kernel = kernel_path(profile, arch)?;
-    let loader = loader_path(profile, arch)?;
-    if !kernel.exists() {
-        anyhow::bail!("Expected the kernel at {}", kernel.display());
-    }
-    if !loader.exists() {
-        anyhow::bail!("Expected the EFI loader at {}", loader.display());
-    }
-
-    println!("kernel: {} ({:.1} KB)", kernel.display(), kib(&kernel)?);
-    println!("loader: {} ({:.1} KB)", loader.display(), kib(&loader)?);
     Ok(())
 }
 

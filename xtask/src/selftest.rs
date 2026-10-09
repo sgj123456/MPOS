@@ -46,7 +46,12 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
     // The x86_64 sweep: its own initramfs on the QEMU wiring in `machine.toml`.
     // Named rather than left to the workspace default, so the machine this
     // sweep boots and the machine it builds are the same value.
-    utils::build_kernel(profile, Arch::X86_64)?;
+    //
+    // The *test* build of the kernel, not the ordinary one: this sweep is what
+    // the boot's suites exist for, and they are only in the image a
+    // `--features selftest` build produces (`utils::build_test_kernel` says why
+    // the two cannot be the same artifact).
+    let kernel = utils::build_test_kernel(build_dir, profile, Arch::X86_64)?;
     println!();
 
     let built = build_user_tests()?;
@@ -74,7 +79,7 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
     // What is left is this arm's own: the throwaway initramfs, the QEMU wiring
     // in `machine.toml`, and a verdict that can quote an exit status.
     let tar = build_test_initramfs(build_dir, &plan.staged)?;
-    let (status, log) = boot_tests(build_dir, profile, &tar)?;
+    let (status, log) = boot_tests(build_dir, profile, &kernel, &tar)?;
 
     report(&plan.staged, plan.built, &log, status)
 }
@@ -442,7 +447,12 @@ echo "=== END"
 /// of the captured serial log. The boot disk is QEMU's virtual FAT: the
 /// loader, kernel and test initramfs are served out of a plain directory, so
 /// no image needs creating and no privilege is needed to write it.
-fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32>, String)> {
+fn boot_tests(
+    build_dir: &Path,
+    profile: &str,
+    kernel: &Path,
+    tar: &Path,
+) -> Result<(Option<i32>, String)> {
     println!("User tests: booting the test machine");
 
     let esp = build_dir.join("test-esp");
@@ -454,18 +464,20 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
         utils::loader_path(profile, Arch::X86_64)?,
         esp.join("EFI/BOOT/BOOTX64.EFI"),
     )?;
-    fs::copy(
-        utils::kernel_path(profile, Arch::X86_64)?,
-        esp.join("mpos.elf"),
-    )?;
+    fs::copy(kernel, esp.join("mpos.elf"))?;
     fs::copy(tar, esp.join("initramfs.tar"))?;
-    // Two words, both load-bearing. `console=ttyS0` makes the serial wire the
-    // test boot's only console, so every line the harness reads is the whole of
-    // what the machine said - there is no second console to be missing it on.
-    // `mpos.selftest` is the switch the kernel reads to run its milestone checks
-    // (the half-second clock wait and the scheduler sleeps); a normal boot leaves
-    // it off and goes straight to init, and the test boot wants every check run.
-    fs::write(esp.join("mpos.cmdline"), "console=ttyS0 mpos.selftest\n")?;
+    // `console=ttyS0` makes the serial wire the test boot's only console, so
+    // every line the harness reads is the whole of what the machine said - there
+    // is no second console to be missing it on.
+    //
+    // There used to be a second word here, `mpos.selftest`, and the kernel used
+    // to parse it to decide whether to run its checks. Nothing reads it now:
+    // whether a machine runs its suites is which *image* was built, so the test
+    // boot is the build `utils::build_test_kernel` made and the word would be a
+    // word nobody answers to. It is gone rather than left in as a marker, because
+    // a marker the kernel ignores is exactly the shape that reads as a mechanism
+    // and is not one.
+    fs::write(esp.join("mpos.cmdline"), "console=ttyS0\n")?;
 
     // A SATA disk beside the ESP, so the test machine has *two* disks from two
     // drivers: the ESP reaches the guest through virtio-blk, and this one
@@ -566,11 +578,24 @@ fn report(tests: &[&UserTest], built: usize, text: &str, status: Option<i32>) ->
     let summary = verdict.summary;
     let clean = status == Some(33) && summary.is_some();
 
+    // The kernel's own suites, which ran before any program did. Both halves of
+    // that sentence are asserted: the line has to be *there* (a test kernel that
+    // reports nothing has not said its suites ran), and it has to say zero
+    // failed.
+    let kunit = verdict.kunit;
+
     println!();
     if let Some(summary) = summary {
         println!("self-test guest: {summary} ({} built)", tests.len());
     } else {
         println!("self-test guest: no summary line - the run did not get to the end");
+    }
+    match kunit {
+        Some(kunit) => println!(
+            "self-test guest: mpos-kunit {} passed, {} failed",
+            kunit.passed, kunit.failed
+        ),
+        None => println!("self-test guest: the kernel printed no mpos-kunit line"),
     }
     let skipped = built.saturating_sub(tests.len());
     if skipped > 0 {
@@ -589,7 +614,7 @@ fn report(tests: &[&UserTest], built: usize, text: &str, status: Option<i32>) ->
         }
     }
 
-    if !clean {
+    if !clean || kunit.map(|kunit| kunit.failed).unwrap_or(1) != 0 {
         println!();
         println!("self-test: the last of the serial log:");
         let tail: Vec<&str> = text.lines().collect();
@@ -599,10 +624,15 @@ fn report(tests: &[&UserTest], built: usize, text: &str, status: Option<i32>) ->
     }
 
     println!();
-    if clean && missing.is_empty() {
+    let suites_clean = kunit
+        .map(|kunit| kunit.failed == 0 && kunit.passed > 0)
+        .unwrap_or(false);
+    if clean && missing.is_empty() && suites_clean {
+        let kunit = kunit.expect("checked above");
         println!(
-            "self-test: all {} user tests passed, unit tests passed{}",
+            "self-test: all {} user tests passed, unit tests passed, and the kernel's {} self-test cases passed{}",
             tests.len(),
+            kunit.passed,
             if skipped > 0 {
                 format!(" ({skipped} not run - see tests.toml)")
             } else {
@@ -612,13 +642,17 @@ fn report(tests: &[&UserTest], built: usize, text: &str, status: Option<i32>) ->
         Ok(())
     } else {
         bail!(
-            "self-test failed: {} of {} user tests did not pass{}",
+            "self-test failed: {} of {} user tests did not pass{}, and the kernel's suites report {}",
             missing.len(),
             tests.len(),
             if clean {
                 ""
             } else {
                 " and the run did not end cleanly"
+            },
+            match kunit {
+                Some(kunit) => format!("{} passed, {} failed", kunit.passed, kunit.failed),
+                None => "nothing at all - no mpos-kunit line".to_string(),
             }
         )
     }
@@ -654,13 +688,11 @@ const SWEEP_DISK_BYTES: u64 = 64 * 1024 * 1024;
 pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
     // The kernel this sweep boots has to be the current one, and it is this
     // arm's own build: the first machine's is done by `run_tests`, and `main`
-    // does not build for `test` on either machine.
-    utils::build_kernel(profile, arch)?;
+    // does not build for `test` on either machine. It is the *test* build, so the
+    // boot's suites are in the image at all (`utils::build_test_kernel`).
+    let kernel = utils::build_test_kernel(build_dir, profile, arch)?;
     println!();
-    let (kernel, loader) = (
-        utils::kernel_path(profile, arch)?,
-        utils::loader_path(profile, arch)?,
-    );
+    let loader = utils::loader_path(profile, arch)?;
     let built = build_std_tests(arch)?;
     println!("user tests: {} {} programs built", arch.name(), built.len());
 
@@ -897,6 +929,36 @@ fn report_disk_sweep(
         );
     };
     println!("self-test ({}): {summary}", arch.name());
+
+    // The kernel's own suites, which ran before any program did - the same
+    // two-part assertion the first machine's arm makes: the line has to be
+    // there, and it has to say zero failed.
+    let kunit = verdict.kunit;
+    let suites_clean = kunit
+        .map(|kunit| kunit.failed == 0 && kunit.passed > 0)
+        .unwrap_or(false);
+    match kunit {
+        Some(kunit) => println!(
+            "self-test ({}): mpos-kunit {} passed, {} failed",
+            arch.name(),
+            kunit.passed,
+            kunit.failed
+        ),
+        None => println!(
+            "self-test ({}): the kernel printed no mpos-kunit line",
+            arch.name()
+        ),
+    }
+    if !suites_clean {
+        bail!(
+            "self-test ({}) failed: the kernel's own suites report {}",
+            arch.name(),
+            match kunit {
+                Some(kunit) => format!("{} passed, {} failed", kunit.passed, kunit.failed),
+                None => "nothing at all - no mpos-kunit line, so they did not run".to_string(),
+            }
+        );
+    }
 
     if !verdict.failed.is_empty() {
         let mut names: Vec<&str> = verdict
