@@ -40,6 +40,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
 pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -> Result<()> {
     check_target_gates()?;
+    check_boot_openings()?;
     run_unit_tests()?;
     println!();
 
@@ -108,6 +109,30 @@ fn check_target_gates() -> Result<()> {
         "{} test module(s) can never run; host-compile the file or move the pins \
          to a program that boots (NOTES.md §11.2 Step F)",
         dead.len()
+    );
+}
+
+/// The other structural check, and the same kind of blindness: a test opening in
+/// the boot's own code is a *word* - a command-line marker, a run-time feature
+/// ask, an `M*` string - so nothing in the toolchain notices one coming back.
+/// Seven files and a text match, which is cheap enough to run on every sweep
+/// (`NOTES.md` §15.19 for the mechanism, §15.24 for the vocabulary).
+fn check_boot_openings() -> Result<()> {
+    println!("Target gates: the boot has no test opening");
+    let openings = crate::gates::test_openings(&utils::project_root()?)?;
+    if openings.is_empty() {
+        return Ok(());
+    }
+    for opening in &openings {
+        eprintln!(
+            "  {}:{} {}: {}",
+            opening.file, opening.line, opening.what, opening.code
+        );
+    }
+    bail!(
+        "{} test opening(s) in the boot's own code; whether a kernel carries tests \
+         is the build's to say, not a word's or a run-time check's (NOTES.md §15.19)",
+        openings.len()
     );
 }
 

@@ -262,6 +262,120 @@ fn as_attribute(line: &str) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
+// ---------------------------------------------------------------------------
+// The other rule this file carries: no test opening in the boot's own code
+// ---------------------------------------------------------------------------
+
+/// Where a test opening could grow back: the boot's own code, and only that.
+///
+/// Not a walk of the kernel: a boot-time `if testing { … }` can only be written
+/// where the boot is written, which is the wiring layer's bodies, the harness
+/// beside them and the machine layer's own aarch64 boot. A gate over the whole
+/// tree would be a gate over prose - and this list is the reason it is a list:
+/// three comments in it say `mpos.selftest` *on purpose*, to record what the
+/// kernel stopped reading, so the walk skips comments and the rule is about code.
+const BOOT_CODE: &[&str] = &[
+    "src/board/aarch64.rs",
+    "src/board/kunit.rs",
+    "src/board/mod.rs",
+    "src/board/report.rs",
+    "src/board/steps.rs",
+    "src/board/x86_64.rs",
+    "arch/src/arch/aarch64/mod.rs",
+];
+
+/// A test opening that has grown back into the boot's own code.
+#[derive(Debug)]
+pub struct TestOpening {
+    /// The file, relative to the workspace root.
+    pub file: String,
+    /// 1-based line.
+    pub line: usize,
+    /// Which shape it is, as a sentence for the failure message.
+    pub what: &'static str,
+    /// The offending text, trimmed.
+    pub code: String,
+}
+
+/// Every way the boot has grown a way to know it is being tested. Empty is the
+/// healthy answer.
+///
+/// The three shapes are the three the refactor removed, each of which the
+/// compiler cannot see because it is a *word* rather than a type
+/// (`docs/NOTES.md` §15.19, §15.23):
+///
+/// - the kernel reading a test word off its own command line, which is what
+///   `mpos.selftest` was;
+/// - `feature = "selftest"` outside a `#[cfg]`, i.e. a check that survives into
+///   the shipping kernel and decides something at run time. Inside a `#[cfg]` it
+///   is the mechanism - the only place a test build may differ;
+/// - an `M*` marker literal (`"M5_VIRTIO_OK"`), the vocabulary whose writers were
+///   the checks. A check that comes back should speak in sentences; a reader
+///   cannot tell a marker nothing parses from a mechanism.
+pub fn test_openings(root: &Path) -> Result<Vec<TestOpening>> {
+    let mut out = Vec::new();
+    for relative in BOOT_CODE {
+        let path = root.join(relative);
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        for (line, number) in numbered_logical_lines(&text) {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let mut note = |what: &'static str, code: &str| {
+                out.push(TestOpening {
+                    file: (*relative).to_owned(),
+                    line: number,
+                    what,
+                    code: code.trim().to_owned(),
+                })
+            };
+            if line.contains("mpos.selftest") {
+                note("reads a test word off the command line", &line);
+            }
+            if line.contains("feature = \"selftest\"") && as_attribute(&line).is_none() {
+                note("asks the test feature at run time", &line);
+            }
+            for literal in string_literals(&line) {
+                if is_marker_literal(literal) {
+                    note("prints an `M*` marker", literal);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every `"…"` on a line, by the crude rule this file's header argues for: the
+/// quotes are matched, not parsed. An escaped quote inside a string can split one
+/// literal into two, which costs nothing here - neither half can be `"M`+digit.
+fn string_literals(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('"') else { break };
+        out.push(&after[..close]);
+        rest = &after[close + 1..];
+    }
+    out
+}
+
+/// Whether `literal` has the milestone markers' shape: `M`, a digit, `_`, then
+/// capitals and underscores - `M5_VIRTIO_OK`, `M8_OK`. `MPOS_SWITCH_ROOT_OK` (the
+/// init script's own line, which is not the kernel's to police) is not one, and
+/// neither is any word a boot line would begin with.
+fn is_marker_literal(literal: &str) -> bool {
+    let bytes = literal.as_bytes();
+    bytes.len() > 3
+        && bytes[0] == b'M'
+        && bytes[1].is_ascii_digit()
+        && bytes[2] == b'_'
+        && bytes[3..]
+            .iter()
+            .all(|b| b.is_ascii_uppercase() || *b == b'_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +462,83 @@ mod tests {
             "a `#[cfg(test)]` module the host never compiles: {dead:#?}\n\
              Either host-compile the file, or move the pins to a program that runs \
              (NOTES.md §11.2 Step F)."
+        );
+    }
+
+    /// The boot's own code, with every listed file present and empty, so a test
+    /// can give one of them the shape it is about.
+    fn scratch_boot_tree(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mpos-xtask-boot-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for file in BOOT_CODE {
+            let path = dir.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "fn f() {}\n").unwrap();
+        }
+        dir
+    }
+
+    /// All three shapes are reported, which is the half that keeps the gate from
+    /// agreeing with itself: a checker that cannot tell an opening from ordinary
+    /// code would pass on a tree that has one.
+    #[test]
+    fn every_shape_of_test_opening_is_reported() {
+        let dir = scratch_boot_tree("shapes");
+        fs::write(
+            dir.join("src/board/x86_64.rs"),
+            "fn f() {\n\
+             \x20   let word = \"mpos.selftest\";\n\
+             \x20   let testing = cfg!(feature = \"selftest\");\n\
+             \x20   println!(\"M8_OK\");\n\
+             }\n",
+        )
+        .unwrap();
+        let found = test_openings(&dir).unwrap();
+        assert_eq!(found.len(), 3, "{found:#?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A comment may name all three, and the tree's own comments do - they are
+    /// the record of what the kernel stopped doing. Prose is not an opening: a
+    /// gate that fired on it would be switched off within a week.
+    #[test]
+    fn a_comment_that_names_the_vocabulary_is_not_an_opening() {
+        let dir = scratch_boot_tree("prose");
+        fs::write(
+            dir.join("src/board/aarch64.rs"),
+            "// M8_OK used to be printed here, and `mpos.selftest` was read here.\n\
+             //! Not gated on `feature = \"selftest\"` any more.\n\
+             fn f() {}\n",
+        )
+        .unwrap();
+        let found = test_openings(&dir).unwrap();
+        assert!(found.is_empty(), "{found:#?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The vocabulary's shape, and the one line that only looks like it: the
+    /// initramfs script's own `MPOS_SWITCH_ROOT_OK` is not the kernel's.
+    #[test]
+    fn only_the_marker_shape_counts() {
+        assert!(is_marker_literal("M5_VIRTIO_OK"));
+        assert!(is_marker_literal("M8_OK"));
+        assert!(!is_marker_literal("MPOS_SWITCH_ROOT_OK"));
+        assert!(!is_marker_literal("M5_"));
+        assert!(!is_marker_literal("M5_virtio"));
+        assert!(!is_marker_literal("virtio-gpu: /dev/fb0 is driven at"));
+    }
+
+    #[test]
+    fn the_boot_has_no_test_opening() {
+        let root = crate::utils::project_root().expect("the workspace root");
+        let openings = test_openings(&root).expect("the boot code walk");
+        assert!(
+            openings.is_empty(),
+            "a test opening in the boot's own code: {openings:#?}\n\
+             The boot is told what to build by the build rather than by a word or \
+             a run-time check (NOTES.md §15.19), and its log speaks in sentences \
+             rather than `M*` markers (§15.24)."
         );
     }
 }
