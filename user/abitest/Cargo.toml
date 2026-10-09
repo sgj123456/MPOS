@@ -85,10 +85,6 @@ name = "t-prime"
 path = "src/bin/integration/t-prime.rs"
 
 [[bin]]
-name = "t-rawicmp"
-path = "src/bin/integration/t-rawicmp.rs"
-
-[[bin]]
 name = "t-seat"
 path = "src/bin/integration/t-seat.rs"
 
