@@ -3025,6 +3025,37 @@ pub fn master_closed(ofd: u64) {
     release_framebuffers(ofd);
 }
 
+/// The exit path's half of [`master_closed`].
+///
+/// [`master_closed`] is called from the `close(2)` hook, and a process that ends
+/// without closing its card - every `exit_group`, which is what a Rust `main`
+/// returning through `std::process::exit` does, and what a killed compositor
+/// does - never runs that hook. Its per-description DRM state then outlives it:
+/// the master and the console binding `SET_MASTER` took, the client-capability
+/// set, the authorisations, the sync objects, the framebuffers. The next
+/// description the allocator hands the *same address* - an `ofd` **is** that
+/// address (`file.ofd()`), so a reused one is a real thing and not a
+/// theoretical one - then inherits a claim it never made. That is exactly the
+/// failure `master_closed`'s own header names ("a compositor that is killed ...
+/// must not leave the machine holding a screen nobody can drive"), and it is
+/// reachable from a program that merely returns: the sweep's `t-drm` sets
+/// `DRM_CLIENT_CAP_ATOMIC`, and `t-drm-props` - which opens a *fresh, uncapped*
+/// description and asserts it is not shown the atomic properties - read the
+/// leaked cap and failed until this ran.
+///
+/// Registered with `sched::exit` (`src/board/steps.rs`) so the descriptor's
+/// subsystem releases its own state rather than the scheduler naming `drivers`,
+/// which is the whole point of `sched::exit`'s hook list. `for_each_last` is the
+/// same "is this the final reference" rule `close(2)`'s hook applies by hand, so
+/// a description a fork still holds is left alone.
+pub fn close_at_exit(files: &[Arc<crate::vfs::File>], _owner: u32) {
+    crate::vfs::file::for_each_last(files, |file, ofd| {
+        if file.inode().as_any().downcast_ref::<DrmCard>().is_some() {
+            master_closed(ofd);
+        }
+    });
+}
+
 /// Take a description's framebuffers away with it: Linux's `drm_fb_release`,
 /// which `drm_file_free` runs for every framebuffer the closing `struct
 /// drm_file` made.

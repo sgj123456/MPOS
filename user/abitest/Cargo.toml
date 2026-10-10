@@ -41,10 +41,6 @@ build = "build.rs"
 mpos-abi = { path = "../../crates/abi" }
 
 [[bin]]
-name = "t-drm"
-path = "src/bin/integration/t-drm.rs"
-
-[[bin]]
 name = "t-drm-props"
 path = "src/bin/integration/t-drm-props.rs"
 

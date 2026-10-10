@@ -477,6 +477,16 @@ same measurement puts behind `vfs` and so behind `hal` too)**
       mtime cargo's linking does not move forward) and the two-machine gate sat silent for fourteen
       minutes on it; the fix is at the build, because the run-time guard that would have named the
       mismatch is refused by the boot's own gate (§15.19)
+- [x] **A process hands the card back when it ends, not only when it closes (§15.12).** The DRM
+      master, its console binding, the client-capability set, the authorisations, the sync objects
+      and the framebuffers were released by the `close(2)` hook alone, and `do_exit` never runs it:
+      `Report::finish` is `std::process::exit`, which is `exit_group`, which unwinds nothing, so a
+      description that ended without closing its card left its DRM state behind. Because an `ofd` is
+      the description's *address*, the next description the allocator placed there inherited a claim
+      it never made. Found when five `drm*` programs first shared one boot - `t-drm` broke
+      `t-drm-args`, `t-drm-lease`, then `t-drm-props` - and fixed by registering
+      `drivers::drm::close_at_exit` with `sched::exit` beside locks, the socket and the inotify
+      watch, so the exit path delivers the property `master_closed`'s header already promised
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the

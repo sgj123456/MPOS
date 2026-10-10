@@ -19,10 +19,11 @@
 //! before the batch is dropped, because most of these resources identify
 //! ownership by reference count (`vfs::file::for_each_last`) and the count stops
 //! saying who owns what the moment the batch is released. Registration happens
-//! in `main.rs`, in the order the resources have to go: locks first (they are
-//! keyed by `(device, inode)` and the inode is reached *through* a descriptor),
-//! then the socket, inotify, evdev and uinput state keyed by the open file
-//! description. A hook that ran after the drop would find nothing to release,
+//! in `board::steps::register_exit_hooks`, in the order the resources have to go:
+//! locks first (they are keyed by `(device, inode)` and the inode is reached
+//! *through* a descriptor), then the socket, inotify, the card's DRM state and
+//! the evdev/uinput state keyed by the open file description. A hook that ran
+//! after the drop would find nothing to release,
 //! which is the failure the order exists to prevent - and the reason the
 //! registry is worth a host test rather than a comment.
 //!

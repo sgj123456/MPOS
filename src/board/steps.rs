@@ -175,13 +175,19 @@ pub fn bring_up_net(dev: alloc::sync::Arc<dyn mpos::drivers::virtio::NetDevice>)
 /// (`mpos_input_registry`: "this machine has an evdev registry - and therefore
 /// somewhere for a created uinput device to land"), rather than on an
 /// architecture, so a port that grows the input stack gets them by declaring the
-/// capability and nothing here moves. The other three are every machine's: locks
-/// and watch state are keyed by the open file description, and the socket hook's
-/// absence has the measurement above.
+/// capability and nothing here moves. The other four are every machine's: locks,
+/// watch state, the card's DRM master and the socket are each keyed by the open
+/// file description, and the socket hook's absence has the measurement above.
 pub fn register_exit_hooks() {
     sched::exit::register(mpos::vfs::locks::release_on_process_exit);
     sched::exit::register(mpos::net::socket::close_sockets_at_exit);
     sched::exit::register(mpos::vfs::inotify::close_at_exit);
+    // The card's per-description state - the master, the client-capability set,
+    // the framebuffers - is released by the `close(2)` hook, which a process
+    // that simply returns never runs. Without this the DRM state outlives the
+    // process that made it, and a later description handed the same `ofd`
+    // address inherits it (`drivers::drm::close_at_exit` says so in full).
+    sched::exit::register(mpos::drivers::drm::close_at_exit);
     #[cfg(mpos_input_registry)]
     {
         sched::exit::register(mpos::drivers::virtio::input::close_at_exit);
