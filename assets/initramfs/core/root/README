@@ -1,0 +1,61 @@
+# The initramfs overlay
+
+Whatever is in this directory is merged into the early userspace the kernel
+unpacks: the *contents* map to that archive's root, so `core/init` becomes
+`/init` and replaces what the packages put there. Directories are merged; files
+and symlinks overwrite.
+
+It is merged before the machine's own tree, and after everything generated from
+`initramfs.toml`, so a file here is the authority over anything the build writes
+- and a machine may still replace anything here.
+
+## Core and machine trees
+
+This tree is the **shared** half of both machines' archives: one copy of each
+file, installed into the x86_64 archive and the aarch64 archive alike. The
+per-machine trees (`initramfs/x86_64/`, `initramfs/aarch64/`) merge *after* it.
+Both are **empty today** and that is a state, not an oversight: the `/init`
+script is one file for both machines (see below), and a machine's own early
+userspace has had nothing else to add. The place to put a file both machines
+want is this one; a file only one machine's early userspace wants goes in its
+own tree, whose directory a merge creates on demand.
+
+The disk's userland has the same split (`assets/rootfs/core/`), and the reason is
+the same one: one copy of what both machines want, so that two copies cannot
+drift. It has happened here - this was two `/init` scripts, the second one's
+header claiming to be the first one while the bodies differed by the selftest
+probe, the switch-root verdict line and the name of the disk's own pid-1 chain.
+
+## init
+
+`init` is the script the kernel runs as pid 1 on the ramfs, on both machines. It
+mounts the pseudo-filesystems, mounts the filesystem the command line names with
+`root=`, moves the mounts onto it and `switch_root`s into the disk's own pid-1
+chain - `/init` if the disk ships one, `/sbin/init` otherwise, which is the one
+machine difference the script has left and the disk itself answers it.
+
+It lives here rather than in a Rust string in `xtask`, so editing it is editing
+a shell script. It must stay executable - the kernel execs it - and the archive
+carries the mode it has in this tree.
+
+Three things are worth knowing when changing it:
+
+* Anything created *before* `switch_root` disappears with the ramfs; anything
+  mounted onto the new root survives. That is why the script makes `/sysroot/tmp`
+  and friends and then mounts onto them.
+* `mount -t devpts devpts /sysroot/dev/pts` is not optional. Without it every
+  `openpty` in the real system fails with ENOENT - which is how a `doas` or a
+  nested shell reports "unable to allocate pty".
+* The applets it execs are a contract with the applet farm: the build reads the
+  `@vocabulary:` line at the end of the script and `cargo test -p mpos-xtask`
+  fails when a verb on it is not an applet the archive carries. A name missing
+  from the farm is a boot that dies on ENOENT mid-pivot, and a headless verdict
+  reads that as a hang.
+
+## An extra mount at boot
+
+```sh
+# initramfs/core/etc/extra-mount.sh
+#!/bin/sh
+mount -t tmpfs tmpfs /tmp
+```

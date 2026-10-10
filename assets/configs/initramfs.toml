@@ -8,9 +8,9 @@
 # The sections work as they do in `rootfs.toml` and `machine.toml`: `[default]`
 # is the baseline both machines read, each machine's own half overrides it, and
 # `xtask/src/config.rs::parse_sectioned_toml` reads those three headers alone.
-# `initramfs.arch` is the *package* architecture apk resolves against, so each
-# half names its own - unlike the loader and kernel targets, which xtask picks
-# from its own `--arch`.
+# The machine itself is not a key here: the package architecture apk resolves
+# against is the `--arch` the build was given (`xtask/src/arch.rs`), the same
+# word that picks the loader and kernel targets.
 #
 # Since `NOTES.md` §15.6 both machines switch root from their initramfs's script
 # rather than one of them doing it in the kernel, so the archive is the same
@@ -25,8 +25,6 @@
 initramfs.mirror = "https://mirrors.tuna.tsinghua.edu.cn/alpine"
 # Alpine branch
 initramfs.branch = "edge"
-# Architecture. Each half names its own; this is the baseline's.
-initramfs.arch = "x86_64"
 # The repository components to fetch, in the order apk should look in them.
 initramfs.repos = ["main", "community"]
 
@@ -44,8 +42,9 @@ initramfs.base_packages = ["busybox", "alpine-baselayout", "apk-tools"]
 # The first machine's own half - every value it reads is one of the baseline's.
 [x86_64]
 
-# The second machine's own half.
+# The second machine's own half. Empty now too: the one key it used to name was
+# `initramfs.arch`, and the package architecture apk is asked for comes from the
+# build's `--arch` rather than from this file. The section stays so the file
+# keeps the three-header shape both other config files wear, and so the next
+# value that really is only this machine's has an obvious place to be written.
 [aarch64]
-# This is the one key it does not share: a cross-arch `apk` is asked for this
-# machine's packages, and the loader/kernel targets are xtask's own choice.
-initramfs.arch = "aarch64"

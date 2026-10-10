@@ -1210,9 +1210,9 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         // with the hotspot appended to the second, so one handler serves them.
         NR_MODE_CURSOR | NR_MODE_CURSOR2 => mode_cursor(arg, nr == NR_MODE_CURSOR2, card.lease()),
         NR_MODE_CREATE_LEASE => create_lease(card, minor, ofd, arg),
-        NR_MODE_LIST_LESSES => list_leases(card, arg),
+        NR_MODE_LIST_LESSES => list_lessees(card, arg),
         NR_MODE_REVOKE_LEASE => revoke_lease(card, ofd, arg),
-        NR_MODE_GET_LEASE => get_lease(arg),
+        NR_MODE_GET_LEASE => get_lease(card, arg),
         // The sync object family. Every one of these is per *client* - the
         // handle a request names means something only next to the description
         // that made it - which is why they are the only arms here that take
@@ -2632,14 +2632,37 @@ fn leased(lease: Option<&LeaseSet>, id: u32) -> bool {
     lease.is_none_or(|l| l.holds(id))
 }
 
-/// `DRM_IOCTL_MODE_CREATE_LEASE`: the master hands a subset of the card's
-/// objects to somebody else, as a *file descriptor*.
+/// The lessee ids `MODE_CREATE_LEASE` has handed out, and the lease each one
+/// names.
 ///
-/// `struct drm_mode_create_lease { __u64 objects_ptr, __u32 object_count,
-/// __u32 flags, __u32 fd, __u32 __pad }`. The objects are read the way every
-/// other id list on this card is read - `user_array` first, then element by
-/// element - and the fd is installed the way `PRIME_HANDLE_TO_FD` installs its
-/// dma-buf: a new `File`, the lowest free slot, `O_CLOEXEC` if the caller asked.
+/// Linux keeps a lease in the *master's* file private, which is where
+/// `MODE_REVOKE_LEASE` finds it: that request arrives on the master carrying
+/// nothing but the id, because the whole point of a lease is that its
+/// descriptor has gone to another process. This kernel has no per-file lease
+/// list to hang one on, so the id resolves here instead. An entry is dropped
+/// when the lease is revoked; one whose descriptor is closed without a revoke
+/// leaves its id behind, which is the same shape as a Linux `lessee_id` whose
+/// file nobody can name any more.
+static LESSEES: Mutex<RefCell<Vec<(u32, Arc<LeaseSet>)>>> = Mutex::new(RefCell::new(Vec::new()));
+/// The next lessee id. Linux's is a per-file counter too, and nothing outside
+/// this file compares them for anything but equality.
+static NEXT_LESSEE: AtomicU32 = AtomicU32::new(1);
+
+/// `DRM_IOCTL_MODE_CREATE_LEASE`: the master hands a subset of the card's
+/// objects to somebody else, as a *file descriptor*, and names the handover
+/// with a lessee id.
+///
+/// `struct drm_mode_create_lease { __u64 object_ids; __u32 object_count;
+/// __u32 flags; __u32 lessee_id; __u32 fd; }` - five fields, 24 bytes, and no
+/// trailing `pad` (this machine's `<drm_mode.h>` has none, as `cc` will say).
+/// The objects are read
+/// the way every other id list on this card is read (`user_array` first, then
+/// element by element), and the fd is installed the way `PRIME_HANDLE_TO_FD`
+/// installs its dma-buf: a new `File`, the lowest free slot, `O_CLOEXEC` if the
+/// caller asked. The two returned words are in the header's order rather than
+/// "whichever order this driver found convenient": a caller built against
+/// `drm_mode.h` reads `fd` at 20, and a kernel that wrote it at 16 hands a real
+/// `libdrm` a zero descriptor it thinks it can flip.
 ///
 /// Only the master may lease. That is not a courtesy: a lease *is* a claim on
 /// the screen, and letting an unauthorised descriptor mint one would be a way to
@@ -2675,8 +2698,11 @@ fn create_lease(card: &DrmCard, minor: u32, caller: u64, arg: usize) -> isize {
             return -22; // EINVAL
         }
     }
-    let lease = card.lease_of(ids.to_vec(), flags);
-    let fd = match crate::vfs::open_inode(lease) {
+    let leased = card.lease_of(ids.to_vec(), flags);
+    let Some(lease) = leased.lease_arc() else {
+        return -22; // EINVAL: the descriptor we just made is somehow no lease
+    };
+    let fd = match crate::vfs::open_inode(leased) {
         Ok(fd) => fd,
         Err(_) => return -24, // EMFILE
     };
@@ -2686,36 +2712,46 @@ fn create_lease(card: &DrmCard, minor: u32, caller: u64, arg: usize) -> isize {
         // `exec` hygiene.
         let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
     }
-    unsafe { ((arg + 16) as *mut u32).write_unaligned(fd as u32) };
+    let lessee = NEXT_LESSEE.fetch_add(1, Ordering::Relaxed);
+    critical_section::with(|cs| LESSEES.borrow(cs).borrow_mut().push((lessee, lease)));
+    // The header's order: `lessee_id` at 16, `fd` at 20.
+    unsafe { ((arg + 16) as *mut u32).write_unaligned(lessee) };
+    unsafe { ((arg + 20) as *mut u32).write_unaligned(fd as u32) };
     0
 }
 
-/// `DRM_IOCTL_MODE_GET_LEASE`: read a lease fd back - which objects it covers,
-/// and what it was sealed with. The caller names the descriptor in `fd`, and on
-/// a kernel with one card and one lease holder the descriptor answering the
-/// request *is* the one being asked about: an fd belonging to another process is
-/// refused the same `EINVAL` Linux gives a lease that does not exist.
-fn get_lease(arg: usize) -> isize {
-    let want_fd = unsafe { ((arg + 16) as *const u32).read_unaligned() } as i32;
-    let Ok(current) = crate::sched::current_fds().clone_at(want_fd) else {
-        return -22; // EINVAL: there is no such descriptor to ask about
-    };
-    let inode = current.inode();
-    // The descriptor is looked up in the *caller's* table, so the only fd that
-    // can answer is one this process holds - which is the same restriction
-    // Linux imposes by walking the caller's own file-private lease list.
-    let Some(card) = inode.as_any().downcast_ref::<DrmCard>() else {
-        return -22;
-    };
+/// `DRM_IOCTL_MODE_GET_LEASE`: which objects a lease covers.
+///
+/// The request is issued on the *lease* descriptor - `drmModeGetLease(fd)` is
+/// given the fd `drmModeCreateLease` returned, not the master's - because on
+/// Linux the lease is the file and the id list hangs off it. `struct
+/// drm_mode_get_lease { __u32 count_objects; __u32 pad; __u64 objects_ptr; }`:
+/// the count is always rewritten, the array is filled when the caller brought
+/// room for it and somewhere to put it, and a descriptor that is not a lease
+/// answers the `EINVAL` Linux gives a lease that does not exist. (An earlier
+/// shape named a descriptor number in the struct instead, which is a request no
+/// `libdrm` sends: it made this ioctl unaskable from the only program that has
+/// the lease.)
+fn get_lease(card: &DrmCard, arg: usize) -> isize {
     let Some(lease) = card.lease() else {
-        return -22;
+        return -22; // EINVAL: this descriptor is not a lease
     };
     let ids = lease.objects();
+    // The caller's `count_objects` is both the question and the answer: it
+    // arrives as the room the caller brought and leaves as the total there is.
+    // So it is read *before* the answer is written - a handler that wrote first
+    // and read back would see its own total and copy that many, which is a
+    // caller whose array was shorter than the lease getting its neighbour
+    // overwritten. Linux reads the capacity, writes the total and copies the
+    // smaller of the two; the write below is therefore last of the three, and
+    // the copy is bounded by what the caller actually offered.
+    let room = unsafe { (arg as *const u32).read_unaligned() } as usize;
     unsafe { (arg as *mut u32).write_unaligned(ids.len() as u32) };
     let ptr = unsafe { ((arg + 8) as *const u64).read_unaligned() } as usize;
-    if !ids.is_empty() && ptr != 0 && user_array(ptr, ids.len(), 4, true) {
+    let take = core::cmp::min(room, ids.len());
+    if take > 0 && ptr != 0 && user_array(ptr, take, 4, true) {
         let out = ptr as *mut u32;
-        for (i, id) in ids.iter().enumerate() {
+        for (i, id) in ids.iter().take(take).enumerate() {
             unsafe { out.add(i).write_unaligned(*id) };
         }
     }
@@ -2728,65 +2764,75 @@ fn known_object(id: u32) -> bool {
     matches!(id, CRTC_ID | ENCODER_ID | CONNECTOR_ID | PLANE_ID)
 }
 
-/// `DRM_IOCTL_MODE_LIST_LESSES`: how many leases this descriptor handed out,
-/// and - given room - which of the card's objects are under one.
+/// `DRM_IOCTL_MODE_LIST_LESSES`: how many lessees this descriptor handed out,
+/// and - given room - their lessee ids.
 ///
-/// `struct drm_mode_get_lease { __u32 count_objects, __u32 pad, __u64
-/// objects_ptr }`. The count is always rewritten; the array is filled only when
+/// `struct drm_mode_list_lessees { __u32 count_lessees, __u32 pad, __u64
+/// lessees_ptr }`. The count is always rewritten; the array is filled only when
 /// the caller brought room for it, which is the same two-call shape
-/// `GETRESOURCES` uses.
-fn list_leases(card: &DrmCard, arg: usize) -> isize {
-    let Some(lease) = card.lease() else {
-        // The card itself has no lease list to enumerate: on Linux this is the
-        // lessor's file private, and a plain card descriptor has never leased
-        // anything from itself.
+/// `GETRESOURCES` uses. It answers *lessees*, not objects - the objects are
+/// `MODE_GET_LEASE`'s question - and a lease descriptor has handed nothing out,
+/// which is also the answer a non-lessor gets on Linux.
+fn list_lessees(card: &DrmCard, arg: usize) -> isize {
+    if card.lease().is_some() {
+        // A lease is a lessee, not a lessor: on Linux this is the lessor's file
+        // private, and a leased descriptor has never leased anything from
+        // itself.
         unsafe { (arg as *mut u32).write_unaligned(0) };
         return 0;
-    };
-    let ids = lease.objects();
+    }
+    let ids: Vec<u32> = critical_section::with(|cs| {
+        LESSEES
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .map(|(lessee, _)| *lessee)
+            .collect()
+    });
+    // The same shared field as `get_lease`'s, so the same order: read the room
+    // the caller brought, write the total there is, copy the smaller. (This one
+    // read its capacity back *after* writing the answer, which made the
+    // comparison true by construction and copied every id the card had handed
+    // out into whatever the caller's array happened to be.)
+    let room = unsafe { (arg as *const u32).read_unaligned() } as usize;
     unsafe { (arg as *mut u32).write_unaligned(ids.len() as u32) };
-    // The caller's `count_objects` is both the answer slot and, on the sizing
-    // call, zero: read it back *after* writing, which is what Linux's
-    // `list_len` comparison does with the value the caller brought.
-    let want = unsafe { (arg as *const u32).read_unaligned() } as usize;
     let ptr = unsafe { ((arg + 8) as *const u64).read_unaligned() } as usize;
-    if want >= ids.len() && ptr != 0 && user_array(ptr, ids.len(), 4, true) {
+    let take = core::cmp::min(room, ids.len());
+    if take > 0 && ptr != 0 && user_array(ptr, take, 4, true) {
         let out = ptr as *mut u32;
-        for (i, id) in ids.iter().enumerate() {
+        for (i, id) in ids.iter().take(take).enumerate() {
             unsafe { out.add(i).write_unaligned(*id) };
         }
     }
     0
 }
 
-/// `DRM_IOCTL_MODE_REVOKE_LEASE`: the lessor takes a lease back by the
-/// descriptor number it handed out.
+/// `DRM_IOCTL_MODE_REVOKE_LEASE`: the lessor takes a lease back by the lessee
+/// id `MODE_CREATE_LEASE` returned.
 ///
-/// The card cannot look the fd up in the *lessor's* table from here (the ioctl
-/// arrives with the lessor's descriptor, and the lease fd may live in another
-/// process entirely), so Linux marks the lease's file private dead. Here the
-/// lease's own object list is emptied, which refuses every later request that
-/// names an object - the same practical effect for the one card this kernel has.
+/// `struct drm_mode_revoke_lease { __u32 lessee_id; }` - an id rather than a
+/// descriptor, which is what lets a compositor revoke a lease whose fd it has
+/// already handed to another process. (The id is the whole reason the number
+/// exists: the lessor cannot name the fd, because the fd is the lessee's.)
+///
+/// Linux marks the lease's file private dead; here the lease's own object list
+/// is emptied, which refuses every later request that names an object - the same
+/// practical effect for the one card this kernel has.
 fn revoke_lease(_card: &DrmCard, caller: u64, arg: usize) -> isize {
-    // The number names a descriptor in the *caller's* table, and the caller is
-    // the one entitled to take a lease back: a lease may only be revoked by
+    // Only the master may take a lease back: a lease may only be revoked by
     // whoever holds the master that made it.
     if !is_master(caller) {
         return -13; // EACCES
     }
-    let target = unsafe { (arg as *const u32).read_unaligned() } as i32;
-    let Ok(file) = crate::sched::current_fds().clone_at(target) else {
-        return -22; // EINVAL: no such descriptor to take back
+    let lessee = unsafe { (arg as *const u32).read_unaligned() };
+    let Some(lease) = critical_section::with(|cs| {
+        let mut all = LESSEES.borrow(cs).borrow_mut();
+        let at = all.iter().position(|(id, _)| *id == lessee)?;
+        Some(all.remove(at).1)
+    }) else {
+        return -22; // EINVAL: there is no such lessee to take back
     };
-    let inode = file.inode();
-    let Some(leased) = inode
-        .as_any()
-        .downcast_ref::<DrmCard>()
-        .and_then(|c| c.lease())
-    else {
-        return -22; // EINVAL: the descriptor is not a lease
-    };
-    leased.revoke();
+    lease.revoke();
     0
 }
 
@@ -3085,18 +3131,31 @@ fn arg_shape(nr: u32) -> Option<(usize, bool)> {
         NR_ADDFB2 => (104, false),   // struct drm_mode_fb_cmd2
         NR_RMFB => (4, false),       // struct drm_mode_rmfb
         NR_PAGE_FLIP => (24, false), // struct drm_mode_crtc_page_flip
-        // `struct drm_mode_create_lease`: objects pointer, count, flags, the fd
-        // that comes back, padding - 24 bytes, and both read and written.
+        // The lease family, at `drm_mode.h`'s own sizes, which are `sizeof` of
+        // the structs and not the count of words this driver touches:
+        // `create_lease` is the objects pointer, the count, the flags and the
+        // two words it returns - 24 bytes, no trailing pad, read and written;
+        // `list_lessees` and `get_lease` are a count, padding and a pointer
+        // (16); `revoke_lease` is one id (4).
+        //
+        // These were once 24/16/8 - the sizes this driver's own handlers
+        // happened to touch - and a `libdrm` caller sends the header's, so a
+        // request whose words were in the right place was still validated
+        // against a length the caller never allocated. The 28 written here on
+        // the way past was that same mistake one step finer: the struct this
+        // machine's `<drm_mode.h>` declares has *five* fields and no `pad`, so
+        // `sizeof` is 24 and `DRM_IOWR(0xC6, struct drm_mode_create_lease)` is
+        // 0xc01864c6 rather than 0xc01c64c6 - a size no alignment could
+        // produce, being 28 after a `__u64` first member. The number was
+        // invented from the field list rather than measured, which is why the
+        // row below is what `cc` prints for the header on this machine.
         NR_MODE_CREATE_LEASE => (24, true), // struct drm_mode_create_lease
-        NR_MODE_LIST_LESSES => (16, true),  // struct drm_mode_get_lease
-        NR_MODE_REVOKE_LEASE => (8, false), // struct drm_mode_revoke_lease
-        // `struct drm_mode_get_lease` is the *create* struct minus the flags:
-        // objects pointer, count, the fd being asked about, padding - 24 bytes.
-        NR_MODE_GET_LEASE => (24, true), // struct drm_mode_get_lease is 16; the
-        // 24-byte form is CREATE's answer
-        NR_CREATE_DUMB => (32, true),  // struct drm_mode_create_dumb
-        NR_MAP_DUMB => (16, true),     // struct drm_mode_map_dumb
-        NR_DESTROY_DUMB => (4, false), // struct drm_mode_destroy_dumb
+        NR_MODE_LIST_LESSES => (16, true),  // struct drm_mode_list_lessees
+        NR_MODE_GET_LEASE => (16, true),    // struct drm_mode_get_lease
+        NR_MODE_REVOKE_LEASE => (4, false), // struct drm_mode_revoke_lease
+        NR_CREATE_DUMB => (32, true),       // struct drm_mode_create_dumb
+        NR_MAP_DUMB => (16, true),          // struct drm_mode_map_dumb
+        NR_DESTROY_DUMB => (4, false),      // struct drm_mode_destroy_dumb
         // The sync object family. The two wait structs are the ones worth
         // reading twice: this host's `drm.h` has grown a trailing
         // `deadline_nsec` on each, so they are 40 and 48 bytes and *not* the 32
@@ -6996,6 +7055,13 @@ impl DrmCard {
         self.lease.as_deref()
     }
 
+    /// The same lease as the shared handle the lessee registry keeps, so a lease
+    /// that has been handed out can still be reached by its lessee id after its
+    /// descriptor has gone to another process.
+    fn lease_arc(&self) -> Option<Arc<LeaseSet>> {
+        self.lease.clone()
+    }
+
     /// Which of the card's names this node is: 0 = `card0`, the master's screen;
     /// 128 = `renderD128`, an allocation handle that is never asked who owns the
     /// display.
@@ -7036,6 +7102,19 @@ impl Inode for DrmCard {
 
     fn set_owner(&self, uid: u32, gid: u32) {
         self.perms.set_owner(uid, gid);
+    }
+
+    fn atime(&self) -> u64 {
+        self.perms.atime()
+    }
+
+    fn mtime(&self) -> u64 {
+        self.perms.mtime()
+    }
+
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        self.perms.set_times(atime, mtime);
+        Ok(())
     }
 
     /// The device number `stat` reports: DRM's major 226 and this name's

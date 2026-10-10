@@ -359,6 +359,19 @@ impl Inode for Uinput {
         self.perms.set_owner(uid, gid);
     }
 
+    fn atime(&self) -> u64 {
+        self.perms.atime()
+    }
+
+    fn mtime(&self) -> u64 {
+        self.perms.mtime()
+    }
+
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        self.perms.set_times(atime, mtime);
+        Ok(())
+    }
+
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0x9f00,

@@ -1,0 +1,167 @@
+#!/bin/sh
+# The early-userspace `/init` **both** machines run: mount the pseudo-filesystems
+# on the temporary root, mount the root filesystem the kernel command line
+# names, and hand the machine over.
+#
+# One script for the two machines, and it lives here - in the shared core - rather
+# than in either machine's own overlay tree, which is merged *after* this one
+# (`xtask/src/initramfs.rs::merge_overlays`). It used to be two files, one per
+# machine, the second one's header claiming this ("This is the same script the
+# x86_64 machine runs as its initramfs `/init`") while the two bodies had drifted
+# apart by the selftest probe, the verdict line and the name of the disk's own
+# pid-1 chain. What replaced them is the split `rootfs-core/` already makes for
+# the disk's userland: one copy of what both machines want, in the core.
+#
+# Why the pivot is userspace's job at all: a kernel that assembles the real root
+# first leaves pieces the owner of the system cannot unmount, so `switch_root`
+# belongs to pid 1 (`NOTES.md` §15.6). This script *is* that pid 1 on both
+# machines - everything it does before the switch dies with the ramfs, and
+# everything it mounts *onto the new root* does not. The pivot moved out of the
+# kernel and into here, which is why the `MPOS_SWITCH_ROOT_OK` line it prints
+# immediately before the exec is the evidence that a program and not the kernel
+# promoted the disk (`NOTES.md` §15.7).
+
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+
+# Before the command line is read, because /proc/cmdline is where it is read
+# from, and before anything else because every tool below wants one of these
+# three.
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev
+
+root=''
+# The command line says which filesystem the root device carries
+# (`rootfstype=`); ext4 is the fallback because the kernel routes ext2, ext3
+# and ext4 to the same driver and the name costs nothing.
+rootfstype='ext4'
+rootflags='rw'
+# Whether this is a test boot. The kernel reads the same word to decide whether
+# it may queue a console line before the handoff, so the two halves of that
+# instrument agree by reading one source rather than by remembering a flag.
+# The first machine's test boot never carries it - its payload stages an `/init`
+# of its own into a throwaway archive (`xtask/src/selftest.rs`) - so the block
+# below is inert there rather than a second behaviour.
+selftest=''
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        root=*)        root="${arg#root=}" ;;
+        rootfstype=*)  rootfstype="${arg#rootfstype=}" ;;
+        rootflags=*)   rootflags="${arg#rootflags=}" ;;
+        mpos.selftest) selftest=1 ;;
+    esac
+done
+
+# A real console line reaches a userspace program through the whole chain: the
+# kernel queues "echo-test\n" on the console tty before it hands the machine to
+# this script (an instrument `mpos.selftest` boots carry and a real userland
+# must never see), and reading it back echoes it - proof that a scheduler-run
+# EL0 process read console input and wrote the bytes it read, through
+# `syscall::dispatch`, on the ramfs root, before the pivot. The verdict command
+# pins the prefixed form; the tty's own canonical echo shows the same bytes
+# without it.
+#
+# Three details are measured, not assumed. *stdin*, not `/dev/console`: this
+# kernel's `/dev/console` is a write-only character device whose `read` answers
+# end of input, so a read of it returns nothing at all, while fd 0 is the
+# console tty the line was queued on. `read`, not `cat`: a tty that has
+# delivered its one queued line blocks the next read for ever, and `cat` loops
+# until end of input - so `cat` would hang the pivot, where `read` returns the
+# moment the line ends. And the whole block is gated on `mpos.selftest`,
+# because that is what gates the kernel's injection: an Alpine boot carries no
+# such word, queues nothing, and would otherwise sit here waiting for a line
+# nobody owes it.
+if [ -n "$selftest" ]; then
+    read line
+    echo "R:$line"
+fi
+
+if [ -z "$root" ]; then
+    echo "initramfs: no root= on the command line; staying here"
+    exec /bin/sh
+fi
+
+mkdir -p /sysroot
+if ! mount -t "$rootfstype" -o "$rootflags" "$root" /sysroot; then
+    echo "MPOS_SWITCH_ROOT_FAILED: cannot mount $root"
+    exec /bin/sh
+fi
+
+# The directories the real init expects to find already mounted. What is
+# mounted here survives the pivot; what is created here does not, so each one
+# is made on the new root, not on the ramfs.
+for dir in proc sys dev tmp run; do
+    mkdir -p "/sysroot/$dir"
+done
+
+mount -t proc     proc     /sysroot/proc
+mount -t sysfs    sysfs    /sysroot/sys
+mount -t tmpfs    tmpfs    /sysroot/tmp
+mount -t tmpfs    tmpfs    /sysroot/run
+mount --move /dev /sysroot/dev
+
+# devpts is a filesystem of its own, not a directory devtmpfs hands out: the
+# kernel's devfs carries the empty /dev/pts mountpoint, and until devpts sits
+# on it, every openpty - sudo's "unable to allocate pty", a nested ssh - dies
+# opening /dev/pts/<n> with ENOENT.
+mount -t devpts devpts /sysroot/dev/pts
+
+# The host share, mounted on the tree that becomes `/`. The *kernel* does not
+# mount it, and that is the rule the pseudo-filesystems above follow as well: a
+# mount belongs to the owner of the tree it lands on, and a kernel-side mount
+# would hang on the bootstrap root this switch deletes - leaving a payload under
+# the new tree with an ordinary empty `/mnt/share` (and worse, one the disk
+# mounted over `/mnt` would cover, which is what happens to any mount a later one
+# is hung in front of). So the share is mounted here, on the root that survives.
+#
+# No tag is written here. The host chooses the tag (`-virtfs
+# ...,mount_tag=...`), and an empty source is this kernel's spelling for "the
+# share the bus exported" - the spelling the test runner's own runner script uses
+# too, without either of them keeping a copy of the host's choice. A boot with no
+# share has nothing to mount and says so rather than failing.
+mkdir -p /sysroot/mnt/share
+mount -t 9p '' /sysroot/mnt/share || echo "initramfs: no host share to re-mount"
+
+# The verdict line, *before* the exec: `switch_root` deletes the ramfs it stood
+# in, and with it any chance of printing after the promotion. Its presence on
+# the wire means the disk answered `mount`, the targets the switch moves exist,
+# and the exec was attempted; the boot's later lines are the proof the promotion
+# served a tree rather than an empty directory - busybox init prints `login:` on
+# an Alpine disk, and a test disk's `/sbin/init` execs the payload whose markers
+# (`MPOS_EXEC_OK`, `MPOS_MUSL_OK`) follow.
+echo "MPOS_SWITCH_ROOT_OK: / is $root ($rootfstype)"
+
+# Nothing is prepared for `switch_root` beyond the name it execs, and that is a
+# measurement rather than a simplification. Its usage line is the whole of what
+# it does - "chroot to NEW_ROOT, delete all in /, move NEW_ROOT to /, execute
+# NEW_INIT. PID must be 1. NEW_ROOT must be a mountpoint" - and this script
+# satisfies every one of those: it is pid 1, it mounted the new root, and `PATH`
+# was exported at the top. The two lines this replaced came from the second
+# machine's script and were both wrong about *this* busybox: `strings busybox |
+# grep oldroot` is empty (it deletes the old root by walking `/`; it does not
+# move it to `/oldroot`), and `PATH must be set` is not in the binary either -
+# that check belongs to util-linux's `switch_root`. What the `mkdir` did leave
+# behind was an empty `/oldroot` on every root the first machine booted, which
+# no standard Alpine root has (`docs/NOTES.md` §15.34).
+
+# The disk's own pid-1 chain, under the name a standard Alpine disk answers to.
+# Both machines reach the same name because both disks carry it as an installed
+# fact rather than as something a boot has to make: the applet farm
+# (`/sbin/init`, `/bin/mount`, ...) is laid by the build, because a
+# cross-architecture `apk` installs with `--no-scripts` and busybox's own
+# post-install never runs (`assets/configs/busybox-applets.txt`). That is what
+# this script used to cover with a test for `/init`: the second machine's disk
+# carried a script of its own, which made one script serve two differently
+# shaped disks.
+if [ ! -x /sysroot/sbin/init ]; then
+    echo "initramfs: $root carries no /sbin/init to hand over to"
+    exec /bin/sh
+fi
+exec switch_root /sysroot /sbin/init
+
+# The vocabulary this script execs, as a comment the build can read. Editing a
+# command line below without its verb here fails `cargo test -p mpos-xtask`
+# (initramfs's farm pin), because a name missing from the applet farm is a boot
+# that dies on ENOENT mid-pivot - and a headless verdict reads that as a hang.
+# One list, two readers: the shell ignores these lines, the test does not.
+@vocabulary: sh mount cat echo mkdir switch_root

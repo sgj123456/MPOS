@@ -74,12 +74,17 @@ unsafe impl Hal for HalImpl {
 }
 
 // ---------------------------------------------------------------------------
-// The PCI transport. Every item below reaches a device through a BAR and the
-// port-based configuration mechanism, so it is x86_64's; aarch64 drives virtio
-// over the memory-mapped transport instead (see `crate::drivers::virtio`'s
-// aarch64 path). They are gated as a block so `HalImpl` above compiles on both.
+// The PCI transport. Every item below reaches a device through a BAR, over the
+// configuration space `drivers::pci` reads - by port I/O on one machine and
+// through the ECAM window its firmware described on another, which is that
+// module's own decision and made once at boot. So this is not one machine's
+// code: a machine whose devices hang off a bus compiles it and finds them; a
+// machine with no bus finds none (`drivers::pci` answers an empty bus, and a
+// machine that describes its devices as memory-mapped windows reaches them
+// through `crate::drivers::virtio::mmio` instead). The one part that *is*
+// hardware-bound is the message-signalled arming, which needs an MSI controller
+// and is gated on `mpos_msi` (`device_config` below, and `net.rs`).
 
-#[cfg(target_arch = "x86_64")]
 mod pci_transport {
     use super::*;
 
@@ -197,6 +202,7 @@ mod pci_transport {
     /// caller: the host raises `VIRTIO_GPU_EVENT_DISPLAY` in `events_read` when the
     /// display it wants us to drive changes shape, and nothing else in this kernel
     /// can see a window resize.
+    #[cfg(mpos_msi)]
     pub fn device_config(device_ids: &[u16]) -> Option<usize> {
         let func = pci::find_any(VENDOR_VIRTIO, device_ids)
             .into_iter()
@@ -205,5 +211,12 @@ mod pci_transport {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-pub use pci_transport::{claim_drm_card, device_config, pci_root, transport, transport_all};
+/// The virtio *device configuration* window of the first device answering one of
+/// `device_ids`, where a driver polls for events the device itself reports.
+///
+/// A capability, not a machine: the window is the one the MSI-X table shares
+/// (`msix::device_config_of`), so a machine with no MSI controller has no such
+/// address to hand out and this does not exist for it (`mpos_msi`).
+#[cfg(mpos_msi)]
+pub use pci_transport::device_config;
+pub use pci_transport::{claim_drm_card, pci_root, transport, transport_all};

@@ -53,9 +53,26 @@ use rustix::fd::{AsRawFd, BorrowedFd};
 use rustix::io::{read, write};
 use rustix::pipe::pipe;
 
-/// The kernel's packed record: `data` sits at byte 4, and the wait writes
-/// exactly this shape back.
+/// The *machine's* record, which the ctl hands over and the wait writes back.
+///
+/// Linux packs `struct epoll_event` on x86_64 only - twelve bytes with `data` at
+/// byte 4 there, sixteen with `data` at byte 8 on every other machine
+/// (`EPOLL_PACKED` is `#if defined(__x86_64__)` in the uapi, and musl's
+/// `sys/epoll.h` copies that guard) - so a test that hard-codes *either* shape
+/// agrees with a kernel that writes the wrong one. That is what this file did:
+/// it asserted the x86_64 layout on both machines, so the aarch64 machine could
+/// write it and no claim here could tell. The shape below is the machine's, and
+/// the claims that use it - the caller's data word arriving verbatim - are what
+/// fail if a kernel writes the other machine's offsets.
+#[cfg(target_arch = "x86_64")]
 #[repr(C, packed(4))]
+#[derive(Clone, Copy)]
+struct Ev {
+    events: u32,
+    data: u64,
+}
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct Ev {
     events: u32,
@@ -65,6 +82,15 @@ struct Ev {
 const ADD: i32 = 1;
 const DEL: i32 = 2;
 const MOD: i32 = 3;
+
+/// The 64-bit data word the claims below register and read back.
+///
+/// Every bit of it matters, and that is the correction the aarch64 bug forced:
+/// a word whose *high* half is zero survives a kernel that reads `data` four
+/// bytes early and writes it four bytes early, because the two errors cancel -
+/// so the small value this file used to register (`0x1234`) pinned the round
+/// trip and not the layout, and the kernel's aarch64 half was wrong behind it.
+const DATA: u64 = 0x0123_4567_89ab_cdef;
 
 fn last_errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
@@ -170,11 +196,19 @@ fn main() {
     println!("t-epoll");
     let mut r = Report::new();
 
-    // The layout claim the migrated record rests on: the caller's array is
-    // byte-for-byte what the kernel reads and writes.
+    // The layout claim the record rests on: the caller's array is byte-for-byte
+    // the *machine's* struct, which is twelve bytes with `data` at 4 on x86_64
+    // and sixteen with `data` at 8 on aarch64. A kernel that writes the other
+    // machine's offsets fails here, and then fails the data claims below - the
+    // shape the aarch64 bug had before this claim existed.
+    let (record_size, record_data) = if cfg!(target_arch = "x86_64") {
+        (12, 4)
+    } else {
+        (16, 8)
+    };
     r.check(
-        "the event record is the size Linux reads",
-        core::mem::size_of::<Ev>() == 12 && core::mem::offset_of!(Ev, data) == 4,
+        "the event record is this machine's own epoll_event",
+        core::mem::size_of::<Ev>() == record_size && core::mem::offset_of!(Ev, data) == record_data,
     );
 
     // The two creations: the legacy size argument is ignored beyond having to
@@ -266,7 +300,14 @@ fn main() {
     // Data arrives, and the wait wakes carrying the caller's data word.
     let wrote = write(unsafe { BorrowedFd::borrow_raw(wout) }, b"ping").is_ok_and(|n| n == 4);
     r.check("the pipe takes the bytes", wrote);
-    let e = ev(EventFlags::IN, 0x1234);
+    // The data word is deliberately one whose *high* half is not zero, and that
+    // is a correction this claim needed: a value below 2^32 round-trips through
+    // either layout, because the kernel's read and its write are wrong in
+    // opposite directions and cancel - 0x1234 came back as 0x1234 from a kernel
+    // that read `data` at byte 4 and the caller read it at byte 8. A word with
+    // all sixty-four bits set in it cannot cancel: udev's registered pointer did
+    // not, which is how the aarch64 half of this layout was found at all.
+    let e = ev(EventFlags::IN, DATA);
     r.check(
         "MOD setting the data word succeeds",
         ctl(epfd, MOD, rin, Some(&e)) == 0,
@@ -278,7 +319,7 @@ fn main() {
             "the report carries EPOLLIN",
             EventFlags::from_bits_retain(events[0].events).contains(EventFlags::IN),
         );
-        r.check("the report carries the data word", events[0].data == 0x1234);
+        r.check("the report carries the data word", events[0].data == DATA);
     }
 
     // Drained, and reported once already: a zero-timeout look sees nothing.
@@ -330,7 +371,7 @@ fn main() {
     r.check("a second pipe is made", gone.is_ok());
     if let Ok((g_r, g_w)) = &gone {
         let (g_r, g_w) = (g_r.as_raw_fd(), g_w.as_raw_fd());
-        let e = ev(EventFlags::IN, 0x55);
+        let e = ev(EventFlags::IN, DATA + 1);
         r.check("its read end is added", ctl(epfd, ADD, g_r, Some(&e)) == 0);
         r.check("the writer is closed", unsafe { libc::close(g_w) } == 0);
         let n = wait(epfd, &mut events, 8, 200);
@@ -342,7 +383,7 @@ fn main() {
             );
             r.check(
                 "the caller's data word rides with it",
-                events[0].data == 0x55,
+                events[0].data == DATA + 1,
             );
         }
         // A second look finds the hang-up still there: it is a state, not an

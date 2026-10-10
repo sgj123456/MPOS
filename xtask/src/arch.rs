@@ -174,20 +174,6 @@ impl Arch {
     /// Whether this machine's *kernel* reads a probe file off its root
     /// partition, which is what makes that file part of the image.
     ///
-    /// The second machine's `check_fs` mounts the root's filesystem at boot and
-    /// reads `/hello` back through the block driver (`NOTES.md` §9.1 - the check
-    /// runs on every boot, a test build or not, and it halts the machine when
-    /// the file is not there), so the file has to
-    /// be in the image that machine boots. The first machine's filesystem check
-    /// is its initramfs script's `mount`, which needs no known file, so writing
-    /// the probe there would be a file nothing reads.
-    pub fn kernel_reads_root_probe(self) -> bool {
-        match self {
-            Arch::X86_64 => false,
-            Arch::Aarch64 => true,
-        }
-    }
-
     /// The stamp that records what this machine's root filesystem was built
     /// from, under `build/`.
     ///

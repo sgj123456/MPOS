@@ -11,16 +11,17 @@
 //! wrong; a report is shared because there is nothing in it a machine *could*
 //! answer differently - every line below is a function of `BootInfo`, the
 //! scheduler, or a `hal` register read. Before this module existed, all five lived
-//! in `board/x86_64.rs` and the second machine had none of them (an empty
-//! `panic_context`) or a machine-shaped substitute (`hal::halt` where the first
-//! machine parked). `NOTES.md` §13.23 and Phase 15's stages 15.4/15.5 are where
-//! that came from.
+//! in the first machine's boot body and the second machine had none of them (an
+//! empty `panic_context`) or a machine-shaped substitute (`hal::halt` where the
+//! first machine parked). `NOTES.md` §13.23 and Phase 15's stages 15.4/15.5 are
+//! where that came from - and the bodies themselves are gone now, replaced by the
+//! one flow beside this file.
 //!
 //! What is *not* here: which console the lines go to (the console service, above
-//! this), when a machine calls [`banner`] (its own `init`'s first act, so the
-//! record is on the wire before anything it describes is used), and the panic
-//! handler itself, which is `src/main.rs`'s - architecture-independent, and it
-//! calls the one function below.
+//! this), when [`banner`] is called (the flow's first act, so the record is on the
+//! wire before anything it describes is used), and the panic handler itself, which
+//! is `src/main.rs`'s - architecture-independent, and it calls the one function
+//! below.
 
 #[cfg(feature = "selftest")]
 use alloc::string::String;

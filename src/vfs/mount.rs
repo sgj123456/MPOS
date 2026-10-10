@@ -547,8 +547,8 @@ impl Vfs {
     /// device twice needs care: a mount whose point lives in the second tree is
     /// reached by a name the promoted one does not prefix (`/mnt/share` while
     /// the disk is handed over from `/sysroot`), and this test drops it. The
-    /// second machine's init mounts the host share *onto the new root* for
-    /// exactly that reason (`initramfs-aarch64/init`).
+    /// initramfs's script mounts the host share *onto the new root* for exactly
+    /// that reason (`assets/initramfs/core/init`).
     pub fn move_root(&self, at: &Arc<dyn Inode>) -> VfsResult<()> {
         // Named outside the table lock: `path_of` walks the tree and takes
         // the same lock this edit needs, so every mount point is named first

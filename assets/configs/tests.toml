@@ -52,7 +52,13 @@ default = []
 #   t-tcp-close          needs a listener on the host's 127.0.0.1:4599; with
 #                        none it prints `skip:` and passes, so it is a probe
 #                        and not a gate in either state
-external = ["t-dns", "t-rawicmp", "t-stdresolve", "t-tcp-close", "t-udp"]
+#   t-dhcp               the BOOTP answer it waits for is the host's slirp's,
+#                        not this machine's: a red one says the host's DHCP
+#                        server or its link is the thing that changed. The
+#                        *door* - the AF_PACKET socket, its name and its bind
+#                        - is this machine's, and is the part the program
+#                        asserts before it sends.
+external = ["t-dhcp", "t-dns", "t-rawicmp", "t-stdresolve", "t-tcp-close", "t-udp"]
 
 # Slow, or a measurement rather than an assertion. `t-fill-ramfs` writes up to
 # 1024 MiB a chunk at a time; the other three are instruments whose numbers are

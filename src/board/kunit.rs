@@ -52,11 +52,11 @@ pub(crate) const SUITES: &[Suite] = &[
         cases: &[
             Case {
                 name: "clock_breaks_registers",
-                run: super::x86_64::check_arch_clock,
+                run: super::suites::check_arch_clock,
             },
             Case {
                 name: "page_tables_and_spaces",
-                run: super::x86_64::check_arch_pages,
+                run: super::suites::check_arch_pages,
             },
         ],
     },
@@ -66,7 +66,7 @@ pub(crate) const SUITES: &[Suite] = &[
         phase: Phase::ConsoleInput,
         cases: &[Case {
             name: "console_receive",
-            run: super::aarch64::check_console_rx,
+            run: super::suites::check_console_rx,
         }],
     },
     #[cfg(target_arch = "aarch64")]
@@ -75,9 +75,12 @@ pub(crate) const SUITES: &[Suite] = &[
         phase: Phase::ConsoleTx,
         cases: &[Case {
             name: "console_transmit",
-            run: super::aarch64::check_serial_tx,
+            run: super::suites::check_serial_tx,
         }],
     },
+    // The boot's device step, read back: what the probe registered, on either
+    // machine (`src/board/suites.rs`).
+    super::suites::SUITE,
 ];
 
 /// How many cases have answered, so far.

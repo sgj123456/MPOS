@@ -12,8 +12,9 @@
 //! What is left is small because of what the kernel actually asked the crate
 //! for: `new`, `resolution()`, `change_resolution()` and `flush()`. Nothing here
 //! reads EDID (the DRM layer synthesizes its own block), nothing drives the
-//! device's cursor queue (the DRM cursor is a real second plane,
-//! `drm_cursor.rs`), and the cursor queue is not even configured - a device
+//! device's cursor queue (the DRM cursor is a real second plane, `drm.rs` over
+//! the blend in `crate::gpu::cursor`), and the cursor queue is not even
+//! configured - a device
 //! whose second queue nobody uses is a queue with no reason to exist.
 //!
 //! This file lands as a *refactor*: the same commands in the same order, so a

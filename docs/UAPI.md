@@ -204,6 +204,7 @@ back. This is the list, not the byte-by-byte record (that lives in the tests).
 | `struct rand_pool_info` | `RNDADDENTROPY` | `t-ioctl` |
 | `struct fb_*` / `fb_var_screeninfo` | `/dev/fb0` | `t-fbdev` |
 | `drm_mode_*` | `/dev/dri/card0` | `t-drm`, `t-drm-props`, `t-drm-lease`, `t-drm-sync` |
+| `struct epoll_event` | `epoll_ctl`/`epoll_wait` | `t-epoll`, and it is the record's **machine's** own: twelve bytes with `data` at 4 on x86_64, sixteen with `data` at 8 on aarch64 (`EPOLL_PACKED` in the uapi is `#if defined(__x86_64__)`, and musl's `sys/epoll.h` copies that guard). A kernel that writes one machine's offsets fails the layout claim and the data-word claims with it — which is how the aarch64 half was found |
 
 ---
 
@@ -399,6 +400,33 @@ the commit bodies), and each moved its pin in the same commit.
     `src/syscall/linux/fs/file.rs`'s `F_SETFD` arm. Pin: `t-fcntl` on **both** machines (S6
     batch 11), which reads the stored word back and so tells the three possible answers apart
     — refused, stored whole (`0xFFFF_FFFF`), and masked to `1`.
+
+13. **A `/dev` node keeps the clocks `utimensat` hands it; every device node here used to answer
+    `EOPNOTSUPP`.** Linux's devtmpfs stores a node's `atime`/`mtime` — measured on a host whose
+    `/dev` *is* a devtmpfs: `touch -d @1600000000 /dev/zero` answers `0` and `stat` reads the
+    stamp back (`2020-09-13 20:26:40`) — and eudev's node path sets the timestamps of every
+    device node it manages, which is what a boot showed: the dispatcher's once-per-number note
+    printed `mpos: syscall 88 (fd -100) -> EOPNOTSUPP` on aarch64 (280 is the same call on
+    x86_64) while the boot still reached `mpos login:`. Nothing failed; what a caller could not
+    do was treat the refusal as fatal without taking a path Linux never sends it down, which is
+    the §3.2 shape. The cell is where the plan said it would be — `NodePerms`, which already
+    held a device node's mode and owner, in `src/vfs/devfs.rs` — and it holds both clocks now,
+    forwarded by every node that had one: `DevNode`, and, in their own modules, the console tty,
+    `/dev/tty0`, the controlling-tty alias, `/dev/ptmx`, the DRM card, `/dev/fb0`, `/dev/uinput`
+    and the evdev nodes. **The kind that plan had left out was found by measuring, not by
+    reading**: with all of those wired, the same boot still printed the line, and a temporary
+    probe on the refusal named `BlockDev … rdev Some((254, 1))` — `/dev/vda1`, so udev's subject
+    was the *disk* nodes, and `DevBlockNode` (a separate inode in the same file) was the device
+    kind with no `NodePerms` at all. It has one now, born `0660 root:root` — the number
+    `mode_of` already fell back to for the kind, so nothing `stat` reported moved, and
+    `chmod`/`chown` on `/dev/vda2` now stick the way they do on the character nodes. Pin: a case
+    of the `vfs` suite (`device_nodes_keep_the_clocks_they_are_given`, both node kinds, the two
+    clocks moved independently) and `t-devtmpfs` on **both** machines (`/dev/null`, `/dev/tty0`
+    and a block node — the first of the names the boot published). *Remaining, named:* a node
+    reports zero until something stamps it — Linux's devtmpfs stamps one at creation, and there
+    is no mount-time number here to give a node that arrives when its driver registers it — and
+    the directories, symlinks and socket names devfs makes still answer the trait's default,
+    holding no `NodePerms` to keep a clock in.
 
 ### 5.2 Small, measured, and not yet landed
 

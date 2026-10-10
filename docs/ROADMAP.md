@@ -454,6 +454,15 @@ same measurement puts behind `vfs` and so behind `hal` too)**
       remain (the install writes no `/etc/hostname`, so the prompt says `localhost`, and the machine's
       `/proc/net` rows are the same table the first machine's is) · [~] 9.2 RISC-V support
 - [ ] **13 Machine-seam purity + aarch64 parity — 13.1/13.3–13.17 landed, 13.19–13.31 landed, 13.18 open, 13.2 in progress (§13); the boot-side half is Phase 15 (§15), where 15.19–15.24 put the boot's self-tests in a test build, move every check family into a suite beside the module it tests, and take the `M*` marker vocabulary out of the boot log (§15)**
+- [x] **The boot is one flow — the two machine bodies are gone (§15.8).** One `start` and one
+      sequence for every machine: the device step is `drivers::virtio::probe`, which asks the PCI
+      front-end *and* the memory-mapped windows the record's device tree describes, registering what
+      answers through each class's own contract, so the boot flow carries no architecture at all.
+      The kernel mounts nothing but its bootstrap ramfs — `/dev`, `/proc`, `/sys`, the real root and
+      the host share belong to the early userland (`assets/initramfs/core/init`), which is what a
+      distribution's mount tree is. The machines' per-boot device checks became a test-build
+      read-back (`src/board/suites.rs` plus the shared `devices` suite), so a distribution boot
+      neither pays for them nor can be halted by one (§13.14's rule)
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the

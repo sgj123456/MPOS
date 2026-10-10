@@ -32,7 +32,6 @@
 //! pump that keeps its events moving - is one copy on both machines, and the only
 //! lines that name a bus are the two probes that open it (`NOTES.md` §13.28).
 
-#[cfg(target_arch = "x86_64")]
 use alloc::sync::Arc;
 use core::cell::RefCell;
 
@@ -41,7 +40,6 @@ use virtio_drivers::device::socket::{VirtIOSocket, VsockAddr, VsockConnectionMan
 use virtio_drivers::transport::Transport;
 
 use super::hal::HalImpl;
-#[cfg(target_arch = "x86_64")]
 use super::hal::transport;
 use super::{VSOCK_PER_CONNECTION_BUFFER, VsockDevice};
 
@@ -50,7 +48,6 @@ use super::{VSOCK_PER_CONNECTION_BUFFER, VsockDevice};
 /// that CID here for `getsockname` to answer with. The MMIO side finds its
 /// window by this device's own `DeviceID` (`19`) instead, which is the machine
 /// layer's read, not this module's.
-#[cfg(target_arch = "x86_64")]
 const DEVICE_VSOCK: &[u16] = &[0x1053];
 
 /// A virtio-vsock device over the transport it arrived on - `PciTransport` on the
@@ -209,7 +206,6 @@ impl<T: Transport + Send> VsockDevice for VirtioVsock<T> {
 /// hands it to `net::vsock::init` the same way. The handle is the contract
 /// rather than the concrete device, so the caller never learns which bus
 /// answered.
-#[cfg(target_arch = "x86_64")]
 pub fn init_global() -> Option<Arc<dyn VsockDevice>> {
     let driver = VirtIOSocket::<HalImpl, _>::new(transport(DEVICE_VSOCK)?).ok()?;
     Some(Arc::new(VirtioVsock::new(driver)))

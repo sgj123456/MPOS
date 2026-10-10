@@ -41,7 +41,6 @@ use virtio_drivers::transport::Transport;
 
 use super::SoundCard;
 use super::hal::HalImpl;
-#[cfg(target_arch = "x86_64")]
 use super::hal::transport;
 use crate::syscall::linux::abi::{
     AFMT_S16_LE, SNDCTL_DSP_CHANNELS, SNDCTL_DSP_GETBLKSIZE, SNDCTL_DSP_GETFMTS,
@@ -68,7 +67,6 @@ use crate::syscall::linux::abi::{
 /// It names the PCI vendor's ID range, so it is the first machine's: the second
 /// finds the same card by the `virtio,mmio` window its device tree names, whose
 /// `DeviceID` is `25` (`VIRTIO_ID_SOUND`).
-#[cfg(target_arch = "x86_64")]
 const DEVICE_SOUND: &[u16] = &[0x1059];
 
 /// One period of audio, and the buffer the device holds behind the stream.
@@ -421,7 +419,6 @@ pub fn install_probed<T: Transport + Send + 'static>(
 }
 
 /// The first machine's door: probe the PCI bus for the card and bring it up.
-#[cfg(target_arch = "x86_64")]
 pub fn init_global() -> Option<Arc<dyn SoundCard>> {
     let opened = match transport(DEVICE_SOUND) {
         Some(transport) => VirtIOSound::<HalImpl, _>::new(transport).map_err(|_| Probe::Init),

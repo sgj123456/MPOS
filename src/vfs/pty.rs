@@ -550,6 +550,19 @@ impl Inode for Ptmx {
         PTMX_PERMS.set_owner(uid, gid);
     }
 
+    fn atime(&self) -> u64 {
+        PTMX_PERMS.atime()
+    }
+
+    fn mtime(&self) -> u64 {
+        PTMX_PERMS.mtime()
+    }
+
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        PTMX_PERMS.set_times(atime, mtime);
+        Ok(())
+    }
+
     /// The pty multiplexer has no position either: `lseek` is `ESPIPE`.
     fn seekable(&self) -> bool {
         false

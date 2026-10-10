@@ -27,12 +27,37 @@ use crate::drivers::pci;
 
 use super::NetDevice;
 use super::hal::{HalImpl, pci_root};
+#[cfg(mpos_msi)]
 use super::msix;
 
 const VENDOR_VIRTIO: u16 = 0x1af4;
 /// The transitional device id for a network adapter; a modern-only device
 /// answers 0x1041 instead.
 const DEVICE_NET: u16 = 0x1000;
+
+/// The adapter this machine has, whichever transport the probe opened it over.
+///
+/// One slot for the machine's network device, and it exists because two steps of
+/// the boot cannot be the same step: the device is *found* as soon as the kernel
+/// can reach device memory, while the *stack* over it (`net::init` and the
+/// service task) needs a running scheduler. So the probe publishes here and the
+/// bring-up reads here, and neither has to know which bus answered or when the
+/// other ran. A machine whose card never probed leaves this `None`, and the
+/// socket calls answer `ENETDOWN` - which is what a `None` from [`device`] means
+/// to `net::init`.
+static ADAPTER: Mutex<RefCell<Option<Arc<dyn NetDevice>>>> = Mutex::new(RefCell::new(None));
+
+/// Publish `dev` as this machine's network adapter. Called by the probe.
+pub fn install(dev: Arc<dyn NetDevice>) {
+    critical_section::with(|cs| {
+        *ADAPTER.borrow(cs).borrow_mut() = Some(dev);
+    });
+}
+
+/// The adapter the probe published, if it found one.
+pub fn device() -> Option<Arc<dyn NetDevice>> {
+    critical_section::with(|cs| ADAPTER.borrow(cs).borrow().clone())
+}
 
 /// Slots in each queue. The receive side keeps this many buffers posted, so a
 /// burst that arrives while the kernel is busy is not dropped for want of
@@ -149,23 +174,36 @@ impl VirtioNet {
         )
         .ok()?;
 
+        // Mutable only where there is an interrupt to enable: on a machine with
+        // no MSI controller the arming below does not exist and nothing writes
+        // through the binding again.
+        #[cfg_attr(not(mpos_msi), allow(unused_mut))]
         let mut device = VirtIONet::<HalImpl, _, QUEUE_SIZE>::new(transport, BUFFER_BYTES).ok()?;
         let mac = device.mac_address();
 
-        // Arm the message-signalled interrupt: the vector table entry first,
-        // then the queues' binding to it - the order the virtio spec demands,
-        // entry ready before the queue names it. Either step failing leaves
-        // the machine exactly as it was, polled, which is what it ran as
-        // before any of this existed. The APIC's EOI register is mapped
-        // first as well: the handler's last write goes there, and an unmapped
-        // write from interrupt context is a panic nothing recovers from.
-        crate::hal::init_message_signalled();
-        if msix::enable(&func, crate::hal::net_msi_vector()) && msix::set_queue_vectors(&func) {
-            // With the queues told whom to interrupt, the notification
-            // suppression flags come off. (A no-op while `VIRTIO_F_EVENT_IDX`
-            // is negotiated - the crate re-arms that way - and the honest
-            // spelling of the same request the day it is not.)
-            device.enable_interrupts();
+        // Arm the message-signalled interrupt, where this machine has an MSI
+        // controller to arm: the vector table entry first, then the queues'
+        // binding to it - the order the virtio spec demands, entry ready before
+        // the queue names it. Either step failing leaves the machine exactly as
+        // it was, polled, which is what it ran as before any of this existed.
+        // The APIC's EOI register is mapped first as well: the handler's last
+        // write goes there, and an unmapped write from interrupt context is a
+        // panic nothing recovers from.
+        //
+        // Gated on the capability, not on a machine: a port whose devices are
+        // wired to a GIC has no message-signalled delivery at all, so there is
+        // nothing to arm and the adapter stays polled - which is the same state
+        // this code leaves behind when the arming fails.
+        #[cfg(mpos_msi)]
+        {
+            crate::hal::init_message_signalled();
+            if msix::enable(&func, crate::hal::net_msi_vector()) && msix::set_queue_vectors(&func) {
+                // With the queues told whom to interrupt, the notification
+                // suppression flags come off. (A no-op while `VIRTIO_F_EVENT_IDX`
+                // is negotiated - the crate re-arms that way - and the honest
+                // spelling of the same request the day it is not.)
+                device.enable_interrupts();
+            }
         }
 
         // The device is this driver's from here, which is what `lspci -k`

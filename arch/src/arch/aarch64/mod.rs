@@ -39,6 +39,11 @@
 pub(crate) mod context;
 pub(crate) mod critical;
 pub(crate) mod gic;
+/// Where a BAR the firmware handed out is mapped - the aarch64 half of
+/// `hal::map_mmio_window`. It has a window to allocate from because PCIe is
+/// here now (`NOTES.md` §9.1's gap): the ECAM walk and the AHCI driver both ask
+/// for addresses no device tree names.
+pub(crate) mod mmio;
 pub(crate) mod paging;
 pub(crate) mod pl011;
 pub(crate) mod pl031;
@@ -546,6 +551,36 @@ fn check_paging(info: &BootInfo, sections: &KernelSections, frames: usize) {
         "page tables: {frames} frames ({} KiB), TTBR0 {ttbr0:#x}, TTBR1 {ttbr1:#x} \
          (the kernel's own, read back from the registers)",
         frames * PAGE_SIZE / 1024,
+    );
+
+    // `TCR_EL1`'s `IPS` is a *limit* rather than a detail: it bounds every
+    // physical address the walk may output, and an unset field is 32 bits rather
+    // than "no limit". A descriptor above it is not a refused write but a fault
+    // at the first *read* - the PCIe ECAM at `0x40_1000_0000` is where that cost
+    // a boot, as an address-size abort (`ESR_EL1` `0x96000003`) whose address was
+    // the first byte of the dynamic MMIO window.
+    //
+    // The check reads the register back and compares it with what this CPU says
+    // it implements, which is the pair that catches it: the code that wrote the
+    // field *omitted* it, and every physical address the kernel had reached
+    // before the ECAM - RAM below 4 GiB, a device window at `0x0800_0000` - fits
+    // in 32 bits, so the omission was invisible rather than loud.
+    let tcr = paging::tcr_el1();
+    let ips = paging::ips_in(tcr);
+    let want = paging::programmed_ips();
+    if ips != want {
+        let _ = writeln!(
+            out,
+            "tables: TCR_EL1 {tcr:#x} holds IPS {ips}, but this CPU implements {want} \
+             ({} bits): a device above that would fault at the first read",
+            paging::phys_bits()
+        );
+        halt();
+    }
+    let _ = writeln!(
+        out,
+        "physical addresses: {} bits, and TCR_EL1 IPS holds it",
+        paging::phys_bits()
     );
 
     if !paging::enabled() {
@@ -2101,7 +2136,8 @@ fn check_timer() {
 
 /// Say who this is, what it was handed, and get out of the way.
 ///
-/// Deliberately the same shape as the x86_64 banner (`src/board/x86_64.rs`), so
+/// Deliberately the same shape as the x86_64 banner (`src/board/report.rs`,
+/// the shared one), so
 /// the two machines' first lines are comparable rather than merely both
 /// present - and so that a loader which relocated the image to the wrong base,
 /// or handed over the wrong memory map, shows up as a wrong number here rather
@@ -2337,10 +2373,27 @@ impl crate::hal::Paging for crate::hal::Current {
 
     #[inline]
     fn map_mmio_window(phys: usize, len: usize) -> Option<usize> {
-        // The device window is mapped whole at boot, so a physical MMIO range
-        // inside it is already reachable: the answer is its offset into the
-        // kernel-half alias, and `None` if the range falls outside the window.
-        paging::device_virt(phys, len)
+        // Three answers now, and which one a caller gets is a fact about the
+        // range rather than about the caller. Inside the window the boot mapped,
+        // the range is already reachable at its offset into the kernel-half
+        // alias, and that is still the answer - a device the tree describes keeps
+        // its one address. Outside it, the range is a BAR or an ECAM bus, whose
+        // address the firmware chose at enumeration time: it gets a mapping of
+        // its own from `mmio::window`.
+        //
+        // The third answer comes first, and it is the one a *device* address can
+        // need: `TCR_EL1`'s `IPS` bounds every physical address the walk may
+        // output, so a range above this CPU's own physical address space has no
+        // mapping to give. Writing one anyway is what an address-size abort at
+        // the first read is made of - the machine stops on a leaf nothing could
+        // translate instead of the driver being told there is no device there.
+        // `None` is this contract's own word for "this machine cannot map that
+        // range" (`hal::Paging::map_mmio_window`), the same answer a full window
+        // gives, and the absence a driver is built to read rather than die of.
+        if !paging::phys_reachable(phys, len) {
+            return None;
+        }
+        paging::device_virt(phys, len).or_else(|| mmio::window(phys, len))
     }
 
     #[inline]

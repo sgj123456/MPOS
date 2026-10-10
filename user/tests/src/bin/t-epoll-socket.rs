@@ -40,9 +40,22 @@ use rustix::net::{
 use std::net::Ipv4Addr;
 use std::os::fd::{AsFd, AsRawFd};
 
-/// The kernel's packed record: `data` sits at byte 4, and the wait writes
-/// exactly this shape back.
+/// The *machine's* record: `data` sits at byte 8 on aarch64 and at byte 4 on the
+/// x86_64 layout the struct is packed into (`EPOLL_PACKED` in the uapi is
+/// `#if defined(__x86_64__)`, and musl's `sys/epoll.h` copies that guard).
+/// Declared here rather than imported because the wait writes the caller's own
+/// shape back - which is exactly why it has to be *this* machine's: the sibling
+/// `t-epoll` carried the x86_64 shape on both machines, so the kernel could
+/// write the wrong offsets on aarch64 and no claim could see it.
+#[cfg(target_arch = "x86_64")]
 #[repr(C, packed(4))]
+#[derive(Clone, Copy)]
+struct Ev {
+    events: u32,
+    data: u64,
+}
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct Ev {
     events: u32,

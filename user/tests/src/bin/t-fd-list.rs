@@ -35,10 +35,10 @@
 //! # Where the listing comes from
 //!
 //! The x86_64 test initramfs mounts `/proc` with busybox before it runs
-//! anything, and the aarch64 sweep's disk chain does the same
-//! (`rootfs-aarch64/init`'s `mount -t proc proc /proc`) before the runner takes
-//! over - *measured*, not assumed: both runs of this program report "the
-//! payload's own /proc". The mount below is the `t-tmpfile-link` pattern, and it
+//! anything, and on the aarch64 sweep's disk the shared init script
+//! (`assets/initramfs/core/init`) mounts one on the new root before the pivot -
+//! *measured*, not assumed: both runs of this program report "the payload's own
+//! /proc". The mount below is the `t-tmpfile-link` pattern, and it
 //! is there for a payload that has none, which is a harness gap rather than the
 //! kernel's; it says which `/proc` it used, so a reader can tell the two cases
 //! apart. The fixtures are the test's own under `/tmp`, which both runners back

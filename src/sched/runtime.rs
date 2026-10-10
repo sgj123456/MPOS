@@ -2421,11 +2421,12 @@ pub fn spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<TaskI
     // tree, not a task's. `resolve_at` jails an absolute path to
     // `process_root()`, and before init exists that is the boot task's - empty,
     // so it falls back to the global root, which is right for x86_64 (initramfs
-    // root, no switch) but stale on this machine: pid 1 is resolved after
-    // `pivot_root` has replaced the global root, and a `#!/bin/sh` init would
-    // look for its interpreter in the ramfs the switch just moved to
-    // `/oldroot` - `NoEntry`, and an init that cannot be spawned ends the
-    // machine. The explicit start is the switched tree itself.
+    // root, no switch) but stale on this machine: pid 1 is resolved after the
+    // root switch has replaced the global root, and a `#!/bin/sh` init would
+    // look for its interpreter in the ramfs the switch has just deleted
+    // (`/oldroot` in the kernel-pivot era `NOTES.md` §13.3 records) - `NoEntry`,
+    // and an init that cannot be spawned ends the machine. The explicit start is
+    // the switched tree itself.
     let start = if current() == TaskId(BOOT_SLOT) {
         Some(crate::vfs::global().root_inode())
     } else {

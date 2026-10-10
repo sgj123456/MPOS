@@ -41,20 +41,8 @@ build = "build.rs"
 mpos-abi = { path = "../../crates/abi" }
 
 [[bin]]
-name = "t-dns"
-path = "src/bin/integration/t-dns.rs"
-
-[[bin]]
-name = "t-drm-args"
-path = "src/bin/integration/t-drm-args.rs"
-
-[[bin]]
 name = "t-drm"
 path = "src/bin/integration/t-drm.rs"
-
-[[bin]]
-name = "t-drm-lease"
-path = "src/bin/integration/t-drm-lease.rs"
 
 [[bin]]
 name = "t-drm-props"
@@ -77,14 +65,6 @@ name = "t-evdev"
 path = "src/bin/integration/t-evdev.rs"
 
 [[bin]]
-name = "t-fill-ramfs"
-path = "src/bin/integration/t-fill-ramfs.rs"
-
-[[bin]]
-name = "t-prime"
-path = "src/bin/integration/t-prime.rs"
-
-[[bin]]
 name = "t-seat"
 path = "src/bin/integration/t-seat.rs"
 
@@ -93,16 +73,8 @@ name = "t-sh"
 path = "src/bin/integration/t-sh.rs"
 
 [[bin]]
-name = "t-tcp-close"
-path = "src/bin/integration/t-tcp-close.rs"
-
-[[bin]]
 name = "t-udev-worker"
 path = "src/bin/integration/t-udev-worker.rs"
-
-[[bin]]
-name = "t-dhcp"
-path = "src/bin/integration/t-dhcp.rs"
 
 [lints]
 workspace = true

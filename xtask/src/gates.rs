@@ -275,12 +275,13 @@ fn as_attribute(line: &str) -> Option<String> {
 /// three comments in it say `mpos.selftest` *on purpose*, to record what the
 /// kernel stopped reading, so the walk skips comments and the rule is about code.
 const BOOT_CODE: &[&str] = &[
-    "src/board/aarch64.rs",
+    "src/board/flow.rs",
     "src/board/kunit.rs",
     "src/board/mod.rs",
     "src/board/report.rs",
     "src/board/steps.rs",
-    "src/board/x86_64.rs",
+    "src/board/suites.rs",
+    "src/drivers/virtio/probe.rs",
     "arch/src/arch/aarch64/mod.rs",
 ];
 
@@ -486,7 +487,7 @@ mod tests {
     fn every_shape_of_test_opening_is_reported() {
         let dir = scratch_boot_tree("shapes");
         fs::write(
-            dir.join("src/board/x86_64.rs"),
+            dir.join("src/board/flow.rs"),
             "fn f() {\n\
              \x20   let word = \"mpos.selftest\";\n\
              \x20   let testing = cfg!(feature = \"selftest\");\n\
@@ -506,7 +507,7 @@ mod tests {
     fn a_comment_that_names_the_vocabulary_is_not_an_opening() {
         let dir = scratch_boot_tree("prose");
         fs::write(
-            dir.join("src/board/aarch64.rs"),
+            dir.join("src/board/suites.rs"),
             "// M8_OK used to be printed here, and `mpos.selftest` was read here.\n\
              //! Not gated on `feature = \"selftest\"` any more.\n\
              fn f() {}\n",

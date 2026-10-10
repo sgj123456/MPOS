@@ -96,7 +96,7 @@ cargo xtask [global flags] <command>
 | 构建目录 | `--build-dir <PATH>` | 默认 `$MPOS_BUILD_DIR`，再默认 `build/` | default `$MPOS_BUILD_DIR`, else `build/` |
 | 构建档 | `--profile <NAME>` | 默认 `$PROFILE`，再默认 `debug`；发布用 `--profile release` | default `$PROFILE`, else `debug`; use `--profile release` |
 | 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror`（默认取 `machine.toml` 的 `qemu.mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror` (defaults to `qemu.mode` in `machine.toml`, else `mirror`) |
-| 机器 | `--arch <ARCH>` | 全局：`x86_64`（默认）或 `aarch64`。**每条命令都真的处理那台机器**：`build` 编它的内核与 loader，`disk`/`rootfs`/`all` 铺并安装**它自己的**磁盘镜像（`mpos-uefi-x86_64.img` / `aarch64-disk.img`，各带自己的 stamp），`run` 启动它（第二台机器 pid 1 同样是盘上的 `/init`，busybox init 读 `/etc/inittab`），`test` 走同一套盘上 sweep（唯一还分机器的是选哪些程序），`initramfs` 建那台机器的归档。两台机器之间只剩真事实的差别，都在 `Arch` 与各配置文件的 `[aarch64]` 段里 | global: `x86_64` (default) or `aarch64`. **Every command really handles that machine**: `build` compiles its kernel and loader, `disk`/`rootfs`/`all` lay and install **its own** disk image (`mpos-uefi-x86_64.img` / `aarch64-disk.img`, each with its own stamp), `run` boots it (the second machine's pid 1 is likewise the disk's own `/init`, busybox init reading `/etc/inittab`), `test` takes the same on-disk sweep (only the program selection still differs) and `initramfs` builds that machine's archive. What is left between the machines is only real differences, held in `Arch` and in each file's `[aarch64]` section |
+| 机器 | `--arch <ARCH>` | 全局：`x86_64`（默认）或 `aarch64`。**每条命令都真的处理那台机器**：`build` 编它的内核与 loader，`disk`/`rootfs`/`all` 铺并安装**它自己的**磁盘镜像（`mpos-uefi-x86_64.img` / `aarch64-disk.img`，各带自己的 stamp），`run` 启动它（两台机器的 pid 1 都是盘上标准的 `/sbin/init`，busybox init 读 `/etc/inittab`——同一条链），`test` 走同一套盘上 sweep（唯一还分机器的是选哪些程序），`initramfs` 建那台机器的归档。两台机器之间只剩真事实的差别，都在 `Arch` 与各配置文件的 `[aarch64]` 段里 | global: `x86_64` (default) or `aarch64`. **Every command really handles that machine**: `build` compiles its kernel and loader, `disk`/`rootfs`/`all` lay and install **its own** disk image (`mpos-uefi-x86_64.img` / `aarch64-disk.img`, each with its own stamp), `run` boots it (both machines' pid 1 is the disk's own standard `/sbin/init`, busybox init reading `/etc/inittab` — one chain), `test` takes the same on-disk sweep (only the program selection still differs) and `initramfs` builds that machine's archive. What is left between the machines is only real differences, held in `Arch` and in each file's `[aarch64]` section |
 | 测试分组 | `--groups <A,B>` | 仅 `test`：除分组外的测试之外再跑这些分组（取代 `tests.toml` 的 `default`）| `test` only: run these groups *in addition* to the ungrouped tests (replaces the file's `default`) |
 | 全部分组 | `--all-groups` | 仅 `test`：连非默认分组一起跑 | `test` only: run every group, including the ones left out by default |
 
@@ -176,13 +176,16 @@ code rather than a stale image.
 配置分成两个文件，分界不是按大小而是按**代价**：`rootfs.toml` 的 mtime 决定要不要重装
 Alpine 全树（三十多个包，走网络），`machine.toml` 里改任何东西都不会动镜像。每份配置
 都只有一个文件、同时描述**两台**机器，用三个段：`[default]` 是共享基线，`[x86_64]` /
-`[aarch64]` 各自覆盖它——键名自带前缀（`qemu.memory`、`rootfs.arch`、`system.hostname`）。
+`[aarch64]` 各自覆盖它——键名自带前缀（`qemu.memory`、`rootfs.mirror`、`system.hostname`）。
+机器本身不是键：apk 的包架构就是构建时 `--arch` 的那个词（`xtask/src/arch.rs`）。
 
 The configuration is two files, and the line between them is cost rather than
 tidiness: `rootfs.toml`'s mtime is what decides whether the Alpine tree is
 reinstalled, so nothing that is not part of the image lives there. Each file
 describes **both** machines in three sections — `[default]` is the shared baseline
 and `[x86_64]`/`[aarch64]` override it — with keys dotted by what they belong to.
+The machine itself is not a key: the package architecture `apk` is asked for is
+the `--arch` the build was given (`xtask/src/arch.rs`).
 
 | 文件 | file | 内容 | contents |
 | --- | --- | --- | --- |

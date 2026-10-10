@@ -15,12 +15,6 @@
 //! step every driver starts with, so the only part that differs between
 //! them is the ID the device answers.
 
-//! Every driver here except `hal` reaches its device over PCI today, so the
-//! PCI-only ones are x86_64's. `hal` is the machine-neutral `Hal` impl the
-//! aarch64 MMIO transport builds on (`NOTES.md` §9.1); the aarch64 `rng`/`blk`/
-//! `net` over MMIO come as the drivers stage proceeds, so `rng` is gated to
-//! x86_64 until its MMIO path exists.
-
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -32,7 +26,14 @@ use virtio_drivers::transport::Transport;
 
 use self::hal::HalImpl;
 
-#[cfg(target_arch = "x86_64")]
+// Every transport this module can speak is compiled on every machine, because
+// which one a device is behind is a fact about the *machine* and not about the
+// build's architecture: the block device and the network adapter are opened over
+// a PCI BAR here and over a memory-mapped window there, and the caller that
+// probes for them (`probe`) should not have to be two functions to say so. What
+// is arch-bound is an optional capability: MSI-X needs an MSI controller
+// (`mpos_msi`), so the module that arms it is gated on that word and a machine
+// without the controller has no such module rather than a stub.
 pub mod blk;
 pub mod console;
 pub mod fs9p;
@@ -50,16 +51,23 @@ pub mod hal;
 /// §15.2).
 #[cfg(mpos_input_registry)]
 pub mod input;
-/// The memory-mapped virtio transport, this machine's path to its devices. Only
-/// aarch64 has its virtio behind fixed MMIO windows; x86_64 reaches the same
-/// devices over a PCI BAR, so this is gated to aarch64 and is where its first
-/// driven device (virtio-rng, `NOTES.md` §9.1 stage 7) is opened.
-#[cfg(target_arch = "aarch64")]
+/// The memory-mapped virtio transport: the path to a device whose firmware
+/// describes it as a window rather than as a PCI function. Compiled on every
+/// machine now - a machine with no such window simply has none to walk
+/// (`mmio::windows` reads the record's device tree, which an ACPI machine does
+/// not carry), and the probe below asks both transports on both machines
+/// rather than the build deciding which one a device "must" be behind.
 pub mod mmio;
-#[cfg(target_arch = "x86_64")]
+/// The MSI-X arming for the PCI transports, on the machines that have an MSI
+/// controller. A capability, not an architecture: a machine whose devices are
+/// wired to a GIC has no message-signalled delivery to arm and no such module.
+#[cfg(mpos_msi)]
 pub mod msix;
-#[cfg(target_arch = "x86_64")]
 pub mod net;
+/// The one pass that finds this machine's devices and registers them, whichever
+/// transport carries each: the boot's device step, and the reason it is one step
+/// on both machines rather than one per machine.
+pub mod probe;
 pub mod rng;
 pub mod sound;
 pub mod vsock;

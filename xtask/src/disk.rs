@@ -63,8 +63,9 @@ pub fn build_disk(build_dir: &Path, _profile: &str, arch: Arch) -> Result<()> {
     Ok(())
 }
 
-/// Creates `arch`'s image unless it is already there, and - because a boot of
-/// the second machine reads it - the raw pattern image its block check verifies.
+/// Creates `arch`'s image unless it is already there, and the two fixtures a
+/// boot of it attaches: the raw pattern image the second machine's block check
+/// verifies, and the SATA disk its AHCI controller serves.
 ///
 /// The pattern belongs to the *boot*, not to the image: the check that reads it
 /// is the second machine's device probe (`check_blk`, `NOTES.md` §9.1), which
@@ -72,6 +73,12 @@ pub fn build_disk(build_dir: &Path, _profile: &str, arch: Arch) -> Result<()> {
 /// first machine has no such check. It is written here rather than by each
 /// caller because it is one 1 MiB file of a known content that both a sweep and
 /// an interactive boot attach.
+///
+/// The SATA disk is not gated on `arch` while the pattern is, and that is the
+/// difference between them: the pattern is read by a check only one machine
+/// has, whereas the wiring hands *both* machines an AHCI controller, so a boot
+/// of either one that had no disk behind it would be a boot whose `t-ahci`
+/// failed for a reason that is not the driver's.
 pub fn ensure(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
     if !image_path(build_dir, arch).exists() {
         build_disk(build_dir, profile, arch)?;
@@ -79,6 +86,7 @@ pub fn ensure(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
     if arch == Arch::Aarch64 {
         ensure_pattern_image(build_dir, arch)?;
     }
+    ensure_sata_image(build_dir)?;
     Ok(())
 }
 
@@ -196,19 +204,12 @@ fn copy_into_partition(src: &Path, image: &Path, start: u64, what: &str) -> Resu
 /// AAVMF with the loader, the kernel and this machine's initramfs on it.
 const ESP_BYTES: u64 = 48 * 1024 * 1024;
 
-/// The file a boot's filesystem check reads back through the VFS, and the bytes
-/// it must find there.
-///
-/// Written into every root a sweep lays, and into the installed root of a
-/// machine whose kernel reads it (`Arch::kernel_reads_root_probe`), so "the disk
-/// mounted and served a file" is one line on the wire rather than the absence of
-/// an error.
-pub const PROBE_FILE: &str = "hello";
-pub const PROBE_BYTES: &[u8] = b"mpos reads from ext4 over virtio-MMIO\n";
-
-/// The raw block image the block-driver check reads a known pattern off. Every
-/// byte is `i as u8`, so sector 0 reads back exactly as that check expects. It
-/// is read, never mounted.
+/// The raw block image the block-driver check uses as its scratch device. Every
+/// byte is `i as u8` and nothing reads it for that value any more - the check
+/// asks the kernel whether a window carries a filesystem and writes a pattern it
+/// generates itself (`docs/NOTES.md` §15.34) - so what this file has to be is
+/// *raw*: no partition table, no superblock, a device nothing will miss a sector
+/// of.
 ///
 /// One file per machine, and one content for every boot of that machine: it is
 /// a *fixture* the check compares bytes against, so two media sharing it is a
@@ -226,6 +227,39 @@ fn ensure_pattern_image(build_dir: &Path, arch: Arch) -> Result<()> {
     fs::create_dir_all(build_dir)?;
     let pattern: Vec<u8> = (0..1024 * 1024u32).map(|i| i as u8).collect();
     fs::write(&path, &pattern).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+/// The disk the machine's AHCI controller serves, and its size.
+///
+/// Sparse and small on purpose: what `t-ahci` does with it is write one sector
+/// and read it back, so every byte past the first few is a hole in a file on
+/// the host and nothing in the guest depends on its content.
+pub const SATA_TEST_IMAGE: &str = "test-sata.img";
+pub const SATA_TEST_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The second disk, on a real controller rather than on virtio.
+///
+/// One file for *both* machines, unlike the pattern image above, and for the
+/// opposite reason: nothing compares this disk's bytes against a value, so
+/// there is no per-machine content to keep apart - and what the driver has to
+/// be proved against is one machine's controller answering, which is the same
+/// question on either.
+pub fn sata_image(build_dir: &Path) -> PathBuf {
+    build_dir.join(SATA_TEST_IMAGE)
+}
+
+/// Writes the SATA image unless one of the right size is already there.
+pub fn ensure_sata_image(build_dir: &Path) -> Result<()> {
+    let path = sata_image(build_dir);
+    if path.metadata().map(|m| m.len()).unwrap_or(0) == SATA_TEST_BYTES {
+        return Ok(());
+    }
+    fs::create_dir_all(build_dir)?;
+    let file =
+        fs::File::create(&path).with_context(|| format!("Failed to create {}", path.display()))?;
+    file.set_len(SATA_TEST_BYTES)
+        .with_context(|| format!("Failed to size {}", path.display()))?;
     Ok(())
 }
 
@@ -276,6 +310,20 @@ pub fn stage_program(root: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    // A symlink standing where the payload wants its program is *replaced*, not
+    // written through. The applet farm puts links at 309 names (`lay_applet_farm`
+    // below), and one of them is the name a test's runner wants - `sbin/init` -
+    // so `fs::write` would follow the link out of the tree entirely and fail on
+    // whoever owns its target (measured: `Permission denied`, the host's
+    // `/bin/busybox`). The payload lands last by contract; this is what makes
+    // "lands" true for a name that is currently a link.
+    if path
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        fs::remove_file(&path)
+            .with_context(|| format!("Failed to replace the link at {}", path.display()))?;
     }
     fs::write(&path, bytes).with_context(|| format!("Failed to lay {name} on the disk"))?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
@@ -332,6 +380,10 @@ pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<Pat
     // the file. It is a known 1 MiB pattern, so laying it once and reusing it is
     // the whole cost.
     ensure_pattern_image(build_dir, arch)?;
+    // The SATA disk, for exactly the same reason: `virt_machine_args` attaches
+    // an AHCI controller to every boot of the second machine, and a sweep on a
+    // fresh tree has no `disk`/`rootfs` run behind it either.
+    ensure_sata_image(build_dir)?;
     let disk = medium(build_dir, arch).with_extension("img");
     // Hoisted above the check because it is an *input* to it: `ensure_path` is
     // itself cached, and when it does rebuild the archive the new mtime is
@@ -388,14 +440,19 @@ pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<Pat
     // name, and a disk root is also what a test execs `/bin/true` and `/bin/ls`
     // from.
     crate::initramfs::link_farm(&staging, arch)?;
-    fs::write(staging.join(PROBE_FILE), PROBE_BYTES)?;
-    // The overlay pair first, the payload *after* it. Order is the contract: the
-    // machine overlay carries the disk's `/init` - the post-switch pid-1 chain -
-    // while a test boot's payload names some of the same paths with its own
-    // programs. The payload landing last is what lets a runner stand beside the
-    // script rather than under it; the overlay's remaining files
-    // (`etc/inittab`) still arrive, because nothing in the payload names them.
+    // And the *full* farm, the one an installed image carries: a disk root
+    // answers the same names a product one does, so a test that execs an applet
+    // the archive never needed (`t-busybox-farm`, and any program reaching for
+    // `/sbin/...`) meets the same tree here as on the machine's own root. One
+    // list, laid by one function (`docs/NOTES.md` §15.34); a name already
+    // answered - the runner staged below, a package's own link - is left alone.
     let project = crate::utils::project_root()?;
+    crate::rootfs::lay_applet_farm(&project, &staging)?;
+    // The overlay pair first, the payload *after* it. Order is the contract: the
+    // machine overlay carries the disk's files (the mountpoints a real init
+    // expects, `etc/inittab`) while a test boot's payload names some of the same
+    // paths with its own programs. The payload landing last is what lets a
+    // runner stand beside the tree rather than under it.
     crate::rootfs::merge_overlays(&project, arch.root_overlay(), &staging)?;
     for (name, bytes) in entries {
         stage_program(&staging, name, bytes)?;

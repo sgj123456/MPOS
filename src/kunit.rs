@@ -39,23 +39,25 @@ use crate::boot::BootInfo;
 
 /// The boot step a suite needs to have happened.
 ///
-/// The two machine-specific variants are declared where their machine's checks
-/// are: a phase with no suite in it is a name nothing constructs, which the
-/// compiler would report and which would be the right report.
+/// One vocabulary for every machine, because the *boot* is one sequence now
+/// (`src/board/flow.rs`): it reaches the same phases on both, and a phase a
+/// machine has no suite for simply runs nothing there - which is the honest
+/// "this machine's checks have nothing to say at this step" rather than a name
+/// that does not exist. The variants used to be gated to the machine whose checks
+/// declared them, on the reasoning that a phase nothing constructs is a name the
+/// compiler should report; with one flow every phase is constructed everywhere, so
+/// that reasoning no longer holds and the names are neutral.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     /// The frame allocator and the slab heap are up.
     Heap,
     /// The machine's own page tables, interrupts and clock are up.
-    #[cfg(target_arch = "x86_64")]
     Arch,
     /// The scheduler has adopted the boot context.
     Scheduler,
     /// The console's *polled* receiver can be read, and nothing else reads it.
-    #[cfg(target_arch = "aarch64")]
     ConsoleInput,
     /// The console's transmit ring is armed and an interrupt drains it.
-    #[cfg(target_arch = "aarch64")]
     ConsoleTx,
     /// The bootstrap root is mounted and the archive unpacked.
     Vfs,

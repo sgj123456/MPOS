@@ -28,12 +28,6 @@ use crate::qemu;
 use crate::sweep;
 use crate::utils;
 
-/// The SATA disk the test machine is given, and how big it is. Named here and
-/// used by `qemu`'s `Boot::Esp` arm through the same build directory, so the
-/// file that is made and the file that is attached are one name.
-pub const SATA_TEST_IMAGE: &str = "test-sata.img";
-pub const SATA_TEST_BYTES: u64 = 4 * 1024 * 1024;
-
 /// How long the guest may run before the harness gives up on it. TCG is slow;
 /// KVM is not. `MPOS_TEST_TIMEOUT` overrides, in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
@@ -566,6 +560,17 @@ pub(crate) const TEST_INIT: &str = r#"#!/bin/sh
 # init mounts it here, and so does this one.
 /bin/busybox mount -t devpts devpts /dev/pts
 
+# The host share, mounted where the runner's payload reads it. The *kernel*
+# does not mount it - a mount belongs to the owner of the tree it lands on, and
+# on this machine that is this runner (the distribution's initramfs script
+# mounts the same share on the root it promotes, which is why the mount here is
+# allowed to fail: on that machine the share is already there, and a second
+# mount over the same point is either the same device twice or an honest
+# refusal this script has nothing to do about). An empty source is this
+# kernel's spelling for "the share the bus exported", so no tag is copied here.
+/bin/busybox mkdir -p /mnt/share
+/bin/busybox mount -t 9p '' /mnt/share || echo "test init: no host share to mount"
+
 # The socket tests talk to QEMU's user-network stack, which only answers at
 # its fixed addresses once the interface is up and carries the address slirp
 # expects of the guest. The kernel brings eth0 up with that address and route
@@ -654,11 +659,10 @@ fn boot_tests(
     // whose every line is a volatile register access gets pinned at all
     // (`NOTES.md` §7.3). Sparse and small: the test writes one sector and reads
     // it back, and nothing else in the suite touches it.
-    let sata = build_dir.join(SATA_TEST_IMAGE);
-    if sata.metadata().map(|m| m.len()).unwrap_or(0) != SATA_TEST_BYTES {
-        let file = fs::File::create(&sata)?;
-        file.set_len(SATA_TEST_BYTES)?;
-    }
+    //
+    // `disk`'s function and not a local one: both machines' wiring attaches this
+    // disk now, so the file is one fixture with one name that either arm lays.
+    crate::disk::ensure_sata_image(build_dir)?;
 
     let (firmware, vars) = qemu::write_firmware_vars(build_dir, Arch::X86_64)?;
 
@@ -906,7 +910,14 @@ pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()>
     // directories a mount lands on are the ones that pipeline installs for this
     // machine - the same ones the *ramfs* half runs - instead of a second,
     // hand-written multi-call binary maintained beside them.
-    let mut entries: Vec<(&str, &[u8])> = vec![("init", TEST_INIT.as_bytes())];
+    //
+    // The runner lands at `/sbin/init` because that *is* the disk's pid-1 chain
+    // now: the shared initramfs script execs `/sbin/init` after the switch on
+    // both machines (`assets/initramfs/core/init`), the name a standard Alpine
+    // disk answers to, and the payload lands last so the runner stands where the
+    // installed image's own `/sbin/init` would. It used to be `/init`, which was
+    // the second machine's own chain back when this machine's disk carried one.
+    let mut entries: Vec<(&str, &[u8])> = vec![("sbin/init", TEST_INIT.as_bytes())];
     let paths: Vec<String> = plan
         .staged
         .iter()

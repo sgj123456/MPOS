@@ -4,10 +4,16 @@
 //! `arch::x86_64` or `blk`. They are architecture-aware (using port I/O,
 //! PCI enumeration) but are not part of the core architecture abstraction.
 
-/// Every driver below `virtio` is x86_64's machine: port I/O, `uart_16550`,
-/// PCI enumeration, AHCI, DRM. On aarch64 they are `#[cfg]`-ed out - a no-op
-/// there, exactly as `virtio::pci` and the console `vcmux` already were
-/// (`NOTES.md` §9.1's prep shape). `virtio` is the exception: its `Hal` impl is
+/// Two of the drivers below are one machine's and two are both machines'.
+/// `ahci` and `pci` used to be x86_64's alone, and the reason was not the
+/// driver: it was that this machine had no way to reach a BAR. Closing that
+/// (`arch::aarch64::mmio`, a bump-allocated window above the fixed one, and
+/// ECAM read from the device tree when the firmware publishes no MCFG) made
+/// both of them ordinary drivers again, so the `#[cfg]` came off rather than
+/// being replaced with a second copy - `NOTES.md` §9.1's "a PCIe aarch64
+/// server that hands out BARs to map dynamically is a named gap" is closed,
+/// and `t-ahci` is migratable. `virtio` is the exception of a different kind:
+/// its `Hal` impl is
 /// machine-neutral (the MMIO-mapping seam took the last x86_64-only call out of
 /// it), so it compiles on both, and the aarch64 MMIO transport is added there.
 /// `devices` is the other exception, for the same reason and by the same method:
@@ -20,11 +26,14 @@
 /// are *not* gated any more: each is published by whichever machine opened the
 /// device, through the driver module the two machines share (`NOTES.md`
 /// §13.24/§13.25).
-#[cfg(target_arch = "x86_64")]
 pub mod ahci;
 pub mod devices;
 pub mod drm;
-#[cfg(target_arch = "x86_64")]
+/// PCI configuration space, and the snapshot of the bus behind it. On both
+/// machines now: the window is the device tree's ECAM when the firmware
+/// published no MCFG, and the port pair it falls back to is x86_64's alone
+/// (`ports`, inside the module) - a machine with no I/O address space has an
+/// absent-function answer there instead.
 pub mod pci;
 /// The real-time clock's device node - `/dev/rtc0`, and the `RTC_*` ioctls'
 /// conversion between a Unix second and the nine fields `struct rtc_time` spells.

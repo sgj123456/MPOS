@@ -19,7 +19,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use critical_section::Mutex;
@@ -81,24 +81,44 @@ pub trait CharDevice: Send + Sync {
 /// ever read.
 ///
 /// A device inode that is its own `Inode` implementation - the tty, the DRM
-/// card, an event node - holds one of these and forwards the five trait
-/// methods to it; that is the whole of the mode story for that node.
+/// card, an event node - holds one of these and forwards the trait's methods to
+/// it; that is the whole of the mutable-attribute story for that node.
+///
+/// The two clocks live here for the same reason the mode does, and arrived
+/// last: Linux's devtmpfs keeps each node's `atime`/`mtime`, and udev's node
+/// path sets them on the devices it manages. Which devices those are was worth
+/// measuring rather than guessing - a boot whose refusal was instrumented for
+/// one run named `BlockDev` with `rdev 254:1` four times over, so this guest's
+/// udev was touching the *disk* nodes (`/dev/vda`, `/dev/vda1`, `/dev/vda2`,
+/// `/dev/sda`) and no character node at all. A `/dev` node that answered
+/// `utimensat` with `EOPNOTSUPP` therefore sent eudev down a path Linux never
+/// sends it down - once per boot on the wire, and nowhere else visible, which
+/// is the shape `docs/UAPI.md` §5.2 recorded and this closes. A node nobody has
+/// stamped reports the trait's zero, not a made-up time: what would be stamped
+/// instead is the mount's or the driver's moment, and this filesystem has
+/// neither to hand a node that arrives when its driver registers it.
 pub struct NodePerms {
     mode: Mutex<RefCell<u32>>,
     owner: Mutex<RefCell<(u32, u32)>>,
+    atime: Mutex<Cell<u64>>,
+    mtime: Mutex<Cell<u64>>,
 }
 
 impl NodePerms {
-    /// The node's mode at birth, and its owner. Numbers are the low twelve
-    /// permission bits only; the kind bits belong to [`Metadata::kind`].
+    /// The node's mode at birth, and its owner - and no clocks, because a node
+    /// has no time of its own to report until a caller sets one (see the
+    /// struct). Numbers are the low twelve permission bits only; the kind bits
+    /// belong to [`Metadata::kind`].
     pub const fn new(mode: u32, uid: u32, gid: u32) -> NodePerms {
         NodePerms {
             mode: Mutex::new(RefCell::new(mode)),
             owner: Mutex::new(RefCell::new((uid, gid))),
+            atime: Mutex::new(Cell::new(0)),
+            mtime: Mutex::new(Cell::new(0)),
         }
     }
 
-    /// The five answers an `Inode` forwards - see [`Inode::keeps_modes`].
+    /// The answers an `Inode` forwards - see [`Inode::keeps_modes`].
     /// `keeps` is true by construction: a node carrying one of these is a
     /// node that stores what it is told.
     pub fn keeps(&self) -> bool {
@@ -120,6 +140,30 @@ impl NodePerms {
     pub fn set_owner(&self, uid: u32, gid: u32) {
         critical_section::with(|cs| *self.owner.borrow(cs).borrow_mut() = (uid, gid));
     }
+
+    pub fn atime(&self) -> u64 {
+        critical_section::with(|cs| self.atime.borrow(cs).get())
+    }
+
+    pub fn mtime(&self) -> u64 {
+        critical_section::with(|cs| self.mtime.borrow(cs).get())
+    }
+
+    /// `utimensat`: keep both clocks the caller gave.
+    ///
+    /// Both, rather than the mtime alone: the two words are independent - `touch
+    /// -a` sends an atime with `UTIME_OMIT` in the other slot, and the syscall
+    /// layer resolves each sentinel against the value *this* node reports - so a
+    /// node that folded them into one would hand back the other's number. The
+    /// change time is left to the trait's default, which reports the mtime: a
+    /// device node's `ctime` is not a number any caller here reads, and inventing
+    /// one would be the approximation this file's rules refuse.
+    pub fn set_times(&self, atime: u64, mtime: u64) {
+        critical_section::with(|cs| {
+            self.atime.borrow(cs).set(atime);
+            self.mtime.borrow(cs).set(mtime);
+        });
+    }
 }
 
 /// One registered device, as an inode.
@@ -129,12 +173,13 @@ struct DevNode {
     /// The device number `st_rdev` reports - the identity libc's `ttyname`
     /// matches descriptors by when it walks `/dev`.
     dev_id: (u32, u32),
-    /// What `chmod(2)`/`chown(2)` on this node leave behind, and what the
-    /// permission checks read. Devices are born `0666 root:root` here - the
-    /// mode `stat` already reported for them before any of this existed, and
-    /// the number udev's rules then tighten or hand out by group. The named
-    /// gap in `NOTES.md` keeps Linux's *devtmpfs* birth (`0600` until udev);
-    /// what this commit ends is the silence, not that difference.
+    /// What `chmod(2)`/`chown(2)`/`utimensat(2)` on this node leave behind, and
+    /// what the permission checks and `stat` read. Devices are born
+    /// `0666 root:root` here - the mode `stat` already reported for them before
+    /// any of this existed, and the number udev's rules then tighten or hand out
+    /// by group. The named gap in `NOTES.md` keeps Linux's *devtmpfs* birth
+    /// (`0600` until udev); what this commit ends is the silence, not that
+    /// difference.
     perms: NodePerms,
 }
 
@@ -161,6 +206,19 @@ impl Inode for DevNode {
 
     fn set_owner(&self, uid: u32, gid: u32) {
         self.perms.set_owner(uid, gid);
+    }
+
+    fn atime(&self) -> u64 {
+        self.perms.atime()
+    }
+
+    fn mtime(&self) -> u64 {
+        self.perms.mtime()
+    }
+
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        self.perms.set_times(atime, mtime);
+        Ok(())
     }
 
     fn as_chardev(&self) -> Option<&dyn CharDevice> {
@@ -209,11 +267,60 @@ struct DevBlockNode {
     /// say which storage it came from - which is exactly the link `lsblk` and
     /// `df` follow to put a partition and its mount point on one line.
     dev_id: (u32, u32),
+    /// The mode, owner and clocks this node keeps, like every other device
+    /// node's - see [`NodePerms`]. It arrived last of the four device kinds,
+    /// and the trace that found it is the measurement: a boot's only
+    /// `utimensat` refusal named `BlockDev` with `rdev 254:1`, which is
+    /// `/dev/vda1` - udev's node path sets the timestamps of the disks it
+    /// finds, and a block node that answered `EOPNOTSUPP` there was the one
+    /// node kind the devtmpfs half of this file had left out.
+    ///
+    /// The mode it is born with is the number `stat` already reported for a
+    /// block node before this field existed - `abi::mode_of`'s fallback for
+    /// the kind, `0660` (`brw-rw----`, Linux's own devtmpfs birth for one) -
+    /// so nothing a caller reads moves; what changes is that `chmod` and
+    /// `chown` on `/dev/vda2` now stick, which is the same claim the character
+    /// nodes' modes make and the half udev's `GROUP=disk` rules are written
+    /// against.
+    perms: NodePerms,
 }
 
 impl Inode for DevBlockNode {
     fn rdev(&self) -> Option<(u32, u32)> {
         Some(self.dev_id)
+    }
+
+    fn keeps_modes(&self) -> bool {
+        self.perms.keeps()
+    }
+
+    fn mode(&self) -> u32 {
+        self.perms.mode()
+    }
+
+    fn set_mode(&self, mode: u32) {
+        self.perms.set_mode(mode);
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        self.perms.owner()
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        self.perms.set_owner(uid, gid);
+    }
+
+    fn atime(&self) -> u64 {
+        self.perms.atime()
+    }
+
+    fn mtime(&self) -> u64 {
+        self.perms.mtime()
+    }
+
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        self.perms.set_times(atime, mtime);
+        Ok(())
     }
 
     fn metadata(&self) -> Metadata {
@@ -687,7 +794,12 @@ impl DevFs {
             .find(name)
             .map(|(major, minor, _whole)| (major, minor))
             .unwrap_or((0, 0));
-        let node: Arc<dyn Inode> = Arc::new(DevBlockNode { ino, dev, dev_id });
+        let node: Arc<dyn Inode> = Arc::new(DevBlockNode {
+            ino,
+            dev,
+            dev_id,
+            perms: NodePerms::new(0o660, 0, 0),
+        });
         critical_section::with(|cs| {
             let prev = self
                 .root
@@ -769,7 +881,7 @@ mod tests {
     use critical_section::Mutex;
 
     use super::{CharDevice, DevFs};
-    use crate::vfs::{File, FileSystem, NodeKind, VfsError, VfsResult};
+    use crate::vfs::{File, FileSystem, Inode, NodeKind, VfsError, VfsResult};
 
     /// Emits its bytes once, then end of input.
     struct Source {
@@ -815,6 +927,23 @@ mod tests {
         Arc::new(Sink {
             got: Mutex::new(core::cell::RefCell::new(Vec::new())),
         })
+    }
+
+    /// A block device with no storage behind it. What a block *node* is asked
+    /// here is about its attributes, and a claim about them has no reason to
+    /// move sectors.
+    struct BlankDisk;
+
+    impl crate::blk::BlockDev for BlankDisk {
+        fn capacity_sectors(&self) -> u64 {
+            8
+        }
+
+        fn read_at(&self, _offset: u64, buf: &mut [u8]) {
+            buf.fill(0);
+        }
+
+        fn write_at(&self, _offset: u64, _buf: &[u8]) {}
     }
 
     #[test]
@@ -947,6 +1076,53 @@ mod tests {
         fs.root().unlink("log").unwrap();
         assert_eq!(fs.root().lookup("log").err(), Some(VfsError::NoEntry));
         assert!(fs.root().create("log", NodeKind::Socket).is_ok());
+    }
+
+    /// The clocks claim, made of whichever device node the caller hands in:
+    /// the node takes a stamp, `stat`'s reader reads both words back, and the
+    /// two words move independently.
+    fn keeps_the_clocks(node: &Arc<dyn Inode>, what: &str) {
+        assert_eq!(
+            (node.atime(), node.mtime()),
+            (0, 0),
+            "a {what} node nobody has stamped reports the trait's zero, not a made-up time"
+        );
+
+        node.set_times(111, 222).expect("utimensat");
+        assert_eq!(node.atime(), 111, "a {what} node's st_atime took the value");
+        assert_eq!(node.mtime(), 222, "a {what} node's st_mtime took the value");
+        assert_eq!(
+            node.ctime(),
+            222,
+            "and its ctime follows the mtime, the trait's default for one clock"
+        );
+
+        // The two words are independent - `touch -a` sends an atime with
+        // `UTIME_OMIT` in the other slot, and the syscall resolves each
+        // sentinel against what the node reports - so a node that folded them
+        // into one would hand back the other's number here.
+        node.set_times(333, 222).expect("utimensat, mtime omitted");
+        assert_eq!((node.atime(), node.mtime()), (333, 222));
+    }
+
+    #[test]
+    fn device_nodes_keep_the_clocks_they_are_given() {
+        // udev's node path sets the timestamps of every device node it manages.
+        // This filesystem answered the trait's default `EOPNOTSUPP` instead -
+        // one line of a boot's log, and a caller sent down a path Linux never
+        // sends it down (`docs/UAPI.md` §5.2). The mode next door was already
+        // kept, which is how the two halves came to disagree.
+        let _bus = crate::uevent::test_bus::take();
+        let fs = DevFs::new();
+        fs.register("sink", sink());
+        fs.register_block("vda1", Arc::new(BlankDisk));
+
+        // The node the filesystem makes around a driver, and the block node
+        // beside it. The second is the kind this file left out until a boot
+        // said so: its one refusal named `BlockDev` with `rdev 254:1`, which is
+        // `/dev/vda1`.
+        keeps_the_clocks(&fs.root().lookup("sink").unwrap(), "character");
+        keeps_the_clocks(&fs.root().lookup("vda1").unwrap(), "block");
     }
 
     #[test]

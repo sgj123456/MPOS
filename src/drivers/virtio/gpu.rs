@@ -33,18 +33,15 @@ use crate::mm::{self, PAGE_SIZE};
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsResult};
 
 use virtio_drivers::transport::Transport;
-#[cfg(target_arch = "x86_64")]
 use virtio_drivers::transport::pci::PciTransport;
 
 use super::gpu_ctrl::Gpu;
-#[cfg(target_arch = "x86_64")]
 use super::hal::transport;
 
 /// The modern device ID; virtio-gpu never had a legacy form. It names the PCI
 /// vendor's ID range, so it is the first machine's: the second finds the same
 /// device by the `virtio,mmio` window its device tree names, whose `DeviceID` is
 /// `16` (`VIRTIO_ID_GPU`).
-#[cfg(target_arch = "x86_64")]
 const DEVICE_GPU: &[u16] = &[0x1050];
 
 /// The resolution a headless machine gets: the one every framebuffer
@@ -340,9 +337,16 @@ static GLOBAL: Mutex<RefCell<Option<Arc<VirtioGpuDev>>>> = Mutex::new(RefCell::n
 /// function to declare, so it has no `/sys/class/drm` card - a named gap, and
 /// not a claim about the card: the device is the same one over its own
 /// transport (`NOTES.md` §13.26).
-#[cfg(target_arch = "x86_64")]
 pub fn init_global() -> Option<(Arc<VirtioGpuDev>, Gpu<PciTransport>)> {
+    // The device's own configuration window, where the display's *events* arrive
+    // (`VIRTIO_GPU_EVENT_DISPLAY`, a resize). It is the window the MSI-X table
+    // shares, so a machine with no MSI controller has nothing to poll there and
+    // the card comes up without one - the honest `None`, and the same value the
+    // event poll treats as "no configuration space" (`mpos_msi`).
+    #[cfg(mpos_msi)]
     let config = super::hal::device_config(DEVICE_GPU);
+    #[cfg(not(mpos_msi))]
+    let config = None;
     let device = Gpu::new(transport(DEVICE_GPU)?).ok()?;
     super::hal::claim_drm_card(DEVICE_GPU);
     VirtioGpuDev::install(device, config)
@@ -419,6 +423,19 @@ impl Inode for FbDev {
 
     fn set_owner(&self, uid: u32, gid: u32) {
         self.1.set_owner(uid, gid);
+    }
+
+    fn atime(&self) -> u64 {
+        self.1.atime()
+    }
+
+    fn mtime(&self) -> u64 {
+        self.1.mtime()
+    }
+
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        self.1.set_times(atime, mtime);
+        Ok(())
     }
 
     fn metadata(&self) -> Metadata {

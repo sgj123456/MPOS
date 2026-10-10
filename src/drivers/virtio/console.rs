@@ -31,7 +31,6 @@ use virtio_drivers::transport::Transport;
 
 use super::ConsolePort;
 use super::hal::HalImpl;
-#[cfg(target_arch = "x86_64")]
 use super::hal::transport;
 
 /// The transitional device ID; a modern-only device answers 0x1043 instead.
@@ -39,7 +38,6 @@ use super::hal::transport;
 /// port on it - one PCI function, which is what this probes for. A device that
 /// arrives over an MMIO window is found by its own `DeviceID` (`3`) instead,
 /// which is the machine layer's read, not this module's.
-#[cfg(target_arch = "x86_64")]
 const DEVICE_CONSOLE: &[u16] = &[0x1003, 0x1043];
 
 /// A virtio console port over the transport it arrived on.
@@ -144,7 +142,6 @@ pub fn global() -> Option<Arc<dyn ConsolePort>> {
 ///
 /// The first machine's door into [`install`]; a machine that reaches the same
 /// device over an MMIO window opens it there and installs it the same way.
-#[cfg(target_arch = "x86_64")]
 pub fn init_global() -> Option<Arc<dyn ConsolePort>> {
     let device = VirtIOConsole::<HalImpl, _>::new(transport(DEVICE_CONSOLE)?).ok()?;
     Some(install(Arc::new(VirtioHvc::new(device))))

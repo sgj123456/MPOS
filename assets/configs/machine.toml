@@ -180,14 +180,6 @@ qemu.mode = "gui"
 # `xtask/src/qemu.rs::virt_machine_args`, next to the first machine's own
 # list, with the reason on each line.
 [aarch64]
-# 256 MiB, not the 2048 above: this machine boots a disk root and a shell, and
-# the figure was measured down rather than chosen (`NOTES.md` §9.1's device RAM
-# cost). `MEM=` still overrides both.
-qemu.memory = "256"
-# Serial only. This machine's `run --arch aarch64` has no window backend: the
-# session is the PL011, and the kernel's framebuffer console is painted on a
-# scanout nobody is looking at.
-qemu.display = "none"
 # Empty, and it has to be: the key would otherwise inherit the baseline's
 # `["-vga", "none"]`, an x86-only option that a `-machine virt` boot refuses
 # outright. An empty list is a value; an absent key is not one.

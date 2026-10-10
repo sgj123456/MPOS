@@ -212,14 +212,15 @@ pub mod mm;
 ///
 /// Ungated on both machines since §13.4's device seam landed and the second one
 /// got an adapter. `net` holds `Arc<dyn drivers::virtio::NetDevice>` and names no
-/// transport; the machine that owns the card opens it - `board/x86_64.rs` over the
-/// PCI bus, `board/aarch64.rs` over the MMIO window its `check_net` found and
-/// published - and hands it to `net::init`, so the stack above the seam is the
-/// same code on both and a machine with no card hands over nothing (the honest
-/// `ENETDOWN`, not a device that pretends to answer). The one reference still
-/// x86_64's is `collect_net_sockets`, the four `/proc/net` rows, gated with
-/// procfs's *own* condition: its only caller is procfs, which the second machine
-/// has not been given yet (`NOTES.md` §13's port-progress ledger).
+/// transport; the boot's device step opens whichever card the machine has -
+/// `drivers::virtio::probe`, PCI first and then the memory-mapped windows the
+/// record's device tree describes - publishes it in one slot
+/// (`drivers::virtio::net::install`), and the flow hands it to `net::init`, so the
+/// stack above the seam is the same code on both and a machine with no card hands
+/// over nothing (the honest `ENETDOWN`, not a device that pretends to answer). The
+/// one reference still x86_64's is `collect_net_sockets`, the four `/proc/net`
+/// rows, gated with procfs's *own* condition: its only caller is procfs, which the
+/// second machine has not been given yet (`NOTES.md` §13's port-progress ledger).
 #[cfg(target_os = "none")]
 pub mod net;
 /// The PCI devices the machine has, and the files `/sys` and `/proc` describe

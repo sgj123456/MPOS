@@ -30,7 +30,6 @@ use virtio_drivers::transport::Transport;
 
 use super::EntropySource;
 use super::hal::HalImpl;
-#[cfg(target_arch = "x86_64")]
 use super::hal::transport;
 use crate::vfs::VfsResult;
 use crate::vfs::devfs::{CharDevice, DevFs};
@@ -39,7 +38,6 @@ use crate::vfs::devfs::{CharDevice, DevFs};
 /// It names the PCI vendor's ID range, so it is read only by the first
 /// machine's probe; the second finds the same device by its device-tree
 /// `virtio,mmio` window (`super::mmio`).
-#[cfg(target_arch = "x86_64")]
 const DEVICE_RNG: &[u16] = &[0x1005, 0x1045];
 
 /// The entropy pipe over whatever transport the machine opened it on.
@@ -139,7 +137,6 @@ pub fn install_probed<T: Transport + Send + 'static>(
 }
 
 /// The first machine's door: probe the PCI bus for the device and bring it up.
-#[cfg(target_arch = "x86_64")]
 pub fn init_global() -> Option<Arc<dyn EntropySource>> {
     let opened = transport(DEVICE_RNG).and_then(|t| VirtIORng::<HalImpl, _>::new(t).ok());
     install_probed(opened)

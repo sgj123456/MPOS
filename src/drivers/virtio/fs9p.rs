@@ -36,7 +36,6 @@ use virtio_drivers::transport::Transport;
 
 use super::P9Device;
 use super::hal::HalImpl;
-#[cfg(target_arch = "x86_64")]
 use super::hal::transport_all;
 
 /// The transitional device ID; a modern-only device answers 0x1049 instead.
@@ -45,7 +44,6 @@ use super::hal::transport_all;
 /// block device this kernel already probes. The MMIO side finds its window by
 /// this device's own `DeviceID` (`9`) instead, which is the machine layer's
 /// read, not this module's.
-#[cfg(target_arch = "x86_64")]
 const DEVICE_9P: &[u16] = &[0x1009, 0x1049];
 
 /// A virtio-9p device over the transport it arrived on - `PciTransport` on the
@@ -126,7 +124,6 @@ pub fn install(devices: Vec<Arc<dyn P9Device>>) -> Vec<Arc<dyn P9Device>> {
 /// is deliberately no device-level `init_global` returning one `Arc` the way the
 /// card-shaped drivers have: a share is a filesystem, and a machine may have
 /// several.
-#[cfg(target_arch = "x86_64")]
 pub fn init_global() -> Vec<Arc<dyn P9Device>> {
     let mut found: Vec<Arc<dyn P9Device>> = Vec::new();
     for transport in transport_all(DEVICE_9P) {

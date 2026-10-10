@@ -6,7 +6,7 @@
 //! not a TOML library. What it does have is sections, and they are load-bearing:
 //! `[default]` is the baseline both machines read, `[x86_64]` and `[aarch64]` are
 //! the machines' own halves, and a key carries the name of the thing it belongs
-//! to (`qemu.memory`, `system.hostname`, `rootfs.arch`). One file therefore
+//! to (`qemu.memory`, `system.hostname`, `rootfs.mirror`). One file therefore
 //! describes two machines without either machine's values being visible to the
 //! other ([`parse_sectioned_toml`]). `tests.toml` uses no sections and is read
 //! flat ([`parse_simple_toml`]).
@@ -140,7 +140,6 @@ impl RunMode {
 pub struct InitramfsConfig {
     pub mirror: String,
     pub branch: String,
-    pub arch: String,
     pub repos: Vec<String>,
     pub base_packages: Vec<String>,
     pub extra_packages: Vec<String>,
@@ -224,7 +223,6 @@ pub struct QemuConfig {
 pub struct RootfsConfig {
     pub mirror: String,
     pub branch: String,
-    pub arch: String,
     pub repos: Vec<String>,
     pub filesystem: String,
     pub root_device: String,
@@ -275,9 +273,6 @@ impl InitramfsConfig {
             branch: values
                 .remove("initramfs.branch")
                 .unwrap_or_else(|| "latest-stable".to_string()),
-            arch: values
-                .remove("initramfs.arch")
-                .unwrap_or_else(|| arch.name().to_string()),
             repos: take_list(&mut values, "initramfs.repos", &["main", "community"]),
             base_packages: parse_package_list(
                 values
@@ -602,9 +597,11 @@ impl RootfsConfig {
     /// The image's contents for `arch`: the `[default]` baseline with that
     /// machine's own section overlaid over it ([`parse_sectioned_toml`]).
     ///
-    /// `arch` picks which section is overlaid; it is not checked against the
-    /// `rootfs.arch` key, because that key is what *apk* is asked for and the
-    /// caller that boots the machine is the authority on which machine it is.
+    /// `arch` picks which section is overlaid *and* is the machine itself: the
+    /// package architecture `apk` is asked for is [`Arch::name`], read where the
+    /// install runs rather than written down a second time here. A `rootfs.arch`
+    /// key would be a second answer to a question `--arch` has already answered,
+    /// and the two could disagree without anything noticing.
     pub fn load(path: &Path, arch: Arch) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read the rootfs config from {}", path.display()))?;
@@ -623,9 +620,6 @@ impl RootfsConfig {
             branch: values
                 .remove("rootfs.branch")
                 .unwrap_or_else(|| "latest-stable".to_string()),
-            arch: values
-                .remove("rootfs.arch")
-                .unwrap_or_else(|| arch.name().to_string()),
             repos: take_list(&mut values, "rootfs.repos", &["main", "community"]),
             filesystem: values
                 .remove("rootfs.filesystem")
@@ -1039,6 +1033,33 @@ qemu.gpu = \"c\"
                 "the name lives with the image"
             );
         }
+
+        // The machine's own word is not a key in either image file. The package
+        // architecture `apk` is asked for is the `--arch` the build was given
+        // (`Arch::name()`), so a `rootfs.arch`/`initramfs.arch` spelling would be
+        // a second answer to a question the switch has already answered - and one
+        // that could disagree with the word the kernel and the loader were built
+        // for, without anything failing. A key nothing reads is dropped in
+        // silence, which is why its absence is pinned rather than assumed.
+        let initramfs = std::fs::read_to_string(root.join(crate::paths::INITRAMFS_CONFIG))
+            .expect("initramfs.toml is the early userspace half");
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for (what, keys) in [
+                ("rootfs.toml", parse_sectioned_toml(&image, arch).unwrap()),
+                (
+                    "initramfs.toml",
+                    parse_sectioned_toml(&initramfs, arch).unwrap(),
+                ),
+            ] {
+                for key in ["rootfs.arch", "initramfs.arch"] {
+                    assert!(
+                        !keys.contains_key(key),
+                        "{what} names {key}, which nothing reads: the package \
+                         architecture is the build's `--arch`"
+                    );
+                }
+            }
+        }
     }
 
     /// What the two machines actually read out of the shipped files.
@@ -1057,16 +1078,19 @@ qemu.gpu = \"c\"
         let arm_map = parse_sectioned_toml(&machine, Arch::Aarch64).unwrap();
 
         // Read from the map for the memory, because `QemuConfig` lets a one-off
-        // `MEM=` win over the file and this is a claim about the file.
+        // `MEM=` win over the file and this is a claim about the file. Both
+        // machines read the baseline's figure: the second machine's half stopped
+        // naming its own when its window and its device stack became the first's.
         assert_eq!(x86_map["qemu.memory"], "2048");
-        assert_eq!(arm_map["qemu.memory"], "256");
+        assert_eq!(arm_map["qemu.memory"], "2048");
         let x86_qemu = QemuConfig::from_values(&mut x86_map.clone(), "probe".into());
         let arm_qemu = QemuConfig::from_values(&mut arm_map.clone(), "probe".into());
-        // The first machine's window backend is the *absent* key, which is what
-        // makes `run` use `sdl`; the second's is `none`, and it is a value
-        // because that machine has no window at all.
+        // The window backend is the *absent* key on both, which is what makes
+        // `run` fall back to `sdl` for either machine. It used to be `none` for
+        // the second, and that value is what `--arch aarch64` used when the
+        // second machine had no window to show anything in.
         assert_eq!(x86_qemu.display, None);
-        assert_eq!(arm_qemu.display.as_deref(), Some("none"));
+        assert_eq!(arm_qemu.display, None);
         // `-vga none` is an x86-only option a `-machine virt` boot refuses, so
         // the second machine's half overrides the list with an empty one - which
         // is a value, while an absent key would inherit the baseline's.
@@ -1082,12 +1106,10 @@ qemu.gpu = \"c\"
             RootfsConfig::load(&root.join(crate::paths::ROOTFS_CONFIG), Arch::X86_64).unwrap();
         let arm =
             RootfsConfig::load(&root.join(crate::paths::ROOTFS_CONFIG), Arch::Aarch64).unwrap();
-        // The package architecture, the serial port and the root device are
-        // machine facts, and each half names its own.
-        assert_eq!(
-            (x86.arch.as_str(), arm.arch.as_str()),
-            ("x86_64", "aarch64")
-        );
+        // The serial port and the root device are machine facts, and each half
+        // names its own. The package architecture is one too, and it is the one
+        // a config key may not name: `apk` is asked for the build's `--arch`
+        // (`Arch::name()`), so a `rootfs.arch` key would be a second answer.
         assert_eq!(
             (x86.serial_port.as_str(), arm.serial_port.as_str()),
             ("ttyS0", "ttyAMA0")
@@ -1102,20 +1124,20 @@ qemu.gpu = \"c\"
             (x86.root_device.as_str(), arm.root_device.as_str()),
             ("/dev/vda2", "/dev/vda2")
         );
-        // The desktop's base packages are not the second machine's, and the
-        // second machine's extra list is not the desktop's.
-        assert!(x86.base_packages.iter().any(|p| p == "e2fsprogs"));
-        assert!(!arm.base_packages.iter().any(|p| p == "e2fsprogs"));
+        // One userland now: the second machine reads the baseline's package
+        // lists whole, so its lists are the first machine's, from the one place
+        // they are written. What stayed per-machine in `machine.toml` is
+        // `extra_args` above - a boot option a `-machine virt` refuses, not a
+        // package.
+        assert_eq!(x86.base_packages, arm.base_packages);
+        assert_eq!(x86.extra_packages, arm.extra_packages);
         assert!(x86.extra_packages.iter().any(|p| p == "weston"));
-        assert!(!arm.extra_packages.iter().any(|p| p == "weston"));
-        assert!(arm.extra_packages.iter().any(|p| p == "strace"));
-        // The account is the first machine's: the second logs in as root alone,
-        // which is what emptying `user.name` in its half means.
+        // The account is the baseline's too, and both machines get it. The
+        // second machine's install cannot chroot to run `adduser`, so it writes
+        // the account's files itself (`rootfs::create_account_without_chroot`);
+        // what this pins is that it is asked for at all.
         assert_eq!(x86.user.name, "mpos");
-        assert!(
-            arm.user.name.is_empty(),
-            "the second machine has no account beyond root"
-        );
+        assert_eq!(arm.user.name, "mpos");
         // What the two share is written once and read by both.
         assert_eq!(x86.hostname, arm.hostname);
         assert_eq!(x86.timezone, arm.timezone);
@@ -1127,10 +1149,6 @@ qemu.gpu = \"c\"
             .unwrap();
         let arm = InitramfsConfig::load(&root.join(crate::paths::INITRAMFS_CONFIG), Arch::Aarch64)
             .unwrap();
-        assert_eq!(
-            (x86.arch.as_str(), arm.arch.as_str()),
-            ("x86_64", "aarch64")
-        );
         assert_eq!(x86.mirror, arm.mirror);
         assert_eq!(x86.repos, arm.repos);
     }
@@ -1180,11 +1198,11 @@ qemu.gpu = \"c\"
                 "{shared} is named by the core list, not repeated in [aarch64]"
             );
         }
-        // The halves that stayed per-machine, with their reasons written in the
-        // file itself: e2fsprogs/dosfstools belong to the guest that makes
-        // filesystems; the second machine adds nothing to the core.
+        // The one base name that is not the core's: the filesystem tools a guest
+        // with disks needs to *make* them. Both machines read it from the
+        // baseline now, the second having stopped being the smaller tree.
         assert!(x86.base_packages.iter().any(|p| p == "e2fsprogs"));
-        assert!(!arm.base_packages.iter().any(|p| p == "e2fsprogs"));
+        assert!(arm.base_packages.iter().any(|p| p == "e2fsprogs"));
         // And openrc left the x86 extras when it entered the core - one name,
         // one place, both machines.
         assert!(!x86.extra_packages.iter().any(|p| p == "openrc"));

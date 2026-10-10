@@ -200,6 +200,12 @@ pub fn build_rootfs(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
     // any name either writes.
     enable_services(&mount_dir)?;
     write_modules(&mount_dir)?;
+    // The busybox applet farm, re-asserted on every build for the same reason
+    // the runlevels are: it is the build's answer to a post-install script a
+    // cross-architecture `apk` could not run, and a name that only appears on a
+    // reinstall is one that rots. It runs *before* the overlay, so a file either
+    // tree carries stays the authoritative last word over a name it holds.
+    lay_applet_farm(&root, &mount_dir)?;
     // The overlay pair, applied last: `rootfs-core/` is the half both machines
     // share and the machine's own tree wins over it, so `rootfs/` stays the
     // authoritative last word on any name either writes.
@@ -302,8 +308,8 @@ fn write_fstab(mount_dir: &Path, config: &RootfsConfig, root_uuid: &str) -> Resu
     Ok(())
 }
 
-/// The machine's own configuration: the shared half (below), plus the two
-/// steps that need the image's own userland to be *runnable*.
+/// The machine's own configuration: the shared half (below), plus the account
+/// the image logs in as.
 ///
 /// This runs on both build paths - the full install and the boot-files update -
 /// because none of it needs `apk`, all of it is cheap, and a change to the
@@ -314,36 +320,192 @@ fn write_fstab(mount_dir: &Path, config: &RootfsConfig, root_uuid: &str) -> Resu
 fn write_system_config(mount_dir: &Path, config: &RootfsConfig, arch: Arch) -> Result<()> {
     write_shared_config(mount_dir, config)?;
 
-    // Hashing a password is `crypt(3)`, and creating an account is busybox's
-    // `adduser` - both run in the chroot, so both need an image this host can
-    // *exec*. That is the first machine's answer only: a tree installed for the
-    // other architecture cannot be chrooted into from this host, which is the
-    // same boundary `Arch::host_runs_guest_userland` draws for the package
-    // install. Everything above is pure file I/O and therefore shared;
-    // everything here is not - and a machine whose `user.name`/`root_password`
-    // are set would be asking for something this build cannot do, which is worth
-    // refusing here rather than meeting as an `Exec format error` from chroot.
-    if !arch.host_runs_guest_userland() {
-        if !config.root_password.is_empty() || !config.user.name.is_empty() {
-            anyhow::bail!(
-                "rootfs: {} asks for an account password, which is set by running the \
-                 image's own chpasswd - and this host cannot run {} binaries. Leave the \
-                 password empty (the console is a serial line with no keyboard) or build \
-                 on that machine",
-                arch.name(),
-                arch.name()
-            );
+    // Hashing a password is `crypt(3)` and running the image's own `adduser` is
+    // how its account is made; both are the image's *userland*, so both need a
+    // tree this host can exec. That is `Arch::host_runs_guest_userland`, the same
+    // boundary `install_base` draws with `--no-scripts` - and the account is what
+    // the two sides of it answer differently.
+    if arch.host_runs_guest_userland() {
+        // The first machine: `install_base` has already run the image's
+        // `adduser`, so the account exists and only its password is written here
+        // - on every build path, which is what makes changing it cheap.
+        if !config.root_password.is_empty() {
+            set_password(mount_dir, "root", &config.root_password)?;
+        }
+        if !config.user.name.is_empty() {
+            set_password(mount_dir, &config.user.name, &config.user.password)?;
         }
         return Ok(());
     }
 
-    if !config.root_password.is_empty() {
-        set_password(mount_dir, "root", &config.root_password)?;
-    }
+    // The second machine: this host cannot enter the tree, so the account is
+    // written here instead, in the only form a cross-architecture build can
+    // manage - the files `adduser` would have written, by pure file I/O. What is
+    // still out of reach is a *password*, because hashing one is the image's own
+    // `crypt(3)`: that is refused by name rather than written in a shape the
+    // guest cannot check.
+    refuse_password(arch, "system.root_password", "root", &config.root_password)?;
     if !config.user.name.is_empty() {
-        set_password(mount_dir, &config.user.name, &config.user.password)?;
+        refuse_password(
+            arch,
+            "user.password",
+            &config.user.name,
+            &config.user.password,
+        )?;
     }
+    // The packages' own system accounts come first: the configured account joins
+    // some of the groups they make, and the other order would create such a group
+    // itself at a *regular* id (measured: `seat` at 1001 on the image built
+    // before this, against 103 on the machine whose package scripts ran).
+    create_system_accounts(mount_dir)?;
+    create_account_without_chroot(mount_dir, &config.user)
+}
+
+/// The first id a *system* account or group gets: where Alpine's `adduser -S`
+/// and `addgroup -S` begin their search.
+const FIRST_SYSTEM_ID: u32 = 100;
+
+/// The groups a cross-architecture install has to make itself, in the order the
+/// packages' own post-install scripts make them - which is what decides their
+/// ids - each beside the package whose script names it.
+///
+/// Read out of the image's own script store, not guessed: every one of these is
+/// an `addgroup -S <name>` line in `/lib/apk/db/scripts.tar.gz` of the tree this
+/// install builds (`busybox`'s, `dbus`'s, `seatd`'s and `weston`'s post-install
+/// scripts), and the two shipped images' `/etc/group` files differ by exactly
+/// these four names plus the ids they push:
+///
+///   x86_64  (scripts run):   klogd:101  messagebus:102  seat:103  weston-launch:104
+///   aarch64 (`--no-scripts`): *none of the four*
+///
+/// `seat` is the one that shows what not making them costs: the configured
+/// account joins it, so [`create_account_without_chroot`] used to *create* it -
+/// at the first free id for a regular group, 1001 - and the two machines'
+/// group files then disagreed about the group the seat manager hands its socket
+/// to. A group-only name is made here so that membership finds it.
+const SYSTEM_GROUPS: [(&str, &str); 4] = [
+    ("klogd", "busybox"),
+    ("messagebus", "dbus"),
+    ("seat", "seatd"),
+    ("weston-launch", "weston"),
+];
+
+/// The system *users* of the same list: `(name, primary group, package)`.
+///
+/// Both scripts spell the same call - `adduser -S -D -H -h /dev/null -s
+/// /sbin/nologin -G <group> -g <name> <name>` - and `-D` is why the shadow line
+/// this writes is *locked* rather than passwordless: measured against the image
+/// whose scripts ran, whose lines are
+/// `klogd:!:20736:0:99999:7:::` and `messagebus:!:20736:0:99999:7:::`.
+const SYSTEM_USERS: [(&str, &str, &str); 2] = [
+    ("klogd", "klogd", "busybox"),
+    ("messagebus", "messagebus", "dbus"),
+];
+
+/// Makes the system accounts a cross-architecture install cannot let the
+/// packages' own scripts make.
+///
+/// The same boundary [`create_account_without_chroot`] works on, one step
+/// earlier: `apk --no-scripts` skips every post-install script, and a script
+/// that creates an account is not something the machine's own `/init` can finish
+/// later without being told to. What that costs is visible on the machine:
+/// `dbus` refuses to start (`checkpath: owner 'root:messagebus' not found`, then
+/// `ERROR: dbus failed to start`) and `syslogd` runs as root instead of dropping
+/// to `klogd`. Both are the *result* of those scripts, which is what the two
+/// shipped images' own files measured:
+///
+///   x86_64:  klogd:x:100:101:klogd:/dev/null:/sbin/nologin
+///            messagebus:x:101:102:messagebus:/dev/null:/sbin/nologin
+///   aarch64: neither account at all
+///
+/// So this writes those two lines, their groups, and the two group-only names,
+/// with Alpine's own rule for the ids - the first free one at or above
+/// [`FIRST_SYSTEM_ID`] - in the order the scripts run, which is what reproduces
+/// the other image's 100/101 users and 101/102/103/104 groups. Idempotent for
+/// the same reason the account is: a name that is already there is left exactly
+/// as it is, and a group that exists keeps whatever id it has.
+fn create_system_accounts(mount_dir: &Path) -> Result<()> {
+    let passwd_path = mount_dir.join("etc/passwd");
+    let group_path = mount_dir.join("etc/group");
+    let shadow_path = mount_dir.join("etc/shadow");
+
+    let mut passwd = fs::read_to_string(&passwd_path)
+        .with_context(|| format!("Failed to read {}", passwd_path.display()))?;
+    let mut groups = fs::read_to_string(&group_path)
+        .with_context(|| format!("Failed to read {}", group_path.display()))?;
+    let mut shadow = fs::read_to_string(&shadow_path)
+        .with_context(|| format!("Failed to read {}", shadow_path.display()))?;
+
+    let mut made: Vec<String> = Vec::new();
+    for (name, package) in SYSTEM_GROUPS {
+        if !has_name(&groups, name) {
+            ensure_group(&mut groups, name, None, FIRST_SYSTEM_ID);
+            made.push(format!("group {name} ({package})"));
+        }
+    }
+    // `adduser -S` counts in the *user* sequence, which is its own: `klogd` is
+    // user 100 while its group is 101, and `messagebus` is user 101 while its
+    // group is 102.
+    for (name, group, package) in SYSTEM_USERS {
+        if has_name(&passwd, name) {
+            continue;
+        }
+        let gid = ensure_group(&mut groups, group, None, FIRST_SYSTEM_ID);
+        let uid = next_free_id(&passwd, FIRST_SYSTEM_ID);
+        append_line(
+            &mut passwd,
+            &format!("{name}:x:{uid}:{gid}:{name}:/dev/null:/sbin/nologin"),
+        );
+        remove_line(&mut shadow, name);
+        append_line(
+            &mut shadow,
+            &format!("{name}:!:{today}:0:99999:7:::", today = days_since_epoch()),
+        );
+        made.push(format!("user {name} ({package})"));
+    }
+
+    if made.is_empty() {
+        return Ok(());
+    }
+    for (path, text) in [
+        (&passwd_path, &passwd),
+        (&group_path, &groups),
+        (&shadow_path, &shadow),
+    ] {
+        fs::write(path, text).with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+    println!("rootfs: created the system accounts {}", made.join(", "));
     Ok(())
+}
+
+/// Today, as `/etc/shadow` counts it: whole days since the epoch. `adduser`
+/// writes this same field, and the other image's lines carry the day its own
+/// install ran, so a build stamping its own day here is the faithful answer
+/// rather than a zero a shadow tool would read as a password past its time.
+fn days_since_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() / 86_400)
+        .unwrap_or(0)
+}
+
+/// Refuses a password where the host cannot run the image's own `chpasswd`.
+///
+/// The account beside it *is* made without a chroot (see
+/// [`create_account_without_chroot`]); a password is the one part that is not,
+/// because hashing one is `crypt(3)` and the image's libc owns that function.
+/// It is refused by the key that asked for it, so the message names where to
+/// look rather than only what failed.
+fn refuse_password(arch: Arch, key: &str, account: &str, password: &str) -> Result<()> {
+    if password.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "rootfs: {key} sets a password for `{account}`, which is hashed by running the \
+         image's own `chpasswd` - and this host cannot run {} binaries. Leave it empty \
+         (the console is a serial line with no keyboard) or build on that machine",
+        arch.name()
+    )
 }
 
 /// The half of the machine's configuration that is pure file I/O, and so the
@@ -354,7 +516,11 @@ fn write_system_config(mount_dir: &Path, config: &RootfsConfig, arch: Arch) -> R
 /// clock, its locale, the network hook directories, and the two cleanups the
 /// generated files need. A cross-arch install cannot chroot the target's
 /// userland, so what this writes with `fs::write` alone is exactly the boundary
-/// between the one shared layer and the x86-only executable half above.
+/// between the one shared layer and the half above that needs the image's own
+/// programs. That half is a *password* now and no longer the account: the
+/// account itself is text, so it is written on this side too
+/// ([`create_account_without_chroot`]), and an account whose password is empty -
+/// the shipped config's, on both machines - needs nothing executed at all.
 pub(crate) fn write_shared_config(mount_dir: &Path, config: &RootfsConfig) -> Result<()> {
     // The name the prompt, `hostname` and the DHCP client report. Written
     // rather than left to alpine-baselayout's `localhost`, so that
@@ -498,6 +664,57 @@ pub(crate) fn merge_overlays(root: &Path, machine_tree: &str, mount_dir: &Path) 
     Ok(())
 }
 
+/// Lay the busybox applet farm a package's own post-install would have made.
+///
+/// `busybox --install -s` is the honest way to make it, and it has to run as
+/// *the tree's* busybox - which is the target's binary, and the host cannot exec
+/// it. So the names are data ([`crate::paths::BUSYBOX_APPLETS`], from
+/// `busybox --list-full` on the same Alpine packages) and this links them,
+/// which is the same shape as `SYSTEM_USERS`: what a package's script would have
+/// written, written by the build instead. Without it a cross-architecture
+/// install has no `/sbin/init` at all - the package ships the applet, not the
+/// name - and the disk's pid-1 chain does not exist until somebody boots it.
+///
+/// Used by an image install *and* by a sweep's medium (`disk::sweep_medium`), so
+/// a test disk answers the same names a product one does.
+pub(crate) fn lay_applet_farm(root: &Path, mount_dir: &Path) -> Result<()> {
+    let path = root.join(crate::paths::BUSYBOX_APPLETS);
+    let list =
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let paths: Vec<&str> = list
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    link_applet_paths(mount_dir, &paths)
+}
+
+/// Link `/bin/busybox` at each relative `path` under `dest`, skipping the ones
+/// that already answer.
+///
+/// Absolute targets, because the guest resolves a symlink relative to the tree
+/// it stands in and `busybox` sits at `/bin/busybox`. A path that already
+/// answers is left *alone* rather than replaced: `sbin/ifup` is ifupdown's and
+/// `sbin/mkfs.vfat` is dosfstools', and a link into busybox over either would
+/// lose the program a boot script reads. That rule is also what makes a second
+/// build a no-op, and it is the same one the archive's small farm uses
+/// (`initramfs::link_applets`), so both farms answer "what is already here?"
+/// the same way.
+pub(crate) fn link_applet_paths(dest: &Path, paths: &[&str]) -> Result<()> {
+    for path in paths {
+        let target = dest.join(path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if target.symlink_metadata().is_ok() {
+            continue;
+        }
+        std::os::unix::fs::symlink("/bin/busybox", &target)
+            .with_context(|| format!("Failed to link /bin/busybox at {}", target.display()))?;
+    }
+    Ok(())
+}
+
 /// Sets or clears one account's password.
 ///
 /// Empty means "nothing to type": the shadow field is emptied, which is what
@@ -632,6 +849,230 @@ fn addgroup_in_image(mount_dir: &Path, args: &[&str]) {
         }
         Err(e) => eprintln!("addgroup {:?} could not run: {}", args, e),
     }
+}
+
+/// Creates the account the config names on a machine whose userland this host
+/// cannot execute.
+///
+/// [`create_user`] is the first machine's answer, and it is the better one: it
+/// runs the image's own `adduser`, so the busybox that will *read*
+/// `/etc/passwd`, `/etc/group` and `/etc/shadow` is the one that writes them. A
+/// cross-architecture build has no such door - a chroot into the tree is `Exec
+/// format error` (measured), the same boundary that makes `install_base` pass
+/// `--no-scripts` - so this writes the three entries `adduser` would have
+/// written, and nothing here is executed.
+///
+/// The shape is small and the files are text: a `passwd` line naming the primary
+/// group `adduser` makes for the account, the same group made in `/etc/group`,
+/// one membership per configured group, and a `shadow` line whose password field
+/// is empty. Groups the config names are *made* when they are missing, which is
+/// not a convenience but a consequence of the same boundary: a package that makes
+/// a system group does it in its post-install script, and a cross-arch install
+/// runs none (`seatd`'s `seat` is the live example), so the account's own groups
+/// are the one place the build can be sure they exist.
+///
+/// It runs on *every* build path rather than only on a full install, and it is
+/// idempotent: an account that is already there is left exactly as it is, so a
+/// rebuild - or a config edit that lands on the boot-files path - neither
+/// duplicates the entries nor renumbers the account. (That is also why it is the
+/// one step here that may not assume an empty tree.)
+///
+/// What it deliberately does not do, beside what `adduser` does: copy `/etc/skel`
+/// into the home. Nothing in either image's boot reads a dotfile from there, and
+/// an empty home is the honest half of a step this build cannot run.
+fn create_account_without_chroot(mount_dir: &Path, user: &UserConfig) -> Result<()> {
+    if user.name.is_empty() {
+        return Ok(());
+    }
+
+    let passwd_path = mount_dir.join("etc/passwd");
+    let group_path = mount_dir.join("etc/group");
+    let shadow_path = mount_dir.join("etc/shadow");
+
+    let mut passwd = fs::read_to_string(&passwd_path)
+        .with_context(|| format!("Failed to read {}", passwd_path.display()))?;
+    // The account is the `passwd` entry; a tree that already has it (a rebuild)
+    // is left alone here, and `write_shared_config` above has re-cleared its
+    // shadow field on the way past.
+    if passwd
+        .lines()
+        .any(|line| line_name(line) == Some(user.name.as_str()))
+    {
+        return Ok(());
+    }
+    let mut groups = fs::read_to_string(&group_path)
+        .with_context(|| format!("Failed to read {}", group_path.display()))?;
+    let mut shadow = fs::read_to_string(&shadow_path)
+        .with_context(|| format!("Failed to read {}", shadow_path.display()))?;
+
+    // The primary group, named after the account, then one membership per
+    // configured group. `user.groups` carries the primary group's own name in
+    // the shipped config, so joining it adds a membership there too - which is
+    // what the first machine's `addgroup mpos mpos` leaves behind, and the two
+    // images' files are better off saying the same thing.
+    let gid = ensure_group(&mut groups, &user.name, None, FIRST_REGULAR_ID);
+    let uid = next_free_id(&passwd, FIRST_REGULAR_ID);
+    for name in &user.groups {
+        // A group the *system accounts* already made keeps its own id, which is
+        // what makes the compositor's `seat` the same group on both machines.
+        ensure_group(&mut groups, name, Some(&user.name), FIRST_REGULAR_ID);
+    }
+
+    append_line(
+        &mut passwd,
+        &format!(
+            "{}:x:{}:{}:Linux User,,,:/home/{}:{}",
+            user.name, uid, gid, user.name, user.shell
+        ),
+    );
+    // An empty password field is the whole of what makes a login passwordless;
+    // the aging fields are the ones an Alpine account gets (min 0, max 99999,
+    // warn 7). Any stub line already carrying the name is dropped first, so the
+    // file cannot end up with two entries for one account - `write_shared_config`
+    // clears a field *by name* and would address the first of them.
+    remove_line(&mut shadow, &user.name);
+    append_line(&mut shadow, &format!("{}::0:0:99999:7:::", user.name));
+
+    for (path, text) in [
+        (&passwd_path, &passwd),
+        (&group_path, &groups),
+        (&shadow_path, &shadow),
+    ] {
+        fs::write(path, text).with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+
+    // A home the account can actually use. The build runs as root - the mount
+    // needs it - so the directory can be owned by the new account; a host test
+    // cannot own a foreign id, and what it pins is the account's numbers and the
+    // file shape rather than the owner.
+    let home = mount_dir.join("home").join(&user.name);
+    fs::create_dir_all(&home).with_context(|| format!("Failed to create {}", home.display()))?;
+    utils::set_mode(&home, 0o755)?;
+    if utils::is_root() {
+        std::os::unix::fs::chown(&home, Some(uid), Some(gid))
+            .with_context(|| format!("Failed to own {}", home.display()))?;
+    }
+
+    println!(
+        "rootfs: created the account {} ({}) without a chroot",
+        user.name,
+        if user.groups.is_empty() {
+            "no extra groups".to_string()
+        } else {
+            user.groups.join(", ")
+        }
+    );
+    Ok(())
+}
+
+/// The first id a regular account or group gets. Alpine's own `adduser` and
+/// `addgroup` begin their search here, so an account made without a chroot lands
+/// where one made with it would.
+const FIRST_REGULAR_ID: u32 = 1000;
+
+/// The name at the head of a `passwd`/`group`/`shadow` line, or `None` for a
+/// line that has none (a blank one, or a comment).
+fn line_name(line: &str) -> Option<&str> {
+    let name = line.split(':').next()?.trim();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The smallest identifier at or above `floor` that no line of `text` already
+/// uses. Both files this is asked about keep it in field 2 - `passwd`'s uid and
+/// `group`'s gid - so one function answers for both.
+fn next_free_id(text: &str, floor: u32) -> u32 {
+    let used: std::collections::HashSet<u32> = text
+        .lines()
+        .filter_map(|line| line.split(':').nth(2))
+        .filter_map(|field| field.trim().parse().ok())
+        .collect();
+    let mut id = floor;
+    while used.contains(&id) {
+        id += 1;
+    }
+    id
+}
+
+/// The gid `name` has in a `group` file's text, making the group at a free id
+/// when the text does not carry it. Answers the id either way, which is what
+/// lets the `passwd` line name it as the account's primary group.
+///
+/// `member` is a second, optional job in the same walk: the account is added to
+/// the group's comma list, whether the group was just made or was already there.
+/// The two belong together because `adduser` and `addgroup USER GROUP` are the
+/// two calls this stands in for, and both end in one line of one file.
+///
+/// `floor` is the caller's own rule for a *new* group, because the two callers
+/// have different ones and Alpine does too: `adduser` makes a regular group from
+/// [`FIRST_REGULAR_ID`] up, while the system groups a package's script makes with
+/// `addgroup -S` come from [`FIRST_SYSTEM_ID`] up.
+fn ensure_group(text: &mut String, name: &str, member: Option<&str>, floor: u32) -> u32 {
+    if let Some(line) = text.lines().find(|line| line_name(line) == Some(name)) {
+        let fields: Vec<&str> = line.split(':').collect();
+        let gid: u32 = fields
+            .get(2)
+            .and_then(|field| field.trim().parse().ok())
+            .unwrap_or(FIRST_REGULAR_ID);
+        if let Some(member) = member {
+            let members = fields.get(3).copied().unwrap_or("");
+            // `addgroup` treats "already a member" as success, and so does this:
+            // the group carrying the account is the end state either way.
+            if !members.split(',').any(|existing| existing == member) {
+                let joined = if members.is_empty() {
+                    member.to_string()
+                } else {
+                    format!("{members},{member}")
+                };
+                let replaced = format!("{name}:x:{gid}:{joined}");
+                let mut updated = text
+                    .lines()
+                    .map(|line| {
+                        if line_name(line) == Some(name) {
+                            replaced.clone()
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect::<Vec<String>>()
+                    .join("\n");
+                updated.push('\n');
+                *text = updated;
+            }
+        }
+        return gid;
+    }
+
+    let gid = next_free_id(text, floor);
+    append_line(text, &format!("{name}:x:{gid}:{}", member.unwrap_or("")));
+    gid
+}
+
+/// Whether a `passwd`/`group`/`shadow` file's text carries this name already.
+fn has_name(text: &str, name: &str) -> bool {
+    text.lines().any(|line| line_name(line) == Some(name))
+}
+
+/// Drops every line naming `name`.
+fn remove_line(text: &mut String, name: &str) {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| line_name(line) != Some(name))
+        .collect();
+    *text = if kept.is_empty() {
+        String::new()
+    } else {
+        kept.join("\n") + "\n"
+    };
+}
+
+/// Appends a line to a file's contents, keeping exactly one newline between it
+/// and what was there.
+fn append_line(text: &mut String, line: &str) {
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(line);
+    text.push('\n');
 }
 
 fn install_file(src: &Path, dst: &Path) -> Result<()> {
@@ -961,22 +1402,24 @@ fn install_base(
     // Two flags differ between the machines, and both are about what an install
     // can *run*:
     //
-    // * `--arch` is the package architecture, which is the machine's own word
-    //   (`rootfs.arch`, from that machine's own half of the configuration) - the
-    //   one difference no amount of shared code can wish away, because a mirror
-    //   serves each architecture's packages separately.
+    // * `--arch` is the package architecture, which is the machine's own word -
+    //   the one difference no amount of shared code can wish away, because a
+    //   mirror serves each architecture's packages separately. It comes from
+    //   the `Arch` the command was given and not from a config key, so the word
+    //   apk is asked for is the same word the kernel and loader were built for.
     // * `--no-scripts` where the host cannot exec the target's binaries. A
     //   package's post-install script is the *guest's* program, and a cross-arch
     //   `execve` is `Exec format error` (measured): apk would fail the install
     //   rather than skip it. What such a script would have done is done by the
-    //   machine's own `/init` at first boot instead - busybox's applet farm, for
-    //   one, which `rootfs-aarch64/init` builds on the machine that can run it.
+    //   build instead, in the machine's own name rather than at first boot -
+    //   busybox's applet farm, for one, which `lay_applet_farm` links from
+    //   `assets/configs/busybox-applets.txt`.
     let no_scripts: &[&str] = if arch.host_runs_guest_userland() {
         &[]
     } else {
         &["--no-scripts"]
     };
-    let mut base_flags = vec!["--arch", config.arch.as_str(), "--update-cache", "--initdb"];
+    let mut base_flags = vec!["--arch", arch.name(), "--update-cache", "--initdb"];
     base_flags.extend_from_slice(no_scripts);
 
     apk_add(&[&apk], mount_dir, &base_flags, &config.base_packages)
@@ -1001,17 +1444,6 @@ fn install_base(
             .context("Failed to install the additional packages")?;
     }
 
-    // The file this machine's kernel reads back off the root it just booted
-    // (`Arch::kernel_reads_root_probe`): its filesystem check mounts the
-    // partition and looks for exactly these bytes, so "the disk mounted and
-    // served a file" is a line on the wire rather than the absence of an error.
-    // Written last, so nothing above can hide it.
-    if arch.kernel_reads_root_probe() {
-        let probe = mount_dir.join(crate::disk::PROBE_FILE);
-        fs::write(&probe, crate::disk::PROBE_BYTES)
-            .with_context(|| format!("Failed to lay the probe file at {}", probe.display()))?;
-    }
-
     // After the packages, so a shell the config names is one that is installed
     // by the time the account points at it.
     if arch.host_runs_guest_userland() {
@@ -1029,9 +1461,9 @@ fn install_base(
 /// package both use is one name in one place, and the drift §13.12 recorded -
 /// `openrc` in the second machine's base but sitting in the first's extras -
 /// cannot come back. A cross-arch install runs no post-install scripts, so a
-/// package whose scripts do real work (busybox's applet farm) is covered by
-/// the disk `/init` re-making them at first boot (`rootfs-aarch64/init`), and
-/// nothing joins this list that needs more than that.
+/// package whose scripts do real work is covered by the build instead: the
+/// applet farm is `lay_applet_farm`'s, and nothing joins this list that needs
+/// more than that.
 pub(crate) const SHARED_BASE_PACKAGES: &[&str] = &["alpine-base", "openrc"];
 
 /// The services a fresh image boots with, in the runlevel each starts from.
@@ -1378,6 +1810,32 @@ mod tests {
         dir
     }
 
+    /// The same tree, with the two files a *cross-architecture* install also
+    /// reads: `staged_dir` above is the first machine's fixture, whose account
+    /// the image's own `adduser` would have made, so it has no `/etc/passwd` at
+    /// all. `create_account_without_chroot` writes it, so the test has to give
+    /// it one - as `alpine-baselayout` leaves it, system accounts and all.
+    fn staged_account_tree(name: &str) -> PathBuf {
+        let dir = staged_dir(name);
+        fs::write(
+            dir.join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/ash\nbin:x:1:1:bin:/bin:/sbin/nologin\ndaemon:x:2:2:daemon:/sbin:/sbin/nologin\nnobody:x:65534:65534:nobody:/:/sbin/nologin\n",
+        )
+        .unwrap();
+        // `users` at gid 100 is the base system's own, and it is load-bearing:
+        // it is what makes Alpine's `addgroup -S` put the first system group at
+        // **101** and not 100 - measured, the shipped x86_64 image has
+        // `users:100  klogd:101  messagebus:102  seat:103  weston-launch:104`,
+        // and this fixture has to carry the base file for the same reason the
+        // real tree does.
+        fs::write(
+            dir.join("etc/group"),
+            "root:x:0:root\nbin:x:1:\ndaemon:x:2:\nwheel:x:10:\nusers:x:100:\nnobody:x:65534:\n",
+        )
+        .unwrap();
+        dir
+    }
+
     /// The configuration a test asks for, read back through the real loader -
     /// the keys and the defaults are then the ones the build gets, not a
     /// hand-built struct that can drift from them. `name` keys the file as
@@ -1422,6 +1880,210 @@ mod tests {
         assert!(
             !dir.join("etc/securetty").exists(),
             "securetty lists tty names ttyname(2) cannot answer yet"
+        );
+    }
+
+    #[test]
+    fn a_machine_the_host_cannot_run_gets_its_account_written_not_chrooted() {
+        // The counterfactual for the whole step: the second machine's config
+        // names the same account the first machine's does, and the build used to
+        // refuse it outright ("asks for an account password ... build on that
+        // machine"). Nothing here is executed, so a host that cannot run aarch64
+        // binaries still gets the `mpos` login the shared `/etc/inittab` offers.
+        let dir = staged_account_tree("no-chroot");
+        let config = load_config(
+            "no-chroot",
+            "[default]\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n\
+             user.groups = [\"mpos\", \"wheel\", \"seat\"]\nuser.shell = \"/usr/bin/fish\"\n\
+             user.password = \"\"\n",
+        );
+        write_system_config(&dir, &config, Arch::Aarch64).unwrap();
+
+        let passwd = fs::read_to_string(dir.join("etc/passwd")).unwrap();
+        let account = passwd
+            .lines()
+            .find(|line| line.starts_with("mpos:"))
+            .expect("the account was created")
+            .to_string();
+        let fields: Vec<&str> = account.split(':').collect();
+        // name:x:uid:gid:gecos:home:shell - the shape busybox writes, at an id
+        // above the system accounts, with the primary group named after it.
+        assert_eq!(fields[0], "mpos");
+        assert_eq!(fields[1], "x");
+        let uid: u32 = fields[2].parse().expect("a numeric uid");
+        let gid: u32 = fields[3].parse().expect("a numeric gid");
+        assert!(uid >= 1000 && gid >= 1000, "{account}");
+        assert_eq!(fields[5], "/home/mpos");
+        assert_eq!(fields[6], "/usr/bin/fish");
+
+        let groups = fs::read_to_string(dir.join("etc/group")).unwrap();
+        // The primary group exists and carries the account, which is what the
+        // first machine's `addgroup mpos mpos` leaves behind...
+        assert!(
+            groups
+                .lines()
+                .any(|line| line == format!("mpos:x:{gid}:mpos")),
+            "{groups}"
+        );
+        // ...`wheel` (which the base system ships) is joined, and `seat` - which
+        // `seatd`'s own post-install would have made, and a `--no-scripts`
+        // install never ran - exists because the account joined it.
+        assert!(
+            groups
+                .lines()
+                .any(|line| line.starts_with("wheel:x:10:") && line.ends_with("mpos")),
+            "{groups}"
+        );
+        let seat = groups
+            .lines()
+            .find(|line| line.starts_with("seat:"))
+            .expect("a group the account names is made");
+        assert!(seat.ends_with(":mpos"), "{seat}");
+
+        let shadow = fs::read_to_string(dir.join("etc/shadow")).unwrap();
+        assert_eq!(
+            shadow
+                .lines()
+                .filter(|line| line.starts_with("mpos:"))
+                .count(),
+            1,
+            "one shadow entry for one account: {shadow}"
+        );
+        assert!(
+            shadow.lines().any(|line| line.starts_with("mpos::")),
+            "an empty password field is what makes the login passwordless: {shadow}"
+        );
+
+        // The home is made for the account. Its owner is the build's job (it runs
+        // as root); the mode is this one's.
+        use std::os::unix::fs::PermissionsExt;
+        let home = dir.join("home/mpos");
+        assert!(home.is_dir(), "the account has a home");
+        assert_eq!(home.metadata().unwrap().permissions().mode() & 0o777, 0o755);
+
+        // A second pass changes nothing: the build runs on the boot-files path
+        // too, and an account a previous build made is the one it must not
+        // duplicate or renumber.
+        write_system_config(&dir, &config, Arch::Aarch64).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("etc/passwd")).unwrap(), passwd);
+        assert_eq!(fs::read_to_string(dir.join("etc/group")).unwrap(), groups);
+        assert_eq!(fs::read_to_string(dir.join("etc/shadow")).unwrap(), shadow);
+    }
+
+    #[test]
+    fn a_machine_the_host_cannot_run_gets_the_system_accounts_the_scripts_would_make() {
+        // The pin for what `--no-scripts` skips, measured *before* this code
+        // existed, out of the two shipped images' own files: the machine whose
+        // package scripts ran has
+        //     klogd:x:100:101:klogd:/dev/null:/sbin/nologin
+        //     messagebus:x:101:102:messagebus:/dev/null:/sbin/nologin
+        // and the groups klogd 101, messagebus 102, seat 103, weston-launch 104;
+        // the cross-arch image had neither user and its `seat` at **1001**,
+        // because the configured account joins that group and so *made* it - at
+        // the first free id for a regular group, which is not where a package's
+        // `addgroup -S` would have put it. On the machine that is `dbus`
+        // refusing to start (`checkpath: owner 'root:messagebus' not found`).
+        let dir = staged_account_tree("system-accounts");
+        let config = load_config(
+            "system-accounts",
+            "[default]\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n\
+             user.groups = [\"mpos\", \"wheel\", \"seat\"]\nuser.shell = \"/bin/sh\"\n",
+        );
+        write_system_config(&dir, &config, Arch::Aarch64).unwrap();
+
+        let passwd = fs::read_to_string(dir.join("etc/passwd")).unwrap();
+        let groups = fs::read_to_string(dir.join("etc/group")).unwrap();
+        let shadow = fs::read_to_string(dir.join("etc/shadow")).unwrap();
+
+        // The two users, at the ids `adduser -S` picks: the first free ones from
+        // 100 in the *user* sequence, each with its own group beside it.
+        assert!(
+            passwd.contains("klogd:x:100:101:klogd:/dev/null:/sbin/nologin"),
+            "{passwd}"
+        );
+        assert!(
+            passwd.contains("messagebus:x:101:102:messagebus:/dev/null:/sbin/nologin"),
+            "{passwd}"
+        );
+        // The four groups, in the order their packages install, at the system
+        // ids the other image's own file carries.
+        for group in [
+            "klogd:x:101:",
+            "messagebus:x:102:",
+            "seat:x:103:",
+            "weston-launch:x:104:",
+        ] {
+            assert!(groups.contains(group), "{group} missing from {groups}");
+        }
+        // `-D` means *locked*, not passwordless: an empty password field here
+        // would be a system account anyone could log into.
+        for name in ["klogd", "messagebus"] {
+            assert!(shadow.contains(&format!("{name}:!:")), "{shadow}");
+        }
+        // And the configured account joins the *system* `seat` - which is the
+        // whole reason this runs before it: the other order makes a second group
+        // at a regular id instead.
+        assert!(
+            groups
+                .lines()
+                .any(|line| line.starts_with("seat:x:103:") && line.ends_with("mpos")),
+            "{groups}"
+        );
+        assert!(
+            !groups.contains("seat:x:1001:"),
+            "the account made its own seat group: {groups}"
+        );
+
+        // Idempotent, like the account itself.
+        write_system_config(&dir, &config, Arch::Aarch64).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("etc/passwd")).unwrap(), passwd);
+        assert_eq!(fs::read_to_string(dir.join("etc/group")).unwrap(), groups);
+        assert_eq!(fs::read_to_string(dir.join("etc/shadow")).unwrap(), shadow);
+    }
+
+    #[test]
+    fn a_password_is_still_refused_where_the_host_cannot_run_the_image() {
+        // What is *not* reachable without a chroot is hashing, so the refusal
+        // narrows from "any account at all" to "a password" - and both spellings
+        // of one are named by the key that asked for them rather than silently
+        // ignored, because a login nobody can pass is a broken image.
+        let dir = staged_account_tree("no-chroot-password");
+        for (key, toml) in [
+            (
+                "system.root_password",
+                "[default]\nuser.name = \"\"\nsystem.root_password = \"hunter2\"\n",
+            ),
+            (
+                "user.password",
+                "[default]\nuser.name = \"mpos\"\nuser.password = \"hunter2\"\n",
+            ),
+        ] {
+            let config = load_config("no-chroot-password", toml);
+            let error = write_system_config(&dir, &config, Arch::Aarch64)
+                .expect_err("a password needs the image's own crypt(3)")
+                .to_string();
+            assert!(error.contains("aarch64"), "{error}");
+            assert!(error.contains(key), "{error}");
+            assert!(
+                !fs::read_to_string(dir.join("etc/passwd"))
+                    .unwrap()
+                    .contains("mpos"),
+                "the refusal happens before anything is written"
+            );
+        }
+
+        // The other direction: an empty password is not a refusal, and the same
+        // config is accepted - so what the two machines share is still shared.
+        let config = load_config(
+            "no-chroot-password",
+            "[default]\nuser.name = \"mpos\"\nuser.password = \"\"\n",
+        );
+        write_system_config(&dir, &config, Arch::Aarch64).unwrap();
+        assert!(
+            fs::read_to_string(dir.join("etc/passwd"))
+                .unwrap()
+                .contains("mpos:"),
+            "the account is made when no password is asked for"
         );
     }
 
@@ -1560,6 +2222,44 @@ mod tests {
             );
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn the_applet_farm_is_the_list_busybox_would_install() {
+        // Shape pin, host-side: the file the build links from is data, and it
+        // has to stay readable and diffable after a regeneration. What it
+        // *contains* is pinned on the machine by `t-busybox-farm`, which asks
+        // each busybox for its own answer - this is what keeps a hand-edit, or a
+        // re-dump from some other tree, from passing unnoticed.
+        let root = utils::project_root().unwrap();
+        let text = fs::read_to_string(root.join(crate::paths::BUSYBOX_APPLETS)).unwrap();
+        let paths: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        assert!(!paths.is_empty(), "the farm cannot be empty");
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted, "regenerate with `| sort` and keep it sorted");
+        assert!(
+            sorted.windows(2).all(|pair| pair[0] != pair[1]),
+            "a path is listed twice"
+        );
+        for path in &paths {
+            let (dir, name) = path
+                .rsplit_once('/')
+                .unwrap_or_else(|| panic!("{path} names no directory"));
+            assert!(
+                ["bin", "sbin", "usr/bin", "usr/sbin"].contains(&dir),
+                "{path} is not under a directory a PATH holds"
+            );
+            assert!(!name.is_empty(), "{path} names no applet");
+        }
+        assert!(
+            paths.contains(&"sbin/init"),
+            "the pid-1 name is the whole reason the build lays this farm"
+        );
     }
 
     #[test]

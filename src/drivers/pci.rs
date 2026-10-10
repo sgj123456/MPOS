@@ -40,6 +40,7 @@
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use critical_section::Mutex;
+#[cfg(target_arch = "x86_64")]
 use x86_64::instructions::port::Port;
 
 use crate::acpi::EcamRange;
@@ -49,7 +50,12 @@ use crate::pci::{
     bar_range, rom_bar,
 };
 
+/// Mechanism 1's address and data ports: only an x86_64 machine has an I/O
+/// address space to put them in, and the constant is gate-kept with the module
+/// below so that the two facts cannot drift apart.
+#[cfg(target_arch = "x86_64")]
 const CONFIG_ADDRESS: u16 = 0xcf8;
+#[cfg(target_arch = "x86_64")]
 const CONFIG_DATA: u16 = 0xcfc;
 
 /// Command register bits.
@@ -162,72 +168,119 @@ fn use_ports() {
 }
 
 // ---------------------------------------------------------------------------
-// Mechanism 1: the port pair
+// Mechanism 1: the port pair, and what a machine with no ports answers
 // ---------------------------------------------------------------------------
 
-fn port_address(bus: u8, slot: u8, func: u8, off: u8) -> u32 {
-    0x8000_0000
-        | (bus as u32) << 16
-        | (slot as u32) << 11
-        | (func as u32) << 8
-        | (off as u32 & 0xfc)
-}
-
-fn port_read32(bus: u8, slot: u8, func: u8, off: u8) -> u32 {
-    unsafe {
-        Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
-        Port::new(CONFIG_DATA).read()
-    }
-}
-
-fn port_write32(bus: u8, slot: u8, func: u8, off: u8, value: u32) {
-    unsafe {
-        Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
-        Port::new(CONFIG_DATA).write(value);
-    }
-}
-
-/// Read one byte of configuration space over the port pair.
+/// The machine's own fallback for a configuration access the window did not
+/// serve, as one name on both machines.
 ///
-/// A *byte* access, not a dword with three bytes ignored. Mechanism 1's data
-/// port is four bytes wide and a narrower access reaches only the bytes it
-/// names - which is what makes a byte read see what a byte write wrote.
-fn port_read8(bus: u8, slot: u8, func: u8, off: u8) -> u8 {
-    unsafe {
-        Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
-        Port::new(CONFIG_DATA + (off as u16 & 3)).read()
-    }
-}
-
-/// Write one byte of configuration space over the port pair.
+/// The two arms are the two kinds of machine this kernel boots. An x86_64 one
+/// reaches configuration space through mechanism 1's address and data ports,
+/// which exist whether or not the firmware named a window; an aarch64 one has
+/// no I/O address space at all - no instruction to reach it and nothing
+/// decoded behind one - so on that machine the window is the *only* door, and
+/// an access that finds no window is answered the way a PCI bus answers a
+/// function that is not there: all ones, the width of the access.
 ///
-/// The access size is load-bearing rather than pedantic. A byte write reaches
-/// one byte of the addressed dword; a read-modify-write of the whole dword
-/// would write back the bytes beside it, and the register beside the command
-/// word is the *status* word, whose error bits are cleared by writing ones.
-/// A read-modify-write there would silently throw away every error flag the
-/// device had raised.
-fn port_write8(bus: u8, slot: u8, func: u8, off: u8, value: u8) {
-    unsafe {
-        Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
-        Port::new(CONFIG_DATA + (off as u16 & 3)).write(value)
+/// That is what lets the rest of this module be one body on both machines. The
+/// fallback is not "this machine cannot do PCI" - which would make the walk, the
+/// snapshot and every driver's `find` a second shape to keep - but "this access
+/// found nothing", which is a bus's own answer for an absent function and is
+/// already what [`enumerate`] skips.
+#[cfg(target_arch = "x86_64")]
+mod ports {
+    use x86_64::instructions::port::Port;
+
+    use super::{CONFIG_ADDRESS, CONFIG_DATA};
+
+    fn port_address(bus: u8, slot: u8, func: u8, off: u8) -> u32 {
+        0x8000_0000
+            | (bus as u32) << 16
+            | (slot as u32) << 11
+            | (func as u32) << 8
+            | (off as u32 & 0xfc)
+    }
+
+    pub(super) fn read32(bus: u8, slot: u8, func: u8, off: u8) -> u32 {
+        unsafe {
+            Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
+            Port::new(CONFIG_DATA).read()
+        }
+    }
+
+    pub(super) fn write32(bus: u8, slot: u8, func: u8, off: u8, value: u32) {
+        unsafe {
+            Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
+            Port::new(CONFIG_DATA).write(value);
+        }
+    }
+
+    /// Read one byte of configuration space over the port pair.
+    ///
+    /// A *byte* access, not a dword with three bytes ignored. Mechanism 1's data
+    /// port is four bytes wide and a narrower access reaches only the bytes it
+    /// names - which is what makes a byte read see what a byte write wrote.
+    pub(super) fn read8(bus: u8, slot: u8, func: u8, off: u8) -> u8 {
+        unsafe {
+            Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
+            Port::new(CONFIG_DATA + (off as u16 & 3)).read()
+        }
+    }
+
+    /// Write one byte of configuration space over the port pair.
+    ///
+    /// The access size is load-bearing rather than pedantic. A byte write reaches
+    /// one byte of the addressed dword; a read-modify-write of the whole dword
+    /// would write back the bytes beside it, and the register beside the command
+    /// word is the *status* word, whose error bits are cleared by writing ones.
+    /// A read-modify-write there would silently throw away every error flag the
+    /// device had raised.
+    pub(super) fn write8(bus: u8, slot: u8, func: u8, off: u8, value: u8) {
+        unsafe {
+            Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
+            Port::new(CONFIG_DATA + (off as u16 & 3)).write(value)
+        }
+    }
+
+    /// Read a 16-bit configuration register, `off` even, over the port pair.
+    pub(super) fn read16(bus: u8, slot: u8, func: u8, off: u8) -> u16 {
+        unsafe {
+            Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
+            Port::new(CONFIG_DATA + (off as u16 & 2)).read()
+        }
+    }
+
+    /// Write a 16-bit configuration register, `off` even, over the port pair.
+    pub(super) fn write16(bus: u8, slot: u8, func: u8, off: u8, value: u16) {
+        unsafe {
+            Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
+            Port::new(CONFIG_DATA + (off as u16 & 2)).write(value)
+        }
     }
 }
 
-/// Read a 16-bit configuration register over the port pair. `off` must be even.
-fn port_read16(bus: u8, slot: u8, func: u8, off: u8) -> u16 {
-    unsafe {
-        Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
-        Port::new(CONFIG_DATA + (off as u16 & 2)).read()
+/// The same six calls on a machine with no port I/O: an absent function's
+/// answer, at the width the caller asked for.
+///
+/// A write is *dropped* rather than panicked on, and that is the PCI answer
+/// rather than a shortcut: a write to a function that is not there is discarded
+/// by the bus, and a driver that writes to one gets no error from the machine.
+/// What must not happen is a *read* inventing a device, which is why the reads
+/// are all ones - the value [`enumerate`] tests for.
+#[cfg(not(target_arch = "x86_64"))]
+mod ports {
+    pub(super) fn read32(_bus: u8, _slot: u8, _func: u8, _off: u8) -> u32 {
+        super::PCI_ERROR_RESPONSE
     }
-}
-
-/// Write a 16-bit configuration register over the port pair. `off` must be even.
-fn port_write16(bus: u8, slot: u8, func: u8, off: u8, value: u16) {
-    unsafe {
-        Port::new(CONFIG_ADDRESS).write(port_address(bus, slot, func, off));
-        Port::new(CONFIG_DATA + (off as u16 & 2)).write(value)
+    pub(super) fn write32(_bus: u8, _slot: u8, _func: u8, _off: u8, _value: u32) {}
+    pub(super) fn read8(_bus: u8, _slot: u8, _func: u8, _off: u8) -> u8 {
+        0xff
     }
+    pub(super) fn write8(_bus: u8, _slot: u8, _func: u8, _off: u8, _value: u8) {}
+    pub(super) fn read16(_bus: u8, _slot: u8, _func: u8, _off: u8) -> u16 {
+        0xffff
+    }
+    pub(super) fn write16(_bus: u8, _slot: u8, _func: u8, _off: u8, _value: u16) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +298,7 @@ pub fn read32(bus: u8, slot: u8, func: u8, off: u8) -> u32 {
         // SAFETY: the window is device memory the firmware named and this module
         // mapped, and the address is four-byte aligned inside its page.
         Some(address) => unsafe { core::ptr::read_volatile(address as *const u32) },
-        None => port_read32(bus, slot, func, off),
+        None => ports::read32(bus, slot, func, off),
     }
 }
 
@@ -255,7 +308,7 @@ pub fn write32(bus: u8, slot: u8, func: u8, off: u8, value: u32) {
         // SAFETY: as `read32`, and the register was read through the same address
         // arithmetic before anything wrote to it.
         Some(address) => unsafe { core::ptr::write_volatile(address as *mut u32, value) },
-        None => port_write32(bus, slot, func, off, value),
+        None => ports::write32(bus, slot, func, off, value),
     }
 }
 
@@ -269,7 +322,7 @@ pub fn read8(bus: u8, slot: u8, func: u8, off: u8) -> u8 {
         // SAFETY: device memory this module mapped; a byte load has no alignment
         // requirement.
         Some(address) => unsafe { core::ptr::read_volatile(address as *const u8) },
-        None => port_read8(bus, slot, func, off),
+        None => ports::read8(bus, slot, func, off),
     }
 }
 
@@ -285,7 +338,7 @@ pub fn write8(bus: u8, slot: u8, func: u8, off: u8, value: u8) {
     match window_byte(bus, slot, func, off) {
         // SAFETY: as `read8`.
         Some(address) => unsafe { core::ptr::write_volatile(address as *mut u8, value) },
-        None => port_write8(bus, slot, func, off, value),
+        None => ports::write8(bus, slot, func, off, value),
     }
 }
 
@@ -295,7 +348,7 @@ pub fn read16(bus: u8, slot: u8, func: u8, off: u8) -> u16 {
         // SAFETY: device memory this module mapped, at an even address inside its
         // page.
         Some(address) => unsafe { core::ptr::read_volatile(address as *const u16) },
-        None => port_read16(bus, slot, func, off),
+        None => ports::read16(bus, slot, func, off),
     }
 }
 
@@ -304,7 +357,7 @@ pub fn write16(bus: u8, slot: u8, func: u8, off: u8, value: u16) {
     match window_byte(bus, slot, func, off & 0xfe) {
         // SAFETY: as `read16`.
         Some(address) => unsafe { core::ptr::write_volatile(address as *mut u16, value) },
-        None => port_write16(bus, slot, func, off, value),
+        None => ports::write16(bus, slot, func, off, value),
     }
 }
 
@@ -808,7 +861,8 @@ fn read_table(info: &BootInfo, phys: u64, cap: usize) -> Option<&'static [u8]> {
 /// `None` is an honest absence - no root pointer, no MCFG among the tables, a
 /// checksum that does not hold, or a length that runs past what this walk reads.
 /// The caller falls back to the port mechanism, which is what a machine with no
-/// window uses.
+/// window uses - and, on a machine with no ports either, to a bus with nothing
+/// on it (see [`discover_ecam_dt`] for the window a device tree names instead).
 ///
 /// What comes back is the range itself ([`EcamRange`]) rather than a kernel-side
 /// copy of it: every question this module asks of a window - does it cover this
@@ -816,6 +870,18 @@ fn read_table(info: &BootInfo, phys: u64, cap: usize) -> Option<&'static [u8]> {
 /// already answers, host-tested and fuzzed. What is *not* decided here is whether
 /// the window is ever read; that is [`init`]'s check.
 fn discover_ecam(info: &BootInfo) -> Option<EcamRange> {
+    if let Some(range) = discover_ecam_acpi(info) {
+        return Some(range);
+    }
+    // A machine with no ACPI tables is not a machine with no PCI: the same
+    // firmware that declined to publish MCFG may still have described the host
+    // bridge in its device tree, which is the whole of what this module needs -
+    // a base, and the buses behind it.
+    discover_ecam_dt(info)
+}
+
+/// The window the firmware's ACPI tables name, if it named one.
+fn discover_ecam_acpi(info: &BootInfo) -> Option<EcamRange> {
     if info.rsdp_phys == 0 {
         crate::println!("pci: the boot record carries no ACPI root pointer");
         return None;
@@ -934,17 +1000,135 @@ fn hand_over(devices: Vec<Device>) -> usize {
     count
 }
 
+/// The window a *device tree* names, for a machine whose firmware published no
+/// ACPI tables at all.
+///
+/// QEMU's `virt` is that machine, and it is booted with `acpi=off` on purpose -
+/// this port reads the tree, and AAVMF publishes either a tree or a set of ACPI
+/// tables and not both (`NOTES.md` §9.1). So MCFG is absent, and for a long time
+/// that read as "this machine has no PCI": the module was x86_64's, one of the
+/// two drivers behind it was reachable only through it, and `t-ahci` stayed
+/// un-migratable because the second machine had no `/dev/sda` (`NOTES.md` §15).
+/// The tree does describe the bus, in the node the ECAM binding reserves for it:
+///
+/// ```text
+/// pcie@10000000 {
+///     compatible = "pci-host-ecam-generic";
+///     device_type = "pci";
+///     reg = <0x40 0x10000000 0x00 0x10000000>;
+///     bus-range = <0x00 0xff>;
+///     dma-coherent;
+/// };
+/// ```
+///
+/// measured by `qemu-system-aarch64 -machine virt,gic-version=2,acpi=off -machine
+/// dumpdtb=` on QEMU 11.1.2 and read back with `dtc`. `reg` is two address cells
+/// and two size cells - the *parent's*, which is what `fdt`'s `Reg` is written to
+/// use - so the four words are one 64-bit base of `0x40_1000_0000` and a length of
+/// `0x1000_0000`: QEMU's high ECAM, 256 MiB, one bus per mebibyte. (This is why
+/// the address cannot be written down: `virt` puts the low ECAM at `0x3f00_0000`
+/// on a machine with no high memory and the high one here when there is, and the
+/// tree is the only place the machine says which.)
+///
+/// `dma-coherent` is in that node and it is worth saying why it matters: it is
+/// the firmware's promise that a device's writes land in memory the CPU can
+/// read without an explicit invalidate, which is what lets this kernel's AHCI
+/// bounce pages work unmodified on this machine. A machine whose tree omits it
+/// would need a cache flush around every transfer, and nothing here claims to
+/// have one.
+fn discover_ecam_dt(info: &BootInfo) -> Option<EcamRange> {
+    let Some(bytes) = info.dtb else {
+        crate::println!("pci: the boot record carries no device tree either");
+        return None;
+    };
+    let tree = match crate::fdt::Fdt::new(bytes) {
+        Ok(tree) => tree,
+        Err(_) => {
+            crate::println!("pci: the device tree will not walk");
+            return None;
+        }
+    };
+    let node = match tree.find_compatible("pci-host-ecam-generic") {
+        Ok(Some(node)) => node,
+        Ok(None) => {
+            crate::println!("pci: the tree names no pci-host-ecam-generic bridge");
+            return None;
+        }
+        Err(_) => {
+            crate::println!("pci: the device tree will not walk");
+            return None;
+        }
+    };
+    let Some((base, size)) = node.reg().next() else {
+        crate::println!("pci: the bridge at {} names no window", node.name());
+        return None;
+    };
+    // A bus is a mebibyte of the window, so the window itself bounds the bus
+    // numbers rather than the other way round: a tree that promised more buses
+    // than its `reg` has room for would send the walk past the end of the
+    // mapping into whatever the firmware put there.
+    let buses = size / crate::acpi::ECAM_BUS_BYTES;
+    if buses == 0 {
+        crate::println!(
+            "pci: the bridge at {} names a {}-byte window, which holds no bus",
+            node.name(),
+            size
+        );
+        return None;
+    }
+    let mut range = node.cells("bus-range");
+    let start_bus = range.next().unwrap_or(0) as u8;
+    // The last bus the window has room for, which is what a `bus-range` wider
+    // than the window is clamped to.
+    let last = (start_bus as u32 + buses as u32 - 1).min(0xff);
+    let end_bus = range.next().unwrap_or(last).min(last) as u8;
+    crate::println!(
+        "pci: the tree names ECAM at {:#x}, buses {}..={}, {} MiB",
+        base,
+        start_bus,
+        end_bus,
+        size / (1024 * 1024)
+    );
+    Some(EcamRange {
+        base,
+        // One segment, which is what the tree's `linux,pci-domain` says and what
+        // every device's `Device` carries a domain for.
+        segment: 0,
+        start_bus,
+        end_bus,
+    })
+}
+
+/// Whether this machine has a port pair to fall back on, which is the question
+/// [`init`]'s order is built around.
+///
+/// Stated once rather than as `cfg!` at each of the four places that ask it, so
+/// that "the ports are the known-good mechanism" and "there may be no ports" are
+/// one fact with one spelling.
+const fn has_ports() -> bool {
+    cfg!(target_arch = "x86_64")
+}
+
 /// Take the bus snapshot, once, and publish it for `/sys` and `/proc`.
 ///
 /// Returns how many functions were found, for the boot's own log line. The
-/// mechanism is chosen here, and the order is the point: the port pair walks the
-/// bus first, because it is the mechanism that asks nothing of the firmware and
-/// is therefore the one known to work; if the firmware named a window, the walk
-/// is done again through it and the two snapshots are compared function by
-/// function. A window that agrees is kept - from here on, discovery and the
-/// `config` files under `/sys` and `/proc` read memory instead of issuing port
-/// cycles - and a window that disagrees about anything is refused, with the port
-/// pair left in place.
+/// mechanism is chosen here, and the order is the point: on a machine that has a
+/// port pair, the ports walk the bus first, because they are the mechanism that
+/// asks nothing of the firmware and are therefore the one known to work; if the
+/// firmware named a window, the walk is done again through it and the two
+/// snapshots are compared function by function. A window that agrees is kept -
+/// from here on, discovery and the `config` files under `/sys` and `/proc` read
+/// memory instead of issuing port cycles - and a window that disagrees about
+/// anything is refused, with the port pair left in place.
+///
+/// **A machine with no port pair cannot be checked that way**, and it is not
+/// checked that way: there is no second mechanism to compare against, so the
+/// window is used as it was found and the absence is said in the log rather than
+/// dressed up as a comparison. That is not a weaker claim than the first
+/// machine's - it is a different one. The check on x86_64 is "these two agree",
+/// which needs two; what remains on aarch64 is "this window is the only door and
+/// here is what the walk read through it", and a walk that read *nothing* is
+/// printed as such rather than published as an empty machine.
 ///
 /// The check is what makes "MMIO by preference" safe to say. Everything above this
 /// module - every driver's `find`, `docs/NOTES.md` §7.4's identity chain - rests
@@ -952,13 +1136,22 @@ fn hand_over(devices: Vec<Device>) -> usize {
 /// compared against the first is exactly the kind of thing that is right until it
 /// is not.
 pub fn init(info: &BootInfo) -> usize {
-    let over_ports = enumerate();
+    let over_ports = if has_ports() { Some(enumerate()) } else { None };
     let Some(ecam) = discover_ecam(info) else {
-        crate::println!("pci: no MCFG window; configuration space is over ports 0xcf8/0xcfc");
-        return hand_over(over_ports);
+        if has_ports() {
+            crate::println!("pci: no ECAM window; configuration space is over ports 0xcf8/0xcfc");
+            // `Some` on every machine that has ports, which is what makes the
+            // unwrap below the *same* statement as the arm that follows.
+            return hand_over(over_ports.unwrap_or_default());
+        }
+        crate::println!(
+            "pci: no ECAM window and no port pair - this machine's configuration space is \
+             unreachable"
+        );
+        return hand_over(Vec::new());
     };
     crate::println!(
-        "pci: MCFG names ECAM at {:#x}, segment {}, buses {}..={}, {} MiB",
+        "pci: ECAM at {:#x}, segment {}, buses {}..={}, {} MiB",
         ecam.base,
         ecam.segment,
         ecam.start_bus,
@@ -976,22 +1169,40 @@ pub fn init(info: &BootInfo) -> usize {
             "pci: the window starts at bus {} and the walk starts at bus 0; ports kept",
             ecam.start_bus
         );
-        return hand_over(over_ports);
+        return hand_over(over_ports.unwrap_or_default());
     }
 
     use_window(ecam);
     let over_mmio = enumerate();
-    if over_mmio != over_ports {
+    if let Some(over_ports) = over_ports {
+        if over_mmio != over_ports {
+            crate::println!(
+                "pci: ECAM disagrees with the port pair{}; ports kept",
+                first_difference(&over_ports, &over_mmio)
+            );
+            use_ports();
+            return hand_over(over_ports);
+        }
+        if over_mmio.is_empty() {
+            // Both mechanisms found nothing, which is a machine with no PCI bus
+            // rather than a window that failed: say which, because the two read
+            // the same in every other line of this log.
+            crate::println!("pci: the port pair and the window agree there are no functions");
+        }
         crate::println!(
-            "pci: ECAM disagrees with the port pair{}; ports kept",
-            first_difference(&over_ports, &over_mmio)
+            "pci: ECAM and the port pair agree on all {} functions; configuration space is over \
+             MMIO",
+            over_mmio.len()
         );
-        use_ports();
-        return hand_over(over_ports);
+        return hand_over(over_mmio);
     }
-    crate::println!(
-        "pci: ECAM and the port pair agree on all {} functions; configuration space is over MMIO",
-        over_mmio.len()
-    );
+    if over_mmio.is_empty() {
+        crate::println!("pci: the window named no function at all; the bus is empty or unreadable");
+    } else {
+        crate::println!(
+            "pci: ECAM is this machine's only mechanism and the walk read {} functions through it",
+            over_mmio.len()
+        );
+    }
     hand_over(over_mmio)
 }

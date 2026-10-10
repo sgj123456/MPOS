@@ -7,13 +7,13 @@
 # a machine's key wins over the baseline's. A key carries the name of the thing
 # it belongs to (`rootfs.mirror`, `system.hostname`, `user.name`).
 #
-# One file describes two userlands that share almost nothing at the top and
-# everything at the bottom. The first machine is a desktop - weston, mesa, the
-# DRM stack, seatd - and the second is the smallest tree that reaches a login
-# prompt; a package list that is right for one is wrong for the other, so each
-# writes its own half under its own name. What the two agree on (the mirror, the
-# repositories, the filesystem, the timezone and the resolver) is written once,
-# in the baseline.
+# One file describes both machines, and they are one guest: each boots the same
+# desktop userland - weston, mesa, the DRM stack, seatd - so the package lists
+# below are the baseline's and neither machine's half names a package. What
+# differs between the two is a hardware fact and is written under the machine's
+# own name; `rootfs.serial_port` is the one such key left. The mirror, the
+# repositories, the filesystem, the timezone and the resolver are the baseline's
+# for the same reason.
 #
 # How the image is *booted* is `machine.toml` beside this file, and that is a
 # cost decision rather than a tidy one: this file's mtime is what decides whether
@@ -40,10 +40,11 @@
 rootfs.mirror = "https://mirrors.tuna.tsinghua.edu.cn/alpine"
 # Alpine branch
 rootfs.branch = "edge"
-# Architecture. This is the *package* architecture apk resolves against, so it
-# is genuinely the machine's and each half names its own - unlike the loader and
-# kernel targets, which xtask picks from its own `--arch`.
-rootfs.arch = "x86_64"
+# The machine itself is deliberately not a key here. The package architecture
+# apk resolves against is the `--arch` the build was given (`xtask/src/arch.rs`
+# is the one place a machine is named), so a `rootfs.arch` spelling would only
+# be a second answer that could disagree with the one the kernel and the loader
+# were built for.
 # The repository components to fetch, in this order: apk takes a package from
 # the first repository that has it, so `main` before `community` is what keeps a
 # package that exists in both coming from the one it belongs to.
@@ -81,10 +82,12 @@ rootfs.mkfs_options = "^has_journal,^metadata_csum"
 # Base packages that are always installed (do not modify unless needed).
 # `alpine-base` and `openrc` arrive through the shared core list
 # (`SHARED_BASE_PACKAGES` in xtask/src/rootfs.rs, folded into every machine's
-# base by config.rs) - what is named here is only this machine's own half:
-# the filesystem tools a guest with disks and partitions needs to *make*
-# them. The second machine has no use for either inside its root (its image
-# is laid by the build on the host), so its half empties this list.
+# base by config.rs) - what is named here is on top of that core: the
+# filesystem tools a guest with disks and partitions needs to *make* them.
+# Both machines read this baseline list and so both carry them; the second
+# machine's image is laid by the build on the host rather than by the guest,
+# but it is one userland and a package list that is right for one is right
+# for the other.
 rootfs.base_packages = ["e2fsprogs", "dosfstools"]
 
 # Additional packages to install in the rootfs, on top of the base ones.
@@ -108,8 +111,9 @@ rootfs.base_packages = ["e2fsprogs", "dosfstools"]
 # stock boot runlevel wants. Which of them the image actually starts is in
 # `xtask/src/rootfs.rs` (`SERVICES`), not here.
 #
-# The second machine's half replaces this list whole: it is a different
-# userland, not a shorter one.
+# Both machines install this list: it is one userland, and neither machine's
+# half replaces it - the desktop that reaches a compositor is the tree both
+# boot.
 rootfs.extra_packages = [
     "busybox-openrc",
     "alpine-release",
@@ -118,9 +122,6 @@ rootfs.extra_packages = [
     "apk-tools",
     "fastfetch",
     "strace",
-    "musl-dev",
-    "gcc",
-    "curl",
     "doas",
     "weston",
     "weston-backend-drm",
@@ -130,6 +131,7 @@ rootfs.extra_packages = [
     # with "Failed to load module: ... desktop-shell.so: No such file or
     # directory" and never draws anything.
     "weston-shell-desktop",
+    "weston-terminal",
     # The pointer's own artwork. Weston draws the cursor from an Xcursor theme,
     # and this image shipped none - /usr/share/icons held only the `hicolor`
     # icon tree, which has no `cursors/` - so weston drew the small built-in
@@ -169,7 +171,6 @@ rootfs.extra_packages = [
     "libinput-tools",
     "dbus",
     "dbus-openrc",
-    "fish"
 ]
 
 # The machine the guest is: its name, its clock and its logins. Both machines
@@ -199,9 +200,15 @@ system.dns = "223.5.5.5"
 system.root_password = ""
 
 # The account created in the guest, besides root. An empty `name` skips the
-# whole thing and leaves an image that only ever logs in as root - which is the
-# second machine's shape, so its half empties the name rather than inheriting
-# this one's.
+# whole thing and leaves an image that only ever logs in as root; both machines
+# name the same account here, so it is written once.
+#
+# The two machines make it differently, and the difference is what a build can
+# *run*: the first machine's account is made by the image's own `adduser` in a
+# chroot, and the second's by `rootfs::create_account_without_chroot` writing the
+# same three files (`/etc/passwd`, `/etc/group`, `/etc/shadow`), because this
+# host cannot exec an aarch64 tree. A non-empty `password` is refused on the
+# second machine either way: hashing one is the image's own `crypt(3)`.
 user.name = "mpos"
 # Groups to add it to. `wheel` is the one /etc/doas.conf grants escalation to;
 # `seat` is the group the seatd service hands its socket to, so an account
@@ -219,47 +226,20 @@ user.password = ""
 # this machine wants belongs here.
 [x86_64]
 
-# The second machine's own half: the smallest tree that boots to a login prompt.
+# The second machine's own half, and it is a hardware fact and nothing else.
 #
 # The keys are the same vocabulary the baseline uses, read by the same
 # `RootfsConfig::load`, so nothing here is a dialect. What is absent is as
-# deliberate as what is present: this machine has no GPU and no DRM, so it has no
-# use for the desktop's graphics stack, and the packages a guest with disks needs
-# to *make* filesystems are the first machine's alone (its image is laid by the
-# build, through the block layer, exactly like the first's).
+# deliberate as what is present: both machines boot the same userland, so no
+# package is named here, and what is left is the one name a machine really owns -
+# the port its console answers on. The bus it enumerates and the card behind it
+# are the driver layer's facts, not this file's.
 [aarch64]
-rootfs.arch = "aarch64"
 # The PL011 - the name this machine's console is called everywhere else, on the
 # `console=` word the image is booted with and on the getty line its inittab
 # renders. `rootfs.root_device` is the baseline's: both machines' roots are the
 # second partition of their own GPT disk.
 rootfs.serial_port = "ttyAMA0"
-# Empty, and it has to be said: the baseline's list is the first machine's, and
-# a guest that does not make filesystems has no use for e2fsprogs/dosfstools
-# inside its root. An empty list is a value; an absent key would inherit theirs.
-rootfs.base_packages = []
-
-# On top of the base: the init system's own runlevel scripts are in the shared
-# core list, and nothing else is needed to reach a login prompt.
-#
-# `strace` is here because it is the tool this machine's ABI was measured with
-# and the one that found what was missing: `ptrace` answers on the second
-# machine since §13.31, and a tracer is what proves it from the syscall side
-# rather than from a test that could agree with the kernel about a wrong shape.
-# Read back on the machine through this image:
-#
-#     strace -f -e trace=openat ls /
-#     openat(AT_FDCWD, "/", O_RDONLY|O_LARGEFILE|O_CLOEXEC|O_DIRECTORY) = 3
-#
-# It is a debugging tool rather than part of the boot - no service needs it, and
-# the boot reaches `login:` without it. It weighs 1.3 MiB in a 256 MiB image.
-rootfs.extra_packages = ["alpine-conf", "busybox-suid", "strace"]
-
-# No account beyond root: the desktop's `mpos` login is the first machine's, so
-# the baseline's `user.name` is emptied rather than inherited. The `wheel` group
-# and `/bin/sh` that the user half defaults to describe an account that is never
-# made, and the image's `/etc/inittab` logs in as root.
-user.name = ""
 
 # How the image is *booted* - the window, the memory, the devices and the
 # standing run mode - is `machine.toml` beside this file. It is a separate

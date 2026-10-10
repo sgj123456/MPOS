@@ -2463,6 +2463,19 @@ impl Inode for ControllingTty {
     fn set_owner(&self, uid: u32, gid: u32) {
         CONTROLLING_PERMS.set_owner(uid, gid);
     }
+
+    fn atime(&self) -> u64 {
+        CONTROLLING_PERMS.atime()
+    }
+
+    fn mtime(&self) -> u64 {
+        CONTROLLING_PERMS.mtime()
+    }
+
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        CONTROLLING_PERMS.set_times(atime, mtime);
+        Ok(())
+    }
     /// A terminal has no position - `lseek(2)` on one is `ESPIPE` - and
     /// saying otherwise is what makes a reader drop the bytes it meant to
     /// push back.
@@ -2540,6 +2553,19 @@ impl Inode for Tty0 {
     fn set_owner(&self, uid: u32, gid: u32) {
         TTY0_PERMS.set_owner(uid, gid);
     }
+
+    fn atime(&self) -> u64 {
+        TTY0_PERMS.atime()
+    }
+
+    fn mtime(&self) -> u64 {
+        TTY0_PERMS.mtime()
+    }
+
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        TTY0_PERMS.set_times(atime, mtime);
+        Ok(())
+    }
     fn seekable(&self) -> bool {
         false
     }
@@ -2609,6 +2635,19 @@ impl Inode for Tty {
 
     fn set_owner(&self, uid: u32, gid: u32) {
         self.perms.set_owner(uid, gid);
+    }
+
+    fn atime(&self) -> u64 {
+        self.perms.atime()
+    }
+
+    fn mtime(&self) -> u64 {
+        self.perms.mtime()
+    }
+
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        self.perms.set_times(atime, mtime);
+        Ok(())
     }
 
     /// Termios ioctls are answered by the device, and a descriptor only says

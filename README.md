@@ -166,8 +166,8 @@ graph TD
 ```
 
 The kernel mounts nothing but its own ramfs root. `/proc`, `/sys`, `/dev`, the real root and the
-`switch_root` all belong to the initramfs's `/init` (`initramfs/init`), because a kernel that
-assembles them first leaves pieces that the owner of the system cannot unmount.
+`switch_root` all belong to the initramfs's `/init` (`assets/initramfs/core/init`), because a kernel
+that assembles them first leaves pieces that the owner of the system cannot unmount.
 
 ### Memory management
 
@@ -286,12 +286,15 @@ The second machine answers the cases it can answer — `arch.console_receive` an
 tally.
 
 **The boot's own checks are not tests, and they run on every boot.** A device the machine was
-configured with, a filesystem it must read, the devfs it must publish: those are asserted on the
+configured with, a filesystem it must mount, the devfs it must publish: those are asserted on the
 way past, and a failure halts the machine with a line that names the subsystem (`virtio-blk: …`,
-`9p: …`, `devfs: …`). They are why an aarch64 image whose root partition carries no `/hello`
-cannot boot at all. The kernel prints no milestone markers any more: nothing parsed them once the
-sweep's own `=== SUMMARY` line and the harness's tally became the gate (`docs/NOTES.md` §15.19,
-§15.24).
+`9p: …`, `devfs: …`). What such a check asserts is the **kernel's** behaviour and nothing the build
+packed into an image: `check_blk` finds a filesystem-less device by the kernel's own partition-and-
+superblock scan and round-trips a pattern it generates, `check_fs` writes its own marker through the
+mounted ext4 and reads it back, and `check_p9` reads the share's root inode — no check names a file
+an image has to carry (`docs/NOTES.md` §15.34). The kernel prints no milestone markers any more:
+nothing parsed them once the sweep's own `=== SUMMARY` line and the harness's tally became the gate
+(`docs/NOTES.md` §15.19, §15.24).
 
 **The real gate is the self-test.** `cargo xtask test` runs the host unit tests and then boots
 the user test programs `tests.toml` selects — every program that is not in a group — requiring
@@ -400,9 +403,11 @@ the image; `initramfs.toml` does the same for the early userspace. All three are
 *both* machines, in three sections: `[default]` is the baseline both read, and `[x86_64]`/`[aarch64]`
 are each machine's own half — so a value the second machine does not share is written once, under its
 own name, and the first machine never sees it. Concrete
-files live as real files under `rootfs/` and `initramfs/`, overlaid *after* anything written
-from the toml — so a file in the tree wins, which is how `/etc/inittab`, `/etc/network/interfaces`
-and `/init` are edited.
+files live as real files under `assets/rootfs/` and `assets/initramfs/`, overlaid *after* anything
+written from the toml — so a file in the tree wins, which is how `/etc/inittab`,
+`/etc/network/interfaces` and `/init` are edited. Both trees are in the same three parts: a `core/`
+half merged first, where one answer for both machines goes, and then each machine's own tree over
+it — the `/init` the two machines run is one file, `assets/initramfs/core/init`.
 
 ### Cross-architecture
 

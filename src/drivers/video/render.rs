@@ -456,12 +456,19 @@ pub fn running() -> bool {
 /// the boot, when a display was found.
 ///
 /// What the task does with the screen follows the console list, and this function
-/// does not decide any of it: the framebuffer console's being one of the
-/// consoles is what moves the kernel's log onto it, and a session claiming the
-/// card is what brings the grids up for a screen somebody else is driving.
-pub fn spawn(device: impl GpuDevice + 'static, view: Arc<VirtioGpuDev>) {
+/// does not decide any of it: the framebuffer console's being one of the consoles
+/// is what moves the kernel's log onto it, and a session claiming the card is what
+/// brings the grids up for a screen somebody else is driving.
+///
+/// The device arrives already erased ([`GpuDevice`]) rather than as a generic
+/// parameter, because the two machines reach the same card over different
+/// transports: a `Gpu<PciTransport>` on one and a `Gpu<MmioTransport>` on the
+/// other, with nothing above the transport that differs. Taking a box is what
+/// lets the boot have one call site for "a display was found" instead of one per
+/// transport - and the task holds it as a box anyway, so nothing is added here.
+pub fn spawn(device: Box<dyn GpuDevice>, view: Arc<VirtioGpuDev>) {
     critical_section::with(|cs| {
-        *DEVICE.borrow(cs).borrow_mut() = Some(Box::new(device));
+        *DEVICE.borrow(cs).borrow_mut() = Some(device);
         *VIEW.borrow(cs).borrow_mut() = Some(view);
     });
     let id = crate::sched::spawn_permanent(task, crate::sched::Priority::NORMAL);

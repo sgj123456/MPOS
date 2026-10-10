@@ -43,7 +43,7 @@ use super::file::{FdTable, File, RawFd};
 use super::{Ino, Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 
 // ---------------------------------------------------------------------------
-// The ABI: event bits, operations, and the packed epoll_event layout
+// The ABI: event bits, operations, and the machine's epoll_event layout
 // ---------------------------------------------------------------------------
 
 /// EPOLLIN: a read would not block - data is waiting, or the end of the
@@ -83,14 +83,33 @@ pub const EPOLL_CTL_ADD: usize = 1;
 pub const EPOLL_CTL_DEL: usize = 2;
 pub const EPOLL_CTL_MOD: usize = 3;
 
-/// One `struct epoll_event` of the x86_64 ABI: twelve bytes, and *packed* -
-/// the `data` word sits at byte 4, not 8, because the struct carries a u32
-/// and a u64 with no alignment padding between them. A wait that wrote
-/// `data` at a word-aligned offset would hand the caller garbage for the
-/// very field it uses to tell its descriptors apart.
+/// One `struct epoll_event`, whose layout is **the machine's** rather than one
+/// number: twelve bytes with `data` at byte 4 on x86_64, sixteen with `data` at
+/// byte 8 on aarch64.
+///
+/// The split is historical and it is Linux's own: the struct is `packed` only on
+/// x86_64 (`EPOLL_PACKED` in `uapi/linux/eventpoll.h` is
+/// `__attribute__((packed))` under `#if defined(__x86_64__)` and nothing
+/// anywhere else), so every other machine carries the u64 at its natural
+/// alignment with four bytes of padding after the u32. Every libc mirrors that
+/// guard - musl's `sys/epoll.h` has the same `#ifdef __x86_64__` - which makes a
+/// kernel that writes the x86_64 offsets everywhere hand the caller garbage in
+/// the one field it uses to tell its descriptors apart: `data` lands four bytes
+/// before the caller reads it, so the caller's low half comes from the middle of
+/// the kernel's `data` and its high half from the *next* record's `events` word.
+/// Measured before this split existed: on aarch64 udev's workers dereferenced
+/// `data.ptr` values whose upper 32 bits were `EPOLLIN`, three forked siblings
+/// dying identically on the first `epoll_wait` after their parent's fork.
+#[cfg(target_arch = "x86_64")]
 pub const EPOLL_EVENT_SIZE: usize = 12;
-/// Where `data` sits inside a `struct epoll_event`.
+#[cfg(target_arch = "aarch64")]
+pub const EPOLL_EVENT_SIZE: usize = 16;
+/// Where `data` sits inside a `struct epoll_event`: byte 4 on the packed x86_64
+/// layout, byte 8 on the machine that aligns it.
+#[cfg(target_arch = "x86_64")]
 pub const EPOLL_EVENT_DATA: usize = 4;
+#[cfg(target_arch = "aarch64")]
+pub const EPOLL_EVENT_DATA: usize = 8;
 
 /// How many descriptors one interest list may hold. Linux bounds this with
 /// `/proc/sys/fs/epoll/max_user_watches` and answers ENOSPC when it is hit;
@@ -633,9 +652,20 @@ mod tests {
         assert_eq!(EPOLL_CTL_ADD, 1);
         assert_eq!(EPOLL_CTL_DEL, 2);
         assert_eq!(EPOLL_CTL_MOD, 3);
-        // `struct epoll_event` is packed: twelve bytes, data at byte 4.
-        assert_eq!(EPOLL_EVENT_SIZE, 12);
-        assert_eq!(EPOLL_EVENT_DATA, 4);
+        // The record's layout is the *machine's* (see the constants), so these
+        // are the host's own half of the split. The aarch64 half - sixteen
+        // bytes, `data` at 8 - cannot be asserted from an x86_64 host, and is
+        // pinned on that machine by `t-epoll`'s own record.
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(EPOLL_EVENT_SIZE, 12);
+            assert_eq!(EPOLL_EVENT_DATA, 4);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(EPOLL_EVENT_SIZE, 16);
+            assert_eq!(EPOLL_EVENT_DATA, 8);
+        }
         assert_eq!(MAX_WATCHES, 1024);
     }
 

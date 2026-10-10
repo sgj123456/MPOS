@@ -91,7 +91,7 @@ hand-written ABI: a `#[repr(C)]` record in `RDI` at `_start`, with its magic num
 boot-stack canary. The record itself is one definition — the `mpos-bootinfo` leaf, which both
 `mpos-boot` and the kernel depend on — so its layout is written once and checked by
 `HANDOFF_MAGIC`. There is still no crate between the two *binaries* (the loader cannot link the
-`no_std` kernel, built for a different target), and the canary in `src/board/x86_64.rs` is still spelled
+`no_std` kernel, built for a different target), and the canary in `crates/bootinfo` is spelled
 on both sides; the record is not.
 
 **`mpos-user-abi` reaches into kernel source.** Each test program does
@@ -259,7 +259,7 @@ they are cross-crate edges.
 | Layer | Module | Owns | Must not |
 |---|---|---|---|
 | Entry | `src/main.rs` | The one architecture-independent entry (`_start`, which takes the loader's record in the platform's first argument register and hands the machine its callbacks) and the one panic handler (the machine's wire, the machine's context dump, stop). Established a machine by `mpos_arch::arch::boot` on x86_64 and aarch64 alike | Contain reusable logic — everything reusable lives in the lib so the host can test it. Name no machine: the bring-up is `arch`'s, so nothing here is `#[cfg]`-ed |
-| Board | `src/board/<arch>.rs` | What only a machine can answer: its boot wiring (`milestone`, `devices`, `init`), its devices, its milestone checks, the boot-stack canary check on x86_64, and the panic context dump | Be entered by more than one path — `src/board/mod.rs` picks the body in one place, exactly as `arch/src/arch/mod.rs` does for the library. Nothing here is machine *layer*: the entry, tables, pages and wire are `mpos-arch`'s (`NOTES.md` §14.8) |
+| Board | `src/board/` | The boot, with no architecture in it: one `start` and one flow (`flow.rs` — the console service, the device step, the kernel's own boot: bootstrap ramfs, archive, display's task, wire, stack, seed, pid-1 handoff), the ordered steps beside it (`steps.rs`), the banner and the panic walk (`report.rs`), and a test build's own evidence (`suites.rs`, `kunit.rs`). The device step itself is `drivers::virtio::probe`, which asks *both* transports — the PCI front-end and the record's MMIO windows — and registers what answers through each class's own contract | Contain a second sequence or a machine's name. The machine name is legal in exactly one place and it is not here: `mpos::arch::boot`, the machine layer's facade (`NOTES.md` §14.8). The kernel mounts nothing but its bootstrap ramfs — `/dev`, `/proc`, `/sys`, the real root and the host share are the early userland's (`assets/initramfs/core/init`, §15.6) |
 | Machine | `arch/src/arch/x86_64/` | GDT/IDT/TSS, PIC and LAPIC, 4-level paging, context switch, the `syscall`/`sysret` gate, the PIT, port I/O | Be named from outside `arch::`/`hal::` — the submodules are `pub(crate)` behind `arch/mod.rs`'s four-item facade, and the depgraph fails on any module but `arch`/`hal`/`main`/`lib` naming it. The register ABI the syscall gate and trap frame carry is per-arch by definition and stays here |
 | HAL | `arch/src/hal/` | The capability traits every machine implements (`Clock`, `WallClock`, `Cpu`, `Interrupts`, `Paging`, `Contexts`, `Console`, `Entropy`) with their associated types, the optional capability traits only some machines have (`Msi`, `SerialRing`, `FpuTrap`, `SignalFrame`), the platform tag `Current`, and the one-line forwards everything above calls | Hold machine logic: the `impl`s live in `arch/<arch>/`, so a port adds them there without editing a shared file. It is not `drivers::virtio::hal` (that is `virtio_drivers`' own `Hal`), and it is one trait per concern — not one per function — the baseline concerns every machine has plus optional capabilities a machine implements only if its hardware has them (`NOTES.md` §11.3) |
 | Memory | `src/mm/` | Buddy frame allocator (order 0–12), slab heap (16–2048 B), mapping plans, the ELF64 loader | Know about files, tasks or devices |
@@ -323,7 +323,8 @@ Details worth knowing:
   is a panic, not a wild read.
 - **The kernel mounts nothing but its own root.** `/proc`, `/sys`, `/dev`, the real root and
   `pivot_root` are all done by the initramfs's `/init`, because a kernel that assembles them
-  first leaves the pieces an owner of the system cannot unmount. See `initramfs/init`.
+  first leaves the pieces an owner of the system cannot unmount. See
+  `assets/initramfs/core/init` — one script for both machines.
 - **The boot stack has a canary.** The loader plants one, and `check_boot_stack()` in
   `src/board/x86_64.rs` verifies it twice — before the handoff and again after `spawn_init`, which is
   the deepest call the boot task ever makes.

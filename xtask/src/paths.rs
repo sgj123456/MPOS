@@ -37,14 +37,33 @@ pub(crate) const INITRAMFS_CONFIG: &str = "assets/configs/initramfs.toml";
 /// The root overlay the first machine merges last.
 pub(crate) const ROOTFS_OVERLAY_X86_64: &str = "assets/rootfs/x86_64";
 
-/// The second machine's root overlay - its own `/init` and `etc/`.
+/// The second machine's root overlay: `etc/`, the mounts and runlevels its own
+/// install writes. It carries no `/init` any more - both machines' disks answer
+/// to the standard `/sbin/init`, whose applet farm the build lays
+/// (`BUSYBOX_APPLETS`).
 pub(crate) const ROOTFS_OVERLAY_AARCH64: &str = "assets/rootfs/aarch64";
 
 /// The root overlay half *both* machines merge before their own (`CORE_OVERLAY`).
 pub(crate) const ROOTFS_CORE: &str = "assets/rootfs/core";
 
-/// The first machine's initramfs overlay, whose `/init` is the script.
+/// The first machine's initramfs overlay: the half only its own early userspace
+/// wants. Empty today, and the `/init` both machines run is *not* here - it is
+/// the core's (`INITRAMFS_CORE`). A directory that does not exist merges to
+/// nothing (`merge_overlay`'s documented answer), which is why an empty half
+/// needs no special case anywhere.
 pub(crate) const INITRAMFS_OVERLAY_X86_64: &str = "assets/initramfs/x86_64";
 
-/// The second machine's initramfs overlay.
+/// The second machine's initramfs overlay, merged after the core. Empty for the
+/// same reason as the first machine's, and the same shape: a file only this
+/// machine's early userspace wants is what would live here.
 pub(crate) const INITRAMFS_OVERLAY_AARCH64: &str = "assets/initramfs/aarch64";
+
+/// The early-userspace overlay half *both* machines merge before their own
+/// (`initramfs.rs`'s `CORE_OVERLAY`), as `ROOTFS_CORE` is for the disk: the one
+/// `/init` script the two machines run, and the tree's inventory beside it.
+pub(crate) const INITRAMFS_CORE: &str = "assets/initramfs/core";
+
+/// The busybox applet farm, one relative path per line: what a package's own
+/// post-install would install, for the machine whose install cannot run it
+/// (`rootfs::lay_applet_farm`).
+pub(crate) const BUSYBOX_APPLETS: &str = "assets/configs/busybox-applets.txt";

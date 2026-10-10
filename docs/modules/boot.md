@@ -75,7 +75,7 @@ The edges - who may call `boot`, and which modules this one may name - are
 
 `boot` owns one userspace fact: the command line. `src/vfs/procfs.rs` renders `/proc/cmdline` from
 `crate::boot::cmdline()`, and the initramfs's `/init` reads `root=`, `rootfstype=` and `rootflags=`
-from it (`initramfs/init`, `initramfs-aarch64/init`). The `console=` parsing is kernel-side policy,
+from it (`assets/initramfs/core/init`, one script for both machines). The `console=` parsing is kernel-side policy,
 not a syscall, and its honesty gap is recorded in `docs/UAPI.md` §5.3: `console=ttyN` pinning is
 refused rather than approximated, and `/dev/console` has no preferred-console plumbing (`NOTES.md`
 §7.1c). The handoff record itself never reaches userspace.

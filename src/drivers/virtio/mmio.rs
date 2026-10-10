@@ -1,32 +1,34 @@
-//! Virtio over the memory-mapped transport, the aarch64 machine's path.
+//! Virtio over the memory-mapped transport: the path to a device whose firmware
+//! describes it as a window rather than as a PCI function.
 //!
-//! x86_64 reaches its virtio devices through a PCI BAR; `virt` has no PCI for
-//! them - its thirty-two `virtio,mmio` windows are fixed physical ranges the
+//! On `virt` the thirty-two `virtio,mmio` windows are fixed physical ranges the
 //! device tree names and the boot maps into the kernel half. The `virtio-drivers`
-//! crate drives both the same way once it is handed a mapped register block: this
-//! module's job is only to turn a device-window address into a transport and open
-//! a device on it, so the crate owns the queue mechanics exactly as it does over
-//! PCI.
+//! crate drives both transports the same way once it is handed a mapped register
+//! block: this module's job is only to turn a device-window address into a
+//! transport and open a device on it, so the crate owns the queue mechanics
+//! exactly as it does over PCI.
 //!
-//! It is aarch64-only: `crate::drivers::virtio` gates this in where `rng`/`blk`/
-//! `net` are gated to the PCI path (`#[cfg(target_arch = "x86_64")]`), and the
-//! caller is a boot milestone check in `arch`, which owns reading the tree and
-//! deciding which window carries which device. The driver is handed an address,
-//! never a tree node - so it names neither `crate::boot` nor `crate::fdt`.
+//! Compiled on every machine, because which transport a device is behind is a
+//! fact about the machine and not about the build: a machine whose firmware
+//! describes itself with ACPI carries no tree, [`windows`] answers with no
+//! windows at all, and its devices come up through the PCI front-ends instead.
+//! What this module owns is the *walk* (`fdt`) and the register block; what it
+//! never owns is the decision of which device the kernel wants - the probe
+//! (`super::probe`) asks for a class by its virtio device ID, and a device is
+//! handed on as the transport-neutral contract (`NetDevice`, `P9Device`, ...) so
+//! nothing above this line learns which bus answered.
 //!
 //! The devices driven here are the ones a *stack* holds rather than a check
 //! reads: the entropy source, the block device a filesystem mounts, the network
 //! adapter the smoltcp stack sends and receives through, and the input device
 //! the evdev registry publishes and pumps. Each gets the same two answers its
 //! PCI counterpart has - a handle the caller owns, behind the usual kernel lock
-//! - and the checks drive them through those handles, so what a milestone proves
-//! and what the subsystem later uses are one device.
+//! - so what the probe opens and what the subsystem later uses are one device.
 //!
 //! The block and net devices are also published where the wiring layer can reach
-//! them ([`blockdev`] is handed to `Ext4Fs::mount` by the disk-root step,
-//! [`net_device`] is handed to `net::init`), because *which* window carries
-//! *which* device is the machine's business and the subsystem above must not
-//! probe for it.
+//! them ([`blockdev`] is the disk the block layer registers, `net::install` the
+//! adapter `net::init` is handed), because *which* window carries *which* device
+//! is the machine's business and the subsystem above must not probe for it.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -237,33 +239,15 @@ impl NetDevice for MmioNet {
 /// The adapter the boot opened, if it opened one. Set once by
 /// [`init_net_global`]; read by [`net_device`], which `main`'s net wiring hands to
 /// `net::init`.
-static NET_GLOBAL: Mutex<RefCell<Option<Arc<MmioNet>>>> = Mutex::new(RefCell::new(None));
-
-/// Open the virtio-net window at `virt` (spanning `size`) as the machine's network
-/// adapter, and return it - or `None` if the window does not open as one.
+/// Open the virtio-net window at `virt` (spanning `size`) as a network adapter,
+/// or `None` if the window does not open as one.
 ///
-/// This is the check's call, and the handle it returns is the *live* device: the
-/// same object `net::init` will be given through [`net_device`]. The boot check
-/// drives its data path (a transmit) while holding this handle, so the frame the
-/// marker reports and the frames the stack later sends go through one open ring
-/// and one device state, not two.
-///
-/// A machine whose card never probed leaves this `None`, and `net_device` answers
-/// `None` with it - which is the honest `ENETDOWN` the stack reports rather than a
-/// device that pretends to answer.
-pub fn init_net_global(virt: usize, size: usize) -> Option<Arc<MmioNet>> {
-    let dev = MmioNet::open(virt, size)?;
-    critical_section::with(|cs| {
-        *NET_GLOBAL.borrow(cs).borrow_mut() = Some(dev.clone());
-    });
-    Some(dev)
-}
-
-/// The machine's network adapter, if it has one - what `main`'s net wiring passes
-/// to `net::init`.
-pub fn net_device() -> Option<Arc<dyn NetDevice>> {
-    let dev = critical_section::with(|cs| NET_GLOBAL.borrow(cs).borrow().clone())?;
-    Some(dev)
+/// The handle that comes back is the live device: the same transport-neutral
+/// contract the PCI front-end answers with, so the probe publishes it in one
+/// place (`super::net::install`) whichever bus found it, and `net::init` is
+/// handed it without learning which.
+pub fn net(virt: usize, size: usize) -> Option<Arc<dyn NetDevice>> {
+    Some(MmioNet::open(virt, size)?)
 }
 
 /// The device-specific configuration window inside a virtio-mmio register
@@ -517,4 +501,95 @@ pub fn rng_device(virt: usize, size: usize) -> Option<Arc<dyn EntropySource>> {
     let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
     let device = VirtIORng::<HalImpl, _>::new(transport).ok()?;
     super::rng::install_probed(Some(device))
+}
+
+// ---------------------------------------------------------------------------
+// Which windows carry which device: the walk over the record's device tree.
+// ---------------------------------------------------------------------------
+
+/// The four identity words a virtio-mmio transport answers before any driver has
+/// touched it, at their fixed offsets in the register block.
+///
+/// They are the whole reason a machine can be asked *which* of its windows carry
+/// a device: `virt` publishes thirty-two `virtio,mmio` nodes whether or not
+/// anything is attached to them, and that is measured rather than assumed (the
+/// tree decompiled with and without `-device virtio-rng-device` differs only in
+/// the firmware's own random seeds, byte for byte). So the tree cannot say, and
+/// the transport's own registers can.
+pub const VIRTIO_MMIO_MAGIC: usize = 0x000;
+/// `Version`: which register layout this transport speaks.
+pub const VIRTIO_MMIO_VERSION: usize = 0x004;
+/// `DeviceID`: zero when no device is attached to the transport.
+pub const VIRTIO_MMIO_DEVICE_ID: usize = 0x008;
+/// `VendorID`: whose device it is, which the specification leaves to the
+/// implementation.
+pub const VIRTIO_MMIO_VENDOR_ID: usize = 0x00c;
+
+/// `MagicValue`: the four ASCII letters `virt`, read as one little-endian word.
+pub const VIRTIO_MAGIC: u32 = 0x7472_6976;
+
+/// `Version`: 2 is the modern (1.0) transport, which is the only register layout
+/// the driver crate reads. Version 1 is the legacy one, whose registers are at
+/// different offsets and which has no device-feature words at all.
+pub const VIRTIO_VERSION_MODERN: u32 = 2;
+
+/// One identity word of the transport mapped at `virt`.
+///
+/// # Safety
+///
+/// `virt` must be a window `hal::map_mmio_window` answered for - that is what
+/// makes the read reachable device memory rather than an arbitrary address - and
+/// `offset` one of the four words above.
+pub unsafe fn read_identity(virt: usize, offset: usize) -> u32 {
+    // SAFETY: the caller's contract. The kernel's own callers read only the four
+    // words above, inside the 512-byte stride a virtio-mmio transport owns.
+    unsafe { core::ptr::read_volatile((virt + offset) as *const u32) }
+}
+
+/// Every `virtio,mmio` window this record describes whose `DeviceID` is `want`,
+/// as `(kernel-virtual header, size)`.
+///
+/// A machine whose firmware describes itself another way carries no device tree
+/// and answers with no windows - which is the honest answer rather than a
+/// failure, because such a machine reaches its devices over another transport.
+/// A tree that will not walk is likewise no windows: what this function cannot
+/// read it cannot claim, and a caller that finds nothing says so in its own line
+/// rather than being handed a wrong window.
+///
+/// The order is the tree's, and callers that need *one* device of a class pick by
+/// what the window answers to a driver probe rather than by position, because
+/// QEMU assigns the MMIO slots in an order nothing can rely on.
+pub fn windows(info: &mpos_bootinfo::BootInfo, want: u32) -> Vec<(usize, usize)> {
+    let Some(bytes) = info.dtb else {
+        return Vec::new();
+    };
+    let Ok(tree) = mpos_fdt::Fdt::new(bytes) else {
+        return Vec::new();
+    };
+    let mut windows = Vec::new();
+    let _ = tree.each(
+        |node| node.is_compatible("virtio,mmio"),
+        |node| {
+            for (address, size) in node.reg() {
+                let (address, size) = (address as usize, size as usize);
+                let Some(virt) = crate::hal::map_mmio_window(address, size) else {
+                    continue;
+                };
+                // SAFETY: `map_mmio_window` answered for this range, which is the
+                // machine saying the window is mapped device memory; the two
+                // offsets are the identity words above.
+                let (magic, id) = unsafe {
+                    (
+                        read_identity(virt, VIRTIO_MMIO_MAGIC),
+                        read_identity(virt, VIRTIO_MMIO_DEVICE_ID),
+                    )
+                };
+                if magic == VIRTIO_MAGIC && id == want {
+                    windows.push((virt, size));
+                }
+            }
+            true
+        },
+    );
+    windows
 }

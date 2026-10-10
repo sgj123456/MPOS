@@ -9,11 +9,13 @@
 //! # One pipeline, two machines
 //!
 //! Both machines build this archive the same way - repositories, apk, the
-//! busybox applet farm, the overlay, ustar - and this module is that one copy.
-//! What differs is [`Machine`]: which toml describes it, which overlay tree
-//! carries its `/init`, where the staging tree and the archive live, whether the
+//! busybox applet farm, the overlays, ustar - and this module is that one copy.
+//! What differs is [`Machine`]: which toml describes it, which overlay tree is
+//! its own half, where the staging tree and the archive live, whether the
 //! package set comes from the toml or is pinned, how the applet farm is laid,
-//! and whether a stamp records when the tree was laid.
+//! and whether a stamp records when the tree was laid. What does *not* differ is
+//! the `/init` script: it is the shared core's, one file for both machines
+//! ([`CORE_OVERLAY`]).
 //!
 //! The module was two files until this became one: `aarch64_initramfs.rs` was
 //! the second machine's copy of this pipeline, and the two shapes are the same
@@ -41,9 +43,13 @@ use crate::utils;
 /// them. Running it means executing it, and the x86_64 build can (its host is
 /// its own architecture) while the aarch64 build cannot: a cross-arch `execve`
 /// is the `Exec format error` the Alpine install records. So the second machine
-/// declares the applets its boot scripts use and links them by hand, and the
-/// guest makes the rest of the farm itself at first boot, on the machine that
-/// can (`rootfs-aarch64/init` runs `busybox --install -s`).
+/// declares the applets its own boot scripts exec and links them by hand.
+///
+/// This is the *archive*'s farm, and it is deliberately short: the archive's
+/// `/init` (the shared core script) needs a shell, a `mount` and a
+/// `switch_root`, and everything else a boot execs comes from the *disk*, whose
+/// full farm the build lays from `busybox --list-full`
+/// (`rootfs::lay_applet_farm`).
 enum Farm {
     /// `chroot <staging> /bin/busybox --install -s` - the host can exec the tree.
     Chroot,
@@ -80,9 +86,11 @@ struct Machine {
     /// The toml this archive is described by: mirror, branch, repositories and
     /// (unless pinned) the package set.
     config: &'static str,
-    /// The overlay tree applied last, whose `/init` is the script. A file in the
-    /// tree beats anything written from the config, which is how editing the
-    /// boot's script is editing a file and not this crate.
+    /// The machine's own overlay tree, applied last - after the shared core, so
+    /// a machine may still replace anything the core carries. Empty today, and
+    /// that is a value rather than a case: the `/init` script is the core's, and
+    /// a directory that does not exist merges to nothing (`merge_overlay`'s
+    /// documented answer).
     overlay: &'static str,
     /// The staging tree under `build/`.
     staging: &'static str,
@@ -140,11 +148,12 @@ const AARCH64: Machine = Machine {
 };
 
 /// The applets the second machine's initramfs scripts exec, besides the shell.
-/// `switch_root` is the pivot; `pivot_root` is what the *disk* `/init` chain may
-/// reach for; `mkdir`/`cat`/`echo` are the script's file vocabulary. A name
-/// missing from the farm is a boot that dies on `ENOENT` mid-script, so this list
-/// is part of the contract with `initramfs-aarch64/init` and `rootfs-aarch64/init`
-/// - [`tests::the_farm_covers_the_scripts_vocabulary`] is what holds it there.
+/// `switch_root` is the pivot; `pivot_root` is what a *disk* script may reach
+/// for; `mkdir`/`cat`/`echo` are the script's file vocabulary. A name missing
+/// from the farm is a boot that dies on `ENOENT` mid-script, so this list is
+/// part of the contract with the shared `/init`
+/// (`assets/initramfs/core/init`) - [`tests::the_farm_covers_the_scripts_vocabulary`]
+/// is what holds it there.
 ///
 /// `true`, `false` and `ls` are here for a *test*, not a script: `t-stdspawn`
 /// runs `/bin/{true,false,echo,cat,sh,ls}` to prove a program can start other
@@ -178,6 +187,26 @@ impl Machine {
     fn tar_path(&self, build_dir: &Path) -> PathBuf {
         build_dir.join(self.tar)
     }
+}
+
+/// The repository's machine-neutral early-userspace overlay: one copy of each
+/// file, merged into **both** machines' archives before their per-machine trees.
+/// A file belongs here when both machines want the same answer and nothing about
+/// the hardware says otherwise; `initramfs/core/root/README` is the inventory
+/// and the rule. The `/init` both machines run is the reason it exists: it was
+/// two files, one per machine, whose bodies had drifted while the second one's
+/// header claimed they were the same script.
+pub(crate) const CORE_OVERLAY: &str = crate::paths::INITRAMFS_CORE;
+
+/// Merge the shared core first, then the machine's own tree over it - so a
+/// machine may still replace anything the core carries, exactly as
+/// `rootfs::merge_overlays` does for the disk. `src` names are resolved against
+/// the repository root; a missing directory merges nothing, which keeps an empty
+/// machine half honest without a special case here.
+fn merge_overlays(root: &Path, machine: &Machine, staging: &Path) -> Result<()> {
+    utils::merge_overlay(&root.join(CORE_OVERLAY), staging)?;
+    utils::merge_overlay(&root.join(machine.overlay), staging)?;
+    Ok(())
 }
 
 /// Build the archive for `arch`, unless the one on disk is already newer than
@@ -226,21 +255,17 @@ pub fn build_initramfs(build_dir: &Path, arch: Arch) -> Result<()> {
     };
     packages.extend(config.extra_packages.clone());
 
-    install_packages(machine, &apk, &staging, &config, &packages)?;
+    install_packages(machine, &apk, &staging, &packages)?;
     lay_farm(machine, &staging)?;
 
-    // `/init` is a file of its own - a file in the overlay tree, applied last -
-    // so nothing here writes it. It used to be a constant in this binary, which
-    // is why a rebuilt `xtask` had to count as a reason to rebuild the archive;
-    // a file in the tree has an mtime, and the staleness check reads that
-    // instead.
+    // `/init` is a file of the overlay trees and not a constant in this binary,
+    // which is why a rebuilt `xtask` stopped counting as a reason to rebuild the
+    // archive: a file in the tree has an mtime, and the staleness check reads
+    // that instead.
     //
-    // The first machine's overlay carries an executable `/init` already and its
-    // `/bin/sh` is a link this function used to make by hand, because the
-    // chrooted `busybox --install -s` above cannot know the tree's shell name.
-    // The second machine's farm is laid by hand and includes `sh`; its `/init`
-    // comes from a git checkout, where the executable bit is not guaranteed, so
-    // it is set here - `execve` refuses a non-executable `/init` even for root.
+    // The first machine's `/bin/sh` is a link this function has to make by hand,
+    // because the chrooted `busybox --install -s` above cannot know the tree's
+    // shell name; the second machine's farm is laid by hand and includes `sh`.
     if matches!(machine.arch, Arch::X86_64) {
         let sh = staging.join("bin/sh");
         if sh.symlink_metadata().is_ok() {
@@ -249,7 +274,12 @@ pub fn build_initramfs(build_dir: &Path, arch: Arch) -> Result<()> {
         std::os::unix::fs::symlink("/bin/busybox", &sh)?;
     }
 
-    utils::merge_overlay(&root.join(machine.overlay), &staging)?;
+    // The overlay pair, applied last: the shared core, then this machine's own
+    // half over it.
+    merge_overlays(&root, machine, &staging)?;
+    // The script comes from a git checkout, where the executable bit is not
+    // guaranteed, so it is set here - `execve` refuses a non-executable `/init`
+    // even for root.
     let init = staging.join("init");
     fs::set_permissions(&init, fs::Permissions::from_mode(0o755))
         .context("The initramfs carries no /init")?;
@@ -268,18 +298,22 @@ pub fn build_initramfs(build_dir: &Path, arch: Arch) -> Result<()> {
 }
 
 /// Ask apk for the packages, in the shape this machine's build needs.
+///
+/// The archive's config is not a parameter: what it decides - which packages, in
+/// which order - is resolved by the caller, and the one thing apk still needs
+/// from it is the machine's own package architecture, which is `machine.arch`'s
+/// word rather than a key's (`xtask/src/arch.rs`).
 fn install_packages(
     machine: &Machine,
     apk: &str,
     staging: &Path,
-    config: &InitramfsConfig,
     packages: &[String],
 ) -> Result<()> {
     // `--no-scripts` because the package scripts are written for a chroot and
     // this tree is not one yet. What they also do is not optional on the first
     // machine: busybox's post-install creates the applet links, so the farm is
     // laid below by hand there instead.
-    let arch = config.arch.as_str();
+    let arch = machine.arch.name();
     match machine.apk {
         Apk::Direct => {
             let status = Command::new(apk)
@@ -326,18 +360,16 @@ fn lay_farm(machine: &Machine, staging: &Path) -> Result<()> {
     }
 }
 
-/// Link this machine's applet farm into a tree of the caller's own.
+/// Link the *archive's* applet vocabulary into a tree of the caller's own.
 ///
-/// A boot disk's root is the archive unpacked ([`unpack_into`]) plus whatever
-/// is staged over it, and the applets a *test* execs are not something the
-/// archive's own scripts happen to name - `t-stdspawn` runs `/bin/true` and
-/// `/bin/ls`, which no boot script mentions. So the disk links the same list
-/// rather than inheriting whatever the ramfs half needed, and the list stays a
-/// property of the machine instead of a second copy in the staging code.
-///
-/// Idempotent: a name already present (because the archive carried it) is left
-/// alone. The first machine's farm is laid by `busybox --install -s` inside its
-/// chroot, so there is nothing to add for it.
+/// A tree laid from this archive - a boot disk's root - is a tree this machine's
+/// scripts will exec in, so it answers the names those scripts name. It is laid
+/// *before* the full farm (`rootfs::lay_applet_farm`), which is what a disk
+/// carries on top: 309 names from the machine's own `busybox --list-full`,
+/// covering this short list and everything else a distribution's scripts reach
+/// for. Keeping the two separate is what makes this list a statement about *this
+/// script* rather than a subset of a bigger one, and the second pass costs a
+/// no-op - a name already answered is skipped (`link_applet_paths`).
 pub fn link_farm(staging: &Path, arch: Arch) -> Result<()> {
     match machine(arch).farm {
         Farm::ByHand(applets) => link_applets(staging, applets),
@@ -346,18 +378,16 @@ pub fn link_farm(staging: &Path, arch: Arch) -> Result<()> {
 }
 
 fn link_applets(staging: &Path, applets: &[&str]) -> Result<()> {
-    // Absolute targets, because the guest resolves a symlink relative to
-    // the tree it stands in and `busybox` sits at `/bin/busybox`.
-    fs::create_dir_all(staging.join("bin"))?;
-    for applet in applets {
-        let path = staging.join(format!("bin/{applet}"));
-        if path.symlink_metadata().is_ok() {
-            continue;
-        }
-        std::os::unix::fs::symlink("/bin/busybox", &path)
-            .with_context(|| format!("Failed to link /bin/{applet} into the initramfs"))?;
-    }
-    Ok(())
+    // The archive's farm is all in `/bin` (the applets its own scripts exec),
+    // and the link itself is `rootfs::link_applet_paths` - one implementation of
+    // "link `/bin/busybox` here unless something already answers", shared with
+    // the disk's full farm.
+    let paths: Vec<String> = applets
+        .iter()
+        .map(|applet| format!("bin/{applet}"))
+        .collect();
+    let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+    crate::rootfs::link_applet_paths(staging, &paths)
 }
 
 /// Pack the staging tree as the archive both kernels' `vfs::tar` reads.
@@ -478,6 +508,12 @@ pub fn needs_rebuild(build_dir: &Path, arch: Arch) -> Result<bool> {
         None => utils::file_mtime(&tar)?,
     };
 
+    // Both halves, because either can hold a file a boot will exec: the core
+    // carries the `/init` script, and a machine's own tree carries anything that
+    // replaced it.
+    if utils::dir_newer_than(&root.join(CORE_OVERLAY), since)? {
+        return Ok(true);
+    }
     utils::dir_newer_than(&root.join(machine.overlay), since)
 }
 
@@ -502,21 +538,21 @@ fn packed_line(arch: Arch, tar: &Path, size: u64) -> String {
 mod tests {
     use super::*;
 
-    /// The farm's list is a contract with the script: every verb declared in
-    /// `initramfs-aarch64/init`'s `@vocabulary:` line must be an applet busybox
-    /// answers - shipped by the package or laid by the farm above. A name that
-    /// is neither is a boot that dies on `ENOENT` mid-pivot, and a headless
-    /// verdict reads that as a hang; this pin fails at build time instead. The
-    /// declaration is read rather than scanned because a shell-script scanner is
-    /// a heuristic, and a heuristic that passes is the failure mode here.
+    /// The farm's list is a contract with the script: every verb declared in the
+    /// shared `/init`'s `@vocabulary:` line must be an applet busybox answers -
+    /// shipped by the package or laid by the farm above. A name that is neither
+    /// is a boot that dies on `ENOENT` mid-pivot, and a headless verdict reads
+    /// that as a hang; this pin fails at build time instead. The declaration is
+    /// read rather than scanned because a shell-script scanner is a heuristic,
+    /// and a heuristic that passes is the failure mode here.
+    ///
+    /// One script to read, because both machines run the core's: this used to
+    /// ask the second machine's own copy, which is also how the two bodies were
+    /// able to drift apart unnoticed.
     #[test]
     fn the_farm_covers_the_scripts_vocabulary() {
         let root = utils::project_root().unwrap();
-        let text = std::fs::read_to_string(
-            root.join(crate::paths::INITRAMFS_OVERLAY_AARCH64)
-                .join("init"),
-        )
-        .unwrap();
+        let text = std::fs::read_to_string(root.join(CORE_OVERLAY).join("init")).unwrap();
         let line = text
             .lines()
             .find(|l| l.starts_with("@vocabulary:"))
@@ -549,6 +585,37 @@ mod tests {
             "one file holds both machines' halves now; the section is what differs"
         );
         assert_eq!(X86_64.config, crate::paths::INITRAMFS_CONFIG);
+    }
+
+    /// The `/init` both machines run is **one** file, and it is the core's: a
+    /// copy in either machine's tree is the drift this split exists to end. The
+    /// two files it replaced *were* the same script - the second one's header
+    /// said so - while their bodies differed by the selftest console probe, the
+    /// switch-root verdict line and the name of the disk's own pid-1 chain, and
+    /// nothing failed over any of it.
+    ///
+    /// The pin is the script and not the directories: a machine tree is allowed
+    /// to be empty (both are, today) and to grow a file of its own; what it may
+    /// not do silently is shadow the shared script.
+    #[test]
+    fn the_boot_script_is_one_file_in_the_shared_core() {
+        let root = utils::project_root().unwrap();
+        assert!(
+            root.join(CORE_OVERLAY).join("init").is_file(),
+            "the shared core must carry the /init both machines run"
+        );
+        // The inventory `initramfs/core/root/README` claims.
+        assert!(
+            root.join(CORE_OVERLAY).join("root/README").is_file(),
+            "the core's README is the inventory of this tree"
+        );
+        for overlay in [X86_64.overlay, AARCH64.overlay] {
+            assert!(
+                !root.join(overlay).join("init").exists(),
+                "{overlay}/init shadows the shared script - two copies is how \
+                 the two machines drifted apart"
+            );
+        }
     }
 
     /// The two machines' archives are two files, and each machine's boot reads

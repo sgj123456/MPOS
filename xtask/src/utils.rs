@@ -242,7 +242,8 @@ pub fn dir_newer_than(dir: &Path, after: SystemTime) -> Result<bool> {
 /// The line `lay_p9_share` writes into every exported share, and the line a boot
 /// reads back to prove the share *serves* rather than merely mounted.
 ///
-/// Written literally in the kernel's `check_p9_dev` too (`board/aarch64.rs`).
+/// Written literally in the kernel's own probe too (`drivers/virtio/probe.rs`
+/// registers the tag the host exported; the mount is the early userland's).
 /// A fixture both sides have to agree on has two copies, and the check's job is
 /// to notice if they drift; the disk image's `i as u8` pattern sector is the
 /// same arrangement (`NOTES.md` §13.29).

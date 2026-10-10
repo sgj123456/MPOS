@@ -39,15 +39,12 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use critical_section::Mutex;
 use virtio_drivers::device::input::AbsInfo;
-#[cfg(target_arch = "x86_64")]
 use virtio_drivers::device::input::VirtIOInput;
 
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 
 use super::InputDevice;
-#[cfg(target_arch = "x86_64")]
 use super::VirtioInputDev;
-#[cfg(target_arch = "x86_64")]
 use super::hal::{HalImpl, transport_all};
 
 /// The modern device ID; virtio-input never had a legacy form. Every input
@@ -59,7 +56,6 @@ use super::hal::{HalImpl, transport_all};
 /// finds the same device by the `virtio,mmio` window its device tree names
 /// (`super::mmio`), and both arrive at [`register`] holding the same
 /// [`InputDevice`].
-#[cfg(target_arch = "x86_64")]
 const DEVICE_INPUT: &[u16] = &[0x1052];
 
 // One `struct input_event`, and the window of them a device keeps, live in
@@ -838,6 +834,19 @@ impl Inode for EvdevNode {
         self.perms.set_owner(uid, gid);
     }
 
+    fn atime(&self) -> u64 {
+        self.perms.atime()
+    }
+
+    fn mtime(&self) -> u64 {
+        self.perms.mtime()
+    }
+
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        self.perms.set_times(atime, mtime);
+        Ok(())
+    }
+
     /// The device number `stat` reports: input's major 13, and the minor
     /// [`input_minor`] gives the device.
     ///
@@ -1065,7 +1074,6 @@ fn publish_nodes(dev: &crate::vfs::devfs::DevFs) {
 /// and everything above is the contract. A function that does not open as an
 /// input device is skipped rather than guessed at, which is why a machine whose
 /// bus answered with none gets an empty list and an honestly empty `/dev/input`.
-#[cfg(target_arch = "x86_64")]
 pub fn init() -> Vec<(Arc<EvdevNode>, String)> {
     let devices: Vec<Arc<dyn InputDevice>> = transport_all(DEVICE_INPUT)
         .into_iter()

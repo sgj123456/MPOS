@@ -245,10 +245,7 @@ pub fn machine_args(
     // that is supposed to have a SATA disk and quietly does not would report
     // `t-ahci` failing for a reason that is not the driver's.
     if let Boot::Esp(esp) = &boot {
-        let disk = esp
-            .parent()
-            .expect("the ESP path has a directory")
-            .join(crate::selftest::SATA_TEST_IMAGE);
+        let disk = crate::disk::sata_image(esp.parent().expect("the ESP path has a directory"));
         args.extend([
             "-drive".into(),
             format!("file={},format=raw,if=none,id=sd0", disk.display()),
@@ -762,6 +759,34 @@ pub fn virt_machine_args(
         "virtio-gpu-device".into(),
     ];
 
+    // The second disk, on a *PCI* controller - the one device on this machine
+    // that is not on an MMIO transport, and deliberately so: it is the second
+    // machine's answer to the first's `ich9-ahci`, and the reason it can be is
+    // that this kernel now enumerates a PCI bus here at all (`discover_ecam_dt`
+    // reads the `pci-host-ecam-generic` window this machine's tree publishes,
+    // and `mmio::window` gives the controller's BAR a virtual address). Before
+    // either of those existed there was nowhere to put a BAR on this machine,
+    // which is why `t-ahci` was a test the first machine alone could run.
+    //
+    // Attached unconditionally rather than "if the file exists", for the reason
+    // the first machine's arm gives: a test machine that is supposed to have a
+    // SATA disk and quietly does not would report `t-ahci` failing for a reason
+    // that is not the driver's. The image is laid beside the boot disk
+    // (`disk::ensure_sata_image`), so its directory is the one fact both ends
+    // already agree on.
+    let sata = crate::disk::sata_image(image.parent().expect("the image has a directory"));
+    args.extend([
+        "-drive".into(),
+        format!(
+            "file={},format=raw,if=none,id=sd0,file.locking=off",
+            sata.display()
+        ),
+        "-device".into(),
+        "ich9-ahci,id=ahci".into(),
+        "-device".into(),
+        "ide-hd,drive=sd0,bus=ahci.0".into(),
+    ]);
+
     // The display and the wire, from the one decision both machines share
     // (`wiring`). This machine names its window backend in its own half of
     // `machine.toml` (`none`: the session is the PL011, and the kernel's
@@ -814,7 +839,7 @@ pub fn virt_machine_args(
         args.extend(["-device".into(), "vhost-vsock-device,guest-cid=4".into()]);
     }
 
-    // The ninth class (`check_p9_dev`): the host share, the same arrangement the
+    // The ninth class (9p): the host share, the same arrangement the
     // first machine's `-virtfs` makes. `-fsdev` is the backend - the host
     // directory QEMU's 9p server exports, with `security_model=none` so the
     // host's own permissions decide - and `virtio-9p-device` is the transport

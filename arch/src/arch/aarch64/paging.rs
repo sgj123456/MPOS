@@ -153,10 +153,14 @@ const MAIR: u64 = (MAIR_DEVICE_BYTE << (8 * ATTR_DEVICE))
     | (MAIR_NORMAL_NC_BYTE << (8 * ATTR_NORMAL_NC))
     | (MAIR_NORMAL_BYTE << (8 * ATTR_NORMAL));
 
-/// `TCR_EL1` for a 48-bit virtual address space on both halves, a 4 KiB granule,
-/// inner-shareable write-back walks and `IPS` 40 bits (1 TiB of physical).
-/// `T0SZ`/`T1SZ` are 16, which is what puts the split at bit 47.
-const TCR: u64 = 16
+/// `TCR_EL1` for a 48-bit virtual address space on both halves, a 4 KiB granule
+/// and inner-shareable write-back walks on both of them.
+///
+/// `T0SZ`/`T1SZ` are 16, which is what puts the split at bit 47. What is *not*
+/// here is `IPS` - the field that bounds every physical address the walk may
+/// output - because that value belongs to the machine rather than to the format:
+/// [`tcr`] reads it off the CPU and ORs it in.
+const TCR_BASE: u64 = 16
     | (16 << 16)
     | (3 << 8)
     | (3 << 10)
@@ -165,6 +169,103 @@ const TCR: u64 = 16
     | (3 << 26)
     | (3 << 28)
     | (2 << 30);
+
+/// `TCR_EL1`'s `IPS` field: bits 34:32, the physical address size in the very
+/// encoding `ID_AA64MMFR0_EL1`'s `PARange` uses.
+const IPS_SHIFT: u64 = 32;
+
+/// The largest code either of those fields defines: `0b110`, 52 bits. A code
+/// above it is reserved, and the answer is to clamp to this one rather than to
+/// refuse to boot - which is Linux's, for the same reason.
+const IPS_MAX: u64 = 6;
+
+/// The physical address size each code stands for, in bits. A code names the
+/// width of the address space, so these are the shifts of its limit.
+const PARANGE_BITS: [u32; 7] = [32, 36, 40, 42, 44, 48, 52];
+
+/// `ID_AA64MMFR0_EL1`'s `PARange`: how much physical address this machine can
+/// name, as the code both `PARange` and `IPS` spell it.
+fn parange() -> u64 {
+    let mmfr0: u64;
+    // SAFETY: `ID_AA64MMFR0_EL1` is readable at EL1 with no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, id_aa64mmfr0_el1", out(reg) mmfr0, options(nomem, nostack));
+    }
+    (mmfr0 & 0xF).min(IPS_MAX)
+}
+
+/// The `IPS` code [`tcr`] programs: this machine's own `PARange`.
+///
+/// Public to the rest of this crate because it is one half of a boot check that
+/// reads the other half back - `TCR_EL1` itself.
+pub fn programmed_ips() -> u64 {
+    parange()
+}
+
+/// `TCR_EL1` as the register holds it.
+///
+/// Read back rather than remembered, for the same reason `adopt` reads the base
+/// registers: the check that `IPS` says what this CPU implements has to compare
+/// the machine's state with the machine's own answer, not with the expression
+/// that wrote it. That expression *was* wrong - it omitted the field entirely -
+/// and a check against it would have agreed with the bug.
+pub fn tcr_el1() -> u64 {
+    let tcr: u64;
+    // SAFETY: `TCR_EL1` is readable at EL1 with no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, tcr_el1", out(reg) tcr, options(nomem, nostack));
+    }
+    tcr
+}
+
+/// The `IPS` code inside a `TCR_EL1` value.
+pub fn ips_in(tcr: u64) -> u64 {
+    (tcr >> IPS_SHIFT) & 0x7
+}
+
+/// How many bits of physical address this machine implements.
+///
+/// The bound on every physical address this module writes into a descriptor: a
+/// leaf whose output address is wider than this is not a mapping the walk can
+/// make, and the hardware's answer is an address-size fault at the *first
+/// access*, not at the write that made it. That is what `TCR_EL1`'s `IPS` field
+/// exists to say, and why leaving it unset is not "no limit": the field's zero
+/// is 32 bits.
+pub fn phys_bits() -> u32 {
+    PARANGE_BITS[parange() as usize]
+}
+
+/// Whether the walk can reach `phys..phys+len`.
+///
+/// Asked before a *device's* address is mapped rather than after it is read,
+/// because a PCIe BAR's address is the firmware's to choose and a firmware that
+/// named one above this CPU's physical address space would otherwise be an abort
+/// at the first access rather than the absence of a device. `crate::arch::aarch64`'s
+/// `map_mmio_window` is the caller that turns a `false` here into that absence.
+pub fn phys_reachable(phys: usize, len: usize) -> bool {
+    match phys.checked_add(len) {
+        Some(end) => (end as u64) <= 1u64 << phys_bits(),
+        None => false,
+    }
+}
+
+/// `TCR_EL1`: [`TCR_BASE`] plus this machine's own physical address size.
+///
+/// `IPS` is the field this was missing, and leaving it out is not a missing
+/// limit but the wrong one: zero is *32 bits*, so the first device above 4 GiB -
+/// this machine's PCIe ECAM at `0x40_1000_0000`, whose registers the PCI walk
+/// reads through the dynamic window - took an address-size abort at the leaf
+/// (`ESR_EL1` `0x96000003`, `FAR_EL1` `0xffff_ffff_4400_0000`) instead of
+/// reading. Every physical address this kernel had reached before the ECAM -
+/// RAM below 4 GiB, and a device window at `0x0800_0000` - fits in 32 bits, which
+/// is the whole reason a zero `IPS` booted for as long as it did, and the reason
+/// the field's absence was invisible until a bus decided to live high.
+///
+/// The 4 KiB granule wants `T1SZ >= 16` once `IPS` is above 44 bits, and
+/// `TCR_BASE`'s `T1SZ` is 16 whatever the field ends up holding.
+fn tcr() -> u64 {
+    TCR_BASE | (parange() << IPS_SHIFT)
+}
 
 /// `SCTLR_EL1` bits the kernel ORs in: `M` (the MMU), `C` (data cache) and `I`
 /// (instruction cache) - deliberately **not** `A` (alignment checking).
@@ -506,23 +607,122 @@ pub fn write_user_u32(root: usize, at: usize, value: u32) -> bool {
     }
 }
 
-/// Map a device's register window into the kernel half.
+/// Map a device's register window into the kernel half, as Device memory.
 ///
-/// There is nothing to add on this machine: the whole 64 MiB window the tree
-/// describes is mapped at boot (stage 5b), and [`device_virt`] is the only door to
-/// it. So `map_mmio` confirms the window already covers `[phys, phys + len)` at
-/// the address the caller named and does nothing - which is correct for a machine
-/// whose devices are a firmware-described range - and panics on a window outside
-/// it. A PCIe aarch64 server that hands out BARs to map dynamically is a named
-/// gap in `NOTES.md` §9.1, not something to half-implement here.
+/// Two ranges, and the difference between them is what this machine's two kinds
+/// of device are. Inside the 64 MiB window the tree describes - PL011, the GIC,
+/// the virtio-MMIO frames - the mapping was made whole at boot (stage 5b) and
+/// [`device_virt`] is the door to it, so the call confirms the caller named the
+/// address that window already uses and returns. **Outside** it, the range is
+/// mapped now: a PCIe device's BARs, and the ECAM window itself, are addresses
+/// the firmware hands out at enumeration time rather than addresses a tree
+/// describes, so there is nothing to have mapped at boot.
+///
+/// That second half is what `NOTES.md` §9.1 used to name as the gap - "a PCIe
+/// aarch64 server that hands out BARs to map dynamically is a named gap, not
+/// something to half-implement here" - and it is closed here rather than
+/// half-implemented: the mapping goes into `TTBR1_EL1`'s own table
+/// ([`kernel_root`]), page by page, with the same Device attributes the boot
+/// window's pages carry, and the walker's cached translations are dropped
+/// afterwards. Kernel half only, and never executable from either exception
+/// level, which [`device_attributes`] is what says.
+///
+/// The tables in between are allocated from the kernel's own frame allocator
+/// through `hal::kernel`, the same door `install`'s builder uses - this module
+/// cannot name `crate::mm`, and a page table is the one thing a machine layer is
+/// allowed to ask the kernel for frames for.
+///
+/// # Panics
+///
+/// On a `virt` or `phys` that is not page-aligned, on an empty length, or on a
+/// `virt` below [`USER_END`]: a device's registers belong in the half a process
+/// cannot name, and a mapping that landed in the low half would be a process's
+/// to reach.
 pub fn map_mmio(virt: usize, phys: usize, len: usize) {
-    if device_virt(phys, len) != Some(virt) {
-        panic!(
-            "aarch64 map_mmio: [{phys:#x}, {:#x}) is outside the fixed device window; \
-             this machine maps its MMIO statically and has no dynamic window yet",
-            phys + len
-        );
+    if device_virt(phys, len) == Some(virt) {
+        // The boot window, already mapped - and the *same* address, which is the
+        // claim being made: a caller that named some other virtual address for a
+        // device inside the window would silently have two addresses for one
+        // register file.
+        return;
     }
+    assert!(
+        virt >= USER_END && virt.is_multiple_of(PAGE_SIZE) && phys.is_multiple_of(PAGE_SIZE),
+        "aarch64 map_mmio: virt {virt:#x} / phys {phys:#x} must be page-aligned and in the \
+         kernel half"
+    );
+    assert!(
+        len > 0,
+        "aarch64 map_mmio: mapping a device's registers of zero length"
+    );
+    let len = vm::align_up(len, PAGE_SIZE);
+    let root = kernel_root();
+    assert!(
+        root != 0,
+        "aarch64 map_mmio: no kernel root to map a device into"
+    );
+    let attrs = device_attributes(MapFlags::READ | MapFlags::WRITE);
+    let mut offset = 0;
+    while offset < len {
+        let at = virt + offset;
+        // Deliberately without `AP_USER`: a device's registers must not be
+        // reachable from EL0, whatever else a process manages to map. That is
+        // `device_attributes`' own answer for the boot window too, and a BAR is
+        // not a looser object than the UART.
+        let table = kernel_table_for(root, at);
+        write_entry(
+            table,
+            index_of(at, 3),
+            ((phys + offset) as u64 & ADDR_PAGE) | VALID | TABLE | attrs,
+        );
+        offset += PAGE_SIZE;
+    }
+    // The tables are live the moment they are written, but the walker is not, and
+    // a stale translation for one of these addresses is the worst kind of stale:
+    // it would send a read of a device's register to whatever was there before,
+    // which for ECAM is a *different function's* configuration space.
+    // SAFETY: everything this drops is a translation of an address in `TTBR1_EL1`
+    // that is being re-read, and the kernel's own code, stack, heap and direct map
+    // are re-walked from the tables rather than from the TLB.
+    unsafe { flush_tlb() };
+}
+
+/// The level-3 table `virt`'s page descriptor belongs in, in the kernel's own
+/// address space, making the tables above it.
+///
+/// A walk that *creates* rather than one that reads, which is the only new thing
+/// here: `install`'s [`Tables`] builder is a boot-time object with a frame
+/// counter, and a BAR is discovered hours later by a driver holding nothing but
+/// an address. The frames come from the kernel's allocator and are zeroed before
+/// they are named, because a table the hardware walks that still holds whatever
+/// the allocator last had there is a machine translating through garbage.
+fn kernel_table_for(root: usize, virt: usize) -> usize {
+    let mut table = root;
+    for level in 0..3 {
+        let entry = read_entry(table, index_of(virt, level));
+        if entry & VALID != 0 {
+            // A block where a table belongs: two mappings at different
+            // granularities, and overwriting the entry would make every address
+            // under it translate to the wrong frame.
+            assert!(
+                entry & TABLE != 0,
+                "aarch64: a block descriptor at {table:#x}[{}] is in the way of a device \
+                 window",
+                index_of(virt, level)
+            );
+            table = (entry & ADDR_PAGE) as usize;
+            continue;
+        }
+        let frame = crate::hal::kernel::alloc_frames(0)
+            .expect("aarch64: out of frames for a device window's page tables");
+        // SAFETY: the allocator handed over `PAGE_SIZE` bytes of RAM nothing else
+        // holds, and the direct map - which is what `phys_to_virt` is - reaches
+        // them. Zeroed before the hardware is told to walk it.
+        unsafe { core::ptr::write_bytes(crate::hal::phys_to_virt(frame) as *mut u8, 0, PAGE_SIZE) };
+        write_entry(table, index_of(virt, level), frame as u64 | VALID | TABLE);
+        table = frame;
+    }
+    table
 }
 
 /// A hierarchy under construction, with its frames from the frame allocator.
@@ -742,7 +942,7 @@ unsafe fn enable_mmu(root: usize) {
             "msr sctlr_el1, {sctlr}",
             "isb",
             mair = in(reg) MAIR,
-            tcr = in(reg) TCR,
+            tcr = in(reg) tcr(),
             root = in(reg) root as u64,
             bits = in(reg) SCTLR_ENABLE,
             sctlr = lateout(reg) _,
