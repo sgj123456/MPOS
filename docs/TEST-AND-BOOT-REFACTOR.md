@@ -400,6 +400,39 @@ leaf，与内核共读**同一份** `Handoff` 定义（`boot/Cargo.toml` 加 `mp
 **一个已确认的好消息**：内核不依赖自己被链在高半——`src/**` 里 `KERNEL_VIRT_BASE` 出现 **0** 次，
 内核只从记录里读 `kernel_virt_base`。所以"就地运行"或"自重定位到高半"都可行，地址模型不是障碍。
 
+### 5.7 再测（2026-10-10）：三个未知量已解决，剩下的是一份清单
+
+本节把 §5.6 的"不能分期"重新量了一遍，**结论不变，但内容变了**：当年挡住分期的那一处（loader 构建立刻 47 个错）
+不是 `target_os` 谓词本身的问题，而是 UEFI 目标**没有能力 flags**；而 §5.6 结尾列的两个先决条件里，
+"PE 段符号"已经有了可落地的答案。三处实测：
+
+| 未知量 | 测量 | 结论 |
+|---|---|---|
+| 加宽机器门之后两台构建还成立吗 | 跑 `.workbuddy/sweep_machine_cfg.py --apply`（63 文件 412 处），再补上 Rust sweep 覆盖不到的 **7 个 `Cargo.toml`** 目标依赖块（新脚本 `.workbuddy/sweep_cargo_cfg.py`，与它配成一对），然后 `cargo check -p mpos --target x86_64-unknown-uefi` | **`mpos-arch` 与内核在 uefi 目标下 check 全绿，内核一行源码都不用改** —— 它本来就是"不假设操作系统"写的。加宽本身不是障碍 |
+| §5.6 的 47 个错到底从哪来 | 加宽后 `cargo build -p mpos-boot --target x86_64-unknown-uefi` | `mpos-arch` 只余 4 个错（aarch64 8 个），全部是 `mpos_serial_ring`/`mpos_qemu_debug_exit`/`mpos_console_input`/`mpos_msi` 这些**能力 flags 在 uefi 目标下无处定义** —— 加宽让 `arch`/`hal` 也进 uefi 构建，而这两个块只存在于 `[target.*-unknown-none]`。补上两个 `[target.*-unknown-uefi]` 块后 x86_64 loader 构建通过。**注意这两个块故意不带** 链接脚本、`-pie`、`-ztext`：现在是固件重定位一个 PE 应用，没有脚本可依、没有固定地址要钉 |
+| PE 下段边界（W^X 用）从哪来 | `RUSTFLAGS="-C link-arg=--defsym=__text_start=0x1000" cargo build -p mpos-boot --target x86_64-unknown-uefi` | rust-lld 的 COFF 写器**忽略**它（原文 `ignoring unknown argument '--defsym=…'`）。所以段边界改从**镜像自己的 PE 头**取：固件阶段用 loaded-image 协议拿 `ImageBase`，节表给 text/rodata/data 三段范围，写进启动记录。aarch64 linker.ld 里那四个 `mpos_*` ASSERT 随脚本一起消失，不用另找地方放 |
+
+**§5.6 没写、这次才暴露的第三个阻塞：aarch64 的 `x18`。** 在 `aarch64-unknown-uefi` 下 `x18` 是**保留寄存器**
+（平台 ABI），而 EL0 入口的 inline asm 把它列成 clobber（`arch/src/arch/aarch64/context.rs:655` 的
+`lateout("x18") _`），rustc 直接拒：`cannot use register x18: x18 is a reserved register on this target`。
+全树只有这一处**内联**写 x18，其余全在 `global_asm!` 文本里（rustc 不检查）。这又是一条"必须原子"的理由：
+那个 clobber 表随目标而变，而 EL0 入口是内核唯一的——`none` 目标上它是必要的（编译器可能把活值放在 x18），
+`uefi` 目标上它不合法也不必要（编译器不会用 x18）。两个目标无法同时正确，除非不加宽。
+
+**剩余清单**（每一项都要重跑启动，按依赖顺序）：
+
+| # | 改动 | 内容 |
+|---|---|---|
+| 1 | `boot` 变纯库 | 删 `[[bin]]`；`elf.rs`(379) 与 `vm.rs`(256) 整体消失（没人再加载内核）；`run()` 从"加载 + 跳转"变成"读 initramfs/cmdline、填记录、`ExitBootServices`、把记录交回"；`uefi` 依赖去掉 `global_allocator` feature（保留 `alloc`） |
+| 2 | 单分配器 | 内核 `src/mm/mod.rs` 的 `#[global_allocator]` 唯一化，按阶段分派：固件阶段走 `uefi::boot::allocate_pool`，`ExitBootServices` 之后走内核堆；阶段标志放 `mpos-boot`（内核已依赖它，依赖方向不倒） |
+| 3 | 段范围改道 | 两个端口不再 `extern "C"` 取六个 `__text_*`/`kernel_end` 符号，改读记录里的三段范围（PE 节表已在上表第 3 行说明怎么来） |
+| 4 | 内核入口 | `src/main.rs` 的 `_start` 换成 `uefi` 的 `#[entry]`：先 `mpos_boot::run()` 走完固件阶段，再 `board::start(&record)`；`build.rs`/target 从 `none` 换 `uefi` |
+| 5 | xtask 单产物 | `Arch::kernel_target()` → uefi；`loader_path` 消失（内核就是那个 EFI 应用）；ESP 只写 `EFI/BOOT/BOOTX64.EFI`，`boot/mpos.elf` 一项消失；`Boot::Esp` 的 SATA 臂不受影响 |
+| 6 | 文档 + 闸门 | `AGENTS.md` 仓库地图、`docs/ARCHITECTURE.md` 启动链、`xtask/README.md` 产物表；两机闸门 + 宿主单测 |
+
+已经做掉、可复核的部分在分支 `wip/boot-uefi-app`（提交 `43b3ea8`：加宽的门 + 两个 uefi 能力块）；
+`main` 保持绿。开工时从那个分支继续，或把那 70 个文件的 diff 当作第 1 步的输入——两条路的机械部分一样。
+
 ## 6. `boot` 架构无关（已完成）
 
 ### 6.1 原状：`boot` 里有三处架构分叉（文件头自己列了）
