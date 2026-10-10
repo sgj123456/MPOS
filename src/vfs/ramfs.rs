@@ -1564,6 +1564,9 @@ mod tests {
     /// tree arrives world-writable.
     #[test]
     fn a_directory_is_born_traversable_and_a_file_is_not() {
+        // The birth mode reads the process-global mask, and this test *sets*
+        // it, so it takes its turn with the others that read one.
+        let _lock = crate::sched::test_lock::take();
         let fs = RamFs::new();
         let root = fs.root();
         let dir = root.create("d", NodeKind::Dir).unwrap();
@@ -1593,6 +1596,9 @@ mod tests {
     /// answer ENOTCONN are what keep `open(2)`-style callers out.
     #[test]
     fn a_socket_node_is_a_name_with_no_bytes() {
+        // Its birth mode is the process-global mask's answer, so it takes its
+        // turn with the test that sets one.
+        let _lock = crate::sched::test_lock::take();
         let fs = RamFs::new();
         let root = fs.root();
         let sock = root.create("x.sock", NodeKind::Socket).unwrap();

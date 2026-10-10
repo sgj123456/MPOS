@@ -148,6 +148,35 @@ pub fn set_current_umask(mask: u32) {
     HOST_UMASK.store(mask, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Taking turns on the host build's process-global test state, for tests: the
+/// creation mask above (and the strict-mode latch below) is one value for the
+/// whole process, so a test that *sets* it races any test that reads a node's
+/// birth mode through it - and the two run in parallel threads in one binary.
+/// The crate has no `std` and the host build has no `spin`, so this is a lock
+/// made of one atomic, which is all a test needs to keep another test's mask
+/// out of its own.
+#[cfg(all(test, not(target_os = "none")))]
+pub mod test_lock {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static LOCK: AtomicBool = AtomicBool::new(false);
+
+    pub struct Held;
+
+    pub fn take() -> Held {
+        while LOCK.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        Held
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            LOCK.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// A host build has one process and no dispatch to guard, but `prctl` and
 /// `seccomp` are host-testable, so the strict-mode latch gets the same
 /// single-value home the creation mask does: one way on, never off, so the

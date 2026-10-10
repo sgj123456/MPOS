@@ -1667,6 +1667,9 @@ mod tests {
 
     #[test]
     fn a_relative_path_resolves_from_the_directory_it_is_given() {
+        // The two birth modes asserted below are the process-global mask's
+        // answer, so this takes its turn with the test that sets one.
+        let _lock = crate::sched::test_lock::take();
         let vfs = Vfs::new();
         let fs = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(fs.clone());
