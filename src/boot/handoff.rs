@@ -21,8 +21,10 @@
 //! `HANDOFF_MAGIC` come from there, so every `crate::boot::handoff::` caller is
 //! unchanged. Both sides read one definition - the loader (`mpos-boot`) depends
 //! on the same leaf - so the record cannot drift. [`HANDOFF_MAGIC`] is still
-//! checked before anything else is read, because a `mpos.elf` written by an
-//! older build and left on a partition is a real thing to refuse. What stays
+//! checked before anything else is read: the kernel now travels inside the
+//! loader, so the two ends are always built together and cannot disagree by
+//! accident, but an image assembled or half-updated by hand is still a real
+//! thing to refuse and the check is one comparison. What stays
 //! here is [`collect`], the translation, which is the kernel's: it is the code
 //! that decides what a region *means*.
 

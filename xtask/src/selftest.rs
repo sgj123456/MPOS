@@ -46,7 +46,12 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
     // the boot's suites exist for, and they are only in the image a
     // `--features selftest` build produces (`utils::build_test_kernel` says why
     // the two cannot be the same artifact).
-    let kernel = utils::build_test_kernel(build_dir, profile, Arch::X86_64)?;
+    // The image it returns is not staged here any more: the loader this call
+    // built alongside the kernel *is* the kernel's container now
+    // (`boot/build.rs`), so the ESP below carries the loader and nothing else
+    // from this pair. The call is for its effect, and the effect is the order -
+    // the self-test kernel first, the loader that embeds it directly after.
+    utils::build_test_kernel(build_dir, profile, Arch::X86_64)?;
     println!();
 
     let built = build_user_tests()?;
@@ -74,7 +79,7 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
     // What is left is this arm's own: the throwaway initramfs, the QEMU wiring
     // in `machine.toml`, and a verdict that can quote an exit status.
     let tar = build_test_initramfs(build_dir, &plan.staged)?;
-    let (status, log) = boot_tests(build_dir, profile, &kernel, &tar)?;
+    let (status, log) = boot_tests(build_dir, profile, &tar)?;
 
     report(&plan.staged, plan.built, &log, status)
 }
@@ -617,15 +622,17 @@ echo "=== END"
 "#;
 
 /// Boots the test initramfs in QEMU and returns the exit status with the path
-/// of the captured serial log. The boot disk is QEMU's virtual FAT: the
-/// loader, kernel and test initramfs are served out of a plain directory, so
-/// no image needs creating and no privilege is needed to write it.
-fn boot_tests(
-    build_dir: &Path,
-    profile: &str,
-    kernel: &Path,
-    tar: &Path,
-) -> Result<(Option<i32>, String)> {
+/// of the captured serial log. The boot disk is QEMU's virtual FAT: the loader
+/// and the test initramfs are served out of a plain directory, so no image
+/// needs creating and no privilege is needed to write it.
+///
+/// No kernel file is staged here any more, and that is the loader's doing rather
+/// than this function's: the loader carries the kernel *inside itself*
+/// (`boot/build.rs`), so a file beside it would be a file nothing opens. What
+/// decides which kernel this boot runs is therefore the loader - the one
+/// `utils::build_test_kernel` built a moment ago, immediately after the
+/// self-test kernel it had just made.
+fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32>, String)> {
     println!("User tests: booting the test machine");
 
     let esp = build_dir.join("test-esp");
@@ -637,7 +644,6 @@ fn boot_tests(
         utils::loader_path(profile, Arch::X86_64)?,
         esp.join("EFI/BOOT/BOOTX64.EFI"),
     )?;
-    fs::copy(kernel, esp.join("mpos.elf"))?;
     fs::copy(tar, esp.join("initramfs.tar"))?;
     // `console=ttyS0` makes the serial wire the test boot's only console, so
     // every line the harness reads is the whole of what the machine said - there

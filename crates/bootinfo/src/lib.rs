@@ -16,8 +16,10 @@
 //! this one definition: the loader (`mpos-boot`) depends on this crate, so the
 //! layout is written once and cannot drift out of step with itself. The
 //! [`HANDOFF_MAGIC`] the loader writes is still checked by the kernel before it
-//! reads anything else, because a `mpos.elf` left on a partition by an older
-//! build is a real thing to guard against.
+//! reads anything else: the kernel travels inside the loader now, so the two
+//! ends are always built together and cannot disagree by accident, but a boot
+//! volume assembled or half-updated by hand is a real thing to guard against and
+//! the check is one comparison.
 //!
 //! [`BootInfo`] is not a wire format. It is what the kernel turned the record
 //! into: plain data, no pointers, no page-table root, no EFI table, and a

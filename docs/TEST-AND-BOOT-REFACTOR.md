@@ -125,7 +125,7 @@ xtask/src/sweep.rs              新文件
 ### 2.3 依赖
 
 - 先做 #1 再做 #2：届时"构建用户程序"这一支在两侧形状相同，只需参数化 target。
-- 与 #4 无关；与 #5 相交于 ESP 布局（#5 之后 `mpos.elf` 不再单独存在，`Payload` 的构造要跟着改）。
+- 与 #4 无关；与 #5 相交于 ESP 布局（`mpos.elf` 不再单独存在——这一条已由 §5.8 以更小的代价拿到，`Payload` 的构造不用再等 #5）。
 
 ### 2.4 验证
 
@@ -432,6 +432,47 @@ leaf，与内核共读**同一份** `Handoff` 定义（`boot/Cargo.toml` 加 `mp
 
 已经做掉、可复核的部分在分支 `wip/boot-uefi-app`（提交 `43b3ea8`：加宽的门 + 两个 uefi 能力块）；
 `main` 保持绿。开工时从那个分支继续，或把那 70 个文件的 diff 当作第 1 步的输入——两条路的机械部分一样。
+
+### 5.8 另一条路（2026-10-10 晚）：`bzImage` 形状——先取 #5 的**收益**，不付它的代价
+
+这一轮的要求是"boot 不再是单独的可执行文件"。清单里最直观的那条收益（ESP 上不再有
+`mpos.elf`）其实**不需要 #5 的原子步**就能拿到，代价小得多，所以先把这一半做了。
+
+**做法**（Linux `bzImage` 的形状，逐项对应）：
+
+| `bzImage` | 这里 |
+|---|---|
+| 固件启动的是 stub（PE 应用） | 不变：`EFI/BOOT/BOOT<ARCH>.EFI` 就是 `mpos-boot` |
+| 内核作为**数据**放在同一个文件里，不是第二个文件 | `boot/build.rs` 把内核 DEFLATE 压进 loader 自己的镜像（`OUT_DIR/kernel.deflate`），`lib.rs` 用 `include_bytes!` 取到、开机时 inflate |
+| 压缩端与解压端必须同一种方言 | 两端**同一个 `miniz_oxide`**：`[build-dependencies]` 压缩，`[dependencies]` 解压 |
+| 内核仍是"被装载者"，不是固件应用 | 不变：`elf.rs`/`vm.rs` 一行没动，`run()` 仍然装载并跳转 |
+
+**为什么用 build script 而不是 `include_bytes!` 一个固定路径**：内核正是那个**会动的输入**。
+写在源码里的路径会让 loader 继续携带上一次的内核，而 cargo 没有任何理由因为"只有内核变了"
+去重建 boot crate。build script 能声明真正的那条依赖——那个文件的字节（`cargo:rerun-if-changed`）。
+
+**为什么 initramfs 与 cmdline 仍然是文件**：它们是内核**接手后自己解包**的数据，不是 loader
+必须摆放并跳转的程序；把它们也嵌进来，意味着早期用户空间每多一个文件就要重新链接一次 loader。
+Linux 画的线也是这条（内核在 `bzImage` 里，initrd 不在）。
+
+**实测**（两台机器，2026-10-10）：
+
+| | compressed | loaded | loader 体积 |
+|---|---|---|---|
+| x86_64 | 809 KiB | 2396 KiB（33%） | 64 KB → 912 KB |
+| aarch64 | 834 KiB | 2288 KiB（36%） | 66 KB → 937 KB |
+
+ESP 承载的字节数因此**变小**（原来是 64 KB loader + 2.4 MB kernel，现在是一个 912 KB 的文件），
+`build/<arch>-sweep-esp` 现在只有 `EFI/BOOT/BOOT<ARCH>.EFI`、`initramfs.tar`、`mpos.cmdline`。
+
+**它没有做的事——也就是 #5 剩下的部分为什么仍然是原子的**：`run()` 依旧"装载 + 跳转"，
+`elf.rs`(379) 与 `vm.rs`(256) 都还在，内核仍然**不是**固件应用。所以这一节不是 #5 的第 1 步，
+而是把 #5 的**收益**与**代价**切开：单分配器、`x18` 的目标冲突、失去 `-kernel` 裸机直启，
+这三样一个都不用付。清单第 5 行的"`boot/mpos.elf` 一项消失"**已经达成**；第 1–4 行与第 6 行不变。
+
+**闸门**：aarch64 `164 staged, pass=164 fail=0`；x86_64 `161 staged, pass=161 fail=0`；
+宿主单测 101；kunit 29。两台机器的串口都打出新路径那一行
+（`mpos-boot: kernel image: N KiB compressed, M KiB loaded`）。
 
 ## 6. `boot` 架构无关（已完成）
 

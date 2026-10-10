@@ -144,7 +144,7 @@ graph TB
 ```mermaid
 graph TD
     A["UEFI firmware"] --> B["EFI/BOOT/BOOTX64.EFI — mpos-boot"]
-    B --> B1["read mpos.elf, initramfs.tar, mpos.cmdline from the ESP"]
+    B --> B1["inflate the kernel carried inside the loader, read initramfs.tar + mpos.cmdline from the ESP"]
     B1 --> B2["memory map · page tables · direct map at KERNEL_VIRT_BASE"]
     B2 --> B3["relocate the PIE image · exit boot services"]
     B3 --> C["_start(handoff) — ring 0, kernel stack, interrupts off"]

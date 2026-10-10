@@ -542,16 +542,21 @@ mod tests {
     }
 
     /// A name that fits in 8.3 is written as one entry and no long-name chain.
+    ///
+    /// `KERNEL.ELF` stands in for the class rather than naming a file this build
+    /// writes: nothing the ESP carries fits in 8.3 any more - `mpos.elf` was the
+    /// last one, and the kernel is inside the loader now - but the splitter still
+    /// has to answer for whatever name it is handed.
     #[test]
     fn an_eight_dot_three_name_needs_no_long_entries() {
-        let (short, long) = split_name("mpos.elf");
-        assert!(long.is_none(), "mpos.elf fits in 8.3");
-        assert_eq!(&short[..4], b"MPOS");
+        let (short, long) = split_name("KERNEL.ELF");
+        assert!(long.is_none(), "KERNEL.ELF fits in 8.3");
+        assert_eq!(&short[..6], b"KERNEL");
         assert_eq!(&short[8..11], b"ELF");
     }
 
-    /// The two names the ESP actually carries that do not, and which are the
-    /// whole reason this module exists.
+    /// The two names the loader asks the ESP for by name, and which do not fit -
+    /// they are the whole reason this module exists.
     #[test]
     fn the_esp_names_that_forced_this_module_get_long_entries() {
         let (short, long) = split_name("initramfs.tar");

@@ -463,6 +463,16 @@ same measurement puts behind `vfs` and so behind `hal` too)**
       distribution's mount tree is. The machines' per-boot device checks became a test-build
       read-back (`src/board/suites.rs` plus the shared `devices` suite), so a distribution boot
       neither pays for them nor can be halted by one (§13.14's rule)
+- [x] **The kernel travels inside the loader — the ESP carries one bootable file (§15.9).** The
+      kernel is DEFLATE-compressed into the loader's own image at build time (`boot/build.rs`) and
+      inflated at boot (`boot/src/lib.rs`), which is Linux's `bzImage` shape: the stub is still a
+      stub and the kernel is still not a firmware application, but the load path no longer begins
+      with a second file. `initramfs.tar` and `mpos.cmdline` stay files — they are data the kernel
+      unpacks itself, not programs the loader has to place and jump to. This is the *visible* half
+      of the boot refactor's step 5 (`TEST-AND-BOOT-REFACTOR.md` §5.8) taken without its costs: one
+      allocator serving two firmware phases, the `x18` clash, and the loss of the `-kernel`
+      bare-metal path all remain unpaid, because they follow from the kernel being *started* by the
+      firmware, not from its being *carried* by the loader
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the

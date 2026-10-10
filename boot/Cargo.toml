@@ -35,9 +35,29 @@ mpos-acpi = { path = "../crates/acpi" }
 # depends on is the one that holds the machines, and there is nothing else in
 # the graph that does (`NOTES.md` §14.6).
 mpos-arch = { path = "../arch" }
+# The decompressor, for the payload the loader *carries* rather than reads.
+# This is the half of the `bzImage` shape the loader could not have before: the
+# kernel is compressed into the loader's own image at build time, and this is
+# what turns it back into bytes at boot. `with-alloc` and not the default set
+# is the whole of what it needs - the output is a `Vec` the firmware's pool
+# allocator owns, and nothing here has a file system to write through.
+miniz_oxide = { version = "0.8", default-features = false, features = [
+    "with-alloc",
+] }
 uefi = { version = "0.36", default-features = false, features = [
     "alloc",
     "global_allocator",
+] }
+
+# The same crate on the other side of the wall: `build.rs` compresses the kernel
+# with the *encoder* here, and the loader decompresses it at boot with the
+# decoder above. One crate for both ends because the two must agree on a DEFLATE
+# dialect, and a compressor on one side and a decompressor from another project
+# on the other is exactly the pair that drifts (a `zlib`-wrapped stream read by a
+# raw-inflate reader is a boot that dies on a checksum nobody wrote).
+[build-dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = [
+    "with-alloc",
 ] }
 
 [[bin]]

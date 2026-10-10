@@ -139,7 +139,7 @@ graph TB
 ```mermaid
 graph TD
     A["UEFI 固件"] --> B["EFI/BOOT/BOOTX64.EFI — mpos-boot"]
-    B --> B1["从 ESP 读取 mpos.elf、initramfs.tar、mpos.cmdline"]
+    B --> B1["解压内嵌在 loader 里的内核，从 ESP 读取 initramfs.tar、mpos.cmdline"]
     B1 --> B2["内存映射 · 页表 · KERNEL_VIRT_BASE 处的高半区直接映射"]
     B2 --> B3["重定位 PIE 镜像 · exit boot services"]
     B3 --> C["_start(handoff) — ring 0，内核栈，中断关闭"]
@@ -370,7 +370,7 @@ cargo build --target x86_64-unknown-none # 同样的东西，不经过 xtask
 
 | # | 名称 | 类型 | 大小 | 内容 |
 |---|------|------|------|----------|
-| 1 | `efi` | FAT32，可引导 | 128 MiB（来自 `rootfs.toml`） | `EFI/BOOT/BOOTX64.EFI`（引导加载器）、`mpos.elf`、`initramfs.tar`、`mpos.cmdline` |
+| 1 | `efi` | FAT32，可引导 | 128 MiB（来自 `rootfs.toml`） | `EFI/BOOT/BOOTX64.EFI`（引导加载器，内核压缩内嵌其中）、`initramfs.tar`、`mpos.cmdline` |
 | 2 | `system` | ext4 | 2 GiB 镜像的剩余部分 | Alpine 根文件系统——`/sbin/init`、OpenRC、musl、busybox、`apk` |
 
 QEMU 在 OVMF 下直接引导它：没有 ISO，没有光驱，没有 loop 设备，`cargo xtask test`

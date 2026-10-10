@@ -5,10 +5,12 @@
 //! address space, handed over in one instruction - so the interesting part of
 //! this crate is not the sequence of steps but the order they have to happen in:
 //!
-//! 1. **Read what the kernel needs off the boot partition.** `mpos.elf`, and
-//!    the initramfs and command line beside it. This has to be first because it
-//!    is the only step that can fail in a way worth reporting, and because
-//!    reading needs the firmware's file protocols, which do not survive step 5.
+//! 1. **Read what the kernel needs off the boot partition.** The initramfs and
+//!    the command line - the kernel itself is not read, because it travels
+//!    inside this image (`build.rs` compresses it in). This has to be first
+//!    because it is the only step that can fail in a way worth reporting, and
+//!    because reading needs the firmware's file protocols, which do not survive
+//!    step 5.
 //! 2. **Work out the memory map.** Also firmware data, also gone at step 5, and
 //!    it is what the page tables and the kernel's frame allocator are both built
 //!    from.
@@ -148,13 +150,53 @@ const ACPI_GUID: Guid = guid!("eb9d2d30-2d88-11d3-9a16-0090273fc14c");
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const FDT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-/// Where the kernel and its two companions are on the boot partition. Fixed
-/// names rather than a boot entry or a config file: the layout is decided by the
-/// script that builds the image, the loader is built from the same tree, and a
-/// path that arrives from somewhere else is a path an attacker controls.
-const KERNEL_PATH: &CStr16 = cstr16!("\\mpos.elf");
+/// The two files the loader still reads off the boot partition, and where they
+/// are: fixed names rather than a boot entry or a config file, because the
+/// layout is decided by the script that builds the image, the loader is built
+/// from the same tree, and a path that arrives from somewhere else is a path an
+/// attacker controls.
+///
+/// The kernel is deliberately not one of them. It travels *inside this image*
+/// (see [`PACKED_KERNEL`]), and that is the whole difference from the loader
+/// that used to open `\mpos.elf` beside these two. The split is not arbitrary:
+/// the early userspace is data the kernel is *handed*, copied into frames and
+/// then unpacked by the kernel itself, and a copy of it has no business in the
+/// loader's own image - it would have to be rebuilt into the loader every time a
+/// file in it changed. The kernel is the one thing the loader has to place in
+/// memory and jump to, and carrying it is what makes a single file enough.
 const INITRAMFS_PATH: &CStr16 = cstr16!("\\initramfs.tar");
 const CMDLINE_PATH: &CStr16 = cstr16!("\\mpos.cmdline");
+
+/// The kernel, DEFLATE-compressed into this image by `build.rs`, and the reason
+/// the boot volume needs one file and not two.
+///
+/// The name is `build.rs`'s (`PAYLOAD`), spelled again rather than shared
+/// because the two ends are separate compilations and there is no crate between
+/// them - the same reason [`MAGIC`] and [`FDT_MAGIC`] are written twice.
+const PACKED_KERNEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernel.deflate"));
+
+/// The kernel, decompressed, or `None` when this build carries none.
+///
+/// `None` is a real state rather than a defensive one: the crate is built on
+/// trees with no kernel (a `cargo check`, a lint) and `build.rs` answers those
+/// with an empty payload and a warning that names the command to run. What must
+/// not happen is a loader that boots the *previous* kernel because nobody made
+/// it depend on the new one - which is why the payload is a build-script output
+/// and not a path, and why a boot with no payload refuses by name before
+/// anything else in [`run`] has happened.
+///
+/// `expect` and not a fallback: a non-empty payload that will not inflate is a
+/// build that wrote something it did not mean to, and there is no second
+/// interpretation of those bytes worth trying.
+fn unpack_kernel() -> Option<Vec<u8>> {
+    if PACKED_KERNEL.is_empty() {
+        return None;
+    }
+    Some(
+        miniz_oxide::inflate::decompress_to_vec(PACKED_KERNEL)
+            .expect("the embedded kernel is not a valid DEFLATE stream"),
+    )
+}
 
 /// The boot stack, in pages. The kernel runs on this until its scheduler gives
 /// every task one of its own; it is the stack `_start` and everything down to
@@ -230,12 +272,24 @@ pub fn run() -> Status {
     early::set_log(log);
     log("mpos-boot starting");
 
+    // Before the volume is opened: a loader with no kernel inside it has no
+    // business reading the files beside it, and a refusal that names the
+    // reason is worth more than a firmware message about a file that is not
+    // there a step later.
+    let Some(kernel_bytes) = unpack_kernel() else {
+        log("no kernel: this loader was built without one (see boot/build.rs)");
+        return Status::UNSUPPORTED;
+    };
+    log(&format!(
+        "kernel image: {} KiB compressed, {} KiB loaded",
+        PACKED_KERNEL.len() / 1024,
+        kernel_bytes.len() / 1024
+    ));
+
     let image = boot::image_handle();
     let fs = boot::get_image_file_system(image).expect("the boot volume has no file system");
     let mut fs = FileSystem::new(fs);
 
-    let kernel_bytes = read(&mut fs, KERNEL_PATH);
-    log(&format!("kernel image: {} KiB", kernel_bytes.len() / 1024));
     let initramfs = read(&mut fs, INITRAMFS_PATH);
     log(&format!("initramfs: {} KiB", initramfs.len() / 1024));
     let cmdline = read(&mut fs, CMDLINE_PATH);

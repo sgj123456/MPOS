@@ -77,7 +77,7 @@ flowchart TB
     XTASK -->|"assembles"| IMG["build/mpos-uefi-x86_64.img"]
     XTASK -->|"reads"| CFG["assets/configs/*.toml<br/>assets/rootfs/ · assets/initramfs/"]
     FUZZ -->|"host build of the lib"| K
-    BOOT -->|"loads mpos.elf + initramfs.tar<br/>+ mpos.cmdline"| IMG
+    BOOT -->|"inflates the kernel it carries<br/>+ reads initramfs.tar, mpos.cmdline"| IMG
     K -->|"ELF loader, PT_INTERP-free<br/>static ET_EXEC"| U
     K -->|"_start(handoff: *const Handoff)"| BOOT
 
@@ -296,8 +296,8 @@ sequenceDiagram
     participant R as /sbin/init (OpenRC, on /dev/vda2)
 
     FW->>L: load EFI/BOOT/BOOTX64.EFI from partition 1
-    L->>L: read mpos.elf, initramfs.tar, mpos.cmdline from the ESP
-    L->>L: memory map -> page tables, image frames, stack, file copies
+    L->>L: inflate the kernel carried in this image, read initramfs.tar + mpos.cmdline from the ESP
+    L->>L: memory map -> page tables, image frames, stack, kernel + initramfs in memory
     L->>L: relocate the PIE image against KERNEL_VIRT_BASE
     L->>L: exit boot services (point of no return)
     L->>K: jump to _start with RDI = &Handoff

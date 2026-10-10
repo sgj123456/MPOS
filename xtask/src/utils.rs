@@ -348,13 +348,18 @@ pub fn build_kernel(profile: &str, arch: Arch) -> Result<()> {
 /// a cargo feature rather than a `--cfg …`), so a kernel built by
 /// [`build_kernel`] carries no test code at all and no way to run any.
 ///
-/// The image is **copied** out of the target directory rather than left there.
-/// Cargo holds one `mpos` per target and profile: a production build after a test
-/// build - or the reverse, which is what `cargo xtask test` then `cargo xtask run`
-/// does - replaces the other's binary, and the ESP assembled a moment later would
-/// stage whichever one happened to be there. The copy is what makes "the test
-/// machine booted the test kernel" a fact rather than an assumption, and it is
-/// also why this returns a path instead of nothing.
+/// The image is **copied** out of the target directory rather than left there,
+/// and the reason has narrowed since the loader began carrying the kernel. Cargo
+/// holds one `mpos` per target and profile: a production build after a test build
+/// - or the reverse, which is what `cargo xtask test` then `cargo xtask run` does
+/// - replaces the other's binary, so anything reading the target path a moment
+/// later reads whichever one happened to be there. What makes "the test machine
+/// booted the test kernel" a fact is now the *loader*: `build_loader` runs
+/// directly below the kernel build and `boot/build.rs` embeds whatever it finds,
+/// so the loader and the kernel are one file built together. The copy is what the
+/// second machine's medium carries as its kernel input, and asks about when
+/// deciding whether its disk is stale - which is why this returns a path instead
+/// of nothing.
 ///
 /// What it costs: the shared target directory means alternating the two builds
 /// recompiles the kernel crate, because the feature set changed. Measured at a
@@ -418,11 +423,19 @@ fn build_loader(profile: &str, arch: Arch) -> Result<()> {
     if profile == "release" {
         loader_build.arg("--release");
     }
+    // The kernel the loader is to *carry*. Both callers build the kernel first
+    // and this immediately after, so the `mpos` in the target directory at this
+    // moment is the one this boot will run - the ordinary build or the self-test
+    // one - and naming it is what makes the loader carry *that* kernel rather
+    // than whichever one the last `cargo build` happened to leave there. The
+    // loader's build script does the embedding (`boot/build.rs`), and it is
+    // watching this file's bytes, so a changed kernel relinks the loader.
     loader_build
         .arg("-p")
         .arg("mpos-boot")
         .arg("--target")
         .arg(arch.loader_target())
+        .env("MPOS_KERNEL_ELF", kernel_path(profile, arch)?)
         .current_dir(&root);
     let status = loader_build
         .status()

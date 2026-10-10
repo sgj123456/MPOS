@@ -1,6 +1,6 @@
 # loader
 
-**Home:** `boot/` (crate `mpos-boot`) · **Owns:** the UEFI firmware phase that becomes the kernel — read the three files off the boot partition, build an address space, and stop being a program.
+**Home:** `boot/` (crate `mpos-boot`) · **Owns:** the UEFI firmware phase that becomes the kernel — decompress the kernel it carries, read the two files beside it off the boot partition, build an address space, and stop being a program.
 
 ## What it owns
 
@@ -9,15 +9,17 @@ behind is a `Handoff`'s worth of plain data and an address space, handed over in
 instruction — so the interesting part of this crate is not the list of steps but the order
 they have to happen in (`boot/src/lib.rs`):
 
-1. **Read what the kernel needs off the boot partition** — `\mpos.elf`, `\initramfs.tar`
-   and `\mpos.cmdline`. This is first because it is the only step that can fail in a way
-   worth reporting, and because reading needs the firmware's file protocols, which do not
+1. **Take the kernel out of this image, and read its two companions off the boot
+   partition** — the kernel is *inside* the loader (`PACKED_KERNEL`, written by
+   `boot/build.rs`) and is inflated here; `\initramfs.tar` and `\mpos.cmdline` are the
+   files. This is first because it is the only step that can fail in a way worth
+   reporting, and because reading needs the firmware's file protocols, which do not
    survive step 5.
 2. **Work out the memory map** — also firmware data, also gone at step 5, and what both
    the page tables and the kernel's frame allocator are built from.
-3. **Allocate everything** — the page-table pool, the image frames, the boot stack and
-   the copies of the two files. After step 5 there is no allocator left, not even the
-   loader's own.
+3. **Allocate everything** — the page-table pool, the image frames, the boot stack, the
+   decompressed kernel and the copy of the early userspace. After step 5 there is no
+   allocator left, not even the loader's own.
 4. **Build the address space and load the image into it**, relocated against
    `KERNEL_VIRT_BASE` so the higher-half jump lands where the kernel's own data already
    points.
@@ -28,6 +30,32 @@ The one thing the loader deliberately does *not* do is decide anything the kerne
 decide itself: it does not pick a root device, parse a command line or touch a file
 system on the disk. It moves bytes and builds page tables; everything above that is the
 kernel's business.
+
+**The kernel travels inside the loader.** The boot volume carries one bootable file, not a
+stub beside a kernel. `boot/build.rs` compresses the kernel for this machine into the
+loader's own image — DEFLATE, with `miniz_oxide` on *both* sides of the wall, once as a
+build dependency to compress and once as a runtime dependency to inflate — and `lib.rs`
+inflates it before it opens the volume. This is Linux's `bzImage` shape, and it is worth
+naming what it is and is not: the stub is still a stub, the kernel is still not a firmware
+application, and the load path is unchanged in every step but the first. The shorter
+spelling would have been an `include_bytes!` of a fixed path, and it is the worse one: the
+kernel is precisely the input that moves, and a path written in the source is a loader that
+goes on quietly carrying the previous kernel, because cargo has no reason to rebuild this
+crate when only the kernel changed. A build script can declare the dependency that is real
+— the kernel file's own bytes.
+
+The two companions stay files, and the split is not arbitrary. They are *data* the kernel
+is handed and unpacks itself; carrying them would mean rebuilding the loader into a larger
+image for every file the early userspace gains, and the early userspace is a whole
+distribution's worth of them. The kernel is the one thing the loader has to place in memory
+and jump to. Linux draws the line in the same place — the kernel is in `bzImage` and the
+initrd is not.
+
+Because the kernel is inside the loader, the record crossing the two of them is now written
+and read by compilations from a single build. That removes a whole class of ABI mismatch;
+the `HANDOFF_MAGIC` check below stays as the guard for the class that remains (a boot
+volume assembled or half-updated by hand), and it is cheap enough to keep for a reason that
+has merely got smaller.
 
 Since the crate split, the loader is a **library plus a thin `#[entry]` binary**:
 `boot/src/lib.rs` holds the whole sequence as `mpos_boot::run()` and `boot/src/main.rs` is
@@ -47,10 +75,11 @@ nothing, because its kernel walks a BAR).
 
 | File | What lives there |
 |---|---|
-| `boot/Cargo.toml` | The crate's two targets: `uefi` with `alloc` + `global_allocator` (the firmware's pool allocator is the only one before boot services go), and the `[[bin]]` (`mpos-boot`, `src/main.rs`) beside the `[lib]` (`mpos_boot`, `src/lib.rs`) |
+| `boot/Cargo.toml` | The crate's two targets: `uefi` with `alloc` + `global_allocator` (the firmware's pool allocator is the only one before boot services go), and the `[[bin]]` (`mpos-boot`, `src/main.rs`) beside the `[lib]` (`mpos_boot`, `src/lib.rs`). `miniz_oxide` appears twice on purpose — once in `[dependencies]` (the loader's inflate) and once in `[build-dependencies]` (the build script's deflate) — so that the two ends of the stream cannot be different DEFLATE dialects |
+| `boot/build.rs` | Compresses the kernel for this machine into the loader's image. Finds it by `MPOS_KERNEL_ELF` (which `xtask` always sets, to the kernel it just built) or by deriving the path from the target, declares the file's bytes as a rebuild dependency, and writes `kernel.deflate` into `OUT_DIR` for `lib.rs` to `include_bytes!`. Writes an *empty* payload plus a `cargo:warning` when there is no kernel — the crate stays buildable, and the loader refuses to boot |
 | `boot/.cargo/config.toml` | `[build] target = "x86_64-unknown-uefi"`, so a build started inside this directory does the right thing on its own |
 | `boot/src/main.rs` | The `#[entry]`: `fn main() -> Status { mpos_boot::run() }`. Nothing else |
-| `boot/src/lib.rs` | The whole sequence: `run()`, the path constants, the stack sizing and its canary, the handoff `HANDOFF` static and `write_handoff`, `copy_to_frames`, `copy_device_tree`, `allocate`, `read`/`trim`/`kind_of`, `log`, the `#[panic_handler]`, and the `wcslen` shim |
+| `boot/src/lib.rs` | The whole sequence: `run()`, the two path constants and the carried kernel (`PACKED_KERNEL`, `unpack_kernel`), the stack sizing and its canary, the handoff `HANDOFF` static and `write_handoff`, `copy_to_frames`, `copy_device_tree`, `allocate`, `read`/`trim`/`kind_of`, `log`, the `#[panic_handler]`, and the `wcslen` shim |
 | `boot/src/elf.rs` | Just enough ELF64: `Segment`, `Relocation`, `Range`, `Kernel::parse` (program headers, `PT_DYNAMIC`, section boundaries) and `Kernel::load` (copy segments, zero `.bss`, apply `R_X86_64_RELATIVE`/`R_AARCH64_RELATIVE` against the virtual base). Every read goes through a bounds-checked `Reader` that panics with the offset it refused |
 | `boot/src/vm.rs` | The architecture-free plan: `HHDM_OFFSET`, `KERNEL_VIRT_BASE`, `Pool` (a bump allocator implementing `mpos_arch::early::Frames`), `is_ram`, `map_physical_memory`, `map_kernel_image`, `pool_bytes_for`, `merge`, and the `pub use mpos_arch::early::PageTables` re-export |
 | `crates/bootinfo/src/lib.rs` | The one definition of the record both sides read: `Handoff`, `AbiRegion`, `HANDOFF_MAGIC`, `BOOT_STACK_CANARY`, `MAX_MEM_REGIONS`, the `KIND_*` constants, and the kernel's `BootInfo`/`MemKind`/`MemRegion` view. The loader depends on it; `src/boot/handoff.rs` re-exports the kernel's side |
@@ -64,15 +93,18 @@ owns — its file protocols, its memory map, its allocator, its console — is u
 `write_handoff`/`HANDOFF`'s single write happens after it with no allocation, because
 there is no allocator left (`write_handoff` writes the regions straight into the record's
 fixed array and folds neighbours in one pass, UEFI memory maps being ordered by physical
-address).
+address). A build with no kernel to carry — a `cargo check`, a lint — makes `run` answer
+`Status::UNSUPPORTED` with one line on the wire, before the volume is opened: a loader
+carrying nothing refuses by name rather than booting whatever it can find.
 
 **The record.** `crates/bootinfo`'s `Handoff` is a `#[repr(C)]` wire format crossing from
 one compilation into another, and it is the one crate both sides depend on, so its layout
 is written once and cannot drift out of step with itself. `HANDOFF_MAGIC` is still checked
-by the kernel before it reads anything else, because a `mpos.elf` left on a partition by an
-older build is a real thing to guard against — changing a field changes the ABI an older
-image is read with, so `HANDOFF_MAGIC` is bumped unless the change is append-only
-(AGENTS.md §4). `BOOT_STACK_CANARY` lives beside the magic for the same reason: the loader
+by the kernel before it reads anything else. Since the kernel moved inside the loader the
+two ends are built together, so a mismatch cannot happen by accident — one whole class of
+failure is gone — and the check stays for the class that remains, an image assembled or
+half-updated by hand: changing a field changes the ABI the record is read with, so
+`HANDOFF_MAGIC` is bumped unless the change is append-only (AGENTS.md §4). `BOOT_STACK_CANARY` lives beside the magic for the same reason: the loader
 is the only party that knows where the boot stack begins, so it plants the mark in the
 lowest word and reports the address in `boot_stack_base`; the kernel checks it once it is
 up. The address is written through the direct map, not the physical one, because the

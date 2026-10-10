@@ -201,7 +201,8 @@ fn copy_into_partition(src: &Path, image: &Path, start: u64, what: &str) -> Resu
 /// The ESP partition's size, and why it is not smaller: FAT32 is defined to
 /// need at least 65525 clusters, which at 512 bytes a sector is ~34 MiB, and a
 /// smaller volume is not a FAT32 one. 48 MiB is the size measured to boot under
-/// AAVMF with the loader, the kernel and this machine's initramfs on it.
+/// AAVMF with the loader - which carries the kernel inside it - this machine's
+/// initramfs and the command line on it.
 const ESP_BYTES: u64 = 48 * 1024 * 1024;
 
 /// The raw block image the block-driver check uses as its scratch device. Every
@@ -368,7 +369,10 @@ pub struct Boot<'a> {
 /// unchanged is rebuilt.
 pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<PathBuf> {
     let Boot {
-        kernel,
+        // Not laid on the ESP any more - it is inside `loader` now - but still
+        // read here for nothing and by `medium_is_stale` for the kernel's own
+        // change, which is the reason the field is still part of this input.
+        kernel: _,
         loader,
         entries,
         disk_bytes,
@@ -408,8 +412,12 @@ pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<Pat
 
     fs::copy(loader, boot_dir.join(arch.uefi_boot_file()))
         .with_context(|| format!("Failed to install {}", loader.display()))?;
-    fs::copy(kernel, esp.join("mpos.elf"))
-        .with_context(|| format!("Failed to install {}", kernel.display()))?;
+    // And no `mpos.elf` beside it: the kernel travels *inside* that loader
+    // (`boot/build.rs` compresses it into the loader's own image), which is what
+    // makes this volume carry one file where it used to carry two. The kernel is
+    // still an input to this medium - a changed kernel rebuilds the loader, and
+    // the loader's bytes are what this stage copies - but it is no longer a file
+    // anything opens at boot.
     // The command line the kernel records and reads back. A boot that carries a
     // real userland is not a test and says so by *leaving the word off*:
     // `mpos.selftest` is what lets the handoff inject a line of console input,
@@ -547,9 +555,12 @@ fn digest(bytes: &[u8]) -> u64 {
 /// True when the medium in `build/` is not the one this sweep is asking for.
 ///
 /// A missing image or a missing stamp is stale - there is nothing to reuse - and
-/// so is a fingerprint that no longer matches. Then the mtimes: the kernel, the
-/// loader and the initramfs are copied onto the ESP whole, and the toml plus the
-/// two overlay trees become the root filesystem.
+/// so is a fingerprint that no longer matches. Then the mtimes: the loader and
+/// the initramfs are copied onto the ESP whole, and the toml plus the two overlay
+/// trees become the root filesystem. The kernel is asked about as well even
+/// though it is no longer a file on that volume: it is inside the loader, so a
+/// kernel that moved makes a loader that moved, and asking about the kernel
+/// directly is what still holds if that chain ever breaks.
 ///
 /// This program is an input too, and it is the one entry that is not something
 /// the image is made *of*: [`crate::fat`] writes the ESP's long filenames by

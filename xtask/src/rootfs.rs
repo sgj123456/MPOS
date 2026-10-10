@@ -182,9 +182,7 @@ pub fn build_rootfs(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
         install_base(build_dir, &mount_dir, &config, &root_dev, arch)?;
     }
 
-    install_boot_files(
-        &mount_dir, &config, &kernel, &loader, &initramfs, mode, arch,
-    )?;
+    install_boot_files(&mount_dir, &config, &loader, &initramfs, mode, arch)?;
 
     // The machine's own configuration, then the overlay. Both run on every
     // build path - a change to the hostname or to a file under `rootfs/` should
@@ -1722,13 +1720,18 @@ pub(crate) fn apk_add(
 /// of the two names it looks for is the machine's own (`Arch::uefi_boot_file`),
 /// fixed by the UEFI specification rather than chosen.
 ///
-/// The loader's three paths are the ESP's root on both machines, which is why
+/// The loader's *two* paths are the ESP's root on both machines, which is why
 /// this one function writes both: the loader is one crate with one set of paths
 /// in it, mounted here as `/boot` (the ESP) on either machine.
+///
+/// There is no third path for the kernel, and that is the shape rather than an
+/// omission: the kernel is inside the loader (`boot/build.rs` compresses it in),
+/// so the volume holds the loader, the early userspace and the command line -
+/// and a kernel that is not a file here is a kernel that cannot be left behind
+/// by the next build.
 fn install_boot_files(
     mount_dir: &Path,
     config: &RootfsConfig,
-    kernel: &Path,
     loader: &Path,
     initramfs: &Path,
     mode: crate::config::RunMode,
@@ -1739,7 +1742,6 @@ fn install_boot_files(
         loader,
         &mount_dir.join("boot/EFI/BOOT").join(arch.uefi_boot_file()),
     )?;
-    install_file(kernel, &mount_dir.join("boot/mpos.elf"))?;
     install_file(initramfs, &mount_dir.join("boot/initramfs.tar"))?;
     fs::write(
         mount_dir.join("boot/mpos.cmdline"),

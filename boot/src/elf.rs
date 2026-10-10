@@ -2,7 +2,7 @@
 //! relocations and four section boundaries.
 //!
 //! Hand-written rather than pulled from the `elf` crate because the loader
-//! reads exactly one file, that file is this project's own kernel, and the
+//! parses exactly one image, that image is this project's own kernel, and the
 //! failure mode that matters is a clear panic - "segment 3 reaches past the end
 //! of the image" - rather than a typed error nobody can act on. Every read goes
 //! through [`Reader`], which bounds-checks against the file and panics with the
@@ -60,9 +60,9 @@ pub struct Range {
     pub end: u64,
 }
 
-/// A parsed kernel image. Borrows the file it was parsed from, so the bytes
-/// have to outlive it - which they do, being an allocation of the loader's that
-/// is never freed.
+/// A parsed kernel image. Borrows the bytes it was parsed from - the loader's
+/// decompressed copy of the payload it carries - so those bytes have to outlive
+/// it, which they do, being an allocation of the loader's that is never freed.
 pub struct Kernel<'a> {
     bytes: &'a [u8],
     /// The relocation kind this image's machine uses for a self-relative fixup,
@@ -134,16 +134,16 @@ impl<'a> Kernel<'a> {
         assert_eq!(
             r.slice(0, 4),
             ELF_MAGIC,
-            "mpos.elf does not begin with an ELF magic number"
+            "the kernel image does not begin with an ELF magic number"
         );
-        assert_eq!(r.u8(4), ELFCLASS64, "mpos.elf is not a 64-bit ELF file");
+        assert_eq!(r.u8(4), ELFCLASS64, "the kernel image is not a 64-bit ELF file");
         // Both machines this loader serves, and no other: the two are the ones
         // a UEFI firmware can hand it, and an image built for a third would be
         // one whose page-table format the loader below does not speak.
         let machine = r.u16(18);
         assert!(
             machine == EM_X86_64 || machine == EM_AARCH64,
-            "mpos.elf was built for machine {machine}, not x86_64 ({EM_X86_64}) \
+            "the kernel image was built for machine {machine}, not x86_64 ({EM_X86_64}) \
              or aarch64 ({EM_AARCH64})"
         );
         let relative = if machine == EM_AARCH64 {
@@ -189,10 +189,10 @@ impl<'a> Kernel<'a> {
                 _ => {}
             }
         }
-        assert!(!segments.is_empty(), "mpos.elf has no loadable segments");
+        assert!(!segments.is_empty(), "the kernel image has no loadable segments");
         assert!(
             lowest <= entry && entry < highest,
-            "mpos.elf's entry point is not in the image"
+            "the kernel image's entry point is not inside it"
         );
 
         let mut kernel = Kernel {
@@ -249,7 +249,7 @@ impl<'a> Kernel<'a> {
         };
         assert!(
             rela_ent >= 24,
-            "mpos.elf uses {rela_ent}-byte relocation entries, which are not the 24-byte form"
+            "the kernel image uses {rela_ent}-byte relocation entries, which are not the 24-byte form"
         );
 
         let mut out = Vec::new();
@@ -261,7 +261,7 @@ impl<'a> Kernel<'a> {
             let symbol = info >> 32;
             assert_eq!(
                 kind, self.relative,
-                "mpos.elf carries a relocation of type {kind} against symbol {symbol}; \
+                "the kernel image carries a relocation of type {kind} against symbol {symbol}; \
                  only its machine's RELATIVE fixup ({}) is expected from a static PIE",
                 self.relative,
             );
@@ -306,9 +306,9 @@ impl<'a> Kernel<'a> {
             None
         };
 
-        let text = find(".text").expect("mpos.elf has no .text section");
-        let rodata = find(".rodata").expect("mpos.elf has no .rodata section");
-        let data = find(".data").expect("mpos.elf has no .data section");
+        let text = find(".text").expect("the kernel image has no .text section");
+        let rodata = find(".rodata").expect("the kernel image has no .rodata section");
+        let data = find(".data").expect("the kernel image has no .data section");
         let bss = find(".bss");
         assert_ne!(
             rodata.2, SHT_NOBITS,
@@ -337,7 +337,7 @@ impl<'a> Kernel<'a> {
                 return segment.file_offset + (vaddr - segment.vaddr);
             }
         }
-        panic!("mpos.elf addresses {vaddr:#x} with no segment holding its bytes");
+        panic!("the kernel image addresses {vaddr:#x} with no segment holding its bytes");
     }
 
     /// Copy the image into `dest` and apply the relocations for a load base of

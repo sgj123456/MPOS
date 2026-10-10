@@ -9831,3 +9831,60 @@ are the evidence, and a distribution mounts its own root. (4) `cargo xtask run`/
 Alpine boot of either machine) was **not** re-run for this cut - the two sweeps and their kernel
 cases are what was measured; the Alpine path is the same script doing the same mounts it already
 did, with the kernel's three redundant ones removed.
+
+### 15.9 The kernel travels inside the loader — **LANDED**
+
+The boot volume carries one bootable file, not a stub beside a kernel. `boot/build.rs` compresses
+the kernel this build is for (DEFLATE, `miniz_oxide` level 9) into the loader's own image, and
+`boot/src/lib.rs` inflates it from the `include_bytes!` of that payload before it opens the volume.
+The ESP's root now holds `EFI/BOOT/BOOT<ARCH>.EFI`, `initramfs.tar` and `mpos.cmdline`, and no
+`mpos.elf`. This is Linux's `bzImage` shape, with the parts named: the stub is still a stub, the
+kernel is still not a firmware application, and every step of the load path but the first is
+unchanged.
+
+**Why a build script and not a path.** The shorter spelling - `include_bytes!` of a fixed path - is
+wrong for the one reason this crate has to be careful: the kernel is the input that *moves*. Cargo
+rebuilds a crate when something it declared moved, and a path written in the source declares
+nothing, so the loader would go on carrying the previous kernel with no word said. `build.rs`
+declares the two dependencies that are real - `MPOS_KERNEL_ELF` (which `xtask` always sets, to the
+kernel it has just built, so a self-test boot and an ordinary boot each carry their own) and the
+file's own bytes (`cargo:rerun-if-changed`). The same crate appears in `[dependencies]` *and*
+`[build-dependencies]` on purpose: a compressor from one project and a decompressor from another is
+a pair that drifts, and what it drifts into is a boot that dies on a stream it cannot read.
+
+**Why the other two stay files.** They are data the kernel is handed and unpacks itself, not
+programs the loader has to place in memory and jump to. Carrying them would mean relinking the
+loader into a larger image every time a file in the early userspace changed - and there is a
+distribution's worth of them. Linux draws the line in the same place.
+
+**Measured** (the two machines, 2026-10-10):
+
+| | compressed | loaded | loader |
+|---|---|---|---|
+| x86_64 | 809 KiB | 2396 KiB (33%) | 64 KB -> 912 KB |
+| aarch64 | 834 KiB | 2288 KiB (36%) | 66 KB -> 937 KB |
+
+Both serial logs carry the new line - `mpos-boot: kernel image: 809 KiB compressed, 2396 KiB
+loaded` on the first, `834 ... 2288` on the second - and `build/<arch>-sweep-esp` holds three
+files. The bytes the volume carries *fall* (64 KB loader + 2.4 MB kernel becomes one 912 KB file),
+so the compression pays for itself in the one place it was not needed.
+
+**What it deliberately does not do.** `run()` still loads an image and jumps to it: `elf.rs` (379)
+and `vm.rs` (256) are untouched and the kernel is still not a PE. This is therefore **not** step 1
+of `TEST-AND-BOOT-REFACTOR.md` §5 - which now records it as §5.8 - but takes §5's *visible* half
+(one artifact, no `mpos.elf`) without any of its costs. The three costs §5.7 named - one allocator
+serving two firmware phases, the `x18` clash that makes `none` and `uefi` unable to be correct at
+the same time, and the loss of the `-kernel` bare-metal path - all remain unpaid, because none of
+them follows from the kernel being *carried*; they follow from the kernel being *started by the
+firmware*.
+
+**One guard got smaller, and the comments now say what it guards.** `HANDOFF_MAGIC`'s reason used
+to be "an older `mpos.elf` left on a partition". The kernel is inside the loader now, so the record's
+two ends are always built together and cannot disagree by accident; the check stays - it is one
+comparison, and a boot volume assembled or half-updated by hand is still a thing to refuse - and
+`src/boot/handoff.rs`, `docs/modules/boot.md` and `docs/modules/loader.md` were reworded rather than
+left naming a file that no longer exists.
+
+**Gates.** aarch64 `164 staged, pass=164 fail=0`; x86_64 `161 staged, pass=161 fail=0`; host unit
+tests 101 (`mpos-xtask`), the kernel's 29. `xtask/src/fat.rs`'s 8.3 example was `mpos.elf` and is
+now a name that stands for the class, because nothing the ESP carries fits in 8.3 any more.

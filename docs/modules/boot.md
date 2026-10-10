@@ -44,8 +44,8 @@ into page tables and a direct map (`mpos-arch`); and the `/proc/cmdline` node, w
 
 - `Handoff` is a wire format: `#[repr(C)]`, written by one compilation (the UEFI loader) and read by
   another (the kernel), with every field a promise to a binary this crate never sees. `HANDOFF_MAGIC`
-  is checked before anything else is read, because a `mpos.elf` left on a partition by an older build
-  is a real thing to refuse. `boot_stack_base` and the two device-tree fields are last on purpose, so
+  is checked before anything else is read: a boot volume assembled or half-updated by hand is a real
+  thing to refuse, and the check costs one comparison. `boot_stack_base` and the two device-tree fields are last on purpose, so
   appending them left every older offset untouched (the field's own doc argues why).
 - `collect(at: *const Handoff) -> BootInfo` is `unsafe` and validates rather than trusts: it asserts
   the magic, caps `region_count` at `MAX_MEM_REGIONS`, reads the command line as UTF-8 (a bad line

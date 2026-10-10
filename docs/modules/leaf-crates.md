@@ -77,8 +77,8 @@ Each leaf is entered through the symbols its dependents name:
 - `mpos-bootinfo` splits its two halves on purpose. `Handoff` is a wire format —
   `#[repr(C)]`, crossing from the loader's compilation into the kernel's — while
   `BootInfo` is the kernel's own view and is not one. A change to a field changes
-  the ABI an older `mpos.elf` is read with, which is why the record is one
-  definition both sides depend on.
+  the ABI the loader and the kernel read each other's records with, which is why
+  the record is one definition both sides depend on.
 - `mpos-vm` is the vocabulary `hal::Paging` and `hal::AddressSpaceOps` are written
   in: the kernel owns what a mapping *is*, the machine owns how one is made, so
   the vocabulary sits below both.
