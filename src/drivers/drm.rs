@@ -5417,7 +5417,14 @@ fn add_fb(arg: usize, owner: u64) -> isize {
 
 fn add_fb2(arg: usize, owner: u64) -> isize {
     // struct drm_mode_fb_cmd2: fb_id@0,width@4,height@8,pixel_format@12,
-    // flags@16, handles[4]@20, pitches[4]@36, offsets[4]@52, modifier[4]@68.
+    // flags@16, handles[4]@20, pitches[4]@36, offsets[4]@52, modifier[4]@72.
+    // The four `__u64` start at 72 and not at 68, because `offsets` ends at 68
+    // and a `u64` cannot begin there - the gap is the padding `drm_mode.h` has
+    // at 68..72, measured (`sizeof` 104, `offsetof(modifier)` 72) rather than
+    // counted. Reading at 68 answers the *padding* plus the low half of
+    // `modifier[0]`, which is zero for every modifier a caller writes at the
+    // offset Linux reads - so the bug was invisible to a caller that only ever
+    // names LINEAR, and only a non-linear modifier put at 72 showed it.
     // The fourcc names the layout; every 32-bit spelling this scanout can
     // show lands on the ADDFB path, and the rest is refused. A nonzero
     // plane offset or format modifier is too: there is exactly one linear
@@ -5429,7 +5436,7 @@ fn add_fb2(arg: usize, owner: u64) -> isize {
     let pitch = unsafe { ((arg + 36) as *const u32).read_unaligned() };
     let offset = unsafe { ((arg + 52) as *const u32).read_unaligned() };
     let flags = unsafe { ((arg + 16) as *const u32).read_unaligned() };
-    let modifier = unsafe { ((arg + 68) as *const u64).read_unaligned() };
+    let modifier = unsafe { ((arg + 72) as *const u64).read_unaligned() };
     // A plane offset other than the start of the buffer is still refused: the
     // scanout copies the buffer from its beginning and has nowhere to start
     // part-way in.
@@ -5537,7 +5544,8 @@ fn get_fb(arg: usize) -> isize {
 /// one.
 fn get_fb2(arg: usize) -> isize {
     // struct drm_mode_fb_cmd2: fb_id@0, width@4, height@8, pixel_format@12,
-    // flags@16, handles[4]@20, pitches[4]@36, offsets[4]@52, modifier[4]@68.
+    // flags@16, handles[4]@20, pitches[4]@36, offsets[4]@52, modifier[4]@72 -
+    // the offsets `add_fb2` reads, which this answers in the other direction.
     let id = unsafe { (arg as *const u32).read_unaligned() };
     critical_section::with(|cs| {
         let st = STATE.borrow(cs).borrow();
@@ -5564,7 +5572,7 @@ fn get_fb2(arg: usize) -> isize {
                 w32(20 + plane * 4, if first { fb.handle } else { 0 });
                 w32(36 + plane * 4, if first { fb.pitch } else { 0 });
                 w32(52 + plane * 4, 0); // offsets: the buffer starts at its start
-                w64(68 + plane * 8, if first { fb.modifier } else { 0 });
+                w64(72 + plane * 8, if first { fb.modifier } else { 0 });
             }
         }
         0

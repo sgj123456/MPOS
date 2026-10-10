@@ -487,6 +487,14 @@ same measurement puts behind `vfs` and so behind `hal` too)**
       `t-drm-args`, `t-drm-lease`, then `t-drm-props` - and fixed by registering
       `drivers::drm::close_at_exit` with `sched::exit` beside locks, the socket and the inotify
       watch, so the exit path delivers the property `master_closed`'s header already promised
+- [x] **`ADDFB2` reads its format modifier at the offset the uapi gives it (§15.13).** The field is
+      at 72, not 68: `offsets[4]` ends at 68 and 68..72 is the padding the `__u64` forces, measured
+      against the installed headers. `add_fb2` read at 68 and `get_fb2` wrote at 68, and the no-std
+      test it was written against spelled its offsets by hand in the same wrong place, so the two
+      agreed with each other and with nothing else. Invisible while the only modifier anyone named
+      was `LINEAR`, which is 0, because the padding reads as 0 too. Pinned by naming a vendor
+      modifier whose low 32 bits are zero (`0x0100_0000_0000_0000`), so the offset - not the value -
+      decides the answer: with the kernel back at 68 the claim fails `got 0, want -22`
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the
