@@ -56,9 +56,5 @@ path = "src/bin/integration/t-drm-sync.rs"
 name = "t-evdev"
 path = "src/bin/integration/t-evdev.rs"
 
-[[bin]]
-name = "t-seat"
-path = "src/bin/integration/t-seat.rs"
-
 [lints]
 workspace = true
