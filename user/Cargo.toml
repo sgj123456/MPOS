@@ -4,8 +4,9 @@
 # Linux ABI is written against musl and its loader only accepts the static
 # ET_EXEC shape - see the rustflags in the root `.cargo/config.toml`.
 #
-# The test programs are deliberately *not* here: the no-std ABI conformance
-# suite lives in `user/abitest`, the std-side tests in `user/tests`, and
+# The test programs are deliberately *not* here: they live in `user/tests` -
+# the `#![no_std]` conformance suite that used to sit beside it in
+# `user/abitest` moved there one program at a time and is now finished - and
 # `cargo xtask test` is what builds and runs them. A regular program ships in
 # the system image; a test only ever ships in the self-test initramfs.
 [package]

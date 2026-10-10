@@ -5,7 +5,7 @@
 # without it would build the user programs for the host too, and they are
 # built for musl.
 [workspace]
-members = ["arch", "user", "user/tests", "user/abitest", "boot", "xtask", "crates/*"]
+members = ["arch", "user", "user/tests", "boot", "xtask", "crates/*"]
 # "." is the kernel - the root package, which is a member without being
 # listed in `members`.
 default-members = ["."]

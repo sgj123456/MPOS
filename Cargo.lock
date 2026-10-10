@@ -444,13 +444,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mpos-user-abi"
-version = "0.1.0"
-dependencies = [
- "mpos-abi",
-]
-
-[[package]]
 name = "mpos-user-tests"
 version = "0.1.0"
 dependencies = [

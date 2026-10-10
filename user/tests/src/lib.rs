@@ -12,11 +12,10 @@
 //! reading the log is the per-claim detail. That division is why this helper
 //! prints and exits rather than reporting to the runner.
 //!
-//! The no-std conformance suite (`user/abitest`) reports the same way through
-//! `lin::check_true`/`lin::check_eq`/`lin::done` and the same exit codes. This is
-//! the std side's half of one protocol - which is what makes the two suites
-//! able to run under the same reader, and what let the suite move from one to the
-//! other (`NOTES.md` §15.11).
+//! This is the same protocol the `#![no_std]` conformance suite spoke through
+//! `lin::check_true`/`lin::check_eq`/`lin::done`, and the same exit codes - what
+//! let that suite move here one program at a time and vanish when the last one
+//! did (`NOTES.md` §15.11). One protocol, one reader, one crate now.
 
 /// The claims one test has made, and whether any of them failed.
 pub struct Report {

@@ -4,10 +4,9 @@
 //!
 //! 1. The host unit tests - the arch-independent core of the kernel (`cargo
 //!    test --lib`) and xtask's own.
-//! 2. The user test programs. The ABI conformance suite (`user/abitest`, split
-//!    into `src/bin/syscall/` and `src/bin/integration/`) and the std-side tests
-//!    (`user/tests`) are built, packed into an initramfs, and booted in QEMU
-//!    without a disk: the test `/init` runs every `/bin/t-*` it finds, prints a
+//! 2. The user test programs. `user/tests` is built, packed into an initramfs,
+//!    and booted in QEMU without a disk: the test `/init` runs every `/bin/t-*`
+//!    it finds, prints a
 //!    `=== PASS`/`=== FAIL` verdict per program, and ends the machine with
 //!    `poweroff -f`, which the kernel turns into QEMU's debug exit. The serial
 //!    console is captured to a file and parsed here.
@@ -220,13 +219,12 @@ impl sweep::TestProgram for UserTest {
     }
 }
 
-/// Builds both user test crates and returns what they produced.
+/// Builds the user test crate and returns what it produced.
 ///
-/// The std-side crate builds like any musl program. The ABI suite must not
-/// inherit the root `.cargo/config.toml`'s `x86_64-unknown-none` flags - they
-/// point at the kernel's linker script - so it is built with `RUSTFLAGS`,
-/// which replaces the configuration's flags for this invocation rather than
-/// merging with them.
+/// It builds like any musl program, and it is the suite's only crate: the
+/// `#![no_std]` conformance suite that used to sit beside it in `user/abitest`
+/// was moved here one batch at a time, and the move is finished - so there is
+/// one build, one target, and one `src/bin` for the sweep to walk.
 fn build_user_tests() -> Result<Vec<UserTest>> {
     let root = utils::project_root()?;
     let mut tests = Vec::new();
@@ -242,46 +240,22 @@ fn build_user_tests() -> Result<Vec<UserTest>> {
         "x86_64-unknown-linux-musl",
     ])
     .current_dir(&root);
-    utils::run_status(&mut cmd, "the std-side user tests")?;
+    utils::run_status(&mut cmd, "the user tests")?;
 
-    println!("User tests: the ABI conformance suite (mpos-user-abi)");
-    let mut cmd = Command::new("cargo");
-    cmd.env("RUSTFLAGS", "-C relocation-model=static");
-    cmd.args([
-        "build",
-        "--release",
-        "-p",
-        "mpos-user-abi",
-        "--target",
-        "x86_64-unknown-none",
-    ])
-    .current_dir(root.join("user/abitest"));
-    utils::run_status(&mut cmd, "the ABI conformance suite")?;
-
-    let sources = [
-        (
-            root.join("user/abitest/src/bin"),
-            target_dir()?.join("x86_64-unknown-none/release"),
-        ),
-        (
-            root.join("user/tests/src/bin"),
-            target_dir()?.join("x86_64-unknown-linux-musl/release"),
-        ),
-    ];
-    for (src_dir, out_dir) in sources {
-        collect_user_tests(&src_dir, &out_dir, &mut tests)?;
-    }
+    collect_user_tests(
+        &root.join("user/tests/src/bin"),
+        &target_dir()?.join("x86_64-unknown-linux-musl/release"),
+        &mut tests,
+    )?;
     tests.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(tests)
 }
 
 /// Find every test program under `src_dir`, recursing into subdirectories.
 ///
-/// The ABI suite is split by what a test needs - `syscall/` for a self-contained
-/// syscall family, `integration/` for a device, the network, or a subsystem run
-/// end to end - so its programs no longer sit directly in `src/bin`; the std-side
-/// suite is still flat, which the same walk covers. The binary keeps the file's
-/// name, which is what a `/bin/t-*` run and the verdict line are keyed on.
+/// The walk covers subdirectories because the suite used to be split by what a
+/// test needs, and the binary keeps the file's name either way: that is what a
+/// `/bin/t-*` run and the verdict line are keyed on.
 fn collect_user_tests(src_dir: &Path, out_dir: &Path, tests: &mut Vec<UserTest>) -> Result<()> {
     for entry in
         fs::read_dir(src_dir).with_context(|| format!("Failed to read {}", src_dir.display()))?

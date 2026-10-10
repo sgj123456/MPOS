@@ -6,10 +6,12 @@
 //! therefore whole files, pulled in by `#[cfg]` - not one list with per-name
 //! `#[cfg]` on each value - because the divergence is the ABI, not a handful of
 //! rows. Each table holds the same `pub const` names, so `dispatch`'s match
-//! arms and the test harness (`user/abitest/lib/lin.rs`, which `#[path]`-includes
-//! this file) keep addressing `nr::NAME` unchanged; only the numbers differ by
-//! machine. `include!` (rather than `mod`) is used so this stays the single
-//! addressable file the harness names.
+//! arms and the tests below keep addressing `nr::NAME` unchanged; only the
+//! numbers differ by machine. `include!` (rather than `mod`) is used so this
+//! stays one addressable file. The std-side test suite takes its numbers from
+//! `libc::SYS_*` instead, which is the other direction of the same guarantee:
+//! a table the kernel wrote and a table the tests wrote could agree and still
+//! both be wrong, and two sources that cannot be reconciled cannot hide that.
 //!
 //! `include!` pastes the file's contents into this module verbatim. On the host
 //! and x86_64 targets the x86 table is compiled, and the tests below - every
