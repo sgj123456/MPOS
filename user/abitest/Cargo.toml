@@ -53,10 +53,6 @@ name = "t-drm-sync"
 path = "src/bin/integration/t-drm-sync.rs"
 
 [[bin]]
-name = "t-virtgpu"
-path = "src/bin/integration/t-virtgpu.rs"
-
-[[bin]]
 name = "t-evdev"
 path = "src/bin/integration/t-evdev.rs"
 

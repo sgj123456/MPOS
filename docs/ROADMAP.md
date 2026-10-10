@@ -472,7 +472,11 @@ same measurement puts behind `vfs` and so behind `hal` too)**
       of the boot refactor's step 5 (`TEST-AND-BOOT-REFACTOR.md` §5.8) taken without its costs: one
       allocator serving two firmware phases, the `x18` clash, and the loss of the `-kernel`
       bare-metal path all remain unpaid, because they follow from the kernel being *started* by the
-      firmware, not from its being *carried* by the loader
+      firmware, not from its being *carried* by the loader. Its first version carried the *wrong*
+      kernel into a self-test boot on the second machine (the build script's freshness rule read a
+      mtime cargo's linking does not move forward) and the two-machine gate sat silent for fourteen
+      minutes on it; the fix is at the build, because the run-time guard that would have named the
+      mismatch is refused by the boot's own gate (§15.19)
 
 **Architecture debt (Phase 11 — audit done, Steps A/B/C/D/E/F/G landed, HAL S1 landed (§11.4), V-1/V-4/V-13 closed)**
 - [x] 11.A subtract: the orphan/duplicate machine modules, the leftover `[msgtrace]` in the

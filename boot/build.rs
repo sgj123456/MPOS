@@ -74,14 +74,23 @@ fn main() {
     let packed = miniz_oxide::deflate::compress_to_vec(&raw, LEVEL);
     fs::write(&payload, &packed)
         .unwrap_or_else(|e| panic!("Failed to write {}: {e}", payload.display()));
-    // The one place the compression is measured. `xtask` reports the loader's
-    // size, which is what a boot pays; this is what says the payload was
-    // compressed at all, and by how much.
+    // The one place the compression is measured, and the only place that says
+    // *which* kernel the loader is carrying. Both matter: the ratio is what a
+    // boot pays, and the source is the fact this whole build script exists to
+    // get right - a loader carrying the wrong kernel is a boot that runs
+    // yesterday's machine, and the symptom (a boot that hangs, or one that runs
+    // the production build's tests) does not name the cause.
     println!(
-        "cargo:warning=kernel payload: {} KiB -> {} KiB ({}%)",
+        "cargo:warning=kernel payload: {} KiB -> {} KiB ({}%) from {} ({})",
         raw.len() / 1024,
         packed.len() / 1024,
-        packed.len() * 100 / raw.len().max(1)
+        packed.len() * 100 / raw.len().max(1),
+        kernel.display(),
+        if env::var_os("MPOS_KERNEL_ELF").is_some() {
+            "MPOS_KERNEL_ELF"
+        } else {
+            "derived from TARGET"
+        }
     );
 }
 
@@ -104,10 +113,18 @@ fn kernel_path(out: &Path, target: &str, profile: &str) -> Option<PathBuf> {
     if kernel_target == target {
         return None;
     }
-    // This script's output sits at
-    // `<target dir>/<target>/<profile>/build/<crate>-<hash>/out`, so the target
-    // directory is six levels up - the same `target/` every `cargo build` from
-    // the workspace root writes to.
-    let target_dir = out.ancestors().nth(5)?;
+    // Cargo's build-script output sits somewhere under
+    // `<target dir>/<target>/<profile>/build/…/out`, and how many levels sit
+    // between `out` and `<target dir>` is cargo's business rather than this
+    // script's - it has been two shapes already (`build/<crate>-<hash>/out` and
+    // `build/<crate>/<hash>/out`). Counting them is what this did first, and
+    // the off-by-one failed *silently*: the derived path simply did not exist,
+    // so the script reported "no kernel to carry" on a tree that had one. The
+    // directory is found by name instead - the first ancestor called `<target>`
+    // is this build's target directory's child, whatever the depth.
+    let triple_dir = out
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == target))?;
+    let target_dir = triple_dir.parent()?;
     Some(target_dir.join(kernel_target).join(profile).join("mpos"))
 }

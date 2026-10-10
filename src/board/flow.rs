@@ -263,6 +263,23 @@ pub fn init(info: &BootInfo) -> ! {
         vfs::tty::global().receive_byte(byte);
     }
 
+    // A check whose absence is deliberate, and whose absence the gate enforces:
+    // this is where "the command line asks for a self-test and this kernel is the
+    // ordinary build - say so instead of queueing nothing and letting the early
+    // userland wait for ever" would go, and `xtask`'s own gate refuses it by name
+    // ("the boot has no test opening", `NOTES.md` §15.19): whether a kernel
+    // carries tests is the *build's* to say, not a word's and not a run-time
+    // check's. That is also why `boot::cmdline_has` has no caller - it is the one
+    // spelling of a question nothing in the boot is allowed to ask.
+    //
+    // Which leaves the pairing this check would have caught to be got right where
+    // it can be got right: at the build, by the loader carrying the kernel its
+    // caller just built rather than whichever variant last stood at the target
+    // path (`xtask/src/utils.rs::build_loader`). Measured wrong once, before that
+    // was fixed: the second machine booted the ordinary kernel into a self-test
+    // boot, printed every line above this one, and then waited for ever - no test
+    // output, and a cause in two files this one is not among.
+
     hand_to_init(info)
 }
 

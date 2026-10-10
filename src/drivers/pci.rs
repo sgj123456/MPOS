@@ -40,8 +40,6 @@
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use critical_section::Mutex;
-#[cfg(target_arch = "x86_64")]
-use x86_64::instructions::port::Port;
 
 use crate::acpi::EcamRange;
 use crate::boot::BootInfo;

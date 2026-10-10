@@ -168,6 +168,22 @@ pub fn loader_path(profile: &str, arch: Arch) -> Result<PathBuf> {
         .join("mpos-boot.efi"))
 }
 
+/// Where the **self-test** kernel is staged, which is also the path the loader is
+/// handed when a self-test boot is being built.
+///
+/// A path of this build's own rather than the target directory's, because the
+/// loader's build script decides whether it is out of date from the mtime of the
+/// file it is given (`boot/build.rs`), and the target directory's `mpos` is one
+/// path that two builds - the ordinary one and this one - alternate at, with
+/// mtimes cargo's linking does not move forward ([`build_test_kernel`] carries the
+/// measurement). Its own function so that the test below can ask "are the two
+/// kernels named by different paths?" without building anything.
+pub fn test_kernel_path(build_dir: &Path, arch: Arch) -> PathBuf {
+    build_dir
+        .join(format!("{}-test-kernel", arch.name()))
+        .join("mpos")
+}
+
 /// The disk image `arch`'s machine boots, under the build directory.
 ///
 /// The name is the machine's (`Arch::disk_image`) and the two are different
@@ -323,9 +339,9 @@ pub fn build_kernel(profile: &str, arch: Arch) -> Result<()> {
         anyhow::bail!("The kernel did not build");
     }
 
-    build_loader(profile, arch)?;
-
     let kernel = kernel_path(profile, arch)?;
+    build_loader(profile, arch, &kernel)?;
+
     let loader = loader_path(profile, arch)?;
     if !kernel.exists() {
         anyhow::bail!("Expected the kernel at {}", kernel.display());
@@ -349,17 +365,22 @@ pub fn build_kernel(profile: &str, arch: Arch) -> Result<()> {
 /// [`build_kernel`] carries no test code at all and no way to run any.
 ///
 /// The image is **copied** out of the target directory rather than left there,
-/// and the reason has narrowed since the loader began carrying the kernel. Cargo
-/// holds one `mpos` per target and profile: a production build after a test build
-/// - or the reverse, which is what `cargo xtask test` then `cargo xtask run` does
-/// - replaces the other's binary, so anything reading the target path a moment
-/// later reads whichever one happened to be there. What makes "the test machine
-/// booted the test kernel" a fact is now the *loader*: `build_loader` runs
-/// directly below the kernel build and `boot/build.rs` embeds whatever it finds,
-/// so the loader and the kernel are one file built together. The copy is what the
-/// second machine's medium carries as its kernel input, and asks about when
-/// deciding whether its disk is stale - which is why this returns a path instead
-/// of nothing.
+/// and the copy is the loader's *input* rather than a record kept beside it.
+/// Cargo holds one `mpos` per target and profile, so the two kernels this front
+/// end builds - this one and [`build_kernel`]'s - are one file in the target
+/// directory, alternating there; and cargo links an already-compiled artifact
+/// into place keeping that artifact's own compile time, so that file's mtime can
+/// stand still across the alternation. The loader's build script decides it is
+/// out of date from the mtime of the file it is handed (`boot/build.rs`), so
+/// handing it the target path lets it keep the *other* variant's kernel -
+/// measured: a self-test boot on the second machine booted the ordinary kernel
+/// and then waited for ever on the console line only a self-test kernel queues,
+/// with no test output at all. This copy is written here, by this build, and
+/// nothing else writes it, which is what makes "the loader carries the kernel
+/// this call has just built" true rather than likely. It is also what the second
+/// machine's medium carries as its kernel input, and asks about when deciding
+/// whether its disk is stale - which is why this returns a path instead of
+/// nothing.
 ///
 /// What it costs: the shared target directory means alternating the two builds
 /// recompiles the kernel crate, because the feature set changed. Measured at a
@@ -392,16 +413,31 @@ pub fn build_test_kernel(build_dir: &Path, profile: &str, arch: Arch) -> Result<
         anyhow::bail!("The test kernel did not build");
     }
 
+    // The copy is made *first*, and the loader is handed this path rather than
+    // the one in the target directory. That order is load-bearing, and getting
+    // it wrong is a hang rather than a wrong number: the loader's build script
+    // watches the bytes of the file it is given, but what cargo hands it to
+    // watch is a *mtime*, and cargo links an already-compiled artifact into
+    // place keeping that artifact's own compile time. The two kernels this front
+    // end builds - this one and `build_kernel`'s - land at the same target path
+    // with mtimes that do not move forward between them, so a watched target
+    // path is one whose "has it changed?" can answer no when the answer is yes.
+    // What that produced was a loader carrying the *ordinary* kernel into a
+    // self-test boot: the machine booted, and then the early userspace waited
+    // for ever on a console line the self-test kernel would have queued, because
+    // the kernel that booted was not that kernel. This copy is written by this
+    // function, so its mtime is this build's, and it is a path no other build
+    // writes.
+    let source = kernel_path(profile, arch)?;
+    let image = test_kernel_path(build_dir, arch);
+    if let Some(dir) = image.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    mirror(&source, &image)?;
+
     // The loader is the same program in both builds - it loads an ELF and does
     // not know what is in it - so this is the ordinary build of it.
-    build_loader(profile, arch)?;
-
-    let source = kernel_path(profile, arch)?;
-    let dir = build_dir.join(format!("{}-test-kernel", arch.name()));
-    fs::create_dir_all(&dir)?;
-    let image = dir.join("mpos");
-    fs::copy(&source, &image)
-        .with_context(|| format!("Failed to copy {} to {}", source.display(), image.display()))?;
+    build_loader(profile, arch, &image)?;
 
     println!(
         "self-test kernel: {} ({:.1} KB)",
@@ -411,8 +447,39 @@ pub fn build_test_kernel(build_dir: &Path, profile: &str, arch: Arch) -> Result<
     Ok(image)
 }
 
-/// Build the EFI loader, which is the same program for both kernel builds.
-fn build_loader(profile: &str, arch: Arch) -> Result<()> {
+/// Put `source` over `image`, and leave `image` alone when it already holds
+/// those bytes.
+///
+/// `fs::copy` would rewrite it every time, and the loader's build script watches
+/// this file: a file rewritten on every self-test run is a loader relinked and a
+/// kernel recompressed on every self-test run, for a boot that was going to be
+/// identical. Comparing first is what the saving costs - two reads of a couple
+/// of mebibytes, against a relink of a megabyte of PE.
+fn mirror(source: &Path, image: &Path) -> Result<()> {
+    let bytes = fs::read(source).with_context(|| format!("Failed to read {}", source.display()))?;
+    if fs::read(image).is_ok_and(|old| old == bytes) {
+        return Ok(());
+    }
+    fs::write(image, &bytes).with_context(|| format!("Failed to write {}", image.display()))?;
+    Ok(())
+}
+
+/// Build the EFI loader, which is the same program for both kernel builds, and
+/// hand it the kernel it is to carry.
+///
+/// `kernel` is the caller's path rather than one computed here, and that is the
+/// load-bearing part. The two callers build two different kernels that land at
+/// the same path in the target directory, and the loader's build script decides
+/// it is out of date from the *mtime* of the file it is handed (`boot/build.rs`).
+/// Cargo links an already-compiled artifact into place keeping that artifact's
+/// own compile time, so a target path is a path whose mtime can stand still
+/// while its bytes change - and the case where they change is exactly the case
+/// that matters, the alternation between the ordinary kernel and the self-test
+/// one. So each caller hands over a path only it writes: `build_kernel` the
+/// target directory's `mpos`, [`build_test_kernel`] its own copy under `build/`.
+/// The two values differ, so switching between them reruns the script before the
+/// file's own change is even considered.
+fn build_loader(profile: &str, arch: Arch, kernel: &Path) -> Result<()> {
     let root = project_root()?;
     println!(
         "Building the {arch} EFI loader ({profile})",
@@ -423,19 +490,17 @@ fn build_loader(profile: &str, arch: Arch) -> Result<()> {
     if profile == "release" {
         loader_build.arg("--release");
     }
-    // The kernel the loader is to *carry*. Both callers build the kernel first
-    // and this immediately after, so the `mpos` in the target directory at this
-    // moment is the one this boot will run - the ordinary build or the self-test
-    // one - and naming it is what makes the loader carry *that* kernel rather
-    // than whichever one the last `cargo build` happened to leave there. The
-    // loader's build script does the embedding (`boot/build.rs`), and it is
-    // watching this file's bytes, so a changed kernel relinks the loader.
+    // The kernel the loader is to *carry*, as the caller named it. The loader's
+    // build script does the embedding (`boot/build.rs`) and watches this file's
+    // bytes; naming it here is what makes the loader carry the kernel its caller
+    // just built rather than whichever one the last `cargo build` left at the
+    // target directory's path.
     loader_build
         .arg("-p")
         .arg("mpos-boot")
         .arg("--target")
         .arg(arch.loader_target())
-        .env("MPOS_KERNEL_ELF", kernel_path(profile, arch)?)
+        .env("MPOS_KERNEL_ELF", kernel)
         .current_dir(&root);
     let status = loader_build
         .status()
@@ -852,6 +917,28 @@ mod tests {
         assert_eq!(version_cmp(older, newer), std::cmp::Ordering::Less);
         assert_eq!(version_cmp(newer, older), std::cmp::Ordering::Greater);
         assert_eq!(version_cmp(older, older), std::cmp::Ordering::Equal);
+    }
+
+    /// The loader is handed a path, and it decides from that file's *mtime*
+    /// whether it is out of date. The two kernels this front end builds are one
+    /// path in the target directory, alternating there with mtimes cargo's linking
+    /// does not move forward - so if both callers ever hand over that one path, the
+    /// loader can keep the *other* variant's kernel, and the boot that produces
+    /// hangs before its first test with nothing on the wire (`build_test_kernel`
+    /// carries the measurement: a second machine that waited for ever on a console
+    /// line only a self-test kernel queues). This is the cheap alarm for that; the
+    /// way it was actually found cost a gate that had to be killed.
+    #[test]
+    fn the_loader_is_handed_a_path_each_kernel_build_owns() {
+        let build = Path::new("/nonexistent/mpos-build");
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            assert_ne!(
+                kernel_path("release", arch).unwrap(),
+                test_kernel_path(build, arch),
+                "the ordinary kernel and the self-test one reach the loader as one path, \
+                 which is a loader that can keep the wrong variant's kernel"
+            );
+        }
     }
 
     /// A scratch directory of this test's own, removed first so a previous
