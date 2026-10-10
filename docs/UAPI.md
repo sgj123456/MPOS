@@ -424,9 +424,13 @@ the commit bodies), and each moved its pin in the same commit.
     clocks moved independently) and `t-devtmpfs` on **both** machines (`/dev/null`, `/dev/tty0`
     and a block node — the first of the names the boot published). *Remaining, named:* a node
     reports zero until something stamps it — Linux's devtmpfs stamps one at creation, and there
-    is no mount-time number here to give a node that arrives when its driver registers it — and
-    the directories, symlinks and socket names devfs makes still answer the trait's default,
-    holding no `NodePerms` to keep a clock in.
+    is no mount-time number here to give a node that arrives when its driver registers it. The
+    directories, symlinks and socket names devfs makes, which hold no `NodePerms`, keep them too
+    now — the refusal a desktop still showed came from that same pass (`NOTES.md` §15.35) — and
+    the trait's default, for a node that has nowhere to keep a clock, answers `EPERM`: measured
+    on the host, that is what every anonymous-inode descriptor (`eventfd`, `epoll`, `timerfd`,
+    `signalfd`, `inotify`) and every `/proc` directory answer, while `EOPNOTSUPP` is not a
+    refusal Linux gives this call at all.
 
 ### 5.2 Small, measured, and not yet landed
 

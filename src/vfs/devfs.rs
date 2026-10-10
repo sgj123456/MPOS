@@ -24,7 +24,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use critical_section::Mutex;
 
-use super::{FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
+use super::{Clocks, FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
 
 /// The whole surface of a character device, in the only units that make sense
 /// for one: bytes in, bytes out.
@@ -400,6 +400,7 @@ fn window_for(offset: u64, len: u64, end: u64) -> (u64, u64) {
 
 /// The one directory, holding every device by name.
 struct DevRoot {
+    clocks: Clocks,
     inodes: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
     next_ino: Arc<AtomicU64>,
 }
@@ -411,6 +412,22 @@ impl Inode for DevRoot {
             kind: NodeKind::Dir,
             size: 0,
         }
+    }
+
+    fn mtime(&self) -> u64 {
+        self.clocks.mtime()
+    }
+
+    fn atime(&self) -> u64 {
+        self.clocks.atime()
+    }
+
+    /// `utimensat`: kept, on the shape Linux measures for a `/dev` directory,
+    /// a device node's symlink and a socket (`.workbuddy/utimensat_host.c`) -
+    /// a node that answers `EOPNOTSUPP` here is a node `touch` cannot use.
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        self.clocks.set(atime, mtime);
+        Ok(())
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
@@ -458,11 +475,15 @@ impl Inode for DevRoot {
             let node: Arc<dyn Inode> = if kind == NodeKind::Dir {
                 Arc::new(DevDirNode {
                     ino,
+                    clocks: Clocks::new(),
                     children: Mutex::new(RefCell::new(BTreeMap::new())),
                     next_ino: self.next_ino.clone(),
                 })
             } else {
-                Arc::new(DevSocketNode { ino })
+                Arc::new(DevSocketNode {
+                    ino,
+                    clocks: Clocks::new(),
+                })
             };
             inodes.insert(String::from(name), node.clone());
             Ok(node)
@@ -482,6 +503,7 @@ impl Inode for DevRoot {
             let node: Arc<dyn Inode> = Arc::new(DevSymlinkNode {
                 ino,
                 target: String::from(target),
+                clocks: Clocks::new(),
             });
             inodes.insert(String::from(name), node.clone());
             Ok(node)
@@ -508,6 +530,7 @@ impl Inode for DevRoot {
 struct DevSymlinkNode {
     ino: Ino,
     target: String,
+    clocks: Clocks,
 }
 
 impl Inode for DevSymlinkNode {
@@ -517,6 +540,22 @@ impl Inode for DevSymlinkNode {
             kind: NodeKind::Symlink,
             size: self.target.len() as u64,
         }
+    }
+
+    fn mtime(&self) -> u64 {
+        self.clocks.mtime()
+    }
+
+    fn atime(&self) -> u64 {
+        self.clocks.atime()
+    }
+
+    /// `utimensat`: kept, on the shape Linux measures for a `/dev` directory,
+    /// a device node's symlink and a socket (`.workbuddy/utimensat_host.c`) -
+    /// a node that answers `EOPNOTSUPP` here is a node `touch` cannot use.
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        self.clocks.set(atime, mtime);
+        Ok(())
     }
 
     fn readlink(&self) -> VfsResult<String> {
@@ -532,6 +571,7 @@ impl Inode for DevSymlinkNode {
 /// socket - which is decided by the registry lookup, not by anything here.
 struct DevSocketNode {
     ino: Ino,
+    clocks: Clocks,
 }
 
 impl Inode for DevSocketNode {
@@ -541,6 +581,22 @@ impl Inode for DevSocketNode {
             kind: NodeKind::Socket,
             size: 0,
         }
+    }
+
+    fn mtime(&self) -> u64 {
+        self.clocks.mtime()
+    }
+
+    fn atime(&self) -> u64 {
+        self.clocks.atime()
+    }
+
+    /// `utimensat`: kept, on the shape Linux measures for a `/dev` directory,
+    /// a device node's symlink and a socket (`.workbuddy/utimensat_host.c`) -
+    /// a node that answers `EOPNOTSUPP` here is a node `touch` cannot use.
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        self.clocks.set(atime, mtime);
+        Ok(())
     }
 }
 
@@ -552,6 +608,7 @@ impl Inode for DevSocketNode {
 /// unlinking for them.
 pub(crate) struct DevDirNode {
     ino: u64,
+    clocks: Clocks,
     children: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
     next_ino: Arc<AtomicU64>,
 }
@@ -591,6 +648,22 @@ impl Inode for DevDirNode {
         }
     }
 
+    fn mtime(&self) -> u64 {
+        self.clocks.mtime()
+    }
+
+    fn atime(&self) -> u64 {
+        self.clocks.atime()
+    }
+
+    /// `utimensat`: kept, on the shape Linux measures for a `/dev` directory,
+    /// a device node's symlink and a socket (`.workbuddy/utimensat_host.c`) -
+    /// a node that answers `EOPNOTSUPP` here is a node `touch` cannot use.
+    fn set_times(&self, atime: u64, mtime: u64) -> VfsResult<()> {
+        self.clocks.set(atime, mtime);
+        Ok(())
+    }
+
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
         critical_section::with(|cs| {
             self.children
@@ -626,11 +699,15 @@ impl Inode for DevDirNode {
             let node: Arc<dyn Inode> = if kind == NodeKind::Dir {
                 Arc::new(DevDirNode {
                     ino,
+                    clocks: Clocks::new(),
                     children: Mutex::new(RefCell::new(BTreeMap::new())),
                     next_ino: self.next_ino.clone(),
                 })
             } else {
-                Arc::new(DevSocketNode { ino })
+                Arc::new(DevSocketNode {
+                    ino,
+                    clocks: Clocks::new(),
+                })
             };
             children.insert(String::from(name), node.clone());
             Ok(node)
@@ -647,6 +724,7 @@ impl Inode for DevDirNode {
             let node: Arc<dyn Inode> = Arc::new(DevSymlinkNode {
                 ino,
                 target: String::from(target),
+                clocks: Clocks::new(),
             });
             children.insert(String::from(name), node.clone());
             Ok(node)
@@ -674,6 +752,7 @@ impl DevFs {
     pub fn new() -> Arc<DevFs> {
         Arc::new(DevFs {
             root: Arc::new(DevRoot {
+                clocks: Clocks::new(),
                 inodes: Mutex::new(RefCell::new(BTreeMap::new())),
                 next_ino: Arc::new(AtomicU64::new(1)),
             }),
@@ -722,6 +801,7 @@ impl DevFs {
         let ino = self.root.next_ino.fetch_add(1, Ordering::Relaxed);
         let node = Arc::new(DevDirNode {
             ino,
+            clocks: Clocks::new(),
             children: Mutex::new(RefCell::new(BTreeMap::new())),
             next_ino: self.root.next_ino.clone(),
         });
@@ -753,6 +833,7 @@ impl DevFs {
                 Arc::new(DevSymlinkNode {
                     ino,
                     target: String::from(target),
+                    clocks: Clocks::new(),
                 }) as Arc<dyn Inode>,
             );
             assert!(prev.is_none(), "device {name} registered twice");
@@ -1123,6 +1204,27 @@ mod tests {
         // `/dev/vda1`.
         keeps_the_clocks(&fs.root().lookup("sink").unwrap(), "character");
         keeps_the_clocks(&fs.root().lookup("vda1").unwrap(), "block");
+    }
+
+    #[test]
+    fn path_named_nodes_keep_the_clocks_they_are_given() {
+        // §15.32 wired the character and block nodes, and the refusal a
+        // desktop showed came back right after "Populating /dev with existing
+        // devices through uevents" - the pass where udev *names a symlink*
+        // (`/dev/root`) and mdev lays directories. Measured on a host, `/dev`
+        // itself and a device node's symlink both keep the two clocks, so the
+        // four nodes still answering the trait's default - the root, an mdev
+        // directory, a link and a socket name - keep them too.
+        let _bus = crate::uevent::test_bus::take();
+        let fs = DevFs::new();
+        fs.register_dir("dri");
+        fs.register_symlink("root", "vda1");
+        let sock = fs.root().create("log", NodeKind::Socket).unwrap();
+
+        keeps_the_clocks(&fs.root(), "/dev itself");
+        keeps_the_clocks(&fs.root().lookup("dri").unwrap(), "/dev/dri");
+        keeps_the_clocks(&fs.root().lookup("root").unwrap(), "/dev/root");
+        keeps_the_clocks(&sock, "/dev/log");
     }
 
     #[test]

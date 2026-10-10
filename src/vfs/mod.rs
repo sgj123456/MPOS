@@ -160,6 +160,61 @@ pub struct Metadata {
     pub size: u64,
 }
 
+/// The two clocks `utimensat`/`futimens` hand a node, for a node that has
+/// somewhere to put them.
+///
+/// Which nodes have somewhere is not a matter of taste, and it was measured
+/// rather than decided (`.workbuddy/utimensat_host.c`, run on a Linux host):
+/// a pipe, a socket, a `memfd`, `/dev/null`, a directory and a `/proc` file all
+/// report a real `st_mtime` afterwards, and the only ones that refuse are the
+/// *anonymous-inode* descriptors - `eventfd`, `epoll`, `timerfd`, `signalfd`
+/// and `inotify` - which answer `EPERM`. A `/proc` *directory* answers `EPERM`
+/// too.
+///
+/// So a node here either carries one of these, or answers `EPERM`. What none of
+/// them may do is answer `EOPNOTSUPP`, which is the shape that put
+/// `mpos: syscall 88 (fd -100) -> EOPNOTSUPP` on a desktop boot's console and
+/// made `note_eopnotsupp` name a syscall number with no way to say whose
+/// (§15.33): the note is printed once per *number*, so a second refusing node
+/// stays silent behind the first.
+pub struct Clocks {
+    atime: critical_section::Mutex<core::cell::Cell<u64>>,
+    mtime: critical_section::Mutex<core::cell::Cell<u64>>,
+}
+
+impl Default for Clocks {
+    fn default() -> Self {
+        Clocks::new()
+    }
+}
+
+impl Clocks {
+    /// Both clocks start at the epoch, which is what a node that has never been
+    /// named by `utimensat` reports.
+    pub fn new() -> Self {
+        Clocks {
+            atime: critical_section::Mutex::new(core::cell::Cell::new(0)),
+            mtime: critical_section::Mutex::new(core::cell::Cell::new(0)),
+        }
+    }
+
+    /// Both clocks at once, which is all `utimensat` ever asks for.
+    pub fn set(&self, atime: u64, mtime: u64) {
+        critical_section::with(|cs| {
+            self.atime.borrow(cs).set(atime);
+            self.mtime.borrow(cs).set(mtime);
+        });
+    }
+
+    pub fn atime(&self) -> u64 {
+        critical_section::with(|cs| self.atime.borrow(cs).get())
+    }
+
+    pub fn mtime(&self) -> u64 {
+        critical_section::with(|cs| self.mtime.borrow(cs).get())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VfsError {
     /// ENOENT: a named entry does not exist.
@@ -845,10 +900,16 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// Set the node's access and modification clocks - what `utimensat`/`futimens`
     /// do when a caller (or `touch`) names times. The change clock moves with
     /// the metadata, so a filesystem that keeps the three stores a fresh ctime
-    /// itself and takes only these two. The default refuses, for a filesystem
-    /// with nowhere to keep a time.
+    /// itself and takes only these two.
+    ///
+    /// The default is `EPERM` and not "unsupported": measured on a Linux host,
+    /// that is what the nodes with nowhere to keep a time answer - every
+    /// anonymous-inode descriptor (`eventfd`, `epoll`, `timerfd`, `signalfd`,
+    /// `inotify`) and every `/proc` directory - and `EOPNOTSUPP` is not an
+    /// answer Linux gives for this call at all. A node that *can* keep them
+    /// carries a [`Clocks`] and forwards the three methods to it.
     fn set_times(&self, _atime: u64, _mtime: u64) -> VfsResult<()> {
-        Err(VfsError::Unsupported)
+        Err(VfsError::NotPermitted)
     }
 
     /// Name a new symbolic link in this directory. Separate from [`Inode::create`]

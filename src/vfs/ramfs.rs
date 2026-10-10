@@ -569,9 +569,10 @@ struct RamSymlink {
     ino: Ino,
     /// How many names reach it: one, plus one per `link` of the link itself.
     links: Mutex<Cell<u64>>,
-    /// The moment the link was made - all the clock a link, which has no
-    /// contents to rewrite, can have.
-    mtime: u64,
+    /// The link's clock: the moment it was made, and then whatever
+    /// `utimensat` was asked for - Linux keeps a symlink's clocks, and
+    /// `touch -h` is a caller that names one.
+    mtime: Mutex<Cell<u64>>,
     target: String,
     /// Linux's birth mode (`0777` under `S_IFLNK`), stored rather than left
     /// unset so `stat` of the link reads what an ext2 link carries and a
@@ -621,7 +622,16 @@ impl Inode for RamSymlink {
     }
 
     fn mtime(&self) -> u64 {
-        self.mtime
+        critical_section::with(|cs| self.mtime.borrow(cs).get())
+    }
+
+    /// `utimensat`, on the shape Linux keeps: a symlink's and a socket's
+    /// clocks are settable (`.workbuddy/utimensat_host.c`), and the atime
+    /// is accepted and dropped here for the same reason a file's is - one
+    /// clock stands for all three in this filesystem.
+    fn set_times(&self, _atime: u64, mtime: u64) -> VfsResult<()> {
+        critical_section::with(|cs| self.mtime.borrow(cs).set(mtime));
+        Ok(())
     }
 
     fn readlink(&self) -> VfsResult<String> {
@@ -641,6 +651,11 @@ impl Inode for RamSymlink {
 /// of a null device and a harmless one for anything nobody has opened yet.
 struct RamDev {
     ino: Ino,
+    /// The clock `utimensat` hands it - a device node made by `mknod` keeps one
+    /// on Linux, the same as one devtmpfs published does. Like every node in
+    /// this filesystem it keeps *one* word: the atime is accepted and dropped
+    /// into the mtime, the rule the file and the directory already follow.
+    mtime: Mutex<Cell<u64>>,
     /// How many names reach it: a `mknod` placeholder can be linked like any
     /// other node.
     links: Mutex<Cell<u64>>,
@@ -663,6 +678,18 @@ impl Inode for RamDev {
         Ok(buf.len())
     }
 
+    fn mtime(&self) -> u64 {
+        critical_section::with(|cs| self.mtime.borrow(cs).get())
+    }
+
+    /// `utimensat`: kept rather than refused, which is what Linux's `mknod`ed
+    /// device nodes do (measured on a host, `.workbuddy/utimensat_host.c`) -
+    /// and folded into one clock, the shape every node here has.
+    fn set_times(&self, _atime: u64, mtime: u64) -> VfsResult<()> {
+        critical_section::with(|cs| self.mtime.borrow(cs).set(mtime));
+        Ok(())
+    }
+
     counts_its_names!();
     names_live_in_dirs!();
 }
@@ -676,9 +703,9 @@ struct RamSocket {
     ino: Ino,
     /// How many names reach it - the bound path, and any `link` of it.
     links: Mutex<Cell<u64>>,
-    /// The moment `bind` planted the name; a socket's own clock has nothing
-    /// else to say about it.
-    mtime: u64,
+    /// The socket's clock: the moment `bind` planted the name, and then
+    /// whatever `utimensat` was asked for.
+    mtime: Mutex<Cell<u64>>,
     mode: Mutex<Cell<Option<u32>>>,
     owner: Mutex<Cell<(u32, u32)>>,
     flags: NodeFlags,
@@ -702,7 +729,16 @@ impl Inode for RamSocket {
     }
 
     fn mtime(&self) -> u64 {
-        self.mtime
+        critical_section::with(|cs| self.mtime.borrow(cs).get())
+    }
+
+    /// `utimensat`, on the shape Linux keeps: a symlink's and a socket's
+    /// clocks are settable (`.workbuddy/utimensat_host.c`), and the atime
+    /// is accepted and dropped here for the same reason a file's is - one
+    /// clock stands for all three in this filesystem.
+    fn set_times(&self, _atime: u64, mtime: u64) -> VfsResult<()> {
+        critical_section::with(|cs| self.mtime.borrow(cs).set(mtime));
+        Ok(())
     }
 
     fn mode(&self) -> u32 {
@@ -866,6 +902,7 @@ impl Inode for RamDir {
             NodeKind::CharDev | NodeKind::BlockDev => Arc::new(RamDev {
                 ino: fresh_ino(),
                 links: Mutex::new(Cell::new(1)),
+                mtime: Mutex::new(Cell::new(at)),
             }),
             // A socket name, made by `bind` alone. Its clock is the bind;
             // `connect` looks up the node's identity, never its bytes. The
@@ -874,7 +911,7 @@ impl Inode for RamDir {
             NodeKind::Socket => Arc::new(RamSocket {
                 ino: fresh_ino(),
                 links: Mutex::new(Cell::new(1)),
-                mtime: now(),
+                mtime: Mutex::new(Cell::new(now())),
                 mode: Mutex::new(Cell::new(birth)),
                 owner: Mutex::new(Cell::new(owner)),
                 flags: NodeFlags::new(),
@@ -904,7 +941,7 @@ impl Inode for RamDir {
         let node: Arc<dyn Inode> = Arc::new(RamSymlink {
             ino: fresh_ino(),
             links: Mutex::new(Cell::new(1)),
-            mtime: at,
+            mtime: Mutex::new(Cell::new(at)),
             target: String::from(target),
             mode: Mutex::new(Cell::new(birth_mode(NodeKind::Symlink))),
             owner: Mutex::new(Cell::new(crate::sched::current_owner())),
@@ -1552,6 +1589,21 @@ mod tests {
         // A symlink answers with its creation time; it has no write path.
         let link = root.symlink("l", "/f").unwrap();
         assert_ne!(link.mtime(), 0);
+
+        // A symlink, a socket name and a `mknod` device node take a
+        // `utimensat` where they used to answer the trait's default
+        // `EOPNOTSUPP` - and fold it into the one clock this filesystem keeps,
+        // exactly as the file above does (`NOTES.md` §15.35). The refusal, not
+        // the folding, was the divergence a caller tripped over.
+        for (what, node) in [
+            ("symlink", link.clone()),
+            ("socket", root.create("s", NodeKind::Socket).unwrap()),
+            ("device", root.create("d", NodeKind::CharDev).unwrap()),
+        ] {
+            node.set_times(111, 222).unwrap();
+            assert_eq!(node.mtime(), 222, "a ramfs {what} takes the caller's value");
+            assert_eq!(node.atime(), 222, "and folds the atime into it, its one clock");
+        }
     }
 
     /// A directory is born traversable by everyone, and a file is not: the

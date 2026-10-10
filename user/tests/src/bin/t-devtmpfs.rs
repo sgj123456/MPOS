@@ -30,17 +30,28 @@
 //! number to hand a node that arrives when its driver registers it, so a node
 //! nobody has stamped reports zero - the trait's own answer for a filesystem
 //! that keeps nothing, and what `/dev` already reported - rather than a
-//! plausible time. The directories, symlinks and socket names under `/dev` are
-//! outside this claim too: they hold no `NodePerms` and still answer the trait's
-//! default. Both remainders are named in `docs/UAPI.md` §5.2.
+//! plausible time. The *directories* under `/dev` are claimed too, now: the
+//! refusal a desktop still showed landed in the pass where udev lays
+//! directories and names symlinks, so the node the filesystem *is* (`/dev`
+//! itself) and a directory under it (`/dev/dri`, where a display driver
+//! registered) take the same stamp a device node does (`NOTES.md` §15.35).
+//! A symlink is not claimed here: `stat` follows one, so the path-taking door
+//! this test uses would stamp the target and not the link - the host suite's
+//! `path_named_nodes_keep_the_clocks_they_are_given` pins `DevSymlinkNode`
+//! directly instead.
 
 use mpos_user_tests::Report;
 use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_OMIT, stat, utimensat};
 
 /// The clock the test sets. Far from any boot time, so a node that answered
 /// "now" - or the epoch - cannot pass as this value.
+///
+/// `MTIME` is deliberately *not* `ATIME + 1`: the `touch -a` half below sets
+/// the atime to `ATIME + 1` while asking the mtime to stay, so if the two
+/// numbers collided the "the mtime did not move" line would compare a value
+/// against itself and pass on a node that moved the wrong clock.
 const ATIME: i64 = 1_600_000_001;
-const MTIME: i64 = 1_600_000_002;
+const MTIME: i64 = 1_600_000_007;
 
 /// The block nodes a boot of either machine publishes, in the order this test
 /// asks for them: the SATA disk the sweep attaches on both (major 8), then this
@@ -148,6 +159,19 @@ fn main() {
     match block {
         Some(path) => claim(&mut r, path),
         None => r.check(&format!("one of {BLOCK_NODES:?} exists to claim"), false),
+    }
+
+    // The node the filesystem *is*: `/dev` itself, a directory whose inode is
+    // `DevRoot`. Always here, and the inode the refusal a desktop still showed
+    // reached once the block nodes kept their clocks (`NOTES.md` §15.35).
+    claim(&mut r, "/dev");
+    // A directory udev/mdev lays under `/dev` for the GPU. Present only where a
+    // display driver registered, so its absence is noted rather than failed -
+    // the *kind* is what is claimed, and `/dev` above already pins `DevDirNode`
+    // on a machine that has no `/dev/dri`.
+    match stat("/dev/dri") {
+        Ok(_) => claim(&mut r, "/dev/dri"),
+        Err(_) => println!("  (no /dev/dri on this machine)"),
     }
 
     r.finish()
