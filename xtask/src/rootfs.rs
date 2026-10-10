@@ -945,12 +945,31 @@ fn create_account_without_chroot(mount_dir: &Path, user: &UserConfig) -> Result<
     // needs it - so the directory can be owned by the new account; a host test
     // cannot own a foreign id, and what it pins is the account's numbers and the
     // file shape rather than the owner.
+    //
+    // Being uid 0 is not the same fact as being *able* to own a foreign id, and
+    // the machine this was measured on is the one that separates them: its root
+    // is the root of a user namespace whose map holds a single id
+    // (`/proc/self/uid_map` = `0 1000 1`), so `chown` to any other id answers
+    // `EINVAL` - the id cannot be represented here - on every filesystem, and a
+    // build that treated that as fatal could not write an account at all. So
+    // `EINVAL` is read as what it says and printed rather than assumed, the way
+    // `hand_back` already treats a refused hand-over of the build tree; every
+    // other error is still a failure, because a home the account cannot write
+    // in is a real defect of an installed image.
     let home = mount_dir.join("home").join(&user.name);
     fs::create_dir_all(&home).with_context(|| format!("Failed to create {}", home.display()))?;
     utils::set_mode(&home, 0o755)?;
-    if utils::is_root() {
-        std::os::unix::fs::chown(&home, Some(uid), Some(gid))
-            .with_context(|| format!("Failed to own {}", home.display()))?;
+    if utils::is_root()
+        && let Err(err) = std::os::unix::fs::chown(&home, Some(uid), Some(gid))
+    {
+        if err.raw_os_error() != Some(libc::EINVAL) {
+            return Err(err).with_context(|| format!("Failed to own {}", home.display()));
+        }
+        println!(
+            "rootfs: {} is left owned by the build user - this machine cannot own id {uid} \
+             (a user namespace whose map holds one id)",
+            home.display()
+        );
     }
 
     println!(

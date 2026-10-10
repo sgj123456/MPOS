@@ -130,6 +130,20 @@ pub fn select<'a, T: TestProgram>(
     // gaps. So here a *reason* never leaves a program out; only this machine's
     // own gap list does. A machine-named group keeps meaning "not me" everywhere
     // else, unchanged.
+    //
+    // The one exception is a program that is not a check at all. A measurement
+    // instrument (`t-forkcost`, `t-netlat`) is a different instrument on each
+    // machine, so running it on both is right. A diagnostic (`t-sh`) is the
+    // *same* thing everywhere - an interactive shell exec'd onto the console to
+    // be read by hand - and §15.34's rule says what a boot may assert is
+    // bounded by what the kernel itself produces, which an interactive child's
+    // state letter is not. So `diagnostic` leaves a program out on both arms;
+    // `external` and `slow` stay x86_64-harness words.
+    let hand_read = |name: &str| {
+        config
+            .groups_of(name, Machine::X86_64)
+            .contains(&"diagnostic")
+    };
     let staged: Vec<&'a T> = if machine == Machine::X86_64 {
         built
             .iter()
@@ -139,10 +153,11 @@ pub fn select<'a, T: TestProgram>(
         built
             .iter()
             .filter(|test| {
-                !config
-                    .groups_of(test.name(), machine)
-                    .iter()
-                    .any(|group| config.owns_a_machine(group))
+                !hand_read(test.name())
+                    && !config
+                        .groups_of(test.name(), machine)
+                        .iter()
+                        .any(|group| config.owns_a_machine(group))
             })
             .collect()
     };
@@ -298,6 +313,24 @@ aarch64 = ["t-drm"]
         TestConfig::load(&path).unwrap()
     }
 
+    /// The same loader over a file that also carries the `diagnostic` group -
+    /// which the base fixture deliberately does not, so adding it there would
+    /// move every other expectation in this module at once.
+    fn config_with_diagnostic(name: &str) -> TestConfig {
+        const WITH_DIAGNOSTIC: &str = r#"
+default = []
+external = ["t-dns", "t-udp"]
+slow = ["t-forkcost"]
+aarch64 = ["t-drm"]
+diagnostic = ["t-sh"]
+"#;
+        let dir = std::env::temp_dir().join(format!("mpos-sweep-tests-{name}"));
+        std::fs::create_dir_all(dir.join(crate::paths::TESTS_CONFIG).parent().unwrap()).unwrap();
+        let path = dir.join(crate::paths::TESTS_CONFIG);
+        std::fs::write(&path, WITH_DIAGNOSTIC).unwrap();
+        TestConfig::load(&path).unwrap()
+    }
+
     fn built() -> Vec<Program> {
         vec![
             Program("t-tcp"),
@@ -306,6 +339,12 @@ aarch64 = ["t-drm"]
             Program("t-forkcost"),
             Program("t-drm"),
         ]
+    }
+
+    fn built_with_diagnostic() -> Vec<Program> {
+        let mut tests = built();
+        tests.push(Program("t-sh"));
+        tests
     }
 
     /// A group nobody defined is refused by name rather than shrinking the run:
@@ -419,6 +458,50 @@ aarch64 = ["t-drm"]
         let x86 = select(Machine::X86_64, &config, &built, &Selection::default()).unwrap();
         let left_out: Vec<&str> = x86.skipped.iter().map(|p| p.name()).collect();
         assert_eq!(left_out, vec!["t-dns", "t-udp", "t-forkcost"]);
+    }
+
+    /// `diagnostic` is not a harness word but a kind: what it names is not a
+    /// check at all (`t-sh` execs an interactive shell onto the console to be
+    /// read by hand), so the §13.5 contract - run everything else - does not
+    /// cover it, and leaving it out on both arms' *default* sweeps is the
+    /// honest reading of "everything that is a check of this machine". The
+    /// second arm still has no way to ask for a reason-group by name: `main`
+    /// refuses `--groups` there before it gets here, because its payload's
+    /// selection vocabulary is the first machine's suites' membership.
+    /// Measured on batch 43's day: with the reason-blind branch alone, the
+    /// second machine ran `t-sh` in its default sweep while the first left it
+    /// out of the very same one.
+    #[test]
+    fn a_diagnostic_is_left_out_on_both_machines_default_sweeps() {
+        let config = config_with_diagnostic("diagnostic-on-both");
+        let built = built_with_diagnostic();
+
+        let aarch64 = select(Machine::Aarch64, &config, &built, &Selection::default()).unwrap();
+        let staged: Vec<&str> = aarch64.staged.iter().map(|p| p.name()).collect();
+        assert!(
+            !staged.contains(&"t-sh"),
+            "a diagnostic belongs to no machine's default sweep"
+        );
+        assert!(
+            aarch64.skipped.iter().any(|p| p.name() == "t-sh"),
+            "and it is reported as left out, never silently absent"
+        );
+
+        // Every *other* reason-group still binds neither arm the way §13.5 says.
+        for program in ["t-dns", "t-forkcost"] {
+            assert!(
+                staged.contains(&program),
+                "{program} is built for this machine and only `diagnostic` \
+                 may leave a built program out here"
+            );
+        }
+
+        let x86 = select(Machine::X86_64, &config, &built, &Selection::default()).unwrap();
+        assert!(
+            x86.skipped.iter().any(|p| p.name() == "t-sh"),
+            "the first machine's selection is unchanged: a plain sweep \
+             still leaves the diagnostic out"
+        );
     }
 
     /// The parser reads what both runners print, and beats the two cheaper

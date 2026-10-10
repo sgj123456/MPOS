@@ -57,24 +57,12 @@ name = "t-virtgpu"
 path = "src/bin/integration/t-virtgpu.rs"
 
 [[bin]]
-name = "t-ahci"
-path = "src/bin/integration/t-ahci.rs"
-
-[[bin]]
 name = "t-evdev"
 path = "src/bin/integration/t-evdev.rs"
 
 [[bin]]
 name = "t-seat"
 path = "src/bin/integration/t-seat.rs"
-
-[[bin]]
-name = "t-sh"
-path = "src/bin/integration/t-sh.rs"
-
-[[bin]]
-name = "t-udev-worker"
-path = "src/bin/integration/t-udev-worker.rs"
 
 [lints]
 workspace = true
