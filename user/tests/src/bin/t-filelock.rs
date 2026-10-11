@@ -64,7 +64,7 @@
 //!
 //! The probe's `struct flock` is `libc::flock`, not the hand-rolled 32 bytes the
 //! no-std version laid out: the layout is a per-target fact and belongs in a
-//! maintained table. It is what `docs/UAPI.md` §4 pins, so the claim and the
+//! maintained table. It is what `docs/uapi/` §4 pins, so the claim and the
 //! record agree.
 
 use mpos_user_tests::Report;

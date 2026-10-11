@@ -481,6 +481,136 @@ fn route_table_text() -> String {
     }
 }
 
+/// `/proc/net/dev`: every interface and its frame counters, in Linux's column
+/// layout.
+///
+/// The file is the canonical door for what §10.4's instrument counts - rx/tx
+/// packets and bytes per interface - which is why this kernel puts the numbers
+/// here rather than behind a private protocol: an ordinary boot answers them,
+/// no boot word arms them, and a reader that parses by position (`ifconfig`,
+/// `ss -i`, procps' own tools) finds every standard column where Linux puts
+/// it. The one divergence is named in [`net_dev_row`]: two words appended past
+/// the last standard column, which a positional reader never reaches.
+///
+/// Both header lines are copied byte for byte from what Linux prints -
+/// measured on the host 2026-10-11, and pinned as literals by the test beside
+/// [`net_dev_row`] - because the file is parsed by *position*: the column line
+/// is where readers find each field, and a program that reads it is not asked
+/// to be forgiving. Two header lines, then one row per interface.
+fn net_dev_text() -> String {
+    let mut out = String::from(
+        "Inter-|   Receive                                                |  Transmit\n\
+         \x20face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n",
+    );
+    for row in net_dev_rows() {
+        out.push_str(&net_dev_row(&row));
+    }
+    out
+}
+
+/// One `/proc/net/dev` row, rendered from a [`NetDevRow`].
+///
+/// Split from [`net_dev_text`] so the host test hands it hand-built numbers and
+/// checks the columns byte for byte - the same shape `partitions_text` uses,
+/// and for the same reason: the rendering is the contract, and a machine that
+/// has no stack cannot be the only witness to it.
+fn net_dev_row(row: &NetDevRow) -> String {
+    // The widths below are *measured*, not guessed: real Linux (host,
+    // 2026-10-11) right-aligns every value into a fixed advance - the name in
+    // six columns plus its colon and one space, then rx bytes/packets at 8,
+    // errs/drop/fifo at 5, frame at 6, compressed at 11, multicast at 10, tx
+    // bytes at 9, tx packets at 8, errs/drop/fifo at 5, colls at 6, carrier at
+    // 8, compressed at 11. A field wider than its column pushes only itself
+    // (`%llu` has no truncation), which is what the host's own rows show for a
+    // ten-digit byte count - and the test beside this function pins both the
+    // aligned shape and that overflow case.
+    //
+    // The zeros are honest: this kernel's seam does not count errors, drops,
+    // fifos or collisions - a frame either crosses or does not - and zero is
+    // what Linux itself reports for a driver that keeps no such counter.
+    //
+    // The two appended words are this kernel's own, *after* the last standard
+    // column: `mtu` because `ip -s link` reads the link's current MTU and this
+    // kernel's is settable (`ip link set eth0 mtu N`), and `pool=<hits>:<misses>`
+    // because §10.4's instrument state has no Linux column to live in — inventing
+    // one *inside* the table would shift every reader's positions, which is the
+    // wrong-shape answer, while extra words at the tail are invisible to a
+    // parser that stops at `compressed`. Divergence disclosed here, in
+    // `docs/uapi/`, and read by `t-netstats`.
+    alloc::format!(
+        "{:>6}: {:>7} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10} mtu {mtu} pool={hits}:{misses}\n",
+        row.name,
+        row.rx_bytes,
+        row.rx_packets,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        row.tx_bytes,
+        row.tx_packets,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        mtu = row.mtu,
+        hits = row.pool_hits,
+        misses = row.pool_misses,
+    )
+}
+
+/// A `/proc/net/dev` row as plain numbers, so the renderer is testable without
+/// a stack and the collector stays a translation layer.
+pub(crate) struct NetDevRow {
+    pub name: &'static str,
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub mtu: usize,
+    pub pool_hits: u64,
+    pub pool_misses: u64,
+}
+
+/// The rows, from the seam's counters on the machine.
+///
+/// The same two-body rule as [`net_rows`], but with nothing to stub on the
+/// host: the *renderer*'s claims are pinned against hand-built [`NetDevRow`]
+/// values by the tests below, and a host build has no seam to count - so the
+/// empty answer here is the honest one, not a fixture dressed up as data. The
+/// stats type lives in `crate::net::pool`, inside the machine-gated stack - the
+/// host build never names it, only its own [`NetDevRow`] twin.
+fn net_dev_rows() -> Vec<NetDevRow> {
+    #[cfg(target_os = "none")]
+    {
+        crate::net::net_dev_rows()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+    #[cfg(not(target_os = "none"))]
+    Vec::new()
+}
+
+#[cfg(target_os = "none")]
+impl From<crate::net::pool::NetDevStats> for NetDevRow {
+    fn from(s: crate::net::pool::NetDevStats) -> NetDevRow {
+        NetDevRow {
+            name: s.name,
+            rx_bytes: s.rx_bytes,
+            rx_packets: s.rx_packets,
+            tx_bytes: s.tx_bytes,
+            tx_packets: s.tx_packets,
+            mtu: s.mtu,
+            pool_hits: s.pool_hits,
+            pool_misses: s.pool_misses,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The questions /proc asks the scheduler.
 //
@@ -1547,9 +1677,18 @@ fn partitions_text(numbering: &crate::uevent::Numbering) -> String {
 /// refused, and userland reads it to decide whether to remount. The last two
 /// are `dump`'s and `fsck`'s and are zero for everything here, as they are on
 /// Linux for every filesystem no dump or fsck would ever be pointed at.
+///
+/// The table is **the caller's**, through `mount::mount_records` - the free
+/// function that routes by `process_fs_context` - and not the machine's. This
+/// is what makes a mount namespace observable at all: the file *is* the way
+/// userland compares two namespaces (`findmnt`, OpenRC's scan), so a renderer
+/// reading the machine's table would answer every task with the same list and
+/// `unshare(CLONE_NEWNS)` would be invisible where it matters. Measured by
+/// `t-ns-mnt`, whose child unshared, unmounted inside its copy, and read this
+/// file back to see whether the peel had landed.
 fn mounts_text() -> String {
     let mut out = String::new();
-    for record in super::mount::global().mount_records() {
+    for record in super::mount::mount_records() {
         out.push_str(&alloc::format!(
             "{} {} {} {} 0 0\n",
             if record.source.is_empty() {
@@ -1590,7 +1729,10 @@ fn mounts_text() -> String {
 /// has: a mount belongs to one namespace and shares with nothing, and an empty
 /// list is what Linux prints for a mount that shares with nothing either.
 fn mountinfo_text() -> String {
-    mountinfo_lines(&super::mount::global().mount_records())
+    // The caller's table, for the reason [`mounts_text`] gives: the two files
+    // are two renderings of one fact, and a reader that found them disagreeing
+    // about which mounts exist would have no way to tell which was right.
+    mountinfo_lines(&super::mount::mount_records())
 }
 
 /// [`mountinfo_text`] over a mount table the caller supplies, so the rendering
@@ -1944,6 +2086,9 @@ impl ProcFs {
         net.add("tcp", NodeKind::File, file(|| format_net(&net_rows(true))));
         net.add("udp", NodeKind::File, file(|| format_net(&net_rows(false))));
         net.add("route", NodeKind::File, file(route_table_text));
+        // The per-interface counters. §10.4's instrument reads through this
+        // door - Linux's own one, so no private protocol was needed for it.
+        net.add("dev", NodeKind::File, file(net_dev_text));
         self.root.add("net", NodeKind::Dir, net);
 
         // `/proc/bus/pci`: pciutils' fallback access method, and the one
@@ -2224,6 +2369,68 @@ mod tests {
             partition_row("vda3", 254, 3, 131_072 * 2),
             " 254    3     131072 vda3\n"
         );
+    }
+
+    /// `/proc/net/dev`'s row shape, byte for byte against what real Linux
+    /// prints (host, 2026-10-11): the six-wide right-aligned name and its
+    /// colon, then sixteen right-justified counters at their measured widths.
+    /// The two strings below are copied from the host's own file - a short
+    /// counter row and one whose ten-digit byte count overflows its column and
+    /// pushes only itself - so this test is the measurement, not a restatement
+    /// of the format string.
+    ///
+    /// The counterfactual is §10.4's instrument read wrong: a renderer that
+    /// shifted any column, or left the counters unaligned, would still let
+    /// `t-netstats` find *a* number on the line while breaking every reader
+    /// that parses by position - which is the whole reason the file exists.
+    #[test]
+    fn a_net_dev_row_has_linuxs_column_widths() {
+        let row = |name, rx_bytes, rx_packets, tx_bytes, tx_packets| NetDevRow {
+            name,
+            rx_bytes,
+            rx_packets,
+            tx_bytes,
+            tx_packets,
+            mtu: 1500,
+            pool_hits: 0,
+            pool_misses: 0,
+        };
+        // The host's `lo:` row verbatim (its counters replaced with the same
+        // numbers on both sides, as this kernel reports no drops).
+        let expected = "    lo:  102781    1346    0    0    0     0          0         0   102781    1346    0    0    0     0       0          0";
+        let mut got = net_dev_row(&row("lo", 102_781, 1_346, 102_781, 1_346));
+        // Strip the appended words before comparing to Linux's line; they are
+        // claimed separately below.
+        got.truncate(expected.len() + 1);
+        assert_eq!(got.trim_end(), expected, "the standard columns drifted");
+        // A ten-digit byte count overflows its column and pushes only itself,
+        // exactly as the host's wlan0 row does.
+        let big = net_dev_row(&row(
+            "wlan0",
+            558_747_477,
+            1_615_726,
+            3_399_828_847,
+            2_768_186,
+        ));
+        assert!(
+            big.starts_with(
+                " wlan0: 558747477 1615726    0    0    0     0          0         0 3399828847 2768186    0    0    0     0       0          0"
+            ),
+            "{big}"
+        );
+        // The appended words, named once each: the settable MTU and the pool's
+        // pair, after the last standard column.
+        let eth = net_dev_row(&NetDevRow {
+            name: "eth0",
+            rx_bytes: 7,
+            rx_packets: 1,
+            tx_bytes: 9,
+            tx_packets: 2,
+            mtu: 1500,
+            pool_hits: 41,
+            pool_misses: 3,
+        });
+        assert!(eth.ends_with("mtu 1500 pool=41:3\n"), "{eth}");
     }
 
     /// Every disk this machine has, each under its own major and with its own

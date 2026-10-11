@@ -677,6 +677,62 @@ pub fn merge_overlay(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A digest of a directory tree's *content*: every file path, its type (file /
+/// symlink with its target), and its bytes' digest, walked in sorted order so
+/// the answer does not depend on what `read_dir` happened to return first.
+///
+/// Like [`crate::disk`]'s sweep-medium digest, this is `DefaultHasher` and is
+/// promised across no compiler version - and it does not need to be: a digest
+/// that changes when it should not costs one rebuild, which is the direction
+/// every ambiguity in the staleness rules is resolved towards. An unreadable
+/// entry folds into a named constant rather than an error: the stamp reader
+/// treats "no digest" as "rebuild", and a build must not die over a file it
+/// cannot open while deciding whether to run at all.
+pub fn dir_digest(dir: &Path) -> u64 {
+    fn walk(base: &Path, rel: &str, acc: &mut Vec<(String, String)>) {
+        let Ok(entries) = fs::read_dir(base) else {
+            return;
+        };
+        let mut names: Vec<_> = entries.flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        for name in names {
+            let from = base.join(&name);
+            let path = if rel.is_empty() {
+                name.to_string_lossy().into_owned()
+            } else {
+                format!("{rel}/{}", name.to_string_lossy())
+            };
+            let Ok(meta) = fs::symlink_metadata(&from) else {
+                continue;
+            };
+            if meta.is_dir() {
+                acc.push((path.clone(), "dir".into()));
+                walk(&from, &path, acc);
+            } else if meta.file_type().is_symlink() {
+                let target = fs::read_link(&from)
+                    .map(|t| t.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "<unreadable>".into());
+                acc.push((path, format!("link:{target}")));
+            } else {
+                let bytes = fs::read(&from).unwrap_or_default();
+                acc.push((path, format!("file:{:016x}", content_digest(&bytes))));
+            }
+        }
+    }
+    let mut acc = Vec::new();
+    walk(dir, "", &mut acc);
+    acc.sort();
+    content_digest(format!("{acc:?}").as_bytes())
+}
+
+/// A digest of raw bytes. `DefaultHasher`, same promise as [`dir_digest`].
+pub fn content_digest(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub fn run_status(cmd: &mut Command, what: &str) -> Result<()> {
     let status = cmd
         .status()

@@ -9,12 +9,12 @@
 //!
 //! Dentries - the name-to-inode edges - have no cache of their own yet. Each
 //! filesystem holds its edges directly (ramfs in per-directory maps), and
-//! [`mount::Vfs::resolve`] is the only walker, treating every edge as fresh.
+//! [`mount::MountTable::resolve`] is the only walker, treating every edge as fresh.
 //! A shared dcache becomes worth its complexity with the disk-backed
 //! filesystems, whose directories are worth caching; the memory ones
 //! are their own cache.
 //!
-//! [`mount::Vfs`] is instantiable rather than global so tests can build
+//! [`mount::MountTable`] is instantiable rather than global so tests can build
 //! isolated tables; the kernel holds one instance, exposed by [`mount_root`],
 //! [`mount`] and [`resolve`].
 
@@ -1695,7 +1695,7 @@ mod tests {
 
     use alloc::sync::Arc;
 
-    use super::mount::Vfs;
+    use super::mount::MountTable;
     use super::{NodeKind, R_OK, VfsError, W_OK, X_OK, may_as, permitted, split_parent};
 
     #[test]
@@ -1731,7 +1731,7 @@ mod tests {
         // The two birth modes asserted below are the process-global mask's
         // answer, so this takes its turn with the test that sets one.
         let _lock = crate::sched::test_lock::take();
-        let vfs = Vfs::new();
+        let vfs = MountTable::new();
         let fs = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
@@ -1834,7 +1834,7 @@ mod tests {
         // `lstat(".")` is what a directory-listing tool asks first, and it is
         // the case a parent/name split cannot express. It must answer the
         // directory itself rather than refuse.
-        let vfs = Vfs::new();
+        let vfs = MountTable::new();
         let fs = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
@@ -1901,7 +1901,7 @@ mod tests {
     /// that was unpinned.
     #[test]
     fn a_relative_link_deep_in_an_absolute_path_resolves_to_its_target() {
-        let vfs = Vfs::new();
+        let vfs = MountTable::new();
         let fs = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
@@ -1945,7 +1945,7 @@ mod tests {
 
     #[test]
     fn may_as_answers_for_the_node_and_the_identity_it_is_given() {
-        let vfs = Vfs::new();
+        let vfs = MountTable::new();
         let fs = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
@@ -1986,7 +1986,7 @@ mod tests {
         // set. The pin is the counterfactual: without the branch, `(0,0)`
         // against these nodes is `Access` where Linux says yes, and `Ok`
         // where Linux says no.
-        let vfs = Vfs::new();
+        let vfs = MountTable::new();
         let fs = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();

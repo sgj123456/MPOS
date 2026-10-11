@@ -441,8 +441,12 @@ const _: () = assert!(core::mem::offset_of!(ResourceInfo, size) == 8);
 const _: () = assert!(core::mem::size_of::<VirtgpuBox>() == 24);
 const _: () = assert!(core::mem::size_of::<TransferToHost>() == 44);
 const _: () = assert!(core::mem::offset_of!(TransferToHost, box_) == 4);
-const _: () = assert!(core::mem::offset_of!(TransferToHost, box_) + core::mem::offset_of!(VirtgpuBox, w) == 16);
-const _: () = assert!(core::mem::offset_of!(TransferToHost, box_) + core::mem::offset_of!(VirtgpuBox, d) == 24);
+const _: () = assert!(
+    core::mem::offset_of!(TransferToHost, box_) + core::mem::offset_of!(VirtgpuBox, w) == 16
+);
+const _: () = assert!(
+    core::mem::offset_of!(TransferToHost, box_) + core::mem::offset_of!(VirtgpuBox, d) == 24
+);
 const _: () = assert!(core::mem::size_of::<FbCmd>() == 28);
 const _: () = assert!(core::mem::offset_of!(FbCmd, handle) == 24);
 const _: () = assert!(core::mem::size_of::<FbCmd2>() == 104);
@@ -590,7 +594,13 @@ fn main() {
 
     // GETRESOURCES reports one crtc, connector, encoder.
     let mut res = CardRes::default();
-    let got = unsafe { ioctl(fd, ioc_d(NR_GETRESOURCES, 64), (&raw mut res) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GETRESOURCES, 64),
+            (&raw mut res) as *mut c_void,
+        )
+    };
     check_is(&mut r, "GETRESOURCES succeeds", got, 0);
     check_true(&mut r, "one CRTC", res.count_crtcs == 1);
     check_true(&mut r, "one connector", res.count_connectors == 1);
@@ -615,7 +625,13 @@ fn main() {
         count_fbs: 0,
         ..CardRes::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_GETRESOURCES, 64), (&raw mut fill) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GETRESOURCES, 64),
+            (&raw mut fill) as *mut c_void,
+        )
+    };
     check_is(
         &mut r,
         "the fill call succeeds with an empty array beside a dangling pointer",
@@ -636,7 +652,13 @@ fn main() {
     // then writes through a zero-length allocation. Pinned here so the layout
     // cannot drift again.
     let mut pres = GetPlaneRes::default();
-    let got = unsafe { ioctl(fd, ioc_d(NR_GETPLANERESOURCES, 16), (&raw mut pres) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GETPLANERESOURCES, 16),
+            (&raw mut pres) as *mut c_void,
+        )
+    };
     check_is(&mut r, "GETPLANERESOURCES succeeds", got, 0);
     check_is(
         &mut r,
@@ -649,9 +671,20 @@ fn main() {
         plane_id_ptr: plane_ids.as_mut_ptr() as u64,
         count_planes: plane_ids.len() as u32,
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_GETPLANERESOURCES, 16), (&raw mut pres) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GETPLANERESOURCES, 16),
+            (&raw mut pres) as *mut c_void,
+        )
+    };
     check_is(&mut r, "the plane list fills", got, 0);
-    check_is(&mut r, "the first is the primary plane", plane_ids[0] as isize, 36);
+    check_is(
+        &mut r,
+        "the first is the primary plane",
+        plane_ids[0] as isize,
+        36,
+    );
 
     // CREATE_DUMB: 64x64 @ 32bpp -> pitch 256, size 16384, handle >= 1.
     let mut dumb = CreateDumb {
@@ -660,12 +693,23 @@ fn main() {
         bpp: 32,
         ..CreateDumb::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_CREATE_DUMB, 32), (&raw mut dumb) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_CREATE_DUMB, 32),
+            (&raw mut dumb) as *mut c_void,
+        )
+    };
     check_is(&mut r, "CREATE_DUMB succeeds", got, 0);
     let handle = dumb.handle;
     let size = dumb.size;
     check_true(&mut r, "a dumb buffer handle is returned", handle >= 1);
-    check_is(&mut r, "the dumb size is pitch*height", size as isize, 16384);
+    check_is(
+        &mut r,
+        "the dumb size is pitch*height",
+        size as isize,
+        16384,
+    );
 
     // MAP_DUMB -> a nonzero mmap offset.
     let mut map = MapDumb {
@@ -692,7 +736,11 @@ fn main() {
     if let Ok(m) = m {
         unsafe { (m as *mut u32).write_volatile(0xdead_beef) };
         let back = unsafe { (m as *const u32).read_volatile() };
-        check_true(&mut r, "the mapped buffer holds what was written", back == 0xdead_beef);
+        check_true(
+            &mut r,
+            "the mapped buffer holds what was written",
+            back == 0xdead_beef,
+        );
         let _ = unsafe { rustix::mm::munmap(m, size as usize) };
     }
 
@@ -708,19 +756,44 @@ fn main() {
         bo_handle: handle,
         ..ResourceInfo::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_RESOURCE_INFO, 16), (&raw mut info) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_INFO, 16),
+            (&raw mut info) as *mut c_void,
+        )
+    };
     check_is(&mut r, "RESOURCE_INFO succeeds for a dumb buffer", got, 0);
     let res_handle = info.res_handle;
-    check_true(&mut r, "a dumb buffer names a device resource", res_handle != 0);
-    check_is(&mut r, "the resource size is the dumb buffer's own", info.size as isize, size as isize);
+    check_true(
+        &mut r,
+        "a dumb buffer names a device resource",
+        res_handle != 0,
+    );
+    check_is(
+        &mut r,
+        "the resource size is the dumb buffer's own",
+        info.size as isize,
+        size as isize,
+    );
     // Asking twice answers the same resource: it is made once, not per request.
     let mut info2 = ResourceInfo {
         bo_handle: handle,
         ..ResourceInfo::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_RESOURCE_INFO, 16), (&raw mut info2) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_INFO, 16),
+            (&raw mut info2) as *mut c_void,
+        )
+    };
     check_is(&mut r, "RESOURCE_INFO is idempotent", got, 0);
-    check_true(&mut r, "and names the same resource twice", info2.res_handle == res_handle);
+    check_true(
+        &mut r,
+        "and names the same resource twice",
+        info2.res_handle == res_handle,
+    );
 
     // TRANSFER_TO_HOST of the whole buffer: Linux completes it, and so does this
     // now. The box is the identity rectangle because a 2D resource has one
@@ -736,15 +809,32 @@ fn main() {
         },
         ..TransferToHost::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_TRANSFER_TO_HOST, 44), (&raw mut xfer) as *mut c_void) };
-    check_is(&mut r, "TRANSFER_TO_HOST completes for a dumb buffer", got, 0);
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_TRANSFER_TO_HOST, 44),
+            (&raw mut xfer) as *mut c_void,
+        )
+    };
+    check_is(
+        &mut r,
+        "TRANSFER_TO_HOST completes for a dumb buffer",
+        got,
+        0,
+    );
     // And an unknown handle is still ENOENT rather than a resource conjured for
     // it - the answer the lookup gives before any device work.
     let mut unknown = ResourceInfo {
         bo_handle: 0xffff_ff00,
         ..ResourceInfo::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_RESOURCE_INFO, 16), (&raw mut unknown) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_INFO, 16),
+            (&raw mut unknown) as *mut c_void,
+        )
+    };
     check_refused(
         &mut r,
         "RESOURCE_INFO refuses a handle this card never made",
@@ -812,10 +902,20 @@ fn main() {
     let got = unsafe { ioctl(fd, ioc_d(NR_GETFB, 28), (&raw mut getfb) as *mut c_void) };
     check_is(&mut r, "GETFB succeeds", got, 0);
     check_is(&mut r, "GETFB reports the width", getfb.width as isize, 64);
-    check_is(&mut r, "GETFB reports the height", getfb.height as isize, 64);
+    check_is(
+        &mut r,
+        "GETFB reports the height",
+        getfb.height as isize,
+        64,
+    );
     check_is(&mut r, "GETFB reports the pitch", getfb.pitch as isize, 256);
     check_is(&mut r, "GETFB reports the bpp", getfb.bpp as isize, 32);
-    check_is(&mut r, "GETFB reports the handle", getfb.handle as isize, handle as isize);
+    check_is(
+        &mut r,
+        "GETFB reports the handle",
+        getfb.handle as isize,
+        handle as isize,
+    );
 
     // ADDFB2: the fourcc spelling of the same binding - XRGB8888, one
     // plane, no offsets or modifiers - answered with a second fb id.
@@ -858,8 +958,18 @@ fn main() {
         g2.pixel_format as isize,
         FORMAT_XRGB8888 as isize,
     );
-    check_is(&mut r, "and no modifier flag, since none was carried", g2.flags as isize, 0);
-    check_is(&mut r, "and the handle behind it", g2.handles[0] as isize, handle as isize);
+    check_is(
+        &mut r,
+        "and no modifier flag, since none was carried",
+        g2.flags as isize,
+        0,
+    );
+    check_is(
+        &mut r,
+        "and the handle behind it",
+        g2.handles[0] as isize,
+        handle as isize,
+    );
     check_is(&mut r, "and the pitch", g2.pitches[0] as isize, 256);
     check_is(
         &mut r,
@@ -873,8 +983,18 @@ fn main() {
         g2.handles[1] as isize,
         0,
     );
-    check_is(&mut r, "and the fourth pitch zeroed", g2.pitches[3] as isize, 0);
-    check_is(&mut r, "and the second modifier zeroed", g2.modifier[1] as isize, 0);
+    check_is(
+        &mut r,
+        "and the fourth pitch zeroed",
+        g2.pitches[3] as isize,
+        0,
+    );
+    check_is(
+        &mut r,
+        "and the second modifier zeroed",
+        g2.modifier[1] as isize,
+        0,
+    );
 
     // The legacy ADDFB names its layout as bpp plus depth, because its struct
     // predates fourcc codes - so GETFB2 on such a framebuffer is answering with
@@ -929,9 +1049,20 @@ fn main() {
         plane_id_ptr: plane_ids.as_mut_ptr() as u64,
         count_planes: plane_ids.len() as u32,
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_GETPLANERESOURCES, 16), (&raw mut pl_res) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GETPLANERESOURCES, 16),
+            (&raw mut pl_res) as *mut c_void,
+        )
+    };
     check_is(&mut r, "the plane list is read", got, 0);
-    check_is(&mut r, "two planes, where there used to be one", pl_res.count_planes as isize, 2);
+    check_is(
+        &mut r,
+        "two planes, where there used to be one",
+        pl_res.count_planes as isize,
+        2,
+    );
     check_is(
         &mut r,
         "and the second is the cursor plane",
@@ -956,7 +1087,12 @@ fn main() {
         cp.plane_id as isize,
         CURSOR_PLANE_ID as isize,
     );
-    check_is(&mut r, "one format, not the primary plane's two", cp.count_format_types as isize, 1);
+    check_is(
+        &mut r,
+        "one format, not the primary plane's two",
+        cp.count_format_types as isize,
+        1,
+    );
     check_is(
         &mut r,
         "and it is ARGB8888, the layout a cursor carries its alpha in",
@@ -973,7 +1109,13 @@ fn main() {
     check_refused(
         &mut r,
         "GETPLANE of a plane that is not there is ENOENT",
-        unsafe { ioctl(fd, ioc_d(NR_GETPLANE, 32), (&raw mut bogus_plane) as *mut c_void) },
+        unsafe {
+            ioctl(
+                fd,
+                ioc_d(NR_GETPLANE, 32),
+                (&raw mut bogus_plane) as *mut c_void,
+            )
+        },
         Errno::NOENT,
     );
 
@@ -1026,7 +1168,12 @@ fn main() {
     let cursor_fb = cfb.fb_id;
     cur.handle = cursor_fb;
     let got = unsafe { ioctl(fd, ioc_d(NR_MODE_CURSOR, 28), (&raw mut cur) as *mut c_void) };
-    check_is(&mut r, "and MODE_CURSOR binds it to the cursor plane", got, 0);
+    check_is(
+        &mut r,
+        "and MODE_CURSOR binds it to the cursor plane",
+        got,
+        0,
+    );
     let mut cp2 = GetPlane {
         plane_id: CURSOR_PLANE_ID,
         ..GetPlane::default()
@@ -1051,7 +1198,13 @@ fn main() {
         hot_y: 1,
         ..ModeCursor2::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_MODE_CURSOR2, 36), (&raw mut cur2) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_MODE_CURSOR2, 36),
+            (&raw mut cur2) as *mut c_void,
+        )
+    };
     check_is(&mut r, "MODE_CURSOR2 moves the pointer", got, 0);
 
     // And a zero-sized image turns it off, which is how libdrm spells it.
@@ -1066,16 +1219,27 @@ fn main() {
     };
     let got = unsafe { ioctl(fd, ioc_d(NR_GETPLANE, 32), (&raw mut cp3) as *mut c_void) };
     check_is(&mut r, "the cursor plane reads back again", got, 0);
-    check_is(&mut r, "with nothing bound, so the pointer is gone", cp3.fb_id as isize, 0);
+    check_is(
+        &mut r,
+        "with nothing bound, so the pointer is gone",
+        cp3.fb_id as isize,
+        0,
+    );
 
     // OBJ_GETPROPERTIES on the connector: the two-call list shape, and the
     // CRTC_ID/DPMS pair a compositor drives the connector by.
     let mut props = ObjGetProperties {
-        obj_id: 35,               // the connector
-        obj_type: 0xc0c0_c0c0,    // DRM_MODE_OBJECT_CONNECTOR
+        obj_id: 35,            // the connector
+        obj_type: 0xc0c0_c0c0, // DRM_MODE_OBJECT_CONNECTOR
         ..ObjGetProperties::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_OBJ_GETPROPERTIES, 32), (&raw mut props) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_OBJ_GETPROPERTIES, 32),
+            (&raw mut props) as *mut c_void,
+        )
+    };
     check_is(&mut r, "OBJ_GETPROPERTIES succeeds", got, 0);
     let count = props.count_props;
     // The *set* is the card's business and its own test's: `t-drm-props` pins
@@ -1104,17 +1268,38 @@ fn main() {
         obj_type: 0xc0c0_c0c0,
         ..ObjGetProperties::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_OBJ_GETPROPERTIES, 32), (&raw mut props) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_OBJ_GETPROPERTIES, 32),
+            (&raw mut props) as *mut c_void,
+        )
+    };
     check_is(&mut r, "OBJ_GETPROPERTIES fills the arrays", got, 0);
-    check_is(&mut r, "the connector's first property is CRTC_ID", prop_ids[0] as isize, 70);
+    check_is(
+        &mut r,
+        "the connector's first property is CRTC_ID",
+        prop_ids[0] as isize,
+        70,
+    );
     check_is(
         &mut r,
         "the connector is bound to the one CRTC",
         prop_values[0] as isize,
         CRTC_ID as isize,
     );
-    check_is(&mut r, "the connector's second property is DPMS", prop_ids[1] as isize, 71);
-    check_is(&mut r, "the connector's DPMS mode is on", prop_values[1] as isize, 0);
+    check_is(
+        &mut r,
+        "the connector's second property is DPMS",
+        prop_ids[1] as isize,
+        71,
+    );
+    check_is(
+        &mut r,
+        "the connector's DPMS mode is on",
+        prop_values[1] as isize,
+        0,
+    );
 
     // OBJ_GETPROPERTIES on the plane: the `type` property that classifies it
     // - what weston picks its primary plane by - and the frame properties an
@@ -1122,11 +1307,17 @@ fn main() {
     // The list is sized from the count the first call answered, which is the
     // two-call contract every KMS list ioctl follows.
     let mut pprops = ObjGetProperties {
-        obj_id: 36,              // the plane
-        obj_type: 0xeeee_eeee,   // DRM_MODE_OBJECT_PLANE
+        obj_id: 36,            // the plane
+        obj_type: 0xeeee_eeee, // DRM_MODE_OBJECT_PLANE
         ..ObjGetProperties::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_OBJ_GETPROPERTIES, 32), (&raw mut pprops) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_OBJ_GETPROPERTIES, 32),
+            (&raw mut pprops) as *mut c_void,
+        )
+    };
     check_is(&mut r, "the plane carries properties", got, 0);
     let plane_count = pprops.count_props as usize;
     check_true(
@@ -1144,10 +1335,26 @@ fn main() {
         obj_type: 0xeeee_eeee,
         ..ObjGetProperties::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_OBJ_GETPROPERTIES, 32), (&raw mut pprops) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_OBJ_GETPROPERTIES, 32),
+            (&raw mut pprops) as *mut c_void,
+        )
+    };
     check_is(&mut r, "the plane's properties fill", got, 0);
-    check_is(&mut r, "the plane's property is its type", pids[0] as isize, 73);
-    check_is(&mut r, "the plane is a primary surface", pvals[0] as isize, 1);
+    check_is(
+        &mut r,
+        "the plane's property is its type",
+        pids[0] as isize,
+        73,
+    );
+    check_is(
+        &mut r,
+        "the plane is a primary surface",
+        pvals[0] as isize,
+        1,
+    );
     let seen = &pids[..plane_count.min(16)];
     check_true(
         &mut r,
@@ -1223,7 +1430,13 @@ fn main() {
         drm_di_minor: 4,
         ..SetVersion::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_SET_VERSION, 16), (&raw mut dver) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_SET_VERSION, 16),
+            (&raw mut dver) as *mut c_void,
+        )
+    };
     check_is(&mut r, "SET_VERSION succeeds", got, 0);
     check_is(
         &mut r,
@@ -1266,7 +1479,13 @@ fn main() {
         bpp: 32,
         ..CreateDumb::default()
     };
-    let got = unsafe { ioctl(fd, ioc_d(NR_CREATE_DUMB, 32), (&raw mut dumb2) as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_CREATE_DUMB, 32),
+            (&raw mut dumb2) as *mut c_void,
+        )
+    };
     check_is(&mut r, "a second dumb buffer is made", got, 0);
     let mut close = GemClose {
         handle: dumb2.handle,
@@ -1361,7 +1580,13 @@ fn main() {
             bpp: 32,
             ..CreateDumb::default()
         };
-        let got = unsafe { ioctl(rfd, ioc_d(NR_CREATE_DUMB, 32), (&raw mut rdumb) as *mut c_void) };
+        let got = unsafe {
+            ioctl(
+                rfd,
+                ioc_d(NR_CREATE_DUMB, 32),
+                (&raw mut rdumb) as *mut c_void,
+            )
+        };
         check_is(&mut r, "the render node makes a dumb buffer", got, 0);
         let rhandle = rdumb.handle;
         let rsize = rdumb.size as usize;
@@ -1399,7 +1624,13 @@ fn main() {
                 handle: rhandle,
                 ..GemClose::default()
             };
-            let _ = unsafe { ioctl(rfd, ioc_d(NR_GEM_CLOSE, 8), (&raw mut rclose) as *mut c_void) };
+            let _ = unsafe {
+                ioctl(
+                    rfd,
+                    ioc_d(NR_GEM_CLOSE, 8),
+                    (&raw mut rclose) as *mut c_void,
+                )
+            };
         }
     }
 

@@ -53,7 +53,7 @@
 //! blocked by the reading task and named in the mask.
 //!
 //! With the block in place a second divergence shows, and the drain below is
-//! shaped around it (`docs/UAPI.md` §5.2 carries both): this kernel keeps a
+//! shaped around it (`docs/uapi/` §5.2 carries both): this kernel keeps a
 //! child's exit in one table and queues a generated `SIGCHLD` in another when
 //! the caller has it blocked, so one death is handed over as **two** records -
 //! the queued copy first, whose `ssi_code` is `SI_USER`, and then the exit
@@ -196,7 +196,7 @@ fn main() {
     r.check("a child was forked", kid > 0);
     if kid > 0 {
         // The drain, because the two machines disagree about how many records
-        // one death makes (`docs/UAPI.md` §5.2): Linux reports it once, out of
+        // one death makes (`docs/uapi/` §5.2): Linux reports it once, out of
         // the pending queue, with `ssi_code` `CLD_EXITED`; this kernel keeps
         // the exit in its own table *and* queues a generated `SIGCHLD` for a
         // caller that blocked it, so it hands over the queued copy (an

@@ -55,7 +55,15 @@ use rustix::io::{pread, pwrite};
 /// capacity that is *reported* and a capacity that is *reachable* are two
 /// different claims, and the whole point of checking both is that they can
 /// disagree.
-const SATA_BYTES: u64 = 4 * 1024 * 1024;
+///
+/// 96 MiB, not the 4 MiB this file first named: §10.5's disk-backed instrument
+/// needed a disk a filesystem fits on, so the backing file grew and this pin
+/// moved with it. The *scratch* region below (sectors 4000 and 6000) sits
+/// inside what that filesystem occupies — harmless because the programs that
+/// read it lay their own copy first, through the block door, and the fence
+/// between the two is the sweep's: the disk is laid fresh before every run
+/// (`disk::reset_sata_image`), so nothing a run writes can be read by the next.
+const SATA_BYTES: u64 = 96 * 1024 * 1024;
 const SATA_SECTORS: u64 = SATA_BYTES / 512;
 
 /// A 16 KiB pattern and a 1 MiB answer - the widths the request-shape claims
@@ -114,7 +122,7 @@ fn main() {
     );
     r.check(
         "and gives its size, in the column a partitioner reads",
-        contains(&listing, b" 4096 sda"),
+        contains(&listing, b" 98304 sda"),
     );
 
     // --- the capacity IDENTIFY reported is the capacity that is readable ---
@@ -185,7 +193,7 @@ fn main() {
     // virtio-blk has never accepted anything less than that.
     let pattern: Vec<u8> = (0..PATTERN_BYTES).map(fingerprint).collect();
     // Sector 6000: past the single-sector test above, and far enough inside the
-    // 4 MiB image that the 1 MiB read below still fits.
+    // disk that the 16 KiB write and the 1 MiB read below still fit.
     let wide = 6000u64 * 512;
     r.check(
         "a 16 KiB write is one request",

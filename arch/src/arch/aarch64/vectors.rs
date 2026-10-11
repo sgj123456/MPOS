@@ -89,6 +89,29 @@ const EC_INSTR_ABORT_EL0: u64 = 0x20;
 /// caller's buffer takes this one, exactly as the program's own write would take
 /// the EL0 class above. See [`sync`] for why it is resolvable rather than fatal.
 const EC_DATA_ABORT_EL1: u64 = 0x25;
+/// `ESR_EL1.EC` for a trapped `MRS`/`MSR`/system instruction executed at EL0 -
+/// Linux's "MSR/MRS (AArch64)".
+///
+/// This machine's `SCTLR_EL1` leaves `UCT` (which gates an EL0 read of
+/// `CTR_EL0`) clear, and that is Linux's own setting rather than an oversight:
+/// `paging::SCTLR_ENABLE` ORs only `M|C|I` onto the register the firmware left,
+/// exactly as Linux's `__cpu_setup` writes its own set and nothing else, so the
+/// access *traps* - and the trap is what lets the kernel answer with the value
+/// the system as a whole agrees on rather than the one this CPU happens to
+/// carry. `arch/arm64/kernel/traps.c` answers this class from a table of traps
+/// it handles (`ctr_read_handler`, `user_cache_maint_handler`, the counter and
+/// `CPUID` reads) and refuses everything else with `SIGILL`; [`el0_sys`] is that
+/// table's first row here.
+///
+/// Measured, and the whole reason this class is handled at all: the aarch64
+/// machine's weston boot died during its `llvmpipe` startup with
+/// `user fault ... ESR 0x6232c061`. That ESR is `EC 0x18` with `ISS 0x32c061`: a
+/// *read* (`ISS` bit 0) of `op0=3, op1=3, CRn=0, CRm=0, op2=1` - `CTR_EL0` -
+/// into `Rt = x3`, i.e. `mrs x3, ctr_el0`, which is what a compiler emits as the
+/// first instruction of a code flush (the builtin the C libraries spell
+/// `__clear_cache`) because a flush has to know the line sizes before it can
+/// stride by them.
+const EC_SYS64: u64 = 0x18;
 
 /// `exit_group`'s number on this machine, which is not the number the x86_64
 /// table gives it (231, against 94 here).
@@ -779,6 +802,225 @@ extern "C" fn unexpected() -> ! {
     halt()
 }
 
+/// A system register's encoding, packed the way Linux spells one in its
+/// `sys_reg()`: `op0` in bits 14:15, `op1` in 11:13, `CRn` in 7:10, `CRm` in
+/// 3:6 and `op2` in 0:2.
+///
+/// Every register this file names goes through it, so a constant here is
+/// checkable against the architecture's own table (`CTR_EL0` is
+/// `op0=3, op1=3, CRn=0, CRm=0, op2=1`) rather than against a bit pattern
+/// someone hexed by hand - and the packing is not the instruction word's, it is
+/// the kernel's, so it must not be confused with the `ISS` bits
+/// [`sys64_register`] reads.
+const fn sys_reg(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
+    (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
+}
+
+/// `CTR_EL0`, the cache type register: the register line size and the
+/// cache-maintenance reach a JIT reads before it writes back the code it has
+/// just made.
+const SYS_CTR_EL0: u32 = sys_reg(3, 3, 0, 0, 1);
+
+/// The five fields of the system register an [`EC_SYS64`] trap named, in the
+/// architecture's own order - `(op0, op1, CRn, CRm, op2)` - decoded out of
+/// `ESR_EL1`'s `ISS`.
+///
+/// The positions are the architecture's: for this class `ISS[21:20]` is `op0`,
+/// `ISS[19:17]` is `op2`, `ISS[16:14]` is `op1`, `ISS[13:10]` is `CRn` and
+/// `ISS[4:1]` is `CRm`. `op0` is read as a field rather than folded into one
+/// comparison because it is also what tells the *form* of the instruction
+/// apart: `0b11` is `MRS`/`MSR`, whose `ISS` bit 0 is the direction, and `0b01`
+/// is the `SYS`/`SYSL` system-instruction form, where the same bit is the same
+/// direction field - clear for the `SYS` spelling a `DC`/`IC` operation uses,
+/// set for the `SYSL` spelling that reads a value out.
+fn sys64_fields(esr: u64) -> (u32, u32, u32, u32, u32) {
+    (
+        ((esr >> 20) & 0x3) as u32,
+        ((esr >> 14) & 0x7) as u32,
+        ((esr >> 10) & 0xf) as u32,
+        ((esr >> 1) & 0xf) as u32,
+        ((esr >> 17) & 0x7) as u32,
+    )
+}
+
+/// The system register an [`EC_SYS64`] trap named, packed by [`sys_reg`] so that
+/// the comparison against a named register is an equality rather than a mask.
+fn sys64_register(esr: u64) -> u32 {
+    let (op0, op1, crn, crm, op2) = sys64_fields(esr);
+    sys_reg(op0, op1, crn, crm, op2)
+}
+
+/// Whether an [`EC_SYS64`] trap was a *read* - `MRS`, or the `SYSL` spelling of a
+/// system instruction. `ISS` bit 0; both write forms have it clear.
+fn sys64_read(esr: u64) -> bool {
+    esr & 1 != 0
+}
+
+/// A word for the instruction an [`EC_SYS64`] trap stopped, for a report that
+/// has to say what arrived rather than only that something did. The two
+/// register forms and the system-instruction form are told apart by `op0`, and
+/// they are not interchangeable: a `SYS` is not an `MSR` and a report that
+/// called it one would be a shape that looks like the truth.
+fn sys64_form(esr: u64) -> &'static str {
+    match sys64_fields(esr).0 {
+        0b01 if sys64_read(esr) => "SYSL",
+        0b01 => "SYS",
+        0b11 if sys64_read(esr) => "MRS",
+        0b11 => "MSR",
+        _ => "system instruction",
+    }
+}
+
+/// The register an [`EC_SYS64`] trap names: the instruction's `Rt`, `ISS[9:5]`.
+/// A read puts its answer there and a `SYS` operation takes its operand from it;
+/// 31 is `XZR`, which for a read answers nowhere and for an operand is zero.
+fn sys64_rt(esr: u64) -> usize {
+    ((esr >> 5) & 0x1f) as usize
+}
+
+/// The cache-maintenance operation an [`EC_SYS64`] trap is, when it is one: the
+/// `CRm` of `SYS #3, C7, C<m>, #1`, whose other fields every member of the family
+/// shares. `None` is therefore "not this family" rather than "not an
+/// operation", and Linux keys its own `user_cache_maint_handler` on the same
+/// `op0`/`op1`/`CRn`/`op2` shape.
+fn sys64_cache_op(esr: u64) -> Option<u32> {
+    let (op0, op1, crn, crm, op2) = sys64_fields(esr);
+    (op0 == 0b01 && op1 == 0b011 && crn == 0b0111 && op2 == 0b001).then_some(crm)
+}
+
+/// `CTR_EL0` of this CPU, read at EL1 for the program whose EL0 read trapped.
+///
+/// Linux answers its `ctr_read_handler` from `arm64_ftr_reg_ctrel0`'s *user*
+/// value, the sanitized form - which differs from the hardware's own only where
+/// a system is heterogeneous (the `IminLine` a big.LITTLE machine has to agree
+/// on) or carries one of the errata its workaround list names. This machine has
+/// one CPU type and no such list, so the register's own value is the honest
+/// answer rather than an approximation of it.
+fn cache_type() -> u64 {
+    let ctr: u64;
+    // SAFETY: `CTR_EL0` is readable at EL1 with no side effects; it is the same
+    // register the trapped instruction would have read had `SCTLR_EL1.UCT` let
+    // it, and reading it here does not consume anything.
+    unsafe {
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+    }
+    ctr
+}
+
+/// `DC CIVAC` - clean and invalidate the cache line the address names, to the
+/// point of coherency.
+///
+/// Linux *promotes* the three clean-by-address operations a program may ask for
+/// (`user_cache_maint_handler` answers `DC CVAU` and `DC CVAC` with `DC CIVAC`
+/// as well): a clean to the point of unification is enough on the core that
+/// wrote, and the point of coherency is what another core's fetch reads. The
+/// trapped instruction is not re-executed - `SCTLR_EL1.UCI` is what stopped it,
+/// and this runs the operation at an exception level that may.
+fn cache_clean_invalidate(addr: usize) {
+    // SAFETY: the address was checked against the running program's own tables
+    // before this ran, so the translation cannot fault, and the instruction
+    // reads and writes no memory - its whole effect is on caches. The program's
+    // own `dsb`/`isb` are *not* gated by `UCI` and run at EL0 unchanged, so the
+    // ordering of this against the caller's next fetch is its own business.
+    unsafe {
+        core::arch::asm!(
+            "dc civac, {addr}",
+            addr = in(reg) addr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// `IC IVAU` - invalidate the instruction cache line the address names, inner
+/// shareable: the operation the program asked for, issued unchanged at EL1.
+fn instruction_cache_invalidate(addr: usize) {
+    // SAFETY: as [`cache_clean_invalidate`]. `IC IVAU` is inner-shareable by
+    // definition, so nothing is weakened by running it here.
+    unsafe {
+        core::arch::asm!(
+            "ic ivau, {addr}",
+            addr = in(reg) addr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// Step the frame past the instruction a trap stopped, which is the one the
+/// program resumes *on*: `ELR_EL1` holds the trapped instruction itself rather
+/// than the one after it. (The `svc` path needs no such step - the architecture
+/// already leaves `ELR_EL1` *past* a supervisor call, which is exactly the
+/// asymmetry this exists for.)
+fn skip(pc: &mut u64) {
+    *pc += 4;
+}
+
+/// What [`el0_sys`] did with a trapped system instruction.
+enum Sys64Answer {
+    /// The instruction is answered: the frame carries the value or the effect,
+    /// and the program resumes at the instruction after it.
+    Answered,
+    /// The program named an address its own tables do not map. Linux answers a
+    /// maintenance fault with `arm64_notify_segfault`, and so does this: a
+    /// `SIGSEGV` for the address, which is all a flush that cannot happen can be
+    /// told.
+    Segv(usize),
+    /// This kernel has no answer for the instruction: `SIGILL`, which is what
+    /// Linux's `do_el0_sys` delivers when its own table falls through to
+    /// `do_el0_undef`.
+    Illegal,
+}
+
+/// A trap from EL0 that is a *system instruction* rather than a fault: the
+/// machine's own answer to one, applied to the frame the program resumes from.
+///
+/// Linux's `do_el0_sys` (`arch/arm64/kernel/traps.c`) walks a table of traps, and
+/// the two rows below are its first two. That is a measurement rather than a
+/// reading of it: on this machine both arrive from one code flush, seconds
+/// apart. `llvmpipe`'s startup on the desktop image died first on an EL0 read of
+/// `CTR_EL0` - Linux's `ctr_read_handler`, the register a flush sizes itself
+/// from - and with that answered, the next trap was the `DC CVAU` the same flush
+/// issues with it (`user_cache_maint_handler`), measured as
+/// `ESR 0x6212dc56` = `SYS #3, C7, C11, #1`. Both are `t-el0-sysreg`'s subject.
+///
+/// What is deliberately not here is named, because a gap in this shape arrives
+/// as a `SIGILL` and not as silence: the `CNTVCT_EL0`/`CNTFRQ_EL0` and `CPUID`
+/// reads Linux's table also answers; `DC ZVA`, which Linux refuses here too (it
+/// is a memory write gated by `SCTLR_EL1.DZE`, and Linux's table has no row for
+/// it either); and `DC CVAP`/`DC CVADP`, the point-of-persistence pair, which
+/// Linux *does* answer and this kernel refuses - they need `FEAT_DPB`, and an
+/// EL1 spelling of an operation the CPU does not implement is an undefined
+/// instruction, which this machine answers by stopping. A refusal is the honest
+/// and the safe answer there, and it is `docs/uapi/` §5.2's named gap.
+fn el0_sys(esr: u64, frame: &mut UserFrame) -> Sys64Answer {
+    if sys64_read(esr) && sys64_register(esr) == SYS_CTR_EL0 {
+        let rt = sys64_rt(esr);
+        if rt < 31 {
+            frame.x[rt] = cache_type();
+        }
+        skip(&mut frame.pc);
+        return Sys64Answer::Answered;
+    }
+    if let Some(op) = sys64_cache_op(esr) {
+        let rt = sys64_rt(esr);
+        let addr = if rt < 31 { frame.x[rt] as usize } else { 0 };
+        if !super::paging::user_page_present(addr) {
+            return Sys64Answer::Segv(addr);
+        }
+        match op {
+            // `DC CVAC` (10), `DC CVAU` (11) and `DC CIVAC` (14), each promoted.
+            10 | 11 | 14 => cache_clean_invalidate(addr),
+            // `IC IVAU` (5).
+            5 => instruction_cache_invalidate(addr),
+            // `DC ZVA` (4), `DC CVAP`/`CVADP` (12/13) and anything else `CRm`
+            // can hold.
+            _ => return Sys64Answer::Illegal,
+        }
+        skip(&mut frame.pc);
+        return Sys64Answer::Answered;
+    }
+    Sys64Answer::Illegal
+}
+
 /// A `svc` from EL0: the gate every system call on this machine comes through.
 ///
 /// What this stage's gate answers is the kernel's own default and one call that
@@ -806,16 +1048,19 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
 
     // The class is read first and everything else depends on it, because it is
     // the one field of `ESR_EL1` whose meaning does not depend on itself. A trap
-    // from EL0 that is not an `svc` is a fault in the program - a bad address, a
-    // bad instruction - and this kernel has no way to tell a program about one
-    // yet, so it says so and stops rather than resuming into the same fault.
+    // from EL0 that is not an `svc` arrives in three shapes, and they are
+    // answered in the order the machine is surest about: a system instruction
+    // the hardware traps and this kernel can answer ([`el0_sys`]), a page fault
+    // the program's own mapping can resolve, and - what is left - a fault in the
+    // program, which this kernel has no way to tell it about yet, so it says so
+    // and stops rather than resuming into the same fault.
     let esr = system_register("esr");
     let class = esr >> 26;
-    // A trap from EL0 that is not an `svc` is a fault in the program. x86's twin
-    // `page_fault` answers the three faults that are not the program's error - a
-    // copy-on-write write after a `fork`, a page of an anonymous mapping never yet
-    // touched, and a push past the end of the mapped stack - by taking the page
-    // from the allocator and letting the instruction retry. These run on aarch64
+    // The page-fault half is what x86's twin `page_fault` answers - the three
+    // faults that are not the program's error, which are a copy-on-write write
+    // after a `fork`, a page of an anonymous mapping never yet touched, and a
+    // push past the end of the mapped stack - by taking the page from the
+    // allocator and letting the instruction retry. These run on aarch64
     // through the same arch-neutral resolvers (`hal::kernel`), so a real program
     // (a libc's larger stack, its thread arena, a `fork`'s COW page) can grow its
     // memory the way the 142 x86 musl tests already do. Any fault left after them
@@ -826,6 +1071,52 @@ extern "C" fn el0_sync(frame: *mut UserFrame) -> u64 {
     // (the bring-up EL0 probe) there is no task or VMA to resolve against, so those
     // traps stay fatal.
     if class != EC_SVC_FROM_AARCH64 {
+        // The machine's own answers come first, and they need no task: a trapped
+        // system instruction is decoded, answered and skipped, and the scheduler
+        // has nothing to do with either half.
+        if class == EC_SYS64 {
+            let answer = el0_sys(esr, frame);
+            if let Sys64Answer::Answered = answer {
+                return 0;
+            }
+            // Both failures are the program's own, and the report that names one
+            // needs a task to name it to: before `sched::started()` the bring-up
+            // EL0 probe is the only caller there is, and the halt report at the
+            // end of this branch says more about a trap than either line here
+            // could.
+            if crate::hal::kernel::started() {
+                match answer {
+                    // Linux's `arm64_notify_segfault`: the flush named an
+                    // address this space does not map.
+                    Sys64Answer::Segv(addr) => {
+                        crate::hal::kernel::kprintln!(
+                            "user fault at {addr:#x}: an EL0 cache maintenance \
+                             instruction named it and this space does not map it \
+                             (pc {:#x}, ESR {esr:#x})",
+                            frame.pc
+                        );
+                        crate::hal::kernel::exit(-11);
+                    }
+                    // `SIGILL`, Linux's answer to a trap its own table has no
+                    // row for (`do_el0_sys` falls through to `do_el0_undef`) -
+                    // not the `SIGSEGV` a bad address gets. The register is
+                    // named because it is the whole of what the report can say:
+                    // there is no faulting address here, and `FAR_EL1` still
+                    // holds whichever page fault came last, so printing it would
+                    // be an invented answer.
+                    _ => {
+                        crate::hal::kernel::kprintln!(
+                            "user fault: unhandled {} of system register {:#06x} \
+                             at pc {:#x} (ESR {esr:#x})",
+                            sys64_form(esr),
+                            sys64_register(esr),
+                            frame.pc
+                        );
+                        crate::hal::kernel::exit(-4);
+                    }
+                }
+            }
+        }
         if crate::hal::kernel::started() {
             let addr = system_register("far") as usize;
             let is_write = match class {

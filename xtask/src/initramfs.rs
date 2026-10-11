@@ -255,7 +255,13 @@ pub fn build_initramfs(build_dir: &Path, arch: Arch) -> Result<()> {
     };
     packages.extend(config.extra_packages.clone());
 
-    install_packages(machine, &apk, &staging, &packages)?;
+    install_packages(
+        machine,
+        &apk,
+        &staging,
+        &packages,
+        &crate::rootfs::apk_cache_dir(build_dir, machine.arch),
+    )?;
     lay_farm(machine, &staging)?;
 
     // `/init` is a file of the overlay trees and not a constant in this binary,
@@ -308,18 +314,28 @@ fn install_packages(
     apk: &str,
     staging: &Path,
     packages: &[String],
+    cache_dir: &Path,
 ) -> Result<()> {
     // `--no-scripts` because the package scripts are written for a chroot and
     // this tree is not one yet. What they also do is not optional on the first
     // machine: busybox's post-install creates the applet links, so the farm is
     // laid below by hand there instead.
+    //
+    // Both shapes share the rootfs pipeline's download cache (`--cache-dir`),
+    // which is where the archive bytes come from when the mirror need not be
+    // asked again; the index refresh stays unconditional here because this
+    // tree is rebuilt whole (see [`build_initramfs`]) and its stamp records no
+    // owned set — an initramfs install is always a fresh one.
     let arch = machine.arch.name();
+    std::fs::create_dir_all(cache_dir)?;
     match machine.apk {
         Apk::Direct => {
             let status = Command::new(apk)
                 .args(["--no-progress", "add"])
                 .arg("--root")
                 .arg(staging)
+                .arg("--cache-dir")
+                .arg(cache_dir)
                 .args(["--arch", arch, "--initdb", "--no-scripts", "--update-cache"])
                 .args(packages)
                 .status()
@@ -334,7 +350,7 @@ fn install_packages(
             if !utils::is_root() {
                 flags.push("--usermode");
             }
-            crate::rootfs::apk_add(&[apk], staging, &flags, packages)
+            crate::rootfs::apk_add(&[apk], staging, &flags, packages, cache_dir)
         }
     }
 }

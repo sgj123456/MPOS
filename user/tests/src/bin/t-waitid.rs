@@ -8,7 +8,7 @@
 //! ready.
 //!
 //! Three divergences this kernel has are named here rather than hidden, each
-//! with the host's answer measured beside it (`docs/UAPI.md` §5.2 carries them):
+//! with the host's answer measured beside it (`docs/uapi/` §5.2 carries them):
 //!
 //! * **`id` is ignored.** `P_PID` does not name the child waited for; the kernel
 //!   collects any ready child. Every check below is ordered so only the child
@@ -139,7 +139,7 @@ fn main() {
     // (`P_PGID`) with `id = 0` is accepted, and the childless caller is answered
     // `ECHILD` (errno 10) rather than `EINVAL`. The payload pins this kernel's
     // refusal and the host names the service it does not share, which is the
-    // shape `docs/UAPI.md` §5.2 records (the `id`-ignoring half above is the
+    // shape `docs/uapi/` §5.2 records (the `id`-ignoring half above is the
     // other one this program pins).
     let mut info = poisoned();
     let answered = waitid(2, 0, &mut info, libc::WEXITED);

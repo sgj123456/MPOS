@@ -215,7 +215,9 @@ user.name = "mpos"
 # that is not root can still start a compositor (seatd's own package makes
 # the group, and root is let through regardless).
 user.groups = ["mpos", "wheel", "seat"]
-user.shell = "/usr/bin/fish"
+# No `user.shell`: the account takes the build's default, `/bin/sh`, which on
+# Alpine is busybox's `ash` - the same shell `root` gets, and the only shell
+# this image carries.
 # Empty means the account has no password to type, like root above. Anything
 # else is set with chpasswd.
 user.password = ""

@@ -1121,6 +1121,15 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
             if bits & crate::syscall::linux::nr::CLONE_NEWUTS != 0 {
                 crate::sched::unshare_uts();
             }
+            if bits & crate::syscall::linux::nr::CLONE_NEWNS != 0 {
+                // The caller moves to a copy of the table it was resolving
+                // through (Linux's `copy_mnt_ns` → `unshare_mnt_ns`): what it
+                // mounts or unmounts from here is visible to its own future
+                // children only, never to the namespace it came from. Its
+                // siblings keep the old table — the same per-task rule as UTS
+                // above, and `t-ns-mnt` holds both halves of the divergence.
+                crate::sched::unshare_mnt();
+            }
             0
         }
     }

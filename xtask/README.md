@@ -173,15 +173,25 @@ code rather than a stale image.
 
 ## 配置：`rootfs.toml` 与 `machine.toml`（在 `assets/configs/` | under `assets/configs/`）
 
-配置分成两个文件，分界不是按大小而是按**代价**：`rootfs.toml` 的 mtime 决定要不要重装
-Alpine 全树（三十多个包，走网络），`machine.toml` 里改任何东西都不会动镜像。每份配置
+配置分成两个文件，分界不是按大小而是按**代价**：`rootfs.toml` 决定装什么，但不再以
+mtime 一刀切——stamp 记录两组内容哈希：**shape keys**（镜像站/分支/`repos`/文件系统/
+磁盘几何）变了才全量重装；只改**包列表**则做差集增删（读 `lib/apk/db/installed`，只删
+上次构建 own 过的包）。`.apk` 下载落在 `build/apk-cache/<arch>/`，索引命中即可离线重跑。
+`--force-full` 强制回到全量路径。`machine.toml` 里改任何东西都不会动镜像。每份配置
 都只有一个文件、同时描述**两台**机器，用三个段：`[default]` 是共享基线，`[x86_64]` /
 `[aarch64]` 各自覆盖它——键名自带前缀（`qemu.memory`、`rootfs.mirror`、`system.hostname`）。
 机器本身不是键：apk 的包架构就是构建时 `--arch` 的那个词（`xtask/src/arch.rs`）。
 
 The configuration is two files, and the line between them is cost rather than
-tidiness: `rootfs.toml`'s mtime is what decides whether the Alpine tree is
-reinstalled, so nothing that is not part of the image lives there. Each file
+tidiness: `rootfs.toml` decides what is installed, but no longer by a single
+mtime — the stamp records two content hashes. A change to the **shape keys**
+(mirror, branch, `repos`, filesystem, disk geometry) still lays the whole image;
+a change to the **package lists** alone installs and removes only the difference,
+read against the tree's own `lib/apk/db/installed`, and removes only packages an
+earlier build of this series owned. Downloaded `.apk` files land in
+`build/apk-cache/<arch>/`, so a warm cache answers an offline host; `--force-full`
+lays the image fresh whatever the hashes say. Nothing that is not part of the
+image lives in `rootfs.toml`. Each file
 describes **both** machines in three sections — `[default]` is the shared baseline
 and `[x86_64]`/`[aarch64]` override it — with keys dotted by what they belong to.
 The machine itself is not a key: the package architecture `apk` is asked for is

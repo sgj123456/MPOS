@@ -48,6 +48,14 @@
 //! works, through slirp) rather than the loopback.
 
 pub mod packet;
+/// The seam's frame counters and buffer pool (§10.4).
+///
+/// Reached only through `crate::net`, which the host build skips - so its
+/// pins live in `t-netstats`, the program that boots, rather than a
+/// `cfg(test)` module here that would never run (`gates.rs`'s dead-host-test
+/// check enforces exactly that reading, and `net/socket.rs`'s tail note is the
+/// precedent).
+pub mod pool;
 pub mod rtnl;
 pub mod socket;
 pub mod unix;
@@ -1066,6 +1074,24 @@ pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> 
     .unwrap_or_default()
 }
 
+/// The per-interface counters for `/proc/net/dev`: the seam's totals beside the
+/// link's live MTU, in `pool::NetDevStats` rows.
+///
+/// Same gating and same shape as [`collect_net_sockets`] - the only caller is
+/// `/proc/net`, so it exists exactly where procfs does - with one addition the
+/// socket table never needed: the numbers *must* answer even when the stack
+/// never came up. A machine with no adapter has a stack that was never built
+/// (`init` is not called) but still has an eth0 to name in the file, whose
+/// counters are the zeros the statics hold; reading the MTU through the stack
+/// therefore defaults to the boot value rather than dropping the row. The
+/// counters themselves live in `pool`'s statics precisely so this door never
+/// depends on the stack existing.
+#[cfg(target_os = "none")]
+pub(crate) fn net_dev_rows() -> Vec<pool::NetDevStats> {
+    let mtu = with_stack(|st| st.eth.device.mtu).unwrap_or(MTU);
+    pool::net_dev_stats(mtu)
+}
+
 /// A smoltcp TCP socket's state as the numeric `/proc/net/tcp` `st` byte
 /// (LISTEN=10, ESTABLISHED=1, TIME_WAIT=6, ...).
 fn tcp_proc_state(sock: &tcp::Socket) -> u8 {
@@ -1786,6 +1812,11 @@ pub(crate) fn socket_ready(handle: usize) -> crate::vfs::Ready {
 /// calls this and leaves every socket call answering `ENETDOWN`, which is where
 /// the stack already was before it came up.
 pub fn init(dev: Arc<dyn NetDevice>) {
+    // Fill the seam's frame pool before the first frame can arrive (§10.4).
+    // Here rather than at the first take because a steady-path allocation is
+    // exactly what the pool exists to remove, and `init` runs once with the
+    // allocator up and no lock held against a frame.
+    pool::init();
     let mac = dev.mac();
 
     let mut device = NicDevice {
@@ -1906,10 +1937,26 @@ static NET: Mutex<RefCell<Option<Stack>>> = Mutex::new(RefCell::new(None));
 /// `Device` contract hands frames over one token pair at a time.
 struct NicDevice {
     net: Arc<dyn NetDevice>,
-    /// A frame polled but not yet consumed: `receive` must return the *same*
-    /// frame on a repeat call, since smoltcp may drop the token pair without
-    /// reading it (a run with nothing to send, for instance).
-    pending: Option<Vec<u8>>,
+    /// The frame polled from the driver and not yet handed to smoltcp, with its
+    /// pool guard.
+    ///
+    /// The handover **clears** this slot: from `receive`'s return the token owns
+    /// the frame, so the next call polls the driver again. That is not a detail.
+    /// A `receive` that kept handing out a token pair after the first frame gave
+    /// the stack an *empty* frame for ever, and smoltcp's ingress loop reads an
+    /// empty frame as "a packet was processed, try again"
+    /// (`iface/interface/mod.rs`, `socket_ingress`), so `poll` never returned:
+    /// measured on the first gate run after §10.4's pool landed, as a machine
+    /// that stopped at `t-epoll-socket` and never printed again — that loop runs
+    /// inside the stack's critical section, so the timer interrupt was off too.
+    ///
+    /// A [`pool::PendingFrame`] rather than a bare `Vec` because the guard is
+    /// what returns the pool slot when the frame's life ends: the token carries
+    /// the same guard, so both endings (the stack read the frame; smoltcp took
+    /// the pair and dropped it unread) hand the slot back exactly once. §10.4's
+    /// one Drop guard, by design — every other recycle point is an explicit put
+    /// at the site of last use.
+    pending: Option<pool::PendingFrame>,
     /// The MTU the link reports. Settable through `RTM_SETLINK`; defaults to
     /// [MTU] at boot. smoltcp reads it via `capabilities()` on every poll, so
     /// a change applies to the next frame without any state to flush.
@@ -1931,15 +1978,45 @@ impl Device for NicDevice {
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         if self.pending.is_none() {
-            self.pending = self.net.poll();
+            // The seam's own copy-out of the driver's frame (§10.4's RX half):
+            // `NetDevice::poll` hands back bytes it borrowed from the ring, and
+            // this is where they become an owned buffer - so this is where the
+            // pool takes its slot. A pooled take keeps the ring's bounce from
+            // being a fresh heap allocation on every arrival.
+            let frame = self.net.poll()?;
+            // An empty frame is "nothing arrived", not a frame. Answering it
+            // with a token would be the same hang the handover below records
+            // from the other side: smoltcp reads an empty frame as *processed*
+            // and asks again, so its ingress loop would never end - inside the
+            // stack's critical section, with the clock off. `?`-style `None` is
+            // also the truthful answer: a zero-length frame is a driver that
+            // read nothing.
+            if frame.is_empty() {
+                return None;
+            }
+            let len = frame.len();
+            let mut buf = pool::take_rx(len);
+            buf.copy_from_slice(&frame);
+            self.pending = Some(pool::PendingFrame::new(buf));
         }
-        let frame = self.pending.take()?;
+        // The handover — and it *clears* the slot: from here the token owns the
+        // frame, guard included, so the next `receive` polls the driver for the
+        // next arrival. Leaving the frame in place is what made the stack see
+        // one frame and then an endless run of empty ones, which is the hang
+        // this field's own note records.
+        let pending = self.pending.take()?;
+        // One count per frame crossing the seam, taken here rather than at
+        // `packet::deliver` below: a frame polled is a frame received whether
+        // or not smoltcp's token pair is later read, and this is the one line
+        // every arrival passes - the sockets' reader and the raw family both
+        // consume the same token. (§10.4's instrument; see `pool.rs`.)
+        pool::record_rx(pending.as_slice().len());
         // The packet sockets see the frame before the stack decides whether
         // it is any of the IP layer's business - which is the whole point of
         // the family (see `packet`).
-        packet::deliver(&frame);
+        packet::deliver(pending.as_slice());
         Some((
-            FrameRx { frame },
+            FrameRx { frame: pending },
             FrameTx {
                 net: self.net.clone(),
             },
@@ -1974,13 +2051,23 @@ impl Device for NicDevice {
 }
 
 /// One received frame, handed to smoltcp as raw bytes.
+///
+/// The frame carries its pool guard, and that is the whole recycle story for
+/// this direction: `consume` reads the bytes, and the guard returns the slot
+/// when the token drops — whether that happens here (the stack read the frame)
+/// or on the path where smoltcp takes the token pair and drops it unread. One
+/// owner, both endings, and no `put_rx` call at either site.
 struct FrameRx {
-    frame: Vec<u8>,
+    frame: pool::PendingFrame,
 }
 
 impl RxToken for FrameRx {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-        f(&self.frame)
+        // The guard is dropped at the end of this call, after `f` has read the
+        // bytes: §10.4's site of last use is the token's own end, and the two
+        // endings share it because they share the owner.
+        let Self { frame } = self;
+        f(frame.as_slice())
     }
 }
 
@@ -1991,11 +2078,24 @@ struct FrameTx {
 
 impl TxToken for FrameTx {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut frame = alloc::vec![0u8; len];
+        // §10.4's TX half: the buffer smoltcp fills comes from the pool when a
+        // slot can serve it and from a fresh allocation otherwise - the
+        // fallback is counted as a miss rather than hidden.
+        let mut frame = pool::take_tx(len);
         let result = f(&mut frame);
+        // One count per outgoing frame built at the seam, taken *before* the
+        // transmit's own success or failure: a full hardware queue drops the
+        // frame here (the comment below), and Linux's `tx_packets` counts the
+        // frames the stack handed the driver, which is what this column can
+        // honestly mean. (§10.4's instrument; see `pool.rs`.)
+        pool::record_tx(len);
         // A full hardware queue drops the frame here. TCP retransmits on its
         // own; a dropped datagram is the lossy-network behavior UDP promises.
         let _ = self.net.transmit(&frame);
+        // The seam's TX recycle point: `transmit` copies into the driver's own
+        // buffer, so this Vec's last use ended with that call and the slot
+        // comes straight back.
+        pool::put_tx(frame);
         result
     }
 }

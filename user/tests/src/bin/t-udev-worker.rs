@@ -253,7 +253,8 @@ fn main() {
 
     let mut body = [0u8; 8];
     let mut cred_space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmCredentials(1))];
-    let (received, cred) = manager_recv(&manager, &mut body, 0, &mut cred_space, RecvFlags::DONTWAIT);
+    let (received, cred) =
+        manager_recv(&manager, &mut body, 0, &mut cred_space, RecvFlags::DONTWAIT);
     check_is(
         &mut r,
         "the manager's zero-length receive answers 0, not EINVAL",
@@ -291,7 +292,8 @@ fn main() {
         unsafe { libc::_exit(queued.map_or(1, |_| 0)) };
     }
     let _ = waitpid(Pid::from_raw(child), WaitOptions::empty());
-    let (received, cred) = manager_recv(&manager, &mut body, 0, &mut cred_space, RecvFlags::DONTWAIT);
+    let (received, cred) =
+        manager_recv(&manager, &mut body, 0, &mut cred_space, RecvFlags::DONTWAIT);
     r.check(
         "a forked worker's reply carries its own pid, not the manager's",
         got_bytes(&received) == 0 && cred.as_ref().is_some_and(|c| is_from(c, child)),
@@ -302,7 +304,8 @@ fn main() {
     // is its boundary.
     let three = [1u8, 2, 3];
     let _ = worker_send(&worker, &three);
-    let (received, cred) = manager_recv(&manager, &mut body, 0, &mut cred_space, RecvFlags::DONTWAIT);
+    let (received, cred) =
+        manager_recv(&manager, &mut body, 0, &mut cred_space, RecvFlags::DONTWAIT);
     check_is(
         &mut r,
         "a zero-length buffer still takes a message that has bytes",

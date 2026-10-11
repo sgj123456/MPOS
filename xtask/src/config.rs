@@ -679,6 +679,75 @@ impl RootfsConfig {
             user: UserConfig::from_values(&mut values),
         })
     }
+
+    /// The names this build installs — base plus extras, deduped, in first-listed
+    /// order. This is the *owned set* a stamp records: what the build handed
+    /// `apk`, not the dependency closure apk resolved on top of it, because only
+    /// a name the build itself installed may be removed by a later build's diff.
+    pub fn installed_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for name in self.base_packages.iter().chain(self.extra_packages.iter()) {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        out
+    }
+
+    /// The hash of the keys that decide the image's *shape*: the repository it
+    /// is filled from and the filesystem layout it is laid into. A change here
+    /// cannot be answered incrementally — the mirror decides every package's
+    /// bytes, and the partition sizes and filesystem type are decided before
+    /// any package runs — so [`crate::rootfs::needs_full_install`] compares
+    /// exactly this value against the one the last build recorded.
+    ///
+    /// Deliberately *not* in here: the package lists (a delta, not a shape —
+    /// [`Self::package_delta_hash`]), and the identity keys (`hostname`,
+    /// `timezone`, `locale`, `dns`, the accounts) whose files
+    /// `write_system_config` re-asserts on every build path anyway. A key that
+    /// belongs to neither group would silently stop invalidating something;
+    /// the test over the two hashes' coverage walks the struct field by field.
+    pub fn full_install_hash(&self) -> String {
+        let mut parts = vec![
+            format!("mirror={}", self.mirror),
+            format!("branch={}", self.branch),
+            format!("filesystem={}", self.filesystem),
+            format!("root_device={}", self.root_device),
+            format!("image_size={}", self.image_size),
+            format!("esp_size={}", self.esp_size),
+            format!("mkfs_options={}", self.mkfs_options),
+        ];
+        // Sorted so a list's *order* in the file does not decide the answer:
+        // repositories reordered is the same image.
+        let mut repos = self.repos.clone();
+        repos.sort();
+        parts.push(format!("repos={repos:?}"));
+        digest_of(&parts.join("\n"))
+    }
+
+    /// The hash of what gets *installed*: the two package lists, plus the digests
+    /// of the overlay trees the caller passes in sorted order (the trees land in
+    /// the image too, so their content belongs to the record of "what the current
+    /// configuration means"). Order-insensitive on both lists for the same reason
+    /// `full_install_hash` sorts its repos: a reordered list installs the same
+    /// packages.
+    pub fn package_delta_hash(&self, overlay_tree_digests: Vec<u64>) -> String {
+        let mut base = self.base_packages.clone();
+        base.sort();
+        let mut extra = self.extra_packages.clone();
+        extra.sort();
+        let mut trees = overlay_tree_digests;
+        trees.sort_unstable();
+        digest_of(&format!("base={base:?}\nextra={extra:?}\ntrees={trees:?}"))
+    }
+}
+
+/// One digest, formatted the way both stamps spell a hash. Same rule as
+/// [`crate::disk`]'s medium fingerprint: `DefaultHasher` promises nothing
+/// across compiler versions, and an ambiguity costs one rebuild — towards
+/// correctness, never away from it.
+fn digest_of(text: &str) -> String {
+    format!("{:016x}", crate::utils::content_digest(text.as_bytes()))
 }
 
 /// Takes one array-valued key, answering `default` when it is not there.
@@ -852,6 +921,15 @@ fn parse_package_list(list: String) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The configuration a test asks for, read through the real loader — same
+    /// helper shape `rootfs::tests` uses: keys and defaults are what the build
+    /// gets, not a hand-built struct that can drift from them.
+    fn load_config(name: &str, toml: &str) -> RootfsConfig {
+        let path = std::env::temp_dir().join(format!("mpos-config-test-{name}.toml"));
+        std::fs::write(&path, toml).unwrap();
+        RootfsConfig::load(&path, Arch::X86_64).unwrap()
+    }
 
     #[test]
     fn run_modes_round_trip_and_name_their_console_list() {
@@ -1566,14 +1644,14 @@ qemu.gpu = \"c\"
     #[test]
     fn reads_the_user_the_image_logs_in_as() {
         let mut values = parse_sectioned_toml(
-            "[default]\nuser.name = \"mpos\"\nuser.groups = [\"wheel\", \"audio\"]\nuser.shell = \"/bin/fish\"\nuser.password = \"hunter2\"\n",
+            "[default]\nuser.name = \"mpos\"\nuser.groups = [\"wheel\", \"audio\"]\nuser.shell = \"/bin/ash\"\nuser.password = \"hunter2\"\n",
             Arch::X86_64,
         )
         .unwrap();
         let user = UserConfig::from_values(&mut values);
         assert_eq!(user.name, "mpos");
         assert_eq!(user.groups, vec!["wheel", "audio"]);
-        assert_eq!(user.shell, "/bin/fish");
+        assert_eq!(user.shell, "/bin/ash");
         assert_eq!(user.password, "hunter2");
     }
 
@@ -1640,5 +1718,87 @@ qemu.gpu = \"c\"
             vec!["wheel"]
         );
         assert!(take_list(&mut values, "qemu.extra_args", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_shape_key_change_moves_the_full_hash_and_a_package_change_does_not() {
+        // The two hashes are the whole incrementality rule, so each is pinned
+        // against the key group it must own: the shape hash moves for the mirror
+        // and the partition sizes and *not* for a package name; the delta hash
+        // moves for a package list and not for the shape. A key added to
+        // `RootfsConfig` without joining either group would make one of these
+        // assertions stale on its first read — the field-walk test below is what
+        // catches that instead of hoping a reviewer notices.
+        let base = load_config(
+            "hashes",
+            "[default]\nrootfs.mirror = \"https://one\"\nrootfs.branch = \"v3.20\"\nrootfs.base_packages = \"busybox\"\nrootfs.extra_packages = \"openrc\"\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n",
+        );
+        let mut moved_shape = base.full_install_hash();
+        let _ = &mut moved_shape;
+
+        // The same set in a different order hashes the same: the hash is of
+        // the *set*, not of how the file happened to spell it. (A multi-line
+        // array is a different claim and is pinned by `scan`'s own tests.)
+        let ordered = load_config(
+            "hashes-ordered",
+            "[default]\nrootfs.mirror = \"https://one\"\nrootfs.branch = \"v3.20\"\nrootfs.base_packages = \"busybox,mksh\"\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n",
+        );
+        let reversed = load_config(
+            "hashes-reversed",
+            "[default]\nrootfs.mirror = \"https://one\"\nrootfs.branch = \"v3.20\"\nrootfs.base_packages = \"mksh,busybox\"\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n",
+        );
+        assert_eq!(
+            ordered.package_delta_hash(vec![]),
+            reversed.package_delta_hash(vec![]),
+            "a package list reordered hashes as the set it spells"
+        );
+
+        // A package added changes only the delta side.
+        let more_packages = load_config(
+            "hashes-more",
+            "[default]\nrootfs.mirror = \"https://one\"\nrootfs.branch = \"v3.20\"\nrootfs.base_packages = \"busybox,e2fsprogs\"\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n",
+        );
+        let fewer = load_config(
+            "hashes-fewer",
+            "[default]\nrootfs.mirror = \"https://one\"\nrootfs.branch = \"v3.20\"\nrootfs.base_packages = \"busybox\"\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n",
+        );
+        assert_ne!(
+            more_packages.package_delta_hash(vec![]),
+            fewer.package_delta_hash(vec![]),
+            "the delta hash sees the package set"
+        );
+        assert_eq!(
+            more_packages.full_install_hash(),
+            fewer.full_install_hash(),
+            "and the shape hash does not"
+        );
+
+        // The mirror is shape: every package's bytes come from it.
+        let other_mirror = load_config(
+            "hashes-mirror",
+            "[default]\nrootfs.mirror = \"https://two\"\nrootfs.branch = \"v3.20\"\nrootfs.base_packages = \"busybox\"\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n",
+        );
+        assert_ne!(
+            fewer.full_install_hash(),
+            other_mirror.full_install_hash(),
+            "a mirror change invalidates the whole image"
+        );
+    }
+
+    #[test]
+    fn the_owned_set_is_base_plus_extras_deduped_in_first_listed_order() {
+        let config = load_config(
+            "owned",
+            "[default]\nrootfs.base_packages = \"busybox,openrc\"\nrootfs.extra_packages = \"openrc,weston\"\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n",
+        );
+        let owned = config.installed_names();
+        // openrc appears in both lists and once here: apk dedupes its own
+        // arguments, and an owned set with a duplicate would double-count on the
+        // remove side of a later diff.
+        let openrc = owned.iter().filter(|n| *n == "openrc").count();
+        assert_eq!(openrc, 1, "one name listed twice is owned once");
+        let busy = owned.iter().position(|n| n == "busybox").unwrap();
+        let weston = owned.iter().position(|n| n == "weston").unwrap();
+        assert!(busy < weston, "first-listed order survives the dedupe");
     }
 }

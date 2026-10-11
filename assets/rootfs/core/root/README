@@ -32,10 +32,12 @@ substitution happens in `xtask/src/rootfs.rs` (`render_inittab`).
 | `etc/resolv.conf` | the resolver - QEMU's user-mode forwarder at 10.0.2.3 |
 | `etc/doas.conf` | who may escalate: `wheel`, no password |
 
-The Wayland session's pieces stay in `rootfs/`: `etc/profile.d/xdg-runtime.sh`,
-`etc/fish/conf.d/xdg-runtime.fish` and `etc/local.d/xdg-runtime.start` exist for
-a compositor this machine has no GPU for, so they are the first machine's
-overlay, not the core's.
+The Wayland session's pieces are `etc/profile.d/xdg-runtime.sh` (the
+`XDG_RUNTIME_DIR` libwayland refuses to start without),
+`etc/local.d/xdg-runtime.start` (which makes that directory at boot) and
+`etc/xdg/weston/weston.ini` (the compositor's own settings). They belong with
+whichever machines run a compositor - both images carry one, weston over mesa's
+software GL, so both read them.
 
 `rootfs.toml` is for the values the build has to interpolate - the hostname, the
 accounts and their passwords, the package list, the mirror, the disk layout -

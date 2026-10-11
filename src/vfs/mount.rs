@@ -8,7 +8,8 @@
 //! needed a cross-filesystem parent pointer is simply not on the stack.
 //!
 //! The table is a plain instance, not a global, so tests can build isolated
-//! trees; the kernel's own table lives in [`STATIC`] behind the free functions.
+//! trees; the kernel's own table lives behind [`machine_table`], which every free function here
+//! routes through — the caller's own table when its task has unshared one.
 
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -165,7 +166,7 @@ struct Mount {
 }
 
 /// A set of mounts with a root, and the resolver over them.
-pub struct Vfs {
+pub struct MountTable {
     root: Mutex<RefCell<Option<Arc<dyn Inode>>>>,
     mounts: Mutex<RefCell<Vec<Mount>>>,
     /// What `/` is, for /proc/mounts. The root is not in the mount table - it
@@ -217,9 +218,9 @@ struct MountPoint {
     fstype: alloc::string::String,
 }
 
-impl Vfs {
-    pub const fn new() -> Vfs {
-        Vfs {
+impl MountTable {
+    pub const fn new() -> MountTable {
+        MountTable {
             root: Mutex::new(RefCell::new(None)),
             mounts: Mutex::new(RefCell::new(Vec::new())),
             root_fstype: Mutex::new(RefCell::new(None)),
@@ -235,8 +236,95 @@ impl Vfs {
         }
     }
 
-    /// Install the root filesystem. Once, at boot: a second call is a bug.
+    /// A **copy** of this table: the same mounts, the same records, fresh
+    /// counters. This is `unshare(CLONE_NEWNS)`'s namespace — Linux's
+    /// `copy_mnt_ns` + `copy_tree` of the mount list, and the copy is the whole
+    /// feature: a caller handed an *empty* table would lose every filesystem
+    /// under its feet at the instant of the call, which is not what asking for
+    /// your own namespace means.
     ///
+    /// The three counters are re-minted from 1 rather than carried over, because
+    /// they are *this table's* facts: a mount id names a mount within one table
+    /// (mountinfo's id/parent-id columns only ever compare ids of one reader's
+    /// own tree), and two tables that shared a counter source would hand out two
+    /// mounts claiming to be one attachment. The instance ids (`fs_seq`) and the
+    /// anonymous device numbers (`anon_seq`) restart too, and that restart is
+    /// honest for the same reason [`Self::fs_of_path`] already answers per-table:
+    /// "which instance serves this path" is asked of one table at a time, and no
+    /// caller on this kernel compares an id across two of them. What a copy does
+    /// *not* get is a fresh identity for the served filesystems themselves — the
+    /// `Arc<dyn FileSystem>` values travel by reference, so a file written
+    /// through one table's mount is visible through the other's, exactly as it
+    /// is across a fork today. Namespaces isolate names, not data.
+    pub fn copy(&self) -> Arc<MountTable> {
+        let fresh = Arc::new(MountTable::new());
+        critical_section::with(|cs| {
+            *fresh.root.borrow(cs).borrow_mut() = self.root.borrow(cs).borrow().clone();
+            *fresh.mounts.borrow(cs).borrow_mut() = self
+                .mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .map(|m| Mount {
+                    at: m.at.clone(),
+                    root: m.root.clone(),
+                    fstype: m.fstype.clone(),
+                    source: m.source.clone(),
+                    id: m.id,
+                    mount_id: m.mount_id,
+                    dev: m.dev,
+                    read_only: m.read_only,
+                    fs: m.fs.clone(),
+                    bind: m.bind,
+                })
+                .collect();
+            *fresh.root_fstype.borrow(cs).borrow_mut() =
+                self.root_fstype.borrow(cs).borrow().clone();
+            *fresh.root_source.borrow(cs).borrow_mut() =
+                self.root_source.borrow(cs).borrow().clone();
+            *fresh.root_fs.borrow(cs).borrow_mut() = self.root_fs.borrow(cs).borrow().clone();
+            *fresh.root_read_only.borrow(cs).borrow_mut() =
+                *self.root_read_only.borrow(cs).borrow();
+            *fresh.root_dev.borrow(cs).borrow_mut() = *self.root_dev.borrow(cs).borrow();
+            *fresh.root_mount_id.borrow(cs).borrow_mut() = *self.root_mount_id.borrow(cs).borrow();
+            // The copied records keep their ids; the counters start above every
+            // id in the copy so a later mount cannot mint one already spoken for.
+            let max_mount_id = fresh
+                .mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .map(|m| m.mount_id)
+                .max()
+                .unwrap_or(0);
+            let max_id = fresh
+                .mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .map(|m| m.id)
+                .max()
+                .unwrap_or(0);
+            let max_anon = fresh
+                .mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .filter(|m| crate::uevent::major_of(m.dev) == 0)
+                .map(|m| crate::uevent::minor_of(m.dev) as u64)
+                .max()
+                .unwrap_or(0);
+            *fresh.mount_seq.borrow(cs).borrow_mut() =
+                core::cmp::max(max_mount_id, *self.root_mount_id.borrow(cs).borrow()) + 1;
+            *fresh.fs_seq.borrow(cs).borrow_mut() = max_id + 1;
+            *fresh.anon_seq.borrow(cs).borrow_mut() = max_anon + 1;
+            *fresh.mount_points.borrow(cs).borrow_mut() =
+                self.mount_points.borrow(cs).borrow().clone();
+        });
+        fresh
+    }
+
+    /// Install the root filesystem. Once, at boot: a second call is a bug.
     /// The *filesystem itself* is recorded, not only its name and its device
     /// number, because the root slot is where a machine's every later question
     /// about "which filesystem serves this node" lands: `fs_serving_inode`
@@ -325,7 +413,7 @@ impl Vfs {
     /// takes an `Arc` rather than a borrow: a caller that has one to give must
     /// not lose it, and a caller's borrowed `&dyn FileSystem` has no answer to
     /// the questions above at all.
-    pub fn mount(&self, path: &str, fs: Arc<dyn FileSystem>) -> VfsResult<()> {
+    pub(crate) fn mount(&self, path: &str, fs: Arc<dyn FileSystem>) -> VfsResult<()> {
         if critical_section::with(|cs| self.root.borrow(cs).borrow().is_none()) {
             return Err(VfsError::NoRoot);
         }
@@ -341,7 +429,7 @@ impl Vfs {
             return Err(VfsError::Invalid);
         }
 
-        let parent = self.resolve(parent_path)?;
+        let parent = self.resolve_caller(parent_path, self.root_inode())?;
         let at = parent.lookup(name)?;
         if at.metadata().kind != NodeKind::Dir {
             return Err(VfsError::NotDir);
@@ -461,7 +549,7 @@ impl Vfs {
     /// `rename`'s "same filesystem?" test ask about; what `stat` reports for
     /// the path is [`Vfs::dev_of_path`], and for a filesystem with a device
     /// behind it the two are deliberately different numbers.
-    pub fn fs_of_path(&self, path: &str) -> (u64, alloc::string::String) {
+    pub(crate) fn fs_of_path(&self, path: &str) -> (u64, alloc::string::String) {
         let point = self.serving_point(path);
         (point.id, point.fstype)
     }
@@ -475,7 +563,7 @@ impl Vfs {
     /// by `stat`ing its mountpoint and then looks that number up in
     /// `/proc/self/mountinfo` reads the same value from both only because both
     /// come from here.
-    pub fn dev_of_path(&self, path: &str) -> u64 {
+    pub(crate) fn dev_of_path(&self, path: &str) -> u64 {
         self.serving_point(path).dev
     }
 
@@ -824,7 +912,12 @@ impl Vfs {
     /// currently covering it - resolving all the way would re-aim the mount
     /// into the existing mount's filesystem, and its "is this point taken?"
     /// check at that answer is a question about the wrong inode.
-    fn mountpoint_inode(
+    /// The directory `path` names as a mountpoint, resolved for a caller: the
+    /// last component looked up in its parent rather than walked through, so a
+    /// bind's target may be a name that does not exist yet in the sense of a
+    /// mount - but must still be a directory. `None` start means the machine's
+    /// tree (`/` answers this table's root); `Some` means the caller's cwd.
+    pub(crate) fn mountpoint_at(
         &self,
         path: &str,
         start: Option<Arc<dyn Inode>>,
@@ -834,11 +927,13 @@ impl Vfs {
             // The target of a bind can never be `/` itself (the kernel has
             // one root slot, and no mountpoint inode names it), but the
             // mountpoint of a path *is* wherever the walk starts for "/".
-            return Ok(self.root_inode());
+            // The caller's root, not the machine's: a chrooted task's "/" is
+            // its own jail, and `mount --bind x /` inside that chroot names it.
+            return self.caller_root().ok_or(VfsError::NoRoot);
         }
         let (parent_path, name) = split_last(trimmed);
         let parent = match start {
-            Some(s) => self.resolve_from(parent_path, s)?,
+            Some(s) => self.resolve_caller(parent_path, s)?,
             None => self.resolve(parent_path)?,
         };
         if parent.metadata().kind != NodeKind::Dir {
@@ -876,7 +971,7 @@ impl Vfs {
     /// mounted on it. The mount is removed from the mount table, and subsequent
     /// accesses to files under `path` will see the underlying directory in the
     /// parent filesystem instead.
-    pub fn unmount(&self, path: &str) -> VfsResult<()> {
+    pub(crate) fn unmount(&self, path: &str) -> VfsResult<()> {
         if critical_section::with(|cs| self.root.borrow(cs).borrow().is_none()) {
             return Err(VfsError::NoRoot);
         }
@@ -914,10 +1009,15 @@ impl Vfs {
     /// Dropping it here instead would leave the tree alive in whatever still
     /// pointed into it, with no name left to reach it by - a leak with no
     /// handle. Detaching it is the caller's next step, and a deliberate one.
-    pub fn pivot_root(&self, new_root: &str, put_old: &str) -> VfsResult<()> {
+    pub(crate) fn pivot_root(&self, new_root: &str, put_old: &str) -> VfsResult<()> {
         let old_root = critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
             .ok_or(VfsError::NoRoot)?;
-        let new_root_inode = self.resolve(new_root.trim_end_matches('/'))?;
+        // Resolved against the *caller*, as `mount(2)` resolves its target: an
+        // initramfs's pid 1 runs this with absolute paths from its own cwd, and
+        // today that lands on the same root either way. The jail form is what
+        // keeps the promise honest once the caller can hold a different view.
+        let new_root_inode =
+            self.resolve_caller(new_root.trim_end_matches('/'), old_root.clone())?;
 
         // `put_old` is walked *inside* the new root: it names a directory in
         // the tree that is about to become `/`, not one in the tree being
@@ -1009,9 +1109,9 @@ impl Vfs {
     }
 
     /// Walk `path` from the root, crossing mounts as they are met.
-    pub fn resolve(&self, path: &str) -> VfsResult<Arc<dyn Inode>> {
+    pub(crate) fn resolve(&self, path: &str) -> VfsResult<Arc<dyn Inode>> {
         let root = self.root_opt().ok_or(VfsError::NoRoot)?;
-        self.resolve_walk(path, root.clone(), Some(root))
+        self.resolve_walk(path, root.clone(), Some(root), self)
     }
 
     /// The root inode as it stands, or `None` before a filesystem is mounted -
@@ -1019,6 +1119,83 @@ impl Vfs {
     /// the one caller that cannot run without a root.
     fn root_opt(&self) -> Option<Arc<dyn Inode>> {
         critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
+    }
+
+    /// The root this **caller** is jailed to: its own `chroot` root when it has
+    /// one, else this table's root. One function because there is one question
+    /// - "where does an absolute path begin for whoever is asking" - and two
+    /// answers by context: a syscall arrives with a task whose slot may carry a
+    /// re-homed directory (`sched::current_root`, which itself falls back to the
+    /// machine's root), and everything else - boot code running before any task
+    /// exists, a host test driving a bare tree - means the table's own.
+    ///
+    /// This is the jail half of every resolution; the *table* half is separate
+    /// by design. The mount set is still the machine's single table here, so a
+    /// chrooted task's walk crosses mounts exactly as an unjailed one does:
+    /// `pivot_root`/`switch_root` can only move `/` from outside any chroot, and
+    /// making the crossing follow the chroot alone would hand a chrooted pid 1 a
+    /// live view of mounts its tree no longer contains. When the table itself
+    /// becomes per-task (the MNT namespace step), the two halves meet at this
+    /// one call site - the task's context carries both its root and its table.
+    fn caller_root(&self) -> Option<Arc<dyn Inode>> {
+        process_fs_context().1.or_else(|| self.root_opt())
+    }
+
+    /// Resolve `path` against a caller's start, jailed to *that table's* root.
+    /// The three sibling walks below differ only in what they hand back; all
+    /// three take their jail here rather than through [`Vfs::resolve_from`],
+    /// because `resolve_from` is the machine-rooted walk - the shape a boot step
+    /// or a host test on an explicit tree means - and these are the shapes a
+    /// syscall reaches with its caller's cwd. Keeping the two apart is what
+    /// makes "resolved against the caller" mean the same thing everywhere.
+    pub fn resolve_caller(&self, path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
+        self.resolve_walk(path, start, self.caller_root(), self)
+    }
+
+    /// [`Vfs::resolve_caller`] handing back the directory the last name lives
+    /// in and the name itself - Linux's `user_path_parent` shape, the one every
+    /// make-or-remove call resolves through. See
+    /// [`Vfs::resolve_parent_from`] for why the walk stops before the name.
+    pub fn resolve_caller_parent(
+        &self,
+        path: &str,
+        start: Arc<dyn Inode>,
+    ) -> VfsResult<(Arc<dyn Inode>, String)> {
+        let (parent_path, name) = split_last(path);
+        if name.is_empty() {
+            return Err(VfsError::Invalid);
+        }
+        // A trailing `.` or `..` names the directory itself, which is ordinary
+        // resolution (`unlink(".")` is what Linux refuses as EISDIR later).
+        if name == "." || name == ".." {
+            let dir = self.resolve_caller(path, start)?;
+            return Ok((dir, String::from(name)));
+        }
+        let parent = self.resolve_caller(parent_path, start)?;
+        // The directory the name will land in, checked to *be* one: a bind or
+        // an unlink under a plain file is `ENOTDIR` from here, never the
+        // `EACCES` a search through a file's absent execute bit would give.
+        crate::vfs::require_directory(&parent)?;
+        Ok((parent, String::from(name)))
+    }
+
+    /// [`Vfs::resolve_caller`] without following a symbolic link in the **last**
+    /// component - what `lstat`, `readlink` and `symlink` need. Same rules as
+    /// [`Vfs::resolve_no_follow`], jailed like every other caller-shaped walk.
+    pub fn resolve_caller_no_follow(
+        &self,
+        path: &str,
+        start: Arc<dyn Inode>,
+    ) -> VfsResult<Arc<dyn Inode>> {
+        let (parent_path, name) = split_last(path);
+        if name.is_empty() || name == "." || name == ".." {
+            return self.resolve_caller(path, start);
+        }
+        let parent = self.resolve_caller(parent_path, start)?;
+        if parent.metadata().kind != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        parent.lookup(name)
     }
 
     /// Walk `path` from `start` instead of the root - which is what a
@@ -1031,8 +1208,12 @@ impl Vfs {
     /// all named by one `jail` argument; this is that walk with the jail being
     /// the machine's own root, which is what a caller with no process context -
     /// the mount bookkeeping, a host test on a bare tree - means.
-    pub fn resolve_from(&self, path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
-        self.resolve_walk(path, start, self.root_opt())
+    pub(crate) fn resolve_from(
+        &self,
+        path: &str,
+        start: Arc<dyn Inode>,
+    ) -> VfsResult<Arc<dyn Inode>> {
+        self.resolve_walk(path, start, self.root_opt(), self)
     }
 
     /// Walk `path` from `start`, treating `jail` as the root: the directory an
@@ -1047,11 +1228,19 @@ impl Vfs {
     /// existed.
     ///
     /// The mount crossing is the same walk as ever, one node deeper in the tree.
+    /// The walk itself. `jail` says where an absolute path begins and what `..`
+    /// clamps against; `table` is *which mount set the crossing consults* — the
+    /// caller's own once it has unshared one, this table otherwise. They are two
+    /// arguments because they are two facts a task carries together
+    /// (`process_fs_context`) and a resolution that crossed mounts in the
+    /// machine's table while jailing to a private root would show one namespace's
+    /// mounts inside another's tree.
     fn resolve_walk(
         &self,
         path: &str,
         start: Arc<dyn Inode>,
         jail: Option<Arc<dyn Inode>>,
+        table: &MountTable,
     ) -> VfsResult<Arc<dyn Inode>> {
         let absolute = path.starts_with('/');
         let start = if absolute {
@@ -1175,7 +1364,7 @@ impl Vfs {
                             child
                         } else {
                             critical_section::with(|cs| {
-                                let mounts = self.mounts.borrow(cs).borrow();
+                                let mounts = table.mounts.borrow(cs).borrow();
                                 // The newest mount on the point wins, the
                                 // way a stack of mounts peels from the top.
                                 match mounts.iter().rposition(|m| Arc::ptr_eq(&m.at, &child)) {
@@ -1435,6 +1624,9 @@ impl Vfs {
     /// several names that the caller did not use, and for a tree too large to
     /// look through. The first is what POSIX asks for; the others leave `..`
     /// where it was, which is the honest answer when the tree cannot say.
+    /// The directory `target` sits in, found by walking down from this table's
+    /// root — the one parent question the chain cannot answer for itself (a
+    /// `..` at a walk's base). Bounded below; see the constant.
     fn parent_of(&self, target: &Arc<dyn Inode>) -> Option<Arc<dyn Inode>> {
         // Bounded: the answer is near the top for every cwd a program actually
         // holds, and searching a large tree without limit to resolve one `..`
@@ -1574,18 +1766,62 @@ fn split_last(path: &str) -> (&str, &str) {
     }
 }
 
-impl Default for Vfs {
-    fn default() -> Vfs {
-        Vfs::new()
+impl Default for MountTable {
+    fn default() -> MountTable {
+        MountTable::new()
     }
 }
 
-static STATIC: Vfs = Vfs::new();
+/// The machine's one mount table — the namespace every task starts in until it
+/// unshares one of its own. A value rather than a bare `static` because a task's
+/// slot holds an `Arc` to *some* table, and the machine's has to be an `Arc` too
+/// for the two to be interchangeable; everything that used to reach `&'static`
+/// (`global()`) keeps working, since the inner table is still reachable through
+/// the handle.
+/// The machine's table, behind a handle rather than in a bare `static`: a
+/// task's namespace slot holds an `Arc<MountTable>`, and the machine's own has
+/// to be an `Arc` too for the two to answer the same questions. The value is
+/// built on first use and never replaced; cloning the handle shares the state,
+/// which is exactly what fork inheritance means.
+///
+/// One critical section for the whole slot because the lock discipline this
+/// module keeps everywhere else is `critical_section::with` — a mutex on both
+/// targets, reentrant-kind on the host — and a second kind of lock here would be
+/// a second thing to reason about for a value that is written exactly once.
+static STATIC: Mutex<RefCell<Option<Arc<MountTable>>>> = Mutex::new(RefCell::new(None));
 
-/// The kernel's one instance, for callers the free functions do not cover -
-/// the initramfs unpacker, which walks and creates through a `&Vfs`.
-pub fn global() -> &'static Vfs {
-    &STATIC
+/// The machine's table, initializing it on first use. Every free function here
+/// answers "the caller's table, or this one" through this call, which is what
+/// makes the namespace routing have exactly one decision point.
+///
+/// `spin::Once` is the repo's one-time-init primitive (the IDT and the GDT use
+/// it for hardware); here it holds the *value* the machine table is, and every
+/// call hands out an `Arc` over the same inner state. Cloning the `Arc` is the
+/// cheap half; cloning the table would be the bug — two handles to one set of
+/// mounts is a shared namespace, which is what fork inheritance means.
+pub fn machine_table() -> Arc<MountTable> {
+    critical_section::with(|cs| {
+        let mut slot = STATIC.borrow(cs).borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Arc::new(MountTable::new()));
+        }
+        slot.as_ref().expect("just filled").clone()
+    })
+}
+
+/// The kernel's one instance, for callers that want the machine's table by
+/// borrow rather than by handle — the initramfs unpacker, a host test naming
+/// the fallback. A task's *own* table is reached through the free functions,
+/// which route by `process_fs_context`; nothing outside this module should
+/// resolve against `global()` directly from syscall context.
+pub fn global() -> &'static MountTable {
+    // The `Arc` is leaked to a `'static` borrow on first use, once. A handle
+    // that lived only inside the slot would dangle the moment it was returned,
+    // and the callers of this function (`tar::unpack_into`, host tests naming
+    // the fallback table) want the same shape they always had: a borrow of the
+    // machine's one table. Leaking it is honest — the machine's namespace is
+    // never torn down while the kernel runs.
+    &*alloc::boxed::Box::leak(alloc::boxed::Box::new(machine_table()))
 }
 
 /// Install the kernel's root filesystem. Once, at boot.
@@ -1593,12 +1829,12 @@ pub fn global() -> &'static Vfs {
 /// The instance travels, not just a borrow of it: see [`Vfs::mount_root`] for
 /// what a root recorded without one costs.
 pub fn mount_root(fs: Arc<dyn FileSystem>) {
-    STATIC.mount_root(fs);
+    machine_table().mount_root(fs);
 }
 
 /// Mount `fs` at the directory named by `path` in the kernel's tree.
 pub fn mount(path: &str, fs: Arc<dyn FileSystem>) -> VfsResult<()> {
-    STATIC.mount(path, fs)
+    caller_table().mount(path, fs)
 }
 
 /// Unmount the filesystem mounted at `path`.
@@ -1608,7 +1844,7 @@ pub fn mount(path: &str, fs: Arc<dyn FileSystem>) -> VfsResult<()> {
 /// to files under `path` will see the underlying directory in the parent
 /// filesystem instead.
 pub fn unmount(path: &str) -> VfsResult<()> {
-    STATIC.unmount(path)
+    caller_table().unmount(path)
 }
 
 /// Replace the root filesystem: move `new_root` to `/`, and move the old root
@@ -1618,7 +1854,7 @@ pub fn unmount(path: &str) -> VfsResult<()> {
 /// previously `new_root`, and `put_old` holds the old root filesystem's
 /// contents, ready to be unmounted.
 pub fn pivot_root(new_root: &str, put_old: &str) -> VfsResult<()> {
-    STATIC.pivot_root(new_root, put_old)
+    caller_table().pivot_root(new_root, put_old)
 }
 
 /// Mount `fs` on the directory `target` already resolves to, recording the
@@ -1649,13 +1885,13 @@ pub fn mount_at_opt(
     dev: Option<u64>,
 ) -> VfsResult<()> {
     let at = resolve_opt(target, start)?;
-    STATIC.mount_at(at, fs, fstype, source, read_only, dev)
+    caller_table().mount_at(at, fs, fstype, source, read_only, dev)
 }
 
 /// `mount -o remount,...`: change a mounted filesystem's flags.
 pub fn remount(target: &str, start: Option<Arc<dyn Inode>>, read_only: bool) -> VfsResult<()> {
     let at = resolve_opt(target, start)?;
-    STATIC.remount(&at, read_only)
+    caller_table().remount(&at, read_only)
 }
 
 /// `mount --bind source target`: an existing tree, a second name. Both paths
@@ -1668,61 +1904,69 @@ pub fn bind_mount(
     read_only: bool,
 ) -> VfsResult<()> {
     let src = resolve_opt(source, start.clone())?;
-    let at = STATIC.mountpoint_inode(target, start)?;
-    STATIC.bind_mount(at, src, source, read_only)
+    let at = caller_table().mountpoint_at(target, start)?;
+    caller_table().bind_mount(at, src, source, read_only)
 }
 
 /// Unmount the filesystem at `path`, resolved against a caller's cwd.
 pub fn unmount_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<()> {
     let resolved = resolve_opt(path, start)?;
-    STATIC.unmount_resolved(&resolved)
+    caller_table().unmount_resolved(&resolved)
 }
 
 /// Every mount, as `/proc/mounts` and `/proc/self/mountinfo` report it.
 pub fn mount_records() -> Vec<MountRecord> {
-    STATIC.mount_records()
+    caller_table().mount_records()
 }
 
 /// The filesystem instance id serving `path`, with its type. This is the
 /// instance's *identity*; what `stat` reports for the path is [`dev_of_path`].
 pub fn fs_of_path(path: &str) -> (u64, alloc::string::String) {
-    STATIC.fs_of_path(path)
+    caller_table().fs_of_path(path)
 }
 
 /// What `stat`'s `st_dev` reports for `path`: the number of the device behind
 /// the filesystem that serves it, or an anonymous number for a pseudo-filesystem.
 pub fn dev_of_path(path: &str) -> u64 {
-    STATIC.dev_of_path(path)
+    caller_table().dev_of_path(path)
 }
 
 /// The same, for an inode with no path - `fstat(2)`'s descriptor shape.
 pub fn dev_of_inode(inode: &Arc<dyn Inode>) -> u64 {
-    STATIC.dev_of_inode(inode)
+    caller_table().dev_of_inode(inode)
 }
 
 /// The space accounting of the filesystem that serves `path`, straight from
 /// the instance. `None` when the serving filesystem has no real numbers
 /// (ramfs and friends answer through the syscall layer instead).
 pub fn fs_stats_of_path(path: &str) -> Option<super::FsStats> {
-    STATIC.fs_serving_path(path).and_then(|fs| fs.statfs())
+    caller_table()
+        .fs_serving_path(path)
+        .and_then(|fs| fs.statfs())
 }
 
 /// The same, for an inode with no path - `fstatfs(2)`'s descriptor shape.
 pub fn fs_stats_of_inode(inode: &Arc<dyn Inode>) -> Option<super::FsStats> {
-    STATIC.fs_serving_inode(inode).and_then(|fs| fs.statfs())
+    caller_table()
+        .fs_serving_inode(inode)
+        .and_then(|fs| fs.statfs())
 }
 
 /// The type of the filesystem a node belongs to, by identity: a mount's own
 /// root names that mount; anything else names the root filesystem.
 pub fn fstype_of_inode(inode: &Arc<dyn Inode>) -> alloc::string::String {
+    // The caller's table first: which filesystem *type* a node belongs to is a
+    // fact about the mounts that name it, and two tables can name one inode
+    // differently (a mount in one namespace, plain directory in another).
+    let table = process_fs_context().0.unwrap_or_else(machine_table);
     let (root_fstype, hits) = critical_section::with(|cs| {
-        let fstype = STATIC
+        let fstype = table
             .root_fstype
             .borrow(cs)
             .borrow()
             .clone()
             .unwrap_or_else(|| alloc::string::String::from("unknown"));
-        let hits: Vec<alloc::string::String> = STATIC
+        let hits: Vec<alloc::string::String> = table
             .mounts
             .borrow(cs)
             .borrow()
@@ -1744,8 +1988,9 @@ pub fn fstype_of_inode(inode: &Arc<dyn Inode>) -> alloc::string::String {
 /// [`dev_of_inode`], which is a different number whenever the filesystem has a
 /// device behind it.
 pub fn fs_id_of_inode(inode: &Arc<dyn Inode>) -> u64 {
+    let table = process_fs_context().0.unwrap_or_else(machine_table);
     critical_section::with(|cs| {
-        STATIC
+        table
             .mounts
             .borrow(cs)
             .borrow()
@@ -1761,7 +2006,15 @@ pub fn fs_id_of_inode(inode: &Arc<dyn Inode>) -> u64 {
 /// job (a per-process view held in `sched`); this only answers *which* inode and
 /// refuses a non-directory, so it can name nothing outside the process's tree.
 pub fn chroot_target(path: &str, cwd: &Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
-    let inode = resolve_opt(path, Some(cwd.clone()))?;
+    // Resolved against the caller's *current* root explicitly — `resolve_caller`
+    // with the task's own jail — because this is the one walk whose answer
+    // re-homes the task: it must see what the task sees today, not whatever the
+    // fallback would pick. The handler checks CAP_SYS_CHROOT before calling and
+    // installs the returned inode through `sched::set_root`.
+    let (table, root) = process_fs_context();
+    let table = table.unwrap_or_else(machine_table);
+    let jail = root.or_else(|| table.root_opt());
+    let inode = table.resolve_walk(path, cwd.clone(), jail, &table)?;
     if inode.metadata().kind != NodeKind::Dir {
         return Err(VfsError::NotDir);
     }
@@ -1771,19 +2024,19 @@ pub fn chroot_target(path: &str, cwd: &Arc<dyn Inode>) -> VfsResult<Arc<dyn Inod
 /// `mount(2)`'s MS_MOVE, free-function spelling: the filesystem mounted at
 /// `at` becomes the root.
 pub fn move_root(at: &Arc<dyn Inode>) -> VfsResult<()> {
-    STATIC.move_root(at)
+    caller_table().move_root(at)
 }
 
 /// Re-home the mount serving `source` on the directory `at`.
 pub fn move_mount(source: &Arc<dyn Inode>, at: &Arc<dyn Inode>) -> VfsResult<()> {
-    STATIC.move_mount(source, at)
+    caller_table().move_mount(source, at)
 }
 
 /// Resolve `path` in the kernel's (machine's) tree. The boot code, which runs
 /// before any task exists and so has no per-process root, starts every walk
 /// here; a syscall resolves against its caller's root through `resolve_at`.
 pub fn resolve(path: &str) -> VfsResult<Arc<dyn Inode>> {
-    STATIC.resolve(path)
+    caller_table().resolve(path)
 }
 
 /// Resolve `path` starting from `start` - a process's cwd - and jailed to that
@@ -1791,43 +2044,118 @@ pub fn resolve(path: &str) -> VfsResult<Arc<dyn Inode>> {
 /// `chroot` root (the machine's root for any task that never called one), as `/`
 /// must, and a `..` at that root stays there rather than climbing out.
 pub fn resolve_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
-    STATIC.resolve_walk(path, start, process_root().or_else(|| STATIC.root_opt()))
+    // The caller's own table when it has one; the machine's otherwise. Same
+    // rule as [`resolve`] below for every other free function here.
+    let (table, _) = process_fs_context();
+    let table = table.unwrap_or_else(machine_table);
+    table.resolve_caller(path, start)
 }
 
 /// The directory `path` names its last component in, resolved through
 /// [`resolve_at`] so a `dirfd`-relative call sees the caller's tree. See
 /// [`Vfs::resolve_parent_from`] for why the walk stops before the name.
 pub fn resolve_parent_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<(Arc<dyn Inode>, String)> {
-    STATIC.resolve_parent_from(path, start)
+    let (table, _) = process_fs_context();
+    let table = table.unwrap_or_else(machine_table);
+    table.resolve_caller_parent(path, start)
 }
 
-/// The calling task's root, jailed absolute paths begin at. `None` off the
-/// machine: the VFS compiles for the host so its tree logic is unit-testable,
-/// but the running task's root is a scheduler fact that only exists there, and no
-/// host test drives a per-process lookup - it resolves through the `Vfs` methods
-/// against an explicit tree.
+/// The calling task's mount context: `(table, root)`, both `None` when the
+/// caller has neither — which is every boot step (running before any task
+/// exists), every kernel-side walk, and every host test driving an explicit
+/// table. On bare metal this reads the running task's slots once; on the host it
+/// answers `(None, None)` because a host resolution has no per-task namespace to
+/// consult and each test already names the table it walks.
+///
+/// One call for two facts because one resolution needs both: the table decides
+/// which mounts exist to cross into, and the root decides where an absolute path
+/// begins and what `..` clamps against. Keeping them apart was fine while every
+/// caller shared the machine's table; with namespaces they move together or a
+/// chrooted task would jail its paths into one table while crossing mounts in
+/// another.
 #[cfg(target_os = "none")]
-fn process_root() -> Option<Arc<dyn Inode>> {
-    Some(crate::sched::current_root())
+pub(crate) fn process_fs_context() -> (Option<Arc<MountTable>>, Option<Arc<dyn Inode>>) {
+    crate::sched::current_fs_context()
 }
 
 #[cfg(not(target_os = "none"))]
-fn process_root() -> Option<Arc<dyn Inode>> {
-    None
+pub(crate) fn process_fs_context() -> (Option<Arc<MountTable>>, Option<Arc<dyn Inode>>) {
+    (None, None)
+}
+
+/// The table a resolution or a mount operation answers to: the calling task's
+/// own when it has unshared one, the machine's otherwise (`None` off any task —
+/// boot code, and every host test driving an explicit tree). One function because
+/// that question is asked by every free function below, and a namespace step
+/// that answered it in twelve places is how two of them start disagreeing about
+/// which table a syscall saw.
+pub(crate) fn caller_table() -> Arc<MountTable> {
+    process_fs_context().0.unwrap_or_else(machine_table)
 }
 
 #[cfg(all(test, not(target_os = "none")))]
 mod tests {
     use alloc::sync::Arc;
 
-    use super::{Vfs, split_last};
+    use super::{MountTable, split_last};
     use crate::vfs::ramfs::RamFs;
     use crate::vfs::{FileSystem, NodeKind, VfsError};
 
-    fn tree_with_root() -> Arc<Vfs> {
-        let vfs = Arc::new(Vfs::new());
+    fn tree_with_root() -> Arc<MountTable> {
+        let vfs = Arc::new(MountTable::new());
         vfs.mount_root(RamFs::new());
         vfs
+    }
+
+    #[test]
+    fn two_tables_do_not_see_each_others_mounts() {
+        // The mount table is a *value*, and this is the counterfactual that says
+        // so: with one shared table, `a`'s mount answers `b`'s walk and both
+        // records lists. Every later per-task namespace step rests on this being
+        // true of the type itself rather than of a caller's discipline — a task
+        // holding its own table cannot leak through any path the free functions
+        // take, because the free functions all name the one table they forward
+        // to. That forwarding list is what makes "which table does a syscall see"
+        // answerable in one place, so it is pinned here too: `STATIC` is the
+        // kernel's table, and nothing else exists behind the free functions.
+        let a = tree_with_root();
+        let b = tree_with_root();
+        // `mount(2)` names an existing directory, so both trees carry the
+        // mountpoint before either takes a mount — the same precondition every
+        // other mount test in this module builds by hand.
+        for vfs in [&a, &b] {
+            vfs.resolve("/")
+                .unwrap()
+                .create("mnt", NodeKind::Dir)
+                .expect("the shared mountpoint directory");
+        }
+        let tmp_a = RamFs::new();
+        tmp_a
+            .root()
+            .create("from-a", NodeKind::File)
+            .expect("the mounted fs is writable");
+        a.mount("/mnt", tmp_a).unwrap();
+
+        assert!(
+            a.resolve("/mnt/from-a").is_ok(),
+            "the mounting table sees its own mount"
+        );
+        assert_eq!(
+            b.resolve("/mnt/from-a").err(),
+            Some(VfsError::NoEntry),
+            "the other table does not"
+        );
+        assert_eq!(a.mount_records().len(), 2, "one root slot + one mount");
+        assert_eq!(
+            b.mount_records().len(),
+            1,
+            "and the second table never grew a record from the first's mount"
+        );
+        assert_ne!(
+            a.fs_of_path("/mnt").0,
+            b.fs_of_path("/mnt").0,
+            "instance identity is per-table: the same name serves different facts"
+        );
     }
 
     #[test]
@@ -2009,13 +2337,13 @@ mod tests {
 
     #[test]
     fn resolving_before_a_root_exists_is_noroot() {
-        let vfs = Vfs::new();
+        let vfs = MountTable::new();
         assert_eq!(vfs.resolve("/").err(), Some(VfsError::NoRoot));
         assert_eq!(vfs.mount("/", RamFs::new()).err(), Some(VfsError::NoRoot));
     }
     /// Build `/bin/busybox` as a file and `/bin/ls`, `/bin/sh` as links to it -
     /// the shape a busybox rootfs is made of.
-    fn tree_with_busybox() -> Arc<Vfs> {
+    fn tree_with_busybox() -> Arc<MountTable> {
         let vfs = tree_with_root();
         let bin = vfs
             .resolve("/")
@@ -2212,7 +2540,7 @@ mod tests {
             .unwrap()
             .create("mnt", NodeKind::Dir)
             .unwrap();
-        let at = vfs.mountpoint_inode("/mnt", None).unwrap();
+        let at = vfs.mountpoint_at("/mnt", None).unwrap();
         vfs.mount_at(
             at,
             RamFs::new(),
@@ -2261,7 +2589,7 @@ mod tests {
         root.create("proc", NodeKind::Dir).unwrap();
         root.create("sys", NodeKind::Dir).unwrap();
         for (path, fstype) in [("/proc", "proc"), ("/sys", "sysfs")] {
-            let at = vfs.mountpoint_inode(path, None).unwrap();
+            let at = vfs.mountpoint_at(path, None).unwrap();
             vfs.mount_at(at, RamFs::new(), fstype, fstype, false, None)
                 .unwrap();
         }
@@ -2296,7 +2624,7 @@ mod tests {
             .unwrap()
             .create("mnt", NodeKind::Dir)
             .unwrap();
-        let at = vfs.mountpoint_inode("/mnt", None).unwrap();
+        let at = vfs.mountpoint_at("/mnt", None).unwrap();
         vfs.mount_at(
             at,
             RamFs::new(),
@@ -2357,7 +2685,7 @@ mod tests {
             .unwrap()
             .create("new", NodeKind::Dir)
             .unwrap();
-        let at = vfs.mountpoint_inode("/new", None).unwrap();
+        let at = vfs.mountpoint_at("/new", None).unwrap();
         vfs.mount_at(
             at.clone(),
             RamFs::new(),
@@ -2391,13 +2719,13 @@ mod tests {
 mod cwd_tests {
     use alloc::sync::Arc;
 
-    use super::Vfs;
+    use super::MountTable;
     use crate::vfs::NodeKind;
     use crate::vfs::ramfs::RamFs;
 
     #[test]
     fn a_relative_path_starts_at_the_given_node() {
-        let vfs = Arc::new(Vfs::new());
+        let vfs = Arc::new(MountTable::new());
         vfs.mount_root(RamFs::new());
         vfs.resolve("/")
             .unwrap()

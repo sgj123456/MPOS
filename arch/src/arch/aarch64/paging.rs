@@ -581,6 +581,27 @@ pub fn user_accessible(start: usize, len: usize, write: bool) -> bool {
     }
 }
 
+/// Whether the *active* space's tables describe the page `addr` lies in as a
+/// user page - a leaf carrying `USER`. It is the one condition a
+/// cache-maintenance instruction needs before this kernel can run the EL1
+/// spelling of it on a program's behalf, and it is deliberately stricter than
+/// [`user_accessible`]: rule 1's absent page is accessible to a *copy* because
+/// the fault it takes can supply the page, and this caller has no such escape -
+/// a maintenance instruction translates its address, so an absent page is a
+/// data abort at EL1, which the machine's own synchronous entry answers by
+/// resolving it or by stopping. Linux lets that fault happen and converts it
+/// (`arm64_notify_segfault`), so the two agree on what a program sees - a flush
+/// over an address nothing maps is `SIGSEGV` on both - and asking the tables
+/// first is what keeps an unresolvable one from stopping this machine.
+///
+/// `USER` and not `READ`: a by-VA maintenance operation translates its address
+/// without reading or writing memory, so a page a program mapped `PROT_NONE` is
+/// answered here exactly as the hardware would answer the EL0 instruction with
+/// `SCTLR_EL1.UCI` set.
+pub fn user_page_present(addr: usize) -> bool {
+    translate(addr & !(PAGE_SIZE - 1)).is_some_and(|(_, flags, _)| flags.contains(MapFlags::USER))
+}
+
 /// Whether the leaf mapping at `virt` in the *active* space carries the
 /// copy-on-write marker. The hardware does not enforce that bit, so `translate`
 /// never reports it; this asks the descriptor directly. It is the first question

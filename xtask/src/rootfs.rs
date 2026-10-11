@@ -100,13 +100,20 @@ pub fn build_rootfs(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
     // turns into minutes, so the base install runs only when the thing that
     // decides what is installed - the configuration - has changed, or when
     // there is no image to update.
+    // The record the last build left, read once and carried through this one:
+    // its owned set is what an incremental install diffs against, and its
+    // package-list hash is what tells a moved list from a torn record. A v1 or
+    // missing stamp reads as `None` everywhere it is used, which resolves to
+    // the full install — the direction that costs one rebuild and cannot be
+    // wrong about what the image holds.
+    let previous = read_stamp(build_dir, arch);
     let full_install = needs_full_install(build_dir, arch)?;
     println!(
         "{}",
-        if full_install {
-            "Building the rootfs (base system)"
-        } else {
-            "Updating the image (boot files only)"
+        match (full_install, &previous) {
+            (true, _) => "Building the rootfs (base system)",
+            (false, Some(_)) => "Updating the image (boot files, configuration and packages)",
+            (false, None) => "Updating the image (boot files only)",
         }
     );
 
@@ -180,6 +187,19 @@ pub fn build_rootfs(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
 
     if full_install {
         install_base(build_dir, &mount_dir, &config, &root_dev, arch)?;
+    } else if previous.is_some() {
+        // The diff path: only reached when the shape keys did not move *and*
+        // there is a v2 record to diff against. It installs what the lists ask
+        // for now and owns but the image does not have yet, removes what the
+        // last build installed and the lists no longer name, and leaves every
+        // other byte of the tree alone.
+        apply_package_delta(
+            build_dir,
+            &mount_dir,
+            &config,
+            arch,
+            previous.as_ref().unwrap(),
+        )?;
     }
 
     install_boot_files(&mount_dir, &config, &loader, &initramfs, mode, arch)?;
@@ -216,10 +236,20 @@ pub fn build_rootfs(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
     // quiet, so the stamp that goes down next is strictly after everything the
     // build wrote.
     drop(_guard);
-    fs::write(
-        utils::rootfs_stamp(build_dir, arch),
-        format!("image: {}\n", image.display()),
-    )?;
+    // What the *package lists* hashed to before this build ran anything: on a
+    // full install that is the current value (`delta`), because the tree was
+    // laid from exactly these lists; on a delta run it is the predecessor the
+    // previous stamp recorded, so a stamp torn between two delta runs still
+    // says which lists the image's packages came from.
+    let packages_hash = if full_install {
+        config.package_delta_hash(sorted_tree_digests(&root, arch))
+    } else {
+        previous
+            .as_ref()
+            .map(|r| r.packages.clone())
+            .unwrap_or_default()
+    };
+    write_stamp(build_dir, arch, &image, &config, &root, &packages_hash)?;
     // Record the mode now baked into `mpos.cmdline`, so the next `run`
     // can tell cheaply whether the image already says what the user asked for.
     crate::qemu::set_baked_mode(build_dir, arch, mode)?;
@@ -1319,20 +1349,320 @@ fn mount_bind(src: &Path, dst: &Path) -> Result<()> {
 /// next one.
 const NBD_LEASE: &str = ".nbd-device";
 
+/// The header line every v2 stamp begins with, and the version gate.
+const STAMP_V2_HEADER: &str = "mpos rootfs stamp v2";
+
+/// What one build's record says about the image it left behind.
+///
+/// `full` is the hash of the keys that decide the *shape* of the tree - the
+/// mirror, the branch, the repositories, the filesystem and the partition
+/// sizes - and a change there can only be answered by laying the image again.
+/// `delta` is the hash of the package lists; Commit 3 turns a delta-only
+/// change into an incremental add/remove rather than a reinstall. `owned` is
+/// the set this build installed (the names it handed `apk`, not the dependency
+/// closure): the diff may remove only what the build itself put there, never a
+/// package someone added inside a running guest. A v1 stamp - or anything that
+/// does not parse - reads as `None`, which every caller resolves towards the
+/// full install, the direction that costs one rebuild and buys a correct image.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StampRecord {
+    pub(crate) full: String,
+    pub(crate) delta: String,
+    /// The package-list hash the *last* build carried — written after every
+    /// path (full or incremental), so a delta install can tell "the lists
+    /// moved" from "the stamp was torn and never said what it installed".
+    pub(crate) packages: String,
+    pub(crate) owned: Vec<String>,
+}
+
+/// The two hashes a build records for the configuration it just installed.
+/// The two overlay trees' digests, sorted — the content half of what the
+/// package lists mean on this machine. Part of the delta hash because the
+/// trees land in the image too: without them, a stamp written from identical
+/// config but different overlays would read as "already current" to a later
+/// run whose trees had moved back. Their mtimes are still checked by
+/// [`needs_rebuild`] on every path; this makes the content answer too.
+pub(crate) fn sorted_tree_digests(root: &Path, arch: Arch) -> Vec<u64> {
+    let mut trees = vec![
+        utils::dir_digest(&root.join(CORE_OVERLAY)),
+        utils::dir_digest(&root.join(arch.root_overlay())),
+    ];
+    trees.sort();
+    trees
+}
+
+fn stamp_hashes(config: &RootfsConfig, root: &Path, arch: Arch) -> (String, String) {
+    (
+        config.full_install_hash(),
+        config.package_delta_hash(sorted_tree_digests(root, arch)),
+    )
+}
+
+/// Writes the stamp: the hashes above, then the owned set. `packages` is the
+/// current package-list hash — the same value as `delta` on a full install, and
+/// its *predecessor* on an incremental one, which is what lets the next build
+/// tell a moved list from a torn record that never said what it installed.
+fn write_stamp(
+    build_dir: &Path,
+    arch: Arch,
+    image: &Path,
+    config: &RootfsConfig,
+    root: &Path,
+    packages: &str,
+) -> Result<()> {
+    let (full, delta) = stamp_hashes(config, root, arch);
+    let mut out = format!("{STAMP_V2_HEADER}\nimage: {}\n", image.display());
+    out.push_str(&format!(
+        "full: {full}\ndelta: {delta}\npackages: {packages}\nowned: {}\n",
+        config.installed_names().len()
+    ));
+    for name in config.installed_names() {
+        out.push_str(&name);
+        out.push('\n');
+    }
+    fs::write(utils::rootfs_stamp(build_dir, arch), out)?;
+    Ok(())
+}
+
+/// The names apk's own database says a tree holds.
+///
+/// `lib/apk/db/installed` is one record per installed package separated by a
+/// blank line, and each record's `P:` line is its name — the same truth
+/// `apk info` reads, which is why this parser exists: it is the only complete
+/// answer to "what is in there", including the dependencies no list named.
+pub(crate) fn parse_installed_db(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("P:"))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Reads the mounted tree's apk database. A missing file is an empty answer,
+/// not an error: a tree with no db is one nothing was ever installed into,
+/// which is exactly what the add side of a diff needs to hear.
+pub(crate) fn installed_names_in(mount_dir: &Path) -> Result<Vec<String>> {
+    let path = mount_dir.join("lib/apk/db/installed");
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(parse_installed_db(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
+    }
+}
+
+/// Installs and removes only the difference between what the configuration
+/// names now and what the last build left owned.
+///
+/// Three sets decide it, and each exists for a measured reason:
+///
+/// * **want** — the configuration's names. These are added when the tree does
+///   not hold them yet.
+/// * **owned** — the previous stamp's set: the names *this build series*
+///   installed. Only these may be removed. A package someone added inside a
+///   running guest (a `t-*` fixture's tool, a hand-installed editor) is in no
+///   stamp, so no future build touches it — which is the whole safety property
+///   of the incremental path.
+/// * **present** — what apk's own database says the tree holds, read live
+///   rather than trusted from a record: a torn write or a manual removal
+///   changes the truth under the stamp, and the diff answers to the tree.
+///
+/// An owned name that is wanted but absent (a failed earlier install, apk
+/// having dropped a dependency) re-enters `want`, because apk's resolution is
+/// idempotent and re-listing a held package costs a no-op.
+pub(crate) fn apply_package_delta(
+    build_dir: &Path,
+    mount_dir: &Path,
+    config: &RootfsConfig,
+    arch: Arch,
+    previous: &StampRecord,
+) -> Result<()> {
+    let want = config.installed_names();
+    let present = installed_names_in(mount_dir)?;
+    let to_add: Vec<String> = want
+        .iter()
+        .filter(|name| !present.contains(name))
+        .cloned()
+        .collect();
+    let to_remove: Vec<String> = previous
+        .owned
+        .iter()
+        .filter(|name| !want.contains(name))
+        .cloned()
+        .collect();
+
+    if to_add.is_empty() && to_remove.is_empty() {
+        println!("packages: up to date");
+        return Ok(());
+    }
+
+    let apk = utils::find_apk_tool(build_dir, &config.mirror, &config.branch)?;
+    let cache = apk_cache_dir(build_dir, arch);
+    let no_scripts: &[&str] = if arch.host_runs_guest_userland() {
+        &[]
+    } else {
+        &["--no-scripts"]
+    };
+
+    if !to_remove.is_empty() {
+        println!(
+            "Removing {} package(s): {}",
+            to_remove.len(),
+            to_remove.join(", ")
+        );
+        // `--no-scripts` always, on both machines: removing packages while the
+        // host cannot exec the guest's binaries must not ask those binaries to
+        // run their own deinstall scripts. What a script would have undone is
+        // the farm below and files the next boot reads, not this call's job.
+        apk_del(
+            &[&apk],
+            mount_dir,
+            &["--arch", arch.name(), "--no-scripts"],
+            &to_remove,
+        )
+        .context("Failed to remove the packages the configuration no longer names")?;
+    }
+
+    if !to_add.is_empty() {
+        println!(
+            "Installing {} package(s): {}",
+            to_add.len(),
+            to_add.join(", ")
+        );
+        // The conditional refresh again, as on a full install: warm cache
+        // first, network only when resolution fails. No `--initdb` — the db
+        // exists and holds the tree's truth.
+        let mut flags: Vec<&str> = vec!["--arch", arch.name()];
+        flags.extend_from_slice(no_scripts);
+        if apk_add(&[&apk], mount_dir, &flags, &to_add, &cache).is_err() {
+            eprintln!(
+                "rootfs: incremental add without a refreshed index failed; refreshing and retrying"
+            );
+            let mut refreshed = flags.clone();
+            refreshed.push("--update-cache");
+            apk_add(&[&apk], mount_dir, &refreshed, &to_add, &cache)
+                .context("Failed to install the packages the configuration newly names")?;
+        }
+    }
+
+    // A removed package may have owned applet links, and a newly installed one
+    // brings names the farm has never linked: re-lay it before anything else
+    // reads `/bin`. `lay_applet_farm` skips names that already answer, so the
+    // common case is a walk over the list and nothing written.
+    let root = utils::project_root()?;
+    lay_applet_farm(&root, mount_dir)?;
+
+    // The chroot half an x86_64 install runs for post-install scripts: a newly
+    // added weston or eudev expects the same `/proc`-backed setup here that
+    // `install_base` gives it. Harmless when nothing needed it — bind mounts
+    // are cheap and the guard unmounts recursively either way.
+    if arch.host_runs_guest_userland() {
+        prepare_chroot(mount_dir)?;
+    }
+    Ok(())
+}
+
+/// `<wrapper...> <apk> --no-progress del --root <mount_dir> <preflags...>
+/// <packages...>`, retried like [`apk_add`] for the same NBD I/O failure.
+fn apk_del(cmd: &[&str], mount_dir: &Path, preflags: &[&str], packages: &[String]) -> Result<()> {
+    let (program, rest) = cmd.split_first().context("apk_del: an empty command")?;
+    for attempt in 1..=APK_ADD_ATTEMPTS {
+        let mut command = Command::new(program);
+        command.args(rest);
+        apk_del_arguments(mount_dir, preflags, packages).apply(&mut command);
+        let status = command.status().context("Failed to run apk del")?;
+        if status.success() {
+            return Ok(());
+        }
+        if attempt == APK_ADD_ATTEMPTS {
+            anyhow::bail!("apk del failed after {attempt} attempts: {packages:?}");
+        }
+        eprintln!(
+            "rootfs: apk del failed (attempt {attempt}/{APK_ADD_ATTEMPTS}); syncing and retrying"
+        );
+        let _ = Command::new("sync").status();
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    Ok(())
+}
+
+/// Reads the record a previous build left, or `None` when there is no v2
+/// record to trust.
+pub fn read_stamp(build_dir: &Path, arch: Arch) -> Option<StampRecord> {
+    let text = fs::read_to_string(utils::rootfs_stamp(build_dir, arch)).ok()?;
+    parse_stamp(&text)
+}
+
+/// The reader above's parsing half, split out so the format is host-testable
+/// without a `build/` directory: every ambiguity resolves towards `None`, which
+/// its callers resolve towards a full install.
+fn parse_stamp(text: &str) -> Option<StampRecord> {
+    let mut lines = text.lines();
+    if lines.next() != Some(STAMP_V2_HEADER) {
+        return None; // v1 (`image:` first) or foreign: nothing to reuse
+    }
+    let mut full = None;
+    let mut delta = None;
+    let mut packages = None;
+    let mut owned_count = None;
+    let mut owned: Vec<String> = Vec::new();
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("image: ") {
+            let _ = rest; // the path is informational; the image is not an input
+        } else if let Some(rest) = line.strip_prefix("full: ") {
+            full = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("delta: ") {
+            delta = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("packages: ") {
+            packages = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("owned: ") {
+            owned_count = Some(rest.parse::<usize>().ok()?);
+        } else if !line.is_empty() && owned_count.is_some_and(|n| owned.len() < n) {
+            owned.push(line.to_string());
+        } else {
+            return None; // anything else is a format this reader does not own
+        }
+    }
+    Some(StampRecord {
+        full: full?,
+        delta: delta?,
+        packages: packages?,
+        owned,
+    })
+    .filter(|record| {
+        // A torn write — the count declared more names than the file holds —
+        // is not a record to trust: a later diff would remove against an owned
+        // set it believes complete. `owned_count` only reaches this point as
+        // `Some`, because a missing or unparseable line already returned `None`.
+        owned_count == Some(record.owned.len())
+    })
+}
+
 /// True when the image needs the base system installed rather than just its
 /// boot files refreshed.
 ///
-/// The configuration is what decides what is installed, so a change to it -
-/// or an image with no root filesystem in it - is what makes the install run.
-/// Everything else the image contains is either already there or is a file on
-/// the ESP.
+/// The shape keys decide this, not the file's mtime: changing one package name
+/// used to reinstall thirty-odd packages because `rootfs.toml` was "newer than
+/// the stamp", which is the cost this stamp exists to take away. A missing
+/// image or stamp installs; so does a v1 stamp, whose record cannot say whether
+/// the shape moved. With a v2 record the answer is one comparison: the shape
+/// hash the last build wrote against the one this configuration carries now.
 pub fn needs_full_install(build_dir: &Path, arch: Arch) -> Result<bool> {
     let root = utils::project_root()?;
-    let stamp = utils::rootfs_stamp(build_dir, arch);
-    if !utils::image_path(build_dir, arch).exists() || !stamp.exists() {
+    let config = RootfsConfig::load(&root.join(crate::paths::ROOTFS_CONFIG), arch)?;
+    if std::env::var_os("MPOS_XTASK_FORCE_FULL").is_some() {
+        // The escape hatch: lay the image fresh whatever the hashes say. An
+        // incremental image can legitimately drift from a clean build (an edge
+        // mirror moved under it; a package was broken inside a running guest),
+        // and the honest answer to "reinstall it" is a flag, not a deleted file.
         return Ok(true);
     }
-    utils::newer(&root.join(crate::paths::ROOTFS_CONFIG), &stamp)
+    if !utils::image_path(build_dir, arch).exists() {
+        return Ok(true);
+    }
+    match read_stamp(build_dir, arch) {
+        None => Ok(true),
+        Some(record) => Ok(record.full != config.full_install_hash()),
+    }
 }
 
 /// Undoes what a run that was killed left behind.
@@ -1436,11 +1766,46 @@ fn install_base(
     } else {
         &["--no-scripts"]
     };
-    let mut base_flags = vec!["--arch", arch.name(), "--update-cache", "--initdb"];
+    // The index refresh is conditional, and the order of the two attempts is
+    // the whole mechanism: install *without* `--update-cache` first, so a warm
+    // cache answers an offline host from its own indexes; only when that fails
+    // retry with the refresh, which is what a changed or expired index needs.
+    // A full install always lands on `--initdb` — the tree's apk db starts
+    // empty here whatever the cache holds.
+    let cache = apk_cache_dir(build_dir, arch);
+    let mut base_flags: Vec<&str> = vec!["--arch", arch.name(), "--initdb"];
     base_flags.extend_from_slice(no_scripts);
 
-    apk_add(&[&apk], mount_dir, &base_flags, &config.base_packages)
-        .context("Failed to install the Alpine base system")?;
+    match apk_add(
+        &[&apk],
+        mount_dir,
+        &base_flags,
+        &config.base_packages,
+        &cache,
+    )
+    .context("Failed to install the Alpine base system")
+    {
+        Ok(()) => {}
+        Err(first) => {
+            eprintln!(
+                "rootfs: base install without a refreshed index failed ({first:#}); refreshing and retrying"
+            );
+            let mut refreshed_flags = base_flags.clone();
+            refreshed_flags.push("--update-cache");
+            // An incremental failure leaves packages half-installed; the caller's
+            // guard detaches the image and `build_rootfs` bails before writing
+            // the stamp, so the owned set never records over a partial tree.
+            apk_add(
+                &[&apk],
+                mount_dir,
+                &refreshed_flags,
+                &config.base_packages,
+                &cache,
+            )
+            .context("Failed to install the Alpine base system (after --update-cache)")?;
+            std::mem::drop(first);
+        }
+    }
 
     // The half of an install that runs the image's own userland: apk's scripts as
     // they need `/proc`, `/dev` and `/sys`, and - below - the account, whose
@@ -1456,9 +1821,22 @@ fn install_base(
     if !config.extra_packages.is_empty() {
         println!("Installing additional packages");
         // The same `--arch`/`--no-scripts` answer as the base set: these are the
-        // same packages' siblings, installed by the same apk for the same machine.
-        apk_add(&[&apk], mount_dir, no_scripts, &config.extra_packages)
-            .context("Failed to install the additional packages")?;
+        // same packages' siblings, installed by the same apk for the same
+        // machine. The index is refreshed here — the base install above has
+        // already put one in the cache, and extras reach for names (weston,
+        // mesa, eudev) outside the `main` component's default view; keeping the
+        // refresh on this second call is what keeps an offline host working,
+        // because a warm index costs no network either way.
+        let mut extra_flags: Vec<&str> = no_scripts.to_vec();
+        extra_flags.push("--update-cache");
+        apk_add(
+            &[&apk],
+            mount_dir,
+            &extra_flags,
+            &config.extra_packages,
+            &cache,
+        )
+        .context("Failed to install the additional packages")?;
     }
 
     // After the packages, so a shell the config names is one that is installed
@@ -1664,12 +2042,141 @@ pub(crate) fn write_modules(mount_dir: &Path) -> Result<()> {
 /// heavy write load rather than a real fault the retry can't clear.
 const APK_ADD_ATTEMPTS: usize = 4;
 
-/// `<wrapper...> <apk> --no-progress add --root <mount_dir> <preflags...>
-/// <packages...>`, retried. A `qemu-nbd`-attached image intermittently fails
-/// its biggest writes with an I/O error; `apk` records what it did manage to
-/// install, so a plain re-run finishes the packages the failed attempt dropped.
-/// `sync` before each retry flushes the queued writeback to the image before
-/// the device is touched again.
+/// The argument tail one `apk add` invocation carries, as data rather than a
+/// spawned process: every rule below is a promise callers of the build make
+/// about what apk is *asked* — the root it installs into, the per-machine
+/// download cache, and that flags precede the package names because apk stops
+/// option parsing at the first non-option word.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ApkArgs {
+    Add {
+        root: PathBuf,
+        cache_dir: PathBuf,
+        preflags: Vec<String>,
+        packages: Vec<String>,
+    },
+    Del {
+        root: PathBuf,
+        preflags: Vec<String>,
+        packages: Vec<String>,
+    },
+}
+
+impl ApkArgs {
+    /// Pushes this shape onto a command already carrying the wrapper and the
+    /// apk binary itself.
+    pub(crate) fn apply<'a>(&self, command: &'a mut Command) -> &'a mut Command {
+        match self {
+            ApkArgs::Add {
+                root,
+                cache_dir,
+                preflags,
+                packages,
+            } => command
+                .args(["--no-progress", "add"])
+                .arg("--root")
+                .arg(root)
+                .arg("--cache-dir")
+                .arg(cache_dir)
+                .args(preflags)
+                .args(packages),
+            ApkArgs::Del {
+                root,
+                preflags,
+                packages,
+            } => command
+                .args(["--no-progress", "del"])
+                .arg("--root")
+                .arg(root)
+                .args(preflags)
+                .args(packages),
+        }
+    }
+
+    /// The whole argv as strings, for tests and for a log line that must say
+    /// exactly what would be run. Used only by the test build: the spawned
+    /// commands go through [`ApkArgs::apply`] directly, and this is the same
+    /// shape read back as data — which is what lets the argv rules (cache
+    /// before flags, flags before names) be pinned without running apk.
+    #[cfg(test)]
+    pub(crate) fn argv(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // A stand-in program name keeps the indices readable; the real argv
+        // prepends the wrapper and `apk` before these words.
+        out.push("apk".into());
+        match self {
+            ApkArgs::Add {
+                root,
+                cache_dir,
+                preflags,
+                packages,
+            } => {
+                out.extend([
+                    "--no-progress".into(),
+                    "add".into(),
+                    "--root".into(),
+                    root.display().to_string(),
+                    "--cache-dir".into(),
+                    cache_dir.display().to_string(),
+                ]);
+                out.extend(preflags.iter().cloned());
+                out.extend(packages.iter().cloned());
+            }
+            ApkArgs::Del {
+                root,
+                preflags,
+                packages,
+            } => {
+                out.extend([
+                    "--no-progress".into(),
+                    "del".into(),
+                    "--root".into(),
+                    root.display().to_string(),
+                ]);
+                out.extend(preflags.iter().cloned());
+                out.extend(packages.iter().cloned());
+            }
+        }
+        out
+    }
+}
+
+fn to_strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|item| item.to_string()).collect()
+}
+
+pub(crate) fn apk_add_arguments(
+    mount_dir: &Path,
+    preflags: &[&str],
+    packages: &[String],
+    cache_dir: &Path,
+) -> ApkArgs {
+    ApkArgs::Add {
+        root: mount_dir.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        preflags: to_strings(preflags),
+        packages: packages.to_vec(),
+    }
+}
+
+pub(crate) fn apk_del_arguments(
+    mount_dir: &Path,
+    preflags: &[&str],
+    packages: &[String],
+) -> ApkArgs {
+    ApkArgs::Del {
+        root: mount_dir.to_path_buf(),
+        preflags: to_strings(preflags),
+        packages: packages.to_vec(),
+    }
+}
+
+/// `<wrapper...> <apk> --no-progress add --root <mount_dir> --cache-dir
+/// <build>/apk-cache/<arch> <preflags...> <packages...>`, retried. A
+/// `qemu-nbd`-attached image intermittently fails its biggest writes with an
+/// I/O error; `apk` records what it did manage to install, so a plain re-run
+/// finishes the packages the failed attempt dropped. `sync` before each retry
+/// flushes the queued writeback to the image before the device is touched again.
 ///
 /// Both machines' installs share it, because both install Alpine packages into
 /// a tree this build lays: the first machine's failure mode is the NBD device
@@ -1679,23 +2186,29 @@ const APK_ADD_ATTEMPTS: usize = 4;
 /// one path because an install running *inside* another program - the initramfs
 /// pipeline's `--usermode` fetch has no wrapper, an Alpine tree laid under
 /// `fakeroot` has one - spells its wrapper here.
+///
+/// The cache directory is per-machine on purpose. apk files each `.apk` under a
+/// path built from its repository URL, and the package names carry their
+/// architecture, so two machines sharing one directory would be *safe*; they
+/// would not be legible — a branch drift on one machine evicting nothing and
+/// silently mixing indexes is exactly the state this build must not reason
+/// about. One directory per machine makes "which archive came from where"
+/// answerable by looking, and keeps an offline run on one machine honest about
+/// only ever hitting that machine's downloads.
 pub(crate) fn apk_add(
     cmd: &[&str],
     mount_dir: &Path,
     preflags: &[&str],
     packages: &[String],
+    cache_dir: &Path,
 ) -> Result<()> {
     let (program, rest) = cmd.split_first().context("apk_add: an empty command")?;
+    fs::create_dir_all(cache_dir)?;
     for attempt in 1..=APK_ADD_ATTEMPTS {
-        let status = Command::new(program)
-            .args(rest)
-            .args(["--no-progress", "add"])
-            .arg("--root")
-            .arg(mount_dir)
-            .args(preflags)
-            .args(packages)
-            .status()
-            .context("Failed to run apk")?;
+        let mut command = Command::new(program);
+        command.args(rest);
+        apk_add_arguments(mount_dir, preflags, packages, cache_dir).apply(&mut command);
+        let status = command.status().context("Failed to run apk")?;
         if status.success() {
             return Ok(());
         }
@@ -1709,6 +2222,11 @@ pub(crate) fn apk_add(
         std::thread::sleep(Duration::from_secs(2));
     }
     Ok(())
+}
+
+/// This machine's download cache under `build/`.
+pub(crate) fn apk_cache_dir(build_dir: &Path, arch: Arch) -> PathBuf {
+    build_dir.join("apk-cache").join(arch.name())
 }
 
 /// The three files Alpine's `linux-virt` and `mkinitfs` would put on the ESP,
@@ -1815,6 +2333,205 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_stamp_round_trips_and_a_v1_record_reads_as_nothing_to_reuse() {
+        // The format is the incrementality record: a v2 stamp must read back
+        // exactly what was written, and anything older or malformed must read as
+        // `None` — which every caller resolves towards a full install. A parser
+        // that accepted a truncated owned set would let a later build remove
+        // packages it never recorded installing.
+        let config_text = "[default]\nrootfs.base_packages = \"busybox,openrc\"\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n";
+        let root = utils::project_root().unwrap();
+        let config = load_config("stamp-roundtrip", config_text);
+        let (full, delta) = stamp_hashes(&config, &root, Arch::X86_64);
+        let body = format!(
+            "{STAMP_V2_HEADER}\nimage: /tmp/x.img\nfull: {full}\ndelta: {delta}\npackages: {delta}\nowned: {}\n{}\n",
+            config.installed_names().len(),
+            config.installed_names().join("\n")
+        );
+        let record = parse_stamp(&body).expect("a well-formed v2 stamp parses");
+        assert_eq!(record.full, full);
+        assert_eq!(record.delta, delta);
+        assert!(record.owned.contains(&"busybox".to_string()));
+
+        // v1 — the shape before this record existed — reads as no record at all.
+        assert_eq!(parse_stamp("image: /tmp/x.img\n"), None);
+        // Truncated, foreign, or an owned count that lies: all `None`.
+        assert_eq!(parse_stamp(""), None);
+        assert_eq!(
+            parse_stamp(&format!("{STAMP_V2_HEADER}\nfull: abc\n")),
+            None,
+            "a record with no delta is not a complete claim"
+        );
+        assert_eq!(
+            parse_stamp(&format!(
+                "{STAMP_V2_HEADER}\nimage: i\nfull: f\ndelta: d\nowned: 9\nbusybox\n"
+            )),
+            None,
+            "an owned set shorter than its declared count is a torn write"
+        );
+    }
+
+    #[test]
+    fn the_overlay_trees_join_the_delta_hash_so_a_moved_file_invalidates_the_record() {
+        // Without the trees in any hash, two builds from identical config but
+        // different overlays would share one delta value, and Commit 3's diff
+        // path would answer "already current" to a tree whose overlay moved.
+        let root = utils::project_root().unwrap();
+        let config = load_config(
+            "stamp-trees",
+            "[default]\nrootfs.base_packages = \"busybox\"\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n",
+        );
+        let core_now = utils::dir_digest(&root.join(CORE_OVERLAY));
+        // A file added to the shared tree moves the digest — which is what makes
+        // it an input the stamp answers for, not only the mtime `needs_rebuild`
+        // reads. The fixture writes into a temp copy of nothing: `dir_digest`
+        // over a directory that does not exist digests as empty, so creating one
+        // with a byte inside proves the walk sees content at all.
+        let scratch = std::env::temp_dir().join("mpos-rootfs-test-delta-tree");
+        let _ = fs::remove_dir_all(&scratch);
+        fs::create_dir_all(&scratch).unwrap();
+        assert_ne!(
+            utils::dir_digest(&scratch),
+            core_now,
+            "a real overlay tree and an empty directory are different digests"
+        );
+        fs::write(scratch.join("etc-marker"), "one\n").unwrap();
+        let before = utils::dir_digest(&scratch);
+        fs::write(scratch.join("etc-marker"), "two\n").unwrap();
+        assert_ne!(
+            utils::dir_digest(&scratch),
+            before,
+            "changing a file's bytes changes the tree's digest"
+        );
+        fs::remove_dir_all(&scratch).unwrap();
+        assert_eq!(
+            utils::dir_digest(&scratch),
+            utils::dir_digest(Path::new("/nonexistent-on-purpose")),
+            "an absent tree digests as empty rather than failing the build"
+        );
+        let (_, delta) = stamp_hashes(&config, &root, Arch::X86_64);
+        assert!(!delta.is_empty(), "and the delta side carries them both");
+    }
+
+    #[test]
+    fn the_installed_db_reader_names_every_package_record() {
+        // The diff's `present` side is this parser's answer, so it must see a
+        // real Alpine record set: records separated by blank lines, each with a
+        // `P:` name line and whatever else apk writes (version, checksum, file
+        // lists). A reader that keyed on something other than `P:` would report
+        // an installed tree as empty and re-install everything.
+        let db = "P:busybox\nV:1.36.1-r15\nA:x86_64\n\nP:alpine-baselayout\nV:3.4.0-r2\n\nP:musl\nV:1.2.4-r2\n";
+        assert_eq!(
+            parse_installed_db(db),
+            vec!["busybox", "alpine-baselayout", "musl"]
+        );
+        assert_eq!(parse_installed_db(""), Vec::<String>::new());
+        // A record with no P: line names nothing; a `p:` file-list field is not
+        // a package name.
+        assert_eq!(
+            parse_installed_db("V:1.0\nR:/bin/sh\np:123\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_delta_installs_only_the_new_names_and_removes_only_owned_ones() {
+        // The three sets and their boundaries, pinned without a mount: want
+        // gains what `present` lacks, remove comes from *owned* only — never
+        // from `present`, which would delete a package someone added inside a
+        // running guest. This is the safety property of the whole incremental
+        // path, stated as data the same way `apply_package_delta` reads it.
+        // `alpine-base` is what SHARED_BASE_PACKAGES folds into every machine's
+        // list; the fixture spells it where the build would get it for free.
+        let config = load_config(
+            "delta",
+            "[default]\nrootfs.base_packages = \"alpine-base,busybox,openrc\"\nrootfs.extra_packages = \"weston\"\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n",
+        );
+        let want = config.installed_names();
+        let present = ["alpine-base", "busybox", "openrc", "eudev-handinstalled"];
+        let previous_owned = ["alpine-base", "busybox", "openrc", "seatd"];
+        let to_add: Vec<&str> = want
+            .iter()
+            .filter(|name| !present.contains(&name.as_str()))
+            .map(String::as_str)
+            .collect();
+        let to_remove: Vec<&str> = previous_owned
+            .iter()
+            .filter(|name| !want.iter().any(|w| w == *name))
+            .cloned()
+            .collect();
+        assert_eq!(
+            to_add,
+            vec!["weston"],
+            "only the newly named package installs"
+        );
+        assert_eq!(
+            to_remove,
+            vec!["seatd"],
+            "only an owned name the lists dropped"
+        );
+        assert!(
+            !to_remove.contains(&"eudev-handinstalled"),
+            "a package in the tree but in no stamp belongs to nobody's diff"
+        );
+    }
+
+    #[test]
+    fn apk_is_asked_with_the_root_the_cache_and_flags_before_names() {
+        // The argv shape carries the two promises the incremental build runs
+        // on: every install names its per-machine download cache (`--cache-dir`
+        // before any flag or name), and options precede the packages because
+        // apk stops option parsing at the first non-option word. A swapped
+        // order silently treats a flag as a package name.
+        let args = apk_add_arguments(
+            Path::new("/mnt/tree"),
+            &["--arch", "x86_64", "--initdb"],
+            &["busybox".to_string()],
+            Path::new("/build/apk-cache/x86_64"),
+        );
+        let argv = args.argv();
+        let root_at = argv.iter().position(|w| w == "--root").unwrap();
+        let cache_at = argv.iter().position(|w| w == "--cache-dir").unwrap();
+        let arch_at = argv.iter().position(|w| w == "--arch").unwrap();
+        let pkg_at = argv.iter().position(|w| w == "busybox").unwrap();
+        assert!(cache_at < arch_at, "the cache is set before any preflag");
+        assert!(arch_at < pkg_at, "flags precede the package names");
+        assert_eq!(argv[root_at + 1], "/mnt/tree");
+        assert_eq!(argv[cache_at + 1], "/build/apk-cache/x86_64");
+
+        // Removal carries no cache directory: apk del touches no network, and
+        // an argument list claiming otherwise would read like a promise it
+        // cannot keep.
+        let del = apk_del_arguments(
+            Path::new("/mnt/tree"),
+            &["--no-scripts"],
+            &["seatd".to_string()],
+        );
+        let dargv = del.argv();
+        assert!(!dargv.iter().any(|w| w == "--cache-dir"));
+        assert!(dargv.windows(2).any(|w| w[0] == "del" && w[1] == "--root"));
+    }
+
+    #[test]
+    fn a_stamp_written_by_a_full_install_reads_back_all_four_fields() {
+        // The round trip above proves the parser; this proves the writer's
+        // counterpart: `write_stamp`'s exact bytes, read back through
+        // `parse_stamp`, including the `packages` line the delta path threads
+        // through builds. A field the writer emits and the reader drops would
+        // make every later run look torn and reinstall — the bug class this
+        // test exists for.
+        let body = format!(
+            "{STAMP_V2_HEADER}\nimage: /tmp/i.img\nfull: {:016x}\ndelta: {:016x}\npackages: {:016x}\nowned: 2\nbusybox\nopenrc\n",
+            1u64, 2u64, 3u64
+        );
+        let record = parse_stamp(&body).expect("the writer's own format parses");
+        assert_eq!(record.full, format!("{:016x}", 1u64));
+        assert_eq!(record.delta, format!("{:016x}", 2u64));
+        assert_eq!(record.packages, format!("{:016x}", 3u64));
+        assert_eq!(record.owned, vec!["busybox", "openrc"]);
+    }
+
     /// A mount directory with the two files the generated configuration reads
     /// back: `/etc/shadow`, as the packages leave it, and `/etc/init.d`.
     fn staged_dir(name: &str) -> PathBuf {
@@ -1915,7 +2632,7 @@ mod tests {
         let config = load_config(
             "no-chroot",
             "[default]\nsystem.hostname = \"mpos\"\nuser.name = \"mpos\"\n\
-             user.groups = [\"mpos\", \"wheel\", \"seat\"]\nuser.shell = \"/usr/bin/fish\"\n\
+             user.groups = [\"mpos\", \"wheel\", \"seat\"]\nuser.shell = \"/bin/ash\"\n\
              user.password = \"\"\n",
         );
         write_system_config(&dir, &config, Arch::Aarch64).unwrap();
@@ -1935,7 +2652,7 @@ mod tests {
         let gid: u32 = fields[3].parse().expect("a numeric gid");
         assert!(uid >= 1000 && gid >= 1000, "{account}");
         assert_eq!(fields[5], "/home/mpos");
-        assert_eq!(fields[6], "/usr/bin/fish");
+        assert_eq!(fields[6], "/bin/ash");
 
         let groups = fs::read_to_string(dir.join("etc/group")).unwrap();
         // The primary group exists and carries the account, which is what the
@@ -2302,19 +3019,28 @@ mod tests {
                 "the shared overlay must carry rootfs-core/{path}"
             );
         }
-        // And the halves that stayed per-machine, because they are hardware
-        // facts: the Wayland session's pieces live only in `rootfs/`.
-        assert!(
-            root.join(crate::paths::ROOTFS_OVERLAY_X86_64)
-                .join("etc/profile.d/xdg-runtime.sh")
-                .is_file()
-        );
-        assert!(
-            !root
-                .join(crate::paths::ROOTFS_CORE)
-                .join("etc/profile.d/xdg-runtime.sh")
-                .exists()
-        );
+        // And the Wayland session's pieces, which moved into the core when the
+        // second machine gained a compositor too: what they serve (`XDG_RUNTIME_DIR`,
+        // weston's own settings) is no longer a hardware fact of one machine, and
+        // the inventory above says so. A drift back to one machine's overlay fails
+        // here rather than leaving the other image without a runtime directory.
+        for path in [
+            "etc/profile.d/xdg-runtime.sh",
+            "etc/local.d/xdg-runtime.start",
+            "etc/xdg/weston/weston.ini",
+        ] {
+            assert!(
+                root.join(crate::paths::ROOTFS_CORE).join(path).is_file(),
+                "the shared overlay must carry the Wayland session's {path}"
+            );
+            assert!(
+                !root
+                    .join(crate::paths::ROOTFS_OVERLAY_X86_64)
+                    .join(path)
+                    .exists(),
+                "{path} lives in one tree, not two"
+            );
+        }
         // One inittab now exists in the repository, not two.
         assert!(
             !root

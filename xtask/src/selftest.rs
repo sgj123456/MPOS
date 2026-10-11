@@ -75,12 +75,38 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
     }
     let plan = sweep::select(crate::config::Machine::X86_64, &config, &built, &selection)?;
 
-    // What is left is this arm's own: the throwaway initramfs, the QEMU wiring
-    // in `machine.toml`, and a verdict that can quote an exit status.
-    let tar = build_test_initramfs(build_dir, &plan.staged)?;
-    let (status, log) = boot_tests(build_dir, profile, &tar)?;
+    // `tests.toml`'s own rule, one question answered from the file rather than
+    // from a built-program list: would a *plain* sweep stage this name? Both
+    // §10.5 instruments must answer yes on both machines - they are exact
+    // counts, not timings, so they belong in the gate - and the answer is what
+    // the notes' group-membership claim rests on. The staged sets themselves
+    // are decided by `select`, which this check shares `runs` with (pinned in
+    // `sweep::tests`). Same `config` the selection above read.
+    for machine in [
+        crate::config::Machine::X86_64,
+        crate::config::Machine::Aarch64,
+    ] {
+        for instrument in ["t-ext4-mount", "t-diskbench", "t-netstats"] {
+            if !sweep::in_default(machine, &config, instrument) {
+                bail!(
+                    "{instrument} is not in {machine:?}'s default sweep; §10.5's \
+                     instrument only measures when its programs stage everywhere \
+                     (see tests.toml's comment above the slow group)"
+                );
+            }
+        }
+    }
 
-    report(&plan.staged, plan.built, &log, status)
+    // What is left is this arm's own: the throwaway initramfs, the QEMU wiring
+    // in `machine.toml`, and a verdict that can quote an exit status. The
+    // disk-counter word is decided here (§10.5): armed only when *this* run
+    // stages the program that reads it back - the same question the staging
+    // above asks of the same list, so the boot and its payload cannot disagree.
+    let tar = build_test_initramfs(build_dir, &plan.staged)?;
+    let diskstat = diskstat_for_staged(plan.staged.iter().map(|test| test.name.as_str()));
+    let (status, log) = boot_tests(build_dir, profile, &tar, diskstat)?;
+
+    report(&plan.staged, plan.built, &log, status, diskstat)
 }
 
 /// The structural check that belongs ahead of the compiler: a `#[cfg(test)]`
@@ -323,11 +349,33 @@ fn build_test_initramfs(build_dir: &Path, tests: &[&UserTest]) -> Result<PathBuf
     // owner/group the pack below always did. The runner
     // script still rides as its own member, written here rather than copied
     // from a staging tree.
+    // §10.5's ext4 fixture rides only when this run stages the programs that
+    // read it. It costs 80 MiB unpacked (the pattern file plus the filesystem's
+    // own geometry), which the x86_64 sweep's ramfs budget - a quarter of its
+    // 2 GiB (§10.4) - absorbs with room; a plain sweep pays it because both
+    // instruments are in the default list, and a selection that left them out
+    // (`--groups`, or a membership edit in tests.toml) leaves the tail alone.
+    // The member is named absolutely because that is how the boot's tar reader
+    // spells an absolute path; the disk arm's entry drops the slash for the
+    // same guest answer from its own channel shape.
+    let mut extra: Vec<(&str, PathBuf)> = Vec::new();
+    if tests
+        .iter()
+        .any(|test| test.name == "t-ext4-mount" || test.name == "t-diskbench")
+    {
+        let image = crate::disk::build_ext4_image(build_dir)?;
+        extra.push((DISKSTAT_FIXTURE_MEMBER, image));
+    }
+    let extra_refs: Vec<(&str, &Path)> = extra
+        .iter()
+        .map(|(name, path)| (*name, path.as_path()))
+        .collect();
     let tar = build_dir.join("test-initramfs.tar");
     append_test_members(
         &crate::initramfs::archive_path(build_dir, Arch::X86_64),
         &tar,
         tests,
+        &extra_refs,
     )?;
 
     let size = fs::metadata(&tar)?.len();
@@ -466,7 +514,14 @@ fn rename_root_init(bytes: &mut [u8]) -> bool {
 /// `src/vfs/tar.rs` stops at two consecutive all-zero blocks, so the appended
 /// members simply continue the walk. Two final zero blocks close the stream,
 /// which is also what a GNU `tar -tvf` answers when asked to list the result.
-fn append_test_members(base: &Path, out: &Path, tests: &[&UserTest]) -> Result<()> {
+/// `extra` rides after the programs as plain members — the ext4 fixture's path
+/// and bytes — so one archive carries everything the test boot reads.
+fn append_test_members(
+    base: &Path,
+    out: &Path,
+    tests: &[&UserTest],
+    extra: &[(&str, &Path)],
+) -> Result<()> {
     use std::io::{BufWriter, Write};
     let mut w = BufWriter::new(
         fs::File::create(out).with_context(|| format!("Failed to create {}", out.display()))?,
@@ -501,6 +556,14 @@ fn append_test_members(base: &Path, out: &Path, tests: &[&UserTest]) -> Result<(
         let bytes =
             fs::read(&test.binary).with_context(|| format!("Failed to stage {}", test.name))?;
         let header = ustar_header(&format!("./bin/{}", test.name), 0o755, bytes.len() as u64);
+        w.write_all(&header)?;
+        w.write_all(&bytes)?;
+        let pad = (512 - bytes.len() % 512) % 512;
+        w.write_all(&vec![0u8; pad])?;
+    }
+    for (name, path) in extra {
+        let bytes = fs::read(path).with_context(|| format!("Failed to stage {name}"))?;
+        let header = ustar_header(name, 0o644, bytes.len() as u64);
         w.write_all(&header)?;
         w.write_all(&bytes)?;
         let pad = (512 - bytes.len() % 512) % 512;
@@ -595,6 +658,61 @@ echo "=== END"
 /bin/busybox poweroff -f
 "#;
 
+/// The boot word that arms §10.5's disk-counter protocol, with its leading
+/// space: empty when the run does not stage the instrument. The kernel reads
+/// this exact word (`src/board/flow.rs`'s `DISKSTAT_WORD`), and the two files
+/// cannot share one definition - xtask is a host binary and the kernel is the
+/// thing booted - so [`tests::the_diskstat_word_matches_the_kernels_constant`]
+/// pins them against each other instead.
+const DISKSTAT_ON: &str = " mpos.diskstat";
+
+/// Where §10.5's ext4 fixture lands inside either machine's payload - the same
+/// path on both machines, which is what lets `t-ext4-mount` open one name here
+/// regardless of whose sweep it is in. The x86_64 ramfs unpack turns the member
+/// `/dev-sda-fs.img` into exactly this file (a leading slash is how its reader
+/// names an absolute path); the aarch64 medium stages the bytes under the same
+/// name because an ext4 tree is already rooted - the same guest answer from two
+/// channel shapes.
+///
+/// **At the root, and deliberately not under `/dev`**, which is where the first
+/// draft put it. Both boots mount a `devtmpfs` over `/dev` - the x86_64 runner's
+/// script does it (and the second machine's initramfs chain before it) - so a
+/// payload file unpacked into `/dev` is shadowed the moment that mount lands.
+/// Measured on the pair's first gate run: the harness staged the fixture and both
+/// programs reported it missing (`ENOENT`), because the bytes existed in the
+/// payload and in nobody's `/dev`. The root is not a mountpoint on either
+/// machine.
+const DISKSTAT_FIXTURE_MEMBER: &str = "/dev-sda-fs.img";
+
+/// The fixture's name as a *disk* entry: the member above without the absolute
+/// slash, spelled out rather than derived so
+/// [`tests::both_payload_channels_lay_the_fixture_at_one_path`] compares two
+/// literals instead of a value against itself. Both arms push through this one
+/// constant.
+const DISKSTAT_FIXTURE_ENTRY: &str = "dev-sda-fs.img";
+
+/// §10.5's disk-counter protocol: the boot word, armed when this run's staged
+/// set actually contains `t-diskbench`.
+///
+/// The arming is a *boot word* (`mpos.diskstat` on the kernel command line), and
+/// this is the only place that decides whether to put it there - asked of the
+/// *staged list itself*, which both arms have by the time they write a boot
+/// line, and which the fixture staging above reads the same question from. The
+/// pairing is what makes it honest: a boot armed while nothing reads the
+/// counters back is a machine whose `uname` answers a private shape for no
+/// reason. A name moved out of the default group in `tests.toml` leaves the
+/// staged set, un-arms the sweep with no other edit, and drops the 80 MiB
+/// fixture with it: the instrument leaves no half-state behind.
+///
+/// The `staged` iterator yields whatever shape the arm keeps its names in.
+fn diskstat_for_staged<'a>(mut staged: impl Iterator<Item = &'a str>) -> &'static str {
+    if staged.any(|name| name == "t-diskbench") {
+        DISKSTAT_ON
+    } else {
+        ""
+    }
+}
+
 /// Boots the test initramfs in QEMU and returns the exit status with the path
 /// of the captured serial log. The boot disk is QEMU's virtual FAT: the loader
 /// and the test initramfs are served out of a plain directory, so no image
@@ -606,7 +724,12 @@ echo "=== END"
 /// decides which kernel this boot runs is therefore the loader - the one
 /// `utils::build_test_kernel` built a moment ago, immediately after the
 /// self-test kernel it had just made.
-fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32>, String)> {
+fn boot_tests(
+    build_dir: &Path,
+    profile: &str,
+    tar: &Path,
+    diskstat: &str,
+) -> Result<(Option<i32>, String)> {
     println!("User tests: booting the test machine");
 
     let esp = build_dir.join("test-esp");
@@ -630,7 +753,10 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     // word nobody answers to. It is gone rather than left in as a marker, because
     // a marker the kernel ignores is exactly the shape that reads as a mechanism
     // and is not one.
-    fs::write(esp.join("mpos.cmdline"), "console=ttyS0\n")?;
+    fs::write(
+        esp.join("mpos.cmdline"),
+        format!("console=ttyS0{diskstat}\n"),
+    )?;
 
     // A SATA disk beside the ESP, so the test machine has *two* disks from two
     // drivers: the ESP reaches the guest through virtio-blk, and this one
@@ -642,7 +768,12 @@ fn boot_tests(build_dir: &Path, profile: &str, tar: &Path) -> Result<(Option<i32
     //
     // `disk`'s function and not a local one: both machines' wiring attaches this
     // disk now, so the file is one fixture with one name that either arm lays.
-    crate::disk::ensure_sata_image(build_dir)?;
+    // Laid *fresh* before every sweep: the suite writes to this disk (`t-ahci` a
+    // sector, §10.5's pair a whole filesystem), and the claims about the bytes
+    // around what was written are only claims if the state before them is known
+    // — on a file that outlives the run, "ensured" would mean "whatever the last
+    // run left" (`disk::reset_sata_image`).
+    crate::disk::reset_sata_image(build_dir)?;
 
     let (firmware, vars) = qemu::write_firmware_vars(build_dir, Arch::X86_64)?;
 
@@ -717,7 +848,13 @@ fn test_timeout_secs() -> u64 {
 /// crashed, hung or never ran. `built` is what the crate produced, so the line
 /// can say how much of it the configuration left out - a sweep that quietly
 /// runs less than it used to is the failure this number is here to catch.
-fn report(tests: &[&UserTest], built: usize, text: &str, status: Option<i32>) -> Result<()> {
+fn report(
+    tests: &[&UserTest],
+    built: usize,
+    text: &str,
+    status: Option<i32>,
+    diskstat: &str,
+) -> Result<()> {
     // The protocol is `sweep`'s - one parser for both runners - and what this
     // arm does with it is its own, because its claim is: every staged program
     // printed `=== PASS`, and the machine ended on the debug exit.
@@ -753,6 +890,9 @@ fn report(tests: &[&UserTest], built: usize, text: &str, status: Option<i32>) ->
     if skipped > 0 {
         println!("self-test guest: {skipped} of {built} user tests left out by tests.toml");
     }
+    report_diskstat(text, diskstat)?;
+    let names: Vec<&str> = tests.iter().map(|t| t.name.as_str()).collect();
+    report_netstat(text, &names)?;
     println!(
         "self-test guest: exit {} (33 is the clean debug exit)",
         status.unwrap_or(-1)
@@ -914,9 +1054,39 @@ pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()>
         &utils::project_root()?.join(crate::paths::ROOTFS_CONFIG),
         arch,
     )?;
+    // §10.5's fixture and the boot word it arms, both keyed on this run's
+    // staged set: the image rides the sweep medium as `dev/dev-sda-fs.img`,
+    // which lands at the *same* guest path the first machine's archive member
+    // unpacks to (`/dev/dev-sda-fs.img`), so one test program reads either
+    // machine — and `mpos.diskstat` goes on the line only when `t-diskbench` is
+    // in the set that will read the counters back.
+    let diskstat = diskstat_for_staged(plan.staged.iter().map(|(name, _)| name.as_str()));
+    // The fixture rides only when the programs that read it are staged: a
+    // sweep without them does not pay 80 MiB of root partition for an image
+    // nothing opens. With them, the medium grows to carry it - `mkfs.ext4`
+    // answers "no blocks" rather than a warning when the tree overflows the
+    // size, and a sweep that dies in the builder reads as a build failure.
+    let mut disk_bytes = SWEEP_DISK_BYTES;
+    let mut fixture: Option<Vec<u8>> = None;
+    if plan
+        .staged
+        .iter()
+        .any(|(name, _)| name == "t-ext4-mount" || name == "t-diskbench")
+    {
+        let image = crate::disk::build_ext4_image(build_dir)?;
+        let bytes = fs::read(&image)
+            .with_context(|| format!("Failed to read the ext4 fixture {}", image.display()))?;
+        disk_bytes += bytes.len() as u64 + 16 * 1024 * 1024;
+        fixture = Some(bytes);
+    }
+    if let Some(bytes) = &fixture {
+        // The same path as the archive member, without the leading slash: a
+        // disk entry is named from the root already.
+        entries.push((DISKSTAT_FIXTURE_ENTRY, bytes.as_slice()));
+    }
     let cmdline = format!(
-        "console={} mpos.selftest root={} rootfstype={}\n",
-        rootfs.serial_port, rootfs.root_device, rootfs.filesystem
+        "console={} mpos.selftest root={} rootfstype={}{}\n",
+        rootfs.serial_port, rootfs.root_device, rootfs.filesystem, diskstat
     );
     let disk = crate::disk::sweep_medium(
         build_dir,
@@ -925,7 +1095,7 @@ pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()>
             kernel: &kernel,
             loader: &loader,
             entries: &entries,
-            disk_bytes: SWEEP_DISK_BYTES,
+            disk_bytes,
             cmdline: &cmdline,
         },
     )?;
@@ -943,7 +1113,7 @@ pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()>
     )?;
     print!("{log}");
     let staged: Vec<&str> = tests.iter().map(|(name, _)| name.as_str()).collect();
-    report_disk_sweep(build_dir, arch, &staged, plan.skipped.len(), &log)
+    report_disk_sweep(build_dir, arch, &staged, plan.skipped.len(), &log, diskstat)
 }
 
 /// The names in `machine`'s own `tests.toml` groups that `built` does not carry.
@@ -1043,6 +1213,57 @@ impl sweep::TestProgram for (String, Vec<u8>) {
     }
 }
 
+/// §10.5's instrument line, printed by both sweep arms when the boot was armed.
+///
+/// An armed run that leaves no reading behind is refused - the same rule the
+/// kernel's own suites are held to ("a suite that silently never ran leaves its
+/// cases out of the count"): an instrument whose numbers vanished would make a
+/// green sweep read as a measured one. An un-armed run prints nothing and fails
+/// nothing; the numbers themselves are the payload's, not a verdict.
+fn report_diskstat(log: &str, diskstat: &str) -> Result<()> {
+    if diskstat.is_empty() {
+        return Ok(());
+    }
+    let readings = sweep::diskstat_readings(log);
+    if readings.is_empty() {
+        bail!(
+            "the sweep booted armed for the disk-counter protocol but \
+             `t-diskbench` left no DISKSTAT line in the log: the instrument \
+             did not run"
+        );
+    }
+    println!("self-test (diskstat): device reads counted through the ext4 mount");
+    for (disk, cold, warm) in readings {
+        println!("  {disk}: cold={cold} warm={warm}");
+    }
+    Ok(())
+}
+
+/// §10.4's instrument line, printed by both sweep arms when the run staged it.
+///
+/// Unlike the disk-counter reading, this door needs no arming - `/proc/net/dev`
+/// answers on every boot - so the claim here is only about *visibility*: a run
+/// that staged `t-netstats` and left no `NETSTAT` line behind refused itself in
+/// the program's own verdict (a missing PASS fails the sweep), and what lands
+/// here is the number, printed for the record. Rule 6's before/after figure,
+/// automated rather than trusted to whoever ran the gate.
+fn report_netstat(log: &str, staged: &[&str]) -> Result<()> {
+    if !staged.contains(&"t-netstats") {
+        return Ok(());
+    }
+    let readings = sweep::netstat_readings(log);
+    let Some((tx, rate, hits, misses)) = readings.first() else {
+        bail!(
+            "the sweep staged t-netstats but its NETSTAT line never reached \
+             the log: the instrument's number was lost between the guest and \
+             the report"
+        );
+    };
+    println!("self-test (netstat): frame counters through /proc/net/dev");
+    println!("  tx={tx} datagrams_per_sec={rate} pool={hits}:{misses}");
+    Ok(())
+}
+
 /// Read a disk sweep's verdict out of the log.
 ///
 /// Three facts have to agree, and each is a different way for the run to be
@@ -1063,6 +1284,7 @@ fn report_disk_sweep(
     staged: &[&str],
     left_out: usize,
     log: &str,
+    diskstat: &str,
 ) -> Result<()> {
     // The protocol is `sweep`'s - one parser for both runners. What this arm
     // does with it is its own, because its claim differs from the first
@@ -1160,6 +1382,8 @@ fn report_disk_sweep(
         staged.len(),
         left_out
     );
+    report_diskstat(log, diskstat)?;
+    report_netstat(log, staged)?;
     Ok(())
 }
 
@@ -1168,7 +1392,10 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{LEAF_CRATES, UserTest, append_test_members, ustar_header};
+    use super::{
+        DISKSTAT_FIXTURE_ENTRY, DISKSTAT_FIXTURE_MEMBER, DISKSTAT_ON, LEAF_CRATES, UserTest,
+        append_test_members, ustar_header,
+    };
 
     /// The tail-staging writer's own format claims, against the host `tar`:
     /// the checksum rule both readers enforce ("sum with the chksum field read
@@ -1204,7 +1431,7 @@ mod tests {
         let tests: Vec<&UserTest> = staged.iter().collect();
 
         let out = dir.join("tail.tar");
-        append_test_members(&base_path, &out, &tests).unwrap();
+        append_test_members(&base_path, &out, &tests, &[]).unwrap();
 
         let listed = std::process::Command::new("tar")
             .args(["-tvf"])
@@ -1313,6 +1540,63 @@ mod tests {
             block.contains("linker=rust-lld"),
             "the aarch64 link must name rust-lld: the host `ld` rejects the \
              `--fix-cortex-a53-843419` rustc passes for this target.\n{block}"
+        );
+    }
+
+    /// The disk-counter boot word is one string with two readers: this file
+    /// puts it on a sweep's command line, and `src/board/flow.rs` compares the
+    /// command line against its own constant. A drift between them is an
+    /// instrument that silently never arms - the sweep boots un-armed,
+    /// `t-diskbench` finds no protocol, and its claims go red for a reason
+    /// that reads like the kernel's fault. So the pair is pinned here, where
+    /// both halves are just text.
+    #[test]
+    fn the_diskstat_word_matches_the_kernels_constant() {
+        let flow = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask has a parent directory")
+            .join("src/board/flow.rs");
+        let text = fs::read_to_string(&flow).expect("the boot flow is readable");
+        let declared = text
+            .lines()
+            .find_map(|line| line.strip_prefix("pub const DISKSTAT_WORD: &str = "))
+            .and_then(|rest| rest.trim_end().strip_suffix(';'))
+            .expect("flow.rs declares DISKSTAT_WORD as a plain literal");
+        assert_eq!(
+            declared.trim_matches('"'),
+            DISKSTAT_ON.trim(),
+            "the sweep's arming word and the boot's reading word diverged"
+        );
+    }
+
+    /// The fixture's two payload spellings are one guest path, and the rule is
+    /// the channels' own: an archive member names itself absolutely (the
+    /// ramfs unpacker takes the leading slash as the path), a disk entry names
+    /// itself from a root that already exists. Both must land at exactly
+    /// `/dev-sda-fs.img` or `t-ext4-mount` opens a name that exists on one
+    /// machine and not the other - the same program passing one sweep and
+    /// failing its twin for a reason that reads like the kernel's fault.
+    ///
+    /// The path's own rule is asserted here too: *not* under `/dev`, because
+    /// both boots mount a `devtmpfs` over that directory and a payload there is
+    /// shadowed (measured - see the constant's comment). This is the cheap half
+    /// of that mistake: both programs hard-code the same name, so a harness that
+    /// moved the file would fail their opens rather than silently testing a
+    /// different one.
+    #[test]
+    fn both_payload_channels_lay_the_fixture_at_one_path() {
+        assert!(
+            DISKSTAT_FIXTURE_MEMBER.starts_with("/dev-"),
+            "the member is an absolute path at the root, and not under /dev"
+        );
+        assert!(
+            !DISKSTAT_FIXTURE_ENTRY.starts_with('/'),
+            "a disk entry must not carry the absolute slash"
+        );
+        assert_eq!(
+            format!("/{DISKSTAT_FIXTURE_ENTRY}"),
+            DISKSTAT_FIXTURE_MEMBER,
+            "the two spellings drifted apart"
         );
     }
 

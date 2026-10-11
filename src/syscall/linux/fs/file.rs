@@ -182,7 +182,7 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
     // to stop at - the classic `/tmp` defence, and a §4.2 accept-and-drop with
     // security meaning.
     if flags & O_NOFOLLOW != 0
-        && let Ok(inode) = crate::vfs::global().resolve_no_follow(path, base.clone())
+        && let Ok(inode) = crate::vfs::global().resolve_caller_no_follow(path, base.clone())
         && inode.metadata().kind == NodeKind::Symlink
     {
         return err::ELOOP;
@@ -721,7 +721,7 @@ pub fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // walks to the parent and looks the name up there - a resolver that
     // followed links would hand back the very thing it was told not to.
     let (meta, rdev, stored, nlink, owner, times) = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-        match crate::vfs::global().resolve_no_follow(&path, base) {
+        match crate::vfs::global().resolve_caller_no_follow(&path, base) {
             Ok(inode) => (
                 inode.metadata(),
                 inode.rdev(),
@@ -823,7 +823,7 @@ pub fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         // parent-and-name no-follow walk `fstatat`'s `lstat` uses, rather than
         // the following resolver.
         let resolved = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            crate::vfs::global().resolve_no_follow(&path, base)
+            crate::vfs::global().resolve_caller_no_follow(&path, base)
         } else {
             crate::vfs::resolve_opt(&path, Some(base))
         };
@@ -952,7 +952,7 @@ fn xattr_target(path: &str, cwd: &Arc<dyn Inode>, follow: bool) -> isize {
     let resolved = if follow {
         crate::vfs::resolve_opt(path, Some(cwd.clone()))
     } else {
-        crate::vfs::global().resolve_no_follow(path, cwd.clone())
+        crate::vfs::global().resolve_caller_no_follow(path, cwd.clone())
     };
     match resolved {
         Ok(_) => err::EOPNOTSUPP,
@@ -1133,7 +1133,7 @@ pub fn utimensat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             Err(e) => return e,
         };
         let resolved = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            crate::vfs::global().resolve_no_follow(&path, base)
+            crate::vfs::global().resolve_caller_no_follow(&path, base)
         } else {
             crate::vfs::resolve_opt(&path, Some(base))
         };
@@ -1637,7 +1637,7 @@ pub fn readlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     } else {
         // The link, not what it points at: a resolver that followed it would
         // answer EINVAL for every link and the target for nothing.
-        match crate::vfs::global().resolve_no_follow(&path, cwd.clone()) {
+        match crate::vfs::global().resolve_caller_no_follow(&path, cwd.clone()) {
             Ok(node) => match node.readlink() {
                 Ok(target) => target,
                 Err(e) => return err_of(e),
@@ -4034,7 +4034,7 @@ pub fn handle_fchownat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
         };
     }
     let found = if args[4] & AT_SYMLINK_NOFOLLOW != 0 {
-        crate::vfs::global().resolve_no_follow(&path, base)
+        crate::vfs::global().resolve_caller_no_follow(&path, base)
     } else {
         crate::vfs::resolve_opt(&path, Some(base))
     };
@@ -4092,7 +4092,7 @@ pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     };
     // Both names have to exist as paths for the request to be a request:
     // a link to a missing file is ENOENT, not EPERM.
-    let old = match crate::vfs::global().resolve_no_follow(&old_path, old_base.clone()) {
+    let old = match crate::vfs::global().resolve_caller_no_follow(&old_path, old_base.clone()) {
         Ok(inode) => inode,
         Err(e) => return err_of(e),
     };
@@ -5201,7 +5201,7 @@ pub fn handle_faccessat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
         Err(e) => return e,
     };
     let found = if flags & abi::AT_SYMLINK_NOFOLLOW != 0 {
-        crate::vfs::global().resolve_no_follow(&path, base)
+        crate::vfs::global().resolve_caller_no_follow(&path, base)
     } else {
         crate::vfs::resolve_opt(&path, Some(base))
     };
@@ -5287,7 +5287,7 @@ pub fn handle_fchmodat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
         Err(e) => return e,
     };
     let resolved = if flags & abi::AT_SYMLINK_NOFOLLOW != 0 {
-        crate::vfs::global().resolve_no_follow(&path, base)
+        crate::vfs::global().resolve_caller_no_follow(&path, base)
     } else {
         crate::vfs::resolve_opt(&path, Some(base))
     };

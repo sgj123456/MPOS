@@ -588,7 +588,7 @@ pub(super) const STATX_SIZE: usize = 256;
 ///
 /// The nanosecond halves stay zero (no filesystem here keeps sub-second clocks)
 /// and `stx_blksize` is 512, the block size this kernel's `struct stat`
-/// reports - both named in `UAPI.md` rather than implied.
+/// reports - both named in `docs/uapi/` rather than implied.
 pub(crate) fn write_statx(
     buf: usize,
     mask: u32,
@@ -1227,7 +1227,25 @@ pub(crate) fn validate_clone_flags(
         | crate::syscall::linux::nr::CLONE_CHILD_CLEARTID
         | crate::syscall::linux::nr::CLONE_CHILD_SETTID
         | crate::syscall::linux::nr::CLONE_DETACHED
-        | crate::syscall::linux::nr::CLONE_UNTRACED;
+        | crate::syscall::linux::nr::CLONE_UNTRACED
+        // The namespace kinds are *known* here and *decided elsewhere*: a
+        // `CLONE_NEW*` is a real flag whose answer is the scheduler's
+        // (`crate::abi::clone_namespace_verdict` — is this kind served at all,
+        // and is the caller allowed one), not a bit from a newer kernel. An
+        // earlier revision left them out of this mask, which made every
+        // namespace flag `EINVAL` before the scheduler could answer: the
+        // `t-clone` claims about the served kind and the three refusals were
+        // unreachable, and the verdict was code no word could reach. The
+        // distinction this file keeps is between a bit *nobody* knows
+        // (`EINVAL`) and a real request this kernel cannot honour
+        // (`EOPNOTSUPP`, from the verdict).
+        //
+        // `CLONE_NEWTIME` is part of the vocabulary above and is still refused
+        // here, by the signal-byte rule below rather than by this mask: it sits
+        // at 0x80, inside the byte that carries the exit signal, so the mask
+        // strips it and the signal check sees 128. That is Linux's own
+        // arrangement (`clone` has no `CLONE_NEWTIME`; `unshare` does).
+        | crate::syscall::linux::nr::CLONE_NAMESPACES;
     if flags & !KNOWN != 0 {
         return Err(err::EINVAL);
     }
@@ -1332,22 +1350,43 @@ pub(crate) fn unshare_verdict(flags: usize, privileged: bool) -> Result<usize, i
         | n::CLONE_THREAD
         | n::CLONE_SYSVSEM;
 
-    /// The namespace kinds this kernel can isolate observably. One, so far: the
-    /// build order and the reason for it are the plan's §6.3.
-    const SERVED: usize = n::CLONE_NEWUTS;
+    /// The namespace kinds this kernel can isolate observably. Two now — the
+    /// names, and the mount table (`t-ns-mnt` holds MNT's "child differs *and*
+    /// the parent does not"). The build order and the reason for it are the
+    /// plan's §6.3; MNT landed at step 1 of that ladder.
+    const SERVED: usize = n::CLONE_NEWUTS | n::CLONE_NEWNS;
 
+    // `CAP_SYS_ADMIN` is the gate on every privileged namespace kind, asked
+    // of the caller's *effective capability set* — the question the credential
+    // model exists to answer, not the crude `euid == 0` it replaced (a caller
+    // that has dropped the capability is refused like Linux's, whatever its
+    // identity says).
     if flags & !(n::CLONE_NAMESPACES | SEPARABLE) != 0 {
         return Err(err::EINVAL);
     }
     let asked = flags & n::CLONE_NAMESPACES;
-    if asked & !SERVED != 0 {
-        return Err(err::EOPNOTSUPP);
-    }
+    // The privilege first, then what can be served — Linux's own order
+    // (`check_unshare_flags` consults `ns_capable` before the kinds exist to
+    // copy). A caller without `CAP_SYS_ADMIN` gets the permission answer for
+    // *any* namespace word, even one this kernel would refuse on capability
+    // grounds anyway; measuring it is what pinned the direction.
     if asked != 0 && !privileged {
         return Err(err::EPERM);
     }
+    if asked & !SERVED != 0 {
+        return Err(err::EOPNOTSUPP);
+    }
     Ok(asked)
 }
+
+// The clone-side namespace verdict lives in the `abi` **leaf** now —
+// `crate::abi::clone_namespace_verdict` — because its reader is the scheduler
+// (`sched::clone` decides before it creates anything), and a `sched → syscall`
+// edge is exactly the V-* class Phase 11 keeps at zero. The words it consults
+// (`CLONE_NEW*`) are defined there, so the rule has one home. There is no
+// re-export here: the syscall layer's clone handler never consulted it (the
+// scheduler answers for both `fork` and `clone`), and an import nothing reads
+// is a warning on every bare-metal build.
 
 // ---------------------------------------------------------------------------
 // reboot(2): the magic cmd words
@@ -2988,10 +3027,37 @@ mod tests {
             Err(crate::syscall::err::EINVAL)
         );
 
-        // An unknown bit - CLONE_NEWNS (0x20000) among them - is refused
-        // before anything is created.
+        // A bit *nobody* knows is refused before anything is created. Every bit
+        // below 2^32 is either the exit signal or one of Linux's own flags -
+        // `CLONE_NEWNS` among them, which this mask carries so the scheduler can
+        // answer it (below) - so the unknown bit named here is above every
+        // vocabulary either kernel defines. Measured on the host: Linux has no
+        // such check at all and starts the child (`.workbuddy/probe_clone_unknown.c`).
         assert_eq!(
-            validate_clone_flags(n::CLONE_VM | 0x2_0000, 0, 0),
+            validate_clone_flags(n::CLONE_VM | (1 << 44), 0, 0),
+            Err(crate::syscall::err::EINVAL)
+        );
+
+        // A namespace kind is *known* here and *decided* by the scheduler's
+        // verdict (leaf `mpos-abi`, `clone_namespace_verdict`): the word has to
+        // arrive with the bit still in it, or the refusal cannot name what is
+        // missing (`EOPNOTSUPP`) instead of reading a real flag as a bit from a
+        // newer kernel. Both halves are pinned - this one for arrival, the
+        // leaf's own test for the answer.
+        assert_eq!(
+            validate_clone_flags(17 | n::CLONE_NEWNS, 0, 0),
+            Ok((17, n::CLONE_NEWNS))
+        );
+        assert_eq!(
+            validate_clone_flags(17 | n::CLONE_NEWPID, 0, 0),
+            Ok((17, n::CLONE_NEWPID))
+        );
+        // `CLONE_NEWTIME` is part of that vocabulary and still never reaches the
+        // verdict: it sits at 0x80, inside the byte the exit signal spends, so
+        // the mask above strips it and the signal check refuses 128. Linux's own
+        // arrangement - `clone` has no `CLONE_NEWTIME`, `unshare` does.
+        assert_eq!(
+            validate_clone_flags(n::CLONE_NEWTIME, 0, 0),
             Err(crate::syscall::err::EINVAL)
         );
 
@@ -3064,17 +3130,28 @@ mod tests {
         assert_eq!(unshare_verdict(0, true), Ok(0));
         assert_eq!(unshare_verdict(0, false), Ok(0));
 
-        // The one served namespace: granted with the privilege, refused
-        // without it, and the verdict names the bit so the caller can act.
+        // The two served namespaces — the names, and the mount table (§6.3's
+        // step 1): each granted with the privilege, refused without it, and the
+        // verdict names the bits so the handler copies exactly what was granted.
         assert_eq!(unshare_verdict(n::CLONE_NEWUTS, true), Ok(n::CLONE_NEWUTS));
         assert_eq!(unshare_verdict(n::CLONE_NEWUTS, false), Err(err::EPERM));
+        assert_eq!(unshare_verdict(n::CLONE_NEWNS, true), Ok(n::CLONE_NEWNS));
+        assert_eq!(unshare_verdict(n::CLONE_NEWNS, false), Err(err::EPERM));
+        // An unserved kind asked by an unprivileged caller answers `EPERM`,
+        // not `EOPNOTSUPP` — Linux's order, measured, and the reason the two
+        // checks sit in this sequence above.
+        assert_eq!(unshare_verdict(n::CLONE_NEWPID, false), Err(err::EPERM));
+        // Both at once answers both: nothing about one gates the other.
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWUTS | n::CLONE_NEWNS, true),
+            Ok(n::CLONE_NEWUTS | n::CLONE_NEWNS)
+        );
 
-        // The seven this kernel has one of and no way to make a second. Served
+        // The six this kernel has one of and no way to make a second. Served
         // namespace or not, the answer is the same for both privileged and
         // unprivileged callers: this is not a permissions answer.
         for bit in [
             n::CLONE_NEWTIME,
-            n::CLONE_NEWNS,
             n::CLONE_NEWCGROUP,
             n::CLONE_NEWIPC,
             n::CLONE_NEWUSER,
@@ -3086,21 +3163,24 @@ mod tests {
                 Err(err::EOPNOTSUPP),
                 "{bit:#x} was granted with no namespace behind it"
             );
-            assert_eq!(unshare_verdict(bit, false), Err(err::EOPNOTSUPP));
+            // The privilege is consulted first — Linux's order — so the same
+            // unserved bit answers `EPERM` to an unprivileged caller and only
+            // reaches the capability question at all when it does not.
+            assert_eq!(unshare_verdict(bit, false), Err(err::EPERM));
         }
 
-        // A word that mixes the served one with an unserved one is refused
+        // A word that mixes a served kind with an unserved one is refused
         // whole - `Err`, so the handler copies nothing - where Linux's
         // `ksys_unshare` would already have unshared the first part by the time
         // the second failed.
         assert_eq!(
-            unshare_verdict(n::CLONE_NEWUTS | n::CLONE_NEWNS, true),
+            unshare_verdict(n::CLONE_NEWNS | n::CLONE_NEWPID, true),
             Err(err::EOPNOTSUPP)
         );
         assert_eq!(
-            unshare_verdict(n::CLONE_NEWNS | n::CLONE_NEWUTS, false),
-            Err(err::EOPNOTSUPP),
-            "the unserved bit is decided before the privilege is consulted"
+            unshare_verdict(n::CLONE_NEWPID | n::CLONE_NEWNS, false),
+            Err(err::EPERM),
+            "the privilege is consulted before the kind is — Linux's order"
         );
 
         // The six thread-group flags are accepted as the no-ops they are on a
@@ -4432,5 +4512,92 @@ mod entropy_tests {
         let (sec, nsec) = timespec_from_ticks(u64::MAX, 250);
         assert!(sec > 0);
         assert!((0..1_000_000_000).contains(&nsec));
+    }
+}
+
+/// §10.5's disk-counter protocol: the `uname(2)` payload, rendered from the
+/// block layer's live counters.
+///
+/// Lives in this module because its whole behaviour is table answers - read a
+/// registry, format rows - and that is where AGENTS.md's recipe #4 puts what a
+/// host test must reach: the same door `t-diskbench` reads on a booted machine
+/// is exercised here against registered mock devices, which is the pin the
+/// instrument's *shape* (magic word, row grammar, per-disk naming) carries
+/// before any QEMU runs. `proc::handle_uname` calls it when the caller's
+/// namespace is armed; the armed boot itself is `board::flow`'s decision, made
+/// from the command line, and the two halves are pinned equal by xtask's
+/// `the_diskstat_word_matches_the_kernels_constant`.
+pub(crate) fn diskstat_uts_fields() -> (String, String) {
+    let release = alloc::format!("{:#x}", crate::abi::DISKSTAT_OSRELEASE_MAGIC);
+    let mut version = String::from("#1 ");
+    for (name, reads, writes) in crate::blk::io_stats() {
+        version.push_str(&alloc::format!("{name}:{reads}:{writes},"));
+    }
+    (release, version)
+}
+
+#[cfg(test)]
+mod diskstat_tests {
+    use super::*;
+    use alloc::sync::Arc;
+
+    /// A device that answers with zeros and remembers nothing: the fixture is
+    /// the registry, not the storage.
+    struct Zeros;
+
+    impl crate::blk::BlockDev for Zeros {
+        fn capacity_sectors(&self) -> u64 {
+            2048
+        }
+        fn read_at(&self, _offset: u64, buf: &mut [u8]) {
+            for b in buf.iter_mut() {
+                *b = 0;
+            }
+        }
+        fn write_at(&self, _offset: u64, _buf: &[u8]) {}
+    }
+
+    /// The protocol's shape, end to end through the real registry: every
+    /// registered disk gets exactly one `<name>:<reads>:<writes>` row under a
+    /// `#1 ` prefix, `release` answers the magic word, and a read issued after
+    /// registration shows up in the next rendering - the rows are live, not a
+    /// snapshot taken at mount.
+    ///
+    /// The counterfactual is the instrument's failure mode without this pin: a
+    /// renderer that named no disk, or counted bytes instead of calls, or froze
+    /// its rows at registration time would still let `t-diskbench` print a
+    /// plausible `DISKSTAT` line - and the sweep's cold/warm claims are only
+    /// evidence if the door they come through is the one being measured.
+    #[test]
+    fn the_rows_name_every_registered_disk_and_track_live_reads() {
+        crate::blk::add_disk("dstat-da", 8, "/devices/test/block", Arc::new(Zeros));
+        let (release, version) = diskstat_uts_fields();
+        assert_eq!(release, "0x6d706f7300000001");
+        // A fresh registry may hold disks another test registered first; the
+        // claim is about *this* disk's row and the prefix, not the count.
+        assert!(version.starts_with("#1 "), "{version}");
+        let before = crate::blk::io_stats()
+            .into_iter()
+            .find(|(name, _, _)| name == "dstat-da")
+            .expect("the registered disk names itself");
+        assert_eq!(before.1, 0, "a fresh disk starts at zero reads");
+
+        crate::blk::disks()
+            .iter()
+            .find(|disk| disk.name == "dstat-da")
+            .expect("the disk lists itself")
+            .dev
+            .read_at(0, &mut [0u8; 512]);
+
+        let after = crate::blk::io_stats()
+            .into_iter()
+            .find(|(name, _, _)| name == "dstat-da")
+            .expect("still there");
+        assert_eq!(after.1, 1, "one call, one read counted");
+        let (_, version) = diskstat_uts_fields();
+        assert!(
+            version.contains("dstat-da:1:0,"),
+            "the live count renders into the row: {version}"
+        );
     }
 }

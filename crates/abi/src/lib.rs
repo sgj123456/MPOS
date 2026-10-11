@@ -31,6 +31,28 @@
 /// and the syscall layer reads it back for `umask(2)`'s first answer.
 pub const DEFAULT_UMASK: u32 = 0o022;
 
+/// The magic `release` word that turns `uname(2)` into §10.5's disk-read
+/// counter.
+///
+/// A *private* ABI word, and saying so is the whole disclosure: Linux's
+/// `kernel_osrelease` is a string no caller compares against a number, so a
+/// value of `0x6D70_6F73_0000_0001` ("mpos" + version 1) in that field cannot
+/// collide with anything a real kernel answers - and a program that parses
+/// `uname -r` sees an odd-but-plausible release string tail rather than an
+/// error. This is the same door `t-diskbench` reads its numbers through because
+/// there is no other door to put them behind: `/proc/partitions` is column-
+/// parsed by tools (`fdisk` opens it before anything else), so appending a
+/// sixth column would break the readers that exist, and this kernel has no
+/// sysfs attribute store a `/sys/class/block/*/stat` file could live in. The
+/// counter lives where a measurement can reach it, and the fact that it is
+/// private is written down here, in the UAPI table, and beside the handler.
+///
+/// The payload grammar is one row per registered disk, rendered live at call
+/// time: `version` = `"#1 "` followed by `<name>:<reads>:<writes>,` for every
+/// disk in registration order. The reader-side spelling of both halves — the
+/// word and the rows — is `user/tests/src/bin/t-diskbench.rs`.
+pub const DISKSTAT_OSRELEASE_MAGIC: u64 = 0x6D70_6F73_0000_0001;
+
 // `clone(2)` flag bits. Each one names a part of the caller that the child
 // **shares** instead of copying; a zero flag word is therefore plain `fork`.
 //
@@ -224,6 +246,37 @@ pub fn rlimit_admit(old: Rlimit, new: Rlimit, is_root: bool) -> Result<Rlimit, i
     Ok(new)
 }
 
+/// What a `clone`'s flag word asks *of the new task's namespaces*, decided
+/// before anything is created. Linux creates the child inside copied
+/// namespaces (`create_new_namespaces`, one flag per kind, behind
+/// `CAP_SYS_ADMIN` checked there too); this kernel serves the two kinds whose
+/// copies are wired into the child's construction — the mount table (the child
+/// starts in a copy; `t-ns-mnt`) and the names (Linux's `copy_utsname` on
+/// exactly this flag; `t-clone` pins it) — and refuses every other kind whole.
+/// A caller asking for PID isolation gets the same answer from here as
+/// `unshare` gives it: nothing to hand over yet.
+///
+/// The unserved-kind refusal is `EOPNOTSUPP`, not `EINVAL`: the bit is a real
+/// namespace flag (an unknown bit is the caller's own validation job, upstream
+/// of this), and what is missing is this kernel's ability, which is precisely
+/// what `EOPNOTSUPP` means (`AGENTS.md` §3.2).
+///
+/// This is the leaf's rather than the syscall layer's because its reader is the
+/// scheduler — `sched::clone` answers it before creating anything, and a
+/// `sched → syscall` edge is exactly the V-* class Phase 11 keeps at zero. The
+/// namespace bits it consults are defined above, so the rule has one home.
+pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isize> {
+    const SERVED: usize = CLONE_NEWUTS | CLONE_NEWNS;
+    let asked = flags & CLONE_NAMESPACES;
+    if asked != 0 && !privileged {
+        return Err(mpos_err::EPERM);
+    }
+    if asked & !SERVED != 0 {
+        return Err(mpos_err::EOPNOTSUPP);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +328,58 @@ mod tests {
                 | CLONE_NEWUSER
                 | CLONE_NEWPID
                 | CLONE_NEWNET
+        );
+    }
+
+    #[test]
+    fn the_clone_namespace_verdict_serves_two_kinds_and_refuses_whole() {
+        // The rule the scheduler asks before it creates anything: the two kinds
+        // whose copies are wired into a child's construction are served, every
+        // other kind is refused *whole* (`EOPNOTSUPP` - "present, cannot do
+        // that") rather than half-served with a child that shares what its flags
+        // said it got its own of, and a caller without `CAP_SYS_ADMIN` is
+        // refused `EPERM` first, for *any* namespace word (Linux's order:
+        // privilege, then what can be served).
+        //
+        // This pin exists because its absence was measured: the verdict landed
+        // with no test of its own *and* behind a syscall-layer mask that read
+        // every namespace bit as unknown, so it was code no word could reach and
+        // nothing could notice (`t-clone`'s served/refused claims ran red).
+        assert_eq!(clone_namespace_verdict(CLONE_NEWUTS, true), Ok(()));
+        assert_eq!(clone_namespace_verdict(CLONE_NEWNS, true), Ok(()));
+        assert_eq!(
+            clone_namespace_verdict(CLONE_NEWUTS | CLONE_NEWNS, true),
+            Ok(())
+        );
+        // A word asking for no namespace has nothing to decide, whatever the
+        // caller holds - the byte `fork` is built from is not a namespace.
+        assert_eq!(clone_namespace_verdict(0, true), Ok(()));
+        assert_eq!(clone_namespace_verdict(0, false), Ok(()));
+        assert_eq!(
+            clone_namespace_verdict(CLONE_NEWPID, true),
+            Err(mpos_err::EOPNOTSUPP)
+        );
+        assert_eq!(
+            clone_namespace_verdict(CLONE_NEWNET, true),
+            Err(mpos_err::EOPNOTSUPP)
+        );
+        assert_eq!(
+            clone_namespace_verdict(CLONE_NEWUSER, true),
+            Err(mpos_err::EOPNOTSUPP)
+        );
+        // Served *and* unserved in one word: nothing is half-done, so the whole
+        // request is refused and the served kind is not quietly handed over.
+        assert_eq!(
+            clone_namespace_verdict(CLONE_NEWUTS | CLONE_NEWNET, true),
+            Err(mpos_err::EOPNOTSUPP)
+        );
+        assert_eq!(
+            clone_namespace_verdict(CLONE_NEWNS, false),
+            Err(mpos_err::EPERM)
+        );
+        assert_eq!(
+            clone_namespace_verdict(CLONE_NEWPID, false),
+            Err(mpos_err::EPERM)
         );
     }
 

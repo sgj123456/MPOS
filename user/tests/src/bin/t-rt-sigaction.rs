@@ -60,7 +60,7 @@
 //! Linux refuses `SIGKILL`/`SIGSTOP` only when a disposition is being *set* -
 //! `act && sig_kernel_only(sig)` in `do_sigaction` - so a bare query of either
 //! answers 0 there (measured on this host). This kernel refuses the query too.
-//! `docs/UAPI.md` §5.2 carries it; the two claims below pin this kernel's
+//! `docs/uapi/` §5.2 carries it; the two claims below pin this kernel's
 //! answer on the payload and take the host's under `MPOS_ON_HOST`, each with a
 //! printed note, which is the shape batch 13 gave the same kind of claim.
 

@@ -734,7 +734,7 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             // day; here a pipe or socket asking is answered the honest
             // `ENOTTY` rather than a borrowed zero. (A regular file and a pipe
             // *would* answer 0 with their remaining/queued bytes on Linux;
-            // that is a named divergence in `UAPI.md` §5.2, not this arm's.)
+            // that is a named divergence in `docs/uapi/` §5.2, not this arm's.)
             let file = match crate::sched::current_fds().clone_at(fd) {
                 Ok(f) => f,
                 Err(e) => return err_of(e),

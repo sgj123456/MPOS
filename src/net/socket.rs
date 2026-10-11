@@ -1605,7 +1605,7 @@ fn send_common(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bo
     }
     match typ {
         Some(SOCK_STREAM) => tcp_send(handle, data, nonblock),
-        Some(SOCK_DGRAM) => udp_send(handle, data, dst),
+        Some(SOCK_DGRAM) => udp_send(handle, data, dst, nonblock),
         Some(SOCK_RAW) => raw_send(handle, data, dst),
         Some(_) => err::EINVAL,
         None => err::EBADF,
@@ -1697,7 +1697,40 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
 
 /// Send one datagram. A first send on an unbound socket binds an anonymous
 /// port first, which is what Linux's automatic bind on send does.
-fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
+///
+/// The socket's send buffer is finite, so a burst outruns it, and what the
+/// caller hears then is the caller's question rather than the kernel's. Two
+/// answers, and this kernel gives the second:
+///
+/// * the datagram is **wider than the buffer that would hold it** —
+///   `EMSGSIZE`, whatever the mode says, because waiting cannot make it fit;
+/// * the buffer has **no room at this instant** — `EAGAIN`, which is Linux's
+///   answer to a non-blocking sender. Linux's *blocking* sender would instead
+///   wait for the buffer to drain, and **this kernel deliberately does not**,
+///   because there is no wakeup source to wait on: the buffer drains into the
+///   device's TX ring, the ring drains when the device completes descriptors,
+///   and this driver takes no interrupt for a completion — so a parked sender
+///   would sleep until something else happened to poll the stack. Both shapes
+///   were measured: a park with no deadline stopped the sweep dead at
+///   `t-netstats`'s first parked send, and a tick-bounded park spun at 97% CPU
+///   because the wait's own readiness answer (`can_send()`) was true while
+///   `enqueue` still refused — a wait that can never end. `EAGAIN` is the
+///   honest answer until the ring has a completion event (named in `docs/uapi/`
+///   §5.2 and `docs/notes/` §4.3); a caller retries, which is what the burst in
+///   `t-netstats` now does.
+///
+/// This replaces a single mapping from smoltcp's `BufferFull` to `EMSGSIZE`,
+/// which was wrong in the *common* case: smoltcp reports that one error for "no
+/// room at this instant" as well as for "this datagram can never fit", so a
+/// burst of ordinary 1400-byte datagrams was refused as though each were
+/// oversized after four sends — the depth of the virtio TX ring. Measured by
+/// `t-netstats`, whose 256-datagram burst is the pin.
+fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool) -> isize {
+    // The mode does not change the answer here: a full buffer is `EAGAIN` for a
+    // blocking caller too, because there is nothing to wait on (the doc above
+    // says why). Kept in the signature because that is the decision this
+    // function owns the day the ring grows a completion event.
+    let _ = nonblock;
     let sent = super::with(handle, |stack, entry| {
         stack.poll_once();
         let Channel::Udp {
@@ -1732,6 +1765,7 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
         let sock = stack
             .sockets_mut(*home)
             .get_mut::<udp::Socket>(*sock_handle);
+        let buffer_bytes = sock.payload_send_capacity();
         match sock.send_slice(data, target) {
             Ok(()) => {
                 // Queued is not sent: the extra poll puts the datagram on
@@ -1739,8 +1773,12 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
                 stack.poll_once();
                 Ok(data.len() as isize)
             }
-            // A datagram bigger than the send pool is never going to fit.
-            Err(udp::SendError::BufferFull) => Err(err::EMSGSIZE),
+            // Wider than the buffer that would have to hold it: no amount of
+            // retrying fits it, and Linux names that rather than hanging.
+            Err(udp::SendError::BufferFull) if data.len() > buffer_bytes => Err(err::EMSGSIZE),
+            // Full *now*: the caller retries (the doc above says why this is
+            // not a park).
+            Err(udp::SendError::BufferFull) => Err(err::EAGAIN),
             Err(udp::SendError::Unaddressable) => Err(err::EINVAL),
         }
     });

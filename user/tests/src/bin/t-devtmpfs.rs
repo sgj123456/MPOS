@@ -7,7 +7,7 @@
 //! Nothing in a boot *failed* over it. What it did was put one line on the wire
 //! (`mpos: syscall 88 (fd -100) -> EOPNOTSUPP` on aarch64, printed once per
 //! boot by the dispatcher's note table) and send its caller down a path Linux
-//! never sends it down, which is the shape `docs/UAPI.md` §5.2 recorded:
+//! never sends it down, which is the shape `docs/uapi/` §5.2 recorded:
 //! eudev's node path sets the timestamps of the device nodes it manages - the
 //! ones a boot here touched were the disks - and `touch -d @1600000000
 //! /dev/zero` answers `0` on a host whose `/dev` *is* devtmpfs, with `stat`

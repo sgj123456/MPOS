@@ -136,7 +136,11 @@ impl<'a> Kernel<'a> {
             ELF_MAGIC,
             "the kernel image does not begin with an ELF magic number"
         );
-        assert_eq!(r.u8(4), ELFCLASS64, "the kernel image is not a 64-bit ELF file");
+        assert_eq!(
+            r.u8(4),
+            ELFCLASS64,
+            "the kernel image is not a 64-bit ELF file"
+        );
         // Both machines this loader serves, and no other: the two are the ones
         // a UEFI firmware can hand it, and an image built for a third would be
         // one whose page-table format the loader below does not speak.
@@ -189,7 +193,10 @@ impl<'a> Kernel<'a> {
                 _ => {}
             }
         }
-        assert!(!segments.is_empty(), "the kernel image has no loadable segments");
+        assert!(
+            !segments.is_empty(),
+            "the kernel image has no loadable segments"
+        );
         assert!(
             lowest <= entry && entry < highest,
             "the kernel image's entry point is not inside it"

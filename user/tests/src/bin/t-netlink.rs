@@ -469,7 +469,20 @@ fn main() {
         "the link dump reports the new MTU",
         dump_shows(&fd, RTM_GETLINK, 16, IFLA_MTU, &1400u32.to_le_bytes()),
     );
+    // ...and put it back, because the MTU is the *machine's*, not this test's:
+    // the sweep runs program after program in one boot, and the next network
+    // program sends datagrams sized for the MTU it expects. Leaving 1400 here is
+    // what broke `t-netstats` — measured: its 1400-byte payload plus 42 bytes of
+    // headers cannot be dispatched under a 1400-byte MTU, so smoltcp accepted the
+    // datagrams into the socket's buffer, never put one on the wire, and the
+    // buffer filled after four (2000 `EAGAIN` retries, four frames at the seam,
+    // one of them the ARP request). The rule the repo states for a check that
+    // touches shared state — put it back — is what this line is.
+    r.check(
+        "ip link set eth0 mtu 1500 puts it back",
+        mutation_report(&fd, &setmtu(1500)) == 0,
+    );
 
     drop(fd);
-    r.finish();
+    r.finish()
 }

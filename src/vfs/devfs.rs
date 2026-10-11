@@ -93,7 +93,7 @@ pub trait CharDevice: Send + Sync {
 /// `/dev/sda`) and no character node at all. A `/dev` node that answered
 /// `utimensat` with `EOPNOTSUPP` therefore sent eudev down a path Linux never
 /// sends it down - once per boot on the wire, and nowhere else visible, which
-/// is the shape `docs/UAPI.md` §5.2 recorded and this closes. A node nobody has
+/// is the shape `docs/uapi/` §5.2 recorded and this closes. A node nobody has
 /// stamped reports the trait's zero, not a made-up time: what would be stamped
 /// instead is the mount's or the driver's moment, and this filesystem has
 /// neither to hand a node that arrives when its driver registers it.
@@ -1191,7 +1191,7 @@ mod tests {
         // udev's node path sets the timestamps of every device node it manages.
         // This filesystem answered the trait's default `EOPNOTSUPP` instead -
         // one line of a boot's log, and a caller sent down a path Linux never
-        // sends it down (`docs/UAPI.md` §5.2). The mode next door was already
+        // sends it down (`docs/uapi/` §5.2). The mode next door was already
         // kept, which is how the two halves came to disagree.
         let _bus = crate::uevent::test_bus::take();
         let fs = DevFs::new();

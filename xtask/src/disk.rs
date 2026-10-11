@@ -233,12 +233,8 @@ fn ensure_pattern_image(build_dir: &Path, arch: Arch) -> Result<()> {
 
 /// The disk the machine's AHCI controller serves, and its size.
 ///
-/// Sparse and small on purpose: what `t-ahci` does with it is write one sector
-/// and read it back, so every byte past the first few is a hole in a file on
-/// the host and nothing in the guest depends on its content.
+/// The name the SATA backing file carries under `build/`.
 pub const SATA_TEST_IMAGE: &str = "test-sata.img";
-pub const SATA_TEST_BYTES: u64 = 4 * 1024 * 1024;
-
 /// The second disk, on a real controller rather than on virtio.
 ///
 /// One file for *both* machines, unlike the pattern image above, and for the
@@ -250,15 +246,57 @@ pub fn sata_image(build_dir: &Path) -> PathBuf {
     build_dir.join(SATA_TEST_IMAGE)
 }
 
+/// The size the SATA backing file is laid at, by whoever lays it first.
+///
+/// 4 MiB of zeros is what `t-ahci`'s one-sector write ever needed; §10.5's
+/// instrument then needs more — `t-ext4-mount` copies an 80 MiB ext4 fixture
+/// onto this disk, and a device whose capacity is under the copy's length
+/// refuses every write past its end (`check_span`), which would read as a
+/// broken driver rather than an undersized fixture. So the number lives in one
+/// constant both ends honour.
+pub const SATA_TEST_BYTES: u64 = 96 * 1024 * 1024;
+
 /// Writes the SATA image unless one of the right size is already there.
 pub fn ensure_sata_image(build_dir: &Path) -> Result<()> {
     let path = sata_image(build_dir);
     if path.metadata().map(|m| m.len()).unwrap_or(0) == SATA_TEST_BYTES {
         return Ok(());
     }
+    lay_zeros(&path)?;
+    Ok(())
+}
+
+/// Lay the SATA disk a **sweep** boots, fresh: zeros, the shape every claim
+/// about it is stated against.
+///
+/// [`ensure_sata_image`] creates the file when it is missing and otherwise
+/// leaves it alone, which is right for a session — `cargo xtask run` boots the
+/// disk a person may have written to, and their bytes are theirs. It is wrong
+/// for a gate, because the programs that run against this disk *write* to it:
+/// `t-ahci` a sector and a 16 KiB run, and §10.5's pair a whole filesystem
+/// through the block door. Every claim they make about what is *around* what
+/// they wrote ("and is still zero", "the sector before it was not written by the
+/// long request") is a claim about a disk in a known state — and the file
+/// outlives the run, so a sweep that inherited the last one's filesystem would
+/// fail its own pins on the second run and pass on the third. That is the one
+/// shape a gate must not have.
+///
+/// So a sweep lays its own disk before every boot, the way it lays its ESP and
+/// its medium. Sparse on the host: a run that touches a few sectors pays for a
+/// few sectors.
+pub fn reset_sata_image(build_dir: &Path) -> Result<()> {
     fs::create_dir_all(build_dir)?;
-    let file =
-        fs::File::create(&path).with_context(|| format!("Failed to create {}", path.display()))?;
+    lay_zeros(&sata_image(build_dir))
+}
+
+/// Truncate a file to [`SATA_TEST_BYTES`] of zeros, creating it if needed.
+fn lay_zeros(path: &Path) -> Result<()> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("Failed to lay {}", path.display()))?;
     file.set_len(SATA_TEST_BYTES)
         .with_context(|| format!("Failed to size {}", path.display()))?;
     Ok(())
@@ -295,6 +333,100 @@ fn esp_dir(build_dir: &Path, arch: Arch) -> PathBuf {
 /// directory has to be a real image once there is a table to put it in.
 fn esp_image(build_dir: &Path, arch: Arch) -> PathBuf {
     build_dir.join(format!("{}-sweep-esp.fat", arch.name()))
+}
+
+/// The test machine's ext4 fixture: one filesystem image with the files
+/// `t-diskbench` reads and `t-ext4-mount` mounts. Built once into
+/// `build/test-sata.ext4.img`, **shared by both machines' sweeps** — unlike the
+/// pattern image, which is per-machine because a check compares its bytes, this
+/// fixture reaches each guest through that machine's own payload channel (the
+/// x86_64 test initramfs carries it as an archive member; the aarch64 sweep
+/// medium lays it on its root partition), so the guest never reads the host
+/// file and there is no per-machine content to keep apart. A fresh sparse image
+/// is what made every read of an unwritten extent cost a device read (§10.5's
+/// instrument needs a disk that answers like a disk).
+///
+/// The tree it lays from is built by hand — mkfs's `-d` takes a host directory,
+/// and this content is three files, not a distribution. The two generated files
+/// are `(block + byte) % 251` per byte rather than stored, so a reader can check
+/// *content* and not only speed, and a slot handed back for the wrong block
+/// fails as data. **Two sizes, because the instrument asks two questions**: the
+/// cache's own working set is 8 MiB (2048 slots of 4 KiB), so one file is
+/// bigger than it by eightfold — a sequential scan must miss every block, and
+/// the count says so — and one fits in half of it, so a second pass over *that*
+/// file must cost no device reads at all. The first draft asked the second
+/// question of the first file, where the answer is arithmetically forced to be
+/// "no" (measured: cold 16387, warm 16384). The sizes are constants
+/// `t-diskbench` names; changing either without the other is the drift this
+/// comment pins in one place.
+pub fn build_ext4_image(build_dir: &Path) -> Result<PathBuf> {
+    sata_ext4_image(build_dir).existing_or_build(EXT4_FIXTURE_BYTES, || {
+        let tree = build_dir.join("test-sata-staging");
+        let _ = fs::remove_dir_all(&tree);
+        fs::create_dir_all(&tree)?;
+        let mut bytes: Vec<u8> = Vec::with_capacity(PATTERN_BYTES as usize);
+        for i in 0..PATTERN_BYTES as usize {
+            bytes.push((((i / 4096) as u64 + (i % 4096) as u64) % 251) as u8)
+        }
+        fs::write(tree.join("pattern.bin"), &bytes)?;
+        let mut cached: Vec<u8> = Vec::with_capacity(CACHED_BYTES as usize);
+        for i in 0..CACHED_BYTES as usize {
+            cached.push((((i / 4096) as u64 + (i % 4096) as u64) % 251) as u8)
+        }
+        fs::write(tree.join("cached.bin"), &cached)?;
+        fs::write(tree.join("hello.txt"), b"mpos ext4 test filesystem\n")?;
+        // The fixture is its own volume, not a sweep medium's `ext4_image`: it
+        // is copied onto the guest's SATA disk by `t-ext4-mount`, and the file
+        // itself is what lands there.
+        lay_ext4(&sata_ext4_image(build_dir), &tree, EXT4_FIXTURE_BYTES)?;
+        let _ = fs::remove_dir_all(&tree);
+        Ok(())
+    })
+}
+
+/// The fixture's pattern file: 64 MiB, past the cache's 8 MiB by eightfold, so a
+/// sequential scan misses every block whatever the policy does.
+const PATTERN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The fixture's *fitting* file: 4 MiB, half of the cache's 2048 slots, so a
+/// second sequential pass over it is served from memory. The other half of the
+/// instrument's question, and the reason it is a second file.
+const CACHED_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The fixture volume's size: the two generated files plus 16 MiB of filesystem
+/// metadata and slack (an `mkfs` that runs out of blocks answers "no blocks",
+/// which reads as a build failure).
+const EXT4_FIXTURE_BYTES: u64 = PATTERN_BYTES + CACHED_BYTES + 16 * 1024 * 1024;
+
+/// The fixture's path under `build/`.
+fn sata_ext4_image(build_dir: &Path) -> PathBuf {
+    build_dir.join("test-sata.ext4.img")
+}
+
+/// One cached builder over a derived file: reuse the artifact when it is already
+/// the declared size, otherwise run the closure that lays it and hand back its
+/// path. Split out from [`build_ext4_image`] so the rule has a name and can be
+/// pinned directly (`fixture_is_laid_once_and_reused`).
+///
+/// The identity is the **size**, the same rule [`ensure_sata_image`] uses for the
+/// SATA backing file, and for the same reason: a fixture whose content is defined
+/// by a constant has to be rebuilt when that constant moves, or a tree still
+/// holding the old image runs against a shape the programs no longer describe.
+/// "Exists" was that identity until the fixture gained its second file — an
+/// 80 MiB image from an earlier build would then have answered a `t-diskbench`
+/// that expects the 4 MiB `cached.bin` inside it, and the failure would read as
+/// the kernel's.
+trait ExistingOrBuild {
+    fn existing_or_build(self, bytes: u64, build: impl FnOnce() -> Result<()>) -> Result<PathBuf>;
+}
+
+impl ExistingOrBuild for PathBuf {
+    fn existing_or_build(self, bytes: u64, build: impl FnOnce() -> Result<()>) -> Result<PathBuf> {
+        if self.metadata().map(|m| m.len()).unwrap_or(0) != bytes {
+            build()?;
+        }
+        Ok(self)
+    }
 }
 
 /// Lay one payload file on a staging tree, creating any directory its name
@@ -386,8 +518,10 @@ pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<Pat
     ensure_pattern_image(build_dir, arch)?;
     // The SATA disk, for exactly the same reason: `virt_machine_args` attaches
     // an AHCI controller to every boot of the second machine, and a sweep on a
-    // fresh tree has no `disk`/`rootfs` run behind it either.
-    ensure_sata_image(build_dir)?;
+    // fresh tree has no `disk`/`rootfs` run behind it either. Laid *fresh*
+    // rather than merely ensured, because this sweep's own programs write to it
+    // (`reset_sata_image` says why the two are not the same question).
+    reset_sata_image(build_dir)?;
     let disk = medium(build_dir, arch).with_extension("img");
     // Hoisted above the check because it is an *input* to it: `ensure_path` is
     // itself cached, and when it does rebuild the archive the new mtime is
@@ -465,7 +599,7 @@ pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<Pat
     for (name, bytes) in entries {
         stage_program(&staging, name, bytes)?;
     }
-    lay_ext4(build_dir, arch, &staging, disk_bytes)?;
+    lay_ext4(&ext4_image(build_dir, arch), &staging, disk_bytes)?;
 
     // The ESP half: `mkfs.fat` makes the empty volume and `fat::populate` fills
     // it, which is the root-free way to do what `mcopy` or a mount would.
@@ -540,16 +674,11 @@ fn medium_fingerprint(entries: &[(&str, &[u8])], disk_bytes: u64, cmdline: &str)
     out
 }
 
-/// A digest of a staged program's bytes.
-///
-/// `DefaultHasher` is not a checksum and is not promised to hash the same way
-/// across compiler versions. It does not need to be: a digest that changes when
-/// it should not costs one rebuild, and one rebuild is the direction every
-/// ambiguity here is resolved towards.
+/// A digest of a staged program's bytes — the shared
+/// [`crate::utils::content_digest`], so the sweep medium and the rootfs stamp
+/// answer with one hash function and one set of semantics.
 fn digest(bytes: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(bytes, &mut hasher);
-    std::hash::Hasher::finish(&hasher)
+    crate::utils::content_digest(bytes)
 }
 
 /// True when the medium in `build/` is not the one this sweep is asking for.
@@ -628,10 +757,9 @@ fn medium_is_stale(
 /// [`stage_program`] sets. An *installed* root - which is where ownership does
 /// matter, because `login(1)` reads `/etc/shadow` - is not laid this way at all;
 /// `rootfs` installs it through the block layer.
-fn lay_ext4(build_dir: &Path, arch: Arch, tree: &Path, disk_bytes: u64) -> Result<()> {
-    let ext4 = ext4_image(build_dir, arch);
+fn lay_ext4(image: &Path, tree: &Path, disk_bytes: u64) -> Result<()> {
     let file =
-        fs::File::create(&ext4).with_context(|| format!("Failed to create {}", ext4.display()))?;
+        fs::File::create(image).with_context(|| format!("Failed to create {}", image.display()))?;
     file.set_len(disk_bytes)?;
     drop(file);
 
@@ -640,7 +768,7 @@ fn lay_ext4(build_dir: &Path, arch: Arch, tree: &Path, disk_bytes: u64) -> Resul
         .arg(tree)
         .args(["-O", "^has_journal,^metadata_csum"])
         .args(["-b", "4096"])
-        .arg(&ext4);
+        .arg(image);
     crate::utils::run_status(&mut cmd, "mkfs.ext4 the filesystem image")
 }
 
@@ -665,6 +793,52 @@ mod tests {
         // And the two machines never share one: a sweep's medium carries the
         // payload built for its own machine's target.
         assert_ne!(medium(build, Arch::X86_64), medium(build, Arch::Aarch64));
+    }
+
+    /// §10.5's fixture is laid once and reused: the cached builder runs its
+    /// closure only when the file is absent, and hands the same path back
+    /// every time after. The counterfactual is a sweep that re-laid 64 MiB of
+    /// pattern on every run - not wrong, but the cost this whole pipeline
+    /// exists to refuse; and an *un*cached builder would be worse, because the
+    /// x86_64 archive tail and the aarch64 medium both read the file through
+    /// this one function and must see one image, not two generations of it.
+    #[test]
+    fn fixture_is_laid_once_and_reused() {
+        let dir = std::env::temp_dir().join(format!("mpos-fixture-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fixture.img");
+
+        let mut builds = 0;
+        for _ in 0..3 {
+            let p = path
+                .clone()
+                .existing_or_build(4, || {
+                    builds += 1;
+                    fs::write(&path, b"laid").map_err(|e| anyhow::anyhow!(e))
+                })
+                .unwrap();
+            assert_eq!(p, path);
+        }
+        assert_eq!(builds, 1, "the closure ran more than once for one artifact");
+        assert_eq!(fs::read(&path).unwrap(), b"laid");
+
+        // And the identity is the *size*, so an artifact laid by an older
+        // constant is replaced rather than used: the counterfactual is the
+        // fixture gaining a file (the 4 MiB `cached.bin`) while a tree still
+        // holds the image built before it, which a caller has no way to notice
+        // - `t-diskbench` would read a file the image does not carry.
+        let p = path
+            .clone()
+            .existing_or_build(9, || {
+                builds += 1;
+                fs::write(&path, b"relaid!!").map_err(|e| anyhow::anyhow!(e))
+            })
+            .unwrap();
+        assert_eq!(p, path);
+        assert_eq!(builds, 2, "a wrong-size artifact was reused");
+        assert_eq!(fs::read(&path).unwrap(), b"relaid!!");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A sweep's boot has its block check's fixture behind it.

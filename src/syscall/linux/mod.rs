@@ -427,7 +427,7 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
         // puts in the caller's block; §4.2 forbids that, and the caller it was
         // written for (glibc) registers at length 33/alignment 64 on a current
         // kernel, a shape that arm rejected anyway, so it honoured neither.
-        // Doing `rseq` for real is a named gap. See `NOTES.md` A6.
+        // Doing `rseq` for real is a named gap. See `docs/notes/` §12.1 A6.
         nr::CLEANUP_AFTER_KTHREAD => 0,
 
         // --- the calls an ordinary libc reaches for ---

@@ -1194,6 +1194,16 @@ struct Task {
     /// than by moving the machine's root. This is what keeps an unprivileged
     /// `chroot` inside its caller.
     root: Option<Arc<dyn crate::vfs::Inode>>,
+    /// The mount table this task resolves through - its namespace, in Linux's
+    /// `nsproxy->mnt_ns`. `None` is the machine's one table (`vfs::mount::global`),
+    /// which is where every task starts and what every boot step means;
+    /// `unshare(CLONE_NEWNS)` replaces it with [`crate::vfs::mount::MountTable::copy`]
+    /// of the current one, and `fork`/`clone` hand it on **by reference** — the
+    /// child shares the parent's table until it unshares its own, exactly as the
+    /// `uts` slot beside it works. A task's view of "what is mounted where" is
+    /// therefore two facts held together: this table and the `root` above, which
+    /// is why `current_fs_context` answers both in one call.
+    fs_ns: Option<Arc<crate::vfs::mount::MountTable>>,
     /// The task that spawned this one in ring 3, if any. Its `wait` blocks on
     /// this task's exit; kernel-spawned tasks have none.
     parent: Option<TaskId>,
@@ -1537,6 +1547,7 @@ impl Task {
             cwd: None,
             cwd_path: None,
             root: None,
+            fs_ns: None,
             parent: None,
             pgid: TaskId(0),
             session: TaskId(0),
@@ -2054,6 +2065,7 @@ impl Table {
             cwd: None,
             cwd_path: None,
             root: None,
+            fs_ns: None,
             parent: None,
             pgid: TaskId(0),
             session: TaskId(0),
@@ -2514,6 +2526,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             cwd: None,
             cwd_path: None,
             root: None,
+            fs_ns: None,
             parent: None,
             // init leads the first process group, so a command started
             // before any job control exists still has a group to land in.
@@ -2670,6 +2683,7 @@ pub fn try_spawn_user(
             cwd: t.task(parent).cwd.clone(),
             cwd_path: t.task(parent).cwd_path.clone(),
             root: t.task(parent).root.clone(),
+            fs_ns: t.task(parent).fs_ns.clone(),
             parent: Some(parent),
             pgid: t.task(parent).pgid,
             session: t.task(parent).session,
@@ -3560,6 +3574,42 @@ pub fn set_root(dir: Arc<dyn crate::vfs::Inode>) {
     with_table(|t| t.task_mut(t.current).root = Some(dir));
 }
 
+/// The running task's mount context: the table its paths resolve through and
+/// the directory its absolute paths begin at. One call because every resolution
+/// needs both — `resolve_walk`'s jail is the root, and the mount crossing that
+/// walks over it reads the table — and two answers by context: a task that never
+/// unshared holds `None` here and means the machine's one table
+/// (`vfs::mount::global`), exactly as the `root` slot's `None` means the
+/// machine's root. Boot code runs before any task exists and never calls this;
+/// the host build has no task table to ask, so `vfs::mount`'s side of the pair
+/// falls back to the table under test there (see `process_fs_context`).
+pub fn current_fs_context() -> (
+    Option<Arc<crate::vfs::mount::MountTable>>,
+    Option<Arc<dyn crate::vfs::Inode>>,
+) {
+    with_table(|t| {
+        let task = t.task(t.current);
+        (task.fs_ns.clone(), task.root.clone())
+    })
+}
+
+/// Give the running task a mount table of its own: `unshare(CLONE_NEWNS)`'s
+/// scheduler half. The copy is the VFS's (`MountTable::copy`, Linux's
+/// `copy_mnt_ns`) — this only moves the caller's slot, which is what makes the
+/// split observable: the task's siblings and children keep pointing at the old
+/// table, and everything they resolve goes on answering the mounts the caller is
+/// about to stop seeing. Same per-task rule as `unshare_uts` beside it.
+pub fn unshare_mnt() {
+    with_table(|t| {
+        let fresh = t.task(t.current).fs_ns.clone();
+        let copied = match fresh {
+            Some(table) => table.copy(),
+            None => crate::vfs::mount::global().copy(),
+        };
+        t.task_mut(t.current).fs_ns = Some(copied);
+    });
+}
+
 /// The path the running task's cwd was reached by, or "/" when it has never
 /// moved - the answer `getcwd` owes its caller.
 pub fn current_cwd_path() -> alloc::string::String {
@@ -4032,6 +4082,38 @@ pub fn current_comm_bytes() -> [u8; 16] {
 #[cfg(target_os = "none")]
 pub fn current_uts() -> Arc<crate::uts::Uts> {
     with_table(|t| Arc::clone(&t.task(t.current).uts))
+}
+
+/// Whether the running task's UTS namespace answers `uname`'s
+/// `release`/`version` with §10.5's private disk-counter protocol.
+///
+/// One read per caller, lock held only to clone an `Arc`, exactly like
+/// [`current_uts`] - and the same reason: the caller may format strings after
+/// this returns, which allocates, which must not happen under the table lock.
+#[cfg(target_os = "none")]
+pub fn current_diskstat() -> bool {
+    with_table(|t| t.task(t.current).uts.diskstat())
+}
+
+/// Arm §10.5's disk-counter protocol on the boot task's UTS namespace.
+///
+/// Called once, by the boot flow, before pid 1 exists — and it lands on the
+/// *init namespace*, which every later task inherits by reference, so one call
+/// arms the machine. A task that unshares its UTS namespace copies the flag
+/// with the names: the payload is rendered from the live counters at read
+/// time, so a private namespace inside an armed boot still reads real numbers.
+///
+/// The arming goes through `uts::arm_init`, not through the task table: the
+/// boot flow runs this before `sched::init()` adopts the boot task, when there
+/// is no table entry for `t.current` to name yet (the boot task is adopted
+/// into slot 0 only there), and `Table::task` panics on an absent slot. The
+/// init namespace is what every later task is created with (`create_at` hands
+/// each new task `uts::init()`), so arming it before any task exists reaches
+/// every task afterwards — which is the same inheritance the doc above
+/// describes, just taken from the namespace rather than from a table row.
+#[cfg(target_os = "none")]
+pub fn arm_diskstat_boot_namespace() {
+    crate::uts::arm_init();
 }
 
 /// Give the running task a namespace of its own: `unshare(CLONE_NEWUTS)`.
@@ -5703,6 +5785,28 @@ pub fn exit(code: isize) -> ! {
         }
         t.task_mut(id).exited = true;
         record_retired(id, code, t.task(id).trace.tracer);
+
+        // Linux's `forget_original_parent`: a process that exits hands every
+        // child that was still its own to init. Without this a zombie keeps a
+        // `parent` naming a *slot* — and slots are reused, so the next process
+        // to occupy this one inherits the dead process's children: `read_sigchld`
+        // filters by `task.parent == Some(me)`, and `wait4`'s tables do the same
+        // by number. Measured, once the sweep's program count grew: `t-signalfd`
+        // was handed four records for one death, three of them naming slots 8
+        // and 10 — unreaped orphans of an *earlier* occupant of its own slot —
+        // and the read before its fork answered a record where the claim is
+        // `EAGAIN`.
+        //
+        // Init is always alive (the kernel stops the machine rather than let it
+        // exit, below), so it is the only candidate. Linux also gives a dead
+        // child to its *tracer* when one is attached, and sends SIGHUP+SIGCONT
+        // to an orphaned process group; neither is modelled here, and this walk
+        // is where the first of them would go.
+        for slot in t.tasks.iter_mut().flatten() {
+            if slot.parent == Some(id) {
+                slot.parent = Some(INIT_PID);
+            }
+        }
 
         // Everything the task owned is given back *here*, at its exit, which
         // is Linux's own moment for it (`do_exit` closes the files and tears
@@ -7747,6 +7851,30 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             cwd: parent_cwd,
             cwd_path: parent_cwd_path,
             root: parent_root,
+            // The same mount table as its parent, by reference — see the `uts`
+            // line below: a copy here would give `fork` the effect `unshare` is
+            // for. A child that wants its own namespace asks for it explicitly.
+            // `clone(CLONE_NEWNS)`: the child starts in a *copy* of the
+            // parent's table (Linux's `copy_mnt_ns` on exactly this flag), so
+            // what it mounts or peels never reaches the namespace it came from
+            // — and the copy is of what the parent holds *now*, including any
+            // namespace the parent itself unshared, which is the composition
+            // Linux has. Without the flag the reference is handed on, as every
+            // fork since the beginning did. Pinned by `t-ns-mnt`. A new group
+            // needs no nsproxy for this: the child *is* a fresh group, so the
+            // fresh `Arc` at creation is the whole mechanism — which is why MNT
+            // lands here while CLONE_FS-style separation stays parked with the
+            // shared-group handle.
+            fs_ns: if request.flags & crate::abi::CLONE_NEWNS != 0 {
+                match &t.task(parent_id).fs_ns {
+                    Some(table) => Some(table.copy()),
+                    // The machine's table copied: a child of an unshared
+                    // parent gets its own private view of the same world.
+                    None => Some(crate::vfs::mount::machine_table().copy()),
+                }
+            } else {
+                t.task(parent_id).fs_ns.clone()
+            },
             parent: Some(parent_id),
             pgid: t.task(parent_id).pgid,
             // A fork child is in the same session as its parent and holds the
@@ -7758,7 +7886,18 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // A fork child is in its parent's namespace, by reference: the two
             // go on reporting one set of names until one of them unshares. A
             // copy here would give a `fork` the effect `unshare` is for.
-            uts: Arc::clone(&t.task(parent_id).uts),
+            // `clone(CLONE_NEWUTS)`: the child starts in a *copy* of its
+            // parent's names (Linux's `copy_utsname` on exactly this flag), so
+            // it can rename without the parent following — and the copy is of
+            // what the parent holds *now*, including any namespace the parent
+            // itself unshared, which is the composition Linux has. Without the
+            // flag the reference is handed on, as every fork since the
+            // beginning did. Pinned by `t-clone`.
+            uts: if request.flags & crate::abi::CLONE_NEWUTS != 0 {
+                t.task(parent_id).uts.copied()
+            } else {
+                Arc::clone(&t.task(parent_id).uts)
+            },
             umask: t.task(parent_id).umask,
             oom_score_adj: t.task(parent_id).oom_score_adj,
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
@@ -8222,6 +8361,18 @@ fn scheduler_loop() {
 /// could corrupt by continuing, so suspending it would buy nothing - and every
 /// `CLONE_VFORK` caller in practice (`posix_spawn`) waits on the child itself.
 pub fn clone(state: &UserFrame, request: CloneRequest) -> isize {
+    // The namespace kinds `clone` may carry, decided before anything is
+    // created: privilege first, then the one kind whose copy is wired into the
+    // child's construction below (`clone_namespace_verdict` names which, and
+    // why the rest are refused whole rather than half-served). A thread-group
+    // nsproxy is *not* needed for this — the child is a new group by
+    // construction, so handing it a fresh `Arc` at creation is the whole
+    // mechanism, which is why MNT lands here while CLONE_FS-style separation
+    // stays parked with the shared-group handle.
+    let privileged = current_credentials().has_effective(crate::cred::CAP_SYS_ADMIN);
+    if let Err(e) = crate::abi::clone_namespace_verdict(request.flags, privileged) {
+        return e;
+    }
     if request.flags & crate::abi::CLONE_THREAD != 0 {
         return spawn_thread(state, request);
     }
@@ -8283,6 +8434,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         let cwd = parent.cwd.clone();
         let cwd_path = parent.cwd_path.clone();
         let root = parent.root.clone();
+        let parent_fs_ns = parent.fs_ns.clone();
         let brk_base = parent.brk_base;
         let brk_pages = parent.brk_pages;
         let mmap_cursor = parent.mmap_cursor;
@@ -8352,6 +8504,12 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             cwd,
             cwd_path,
             root,
+            // A thread is its process: the group's mount table is shared by all
+            // of its tasks, so this is the creator's slot value, by reference —
+            // Linux's `clone(CLONE_FS)` is what every thread creation sets here,
+            // and unsharing a mount namespace from within a thread group is left
+            // to the task that asks (`unshare` moves only the caller).
+            fs_ns: parent_fs_ns,
             // Not a child: `wait` collects processes, and a thread is not one.
             // The process becomes collectable when its leader exits.
             parent: None,

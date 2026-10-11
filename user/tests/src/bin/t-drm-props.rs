@@ -393,7 +393,10 @@ fn check_refused(r: &mut Report, name: &str, got: isize, want: Errno) {
     if got == refused(want) {
         r.check(name, true);
     } else {
-        r.check(&format!("{name} (got {got}, want {})", refused(want)), false);
+        r.check(
+            &format!("{name} (got {got}, want {})", refused(want)),
+            false,
+        );
     }
 }
 
@@ -661,7 +664,10 @@ fn main() {
             f
         }
         Err(e) => {
-            r.check(&format!("a second descriptor of the card opens ({e:?})"), false);
+            r.check(
+                &format!("a second descriptor of the card opens ({e:?})"),
+                false,
+            );
             println!("FAILED");
             std::process::exit(1);
         }
@@ -685,11 +691,7 @@ fn main() {
             "and by id it is still answered, flagged ATOMIC",
             name_of(&prop) == b"FB_ID" && prop.flags & PROP_ATOMIC != 0,
         ),
-        None => check_true(
-            &mut r,
-            "the plane's FB_ID answers GETPROPERTY by id",
-            false,
-        ),
+        None => check_true(&mut r, "the plane's FB_ID answers GETPROPERTY by id", false),
     }
 
     let mut cap = Cap {
@@ -1407,7 +1409,12 @@ fn main() {
                 prop.flags & PROP_BLOB != 0 && prop.flags & PROP_IMMUTABLE != 0,
             );
             let bytes = blob(fd, blob_id as u32).expect("the IN_FORMATS bytes");
-            check_is(&mut r, "the blob is version 1", get32(&bytes, 0) as isize, 1);
+            check_is(
+                &mut r,
+                "the blob is version 1",
+                get32(&bytes, 0) as isize,
+                1,
+            );
             check_is(
                 &mut r,
                 "it lists as many formats as the plane reports",
@@ -1420,7 +1427,12 @@ fn main() {
                 get32(&bytes, 12) as isize,
                 24,
             );
-            check_is(&mut r, "there is one modifier", get32(&bytes, 16) as isize, 1);
+            check_is(
+                &mut r,
+                "there is one modifier",
+                get32(&bytes, 16) as isize,
+                1,
+            );
             // 24 + 4 * n, rounded up to eight - which for two formats is 32.
             let modifiers = get32(&bytes, 20) as usize;
             check_is(

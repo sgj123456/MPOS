@@ -1602,7 +1602,11 @@ mod tests {
         ] {
             node.set_times(111, 222).unwrap();
             assert_eq!(node.mtime(), 222, "a ramfs {what} takes the caller's value");
-            assert_eq!(node.atime(), 222, "and folds the atime into it, its one clock");
+            assert_eq!(
+                node.atime(),
+                222,
+                "and folds the atime into it, its one clock"
+            );
         }
     }
 

@@ -64,6 +64,24 @@ external = ["t-dhcp", "t-dns", "t-rawicmp", "t-stdresolve", "t-tcp-close", "t-ud
 # 1024 MiB a chunk at a time; the other three are instruments whose numbers are
 # the point and whose verdict can depend on how busy the host is (§10.2, §10.4
 # carry their figures).
+#
+# The two §10.5 programs stay in the **default** sweep rather than here, and
+# that is a decision with a reason: their claims are exact device-read counts,
+# not timings, so they are as stable as the cache tests' mock counts were — and
+# `t-diskbench`'s warm pass asserting `warm=0` is the regression pin the cache
+# policy has on the machine, which only a default-group program is. They also
+# arm the boot's disk-counter protocol through their own membership (a plain
+# sweep stages them, so its command line carries `mpos.diskstat`; move either
+# name here and the arming follows automatically), and the harness refuses an
+# armed run whose instrument left no reading behind.
+#
+# `t-netstats` joins them in the **default** sweep for the same shape of
+# reason: its claims are exact frame counts read off `/proc/net/dev` after a
+# fixed 256-datagram burst - one per sent datagram, an arithmetic fact about
+# the seam rather than a timing - while the datagrams-per-second figure it
+# prints is §10.4's before/after number and follows t-pipecost's "reported,
+# not asserted" rule. The harness likewise refuses a sweep that staged it but
+# saw no `NETSTAT` line.
 slow = ["t-fill-ramfs", "t-forkcost", "t-netlat", "t-pipecost"]
 
 # Not a check at all. `t-sh` execs an interactive busybox ash onto the console

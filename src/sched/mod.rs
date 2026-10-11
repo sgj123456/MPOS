@@ -37,26 +37,27 @@ pub use runtime::{
     CloneRequest, INIT_PID, ITIMER_PROF, ITIMER_REAL, ITIMER_VIRTUAL, Identity, ItimerSnapshot,
     ItimerState, MAX_TASKS, MapFacts, Redirect, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD_ID,
     STACK_ORDER, SpawnError, Stop, TIMER_ABSTIME, TaskSnapshot, TimerNotify, WaitEnd, WaitEvent,
-    WaitPark, acquire_controlling_tty, become_session_leader, block_until, block_until_child_event,
-    block_until_code, block_until_deadline, block_until_interruptible, brk, charge_cpu,
-    check_itimer, child_event, child_event_pending, child_exited_unreaped, claim_anon_gaps, clone,
-    continued_report_pending, controlling_tty_of_current, credentials_of, current, current_blocked,
-    current_comm_bytes, current_cpu_ticks, current_credentials, current_cwd, current_cwd_path,
-    current_disposition, current_exe, current_fds, current_groups, current_identity,
-    current_is_root, current_is_seccomp_strict, current_map_user, current_owner, current_pending,
-    current_pgid, current_real_owner, current_rlimit, current_root, current_stack_range,
-    current_tgid, current_tls, current_umask, current_uts, deliver_pending_signal,
-    descriptor_numbers, descriptors_of, detach_traced, discard_exit_code, exec_replace, exit,
-    exit_code, exit_group, fork, frames_range_free, get_mmap_cursor, group_members, has_children,
-    has_deliverable_signal, has_live_child, has_seccomp_filter, has_tracer, init, insert_vma,
-    is_child, is_running, is_stopped, itimer_snapshot, itimer_swap, kernel_lazy_accessible,
-    madvise_dontneed, map_anon, map_facts, map_frames, may_inspect, membarrier_registrations,
-    move_user_page, munmap_user, nice_of, oom_score_adj_of, parent_of, pause, pgid_of,
-    poll_any_child, poll_any_child_event, populate_user_page_at, preempt, process_members,
-    protect_user, protect_user_range, read_sigchld, read_user, read_user_of, record_eager_range,
-    register_membarrier, release_user_frames, reset_disposition, resolve_anon_fault,
-    resolve_cow_fault, resolve_script, resolve_stack_growth, resume_traced, rlimits_of,
-    robust_head, run_seccomp_filters, send_signal, send_signal_group, send_signal_info,
+    WaitPark, acquire_controlling_tty, arm_diskstat_boot_namespace, become_session_leader,
+    block_until, block_until_child_event, block_until_code, block_until_deadline,
+    block_until_interruptible, brk, charge_cpu, check_itimer, child_event, child_event_pending,
+    child_exited_unreaped, claim_anon_gaps, clone, continued_report_pending,
+    controlling_tty_of_current, credentials_of, current, current_blocked, current_comm_bytes,
+    current_cpu_ticks, current_credentials, current_cwd, current_cwd_path, current_diskstat,
+    current_disposition, current_exe, current_fds, current_fs_context, current_groups,
+    current_identity, current_is_root, current_is_seccomp_strict, current_map_user, current_owner,
+    current_pending, current_pgid, current_real_owner, current_rlimit, current_root,
+    current_stack_range, current_tgid, current_tls, current_umask, current_uts,
+    deliver_pending_signal, descriptor_numbers, descriptors_of, detach_traced, discard_exit_code,
+    exec_replace, exit, exit_code, exit_group, fork, frames_range_free, get_mmap_cursor,
+    group_members, has_children, has_deliverable_signal, has_live_child, has_seccomp_filter,
+    has_tracer, init, insert_vma, is_child, is_running, is_stopped, itimer_snapshot, itimer_swap,
+    kernel_lazy_accessible, madvise_dontneed, map_anon, map_facts, map_frames, may_inspect,
+    membarrier_registrations, move_user_page, munmap_user, nice_of, oom_score_adj_of, parent_of,
+    pause, pgid_of, poll_any_child, poll_any_child_event, populate_user_page_at, preempt,
+    process_members, protect_user, protect_user_range, read_sigchld, read_user, read_user_of,
+    record_eager_range, register_membarrier, release_user_frames, reset_disposition,
+    resolve_anon_fault, resolve_cow_fault, resolve_script, resolve_stack_growth, resume_traced,
+    rlimits_of, robust_head, run_seccomp_filters, send_signal, send_signal_group, send_signal_info,
     send_signal_process, session_of_tty, set_brk_base, set_clear_tid, set_current_blocked,
     set_current_comm, set_current_identity, set_current_rlimit, set_current_tls, set_current_umask,
     set_cwd, set_cwd_path, set_mmap_cursor, set_nice, set_oom_score_adj, set_pgid, set_robust_head,
@@ -67,9 +68,10 @@ pub use runtime::{
     take_exit_code, take_exit_code_current, take_fatal_signal, take_pending_event,
     take_signal_in_set, take_stop_report, take_vmas, task_count, thread_snapshots, timer_alloc,
     timer_arm, timer_overrun, timer_remove, timer_state, tls_of, trace_options, trace_syscall,
-    tracer_of, try_spawn_user, uid_members, unmap_user, unshare_uts, user_frame_at, user_mapped,
-    vfork, vma_gaps, vma_prot_at, vma_range_free, wait_any_child, wait_any_child_event,
-    wait_for_interrupt, wake, with_current_credentials, write_user, write_user_of, yield_now,
+    tracer_of, try_spawn_user, uid_members, unmap_user, unshare_mnt, unshare_uts, user_frame_at,
+    user_mapped, vfork, vma_gaps, vma_prot_at, vma_range_free, wait_any_child,
+    wait_any_child_event, wait_for_interrupt, wake, with_current_credentials, write_user,
+    write_user_of, yield_now,
 };
 
 /// The stop accessors and the register-file snapshot are the machine's to build
@@ -319,6 +321,53 @@ pub fn current_cpu_ticks() -> (u64, u64, u64, u64) {
 }
 
 /// The host build's one process, so one slot stands for "the running task's
+/// mount namespace" — the same arrangement `HOST_UTS` below uses for the names.
+/// A host test that unshares gets a copy of the table it was in and can see the
+/// copy is independent; nothing on the host drives a per-task table, because the
+/// VFS tests resolve through explicit `MountTable` values instead.
+#[cfg(not(target_os = "none"))]
+static HOST_MNT: critical_section::Mutex<
+    core::cell::RefCell<Option<alloc::sync::Arc<crate::vfs::mount::MountTable>>>,
+> = critical_section::Mutex::new(core::cell::RefCell::new(None));
+
+/// The host build's mount context: `(table, root)`, with the machine's own
+/// table standing in until something unshares. The root half answers the
+/// table's own root — there is no per-process chroot to read on the host.
+/// The host build's mount context. `None` for the table: a host resolution has
+/// no per-task namespace to consult, and every host caller already drives an
+/// explicit `MountTable` value — which is exactly what `process_fs_context`'s
+/// `None` arm means there ("this table"), so the same answer keeps the walk
+/// honest on both targets. A host test that wants to see a namespace copy works
+/// on two `MountTable` values directly (`MountTable::copy`), which is the shape
+/// [`two_tables_do_not_see_each_others_mounts`] pins.
+///
+/// [`two_tables_do_not_see_each_others_mounts`]: crate::vfs::mount::MountTable::copy
+#[cfg(not(target_os = "none"))]
+pub fn current_fs_context() -> (
+    Option<alloc::sync::Arc<crate::vfs::mount::MountTable>>,
+    Option<alloc::sync::Arc<dyn crate::vfs::Inode>>,
+) {
+    (None, None)
+}
+
+/// The one-process form of `unshare(CLONE_NEWNS)` on the host: the process
+/// moves to a copy of the table it was in, held in `HOST_MNT`. No host test
+/// drives it today — the VFS tests pass tables explicitly — but it exists so
+/// the machine body and the host body of this pair both compile (V-11's rule:
+/// a module with two bodies has both move).
+#[cfg(not(target_os = "none"))]
+pub fn unshare_mnt() {
+    critical_section::with(|cs| {
+        let mut slot = HOST_MNT.borrow(cs).borrow_mut();
+        let copied = match &*slot {
+            Some(table) => table.copy(),
+            None => crate::vfs::mount::global().copy(),
+        };
+        *slot = Some(copied);
+    });
+}
+
+/// The host build's one process, so one slot stands for "the running task's
 /// namespace" and `unshare_uts` is observable without a task table - the same
 /// arrangement the `comm` slot and the creation mask above use. It starts at
 /// `uts::init()`, the namespace a boot's first task holds on the machine, so a
@@ -342,6 +391,20 @@ pub fn current_uts() -> alloc::sync::Arc<crate::uts::Uts> {
             .clone()
     })
 }
+
+/// The host build's diskstat answer: never armed, because no host build boots
+/// with a disk to count and arming is a boot-step fact. The pair with
+/// `runtime`'s bare-metal body must both compile (V-11).
+#[cfg(not(target_os = "none"))]
+pub fn current_diskstat() -> bool {
+    false
+}
+
+/// The host build's arm step: nothing to arm on a machine with no task table
+/// and no disk; see the bare-metal body for what it does there (V-11's rule:
+/// a module with two bodies has both move).
+#[cfg(not(target_os = "none"))]
+pub fn arm_diskstat_boot_namespace() {}
 
 /// The one-process form of `unshare(CLONE_NEWUTS)`: the host build's process
 /// moves to a copy of the namespace it was in, so a test can see the copy is

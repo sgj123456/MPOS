@@ -10,7 +10,7 @@
 //! reported every capability effective and permitted for every task, `capset`
 //! stored nothing, and no path in the tree asked a capability question at all.
 //! Storing a value nothing consults is a shape that looks finished while
-//! doing less, so the options stayed refused (`UAPI.md` §5.3 names the
+//! doing less, so the options stayed refused (`docs/uapi/` §5.3 names the
 //! prerequisite). This module is that prerequisite.
 //!
 //! What is real here, and what is not. The four sets, the dumpable tri-state

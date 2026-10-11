@@ -230,7 +230,11 @@ fn main() {
     // feature line), so Linux refuses `RESOURCE_CREATE_BLOB` there too.
     let row: [(u64, u32, &str); 6] = if three_d {
         [
-            (3, 0, "RESOURCE_BLOB is 0 - the device offers no blob feature"),
+            (
+                3,
+                0,
+                "RESOURCE_BLOB is 0 - the device offers no blob feature",
+            ),
             (4, 0, "HOST_VISIBLE is 0"),
             (5, 0, "CROSS_DEVICE is 0"),
             (
@@ -303,7 +307,13 @@ fn main() {
     );
 
     let mut execbuf = [0u8; 64];
-    let got = unsafe { ioctl(fd, ioc_d(NR_EXECBUFFER, 64), execbuf.as_mut_ptr() as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_EXECBUFFER, 64),
+            execbuf.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_refused(
         &mut r,
         "EXECBUFFER is ENOSYS - there is no context to submit to",
@@ -327,7 +337,13 @@ fn main() {
     );
 
     let mut context = [0u8; 16];
-    let got = unsafe { ioctl(fd, ioc_d(NR_CONTEXT_INIT, 16), context.as_mut_ptr() as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_CONTEXT_INIT, 16),
+            context.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_refused(
         &mut r,
         "CONTEXT_INIT is EINVAL, which is Linux's answer without virgl",
@@ -367,7 +383,13 @@ fn main() {
     // - the over-read guard, which is this card's own addition and pinned further
     // down.
     put_u32(&mut rc, 48, 64 * 64 * 4);
-    let got = unsafe { ioctl(fd, ioc_d(NR_RESOURCE_CREATE, 56), rc.as_mut_ptr() as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_CREATE, 56),
+            rc.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_ok(&mut r, "a 2D resource is created", got);
     let handle = u32_at(&rc, 40);
     let res_handle = u32_at(&rc, 44);
@@ -379,7 +401,13 @@ fn main() {
     // honest answer needs something to name.
     let mut info = [0u8; 16];
     put_u32(&mut info, 0, handle);
-    let got = unsafe { ioctl(fd, ioc_d(NR_RESOURCE_INFO, 16), info.as_mut_ptr() as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_INFO, 16),
+            info.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_ok(&mut r, "RESOURCE_INFO succeeds", got);
     check_is(
         &mut r,
@@ -448,12 +476,24 @@ fn main() {
     // slot going away.
     let mut close = [0u8; 8];
     put_u32(&mut close, 0, handle);
-    let got = unsafe { ioctl(fd, ioc_d(NR_GEM_CLOSE, 8), close.as_mut_ptr() as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GEM_CLOSE, 8),
+            close.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_ok(&mut r, "GEM_CLOSE releases the resource handle", got);
 
     // ---- RESOURCE_CREATE: what a card without 3D still refuses --------------
     put_u32(&mut rc, 0, 4); // the 3D target
-    let got = unsafe { ioctl(fd, ioc_d(NR_RESOURCE_CREATE, 56), rc.as_mut_ptr() as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_CREATE, 56),
+            rc.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_refused(
         &mut r,
         "a 3D target is EINVAL, as a card without 3D answers it",
@@ -463,12 +503,24 @@ fn main() {
 
     put_u32(&mut rc, 0, 2);
     put_u32(&mut rc, 20, 2); // depth
-    let got = unsafe { ioctl(fd, ioc_d(NR_RESOURCE_CREATE, 56), rc.as_mut_ptr() as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_CREATE, 56),
+            rc.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_refused(&mut r, "a depth above one is EINVAL", got, Errno::INVAL);
 
     put_u32(&mut rc, 20, 1);
     put_u32(&mut rc, 32, 2); // nr_samples
-    let got = unsafe { ioctl(fd, ioc_d(NR_RESOURCE_CREATE, 56), rc.as_mut_ptr() as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_CREATE, 56),
+            rc.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_refused(&mut r, "multisampling is EINVAL", got, Errno::INVAL);
 
     // ---- EFAULT comes before any of the refusals ----------------------------
@@ -583,7 +635,13 @@ fn three_d_assertions(fd: i32, r: &mut Report) {
     put_u32(&mut rc, 28, 1);
     put_u32(&mut rc, 32, 1);
     put_u32(&mut rc, 48, 64 * 64 * 4);
-    let got = unsafe { ioctl(fd, ioc_d(NR_RESOURCE_CREATE, 56), rc.as_mut_ptr() as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_CREATE, 56),
+            rc.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_ok(
         r,
         "a 3D target is served, where a card without 3D answers EINVAL",
@@ -606,7 +664,13 @@ fn three_d_assertions(fd: i32, r: &mut Report) {
     let mut ctx = [0u8; 16];
     put_u32(&mut ctx, 0, 2); // num_params
     ctx[8..16].copy_from_slice(&(params.as_ptr() as u64).to_ne_bytes());
-    let got = unsafe { ioctl(fd, ioc_d(NR_CONTEXT_INIT, 16), ctx.as_mut_ptr() as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_CONTEXT_INIT, 16),
+            ctx.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_refused(
         r,
         "CONTEXT_INIT is EEXIST - the first 3D command already made the context",
@@ -724,6 +788,12 @@ fn three_d_assertions(fd: i32, r: &mut Report) {
     // ---- and the 3D handle releases like any other -------------------------
     let mut close = [0u8; 8];
     put_u32(&mut close, 0, handle);
-    let got = unsafe { ioctl(fd, ioc_d(NR_GEM_CLOSE, 8), close.as_mut_ptr() as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GEM_CLOSE, 8),
+            close.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_ok(r, "GEM_CLOSE releases the 3D resource", got);
 }

@@ -233,14 +233,16 @@ fn main() {
     // Which console a test was started on is the harness's business, so the number
     // is read rather than asserted.
     let mut st = [0xAAu8; 6];
-    let r0 = unsafe { ioctl(tty, ior(VT, NR_VT_GETSTATE, 6), st.as_mut_ptr() as *mut c_void) };
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            ior(VT, NR_VT_GETSTATE, 6),
+            st.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_eq(&mut r, "VT_GETSTATE succeeds", r0, 0);
     let active = stat_shorts(&st, 0);
-    check_true(
-        &mut r,
-        "VT_GETSTATE names the active console",
-        active >= 1,
-    );
+    check_true(&mut r, "VT_GETSTATE names the active console", active >= 1);
     check_eq(
         &mut r,
         "v_state always carries /dev/tty0's bit",
@@ -257,7 +259,13 @@ fn main() {
     // And the console's *mode*, through the door that answers it: `struct vt_stat`
     // has no mode field on Linux, so a console's text mode is `KDGETMODE`'s.
     let mut kdmode = [0u8; 4];
-    let r0 = unsafe { ioctl(tty, io(KD, NR_KDGETMODE), kdmode.as_mut_ptr() as *mut c_void) };
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            io(KD, NR_KDGETMODE),
+            kdmode.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_eq(&mut r, "KDGETMODE succeeds on a fresh console", r0, 0);
     check_eq(
         &mut r,
@@ -270,7 +278,13 @@ fn main() {
     // which is what tells a manager it can put its session here without asking
     // permission first.
     let mut vm = [0u8; 8];
-    let r0 = unsafe { ioctl(tty, ior(VT, NR_VT_GETMODE, 8), vm.as_mut_ptr() as *mut c_void) };
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            ior(VT, NR_VT_GETMODE, 8),
+            vm.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_eq(&mut r, "VT_GETMODE succeeds", r0, 0);
     check_eq(
         &mut r,
@@ -287,7 +301,13 @@ fn main() {
     let want = vt_mode_bytes(VT_PROCESS, 0, SIGUSR1, SIGUSR2, 0);
     let r0 = unsafe { ioctl(tty, iow(VT, NR_VT_SETMODE, 8), want.as_ptr() as *mut c_void) };
     check_eq(&mut r, "VT_SETMODE(VT_PROCESS) succeeds", r0, 0);
-    let r0 = unsafe { ioctl(tty, ior(VT, NR_VT_GETMODE, 8), vm.as_mut_ptr() as *mut c_void) };
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            ior(VT, NR_VT_GETMODE, 8),
+            vm.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_eq(&mut r, "VT_GETMODE after SETMODE succeeds", r0, 0);
     check_true(
         &mut r,
@@ -302,9 +322,21 @@ fn main() {
     // `VT_GETSTATE`. seatd names `SIGIO` there, so a kernel that stored it would be
     // reading back a number that owes the caller nothing.
     let with_fr = vt_mode_bytes(VT_PROCESS, 0, SIGUSR1, SIGUSR2, SIGIO);
-    let r0 = unsafe { ioctl(tty, iow(VT, NR_VT_SETMODE, 8), with_fr.as_ptr() as *mut c_void) };
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            iow(VT, NR_VT_SETMODE, 8),
+            with_fr.as_ptr() as *mut c_void,
+        )
+    };
     check_eq(&mut r, "VT_SETMODE with frsig named succeeds", r0, 0);
-    let r0 = unsafe { ioctl(tty, ior(VT, NR_VT_GETMODE, 8), vm.as_mut_ptr() as *mut c_void) };
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            ior(VT, NR_VT_GETMODE, 8),
+            vm.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_eq(&mut r, "VT_GETMODE after the frsig call succeeds", r0, 0);
     check_true(
         &mut r,
@@ -333,13 +365,15 @@ fn main() {
     // The mode the two refusals above did *not* take is still the one set,
     // because a refused SETMODE that half-wrote its struct is worse than one
     // that was never answered at all.
-    let r0 = unsafe { ioctl(tty, ior(VT, NR_VT_GETMODE, 8), vm.as_mut_ptr() as *mut c_void) };
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            ior(VT, NR_VT_GETMODE, 8),
+            vm.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_eq(&mut r, "VT_GETMODE after the refusals succeeds", r0, 0);
-    check_true(
-        &mut r,
-        "a refused VT_SETMODE changed nothing",
-        vm == want,
-    );
+    check_true(&mut r, "a refused VT_SETMODE changed nothing", vm == want);
 
     // VT_RELDISP is an answer to a question, and nobody has asked this console
     // anything yet: a session that could complete a switch it was never offered
@@ -378,13 +412,14 @@ fn main() {
     // a seat manager can stand on a `VT_PROCESS` console and ask for another one
     // without blocking itself out of the answer.
     let r0 = unsafe { ioctl(tty, io(VT, NR_VT_ACTIVATE), active as usize as *mut c_void) };
-    check_eq(
-        &mut r,
-        "VT_ACTIVATE on the current console succeeds",
-        r0,
-        0,
-    );
-    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_WAITACTIVE), active as usize as *mut c_void) };
+    check_eq(&mut r, "VT_ACTIVATE on the current console succeeds", r0, 0);
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            io(VT, NR_VT_WAITACTIVE),
+            active as usize as *mut c_void,
+        )
+    };
     check_eq(
         &mut r,
         "VT_WAITACTIVE on the current console returns",
@@ -417,12 +452,7 @@ fn main() {
         ENXIO,
     );
     let r0 = unsafe { ioctl(tty, io(VT, NR_VT_WAITUNTIL), active as usize as *mut c_void) };
-    check_eq(
-        &mut r,
-        "VT_WAITUNTIL on the active console returns",
-        r0,
-        0,
-    );
+    check_eq(&mut r, "VT_WAITUNTIL on the active console returns", r0, 0);
 
     // KDSETMODE(KD_GRAPHICS) -> KDGETMODE reads it back. This pair is the
     // handover: the text console stops drawing on the screen the session has
@@ -447,10 +477,22 @@ fn main() {
     // answers, one predicate, asked back to back so nothing can move between them -
     // which is what makes this a pin of the mask's numbering rather than of itself.
     let mut free_q = [0u8; 4];
-    let r0 = unsafe { ioctl(tty, io(VT, NR_VT_OPENQRY), free_q.as_mut_ptr() as *mut c_void) };
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            io(VT, NR_VT_OPENQRY),
+            free_q.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_eq(&mut r, "VT_OPENQRY succeeds again", r0, 0);
     let free = i32::from_ne_bytes(free_q) as u16;
-    let r0 = unsafe { ioctl(tty, ior(VT, NR_VT_GETSTATE, 6), st.as_mut_ptr() as *mut c_void) };
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            ior(VT, NR_VT_GETSTATE, 6),
+            st.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_eq(&mut r, "VT_GETSTATE succeeds again", r0, 0);
     check_eq(
         &mut r,
@@ -524,7 +566,13 @@ fn main() {
     let auto = vt_mode_bytes(VT_AUTO, 0, 0, 0, 0);
     let r0 = unsafe { ioctl(tty, iow(VT, NR_VT_SETMODE, 8), auto.as_ptr() as *mut c_void) };
     check_eq(&mut r, "VT_SETMODE(VT_AUTO) restores", r0, 0);
-    let r0 = unsafe { ioctl(tty, ior(VT, NR_VT_GETMODE, 8), vm.as_mut_ptr() as *mut c_void) };
+    let r0 = unsafe {
+        ioctl(
+            tty,
+            ior(VT, NR_VT_GETMODE, 8),
+            vm.as_mut_ptr() as *mut c_void,
+        )
+    };
     check_eq(&mut r, "VT_GETMODE after the restore succeeds", r0, 0);
     check_true(
         &mut r,
@@ -544,20 +592,16 @@ fn main() {
     // than answer for a device it is not.
     if let Ok(null) = rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty()) {
         let null = null.as_raw_fd();
-        let r0 = unsafe { ioctl(null, ior(VT, NR_VT_GETSTATE, 6), st.as_mut_ptr() as *mut c_void) };
-        check_eq(
-            &mut r,
-            "VT_GETSTATE on a non-tty is ENOTTY",
-            r0,
-            ENOTTY,
-        );
+        let r0 = unsafe {
+            ioctl(
+                null,
+                ior(VT, NR_VT_GETSTATE, 6),
+                st.as_mut_ptr() as *mut c_void,
+            )
+        };
+        check_eq(&mut r, "VT_GETSTATE on a non-tty is ENOTTY", r0, ENOTTY);
         let r0 = unsafe { ioctl(null, io(KD, NR_KDGETMODE), kd.as_mut_ptr() as *mut c_void) };
-        check_eq(
-            &mut r,
-            "KDGETMODE on a non-tty is ENOTTY",
-            r0,
-            ENOTTY,
-        );
+        check_eq(&mut r, "KDGETMODE on a non-tty is ENOTTY", r0, ENOTTY);
     }
 
     // DRM master/auth carry no argument (they are `_IO`), so they must be
@@ -569,30 +613,16 @@ fn main() {
         // The card is unclaimed on a test boot, so this session can take it -
         // and having taken it, it is the only one that may set a mode.
         let r0 = unsafe { ioctl(card, io(DRM, NR_DRM_SET_MASTER), core::ptr::null_mut()) };
-        check_eq(
-            &mut r,
-            "DRM SET_MASTER succeeds (no arg)",
-            r0,
-            0,
-        );
+        check_eq(&mut r, "DRM SET_MASTER succeeds (no arg)", r0, 0);
         // `drmIsMaster` asks with AUTH, and reads its *failure* as "I am the
         // master": `EACCES` for a non-master, `EINVAL` for the one that is.
         // A card that answered 0 here would be a card weston refuses to build a
         // display device on, and a card that answered EACCES to its master would
         // be a card no compositor can ever start on.
         let r0 = unsafe { ioctl(card, io(DRM, NR_DRM_AUTH), core::ptr::null_mut()) };
-        check_eq(
-            &mut r,
-            "DRM AUTH as the master is EINVAL",
-            r0,
-            EINVAL,
-        );
+        check_eq(&mut r, "DRM AUTH as the master is EINVAL", r0, EINVAL);
         let card2 = rustix::fs::open("/dev/dri/card0", OFlags::RDWR, Mode::empty());
-        check_true(
-            &mut r,
-            "/dev/dri/card0 opens a second time",
-            card2.is_ok(),
-        );
+        check_true(&mut r, "/dev/dri/card0 opens a second time", card2.is_ok());
         if let Ok(card2) = card2 {
             let card2 = card2.as_raw_fd();
             // A second open is a second *file description*, and a description is
@@ -630,12 +660,7 @@ fn main() {
                     tok.as_mut_ptr() as *mut c_void,
                 )
             };
-            check_eq(
-                &mut r,
-                "GET_MAGIC on the client succeeds",
-                r0,
-                0,
-            );
+            check_eq(&mut r, "GET_MAGIC on the client succeeds", r0, 0);
             check_true(
                 &mut r,
                 "GET_MAGIC hands out a nonzero token",
@@ -646,12 +671,7 @@ fn main() {
             // names its own description, not the master that was in place when
             // it was minted.
             let r0 = unsafe { ioctl(card, io(DRM, NR_DRM_SET_MASTER), core::ptr::null_mut()) };
-            check_eq(
-                &mut r,
-                "the first descriptor takes the master back",
-                r0,
-                0,
-            );
+            check_eq(&mut r, "the first descriptor takes the master back", r0, 0);
             // Spending is the master's operation, and `card2` is not the master
             // any more - so the very number it was given is now worthless in its
             // own hands.
@@ -662,12 +682,7 @@ fn main() {
                     spend.as_mut_ptr() as *mut c_void,
                 )
             };
-            check_eq(
-                &mut r,
-                "a non-master cannot spend a token",
-                r0,
-                EACCES,
-            );
+            check_eq(&mut r, "a non-master cannot spend a token", r0, EACCES);
             let r0 = unsafe {
                 ioctl(
                     card,
@@ -675,12 +690,7 @@ fn main() {
                     spend.as_mut_ptr() as *mut c_void,
                 )
             };
-            check_eq(
-                &mut r,
-                "the master spends the token on the client",
-                r0,
-                0,
-            );
+            check_eq(&mut r, "the master spends the token on the client", r0, 0);
             // The authenticated descriptor still is not the master - an
             // authorisation buys the right to drive the screen, not the right to
             // authorise anybody else. `AUTH` is the master probe, and it says no.
@@ -700,38 +710,18 @@ fn main() {
                     spend.as_mut_ptr() as *mut c_void,
                 )
             };
-            check_eq(
-                &mut r,
-                "a spent token is refused",
-                r0,
-                EACCES,
-            );
+            check_eq(&mut r, "a spent token is refused", r0, EACCES);
             // `DROP_MASTER` is void too, including from a description that is
             // not the master - there it is simply a no-op rather than an error.
             let r0 = unsafe { ioctl(card2, io(DRM, NR_DRM_DROP_MASTER), core::ptr::null_mut()) };
-            check_eq(
-                &mut r,
-                "DROP_MASTER from a non-master is allowed",
-                r0,
-                0,
-            );
+            check_eq(&mut r, "DROP_MASTER from a non-master is allowed", r0, 0);
         }
         let r0 = unsafe { ioctl(card, io(DRM, NR_DRM_DROP_MASTER), core::ptr::null_mut()) };
-        check_eq(
-            &mut r,
-            "DRM DROP_MASTER succeeds (no arg)",
-            r0,
-            0,
-        );
+        check_eq(&mut r, "DRM DROP_MASTER succeeds (no arg)", r0, 0);
         // And having dropped it, the same descriptor is no longer the master, so
         // the probe's answer flips the other way.
         let r0 = unsafe { ioctl(card, io(DRM, NR_DRM_AUTH), core::ptr::null_mut()) };
-        check_eq(
-            &mut r,
-            "DRM AUTH after DROP_MASTER is EACCES",
-            r0,
-            EACCES,
-        );
+        check_eq(&mut r, "DRM AUTH after DROP_MASTER is EACCES", r0, EACCES);
     }
 
     r.finish();

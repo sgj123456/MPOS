@@ -3255,6 +3255,33 @@ pub(super) fn handle_uname(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // disagree with the other two: a program that set a domain and then
         // asked `uname` was told the domain it had just set was `(none)`.
         write_str(325, &crate::sched::current_uts().domainname());
+
+        // §10.5's private disk-counter protocol *overrides two fields of the
+        // answer above*; it does not replace it. On a machine booted for the
+        // measurement (`xtask test`, whose command line carries `mpos.diskstat`
+        // exactly when the sweep stages `t-diskbench`), `release` answers the
+        // magic word (`abi::DISKSTAT_OSRELEASE_MAGIC`) and `version` carries one
+        // row per registered disk, `<name>:<reads>:<writes>,` - rendered *here*,
+        // at read time, because the counters move while the machine runs. A
+        // *private* ABI word, disclosed in `crates/abi` and the UAPI table: no
+        // real kernel's osrelease is a number, so nothing that parses these
+        // fields can collide with it, and there is no other door for these
+        // counts - `/proc/partitions` is column-parsed by tools and this kernel
+        // has no sysfs attribute store.
+        //
+        // The two fields, and only the two: an armed boot still answers Linux's
+        // sysname, this machine's name and the caller's nodename and
+        // domainname, because every other program in the sweep reads them. The
+        // first draft returned from here *before* writing them, and three
+        // programs measured the zeroed fields as failures (`t-uname`'s three
+        // claims, `t-ns-uts`'s four door claims and `t-clone`'s NEWUTS read-back
+        // - the sweep arms the protocol whenever `t-diskbench` is staged, which
+        // is the default).
+        if crate::sched::current_diskstat() {
+            let (release, version) = abi::diskstat_uts_fields();
+            write_str(130, &release);
+            write_str(195, &version);
+        }
     }
     0
 }

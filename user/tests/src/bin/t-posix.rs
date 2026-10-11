@@ -37,10 +37,12 @@
 //! no-terminal `ENOTTY` this kernel pins; and `seccomp(STRICT)` the host
 //! refuses outright with `EFAULT`, flags or no flags, so a strict child
 //! there exits early and the death-by-`SIGKILL` claim is named as
-//! unmeasurable rather than false. `unshare(CLONE_NEWNS|CLONE_NEWTIME)` the
-//! host *serves* to root (real namespaces both) where this kernel answers
+//! unmeasurable rather than false. `unshare(CLONE_NEWTIME)` the
+//! host *serves* to root (a real time namespace) where this kernel answers
 //! its deliberate `EOPNOTSUPP` - the plan's refuse-rather-than-approximate
-//! rule - and the strict-mode stray-flags `EINVAL` meets the host's
+//! rule - while `CLONE_NEWNS` and `CLONE_NEWUTS` are *served* on both sides
+//! now that the ladder's first two rungs are built (§6.3) - and the
+//! strict-mode stray-flags `EINVAL` meets the host's
 //! `EFAULT` from the same refusal. Everything else the probe measured
 //! agrees: the identity dance, the capability words (`ffffffff`/`0x1ff`,
 //! nothing inheritable, the round-trip through `capset`), the priority
@@ -639,33 +641,41 @@ fn main() {
     // answers 0 for it. The mount namespace is `0x2_0000`, and a program asking
     // for it was being told `EINVAL` as though the bit were undefined.
     //
-    // `unshare(CLONE_NEWNS)` is the row where this kernel and Linux part
-    // company, and deliberately: Linux answers `EPERM` there for want of
-    // `CAP_SYS_ADMIN`, and this answers `EOPNOTSUPP` because there is no second
-    // mount table to be given even to root. That is the plan's refuse-rather-
+    // The two namespaces the ladder has built are *served* now - the mount
+    // table (`CLONE_NEWNS`, MNT at step 1) and the names (`CLONE_NEWUTS`, the
+    // step before it) - so this kernel and Linux agree on those grants, and
+    // what the grant buys (a copy that the namespace it came from does not
+    // follow) is `t-ns-mnt`'s and `t-ns-uts`'s subject.
+    //
+    // `unshare(CLONE_NEWTIME)` is the row where this kernel and Linux part
+    // company, and deliberately: Linux *serves* it to a caller holding
+    // `CAP_SYS_ADMIN`, and this answers `EOPNOTSUPP` because there is no time
+    // namespace to be given even to root. That is the plan's refuse-rather-
     // than-approximate rule, and a caller told `EPERM` would go looking for a
     // capability that does not help. The probe's host root *has* the
-    // capability, and the host serves both this and `CLONE_NEWTIME` - so a
-    // host run accepts the served answer beside this kernel's refusal.
+    // capability and serves it - so a host run accepts the served answer beside
+    // this kernel's refusal.
     r.check("unshare(0) succeeds", unsafe { libc::unshare(0) } == 0);
-    let mount_ns = rc(unsafe { libc::unshare(0x0002_0000) });
+    // Measured against the running kernel before being written down - which is
+    // what caught this block asserting `0x1_0000` was `CLONE_NEWNS`: that is
+    // `CLONE_THREAD`, and Linux answers 0 for it. The mount namespace is
+    // `0x2_0000`, and a program asking for it was being told `EINVAL` as though
+    // the bit were undefined.
     r.check(
-        "unshare CLONE_NEWNS answers EOPNOTSUPP",
-        mount_ns == -(libc::EOPNOTSUPP as libc::c_int) || host_run() && mount_ns == 0,
+        "unshare CLONE_NEWNS is served (MNT, step 1 of the ladder)",
+        unsafe { libc::unshare(0x0002_0000) } == 0,
     );
     let time_ns = rc(unsafe { libc::unshare(0x0000_0080) });
     r.check(
         "unshare CLONE_NEWTIME answers EOPNOTSUPP",
         time_ns == -(libc::EOPNOTSUPP as libc::c_int) || host_run() && time_ns == 0,
     );
-    // CLONE_NEWUTS is the one namespace this kernel *serves*, and this line
-    // used to assert `EOPNOTSUPP` along with the other seven: it is the pin that
-    // moved with the measurement when UTS landed (plan §6.3, step 1). All it can
-    // pin here is that the call is granted, which is exactly what the other
-    // seven do not get; what the copy buys - and that the namespace it came from
-    // does not follow - is `t-ns-uts`'s subject.
+    // CLONE_NEWUTS is the other served kind, and this line used to assert
+    // `EOPNOTSUPP` along with the other seven: it is the pin that moved with the
+    // measurement when UTS landed (plan §6.3). All it can pin here is that the
+    // call is granted, which is exactly what the unserved kinds do not get.
     r.check(
-        "unshare CLONE_NEWUTS is served (the one namespace built so far)",
+        "unshare CLONE_NEWUTS is served (UTS, the step before it)",
         unsafe { libc::unshare(0x0400_0000) } == 0,
     );
     // The thread-group flags: a task with no sibling of its own to split from

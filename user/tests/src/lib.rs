@@ -65,3 +65,53 @@ impl Report {
 pub fn host_run() -> bool {
     std::env::var_os("MPOS_ON_HOST").is_some()
 }
+
+/// Copy §10.5's ext4 fixture onto the SATA disk, through the block door.
+///
+/// Both programs of that instrument need the filesystem *on* the disk before they
+/// can read a block of it, and neither may depend on the other having run: the
+/// runner walks `/bin/t-*` in name order, so `t-diskbench` is staged before
+/// `t-ext4-mount` and would find a disk still made of zeros — which is exactly
+/// what the first gate run of the pair measured (the disk is laid fresh by the
+/// sweep, `disk::reset_sata_image`, so nothing is inherited from an earlier run
+/// either). Each therefore lays a copy of its own: 80 MiB through `write(2)` on
+/// the block node, which is the AHCI write path at volume, idempotent, and the
+/// one place this loop lives.
+///
+/// Returns the bytes copied. The error is the door's own errno, wrapped so a
+/// caller can print which one it was.
+pub fn lay_ext4_fixture(source: &str, disk: &str) -> std::io::Result<u64> {
+    use rustix::fs::{CWD, Mode, OFlags, openat};
+
+    /// One read per chunk: big enough that the loop is not the cost, small
+    /// enough to keep the payload out of any second mapping while the block
+    /// layer does the moving.
+    const CHUNK: usize = 1024 * 1024;
+
+    fn errno(e: rustix::io::Errno) -> std::io::Error {
+        std::io::Error::from_raw_os_error(e.raw_os_error())
+    }
+
+    let src = openat(CWD, source, OFlags::RDONLY, Mode::empty()).map_err(errno)?;
+    let dst = openat(CWD, disk, OFlags::WRONLY, Mode::empty()).map_err(errno)?;
+    let mut buf = vec![0u8; CHUNK];
+    let mut copied = 0u64;
+    loop {
+        let n = rustix::io::read(&src, &mut buf).map_err(errno)?;
+        if n == 0 {
+            return Ok(copied);
+        }
+        // Sequential writes to the raw device: the file position *is* the sector
+        // address, so no `pwrite` dance is needed - and a short write is
+        // continued rather than read as the end of the copy.
+        let mut done = 0;
+        while done < n {
+            let k = rustix::io::write(&dst, &buf[done..n]).map_err(errno)?;
+            if k == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+            }
+            done += k;
+        }
+        copied += n as u64;
+    }
+}

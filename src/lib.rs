@@ -207,8 +207,8 @@ pub mod kernel_services;
 pub mod kunit;
 pub mod logging;
 pub mod mm;
-/// The network stack, and the socket syscalls over it. Host builds skip it:
-/// its tests are the conformance programs that run on the machine.
+/// The network stack, and the socket syscalls over it. Host builds skip most of
+/// it: its tests are the conformance programs that run on the machine.
 ///
 /// Ungated on both machines since §13.4's device seam landed and the second one
 /// got an adapter. `net` holds `Arc<dyn drivers::virtio::NetDevice>` and names no

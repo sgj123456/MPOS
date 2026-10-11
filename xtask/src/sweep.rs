@@ -77,6 +77,26 @@ pub fn load_config() -> Result<TestConfig> {
     TestConfig::load(&utils::project_root()?.join(crate::paths::TESTS_CONFIG))
 }
 
+/// Whether `name` belongs to `machine`'s *default* sweep: ungrouped, or named
+/// in a group the plain run adds.
+///
+/// Lives here because it is the same question `select` answers when it fills a
+/// `Plan`, and one reader of `tests.toml` decides membership - pinned against
+/// that selection by [`tests::in_default_follows_the_group_membership_the_selection_uses`].
+/// Its caller today is §10.5's documentation of intent: the instrument's two
+/// programs stay in the default list on both machines *because* they are exact
+/// counts rather than timings, and this is the question an arm could ask if a
+/// future harness ever needed "would a plain sweep stage this name" without a
+/// built-program list to select from.
+pub fn in_default(machine: Machine, config: &TestConfig, name: &str) -> bool {
+    let selected = config.selection(&[], false);
+    // A machine's own gap group is not a reason-group: a name the second
+    // machine cannot serve yet is still in that machine's *plain* run for the
+    // first arm's purposes, but for this arm it never stages - so "is this
+    // program in my default sweep" is exactly `runs`, unchanged.
+    config.runs(name, &selected, machine)
+}
+
 /// Choose what this run boots, refusing a group nobody defined.
 ///
 /// The refusal is the point rather than the politeness: a group name nobody
@@ -279,6 +299,84 @@ pub fn verdict(log: &str) -> Verdict<'_> {
         setup_failed,
         kunit: kunit(log),
     }
+}
+
+/// §10.4's frame-rate readings, out of a sweep log.
+///
+/// `t-netstats` prints its steady-state line per run in the shape
+/// `NETSTAT tx=<n> datagrams_per_sec=<rate> pool=<hits>:<misses>`; this keeps
+/// the last word (a wire can wrap or repeat) and hands back every parsed
+/// number. The instrument also prints `NETSTAT_FIRST` - the cold first-burst
+/// window, kept for anyone who wants that number too - and the prefix check
+/// below is anchored at the space so only the steady-state line parses. The
+/// rate is *reported, not asserted* - t-pipecost's rule for any throughput
+/// figure under TCG - and these readings exist so §10.4's before/after pair
+/// lands beside the verdict automatically rather than in whoever-ran-the-gate's
+/// notes. An empty answer means the instrument did not run, which the armed
+/// report refuses only when the default list staged it.
+pub fn netstat_readings(log: &str) -> Vec<(u64, u64, u64, u64)> {
+    let mut latest: Option<(u64, u64, u64, u64)> = None;
+    for line in log.lines() {
+        let Some(rest) = line.trim_end().strip_prefix("NETSTAT ") else {
+            continue;
+        };
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        let field = |key: &str| words.iter().find_map(|w| w.strip_prefix(key));
+        let parse = |v: Option<&str>| v.and_then(|v| v.parse::<u64>().ok());
+        let (Some(tx), Some(rate)) = (parse(field("tx=")), parse(field("datagrams_per_sec=")))
+        else {
+            continue;
+        };
+        // The pool pair arrives as one word, `<hits>:<misses>`; a line without
+        // it is an older instrument's output and still counts for the rate.
+        let (hits, misses) = match field("pool=").and_then(|p| p.split_once(':')) {
+            Some((h, m)) => (h.parse().unwrap_or(0), m.parse().unwrap_or(0)),
+            None => (0, 0),
+        };
+        latest = Some((tx, rate, hits, misses));
+    }
+    latest.into_iter().collect()
+}
+
+/// §10.5's disk-counter readings, out of a sweep log.
+///
+/// `t-diskbench` prints one line per pass in the shape
+/// `DISKSTAT <disk> cold=<reads> warm=<reads>`; this keeps the last word for
+/// each number (a QEMU wire can wrap or repeat a line, and the final word is
+/// what the run ended with). An empty answer means no instrument ran - which is
+/// *not* an error here: the caller armed the boot only when the default list
+/// staged the program, so an un-armed run legitimately has nothing to read. The
+/// armed report refuses silence.
+pub fn diskstat_readings(log: &str) -> Vec<(&str, u64, u64)> {
+    let mut out: Vec<(&str, u64, u64)> = Vec::new();
+    for line in log.lines() {
+        let Some(rest) = line.trim_end().strip_prefix("DISKSTAT ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let Some(disk) = words.next() else { continue };
+        let after_disk: Vec<&str> = words.collect();
+        let Some(cold) = after_disk
+            .iter()
+            .find_map(|w| w.strip_prefix("cold="))
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some(warm) = after_disk
+            .iter()
+            .find_map(|w| w.strip_prefix("warm="))
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if let Some(existing) = out.iter_mut().find(|(d, _, _)| *d == disk) {
+            *existing = (disk, cold, warm);
+        } else {
+            out.push((disk, cold, warm));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -542,5 +640,65 @@ diagnostic = ["t-sh"]
         let verdict = verdict("=== RUN t-a\n=== PASS t-a\n");
         assert_eq!(verdict.passed, vec!["t-a"]);
         assert!(verdict.summary.is_none());
+    }
+
+    /// §10.5's reader: the instrument's line parses out of a log that carries
+    /// everything else a sweep prints, the last word for a disk wins (a wire
+    /// can wrap), and a malformed line is dropped rather than panicking the
+    /// report - the harness must not die on one stray byte of a serial stream.
+    #[test]
+    fn the_diskstat_reader_keeps_the_last_word_per_disk() {
+        let log = "\
+=== RUN t-diskbench
+DISKSTAT sda cold=16384 warm=0
+some other noise cold=999999
+=== PASS t-diskbench
+DISKSTAT sda cold=16384 warm=7
+DISKSTAT vda cold=2 warm=0
+=== SUMMARY pass=2 fail=0
+";
+        let readings = diskstat_readings(log);
+        assert_eq!(readings.len(), 2);
+        assert_eq!(readings[0], ("sda", 16384, 7));
+        assert_eq!(readings[1], ("vda", 2, 0));
+        assert!(diskstat_readings("no instrument here").is_empty());
+    }
+
+    /// §10.4's reader: the instrument's line parses out of a log that carries
+    /// everything else a sweep prints, the last word wins, and a malformed or
+    /// older-shape line is dropped rather than panicking the report - the same
+    /// rule `diskstat_readings` follows, because one stray byte of a serial
+    /// stream must never end a gate run.
+    #[test]
+    fn the_netstat_reader_keeps_the_last_word() {
+        let log = "\
+=== RUN t-netstats
+NETSTAT_FIRST tx=256 datagrams_per_sec=7000
+NETSTAT tx=512 datagrams_per_sec=8123 pool=0:256
+=== PASS t-netstats
+NETSTAT tx=512 datagrams_per_sec=9000 pool=41:3
+=== SUMMARY pass=1 fail=0
+";
+        let readings = netstat_readings(log);
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0], (512, 9000, 41, 3));
+        assert!(netstat_readings("no instrument here").is_empty());
+    }
+
+    /// The arming question is `tests.toml`'s, not the machine's: a name in no
+    /// group is in both machines' default sweep, and a machine-named gap is not
+    /// in *that* machine's. This is what keeps the disk-counter boot word and
+    /// the staged instrument from ever disagreeing.
+    #[test]
+    fn in_default_follows_the_group_membership_the_selection_uses() {
+        let config = config("in-default");
+        // `t-dns` is in `external`, which a plain run does not add: not default.
+        assert!(!in_default(Machine::X86_64, &config, "t-dns"));
+        // `t-drm` is aarch64's own gap: out of *its* default, in x86_64's.
+        assert!(!in_default(Machine::Aarch64, &config, "t-drm"));
+        assert!(in_default(Machine::X86_64, &config, "t-drm"));
+        // A name in no group at all is in both.
+        assert!(in_default(Machine::X86_64, &config, "t-anything-else"));
+        assert!(in_default(Machine::Aarch64, &config, "t-anything-else"));
     }
 }

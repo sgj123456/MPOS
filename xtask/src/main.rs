@@ -76,6 +76,14 @@ struct Cli {
     #[arg(long, global = true)]
     all_groups: bool,
 
+    /// `rootfs`/`all`: lay the image from scratch — partition table, filesystems
+    /// and a whole base install — whatever the stamp says. The escape hatch for
+    /// an incremental image that has drifted (an edge mirror moved under it, a
+    /// package was broken by hand inside a guest): the same configuration, but
+    /// built fresh rather than diffed.
+    #[arg(long, global = true)]
+    force_full: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -185,6 +193,16 @@ fn main() -> Result<()> {
         // threads), and no other code reads the environment concurrently in
         // this process before we `exec`/`spawn` the privileged half.
         unsafe { env::set_var("MPOS_XTASK_MODE", mode.name()) };
+    }
+
+    // `--force-full` travels the same way `--mode` does: an environment
+    // variable read by `needs_full_install`, carried across sudo both as an
+    // assignment and — below — re-parsed from argv so the child recomputes the
+    // same decision. A flag that only lived in the unprivileged parent would
+    // be silently dropped at the root boundary, which is exactly where the
+    // install runs.
+    if cli.force_full {
+        unsafe { env::set_var("MPOS_XTASK_FORCE_FULL", "1") };
     }
 
     // `run` needs root only when the image has to be rebuilt, and it has to be
@@ -443,6 +461,9 @@ fn build_under_sudo(
     if let Some(mode) = env::var_os("MPOS_XTASK_MODE") {
         sudo.arg(format!("MPOS_XTASK_MODE={}", mode.to_string_lossy()));
     }
+    if env::var_os("MPOS_XTASK_FORCE_FULL").is_some() {
+        sudo.arg("MPOS_XTASK_FORCE_FULL=1");
+    }
     sudo.arg(exe)
         .arg("--build-dir")
         .arg(build_dir)
@@ -457,6 +478,9 @@ fn build_under_sudo(
         .arg(command.name());
     if let Some(mode) = mode {
         sudo.arg("--mode").arg(mode.name());
+    }
+    if env::var_os("MPOS_XTASK_FORCE_FULL").is_some() {
+        sudo.arg("--force-full");
     }
 
     let status = sudo.status().context("Failed to run sudo")?;

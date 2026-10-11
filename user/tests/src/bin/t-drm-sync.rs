@@ -361,7 +361,10 @@ fn check_refused(r: &mut Report, name: &str, got: isize, want: Errno) {
     if got == refused(want) {
         r.check(name, true);
     } else {
-        r.check(&format!("{name} (got {got}, want {})", refused(want)), false);
+        r.check(
+            &format!("{name} (got {got}, want {})", refused(want)),
+            false,
+        );
     }
 }
 
@@ -519,10 +522,7 @@ fn handle_to_fd(fd: i32, handle: u32, flags: u32, point: u64) -> (isize, i32) {
     let r = unsafe {
         ioctl(
             fd,
-            ioc_d(
-                NR_SYNCOBJ_HANDLE_TO_FD,
-                size_of::<SyncobjHandle>() as u32,
-            ),
+            ioc_d(NR_SYNCOBJ_HANDLE_TO_FD, size_of::<SyncobjHandle>() as u32),
             (&raw mut arg) as *mut c_void,
         )
     };
@@ -549,10 +549,7 @@ fn fd_to_handle_at(fd: i32, target: u32, flags: u32, dfd: i32, point: u64) -> (i
     let r = unsafe {
         ioctl(
             fd,
-            ioc_d(
-                NR_SYNCOBJ_FD_TO_HANDLE,
-                size_of::<SyncobjHandle>() as u32,
-            ),
+            ioc_d(NR_SYNCOBJ_FD_TO_HANDLE, size_of::<SyncobjHandle>() as u32),
             (&raw mut arg) as *mut c_void,
         )
     };
@@ -648,10 +645,7 @@ fn property_id(fd: i32, obj: u32, obj_type: u32, want: &[u8]) -> u32 {
     let got = unsafe {
         ioctl(
             fd,
-            ioc_d(
-                NR_OBJ_GETPROPERTIES,
-                size_of::<ObjGetProperties>() as u32,
-            ),
+            ioc_d(NR_OBJ_GETPROPERTIES, size_of::<ObjGetProperties>() as u32),
             (&raw mut arg) as *mut c_void,
         )
     };
@@ -807,8 +801,7 @@ fn main() {
         r.finish();
     }
 
-    let node: OwnedFd = match rustix::fs::open("/dev/dri/renderD128", OFlags::RDWR, Mode::empty())
-    {
+    let node: OwnedFd = match rustix::fs::open("/dev/dri/renderD128", OFlags::RDWR, Mode::empty()) {
         Ok(fd) => {
             r.check("/dev/dri/renderD128 opens", true);
             fd
@@ -854,7 +847,12 @@ fn main() {
         signaled != plain,
     );
     let (got, _) = create(fd, 0x8000);
-    check_refused(&mut r, "an unknown CREATE flag is refused", got, Errno::INVAL);
+    check_refused(
+        &mut r,
+        "an unknown CREATE flag is refused",
+        got,
+        Errno::INVAL,
+    );
 
     // An object with nothing behind it is *refused*, not treated as ready: this
     // is the rule the measured card has and the upstream sources do not.
@@ -875,7 +873,12 @@ fn main() {
     let (got, _) = wait_one(fd, signaled, 0, 0);
     check_is(&mut r, "WAIT the SIGNALED one answers at once", got, 0);
     let (_, first) = wait_one(fd, signaled, 0, 0);
-    check_is(&mut r, "naming the handle that satisfied it", first as isize, 0);
+    check_is(
+        &mut r,
+        "naming the handle that satisfied it",
+        first as isize,
+        0,
+    );
     // `WAIT_ALL` is the "every handle" form, and on this card the *empty* object
     // poisons the whole array rather than being skipped as already-signaled.
     let mut mixed = [signaled, plain];
@@ -926,7 +929,12 @@ fn main() {
         Errno::TIME,
     );
     let (got, _) = wait_one(fd, 0xdead_beef, 0, 0);
-    check_refused(&mut r, "WAIT a handle that does not exist", got, Errno::NOENT);
+    check_refused(
+        &mut r,
+        "WAIT a handle that does not exist",
+        got,
+        Errno::NOENT,
+    );
     let (got, _) = wait_one(fd, plain, 0, 0x8000);
     check_refused(&mut r, "an unknown WAIT flag is refused", got, Errno::INVAL);
     let mut arg = SyncobjWait::default();
@@ -1091,7 +1099,12 @@ fn main() {
         0,
     );
     let (_, point) = query(fd, signaled);
-    check_is(&mut r, "and takes the point back to zero", point as isize, 0);
+    check_is(
+        &mut r,
+        "and takes the point back to zero",
+        point as isize,
+        0,
+    );
     let (got, _) = wait_one(fd, signaled, 0, 0);
     check_refused(&mut r, "with the fence gone as well", got, Errno::INVAL);
     {
@@ -1116,7 +1129,12 @@ fn main() {
                 (&raw mut bad) as *mut c_void,
             )
         };
-        check_refused(&mut r, "TIMELINE_SIGNAL with an unknown flag", got, Errno::INVAL);
+        check_refused(
+            &mut r,
+            "TIMELINE_SIGNAL with an unknown flag",
+            got,
+            Errno::INVAL,
+        );
     }
 
     // --- the two descriptors, and the requests that tell them apart ---
@@ -1206,7 +1224,12 @@ fn main() {
         fenced as isize,
     );
     let (got, _) = handle_to_fd(fd, fenced, 0x8000, 0);
-    check_refused(&mut r, "HANDLE_TO_FD with an unknown flag", got, Errno::INVAL);
+    check_refused(
+        &mut r,
+        "HANDLE_TO_FD with an unknown flag",
+        got,
+        Errno::INVAL,
+    );
 
     // --- the `point` field, and the flag that makes it a timeline point --------
     // All of this is measured on the real card (§7.4), because the sources say
@@ -1262,9 +1285,19 @@ fn main() {
     // would take both.
     let (got, tl) = create(fd, 0);
     check_is(&mut r, "an object for the point rules is made", got, 0);
-    check_is(&mut r, "and given a point of 5", timeline_signal(fd, tl, 5), 0);
+    check_is(
+        &mut r,
+        "and given a point of 5",
+        timeline_signal(fd, tl, 5),
+        0,
+    );
     let (got, _at5) = handle_to_fd(fd, tl, H2F_EXPORT_SYNC_FILE | H2F_TIMELINE, 5);
-    check_is(&mut r, "the point the object has reached is answered", got, 0);
+    check_is(
+        &mut r,
+        "the point the object has reached is answered",
+        got,
+        0,
+    );
     let (got, _below) = handle_to_fd(fd, tl, H2F_EXPORT_SYNC_FILE | H2F_TIMELINE, 3);
     check_is(&mut r, "and so is a point below it", got, 0);
     let (got, _) = handle_to_fd(fd, tl, H2F_EXPORT_SYNC_FILE | H2F_TIMELINE, 6);
@@ -1338,7 +1371,12 @@ fn main() {
         // A plain object's fence: no point to carry, so the destination lands on
         // 0 - below where it was, which no other door here allows.
         let (_, dst) = create(fd, 0);
-        check_is(&mut r, "a destination at point 4", timeline_signal(fd, dst, 4), 0);
+        check_is(
+            &mut r,
+            "a destination at point 4",
+            timeline_signal(fd, dst, 4),
+            0,
+        );
         let got = fd_to_handle(fd, dst, F2H_IMPORT_SYNC_FILE, sf_plain).0;
         check_is(&mut r, "importing a plain object's sync_file", got, 0);
         let (_, landed) = query(fd, dst);
@@ -1517,7 +1555,9 @@ fn main() {
     check_refused(
         &mut r,
         "and an unreached point fires nothing",
-        read(&ev, &mut counter).map(|n| n as isize).unwrap_or_else(errno_is),
+        read(&ev, &mut counter)
+            .map(|n| n as isize)
+            .unwrap_or_else(errno_is),
         Errno::AGAIN,
     );
     check_is(
@@ -1529,7 +1569,9 @@ fn main() {
     check_is(
         &mut r,
         "hands the counter its one increment",
-        read(&ev, &mut counter).map(|n| n as isize).unwrap_or_else(errno_is),
+        read(&ev, &mut counter)
+            .map(|n| n as isize)
+            .unwrap_or_else(errno_is),
         8,
     );
     check_is(
@@ -1542,7 +1584,9 @@ fn main() {
     check_refused(
         &mut r,
         "a second signal owes nothing more",
-        read(&ev, &mut counter).map(|n| n as isize).unwrap_or_else(errno_is),
+        read(&ev, &mut counter)
+            .map(|n| n as isize)
+            .unwrap_or_else(errno_is),
         Errno::AGAIN,
     );
     let mut ev_arg = SyncobjEventfd {
@@ -1564,7 +1608,9 @@ fn main() {
     check_is(
         &mut r,
         "and fires at once for a fence that is already there",
-        read(&ev, &mut counter).map(|n| n as isize).unwrap_or_else(errno_is),
+        read(&ev, &mut counter)
+            .map(|n| n as isize)
+            .unwrap_or_else(errno_is),
         8,
     );
     let mut ev_arg = SyncobjEventfd {
@@ -1613,7 +1659,11 @@ fn main() {
         let mut out_fence_fd: i32 = -1;
         let got = atomic_one(fd, out_ptr, &mut out_fence_fd as *mut i32 as u64, 0);
         check_is(&mut r, "a commit carrying OUT_FENCE_PTR succeeds", got, 0);
-        check_true(&mut r, "and writes back a fence descriptor", out_fence_fd >= 0);
+        check_true(
+            &mut r,
+            "and writes back a fence descriptor",
+            out_fence_fd >= 0,
+        );
         check_true(
             &mut r,
             "which is already through, because the frame has gone",
@@ -1654,7 +1704,12 @@ fn main() {
         // -1 is the property's own spelling of "no fence", which is what every
         // commit that is not part of an explicit-sync chain carries.
         let got = atomic_one(fd, in_fd, -1i64 as u64, 0);
-        check_is(&mut r, "a commit carrying IN_FENCE_FD = -1 succeeds", got, 0);
+        check_is(
+            &mut r,
+            "a commit carrying IN_FENCE_FD = -1 succeeds",
+            got,
+            0,
+        );
         let got = atomic_one(fd, in_fd, (-1i32 as u32) as u64, 0);
         check_is(
             &mut r,
@@ -1701,7 +1756,12 @@ fn main() {
         destroy(fd, 0xdead_beef),
         Errno::INVAL,
     );
-    check_is(&mut r, "DESTROY a handle the card gave out", destroy(fd, dst), 0);
+    check_is(
+        &mut r,
+        "DESTROY a handle the card gave out",
+        destroy(fd, dst),
+        0,
+    );
     check_refused(
         &mut r,
         "and it names nothing afterwards",
@@ -1787,4 +1847,3 @@ fn main() {
 
     r.finish();
 }
-

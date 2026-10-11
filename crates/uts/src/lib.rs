@@ -70,6 +70,11 @@ pub const DEFAULT_DOMAINNAME: &str = "(none)";
 pub struct Uts {
     nodename: Mutex<RefCell<String>>,
     domainname: Mutex<RefCell<String>>,
+    /// The armed side of §10.5's disk-counter protocol, kept beside the names
+    /// because `uname(2)`'s handler reads it through the caller's namespace -
+    /// one door, one holder. `false` is every ordinary boot; only a machine
+    /// booted with `mpos.diskstat` arms it, from the kernel's own boot step.
+    diskstat: Mutex<RefCell<bool>>,
 }
 
 impl Uts {
@@ -80,6 +85,7 @@ impl Uts {
         Arc::new(Uts {
             nodename: Mutex::new(RefCell::new(String::new())),
             domainname: Mutex::new(RefCell::new(String::new())),
+            diskstat: Mutex::new(RefCell::new(false)),
         })
     }
 
@@ -135,16 +141,31 @@ impl Uts {
     /// the truth, and it must then be free to diverge, so that the next
     /// `sethostname` is invisible to the namespace it came from.
     pub fn copied(&self) -> Arc<Uts> {
-        let (nodename, domainname) = critical_section::with(|cs| {
+        let (nodename, domainname, diskstat) = critical_section::with(|cs| {
             (
                 self.nodename.borrow(cs).borrow().clone(),
                 self.domainname.borrow(cs).borrow().clone(),
+                *self.diskstat.borrow(cs).borrow(),
             )
         });
         Arc::new(Uts {
             nodename: Mutex::new(RefCell::new(nodename)),
             domainname: Mutex::new(RefCell::new(domainname)),
+            diskstat: Mutex::new(RefCell::new(diskstat)),
         })
+    }
+
+    /// Whether this namespace answers `uname`'s `release`/`version` with
+    /// §10.5's private disk-counter protocol instead of the build banner.
+    pub fn diskstat(&self) -> bool {
+        critical_section::with(|cs| *self.diskstat.borrow(cs).borrow())
+    }
+
+    /// Arm the protocol on this namespace. Called only from the kernel's boot
+    /// step - there is no syscall door that arms it, which is part of why a
+    /// userland program can neither trigger nor spoof the protocol.
+    pub fn set_diskstat(&self, armed: bool) {
+        critical_section::with(|cs| *self.diskstat.borrow(cs).borrow_mut() = armed);
     }
 }
 
@@ -165,6 +186,17 @@ pub fn init() -> Arc<Uts> {
             .get_or_insert_with(Uts::unnamed)
             .clone()
     })
+}
+
+/// Arm §10.5's disk-counter protocol on the init namespace itself.
+///
+/// This is the one writer that reaches the namespace *before* any task holds
+/// it: the boot flow arms before `sched::init()` adopts the boot task, so the
+/// word lands on the namespace every later task is created with rather than on
+/// a table row that does not exist yet. There is no syscall door here — same
+/// rule as [`Uts::set_diskstat`], which this exists to reach safely.
+pub fn arm_init() {
+    init().set_diskstat(true);
 }
 
 #[cfg(test)]
@@ -212,5 +244,41 @@ mod tests {
     #[test]
     fn init_is_one_namespace_however_often_it_is_asked_for() {
         assert!(Arc::ptr_eq(&init(), &init()));
+    }
+
+    /// §10.5's protocol rides the copy, and `arm_init` is what puts it on the
+    /// init namespace before any task exists to carry it. The claim is about the
+    /// *instrument*, not the names: a `unshare(CLONE_NEWUTS)` inside an armed
+    /// sweep boot must still answer the magic release word - if the flag were
+    /// dropped, the child's `t-diskbench` would read a version banner where its
+    /// counters should be and the measurement would silently become nothing.
+    #[test]
+    fn an_armed_diskstat_protocol_survives_the_copy() {
+        let outer = Uts::unnamed();
+        assert!(!outer.diskstat());
+        outer.set_diskstat(true);
+        let inner = outer.copied();
+        assert!(inner.diskstat(), "the copy lost the protocol");
+        inner.set_diskstat(false);
+        assert!(
+            outer.diskstat(),
+            "un-arming the copy moved the namespace it came from"
+        );
+    }
+
+    /// The arming path the boot flow uses (`sched::arm_diskstat_boot_namespace`
+    /// → this) lands on the one namespace every later task inherits — the
+    /// counterfactual for the boot panic this replaced: arming used to go
+    /// through the task table, which had no entry before `sched::init()` adopted
+    /// the boot task, and `Table::task` panics on an absent slot. Here the same
+    /// arm reaches `init()`'s own object with no table in sight.
+    #[test]
+    fn arm_init_arms_the_namespace_every_task_inherits() {
+        arm_init();
+        assert!(init().diskstat(), "the init namespace did not take the arm");
+        assert!(
+            Arc::ptr_eq(&init(), &init()),
+            "the arm went to a different namespace than tasks inherit"
+        );
     }
 }

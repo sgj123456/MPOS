@@ -14,7 +14,7 @@
 use alloc::format;
 use alloc::sync::Arc;
 
-use super::mount::Vfs;
+use super::mount::MountTable;
 use super::{Inode, NodeKind, VfsError, VfsResult};
 
 pub const BLOCK: usize = 512;
@@ -130,7 +130,7 @@ fn octal(bytes: &[u8]) -> Option<u64> {
 /// Parent directories are created as needed, so an archive need not mention
 /// them. A directory named twice is fine; a file named twice is a broken
 /// archive and stops the unpack.
-pub fn unpack_into(vfs: &Vfs, archive: &[u8]) -> VfsResult<usize> {
+pub fn unpack_into(vfs: &MountTable, archive: &[u8]) -> VfsResult<usize> {
     let mut count = 0;
     for entry in entries(archive) {
         let path = format!("/{}", entry.path);
@@ -164,7 +164,7 @@ pub fn unpack_into(vfs: &Vfs, archive: &[u8]) -> VfsResult<usize> {
 }
 
 /// The directory named by `path`, created along with its parents if missing.
-fn ensure_dir(vfs: &Vfs, path: &str) -> VfsResult<Arc<dyn Inode>> {
+fn ensure_dir(vfs: &MountTable, path: &str) -> VfsResult<Arc<dyn Inode>> {
     match vfs.resolve(path) {
         Ok(node) => {
             if node.metadata().kind == NodeKind::Dir {
@@ -201,7 +201,7 @@ mod tests {
     use alloc::{format, vec, vec::Vec};
 
     use super::{BLOCK, EntryKind, entries};
-    use crate::vfs::mount::Vfs;
+    use crate::vfs::mount::MountTable;
     use crate::vfs::ramfs::RamFs;
     use crate::vfs::{NodeKind, VfsError};
 
@@ -242,8 +242,8 @@ mod tests {
         Vec::from(header.as_slice())
     }
 
-    fn tree() -> Vfs {
-        let vfs = Vfs::new();
+    fn tree() -> MountTable {
+        let vfs = MountTable::new();
         vfs.mount_root(RamFs::new());
         vfs
     }

@@ -10,10 +10,16 @@
 //! would refuse anyway, which is the proof the gate runs *before* the type
 //! validation, as Linux's does. Then the caller raises itself back through
 //! the saved id, the effective set is restored from permitted, and the same
-//! calls work again. `unshare(CLONE_NEWNS)` keeps its `EOPNOTSUPP` the whole
-//! time - this kernel's refuse-rather-than-approximate answer, which no
-//! capability can turn into a mount namespace - and `CLONE_NEWUTS`, the one
-//! served kind, splits exactly when the capability comes back.
+//! calls work again. Two of the namespace kinds are *served* now - the names
+//! (`CLONE_NEWUTS`) and the mount table (`CLONE_NEWNS`, MNT at step 1 of
+//! §6.3's ladder) - so both answer `EPERM` while the capability is down and
+//! split exactly when it comes back, and a kind the kernel cannot hand over at
+//! all (`CLONE_NEWPID` and the rest of the unserved ladder) is `EOPNOTSUPP`
+//! *once the capability is back*: the privilege answer comes first, as Linux
+//! decides it, so an unprivileged caller hears the same `EPERM` a Linux would
+//! give it and only a capable one learns what this machine cannot do. That pair
+//! is the difference between a gate and a refusal, and this program pins both
+//! halves.
 //!
 //! The set words themselves are read through `capget` (the v3 wire shape,
 //! two records): while lowered, effective is empty and permitted is still
@@ -190,14 +196,16 @@ fn main() {
         "unshare CLONE_NEWUTS answers EPERM while lowered",
         uts == -(libc::EPERM as isize),
     );
-    // The served-kind ordering: NEWUTS is served, so a capability-less
-    // caller gets Linux's EPERM; NEWNS is not served at all, so the
-    // refusal is EOPNOTSUPP whatever the caller holds - the
-    // refuse-rather-than-approximate rule, which no capability buys.
+    // The ordering the two refusals share: privilege is asked *first*, as
+    // Linux's `check_unshare_flags` does before any kind exists to copy - so
+    // CLONE_NEWNS, a served kind since MNT landed, answers the same EPERM as
+    // CLONE_NEWUTS while the capability is down rather than a served-looking
+    // success. What the *unserved* kinds answer is below, where the capability
+    // is back and nothing else can be the reason.
     let mount = unshare(0x0002_0000);
     r.check(
-        "unshare CLONE_NEWNS is EOPNOTSUPP even lowered (refused, not gated)",
-        mount == -(libc::EOPNOTSUPP as isize),
+        "unshare CLONE_NEWNS answers EPERM while lowered (served, so gated)",
+        mount == -(libc::EPERM as isize),
     );
     let noop = unshare(0);
     r.check("unshare(0) is still a no-op", noop == 0);
@@ -229,10 +237,22 @@ fn main() {
         hung == -(libc::ENOTTY as isize),
     );
     // The served namespace splits again now that the capability is back -
-    // the one positive answer in the set, and the difference between a gate
-    // and a refusal.
+    // the positive answers in the set, and the difference between a gate and
+    // a refusal.
     let uts = unshare(0x0400_0000);
     r.check("unshare CLONE_NEWUTS is served again", uts == 0);
+    let mount = unshare(0x0002_0000);
+    r.check("unshare CLONE_NEWNS is served again", mount == 0);
+    // And the kind this machine has no way to hand over keeps its honest
+    // refusal *now* that no capability gate can be the reason: EOPNOTSUPP is
+    // "present, cannot do that", which is what a capable caller learns, and
+    // what an unprivileged one would have heard as EPERM above. Nothing is
+    // unshared either way - the refusal is whole.
+    let pid = unshare(0x2000_0000);
+    r.check(
+        "unshare CLONE_NEWPID is EOPNOTSUPP once nothing else can be the reason",
+        pid == -(libc::EOPNOTSUPP as isize),
+    );
 
     r.finish()
 }

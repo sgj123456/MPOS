@@ -1863,7 +1863,7 @@ mod tests {
     /// decoration - a reader's path crosses it, and the links inside the tree
     /// are relative to directories on the far side of it.
     fn resolve(fs: &Arc<SysFs>, path: &str) -> Arc<dyn Inode> {
-        let vfs = crate::vfs::mount::Vfs::new();
+        let vfs = crate::vfs::mount::MountTable::new();
         let root = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(root.clone());
         root.root().create("sys", NodeKind::Dir).unwrap();
@@ -1880,7 +1880,7 @@ mod tests {
     /// budget before it reaches anything this deep - and every relative link
     /// target in `/sys` names its parent with `..`.
     fn resolve_on_a_full_root(fs: &Arc<SysFs>, path: &str, fillers: usize) -> Arc<dyn Inode> {
-        let vfs = crate::vfs::mount::Vfs::new();
+        let vfs = crate::vfs::mount::MountTable::new();
         let root = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(root.clone());
         root.root().create("sys", NodeKind::Dir).unwrap();

@@ -59,6 +59,13 @@ use super::kunit;
 use super::report;
 use super::steps;
 
+/// The boot word that arms §10.5's disk-counter protocol (§10.5, `abi`'s
+/// `DISKSTAT_OSRELEASE_MAGIC` carries the other half of the pair). Named here
+/// rather than spelled at its one use so the launch side (`xtask`'s sweep) and
+/// this one have a single string to agree on - it is a contract between two
+/// readers of the same command line.
+pub const DISKSTAT_WORD: &str = "mpos.diskstat";
+
 /// Bring the console service up, and say what was booted.
 ///
 /// The one step between "the machine layer's own writer carries every line" and
@@ -151,6 +158,24 @@ pub fn init(info: &BootInfo) -> ! {
     // installs allocates and the level it prints at is read from the command
     // line. Everything after this point is worth being able to turn on or off.
     mpos::logging::init();
+
+    // §10.5's disk-counter protocol, armed here and nowhere else: a boot
+    // carrying the word below spends its whole life answering `uname`'s
+    // `release` with the magic word (`abi::DISKSTAT_OSRELEASE_MAGIC`) and its
+    // `version` with the live per-disk counters, which is what makes
+    // `t-diskbench` a measurement rather than a guess. This is not a *test*
+    // opening: it does not decide whether the kernel runs checks - that stays
+    // the build's to say (§15.19, and `xtask`'s own gate still refuses
+    // `mpos.selftest` by name) - it renames two ABI fields for one launch, and
+    // only `cargo xtask test` ever puts the word on a line; the session image
+    // never carries it, and nothing a program can do turns it on. The flag
+    // rides the boot task's UTS namespace, so every task inherits it and a
+    // `unshare(CLONE_NEWUTS)` copy keeps reporting real numbers - the payload
+    // is rendered from the live counters at read time.
+    if info.cmdline.split_whitespace().any(|w| w == DISKSTAT_WORD) {
+        sched::arm_diskstat_boot_namespace();
+        mpos::println!("diskstat: uname release/version carry the per-disk io counters");
+    }
 
     // The heap, used once: an allocation that is written, read back and dropped
     // is the cheapest proof that the allocator the whole kernel now depends on

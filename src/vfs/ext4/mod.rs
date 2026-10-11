@@ -2328,7 +2328,7 @@ mod tests {
     #[test]
     fn an_apk_style_symlink_commit_resolves() {
         let fs = mounted(Arc::new(format()));
-        let vfs = alloc::sync::Arc::new(crate::vfs::mount::Vfs::new());
+        let vfs = alloc::sync::Arc::new(crate::vfs::mount::MountTable::new());
         vfs.mount_root(alloc::sync::Arc::new(fs));
 
         let root = vfs.resolve("/").expect("root");
@@ -3300,11 +3300,17 @@ mod tests {
         }
     }
 
-    /// Read a large file (the multi-megabyte `fish` binary, whose embedded
-    /// theme data fish fetches at a high byte offset) through this driver and
-    /// write it to `MPOS_BIGFILE_OUT`, so the host can hash-compare it against
-    /// `debugfs` ground truth. A large-file/extent-tree read slip corrupts a
-    /// high offset only - exactly what small-file round-trips cannot catch.
+    /// Read a large file through this driver and write it to
+    /// `MPOS_BIGFILE_OUT`, so the host can hash-compare it against `debugfs`
+    /// ground truth. A large-file/extent-tree read slip corrupts a high offset
+    /// only - exactly what small-file round-trips cannot catch.
+    ///
+    /// The subject is `usr/lib/libcrypto.so.3`: 4.5 MB, so its high offsets ride
+    /// the extent tree, and it is a file **both** machines' package lists
+    /// guarantee, because `apk-tools` links it. The fixture used to be
+    /// `usr/bin/fish` - a program an image can stop carrying, and one this
+    /// image did, which makes an instrument whose subject has left the machine
+    /// one that fails for a reason that is not the driver's.
     #[test]
     fn a_large_file_reads_through_the_driver_byte_for_byte() {
         let Ok(img) = std::env::var("MPOS_EXT4_IMG") else {
@@ -3325,12 +3331,12 @@ mod tests {
             .root()
             .lookup("usr")
             .expect("usr")
-            .lookup("bin")
-            .expect("bin")
-            .lookup("fish")
-            .expect("fish");
+            .lookup("lib")
+            .expect("lib")
+            .lookup("libcrypto.so.3")
+            .expect("libcrypto.so.3");
         let size = bin.metadata().size as usize;
-        assert!(size > 1 << 20, "fish is a multi-megabyte binary");
+        assert!(size > 1 << 20, "libcrypto is a multi-megabyte binary");
         // Read it in small chunks, the way a reader with a modest buffer does.
         let mut got: Vec<u8> = Vec::with_capacity(size);
         let mut off = 0u64;

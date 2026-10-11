@@ -49,7 +49,7 @@
 //! foreground (`src/vfs/tty.rs`, "the same answer for a program that never
 //! asks"), which is why the no-std version passed without a session. The getty
 //! sequence is used here so that the claim holds on **both** machines rather
-//! than on one: the divergence itself is named in `docs/UAPI.md` §5.2 and is
+//! than on one: the divergence itself is named in `docs/uapi/` §5.2 and is
 //! not what this program pins.
 //!
 //! `TIOCGPTN`'s *number* is the one claim that is this kernel's own. This

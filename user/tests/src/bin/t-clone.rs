@@ -89,11 +89,22 @@
 //!
 //! Two claims are *designed divergences* and are named where they are made,
 //! both measured against this host's own kernel rather than assumed: the
-//! unknown-flag bit answers `EINVAL` here where a host Linux reads that bit as
-//! `CLONE_NEWNET`, and a null tid pointer is refused here where a host Linux
-//! starts the child and skips the write. This kernel's answer is the claim; a
-//! host's own answer is accepted only in a host run (`mpos_user_tests::host_run`)
-//! and the difference is printed rather than hidden.
+//! unknown-flag bit answers `EINVAL` here where a host Linux has no unknown-bit
+//! check at all and starts the child (measured: 2^32, 2^44 and `CLONE_PTRACE`
+//! each answer a pid, 7.2.9), and a null tid pointer is refused here where a
+//! host Linux starts the child and skips the write. This kernel's answer is the
+//! claim; a host's own answer is accepted only in a host run
+//! (`mpos_user_tests::host_run`) and the difference is printed rather than
+//! hidden.
+//!
+//! The namespace kinds are the third thing the flag word decides, and the
+//! answer is settled *before* anything is created: the two kinds this kernel
+//! serves - `CLONE_NEWUTS` and `CLONE_NEWNS` (§6.3's ladder, MNT at step 1) -
+//! give the child a *copy* of the caller's names or mount table, while every
+//! other kind is refused whole with `EOPNOTSUPP` rather than handed a child
+//! that shares what its flags said it got its own of. The word is the scheduler's
+//! to answer (`abi::clone_namespace_verdict`), which is why the syscall layer
+//! must pass these bits through rather than read them as unknown.
 //!
 //! A third divergence is *avoided* rather than gated, because a request that
 //! means different things on the two machines cannot be one claim: the no-std
@@ -117,6 +128,15 @@ const CHILD_CODE: i32 = 33;
 /// How long the caller spins before giving up on a thread that should have run.
 /// A test that waits for ever is worse than a test that fails.
 const SPIN_LIMIT: usize = 200_000;
+
+/// The refusal-probe label, built without pulling in `format!` machinery the
+/// file otherwise has no use for.
+fn alloc_label(kind: &str) -> String {
+    let mut s = String::from("clone(CLONE_NEW");
+    s.push_str(kind);
+    s.push_str(") is refused whole");
+    s
+}
 
 /// What a real thread writes, and what it answers for its own identity. Memory
 /// is shared with a thread, so the caller reads these back.
@@ -197,16 +217,23 @@ fn main() {
     let mut r = Report::new();
     let null = core::ptr::null_mut::<i32>();
 
-    // An unknown flag bit names something this kernel does not implement. Bit 30
-    // is the one to name: it is a bit the kernel's own `KNOWN` mask does not
-    // carry, so no served request can hide behind it. On a host Linux the same
-    // bit is `CLONE_NEWNET`, whose answer is `EPERM` to an unprivileged caller
-    // and a new namespace to a privileged one - neither is `EINVAL` - so the
-    // host's answer is accepted only in a host run, and the difference is
-    // printed rather than hidden.
-    let ret = probe(1 << 30);
+    // An unknown flag bit names something this kernel does not implement. The
+    // bit has to be outside *both* vocabularies: every bit below 2^32 is either
+    // the exit signal or a real Linux flag - bit 30, the obvious choice, is
+    // `CLONE_NEWNET`, which this kernel now *knows* and refuses by name
+    // (`EOPNOTSUPP`, pinned by the namespace checks below) - so the bit named
+    // here is 2^44, above every flag either kernel defines.
+    //
+    // This is a *designed divergence*, not Linux's answer: measured on this
+    // host (7.2.9, `.workbuddy/probe_clone_unknown.c`), Linux has no unknown-bit
+    // check at all - 2^32, 2^44 and `CLONE_PTRACE` each start a child - so a
+    // host run's child is accepted and the difference is printed rather than
+    // hidden.
+    let ret = probe(1 << 44);
     if mpos_user_tests::host_run() && !refused(ret, libc::EINVAL) {
-        println!("note: bit 30 is CLONE_NEWNET on the host - Linux's answer, not mpos's EINVAL");
+        println!(
+            "note: the host starts the child for a bit it does not know - Linux's answer, not mpos's EINVAL"
+        );
     }
     r.check(
         "an unknown flag bit is EINVAL",
@@ -240,6 +267,114 @@ fn main() {
     r.check(
         "CLONE_PARENT_SETTID with a null pointer is EINVAL",
         refused(ret, libc::EINVAL) || mpos_user_tests::host_run(),
+    );
+
+    // The namespace kinds, refused or served by whether a copy exists to hand
+    // over (§6.3's ladder). PID/NET/IPC answer `EOPNOTSUPP` — "present, cannot
+    // do that" — before anything is created; an unserved bit must not quietly
+    // produce a child that shares what its flags said it got its own of. (On a
+    // host run the word may answer `EPERM` or `EINVAL` by the host's own policy
+    // before it reaches any kind, so the claim is about *this* machine's answer
+    // and the host line says which it was.)
+    //
+    // The words come from `libc::CLONE_NEW*` like every other flag in this file,
+    // and that is a correction rather than a style: the first draft wrote three
+    // literals and got two of them wrong — the one it called `CLONE_NEWPID` was
+    // `0x0008_0000`, which is `CLONE_SETTLS`, and the one it called
+    // `CLONE_NEWIPC` was `0x2000_0000`, which is `CLONE_NEWPID`. Measured, not
+    // guessed: the `CLONE_SETTLS` word *started a child* instead of refusing
+    // one, and that child ran the rest of this program with whatever the
+    // register happened to hold as its thread pointer. A hand-written flag table
+    // is a second source of truth for a number a maintained one already has.
+    let names: &[(&str, usize)] = &[
+        ("PID", libc::CLONE_NEWPID as usize),
+        ("NET", libc::CLONE_NEWNET as usize),
+        ("IPC", libc::CLONE_NEWIPC as usize),
+    ];
+    for (name, bit) in names {
+        let ret = probe(libc::SIGCHLD as usize | bit);
+        let ok = if mpos_user_tests::host_run() {
+            ret < 0 // some refusal; the host's own namespace policy decides the number
+        } else {
+            refused(ret, 95) // EOPNOTSUPP
+        };
+        let label = alloc_label(name);
+        r.check(&label, ok);
+    }
+
+    // `CLONE_NEWUTS` is served: the child starts in a *copy* of its parent's
+    // names (Linux's `copy_utsname` on this flag), so a rename inside never
+    // reaches out. The child renames, reads its own names back, and reports
+    // what it saw while the parent compares against its own view.
+    //
+    // The report rides a *pipe*, and that is a correction rather than a style:
+    // this clone is process-shaped, so the child has its own copy of the
+    // address space — a `static` the child stores into is the *child's* copy,
+    // and the parent reads the one it wrote, for ever false. Measured: the
+    // first draft used `static UTS_REPORT: AtomicBool`, and this claim failed
+    // while the child's own read-back said the rename had landed.
+    // `t-ns-mnt`/`t-ns-uts` report a child's observation through a pipe for
+    // exactly this reason.
+    let mut reported = [0u8; 32];
+    let mut n = 0usize;
+    let report = rustix::pipe::pipe();
+    if let Ok((tail, head)) = report {
+        let uts_pid = unsafe {
+            // `CLONE_NEWUTS` is `0x0400_0000` on **both** machines — the
+            // namespace bits are asm-generic's and arm64 overrides none of them
+            // (checked against the installed headers), so this word means the
+            // same request on x86_64 and aarch64 alike.
+            clone_raw(libc::SIGCHLD as usize | 0x0400_0000, 0, null, null, 0)
+        };
+        if uts_pid == 0 {
+            // The rename through the raw door — `sethostname(name, len)` —
+            // because a child of a `std` process must not run anything that
+            // forks or flushes on its way out. It then reads the name back
+            // through `uname(2)`'s raw word and reports both halves in one word
+            // down the pipe.
+            let name = b"cloned-inside\0";
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_sethostname,
+                    name.as_ptr() as libc::c_long,
+                    (name.len() - 1) as libc::c_long,
+                )
+            };
+            let mut uts = [0u8; 333]; // Linux's `struct old_utsname`: 65*5+8-ish; uname writes 65-byte fields
+            let urc = unsafe { libc::syscall(libc::SYS_uname, uts.as_mut_ptr() as libc::c_long) };
+            // nodename is the second field, at offset 65, NUL-terminated.
+            let node = &uts[65..130];
+            let node_ok =
+                urc == 0 && rc == 0 && node.starts_with(b"cloned-inside") && node[13] == 0;
+            let msg: &[u8] = if node_ok { b"renamed\n" } else { b"!renamed\n" };
+            let _ = rustix::io::write(&head, msg);
+            drop(head);
+            leave(CHILD_CODE);
+        }
+        r.check("clone(CLONE_NEWUTS) creates the child", uts_pid > 0);
+        if uts_pid <= 0 {
+            println!("  clone answered {uts_pid}");
+        }
+        // The parent's own end of the write side goes before the drain, or EOF
+        // never comes: the child holds a copy of it too, and the drain waits on
+        // every writer (`t-ns-uts`'s lesson, from the same shape).
+        drop(head);
+        n = rustix::io::read(&tail, &mut reported).unwrap_or(0);
+        if uts_pid > 0 {
+            let _ = collect(uts_pid as isize);
+        }
+    } else {
+        r.check("the report pipe is made", false);
+    }
+    r.check(
+        "the NEWUTS child renamed only its own copy",
+        reported[..n].starts_with(b"renamed"),
+    );
+    let mut pbuf = [0u8; 333];
+    let prc = unsafe { libc::syscall(libc::SYS_uname, pbuf.as_mut_ptr() as libc::c_long) };
+    r.check(
+        "and the parent kept its own name",
+        prc == 0 && !pbuf[65..130].starts_with(b"cloned-inside"),
     );
 
     // A process-shaped clone is fork: the child gets 0 and its own memory. The

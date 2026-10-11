@@ -30,7 +30,7 @@
 //! The other reason is the rule's clause (a): `sched_setattr`/`sched_getattr`
 //! have no `rustix` binding at all, so the 48-byte `struct sched_attr` goes
 //! through `libc::syscall` too. That struct's layout is a UAPI fact
-//! (`docs/UAPI.md` §4 pins it to this program): the size at offset 0, the policy
+//! (`docs/uapi/` §4 pins it to this program): the size at offset 0, the policy
 //! at 4, the nice at 16 - and the nice it carries is the plain `-20..19` value,
 //! not the raw `20-nice` the `getpriority` wrapper flips.
 //!

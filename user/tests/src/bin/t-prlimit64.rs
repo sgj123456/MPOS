@@ -40,7 +40,7 @@
 //! The 16-byte struct is written out here rather than taken from a binding,
 //! because there is no binding to take on this target: `libc::rlimit64` is
 //! declared for Android and l4re and not for linux-musl. Its layout is the UAPI
-//! (`docs/UAPI.md` §4 pins it to this program) and is the same on both machines.
+//! (`docs/uapi/` §4 pins it to this program) and is the same on both machines.
 
 use mpos_user_tests::Report;
 use rustix::io::Errno;

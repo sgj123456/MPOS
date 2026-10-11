@@ -251,7 +251,13 @@ fn main() {
 
     // EVIOCGVERSION: the evdev ABI, always 1.
     let mut version: i32 = 0;
-    let got = unsafe { ioctl(fd, ioc(IOC_READ, 0x01, 4), &mut version as *mut i32 as *mut c_void) };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc(IOC_READ, 0x01, 4),
+            &mut version as *mut i32 as *mut c_void,
+        )
+    };
     check_eq(&mut r, "EVIOCGVERSION succeeds", got, 0);
     check_eq(&mut r, "the evdev version is 1", version as isize, 1);
 
@@ -295,12 +301,7 @@ fn main() {
             text.as_mut_ptr() as *mut c_void,
         )
     };
-    check_eq(
-        &mut r,
-        "EVIOCGPHYS answers ENOENT, not ENOTTY",
-        got,
-        ENOENT,
-    );
+    check_eq(&mut r, "EVIOCGPHYS answers ENOENT, not ENOTTY", got, ENOENT);
     let got = unsafe {
         ioctl(
             fd,
@@ -308,12 +309,7 @@ fn main() {
             text.as_mut_ptr() as *mut c_void,
         )
     };
-    check_eq(
-        &mut r,
-        "EVIOCGUNIQ answers ENOENT, not ENOTTY",
-        got,
-        ENOENT,
-    );
+    check_eq(&mut r, "EVIOCGUNIQ answers ENOENT, not ENOTTY", got, ENOENT);
 
     // EVIOCGABS on a keyboard axis: EINVAL, the device has no absolute axis.
     let mut abs = [0u8; 24];
@@ -324,12 +320,7 @@ fn main() {
             abs.as_mut_ptr() as *mut c_void,
         )
     };
-    check_eq(
-        &mut r,
-        "EVIOCGABS on an absent axis is EINVAL",
-        got,
-        EINVAL,
-    );
+    check_eq(&mut r, "EVIOCGABS on an absent axis is EINVAL", got, EINVAL);
 
     // EVIOCSFF / EVIOCRMFF / EVIOCSKEYCODE / EVIOCGKEYCODE - the per-device
     // capability refusals. Measured on real Linux: an evdev node with no
@@ -379,13 +370,25 @@ fn main() {
     check_eq(
         &mut r,
         "EVIOCSKEYCODE on a node with no keycodes array is EINVAL",
-        unsafe { ioctl(fd, ioc(IOC_WRITE, 0x04, 8), keypair.as_mut_ptr() as *mut c_void) },
+        unsafe {
+            ioctl(
+                fd,
+                ioc(IOC_WRITE, 0x04, 8),
+                keypair.as_mut_ptr() as *mut c_void,
+            )
+        },
         EINVAL,
     );
     check_eq(
         &mut r,
         "EVIOCGKEYCODE is EINVAL, not a zeroed success",
-        unsafe { ioctl(fd, ioc(IOC_READ, 0x04, 8), keypair.as_mut_ptr() as *mut c_void) },
+        unsafe {
+            ioctl(
+                fd,
+                ioc(IOC_READ, 0x04, 8),
+                keypair.as_mut_ptr() as *mut c_void,
+            )
+        },
         EINVAL,
     );
 
@@ -473,7 +476,13 @@ fn main() {
     check_eq(
         &mut r,
         "a short EVIOCGKEY buffer is filled to its own length",
-        unsafe { ioctl(fd, ioc(IOC_READ, 0x18, short_len), short.as_mut_ptr() as *mut c_void) },
+        unsafe {
+            ioctl(
+                fd,
+                ioc(IOC_READ, 0x18, short_len),
+                short.as_mut_ptr() as *mut c_void,
+            )
+        },
         8,
     );
     let mut sw = [0xAAu8; 64];
@@ -481,7 +490,13 @@ fn main() {
     check_eq(
         &mut r,
         "EVIOCGSW returns its 8-byte switch bitmap",
-        unsafe { ioctl(fd, ioc(IOC_READ, 0x1b, sw_len), sw.as_mut_ptr() as *mut c_void) },
+        unsafe {
+            ioctl(
+                fd,
+                ioc(IOC_READ, 0x1b, sw_len),
+                sw.as_mut_ptr() as *mut c_void,
+            )
+        },
         8,
     );
     // EVIOCGMTSLOTS: measured EINVAL on a node without multi-touch, and no evdev
@@ -491,7 +506,13 @@ fn main() {
     check_eq(
         &mut r,
         "EVIOCGMTSLOTS on a non-multitouch node is EINVAL",
-        unsafe { ioctl(fd, ioc(IOC_READ, 0x0a, mt_len), mt.as_mut_ptr() as *mut c_void) },
+        unsafe {
+            ioctl(
+                fd,
+                ioc(IOC_READ, 0x0a, mt_len),
+                mt.as_mut_ptr() as *mut c_void,
+            )
+        },
         EINVAL,
     );
 
@@ -513,7 +534,10 @@ fn main() {
             fd
         }
         Err(e) => {
-            r.check(&format!("a second open() of the node succeeds ({e:?})"), false);
+            r.check(
+                &format!("a second open() of the node succeeds ({e:?})"),
+                false,
+            );
             println!("FAILED");
             std::process::exit(1);
         }
@@ -694,14 +718,8 @@ fn main() {
             same,
         );
         if !same {
-            println!(
-                "  /sys/dev/char link: {}",
-                link.to_string_lossy()
-            );
-            println!(
-                "  /sys/class link:    {}",
-                class_link.to_string_lossy()
-            );
+            println!("  /sys/dev/char link: {}", link.to_string_lossy());
+            println!("  /sys/class link:    {}", class_link.to_string_lossy());
         }
     }
 
@@ -746,7 +764,13 @@ fn main() {
         check_eq(
             &mut r,
             "UI_GET_VERSION succeeds",
-            unsafe { ioctl(uifd, UI_GET_VERSION, &mut version as *mut u32 as *mut c_void) },
+            unsafe {
+                ioctl(
+                    uifd,
+                    UI_GET_VERSION,
+                    &mut version as *mut u32 as *mut c_void,
+                )
+            },
             0,
         );
         check_true(&mut r, "the interface has a version", version > 0);
@@ -924,11 +948,7 @@ fn main() {
                 write(&ui, &more),
                 more.len() as isize,
             );
-            check_true(
-                &mut r,
-                "the owner is told it is readable",
-                readable(&synth),
-            );
+            check_true(&mut r, "the owner is told it is readable", readable(&synth));
             check_true(
                 &mut r,
                 "a non-owner of a grabbed device is not",

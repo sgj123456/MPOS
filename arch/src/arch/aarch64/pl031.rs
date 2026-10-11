@@ -21,7 +21,7 @@
 //! from writing the wrong register: `RTC_DR` is the counter's *read* door, and the
 //! load door is `RTC_LR` at `0x08`. What made it worth re-measuring is that the
 //! refusal was visible in a real boot: with no writable clock this machine could not
-//! back `/dev/rtc0`'s `RTC_SET_TIME`, which is a promise `UAPI.md` already records
+//! back `/dev/rtc0`'s `RTC_SET_TIME`, which is a promise `docs/uapi/` already records
 //! as served, and OpenRC's `hwclock` service runs `hwclock --systohc` on the way
 //! down. `write_epoch` now loads the counter and reads it back, so a write the
 //! device dropped is still a `false` rather than a success (`AGENTS.md` §4).
