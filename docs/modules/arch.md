@@ -25,7 +25,7 @@ the questions a trap entry has to ask the kernel ("is this page one to populate?
 through one registered `&'static dyn Kernel`. The asymmetry is deliberate: the downward
 path is hot and stays monomorphised, while the upward path is a fault, a tick or a log
 line and can afford one indirect call — and the exception entry points are reached from
-`global_asm!`, so they cannot be generic anyway (NOTES.md §14.2).
+`global_asm!`, so they cannot be generic anyway (docs/notes/ §14.2).
 
 The crate is target-gated in one unusual way, and that gate is what lets one crate hold
 both halves of `arch`. `hal` and `arch` are compiled for `target_os = "none"` — the
@@ -37,7 +37,7 @@ descriptor format* and that is exactly the trap: `arch/<machine>/paging.rs` deco
 well as encodes and runs on tables the kernel owns, while `early/` encodes only, a leaf
 at a time, on tables built from a firmware allocation — and a caller that reached the
 wrong one would be reading a `BootInfo` nobody built, or writing into an identity map
-that no longer exists (`arch/src/early/mod.rs`, NOTES.md §14.6).
+that no longer exists (`arch/src/early/mod.rs`, notes/ §14.6).
 
 What deliberately does **not** live here is as much the point:
 
@@ -118,7 +118,7 @@ callbacks on both machines, which is what makes the kernel's `_start` one piece 
 architecture-independent code — plus `kernel_sections()`, `print_args`, `halt`,
 `init_interrupts` and `enable_console_interrupts`. The three callbacks travel down because
 the console service, the device drivers and the handoff all sit above this crate and may
-not be named from it; `arch` only ever invokes the pointers (NOTES.md §14.8).
+not be named from it; `arch` only ever invokes the pointers (docs/notes/ §14.8).
 
 **The loader's half.** `early::Frames` is the seam that decides who allocates: the loader
 hands over one contiguous run of `LOADER_DATA` frames (`boot::vm::Pool`), and
@@ -138,11 +138,11 @@ restate the edges.
 
 ## What userspace sees
 
-This crate owns no `docs/UAPI.md` row of its own — userspace never names a capability or
+This crate owns no `docs/uapi/` row of its own — userspace never names a capability or
 a port. What it owns is the *per-machine half* of rows that other modules document: the
 `open(2)` flag vocabulary, the `struct stat`/`statx` sizes and field placements, the signal
 frame's layout and the register file's field order all have one spelling per machine, and
-it is the machine's spelling. `docs/UAPI.md` carries each row with Linux's answer, this
+it is the machine's spelling. `docs/uapi/` carries each row with Linux's answer, this
 kernel's answer and the pin; the machine's half of those rows is implemented by
 `arch/<arch>/signal.rs`, `arch/<arch>/context.rs` and the ABI tables the ports expose
 (`ABI_REG_COUNT`/`ABI_REG_INDEX`), and every one of them is pinned on both machines (see
@@ -158,7 +158,7 @@ under `crates/`. So the pin is the bare-metal gate and the link, and both are re
 |---|---|
 | `cargo xtask test` (x86_64) | Boots the kernel through this crate's `arch::x86_64::boot`: the page tables, the interrupt controllers, the syscall gate and every `t-*` program below, under the `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol |
 | `cargo xtask test --arch aarch64` | The same gate for the second machine, which is the only run that exercises `arch::aarch64` — its vectors, GIC, timer, PL011, PL031 and `paging` — and the machine layer's own boot checks: the timer, context switches, the kernel's page tables, the device tree's windows, EL0 entry, address spaces, the paging operations, the wall clock, per-CPU state, the serial receiver and TLS. They run on every boot (not only in a test build) and halt the machine with a line naming the subsystem. Nothing parses their output; what the sweep reads is the `user` half's own protocol |
-| `arch/src/arch/aarch64/linker.ld` `ASSERT`s | That `mpos_enter_frame`, `mpos_context_switch`, `mpos_context_round_trip` and `mpos_task_trampoline` land inside `__text_start..__text_end`. Every `global_asm!` in the crate is one assembly unit, and a block that changes section without restoring moves everything assembled after it; measured, one such leak put a context-switch block in `.rodata.el0_program` and the first call to it was an instruction abort inside the image (NOTES.md §13.16). The x86_64 script has no such `ASSERT`s |
+| `arch/src/arch/aarch64/linker.ld` `ASSERT`s | That `mpos_enter_frame`, `mpos_context_switch`, `mpos_context_round_trip` and `mpos_task_trampoline` land inside `__text_start..__text_end`. Every `global_asm!` in the crate is one assembly unit, and a block that changes section without restoring moves everything assembled after it; measured, one such leak put a context-switch block in `.rodata.el0_program` and the first call to it was an instruction abort inside the image (docs/notes/ §13.16). The x86_64 script has no such `ASSERT`s |
 | `cargo xtask depgraph` | That no module outside `arch`/`hal`/`main`/`lib` names `crate::arch::`, and that no new edge appears — the crate boundary and the measured ratchet move together |
 | `mpos-vm`'s host tests (`crates/vm/src/lib.rs`) | The mapping *plan* this crate's `Paging::install` consumes: `every_mapping_is_page_granular`, `nothing_is_both_writable_and_executable`, `no_two_entries_cover_the_same_page`, `the_kernel_image_is_mapped_with_per_section_permissions`, `the_direct_map_covers_all_physical_memory` |
 | `mpos-bootinfo`'s host build | The record `Paging::install` receives and the aarch64 entry is handed; the crate is listed in `xtask`'s `LEAF_CRATES`, so stage 1 of the gate builds it for the host |
@@ -180,7 +180,7 @@ capability's answer changes:
 ## Evidence and open work
 
 The machine seam's reasoning, every measurement and the lessons that produced it are
-docs/NOTES.md §13 ("Machine-seam purity and aarch64 parity") — §13.1 (the flag, not the
+notes/ §13 ("Machine-seam purity and aarch64 parity") — §13.1 (the flag, not the
 architecture), §13.2 (the callers stop spelling the machine; still in progress), §13.9
 (the uaccess rules), §13.14 (a boot check must leave the machine as it found it), §13.16
 (the assembly section leak and the `ASSERT`s), §13.21/§13.22 (the exception entry's
@@ -188,8 +188,8 @@ architecture), §13.2 (the callers stop spelling the machine; still in progress)
 hook table and why it is not a generic parameter, §14.6 the loader's half, §14.8 the
 kernel's entry becoming one file. §15 records the two machines' boot flow converging.
 
-The status of the remaining work — the aarch64 parity thread, the not-yet-unified callers
-and the open 13.18 — is the status board at the top of docs/ROADMAP.md (the "13
+The status of the remaining work — the aarch64 parity thread and the not-yet-unified
+callers (13.2) — is the status board at the top of docs/ROADMAP.md (the "13
 Machine-seam purity + aarch64 parity" line) and Phase 15's own section. The intended shape
 of the module graph and the meaning of the edges are docs/ARCHITECTURE.md §1 (the
 repository as crates), §2 (the module graph) and §3 (what each layer owns); this page

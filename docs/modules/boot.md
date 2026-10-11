@@ -50,7 +50,7 @@ into page tables and a direct map (`mpos-arch`); and the `/proc/cmdline` node, w
 - `collect(at: *const Handoff) -> BootInfo` is `unsafe` and validates rather than trusts: it asserts
   the magic, caps `region_count` at `MAX_MEM_REGIONS`, reads the command line as UTF-8 (a bad line
   fails here, not at every later use), and refuses a record whose *allocatable* regions contain the
-  boot stack (`NOTES.md` §13.17) - the frame allocator's zones are exactly those regions, so a
+  boot stack (`docs/notes/` §13.17) - the frame allocator's zones are exactly those regions, so a
   loader that described the stack as `Usable` would hand the kernel the stack it is standing on.
 - `BootInfo` is not a wire format: plain data, no pointers, no page-table root, no EFI table, with
   `phys_to_virt`, `regions`, `allocatable_bytes` and `MemKind::is_allocatable` (`BootloaderReclaimable`
@@ -76,8 +76,8 @@ The edges - who may call `boot`, and which modules this one may name - are
 `boot` owns one userspace fact: the command line. `src/vfs/procfs.rs` renders `/proc/cmdline` from
 `crate::boot::cmdline()`, and the initramfs's `/init` reads `root=`, `rootfstype=` and `rootflags=`
 from it (`assets/initramfs/core/init`, one script for both machines). The `console=` parsing is kernel-side policy,
-not a syscall, and its honesty gap is recorded in `docs/UAPI.md` §5.3: `console=ttyN` pinning is
-refused rather than approximated, and `/dev/console` has no preferred-console plumbing (`NOTES.md`
+not a syscall, and its honesty gap is recorded in docs/uapi/ §5.3: `console=ttyN` pinning is
+refused rather than approximated, and `/dev/console` has no preferred-console plumbing (`docs/notes/`
 §7.1c). The handoff record itself never reaches userspace.
 
 ## Pins
@@ -118,7 +118,7 @@ userspace consumer is the initramfs `/init` script, which is a shell program, no
 
 ## Evidence and open work
 
-The reasoning is in `docs/NOTES.md`: §14.7 (the loader becomes a library and the record one
+The reasoning is in `docs/notes/`: §14.7 (the loader becomes a library and the record one
 definition), §14.6 (the loader's half of the machine layer moved to `mpos-arch::early`), §13.17 (why a
 record offering the boot stack is refused), §13.23 (`BOOT_STACK_CANARY` lives in the shared leaf),
 §7.1c (the console-list gaps), §14.9 (why the boot *steps* did not come back into this module), and

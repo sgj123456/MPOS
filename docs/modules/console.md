@@ -28,7 +28,7 @@ event machinery itself is `no_std` with `default-features = false`. Its `MAX_LEV
 `target_os = "none"` alone (not an architecture), because the sink it needs is `console::write_bytes`
 and the clock it needs is `hal::ticks`, and both machines have had those since stages 1c and 4; the
 gate used to name x86_64 with a premise that had expired, which silently dropped every `tracing` line
-on the second machine (`docs/NOTES.md` §13.23).
+on the second machine (`docs/notes/` §13.23).
 
 What deliberately does **not** live here: the line discipline (`vfs::tty`'s `LineDiscipline`), the
 settings it obeys (`vfs::termios`'s `Termios`), the multiplexer and its switch negotiation
@@ -38,7 +38,7 @@ before it is written, and the mux owns which of six terminals is on the screen. 
 something the console owns - the screen, the render task, the card handover - it asks through this
 module's `display_*` seams (`display_notify`, `display_master_held`, `display_handover`,
 `display_card_grabbed`), which are no-ops with honest answers on a machine with no framebuffer. That
-seam is what let the mux leave the first machine's body and compile for both (`docs/NOTES.md`
+seam is what let the mux leave the first machine's body and compile for both (`docs/notes/`
 §13.16).
 
 The `console=` list is parsed in `src/boot/console_list.rs`, not here, because the parse runs at the
@@ -134,16 +134,16 @@ are §7.
 ## What userspace sees
 
 The console's userspace surface is shared with the tty and is owned jointly with `src/vfs/tty.rs`.
-`docs/UAPI.md` carries the rows: the `0x54xx` termios/`TIOC*` family (owner `src/vfs/tty.rs`,
+`docs/uapi/` carries the rows: the `0x54xx` termios/`TIOC*` family (owner `src/vfs/tty.rs`,
 `src/vfs/pty.rs`), and the `'V'` (VT) and `'K'` (KD) families, served by `Tty::vt_ioctl` and
 `Tty::kd_ioctl` with their state in `src/vfs/vcmux.rs`. The console tty is published under the
 machine's own serial name, and the kernel log is reachable through `syslog(2)` (pinned by `t-syslog`)
-even though `docs/UAPI.md` has no dedicated `syslog` row - a gap in the inventory rather than in the
-kernel (inference: a grep of `docs/UAPI.md` finds no `syslog`/`klogctl` row).
+even though `docs/uapi/` has no dedicated `syslog` row - a gap in the inventory rather than in the
+kernel (inference: a grep of `docs/uapi/` finds no `syslog`/`klogctl` row).
 
-Two console gaps are named rather than approximated, in `docs/UAPI.md`: `console=ttyN` pinning is
-refused, and `/dev/console` has no preferred-console plumbing (`docs/NOTES.md` §7.1c). The serial
-transmit wait is fatal-signal-only, like `wait4` (`docs/UAPI.md` §1.2).
+Two console gaps are named rather than approximated, in `docs/uapi/`: `console=ttyN` pinning is
+refused, and `/dev/console` has no preferred-console plumbing (`docs/notes/` §7.1c). The serial
+transmit wait is fatal-signal-only, like `wait4` (docs/uapi/ §1.2).
 
 ## Pins
 
@@ -154,7 +154,7 @@ transmit wait is fatal-signal-only, like `wait4` (`docs/UAPI.md` §1.2).
 | `src/vfs/termios.rs` tests | host | `a_stored_termios_reads_back_as_itself`, `a_termios2_carries_its_speeds_at_the_end_of_forty_four_bytes`, `the_console_default_is_a_line_at_a_time_and_echoed` |
 | `src/vfs/tty.rs` tests | host | the `LineDiscipline` suite, and above it `the_report_and_the_screen_never_disagree_about_the_cursor`, `a_query_to_a_terminal_the_kernel_does_not_draw_travels_unanswered`, `a_query_to_a_screen_the_kernel_draws_is_answered_and_kept_off_the_wire`, `a_console_reports_its_screens_window_and_others_do_not` |
 | `t-tty-query` | `user/tests` | which questions the console answers and which it forwards, per who draws the screen |
-| `t-tty-vtime` | `user/tests` | the `VMIN`/`VTIME` blocking read table (the source of `NOTES.md` §12.4a) |
+| `t-tty-vtime` | `user/tests` | the `VMIN`/`VTIME` blocking read table (the source of `docs/notes/` §12.4a) |
 | `t-tty-nonblock` | `user/tests` | the same table with `O_NONBLOCK` |
 | `t-tty-eintr` | `user/tests` | a trapped signal ending a blocked read |
 | `t-vt` | `user/tests` | the `'V'`/`'K'` family on both machines, and the mux switch visible on the wire |
@@ -170,9 +170,9 @@ and the machine tests. `t-aa-ptyprobe` in `user/tests` describes itself as a tem
 ## Evidence and open work
 
 The reasoning behind the framebuffer takeover, the mux port to both machines and the logging gate is
-in `docs/NOTES.md` §13.16 and §13.23; the framebuffer console's own landing is §13.26; the `t-tty-vtime`
+in `docs/notes/` §13.16 and §13.23; the framebuffer console's own landing is §13.26; the `t-tty-vtime`
 freeze is §12.4a, and its read-path sibling note is the same section. The console-list design (why a
 list, not a "headless" flag) is the module header of `src/boot/console_list.rs`, and the `console=`
-gaps are `docs/UAPI.md`'s "Console gaps" bullet, whose reasoning is `docs/NOTES.md` §7.1c. `docs/ARCHITECTURE.md` §2/§3 own the
+gaps are `docs/uapi/`'s "Console gaps" bullet, whose reasoning is `docs/notes/` §7.1c. `docs/ARCHITECTURE.md` §2/§3 own the
 edges and §7 the concurrency rules, and `docs/ROADMAP.md` owns what is left: the `/dev/console`
 preferred-console plumbing and `console=ttyN` pinning.

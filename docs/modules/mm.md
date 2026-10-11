@@ -49,7 +49,7 @@ declaration in `src/mm/mod.rs` says otherwise. One of the two is stale; this pag
 list of `Mapping`s and does not get to invent policy (`vm.rs`'s header). The "how is it mapped"
 half is `hal`'s, which is why `vm.rs` is now a re-export of the `mpos-vm` crate — the vocabulary had
 to move below both `mm` and the machine layer once the machine layer became a crate that cannot name
-`mm` (`NOTES.md` §14, step S2b). The paths every caller already used are unchanged.
+`mm` (`docs/notes/` §14, step S2b). The paths every caller already used are unchanged.
 
 ## Key files
 
@@ -85,7 +85,7 @@ and the diagnosis is impossible by then.
 a power-of-two multiple of the class size from it, so a slot is always aligned to at least its own
 size, and only a request with alignment *larger than a page* needs the `Large` side table at all.
 Runs are never returned to the frame allocator (waste is bounded by each class's high-water mark).
-The `PMM` still panics on failure — `docs/NOTES.md` §8.0 — which is why the heap carries a bounded
+The `PMM` still panics on failure — `docs/notes/` §8.0 — which is why the heap carries a bounded
 `MAX_LARGE` table rather than an unbounded map.
 
 **The mapping plan (`src/mm/vm.rs` → `mpos-vm`).** `kernel_mappings` produces disjoint page-granular
@@ -116,10 +116,10 @@ aarch64 `USER_LIMIT` is `1 << 48`, not x86_64's `1 << 47`, and a shared value wa
 
 ## What userspace sees
 
-`mm` owns **no dispatch row** of its own in `docs/UAPI.md`. The surface it participates in — `mmap`,
+`mm` owns **no dispatch row** of its own in `docs/uapi/`. The surface it participates in — `mmap`,
 `munmap`, `mprotect`, `madvise`, `mremap`, `brk`, `process_vm_readv`/`writev` — is dispatched in
 `src/syscall/linux/proc.rs`, and the `MAP_*`/`MREMAP_*` flag words live in `src/syscall/linux/abi.rs`;
-the inventory's rows are therefore the syscall module's to keep (`docs/UAPI.md` §1, the "`mmap`
+the inventory's rows are therefore the syscall module's to keep (docs/uapi/ §1, the "`mmap`
 flags" row in §3, and the `madvise` advice vocabulary in §3). What `mm` supplies is the *semantics*
 those rows promise: which range a mapping may claim, what a split does to a frame-backed offset, and
 where a `MAP_FIXED`/hint/`MAP_FIXED_NOREPLACE` placement lands. The one piece `mm` declares itself
@@ -131,13 +131,13 @@ a recorded `sched → syscall` edge blocking the aarch64 un-gate.
 
 | Pin | Kind | What it would fail on |
 |---|---|---|
-| `src/mm/kunit.rs` `const SUITE` — `frames`, `large_block`, `heap` | boot (`--features selftest`) | The allocators on a real machine: zones exist, a block survives the direct map, the buddy merge re-hands the same block back, the largest block a zone gives out is usable end to end, every slab class returns every byte, and the heap and frame allocator agree about what they have handed out. Runs at `Phase::Heap`; the boot suite's shape is `docs/NOTES.md` §15.20 |
+| `src/mm/kunit.rs` `const SUITE` — `frames`, `large_block`, `heap` | boot (`--features selftest`) | The allocators on a real machine: zones exist, a block survives the direct map, the buddy merge re-hands the same block back, the largest block a zone gives out is usable end to end, every slab class returns every byte, and the heap and frame allocator agree about what they have handed out. Runs at `Phase::Heap`; the boot suite's shape is `docs/notes/` §15.20 |
 | `src/mm/pframe.rs` `mod tests` — `seeding_accounts_for_every_frame`, `allocations_are_disjoint`, `exhausting_a_zone_then_refilling_it_loses_nothing`, `freed_buddies_merge_back_into_a_larger_block`, `merging_cascades_all_the_way_up`, `stale_list_entries_are_skipped_not_handed_out`, `orders_above_the_maximum_are_refused`, `a_region_smaller_than_its_metadata_is_rejected`, `the_pmm_only_takes_allocatable_regions` | host | The buddy allocator's disjointness, alignment, merge-cascade accounting and zone selection |
 | `src/mm/elf.rs` `mod tests` — `a_static_executable_parses_into_its_load_segments`, `the_executable_bit_and_the_write_bit_come_out_of_the_header`, `segments_that_do_not_load_are_skipped`, `refuse_what_the_loader_cannot_place`, `a_segment_past_the_lower_half_is_refused`, `only_a_position_independent_image_moved_from_its_named_addresses`, `a_static_image_names_no_interpreter`, `a_dynamic_image_reports_the_interpreter_it_asks_for`, `the_relative_relocations_are_the_ones_the_loader_reads`, `a_relocation_target_outside_every_segment_refuses_the_image`, `a_rela_table_of_an_unknown_record_size_is_left_alone`, `a_rela_table_outside_every_segment_is_left_alone`, `an_empty_interpreter_path_is_not_an_interpreter`, `an_x86_64_image_reports_its_machine`, `an_aarch64_image_gets_its_relative_relocations_read`, `an_image_for_an_unknown_machine_is_refused`, `a_file_that_names_no_machine_is_refused` | host | What the loader accepts/refuses, the `ET_EXEC` vs `ET_DYN` placement rule, and per-machine relocation extraction |
 | `src/mm/vma.rs` `mod tests` — `lookup_finds_the_covering_area_and_nothing_else`, `a_later_insert_replaces_exactly_its_own_range`, `adjacent_areas_of_one_object_merge_and_dissimilar_ones_do_not`, `one_object_is_recognised_across_two_handles_to_it`, `a_split_keeps_the_frame_offset_with_its_address`, `a_shared_bit_the_two_halves_do_not_agree_on_is_two_areas`, `a_name_splits_an_area_and_a_shared_one_folds_it_back`, `a_split_keeps_the_name_on_both_halves`, `remove_range_leaves_the_ends_and_takes_the_middle`, `take_range_hands_back_what_it_removed`, `set_prot_touches_only_what_is_already_there`, `set_prot_splits_so_the_untouched_part_keeps_its_bits`, `gaps_report_what_growth_may_claim`, `gaps_are_one_hole_per_hole_whatever_order_the_table_holds`, `mmap_placement_rules_over_a_lazy_arena` | host | The merge/split/gap semantics, the object-identity rule, and the `mmap` placement replay |
 | `crates/vm/src/lib.rs` `mod tests` — `every_mapping_is_page_granular`, `nothing_is_both_writable_and_executable`, `no_two_entries_cover_the_same_page`, `the_kernel_image_is_mapped_with_per_section_permissions`, `the_direct_map_covers_all_physical_memory` | host | `kernel_mappings`: granularity, W^X, disjointness and direct-map coverage |
 | `user/tests/src/bin/t-mmap.rs`, `t-mmap-demand.rs`, `t-mmap-reserve-commit.rs`, `t-mmap-shared-fork.rs`, `t-munmap.rs`, `t-mprotect.rs`, `t-mremap.rs`, `t-madvise.rs`, `t-maps.rs`, `t-brk.rs`, `t-memfd-shm.rs`, `t-lazy-buffer.rs`, `t-process-vm-libc.rs`, `t-fork.rs` | `t-*` (std) | The mapping/placement/lazy-fault/COW behaviour end to end on a booted machine |
-| `user/tests/src/bin/t-aslr.rs` | `t-*` (std) | Which layout landmarks are randomised (`NOTES.md` §8.1; the heap-anchor half is a named gap) |
+| `user/tests/src/bin/t-aslr.rs` | `t-*` (std) | Which layout landmarks are randomised (`docs/notes/` §8.1; the heap-anchor half is a named gap) |
 
 There is **no `t-*` program under `user/abitest` that targets `mm`** today: the `no_std` suite's
 live programs are `src/bin/integration/t-*.rs`, and none of them exercises the allocator, the VMA
@@ -148,13 +148,13 @@ heap specifically has no pin of either kind, which is the same observation as th
 ## Evidence and open work
 
 The reasoning and the measurements are elsewhere and are not restated here. The frame allocator's
-statics and the heap's worst-case rule: `docs/NOTES.md` §8.0. The VMA/`mmap` placement lesson (one
-hole reported twice from an unsorted table) and the `insert_present` measurement: `docs/NOTES.md`
+statics and the heap's worst-case rule: `docs/notes/` §8.0. The VMA/`mmap` placement lesson (one
+hole reported twice from an unsorted table) and the `insert_present` measurement: `docs/notes/`
 §15.18. The `mm`↔`vfs` seam and `MappedObject`: `docs/ARCHITECTURE.md` §9 (V-13) and
-`docs/NOTES.md` §11.4. The mapping vocabulary's move to the `mpos-vm` leaf: `docs/NOTES.md` §14
-(step S2b). The `/proc/<pid>/maps` gap that `MappedRange` carries rather than hides: `docs/NOTES.md`
+`docs/notes/` §11.4. The mapping vocabulary's move to the `mpos-vm` leaf: `docs/notes/` §14
+(step S2b). The `/proc/<pid>/maps` gap that `MappedRange` carries rather than hides: `docs/notes/`
 §7.4. The aarch64 `USER_LIMIT`/`MMAP_BASE` divergence and the `dlopen` failure it caused:
-`docs/NOTES.md` §9.1. Feature status (`mmap`, `madvise`, shared anonymous memory) is on the board in
-`docs/ROADMAP.md`, and the userspace verdicts are `docs/UAPI.md`'s rows. The remaining work this page
+`docs/notes/` §9.1. Feature status (`mmap`, `madvise`, shared anonymous memory) is on the board in
+`docs/ROADMAP.md`, and the userspace verdicts are `docs/uapi/`'s rows. The remaining work this page
 points at — without inventing it — is the heap's host testability relative to the rule, and the
 `brk`-anchor randomisation gap `t-aslr` names (which is `sched`'s layout, not a wrong number here).

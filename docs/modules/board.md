@@ -31,7 +31,7 @@ kinds of duplication:
   `arm_console` calls `crate::arch::enable_console_interrupts`, which only the wiring may name, and
   the library's `boot` module was tried first and rejected because `vfs` already names `boot` (the
   command line behind `/proc/cmdline`), so `boot` reaching back for `sched`/`vfs` would close a
-  mutual edge (`NOTES.md` §14.9).
+  mutual edge (`docs/notes/` §14.9).
 - `report.rs` is the shared *reporting* - the boot banner, the boot-stack canary check, `park`, and
   the two things a dying kernel says (`report_stack_use`, `panic_context`). It is separate from
   `steps` because the duplication is a different kind: nothing in a report is a machine's to answer
@@ -41,11 +41,11 @@ kinds of duplication:
   one list of what a self-test boot checks, and `reached(phase, info)` runs the suites whose phase it
   is. The suites themselves sit beside the modules they test - `mm`'s, `sched`'s, `vfs`'s,
   `syscall`'s two, and the boot's own in `report` - which is what lets one read that module's private
-  state, and it is where the neutral milestone checks went (`NOTES.md` §15.19-§15.23). `checks/` no
+  state, and it is where the neutral milestone checks went (`docs/notes/` §15.19-§15.23). `checks/` no
   longer exists.
 
 What deliberately does **not** live here: the entry, the descriptor tables, the page tables, the wire
-and the device description - those are `mpos-arch` (`NOTES.md` §14.8); the architecture-independent
+and the device description - those are `mpos-arch` (`docs/notes/` §14.8); the architecture-independent
 entry `_start` and the panic handler, which are `src/main.rs`; and the handoff record itself, which is
 the `mpos-bootinfo` leaf the loader and the kernel share (see [boot](boot.md)).
 
@@ -89,14 +89,14 @@ The boot *sequence* this module implements is `docs/ARCHITECTURE.md` §4.
 
 ## What userspace sees
 
-`board` owns no `docs/UAPI.md` rows of its own - it is the wiring, not an ABI surface. What it
+`board` owns no `docs/uapi/` rows of its own - it is the wiring, not an ABI surface. What it
 decides of the userspace's world is reached through rows another module owns: `/init` becomes pid 1
 (so `/proc/1/cmdline` exists), the aarch64 body builds and mounts `/dev` (`check_dev`, the
 `standard_devfs` set the devfs rows describe), and both bodies hang the boot disk at `/mnt` and the
 host share at `/mnt/share` (so `/proc/mounts` and `statfs` name them). The `console=` policy the
 x86_64 `milestone` installs is `boot::console_list`'s, not this module's; its gap is recorded in
-`docs/UAPI.md` §5.3 (`console=ttyN` pinning refused, `/dev/console` has no preferred-console
-plumbing; `NOTES.md` §7.1c).
+docs/uapi/ §5.3 (`console=ttyN` pinning refused, `/dev/console` has no preferred-console
+plumbing; `docs/notes/` §7.1c).
 
 ## Pins
 
@@ -120,10 +120,10 @@ Two honest caveats, both from the code. First, whether a machine runs its checks
 decided by which *image* was built (`--features selftest`, `src/board/kunit.rs`) rather than by a word
 on the command line: a kernel from `build`/`run`/`disk` carries neither the suites nor the harness,
 and the `mpos.selftest` word the kernel used to parse for that decision is gone from it
-(`NOTES.md` §15.19). Second, a boot's verdict is the sweep's
+(`docs/notes/` §15.19). Second, a boot's verdict is the sweep's
 `=== RUN/PASS/FAIL/SUMMARY/END` plus the harness's own tally, and the `M*`-shaped markers the checks
 used to print are gone - nothing had parsed them since §15.6/§15.7 retired the command that did, and
-a marker a reader cannot tell from a mechanism is worse than a sentence (`NOTES.md` §15.24).
+a marker a reader cannot tell from a mechanism is worse than a sentence (`docs/notes/` §15.24).
 
 No `t-*` program pins this module directly, and none names it: grepping `user/` for `\bboard\b`
 finds nothing (the earlier substring matches are all `keyboard`). The closest adjacent pin - and it
@@ -134,7 +134,7 @@ shape `AGENTS.md` §3.6 warns about: the milestone checks are what actually exer
 
 ## Evidence and open work
 
-The reasoning, and where each claim was measured, is in `docs/NOTES.md`: §14.9 (why the five steps
+The reasoning, and where each claim was measured, is in `docs/notes/`: §14.9 (why the five steps
 are stated once and live in the wiring crate, not in the library), §14.8 (the machine's half moved
 down into `mpos-arch`), §13.23 (the neutral checks and the shared reporting), §13.21 (the aarch64
 trap stubs the checks depend on), §13.14/§13.15 (a check must not leave the machine it checks

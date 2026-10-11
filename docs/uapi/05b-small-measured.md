@@ -1,0 +1,240 @@
+# UAPI §5.2
+
+Part of the split `docs/uapi/` inventory — index and reading rules in [index.md](index.md).
+Section numbers are unchanged from the original `UAPI.md`.
+
+### 5.2 Small, measured, and not yet landed
+
+- **An absolute path does not make the `*at` family ignore its dirfd.** Linux's rule is that
+  when the path is absolute the dirfd is not used at all, and it is the *dirfd* that stops
+  being a question rather than the path: measured here, `newfstatat(77, "/tmp", buf, 0)` with
+  `77` not open answers `0`, errno `0`. This kernel resolves the dirfd first whatever the path
+  looks like — one `base_of` does it for the whole family — so the same call answers `EBADF`.
+  Not a §3.2 defect (an honest refusal rather than a wrong number), but a caller holding a
+  stale dirfd and an absolute path takes its fallback where Linux succeeded, and the *same*
+  difference is reachable through `openat`, `unlinkat`, `linkat` and the rest. Owner:
+  `src/syscall/linux/fs/file.rs`'s `base_of` and its twenty call sites. `t-newfstatat`'s
+  bad-dirfd claim therefore names its path *relatively*, which is `EBADF` on both machines,
+  and does not pin this either way (S6 batch 12). `docs/notes/` §15.17.
+- **`F_GETFL` reports no access mode.** Linux ORs the descriptor's access mode into the word
+  `fcntl(F_GETFL)` returns, so a descriptor opened `O_WRONLY` reports `1` (measured on a
+  current host); this kernel reports the description's stored status word, whose access bits
+  are always zero, and keeps the mode separately (`src/vfs/file.rs`'s `ACC_*`, which the
+  read/write `EBADF` refusal reads). A caller that reads `F_GETFL` to learn which way a
+  descriptor opens is told `O_RDONLY` for every one of them. Not a §3.2 defect — the answer
+  is a zero rather than a wrong number — but a divergence a program can see, and `t-fcntl`
+  pins the current answer on **both** machines (S6 batch 11). Closing it means folding the
+  access bits into the reported word, which has its own blast radius: `rustix::fs::Dir`
+  reuses an `F_GETFL` word for the `openat(fd, ".")` it opens a directory's descriptor with.
+  Owner: `src/syscall/linux/fs/file.rs`'s `F_GETFL` arm + the `access` field already there.
+  `docs/notes/` §15.16.
+- **A `flock` dies on *any* close of its description, not the last.** Linux releases the
+  description's `flock` when the last descriptor referring to it closes, so closing one of
+  several `dup`s leaves the lock in force — measured on a current host: `flock(a, LOCK_EX)`,
+  `close(dup_of_a)`, then a fresh `open()` of the file still answers `EWOULDBLOCK`. This
+  kernel releases it on any close naming that description, because the close path passes the
+  description's identity and nothing about how many descriptors still hold it — so a process
+  that dups its lock descriptor and closes the dup silently loses its lock, and a second
+  process can take it. `src/vfs/locks.rs`'s own `release_on_close` record already states the
+  Linux rule, so the code and its documentation disagree. Owner: `src/syscall/linux/fs/file.rs`'s
+  close path (which already tests `Arc::strong_count` after the close for the evdev half) and
+  `src/vfs/locks.rs`. `docs/notes/` §15.16.
+- **`waitid(2)` ignores its `id`, serves two of Linux's four idtypes, and calls
+  "no event asked for" a success.** Three divergences, each measured on a
+  current host. (a) The `id` argument is not used: `P_PID` does not name the
+  child waited for, so a caller naming one child is handed whichever child
+  finishes first (`wait4` *does* honour its pid, which is what makes this
+  `waitid`'s own). (b) `P_ALL` and `P_PID` are served and `P_PGID` (2) and
+  `P_PIDFD` (3) are answered `EINVAL`, where Linux serves `P_PGID`: measured,
+  `idtype = 2` with `id = 0` is accepted and a childless caller is answered
+  `ECHILD` (errno 10). (c) A call whose `options` asks for none of
+  `WEXITED`/`WSTOPPED`/`WCONTINUED` is answered `0` with the record cleared,
+  where Linux clears the record and then refuses with `EINVAL` (errno 22) —
+  measured, and the *zeroing* is the half both machines agree on; (c) is the
+  §3.2 shape in the milder direction, a success where Linux refuses, rather
+  than a wrong number. Owner: `src/syscall/linux/proc.rs`'s `handle_waitid` (the
+  `_id` binding, the `idtype` check, and the `options & WEXITED == 0` arm).
+  `t-waitid` pins this kernel's answers on **both** machines and names each
+  host answer beside it under `MPOS_ON_HOST`. `docs/notes/` §15.11 (batch 18).
+
+- **`rt_sigaction` refuses a bare *query* of `SIGKILL`/`SIGSTOP`.** Linux's rule
+  is `act && sig_kernel_only(sig)` — a disposition cannot be *set* for either,
+  but a call that hands over no `act` and merely asks what is in force is
+  served: measured on a current host, `rt_sigaction(SIGKILL, NULL, NULL, 8)`
+  answers `0`, and `t-rt-sigaction`'s two claims print the note that records it
+  under `MPOS_ON_HOST`. This kernel validates the signal number before it looks
+  at `act` at all (`sched::signal::catchable`), so the same call answers
+  `EINVAL`. Not a §3.2 defect — an honest refusal where Linux succeeds, the mild
+  direction — but a caller that probes a disposition before setting one takes a
+  fallback it did not need. Owner: `src/syscall/linux/mod.rs`'s `sigaction`,
+  where the `catchable` check would split into "is this a signal" (unconditional)
+  and "may it be given a disposition" (only when `act != 0`). `t-rt-sigaction`
+  pins this kernel's answer on **both** machines. `docs/notes/` §15.11 (batch 20).
+
+- **`signalfd(2)` and `SIGCHLD`: one death, two records, and the wrong code.**
+  Three divergences, each measured on a current host, all of them on the path the
+  compositor-shaped caller this descriptor exists for walks. (a) A child's exit
+  lives in one table (`sched::read_sigchld`) and a generated `SIGCHLD` is *also*
+  queued when the caller has it blocked (`sched::runtime`'s `wants_sigchld`), so
+  a descriptor whose mask names `SIGCHLD` hands over **two** records for one
+  death: the queued copy first, then the exit record. Linux's pending queue is
+  the one table, so one death is one record. (b) That queued copy's `ssi_code`
+  is `SI_USER` (`SigInfo::user`), where Linux's record for a child's exit is
+  `CLD_EXITED`, with the status beside it — the divergence `sched::runtime`'s own
+  comment measured (`si_code=1`) without implementing. (c) An *unblocked*
+  `SIGCHLD` is discarded by Linux (`sig_ignored()`, and `SIGCHLD`'s default
+  action is the ignoring one), so a `signalfd` watching it sees nothing until the
+  caller blocks it — measured with the pair one child's exit makes: unblocked the
+  read answers `-1`/`EAGAIN` (errno 11), blocked it answers the 128-byte record.
+  This kernel reports the exit whatever the mask says, which is what let the
+  no-std version pass without blocking anything. Owner: `src/sched/runtime.rs`'s
+  `queue_signal` call (the record's code, and the second table) with
+  `src/vfs/signalfd.rs`'s `take_signal` (which source wins). `t-signalfd` blocks
+  `SIGCHLD` the way its own contract says, claims the *count* of records with
+  this kernel's answer on the payload and Linux's under `MPOS_ON_HOST`, and pins
+  the exit record's `CLD_EXITED` and pid on **both** machines. `docs/notes/` §15.11
+  (batch 21). **Re-measured after the program count grew, and the count had
+  drifted to four**: the three extra records named *other* slots (`8`, `10`) and
+  the read before the test's own fork already answered one, because an unreaped
+  child kept a `parent` that names a **slot** — and a slot is reused, so the next
+  process to occupy it was handed the dead process's orphans. Fixed where Linux
+  fixes it (`forget_original_parent`: a process that exits gives its remaining
+  children to init, `src/sched/runtime.rs`'s exit path), which also makes this
+  entry's "two records for one death" deterministic rather than
+  neighbourhood-dependent. `docs/notes/` §6.
+
+- **A UDP send's full buffer answered `EMSGSIZE`, so a burst stopped at four —
+  and the blocking half of Linux's rule is not implemented yet, by name.** A
+  socket's send buffer is finite, so a burst outruns it; what the caller hears
+  then is Linux's question, and Linux's answer has two halves — a *blocking*
+  sender waits for room, a non-blocking one is `EAGAIN` — with `EMSGSIZE` kept
+  for the datagram wider than the buffer that would have to hold it. This kernel
+  had one mapping for both of `smoltcp`'s meanings of `BufferFull` ("wider than
+  the buffer" and "no room at this instant") and answered **`EMSGSIZE`** to each,
+  so a perfectly ordinary 1400-byte datagram was refused as though it were
+  oversized. Measured by `t-netstats`, which sends 256 of them back to back:
+  **four were accepted** — the depth of the virtio TX ring — and every send after
+  that was refused, so `tx_packets` moved by four and the burst's rate said
+  nothing. `src/net/socket.rs`'s `udp_send` now asks which case it is
+  (`data.len() > sock.payload_send_capacity()` keeps `EMSGSIZE`) and answers
+  **`EAGAIN`** to the momentary full. **The wait is not implemented, and that is
+  the named half**: the buffer drains into the device's TX ring, the ring drains
+  when the device completes descriptors, and this driver takes no interrupt for a
+  completion — so there is no event a blocking sender could wait on, and a park
+  there sleeps until something else happens to poll the stack. Both shapes were
+  tried and measured: a park with no deadline stopped the sweep dead at
+  `t-netstats`'s first parked send, and a tick-bounded park spun at **97% CPU**
+  because the wait's own readiness answer (`can_send()`, the metadata ring) was
+  true while `enqueue` still refused on the payload ring — a wait that can never
+  end. **Follow-up, and the way this closes**: give the TX ring a completion
+  wakeup (a TX interrupt, or a wake from the driver's `transmit`) and the blocking
+  sender can wait as Linux's does. Until then `t-netstats`'s burst retries on
+  `EAGAIN` (a bound, not a tolerance) and prints the retry count as a measurement,
+  and its exactness pair — one `sendto` moves `tx_packets` by exactly one and
+  `tx_bytes` by exactly the frame's size — is the pin. `docs/notes/` §10.4.
+
+- **A terminal's foreground group, and a pty's number: two conventions this kernel
+  answers its own way.** (a) *Whose signals a terminal carries.* Linux keeps a
+  terminal's foreground group strictly as session state: it is set when a session
+  leader makes the tty its controlling terminal (`__proc_set_tty`) or by
+  `TIOCSPGRP` from that session, and a terminal no session holds has none -
+  measured on a current host, `TIOCSWINSZ` on a fresh pair's master runs no
+  handler at all (five setups probed: nothing claimed, `tcsetpgrp` without a
+  session, a read first, and a session leader with the slave as its ctty - only
+  the last two deliver, and the third only on this kernel), `TIOCGPGRP` on its
+  slave answers `-1`/`ENOTTY` (errno 25) and `tcsetpgrp(slave, getpgrp())` is
+  refused with the same number. This kernel answers "the reader": `Tty::read`
+  records the reading task's group as the terminal's foreground
+  (`src/vfs/tty.rs`, "the same answer for a program that never asks"), and
+  `TIOCGPGRP` reports zero rather than refusing when nobody owns the terminal
+  (`src/syscall/linux/fs/ioctl.rs`'s `0x540F`/`0x5410` arm). A program that reads
+  a tty it never claimed therefore *receives* the typed `SIGINT` and the resize
+  `SIGWINCH` here, where Linux would aim at nobody, and a supervisor asking
+  `tcgetpgrp` on a pair no session holds reads `0` here and an error there.
+  Owner: `src/vfs/tty.rs`'s `read`/`foreground` and `src/sched/runtime.rs`'s ctty
+  bookkeeping. `t-pty` pins the *delivery* on **both** machines by giving the pair
+  a session the ABI's way - a getty's `setsid` + open + `TIOCSCTTY` - and names
+  this rule in its comment instead of pinning it. (b) *The number `TIOCGPTN`
+  mints.* This kernel numbers its pairs past the six virtual consoles
+  (`src/vfs/pty.rs`'s counter starts at `VC_COUNT + 1`); Linux's `devpts` numbers
+  from 0 - measured on a current host, which answered 5. Both name a real slave,
+  so no caller is misled, but a program that hard-codes a first number does not
+  meet it here. `t-pty` pins this kernel's answer on the payload and accepts the
+  host's under `MPOS_ON_HOST`, printing what the host said. `docs/notes/` §15.11
+  (batch 22).
+
+- **`FIONREAD` on a regular file and on a pipe.** Linux answers `0` and the bytes
+  remaining/queued; this kernel answers `ENOTTY` for everything that is not the entropy
+  pair. The `ENOTTY` is an honest "this descriptor has no queue-length story here" rather
+  than a wrong number, so it is not a §3.2 defect — but it is a divergence a program can
+  see. Closing it needs a per-descriptor byte count (a pipe has one; a file has
+  `size - offset`). Owner: `fs.rs` + the node's own `poll` story.
+- **`RNDRESEEDCRNG` provenance.** Now that the reseed is real, `RNDGETENTCNT`'s 4096 stays
+  a constant across it; a caller that reseeds and re-reads sees the same figure Linux shows,
+  so no change is needed — recorded so the next reader does not "fix" it into a lie.
+- **`/proc/<pid>/smaps` and `numa_maps`.** `maps` is served in Linux's exact format; the
+  two siblings are unwritten. Owner: `src/vfs/procfs.rs`.
+- **`devfs` birth modes.** Devices are born `0666 root:root`; `devtmpfs` births `0600`
+  and lets udev widen it. Needs per-class birth modes and group-name resolution, not a new
+  mechanism (`docs/notes/` §3.4).
+- **The console tty is published under the machine's own serial name.** `/dev/ttyS0` on
+  x86_64, `/dev/ttyAMA0` on aarch64 - one node (the console tty, where the kernel log goes
+  and which the kernel's standard descriptors are) under the name the psABI gives that
+  machine's first serial port, which is also the name `console=` spells. `mount -t proc` and
+  `mount -t sysfs` are served on **both** machines (a real init mounts and reads them); the
+  parts that are x86_64's - PCI config-space read/write, the evdev registry `/sys/class/input`
+  enumerates - sit behind the `mpos_pci_config`/`mpos_input_registry` capability flags, so a
+  machine without one builds the tree from the neutral model (empty on aarch64) instead of
+  refusing the filesystem.
+- **`open(2)`'s flag *numbers* are the machine's, and four differ.** arm64's
+  `asm/fcntl.h` overrides `O_DIRECTORY` (`0x4000` vs x86_64's `0x10000`), `O_NOFOLLOW`
+  (`0x8000` vs `0x20000`), `O_DIRECT` (`0x10000` vs `0x4000`) and `O_LARGEFILE` (`0x20000`
+  vs `0`, i.e. absent) before including `asm-generic/fcntl.h`. `O_TMPFILE` is
+  `O_DIRECTORY`'s partner, so its composite moves with it (`0x404000` on arm64, `0x410000`
+  on x86_64) while its own bit, `__O_TMPFILE` (`0x400000`), does not. The overlap is
+  load-bearing rather than tidy: arm64's `O_LARGEFILE` is x86_64's `O_NOFOLLOW` bit, and
+  musl's `open()` adds `O_LARGEFILE` to every open - so a kernel carrying one table answered
+  `ELOOP` to every `open()` of a symbolic link on aarch64, which is what stopped `openrc`
+  starting its syslog service (the loader opening `libcap.so.2 -> libcap.so.2.78`). Pinned by
+  `user/tests/src/bin/t-open-flags.rs` on both machines. `O_LARGEFILE` is deliberately
+  undefined in the kernel: it is ignored, as Linux ignores it, and what matters is that
+  ignoring it does not mean mistaking it for another flag.
+- **The `DRM_VIRTGPU_*` family (`0x41..=0x4b`) is served, 2D and 3D both.** All eleven
+  requests are dispatched, and each answers per card shape, as Linux's does
+  (the instrument was `user/staging/virtgpu-probe/`, now deleted - its table is
+  in `docs/notes/` §7.4, as are the GL card's own answers -
+  `virgl=1 context_init=1 capsets=2 cached=2 mask=0x6`), with
+  its one named divergence left in the `'d'` row above (of the three it carried, two
+  are closed). The **mailbox** (`render::job` - an
+  ioctl describes a device command and parks, because the control queue belongs to the
+  render task) and a **device resource** behind a GEM handle (`Dumb.resource` in
+  `drivers/drm.rs`) carry both halves, and the 3D commands ride the same machinery:
+  `CTX_CREATE`/`DESTROY`/`ATTACH_RESOURCE`, `RESOURCE_CREATE_3D`,
+  `TRANSFER_{TO,FROM}_HOST_3D`, `SUBMIT_3D`, `GET_CAPSET_INFO`/`GET_CAPSET`. There is no
+  command-stream parser to fuzz because there is nothing to parse - Linux forwards the
+  stream with `vmemdup_user` and never reads it (§4 rule 2's target is the
+  variable-length `GET_CAPSET` reply instead, and it is
+  `fuzz/fuzz_targets/virtgpu_capset.rs`). **What the family still does not buy is a
+  renderer, and the reason is not in this row**: Mesa never loads the virtio driver,
+  because the DRM device's parent chain carries no bus identity, so `drmGetDevices2`
+  finds no card and every EGL platform falls back to `llvmpipe` - measured, with the
+  sysfs attributes and the two interpositions that ruled other explanations out, in
+  `docs/notes/` §7.4. **And one fix the 2D half already owes**: `CREATE_DUMB` should create a
+  device resource as Linux's does, which would remove two of the three divergences above.
+  It is not done because it would make every dumb buffer eagerly backed and add a device
+  round trip to the path the console, weston and `/dev/fb0` all allocate through.
+- **The EL0 system-instruction traps Linux answers and this kernel refuses.** Two rows of
+  Linux's `do_el0_sys` table are served - the `CTR_EL0` read and the
+  `DC CVAU`/`CVAC`/`CIVAC`/`IC IVAU` maintenance family, pinned by `t-el0-sysreg` - and what
+  is left of that table falls through to `SIGILL`, which is Linux's own answer for a trap its
+  table has no row for *but is not Linux's answer for four of these*. Linux serves the counter
+  reads (`CNTVCT_EL0`/`CNTVCTSS_EL0`, `CNTFRQ_EL0`), the `CPUID` reads (`do_emulate_mrs`),
+  `WFI` (whose handler simply skips it), and the point-of-persistence pair of maintenance
+  operations (`DC CVAP`/`DC CVADP`). The pair is refused here for a reason the others do not
+  share and it is worth naming: they need `FEAT_DPB`, and running an EL1 spelling of an
+  operation the CPU does not implement is an *undefined instruction*, which this machine
+  answers by stopping - so a refusal is the safe answer as well as the honest one. None of the
+  four has been asked for on either machine yet (llvmpipe's flush asks for the pair that is
+  served), so what is missing is need rather than design, and each refusal is a signal a caller
+  can see rather than silence. Owner: `arch/src/arch/aarch64/vectors.rs`'s `el0_sys`, whose own
+  doc names each. `docs/notes/` §15.36.

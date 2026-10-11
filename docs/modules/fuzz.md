@@ -15,7 +15,7 @@ therefore `cargo fuzz` run **from inside `fuzz/`**, not from the repository root
 
 What the directory owns is the negative direction of the project's design rule: any
 place the kernel reads user- or wire-supplied bytes joins the targets here, or
-`docs/NOTES.md` says why not (`AGENTS.md` §3, extended rule 2). Its scope is exactly
+`docs/notes/` says why not (`AGENTS.md` §3, extended rule 2). Its scope is exactly
 the modules the kernel's `src/lib.rs` leaves compiled for a host build — the ELF
 loader, the ustar initramfs, ext2/ext4's on-disk structures, partition tables, paths,
 PCI sizing, the console's escape parser, the 9P `Rstat` record, and the
@@ -100,16 +100,16 @@ worth fuzzing there is the field values and not their encoding.
 ## What userspace sees
 
 The fuzz targets make no userspace-visible promise of their own: `fuzz/` is not in
-the kernel graph and owns no row in `docs/UAPI.md`. They fuzz the *parsers* that rows
+the kernel graph and owns no row in `docs/uapi/`. They fuzz the *parsers* that rows
 elsewhere in the tree depend on; which syscall or ioctl reaches each parser is the
-owning module's page, and the row's pin is the `t-*` program named in `docs/UAPI.md`.
+owning module's page, and the row's pin is the `t-*` program named in `docs/uapi/`.
 So this section is empty by design, not by omission.
 
 ## Pins
 
 There is **no gate** that runs the fuzz targets: `cargo xtask test` neither builds
 nor invokes them, and no CI hook here does. The real pin is the rule in `AGENTS.md`
-§3 (extended rule 2) — a new parser lands with a target, or `docs/NOTES.md` says why
+§3 (extended rule 2) — a new parser lands with a target, or `docs/notes/` says why
 not — and the manual commands:
 
 | Command (run from `fuzz/`) | What it does |
@@ -125,7 +125,7 @@ find the wrap the kernel would not.
 
 ## Evidence and open work
 
-- `docs/NOTES.md` §13.29 records why `p9_stat` exists at all: a `statu` record's own
+- `docs/notes/` §13.29 records why `p9_stat` exists at all: a `statu` record's own
   length word decides where it ends over bytes a *server* chose, and a slice that
   panics instead of answering `None` takes the machine down when a share answers
   something odd — neither reachable through well-behaved message framing, which is

@@ -75,7 +75,7 @@ module links against; the "contract" is the invariant each caller of `critical_s
 
 Nothing. This section is empty on purpose: `sync` is a purely kernel-internal concern, and a lock
 bug in it surfaces to userspace as a hang, a lost wakeup, or a stall rather than as any errno. There
-is no row here for `docs/UAPI.md` to own.
+is no row here for `docs/uapi/` to own.
 
 ## Pins
 
@@ -98,7 +98,7 @@ stopped matching the tree.
 ## Evidence and open work
 
 The idle-halt-cost measurement and the "a wake that nobody re-reads is a wait that never ends"
-reasoning are `docs/NOTES.md` §10.2 and §12.4a; the concurrency model, including the *lock, poll,
+reasoning are `docs/notes/` §10.2 and §12.4a; the concurrency model, including the *lock, poll,
 try, unlock, park* pattern, is `docs/ARCHITECTURE.md` §7. The rules a change to this area must carry
 are `AGENTS.md` §3 ("Concurrency" and the seven extended rules), and `docs/ROADMAP.md` owns the
 remaining work of the phase that keeps the graph honest. If this module ever grows a

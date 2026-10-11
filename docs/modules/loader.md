@@ -60,7 +60,7 @@ has merely got smaller.
 Since the crate split, the loader is a **library plus a thin `#[entry]` binary**:
 `boot/src/lib.rs` holds the whole sequence as `mpos_boot::run()` and `boot/src/main.rs` is
 a firmware entry that calls it and returns its `Status`. That shape is deliberate — it is
-what a second caller needs, and the kernel is the intended second caller (NOTES.md §14.7).
+what a second caller needs, and the kernel is the intended second caller (docs/notes/ §14.7).
 There is **no architecture in this crate at all**. The three machine things it needs — the
 page-table descriptor, the progress wire, and the last instruction — are
 `mpos_arch::early`, one arm per machine; `boot/src/vm.rs` contains no `cfg`, no descriptor
@@ -156,7 +156,7 @@ initramfs's `init` reads to learn `root=` (the kernel records it through
 the initramfs's own `/init` pivots. The device tree it copies out of the firmware's
 configuration table (on the machine whose firmware publishes one) is what the kernel's
 aarch64 boot reads back as `BootInfo::dtb`. The record itself and the command line are
-documented in `docs/modules/boot.md`; `docs/UAPI.md` is where the userspace-visible
+documented in `docs/modules/boot.md`; `docs/uapi/` is where the userspace-visible
 surface as rows lives, and this crate contributes none of them directly.
 
 ## Pins
@@ -187,7 +187,7 @@ loader's ELF reads are bounds-checked at run time instead: every offset goes thr
 
 ## Evidence and open work
 
-The reasoning behind the crate's shape is docs/NOTES.md §14.6 ("the loader's half of the
+The reasoning behind the crate's shape is notes/ §14.6 ("the loader's half of the
 machine layer" — the three machine things that moved to `mpos_arch::early`, and the two
 that deliberately did not) and §14.7 ("the loader becomes a crate, and the record one
 definition" — the library-plus-`#[entry]` split and the deletion of the loader's own

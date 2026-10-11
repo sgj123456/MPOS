@@ -3,7 +3,7 @@
 One document per module, mirroring the source tree. This is the **documentation
 structure** for the project: when a module changes, its document here changes with
 it, and a new module arrives with its document (the same rule `AGENTS.md` §3
-already states for `docs/ARCHITECTURE.md`'s edges and `docs/UAPI.md`'s rows).
+already states for `docs/ARCHITECTURE.md`'s edges and `docs/uapi/`'s rows).
 
 The three docs above this directory answer different questions, and a module page
 does not repeat them:
@@ -12,9 +12,9 @@ does not repeat them:
 |---|---|
 | What is this project, and how do I build it? | `README.md` |
 | What is planned, and where does it stand? | `docs/ROADMAP.md` |
-| *Why* is the code like this — the measurement, the lesson? | `docs/NOTES.md` |
+| *Why* is the code like this — the measurement, the lesson? | `docs/notes/` (via `docs/notes/index.md`) |
 | What are the modules and what may call what? | `docs/ARCHITECTURE.md` §2/§3 |
-| What does userspace see, and is it served? | `docs/UAPI.md` |
+| What does userspace see, and is it served? | `docs/uapi/` |
 | **What does one module own, and how is it structured?** | the page in this directory |
 
 ## The template
@@ -37,14 +37,14 @@ The traits / entry points other modules call, and the invariant each one keeps.
 The *edges* (who may call this) are `docs/ARCHITECTURE.md` §2/§3 — link, do not copy.
 
 ## What userspace sees
-The rows this module owns in `docs/UAPI.md`, when it has any.
+The rows this module owns in `docs/uapi/`, when it has any.
 
 ## Pins
 The host tests and `t-*` programs that would fail if this module's contract broke.
 
 ## Evidence and open work
-Pointers into `docs/NOTES.md` (§N) and `docs/ROADMAP.md` for the reasoning and the
-remaining work. No measurements are restated here — that is what NOTES is for.
+Pointers into `docs/notes/` (§N, routed by `docs/notes/index.md`) and `docs/ROADMAP.md` for the
+reasoning and the remaining work. No measurements are restated here — that is what the notes are for.
 ```
 
 ## The pages

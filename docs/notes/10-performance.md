@@ -1,0 +1,706 @@
+# §10 Phase 10: Performance
+
+Part of the split `docs/notes/` evidence library — routing for every `§N.M` pointer is in
+[index.md](index.md). Section numbers are unchanged from the original `NOTES.md`.
+
+## Phase 10: Performance
+
+One number framed this phase: `ping 127.0.0.1` measured 20 ms on the 100 Hz
+build (7.5 ms at the current 250 Hz) against the host's 0.03 ms. The cause
+was architectural rather than slow code - every blocking network wait slept a
+whole clock tick per round, arrived frames were discovered only by tick-rate
+polling because the virtio-net adapter was never interrupted, and an AF_INET
+socket had no wakeup source at all (pipes and AF_UNIX already did). Each
+subsystem below names the same shape of fix: make the event end the wait.
+
+### 10.1 Network Latency — **DONE**
+
+- Blocking socket calls (`recv`/`send`/`connect`, TCP/UDP/raw) park on their
+  own readiness through `block_until_deadline` instead of sleeping a tick per
+  round; signals still end them as `EINTR`. Sockets register with the stack
+  through `poll_subscribe`, and every poll wakes the registered list.
+- `poll(2)`/`select(2)` park the same way, with the tick kept as the bound
+  for descriptors that have no waker behind them (uevent, signalfd,
+  eventfd). An unclocked `epoll_wait` over a network socket - which
+  previously would sleep forever, having no wakeup source - now ends with
+  the event (`t-epoll-socket`).
+- The virtio-net adapter is armed for MSI-X: the vector table entry is
+  programmed by hand and every queue bound to vector 0 through the common
+  configuration, whose BAR is 64-bit and sits above 4 GiB (reading only the
+  low dword maps ordinary RAM, and register "writes" round-trip through it
+  while the device hears nothing). The handler polls, wakes the waiters,
+  EOIs the local APIC, and preempts so the woken task runs immediately
+  rather than at the next tick. The tick-rate polls all remain, so a machine
+  where the interrupt cannot be armed runs exactly as it did.
+- `sendto`/UDP/TCP emit immediately after queueing rather than at the next
+  poll; smoltcp's clock reads the TSC instead of the tick counter; `xtask`
+  builds release by default (the loader gained the `wcslen` its release
+  codegen calls for).
+- Measured by `t-netlat` (20 ICMP echo rounds to 127.0.0.1): 7.5 ms → 0.3 ms
+  average, 74 µs floor - the remainder is slirp's own path through the host.
+
+### 10.2 Context-Switch and Fork Cost — **PARTIAL** (three of four landed, measured)
+
+**Why**: every task switch saved and restored 512 B of FPU state
+(`fxsave`/`fxrstor` unconditionally), rewrote CR3 with a full TLB flush, and
+`fork` walked the entire address space to mark pages COW with a flush after
+every page. A busybox fork+exec paid all three.
+
+| Change | Where | State |
+|---|---|---|
+| Save FPU state lazily: `CR0.TS` on the task entered, its `#NM` restores it | `arch/x86_64/context.rs`, `idt.rs`, `sched/runtime.rs` | **done** |
+| One TLB flush per fork instead of per-page `protect` calls | `sched/runtime.rs`, `arch/x86_64/paging.rs` | **done** |
+| Kernel stacks smaller than the fixed 64 KiB per task | `sched/runtime.rs` | **done** |
+| Enable PCID (`CR4.PCIDE`), keep per-process TLB entries across switches | `arch/x86_64/paging.rs` | **not done** — the argument is below |
+
+**The lazy FPU.** `mpos_context_switch` no longer touches the 512 bytes of
+`FpuState` at the head of each `Context`; it sets `CR0.TS` on the task it
+enters, and that task's first floating-point instruction traps into the `#NM`
+handler, which clears the bit and loads the image. The saving half stays eager
+and moved into Rust (`Table::hand_over_fpu`), because that is the last moment
+at which the outgoing task's registers are uncontroversially its own. A task's
+`fpu_live` flag says whether the hardware holds its state, so the FPU is written
+out only when it was actually used: a program that never executes a vector
+instruction - which is most of this image, and all of a shell's `fork`+`exec` -
+pays one `mov cr0` per switch and nothing else. `fork`/`clone` read the
+creator's image through `Table::inherit_fpu` (registers when live, its saved
+block when not) and `execve` claims the registers before `fninit`, because a
+task that never used the FPU is running with `TS` set. The property the whole
+scheme rests on - that the register file belongs to a task and not to the CPU -
+was already pinned by `t-fpu-across-switch`, which stores two distinguishable
+bit patterns to `xmm7` across a `sched_yield`; it passes unchanged, and it
+exercises the deferred restore on both sides.
+
+**The fork flush.** `parent_space.protect(..) + set_cow_bit(..)` per page became
+`set_cow_bit_quietly(..)` per page and one `flush_if_active()` after the loop.
+What that removes is 16384 CR3 writes for a parent with 8192 pages, and the
+per-page `update_flags` round trip that re-derived the PTE's flags from the
+walk's own report - the quiet form sets the COW bit and clears `WRITE` in one
+write and leaves the rest of the entry alone, which also stops the fork from
+dropping `ACCESSED`/`DIRTY` on the parent's pages.
+
+**What the machine says.** `t-forkcost` (new, and in the suite) runs the *same*
+fork/exit/wait loop twice: once with a 32 MiB arena mapped in the parent, and
+once after `munmap` has given it back. The second parent has a few pages of
+address space instead of 8192, so anything that scales with the mapping shrinks
+by three orders of magnitude.
+
+| 220 cycles, 200 timed | `fork` | `wait4` |
+|---|---|---|
+| 32 MiB parent, per-page flush (the old shape) | 349.0 µs | 7650.8 µs |
+| 32 MiB parent, one flush (this change) | 350.9 µs | 7648.9 µs |
+| no arena at all, one flush | **17.0 µs** | 7982.8 µs |
+
+Three things fall out of that, and the first two are corrections to what this
+section said before the measurement existed.
+
+**The fork flush change is not measurable, and the reason is not subtle.** Sixteen
+thousand CR3 writes moved the fork by 0.5% - inside the noise - because a CR3
+write is not a TLB flush on this machine: QEMU runs with `-accel kvm`, the
+guest's translations are tagged (`VPID`), and loading a CR3 is a tag switch
+rather than an invalidation. The change is kept because it is strictly less work
+and the smaller of the two shapes, but nobody should read a speedup into it.
+
+**The cost of a `fork` is the mapping; the `wait4` after it was the clock.**
+Taking the arena away cuts the fork from 351 µs to 17 µs - twenty-one times -
+and used to leave the `wait4` where it was, at *eight milliseconds either way*.
+An earlier draft read the second row as the child's exit and its 8192 frame
+references coming home (`release_user_frames`), and the third row refuted it: a
+parent reaping a child that owned nothing paid exactly the same 8 ms.
+
+**What that 8 ms was, and why it mattered more than anything in this section.**
+One tick of this build's 250 Hz clock, on *every* blocking wait, and the cause
+was the boot task. `park()` - where the boot task spends the machine's life -
+halted the core with `wait_for_interrupt` instead of blocking in the scheduler,
+which left a permanently *runnable* task at NORMAL priority: the picker handed
+it the CPU, `hlt` stopped the core while holding it, and a task that has halted
+can only be taken off it by an interrupt - of which the one that reliably
+arrives is the clock. Anything woken while the idle task was in that state (or
+behind it in the ready queue) waited for the next tick. A probe in the scheduler
+recording the wake-to-resume latency in whole ticks is what named it: 604 of 640
+wakes took *exactly one* tick, never two, while the scheduler itself never went
+idle, so the task was ready and the picker was choosing somebody else first.
+Parking the boot task in the scheduler puts the idle halt back in the
+scheduler's own loop, which is where the virtio-net handler's comment already
+assumed it was - "in the scheduler's own context ... the scheduler's next turn
+picks the woken task on its own". That is the whole fix: one call site.
+
+| `t-forkcost`, 200 cycles | before | after |
+|---|---|---|
+| `wait4`, 32 MiB parent | 7 648 682 ns | 1 760 ns - 100 µs |
+| `wait4`, no arena | 7 980 378 ns | 13 046 ns - 100 µs |
+| `fork`, 32 MiB parent | 351 052 ns | 223 983 - 298 868 ns |
+
+The `fork` row is the control and it is the mapping: it did not move. The `wait4`
+rows are now the child's own exit and a picker turn instead of a clock tick, and
+the *range* is the honest shape of that figure rather than noise in it: a parent
+that reaches `wait4` after its child has already exited does not block at all and
+reads ~2 µs, one that gets there first blocks and reads ~100 µs on a loaded
+machine - and one of them can print *below* the clock's resolution, where a
+negative figure is the TSC fraction's noise floor and not a negative time. What
+matters for both is the same: they are tens of microseconds against a tick of
+4 ms, which is what `t-forkcost` now *asserts* (§10.7). §10.4 carries the same
+fix's effect where it was largest.
+
+**Why PCID is not done, and it is a decision rather than an oversight.** Three
+things have to be true before `CR4.PCIDE` pays for itself, and only the first is
+straightforward. (1) Each address space needs a stable PCID and a way to
+invalidate a *recycled* one - manageable, with 4096 of them and 64 task slots.
+(2) The kernel half must be mapped `GLOBAL`, or every process carries its own
+copy of the kernel's translations in the TLB: the `G` bit is only honoured on
+the entry that maps a page, so making the kernel half global means setting it on
+the bootloader's huge-page leaves, and `page_flags` deliberately leaves it off
+today for exactly this reason. Without it, a PCID switch trades one flush for a
+per-address-space replication of the kernel's working set. (3) Every existing
+CR3 write has to be re-audited for *which* PCIDs it must invalidate: with
+`PCIDE` on, `activate(root)` invalidates the PCID written and leaves the others
+alone, so `map_mmio` and the kernel-half table walks - which is where a write
+adds a mapping every address space must see - would leave stale entries in every
+*other* PCID, which is a wrong translation rather than a slow one. On top of
+that, the workload here is `fork`+`exec`, and every `exec` builds a fresh
+`AddressSpace` with a fresh PCID, so the reuse PCID is paid for is rare by
+construction: the win would be the parent's entries surviving a child's
+lifetime, which the table above suggests is not where the time goes anyway.
+Recorded rather than attempted, so the next person starts from the audit list
+rather than from the idea.
+
+### 10.3 Syscall Path — **PARTIAL** (the cheap half landed)
+
+**Why**: every scheduler turn and every clock tick scanned all 64 task slots
+for an armed interval timer whether any process had armed one, and every
+user-buffer operation walked four page-table levels per page.
+
+| Change | Where | State |
+|---|---|---|
+| A global "any itimer armed" flag; `check_itimers` skips the scan when clear | `sched/runtime.rs` | **done** |
+| Validate user buffers with the copy itself (fault handler catches `EFAULT`) | `arch/x86_64/paging.rs`, `syscall/mod.rs` | **not done** — the argument is below |
+
+**The itimer flag.** `ITIMER_ARMED` is set by `itimer_swap` - which is the only
+place a timer is ever armed, because no task inherits one and `exec` clears them
+- and recomputed *by the scan itself* when it runs. That ordering is the point:
+a task that exits while armed disarms a timer without going through
+`itimer_swap`, so a flag that was only ever "set on arm" would stay set for the
+rest of the boot and quietly restore the full scan. Recomputing costs one extra
+scan after the last timer goes away and makes the flag wrong only in the
+direction of running the scan - never in the direction of skipping a timer that
+is due. Only `ITIMER_REAL` is tracked, because it is the only one that is a
+wall-clock deadline the scheduler has to honour.
+
+**Why the fault-driven copy is not here.** The plan's premise does not survive
+reading the code. There is no pre-walk separate from the copy: `read_user` and
+`write_user` translate one page at a time *as they copy*, through the direct
+map, and a read is therefore one walk per page, not two. Only the write
+direction walks twice, and the second walk is the copy-on-write probe
+(`is_cow_page` before `translate`) - which is a handful of loads against the
+page-table entries the walk just touched, next to a `memcpy` of the same page.
+Deferring all of it to the CPU's own address translation would mean the kernel
+dereferencing a user pointer, and then a `#PF` taken in **ring 0** on a bad
+pointer has to become `EFAULT` rather than a panic: that needs an
+exception-table/fixup mechanism (identify the faulting RIP as inside the copy
+routine, redirect the trap frame to a landing pad, resume), and getting the RIP
+range check wrong turns a real kernel bug into a silent `EFAULT`. The safe shape
+is kept: the kernel never dereferences a user pointer, so a bad one cannot fault
+at all. What is left as a possible future is the one-walk dedup of the write
+path, which is a strict reduction in work with no measurable claim attached.
+
+### 10.4 Pipes and Per-Frame Allocations — **DONE** (all three landed; the rate pair awaits two gate runs)
+
+**Why**: pipe reads and writes moved bytes one at a time through a `VecDeque`
+(`pop_front`/`extend(iter().copied())`), and the network path allocates and
+frees a fresh `Vec` per frame in each direction.
+
+| Change | Where | State |
+|---|---|---|
+| A ring buffer with slice copies for pipe data | `vfs/pipe.rs` | **done** |
+| The raw receive temporary sized from the actual datagram, or on the stack | `net/socket.rs` | **done** |
+| A pool of frame buffers behind the smoltcp device seam | `net/pool.rs` | **done** |
+
+**The pipe.** `PipeState::data` is now a [`Ring`] over a `Vec` whose live bytes
+are `bytes[start..]`: storage taken lazily, reclaimed when the reader catches the
+writer, and the dead prefix dropped with one `drain` on the pass where the
+arrival would otherwise pass `CAPACITY`. A read is one slice copy and a write is
+one `extend_from_slice`, where the old shape was 8192 deque operations for a
+`PIPE_BUF` round trip. `t-pipecost` (new, and in the suite) measures it in two
+phases, because the two turn out to answer different questions:
+
+| 16 MiB through one pipe | before | after |
+|---|---|---|
+| one process, 4096-byte units (data path only) | 61.7 ms - 259 MiB/s | 6.1 ms - **2611 MiB/s** |
+| two processes, 64 KiB chunks (a pipeline) | 2047.5 ms - 7 MiB/s | 2047.4 ms - 7 MiB/s |
+
+The first row is the change: ten times the throughput, which is what two slice
+copies per 4096 bytes instead of 8192 deque operations buys.
+
+**The second row was the finding, and it was bigger than the change.** A
+two-process transfer did not move at all when the ring landed - 2047.5 ms to
+2047.4 ms - and the arithmetic said why: 2047 ms over 256 chunks is **8.0 ms per
+64 KiB chunk**. The reading taken at the time was "two ticks per handover", and
+the count was right while the unit was wrong: a chunk is not one handover but
+*two blocking waits* - the writer waiting for room in a full pipe, the reader
+waiting for data in an empty one - so the figure was **one tick per wait**, and
+one tick was the cost of *any* wake on this machine (§10.2). The bytes were
+never the cost. `t-pipecost` is the instrument, and it was deliberately in the
+suite so the fix had a number waiting for it:
+
+| 16 MiB through one pipe | before | after |
+|---|---|---|
+| one process, 4096-byte units (data path only) | 6.5 ms - 2 478 MiB/s | 1.6 ms - **10 206 MiB/s** |
+| two processes, 64 KiB chunks (a pipeline) | 2047.3 ms - 7 MiB/s | 1.6 ms - **10 168 MiB/s** |
+
+The second row is the whole point of the pair: the same 16 MiB, through the same
+pipe, now crosses 256 task boundaries at *the same speed as the copy that
+crosses none*. Nothing about the pipe changed for this - the fix is the boot
+task's park (§10.2) - and it is the clearest statement of what a wake used to
+cost, because the pipeline was previously 1 300 times slower than the data path
+it was built out of.
+
+**The raw receive.** `raw_recv` filled a fresh `alloc::vec![0u8; 1500]` and then
+copied it into the caller's buffer. It now receives straight into `out`: no
+allocation, no second pass over a full MTU, and the "packet larger than the
+caller's buffer" case is `recv_slice`'s own `Truncated` - the same `EMSGSIZE`,
+detected before anything has been allocated for it. Behaviourally identical for
+every packet the MTU admits, which is all the old 1500-byte temporary could
+hold either.
+
+**The frame pool: three allocations, one of them out of reach.** The three the
+plan names for the network path are the TX build, the RX copy and the raw
+temporary; the raw one went first (above), and the seam's two remain - now
+served from a pool rather than freed (§10.4's last item, landed with the
+instrument that preceded it). One known cost stays deliberately: virtio-drivers'
+inner `TxBuffer` allocates per send *below* `NetDevice::transmit`, across a crate
+whose `Transport` trait is not object-safe (AGENTS.md §5's trap), so it is out of
+this change's scope and the before/after figure is attributed to the seam's two
+Vecs only - nothing here claims more.
+
+**The instrument landed first, as demanded.** `net/pool.rs` counts every frame
+at exactly the two seam points the pool reuses - one relaxed add when a
+frame enters `NicDevice::receive`, one when `FrameTx::consume` builds an
+outgoing frame (Linux's `tx_packets` counts frames handed to the driver, so a
+refused send still counts) - and the door is Linux's own `/proc/net/dev`, which
+this kernel did not have until now despite what `docs/uapi/03` claimed. The
+file carries Linux's exact column widths (measured off a live `lo:` row, pinned
+by procfs's host render test), an honest zeroed `lo` row - loopback runs on
+smoltcp's internal device and never crosses this seam, so zeros are the truth
+rather than invented numbers - and one named divergence appended past the last
+standard column: `mtu <n> pool=<hits>:<misses>`. `t-netstats` (default group,
+both machines) sends a 256-datagram UDP burst to slirp's gateway and asserts
+the deltas exactly - `tx_packets` +256, `tx_bytes` +256·(1400+42, the whole
+Ethernet frame: measured against a diagnostic frame, 62 bytes for a 20-byte
+datagram) - because one
+datagram within the MTU is one frame through this seam; the datagrams-per-second
+figure is printed for §10.4's before/after ledger and follows `t-pipecost`'s
+"reported, not asserted" rule. The harness refuses a sweep that staged the
+program but saw no `NETSTAT` line.
+
+**The pool itself.** Sixteen slots per direction, each 2048 bytes - the width
+the driver's own receive ring already pre-allocates, so a slot is one of the
+buffers the machine proves it wants - filled once at `net::init` and bounded at
+**64 KiB resident** worst case before the first allocation exists (§10's rule-4
+discipline: no user steers count or width). A frame wider than a slot - an MTU
+raised past 2034 by `ip link set ... mtu` - falls back to a fresh allocation and
+is counted as a miss rather than growing the bound; an exhausted list does the
+same, so a leak anywhere upstream degrades into "the pool earns less", never
+into a wrong answer. `FrameTx::consume` puts back at the site of last use, right
+after the driver has copied the frame out; the RX direction has exactly one
+`Drop` guard, `PendingFrame`, and the guard travels *into* the token (`FrameRx`
+holds it), so a frame's slot comes back from one place whichever way the frame's
+life ends — the stack reading it in `consume`, or smoltcp taking the token pair
+and dropping it unread. The pin is the
+warm-up claim in `t-netstats`: a second identical burst must move `pool_hits` by
+at least 256 - the counterfactual being `fits_pool`'s bound off by one, which
+would make every full-MTU frame a silent miss and leave hits where they were. A
+host test could not run that pin: `pool.rs` lives behind the machine-gated
+`crate::net` (the trap at `net/socket.rs`'s tail note), so the policy is pinned
+by the program that boots.
+
+**The one bug the pool landed with, and why the machine went silent (measured).**The first draft's handover left the frame in `NicDevice::pending` and handed the
+token a buffer it had emptied, so every `receive` after the first one returned a
+token pair over an *empty* frame instead of polling the driver. smoltcp reads an
+empty frame as "a packet was processed, try again" (`iface/interface/mod.rs`,
+`socket_ingress`), and `Interface::poll` loops on exactly that answer - so `poll`
+never returned, and it was running inside the stack's critical section, which on
+this uniprocessor machine means the clock interrupt was off too. What the gate
+saw: the sweep reached `t-epoll-socket`, printed its first four claims, and then
+produced no further byte for fourteen minutes (QEMU alive, the serial file's
+offset frozen, the guest's own idle loop never reached). Three changes came out
+of it. The handover now *clears* the slot (`Option::take`), which is the part the
+next `receive` depends on. The guard rides into the token as described above, so
+both endings return the slot from one `Drop` and `FrameRx::consume` no longer
+carries an explicit `put_rx` - fewer owners, not more. And a zero-length frame
+from the driver now answers `None` ("nothing arrived") rather than a token, since
+that is the same infinite loop entered from the other side; a fabricated empty
+token pair is never a truthful answer. The claim that caught it is
+`t-epoll-socket`'s: a parked `epoll_wait` woken by an ICMP reply, which cannot be
+woken once the stack has stopped seeing frames.
+
+**And the same program's burst failed for a second reason *and* a third, which took five probes to
+separate.** The first was the shared-state leak above (the MTU), a real cross-test bug whose
+fix stands. With the link at 1500 the burst's datagrams *still* never reached the seam, and the
+remaining cause turned out to be a **property of the stack under test**, not a fault:
+`smoltcp`'s `socket_meta.rs` carries `DISCOVERY_SILENT_TIME = 1000 ms` — a socket whose dispatch
+failed because the neighbour was unknown is **skipped by the egress for a full second**, and the
+probe it fired (one ARP request, which is exactly what the seam showed once per burst) is rate
+limited with it. A burst that begins inside that second therefore sees every `sendto` refused
+(`EAGAIN` since the split above, `EMSGSIZE` before it) while the socket's send buffer fills —
+2000 refusals and four frames at the seam, which reads *exactly* like a stack that stopped.
+
+What the probes eliminated, in order, each a temporary print at the seam and once again removed:
+
+1. the MTU (the leak above — fixed, and the refusal persisted at 1500);
+2. pacing (the same burst with 1 ms between *accepted* sends behaved identically — the pause was
+   on the wrong side of the wedge);
+3. the ARP exchange itself: the request is well formed (`sender=10.0.2.15 target=10.0.2.2`), the
+   reply arrives (`opcode=2`, dst **our exact MAC** `52:54:00:12:34:56`, src `52:55:0a:00:02:02`,
+   target `10.0.2.15`), and the frame is *consumed by smoltcp* (printed inside the token's
+   `consume`);
+4. the interface's state throughout: `ip_addrs=[10.0.2.15/24]`, `has_10.0.2.15=true`, `up=true`;
+5. the socket the entry names: in the polled fabric (`home=Eth`), **bound** (`*:32768`, the
+   implicit bind), and `can_send()` **true** — which is what finally closed the argument: with
+   room and a fitting size, `PacketBuffer::enqueue`'s only remaining refusal is the split free
+   window, i.e. the socket *holds* datagrams the egress is not taking, and the egress was not
+   taking them because its own rate limit had not expired.
+
+The fix is at the *test's* end, not the kernel's: `t-netstats` **primes the link** — one datagram
+per turn until the *datagram's* own frame (not the 42-byte probe's) appears at the seam, bounded at
+the silent time plus slack — and re-baselines the counters afterwards. The same measurement
+corrected one of its claims: the seam counts the *whole* Ethernet frame, so the byte assertion is
+`+42` (Ethernet 14 + IP 20 + UDP 8), not `+28` — read off a diagnostic frame that was 62 bytes for
+a 20-byte datagram. `t-netlink` also puts the MTU back now, which is the rule the repo states for a
+check that changes shared state. **What remains a named kernel gap** is the answer a caller gets
+inside that second: `EAGAIN` where Linux's sender would queue the packet behind the ARP entry and
+*succeed* (see `docs/uapi/` §5.2) — the honest refusal this kernel gives until the TX ring has a
+completion event to wait on.
+
+| 512 UDP datagrams through the eth0 seam | before (fresh `Vec` per frame) | after (pool serving slots) |
+|---|---|---|
+| datagrams/s, x86_64 TCG | *(owed: one `cargo xtask test` run with the pool reverted — `NETSTAT` prints it)* | `12213` over the whole run's window, `13515` over the first burst's |
+| datagrams/s, aarch64 TCG | *(owed, same run)* | `19807` over the whole run's window, `22699` over the first burst's |
+| `pool=` word | `0:<n>` — every frame a miss | **`1036:0`** (x86_64) and **`1098:0`** (aarch64) — every take of the run was a hit, the counts being the two bursts' 1024 plus each machine's priming and ARP frames |
+
+The *after* column is measured (`cargo xtask test`, x86_64, `pass=166 fail=0`); the *before* one is
+still owed and needs the pool reverted for one run, because it is the only way to say what the
+per-frame allocation cost. What the *after* numbers do establish on their own: a full-MTU datagram
+is served from a slot every time (no miss in 1036 takes), and the burst is one frame per datagram
+(the exactness pair above), which is the rule the pool exists to keep.
+
+The rate pair is **not yet measured**: the gate needs QEMU and sudo, and both
+figures come from operator runs of the same command (`cargo xtask test`, whose
+report prints the `self-test (netstat)` line this table quotes). The row says so
+rather than carrying a number from a different question.
+
+### 10.5 Filesystem and Block Read Path — **PARTIAL** (the verifiable one landed; the disk-backed instrument now stands too)
+
+**Why**: ext4's cache was a 512-slot direct-mapped array that thrashes on large
+working sets, path resolution reads a directory block per component on a miss,
+and each 4 KiB write leaves for the device as eight 512-byte synchronous
+requests. Write-through stays: crash visibility is a deliberate semantic, and
+only the read side is being tuned.
+
+| Change | Where | State |
+|---|---|---|
+| Set-associative cache with victim selection | `vfs/ext4/cache.rs` | **done** |
+| Sequential readahead past the block being asked for | `vfs/ext4/` | not done |
+| virtio-blk interrupt-driven completions and multi-request pipelining | `drivers/virtio/blk.rs` | not done |
+| A SATA probe that ends in an answer instead of a budget | `drivers/ahci.rs`, `crates/ahci` | **done, measured** |
+
+**The probe's cost, before and after.** Not a throughput change but the same
+ledger, because it is a device wait that the boot pays: on a `q35` machine whose
+built-in SATA controller has no disk on it, the gap between `virtio-blk: vda, ...`
+and `blk: no data partition ...` in the boot log was **28.412 s** and is now
+**0.001 s**, measured on the same image copy with a timestamped serial log
+(`-machine q35,sata=off` gives the same 2 ms, which is what named the probe as the
+cost). The healthy path is unchanged and still measured - a command on a port
+that really has a device retires at try 0-2 - and `t-ahci` is the pin that says
+so. `docs/notes/` §7.3 holds the register dump, why a count of MMIO reads is still
+the shape rather than a tick deadline, and the two gaps that were left open there
+and are now closed.
+
+**The cache.** Four-way set-associative, least-recently-used within a set, over
+fast-lazily-allocated slots - and the set count kept at the 512 that the original
+`ls` measurement justified, so the change is *only* about collision and not about
+size. A block's set is `block % CACHE_SETS`; an empty way takes it first, and
+otherwise the way whose block was asked for longest ago, dated on every access
+including hits (dating only misses would make the policy "first loaded" rather
+than "least recently used"). Slots no longer allocate their 4 KiB buffer at mount
+- a slot takes its buffer the first time it holds a block - which is what makes
+`CACHE_SLOTS` 2048 total slots (8 MiB, if a filesystem ever touches all of them)
+affordable, and which also removes a fixed 2 MiB per mount that used to be paid
+whether or not anything was read.
+
+The instrument is a host unit test, not a clock, because a cache's quality is a
+*count*: a mock `BlockDev` that counts reads per block and answers with a pattern
+derived from the block number, so a slot handed back for the wrong block fails as
+content rather than as slowness. The numbers are the same on every machine and
+under TCG or KVM, which is why they are worth writing down:
+
+| Trace | direct-mapped (before) | 4-way LRU (after) |
+|---|---|---|
+| four blocks a set-count apart, accessed round-robin, 4096 accesses | **4096 reads** (0% hits) | **4 reads** |
+| a 2048-block sequential scan | 2048 reads | 2048 reads |
+| one hot block read between 2048 scan blocks | <=5 reads of it | <=5 reads of it |
+
+The first row is why the ways are there: a working set of four blocks that share
+a set - four groups' inode tables, say - made a direct-mapped cache *not a
+cache*, with every access evicting what the next one wanted. The second and third
+rows are the traces that must not regress, and the second is also the honest
+limit of this change: a sequential scan has no reuse in it, so no cache can help
+it, and the two runs read the same 2048 blocks either way. 63 ext4 host tests
+cover the driver through the new cache, including a byte-for-byte read of a large
+file and a mount of an image the host's `mke2fs` made.
+
+**Why the other two are not done, and it is one reason between them.** They
+cannot be measured *well*, and they are each other's prerequisite. `BlockDev::read_at`
+is capped at one 4 KiB page per call by its own contract - "drivers bounce through
+a single page-sized, physically contiguous buffer" - so readahead cannot ask the
+device for fewer, larger reads; it can only issue the same reads earlier, and
+this kernel's block driver is synchronous and polled, so "earlier" overlaps
+nothing. Readahead becomes worth having exactly when item 3 gives the device
+asynchronous completions it can be pipelined behind, and until then it is a
+prefetch into a cache that the reader is about to miss anyway.
+
+The measurement gap was the real prerequisite, and it is worth stating plainly:
+the test machine used to boot the conformance suite *without a filesystem on its
+disk*, so no `t-*` program exercised the ext4 read path at all - the numbers
+above existed only because the cache policy was pure enough to drive from a host
+test. Either item would have been landed blind. **That gap closed with the entry
+below**; what remains true is the ordering argument above — readahead's best
+number still needs pipelining to overlap behind.
+
+**The prerequisite landed (2026-10-11): the disk-backed instrument, in three parts.**
+
+* **A filesystem on the test disk.** `xtask/src/disk.rs::build_ext4_image` lays
+  one 84 MiB ext4 volume by hand (`mkfs.ext4 -d`, journal and metadata checksums
+  off — the shapes this kernel's driver reads) carrying three files:
+  `pattern.bin`, 64 MiB of `(block + byte) % 251`; `cached.bin`, 4 MiB of the same
+  generator; and `hello.txt`. **Two generated sizes, because the instrument asks
+  two questions**: 64 MiB is eight times the cache's 2048 slots, so a sequential
+  scan of it must miss every block; 4 MiB is *half* the cache, so it fits, and a
+  second pass over it must cost no device reads at all. The first draft asked the
+  second question of the first file, where the answer is arithmetically forced to
+  be "no" — the gate measured it (`cold=16387 warm=16384`, i.e. a warm pass that
+  re-read every block because it could not be held), and `cached.bin` is that
+  measurement's fix. The fixture's identity moved with it: `existing_or_build` now
+  keys on the file's **size** rather than on its existence (the rule
+  `ensure_sata_image` already used), so a tree holding the older two-file image
+  rebuilds rather than answering a `t-diskbench` that expects a file inside it.
+  The SATA backing file grew with the fixture —
+  `SATA_TEST_BYTES` is now 96 MiB, sparse on the host so an untouched sweep pays
+  nothing for it —   because a copy longer than the device's capacity is refused
+  sector by sector (`ahci`'s `check_span`), which would read as a broken driver.
+  Two pins moved with that number rather than being left to rot: `t-ahci`'s
+  capacity claims, which now name 96 MiB (`98304` in `/proc/partitions`' 1 KiB
+  column, and the read one sector past sector 196608 answering empty), and the
+  disk's *state* — a sweep lays it fresh before every boot
+  (`disk::reset_sata_image`), because `t-ahci`'s claims about the bytes *around*
+  what it wrote ("and is still zero") are claims about a disk nothing else has
+  touched, and the backing file outlives the run. `t-ahci`'s scratch sectors
+  (4000 and 6000) sit inside the region this instrument's filesystem later
+  occupies, harmlessly: every reader of that filesystem lays its own copy first,
+  and the fresh lay is what keeps one run from reading the last one's writes.
+  It rides each machine's own payload channel to the guest at
+  `/dev-sda-fs.img`: an appended member of the x86_64
+  test initramfs (`selftest::append_test_members`'s `extra` — absolute member
+  name, which is how the boot's tar reader spells an absolute path), and a
+  staged entry on the aarch64 sweep medium (`run_disk_sweep`'s `entries`, named
+  from its already-rooted tree, which grows `SWEEP_DISK_BYTES` by the fixture
+  when it rides). One guest path on both machines, so one pair of programs runs
+  on both; the two spellings are pinned equal by
+  `both_payload_channels_lay_the_fixture_at_one_path`. **The path is at the root
+  and not under `/dev` where it started**: both boots mount a `devtmpfs` over
+  `/dev`, so the first draft's file was shadowed the moment that mount landed —
+  measured on the pair's first gate run, where the harness staged the fixture and
+  both programs reported `ENOENT`. The harness's pin grew the rule with it (the
+  member is an absolute name *outside* `/dev`).
+* **`t-ext4-mount` copies it onto `/dev/sda` through the block door** — 1 MiB
+  chunks through `write(2)`, which is the AHCI write path at volume, before the
+  read path is judged — then mounts `-t ext4 /mnt/ext4test` and checks the tree
+  back: `hello.txt`'s text, the pattern file's size, and its first two blocks'
+  bytes against the generator. Content, not just speed. It leaves its mount
+  standing, and nothing depends on that either way: the mount table is per-task
+  (§6.3), the two programs of this instrument are separate processes, and *the
+  runner walks `/bin/t-*` in name order* — `t-diskbench` is staged **before**
+  `t-ext4-mount`, which the first gate run of the pair measured when
+  `t-diskbench`'s mount found a disk still made of zeros. So each program lays
+  its own copy through one shared loop
+  (`user/tests/src/lib.rs::lay_ext4_fixture`) and mounts its own view:
+  order-independent set members rather than a sequence, with `t-diskbench` still
+  checking what the path is actually *on* (`statx`'s `st_dev` against the root's)
+  and reporting which case it ran in.
+* **The device-read counter, and the door it comes through.** `crates/blk` gained
+  `Counted`: a wrapper `add_disk` puts around every registered device, counting
+  *calls* per disk with relaxed atomics. The wrapper is at the seam rather than
+  in either driver because every path to storage passes through a registered
+  `BlockDev` — a cache miss, a partition window, a `dd` on `/dev/sda` — and a
+  count taken anywhere else counts less than the machine does. `part::Window`
+  deliberately wraps the counted device, so a partition's accesses are the
+  disk's too (pinned: `a_window_over_a_counted_device_shares_the_count`; the
+  counterfactual pin for the wrapper itself is
+  `the_wrapper_counts_calls_and_forwards_every_access` — without those two tests
+  a constant zero could pass every claim below).
+  The counters reach userland through `uname(2)` on an **armed boot only**: the
+  command-line word `mpos.diskstat` (`board/flow.rs::DISKSTAT_WORD`) arms the
+  boot task's UTS namespace, `release` then answers the private magic
+  `0x6d706f7300000001` (`abi::DISKSTAT_OSRELEASE_MAGIC`) and `version` carries
+  `<name>:<reads>:<writes>,` rows rendered live at call time. A *private* ABI
+  word, disclosed in `docs/uapi/01-syscall-table.md` §1.0's sub-gap table: no
+  real kernel's osrelease is a number, nothing that parses the field can collide
+  with it, and there is no other door — `/proc/partitions` is column-parsed by
+  tools like `fdisk`, and this kernel has no sysfs attribute store a
+  `/sys/class/block/*/stat` could live in. Arming is a boot-step fact with no
+  syscall door, so userland can neither trigger nor spoof the protocol; the flag
+  rides the namespace copy, so a `unshare(CLONE_NEWUTS)` inside an armed boot
+  still reads real numbers (pinned by `an_armed_diskstat_protocol_survives_the_copy`).
+  The renderer — magic word, `#1 ` prefix, one `<name>:<reads>:<writes>,` row
+  per registered disk, live at call time — lives in `syscall::linux::abi`, where
+  the host suite reaches it:
+  `the_rows_name_every_registered_disk_and_track_live_reads` pins the door's
+  *shape* against mock devices before any QEMU has run.
+* **`t-diskbench` is the number.** A cold sequential pass over the 64 MiB file,
+  then a cold pass and a warm one over the 4 MiB file, with the counters read
+  before and after each through the door. Its claims: the big file's cold pass
+  ≥ 16384 device reads (its own blocks — 64 MiB is eight times the cache's 2048
+  slots, so every block misses whatever the policy does); the fitting file's
+  cold pass ≥ 1024 (its blocks, which fit); and its warm pass == 0 (**the
+  regression pin the cache policy has on the machine**, not only against the
+  mock). Both stay in the **default** sweep for that reason — they are exact
+  counts, not timings, as stable as the mock's were. The content check rode
+  `t-ext4-mount`.
+* **The harness reads the numbers back.** `t-diskbench` prints one line,
+  `DISKSTAT sda cold=N warm=M`; `sweep::diskstat_readings` greps it out of the
+  serial log (last word per disk wins) and both report paths print it beside the
+  verdict — rule 6's before/after figure, automated. An armed run whose
+  instrument left no reading behind is *refused* (the same rule the kernel's own
+  suites are held to: a silent absence must not read as coverage). And the
+  arming follows the staged list itself: each arm asks its own selection — the
+  set it has already computed by the time it writes a boot line — whether
+  `t-diskbench` is in it (`selftest::diskstat_for_staged`), and only then puts
+  the word on the line; move the name out of the default group and the fixture,
+  the arming and the reading all follow automatically, leaving no half-state.
+  `sweep::in_default` answers the same membership question from `tests.toml`
+  alone, and `run_tests` refuses a sweep configuration that ever leaves either
+  instrument out of a plain run. The word the sweep writes and the word the boot
+  reads are pinned equal by
+  `the_diskstat_word_matches_the_kernels_constant` (xtask cannot name the kernel
+  crate, so the pair is checked as text).
+
+**What the instrument measured on its first green runs** (`cargo xtask test` — x86_64
+`pass=166 fail=0`, aarch64 `pass=175 fail=0`): `DISKSTAT sda cold=16387 warm=0 smallcold=1024` on
+**both** machines — the cold pass over the 64 MiB file costs **16387** device reads, exactly its
+own 16384 blocks plus **three** metadata reads (the superblock, the extent tree and the inode's
+own block, and no more: the layout is named in this section and the count agrees with it), and the
+*fitting* file's warm pass costs **0**, which is the cache policy's pin on the machine rather than
+against the mock. The pair the readahead work will be measured against is therefore (16387, 0): a
+64 MiB sequential read is worth 16387 device reads today, and every name in `vfs/ext4/` that
+changes that number has an instrument that will say so. What the numbers *cannot* say yet is how
+much of the 16387 a readahead or a pipelined request would remove — that needs the change, and the
+instrument is what makes it countable.
+
+With the instrument standing, the two deferred items keep their order: readahead
+(`vfs/ext4/`) can now be counted before and after on a real card, and virtio-blk
+pipelining (`drivers/virtio/blk.rs`) likewise — each still wants the other for
+its *best* number, but neither is blind any more.
+
+
+### 10.6 Serial Output — **DONE**
+
+**Why it mattered**: UART transmit used to be polled with the console lock held;
+on real hardware a 60-byte line costs ~5 ms of machine-wide stall (QEMU's
+emulated 16550 never blocks, which is why it does not show here). The kernel's
+own hot paths log nothing, so this only bit on the day they did - which is what
+a `bat` over a minified stylesheet turned into a machine that looked dead.
+
+| Change | Where |
+|---|---|
+| A transmit ring drained by the TX-held interrupt; `write` only enqueues and parks on a full ring, re-arming before *every* park so a write larger than one drain burst cannot sleep unannounced | `drivers/serial.rs`, `console.rs` |
+| The framebuffer console's serial **mirror** is best-effort: it hands bytes to the ring and returns, so a host terminal that cannot keep up drops bytes rather than throttling the window or the console mux | `console.rs` (`serial_mirror_now`) |
+
+### 10.7 Sub-Tick Sleeps — planned (the wake half is done, and was not this)
+
+**The wake latency was filed here and did not belong here; it is fixed.** Two
+measurements said a *woken* task - not sleeping on a deadline, but parked in
+`block_until` and made runnable by an event - did not resume for what looked
+like two ticks:
+
+| measured | before | after | instrument |
+|---|---|---|---|
+| `wait4` reaping a child, whatever that child owned | ~8.0 ms, unchanged when the child's 32 MiB address space is taken away | 1.8 µs | `t-forkcost` (§10.2) |
+| a 64 KiB pipe handover between two processes | 8.0 ms per chunk, 7 MiB/s | 6.1 µs per chunk, 10 168 MiB/s | `t-pipecost` (§10.4) |
+
+Neither was a sleep rounding to a tick, which is what this section is for: the
+woken task was *ready* and the picker was not choosing it, because the boot
+task's `park()` halted the core while remaining runnable at NORMAL priority and
+a halted task is only taken off the CPU by an interrupt. The scheduler never
+went idle once during the whole suite, which is the observation that separates
+"the task is not runnable" from "the task is runnable and somebody else is
+running" - and a probe recording wake-to-resume in *ticks* named the last one
+directly: 604 of 640 wakes took exactly one tick. §10.2 has the fix and the
+numbers.
+
+**The bound is now written, in the one place it is honest.** `t-forkcost`
+asserts that *both* of its `wait4` rows - each a 200-round average - are under
+one clock tick. A wake must be a scheduler turn and not a deadline, and the
+before-figures above are *clock-quantized*: they sat at two ticks (7.6-8.1 ms)
+in every run, because a wait that ends on the clock cannot land between ticks.
+So the bound sits ~40× above the fixed figure (tens of microseconds) and below a
+broken one that cannot drift down to meet it. `t-pipecost` still only *reports*,
+deliberately: its figures are throughputs, and a bound that holds under KVM can
+be a flaky failure under TCG, which is its own stated rule. The wake is where
+the quantized claim can be made, and it is the claim that mattered.
+
+**Why**: the tick is the smallest unit a sleep can name (4 ms at 250 Hz).
+Event-driven waits ended the network's dependence on it; the remaining
+callers - `nanosleep`, timerfd, TCP retransmit pacing - still round to whole
+ticks.
+
+**What is already there, and what is actually missing**: reading time is *not*
+the gap. `timer::since_boot_nanos()` already resolves below the tick from the
+TSC, with `CYCLES_PER_TICK` calibrated from two observed ticks - so a
+`nanosleep(200µs)` knows precisely when it is late. The gap is the *wake*:
+`sleep_ticks` parks the task on the tick counter, so the smallest unit of
+sleeping is still one PIT interrupt. Design the change around arming a deadline,
+not around a finer clock.
+
+**The order that stays bootable** - the timer is what the whole scheduler rests
+on, so each step must be green before the next:
+
+| Step | Change | Where |
+|---|---|---|
+| 1 | Program the LAPIC timer once, in **one-shot**, from a calibrated count: divide by 16, measure the bus cycles per tick against the PIT *before* enabling, and refuse to go sub-tick at all when the calibration says the LAPIC timer is not ticking (KVM/TCG differ here). | `arch/x86_64/lapic.rs`, `arch/x86_64/timer.rs` |
+| 2 | A vector for it in the IDT, and a handler that wakes only the task whose deadline armed it - not the whole tick pass, which would put the cost back. Keep the PIT as the periodic floor so a lost one-shot cannot stall the machine: the tick still advances time, the one-shot only sharpens the wake-up. | `arch/x86_64/idt.rs`, `sched/` |
+| 3 | `sleep_ns`, and have `nanosleep`/timerfd/`block_until_deadline` take it: below one remaining tick arm the one-shot, otherwise park on the tick as now. The deadline a wait already carries is in ticks today - widening it to nanoseconds is the edit everything else hangs on. | `sched/policy.rs`, `sched/runtime.rs`, `vfs/timerfd.rs` |
+| 4 | Measure it: a guest test that sleeps 1 ms twenty times and asserts the elapsed `since_boot_nanos()` is near 20 ms and *not* near 80 ms (twenty 4 ms ticks). Without the number the change is a claim. | `user/abitest/src/bin/` |
+
+**The trap to watch**: one-shot timers and *interrupt coalescing* fight. If a
+one-shot is armed while another is pending, arming must not push the earlier
+deadline out - a task whose wake-up got postponed by somebody else's sleep is a
+latency bug that only shows under load, which is where it will be found first.
+
+---
+
+
+### 10.8 The build's own cost: an incremental rootfs, measured before and after — **LANDED** (xtask)
+
+The change: `cargo xtask rootfs` used to answer *any* touch of `rootfs.toml` with a full reinstall
+— GPT, both filesystems, `apk add --initdb` for thirty-odd packages over the network — because the
+staleness rule was one mtime comparison (`utils::newer(rootfs.toml, stamp)`). Editing one package
+name paid that whole bill. The mechanism now has three parts, each its own commit:
+
+* **Two content hashes in the stamp** (`xtask/src/rootfs.rs`, `StampRecord`). The shape keys
+  (mirror, branch, repos, filesystem, disk geometry) decide a fresh lay; the package lists plus the
+  two overlay trees' digests decide the delta side. A v1 or unparseable stamp resolves towards the
+  full install — the direction that costs one rebuild and cannot be wrong about what the image holds.
+* **A per-machine download cache**: every `apk add` carries `--cache-dir build/apk-cache/<arch>`,
+  and the index refresh is conditional — install from the warm cache first, retry with
+  `--update-cache` only when resolution fails. An offline host with a warm cache installs.
+* **The diff itself**: read `lib/apk/db/installed` (the tree's own truth, not a trusted record),
+  add what the configuration names and the tree lacks, remove what the previous build *owned* and
+  the configuration no longer names. A package in the tree but in no stamp belongs to nobody's
+  diff — that is the safety property, pinned by `a_delta_installs_only_the_new_names_and_removes_only_owned_ones`.
+
+**Measured before.** (To be filled by the operator's run on this machine: `time cargo xtask rootfs`
+on a current image after appending one name to `rootfs.extra_packages` — the old path reinstalls
+everything; the new path prints `Installing 1 package(s): <name>`.) The gate ran green around the
+change without these numbers, so this entry records the mechanism and leaves the figure named rather
+than invented — AGENTS §3 rule 6 asks for before/after, and the honest form of "not yet measured"
+is this line, not a made-up number. The counterfactual pins are the host tests above; the timing
+figure lands here on the first run that takes it.

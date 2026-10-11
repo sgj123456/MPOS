@@ -60,7 +60,7 @@ small relaxed-store ring that the panic handler dumps.
 
 `linux_dispatch` is the machine's single entry into the ABI — the syscall/trap
 gate reaches it through the kernel-services hook table
-(`crate::kernel_services`'s `dispatch_syscall`, `NOTES.md` §14.2), and the boot
+(`crate::kernel_services`'s `dispatch_syscall`, `docs/notes/` §14.2), and the boot
 milestone checks call it directly — and `dispatch` is the table underneath it;
 both are
 `unsafe` because `regs_ptr` must be the gate's own frame for the calling task.
@@ -92,16 +92,16 @@ recipe is: the number and `pub const` beside the other numbers (in the arch tabl
 or `proc.rs` (memory/process/time) or `posix.rs` (identity/capabilities/
 scheduling/clocks), validation with the handler and pure facts in the
 host-compiled `abi.rs`, a conformance program with its `[[bin]]` entry, and an
-update to `docs/ROADMAP.md`/`docs/UAPI.md`/`docs/NOTES.md` in the same commit. A
+update to `docs/ROADMAP.md`/`docs/uapi/`/`docs/notes/` in the same commit. A
 call that is not implemented has no arm at all: it falls to `_ => ENOSYS`.
 
 ## What userspace sees
 
 Everything. The syscall inventory — the numbers, which are served, which are
 deliberately `ENOSYS` with their prerequisite named, and which are served with a
-named sub-gap — belongs to `docs/UAPI.md` §1 (with the raw number table in
+named sub-gap — belongs to docs/uapi/ §1 (with the raw number table in
 `linux/nr.rs`/`nr_x86_64.rs`/`nr_aarch64.rs`) and is not restated here. The
-device-`ioctl` families this layer routes are `docs/UAPI.md` §2; the struct
+device-`ioctl` families this layer routes are docs/uapi/ §2; the struct
 layouts it writes are §4; the flag vocabularies are §3. The module's own console
 notes (`note_enosys`, `note_eopnotsupp`) are the diagnostic face of the refusal
 policy.
@@ -130,11 +130,11 @@ decides which of these the default sweep runs.
 
 ## Evidence and open work
 
-`docs/NOTES.md` is where the reasoning and measurements live: Phase 1 §1 and §1.3
+`docs/notes/` is where the reasoning and measurements live: Phase 1 §1 and §1.3
 (the syscall-completion pass and the calls left refused), §8.2 (seccomp, whose
 pre-checks sit at the top of `dispatch`), §11.2 Step E (the `fs.rs` split into
 `file.rs` + `ioctl.rs`), §12.2 (accepted calls whose full contract is not
 implemented), and §15.11 (the migration of the `no_std` suite onto the `std`
 side, a batch at a time). `docs/ROADMAP.md`'s "P1 Syscall completion" and
-"Remaining ABI support" track what is left, and `docs/UAPI.md` §5 is the working
+"Remaining ABI support" track what is left, and docs/uapi/ §5 is the working
 list of served / honestly refused / wrong shape.

@@ -61,7 +61,7 @@ as `hal::AbiRegs`, sized by `hal::Contexts::ABI_REG_COUNT`, and the only code he
 one does so through the machine's `to_user_regs`/`from_user_regs` — the same code is right on a
 machine whose file is 34 words as on one whose is 27. The `ptrace` protocol words themselves
 (`PTRACE_EVENT_*`, `PTRACE_O_*`, `SYSCALL_TRAP`) come from the arch-neutral `crate::abi` leaf, which
-is what took `sched → syscall` to zero (`docs/NOTES.md` §13.2).
+is what took `sched → syscall` to zero (`docs/notes/` §13.2).
 
 ## Key files
 
@@ -123,12 +123,12 @@ its own lock cannot create a lock-order dependency.
 
 ## What userspace sees
 
-`sched` owns **no dispatch row** of its own in `docs/UAPI.md`. The surface it is the engine behind —
+`sched` owns **no dispatch row** of its own in `docs/uapi/`. The surface it is the engine behind —
 `clone`, `fork`, `vfork`, `execve`, `exit`/`exit_group`, `wait4`/`waitid`, `kill`/`tgkill`/`sigqueue`,
 `rt_sigaction`, `rt_sigprocmask`, `rt_sigtimedwait`, `sigaltstack`, `futex`, `nanosleep`,
 `sched_*`, the POSIX timers, `set_robust_list`, `set_tid_address`, `ptrace`, `setrlimit`/`prlimit64`
 — is dispatched in `src/syscall/linux/proc.rs` and `src/syscall/linux/posix.rs`, and the inventory's
-rows belong to the syscall module (`docs/UAPI.md` §1, the `clone`/`sched_*` rows and the closed
+rows belong to the syscall module (docs/uapi/ §1, the `clone`/`sched_*` rows and the closed
 vocabularies in §3, and the `struct sched_attr` and `struct rlimit` layout rows in §4). The ABI facts
 `clone`'s flag bits and the resource-limit model are the `mpos-abi` leaf's (`crate::abi`, re-exported
 by `syscall::linux::abi`), not `sched`'s; `runtime.rs` carries a per-task *copy* of the limit table
@@ -146,7 +146,7 @@ does when it wakes.
 | `src/sched/exit.rs` `mod tests` — `hooks_run_in_registration_order_and_an_empty_list_is_not_a_special_case` | host | Registration order, the empty-list no-op, and the exit/cloexec list separation |
 | `src/sched/mod.rs` `mod tests` — `unshare_gives_a_copy_of_the_names_and_not_the_names_themselves` | host | The one-process `unshare(CLONE_NEWUTS)` copy semantics |
 | `user/tests/src/bin/` — `t-futex.rs`, `t-clone.rs`, `t-fork.rs`, `t-exit-group.rs`, `t-wait4.rs`, `t-waitid.rs`, `t-wait-eintr.rs`, `t-kill.rs`, `t-sigaltstack.rs`, `t-signal-delivery.rs`, `t-signal-frame.rs`, `t-signalfd.rs`, `t-sa-restart.rs`, `t-rt-sigaction.rs`, `t-rt-signal-queue.rs`, `t-rt-sigprocmask.rs`, `t-rt-sigtimedwait.rs`, `t-segv.rs`, `t-set-robust-list.rs`, `t-set-tid-address.rs`, `t-nanosleep.rs`, `t-priority.rs`, `t-sched-getaffinity.rs`, `t-timer-create.rs`, `t-timerfd.rs`, `t-ptrace.rs`, `t-ptrace-attach.rs`, `t-times.rs`, `t-fpu-across-switch.rs`, `t-regs-across-syscall.rs`, `t-getpid.rs`, `t-ns-uts.rs`, `t-caps.rs` | `t-*` (std) | The runtime's task, signal, futex, wait, timer and ptrace behaviour end to end on a booted machine — the only pins `runtime.rs` has, since it is machine-gated |
-| `user/abitest/src/bin/integration/t-forkcost.rs` | `t-*` (no_std) | Not a contract pin — a `slow`-group instrument whose numbers are `docs/NOTES.md` §10.2's subject |
+| `user/abitest/src/bin/integration/t-forkcost.rs` | `t-*` (no_std) | Not a contract pin — a `slow`-group instrument whose numbers are `docs/notes/` §10.2's subject |
 
 There is no `t-*` program under `user/abitest` that pins `sched`'s contract: the `no_std` suite's
 live programs are `src/bin/integration/*`, and the closest, `t-forkcost`, is a measurement rather
@@ -157,13 +157,13 @@ the std-side programs above, and its pure half entirely by the host tests.
 
 The reasoning and the measurements live elsewhere and are not restated here. The task-switch/fork
 cost and the "woken task must be made runnable / idle halt belongs to the scheduler's loop" lesson:
-`docs/NOTES.md` §10.2 and `docs/ARCHITECTURE.md` §7. The exit-hook inversion that closed the
-`sched → net`/`vfs`/`drivers` edges: `docs/NOTES.md` §11.1.3 and `docs/ARCHITECTURE.md` §9 (V-3).
-The `ptrace` protocol words' move to the `abi` leaf (`sched → syscall` = 0): `docs/NOTES.md` §13.2.
-The four ASLR landmarks and the deliberately-not-randomised `ET_EXEC` address: `docs/NOTES.md` §8.1.
+`docs/notes/` §10.2 and `docs/ARCHITECTURE.md` §7. The exit-hook inversion that closed the
+`sched → net`/`vfs`/`drivers` edges: `docs/notes/` §11.1.3 and `docs/ARCHITECTURE.md` §9 (V-3).
+The `ptrace` protocol words' move to the `abi` leaf (`sched → syscall` = 0): `docs/notes/` §13.2.
+The four ASLR landmarks and the deliberately-not-randomised `ET_EXEC` address: `docs/notes/` §8.1.
 The heap-anchor randomisation gap `t-aslr` names (this kernel's `brk` anchor is not drawn where
-Linux draws it): `docs/ROADMAP.md` and `docs/NOTES.md` §15.11 (batch 35). Feature status (signals,
+Linux draws it): `docs/ROADMAP.md` and `docs/notes/` §15.11 (batch 35). Feature status (signals,
 ptrace, resource limits, namespaces) is on the board in `docs/ROADMAP.md` (Phases 2 and 6), and the
-userspace verdicts are `docs/UAPI.md`'s rows. `runtime.rs`'s own named divergences — among them the
+userspace verdicts are `docs/uapi/`'s rows. `runtime.rs`'s own named divergences — among them the
 dropped real-time record on a full `RtQueue` and the `signalfd` double-record for one child death
-attributed to `queue_signal` — are recorded in `docs/UAPI.md` §5.2 and `docs/NOTES.md`, not here.
+attributed to `queue_signal` — are recorded in docs/uapi/ §5.2 and `docs/notes/`, not here.

@@ -1,0 +1,67 @@
+# UAPI §2
+
+Part of the split `docs/uapi/` inventory — index and reading rules in [index.md](index.md).
+Section numbers are unchanged from the original `UAPI.md`.
+
+## 2. Device `ioctl`s, by family
+
+Dispatched on the whole request word (magic byte plus command), never on the command byte
+alone — the one time that was done wrong, `RNDADDENTROPY` (`'R'` nr 3) was answered as the
+drain (`'R'` nr 4) and OpenRC's `seedrng` failed to seed the boot (`docs/notes/` §12.1 A8).
+
+| Family | Device(s) | Owner module | Verdict |
+|---|---|---|---|
+| `'R'` (0x52) | `/dev/random`, `/dev/urandom` | `src/syscall/linux/fs.rs`, `src/rand.rs` | Served, measured: `RNDGETENTCNT`, the `RNDADDENTROPY` credit, `RNDRESEEDCRNG` (a real re-key) and `FIONREAD` (`EINVAL`, as Linux); `RNDZAPENTCNT`/`RNDCLEARPOOL` refused `EOPNOTSUPP` (no drainable count). Both former gaps closed — [05-work-list.md §5.1 items 1–2](05-work-list.md) |
+| `'E'` (0x45) | `/dev/input/eventN` | `crates/evdev` | Served, measured: `EVIOCREVOKE` one-way NULL-arg, `EVIOCGPHYS`/`UNIQ` `ENOENT` for an absent string, `EVIOCSFF`/`RMFF` `ENOSYS`, keycodes `EINVAL`, `REP` stored gated on `EV_REP`, `GKEY/LED/SND/SW` return counts |
+| `'U'` (0x55) | `/dev/uinput` | `drivers/uinput.rs` (`Uinput::ioctl`), vocabulary in `crates/uinput` | Served; gaps: no `UI_ABS_SETUP`, no force feedback, no `/sys/class/input` entry (sysfs is built once at boot) |
+| `'V'` (0x56) | virtual consoles | `vfs/tty.rs` (`Tty::vt_ioctl`), state in `vfs/vcmux.rs`+`vfs/vtmode.rs` | Served: `VT_SETMODE`/`VT_PROCESS` negotiation, `VT_ACTIVATE` non-blocking, `VT_WAITACTIVE` sleeping, `VT_SENDSIG` → `ENOTTY` (measured); `VT_GETSTATE` answers Linux's `struct vt_stat` — `v_active` from `term::vc::active()`, `v_state` from `vcmux::state_mask()`, `v_signal` left untouched as Linux leaves it (measured on Linux 7.2.8 with the shorts pre-filled `0xAAAA`; pinned by `t-vt` + `t-seat`, `docs/notes/` §13.18 closed) |
+| `'K'` (0x4B) | virtual consoles | `vfs/tty.rs` (`Tty::kd_ioctl`) | **Refused as a closed set**: five requests served (`KDSETMODE`/`KDGETMODE`/`KDSKBMODE`/`KDGKBMODE`/`KDGKBTYPE`), the rest of the block `EOPNOTSUPP`, outside it `ENOTTY`. Per-device *serve* from live console state is the Phase-11 B2 move (`docs/notes/` §12.1 A2) |
+| `'b'` (0x62) | dma-buf | `src/syscall/linux/fs.rs` | Served (`SYNC` as the documented coherent-memory no-op, `SET_NAME` a debug label) |
+| `'d'` (0x64) | `/dev/dri/card0`, `renderD128` | `src/drivers/drm.rs`, `crates/gpu/src/virtgpu.rs`, `crates/gpu/src/*.rs` | Served across the compositor surface, and **the `DRM_VIRTGPU_*` family with it, 2D and 3D both**: all eleven requests are dispatched, and each answers per card shape, as Linux's does (measured; the instrument was `user/staging/virtgpu-probe/`, now deleted - its table is in `docs/notes/` §7.4, and the GL card's own answers too). On a card with no 3D — `GETPARAM` (`3D_FEATURES` 0, `CAPSET_QUERY_FIX` 1, unknown parameter `EINVAL`, the write four bytes wide as Linux's is), `RESOURCE_CREATE` (a real device resource, made across the mailbox to the render task), and `RESOURCE_INFO`/`MAP`/`WAIT`/`TRANSFER_TO_HOST` for the handle it returns; `GET_CAPS`/`EXECBUFFER`/`TRANSFER_FROM_HOST` `ENOSYS`, `CONTEXT_INIT`/`RESOURCE_CREATE_BLOB`/a 3D `RESOURCE_CREATE` `EINVAL`. On a GL card the same requests answer as Linux's GL card does: `VIRGL` and `CONTEXT_INIT` are negotiated (`3D_FEATURES` 1, `SUPPORTED_CAPSET_IDs` 6), `CONTEXT_INIT` is `EEXIST` because the context is created implicitly on the first resource, a 3D `RESOURCE_CREATE`, `EXECBUFFER` and `TRANSFER_FROM_HOST` complete, and the two advertised cap sets are fetched and cached. `RESOURCE_CREATE_BLOB` stays `EINVAL` on both shapes, which is Linux's answer on both too. **One named divergence left, of three**: `RESOURCE_INFO`'s `res_handle` **was** 0 for a plain dumb buffer and `TRANSFER_TO_HOST` on one **was** `EINVAL`, where Linux names a resource and completes the copy - both closed by making the resource on the first request that addresses the handle as one (`drivers/drm.rs`'s `back_dumb_with_a_resource`; Linux makes it at `CREATE_DUMB`, and this card makes it later because the console, weston and the fbdev node all allocate dumb buffers and none of them ever asks). The one left is a *refusal*: a transfer whose rectangle does not fit the backing the device was given is refused where Linux would read past it. Both closed halves are pinned by `t-drm` - a dumb buffer's `RESOURCE_INFO` is non-zero and idempotent, its `TRANSFER_TO_HOST` completes, and a handle the card never made is still `ENOENT`. A framebuffer belongs to the open file description that made it and is released with it (Linux's `drm_file_free` → `drm_fb_release`), so `GETRESOURCES`'s `count_fbs` is a list of live framebuffers rather than a list of ids a dead session left behind. The cursor plane publishes `SRC_X`/`SRC_Y`/`SRC_W`/`SRC_H` and `CRTC_W`/`CRTC_H` beside `type`/`FB_ID`/`CRTC_ID`/`CRTC_X`/`CRTC_Y`/`IN_FORMATS`, because a compositor adds them to every plane's atomic state and one the plane does not have reaches the card as property 0 and refuses the whole commit; this cursor cannot scale or crop, so the identity rectangle is the only one a commit may name and any other is `EINVAL`. `DRM_CLIENT_CAP_ATOMIC` is per open file description in the same way the framebuffers are, and it decides what the two property-list doors answer: a client that has not set it is **not shown** the properties Linux flags `DRM_MODE_PROP_ATOMIC` - the connector's `CRTC_ID`, the CRTC's `ACTIVE`/`MODE_ID`/`OUT_FENCE_PTR`, and the planes' `FB_ID`/`CRTC_ID`, both rectangles and the two fences - while `GETPROPERTY` asked for one **by id** still answers and still reports the flag. That is Linux's rule, measured on the host's card before it was written: six properties on a CRTC for an uncapped client and nine for a capped one, seventeen and eighteen on a connector, and a second descriptor of the same card kept its own answer. Pinned by `t-drm-props`. A `SYNCOBJ_FD_TO_HANDLE` import with `IMPORT_SYNC_FILE` lands its destination on a point, and the two `TIMELINE` flags decide *which*, measured both ways: without the flag it is the **fence's own point**, *set* rather than raised (a destination at 4 imported from a plain object's `sync_file` reads 0 afterwards, and one imported from a timeline's reads that timeline's point, which the exporting object's own `point` snapshots at export - an export *asked for* point 5 from an object at 9 lands 9); with the flag the request names it and it *raises*, like every other point writer here (4 with 2 asked for stays 4, with 6 goes to 6). Either way the destination **becomes a timeline**, point 0 included, so a plain object that refuses `TIMELINE_WAIT` answers it from point 0 after an import. Pinned by `t-drm-sync`. A property write is either **recorded and read back, or refused**: a value the property's own advertised range or enum does not hold is `EINVAL` (`max bpc` 16 was the first of these; `DPMS` 9 and `ACTIVE` 2 followed it, each sharing *one* value list with the read path so the shape a caller reads and the shape a write must match cannot drift), and an accepted write is what the read-back says - `pixel blend mode` records `Coverage` or `Pre-multiplied` rather than steering nothing and answering `Pre-multiplied` to both (nothing here composites: the scanout is the compositor's finished frame, so the value is state, not a mode). A blob-typed property is judged by the *same* test the commit path uses rather than by a second one: `MODE_ID` names a blob holding a mode this card can show, or 0 for none - a commit naming anything else was already `EINVAL`, and the single-property door recording an id that named nothing was the two doors disagreeing about one property. Pinned by `t-drm-props`, which reads the card's own mode back from `GETCONNECTOR` and stores it as the blob it names rather than assuming what a mode is. Other §7.4 gaps: `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` |
+| `'P'` (0x50) | `/dev/dsp` | `src/drivers/virtio/sound.rs` | Served; the family's rate/channels/format belong to the writer |
+| `'p'` (0x70) + `0x8024_7009`/`0x4024_700A` | `/dev/rtc0`, `/dev/rtc` | `src/drivers/rtc_dev.rs` | Served on **both** machines (`RTC_RD_TIME`/`RTC_SET_TIME`); alarm/interrupt requests `ENOTTY`, and so is the family aimed at any other descriptor. The readiness asked for is `'p'`, which is what the shipped `linux/rtc.h` spells all twenty-four of its commands with (measured: no `'t'` spelling exists in that header tree) and what Alpine's `hwclock` sends; the arm also tolerates a `'t'` magic never seen, and a request matching only by it reaches the same `ENOTTY` tail ([05-work-list.md §5.1 item 8](05-work-list.md)) |
+| `0x12` (block) | `/dev/vda`, `/dev/sda` | `src/blk/`, `src/syscall/linux/fs.rs` | Served; the size trio's buffer direction was the sole outlier and is fixed ([05-work-list.md §5.1 item 3](05-work-list.md)) |
+| `'f'` (0x66) | any file an `open` names | `src/syscall/linux/fs.rs` `fs_flags_ioctl` + `src/vfs/ext4/`, `src/vfs/ramfs.rs` | Served: `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS`, the inode attribute word `lsattr`/`chattr` are made of; the rest of the family `ENOTTY`; a bit this kernel cannot keep `EOPNOTSUPP` and *not stored*; `IMMUTABLE`/`APPEND` need `CAP_LINUX_IMMUTABLE` ([05-work-list.md §5.1 items 4–5](05-work-list.md)) |
+| `0x89xx` (`SIOC*`) | `eth0` | `src/net/rtnl.rs` (dispatched in `fs.rs`) | Served (`SIOCGIFFLAGS`/`SIOCSIFFLAGS`/`SIOCSIFMTU`/`SIOCGIFINDEX`/`SIOCGIFTXQLEN`/`SIOCGIFHWADDR`) |
+| `0x4600`+ (`FBIO*`) | `/dev/fb0` | `src/drivers/video/` | Served (`FBIOGET_VSCREENINFO`/`GET_FSCREENINFO`/`PAN_DISPLAY`/`WAITFORVSYNC`); `FBIOPUT_VSCREENINFO` refused rather than faked |
+| `0x54xx` (termios/`TIOC*`) | ttys, pty pairs, consoles | `src/vfs/tty.rs`, `src/vfs/pty.rs` | Served: `TIOCGWINSZ`/`TIOCSWINSZ`, `TIOCGPGRP`/`TIOCSPGRP`, `TIOCGSID`, `TIOCGPTN`, `TIOCSPTLCK`, `TCGETS`/`TCSETS`, `FIONBIO`, `FIONREAD` — the entropy pair answering `EINVAL` as Linux does, and a regular file/pipe keeping the honest `ENOTTY` ([05b-small-measured.md §5.2](05b-small-measured.md)). `TIOCGWINSZ` answers `0x0` for a terminal nobody has sized, as Linux does: a program told zero knows it was told nothing and falls back (or asks the terminal) instead of laying out a window the numbers invented |
+
+Anything not named here falls to the `_ => ENOTTY` tail — Linux's own answer for a request
+a device does not implement.
+
+### 2.1 `futex`'s operation word, per command
+
+`futex(2)` is one dispatch arm (`nr::FUTEX` → `proc::handle_futex`) over a *command* word, and
+the refusal lives at operation level: an unimplemented command reaches
+`note_missing_futex_op`, which prints `mpos: futex op {op:#x} -> ENOSYS` once per number — the
+one refusal `note_enosys` cannot describe, because it is keyed by syscall number and every one of
+these arrives as `futex`. Served commands, measured in `src/syscall/linux/proc.rs`:
+
+| Command | Value | Verdict | Pin |
+|---|---|---|---|
+| `FUTEX_WAIT` | 0 | Served (relative deadline; `FUTEX_CLOCK_REALTIME` selects the clock) | `t-futex`, `t-wait-eintr` |
+| `FUTEX_WAKE` | 1 | Served | `t-futex` |
+| `FUTEX_FD` | 2 | Refused `ENOSYS` (Linux removed it in 2.6.26) | `note_missing_futex_op` names it in the log |
+| `FUTEX_REQUEUE` / `CMP_REQUEUE` / `WAKE_OP` | 3, 4, 5 | Refused `ENOSYS` | " |
+| `FUTEX_LOCK_PI` / `UNLOCK_PI` / `TRYLOCK` | 6, 7, 8 | Refused `ENOSYS` (no priority-inheritance futexes) | " |
+| `FUTEX_WAIT_BITSET` | 9 | Served — an empty bitset is `EINVAL`, which is Linux's answer and the claim `t-futex` opens with | `t-futex` |
+| `FUTEX_WAKE_BITSET` | 10 | Served | `t-futex` |
+| `FUTEX_CMP_REQUEUE_PI` / `WAIT_REQUEUE_PI` | 12, 13 | Refused `ENOSYS` | " |
+| `FUTEX_PRIVATE_FLAG` | +128 | Accepted on any command — this kernel is uniprocessor, so shared and private are one table | `t-futex` |
+| `FUTEX_CLOCK_REALTIME` | +256 | Honoured on the wait forms (measured above) | `t-futex` |
+
+The owner is `src/syscall/linux/proc.rs` (`handle_futex`); the wake side is
+`crate::sched::futex`. A caller that needs only mutex/condvar traffic never leaves the served
+rows; anything asking for priority inheritance or requeueing reads the honest `ENOSYS` with its
+operation named in the log.
+
+### 2.2 Request words, by whole encoding
+
+The dispatch filters on the **whole** `_IOC_TYPE` magic (`family_nr`,
+`src/syscall/linux/fs/ioctl.rs`) — never on the command byte alone, the rule §12.1 A8's
+`RNDADDENTROPY` incident exists to enforce. The families and their magic bytes are the table
+above; the individual words a pin asserts against live in the guest programs named there
+(`t-ioctl` carries the `'R'` family as a table of whole command words, `t-vt` reads the `'V'`
+words out of the shipped headers rather than recalling them, `t-drm-lease` pins the lease family
+against `<drm.h>`'s literals).
+

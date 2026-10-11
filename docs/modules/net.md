@@ -93,13 +93,13 @@ they are linked here, not copied.
 
 ## What userspace sees
 
-The rows this module owns are in `docs/UAPI.md`: the `socket`/`bind`/`connect`/
+The rows this module owns are in `docs/uapi/`: the `socket`/`bind`/`connect`/
 `listen`/`accept`/`send*`/`recv*`/`getsock{name,opt}` family in §1, the `SIOC*`
 (`0x89xx`) interface-ioctl row that routes through `fs/ioctl.rs`, and the
 structure-layout rows for `struct sockaddr_ll`, `struct nlmsghdr`/`rtattr`/
 `ifa*msg` and `struct ifreq` in §4. The gaps — record-only `SO_LINGER`/buffer
 sizes, `AF_PACKET` `SOCK_RAW`, the named `SOCK_SEQPACKET` stream, `MSG_PEEK` — are
-listed in `docs/UAPI.md` §5.2, with the module gate's consequence for host
+listed in docs/uapi/ §5.2, with the module gate's consequence for host
 testing in §5.4. That file is the inventory; this page does not duplicate its
 rows.
 
@@ -123,12 +123,12 @@ kernel.
 
 ## Evidence and open work
 
-The reasoning and measurements behind each landing are `docs/NOTES.md` §4.1
+The reasoning and measurements behind each landing are `docs/notes/` §4.1
 (`AF_UNIX`), §4.2 (ICMP and `IP_RECVTTL`), §4.4 (the netlink write side), §4.5
 (`AF_PACKET`, still partial) and §10.1 (network latency); the aarch64 stack flip
 and the vsock host-gating are §13.4 and §13.28. `docs/ROADMAP.md`'s Phase 4 is
 where the status and the remaining networking work are tracked. `AF_VSOCK` has no
 conformance program at all, because a test boot deliberately gets no host vsock
 bus (§13.28) — that gap, the `AF_PACKET` parsers' lack of a host test or fuzz
-target, and the `net` gate's other consequences are named in `docs/UAPI.md` §5.2
+target, and the `net` gate's other consequences are named in docs/uapi/ §5.2
 and §5.4.

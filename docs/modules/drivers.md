@@ -88,7 +88,7 @@ machine-only drivers, `src/drivers/virtio/` for the transport seam and the devic
 
 | File | What lives there |
 |---|---|
-| `src/drivers/pci.rs` | PCI config space behind one address, over whichever of two mechanisms the machine has: the memory-mapped window ACPI's MCFG names (`use_window`/`slice`, one bus's mebibyte mapped on the first access to it, `window_byte` computing the register's address) or mechanism 1's port pair 0xcf8/0xcfc (`port_read32`/`port_write32`/…). `read8`/`read16`/`read32` and their writers dispatch between them; `config_read`/`config_write` walk in Linux's access sizes either way. Also here: the `Func` address type (`bdf`, `io_bar0`, `command_on`), the `COMMAND_*` bits, `find`/`find_any`, the one-shot bus snapshot `enumerate()` (`scan_bus`, `secondary_bus`, `read_function`, `read_bars`) that `init()` publishes, and the firmware-facing half (`discover_ecam`, `read_table`) that reads the ACPI tables through the root pointer the loader records. Only the *bus cycles* are here; every decision about what was read is in `crate::pci`. `init` is where the mechanism is chosen, and the choice is a check rather than a preference: the bus is walked over the ports, then over the window, and the window is kept only if the two snapshots are equal function for function (`first_difference` names the one that was not) - so "MMIO by default" is a claim this machine re-proves on every boot (`docs/NOTES.md` §7.6) |
+| `src/drivers/pci.rs` | PCI config space behind one address, over whichever of two mechanisms the machine has: the memory-mapped window ACPI's MCFG names (`use_window`/`slice`, one bus's mebibyte mapped on the first access to it, `window_byte` computing the register's address) or mechanism 1's port pair 0xcf8/0xcfc (`port_read32`/`port_write32`/…). `read8`/`read16`/`read32` and their writers dispatch between them; `config_read`/`config_write` walk in Linux's access sizes either way. Also here: the `Func` address type (`bdf`, `io_bar0`, `command_on`), the `COMMAND_*` bits, `find`/`find_any`, the one-shot bus snapshot `enumerate()` (`scan_bus`, `secondary_bus`, `read_function`, `read_bars`) that `init()` publishes, and the firmware-facing half (`discover_ecam`, `read_table`) that reads the ACPI tables through the root pointer the loader records. Only the *bus cycles* are here; every decision about what was read is in `crate::pci`. `init` is where the mechanism is chosen, and the choice is a check rather than a preference: the bus is walked over the ports, then over the window, and the window is kept only if the two snapshots are equal function for function (`first_difference` names the one that was not) - so "MMIO by default" is a claim this machine re-proves on every boot (`docs/notes/` §7.6) |
 | `src/drivers/virtio/hal.rs` | `HalImpl` — the crate's `Hal` over the kernel's frame allocator and direct map (`dma_alloc`/`dma_dealloc`, `mmio_phys_to_virt` through `crate::hal::map_mmio_window`, `share`/`unshare`). Below it, the x86_64-only `pci_transport` module: `IoCam` (`ConfigurationAccess` over `pci.rs`), `pci_root()`, `transport()`/`transport_all()` (probe + command-on + `PciTransport::new` + `pci::claim`), `device_config()` and `claim_drm_card()` |
 | `src/drivers/virtio/mmio.rs` | The aarch64 transport. Turns a `virtio,mmio` window into an `MmioTransport` and opens one device per class: `blockdev`, `init_net_global`/`net_device`, `gpu_device`, `sound_device`, `console_device`, `vsock_device`, `p9_device`, `input_device`, `rng_device`, plus the boot-probe helpers `read_blocks`/`capacity`/`write_readback`. `SECTOR`, `DEVICE_CONFIG_OFFSET` and the `NET_*` constants live here |
 | `src/drivers/virtio/msix.rs` | MSI-X for a virtio PCI function, by hand: `enable` (walk the capability list, map the table, arm entry 0 at an IDT vector) and `set_queue_vectors` (bind every queue to that vector through the common-configuration window), plus `device_config_of` and the capability-walk helpers `find_cap`/`find_next`/`bar_address`/`map_structure`/`vendor_cap_window`. x86_64-only |
@@ -212,7 +212,7 @@ rather than an edit it makes.
 
 This module owns the `/dev` node set and the ioctl families behind the nodes it publishes. The
 families themselves — their numbers, their verdicts and their remaining gaps — are
-`docs/UAPI.md` §2's rows; this section names the doors, not their contract:
+docs/uapi/ §2's rows; this section names the doors, not their contract:
 
 | Family | Device(s) | Owning code |
 |---|---|---|
@@ -231,7 +231,7 @@ the machine's own serial name, the `console` sink, `tty0` and one node per virtu
 (`fd`, `stdin`, `stdout`, `stderr`), the disk names and their partitions, and the virtio nodes,
 which a driver publishes when its probe succeeds (`devices::publish` — see the Key files row). A
 driver that never came up is simply not in the registry, so a machine without a device has no node
-rather than one whose open goes nowhere. `docs/UAPI.md` §4/§6 hold the layouts and the pins; the
+rather than one whose open goes nowhere. docs/uapi/ §4/§6 hold the layouts and the pins; the
 node *names* are Linux's, and a name a machine does not have is absent rather than a node whose
 open goes nowhere.
 
@@ -273,34 +273,34 @@ Run by `cargo xtask test`; the integration suite lives in
 
 ## Evidence and open work
 
-The reasoning, the measurements and the lessons behind every shape above are in `docs/NOTES.md`;
+The reasoning, the measurements and the lessons behind every shape above are in `docs/notes/`;
 this page states the shape and points there rather than restating a number.
 
-- **The device classes and their measurements.** `NOTES.md` §7.1 (the display: virtio-gpu,
+- **The device classes and their measurements.** `docs/notes/` §7.1 (the display: virtio-gpu,
   framebuffer and DRM/KMS), §7.1b/§7.1c (what the console answers and which consoles the kernel
   has), §7.2 (virtio-input/evdev), §7.2b (`/dev/dsp` and the OSS parameters), §7.3 (AHCI — the
   stretch item, its measurements and what measuring it corrected), §7.4 (the next compositor and
   the `DRM_VIRTGPU_*` answer table). The status board is `docs/ROADMAP.md`.
-- **Configuration space, and which mechanism reads it.** `NOTES.md` §7.6 (the ACPI tables, the
+- **Configuration space, and which mechanism reads it.** `docs/notes/` §7.6 (the ACPI tables, the
   MCFG reserved word a fixture agreed with the bug about) and §7.6a (the switch itself: one
   address over two mechanisms, a bus's mebibyte mapped on first access, and the both-ways walk
   that has to agree before the window is trusted). Its open half is named in `docs/ROADMAP.md`:
   a function's space is 4 KiB and `CFG_SIZE` is still the port mechanism's 256, so PCIe extended
   capabilities are outside every reader.
-- **The seam and the aarch64 classes.** `NOTES.md` §9.1 (`map_mmio_window` taking the last
+- **The seam and the aarch64 classes.** `docs/notes/` §9.1 (`map_mmio_window` taking the last
   x86_64-only call out of `HalImpl`; the virtio-rng over MMIO as the drivers stage's first
   device), §13.4 (the network stack holds the adapter as a contract), §13.24 (the input registry),
   §13.25 (the console port and `/dev/hvc0`), §13.26 (the card and the render task), §13.27 (the
   sound card), §13.28 (the vsock device), §13.29 (the 9p share and the probe with no caller). The
   one-copy claim per class is §15.2.
-- **The two traps.** `AGENTS.md` §5 carries them; `NOTES.md` §13.26 is the measurement that the
+- **The two traps.** `AGENTS.md` §5 carries them; `docs/notes/` §13.26 is the measurement that the
   GPU class cost a type-erasure refactor (`Gpu<T>` + `Box<dyn GpuDevice>`), and §13.23/§13.24 the
   re-measurement of the capability flip once the module gates moved behind it.
 - **The edges.** `docs/ARCHITECTURE.md` §2 (the module graph — `drivers` calls `mm`, `pci`,
   `sched`; `net` calls `drivers`, `sched`, `uevent`), §3 (what each layer owns, including the
   "must not parse a device's ioctl ABI" row that the driver-side ioctl dispatch is measured
   against), §8 (target gating and host testability) and §9 (the debt audit).
-- **The userspace surface.** `docs/UAPI.md` §2 (the ioctl families by name), §4 (the struct
+- **The userspace surface.** docs/uapi/ §2 (the ioctl families by name), §4 (the struct
   layouts, including the DRM and EDID blobs) and §6 (where the pins live).
 
 Open work, named rather than stubbed in code:
@@ -308,13 +308,13 @@ Open work, named rather than stubbed in code:
 - **3D / virgl.** The `DRM_VIRTGPU_*` family answers per card shape; the renderer capabilities are
   gated on what the transport actually agreed to (`Gpu::features`), and `RESOURCE_CREATE_BLOB`
   stays refused on both card shapes. The plan and the deliberate scope are `docs/ROADMAP.md`
-  (3D/virgl/venus) with the reasoning in `NOTES.md` §7.4.
+  (3D/virgl/venus) with the reasoning in `docs/notes/` §7.4.
 - **DRM gaps this card declines.** `gamma_refused` and `sequence_refused` answer for the
   `GAMMA`/`CRTC_GET_SEQUENCE`/`CRTC_QUEUE_SEQUENCE` requests as this card's answer rather than the
   catch-all's; the `DRM_CAP_ASYNC_PAGE_FLIP` refusal is named as a capability this hardware does
   not have.
 - **uinput.** `UI_ABS_SETUP`, force feedback and a runtime `/sys/class/input` entry are recorded as
-  absent in `drivers/uinput.rs`'s header and in `docs/UAPI.md` §2's `'U'` row.
+  absent in `drivers/uinput.rs`'s header and in docs/uapi/ §2's `'U'` row.
 - **AHCI scope.** One controller, one port, `IDENTIFY`/`READ DMA EXT`/`WRITE DMA EXT`/
   `FLUSH CACHE EXT`; NCQ, ATAPI, port multipliers, hotplug and 28-bit LBA are absent by the
   scope `drivers/ahci.rs` states.

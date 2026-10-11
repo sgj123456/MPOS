@@ -75,7 +75,7 @@ The traits other layers are allowed to name are in `src/vfs/mod.rs`:
   Every method has a failing default, so an implementation overrides exactly what its storage can
   do. The `Any` supertrait plus the inherent `impl dyn Inode { fn as_any }` is the *only* way a
   caller reaches a concrete type it already knows is behind the node; nothing in `src/vfs/mod.rs`
-  names a driver or a socket family (Phase 11 B1, `NOTES.md` §11.1.1 / §11.2 Step B1). A new device
+  names a driver or a socket family (Phase 11 B1, `docs/notes/` §11.1.1 / §11.2 Step B1). A new device
   type should add no method here — ask `as_any` from the layer that owns the type.
 - **`FileSystem`** (`Send + Sync`) — a mounted instance (the superblock-equivalent): `root()`,
   `name()`, the optional `statfs()`, and the read-only promise (`read_only`/`set_read_only`). A
@@ -88,7 +88,7 @@ The traits other layers are allowed to name are in `src/vfs/mod.rs`:
 - **`FsStats`**, **`Metadata`**, **`Ready`** — `statfs`, the facts that outlive an open, and
   `poll`'s per-node readiness.
 - **`MappedInode`** — wraps an `Inode` as `mm::vma::MappedObject`, the three-question trait
-  (`frame_at`, `identity`) that closed the `mm → vfs` cycle (V-13, `NOTES.md` §11.1/§11.2; the
+  (`frame_at`, `identity`) that closed the `mm → vfs` cycle (V-13, `docs/notes/` §11.1/§11.2; the
   tenant of an address space is `mm`'s, the thing behind the pages is the VFS's).
 
 The mount/resolution contract is on `Vfs` in `src/vfs/mount.rs`; the free functions are thin
@@ -103,7 +103,7 @@ spellings of it over the kernel's one table. The notable invariants each one kee
   is the serving *instance* (what `EXDEV` and `linkat` ask by, shared by a bind), and `Mount::dev`
   is what `stat`'s `st_dev` reports (the device's own number, or an anonymous one for a
   pseudo-filesystem). `dev_of_path` and `mount_records` derive their answers from one place so a
-  tool reading `stat` and `/proc/self/mountinfo` cannot see them disagree (`NOTES.md` §7.4).
+  tool reading `stat` and `/proc/self/mountinfo` cannot see them disagree (`docs/notes/` §7.4).
 - **`pivot_root`/`move_root`** hand a whole filesystem to `/` and park the old tree at `put_old`;
   the mounts inside the promoted tree follow by *name*, and the rest are dropped deliberately.
 - **`File`/`FdTable`**: an fd number means nothing without its table. `FdTable::duplicate` shares the
@@ -114,12 +114,12 @@ spellings of it over the kernel's one table. The notable invariants each one kee
 
 Where the layering is deliberately unequal, and was recently fixed or audited:
 
-- **The `vfs ↔ console` pair is broken** (V-4, `NOTES.md` §11.1.4 / §11.2 Step D): the emulator, the
+- **The `vfs ↔ console` pair is broken** (V-4, `docs/notes/` §11.1.4 / §11.2 Step D): the emulator, the
   `VC_COUNT`/`K_*`/`KD_*` vocabulary, the handover table (`vtmode`) and the active-console number
   all moved to the `term` leaf; `console.rs` reads "which console is on screen" from the leaf, so
   `console → vfs` fell to zero. Relocating `vcmux.rs` itself was evaluated and rejected (D.2b) —
   it stays in `vfs` because its pty/tty orchestration coherently belongs with the nodes it drives.
-- **The `syscall/linux/fs.rs` split** (Phase 11 E, `NOTES.md` §11.2 Step E) is why the path/file
+- **The `syscall/linux/fs.rs` split** (Phase 11 E, `docs/notes/` §11.2 Step E) is why the path/file
   and device-ioctl handlers now live in `src/syscall/linux/fs/{mod,file,ioctl}.rs`: the `vfs` module
   owns the objects and the per-device ioctl *contracts*, the split `fs` module owns the gate.
 - **The surviving `drivers ↔ vfs` pair** is a live finding, not precedent: `vcmux`, `procfs`, `sysfs`
@@ -131,14 +131,14 @@ Where the layering is deliberately unequal, and was recently fixed or audited:
 
 ## What userspace sees
 
-The syscall gate is `src/syscall/linux/fs/` (one row per handler in `docs/UAPI.md` §1), but the
-families it serves are this module's objects. The rows this module owns in `docs/UAPI.md`:
+The syscall gate is `src/syscall/linux/fs/` (one row per handler in docs/uapi/ §1), but the
+families it serves are this module's objects. The rows this module owns in `docs/uapi/`:
 
-- **Device-`ioctl` families** (`docs/UAPI.md` §2): `'V'` virtual consoles (`vfs/tty.rs`
+- **Device-`ioctl` families** (docs/uapi/ §2): `'V'` virtual consoles (`vfs/tty.rs`
   `Tty::vt_ioctl`, state read back through `vcmux`), `'K'` console mode (`Tty::kd_ioctl`), `'f'`
   inode attribute flags (`src/vfs/ext4/`, `src/vfs/ramfs.rs`), and the termios/`TIOC*` block
   (`vfs/tty.rs`, `vfs/pty.rs`).
-- **Flag words** (`docs/UAPI.md` §3): the inode attribute flag vocabulary
+- **Flag words** (docs/uapi/ §3): the inode attribute flag vocabulary
   (`INODE_FL_VISIBLE`/`INODE_FL_MODIFIABLE` in `src/vfs/mod.rs`), and the filesystem-has-no-flags
   refusal (`Inode::flags` default).
 - **The filesystems userland mounts and reads**: `/proc`, `/sys`, `/dev`, `/dev/pts`, `/proc/mounts`
@@ -146,8 +146,8 @@ families it serves are this module's objects. The rows this module owns in `docs
   `t-stat-consistency` checks agree between `stat`, `fstat` and the mount table.
 
 `eventfd2`, `timerfd`, `signalfd`, `inotify`, `memfd`, `epoll`, the lock families and the file
-syscalls each have their own `docs/UAPI.md` row and their own conformance program below. The
-authoritative list is `docs/UAPI.md`; this page deliberately does not copy it.
+syscalls each have their own `docs/uapi/` row and their own conformance program below. The
+authoritative list is `docs/uapi/`; this page deliberately does not copy it.
 
 ## Pins
 
@@ -206,7 +206,7 @@ object, and in the neighbour's page when it is about the ABI or the wire.
 The reasoning and the measurements live in the docs above this directory; this page points at them
 rather than re-arguing or restating numbers.
 
-- **Why the code is shaped this way** — `docs/NOTES.md`: §11.1.1 and §11.2 Step B1 (the `Inode`
+- **Why the code is shaped this way** — `docs/notes/`: §11.1.1 and §11.2 Step B1 (the `Inode`
   downcast chain, V-1, and its closure); §11.1.4 and §11.2 Step D (V-4, the terminal emulator and
   console mux, the `vfs ↔ console` pair broken, D.2b rejected); §11.2 Step E (the `fs.rs` split);
   §11.1 V-13 (the `mm`/`vfs` seam and `MappedInode`); §7.4 (`File::dev`, `st_dev` consistency and
@@ -216,7 +216,7 @@ rather than re-arguing or restating numbers.
   path) and the Phase-11 items (A–G, `11.D`), and "Remaining ABI support" for the calls that have
   not landed. The `drivers ↔ vfs` mutual pair is the one surviving edge this module contributes;
   its remaining half is the procfs/sysfs/9p device-state door (V-4's note), plus the lazy-mount and
-  namespace work parked in `docs/UAPI.md` §5.4.
+  namespace work parked in docs/uapi/ §5.4.
 - **Known gaps named in the code** — the `src/vfs/ext4/mod.rs` header states what the driver
   deliberately does not do (permission checks, timestamp *updates*); the `src/vfs/p9.rs` header names
   the 9P2000.u gaps (no `symlink`/`link`, and `rename` answering `EXDEV` because the dialect has no

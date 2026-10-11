@@ -29,7 +29,7 @@ each names the program that measured it (`t-faccessat`, `t-dup2`, `t-dup3`,
 bitflags-versus-plain-enum distinction the rule turns on is spelled out there too.
 
 The suite tree is also mid-migration, and that is a fact about the current tree
-rather than a plan. `docs/NOTES.md` §15.11 moves `user/abitest` to `user/tests` a
+rather than a plan. `docs/notes/` §15.11 moves `user/abitest` to `user/tests` a
 batch at a time (mechanical per program: `#![no_std]` + `lin::raw_sys` becomes
 `fn main()` + `rustix::`, `lin::check_true`/`done` becomes `Report::check`/`finish`);
 the syscall family is fully migrated, so `user/abitest/src/bin/` holds only the
@@ -85,12 +85,12 @@ builds, stages and reads the verdicts), the kernel-side pins (those are host
 - **A migrated program's claims are the contract, not its fixture.** The `std` tests
   own their fixtures (`/tmp` files, their own `PROT_NONE` pages, their own pty pairs)
   precisely because the no-std versions depended on what a particular root happened
-  to carry; `docs/NOTES.md` §15.11 records each time a fixture had to move and why.
+  to carry; `docs/notes/` §15.11 records each time a fixture had to move and why.
 
 ## What userspace sees
 
 These modules *are* userspace; they own no kernel promise, they **pin** the ones
-`docs/UAPI.md` records. Every row in that inventory names the program that would
+`docs/uapi/` records. Every row in that inventory names the program that would
 fail if the promise changed — a syscall's shape and errno, an ioctl family, a
 struct layout, a flag vocabulary — and the two suites are how those pins reach the
 machine rather than a comment. The `t-` naming, the `/bin/t-*` glob and the verdict
@@ -113,7 +113,7 @@ without its `[[bin]]` block is caught as "no binary" for a source the walk found
 
 ## Evidence and open work
 
-- `docs/NOTES.md` §15.11 is the migration ledger: every batch, the fixture that moved,
+- `docs/notes/` §15.11 is the migration ledger: every batch, the fixture that moved,
   the rule clause it measured, the kernel bugs it found, and the gate runs. It is the
   page to read before adding or moving a `t-` program.
 - `docs/ROADMAP.md`'s status board and its Phase-15 items are the plan; the remaining

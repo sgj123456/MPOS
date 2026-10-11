@@ -62,7 +62,7 @@
 graph TB
     subgraph UserSpace["用户空间 (Ring 3)"]
         MUSL["musl libc"]
-        SHELL["/bin/sh · fish · busybox"]
+        SHELL["busybox ash (/bin/sh, /bin/ash)"]
         WESTON["weston (DRM/KMS + GL)"]
         TESTS["约 120 个 ABI 一致性程序"]
     end
@@ -227,7 +227,7 @@ graph LR
 
 `src/syscall/linux/nr.rs` 命名了 **252 个 Linux x86_64 系统调用号**；每一个都由
 `src/syscall/linux/mod.rs` 中的分发表路由，其中约 234 个真正工作——剩下的少数几个回答
-`ENOSYS`，由 `NOTES.md` 作为剩余 ABI 缺口追踪记录（`fanotify`、`keyctl`、`userfaultfd`、
+`ENOSYS`，由 `docs/notes/` 作为剩余 ABI 缺口追踪记录（`fanotify`、`keyctl`、`userfaultfd`、
 实时信号 33–64、`io_uring`）。POSIX 间隔定时器（`timer_create` 222 … `timer_delete` 226）
 以它们本来的五个调用号加入了真正工作的集合；`SIGRTMIN`（32）可以被排队、屏蔽和等待——
 那是 musl 的 `SIGEV_THREAD` 辅助函数唯一需要的实时信号号——而针对它的*处置方式*及其上方的
@@ -244,10 +244,10 @@ graph LR
 | `syscall/linux/nr.rs` | — | 调用号本身，被测试套件以 `#[path]` 引入，让内核与测试共享同一张表 |
 
 `ioctl` 值得一提：目前 fbdev、DRM、RTC、uinput、evdev、TTY 和块设备的请求号族都在
-`fs.rs` 中解析，这正是该文件有 6300 行的原因。`NOTES.md` Phase 11（Step B）就是把这些契约
+`fs.rs` 中解析，这正是该文件有 6300 行的原因。`docs/notes/` Phase 11（Step B）就是把这些契约
 交还给各自驱动的计划。
 
-与 Linux 有意为之的分歧按子系统收集在 `NOTES.md` 中——例如 IPv4 上的 `listen(2)` 返回
+与 Linux 有意为之的分歧按子系统收集在 `docs/notes/` 中——例如 IPv4 上的 `listen(2)` 返回
 `EOPNOTSUPP`（协议栈只支持出站）、`SO_LINGER{on,0}` 保持正常关闭而不是伪造、
 `unshare`/`setns` 先校验再拒绝，以及 `seccomp` 支持 `STRICT` 但不支持 `FILTER`。
 它们记录在那里，而不是藏在这里。
@@ -280,9 +280,9 @@ harness，因此普通引导不需要付出这些用例所需的半秒时钟等�
 （`virtio-blk: …`、`9p: …`、`devfs: …`）。这类检查断言的是**内核**的行为，而不是构建往镜像里塞
 进去的任何东西：`check_blk` 用内核自己的分区表与超级块扫描找出一个不含文件系统的设备，再往返它
 自己生成的图案；`check_fs` 在挂上的 ext4 里写自己的标记文件再读回；`check_p9` 读 share 根 inode
-—— 没有任何检查点着镜像必须携带的文件名（`docs/NOTES.md` §15.34）。内核不再打印里程碑标记：自从
+—— 没有任何检查点着镜像必须携带的文件名（`docs/notes/` §15.34）。内核不再打印里程碑标记：自从
 sweep 自己的 `=== SUMMARY` 行与 harness 的总计成为门禁之后，没有任何东西解析它们
-（`docs/NOTES.md` §15.19、§15.24）。
+（`docs/notes/` §15.19、§15.24）。
 
 **真正的门禁是自检。** `cargo xtask test` 先运行主机单元测试，然后引导 `tests.toml` 选中的
 用户测试程序——所有不在任何分组中的程序——要求每个程序打印 `=== PASS`，并且整个运行以
@@ -392,8 +392,8 @@ QEMU 在 OVMF 下直接引导它：没有 ISO，没有光驱，没有 loop 设�
 
 不可用，而且配置也不再假装可用：`.cargo/config.toml` 里没有 `aarch64-unknown-none`
 profile，`rust-toolchain.toml` 里也没有这个目标，因为过去放在那里的那个 profile 指向
-`arch/aarch64/linker.ld`，而这样的脚本从未存在过（`NOTES.md` Phase 11 Step A 移除了它）。
-`NOTES.md` §9.1 列出了一个真正的 aarch64 移植所需要的东西——异常向量、GIC、页表、PSCI、
+`arch/aarch64/linker.ld`，而这样的脚本从未存在过（`docs/notes/` Phase 11 Step A 移除了它）。
+`docs/notes/` §9.1 列出了一个真正的 aarch64 移植所需要的东西——异常向量、GIC、页表、PSCI、
 通用定时器、UART——其中没有任何一项已经写好。
 
 ---
@@ -585,7 +585,7 @@ mpos/
 ├── initramfs.toml           # 早期用户空间里有什么
 ├── .cargo/config.toml       # 目标、rustflags 和 `cargo xtask` 别名
 ├── rust-toolchain.toml      # nightly + 四个目标
-├── docs/                    # ROADMAP.md · NOTES.md · ARCHITECTURE.md · UAPI.md · README.zh.md
+├── docs/                    # ROADMAP.md · notes/ · uapi/ · ARCHITECTURE.md · README.zh.md
 ├── README.md · AGENTS.md
 └── LICENSE
 ```
@@ -607,8 +607,8 @@ mpos/
   会死锁。任何锁下都不休眠。
 - **每一次唤醒都是事件，不是节拍。** 阻塞调用在它等待的那件事上挂起，由到达唤醒，
   而不是由下一个时钟中断唤醒。正是这一条纪律把回环 `ping` 从 7.5 ms 降到 0.3 ms，
-  把两进程管道交接从 7 MiB/s 提到 10 168 MiB/s（`NOTES.md` §10.1、§10.4）。
-- **没有数字就不作声明。** `NOTES.md` 中的性能改动都带有来自套件内仪器的前后测量——
+  把两进程管道交接从 7 MiB/s 提到 10 168 MiB/s（`docs/notes/` §10.1、§10.4）。
+- **没有数字就不作声明。** `docs/notes/` 中的性能改动都带有来自套件内仪器的前后测量——
   `t-forkcost`、`t-pipecost`、`t-netlat`，或者一个统计设备读取次数的主机测试。
 - **分歧要记录，不要隐藏。** MPOS 有意与 Linux 不同的地方，原因和钉住它的测试都写在
   特性旁边。
@@ -623,7 +623,7 @@ mpos/
 | **信号** | 通过真正的 `rt_sigframe` 投递，所以处理函数会被调用，而 `rt_sigreturn` 会恢复被打断的代码。`SIGKILL` 和 `SIGSTOP` 不可屏蔽 |
 | **ASLR** | `ET_DYN` 镜像、它的解释器、栈顶和 `mmap` 区域都在每次 `exec` 时重新抽签；`ET_EXEC` 镜像保持它链接时的地址，因为固定地址的含义就是这个 |
 | **Slab 分配与大请求** | 超过 2048 B 的请求绕过 slab 直接取帧；堆会缓存已释放的空槽，这就是 `/proc/meminfo` 里的"空闲"内存不是全部真相的原因 |
-| **内核 panic 会终结这台机器** | `panic = "abort"`，加上一个打印栈扫描并以 `35` 退出 QEMU 的 panic 处理函数。全局分配器的失败路径仍然是一个 panic——`NOTES.md` §8.0 中的未决项 |
+| **内核 panic 会终结这台机器** | `panic = "abort"`，加上一个打印栈扫描并以 `35` 退出 QEMU 的 panic 处理函数。全局分配器的失败路径仍然是一个 panic——`docs/notes/` §8.0 中的未决项 |
 
 ---
 
@@ -636,8 +636,8 @@ mpos/
 | `docs/README.zh.md` | 本文件：MPOS 是什么，以及如何构建、运行和测试（中文版，与英文版逐节对应） |
 | `docs/ARCHITECTURE.md` | 依赖图、引导与系统调用序列、按层的所有权划分、模块间的实测边，以及分层违规 |
 | `docs/ROADMAP.md` | 规划：特性路线图与状态板、各阶段剩余工作、优先级总览 |
-| `docs/NOTES.md` | 证据：全部测量、门禁记录、教训与陷阱——实测的性能工作，以及 Phase 11 的架构债务审计及其整改计划 |
-| `docs/UAPI.md` | 以清单形式呈现的用户空间可见接口面：系统调用、设备 ioctl、结构体布局和标志词汇表，每一行都带着 Linux 的回答、本内核的回答和那个钉子——一份关于什么是*已服务*、什么是*诚实拒绝*、什么是*错误形态*的工作清单 |
+| `docs/notes/` | 证据库：每个 phase 一个文件外加索引 `index.md`——全部测量、门禁记录、教训与陷阱，实测的性能工作，以及 Phase 11 的架构债务审计及其整改计划。`§N.M` 指针经 `docs/notes/index.md` 路由 |
+| `docs/uapi/` | 以清单形式呈现的用户空间可见接口面：系统调用、设备 ioctl、结构体布局和标志词汇表，每一行都带着 Linux 的回答、本内核的回答和那个钉子——一份关于什么是*已服务*、什么是*诚实拒绝*、什么是*错误形态*的工作清单 |
 | `xtask/README.md` | 每一条构建/运行命令、标志和环境变量（中英双语） |
 | `fuzz/README.md` | 每个 fuzz 目标的输入是什么 |
 

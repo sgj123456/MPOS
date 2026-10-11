@@ -30,7 +30,7 @@ opting the boot instant and tick counter on top so a machine whose sources are a
 seed an outside caller cannot predict. The machine's rng *device* is injected through
 `set_device_entropy` rather than named, because a kernel service naming `crate::drivers` would close a
 cycle with the edge that already runs the other way - which device a machine has is the wiring
-layer's fact (`docs/NOTES.md` §14.3). On the host build `seed()` is a fixed constant on purpose, so a
+layer's fact (`docs/notes/` §14.3). On the host build `seed()` is a fixed constant on purpose, so a
 unit test seeds the same every run.
 
 ### kobject events (`src/uevent.rs`)
@@ -79,7 +79,7 @@ unchanged by the move - the semantics are the contract.
 
 `arch/**` has to ask the kernel whether a faulting page is one to populate, where a `svc` goes, and
 what a line of console input means, and it asks through `hal::kernel::Kernel` - a trait the *kernel*
-crate implements - so the machine layer never names `sched`, `syscall` or `mm` (`docs/NOTES.md`
+crate implements - so the machine layer never names `sched`, `syscall` or `mm` (`docs/notes/`
 §14.2). This file is the one implementation of that trait (`struct Services`), registered once by
 `register()` from `src/main.rs::_start` before anything that can take a trap is armed on either
 machine (before the x86_64 IDT, before the aarch64 vector table). The trait is deliberately a *fact*
@@ -129,7 +129,7 @@ the network-stack wake call, which is `#[cfg(mpos_net)]`).
 
 ## What userspace sees
 
-- `src/rand.rs`: the `'R'` ioctl row in `docs/UAPI.md` - `RNDGETENTCNT`, the `RNDADDENTROPY`
+- `src/rand.rs`: the `'R'` ioctl row in `docs/uapi/` - `RNDGETENTCNT`, the `RNDADDENTROPY`
   credit, and `RNDRESEEDCRNG` (a real re-key) served; `RNDZAPENTCNT`/`RNDCLEARPOOL` refused
   `EOPNOTSUPP`; `FIONREAD` answering `EINVAL` as Linux does. The `getrandom` flag row is the same
   file's other face.
@@ -140,7 +140,7 @@ the network-stack wake call, which is `#[cfg(mpos_net)]`).
 - `src/kernel_services.rs`: nothing userspace can name; it is the machine layer's bridge into the
   kernel.
 
-The `RNDRESEEDCRNG` provenance and the `FIONREAD` divergence are `docs/UAPI.md` §5.1; the
+The `RNDRESEEDCRNG` provenance and the `FIONREAD` divergence are docs/uapi/ §5.1; the
 `PROT_READ`-destination `EFAULT` case is §5.2.
 
 ## Pins
@@ -163,9 +163,9 @@ sweep, not the host suite.
 
 ## Evidence and open work
 
-The measurements and the lessons behind each corner are in `docs/NOTES.md`: the entropy device
+The measurements and the lessons behind each corner are in `docs/notes/`: the entropy device
 injection and the machine-seam rule in §14.2/§14.3, the aarch64 virtio-disk `DEVPATH` defect that
 `VIRTIO_BLK_DEVPATH` fixes in §15.10, and the `rand`-in-stage-1 flake that the trap table warns about
-in §12.4a. The userspace verdicts are `docs/UAPI.md` §5.1/§5.2. The remaining work is
-`docs/ROADMAP.md`'s: the `RNDRESEEDCRNG` entropy-count provenance noted in `docs/UAPI.md`, and the
+in §12.4a. The userspace verdicts are docs/uapi/ §5.1/§5.2. The remaining work is
+`docs/ROADMAP.md`'s: the `RNDRESEEDCRNG` entropy-count provenance noted in `docs/uapi/`, and the
 `uaccess` `user_accessible` stub's limits on the host build.

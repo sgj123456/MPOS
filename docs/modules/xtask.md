@@ -81,11 +81,11 @@ Which kernel modules these commands may reach, and the edge rules, are
 ## What userspace sees
 
 `xtask` makes no syscall promise of its own — it is not in the kernel graph and
-serves no `docs/UAPI.md` row. The only thing it hands the guest is the boot command
+serves no `docs/uapi/` row. The only thing it hands the guest is the boot command
 line it bakes into `mpos.cmdline` (the `console=` list, chosen with `--mode`) and the
 programs it stages for a sweep; both are inputs to the machine, not a contract
 userspace reads. Everything the user sees from a *boot* is the kernel's, documented
-in `docs/UAPI.md` and the kernel's module pages.
+in `docs/uapi/` and the kernel's module pages.
 
 ## Pins
 
@@ -103,11 +103,11 @@ in `docs/UAPI.md` and the kernel's module pages.
   a phase, the module header cites it: `depgraph.rs` §11.2 Step G, `gates.rs` §11.2
   Step F, `selftest.rs` the self-test protocol, `initramfs.rs` §15.6, `disk.rs` the
   sweep medium, `sweep.rs` the refactor that removed the duplicated harness.
-- `docs/NOTES.md` §15.18 records the capability gates being wired to the syscalls
+- `docs/notes/` §15.18 records the capability gates being wired to the syscalls
   that own them, with the gate runs beside it; the `--arch` switch's own measurement
-  is the header of `arch.rs` and `docs/NOTES.md` §15.18/§13.x's per-machine sweeps.
+  is the header of `arch.rs` and `docs/notes/` §15.18/§13.x's per-machine sweeps.
 - `docs/ROADMAP.md`'s status board is the plan for what the front end still has to
   grow (for example the aarch64 `tests.toml` group and the remaining migration in
-  §15.11); `docs/NOTES.md` holds the numbers. A new command lands with a
+  §15.11); `docs/notes/` holds the numbers. A new command lands with a
   `xtask/README.md` row and, if it changes what a sweep boots, a `sweep.rs` decision —
   the same one-intent-per-commit rule as the rest of the tree.

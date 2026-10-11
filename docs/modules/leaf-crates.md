@@ -23,7 +23,7 @@ the kernel — not `vfs`, not `syscall`, not `sched`. That is what made moves li
 acquire that edge by accident, and `cargo xtask depgraph` (AGENTS.md §2, `xtask/src/depgraph.rs`)
 re-measures every `crate::` reference and fails on an unrecorded one. The reasoning
 behind each extraction, including the ones that had to be postponed and why, is the
-Phase-11 leaf-crate work in `docs/ROADMAP.md` §11.E and its evidence in `docs/NOTES.md`
+Phase-11 leaf-crate work in `docs/ROADMAP.md` §11.E and its evidence in `docs/notes/`
 §11.2 Step E.
 
 What deliberately does **not** live here:
@@ -96,7 +96,7 @@ than here.
 ## What userspace sees
 
 The leaves do not serve syscalls, but several of them own the shape a
-userspace-visible row is written in. `docs/UAPI.md` names them by crate:
+userspace-visible row is written in. `docs/uapi/` names them by crate:
 
 | Rows | Leaf | What it fixes |
 |---|---|---|
@@ -106,7 +106,7 @@ userspace-visible row is written in. `docs/UAPI.md` names them by crate:
 | the `RLIMIT_*` model | `crates/abi` | the resource rows `prlimit64` speaks |
 | every errno a row answers with | `mpos-err` | the "no" in Linux's spelling |
 
-The errno table is why every refusal in `docs/UAPI.md` has one spelling; the
+The errno table is why every refusal in `docs/uapi/` has one spelling; the
 leaf's header names the upward edges it removed.
 
 ## Pins
@@ -130,7 +130,7 @@ run, and `mpos-fdt` sat in exactly that state.
 
 ## Evidence and open work
 
-- `docs/NOTES.md` §11.2 Step E — the extraction of the leaves and the enforcement
+- `docs/notes/` §11.2 Step E — the extraction of the leaves and the enforcement
   it bought; `docs/ROADMAP.md` §11.E (including the three that followed and the
   reasons `gpu`/`evdev`/`uinput` had to wait for an injectable wake).
 - The crate headers carry the per-leaf evidence: `mpos-err` and `docs/ARCHITECTURE.md`
@@ -139,5 +139,5 @@ run, and `mpos-fdt` sat in exactly that state.
   `mpos-vm` §14 S2a/S2b.
 - Open work is the edges the leaves did *not* remove by themselves: the surviving
   `drivers ↔ vfs` pair and the rest of the Phase-11 debt audit live in
-  `docs/ARCHITECTURE.md` §9 and `docs/NOTES.md` Phase 11. A new leaf arrives with
+  `docs/ARCHITECTURE.md` §9 and `docs/notes/` Phase 11. A new leaf arrives with
   this page updated, in the commit that adds it (the rule in `docs/modules/README.md`).

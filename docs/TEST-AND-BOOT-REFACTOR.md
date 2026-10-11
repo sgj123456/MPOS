@@ -11,7 +11,7 @@
 | 3 | 修复 `FAIL t-unix` | **已修复并验证**（`=== SUMMARY pass=155 fail=0`） |
 | 4 | `main` 架构无关 | **切片 1 已落地**（hook 表实现合一，−263 行）；切片 2–4 已给出方案 |
 | 1 | no_std 用户测试 → std + rustix | 已给出范围清单、测试集合与迁移机制 |
-| 2 | xtask `run`/`test` 共用逻辑 | **已落地**（2026-10-08；形状比本节设想更彻底，见 §2.5 与 `NOTES.md` §15.7） |
+| 2 | xtask `run`/`test` 共用逻辑 | **已落地**（2026-10-08；形状比本节设想更彻底，见 §2.5 与 docs/notes/ §15.7） |
 | 5 | boot 由可执行文件改为 crate，内核成为 UEFI 存根 | 已给出改动点与依赖顺序 |
 | 6 | boot 架构无关，架构码下沉 arch crate | 已给出改动点与依赖顺序 |
 
@@ -148,7 +148,7 @@ xtask/src/sweep.rs              新文件
 | 保留两个 aarch64 判定命令 | **删除**：`cargo xtask boot-aarch64`、`alpine-aarch64` 退役，第二台机器的门禁与第一台机器同形（`build`/`disk`/`rootfs`/`all`/`run`/`test` + `--arch`），marker 链不再由命令断言 |
 | 第二台机器的安装继续走 staging 树 + `fakeroot` + `mkfs -d` | 改为与第一台机器同一路：`qemu-nbd` 挂载 + `apk add --arch aarch64 --no-scripts`（以 root 运行，所以属主天然正确，也无需 `fakeroot`） |
 
-改动清单、逐条替换关系与实测结果见 `docs/NOTES.md` §15.7；本节只在方案层面记录"为什么不按
+改动清单、逐条替换关系与实测结果见 docs/notes/ §15.7；本节只在方案层面记录"为什么不按
 原计划做"。原计划里"#1 之后形状才收敛"的判断仍然成立——用户程序迁到 std 套件后才有了今天这条
 单一路径。
 
