@@ -1179,21 +1179,21 @@ struct Task {
     /// The descriptors this task's fd numbers index. Kernel tasks share the
     /// kernel's table; a process has one of its own.
     fds: Arc<FdTable>,
-    /// The directory relative paths name things from. `None` is the root,
-    /// which is where everyone starts; the VFS is mounted long after the
-    /// first tasks exist, so the root inode cannot be grabbed up front.
-    cwd: Option<Arc<dyn crate::vfs::Inode>>,
-    /// The path `cwd` was reached by, as the caller spelled it out - what
-    /// `getcwd` reports. `None` means "never left /", which is the truth for
-    /// every task that has not asked to be anywhere else.
-    cwd_path: Option<alloc::string::String>,
-    /// The directory this task's absolute paths begin at - the root it sees,
-    /// not the machine's. `None` is the machine root, which is where every task
-    /// starts; `chroot(2)` sets it, and `fork`/`clone` hand it on by reference so
-    /// a chrooted pid 1 re-homes the whole userspace tree by inheritance rather
-    /// than by moving the machine's root. This is what keeps an unprivileged
-    /// `chroot` inside its caller.
-    root: Option<Arc<dyn crate::vfs::Inode>>,
+    /// The process's filesystem context: the root absolute paths begin at, the
+    /// cwd, the path that cwd was reached by, and the file-creation mask -
+    /// Linux's `fs_struct`, and the one object `CLONE_FS` shares and
+    /// `unshare(CLONE_FS)` splits.
+    ///
+    /// It is one `Arc` rather than four copied fields, and the sharing is the
+    /// point rather than a tidy-up: with the four facts copied into a thread, a
+    /// thread's `chdir` moved only that thread, where Linux's moves its whole
+    /// process. Measured on a current host (7.2.9): a thread that `chdir`s to
+    /// `/tmp` takes the creating thread's own `getcwd` with it, and only
+    /// `unshare(CLONE_FS)` splits the two (`.workbuddy/probe_unshare_flags.c`).
+    /// `crate::sched::fs` holds the object and the rule; this field is whose it
+    /// is. The mount namespace is *not* in here - Linux keeps `fs_struct` and
+    /// `nsproxy` apart, and so does the `fs_ns` slot below.
+    fs: Arc<crate::sched::FsStruct>,
     /// The mount table this task resolves through - its namespace, in Linux's
     /// `nsproxy->mnt_ns`. `None` is the machine's one table (`vfs::mount::global`),
     /// which is where every task starts and what every boot step means;
@@ -1246,14 +1246,6 @@ struct Task {
     /// a parent renamed itself after a `fork`. `src/uts.rs` holds the object and
     /// the rule; this field is only whose it is.
     uts: Arc<crate::uts::Uts>,
-    /// The file-creation mask, `0o022` until something calls `umask`.
-    ///
-    /// It belongs to the process and not to the machine: a shell sets its own
-    /// and every program it starts inherits that, while a program that sets a
-    /// restrictive mask must not narrow what its neighbours may create. It is
-    /// applied by masking the mode at every create, which is the only place
-    /// it is ever read.
-    umask: u32,
     /// The OOM-killer's score adjustment and the floor of it: the two numbers
     /// Linux keeps as `sig->oom_score_adj` and `sig->oom_score_adj_min`, and
     /// which `/proc/<pid>/oom_score_adj` reads and writes.
@@ -1544,9 +1536,7 @@ impl Task {
             dispositions: signal::Actions::default(),
             alt_stack: None,
             fds: crate::vfs::file::kernel_fds(),
-            cwd: None,
-            cwd_path: None,
-            root: None,
+            fs: crate::sched::FsStruct::new(crate::abi::DEFAULT_UMASK),
             fs_ns: None,
             parent: None,
             pgid: TaskId(0),
@@ -1563,7 +1553,6 @@ impl Task {
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
-            umask: crate::abi::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
             nice: 0,
@@ -2066,9 +2055,7 @@ impl Table {
             dispositions: signal::Actions::default(),
             alt_stack: None,
             fds: crate::vfs::file::kernel_fds(),
-            cwd: None,
-            cwd_path: None,
-            root: None,
+            fs: crate::sched::FsStruct::new(crate::abi::DEFAULT_UMASK),
             fs_ns: None,
             parent: None,
             pgid: TaskId(0),
@@ -2085,7 +2072,6 @@ impl Table {
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
-            umask: crate::abi::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
             nice: 0,
@@ -2531,9 +2517,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             dispositions: signal::Actions::default(),
             alt_stack: None,
             fds: Arc::new(FdTable::with_standard(crate::vfs::tty::global())),
-            cwd: None,
-            cwd_path: None,
-            root: None,
+            fs: crate::sched::FsStruct::new(crate::abi::DEFAULT_UMASK),
             fs_ns: None,
             parent: None,
             // init leads the first process group, so a command started
@@ -2555,7 +2539,6 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
-            umask: crate::abi::DEFAULT_UMASK,
             oom_score_adj: 0,
             oom_score_adj_min: 0,
             nice: 0,
@@ -2692,9 +2675,10 @@ pub fn try_spawn_user(
             dispositions: signal::Actions::default(),
             alt_stack: None,
             fds,
-            cwd: t.task(parent).cwd.clone(),
-            cwd_path: t.task(parent).cwd_path.clone(),
-            root: t.task(parent).root.clone(),
+            // A new program, not a thread: it gets its own handle copied from
+            // the starter's, so what it `chdir`s to does not move the process
+            // that launched it.
+            fs: t.task(parent).fs.copy(),
             fs_ns: t.task(parent).fs_ns.clone(),
             parent: Some(parent),
             pgid: t.task(parent).pgid,
@@ -2705,7 +2689,6 @@ pub fn try_spawn_user(
             // namespace of whatever started it until it unshares, which is the
             // rule `fork` follows for the same reason.
             uts: Arc::clone(&t.task(parent).uts),
-            umask: t.task(parent).umask,
             oom_score_adj: t.task(parent).oom_score_adj,
             oom_score_adj_min: t.task(parent).oom_score_adj_min,
             nice: t.task(parent).nice,
@@ -3556,16 +3539,19 @@ pub fn has_children(parent: TaskId) -> bool {
 /// The directory relative paths this task names things from, or the root
 /// when it has never asked to be anywhere else.
 pub fn current_cwd() -> Arc<dyn crate::vfs::Inode> {
-    with_table(|t| match &t.task(t.current).cwd {
-        Some(dir) => dir.clone(),
+    with_table(|t| match t.task(t.current).fs.cwd() {
+        Some(dir) => dir,
         None => crate::vfs::global().root_inode(),
     })
 }
 
 /// Move the running task's cwd to `dir`. Checked to be a directory by the
-/// caller; this only remembers.
+/// caller; this only remembers. The move lands on the process's shared
+/// [`crate::sched::FsStruct`], so a thread that `chdir`s moves its whole
+/// process - which is Linux's answer (`CLONE_FS` shares `fs_struct`) and what
+/// `unshare(CLONE_FS)` is for when it is not wanted.
 pub fn set_cwd(dir: Arc<dyn crate::vfs::Inode>) {
-    with_table(|t| t.task_mut(t.current).cwd = Some(dir));
+    with_table(|t| t.task(t.current).fs.set_cwd(dir));
 }
 
 /// The directory this task's absolute paths begin at - the root `chroot(2)`
@@ -3573,17 +3559,19 @@ pub fn set_cwd(dir: Arc<dyn crate::vfs::Inode>) {
 /// is what lets a task exist before the VFS is mounted, exactly as `current_cwd`
 /// does.
 pub fn current_root() -> Arc<dyn crate::vfs::Inode> {
-    with_table(|t| match &t.task(t.current).root {
-        Some(dir) => dir.clone(),
+    with_table(|t| match t.task(t.current).fs.root() {
+        Some(dir) => dir,
         None => crate::vfs::global().root_inode(),
     })
 }
 
 /// Re-home the running task: make `dir` the root its absolute paths begin at.
 /// Checked to be a directory by the caller; this only remembers. The machine's
-/// own root is left standing - this is a per-process view, not a namespace.
+/// own root is left standing - this is a per-process view, not a namespace -
+/// and it lands on the process's shared [`crate::sched::FsStruct`], so a thread
+/// that `chroot`s re-homes its process, as Linux's does.
 pub fn set_root(dir: Arc<dyn crate::vfs::Inode>) {
-    with_table(|t| t.task_mut(t.current).root = Some(dir));
+    with_table(|t| t.task(t.current).fs.set_root(dir));
 }
 
 /// The running task's mount context: the table its paths resolve through and
@@ -3601,7 +3589,7 @@ pub fn current_fs_context() -> (
 ) {
     with_table(|t| {
         let task = t.task(t.current);
-        (task.fs_ns.clone(), task.root.clone())
+        (task.fs_ns.clone(), task.fs.root())
     })
 }
 
@@ -3627,8 +3615,8 @@ pub fn unshare_mnt() {
 pub fn current_cwd_path() -> alloc::string::String {
     with_table(|t| {
         t.task(t.current)
-            .cwd_path
-            .clone()
+            .fs
+            .cwd_path()
             .unwrap_or_else(|| alloc::string::String::from("/"))
     })
 }
@@ -3636,7 +3624,7 @@ pub fn current_cwd_path() -> alloc::string::String {
 /// Remember the path the running task's cwd was reached by. The caller
 /// normalizes it; this only stores.
 pub fn set_cwd_path(path: alloc::string::String) {
-    with_table(|t| t.task_mut(t.current).cwd_path = Some(path));
+    with_table(|t| t.task(t.current).fs.set_cwd_path(path));
 }
 
 /// The task `id` was spawned by, when it has one in ring 3. This is what
@@ -3967,13 +3955,14 @@ pub fn set_current_identity(identity: Identity) {
 /// The running task's file-creation mask - what `umask(2)` reports, and what
 /// every create masks the mode it was given with.
 pub fn current_umask() -> u32 {
-    with_table(|t| t.task(t.current).umask)
+    with_table(|t| t.task(t.current).fs.umask())
 }
 
 /// Store the running task's file-creation mask. The syscall layer has already
-/// narrowed it to the twelve bits a mode can hold.
+/// narrowed it to the twelve bits a mode can hold. It lands on the process's
+/// shared [`crate::sched::FsStruct`], so a thread's `umask` is its process's.
 pub fn set_current_umask(mask: u32) {
-    with_table(|t| t.task_mut(t.current).umask = mask);
+    with_table(|t| t.task(t.current).fs.set_umask(mask));
 }
 
 /// The OOM score adjustment of `pid` and the floor of it, as
@@ -4191,8 +4180,8 @@ pub fn setns_mnt(table: Arc<crate::vfs::mount::MountTable>) {
         let me = t.current;
         let root = table.ns_root();
         t.task_mut(me).fs_ns = Some(table);
-        if root.is_some() {
-            t.task_mut(me).root = root;
+        if let Some(root) = root {
+            t.task(me).fs.set_root(root);
         }
     });
 }
@@ -6361,8 +6350,8 @@ fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         argv: alloc::sync::Arc::clone(&task.argv),
         env: alloc::sync::Arc::clone(&task.env),
         cwd: task
-            .cwd_path
-            .clone()
+            .fs
+            .cwd_path()
             .unwrap_or_else(|| alloc::string::String::from("/")),
         threads: task.mm.live.load(core::sync::atomic::Ordering::Relaxed),
         rss_pages,
@@ -7699,9 +7688,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         parent_has_space,
         parent_priority,
         parent_fds,
-        parent_cwd,
-        parent_cwd_path,
-        parent_root,
+        parent_fs,
         parent_exe,
         parent_argv,
         parent_env,
@@ -7718,9 +7705,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         let parent_has_space = parent.space.is_some();
         let parent_priority = parent.priority;
         let parent_fds = Arc::clone(&parent.fds);
-        let parent_cwd = parent.cwd.clone();
-        let parent_cwd_path = parent.cwd_path.clone();
-        let parent_root = parent.root.clone();
+        let parent_fs = Arc::clone(&parent.fs);
         let parent_exe = parent.exe.clone();
         let parent_argv = alloc::sync::Arc::clone(&parent.argv);
         let parent_env = alloc::sync::Arc::clone(&parent.env);
@@ -7754,9 +7739,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             parent_has_space,
             parent_priority,
             parent_fds,
-            parent_cwd,
-            parent_cwd_path,
-            parent_root,
+            parent_fs,
             parent_exe,
             parent_argv,
             parent_env,
@@ -7916,10 +7899,25 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             blocked: t.task(parent_id).blocked,
             dispositions: signal::Actions::default(),
             alt_stack: None,
-            fds: Arc::new(parent_fds.duplicate()),
-            cwd: parent_cwd,
-            cwd_path: parent_cwd_path,
-            root: parent_root,
+            // The descriptors are the parent's *numbering* copied - both
+            // processes share the open file descriptions but closing a number
+            // on one side must not close it on the other - unless the caller
+            // asked to keep sharing them, which is `CLONE_FILES` and what a
+            // thread gets. Linux's `copy_files`/`copy_fd`.
+            fds: if request.flags & crate::abi::CLONE_FILES != 0 {
+                Arc::clone(&parent_fds)
+            } else {
+                Arc::new(parent_fds.duplicate())
+            },
+            // `CLONE_FS` keeps the process's filesystem context, so a thread
+            // that `chdir`s moves its process; without it the child gets a copy
+            // of its own, which is a plain `fork` and every `clone` that did not
+            // name the flag. Linux's `copy_fs_struct` on exactly that bit.
+            fs: if request.flags & crate::abi::CLONE_FS != 0 {
+                Arc::clone(&parent_fs)
+            } else {
+                parent_fs.copy()
+            },
             // The same mount table as its parent, by reference — see the `uts`
             // line below: a copy here would give `fork` the effect `unshare` is
             // for. A child that wants its own namespace asks for it explicitly.
@@ -7967,7 +7965,6 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             } else {
                 Arc::clone(&t.task(parent_id).uts)
             },
-            umask: t.task(parent_id).umask,
             oom_score_adj: t.task(parent_id).oom_score_adj,
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
             nice: t.task(parent_id).nice,
@@ -8473,7 +8470,15 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         let parent_id = t.current;
         let parent = t.task(parent_id);
         let mm = parent.mm.clone();
-        let fds = parent.fds.clone();
+        // A thread shares its process's descriptor *table* under `CLONE_FILES`
+        // - which is what a libc's thread creation asks for, and the whole
+        // reason `close` in one thread is visible to its siblings - and gets a
+        // private copy without it, exactly as Linux's `copy_files` decides.
+        let fds = if request.flags & crate::abi::CLONE_FILES != 0 {
+            alloc::sync::Arc::clone(&parent.fds)
+        } else {
+            alloc::sync::Arc::new(parent.fds.duplicate())
+        };
         let tgid = parent.tgid;
         let pgid = parent.pgid;
         let session = parent.session;
@@ -8484,7 +8489,15 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         // the creator's `nsproxy` - so a thread that unshared would split from
         // its own process, which is not what a thread is.
         let uts = alloc::sync::Arc::clone(&parent.uts);
-        let umask = parent.umask;
+        // `CLONE_FS` is what every `pthread_create` sets: a thread that
+        // `chdir`s moves its process, which is Linux's answer (measured -
+        // `.workbuddy/probe_unshare_flags.c`). A raw `clone(CLONE_THREAD)`
+        // that did not name it gets a handle of its own.
+        let fs = if request.flags & crate::abi::CLONE_FS != 0 {
+            alloc::sync::Arc::clone(&parent.fs)
+        } else {
+            parent.fs.copy()
+        };
         let oom_score_adj = parent.oom_score_adj;
         let oom_score_adj_min = parent.oom_score_adj_min;
         let nice = parent.nice;
@@ -8500,9 +8513,6 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         // thread that started unblocked would take the timer's signal as a
         // fatal default action instead of waiting for it.
         let blocked = parent.blocked;
-        let cwd = parent.cwd.clone();
-        let cwd_path = parent.cwd_path.clone();
-        let root = parent.root.clone();
         let parent_fs_ns = parent.fs_ns.clone();
         let brk_base = parent.brk_base;
         let brk_pages = parent.brk_pages;
@@ -8570,9 +8580,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             dispositions,
             alt_stack: None,
             fds,
-            cwd,
-            cwd_path,
-            root,
+            fs,
             // A thread is its process: the group's mount table is shared by all
             // of its tasks, so this is the creator's slot value, by reference —
             // Linux's `clone(CLONE_FS)` is what every thread creation sets here,
@@ -8587,11 +8595,11 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             // terminal its creator's group holds.
             session,
             ctty,
-            // ...and the same identity, group and user words alike, and the
-            // same creation mask - a thread creates files as its process does.
+            // ...and the same identity, group and user words alike. The
+            // creation mask comes with the `fs` handle above - the same one
+            // under `CLONE_FS`, a copy without it.
             identity,
             uts,
-            umask,
             oom_score_adj,
             oom_score_adj_min,
             nice,

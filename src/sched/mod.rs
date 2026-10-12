@@ -6,6 +6,7 @@
 //! `arch::context` to move between them.
 
 pub mod exit;
+pub mod fs;
 pub mod futex;
 pub mod policy;
 pub mod signal;
@@ -19,6 +20,7 @@ mod runtime;
 #[cfg(all(target_os = "none", feature = "selftest"))]
 pub mod kunit;
 
+pub use fs::FsStruct;
 pub use policy::{ARGS_BYTES_MAX, ARGV_MAX, Priority, TaskId};
 /// How many tasks are alive forever, which is what [`kunit`]'s wait-for-the-other
 /// tasks helper compares against.
