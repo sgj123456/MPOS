@@ -295,6 +295,74 @@ impl Core {
         });
     }
 
+    /// Read `run` **contiguous device blocks** beginning at `block` into `dst`,
+    /// whose first `block_size - in_block` bytes are the tail of the first block.
+    ///
+    /// One device call when the device allows a run that wide (§10.5: the read
+    /// path's own copies are why this exists - `read_bytes` per block is one
+    /// device command per 4 KiB, and a 64 MiB sequential read is 16384 of them).
+    /// Every block of the run is left **resident in the cache**, which is what
+    /// makes the caller's next request for one of them a hit rather than a
+    /// second read: the run is the caller's own demand, so nothing is fetched
+    /// that was not asked for.
+    fn read_run(&self, block: u64, run: usize, in_block: usize, dst: &mut [u8]) {
+        let block_size = self.block_size();
+        critical_section::with(|cs| {
+            let mut cache = self.cache.borrow(cs).borrow_mut();
+            let head = (block_size - in_block).min(dst.len());
+            {
+                let page = cache.slot_run(&*self.dev, block, run, block_size);
+                dst[..head].copy_from_slice(&page[in_block..in_block + head]);
+            }
+            // The rest of the run is resident already, so these are hits; the
+            // borrow above ends first because a slot's slice may not outlive the
+            // cache call that follows it.
+            let mut at = head;
+            for i in 1..run {
+                if at >= dst.len() {
+                    break;
+                }
+                let take = block_size.min(dst.len() - at);
+                let page = cache.slot(&*self.dev, block + i as u64, block_size);
+                dst[at..at + take].copy_from_slice(&page[..take]);
+                at += take;
+            }
+        });
+    }
+
+    /// How far the **contiguous device run** beginning at `logical` goes, up to
+    /// `cap` blocks. A walk of the extent tree in memory - `bmap_lookup` per
+    /// block, no device read - so it is the *mapping* that decides whether a run
+    /// is worth one call, and a hole or a jump to a different physical block ends
+    /// it. A run of one is the answer for a file stored in scattered blocks, and
+    /// the caller then behaves exactly as it did before this existed.
+    fn contiguous_run(&self, data: &InodeData, logical: u64, cap: usize) -> usize {
+        let Some(first) = self.bmap_lookup(data, logical) else {
+            return 0;
+        };
+        let mut run = 1;
+        while run < cap {
+            match self.bmap_lookup(data, logical + run as u64) {
+                Some(next) if next == first + run as u64 => run += 1,
+                _ => break,
+            }
+        }
+        run
+    }
+
+    /// The widest run this filesystem's device will load in one call - asked
+    /// through the cache, because the bound is the device's own
+    /// [`crate::blk::BlockDev::max_transfer`] clamped by the cache's scratch.
+    fn run_width(&self) -> usize {
+        let block_size = self.block_size();
+        critical_section::with(|cs| {
+            self.cache
+                .borrow(cs)
+                .borrow()
+                .run_width(&*self.dev, usize::MAX, block_size)
+        })
+    }
+
     /// Run `f` over a cached block; write back through the device only if `f`
     /// reports a modification. Write-through in one step: the disk never
     /// trails the cache.
@@ -1162,18 +1230,38 @@ impl Inode for Ext4Ino {
         }
         let mut done = 0;
         let mut pos = offset;
+        // How wide a run this device will load in one call - asked once, since
+        // it depends on the device and the block size and not on where the read
+        // is. `1` is a device that answers the page default, and then every
+        // branch below is the per-block read this loop has always been.
+        let width = self.fs.run_width();
         while pos < end {
             let logical = pos / block_size;
             let in_block = (pos % block_size) as usize;
             let n = ((end - pos) as usize).min(block_size as usize - in_block);
             match self.fs.bmap_lookup(&data, logical) {
-                Some(block) => self
-                    .fs
-                    .read_bytes(block, in_block, &mut buf[done..done + n]),
-                None => buf[done..done + n].fill(0),
+                Some(block) => {
+                    // The demand run: how many blocks this *request* still wants,
+                    // and how far they are contiguous on the device. A read of
+                    // one block asks for one block and gains nothing, which is
+                    // the point - the width is the caller's, not a prefetch's.
+                    let want = ((end - pos) as usize)
+                        .div_ceil(block_size as usize)
+                        .max(1)
+                        .min(width);
+                    let run = self.fs.contiguous_run(&data, logical, want);
+                    let take = (run * block_size as usize - in_block).min((end - pos) as usize);
+                    self.fs
+                        .read_run(block, run, in_block, &mut buf[done..done + take]);
+                    done += take;
+                    pos += take as u64;
+                }
+                None => {
+                    buf[done..done + n].fill(0);
+                    done += n;
+                    pos += n as u64;
+                }
             }
-            done += n;
-            pos += n as u64;
         }
         // `relatime` - Linux's default, and the only shape of "update the
         // access time on read" that is not a device write per read. The access

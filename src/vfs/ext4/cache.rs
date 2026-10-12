@@ -47,6 +47,16 @@ pub(crate) const CACHE_SLOTS: usize = CACHE_SETS * CACHE_WAYS;
 
 pub(crate) const NO_BLOCK: u64 = u64::MAX;
 
+/// The most blocks one run fetch may cover, and so the width of the scratch
+/// buffer a run needs: 16 × 4 KiB = **64 KiB**, allocated once per mount when a
+/// run first asks for it (§10's rule-4 discipline - the caller steers neither the
+/// count nor the width, and the buffer is the cache's, not the request's).
+///
+/// Sixteen is also what the device's own figure usually allows: `src/drivers/ahci.rs`
+/// answers `max_transfer` = 128 KiB, so this is the tighter of the two bounds
+/// there, while a driver at the default (`PAGE_SIZE`) never reaches it.
+pub(crate) const RUN_BLOCKS: usize = 16;
+
 pub(crate) struct Slot {
     block: u64,
     /// The buffer, empty until this slot is first used. A slot that has never
@@ -65,6 +75,10 @@ pub(crate) struct Cache {
     /// The access counter the `stamp`s are drawn from. Wrapping is fine and
     /// unreachable: it would take 2^64 block accesses to revisit a value.
     clock: u64,
+    /// Where a wide run lands before it is scattered into slots, so one device
+    /// call can serve [`Cache::slot_run`]. Empty until the first run; then
+    /// `RUN_BLOCKS * block_size` at most.
+    run: Vec<u8>,
 }
 
 impl Cache {
@@ -78,6 +92,7 @@ impl Cache {
                 })
                 .collect(),
             clock: 0,
+            run: Vec::new(),
         }
     }
 
@@ -87,18 +102,14 @@ impl Cache {
     pub(crate) fn slot(&mut self, dev: &dyn BlockDev, block: u64, block_size: usize) -> &mut [u8] {
         self.clock = self.clock.wrapping_add(1);
         let stamp = self.clock;
-        let base = (block % CACHE_SETS as u64) as usize * CACHE_WAYS;
-
-        for way in 0..CACHE_WAYS {
-            let slot = &mut self.slots[base + way];
-            if slot.block == block {
-                // A hit still has to be dated, or "least recently used" would
-                // be "first loaded" and the hot block would lose to a scan.
-                slot.stamp = stamp;
-                return &mut slot.bytes;
-            }
+        if let Some(at) = self.resident(block) {
+            // A hit still has to be dated, or "least recently used" would be
+            // "first loaded" and the hot block would lose to a scan.
+            self.slots[at].stamp = stamp;
+            return &mut self.slots[at].bytes;
         }
 
+        let base = (block % CACHE_SETS as u64) as usize * CACHE_WAYS;
         let at = self.victim(base);
         let slot = &mut self.slots[at];
         if slot.bytes.len() != block_size {
@@ -110,6 +121,96 @@ impl Cache {
         slot.block = block;
         slot.stamp = stamp;
         &mut slot.bytes
+    }
+
+    /// [`Cache::slot`] for a caller that knows it is reading **onward**: the
+    /// block, and up to `want` consecutive device blocks with it, in one device
+    /// call.
+    ///
+    /// This is a *demand* run and not a readahead, and the distinction is the
+    /// whole design. `want` is what the caller's own request is about to touch -
+    /// `ext4`'s file-read loop counts the run of contiguous blocks its extent
+    /// lookup just found - so a random read of one block asks for one block and
+    /// pays nothing for the privilege. A readahead *past* the request is the
+    /// other design (Linux's `file_ra_state`, with sequential detection and a
+    /// growing window); it is not this one because the cost it adds - device
+    /// reads a random pattern never wanted - is invisible to §10.5's instrument,
+    /// which measures one sequential pass.
+    ///
+    /// A hit returns at once and ignores `want`: a run already resident must not
+    /// re-read anything, which is also what makes it safe for the *second* block
+    /// of a run to ask again with a shorter `want`.
+    ///
+    /// The width is bounded twice and neither bound is the caller's to steer:
+    /// the device's [`BlockDev::max_transfer`] (its promise that the run is one
+    /// command) and [`RUN_BLOCKS`].
+    pub(crate) fn slot_run(
+        &mut self,
+        dev: &dyn BlockDev,
+        block: u64,
+        want: usize,
+        block_size: usize,
+    ) -> &mut [u8] {
+        if self.resident(block).is_some() {
+            return self.slot(dev, block, block_size);
+        }
+        let width = self.run_width(dev, want, block_size);
+        if width == 1 {
+            return self.slot(dev, block, block_size);
+        }
+
+        // The run lands in the scratch first, because one device call is the
+        // point and the slots are separately allocated.
+        let need = width * block_size;
+        if self.run.len() < need {
+            self.run = vec![0; need];
+        }
+        dev.read_at(block * block_size as u64, &mut self.run[..need]);
+
+        self.clock = self.clock.wrapping_add(1);
+        let stamp = self.clock;
+        // Where each block of the run goes, decided before anything moves: the
+        // run's blocks are *consecutive*, so they land in consecutive sets and
+        // no two of them can choose the same way - which is what lets this be a
+        // decision and not a search.
+        let mut places = [0usize; RUN_BLOCKS];
+        for (i, place) in places[..width].iter_mut().enumerate() {
+            let at = block + i as u64;
+            *place = match self.resident(at) {
+                Some(at) => at,
+                None => self.victim((at % CACHE_SETS as u64) as usize * CACHE_WAYS),
+            };
+        }
+        for (i, &at) in places[..width].iter().enumerate() {
+            let slot = &mut self.slots[at];
+            if slot.bytes.len() != block_size {
+                slot.bytes = vec![0; block_size];
+            }
+            slot.bytes
+                .copy_from_slice(&self.run[i * block_size..(i + 1) * block_size]);
+            slot.block = block + i as u64;
+            // The block that was asked for is the most recent; the run's tail is
+            // older by its distance from it, so an eviction takes the tail first.
+            slot.stamp = stamp.saturating_sub(i as u64);
+        }
+        &mut self.slots[places[0]].bytes
+    }
+
+    /// How many blocks a run from `block` may cover: the caller's demand,
+    /// clamped by what the device moves in one transfer and by [`RUN_BLOCKS`].
+    /// Public to the filesystem because the read loop asks the *same* question
+    /// before it decides how far to look ahead - a run longer than this would be
+    /// loaded in pieces, and the loop would rather ask once for the width it will
+    /// actually get.
+    pub(crate) fn run_width(&self, dev: &dyn BlockDev, want: usize, block_size: usize) -> usize {
+        let by_device = (dev.max_transfer() / block_size).max(1);
+        want.max(1).min(by_device).min(RUN_BLOCKS)
+    }
+
+    /// The way of `block`'s set that already holds it, if any.
+    fn resident(&self, block: u64) -> Option<usize> {
+        let base = (block % CACHE_SETS as u64) as usize * CACHE_WAYS;
+        (base..base + CACHE_WAYS).find(|&at| self.slots[at].block == block)
     }
 
     /// Which way of this set loses its block: one that has never held one, or
@@ -175,14 +276,29 @@ mod tests {
             self.reads.len() as u64 * (BLOCK as u64 / 512)
         }
 
+        /// A mock that genuinely serves a wide buffer - it fills every byte of
+        /// one - so it may honestly claim a run. `16 * BLOCK` is what the real
+        /// width turns out to be (`RUN_BLOCKS`, and the AHCI disk's 128 KiB is
+        /// the looser of the two bounds), which is what lets the run's own test
+        /// below ask for the width rather than hard-code one.
+        fn max_transfer(&self) -> usize {
+            RUN_BLOCKS * BLOCK
+        }
+
         fn read_at(&self, offset: u64, buf: &mut [u8]) {
-            let block = offset / BLOCK as u64;
-            self.reads[block as usize].fetch_add(1, Ordering::Relaxed);
+            let first = offset / BLOCK as u64;
+            // **Every block the call covers** is counted, not just the one at the
+            // offset: a call that moves a run transfers each of its blocks once,
+            // and the per-block counters are what the tests read.
             self.total.fetch_add(1, Ordering::Relaxed);
+            for i in 0..buf.len().div_ceil(BLOCK) {
+                self.reads[(first + i as u64) as usize].fetch_add(1, Ordering::Relaxed);
+            }
             // Every byte of the block is derived from its number, so a slot
             // holding the wrong block cannot pass by luck.
             for (i, byte) in buf.iter_mut().enumerate() {
-                *byte = (block as u8) ^ (i as u8);
+                let block = first + (i / BLOCK) as u64;
+                *byte = (block as u8) ^ ((i % BLOCK) as u8);
             }
         }
 
@@ -266,6 +382,87 @@ mod tests {
             dev.reads_of(HOT),
         );
         assert_eq!(dev.total(), 2048 + dev.reads_of(HOT));
+    }
+
+    /// A sequential scan through **runs**: one device call per run of
+    /// contiguous blocks, and every block still transferred exactly once.
+    ///
+    /// This is §10.5's change in the cache's own terms, and it is the
+    /// regression pin for the two ways it could be wrong: a run that was one call
+    /// but lost its tail would show as a block transferred twice (the second
+    /// `slot_run` would miss), and a run that re-read what it already held would
+    /// show as more calls than the scan has runs.
+    #[test]
+    fn a_sequential_scan_through_runs_costs_one_call_per_run() {
+        let (mut cache, dev) = cache_and_device(8192);
+        let width = cache.run_width(&dev, usize::MAX, BLOCK);
+        assert!(width > 1, "a run of one is not a run: width {width}");
+        for block in 0..2048u64 {
+            cache.slot_run(&dev, block, width, BLOCK);
+        }
+        assert_eq!(
+            dev.total(),
+            (2048 / width) as u64,
+            "a 2048-block scan through runs of {width}",
+        );
+        for block in 0..2048u64 {
+            assert_eq!(
+                dev.reads_of(block),
+                1,
+                "block {block} was transferred {} times",
+                dev.reads_of(block),
+            );
+        }
+    }
+
+    /// A run's blocks are resident and hold **their own** bytes - the run is
+    /// scattered into per-block slots, so a copy that shifted by one would read
+    /// as content rather than as slowness.
+    #[test]
+    fn every_block_of_a_run_holds_its_own_bytes() {
+        let (mut cache, dev) = cache_and_device(8192);
+        let width = cache.run_width(&dev, usize::MAX, BLOCK);
+        cache.slot_run(&dev, 100, width, BLOCK);
+        assert_eq!(dev.total(), 1, "the run itself");
+        for i in 0..width as u64 {
+            let want: Vec<u8> = (0..BLOCK).map(|b| ((100 + i) as u8) ^ (b as u8)).collect();
+            assert_eq!(
+                cache.slot(&dev, 100 + i, BLOCK),
+                &want[..],
+                "block {} after the run",
+                100 + i,
+            );
+        }
+        assert_eq!(dev.total(), 1, "the run was re-read through its slots");
+    }
+
+    /// A **demand** run is not a prefetch: asking for one block loads one block.
+    /// This is the whole reason the width comes from the caller and not from a
+    /// heuristic - a random read must not drag a run of its neighbours in, and
+    /// the instrument §10.5 measures could not see that cost.
+    #[test]
+    fn asking_for_one_block_loads_one_block() {
+        let (mut cache, dev) = cache_and_device(8192);
+        cache.slot_run(&dev, 500, 1, BLOCK);
+        assert_eq!(dev.total(), 1, "a one-block demand");
+        assert_eq!(dev.reads_of(500), 1);
+        assert_eq!(dev.reads_of(501), 0, "a neighbour was loaded unasked");
+    }
+
+    /// A one-block **demand** is one block read, whatever the device could move:
+    /// `run_width` answers the caller's own figure when it is the smaller one, so
+    /// a random read of a block does not drag its neighbours in. (The device's
+    /// *default* - a driver that answers no `max_transfer` at all - is pinned
+    /// where the default lives, in `crates/blk`.)
+    #[test]
+    fn a_one_block_demand_never_forms_a_run() {
+        let (mut cache, dev) = cache_and_device(8192);
+        assert_eq!(cache.run_width(&dev, 1, BLOCK), 1);
+        for block in 0..8u64 {
+            cache.slot_run(&dev, block, 1, BLOCK);
+        }
+        assert_eq!(dev.total(), 8, "eight one-block demands");
+        assert_eq!(dev.reads_of(0), 1);
     }
 
     /// The ways have to be chosen, not guessed at: with four blocks of a set

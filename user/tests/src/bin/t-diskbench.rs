@@ -18,12 +18,18 @@
 //! the machine). The claims are exact where the layout is known and bounded
 //! elsewhere:
 //!
-//! * the **cold** pass over the 64 MiB `pattern.bin` reads at least the file's
-//!   own blocks from the device — 64 MiB is 16384 4-KiB blocks, past the
+//! * the **cold** pass over the 64 MiB `pattern.bin` reads the file's own blocks
+//!   from the device **in runs** — 64 MiB is 16384 4-KiB blocks, past the
 //!   cache's 2048 slots by eightfold, so every block misses whatever the policy
-//!   does;
-//! * the cold pass over the 4 MiB `cached.bin` reads *its* blocks too — it is
-//!   half of the cache, so they fit, and that is the point of the second file;
+//!   does, and since §10.5's wide transfer the misses come back a run of blocks
+//!   at a time: **1027 calls** (16384/16 plus the three metadata reads) where one
+//!   block per call would be 16384. The claim is the shape (`cold <` the block
+//!   count) and the *exact* figure is printed, because the width is the device's
+//!   to promise and the harness's only interest is that a run happened and no
+//!   block was read twice;
+//! * the cold pass over the 4 MiB `cached.bin` reads *its* blocks too, in runs —
+//!   it is half of the cache, so they fit, and that is the point of the second
+//!   file;
 //! * the **warm** pass over `cached.bin` reads *nothing more*: every block of a
 //!   file that fits is still cached, which is the claim that fails if the cache
 //!   forgets between passes. **It is a second file and not the first for a
@@ -240,9 +246,25 @@ fn main() {
     let cold = sda_reads(&rows)
         .map(|n| n.saturating_sub(base))
         .unwrap_or(0);
+    // **In runs**: §10.5's wide transfer, measured. The counter counts *calls*,
+    // so a pass that read one block per call would report the file's block count
+    // here (16384) - and the claim is that it does not. The exact figure is
+    // reported beside the verdict rather than asserted, because how wide a run
+    // this device serves is the kernel's business: what the harness pins is the
+    // *shape*, that the file's blocks reach the device in runs and no block is
+    // read twice (a call cannot cover fewer than one block, so `cold <= blocks`).
     r.check(
-        "the cold pass reached the device for the file's blocks",
-        cold >= PATTERN_BYTES / BLOCK,
+        "the cold pass reached the device for the file's blocks, in runs",
+        cold > 0 && cold < PATTERN_BYTES / BLOCK,
+    );
+    // ...and the runs are *wide*, not merely wider than one: at least eight
+    // blocks per call on average. The bound is the test's own and stated as such
+    // - the measured figure is two blocks clear of it on each side (a 16-block
+    // run gives `16384/16 + 3`, and a run of one gives `16384`) - so it pins the
+    // order of magnitude without pinning the kernel's constant.
+    r.check(
+        "and in runs of at least eight blocks each",
+        cold <= PATTERN_BYTES / BLOCK / 8,
     );
     drop(fd);
 
@@ -282,8 +304,8 @@ fn main() {
         .map(|n| n.saturating_sub(small_base))
         .unwrap_or(0);
     r.check(
-        "and its blocks came off the device, because they fit the cache only now",
-        small_cold >= CACHED_BYTES / BLOCK,
+        "and its blocks came off the device in runs, because they fit the cache only now",
+        small_cold > 0 && small_cold < CACHED_BYTES / BLOCK,
     );
 
     // ---- Warm pass: the cache must keep every block it just loaded ----

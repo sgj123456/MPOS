@@ -413,7 +413,8 @@ only the read side is being tuned.
 | Change | Where | State |
 |---|---|---|
 | Set-associative cache with victim selection | `vfs/ext4/cache.rs` | **done** |
-| Sequential readahead past the block being asked for | `vfs/ext4/` | not done |
+| A **demand run** past the block being asked for, in one device call | `vfs/ext4/cache.rs`, `crates/blk`, `drivers/ahci.rs` | **done, measured** (below) |
+| virtio-blk's half of the same: a physically-contiguous bounce, then a wide `max_transfer` | `drivers/virtio/blk.rs` | not done — named below |
 | virtio-blk interrupt-driven completions and multi-request pipelining | `drivers/virtio/blk.rs` | not done |
 | A SATA probe that ends in an answer instead of a budget | `drivers/ahci.rs`, `crates/ahci` | **done, measured** |
 
@@ -644,6 +645,66 @@ size each driver really serves in one command) is what has an instrument, and it
 is a change to the block contract plus `vfs/ext4/cache.rs`'s fetch — not
 readahead alone. Recorded here so that the next reader does not implement
 readahead for a number it cannot produce.
+
+**What was implemented on top of that, and what it measured.** The item is a
+*demand run*. `crates/blk`'s trait gained `max_transfer()` — the width a device
+moves in **one transfer**, defaulting to `PAGE_SIZE` so a driver that says nothing
+keeps the old contract (and both wrappers a mounted filesystem stands behind,
+`Window` and `Counted`, forward it, which the first run of this change proved is
+not a formality). `AhciDisk` answers its `MAX_TRANSFER` (128 KiB, the PRDT's
+`BOUNCE_PAGES`). `vfs/ext4/cache.rs` gained `slot_run`: load `[block, block+want)`
+in one device call into a scratch buffer bounded by `RUN_BLOCKS` = **16 blocks**
+(64 KiB, the tighter of the two bounds), then scatter it into the per-block slots,
+so every block of the run is resident and the next request for one of them is a
+hit rather than a second read. `Inode::read_at` asks for the run its own request
+needs — and `contiguous_run` walks the extent tree *in memory* to find how far the
+device blocks are consecutive, so a file stored in scattered blocks takes exactly
+the path it always did.
+
+It is a **demand** run and not a readahead, which is the design decision the
+paragraph above arrived at: `want` is what the caller's own request is about to
+touch, so a random read of one block asks for one block and pays nothing, and
+there is no heuristic to get wrong. A readahead past the request (Linux's
+`file_ra_state`) would buy nothing here — the pass is full-rate either way — and
+would add device reads to a random pattern that §10.5's instrument cannot see.
+
+The numbers, `cargo xtask test`, **identical on both machines** (which is what a
+count is for):
+
+| instrument | before | after |
+|---|---|---|
+| `cold` — a 64 MiB sequential read | **16387** | **1027** (16384/16 plus the three metadata reads) |
+| `smallcold` — the fitting file's cold pass | **1024** | **65** |
+| `warm` — the fitting file's second pass | 0 | 0 |
+
+**The first run of this change measured nothing at all, and the reason is the
+lesson worth keeping: a wrapper is a driver to its callers.** The chain a mounted
+filesystem sees is `ext4 → Window → Counted → AhciDisk`. `Window` forwarded
+`max_transfer` (it must — the measured filesystem lives on a *partition*), and
+`Counted` did not, so the disk's 128 KiB promise was replaced by the page default
+one layer *below* the filesystem and `cold` came back as 16387. Nothing about the
+cache was wrong; the width had been answered by a wrapper that had never been
+asked. Both wrappers' forwarding now has a host test in `crates/blk`, and a
+partition's window over a wide disk is one of them.
+
+`t-diskbench`'s claims moved with the measurement, which is rule 1's carve-out:
+"the cold pass reached the device for the file's blocks" was `cold >= 16384` — one
+call per block, the behaviour this change removes — and is now "**in runs**"
+(`0 < cold < 16384`) plus "runs of at least eight blocks each" (`cold <=
+16384/8`). The exact figure is *reported* rather than asserted, because how wide a
+run the device serves is the kernel's business; what the harness pins is that a
+run happened at all and that no block was read twice. The counterfactual is the
+claim's own proof: with `AhciDisk::max_transfer` put back to the page default for
+one run, `cold` returns to **16387** and all three run claims fail.
+
+What this does **not** do, named: **the root disk (`vda`) still reads one block per
+call.** The crate describes a request's data with one descriptor per *buffer*, and
+a descriptor carries a single physical address — so a wide buffer there has to be
+**physically contiguous**, which a kernel `Vec` of 32 pages is not. `VirtioBlk::max_transfer`
+therefore answers `PAGE_SIZE` and says why. A contiguous multi-frame bounce
+(`mm::alloc_frames`, one order) is what would put that disk on the wide path, and
+it is a driver change with its own measurement — virtio-blk's own `Counted`
+counter would show it.
 
 
 ### 10.6 Serial Output — **DONE**

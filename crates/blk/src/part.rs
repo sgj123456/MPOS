@@ -65,6 +65,15 @@ impl BlockDev for Window {
         self.inner.write_at(self.base + offset, buf);
     }
 
+    /// Forwarded, and it is not a formality: the *measured* filesystem in §10.5
+    /// lives on a partition, so a window that answered the page default would
+    /// narrow the disk behind it back to one block per call and quietly undo the
+    /// whole point of asking. A window reads and writes through the same device
+    /// the disk is, so it moves exactly as much in one transfer.
+    fn max_transfer(&self) -> usize {
+        self.inner.max_transfer()
+    }
+
     fn flush(&self) -> bool {
         self.inner.flush()
     }
@@ -335,6 +344,12 @@ mod tests {
                 disk[at..at + buf.len()].copy_from_slice(buf);
             });
         }
+
+        /// Four pages, so a test can tell "the window forwarded this" from "the
+        /// window answered the default".
+        fn max_transfer(&self) -> usize {
+            4 * crate::PAGE_SIZE
+        }
     }
 
     /// Lay a GPT over `disk`, with one entry per `(start, sectors)`.
@@ -472,6 +487,24 @@ mod tests {
         let mut buf = [0u8; 8];
         disk.read_at(2049 * SECTOR + SUPERBLOCK + 64, &mut buf);
         assert_eq!(buf, marker);
+    }
+
+    /// The window forwards the disk's transfer width, and this is the tell for a
+    /// change that lands and moves nothing: the filesystem §10.5 measures lives
+    /// on a *partition*, so a window answering the page default would narrow the
+    /// disk behind it back to one block per call.
+    #[test]
+    fn a_window_moves_as_much_as_the_disk_behind_it() {
+        let disk = Arc::new(Fake::new(4096));
+        write_gpt(&disk, &[(1, 2048), (2049, 2047)]);
+        disk.put_ext2(2049);
+        let found = find_filesystem(disk.clone()).expect("the second partition mounts");
+        assert_ne!(
+            disk.max_transfer(),
+            crate::PAGE_SIZE,
+            "the fake must answer something other than the default, or this proves nothing",
+        );
+        assert_eq!(found.max_transfer(), disk.max_transfer());
     }
 
     /// The three named partitions are picked by position, not by content:

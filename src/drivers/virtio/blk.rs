@@ -111,6 +111,25 @@ impl BlockDev for VirtioBlk {
         self.sectors
     }
 
+    /// A page, and it is a real limit rather than modesty.
+    ///
+    /// The crate describes a request's data with **one descriptor per buffer
+    /// slice**, and a descriptor carries a single physical address - so a buffer
+    /// that spans pages the frame allocator did not put next to each other would
+    /// send the device to the wrong place, which is why `read_at`'s own comment
+    /// is about `dma_safe` and why the bounce below is a fixed 2 KiB stack
+    /// buffer. Answering `PAGE_SIZE` keeps the contract the kernel was written
+    /// against: one call, one page, one transfer.
+    ///
+    /// What a wider answer would need, and it is not driver-local: the bounce
+    /// would have to be **physically contiguous** frames (`mm::alloc_frames`
+    /// gives a run in one order), so one descriptor covers it and the device
+    /// really does one transfer. That is the change `docs/notes/` §10.5 names as
+    /// the prerequisite for this disk to join the wide path.
+    fn max_transfer(&self) -> usize {
+        crate::blk::PAGE_SIZE
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) {
         assert!(
             offset.is_multiple_of(SECTOR) && buf.len().is_multiple_of(SECTOR as usize),

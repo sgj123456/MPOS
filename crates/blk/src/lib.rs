@@ -30,15 +30,19 @@ use core::cell::RefCell;
 
 use critical_section::Mutex;
 
-/// The largest buffer [`BlockDev::read_at`]/[`BlockDev::write_at`] is handed in
-/// one call: the trait's contract says a driver bounces through a single
-/// page-sized, physically contiguous buffer, so this is the machine's 4 KiB
-/// page as the block layer's *own* transfer bound.
+/// The **default** transfer bound: [`BlockDev::max_transfer`] answers with this
+/// until a driver says otherwise, and it is the bound the rest of the kernel was
+/// written against.
 ///
-/// It is written here rather than read from `mm::PAGE_SIZE` because this crate
-/// is a leaf that cannot name the kernel - and because the bound belongs to the
-/// trait that states it, not to the frame allocator that happens to size the
-/// same hardware fact.
+/// It is the machine's 4 KiB page, written here rather than read from
+/// `mm::PAGE_SIZE` because this crate is a leaf that cannot name the kernel - and
+/// because the number belongs beside the contract it bounds, not to the frame
+/// allocator that happens to size the same hardware fact.
+///
+/// A driver whose hardware moves more than a page answers [`BlockDev::max_transfer`]
+/// with its own figure; this stays the *floor*, so a driver that says nothing is
+/// honest by default. `src/drivers/ahci.rs` is the one that does: its bounce is a
+/// list of pages behind a scatter-gather PRDT, so one command carries 128 KiB.
 pub const PAGE_SIZE: usize = 4096;
 
 /// One disk the kernel has, named the way userland will name it.
@@ -131,12 +135,26 @@ pub trait BlockDev: Send + Sync {
     fn capacity_sectors(&self) -> u64;
 
     /// Read whole sectors into `buf`. The offset and length are multiples of
-    /// 512, and `buf` is at most one 4 KiB page - drivers bounce through a
-    /// single page-sized, physically contiguous buffer.
+    /// 512, and `buf` is at most [`BlockDev::max_transfer`] bytes.
     fn read_at(&self, offset: u64, buf: &mut [u8]);
 
     /// Write whole sectors from `buf`, under the same contract as [`read_at`].
     fn write_at(&self, offset: u64, buf: &[u8]);
+
+    /// The largest buffer this device moves in **one transfer**: how wide a
+    /// call may be and still be one command rather than several.
+    ///
+    /// The default is [`PAGE_SIZE`], which is the bound the rest of the kernel
+    /// was written against and the one a driver that says nothing keeps - so a
+    /// new driver is honest by default rather than flattered. A driver whose
+    /// hardware really moves more answers with its own figure, and the number
+    /// it answers is a promise about *one command*: a caller (the block cache,
+    /// `vfs/ext4/cache.rs`) hands it a whole contiguous run of blocks precisely
+    /// so the device does one transfer for the run, and a driver that split the
+    /// run internally would make `Counted`'s "one call is one transfer" a lie.
+    fn max_transfer(&self) -> usize {
+        PAGE_SIZE
+    }
 
     /// Ask the device to push whatever it has cached to stable media. A
     /// filesystem that promises a commit point - a journal, or even just
@@ -216,6 +234,17 @@ impl BlockDev for Counted {
         self.writes
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         self.inner.write_at(offset, buf);
+    }
+
+    /// Forwarded, and **this wrapper is the one that hid the width**: the first
+    /// gate run of §10.5's wide transfer measured nothing at all, because the
+    /// chain a mounted filesystem sees is `Window → Counted → driver` and only
+    /// the window was forwarding. The counter is a wrapper like any other and a
+    /// wrapper that answers the default narrows the disk behind it - which for
+    /// this instrument is the whole measurement, since the counted device *is*
+    /// the one the numbers come from.
+    fn max_transfer(&self) -> usize {
+        self.inner.max_transfer()
     }
 
     fn flush(&self) -> bool {
@@ -303,6 +332,45 @@ mod tests {
         assert_eq!(counted.writes(), 1, "one write counted");
         assert_eq!(plain.touched(), 1536, "the device underneath saw the bytes");
         assert_eq!(counted.capacity_sectors(), 2048, "capacity forwarded");
+    }
+
+    /// A driver that says nothing moves one page per call, and that default is a
+    /// promise the callers rest on: `vfs/ext4/cache.rs` asks the device how wide
+    /// a run it will load in one transfer, and a driver that never overrode
+    /// [`BlockDev::max_transfer`] must be answered with the bound the kernel was
+    /// written against rather than with an optimistic figure.
+    #[test]
+    fn a_driver_that_says_nothing_moves_one_page() {
+        let plain = Plain::new(2048);
+        assert_eq!(plain.max_transfer(), PAGE_SIZE);
+        assert_eq!(Counted::new("testdb", plain).max_transfer(), PAGE_SIZE);
+    }
+
+    /// ...and a driver that *does* say something has it forwarded through both
+    /// wrappers a mounted filesystem stands behind. This is the pin for the
+    /// mistake the first measurement found: `Counted` did not forward, so the
+    /// chain `Window → Counted → driver` answered the default for a disk that had
+    /// promised 128 KiB, and §10.5's wide transfer changed no number at all.
+    #[test]
+    fn the_wrappers_forward_the_width_the_driver_promised() {
+        struct Wide;
+        impl BlockDev for Wide {
+            fn capacity_sectors(&self) -> u64 {
+                2048
+            }
+            fn read_at(&self, _offset: u64, buf: &mut [u8]) {
+                buf.fill(0);
+            }
+            fn write_at(&self, _offset: u64, _buf: &[u8]) {}
+            fn max_transfer(&self) -> usize {
+                4 * PAGE_SIZE
+            }
+        }
+        assert_eq!(Wide.max_transfer(), 4 * PAGE_SIZE);
+        assert_eq!(
+            Counted::new("testdc", Arc::new(Wide)).max_transfer(),
+            4 * PAGE_SIZE
+        );
     }
 
     /// A window over a counted device does not double-count and does not
