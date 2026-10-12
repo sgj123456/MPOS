@@ -180,6 +180,39 @@ pub enum Job {
         fence: u64,
         stream: Vec<u8>,
     },
+    /// Make the cursor resource `id` at `width` x `height` and attach `entries` -
+    /// the control-queue half of showing a hardware pointer. It is the same pair
+    /// [`Job::Create2d`] performs, named apart because the cursor's resource is the
+    /// DRM layer's to own and its lifetime is the cursor binding's, not a dumb
+    /// buffer's.
+    CreateCursor2d {
+        id: u32,
+        width: u32,
+        height: u32,
+        entries: Vec<(u64, u32)>,
+    },
+    /// Copy the cursor resource's pixels from guest memory into the device - the
+    /// second control-queue step, which must land before [`Job::SetCursor`] names
+    /// the resource (the ordering holds because `drain_jobs` pops in push order and
+    /// each control command completes synchronously).
+    TransferCursor { id: u32, width: u32, height: u32 },
+    /// Load the transferred resource as the host's pointer image at (`x`, `y`) with
+    /// hotspot (`hot_x`, `hot_y`) - the cursor-queue `UPDATE_CURSOR`. A `resource_id`
+    /// of zero hides the pointer.
+    SetCursor {
+        id: u32,
+        x: u32,
+        y: u32,
+        hot_x: u32,
+        hot_y: u32,
+    },
+    /// Move the already-loaded pointer to (`x`, `y`) on the cursor queue, touching no
+    /// resource - what a pointer-motion event costs once an image is bound.
+    MoveCursor { x: u32, y: u32 },
+    /// Release the cursor resource `id` on the control queue, when its framebuffer is
+    /// destroyed or unbound. Pushed *before* any [`Job::Unref`] of the same buffer so
+    /// the device never sees a cursor naming a released resource.
+    DestroyCursor { id: u32 },
 }
 
 /// One queued job and how its requester learns the answer.
@@ -309,6 +342,29 @@ fn perform(device: &mut dyn GpuDevice, kind: &Job) -> isize {
             fence,
             stream,
         } => device.submit_3d(*ctx, *ring_idx, *fence, stream),
+        // The cursor resource's create+attach is the same pair `Create2d` performs;
+        // both must land, because a cursor resource created and never backed is one
+        // the device reads from nowhere when `SetCursor` names it.
+        Job::CreateCursor2d {
+            id,
+            width,
+            height,
+            entries,
+        } => device
+            .create_2d(*id, *width, *height)
+            .and_then(|()| device.attach_backing(*id, entries)),
+        Job::TransferCursor { id, width, height } => {
+            device.transfer_to_host_2d(*id, *width, *height)
+        }
+        Job::SetCursor {
+            id,
+            x,
+            y,
+            hot_x,
+            hot_y,
+        } => device.update_cursor(*id, *x, *y, *hot_x, *hot_y),
+        Job::MoveCursor { x, y } => device.move_cursor(*x, *y),
+        Job::DestroyCursor { id } => device.unref(*id),
     };
     match done {
         Ok(()) => 0,
@@ -362,6 +418,7 @@ fn publish_card(device: &mut dyn GpuDevice) {
         virgl: features.contains(crate::gpu::abi::Features::VIRGL),
         context_init: features.contains(crate::gpu::abi::Features::CONTEXT_INIT),
         capset_ids: crate::gpu::virtgpu::table_mask(&capsets),
+        cursor_q: device.has_cursor_queue(),
     };
     // Said out loud, and the `cached=` count is the half worth having: a cap set
     // whose fetch failed is skipped silently (`continue` above), so without this
@@ -369,9 +426,10 @@ fn publish_card(device: &mut dyn GpuDevice) {
     // device that had none - and `GETPARAM(7)` answering `0` would be the only
     // trace, indistinguishable from the honest no-3D answer.
     crate::println!(
-        "virtio-gpu: virgl={} context_init={} capsets={num_capsets} cached={} mask={:#x}",
+        "virtio-gpu: virgl={} context_init={} cursorq={} capsets={num_capsets} cached={} mask={:#x}",
         card.virgl as u8,
         card.context_init as u8,
+        card.cursor_q as u8,
         capsets.len(),
         card.capset_ids,
     );

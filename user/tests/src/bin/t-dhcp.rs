@@ -42,7 +42,7 @@
 //! host's ones.
 
 use std::ffi::c_void;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use mpos_user_tests::{Report, host_run};
 use rustix::event::{PollFd, PollFlags, poll};
@@ -393,6 +393,228 @@ fn main() {
             rx[BOOTP + 28..BOOTP + 34] == mac,
         );
     }
+
+    // --- the same DISCOVER through the door a shipping client opens first ---
+    //
+    // `busybox udhcpc` builds no Ethernet frame: its first call is
+    // `socket(AF_INET, SOCK_RAW, IPPROTO_RAW)` - measured on the machine, because
+    // §4.5's boot stopped exactly there - and the packet it sends carries its
+    // *own* IP header. The kernel's half is Linux's, measured on the host with
+    // `.workbuddy/probe_rawip.c`: the total length becomes the sent length, the
+    // header checksum is recomputed, the source is filled in when the caller left
+    // it zero, the identification is assigned when the caller left it zero, and
+    // the *header's* destination is the packet's (the argument is required all the
+    // same - `EDESTADDRREQ` without it). This header leaves the source at 0.0.0.0,
+    // so the answer arriving at all is that rule doing its work: a server can only
+    // reply to an address.
+    //
+    // It also pins *where* the send goes: smoltcp's raw-socket emit drops a packet
+    // whose IP protocol byte is not the socket's (`socket/raw.rs`: "wrong ip
+    // protocol, dropping"), and this channel is bound to 255 while the packet is
+    // UDP - so a kernel that sent it through that socket would queue it, return
+    // the full length from `sendto`, and hear nothing. That was measured here once
+    // (`Ok(0)` from the poll below); the door now reaches the device directly.
+    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW) };
+    check_ok(
+        &mut r,
+        "AF_INET SOCK_RAW with IPPROTO_RAW opens",
+        raw as isize,
+    );
+    if raw < 0 {
+        r.finish();
+    }
+    // A fresh transaction id, so the answer below cannot be the first DISCOVER's
+    // (a server is entitled to ignore a retransmit).
+    const RAW_XID: u32 = 0x4d504f54;
+    pkt[BOOTP + 4..BOOTP + 8].copy_from_slice(&RAW_XID.to_be_bytes());
+
+    let refused = unsafe {
+        as_raw(libc::sendto(
+            raw,
+            pkt.as_ptr().cast::<c_void>(),
+            TOTAL,
+            0,
+            core::ptr::null(),
+            0,
+        ) as isize)
+    };
+    r.check(
+        "sendto through the raw door without a destination is EDESTADDRREQ",
+        refused == -(libc::EDESTADDRREQ as isize),
+    );
+
+    let mut broadcast = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_be_bytes([255, 255, 255, 255]),
+        },
+        sin_zero: [0; 8],
+    };
+    let sent = unsafe {
+        as_raw(libc::sendto(
+            raw,
+            pkt.as_ptr().cast::<c_void>(),
+            TOTAL,
+            0,
+            (&raw mut broadcast).cast::<libc::sockaddr>(),
+            core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) as isize)
+    };
+    r.check(
+        &format!("and with one the whole packet goes (got {sent}, want {TOTAL})"),
+        sent == TOTAL as isize,
+    );
+
+    let mut waiting_again = [PollFd::new(&sock, PollFlags::IN)];
+    let ready_again = poll(&mut waiting_again, Some(&PATIENCE));
+    r.check(
+        &format!("the server answers through the raw door too ({ready_again:?})"),
+        ready_again == Ok(1),
+    );
+    if ready_again == Ok(1) {
+        // Read this one the way a shipping client does, and not the way the
+        // first answer was read. `busybox udhcpc` asks for its replies with
+        // **`recvmsg`** - measured on the host (`strace`: `recvmsg(5,
+        // {msg_iovlen=1, msg_control=...})`) - because it wants
+        // `PACKET_AUXDATA` beside the payload; its listen socket is the
+        // `AF_PACKET` one. The `recvmsg` door had no branch for that family,
+        // so the call fell through to the registry's "not a socket" answer and
+        // the client printed `read error: Not a socket, reopening socket`
+        // after every DISCOVER - while this program, reading the same socket
+        // with `recvfrom`, stayed green. The two reads are the two doors, and
+        // a green pair is the claim that both answer.
+        let mut rx2 = [0u8; 600];
+        let mut iov = [libc::iovec {
+            iov_base: rx2.as_mut_ptr().cast::<c_void>(),
+            iov_len: rx2.len(),
+        }];
+        // Room for a `tpacket_auxdata` control message, as the client leaves
+        // it: the kernel filling none is the honest answer, and the client
+        // only reads it to *skip* a checksum check it is prepared to make.
+        let mut control = [0u8; 64];
+        let mut name = [0u8; 20];
+        let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+        msg.msg_name = name.as_mut_ptr().cast::<c_void>();
+        msg.msg_namelen = name.len() as libc::socklen_t;
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast::<c_void>();
+        msg.msg_controllen = control.len() as libc::socklen_t;
+        let got = unsafe { as_raw(libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) as isize) };
+        r.check(
+            &format!("and recvmsg on the same socket reads it too (got {got}, want > 0)"),
+            got > 0,
+        );
+        r.check(
+            &format!(
+                "naming the sender in a sockaddr_ll (namelen {}, family {})",
+                msg.msg_namelen,
+                u16::from_ne_bytes([name[0], name[1]])
+            ),
+            msg.msg_namelen as usize == 20 && u16::from_ne_bytes([name[0], name[1]]) == 17,
+        );
+        if got > 0 {
+            let at = BOOTP + 4;
+            let xid = u32::from_be_bytes([rx2[at], rx2[at + 1], rx2[at + 2], rx2[at + 3]]);
+            r.check(
+                &format!("carrying the raw door's transaction id ({xid:#x})"),
+                xid == RAW_XID,
+            );
+        }
+    }
+
+    // The receive half is this door's own queue - a filterless smoltcp socket
+    // would steal the machine's UDP and TCP delivery (§4.5), so the NIC seam
+    // copies every delivered IPv4 packet here instead. What `recvfrom` hands
+    // back is the *complete* IP packet: header first, its source the sender.
+    // Polled through the door's own descriptor first - a reply that reaches
+    // the AF_PACKET tap must reach this one too, and a poll that times out
+    // says the seam never filled it (a bare libc fd borrows as an `AsFd` for
+    // `PollFd::new`; the read below then takes with `MSG_DONTWAIT`, because
+    // this sweep has no watchdog to notice a park).
+    let raw_fd = unsafe { BorrowedFd::borrow_raw(raw) };
+    let mut waiting_door = [PollFd::new(&raw_fd, PollFlags::IN)];
+    let door_ready = poll(&mut waiting_door, Some(&PATIENCE));
+    r.check(
+        &format!("the door goes readable on its own ({door_ready:?})"),
+        door_ready == Ok(1),
+    );
+    // `rx3`/`again` live outside the block: the renewal claim below reads the
+    // same packet back.
+    let mut rx3 = [0u8; 600];
+    let mut again = -1isize;
+    if door_ready == Ok(1) {
+        again = unsafe {
+            as_raw(libc::recvfrom(
+                raw,
+                rx3.as_mut_ptr().cast::<c_void>(),
+                rx3.len(),
+                libc::MSG_DONTWAIT,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            ) as isize)
+        };
+        r.check(
+            &format!("the door itself reads one whole packet (got {again})"),
+            (20..=600isize).contains(&again),
+        );
+        if again >= 20 {
+            let version = rx3[0] >> 4;
+            let ihl = (rx3[0] & 0x0f) as usize * 4;
+            let total = u16::from_be_bytes([rx3[2], rx3[3]]) as usize;
+            let proto = rx3[9];
+            let src = [rx3[12], rx3[13], rx3[14], rx3[15]];
+            r.check(
+                &format!("starting with a v4 header, not a payload (version {version})"),
+                version == 4 && ihl >= 20 && total <= again as usize,
+            );
+            r.check(
+                &format!("whose protocol byte is the reply's ({proto}) from slirp ({src:?})"),
+                proto == 17 && src == [10, 0, 2, 2],
+            );
+        }
+    }
+
+    // And the one shape the door does not serve yet, refused by name rather
+    // than addressed to a guess: a unicast send needs the ARP/next-hop lookup
+    // this direct-to-device path does not do (§4.5's named prerequisite).
+    // The client's own next step after the discover is exactly that -
+    // `udhcpc` renews with a *unicast* REQUEST aimed at the server that
+    // answered - so the packet read above supplies the aim: rewrite the
+    // header's destination with the OFFER's source and send. A product boot
+    // measured the same stop (`bind-choosenack` reaches the refusal, not a
+    // crash); the lease half of the story remains §4.5's unicast gap.
+    let mut unicast = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_be_bytes([10, 0, 2, 2]),
+        },
+        sin_zero: [0; 8],
+    };
+    if again >= 20 {
+        let server = [rx3[12], rx3[13], rx3[14], rx3[15]];
+        pkt[IP_DST..IP_DST + 4].copy_from_slice(&server);
+        let req = unsafe {
+            as_raw(libc::sendto(
+                raw,
+                pkt.as_ptr().cast::<c_void>(),
+                TOTAL,
+                0,
+                (&raw mut unicast).cast::<libc::sockaddr>(),
+                core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            ) as isize)
+        };
+        r.check(
+            &format!("a unicast through it is EOPNOTSUPP (got {req})"),
+            req == -(libc::EOPNOTSUPP as isize),
+        );
+    } else {
+        r.check("a unicast through it is EOPNOTSUPP", false);
+    }
+
+    unsafe { libc::close(raw as i32) };
 
     r.finish();
 }

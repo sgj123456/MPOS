@@ -163,6 +163,22 @@ pub const CMD_TRANSFER_TO_HOST_3D: u32 = 0x0205;
 pub const CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
 pub const CMD_SUBMIT_3D: u32 = 0x0207;
 
+/// The cursor commands, which - unlike every other command in this file - travel
+/// on the device's **cursor queue**, not the control queue. The spec puts
+/// `UPDATE_CURSOR` and `MOVE_CURSOR`'s request structs under "data passed in the
+/// cursor vq", so a driver that sent them on the control ring would have the
+/// device read a command off a queue it is not watching. They answer
+/// `RESP_OK_NODATA`.
+///
+/// `UPDATE_CURSOR` carries a resource id and loads that resource as the pointer
+/// image *and* moves it to `pos`; `MOVE_CURSOR` changes only the position of the
+/// image already loaded. Before an `UPDATE_CURSOR`, the driver must have created,
+/// attached backing to, and transferred the cursor resource on the control queue
+/// and seen those land - which is what makes the two-queue ordering a real
+/// constraint rather than a detail (`drivers/virtio/gpu_ctrl.rs`).
+pub const CMD_UPDATE_CURSOR: u32 = 0x0300;
+pub const CMD_MOVE_CURSOR: u32 = 0x0301;
+
 /// The response codes. Only the ones a request can be answered with are named;
 /// `check` below turns anything else into an error, so an unnamed code is
 /// reported as itself rather than mistaken for a success.
@@ -335,6 +351,47 @@ pub struct ResourceFlush {
     pub rect: Rect,
     pub resource_id: u32,
     pub padding: u32,
+}
+
+/// `struct virtio_gpu_cursor_pos`: where on a scanout the pointer sits. The
+/// cursor commands' shared position field; `x`/`y` are pixels within the scanout
+/// named by `scanout_id`, and both are unsigned - the device clamps a pointer to
+/// the display rather than faulting on a negative coordinate.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CursorPos {
+    pub scanout_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub padding: u32,
+}
+
+/// `struct virtio_gpu_update_cursor`: load resource `resource_id` as the pointer
+/// image and place it at `pos`, with `hot_x`/`hot_y` the pixel of the image that
+/// is the actual pointer point. Sent on the cursor queue ([`CMD_UPDATE_CURSOR`]).
+///
+/// A `resource_id` of zero is "hide the cursor" - the same spelling the control
+/// queue's `SET_SCANOUT` uses for a screen, and what `MOVE_CURSOR` cannot express
+/// because it names no resource.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UpdateCursor {
+    pub header: CtrlHeader,
+    pub pos: CursorPos,
+    pub resource_id: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+}
+
+/// `struct virtio_gpu_move_cursor`: move the already-loaded pointer image to
+/// `pos`, changing nothing else. Sent on the cursor queue ([`CMD_MOVE_CURSOR`])
+/// and the cheap half of the pair - a pointer motion event costs this rather than
+/// an [`UpdateCursor`] precisely because it must not re-transfer the image.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MoveCursor {
+    pub header: CtrlHeader,
+    pub pos: CursorPos,
 }
 
 /// `struct virtio_gpu_transfer_to_host_2d`.
@@ -698,6 +755,12 @@ mod tests {
         assert_eq!(CMD_TRANSFER_TO_HOST_3D, 0x0205);
         assert_eq!(CMD_TRANSFER_FROM_HOST_3D, 0x0206);
         assert_eq!(CMD_SUBMIT_3D, 0x0207);
+        // The cursor pair, whose numbers are the header's `0x0300`/`0x0301` and
+        // which travel on the *cursor* queue - a reader of this file would
+        // otherwise assume they were control-queue commands like every number
+        // above them.
+        assert_eq!(CMD_UPDATE_CURSOR, 0x0300);
+        assert_eq!(CMD_MOVE_CURSOR, 0x0301);
         assert_eq!(RESP_OK_NODATA, 0x1100);
         assert_eq!(RESP_OK_DISPLAY_INFO, 0x1101);
         assert_eq!(RESP_OK_CAPSET_INFO, 0x1102);
@@ -760,6 +823,14 @@ mod tests {
         assert_eq!(size_of::<ResourceUnref>(), 32);
         assert_eq!(size_of::<SetScanout>(), 48);
         assert_eq!(size_of::<ResourceFlush>(), 48);
+        // The cursor pair. `UpdateCursor` is the header (24) + `CursorPos` (16) +
+        // resource_id/hot_x/hot_y (12) = 52 of named fields, rounded up to 56 by
+        // the header's own trailing alignment; `MoveCursor` is header + `CursorPos`
+        // = 40. A field added or reordered fails here before it silently
+        // mis-encodes a pointer onto the wrong scanout.
+        assert_eq!(size_of::<CursorPos>(), 16);
+        assert_eq!(size_of::<UpdateCursor>(), 56);
+        assert_eq!(size_of::<MoveCursor>(), 40);
         assert_eq!(size_of::<TransferToHost2d>(), 56);
         assert_eq!(size_of::<ResourceAttachBacking>(), 32);
         assert_eq!(size_of::<ResourceDetachBacking>(), 32);
@@ -845,6 +916,21 @@ mod tests {
         assert_eq!(core::mem::offset_of!(RespCapsetInfo, capset_max_size), 32);
         assert_eq!(core::mem::offset_of!(GetCapset, capset_id), 24);
         assert_eq!(core::mem::offset_of!(GetCapset, capset_version), 28);
+
+        // The cursor structs' fields, pinned because `gpu_ctrl` builds them from
+        // kernel state and the device reads them by byte position: a reordered
+        // `resource_id`/`hot_x` pair would put the pointer image's resource id in
+        // the hotspot slot and load nothing. `CursorPos` starts at 24 (after the
+        // header) and its `x`/`y` are at +4/+8; `UpdateCursor` then carries the
+        // resource at 40 and the hotspot at 44/48.
+        assert_eq!(core::mem::offset_of!(CursorPos, scanout_id), 0);
+        assert_eq!(core::mem::offset_of!(CursorPos, x), 4);
+        assert_eq!(core::mem::offset_of!(CursorPos, y), 8);
+        assert_eq!(core::mem::offset_of!(UpdateCursor, pos), 24);
+        assert_eq!(core::mem::offset_of!(UpdateCursor, resource_id), 40);
+        assert_eq!(core::mem::offset_of!(UpdateCursor, hot_x), 44);
+        assert_eq!(core::mem::offset_of!(UpdateCursor, hot_y), 48);
+        assert_eq!(core::mem::offset_of!(MoveCursor, pos), 24);
     }
 
     /// The cap set reader bounds the payload by the buffer and by nothing else.

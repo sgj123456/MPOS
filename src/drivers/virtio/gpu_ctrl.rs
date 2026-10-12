@@ -11,11 +11,14 @@
 //!
 //! What is left is small because of what the kernel actually asked the crate
 //! for: `new`, `resolution()`, `change_resolution()` and `flush()`. Nothing here
-//! reads EDID (the DRM layer synthesizes its own block), nothing drives the
-//! device's cursor queue (the DRM cursor is a real second plane, `drm.rs` over
-//! the blend in `crate::gpu::cursor`), and the cursor queue is not even
-//! configured - a device
-//! whose second queue nobody uses is a queue with no reason to exist.
+//! reads EDID (the DRM layer synthesizes its own block). The cursor queue *is*
+//! configured when the device has one - `UPDATE_CURSOR`/`MOVE_CURSOR` go out on it
+//! (`submit_cursor`, [`Gpu::update_cursor`]) so a virtualized host draws the
+//! pointer itself - and where a device has no second queue the DRM layer falls back
+//! to blending the cursor into the scanout (`drm.rs`'s `paint_cursor`). Which path
+//! runs is decided once at bring-up by whether `VirtQueue::new` accepted the cursor
+//! queue, published upward as `Card::cursor_q`; see `docs/notes/` §7.4 for the
+//! measurement that made the host cursor the primary path.
 //!
 //! This file lands as a *refactor*: the same commands in the same order, so a
 //! boot behaves as it did and the pins that already cover the display path
@@ -36,6 +39,12 @@ use crate::mm::PAGE_SIZE;
 
 /// The control queue: the one every command in `virtgpu_abi` travels on.
 const QUEUE_CONTROL: u16 = 0;
+/// The cursor queue: the one `UPDATE_CURSOR` and `MOVE_CURSOR` travel on. Every
+/// other command in this driver is a control-queue command; these two are the
+/// exception the spec carves out (`virtio_gpu_update_cursor`/`move_cursor` are
+/// "data passed in the cursor vq"), so they need their own ring and their own
+/// scratch rather than the control queue's.
+const QUEUE_CURSOR: u16 = 1;
 /// Two descriptors deep, which is what the crate's device was built with and is
 /// all this driver can use: every command below is sent and waited for one at a
 /// time, so a third descriptor would be a slot nothing can occupy.
@@ -177,6 +186,26 @@ pub trait GpuDevice: Send {
 
     /// One cap set's bytes, by id and version.
     fn get_capset(&mut self, id: u32, version: u32, out: &mut [u8]) -> Result<usize, Error>;
+
+    /// Whether this device has a cursor queue - the fact the DRM layer branches
+    /// on between a host-rendered pointer and a software-blended one.
+    fn has_cursor_queue(&self) -> bool;
+
+    /// Load `resource_id` as the pointer image at (`x`, `y`) with hotspot
+    /// (`hot_x`, `hot_y`), on the cursor queue. See the inherent method for the
+    /// resource-must-already-be-transferred ordering this depends on.
+    fn update_cursor(
+        &mut self,
+        resource_id: u32,
+        x: u32,
+        y: u32,
+        hot_x: u32,
+        hot_y: u32,
+    ) -> Result<(), Error>;
+
+    /// Move the loaded pointer image to (`x`, `y`) on the cursor queue, touching
+    /// no resource.
+    fn move_cursor(&mut self, x: u32, y: u32) -> Result<(), Error>;
 }
 
 /// The device: one transport, one control queue, and the scanout's memory.
@@ -190,6 +219,13 @@ pub trait GpuDevice: Send {
 pub struct Gpu<T: Transport> {
     transport: T,
     control: VirtQueue<HalImpl, QUEUE_SIZE>,
+    /// The cursor queue, when this device has one. `None` on a device that did
+    /// not configure a second queue - which is the whole of "no hardware cursor
+    /// here", and why the DRM layer falls back to blending the pointer into the
+    /// scanout rather than failing. It is built with `.ok()` in [`Gpu::new`] and
+    /// never `?`-ed: a device that refuses its cursor queue is still a device
+    /// with a display, and a `?` here would take the screen down with it.
+    cursor: Option<VirtQueue<HalImpl, QUEUE_SIZE>>,
     /// The feature word the transport actually agreed to, kept rather than
     /// discarded once the queue is built.
     ///
@@ -227,6 +263,18 @@ pub struct Gpu<T: Transport> {
     /// How much of `send` the command in flight occupies. `pixels` hands back the
     /// whole block, and only this much of it is the request.
     flight: usize,
+    /// The cursor queue's own request/response scratch, mirroring `send`/`recv`
+    /// above. They are *separate* blocks rather than shared with the control
+    /// queue because the single-flight invariant that lets one pair be reused is
+    /// per-queue: a control command and a cursor command are two rings the device
+    /// drains independently, and overwriting one buffer while the other ring still
+    /// names it would hand the device torn bytes. Cursor requests are always one
+    /// struct (`virtio_gpu_update_cursor`, 48 bytes), so these never grow past a
+    /// page and there is no `cursor_reserve` - the same bound `reserve` states,
+    /// reached without the growth path.
+    cursor_send: Frames,
+    cursor_recv: Frames,
+    cursor_flight: usize,
     /// The framebuffer's resource memory, while a scanout points at it.
     fb: Option<Frames>,
     /// The rectangle the scanout was last set to, which `flush` needs and
@@ -260,6 +308,20 @@ impl<T: Transport> Gpu<T> {
             agreed.contains(abi::Features::RING_INDIRECT_DESC),
             agreed.contains(abi::Features::RING_EVENT_IDX),
         )?;
+        // The cursor queue, built in the same pre-`finish_init` window because
+        // that is the last moment this holds `&mut transport`, and `.ok()` rather
+        // than `?` because a device with no second queue is a device with no
+        // hardware cursor, not a device with no display. `VirtQueue::new`'s own
+        // error is the probe: `InvalidParam` when the device reports no queue at
+        // this index (there is no `num_queues`/`queue_is_valid` to ask first), so
+        // its `Ok`/`Err` *is* "does this machine have a cursor queue".
+        let cursor = VirtQueue::new(
+            &mut transport,
+            QUEUE_CURSOR,
+            agreed.contains(abi::Features::RING_INDIRECT_DESC),
+            agreed.contains(abi::Features::RING_EVENT_IDX),
+        )
+        .ok();
         // Read before `finish_init` for the same reason the queue is built
         // before it: the config space is the transport's, and this is the last
         // moment this function holds it. A device that has no cap sets answers
@@ -271,12 +333,16 @@ impl<T: Transport> Gpu<T> {
         Ok(Gpu {
             transport,
             control,
+            cursor,
             agreed,
             send: Frames::new(1),
             recv: Frames::new(1),
             send_pages: 1,
             recv_pages: 1,
             flight: 0,
+            cursor_send: Frames::new(1),
+            cursor_recv: Frames::new(1),
+            cursor_flight: 0,
             fb: None,
             rect: None,
             num_capsets,
@@ -329,7 +395,8 @@ impl<T: Transport> Gpu<T> {
         }
     }
 
-    /// Send one command and hand back the first `rsp_len` bytes of its answer.
+    /// Send one command on the **control queue** and hand back the first
+    /// `rsp_len` bytes of its answer.
     ///
     /// `parts` are concatenated into the send buffer and go out as one
     /// descriptor chain entry, which is how the devices below expect a command:
@@ -340,7 +407,7 @@ impl<T: Transport> Gpu<T> {
         Ok(self.submit_written(parts, rsp_len)?.0)
     }
 
-    /// The same, and how many bytes the device says it wrote.
+    /// The same on the control queue, and how many bytes the device says it wrote.
     ///
     /// The length is only interesting for the one reply whose size the *device*
     /// picks - `GET_CAPSET`'s cap set, where "the buffer could have held it" and
@@ -376,6 +443,60 @@ impl<T: Transport> Gpu<T> {
             &mut self.transport,
         )? as usize;
         Ok((&self.recv.pixels()[..rsp_len], written))
+    }
+
+    /// Send one command on the **cursor queue**, which has no reply beyond its
+    /// header and never grows its scratch.
+    ///
+    /// Both cursor commands answer `RESP_OK_NODATA`, so unlike the control queue
+    /// there is no variable-length reply to size a receive buffer for and nothing
+    /// past the header to read: the whole request is one fixed struct assembled
+    /// from `parts`, and the whole answer is whether the device said OK. It runs
+    /// on the cursor queue's own ring and its own `cursor_send` block for the
+    /// reason [`Gpu::cursor_send`] states - a control command and a cursor
+    /// command are drained independently, so they cannot share one buffer.
+    ///
+    /// Returns `Error::NotReady` when this device has no cursor queue; every
+    /// caller gates on [`Gpu::has_cursor_queue`] first, so that arm is a
+    /// belt-and-braces refusal rather than an expected path.
+    fn submit_cursor(&mut self, parts: &[&[u8]]) -> Result<(), Error> {
+        let queue = self.cursor.as_mut().ok_or(Error::NotReady)?;
+        let need: usize = parts.iter().map(|part| part.len()).sum();
+        // One page is the whole bound: a cursor command is a single fixed struct
+        // (56 bytes for UPDATE, 40 for MOVE), so `need` never reaches a second
+        // page and the block never has to grow. Stated rather than assumed, the
+        // way `reserve` states its growth - here the absence of growth is the
+        // property.
+        if need > PAGE_SIZE {
+            return Err(Error::IoError);
+        }
+        {
+            let buf = self.cursor_send.pixels();
+            let mut at = 0;
+            for part in parts {
+                buf[at..at + part.len()].copy_from_slice(part);
+                at += part.len();
+            }
+            self.cursor_flight = at;
+        }
+        // A cursor command is consumed by the device, not answered: measured on
+        // QEMU's virtio-gpu, the cursor queue completes the element with a used-ring
+        // length of zero and writes no reply header back, unlike the control queue.
+        // So *completion* - `add_notify_wait_pop` returning without an error, which
+        // means the device took the descriptor off the available ring and returned it
+        // used - is the whole of "the host got the pointer". Reading a status word
+        // would be reading a buffer the device never filled: the previous attempt did
+        // exactly that, saw a zeroed header, and reported a successful host-cursor
+        // update as `EIO` on every motion event, so the pointer was drawn by the guest
+        // blend path that had been switched off. The writable buffer stays because
+        // virtio-drivers' synchronous helper requires one; its contents are ignored.
+        let mut recv = [self.cursor_recv.pixels()];
+        queue.add_notify_wait_pop(
+            &[&self.cursor_send.pixels()[..self.cursor_flight]],
+            &mut recv[..],
+            &mut self.transport,
+        )?;
+        Ok(())
     }
 
     /// A command whose whole answer is its `CtrlHeader`.
@@ -847,6 +968,79 @@ impl<T: Transport> Gpu<T> {
             resource_id,
         })
     }
+
+    /// Whether this device has a cursor queue at all - the single fact the DRM
+    /// layer branches on to decide between a host-rendered pointer and blending
+    /// one into the scanout. It is exactly whether [`Gpu::cursor`] was built,
+    /// which is decided once at bring-up from the device's own answer.
+    pub fn has_cursor_queue(&self) -> bool {
+        self.cursor.is_some()
+    }
+
+    /// Load `resource_id` as the pointer image and place it at (`x`, `y`) with
+    /// its hotspot at (`hot_x`, `hot_y`) - the cursor queue's `UPDATE_CURSOR`.
+    ///
+    /// The caller must have already created, attached backing to and transferred
+    /// that resource on the **control** queue and seen those land; this command
+    /// reads the resource, it does not fill it. That ordering holds for free when
+    /// both halves run through the render task in push order (the control commands
+    /// are synchronous round trips that complete before the next job is drained),
+    /// which is how `drm.rs` posts them - see `Job::CreateCursor2d`/`TransferCursor`
+    /// there.
+    ///
+    /// A `resource_id` of zero hides the pointer, the same spelling `SET_SCANOUT`
+    /// uses for a screen.
+    pub fn update_cursor(
+        &mut self,
+        resource_id: u32,
+        x: u32,
+        y: u32,
+        hot_x: u32,
+        hot_y: u32,
+    ) -> Result<(), Error> {
+        let request = abi::UpdateCursor {
+            header: abi::CtrlHeader::new(abi::CMD_UPDATE_CURSOR),
+            pos: abi::CursorPos {
+                scanout_id: abi::SCANOUT_ID,
+                x,
+                y,
+                padding: 0,
+            },
+            resource_id,
+            hot_x,
+            hot_y,
+        };
+        self.submit_cursor(&[abi::as_bytes(&request)])?;
+        Ok(())
+    }
+
+    /// Move the already-loaded pointer image to (`x`, `y`) - the cursor queue's
+    /// `MOVE_CURSOR`, the cheap half that touches no resource.
+    ///
+    /// This is what a pointer-motion event costs once an image is loaded, and why
+    /// the DRM layer keeps "is an image bound" separate from "where is it": a move
+    /// sends neither a resource id nor a hotspot, because the image and its hotspot
+    /// are unchanged.
+    ///
+    /// **No ring index**, named as a limitation rather than an omission: on a
+    /// device that negotiated `VIRTIO_GPU_F_CURSOR_RING_IDX`, `MOVE_CURSOR` carries
+    /// `FLAG_INFO_RING_IDX` and a `ring_idx` selecting which cursor ring. This
+    /// kernel does not ask for that feature (`abi::WANTED_FEATURES`), so the field
+    /// stays zero - correct for QEMU's single cursor ring today, and the thing to
+    /// revisit if multi-ring cursors are ever negotiated.
+    pub fn move_cursor(&mut self, x: u32, y: u32) -> Result<(), Error> {
+        let request = abi::MoveCursor {
+            header: abi::CtrlHeader::new(abi::CMD_MOVE_CURSOR),
+            pos: abi::CursorPos {
+                scanout_id: abi::SCANOUT_ID,
+                x,
+                y,
+                padding: 0,
+            },
+        };
+        self.submit_cursor(&[abi::as_bytes(&request)])?;
+        Ok(())
+    }
 }
 
 /// The erase point: every method is the inherent one above, so the render task
@@ -927,5 +1121,24 @@ impl<T: Transport + Send> GpuDevice for Gpu<T> {
 
     fn get_capset(&mut self, id: u32, version: u32, out: &mut [u8]) -> Result<usize, Error> {
         self.get_capset(id, version, out)
+    }
+
+    fn has_cursor_queue(&self) -> bool {
+        self.has_cursor_queue()
+    }
+
+    fn update_cursor(
+        &mut self,
+        resource_id: u32,
+        x: u32,
+        y: u32,
+        hot_x: u32,
+        hot_y: u32,
+    ) -> Result<(), Error> {
+        self.update_cursor(resource_id, x, y, hot_x, hot_y)
+    }
+
+    fn move_cursor(&mut self, x: u32, y: u32) -> Result<(), Error> {
+        self.move_cursor(x, y)
     }
 }

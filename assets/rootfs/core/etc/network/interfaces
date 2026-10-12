@@ -5,10 +5,22 @@
 # 10.0.2.0/24 with the host reachable as 10.0.2.2 and its resolver as 10.0.2.3.
 #
 # This file is the configuration for the network: a static address, a second
-# interface or a bridge goes here, not into the build. The two hook directories
-# are what the post-up/post-down lines invoke.
+# interface or a bridge goes here, not into the build. The two hook lines below
+# are what Debian's ifupdown spells, and they name the hook *directories* the
+# `ifupdown-ng` package installs (`/etc/network/if-post-up.d` and friends).
+#
+# They run them through `run-parts` rather than as a bare glob, which is the
+# difference between a wired hook and a broken interface. A glob is expanded by
+# the *shell*, so a directory with nothing in it hands the shell the unexpanded
+# pattern as a command name: `/bin/sh: line 0: /etc/network/if-post-up.d/*: not
+# found`, exit 127, and `ifup: failed to change interface eth0 state to 'up'` -
+# measured in a product boot whose lease was, all the same, fine. `run-parts`
+# (a busybox applet, and in this image's applet list) answers 0 for an empty
+# directory and 0 even for a missing one - measured on the host - so the hook
+# stays where a script can be dropped and an interface with nothing to run
+# still comes up.
 auto eth0
 iface eth0 inet dhcp
 
-post-up /etc/network/if-post-up.d/*
-post-down /etc/network/if-post-down.d/*
+post-up run-parts /etc/network/if-post-up.d
+post-down run-parts /etc/network/if-post-down.d

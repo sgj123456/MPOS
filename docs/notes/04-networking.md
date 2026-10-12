@@ -471,18 +471,21 @@ The named gaps, each with what it waits on:
 
   `AF_INET, SOCK_RAW, IPPROTO_RAW` — the door a DHCP client uses to *send* a
   DISCOVER before it has an address of its own, building the IP header itself.
-  (The *receive* half needs no new door: it is `AF_PACKET`, which works — that is
-  what `t-dhcp` pins.) This kernel serves `AF_INET`+`SOCK_RAW` for ICMP
+  (The *receive* half needs no new door: it is `AF_PACKET` - and which *call*
+  the client reads it with turned out to be the whole of what was left; see the
+  bullet below.) This kernel serves `AF_INET`+`SOCK_RAW` for ICMP
   (`t-rawicmp`) and refuses the wildcard protocol with `EPROTONOSUPPORT`, so what
   is left of this gap is that one door, and its shape is named rather than
   guessed: the caller's own IP header under Linux's `IP_HDRINCL` rules (the total
   length, the checksum and the source address filled in when it is left zero),
   `CAP_NET_RAW` as the gate, and `EPROTONOSUPPORT` kept for every other protocol.
-  Until it opens the static 10.0.2.15 stays a boot *default* over a live interface
-  rather than a decision the kernel reserves: `RTM_NEWADDR` and `AF_PACKET` both
-  overrule it. A boot with the wiring and no client is worth stating plainly, and
-  this one is: the lease never appears, and what fails is the client's first call
-  rather than a silent no-op.
+  The door is open now, and with the receive call settled (below) a product boot
+  leases: `udhcpc: broadcasting discover` / `broadcasting select for 10.0.2.15,
+  server 10.0.2.2` / `lease of 10.0.2.15 obtained from 10.0.2.2, lease time
+  86400` (2026-10-13) - the address is the client's own negotiation from here,
+  over a door userland drives, and not a number this kernel decided. What is
+  left is `AF_PACKET`'s `SOCK_RAW` and the door's unicast half, both named
+  above and below.
 * **What a first attempt at that door measured, and why it was reverted** (2026-10-12).
   The rules were measured on the host first (`.workbuddy/probe_rawip.c`): `IP_HDRINCL`
   reads **1** on a fresh `SOCK_RAW`/`IPPROTO_RAW` socket (the protocol implies the
@@ -535,6 +538,55 @@ The named gaps, each with what it waits on:
   protocol, pinned by `t-caps` on both machines (a lowered caller answers `EPERM` for
   ICMP, for a protocol nothing has, and for `AF_PACKET`; the same calls succeed once the
   capability is back).
+* **What the working client measured, and the two bugs it took to get there**
+  (2026-10-13). With the door open, the boot reached `udhcpc: broadcasting
+  discover` and then answered itself `udhcpc: read error: Not a socket,
+  reopening socket` on every retry - while the NIC seam printed a 590-byte
+  frame per DISCOVER, which is the server replying. So the client's own shape
+  was measured on the host first, the way the door's rules were:
+
+  ```
+  socket(AF_INET, SOCK_RAW, IPPROTO_RAW) = 5      opened twice, closed both times
+  socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP)) = 5   the *listen* socket
+  bind(5, {AF_PACKET, ETH_P_IP, ifindex}) = 0
+  setsockopt(5, SOL_PACKET, PACKET_AUXDATA, [1]) = 0
+  sendto(6, "E\0\1H...", 328, ...)                DISCOVER, its own temp socket
+  recvmsg(5, {msg_iov=656, msg_control=PACKET_AUXDATA}, 0) = 576
+  ```
+
+  (`sudo strace -f -e trace=network,read busybox udhcpc -i lo`; the host has
+  1.36.1, the image 1.38.0, and the 1.38 binary carries the same strings.)
+  `d4_recv_raw_packet` moved off `safe_read` onto `recvmsg` so that it could
+  read `PACKET_AUXDATA` and skip a UDP checksum a VM never computed; the
+  `AF_INET` raw socket is the door the client *dies* on when it is refused, and
+  carries no byte. Two things were wrong on this side of that measurement:
+
+  * `handle_recvmsg` had no `AF_PACKET` branch, so the call fell through to the
+    registry's `ENOTSOCK`. `t-dhcp` could not see it: that program reads the
+    same socket with `recvfrom`, which does have a branch - which is why "the
+    receive half works" was true of one door and not the other. It reads one
+    answer with each now, and a green pair is the claim that both answer.
+  * The NIC seam's copy into the wildcard door (`echo_to_raw_doors`) compared
+    the frame's two type bytes against a *second* spelling of the ethertype
+    written with the wrong endian detour - `0x0800u16.to_le()`, where
+    `from_le_bytes` of the wire's `08 00` is `0x0008`. Every frame returned at
+    that line, which measured as "the seam runs and no door is ever filled".
+    The constant is gone; the seam uses `packet::IPV4_ETHERTYPE`, the spelling
+    that was measured. A constant written twice is §15's rule, and this is it
+    again.
+
+  And one the fix would have walked straight into: the seam took the **stack's
+  lock** to find the doors, while `NicDevice::receive` is called from inside
+  `poll_once`, which every caller reaches *already* holding `NET` borrowed - a
+  re-entered `RefCell` is a panic, not a `None`. The doors are a static list of
+  their own now (`socket::RAW_DOORS`, the shape `packet.rs`'s tap uses), each
+  holding a clone of the queue's `Arc`, and a door whose channel is freed is
+  dropped on the next frame. The queue holds `Vec<u8>` at the length the packet
+  arrived with: the 512-byte slot it replaced dropped QEMU's **576**-byte
+  BOOTREPLY whole (14 + 20 + 8 + 548 - `struct bootp_t` with `DHCP_OPT_LEN`
+  312, the `len=590` the seam was printing) and made a short packet read back
+  as a full slot. Measured green: `the door itself reads one whole packet (got
+  576)`.
 * The parsers over `sockaddr_ll` and the Ethernet frame have no host-side pin.
   `AGENTS.md` §3 asks every new parser for a fuzz target, and `net/packet.rs`
   has none — not from oversight but from the §6 trap that gates the whole `net`

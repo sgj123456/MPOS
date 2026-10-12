@@ -171,7 +171,7 @@ capability's answer changes:
 | `user/tests/src/bin/t-signal-frame.rs` | `SignalFrame::enter`/`exit` and the two machines' `rt_sigframe` layout — every register the trapped call was using comes back, and on aarch64 the vector half |
 | `user/tests/src/bin/t-fpu-across-switch.rs` | `Contexts`/`FpuTrap`: the floating-point state belongs to a task, not the CPU |
 | `user/tests/src/bin/t-regs-across-syscall.rs` | `Gate`/`UserFrameOps`: what a trap from EL0 gives back unchanged, integer and SIMD alike |
-| `user/tests/src/bin/t-arch-prctl.rs` | x86_64's `Cpu::set_thread_pointer` (the `%fs` base behind `arch_prctl`); it is the program `tests.toml`'s `aarch64` group excludes, because the call has no arm64 counterpart |
+| `user/tests/src/bin/t-arch-prctl.rs` | x86_64's `Cpu::set_thread_pointer` (the `%fs` base behind `arch_prctl`); it is the program `tests.toml`'s aarch64 `gaps` list excludes, because the call has no arm64 counterpart |
 | `user/tests/src/bin/t-set-tid-address.rs` | The thread-pointer/TLS contract from the `set_tid_address` side on both machines |
 | `user/tests/src/bin/t-lazy-buffer.rs` | `Paging::user_accessible`'s three rules: an absent page is the VMA table's to answer, a copy-on-write page counts as writable, `len == 0` is accessible |
 | `user/tests/src/bin/t-open-flags.rs` | The per-machine `open(2)` flag *numbers* — the table `arch/<arch>/` must not share |

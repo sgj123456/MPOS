@@ -258,6 +258,30 @@ pub(crate) fn deliver(frame: &[u8]) {
 /// frame to the device. `Ok(())` means the frame left; a full queue is the
 /// device's `Err`, which the caller reads as `EIO`-worthy refusal.
 pub(crate) fn send(sock: &PacketSock, dst_mac: [u8; 6], payload: &[u8]) -> Result<usize, isize> {
+    let ethertype = if sock.protocol == 0 {
+        // `ETH_P_ALL` cannot be a frame's type; an untyped sender means the
+        // payload's own kind, and a DHCP client is a `htons(ETH_P_IP)` one.
+        // Written as the wire's `08 00` - the pattern, in memory order.
+        IPV4_ETHERTYPE
+    } else {
+        sock.protocol
+    };
+    send_frame(dst_mac, ethertype, payload)
+}
+
+/// The wire's `08 00` for `ETH_P_IP`, in memory order.
+pub(crate) const IPV4_ETHERTYPE: u16 = 0x0800u16.to_be();
+
+/// Put one frame on the wire: the header the kernel owns - destination as given,
+/// source the device's real MAC - and then the payload.
+///
+/// The header is built here rather than by each caller because there is more than
+/// one now: `send` above for a packet socket, whose protocol the caller chose, and
+/// the raw-IP door (`src/net/socket.rs`), which carries a complete IPv4 packet and
+/// therefore has to reach the device *without* smoltcp's raw-socket emit - that
+/// emit drops a queued packet whose IP protocol byte is not the socket's, and a
+/// DHCP client's packet is UDP while the channel is `IPPROTO_RAW` (§4.5).
+pub(crate) fn send_frame(dst_mac: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<usize, isize> {
     let mac = crate::net::packet_mac();
     let Some(mac) = mac else {
         return Err(crate::err::ENETDOWN);
@@ -265,14 +289,6 @@ pub(crate) fn send(sock: &PacketSock, dst_mac: [u8; 6], payload: &[u8]) -> Resul
     let mut frame = Vec::with_capacity(14 + payload.len());
     frame.extend_from_slice(&dst_mac);
     frame.extend_from_slice(&mac);
-    let ethertype = if sock.protocol == 0 {
-        // `ETH_P_ALL` cannot be a frame's type; an untyped sender means the
-        // payload's own kind, and a DHCP client is a `htons(ETH_P_IP)` one.
-        // Written as the wire's `08 00` - the pattern, in memory order.
-        0x0800u16.to_be()
-    } else {
-        sock.protocol
-    };
     frame.extend_from_slice(&ethertype.to_le_bytes());
     frame.extend_from_slice(payload);
     crate::net::packet_transmit(&frame)?;

@@ -17,15 +17,21 @@
 # than the caller asked for is the one failure this must not have. A test may
 # appear in more than one group, and then runs when any of them is asked for.
 #
-# One group is different in kind from the rest: a group **named after a machine**
-# is that machine's list of what it cannot serve yet. Only that machine's sweep
-# sees it, so its members are ungrouped - and in a plain sweep - everywhere else.
-# An exclusion written that way can never take a test out of the other machine's
-# gate. See `aarch64` at the bottom.
+# The file is written in the three sections every config file in this tree uses:
+# `[default]` is the baseline both machines read, and `[x86_64]`/`[aarch64]` are
+# each machine's own half. A group under `[default]` binds both sweeps; a group
+# under a machine's own section is that machine's alone and invisible to the
+# other, and it is *added* to the baseline's group of the same name rather than
+# replacing it - so `[aarch64] external = ["t-x"]` names one more program that
+# needs the internet there, without answering what `external` means elsewhere.
 #
 # The parser is the small one `rootfs.toml` uses: `key = value`, one array per
-# key (which may be written across several lines), and section headers are for
-# the reader. Group order in the output follows the name, not the line.
+# key (which may be written across several lines), and a key before any header -
+# or under a header that is not one of the three - is an error rather than a
+# group that silently stops leaving its tests out. Group order in the output
+# follows the name, not the line.
+
+[default]
 
 # Groups a plain `cargo xtask test` adds to the ungrouped tests. Empty - the
 # shipped value - means "the ungrouped ones", which is what the sweep should be:
@@ -36,7 +42,9 @@ default = []
 # user-mode stack, or a program listening on the host. A red one of these is a
 # statement about the internet or the host's own services before it is a
 # statement about the kernel - which is why the default sweep leaves them out,
-# and why they are worth running on purpose.
+# and why they are worth running on purpose. The reason is the same on both
+# machines: slirp's DHCP server and the host's resolver are outside either of
+# them.
 #
 #   t-dns, t-stdresolve  resolve real names through the host's resolver
 #   t-udp                sends a DNS query to 10.0.2.3 and reads the answer
@@ -86,27 +94,35 @@ slow = ["t-fill-ramfs", "t-forkcost", "t-netlat", "t-pipecost"]
 
 # Not a check at all. `t-sh` execs an interactive busybox ash onto the console
 # and prints what it observes about where the shell stopped; it is here to be
-# run by hand when a shell problem needs looking at. This group is the one
-# reason-group that binds *both* machines: a measurement instrument
-# (`t-forkcost`, `t-netlat`) is a different instrument on each machine, so
-# running it on both is right, but a diagnostic is the same thing everywhere -
-# and §15.34's rule bounds what a boot may assert by what the kernel itself
-# produces, which an interactive child's state letter is not. `external` and
-# `slow` stay x86_64-harness words; see `xtask/src/sweep.rs`'s `select`.
+# run by hand when a shell problem needs looking at. This is the one group that
+# is the same thing on both machines for a reason beyond the harness: a
+# measurement instrument (`t-forkcost`, `t-netlat`) is a different instrument on
+# each machine, so running it on both is right, but a diagnostic is one thing
+# everywhere - and §15.34's rule bounds what a boot may assert by what the
+# kernel itself produces, which an interactive child's state letter is not.
 diagnostic = ["t-sh"]
 
-# The second machine's own list: what aarch64 cannot serve yet. A group named
-# after a machine is invisible to the other machine's sweep, so every name here
-# still runs in x86_64's default sweep exactly as it did before - what this group
-# changes is the aarch64 arm, which leaves these out and prints them by name
-# rather than reporting them as failures or skipping them silently. The way to
-# shrink this group is to make the call work, not to edit a list of things nobody
-# runs (`NOTES.md` §13.4/§13.5).
+# The first machine's own half. Empty, and an empty section is that machine's
+# answer rather than a missing one: every group it needs is a group the baseline
+# already carries, and an `[x86_64]` with nothing under it says so in the place
+# a reader would look for it.
+[x86_64]
+
+# The second machine's own half, and the only group in it is `gaps` - what
+# aarch64 cannot serve yet.
 #
-# It is empty, and empty is the state to keep it in rather than a reason to delete
-# the group: the mechanism stays because the day a call cannot be served is the day
-# a name belongs here, and an empty list says "nothing is left" more plainly than
-# an absent section says anything at all.
+# `gaps` is different in kind from every other group in this file: it is an
+# exclusion rather than a reason. A reason can be asked for by name
+# (`--groups external`) because a program that needs the internet is a program
+# someone may want to run; a gap cannot, because a machine has no call for what
+# it cannot serve - `--groups gaps` is refused, and `--all-groups` still leaves
+# these out. Being written *here* rather than in `[default]` is what makes it
+# honest: the group is invisible to x86_64's sweep, so a test it lists stays in
+# the first machine's default sweep exactly as it did before - what changes is
+# the aarch64 arm, which leaves it out and prints it by name rather than
+# reporting it as a failure or skipping it silently. The way to shrink this
+# group is to make the call work, not to edit a list of things nobody runs
+# (`docs/notes/` §13.4/§13.5).
 #
 # Two families left it, both by making the call work:
 #
@@ -130,10 +146,8 @@ diagnostic = ["t-sh"]
 # missing handler:
 #
 #   t-arch-prctl  `arch_prctl` is x86_64's own call (arm64 has no number for
-#                it - TLS goes through other doors there). The program builds
-#                on both machines and says "skipped" on the second; naming it
-#                here keeps the sweep's question honest on both.
-#
-# What is left outside the machine is `external` above, and its reason is the
-# internet rather than this machine.
-aarch64 = ["t-arch-prctl"]
+#                 it - TLS goes through other doors there). The program builds
+#                 on both machines and says "skipped" on the second; naming it
+#                 here keeps the sweep's question honest on both.
+[aarch64]
+gaps = ["t-arch-prctl"]

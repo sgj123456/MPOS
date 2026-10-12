@@ -111,6 +111,10 @@ const PROP_OBJECT: u32 = 1 << 6;
 const PROP_ATOMIC: u32 = 1 << 31;
 /// `DRM_CLIENT_CAP_ATOMIC`, the capability number in `drm.h`.
 const CLIENT_CAP_ATOMIC: u64 = 3;
+/// `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`, the cap that makes a virtualized card's
+/// cursor plane publish its hotspot properties (`drm.h`). The cursor plane's
+/// `HOTSPOT_X`/`HOTSPOT_Y` are enumerated only for a client that has set it.
+const CLIENT_CAP_CURSOR_PLANE_HOTSPOT: u64 = 6;
 /// `PROP_PLANE_FB_ID` and `PROP_CRTC_ID`: this card's numbering for the two
 /// atomic properties the pin below looks for (`src/drivers/drm.rs`). The *name*
 /// is the ABI and the id is this card's, so each is used only after the
@@ -1265,6 +1269,73 @@ fn main() {
         "the cursor plane's CRTC_X reads back where the pointer is",
         property_id(fd, CURSOR_PLANE_ID, OBJECT_PLANE, b"CRTC_X").is_some(),
     );
+
+    // --- the cursor plane's hotspot, behind its cap ------------------------------------
+    // A virtualized card's cursor plane carries `HOTSPOT_X`/`HOTSPOT_Y`, and a
+    // client sees them only once it has set `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`.
+    // Before that cap this cursor plane must *not* list them - the same per-client
+    // gating `DRM_CLIENT_CAP_ATOMIC` gives the atomic properties, and the reason a
+    // compositor that never asked is not handed a property it will not set.
+    let mut pre_hotspot_ids = [0u32; 16];
+    let pre_hotspot_count = prop_list(fd, CURSOR_PLANE_ID, OBJECT_PLANE, &mut pre_hotspot_ids);
+    let pre_has_hotspot = ["HOTSPOT_X", "HOTSPOT_Y"]
+        .iter()
+        .any(|name| property_id(fd, CURSOR_PLANE_ID, OBJECT_PLANE, name.as_bytes()).is_some());
+    check_true(
+        &mut r,
+        "the cursor plane hides its hotspot before the cap is set",
+        !pre_has_hotspot,
+    );
+
+    let mut hot_cap = Cap {
+        capability: CLIENT_CAP_CURSOR_PLANE_HOTSPOT,
+        value: 1,
+    };
+    check_is(
+        &mut r,
+        "DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT is accepted",
+        unsafe {
+            ioctl(
+                fd,
+                ioc_d(NR_SET_CLIENT_CAP, size_of::<Cap>() as u32),
+                (&raw mut hot_cap) as *mut c_void,
+            )
+        },
+        0,
+    );
+
+    let x_id = property_id(fd, CURSOR_PLANE_ID, OBJECT_PLANE, b"HOTSPOT_X");
+    let y_id = property_id(fd, CURSOR_PLANE_ID, OBJECT_PLANE, b"HOTSPOT_Y");
+    check_true(
+        &mut r,
+        "and now the cursor plane lists HOTSPOT_X",
+        x_id.is_some(),
+    );
+    check_true(&mut r, "and HOTSPOT_Y", y_id.is_some());
+    // The cap adds to the list rather than replacing it: nothing the uncapped view
+    // showed is missing now (the same direction the ATOMIC cap is pinned on).
+    if let Some((hx, _)) = x_id {
+        let mut post_ids = [0u32; 16];
+        let post_count = prop_list(fd, CURSOR_PLANE_ID, OBJECT_PLANE, &mut post_ids);
+        check_true(
+            &mut r,
+            "the capped list still carries every id the uncapped one had",
+            pre_hotspot_ids[..pre_hotspot_count.min(16)]
+                .iter()
+                .all(|id| post_ids[..post_count.min(16)].contains(id)),
+        );
+        // A write to the hotspot reads back what was written - an accepted property
+        // whose value the read path reports, not one stored nowhere.
+        let _ = set_property(fd, 4, hx, CURSOR_PLANE_ID, OBJECT_PLANE);
+        check_is(
+            &mut r,
+            "and a HOTSPOT_X write reads back",
+            property_id(fd, CURSOR_PLANE_ID, OBJECT_PLANE, b"HOTSPOT_X")
+                .map(|(_, v)| v as i32)
+                .unwrap_or(-1) as isize,
+            4,
+        );
+    }
 
     // --- the object-typed properties carry their one value -----------------------------
     // An `OBJECT` property's value is the *kind* of object it points at, and it

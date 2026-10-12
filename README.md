@@ -301,7 +301,9 @@ the user test programs `tests.toml` selects — every program that is not in a g
 each to print `=== PASS` and the run to end with a `=== SUMMARY` line and QEMU exit code 33.
 The tests that need something outside the machine, or that measure rather than assert, are in
 groups and run by name (`--groups`, `--all-groups`), which is what keeps a red gate a statement
-about the kernel. See [Testing](#testing).
+about the kernel. Those reason groups live in `tests.toml`'s `[default]` section and bind both
+machines; each machine's own `[x86_64]`/`[aarch64]` section holds only its `gaps` — what that
+machine cannot serve yet, which no run may ask for by name. See [Testing](#testing).
 
 ---
 

@@ -2134,51 +2134,80 @@ driver opt-in rather than the compositor-facing family the sentence implied - th
 same finding, and the same correction, as `FB_DAMAGE_CLIPS` and `OUT_FENCE_PTR`
 further down that table.
 
-**The cursor is a plane now, and the cap is still refused for the reason the
-measurement gives.** The card has a second plane whose `type` is Cursor, listed by
-`GETPLANERESOURCES` and described by `GETPLANE`; the `plane_id` a `GETPLANE`
-carries finally selects *which* plane answers, where it used to be ignored
-entirely and every question was answered with the primary plane - a bug on its own,
-and a blocker for a second plane, since a compositor finds its cursor plane by
-asking about each id and reading `type` back. `MODE_CURSOR` and `MODE_CURSOR2` are
-the legacy door to the same plane; they are in the `PRESENTATION` list with the
-other requests that put pixels on the screen, because a pointer that keeps moving
-after the master loses its console is pixels.
+**The cursor is a plane, and it drives a host pointer.** The card has a second
+plane whose `type` is Cursor, listed by `GETPLANERESOURCES` and described by
+`GETPLANE`; the `plane_id` a `GETPLANE` carries finally selects *which* plane
+answers, where it used to be ignored entirely and every question was answered with
+the primary plane - a bug on its own, and a blocker for a second plane, since a
+compositor finds its cursor plane by asking about each id and reading `type` back.
+`MODE_CURSOR` and `MODE_CURSOR2` are the legacy door to the same plane; they are in
+the `PRESENTATION` list with the other requests that put pixels on the screen,
+because a pointer that keeps moving after the master loses its console is pixels.
 
-`DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` stays refused, and the measurement is why:
-`modetest -p` reports `type`, `IN_FORMATS` and `IN_FORMATS_ASYNC` as the *only*
-properties on any of the real card's four cursor planes, with no `HOTSPOT_X` or
-`HOTSPOT_Y` anywhere in the machine. Having a cursor plane is a different question
-from publishing hotspot properties, and the hotspot itself is not lost - it is in
-`MODE_CURSOR2`'s struct, which this card honours, and a compositor that needs it
-subtracts it from the position it asks for. So the cap is refused because there is
-no property for it to be about, which is exactly what a real card's cursor planes
-measure as.
+**`DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` is now accepted, and the earlier refusal was
+measured against the wrong card.** An older paragraph here kept the cap refused on the
+strength of `modetest -p` reporting `type`, `IN_FORMATS` and `IN_FORMATS_ASYNC` as the
+only properties on a real **amdgpu**'s cursor planes - no `HOTSPOT_X`/`HOTSPOT_Y`
+anywhere. That measurement is correct for amdgpu and was the wrong instrument for this
+device: virtio-gpu is one of the *virtualized* drivers the cap exists for, and Linux's
+own virtio-gpu publishes `HOTSPOT_X`/`HOTSPOT_Y` on its cursor plane behind exactly
+this cap. A weston boot made the consequence concrete: with the cap refused but the
+cursor plane still enumerated, weston reported `cursor planes: yes`, bound the plane,
+and got nothing on the window - the host renders a virtualized cursor only when the
+guest hands it a hotspot-correct image, and a guest that never took the cap could not.
+The cap is therefore recorded per open-file like `DRM_CLIENT_CAP_ATOMIC`, the two
+hotspot properties are published on the cursor plane gated to a client that set it, and
+the pointer point is carried through to the host (`Job::SetCursor`), which draws it.
+The coordinate convention moved with the path: the kernel subtracts the hotspot from
+the position before telling the device where the image's top-left goes, so accepting
+the cap does not shift the pointer.
 
 **The composition is the one thing here that is arithmetic, so it is the one thing
-in its own host-tested module.** There is no display controller to composite an
-overlay, so the cursor is blended into the scanout block by the same pass that fills
-it: `crates/gpu/src/cursor.rs` holds that blend - `ARGB8888` over `BGRA`, premultiplied,
-hotspot-pinned, clipped at all four edges in one intersection computed up front -
-with ten `cargo test` cases beside it, following `drm_blob.rs` and `evdev.rs`. The
-driver calls it at the end of every `copy_to_scanout`, which is what makes the two
-orderings come out right without either side knowing about the other: a
-compositor's flip lands *under* the pointer rather than erasing it, and a
-`MODE_CURSOR` move re-copies and re-blends, so the pointer moves without the
-compositor redrawing anything. The `ARGB8888` in that sentence is the format the
-fourcc correction above had to land first.
+in its own host-tested module - and it is now the *fallback*, not the primary path.**
+`crates/gpu/src/cursor.rs` holds the software blend - `ARGB8888` over `BGRA`,
+premultiplied, hotspot-pinned, clipped at all four edges in one intersection computed
+up front - with ten `cargo test` cases beside it, following `drm_blob.rs` and
+`evdev.rs`. On a device with no cursor queue the driver calls it at the end of every
+`copy_to_scanout`, which is what makes the two orderings come out right without either
+side knowing about the other: a compositor's flip lands *under* the pointer rather than
+erasing it, and a `MODE_CURSOR` move re-copies and re-blends, so the pointer moves
+without the compositor redrawing anything. On a device that *has* a cursor queue the
+host draws the pointer instead, so `paint_cursor` is skipped (`host_cursor_live()` gates
+the one call site) and a move costs one small cursor-queue command rather than a
+full-frame gather and flush. The `ARGB8888` in that sentence is the format the fourcc
+correction above had to land first.
 
-**Two gaps in this area are named rather than filled.** The cursor plane publishes
-`type`, `FB_ID`, `CRTC_ID`, `CRTC_X`, `CRTC_Y` and its own `IN_FORMATS` - no
-`SRC_*`/`CRTC_W`/`CRTC_H`, because this card's cursor has no scaler and no crop and
-a published-then-ignored property is the silent success `AGENTS.md` §3 forbids. A
-compositor that wants to crop or scale a cursor will not find the properties and
-will do it itself, which is the honest outcome but is narrower than a real card. And
-an unknown CRTC in `MODE_CURSOR` is `EINVAL`, which is what this file has always
-answered for an object it cannot use, where Linux's `drm_crtc_find` says `ENOENT`;
-the whole file would have to move together for that to change, so the cursor follows
-the file rather than splitting it. The cursor plane work is where the cap's answer belongs,
-and it had this measurement to build on rather than a guess.
+**One gap in this area is named rather than filled.** An unknown CRTC in
+`MODE_CURSOR` is `EINVAL`, which is what this file has always answered for an
+object it cannot use, where Linux's `drm_crtc_find` says `ENOENT`; the whole file
+would have to move together for that to change, so the cursor follows the file
+rather than splitting it. A second gap is named by necessity rather than choice: both
+configured machines' virtio-gpu devices expose a cursor queue, so the no-cursorq
+software-fallback branch cannot be exercised on this host - it is kept because a
+device without a second queue needs it, and it is stated as untested-here rather than
+claimed as measured.
+
+**The other one - "the cursor plane publishes no `SRC_*`/`CRTC_W`/`CRTC_H`" - was
+wrong, and the weston desktop caught it.** A wlroots or weston atomic state carries
+one `drm_plane_state` for *every* plane, and `drm_plane_state_add_props` names
+`SRC_X`/`SRC_Y`/`SRC_W`/`SRC_H` and `CRTC_W`/`CRTC_H` on each without first asking
+whether the plane has them. So when the compositor built its cursor-plane state, those
+six lookups returned handle 0; the commit reached the card as property 0, was refused,
+and took the whole commit down - weston logged `couldn't set plane state` /
+`atomic: couldn't compile atomic state`, and the pointer moved and clicked correctly
+but was never seen, because the plane stayed empty. The paragraph above had said a
+compositor wanting to crop or scale would "do it itself"; the measured truth is that
+weston does not ask first - it names the rectangles unconditionally, and a card that
+has not published them fails the commit rather than getting a smaller state. The plane
+now publishes all eleven (`type`, `FB_ID`, `CRTC_ID`, `CRTC_X`/`CRTC_Y`, the six
+rectangles and its own `IN_FORMATS`). They are *honoured*, not published-then-ignored,
+which is what keeps the `AGENTS.md` §3 rule the original paragraph invoked intact:
+this card's cursor has no scaler and no crop, so `Commit::cursor_rect_ok` accepts only
+the identity rectangle (the image whole, at its own size) and refuses a real crop or
+scale with `EINVAL` - the same answer a non-scaling hardware cursor plane gives. The kernel's
+atomic cursor path is complete by inspection; reading the pointer back on the window, and
+settling whether weston upscales its image to the cap this card answers (see R.7), is what
+closes it.
 
 Properties and caps, cheap one at a time and load-bearing in aggregate: `EDID`
 (a blob - with non-zero `mm_width`/`mm_height` and a `subconnector`, if anything
@@ -2187,8 +2216,9 @@ is ever to show a monitor's name), `non-desktop`, `max bpc`,
 `DRM_CAP_ASYNC_PAGE_FLIP` beside them, `GAMMA_LUT`/`GAMMA_LUT_SIZE`,
 `FB_DAMAGE_CLIPS` (the blob that lets a compositor say *what* changed instead of
 sending whole frames), `OUT_FENCE_PTR`, `IN_FORMATS` with
-`DRM_CAP_ADDFB2_MODIFIERS`, and `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` - refused
-today, and asked for precisely by the virtualized drivers.
+`DRM_CAP_ADDFB2_MODIFIERS`, and `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` - asked for
+precisely by the virtualized drivers, which is why this card accepts it (§7.4's cursor
+account above).
 
 **The list above was written from the sources, and measuring it corrected three
 of its entries.** `modetest -c -p` against the real card on the development host
@@ -2500,6 +2530,26 @@ it is the same absence as `DRM_CAP_ASYNC_PAGE_FLIP` being 0.
 > the point back, because reading 0 alone cannot tell "never had a point" from
 > "just been given point 0".
 
+**The sweep that followed found three faults, and one of them was the test's own.** With the
+cap path landed, `t-drm` and `t-drm-props` ran red on the next sweep - which is what the pins
+are for. `a HOTSPOT_X write reads back (got 0, want 4)`, `and HOTSPOT_Y` and
+`RMFB removes the cursor's framebuffer (got -22, want 0)` were the three. Two were the kernel's.
+`OBJ_SETPROPERTY`'s type check named `(OBJECT_PLANE, PLANE_ID)` and not
+`(OBJECT_PLANE, CURSOR_PLANE_ID)`, so every write to a cursor property was refused with `EINVAL`
+while the read of the same property still answered the old value - a half-written door, which is
+worse than a closed one, because a client that reads back what it wrote concludes the write
+worked. And the cursor plane's property list carried `HOTSPOT_X` and `HOTSPOT_Y` while its count
+stopped one short of the second, so a client that had set the cap was shown one of the two; the
+first fault's fix has to narrow the "shown" arm to the primary plane as well, or the cursor
+plane's `FB_ID` would walk into `copy_to_scanout` and paint the cursor image over the whole
+scanout. The third fault was the test's: `t-drm`'s `NR_RMFB` was `0xA4`, which is
+`MODE_GETGAMMA` - an ioctl number encodes the command *and* the argument size, so the wrong one
+is answered with the gamma request's `EINVAL`, and a test that reads that as "the card refuses
+to remove this framebuffer" is reading a refusal to a question it never asked. `MODE_RMFB` is
+`0xAF`, read out of `/usr/include/libdrm/drm.h` rather than written from memory, which is the
+same lesson the lease family already carried. The sweep after the fixes: `pass=175 fail=0`, both
+programs green, `rustfmt` clean.
+
 **Gate, quoted from its own summary**: host `615 passed`; `mpos-xtask 36 passed`;
 guest `=== SUMMARY pass=131 fail=0 (131 built)`, QEMU exit 33, `9 of 140 user
 tests left out by tests.toml` (the same nine as before, `t-drm-sync` being a
@@ -2713,7 +2763,7 @@ not "the window makes it right". It is a `docs/ROADMAP.md` item of its own.
 
 ---
 
-### R.7 (moved from ROADMAP's status board) — the weston seat chain, the compositor's cursor and console, and two gaps that have no evidence file yet
+### R.7 (moved from ROADMAP's status board) — the weston seat chain, the compositor's cursor and console, and the gaps that have since closed
 
 **`start-weston.sh` survives being run twice.** It asks whether a seatd is *answering* rather than whether `/run/seatd.sock` exists (a socket path outlives the daemon that bound it, here as on Linux), removes the stale name before a new daemon tries to bind it, and starts seatd in its own session: the script `exec`s into weston, so a seatd backgrounded there shared the compositor's process group and `^C` on the console — which signals the whole foreground group — used to kill the seat manager along with the desktop.
 
@@ -2721,10 +2771,10 @@ not "the window makes it right". It is a `docs/ROADMAP.md` item of its own.
 
 **`--mode gui` keyboard rule, stated exactly.** A keystroke reaches the active console's shell unless a compositor is *both* grabbing the device and holding the screen; that conjunction, not the grab alone, is what takes the keyboard off the shell, so a plain GUI console (nothing has grabbed the device) is typable again — as is the same console after `^A` moves its session off the screen while a stale claim survives (§7.1, `input::service`).
 
-**The pointer composited by the one flusher**, in a host-tested pure function (`crates/gpu/src/cursor.rs`, 10 host tests); `CRTC_X`/`CRTC_Y` steer rather than merely record (`t-drm-props`), and `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` stays refused, which the measurement shows is what a real card does (§7.4).
+**The pointer composited by the one flusher**, in a host-tested pure function (`crates/gpu/src/cursor.rs`, 10 host tests); `CRTC_X`/`CRTC_Y` steer rather than merely record (`t-drm-props`), and on a device with a cursor queue the host draws the pointer instead - `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` is accepted and `HOTSPOT_X`/`HOTSPOT_Y` published behind it, and binding or moving the plane posts virtio-gpu `UPDATE_CURSOR`/`MOVE_CURSOR` (§7.4). The software blend remains the no-cursorq fallback.
 
 **The two blobs the property families point at, as pure encoders** in `crates/gpu/src/blob.rs` with 15 host tests — `drivers/drm.rs` is kernel-only, so the bytes a real reader parses had to live somewhere a host can check them. Verified against `edid-decode` rather than only against the module's own decoder, which caught a real bug (a descriptor's first two bytes) (§7.4).
 
-**Gap, no evidence file yet — the aarch64 session.** A login shell on the aarch64 image has no `XDG_RUNTIME_DIR` (measured 2026-10-11) and weston started from it stops at `fatal: failed to add socket`; supplied by hand, the compositor comes up. The files that provide it are being moved into the shared `core/` overlay by work in flight as this was measured, so re-measure before acting on it (§15.36).
+**Gap closed — the aarch64 session environment.** A login shell on the aarch64 image had no `XDG_RUNTIME_DIR` (measured 2026-10-11) and weston started from it stopped at `fatal: failed to add socket`. The files that provide it now ship in the shared `core/` overlay, so both machines' login shells have it (§15.36/§15.37).
 
-**Gap, no evidence file yet — weston's EL0 write fault.** With a runtime dir weston reaches `Compositor capabilities:`, creates `wayland-1`, loads `desktop-shell.so` and launches both helper processes, and then takes a genuine EL0 **write** fault one page above its stack pointer (`ESR 0x92000047`, a level-3 translation fault the resolver refused for want of a VMA) — the next thing to measure (§15.36).
+**Gap closed — weston's EL0 write fault, and the cursor it was hiding.** With a runtime dir weston used to reach `Compositor capabilities:`, create `wayland-1`, load `desktop-shell.so` and launch both helper processes, then take a genuine EL0 **write** fault one page above its stack pointer (`ESR 0x92000047`, a level-3 translation fault with `WnR` set) that the resolver refused for want of a VMA (§15.36's last note). The desktop now comes up whole: the fault is resolved by `resolve_stack_growth` on the aarch64 EL0 data-abort path (`arch/src/arch/aarch64/vectors.rs`, alongside the COW and anon resolvers), so the push past the stack boundary grows the stack instead of ending the task. What that boot then showed was the pointer never appearing even though the desktop rendered — and two causes were behind it, both now fixed. First, this card's cursor plane had failed to publish the rectangles weston names unconditionally; §7.4 carries the measurement and the fix (the plane publishes `SRC_*`/`CRTC_W`/`CRTC_H` and honours them as identity-or-refuse). Second, and the reason a *correctly bound* plane still drew nothing on a virtualized display: the card refused `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` while still enumerating the cursor plane, so weston reported `cursor planes: yes`, bound the plane through atomic, and the host - which only draws a virtualized cursor handed a hotspot-correct image over the virtio-gpu cursor queue - showed nothing. The card drove its own software blend into the scanout and never configured the device's cursor queue at all. The fix routes the pointer to the host: the cursor queue is configured when the device has one (probed at bring-up, published as `Card::cursor_q`), the hotspot cap is accepted and `HOTSPOT_X`/`HOTSPOT_Y` are published per-client, and binding or moving the plane posts `UPDATE_CURSOR`/`MOVE_CURSOR` on the cursor queue (`Job::SetCursor`/`MoveCursor`) so the host composites the pointer over whatever frame the guest presents; the software blend remains only as the fallback for a device with no second queue. Pins: `t-drm-props` proves the cap + hotspot enumeration gating, `t-drm` proves an `RMFB` of the cursor's framebuffer takes the plane's binding down (no dangling host resource). **Window confirmation is the remaining step:** the kernel path is complete and gated green on the host and both bare-metal builds, but reading the pointer back on the QEMU window after a `cargo xtask run --mode gui` weston boot is what closes this gap for real, and the no-cursorq fallback branch cannot be exercised on either configured machine (§7.4 names that as a gap).

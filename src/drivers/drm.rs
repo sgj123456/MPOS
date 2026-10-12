@@ -134,6 +134,23 @@ const PROP_IN_FORMATS: u32 = 94;
 /// two ends are 0 and the whole 64-bit span, since the value is an address and
 /// not a number with a meaning of its own.
 const PROP_OUT_FENCE_PTR: u32 = 95;
+/// The cursor plane's `HOTSPOT_X`/`HOTSPOT_Y`: the pixel of the cursor image that
+/// is the actual pointer point, which a compositor sets when it has bound an image
+/// and reads back as part of the plane's state.
+///
+/// These exist because this card *is* one of the virtualized drivers the cap is
+/// named for: Linux's virtio-gpu publishes them on its cursor plane, and a client
+/// only sees them once it has set `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`. They are
+/// gated per open file exactly like [`ATOMIC_PROPS`] - see [`PROP_HOTSPOT_X`]'s
+/// use in the two list doors - so a client that never asked is not shown them.
+/// The §7.4 record explains why an earlier note here refused the cap on the
+/// strength of a non-virtualized amdgpu measurement that did not apply to this
+/// device.
+const PROP_HOTSPOT_X: u32 = 96;
+const PROP_HOTSPOT_Y: u32 = 97;
+/// The two hotspot properties, listed together so the two enumeration doors can
+/// hide both at once and cannot drift apart on one of them.
+const HOTSPOT_PROPS: [u32; 2] = [PROP_HOTSPOT_X, PROP_HOTSPOT_Y];
 /// The connector's property list, in one place: `GETCONNECTOR` and
 /// `OBJ_GETPROPERTIES` both report it, and a client that read it from one and
 /// not the other would see two different connectors.
@@ -874,6 +891,15 @@ struct DrmState {
     cursor_crtc: u32,
     cursor_pos: (i32, i32),
     cursor_hotspot: (i32, i32),
+    /// The device resource the host cursor is currently drawn from, and the
+    /// framebuffer it was made from - `Some((res_id, fb_id))` once an image has
+    /// been transferred to the host and shown there. It exists so a pointer move
+    /// sends only `MOVE_CURSOR` rather than re-transferring the image every frame,
+    /// and so a *rebind* (a different `fb_id`) is recognized as needing the full
+    /// create+transfer+update again. `None` means no host cursor is showing; the
+    /// id is taken from [`DrmState::next_res_id`] like any other resource, never a
+    /// fixed constant that could alias one. See `show_cursor`.
+    cursor_resource: Option<(u32, u32)>,
     /// Property blobs, by id (1-based, as every id space here is). A mode
     /// arrives as one, and so does a damage-rectangle list.
     blobs: Vec<Option<Vec<u8>>>,
@@ -928,6 +954,13 @@ struct DrmState {
     /// answers every one of them the same either way; storing them would be
     /// state with no reader. This one has a reader: the list doors.
     atomic_ofds: Vec<u64>,
+    /// The open file descriptions that have set `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`.
+    /// The cursor plane's [`HOTSPOT_PROPS`] are enumerated only for these, exactly
+    /// as [`Self::atomic_ofds`] gates the atomic properties - the cap is per client,
+    /// and a description that never asked must not be shown a property it will not
+    /// set. Cleared on close and on losing master, so a recycled `ofd` cannot inherit
+    /// another client's view (§7.4's leak lesson).
+    hotspot_ofds: Vec<u64>,
 }
 
 mod drm_event {
@@ -971,6 +1004,7 @@ static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
     cursor_crtc: CRTC_ID,
     cursor_pos: (0, 0),
     cursor_hotspot: (0, 0),
+    cursor_resource: None,
     blobs: Vec::new(),
     edid_bytes: None,
     edid_dims: (0, 0),
@@ -981,6 +1015,7 @@ static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
     events: VecDeque::new(),
     syncobjs: Vec::new(),
     atomic_ofds: Vec::new(),
+    hotspot_ofds: Vec::new(),
 }));
 
 /// The `drm_version` answer: the KMS ABI version this kernel speaks (4.0), and
@@ -1196,13 +1231,42 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_ADDFB2 => add_fb2(arg, ofd),
         NR_RMFB => {
             let id = unsafe { (arg as *const u32).read_unaligned() };
-            critical_section::with(|cs| {
-                for fb in STATE.borrow(cs).borrow_mut().fbs.iter_mut() {
+            let cursor_died = critical_section::with(|cs| {
+                let mut st = STATE.borrow(cs).borrow_mut();
+                for fb in st.fbs.iter_mut() {
                     if fb.as_ref().is_some_and(|f| f.id == id) {
                         *fb = None;
                     }
                 }
+                // Removing the framebuffer the host pointer is drawn from takes the
+                // binding down and hands back the resource, so the caller can hide +
+                // release it outside the lock. Without this the device would keep an
+                // `UPDATE_CURSOR` naming a released resource - the dangling-id case
+                // `release_framebuffers` closes on the close path, and `RMFB` is the
+                // other door to the same framebuffer going away.
+                if st.cursor_fb == id {
+                    st.cursor_fb = 0;
+                    st.cursor_resource.take()
+                } else {
+                    None
+                }
             });
+            if let Some((res, _)) = cursor_died {
+                if host_cursor_live() {
+                    let _ = crate::drivers::video::render::job(
+                        crate::drivers::video::render::Job::SetCursor {
+                            id: 0,
+                            x: 0,
+                            y: 0,
+                            hot_x: 0,
+                            hot_y: 0,
+                        },
+                    );
+                    let _ = crate::drivers::video::render::job(
+                        crate::drivers::video::render::Job::DestroyCursor { id: res },
+                    );
+                }
+            }
             0
         }
         NR_PAGE_FLIP => page_flip(arg, card.lease()),
@@ -3021,6 +3085,7 @@ pub fn master_closed(ofd: u64) {
         st.syncobjs
             .retain(|rec| rec.as_ref().is_none_or(|rec| rec.owner != ofd));
         st.atomic_ofds.retain(|&owner| owner != ofd);
+        st.hotspot_ofds.retain(|&owner| owner != ofd);
     });
     release_framebuffers(ofd);
 }
@@ -3075,7 +3140,7 @@ pub fn close_at_exit(files: &[Arc<crate::vfs::File>], _owner: u32) {
 /// which is what a compositor's exit looks like on a real card too, and what
 /// lets the text console take the screen over from here.
 fn release_framebuffers(ofd: u64) {
-    critical_section::with(|cs| {
+    let cursor_died = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         let gone: Vec<u32> = st
             .fbs
@@ -3085,16 +3150,39 @@ fn release_framebuffers(ofd: u64) {
             .map(|f| f.id)
             .collect();
         if gone.is_empty() {
-            return;
+            return None;
         }
         st.fbs.retain(|f| f.as_ref().is_none_or(|f| f.owner != ofd));
         if gone.contains(&st.current_fb) {
             st.current_fb = 0;
         }
+        // The cursor framebuffer going means the host pointer is now drawn from a
+        // resource whose backing this client no longer owns. Take the binding down
+        // and hand back the resource id so the caller can hide + release it *outside*
+        // the lock (a device command parks, and parking here would be parking in the
+        // close path holding `STATE`).
         if gone.contains(&st.cursor_fb) {
             st.cursor_fb = 0;
+            st.cursor_resource.take()
+        } else {
+            None
         }
     });
+    if let Some((id, _)) = cursor_died {
+        if host_cursor_live() {
+            let _ =
+                crate::drivers::video::render::job(crate::drivers::video::render::Job::SetCursor {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    hot_x: 0,
+                    hot_y: 0,
+                });
+            let _ = crate::drivers::video::render::job(
+                crate::drivers::video::render::Job::DestroyCursor { id },
+            );
+        }
+    }
 }
 
 /// Whether the card fd should report hang-up: true from the moment a master
@@ -3353,19 +3441,30 @@ fn set_client_cap(arg: usize, ofd: u64) -> isize {
             });
             0
         }
-        // Refused because the object behind them does not exist here: no
-        // plane with a color pipeline, and no `HOTSPOT_X`/`HOTSPOT_Y` plane
-        // property for the cursor cap to be about. That last one is the
-        // *measurement* rather than a shortcut - `modetest -p` on the real
-        // amdgpu card reports `type`, `IN_FORMATS` and `IN_FORMATS_ASYNC` as
-        // the only properties on any of its four cursor planes, with no
-        // hotspot property anywhere in the machine - so a real card refuses
-        // this cap's premise too, and a driver opting in is what the cap is
-        // for. Having a cursor *plane* is not the same thing: the hotspot a
-        // compositor needs is also carried by `MODE_CURSOR2`'s struct, which
-        // this card honours. `EOPNOTSUPP` is Linux's answer for a cap the
-        // driver declares it does not do, and this card answers it honestly.
-        CLIENT_CAP_CURSOR_PLANE_HOTSPOT | CLIENT_CAP_PLANE_COLOR_PIPELINE => -95,
+        // The cursor plane's hotspot pair, recorded per description exactly like
+        // `CLIENT_CAP_ATOMIC`: it is a second cap with its own reader (the two list
+        // doors hide [`HOTSPOT_PROPS`] for a client that has not set it), so a
+        // compositor that asks sees `HOTSPOT_X`/`HOTSPOT_Y` on the cursor plane and
+        // one that does not, does not. A `value` of 0 unsets it, the same teardown
+        // request weston makes. This card accepts the cap because it *is* one of the
+        // virtualized drivers the cap names: Linux's virtio-gpu publishes the hotspot
+        // properties behind it, and an earlier note here refused it on the strength of
+        // a non-virtualized amdgpu measurement - §7.4 records why that was the wrong
+        // instrument.
+        CLIENT_CAP_CURSOR_PLANE_HOTSPOT => {
+            critical_section::with(|cs| {
+                let mut st = STATE.borrow(cs).borrow_mut();
+                st.hotspot_ofds.retain(|&owner| owner != ofd);
+                if value == 1 {
+                    st.hotspot_ofds.push(ofd);
+                }
+            });
+            0
+        }
+        // Refused because the object behind it does not exist here: no plane has a
+        // color pipeline, so there is nothing for the plane-color cap to be about.
+        // `EOPNOTSUPP` is Linux's answer for a cap the driver declares it does not do.
+        CLIENT_CAP_PLANE_COLOR_PIPELINE => -95,
         // A capability number the driver has never heard of is not "not
         // supported", it is not a request at all, and Linux says so.
         _ => libc_einval(),
@@ -3690,10 +3789,25 @@ fn copy_to_scanout(st: &DrmState, fb_id: u32) -> isize {
             dumb.copy_span(y * dumb.pitch as usize, scanout.add(y * scan_pitch), row);
         }
     }
-    // The pointer goes on last, over the frame that was just copied. See
-    // [`paint_cursor`] for why this is the right place for it.
-    paint_cursor(st, scanout, screen_w, screen_h);
+    // The pointer goes on last, over the frame that was just copied - *unless*
+    // this device renders the pointer itself. When it does ([`host_cursor_live`]),
+    // the scanout carries only the compositor's frame and the host composites the
+    // cursor over it, so blending here would draw a second pointer into the frame
+    // the host already has one on. See [`paint_cursor`] for why this is the right
+    // place for the software path.
+    if !host_cursor_live() {
+        paint_cursor(st, scanout, screen_w, screen_h);
+    }
     0
+}
+
+/// Whether the host renders the pointer, so the kernel must not blend one into the
+/// scanout. True exactly when the device published a cursor queue at bring-up;
+/// false on a card with no second queue, where [`paint_cursor`] is the presentation
+/// path. One predicate, read at the single blend call site above, which is what
+/// makes the two paths auditable against each other rather than scattered.
+fn host_cursor_live() -> bool {
+    card().cursor_q
 }
 
 /// Draw the cursor plane onto the scanout, over whatever the framebuffer copy has
@@ -3908,7 +4022,7 @@ fn get_connector(arg: usize, ofd: u64) -> isize {
     let visible = if atomic {
         all
     } else {
-        without_atomic(&mut visible_props, &mut visible_values, all)
+        without_props(&mut visible_props, &mut visible_values, all, &ATOMIC_PROPS)
     };
     unsafe {
         let p = arg as *mut u8;
@@ -4080,6 +4194,24 @@ fn get_property(arg: usize) -> isize {
         PROP_CRTC_Y => ("CRTC_Y", PROP_RANGE, &[0, u32::MAX as u64], &[]),
         PROP_CRTC_W => ("CRTC_W", PROP_RANGE, &[0, u32::MAX as u64], &[]),
         PROP_CRTC_H => ("CRTC_H", PROP_RANGE, &[0, u32::MAX as u64], &[]),
+        // The cursor image's hotspot: the pixel of the image that is the pointer
+        // point. Signed ranges bounded by the largest cursor this card takes, which
+        // is what a real virtio-gpu cursor plane carries and why they are signed -
+        // a compositor may name a hotspot at or beyond an edge. Only the *cursor*
+        // plane has them; see [`HOTSPOT_PROPS`] for the cap that gates their
+        // enumeration.
+        PROP_HOTSPOT_X => (
+            "HOTSPOT_X",
+            PROP_RANGE | PROP_SIGNED_RANGE,
+            &[0, CURSOR_SIZE],
+            &[],
+        ),
+        PROP_HOTSPOT_Y => (
+            "HOTSPOT_Y",
+            PROP_RANGE | PROP_SIGNED_RANGE,
+            &[0, CURSOR_SIZE],
+            &[],
+        ),
         // How the plane's pixels are composited onto what is below them.
         // The scanout carries the compositor's finished frame, so
         // pre-multiplied alpha is what it is set to; the property exists
@@ -4273,6 +4405,27 @@ fn set_object_prop(st: &mut DrmState, obj: u32, prop_id: u32, value: u64) -> isi
         (CURSOR_PLANE_ID, PROP_PLANE_CRTC_ID) => st.cursor_crtc = value as u32,
         (CURSOR_PLANE_ID, PROP_CRTC_X) => st.cursor_pos.0 = value as i32,
         (CURSOR_PLANE_ID, PROP_CRTC_Y) => st.cursor_pos.1 = value as i32,
+        // The cursor's hotspot: the pixel of the image that is the pointer point,
+        // recorded so a read-back reports what was written and so the host-cursor
+        // path (`Job::SetCursor`) can subtract it from `cursor_pos` to place the
+        // image's top-left where the device expects. A signed write outside the
+        // largest cursor is refused rather than stored, matching the range
+        // [`get_property`] advertises - the same "an accepted write is what the
+        // read says" rule every ranged property here follows.
+        (CURSOR_PLANE_ID, PROP_HOTSPOT_X) => {
+            let v = value as i64;
+            if !(0..=(CURSOR_SIZE as i64)).contains(&v) {
+                return libc_einval();
+            }
+            st.cursor_hotspot.0 = v as i32
+        }
+        (CURSOR_PLANE_ID, PROP_HOTSPOT_Y) => {
+            let v = value as i64;
+            if !(0..=(CURSOR_SIZE as i64)).contains(&v) {
+                return libc_einval();
+            }
+            st.cursor_hotspot.1 = v as i32
+        }
         // The cursor's rectangle, accepted rather than recorded: the only one
         // this card honours is the image's own, so by the time a write reaches
         // here the commit has already established that this is it
@@ -4359,14 +4512,31 @@ fn obj_set_property(arg: usize) -> isize {
     let prop_id = unsafe { ((arg + 8) as *const u32).read_unaligned() };
     let obj_id = unsafe { ((arg + 12) as *const u32).read_unaligned() };
     let obj_type = unsafe { ((arg + 16) as *const u32).read_unaligned() };
+    // Both planes are named here, not just the primary: the cursor plane is a
+    // plane to every caller that reads it, and its properties are settable, so
+    // a type check that knew only `PLANE_ID` turned *every* write to a cursor
+    // property into `EINVAL` while the read of the same property went on
+    // reporting the old value. That is the shape `t-drm-props` caught as
+    // `a HOTSPOT_X write reads back (got 0, want 4)`.
     let matches_type = matches!(
         (obj_type, obj_id),
-        (OBJECT_CONNECTOR, CONNECTOR_ID) | (OBJECT_CRTC, CRTC_ID) | (OBJECT_PLANE, PLANE_ID)
+        (OBJECT_CONNECTOR, CONNECTOR_ID)
+            | (OBJECT_CRTC, CRTC_ID)
+            | (OBJECT_PLANE, PLANE_ID)
+            | (OBJECT_PLANE, CURSOR_PLANE_ID)
     );
     if !matches_type {
         return libc_einval();
     }
-    let shown = prop_id == PROP_PLANE_FB_ID;
+    // The *primary* plane's buffer is the one write this door acts on by
+    // copying: a caller that sets it outside a commit is asking for that
+    // buffer to be on the screen now. The cursor plane's buffer is a different
+    // present - the pointer is the host's to draw on a device with a cursor
+    // queue, and a blend over the master's frame on one without - so it is
+    // presented below the way `MODE_CURSOR` presents its own image, never by
+    // copying the cursor image over the whole scanout.
+    let shown = prop_id == PROP_PLANE_FB_ID && obj_id == PLANE_ID;
+    let cursor_image = prop_id == PROP_PLANE_FB_ID && obj_id == CURSOR_PLANE_ID;
     let rc = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         if shown {
@@ -4386,6 +4556,30 @@ fn obj_set_property(arg: usize) -> isize {
     });
     if rc == 0 && shown {
         crate::drivers::video::render::request_flush_blocking();
+        return rc;
+    }
+    if rc == 0 && cursor_image {
+        // The same two presents `MODE_CURSOR` makes, for the same reason: on a
+        // device with a cursor queue one small command moves the pointer, and
+        // on one without, the frame is rebuilt around the new image and
+        // flushed. Nothing is drawn when there is no frame to draw over - the
+        // image and position are recorded either way, so it appears with the
+        // next commit.
+        if host_cursor_live() {
+            let _ = show_cursor();
+        } else {
+            let rc = critical_section::with(|cs| {
+                let st = STATE.borrow(cs).borrow();
+                if st.current_fb == 0 {
+                    return 0;
+                }
+                copy_to_scanout(&st, st.current_fb)
+            });
+            if rc == 0 {
+                crate::drivers::video::render::request_flush_blocking();
+            }
+            return rc;
+        }
     }
     rc
 }
@@ -4545,11 +4739,18 @@ fn mode_atomic(arg: usize) -> isize {
         if let Some(fb) = plan.plane_fb.filter(|f| *f != 0)
             && !fb_fits_at(&st, fb, fit_w, fit_h)
         {
+            crate::println!("mpos-dbg: EINVAL from fb_fits_at fb={fb} fit={fit_w}x{fit_h}");
             return (libc_einval(), None);
         }
         // The cursor's rectangle, which has to be the identity for the image
         // the commit is binding - see `Commit::cursor_rect_ok`.
         if !plan.cursor_rect_ok(&st) {
+            crate::println!(
+                "mpos-dbg: EINVAL from cursor_rect_ok src={:?} dst={:?} cfb={:?}",
+                plan.cursor_src,
+                plan.cursor_dst,
+                st.cursor_fb
+            );
             return (libc_einval(), None);
         }
         // A rehearsal is answered by the checks above and drives no resize.
@@ -4624,18 +4825,25 @@ fn mode_atomic(arg: usize) -> isize {
         0
     });
     if rc == 0 {
-        // A commit that moved the pointer carried no new frame, and the pointer is
-        // drawn in the copy - so the master's framebuffer is copied again here,
-        // with the new position, before the flush that makes it visible. Same
-        // reasoning as `mode_cursor`'s, and the reason an atomic cursor move and a
-        // legacy one are equally prompt.
+        // A commit that touched the pointer has to make it visible. On a device with
+        // a cursor queue that means handing the image/position to the host
+        // (`show_cursor`), and *not* re-copying the master's framebuffer - the host
+        // composites the pointer over whatever frame is already there, so a move costs
+        // one cursor-queue command rather than a full gather. On a device without one,
+        // the pointer is drawn in the copy, so the frame is rebuilt around it exactly
+        // as before. Same reasoning as `mode_cursor`, and the reason an atomic cursor
+        // move and a legacy one are equally prompt on either path.
         if cursor_touched {
-            critical_section::with(|cs| {
-                let st = STATE.borrow(cs).borrow();
-                if st.current_fb != 0 {
-                    let _ = copy_to_scanout(&st, st.current_fb);
-                }
-            });
+            if host_cursor_live() {
+                let _ = show_cursor();
+            } else {
+                critical_section::with(|cs| {
+                    let st = STATE.borrow(cs).borrow();
+                    if st.current_fb != 0 {
+                        let _ = copy_to_scanout(&st, st.current_fb);
+                    }
+                });
+            }
         }
         // The out-fence's descriptor, made *before* the frame is flushed, so
         // that a caller with no descriptor left hears `EMFILE` from a commit
@@ -4690,6 +4898,11 @@ struct Commit {
     cursor_fb: Option<u32>,
     cursor_src: Option<(u32, u32, u32, u32)>,
     cursor_dst: Option<(u32, u32)>,
+    /// The hotspot this commit names for the cursor plane, if it names one. Kept
+    /// so a commit that sets an image and its hotspot in one atomic request lands
+    /// both together - the same coupling that makes `MODE_CURSOR2`'s struct carry
+    /// them as a pair - rather than binding the image at a stale offset.
+    cursor_hotspot: Option<(i32, i32)>,
     /// `IN_FENCE_FD`'s value: the descriptor the commit was handed, or -1 for
     /// the property's own spelling of "no fence". Kept as a number here and
     /// resolved to a fence before any lock is taken, because a descriptor number
@@ -4733,6 +4946,8 @@ impl Commit {
                 | (CURSOR_PLANE_ID, PROP_PLANE_CRTC_ID)
                 | (CURSOR_PLANE_ID, PROP_CRTC_X)
                 | (CURSOR_PLANE_ID, PROP_CRTC_Y)
+                | (CURSOR_PLANE_ID, PROP_HOTSPOT_X)
+                | (CURSOR_PLANE_ID, PROP_HOTSPOT_Y)
         ) || (obj == PLANE_ID && (PROP_SRC_X..=PROP_CRTC_H).contains(&prop))
             || (obj == CURSOR_PLANE_ID && (PROP_SRC_X..=PROP_CRTC_H).contains(&prop));
         if !known {
@@ -4769,6 +4984,20 @@ impl Commit {
                         d.1 = value as u32;
                     }
                     self.cursor_dst = Some(d);
+                }
+                // The hotspot, kept so a commit that binds an image and names its
+                // pointer point in one request lands both together. Signed like the
+                // property's range; the write path validates it against the same
+                // bound `set_object_prop` uses, so the two doors agree.
+                PROP_HOTSPOT_X => {
+                    let mut h = self.cursor_hotspot.unwrap_or((0, 0));
+                    h.0 = value as i64 as i32;
+                    self.cursor_hotspot = Some(h);
+                }
+                PROP_HOTSPOT_Y => {
+                    let mut h = self.cursor_hotspot.unwrap_or((0, 0));
+                    h.1 = value as i64 as i32;
+                    self.cursor_hotspot = Some(h);
                 }
                 _ => {}
             }
@@ -5022,21 +5251,25 @@ fn destroy_blob(arg: usize) -> isize {
     })
 }
 
-/// The properties of a list a client without `DRM_CLIENT_CAP_ATOMIC` is shown:
-/// the ones in [`ATOMIC_PROPS`] are taken out, in place, and the count comes
-/// back with them. `values` runs parallel to `ids` and is compacted the same
-/// way, because a caller reads the two as pairs.
+/// The properties of a list a client that has not set the cap behind them is
+/// shown: the ones in `hidden` are taken out, in place, and the count comes back
+/// with them. `values` runs parallel to `ids` and is compacted the same way,
+/// because a caller reads the two as pairs.
 ///
 /// The filter sits over an already-built list rather than inside every arm that
-/// builds one, because an object's *contents* and who may see them are two
-/// facts and only the second is what the cap changes. It is also the same skip
-/// `GETCONNECTOR` makes over its own list, from the same table - the two must
-/// agree, since a client reading a connector from one door and the other would
-/// otherwise be handed two different connectors.
-fn without_atomic(ids: &mut [u32], values: &mut [u64], count: usize) -> usize {
+/// builds one, because an object's *contents* and who may see them are two facts
+/// and only the second is what the cap changes. It serves both gated families -
+/// [`ATOMIC_PROPS`] for `DRM_CLIENT_CAP_ATOMIC` and [`HOTSPOT_PROPS`] for
+/// `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` - from one code path, which is what keeps
+/// the two enumeration doors (`GETCONNECTOR` and `OBJ_GETPROPERTIES`) agreeing on
+/// any given object; a client reading a connector from one door and the other would
+/// otherwise be handed two different connectors. The §7.4 measurement saw exactly
+/// this on a connector: seventeen properties to a description without the cap,
+/// eighteen with it, and per *description*.
+fn without_props(ids: &mut [u32], values: &mut [u64], count: usize, hidden: &[u32]) -> usize {
     let mut kept = 0;
     for index in 0..count {
-        if ATOMIC_PROPS.contains(&ids[index]) {
+        if hidden.contains(&ids[index]) {
             continue;
         }
         ids[kept] = ids[index];
@@ -5240,8 +5473,8 @@ fn obj_get_properties(arg: usize, ofd: u64) -> isize {
                         PROP_SRC_W,
                         PROP_SRC_H,
                         PROP_IN_FORMATS,
-                        0,
-                        0,
+                        PROP_HOTSPOT_X,
+                        PROP_HOTSPOT_Y,
                         0,
                         0,
                     ],
@@ -5258,29 +5491,38 @@ fn obj_get_properties(arg: usize, ofd: u64) -> isize {
                         iw as u64,
                         ih as u64,
                         DRIVER_BLOB_CURSOR_IN_FORMATS as u64,
-                        0,
-                        0,
+                        st.cursor_hotspot.0 as i64 as u64,
+                        st.cursor_hotspot.1 as i64 as u64,
                         0,
                         0,
                     ],
-                    11usize,
+                    // Both hotspots are in the list, so both are in the count.
+                    // Thirteen enumerated `HOTSPOT_X` (index 12) and left
+                    // `HOTSPOT_Y` (13) sitting past the end of its own array -
+                    // which measured as a client that had set the cap being
+                    // shown one of the two properties the cap is for.
+                    14usize,
                 ))
             }
             _ => None,
         };
         let (mut ids, mut values, count) = list?;
-        // What this client is shown. A description that has not set
-        // `DRM_CLIENT_CAP_ATOMIC` is not shown the atomic properties *at all* -
-        // not a smaller list of values, but a shorter list of ids - which is
-        // what the measurement on this host's card found on a CRTC (six
-        // properties uncapped, nine capped) and on a connector (seventeen and
-        // eighteen, the difference being `CRTC_ID`). Asking for one by id is a
-        // different door and is not filtered here; see [`get_property`].
-        let count = if st.atomic_ofds.contains(&ofd) {
-            count
-        } else {
-            without_atomic(&mut ids, &mut values, count)
-        };
+        // What this client is shown. A description that has not set a cap is not
+        // shown the properties behind it *at all* - not a smaller list of values,
+        // but a shorter list of ids - which is what the measurement on this host's
+        // card found on a CRTC (six properties uncapped, nine capped) and on a
+        // connector (seventeen and eighteen, the difference being `CRTC_ID`). Two
+        // gated families run through the same filter here: the atomic properties for
+        // `DRM_CLIENT_CAP_ATOMIC`, and the cursor plane's hotspot pair for
+        // `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`. Asking for one by id is a different
+        // door and is not filtered here; see [`get_property`].
+        let mut count = count;
+        if !st.atomic_ofds.contains(&ofd) {
+            count = without_props(&mut ids, &mut values, count, &ATOMIC_PROPS);
+        }
+        if !st.hotspot_ofds.contains(&ofd) {
+            count = without_props(&mut ids, &mut values, count, &HOTSPOT_PROPS);
+        }
         Some((ids, values, count))
     }) else {
         return libc_einval();
@@ -5651,6 +5893,22 @@ fn destroy_handle(handle: usize) -> isize {
     let found = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         st.prime.retain(|record| record.handle as usize != handle);
+        // If this handle backs the framebuffer the host pointer is drawn from, the
+        // cursor binding and its separate device resource go with it. Cleared here so
+        // the caller hides + releases the cursor *before* the `Unref` below - push
+        // order keeps the device from ever seeing an `UPDATE_CURSOR` name a resource
+        // whose pages are already gone. The cursor's own resource id differs from the
+        // dumb buffer's `res`, so the two releases do not collide.
+        let cursor_died = st
+            .fbs
+            .iter()
+            .filter_map(|f| f.as_ref())
+            .any(|f| f.id == st.cursor_fb && f.handle as usize == handle)
+            .then(|| st.cursor_resource.take().map(|(id, _)| id))
+            .flatten();
+        if cursor_died.is_some() {
+            st.cursor_fb = 0;
+        }
         match st.dumb.get_mut(handle - 1) {
             Some(slot) if slot.is_some() => {
                 let res = slot
@@ -5661,14 +5919,31 @@ fn destroy_handle(handle: usize) -> isize {
                     d.release();
                 }
                 *slot = None;
-                Some(res)
+                Some((res, cursor_died))
             }
             _ => None,
         }
     });
-    let Some(res) = found else {
+    let Some((res, cursor_died)) = found else {
         return libc_einval();
     };
+    // Hide and release the host cursor first (a cursor-queue command, then the
+    // control-queue unref of its resource), before the dumb buffer's own unref below.
+    if let Some(cur_id) = cursor_died {
+        if host_cursor_live() {
+            let _ =
+                crate::drivers::video::render::job(crate::drivers::video::render::Job::SetCursor {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    hot_x: 0,
+                    hot_y: 0,
+                });
+            let _ = crate::drivers::video::render::job(
+                crate::drivers::video::render::Job::DestroyCursor { id: cur_id },
+            );
+        }
+    }
     // A resource the device still holds is told to let go. The answer is
     // ignored: the caller asked for the handle to be released and it has been,
     // and a device that refuses to unref a resource whose pages are already back
@@ -6924,12 +7199,18 @@ fn mode_cursor(arg: usize, hot: bool, lease: Option<&LeaseSet>) -> isize {
         });
     }
 
-    // Present. Nothing was committed, so nothing else would rebuild the scanout -
-    // and the pointer is drawn *in* that rebuild, so the master's frame is copied
-    // again here, with the new image and position, and flushed. This is what
-    // `SETCRTC` and `PAGE_FLIP` do for their own frames, and it is why a cursor
-    // move is as prompt as a commit: the compositor does not redraw, and the
-    // kernel does not wait for one to.
+    // Present. On a device with a cursor queue the pointer is the host's to draw,
+    // so this hands the image and position over (`show_cursor`) and does *not*
+    // re-copy the master's framebuffer or flush it - a move costs one small
+    // cursor-queue command, not a full gather. On a device without one, the pointer
+    // is blended into the scanout, which means the frame has to be rebuilt around it
+    // exactly as before: the master's framebuffer is copied again with the new image
+    // and position, then flushed. This is what `SETCRTC` and `PAGE_FLIP` do for their
+    // own frames, and it is why a software-path cursor move is as prompt as a commit.
+    if host_cursor_live() {
+        let _ = show_cursor();
+        return 0;
+    }
     let rc = critical_section::with(|cs| {
         let st = STATE.borrow(cs).borrow();
         if st.current_fb == 0 {
@@ -6944,6 +7225,236 @@ fn mode_cursor(arg: usize, hot: bool, lease: Option<&LeaseSet>) -> isize {
         crate::drivers::video::render::request_flush_blocking();
     }
     0
+}
+
+/// Hand the cursor plane's current state to the host as a hardware pointer, on the
+/// device's cursor queue. This is what makes a pointer appear on a virtualized
+/// display: the host composites it over whatever the guest scanout shows, so the
+/// kernel neither blends it into the frame nor re-copies the master's framebuffer to
+/// move it. [`host_cursor_live`] gates this against the software path.
+///
+/// Three cases, decided by what changed since the last call and read off
+/// [`DrmState::cursor_resource`]:
+///   * **no image bound** (`cursor_fb == 0`) - hide: `UPDATE_CURSOR` with resource 0,
+///     and drop any tracked resource.
+///   * **same image, moved** - `MOVE_CURSOR` alone: no resource work, which is the
+///     whole point of keeping the two commands apart. A pointer-motion event costs
+///     one small cursor-queue command, not a framebuffer gather and flush.
+///   * **new image** (a different `fb_id`, or none shown yet) - create + attach +
+///     transfer the resource on the control queue, then `UPDATE_CURSOR` on the
+///     cursor queue. The three control commands are pushed before the update so
+///     `drain_jobs`' FIFO order fences them; the device has the pixels by the time
+///     it is told to load them.
+///
+/// The position sent is `cursor_pos - cursor_hotspot`: the device places the image's
+/// top-left at that point, and `cursor_pos` is the pointer point, so the hotspot is
+/// subtracted here rather than in [`crate::gpu::cursor::compose`] (which keeps doing
+/// its own subtraction for the software fallback). That is why accepting the hotspot
+/// cap does not shift the pointer: the coordinate convention moves with the path, and
+/// both land the tip where the compositor meant it.
+///
+/// Runs entirely outside the STATE critical section except for reading the fields it
+/// needs and recording the new resource id - the device round trips park the caller,
+/// and parking while holding `STATE` is forbidden (`back_dumb_with_a_resource` says
+/// the same). Returns an errno the caller may ignore: a failed host cursor leaves the
+/// recorded state intact and the next commit retries.
+fn show_cursor() -> isize {
+    if !host_cursor_live() {
+        return 0;
+    }
+    // Read everything the decision needs under one lock, including the buffer's
+    // frames materialized for a fresh binding, so no device command is built from
+    // state that can change underneath it.
+    enum Want {
+        Hide,
+        Move {
+            x: u32,
+            y: u32,
+        },
+        Show {
+            fb_id: u32,
+            entries: Vec<(u64, u32)>,
+            width: u32,
+            height: u32,
+            x: u32,
+            y: u32,
+            hot_x: u32,
+            hot_y: u32,
+        },
+    }
+    let want = critical_section::with(|cs| -> Result<Want, isize> {
+        let mut st = STATE.borrow(cs).borrow_mut();
+        if st.cursor_fb == 0 {
+            return Ok(Want::Hide);
+        }
+        // Copy out everything the framebuffer contributes *before* touching the
+        // dumb table mutably below; `fb` borrows `st.fbs` and the page-growing path
+        // needs `&mut st.dumb`, which cannot overlap it.
+        let (handle, width, height) = match st
+            .fbs
+            .iter()
+            .filter_map(|f| f.as_ref())
+            .find(|f| f.id == st.cursor_fb)
+        {
+            Some(fb) => (fb.handle as usize - 1, fb.width, fb.height),
+            None => return Ok(Want::Hide),
+        };
+        let fb_id = st.cursor_fb;
+        // The pointer point minus the hotspot is where the image's top-left goes.
+        let (px, py) = st.cursor_pos;
+        let (hx, hy) = st.cursor_hotspot;
+        let (x, y) = (px - hx, py - hy);
+        // A move only if the very same framebuffer is already showing on the host.
+        if st
+            .cursor_resource
+            .is_some_and(|(_, shown_fb)| shown_fb == fb_id)
+        {
+            return Ok(Want::Move {
+                x: x.max(0) as u32,
+                y: y.max(0) as u32,
+            });
+        }
+        // Otherwise bind afresh. A GBM/PRIME-imported cursor buffer arrives with its
+        // pages *promised but not yet backed* - weston maps and writes it through the
+        // dma-buf, and demand paging fills a frame only when a byte is touched - so
+        // the device would read nowhere for any page not yet materialized. Grow them
+        // here, exactly as `back_dumb_with_a_resource` does for a plain dumb buffer:
+        // this is the mutable borrow that path needs and an immutable one could not
+        // take. Refusing instead was the bug: the first SHOW saw "0 of 4 pages", made
+        // no resource, and every later event was a MOVE against a host that had never
+        // been given an image - a pointer that moved and clicked and stayed invisible.
+        let dumb = match st.dumb.get_mut(handle).and_then(|s| s.as_mut()) {
+            Some(d) => d,
+            None => return Ok(Want::Hide),
+        };
+        let pages = (dumb.size() as usize).div_ceil(PAGE_SIZE);
+        for page in 0..pages {
+            if dumb.ensure_page(page) == 0 {
+                return Err(-12); // ENOMEM - the allocator refused, retry next commit
+            }
+        }
+        let entries: Vec<(u64, u32)> = dumb
+            .frames
+            .iter()
+            .take(pages)
+            .map(|&p| (p as u64, PAGE_SIZE as u32))
+            .collect();
+        Ok(Want::Show {
+            fb_id,
+            entries,
+            width,
+            height,
+            x: x.max(0) as u32,
+            y: y.max(0) as u32,
+            hot_x: hx.max(0) as u32,
+            hot_y: hy.max(0) as u32,
+        })
+    });
+    let want = match want {
+        Ok(w) => w,
+        Err(errno) => return errno,
+    };
+
+    match want {
+        Want::Hide => {
+            let old = critical_section::with(|cs| {
+                let mut st = STATE.borrow(cs).borrow_mut();
+                st.cursor_resource.take()
+            });
+            // Hide the host pointer first, then release its resource - the device
+            // must never be left naming a resource it no longer has.
+            let _ =
+                crate::drivers::video::render::job(crate::drivers::video::render::Job::SetCursor {
+                    id: 0,
+                    x: 0,
+                    y: 0,
+                    hot_x: 0,
+                    hot_y: 0,
+                });
+            if let Some((id, _)) = old {
+                let _ = crate::drivers::video::render::job(
+                    crate::drivers::video::render::Job::DestroyCursor { id },
+                );
+            }
+            0
+        }
+        Want::Move { x, y } => {
+            crate::drivers::video::render::job(crate::drivers::video::render::Job::MoveCursor {
+                x,
+                y,
+            })
+        }
+        Want::Show {
+            fb_id,
+            entries,
+            width,
+            height,
+            x,
+            y,
+            hot_x,
+            hot_y,
+        } => {
+            // Take a fresh resource id only now that a real command is going out, so
+            // a failure above leaves no gap (the same discipline as
+            // `back_dumb_with_a_resource`). Release any previous cursor resource
+            // first, in push order: destroy-before-create keeps the device from ever
+            // holding two ids for one pointer.
+            let (id, old) = critical_section::with(|cs| {
+                let mut st = STATE.borrow(cs).borrow_mut();
+                let old = st.cursor_resource.take();
+                let id = st.next_res_id;
+                st.next_res_id = st.next_res_id.wrapping_add(1);
+                (id, old)
+            });
+            if let Some((old_id, _)) = old {
+                let _ = crate::drivers::video::render::job(
+                    crate::drivers::video::render::Job::DestroyCursor { id: old_id },
+                );
+            }
+            // Control queue: make the resource, back it, fill it. Each completes
+            // synchronously before the next job drains, so these three land before
+            // the cursor-queue update below names the resource.
+            if crate::drivers::video::render::job(
+                crate::drivers::video::render::Job::CreateCursor2d {
+                    id,
+                    width,
+                    height,
+                    entries,
+                },
+            ) != 0
+            {
+                return -5; // EIO
+            }
+            if crate::drivers::video::render::job(
+                crate::drivers::video::render::Job::TransferCursor { id, width, height },
+            ) != 0
+            {
+                let _ = crate::drivers::video::render::job(
+                    crate::drivers::video::render::Job::DestroyCursor { id },
+                );
+                return -5; // EIO
+            }
+            // Cursor queue: load and place it.
+            let rc =
+                crate::drivers::video::render::job(crate::drivers::video::render::Job::SetCursor {
+                    id,
+                    x,
+                    y,
+                    hot_x,
+                    hot_y,
+                });
+            if rc == 0 {
+                critical_section::with(|cs| {
+                    STATE.borrow(cs).borrow_mut().cursor_resource = Some((id, fb_id));
+                });
+            } else {
+                let _ = crate::drivers::video::render::job(
+                    crate::drivers::video::render::Job::DestroyCursor { id },
+                );
+            }
+            rc
+        }
+    }
 }
 
 fn create_dumb(arg: usize) -> isize {

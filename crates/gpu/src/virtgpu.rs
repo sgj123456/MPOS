@@ -135,6 +135,14 @@ pub struct Card {
     /// what the parameter *is*, and both questions a caller asks of it - "is
     /// set 1 there" and "which are there" - are tests of one bit.
     pub capset_ids: u32,
+    /// Whether the device has a cursor queue - the fact that decides whether the
+    /// DRM layer hands the pointer to the host (`UPDATE_CURSOR`/`MOVE_CURSOR`) or
+    /// blends it into the scanout itself. Read from the negotiated device at
+    /// bring-up, not from a feature bit: virtio-gpu's cursor support is implied by
+    /// the second queue existing, and there is no `F_CURSOR` in the feature word.
+    /// `false` is both "no queue" and "no card", which is why [`Card::NONE`] says
+    /// so rather than leaving it undecided.
+    pub cursor_q: bool,
 }
 
 impl Card {
@@ -151,6 +159,7 @@ impl Card {
         virgl: false,
         context_init: false,
         capset_ids: 0,
+        cursor_q: false,
     };
 }
 
@@ -338,6 +347,7 @@ mod tests {
             virgl: false,
             context_init: false,
             capset_ids: 0,
+            cursor_q: false,
         };
         assert_eq!(param(1, &card), Ok(0)); // 3D_FEATURES
         assert_eq!(param(2, &card), Ok(1)); // CAPSET_QUERY_FIX: unconditional, measured
@@ -360,6 +370,7 @@ mod tests {
             virgl: true,
             context_init: true,
             capset_ids: 6,
+            cursor_q: false,
         };
         assert_eq!(param(1, &card), Ok(1)); // 3D_FEATURES
         assert_eq!(param(2, &card), Ok(1)); // CAPSET_QUERY_FIX
@@ -388,6 +399,7 @@ mod tests {
                 virgl: true,
                 context_init: true,
                 capset_ids: 6,
+                cursor_q: false,
             },
         ];
         for card in &cards {

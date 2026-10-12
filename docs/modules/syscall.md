@@ -123,10 +123,11 @@ programs `t-fstat`, `t-newfstatat`, `t-statx`, `t-statx-agree`, `t-stat-buffer`,
 `t-stat-consistency`, `t-open-flags`, `t-openat`, `t-openat2`, `t-fcntl`,
 `t-pipe2`, `t-signal-frame`, `t-signal-delivery`, `t-signalfd`,
 `t-rt-signal-queue`, `t-clone`, `t-execve`, `t-futex`. On the bare-metal side
-(`user/abitest/src/bin/integration/`): `t-ioctl` (the device-`ioctl` entry and its
+(`user/tests/src/bin/`): `t-ioctl` (the device-`ioctl` entry and its
 families) and `t-netlink` (a request word routed through `fs/ioctl.rs` to the net
-half). The `no_std` harness itself is `user/abitest/lib/lin.rs`, and `tests.toml`
-decides which of these the default sweep runs.
+half) — both std-side since the `no_std` suite finished migrating (§15.11's last
+batch deleted `user/abitest`), and `tests.toml` decides which of these the
+default sweep runs.
 
 ## Evidence and open work
 

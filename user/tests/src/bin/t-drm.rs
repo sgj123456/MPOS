@@ -90,6 +90,21 @@ const NR_MODE_CURSOR: u32 = 0xa3;
 const NR_MODE_CURSOR2: u32 = 0xbb;
 const NR_GETPROPERTY: u32 = 0xaa;
 const NR_GETFB: u32 = 0xad;
+/// `DRM_IOCTL_MODE_RMFB`: remove a framebuffer by id. Its cursor-facing
+/// significance is that removing the framebuffer a bound cursor plane points at
+/// must take the binding down too, or the device keeps an `UPDATE_CURSOR` naming a
+/// released resource.
+///
+/// `0xAF` is `drm.h`'s own number - `DRM_IOWR(0xAF, unsigned int)` - read out of
+/// `/usr/include/libdrm/drm.h` rather than remembered, because the one thing a
+/// wrong command number does here is *nothing visible*: the request word carries
+/// both which command this is and how big its argument is, so a call spelled
+/// `0xA4` (which is `MODE_GETGAMMA`) reaches the card as a gamma request with a
+/// 4-byte argument and answers `EINVAL` - which reads exactly like "the card
+/// refused to remove this framebuffer". It measured as `RMFB removes the
+/// cursor's framebuffer (got -22, want 0)` for that reason, and the constant
+/// is now the header's.
+const NR_RMFB: u32 = 0xaf;
 const NR_ADDFB: u32 = 0xae;
 const NR_PAGE_FLIP: u32 = 0xb0;
 const NR_CREATE_DUMB: u32 = 0xb2;
@@ -1186,6 +1201,45 @@ fn main() {
         cp2.fb_id as isize,
         cursor_fb as isize,
     );
+
+    // Removing the framebuffer a bound cursor plane points at has to take the
+    // binding down. `RMFB` nulls the framebuffer; if the cursor plane kept naming
+    // the dead id, the host would be left with an `UPDATE_CURSOR` pointing at a
+    // released resource - the dangling-id case `release_framebuffers` closes when a
+    // client exits, and this is the other door to the same framebuffer going away
+    // while the client lives on. Read back through `GETPLANE`, the cursor plane must
+    // now name nothing.
+    let mut rm = cursor_fb;
+    let got = unsafe { ioctl(fd, ioc_d(NR_RMFB, 4), (&raw mut rm) as *mut c_void) };
+    check_is(&mut r, "RMFB removes the cursor's framebuffer", got, 0);
+    let mut cp_rm = GetPlane {
+        plane_id: CURSOR_PLANE_ID,
+        ..GetPlane::default()
+    };
+    let got = unsafe { ioctl(fd, ioc_d(NR_GETPLANE, 32), (&raw mut cp_rm) as *mut c_void) };
+    check_is(&mut r, "the cursor plane still reads back", got, 0);
+    check_is(
+        &mut r,
+        "and names no framebuffer once its image was removed",
+        cp_rm.fb_id as isize,
+        0,
+    );
+
+    // Re-bind a fresh cursor image for the moves below (the old fb is gone).
+    let mut cfb2 = FbCmd2 {
+        width: 64,
+        height: 64,
+        pixel_format: FORMAT_ARGB8888,
+        pitches: [256, 0, 0, 0],
+        handles: [handle, 0, 0, 0],
+        ..FbCmd2::default()
+    };
+    let got = unsafe { ioctl(fd, ioc_d(NR_ADDFB2, 104), (&raw mut cfb2) as *mut c_void) };
+    check_is(&mut r, "a replacement cursor framebuffer binds", got, 0);
+    cur.handle = cfb2.fb_id;
+    cur.width = 64;
+    cur.height = 64;
+    let _ = unsafe { ioctl(fd, ioc_d(NR_MODE_CURSOR, 28), (&raw mut cur) as *mut c_void) };
 
     // `MODE_CURSOR2` moves it, hotspot and all. Where it landed is read back by
     // `t-drm-props`, which has the property-name lookup this file does not.

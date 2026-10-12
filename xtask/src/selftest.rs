@@ -60,11 +60,12 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
     // refusal, the selection and the two lines under it are `sweep`'s, because
     // they are questions about `tests.toml` rather than about this machine.
     let config = sweep::load_config()?;
-    // The declared-name check, and *this* arm's scope: it builds both suites
-    // (170 programs today, the bare-metal conformance suite among them), so a
-    // name in the file that no program answers to is a stale entry. The second
-    // machine builds only the std suite and asks the narrower question;
-    // `sweep::select` records why the two cannot share one scope.
+    // The declared-name check, and *this* arm's scope: every name in the file
+    // has to be answerable by a program this run built, or it is a stale entry.
+    // The second machine's arm asks the narrower question of its own `gaps`
+    // alone - both arms build the same std suite since §15.11's last batch
+    // deleted the `no_std` one, so the two answers now coincide for every
+    // `[default]` name; `sweep::select` records why the scopes are still two.
     let names: Vec<String> = built.iter().map(|test| test.name.clone()).collect();
     let unmatched = config.unmatched(&names);
     if !unmatched.is_empty() {
@@ -981,7 +982,12 @@ const SWEEP_DISK_BYTES: u64 = 96 * 1024 * 1024;
 /// `=== END` is what ends the poll: unlike the first machine's sweep there is no
 /// debug exit to wait for - the runner ends the machine itself, so the harness's
 /// own last line is the terminator.
-pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()> {
+pub fn run_disk_sweep(
+    build_dir: &Path,
+    profile: &str,
+    arch: Arch,
+    selection: sweep::Selection,
+) -> Result<()> {
     // The kernel this sweep boots has to be the current one, and it is this
     // arm's own build: the first machine's is done by `run_tests`, and `main`
     // does not build for `test` on either machine. It is the *test* build, so the
@@ -1013,10 +1019,12 @@ pub fn run_disk_sweep(build_dir: &Path, profile: &str, arch: Arch) -> Result<()>
     }
 
     // The selection is `sweep`'s - the same questions about `tests.toml` the
-    // other arm asks - and the flags are empty because `main` refuses
-    // `--groups` on this arm before it gets here (this payload's group
-    // vocabulary is the first machine's suites' membership).
-    let plan = sweep::select(machine, &config, &built, &sweep::Selection::default())?;
+    // other arm asks, with the same answers. The reason-groups bind this machine
+    // as they bind the first one: what `external` and `slow` name is outside the
+    // machine under test, and slirp's DHCP server, the host's resolver and a
+    // public address are outside this one too. `--groups` reaches this arm as
+    // well now, which is what keeps those programs runnable here at all.
+    let plan = sweep::select(machine, &config, &built, &selection)?;
     let tests = &plan.staged;
 
     // The runner is the *shared* one: the same `#!/bin/sh` script the first
@@ -1468,16 +1476,19 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A gap whose program the payload does not build
     /// A gap whose program the payload does not build is a claim nothing in the
     /// sweep can check: there is no program to leave out, so the entry would sit
     /// in the file looking measured for ever. The rule is exercised on a list
-    /// that *has* gaps, because the shipped file's own list is empty - the state
-    /// the harness cut left it in - and a test must not need the file to be
-    /// wrong to run.
+    /// that *has* gaps, because a test must not need the file to be wrong to
+    /// run - and on the repository's own file, whose list is one name long today
+    /// (`t-arch-prctl`) and may be empty again the day the second machine grows
+    /// the call.
     #[test]
     fn a_named_gap_has_to_be_a_program_the_payload_builds() {
-        let gaps = [("aarch64", "t-gone"), ("aarch64", "t-here")];
+        let gaps = [
+            (crate::config::GAP_GROUP, "t-gone"),
+            (crate::config::GAP_GROUP, "t-here"),
+        ];
         let built = ["t-here".to_string(), "t-openat".to_string()];
         assert_eq!(
             super::missing_programs(&gaps, &built),
@@ -1500,8 +1511,10 @@ mod tests {
             crate::config::TestConfig::load(&root.join(crate::paths::TESTS_CONFIG)).unwrap();
         let machine = crate::config::Machine::Aarch64;
         assert!(
-            config.group_names(machine).contains(&"aarch64"),
-            "the second machine's gap group is gone rather than empty"
+            config
+                .group_names(machine)
+                .contains(&crate::config::GAP_GROUP),
+            "the second machine's gap group has to be there, empty or not"
         );
         let gaps: Vec<String> = config
             .machine_tests(machine)

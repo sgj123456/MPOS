@@ -107,6 +107,21 @@ const EPHEMERAL_MAX: u16 = 60999;
 const TCP_RX_BYTES: usize = 64 * 1024;
 const TCP_TX_BYTES: usize = 16 * 1024;
 
+/// The wildcard raw door's receive queue (`Channel::Raw`'s field, and the type
+/// `socket::echo_to_raw_doors` fills): complete IPv4 packets, oldest first,
+/// each at the length it arrived with. Named here because both this module's
+/// channel and the socket module's seam and reader reach the same cells.
+///
+/// `Vec<u8>` rather than a fixed slot because a slot is a length this kernel
+/// would be inventing: the reader hands the caller what it pops, so a
+/// 512-byte slot made a 300-byte packet read back as 512 and dropped QEMU's
+/// 576-byte BOOTP reply whole. The bound is the *count* (`socket::RAW_ECHO_
+/// FRAMES`), which is the one that says how much memory a stopped reader can
+/// cost the kernel.
+pub(crate) type EchoQueue = alloc::sync::Arc<
+    critical_section::Mutex<core::cell::RefCell<alloc::collections::VecDeque<alloc::vec::Vec<u8>>>>,
+>;
+
 /// Datagrams the receive side can hold at once, and the shared byte pool
 /// behind them. A DNS answer fits in under a kilobyte; four slots cover a
 /// resolver that fires at two servers at once.
@@ -179,6 +194,18 @@ pub(crate) enum Channel {
         handle: SocketHandle,
         /// The IP protocol number this socket is bound to (e.g. 1 for ICMP).
         protocol: u8,
+        /// The wildcard door (`IPPROTO_RAW`) keeps its own queue of complete
+        /// IPv4 packets here, because it cannot keep them in smoltcp: a raw
+        /// socket with *no* protocol filter matches every IPv4 packet, and the
+        /// interface then reports each one *handled* (`iface/interface/ipv4.rs`:
+        /// `process_udp`/`process_tcp` take the flag from `raw_socket_filter`),
+        /// stealing the machine's UDP and TCP delivery. A bounded copy at the
+        /// seam - Linux's `recvfrom` answer for this socket is "the packet you
+        /// sent, if you are root on a box that echoes", which no client asks -
+        /// is honest where an unbounded steal is not. Newest kept, oldest lost,
+        /// the same shape as a packet socket's ring. An `Arc` so the seam can
+        /// reach it by handle without nesting the stack lock inside itself.
+        echoed: EchoQueue,
     },
 }
 
@@ -212,6 +239,12 @@ pub(crate) struct Entry {
     /// per-socket so a set is not visible on its neighbours, and a query answers
     /// what the process asked for rather than a constant.
     pub opts: SockOpts,
+    // A wildcard door's parked readers are *not* here. They live on the door
+    // record the seam keeps (`socket::RawDoor`), because the seam runs inside
+    // `poll_once` and cannot take this registry's lock to find them - a door
+    // reached through the stack would re-enter `NET`'s borrow, which panics
+    // (§4.5). The queue (`Channel::Raw`'s `echoed`) is the shared cell that
+    // lets the two lists stay apart.
 }
 
 /// The `setsockopt`/`getsockopt` state a socket carries. The buffer sizes get
@@ -349,7 +382,7 @@ pub(crate) struct Stack {
     eth: Fabric<NicDevice>,
     /// lo: `127.0.0.0/8`, carried by smoltcp's own loopback device.
     lo: Fabric<smoltcp::phy::Loopback>,
-    entries: Vec<Option<Entry>>,
+    pub(crate) entries: Vec<Option<Entry>>,
     /// The passive-open state behind every `listen`ing socket, indexed by the
     /// id a [`Channel::TcpListen`] carries. Slots are reused, so a listener
     /// that goes away costs nothing but a `None`.
@@ -439,7 +472,7 @@ impl Stack {
     /// The loopback is polled second and unconditionally on its own flag: a
     /// socket it carries must progress even when the NIC is down, which is the
     /// one thing the single-interface version could not express.
-    fn poll_once(&mut self) {
+    pub(crate) fn poll_once(&mut self) {
         let now = now();
         self.poll_home(Home::Eth, now);
         self.poll_home(Home::Lo, now);
@@ -1147,6 +1180,9 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
                 home: Home::Eth,
                 handle: stack.add_raw(Home::Eth, protocol as u8),
                 protocol: protocol as u8,
+                echoed: alloc::sync::Arc::new(critical_section::Mutex::new(
+                    core::cell::RefCell::new(alloc::collections::VecDeque::new()),
+                )),
             },
             // The IPv6 stub: an entry with no smoltcp socket behind it.
             (socket::AF_INET6, _) => Channel::Inet6,
@@ -1374,6 +1410,14 @@ pub(crate) fn free_entry(handle: usize) {
                 stack.sockets_mut(home).remove(h);
             }
         }
+        // The wildcard door's queue is the one piece of a raw channel that is
+        // not smoltcp's, so its retirement is this table's act: drop the Arc,
+        // and the seam stops copying frames into it from here on. A stillborn
+        // entry (a socket whose last close lands while another task sits in
+        // `recvfrom`) wakes nothing - that reader's own next step reads the
+        // slot gone and answers `EBADF`, which is every other teardown's race
+        // answer here too. `entry` is dropped with the closure, and the queue
+        // goes with it - the seam holds no reference of its own.
     });
 }
 
@@ -1775,11 +1819,19 @@ pub(crate) fn socket_ready(handle: usize) -> crate::vfs::Ready {
                 }
             }
             Channel::Raw {
-                home, handle: h, ..
+                home,
+                handle: h,
+                echoed,
+                ..
             } => {
                 let sock = stack.sockets_mut(*home).get_mut::<raw_sock::Socket>(*h);
+                // The wildcard door's own queue counts as readable - it is the
+                // only one that ever fills (the seam copies a delivered packet
+                // in), and its readiness is what ends a blocking `recvfrom`.
+                let echoed_ready =
+                    critical_section::with(|cs| !echoed.borrow(cs).borrow().is_empty());
                 crate::vfs::Ready {
-                    read: sock.can_recv(),
+                    read: sock.can_recv() || echoed_ready,
                     write: sock.can_send(),
                 }
             }
@@ -2015,6 +2067,12 @@ impl Device for NicDevice {
         // it is any of the IP layer's business - which is the whole point of
         // the family (see `packet`).
         packet::deliver(pending.as_slice());
+        // The wildcard raw door (`AF_INET`+`SOCK_RAW`+`IPPROTO_RAW`) cannot
+        // hold a filterless smoltcp socket - it would swallow the machine's
+        // UDP and TCP delivery - so its receive queue is filled by a bounded
+        // copy taken at this seam, before the stack decides whose business
+        // the frame is. `None` costs nothing: no such socket is open.
+        socket::echo_to_raw_doors(pending.as_slice());
         Some((
             FrameRx { frame: pending },
             FrameTx {

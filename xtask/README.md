@@ -96,7 +96,7 @@ cargo xtask [global flags] <command>
 | 构建目录 | `--build-dir <PATH>` | 默认 `$MPOS_BUILD_DIR`，再默认 `build/` | default `$MPOS_BUILD_DIR`, else `build/` |
 | 构建档 | `--profile <NAME>` | 默认 `$PROFILE`，再默认 `debug`；发布用 `--profile release` | default `$PROFILE`, else `debug`; use `--profile release` |
 | 运行模式 | `--mode <MODE>` | 仅 `run`：`terminal` / `gui` / `mirror`（默认取 `machine.toml` 的 `qemu.mode`，再默认 `mirror`）| `run` only: `terminal`/`gui`/`mirror` (defaults to `qemu.mode` in `machine.toml`, else `mirror`) |
-| 机器 | `--arch <ARCH>` | 全局：`x86_64`（默认）或 `aarch64`。**每条命令都真的处理那台机器**：`build` 编它的内核与 loader，`disk`/`rootfs`/`all` 铺并安装**它自己的**磁盘镜像（`mpos-uefi-x86_64.img` / `aarch64-disk.img`，各带自己的 stamp），`run` 启动它（两台机器的 pid 1 都是盘上标准的 `/sbin/init`，busybox init 读 `/etc/inittab`——同一条链），`test` 走同一套盘上 sweep（唯一还分机器的是选哪些程序），`initramfs` 建那台机器的归档。两台机器之间只剩真事实的差别，都在 `Arch` 与各配置文件的 `[aarch64]` 段里 | global: `x86_64` (default) or `aarch64`. **Every command really handles that machine**: `build` compiles its kernel and loader, `disk`/`rootfs`/`all` lay and install **its own** disk image (`mpos-uefi-x86_64.img` / `aarch64-disk.img`, each with its own stamp), `run` boots it (both machines' pid 1 is the disk's own standard `/sbin/init`, busybox init reading `/etc/inittab` — one chain), `test` takes the same on-disk sweep (only the program selection still differs) and `initramfs` builds that machine's archive. What is left between the machines is only real differences, held in `Arch` and in each file's `[aarch64]` section |
+| 机器 | `--arch <ARCH>` | 全局：`x86_64`（默认）或 `aarch64`。**每条命令都真的处理那台机器**：`build` 编它的内核与 loader，`disk`/`rootfs`/`all` 铺并安装**它自己的**磁盘镜像（`mpos-uefi-x86_64.img` / `aarch64-disk.img`，各带自己的 stamp），`run` 启动它（两台机器的 pid 1 都是盘上标准的 `/sbin/init`，busybox init 读 `/etc/inittab`——同一条链），`test` 走同一套盘上 sweep（选哪些程序的规则也相同，只有 `tests.toml` 的 `[aarch64]` 段是第二台自己的），`initramfs` 建那台机器的归档。两台机器之间只剩真事实的差别，都在 `Arch` 与各配置文件的 `[aarch64]` 段里 | global: `x86_64` (default) or `aarch64`. **Every command really handles that machine**: `build` compiles its kernel and loader, `disk`/`rootfs`/`all` lay and install **its own** disk image (`mpos-uefi-x86_64.img` / `aarch64-disk.img`, each with its own stamp), `run` boots it (both machines' pid 1 is the disk's own standard `/sbin/init`, busybox init reading `/etc/inittab` — one chain), `test` takes the same on-disk sweep (the selection rule is the same too — only `tests.toml`'s `[aarch64]` section is the second machine's own) and `initramfs` builds that machine's archive. What is left between the machines is only real differences, held in `Arch` and in each file's `[aarch64]` section |
 | 测试分组 | `--groups <A,B>` | 仅 `test`：除分组外的测试之外再跑这些分组（取代 `tests.toml` 的 `default`）| `test` only: run these groups *in addition* to the ungrouped tests (replaces the file's `default`) |
 | 全部分组 | `--all-groups` | 仅 `test`：连非默认分组一起跑 | `test` only: run every group, including the ones left out by default |
 
@@ -110,7 +110,7 @@ cargo xtask [global flags] <command>
 | `rootfs` | rootfs | 把该机器要的 Alpine 根文件系统装进它的镜像（会顺带更新 initramfs）。按包安装：`--arch x86_64`/`aarch64` 各自解析自己的包，跨架构那台加 `--no-scripts` 并跳过需要跑镜像内程序的 chroot 半区 | install that machine's Alpine root into its image (refreshes the initramfs too). Per package: each machine resolves its own `--arch`, and the cross-arch one adds `--no-scripts` and skips the chroot half that runs the image's own programs | 是 yes |
 | `run` | run | 在 QEMU 中启动该机器的镜像；若产物过期会先自动重建（只改了内核/loader/initramfs → 只刷新引导文件，不重装包） | boot that machine's image in QEMU, rebuilding first if stale (a kernel/loader/initramfs change refreshes the boot files alone — no package install) | 视情况 when needed |
 | `all` | all | 一次做完：内核、initramfs、镜像、根文件系统 | build everything in one go | 是 yes |
-| `test` | test | 自测：宿主单元测试 + 在 QEMU 里跑 `tests.toml` 选中的用户测试程序并解析结果。**两台机器现在走同一条盘上 sweep**（`selftest::run_disk_sweep`）：测试载荷装在根分区上，共享的 `TEST_INIT` 遍历 `/bin/t-*`，同一套 `=== RUN/PASS/FAIL/SUMMARY`/`END` 协议读结论。唯一还分机器的是**选哪些程序**——`tests.toml` 的分组以 x86_64 的程序命名，所以 `--arch aarch64` 会按名拒绝 `--groups`/`--all-groups`，而不是跑一份和你要的不一样的集合；两台机器都不可能静默跑另一台 | self-test sweep: host unit tests + the user test programs `tests.toml` selects, booted in QEMU. **Both machines now take the same on-disk sweep** (`selftest::run_disk_sweep`): the payload rides on the root partition, the shared `TEST_INIT` walks `/bin/t-*`, and the same `=== RUN/PASS/FAIL/SUMMARY`/`END` reader reads the verdict. What still differs is the *selection* — `tests.toml`'s groups name x86_64's programs, so `--arch aarch64` refuses `--groups`/`--all-groups` by name rather than running a different set than was asked for. Neither arm can silently boot the other machine | 否 no |
+| `test` | test | 自测：宿主单元测试 + 在 QEMU 里跑 `tests.toml` 选中的用户测试程序并解析结果。**两台机器现在走同一条盘上 sweep**（`selftest::run_disk_sweep`）：测试载荷装在根分区上，共享的 `TEST_INIT` 遍历 `/bin/t-*`，同一套 `=== RUN/PASS/FAIL/SUMMARY`/`END` 协议读结论。**选哪些程序也是同一条规则**——一份 `tests.toml` 同时回答两台机器：不属于任何分组、或属于本次点名的分组的程序才跑，`--groups`/`--all-groups` 在两边含义相同，唯一不能按名点的是机器自己的 `gaps`（它还不能服务的那些）；两台机器都不可能静默跑另一台 | self-test sweep: host unit tests + the user test programs `tests.toml` selects, booted in QEMU. **Both machines now take the same on-disk sweep** (`selftest::run_disk_sweep`): the payload rides on the root partition, the shared `TEST_INIT` walks `/bin/t-*`, and the same `=== RUN/PASS/FAIL/SUMMARY`/`END` reader reads the verdict. the *selection* is the same rule on both arms — one `tests.toml` answers it for either machine: a program runs when it is in no group or in a group the run asked for, `--groups`/`--all-groups` mean the same thing on either machine, and the only group neither may ask for is a machine's own `gaps`, its list of what it cannot serve yet. Neither arm can silently boot the other machine | 否 no |
 | `depgraph` | depgraph | 重新测量内核模块图并对照 Phase 11 的棘轮：任何新增的向上依赖或增长的计数都会让命令失败（它同时是一个宿主测试，`cargo xtask test` 会跑到） | re-measure the kernel's module graph against the Phase-11 ratchet; fails when an upward edge appears or a count grows (also a host test, so `test` runs it) | 否 no |
 | `clean` | clean | 删除 `build/` 与 `target/` | remove the build and target directories | 视情况 when needed |
 
@@ -245,27 +245,47 @@ machine, or takes seconds, or measures rather than asserts:
 | `external` | | 需要机器之外的东西：宿主的网络（经 QEMU 用户态栈）或宿主上监听的服务 | needs something outside the machine: the host's network, or a listener on the host |
 | `slow` | | 慢，或只是测量：`t-fill-ramfs` 最多写 1024 MiB，其余是计时仪器 | slow, or measurement rather than assertion |
 | `diagnostic` | | 不是检查：`t-sh` 驱动一个交互 shell 并打印观察 | not a check: it drives an interactive shell and prints what it sees |
+| `gaps` | | 不是理由而是**排除**：写在哪台机器自己的段里，就是那台机器还不能服务的程序（今天只有 `t-arch-prctl`——`arch_prctl` 是 x86_64 自己的调用）。它按名点不动，`--groups gaps` 会被拒绝 | not a reason but an **exclusion**: written in a machine's own section, it lists what *that* machine cannot serve yet (today only `t-arch-prctl` — `arch_prctl` is x86_64's own call). It cannot be asked for by name: `--groups gaps` is refused |
+
+文件用这里每个配置文件都有的三段写成：`[default]` 是两台机器都读的基线，`[x86_64]` /
+`[aarch64]` 是各自的半边。基线里的分组两台都认（DHCP 服务器、宿主的解析器、一个公网地址
+在两台机器外面都一样远）；写在机器自己段里的分组只属于它，而且是**加进**基线同名分组，
+不是替换——`[aarch64] external = ["t-x"]` 说的是"那边多一个需要互联网的程序"，而不是
+"`external` 在那边是另一个意思"。一个分组比一台机器活得久，所以段的边界才是机器属性的
+位置，组名不是。
+The file is written in the three sections every config file here uses:
+`[default]` is the baseline both machines read, `[x86_64]`/`[aarch64]` are each
+machine's own half. A group in the baseline binds both sweeps (slirp's DHCP
+server, the host's resolver and a public address are equally outside either
+machine); a group under a machine's own section is that machine's alone and is
+*added* to the baseline's group of the same name rather than replacing it —
+`[aarch64] external = ["t-x"]` says "one more program needs the internet
+*there*", not "`external` means something else over there". A group outlives a
+machine, so the section boundary is where machine-ness lives, not the group name.
 
 ```sh
 cargo xtask test                      # 默认集：分组外的全部测试
 cargo xtask test --groups external    # 再多跑 external（命名分组会取代文件里的 default）
 cargo xtask test --groups external,slow
-cargo xtask test --all-groups         # 全部，含 slow / external / diagnostic
+cargo xtask test --all-groups         # 这台机器看得见的全部（gaps 除外，它谁都不能点）
 ```
 
 `default` 键给出默认额外要跑的分组（出厂为空）。分组名随你加，一个测试也能出现在多个分组
 里，那么在任一被点名的分组下都会跑。两种「静默少跑」都会被拒绝：命令行写了文件里没有的
 分组名会报错并列出可选名字，文件里写了没有任何已构建程序对应的名字也会报错（分组比测试
-活得久，或者拼错了一个名字）。被跳过的测试按分组打印出来，判决只对**装进镜像的那些**要求，
-所以「N built」和「M left out」两件事都说得清楚。
+活得久，或者拼错了一个名字——第一台机器的 sweep 拿着整份文件问这个问题，第二台拿着自己
+的 `gaps` 问，因为它的载荷曾经和第一台不是同一批程序）。被跳过的测试按分组打印出来，判决
+只对**装进镜像的那些**要求，所以「N built」和「M left out」两件事都说得清楚。
 
 `default` names the groups the sweep adds to the ungrouped tests (empty as
 shipped), group names are yours to add, and a test may appear in several. Two
 kinds of silent narrowing are refused: a group name on the command line that the
-file does not define, and a name in the file that no built program answers to.
-What was skipped is printed group by group, and the verdict check only requires a
-`=== PASS` from the programs that were staged — so "N built" and "M left out"
-are both said out loud.
+file does not define, and a name in the file that no built program answers to —
+the first machine's sweep asks that question of the whole file, the second asks
+it of its own `gaps`, because its payload was not always the same set of
+programs the first machine's was. What was skipped is printed group by group,
+and the verdict check only requires a `=== PASS` from the programs that were
+staged — so "N built" and "M left out" are both said out loud.
 
 ---
 

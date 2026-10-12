@@ -21,12 +21,12 @@ at those rather than repeating them.
 | `crates/` | downward-only leaf crates (§3): `err`/`abi`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu`/`evdev`/`uinput`/`blk`/`fdt`/`bootinfo`/`vm` |
 | `boot/` | `mpos-boot`, the UEFI loader — its own target (`-unknown-uefi`), no kernel dep, no architecture in it at all (the three machine things it needs are `mpos-arch`'s `early/`). A **library plus a thin `#[entry]` binary**: `src/lib.rs` (`mpos_boot::run`) holds the whole sequence and `src/main.rs` is the firmware entry that calls it, so the kernel can become the second caller (`docs/notes/` §14.7). The handoff record is one definition in the `crates/bootinfo` leaf, read by both machines and both sides of the seam |
 | `xtask/` | `mpos-xtask`, the build/run/test front-end; `xtask/README.md` documents every command |
-| `user/` | `mpos-user` (ordinary `std` programs); `user/abitest/` = the `no_std` conformance suite (`src/bin/syscall/` one family, `src/bin/integration/` end-to-end); `user/tests/` = `std`-side tests. Scratch used to live in a wired-into-no-build `user/staging/`; it is deleted — a measurement's instrument now lives beside the claim it measured (a probe under `.workbuddy/`, a table in the `docs/notes/` row) or in the test itself |
+| `user/` | `mpos-user` (ordinary `std` programs); `user/tests/` is the whole ABI suite — the `no_std` conformance suite that used to sit beside it in `user/abitest/` finished moving across (§15.11's last batch) and was deleted. Scratch used to live in a wired-into-no-build `user/staging/`; it is deleted too — a measurement's instrument now lives beside the claim it measured (a probe under `.workbuddy/`, a table in the `docs/notes/` row) or in the test itself |
 | `fuzz/` | `mpos-fuzz`, **its own workspace**: libFuzzer targets over the kernel's parsers |
 | `assets/rootfs/`, `assets/configs/rootfs.toml` | the guest image's contents, for both machines: `rootfs.toml` is one file in three sections (`[default]` is the baseline both read, `[x86_64]`/`[aarch64]` are each machine's own half), and `assets/rootfs/x86_64/` + `assets/rootfs/aarch64/` are the two overlay trees; `assets/rootfs/core/` is the shared half merged before either |
 | `assets/initramfs/`, `assets/configs/initramfs.toml` | the early-userspace tree the kernel unpacks as its first root, and its packages — the **same three-part overlay as the rootfs** (`core/` merged first, carrying the one `/init` both machines run; each machine's own tree over it, empty today), built by the **same pipeline** (`xtask/src/initramfs.rs`) through its toml section |
 | `assets/configs/machine.toml` | what the image is *booted* on — memory, cpus, devices, run mode — in the **same three sections**. Host-side only, so editing it never reinstalls |
-| `assets/configs/tests.toml` | which test programs the sweep runs by default, and its groups |
+| `assets/configs/tests.toml` | which test programs the sweep runs by default, and its groups — one file in the same three sections (`[default]` is the baseline both machines read, `[x86_64]`/`[aarch64]` are each machine's own half; the only exclusion-shaped group is a machine's `gaps`) |
 | `assets/configs/busybox-applets.txt` | the applet paths (`bin/ls`, `sbin/init`, …) one per line, from `busybox --list-full` — the farm `rootfs::lay_applet_farm` links on every build, *before* the overlay; pinned on both machines by `t-busybox-farm`. Why the build lays it: `docs/notes/` §15.34 |
 | `build/`, `target/`, `build-test/` | build output and scratch. Never edit, never commit |
 
@@ -61,11 +61,9 @@ cargo clippy --target aarch64-unknown-none           # everything under arch/src
 (cd boot && cargo clippy --target aarch64-unknown-uefi)   # #[cfg]-ed out of every x86 target above
 ```
 
-**Three build traps.** (1) **`--target` is mandatory for host work**: `.cargo/config.toml` pins
+**Two build traps.** (1) **`--target` is mandatory for host work**: `.cargo/config.toml` pins
 `[build] target = "x86_64-unknown-none"`, so a bare `cargo test` builds for bare metal and cannot
-run. (2) **`user/abitest` uses overridden flags**: its profile uses the *kernel's* linker script, so
-the gate builds it with `RUSTFLAGS=-C relocation-model=static` from inside `user/abitest/`; by hand
-without that yields binaries the loader rejects. (3) **The aarch64 target links in `--release`
+run. (2) **The aarch64 target links in `--release`
 only**: a debug build fails with `relocation R_AARCH64_ABS64 …` from the *sysroot's* `liballoc`, and
 no gate notices — anything hand-verifying an aarch64 change must pass `--release`.
 
@@ -84,17 +82,22 @@ Both machines read the protocol from the same `TEST_INIT` runner and the same ve
 differs is where the payload sits — the first machine's programs ride in that throwaway archive
 (its boot keeps it as its root), the second machine's ride on the root partition of a medium the
 sweep lays for itself (`disk::sweep_medium`, its own `build/<arch>-sweep.img`, so it cannot
-overwrite the image `run` installed), because its boot switches root. The selection still differs
-too: `tests.toml`'s groups name x86_64's programs, so `--arch aarch64` refuses
-`--groups`/`--all-groups` rather than running a different set than was asked for.
+overwrite the image `run` installed), because its boot switches root. The *selection* is one
+question on both arms now: a program runs when it is in no group or in a group the run asked for,
+`--groups`/`--all-groups` mean the same thing on either machine, and the only group neither may
+ask for is a machine's own `gaps` — its list of what it cannot serve yet (§15.36).
 
 **`tests.toml` picks which programs run.** All are built; grouped ones are left of the default
-sweep. Groups: `external` (needs the host network or a listener), `slow` (measurement/seconds),
-`diagnostic` (not a check at all). `--groups <a,b>` replaces the file's default; `--all-groups` runs
-everything; an undefined group name is an error — a sweep that quietly runs fewer tests than asked
-is the one failure this must not have. A new test lands with a group decision; silence is the
-default. Nothing a test runs can leak into the image `cargo xtask run` boots (test artefacts live
-under `build/`).
+sweep. It is written in the three sections every config file here uses: `[default]` holds the
+groups both machines read — `external` (needs the host network or a listener), `slow`
+(measurement/seconds), `diagnostic` (not a check at all) — and `[x86_64]`/`[aarch64]` hold each
+machine's own half, *added* to the baseline's group of the same name rather than replacing it. The
+one group that is an exclusion rather than a reason is a machine's `gaps`: what that machine cannot
+serve yet, invisible to the other's sweep and refused by name on its own. `--groups <a,b>` replaces
+the file's `default`; `--all-groups` runs every group a machine can see; an undefined group name is
+an error — a sweep that quietly runs fewer tests than asked is the one failure this must not have. A
+new test lands with a group decision; silence is the default. Nothing a test runs can leak into the
+image `cargo xtask run` boots (test artefacts live under `build/`).
 
 **Reporting the gate — never from a stale run.** This file carries **no test counts and no sweep
 composition figures**: a snapshot here goes stale within a commit or two (the last such snapshot —
@@ -220,15 +223,13 @@ its per-claim printing and exit status from the crate's own `Report` (`user/test
 instead of a local copy. Use `rustix` first; drop to `libc` only where the crate's rule allows it,
 and read that rule where it is owned — `user/tests/Cargo.toml`'s header states the measured clauses
 (unbound call, wrong wrapper syscall, shape cannot express the claim, plus the bitflags-vs-enum
-distinction and the numbers-from-rustix convention), each with its measurement beside it. `no_std`
-raw-syscall →
-`user/abitest/src/bin/{syscall,integration}/t-<name>.rs`, which is where the *unmigrated* half of the
-ABI suite lives: `docs/notes/` §15.11 moves it to the std side a batch at a time, so a new test does not
-belong there. **Add an explicit `[[bin]]` block to `user/abitest/Cargo.toml`** — Cargo does not
-auto-discover `src/bin/<subdir>/*.rs`; the std side needs none. Print `ok:`/`FAIL:` per check and a
-final `PASS`/`FAILED` (`Report::finish` does both). The no_std harness is `user/abitest/lib/lin.rs`.
-Keep the `t-` name (the test `/init` globs `/bin/t-*`). Decide its group in `tests.toml` — and a name
-in a machine's own group must be a program that machine actually builds (§5's trap).
+distinction and the numbers-from-rustix convention), each with its measurement beside it. The
+`no_std` raw-syscall suite this used to point at finished moving across and was deleted (§15.11's
+last batch), so `user/tests` is the whole ABI suite now. Print `ok:`/`FAIL:` per check and a
+final `PASS`/`FAILED` (`Report::finish` does both). Keep the `t-` name (the test `/init` globs
+`/bin/t-*`). Decide its group in `tests.toml` — under `[default]` it binds both machines, under a
+machine's own section it is that machine's alone, and a name in a machine's `gaps` must be a
+program that machine actually builds (§5's trap).
 
 **Add a kernel unit test.** A `#[cfg(test)] mod tests` at the bottom of the file it tests, with the
 parent module compiled for the host (§3). Assert on the contract (value, errno, count), not a log
@@ -310,7 +311,7 @@ definition the loader and both kernels read now (§13.23) — and the loader's
 | `fuzz/` won't build from the root | It is its own workspace; run `cargo fuzz` from inside `fuzz/` |
 | A `net/*` host test never runs | `src/lib.rs` gates the whole `net` module on `target_os = "none"`; a host test inside it is unreachable |
 | Two `cargo xtask test` runs in one tree report nonsense | They share `build/test-*` artefacts and one reads a log the other is writing. Trust the log's own summary + `=== END`, re-run alone |
-| The two sweeps do not build the same programs | x86_64's arm builds **both** suites (the bare-metal `user/abitest` plus `user/tests`), aarch64's builds **only** the std suite — the counts move with §15.11's migration, so read them off a run, never from here. So "every name `tests.toml` declares must be a program this arm built" has two scopes, and `tests.toml`'s `external`/`slow`/`diagnostic` groups name programs only the first machine carries. Sharing the check refuses every aarch64 sweep — measured on eight names (§15.8). Each arm asks its own question (`xtask/src/sweep.rs`'s `select` records why) |
+| The two sweeps do not build the same programs | They do now — §15.11's last batch finished the migration and deleted `user/abitest`, so both arms build the same std suite — but the counts moved repeatedly on the way, so read them off a run, never from here. "Every name `tests.toml` declares must be a program this arm built" is still two questions: the first machine's sweep asks it of the whole file, the second asks it of its own `gaps`. A `[default]` group's reason is the same on both machines, so a name in one is a program both arms build — the narrower question is not wrong, only smaller (`xtask/src/sweep.rs`'s `select` records why) |
 | The test machine ≠ the run machine | `xtask test` boots an initramfs on its own QEMU wiring; `xtask run` boots the disk image on `machine.toml`'s. A device only one has is a shape no test sees — name a driver's "controller with nothing on it" behaviour on the machine that has one before calling it measured (§7.3's 28 s empty-controller boot) |
 | A device class needs a *host* backend, not just a QEMU device | vsock is the one virtio device QEMU does not emulate in userspace — `vhost-vsock-*` is a host kernel module, so a machine naming it without `/dev/vhost-vsock` refuses to start. Attach only where the host can back it (`qemu::virt_machine_args` asks), and print the absence rather than dying of it. Give each guest a distinct CID (the two machines take `3` and `4`): a second guest claiming a live CID aborts QEMU before the guest starts (§13.28) |
 | A driver compiles, is host-tested, and **nothing calls it** | The shape that hid the 9p share for months: `fs9p::init_global` filled the registry every mount reads and was called from nowhere, while every boot printed "no share on the bus". A complete driver plus green host tests is exactly what hides it — they pin the parser, not the wiring. The tell is a boot log line that never changes: grep for the line the device should print and check whether any commit ever changed it (§13.29) |

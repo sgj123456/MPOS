@@ -424,8 +424,11 @@ are not restated in the phase sections above.
         and hands `t-stdargs` the argv the x86 harness's PATH lookup hands it
         (`arg0("t-stdargs") one two three`), and a `=== SETUP_FAIL` line now refuses the
         verdict outright rather than letting an unprepared machine read as failing tests.
-        `--groups`/`--all-groups` stay refused for this arm: the file's vocabulary also names
-        the `no_std` raw-syscall suite, which has no aarch64 port
+        `--groups`/`--all-groups` were refused for this arm on the day, because the
+        file's vocabulary then also named the `no_std` raw-syscall suite, which has no
+        aarch64 port; that suite finished migrating and was deleted, and §15.38 made
+        both arms ask the same question — the flags mean the same thing on either
+        machine now, and the only group neither may ask for is a machine's own `gaps`
   - [x] 13.6 aarch64 `/bin`: **the harness gap closes and the second machine's own list is
         empty**. The gap was never the ABI — `t-stdspawn` runs
         `/bin/{true,false,echo,cat,sh}` and `t-socketpair` runs `/bin/cat`, while the
@@ -449,8 +452,10 @@ are not restated in the phase sections above.
         streams` and `t-socketpair`'s `read back what the pair carried` among the passes; x86
         is unchanged (`pass=142 fail=0`, the same 10 left out). `tests.toml`'s `aarch64` group
         is **empty** and stays as an empty group - the mechanism is what names a gap, and the
-        day a call cannot be served is the day a name goes back in. What remains outside the
-        machine is `external`, and its reason is the internet
+        day a call cannot be served is the day a name goes back in. (That day came, and §15.38
+        renamed the group `gaps` under `[aarch64]` when `tests.toml` took the three sections:
+        `t-arch-prctl` is the one name in it, an architecture rather than a missing handler.)
+        What remains outside the machine is `external`, and its reason is the internet
   - [x] 13.7 aarch64 `SerialRing`: the PL011's line (SPI 33) is routed through the GIC and the
         second machine queues its console output instead of waiting on the wire — with the queue
         itself lifted out of `drivers/serial.rs` into `drivers::tx_ring`, behind a three-method

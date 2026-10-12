@@ -88,6 +88,192 @@ const SOCK_CLOEXEC: u32 = 0o2000000;
 const IPPROTO_ICMP: u32 = 1;
 const IPPROTO_TCP: u32 = 6;
 const IPPROTO_UDP: u32 = 17;
+/// The wildcard protocol a raw socket may name: the packet carries its own IP
+/// header and the kernel fills in what the header left out. Linux calls the
+/// caller's half of that `IP_HDRINCL`, implies it from this protocol rather than
+/// letting it be set (measured: a fresh socket reads back 1), and it is the door
+/// `busybox udhcpc` opens first - measured on this machine (§4.5).
+const IPPROTO_RAW: u32 = 255;
+
+/// The identification field handed to a `IPPROTO_RAW` packet whose caller left it
+/// zero. Linux assigns one (measured: two sends left with different ids), and it
+/// matters that it is a counter rather than a constant - two live fragments of the
+/// same (source, destination, protocol) quad with the same id are a reassembly
+/// collision, which is the whole reason the field exists.
+static RAW_IDENT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(1);
+
+/// Packets per wildcard raw door before the oldest gives way. Two DHCP
+/// transactions' worth of replies by any measure; the number exists so a
+/// stopped reader cannot make the kernel eat memory on its behalf, the same
+/// reason a packet socket's ring has one.
+const RAW_ECHO_FRAMES: usize = 8;
+
+/// The protocol a raw channel was opened with, or `None` for any other channel.
+fn raw_protocol(handle: usize) -> Option<u8> {
+    super::with(handle, |_, entry| match &entry.channel {
+        Channel::Raw { protocol, .. } => Some(*protocol),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// One wildcard door's receive queue: complete IPv4 packets, oldest first,
+/// bounded by `RAW_ECHO_FRAMES`. The type is `super::EchoQueue`, defined where
+/// the channel that owns it is; this alias keeps the seam and the reader's
+/// signatures short.
+type EchoQueue = super::EchoQueue;
+
+/// One wildcard door's queue, cloned out of the registry so a parked reader can
+/// take from it without holding the stack lock. Only ever fetched for a door
+/// bound to `IPPROTO_RAW`; every other channel answers `None`.
+fn raw_echo_queue(handle: usize) -> Option<EchoQueue> {
+    super::with(handle, |_, entry| match &entry.channel {
+        Channel::Raw { echoed, .. } => Some(echoed.clone()),
+        _ => None,
+    })
+    .flatten()
+}
+
+/// One wildcard door, as the NIC seam sees it: the queue the seam fills, and
+/// the tasks parked on that queue.
+///
+/// The list lives **outside** the stack, which is the shape `packet.rs`'s tap
+/// uses and is not a matter of taste here: the seam runs *inside*
+/// `Stack::poll_once` - `NicDevice::receive` is called by it - and every way
+/// in reaches that poll through `with`/`with_stack`, which is already holding
+/// `NET`'s `RefCell` borrowed. A seam that reached for the registry through
+/// the same lock would re-enter that borrow, and a re-entered `RefCell` is a
+/// panic, not a `None` (§4.5). So the door carries a *clone* of the queue's
+/// `Arc` and its own waiter list, and the two owners meet only through the
+/// cells.
+struct RawDoor {
+    queue: EchoQueue,
+    waiters: Vec<crate::sched::policy::TaskId>,
+}
+
+/// Every open wildcard door. Small, and emptied by the seam itself: a door
+/// whose channel has been freed is the only holder of its queue left, so a
+/// strong count of one is "the registry entry is gone" and the door goes.
+static RAW_DOORS: critical_section::Mutex<core::cell::RefCell<Vec<RawDoor>>> =
+    critical_section::Mutex::new(core::cell::RefCell::new(Vec::new()));
+
+/// Put the channel `handle` names on the seam's door list, so arriving IPv4
+/// packets reach its queue without the stack lock. Only a wildcard door has
+/// one: every other raw channel is served by its smoltcp socket.
+fn open_raw_door(handle: usize) {
+    let Some(queue) = raw_echo_queue(handle) else {
+        return;
+    };
+    critical_section::with(|cs| {
+        RAW_DOORS.borrow(cs).borrow_mut().push(RawDoor {
+            queue,
+            waiters: Vec::new(),
+        });
+    });
+}
+
+/// Take `id` out of, or put it back into, one door's parked-reader list - run
+/// *before* the park is entered (so no frame can arrive between the last empty
+/// check and the sleep without this task being in the list) and again when the
+/// wait ends, however it ends. The door's own list is the shape `packet.rs`'s
+/// tap uses: the stack-wide wake list is driven by the poll loop, and a door
+/// whose queue the poll loop never fills would park forever behind wakes that
+/// mean nothing to it (measured: the sweep hung 900 s on exactly that).
+fn echo_park(handle: usize, id: crate::sched::policy::TaskId, register: bool) {
+    // Found by the queue, not by the handle: the list is the only place the
+    // seam can reach, and the queue's `Arc` is what both sides name.
+    let Some(queue) = raw_echo_queue(handle) else {
+        return;
+    };
+    critical_section::with(|cs| {
+        for door in RAW_DOORS.borrow(cs).borrow_mut().iter_mut() {
+            if !Arc::ptr_eq(&door.queue, &queue) {
+                continue;
+            }
+            if register {
+                if !door.waiters.contains(&id) {
+                    door.waiters.push(id);
+                }
+            } else {
+                door.waiters.retain(|&w| w != id);
+            }
+        }
+    });
+}
+
+/// Copy one delivered IPv4 packet into one door's queue, newest kept and
+/// oldest lost past the bound. The queue holds the packet's own length, not a
+/// fixed slot: what arrives is what the machine received (§4.5), and a caller
+/// reading a short packet back as a full slot is a length this kernel made up.
+/// Measured on the shape that caught it - QEMU's BOOTP reply is a 576-byte IP
+/// packet, and a 512-byte slot dropped every one of them whole.
+fn push_into(queue: &EchoQueue, packet: &[u8]) {
+    critical_section::with(|cs| {
+        let mut q = queue.borrow(cs).borrow_mut();
+        q.push_back(packet.to_vec());
+        while q.len() > RAW_ECHO_FRAMES {
+            q.pop_front();
+        }
+    });
+}
+
+/// The NIC seam's copy of a frame's IP half into every open wildcard door,
+/// and the wake for whoever is parked reading one.
+///
+/// Called before smoltcp decides whose business the frame is, exactly as the
+/// packet tap is; unlike the tap this one answers only doors bound to
+/// `IPPROTO_RAW`, because that is the shape of what they asked for - every
+/// packet, header and all (`recvfrom` hands the complete IPv4 packet up on
+/// this family, §4.5's rules). A wildcard door receives **every** delivered
+/// IPv4 packet, ICMP included: Linux's raw socket bound to 255 is not
+/// protocol-filtered at receive time, and a client that reads back its own
+/// kind must be able to see it.
+pub(crate) fn echo_to_raw_doors(frame: &[u8]) {
+    // The ethertype is the wire's `08 00` as a *pattern*, host order - the one
+    // spelling `packet.rs` was measured into, reused rather than restated. A
+    // second copy of the constant written with the other endian detour is what
+    // made this door compare 0x0800 against 0x0008 and return on every frame,
+    // which measured as "the seam runs and no door is ever filled".
+    if frame.len() < 14
+        || u16::from_le_bytes([frame[12], frame[13]]) != super::packet::IPV4_ETHERTYPE
+    {
+        return;
+    }
+    let packet = &frame[14..];
+    // Version 4, IHL at least five, and the buffer fits the header it claims -
+    // the same three rules `Ipv4Packet::new_checked` holds, run against the
+    // borrowed slice directly (no copy: this runs on every arriving frame).
+    let version_ok = packet.first().is_some_and(|b| b >> 4 == 4);
+    let ihl_ok = packet.len() >= 20 && (packet[0] & 0x0f) as usize * 4 <= packet.len();
+    if !(version_ok && ihl_ok) {
+        return;
+    }
+    // One pass over the door list under *its* lock: fill each queue and
+    // collect the tasks parked on it. Never the stack's lock - this is called
+    // from `NicDevice::receive`, which is called from inside `poll_once`,
+    // which every caller reaches already holding `NET` borrowed.
+    let woke: alloc::vec::Vec<crate::sched::policy::TaskId> = critical_section::with(|cs| {
+        let mut doors = RAW_DOORS.borrow(cs).borrow_mut();
+        // A door whose channel is gone leaves with the next frame: the list is
+        // then the only holder of its queue.
+        doors.retain(|door| Arc::strong_count(&door.queue) > 1);
+        let mut woke = alloc::vec::Vec::new();
+        for door in doors.iter_mut() {
+            push_into(&door.queue, packet);
+            woke.extend(door.waiters.iter().copied());
+        }
+        woke
+    });
+    // A task parked in `recvfrom` on such a door hears about it now, not on
+    // the next tick - the same wake the stack's own poll gives a
+    // smoltcp-delivered socket. The *stack-wide* list is deliberately not
+    // touched here: a caller that reached this door through `poll(2)`/`epoll`
+    // is registered there, and it is woken when the poll that carried this
+    // frame ends - which is the poll this call is running inside of.
+    for id in woke {
+        crate::sched::wake(id);
+    }
+}
 
 const SOL_SOCKET: usize = 1;
 const SO_TYPE: usize = 3;
@@ -955,10 +1141,12 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
     let protocol_matches = match typ {
         SOCK_STREAM => protocol == 0 || protocol == IPPROTO_TCP,
         SOCK_DGRAM => protocol == 0 || protocol == IPPROTO_UDP,
-        // Raw sockets: IPPROTO_ICMP (1) is what `ping` needs. Protocol 0
-        // is allowed too - Linux defaults to the "raw" protocol for the
-        // family, which for AF_INET is ICMP.
-        SOCK_RAW => protocol == 0 || protocol == IPPROTO_ICMP,
+        // Raw sockets: IPPROTO_ICMP (1) is what `ping` needs, and IPPROTO_RAW
+        // (255) is what a DHCP client needs - a packet with the *caller's* own IP
+        // header, which is how a client asks for an address before it has one.
+        // Protocol 0 is allowed too: Linux defaults to the "raw" protocol for
+        // the family, which for AF_INET is ICMP.
+        SOCK_RAW => protocol == 0 || protocol == IPPROTO_ICMP || protocol == IPPROTO_RAW,
         _ => return err::ESOCKTNOSUPPORT,
     };
     if !protocol_matches {
@@ -969,6 +1157,12 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         Ok(handle) => handle,
         Err(e) => return e,
     };
+    // A wildcard door is put on the seam's list as soon as it exists, rather
+    // than looked up per frame: the seam runs inside the stack's poll and
+    // cannot walk the registry to find one (§4.5).
+    if typ == SOCK_RAW && protocol == IPPROTO_RAW {
+        open_raw_door(handle);
+    }
     let fd = match crate::vfs::open_inode(Arc::new(SocketInode { handle })) {
         Ok(fd) => fd,
         Err(e) => return crate::uaccess::err_of(e),
@@ -1433,6 +1627,15 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
         return err::EFAULT;
     }
     let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
+    // The destination's port is nothing to a raw IP socket - the packet it
+    // names carries its own protocol header - and Linux knows that: `ip_send_
+    // msg` reads only `sin_addr` for `SOCK_RAW`, and a caller may leave the
+    // whole address out (`NULL`) when the packet's own header says where it
+    // goes. A raw channel therefore reads family and address through the same
+    // parser but ignores what it would make of the port; every other type
+    // keeps the parse exactly as it was. (The shape this answers for is
+    // busybox's `udhcpc`: its renewal names `sockaddr_in{AF_INET, 0, server}`
+    // with no port at all.)
     let dst = if args[4] != 0 {
         match parse_sockaddr_in(args[4], args[5], from_user) {
             Ok(endpoint) => Some(endpoint),
@@ -2063,6 +2266,88 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         }
         return n as isize;
     }
+    // A packet socket's receive in scatter-gather form: one frame's payload
+    // into the first iovec, the sender's *link* address into `msg_name` - the
+    // same `sockaddr_ll` the `recvfrom` door writes.
+    //
+    // This branch exists because `busybox udhcpc` asks for its DHCP replies
+    // this way, and neither of the two calls beside it: `d4_recv_raw_packet`
+    // moved off `safe_read` onto `recvmsg` so that it could read
+    // `PACKET_AUXDATA` and skip the UDP checksum on a host that never
+    // computed one. Measured on this machine's host - `strace` on `udhcpc`
+    // shows the *listen* socket being `socket(PF_PACKET, SOCK_DGRAM,
+    // htons(ETH_P_IP))`, bound to the ifindex, and the read being
+    // `recvmsg(5, {msg_iovlen=1, msg_control=...})`. With no branch here the
+    // call reached the registry's "not a socket" answer and the client printed
+    // `read error: Not a socket, reopening socket` after every DISCOVER, while
+    // `t-dhcp` - which reads the same socket with `recvfrom` - stayed green
+    // (§4.5).
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_any().downcast_ref::<PacketSock>()
+    {
+        let (name, _namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
+            Ok(fields) => fields,
+            Err(e) => return e,
+        };
+        if iovlen > 0 && !crate::uaccess::buffer_ok(iov, iovlen * 16, false, from_user) {
+            return err::EFAULT;
+        }
+        let (buf, len) = first_iovec(iov, iovlen, from_user).unwrap_or((0, 0));
+        if args[2] & MSG_PEEK != 0 {
+            return err::EOPNOTSUPP;
+        }
+        if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
+            return err::EFAULT;
+        }
+        let frame = if dontwait(fd, args[2]) {
+            match sock.try_recv() {
+                Some(frame) => frame,
+                None => return err::EAGAIN,
+            }
+        } else {
+            match sock.recv_blocking() {
+                Ok(frame) => frame,
+                // A catchable signal ended the wait having taken nothing - the
+                // shape `udhcpc`'s own retry loop is built on.
+                Err(e) => return crate::uaccess::err_of(e),
+            }
+        };
+        let (payload, src, proto) = frame;
+        let n = payload.len().min(len);
+        unsafe {
+            core::ptr::copy_nonoverlapping(payload.as_ptr(), buf as *mut u8, n);
+        }
+        if name != 0
+            && !crate::uaccess::buffer_ok(
+                name,
+                crate::net::packet::SOCKADDR_LL_LEN,
+                true,
+                from_user,
+            )
+        {
+            return err::EFAULT;
+        }
+        if !crate::uaccess::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
+            return err::EFAULT;
+        }
+        unsafe {
+            if name != 0 {
+                crate::net::packet::write_sll(proto, &src, name);
+                ((msghdr + 8) as *mut u32)
+                    .write_unaligned(crate::net::packet::SOCKADDR_LL_LEN as u32);
+            }
+            // No control data. `PACKET_AUXDATA` is the one thing a caller of
+            // this family asks for and it is left unfilled rather than
+            // invented: the reader that wants it uses it only to *skip* a
+            // checksum check, so an empty buffer costs it a check it was
+            // prepared to make anyway.
+            ((msghdr + MSGHDR_CONTROLLEN) as *mut usize).write_unaligned(0);
+            // `MSG_TRUNC`: the report a short buffer cannot make for itself.
+            let flags = if n < payload.len() { MSG_TRUNC } else { 0 };
+            ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags);
+        }
+        return n as isize;
+    }
     // The datagram receive in scatter-gather form: one message into the
     // first iovec (the stack wants contiguity, and a syslog-sized message
     // fits the first iovec of every caller this image has), and the
@@ -2555,12 +2840,97 @@ fn raw_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
         Some(ep) => ep,
         None => return err::EDESTADDRREQ,
     };
+    // A caller that named IPPROTO_RAW carries its own IP header when it wants
+    // to (Linux's `IPPROTO_RAW` implies `IP_HDRINCL`, measured: a fresh socket
+    // reads the option back as 1), and *that* packet goes to the **device**
+    // rather than through smoltcp's raw socket. The measurement behind the
+    // split is §4.5's: smoltcp's raw emit *discards* a queued packet whose IP
+    // protocol byte is not the socket's (`socket/raw.rs`'s `dispatch`: "wrong
+    // ip protocol, dropping"), and this channel's socket is bound to `255`
+    // while a DHCP client's packet carries `17` - so the packet was queued,
+    // `sendto` returned its whole length, and nothing left the machine.
+    //
+    // Which shape the call is, is read off the packet's own first nibble, not
+    // off anything else: Linux answers an `IPPROTO_RAW` socket whose payload
+    // starts with a v4 header by sending *it* (the caller's bytes are the
+    // packet), and only when the first byte is not `0x4n` does it treat the
+    // buffer as a protocol payload in need of the kernel's own header - the
+    // same ICMP path `ping` has always used, where no drop can happen because
+    // the socket's protocol byte matches what smoltcp stamps into the header
+    // it builds. So one branch per shape, and both shapes share the door's
+    // rules below.
+    if raw_protocol(handle) != Some(IPPROTO_RAW as u8) || !data.first().is_some_and(|b| b >> 4 == 4)
+    {
+        return raw_emit_through_stack(handle, data, target);
+    }
+    let mut pkt = alloc::vec::Vec::from(data);
+    let (dst_mac, len) = {
+        // `new_checked` is where the IHL-at-least-five and fits-the-buffer
+        // rules already live; a short or lying header is `EINVAL`, as Linux
+        // answers. Version is already known to be 4 from the nibble above.
+        let mut packet = match smoltcp::wire::Ipv4Packet::new_checked(&mut pkt[..]) {
+            Ok(packet) => packet,
+            Err(_) => return err::EINVAL,
+        };
+        // A header that claims *more* than the call sent is refused the way
+        // Linux's `ip_raw_xmit`'s length check refuses it (`EINVAL`) - not
+        // truncated onto the wire, which would send a frame whose bytes past
+        // the caller's buffer are this kernel's own heap.
+        if (packet.total_len() as usize) > data.len() {
+            return err::EINVAL;
+        }
+        packet.set_total_len(data.len() as u16);
+        if packet.src_addr() == smoltcp::wire::Ipv4Address::UNSPECIFIED {
+            packet.set_src_addr(smoltcp::wire::Ipv4Address::new(
+                super::LOCAL_IP[0],
+                super::LOCAL_IP[1],
+                super::LOCAL_IP[2],
+                super::LOCAL_IP[3],
+            ));
+        }
+        if packet.ident() == 0 {
+            packet.set_ident(RAW_IDENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
+        }
+        packet.fill_checksum();
+        let dst = packet.dst_addr();
+        // One shape this door does not serve yet, refused by name rather than
+        // addressed to a guess: a *unicast* destination needs the ARP/next-hop
+        // lookup smoltcp performs for every other socket, and this path
+        // reaches the device directly. All a DHCP client sends before it has
+        // an address is broadcast, which needs no neighbour - and the client's
+        // renewal against a known server is the first caller to hit this line
+        // (measured in a product boot: `bind-choosenack` stops here, not in a
+        // crash). The prerequisite is named in §4.5.
+        if !dst.is_broadcast() {
+            return err::EOPNOTSUPP;
+        }
+        ([0xffu8; 6], packet.total_len() as usize)
+    };
+    match super::packet::send_frame(dst_mac, super::packet::IPV4_ETHERTYPE, &pkt[..len]) {
+        Ok(n) => n as isize,
+        Err(e) => e,
+    }
+}
+
+/// The header-less half of a raw send: the kernel builds the IPv4 header in
+/// front of the caller's protocol payload - Linux's `SOCK_RAW` without
+/// `IP_HDRINCL`, which is what `ping` speaks - and hands the packet to the
+/// smoltcp socket, whose own protocol byte always matches the header stamped
+/// here, so §4.5's silent drop cannot fire on this path.
+///
+/// The one shape that could steal the machine's delivery - a filterless
+/// smoltcp raw socket - is never created: `add_raw` binds the channel's number
+/// (`Unknown(255)` for the wildcard door), so the door's receive is the seam's
+/// own queue (`echo_to_raw_doors`) and this socket's ingress stays empty by
+/// construction.
+fn raw_emit_through_stack(handle: usize, data: &[u8], target: IpEndpoint) -> isize {
     let sent = super::with(handle, |stack, entry| {
         stack.poll_once();
         let Channel::Raw {
             home,
             handle: sock_handle,
             protocol,
+            ..
         } = &entry.channel
         else {
             return Err(err::ENOTSOCK);
@@ -2633,7 +3003,24 @@ fn raw_recv(
     out: &mut [u8],
     nonblock: bool,
 ) -> Result<(usize, Option<IpEndpoint>), isize> {
+    // The wildcard door reads its own queue, not smoltcp's. Its smoltcp socket
+    // is bound to `255` and matches no delivered packet by design (§4.5's
+    // filterless-socket argument), so the queue the seam fills is the whole of
+    // what this family ever receives here - and reading it first is what keeps
+    // an ICMP-shaped door from waiting on a slot that can never fill.
+    if raw_protocol(handle) == Some(IPPROTO_RAW as u8) {
+        return raw_wildcard_recv(handle, out, nonblock);
+    }
     loop {
+        // A frame that arrived while nobody was parked is taken at the start
+        // of every attempt, not only after a park: the NIC seam queues it and
+        // wakes whoever waits *then*, and a reader that comes later must still
+        // find it. This is the poll-before-try order every other receive here
+        // keeps (`tcp_recv`, `udp_recv`, and `service`'s wake in §10.1) - the
+        // one the first version of this door forgot, which measured as a
+        // blocking `recvfrom` sleeping through a reply already sitting in the
+        // stack's own buffers (`EWOULDBLOCK` forever).
+        super::with_stack(|stack| stack.poll_once());
         // The packet is received straight into the caller's buffer. It used to
         // land in a fresh 1500-byte `Vec` that was then copied out, which is one
         // heap allocation and one extra pass over up to a full MTU per datagram
@@ -2698,6 +3085,77 @@ fn raw_recv(
             return Err(err::EINTR);
         }
     }
+}
+
+/// The wildcard door's `recvfrom`: one complete IPv4 packet per call, read off
+/// the queue the NIC seam fills (§4.5 - a filterless smoltcp socket would steal
+/// the machine's UDP and TCP delivery, so this family's receive is the kernel's
+/// own copy, not the stack's). The wait shape is `raw_recv`'s, line for line:
+/// `EWOULDBLOCK` non-blocking, any deliverable signal first (`udhcpc` arms a
+/// `SIGALRM` and reads again), and the park ends on the stack's wake list.
+fn raw_wildcard_recv(
+    handle: usize,
+    out: &mut [u8],
+    nonblock: bool,
+) -> Result<(usize, Option<IpEndpoint>), isize> {
+    let Some(queue) = raw_echo_queue(handle) else {
+        return Err(err::EBADF);
+    };
+    loop {
+        // Drain the device first, every attempt. The seam that fills this
+        // door's queue runs only when smoltcp reads a frame, and smoltcp reads
+        // one only during a poll - so a reply that arrived while nobody was
+        // parked sits in the driver's ring until someone asks for it. This is
+        // the poll-before-try order `tcp_recv`/`udp_recv` keep (§10.1's event
+        // shape), and the one the door's first version forgot: measured as a
+        // blocking `recvfrom` sleeping through a reply already on the machine,
+        // and an `MSG_DONTWAIT` read answering `EWOULDBLOCK` forever.
+        super::with_stack(|stack| stack.poll_once());
+        if let Some(slot) = take_from(&queue) {
+            // The held length is the frame's IP half as it arrived; a caller's
+            // smaller buffer truncates the *copy*, never the record - Linux's
+            // raw socket hands up the whole packet and lets `msg_msg_flags`
+            // say `MSG_TRUNC`, which this kernel does not yet carry (a named
+            // sub-gap beside §4.5's door, not a new shape).
+            let n = slot.len().min(out.len());
+            out[..n].copy_from_slice(&slot[..n]);
+            // The sender is the IP header's, at its documented offset - read
+            // only when the packet is long enough to have one, which a door
+            // that queues whole packets still cannot promise of a truncated
+            // frame.
+            let src = if slot.len() >= 20 {
+                IpAddress::v4(slot[12], slot[13], slot[14], slot[15])
+            } else {
+                IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
+            };
+            return Ok((n, Some(IpEndpoint::new(src, 0))));
+        }
+        if nonblock {
+            return Err(err::EWOULDBLOCK);
+        }
+        if crate::sched::has_deliverable_signal() {
+            return Err(err::EINTR);
+        }
+        // Register before the park and unregister after, the same order
+        // `park_until` keeps for the stack-wide list: between the last empty
+        // check and the sleep a frame can arrive, and only a task already in
+        // the door's list is woken by it.
+        let me = crate::sched::current();
+        echo_park(handle, me, true);
+        let end = crate::sched::block_until_interruptible(|| {
+            critical_section::with(|cs| !queue.borrow(cs).borrow().is_empty())
+        });
+        echo_park(handle, me, false);
+        match end {
+            crate::sched::WaitEnd::Interrupted => return Err(err::EINTR),
+            crate::sched::WaitEnd::Condition | crate::sched::WaitEnd::Deadline => {}
+        }
+    }
+}
+
+/// Pop one packet off one door's queue, the reader's half of `push_into`.
+fn take_from(queue: &EchoQueue) -> Option<alloc::vec::Vec<u8>> {
+    critical_section::with(|cs| queue.borrow(cs).borrow_mut().pop_front())
 }
 
 // ---------------------------------------------------------------------------

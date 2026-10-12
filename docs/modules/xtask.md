@@ -38,7 +38,7 @@ out of the serial log.
 |---|---|
 | `src/main.rs` | the command set (`Cli`/`Commands`), `dispatch`, the resolved `Invocation`, and the whole privilege dance (`build_under_sudo`, `escalate`, `hand_back`) |
 | `src/arch.rs` | `Arch` — the machines this front end builds, and every per-machine fact (target triples, image names) answered once |
-| `src/config.rs` | the small TOML-subset parser for `machine.toml`, `rootfs.toml`, `initramfs.toml` and the flat `tests.toml`; the sectioned files' `[default]`/`[x86_64]`/`[aarch64]` semantics |
+| `src/config.rs` | the small TOML-subset parser for `machine.toml`, `rootfs.toml`, `initramfs.toml` and `tests.toml`; the sectioned files' `[default]`/`[x86_64]`/`[aarch64]` semantics — `tests.toml` took the same three sections in §15.38, its keys being groups of test programs |
 | `src/disk.rs` | the `disk` command (the raw image) and `sweep_medium`, the rootless GPT staging disk a test sweep boots |
 | `src/fat.rs` | the FAT32 writer used to put boot files on the ESP without mounting it (long-name entries included) |
 | `src/initramfs.rs` | the `initramfs` command: one pipeline, two machines — repos, apk, busybox applet farm, overlay, ustar |
@@ -65,8 +65,9 @@ commands that need artefacts current before they escalate.
   contract between `main`'s pre-dispatch steps and the per-command bodies.
 - The `test` arm is where the machines genuinely differ and where the front end
   refuses to lie: `Arch::X86_64` runs `selftest::run_tests`, `Arch::Aarch64` runs
-  `selftest::run_disk_sweep` and *refuses* `--groups`/`--all-groups` by name, because
-  `tests.toml`'s groups name x86_64's programs.
+  `selftest::run_disk_sweep`, and both ask `sweep::select` the same question about
+  `tests.toml` — `--groups`/`--all-groups` mean the same thing on either machine,
+  and the one group neither may ask for is a machine's own `gaps` (§15.38).
 - `sweep::select`/`sweep::Selection` own what a run boots and what it leaves out, so
   the two arms share one answer to "what does `tests.toml` mean" and keep only the
   payload location machine-specific.
@@ -107,7 +108,7 @@ in `docs/uapi/` and the kernel's module pages.
   that own them, with the gate runs beside it; the `--arch` switch's own measurement
   is the header of `arch.rs` and `docs/notes/` §15.18/§13.x's per-machine sweeps.
 - `docs/ROADMAP.md`'s status board is the plan for what the front end still has to
-  grow (for example the aarch64 `tests.toml` group and the remaining migration in
-  §15.11); `docs/notes/` holds the numbers. A new command lands with a
+  grow (for example the remaining migration in §15.11, which finished, and each
+  machine's own `gaps` list); `docs/notes/` holds the numbers. A new command lands with a
   `xtask/README.md` row and, if it changes what a sweep boots, a `sweep.rs` decision —
   the same one-intent-per-commit rule as the rest of the tree.

@@ -31,7 +31,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::config::{Machine, TestConfig};
+use crate::config::{GAP_GROUP, Machine, TestConfig};
 use crate::utils;
 
 /// The summary line the parse below counts on. The verdict lines around it are
@@ -110,15 +110,15 @@ pub fn in_default(machine: Machine, config: &TestConfig, name: &str) -> bool {
 /// # What is deliberately *not* here
 ///
 /// The "a declared name must be a program this arm builds" check. It looks like
-/// one rule and is two, measured: the first machine's arm builds both suites, so
-/// every name in the file has to be answerable there; the second's builds only
-/// the std-side suite (153 programs against the first's 170 today - §15.11 moves
-/// the rest across a batch at a time), so the names in
-/// `external`/`slow`/`diagnostic` that belong to the bare-metal conformance
-/// suite legitimately have no program on that machine. Sharing one scope would
-/// either refuse every aarch64 sweep or stop checking the first machine
-/// altogether, so each arm keeps the question it can answer - and its own
-/// wording for it.
+/// one rule and was two while the ABI migration was still moving: the first
+/// machine's arm built both suites, so every name in the file had to be
+/// answerable there, while the second's built only the std-side suite, and a
+/// name belonging to the `no_std` conformance suite legitimately had no program
+/// on that machine (measured on eight names, §15.8). §15.11's last batch
+/// finished the move and deleted that suite, so both arms now build the same
+/// std suite and the two answers coincide - but each arm still asks its own
+/// question (the whole file there, its own `gaps` here), because a question a
+/// machine cannot answer is worse than a narrower one it can.
 pub fn select<'a, T: TestProgram>(
     machine: Machine,
     config: &TestConfig,
@@ -139,48 +139,61 @@ pub fn select<'a, T: TestProgram>(
         );
     }
 
+    // A group that names a machine is an exclusion, never a selection: it is
+    // that machine's list of what it cannot serve, so `--groups aarch64` cannot
+    // mean "run the gap list" on any machine - and saying so is better than
+    // answering a caller's request with a smaller run because the group it
+    // named only ever removes.
+    let exclusions: Vec<&String> = selection
+        .groups
+        .iter()
+        .filter(|group| config.is_gap(group.as_str()))
+        .collect();
+    if !exclusions.is_empty() {
+        bail!(
+            "{} (asked through --groups) is an exclusion rather than a reason; \
+             it names what a machine cannot serve yet, so it can only leave \
+             tests out - never add them",
+            exclusions
+                .iter()
+                .map(|group| group.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     let selected = config.selection(&selection.groups, selection.all);
-    // The reason-groups (`external`, `slow`, `diagnostic`) are x86_64's
-    // vocabulary: they name programs that need *that* machine's harness - the
-    // internet through its QEMU wiring, a host listener on its 127.0.0.1 - or
-    // measure against its clock. On the second machine the same-named program is
-    // a different instrument (`t-netlat` measures this kernel's own loopback
-    // fabric, not the internet), and §13.5's contract for this arm is that it
-    // runs **every program it built** except the ones its own group names as
-    // gaps. So here a *reason* never leaves a program out; only this machine's
-    // own gap list does. A machine-named group keeps meaning "not me" everywhere
-    // else, unchanged.
+    // One rule on both machines, because the file is written to be read once:
+    // a program runs when it is in no group, or in a group this run asked for -
+    // and a group that *names a machine* is never one that can be asked for, so
+    // it only ever removes. `groups_of` already hides another machine's group,
+    // which is what keeps `t-arch-prctl` in the first machine's default sweep
+    // and out of the second's from the same file.
     //
-    // The one exception is a program that is not a check at all. A measurement
-    // instrument (`t-forkcost`, `t-netlat`) is a different instrument on each
-    // machine, so running it on both is right. A diagnostic (`t-sh`) is the
-    // *same* thing everywhere - an interactive shell exec'd onto the console to
-    // be read by hand - and §15.34's rule says what a boot may assert is
-    // bounded by what the kernel itself produces, which an interactive child's
-    // state letter is not. So `diagnostic` leaves a program out on both arms;
-    // `external` and `slow` stay x86_64-harness words.
-    let hand_read = |name: &str| {
-        config
-            .groups_of(name, Machine::X86_64)
-            .contains(&"diagnostic")
-    };
-    let staged: Vec<&'a T> = if machine == Machine::X86_64 {
-        built
-            .iter()
-            .filter(|test| config.runs(test.name(), &selected, machine))
-            .collect()
-    } else {
-        built
-            .iter()
-            .filter(|test| {
-                !hand_read(test.name())
-                    && !config
-                        .groups_of(test.name(), machine)
+    // It used to be two rules: the reason-groups (`external`, `slow`,
+    // `diagnostic`) bound the first machine only, and the second ran every
+    // program it built minus its own gap list (§13.5, §15.29). Measured on the
+    // two sweeps of one kernel: x86_64 staged 169 of 180 programs and aarch64
+    // 178 - the same file left out eleven on one machine and two on the other,
+    // and the nine that only the second ran are exactly the internet's and the
+    // clock's (`t-dns`, `t-rawicmp`, `t-stdresolve`, `t-udp`, `t-tcp-close`,
+    // `t-dhcp`, `t-fill-ramfs`, `t-forkcost`, `t-netlat`, `t-pipecost`). A
+    // group's *reason* is the machine under test or something outside it, and
+    // the DHCP server, the resolver and a public address are outside both
+    // machines - so a plain sweep on either one is a statement about the
+    // kernel, and the way to run the rest on purpose is `--groups`, which now
+    // works on both arms.
+    let staged: Vec<&'a T> = built
+        .iter()
+        .filter(|test| {
+            let groups = config.groups_of(test.name(), machine);
+            !groups.iter().any(|group| config.is_gap(group))
+                && (groups.is_empty()
+                    || groups
                         .iter()
-                        .any(|group| config.owns_a_machine(group))
-            })
-            .collect()
-    };
+                        .any(|group| selected.iter().any(|asked| asked == group)))
+        })
+        .collect();
     let skipped: Vec<&'a T> = built
         .iter()
         .filter(|test| {
@@ -437,10 +450,13 @@ mod tests {
     }
 
     const TOML: &str = r#"
+[default]
 default = []
 external = ["t-dns", "t-udp"]
 slow = ["t-forkcost"]
-aarch64 = ["t-drm"]
+
+[aarch64]
+gaps = ["t-drm"]
 "#;
 
     fn config(name: &str) -> TestConfig {
@@ -460,11 +476,14 @@ aarch64 = ["t-drm"]
     /// move every other expectation in this module at once.
     fn config_with_diagnostic(name: &str) -> TestConfig {
         const WITH_DIAGNOSTIC: &str = r#"
+[default]
 default = []
 external = ["t-dns", "t-udp"]
 slow = ["t-forkcost"]
-aarch64 = ["t-drm"]
 diagnostic = ["t-sh"]
+
+[aarch64]
+gaps = ["t-drm"]
 "#;
         let dir = std::env::temp_dir().join(format!("mpos-sweep-tests-{name}"));
         std::fs::create_dir_all(dir.join(crate::paths::TESTS_CONFIG).parent().unwrap()).unwrap();
@@ -533,11 +552,11 @@ diagnostic = ["t-sh"]
     }
 
     /// `--groups` *replaces* the default list rather than adding to it, and a
-    /// machine's own group is invisible to the other machine's sweep - which is
-    /// the whole reason a gap is declared per machine instead of being deleted
-    /// from the file.
+    /// group written in a machine's own section is invisible to the other
+    /// machine's sweep - which is the whole reason a gap is declared per machine
+    /// instead of being deleted from the file.
     #[test]
-    fn a_group_selects_its_own_programs_and_a_machines_group_is_its_own() {
+    fn a_group_selects_its_own_programs_and_a_machines_own_section_is_its_own() {
         let config = config("group-selection");
         let built = built();
 
@@ -566,84 +585,129 @@ diagnostic = ["t-sh"]
         let aarch64 = select(Machine::Aarch64, &config, &built, &Selection::default()).unwrap();
         assert_eq!(
             aarch64.staged.iter().map(|p| p.name()).collect::<Vec<_>>(),
-            vec!["t-tcp", "t-dns", "t-udp", "t-forkcost"],
+            vec!["t-tcp"],
             "this machine's own group is one of its groups, so `t-drm` is left \
-             out - and the *reason* groups are x86_64's vocabulary: they name \
-             that harness's needs, while this arm stages every program it built \
-             (§13.5), so `external` and `slow` leave nothing out here"
+             out - and so are the *reason* groups, which bind both machines: \
+             what `external` and `slow` name is outside the machine under test \
+             on either of them"
         );
-        assert_eq!(aarch64.skipped.len(), 1);
+        assert_eq!(aarch64.skipped.len(), 4);
+
+        // `--groups` reaches the second machine too now, which is what keeps
+        // those four programs runnable there at all: a group can be asked for
+        // on either arm, and only an exclusion cannot.
+        let asked = Selection {
+            groups: vec!["slow".to_string()],
+            all: false,
+        };
+        let asked = select(Machine::Aarch64, &config, &built, &asked).unwrap();
+        assert_eq!(
+            asked.staged.iter().map(|p| p.name()).collect::<Vec<_>>(),
+            vec!["t-tcp", "t-forkcost"],
+            "the same flag on the second machine brings the instrument back, \
+             and still leaves this machine's own gap out"
+        );
     }
 
-    /// The rule §13.5 wrote for this arm, measured on the day the std side first
-    /// carried the instruments: moving `t-forkcost`, `t-netlat` and `t-pipecost`
-    /// across made them *build* on aarch64, and the shared `runs()` still read
-    /// their `slow` membership as an exclusion there - so three programs sat in
-    /// the payload built, selected out, and run by neither arm's default sweep.
-    /// A reason-group's membership is a statement about the x86_64 harness; the
-    /// second machine's contract is its whole payload minus its own gap list.
+    /// A reason-group's membership is a statement about what a check needs
+    /// *outside* the machine under test, and the internet, the host's resolver
+    /// and the host's clock are outside both of them - so `external` and `slow`
+    /// leave the same programs out of both machines' plain sweeps, and the
+    /// numbers that made this visible are the two sweeps of one kernel: 169 of
+    /// 180 staged on x86_64 against 178 on aarch64, the nine extra being
+    /// precisely these two groups' members plus the DHCP client.
+    ///
+    /// What has to survive that is that they can still be run on purpose, which
+    /// is the second half of the test: `--groups` now reaches both arms.
     #[test]
-    fn a_reason_group_never_leaves_a_built_program_out_of_the_second_machine() {
-        let config = config("reason-groups-do-not-bind-aarch64");
+    fn a_reason_group_leaves_a_built_program_out_of_both_machines_by_default() {
+        let config = config("reason-groups-bind-both");
         let built = built();
-        let plan = select(Machine::Aarch64, &config, &built, &Selection::default()).unwrap();
-        let staged: Vec<&str> = plan.staged.iter().map(|p| p.name()).collect();
-        for program in ["t-dns", "t-udp", "t-forkcost"] {
-            assert!(
-                staged.contains(&program),
-                "{program} is built for this machine but a reason-group hid it \
-                 from the sweep"
-            );
+
+        for machine in [Machine::X86_64, Machine::Aarch64] {
+            let plan = select(machine, &config, &built, &Selection::default()).unwrap();
+            let staged: Vec<&str> = plan.staged.iter().map(|p| p.name()).collect();
+            for program in ["t-dns", "t-udp", "t-forkcost"] {
+                assert!(
+                    !staged.contains(&program),
+                    "{program} is a reason-group's, and a plain sweep on \
+                     {machine:?} is a statement about the kernel alone"
+                );
+            }
         }
-        // And the first machine keeps its gate exactly as before: the same
-        // programs are the ones a plain sweep leaves out there.
-        let x86 = select(Machine::X86_64, &config, &built, &Selection::default()).unwrap();
-        let left_out: Vec<&str> = x86.skipped.iter().map(|p| p.name()).collect();
-        assert_eq!(left_out, vec!["t-dns", "t-udp", "t-forkcost"]);
+
+        let asked = Selection {
+            groups: vec!["external".to_string(), "slow".to_string()],
+            all: false,
+        };
+        for machine in [Machine::X86_64, Machine::Aarch64] {
+            let plan = select(machine, &config, &built, &asked).unwrap();
+            let staged: Vec<&str> = plan.staged.iter().map(|p| p.name()).collect();
+            for program in ["t-dns", "t-udp", "t-forkcost"] {
+                assert!(
+                    staged.contains(&program),
+                    "{program} was asked for by name, and a run that stages \
+                     less than it was asked for is the one failure this has \
+                     ({machine:?})"
+                );
+            }
+        }
+    }
+
+    /// A group that names a machine is an exclusion: `--groups aarch64` cannot
+    /// mean "run the gap list" anywhere, and refusing beats a smaller run that
+    /// looks like the flag worked (`--all-groups` still sees every *reason*;
+    /// the gap stays a gap, because that machine cannot serve it).
+    #[test]
+    fn an_exclusion_cannot_be_asked_for() {
+        let config = config("exclusion-not-selectable");
+        let built = built();
+        let selection = Selection {
+            groups: vec![GAP_GROUP.to_string()],
+            all: false,
+        };
+        for machine in [Machine::X86_64, Machine::Aarch64] {
+            let error = select(machine, &config, &built, &selection)
+                .expect_err("a gap list is not a selection")
+                .to_string();
+            assert!(error.contains(GAP_GROUP), "{error}");
+            assert!(error.contains("cannot serve"), "{error}");
+        }
     }
 
     /// `diagnostic` is not a harness word but a kind: what it names is not a
     /// check at all (`t-sh` execs an interactive shell onto the console to be
-    /// read by hand), so the §13.5 contract - run everything else - does not
-    /// cover it, and leaving it out on both arms' *default* sweeps is the
-    /// honest reading of "everything that is a check of this machine". The
-    /// second arm still has no way to ask for a reason-group by name: `main`
-    /// refuses `--groups` there before it gets here, because its payload's
-    /// selection vocabulary is the first machine's suites' membership.
-    /// Measured on batch 43's day: with the reason-blind branch alone, the
-    /// second machine ran `t-sh` in its default sweep while the first left it
-    /// out of the very same one.
+    /// read by hand), and §15.34's rule says what a boot may assert is bounded
+    /// by what the kernel itself produces, which an interactive child's state
+    /// letter is not. So it is a reason-group like any other, and it leaves its
+    /// member out of *both* arms' default sweeps - measured on batch 43's day,
+    /// when the reason-blind branch had the second machine running `t-sh` in
+    /// the very sweep the first left it out of.
     #[test]
     fn a_diagnostic_is_left_out_on_both_machines_default_sweeps() {
         let config = config_with_diagnostic("diagnostic-on-both");
         let built = built_with_diagnostic();
 
-        let aarch64 = select(Machine::Aarch64, &config, &built, &Selection::default()).unwrap();
-        let staged: Vec<&str> = aarch64.staged.iter().map(|p| p.name()).collect();
-        assert!(
-            !staged.contains(&"t-sh"),
-            "a diagnostic belongs to no machine's default sweep"
-        );
-        assert!(
-            aarch64.skipped.iter().any(|p| p.name() == "t-sh"),
-            "and it is reported as left out, never silently absent"
-        );
-
-        // Every *other* reason-group still binds neither arm the way §13.5 says.
-        for program in ["t-dns", "t-forkcost"] {
+        for machine in [Machine::X86_64, Machine::Aarch64] {
+            let plan = select(machine, &config, &built, &Selection::default()).unwrap();
+            let staged: Vec<&str> = plan.staged.iter().map(|p| p.name()).collect();
             assert!(
-                staged.contains(&program),
-                "{program} is built for this machine and only `diagnostic` \
-                 may leave a built program out here"
+                !staged.contains(&"t-sh"),
+                "a diagnostic belongs to no machine's default sweep ({machine:?})"
             );
+            assert!(
+                plan.skipped.iter().any(|p| p.name() == "t-sh"),
+                "and it is reported as left out, never silently absent"
+            );
+            // The other reason-groups leave their members out here too, on both
+            // machines alike.
+            for program in ["t-dns", "t-forkcost"] {
+                assert!(
+                    !staged.contains(&program),
+                    "{program} is a reason-group's, on {machine:?} as on the other"
+                );
+            }
         }
-
-        let x86 = select(Machine::X86_64, &config, &built, &Selection::default()).unwrap();
-        assert!(
-            x86.skipped.iter().any(|p| p.name() == "t-sh"),
-            "the first machine's selection is unchanged: a plain sweep \
-             still leaves the diagnostic out"
-        );
     }
 
     /// The parser reads what both runners print, and beats the two cheaper

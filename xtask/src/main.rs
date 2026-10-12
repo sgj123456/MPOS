@@ -402,23 +402,16 @@ fn dispatch(command: Commands, invocation: Invocation<'_>, tests: sweep::Selecti
         // Both machines run the same sweep now: a disk with the test payload
         // staged on its root, the shared `TEST_INIT` walking `/bin/t-*`, and
         // the same `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol read off the
-        // serial line (`selftest::run_disk_sweep`). What still differs is the
-        // *selection*: x86_64's programs are named by `tests.toml`'s groups,
-        // and aarch64's group vocabulary does not exist yet, so this arm
-        // refuses a selection it cannot honour rather than running a different
-        // set than was asked for.
+        // serial line (`selftest::run_disk_sweep`). The *selection* is the same
+        // question on both now, and one `tests.toml` answers it: a program runs
+        // when it is in no group or in a group this run asked for, and the one
+        // group that can never be asked for is a group naming a machine - that
+        // machine's list of what it cannot serve (`sweep::select`). So
+        // `--groups`/`--all-groups` mean the same thing on either arm, and what
+        // a plain sweep leaves out it leaves out on both (§15.38).
         Commands::Test => match arch {
             Arch::X86_64 => selftest::run_tests(build_dir, profile, tests),
-            Arch::Aarch64 => {
-                if !tests.groups.is_empty() || tests.all {
-                    anyhow::bail!(
-                        "--groups/--all-groups select among x86_64's programs today; \
-                         the aarch64 sweep runs every aarch64 program it built \
-                         (NOTES.md §13.5)"
-                    );
-                }
-                selftest::run_disk_sweep(build_dir, profile, arch)
-            }
+            Arch::Aarch64 => selftest::run_disk_sweep(build_dir, profile, arch, tests),
         },
         Commands::Depgraph => depgraph::run(&utils::project_root()?),
         Commands::Clean => utils::clean(build_dir),
