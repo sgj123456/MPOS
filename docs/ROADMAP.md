@@ -1,7 +1,7 @@
 # MPOS Roadmap
 
 What MPOS is building, phase by phase, and where each phase stands: the objectives,
-the checklist, the remaining work and the priority — and nothing else.
+the checklist, the remaining work and what to do next — and nothing else.
 
 Every measurement, gate run, lesson and trap behind a claim here lives in the
 [`notes/`](notes/index.md) evidence library, which is where a design decision's reasoning belongs.
@@ -40,7 +40,7 @@ One-glance status of the whole roadmap. Each line is a conclusion plus its evide
 **Process (Phase 6)**
 - [x] 6.1 ptrace (§6.1) · [x] 6.2 real rlimits incl. NOFILE/STACK (§6.2) · [x] 6.4 identity/cap calls, threads via `clone(CLONE_THREAD)` (§6.4)
 - [x] teardown at exit, not at reap — an exited task gives back its address space and every descriptor immediately (§6, R.15)
-- [~] 6.3 Namespaces — UTS built; **MNT steps 1 and 2 built**: the mount table is per-task (`MountTable` as a value), `unshare(CLONE_NEWNS)` copies it and `t-ns-mnt` pins both directions of divergence, `clone(CLONE_NEWNS|CLONE_NEWUTS)` copies per-kind into the child (`t-clone`), and a namespace is now nameable by a **descriptor** — `/proc/<pid>/ns/{mnt,uts}` are openable links (`kind:[id]`, one number pool) and `setns` joins by reference, so a caller adopts a namespace another process made (`t-ns-setns` pins the surface, the measured refusals, and the share-vs-copy difference). PID/NET designed, ordered UTS → MNT → PID → NET; the other six kinds have no entry at all, which is the surface a kernel built without them has; **MNT is complete** — threads share the process's filesystem context (root, cwd, path, mask) and its descriptor table, `unshare(CLONE_FS)`/`CLONE_FILES` split the caller's own slot, and the three thread-group flags a sibling makes impossible (`CLONE_VM`/`CLONE_SIGHAND`/`CLONE_THREAD`) are `EINVAL` where all six are `0` alone, measured one child per flag (`t-unshare-fs`); `t-ns-setns` pins that a namespace and its contents outlive the process that made them, and every path-taking syscall resolves in the caller's *own* tree — its mount namespace and its root — where `t-caller-paths` pins one claim per handler (`lstat`/`statx`/`readlink`/`O_NOFOLLOW` inside a namespace, `mkdir` inside a jail) (§6.3, §6.6)
+- [~] 6.3 Namespaces — UTS built; **MNT complete**: the mount table is per-task, `unshare(CLONE_NEWNS)` copies it (`t-ns-mnt`, `t-clone`), a namespace is nameable by a descriptor and joinable with `setns` (`t-ns-setns`), threads share the process's filesystem context and descriptor table until `unshare(CLONE_FS)`/`CLONE_FILES` split them (`t-unshare-fs`), and every path-taking syscall resolves in the caller's *own* tree (`t-caller-paths`). PID/NET designed, ordered UTS → MNT → PID → NET; the other six kinds have no entry at all (§6.3, §6.6)
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§Remaining)
@@ -86,8 +86,8 @@ One-glance status of the whole roadmap. Each line is a conclusion plus its evide
 - [x] 10.1 network latency — event-driven waits + MSI-X (§10.1)
 - [~] 10.2 context-switch/fork cost — lazy FPU, one TLB flush, smaller stacks; PCID recorded as a decision (§10.2)
 - [~] 10.3 syscall path — itimer flag landed; fault-driven user-buffer copy not (§10.3)
-- [x] 10.4 pipes + per-frame allocations — ring, handover and the seam frame pool all landed, and the **rate pair is measured**: the pool does **not** move the rate (before `12138`/`20372` datagrams/s, after `11768` and `19652` — the before sits inside the after's own 0.8–3.9 % run-to-run spread), while `pool=1036:0` and the counterfactual's failing warm-up pin say the steady path never allocates and its volume is bounded at 64 KiB (§10.4)
-- [~] 10.5 ext4/virtio-blk read path — cache landed; the disk-backed instrument stands, and the **wide transfer landed and is measured**: `cold` (a 64 MiB sequential read) **16387 → 1027** and `smallcold` **1024 → 65**, identical on both machines, from a demand run of 16 blocks per device call (`BlockDev::max_transfer`, `AhciDisk`'s 128 KiB PRDT) — readahead could not have moved this number and the arithmetic is in §10.5. Both virtio block transports now answer the same width, behind a test that **proves** the buffer is one direct-map run rather than assuming it (`crates/blk::direct_map_run`, the page tables' answer to what `HalImpl::share`'s subtraction needs) — the "contiguous multi-frame bounce" an earlier draft named as the prerequisite turned out to be already met by the slab and the direct map, and would have copied every read of the busiest disk (§10.5). Still open: the last row is now **measured and re-scoped** — `src/drivers/kunit.rs`'s boot suite counts what a device call masks on both machines, the mask's size is the device's latency (µs for the runs a filesystem asks for), **interrupt-driven completions** are a structure change whose pin is that suite's claim, and `multi-request pipelining` is **dropped** (no consumer) — and the **first machine's** own boot-disk figure is a named gap: its sweep's `vda` is QEMU's read-only VFAT ESP, mounted by nothing, so no boot counts the installed image's root (§10.5)
+- [x] 10.4 pipes + per-frame allocations — ring, handover and the seam frame pool all landed; the rate-pair measurement says the pool does not move the rate while the steady path never allocates, bounded at 64 KiB (§10.4)
+- [~] 10.5 ext4/virtio-blk read path — cache landed; the **wide transfer landed and is measured** (a cold 64 MiB read ~16× faster, identical on both machines), both virtio block transports answer the same width behind a direct-map-run proof, and §10.5's last row is **measured and re-scoped**: the mask's size is the device's latency, **interrupt-driven completions** are the structure change whose pin is `src/drivers/kunit.rs`'s suite, `multi-request pipelining` is **dropped** (no consumer). Still open: the first machine's own boot-disk figure — its sweep's `vda` is QEMU's read-only VFAT ESP, so no boot counts the installed image's root (§10.5)
 - [x] 10.6 serial TX ring · [ ] 10.7 sub-tick sleeps (LAPIC one-shot) (§10.6, §10.7)
 
 **Architectures (Phase 9)**
@@ -114,9 +114,9 @@ One-glance status of the whole roadmap. Each line is a conclusion plus its evide
 
 In the order that keeps each step verifiable on its own:
 
-1. **namespaces** (§6.3) — UTS built, per-process root landed (`t-chroot`), **MNT landed through step 2**: the table moved onto the task, `unshare(CLONE_NEWNS)` copies it (`t-ns-mnt`), and `/proc/<pid>/ns/{mnt,uts}` + `setns` let a namespace be *named by a descriptor* and joined by reference (`t-ns-setns`). What is left of MNT is nothing — CLONE_FS-style separation landed: threads share the process's filesystem context and descriptor table, `unshare(CLONE_FS)`/`CLONE_FILES` split the caller's own slot, and the three flags a sibling makes impossible answer `EINVAL` (`t-unshare-fs`, §6.3); the ladder's next rung (PID, then NET) is designed and unbuilt, and seccomp's one named piece left is the `PTRACE_EVENT_SECCOMP` stop (§8.2).
-2. **the block layer's mask** (§10.5's last row, measured and re-scoped) — a device call holds the machine inside `critical_section::with`, and `src/drivers/kunit.rs`'s boot suite now measures it in the machine's own clock on every registered disk: the mask's size is the *device's* latency (1–42 ms for the largest call one allocation can be; **~8 µs** for the 64 KiB run a filesystem actually asks for), the tick count only moves past the second period a mask spans, and the two machines' timers differ — x86_64's count loses a masked period for good, aarch64's catches up (`11/10` measured across 41 ms). What that leaves: **interrupt-driven completions** are a structure change whose justification is the unbounded case (§7.3's 28.4 s probe in one mask) and whose pin is the suite's claim, dormant while every call is under a period; **`multi-request pipelining` is dropped** (one call is already one transfer, and readahead — the only caller that would want two in flight — was re-scoped in `9aa4f18`). What the row still needs, named: a block completion line beside `Line::{Timer, Serial}` and net's MSI-X vector, and a block waiter registry beside net's `subscribe`/`wake_waiters`/`irq_service`.
-3. **the DHCP client's last door** (§4.5) — the wiring landed and is measured: the image carries `/usr/share/udhcpc/default.script`, `SERVICES` enables `networking`, and a product boot shows `* Starting networking ...` / `*   eth0 ...`. The client then stops on its **first** syscall — `udhcpc: socket(AF_INET,3,255): Protocol not supported` — because `AF_INET`+`SOCK_RAW`+`IPPROTO_RAW` (the door a client sends a DISCOVER through before it has an address) is not served, while ICMP's raw form is (`t-rawicmp`). A **first attempt at that door is recorded rather than landed**: its Linux rules are all measured (`.workbuddy/probe_rawip.c`, tabulated in §4.5) and a draft took the boot from that first syscall to `udhcpc: broadcasting discover`, but the queued packet never reached the server - so it was reverted rather than ship a door that accepts a frame and drops it. §4.5 now carries the **cause**: smoltcp's raw emit *drops* a queued packet whose IP protocol byte differs from the socket's (`socket/raw.rs`'s `dispatch`), which is what the `255`-bound channel does to a UDP packet - so the next attempt sends through the device (the `AF_PACKET` path) instead, serving broadcast (all DHCP needs) and naming the unicast case, whose prerequisite is the next-hop lookup smoltcp would have done. The `CAP_NET_RAW` half *did* land: both raw doors ask it before the protocol, pinned by `t-caps` on both machines. The selftest keeps riding the kernel's static default (the item's own carve-out).
+1. **namespaces** (§6.3) — UTS and MNT are landed (the board's line carries the pins); what is left is the ladder's next rung, **PID then NET** — designed, unbuilt. Beside it: seccomp's one named piece, the `PTRACE_EVENT_SECCOMP` stop (§8.2).
+2. **the block layer's mask** (§10.5's last row, measured and re-scoped) — the suite's findings are §10.5's; what the row still *needs*, and this is the plan's own increment: a block completion line beside `Line::{Timer, Serial}` and net's MSI-X vector, and a block waiter registry beside net's `subscribe`/`wake_waiters`/`irq_service`. Interrupt-driven completions are justified by the unbounded case (§7.3's 28.4 s probe in one mask), dormant while every call is under a period.
+3. **the DHCP client's last door** (§4.5) — `AF_INET`+`SOCK_RAW`+`IPPROTO_RAW` is not served, so `udhcpc` stops at its first syscall. The rules, the reverted attempt, smoltcp's protocol-byte drop as the cause, and why the next attempt must send through the device (`AF_PACKET` path): all §4.5's. The `CAP_NET_RAW` half landed (`t-caps`).
 4. **the aarch64 session + weston's write fault** (§15.36) — the two lines above marked *(no evidence file yet)*; measure first, then write the entry.
 5. **the display path specifically** — §7.4 carries its own order, and its first step is not a kernel change at all: boot a wlroots compositor on `WLR_RENDERER=pixman` and read what it says; it is the cheapest way to find what the analysis has wrong.
 
@@ -140,36 +140,14 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are TCP's two record-only options, `SO_LINGER`'s egress reset,
 buffer sizes, `MADV_FREE`, MNT/PID/NET isolation, and the unsized-pty window divergence.
 
-Two of those "buffer sizes" are now named down to the line, both found by `t-netstats` (the
-first program of the default sweep that sends an IP packet off the machine, `docs/notes/` §10.4):
-a **blocking UDP send does not wait for the send buffer** — `EAGAIN` where Linux waits, because
-there is no event for the device's TX completion to wait on (`docs/uapi/` §5.2). What the same
-program *also* measured is a test-side lesson rather than a gap: its first failures were a link
-MTU an earlier program in the sweep had left at 1400, which no datagram of its burst could fit
-under. Both halves are now pinned by that program (it asks the MTU and refuses to report a stack
-failure for a link that cannot carry its datagram; `t-netlink` puts the MTU back).
+Two of those "buffer sizes" are named down to the line, both found by `t-netstats`: a **blocking
+UDP send does not wait for the send buffer** (`EAGAIN` where Linux waits — no event exists for the
+device's TX completion to wait on; `docs/uapi/` 05-work-list §5.2). The MTU story that program also
+caught is a test-side lesson, not a gap: it lives with §10.4's measurement.
 
 ---
 
-## Priority Summary
-
-| Phase | Effort | Impact | Blocks |
-|-------|--------|--------|--------|
-| **P1: epoll + timerfd** | ~2 weeks | Critical | Most network services |
-| **P2: Signal delivery** | ~2 weeks | Critical | Shell, bash, most programs |
-| **P3: FS enhancements** | ~2 weeks | High | Hard links, timestamps, locking |
-| **P4: Networking** | ~2 weeks | High | AF_UNIX, ping, TCP options |
-| **P5: Memory** | ~1 week | Medium | Shared memory, madvise |
-| **P6: Process** | ~2 weeks | Medium | Debugging, rlimits |
-| **P7: Drivers** | ~2 weeks | Low | GUI, input |
-| **P8: Security** | ~1 week | Low | ASLR, seccomp |
-| **P9: Architectures** | ~4 weeks | Low | aarch64, RISC-V |
-| **P10: Performance** | 10.1 done; rest ~3 weeks | High (10.2-10.3) / Medium (rest) | Interactive latency, throughput |
-| **P11: Architectural debt** | A done; B–C ~3–5 weeks; D–G ~1 week | High (maintainability) | Every later phase (§11) |
-| **P12: ABI truthfulness** | gate restore ~days; Group A ~2 days; Group B ~1–2 weeks | High (correctness) | Programs that trust a false success (§12) |
-| **P13: Machine-seam purity + aarch64 parity** | estimate: purity 13.1–13.2 ~2–4 weeks; parity 13.3–13.5 the aarch64 ladder | High (the second machine becomes usable) / Medium (maintainability) | A third port (§9.2 RISC-V) (§13) |
-
-**Recommended order**: P1 -> P2 -> P3 -> P4 -> P5 -> P6 -> P7 -> P8 -> P9
-
-**P11 Step A is done.** P11's Steps B and C are the ones worth doing before the next device driver
-or the next per-open-file resource is added, because each of those makes the debt one line larger.
+*The phase-by-phase effort/impact table this file used to end with is retired: P1–P9's estimates
+predated Phases 12–15 landing, and "Recommended order: P1 → … → P9" orders work the status board
+above marks done. What is open lives in the board and the moves above; `docs/notes/`'s appendix
+carries the per-phase history.*

@@ -3,7 +3,7 @@
 How to work in this repository. Read this before your first edit. The other docs split the rest:
 `README.md` = what MPOS *is*; `docs/ARCHITECTURE.md` = how it is put together, the module graph and
 where the layering is violated; `docs/ROADMAP.md` = the plan - the phase-by-phase roadmap, the status board, the remaining
-work and the priority; `docs/notes/` = the evidence behind it (one file per phase plus an index,
+work and what to do next; `docs/notes/` = the evidence behind it (one file per phase plus an index,
 split from the old single `NOTES.md`; a `§N.M` pointer routes through `docs/notes/index.md`) —
 the measured status of every phase,
 the ledger of every gate run and measurement, and the home of any new plan; `docs/uapi/` = the
@@ -335,7 +335,7 @@ gitignored). Never push to a remote unless explicitly asked.
 ## 7. Where the plans live
 
 - `docs/ROADMAP.md` — the plan: the phase-by-phase roadmap, the status board at the top,
-  "Suggested next moves", the priority summary. What to do next lives here.
+  "Suggested next moves", what is open and in which order. What to do next lives here.
 - `docs/notes/` — the evidence: the ledger of each gate run, performance change and lesson
   *with its measurement*, and the reasoning behind every divergence the roadmap names.
 - `docs/uapi/` — the userspace surface as an inventory (syscalls, ioctl families, layouts, flag

@@ -666,7 +666,7 @@ layers; `AGENTS.md` is the short version for anyone (or anything) about to make 
 | `AGENTS.md` | The working guide: commands, conventions, recipes for adding a syscall or a test, known traps |
 | `docs/README.zh.md` | Chinese translation, kept in section-by-section correspondence with this file |
 | `docs/ARCHITECTURE.md` | The dependency graphs, the boot and syscall sequences, per-layer ownership, the measured inter-module edges, and the layering violations |
-| `docs/ROADMAP.md` | The plan: the feature roadmap and status board, the remaining work per phase, the priority summary |
+| `docs/ROADMAP.md` | The plan: the feature roadmap and status board, the remaining work per phase, and what to do next |
 | `docs/notes/` | The evidence library: one file per phase plus an index (`index.md`) — every measurement, gate run, lesson and trap, the measured performance work, and Phase 11's architecture-debt audit and remediation plan. A `§N.M` pointer routes through `docs/notes/index.md` |
 | `docs/uapi/` | The userspace-visible surface as an inventory: syscalls, device ioctls, struct layouts and flag vocabularies, each with Linux's answer, this kernel's, and the pin — the working list of what is served, honestly refused, or a wrong shape |
 | `xtask/README.md` | Every build/run command, flag and environment variable (bilingual) |
