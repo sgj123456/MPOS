@@ -2096,6 +2096,33 @@ pub fn resolve_parent_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<(Arc<dy
     table.resolve_caller_parent(path, start)
 }
 
+/// Resolve `path` from `start` **without following the last name**, through the
+/// caller's table.
+///
+/// The free twin of [`Vfs::resolve_caller_no_follow`], and the one a syscall
+/// must use: this module's header states the rule — *nothing outside it resolves
+/// against [`global`] from syscall context* — and the reason is a namespace. A
+/// task that unshared its mounts has mounts the machine's table does not, so a
+/// probe that asked the machine's table would answer about a tree the caller is
+/// not standing in. That is not hypothetical: a dozen path-taking handlers asked
+/// `global()` here, and the divergence is sharp rather than subtle, because the
+/// *following* walks were caller-routed already. Inside a namespace with a
+/// filesystem mounted, `stat("/mnt/f")` saw the mount and `lstat("/mnt/f")` did
+/// not — the same path, two answers, and the wrong one for every `ls -l` in a
+/// container.
+pub fn resolve_no_follow_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
+    let (table, _) = process_fs_context();
+    let table = table.unwrap_or_else(machine_table);
+    table.resolve_caller_no_follow(path, start)
+}
+
+/// The filesystem serving `inode` **in the caller's table** - the identity test
+/// `fstatfs` and `linkat`'s `EXDEV` ask, on the same rule as
+/// [`resolve_no_follow_at`] above.
+pub fn fs_serving_inode_of(inode: &Arc<dyn Inode>) -> Option<Arc<dyn FileSystem>> {
+    caller_table().fs_serving_inode(inode)
+}
+
 /// The calling task's mount context: `(table, root)`, both `None` when the
 /// caller has neither — which is every boot step (running before any task
 /// exists), every kernel-side walk, and every host test driving an explicit

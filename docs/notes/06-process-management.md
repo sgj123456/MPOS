@@ -289,11 +289,11 @@ two halves of the same seam rather than a claim that had aged:
   table onto the task and routed the *resolution* free functions through `process_fs_context`, but the
   two renderers kept `mount::global()` — so every task read one list and `t-ns-mnt`'s "a child's umount
   peels its own copy" looked at the machine's mounts from inside a copy, where the peel cannot be seen.
-  They call the caller-routed `mount::mount_records()` now. A sibling of the same oversight is **named
-  rather than fixed**: `linkat`'s descriptor-side `EXDEV` check still asks
-  `mount::global().fs_serving_inode` (`src/syscall/linux/fs/file.rs`), so a task with its own mounts can
-  be refused a link Linux would have made — an exotic path that wants its own pin before its own fix,
-  and it is the remaining half of "every free function routes through the process context".
+  They call the caller-routed `mount::mount_records()` now. A sibling of the same oversight was **named rather than fixed** here, and asked for its own pin before its own fix: `linkat`'s descriptor-side `EXDEV` check still asked
+  `mount::global().fs_serving_inode` (`src/syscall/linux/fs/file.rs`), so a task
+  with its own mounts could be refused a link Linux would have made — an exotic
+  path, and the remaining half of "every free function routes through the process
+  context". It is fixed below, with the family it turned out to belong to.
 * **`uname` answered four empty fields on an armed boot.** §10.5's disk-counter protocol `return`ed
   from the middle of the handler after writing `release` and `version`, leaving sysname, nodename,
   machine and domainname as the caller's zeros — and the sweep arms that protocol whenever it stages
@@ -698,6 +698,47 @@ Gate for the correction: x86_64 `pass=167 fail=0 (167 built)` and aarch64
 failed`; the host suites all green (kernel 530, `mpos-xtask` 116, the leaf
 crates' own), `fmt --check` clean, `depgraph` within the ratchet. The three new
 claims hold on both machines, and `t-ns-setns` prints no note any more.
+
+**The other half of "every free function routes through the process context" — and
+the family it turned out to be.** The sentence above named one site, `linkat`'s
+descriptor-side `EXDEV` check. Fixing it found a class: a dozen handlers in
+`src/syscall/linux/fs/file.rs` resolved through the *machine's* table, because
+they reached for `mount::global()` where this module's own header says nothing
+outside it may. What let the bug survive review is that the divergence is sharp
+rather than subtle — the *following* walks were caller-routed already, so inside a
+namespace with a filesystem mounted `stat("/mnt/f")` saw the mount and
+`lstat("/mnt/f")` did not. One path, two trees, and the wrong one for every
+`ls -l` in a container.
+
+What landed is the rule rather than the site: two free functions in
+`src/vfs/mount.rs` — `resolve_no_follow_at` and `fs_serving_inode_of` — which
+compute the caller's table the way every other free function there does, and the
+sites now go through them. Each one: `newfstatat`'s no-follow walk, `statx` with
+the same flag, `readlink`, `xattr_target`, `utimensat`, `mkdirat`'s existence
+probe, `fchownat`, `linkat`'s two (the source's resolution and the identity test),
+`fchmodat`, `mknodat`'s probe, `vectored_at_position`'s buffer target, and `open`'s
+`O_NOFOLLOW`/`ELOOP` probe. Two of those carried a *second* defect: `mkdirat`'s and
+`mknodat`'s probes called `MountTable::resolve_no_follow`, whose walk starts at the
+machine's **root** — so a chrooted task was refused a directory it did not have
+because the machine's root had one. `path_of`'s render jail (`/proc/<pid>/cwd`
+naming an inode from a root) is a *different* question — whose root a path is
+*rendered* against, not which tree it resolves in — and is left named rather than
+moved with these; it wants its own reading and its own pin.
+
+The pin is `t-caller-paths` (both machines, default sweep), one claim per
+observable: `lstat`, `statx` with the same flag, `readlink` and
+`open(O_NOFOLLOW)`→`ELOOP` inside a mount namespace, and `mkdir("/tmp")` inside a
+jail. **Every claim was checked as a counterfactual**, and with the fix stashed all
+five fail. That check also *cut the pin down*: three sites the first draft claimed
+— a namespace `mkdir`'s `EEXIST`, `linkat`'s `EXDEV`, and `access` — pass with *and*
+without the fix, because the filesystem's own create/`link` refuses in the same
+place, so they pin nothing and were removed rather than kept as decoration. Rule
+4's criterion is the reason to prefer five claims that fail to twelve that pass.
+
+Gates: x86_64 `pass=169 fail=0 (169 built)` and aarch64 `pass=178 fail=0`, both
+`mpos-kunit 29 passed, 0 failed`, the five `t-caller-paths` claims green on each;
+host 533 + `mpos-xtask` 116; `fmt --check` clean; `clippy` clean on both kernel
+targets; `depgraph` within the ratchet.
 
 ### R.6 (moved from ROADMAP's status board) — `/proc/<pid>/maps`: the three sources, and why two of them stay beside the VMA table
 

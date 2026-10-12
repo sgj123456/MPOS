@@ -93,7 +93,8 @@ pub mod vcmux;
 
 pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write};
 pub use mount::{
-    global, mount, mount_root, pivot_root, resolve, resolve_at, resolve_parent_at, unmount,
+    fs_serving_inode_of, global, mount, mount_root, pivot_root, resolve, resolve_at,
+    resolve_no_follow_at, resolve_parent_at, unmount,
 };
 
 use alloc::string::String;
