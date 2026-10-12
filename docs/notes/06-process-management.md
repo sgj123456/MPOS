@@ -599,6 +599,13 @@ What the join does is the claim between them - the marker the child wrote inside
 its own mount, readable in the caller's namespace after joining and unreadable
 before.
 
+Gates: x86_64 `pass=167 fail=0 (167 built)` and aarch64 `pass=176 fail=0` (176
+staged, 2 left out), host 530 + `mpos-uts` 5 + `mpos-xtask` 116, `fmt --check`
+clean, `depgraph` within the ratchet (8/8). The commit body had to say the
+aarch64 arm was still un-re-run when it landed; this is the line that closes
+that, added after the fact because a body is a record of the moment and not a
+claim about later.
+
 The pin is `t-ns-setns` (both machines, default sweep): the directory's two names
 and the six `ENOENT`s, the link text's shape and the two kinds' different
 numbers, the descriptor's `EINVAL`/`ESPIPE`/`EPERM` set, every measured refusal
