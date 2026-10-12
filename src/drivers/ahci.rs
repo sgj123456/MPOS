@@ -466,6 +466,23 @@ impl BlockDev for AhciDisk {
         });
     }
 
+    /// One command's transfer, which is what a caller may ask for in one call.
+    ///
+    /// [`MAX_TRANSFER`] is the bounce's own bound and not a separate figure: the
+    /// port holds [`BOUNCE_PAGES`] pages, `issue` describes one command with one
+    /// PRDT entry per page, and a longer request is `chunks`' business of being
+    /// more commands - so a request this wide is exactly one command, which is
+    /// what the trait's promise is about. The block cache asks it to decide how
+    /// wide a run to load in one call, and with this method absent the disk
+    /// answers the page default: `t-diskbench`'s cold pass over a 64 MiB file
+    /// then costs **16387** device calls (one per block, measured on the committed
+    /// tree at `3be89aa`) instead of 1027, and its three run claims fail. The
+    /// method was named - and answered - by the change that added the run, whose
+    /// commit lost this hunk; the red run above is where its absence was found.
+    fn max_transfer(&self) -> usize {
+        MAX_TRANSFER
+    }
+
     /// `FLUSH CACHE EXT`, and `true` only when the device said it worked.
     ///
     /// A failure here is a panic rather than a `false`, and the distinction is
