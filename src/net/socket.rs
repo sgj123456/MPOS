@@ -897,6 +897,15 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
     // whole reason for it - and what it needs from the stack is the NIC,
     // not the IP layer's cooperation.
     if domain == crate::net::packet::AF_PACKET {
+        // Every packet socket needs `CAP_NET_RAW`, `SOCK_DGRAM` included:
+        // measured on the host, an unprivileged caller is refused `EPERM` for
+        // both types. It is asked before this family's own refusals, so a lowered
+        // caller hears `EPERM` for a `SOCK_RAW` this kernel does not serve
+        // (`EOPNOTSUPP` for one that does hold the capability) - Linux's
+        // observable answer in both cases.
+        if !crate::sched::current_credentials().has_effective(crate::cred::CAP_NET_RAW) {
+            return err::EPERM;
+        }
         let raw_type = args[1] as u32;
         let nonblock = raw_type & SOCK_NONBLOCK != 0;
         let cloexec = raw_type & SOCK_CLOEXEC != 0;
@@ -930,6 +939,18 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
     let _ = raw_type & SOCK_CLOEXEC != 0;
     let typ = (raw_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as u16;
     let protocol = args[2] as u32;
+
+    // A raw socket needs `CAP_NET_RAW`, and Linux asks for it *before* it looks
+    // at the protocol: measured on the host (`.workbuddy/probe_rawip.c`, a
+    // caller that has dropped to an unprivileged id), ICMP, TCP and a protocol
+    // number nothing has are *all* `EPERM`. So the gate is not something a caller
+    // can read off one refusal's errno, and it is asked of the caller's effective
+    // set the way the namespace gates are (`docs/notes/` §15.18).
+    if typ == SOCK_RAW
+        && !crate::sched::current_credentials().has_effective(crate::cred::CAP_NET_RAW)
+    {
+        return err::EPERM;
+    }
 
     let protocol_matches = match typ {
         SOCK_STREAM => protocol == 0 || protocol == IPPROTO_TCP,

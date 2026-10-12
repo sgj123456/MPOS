@@ -210,6 +210,34 @@ fn main() {
     let noop = unshare(0);
     r.check("unshare(0) is still a no-op", noop == 0);
 
+    // Raw sockets are the other family this model gates. Linux asks for
+    // `CAP_NET_RAW` *before* it looks at the protocol - measured on the host
+    // (`.workbuddy/probe_rawip.c`, an unprivileged caller): ICMP, IPPROTO_RAW,
+    // TCP and a protocol number nothing has are all EPERM - so the claim that
+    // tells the two orders apart is the one with a protocol that is *not*
+    // served, and it must answer EPERM rather than EPROTONOSUPPORT.
+    let icmp = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP) };
+    r.check(
+        "AF_INET SOCK_RAW answers EPERM while lowered",
+        icmp == -(libc::EPERM),
+    );
+    let bogus = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, 99) };
+    r.check(
+        "and EPERM before it judges the protocol (99 is not served)",
+        bogus == -(libc::EPERM),
+    );
+    let packet = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_DGRAM,
+            libc::htons(libc::ETH_P_ALL as u16) as i32,
+        )
+    };
+    r.check(
+        "AF_PACKET answers EPERM while lowered (SOCK_DGRAM too)",
+        packet == -(libc::EPERM),
+    );
+
     // ---- the way back, through the saved id ----
     let raised = setresuid(u32::MAX, 0, u32::MAX);
     r.check(
@@ -221,6 +249,18 @@ fn main() {
         "capget succeeds after the raise",
         capget(&mut header, &mut data) == 0,
     );
+
+    // ...and the raw doors open again for the same caller, which is the other
+    // half of the gate: what `EPERM` refused a moment ago is now served, so the
+    // refusals above were the capability's doing and not a missing feature.
+    let icmp = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP) };
+    r.check(
+        "AF_INET SOCK_RAW opens once the capability is back",
+        icmp >= 0,
+    );
+    if icmp >= 0 {
+        unsafe { libc::close(icmp as i32) };
+    }
     r.check(
         "the effective set is full again (restored from permitted)",
         data[0].effective == u32::MAX && data[1].effective == CAP_HIGH,

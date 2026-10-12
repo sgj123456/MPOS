@@ -483,6 +483,32 @@ The named gaps, each with what it waits on:
   overrule it. A boot with the wiring and no client is worth stating plainly, and
   this one is: the lease never appears, and what fails is the client's first call
   rather than a silent no-op.
+* **What a first attempt at that door measured, and why it was reverted** (2026-10-12).
+  The rules were measured on the host first (`.workbuddy/probe_rawip.c`): `IP_HDRINCL`
+  reads **1** on a fresh `SOCK_RAW`/`IPPROTO_RAW` socket (the protocol implies the
+  option rather than the caller setting it); `sendto` with no destination is
+  `EDESTADDRREQ`; a header shorter than its IHL is `EINVAL`; the **header's**
+  destination wins over the argument and its total length is overwritten by the sent
+  length; the source, the identification and the header checksum are filled in when the
+  caller leaves them zero; `recv` on such a socket gets nothing, ever; and the whole
+  raw family - `AF_PACKET` included, both its types - is `EPERM` for a caller without
+  `CAP_NET_RAW`, asked *before* the protocol is judged. A draft that served the door
+  took the boot past its first syscall — `udhcpc: started, v1.38.0` /
+  `udhcpc: broadcasting discover` — and then the server never answered
+  (`FAIL: the server answers through the raw door too (Ok(0))`, a poll timeout, while
+  the same DISCOVER through `AF_PACKET` answers as it always did). So the packet was
+  *queued* (`sendto` returned the full 292 bytes) and did not leave as built. The draft
+  was reverted rather than landed, because a door that accepts a packet and drops it
+  silently is worse than one that refuses. **Where the next attempt starts**: smoltcp's
+  raw socket carries its own `ip_protocol` (`socket/raw.rs`), while the dispatch that
+  emits the frame lives in the interface - so the first question is whether the emitted
+  header is rebuilt from that field (255, the channel's) instead of the caller's byte
+  (17, UDP), and if it is, whether the fix is a per-packet protocol or a send path that
+  bypasses the raw socket for `IPPROTO_RAW` entirely.
+  The `CAP_NET_RAW` half **was** verified and landed: both raw doors ask it before the
+  protocol, pinned by `t-caps` on both machines (a lowered caller answers `EPERM` for
+  ICMP, for a protocol nothing has, and for `AF_PACKET`; the same calls succeed once the
+  capability is back).
 * The parsers over `sockaddr_ll` and the Ethernet frame have no host-side pin.
   `AGENTS.md` §3 asks every new parser for a fuzz target, and `net/packet.rs`
   has none — not from oversight but from the §6 trap that gates the whole `net`

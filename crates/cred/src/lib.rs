@@ -76,6 +76,14 @@ pub const CAP_SYS_TTY_CONFIG: u32 = 26;
 /// checks *before* the type, so even an unknown type answers `EPERM` from a
 /// caller without it.
 pub const CAP_SYSLOG: u32 = 34;
+/// `CAP_NET_RAW`, which every raw socket requires - `AF_PACKET` and `AF_INET`'s
+/// `SOCK_RAW` alike, whatever protocol the caller names. Linux asks for it
+/// *before* it looks at the protocol: measured on the host
+/// (`.workbuddy/probe_rawip.c`, a caller that dropped to an unprivileged id),
+/// `SOCK_RAW` with ICMP, with `IPPROTO_RAW`, with TCP and with a protocol number
+/// nothing has are **all** `EPERM`, so the gate is not visible in one refusal's
+/// errno.
+pub const CAP_NET_RAW: u32 = 13;
 
 /// `SUID_DUMP_DISABLE`: nobody may inspect the process without a capability.
 pub const SUID_DUMP_DISABLE: u8 = 0;
