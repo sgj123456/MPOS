@@ -499,12 +499,38 @@ The named gaps, each with what it waits on:
   the same DISCOVER through `AF_PACKET` answers as it always did). So the packet was
   *queued* (`sendto` returned the full 292 bytes) and did not leave as built. The draft
   was reverted rather than landed, because a door that accepts a packet and drops it
-  silently is worse than one that refuses. **Where the next attempt starts**: smoltcp's
-  raw socket carries its own `ip_protocol` (`socket/raw.rs`), while the dispatch that
-  emits the frame lives in the interface - so the first question is whether the emitted
-  header is rebuilt from that field (255, the channel's) instead of the caller's byte
-  (17, UDP), and if it is, whether the fix is a per-packet protocol or a send path that
-  bypasses the raw socket for `IPPROTO_RAW` entirely.
+  silently is worse than one that refuses.
+
+  **The cause, found by reading smoltcp rather than by guessing.** The header is *not*
+  rebuilt from the socket's field - the packet is **dropped**, and by name:
+  `socket/raw.rs`'s `dispatch` carries
+
+  ```rust
+  if ip_protocol.is_some_and(|next_header| next_header != packet.next_header()) {
+      net_trace!("raw: sent packet with wrong ip protocol, dropping.");
+      return Ok(());
+  }
+  ```
+
+  so a queued packet whose IP protocol byte is not the *socket's* is discarded silently
+  (`Ok(())`), which is exactly the shape measured above: `sendto` returns the full
+  length because it only queued, and nothing leaves. This kernel's `Channel::Raw`
+  builds its socket with the channel's protocol - `255` for `IPPROTO_RAW` - while a
+  DHCP client's packet carries `17`, so the door as written can never send UDP.
+
+  **And the two obvious ways out are both wrong, for reasons worth writing down.**
+  Creating the socket with *no* protocol filter makes smoltcp emit anything (the check
+  is `is_some_and`), but `accepts` then matches every IPv4 packet and the interface's
+  `raw_socket_filter` reports them *handled* - so such a socket would swallow the
+  machine's UDP and TCP delivery. And binding the channel's socket to the header's
+  protocol (per send, or lazily at the first one) breaks the other direction the same
+  way: a socket bound to `17` receives UDP and steals it from the real UDP sockets.
+
+  A raw-IP send therefore has to leave through the **device**, the way an `AF_PACKET`
+  send already does - the frame built from the header plus the link address - and that
+  is a door with its own prerequisite: a broadcast destination (all `dhcp` needs) needs
+  no neighbour resolution, while a *unicast* one needs the ARP/next-hop lookup smoltcp
+  would have done, so the honest first version serves broadcast and names unicast.
   The `CAP_NET_RAW` half **was** verified and landed: both raw doors ask it before the
   protocol, pinned by `t-caps` on both machines (a lowered caller answers `EPERM` for
   ICMP, for a protocol nothing has, and for `AF_PACKET`; the same calls succeed once the
