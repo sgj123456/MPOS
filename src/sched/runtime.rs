@@ -3593,6 +3593,59 @@ pub fn current_fs_context() -> (
     })
 }
 
+/// Give the running task a filesystem context of its own: `unshare(CLONE_FS)`'s
+/// scheduler half, and Linux's `copy_fs_struct`. The caller keeps the root, the
+/// cwd, the path and the mask it had and stops *sharing* them, so from here a
+/// `chdir` moves only this task where before it moved the whole process. An
+/// empty context would be a way to lose the machine, which is why the copy is
+/// the only shape that can mean "unshare" here.
+pub fn unshare_fs() {
+    with_table(|t| {
+        let me = t.current;
+        let copied = t.task(me).fs.copy();
+        t.task_mut(me).fs = copied;
+    });
+}
+
+/// Give the running task a descriptor table of its own:
+/// `unshare(CLONE_FILES)`'s scheduler half, Linux's `copy_files`. The copy is
+/// `FdTable`'s own (`duplicate`, exactly what a `fork` gives a child): the
+/// *numbering* becomes this task's, while the open file descriptions behind the
+/// numbers stay shared - so a `close` here no longer closes the number for a
+/// sibling, but a read position still moves for both.
+pub fn unshare_files() {
+    with_table(|t| {
+        let me = t.current;
+        let copied = Arc::new(t.task(me).fds.duplicate());
+        t.task_mut(me).fds = copied;
+    });
+}
+
+/// Whether the running task shares its thread group with another *live* task -
+/// the fact Linux's `check_unshare_flags` asks before it refuses
+/// `CLONE_THREAD`, `CLONE_SIGHAND` or `CLONE_VM`.
+///
+/// Measured on a current host (7.2.9), one child per flag: each of the three is
+/// `0` for a single-threaded caller and `EINVAL` the moment a sibling exists,
+/// because there is a real thing behind the flag that cannot be split off the
+/// caller alone - an address space or a handler table that its siblings are
+/// using.
+///
+/// The walk is [`process_members`], which is the one definition of a thread
+/// group's liveness in this file, and using it is not tidiness: a hand-rolled
+/// `task.tgid == tgid` filter that forgot `!task.exited` measured **members a
+/// group does not have**. A thread whose slot was reused leaves an exited task
+/// behind, and a *tgid is a slot number* - so the next process to occupy that
+/// slot inherits the dead thread's number as its own group id, finds a "sibling"
+/// nobody can see, and is refused `unshare(CLONE_THREAD)` on a machine where it
+/// is the only thread. The same slot-reuse shape this file already paid for
+/// once, in `docs/notes/` §6.5 (a dead process's orphans handed to the next
+/// occupant of its slot).
+pub fn thread_group_has_siblings() -> bool {
+    let tgid = with_table(|t| t.task(t.current).tgid);
+    process_members(tgid).len() > 1
+}
+
 /// Give the running task a mount table of its own: `unshare(CLONE_NEWNS)`'s
 /// scheduler half. The copy is the VFS's (`MountTable::copy`, Linux's
 /// `copy_mnt_ns`) — this only moves the caller's slot, which is what makes the

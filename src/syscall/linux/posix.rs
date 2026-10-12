@@ -1091,15 +1091,19 @@ pub fn handle_clock_settime(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 /// deliberate divergence from Linux's `ksys_unshare`, which unshares as it walks
 /// the word and can leave a caller halfway with nothing saying so.
 ///
-/// The thread-group flags are accepted as the no-ops they are for a caller that
-/// has no other thread to split from — and Linux answers `0` for all six there
-/// too, measured one child per flag (`CLONE_VM`, `CLONE_FS`, `CLONE_FILES`,
-/// `CLONE_SIGHAND`, `CLONE_THREAD`, `CLONE_SYSVSEM`). For a caller that *does*
-/// have siblings the two answers part company: Linux refuses with `EINVAL`
-/// because the resource really is shared, and this kernel still answers `0`
-/// because splitting a descriptor table or a handler table off from one's
-/// siblings is not modelled — a named gap (`NOTES.md` §6.3), not an answer this
-/// call pretends to have.
+/// The thread-group flags are Linux's now, measured rather than recalled
+/// (`.workbuddy/probe_unshare_flags.c`, host 7.2.9, one child per flag). For a
+/// caller with no other thread to split from all six answer `0`, and two of them
+/// *split* the caller's slot: `CLONE_FS` copies the process's filesystem context
+/// (Linux's `copy_fs_struct`, so a `chdir` from here moves only this task) and
+/// `CLONE_FILES` copies the descriptor table (Linux's `copy_files`, so a `close`
+/// here no longer closes the number for a sibling). `CLONE_SYSVSEM` is accepted
+/// and is nothing to do - there is no SysV semaphore undo list here to split.
+/// The remaining three are refused `EINVAL` as soon as a sibling exists, which
+/// is Linux's own answer and the reason it gives: the address space or the
+/// handler table really is shared, so "unshare it for me alone" is not a request
+/// the call can honour. That refusal is decided in `abi::unshare_verdict`, ahead
+/// of the namespace work, as Linux's `check_unshare_flags` is.
 ///
 /// One more gap rides with the call rather than the namespace:
 /// `clone(CLONE_NEWUTS)` — the *child* getting the copy — is still `EINVAL` from
@@ -1115,7 +1119,11 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
     // that has dropped the capability is refused like Linux's, whatever its
     // identity says).
     let privileged = crate::sched::current_credentials().has_effective(crate::cred::CAP_SYS_ADMIN);
-    match super::abi::unshare_verdict(args[0], privileged) {
+    // The sibling fact is read here rather than in the leaf: it is scheduler
+    // state, and the verdict is a pure function of it (which is how the host
+    // tests argue with all four refusals without a task table).
+    let has_siblings = crate::sched::thread_group_has_siblings();
+    match super::abi::unshare_verdict(args[0], privileged, has_siblings) {
         Err(e) => e,
         Ok(bits) => {
             if bits & crate::syscall::linux::nr::CLONE_NEWUTS != 0 {
@@ -1129,6 +1137,12 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
                 // siblings keep the old table — the same per-task rule as UTS
                 // above, and `t-ns-mnt` holds both halves of the divergence.
                 crate::sched::unshare_mnt();
+            }
+            if bits & crate::syscall::linux::nr::CLONE_FS != 0 {
+                crate::sched::unshare_fs();
+            }
+            if bits & crate::syscall::linux::nr::CLONE_FILES != 0 {
+                crate::sched::unshare_files();
             }
             0
         }

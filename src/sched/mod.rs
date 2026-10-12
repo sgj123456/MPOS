@@ -69,11 +69,12 @@ pub use runtime::{
     stop_of, take_child_event, take_continued_report, take_deliverable_siginfo,
     take_deliverable_signal, take_exit_code, take_exit_code_current, take_fatal_signal,
     take_pending_event, take_signal_in_set, take_stop_report, take_vmas, task_count,
-    thread_snapshots, timer_alloc, timer_arm, timer_overrun, timer_remove, timer_state, tls_of,
-    trace_options, trace_syscall, tracer_of, try_spawn_user, uid_members, unmap_user, unshare_mnt,
-    unshare_uts, user_frame_at, user_mapped, vfork, vma_gaps, vma_prot_at, vma_range_free,
-    wait_any_child, wait_any_child_event, wait_for_interrupt, wake, with_current_credentials,
-    write_user, write_user_of, yield_now,
+    thread_group_has_siblings, thread_snapshots, timer_alloc, timer_arm, timer_overrun,
+    timer_remove, timer_state, tls_of, trace_options, trace_syscall, tracer_of, try_spawn_user,
+    uid_members, unmap_user, unshare_files, unshare_fs, unshare_mnt, unshare_uts, user_frame_at,
+    user_mapped, vfork, vma_gaps, vma_prot_at, vma_range_free, wait_any_child,
+    wait_any_child_event, wait_for_interrupt, wake, with_current_credentials, write_user,
+    write_user_of, yield_now,
 };
 
 /// The stop accessors and the register-file snapshot are the machine's to build

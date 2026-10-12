@@ -242,8 +242,8 @@ own table is the next step of the ladder, named rather than half-served.
 
 Step 2 landed on top of it.** `clone(CLONE_NEWNS)` is served — and the reason it needed no
 nsproxy turned out to be structural: the child *is* a new thread group, so the fresh `Arc` at
-creation is the whole mechanism (what stays parked with a shared-group handle is CLONE_FS-style
-*separation*, where siblings must split). `clone(CLONE_NEWUTS)` came with it, same shape, Linux's
+creation is the whole mechanism (what stayed parked with a shared-group handle was CLONE_FS-style
+*separation*, where siblings must split — since landed, "Step 3" below). `clone(CLONE_NEWUTS)` came with it, same shape, Linux's
 `copy_utsname` on exactly that flag; `t-clone` gained the pair of claims (the child renames only
 its copy; the parent keeps its own name read back through raw `uname`) and the refusal probes for
 PID/NET/IPC (`EOPNOTSUPP`, privilege-before-kind in both verdict functions — Linux's order, and
@@ -388,13 +388,11 @@ it.
   and what `CLONE_NEWUTS|CLONE_THREAD` means for a group that shares an address
   space) and it wants its own measurement, so the `EINVAL` stands as "this call
   cannot do that here" rather than as a half-built grant.
-* **The six thread-group flags still answer `0` for a caller that has siblings.**
-  Linux refuses with `EINVAL` there, because the descriptor table or the handler
-  table really is shared. This kernel answers `0` for every caller, which is
-  Linux's answer only for a single-threaded one - and since threads exist now
-  (`t-clone`), the old comment's premise ("a process is its own only thread") is
-  no longer universally true. Splitting a resource off from one's siblings is
-  what is not modelled.
+* **The six thread-group flags** are Linux's as of "Step 3, landed" below: the
+  three a sibling makes impossible answer `EINVAL`, and `CLONE_FS`/`CLONE_FILES`
+  split the caller's own slot. What is still not modelled is the *other* half of
+  `CLONE_SIGHAND` - a thread's handler table is copied rather than shared, which
+  is the divergence §6.4 names.
 * **`setns` still cannot name a namespace**, and that is now the interesting
   half: `/proc/<pid>/ns/<kind>` does not exist, so there is no descriptor for the
   call to check a type against, and it answers `EINVAL`/`EBADF` - all it can
@@ -440,8 +438,65 @@ kernel serves, and the row above is the measurement the *unserved* seven still
 give ("Step 1, landed" earlier in this section). And "a process is its own only
 thread" stopped being true when threads landed (§6.4): the six thread-group flags
 are a no-op for the *unshared* caller the table was measured on, and for a caller
-that does have siblings Linux answers `EINVAL` where this kernel still answers
-`0`. That is a named gap in the "Step 1, landed" list rather than a claim.
+that does have siblings three of them are `EINVAL` - which is this kernel's
+answer too now, in "Step 3, landed" below.
+
+**Step 3, landed: the six thread-group flags.** The gap the "Step 1, landed" list
+carried - all six answering `0` for every caller, where Linux refuses three of
+them once a sibling exists - is closed, and closing it needed the measurement
+first, because the rule is not the shape a recalled answer gives.
+`.workbuddy/probe_unshare_flags.c` (host 7.2.9, one `fork` per flag, one child per
+case, the sibling case making a live `pthread`) measured:
+
+| `unshare(flag)` | with a live sibling | alone |
+|---|---|---|
+| `CLONE_VM` | **`EINVAL`** | `0` |
+| `CLONE_FS` | `0` | `0` |
+| `CLONE_FILES` | `0` | `0` |
+| `CLONE_SIGHAND` | **`EINVAL`** | `0` |
+| `CLONE_THREAD` | **`EINVAL`** | `0` |
+| `CLONE_SYSVSEM` | `0` | `0` |
+
+and the `0`s are real *splits* rather than no-ops: a thread that `chdir`s moves the
+process's own cwd until it unshares `CLONE_FS` (the creating thread's `getcwd`
+follows, then stops following), and a thread that closes a descriptor takes it
+from its sibling until it unshares `CLONE_FILES` (the sibling's `/proc/<tid>/fd`
+loses it, then keeps it).
+
+So the rule is **asymmetric**, and a version that swept all six together would be
+wrong twice: the three Linux cannot split off one caller alone - an address space
+or a handler table its siblings are using - are `EINVAL`, and the three it *can*
+are served by copying the caller's slot. What landed is that asymmetry.
+`abi::unshare_verdict` gained the caller's sibling fact and refuses the trio with
+Linux's errno, ahead of all the namespace work exactly as `check_unshare_flags`
+is; the handler acts on the word the verdict returns, splitting `CLONE_FS` into
+`FsStruct::copy` (Linux's `copy_fs_struct`) and `CLONE_FILES` into
+`FdTable::duplicate` (Linux's `copy_files`). The *default* had to move first: a
+thread was copying the four fs facts, so a thread's `chdir` moved only itself
+where Linux's moves its process - the shared handle landed one commit earlier for
+that reason, and `t-unshare-fs` pins the default and the split as one fact seen
+from both ends.
+
+**What the pin caught that the design did not.** The first run of `t-unshare-fs`
+was red on one claim - "`0` for a caller with no sibling", asked in a forked
+child, answered `EINVAL` - while the virgin process at the top of the same
+program answered `0`. So the verdict was right and the *sibling fact* was not, and
+the cause is a shape this file has already paid for once: a **tgid is a slot
+number**. A thread's slot is not given back the moment it exits, so a thread that
+runs `unshare(CLONE_VM)`, gets `EINVAL` and exits leaves an *exited* task behind
+whose tgid is its leader's slot - and the next process forked into a slot a dead
+thread once occupied wears that number as its own group id and finds a sibling
+nobody can see. The rule was therefore not to patch the new predicate but to stop
+having a second one: `thread_group_has_siblings` asks `process_members`, which is
+this file's one definition of "the live tasks of one thread group" and filters
+`!exited`. The claim stayed *after* the threads on purpose - that ordering is the
+regression pin, and a virgin caller would have passed either way.
+
+Gate for the step: x86_64 `pass=168 fail=0 (168 built)` and aarch64
+`pass=177 fail=0`, both with `mpos-kunit 29 passed, 0 failed`; host suites all
+green (kernel 533, `mpos-xtask` 116); `fmt --check` clean; `clippy` clean on
+`x86_64-unknown-none`, `-linux-gnu` and `aarch64-unknown-none`; `depgraph` within
+the ratchet. `t-unshare-fs`'s nine claims pass on both machines.
 
 ### 6.4 Additional Process Syscalls — **DONE**
 All wired to real handlers in `posix.rs`/`proc.rs`: `getpgrp`, `setreuid`,
