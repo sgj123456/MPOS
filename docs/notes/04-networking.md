@@ -455,14 +455,34 @@ The named gaps, each with what it waits on:
   because a caller that writes its own header writes a source MAC this kernel
   cannot vouch for; the honest shape needs the header passed through untouched
   and the length checked, not invented.
-* The boot still has no client. The *mechanism* is what `t-dhcp` pins — a
-  hand-built DHCPDISCOVER to the broadcast and slirp's BOOTREPLY read back with
-  its transaction id — but wiring `busybox udhcpc -s` into OpenRC (and giving
-  the selftest initramfs one too, or its network tests ride the static default)
-  is the remaining move before the static bring-up can be retired. Until it
-  happens the static 10.0.2.15 is a boot *default* over a live interface, not
-  a decision the kernel reserves: `RTM_NEWADDR` and now `AF_PACKET` both
-  overrule it.
+* The boot still has no *working* client, and the two halves of that sentence are
+  measured separately now (2026-10-12). **The wiring is in the image and runs**:
+  `assets/rootfs/core/usr/share/udhcpc/default.script` is the script `ifup` hands
+  to `udhcpc -s` (without it a client leases and configures *nothing* - the
+  interface keeps whatever address it had and the boot looks successful),
+  `xtask/src/rootfs.rs`'s `SERVICES` enables `networking`, and a product boot
+  shows both working: `* Starting networking ...` / `*   eth0 ...`. The client then
+  stops on its **first** syscall:
+
+  ```
+  udhcpc: socket(AF_INET,3,255): Protocol not supported
+  ifup: failed to change interface eth0 state to 'up'
+  ```
+
+  `AF_INET, SOCK_RAW, IPPROTO_RAW` — the door a DHCP client uses to *send* a
+  DISCOVER before it has an address of its own, building the IP header itself.
+  (The *receive* half needs no new door: it is `AF_PACKET`, which works — that is
+  what `t-dhcp` pins.) This kernel serves `AF_INET`+`SOCK_RAW` for ICMP
+  (`t-rawicmp`) and refuses the wildcard protocol with `EPROTONOSUPPORT`, so what
+  is left of this gap is that one door, and its shape is named rather than
+  guessed: the caller's own IP header under Linux's `IP_HDRINCL` rules (the total
+  length, the checksum and the source address filled in when it is left zero),
+  `CAP_NET_RAW` as the gate, and `EPROTONOSUPPORT` kept for every other protocol.
+  Until it opens the static 10.0.2.15 stays a boot *default* over a live interface
+  rather than a decision the kernel reserves: `RTM_NEWADDR` and `AF_PACKET` both
+  overrule it. A boot with the wiring and no client is worth stating plainly, and
+  this one is: the lease never appears, and what fails is the client's first call
+  rather than a silent no-op.
 * The parsers over `sockaddr_ll` and the Ethernet frame have no host-side pin.
   `AGENTS.md` §3 asks every new parser for a fuzz target, and `net/packet.rs`
   has none — not from oversight but from the §6 trap that gates the whole `net`

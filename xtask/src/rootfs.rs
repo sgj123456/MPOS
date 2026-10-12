@@ -1920,7 +1920,25 @@ const SERVICES: &[(&str, &[&str])] = &[
             "hwclock", "modules", "sysctl", "hostname", "bootmisc", "syslog", "seedrng",
         ],
     ),
-    ("default", &["dbus", "seatd", "crond", "local"]),
+    (
+        "default",
+        &[
+            // The service that reads `/etc/network/interfaces` (`iface eth0 inet
+            // dhcp`) and runs `ifup` for each `auto` interface. The image has
+            // declared DHCP since the file was written; what was missing is this
+            // line, so nothing ever ran `ifup` - the address came from the
+            // kernel's own static default and the client §4.5 names as the gap
+            // was never invoked. `enable_services` skips a service the image does
+            // not have and *says so*, so a machine whose Alpine install carries
+            // no such script reports the name rather than booting quietly
+            // unconfigured.
+            "networking",
+            "dbus",
+            "seatd",
+            "crond",
+            "local",
+        ],
+    ),
     ("shutdown", &["killprocs", "mount-ro", "savecache"]),
 ];
 
@@ -3053,6 +3071,50 @@ mod tests {
                 .join(crate::paths::ROOTFS_OVERLAY_AARCH64)
                 .join("etc/inittab")
                 .exists()
+        );
+    }
+
+    /// The DHCP client the boot now runs, pinned where a sweep cannot see it.
+    ///
+    /// Both sweeps boot a payload of their own (the first machine's throwaway
+    /// initramfs, the second's sweep medium), so neither runs the *image's*
+    /// `/etc/init.d` - which makes this wiring the easier thing to lose: drop one
+    /// line of [`SERVICES`], or one file out of the tree, and every test still
+    /// passes while a product boot comes up with no address of its own.
+    ///
+    /// The three parts are the three that have to meet: the service that reads
+    /// `/etc/network/interfaces` (whose `iface eth0 inet dhcp` line was already
+    /// there, which is why the gap was invisible), the script `ifup` hands to
+    /// `udhcpc -s`, and that script's executable bit - `merge_overlay` is
+    /// `fs::copy`, so the mode in the tree is the mode in the image, and a script
+    /// the shell cannot run fails exactly the way a missing one does.
+    #[test]
+    fn the_image_carries_the_dhcp_client_the_boot_runs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::utils::project_root().unwrap();
+        let script = root
+            .join(crate::paths::ROOTFS_CORE)
+            .join("usr/share/udhcpc/default.script");
+        assert!(
+            script.is_file(),
+            "the shared overlay must carry the udhcpc script `ifup` invokes"
+        );
+        let mode = fs::metadata(&script).unwrap().permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "the udhcpc script must be executable in the overlay ({mode:o}): \
+             `merge_overlay` copies the mode, and a script the shell cannot run \
+             leaves the client with a lease and nothing configured"
+        );
+        let default = SERVICES
+            .iter()
+            .find(|(runlevel, _)| *runlevel == "default")
+            .expect("SERVICES names the default runlevel");
+        assert!(
+            default.1.contains(&"networking"),
+            "the default runlevel must enable `networking`, or nothing runs ifup \
+             and the image's `inet dhcp` never reaches a client"
         );
     }
 

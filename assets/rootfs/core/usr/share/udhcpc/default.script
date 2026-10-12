@@ -1,0 +1,60 @@
+#!/bin/sh
+# What `udhcpc` does with the lease it gets.
+#
+# busybox's `ifup`, for an interface the image's `/etc/network/interfaces`
+# declares `inet dhcp`, runs
+# `udhcpc -s /usr/share/udhcpc/default.script` - and without this file udhcpc
+# acquires a lease and configures *nothing*: the interface keeps whatever address
+# it had and the boot looks successful. So this is not a convenience, it is the
+# half of the client that touches the machine.
+#
+# BusyBox calls it by *action*, with the lease in the environment: `deconfig`
+# (the interface is going away), `bound` (a new lease), `renew` (the same one
+# again), `leasefail` and `nak` (the server said no). `$interface` names the
+# interface in every action; `bound`/`renew` add the lease's own `$ip`, `$mask`
+# (the prefix length), `$subnet`, `$broadcast`, `$router` (a space-separated
+# list), `$dns` and `$lease`.
+#
+# Both configuring actions are written to be *idempotent*, for two reasons that
+# are on this machine: udhcpc calls them again on every renewal, and the kernel
+# comes up with a static address of its own (`src/net/mod.rs`, the boot default
+# §4.5 records) - so the address is flushed before it is added and the default
+# route is removed before it is installed. What the interface ends with is this
+# lease's, not a mixture of it and the boot default.
+#
+# The broadcast address is not passed on purpose: the kernel derives it from the
+# prefix, and a lease that omits `$broadcast` (some servers do) would otherwise
+# make this script fail on the one field it did not need.
+#
+# `/etc/resolv.conf` is deliberately NOT touched, and that is the machine's
+# reason rather than taste: QEMU's user-mode network answers DHCP with the same
+# resolver the build writes into the image (`rootfs.toml`'s `system.dns`,
+# 10.0.2.3), and the build's answer is the authority - a client that rewrote the
+# file would make the image's resolver depend on which server answered rather
+# than on how it was built.
+set -u
+
+case "${1:-}" in
+deconfig)
+    ip addr flush dev "$interface"
+    ;;
+bound | renew)
+    ip addr flush dev "$interface"
+    ip addr add "$ip/${mask:-24}" dev "$interface"
+    # A single-homed client uses the lease's first router; the list BusyBox hands
+    # over is the server's, and this machine has one wire.
+    set -- $router
+    if [ $# -gt 0 ]; then
+        ip route del default 2>/dev/null || true
+        ip route add default via "$1" dev "$interface"
+    fi
+    echo "udhcpc: $interface is $ip/${mask:-24} via ${router:-no router} (lease ${lease:-?})"
+    ;;
+leasefail)
+    echo "udhcpc: no lease on $interface"
+    ;;
+nak)
+    echo "udhcpc: $interface: the server refused the lease"
+    ;;
+esac
+exit 0
