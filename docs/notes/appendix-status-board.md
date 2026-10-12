@@ -1217,7 +1217,8 @@ are not restated in the phase sections above.
         kernel answered `ENOENT` at that name, so `[ -e /proc/self/environ ]` failed, the check never
         ran, and OpenRC concluded "not mounted" and mounted over the procfs the disk `/init` had
         already mounted: `mount: mounting proc on /proc failed: Resource busy`, the `/proc` service
-        reporting `[ !! ]` - while `cargo xtask alpine-aarch64` still reported success, because it
+        reporting `[ !! ]` - while `cargo xtask alpine-aarch64` still reported success (the command
+        §15.7 has since retired; the statement is this run's, not a usable check today), because it
         keys on `login:` and the runlevel carries on past a failed service either way. The gap was in
         the *ABI*, not the boot: `Task` already carried `argv` for `/proc/<pid>/cmdline` and had no
         `env` to carry the environment beside it, so `execve`'s `envp` laid the block on the initial

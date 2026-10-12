@@ -15,7 +15,10 @@ the vsock device §13.28, and the host share §13.29). 15.6, the initramfs flow,
 `mpos login:` in 16 s, and `depgraph` within the ratchet. `### 15.6` below records what it cost.
 The last named difference this machine carried from the first - `init_net` +
 `virtio::spawn_service` behind `mpos.selftest` - is also closed, measured the same day.
-Measured 2026-10-07.**
+Measured 2026-10-07.** *(This header is that day's snapshot; the phase has since landed through
+§15.36. Two of its words are retired facts, not current ones: `boot-aarch64`/`alpine-aarch64`
+are commands §15.7 deleted — the same work is `run`/`rootfs`/`test --arch aarch64` — and the
+`mpos.selftest` boot word is gone with §15.19's test-build change.)*
 
 Phase 13 closed the *ABI* gap (13.3–13.16) and §13.19/§13.20 closed two of its consequences. What
 is left is the *boot*: the second machine reaches the same userspace surface as the first, but it
@@ -217,7 +220,10 @@ different machine.
 - **A device check runs on every aarch64 boot, a session included**, and halts the machine when it
   fails: `check_blk` needs the 1 MiB pattern image beside the disk, `check_fs` needs the root
   partition to carry `/hello`. Both are therefore inputs of *any* aarch64 image, not only a test's
-  (`disk::blk_image`, `Arch::kernel_reads_root_probe`).
+  (`disk::blk_image`, `Arch::kernel_reads_root_probe`). *(Superseded by §15.34: the checks now
+  assert only what the kernel produces from the configured devices — no packed fixture, no
+  `/hello`; `PROBE_FILE`/`PROBE_BYTES`/`Arch::kernel_reads_root_probe` are gone. What survives of
+  this bullet is the first clause: a device check runs on every boot and halts the machine.)*
 
 ---
 
