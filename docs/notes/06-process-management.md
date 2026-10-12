@@ -613,22 +613,36 @@ above, and the claim the whole surface exists for - a child that unshares and
 mounts a marker, and a caller that joins *its* namespace through
 `/proc/<child>/ns/mnt` and reads that marker, where an `unshare` would have left
 it looking at an empty copy. The namespace outliving the process that made it is
-the last line - and the first draft of it was **wrong about which half
-survives**, which is worth recording because the measurement is the whole
-finding. What the run shows, after the child is killed: the caller's own link
-still names the namespace and `/proc/self/mounts` still carries the child's
-mount at that path, but the marker the child wrote **cannot be read any more**.
-So the namespace survives and the storage behind the mount does not, and the
-test claims the two halves it measured (the link and the mount-table entry) while
-the third is printed as a note rather than pinned - a claim here would pin the
-defect and go red the day it is fixed, which is the one shape a pin must not
-have. **Open, with the next measurement named**: the mount was made by the child,
-inside the namespace the child had just unshared, and the likeliest owner of
-those bytes is that task's own ramfs charge (`vfs::ramfs`'s byte budget is per
-`mm`) - which the exit path releases. If that is it, the fix is that a
-filesystem mounted into a *namespace* is charged to the namespace and not to the
-process that mounted it, and the mount outliving its mounter is exactly what
-`setns` makes observable.
+the last line, pinned in all three of its halves: after the child is killed, the
+caller's link still reports the *number* it joined, `/proc/self/mounts` still
+carries the child's mount, and the marker the child wrote is still readable.
+
+**That line was got wrong twice, and the second time is the one worth keeping.**
+The first draft read the marker *after* the peel that removes the mount, so it was
+measuring the `umount` and not the namespace's life; the fix was to take the
+observation first. That fix was incomplete, and the commit that landed `setns`
+shipped with the second mistake and a defect named out of it: the test peeled in
+**two** places - once early, inside the join block, and once at the end - so the
+"does the mount outlive its mounter" reading was still taken after the *early*
+peel, and the absence it found was again the test's own act. What that produced
+was a named defect ("a mount made inside a namespace does not outlive the process
+that mounted it") and a hypothesis about its cause (`vfs::ramfs`'s byte budget
+charged per `mm`) that the code never had: `Usage` is per *mount*, held by the
+`RamFs` the `Mount` record keeps (`Mount::fs`), which the namespace's own `Arc`
+keeps alive - so those bytes go exactly when the namespace does and not a moment
+before. With the peel left to the end - the single peel the test's own comment had
+described all along - all three halves hold and all three are claims, and the run
+that says so is the gate below. The lesson is `AGENTS.md`'s own: a recorded
+measurement is about the machine that made it, and this number was real while the
+*question* was not the one the code was answering. The roadmap's 6.3 row loses the
+defect it had carried, and MNT's remaining work is CLONE_FS-style separation
+alone.
+
+Gate for the correction: x86_64 `pass=167 fail=0 (167 built)` and aarch64
+`pass=176 fail=0` (176 staged, 2 left out), both with `mpos-kunit 29 passed, 0
+failed`; the host suites all green (kernel 530, `mpos-xtask` 116, the leaf
+crates' own), `fmt --check` clean, `depgraph` within the ratchet. The three new
+claims hold on both machines, and `t-ns-setns` prints no note any more.
 
 ### R.6 (moved from ROADMAP's status board) — `/proc/<pid>/maps`: the three sources, and why two of them stay beside the VMA table
 

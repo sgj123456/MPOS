@@ -323,6 +323,10 @@ fn main() {
         "another process's mount namespace opens by its pid",
         child_mnt.is_some(),
     );
+    // The link text the caller reads once it has joined, kept so that the claim
+    // after the mounter dies can say the *number* did not change rather than
+    // that some link still answers.
+    let mut joined_link: Option<String> = None;
     if let Some(fd) = &child_mnt {
         r.check(
             "and joining it is served",
@@ -342,6 +346,7 @@ fn main() {
                 _ => false,
             },
         );
+        joined_link = readlink("/proc/self/ns/mnt");
         // Three views of the same question, because "the mount is in the
         // namespace" and "the walk crosses it" are answered by different code
         // and the measurement has to say which one is missing. `/proc/mounts`
@@ -364,50 +369,47 @@ fn main() {
         // mountpoint is a mount stack, which Linux allows and this kernel does
         // too, so the observation would say nothing about the join. What the
         // join did is the marker above.
-        let _ = unmount(INNER, UnmountFlags::empty());
+        //
+        // The peel happens *once*, at the end of this function. An earlier
+        // draft peeled here - before the child was killed - which made the
+        // "outlives the mounter" claims below unmeasurable: the mount was
+        // already gone, by the caller's own hand, so reading its absence as the
+        // child's doing was reading the test's own act. That is the whole of
+        // what this ordering fixes.
     }
     // The namespace outlives the process that made it, because the caller is in
-    // it now: killing the child must not take the mount with it. The claim
-    // comes *before* the peel below, which is what removes the mount from this
-    // namespace - and it was written the other way round first, which is how the
-    // ordering was measured rather than assumed.
+    // it now: killing the child must not take the namespace or its contents with
+    // it. Three claims, one per half - the number, the table entry, the bytes -
+    // and all three taken with the mount still in place.
     unsafe {
         libc::kill(child, libc::SIGKILL);
     }
     let mut status = 0;
     let reaped = unsafe { libc::waitpid(child, &mut status, 0) };
     r.check("the child is reaped", reaped == child);
-    // The namespace survives the process that made it: the caller's own link
-    // still names it and its table still carries the mount. **The storage behind
-    // that mount does not**, and that is measured rather than assumed - the
-    // marker the child wrote is no longer readable while both of these still
-    // hold - so the claim is the two halves that do and the observation is
-    // named as a gap in `docs/notes/` rather than pinned as a behaviour.
+    let link_after = readlink("/proc/self/ns/mnt");
     r.check(
-        "and the namespace outlives it (the caller's link still names it)",
-        readlink("/proc/self/ns/mnt").is_some(),
+        "the namespace outlives the process that made it (the caller's link still names it)",
+        joined_link.is_some() && link_after == joined_link,
     );
     let mounts_after = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
-    let carried_after = mounts_after
-        .lines()
-        .any(|line| line.split_whitespace().nth(1) == Some(INNER));
-    // Printed, not claimed: a claim here would *pin* the defect and go red the
-    // day somebody fixes it, which is the one shape a pin must not have. What is
-    // owed is a name, and `docs/notes/` §6.6 carries the observation with the
-    // measurement that produced it.
-    // Printed, not claimed: what the run measured is that the mount the child
-    // made goes with the child - the namespace object outlives it (the link
-    // above still answers) while the mount inside it does not (`carried_after`
-    // is false and the marker is unreadable). A claim here would *pin* that
-    // defect and go red the day somebody fixes it, which is the one shape a pin
-    // must not have; what is owed is a name, and `docs/notes/` §6.6 carries the
-    // measurement.
-    if !carried_after {
-        println!(
-            "note: the child's mount went with the child - the namespace outlives it, its contents do not (docs/notes/ §6.6)"
-        );
-    }
-    let _ = unmount(INNER, UnmountFlags::empty());
+    r.check(
+        "and its mount is still in the table the caller resolves through",
+        mounts_after
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(INNER)),
+    );
+    r.check(
+        "and the storage behind that mount is still readable",
+        std::fs::read_to_string(MARKER).ok().as_deref() == Some("inside\n"),
+    );
+    // The peel, once, and last: the mount is the caller's to remove now, and
+    // removing it is the *caller's* act rather than a side effect of the
+    // process that made it going away.
+    r.check(
+        "and only the caller's own peel removes it",
+        unmount(INNER, UnmountFlags::empty()).is_ok() && std::fs::read_to_string(MARKER).is_err(),
+    );
 
     r.finish()
 }
