@@ -205,6 +205,16 @@ pub struct MountTable {
     /// table changes. `stat` answers per path, and recomputing the mountpoint
     /// paths on every stat would be a tree walk per call.
     mount_points: Mutex<RefCell<Vec<MountPoint>>>,
+    /// The number this namespace is known by (`mnt:[<id>]`), minted from
+    /// `crate::ns`'s one pool the first time somebody asks.
+    ///
+    /// Lazily, because `new()` is `const` - the machine's table is built in a
+    /// `static` - and a mint is not. A first-read mint is still an *identity*:
+    /// every later read of the same table answers the same number, and a copy
+    /// (`unshare`, `clone` with the flag) starts at zero again and so gets a
+    /// number of its own, which is what makes it a namespace rather than a
+    /// name for one.
+    ns_id: Mutex<RefCell<u64>>,
 }
 
 /// One mountpoint, as the readers that answer by path need it.
@@ -233,7 +243,32 @@ impl MountTable {
             fs_seq: Mutex::new(RefCell::new(1)),
             anon_seq: Mutex::new(RefCell::new(1)),
             mount_points: Mutex::new(RefCell::new(Vec::new())),
+            ns_id: Mutex::new(RefCell::new(0)),
         }
+    }
+
+    /// The root this namespace resolves absolute paths against. `None` before
+    /// `mount_root`/`pivot_root` has installed one, which in practice is only
+    /// a table built and not yet given a filesystem.
+    ///
+    /// `setns` is the caller that needs it: joining a mount namespace moves the
+    /// caller's root to the *namespace's*, because an absolute path means "from
+    /// this namespace's root" and a caller left holding the old one would be
+    /// jailed in a tree the namespace it just joined does not have.
+    pub fn ns_root(&self) -> Option<Arc<dyn super::Inode>> {
+        critical_section::with(|cs| self.root.borrow(cs).borrow().clone())
+    }
+
+    /// The number this namespace is known by, minted on first ask and stable
+    /// from then on (`/proc/<pid>/ns/mnt` reads `mnt:[<this>]`).
+    pub fn ns_id(&self) -> u64 {
+        critical_section::with(|cs| {
+            let mut slot = self.ns_id.borrow(cs).borrow_mut();
+            if *slot == 0 {
+                *slot = crate::vfs::ns::mint();
+            }
+            *slot
+        })
     }
 
     /// A **copy** of this table: the same mounts, the same records, fresh
@@ -1377,18 +1412,19 @@ impl MountTable {
                             })
                         };
                         if child.metadata().kind == NodeKind::Symlink {
-                            // A descriptor's second name - `/proc/<pid>/fd/N`
-                            // and the `/dev/std*` links into it - is a link
-                            // that must not be spliced. Its target is a
-                            // *report* about a descriptor, not a path to
-                            // reopen: the walk hands the link itself back, and
-                            // the opener reads `as_fd` off it and clones the
-                            // descriptor, position and flags and all. Splicing
-                            // would open a fresh description of whatever the
-                            // descriptor once named - a different file
-                            // position, or nothing at all once the name has
-                            // gone.
-                            if child.as_fd().is_some() {
+                            // A link that carries a *payload* must not be
+                            // spliced: its target is a report, not a path to
+                            // reopen. Two of them - `/proc/<pid>/fd/N` (and the
+                            // `/dev/std*` links into it), whose payload is a
+                            // descriptor, and `/proc/<pid>/ns/<kind>`, whose
+                            // payload is a namespace. The walk hands the link
+                            // itself back and the opener asks what it really
+                            // names: for a descriptor it clones it, position
+                            // and flags and all (splicing would open a fresh
+                            // description of whatever the descriptor once
+                            // named), and for a namespace `setns` joins the
+                            // object the link reports.
+                            if child.as_fd().is_some() || child.as_namespace().is_some() {
                                 stack.push(child);
                                 continue;
                             }

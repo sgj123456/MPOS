@@ -1555,7 +1555,11 @@ impl Task {
             identity: Identity::default(),
             // A kernel task starts in the machine's own namespace, the one
             // every task is born in until something unshares.
-            uts: crate::uts::init(),
+            // The machine's one UTS namespace (`crates/uts`'s `init` keeps the
+            // first). The id is minted here because the pool is the kernel's;
+            // only the first call's is worn, and a number nothing wears is the
+            // price of a leaf that cannot mint its own.
+            uts: crate::uts::init(crate::vfs::ns::mint()),
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -2073,7 +2077,11 @@ impl Table {
             identity: Identity::default(),
             // A kernel task starts in the machine's own namespace, the one
             // every task is born in until something unshares.
-            uts: crate::uts::init(),
+            // The machine's one UTS namespace (`crates/uts`'s `init` keeps the
+            // first). The id is minted here because the pool is the kernel's;
+            // only the first call's is worn, and a number nothing wears is the
+            // price of a leaf that cannot mint its own.
+            uts: crate::uts::init(crate::vfs::ns::mint()),
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -2539,7 +2547,11 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             // Init starts as root, like everything the kernel itself spawns.
             identity: Identity::default(),
             // ...and in the machine's own namespace, the one a boot begins in.
-            uts: crate::uts::init(),
+            // The machine's one UTS namespace (`crates/uts`'s `init` keeps the
+            // first). The id is minted here because the pool is the kernel's;
+            // only the first call's is worn, and a number nothing wears is the
+            // price of a leaf that cannot mint its own.
+            uts: crate::uts::init(crate::vfs::ns::mint()),
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -4133,8 +4145,65 @@ pub fn arm_diskstat_boot_namespace() {
 #[cfg(target_os = "none")]
 pub fn unshare_uts() {
     with_table(|t| {
-        let fresh = t.task(t.current).uts.copied();
+        let fresh = t.task(t.current).uts.copied(crate::vfs::ns::mint());
         t.task_mut(t.current).uts = fresh;
+    });
+}
+
+/// The namespace one **named** task is in, for `/proc/<pid>/ns/<kind>`.
+///
+/// The twin of [`current_fs_context`] for a pid, and the reason this exists is
+/// the whole reason that surface does: `/proc/<pid>/ns` is about *another*
+/// process, so a reader has to be able to ask for a task it is not. `None` when
+/// nothing answers to that pid (the directory checked a moment ago; this is the
+/// same answer one instant later, which is what a name about live state means
+/// here), and `None` for a task that has never unshared resolves to the
+/// machine's own table and names - the namespace every process starts in.
+pub fn ns_of(pid: usize, kind: crate::vfs::ns::Kind) -> Option<crate::vfs::ns::Namespace> {
+    with_table(|t| {
+        let task = t.tasks.get(pid).and_then(|slot| slot.as_ref())?;
+        Some(match kind {
+            crate::vfs::ns::Kind::Mount => crate::vfs::ns::Namespace::Mount(
+                task.fs_ns
+                    .clone()
+                    .unwrap_or_else(crate::vfs::mount::machine_table),
+            ),
+            crate::vfs::ns::Kind::Uts => crate::vfs::ns::Namespace::Uts(task.uts.clone()),
+        })
+    })
+}
+
+/// Join a mount namespace: `setns(fd, CLONE_NEWNS)`'s scheduler half, and the
+/// deliberate opposite of [`unshare_mnt`] - a join *adopts* the namespace the
+/// descriptor holds rather than copying the caller's, so the caller and every
+/// process already in that namespace see each other's mounts from here on
+/// (Linux's `mntns_install`). Joining the namespace one is already in is
+/// therefore a no-op that still succeeds, which is what `setns` on
+/// `/proc/self/ns/mnt` is for everybody who has never unshared.
+///
+/// The caller's root moves with it, for the reason [`MountTable::ns_root`]
+/// states. The caller's *cwd* does not: Linux re-resolves it by path inside the
+/// new namespace, and a directory the new namespace cannot reach is left where
+/// it is - the inode stays valid either way, and the re-resolution is named as
+/// not modelled in `docs/notes/` rather than half-done here.
+pub fn setns_mnt(table: Arc<crate::vfs::mount::MountTable>) {
+    with_table(|t| {
+        let me = t.current;
+        let root = table.ns_root();
+        t.task_mut(me).fs_ns = Some(table);
+        if root.is_some() {
+            t.task_mut(me).root = root;
+        }
+    });
+}
+
+/// Join a UTS namespace: `setns(fd, CLONE_NEWUTS)`'s half. The names come with
+/// the object, by reference - the caller now reads and renames the namespace
+/// the descriptor named, and the one it left is untouched.
+pub fn setns_uts(uts: Arc<crate::uts::Uts>) {
+    with_table(|t| {
+        let me = t.current;
+        t.task_mut(me).uts = uts;
     });
 }
 
@@ -7894,7 +7963,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // flag the reference is handed on, as every fork since the
             // beginning did. Pinned by `t-clone`.
             uts: if request.flags & crate::abi::CLONE_NEWUTS != 0 {
-                t.task(parent_id).uts.copied()
+                t.task(parent_id).uts.copied(crate::vfs::ns::mint())
             } else {
                 Arc::clone(&t.task(parent_id).uts)
             },

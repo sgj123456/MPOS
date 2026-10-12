@@ -37,6 +37,12 @@ pub mod locks;
 #[cfg(target_os = "none")]
 pub mod memfd;
 pub mod mount;
+/// The namespace identities the kernel knows, and the text `/proc/<pid>/ns/<kind>`
+/// reads back as. Home: `vfs`, because the mount namespace and the renderer are
+/// both here, and a concept with four readers belongs where its subject lives -
+/// the graph's own ratchet refused a module of its own for making a
+/// `ns <-> vfs` cycle.
+pub mod ns;
 /// 9P client. Reached only through `drivers::virtio::fs9p`, which carries the
 /// `P9Device` contract whichever bus opened the device (`NOTES.md` §13.29), and
 /// mounted by the `mount -t 9p` factory in `syscall` - no core vfs module
@@ -514,6 +520,19 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// open. Resolution hands back the link's own inode, so this is how the
     /// opener is told what the name really meant.
     fn as_fd(&self) -> Option<usize> {
+        None
+    }
+
+    /// The namespace this node names, if it names one.
+    ///
+    /// `/proc/<pid>/ns/<kind>` is a *magic* link in the same sense
+    /// [`Inode::as_fd`] is: its `readlink` answers a report (`mnt:[<id>]`, which
+    /// is not a path anybody can reopen) and what opening it really means is
+    /// the namespace object itself, which `setns` then joins. Resolution hands
+    /// the link's own inode back for it, exactly as it does for a descriptor's
+    /// second name - the one condition the walk tests is "does this link carry
+    /// a payload", and this is the second kind of payload.
+    fn as_namespace(&self) -> Option<crate::vfs::ns::Namespace> {
         None
     }
 

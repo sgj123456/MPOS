@@ -1135,16 +1135,55 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
-/// `setns(fd, nstype)` — join a namespace a descriptor names. No namespace
-/// is reachable through a descriptor here — none exists to open — so a
-/// number that names a descriptor answers EINVAL (the "not a namespace"
-/// refusal) and a number that names nothing answers EBADF, which is the
-/// whole of what the call can learn.
+/// `setns(fd, nstype)` — join a namespace a descriptor names.
+///
+/// A namespace is named by a descriptor now, because `/proc/<pid>/ns/<kind>` is
+/// openable: the link's own inode carries the namespace and this call joins
+/// *that object* rather than copying the caller's, so the caller and every
+/// process already in the namespace see each other's mounts and names from here
+/// on. That is the whole difference from `unshare`, which copies.
+///
+/// The order of the questions is the one a real kernel answers in, measured
+/// (the probe is `.workbuddy/probe_setns.c`, host 7.2.9):
+///
+/// 1. a number that names no descriptor is `EBADF`;
+/// 2. a descriptor that is not a namespace — a pipe, a plain file, a directory
+///    — is `EINVAL`, which is Linux's "not a namespace" answer (`-22` for each
+///    of the three);
+/// 3. the flag word is checked *next*, and everything but zero or exactly this
+///    descriptor's kind is `EINVAL`: a sibling's bit, two bits at once and a
+///    word that is no namespace bit all answer `-22` (see
+///    `abi::setns_verdict` for the four measurements);
+/// 4. **then** the capability. The probe was an unprivileged caller, and its
+///    call with the *matching* bit was refused `EPERM` while the mismatched
+///    ones were refused `EINVAL` — which is what fixes this order rather than
+///    the other one. `CAP_SYS_ADMIN` is asked of the caller's *effective set*,
+///    the same gate and the same question `unshare` asks.
+///
+/// A kind this kernel does not have is not reachable at all: `/proc/<pid>/ns`
+/// has no entry for it, so no descriptor for one can exist and no branch here
+/// has to answer for it. That absence *is* the refusal, and it is the same one a
+/// real kernel gives a machine built without the namespace.
 pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
-    match crate::sched::current_fds().clone_at(args[0] as i32) {
-        Ok(_) => err::EINVAL,
-        Err(_) => err::EBADF,
+    let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(file) => file,
+        Err(_) => return err::EBADF,
+    };
+    let Some(namespace) = file.inode().as_namespace() else {
+        return err::EINVAL;
+    };
+    if let Err(e) = super::abi::setns_verdict(namespace.kind(), args[1]) {
+        return e;
     }
+    let privileged = crate::sched::current_credentials().has_effective(crate::cred::CAP_SYS_ADMIN);
+    if !privileged {
+        return err::EPERM;
+    }
+    match namespace {
+        crate::vfs::ns::Namespace::Mount(table) => crate::sched::setns_mnt(table),
+        crate::vfs::ns::Namespace::Uts(uts) => crate::sched::setns_uts(uts),
+    }
+    0
 }
 
 /// `seccomp(op, flags, args)` — the secure-computing mode. Strict mode is

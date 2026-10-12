@@ -138,6 +138,11 @@ struct ProcLink {
     /// name under `/proc/<pid>/fd` is, and opening one has to open the
     /// descriptor rather than the link.
     fd: Option<usize>,
+    /// The namespace this link names, when it names one: every name under
+    /// `/proc/<pid>/ns` is. The second kind of payload a link can carry, and
+    /// asked for the same way - the walk must not splice this link either,
+    /// because its target is a report (`mnt:[<id>]`) rather than a path.
+    ns: Option<(usize, crate::vfs::ns::Kind)>,
 }
 
 impl Inode for ProcLink {
@@ -162,6 +167,36 @@ impl Inode for ProcLink {
             return None;
         }
         self.fd
+    }
+
+    fn as_namespace(&self) -> Option<crate::vfs::ns::Namespace> {
+        // Asked at open time, not recorded at build time: a process that
+        // unshared a moment ago is in a different namespace now, and a link
+        // that answered with what it was built from would be naming the one
+        // the process left. `None` when the process is gone - the same answer
+        // `readlink` gives, one instant later.
+        let (pid, kind) = self.ns?;
+        namespace_of(pid, kind)
+    }
+
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+        // A namespace is not bytes, and Linux says so with `EINVAL` rather than
+        // by returning zero: measured on a current host, `read` on an opened
+        // `/proc/self/ns/mnt` answers `-1`/`EINVAL` (errno 22). A descriptor's
+        // second name is a different answer - it *is* a file descriptor, and
+        // the opener clones it rather than reading the link - so this applies
+        // only to the namespace payload.
+        if self.ns.is_some() {
+            return Err(VfsError::Invalid);
+        }
+        Err(VfsError::Unsupported)
+    }
+
+    fn seekable(&self) -> bool {
+        // `lseek` on a namespace descriptor is `ESPIPE`, measured with the same
+        // probe. A descriptor's second name keeps the seekability of the
+        // descriptor it clones, so the answer is the namespace's alone.
+        self.ns.is_none()
     }
 }
 
@@ -358,6 +393,7 @@ fn link(target: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn 
         target: Box::new(target),
         pid: 0,
         fd: None,
+        ns: None,
     })
 }
 
@@ -373,6 +409,7 @@ fn fd_link(
         target: Box::new(target),
         pid,
         fd: Some(fd),
+        ns: None,
     })
 }
 
@@ -1403,6 +1440,12 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     let fds = ProcDir::new(Some(Arc::new(Descriptors { pid })));
     node.add("fd", NodeKind::Dir, fds);
 
+    // `/proc/<pid>/ns`: one link per namespace the process is in, naming the
+    // namespace the way `readlink` reports it and handing `setns` the object
+    // when it is opened.
+    let namespaces = ProcDir::new(Some(Arc::new(Namespaces { pid })));
+    node.add("ns", NodeKind::Dir, namespaces);
+
     Some(node)
 }
 
@@ -1453,6 +1496,64 @@ impl Dynamic for Descriptors {
         // each other until the kernel stack ran out.
         let pid = self.pid;
         Some(fd_link(pid, fd, move || fd_target(pid, fd)))
+    }
+}
+
+/// One process's namespace, for the two readers that need the object rather
+/// than its text. Two bodies for the reason [`task`] has two: the namespace
+/// slots live in the scheduler's task table, which only exists on a machine
+/// with tasks.
+#[cfg(target_os = "none")]
+fn namespace_of(pid: usize, kind: crate::vfs::ns::Kind) -> Option<crate::vfs::ns::Namespace> {
+    crate::sched::ns_of(pid, kind)
+}
+
+#[cfg(not(target_os = "none"))]
+fn namespace_of(_pid: usize, _kind: crate::vfs::ns::Kind) -> Option<crate::vfs::ns::Namespace> {
+    None
+}
+
+/// A link that names a *namespace*: every entry under `/proc/<pid>/ns`.
+///
+/// The same shape [`fd_link`] has and for the same reason - the walk must hand
+/// the link back rather than splice it - with a namespace where the descriptor
+/// was. `readlink` answers the fact (`mnt:[<id>]`, measured: that is what a real
+/// kernel's `readlink` prints), and `as_namespace` answers the object `setns`
+/// joins. Both are asked of the *live* process, so a link opened after its
+/// process unshared names the namespace it is in now.
+fn ns_link(pid: usize, kind: crate::vfs::ns::Kind) -> Arc<dyn Inode> {
+    Arc::new(ProcLink {
+        ino: next_ino(),
+        target: Box::new(move || namespace_of(pid, kind).map(|ns| ns.link_text())),
+        pid,
+        fd: None,
+        ns: Some((pid, kind)),
+    })
+}
+
+/// The namespaces of one process, as `/proc/<pid>/ns` lists them.
+///
+/// The kinds this kernel has, and *only* those: a machine built without a
+/// namespace has no entry for it either (a real kernel without `CONFIG_TIME_NS`
+/// answers `ENOENT` for `/proc/self/ns/time`), so a reader sees two names and is
+/// told nothing it cannot check. A name that is not one of them - `pid`, `net`,
+/// `user`, `cgroup`, `time` - is `ENOENT` from the directory, and `setns` never
+/// sees a descriptor for a namespace that does not exist.
+struct Namespaces {
+    pid: usize,
+}
+
+impl Dynamic for Namespaces {
+    fn names(&self) -> Vec<(String, NodeKind)> {
+        crate::vfs::ns::Kind::ALL
+            .iter()
+            .map(|kind| (String::from(kind.name()), NodeKind::Symlink))
+            .collect()
+    }
+
+    fn node(&self, name: &str) -> Option<Arc<dyn Inode>> {
+        let kind = crate::vfs::ns::Kind::of_name(name)?;
+        Some(ns_link(self.pid, kind))
     }
 }
 

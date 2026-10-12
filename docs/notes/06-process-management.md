@@ -528,6 +528,101 @@ The pins are `t-signalfd`'s two claims — "a read with no child exited answers
 `EAGAIN`" before the fork, and "a child's death is reported once" (this kernel's
 two records, Linux's one) — which are exactly the claims the strays broke.
 
+### 6.6 A namespace a descriptor can name — `setns` + `/proc/<pid>/ns/*` — **LANDED**
+
+The half of MNT the step above left: `unshare` gives a caller a namespace of its
+own, `clone` gives one to a child, and neither lets a program *adopt* the
+namespace another process already made. That is what the descriptor is for -
+Linux's `/proc/<pid>/ns/<kind>` is an openable link whose target is a report, and
+`setns` joins the object the descriptor holds rather than copying the caller's -
+and it is the shape a container runtime is built out of: a parent that makes a
+mount namespace, and the processes that join it afterwards.
+
+**Measured first** (`.workbuddy/probe_setns.c`, host 7.2.9), because almost every
+claim here is about Linux's answer rather than this kernel's:
+
+| question | the host's answer |
+|---|---|
+| what is in `/proc/self/ns` | ten names - `net, uts, ipc, pid, pid_for_children, user, mnt, cgroup, time, time_for_children` - every one a symlink (`lstat` mode 777) |
+| what a link reads back as | `kind:[<n>]`, and the numbers come from **one pool**: `net` 4026531833 down to `mnt` 4026531832, consecutive in creation order |
+| what `open` on a link gives | a descriptor for the *namespace*: `read` is `EINVAL`, `write` is `EBADF` (opened read-only), `lseek` is `ESPIPE`, and `fstat`'s `st_ino` (148898) is **not** the number the link reports |
+| `setns(fd, nstype)` with a sibling kind's bit | `EINVAL` (`-22`), not `EPERM` |
+| with **two** namespace bits at once | `EINVAL` for both a mount and a UTS descriptor |
+| with a word that is no namespace bit (`0x10000000`) | `EINVAL` |
+| with a pipe, a plain file, a directory | `EINVAL` - not a namespace, whatever the descriptor is |
+| with a number that names nothing | `EBADF` |
+| `/proc/<pid>/ns/mnt` for a pid that does not exist | `ENOENT` |
+| the capability's position | **after** all of the above: the probe's unprivileged caller was refused `EPERM` for the *matching* bit and `EINVAL` for the mismatched ones |
+
+What the host would not let the probe reach is a *successful* join (this sandbox
+refuses `setns` into one's own namespace with `EPERM`), so the success path is
+this kernel's design rather than a Linux measurement, and the test says so.
+
+**What landed.** `vfs::ns` owns the two facts both halves need: the one number
+pool (`mint()`, starting where Linux's numbers live) and the link text
+(`kind:[<id>]`). Its first home was a module of its own, `crate::ns`, and the
+depgraph ratchet refused it in the same run: `ns → vfs` (the mount namespace's
+object) and `vfs → ns` (the renderer and the link payload) made a **ninth mutual
+pair** where eight are recorded. The rule's own remedy is the one taken - remove
+the edge rather than raise the constant - and the concept belongs under `vfs`
+anyway, where the mount namespace and the `/proc` renderer already live. `MountTable` and `Uts` each carry an id - lazily for the table,
+because `MountTable::new` is `const` and the machine's table is built in a
+`static`; passed in for the UTS namespace, because a leaf crate cannot mint from a
+pool the kernel owns. `/proc/<pid>/ns` is a `Dynamic` directory beside `fd`,
+listing **only** the kinds this kernel has, and each entry is the same *magic
+link* the descriptor names already are (`ProcLink` grew a second payload beside
+its `fd`): the walk hands the link back instead of splicing it, `readlink`
+answers the report, and `as_namespace` answers the object - asked of the *live*
+process, so a link opened after its process unshared names the namespace it is in
+now. `setns` then asks its four questions in the measured order (descriptor →
+flags → capability → join) and joins by **reference**: the caller's `fs_ns`
+*becomes* the object, so a mount made by one member of the namespace is seen by
+every other member, and the caller's root moves to the namespace's root (Linux's
+`mntns_install`) while its cwd stays where it is.
+
+**Two things are named rather than done.** The *cwd* is not re-resolved by path
+inside the new namespace, which is what Linux does; an inode stays valid across
+the join either way, so what is missing is the re-resolution and not the safety.
+And the kinds this kernel has not (pid, net, ipc, user, cgroup, time) have **no
+entry** in `/proc/<pid>/ns` - which is the surface a real kernel built without a
+namespace has (a machine with `CONFIG_TIME_NS` off answers `ENOENT` for
+`/proc/self/ns/time`), so a reader is told two names and nothing it cannot check,
+and no descriptor for an absent namespace can exist to be handed to `setns`.
+
+Two of the pin's own claims had to be corrected by the gate rather than the
+kernel, and both are worth naming because the kernel was right: a *second*
+`mount` at a mountpoint that already has one **succeeds** here (that is Linux's
+own mount stack, and the claim that it would be refused was wrong), and the
+"namespace outlives the process" claim was reading the marker *after* the peel
+that removes it, so it was measuring the `umount` and not the namespace's life.
+What the join does is the claim between them - the marker the child wrote inside
+its own mount, readable in the caller's namespace after joining and unreadable
+before.
+
+The pin is `t-ns-setns` (both machines, default sweep): the directory's two names
+and the six `ENOENT`s, the link text's shape and the two kinds' different
+numbers, the descriptor's `EINVAL`/`ESPIPE`/`EPERM` set, every measured refusal
+above, and the claim the whole surface exists for - a child that unshares and
+mounts a marker, and a caller that joins *its* namespace through
+`/proc/<child>/ns/mnt` and reads that marker, where an `unshare` would have left
+it looking at an empty copy. The namespace outliving the process that made it is
+the last line - and the first draft of it was **wrong about which half
+survives**, which is worth recording because the measurement is the whole
+finding. What the run shows, after the child is killed: the caller's own link
+still names the namespace and `/proc/self/mounts` still carries the child's
+mount at that path, but the marker the child wrote **cannot be read any more**.
+So the namespace survives and the storage behind the mount does not, and the
+test claims the two halves it measured (the link and the mount-table entry) while
+the third is printed as a note rather than pinned - a claim here would pin the
+defect and go red the day it is fixed, which is the one shape a pin must not
+have. **Open, with the next measurement named**: the mount was made by the child,
+inside the namespace the child had just unshared, and the likeliest owner of
+those bytes is that task's own ramfs charge (`vfs::ramfs`'s byte budget is per
+`mm`) - which the exit path releases. If that is it, the fix is that a
+filesystem mounted into a *namespace* is charged to the namespace and not to the
+process that mounted it, and the mount outliving its mounter is exactly what
+`setns` makes observable.
+
 ### R.6 (moved from ROADMAP's status board) — `/proc/<pid>/maps`: the three sources, and why two of them stay beside the VMA table
 
 The file a crash reporter reads to find a program's base address: every mapping in Linux's six-field format — `start-end perms offset dev inode name`, addresses as lowercase hex, the offset zero-padded, `dev` as `%02x:%02x`, and the name in the fixed column Linux uses (73, measured across address and inode widths on 7.2.7) when there is one — which is what makes the last field addressable whatever the width before it. The perms word's fourth character is the `MAP_SHARED` bit, so it is carried on the mapping rather than guessed from what backs it: a `memfd` mapped `MAP_PRIVATE` aliases the same frames and is still `p`. Three sources feed one file, because the address space is recorded in three places: the VMA table (`mmap`, `mprotect`, `brk`), a list of ranges the *loader* filled, and the program break, which is what gives a range the `[heap]` name — applied by address, since this kernel's heap is an ordinary anonymous mapping. `[stack]` is recorded when the stack is laid out and stretched down as the stack grows, so a program reading its own maps from deep in a call is not told about a stack that stops above it.

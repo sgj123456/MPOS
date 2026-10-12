@@ -1389,6 +1389,38 @@ pub(crate) fn unshare_verdict(flags: usize, privileged: bool) -> Result<usize, i
 // is a warning on every bare-metal build.
 
 // ---------------------------------------------------------------------------
+// setns(2): the flag word
+// ---------------------------------------------------------------------------
+
+/// What `setns(fd, nstype)` makes of its second argument, given what the
+/// descriptor named.
+///
+/// Three measured answers from one host (7.2.9), all `EINVAL` and all *before*
+/// the capability is asked - the probe was an unprivileged caller whose call
+/// with the *matching* bit was refused `EPERM` at the next step, which is what
+/// fixes the order:
+///
+/// * a different namespace bit (`/proc/self/ns/mnt`'s descriptor with
+///   `CLONE_NEWUTS`) answers `-22`, not `EPERM`;
+/// * two bits at once (`CLONE_NEWNS|CLONE_NEWUTS`) answers `-22` for both a
+///   mount and a UTS descriptor - the call joins one namespace, so a word
+///   naming two is not a request it can honour;
+/// * a word that is not a namespace bit at all (`0x10000000`) answers `-22`.
+///
+/// Zero is the one word that always passes: `setns(fd, 0)` means "whatever this
+/// descriptor names", and what makes that safe is the descriptor's own kind,
+/// which the caller here already has.
+pub(crate) fn setns_verdict(
+    kind: crate::vfs::ns::Kind,
+    nstype: usize,
+) -> Result<crate::vfs::ns::Kind, isize> {
+    if nstype == 0 || nstype == kind.flag() {
+        return Ok(kind);
+    }
+    Err(err::EINVAL)
+}
+
+// ---------------------------------------------------------------------------
 // reboot(2): the magic cmd words
 // ---------------------------------------------------------------------------
 
@@ -3121,6 +3153,55 @@ mod tests {
     /// `EOPNOTSUPP` for everybody and is now served, and the *word* that mixes a
     /// served namespace with an unserved one is refused whole rather than
     /// half-applied.
+    #[test]
+    fn setns_takes_zero_or_its_own_kind_and_refuses_the_rest_with_einval() {
+        // The measured set, in one place: 0 is "whatever the descriptor names",
+        // the descriptor's own bit is the request, and everything else - a
+        // sibling kind's bit, two of them, or a word that is no namespace bit -
+        // is EINVAL rather than the capability's EPERM (which is the next
+        // question a host answers for the *matching* bit).
+        assert_eq!(
+            setns_verdict(crate::vfs::ns::Kind::Mount, 0),
+            Ok(crate::vfs::ns::Kind::Mount)
+        );
+        assert_eq!(
+            setns_verdict(
+                crate::vfs::ns::Kind::Mount,
+                crate::vfs::ns::Kind::Mount.flag()
+            ),
+            Ok(crate::vfs::ns::Kind::Mount)
+        );
+        assert_eq!(
+            setns_verdict(crate::vfs::ns::Kind::Uts, crate::vfs::ns::Kind::Uts.flag()),
+            Ok(crate::vfs::ns::Kind::Uts)
+        );
+        assert_eq!(
+            setns_verdict(
+                crate::vfs::ns::Kind::Mount,
+                crate::vfs::ns::Kind::Uts.flag()
+            ),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            setns_verdict(
+                crate::vfs::ns::Kind::Mount,
+                crate::vfs::ns::Kind::Mount.flag() | crate::vfs::ns::Kind::Uts.flag()
+            ),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            setns_verdict(crate::vfs::ns::Kind::Uts, 0x1000_0000),
+            Err(crate::syscall::err::EINVAL)
+        );
+        assert_eq!(
+            setns_verdict(
+                crate::vfs::ns::Kind::Uts,
+                crate::syscall::linux::nr::CLONE_NEWPID
+            ),
+            Err(crate::syscall::err::EINVAL)
+        );
+    }
+
     #[test]
     fn unshare_grants_only_what_it_can_copy_and_refuses_the_rest_whole() {
         use crate::syscall::err;

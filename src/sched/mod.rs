@@ -52,26 +52,26 @@ pub use runtime::{
     group_members, has_children, has_deliverable_signal, has_live_child, has_seccomp_filter,
     has_tracer, init, insert_vma, is_child, is_running, is_stopped, itimer_snapshot, itimer_swap,
     kernel_lazy_accessible, madvise_dontneed, map_anon, map_facts, map_frames, may_inspect,
-    membarrier_registrations, move_user_page, munmap_user, nice_of, oom_score_adj_of, parent_of,
-    pause, pgid_of, poll_any_child, poll_any_child_event, populate_user_page_at, preempt,
-    process_members, protect_user, protect_user_range, read_sigchld, read_user, read_user_of,
-    record_eager_range, register_membarrier, release_user_frames, reset_disposition,
+    membarrier_registrations, move_user_page, munmap_user, nice_of, ns_of, oom_score_adj_of,
+    parent_of, pause, pgid_of, poll_any_child, poll_any_child_event, populate_user_page_at,
+    preempt, process_members, protect_user, protect_user_range, read_sigchld, read_user,
+    read_user_of, record_eager_range, register_membarrier, release_user_frames, reset_disposition,
     resolve_anon_fault, resolve_cow_fault, resolve_script, resolve_stack_growth, resume_traced,
     rlimits_of, robust_head, run_seccomp_filters, send_signal, send_signal_group, send_signal_info,
     send_signal_process, session_of_tty, set_brk_base, set_clear_tid, set_current_blocked,
     set_current_comm, set_current_identity, set_current_rlimit, set_current_tls, set_current_umask,
     set_cwd, set_cwd_path, set_mmap_cursor, set_nice, set_oom_score_adj, set_pgid, set_robust_head,
     set_root, set_seccomp_filter, set_seccomp_strict, set_signal_action, set_signal_alt_stack,
-    set_trace_options, set_tracer, signal_action, signal_alt_stack, sleep_ticks, snapshot,
-    snapshots, space_root_of, spawn, spawn_permanent, spawn_user, started, stop_of,
-    take_child_event, take_continued_report, take_deliverable_siginfo, take_deliverable_signal,
-    take_exit_code, take_exit_code_current, take_fatal_signal, take_pending_event,
-    take_signal_in_set, take_stop_report, take_vmas, task_count, thread_snapshots, timer_alloc,
-    timer_arm, timer_overrun, timer_remove, timer_state, tls_of, trace_options, trace_syscall,
-    tracer_of, try_spawn_user, uid_members, unmap_user, unshare_mnt, unshare_uts, user_frame_at,
-    user_mapped, vfork, vma_gaps, vma_prot_at, vma_range_free, wait_any_child,
-    wait_any_child_event, wait_for_interrupt, wake, with_current_credentials, write_user,
-    write_user_of, yield_now,
+    set_trace_options, set_tracer, setns_mnt, setns_uts, signal_action, signal_alt_stack,
+    sleep_ticks, snapshot, snapshots, space_root_of, spawn, spawn_permanent, spawn_user, started,
+    stop_of, take_child_event, take_continued_report, take_deliverable_siginfo,
+    take_deliverable_signal, take_exit_code, take_exit_code_current, take_fatal_signal,
+    take_pending_event, take_signal_in_set, take_stop_report, take_vmas, task_count,
+    thread_snapshots, timer_alloc, timer_arm, timer_overrun, timer_remove, timer_state, tls_of,
+    trace_options, trace_syscall, tracer_of, try_spawn_user, uid_members, unmap_user, unshare_mnt,
+    unshare_uts, user_frame_at, user_mapped, vfork, vma_gaps, vma_prot_at, vma_range_free,
+    wait_any_child, wait_any_child_event, wait_for_interrupt, wake, with_current_credentials,
+    write_user, write_user_of, yield_now,
 };
 
 /// The stop accessors and the register-file snapshot are the machine's to build
@@ -387,7 +387,7 @@ pub fn current_uts() -> alloc::sync::Arc<crate::uts::Uts> {
         HOST_UTS
             .borrow(cs)
             .borrow_mut()
-            .get_or_insert_with(crate::uts::init)
+            .get_or_insert_with(|| crate::uts::init(crate::vfs::ns::mint()))
             .clone()
     })
 }
@@ -415,7 +415,9 @@ pub fn arm_diskstat_boot_namespace() {}
 pub fn unshare_uts() {
     critical_section::with(|cs| {
         let mut slot = HOST_UTS.borrow(cs).borrow_mut();
-        let fresh = slot.get_or_insert_with(crate::uts::init).copied();
+        let fresh = slot
+            .get_or_insert_with(|| crate::uts::init(crate::vfs::ns::mint()))
+            .copied(crate::vfs::ns::mint());
         *slot = Some(fresh);
     });
 }

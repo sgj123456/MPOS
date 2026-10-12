@@ -75,18 +75,35 @@ pub struct Uts {
     /// one door, one holder. `false` is every ordinary boot; only a machine
     /// booted with `mpos.diskstat` arms it, from the kernel's own boot step.
     diskstat: Mutex<RefCell<bool>>,
+    /// The number this namespace is known by: `uts:[<id>]` in
+    /// `/proc/<pid>/ns/uts`, and what `setns` compares two of them by.
+    ///
+    /// The number is **given** to this object rather than minted here, because
+    /// the pool is one pool for every kind (Linux's numbers are per-type inode
+    /// numbers from one allocator, so a mount namespace and a UTS namespace can
+    /// never claim the same one) and the counter therefore lives in the kernel
+    /// (`crate::ns`). That is this crate's discipline at the seam: a leaf takes
+    /// the facts it cannot make and answers only its own.
+    ns_id: u64,
 }
 
 impl Uts {
     /// A namespace nobody has named: both names empty, so both getters answer
     /// their defaults. What a boot starts with, and what a copy of an unnamed
     /// namespace holds.
-    fn unnamed() -> Arc<Uts> {
+    fn unnamed(ns_id: u64) -> Arc<Uts> {
         Arc::new(Uts {
             nodename: Mutex::new(RefCell::new(String::new())),
             domainname: Mutex::new(RefCell::new(String::new())),
             diskstat: Mutex::new(RefCell::new(false)),
+            ns_id,
         })
+    }
+
+    /// The number this namespace is known by (`mnt`'s twin is
+    /// `MountTable::ns_id`, and both are minted from `crate::ns`'s one pool).
+    pub fn ns_id(&self) -> u64 {
+        self.ns_id
     }
 
     /// The name this namespace goes by - `uname`'s `nodename`, `hostname(1)`'s
@@ -140,7 +157,7 @@ impl Uts {
     /// that a program which unshares and then asks what it is called is told
     /// the truth, and it must then be free to diverge, so that the next
     /// `sethostname` is invisible to the namespace it came from.
-    pub fn copied(&self) -> Arc<Uts> {
+    pub fn copied(&self, ns_id: u64) -> Arc<Uts> {
         let (nodename, domainname, diskstat) = critical_section::with(|cs| {
             (
                 self.nodename.borrow(cs).borrow().clone(),
@@ -152,6 +169,7 @@ impl Uts {
             nodename: Mutex::new(RefCell::new(nodename)),
             domainname: Mutex::new(RefCell::new(domainname)),
             diskstat: Mutex::new(RefCell::new(diskstat)),
+            ns_id,
         })
     }
 
@@ -179,11 +197,11 @@ impl Uts {
 static INIT: Mutex<RefCell<Option<Arc<Uts>>>> = Mutex::new(RefCell::new(None));
 
 /// The namespace a boot starts in, created on first use.
-pub fn init() -> Arc<Uts> {
+pub fn init(ns_id: u64) -> Arc<Uts> {
     critical_section::with(|cs| {
         INIT.borrow(cs)
             .borrow_mut()
-            .get_or_insert_with(Uts::unnamed)
+            .get_or_insert_with(|| Uts::unnamed(ns_id))
             .clone()
     })
 }
@@ -191,12 +209,12 @@ pub fn init() -> Arc<Uts> {
 /// Arm §10.5's disk-counter protocol on the init namespace itself.
 ///
 /// This is the one writer that reaches the namespace *before* any task holds
-/// it: the boot flow arms before `sched::init()` adopts the boot task, so the
+/// it: the boot flow arms before `sched::init(7)` adopts the boot task, so the
 /// word lands on the namespace every later task is created with rather than on
 /// a table row that does not exist yet. There is no syscall door here — same
 /// rule as [`Uts::set_diskstat`], which this exists to reach safely.
 pub fn arm_init() {
-    init().set_diskstat(true);
+    init(3).set_diskstat(true);
 }
 
 #[cfg(test)]
@@ -205,7 +223,7 @@ mod tests {
 
     #[test]
     fn a_namespace_nobody_named_reports_the_defaults() {
-        let uts = Uts::unnamed();
+        let uts = Uts::unnamed(1);
         assert_eq!(uts.nodename(), DEFAULT_NODENAME);
         assert_eq!(uts.domainname(), DEFAULT_DOMAINNAME);
     }
@@ -217,11 +235,11 @@ mod tests {
     /// global, which is what this kernel had before this module existed.
     #[test]
     fn a_copy_starts_from_the_names_and_then_diverges() {
-        let outer = Uts::unnamed();
+        let outer = Uts::unnamed(1);
         outer.set_nodename("outer");
         outer.set_domainname("example.test");
 
-        let inner = outer.copied();
+        let inner = outer.copied(2);
         assert_eq!(inner.nodename(), "outer", "the copy did not inherit");
         assert_eq!(inner.domainname(), "example.test");
 
@@ -243,7 +261,7 @@ mod tests {
     /// task visible to the shell it later starts.
     #[test]
     fn init_is_one_namespace_however_often_it_is_asked_for() {
-        assert!(Arc::ptr_eq(&init(), &init()));
+        assert!(Arc::ptr_eq(&init(4), &init(5)));
     }
 
     /// §10.5's protocol rides the copy, and `arm_init` is what puts it on the
@@ -254,10 +272,10 @@ mod tests {
     /// counters should be and the measurement would silently become nothing.
     #[test]
     fn an_armed_diskstat_protocol_survives_the_copy() {
-        let outer = Uts::unnamed();
+        let outer = Uts::unnamed(1);
         assert!(!outer.diskstat());
         outer.set_diskstat(true);
-        let inner = outer.copied();
+        let inner = outer.copied(2);
         assert!(inner.diskstat(), "the copy lost the protocol");
         inner.set_diskstat(false);
         assert!(
@@ -269,15 +287,18 @@ mod tests {
     /// The arming path the boot flow uses (`sched::arm_diskstat_boot_namespace`
     /// → this) lands on the one namespace every later task inherits — the
     /// counterfactual for the boot panic this replaced: arming used to go
-    /// through the task table, which had no entry before `sched::init()` adopted
+    /// through the task table, which had no entry before `sched::init(7)` adopted
     /// the boot task, and `Table::task` panics on an absent slot. Here the same
-    /// arm reaches `init()`'s own object with no table in sight.
+    /// arm reaches `init(7)`'s own object with no table in sight.
     #[test]
     fn arm_init_arms_the_namespace_every_task_inherits() {
         arm_init();
-        assert!(init().diskstat(), "the init namespace did not take the arm");
         assert!(
-            Arc::ptr_eq(&init(), &init()),
+            init(7).diskstat(),
+            "the init namespace did not take the arm"
+        );
+        assert!(
+            Arc::ptr_eq(&init(7), &init(7)),
             "the arm went to a different namespace than tasks inherit"
         );
     }
