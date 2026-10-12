@@ -48,23 +48,32 @@ pub struct VirtioBlk {
 }
 
 impl VirtioBlk {
-    /// Whether `ptr` names memory a request can hand to the device.
+    /// Whether the device can be handed the whole of `buf` as one descriptor.
     ///
-    /// A descriptor carries a *physical* address, and only the direct map
-    /// turns a virtual one into that, by subtraction. Anything else is not
-    /// merely unmappable but unshareable: a user buffer is scattered across
-    /// physical pages that were handed out one at a time, so even an address
-    /// that translated would send the device to the wrong place. The syscalls
-    /// do hand user buffers down - `read`, `readv` and `pread64` pass the
-    /// caller's pointer straight to the filesystem, and a block *device* is
-    /// read with no filesystem in between to break the fall.
-    fn dma_safe(ptr: *const u8) -> bool {
-        ptr as usize >= crate::mm::hhdm_offset()
+    /// [`super::device_reaches`] is the walk; this is the driver asking it. What
+    /// it replaced was `ptr >= mm::hhdm_offset()`, and that is a *necessary*
+    /// condition rather than a sufficient one: an MMIO window or the kernel
+    /// image is mapped in the kernel half and above the offset while *not* being
+    /// at it, so `share`'s subtraction would have sent the device to an address
+    /// computed from the wrong thing. One page of that class of mistake is a
+    /// page; a 128 KiB run of it is a disk's worth of wrong bytes, which is why
+    /// the answer is the page tables' and not the pointer's.
+    fn reaches(buf: &[u8]) -> bool {
+        super::device_reaches(buf)
     }
 
     /// Move `buf.len()` bytes at `offset` through the device, in pieces no
-    /// larger than the bounce buffer, for a caller whose memory the device
-    /// cannot reach.
+    /// larger than the bounce buffer, for a caller whose buffer it cannot be
+    /// handed.
+    ///
+    /// The bounce is a kernel stack array, and that is what makes it a legal
+    /// transfer at all: the stack is frames the direct map reaches, and one run
+    /// of them for the same reason every other kernel buffer is (see
+    /// [`super::device_reaches`]). The syscalls are the callers this exists for:
+    /// `read`, `readv` and `pread64` pass the caller's pointer straight down, and
+    /// a block *device* is read with no filesystem in between to break the fall -
+    /// and the 2 KiB piece is small enough to sit on a 16 KiB kernel stack
+    /// without a thought.
     fn read_at_bounced(&self, offset: u64, buf: &mut [u8]) {
         let mut bounce = [0u8; SECTOR as usize * BOUNCE_SECTORS];
         let mut done = 0;
@@ -76,6 +85,8 @@ impl VirtioBlk {
         }
     }
 
+    /// The other direction of [`Self::read_at_bounced`], for the same callers and
+    /// with the same bounce.
     fn write_at_bounced(&self, offset: u64, buf: &[u8]) {
         let mut bounce = [0u8; SECTOR as usize * BOUNCE_SECTORS];
         let mut done = 0;
@@ -111,23 +122,22 @@ impl BlockDev for VirtioBlk {
         self.sectors
     }
 
-    /// A page, and it is a real limit rather than modesty.
+    /// The width the two virtio transports answer, and why the crate's
+    /// one-descriptor-per-buffer shape does not narrow it.
     ///
-    /// The crate describes a request's data with **one descriptor per buffer
-    /// slice**, and a descriptor carries a single physical address - so a buffer
-    /// that spans pages the frame allocator did not put next to each other would
-    /// send the device to the wrong place, which is why `read_at`'s own comment
-    /// is about `dma_safe` and why the bounce below is a fixed 2 KiB stack
-    /// buffer. Answering `PAGE_SIZE` keeps the contract the kernel was written
-    /// against: one call, one page, one transfer.
-    ///
-    /// What a wider answer would need, and it is not driver-local: the bounce
-    /// would have to be **physically contiguous** frames (`mm::alloc_frames`
-    /// gives a run in one order), so one descriptor covers it and the device
-    /// really does one transfer. That is the change `docs/notes/` §10.5 names as
-    /// the prerequisite for this disk to join the wide path.
+    /// A descriptor carries a single physical address, and `HalImpl::share`
+    /// answers the crate with `virt_to_phys` - a subtraction against the direct
+    /// map. So what a wide buffer needs is not contiguity in the abstract but
+    /// membership of the direct map, and a kernel buffer is in it by
+    /// construction: the direct map is affine, so a range of it is one physical
+    /// run, and the heap hands every allocation past the slab's largest class out
+    /// as a contiguous frame block (`mm::heap`'s `alloc_pages`) - which is what
+    /// `vfs/ext4/cache.rs`'s run scratch is. §10.5 first named a driver-owned
+    /// *contiguous bounce* as the prerequisite for this disk; the scratch and the
+    /// walk [`Self::reaches`] makes showed the prerequisite was already met, and a
+    /// bounce would have copied every read of the busiest disk for nothing.
     fn max_transfer(&self) -> usize {
-        crate::blk::PAGE_SIZE
+        super::BLK_MAX_TRANSFER
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) {
@@ -146,7 +156,7 @@ impl BlockDev for VirtioBlk {
             "virtio-blk read of {count} sectors at {first} runs past the {}-sector device",
             self.sectors
         );
-        if !Self::dma_safe(buf.as_ptr()) {
+        if !Self::reaches(buf) {
             self.read_at_bounced(offset, buf);
             return;
         }
@@ -159,7 +169,7 @@ impl BlockDev for VirtioBlk {
             "virtio-blk write {offset:#x}+{} breaks the sector contract",
             buf.len()
         );
-        if !Self::dma_safe(buf.as_ptr()) {
+        if !Self::reaches(buf) {
             self.write_at_bounced(offset, buf);
             return;
         }

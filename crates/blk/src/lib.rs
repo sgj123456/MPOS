@@ -168,6 +168,47 @@ pub trait BlockDev: Send + Sync {
     }
 }
 
+/// Whether `va..va + len` is a **direct-map run**: one range of the machine's
+/// direct map, which is the condition a driver has to meet before it hands a
+/// whole buffer to its transport as a single descriptor.
+///
+/// The virtio transports are the caller, and the reason is theirs: the crate
+/// describes a request's data with one descriptor per buffer slice and one
+/// physical address per descriptor, and this kernel's `Hal::share` answers that
+/// address with `va - hhdm` - a subtraction. So the buffer such a driver may
+/// hand over whole is not merely "contiguous": every page of it has to be the
+/// page the direct map puts at that address, or the subtraction points the
+/// device at something else entirely.
+///
+/// That is a fact about the active page tables, so a walk answers it and a
+/// pointer comparison cannot: `ptr >= hhdm_offset()` accepts a kernel-image or
+/// MMIO-window address, which lives in the kernel half but *not* at the
+/// direct-map offset. `translate` is the machine's own walk - the physical
+/// address a page maps to and whether it is user-accessible - or `None` when
+/// the page is not mapped at all. A user-accessible page is refused even when it
+/// happens to translate to the right run: userland may write it while the device
+/// does, which no caller of [`BlockDev::read_at`] promises against.
+///
+/// An empty range is trivially one, which is what the vacuous answer should be:
+/// it is the transport's own business to refuse a zero-length request.
+pub fn direct_map_run(
+    hhdm: usize,
+    va: usize,
+    len: usize,
+    mut translate: impl FnMut(usize) -> Option<(usize, bool)>,
+) -> bool {
+    let end = va.saturating_add(len);
+    let mut page = va & !(PAGE_SIZE - 1);
+    while page < end {
+        match translate(page) {
+            Some((phys, false)) if page.checked_sub(hhdm) == Some(phys) => {}
+            _ => return false,
+        }
+        page = page.saturating_add(PAGE_SIZE);
+    }
+    true
+}
+
 /// Reads and writes counted, per disk.
 ///
 /// §10.5's instrument needs one number the machine can answer: *how many
@@ -382,5 +423,75 @@ mod tests {
         let win = part::Window::new(counted.clone(), 8, 16);
         win.read_at(0, &mut [0u8; 512]);
         assert_eq!(counted.reads(), 1, "the window's read reached the disk");
+    }
+
+    /// The direct-map run test, in the shape the virtio transports use it: a
+    /// page table that is *only* the direct map answers yes for any range, and
+    /// the walk reads every page of it rather than the first.
+    #[test]
+    fn a_direct_map_range_is_one_run_the_device_can_be_handed() {
+        const HHDM: usize = 0xffff_8000_0000_0000;
+        // The identity the direct map is: every page maps to itself minus the
+        // offset. Counted, so "it read the whole buffer" is an assertion and
+        // not a hope.
+        let walked = core::cell::Cell::new(0usize);
+        let direct = |va: usize| {
+            walked.set(walked.get() + 1);
+            va.checked_sub(HHDM).map(|phys| (phys, false))
+        };
+
+        assert!(direct_map_run(HHDM, HHDM, 512, direct));
+        assert_eq!(walked.get(), 1, "a 512-byte buffer is one page");
+
+        // Four pages, starting mid-page: the walk covers page boundaries from
+        // the buffer's own first page, and the offset inside it does not change
+        // which pages those are.
+        walked.set(0);
+        assert!(direct_map_run(
+            HHDM,
+            HHDM + 3 * PAGE_SIZE + 100,
+            4 * PAGE_SIZE,
+            direct
+        ));
+        assert_eq!(
+            walked.get(),
+            5,
+            "the pages the range touches, not its length"
+        );
+
+        assert!(direct_map_run(HHDM, HHDM, 0, |_| unreachable!()));
+    }
+
+    /// ...and each of the three ways a range can fail, because each is a real
+    /// caller: a kernel-half mapping that is *not* the direct map (the address
+    /// the old `ptr >= hhdm_offset()` test accepted), a page userland can write,
+    /// and a hole. The last one is why the walk may not stop at the first page.
+    #[test]
+    fn a_range_that_is_not_the_direct_map_is_refused() {
+        const HHDM: usize = 0xffff_8000_0000_0000;
+        let direct = |va: usize| va.checked_sub(HHDM).map(|phys| (phys, false));
+
+        // An MMIO window or the kernel image: mapped in the kernel half, above
+        // the offset, and at a physical address the subtraction would get wrong.
+        let elsewhere = HHDM + 2 * PAGE_SIZE;
+        assert!(elsewhere >= HHDM, "the old test called this DMA-safe");
+        assert!(!direct_map_run(HHDM, elsewhere, 512, |_| Some((
+            0x4000_0000,
+            false
+        ))));
+
+        // A user page: reachable, right run, and refused - userland may write it
+        // while the device does.
+        assert!(!direct_map_run(HHDM, HHDM, 512, |_| Some((0, true))));
+
+        // The hole in the *last* page of a four-page buffer: the first three
+        // answer, and the fourth must still be read.
+        assert!(!direct_map_run(HHDM, HHDM, 4 * PAGE_SIZE, |va| {
+            if va == HHDM + 3 * PAGE_SIZE {
+                None
+            } else {
+                direct(va)
+            }
+        }));
     }
 }

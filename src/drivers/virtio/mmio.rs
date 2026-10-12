@@ -68,12 +68,38 @@ pub struct MmioBlk {
     sectors: u64,
 }
 
+/// Refuse a buffer this transport cannot be handed whole, naming it.
+///
+/// The PCI twin stages such a buffer through its own bounce, because the syscalls
+/// there hand user pointers down; nothing on this machine reaches a block device
+/// that way, so the honest answer is a named panic rather than a request to an
+/// address the crate computes by subtraction. It is also the answer this
+/// transport already gave, one layer down and with less to read: `mm::virt_to_phys`
+/// asserts that the address it was given came out of the direct map, and this says
+/// the same thing about the whole buffer instead of its first byte.
+fn assert_reachable(buf: &[u8]) {
+    assert!(
+        super::device_reaches(buf),
+        "virtio-blk over MMIO was handed a {}-byte buffer the device cannot reach as one run",
+        buf.len()
+    );
+}
+
 impl BlockDev for MmioBlk {
     fn capacity_sectors(&self) -> u64 {
         self.sectors
     }
 
+    /// The same width the PCI transport answers, and for the same reason: the
+    /// crate's one-descriptor-per-buffer shape belongs to the crate and not to
+    /// the bus, so the limit is one answer for both transports
+    /// ([`super::BLK_MAX_TRANSFER`]).
+    fn max_transfer(&self) -> usize {
+        super::BLK_MAX_TRANSFER
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) {
+        assert_reachable(buf);
         critical_section::with(|cs| {
             let mut device = self.device.borrow(cs).borrow_mut();
             // A read error means the transport did not complete the request and a
@@ -86,6 +112,7 @@ impl BlockDev for MmioBlk {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) {
+        assert_reachable(buf);
         critical_section::with(|cs| {
             let mut device = self.device.borrow(cs).borrow_mut();
             device

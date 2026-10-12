@@ -414,7 +414,7 @@ only the read side is being tuned.
 |---|---|---|
 | Set-associative cache with victim selection | `vfs/ext4/cache.rs` | **done** |
 | A **demand run** past the block being asked for, in one device call | `vfs/ext4/cache.rs`, `crates/blk`, `drivers/ahci.rs` | **done, measured** (below) |
-| virtio-blk's half of the same: a physically-contiguous bounce, then a wide `max_transfer` | `drivers/virtio/blk.rs` | not done — named below |
+| virtio-blk's half of the same: a wide `max_transfer` behind a reachability test that proves it | `drivers/virtio/{blk,mmio}.rs`, `crates/blk` | **done, measured** (below; the first machine's own figure is named) |
 | virtio-blk interrupt-driven completions and multi-request pipelining | `drivers/virtio/blk.rs` | not done |
 | A SATA probe that ends in an answer instead of a budget | `drivers/ahci.rs`, `crates/ahci` | **done, measured** |
 
@@ -677,6 +677,30 @@ count is for):
 | `smallcold` — the fitting file's cold pass | **1024** | **65** |
 | `warm` — the fitting file's second pass | 0 | 0 |
 
+**…and the figure was not reproducible from the commit that recorded it (found
+2026-10-12, while extending the same width to the other transport).** The change above
+landed in `3be89aa`, whose message and this section both say `AhciDisk` answers its
+`MAX_TRANSFER` — and the committed tree does not: `impl BlockDev for AhciDisk` carries no
+`max_transfer` at all, so the SATA disk answered the page default and the measured
+filesystem's run width collapsed back to one block. The *wrappers*' forwarding landed
+(`Window`, `Counted`, both host-pinned); the *driver's* override did not, and the first gate
+run afterwards is therefore the counterfactual rather than a confirmation: x86_64
+`=== SUMMARY pass=168 fail=1`, `=== FAIL t-diskbench exit=1`, with
+`FAIL: the cold pass reached the device for the file's blocks, in runs`,
+`FAIL: and in runs of at least eight blocks each` and
+`FAIL: and its blocks came off the device in runs, because they fit the cache only now`, and
+the instrument's own line reading `DISKSTAT sda cold=16387 warm=0 smallcold=1024` — the
+"before" column of the table above, exactly. The override is restored in `20697b7` — one
+method answering `MAX_TRANSFER` — and `t-diskbench`'s three run claims are its pin: red
+without it, green with it, on both machines. The same experiment had been run *deliberately*
+as that change's own counterfactual and reverted; what the committed tree showed was the same
+number arriving on a tree where nobody had done it. The lesson is the one this file's trap
+list keeps meeting in a new shape — a number written down is a claim about the tree that
+*made* it, and `3be89aa`'s own "`pass=169 fail=0`" described a working copy whose `ahci.rs`
+hunk never reached the commit, so the commit and its record disagreed for a day while nothing
+in the tree could tell them apart. `cargo xtask test`, run on the committed tree, is what
+told them apart.
+
 **The first run of this change measured nothing at all, and the reason is the
 lesson worth keeping: a wrapper is a driver to its callers.** The chain a mounted
 filesystem sees is `ext4 → Window → Counted → AhciDisk`. `Window` forwarded
@@ -697,14 +721,79 @@ run happened at all and that no block was read twice. The counterfactual is the
 claim's own proof: with `AhciDisk::max_transfer` put back to the page default for
 one run, `cold` returns to **16387** and all three run claims fail.
 
-What this does **not** do, named: **the root disk (`vda`) still reads one block per
-call.** The crate describes a request's data with one descriptor per *buffer*, and
-a descriptor carries a single physical address — so a wide buffer there has to be
-**physically contiguous**, which a kernel `Vec` of 32 pages is not. `VirtioBlk::max_transfer`
-therefore answers `PAGE_SIZE` and says why. A contiguous multi-frame bounce
-(`mm::alloc_frames`, one order) is what would put that disk on the wide path, and
-it is a driver change with its own measurement — virtio-blk's own `Counted`
-counter would show it.
+**The root disk joined it (2026-10-12) — and the prerequisite this section first named for
+it was already met.** An earlier draft of this entry said the root disk (`vda`) still read
+one block per call and that the fix was a **physically-contiguous multi-frame bounce**,
+because "the crate describes a request's data with one descriptor per *buffer*, and a
+descriptor carries a single physical address — so a wide buffer there has to be physically
+contiguous, which a kernel `Vec` of 32 pages is not". Reading the crate and this kernel said
+otherwise, twice over, and both are checkable in-tree:
+
+* **The crate does not split a wide call.** `VirtIOBlk::read_blocks` is
+  `queue.add_notify_wait_pop(&[req.as_bytes()], &mut [buf, resp.as_mut_bytes()], …)`, and each
+  slice element becomes exactly **one** descriptor (`queue.rs`'s `InputOutputIter` →
+  `Descriptor::set_buf` → `Hal::share`). So the open question §10.5 left here — "whether the
+  crate's queue splits that by `seg_max` internally" — is answered no: one call is one
+  request is one transfer, and `Counted`'s call count is not flattered by a wide buffer.
+* **A kernel `Vec` of 32 pages *is* contiguous here.** `mm::heap`'s slab sends every
+  allocation past its largest class (`class_of` → `MAX_CLASS`, 2 KiB) to `alloc_large` →
+  `alloc_pages(order)` — a contiguous frame block, one order, addressed at `phys_to_virt`.
+  The run scratch `vfs/ext4/cache.rs` reads into is a 64 KiB `Vec`, i.e. exactly that.
+* **And what the device actually needs is weaker than contiguity — it is the direct map.**
+  `HalImpl::share` answers with `mm::virt_to_phys(ptr)`, a *subtraction* from the hhdm
+  offset. The direct map is affine, so any VA range inside it *is* one physical run with
+  the right base address. A bounce would therefore have copied every read of the busiest
+  disk — the first machine's root — to satisfy a condition this kernel's memory already
+  satisfies.
+
+So the change is the width plus the test that says when it holds, and not a bounce:
+`crates/blk::direct_map_run` walks the buffer's pages through the machine's own page tables
+(`hal::translate`) and answers true only when each page maps to *its own* address minus the
+offset and is not user-accessible; `src/drivers/virtio/mod.rs::device_reaches` is that test
+against this kernel's tables, and both transports ask it before handing a buffer down.
+`BLK_MAX_TRANSFER` (32 pages = 128 KiB, the SATA disk's own figure, so the two disks a
+machine can have answer one number) is what `max_transfer` now returns on both. The pointer
+test it replaced was `ptr >= hhdm_offset()`, which is *necessary and not sufficient*: an MMIO
+window or the kernel image is mapped in the kernel half, above the offset, and not *at* it —
+so a wide buffer there would have been handed to the device at an address computed from the
+wrong thing — a page's worth of it today, 128 KiB of it on the wide path. The PCI
+transport keeps its 2 KiB stack bounce for the callers that need it (the syscalls hand user
+pointers down; a kernel stack is itself a legal single descriptor), and the MMIO transport —
+which has no bounce and never had a test at all — now refuses such a buffer by name instead
+of panicking one layer down in `virt_to_phys`'s assert.
+
+**Where it is measured, and where it is not.** A sweep's `vda` is not the same disk on the
+two machines, and that decides the pins. The first machine's sweep boots QEMU's virtual-FAT
+ESP (`qemu.rs`'s `Boot::Esp`): a read-only VFAT image, mounted by nothing, read three times
+at boot by `find_filesystem` — so the PCI transport's wide path has **no counter in its own
+sweep**, and its own figure is a named gap (the behaviour is live under `cargo xtask run`,
+whose root is the installed ext4 image on `vda`; what is missing is a boot that counts it).
+The second machine's sweep boots the sweep medium's ext4 root on virtio-**MMIO**, read by
+every `exec` — and `t-diskbench` already reads it in the pass that lays the fixture:
+`/dev-sda-fs.img` is a *file on that root*, so copying it to `/dev/sda` is a cold sequential
+pass over the boot disk. Nothing new is read for the measurement; the counter is read around
+the copy, and the figure comes out on a second line (`DISKSTAT vda bootcold=N bootblocks=M`),
+reported by `xtask` beside the first.
+
+| instrument | with the page default (the counterfactual) | with `BLK_MAX_TRANSFER` |
+|---|---|---|
+| `bootcold` — the boot disk's pass over the fixture file, 21504 blocks of which 17420 reached the device | **17420** (one call per block fetched) | **1093** |
+| `cold` / `smallcold` / `warm` — the SATA disk's three passes, which this change does not touch | 1027 / 65 / 0 | 1027 / 65 / 0 |
+
+The two `bootcold` figures are each other's check: at one block per call the pass costs one
+call per block it *fetched* (17420 of 21504 — the rest of an 84 MiB file was still in the 8 MiB
+cache when the copy began), and at 16 blocks per call the same 17420 blocks cost
+`17420/16 + 4` metadata reads = **1093**, which is what the wide run measured. Its claims are
+the cold pass's shape: `0 < bootcold < bootblocks`, and the discriminator, `bootcold <=
+bootblocks/8`. The counterfactual run (`BLK_MAX_TRANSFER` put back to `PAGE_SIZE`, aarch64
+`=== SUMMARY pass=177 fail=1`) is what says the second claim is the one that decides: it reads
+`FAIL: and in runs of at least eight blocks each on vda` beside a *passing* `in runs` claim,
+because one call per block still covers fewer calls than the file has blocks — a wide run is
+what the tight claim asks for, and the loose one only says a cache was involved. The content
+half is not this program's: the fixture it copies *off* the boot disk is mounted on
+`/dev/sda` and its files' bytes are checked against their generator (`t-ext4-mount`, and this
+program's own reads), so a wide read that returned the wrong run would fail on content rather
+than on a count.
 
 
 ### 10.6 Serial Output — **DONE**

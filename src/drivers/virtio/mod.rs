@@ -105,6 +105,50 @@ pub fn register_block_disk(dev: alloc::sync::Arc<dyn crate::blk::BlockDev>) {
     );
 }
 
+/// The width both virtio block transports move in one transfer, whichever bus
+/// carries them.
+///
+/// One answer rather than two, because the limit is the *crate's* and not the
+/// transport's: `VirtIOBlk::read_blocks` describes a request's data with one
+/// descriptor per buffer slice and never splits it further, so the buffer it is
+/// handed is one request and one transfer however the machine reaches the
+/// device. What bounds it, then, is what the callers will ask for - and the
+/// figure matches the SATA disk's (`src/drivers/ahci.rs`'s `MAX_TRANSFER`, the
+/// same 32 pages) so the two disks a machine can have answer one number. The
+/// tighter bound at the caller is `vfs/ext4/cache.rs`'s `RUN_BLOCKS` (16 blocks
+/// = 64 KiB), which is what decides how wide a run a mount actually asks for.
+///
+/// Answering this at all is what §10.5's demand run needed: `BlockDev::max_transfer`
+/// was the page default, so the cache asked for one block per call on the root
+/// disk while it asked for sixteen on the SATA one.
+pub(crate) const BLK_MAX_TRANSFER: usize = 32 * crate::blk::PAGE_SIZE;
+
+/// Whether the device can be handed the whole of `buf` as one descriptor.
+///
+/// This is [`crate::blk::direct_map_run`] against the machine's own page tables
+/// and the crate's own assumption, and the assumption is the reason it is a walk
+/// rather than a comparison: [`HalImpl`]'s `share` answers the crate with
+/// `mm::virt_to_phys`, which *subtracts* the direct-map offset. A buffer whose
+/// pages are not at their own direct-map addresses would therefore be handed to
+/// the device at an address computed from the wrong thing - and `ptr >= hhdm`
+/// accepts exactly such a buffer (a kernel-image or MMIO-window one), which is
+/// what the pointer test this replaced was.
+///
+/// A driver calls this before passing a buffer down, and [`blk`]/[`mmio`] do:
+/// the fast path is taken exactly when it is true, and a driver that cannot
+/// answer true has to stage the bytes somewhere it can.
+pub(crate) fn device_reaches(buf: &[u8]) -> bool {
+    crate::blk::direct_map_run(
+        crate::mm::hhdm_offset(),
+        buf.as_ptr() as usize,
+        buf.len(),
+        |va| {
+            crate::hal::translate(va)
+                .map(|(phys, flags)| (phys, flags.contains(crate::mm::MapFlags::USER)))
+        },
+    )
+}
+
 /// The name a virtio function's driver has in `/sys`, and the one `lspci -k`
 /// prints as "Kernel driver in use".
 ///

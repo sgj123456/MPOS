@@ -1236,6 +1236,13 @@ fn report_diskstat(log: &str, diskstat: &str) -> Result<()> {
     for (disk, cold, warm) in readings {
         println!("  {disk}: cold={cold} warm={warm}");
     }
+    // §10.5's other half, where the machine could be asked it: the pass that read
+    // the fixture *file* off the disk the root lives on. A machine whose root is
+    // the boot archive leaves no such line, and `t-diskbench` says which case it
+    // ran rather than passing silently.
+    for (disk, calls, blocks) in sweep::bootdisk_readings(log) {
+        println!("  {disk} (boot disk): bootcold={calls} of {blocks} blocks");
+    }
     Ok(())
 }
 

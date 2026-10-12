@@ -379,6 +379,50 @@ pub fn diskstat_readings(log: &str) -> Vec<(&str, u64, u64)> {
     out
 }
 
+/// The boot disk's half of the same instrument: `DISKSTAT <disk> bootcold=N
+/// bootblocks=M`, the pass `t-diskbench` makes over the root filesystem's disk
+/// when it lays the fixture.
+///
+/// A second reader rather than a wider one, because the two lines answer
+/// different questions about (usually) different disks and their keys mean
+/// different things: `cold`/`warm` are the fixture *filesystem*'s passes on the
+/// SATA disk, and `bootcold`/`bootblocks` are the calls and the blocks of the
+/// pass that copied the fixture *file* off the disk the root lives on. One
+/// reader that insisted on both would drop either line. The rules are the other
+/// one's: the last word for a disk wins (a wire can wrap it), and a malformed
+/// line is dropped rather than ending the report.
+pub fn bootdisk_readings(log: &str) -> Vec<(&str, u64, u64)> {
+    let mut out: Vec<(&str, u64, u64)> = Vec::new();
+    for line in log.lines() {
+        let Some(rest) = line.trim_end().strip_prefix("DISKSTAT ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let Some(disk) = words.next() else { continue };
+        let after_disk: Vec<&str> = words.collect();
+        let Some(calls) = after_disk
+            .iter()
+            .find_map(|w| w.strip_prefix("bootcold="))
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some(blocks) = after_disk
+            .iter()
+            .find_map(|w| w.strip_prefix("bootblocks="))
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if let Some(existing) = out.iter_mut().find(|(d, _, _)| *d == disk) {
+            *existing = (disk, calls, blocks);
+        } else {
+            out.push((disk, calls, blocks));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,6 +706,25 @@ DISKSTAT vda cold=2 warm=0
         assert_eq!(readings[0], ("sda", 16384, 7));
         assert_eq!(readings[1], ("vda", 2, 0));
         assert!(diskstat_readings("no instrument here").is_empty());
+    }
+
+    /// The boot-disk half of the same reader: its own keys, the same
+    /// last-word-per-disk rule, and the same refusal to die on a stray byte. The
+    /// two shapes must not answer for each other - a reader that accepted either
+    /// line would report the fixture filesystem's numbers as the boot disk's.
+    #[test]
+    fn the_boot_disk_reader_keeps_the_last_word_per_disk() {
+        let log = "\
+=== RUN t-diskbench
+DISKSTAT sda cold=16384 warm=0
+DISKSTAT vda bootcold=1344 bootblocks=21504
+=== PASS t-diskbench
+DISKSTAT vda bootcold=1350 bootblocks=21504
+=== SUMMARY pass=1 fail=0
+";
+        assert_eq!(bootdisk_readings(log), vec![("vda", 1350, 21504)]);
+        assert!(bootdisk_readings("DISKSTAT sda cold=1 warm=0").is_empty());
+        assert!(bootdisk_readings("no instrument here").is_empty());
     }
 
     /// §10.4's reader: the instrument's line parses out of a log that carries

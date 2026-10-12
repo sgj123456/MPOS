@@ -10,8 +10,11 @@
 //!
 //! # What it measures, and through which door
 //!
-//! Two files, because the instrument asks two questions, and each in its own
-//! pass with the kernel's per-disk device-access counters read before and after.
+//! Two questions about one disk and a third about another, each in its own pass
+//! with the kernel's per-disk device-access counters read before and after. The
+//! fixture filesystem's reads are the AHCI disk's (`/dev/sda`); the fixture
+//! *file*, read out of the machine's own root, is the boot disk's cold pass, and
+//! the boot disk is the other transport §10.5 has to reach.
 //! The counts are the measurement, not a clock: they are the same on every run,
 //! under TCG or KVM, which is what makes them gate-worthy (`ext4/cache.rs`'s
 //! `Counting` mock established the rule for the host suite; this applies it to
@@ -36,12 +39,21 @@
 //!   measured reason**: the first draft asked this of the 64 MiB file, whose
 //!   answer is arithmetically forced to be "no" — eight times the cache cannot
 //!   be held by it — and the gate showed exactly that (`cold=16387 warm=16384`);
-//! * the numbers are printed as one
-//!   `DISKSTAT <disk> cold=N warm=M smallcold=K` line the sweep harness greps
-//!   out of the serial log and reports beside the verdict — the reader-side half
-//!   of "a performance change ships with its numbers" (rule 6), automated
-//!   rather than trusted to whoever ran the gate. `warm` is the fitting file's
-//!   second pass, the one the cache policy is judged by.
+//! * the **boot disk** is the third question, and it is asked of a pass this
+//!   program was going to make anyway: the fixture it lays is a file on the
+//!   machine's root, so reading it out is a cold sequential pass over the root
+//!   filesystem's disk and over nothing else. The claims are the cold one's
+//!   shape (`bootcold < bootblocks`, and wide enough that a per-block device
+//!   fails them); where the root is the boot *archive* rather than a disk — the
+//!   first machine's test boot — there is no such pass, and the run says which
+//!   case it was instead of claiming nothing;
+//! * the numbers are printed as
+//!   `DISKSTAT <disk> cold=N warm=M smallcold=K` - and, on the machine whose
+//!   root is a disk, `DISKSTAT <disk> bootcold=N bootblocks=M` beside it - lines
+//!   the sweep harness greps out of the serial log and reports beside the verdict
+//!   — the reader-side half of "a performance change ships with its numbers"
+//!   (rule 6), automated rather than trusted to whoever ran the gate. `warm` is
+//!   the fitting file's second pass, the one the cache policy is judged by.
 //!
 //! The counters arrive through `uname(2)`: on a boot armed for this instrument
 //! (`xtask test`, whose command line carries `mpos.diskstat` exactly when this
@@ -151,10 +163,62 @@ fn dev_of(path: &str) -> Option<u64> {
 }
 
 /// The named disk's read counter, from the rows the door reported.
-fn sda_reads(rows: &[(String, u64, u64)]) -> Option<u64> {
+fn disk_reads(rows: &[(String, u64, u64)], disk: &str) -> Option<u64> {
     rows.iter()
-        .find(|(name, _, _)| name == "sda")
+        .find(|(name, _, _)| name == disk)
         .map(|(_, r, _)| *r)
+}
+
+/// The SATA disk's read counter - the fixture's disk, and the one the cold/warm
+/// claims below are about.
+fn sda_reads(rows: &[(String, u64, u64)]) -> Option<u64> {
+    disk_reads(rows, "sda")
+}
+
+/// The major `statx` reports for the filesystem a path is on: the half of
+/// `st_dev` that tells one *driver's* disk from another's (254 is virtio's, 8 is
+/// SCSI's, and an anonymous mount is numbered 0).
+fn dev_major(path: &str) -> Option<u32> {
+    statx(
+        CWD,
+        path,
+        rustix::fs::AtFlags::empty(),
+        StatxFlags::BASIC_STATS,
+    )
+    .ok()
+    .map(|st| st.stx_dev_major)
+}
+
+/// The major a device *node* names - a block device's own numbers, which every
+/// filesystem mounted from it reports as its `st_dev`.
+fn node_major(path: &str) -> Option<u32> {
+    statx(
+        CWD,
+        path,
+        rustix::fs::AtFlags::empty(),
+        StatxFlags::BASIC_STATS,
+    )
+    .ok()
+    .map(|st| st.stx_rdev_major)
+}
+
+/// The disk the root filesystem is on, named the way the counters name it - or
+/// `None` when the root is not on a counted disk at all.
+///
+/// A block device's node carries the drive's numbers in `st_rdev` and the
+/// filesystem mounted from it reports the partition's numbers as `st_dev`, which
+/// share the disk's major - so the two majors meeting is the answer. The first
+/// machine's root is the boot *archive*: an anonymous mount is numbered major 0
+/// (`vfs::mount`'s `next_anon_dev`, which counts a minor up from 1 under a zero
+/// major), and no disk answers that, so this answers `None` rather than a guess.
+fn boot_disk(rows: &[(String, u64, u64)]) -> Option<String> {
+    let major = dev_major("/")?;
+    if major == 0 {
+        return None;
+    }
+    rows.iter()
+        .map(|(name, _, _)| name.clone())
+        .find(|name| node_major(&format!("/dev/{name}")) == Some(major))
 }
 
 fn main() {
@@ -184,6 +248,21 @@ fn main() {
         None => r.finish(),
     };
 
+    // ---- Which disk the root filesystem is on ----
+    //
+    // §10.5's other half, and the reason this program measures two disks: the
+    // SATA disk's run is the AHCI driver's, and the *boot* disk is the one the
+    // same change had to reach, because its transport is the other one. It is
+    // countable here because the fixture this program lays is a file on the
+    // machine's own root: reading it out is a cold sequential pass over the root
+    // filesystem's disk, and it is the same pass either way - nothing is read for
+    // the measurement's sake. Where the root is the boot archive there is no such
+    // disk, and the claims below say which case they ran rather than passing
+    // vacuously.
+    let boot = boot_disk(&rows);
+    let mut boot_run: Option<u64> = None;
+    let mut boot_blocks = 0u64;
+
     // ---- The filesystem is really under the path ----
     let root_dev = dev_of("/");
     let pat_dev = dev_of(PATTERN);
@@ -194,7 +273,18 @@ fn main() {
         // sweep laid; the copy is the same block-door one that program makes and
         // the loop is theirs to share (`mpos_user_tests::lay_ext4_fixture`).
         let _ = mkdirat(CWD, MNT, Mode::from_raw_mode(0o755));
+        // The boot disk's counter, read around the copy and around nothing else:
+        // the copy reads the fixture whole and sequentially, so what moves the
+        // counter between these two reads is that read.
+        let before = boot
+            .as_deref()
+            .and_then(|name| disk_reads(&io_counters().unwrap_or_default(), name));
         let copied = mpos_user_tests::lay_ext4_fixture(FIXTURE, DISK);
+        let after = boot
+            .as_deref()
+            .and_then(|name| disk_reads(&io_counters().unwrap_or_default(), name));
+        boot_run = before.zip(after).map(|(b, a)| a.saturating_sub(b));
+        boot_blocks = copied.as_ref().map(|n| n / BLOCK).unwrap_or(0);
         r.check(
             &format!("the fixture copied to the disk ({copied:?})"),
             copied.is_ok_and(|bytes| bytes > 0),
@@ -206,6 +296,28 @@ fn main() {
         }
     } else {
         r.check("the ext4 mount t-ext4-mount left is visible here", true);
+    }
+
+    // ---- The boot disk's pass: the same width, on the other transport ----
+    match (&boot, boot_run) {
+        (Some(name), Some(calls)) => {
+            r.check(
+                &format!("the {name} boot disk read the fixture's blocks, in runs"),
+                calls > 0 && calls < boot_blocks,
+            );
+            r.check(
+                &format!("and in runs of at least eight blocks each on {name}"),
+                calls <= boot_blocks / 8,
+            );
+        }
+        (Some(name), None) => println!(
+            "skip: an earlier program left the ext4 mount standing, so this run has no cold pass \
+             over the {name} boot disk to count"
+        ),
+        (None, _) => println!(
+            "skip: this machine's root is its boot archive, not a disk - the boot-disk run claim \
+             is the machine whose root is on one"
+        ),
     }
 
     // A mount's own metadata reads move the counter, so measure after the tree
@@ -340,10 +452,13 @@ fn main() {
         warm == 0,
     );
 
-    // The numbers themselves, one line the sweep harness greps. This is the
+    // The numbers themselves, the lines the sweep harness greps. This is the
     // instrument's output, not a verdict: the claims above are what a red run
-    // means, and the line is what a green run *measured*.
+    // means, and the lines are what a green run *measured*.
     println!("DISKSTAT sda cold={cold} warm={warm} smallcold={small_cold}");
+    if let (Some(name), Some(calls)) = (&boot, boot_run) {
+        println!("DISKSTAT {name} bootcold={calls} bootblocks={boot_blocks}");
+    }
     drop(fd);
     if !mounted_here {
         let _ = unmount(MNT, UnmountFlags::empty());
