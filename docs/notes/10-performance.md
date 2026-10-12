@@ -373,20 +373,34 @@ completion event to wait on.
 
 | 512 UDP datagrams through the eth0 seam | before (fresh `Vec` per frame) | after (pool serving slots) |
 |---|---|---|
-| datagrams/s, x86_64 TCG | *(owed: one `cargo xtask test` run with the pool reverted — `NETSTAT` prints it)* | `12213` over the whole run's window, `13515` over the first burst's |
-| datagrams/s, aarch64 TCG | *(owed, same run)* | `19807` over the whole run's window, `22699` over the first burst's |
-| `pool=` word | `0:<n>` — every frame a miss | **`1036:0`** (x86_64) and **`1098:0`** (aarch64) — every take of the run was a hit, the counts being the two bursts' 1024 plus each machine's priming and ARP frames |
+| datagrams/s, x86_64 TCG | `12138` over the whole run's window, `13204` over the first burst's | `12213` and `11768` over the whole run's window on two runs, `13515` over the first burst's |
+| datagrams/s, aarch64 TCG | `20372` over the whole run's window, `22678` over the first burst's | `19807` and `19652` over the whole run's window on two runs, `22699` over the first burst's |
+| `pool=` word | `0:1036` (x86_64) and `0:1100` (aarch64) — every frame a miss | **`1036:0`** (x86_64) and **`1098:0`** (aarch64) — every take of the run was a hit, the counts being the two bursts' 1024 plus each machine's priming and ARP frames |
 
-The *after* column is measured (`cargo xtask test`, x86_64, `pass=166 fail=0`); the *before* one is
-still owed and needs the pool reverted for one run, because it is the only way to say what the
-per-frame allocation cost. What the *after* numbers do establish on their own: a full-MTU datagram
-is served from a slot every time (no miss in 1036 takes), and the burst is one frame per datagram
-(the exactness pair above), which is the rule the pool exists to keep.
+**The rate pair is measured now, and it says no** — which the plan allowed for
+("the numbers are allowed to say 'no'"). The *before* column is one `cargo xtask
+test` run per machine with the pool reverted to the pre-pool seam (a fresh `Vec`
+per frame, the patch reverted after the run); the *after* column is two green
+runs of the same command, and the two runs matter: the same machine reports
+`12213` and `11768` for identical code, a **3.9 %** spread, and the other
+`19807`/`19652`, 0.8 %. `12138` (x86_64) and `20372` (aarch64) sit *inside* the
+after column's own spread — on aarch64 the before figure is even the higher of
+the two. So the pool buys **no** throughput at this burst size: 512 frames' worth
+of 2 KiB allocations is a few hundred microseconds against a burst whose rate is
+set by smoltcp and the virtio ring, and the instrument cannot resolve a
+difference that small against its own jitter.
 
-The rate pair is **not yet measured**: the gate needs QEMU and sudo, and both
-figures come from operator runs of the same command (`cargo xtask test`, whose
-report prints the `self-test (netstat)` line this table quotes). The row says so
-rather than carrying a number from a different question.
+What the other two columns do establish, and what the change is actually worth:
+the steady path **never allocates** (1036 takes, 1036 hits, no miss on x86_64),
+and the allocation it replaces is bounded at **64 KiB resident** before the first
+frame exists rather than whatever a burst of a user's datagrams would ask for
+(§10's rule-4 discipline). The counterfactual comes free with the before run: with
+the pool reverted, `t-netstats`' warm-up claim — "a warmed pool serves a
+full-MTU frame from a slot" — **fails** (`pool=0:1036`, the first burst's hits
+unchanged), which is the pin doing its job; the rate keeps being printed either
+way, so the failing run still yields its number. Both figures come from operator
+runs of the same command (`cargo xtask test`, whose report prints the
+`self-test (netstat)` line this table quotes).
 
 ### 10.5 Filesystem and Block Read Path — **PARTIAL** (the verifiable one landed; the disk-backed instrument now stands too)
 
