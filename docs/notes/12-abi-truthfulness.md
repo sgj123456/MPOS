@@ -26,7 +26,8 @@ Two hard truths the audit surfaced, before any individual line:
 
 - **The board is not currently green.** `AGENTS.md` §3 records the working tree's in-flight tty
   read-path rewrite as red (`t-tty-vtime` hangs, `t-tty-eintr` fails two checks, `t-netlat` is a
-  load flake). That is a *newer* state than §11.1.12's "green", which described the last
+  load flake — the last of these pointed at the working copy's then-current `AGENTS.md`, which no
+  longer records it). That is a *newer* state than §11.1.12's "green", which described the last
   committed baseline (Step A). **Nothing in this phase is verifiable until the gate is green
   again**, so restoring it is task zero, ahead of B and C.
 - **Some of these are recorded as `Done` where they are not.** `docs/notes/`'s own table lists

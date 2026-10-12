@@ -65,7 +65,8 @@ dropping it.
 3. **One root-switch flow: the second machine gets an initramfs `/init`, like the first.** The
    kernel unpacks the archive and hands the machine to `/init` on both machines; the *script* mounts
    `/proc`, `/sys`, `/dev`, `root=` and pivots. That is Linux's own model, it is what
-   `docs/ARCHITECTURE.md` §4 and `AGENTS.md` §4 rule 1 require ("a kernel that assembles them first
+   `docs/ARCHITECTURE.md` §4 and `AGENTS.md` §3's kernel-space discipline require ("a kernel that
+   assembles them first
    leaves pieces the owner of the system cannot unmount"), and it deletes `check_disk_root`'s mount
    half and `switch_root` outright. The alternative - moving the pivot into the kernel for *both*
    machines - is the same line count with more risk: it re-implements the script's `root=`/
@@ -134,7 +135,8 @@ Each is one commit and green alone (AGENTS §3 rule 7). Only stage 0 is measurem
 
 The stage's whole point was that the second machine stops being the exception: the kernel unpacks
 `initramfs-aarch64/`, hands the machine to the script, and the *script* mounts `/dev/vda`, promotes
-it into `/` and `switch_root`s into the disk's own `/init` - the flow `AGENTS.md` §4 rule 1 and
+it into `/` and `switch_root`s into the disk's own `/init` - the flow `AGENTS.md` §3's kernel-space
+discipline and
 `docs/ARCHITECTURE.md` §4 require, and the one the first machine has always run. `check_disk_root`'s
 mount half became `steps::mount_disk_root` (called from `init` exactly where x86_64's `init_blk`
 calls it, with the wrapper deleted outright), `M7_ROOT_OK` stopped being a kernel marker, and the

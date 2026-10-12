@@ -255,7 +255,7 @@ generic parameter:
 
 The Linux register ABI (`user_regs_struct`/`user_pt_regs`, the signal frame, the syscall gate) stays
 in `arch/<arch>/`: it *is* the machine's register layout, and wrapping it in a neutral type would be
-the private dialect `AGENTS.md` §4 rule 3 forbids. "No leakage" means a port writes `arch/<arch>/`
+the private dialect `AGENTS.md` §3 rule 3 forbids. "No leakage" means a port writes `arch/<arch>/`
 and edits no shared file — not that a register frame becomes architecture-neutral.
 
 ### 14.5 Reading the paths in this document

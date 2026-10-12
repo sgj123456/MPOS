@@ -141,9 +141,10 @@ the semantics still incomplete are TCP's two record-only options, `SO_LINGER`'s 
 buffer sizes, `MADV_FREE`, MNT/PID/NET isolation, and the unsized-pty window divergence.
 
 Two of those "buffer sizes" are named down to the line, both found by `t-netstats`: a **blocking
-UDP send does not wait for the send buffer** (`EAGAIN` where Linux waits — no event exists for the
-device's TX completion to wait on; `docs/uapi/` 05-work-list §5.2). The MTU story that program also
-caught is a test-side lesson, not a gap: it lives with §10.4's measurement.
+UDP send does not wait for the send buffer** (`EAGAIN` where Linux waits) — the gap, its two tried
+shapes and their measurements are `docs/uapi/` §5.2's entry; it closes when the TX ring gets a
+completion wakeup. The MTU story that program also caught is a test-side lesson, not a gap: it
+lives with §10.4's measurement.
 
 ---
 

@@ -43,7 +43,7 @@ What deliberately does **not** live here is as much the point:
 
 - The Linux ABI's register layout is the machine's and stays in `arch/<arch>/`:
   `user_regs_struct`, the `sigcontext` field order, the `syscall`/`iretq` gate. Wrapping
-  it in a neutral type would be the private dialect AGENTS.md §4 rule 3 forbids. So "no
+  it in a neutral type would be the private dialect AGENTS.md §3 rule 3 forbids. So "no
   leakage" means a port writes `arch/<arch>/` and edits no shared file — not that a
   register frame becomes architecture-neutral (`arch/src/hal/mod.rs`).
 - The boot wiring, the device bring-up and the milestone checks are `src/board/<arch>.rs`
