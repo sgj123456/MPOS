@@ -415,7 +415,8 @@ only the read side is being tuned.
 | Set-associative cache with victim selection | `vfs/ext4/cache.rs` | **done** |
 | A **demand run** past the block being asked for, in one device call | `vfs/ext4/cache.rs`, `crates/blk`, `drivers/ahci.rs` | **done, measured** (below) |
 | virtio-blk's half of the same: a wide `max_transfer` behind a reachability test that proves it | `drivers/virtio/{blk,mmio}.rs`, `crates/blk` | **done, measured** (below; the first machine's own figure is named) |
-| virtio-blk interrupt-driven completions and multi-request pipelining | `drivers/virtio/blk.rs` | not done |
+| virtio-blk **interrupt-driven completions** — the mask a device call holds | `drivers/kunit.rs` | **measured, re-scoped** (below): the cost is the device's latency, µs–ms per call here, and only one of the two machines' clocks can see it |
+| virtio-blk **multi-request pipelining** | — | **dropped** (below): one call is already one transfer (`e228275`) and nothing above asks for two in flight |
 | A SATA probe that ends in an answer instead of a budget | `drivers/ahci.rs`, `crates/ahci` | **done, measured** |
 
 **The probe's cost, before and after.** Not a throughput change but the same
@@ -795,6 +796,64 @@ half is not this program's: the fixture it copies *off* the boot disk is mounted
 program's own reads), so a wide read that returned the wrong run would fail on content rather
 than on a count.
 
+
+**The last row, measured and then re-scoped (2026-10-12): what a device call masks,
+and which machine can see it.** `VirtIOBlk::read_dma` and `AhciDisk::read_at` both
+hold the port inside `critical_section::with`, and the crate's wait is
+`while !self.can_pop() { spin_loop(); }` — so for as long as a call takes, the machine
+runs nothing else and no timer fires. `src/drivers/kunit.rs`'s boot suite
+(`block.what_a_read_costs_the_clock`) measures that in the machine's own clock, on
+every registered disk, at `Phase::Arch`:
+
+| instrument | x86_64 (KVM) | aarch64 (TCG) |
+|---|---|---|
+| control — 12 ms of spinning, nothing masked | `3/3 ticks` | `3/3 ticks` |
+| the reachability walk over the 64 MiB buffer | `61 µs` | `711 µs` |
+| one 64 MiB read of `vda` (virtio) | `1 ms` (1 ms masked), `1/0 ticks` | `8 ms` (8 masked), **`2/2`** |
+| one 64 MiB read of `sda` (SATA) | `3 ms` (3 ms masked), `1/0` | `42 ms` (41 masked), **`11/10`** |
+
+Three findings, and the third is why the row moves rather than lands:
+
+* **The mask's size is the device's latency, and nothing else.** 64 MiB is the
+  largest single allocation the frame allocator has an order for (`MAX_ORDER`), so it
+  is the largest one call can be; QEMU answers it from the host's page cache in
+  1–42 ms. What the kernel *asks* for is far smaller: a filesystem run is 64 KiB in
+  one call, 1/1024 of that span — **~8 µs of mask on the first machine and ~41 µs on
+  the second**, against a scheduling quantum of 4 ms.
+* **A mask moves the tick count only past the second period it spans, and on one
+  machine it moves nothing at all.** The first draft of the case measured a perfect
+  `3/3` reading 4 MiB pieces (0.75 ms each): the PIT is periodic, so a masked window
+  *defers* a period — one interrupt arrives when the mask ends — and `m` periods
+  masked cost `m − 1` ticks. Then the aarch64 arm measured `11/10` across a 41 ms
+  mask, which is not noise but the machine's timer: `arch/x86_64/timer.rs`'s `tick`
+  is `TICKS.fetch_add(1)`, so a mask is *lost from the count for ever*, while
+  `arch/aarch64/timer.rs`'s adds the periods its own counter says have passed, so it
+  **catches up**. §7.3's "a deadline in ticks would never expire" is still true
+  *inside* the mask on both machines — no handler can run in there — but what the
+  mask leaves behind is machine-shaped, and the case asserts the loss where it can be
+  observed and prints the figures where it cannot.
+* **So the row is a structure change with no number behind it here.** The mask is
+  real and it is proportional to the *device's* latency: µs per filesystem read on
+  these machines, and seconds in the one place the wait is unbounded — §7.3's probe
+  on an empty controller, **28.412 s** in one mask, fixed there by ending the probe
+  early rather than by not masking. A machine whose device is slow (real silicon, or
+  a boot whose reads are not served from the host's cache) pays it in a unit a task
+  feels, which is what §10.6 fixed for the serial: ~5 ms a line, with a ring the
+  device interrupts. So the row's halves land differently. **Interrupt-driven
+  completions** are a structure change whose justification is the unbounded case and
+  whose pin is `drivers/kunit.rs`'s claim — dormant on these machines while every
+  call is under a tick period, and firing the day one is not. And **multi-request
+  pipelining is dropped**, not deferred: one call is already one transfer
+  (`e228275`), the filesystem above is synchronous, and readahead — the only caller
+  that would want two requests in flight — was re-scoped away in `9aa4f18` for the
+  same reason (it cannot move the count).
+
+The instrument is a boot suite and not a `t-` program for a reason the same work
+measured: a userland window around a block read is mostly the work *around* the
+device call — the devfs block window's allocation and zeroing, the copy out to the
+caller's buffer — and those parts are preemptible, so a sibling task runs during
+them. On a 32 MiB raw read that is 30–50 % of the window, the same order as the mask
+itself, and a window that has to beat its own confounds by a factor is not a pin.
 
 ### 10.6 Serial Output — **DONE**
 

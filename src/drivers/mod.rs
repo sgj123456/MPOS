@@ -29,6 +29,12 @@
 pub mod ahci;
 pub mod devices;
 pub mod drm;
+/// This module's suite for a test build: what a block device's read costs the
+/// rest of the machine, counted in the machine's own ticks. A child of the
+/// drivers so it reaches the block layer and the clock the way a driver does, and
+/// listed by the wiring layer's harness (`src/board/kunit.rs`).
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub mod kunit;
 /// PCI configuration space, and the snapshot of the bus behind it. On both
 /// machines now: the window is the device tree's ECAM when the firmware
 /// published no MCFG, and the port pair it falls back to is x86_64's alone

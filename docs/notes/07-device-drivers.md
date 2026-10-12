@@ -1024,6 +1024,19 @@ So two faults, one of them about the number:
    more than on silicon, which is the honest weakness of the shape and is the
    reason the budget is no longer the only bound.
 
+**What the mask leaves behind is the machine's.** Measured 2026-10-12 by
+`src/drivers/kunit.rs`'s `block.what_a_read_costs_the_clock` (written for §10.5's
+last row), and it sharpens the sentence above rather than correcting it: no handler
+can run *inside* a mask on either machine, so a deadline in ticks still cannot expire
+there — but what the count says *afterwards* differs. `arch/x86_64/timer.rs`'s `tick`
+is `TICKS.fetch_add(1)`, an interrupt count, so the periods a mask spans are lost from
+it for good; `arch/aarch64/timer.rs`'s adds the periods its own timer counter says
+have passed, so it **catches up**. Measured across a 41 ms mask (one 64 MiB read):
+**`11/10` ticks** on the second machine, where a pure interrupt count could have
+delivered at most one. A `busy_wait_ms` deadline in ticks is therefore still the wrong
+shape on both - and the *machine* to ask about what a stalled read cost the clock is
+the first one.
+
 Measured after, same wiring on an independent copy of the image: **28.412 s → 0.001 s**, and
 `t-ahci === PASS` on a machine that does have a disk, where a healthy command
 retires at try 0-2 (also measured), so the patience that is left is not being

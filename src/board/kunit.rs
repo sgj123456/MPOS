@@ -40,6 +40,9 @@ pub(crate) const SUITES: &[Suite] = &[
     mpos::vfs::kunit::SUITE,
     mpos::syscall::kunit::SUITE,
     mpos::syscall::kunit::IPC_SUITE,
+    // The block layer's, which needs the devices the boot step before this one
+    // registered (§10.5's last row is about what a read costs the machine).
+    mpos::drivers::kunit::SUITE,
     // The boot's own, and the last: the canary at the bottom of the boot stack,
     // which no subsystem's suite can carry because the check it drives is the
     // wiring layer's own (`src/board/report.rs`), and which wants to run once
