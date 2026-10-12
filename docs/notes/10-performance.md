@@ -614,6 +614,37 @@ With the instrument standing, the two deferred items keep their order: readahead
 pipelining (`drivers/virtio/blk.rs`) likewise — each still wants the other for
 its *best* number, but neither is blind any more.
 
+**Before either is written: readahead cannot move the count, and the reason is the
+transfer bound.** The sentence above says the number is "what the change would
+remove", so the change has to be checked against what the number *can* be. It
+cannot be moved by readahead, and the arithmetic is short. `cold=16387` is
+already `16384 + 3` — every block of the file once, plus three metadata reads —
+so a sequential pass has no read left to remove; readahead fetches blocks
+*earlier*, not fewer, and on a full pass the prefetch is consumed exactly once.
+And `Counted::read_at` counts **calls**, with `crates/blk`'s `PAGE_SIZE` (4096)
+doc'd as "the largest buffer `read_at`/`write_at` is handed in one call" — one
+ext4 block. So the count is `blocks + metadata` by construction, and the only
+thing that changes it is one device transfer moving **more than one block**:
+prefetch a run *and* hand it to the driver in a single call.
+
+That is available, and nearer than the trait's bound suggests: the bound is the
+block layer's own, not the drivers'. `src/drivers/ahci.rs` already moves up to
+`BOUNCE_PAGES * PAGE_SIZE` = **128 KiB in one command** — the bounce is a *list*
+of pages and the PRDT is a scatter-gather table, so non-contiguous pages need no
+contiguous run — and its own comment calls that "a bound on one command, not on a
+request". virtio-blk hands its whole buffer to the crate in one call
+(`request_read` → `add_notify_wait_pop(&[req], &mut [data, resp], …)`); whether
+the crate's queue splits that by `seg_max` internally is the one thing to check
+before the bound is raised, because if it splits, a wide call would stop being
+"one transfer" and the counter would start flattering the change.
+
+So the item is re-scoped rather than started: **a wider transfer** (ext4 fetching
+a contiguous run into the cache in one call, with the trait's bound raised to a
+size each driver really serves in one command) is what has an instrument, and it
+is a change to the block contract plus `vfs/ext4/cache.rs`'s fetch — not
+readahead alone. Recorded here so that the next reader does not implement
+readahead for a number it cannot produce.
+
 
 ### 10.6 Serial Output — **DONE**
 
