@@ -26,7 +26,8 @@ One-glance status of the whole roadmap.
 - [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3)
 
 **Networking (Phase 4)**
-- [x] 4.1 AF_UNIX — both socket types, with per-message credentials and fd passing (§4.1)
+- [x] 4.1 AF_UNIX — both socket types, with per-message credentials and fd passing; the
+  abstract namespace is served, `unshare`-free lifetime and all (`t-unix`, §4.1.1)
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
 - [~] 4.3 TCP — loopback, listener and `SO_REUSEADDR` done; two options record-only (§4.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)

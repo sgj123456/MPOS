@@ -36,9 +36,17 @@
 //!   but carries no message boundaries until a `socketpair` connects it: a
 //!   *named* one is served as the byte stream this family has (the type's
 //!   own note in `net::socket` tells the trade).
-//! * the abstract namespace (`sun_path[0] == '\0'`) answers `EINVAL` - it
-//!   has no filesystem node, hence no part of this design that would hold
-//!   it, and no target daemon reaches for it.
+//! * the abstract namespace (`sun_path[0] == '\0'`) is **served** for the
+//!   names a caller spells, and for the `addrlen` that spells none at all
+//!   (`bind` makes a name up, the way Linux's `unix_autobind` does). It was
+//!   refused until `xwayland-satellite` - which binds
+//!   `@/tmp/.X11-unix/X0` - reached for it, which is the measurement that
+//!   retired the old reason ("no target daemon reaches for it"); the rules
+//!   come from `.workbuddy/probe_unix_abstract.c` rather than from a man
+//!   page. Two narrow rules remain this kernel's own: a path with bytes
+//!   *after* its terminator is `EINVAL` here where Linux ignores them, and
+//!   the name is `String`-free bytes for the abstract case but a `String`
+//!   for a path, so the *path* half still refuses non-UTF-8.
 //! * a bound *stream* socket that was never `listen`ed answers
 //!   `ECONNREFUSED`; Linux's implicit rendezvous at a socket nobody
 //!   listened on is state this kernel declines to model, and both daemons
@@ -193,7 +201,9 @@ struct UnixState {
 /// them, waits behind an event that already finished.
 struct Dgram {
     data: Vec<u8>,
-    from: Option<String>,
+    /// The sender's address, in whichever namespace it lives - which is what
+    /// `recvfrom` hands back.
+    from: Option<UnixAddr>,
     cred: UCred,
 }
 
@@ -208,16 +218,18 @@ const GRAM_MAX: usize = 64 * 1024;
 /// `SOCK_DGRAM` as `socket(2)` names it.
 const SOCK_DGRAM: u16 = 2;
 
-struct BoundName {
-    /// The path spelled at `bind`, for `getsockname`'s echo. The node the
-    /// bind planted is *not* kept: its `(dev, ino)` identity, which the
-    /// table keys on and `unlink` retires, never comes back - ramfs mints
-    /// inode numbers from a counter that only moves forward, and the one
-    /// filesystem that reuses numbers (ext4) cannot host a socket node at
-    /// all. Pinning the node would hold a deleted name's memory for
-    /// nothing.
-    path: String,
-    key: (u64, u64),
+enum BoundName {
+    /// A name in the filesystem: the path spelled at `bind`, and the node's
+    /// identity. The node itself is *not* kept - `(dev, ino)` is what the
+    /// table keys on and `unlink` retires, and ramfs mints inode numbers from
+    /// a counter that only moves forward, so pinning the node would hold a
+    /// deleted name's memory for nothing.
+    Path { path: String, key: (u64, u64) },
+    /// An abstract name: bytes that no filesystem holds, so nothing outside
+    /// this module can retire them. The name lives exactly as long as a
+    /// descriptor does, which is what [`Drop`] is for (Linux has no
+    /// `unlink` on this namespace either).
+    Abstract(Vec<u8>),
 }
 
 impl UnixSock {
@@ -294,7 +306,7 @@ impl UnixSock {
     /// wake whoever sits in `read`. `false` is the queue at its cap - the
     /// sender's `EAGAIN`, never a silent drop of a message someone asked
     /// to send.
-    fn push_dgram(&self, data: &[u8], from: Option<String>, cred: UCred) -> bool {
+    fn push_dgram(&self, data: &[u8], from: Option<UnixAddr>, cred: UCred) -> bool {
         let waiters = critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
             if st.recvq.len() >= RECVQ_MAX {
@@ -339,7 +351,10 @@ impl UnixSock {
     /// sender's name; the copy truncates to the caller's buffer the way
     /// unix datagrams do - the rest of that one message is gone, and the
     /// next read still finds the next message whole.
-    fn take_dgram(&self, buf: &mut [u8]) -> Result<(usize, Option<String>, UCred, bool), VfsError> {
+    fn take_dgram(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(usize, Option<UnixAddr>, UCred, bool), VfsError> {
         loop {
             let taken = critical_section::with(|cs| {
                 let mut st = self.state.borrow(cs).borrow_mut();
@@ -420,21 +435,17 @@ impl UnixSock {
         critical_section::with(|cs| !self.state.borrow(cs).borrow().pending.is_empty())
     }
 
-    /// The bound node's table key, if a bind has planted one - the same
-    /// fact `local_name` reports, told by identity.
-    pub fn bound_key(&self) -> Option<(u64, u64)> {
-        critical_section::with(|cs| self.state.borrow(cs).borrow().bound.as_ref().map(|b| b.key))
+    /// Whether a `bind` has planted a name on this socket. Linux refuses a
+    /// second bind on the grounds that the first is what the fd answers by.
+    pub fn is_bound(&self) -> bool {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().bound.is_some())
     }
 
-    /// The bound path, for `getsockname`.
-    pub fn local_name(&self) -> Option<String> {
-        critical_section::with(|cs| {
-            self.state
-                .borrow(cs)
-                .borrow()
-                .bound
-                .as_ref()
-                .map(|b| b.path.clone())
+    /// The bound address, for `getsockname` - in whichever namespace it lives.
+    pub fn local_addr(&self) -> Option<UnixAddr> {
+        critical_section::with(|cs| match self.state.borrow(cs).borrow().bound.as_ref()? {
+            BoundName::Path { path, .. } => Some(UnixAddr::Path(path.clone())),
+            BoundName::Abstract(name) => Some(UnixAddr::Abstract(name.clone())),
         })
     }
 }
@@ -491,7 +502,7 @@ impl Inode for UnixSock {
         if self.carries_messages() {
             let _ = offset;
             let peer = self.dgram_peer().ok_or(VfsError::NotConnected)?;
-            let name = self.local_name();
+            let name = self.local_addr();
             if peer.push_dgram(buf, name, self_cred()) {
                 Ok(buf.len())
             } else {
@@ -608,6 +619,18 @@ struct Registry {
     /// node and asks this map, which is how symlinks, `..` and mounts all
     /// come for free.
     by_node: BTreeMap<(u64, u64), usize>,
+    /// Which live socket holds each abstract name.
+    ///
+    /// Separate from `by_node` because the two are separate namespaces, and
+    /// keyed on the *socket type* as well as the name because Linux is
+    /// (measured: a datagram `bind` on a stream socket's abstract name answers
+    /// 0). A path cannot be shared that way - it is one node.
+    by_name: BTreeMap<(Vec<u8>, u16), usize>,
+    /// The counter behind `autobind`'s generated names. Linux mints an abstract
+    /// name for a `bind` that names nothing; the *shape* is what the caller can
+    /// observe (five hex characters, `addrlen` 8 from `getsockname`), not the
+    /// value.
+    autobinds: u32,
 }
 
 struct Slot {
@@ -615,6 +638,9 @@ struct Slot {
     /// The key `by_node` points here, so a release can remove its own
     /// entry without scanning paths.
     key: Option<(u64, u64)>,
+    /// The `by_name` key this socket holds, if any - a socket has at most one
+    /// name, so at most one of these two is set.
+    name: Option<(Vec<u8>, u16)>,
 }
 
 impl Registry {
@@ -622,6 +648,8 @@ impl Registry {
         Registry {
             slots: Vec::new(),
             by_node: BTreeMap::new(),
+            by_name: BTreeMap::new(),
+            autobinds: 0,
         }
     }
 }
@@ -640,6 +668,7 @@ pub(crate) fn alloc(typ: u16) -> Arc<UnixSock> {
         reg.slots.push(Some(Slot {
             socket: Arc::downgrade(&sock),
             key: None,
+            name: None,
         }));
         sock
     })
@@ -690,8 +719,96 @@ pub(crate) fn bind(sock: &Arc<UnixSock>, _node: Arc<dyn Inode>, path: String, ke
             reg.by_node.insert(key, sock.id);
         }
         let mut st = sock.state.borrow(cs).borrow_mut();
-        st.bound = Some(BoundName { path, key });
+        st.bound = Some(BoundName::Path { path, key });
     });
+}
+
+/// Bind an **abstract** name: bytes that no filesystem holds, so the whole of
+/// the binding is this module's table plus the socket's own record of what it
+/// answers `getsockname` with.
+///
+/// Linux's rules, measured (`.workbuddy/probe_unix_abstract.c`): a name already
+/// held **by the same socket type** is `EADDRINUSE` - a datagram socket may hold
+/// the name a stream socket holds, because the two keys are different entries -
+/// and a socket that already has a name answers `EINVAL` whatever the second
+/// name is, which is the refusal `bind_path` makes as well.
+pub(crate) fn bind_name(sock: &UnixSock, name: Vec<u8>) -> isize {
+    if sock.is_bound() {
+        return err::EINVAL;
+    }
+    critical_section::with(|cs| {
+        let mut reg = UNIX.borrow(cs).borrow_mut();
+        let key = (name.clone(), sock.typ);
+        if reg.by_name.contains_key(&key) {
+            return err::EADDRINUSE;
+        }
+        reg.by_name.insert(key.clone(), sock.id);
+        if let Some(Some(slot)) = reg.slots.get_mut(sock.id - 1) {
+            slot.name = Some(key);
+        }
+        let mut st = sock.state.borrow(cs).borrow_mut();
+        st.bound = Some(BoundName::Abstract(name));
+        0
+    })
+}
+
+/// `bind` with an `addrlen` of just the family: Linux *makes a name up* rather
+/// than refusing it (measured: success, and `getsockname` answers a leading NUL
+/// and five hex characters). The generated name is this module's own, because
+/// the value is not part of the contract - the *shape* is, and it is what the
+/// caller can see.
+pub(crate) fn bind_autobind(sock: &UnixSock) -> isize {
+    let name = critical_section::with(|cs| {
+        let mut reg = UNIX.borrow(cs).borrow_mut();
+        let mut n = reg.autobinds;
+        loop {
+            n = n.wrapping_add(1);
+            let candidate = alloc::format!("{n:05x}").into_bytes();
+            if !reg.by_name.contains_key(&(candidate.clone(), sock.typ)) {
+                reg.autobinds = n;
+                return candidate;
+            }
+        }
+    });
+    bind_name(sock, name)
+}
+
+/// The live socket holding an abstract name, or `None` - which every caller
+/// turns into the answer Linux gives for a name nobody holds.
+///
+/// The socket *type* is part of the lookup, so a datagram connector cannot find
+/// a stream listener here at all; Linux refuses that pair too.
+fn live_named(name: &[u8], typ: u16) -> Option<Arc<UnixSock>> {
+    critical_section::with(|cs| {
+        let reg = UNIX.borrow(cs).borrow();
+        let id = *reg.by_name.get(&(name.to_vec(), typ))?;
+        reg.slots
+            .get(id - 1)?
+            .as_ref()
+            .and_then(|slot| slot.socket.upgrade())
+    })
+}
+
+/// `connect` by abstract name.
+///
+/// There is no node and no filesystem, so there is nothing to resolve and no
+/// permission to check: a name nobody holds is the answer a dead node gives,
+/// `ECONNREFUSED` (measured: both a stream and a datagram `connect` to an
+/// unbound abstract name answer 111).
+pub(crate) fn connect_named(sock: &UnixSock, name: &[u8], nonblock: bool) -> isize {
+    if sock.end_of().is_some() || sock.dgram_connected() {
+        return err::EISCONN;
+    }
+    let Some(listener) = live_named(name, sock.typ) else {
+        return err::ECONNREFUSED;
+    };
+    let arc = sock_arc(sock);
+    match connect_to(&arc, &listener, nonblock) {
+        Ok(()) => 0,
+        Err(ConnectRefused::Refused) => err::ECONNREFUSED,
+        Err(ConnectRefused::Again) => err::EAGAIN,
+        Err(ConnectRefused::Interrupted) => err::EINTR,
+    }
 }
 
 /// The unlink hook: the name is gone from the namespace, so no new
@@ -708,6 +825,8 @@ pub(crate) fn unbind_node(node: &Arc<dyn Inode>) {
                 slot.key = None;
             }
         }
+        // An abstract name is not a filesystem name: nothing outside this
+        // module can unlink one, so this hook is about paths alone.
     });
 }
 
@@ -733,10 +852,15 @@ impl Drop for UnixSock {
     fn drop(&mut self) {
         let (pending, waiters) = critical_section::with(|cs| {
             let mut reg = UNIX.borrow(cs).borrow_mut();
-            if let Some(Some(slot)) = reg.slots.get_mut(self.id - 1)
-                && let Some(key) = slot.key.take()
-            {
+            let (node_key, name_key) = match reg.slots.get_mut(self.id - 1) {
+                Some(Some(slot)) => (slot.key.take(), slot.name.take()),
+                _ => (None, None),
+            };
+            if let Some(key) = node_key {
                 reg.by_node.remove(&key);
+            }
+            if let Some(name) = name_key {
+                reg.by_name.remove(&name);
             }
             reg.slots[self.id - 1] = None;
             let mut st = self.state.borrow(cs).borrow_mut();
@@ -783,6 +907,18 @@ pub(crate) fn connect(
     nonblock: bool,
 ) -> Result<(), ConnectRefused> {
     let listener = live_listener(node).ok_or(ConnectRefused::Refused)?;
+    connect_to(sock, &listener, nonblock)
+}
+
+/// The handshake itself, once a listener has been found - by node for a path,
+/// by name for an abstract address. Everything below is about the two sockets
+/// and nothing about how the second one was named, which is why it is one body
+/// and not two.
+fn connect_to(
+    sock: &Arc<UnixSock>,
+    listener: &Arc<UnixSock>,
+    nonblock: bool,
+) -> Result<(), ConnectRefused> {
     if sock.typ == SOCK_DGRAM {
         // A datagram `connect` pins a destination and nothing else: no
         // handshake, no queue entry, no listener's consent - the name just
@@ -795,7 +931,7 @@ pub(crate) fn connect(
         critical_section::with(|cs| {
             let cred = listener.state.borrow(cs).borrow().owner;
             let mut st = sock.state.borrow(cs).borrow_mut();
-            st.dgram_peer = Some(Arc::downgrade(&listener));
+            st.dgram_peer = Some(Arc::downgrade(listener));
             st.peer = Some(cred);
         });
         return Ok(());
@@ -1066,42 +1202,96 @@ pub(crate) fn clamp_backlog(backlog: i32) -> usize {
 // `struct sockaddr_un`: the path in front of us
 // ---------------------------------------------------------------------------
 
-/// The path a `sockaddr_un`'s bytes carry, the one parser every unix call
-/// reads through (bind, connect, and the getsockname writer shares the
-/// length arithmetic). The rules are the header's and this kernel's:
-/// at least the two family bytes plus one NUL, never more than the struct;
-/// `AF_UNIX` in the family slot; a terminating NUL with nothing but the
-/// path in front of it - which refuses the abstract namespace (first byte
-/// NUL) with the same arm that refuses an empty path; and valid UTF-8,
-/// because the kernel's path vocabulary is `String`.
-pub(crate) fn sockaddr_un_path(raw: &[u8]) -> Result<String, isize> {
+/// A `sockaddr_un`'s address: the two namespaces Linux has.
+///
+/// They are not two spellings of one thing. A *path* names a node in the
+/// filesystem, and the node - not the string - is what the table keys on, so a
+/// symlink, a `..` and a mount all come for free. An *abstract* name is bytes
+/// and nothing else: no node, no filesystem, no `unlink`. Linux keys those on
+/// the name **and the socket type**, so a stream and a datagram socket may hold
+/// one name between them (measured on the host: `bind` from a datagram socket on
+/// a stream socket's name answers 0), while a path is one node and cannot be
+/// shared that way at all.
+#[derive(Clone)]
+pub(crate) enum UnixAddr {
+    /// A filesystem path, for the caller to resolve to the node that holds it.
+    Path(String),
+    /// An abstract name: the bytes after the leading NUL, to the end of the
+    /// caller's `addrlen` - length-delimited rather than NUL-terminated, so a
+    /// name may contain NULs of its own (measured: Linux binds one).
+    Abstract(Vec<u8>),
+}
+
+/// The address a `sockaddr_un`'s bytes carry, the one parser every unix call
+/// reads through (bind, connect, sendto and the `getsockname` writer shares the
+/// length arithmetic).
+///
+/// The rules, each measured on the host rather than read off a page
+/// (`.workbuddy/probe_unix_abstract.c`):
+///
+/// * fewer than the two family bytes, or more than the struct, is `EINVAL`, and
+///   the family must be `AF_UNIX`;
+/// * **`addrlen` of exactly the family** is the caller naming nothing at all.
+///   Linux *auto*-binds it (a generated abstract name comes back from
+///   `getsockname`) and refuses a `connect` with `EINVAL`, so this is
+///   [`UnixAddrParse::Autobind`] and the call decides;
+/// * a first `sun_path` byte of NUL is the abstract namespace: the **whole**
+///   remainder of the caller's `addrlen` is the name, NULs and all, and an empty
+///   one is a name of zero bytes (also measured: `bind` serves it);
+/// * anything else is a path: NUL-terminated, or the full field with no NUL -
+///   Linux's one exception for a path that fills the struct.
+///
+/// A path that has bytes *after* its terminator is still `EINVAL` here and
+/// ignored on Linux; that divergence is named in the module header rather than
+/// served, because the bytes after a terminator are not part of any name.
+pub(crate) enum UnixAddrParse {
+    Name(UnixAddr),
+    Autobind,
+}
+
+pub(crate) fn sockaddr_un_addr(raw: &[u8]) -> Result<UnixAddrParse, isize> {
     let einval = || Err(crate::err::EINVAL);
-    if raw.len() < 3 || raw.len() > 2 + SUN_PATH_MAX {
+    if raw.len() < 2 || raw.len() > 2 + SUN_PATH_MAX {
         return einval();
     }
     if raw[0] as u16 | ((raw[1] as u16) << 8) != crate::net::socket::AF_UNIX {
         return einval();
     }
     let body = &raw[2..];
+    if body.is_empty() {
+        return Ok(UnixAddrParse::Autobind);
+    }
+    if body[0] == 0 {
+        return Ok(UnixAddrParse::Name(UnixAddr::Abstract(body[1..].to_vec())));
+    }
     let end = match body.iter().position(|&b| b == 0) {
         Some(i) => i,
         // A path that fills the field with no NUL anywhere: Linux accepts
-        // exactly this one case (the field *is* the terminator-less
-        // path); this kernel's path keys are `String`s with a length, so
-        // the same 108-byte name can be taken whole.
+        // exactly this one case (the field *is* the terminator-less name);
+        // this kernel's path keys are `String`s with a length, so the same
+        // 108-byte name can be taken whole.
         None => {
             let name = core::str::from_utf8(body).map_err(|_| crate::err::EINVAL)?;
-            return Ok(name.to_string());
+            return Ok(UnixAddrParse::Name(UnixAddr::Path(name.to_string())));
         }
     };
     if body[end + 1..].iter().any(|&b| b != 0) {
         return einval(); // an interior NUL with bytes after it
     }
-    if end == 0 {
-        return einval(); // the abstract namespace, refused (module header)
-    }
     let name = core::str::from_utf8(&body[..end]).map_err(|_| crate::err::EINVAL)?;
-    Ok(name.to_string())
+    Ok(UnixAddrParse::Name(UnixAddr::Path(name.to_string())))
+}
+
+/// The bytes a `sockaddr_un` answering `getsockname` carries for an abstract
+/// name: the family, the leading NUL, and the name - `addrlen` is `3 + len`,
+/// which is what Linux answers (measured: 13 for a ten-byte name).
+pub(crate) fn sockaddr_un_abstract_bytes(name: &[u8]) -> Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(3 + name.len());
+    out.push(crate::net::socket::AF_UNIX as u8);
+    out.push((crate::net::socket::AF_UNIX >> 8) as u8);
+    out.push(0);
+    out.extend_from_slice(name);
+    out
 }
 
 /// The bytes a `sockaddr_un` answering `getsockname` carries: family, the
@@ -1135,7 +1325,7 @@ pub(crate) fn bind_path(sock: &UnixSock, path: &str) -> isize {
     // that the first is what the fd answers by. The check is the stored
     // key's own - the node it pins is what keeps that key from ever
     // naming a different file behind this socket's back.
-    if sock.bound_key().is_some() {
+    if sock.is_bound() {
         return err::EINVAL;
     }
     let cwd = crate::sched::current_cwd();
@@ -1239,15 +1429,23 @@ fn sock_arc(sock: &UnixSock) -> Arc<UnixSock> {
 /// for the needed size) by storing the length without touching the
 /// address.
 pub(crate) fn write_name(sock: &UnixSock, addr_ptr: usize, len_ptr: usize) -> isize {
-    let path = sock.local_name().unwrap_or_default();
-    write_named(&path, addr_ptr, len_ptr)
+    write_addr(sock.local_addr().as_ref(), addr_ptr, len_ptr)
 }
 
-/// The same contract with the name given directly - which is what
-/// `recvfrom` needs: the address it writes back is the *sender's* name of
-/// the datagram just taken, not the receiver's own.
-pub(crate) fn write_named(path: &str, addr_ptr: usize, len_ptr: usize) -> isize {
-    let bytes = sockaddr_un_bytes(path);
+/// The writer both callers share: `getsockname` answers the socket's own bound
+/// address, `recvfrom` the *sender's* of the datagram just taken. The two
+/// namespaces differ only in the bytes they spell - a path is the string and a
+/// NUL, an abstract name is the leading NUL and the bytes - and `addrlen` is
+/// the length of whichever one is written, which is what Linux reports.
+pub(crate) fn write_addr(addr: Option<&UnixAddr>, addr_ptr: usize, len_ptr: usize) -> isize {
+    let bytes = match addr {
+        Some(UnixAddr::Path(path)) => sockaddr_un_bytes(path),
+        Some(UnixAddr::Abstract(name)) => sockaddr_un_abstract_bytes(name),
+        // No address to answer with. Linux writes the bare family; this
+        // kernel has always written an empty path (the same three bytes the
+        // empty-path probe sees) and that divergence is `t-unix`'s.
+        None => sockaddr_un_bytes(""),
+    };
     if len_ptr == 0 {
         return err::EFAULT;
     }
@@ -1323,29 +1521,40 @@ pub(crate) fn connect_path(sock: &UnixSock, path: &str, nonblock: bool) -> isize
 /// answers `EAGAIN` to the sender - the receiver's slow read is the
 /// sender's problem to hear about, which is the honest version of Linux's
 /// socket-buffer accounting at this scale.
-pub(crate) fn send_dgram(sock: &UnixSock, data: &[u8], dest: Option<&str>) -> isize {
+pub(crate) fn send_dgram(sock: &UnixSock, data: &[u8], dest: Option<&UnixAddr>) -> isize {
     if data.len() > GRAM_MAX {
         return err::EMSGSIZE;
     }
     let target: Arc<UnixSock> = match dest {
-        Some(path) => {
+        Some(addr) => {
             // A connected datagram socket sends to its peer; naming a
             // different destination on the call that already pinned one is
             // `EISCONN`, the same refusal the stream channel answers.
             if sock.dgram_connected() {
                 return err::EISCONN;
             }
-            let cwd = crate::sched::current_cwd();
-            let node = match crate::vfs::resolve_opt(path, Some(cwd)) {
-                Ok(node) => node,
-                Err(e) => return crate::uaccess::err_of(e),
-            };
-            if node.metadata().kind != NodeKind::Socket {
-                return err::ECONNREFUSED;
-            }
-            match live_listener(&node) {
-                Some(sock) => sock,
-                None => return err::ECONNREFUSED,
+            match addr {
+                UnixAddr::Path(path) => {
+                    let cwd = crate::sched::current_cwd();
+                    let node = match crate::vfs::resolve_opt(path, Some(cwd)) {
+                        Ok(node) => node,
+                        Err(e) => return crate::uaccess::err_of(e),
+                    };
+                    if node.metadata().kind != NodeKind::Socket {
+                        return err::ECONNREFUSED;
+                    }
+                    match live_listener(&node) {
+                        Some(sock) => sock,
+                        None => return err::ECONNREFUSED,
+                    }
+                }
+                // An abstract name has no node to resolve and no permission to
+                // check; a name nobody holds answers what a dead node answers
+                // (measured: 111 on Linux for a datagram `sendto`).
+                UnixAddr::Abstract(name) => match live_named(name, sock.typ) {
+                    Some(sock) => sock,
+                    None => return err::ECONNREFUSED,
+                },
             }
         }
         None => match sock.dgram_peer() {
@@ -1368,7 +1577,7 @@ pub(crate) fn send_dgram(sock: &UnixSock, data: &[u8], dest: Option<&str>) -> is
     if !target.carries_messages() {
         return err::ECONNREFUSED;
     }
-    let from = sock.local_name();
+    let from = sock.local_addr();
     if target.push_dgram(data, from, self_cred()) {
         data.len() as isize
     } else {
@@ -1381,7 +1590,7 @@ pub(crate) fn send_dgram(sock: &UnixSock, data: &[u8], dest: Option<&str>) -> is
 pub(crate) fn recv_dgram(
     sock: &UnixSock,
     buf: &mut [u8],
-) -> Result<(usize, Option<String>), VfsError> {
+) -> Result<(usize, Option<UnixAddr>), VfsError> {
     sock.take_dgram(buf).map(|(n, from, _, _)| (n, from))
 }
 
@@ -1390,7 +1599,7 @@ pub(crate) fn recv_dgram(
 pub(crate) fn recv_dgram_cred(
     sock: &UnixSock,
     buf: &mut [u8],
-) -> Result<(usize, Option<String>, UCred, bool), VfsError> {
+) -> Result<(usize, Option<UnixAddr>, UCred, bool), VfsError> {
     sock.take_dgram(buf)
 }
 

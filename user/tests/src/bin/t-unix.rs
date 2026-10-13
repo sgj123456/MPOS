@@ -57,8 +57,9 @@ use rustix::fs::{
 };
 use rustix::io::{Errno, read, write};
 use rustix::net::{
-    AddressFamily, SocketAddrUnix, SocketFlags, SocketType, accept_with, bind, connect,
-    getpeername, listen, shutdown, socket, socket_with,
+    AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType, accept_with,
+    bind, connect, getpeername, getsockname, listen, recvfrom, sendto, shutdown, socket,
+    socket_with,
 };
 
 const SOCK: &str = "/tmp/t-unix.sock";
@@ -70,6 +71,67 @@ fn last_errno() -> i32 {
 
 /// `bind(fd, addr, len)` through the raw door, for the address shapes
 /// `SocketAddrUnix` cannot build: a foreign family word under a unix body.
+/// The raw `getsockname(2)` door. `rustix` has no way to read an abstract
+/// name back - its unix address type spells a path and nothing else - so the
+/// two claims about what the kernel *answers* with go through the syscall,
+/// which is the same reason the empty-path probe does.
+fn getsockname_raw(fd: i32, storage: &mut Storage, len: &mut u32) -> isize {
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_getsockname,
+            fd as libc::c_long,
+            storage as *mut Storage as libc::c_long,
+            len as *mut u32 as libc::c_long,
+        )
+    };
+    if r < 0 {
+        -(last_errno() as isize)
+    } else {
+        r as isize
+    }
+}
+
+/// The raw `recvfrom(2)` door, for the same reason: the *sender's* address of
+/// a datagram is what this program has to read, and for an abstract sender it
+/// is a name no rustix type can carry.
+fn recvfrom_raw(fd: i32, buf: &mut [u8], storage: &mut Storage, len: &mut u32) -> isize {
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_recvfrom,
+            fd as libc::c_long,
+            buf.as_mut_ptr() as libc::c_long,
+            buf.len() as libc::c_long,
+            0 as libc::c_long,
+            storage as *mut Storage as libc::c_long,
+            len as *mut u32 as libc::c_long,
+        )
+    };
+    if r < 0 {
+        -(last_errno() as isize)
+    } else {
+        r as isize
+    }
+}
+
+/// The raw `connect(2)` door, for the shapes a typed address cannot spell -
+/// here an `addrlen` of just the family, which `SocketAddrUnix` cannot build
+/// (its constructors always carry a name).
+fn connect_raw(fd: i32, storage: &Storage, len: u32) -> isize {
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_connect,
+            fd as libc::c_long,
+            storage as *const Storage as libc::c_long,
+            len as libc::c_long,
+        )
+    };
+    if r < 0 {
+        -(last_errno() as isize)
+    } else {
+        r as isize
+    }
+}
+
 fn bind_raw(fd: i32, storage: &Storage, len: u32) -> isize {
     let r = unsafe {
         libc::syscall(
@@ -201,29 +263,120 @@ fn main() {
         // abstract namespace and the empty path come from rustix's own
         // constructors - they *are* those addresses; the wrong family is the
         // one shape the type forbids, so it rides the raw door.
-        let absent = SocketAddrUnix::new_abstract_name(b"abstract").unwrap();
-        // This kernel has no abstract namespace and says EINVAL; real Linux
-        // binds one (measured on the host: success, a leading-NUL name). The
-        // payload sweep pins the refusal; the host branch names the service
-        // it cannot share.
-        let ab = bind(fd2, &absent);
+        // --- the abstract namespace ------------------------------------------
+        //
+        // No filesystem holds the name, so the bytes *are* the address. Every
+        // answer below was measured on the host first
+        // (`.workbuddy/probe_unix_abstract.c`), and it is the namespace
+        // `xwayland-satellite` binds as `@/tmp/.X11-unix/X0`.
+        let abs_name = SocketAddrUnix::new_abstract_name(b"t-unix-abs").unwrap();
+        let srv = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        r.check("an abstract name binds", bind(&srv, &abs_name).is_ok());
+        let other = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
         r.check(
-            "the abstract namespace answers EINVAL",
-            mpos_user_tests::host_run() || ab == Err(Errno::INVAL),
+            "a second bind of the same abstract name is EADDRINUSE",
+            bind(&other, &abs_name) == Err(Errno::ADDRINUSE),
         );
-        // The empty path *as the kernel sees it*: family AF_UNIX, addrlen 3,
-        // sun_path[0] NUL. `SocketAddrUnix::new("")` builds exactly that and
-        // then refuses to send it (its own contract wants a filesystem path),
-        // so this is the raw door's shape - the same clause as the foreign
-        // family below it.
-        let mut empt = Storage {
+        let mut back = Storage {
+            family: 0,
+            pad: [0; 108],
+        };
+        let mut back_len = 128u32;
+        let asked = getsockname_raw(srv.as_raw_fd(), &mut back, &mut back_len);
+        // Linux answers family, the leading NUL, then the name, and `addrlen`
+        // is three more than the name - which is the whole shape of the
+        // abstract namespace's address.
+        r.check(
+            "getsockname answers an abstract sockaddr_un",
+            asked == 0
+                && back.family == 1
+                && back_len == 3 + 10
+                && back.pad[..11]
+                    == [
+                        0, b't', b'-', b'u', b'n', b'i', b'x', b'-', b'a', b'b', b's',
+                    ],
+        );
+        r.check(
+            "an abstract listener accepts a connection",
+            listen(&srv, 4).is_ok() && connect(&other, &abs_name).is_ok(),
+        );
+        let missing = SocketAddrUnix::new_abstract_name(b"t-unix-nobody").unwrap();
+        let cli = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        r.check(
+            "connect to an unbound abstract name is ECONNREFUSED",
+            connect(&cli, &missing) == Err(Errno::CONNREFUSED),
+        );
+        // The key is the name *and* the socket type, so a datagram socket may
+        // hold the name a stream socket holds - Linux keys them that way and a
+        // path cannot be shared at all.
+        let dg = socket(AddressFamily::UNIX, SocketType::DGRAM, None).unwrap();
+        r.check(
+            "a datagram socket may hold a stream's abstract name",
+            bind(&dg, &abs_name).is_ok(),
+        );
+        // A datagram round trip over abstract names, the sender's address
+        // included: the receiver is told the sender's *name*, not a path.
+        let dg_rx = socket(AddressFamily::UNIX, SocketType::DGRAM, None).unwrap();
+        let rx_name = SocketAddrUnix::new_abstract_name(b"t-unix-abs-rx").unwrap();
+        r.check(
+            "a datagram socket binds an abstract name",
+            bind(&dg_rx, &rx_name).is_ok(),
+        );
+        let sent = sendto(&dg, &b"x"[..], SendFlags::empty(), &rx_name);
+        r.check("a datagram reaches an abstract name", sent.is_ok());
+        let mut payload = [0u8; 8];
+        let mut sender = Storage {
+            family: 0,
+            pad: [0; 108],
+        };
+        let mut sender_len = 128u32;
+        let got = recvfrom_raw(
+            dg_rx.as_raw_fd(),
+            &mut payload,
+            &mut sender,
+            &mut sender_len,
+        );
+        r.check("the datagram arrived", got == 1 && payload[0] == b'x');
+        r.check(
+            "the sender's abstract name came back",
+            sender.family == 1
+                && sender_len == 3 + 10
+                && sender.pad[..11]
+                    == [
+                        0, b't', b'-', b'u', b'n', b'i', b'x', b'-', b'a', b'b', b's',
+                    ],
+        );
+        // An `addrlen` of just the family: `bind` makes a name up (Linux's
+        // `unix_autobind`) and every other door refuses - the second half is
+        // `connect`, whose address the parser now accepts.
+        let mut none_at_all = Storage {
             family: 1,
             pad: [0; 108],
         };
-        empt.pad[0] = 0;
+        none_at_all.pad[0] = 0;
+        let auto_fd = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
         r.check(
-            "an empty path answers EINVAL",
-            bind_raw(fd2.as_raw_fd(), &empt, 3) == -libc::EINVAL as isize,
+            "bind with no name at all auto-binds",
+            bind_raw(auto_fd.as_raw_fd(), &none_at_all, 2) == 0,
+        );
+        let mut made = Storage {
+            family: 0,
+            pad: [0; 108],
+        };
+        let mut made_len = 128u32;
+        // Linux's `unix_autobind` mints a five-hex-character name: `addrlen`
+        // 8 and a leading NUL are what a caller can see of it (measured).
+        r.check(
+            "and the name it made is abstract",
+            getsockname_raw(auto_fd.as_raw_fd(), &mut made, &mut made_len) == 0
+                && made.family == 1
+                && made_len == 8
+                && made.pad[0] == 0,
+        );
+        let other2 = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        r.check(
+            "connect with no name at all answers EINVAL",
+            connect_raw(other2.as_raw_fd(), &none_at_all, 2) == -libc::EINVAL as isize,
         );
         let mut wrong = Storage {
             family: 2,

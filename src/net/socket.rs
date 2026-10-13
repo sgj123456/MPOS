@@ -1292,12 +1292,20 @@ pub(crate) fn handle_connect(args: [usize; 6], from_user: bool) -> isize {
                 Ok(raw) => raw,
                 Err(e) => return e,
             };
-            let path = match crate::net::unix::sockaddr_un_path(&raw) {
-                Ok(path) => path,
-                Err(e) => return e,
-            };
             let nonblock = fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
-            return crate::net::unix::connect_path(sock, &path, nonblock);
+            return match crate::net::unix::sockaddr_un_addr(&raw) {
+                Ok(crate::net::unix::UnixAddrParse::Name(crate::net::unix::UnixAddr::Path(
+                    path,
+                ))) => crate::net::unix::connect_path(sock, &path, nonblock),
+                Ok(crate::net::unix::UnixAddrParse::Name(
+                    crate::net::unix::UnixAddr::Abstract(name),
+                )) => crate::net::unix::connect_named(sock, &name, nonblock),
+                // Nothing to connect *to*: Linux refuses this one rather than
+                // making a name up, which is the other half of `bind`'s
+                // `addrlen == 2` (measured: EINVAL).
+                Ok(crate::net::unix::UnixAddrParse::Autobind) => err::EINVAL,
+                Err(e) => e,
+            };
         }
         // A vsock socket's connect is a CID and a port: send the request,
         // then drive the handshake through the events the service task
@@ -1571,14 +1579,19 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
                 Ok(raw) => raw,
                 Err(e) => return e,
             };
-            match crate::net::unix::sockaddr_un_path(&raw) {
-                Ok(path) => Some(path),
+            match crate::net::unix::sockaddr_un_addr(&raw) {
+                Ok(crate::net::unix::UnixAddrParse::Name(addr)) => Some(addr),
+                // `addrlen` of just the family: Linux's `unix_mkname` refuses
+                // anything at or below `offsetof(sun_path)`, so every door
+                // *except* `bind` answers `EINVAL` (measured for `connect`,
+                // `sendto`; `bind` autobinds).
+                Ok(crate::net::unix::UnixAddrParse::Autobind) => return err::EINVAL,
                 Err(e) => return e,
             }
         } else {
             None
         };
-        return crate::net::unix::send_dgram(sock, data, dest.as_deref());
+        return crate::net::unix::send_dgram(sock, data, dest.as_ref());
     }
     // A connected pair's end: the send *is* a write. There is no destination
     // to parse and no control data this kernel carries, so the whole of the
@@ -1710,8 +1723,9 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
                 Ok(raw) => raw,
                 Err(e) => return e,
             };
-            match crate::net::unix::sockaddr_un_path(&raw) {
-                Ok(path) => Some(path),
+            match crate::net::unix::sockaddr_un_addr(&raw) {
+                Ok(crate::net::unix::UnixAddrParse::Name(addr)) => Some(addr),
+                Ok(crate::net::unix::UnixAddrParse::Autobind) => return err::EINVAL,
                 Err(e) => return e,
             }
         } else {
@@ -1721,7 +1735,7 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
         if let Err(e) = gather_iovecs(iov, iovlen, from_user, &mut data) {
             return e;
         }
-        return crate::net::unix::send_dgram(sock, &data, dest.as_deref());
+        return crate::net::unix::send_dgram(sock, &data, dest.as_ref());
     }
     // A connected pair's end, in scatter-gather form: gather, then write.
     // No name is legal to send to, but an `SCM_RIGHTS` control buffer names
@@ -2118,8 +2132,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         return match crate::net::unix::recv_dgram(sock, out) {
             Ok((n, from)) => {
                 if args[4] != 0 {
-                    let name = from.unwrap_or_default();
-                    let r = crate::net::unix::write_named(&name, args[4], args[5]);
+                    let r = crate::net::unix::write_addr(from.as_ref(), args[4], args[5]);
                     if r != 0 {
                         return r;
                     }
@@ -2390,18 +2403,9 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         return match crate::net::unix::recv_dgram_cred(sock, out) {
             Ok((n, from, cred, cut)) => {
                 if name != 0 {
-                    let peer = from.unwrap_or_default();
-                    let bytes = crate::net::unix::sockaddr_un_bytes(&peer);
-                    if !crate::uaccess::buffer_ok(name, bytes.len(), true, from_user) {
-                        return err::EFAULT;
-                    }
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            bytes.as_ptr(),
-                            name as *mut u8,
-                            bytes.len(),
-                        );
-                        ((msghdr + 8) as *mut u32).write_unaligned(bytes.len() as u32);
+                    let r = crate::net::unix::write_addr(from.as_ref(), name, msghdr + 8);
+                    if r < 0 {
+                        return r;
                     }
                 }
                 // The sender's credentials ride along when the reader
@@ -3167,11 +3171,19 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
                 Ok(raw) => raw,
                 Err(e) => return e,
             };
-            let path = match crate::net::unix::sockaddr_un_path(&raw) {
-                Ok(path) => path,
-                Err(e) => return e,
+            return match crate::net::unix::sockaddr_un_addr(&raw) {
+                Ok(crate::net::unix::UnixAddrParse::Name(crate::net::unix::UnixAddr::Path(
+                    path,
+                ))) => crate::net::unix::bind_path(sock, &path),
+                Ok(crate::net::unix::UnixAddrParse::Name(
+                    crate::net::unix::UnixAddr::Abstract(name),
+                )) => crate::net::unix::bind_name(sock, name),
+                // An `addrlen` of just the family: Linux makes a name up.
+                Ok(crate::net::unix::UnixAddrParse::Autobind) => {
+                    crate::net::unix::bind_autobind(sock)
+                }
+                Err(e) => e,
             };
-            return crate::net::unix::bind_path(sock, &path);
         }
         // A vsock socket binds a port; the CID in the address is the
         // guest's own whether the caller spells it or the wildcard,
@@ -3952,7 +3964,10 @@ pub(crate) fn handle_socketpair(args: [usize; 6], from_user: bool) -> isize {
 /// (it owns the family and path rules); this reads the bytes and lets it
 /// answer them.
 fn read_sockaddr_un(ptr: usize, len: usize, from_user: bool) -> Result<alloc::vec::Vec<u8>, isize> {
-    if ptr == 0 || !(3..=2 + crate::net::unix::SUN_PATH_MAX).contains(&len) {
+    // The bounds are Linux's `unix_mkname`: at least the two family bytes (a
+    // caller that names nothing at all is `bind`'s autobind case, measured),
+    // and never more than the struct.
+    if ptr == 0 || !(2..=2 + crate::net::unix::SUN_PATH_MAX).contains(&len) {
         return Err(err::EINVAL);
     }
     if !crate::uaccess::buffer_ok(ptr, len, false, from_user) {

@@ -22,7 +22,7 @@ socket file. Permissions: bind needs write+search on the parent (the
 mkdirat rule), connect needs `W_OK` on the node.
 
 Deliberate divergences from Linux (each asserted in `t-unix`/
-`t-unix-rustix`): the abstract namespace answers `EINVAL`; a connect to a
+`t-unix-rustix`): a connect to a
 bound-but-never-listened name is `ECONNREFUSED` rather than Linux's
 implicit rendezvous at a socket nobody listened on; ext4 refuses socket
 nodes (`EOPNOTSUPP` - `/run` is ramfs); `mknod(S_IFSOCK)` still refuses, so
@@ -101,6 +101,66 @@ bind - and the `EINVAL` it got here is where niri stopped (§7.4). The rule live
 in one place, `net::unix::clamp_backlog`, which the IPv4 pool reads as well: that
 arm had read `-1` as **zero**, a queue one deep, which is the same defect in the
 other family's clothes. Pinned from both sides, `t-unix` and `t-tcp-listen`.
+
+#### 4.1.1 The abstract namespace — **SERVED** (2026-10-13)
+
+It used to answer `EINVAL`, and the reason was written down in the module
+header: it "has no filesystem node, hence no part of this design that would hold
+it, and **no target daemon reaches for it**". The last clause is what retired the
+refusal: `xwayland-satellite` - which the image now carries, because `niri` is
+installed - binds `@/tmp/.X11-unix/X0` and, refused, logs `error opening X11
+sockets, disabling xwayland-satellite integration`. A refusal whose stated
+reason has been measured false is a wrong shape, and the wrong shape is the work
+(`docs/uapi/` §5's list).
+
+**The rules were measured before they were written**
+(`.workbuddy/probe_unix_abstract.c`, run on the host; three of the numbers are
+ones a guess gets wrong):
+
+| call | Linux |
+|---|---|
+| `bind` an explicit abstract name | 0 |
+| `bind` it again | `EADDRINUSE` |
+| — but from a **datagram** socket on a *stream* socket's name | 0 — the key is the name **and the socket type** |
+| `getsockname` | family, the leading NUL, the name; `addrlen` = `3 + name.len()` |
+| `listen`/`connect`/`accept` | all served |
+| `connect` to a name nobody bound (stream *and* datagram) | `ECONNREFUSED` (111, not `ENOENT`) |
+| a datagram `sendto` to a name nobody bound | `ECONNREFUSED` (111) |
+| `addrlen` of just the family (`bind`) | 0 — **auto-binds**: `getsockname` answers a five-hex-character abstract name |
+| the same `addrlen` for `connect`/`sendto` | `EINVAL` (Linux's `unix_mkname` refuses `len <= offsetof(sun_path)`) |
+| a name with an interior NUL | 0 — the abstract name is length-delimited, not NUL-terminated |
+| a name that is only the NUL (`addrlen == 3`) | 0 — a name of zero bytes is a name |
+
+**What landed**: `UnixAddr` in `src/net/unix.rs` is the two namespaces as one
+type - a path resolves to the node the table keys on, an abstract name is bytes
+and nothing else - and the registry carries a second map, `by_name`, keyed on
+`(name, socket_type)` because Linux is. The lifetime is the descriptor's:
+nothing can `unlink` an abstract name, so the last close is what releases it
+(the same `Drop` that retires a path's table key). One handshake serves both,
+which is why `connect` was split into "find the listener" (by node, by name) and
+`connect_to`. `bind`'s `addrlen == 2` generates a name, in Linux's *shape* rather
+than its value; `sendto`/`sendmsg` carry an address rather than a path, so the
+sender's abstract name reaches the receiver's `recvfrom`; and the reader's lower
+bound moved from `3` to `2`, which is the gate that made the autobind case
+unreachable at first (it was written for the old parser's "family + one NUL").
+
+**Two narrow rules stay named**: a path with bytes *after* its terminator is
+`EINVAL` here where Linux ignores them, and a *path* is still a `String`, so the
+path half refuses non-UTF-8 (the abstract half does not - its name is bytes).
+
+**Pinned by `t-unix`**, whose old claim said the opposite: the program asserted
+"the abstract namespace answers `EINVAL`" (with a host branch naming Linux's
+service), and now makes thirteen claims - each measured on the host first, and
+all thirteen green on the machine. The counterfactual is the old kernel's answer
+and the old claim: the program cannot pass against a kernel that refuses the
+namespace.
+
+**What it bought, measured**: `niri` on the same image now logs
+`INFO niri: listening on X11 socket: :0` and no abstract-socket warning at all,
+where before it logged `WARN niri::utils::xwayland::satellite: error opening X11
+sockets, disabling xwayland-satellite integration: error binding to abstract
+socket … Invalid argument`. The renderer warnings beside it are a different gap
+(§7.4's Mesa chain) and are untouched.
 
 ### 4.2 ICMP Improvements — **DONE**
 
