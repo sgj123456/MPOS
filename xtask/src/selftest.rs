@@ -193,6 +193,7 @@ const LEAF_CRATES: &[&str] = &[
     "mpos-uinput",
     "mpos-fdt",
     "mpos-acpi",
+    "mpos-link",
 ];
 
 fn run_unit_tests() -> Result<()> {

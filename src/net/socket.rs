@@ -229,17 +229,19 @@ fn push_into(queue: &EchoQueue, packet: &[u8]) {
 /// protocol-filtered at receive time, and a client that reads back its own
 /// kind must be able to see it.
 pub(crate) fn echo_to_raw_doors(frame: &[u8]) {
-    // The ethertype is the wire's `08 00` as a *pattern*, host order - the one
-    // spelling `packet.rs` was measured into, reused rather than restated. A
-    // second copy of the constant written with the other endian detour is what
-    // made this door compare 0x0800 against 0x0008 and return on every frame,
-    // which measured as "the seam runs and no door is ever filled".
-    if frame.len() < 14
-        || u16::from_le_bytes([frame[12], frame[13]]) != super::packet::IPV4_ETHERTYPE
-    {
+    // The header split, and the ethertype compared as the wire's own two bytes,
+    // are `crate::link`'s - one spelling, host-tested and fuzzed below the
+    // `net` gate. A second copy of the constant written with the other endian
+    // detour made this door compare 0x0800 against 0x0008 and return on every
+    // frame, which measured as "the seam runs and no door is ever filled"
+    // (`docs/notes/` §4.5).
+    let Some(eth) = crate::link::parse_ethernet(frame) else {
+        return;
+    };
+    if eth.ethertype != crate::link::IPV4_ETHERTYPE {
         return;
     }
-    let packet = &frame[14..];
+    let packet = eth.payload;
     // Version 4, IHL at least five, and the buffer fits the header it claims -
     // the same three rules `Ipv4Packet::new_checked` holds, run against the
     // borrowed slice directly (no copy: this runs on every arriving frame).
@@ -1082,7 +1084,7 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
     // this family works *before* the machine has an address - that is the
     // whole reason for it - and what it needs from the stack is the NIC,
     // not the IP layer's cooperation.
-    if domain == crate::net::packet::AF_PACKET {
+    if domain == crate::link::AF_PACKET {
         // Every packet socket needs `CAP_NET_RAW`, `SOCK_DGRAM` included:
         // measured on the host, an unprivileged caller is refused `EPERM` for
         // both types. It is asked before this family's own refusals, so a lowered
@@ -2083,19 +2085,13 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
             core::ptr::copy_nonoverlapping(payload.as_ptr(), buf as *mut u8, n);
         }
         if args[4] != 0 {
-            if !crate::uaccess::buffer_ok(
-                args[4],
-                crate::net::packet::SOCKADDR_LL_LEN,
-                true,
-                from_user,
-            ) {
+            if !crate::uaccess::buffer_ok(args[4], crate::link::SOCKADDR_LL_LEN, true, from_user) {
                 return err::EFAULT;
             }
             crate::net::packet::write_sll(proto, &src, args[4]);
             if args[5] != 0 && crate::uaccess::buffer_ok(args[5], 4, true, from_user) {
                 unsafe {
-                    (args[5] as *mut u32)
-                        .write_unaligned(crate::net::packet::SOCKADDR_LL_LEN as u32);
+                    (args[5] as *mut u32).write_unaligned(crate::link::SOCKADDR_LL_LEN as u32);
                 }
             }
         }
@@ -2318,12 +2314,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             core::ptr::copy_nonoverlapping(payload.as_ptr(), buf as *mut u8, n);
         }
         if name != 0
-            && !crate::uaccess::buffer_ok(
-                name,
-                crate::net::packet::SOCKADDR_LL_LEN,
-                true,
-                from_user,
-            )
+            && !crate::uaccess::buffer_ok(name, crate::link::SOCKADDR_LL_LEN, true, from_user)
         {
             return err::EFAULT;
         }
@@ -2333,8 +2324,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         unsafe {
             if name != 0 {
                 crate::net::packet::write_sll(proto, &src, name);
-                ((msghdr + 8) as *mut u32)
-                    .write_unaligned(crate::net::packet::SOCKADDR_LL_LEN as u32);
+                ((msghdr + 8) as *mut u32).write_unaligned(crate::link::SOCKADDR_LL_LEN as u32);
             }
             // No control data. `PACKET_AUXDATA` is the one thing a caller of
             // this family asks for and it is left unfilled rather than
@@ -2906,7 +2896,7 @@ fn raw_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
         }
         ([0xffu8; 6], packet.total_len() as usize)
     };
-    match super::packet::send_frame(dst_mac, super::packet::IPV4_ETHERTYPE, &pkt[..len]) {
+    match super::packet::send_frame(dst_mac, crate::link::IPV4_ETHERTYPE, &pkt[..len]) {
         Ok(n) => n as isize,
         Err(e) => e,
     }

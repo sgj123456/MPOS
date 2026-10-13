@@ -17,7 +17,10 @@ Section numbers are unchanged from the original `UAPI.md`.
   an unsolicited reset on egress, the second needs buffers not sized once at set
   construction (`docs/notes/` §4.3.3/§4.3.4).
 - **`AF_PACKET` `SOCK_RAW`** (frames with their header) — `EOPNOTSUPP`; needs the header
-  passed through untouched (`docs/notes/` §4.5).
+  passed through untouched. The header *parse* landed with the `mpos-link` leaf
+  (`crates/link`'s `EthFrame`, `docs/notes/` §4.5); what is still missing is the socket
+  side — writing a caller's header verbatim and checking its length rather than inventing
+  one from the device's MAC.
 - **A named `SOCK_SEQPACKET` `AF_UNIX` connection** carries no message boundaries — served
   as the byte stream this family has (`docs/notes/` §4.1).
 - **Console gaps:** `console=ttyN` pinning is refused rather than approximated, and

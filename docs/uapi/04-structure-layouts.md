@@ -18,7 +18,7 @@ back. This is the list, not the byte-by-byte record (that lives in the tests).
 | `struct rlimit` | `prlimit64` | `t-prlimit64` |
 | `struct robust_list_head` | `set/get_robust_list` | `t-set-robust-list` (24 bytes) |
 | EDID base block + `IN_FORMATS` blob | a DRM compositor | `crates/gpu/src/blob.rs` host tests, verified against `edid-decode`; `t-drm-props` |
-| `struct sockaddr_ll` | `AF_PACKET` | `t-dhcp` (no host test — the `net` module is machine-gated, §6) |
+| `struct sockaddr_ll` | `AF_PACKET` | `crates/link` host tests + `fuzz/link_wire`; `t-dhcp` on the machine |
 | `struct nlmsghdr`/`rtattr`/`ifa*msg` | netlink route/uevent | `t-netlink`, `t-uevent` |
 | `struct ifreq` | `SIOC*` | `t-netlink` |
 | `struct rand_pool_info` | `RNDADDENTROPY` | `t-ioctl` |

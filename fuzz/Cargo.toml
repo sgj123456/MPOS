@@ -102,6 +102,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "link_wire"
+path = "fuzz_targets/link_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "logging_cmdline"
 path = "fuzz_targets/logging_cmdline.rs"
 test = false

@@ -205,6 +205,15 @@ pub mod kernel_services;
 /// any suite (`docs/NOTES.md` §15.20).
 #[cfg(all(target_os = "none", feature = "selftest"))]
 pub mod kunit;
+/// The link layer's wire format: `AF_PACKET`'s `sockaddr_ll`, the Ethernet
+/// header, and the packet socket's bounded frame ring. Its own leaf crate, and
+/// the extraction is the point rather than tidiness: these three parsers live
+/// inside `src/net/packet.rs`, which is welded to the NIC seam and therefore
+/// `target_os = "none"`, so no host test and no `fuzz/` target could reach them
+/// (`AGENTS.md` §3 asks every parser of wire bytes for a fuzz target). Below
+/// the gate they gain both, and the crate boundary keeps them from reaching
+/// back up.
+pub use mpos_link as link;
 pub mod logging;
 pub mod mm;
 /// The network stack, and the socket syscalls over it. Host builds skip most of

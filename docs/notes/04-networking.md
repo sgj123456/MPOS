@@ -587,16 +587,24 @@ The named gaps, each with what it waits on:
   312, the `len=590` the seam was printing) and made a short packet read back
   as a full slot. Measured green: `the door itself reads one whole packet (got
   576)`.
-* The parsers over `sockaddr_ll` and the Ethernet frame have no host-side pin.
-  `AGENTS.md` §3 asks every new parser for a fuzz target, and `net/packet.rs`
-  has none — not from oversight but from the §6 trap that gates the whole `net`
-  module on `target_os = "none"` (`src/lib.rs:48`), so neither a host unit test
-  nor a `fuzz/` target can even reach it, and `net/socket.rs`'s annotated test
-  module stands as the standing proof of that (V-11). The only pin today is
-  `t-dhcp` on the machine. The gap closes when the wire-format halves —
-  `sockaddr_ll` decode, header parse, ring accounting — move to an ungated pure
-  module the way `evdev` and `uinput` already do, and gain a fuzz target there.
-  Until then this line is the recorded reason, not a silent exemption.
+* **Closed (2026-10-13): the parsers over `sockaddr_ll` and the Ethernet frame
+  have a host-side pin now.** They had none: `AGENTS.md` §3 asks every new parser
+  for a fuzz target, and `net/packet.rs` carried neither a target nor a host test
+  — not from oversight but from the §6 trap that gates the whole `net` module on
+  `target_os = "none"`, so nothing host-compiled could reach it, and
+  `net/socket.rs`'s annotated test module stood as the standing proof of that
+  (V-11). The wire-format halves — the `sockaddr_ll` decode and encode, the
+  Ethernet header, and the packet socket's bounded frame ring — moved to the
+  `mpos-link` leaf crate (`crates/link`, re-exported as `crate::link`), the shape
+  `evdev` and `uinput` took before them; `src/net/packet.rs` keeps what needs the
+  machine (the tap on the NIC seam, the device's own MAC, the user-memory
+  boundary). Ten host unit tests run in the gate's leaf stage
+  (`cargo xtask test`'s stage 1), and `fuzz/link_wire` is the target — 60 000
+  libFuzzer runs clean. What the crate can now *assert* is the point:
+  `IPV4_ETHERTYPE == u16::from_le_bytes([0x08, 0x00])` is a pinned test, which is
+  exactly the spelling a second copy of that constant got wrong two bullets up —
+  so the parse that could not be tested is now the parse whose endianness cannot
+  drift silently again.
 
 ---
 

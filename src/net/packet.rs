@@ -31,39 +31,34 @@
 //!   filter (`SO_ATTACH_FILTER`) answers `EOPNOTSUPP` - not built, and the
 //!   one door a caller can knock on to find that out.
 //!
-//! The queue is bounded (`RING_FRAMES`): Linux drops frames for a packet
-//! socket whose ring is full and marks the loss (`PACKET_STATISTICS` would
-//! report it); a socket here keeps the newest frames and loses the oldest,
-//! which is the same shape of answer for a client that retransmits.
+//! The wire format itself - `struct sockaddr_ll`'s decode and encode, the
+//! Ethernet header, and the bounded frame ring - is not here. It is the
+//! `mpos-link` leaf (`crate::link`), because this module is welded to the NIC
+//! seam and therefore `target_os = "none"`, and a parser behind that gate can be
+//! neither host-tested nor fuzzed - which is exactly how `sockaddr_ll` and the
+//! header came to have no host pin while `AGENTS.md` §3 asks every wire parser
+//! for one (`docs/notes/` §4.5). What stays here is the part that needs the
+//! machine: the tap on the seam, the device's own MAC, and the user-memory
+//! boundary.
 
-use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use critical_section::Mutex;
 
+use crate::link::{Frame, SockaddrLl};
 use crate::sched::policy::TaskId;
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 
-/// The family number, from Linux's `bits/socket.h`.
-pub(crate) const AF_PACKET: u16 = 17;
+/// eth0's interface index, the one interface this kernel serves. `bind` records
+/// whatever index it is given and every index is this one's, which is the
+/// machine's truth rather than a narrowing of it (the module header).
+const ETH0_IFINDEX: i32 = 2;
 
-/// Frames kept per socket before the oldest gives way. Two pages of DHCP
-/// traffic by any measure; the number exists so a stopped reader cannot
-/// make the kernel eat memory on its behalf.
-const RING_FRAMES: usize = 64;
-/// `sizeof(struct sockaddr_ll)`, per `linux/if_packet.h`: family 0, protocol
-/// 2, ifindex 4, hatype 8, pkttype 10, halen 11, addr 12.
-pub const SOCKADDR_LL_LEN: usize = 20;
-
-/// One tapped frame: the payload half (the `SOCK_DGRAM` promise), and the
-/// two header facts a `recvfrom` answer needs - the source MAC and the
-/// Ethernet type, as their wire patterns.
-type Frame = (Vec<u8>, [u8; 6], u16);
-
-/// One open packet socket. The registry slot is its identity; the queue
-/// holds payload halves of tapped frames, oldest first.
+/// One open packet socket. The registry slot is its identity; the queue holds
+/// payload halves of tapped frames, oldest first, bounded and keeping the
+/// newest (`crate::link::Frames`).
 pub struct PacketSock {
     /// The Ethernet type this socket sees, as the caller's `htons` spelled
     /// it - compared byte-for-byte against the frame's own two type bytes,
@@ -72,7 +67,7 @@ pub struct PacketSock {
     /// The `sll_ifindex` a `bind` recorded. Recorded, not enforced: one
     /// interface exists, and see the module header for the claim.
     bound: Mutex<RefCell<i32>>,
-    rx: Mutex<RefCell<VecDeque<Frame>>>,
+    rx: Mutex<RefCell<crate::link::Frames>>,
     waiters: Mutex<RefCell<Vec<TaskId>>>,
 }
 
@@ -81,7 +76,7 @@ impl PacketSock {
         Arc::new(PacketSock {
             protocol,
             bound: Mutex::new(RefCell::new(0)),
-            rx: Mutex::new(RefCell::new(VecDeque::new())),
+            rx: Mutex::new(RefCell::new(crate::link::Frames::new())),
             waiters: Mutex::new(RefCell::new(Vec::new())),
         })
     }
@@ -104,12 +99,12 @@ impl PacketSock {
         }
         Ok(critical_section::with(|cs| {
             let mut q = self.rx.borrow(cs).borrow_mut();
-            q.pop_front().unwrap_or_default()
+            q.pop().unwrap_or_default()
         }))
     }
 
     pub(crate) fn try_recv(&self) -> Option<Frame> {
-        critical_section::with(|cs| self.rx.borrow(cs).borrow_mut().pop_front())
+        critical_section::with(|cs| self.rx.borrow(cs).borrow_mut().pop())
     }
 
     /// `bind` on a packet socket is one-time on Linux - a second bind of a
@@ -216,16 +211,18 @@ pub(crate) fn retire_for(sock: &PacketSock) {
 /// which is exactly the point: a DHCP reply for a machine with no address
 /// is nobody's business in the IP sense, and every business there is in
 /// the link sense.
+///
+/// Splitting the header is `crate::link::parse_ethernet`'s job, and the
+/// comparison it enables is of the two type numbers as they sit on the wire -
+/// no host-order detour, which is the spelling a second copy of the constant
+/// got wrong once (`docs/notes/` §4.5).
 pub(crate) fn deliver(frame: &[u8]) {
-    if frame.len() < 14 {
+    let Some(eth) = crate::link::parse_ethernet(frame) else {
         return;
-    }
-    // The two bytes *as a byte pattern*: the socket's `htons` number is the
-    // same pattern, and comparing the two without a host-order detour is
-    // what makes `htons(ETH_P_IP)` match the `08 00` on the wire.
-    let ethertype = u16::from_le_bytes([frame[12], frame[13]]);
-    let payload = &frame[14..];
-    let src: [u8; 6] = frame[6..12].try_into().unwrap_or([0; 6]);
+    };
+    let ethertype = eth.ethertype;
+    let src = eth.src;
+    let payload = eth.payload;
     let woke: Vec<TaskId> = critical_section::with(|cs| {
         let mut woke = Vec::new();
         let mut v = SOCKETS.borrow(cs).borrow_mut();
@@ -237,12 +234,10 @@ pub(crate) fn deliver(frame: &[u8]) {
             if sock.protocol != 0 && sock.protocol != ethertype {
                 continue;
             }
-            let mut q = sock.rx.borrow(cs).borrow_mut();
-            q.push_back((payload.to_vec(), src, ethertype));
-            while q.len() > RING_FRAMES {
-                q.pop_front();
-            }
-            drop(q);
+            sock.rx
+                .borrow(cs)
+                .borrow_mut()
+                .push((payload.to_vec(), src, ethertype));
             woke.extend(sock.waiters.borrow(cs).borrow().iter().copied());
         }
         woke
@@ -261,107 +256,62 @@ pub(crate) fn send(sock: &PacketSock, dst_mac: [u8; 6], payload: &[u8]) -> Resul
     let ethertype = if sock.protocol == 0 {
         // `ETH_P_ALL` cannot be a frame's type; an untyped sender means the
         // payload's own kind, and a DHCP client is a `htons(ETH_P_IP)` one.
-        // Written as the wire's `08 00` - the pattern, in memory order.
-        IPV4_ETHERTYPE
+        crate::link::IPV4_ETHERTYPE
     } else {
         sock.protocol
     };
     send_frame(dst_mac, ethertype, payload)
 }
 
-/// The wire's `08 00` for `ETH_P_IP`, in memory order.
-pub(crate) const IPV4_ETHERTYPE: u16 = 0x0800u16.to_be();
-
 /// Put one frame on the wire: the header the kernel owns - destination as given,
 /// source the device's real MAC - and then the payload.
 ///
-/// The header is built here rather than by each caller because there is more than
-/// one now: `send` above for a packet socket, whose protocol the caller chose, and
-/// the raw-IP door (`src/net/socket.rs`), which carries a complete IPv4 packet and
-/// therefore has to reach the device *without* smoltcp's raw-socket emit - that
-/// emit drops a queued packet whose IP protocol byte is not the socket's, and a
-/// DHCP client's packet is UDP while the channel is `IPPROTO_RAW` (§4.5).
+/// The header is built by `crate::link::encode_ethernet` rather than by each
+/// caller because there is more than one now: `send` above for a packet socket,
+/// whose protocol the caller chose, and the raw-IP door (`src/net/socket.rs`),
+/// which carries a complete IPv4 packet and therefore has to reach the device
+/// *without* smoltcp's raw-socket emit - that emit drops a queued packet whose
+/// IP protocol byte is not the socket's, and a DHCP client's packet is UDP while
+/// the channel is `IPPROTO_RAW` (§4.5).
 pub(crate) fn send_frame(dst_mac: [u8; 6], ethertype: u16, payload: &[u8]) -> Result<usize, isize> {
     let mac = crate::net::packet_mac();
     let Some(mac) = mac else {
         return Err(crate::err::ENETDOWN);
     };
-    let mut frame = Vec::with_capacity(14 + payload.len());
-    frame.extend_from_slice(&dst_mac);
-    frame.extend_from_slice(&mac);
-    frame.extend_from_slice(&ethertype.to_le_bytes());
-    frame.extend_from_slice(payload);
+    let frame = crate::link::encode_ethernet(dst_mac, mac, ethertype, payload);
     crate::net::packet_transmit(&frame)?;
     Ok(payload.len())
 }
 
-/// Read a `sockaddr_ll` out of the caller's buffer: the destination MAC
-/// (first six address bytes) and, for `bind`, the interface index.
-pub(crate) struct SockaddrLl {
-    pub ifindex: i32,
-    pub hatype: u16,
-    pub halen: u8,
-    pub addr: [u8; 8],
-}
-
-/// Parse the caller's `sockaddr_ll`, reading the `linux/if_packet.h` offsets.
-/// `None` on a family mismatch or a short struct - Linux's `EINVAL`, which
-/// the caller turns into the return.
-pub(crate) fn parse_sll(raw: &[u8]) -> Option<SockaddrLl> {
-    if raw.len() < SOCKADDR_LL_LEN {
-        return None;
-    }
-    if u16::from_ne_bytes([raw[0], raw[1]]) != AF_PACKET {
-        return None;
-    }
-    let mut addr = [0u8; 8];
-    addr.copy_from_slice(&raw[12..20]);
-    Some(SockaddrLl {
-        ifindex: i32::from_ne_bytes([raw[4], raw[5], raw[6], raw[7]]),
-        hatype: u16::from_ne_bytes([raw[8], raw[9]]),
-        halen: raw[11],
-        addr,
-    })
-}
-
-/// Write one `sockaddr_ll` into the caller's buffer: family, the socket's
-/// `htons` protocol, `eth0`'s index, `ARPHRD_ETHER` and the given address -
-/// the device's own MAC for `getsockname`, a frame's source for `recvfrom`.
-pub(crate) fn write_sll(protocol: u16, addr: &[u8; 6], buf: usize) {
-    unsafe {
-        let base = buf as *mut u8;
-        core::ptr::write_bytes(base, 0, SOCKADDR_LL_LEN);
-        let at = |offset: usize| (buf + offset) as *mut u8;
-        (at(0) as *mut u16).write_unaligned(AF_PACKET);
-        (at(2) as *mut u16).write_unaligned(protocol);
-        (at(4) as *mut i32).write_unaligned(2);
-        (at(8) as *mut u16).write_unaligned(1); // ARPHRD_ETHER
-        at(10).write_unaligned(0u8); // sll_pkttype: unclassified here
-        at(11).write_unaligned(6u8); // sll_halen
-        for (i, byte) in addr.iter().enumerate() {
-            at(12 + i).write_unaligned(*byte);
-        }
-    }
-}
-
-/// Parse a caller-supplied `sockaddr_ll`. `EINVAL` is Linux's answer for a
-/// short or wrong-family address.
+/// Parse a caller-supplied `sockaddr_ll`, reading it through the user-memory
+/// boundary and handing the bytes to `crate::link`'s decoder. `EINVAL` is
+/// Linux's answer for a short or wrong-family address.
 pub(crate) fn parse_sll_from_user(
     ptr: usize,
     len: usize,
     from_user: bool,
 ) -> Result<SockaddrLl, isize> {
     use crate::err;
-    if len < SOCKADDR_LL_LEN || !crate::uaccess::buffer_ok(ptr, len, false, from_user) {
+    if len < crate::link::SOCKADDR_LL_LEN || !crate::uaccess::buffer_ok(ptr, len, false, from_user)
+    {
         return Err(err::EINVAL);
     }
-    let mut raw = [0u8; SOCKADDR_LL_LEN];
+    let mut raw = [0u8; crate::link::SOCKADDR_LL_LEN];
     unsafe {
         for (i, slot) in raw.iter_mut().enumerate() {
             *slot = (ptr as *const u8).add(i).read_unaligned();
         }
     }
-    parse_sll(&raw).ok_or(err::EINVAL)
+    crate::link::parse_sll(&raw).ok_or(err::EINVAL)
+}
+
+/// Write one `sockaddr_ll` into the caller's buffer: `crate::link`'s encode
+/// plus the fact only this side knows - which interface index `eth0` has.
+pub(crate) fn write_sll(protocol: u16, addr: &[u8; 6], buf: usize) {
+    let bytes = crate::link::encode_sll(protocol, ETH0_IFINDEX, addr);
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, bytes.len());
+    }
 }
 
 /// `getsockname` on the socket: its `htons` protocol, eth0's index, and the
@@ -370,7 +320,7 @@ pub(crate) fn sockname(sock: &PacketSock, addr: usize, len_ptr: usize) -> isize 
     use crate::err;
     if addr == 0
         || len_ptr == 0
-        || !crate::uaccess::buffer_ok(addr, SOCKADDR_LL_LEN, true, true)
+        || !crate::uaccess::buffer_ok(addr, crate::link::SOCKADDR_LL_LEN, true, true)
         || !crate::uaccess::buffer_ok(len_ptr, 4, true, true)
     {
         return err::EFAULT;
@@ -378,7 +328,7 @@ pub(crate) fn sockname(sock: &PacketSock, addr: usize, len_ptr: usize) -> isize 
     let mac = crate::net::packet_mac().unwrap_or([0u8; 6]);
     write_sll(sock.protocol, &mac, addr);
     unsafe {
-        (len_ptr as *mut u32).write_unaligned(SOCKADDR_LL_LEN as u32);
+        (len_ptr as *mut u32).write_unaligned(crate::link::SOCKADDR_LL_LEN as u32);
     }
     0
 }

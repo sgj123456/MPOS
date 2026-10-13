@@ -57,9 +57,10 @@ flowchart TB
         EVDEV["mpos-evdev"]
         UINPUT["mpos-uinput"]
         BLK["mpos-blk"]
+        LINK["mpos-link<br/>(sockaddr_ll, Ethernet header, frame ring)"]
     end
 
-    K --> ERR & ABI & DATE & BINFMT & CRED & UTS & SECCOMP & PCI & TERM & AHCI & GPU & EVDEV & UINPUT & BLK
+    K --> ERR & ABI & DATE & BINFMT & CRED & UTS & SECCOMP & PCI & TERM & AHCI & GPU & EVDEV & UINPUT & BLK & LINK
     ABI --> ERR
 
     subgraph Userland["User programs"]
@@ -105,7 +106,7 @@ disagree about a syscall number without one of them failing to build.
 bare-metal default. It depends on `mpos` with `default-features = false`, i.e. it fuzzes
 exactly the part of the kernel that `src/lib.rs` leaves ungated.
 
-**Thirteen pure leaves are their own crates under `crates/`.** Each depends on
+**The pure leaves are their own crates under `crates/`.** Each depends on
 nothing in the kernel (only `core`/`alloc`, and `critical-section` for
 `pci`/`uts`/`term`/`gpu`/`blk`; `mpos-uinput` depends on `mpos-evdev` for one constant), so they were extracted as workspace members and
 re-exported from `src/lib.rs` under their old names (`pub use mpos_err as err;`).
@@ -130,6 +131,16 @@ GPT/MBR decode were already host-tested inside `src/blk`, and extracting them
 removed the module's one upward-ish reference — `part.rs` sized its transfer
 buffer from `mm::PAGE_SIZE`, so the bound now lives with the trait that states
 it (`mpos_blk::PAGE_SIZE`), as a leaf that cannot name the kernel must.
+`link` is the most recent, and the first extracted for a *negative* reason:
+`AF_PACKET`'s `sockaddr_ll` decode, the Ethernet header and the packet socket's
+frame ring sat inside `src/net/packet.rs`, which is welded to the NIC seam and
+therefore `target_os = "none"` — so no host test and no `fuzz/` target could
+reach them, and `AGENTS.md` §3 asks every parser of wire-supplied bytes for a
+fuzz target. Below the gate they gain both, and the crate boundary is what keeps
+them from reaching back up (`docs/notes/` §4.5, `docs/uapi/` §5.4). Like the
+others it does not bump a leaf count: an earlier draft of this paragraph read
+"thirteen" long after the directory held more, which is the stale snapshot
+`AGENTS.md` §2 warns about.
 Anything still inside that component stays inside `mpos` until Phase 11 breaks
 the cycles; `fuzz/` may later depend on these crates directly instead of through
 `mpos`.
@@ -173,7 +184,7 @@ flowchart TB
         RAND["rand<br/>ChaCha20"]
         UEVENT["uevent<br/>kobject events over netlink"]
         BOOTMOD["boot<br/>handoff record"]
-        BINFMT["logging · sync · uaccess · evdev · uinput<br/>(err/date/binfmt/cred/uts/seccomp/term/ahci/gpu/evdev/uinput/blk are leaf crates — §1)"]
+        BINFMT["logging · sync · uaccess · evdev · uinput<br/>(the `crates/` leaves are their own crates — §1)"]
     end
 
     MAIN --> SYSCALL
@@ -269,7 +280,7 @@ they are cross-crate edges.
 | Drivers | `src/drivers/` | virtio (blk, net, gpu, input, console, rng, sound, 9p, vsock, MSI-X) plus the transport-neutral contracts `NetDevice`/`VsockDevice` the stack above holds (one impl per transport - virtio-PCI for x86_64, virtio-MMIO for aarch64, both landed), DRM/KMS, the render task, evdev/uinput, PCI config space, the x86_64 serial console, the console's transmit queue (`tx_ring`, shared by both machines' UARTs), the RTC, the QEMU debug-exit port | Parse a device's ioctl ABI (that is `syscall/linux/fs/ioctl.rs` today — see V-2) |
 | Console | `src/console.rs` | Log ring, serial output, the switch to the framebuffer, the six virtual consoles | Reach into the VFS for the grid — it names the `term` *crate* now, never `vfs::term` (V-4 closed: the `vfs ↔ console` pair is broken). The wire and its transmit ring are reached through `crate::hal`'s `Console`/`SerialRing` forwards, not by naming `drivers::serial`; on a machine with no ring the queue-and-park and framebuffer arms are `#[cfg]`-inert, so it compiles on a polled sink. Both machines are `SerialRing`s now (§13.7) and drain *one* queue - `drivers::tx_ring`, behind a three-method `Transmitter` - so the console's decision about who parks was written once rather than once per UART |
 | ABI | `src/syscall/` | Numbers (`nr.rs`), pure ABI facts and argument validation (`abi.rs`), the dispatch table, and the handlers (`fs/file.rs` + `fs/ioctl.rs`, `proc.rs`, `posix.rs`) | Grow past the point where one file is a device-ioctl switchboard (see V-2) |
-| Services | `crates/err`, `crates/pci`, `crates/date`, `crates/binfmt`, `crates/cred`, `crates/uts`, `crates/seccomp`, `crates/term`, `crates/ahci`, `crates/gpu`, `crates/evdev`, `crates/uinput`, `crates/blk` (leaf crates — §1); `src/rand.rs`, `src/uevent.rs`, `src/logging.rs`, `src/sync/`, `src/uaccess.rs` | One concern each, host-compiled where the logic is pure. The thirteen leaf crates depend only downward and cannot name the kernel — the split is the enforcement. `err` is the errno table itself: a leaf of constants every layer may answer with, so refusing in Linux's language never means naming `syscall` from below. `uaccess` is the userland-boundary leaf (`buffer_ok`/`user_accessible`/`MAX_IO`/`err_of`): a layer below `syscall` validates a caller's pointer and maps a `VfsError` without reaching up into the ABI layer | — |
+| Services | `crates/*` (leaf crates — §1); `src/rand.rs`, `src/uevent.rs`, `src/logging.rs`, `src/sync/`, `src/uaccess.rs` | One concern each, host-compiled where the logic is pure. The leaf crates depend only downward and cannot name the kernel — the split is the enforcement. `err` is the errno table itself: a leaf of constants every layer may answer with, so refusing in Linux's language never means naming `syscall` from below. `uaccess` is the userland-boundary leaf (`buffer_ok`/`user_accessible`/`MAX_IO`/`err_of`): a layer below `syscall` validates a caller's pointer and maps a `VfsError` without reaching up into the ABI layer | — |
 
 **How this table is enforced, not just drawn.** A module may call **downward only**, into what §2
 draws; anything else is a violation. The graph is *measured*: `cargo xtask depgraph` (a host test
@@ -522,7 +533,7 @@ flowchart TB
         H2["sched (policy, signal, futex)"]
         H3["vfs (inode, mount, ramfs, ext4, procfs, sysfs, path, pipe, epoll, …)"]
         H4["syscall (nr, abi)"]
-        H5["pci, binfmt, date, evdev, uinput, logging, rand<br/>+ err/cred/uts/seccomp/term/ahci/gpu/evdev/uinput/blk as leaf crates (§1)"]
+        H5["pci, binfmt, date, evdev, uinput, logging, rand<br/>+ the `crates/` leaves (§1)"]
     end
 ```
 
@@ -618,9 +629,8 @@ while contexts and the user register frame are still named from above and move
 next. Until they do, `arch` is named directly by the boxes that still carry those
 calls — which is exactly the debt the steps are for.
 
-The leaf crates (`err`, `date`, `binfmt`, `cred`, `uts`, `seccomp`, `pci`, `term`, `ahci`,
-`gpu`, `evdev`, `uinput`, `blk`) sit below all of these and may use nothing in the kernel —
-`blk` is named by `vfs`/`drivers`/`uevent` and names nothing back.
+The leaf crates (`crates/`, §1) sit below all of these and may use nothing in the kernel —
+`blk` is named by `vfs`/`drivers`/`uevent` and names nothing back, and `link` by `net`.
 
 with two hard rules: **nothing below `syscall` names `syscall`**, and **nothing outside
 `vfs` names `vfs`'s concrete device types**. Both are measured now rather than asserted:

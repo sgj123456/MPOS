@@ -59,6 +59,7 @@ and the same shape for the others), so the extraction moved no call site's spell
 | `uinput/` | `mpos-uinput` | `/dev/uinput`'s ABI: the request vocabulary (`nr_of`), the bitmap rules, the `struct uinput_setup` layout | `evdev` |
 | `acpi/` | `mpos-acpi` | ACPI tables: the root pointer (both checksums), an SDT header validated against the bytes that arrived, the RSDT/XSDT walk, and MCFG's memory-mapped configuration windows — the window-relative offset (`EcamRange::offset`) and the bus-relative half a kernel needs when it maps the window a bus at a time (`function_offset`), from one definition of the layout. `fuzz/acpi_tables`. Read by `drivers::pci`, first to find the window and then to read the bus through it | — |
 | `fdt/` | `mpos-fdt` | flattened device trees: a blob in, names and numbers out — a walk over the caller's bytes | — |
+| `link/` | `mpos-link` | the link layer's wire format: `AF_PACKET`'s `struct sockaddr_ll` decode/encode at `linux/if_packet.h`'s offsets, the Ethernet header (`parse_ethernet`/`encode_ethernet`) and the packet socket's bounded frame ring. Extracted from `src/net/packet.rs`, which is welded to the NIC seam and therefore `target_os = "none"` — a parser behind that gate can be neither host-tested nor fuzzed (`docs/notes/` §4.5); `fuzz/link_wire` | — |
 
 The intra-directory edges are the whole set the leaves are allowed: `abi → err`,
 `gpu → err`, `uinput → evdev`, `vm → bootinfo`, all downward and all cross-crate.
@@ -88,6 +89,14 @@ Each leaf is entered through the symbols its dependents name:
 - `mpos-evdev`'s `WaiterId` is opaque for the same reason — who to wake is the
   driver's business, and `drivers/virtio/input.rs` converts at the four call sites
   it owns.
+- `mpos-link` promises one endian fact that is easy to get wrong and is stated
+  once rather than at each call site: a frame's Ethernet type is compared as *the
+  two bytes on the wire*, so `IPV4_ETHERTYPE` is the number whose little-endian
+  bytes are `08 00` and
+  `u16::from_le_bytes([frame[12], frame[13]]) == IPV4_ETHERTYPE` holds with no
+  host-order detour. A second spelling of that constant written with the other
+  detour is what once made the raw-IP door's seam return on every frame
+  (`docs/notes/` §4.5).
 
 Who may call each of these, and the rule that a needed edge changes the design
 record in the same commit, is `docs/ARCHITECTURE.md` §2/§3 — read it there rather
@@ -103,6 +112,7 @@ userspace-visible row is written in. `docs/uapi/` names them by crate:
 | `'E'` (0x45), `/dev/input/eventN` | `crates/evdev` | the evdev request family and its answers |
 | `'U'` (0x55), `/dev/uinput` | vocabulary in `crates/uinput`, device in `drivers/uinput.rs` | the `UI_*` request words and the setup/bitmap layouts |
 | `'d'` (0x64), `/dev/dri/*` | `crates/gpu/src/virtgpu.rs` and its siblings | the `DRM_VIRTGPU_*` answers and the wire records |
+| `struct sockaddr_ll`, `AF_PACKET` | `crates/link` | the address struct's layout and the Ethernet type's on-the-wire spelling |
 | the `RLIMIT_*` model | `crates/abi` | the resource rows `prlimit64` speaks |
 | every errno a row answers with | `mpos-err` | the "no" in Linux's spelling |
 
@@ -135,8 +145,8 @@ run, and `mpos-fdt` sat in exactly that state.
   reasons `gpu`/`evdev`/`uinput` had to wait for an injectable wake).
 - The crate headers carry the per-leaf evidence: `mpos-err` and `docs/ARCHITECTURE.md`
   §9 V-14; `mpos-abi` §11.2 (the `sched → syscall` row); `mpos-ahci` §7.3;
-  `mpos-gpu` §7.4; `mpos-term` §11.1.4; `mpos-evdev` §7.2/§11.1.3; `mpos-bootinfo` and
-  `mpos-vm` §14 S2a/S2b.
+  `mpos-gpu`   §7.4; `mpos-term` §11.1.4; `mpos-evdev` §7.2/§11.1.3; `mpos-bootinfo` and
+  `mpos-vm` §14 S2a/S2b; `mpos-link` §4.5.
 - Open work is the edges the leaves did *not* remove by themselves: the surviving
   `drivers ↔ vfs` pair and the rest of the Phase-11 debt audit live in
   `docs/ARCHITECTURE.md` §9 and `docs/notes/` Phase 11. A new leaf arrives with

@@ -55,7 +55,7 @@ wire before the machine owns an address.
 | `socket.rs` | The socket syscalls (`handle_socket`, `handle_bind`, `handle_connect`, `handle_listen`, `handle_accept`/`accept4`, `handle_sendto`/`handle_sendmsg`/`handle_sendmmsg`, `handle_recvfrom`/`handle_recvmsg`/`handle_recvmmsg`, `handle_shutdown`, `handle_getsockname`/`handle_getpeername`, `handle_setsockopt`/`handle_getsockopt`, `handle_socketpair`), and the `SocketInode`/`NlRouteInode` `Inode` impls that carry a socket through the fd table |
 | `unix.rs` | `AF_UNIX`: the `UnixSock`, the bind table keyed on node identity `(dev, ino)`, `listen`/`connect`/`accept_once`, the datagram queue, `SCM_RIGHTS`, `SO_PEERCRED`/`SO_PASSCRED`, and `unbind_node` |
 | `rtnl.rs` | The route half of `AF_NETLINK`: `RTM_GET*` dumps built from the live stack and `RTM_NEW*/DEL*/SET*` mutations parsed and applied to it |
-| `packet.rs` | `AF_PACKET` (`SOCK_DGRAM` only): the `PacketSock`, its bounded ring, `deliver` tapped from the NIC seam, and the `sockaddr_ll` encode/decode |
+| `packet.rs` | `AF_PACKET` (`SOCK_DGRAM` only): the `PacketSock`, `deliver` tapped from the NIC seam, and the user-memory boundary. The wire format itself — `sockaddr_ll` encode/decode, the Ethernet header, the bounded frame ring — sits below the gate in the `mpos-link` leaf crate (`docs/modules/leaf-crates.md`), so it is host-tested and fuzzed (`docs/notes/` §4.5) |
 | `vsock.rs` | `AF_VSOCK`: the `VsockSock`, its id registry, `bind`/`listen`/`connect`/`accept`, credit-checked `send`/`recv` over the virtio socket device |
 
 ## Contracts
@@ -109,13 +109,17 @@ rows.
 an omission: `src/lib.rs` gates `pub mod net;` on `target_os = "none"`, so a
 `#[cfg(test)]` module inside it would never run — the reason `net/socket.rs` ends
 with a comment explaining why it has none, and the reason `AGENTS.md` §5 lists
-"a `net/*` host test never runs" as a known trap. The pins are the guest
-programs. On the `std` side (`user/tests/src/bin/`): `t-socket`, `t-sock-flags`,
-`t-sockmsg`, `t-sockopt`, `t-socketpair`, `t-tcp`, `t-tcp-listen`, `t-udp`,
-`t-udp-loopback`, `t-unix`, `t-unix-dgram`, `t-unix-rustix`, `t-unix-scm`,
-`t-epoll-socket`, `t-uevent`. On the bare-metal side
-(`user/abitest/src/bin/integration/`): `t-dhcp`, `t-netlink`, `t-dns`,
-`t-rawicmp`, `t-netlat`, `t-tcp-close`, `t-udev-worker`. `tests.toml` decides
+"a `net/*` host test never runs" as a known trap. The exception the rule allowed
+is now taken: the `AF_PACKET` wire format — `sockaddr_ll`, the Ethernet header,
+the frame ring — moved to the `mpos-link` leaf crate (`crates/link`), so those
+parsers do run in the gate's leaf stage and are fuzzed by `fuzz/link_wire`
+(`docs/notes/` §4.5). The module's own files still have none, for the reason
+above. The pins are the guest programs, all in `user/tests/src/bin/` now:
+`t-socket`, `t-sock-flags`, `t-sockmsg`, `t-sockopt`, `t-socketpair`, `t-tcp`,
+`t-tcp-listen`, `t-tcp-close`, `t-udp`, `t-udp-loopback`, `t-unix`,
+`t-unix-dgram`, `t-unix-rustix`, `t-unix-scm`, `t-epoll-socket`, `t-uevent`,
+`t-dhcp`, `t-netlink`, `t-dns`, `t-rawicmp`, `t-netlat`, `t-udev-worker`.
+`tests.toml` decides
 which of these the default sweep runs; several network-facing ones sit in its
 `external` group because they need the host's network or a host listener, and a
 red one there is a statement about the internet before it is one about the

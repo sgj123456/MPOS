@@ -18,10 +18,13 @@ place the kernel reads user- or wire-supplied bytes joins the targets here, or
 `docs/notes/` says why not (`AGENTS.md` §3, extended rule 2). Its scope is exactly
 the modules the kernel's `src/lib.rs` leaves compiled for a host build — the ELF
 loader, the ustar initramfs, ext2/ext4's on-disk structures, partition tables, paths,
-PCI sizing, the console's escape parser, the 9P `Rstat` record, and the
-`uinput`/`evdev` vocabulary that turns a user request into a device's self-description.
-Machine-dependent code (`arch`, `drivers`, `console`, `net`) is out of scope here;
-its pins are the conformance programs in `user/abitest` and `user/tests` that run on
+PCI sizing, the console's escape parser, the 9P `Rstat` record, the
+`uinput`/`evdev` vocabulary that turns a user request into a device's
+self-description, and the link layer's wire format (`crates/link`: `sockaddr_ll`,
+the Ethernet header, the packet socket's frame ring).
+Machine-dependent code (`arch`, `drivers`, `console`, and `net` itself, whose wire
+format is now the `mpos-link` leaf crate below the gate) is out of scope here;
+its pins are the conformance programs in `user/tests` that run on
 the machine.
 
 Two properties make this suite more than "it didn't crash". First, the build runs
@@ -62,6 +65,7 @@ check the self-test sweep depends on.
 | `logging_cmdline` | `mpos::logging::level_from_cmdline` |
 | `term_grid` | `mpos::vfs::term::Grid::feed` |
 | `keymap_events` | `mpos::vfs::term::keymap::Keymap::event` |
+| `link_wire` | `mpos::link::{parse_sll, encode_sll, parse_ethernet, encode_ethernet, Frames}` |
 | `signal_sets` | `mpos::sched::signal` |
 | `sched_policy` | `mpos::sched::policy::Scheduler` |
 | `date_civil` | `mpos::date::{days_from_civil, civil_from_epoch}` |
@@ -136,3 +140,8 @@ find the wrap the kernel would not.
   reachable from user or wire bytes whose target is not in the table above. A new
   target arrives with its `[[bin]]` block, its seed if it has a real artefact, and a
   `README.md` row (the entry `p9_stat` still owes).
+- The `net` module's `sockaddr_ll` and Ethernet parsers were the one standing
+  exception this rule had, and it is now closed rather than excused: they lived
+  inside `src/net/packet.rs`, which is `target_os = "none"`, so neither a host
+  test nor a target could reach them — a reason `docs/notes/` §4.5 recorded. The
+  wire format moved to `crates/link` and `link_wire` above is its target.

@@ -89,6 +89,7 @@ not merely that it does not panic - a crash is the least informative outcome.
 | `uevent_encode` | `uevent::Event::encode_seq` | 设备名不能改变一个 uevent 持有几条记录；`SEQNUM` 单调递增 |
 | `term_grid` | `vfs::term::Grid::feed` | 光标不出网格（末列的 wrap-pending 是 `col == cols`，blit 会钳）；逐字节喂入与整块喂入同屏 |
 | `keymap_events` | `vfs::term::keymap::Keymap::event` | 长度不超过缓冲；组合键永不产出字节 |
+| `link_wire` | `link::{parse_sll, encode_sll, parse_ethernet, encode_ethernet, Frames}` | 短的或异族的 `sockaddr_ll` 被拒，字段落在 `linux/if_packet.h` 的偏移上并等于给定字节；短于以太网头的帧被拒；以太网类型就是线上那两个字节；两个 encode 都能往返；环形缓冲不超过 `RING_FRAMES` 且留住最新的 |
 | `signal_sets` | `sched::signal` | 表外信号被丢弃；pending 集按序取空 |
 | `sched_policy` | `sched::policy::Scheduler` | 每次转移恰好移动它声称的那数量；时钟不回退 |
 | `date_civil` | `date::{days_from_civil, civil_from_epoch}` | 两个方向互为逆运算，包括闰年规则 |

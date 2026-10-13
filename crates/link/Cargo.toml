@@ -1,0 +1,16 @@
+# The link layer's wire format, as a leaf crate: `AF_PACKET`'s `sockaddr_ll`,
+# the Ethernet header, and the packet socket's bounded frame ring. Pure
+# arithmetic over bytes, so a host build can argue with it - which is the whole
+# point. The socket that uses this (`src/net/packet.rs`) is welded to the NIC
+# seam and therefore `target_os = "none"`, so nothing checked from *there* can
+# be checked at all, and these three parsers had no host test and no fuzz target
+# while they sat behind that gate (`docs/notes/` §4.5, `docs/uapi/` §5.4).
+[package]
+name = "mpos-link"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[lints]
+workspace = true

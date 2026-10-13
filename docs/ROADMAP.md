@@ -30,7 +30,9 @@ One-glance status of the whole roadmap.
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
 - [~] 4.3 TCP — loopback, listener and `SO_REUSEADDR` done; two options record-only (§4.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
-- [~] 4.5 `AF_PACKET` — link layer as a socket, userland DHCP can ask; `SOCK_RAW` frames `EOPNOTSUPP`; the raw-IP door (`IPPROTO_RAW`) is open with named gaps left *(in flight)* (§4.5)
+- [~] 4.5 `AF_PACKET` — link layer as a socket, userland DHCP can ask; the wire format's host
+  pin landed (`crates/link`, `fuzz/link_wire`, §4.5); `SOCK_RAW` frames `EOPNOTSUPP`; the
+  raw-IP door (`IPPROTO_RAW`) is open with named gaps left *(in flight)* (§4.5)
 
 **Memory (Phase 5)**
 - [x] anonymous demand paging — a `mmap` is an address space; `mincore` reads the page tables (§5.1, §5.2)
@@ -129,9 +131,10 @@ In the order that keeps each step verifiable on its own:
    calls besides the door: the receive is an `AF_PACKET` **`recvmsg`** (measured on the host
    with `strace`, not the `read`/`recvfrom` `t-dhcp` had been pinning), and the seam's own
    ethertype constant was written with the wrong endian detour, so no door was ever filled.
-   `t-dhcp` now reads one answer with each of the two calls. What is left is the named
-   leftovers: `SOCK_RAW` frames, the unicast half of the raw send, and the wire-format
-   parsers' missing host-side pin.
+   `t-dhcp` now reads one answer with each of the two calls. The wire-format parsers' missing
+   host-side pin **closed** (2026-10-13): the `sockaddr_ll` decode, the Ethernet header and the
+   frame ring moved to the `crates/link` leaf (`fuzz/link_wire`), so what is left is the two
+   named gaps: `SOCK_RAW` frames and the unicast half of the raw send.
 4. **the weston pointer on the window** (R.7, §7.4) — the root cause is fixed in code: the cursor
    queue is configured when the device has one, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` is accepted
    with `HOTSPOT_X`/`HOTSPOT_Y` published per-client, and binding or moving the plane hands the

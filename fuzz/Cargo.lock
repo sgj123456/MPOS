@@ -233,6 +233,7 @@ dependencies = [
  "mpos-evdev",
  "mpos-fdt",
  "mpos-gpu",
+ "mpos-link",
  "mpos-pci",
  "mpos-seccomp",
  "mpos-term",
@@ -333,6 +334,10 @@ dependencies = [
  "mpos-err",
  "virtio-drivers",
 ]
+
+[[package]]
+name = "mpos-link"
+version = "0.1.0"
 
 [[package]]
 name = "mpos-pci"

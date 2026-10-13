@@ -97,6 +97,12 @@ mpos-uinput = { path = "crates/uinput" }
 # in a way only a boot would show is the part a host test can pin. Stage 5's
 # first piece; see `NOTES.md` §9.1.
 mpos-fdt = { path = "crates/fdt" }
+# The link layer's wire format: `AF_PACKET`'s `sockaddr_ll`, the Ethernet header
+# and the packet socket's frame ring. Extracted from `src/net/packet.rs`, which
+# is welded to the NIC seam and so machine-only - the three parsers had no host
+# test and no fuzz target while they sat behind `net`'s `target_os = "none"`
+# gate (`docs/notes/` §4.5, `docs/uapi/` §5.4).
+mpos-link = { path = "crates/link" }
 
 # Used by the arch-agnostic mapping plan, so deliberately not target-gated.
 # Already in the tree as a dependency of `x86_64`.
