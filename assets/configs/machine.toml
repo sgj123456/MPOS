@@ -74,51 +74,40 @@ qemu.vsock = true
 # or newer for the card to exist at all.
 qemu.audio = true
 # The GPU device QEMU attaches (`-device`). `virtio-gpu-pci` is the 2D scanout
-# every boot has used, and it asks nothing of the host. That is what this machine
-# boots, "measured" here rather than chosen: a GL boot needs `virtio-gpu-gl-pci`
-# (the same device with the host's `virglrenderer` behind it - the one thing
-# that makes a compositor refusing a *software* EGL device able to run at all,
-# `NOTES.md` §7.4), and this host's QEMU 11.1.1 has no OpenGL to give it:
-#   `-display gtk,gl=on`  -> "OpenGL is not supported by display backend 'gtk'"
-#   `-display egl-headless,gl=on` -> "egl: no drm render node available"
-#   `-display none`        -> "The display backend does not have OpenGL support
-#                             enabled" (QEMU refuses a GL card beside `none`)
-# so the GL card cannot boot here at all, and the 2D card is the honest default
-# for a boot that only has to paint text. On a GL-capable host, switch to
-# `virtio-gpu-gl-pci,edid=on,xres=1920,yres=1080` and name a GL display backend
-# beside it (`display = "gtk,gl=on"`, or `egl-headless,gl=on` for a headless
-# one); without that QEMU refuses the device, and a boot that never starts is
-# worse than a machine with no GL.
+# every boot has used, and it asks nothing of the host - which is why it is the
+# default rather than a fallback.
 #
-# `edid=on,xres=1920,yres=1080` are the card's own suboptions, and they set the
-# resolution the guest boots at. The kernel deliberately *follows the host*: at
-# `init` it reads `GET_DISPLAY_INFO`, whose preferred-mode rectangle carries the
-# native panel size QEMU advertises from this EDID, and builds the scanout at
-# that size - so a card with no suboptions opens at QEMU's default window, and
-# asking for 1080p here is the honest place to ask for it. (A later window
-# resize still takes over, because a resize is exactly a fresh `GET_DISPLAY_INFO`
-# the driver follows.) Switching to the GL card carries the same suboptions.
+# `virtio-gpu-gl-pci` is the same device with the host's `virglrenderer` behind
+# it, and it is one key away. It is *not* the default because the gate cannot
+# carry it yet, measured 2026-10-13 on a host that does have GL - `/dev/dri/
+# renderD128` exists, and `-display egl-headless,gl=on -device virtio-gpu-gl-pci`
+# starts, so the note here that the GL card cannot boot at all was true of the
+# host that wrote it and is not true of this one:
+#   * the sweep passes on it (`pass=169 fail=0`, `mpos-kunit 30 passed, 0
+#     failed`) but QEMU does not return the clean debug exit - the run reports
+#     `QEMU exited with -1 (33 is the clean debug exit)` - so the gate refuses to
+#     call the run green, which is the gate doing its job;
+#   * and virglrenderer rejects a resource the guest asks for:
+#     `vrend_resource_create, Illegal resource parameters, error: Cube map:
+#     unexpected array size 1`.
+# Both are recorded with the rest of the renderer chain in `docs/notes/` §7.4.
 #
-# The key is read by the *first* machine's wiring alone, so it stays in the
-# baseline only because there is no second value to give it: the second machine
-# walks its own device tree and drives the MMIO form of the same card
-# (`xtask/src/qemu.rs::virt_machine_args` says so on the line).
+# What the GL card *does* fix is `DRM_VIRTGPU_GET_CAPS`: with `capsets=2` the
+# request is served (`virtio-gpu: virgl=1 context_init=1 capsets=2 cached=2`),
+# where a 2D card answers `ENOSYS` - which is Linux's own answer for a card with
+# no cap sets, and not a gap this kernel could close by answering something else.
 qemu.gpu = "virtio-gpu-pci"
 # The QEMU display backend for an interactive `run` (`-display`), so the
 # framebuffer console has a window to show itself in. Absent means `sdl`; name
 # another backend your QEMU was built with, or `none` to watch only the serial
 # log - which then goes quiet once the console moves to the framebuffer.
 #
-# The key is absent here, so `run` on the first machine uses `sdl` and a `test`
-# boot falls back to the headless `none`, because a window backend is what an
-# interactive boot needs and the GL backend is unavailable here - see the GPU
-# block. On a GL-capable host a GL card must be named beside a GL display
-# backend (`gtk,gl=on`, or `egl-headless,gl=on` for a headless gate), because
-# QEMU refuses a GL card beside a backend without OpenGL - and a `test` boot
-# reads this key too, so a GL gate would open a window on every boot unless it
-# names `egl-headless,gl=on`. Leaving the key out at all is a machine that
-# refuses to start when the card is GL; on the 2D card it is simply the
-# interactive default.
+# Absent, deliberately: the 2D card above takes any backend. A GL card must be
+# named beside a backend that has OpenGL - `sdl,gl=on` on this host, measured,
+# where `none` is refused outright - and a boot that renders nowhere derives its
+# backend from the card instead of reading this key (`xtask/src/qemu.rs`), so the
+# key stays about the window and nothing else.
+
 # How `cargo xtask run` boots the machine, overridable per invocation with
 # `--mode <mode>`. One word picks both the QEMU wiring and the consoles the guest
 # is told to use, because the window and the guest's own console have to agree.

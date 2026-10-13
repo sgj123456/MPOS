@@ -71,7 +71,10 @@ One-glance status of the whole roadmap.
 - [x] the session environment — `XDG_RUNTIME_DIR` ships in the shared `core/` overlay, so both machines' login shells have it (R.7's gap, closed by §15.36/§15.37)
 - [x] weston's EL0 write fault above its stack — resolved by `resolve_stack_growth` on the aarch64 EL0 data-abort path; the desktop comes up whole (R.7, §15.36)
 - [~] the cursor plane drives a host pointer: hotspot cap accepted, `HOTSPOT_X`/`HOTSPOT_Y` published per-client, and binding/moving posts virtio-gpu `UPDATE_CURSOR`/`MOVE_CURSOR` on the cursor queue (`t-drm`, `t-drm-props`) — kernel path built and gated green; reading the pointer back on the QEMU window after a gui weston boot is what closes it (§7.4, R.7)
-- [ ] 3D / virgl / venus (`DRM_VIRTGPU_*`) — served and pinned, renderer itself unverified (§7.4, R.15)
+- [~] 3D / virgl / venus (`DRM_VIRTGPU_*`) — served and pinned, and *negotiated* on a
+  `virtio-gpu-gl-pci` boot (`virgl=1 capsets=2`); the renderer is still `llvmpipe`, because
+  Mesa cannot identify the node its devpath names, and the GL card is not the gate's default
+  yet (QEMU returns no clean exit) (§7.4, R.15)
 
 **Compositors beyond weston (niri, wlroots)** — analysis in §7.4:
 - [x] the sysfs side of a DRM node's identity; the card found by its driver's declaration; the `..` in a symlink's target (§7.4)
@@ -79,8 +82,14 @@ One-glance status of the whole roadmap.
 - [x] DRM sync objects incl. timeline flags, measured on the real card (§7.4, `t-drm-sync`)
 - [x] the lease family with `drm.h`'s request numbers; legacy KMS queries refused by name; cursor plane driven (§7.4, `t-drm-lease`, `t-drm-args`)
 - [x] `/proc/<pid>/maps` — three sources, two named divergences (§7.4, R.6)
+- [x] niri booted end to end on the 3D card: the card negotiates its cap sets so
+  `DRM_VIRTGPU_GET_CAPS` is served rather than refused, and `niri`/`xwayland-satellite` are
+  image packages now, so the compositor's own two remaining warnings are the renderer's
+  rather than a missing file's (§7.4)
 - [~] the property families a compositor finds by name — four built, three deliberately absent (§7.4, `t-drm-props`)
 - [~] the DRM surface a wlroots pixman compositor needs — in place, never booted (§7.4)
+- [ ] the renderer Mesa would have to pick: `is_software()` stays true until its loader can
+  identify the card, which the node's `virtual/…` devpath is the standing lead for (§7.4)
 
 **Security (Phase 8)**
 - [~] 8.0 allocation-failure panic — reproducing case fixed, tmpfs budget landed; global allocator still panics (§8.0, R.8)
@@ -156,6 +165,13 @@ In the order that keeps each step verifiable on its own:
 5. **the display path specifically** — §7.4 carries its own order, and its first step is not a
    kernel change at all: boot a wlroots compositor on `WLR_RENDERER=pixman` and read what it
    says; it is the cheapest way to find what the analysis has wrong.
+6. **the renderer's device identity** (§7.4's last update) — niri now boots on a 3D card and the
+   card negotiates its cap sets, so the compositor's remaining refusal is Mesa's: it still picks
+   `llvmpipe` and names why (`egl: failed to create dri2 screen`). The lead is the DRM node's own
+   sysfs path — `/sys/devices/virtual/drm/card0` while its `device` link reaches the PCI function,
+   and libudev's parent walk follows the devpath. Beside it, the GL card cannot be the gate's
+   default yet: the sweep passes on it but QEMU returns no clean debug exit. Both are §7.4's, with
+   the numbers.
 
 ---
 

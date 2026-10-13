@@ -152,6 +152,23 @@ rootfs.extra_packages = [
     "mesa-dri-gallium",
     "mesa-utils",
     "kmscube",
+    # The second compositor family, installed to be *measured* rather than
+    # shipped as a working desktop - and the measuring is not about a missing
+    # package, which is why it is worth writing down here. niri's TTY backend is
+    # `GpuManager<GbmGlesBackend<GlesRenderer>>` and nothing else, and it refuses
+    # a software EGL device outright (`ensure!(!egl_device.is_software(),
+    # "software EGL renderers are skipped")`, niri 26.04). On this image's 2D
+    # `virtio-gpu-pci` card Mesa offers llvmpipe and nothing else, so niri starts,
+    # fails to make a renderer, and listens with no output; changing that is a
+    # card and a Mesa chain rather than a package, and `docs/notes/` §7.4 is
+    # where the chain's state is recorded. Installing it here is what makes the
+    # observation repeatable by a boot instead of by someone's `apk add`.
+    "niri",
+    # niri's Xwayland helper. Without it niri logs `error spawning
+    # xwayland-satellite at "xwayland-satellite", disabling integration: No such
+    # file or directory` and runs without X support - one warning about a binary
+    # the image simply did not carry.
+    "xwayland-satellite",
     "seatd",
     "seatd-openrc",
     # udev, and the reason a compositor can see a keyboard at all: libinput

@@ -2582,15 +2582,82 @@ Each step stands on its own, which is the only reason the order is this one:
    driver at all, because libdrm cannot describe the card — `drmGetDevices2`
    returns 0. That chain is **built** now, from a working card's own sysfs reads
    (§7.4's third update): the node hangs off the display-class PCI function, and
-   PCI functions carry the `subsystem` link they never had. What is left here is
-   a *measurement*, not a build: the GL-card run that says whether the renderer
-   is off `llvmpipe`, which the console defect below has so far killed every
-   attempt at.
+   PCI functions carry the `subsystem` link they never had. The *measurement* this
+   line was waiting for — the GL-card run that says whether the renderer is off
+   `llvmpipe` — **has been taken (2026-10-13, the last update in this section),
+   and the answer is no**: the card negotiates `capsets=2` and Mesa still answers
+   `llvmpipe`, with `MESA-EGL: egl: failed to create dri2 screen` above it. What
+   is left is the node's own devpath, which still reads
+   `/sys/devices/virtual/drm/card0` where libudev's parent walk needs it under
+   the PCI function.
 6. ~~**`/proc/<pid>/maps`**~~ and the frame pool: the supporting cast, wanted by
    everything above and by nothing in particular. (`MADV_DONTNEED` was on this
    line, and §5.2 has it now; `maps` is §Remaining's, and it is written - see
    the board's entry for the two things it needed, the loader's recorded ranges
    and the `MAP_SHARED` bit the perms column reports.)
+
+---
+
+> **Update, measured (2026-10-13): the GL-card run happened, and it answers two of
+> the three things it was for.** Taken on a host that now has
+> `/dev/dri/renderD128` - so `-display egl-headless,gl=on -device
+> virtio-gpu-gl-pci` starts, and each backend was checked by running it rather
+> than assumed - booting the disk image and reading the guest over the wire
+> (`cargo xtask run --mode terminal`, driven on stdin), which is the shape this
+> section's earlier updates used.
+>
+> - **The 3D half is negotiated for real.** The kernel's own line reads
+>   `virtio-gpu: virgl=1 context_init=1 cursorq=1 capsets=2 cached=2 mask=0x6`
+>   where the shipped 2D card reads `virgl=0 ... capsets=0`. That closes the
+>   `DRM_VIRTGPU_GET_CAPS` question from the other end: with cap sets present the
+>   request is *served*, and no `mpos: ioctl(...) -> ENOSYS` line appears anywhere
+>   in that boot. On the 2D card the same request is `ENOSYS` because
+>   `num_capsets == 0`, which is Linux's own gate (`virtio_gpu_get_caps_ioctl`)
+>   and therefore not a gap this kernel could close by answering something else.
+> - **And the renderer is still `llvmpipe`.** `eglinfo -B` on that boot reports
+>   `OpenGL core profile renderer: llvmpipe (LLVM 23.1.3, 128 bits)` on the GBM
+>   and surfaceless platforms, with `MESA-EGL: warning: egl: failed to create dri2
+>   screen` / `DRI2: failed to create screen` above it. So `is_software()` is
+>   still true and niri still refuses it - `failed to initialize renderer, falling
+>   back to primary gpu: software EGL renderers are skipped`, then `error adding
+>   primary node device, display-only devices may not work: no allocator available
+>   for device`. The same two lines as on the 2D card, which is the point of
+>   taking the run.
+> - **The identity chain is built; the node's own path is not.**
+>   `readlink -f /sys/class/drm/card0` is `/sys/devices/virtual/drm/card0` while
+>   `readlink /sys/dev/char/226:0/device` is `../../../pci0000:00/0000:00:04.0`,
+>   and `vendor`/`device` read `0x1af4`/`0x1050` *through the class link*. The PCI
+>   identity is therefore reachable by following the link, while the devpath -
+>   which is what libudev's parent walk follows - still says `virtual`. That is
+>   this section's earlier lead, now with both paths side by side.
+>
+> **The GL card is one key away and is not the shipped default, and both reasons
+> are measured rather than assumed.** With `qemu.gpu = "virtio-gpu-gl-pci"` the
+> sweep *passes* on it (`=== SUMMARY pass=169 fail=0`, `mpos-kunit 30 passed, 0
+> failed`) - but QEMU returns no clean debug exit (`QEMU exited with -1 (33 is the
+> clean debug exit)`), so the gate refuses to call the run green, which is the gate
+> doing its job; and virglrenderer rejects a resource the guest asks for
+> (`vrend_resource_create, Illegal resource parameters, error: Cube map:
+> unexpected array size 1`). Telling "the card" apart from "the headless GL
+> backend the gate must name beside it" is the next measurement; until then the
+> shipped machine stays 2D and `machine.toml` carries the whole reading.
+>
+> Two smaller things the same boots measured. **`niri` and `xwayland-satellite`
+> are packages in the image now** (`rootfs.toml`): the compositor had been
+> installed by hand in a guest, which is why it reported `error spawning
+> xwayland-satellite ... No such file or directory` - a warning about a binary the
+> image did not carry, not a kernel answer. With the package installed that line
+> is gone and a *different* one takes its place, which is a new finding rather
+> than a fix: `error opening X11 sockets, disabling xwayland-satellite
+> integration: error binding to abstract socket ... Invalid argument (os error
+> 22)` - an abstract `AF_UNIX` bind answered `EINVAL`. Named here, not explained:
+> `t-unix` pins abstract names, so the shape to find is what *this name* does
+> differently. **And a boot that renders nowhere cannot name `none` on a GL card**
+> - QEMU refuses the device beside it - so `xtask/src/qemu.rs` derives the
+> headless GL backend from the card for a `terminal` run and for a `test`/sweep
+> boot rather than asking a second key for it; without that a GL machine cannot be
+> booted headlessly at all, which the first attempt at this run proved by failing
+> to start.
 
 ---
 

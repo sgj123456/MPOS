@@ -1259,6 +1259,9 @@ qemu.gpu = \"c\"
         // extra condition on vsock is the wiring's rather than a key's.
         assert_eq!(x86_qemu.vsock, arm_qemu.vsock);
         assert_eq!(x86_qemu.audio, arm_qemu.audio);
+        // The 2D card is the shipped default, and the GL one is a key away with
+        // the why in `machine.toml`: the sweep passes on it but QEMU returns no
+        // clean debug exit, so the gate cannot carry it (`docs/notes/` §7.4).
         assert_eq!(x86_qemu.gpu, "virtio-gpu-pci");
 
         let x86 =

@@ -128,10 +128,14 @@ fn wiring(console: &Console, config: &QemuConfig, build_dir: &Path) -> Wiring {
     let configured = config.display.clone().unwrap_or_else(|| "sdl".to_string());
     match console {
         Console::Run(mode) => {
+            // A mode with a window takes the configured backend; one without
+            // renders nowhere, and then the *card* decides what QEMU needs - a GL
+            // card refuses `none` outright, so a `terminal` boot of one has to
+            // name the headless GL backend instead.
             let display = if mode.has_window() {
                 configured
             } else {
-                "none".to_string()
+                windowless_display(&config.gpu)
             };
             let window_shows_the_console = *mode == RunMode::Gui && display != "none";
             let serial = if window_shows_the_console {
@@ -150,10 +154,35 @@ fn wiring(console: &Console, config: &QemuConfig, build_dir: &Path) -> Wiring {
             Wiring { display, serial }
         }
         Console::File(log) => Wiring {
-            display: config.display.clone().unwrap_or_else(|| "none".to_string()),
+            display: windowless_display(&config.gpu),
             serial: SerialSink::File(PathBuf::from(log)),
         },
     }
+}
+
+/// The display argument for a boot that renders nowhere - a `terminal`/`mirror`
+/// run whose console is the wire, or a `test`/sweep boot, which has no window at
+/// all. `none` was the whole of that answer, and a card that needs a GL context
+/// refuses it, so the headless GL backend is derived from the card rather than
+/// written down at each of the two places that need it.
+fn windowless_display(gpu: &str) -> String {
+    if needs_gl_context(gpu) {
+        "egl-headless,gl=on".to_string()
+    } else {
+        "none".to_string()
+    }
+}
+
+/// Whether a card needs a GL context from the display backend.
+///
+/// QEMU spells the GL variant of every virtio GPU with `-gl` in its device name
+/// (`virtio-gpu-gl-pci`, `virtio-vga-gl`, the MMIO `virtio-gpu-gl-device`), and
+/// QEMU refuses one beside a backend without OpenGL - `none` included, which is
+/// the answer for a boot that renders nowhere. So that answer has to come off the
+/// card: the only question left is whether the card it was wired with needs the
+/// context.
+fn needs_gl_context(gpu: &str) -> bool {
+    gpu.contains("-gl")
 }
 
 /// The QEMU command line both `run` and `test` boot with.
@@ -1457,20 +1486,48 @@ mod tests {
         );
         assert_eq!(after(&file, "-display").as_deref(), Some("none"));
 
-        // And a machine that names a display gets it on a *test* boot too, which
-        // is the one thing the file-log boot used not to allow. A
-        // `virtio-gpu-gl-pci` refuses `-display none`, so without this the GL
-        // machine is untestable and the GL half of `DRM_VIRTGPU_*` is reachable
-        // only by hand.
+        // And a boot that renders nowhere ignores the interactive window key
+        // entirely: it has no window to place, and the one thing it must get
+        // right is that a `virtio-gpu-gl-pci` refuses `-display none` - so the
+        // headless GL backend comes off the *card*, not off a key that describes
+        // something else. Without this the GL machine would be untestable, or
+        // every gate run would open a window because a key for the interactive
+        // window travelled into a boot that has none.
+        let mut gl = config("1024", 1, &[]);
+        gl.gpu = "virtio-gpu-gl-pci".to_string();
+        gl.display = Some("gtk".to_string());
         let gl_file = machine_args(
-            &custom,
+            &gl,
             Path::new("/ovmf"),
             Path::new("/build/OVMF_VARS.4m.fd"),
             Boot::Image(PathBuf::from("/build/mpos.img")),
             &Console::File("/build/test-serial.log".to_string()),
             Path::new("/build/9p-share"),
         );
-        assert_eq!(after(&gl_file, "-display").as_deref(), Some("gtk"));
+        assert_eq!(
+            after(&gl_file, "-display").as_deref(),
+            Some("egl-headless,gl=on")
+        );
+        // The same rule reaches a *run* that draws nowhere: a `terminal` boot of
+        // a GL card cannot name `none` either, so it takes the headless GL
+        // backend - and the wire still reaches the launcher's terminal, because
+        // that mode's console is the wire and nothing is drawn.
+        let gl_terminal = machine_args(
+            &gl,
+            Path::new("/ovmf"),
+            Path::new("/build/OVMF_VARS.4m.fd"),
+            Boot::Image(PathBuf::from("/build/mpos.img")),
+            &Console::Run(RunMode::Terminal),
+            Path::new("/build/9p-share"),
+        );
+        assert_eq!(
+            after(&gl_terminal, "-display").as_deref(),
+            Some("egl-headless,gl=on")
+        );
+        assert_eq!(
+            after(&gl_terminal, "-serial").as_deref(),
+            Some("chardev:stdio0")
+        );
         // The console is still the wire, whatever the display is: the test
         // image's own command line names `ttyS0`, and the transcript is still a
         // file rather than a window.
