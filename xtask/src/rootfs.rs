@@ -3118,6 +3118,68 @@ mod tests {
         );
     }
 
+    /// Every *script* in an overlay must be executable, because `merge_overlay`
+    /// is `fs::copy` and the mode in the tree is the mode in the image.
+    ///
+    /// The class rule behind the udhcpc test above rather than a second
+    /// instance of it: the overlays carry scripts a boot runs, and the way one
+    /// of them fails is silent - `./start-weston.sh` in a freshly built image
+    /// answered "Permission denied", which is what a *missing* script answers
+    /// too. It had been `100644` in git since it was written (measured:
+    /// `git log --raw --follow` shows it added as `100644` and never changed),
+    /// and nothing noticed, because the mode is invisible to every test that
+    /// reads a file's *contents*. The three files beside it - the initramfs
+    /// `/init`, `xdg-runtime.start`, the udhcpc script - are `100755`, which is
+    /// why only the desktop's own script was broken.
+    #[test]
+    fn every_script_in_an_overlay_is_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = crate::utils::project_root().unwrap();
+        let mut stack = vec![root.join("assets/rootfs"), root.join("assets/initramfs")];
+        let mut scripts = Vec::new();
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let Ok(head) = fs::read(&path) else { continue };
+                if !head.starts_with(b"#!") {
+                    continue;
+                }
+                let mode = entry.metadata().unwrap().permissions().mode();
+                let relative = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                scripts.push((relative, mode));
+            }
+        }
+        assert!(
+            !scripts.is_empty(),
+            "the overlays carry scripts and this walk found none - it is looking \
+             in the wrong place, which is a check that cannot fail"
+        );
+        let unexecutable: Vec<_> = scripts
+            .iter()
+            .filter(|(_, mode)| mode & 0o111 == 0)
+            .collect();
+        assert!(
+            unexecutable.is_empty(),
+            "a script in an overlay is not executable, so a freshly built image \
+             cannot run it: {unexecutable:#?}\n\
+             `chmod +x` the file in the repository - the mode is what travels, \
+             and a script the shell cannot run fails exactly the way a missing \
+             one does"
+        );
+    }
+
     #[test]
     fn fstab_names_the_root_by_uuid_and_the_configured_filesystem() {
         let dir = staged_dir("fstab");
