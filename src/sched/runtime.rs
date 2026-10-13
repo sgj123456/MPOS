@@ -7251,7 +7251,6 @@ pub fn vma_kind_at(virt: usize) -> Option<&'static str> {
 /// inside one of those, so this is what turns "some library wrote 2 MiB below
 /// its stack pointer" into "*this* library did".
 pub fn mapping_name_at(addr: usize) -> Option<alloc::string::String> {
-    use alloc::string::String;
     let page = pframe::align_down(addr, PAGE_SIZE);
     with_table(|t| {
         let owner = t.space_owner(t.current);

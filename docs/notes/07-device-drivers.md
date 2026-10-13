@@ -2671,6 +2671,29 @@ Each step stands on its own, which is the only reason the order is this one:
 > §5.4 carries the whole chain (`/lib/ld-musl-x86_64.so.1` writing a relocated
 > slot, the twenty shapes that all behave as Linux does, and `t-mmap-hint`, the
 > pin that fails without the fix and passes with it).
+>
+> **And the card's devpath is Linux's now, which was necessary and is not
+> sufficient** (2026-10-13). The node used to hang under
+> `/sys/devices/virtual/drm/card0` with a `device` link to the function, and
+> libudev's parent walk follows the **devpath** rather than a link - so the card
+> described itself as a virtual device with no bus behind it. It is now what
+> Linux registers: a *child* of the function its driver declared
+> (`/sys/devices/pci0000:00/0000:00:04.0/drm/card0`, measured on the machine, and
+> pinned by `sysfs`'s `the_cards_devpath_runs_through_its_function`; a machine
+> whose bus names no display function keeps the `virtual/virtio-gpu` stand-in,
+> because there is no parent to name then).
+>
+> **What that did not do is produce a renderer**: `eglinfo -B` on the same boot
+> still answers `llvmpipe` and still prints `MESA-EGL: warning: egl: failed to
+> create dri2 screen` / `DRI2: failed to create screen`. So the devpath was the
+> *lead* this section recorded and not the whole cause, and the difference is now
+> measured rather than assumed. The same boot also clears the image: 
+> `/usr/lib/dri/virtio_gpu_dri.so` is installed (beside `libEGL.so.1` and
+> `libgbm.so.1`), so Mesa has the card's own driver and fails *inside* its screen
+> creation. The next measurement is that failure with the loader talking -
+> `LIBGL_DEBUG=verbose MESA_DEBUG=1 eglinfo -B`, then
+> `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu`, which separates "the loader cannot
+> find the driver" from "the driver cannot open the device".
 
 ---
 

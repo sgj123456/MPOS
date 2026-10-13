@@ -78,7 +78,10 @@ One-glance status of the whole roadmap.
   yet (QEMU returns no clean exit) (§7.4, R.15)
 
 **Compositors beyond weston (niri, wlroots)** — analysis in §7.4:
-- [x] the sysfs side of a DRM node's identity; the card found by its driver's declaration; the `..` in a symlink's target (§7.4)
+- [x] the sysfs side of a DRM node's identity — the node's own **devpath** is a child of the
+  function its driver declared now, since libudev's parent walk follows the path and not the
+  `device` link (§7.4); the card found by its driver's declaration; the `..` in a symlink's
+  target (§7.4)
 - [x] the socket a compositor binds; `GETRESOURCES`' two-call idiom; property shapes (§7.4)
 - [x] DRM sync objects incl. timeline flags, measured on the real card (§7.4, `t-drm-sync`)
 - [x] the lease family with `drm.h`'s request numbers; legacy KMS queries refused by name; cursor plane driven (§7.4, `t-drm-lease`, `t-drm-args`)

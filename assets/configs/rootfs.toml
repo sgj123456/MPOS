@@ -164,10 +164,10 @@ rootfs.extra_packages = [
     # where the chain's state is recorded. Installing it here is what makes the
     # observation repeatable by a boot instead of by someone's `apk add`.
     "niri",
-    # niri's Xwayland helper. Without it niri logs `error spawning
-    # xwayland-satellite at "xwayland-satellite", disabling integration: No such
-    # file or directory` and runs without X support - one warning about a binary
-    # the image simply did not carry.
+    # # niri's Xwayland helper. Without it niri logs `error spawning
+    # # xwayland-satellite at "xwayland-satellite", disabling integration: No such
+    # # file or directory` and runs without X support - one warning about a binary
+    # # the image simply did not carry.
     "xwayland-satellite",
     "seatd",
     "seatd-openrc",

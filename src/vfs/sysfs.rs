@@ -875,8 +875,6 @@ fn build_drm(
 
         let drm = class.add_dir("drm", next);
         next += 1;
-        let drm_root = virtual_root.add_dir("drm", next);
-        next += 1;
         // Where the card's parent lives. In Linux a DRM node is a child of
         // the device that drives it, and the caller that matters asks that
         // parent three questions: `vendor`, `device`, and - resolved, not
@@ -904,34 +902,32 @@ fn build_drm(
                 (dir, String::from("virtual/virtio-gpu"))
             }
         };
-        let parent = alloc::format!("../../../{}", path);
-        // The `drm/` listing hangs under the *parent*, so the links inside
-        // it climb from there rather than from the node - one level deeper
-        // for every name in the parent's path, plus `devices` and `sys`.
-        // Getting this wrong leaves the listing's entries dangling, which
-        // is worse than an empty listing: a reader that walks `/sys` - udev
-        // does, at coldplug - follows them into nothing.
-        let listing_up = path.matches('/').count() + 2;
+        // The node is a *child* of the device that drives it, which is how
+        // Linux's driver core registers one, so `device` climbs one level.
+        let parent = String::from("../..");
+        // `/sys/devices/<path>/drm/`: the same two levels for a bus that
+        // named a function and for the `virtual/virtio-gpu` stand-in a
+        // machine with no display function gets.
+        let subsystem_up = path.matches('/').count() + 3;
         let gpu_drm = gpu.add_dir("drm", next);
         next += 1;
         for (name, minor, devnode) in [
             ("card0", 0u32, "dri/card0"),
             ("renderD128", 128, "dri/renderD128"),
         ] {
-            // The device itself under `/sys/devices/virtual/drm`, and the
-            // class entry as a link to it - the shape Linux's driver core
-            // produces, and the shape `udev` needs: a uevent names its
-            // device by `/sys/<DEVPATH>`, so a `DEVPATH` that is only the
-            // class symlink's target *in name* is an event the daemon can
-            // resolve to nothing. It then keeps the entry it opened, writes
-            // no properties into it, and every client that reads the
-            // database - libudev, and through it weston's GPU selection -
-            // sees a card with no subsystem and no tags.
-            let dir = drm_root.add_dir(name, next);
+            // The device itself under its *function*, and the class entry as
+            // a link to it - the shape Linux's driver core produces, and the
+            // shape `udev` needs: a uevent names its device by
+            // `/sys/<DEVPATH>`, and libudev's parent walk follows the
+            // **devpath**, not a `device` link. A node parked under
+            // `/sys/devices/virtual/drm` therefore read as a virtual device
+            // with no bus behind it, which is what made Mesa's loader give up
+            // on the card and pick `swrast` (`docs/notes/` §7.4).
+            let dir = gpu_drm.add_dir(name, next);
             next += 1;
             devnodes.push((
                 "drm",
-                alloc::format!("devices/virtual/drm/{}", name),
+                alloc::format!("devices/{}/drm/{}", path, name),
                 226,
                 minor,
             ));
@@ -953,7 +949,7 @@ fn build_drm(
                     ino: next,
                     event: Event {
                         action: "add",
-                        devpath: alloc::format!("/devices/virtual/drm/{}", name),
+                        devpath: alloc::format!("/devices/{}/drm/{}", path, name),
                         subsystem: "drm",
                         devname: String::from(devnode),
                         major: 226,
@@ -977,7 +973,7 @@ fn build_drm(
                 "subsystem",
                 Arc::new(SysSymlink {
                     ino: next,
-                    target: String::from("../../../class/drm"),
+                    target: alloc::format!("{}class/drm", "../".repeat(subsystem_up)),
                 }),
             );
             next += 1;
@@ -993,23 +989,14 @@ fn build_drm(
                 }),
             );
             next += 1;
-            // And the node under the parent's `drm/`, by name, as a link
-            // back to the node itself: that listing is the whole answer to
-            // "which other names does this GPU have", and a copy of the
-            // node here would be a second device to keep in step.
-            gpu_drm.add(
-                name,
-                Arc::new(SysSymlink {
-                    ino: next,
-                    target: alloc::format!("{}virtual/drm/{}", "../".repeat(listing_up), name),
-                }),
-            );
-            next += 1;
+            // The class entry: `/sys/class/drm/card0` is a link to the node
+            // under its function, which is the shape every reader of
+            // `/sys/class/...` expects.
             drm.add(
                 name,
                 Arc::new(SysSymlink {
                     ino: next,
-                    target: alloc::format!("../../devices/virtual/drm/{}", name),
+                    target: alloc::format!("../../devices/{}/drm/{}", path, name),
                 }),
             );
             next += 1;
@@ -1414,7 +1401,6 @@ mod tests {
     #[test]
     fn a_partition_is_a_directory_under_its_disk_and_a_link_beside_it() {
         let fs = fs();
-        let block = block_dir(&fs);
 
         // The disk is a directory with its own attributes, and its partitions are
         // directories inside it - which is what a walk of `/sys/block/<disk>`
@@ -1907,7 +1893,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn a_capability_bitmap_prints_as_linux_prints_one() {
         // udev's `input_id` reads these attributes with `strtoul(..., 16)`
         // per space-separated word, filling a `unsigned long` array - so the
@@ -2152,6 +2137,56 @@ mod tests {
             resolve(&fs, "/sys/dev/char/226:0/device").metadata().ino,
             resolve(&fs, "/sys/dev/char/226:128/device").metadata().ino,
             "both nodes hang from the one GPU"
+        );
+    }
+
+    /// The card's **devpath** runs through the function its driver declared.
+    ///
+    /// This is the fact `libudev` reads: its parent walk follows the devpath,
+    /// not a `device` link, so a node parked under `/sys/devices/virtual/drm`
+    /// described itself as a virtual device with no bus behind it - and Mesa's
+    /// loader, which asks libdrm for the card's PCI ids to pick a DRI driver,
+    /// gave up and chose the software rasteriser. A compositor that refuses a
+    /// software EGL device then had no renderer at all (`docs/notes/` §7.4).
+    ///
+    /// `/sys/dev/char/226:N` is the index's link into the device tree, and its
+    /// target *is* the devpath a uevent names (the `device` link *under* it is
+    /// the node's own, one level up to the function). Two shapes are honest:
+    /// a machine whose driver declared a function has the node under it, and a
+    /// machine whose bus has no display function keeps the `virtual/virtio-gpu`
+    /// stand-in - there is no parent to name then, and inventing one would be a
+    /// claim about a bus nothing found.
+    #[test]
+    fn the_cards_devpath_runs_through_its_function() {
+        let with_function = declared_card_fs();
+        let char_dir = resolve(&with_function, "/sys/dev/char");
+        for (number, node) in [("226:0", "card0"), ("226:128", "renderD128")] {
+            // The *index entry itself*, not what it resolves to - `resolve`
+            // would follow it into the node and lose the devpath.
+            let index = char_dir.lookup(number).expect("the index entry");
+            let target = index.readlink().expect("the index entry is a link");
+            assert_eq!(
+                target,
+                alloc::format!("../../devices/pci0000:00/0000:00:02.0/drm/{node}"),
+                "the card hangs off the function its driver declared"
+            );
+            assert!(
+                !target.contains("virtual/"),
+                "a card with a function behind it is not a virtual device: {target}"
+            );
+        }
+        // And the machine with no display function keeps the older shape:
+        // there is no parent to name, and inventing one would be a claim about
+        // a bus nothing found.
+        let bare = fs();
+        let target = resolve(&bare, "/sys/dev/char")
+            .lookup("226:0")
+            .expect("the index entry")
+            .readlink()
+            .expect("the index entry is a link");
+        assert_eq!(
+            target, "../../devices/virtual/virtio-gpu/drm/card0",
+            "a machine with no display function has no parent to name"
         );
     }
 
