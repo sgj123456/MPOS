@@ -2549,6 +2549,11 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
     // new one rather than as somebody else's memory.
     let taken = crate::sched::take_vmas(old_addr, old);
     let delta = dest as isize - old_addr as isize;
+    // The eagerly-mapped ranges travel with the pages: `take_vmas` returns none
+    // for them (they carry no VMA), and a description left behind would hold
+    // the old address and leave the new one placeable - the bug the occupancy
+    // question was just taught to see.
+    crate::sched::move_eager_ranges(old_addr, old, delta);
 
     // The pages go down before the old ones come away, so a mapping that
     // cannot be placed leaves the original intact rather than half moved. A

@@ -858,6 +858,86 @@ impl Mm {
         critical_section::with(|cs| self.eager.borrow(cs).borrow_mut().push(range));
     }
 
+    /// Drop the parts of eagerly-mapped ranges inside `start..end`, clipped.
+    ///
+    /// `munmap` takes the description with the pages, and this list is a
+    /// description now in more than the reading sense: the occupancy question
+    /// reads it too, so a range left behind after its pages were unmapped would
+    /// hold an address no program can map again - and `/proc/<pid>/maps` would
+    /// keep printing a mapping that is not there.
+    fn forget_ranges(&self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        critical_section::with(|cs| {
+            let mut ranges = self.eager.borrow(cs).borrow_mut();
+            let mut kept: Vec<MappedRange> = Vec::with_capacity(ranges.len() + 1);
+            for range in ranges.drain(..) {
+                if range.end <= start || range.start >= end {
+                    kept.push(range);
+                    continue;
+                }
+                if range.start < start {
+                    kept.push(MappedRange {
+                        start: range.start,
+                        end: start,
+                        prot: range.prot,
+                        name: range.name.clone(),
+                    });
+                }
+                if range.end > end {
+                    kept.push(MappedRange {
+                        start: end,
+                        end: range.end,
+                        prot: range.prot,
+                        name: range.name.clone(),
+                    });
+                }
+            }
+            *ranges = kept;
+        });
+    }
+
+    /// Give the eagerly-mapped ranges inside `start..end` these permissions.
+    ///
+    /// `mprotect` rewrites both halves of every other mapping - the VMA and the
+    /// pages - and for an eager one the description *is* this list, so a
+    /// permission change that skipped it would leave `/proc/<pid>/maps` reading
+    /// the old ones for ever. That is not hypothetical: the loader maps a shared
+    /// object read-only and then `mprotect`s the part of it that is writable,
+    /// which is the case this list was introduced for.
+    fn reprot_ranges(&self, start: usize, end: usize, prot: MapFlags) {
+        if start >= end {
+            return;
+        }
+        critical_section::with(|cs| {
+            for range in self.eager.borrow(cs).borrow_mut().iter_mut() {
+                if range.end > start && range.start < end {
+                    range.prot = prot;
+                }
+            }
+        });
+    }
+
+    /// Carry the eagerly-mapped ranges inside `start..start + len` to
+    /// `start + delta`. `mremap` moves the pages; the description has to travel
+    /// with them for the reason [`Mm::forget_ranges`] gives - the occupancy
+    /// question reads it - and a description left at the old address would both
+    /// hold an address nobody owns and leave the new one placeable.
+    fn move_ranges(&self, start: usize, end: usize, delta: isize) {
+        if start >= end {
+            return;
+        }
+        critical_section::with(|cs| {
+            for range in self.eager.borrow(cs).borrow_mut().iter_mut() {
+                if range.start >= start && range.end <= end {
+                    range.start = range.start.wrapping_add_signed(delta);
+                    range.end = range.end.wrapping_add_signed(delta);
+                }
+            }
+        });
+    }
+
     /// Stretch the reported `[stack]` range down to `page`.
     ///
     /// A stack is a region a program descends into rather than a fixed
@@ -917,7 +997,45 @@ impl Mm {
     }
 
     fn vma_gaps(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
-        critical_section::with(|cs| self.vmas.borrow(cs).borrow().gaps(start, end))
+        let mut gaps = critical_section::with(|cs| self.vmas.borrow(cs).borrow().gaps(start, end));
+        if gaps.is_empty() {
+            return gaps;
+        }
+        // Both sources, because both are mappings. The eager ones - the program
+        // image, the loader's shared objects, and a `MAP_PRIVATE` mapping of an
+        // ordinary file - carry no VMA by design (nothing may drop their pages:
+        // there is no file behind them to refill from), which is exactly why
+        // they were easy to forget here. Forgetting them is what let a second
+        // mapping be placed *over* one: the hint was checked against the table
+        // alone, the address looked free, and a new writable mapping's VMA went
+        // over pages another mapping had already filled - read-only, because the
+        // first one was. The fault that followed had no resolver, and a program
+        // that had only asked for a mapping died instead of it being placed
+        // somewhere else, which is what Linux does with an occupied hint.
+        for range in self.eager_ranges() {
+            let (lo, hi) = (range.start.max(start), range.end.min(end));
+            if lo >= hi {
+                continue;
+            }
+            let mut left = Vec::with_capacity(gaps.len() + 1);
+            for (gs, ge) in gaps {
+                if ge <= lo || gs >= hi {
+                    left.push((gs, ge));
+                    continue;
+                }
+                if gs < lo {
+                    left.push((gs, lo));
+                }
+                if ge > hi {
+                    left.push((hi, ge));
+                }
+            }
+            gaps = left;
+            if gaps.is_empty() {
+                break;
+            }
+        }
+        gaps
     }
 
     /// Whether no VMA describes any part of `start..end`.
@@ -6506,6 +6624,14 @@ pub fn record_eager_range(start: usize, end: usize, prot: MapFlags, name: Option
     });
 }
 
+/// Carry the eagerly-mapped ranges inside `start..start + len` to `start + delta`.
+///
+/// `mremap`'s move half: the pages travel, the VMAs travel, and these must too
+/// or the old address stays occupied for ever and the new one looks free.
+pub fn move_eager_ranges(start: usize, len: usize, delta: isize) {
+    current_mm().move_ranges(start, start.saturating_add(len), delta);
+}
+
 /// The address space of the process `pid`, for `/proc/<pid>/maps`. `None` when
 /// nothing answers to the pid, which is `ENOENT` from the read.
 pub fn map_facts(pid: usize) -> Option<MapFacts> {
@@ -6976,6 +7102,7 @@ pub fn munmap_user(virt: usize, len: usize) {
     }
     let end = virt.saturating_add(len);
     current_mm().vma_remove_range(virt, end);
+    current_mm().forget_ranges(virt, end);
     release_user_frames(unmap_user(virt, len));
 }
 
@@ -6986,7 +7113,9 @@ pub fn protect_user_range(virt: usize, len: usize, flags: MapFlags) {
     if len == 0 {
         return;
     }
-    current_mm().vma_set_prot(virt, virt.saturating_add(len), flags);
+    let end = virt.saturating_add(len);
+    current_mm().vma_set_prot(virt, end, flags);
+    current_mm().reprot_ranges(virt, end, flags);
     protect_user(virt, len, flags);
 }
 
@@ -7134,8 +7263,8 @@ pub fn mapping_name_at(addr: usize) -> Option<alloc::string::String> {
         // something else entirely. `rw-u` is the permissions the *mapping*
         // asks for, which is what makes a read-only *page* inside it an
         // inconsistency rather than a refusal.
-        if let Some(vma) = mm.vma_at(page) {
-            return Some(alloc::format!(
+        let vma_descr = mm.vma_at(page).map(|vma| {
+            alloc::format!(
                 "vma[{}] {:#x}..{:#x} {}{}{}{} kind={}",
                 vma.name.as_deref().unwrap_or("unnamed"),
                 vma.start,
@@ -7165,11 +7294,19 @@ pub fn mapping_name_at(addr: usize) -> Option<alloc::string::String> {
                     VmaKind::Frames { shared: true, .. } => "object(shared)",
                     VmaKind::Frames { shared: false, .. } => "object(private)",
                 }
-            ));
-        }
+            )
+        });
+        // Both sources, when both cover the page. `handle_mmap`'s eager path
+        // records a *range* and no VMA ("every page is present, so this mapping
+        // has no VMA and no fault will ever describe it") - so a page that a
+        // VMA *and* a range describe is a page two mappings share, which is the
+        // shape a dynamic linker's read-only pass and its writable segment make
+        // of one 4 KiB page. Printing only the first source would hide half of
+        // it, and the half it hides is the one that says *which file*.
+        let mut eager = None;
         for range in mm.eager_ranges() {
-            if page >= range.start && page < range.end {
-                return Some(alloc::format!(
+            if page >= range.start && page < range.end && eager.is_none() {
+                eager = Some(alloc::format!(
                     "eager[{}] {:#x}..{:#x}",
                     range.name.as_deref().unwrap_or("unnamed"),
                     range.start,
@@ -7177,7 +7314,13 @@ pub fn mapping_name_at(addr: usize) -> Option<alloc::string::String> {
                 ));
             }
         }
-        None
+        if let Some(eager) = eager {
+            return Some(match vma_descr {
+                Some(vma) => alloc::format!("{vma} + {eager}"),
+                None => eager,
+            });
+        }
+        vma_descr
     })
 }
 

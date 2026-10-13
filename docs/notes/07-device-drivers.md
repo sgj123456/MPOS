@@ -2658,6 +2658,19 @@ Each step stands on its own, which is the only reason the order is this one:
 > boot rather than asking a second key for it; without that a GL machine cannot be
 > booted headlessly at all, which the first attempt at this run proved by failing
 > to start.
+>
+> **The page faults that flood a desktop boot on an image with `niri` installed
+> are a different bug, and they are fixed.** The kernel's "is this address free?"
+> question could not see the mappings that carry no VMA, so a second mapping asked
+> for with such an address as its *hint* was placed over the first - and the write
+> that followed had a resolver for neither a demand fill (the page is present) nor
+> a copy-on-write split (it carries no marker), so the task was killed. It is the
+> reason a desktop boot with `niri` installed showed `PFDIAG` floods and dead
+> `weston-*` clients, and it is why "install niri" looked like the trigger: what
+> matters is *a library whose two mapping passes meet on one page*. `docs/notes/`
+> §5.4 carries the whole chain (`/lib/ld-musl-x86_64.so.1` writing a relocated
+> slot, the twenty shapes that all behave as Linux does, and `t-mmap-hint`, the
+> pin that fails without the fix and passes with it).
 
 ---
 
