@@ -2694,6 +2694,24 @@ Each step stands on its own, which is the only reason the order is this one:
 > `LIBGL_DEBUG=verbose MESA_DEBUG=1 eglinfo -B`, then
 > `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu`, which separates "the loader cannot
 > find the driver" from "the driver cannot open the device".
+>
+> **A route to niri *today*, read off its source rather than measured here
+> (2026-10-13): the TTY backend is not niri's only one.** `src/backend/mod.rs`
+> carries `Tty`, `Winit` and `Headless`, and the Winit backend opens a 1280x800
+> *window* in whatever compositor is already running (`WindowAttributesWayland`,
+> the surface named `niri`), its renderer an EGL context on that window. The
+> `ensure!(!egl_device.is_software())` check lives in the TTY backend's
+> `GpuManager` and **not** in `winit.rs`, so llvmpipe is enough there - which is
+> the whole difference. Selection is environmental, and `main.rs` says it in as
+> many words: with `WAYLAND_DISPLAY`, `WAYLAND_SOCKET` or `DISPLAY` set the
+> *winit* backend is chosen (`--session` removes them to force TTY). smithay's
+> `backend_winit` is behind no feature flag in niri's `Cargo.toml`, so the
+> image's build carries it, and the image carries what an EGL context on a
+> Wayland window needs - `libEGL.so.1`, `libgbm.so.1`,
+> `libwayland-{client,server,egl}`. The recipe is `weston` first (which runs on
+> llvmpipe today) and then, from a shell that can see weston's socket,
+> `WAYLAND_DISPLAY=wayland-1 niri`. **Untried in the guest**: this paragraph is
+> the source and the package list, not a boot.
 
 ---
 
