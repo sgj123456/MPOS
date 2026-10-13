@@ -55,6 +55,24 @@ pub trait Kernel: Sync {
     /// A write to a page marked copy-on-write: give this space its own frame.
     fn resolve_cow_fault(&self, virt: usize) -> bool;
 
+    /// The permissions the process's own mapping gives `virt`, or `None` when no
+    /// mapping describes that address.
+    ///
+    /// A *diagnostic's* question rather than a resolver's. The fault handler has
+    /// already asked every resolver and they have all said no by the time
+    /// anything is reported, so the fact that decides between the two possible
+    /// stories - a writable mapping this kernel left read-only, or a process
+    /// writing where it may not - is exactly the one missing.
+    fn vma_prot_at(&self, virt: usize) -> Option<mpos_vm::MapFlags>;
+
+    /// What kind of mapping describes `virt`, in a word: an anonymous arena, a
+    /// private object or a shared one.
+    fn vma_kind_at(&self, virt: usize) -> Option<&'static str>;
+
+    /// What the mapping containing `addr` is called, or `None` when no mapping
+    /// describes it. A file's path, a `[stack]`, or a name the loader recorded.
+    fn mapping_name_at(&self, addr: usize) -> Option<alloc::string::String>;
+
     /// A fault on a page a mapping covers but nothing has populated yet.
     fn resolve_anon_fault(&self, virt: usize, write: bool) -> bool;
 
@@ -275,6 +293,24 @@ pub fn current_stack_range() -> Option<(usize, usize)> {
 #[inline]
 pub fn resolve_cow_fault(virt: usize) -> bool {
     registered().resolve_cow_fault(virt)
+}
+
+/// The mapping's permissions at `virt`. See [`Kernel::vma_prot_at`].
+#[inline]
+pub fn vma_prot_at(virt: usize) -> Option<mpos_vm::MapFlags> {
+    registered().vma_prot_at(virt)
+}
+
+/// What kind of mapping describes `virt`. See [`Kernel::vma_kind_at`].
+#[inline]
+pub fn vma_kind_at(virt: usize) -> Option<&'static str> {
+    registered().vma_kind_at(virt)
+}
+
+/// What the mapping containing `addr` is called. See [`Kernel::mapping_name_at`].
+#[inline]
+pub fn mapping_name_at(addr: usize) -> Option<alloc::string::String> {
+    registered().mapping_name_at(addr)
 }
 
 /// Resolve a demand-paged fault. See [`Kernel::resolve_anon_fault`].

@@ -302,7 +302,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
     // not a signal to deliver.
     if rip < (1 << 47) {
         crate::hal::kernel::kprintln!("user #PF at {:#x} code={:?} rip={:#x}", addr, code, rip);
-        pf_diag(addr, rip);
+        pf_diag(addr, rip, frame.stack_pointer.as_u64() as usize);
         // Still extends the stack when the fault is a push past the mapped
         // end - the same call, moved here so its answer can be printed with
         // the rest of what the page tables say.
@@ -462,7 +462,32 @@ fn fault_repeats(rip: usize) -> bool {
 /// were the ones withholding it. And a write to `0x8c` in a program's own
 /// read-only image is a null `FILE *` passed to stdio, which the run makes
 /// obvious and the address alone does not.
-fn pf_diag(addr: usize, rip: usize) {
+/// The bytes at `rip`, for a fault report: what the instruction that faulted
+/// actually is, up to the end of its page.
+///
+/// Raw bytes rather than a disassembly, for the reason the report prints
+/// addresses: a page fault is the worst moment to go looking for a decoder. A
+/// `rep movs`/`rep stos`, a store into a computed address and a `push` are told
+/// apart at a glance, and *what was the program doing* is the question a fault
+/// report is asked - the address alone answers it only when it is a stack
+/// pointer.
+///
+/// Empty when the page holding `rip` is itself absent: the read is performed by
+/// the faulting machine, and a user `rip` is no exception to the rule that this
+/// kernel may not dereference one it has not checked.
+fn code_at(rip: usize) -> ([u8; 16], usize) {
+    let room = (PAGE_SIZE - (rip & (PAGE_SIZE - 1))).min(16);
+    let mut code = [0u8; 16];
+    if super::paging::leaf_pte(rip & !(PAGE_SIZE - 1)).is_some() {
+        let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, room) };
+        code[..room].copy_from_slice(bytes);
+        (code, room)
+    } else {
+        (code, 0)
+    }
+}
+
+fn pf_diag(addr: usize, rip: usize, rsp: usize) {
     use core::sync::atomic::AtomicUsize;
 
     // A handful per boot: a task that faults in a loop would otherwise bury
@@ -496,15 +521,7 @@ fn pf_diag(addr: usize, rip: usize) {
         // freed, the user fetch fault was taken, and this diagnostic turned it
         // into a kernel panic. When the page is absent there are no bytes to
         // print, and `rip` beside an empty list says exactly that.
-        let room = (PAGE_SIZE - (rip & (PAGE_SIZE - 1))).min(16);
-        let mut code = [0u8; 16];
-        let code_len = if super::paging::leaf_pte(rip & !(PAGE_SIZE - 1)).is_some() {
-            let bytes = unsafe { core::slice::from_raw_parts(rip as *const u8, room) };
-            code[..room].copy_from_slice(bytes);
-            room
-        } else {
-            0
-        };
+        let (code, code_len) = code_at(rip);
         // And how far the *mapped* pages reach around the hole. A dereference
         // of a pointer that went bad lands a page or two from something real,
         // and the run says so; an access into a mapping the kernel never
@@ -555,14 +572,67 @@ fn pf_diag(addr: usize, rip: usize) {
 
     crate::hal::kernel::kprintln!(
         "PFDIAG page={page:#x} pte={entry:#x} P={} W={} U={} B9={} phys={:#x} run=[{lo:#x}..{hi:#x}) \
-         task={:?} rip={rip:#x}",
+         task={:?} rip={rip:#x} rsp={rsp:#x} below_sp={:#x} op={:02x?}",
         entry & 1,
         (entry >> 1) & 1,
         (entry >> 2) & 1,
         (entry >> 9) & 1,
         entry & 0x000f_ffff_ffff_f000,
-        crate::hal::kernel::current()
+        crate::hal::kernel::current(),
+        rsp.saturating_sub(page),
+        &code_at(rip).0[..code_at(rip).1]
     );
+
+    // And what the *process* asked for, which the page tables do not say. A
+    // present, user, read-only page is two different stories apart: a writable
+    // mapping whose page this kernel left read-only behind the process's back
+    // is a defect here, and a read-only mapping is the process writing where it
+    // may not, which Linux answers the same way.
+    match crate::hal::kernel::vma_prot_at(page) {
+        Some(prot) => crate::hal::kernel::kprintln!(
+            "PFDIAG vma={:#x} ({}{}{}{}) kind={}",
+            prot.bits(),
+            if prot.contains(mpos_vm::MapFlags::READ) {
+                "r"
+            } else {
+                "-"
+            },
+            if prot.contains(mpos_vm::MapFlags::WRITE) {
+                "w"
+            } else {
+                "-"
+            },
+            if prot.contains(mpos_vm::MapFlags::EXEC) {
+                "x"
+            } else {
+                "-"
+            },
+            if prot.contains(mpos_vm::MapFlags::USER) {
+                "u"
+            } else {
+                "-"
+            },
+            crate::hal::kernel::vma_kind_at(page).unwrap_or("?")
+        ),
+        None => crate::hal::kernel::kprintln!(
+            "PFDIAG vma=NONE (no mapping describes {page:#x}: the image, the stack or a hole)"
+        ),
+    }
+
+    // And *who* is writing, and *where*: the name of the mapping each address
+    // belongs to. A `rip` inside a shared object names the library, and the
+    // faulting page named `[stack]` or a file says which region the write was
+    // aimed at - which is the question this report could not answer before.
+    for (what, at) in [("fault_in", page), ("rip_in", rip)] {
+        crate::hal::kernel::kprintln!(
+            "PFDIAG {what}={:#x} {}",
+            at,
+            match crate::hal::kernel::mapping_name_at(at) {
+                Some(name) => name,
+                None => alloc::string::String::from("(no mapping)"),
+            }
+        );
+    }
 
     // Then the whole walk, not just the leaf. The leaf's own bits are a true
     // statement about the leaf and not about the access: the U/S bit is ANDed

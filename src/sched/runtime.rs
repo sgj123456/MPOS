@@ -7072,6 +7072,15 @@ pub fn user_mapped(virt: usize) -> bool {
 /// Used where the *range* decides what a later fault will be allowed to do -
 /// `MADV_DONTNEED` dropping pages that must come back writable, `mremap`
 /// carrying a mapping's permissions with it.
+/// The permissions the process's own mapping gives `virt`, or `None` when no
+/// mapping describes that address.
+///
+/// A fault report's question rather than a resolver's: the resolvers have all
+/// answered no by the time anything is printed, and the one fact that decides
+/// between the two possible stories is missing - whether the page was writable
+/// to begin with. A writable mapping whose page this kernel left read-only is a
+/// defect here; a read-only one is the process writing where it may not, which
+/// is Linux's answer too.
 pub fn vma_prot_at(virt: usize) -> Option<MapFlags> {
     with_table(|t| {
         let owner = t.space_owner(t.current);
@@ -7079,6 +7088,96 @@ pub fn vma_prot_at(virt: usize) -> Option<MapFlags> {
             .mm
             .vma_at(pframe::align_down(virt, PAGE_SIZE))
             .map(|vma| vma.prot)
+    })
+}
+
+/// What kind of mapping describes `virt`, in a word a fault report can print.
+///
+/// [`vma_prot_at`]'s companion: the permissions say whether the process was
+/// allowed to write, and this says *what* it was writing to - an anonymous
+/// arena, a private object (a `memfd` or a file mapped `MAP_PRIVATE`) or one
+/// shared with somebody else.
+pub fn vma_kind_at(virt: usize) -> Option<&'static str> {
+    with_table(|t| {
+        let owner = t.space_owner(t.current);
+        t.task(owner)
+            .mm
+            .vma_at(pframe::align_down(virt, PAGE_SIZE))
+            .map(|vma| match &vma.kind {
+                VmaKind::Anon => "anon",
+                VmaKind::Frames { shared: true, .. } => "object(shared)",
+                VmaKind::Frames { shared: false, .. } => "object(private)",
+            })
+    })
+}
+
+/// What the mapping containing `addr` is *called*, for a fault report: a file
+/// mapping's name, a `[stack]`, the program image's own segment name, or a
+/// library the interpreter mapped.
+///
+/// The two sources are the two `/proc/<pid>/maps` reads as well: the VMA table
+/// (which names a device, a `memfd`, a file) and the loader's *eager* ranges
+/// (the image's segments and every shared object the interpreter mapped, each
+/// recorded with the path it was opened at). A faulting `rip` is almost always
+/// inside one of those, so this is what turns "some library wrote 2 MiB below
+/// its stack pointer" into "*this* library did".
+pub fn mapping_name_at(addr: usize) -> Option<alloc::string::String> {
+    use alloc::string::String;
+    let page = pframe::align_down(addr, PAGE_SIZE);
+    with_table(|t| {
+        let owner = t.space_owner(t.current);
+        let mm = &t.task(owner).mm;
+        // The *range* travels with the name, and that is not decoration: an
+        // unnamed VMA over a page 2 MiB below `sp` says only "some anonymous
+        // region", while `0x…-0x…` beside it says whether the region is the
+        // stack the loader made (64 KiB, `[stack]`), one the stack grew, or
+        // something else entirely. `rw-u` is the permissions the *mapping*
+        // asks for, which is what makes a read-only *page* inside it an
+        // inconsistency rather than a refusal.
+        if let Some(vma) = mm.vma_at(page) {
+            return Some(alloc::format!(
+                "vma[{}] {:#x}..{:#x} {}{}{}{} kind={}",
+                vma.name.as_deref().unwrap_or("unnamed"),
+                vma.start,
+                vma.end,
+                if vma.prot.contains(MapFlags::READ) {
+                    "r"
+                } else {
+                    "-"
+                },
+                if vma.prot.contains(MapFlags::WRITE) {
+                    "w"
+                } else {
+                    "-"
+                },
+                if vma.prot.contains(MapFlags::EXEC) {
+                    "x"
+                } else {
+                    "-"
+                },
+                if vma.prot.contains(MapFlags::USER) {
+                    "u"
+                } else {
+                    "-"
+                },
+                match &vma.kind {
+                    VmaKind::Anon => "anon",
+                    VmaKind::Frames { shared: true, .. } => "object(shared)",
+                    VmaKind::Frames { shared: false, .. } => "object(private)",
+                }
+            ));
+        }
+        for range in mm.eager_ranges() {
+            if page >= range.start && page < range.end {
+                return Some(alloc::format!(
+                    "eager[{}] {:#x}..{:#x}",
+                    range.name.as_deref().unwrap_or("unnamed"),
+                    range.start,
+                    range.end
+                ));
+            }
+        }
+        None
     })
 }
 

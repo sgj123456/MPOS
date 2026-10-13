@@ -44,6 +44,18 @@ impl Kernel for Services {
         sched::resolve_cow_fault(virt)
     }
 
+    fn vma_prot_at(&self, virt: usize) -> Option<mpos_vm::MapFlags> {
+        sched::vma_prot_at(virt)
+    }
+
+    fn vma_kind_at(&self, virt: usize) -> Option<&'static str> {
+        sched::vma_kind_at(virt)
+    }
+
+    fn mapping_name_at(&self, addr: usize) -> Option<alloc::string::String> {
+        sched::mapping_name_at(addr)
+    }
+
     fn resolve_anon_fault(&self, virt: usize, write: bool) -> bool {
         sched::resolve_anon_fault(virt, write)
     }
