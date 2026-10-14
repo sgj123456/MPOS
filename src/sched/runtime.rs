@@ -2109,8 +2109,24 @@ impl Table {
         self.check_posix_timers();
         self.reap();
         self.sched.advance(hal::ticks());
-        let picked = self.sched.pick();
-        picked.map(|id| self.enter(id))
+        // The picker hands back a queued id, and a queue can hold one that is
+        // no longer a task: a task puts itself back when it yields or sleeps
+        // without asking anything about itself first, and a slot the reaper
+        // freed - or a task a group exit marked - cannot be run. Dropping the
+        // id here is the answer, and this is the one place that can give it:
+        // the queues are the scheduler's, and the table is the only thing that
+        // knows whether the task behind an id is still one. `Scheduler::retire`
+        // says the same thing from the other side: "a task left queued after
+        // its slot went away is a pid the picker would dereference into
+        // nothing", and `retire` is called for the siblings of a group exit
+        // only - every other route to that state lands here.
+        while let Some(id) = self.sched.pick() {
+            match self.tasks[id.0].as_ref() {
+                Some(task) if !task.exited => return Some(self.enter(id)),
+                _ => continue,
+            }
+        }
+        None
     }
 
     /// Slot 1 is left free on purpose - it is init's pid - and the top slot is
@@ -2369,6 +2385,28 @@ impl Table {
 
     fn reap(&mut self) {
         self.release_exited();
+        // How many tasks name each slot as the owner of the address space they
+        // run on. A thread has no address space of its own: every question it
+        // asks about its own memory is answered by looking its group **leader**
+        // up (`space_owner`, above) and using the space the leader's slot owns.
+        // A leader that is *named* is therefore not freeable, however dead it
+        // is - its memory is already gone, and what remains is the answer to
+        // the lookups its threads are still making. Linux keeps a thread group
+        // leader until the group's last thread is gone for the same reason, and
+        // the count is taken before the loop because the loop holds the table
+        // mutably.
+        //
+        // Measured on both sides with `t-leader-outlived`. Without this count:
+        // a compositor's main thread ended, the shell beside it collected the
+        // pid (its prompt came back), the reaper freed the slot - and with it
+        // the address space the compositor's worker threads were executing on -
+        // and the next worker to ask for that space was answered with a panic
+        // naming a pid the shell had already buried: `there is no task 10`.
+        // Its siblings took `user #PF` on the pages the freed space had owned.
+        let mut named = [0u32; MAX_TASKS];
+        for task in self.tasks.iter().flatten() {
+            named[task.mm.leader().0] += 1;
+        }
         let mut folds: alloc::vec::Vec<(TaskId, (u64, u64, u64, u64))> = alloc::vec::Vec::new();
         for (slot, entry) in self.tasks.iter_mut().enumerate() {
             let Some(task) = entry else { continue };
@@ -2381,6 +2419,12 @@ impl Table {
                 "reaping the task that is running"
             );
             if exit_code_pending(TaskId(slot)) {
+                continue;
+            }
+            // More than its own reference: a thread of this task's group still
+            // runs on the space this slot owns, so the slot stays a zombie
+            // until that thread is gone and the count above falls to one.
+            if named[slot] > 1 {
                 continue;
             }
 

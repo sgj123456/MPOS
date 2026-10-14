@@ -747,3 +747,75 @@ The file a crash reporter reads to find a program's base address: every mapping 
 **What the work needed, and it is the interesting part:** `execve` maps an image's pages *eagerly* — it fills every page as it loads — so an image leaves **no VMAs at all**, and the same is true of a `MAP_PRIVATE` mapping of an ordinary file. A maps file built from the VMA table alone would therefore omit the one line a crash reporter actually wants: the program's own code. The loader's ranges and the private file mappings are recorded *beside* the table (`mm::vma::MappedRange`) rather than put in it, and the reason is the fault path rather than tidiness: recording them as `VmaKind::Anon` VMAs would make an address that should take a fault — one whose frame a `munmap` or a `MADV_DONTNEED` gave back — silently refill with zeros, which for a program's own code means blank bytes where the file's bytes belong. The cost of that choice is named with it: those ranges are the *load's* record and not the current state, so a `munmap` or `mprotect` over one of them — a dynamic program's `RELRO` pass does the second on every start — is not reflected in the report where a VMA would have been edited. `t-maps` pins the lines, not the mutation, so closing this needs a `forget_ranges`/`reprotect` on the recorded list before it can be pinned.
 
 **Two divergences, pinned as divergences:** an image's and a private file mapping's line reports `dev` `00:00` and inode `0`, because there is no object left to name — and `00:00` is what this kernel's own `stat` reports for every filesystem, so the two files agree rather than disagreeing. And a *shared anonymous* mapping is named `/memfd: (deleted)`, which is Linux's own name for a nameless `memfd` mapping (measured: `memfd_create("", 0)` + `MAP_SHARED` reports exactly that), because that is what the object here is; Linux reaches the same shape through `/dev/zero (deleted)`, which is an artefact of its own implementation. `memfd_create` now *keeps* the name it used to only validate, as `/memfd:<name> (deleted)` — the spelling both of its readers expect, measured on Linux — so a `wl_shm` pool's mapping says which buffer it is instead of leaving the column blank. Not written: `/proc/<pid>/smaps` (per-mapping `Rss`/`VmFlags` and the rest), and `/proc/<pid>/numa_maps`.
+
+
+### 6.7 A group's threads outlive their leader, so the slot that owns their address space outlives the exit code — **LANDED**
+
+**The report.** A compositor aborted on a desktop boot. The shell beside it took its
+prompt back - its `wait` had a code to report - and a moment later the machine died:
+
+```
+KERNEL PANIC: panicked at src/sched/runtime.rs:1714:32:
+there is no task 10
+```
+
+**What the number was.** `1714` is `Table::task`, the shared slot lookup, so the line
+names no caller: it says only that *somebody* asked for task 10, which is the pid the
+compositor's own startup printed (`DEBUG ]: Hyprland PID: 10`), after the slot was
+gone. The first hypothesis - a corrupted descriptor table - was tested against the
+same report from two boots and dropped: the "fd" the dispatcher printed was
+`rmdir(2)`'s pathname pointer (§7.4's EOPNOTSUPP note, fixed separately in
+`1d088e6`), not a descriptor.
+
+**The mechanism, and the shape it is.** A thread has no address space of its own:
+`Table::space_owner` answers the *group leader's* id (`mm.leader()`) and every
+question a thread asks about its own memory - a fault, a map, an unmap - is answered
+by looking that slot up. `reap` freed a slot when two things were true of it: the
+task was `exited`, and its exit code had been collected. Nothing in either question
+asks whether *another* task still names the slot as the owner of the space it is
+executing on. So the leader of a multithreaded group was reaped the moment its parent
+collected it, and dropping the leader's `Task` dropped the address space its threads
+were still running on.
+
+**Measured, on both sides.** `t-leader-outlived` makes the shape without a signal:
+a group of three whose leader ends its own thread with the bare `exit` (`SYS_exit`),
+while two siblings step a counter in a `MAP_SHARED` page the parent reads.
+
+* without the guard: the leader's death is collected, and the two siblings then take
+  `user #PF` at the instruction the freed space had owned - `PFDIAG page=0x450000
+  NOT MAPPED task=13`, `task=14` - and the counter freezes where the death found it
+  (`4 then 4`). A worker that asks for the space *before* it faults on it is the one
+  the panic line names.
+* with it: the slot stays a zombie - its memory is already released, and what remains
+  is the answer to the lookups its threads are still making - and the counter goes on
+  moving (`4 then 128`, two threads at a 10 ms step).
+
+Linux keeps a thread group leader until the group's last thread is gone, which is
+the same rule from the other direction, and this is that rule here.
+
+**The second half, in the same class.** `Scheduler::retire`'s comment already says it:
+"a task left queued after its slot went away is a pid the picker would dereference
+into nothing". `retire` is called for the siblings of an `exit_group` and nowhere
+else, so every other route to that state - a task that puts itself back in its band
+when it yields, a slot the reaper frees between the queue and the pick - lands in
+`Table::next_turn`, which now drops an id whose task is gone or marked exited rather
+than entering it.
+
+**Named, and not fixed.** Two things this session found and deliberately left:
+
+* **a fatal signal ends one thread, not the group.** Linux ends the process
+  (`do_group_exit`); here `exit(-sig)` is called from six places
+  (`sleep_ticks`, `block_until_code`, `block_until_on`,
+  `block_until_on_interruptible`, `block_until_deadline`, `deliver_pending_signal`).
+  Changing all six to `exit_group` compiled and passed every gate, and was reverted
+  rather than shipped, because the pin written for it (`t-fatal-group-exit`) failed
+  with *and* without the change - a claim that cannot tell two kernels apart pins
+  nothing, and it was deleted with the change.
+* **a signal a thread raises at itself does not reach it.** The same pin failed in
+  both kernels because the group never died at all: `raise` from a spawned thread
+  left the leader and its sibling stepping (counter `756 then 831`). A `raise` from
+  the *leader* does kill it, so the difference is delivery to a non-leader thread -
+  `tgkill`'s - and it is unmeasured.
+
+Gates: x86_64 `pass=171 fail=0`, `mpos-kunit 32 passed, 0 failed`; aarch64 as
+recorded by the gate run of the same commit.
