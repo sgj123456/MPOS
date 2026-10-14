@@ -625,7 +625,7 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
         if nr == nr::IOCTL {
             note_eopnotsupp_ioctl(args[0] as i32, args[1] as u32);
         } else {
-            note_eopnotsupp(nr, args[0] as i32);
+            note_eopnotsupp(nr, args);
         }
     }
     ret
@@ -705,14 +705,65 @@ fn note_enosys(nr: u64) {
 /// the number once. "Not supported" is a legitimate answer a libc probes for -
 /// `O_TMPFILE` on a filesystem without it, a `SEEK_HOLE` no driver answers -
 /// and printing it on every occurrence turned one such call into a line per
-/// attempt on the console. `fd` is the call's first argument, which for the
-/// descriptor-taking syscalls names the file that refused - `write(1)` alone
-/// only says *a* write was refused, not whose - so it is printed beside it.
-/// Path-taking calls name nothing useful in `fd`, and there it is noise.
-fn note_eopnotsupp(nr: u64, fd: i32) {
+/// attempt on the console. For a descriptor-taking call the first argument
+/// names the file that refused - `write(1)` alone only says *a* write was
+/// refused, not whose - so it is printed beside the number. A path-taking
+/// call (`rmdir`, `unlink`, the legacy `stat` family) carries a *pointer*
+/// there, so the argument is read as the string it is instead - a diagnostic
+/// that printed the pointer as `fd` put a userspace address on the console
+/// (`syscall 84 (fd 1705166272)`) and read like a corrupted descriptor table,
+/// which sent a reader hunting for a bug that was not there.
+fn note_eopnotsupp(nr: u64, args: [usize; super::ARG_COUNT]) {
     if abi::mark_unsupported(nr) {
-        crate::print!("mpos: syscall {nr} (fd {fd}) -> EOPNOTSUPP\n");
+        if takes_path_in_arg0(nr) {
+            // The same read the handler already did to get this far - a call
+            // refused by a filesystem parsed its path - so this succeeds; the
+            // fallback is for a refusal that did not come from a path at all.
+            match super::cstr_arg(args[0], true) {
+                Ok(path) => {
+                    crate::print!("mpos: syscall {nr} (path {path}) -> EOPNOTSUPP\n");
+                }
+                Err(_) => {
+                    crate::print!("mpos: syscall {nr} (arg0 {:#x}) -> EOPNOTSUPP\n", args[0]);
+                }
+            }
+        } else if matches!(nr, nr::CLONE | nr::UNSHARE) {
+            // These carry a flag word, which is neither a descriptor nor a
+            // path: the sweep's own boot printed `syscall 56 (fd 536870929)`
+            // for a CLONE_NEWPID probe, a number that reads like a descriptor
+            // table gone wrong and is really `0x20000011`.
+            crate::print!(
+                "mpos: syscall {nr} (flags {:#x}) -> EOPNOTSUPP\n",
+                args[0]
+            );
+        } else {
+            crate::print!("mpos: syscall {nr} (fd {}) -> EOPNOTSUPP\n", args[0] as i32);
+        }
     }
+}
+
+#[cfg(target_os = "none")]
+/// Whether `nr`'s first argument is a NUL-terminated path rather than a
+/// descriptor: the legacy calls Linux kept from before `*at` existed. The
+/// `*at` family is deliberately absent - its first argument *is* a descriptor
+/// (`AT_FDCWD` included), so `fd` is the honest name there.
+fn takes_path_in_arg0(nr: u64) -> bool {
+    matches!(
+        nr,
+        nr::OPEN
+            | nr::STAT
+            | nr::LSTAT
+            | nr::ACCESS
+            | nr::CHDIR
+            | nr::MKDIR
+            | nr::RMDIR
+            | nr::UNLINK
+            | nr::READLINK
+            | nr::SYMLINK
+            | nr::CHMOD
+            | nr::MKNOD
+            | nr::TRUNCATE
+    )
 }
 
 #[cfg(target_os = "none")]
