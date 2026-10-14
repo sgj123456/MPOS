@@ -106,6 +106,20 @@ pub struct VirtioGpuDev {
     /// to commit leaves them unequal forever - the screen stays the size it was
     /// driven at, exactly as Linux's fbcon does.
     desired: AtomicUsize,
+    /// The size of the resource the scanout is *presenting*, when that resource
+    /// is a client's rather than this driver's own framebuffer - `None` when
+    /// this driver's framebuffer is on the screen. A compositor draws into its
+    /// own resource and the kernel points the device at it
+    /// (`drivers::drm::client_scanout`, `Gpu::scan_out_client`), so the size the
+    /// screen *is* at that moment is this one, not
+    /// [`scanout`][Self::scanout]'s - which is the geometry of the driver's
+    /// private buffer, a buffer nothing is showing any more. [`driven_dims`]
+    /// is what a reader wants, and keeping the two apart is what stops the card
+    /// reporting a size it is not driving: a compositor that reads a stale size
+    /// back believes its mode is already set, never commits one, and has every
+    /// frame it then sends refused for not fitting the size the card is
+    /// actually driving.
+    presented: Mutex<RefCell<Option<(u32, u32)>>>,
 }
 
 impl VirtioGpuDev {
@@ -223,6 +237,40 @@ impl VirtioGpuDev {
         });
     }
 
+    /// The scanout now shows a *client's* resource of this size.
+    ///
+    /// Recorded rather than inferred: [`driven_dims`] is the only honest answer
+    /// to "what size is the screen", and once a compositor's own buffer is the
+    /// scanout, the driver's private framebuffer's geometry is a fact about a
+    /// buffer nobody is showing.
+    pub fn presenting_client(&self, width: u32, height: u32) {
+        critical_section::with(|cs| {
+            *self.presented.borrow(cs).borrow_mut() = Some((width, height));
+        });
+    }
+
+    /// The scanout is back on this driver's own framebuffer, so its geometry is
+    /// the answer again.
+    pub fn presenting_own_framebuffer(&self) {
+        critical_section::with(|cs| {
+            *self.presented.borrow(cs).borrow_mut() = None;
+        });
+    }
+
+    /// The size the screen is *actually* driving: the presented resource's when
+    /// a client's resource is on the screen, this driver's framebuffer's
+    /// otherwise.
+    ///
+    /// What `GETCRTC` answers and what a committed framebuffer is judged
+    /// against - so it must be the size a viewer of the screen would measure,
+    /// which is the presented resource's, not the private buffer's.
+    pub fn driven_dims(&self) -> (u32, u32) {
+        match critical_section::with(|cs| *self.presented.borrow(cs).borrow()) {
+            Some(dims) => dims,
+            None => self.dims(),
+        }
+    }
+
     /// Build the buffer view over a device the machine has already opened: ask
     /// the host what its display is, fall back to the headless shape, and build
     /// the resource at that size.
@@ -266,6 +314,7 @@ impl VirtioGpuDev {
             })),
             mapped: AtomicBool::new(false),
             desired: AtomicUsize::new(pack_dims(dims.0, dims.1)),
+            presented: Mutex::new(RefCell::new(None)),
         });
 
         // The pages now have more than one kind of owner: the device DMAes

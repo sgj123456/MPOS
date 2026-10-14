@@ -90,6 +90,35 @@ One-glance status of the whole roadmap.
   `DRM_VIRTGPU_GET_CAPS` is served rather than refused, and `niri`/`xwayland-satellite` are
   image packages now, so the compositor's own two remaining warnings are the renderer's
   rather than a missing file's (§7.4)
+- [x] a resource is nameable by the context that names it: `EXECBUFFER` attaches what its
+  `bo_handles` name to the submitting file description's context, and each 3D transfer does the
+  same for its one resource, so the renderer's own batches survive — the boot that used to lose
+  three 852011-byte batches to `Illegal resource` under `initializing the primary renderer` now
+  prints no such line and reaches `putting output Virtual-1` with both sockets up (§7.4,
+  `t-virtgpu`'s two claims, red before it)
+- [x] and the frame reaches the display the way Linux's does: a compositor's framebuffer is
+  **scanned out of the device's own copy of its resource** (`SET_SCANOUT` + `RESOURCE_FLUSH` of
+  the fb's own id, `client_scanout`/`scan_out_client`) rather than copied out of guest pages
+  that were never written — measured as 4096000 zero bytes of committed 1280x800 framebuffer
+  while niri drew into it (`.workbuddy/probe-fb-pixels`), and the predicate is the resource's
+  origin (`Resource::host_pixels`)
+- [x] and the client's resources are *created* the way Linux creates them: on a card that
+  negotiated 3D every `RESOURCE_CREATE` goes through `RESOURCE_CREATE_3D` (`three_d =
+  card().virgl`), because the 2D command is resource/format/width/height and cannot carry the
+  `bind`, `array_size`, `last_level`, `nr_samples` or `flags` a virgl client asks for — the
+  host's GL answered that mismatch with `GL_INVALID_OPERATION` (1282) and dropped kmscube's draws
+  (device pixels for one of its framebuffers: 0 → 4020654, and the three `vrend` lines gone)
+- [~] a framebuffer object's own properties: `OBJ_GETPROPERTIES` answers for one (an empty
+  list, which is what keeps a client walking the card working — niri after kmscube needed it),
+  where Linux publishes `width`, `height`, `format` and `modifier` on an fb (§7.4)
+- [x] the picture itself, in the window: **kmscube's cube and weston's desktop are both visible on
+  the GL card** (watched, 2026-10-14) — a client that renders into a client resource and has the
+  kernel scan it out, and a compositor whose pixels are the guest's, each through its own present
+  path (`docs/notes/` §7.4)
+- [ ] niri's own frame: it commits a framebuffer it never draws into (device pixels 0 of 4096000),
+  with the kernel scanning out exactly that resource — two named leads, its renderer built on
+  `card0` rather than the render node it resolved, and its submissions naming other resources
+  (§7.4)
 - [~] the property families a compositor finds by name — four built, three deliberately absent (§7.4, `t-drm-props`)
 - [~] the DRM surface a wlroots pixman compositor needs — in place, never booted (§7.4)
 - [ ] the renderer Mesa would have to pick: `is_software()` stays true until its loader can

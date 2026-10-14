@@ -43,6 +43,10 @@ pub(crate) const SUITES: &[Suite] = &[
     // The block layer's, which needs the devices the boot step before this one
     // registered (§10.5's last row is about what a read costs the machine).
     mpos::drivers::kunit::SUITE,
+    // The display's, which is the one suite that cannot run where the devices are
+    // probed: the card's owner is a task, so the card is up a step later
+    // (`Phase::Display`) and nowhere before it.
+    mpos::drivers::drm::kunit::SUITE,
     // The boot's own, and the last: the canary at the bottom of the boot stack,
     // which no subsystem's suite can carry because the check it drives is the
     // wiring layer's own (`src/board/report.rs`), and which wants to run once

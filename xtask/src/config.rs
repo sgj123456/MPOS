@@ -1259,10 +1259,17 @@ qemu.gpu = \"c\"
         // extra condition on vsock is the wiring's rather than a key's.
         assert_eq!(x86_qemu.vsock, arm_qemu.vsock);
         assert_eq!(x86_qemu.audio, arm_qemu.audio);
-        // The 2D card is the shipped default, and the GL one is a key away with
-        // the why in `machine.toml`: the sweep passes on it but QEMU returns no
-        // clean debug exit, so the gate cannot carry it (`docs/notes/` §7.4).
-        assert_eq!(x86_qemu.gpu, "virtio-gpu-pci");
+        // The shipped card is the GL one - the only way this machine has a
+        // hardware renderer, and what a compositor needs (§7.4) - and the gate
+        // boots the 2D one on purpose: the guest half is green on the GL card
+        // too (`=== SUMMARY pass=170 fail=0`, `mpos-kunit 30 passed, 0 failed`),
+        // but QEMU then dies inside the host's own `libgallium` on its way out -
+        // `egl_cleanup` under `qemu_cleanup` (the run's `coredumpctl` report) -
+        // so the clean debug exit never arrives and this gate could not call
+        // such a run green. `selftest::boot_tests` overrides the card back to 2D
+        // for that reason, exactly as it drops the vsock bus; the why in full is
+        // `machine.toml`'s (`docs/notes/` §7.4).
+        assert_eq!(x86_qemu.gpu, "virtio-gpu-gl-pci");
 
         let x86 =
             RootfsConfig::load(&root.join(crate::paths::ROOTFS_CONFIG), Arch::X86_64).unwrap();

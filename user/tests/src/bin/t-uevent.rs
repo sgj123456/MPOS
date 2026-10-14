@@ -45,10 +45,26 @@ const UEVENT_GROUP_KERNEL: u32 = 1;
 /// The one udev's own monitors use.
 const UDEV_GROUP: u32 = 2;
 
-/// The sysfs file a cold-plug writes to re-send an event for a device that is
-/// already there - `udevadm trigger`'s own door, so the test needs no device to
-/// appear.
-const TRIGGER: &str = "/sys/devices/virtual/drm/card0/uevent";
+/// The card's **devpath** - the name a uevent announces it under - read out of
+/// the index entry `/sys/dev/char/226:0`, whose link target *is* that devpath
+/// (see `src/vfs/sysfs.rs`'s `the_cards_devpath_runs_through_its_function`).
+///
+/// Asking rather than spelling it is what keeps this test from carrying the
+/// tree's shape. The card hangs off the PCI function its driver declared when
+/// the bus named one (`/devices/pci0000:00/0000:00:04.0/drm/card0`), and off the
+/// `virtual/virtio-gpu` stand-in when it did not; either is the honest name for
+/// the machine that has it, and both of this file's two uses - the file to write
+/// and the string the event must open with - come from this one reading.
+fn card_devpath() -> Option<String> {
+    let link = std::fs::read_link("/sys/dev/char/226:0").ok()?;
+    // The target is relative to `/sys/dev/char`, so one walk up is `/sys`.
+    let devpath = link.to_string_lossy();
+    let devpath = devpath.trim_start_matches("../");
+    if devpath.is_empty() {
+        return None;
+    }
+    Some(format!("/{devpath}"))
+}
 
 /// A `struct sockaddr_nl`: family, pad, port id, groups. Twelve bytes is what a
 /// monitor passes as `msg_namelen`; eight is the short address one claim pins
@@ -185,10 +201,26 @@ fn main() {
     // hangs takes the whole sweep with it - it hung the C probe on a host for
     // exactly that reason. So the precondition is a claim of its own, and the
     // wait is not attempted when it does not hold.
-    if std::fs::metadata(TRIGGER).is_err() {
+    let Some(devpath) = card_devpath() else {
+        println!(
+            "note: this machine has no /sys/dev/char/226:0, so no card's uevent file can be \
+             named - nothing can be announced, so nothing is claimed"
+        );
+        if host_run() {
+            r.finish();
+        }
+        r.check(
+            "the sysfs uevent file this test announces on is there",
+            false,
+        );
+        println!("note: no announcement is possible without it, so the blocking wait is skipped");
+        r.finish();
+    };
+    let trigger = format!("/sys{devpath}/uevent");
+    if std::fs::metadata(&trigger).is_err() {
         if host_run() {
             println!(
-                "note: {TRIGGER} is not a path this host has, and a unicast sendmsg between two \
+                "note: {trigger} is not a path this host has, and a unicast sendmsg between two \
                  monitors answers EPERM here (probe_uevent.c) - nothing can be announced, so \
                  nothing is claimed"
             );
@@ -236,7 +268,7 @@ fn main() {
         unsafe {
             libc::nanosleep(&nap, &mut rem);
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(TRIGGER) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&trigger) {
             use std::io::Write;
             let _ = f.write_all(b"add");
         }
@@ -251,9 +283,12 @@ fn main() {
     );
     if got > 0 {
         let block = &buf[..(got as usize).min(buf.len())];
+        // The event names *this* machine's card, so what it opens with is the
+        // same devpath the trigger was built from - see `card_devpath`.
+        let opener = format!("add@{devpath}");
         r.check(
             "the block opens with the action and the device path",
-            has(block, b"add@/devices/virtual/drm/card0"),
+            has(block, opener.as_bytes()),
         );
         // The legacy shape has no header: the first byte of the first key is
         // the first byte of `add@...`, so a kernel that wrapped the block in a

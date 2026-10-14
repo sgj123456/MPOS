@@ -144,6 +144,16 @@ pub trait GpuDevice: Send {
     /// Put the current scanout's rectangle on the host's display.
     fn flush(&mut self) -> Result<(), Error>;
 
+    /// Put a **client's** frame on the display: point the scanout at `resource`
+    /// and flush that resource, with no transfer - the device holds its pixels.
+    ///
+    /// The other present path, and the one a compositor needs on a card with 3D:
+    /// [`GpuDevice::flush`] carries *this driver's* framebuffer out of guest
+    /// memory, and a client's frame was never there. Which of the two a frame
+    /// wants is `drivers/drm.rs`'s `client_scanout` to say; this call is the
+    /// render task performing it.
+    fn scan_out_client(&mut self, resource: u32, width: u32, height: u32) -> Result<(), Error>;
+
     /// Attach a resource's backing store: `(address, length)` pairs of guest
     /// memory the device may read for that resource.
     fn attach_backing(&mut self, id: u32, entries: &[(u64, u32)]) -> Result<(), Error>;
@@ -166,6 +176,14 @@ pub trait GpuDevice: Send {
 
     /// Bind a resource to a context, so the context's commands may name it.
     fn ctx_attach_resource(&mut self, ctx: u32, resource: u32) -> Result<(), Error>;
+
+    /// The other direction: the context stops being allowed to name `resource`.
+    ///
+    /// Sent when the handle that named it is released, and before that release's
+    /// own unref - which is Linux's order (`gem_object_close` detaches, the object
+    /// outlives the handle) and this card's too, because a resource id here is a
+    /// handle slot the next create re-uses.
+    fn ctx_detach_resource(&mut self, ctx: u32, resource: u32) -> Result<(), Error>;
 
     /// Move a resource between guest memory and the device, in either
     /// direction.
@@ -280,6 +298,15 @@ pub struct Gpu<T: Transport> {
     /// The rectangle the scanout was last set to, which `flush` needs and
     /// `change_resolution` is the only thing that sets.
     rect: Option<abi::Rect>,
+    /// The resource the scanout currently *names*: `RESOURCE_FB` while this
+    /// driver's own framebuffer is what the host scans out, and a client's
+    /// resource id while a compositor's frame is.
+    ///
+    /// Kept because pointing the scanout is a command and the two present paths
+    /// have to agree on which one is in force: [`Gpu::flush`] puts this driver's
+    /// frame back when a client's was the last thing shown, and
+    /// [`Gpu::scan_out_client`] re-points only when the name actually changes.
+    scanout_resource: u32,
     /// How many cap sets the device's configuration says it has.
     ///
     /// Read once at bring-up, and it is what bounds the walk that builds the
@@ -345,6 +372,7 @@ impl<T: Transport> Gpu<T> {
             cursor_flight: 0,
             fb: None,
             rect: None,
+            scanout_resource: abi::RESOURCE_FB,
             num_capsets,
         })
     }
@@ -622,6 +650,14 @@ impl<T: Transport> Gpu<T> {
     /// exists to prevent, not a thing the flush implies.
     pub fn flush(&mut self) -> Result<(), Error> {
         let rect = self.rect.ok_or(Error::NotReady)?;
+        // The screen may be showing a *client's* resource ([`Self::scan_out_client`]).
+        // This is this driver's own frame, so the scanout goes back to it first:
+        // without this a compositor's exit leaves its last frame on the display
+        // and the console never comes back, because `TRANSFER_TO_HOST_2D` +
+        // `RESOURCE_FLUSH` below only ever touch `RESOURCE_FB`.
+        if self.scanout_resource != abi::RESOURCE_FB {
+            self.set_scanout(rect, abi::SCANOUT_ID, abi::RESOURCE_FB)?;
+        }
         self.ok(&abi::TransferToHost2d {
             header: abi::CtrlHeader::new(abi::CMD_TRANSFER_TO_HOST_2D),
             rect,
@@ -633,6 +669,35 @@ impl<T: Transport> Gpu<T> {
             header: abi::CtrlHeader::new(abi::CMD_RESOURCE_FLUSH),
             rect,
             resource_id: abi::RESOURCE_FB,
+            padding: 0,
+        })
+    }
+
+    /// Put a **client's** frame on the display: point the scanout at the resource
+    /// the client drew into, and flush *that*.
+    ///
+    /// No `TRANSFER_TO_HOST_2D`, and that is the whole difference from
+    /// [`Self::flush`]: the transfer is what carries this driver's own framebuffer
+    /// out of guest memory, and a client's frame on a card with 3D was never in it.
+    /// Mesa draws into the device's own copy of the resource - its texture, host
+    /// side - and its export path hands the guest a handle and no readback
+    /// (`virgl_drm_winsys_resource_get_handle`), which `probe-fb-pixels` measured
+    /// from the other end: a compositor's committed framebuffer at 1280x800 was
+    /// 4096000 bytes of **zero** while niri was drawing into it, so copying those
+    /// pages onto the scanout is a black screen - which is exactly what every
+    /// compositor on this card used to get. Naming the resource to the host instead
+    /// is Linux's own shape (`virtio_gpu_cmd_set_scanout` of the framebuffer's
+    /// `hw_res_handle`, then `virtio_gpu_cmd_resource_flush`), and `drivers/drm.rs`'s
+    /// `client_scanout` is who decides that this is the frame to show.
+    pub fn scan_out_client(&mut self, resource: u32, width: u32, height: u32) -> Result<(), Error> {
+        let rect = abi::Rect::whole(width, height);
+        if self.scanout_resource != resource {
+            self.set_scanout(rect, abi::SCANOUT_ID, resource)?;
+        }
+        self.ok(&abi::ResourceFlush {
+            header: abi::CtrlHeader::new(abi::CMD_RESOURCE_FLUSH),
+            rect,
+            resource_id: resource,
             padding: 0,
         })
     }
@@ -966,7 +1031,13 @@ impl<T: Transport> Gpu<T> {
             rect,
             scanout_id,
             resource_id,
-        })
+        })?;
+        // Recorded here rather than at the call sites, because this is the only
+        // command that changes the answer and every way of changing it goes
+        // through here - including `change_resolution`'s own pair and the zero
+        // that stops a scanout before its resource is released.
+        self.scanout_resource = resource_id;
+        Ok(())
     }
 
     /// Whether this device has a cursor queue at all - the single fact the DRM
@@ -1068,6 +1139,10 @@ impl<T: Transport + Send> GpuDevice for Gpu<T> {
         self.flush()
     }
 
+    fn scan_out_client(&mut self, resource: u32, width: u32, height: u32) -> Result<(), Error> {
+        self.scan_out_client(resource, width, height)
+    }
+
     fn attach_backing(&mut self, id: u32, entries: &[(u64, u32)]) -> Result<(), Error> {
         self.attach_backing(id, entries)
     }
@@ -1094,6 +1169,10 @@ impl<T: Transport + Send> GpuDevice for Gpu<T> {
 
     fn ctx_attach_resource(&mut self, ctx: u32, resource: u32) -> Result<(), Error> {
         self.ctx_attach_resource(ctx, resource)
+    }
+
+    fn ctx_detach_resource(&mut self, ctx: u32, resource: u32) -> Result<(), Error> {
+        self.ctx_detach_resource(ctx, resource)
     }
 
     fn transfer_host_3d(

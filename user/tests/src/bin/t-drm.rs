@@ -120,6 +120,14 @@ const NR_GETFB2: u32 = 0xce;
 /// dumb buffer now.
 const NR_RESOURCE_INFO: u32 = 0x45;
 const NR_TRANSFER_TO_HOST: u32 = 0x47;
+/// `DRM_VIRTGPU_RESOURCE_CREATE` and `DRM_VIRTGPU_MAP`, which the buffer-lifetime
+/// claims below need for a reason that has nothing to do with 3D: a create lands
+/// on the **lowest free handle** (`RESOURCE_CREATE` searches the table, while
+/// `CREATE_DUMB` appends), so it is the one request that can show whether a
+/// released name went back into the table or is still held - `MAP` is the one
+/// that shows whether a number is a name at all.
+const NR_RESOURCE_CREATE: u32 = 0x44;
+const NR_VIRTGPU_MAP: u32 = 0x41;
 
 /// `DRM_CLIENT_CAP_ATOMIC`. Set below rather than only asserted: a client that
 /// has not set it is not shown the atomic properties in a list, and the reads
@@ -256,6 +264,37 @@ struct TransferToHost {
     offset: u32,
     stride: u32,
     layer_stride: u32,
+}
+
+/// `struct drm_virtgpu_map`: the mmap offset for a handle's pages.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtgpuMap {
+    offset: u64,
+    handle: u32,
+    pad: u32,
+}
+
+/// `struct drm_virtgpu_resource_create`: the target and its shape in, the GEM
+/// handle and the device's resource id out. Only the fields this file's claim
+/// needs are set - `target` is the 2D one, which both machines serve.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ResourceCreate {
+    target: u32,
+    format: u32,
+    bind: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    array_size: u32,
+    last_level: u32,
+    nr_samples: u32,
+    flags: u32,
+    bo_handle: u32,
+    res_handle: u32,
+    size: u32,
+    stride: u32,
 }
 
 /// `struct drm_mode_fb_cmd`: the legacy framebuffer binding, bpp plus depth.
@@ -453,6 +492,13 @@ const _: () = assert!(core::mem::offset_of!(MapDumb, offset) == 8);
 const _: () = assert!(core::mem::size_of::<ResourceInfo>() == 16);
 const _: () = assert!(core::mem::offset_of!(ResourceInfo, res_handle) == 4);
 const _: () = assert!(core::mem::offset_of!(ResourceInfo, size) == 8);
+const _: () = assert!(core::mem::size_of::<VirtgpuMap>() == 16);
+const _: () = assert!(core::mem::offset_of!(VirtgpuMap, handle) == 8);
+const _: () = assert!(core::mem::size_of::<ResourceCreate>() == 56);
+const _: () = assert!(core::mem::offset_of!(ResourceCreate, width) == 12);
+const _: () = assert!(core::mem::offset_of!(ResourceCreate, bo_handle) == 40);
+const _: () = assert!(core::mem::offset_of!(ResourceCreate, res_handle) == 44);
+const _: () = assert!(core::mem::offset_of!(ResourceCreate, size) == 48);
 const _: () = assert!(core::mem::size_of::<VirtgpuBox>() == 24);
 const _: () = assert!(core::mem::size_of::<TransferToHost>() == 44);
 const _: () = assert!(core::mem::offset_of!(TransferToHost, box_) == 4);
@@ -1451,6 +1497,25 @@ fn main() {
         "VERSION answers no date or description",
         ver.date_len == 0 && ver.desc_len == 0,
     );
+    // The version triple is a feature statement, not a decoration: Mesa's
+    // `virgl_drm_get_version` refuses any major but 0 (the virtio-gpu driver's
+    // own version is 0.x), and it gates the fence-fd protocol on minor >= 1 -
+    // which this kernel's EXECBUFFER refuses, so the honest answer is 0.0.0.
+    // Answering 4.0.0 here cost the whole virgl path once already
+    // (`NOTES.md` §7.4): the screen creation failed, Mesa fell back to
+    // llvmpipe, and a compositor refusing a software EGL device showed nothing.
+    check_is(
+        &mut r,
+        "VERSION answers the 0.x version Mesa's virgl path requires",
+        ver.version_major as isize,
+        0,
+    );
+    check_is(
+        &mut r,
+        "VERSION claims no fence-fd, which EXECBUFFER would refuse",
+        ver.version_minor as isize,
+        0,
+    );
 
     let mut block = [0u8; 64];
     let block_ptr = block.as_mut_ptr() as usize;
@@ -1476,6 +1541,29 @@ fn main() {
         &mut r,
         "VERSION wrote the name through the pointer, not over it",
         &block[..name_len2] == b"virtio_gpu" && ver.name == block_ptr as u64,
+    );
+    // A pointer with no room behind it, for the two fields this card has
+    // nothing to say: a caller that asked for the lengths and was told zero
+    // reserves nothing, and hands the request back the pointer an empty `Vec`
+    // carries - non-null, and nowhere near a mapping. Linux's copy of zero
+    // bytes cannot fault, so an `EFAULT` here is a refusal the caller has no
+    // way to act on. It is what stopped niri between the connector it had just
+    // found and a surface to draw on: `Failed to query drm driver on device
+    // Some("/dev/dri/card0") (Bad address (os error 14))` - one `drmGetVersion`
+    // inside `DrmDevice`'s own setup, three layers below the symptom.
+    ver.date = (block_ptr + 32) as u64;
+    ver.desc = (block_ptr + 40) as u64;
+    let got = unsafe { ioctl(fd, ioc_d(NR_VERSION, 64), (&raw mut ver) as *mut c_void) };
+    check_is(
+        &mut r,
+        "VERSION takes a pointer with zero room for date and desc",
+        got,
+        0,
+    );
+    check_true(
+        &mut r,
+        "and copies nothing through either of them",
+        ver.date_len == 0 && ver.desc_len == 0,
     );
 
     // SET_VERSION: request the 1.4 KMS interface, read the driver's 1.1.
@@ -1503,6 +1591,326 @@ fn main() {
         "SET_VERSION reports the driver",
         dver.drm_dd_major as isize,
         1,
+    );
+
+    // ---- a framebuffer holds its buffer -------------------------------------
+    //
+    // The one place where "the handle is there" and "the buffer is there" are
+    // *different* questions, and every GL compositor on this card depends on the
+    // difference. Mesa's GBM allocator and Aquamarine make a scanout buffer, bind
+    // it with `ADDFB2`, and hand the kernel only the framebuffer: the handle they
+    // made it from is closed, because the framebuffer is all the kernel needs to
+    // flip. Linux's `drm_framebuffer_init` takes a reference on the GEM object for
+    // exactly that reason - the file's handle is one holder, the framebuffer is
+    // another. This card used to free the buffer with the name instead, so the
+    // framebuffer id stayed listed by `GETRESOURCES` while every commit naming it
+    // was refused (`fb_fits_at` asks whether the buffer is there) - and Hyprland
+    // came up with no picture and nothing in its own log to read. niri escaped it
+    // only because Mesa's virgl winsys keeps its handle open.
+    //
+    // Both doors are tried, because the hold has to be a fact about the *buffer*
+    // rather than about which request made it.
+    let mut holding = CreateDumb {
+        height: 96,
+        width: 96,
+        bpp: 32,
+        ..CreateDumb::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_CREATE_DUMB, 32),
+            (&raw mut holding) as *mut c_void,
+        )
+    };
+    check_is(&mut r, "a buffer a framebuffer will hold is made", got, 0);
+    let mut held_fb = FbCmd {
+        width: holding.width,
+        height: holding.height,
+        pitch: holding.pitch,
+        bpp: 32,
+        depth: 24,
+        handle: holding.handle,
+        ..FbCmd::default()
+    };
+    let got = unsafe { ioctl(fd, ioc_d(NR_ADDFB, 28), (&raw mut held_fb) as *mut c_void) };
+    check_is(&mut r, "ADDFB binds it", got, 0);
+    let mut held_close = GemClose {
+        handle: holding.handle,
+        ..GemClose::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GEM_CLOSE, 8),
+            (&raw mut held_close) as *mut c_void,
+        )
+    };
+    check_is(
+        &mut r,
+        "its handle is released while the framebuffer names it",
+        got,
+        0,
+    );
+    let mut held_crtc = ModeCrtc {
+        crtc_id: CRTC_ID,
+        fb_id: held_fb.fb_id,
+        ..ModeCrtc::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_SETCRTC, 104),
+            (&raw mut held_crtc) as *mut c_void,
+        )
+    };
+    check_is(
+        &mut r,
+        "and the framebuffer is still driven - the buffer outlived its name",
+        got,
+        0,
+    );
+    let mut held_flip = PageFlip {
+        crtc_id: CRTC_ID,
+        fb_id: held_fb.fb_id,
+        flags: PAGE_FLIP_EVENT,
+        ..PageFlip::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_PAGE_FLIP, 24),
+            (&raw mut held_flip) as *mut c_void,
+        )
+    };
+    check_is(&mut r, "and it still flips", got, 0);
+    if got == 0 {
+        let mut held_ev = [0u8; 32];
+        let n = rustix::io::read(&card, &mut held_ev).unwrap_or(0);
+        let etype = u32::from_ne_bytes([held_ev[0], held_ev[1], held_ev[2], held_ev[3]]);
+        check_true(
+            &mut r,
+            "and that flip completes",
+            n >= 8 && etype == EVENT_FLIP_COMPLETE,
+        );
+    }
+    // What the framebuffer was made from is still readable, and what the *name*
+    // being gone means is what Linux says for a handle its file no longer has: the
+    // release refused twice, and no map for the number.
+    let mut held_get = FbCmd {
+        fb_id: held_fb.fb_id,
+        ..FbCmd::default()
+    };
+    let got = unsafe { ioctl(fd, ioc_d(NR_GETFB, 28), (&raw mut held_get) as *mut c_void) };
+    check_is(&mut r, "GETFB still answers for it", got, 0);
+    check_is(
+        &mut r,
+        "with the handle it was made from",
+        held_get.handle as isize,
+        holding.handle as isize,
+    );
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GEM_CLOSE, 8),
+            (&raw mut held_close) as *mut c_void,
+        )
+    };
+    check_refused(
+        &mut r,
+        "GEM_CLOSE refuses the name it has already released",
+        got,
+        Errno::INVAL,
+    );
+    let mut held_map = VirtgpuMap {
+        handle: holding.handle,
+        ..VirtgpuMap::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_VIRTGPU_MAP, 16),
+            (&raw mut held_map) as *mut c_void,
+        )
+    };
+    check_refused(
+        &mut r,
+        "VIRTGPU_MAP refuses the released name",
+        got,
+        Errno::NOENT,
+    );
+
+    // The hold itself, through the one request that can see it: a `RESOURCE_CREATE`
+    // lands on the **lowest free handle**, so a create run while a framebuffer
+    // holds the buffer cannot answer with the released name - and does, on a card
+    // that freed the buffer with the name (this pair was red there).
+    let mut held = ResourceCreate {
+        target: 2,
+        width: 96,
+        height: 96,
+        depth: 1,
+        array_size: 1,
+        last_level: 1,
+        nr_samples: 1,
+        size: 96 * 96 * 4,
+        ..ResourceCreate::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_CREATE, 56),
+            (&raw mut held) as *mut c_void,
+        )
+    };
+    check_is(&mut r, "a resource is created", got, 0);
+    let held_handle = held.bo_handle;
+    check_true(&mut r, "and it answers a handle", held_handle != 0);
+    let mut res_fb = FbCmd {
+        width: 96,
+        height: 96,
+        pitch: 384,
+        bpp: 32,
+        depth: 24,
+        handle: held_handle,
+        ..FbCmd::default()
+    };
+    let got = unsafe { ioctl(fd, ioc_d(NR_ADDFB, 28), (&raw mut res_fb) as *mut c_void) };
+    check_is(&mut r, "a framebuffer is bound to the resource", got, 0);
+    let mut res_close = GemClose {
+        handle: held_handle,
+        ..GemClose::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GEM_CLOSE, 8),
+            (&raw mut res_close) as *mut c_void,
+        )
+    };
+    check_is(&mut r, "and its handle is released too", got, 0);
+    let mut res_crtc = ModeCrtc {
+        crtc_id: CRTC_ID,
+        fb_id: res_fb.fb_id,
+        ..ModeCrtc::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_SETCRTC, 104),
+            (&raw mut res_crtc) as *mut c_void,
+        )
+    };
+    check_is(
+        &mut r,
+        "the resource-backed framebuffer drives as well",
+        got,
+        0,
+    );
+    // What the card reports as the size it *drives* is not a claim this program
+    // can make: the size follows the resource the render task is presenting, and
+    // it presents a client's only when the console is not painting - the state a
+    // compositor puts the card in, which a console-owned test boot never
+    // reaches. The rule is pinned in the boot self-test
+    // (`drivers::drm::kunit`) and measured on the machine in `docs/notes/07`
+    // §7.4.
+    let mut neighbour = ResourceCreate {
+        target: 2,
+        width: 96,
+        height: 96,
+        depth: 1,
+        array_size: 1,
+        last_level: 1,
+        nr_samples: 1,
+        size: 96 * 96 * 4,
+        ..ResourceCreate::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_CREATE, 56),
+            (&raw mut neighbour) as *mut c_void,
+        )
+    };
+    check_is(&mut r, "another resource is created", got, 0);
+    check_true(
+        &mut r,
+        "and it does not take the name the framebuffer is holding",
+        neighbour.bo_handle != held_handle,
+    );
+    // Then the framebuffer goes, and the hold with it: the buffer dies with its
+    // last holder, so its slot is the free one again. This is what keeps the hold
+    // from being a leak - a buffer no request can reach any more and no
+    // framebuffer holds is gone.
+    let mut res_rm = res_fb.fb_id;
+    let got = unsafe { ioctl(fd, ioc_d(NR_RMFB, 4), (&raw mut res_rm) as *mut c_void) };
+    check_is(&mut r, "RMFB removes it", got, 0);
+    let mut after = ResourceCreate {
+        target: 2,
+        width: 96,
+        height: 96,
+        depth: 1,
+        array_size: 1,
+        last_level: 1,
+        nr_samples: 1,
+        size: 96 * 96 * 4,
+        ..ResourceCreate::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_CREATE, 56),
+            (&raw mut after) as *mut c_void,
+        )
+    };
+    check_is(
+        &mut r,
+        "a resource is created after the framebuffer goes",
+        got,
+        0,
+    );
+    check_is(
+        &mut r,
+        "and it lands on the name the framebuffer was holding",
+        after.bo_handle as isize,
+        held_handle as isize,
+    );
+    // Leave the table as it was found; the dumb buffer's own hold goes too.
+    let mut res_rm2 = held_fb.fb_id;
+    let got = unsafe { ioctl(fd, ioc_d(NR_RMFB, 4), (&raw mut res_rm2) as *mut c_void) };
+    check_is(&mut r, "the first hold is removed as well", got, 0);
+    for handle in [neighbour.bo_handle, after.bo_handle] {
+        let mut c = GemClose {
+            handle,
+            ..GemClose::default()
+        };
+        let got = unsafe { ioctl(fd, ioc_d(NR_GEM_CLOSE, 8), (&raw mut c) as *mut c_void) };
+        check_is(
+            &mut r,
+            "the resources made for this claim are released",
+            got,
+            0,
+        );
+    }
+    // Put the screen back where this claim found it. The earlier part of this file
+    // bound `fb_id`, and a claim further down that presents through the *current*
+    // framebuffer must not meet a CRTC naming one this claim removed.
+    let mut restore = ModeCrtc {
+        crtc_id: CRTC_ID,
+        fb_id,
+        ..ModeCrtc::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_SETCRTC, 104),
+            (&raw mut restore) as *mut c_void,
+        )
+    };
+    check_is(
+        &mut r,
+        "the screen is put back where this claim found it",
+        got,
+        0,
     );
 
     // The magic handshake, as a master authenticating itself. The master is

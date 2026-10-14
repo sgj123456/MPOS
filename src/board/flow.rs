@@ -231,6 +231,10 @@ pub fn init(info: &BootInfo) -> ! {
         );
         mpos::drivers::video::render::spawn(device, view);
     }
+    // Fired whether or not a card was found: a machine with no display reaches
+    // the same step, and its suite is the one that says so.
+    #[cfg(feature = "selftest")]
+    kunit::reached(kunit::Phase::Display, info);
 
     // The console's own interrupts, before the handoff: the mux has to be up
     // first, so a byte the receiver delivers belongs to the active virtual console

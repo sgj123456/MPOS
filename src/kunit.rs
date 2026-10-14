@@ -61,6 +61,13 @@ pub enum Phase {
     ConsoleTx,
     /// The bootstrap root is mounted and the archive unpacked.
     Vfs,
+    /// The display card is open and its render task is running.
+    ///
+    /// Its own step rather than part of [`Phase::Vfs`], which is the step it
+    /// happens in: the card's *owner* is a task, so it can only come up once
+    /// there is a scheduler to start one on, and a suite that asks the KMS
+    /// doors about the card needs that to have happened rather than the root.
+    Display,
     /// The tty table and the signal path are up.
     Ipc,
     /// No suite runs here: the harness reports what the phases above found.

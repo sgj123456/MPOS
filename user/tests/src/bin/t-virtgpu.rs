@@ -60,8 +60,10 @@ use std::ffi::c_void;
 use std::os::fd::AsRawFd;
 
 use mpos_user_tests::{Report, host_run};
+use rustix::fd::OwnedFd;
 use rustix::fs::{CWD, Mode, OFlags, openat};
 use rustix::io::Errno;
+use rustix::mm::{MapFlags, ProtFlags};
 
 /// `DRM_IOCTL_BASE` is `'d'` (0x64), and the command number sits at bits 8..15
 /// of the request word - see `t-drm.rs` for why this kernel accepts both this
@@ -84,6 +86,39 @@ const NR_GET_CAPS: u32 = 0x49;
 const NR_RESOURCE_CREATE_BLOB: u32 = 0x4a;
 const NR_CONTEXT_INIT: u32 = 0x4b;
 const NR_GEM_CLOSE: u32 = 0x09;
+const NR_CREATE_DUMB: u32 = 0xb2;
+const NR_PRIME_HANDLE_TO_FD: u32 = 0x2d;
+const NR_PRIME_FD_TO_HANDLE: u32 = 0x2e;
+
+/// `VIRGL_CCMD_TRANSFER3D` - the one command that moves a resource's pixels
+/// between the host's copy of it and the guest pages the device was given as its
+/// backing. Its number is the position it holds in virgl's command enum, which
+/// is why it is written here with the count it comes from rather than borrowed
+/// from a header this program does not have: 43 entries precede it.
+const VIRGL_CCMD_TRANSFER3D: u32 = 43;
+
+/// A `TRANSFER3D`'s payload, in dwords, after the command word: the resource,
+/// its level, the transfer usage, the two strides, the box, the offset, and the
+/// direction. The layout is Mesa's own encoder's
+/// (`virgl_encoder_transfer3d_common` then offset then direction), which is the
+/// other end of this wire.
+const VIRGL_TRANSFER3D_SIZE: u32 = 13;
+
+/// The direction word's value for host-to-guest, where `1` is the other way.
+/// This is the only direction whose *effect* a guest can read back: the pixels
+/// land in the pages the device was given, so a caller that filled them first
+/// can tell whether the command ran.
+const VIRGL_TRANSFER_FROM_HOST: u32 = 2;
+
+/// The resource a `transfer3d_from_host` below is built over: 64 x 64 at 32 bits
+/// per pixel, the size and the pitch a GBM buffer of that shape has.
+const PIN_BYTES: usize = 64 * 64 * 4;
+
+/// The bottom of the range this driver keeps for its *own* device resources -
+/// the scanout's framebuffer and the host cursor. A GEM handle a client holds
+/// is always below it, which is what lets one number serve as both a handle
+/// and a wire resource id.
+const DRIVER_RESOURCE_BASE: u32 = 0x4000_0000;
 
 /// What `GETPARAM` leaves in the caller's word before it runs, so that a kernel
 /// writing more than Linux does is visible: the low half is the answer's and the
@@ -161,6 +196,109 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_ne_bytes(a)
 }
 
+/// A command stream whose **one** command is `TRANSFER3D` from the host into
+/// `res_handle`, over the whole of a `width` x `height` level.
+///
+/// The command word carries the length in its top half and the command in its
+/// low byte (`VIRGL_CMD0`), with no object: a stream is a sequence of these, and
+/// this one is a single command of exactly the size the decoder checks for.
+///
+/// The fields are in the order Mesa's encoder writes them, which is the order
+/// vrend's decoder reads: resource, level, usage, stride, layer stride, the six
+/// box words, the offset, the direction. Zero strides mean "the host infers
+/// them", which is what Mesa sends for anything but a blob with guest memory.
+fn transfer3d_from_host(res_handle: u32, width: u32, height: u32) -> [u32; 14] {
+    let mut stream = [0u32; 14];
+    stream[0] = VIRGL_CCMD_TRANSFER3D | (VIRGL_TRANSFER3D_SIZE << 16);
+    stream[1] = res_handle;
+    stream[2] = 0; // level 0, the only one this resource has
+    stream[3] = 1; // PIPE_TRANSFER_READ: the usage a read-back asks for
+    stream[4] = 0; // stride: inferred
+    stream[5] = 0; // layer stride: inferred
+    stream[9] = width; // box.w
+    stream[10] = height; // box.h
+    stream[11] = 1; // box.d
+    stream[13] = VIRGL_TRANSFER_FROM_HOST;
+    stream
+}
+
+/// `EXECBUFFER` with `stream` as its one command and `bo_handle` as the one
+/// buffer it names - the shape a driver's submit has, and the whole of what the
+/// request carries besides the flags this card refuses.
+///
+/// The answer is the *request's*, not the device's: QEMU answers every submit
+/// `OK_NODATA` and discards what virglrenderer made of the stream, so a batch the
+/// host dropped still comes back `0` here. That is why the claim below is about
+/// pixels and not about this return value - see the block that uses it.
+fn submit(fd: i32, stream: &[u32], bo_handle: u32) -> isize {
+    let handles = [bo_handle];
+    let mut eb = [0u8; 64];
+    eb[8..16].copy_from_slice(&(stream.as_ptr() as u64).to_ne_bytes());
+    eb[16..24].copy_from_slice(&(handles.as_ptr() as u64).to_ne_bytes());
+    put_u32(&mut eb, 4, (stream.len() * 4) as u32);
+    put_u32(&mut eb, 24, 1);
+    unsafe { ioctl(fd, ioc_d(NR_EXECBUFFER, 64), eb.as_mut_ptr() as *mut c_void) }
+}
+
+/// `PRIME_HANDLE_TO_FD`: a handle this card made, out as a descriptor another
+/// file can import. `struct drm_prime_handle`: handle@0, flags@4, fd@8.
+fn prime_handle_to_fd(fd: i32, handle: u32) -> (isize, i32) {
+    let mut arg = [0u8; 12];
+    put_u32(&mut arg, 0, handle);
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_PRIME_HANDLE_TO_FD, 12),
+            arg.as_mut_ptr() as *mut c_void,
+        )
+    };
+    (got, i32::from_ne_bytes([arg[8], arg[9], arg[10], arg[11]]))
+}
+
+/// `PRIME_FD_TO_HANDLE`: that descriptor back in, on another file.
+fn prime_fd_to_handle(fd: i32, descriptor: i32) -> (isize, u32) {
+    let mut arg = [0u8; 12];
+    arg[8..12].copy_from_slice(&descriptor.to_ne_bytes());
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_PRIME_FD_TO_HANDLE, 12),
+            arg.as_mut_ptr() as *mut c_void,
+        )
+    };
+    (got, u32_at(&arg, 0))
+}
+
+/// `RESOURCE_INFO`: the device resource a handle names, and its size.
+fn resource_info(fd: i32, handle: u32) -> (isize, u32) {
+    let mut info = [0u8; 16];
+    put_u32(&mut info, 0, handle);
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_INFO, 16),
+            info.as_mut_ptr() as *mut c_void,
+        )
+    };
+    (got, u32_at(&info, 4))
+}
+
+/// Write `byte` over a mapped buffer - the marker the transfer below destroys.
+///
+/// Volatile because the only reader that matters is the device: a plain store
+/// loop is free to be elided, and the pages are written by something this
+/// program cannot see.
+fn fill_marker(map: *mut u8, len: usize, byte: u8) {
+    for i in 0..len {
+        unsafe { map.add(i).write_volatile(byte) };
+    }
+}
+
+/// Whether every byte of the mapping is still the marker.
+fn marker_intact(map: *const u8, len: usize, byte: u8) -> bool {
+    (0..len).all(|i| unsafe { map.add(i).read_volatile() } == byte)
+}
+
 /// `GETPARAM(param)`, with the destination pre-filled.
 fn getparam(fd: i32, param: u64, value: &mut u64) -> isize {
     *value = SENTINEL;
@@ -183,7 +321,7 @@ fn main() {
         r.finish();
     }
 
-    let fd = match openat(CWD, "/dev/dri/card0", OFlags::RDWR, Mode::empty()) {
+    let card = match openat(CWD, "/dev/dri/card0", OFlags::RDWR, Mode::empty()) {
         Ok(card) => {
             r.check("/dev/dri/card0 opens", true);
             card
@@ -193,7 +331,7 @@ fn main() {
             r.finish();
         }
     };
-    let fd = fd.as_raw_fd();
+    let fd = card.as_raw_fd();
 
     // ---- GETPARAM: the measured table, value for value ----------------------
     let mut v = 0u64;
@@ -292,7 +430,7 @@ fn main() {
     // differs on a virgl card - that a create makes the context - is pinned by
     // the `CONTEXT_INIT` answer below, which is the first request after it.
     if three_d {
-        three_d_assertions(fd, &mut r);
+        three_d_assertions(fd, &card, &mut r);
         r.finish();
     }
 
@@ -394,7 +532,28 @@ fn main() {
     let handle = u32_at(&rc, 40);
     let res_handle = u32_at(&rc, 44);
     r.check("and a GEM handle comes back", handle != 0);
-    r.check("and a device resource id", res_handle != 0);
+    // The resource id and the handle are **one number**, and that is what is
+    // pinned here rather than merely "both are nonzero": the guest names a
+    // resource inside its own command stream with the handle this request
+    // answered, so a card that ran an id counter beside the handle table handed
+    // the device ids it had never been told about. `vrend` answered exactly
+    // that stream with `Illegal resource <n>` and Mesa's render process
+    // stopped - no picture, for a reason three layers away from the number
+    // that caused it. The two drifted apart at the first released handle,
+    // because the counter only went up while handles went back into the table.
+    check_is(
+        &mut r,
+        "and the device resource id is the handle it answered",
+        res_handle as isize,
+        handle as isize,
+    );
+    // The other half of the same statement: the driver's own resources (the
+    // scanout's framebuffer, the host cursor) must sit outside the range a
+    // handle can ever reach, or one of *them* is what a command stream names.
+    r.check(
+        "and no handle is ever a driver-owned resource id",
+        handle < DRIVER_RESOURCE_BASE,
+    );
 
     // The three requests that name it, which answered ENOTTY before a resource
     // could exist. They are the reason the previous pass withheld them: their
@@ -485,6 +644,60 @@ fn main() {
     };
     check_ok(&mut r, "GEM_CLOSE releases the resource handle", got);
 
+    // ---- A dumb buffer's own resource is named by its handle too ------------
+    // `CREATE_DUMB` normally makes a buffer the device never hears about: its
+    // pixels reach the screen through this card's own scanout copy, so this
+    // kernel backs it with a device resource lazily, the first time a caller
+    // addresses the handle as one. That late resource has to answer the same
+    // question the hand-made one above does, for the same reason - and it is
+    // the harder case, because nothing forces the two paths to agree: the
+    // asked-for resource takes its id from the slot it was given, and this one
+    // reuses a slot another kind of buffer may already have been released from.
+    //
+    // This is where niri's picture was lost. A client that draws through GBM
+    // holds dumb handles, and its command stream spells resources with those
+    // handles; a late resource that took its id from a separate counter named
+    // something the device had never created.
+    let mut dumb2 = [0u8; 32];
+    put_u32(&mut dumb2, 0, 64); // height
+    put_u32(&mut dumb2, 4, 64); // width
+    put_u32(&mut dumb2, 8, 32); // bpp
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_CREATE_DUMB, 32),
+            dumb2.as_mut_ptr() as *mut c_void,
+        )
+    };
+    check_ok(&mut r, "CREATE_DUMB succeeds", got);
+    let handle = u32_at(&dumb2, 16);
+    let mut info = [0u8; 16];
+    put_u32(&mut info, 0, handle);
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_INFO, 16),
+            info.as_mut_ptr() as *mut c_void,
+        )
+    };
+    check_ok(&mut r, "RESOURCE_INFO succeeds for a dumb buffer", got);
+    check_is(
+        &mut r,
+        "and the resource it was backed with is named by its handle",
+        u32_at(&info, 4) as isize,
+        handle as isize,
+    );
+    let mut close = [0u8; 8];
+    put_u32(&mut close, 0, handle);
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GEM_CLOSE, 8),
+            close.as_mut_ptr() as *mut c_void,
+        )
+    };
+    check_ok(&mut r, "GEM_CLOSE releases the dumb handle", got);
+
     // ---- RESOURCE_CREATE: what a card without 3D still refuses --------------
     put_u32(&mut rc, 0, 4); // the 3D target
     let got = unsafe {
@@ -556,7 +769,7 @@ fn main() {
 /// that the request reaches the device and comes back - because that is what this
 /// pass added; what the device then thinks of a four-byte stream of zeroes is
 /// QEMU's business.
-fn three_d_assertions(fd: i32, r: &mut Report) {
+fn three_d_assertions(fd: i32, card: &OwnedFd, r: &mut Report) {
     // ---- GET_CAPS: real cap sets, where the other card has none ------------
     // `struct drm_virtgpu_get_caps`: cap_set_id@0, cap_set_ver@4, addr@8 (u64),
     // size@16. The card offers sets 1 (VIRGL) and 2 (VIRGL2), which is the mask
@@ -650,7 +863,28 @@ fn three_d_assertions(fd: i32, r: &mut Report) {
     let handle = u32_at(&rc, 40);
     let res_handle = u32_at(&rc, 44);
     r.check("and a GEM handle comes back", handle != 0);
-    r.check("and a device resource id", res_handle != 0);
+    // The resource id and the handle are **one number**, and that is what is
+    // pinned here rather than merely "both are nonzero": the guest names a
+    // resource inside its own command stream with the handle this request
+    // answered, so a card that ran an id counter beside the handle table handed
+    // the device ids it had never been told about. `vrend` answered exactly
+    // that stream with `Illegal resource <n>` and Mesa's render process
+    // stopped - no picture, for a reason three layers away from the number
+    // that caused it. The two drifted apart at the first released handle,
+    // because the counter only went up while handles went back into the table.
+    check_is(
+        r,
+        "and the device resource id is the handle it answered",
+        res_handle as isize,
+        handle as isize,
+    );
+    // The other half of the same statement: the driver's own resources (the
+    // scanout's framebuffer, the host cursor) must sit outside the range a
+    // handle can ever reach, or one of *them* is what a command stream names.
+    r.check(
+        "and no handle is ever a driver-owned resource id",
+        handle < DRIVER_RESOURCE_BASE,
+    );
 
     // ---- CONTEXT_INIT: late, and that is the measurement -------------------
     // The create above made the context implicitly, because Linux's
@@ -765,6 +999,253 @@ fn three_d_assertions(fd: i32, r: &mut Report) {
         got,
         Errno::NOENT,
     );
+
+    // ---- A stream names a resource, and which file may name it --------------
+    //
+    // This is the shape a compositor's picture was lost to, and it is a claim
+    // about *pixels* because it cannot be one about an errno: QEMU answers every
+    // submit `OK_NODATA` and throws away what virglrenderer made of the stream
+    // (`virtio_gpu_virgl_process_cmd`'s submit arm calls
+    // `virgl_renderer_submit_cmd` and never reads its result, which is why the
+    // return value is checked for "served" and nothing more). So the witness is
+    // the transfer itself: `TRANSFER3D` from the host copies the host's pixels
+    // into the pages the device was given as the resource's backing - the very
+    // pages this program maps - so a marker written first and gone afterwards is
+    // a command that really ran, and a marker still there is a batch that was
+    // dropped.
+    //
+    // A resource is nameable **per context**, and the contexts here are per open
+    // file description: `vrend`'s `vrend_renderer_ctx_res_lookup(ctx, handle)`
+    // is what every command in a stream runs through, and `vrend_context`'s own
+    // comment calls its table "resource bounds to this context". Linux keeps a
+    // file's context told about a resource through
+    // `virtio_gpu_cmd_context_attach_resource`, sent from
+    // `virtio_gpu_gem_object_open` - the hook DRM calls when a *different* file
+    // takes a handle to an object - and `..._detach_resource` from its close.
+    // QEMU forwards exactly that pair and nothing else: its
+    // `virgl_renderer_ctx_attach_resource` has one call site, the
+    // `CTX_ATTACH_RESOURCE` handler, and the create handlers attach nothing.
+    //
+    // The two claims below are one question asked twice, and their *pair* is the
+    // measurement: the first submits the stream from the file that made the
+    // resource (the control - the same statement a stream that never leaves its
+    // own file makes), the second from a second file that imported the
+    // descriptor. If only the second fails, a resource is visible to the file
+    // that made it and not to the file that took a handle to it; if the first
+    // fails too, the create itself is the problem and nothing below it can be
+    // trusted.
+    let mut pin = [0u8; 56];
+    put_u32(&mut pin, 0, 2); // PIPE_TEXTURE_2D: the target a GBM buffer arrives with
+    put_u32(&mut pin, 4, 1); // VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
+    put_u32(&mut pin, 8, 2); // bind: scanout
+    put_u32(&mut pin, 12, 64);
+    put_u32(&mut pin, 16, 64);
+    put_u32(&mut pin, 20, 1);
+    put_u32(&mut pin, 24, 1);
+    put_u32(&mut pin, 28, 1);
+    put_u32(&mut pin, 32, 1);
+    put_u32(&mut pin, 48, PIN_BYTES as u32);
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_CREATE, 56),
+            pin.as_mut_ptr() as *mut c_void,
+        )
+    };
+    check_ok(r, "the resource a command stream will name is created", got);
+    let pin_handle = u32_at(&pin, 40);
+    let pin_res = u32_at(&pin, 44);
+    r.check(
+        "and the stream can spell it - its id is the handle it answered",
+        pin_handle != 0 && pin_res == pin_handle,
+    );
+
+    // Its pages, through the same `MAP` and `mmap` a dumb buffer goes through:
+    // they are the pages the device reads and writes for this resource.
+    let mut map = [0u8; 16];
+    put_u32(&mut map, 8, pin_handle);
+    let got = unsafe { ioctl(fd, ioc_d(NR_MAP, 16), map.as_mut_ptr() as *mut c_void) };
+    check_ok(r, "and its pages map", got);
+    let offset = u64_at(&map, 0);
+    let mapped = unsafe {
+        rustix::mm::mmap(
+            core::ptr::null_mut(),
+            PIN_BYTES,
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::SHARED,
+            &card,
+            offset,
+        )
+    };
+    check_ok(
+        r,
+        "into this program's own address space",
+        mapped.is_ok() as isize,
+    );
+    let pages = mapped
+        .map(|p| p as *mut u8)
+        .unwrap_or(core::ptr::null_mut());
+    if !pages.is_null() {
+        fill_marker(pages, PIN_BYTES, 0xa5);
+        r.check(
+            "and hold what is written into them",
+            marker_intact(pages, PIN_BYTES, 0xa5),
+        );
+    }
+
+    let stream = transfer3d_from_host(pin_res, 64, 64);
+
+    // The control: the file that made the resource submits the stream. This is
+    // the same file, so whatever the create told the device it told about *this*
+    // context - if even this is dropped, the resource does not exist on the host
+    // at all and the failure below says nothing about which file may name it.
+    if !pages.is_null() {
+        fill_marker(pages, PIN_BYTES, 0xa5);
+        let got = submit(fd, &stream, pin_handle);
+        r.check(
+            "a submit from the file that made the resource is served",
+            got >= 0,
+        );
+        r.check(
+            "and its transfer lands - the host's pixels reach the guest pages",
+            !marker_intact(pages, PIN_BYTES, 0xa5),
+        );
+    }
+
+    // The second file: the descriptor out of this card, and the render node in.
+    // This is what a compositor does with a buffer it will draw through - it
+    // hands the descriptor to the node it renders on, and that node *adopts the
+    // resource id* rather than making a resource of its own: Mesa's
+    // `virgl_drm_winsys` asks `RESOURCE_INFO` for the id of any handle it
+    // imported, and spells that id in the streams it submits.
+    let (got, descriptor) = prime_handle_to_fd(fd, pin_handle);
+    check_ok(r, "the resource's descriptor comes out", got);
+    match openat(CWD, "/dev/dri/renderD128", OFlags::RDWR, Mode::empty()) {
+        Ok(render) => {
+            r.check("/dev/dri/renderD128 opens", true);
+            let rfd = render.as_raw_fd();
+            let (got, imported) = prime_fd_to_handle(rfd, descriptor);
+            check_ok(r, "and it goes back in on the render node", got);
+            let (got, their_res) = resource_info(rfd, imported);
+            r.check(
+                "and the render node names the same device resource for it",
+                got >= 0 && their_res == pin_res,
+            );
+
+            if !pages.is_null() {
+                fill_marker(pages, PIN_BYTES, 0xa5);
+                let got = submit(rfd, &stream, imported);
+                r.check(
+                    "a submit from the file that imported it is served",
+                    got >= 0,
+                );
+                // The pin. A resource a second file holds a handle to is one that
+                // file's context has to have been told about - Linux tells it from
+                // `gem_object_open`, and a card that never does answers the batch
+                // with `Illegal resource <id>` and drops it, leaving the marker
+                // exactly as it was written.
+                r.check(
+                    "and that file's transfer lands too - a resource is nameable by the file holding it",
+                    !marker_intact(pages, PIN_BYTES, 0xa5),
+                );
+            }
+            drop(render);
+        }
+        Err(e) => {
+            r.check(&format!("/dev/dri/renderD128 opens ({e:?})"), false);
+        }
+    }
+    // The descriptor this program took out, back in: the `OwnedFd` of the card
+    // is dropped at the end of `main`, and this one is not owned by anything.
+    unsafe { rustix::io::close(descriptor) };
+    let mut close = [0u8; 8];
+    put_u32(&mut close, 0, pin_handle);
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GEM_CLOSE, 8),
+            close.as_mut_ptr() as *mut c_void,
+        )
+    };
+    check_ok(r, "and the handle releases like any other", got);
+
+    // ---- And the id a released handle frees is nameable by whatever takes it -
+    //
+    // A resource id here *is* a handle slot, and the next create claims the lowest
+    // free one - so the resource made just below lands on the number just released,
+    // and the file that names it is the same one whose context was told about the
+    // *old* resource under that number. A card that kept "this context has been
+    // told about id N" past the release would send no attach for the new one, and
+    // the batch naming it would be dropped exactly as before, one reuse later. That
+    // is why the release clears the record and tells the context to let go of the
+    // id (Linux's `gem_object_close`), and this is the claim that goes red without
+    // it.
+    if !pages.is_null() {
+        let _ = unsafe { rustix::mm::munmap(pages as *mut c_void, PIN_BYTES) };
+    }
+    let mut again = [0u8; 56];
+    put_u32(&mut again, 0, 2);
+    put_u32(&mut again, 4, 1);
+    put_u32(&mut again, 8, 2);
+    put_u32(&mut again, 12, 64);
+    put_u32(&mut again, 16, 64);
+    put_u32(&mut again, 20, 1);
+    put_u32(&mut again, 24, 1);
+    put_u32(&mut again, 28, 1);
+    put_u32(&mut again, 32, 1);
+    put_u32(&mut again, 48, PIN_BYTES as u32);
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_RESOURCE_CREATE, 56),
+            again.as_mut_ptr() as *mut c_void,
+        )
+    };
+    check_ok(r, "a resource made after a release is created", got);
+    let again_handle = u32_at(&again, 40);
+    let again_res = u32_at(&again, 44);
+    r.check(
+        "and it lands on the released handle's own id",
+        again_res == pin_res && again_handle == pin_handle,
+    );
+
+    let mut remap = [0u8; 16];
+    put_u32(&mut remap, 8, again_handle);
+    let got = unsafe { ioctl(fd, ioc_d(NR_MAP, 16), remap.as_mut_ptr() as *mut c_void) };
+    check_ok(r, "and its pages map", got);
+    match unsafe {
+        rustix::mm::mmap(
+            core::ptr::null_mut(),
+            PIN_BYTES,
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::SHARED,
+            &card,
+            u64_at(&remap, 0),
+        )
+    } {
+        Ok(mapped) => {
+            let pages = mapped as *mut u8;
+            fill_marker(pages, PIN_BYTES, 0xa5);
+            let stream = transfer3d_from_host(again_res, 64, 64);
+            let got = submit(fd, &stream, again_handle);
+            r.check(
+                "and the file that was told about the old one may name the new one",
+                got >= 0 && !marker_intact(pages, PIN_BYTES, 0xa5),
+            );
+            let _ = unsafe { rustix::mm::munmap(pages as *mut c_void, PIN_BYTES) };
+        }
+        Err(_) => r.check("and its pages map into this program", false),
+    }
+    let mut close = [0u8; 8];
+    put_u32(&mut close, 0, again_handle);
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GEM_CLOSE, 8),
+            close.as_mut_ptr() as *mut c_void,
+        )
+    };
+    check_ok(r, "and that handle releases too", got);
 
     // ---- blobs stay refused, on this card too ------------------------------
     // The GL device this was measured against offers no blob feature, so Linux

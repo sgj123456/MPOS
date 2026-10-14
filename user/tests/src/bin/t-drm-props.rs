@@ -89,9 +89,18 @@ const CURSOR_PLANE_ID: u32 = 37;
 /// checks below name an object, and a bare `34` in an argument tells a reader
 /// nothing about which door it is aimed at.
 const CRTC_ID: u32 = 34;
+/// The encoder `GETRESOURCES` and `GETCONNECTOR` both name - the one object the
+/// card advertises that carries no properties at all.
+const ENCODER_ID: u32 = 33;
 const OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 const OBJECT_CRTC: u32 = 0xcccc_cccc;
 const OBJECT_PLANE: u32 = 0xeeee_eeee;
+const OBJECT_ENCODER: u32 = 0xe0e0_e0e0;
+/// `DRM_MODE_OBJECT_ANY`: "the *id* is what I am naming, not the kind". Linux's
+/// `__drm_mode_object_find` resolves the id in the card's object table and
+/// checks the type only when the caller named one, so this tag is answered for
+/// whatever the id is.
+const OBJECT_ANY: u32 = 0;
 const OBJECT_FB: u32 = 0xfbfb_fbfb;
 
 const DRM_CAP_ADDFB2_MODIFIERS: u64 = 0x10;
@@ -531,6 +540,32 @@ fn prop_list(fd: i32, obj_id: u32, obj_type: u32, ids: &mut [u32]) -> usize {
     arg.count_props as usize
 }
 
+/// `OBJ_GETPROPERTIES` on one object, answering the **raw return** rather than
+/// the count.
+///
+/// [`prop_list`] swallows a refusal on purpose - it is used where the list is
+/// the point - and the encoder's pin is the one place the answer *is* the
+/// claim: this card has an object with no properties, and a card that refused it
+/// would have answered 0 there too.
+fn prop_list_rc(fd: i32, obj_id: u32, obj_type: u32, ids: &mut [u32]) -> isize {
+    let mut values = [0u64; 32];
+    let mut arg = ObjGetProperties {
+        count_props: ids.len() as u32,
+        obj_id,
+        obj_type,
+        ..ObjGetProperties::default()
+    };
+    arg.props_ptr = ids.as_mut_ptr() as u64;
+    arg.prop_values_ptr = values.as_mut_ptr() as u64;
+    unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_OBJ_GETPROPERTIES, size_of::<ObjGetProperties>() as u32),
+            (&raw mut arg) as *mut c_void,
+        )
+    }
+}
+
 /// Read a blob whole, answering its bytes.
 fn blob(fd: i32, id: u32) -> Option<[u8; 256]> {
     let mut data = [0u8; 256];
@@ -786,6 +821,85 @@ fn main() {
             && !conn_uncapped[..conn_uncapped_count.min(16)].contains(&PROP_CRTC_ID),
     );
     drop(second);
+
+    // --- the encoder the card advertises still answers ------------------------
+    //
+    // `OBJ_GETPROPERTIES` is the door a compositor walks for every object
+    // `GETRESOURCES` listed, and the encoder is the one object here with no
+    // properties to give. It still has to *answer*: to a client enumerating
+    // what the card said it has, a refusal is not an empty list, it is a card
+    // that will not open. niri said so in its own words - `error adding primary
+    // node device, display-only devices may not work: DRM access error: Error
+    // reading properties on device Some("/dev/dri/card0") (Invalid argument (os
+    // error 22))` - on both cards, whatever the renderer was.
+    //
+    // The raw return is the claim here, not the count: an empty list and a
+    // refusal both read as 0 through [`prop_list`], which is exactly why this
+    // one needs its own door.
+    let mut enc_ids = [0u32; 16];
+    check_is(
+        &mut r,
+        "the encoder the card advertises answers, with an empty property list",
+        prop_list_rc(fd, ENCODER_ID, OBJECT_ENCODER, &mut enc_ids),
+        0,
+    );
+
+    // --- the same door with the kind left to the card --------------------------
+    //
+    // `DRM_MODE_OBJECT_ANY` is a client saying "the **id** is what I am naming",
+    // and Linux answers it out of the card's one object table: the id is
+    // resolved, and the type is checked only when the caller named one. It is
+    // how a property's *value* is read - Aquamarine's `getDRMProp` is
+    // `drmModeObjectGetProperties(fd, obj, DRM_MODE_OBJECT_ANY)` - and the card
+    // that refused the tag did not merely lose a property: the plane whose
+    // `type` could not be read failed `SDRMPlane::init`, which failed the whole
+    // DRM backend and ended in Hyprland's `CBackend::create() failed!`
+    // (`docs/notes/` §7.4).
+    //
+    // Each claim is a *pair* - the same object through both doors - because
+    // "answers under ANY" is worth nothing if it answers a different list, and
+    // the raw return is what tells an empty list from a refusal (the encoder has
+    // no properties to give and must still answer).
+    for (what, id, kind) in [
+        ("the CRTC", CRTC_ID, OBJECT_CRTC),
+        ("the connector", CONNECTOR_ID, OBJECT_CONNECTOR),
+        ("the encoder", ENCODER_ID, OBJECT_ENCODER),
+        ("the primary plane", PLANE_ID, OBJECT_PLANE),
+        ("the cursor plane", CURSOR_PLANE_ID, OBJECT_PLANE),
+    ] {
+        let mut with_any = [0u32; 16];
+        let mut with_kind = [0u32; 16];
+        let any_rc = prop_list_rc(fd, id, OBJECT_ANY, &mut with_any);
+        let kind_rc = prop_list_rc(fd, id, kind, &mut with_kind);
+        check_true(
+            &mut r,
+            &format!("{what} answers DRM_MODE_OBJECT_ANY, with its own kind's list"),
+            any_rc == 0 && kind_rc == 0 && with_any == with_kind,
+        );
+    }
+    // The call itself, on the property it was made for: a *value* read under the
+    // ANY tag, reached by the name a client looks up rather than by this card's
+    // numbering - what `SDRMPlane::init` does with the plane's `type`, and the
+    // value that says this plane is the primary one.
+    check_true(
+        &mut r,
+        "the primary plane's `type` value reads back under DRM_MODE_OBJECT_ANY",
+        property_id(fd, PLANE_ID, OBJECT_ANY, b"type").map(|(_, value)| value) == Some(1),
+    );
+    // ANY is a lookup, not a licence: an id nothing holds is still refused, and
+    // so is a kind the id does not have.
+    check_refused(
+        &mut r,
+        "an id no object holds is refused under DRM_MODE_OBJECT_ANY",
+        prop_list_rc(fd, 0xdead_beef, OBJECT_ANY, &mut [0u32; 16]),
+        Errno::INVAL,
+    );
+    check_refused(
+        &mut r,
+        "the plane's id under the connector's kind is still refused",
+        prop_list_rc(fd, PLANE_ID, OBJECT_CONNECTOR, &mut [0u32; 16]),
+        Errno::INVAL,
+    );
 
     // --- the connector's property list -------------------------------------------------
     //

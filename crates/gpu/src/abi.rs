@@ -206,12 +206,29 @@ pub const FLAG_FENCE: u32 = 1 << 0;
 
 /// The resource this driver's scanout always uses.
 ///
-/// One, because this kernel drives exactly one scanout and one framebuffer: the
-/// device supports 16, the DRM layer exposes one connector, and a second
-/// resource would be a second screen nothing can reach. It is a constant rather
-/// than a counter because its lifetime is the machine's - `change_resolution`
-/// tears it down and builds it again under the same id.
-pub const RESOURCE_FB: u32 = 1;
+/// A constant rather than a counter, because it is one resource for the
+/// machine's lifetime: this kernel drives exactly one scanout and one
+/// framebuffer - the device supports 16, the DRM layer exposes one connector,
+/// and a second resource would be a second screen nothing can reach - and
+/// `change_resolution` tears it down and builds it again under the same id.
+///
+/// The value sits in the driver's own range, far above any GEM handle a client
+/// can hold, and it has to: a resource id is a number the guest's userspace
+/// *names* in its command stream, and the stream spells it with the handle the
+/// DRM layer handed it - so the two spaces must be one space, and a
+/// driver-owned resource cannot sit inside the handle table's range. It was 1
+/// once, which put the driver's own framebuffer at the bottom of the client's
+/// handle table and made every later resource id off by one from the handle
+/// that named it; the device then answered commands about a resource it had
+/// never been told about with `Illegal resource`.
+/// `DRIVER_BLOB_*` in the DRM layer keeps its own ids above the client blob
+/// table for the same reason, a window below this one.
+pub const RESOURCE_FB: u32 = 0x4000_0004;
+
+/// The device resource the host pointer is drawn from, beside
+/// [`RESOURCE_FB`]'s for the same reason: the cursor's id is this driver's own,
+/// and a client's command stream never names it.
+pub const RESOURCE_CURSOR: u32 = 0x4000_0005;
 
 /// Scanout 0 - the only one `num_scanouts` is asked about, and the only one
 /// the DRM layer's single connector names.
@@ -772,7 +789,11 @@ mod tests {
         assert_eq!(RESP_ERR_INVALID_CONTEXT_ID, 0x1204);
         assert_eq!(RESP_ERR_INVALID_PARAMETER, 0x1205);
         assert_eq!(SCANOUT_ID, 0);
-        assert_eq!(RESOURCE_FB, 1);
+        // Above every GEM handle, and beside the cursor's own id: the driver's
+        // resources live outside the client's id space so a command stream can
+        // spell its handles without ever naming one.
+        assert_eq!(RESOURCE_FB, 0x4000_0004);
+        assert_eq!(RESOURCE_CURSOR, 0x4000_0005);
         assert_eq!(FORMAT_B8G8R8A8_UNORM, 1);
         assert_eq!(MAX_SCANOUTS, 16);
         assert_eq!(EVENT_DISPLAY, 1);

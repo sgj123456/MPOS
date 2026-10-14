@@ -73,30 +73,48 @@ qemu.vsock = true
 # exercises the driver and /dev/dsp, the host hears silence. Needs QEMU 8.2
 # or newer for the card to exist at all.
 qemu.audio = true
-# The GPU device QEMU attaches (`-device`). `virtio-gpu-pci` is the 2D scanout
-# every boot has used, and it asks nothing of the host - which is why it is the
-# default rather than a fallback.
+# The GPU device QEMU attaches (`-device`). `virtio-gpu-gl-pci` is the virtio-gpu
+# device with the host's `virglrenderer` behind it, and it is what a boot on this
+# host gets: it is the only way this machine has ever had a hardware renderer
+# (`eglinfo -B` answers `virgl (AMD Radeon 780M ...)`, where every boot before it
+# answered `llvmpipe`), and it is what a compositor needs - niri refuses a
+# software EGL device, and with §7.4's four answers in place it comes up on it:
+# `putting output Virtual-1 at x=0 y=0`, `listening on Wayland socket:
+# wayland-1`. It does ask the *host* for a render node, so a host without one
+# (`/dev/dri/renderD128` absent) wants the 2D card below - one key, and every
+# boot before 2026-10-14 used it.
 #
-# `virtio-gpu-gl-pci` is the same device with the host's `virglrenderer` behind
-# it, and it is one key away. It is *not* the default because the gate cannot
-# carry it yet, measured 2026-10-13 on a host that does have GL - `/dev/dri/
-# renderD128` exists, and `-display egl-headless,gl=on -device virtio-gpu-gl-pci`
-# starts, so the note here that the GL card cannot boot at all was true of the
-# host that wrote it and is not true of this one:
-#   * the sweep passes on it (`pass=169 fail=0`, `mpos-kunit 30 passed, 0
-#     failed`) but QEMU does not return the clean debug exit - the run reports
-#     `QEMU exited with -1 (33 is the clean debug exit)` - so the gate refuses to
-#     call the run green, which is the gate doing its job;
-#   * and virglrenderer rejects a resource the guest asks for:
+# `virtio-gpu-pci` is the 2D scanout, and it is what the **gate** boots - the one
+# boot that cannot carry the GL card, measured 2026-10-14 on this same host. The
+# guest half is green on the GL card (`=== SUMMARY pass=170 fail=0` and
+# `mpos-kunit 30 passed, 0 failed`), but QEMU does not survive the boot's *end*:
+# after the guest writes its debug exit it dies with SIGSEGV inside the **host's**
+# own `libgallium`, reached from QEMU's `egl_cleanup` during `qemu_cleanup`
+# (`coredumpctl`: `#15 egl_cleanup (ui-opengl.so)`). That is a host Mesa teardown
+# crash and not a refusal this kernel could answer, so the gate's exit-33 check
+# reads `-1` and would never call the run green - which is why
+# `xtask/src/selftest.rs` overrides the card back to this one for its own boot,
+# the same way it already drops the vsock bus. `cargo xtask run` keeps the GL
+# card; only the sweep does not;
+#   * and one line the GL boot prints that nobody needs to chase: the *suite's*
+#     own 3D create asks for a cube-map target with `array_size` 1, which is not
+#     a legal cube map, and virglrenderer prints
 #     `vrend_resource_create, Illegal resource parameters, error: Cube map:
-#     unexpected array size 1`.
+#     unexpected array size 1` - and answers it anyway, so nothing fails.
 # Both are recorded with the rest of the renderer chain in `docs/notes/` §7.4.
 #
 # What the GL card *does* fix is `DRM_VIRTGPU_GET_CAPS`: with `capsets=2` the
 # request is served (`virtio-gpu: virgl=1 context_init=1 capsets=2 cached=2`),
 # where a 2D card answers `ENOSYS` - which is Linux's own answer for a card with
 # no cap sets, and not a gap this kernel could close by answering something else.
-qemu.gpu = "virtio-gpu-pci"
+# And it is the only way this machine has ever had a hardware renderer: §7.4
+# carries the four answers that stood between `virtio-gpu-gl-pci` and a picture
+# (a `VERSION` triple Mesa's virgl path refuses; a resource id that was two
+# numbers rather than the one handle; the encoder `OBJ_GETPROPERTIES` refused;
+# and a zero-length `VERSION` field whose pointer was checked anyway). With all
+# four, niri comes up on it - `putting output Virtual-1 at x=0 y=0`, and
+# `wayland-1` listening - which no earlier boot of this machine ever did.
+qemu.gpu = "virtio-gpu-gl-pci"
 # The QEMU display backend for an interactive `run` (`-display`), so the
 # framebuffer console has a window to show itself in. Absent means `sdl`; name
 # another backend your QEMU was built with, or `none` to watch only the serial

@@ -2899,3 +2899,326 @@ not "the window makes it right". It is a `docs/ROADMAP.md` item of its own.
 **Gap closed — the aarch64 session environment.** A login shell on the aarch64 image had no `XDG_RUNTIME_DIR` (measured 2026-10-11) and weston started from it stopped at `fatal: failed to add socket`. The files that provide it now ship in the shared `core/` overlay, so both machines' login shells have it (§15.36/§15.37).
 
 **Gap closed — weston's EL0 write fault, and the cursor it was hiding.** With a runtime dir weston used to reach `Compositor capabilities:`, create `wayland-1`, load `desktop-shell.so` and launch both helper processes, then take a genuine EL0 **write** fault one page above its stack pointer (`ESR 0x92000047`, a level-3 translation fault with `WnR` set) that the resolver refused for want of a VMA (§15.36's last note). The desktop now comes up whole: the fault is resolved by `resolve_stack_growth` on the aarch64 EL0 data-abort path (`arch/src/arch/aarch64/vectors.rs`, alongside the COW and anon resolvers), so the push past the stack boundary grows the stack instead of ending the task. What that boot then showed was the pointer never appearing even though the desktop rendered — and two causes were behind it, both now fixed. First, this card's cursor plane had failed to publish the rectangles weston names unconditionally; §7.4 carries the measurement and the fix (the plane publishes `SRC_*`/`CRTC_W`/`CRTC_H` and honours them as identity-or-refuse). Second, and the reason a *correctly bound* plane still drew nothing on a virtualized display: the card refused `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` while still enumerating the cursor plane, so weston reported `cursor planes: yes`, bound the plane through atomic, and the host - which only draws a virtualized cursor handed a hotspot-correct image over the virtio-gpu cursor queue - showed nothing. The card drove its own software blend into the scanout and never configured the device's cursor queue at all. The fix routes the pointer to the host: the cursor queue is configured when the device has one (probed at bring-up, published as `Card::cursor_q`), the hotspot cap is accepted and `HOTSPOT_X`/`HOTSPOT_Y` are published per-client, and binding or moving the plane posts `UPDATE_CURSOR`/`MOVE_CURSOR` on the cursor queue (`Job::SetCursor`/`MoveCursor`) so the host composites the pointer over whatever frame the guest presents; the software blend remains only as the fallback for a device with no second queue. Pins: `t-drm-props` proves the cap + hotspot enumeration gating, `t-drm` proves an `RMFB` of the cursor's framebuffer takes the plane's binding down (no dangling host resource). **Window confirmation is the remaining step:** the kernel path is complete and gated green on the host and both bare-metal builds, but reading the pointer back on the QEMU window after a `cargo xtask run --mode gui` weston boot is what closes this gap for real, and the no-cursorq fallback branch cannot be exercised on either configured machine (§7.4 names that as a gap).
+
+**Gap closed - niri comes up on the GL machine, and the four answers that stood between `virtio-gpu-gl-pci` and a picture.** Measured 2026-10-14, on the same host, by driving the guest's own shell (`.workbuddy/guest-probe7.py` and `-9`: the script the guest runs is a *file* it reads off the 9p share, because a long command line typed into a serial console is delivered only halfway once a compositor takes the console into `KD_GRAPHICS`; its output is written to the guest's own root and read back out of the image with `qemu-nbd` + `debugfs`, because nothing written through 9p has survived a power-off). Every one of the four was found by asking the guest rather than by reading Mesa, and none was where the symptom appeared:
+
+1. **`VERSION` answered `4.0.0`, and Mesa's virgl winsys refuses any major but 0** - `virgl_drm_get_version` returns `-EINVAL` for `version_major != 0`, so the whole virgl path went down before the card's identity was ever asked, Mesa fell back to `llvmpipe`, and a compositor that refuses a software EGL device had no renderer at all. It answers `0.0.0` now, and the minor being 0 is the same honesty: it is the fence-fd feature version, and this kernel's `EXECBUFFER` refuses `VIRTGPU_EXECBUF_FENCE_FD_OUT`, so a card that said 1 there would promise the one thing it then answers `EINVAL` on. Linux answers 0.1.0 because its execbuffer has the fence.
+2. **A resource id and the GEM handle were two numbers.** A resource id is a field the guest's *command stream* spells, and it spells it with the handle `RESOURCE_CREATE` answered - but ids came from a `next_res_id` counter that only went up while handles went back into the table, so the two drifted apart at the first released handle and the stream named resources the device had never been told about. `vrend` answered `Illegal resource <n>` and Mesa's render process stopped: no picture, for a reason three layers away from the number that caused it. One number now - the slot `RESOURCE_CREATE` claims *is* the id it puts on the wire, claimed inside one critical section because the device is talked to outside every lock - and the driver's own two resources moved out of the clients' range entirely (`RESOURCE_FB` was **1**, the bottom of the handle table).
+3. **`OBJ_GETPROPERTIES` refused the encoder this card itself advertises.** `GETRESOURCES` names `ENCODER_ID` and `GETCONNECTOR` names it back, but the request only knew the connector, the CRTC and the two planes, so the one object with nothing to give was answered `EINVAL` - and to a client enumerating what the card listed, a refusal is not an empty list, it is a card that will not open: `error adding primary node device, display-only devices may not work: DRM access error: Error reading properties on device Some("/dev/dri/card0") (Invalid argument (os error 22))`. It is smithay's `add_props`/`map_props` walking the handles and calling `drmModeObjectGetProperties` on each. The encoder answers with a count of 0 now.
+4. **And `VERSION` checked the pointer of a field it had nothing to copy into.** A caller that asked for the lengths and was told zero reserves no room, and hands the second call the pointer an empty `Vec` carries - non-null, and nowhere near a mapping. Linux's `copy_to_user` of zero bytes cannot fault; this card validated the address anyway and answered `EFAULT`, which is what stopped niri *after* it had found the connector and picked a mode: `Failed to query drm driver on device Some("/dev/dri/card0") (Bad address (os error 14))`. Zero bytes is not an address to check now - the same shape `get_resources` already carried for its own zero-length lists.
+
+With all four, on the GL machine, niri's own words: `got render node: renderD128`, `initializing the primary renderer`, `new connector: Virtual-1 "PNP(MPO) MPOS Virtual 0x00000001"`, `picking mode: 1280x800 ... vrefresh: 60`, `putting output Virtual-1 at x=0 y=0`, `listening on Wayland socket: wayland-1`, `listening on X11 socket: :0` - and no `error adding primary node device` anywhere in it. What is left in that log is the guest's, not the card's: no `waybar` in the image, no `org.freedesktop.login1`/`locale1` on the bus, no default xcursor icon. `eglinfo -B` on the same boot answers `OpenGL core profile renderer: virgl (AMD Radeon 780M Graphics (radeonsi, phoenix, ACO, ...))` on the GBM platform - the host's own GPU, where every earlier boot answered `llvmpipe` under two `failed to create dri2 screen` lines - and `kmscube` renders on it for the whole of its 20s window.
+
+**The 2D card gets three of the four and stops on the one it cannot fix.** On it niri now reads properties and loads the primary node, and then says `failed to initialize renderer, falling back to primary gpu: software EGL renderers are skipped` and `no allocator available for device` - which is a true statement about `llvmpipe`, not a card bug, and is why the GL card is what a compositor needs here. Everything except the renderer is now the same on both machines.
+
+**The GL card is the shipped machine now, and the gate is the one boot that overrides it.** On it the sweep is green - `=== SUMMARY pass=170 fail=0`, `mpos-kunit 30 passed, 0 failed` - but QEMU then dies: SIGSEGV at `egl_cleanup` (QEMU's own `ui-opengl.so`) inside the **host's** `libgallium 26.2.4`, during `qemu_cleanup` *after* the guest wrote its debug exit (`coredumpctl gdb`: `#15 ... egl_cleanup (ui-opengl.so + 0x656f)` / `#16 qemu_display_cleanup` / `#17 qemu_cleanup`). A host Mesa teardown crash, not a refusal this kernel could answer, so the gate's insistence on exit 33 reads `-1` and `cargo xtask test` cannot be green on it. So the split is by *who is booting*: `machine.toml` ships the GL card, because a boot a human watches is the one that wants a renderer, and `selftest::boot_tests` overrides it back to the 2D card - the same place, and the same shape, as the vsock bus it already drops - with the reading above carried in the override and in the key's own comment. A run on this host gets `virgl (AMD Radeon 780M ...)` and niri; the sweep gets `-device virtio-gpu-pci -display none` and its exit 33.
+
+Pins, each one held against the kernel that had the bug - a pin that cannot go red is not a pin: `t-drm` for the `VERSION` triple *and* for the zero-room pointer (`got -14, want 0` against the old kernel), `t-virtgpu` for "the resource id **is** the handle" - for a resource a client made and for the one a dumb buffer gets backed with late, the two paths that used to disagree - and `t-drm-props` for the encoder (`got -22, want 0`). One line the GL boot still prints that nobody needs to chase: the suite's own 3D create asks for a cube-map target with `array_size` 1, which is not a legal cube map, and virglrenderer prints `vrend_resource_create, Illegal resource parameters, error: Cube map: unexpected array size 1` - and answers it anyway, so nothing fails. **That line is not noise, and the "nothing fails" was this section's mistake** - see the third measurement below: what it says is that a create the renderer *refused* was answered as success, so the guest holds a handle to a resource the device never made.
+
+**Gap closed - "no picture" was one number a context had not been told about.** The four answers above let niri come up and take `Virtual-1`; it still painted nothing, and the only thing that said why was QEMU's stderr - above niri's own log, three lines of it, three times over:
+
+    vrend_renderer_transfer_iov: context error reported 2 "mpos" Illegal resource 1
+    context 2 failed to dispatch TRANSFER3D: 22
+    vrend_decode_ctx_submit_cmd: context error reported 2 "mpos" Illegal command buffer 852011
+
+`vrend` resolves a resource **for the context that names it** (`vrend_renderer_ctx_res_lookup`; the context struct's own comment calls its table "resource bounds to this context"), and here a context is one open file description. A command stream that names something its context has not been told about is *dropped* - the whole batch, 852011 bytes of it - over that one number; the batch in this log is the renderer's first, right after `initializing the primary renderer`. Linux keeps a file's context told about its resources at the two moments a file can come to hold one: when it creates one (`virtio_gpu_object_create`, which is `RESOURCE_CREATE_3D` whenever the card has 3D, whatever the target) and when it *opens* a handle to one another file made (`virtio_gpu_gem_object_open` - the only sender of `CTX_ATTACH_RESOURCE` in the host's own `virtio-gpu.ko`, with `virtio_gpu_gem_object_close` sending the mirror). **QEMU forwards exactly that pair and nothing else**: in `hw-display-virtio-gpu-gl.so`, `virgl_renderer_ctx_attach_resource` has one call site - the `CTX_ATTACH_RESOURCE` handler - and both create handlers call `virgl_renderer_resource_create` and return without attaching anything.
+
+This card had one of those three ways wired: `Job::Create3d` attaches, and it is reached only when `target == 4`, the cube map. Mesa's GBM buffers are `PIPE_TEXTURE_2D`, so they took the 2D path - which attached nothing at all, and left the guest's own buffer nameable by *nobody*.
+
+**Measured, because the guest cannot see it.** QEMU answers every submit `OK_NODATA` and discards what virglrenderer made of the stream (`virtio_gpu_virgl_process_cmd`'s submit arm calls `virgl_renderer_submit_cmd` and jumps to the response without reading its result), so the ioctl returns 0 for a batch the host threw away - and a `TRANSFER3D` the host drops leaves the guest's own pages exactly as they were. So `t-virtgpu` reads **pixels**: it creates a `target == 2` resource, maps its pages, writes a marker over them, and submits a one-command stream whose `TRANSFER3D` from the host copies the host's copy of the resource into those very pages. The marker gone is a command that ran; the marker still there is a batch that was dropped. Two claims, one question asked twice: the file that *made* the resource, and a second file that imported its descriptor (`PRIME_HANDLE_TO_FD` then `PRIME_FD_TO_HANDLE` - what a compositor does with a buffer it renders through, Mesa's winsys asking `RESOURCE_INFO` for the imported handle's id and then spelling that id in its own streams). On the kernel before this change **both were red**, each with its own `Illegal resource 2` in QEMU's stderr - including the file that made the resource, which is the statement that nobody could name it.
+
+**The fix is the door every submission passes through.** `EXECBUFFER` resolves its `bo_handles` (it already did, for `ENOENT`, which is Linux's answer for a handle the file does not hold) and hands their resource ids to `attach_resources`, which tells the submitting context about the ones it has not been told about yet; the pairs sent are remembered per context, so only the first stream to name a resource pays a control-queue round trip. The 3D transfers (`TRANSFER_TO_HOST_3D`/`FROM_HOST_3D`, one resource and no handle list) make the same statement for their own request - and the pin's second claim is not a second mechanism: it is the same door answering a file that came by the resource as an imported handle rather than by creating it. Attaching there rather than at Linux's two doors is the bug's own shape: one of the three ways a resource reaches a client's hands was wired, and the door that cannot be missed is the one every submission goes through.
+
+**And the release sends the mirror, which here is not optional.** Linux's `virtio_gpu_gem_object_close` tells the file's context to let go of the object; this card has to as well, for a reason Linux does not have: a resource id here *is* a handle slot, and `virtio_resource_create` claims the lowest free one - so the record "this context has been told about id N" would be a lie the moment a released id came back, and the context would send no attach for the resource that landed on N. `destroy_handle` clears the id out of every context that held it, in the same section that takes the resource out of the handle table, and pushes `CTX_DETACH_RESOURCE` for each of them *before* the unref that follows - push order, so the device never holds a binding to an object it has already let go of. `t-virtgpu`'s third claim is that reuse: create, name, release, create again on the released id, name it from the file whose context was told about the *old* one, and read the pixels.
+
+After all three, the same niri boot that printed three `Illegal resource` lines prints **none** - renderer initialised, connector found, mode picked, `putting output Virtual-1 at x=0 y=0`, `wayland-1` and `X11 socket: :0` listening: the same words as before, with the batch that used to die under them intact. Pins: `t-virtgpu`'s three claims, red on the kernel that had the bug (each with QEMU's line beside it) and green on this one. The control (the file that *made* the resource) is deliberately one of them - "a pin that cannot go red is not a pin" cuts both ways here, because without it a red cross-file claim could not be told apart from a resource that does not exist.
+
+**And the same walk asks about framebuffers, which is what "niri after kmscube" was.** The four answers above taught `OBJ_GETPROPERTIES` to answer for the *encoder*; a boot with **two clients** — reported by hand, then reproduced with kmscube kept in the background — showed it needs a fifth object. With kmscube still running (its framebuffer 100 alive on the card) and niri started after it:
+
+    [dbg] obj_get_properties: unknown object type=0xfbfbfbfb id=100
+    WARN niri::backend::tty: error adding primary node device, display-only devices may not
+      work: DRM access error: Error reading properties on device `Some("/dev/dri/card0")`
+      (Invalid argument (os error 22))
+
+`0xfbfbfbfb` is `DRM_MODE_OBJECT_FB`: smithay's `add_props`/`map_props` walks *every* handle `GETRESOURCES` listed, and framebuffers are on that list. niri alone passed that same walk only because **no framebuffer existed yet** when it ran (its own came later) — which is why this needed two clients to appear at all, and why three headless rounds of a single client never hit it. The card answers for a framebuffer now: an empty list and a count of 0. That count is *not* Linux's answer — Linux publishes `width`, `height`, `format` and `modifier` on an fb — so it is a named gap rather than a silent one, recorded in `docs/ROADMAP.md`: nothing here asks a framebuffer for a property today, and the count is what keeps a client that *walks* the card working until one does.
+
+**And what is left of niri is niri's own: it commits a framebuffer it never drew into.** Every kernel-side answer it needs is now right — it loads its card, reads properties, picks a mode, creates resources, commits and flips, and the kernel scans out *its own* resource (`virtio-gpu: scanning out the compositor's resource 4`) — and the screen is still black because **that resource has no pixels in it**: `.workbuddy/probe-fb-pixels` reads its device copy back through a `TRANSFER3D` and counts zero of 4096000 bytes, in every run. What the instrumented boot then shows, in order of how it was found:
+
+- **Its renderer is on `card0`, not the render node it asked for.** niri's own words are `using as the render node: "/dev/dri/renderD128"`, and smithay's are `Initializing OpenGL ES Renderer native="/dev/dri/card0" platform="PLATFORM_GBM_KHR"` with `GL Renderer: "virgl (AMD Radeon 780M …)"` — a choice on smithay's side (it resolved the render node and then built the renderer on the primary device), and one that still renders through the host's GPU.
+- **Its submissions name the wrong resources.** With a per-submission line in `virtgpu_execbuffer` (`ofd`, the resource ids its `bo_handles` named, and the framebuffer the CRTC was on), its only large batch — 11736 bytes, before the CRTC was bound — names resources **1 and 2**, and later ones name 3/5/6; the framebuffer it commits (id 100, resource 4, a client resource the card's own predicate agrees is device-rendered) is named by **one 56-byte `TRANSFER3D` that reads it back from the host** and by nothing that writes to it.
+- **And it is not waiting for anything the kernel withholds.** It asks for no flip *event* (the kernel queues none while it runs), and its `debug { wait-for-frame-completion-before-queueing false }` — tried in a config directory of niri's own, the image's config untouched — changes nothing: the buffer is still empty.
+
+So the last step is *niri's* side of the device rather than this kernel's, and the proof is that the same kernel shows **kmscube**'s frame on the same card through the same renderer: a client that renders into a client resource and has the kernel scan that resource out is *exactly* what kmscube does, and its cube is visible. Two named leads for whoever picks it up: the renderer's device (card0 rather than `renderD128`), and whatever smithay does between `next_buffer()` and `commit` on a device whose buffers are all the same card's.
+
+**And one thing seen once and deliberately not chased: `weston` started while `niri` holds the card takes a `SIGSEGV` inside a helper of weston's own.** Two compositors, one card — weston alone brings its desktop up, and after niri it dies in `/usr/libexec/weston-desktop-shell` (or `-keyboard`) with a userspace fault at address `0x28`, the instruction at `rip` being `mov 0x28(%r9), %rax` with `r9` null and page 0 unmapped: a null field in *its* code, not a page the kernel handed out. Recorded with the fault's own words rather than explained — nothing in this pass showed the kernel answering that sequence wrong, and chasing a second compositor's error path is its own piece of work.
+
+**What this pass found that is not this kernel's to fix: a create the renderer refuses is answered as success.** The suite's own 3D create is `target == 4` with `array_size == 1` - a cube map with one face, which vrend refuses (`vrend_resource_create, Illegal resource parameters, error: Cube map: unexpected array size 1`) - and QEMU answers it `OK_NODATA` anyway (its create handlers ignore `virgl_renderer_resource_create`'s result), so the guest holds a handle to a resource the device never made. It is the same *false success* class as the four answers above, one layer lower: this kernel cannot see the refusal, and a caller that named such a resource would get an `Illegal resource` line for a resource the create told it it had. Nothing names that one, which is why the line sat here read as noise; the swallow is QEMU's, and what a guest can do about it is witness an *effect* - which is why the pin above is written in pixels.
+
+**Gap closed - and the frame itself, which took three answers and two mistakes of my own.** With the batches surviving, niri came up, took `Virtual-1`, listened on both sockets - and the window stayed black. What followed was measured at each step rather than reasoned about, and every one of the three real causes was somewhere other than where the symptom was.
+
+**First: the frame was never the guest's to copy.** `.workbuddy/probe-fb-pixels` walks the card's own doors (`GETRESOURCES` -> `GETFB` -> `VIRTGPU_MAP` -> `mmap`) and counts what a framebuffer has in guest memory. Before niri, `count_fbs=0` (the kernel's scanout is not a framebuffer - the control); while niri was drawing into its committed 1280x800 framebuffer, that buffer's **4096000 bytes were all zero**. They were never written: Mesa's virgl winsys draws into the device's own copy of the resource (its texture) and its export path hands the guest a handle and *no readback* (`virgl_drm_winsys_resource_get_handle` - flink, KMS handle or PRIME fd, and nothing else). This kernel's presentation was `copy_to_scanout`: the framebuffer's **guest pages copied onto its own scanout resource**, which for every compositor on this card carried black. Linux never copies - `virtio_gpu_cmd_set_scanout` names the framebuffer's own `hw_res_handle` and `virtio_gpu_cmd_resource_flush` repaints it - so now `drivers/drm.rs`'s `client_scanout` answers "whose frame belongs on the screen", the render task presents it with `Gpu::scan_out_client` (SET_SCANOUT + RESOURCE_FLUSH of that resource, **no transfer**: the device already has the pixels), and `flush` gained the hand-back that points the scanout at `RESOURCE_FB` again when the kernel's own frame is the one going up (a compositor's exit leaves the console its screen instead of its last frame). The predicate is the resource's **origin**, not its target or format: `Resource::host_pixels`, true for a resource a client made through this card's 3D-ioctl family on a card that negotiated 3D (the driver behind that call is Mesa's virgl, which draws into the device's copy), false for a dumb buffer (a software rasteriser maps it and stores into the pages) and for an imported dma-buf. `copy_to_scanout` keeps its `fb_fits` check and answers "accepted" without copying for a device-held frame, so every caller that used its answer to accept a flip still does.
+
+**Second: nothing was being drawn at all, and the create command was why.** kmscube - the smallest possible client, one resource and a cube - printed its EGL/GL banner and then, in among its frame counter:
+
+    vrend_check_no_error: context error reported 1 "mpos" Unknown 1282
+    context 1 failed to dispatch DRAW_VBO: 22
+
+`1282` is `GL_INVALID_OPERATION` on the *host*, raised by vrend's own use of a resource the guest had described differently - and vrend reports it against the *next* batch it decodes, which is why the line names a command that is not the one at fault (786440 bytes of draws dropped, and nothing on the screen to show for it). The description was wrong because of a rule this card had invented: `three_d = target == 4`, i.e. only a cube map was made with `RESOURCE_CREATE_3D`, and everything Mesa asks for is `target == 2` (or 0). `virtio_gpu_resource_create_2d` is `resource_id`, `format`, `width`, `height` and nothing else, so Mesa's `bind` (render target, depth attachment, vertex buffer), `array_size`, `last_level`, `nr_samples` and `flags` had nowhere to go. Linux's rule is not the target: `virtio_gpu_object_create` picks `virtio_gpu_cmd_resource_create_3d` whenever `has_virgl_3d`. With `three_d = card().virgl` the same kmscube reads, from the guest's side of the device, `device_pixels_nonzero=0` before and `4020654` after (with byte values in gradients - a frame drawn, not a buffer cleared), and the three vrend lines are gone. It also puts the client's transfers on the 3D command, which is Linux's other half of the same rule and the reason the attach fix above is load-bearing for them.
+
+**Third: my own predicate asked for a master, and this card's rule is that an unbound card serves its holder.** With both of those in, niri's own boot still showed no `scanning out` line, so the present step was still choosing the kernel's framebuffer - and a temporary `[dbg]` line in that step said exactly what it was choosing from:
+
+    [dbg] present: painted=false resent=false pending=true client=None master=false scanout=(100, 1280, 800, true, true)
+
+`host_pixels` was true, the framebuffer was there, a flush was pending - and `master=false`. Requiring a master was wrong for the reason `master_ok`'s own comment gives: a presentation request from an *unbound* card is served, "which is what lets a client's first `SETCRTC` land before its seat manager's `SET_MASTER`" - kmscube never calls it at all, and its requests were being accepted all along (`pending=true` is the receipt). What keeps a *lost* master off the screen is not that condition either: its presentation requests are refused from then on, and the console it lost the screen to paints - and a console that painted wins the present step. With the condition gone the same line reads `client=Some((1, 1280, 800))` and the boot prints, twice, `virtio-gpu: scanning out the compositor's resource 1` / `... 4` - kmscube's two double-buffered framebuffers, the frames the device holds, on the display.
+
+**One thing this work paid for that is not about the picture: the console's own input.** Every measurement above was driven by typing one short line into the guest's serial console, and *two of those lines arrived as their first seven characters* - `sh /mnt/share/pin.sh` became `sh /mnt` twice, and the run then did nothing at all while the harness waited for a marker that could not come. What was measured on the way is the shape of it: the same line sent **in one write** arrives whole and runs, while the same line sent two characters at a time with a pause between (a pace *slower* than a person's) is truncated at the same place. A console that drops bytes for being typed slowly is a console bug rather than a probe bug, and it is not this section's: it belongs to the serial line's receive path (§7.1's console work) and is recorded here because this is where it was found, with both logs (`.workbuddy/pin-*-session.log`) as the measurement.
+
+What is *not* measured here is still the picture itself: that is the window's, and it is the one step a headless run cannot take. What a headless run *can* say - and now does - is that the device holds a drawn frame for the client, that the scanout names that client's own resource, and that no batch is dropped on the way.
+
+**Gap closed - a second compositor, and the tag that means "the id is what I am naming".** Measured 2026-10-14 on the GL machine, from the guest's own console: `hyprland --i-am-really-stupid` (Hyprland v0.54.3, Aquamarine 0.12.0, apk-installed in the guest) reached `Creating the AsyncResourceGatherer!` and died with `terminate called after throwing an instance of 'std::runtime_error'  what():  CBackend::create() failed!` - and it had written its own log to the guest's root (`/root/.cache/hyprland/hyprlandCrashReport1.txt`, read back out of the image with `qemu-nbd` + `debugfs`, the same instrument as the work above). That log says where, one layer below the message:
+
+    drm: Atomic supported, using atomic for modesetting
+    drm: found 1 CRTCs
+    drm: found 2 planes
+    ERR ... drm: aqPlane->init for plane 36 failed
+    ERR ... drm: Failed initializing resources
+    ERR ... DRM Backend failed
+    ERR ... Wayland backend cannot start: wl_display_connect failed (is a wayland compositor running?)
+    CRIT ... Cannot open backend: no allocator available
+
+`36` is this card's primary plane, and it failed in `SDRMPlane::init` - which reads a plane's properties **twice**: once by kind (`getDRMPlaneProps`, `DRM_MODE_OBJECT_PLANE`) and then, for the `type` value it must know before it can call a plane the primary one, through `getDRMProp` - and `getDRMProp` is `drmModeObjectGetProperties(fd, obj, **DRM_MODE_OBJECT_ANY**)`. That tag is Linux saying "the **id** is what I am naming, not the kind": `__drm_mode_object_find` resolves the id in the card's one object table and compares the type *only when the caller named one*. This card matched on the pair, so the tag fell through to the same `EINVAL` a wrong kind gets, `getDRMProp` answered false, and the plane's init returned before it had read a single format - with no line of its own to say so, which is why the failure looked like it was about plane 36's existence rather than about a read of it. The tag is not an Aquamarine quirk: it is how a client reads a property's *value* rather than its shape.
+
+The fix is that resolution, in both object-property doors (`obj_get_properties`, `obj_set_property`): `object_kind(st, id)` answers what an id *is* - the four fixed ids, plus the framebuffers whose ids are the caller's own to allocate - and an id nothing holds is still `EINVAL`, so the tag is a lookup and not a licence.
+
+Pins (`t-drm-props`), each held against the kernel that had the bug: every object read through both doors and compared (`the CRTC/connector/encoder/primary plane/cursor plane answers DRM_MODE_OBJECT_ANY, with its own kind's list`), the `type` **value** read the way Aquamarine reads it, and the two refusals that keep the tag honest - an id no object holds, and a plane's id under the connector's kind. On the kernel before the change **six of the eight were red** (`FAIL: the CRTC answers DRM_MODE_OBJECT_ANY, with its own kind's list`, and its four siblings plus the `type` value; serial log `.workbuddy/serial-prefix.log`), and the two refusals were green on both - which is the control: what was missing was a resolution, not a door.
+
+**Gap closed - a framebuffer holds its buffer, so a compositor may release the handle it bound.** Measured 2026-10-14 on the GL machine, with Hyprland past the plane-property gap above and its commits still refused. Its own console said only that something was refused, four times:
+
+    mpos-dbg: EINVAL from fb_fits_at fb=100 fit=1280x800 ...
+
+and the reason is not in that line, because three separate conditions refuse a framebuffer there. So the line was made to carry the judgement whole, and the run that read it back was driven the way the earlier rounds are: `cargo xtask run --mode terminal`, the script a **file the guest reads off the 9p share** (`sh /mnt/share/hypr.sh`), the answers written to the guest's own root with a `sync` behind each step, and read back with `qemu-nbd --read-only` + `debugfs`. One instrument was fixed on the way and it is the reason the first attempt found nothing: the harness **read the console throughout** the compositor's life, because the previous round left the pty unread through a plain `sleep` while the compositor was printing - the diagnosis *is* the kernel's own lines, and they arrive in exactly that window.
+
+What the line then said, in one refusal:
+
+    fb=100 fit=1280x800 programmed=1280x800 advertised=(1280, 800) mode_blob=Some(1)
+    test_only=true fb=(handle,width,height,pitch,bpp,format)=Some((11, 1280, 800, 5120, 32, 875713112))
+    handle_live=false
+
+The framebuffer is **exactly the mode's size** - 1280x800 at 32 bpp, pitch 5120, `XR24` (`875713112` is the fourcc in the uapi's `('X'<<0|'R'<<8|'2'<<16|'4'<<24)` spelling) - so the geometry is not the problem and neither is the format. The only failing condition is `handle_live=false`: **the handle the framebuffer was made from no longer names a buffer.** `test_only=true` three times and `false` once is Aquamarine's own sequence (a test commit, then the real one), both refused; the guest's own probe agreed from the other side (`probe-fb-pixels`: `fb[0] id=100: 1280x800 handle=11: MAP refuses: -2`, while the same probe had read niri's live `handle=4` in the runs above).
+
+Why the handle was gone is a fact about the idiom, not about Hyprland: Mesa's GBM allocator and Aquamarine make a scanout buffer, bind it with `ADDFB2`, and then **release the handle** - the framebuffer is all the kernel needs to flip it. Linux's `drm_framebuffer_init` takes a reference on the GEM object for exactly that reason: the file's handle is one holder of the object and the framebuffer is another, and `drm_gem_handle_delete` drops only the handle. This card's framebuffer was a *record of a handle number*, and `destroy_handle` took the buffer out of the table with the name - so the id stayed listed by `GETRESOURCES` while every commit naming it was refused, which is a compositor with no picture and nothing to read. niri escaped it only because Mesa's virgl winsys keeps its handle open, which is why the same kernel has been showing niri's and kmscube's frames all along.
+
+The fix makes the two questions different ones. The handle is the client's **name**; the buffer is the object. `Dumb` grows `fb_refs` (one per framebuffer, taken in `insert_fb` and given back by `drop_fb_hold` - on `RMFB` and on the description closing, the two doors a framebuffer leaves by) and `handle_closed` (the name is gone, the buffer is not). Every request that takes a *handle* now asks `handle_names_buffer` and refuses a released name - `MAP`, `WAIT`, `RESOURCE_INFO`, both transfers, a submit's `bo_handles`, `PRIME_HANDLE_TO_FD` - which is Linux's answer for a handle its file no longer has, while the framebuffer keeps reading the buffer straight out of the table. The device's teardown (`CTX_DETACH` mirror, then `Unref`) moved with the buffer to its **last** holder, through `take_buffer`/`tell_buffer_gone`, because a resource the host is still scanning out must not be unref'd while the name goes - and the host cursor's own teardown is deliberately *not* taken down by the release: the binding belongs to the framebuffer, which is still there, and its own release is what takes it down.
+
+Pins (`t-drm`), each held against the kernel that had the bug - and the claims run **before** the magic handshake, which is itself a measurement (see below): a dumb buffer and a `RESOURCE_CREATE`d one are both bound, their handles released, and then the framebuffer is *driven* (`the framebuffer is still driven - the buffer outlived its name`, `and it still flips` and its completion, `the resource-backed framebuffer drives as well`); the name being gone is the other half (`GEM_CLOSE refuses the name it has already released`, `VIRTGPU_MAP refuses the released name`); and the hold is visible through the one request that can see it, because `RESOURCE_CREATE` lands on the **lowest free handle** (`and it does not take the name the framebuffer is holding`, and then, after `RMFB`, `and it lands on the name the framebuffer was holding`). On the kernel before the change **five of them were red** - every drive claim with `(got -22, want 0)`, and both slot claims (`got 3, want 2`) - while the controls stayed green on both: `GETFB still answers for it`, the released name refused twice, and no map for it (serial log `.workbuddy/serial-held-reverse.log`). With the fix: 170/170, kunit 30/30, exit 33.
+
+**And one thing the new claims measured by landing in the wrong place, recorded rather than chased.** Written where they were first written - after the file's `SET_MASTER` - every *presentation* claim came back `EACCES`, while `GETFB`, `GEM_CLOSE`, `CREATE_DUMB` and the whole `VIRTGPU_*` family were served: the card had been **revoked**, and the branch is `master_ok`'s second one (`!vcmux::holds_screen(vc)` → `revoke()`), not a missing authorisation - `is_authorized` already accepts the master itself (`is_master(ofd) || AUTH_OFD.contains(ofd)`). In a headless sweep there is no virtual console on the screen, so a holder that takes the master with `SET_MASTER` locks *itself* out of presenting; on Linux the master is allowed by `drm_is_current_master` regardless. Nothing on the compositor path hits it (Hyprland's commits reached the framebuffer check, i.e. past this gate), and no claim in this file presented after `SET_MASTER` before now - so it is named here with the measurement and left alone rather than changed without one. The claims moved above the handshake, where an unbound card serves its holder, which is the state the rest of the file's KMS claims already relied on.
+
+**Gap closed - `GETCRTC` reports the mode the scanout drives, and the difference is what makes a compositor modeset at all.** Measured 2026-10-14 on the GL machine, on the guest's own console, with the handle gap above fixed and Hyprland still refusing to appear:
+
+    virtio-gpu: host wants 1910x1135; still driving 1280x800 until a compositor commits it
+    mpos-dbg: EINVAL from fb_fits_at fb=100 fit=1280x800 programmed=1280x800
+              advertised=(1910, 1135) mode_blob=None test_only=true
+              fb=(handle,width,height,pitch,bpp,format)=Some((11, 1910, 1135, 7640, 32, 875713112))
+              handle_live=true
+
+Three things changed from the round before, and each one closes a door on a guess. `handle_live=true` says the framebuffer-holds-its-buffer fix holds. The framebuffer is now **1910x1135**, the size the host is asking for, so the buffer is not stale. And `mode_blob=None` is the fact the whole reading turns on: a first enable of an output carries the CRTC's `MODE_ID` - Aquamarine computes `data.modeset` from the committed state and a modeset is what puts the blob in the request - while a **page flip does not**. Four `test_only=true` then the real ones, all without a mode, is a compositor that believes the output is already configured at 1910x1135 and is only pushing frames through it; and each frame was refused because the scanout was still programmed at 1280x800.
+
+Why it believed that is in Aquamarine, and the source says it plainly. `SDRMConnector::connect` takes the CRTC's current mode from `getCurrentMode()`, which reads the CRTC's `MODE_ID` **property value** and falls back to `drmModeGetCrtc` when that value is unset - `GETCRTC` on this card - and then walks `connector->modes`, calling `output->state->setMode(aqMode)` **only for a mode that `memcmp`s different** from it. This card listed one mode, the host's new size, and answered `GETCRTC` with that same size, so nothing differed and `setMode` was never called: the one commit that would have driven the scanout to 1910x1135 was the commit the comparison suppressed. The compositor locked itself out through a lie in a *read*.
+
+The lie was in `get_crtc` alone - it answered `advertised_mode_dims()` where every other use of that function is about what the connector *offers* (`GETCONNECTOR`'s mode list, the `EDID`, `mode_fits`). A CRTC reports what it is driving; the two sizes are the same number except in the window between the host asking for a new one and a compositor committing it, which is the window `resize_to`'s own comment already described - the code just did not keep the promise in the one door that answers "what mode is this CRTC at". `get_crtc` now answers `programmed_mode_dims()`, the scanout's own geometry, so the offered mode and the driven mode differ exactly when they really do differ, and a compositor that wants the new size says so. Nothing else moved: `mode_fits` accepts both sizes, which is what lets a commit that keeps the geometry pass as before.
+
+**The pin is a boot self-test, and it is the only shape that can carry this claim.** No user program can reach the state: `desired` - the size the host is asking for - has exactly one writer, the display event, and no ioctl spells it. Nor can the gate's own boot reach it: the two sizes are read from `GET_DISPLAY_INFO` in the same call at boot (`VirtioGpuDev::install`), so they start equal, and they come apart only when a **host window** changes shape underneath a running machine - which the sweep and every probe in this file have no way to do, because a test boot is windowless (`-display none`) and no event is ever raised. So the kernel carries it: `src/drivers/drm/kunit.rs`, a suite whose case writes the asked-for size into the field the display event writes, calls the door, and asks which size came back. It needed one thing of the harness - a phase that says "the display card is open and its render task is running", because the card's owner is a *task* and the card is therefore up a step after `Phase::Vfs` rather than with the other devices - and `Phase::Display` is that step, fired in `flow.rs` where the card is spawned, whether or not a card was found (a machine with no card reaches the same step, and its case reports rather than passing silently, which is the shape the block suite already uses for a clock that cannot see a masked window).
+
+Held against the kernel that had the bug: the switch to `advertised_mode_dims()` in that one line makes the case report **`GETCRTC reported 1910x1135: the scanout is driving 1280x800 while the host is asking for 1910x1135`** and the boot's tally go from `30 passed, 0 failed` to `30 passed, 1 failed` - with all 170 user tests still green, so the red is this case and nothing else (serial log `.workbuddy/serial-crtc-reverse.log`). With the fix: 170/170, kunit 31/31, exit 33.
+
+**Left unmeasured, and named so the next round starts here: the vrend object errors in that same run.** After the refusals, the same console carried
+
+    got error from kernel - expect bad rendering 2
+    Dropping rendering due to missing shaders: mpos
+    vrend_set_single_sampler_view: context error reported 2 "mpos" Illegal handle 52
+    vrend_object_bind_blend: context error reported 2 "mpos" Illegal handle 46
+    context 2 failed to dispatch DRAW_VBO: 131
+
+which is vrend failing to find *objects* - sampler views, blend states, shaders - in the context that is drawing. Their shape says the objects were never created rather than created and dropped: a create is a `CREATE_OBJECT` command inside a submitted stream, and vrend abandons the **rest of a batch** when it hits a command it cannot dispatch, so one un-attachable id early in a stream would take every object created later in that same stream with it. What is *not* yet measured is which of the two it is - a batch vrend refused, or a create that never reached it - and the reading that would settle it does not need a compositor: a submit of a hand-built stream, one `CREATE_OBJECT` and then a draw that names it, under the same context the compositor uses. It is left unmeasured because the run above cannot separate the two, and because a compositor whose commits are accepted may not walk this path at all - the errors arrived *after* the first refusal, in the stretch where Aquamarine was already reporting a broken render, so the next run on this kernel is what decides whether this family survives the fix.
+
+
+
+**A handle is a name the *file* holds, and that is what kept the compositor black.**
+
+The vrend object errors the round above left unmeasured were not a second bug and
+were not about objects being dropped. That line is **Mesa's** - not Hyprland's and
+not Aquamarine's: `strings libgallium-26.2.4.so`, dumped out of the guest's own
+`/usr/lib` (44 MB, one hit), is where it lives, and it sits in the virgl winsys'
+submit path beside `failure to add relocation` and `waiting got error - %d, slow
+gpu or hang?`. The number it appends is the errno of the `DRM_VIRTGPU_EXECBUFFER`
+that failed, and the errno was `2` - **`ENOENT`**. Mesa marks the winsys failed on
+it and drops all rendering, which is the black screen on *both* compositors and
+which is why nothing about it moved when the mode and framebuffer work landed.
+
+The card's only `ENOENT` on that road is the `bo_handles` loop in
+`virtgpu_execbuffer`, and it answers one number for three states. So the loop now
+names the state (this round's `mpos-dbg: EXECBUFFER refused: handle {h} - {why}`,
+and it carries the open file description), and one boot answered it:
+
+    EXECBUFFER refused: handle 38 - the name was released and a framebuffer is holding the buffer (num_handles=10, bytes=5176, ofd=...3914384)
+    EXECBUFFER refused: handle 39 - the name was released and a framebuffer is holding the buffer (num_handles=10, bytes=5176, ofd=...3914384)
+
+The PRIME traces from that same boot are the whole story, and there are **three
+file descriptions** in them:
+
+    PRIME export <- handle 9   (ofd=...21702800, ino=37632)
+    PRIME import -> handle 39  (ofd=...3914384,  ino=37632, reused=false)
+    PRIME import -> handle 39  (ofd=...3912848,  ino=37632, reused=true)
+    name 39 released           (ofd=...3912848)
+    EXECBUFFER ... handle 39   (ofd=...3914384)    <- refused ENOENT
+
+**Linux's handle table is per `drm_file`; this card's was per card.** The import
+of a dma-buf this card had exported answered the *exporting* handle (the `prime`
+records are keyed by `ino` and the dedup is global), so a second file came away
+naming the very number a first file was already using - and then that second file
+did the thing Linux tells clients to do: `ADDFB` the buffer, `GEM_CLOSE` the
+handle, and keep flipping the framebuffer. On Linux that takes the *caller's* name
+away and nothing else (`drm_gem_handle_delete` drops one handle out of one
+`drm_file`; the object lives while a framebuffer or another file's handle
+references it). Here one flag said "released" for the whole card, so the first
+file's own name died with it, and every batch it submitted came back `ENOENT`.
+The import also left the buffer with no device resource of its own (`resource:
+None`), so the alias was the only thing that had made it nameable at all - which
+is why the second file's import was `reused=true` and had to *stay* that way.
+
+The fix is the fact, not a flag: `Dumb.handle_closed: bool` became
+`Dumb.holders: Vec<u64>` - one entry per open file description that names the
+buffer - written by the create or import that hands a handle out
+(`Dumb::named_by`), removed by `GEM_CLOSE` for the caller alone, and freeing the
+buffer only when it is the last name *and* no framebuffer holds it. An import that
+finds the `ino` already known now adds the importing file's own name to the object
+instead of handing back somebody else's, and the `prime` records are dropped with
+the **object** (`take_buffer`) rather than with the name, so a later import still
+finds the buffer after every name is gone - which is what a dma-buf descriptor
+promises on Linux.
+
+**The pin lives in `t-prime`, and where it lives is part of the measurement.**
+The claim was first written into `t-virtgpu`'s second-file block - the same shape,
+and the file whose subject it is - and the gate went green **on the kernel with
+the bug still in it**. The reason is in that program's own output: the sweep's
+card is a `virtio-gpu-pci`, its `3D_FEATURES` is 0, and the whole second-file
+region sits in the 3D tail that a card without virgl never reaches (`ok: EXECBUFFER
+is ENOSYS - there is no context to submit to` and then straight to `PASS`). The
+claim has to run on either card, so it went to `t-prime`, which walks the same
+PRIME road on a 2D device: a second file opens `renderD128`, imports the
+descriptor, and gives its name back. Held against the kernel that had the bug, the
+boot reports
+
+    ok:    a second file imports the same descriptor
+    ok:    and gives back the name it was given
+    FAIL:  while this file's own name still stands (got -2, res 0, want 9)
+
+- the two `ok:` lines are the control, green on both kernels, and the red is the
+fix's own behaviour - with `=== FAIL t-prime` (169 of 170) and the kernel's own
+suites still 31/31. With the fix: `ok: while this file's own name still stands
+(got 0, res 9, want 9)`, **170/170, kunit 31/31, exit 33**.
+
+And the compositor is the end-to-end reading, on a headless GL machine with the
+fixed kernel: `got error from kernel - expect bad rendering` appears **zero**
+times, there is no vrend error of any kind, and the framebuffers the compositor
+made hold real pixels in their device copies
+
+    fb[0] id=100: 1280x800 handle=10 device_pixels_nonzero=4096000 first=Some(0) some_bytes=[17,21,34,37,53,108,181,255]
+    fb[3] id=103: 1280x800 handle=11 device_pixels_nonzero=4089188 ...
+    fb[4] id=104: 1280x800 handle=9  device_pixels_nonzero=4096000 ...
+
+where the round before had `MAP refuses: -2` and `guest_pages_nonzero=0` on all of
+them - and the presentation door is carrying them, 154 times each:
+
+    virtio-gpu: scanning out the compositor's resource 9 / 10 / 11
+
+**Left unmeasured, and named so the next round starts here.** A gate still asks
+"does *some* file hold this name" (`!holders.is_empty()`) rather than "does *this*
+file", because only `GEM_CLOSE`, the import and the export have the open file
+description in hand; a file that released its own name can therefore still use the
+number while another file holds it, where Linux would answer `ENOENT` from its own
+handle table. No client does that - a client that released a handle does not use it
+again, and the compositor's whole idiom is the opposite - and the `ok:` control
+above is what the difference looks like from the outside. `handle_names_buffer` has
+two callers, so making it per-file is a small change when a reading wants it; it is
+recorded here rather than guessed at.
+
+## The desktop boot's black screen after a host resize - the card answered a size it was not driving
+
+Measured 2026-10-14 on the first machine's GL card, a window opened at 952x1135
+(that is the size the window manager gave it) against a card booted at 1280x800.
+The kernel had been narrating the whole failure once per frame, and the line reads
+like a size complaint:
+
+    mpos-dbg: EINVAL from fb_fits_at fb=100 fit=1280x800 programmed=1280x800 advertised=(952, 1135) mode_blob=None test_only=false fb=(handle,width,height,pitch,bpp,format)=Some((10, 952, 1135, 3808, 32, 875713112)) handle_live=true     x461
+
+Three things in it are load-bearing, and each is a measurement. The framebuffer is
+**952x1135** - the size the host asked for, not a stale one. It is refused for not
+fitting **1280x800**, and `programmed` says the card believes it drives 1280x800.
+And the same boot's own log says what the device is *actually* pointed at:
+
+    virtio-gpu: scanning out the compositor's resource 10
+
+so the screen *was* at 952x1135 - the compositor's own resource. The card had two
+answers to "what size is the screen", and the wrong one won.
+
+Where the two answers live: `dims()` reads the `Scanout` struct, which only
+`resized()` writes - and `resized()` is called from the **resize** path
+(`render.rs::resize_to`) alone. A compositor's resource is presented through
+`render.rs`'s present step, which calls `Gpu::scan_out_client(resource, width,
+height)`: the size is in hand there and was never recorded. `programmed_mode_dims()`,
+`GETCRTC` and `fb_fits_at`'s ceiling are all built from `dims()`, so all three went
+on answering the private framebuffer's geometry while the device scanned out a
+bigger resource.
+
+What made that fatal is the compositor's own startup, and it is the reading §二
+turned on: `SDRMConnector::connect` takes `getCurrentMode()` - the CRTC's `MODE_ID`
+blob if it is set, `GETCRTC` otherwise - and calls `setMode` **only for a mode whose
+`drmModeModeInfo` `memcmp`s different** from it. A raw-ioctl probe run from the
+guest's own console, with the compositor killed, printed both doors at once:
+
+    GETCRTC: mode_valid=1 mode=1280x800 1280x800 clock=61440 fb_id=100
+      MODE_ID = 1
+      MODE_ID blob 1: 68 bytes, 952x1135 clock=64831 name=952x1135
+    getCurrentMode takes the MODE_ID blob path (value 1)
+    connect(): connector 952x1135 vs current 952x1135 -> memcmp EQUAL -> setMode NOT called
+
+The compositor believed the output was already at 952x1135 - which, on the screen,
+it was - so it sent no mode commit, and every frame it did send was judged against
+1280x800 and refused. The probe could also do by hand what the compositor had not:
+an atomic commit of `ACTIVE` + `MODE_ID` came back `rc=0` and moved `GETCRTC` to
+952x1135, at which point the refusals stopped - the measurement that named the
+field.
+
+The fix is one invariant: **the size the card reports as driven is the size of the
+resource it is presenting.** `VirtioGpuDev` keeps a `presented` field; the present
+step sets it with `presenting_client(width, height)` when it points the device at a
+client's resource, and clears it with `presenting_own_framebuffer()` when the screen
+goes back to the driver's own buffer; `driven_dims()` returns it ahead of the
+private framebuffer's geometry. `drivers::drm`'s `programmed_mode_dims()` answers
+`driven_dims()`, so `GETCRTC` and the fit check follow it. `dims()` itself still
+reports the private framebuffer - that is what `/dev/fb0`'s block and
+`FBIOGET_VSCREENINFO` are about.
+
+Counterfactual, both directions, same machine and same compositor: with the old
+reading, **461** `fb_fits_at` refusals in one run and no picture; with the new one,
+**0**, and the compositor's resources cycling in the scanout
+(`scanning out the compositor's resource 10/11/9/10/...`). The probe agrees on the
+new state: `GETCRTC: mode=952x1135` where it had said 1280x800.
+
+The pin is in the boot self-test rather than in a `t-` program, and the reason is
+the same one that put the `GETCRTC` case there: the *state* this is about - a
+compositor's resource on the screen - is what a compositor's hold on the card
+creates, and the render task consults `client_scanout()` only when the console is
+not painting. A console-owned test boot therefore shows the driver's own
+framebuffer, and `drm::kunit`'s `the_crtc_reports_the_resource_on_the_screen` puts
+the field where the render task would put it and asks the door for the answer (half
+the driven size, retried, because the render task repoints the scanout on its own
+beat). A first draft put the claim in `t-drm` and the aarch64 sweep caught it:
+
+    FAIL:  GETCRTC reports the size of the resource on the screen (width) (got 1280, want 96)
+    FAIL:  ... and its height, not this driver's framebuffer's (got 800, want 96)
+
+- which is the gate saying that a claim about a compositor's state cannot live in a
+program that never has one. Recorded (with the gate) as `15-boot-flow.md` §15.39.

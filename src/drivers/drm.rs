@@ -28,6 +28,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -36,6 +37,13 @@ use critical_section::Mutex;
 
 use crate::mm::{PAGE_SIZE, clone_frame_ref, free_frames, phys_to_virt};
 use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsResult};
+
+/// This module's suite for a test build: the KMS doors' own claims, written as a
+/// child so a case calls the doors directly rather than through an opening added
+/// for it (`docs/NOTES.md` §15.20). One `pub const SUITE`, listed by the wiring
+/// layer's harness (`src/board/kunit.rs`).
+#[cfg(all(target_os = "none", feature = "selftest"))]
+pub mod kunit;
 
 /// Fixed KMS object ids - one of each, never changing. libdrm only cares that
 /// `GETRESOURCES` and the `GET*` ioctls agree on them.
@@ -487,16 +495,33 @@ const CLIENT_CAP_PLANE_COLOR_PIPELINE: u64 = 7;
 /// way `open(O_CLOEXEC)` would.
 const DRM_CLOEXEC: u32 = 0x80000;
 
-/// `DRM_MODE_OBJECT_CRTC` / `_CONNECTOR` / `_PLANE` / `_FB`: the object-type
-/// tags of `OBJ_GETPROPERTIES`/`OBJ_SETPROPERTY`, and the single *value* every
-/// `OBJECT`-typed property carries. The four numbers are `<drm_mode.h>`'s, and
-/// they are also what a caller compares against: drm-rs maps them to the
-/// `ValueType` a property reports (`0xfbfbfbfb` is `Framebuffer`, `0xcccccccc`
-/// is `CRTC`), so a tag answered wrong is a property the caller has no type for.
+/// `DRM_MODE_OBJECT_CRTC` / `_CONNECTOR` / `_ENCODER` / `_PLANE` / `_FB`: the
+/// object-type tags of `OBJ_GETPROPERTIES`/`OBJ_SETPROPERTY`, and the single
+/// *value* every `OBJECT`-typed property carries. The numbers are
+/// `<drm_mode.h>`'s, and they are also what a caller compares against: drm-rs
+/// maps them to the `ValueType` a property reports (`0xfbfbfbfb` is
+/// `Framebuffer`, `0xcccccccc` is `CRTC`), so a tag answered wrong is a
+/// property the caller has no type for.
 const OBJECT_CRTC: u32 = 0xcccc_cccc;
 const OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
 const OBJECT_PLANE: u32 = 0xeeee_eeee;
 const OBJECT_FB: u32 = 0xfbfb_fbfb;
+/// `DRM_MODE_OBJECT_ENCODER`. Named next to the four above for the reason the
+/// encoder's own arm states: a card that *advertises* an encoder has to answer
+/// for it, and refusing the one object the card lists that has no properties to
+/// give is the difference between a compositor enumerating the card and one
+/// that gives up on its primary node (`docs/notes/` §7.4).
+const OBJECT_ENCODER: u32 = 0xe0e0_e0e0;
+/// `DRM_MODE_OBJECT_ANY`: "the *id* is what I am naming, not the kind".
+///
+/// Linux's `__drm_mode_object_find` looks the id up in the card's one object
+/// table and checks the type **only when the caller named one**, so this tag is
+/// answered for whatever the id is. It is not a corner: a client reads a
+/// property's *value* through `drmModeObjectGetProperties(fd, obj,
+/// DRM_MODE_OBJECT_ANY)` - Aquamarine's `getDRMProp` is exactly that call - and
+/// a card that refused the tag failed its plane init outright, which took
+/// Hyprland's whole DRM backend down (`docs/notes/` §7.4).
+const OBJECT_ANY: u32 = 0;
 /// `DRM_MODE_PROP_*`, on the bit numbers `drm_mode.h` gives them: the legacy
 /// types are `RANGE` (bit 1), `IMMUTABLE` (bit 2), `ENUM` (bit 3), `BLOB`
 /// (bit 4) and `BITMASK` (bit 5 - no property here is one, so it is named
@@ -651,8 +676,12 @@ const MAX_HANDLES: usize = 64;
 struct Resource {
     /// The id the device knows the resource by. This card chooses it (the device
     /// does not allocate resource ids - Linux's driver takes them from an ida,
-    /// and so does this), and it starts above the scanout's own framebuffer,
-    /// which is `virtgpu_abi::RESOURCE_FB` and is not in this table.
+    /// and so does this), and for a buffer a client asked for it *is* the GEM
+    /// handle: one number, which is what the guest's command stream spells a
+    /// resource with. A driver-owned resource - the scanout's framebuffer, the
+    /// host cursor - has no handle to borrow and takes its constant from the
+    /// driver's own high range (`virtgpu_abi::RESOURCE_FB`/`_CURSOR`); see
+    /// [`virtgpu_resource_create`] for why the two must not overlap.
     id: u32,
     /// The size the *caller* asked for, or a page when it asked for zero - and
     /// the buffer's own `pitch * height` when the resource was made for a dumb
@@ -674,6 +703,27 @@ struct Resource {
     /// `TRANSFER_TO_HOST_2D`, because a 3D resource belongs to a context and the
     /// 2D command has none to address it in.
     virgl: bool,
+    /// Whether the **device** holds this resource's pixels rather than the guest
+    /// pages behind it.
+    ///
+    /// True for a resource a client made through this card's 3D-ioctl family
+    /// (`VIRTGPU_RESOURCE_CREATE`) on a card that negotiated 3D, and that is the
+    /// whole of the predicate: the driver behind that call is Mesa's virgl winsys,
+    /// which draws into the device's own copy of the resource (its texture) and
+    /// whose export path hands the guest a handle and no readback
+    /// (`virgl_drm_winsys_resource_get_handle`). `.workbuddy/probe-fb-pixels`
+    /// measured what that means from the guest's side: the framebuffer niri
+    /// committed, 1280x800, was 4096000 bytes of **zero** while niri was drawing
+    /// into it - so the scanout copy carries black, and a frame like that has to
+    /// reach the display by the device scanning the resource out instead
+    /// ([`client_scanout`], `virtio::gpu_ctrl`'s `scan_out_client`).
+    ///
+    /// False for everything else, deliberately: a dumb buffer's pixels are written
+    /// by the guest (a software rasteriser maps it), an imported dma-buf's are
+    /// whoever wrote them on the other side, and both reach the display through
+    /// that same copy. Which is why this is a fact about the resource's *origin*
+    /// and not about its target, its format or its size.
+    host_pixels: bool,
 }
 
 /// One dumb buffer: its geometry and the physical pages behind it.
@@ -697,6 +747,31 @@ struct Dumb {
     /// `TRANSFER_TO_HOST` needs), and it is also what the handle's release has
     /// to tell the device about - see [`destroy_handle`].
     resource: Option<Resource>,
+    /// How many framebuffers name this buffer - Linux's `drm_framebuffer_init`
+    /// taking a reference on the GEM object, which is what lets a client close
+    /// the handle it made and go on flipping the framebuffer it made from it.
+    ///
+    /// That idiom is not exotic: it is how Mesa's GBM allocator and Aquamarine
+    /// hand a scanout buffer to the card, and without the count the buffer left
+    /// the table at `GEM_CLOSE` while a framebuffer still named it - so every
+    /// commit of that framebuffer was refused (the fit test asks whether the
+    /// buffer is there) and the compositor came up with no picture. Measured as
+    /// one `handle 11 is released while a framebuffer still names it` followed by
+    /// four refusals whose *only* failing condition was `handle_live=false`, on a
+    /// framebuffer of exactly the mode's size (`file` mode_blob=Some(1)
+    /// test_only=true fb=(11, 1280, 800, 5120, 32, XR24)`).
+    fb_refs: u32,
+    /// One entry per open file description that still holds a *name* for this
+    /// buffer - the fact a single `handle_closed` flag got wrong. Linux's handle
+    /// table is **per `drm_file`**: two files that imported the same dma-buf, or
+    /// a second open of the same card, each own their name, and one releasing its
+    /// own must not take the number out from under the other. Measured as
+    /// `name 39 released (ofd=...3912848)` followed by every `EXECBUFFER ... handle
+    /// 39` from a *different* file (`ofd=...3914384`) being refused `ENOENT` - which
+    /// Mesa turns into `got error from kernel - expect bad rendering 2` and a dead
+    /// winsys. The buffer is freed when the last name and the last framebuffer
+    /// both go ([`drop_fb_hold`], [`destroy_handle`]).
+    holders: Vec<u64>,
 }
 
 impl Dumb {
@@ -709,6 +784,8 @@ impl Dumb {
             bpp,
             frames: Vec::new(),
             resource: None,
+            fb_refs: 0,
+            holders: Vec::new(),
         }
     }
 
@@ -722,18 +799,19 @@ impl Dumb {
     /// `virgl` says which of the family's two create paths made it, and it is
     /// carried here rather than re-derived at each use because the request that
     /// would answer it is gone by then: a transfer has a handle, not a target.
-    fn resource(
-        width: u32,
-        height: u32,
-        frames: Vec<usize>,
-        id: u32,
-        size: u64,
-        virgl: bool,
-    ) -> Dumb {
+    fn resource(width: u32, height: u32, frames: Vec<usize>, resource: Resource) -> Dumb {
         let mut buf = Dumb::new(width, height, 32);
         buf.frames = frames;
-        buf.resource = Some(Resource { id, size, virgl });
+        buf.resource = Some(resource);
         buf
+    }
+
+    /// Add one file's name to this buffer. The create or import that hands a
+    /// handle out is what calls it, so the number a client was given is a number
+    /// *that client* holds.
+    fn named_by(mut self, ofd: u64) -> Dumb {
+        self.holders.push(ofd);
+        self
     }
 
     fn size(&self) -> u64 {
@@ -843,14 +921,6 @@ struct PrimeRecord {
 /// fine, because exactly one compositor owns the seat.
 struct DrmState {
     dumb: Vec<Option<Dumb>>,
-    /// The next device resource id a `DRM_VIRTGPU_RESOURCE_CREATE` will take.
-    ///
-    /// This card's to hand out, not the device's: a resource id is a field the
-    /// *request* carries, so the layer that has to remember which id belongs to
-    /// which handle is the layer that chooses it. It starts above the scanout's
-    /// own framebuffer (`virtgpu_abi::RESOURCE_FB`), which was this driver's
-    /// before the family existed and is not in the handle table.
-    next_res_id: u32,
     fbs: Vec<Option<Framebuffer>>,
     /// The framebuffer currently driven to the scanout by the CRTC.
     current_fb: u32,
@@ -897,8 +967,10 @@ struct DrmState {
     /// sends only `MOVE_CURSOR` rather than re-transferring the image every frame,
     /// and so a *rebind* (a different `fb_id`) is recognized as needing the full
     /// create+transfer+update again. `None` means no host cursor is showing; the
-    /// id is taken from [`DrmState::next_res_id`] like any other resource, never a
-    /// fixed constant that could alias one. See `show_cursor`.
+    /// the id is this driver's own constant in the high range beside the
+    /// scanout's - fixed rather than counted because the discipline below is
+    /// destroy-before-create, so the device holds at most one cursor resource
+    /// and nothing else can be aliased. See `show_cursor`.
     cursor_resource: Option<(u32, u32)>,
     /// Property blobs, by id (1-based, as every id space here is). A mode
     /// arrives as one, and so does a damage-rectangle list.
@@ -989,7 +1061,6 @@ mod drm_event {
 
 static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
     dumb: Vec::new(),
-    next_res_id: crate::gpu::abi::RESOURCE_FB + 1,
     fbs: Vec::new(),
     current_fb: 0,
     conn_crtc: CRTC_ID,
@@ -1052,6 +1123,20 @@ static STATE: Mutex<RefCell<DrmState>> = Mutex::new(RefCell::new(DrmState {
 /// driver at all ("failed to get driver name for fd 15", "MESA-LOADER: failed
 /// to retrieve device information"), which is how llvmpipe came up not knowing
 /// which device it was on.
+///
+/// The version triple is a *feature* statement, and Mesa reads it as one:
+/// `virgl_drm_get_version` refuses any `version_major != 0` outright - the
+/// virtio-gpu driver's version is 0.x, and anything else is a different
+/// driver's - which is how this card answering `4.0.0` (a guess at "the
+/// virtio-gpu spec version") cost the whole virgl path: `MESA-EGL: warning:
+/// DRI2: failed to create screen`, then llvmpipe, then a compositor that
+/// refuses a software EGL device with no output at all. The minor version is
+/// the fence-fd feature version - Mesa gates `supports_fences` on
+/// `minor >= 1` - so it stays 0 while [`virtgpu_execbuffer`] refuses
+/// `VIRTGPU_EXECBUF_FENCE_FD_OUT`: a card that says 1 there has promised the
+/// one thing the number means and then answered `EINVAL` on every submit.
+/// Linux answers 0.1.0 because its execbuffer has the fence; this card
+/// answers 0.0.0 because it does not, which is the same shape read honestly.
 fn fill_version(buf: usize) -> isize {
     // struct drm_version: three ints (then four bytes of padding), and a
     // length/pointer pair each for the name, the date and the description.
@@ -1060,7 +1145,7 @@ fn fill_version(buf: usize) -> isize {
 
     unsafe {
         let w = |off: usize, v: i32| ((buf + off) as *mut i32).write_unaligned(v);
-        w(0, 4); // major
+        w(0, 0); // major
         w(4, 0); // minor
         w(8, 0); // patchlevel
 
@@ -1079,19 +1164,31 @@ fn fill_version(buf: usize) -> isize {
             let dst = ((buf + ptr_off) as *const usize).read_unaligned() as *mut u8;
             offered[field] = room;
             ptrs[field] = dst as usize;
+            let to_copy = room.min(text.len());
             given[field] = if dst.is_null() {
                 // The sizing call: it wants the length and brings no room.
                 text.len()
-            } else if !user_array(dst as usize, text.len(), 1, true) {
+            } else if to_copy == 0 {
+                // Nothing to copy, so there is no address to *check*. A caller
+                // that asked for a length and was told zero reserves no room,
+                // and the pointer it then hands this field is the one an empty
+                // `Vec` carries - non-null, and nowhere near a mapping. Linux's
+                // `copy_to_user` of zero bytes cannot fault, so answering
+                // `EFAULT` for it is a refusal the caller has no way to act on:
+                // it is what stopped niri with `Failed to query drm driver on
+                // device Some("/dev/dri/card0") (Bad address (os error 14))`
+                // on its way from the connector it had just found to a surface
+                // (`docs/notes/` §7.4). The same shape `get_resources` already
+                // carries for its own zero-length lists.
+                0
+            } else if !user_array(dst as usize, to_copy, 1, true) {
                 // Room was offered, but not at that address: refuse the copy
                 // and report the length, which is what Linux's failed
                 // `copy_to_user` leaves the caller with.
                 return -14; // EFAULT
             } else {
-                if room >= text.len() {
-                    core::ptr::copy_nonoverlapping(text.as_ptr(), dst, text.len());
-                }
-                room.min(text.len())
+                core::ptr::copy_nonoverlapping(text.as_ptr(), dst, to_copy);
+                to_copy
             };
             len.write_unaligned(given[field]);
         }
@@ -1175,10 +1272,10 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
             // two spell one release - a GEM handle and a dumb buffer are the
             // same object here, and both names may close it.
             let handle = unsafe { (arg as *const u32).read_unaligned() } as usize;
-            destroy_handle(handle)
+            destroy_handle(handle, ofd)
         }
-        NR_PRIME_HANDLE_TO_FD => prime_handle_to_fd(arg),
-        NR_PRIME_FD_TO_HANDLE => prime_fd_to_handle(arg),
+        NR_PRIME_HANDLE_TO_FD => prime_handle_to_fd(arg, ofd),
+        NR_PRIME_FD_TO_HANDLE => prime_fd_to_handle(arg, ofd),
         NR_GETRESOURCES => get_resources(arg),
         NR_GETCRTC => get_crtc(arg),
         NR_SETCRTC => set_crtc(arg, card.lease()),
@@ -1231,41 +1328,51 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_ADDFB2 => add_fb2(arg, ofd),
         NR_RMFB => {
             let id = unsafe { (arg as *const u32).read_unaligned() };
-            let cursor_died = critical_section::with(|cs| {
+            let (cursor_died, gone) = critical_section::with(|cs| {
                 let mut st = STATE.borrow(cs).borrow_mut();
+                // What the framebuffers being removed each held, read before they
+                // go: a handle the client released earlier stays alive only as long
+                // as a framebuffer names it, and this is one of the two doors that
+                // takes such a framebuffer away (`release_framebuffers` is the
+                // other - the description closing).
+                let held: Vec<u32> = st
+                    .fbs
+                    .iter()
+                    .filter_map(|f| f.as_ref())
+                    .filter(|f| f.id == id)
+                    .map(|f| f.handle)
+                    .collect();
                 for fb in st.fbs.iter_mut() {
                     if fb.as_ref().is_some_and(|f| f.id == id) {
                         *fb = None;
                     }
                 }
+                let gone: Vec<BufferGone> = held
+                    .iter()
+                    .filter_map(|&handle| drop_fb_hold(&mut st, cs, handle))
+                    .collect();
                 // Removing the framebuffer the host pointer is drawn from takes the
                 // binding down and hands back the resource, so the caller can hide +
                 // release it outside the lock. Without this the device would keep an
                 // `UPDATE_CURSOR` naming a released resource - the dangling-id case
                 // `release_framebuffers` closes on the close path, and `RMFB` is the
                 // other door to the same framebuffer going away.
-                if st.cursor_fb == id {
+                let cursor_died = if st.cursor_fb == id {
                     st.cursor_fb = 0;
                     st.cursor_resource.take()
                 } else {
                     None
-                }
+                };
+                (cursor_died, gone)
             });
+            // The pointer first, then the buffers: the cursor's binding is the
+            // thing that must not be left naming a resource the device has been
+            // told to drop.
             if let Some((res, _)) = cursor_died {
-                if host_cursor_live() {
-                    let _ = crate::drivers::video::render::job(
-                        crate::drivers::video::render::Job::SetCursor {
-                            id: 0,
-                            x: 0,
-                            y: 0,
-                            hot_x: 0,
-                            hot_y: 0,
-                        },
-                    );
-                    let _ = crate::drivers::video::render::job(
-                        crate::drivers::video::render::Job::DestroyCursor { id: res },
-                    );
-                }
+                hide_host_cursor(res);
+            }
+            for gone in gone {
+                tell_buffer_gone(gone);
             }
             0
         }
@@ -1293,7 +1400,7 @@ fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         NR_SYNCOBJ_TRANSFER => syncobj_transfer(ofd, arg),
         NR_SYNCOBJ_TIMELINE_SIGNAL => syncobj_timeline_signal(ofd, arg),
         NR_SYNCOBJ_EVENTFD => syncobj_eventfd(ofd, arg),
-        NR_CREATE_DUMB => create_dumb(arg),
+        NR_CREATE_DUMB => create_dumb(arg, ofd),
         NR_MAP_DUMB => map_dumb(arg),
         // The `DRM_VIRTGPU_*` family. What a caller hears here is not one
         // refusal but a table of per-request answers - a card with no 3D behind
@@ -1424,6 +1531,16 @@ struct Context {
     /// rings, which is why Linux allocates a `dma_fence_context` per file rather
     /// than numbering globally. It starts at 1 so 0 keeps meaning "no fence".
     next_fence: u64,
+    /// The device resource ids this context has been told about, in the order
+    /// they were attached.
+    ///
+    /// Kept so that a stream or a transfer names each of its resources to the
+    /// device once rather than on every request: [`attach_resources`] sends only
+    /// what is missing from here. Its lifetime is the context's, and a context's
+    /// lifetime is its file description's - so a second file that names the same
+    /// resource is told about it from scratch, which is the guarantee vrend's
+    /// per-context resource table asks for.
+    attached: Vec<u32>,
 }
 
 /// The contexts on the card, one per file description that needed one.
@@ -1450,6 +1567,7 @@ fn context_of(ofd: u64) -> (u32, bool) {
             id,
             created: false,
             next_fence: 1,
+            attached: Vec::new(),
         });
         (id, false)
     })
@@ -1511,6 +1629,98 @@ fn take_fence(ofd: u64) -> u64 {
         context.next_fence = context.next_fence.wrapping_add(1);
         fence
     })
+}
+
+/// Tell `ofd`'s context about the resources `ids`, so the commands that context
+/// runs may name them - answering `0` or the errno the device gave.
+///
+/// # Why this exists at all
+///
+/// `vrend` resolves a resource **for the context that names it**
+/// (`vrend_renderer_ctx_res_lookup`, whose context struct calls the table
+/// "resource bounds to this context"), and the context of a command stream is the
+/// file description that submitted it, because this card keeps one context per
+/// description. So a resource the submitting file's context has not been told
+/// about is one the device answers `Illegal resource <n>` for - and *drops the
+/// whole batch* over, whatever else was in it.
+///
+/// Linux tells a file's context at the two moments a file can come to hold a
+/// resource: when it creates one (`virtio_gpu_object_create`, which is
+/// `virtio_gpu_cmd_resource_create_3d` whenever the card has 3D, whatever the
+/// target) and when it *opens* a handle to one another file made
+/// (`virtio_gpu_gem_object_open` - the only sender of `CTX_ATTACH_RESOURCE` in
+/// the kernel's own `virtio-gpu` module - with `virtio_gpu_gem_object_close`
+/// sending the mirror). QEMU forwards exactly that pair and nothing else: its
+/// `virgl_renderer_ctx_attach_resource` has one call site, the
+/// `CTX_ATTACH_RESOURCE` handler, and neither create handler attaches anything.
+///
+/// This card implemented one of those doors - the 3D create's own attach, for
+/// `target == 4` only - and left every other way a resource reaches a client's
+/// hands unwired. The measured consequence is niri's blank screen: Mesa's GBM
+/// buffers arrive as `target == 2` creates, `target == 2` takes the 2D path and
+/// the 2D path attaches nothing, so the renderer's *first* stream naming one of
+/// its own buffers died with `context error reported 1 "mpos" Illegal resource 2`
+/// and its 852011-byte batch was dropped. `t-virtgpu` pins both halves of the
+/// statement - the file that made the resource and the file that imported it, a
+/// `TRANSFER3D` in each stream whose landing is read back out of the resource's
+/// own pages - and the pin was red on both before this function existed
+/// (`docs/notes/` §7.4).
+///
+/// # Why here, and not at Linux's doors
+///
+/// Because the question a submission asks is "may **this** context name what I
+/// pass", and the `bo_handles` a submit carries are exactly the resources its
+/// commands spell - Mesa's winsys fills that list from the encoder that wrote the
+/// stream. One door, one answer, and no path can arrive holding a resource the
+/// door did not know about; the two-door shape is what this card got wrong, by
+/// implementing one of them. The same statement is made for the 3D transfers,
+/// whose request names one resource and no list at all.
+///
+/// The context is made before it can be told anything, which is why this can
+/// create one: a file that never names a resource never gets here, and Linux's
+/// own hook creates the file's context for the same reason.
+fn attach_resources(ofd: u64, ids: &[u32]) -> isize {
+    if !card().virgl || ids.is_empty() {
+        return 0;
+    }
+    let ctx = match ensure_context(ofd, 0, b"mpos") {
+        Ok(id) => id,
+        Err(errno) => return errno,
+    };
+    // What this context has not been told about. Read, not remembered: the ids
+    // are marked only once the device has taken them, so a command the device
+    // refused is sent again by the next request rather than assumed done.
+    let todo: Vec<u32> = critical_section::with(|cs| {
+        let contexts = CONTEXTS.borrow(cs).borrow();
+        let Some(context) = contexts.iter().find(|c| c.ofd == ofd) else {
+            return Vec::new();
+        };
+        ids.iter()
+            .copied()
+            .filter(|id| !context.attached.contains(id))
+            .collect()
+    });
+    if todo.is_empty() {
+        return 0;
+    }
+    let made = crate::drivers::video::render::job(crate::drivers::video::render::Job::CtxAttach {
+        ctx,
+        ids: todo.clone(),
+    });
+    if made != 0 {
+        return made;
+    }
+    critical_section::with(|cs| {
+        if let Some(context) = CONTEXTS
+            .borrow(cs)
+            .borrow_mut()
+            .iter_mut()
+            .find(|c| c.ofd == ofd)
+        {
+            context.attached.extend_from_slice(&todo);
+        }
+    });
+    0
 }
 
 /// `DRM_VIRTGPU_GETPARAM`: `struct drm_virtgpu_getparam { u64 param; u64 value; }`
@@ -1749,24 +1959,65 @@ fn virtgpu_execbuffer(arg: usize, ofd: u64) -> isize {
     if size > 0 && !crate::uaccess::buffer_ok(command, size as usize, false, true) {
         return -14; // EFAULT
     }
-    // The handles are resolved even though they never reach the device, because
-    // Linux's answer for a handle this file does not hold is `ENOENT` and a caller
-    // acts on it before it ever looks at the fence.
+    // The handles are resolved here for two reasons now: Linux's answer for a
+    // handle this file does not hold is `ENOENT` and a caller acts on it before
+    // it ever looks at the fence, and the *resources* those handles name are what
+    // this context has to be told about before the stream that spells them is
+    // submitted - a resource id a context has not been told about is one the
+    // device answers `Illegal resource <n>` for and drops the whole batch over
+    // (`attach_resources` carries the measurement). The handles themselves still
+    // do not go on the wire; their resource ids do, as attach commands.
+    let mut named = Vec::new();
     if num_handles > 0 {
         if !crate::uaccess::buffer_ok(handles, num_handles as usize * 4, false, true) {
             return -14; // EFAULT
         }
+        // Why the loop gave up, when it did: gathered inside the section and
+        // printed outside it, and it is the whole of what the caller cannot see -
+        // `ENOENT` is one number for three different states, and only one of them
+        // is the caller's fault. Mesa turns this answer into
+        // `got error from kernel - expect bad rendering 2` and marks its winsys
+        // failed, so the difference between "you named a name you released" and
+        // "this buffer is not a device resource" decides what the fix is.
+        let mut refused: Option<(u32, &'static str)> = None;
         let known = critical_section::with(|cs| {
             let st = STATE.borrow(cs).borrow();
-            (0..num_handles as usize).all(|index| {
+            for index in 0..num_handles as usize {
                 let handle =
                     unsafe { ((handles + index * 4) as *const u32).read_unaligned() } as usize;
-                matches!(
-                    st.dumb.get(handle.wrapping_sub(1)).and_then(|slot| slot.as_ref()),
-                    Some(d) if d.resource.is_some()
-                )
-            })
+                let slot = st
+                    .dumb
+                    .get(handle.wrapping_sub(1))
+                    .and_then(|slot| slot.as_ref());
+                // A released name is not a buffer this submit may name, even
+                // when a framebuffer still holds the buffer itself - Linux's
+                // lookup is against the *file's* handle table.
+                let Some(resource) = slot
+                    .filter(|d| !d.holders.is_empty())
+                    .and_then(|d| d.resource.as_ref())
+                else {
+                    refused = Some((
+                        handle as u32,
+                        match slot {
+                            None => "no buffer is recorded at that slot",
+                            Some(d) if d.holders.is_empty() => {
+                                "the name was released and a framebuffer is holding the buffer"
+                            }
+                            Some(_) => "the buffer is a plain dumb buffer with no device resource",
+                        },
+                    ));
+                    return false;
+                };
+                named.push(resource.id);
+            }
+            true
         });
+        if let Some((handle, why)) = refused {
+            crate::println!(
+                "mpos-dbg: EXECBUFFER refused: handle {handle} - {why} \
+                 (num_handles={num_handles}, bytes={size}, ofd={ofd})"
+            );
+        }
         if !known {
             return -2; // ENOENT
         }
@@ -1790,6 +2041,15 @@ fn virtgpu_execbuffer(arg: usize, ofd: u64) -> isize {
         Ok(id) => id,
         Err(errno) => return errno,
     };
+    // The stream's resources, named to this context *before* the submit: a
+    // resource this context has not been told about is one the device answers
+    // `Illegal resource <n>` for, and it drops the whole batch over that one
+    // unknown number - every command in it, half a megabyte of them if that is
+    // what the caller sent.
+    let attached = attach_resources(ofd, &named);
+    if attached != 0 {
+        return attached;
+    }
     let fence = take_fence(ofd);
     crate::drivers::video::render::job(crate::drivers::video::render::Job::Submit3d {
         ctx,
@@ -1828,6 +2088,7 @@ fn virtgpu_transfer_from_host(arg: usize, ofd: u64) -> isize {
         st.dumb
             .get(handle.wrapping_sub(1))
             .and_then(|slot| slot.as_ref())
+            .filter(|d| !d.holders.is_empty())
             .and_then(|d| d.resource.as_ref())
             .map(|r| r.id)
     });
@@ -1838,6 +2099,15 @@ fn virtgpu_transfer_from_host(arg: usize, ofd: u64) -> isize {
         Ok(id) => id,
         Err(errno) => return errno,
     };
+    // The transfer names one resource and no handle list at all, so it says which
+    // resource it needs told to this context itself. A transfer whose resource the
+    // context does not know is one the device answers `Illegal resource <n>` for
+    // and then quietly does nothing about - QEMU discards what virglrenderer made
+    // of it - so the pixels simply never move.
+    let attached = attach_resources(ofd, &[id]);
+    if attached != 0 {
+        return attached;
+    }
     let request = crate::gpu::abi::TransferHost3d {
         header: crate::gpu::abi::CtrlHeader::new(crate::gpu::abi::CMD_TRANSFER_FROM_HOST_3D),
         box3d,
@@ -1895,10 +2165,27 @@ fn virtgpu_resource_create(arg: usize, ofd: u64) -> isize {
     if width == 0 || height == 0 {
         return libc_einval();
     }
-    // `target` is the switch, in Linux's virgl branch and here alike: 2 is the 2D
-    // pipe and 4 is virgl, and the branch above is what keeps the second out of a
-    // card that has no 3D.
-    let three_d = target == 4;
+    // Which command makes this resource is **the card's answer, not the target's**,
+    // and that is Linux's rule: `virtio_gpu_object_create` picks
+    // `virtio_gpu_cmd_resource_create_3d` whenever `has_virgl_3d`, whatever the
+    // target - and it is the only command that *can* carry the caller's fields.
+    // `virtio_gpu_resource_create_2d` is `resource_id`, `format`, `width`, `height`
+    // and nothing else, so a guest whose driver is the 3D family (Mesa's virgl
+    // winsys asks for every one of its resources through this ioctl) would have its
+    // `bind`, `array_size`, `last_level`, `nr_samples` and `flags` dropped on the
+    // floor - and a texture the client then uses as a render target, a depth
+    // attachment or a vertex buffer is not the resource the device was told about.
+    // The host's GL is what says so, and kmscube is where it was read:
+    //
+    //     vrend_check_no_error: context error reported 1 "mpos" Unknown 1282
+    //     context 1 failed to dispatch DRAW_VBO: 22
+    //
+    // (`1282` is `GL_INVALID_OPERATION`, and vrend reports it against the *next*
+    // batch it decodes, which is why the line names a different command than the
+    // one that caused it - 786440 bytes of draws dropped, and a black screen.) The
+    // target still decides what the *guest* asked for and is forwarded as it always
+    // was; what it no longer decides is which command carries it.
+    let three_d = card().virgl;
     // The object's size is the caller's, or a page when it asked for zero -
     // Linux's rule, and the reason the instrument measured 4096 for a 64x64
     // resource. See `Resource::size`.
@@ -1925,12 +2212,76 @@ fn virtgpu_resource_create(arg: usize, ofd: u64) -> isize {
         entries.push((p as u64, PAGE_SIZE as u32));
     }
 
-    let id = critical_section::with(|cs| {
+    // The handle and the wire resource id are one number, and the handle is
+    // claimed *before* the device is told: a resource id is a field the guest's
+    // command stream spells, and it spells it with the handle this ioctl
+    // answers, so a card that kept two spaces - an id counter beside the handle
+    // table - hands the stream ids the device never heard of. `vrend` answers
+    // that stream with `Illegal resource <n>` and the guest's renderer stops,
+    // which is the measured shape (`docs/notes/07-device-drivers.md`, the
+    // virtio-gpu 3D row): the two counters drifted apart the first time a freed
+    // slot was reused, because the id counter only went up while handles went
+    // back into the table.
+    //
+    // The claim is one critical section rather than "pick a slot, leave the
+    // lock, fill it later": the device is talked to outside every lock (the
+    // render task has to run), so anything not settled inside the section is
+    // open to a second caller picking the same slot - two handles, one id, the
+    // same split wearing a different hat. A failure takes the slot back out,
+    // below.
+    //
+    // A freed slot is reused before the table grows, the lowest-first rule the
+    // blob table follows: without it the table fills with holes and every later
+    // create answers `ENOSPC` for a card holding a handful of live resources.
+    let handle = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
-        let id = st.next_res_id;
-        st.next_res_id = st.next_res_id.wrapping_add(1);
-        id
+        let slot = match st.dumb.iter().position(|d| d.is_none()) {
+            Some(slot) => slot,
+            None if st.dumb.len() < MAX_HANDLES => {
+                st.dumb.push(None);
+                st.dumb.len() - 1
+            }
+            None => return 0,
+        };
+        let id = (slot + 1) as u32;
+        st.dumb[slot] = Some(
+            Dumb::resource(
+                width,
+                height,
+                core::mem::take(&mut frames),
+                Resource {
+                    id,
+                    size,
+                    virgl: three_d,
+                    // A resource this request made, on this card: the guest's 3D-ioctl
+                    // family is how Mesa's virgl driver reaches the device, and it
+                    // draws into the device's own copy rather than into these pages.
+                    host_pixels: virgl,
+                },
+            )
+            .named_by(ofd),
+        );
+        slot + 1
     });
+    if handle == 0 {
+        for p in frames.drain(..) {
+            free_frames(p, 0);
+        }
+        return -28; // ENOSPC
+    }
+    let id = handle as u32;
+    // Give the claimed slot back with every page behind it. Nothing owes the
+    // device an unref here: every path below that reaches this either failed
+    // before a command went out or had its one create command refused, so the
+    // device holds nothing to let go of.
+    let give_slot_back = |handle: usize| {
+        critical_section::with(|cs| {
+            let mut st = STATE.borrow(cs).borrow_mut();
+            if let Some(mut d) = st.dumb[handle - 1].take() {
+                d.release();
+            }
+        });
+    };
 
     // The device is told, and this parks until it has answered - with no lock
     // held and no frames borrowed, because the task that answers is the render
@@ -1942,25 +2293,18 @@ fn virtgpu_resource_create(arg: usize, ofd: u64) -> isize {
     // looks at `target`. It is why a `CONTEXT_INIT` after a purely **2D** create
     // answers `EEXIST` on a virgl card, and matching it is cheaper than
     // explaining a divergence a caller can see for itself.
-    let ctx = if virgl {
-        match ensure_context(ofd, 0, b"mpos") {
-            Ok(id) => Some(id),
-            Err(errno) => {
-                for p in frames.drain(..) {
-                    free_frames(p, 0);
-                }
-                return errno;
-            }
-        }
-    } else {
-        None
-    };
+    //
+    // Made, and nothing more: this request does *not* tell the context about the
+    // resource. That is `attach_resources`'s statement, made on the request that
+    // names the resource - the one every way of coming by a resource goes through -
+    // and a second sender here is the shape of the bug this card had (see its own
+    // comment).
+    if virgl && let Err(errno) = ensure_context(ofd, 0, b"mpos") {
+        give_slot_back(handle);
+        return errno;
+    }
     let made = if three_d {
-        // `three_d` implies `virgl` - the branch above is what keeps a 3D target
-        // out of a card that has no 3D - so the context is always there.
-        let ctx = ctx.expect("a 3D target is a virgl target, and virgl made a context");
         crate::drivers::video::render::job(crate::drivers::video::render::Job::Create3d {
-            ctx,
             id,
             request: crate::gpu::abi::ResourceCreate3d {
                 header: crate::gpu::abi::CtrlHeader::new(crate::gpu::abi::CMD_RESOURCE_CREATE_3D),
@@ -1988,45 +2332,19 @@ fn virtgpu_resource_create(arg: usize, ofd: u64) -> isize {
         })
     };
     if made != 0 {
-        for p in frames.drain(..) {
-            free_frames(p, 0);
-        }
+        // The device refused it: the slot goes back to the pool that found it,
+        // with its pages, and no further command went out.
+        give_slot_back(handle);
         return made;
     }
-
-    let mut frames = frames;
-    let pushed = critical_section::with(|cs| {
-        let mut st = STATE.borrow(cs).borrow_mut();
-        if st.dumb.len() >= MAX_HANDLES {
-            return None;
-        }
-        let idx = st.dumb.len();
-        st.dumb.push(Some(Dumb::resource(
-            width,
-            height,
-            core::mem::take(&mut frames),
-            id,
-            size,
-            three_d,
-        )));
-        Some(idx + 1)
-    });
-    let Some(handle) = pushed else {
-        // No handle slot left. The device has already made the resource, so it
-        // is told to let go of it and the frames go back; neither may leak, and
-        // the order of the two does not matter.
-        let _ =
-            crate::drivers::video::render::job(crate::drivers::video::render::Job::Unref { id });
-        for p in frames.drain(..) {
-            free_frames(p, 0);
-        }
-        return -28; // ENOSPC
-    };
 
     unsafe {
         ((arg + 40) as *mut u32).write_unaligned(handle as u32); // bo_handle
         ((arg + 44) as *mut u32).write_unaligned(id); // res_handle
     }
+    crate::println!(
+        "mpos-dbg: RESOURCE_CREATE -> handle {handle} (target {target}, {width}x{height}) ofd={ofd}"
+    );
     0
 }
 
@@ -2068,6 +2386,7 @@ fn back_dumb_with_a_resource(handle: usize) -> Result<(u32, u64), isize> {
             .dumb
             .get(handle.wrapping_sub(1))
             .and_then(|slot| slot.as_ref())
+            .filter(|d| !d.holders.is_empty())
         else {
             return Err(-2); // ENOENT
         };
@@ -2087,6 +2406,7 @@ fn back_dumb_with_a_resource(handle: usize) -> Result<(u32, u64), isize> {
             .dumb
             .get_mut(handle.wrapping_sub(1))
             .and_then(|s| s.as_mut())
+            .filter(|d| !d.holders.is_empty())
         else {
             return Err(-2); // ENOENT
         };
@@ -2119,15 +2439,12 @@ fn back_dumb_with_a_resource(handle: usize) -> Result<(u32, u64), isize> {
         return back_dumb_with_a_resource(handle);
     };
 
-    // The id is taken only once a command is really going to be sent, so a
-    // caller that failed above leaves no gap in the sequence. The device never
-    // hears an id it was not told about either way.
-    let id = critical_section::with(|cs| {
-        let mut st = STATE.borrow(cs).borrow_mut();
-        let id = st.next_res_id;
-        st.next_res_id = st.next_res_id.wrapping_add(1);
-        id
-    });
+    // The resource id is the handle, exactly as `RESOURCE_CREATE` answers it:
+    // one number, because the command stream spells a resource with the handle
+    // and the device was told that same number. The id is taken from the buffer
+    // rather than from a counter of its own, so a dumb buffer this card made and
+    // a resource a client made can never be two names for one object.
+    let id = handle as u32;
 
     let made = crate::drivers::video::render::job(crate::drivers::video::render::Job::Create2d {
         id,
@@ -2151,6 +2468,10 @@ fn back_dumb_with_a_resource(handle: usize) -> Result<(u32, u64), isize> {
                 id,
                 size,
                 virgl: false,
+                // A dumb buffer's pixels are the guest's: whoever writes it maps
+                // it and stores into those pages, which is why the scanout copy
+                // carries this kind of frame correctly.
+                host_pixels: false,
             });
         }
     });
@@ -2186,20 +2507,18 @@ fn virtgpu_resource_info(arg: usize) -> isize {
 ///
 /// The same offset `MAP_DUMB` computes, over the same table, because a resource
 /// and a dumb buffer are the same kind of object here - both are the card's
-/// pages. What differs is the answer to a handle this card never made: Linux's
-/// `drm_gem_dumb_map_offset` looks the handle up and answers `ENOENT`, and so
-/// does this rather than handing back an offset for pages that are not there.
+/// pages. What differs is the answer to a handle this card never made, or to one
+/// whose name the caller has released: Linux's `drm_gem_dumb_map_offset` looks
+/// the handle up in the file's table and answers `ENOENT`, and so does this
+/// rather than handing back an offset for pages the caller no longer has a name
+/// for. The buffer itself may well still be there - a framebuffer that was made
+/// from it holds it - which is exactly why the name is the question here and not
+/// the buffer.
 fn virtgpu_map(arg: usize) -> isize {
     // struct drm_virtgpu_map: offset@0 (u64), handle@8, pad@12.
     let handle = unsafe { ((arg + 8) as *const u32).read_unaligned() } as usize;
-    let known = critical_section::with(|cs| {
-        STATE
-            .borrow(cs)
-            .borrow()
-            .dumb
-            .get(handle.wrapping_sub(1))
-            .is_some_and(|slot| slot.is_some())
-    });
+    let known =
+        critical_section::with(|cs| handle_names_buffer(&STATE.borrow(cs).borrow(), handle));
     if !known {
         return -2; // ENOENT
     }
@@ -2219,18 +2538,13 @@ fn virtgpu_map(arg: usize) -> isize {
 /// about this machine seen through two doors.
 ///
 /// An unknown handle is still `ENOENT`: a caller waiting on something that does
-/// not exist has a bug, and "done" would hide it.
+/// not exist has a bug, and "done" would hide it. So is a released one, for the
+/// same reason the lookup is against the name.
 fn virtgpu_wait(arg: usize) -> isize {
     // struct drm_virtgpu_3d_wait: handle@0, flags@4.
     let handle = unsafe { (arg as *const u32).read_unaligned() } as usize;
-    let known = critical_section::with(|cs| {
-        STATE
-            .borrow(cs)
-            .borrow()
-            .dumb
-            .get(handle.wrapping_sub(1))
-            .is_some_and(|slot| slot.is_some())
-    });
+    let known =
+        critical_section::with(|cs| handle_names_buffer(&STATE.borrow(cs).borrow(), handle));
     if known { 0 } else { -2 } // ENOENT
 }
 
@@ -2279,7 +2593,10 @@ fn virtgpu_transfer_to_host(arg: usize, ofd: u64) -> isize {
         let d = st
             .dumb
             .get(handle.wrapping_sub(1))
-            .and_then(|slot| slot.as_ref())?;
+            .and_then(|slot| slot.as_ref())
+            // A released name is not a buffer this transfer may carry, even when a
+            // framebuffer still holds the buffer.
+            .filter(|d| !d.holders.is_empty())?;
         Some(d.resource.as_ref().map(|r| (r.id, r.size, r.virgl)))
     });
     let Some(res) = found else {
@@ -2314,6 +2631,14 @@ fn virtgpu_transfer_to_host(arg: usize, ofd: u64) -> isize {
             Ok(id) => id,
             Err(errno) => return errno,
         };
+        // The same statement the transfers other direction make, and for the same
+        // reason: this request names one resource to a context, and a context that
+        // has not been told about it gets the transfer dropped rather than
+        // refused.
+        let attached = attach_resources(ofd, &[id]);
+        if attached != 0 {
+            return attached;
+        }
         let request = crate::gpu::abi::TransferHost3d {
             header: crate::gpu::abi::CtrlHeader::new(crate::gpu::abi::CMD_TRANSFER_TO_HOST_3D),
             box3d: crate::gpu::abi::Box3d {
@@ -3140,48 +3465,53 @@ pub fn close_at_exit(files: &[Arc<crate::vfs::File>], _owner: u32) {
 /// which is what a compositor's exit looks like on a real card too, and what
 /// lets the text console take the screen over from here.
 fn release_framebuffers(ofd: u64) {
-    let cursor_died = critical_section::with(|cs| {
+    // What the device has to be told afterwards: the pointer's own resource, and
+    // the buffers the going framebuffers held. Gathered under the lock and acted
+    // on outside it, because every one of these is a device command and a command
+    // parks - parking here would be parking in the close path holding `STATE`.
+    let (cursor_died, buffers_gone) = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
-        let gone: Vec<u32> = st
+        let leaving: Vec<(u32, u32)> = st
             .fbs
             .iter()
             .filter_map(|f| f.as_ref())
             .filter(|f| f.owner == ofd)
-            .map(|f| f.id)
+            .map(|f| (f.id, f.handle))
             .collect();
-        if gone.is_empty() {
-            return None;
+        if leaving.is_empty() {
+            return (None, Vec::new());
         }
         st.fbs.retain(|f| f.as_ref().is_none_or(|f| f.owner != ofd));
-        if gone.contains(&st.current_fb) {
+        if leaving.iter().any(|(id, _)| *id == st.current_fb) {
             st.current_fb = 0;
         }
+        // A handle this description released earlier was held alive by these
+        // framebuffers alone, so their going is what frees it - the same give-back
+        // `RMFB` does, on the other door out.
+        let buffers_gone: Vec<BufferGone> = leaving
+            .iter()
+            .filter_map(|&(_, handle)| drop_fb_hold(&mut st, cs, handle))
+            .collect();
         // The cursor framebuffer going means the host pointer is now drawn from a
         // resource whose backing this client no longer owns. Take the binding down
         // and hand back the resource id so the caller can hide + release it *outside*
         // the lock (a device command parks, and parking here would be parking in the
         // close path holding `STATE`).
-        if gone.contains(&st.cursor_fb) {
+        let cursor_died = if leaving.iter().any(|(id, _)| *id == st.cursor_fb) {
             st.cursor_fb = 0;
             st.cursor_resource.take()
         } else {
             None
-        }
+        };
+        (cursor_died, buffers_gone)
     });
+    // The pointer first, then the buffers: the cursor's binding is the thing that
+    // must not be left naming a resource the device has been told to drop.
     if let Some((id, _)) = cursor_died {
-        if host_cursor_live() {
-            let _ =
-                crate::drivers::video::render::job(crate::drivers::video::render::Job::SetCursor {
-                    id: 0,
-                    x: 0,
-                    y: 0,
-                    hot_x: 0,
-                    hot_y: 0,
-                });
-            let _ = crate::drivers::video::render::job(
-                crate::drivers::video::render::Job::DestroyCursor { id },
-            );
-        }
+        hide_host_cursor(id);
+    }
+    for gone in buffers_gone {
+        tell_buffer_gone(gone);
     }
 }
 
@@ -3619,9 +3949,13 @@ fn write_mode(buf: *mut u8, clock_khz: u32, w: u32, h: u32) {
 }
 
 /// The size the connector advertises as its available mode: what the host last
-/// asked for, whether or not the scanout has been driven to it. `GETCONNECTOR`
-/// and `GETCRTC` report this, because it is the mode a compositor re-probes for
-/// after a hotplug uevent and may then commit.
+/// asked for, whether or not the scanout has been driven to it. `GETCONNECTOR`'s
+/// mode list and the connector's `EDID` report this, because it is the mode a
+/// compositor re-probes for after a hotplug uevent and may then commit.
+///
+/// `GETCRTC` deliberately does *not*: it answers what the scanout is driving
+/// ([`programmed_mode_dims`]), and the difference between the two is the whole of
+/// why a compositor can tell that it still has to modeset.
 fn advertised_mode_dims() -> (u32, u32) {
     match crate::drivers::virtio::gpu::global() {
         Some(gpu) => gpu.advertised_dims(),
@@ -3629,14 +3963,25 @@ fn advertised_mode_dims() -> (u32, u32) {
     }
 }
 
-/// The size the scanout is actually driven at: the block a pixel copy writes
-/// into, and the ceiling a committed framebuffer has to fit once any resize this
-/// very commit asked for has landed. It equals [`advertised_mode_dims`] except
-/// in the window between the host asking for a new size and a compositor
-/// committing it.
+/// The size the scanout is actually driven at: the size of the resource on the
+/// screen - a client compositor's, when one has presented its own, and this
+/// driver's own framebuffer otherwise - and the ceiling a committed framebuffer
+/// has to fit. It equals [`advertised_mode_dims`] except in the window between
+/// the host asking for a new size and a compositor committing it.
+///
+/// That it is the *presented* resource's size and not the driver's private
+/// framebuffer's is load-bearing, and it was measured rather than reasoned
+/// (`docs/notes/07` §7.4). A compositor presents its own buffer at whatever size
+/// it drew - the size the host asked for - so a card that keeps answering with
+/// its private buffer's geometry reports a size it is not driving. The
+/// compositor's own re-read then agrees with the connector, `connect`'s
+/// `memcmp` says "no change", no mode is ever committed, and each frame it does
+/// send is refused by [`fb_fits_at`] for not fitting a size the screen is not
+/// at: `mpos-dbg: EINVAL from fb_fits_at fb=100 fit=1280x800 programmed=1280x800
+/// advertised=(952, 1135) mode_blob=None`, one line per frame, forever.
 fn programmed_mode_dims() -> (u32, u32) {
     match crate::drivers::virtio::gpu::global() {
-        Some(gpu) => gpu.dims(),
+        Some(gpu) => gpu.driven_dims(),
         None => (1024, 768),
     }
 }
@@ -3650,8 +3995,10 @@ fn programmed_mode_dims() -> (u32, u32) {
 /// device carrying `HOTPLUG=1`. A compositor's udev monitor is watching exactly
 /// that - weston's DRM backend logs "[udev] HOTPLUG event" and re-probes its
 /// connectors - and a re-probe is where the new mode is found, because
-/// `GETCONNECTOR` and `GETCRTC` report the size the connector advertises, which
-/// is what [`advertised_mode_dims`] answers.
+/// `GETCONNECTOR`'s mode list carries the size the connector is offering, which
+/// is what [`advertised_mode_dims`] answers. What `GETCRTC` reports is the size
+/// the scanout *drives*, and the compositor needs the two to differ before it
+/// will send the modeset that closes the gap.
 ///
 /// Called by the render task when a host event teaches it a new size, *before*
 /// anything is rebuilt: the announcement is the question, not the answer. The
@@ -3745,18 +4092,120 @@ fn fb_fits_at(st: &DrmState, fb_id: u32, screen_w: u32, screen_h: u32) -> bool {
 /// Whether `handle` names a buffer this card can scan out - which is what
 /// `fb_fits` and `copy_to_scanout` both turn on, and the one question a
 /// GBM/PRIME-imported buffer can fail.
+///
+/// This asks about the *buffer*, not about the client's name for it, and the two
+/// are deliberately different questions: a framebuffer names its buffer by the
+/// handle number, and it keeps naming it after the client releases that name
+/// (Linux's `drm_framebuffer_init` holds the GEM object, so a framebuffer is a
+/// holder in its own right). A released name is the other question, and
+/// [`handle_names_buffer`] is where it is asked.
 fn handle_is_dumb(st: &DrmState, handle: u32) -> bool {
     st.dumb
         .get(handle as usize - 1)
         .is_some_and(|s| s.is_some())
 }
 
+/// Whether `handle` still *names* a buffer: there is one, and the client has not
+/// released the name.
+///
+/// What every request that takes a handle has to ask. A framebuffer holds its
+/// buffer past the release of its name - that is what makes a compositor's
+/// `ADDFB2`-then-`GEM_CLOSE` work at all - so "the buffer is there" is not the
+/// same as "this number is a name a caller may use", and answering the second
+/// with the first would hand a client a buffer it has already let go of.
+fn handle_names_buffer(st: &DrmState, handle: usize) -> bool {
+    st.dumb
+        .get(handle.wrapping_sub(1))
+        .and_then(|slot| slot.as_ref())
+        .is_some_and(|d| !d.holders.is_empty())
+}
+
 /// Put the pixels of framebuffer `fb_id` on the scanout. A framebuffer the
 /// card did not make, or one larger than the scanout's mode, is refused with
 /// the same errno Linux uses.
+/// Whether the framebuffer `fb_id`'s pixels are the *device's* rather than the
+/// guest's - see [`Resource::host_pixels`] for the fact itself and how it was
+/// measured.
+///
+/// No condition on who holds the card, and that is deliberate: this card's own rule
+/// for a presentation request is that an *unbound* card serves its holder
+/// (`master_ok` passes when no console is bound), which is what lets a client that
+/// never calls `SET_MASTER` - kmscube is one, and it is how the first frames on a
+/// fresh boot reach the screen at all - set a mode and flip. Requiring a master
+/// here turned "nothing holds the card" into "the compositor's frame is not what
+/// belongs on the screen", and the screen then kept the kernel's own (blank, after
+/// a resize) framebuffer: measured as `[dbg] present: painted=false resent=false
+/// pending=true client=None master=false` while kmscube was drawing.
+///
+/// What keeps a *lost* master from holding the screen is not this either: its
+/// presentation requests are refused from then on (`master_ok`), and the console it
+/// lost the screen to paints - and a console that painted wins the present step
+/// (`video::render`), which is where the screen goes back to it.
+fn fb_pixels_are_the_devices(st: &DrmState, fb_id: u32) -> bool {
+    if fb_id == 0 {
+        return false;
+    }
+    let Some(fb) = st
+        .fbs
+        .iter()
+        .filter_map(|f| f.as_ref())
+        .find(|f| f.id == fb_id)
+    else {
+        return false;
+    };
+    st.dumb
+        .get(fb.handle.wrapping_sub(1) as usize)
+        .and_then(|slot| slot.as_ref())
+        .and_then(|d| d.resource.as_ref())
+        .is_some_and(|r| r.host_pixels)
+}
+
+/// The compositor's own resource, when *it* is what the display should be showing.
+///
+/// `Some((resource_id, width, height))` exactly when the framebuffer the CRTC is on
+/// is one whose pixels the device holds ([`fb_pixels_are_the_devices`]), and `None`
+/// means this driver's own framebuffer is the thing to put up: a text console, a
+/// card with no 3D, or a client whose frame really is in guest memory - a dumb
+/// buffer drawn by a software rasteriser - which the scanout copy carries correctly.
+///
+/// The render task reads this at the one moment it presents (`video::render`'s own
+/// call), so the answer is taken where the pixels are about to move rather than
+/// cached somewhere it could go stale, and `None` is the answer for every state the
+/// task can be in except that one.
+pub fn client_scanout() -> Option<(u32, u32, u32)> {
+    critical_section::with(|cs| {
+        let st = STATE.borrow(cs).borrow();
+        if !fb_pixels_are_the_devices(&st, st.current_fb) {
+            return None;
+        }
+        let fb = st
+            .fbs
+            .iter()
+            .filter_map(|f| f.as_ref())
+            .find(|f| f.id == st.current_fb)?;
+        let resource = st
+            .dumb
+            .get(fb.handle.wrapping_sub(1) as usize)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|d| d.resource.as_ref())?;
+        Some((resource.id, fb.width, fb.height))
+    })
+}
+
 fn copy_to_scanout(st: &DrmState, fb_id: u32) -> isize {
     if !fb_fits(st, fb_id) {
         return libc_einval();
+    }
+    // A framebuffer whose pixels the *device* holds has nothing here to copy: the
+    // pages below it were never written, so this would carry black onto the screen.
+    // That frame reaches the display the other way - the render task scans the
+    // resource out ([`client_scanout`], `Gpu::scan_out_client`) - so this answers
+    // what the callers use it for ("the frame is accepted") and copies nothing,
+    // exactly as it does for a screen with no framebuffer on it. `fb_fits` above
+    // still ran, because an fb that does not fit the mode is refused whatever its
+    // pixels are.
+    if fb_pixels_are_the_devices(st, fb_id) {
+        return 0;
     }
     let fb = st
         .fbs
@@ -3882,9 +4331,24 @@ fn paint_cursor(st: &DrmState, scanout: *mut u8, screen_w: u32, screen_h: u32) {
 fn get_crtc(arg: usize) -> isize {
     // struct drm_mode_crtc: set_connectors_ptr@0,count_connectors@8,
     // crtc_id@12, fb_id@16, x@20, y@24, gamma_size@28, mode_valid@32, mode@36.
+    // The mode reported here is the one the scanout is *driving*, not the one the
+    // connector is offering. Those are the same size except in the window between
+    // the host asking for a new one and a compositor committing it, and reporting
+    // the offered size in that window is a lie with a deadlock behind it:
+    // Aquamarine's `SDRMConnector::connect` takes the CRTC's current mode
+    // (`getCurrentMode`, which falls back to this ioctl when the CRTC's `MODE_ID`
+    // is unset) and compares it against each mode the connector lists - our single
+    // advertised one - and *skips `setMode` when they match*. So the very commit
+    // that would drive the scanout to the host's new size was the one it never
+    // sent: it believed the CRTC already ran at that size, and page-flipped a
+    // buffer of that size instead, which `fb_fits_at` then refused against the
+    // size the scanout *was* driving. Measured on the GL machine: `fit=1280x800
+    // programmed=1280x800 advertised=(1910, 1135) mode_blob=None` on every commit,
+    // four `TEST_ONLY` then the real ones, with the compositor's own
+    // "got error from kernel - expect bad rendering 2" underneath.
     critical_section::with(|cs| {
         let st = STATE.borrow(cs).borrow();
-        let (w, h) = advertised_mode_dims();
+        let (w, h) = programmed_mode_dims();
         unsafe {
             let p = arg as *mut u8;
             (p.add(12) as *mut u32).write_unaligned(CRTC_ID);
@@ -4497,6 +4961,32 @@ fn set_property(arg: usize) -> isize {
     set_connector_prop(prop_id, value)
 }
 
+/// The kind of the object `id` names, which is everything a caller that asked
+/// under [`OBJECT_ANY`] left to the card.
+///
+/// This is Linux's `__drm_mode_object_find` against the card's one object
+/// table: the four fixed ids are that table, plus the framebuffers, whose ids
+/// are the caller's own to allocate and so are known only to the state. `None`
+/// is an id nothing here holds, which either door turns into the same `EINVAL`
+/// a wrong kind gets.
+fn object_kind(st: &DrmState, id: u32) -> Option<u32> {
+    match id {
+        CRTC_ID => Some(OBJECT_CRTC),
+        CONNECTOR_ID => Some(OBJECT_CONNECTOR),
+        ENCODER_ID => Some(OBJECT_ENCODER),
+        PLANE_ID | CURSOR_PLANE_ID => Some(OBJECT_PLANE),
+        _ if st
+            .fbs
+            .iter()
+            .filter_map(|fb| fb.as_ref())
+            .any(|fb| fb.id == id) =>
+        {
+            Some(OBJECT_FB)
+        }
+        _ => None,
+    }
+}
+
 /// `OBJ_SETPROPERTY`: the object-typed spelling of the same write.
 ///
 /// The object *type* is what the caller says it is talking to, so it is
@@ -4512,22 +5002,6 @@ fn obj_set_property(arg: usize) -> isize {
     let prop_id = unsafe { ((arg + 8) as *const u32).read_unaligned() };
     let obj_id = unsafe { ((arg + 12) as *const u32).read_unaligned() };
     let obj_type = unsafe { ((arg + 16) as *const u32).read_unaligned() };
-    // Both planes are named here, not just the primary: the cursor plane is a
-    // plane to every caller that reads it, and its properties are settable, so
-    // a type check that knew only `PLANE_ID` turned *every* write to a cursor
-    // property into `EINVAL` while the read of the same property went on
-    // reporting the old value. That is the shape `t-drm-props` caught as
-    // `a HOTSPOT_X write reads back (got 0, want 4)`.
-    let matches_type = matches!(
-        (obj_type, obj_id),
-        (OBJECT_CONNECTOR, CONNECTOR_ID)
-            | (OBJECT_CRTC, CRTC_ID)
-            | (OBJECT_PLANE, PLANE_ID)
-            | (OBJECT_PLANE, CURSOR_PLANE_ID)
-    );
-    if !matches_type {
-        return libc_einval();
-    }
     // The *primary* plane's buffer is the one write this door acts on by
     // copying: a caller that sets it outside a commit is asking for that
     // buffer to be on the screen now. The cursor plane's buffer is a different
@@ -4539,6 +5013,32 @@ fn obj_set_property(arg: usize) -> isize {
     let cursor_image = prop_id == PROP_PLANE_FB_ID && obj_id == CURSOR_PLANE_ID;
     let rc = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
+        // `DRM_MODE_OBJECT_ANY` is the id deciding rather than the kind, so it
+        // is resolved first - Linux's `drm_mode_obj_set_property_ioctl` asks
+        // `drm_mode_object_find` the same way, and a write under that tag is a
+        // write to whatever the id names.
+        let obj_type = match obj_type {
+            OBJECT_ANY => match object_kind(&st, obj_id) {
+                Some(kind) => kind,
+                None => return libc_einval(),
+            },
+            named => named,
+        };
+        // Both planes are named here, not just the primary: the cursor plane is
+        // a plane to every caller that reads it, and its properties are
+        // settable, so a type check that knew only `PLANE_ID` turned *every*
+        // write to a cursor property into `EINVAL` while the read of the same
+        // property went on reporting the old value. That is the shape
+        // `t-drm-props` caught as `a HOTSPOT_X write reads back (got 0, want 4)`.
+        if !matches!(
+            (obj_type, obj_id),
+            (OBJECT_CONNECTOR, CONNECTOR_ID)
+                | (OBJECT_CRTC, CRTC_ID)
+                | (OBJECT_PLANE, PLANE_ID)
+                | (OBJECT_PLANE, CURSOR_PLANE_ID)
+        ) {
+            return libc_einval();
+        }
         if shown {
             // The plane's buffer is the one property whose write changes what
             // is on the screen, so it is validated as a buffer before the
@@ -4667,6 +5167,14 @@ fn mode_atomic(arg: usize) -> isize {
             let value = unsafe { values.add(index).read_unaligned() };
             index += 1;
             if let Err(e) = plan.record(obj, prop, value) {
+                // The earliest refusal there is, and the one that hides the most:
+                // a property this card does not have takes the whole commit down
+                // before any of the judgement below is reached, so the caller sees
+                // only `EINVAL` and a compositor's log says nothing about which
+                // property it was.
+                crate::println!(
+                    "mpos-dbg: commit refused at parse: obj={obj} prop={prop} value={value}: {e}"
+                );
                 return e;
             }
         }
@@ -4727,7 +5235,20 @@ fn mode_atomic(arg: usize) -> isize {
         if let Some(blob) = plan.mode_blob.filter(|b| *b != 0) {
             match (mode_fits(&st, blob), mode_size(&st, blob)) {
                 (true, Some(dims)) => resize_to = Some(dims),
-                _ => return (libc_einval(), None),
+                // The one refusal a compositor cannot tell from any other: it
+                // named a mode this card will not show, and the answer is `EINVAL`
+                // with nothing said. So it is said here - the blob, its size (when
+                // it has one) and the two sizes a mode is judged against.
+                _ => {
+                    crate::println!(
+                        "mpos-dbg: EINVAL from mode_fits blob={blob} size={:?} \
+                         advertised={:?} programmed={:?}",
+                        mode_size(&st, blob),
+                        advertised_mode_dims(),
+                        programmed_mode_dims(),
+                    );
+                    return (libc_einval(), None);
+                }
             }
         }
         // The framebuffer is judged against the size this commit will drive -
@@ -4739,7 +5260,29 @@ fn mode_atomic(arg: usize) -> isize {
         if let Some(fb) = plan.plane_fb.filter(|f| *f != 0)
             && !fb_fits_at(&st, fb, fit_w, fit_h)
         {
-            crate::println!("mpos-dbg: EINVAL from fb_fits_at fb={fb} fit={fit_w}x{fit_h}");
+            // This refusal is the one a compositor cannot see the reason for: its
+            // commit comes back `EINVAL` and its own log can only say so. The
+            // whole of what was judged is printed for that reason - the
+            // framebuffer's own shape, its handle, whether that handle still names
+            // a buffer, and the sizes the fit is measured against. Three separate
+            // facts can produce `EINVAL` here (a framebuffer larger than the mode,
+            // one bound to a handle that has been released, or one that is not 32
+            // bpp) and only the first is visible from the caller's side.
+            let rec = st
+                .fbs
+                .iter()
+                .filter_map(|f| f.as_ref())
+                .find(|f| f.id == fb);
+            let live = rec.is_some_and(|f| handle_is_dumb(&st, f.handle));
+            crate::println!(
+                "mpos-dbg: EINVAL from fb_fits_at fb={fb} fit={fit_w}x{fit_h} \
+                 programmed={cur_w}x{cur_h} advertised={:?} mode_blob={:?} test_only={} \
+                 fb=(handle,width,height,pitch,bpp,format)={:?} handle_live={live}",
+                advertised_mode_dims(),
+                plan.mode_blob,
+                flags & ATOMIC_TEST_ONLY != 0,
+                rec.map(|f| (f.handle, f.width, f.height, f.pitch, f.bpp, f.format)),
+            );
             return (libc_einval(), None);
         }
         // The cursor's rectangle, which has to be the identity for the image
@@ -4771,6 +5314,7 @@ fn mode_atomic(arg: usize) -> isize {
         && (w, h) != programmed_mode_dims()
         && !crate::drivers::video::render::resize_blocking(w, h)
     {
+        crate::println!("mpos-dbg: EINVAL from resize_blocking: the host will not drive {w}x{h}");
         return libc_einval();
     }
 
@@ -4791,6 +5335,9 @@ fn mode_atomic(arg: usize) -> isize {
                 if fb != 0
                     && let e @ 1.. = copy_to_scanout(&st, fb)
                 {
+                    crate::println!(
+                        "mpos-dbg: commit refused copying framebuffer {fb} to the scanout: {e}"
+                    );
                     return e;
                 }
                 st.current_fb = fb;
@@ -4806,6 +5353,9 @@ fn mode_atomic(arg: usize) -> isize {
             }
             let rc = set_object_prop(&mut st, obj, prop, value);
             if rc != 0 {
+                crate::println!(
+                    "mpos-dbg: commit refused property obj={obj} prop={prop} value={value}: {rc}"
+                );
                 return rc;
             }
             if obj == CURSOR_PLANE_ID {
@@ -5298,6 +5848,19 @@ fn obj_get_properties(arg: usize, ofd: u64) -> isize {
     // here carries, and the count is what says how much of it is real.
     let Some((ids, values, count)) = critical_section::with(|cs| {
         let st = STATE.borrow(cs).borrow();
+        // `DRM_MODE_OBJECT_ANY` is the id deciding rather than the kind, so a
+        // caller that named only an id is answered for whatever that id is -
+        // Linux's `__drm_mode_object_find`, and the shape a client reads a
+        // property's *value* with. An id nothing here holds comes back `None`
+        // from that same lookup, and this door's answer to it is the `EINVAL` a
+        // wrong kind has always got.
+        let obj_type = match obj_type {
+            OBJECT_ANY => match object_kind(&st, obj_id) {
+                Some(kind) => kind,
+                None => return None,
+            },
+            named => named,
+        };
         let list = match (obj_type, obj_id) {
             (OBJECT_CONNECTOR, CONNECTOR_ID) => Some((
                 [
@@ -5504,6 +6067,41 @@ fn obj_get_properties(arg: usize, ofd: u64) -> isize {
                     14usize,
                 ))
             }
+            // The encoder this card advertises - `GETRESOURCES` names it and
+            // `GETCONNECTOR` names it back - and it carries no properties.
+            //
+            // Answering *that* rather than refusing is the whole of this arm.
+            // A compositor enumerates what the card listed and asks each object
+            // for its properties, and a refusal is not an empty list to it: it
+            // is the primary node failing to open. Measured on niri, which said
+            // `error adding primary node device, display-only devices may not
+            // work: DRM access error: Error reading properties on device
+            // Some("/dev/dri/card0") (Invalid argument (os error 22))` - the
+            // EINVAL this door used to answer for the one object it did not
+            // recognise, on both cards, renderer or not (`docs/notes/` §7.4).
+            // Linux's own answer for an object that exists is a count and
+            // nothing to fill, which is what this arm gives.
+            (OBJECT_ENCODER, ENCODER_ID) => Some(([0; 16], [0u64; 16], 0)),
+            // A **framebuffer** is an object a client walks too, and this card has
+            // to answer for it: smithay's `add_props`/`map_props` walks every handle
+            // `GETRESOURCES` listed - crtcs, connectors, encoders, planes *and
+            // framebuffers* - and a refusal there is not an empty list to it, it is
+            // the primary node failing to open. Measured: with a framebuffer alive
+            // (kmscube still running, its fb 100), niri said
+            //
+            //     [dbg] obj_get_properties: unknown object type=0xfbfbfbfb id=100
+            //     WARN error adding primary node device, display-only devices may not
+            //       work: ... Error reading properties on device `Some("/dev/dri/card0")`
+            //       (Invalid argument (os error 22))
+            //
+            // and with no framebuffer alive at that moment the same walk passes -
+            // which is why this only showed up with two clients in one boot. An empty
+            // list is **not** Linux's answer for an fb (it publishes `width`,
+            // `height`, `format` and `modifier` on one), and that is a named gap: this
+            // card's framebuffer objects carry no properties yet, and the count here is
+            // what keeps a client that *walks* the card working while that is true
+            // (`docs/notes/` §7.4).
+            (OBJECT_FB, _) => Some(([0; 16], [0u64; 16], 0)),
             _ => None,
         };
         let (mut ids, mut values, count) = list?;
@@ -5579,16 +6177,28 @@ fn insert_fb(st: &mut DrmState, handle: u32, shape: FbShape, owner: u64) -> Opti
     // The handle's buffer must exist - and the geometry it comes with has to
     // be a shape the scanout can show: the handle's own bpp (the scanout is
     // a 32-bit BGRA surface, whatever the ADDFB claims), nonzero, with a
-    // pitch wide enough for a row.
-    let dumb = st.dumb.get(slot.checked_sub(1)?).and_then(|d| d.as_ref())?;
+    // pitch wide enough for a row. The name has to be *live* as well: an
+    // `ADDFB2` naming a handle its file has released is `ENOENT` on Linux
+    // (`drm_mode_addfb2` looks it up in the file's handle table), so a buffer
+    // kept alive by some *other* framebuffer is not a buffer this request may
+    // bind.
+    let dumb = st
+        .dumb
+        .get_mut(slot.checked_sub(1)?)
+        .and_then(|d| d.as_mut())?;
     if dumb.bpp != 32
         || shape.bpp != 32
         || shape.width == 0
         || shape.height == 0
         || shape.pitch < shape.width * 4
+        || dumb.holders.is_empty()
     {
         return None;
     }
+    // The framebuffer holds the buffer from here: this is what keeps a
+    // compositor's scanout alive across the release of the handle it was made
+    // from, and it is the hold [`drop_fb_hold`] gives back.
+    dumb.fb_refs += 1;
     let id = st.fbs.len() as u32 + 100;
     st.fbs.push(Some(Framebuffer {
         id,
@@ -5876,13 +6486,159 @@ fn sequence_refused() -> isize {
     -25 // ENOTTY
 }
 
-/// Release a GEM handle - the one path `GEM_CLOSE` and `DESTROY_DUMB` both
-/// spell. The dumb buffer gives its frames back, and the PRIME records that
-/// name the handle go too: the *dma-bufs* the handle exported keep their own
-/// references and their own lifetime, but a later import must not be
-/// answered with a handle that no longer exists. A handle already released
-/// is the refusal Linux makes too.
-fn destroy_handle(handle: usize) -> isize {
+/// The device's side of a buffer leaving the handle table, collected under the
+/// lock and acted on outside it.
+///
+/// Every field is a *device command*'s argument, and a command parks - so the
+/// caller has to be out of the critical section before it can run any of them.
+/// [`take_buffer`] collects, [`tell_buffer_gone`] speaks.
+struct BufferGone {
+    /// The device resource the buffer was backed by, when it was one. A plain
+    /// dumb buffer was never a resource and this is `None`.
+    res: Option<u32>,
+    /// The contexts that had been told about that resource, which have to be
+    /// told it is gone before the resource itself is unref'd.
+    holders: Vec<u32>,
+}
+
+/// Take `handle`'s buffer out of the table, with everything the device has to be
+/// told about it.
+///
+/// The caller has checked the buffer is there. Called when its **last** holder
+/// goes: the client's handle (`GEM_CLOSE`/`DESTROY_DUMB`), or the last
+/// framebuffer made from it ([`drop_fb_hold`]). Linux spells the same rule with a
+/// reference count on the GEM object - the file's handle is one holder and
+/// `drm_framebuffer_init` is another - and the difference between "the handle is
+/// gone" and "the buffer is gone" is exactly what [`destroy_handle`] records.
+fn take_buffer(
+    st: &mut DrmState,
+    cs: critical_section::CriticalSection<'_>,
+    handle: u32,
+) -> BufferGone {
+    let res = st
+        .dumb
+        .get(handle as usize - 1)
+        .and_then(|slot| slot.as_ref())
+        .and_then(|d| d.resource.as_ref())
+        .map(|r| r.id);
+    if let Some(slot) = st.dumb.get_mut(handle as usize - 1) {
+        if let Some(d) = slot.as_mut() {
+            d.release();
+        }
+        *slot = None;
+    }
+    // The dma-buf records that pointed at this object go with it: the number is
+    // about to be handed to the next create, and a record left behind would answer
+    // a later import with a name that now belongs to somebody else's buffer.
+    st.prime.retain(|record| record.handle != handle);
+    // The contexts that had been told about this resource forget it here, in the
+    // same section that takes the resource out of the table: the id is about to
+    // become free for the next create to claim, and a context that kept "told
+    // about id N" would then never send the attach for the resource that lands on
+    // N - the same dropped batch this card was fixed for, one reuse later.
+    let holders = match res {
+        Some(id) => CONTEXTS
+            .borrow(cs)
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|context| {
+                let held = context.attached.contains(&id);
+                context.attached.retain(|attached| *attached != id);
+                held.then_some(context.id)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    BufferGone { res, holders }
+}
+
+/// Tell the device what [`take_buffer`] collected: the mirror of the attach a
+/// context was given, then the unref of the resource itself.
+///
+/// The detach goes out first, so the device is never left holding a binding to an
+/// object it has already let go of. Both answers are ignored for the same reason:
+/// the buffer has left the table either way, and a device that refuses to forget
+/// a resource whose pages are back in the allocator is not something a caller can
+/// act on.
+fn tell_buffer_gone(gone: BufferGone) {
+    let Some(id) = gone.res else {
+        // A plain dumb buffer was never a resource, so the device holds nothing
+        // to let go of.
+        return;
+    };
+    for ctx in gone.holders {
+        let _ = crate::drivers::video::render::job(crate::drivers::video::render::Job::CtxDetach {
+            ctx,
+            ids: [id].to_vec(),
+        });
+    }
+    let _ = crate::drivers::video::render::job(crate::drivers::video::render::Job::Unref { id });
+}
+
+/// Give back the hold one framebuffer had on its buffer, and answer the device's
+/// side of it when that was the buffer's last hold.
+///
+/// The other half of [`insert_fb`]'s `fb_refs += 1`, and the half that makes a
+/// compositor's scanout outlive its handle: the buffer leaves the table when the
+/// framebuffer that named it goes, *provided* the client has already released the
+/// handle. `None` means something still holds it - either another framebuffer, or
+/// the client's own name.
+fn drop_fb_hold(
+    st: &mut DrmState,
+    cs: critical_section::CriticalSection<'_>,
+    handle: u32,
+) -> Option<BufferGone> {
+    let slot = st.dumb.get_mut(handle.checked_sub(1)? as usize)?.as_mut()?;
+    slot.fb_refs = slot.fb_refs.saturating_sub(1);
+    if slot.fb_refs > 0 || !slot.holders.is_empty() {
+        return None;
+    }
+    Some(take_buffer(st, cs, handle))
+}
+
+/// Take the host pointer down for a cursor resource that is going away: the
+/// cursor-queue hide first, then the control-queue unref of the resource it drew
+/// from, in that order, so the device never loads an image whose pages are
+/// already back in the allocator.
+///
+/// A no-op on a card with no cursor queue: the software path draws the pointer
+/// into the frame and keeps no resource of its own to release.
+fn hide_host_cursor(id: u32) {
+    if !host_cursor_live() {
+        return;
+    }
+    let _ = crate::drivers::video::render::job(crate::drivers::video::render::Job::SetCursor {
+        id: 0,
+        x: 0,
+        y: 0,
+        hot_x: 0,
+        hot_y: 0,
+    });
+    let _ = crate::drivers::video::render::job(crate::drivers::video::render::Job::DestroyCursor {
+        id,
+    });
+}
+
+/// Release a GEM handle - the one path `GEM_CLOSE` and `DESTROY_DUMB` both spell.
+/// A name *this file* does not hold is `EINVAL`, the refusal Linux makes too; the
+/// dma-buf records that name the object are not touched, because they are the
+/// object's (`take_buffer` drops them with it) and a later import of the same
+/// descriptor has to find it.
+///
+/// What does *not* happen here is the buffer going away while anything else still
+/// refers to it. Linux's `drm_gem_handle_delete` drops the file's handle and
+/// nothing else: the object lives while anything references it, and both a
+/// framebuffer made from it (`drm_framebuffer_init` holds the GEM object) and
+/// **another file's name** are such references - the handle table is per
+/// `drm_file`. A client that closes the handle after `ADDFB` is therefore doing
+/// nothing wrong - it is the idiom Mesa's GBM allocator and Aquamarine use,
+/// because the framebuffer is all the kernel needs to flip - and this card got it
+/// wrong by freeing the buffer: the framebuffer id stayed listed by `GETRESOURCES`
+/// while every commit naming it was refused (the fit test asks whether the buffer
+/// is there), so the compositor came up with no picture and nothing to read. Now
+/// the *name* goes ([`Dumb::holders`]), the buffer stays, and [`drop_fb_hold`]
+/// frees it when the last framebuffer that holds it goes.
+fn destroy_handle(handle: usize, ofd: u64) -> isize {
     if handle == 0 {
         return libc_einval();
     }
@@ -5890,9 +6646,53 @@ fn destroy_handle(handle: usize) -> isize {
     // of the critical section rather than dropped with the rest because telling
     // the device is a *job*, and a job parks: parking with interrupts off is
     // sleeping while holding a lock, which this kernel forbids.
+    //
+    // `None` answers "there is no such handle" (`EINVAL`, as before); `Some` with
+    // a `None` buffer answers "the name went, the buffer is still held"; `Some`
+    // with a buffer is the buffer leaving, which is what the caller has to tell
+    // the device about.
+    let mut closed_a_held_name: Option<usize> = None;
     let found = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
-        st.prime.retain(|record| record.handle as usize != handle);
+        // What the number is, before anything else: a handle this card never made,
+        // and a name *this file* does not hold, are the same answer (`EINVAL`),
+        // because Linux asks the file's own handle table - a released name is not
+        // in it, while the buffer it named may still be held by a framebuffer or by
+        // another file's name, which are facts about the buffer and not about this
+        // name. The prime records are *not* dropped here: they name the object, so
+        // a later import of the same dma-buf still finds it, and they go with the
+        // object in `take_buffer`.
+        let Some(buffer) = st.dumb.get(handle - 1).and_then(|slot| slot.as_ref()) else {
+            return None;
+        };
+        if !buffer.holders.contains(&ofd) {
+            return None;
+        }
+        if let Some(d) = st.dumb.get_mut(handle - 1).and_then(|slot| slot.as_mut()) {
+            d.holders.retain(|holder| *holder != ofd);
+        }
+        // Somebody still names the buffer - another file that imported the same
+        // dma-buf, or the client's own second open - or a framebuffer made from it
+        // does: the name goes and nothing else does. Not the host cursor either,
+        // because the binding belongs to the framebuffer (see `set_cursor_prop`)
+        // and that framebuffer is still there; the fb's own release takes it down
+        // (`drop_fb_hold`).
+        let held_by_fb = st
+            .fbs
+            .iter()
+            .filter_map(|f| f.as_ref())
+            .any(|f| f.handle as usize == handle);
+        let named_still = st
+            .dumb
+            .get(handle - 1)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|d| !d.holders.is_empty());
+        if held_by_fb || named_still {
+            if held_by_fb {
+                closed_a_held_name = Some(handle);
+            }
+            return Some((None, None));
+        }
         // If this handle backs the framebuffer the host pointer is drawn from, the
         // cursor binding and its separate device resource go with it. Cleared here so
         // the caller hides + releases the cursor *before* the `Unref` below - push
@@ -5909,49 +6709,28 @@ fn destroy_handle(handle: usize) -> isize {
         if cursor_died.is_some() {
             st.cursor_fb = 0;
         }
-        match st.dumb.get_mut(handle - 1) {
-            Some(slot) if slot.is_some() => {
-                let res = slot
-                    .as_ref()
-                    .and_then(|d| d.resource.as_ref())
-                    .map(|r| r.id);
-                if let Some(d) = slot.as_mut() {
-                    d.release();
-                }
-                *slot = None;
-                Some((res, cursor_died))
-            }
-            _ => None,
-        }
+        Some((cursor_died, Some(take_buffer(&mut st, cs, handle as u32))))
     });
-    let Some((res, cursor_died)) = found else {
+    let Some((cursor_died, gone)) = found else {
         return libc_einval();
     };
-    // Hide and release the host cursor first (a cursor-queue command, then the
-    // control-queue unref of its resource), before the dumb buffer's own unref below.
-    if let Some(cur_id) = cursor_died {
-        if host_cursor_live() {
-            let _ =
-                crate::drivers::video::render::job(crate::drivers::video::render::Job::SetCursor {
-                    id: 0,
-                    x: 0,
-                    y: 0,
-                    hot_x: 0,
-                    hot_y: 0,
-                });
-            let _ = crate::drivers::video::render::job(
-                crate::drivers::video::render::Job::DestroyCursor { id: cur_id },
-            );
-        }
+    // A name released while a framebuffer holds the buffer. Nothing else records
+    // it and it matters twice over: the buffer stays (which is the point of the
+    // hold), and this number is one a later `EXECBUFFER` has to answer about - the
+    // submit path refuses a released name with `ENOENT`, and Mesa turns that into
+    // `got error from kernel - expect bad rendering 2` and marks its winsys dead.
+    if let Some(handle) = closed_a_held_name {
+        crate::println!(
+            "mpos-dbg: name {handle} released, a framebuffer is holding the buffer (ofd={ofd})"
+        );
     }
-    // A resource the device still holds is told to let go. The answer is
-    // ignored: the caller asked for the handle to be released and it has been,
-    // and a device that refuses to unref a resource whose pages are already back
-    // in the allocator is not something this caller can act on either way. A
-    // plain dumb buffer was never a resource and skips this entirely.
-    if let Some(id) = res {
-        let _ =
-            crate::drivers::video::render::job(crate::drivers::video::render::Job::Unref { id });
+    // Hide and release the host cursor first (a cursor-queue command, then the
+    // control-queue unref of its resource), before the buffer's own unref below.
+    if let Some(cur_id) = cursor_died {
+        hide_host_cursor(cur_id);
+    }
+    if let Some(gone) = gone {
+        tell_buffer_gone(gone);
     }
     0
 }
@@ -5963,7 +6742,7 @@ fn destroy_handle(handle: usize) -> isize {
 /// the dma-buf over those pages with one reference of its own per page, and
 /// the identity record lets a second export of the same handle answer the
 /// same object.
-fn prime_handle_to_fd(arg: usize) -> isize {
+fn prime_handle_to_fd(arg: usize, ofd: u64) -> isize {
     // struct drm_prime_handle: handle@0, flags@4, fd@8.
     let handle = unsafe { (arg as *const u32).read_unaligned() } as usize;
     let flags = unsafe { ((arg + 4) as *const u32).read_unaligned() };
@@ -5974,7 +6753,14 @@ fn prime_handle_to_fd(arg: usize) -> isize {
         if handle == 0 || handle > MAX_HANDLES {
             return None;
         }
-        let dumb = st.dumb.get_mut(handle - 1).and_then(|slot| slot.as_mut())?;
+        let dumb = st
+            .dumb
+            .get_mut(handle - 1)
+            .and_then(|slot| slot.as_mut())
+            // A released name exports nothing. The descriptor the handle already
+            // gave away keeps its own lifetime, but this number names no buffer for
+            // anyone - `drm_gem_prime_handle_to_fd` looks the handle up first.
+            .filter(|d| !d.holders.is_empty())?;
         // A handle already exported: the same object again, so both
         // descriptors map the same pages.
         if let Some(buf) = st
@@ -6015,6 +6801,10 @@ fn prime_handle_to_fd(arg: usize) -> isize {
     let Some(buf) = buf else {
         return libc_einval();
     };
+    crate::println!(
+        "mpos-dbg: PRIME export <- handle {handle} (ofd={ofd}, ino={})",
+        buf.ino()
+    );
     // The descriptor, in the caller's own table, under the caller's own
     // descriptor ceiling.
     let file = Arc::new(crate::vfs::File::new(buf));
@@ -6036,7 +6826,7 @@ fn prime_handle_to_fd(arg: usize) -> isize {
 /// buffer over its pages, each page with one reference the handle owns (the
 /// descriptor keeps its own), so closing either side leaves the other
 /// standing.
-fn prime_fd_to_handle(arg: usize) -> isize {
+fn prime_fd_to_handle(arg: usize, ofd: u64) -> isize {
     // struct drm_prime_handle, the other way: fd@8 names, handle@0 receives.
     let fd = unsafe { ((arg + 8) as *const i32).read_unaligned() };
     let file = match crate::sched::current_fds().clone_at(fd) {
@@ -6049,16 +6839,32 @@ fn prime_fd_to_handle(arg: usize) -> isize {
     let Some(buf) = inode.as_dmabuf() else {
         return libc_einval(); // not a dma-buf descriptor
     };
-    let handle = critical_section::with(|cs| {
+    let (handle, reused) = critical_section::with(|cs| {
         let mut st = STATE.borrow(cs).borrow_mut();
         let st = &mut *st;
         // The same object the card already knows: its handle, so repeated
-        // imports never stack up aliases of one buffer.
-        if let Some(record) = st.prime.iter().find(|record| record.ino == buf.ino()) {
-            return record.handle;
+        // imports never stack up aliases of one buffer - and the importing file
+        // gets its *own* name on it, because a name is the file's. That is what
+        // lets one file release its handle while another goes on submitting the
+        // batch that names it.
+        let known = st
+            .prime
+            .iter()
+            .find(|record| record.ino == buf.ino())
+            .map(|record| record.handle);
+        if let Some(handle) = known {
+            if let Some(d) = st
+                .dumb
+                .get_mut(handle as usize - 1)
+                .and_then(|slot| slot.as_mut())
+                && !d.holders.contains(&ofd)
+            {
+                d.holders.push(ofd);
+            }
+            return (handle, true);
         }
         if st.dumb.len() >= MAX_HANDLES {
-            return 0;
+            return (0u32, false);
         }
         let frames = buf.clone_frames();
         st.dumb.push(Some(Dumb {
@@ -6071,6 +6877,10 @@ fn prime_fd_to_handle(arg: usize) -> isize {
             // the device about it, and its pixels reach the screen through this
             // card's own scanout copy like any other buffer's.
             resource: None,
+            // This file's own name for it: nobody has made a framebuffer from
+            // this number yet, and *this* file has not released it.
+            fb_refs: 0,
+            holders: vec![ofd],
         }));
         let handle = st.dumb.len() as u32;
         st.prime.push(PrimeRecord {
@@ -6078,11 +6888,17 @@ fn prime_fd_to_handle(arg: usize) -> isize {
             handle,
             buf: None,
         });
-        handle
+        (handle, false)
     });
     if handle == 0 {
         return libc_einval(); // the handle table is full
     }
+    crate::println!(
+        "mpos-dbg: PRIME import -> handle {handle} (ofd={ofd}, ino={}, {}x{}, reused={reused})",
+        buf.ino(),
+        buf.width(),
+        buf.height()
+    );
     unsafe { (arg as *mut u32).write_unaligned(handle) };
     0
 }
@@ -7394,17 +8210,16 @@ fn show_cursor() -> isize {
             hot_x,
             hot_y,
         } => {
-            // Take a fresh resource id only now that a real command is going out, so
-            // a failure above leaves no gap (the same discipline as
-            // `back_dumb_with_a_resource`). Release any previous cursor resource
-            // first, in push order: destroy-before-create keeps the device from ever
-            // holding two ids for one pointer.
+            // The cursor's resource id is this driver's own constant, in the
+            // high range beside the scanout's framebuffer - not a number from
+            // the client's id space, which a command stream can name. One id is
+            // enough because the discipline below is destroy-before-create: the
+            // device holds at most one cursor resource at a time, and the next
+            // image reuses the same id the moment the old one is gone.
             let (id, old) = critical_section::with(|cs| {
                 let mut st = STATE.borrow(cs).borrow_mut();
                 let old = st.cursor_resource.take();
-                let id = st.next_res_id;
-                st.next_res_id = st.next_res_id.wrapping_add(1);
-                (id, old)
+                (crate::gpu::abi::RESOURCE_CURSOR, old)
             });
             if let Some((old_id, _)) = old {
                 let _ = crate::drivers::video::render::job(
@@ -7457,7 +8272,7 @@ fn show_cursor() -> isize {
     }
 }
 
-fn create_dumb(arg: usize) -> isize {
+fn create_dumb(arg: usize, ofd: u64) -> isize {
     // struct drm_mode_create_dumb: height@0,width@4,bpp@8,flags@12,
     // handle@16,pitch@20,size@24(u64).
     let height = unsafe { (arg as *const u32).read_unaligned() };
@@ -7472,7 +8287,8 @@ fn create_dumb(arg: usize) -> isize {
         if idx >= MAX_HANDLES {
             return 0usize;
         }
-        st.dumb.push(Some(Dumb::new(width, height, bpp)));
+        st.dumb
+            .push(Some(Dumb::new(width, height, bpp).named_by(ofd)));
         idx + 1
     });
     if handle == 0 {
@@ -7487,6 +8303,9 @@ fn create_dumb(arg: usize) -> isize {
             ((arg + 24) as *mut u64).write_unaligned(d.size());
         }
     });
+    crate::println!(
+        "mpos-dbg: CREATE_DUMB -> handle {handle} ({width}x{height} {bpp}bpp) ofd={ofd}"
+    );
     0
 }
 

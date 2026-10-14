@@ -102,6 +102,12 @@ static RESIZE_WAITERS: Mutex<RefCell<Vec<TaskId>>> = Mutex::new(RefCell::new(Vec
 /// on the next input. Taken and cleared by the render task, the only flusher.
 static RE_PRESENT: AtomicBool = AtomicBool::new(false);
 
+/// Which resource the display was last told to scan out: 0 for this driver's own
+/// framebuffer, a client's resource id otherwise (ids start at 1, so 0 is free as
+/// the sentinel). Read and written only by this task's present step, where it turns
+/// a state that changes rarely into one line per change rather than one per frame.
+static LAST_SCANOUT: AtomicU32 = AtomicU32::new(0);
+
 /// Ask the render task to re-present the compositor's framebuffer and flush.
 /// Called from the mux's VT-switch path; wakes the task so it happens now.
 pub fn request_re_present() {
@@ -142,17 +148,20 @@ pub enum Job {
     Unref { id: u32 },
     /// Copy `id`'s `width` x `height` pixels from guest memory into the device.
     TransferToHost { id: u32, width: u32, height: u32 },
-    /// Create the 3D resource `id`, attach `entries` as its backing, and let the
-    /// context `ctx` name it.
+    /// Create the 3D resource `id` and attach `entries` as its backing.
     ///
-    /// Three commands and one job, for the reason the 2D pair is one: a resource
-    /// created and never backed is one the device reads from nowhere, and a 3D
-    /// resource no context has been told about is one the stream that wants it
-    /// cannot name. The attach is what carries the context - Linux's
-    /// `RESOURCE_CREATE_3D` leaves the header's `ctx_id` zero - so all three go
-    /// in that order and all three have to land.
+    /// Two commands and one job, for the reason the 2D pair is one: a resource
+    /// created and never backed is one the device reads from nowhere.
+    ///
+    /// It used to be three - create, attach backing, and `CTX_ATTACH_RESOURCE` for
+    /// the creating file's context - and the third is deliberately gone: the
+    /// context a resource has to be *known* to is the one that names it, which is
+    /// [`Job::CtxAttach`]'s statement and the submission's to make, and a second
+    /// sender here is exactly what let this card believe one door was enough. A
+    /// resource created 3D and never named costs nothing now; one that is named is
+    /// attached by the request that names it, like a resource that arrived any
+    /// other way.
     Create3d {
-        ctx: u32,
         id: u32,
         request: crate::gpu::abi::ResourceCreate3d,
         entries: Vec<(u64, u32)>,
@@ -180,6 +189,35 @@ pub enum Job {
         fence: u64,
         stream: Vec<u8>,
     },
+    /// Tell the context `ctx` about the resources `ids`, so that the commands it
+    /// runs may name them.
+    ///
+    /// A job of its own rather than a step inside the submit that asked for it,
+    /// because it is the *device* that has to be told and the device is reachable
+    /// from here alone; the submit that follows is pushed after this one, and
+    /// `drain_jobs` performs them in push order, so the attach always lands
+    /// first.
+    ///
+    /// `ids` is what the caller has *not* told this context about yet - the
+    /// caller keeps that set - so this is one control-queue round trip per
+    /// resource per context and not one per submit. A failed attach leaves the
+    /// caller's set alone, so the next attempt sends it again rather than
+    /// believing a context knows something it was never told.
+    CtxAttach { ctx: u32, ids: Vec<u32> },
+    /// The mirror of [`Job::CtxAttach`], and Linux's
+    /// `virtio_gpu_gem_object_close`: the context is told to let go of `ids` when
+    /// the handle that named them is released.
+    ///
+    /// Two reasons, and the second is this card's own. Linux sends it because a GEM
+    /// object outlives any one file's handle to it, and a context must not keep
+    /// naming what its file has given up. Here a resource id *is* a handle slot and
+    /// the slot is re-used at the first opportunity - so a context's record of
+    /// "already told about id N" that outlived the resource would be a context that
+    /// never sends the attach for the *next* resource to land on N, which is the
+    /// same dropped batch in a slower costume. The detach goes out before the unref
+    /// that follows it (push order), so the device is never left holding a binding
+    /// to an object it has already let go of.
+    CtxDetach { ctx: u32, ids: Vec<u32> },
     /// Make the cursor resource `id` at `width` x `height` and attach `entries` -
     /// the control-queue half of showing a hardware pointer. It is the same pair
     /// [`Job::Create2d`] performs, named apart because the cursor's resource is the
@@ -318,14 +356,12 @@ fn perform(device: &mut dyn GpuDevice, kind: &Job) -> isize {
             device.transfer_to_host_2d(*id, *width, *height)
         }
         Job::Create3d {
-            ctx,
             id,
             request,
             entries,
         } => device
             .create_3d(request)
-            .and_then(|()| device.attach_backing(*id, entries))
-            .and_then(|()| device.ctx_attach_resource(*ctx, *id)),
+            .and_then(|()| device.attach_backing(*id, entries)),
         Job::TransferHost3d {
             to_host,
             ctx,
@@ -342,6 +378,12 @@ fn perform(device: &mut dyn GpuDevice, kind: &Job) -> isize {
             fence,
             stream,
         } => device.submit_3d(*ctx, *ring_idx, *fence, stream),
+        Job::CtxAttach { ctx, ids } => ids
+            .iter()
+            .try_for_each(|id| device.ctx_attach_resource(*ctx, *id)),
+        Job::CtxDetach { ctx, ids } => ids
+            .iter()
+            .try_for_each(|id| device.ctx_detach_resource(*ctx, *id)),
         // The cursor resource's create+attach is the same pair `Create2d` performs;
         // both must land, because a cursor resource created and never backed is one
         // the device reads from nowhere when `SetCursor` names it.
@@ -759,7 +801,41 @@ fn task() {
         let req = REQ.load(Ordering::Relaxed);
         let done = DONE.load(Ordering::Relaxed);
         if painted || resent || req > done {
-            let _ = device.flush();
+            let scanout_client = if painted {
+                None
+            } else {
+                crate::drivers::drm::client_scanout()
+            };
+            // Said once per change rather than once per frame: which of the two
+            // things the display is showing is a fact about the machine's state, and
+            // it is the only line either side of this seam can give a person reading
+            // a boot log for "is the compositor's frame really what is on the screen"
+            // - the pixels themselves are the host's.
+            let presented = scanout_client.map_or(0, |(resource, _, _)| resource);
+            if LAST_SCANOUT.swap(presented, Ordering::Relaxed) != presented {
+                if presented == 0 {
+                    crate::print!("virtio-gpu: this driver's own framebuffer is the scanout\n");
+                } else {
+                    crate::print!(
+                        "virtio-gpu: scanning out the compositor's resource {presented}\n"
+                    );
+                }
+            }
+            let _ = match scanout_client {
+                Some((resource, width, height)) => {
+                    // What the screen *is* from here on: a card that kept
+                    // reporting its own framebuffer's geometry would be
+                    // answering a size it is no longer driving, and every
+                    // frame the compositor then sends would be judged against
+                    // it and refused (`drivers::drm::programmed_mode_dims`).
+                    view.presenting_client(width, height);
+                    device.scan_out_client(resource, width, height)
+                }
+                None => {
+                    view.presenting_own_framebuffer();
+                    device.flush()
+                }
+            };
             // The frame has left. This is the moment a page-flip completion is
             // *about*, and it is the only moment in this kernel that honestly
             // means "the pixels are where they were asked to be" - so it is what

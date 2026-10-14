@@ -133,7 +133,7 @@ fn wiring(console: &Console, config: &QemuConfig, build_dir: &Path) -> Wiring {
             // card refuses `none` outright, so a `terminal` boot of one has to
             // name the headless GL backend instead.
             let display = if mode.has_window() {
-                configured
+                gl_for_card(&configured, &config.gpu)
             } else {
                 windowless_display(&config.gpu)
             };
@@ -170,6 +170,26 @@ fn windowless_display(gpu: &str) -> String {
         "egl-headless,gl=on".to_string()
     } else {
         "none".to_string()
+    }
+}
+
+/// The display backend for a boot that *does* draw a window, given the card.
+///
+/// A GL card refuses a backend without OpenGL (`needs_gl_context`), and QEMU's
+/// own error names the fix: `-display BACKEND,gl=on`. The windowed path used to
+/// pass the configured backend verbatim, so a machine with `qemu.gpu =
+/// "virtio-gpu-gl-pci"` and no `qemu.display` - which defaults to `sdl` - was
+/// refused at QEMU's hand before the guest started, and the same refusal met a
+/// `mirror`/`gui` run of that machine. So the context is derived from the card
+/// here too, exactly as `windowless_display` derives it for a boot that renders
+/// nowhere: the key stays about *which* window, and the card answers whether it
+/// must carry a GL context. A backend that already names `gl=` is left alone, so
+/// an explicit `display = "sdl,gl=core"` says what it means.
+fn gl_for_card(display: &str, gpu: &str) -> String {
+    if needs_gl_context(gpu) && !display.contains("gl=") {
+        format!("{display},gl=on")
+    } else {
+        display.to_string()
     }
 }
 
@@ -1537,6 +1557,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_gl_card_beside_a_window_gets_its_context_from_the_card() {
+        // The refusal that started this: QEMU answers `-device virtio-gpu-gl-pci`
+        // against a bare `-display sdl` with "The display backend does not have
+        // OpenGL support enabled", and the run dies before the guest boots. So a
+        // windowed boot of a GL machine - `mirror` or `gui`, whether the backend
+        // is defaulted or configured - must carry `,gl=on`, while a 2D card leaves
+        // the window exactly as it was named. Without the derivation the default
+        // `sdl` is refused outright; without the 2D case staying untouched the fix
+        // would append a context no plain card asked for.
+        let mut gl = config("1024", 1, &[]);
+        gl.gpu = "virtio-gpu-gl-pci".to_string();
+        let mirror = run_args(&gl, RunMode::Mirror);
+        assert_eq!(
+            after(&mirror, "-display").as_deref(),
+            Some("sdl,gl=on"),
+            "a mirror run of a GL card is refused without a context"
+        );
+        let gui = run_args(&gl, RunMode::Gui);
+        assert_eq!(after(&gui, "-display").as_deref(), Some("sdl,gl=on"));
+
+        // A configured backend is carried with its own suboptions intact, and one
+        // that already names `gl=` is left alone rather than doubled.
+        let mut gtk_gl = config("1024", 1, &[]);
+        gtk_gl.gpu = "virtio-gpu-gl-pci".to_string();
+        gtk_gl.display = Some("gtk".to_string());
+        assert_eq!(
+            after(&run_args(&gtk_gl, RunMode::Mirror), "-display").as_deref(),
+            Some("gtk,gl=on")
+        );
+        let mut explicit = config("1024", 1, &[]);
+        explicit.gpu = "virtio-gpu-gl-pci".to_string();
+        explicit.display = Some("sdl,gl=core".to_string());
+        assert_eq!(
+            after(&run_args(&explicit, RunMode::Mirror), "-display").as_deref(),
+            Some("sdl,gl=core")
+        );
+
+        // The counterfactual: a 2D card's window is untouched by all this.
+        let plain = config("1024", 1, &[]);
+        assert_eq!(
+            after(&run_args(&plain, RunMode::Mirror), "-display").as_deref(),
+            Some("sdl")
+        );
+    }
+
     /// The GPU the machine was wired with, read off the `-device` list the way
     /// QEMU reads it: the card that rides beside the entropy source.
     fn gpu_of(args: &[String]) -> String {
@@ -1556,10 +1622,12 @@ mod tests {
         let plain_args = args(&plain, Boot::Image(PathBuf::from("/build/mpos.img")));
         assert_eq!(gpu_of(&plain_args), "virtio-gpu-pci");
 
-        // Naming the GL card is the whole of the difference: exactly one word
-        // of one `-device`. Pinning that makes a boot failure attributable -
-        // a GL machine that will not start differs from a working 2D one by
-        // the card and by nothing else.
+        // Naming the GL card moves two words, not one: the `-device`, and the
+        // window's `-display`, which must carry `,gl=on` or QEMU refuses the card
+        // outright ("The display backend does not have OpenGL support enabled").
+        // Pinning the exact pair makes a boot failure attributable - a GL machine
+        // that will not start differs from a working 2D one by the card and the
+        // context it needs, and by nothing else.
         let mut gl = config("1024", 1, &[]);
         gl.gpu = "virtio-gpu-gl-pci".to_string();
         let gl_args = args(&gl, Boot::Image(PathBuf::from("/build/mpos.img")));
@@ -1577,11 +1645,14 @@ mod tests {
             .collect();
         assert_eq!(
             differing,
-            vec![(
-                "virtio-gpu-pci".to_string(),
-                "virtio-gpu-gl-pci".to_string()
-            )],
-            "the GPU choice moved something besides the card"
+            vec![
+                (
+                    "virtio-gpu-pci".to_string(),
+                    "virtio-gpu-gl-pci".to_string()
+                ),
+                ("sdl".to_string(), "sdl,gl=on".to_string()),
+            ],
+            "the GPU choice moved something besides the card and its GL context"
         );
 
         // A card is not a mode: every mode boots the machine's own GPU, so

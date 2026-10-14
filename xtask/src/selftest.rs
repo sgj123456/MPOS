@@ -801,6 +801,22 @@ fn boot_tests(
     // `cargo xtask run`, say) - which would abort QEMU before the guest boots
     // and report every test as failed. Leave it off here; `run` keeps it.
     config.vsock = false;
+    // And the card is the 2D one, whatever `machine.toml` ships. The GL card is
+    // what a human boots now - it is the only way this machine has a hardware
+    // renderer, and niri comes up on it (`docs/notes/` §7.4) - but *this* boot
+    // cannot carry it, measured 2026-10-14 on this host: the guest half is green
+    // on it (`=== SUMMARY pass=170 fail=0`, `mpos-kunit 30 passed, 0 failed`)
+    // and QEMU then dies after the guest wrote its debug exit, SIGSEGV inside
+    // the **host's** own `libgallium`, reached from QEMU's `egl_cleanup` under
+    // `qemu_cleanup` (the run's `coredumpctl` report: `#15 egl_cleanup
+    // (ui-opengl.so)`). A host Mesa teardown crash is not a refusal this kernel
+    // could answer, so the exit-33 check below reads `-1` and no run on that
+    // card could ever be called green. What the suite claims about the card is
+    // card-conditional already (`t-virtgpu`'s 3D target is served on one and
+    // refused on the other), so pinning it to the 2D card pins the same claims;
+    // the only thing that changes is whether the host survives its own
+    // shutdown. The why in full is `machine.toml`'s, and it is one key.
+    config.gpu = "virtio-gpu-pci".to_string();
     let args = qemu::machine_args(
         &config,
         &firmware.code,

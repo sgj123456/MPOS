@@ -54,6 +54,8 @@ const NR_CREATE_DUMB: u32 = 0xb2;
 const NR_MAP_DUMB: u32 = 0xb3;
 const NR_PRIME_HANDLE_TO_FD: u32 = 0x2d;
 const NR_PRIME_FD_TO_HANDLE: u32 = 0x2e;
+const NR_GEM_CLOSE: u32 = 0x09;
+const NR_RESOURCE_INFO: u32 = 0x45;
 
 /// `DRM_CLOEXEC == O_CLOEXEC`: mark the exported descriptor close-on-exec.
 const DRM_CLOEXEC: u32 = 0x80000;
@@ -118,6 +120,31 @@ const _: () = assert!(core::mem::size_of::<PrimeHandle>() == 12);
 const _: () = assert!(core::mem::offset_of!(PrimeHandle, handle) == 0);
 const _: () = assert!(core::mem::offset_of!(PrimeHandle, flags) == 4);
 const _: () = assert!(core::mem::offset_of!(PrimeHandle, fd) == 8);
+
+/// `struct drm_gem_close`: the handle a file is giving back.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GemClose {
+    handle: u32,
+    _pad: u32,
+}
+
+/// `struct drm_virtgpu_resource_info`: a handle in, the device resource and the
+/// size it names out.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ResourceInfo {
+    bo_handle: u32,
+    res_handle: u32,
+    size: u32,
+    blob_mem: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<GemClose>() == 8);
+const _: () = assert!(core::mem::offset_of!(GemClose, handle) == 0);
+const _: () = assert!(core::mem::size_of::<ResourceInfo>() == 16);
+const _: () = assert!(core::mem::offset_of!(ResourceInfo, res_handle) == 4);
+const _: () = assert!(core::mem::offset_of!(ResourceInfo, size) == 8);
 
 // --- the control-message door -----------------------------------------------
 //
@@ -485,6 +512,72 @@ fn main() {
         ),
         imp.handle == handle,
     );
+
+    // A handle is a **name the file holds**, not a property of the buffer.
+    // Linux's handle table is per `drm_file`, so a *second* file that imported
+    // this descriptor and then gave back the name it was handed says nothing
+    // about this file's name for the same buffer. Measured as the compositor
+    // coming up black: the render node closed the handle it had imported, and
+    // every batch the compositor's own file submitted naming its own handle came
+    // back `ENOENT` - which Mesa prints as `got error from kernel - expect bad
+    // rendering 2` and answers by dropping all rendering. This card kept one
+    // global flag, so one file's release took the other file's name away with
+    // it, and the claim below is the one that holds that flag to account.
+    match rustix::fs::open(
+        "/dev/dri/renderD128",
+        OFlags::RDWR,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(second) => {
+            let sfd = second.as_raw_fd();
+            let mut imp2 = PrimeHandle {
+                fd: dma.as_raw_fd(),
+                ..PrimeHandle::default()
+            };
+            let got = unsafe {
+                ioctl(
+                    sfd,
+                    ioc_d(NR_PRIME_FD_TO_HANDLE, 12),
+                    (&raw mut imp2) as *mut c_void,
+                )
+            };
+            check_ok(&mut r, "a second file imports the same descriptor", got);
+            let mut close2 = GemClose {
+                handle: imp2.handle,
+                ..GemClose::default()
+            };
+            let got = unsafe {
+                ioctl(
+                    sfd,
+                    ioc_d(NR_GEM_CLOSE, 8),
+                    (&raw mut close2) as *mut c_void,
+                )
+            };
+            check_ok(&mut r, "and gives back the name it was given", got);
+            // The claim. This file's name is this file's: a card that keyed the
+            // name on the *buffer* answered `ENOENT` here, which is the shape
+            // that stopped the compositor drawing.
+            let mut info = ResourceInfo {
+                bo_handle: handle,
+                ..ResourceInfo::default()
+            };
+            let got = unsafe {
+                ioctl(
+                    card_fd,
+                    ioc_d(NR_RESOURCE_INFO, 16),
+                    (&raw mut info) as *mut c_void,
+                )
+            };
+            r.check(
+                &format!(
+                    "while this file's own name still stands (got {got}, res {}, want {handle})",
+                    info.res_handle
+                ),
+                got == 0 && info.res_handle == handle,
+            );
+        }
+        Err(e) => r.check(&format!("/dev/dri/renderD128 opens ({e:?})"), false),
+    }
 
     let _ = unsafe { rustix::mm::munmap(drm_map, SIZE) };
     let _ = unsafe { rustix::mm::munmap(buf_map, SIZE) };
