@@ -454,6 +454,122 @@ ratchet, and the change adds no edge to it - `unix.rs` reaches `crate::sched::cu
 the recorded `net -> sched`, and the namespace spelling it shares with the IP registry
 (`net::normalize`) is inside `net` itself.
 
+**The task a pid namespace is spoken for by, landed: its members cannot end it, and its death is the namespace's.**
+The rung's remaining named gap was "a namespace's pid-1 death does not zap the namespace", and the
+step that closes it turns out to be two rules about one task - the number 1 - with a third and a
+fourth rule about *making* a namespace that the same probes turned up and this kernel does **not**
+have yet. All of it measured: `.workbuddy/probe_pid1.c`, `probe_pid1_handler.c`,
+`probe_pid1_sigsegv.c`, `probe_pid1_alarm.c`, `probe_pid1_fault.c`, `probe_pid1_zap.c`,
+`probe_pid1_nested.c`, `probe_fork_after_init.c`, `probe_pid_ns_again.c`. Two lessons repeat
+already-recorded ones: this host *can* create namespaces (`unshare -Ur`, §6.3's own correction), and
+a probe that answers a question unexpectedly is worth a second probe - three of these exist only
+because the previous one's answer was not the one the source suggested.
+
+**The signal rule, and the four classes it sorts raises into.** A namespace's init ignores the
+signals it would take *by default*; exactly three things reach it, and everything else is dropped:
+
+```
+probe_pid1_sigsegv.c    a sibling's kill(1, SIGSEGV) -> 0, and the init is still alive (also 7, 15)
+probe_pid1_alarm.c      an alarm(1) the init armed itself, SIG_DFL -> discarded, it survives
+probe_pid1_handler.c    SIGTERM with a handler installed -> the handler ran, the call answered 0
+probe_pid1_fault.c      a null-pointer fault -> signalled=1 sig=11: the init died of it
+probe_pid1_blocked.c    a *blocked* SIGTERM, waited for with sigtimedwait -> received
+probe_pid1.c            from the ancestor namespace: SIGTERM -> ignored, SIGKILL -> died
+```
+
+So: a signal with a **handler** crosses; a **forced** SIGKILL/SIGSTOP from an **ancestor** namespace
+crosses (and no other default signal from there - the ancestor's SIGTERM was ignored too); a
+**synchronous fault** crosses, and is not judged by the rule at all, because discarding it would
+return the task to the faulting instruction for ever; and a **blocked** signal is not judged either,
+because Linux checks the blocked masks first ("blocked signals are never ignored") - the last of
+those was found by re-reading the source after the first implementation was written, and it is the
+clause that keeps `sigwait`/`sigtimedwait`/`signalfd` working for an init that wants what its
+members send *as data*. A kernel raise *instead of* an event does **not** cross - the `alarm`
+measurement is what separates "the kernel" from "forced", and it is why the implementation has three
+raise sites rather than two: `queue_signal` (a kernel raise, not forced), `send_signal_info` (a
+task's `kill`, forced only when the sender is in an ancestor namespace), and `force_signal` (the
+kernel's own forced kill, added for the zap). And the discarded signal still answers its sender
+**success** - `kill(1, SIGKILL)` returns 0 and nothing happens - because Linux's check is on
+*delivery*, not on permission: the rule exists so that a member cannot take its init down by
+accident, not so that it can tell that it may not.
+
+The kernel paths that end a task already had to be taken out of the rule's reach, and finding that
+is what the fourth class is: the **strict-seccomp kill and a filter's `RET_KILL_*`** were queued
+signals (`send_signal(current(), SIGKILL)`/`SIGSYS`), which an init would have had discarded - an
+init running a strict filter would have gone on with the blocked call it was supposed to die for.
+Both now `exit(-(sig))` directly, which is Linux's `do_exit(SIGKILL)`/`do_exit(SIGSYS)` and exactly
+what their own comments already said they were matching. The fault path needed nothing: `idt.rs`
+already ends the task itself when the disposition is default, which is why the measured fault
+behaviour is unchanged by this rule rather than a special case in it. One corner is named rather
+than settled: `RET_TRAP`'s SIGSYS is still a *queued* signal, so an init with `SIG_DFL` for SIGSYS
+survives it - whether Linux's `force_sig_info` there reaches past the protection is the one thing
+these probes cannot answer without a seccomp program running as an init, which nothing writes.
+
+**The zap, and the membership that is not the obvious one.** `probe_pid1.c` and `probe_pid1_nested.c`
+together decide the shape, and each corrected a reading of the other:
+
+* a task **in** the namespace dies with its init ✓, and so does a task in a namespace **nested
+  beneath it** - the naive test (`task->active_pid_ns == ns`) would have stopped at the first level,
+  so the test here is "numbered in it or below it" (`PidNs::covers`);
+* the task that **unshared** the namespace - whose *children* go into it, which is the second clause
+  `zap_pid_ns_processes` is usually described with - **survives**: `probe_pid1_zap.c` has it reap the
+  init and reach the end of `main`. So that clause is deliberately *not* implemented, and the
+  obvious "kill everything that could put a task in there" reading is a machine that kills a shell
+  for its child's exit.
+
+Fired for the **last thread** of the group (Linux's `group_dead`) and never for the machine's own
+init, whose exit is the `INIT_EXITED` halt above it. **Named divergence**: Linux loops until the
+namespace is empty, because a task killed in the middle of a `fork` can leave a child behind; this
+is one pass over the table.
+
+**The membership is pinned two levels deep, which is what closes the "nested at one level" gap's
+hard half.** `t-ns-pid`'s init section raises a namespace, an init in it, and - from that init - a
+namespace *nested* under it with an init of its own, then kills the outer init and checks that the
+nested one died too. That claim is the one the naive membership test fails (the nested task's own
+namespace is not the one whose init died) *and* the one a non-forced kill fails (it is the init of
+its namespace, so its own members could never have reached it) - so it pins `covers` and the
+forcedness of `force_signal` at once. The section's nine words are: the namespace was made; the
+sibling's SIGKILL, SIGTERM and SIGUSR1 all answered 0; the init was alive after them; the signal it
+had a handler for ran; the one it had *blocked* came back through `sigtimedwait`; the ancestor's
+SIGKILL landed; the namespace's other task died; and the task in the namespace nested beneath it died
+too. Two of those are the ones that fail against the implementation as it was first written (the
+nested membership, and the blocked clause), which is the counterfactual worth having. The gap is
+narrower but not closed: the numbering chain itself (one task numbered at every level, `/proc` at
+depth, `NSpid`) is still pinned only one level deep, and one clause of Linux's `sig_ignored` is
+named rather than implemented - a **traced** task does not ignore signals either (`return
+!t->ptrace`), so a traced init may receive one where this kernel drops it; the probe for that is not
+written, and the pin says nothing about it.
+
+**And two rules about *making* a namespace that this step found and did not build.** Both measured
+against the same host, both currently served where Linux refuses, and both named in
+`docs/ROADMAP.md`/`docs/uapi/` rather than quietly depended on:
+
+```
+probe_pid_ns_again.c   unshare(CLONE_NEWPID) twice in one process -> the second is EINVAL
+                       clone(CLONE_NEWPID) after one               -> EINVAL
+probe_fork_after_init.c   fork() when the children's namespace's init has exited -> ENOMEM
+```
+
+The first is one rule with two faces: the caller's **own** pid namespace must be the one its children
+would go to (`copy_pid_ns`'s test), so a process may make a pid namespace once - after the first
+call its own numbers and its children's come from different namespaces, which is precisely the state
+the call refuses. It has a third consequence the pin ran into: a `fork` into a namespace whose init
+has **exited** is `ENOMEM`, so a task whose children go to a dead namespace cannot create one at all.
+`t-ns-pid`'s init section is therefore forked *before* the program unshares (its own namespace is
+still the machine's, and it makes the one it needs), and the section's claims are nine words sent
+back up. That shape is not a workaround to hide the divergence: it is the shape a program that
+respects the rule has, and the day the rule lands it is already what the pin exercises.
+
+**Gate.** x86_64 `=== SUMMARY pass=173 fail=0 (173 built)` with the kernel's own
+`mpos-kunit 32 passed, 0 failed` and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32
+cases, exit 0. Neither program count moved - the new claims are thirteen more inside `t-ns-pid`, which
+both sweeps already ran. Host suites: the kernel library's 537 and every leaf crate the gate builds
+(`mpos-pidns` is 9 now, up from 7: the crate grew `is_init`, `is_ancestor_of` and `covers` with
+their own tests), all green; clippy reports nothing on `x86_64-unknown-none`,
+`aarch64-unknown-none` and the host lib; `cargo xtask depgraph` is within the ratchet, and the
+change adds no edge to it - `child_signal` and `child_exit` reach the `pidns` leaf they already
+named.
+
 **NET: one `Stack`, and the device is the reason the list is short.** `net::NET`
 is one interface pair (`eth0` + `lo`), one address table, one route table and one
 socket registry. The record is already shaped like something a second copy would

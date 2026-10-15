@@ -4,7 +4,7 @@ use super::WaitEvent;
 use super::WaitPark;
 use super::child_mm::Mm;
 use super::child_mm::{populate_user_page_at, resolve_anon_fault, resolve_cow_fault};
-use super::child_signal::{current_credentials, queue_signal};
+use super::child_signal::{current_credentials, force_signal, queue_signal};
 use super::load::{initial_stack_rsp, interpreter_bytes, load_user, write_arg_block};
 use super::task::{
     RETIRED, RETIRED_CAP, Retired, SIGCHLD_PENDING, SpawnError, Stack, TIMER_SLOTS, Table, Task,
@@ -224,6 +224,56 @@ pub fn exit(code: isize) -> ! {
         for slot in t.tasks.iter_mut().flatten() {
             if slot.parent == Some(id) {
                 slot.parent = Some(INIT_PID);
+            }
+        }
+
+        // And a pid namespace's init takes its namespace with it - Linux's
+        // `zap_pid_ns_processes`. The membership it tests is the part worth
+        // stating, because the obvious reading of it is wrong: a task dies when
+        // it is **numbered in** the dying namespace, which includes every
+        // namespace nested beneath it, not merely a task whose own namespace
+        // this is. Both halves measured, and the second is what makes the first
+        // a question:
+        //
+        // * a task one namespace down died with its ancestor's init
+        //   (`.workbuddy/probe_pid1_nested.c`), so this is `covers`;
+        // * the task that *unshared* the namespace - whose own children would go
+        //   into it, but which is itself outside - **survived**
+        //   (`.workbuddy/probe_pid1_zap.c`), so this is deliberately *not*
+        //   extended to `pid_ns_children`. Adding that clause would kill the
+        //   shell of an `unshare -fp`, which Linux does not.
+        //
+        // Fired for the **last thread** of the group (Linux's `group_dead`), and
+        // never for the machine's own init: that exit does not reach this line,
+        // because the halt above is what it is. The kill is a **forced** one
+        // (`force_signal`), which is the only way a nested namespace's own init
+        // can be ended by a rule its own members cannot use against it.
+        //
+        // One divergence, named rather than papered over: Linux loops here until
+        // the namespace is empty, because a task killed in the middle of a
+        // `fork` can leave a child behind. This is one pass over the table.
+        let ns = Arc::clone(&t.task(id).pid_ns);
+        let tgid = t.task(id).tgid;
+        let group_dead = !t
+            .tasks
+            .iter()
+            .flatten()
+            .any(|o| o.tgid == tgid && !o.exited);
+        if group_dead && ns.is_init(tgid.0) {
+            let mut killed = alloc::vec::Vec::new();
+            for (slot, task) in t.tasks.iter_mut().enumerate() {
+                let Some(task) = task.as_mut() else { continue };
+                if task.exited || !ns.covers(&task.pid_ns) {
+                    continue;
+                }
+                force_signal(task, signal::SIGKILL);
+                killed.push(TaskId(slot));
+            }
+            // The wakes come after the walk: every target is collected first, so
+            // the table is borrowed once - and a wake needs the scheduler, which
+            // the walk is already holding.
+            for victim in killed {
+                t.sched.wake(victim);
             }
         }
 

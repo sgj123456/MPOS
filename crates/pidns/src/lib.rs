@@ -205,6 +205,52 @@ impl PidNs {
         })
     }
 
+    /// Whether `slot` is this namespace's **init** - the task it knows by the
+    /// number 1.
+    ///
+    /// The one task a namespace has rules of its own for, and both are
+    /// measured on the host rather than read off a page
+    /// (`.workbuddy/probe_pid1.c`, `probe_pid1_handler.c`; `docs/notes/` §6.3):
+    /// signals sent to it by a member of its own namespace are discarded while
+    /// their disposition is the default one - a signal it has installed a
+    /// handler for is delivered like any other - and its own death takes the
+    /// whole namespace with it. Both callers here ask the same question, and
+    /// the answer is this: the number 1, which is why the number matters.
+    ///
+    /// The root namespace answers `true` for slot 1 too, and deliberately: the
+    /// machine's init is the global init, and Linux protects it by the same
+    /// rule (`is_global_init` in `sig_task_ignored`). What it does *not* get is
+    /// the second one - nothing zaps the machine because its init died; the
+    /// machine stops, which is `exit`'s own decision and not this crate's.
+    pub fn is_init(&self, slot: usize) -> bool {
+        self.number_of(slot) == Some(1)
+    }
+
+    /// Whether this namespace is a **strict ancestor** of `other`.
+    ///
+    /// The half of the init rule that decides who may force a signal through
+    /// it: a sender in an ancestor namespace delivers SIGKILL/SIGSTOP where a
+    /// sibling inside the namespace does not, and no other default signal
+    /// either way (measured: a SIGKILL from outside killed the init, a SIGTERM
+    /// from the same outside namespace was still ignored).
+    pub fn is_ancestor_of(&self, other: &PidNs) -> bool {
+        let mut here = other.parent.clone();
+        while let Some(ns) = here {
+            if ns.ns_id == self.ns_id {
+                return true;
+            }
+            here = ns.parent.clone();
+        }
+        false
+    }
+
+    /// Whether `other` is this namespace or one nested inside it: the set of
+    /// tasks this namespace speaks for, and the set its init's death takes with
+    /// it.
+    pub fn covers(&self, other: &PidNs) -> bool {
+        self.ns_id == other.ns_id || self.is_ancestor_of(other)
+    }
+
     /// This namespace, then its parent, and so on to the root.
     fn chain(&self) -> Vec<&PidNs> {
         let mut out = Vec::new();
@@ -370,5 +416,53 @@ mod tests {
         assert_eq!(inner.number_of(8), None);
         assert_eq!(outer.number_of(8), None, "the outer level still names it");
         assert_eq!(root.number_of(8), Some(8), "the root's identity map");
+    }
+
+    /// The init is the task this namespace knows as 1 - not the first slot
+    /// registered, and not the lowest slot: a namespace whose first task has
+    /// been released has an init again at the next number 1 (the counter only
+    /// moves forward, so that is a *different* number-1 in a fresh namespace,
+    /// and answering by slot would name the wrong task).
+    #[test]
+    fn the_init_is_the_task_numbered_one() {
+        let root = PidNs::root(1);
+        let inner = PidNs::child(&root, 2);
+        assert_eq!(inner.allocate(12), 1);
+        assert!(inner.is_init(12));
+        assert!(!inner.is_init(13));
+        assert_eq!(inner.allocate(13), 2);
+        assert!(!inner.is_init(13), "number 2 is a member like any other");
+        // The root: slot 1 is the machine's init, and the identity map is what
+        // says so.
+        assert!(root.is_init(1));
+        assert!(!root.is_init(2));
+    }
+
+    /// A namespace is an ancestor of exactly the namespaces nested under it -
+    /// the question the init's signal rule turns into "may this sender force a
+    /// signal through", and the one its death asks about a task's membership.
+    #[test]
+    fn ancestor_and_coverage_follow_the_chain() {
+        let root = PidNs::root(1);
+        let outer = PidNs::child(&root, 2);
+        let inner = PidNs::child(&outer, 3);
+        let sibling = PidNs::child(&root, 4);
+
+        assert!(root.is_ancestor_of(&outer));
+        assert!(root.is_ancestor_of(&inner), "two levels down counts");
+        assert!(!outer.is_ancestor_of(&root));
+        assert!(
+            !outer.is_ancestor_of(&sibling),
+            "a sibling is not a descendant"
+        );
+        assert!(!outer.is_ancestor_of(&outer), "an ancestor is strict");
+
+        // Coverage is the inclusive half: the set a namespace's init's death
+        // takes with it, and the set a sender must be *outside* of to force a
+        // signal through its init.
+        assert!(outer.covers(&outer));
+        assert!(outer.covers(&inner));
+        assert!(!outer.covers(&sibling));
+        assert!(root.covers(&inner), "the root covers everything");
     }
 }

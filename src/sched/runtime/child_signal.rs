@@ -66,18 +66,88 @@ fn discarded_when_generated(task: &Task, sig: u8) -> bool {
     sig != crate::sched::signal::SIGCONT && task.dispositions.get(sig).is_ignore()
 }
 
+/// Whether a signal being generated for `task` is discarded because `task` is
+/// the **init of its pid namespace** and this is a signal it would take by
+/// default.
+///
+/// Linux's rule, and every clause of it is measured on the host rather than read
+/// off a page (`.workbuddy/probe_pid1*.c`; `docs/notes/` §6.3). Four things
+/// reach an init that has no handler for the signal, and everything else with a
+/// default disposition is dropped:
+///
+/// * a signal it has a **handler** for is delivered like any other (measured:
+///   the handler ran, and the `kill` answered 0 exactly as it does for one that
+///   is discarded) - which is why this tests the disposition and not the signal
+///   number;
+/// * **SIGKILL and SIGSTOP from an ancestor namespace**: `forced` below, and
+///   nothing else is let through by it - a SIGTERM from that same ancestor
+///   namespace was still ignored, and from inside its own namespace a SIGKILL is
+///   ignored too (measured: `kill(1, SIGKILL)`, `kill(1, SIGTERM)` and
+///   `kill(1, SIGBUS)` from a sibling all return 0 and all leave the init
+///   alive);
+/// * a **blocked** signal, which is not judged here at all - Linux checks the
+///   blocked masks before it asks this question ("blocked signals are never
+///   ignored"), measured with an init that blocks SIGTERM and asks for it with
+///   `sigtimedwait`. Without the clause an init could not use
+///   `sigwait`/`sigtimedwait`/`signalfd` for what its members send, which is
+///   exactly how a program that wants them *as data* reads them;
+/// * a **synchronous fault**, also not judged here: the arch's fault handler
+///   ends the task itself when the disposition is default (measured: a
+///   null-pointer fault killed a namespace's init), because a discarded fault
+///   signal would return the task to the faulting instruction for ever.
+///
+/// A kernel raise *instead of* an event - a timer expiry, a closed pipe, an
+/// `alarm` the init armed itself - is **not** forced, and is measured to be
+/// discarded: SIGALRM's default action is to terminate, and an init that armed
+/// one without a handler survived it. So the kernel is a sender like any other
+/// here, and only `force_signal` speaks for the kernel's forced kills.
+///
+/// The discarded signal still answers success to its sender, because that is
+/// what Linux answers: the check is on delivery, not on permission. That is the
+/// point of the rule - it exists so that a member of a namespace cannot take its
+/// init down by accident, not so that it can *tell* that it may not.
+///
+/// One clause of Linux's `sig_ignored` is deliberately not here, and is named in
+/// `docs/notes/` §6.3 rather than guessed at: a **traced** task does not ignore
+/// signals either (`return !t->ptrace`), and whether a traced init receives one
+/// this way has not been measured here.
+fn init_discards(task: &Task, sig: u8, forced: bool) -> bool {
+    let kernel_only = sig == crate::sched::signal::SIGKILL || sig == crate::sched::signal::SIGSTOP;
+    task.pid_ns.is_init(task.tgid.0)
+        && task.blocked & crate::sched::signal::bit(sig) == 0
+        && task.dispositions.get(sig).is_default()
+        && !(forced && kernel_only)
+}
+
 /// Add `sig` to `task`'s pending set and store the `siginfo_t` a handler will
 /// read for it. The one place a bit and its record are set together, so no
 /// raise site can leave a handler looking at a zeroed `signo`.
 ///
 /// An ignored signal never gets here in effect: `task`'s disposition decides,
 /// and the kernel's own raises (a timer expiry, a broken pipe, a child's exit)
-/// follow the same rule a `kill` does.
+/// follow the same rule a `kill` does - including against a namespace's init,
+/// which is measured to survive an `alarm(2)` it armed itself.
 pub(crate) fn queue_signal(task: &mut Task, sig: u8, info: crate::sched::signal::SigInfo) {
-    if discarded_when_generated(task, sig) {
+    if discarded_when_generated(task, sig) || init_discards(task, sig, false) {
         return;
     }
     enqueue(task, sig, info);
+}
+
+/// Add `sig` to `task`'s pending set as a **forced** kernel raise - Linux's
+/// `force_sig`, the `SEND_SIG_PRIV` of a `do_exit`'s neighbourhood rather than a
+/// sender's `kill` - and wake nobody: the callers wake their own targets.
+///
+/// The one kernel path that reaches past a pid namespace init's protection
+/// ([`init_discards`]), which is why it exists: a namespace's death is delivered
+/// with SIGKILL, and a nested namespace's *own* init is one of its targets - a
+/// task whose members cannot end it, so a non-forced kill would leave a
+/// namespace running inside one that is gone.
+pub(crate) fn force_signal(task: &mut Task, sig: u8) {
+    if discarded_when_generated(task, sig) || init_discards(task, sig, true) {
+        return;
+    }
+    enqueue(task, sig, crate::sched::signal::SigInfo::kernel(sig));
 }
 
 /// Put a raised signal where its ABI says it belongs. A standard signal
@@ -152,6 +222,18 @@ pub fn send_signal_info(id: TaskId, sig: u8, info: crate::sched::signal::SigInfo
             && sig != crate::sched::signal::SIGSTOP
             && orphaned_group(t, task.pgid)
         {
+            return true;
+        }
+        // And a namespace's init is not endable from inside its own namespace.
+        // The `forced` half is Linux's: a sender in an **ancestor** namespace
+        // may push SIGKILL/SIGSTOP through, and that is the whole of it - a
+        // SIGTERM from that same ancestor is still discarded. The kernel's own
+        // raises are not forced either (measured: an `alarm` an init armed
+        // itself is discarded); `force_signal` is what speaks for those. The
+        // signal is discarded, not refused: the `true` below is the answer
+        // Linux gives, and a `kill` dropped this way still returns 0.
+        let forced = t.task(t.current).pid_ns.is_ancestor_of(&task.pid_ns);
+        if init_discards(task, sig, forced) {
             return true;
         }
         let Some(task) = t.tasks.get_mut(id.0).and_then(Option::as_mut) else {

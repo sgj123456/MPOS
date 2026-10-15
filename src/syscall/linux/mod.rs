@@ -67,13 +67,20 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
     // SECCOMP_MODE_STRICT is on for this thread. Only the four calls a
     // condemned process still needs survive: read, write, exit and the
     // signal-return trampoline. Anything else is fatal - the filtered call
-    // never reaches the handlers below and this thread gets SIGKILL, matching
-    // the `do_exit(SIGKILL)` Linux runs on a strict-mode violation.
+    // never reaches the handlers below and this thread ends, matching the
+    // `do_exit(SIGKILL)` Linux runs on a strict-mode violation.
+    //
+    // An `exit` rather than a queued signal, and that is Linux's shape: the
+    // kernel ending a task is not a *delivery*, so nothing a task can arrange
+    // about its signals applies to it - including the protection a **pid
+    // namespace's init** has from the signals its own members send
+    // (`sched::runtime::child_signal`'s rule, measured in `docs/notes/` §6.3).
+    // Sent as a kill, a strict-filter violation by an init would be discarded
+    // and an init running a strict filter would go on with the blocked call.
     if crate::sched::current_is_seccomp_strict()
         && !matches!(nr, nr::READ | nr::WRITE | nr::EXIT | nr::RT_SIGRETURN)
     {
-        crate::sched::send_signal(crate::sched::current(), crate::sched::signal::SIGKILL);
-        return err::ENOSYS;
+        crate::sched::exit(-(crate::sched::signal::SIGKILL as isize));
     }
     // And a `SECCOMP_MODE_FILTER` program decides *before* the table does, for
     // the same reason strict mode does: the filtered call must not run at all.
@@ -158,10 +165,14 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
                 // filter returning an invented action was seen to kill the
                 // process with SIGSYS. Allowing instead would have been the
                 // one direction a sandbox cannot survive being wrong in.
-                _ => {
-                    crate::sched::send_signal(crate::sched::current(), SIGSYS);
-                    return err::ENOSYS;
-                }
+                //
+                // Ended by `exit`, not by queueing the signal: Linux delivers
+                // these two with `do_exit(SIGSYS)`, and the difference shows on
+                // a **pid namespace's init**, whose protection discards the
+                // signals its own members send (§6.3) - a filter's own decision
+                // being droppable would be a sandbox that lets a program through
+                // the door its own filter locked.
+                _ => crate::sched::exit(-(SIGSYS as isize)),
             }
         }
     }

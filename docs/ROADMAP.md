@@ -46,7 +46,10 @@ One-glance status of the whole roadmap.
 - [x] teardown at exit, not at reap (§6, R.15)
 - [~] 6.3 Namespaces — UTS, MNT, **PID** and **NET** landed, each with its pin (`t-ns-uts`,
   `t-ns-mnt`, `t-ns-pid`, `t-ns-net`): the numbers a process sees are the reader's namespace's,
-  both directions of the translation and `/proc` rendered per reader (§6.3); a child cloned with
+  both directions of the translation and `/proc` rendered per reader (§6.3); **the task a namespace
+  is spoken for by has rules of its own** — its members cannot end it (only an ancestor's
+  SIGKILL/SIGSTOP, or a signal it has a handler for), and its death takes every task it speaks for,
+  nested namespaces included (§6.3, measured); a child cloned with
   `CLONE_NEWNET` gets a stack of its own - its own `lo`, no wire, and a port space the machine's
   cannot see - and the kind is served by all three calls, with **a socket remembering the stack it
   was made in** (`net`'s handle map): a socket outlives an `unshare`, an inherited descriptor keeps
@@ -179,16 +182,16 @@ One-glance status of the whole roadmap.
 In the order that keeps each step verifiable on its own:
 
 1. **namespaces** (§6.3) — UTS, MNT, PID and NET are landed, and the ladder's remaining work
-   is named per rung: a **wire that can move** into a namespace (`eth0` still cannot enter one),
-   PID's own named gaps (pid-1 death does not zap, nested namespaces pinned at one level, `NSpid`
-   shows one number), the `/proc/net` reader's rows (the collector filters by namespace; no test
-   exercises it), and then the four kinds with no entry at all (user, IPC, cgroup, time - four of
-   `namespaces(7)`'s eight). `AF_UNIX` moved off this list (2026-10-15): its **abstract** names are
-   the socket's namespace's, as Linux's are - and its *path* names turned out not to be namespaced
-   at all, which the plan had wrong. vsock also left it, for a different reason: its port table is
-   machine-global in Linux too (measured), so keying it per namespace would be a divergence - what
-   is left there is a transport question this host cannot ask. Beside it: seccomp's one named piece,
-   the `PTRACE_EVENT_SECCOMP` stop (§8.2).
+   is named per rung: the **pid namespace's own two rules** the last step measured and did not
+   build — one pid namespace per process (a second `unshare(CLONE_NEWPID)`, and a
+   `clone(CLONE_NEWPID)` after one, are `EINVAL`; a `fork` into a namespace whose init has exited
+   is `ENOMEM`), a **wire that can move** into a namespace (`eth0` still cannot enter one),
+   nested namespaces pinned only one level deep for the *numbers* (the zap's reach is pinned two
+   levels now), `NSpid`'s one number, the `/proc/net` reader's rows (the
+   collector filters by namespace; no test exercises it), and then the four kinds with no entry at
+   all (user, IPC, cgroup, time - four of `namespaces(7)`'s eight). `AF_UNIX` moved off this list
+   (2026-10-15) and vsock left it with a measurement instead of an implementation, both recorded in
+   §6.3. Beside it: seccomp's one named piece, the `PTRACE_EVENT_SECCOMP` stop (§8.2).
 2. **interrupt-driven block completions** (§10.5's last row) — measured and re-scoped; §10.5
    carries the structure change, its pin and what each machine's clock can see.
 3. **what is left of the DHCP chain** (§4.5) — the raw-IP door's rules, cause and reverted
