@@ -280,6 +280,25 @@ answers, and the request that would add the address is refused. And **`ip link s
 a namespace is `ENODEV`**, because there is no device at that index - a namespace has no wire, and
 moving one in is `ip link set ... netns`, which this kernel has no place for.
 
+**And the move request itself is now refused rather than silently accepted (2026-10-15).** The
+rtnetlink `link set` handler parsed only `IFLA_MTU` and `IFLA_IFNAME`, so `ip link set eth0 netns N`
+- which carries `IFLA_NET_NS_PID` (or `IFLA_NET_NS_FD`) - fell through the attribute walk and the
+request answered **`0`**: a success report for a wire that had not moved, the single worst answer
+this ABI can give a script. The handler now recognises both attributes and returns `EOPNOTSUPP`
+for the whole request, matching the honest-refusal rule (§3.2): the move is real on Linux and this
+kernel cannot do it, so it says so. The pin is `t-ns-net`'s parent-side claim, which sends the
+request from the machine's namespace with the child's own pid as the destination (a live task in a
+namespace of its own, so the name resolves) and reads back `-EOPNOTSUPP`; before this change the
+same request answered `0` and the claim fails, which is the counterfactual.
+
+**Gate (2026-10-15).** x86_64 `=== SUMMARY pass=173 fail=0` with `mpos-kunit 32 passed, 0 failed`
+and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32 cases. The program counts are
+unchanged from the commit before - this adds a claim *inside* `t-ns-net`, not a program - and the
+new claim prints `ok: ... refuses to hand its wire away, EOPNOTSUPP (got -95)` on both arms.
+clippy reports 0 errors on `x86_64-unknown-none` (its warnings are the pre-existing ones), and
+`cargo xtask depgraph` is within the ratchet: the change is inside `net`'s own `rtnl` module and
+adds no `crate::` edge.
+
 **Gate.** x86_64 `=== SUMMARY pass=173 fail=0 (173 built)` with the kernel's own
 `mpos-kunit 32 passed, 0 failed` and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32
 cases, exit 0. Each arm is one higher than the commit before this one, which is the new pin
@@ -303,8 +322,10 @@ time, and a served set written into a test is the shape that makes it happen.
 
 **Named gaps, each with what it waits on.** A device cannot move into a namespace: `eth0` stays
 the machine's, because `ip link set eth0 netns N` needs a place to move a device *to* and this
-kernel has none. A namespace's stack is never freed - the identity carries no reference count,
-where Linux frees one with the last `struct net` (and `HOMES` is cleaned per socket, not per
+kernel has none - the request is refused with `EOPNOTSUPP` now rather than answered `0`, so what
+remains is the move itself, not the honesty about it. A namespace's stack is never freed - the
+identity carries no reference count, where Linux frees one with the last `struct net` (and
+`HOMES` is cleaned per socket, not per
 namespace). **vsock's own stack stays machine-wide**, which is now a *measured* shape rather than a
 gap (the paragraph below has the probe), and the unix family is split where Linux splits it - its
 **abstract** names are keyed by the socket's namespace, its **path** names are not namespaced at

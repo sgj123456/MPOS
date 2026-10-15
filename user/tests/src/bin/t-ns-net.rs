@@ -12,7 +12,9 @@
 //! * and it has **no wire**: there is no `eth0` to bring up, and the link dump
 //!   has no entry for one, because a namespace cannot take the machine's only
 //!   NIC with it (`ip link set eth0 netns N` is the thing this kernel has no
-//!   place for - the first named gap of the rung);
+//!   place for - the first named gap of the rung) - and the machine's namespace
+//!   answers that move request with `EOPNOTSUPP` rather than a success that
+//!   moved nothing, which is the claim the parent pins below;
 //! * while the machine's stack is untouched: the very port the child holds is
 //!   **free** in the parent's namespace, and a connect to it there is refused -
 //!   the two port spaces are two;
@@ -144,6 +146,9 @@ const RTM_NEWADDR: u16 = 20;
 const NLMSG_ERROR: u16 = 2;
 const IFF_UP: u32 = 0x1;
 const IFA_ADDRESS: u16 = 1;
+/// `IFLA_NET_NS_PID` (`linux/if_link.h`): the network namespace a `link set`
+/// wants to move the device into, named by a pid in the caller's namespace.
+const IFLA_NET_NS_PID: u16 = 19;
 const LO_INDEX: i32 = 1;
 const ETH_INDEX: i32 = 2;
 
@@ -197,6 +202,22 @@ fn set_link_up(index: i32) -> Msg {
     head.extend_from_slice(&IFF_UP.to_ne_bytes()); // ifi_flags
     head.extend_from_slice(&IFF_UP.to_ne_bytes()); // ifi_change
     Msg::new(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, &head)
+}
+
+/// `ip link set <index> netns <pid>` - the same `ifinfomsg`, carrying
+/// `IFLA_NET_NS_PID` instead of a flag change. This is the move request the
+/// machine's namespace must refuse: there is nowhere to move a device *to*.
+fn set_link_netns(index: i32, pid: i32) -> Msg {
+    let mut head = Vec::new();
+    head.push(0); // ifi_family: AF_UNSPEC
+    head.push(0);
+    head.extend_from_slice(&0u16.to_ne_bytes()); // ifi_type
+    head.extend_from_slice(&index.to_ne_bytes());
+    head.extend_from_slice(&0u32.to_ne_bytes()); // ifi_flags
+    head.extend_from_slice(&0u32.to_ne_bytes()); // ifi_change
+    let mut m = Msg::new(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, &head);
+    m.attr(IFLA_NET_NS_PID, &pid.to_ne_bytes());
+    m
 }
 
 /// `ip addr add <ip>/<prefix> dev <index>` - the `ifaddrmsg`, then the address
@@ -580,6 +601,27 @@ fn main() {
         drop(up_w);
         r.check("the child that gets its own stack was cloned", child > 0);
         if child > 0 {
+            // ---- The machine will not give its wire away ----
+            //
+            // `ip link set eth0 netns N` names a namespace to move the device
+            // *to*, and this kernel has no place to move one to (§6.3). The
+            // request is refused with `EOPNOTSUPP` rather than answered with a
+            // success that moved nothing - the bug this claim pins, because the
+            // attribute used to fall through the parser and the answer was `0`.
+            // The pid is the child's: it is a live task in a namespace of its
+            // own, blocked on the pipe a few lines below, so the destination is
+            // real and the refusal is the kernel's rule rather than an
+            // unresolvable name.
+            let route = route_socket();
+            let moved = match &route {
+                Some(fd) => ask(fd, &set_link_netns(ETH_INDEX, child as i32)),
+                None => 0,
+            };
+            r.check(
+                &format!("and the machine refuses to hand its wire away, EOPNOTSUPP (got {moved})"),
+                moved == -(Errno::OPNOTSUPP.raw_os_error() as isize),
+            );
+
             let mine = ns_number();
             r.check(
                 "the parent reads its own net namespace number",

@@ -185,7 +185,9 @@ One-glance status of the whole roadmap.
 In the order that keeps each step verifiable on its own:
 
 1. **namespaces** (§6.3) — UTS, MNT, PID and NET are landed, and the ladder's remaining work
-   is named per rung: a **wire that can move** into a namespace (`eth0` still cannot enter one),
+   is named per rung: a **wire that can move** into a namespace (`eth0` still cannot enter one -
+   `ip link set eth0 netns N` is refused `EOPNOTSUPP` now instead of the bare `0` it returned, so
+   what remains is the move itself and not the honesty about it; 2026-10-15),
    nested namespaces pin the *numbers* two levels deep now, as the zap's reach already did, and
    then the four kinds with no entry at all
    (user, IPC, cgroup, time - four of `namespaces(7)`'s eight). The `/proc/net` reader's rows were

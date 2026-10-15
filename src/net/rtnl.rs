@@ -76,6 +76,12 @@ const IFLA_MTU: u16 = 4;
 const IFLA_QDISC: u16 = 6;
 /// The transmit queue length, as a native-order word.
 const IFLA_TXQLEN: u16 = 13;
+/// The two ways a link request can name the network namespace to move a device
+/// *to*: by pid (`IFLA_NET_NS_PID`, a pid read in the caller's own namespace)
+/// or by an open `/proc/<pid>/ns/net` descriptor (`IFLA_NET_NS_FD`). Numbered
+/// as `linux/if_link.h` numbers them.
+const IFLA_NET_NS_PID: u16 = 19;
+const IFLA_NET_NS_FD: u16 = 28;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
@@ -653,9 +659,20 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
             let mut up: Option<bool> = None;
             let mut mtu: Option<u32> = None;
             let mut name: Option<Vec<u8>> = None;
+            // A request to move this device into another network namespace:
+            // `ip link set eth0 netns N` carries one of these. `eth0` cannot
+            // leave the machine and this kernel has no place to move a device
+            // *to* (§6.3), so the whole request is refused rather than
+            // half-applied. Before this arm the attribute fell to the catch-all
+            // and the request answered `0`: a script that ran the command
+            // believed its wire had moved when nothing had, which is the worst
+            // answer this ABI can give. Linux serves the move; this kernel says
+            // so in its errno instead.
+            let mut move_to = false;
             let ok = for_each_attr(body, 16, |ty, value| {
                 match ty {
                     IFLA_MTU => mtu = le32(value),
+                    IFLA_NET_NS_PID | IFLA_NET_NS_FD => move_to = true,
                     IFLA_IFNAME => {
                         // The NUL a label carries is part of the value, not
                         // the name.
@@ -667,6 +684,9 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
             });
             if !ok {
                 return crate::err::EINVAL;
+            }
+            if move_to {
+                return crate::err::EOPNOTSUPP;
             }
             // The `ifi_change` mask is what says the request means its
             // flags: `ip link set eth0 down` sends flags with only IFF_UP
