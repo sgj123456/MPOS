@@ -23,14 +23,14 @@ extern crate alloc;
 /// spells them. Not target-gated, and it has to be: the driver beside it is
 /// never compiled off the machine, and what that driver and a real QEMU must
 /// agree on is exactly the kind of fact - a command number, a field offset, a
-/// struct size - that an agreement with itself cannot check. `drivers/drm.rs`
+/// struct size - that an agreement with itself cannot check. `drivers/drm/`
 /// records what happens when a number is pinned only against the caller that
 /// sends it.
 pub mod abi;
 /// The two DRM blobs a KMS driver publishes as bytes: an EDID, and the
 /// `IN_FORMATS` list of which format-and-modifier pairs a plane scans out.
 /// Ungated because both are pure encoders and the bytes are what a reader
-/// parses - `drivers/drm.rs` holds the card's state and talks to the GPU, so
+/// parses - `drivers/drm/` holds the card's state and talks to the GPU, so
 /// nothing inside it can be checked off the machine, and an EDID one field out
 /// of place is a display no compositor can name.
 pub mod blob;

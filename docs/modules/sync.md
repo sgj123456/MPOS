@@ -53,7 +53,7 @@ they are named here rather than silently corrected.
 
 The tree-wide picture is not a file: `critical_section::with` and `critical_section::Mutex` appear
 throughout `src/` - the VFS node tables, the scheduler's task/waiter lists, the virtio device state,
-`drivers/drm.rs`, `net/*`, `uevent`, `rand`, and `src/console.rs`'s log rings are all built on them.
+`drivers/drm/`, `net/*`, `uevent`, `rand`, and `src/console.rs`'s log rings are all built on them.
 `spin::Mutex` appears nowhere outside the module's own prohibition (grep).
 
 ## Contracts

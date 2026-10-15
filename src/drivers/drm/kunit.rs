@@ -86,17 +86,17 @@ fn the_crtc_reports_the_mode_it_drives(_info: &BootInfo) -> Result<(), String> {
         println!("(drm) no display card on this machine, so there is no CRTC to ask");
         return Ok(());
     };
-    let (drive_w, drive_h) = super::programmed_mode_dims();
+    let (drive_w, drive_h) = super::props::programmed_mode_dims();
     // The field the host's own display event writes, written here instead: the
     // only way a boot with no window can stand in the window's place.
     let was = gpu.advertised_dims();
     let _ = gpu.set_advertised(ASKED.0, ASKED.1);
-    let asked = super::advertised_mode_dims();
+    let asked = super::props::advertised_mode_dims();
     // `struct drm_mode_crtc`: crtc_id@12, fb_id@16, x@20, y@24, gamma_size@28,
     // mode_valid@32, mode@36 - and inside the mode, hdisplay@+4 and vdisplay@+14.
     // Sized past all of it, because the mode's own 32-byte name runs to +104.
     let mut crtc = [0u8; 128];
-    let rc = super::get_crtc(&raw mut crtc as usize);
+    let rc = super::props::get_crtc(&raw mut crtc as usize);
     // Put back before a single check can return early: this field is read by the
     // connector's next re-probe too, and a suite that left a size behind would be
     // measuring the tests that run after it.
@@ -147,7 +147,7 @@ fn the_crtc_reports_the_resource_on_the_screen(_info: &BootInfo) -> Result<(), S
         println!("(drm) no display card on this machine, so there is no CRTC to ask");
         return Ok(());
     };
-    let own = super::programmed_mode_dims();
+    let own = super::props::programmed_mode_dims();
     // A size the card is not driving at, so that a run which answered the
     // framebuffer's geometry cannot pass. Halving keeps it a size a display
     // could have.
@@ -169,7 +169,7 @@ fn the_crtc_reports_the_resource_on_the_screen(_info: &BootInfo) -> Result<(), S
     let mut got = own;
     for _ in 0..1000 {
         gpu.presenting_client(shown.0, shown.1);
-        got = super::programmed_mode_dims();
+        got = super::props::programmed_mode_dims();
         gpu.presenting_own_framebuffer();
         if got == shown {
             break;
@@ -187,7 +187,7 @@ fn the_crtc_reports_the_resource_on_the_screen(_info: &BootInfo) -> Result<(), S
         got.1
     );
 
-    let back = super::programmed_mode_dims();
+    let back = super::props::programmed_mode_dims();
     case_check!(
         back == own,
         "and with this driver's own framebuffer back on the screen it reports {}x{} where it \

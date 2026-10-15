@@ -1010,3 +1010,68 @@ takes both remaining counts to 0 and is what lets S5 close the modules.
 **The block layer seam is the thirteenth**: `mpos-blk` — the `BlockDev` contract, the disk registry and the GPT/MBR decode — moved out of `src/blk` into `crates/blk`, re-exported as `pub use mpos_blk as blk;` so every `crate::blk::` caller is unchanged. It was already host-compiled and host-tested (13 tests), and the module's one kernel reference — `part.rs` sizing its transfer buffer from `mm::PAGE_SIZE` — is now `mpos_blk::PAGE_SIZE`, the bound belonging to the trait that states it rather than the frame allocator that sizes the same hardware fact. `blk` leaves the module graph as a source: `drivers`/`uevent`/`vfs` still *name* it (a cross-crate edge downward), it names nothing back, and no mutual pair moved (17/17).
 
 **The HAL's stages S2–S5, landed.** The §11.4 table records the pairs and the gate for each; what the prose carried beyond it: **S2** made the interrupt controller a capability — `crate::hal::Interrupts` names `Line::{Timer,Serial}` and asks `unmask`/`mask`/`eoi`, `init_message_signalled` and `net_msi_vector` — so the serial driver names the line it is on rather than PIC bit 4, and the net driver asks for the vector instead of naming `idt::NET_IRQ_VECTOR`; no raw IRQ or vector crosses the seam, `drivers → arch` fell to zero and mutual pairs went 15 → 14, full gate green `pass=142 fail=0 (142 built)` exit 33. **S3** made paging a capability (`install`, `map_mmio`, `translate`, `user_accessible`, `is_cow_page`, `write_user_u32`, the roots, the two `switch_to_*`, plus `type Space: AddressSpaceOps`); `PageTaken` moved to `mm::vm` beside `Mapping`, since it is part of what a mapping *is* rather than an x86 fact; `mm`, `uaccess`, `sched`, `syscall` and `main` stopped naming `arch::paging` entirely; the pair count stayed at 14 while swapping which pair it is (`arch ↔ mm` out, `hal ↔ mm` in, argued in `ARCHITECTURE.md` §9 as the seam's neighbour rather than a leak); gate green as above. **S4** made the task context a capability and shut the door behind it: `crate::hal::Contexts` carries `type Context: ContextOps<Fpu = Self::Fpu>`, `type Fpu`, `type UserFrame`, the FPU save/restore/claim/trap calls, `bootstrap`/`switch`/`resume_user`/`enter_user`/`set_kernel_stack`, and `user_segments`; `sched` no longer names `arch` at all — `task.context.fpu` is `fpu()`/`fpu_mut()`, the two frame literals in `spawn_copy`/`spawn_thread` became `UserFrameOps::forked` plus `set_result(0)`, and `context_regs`/`context_from_regs` are one-line calls onto `to_user_regs`/`from_user_regs` (the machine translating its own frame into the ABI's field order, which is the half of the convergence that *can* live in `arch`); `syscall/linux/proc.rs`'s `gdt::user_selectors` became `hal::user_segments()`; `sched → arch` and `syscall → arch` are both 0 and mutual pairs went 14 → 12. The duplication it left — the Linux register-file field order exists once in `arch/x86_64/context.rs` and once in `syscall/linux/abi.rs`, because one side is bare-metal and the other host-built — is *checked* on every boot in `M1` (`main.rs` asserts all nineteen named indices and the count against the ABI's table), which is what makes it a recorded agreement rather than a hope; gate green as above. **S5's ratchet** (the closure waits for S4): `cargo xtask depgraph` gained a third recorded rule — references to `crate::arch::` from a layer that is not the machine layer (`sched` 17, `syscall` 4 today, both may only fall) — which is what stops the door widening while S4 is written. **S5, the door itself**: `src/arch/mod.rs` is now a facade of four items — `kernel_sections`, `breakpoints_caught` and the two register-table constants the M1 check needs — and `arch/x86_64`'s submodules are `pub(crate)`, so a layer cannot reach `arch::paging` even by writing the path; defence in depth behind the depgraph's allow-list, which catches the reference, this catches the *name*; deleting the module glob made two genuinely dead helpers visible (`gdt::user_code`/`user_data`, reachable only through it) and they are gone, per V-7's rule that dead machine modules are debt; gate green `pass=142 fail=0 (142 built)` exit 33.
+
+---
+
+### R.11.F — the two largest files stop being single files: a split by responsibility, and what a mechanical move quietly dropped
+
+`sched/runtime.rs` (9 099 lines) and `drivers/drm.rs` (8 593 lines) were the two largest files
+in the tree, and the two §11.1.11 named as long *because each holds several subsystems'
+concerns* rather than because its subject is large. Both are directories now, one child per
+responsibility, with `mod.rs` keeping the module's own header and re-exporting the same names:
+
+- `sched/runtime/` — `task.rs` (the task table, `Task`, `Context`/`Stack`, `Layout`, the
+  scheduler loop, the timer and rlimit scans), `child_mm.rs` (the `Mm` carrier, the page-fault
+  resolvers, the user-memory and mmap accessors), `child_signal.rs` (delivery, stops, the wait
+  queues and the child-event table), `child_exit.rs` (`spawn`/`fork`/`clone`/`vfork`/
+  `exec_replace`, exit, reaping and the orphan handover), `load.rs` (image loading, the `#!`
+  chain, the pid-1 handoff), `trace.rs` (ptrace) and `procfs.rs` (the snapshots `/proc` reads).
+- `drivers/drm/` — `abi.rs` (the UAPI vocabulary: ids, request numbers, caps, flags),
+  `state.rs` (`STATE` and the object tables), `ioctl.rs` (`drm_request`, `arg_shape`, the
+  dispatch), `card.rs` (the two device nodes), `props.rs` (KMS enumeration, the property doors,
+  the atomic commit), `fb.rs` (buffers and framebuffers), `flip.rs` (page flip and present),
+  `sync.rs` (`SYNCOBJ_*`), `master.rs` (master, magic, leases) and `virtgpu.rs`
+  (`DRM_VIRTGPU_*`).
+
+Nothing outside either module changed name: `drivers::drm::drm_ioctl` is
+`pub use ioctl::drm_request as drm_ioctl`, `sched::runtime`'s export list is the same list, and
+every `crate::` reference in the tree still names the module it named before.
+
+**What the mechanical move dropped, and what caught it.** A move cut along blank-line blocks is
+not behaviour-preserving by construction, and this one lost two things. Two rows of
+`arg_shape` — `NR_MODE_GETGAMMA | NR_MODE_SETGAMMA => (32, true)` and
+`NR_CRTC_GET_SEQUENCE | NR_CRTC_QUEUE_SEQUENCE => (24, true)` — went with the block they sat in,
+and their absence is *invisible to the compiler* because a `match` has a catch-all: the gamma
+pair was still refused (`EINVAL`, the refusal's own answer) and the sequence pair still fell to
+`ENOTTY`, so only the *ordering* Linux's ioctl layer guarantees was gone. `t-drm-args` holds
+exactly that ordering — "a poisoned GETGAMMA argument is EFAULT before the refusal", "a poisoned
+CRTC_GET_SEQUENCE argument is EFAULT, not ENOTTY" — and the first gate run came back
+`pass=170 fail=1` with those two claims as the only red, which is the pin doing the job rule 6
+keeps it for. The second loss was dead and therefore silent in the other direction: a private
+`Mm::vma_take_range` with no caller anywhere at HEAD, which is why no test could have missed it.
+Both are restored, and the restore is what turned the gate green (`pass=171 fail=0`), which is
+the counterfactual: the two rows are what those two claims rest on.
+
+What made the loss *findable before* the gate — and the reason to write it down — is two cheap
+multiset comparisons over the old file and the concatenation of its children: the **identifier**
+counts, and the set of **match-arm patterns**. Both are blind to indentation, visibility and
+`super::abi::`-style path rewrites, and both point straight at what is missing: the identifier
+pass showed `NR_MODE_GETGAMMA`/`NR_MODE_SETGAMMA`/`NR_CRTC_GET_SEQUENCE`/`NR_CRTC_QUEUE_SEQUENCE`
+each down by exactly one and `vma_take_range`/`take_range` gone entirely, and the arm pass
+showed the two rows and nothing else. A *symbol-name* comparison — the obvious first check, and
+the one that was run first — does not catch either, because neither a dropped arm nor a dropped
+private helper changes the set of names the file declares.
+
+**Both arms, measured.** x86_64 `=== SUMMARY pass=171 fail=0 (171 built)`, exit 0, with the
+kernel's own `mpos-kunit 32 passed, 0 failed`; aarch64 `=== SUMMARY pass=170 fail=0`, the same 32
+cases, exit 0. Host unit tests and the xtask suite run inside that sweep; clippy reports 0 errors
+on `x86_64-unknown-none`, `aarch64-unknown-none`, the host lib and the aarch64 loader;
+`cargo xtask depgraph` is within the ratchet — a move *inside* a module cannot add an edge, which
+is the one thing this refactor never had to argue for.
+
+**Where the name lives now.** The live pointers moved with the split: the file tables in
+`docs/modules/sched.md` and `docs/modules/drivers.md`, `ARCHITECTURE.md`'s carrier examples, the
+two README trees, and the ~20 source comments that named `drivers/drm.rs` or `sched/runtime.rs`
+as the home of a symbol. `docs/notes/`'s own citations were deliberately left alone — they record
+what was measured when, which is the precedent Step E's `fs.rs` split set and the reason a
+`§N.M` pointer is a routing address rather than a file path.

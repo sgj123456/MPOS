@@ -39,7 +39,7 @@
 //! LBA is split across the command FIS, which task-file bits mean failure - are
 //! pinned in the booted machine by `t-ahci` rather than by a host test: every
 //! function below is a volatile access to a register file that only exists on a
-//! machine, which is the same trade `drivers/drm.rs` makes and §5's rule about
+//! machine, which is the same trade `drivers/drm/` makes and §5's rule about
 //! where a pin goes.
 
 use alloc::sync::Arc;

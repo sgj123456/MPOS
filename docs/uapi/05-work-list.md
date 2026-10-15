@@ -166,7 +166,7 @@ the commit bodies), and each moved its pin in the same commit.
     enforced. Measured against this host's own `/proc/self/limits`, which prints Linux's
     sixteen rows in `RLIMIT` order; the label table in `src/vfs/procfs.rs` had fourteen and
     was shifted by the same slip, so `ulimit` read the wrong names as well. Owner:
-    `crates/abi/src/lib.rs`, `src/sched/runtime.rs` (the `resource == 7` fd-ceiling sync),
+    `crates/abi/src/lib.rs`, `src/sched/runtime/` (the `resource == 7` fd-ceiling sync),
     `src/vfs/procfs.rs`. Pin: `crates/abi`'s `default_rlimits_budgets_stack_nofile_and_nproc`
     (which now also asserts that row 5 is unbudgeted), `src/syscall/linux/abi.rs`'s prlimit64
     test, and `t-prlimit64` on **both** machines (S6 batch 10) - whose "the `RLIMIT_NOFILE`

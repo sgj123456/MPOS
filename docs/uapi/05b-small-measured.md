@@ -87,7 +87,7 @@ Section numbers are unchanged from the original `UAPI.md`.
   caller blocks it — measured with the pair one child's exit makes: unblocked the
   read answers `-1`/`EAGAIN` (errno 11), blocked it answers the 128-byte record.
   This kernel reports the exit whatever the mask says, which is what let the
-  no-std version pass without blocking anything. Owner: `src/sched/runtime.rs`'s
+  no-std version pass without blocking anything. Owner: `src/sched/runtime/`'s
   `queue_signal` call (the record's code, and the second table) with
   `src/vfs/signalfd.rs`'s `take_signal` (which source wins). `t-signalfd` blocks
   `SIGCHLD` the way its own contract says, claims the *count* of records with
@@ -99,7 +99,7 @@ Section numbers are unchanged from the original `UAPI.md`.
   child kept a `parent` that names a **slot** — and a slot is reused, so the next
   process to occupy it was handed the dead process's orphans. Fixed where Linux
   fixes it (`forget_original_parent`: a process that exits gives its remaining
-  children to init, `src/sched/runtime.rs`'s exit path), which also makes this
+  children to init, `src/sched/runtime/`'s exit path), which also makes this
   entry's "two records for one death" deterministic rather than
   neighbourhood-dependent. `docs/notes/` §6.
 
@@ -151,7 +151,7 @@ Section numbers are unchanged from the original `UAPI.md`.
   a tty it never claimed therefore *receives* the typed `SIGINT` and the resize
   `SIGWINCH` here, where Linux would aim at nobody, and a supervisor asking
   `tcgetpgrp` on a pair no session holds reads `0` here and an error there.
-  Owner: `src/vfs/tty.rs`'s `read`/`foreground` and `src/sched/runtime.rs`'s ctty
+  Owner: `src/vfs/tty.rs`'s `read`/`foreground` and `src/sched/runtime/`'s ctty
   bookkeeping. `t-pty` pins the *delivery* on **both** machines by giving the pair
   a session the ABI's way - a getty's `setsid` + open + `TIOCSCTTY` - and names
   this rule in its comment instead of pinning it. (b) *The number `TIOCGPTN`
@@ -208,7 +208,7 @@ Section numbers are unchanged from the original `UAPI.md`.
   are closed). The **mailbox** (`render::job` - an
   ioctl describes a device command and parks, because the control queue belongs to the
   render task) and a **device resource** behind a GEM handle (`Dumb.resource` in
-  `drivers/drm.rs`) carry both halves, and the 3D commands ride the same machinery:
+  `drivers/drm/`) carry both halves, and the 3D commands ride the same machinery:
   `CTX_CREATE`/`DESTROY`/`ATTACH_RESOURCE`, `RESOURCE_CREATE_3D`,
   `TRANSFER_{TO,FROM}_HOST_3D`, `SUBMIT_3D`, `GET_CAPSET_INFO`/`GET_CAPSET`. There is no
   command-stream parser to fuzz because there is nothing to parse - Linux forwards the

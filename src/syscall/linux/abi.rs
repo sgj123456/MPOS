@@ -1715,7 +1715,7 @@ pub(crate) fn restartable(nr: u64) -> bool {
 /// The two are `_IOW`-shaped words with the family byte `'d'` at bits 8..15 and
 /// the command number in the low byte: `DRM_IOCTL_SYNCOBJ_WAIT` is `0xc3` and
 /// `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` is `0xca` (their constants in
-/// `src/drivers/drm.rs`). The test is the same `_IOC` family filter
+/// `src/drivers/drm/`). The test is the same `_IOC` family filter
 /// `family_nr` applies - magic byte and command only, never the direction or
 /// size bits, which no restartability rule looks at.
 pub(crate) fn ioctl_restartable(request: u32) -> bool {

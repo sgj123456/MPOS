@@ -120,7 +120,7 @@ tree position are decided are `virtio::register_block_disk`'s (see Contracts).
 |---|---|
 | `src/drivers/virtio/gpu.rs` | `VirtioGpuDev` (the buffer view `/dev/fb0` and the page pins share — `Scanout`, `dims`/`advertised_dims`/`fb_phys`/`fb_len`/`resized`, `install`), the `CONFIG` address for the device's event word and `take_display_event`, `global()`, and the `FbDev` inode (its `mmap_frame`/`frame_backed`). `init_global` is the x86_64 probe |
 | `src/drivers/virtio/gpu_ctrl.rs` | `Gpu<T: Transport>` — the control queue the kernel drives itself (`new`, `features`, `num_capsets`, `change_resolution`, `flush`, the 3D commands `create_3d`/`ctx_create`/`ctx_attach_resource`/`transfer_host_3d`/`submit_3d`, the cap-set walk) — the `GpuDevice` trait that erases the transport for the render task, and the `Frames` DMA block |
-| `src/drivers/drm.rs` | The DRM/KMS UAPI: `DrmCard` (the two nodes), `DrmState`, `drm_ioctl`/`drm_request` and `arg_shape`, the KMS object model (one CRTC/encoder/connector/`PLANE_ID`/`CURSOR_PLANE_ID`, fixed ids and properties), dumb buffers, `ADDFB`/`ADDFB2`, page-flip and vblank events, atomic commits, blob and property stores, `PRIME`, the lease family, the `SYNCOBJ_*` family and the `DRM_VIRTGPU_*` family. Also the session side the render task and VCMUX talk to: `master_request`/`master_ok`/`master_held`/`is_master`, `publish_card`, `frame_landed`, `display_changed`, `grant_and_resent`/`re_present_now`, `master_closed`/`revoke_now` |
+| `src/drivers/drm/` | The DRM/KMS UAPI: the card (`DrmCard`, the two nodes), `DrmState`, `drm_ioctl`/`drm_request` and `arg_shape`, the KMS object model (one CRTC/encoder/connector/`PLANE_ID`/`CURSOR_PLANE_ID`, fixed ids and properties), dumb buffers, `ADDFB`/`ADDFB2`, page-flip and vblank events, atomic commits, blob and property stores, `PRIME`, the lease family, the `SYNCOBJ_*` family and the `DRM_VIRTGPU_*` family. Also the session side the render task and VCMUX talk to: `master_request`/`master_ok`/`master_held`/`is_master`, `publish_card`, `frame_landed`, `display_changed`, `grant_and_resent`/`re_present_now`, `master_closed`/`revoke_now`. One 8 593-line `drm.rs` split by responsibility: `abi.rs` (the UAPI vocabulary - ids, request numbers, caps, flags), `state.rs` (`STATE`, the object tables), `ioctl.rs` (the request decoder, `arg_shape` and the dispatch), `card.rs` (the two device nodes), `props.rs` (KMS enumeration, the property doors and the atomic commit), `fb.rs` (buffers and framebuffers), `flip.rs` (page flip and present), `sync.rs` (`SYNCOBJ_*`), `master.rs` (master, magic and leases) and `virtgpu.rs` (`DRM_VIRTGPU_*`) |
 | `src/drivers/video/mod.rs` | The display module. The pure pixel math is `crate::term::blit` (host-testable); this file is the `#[cfg(target_os = "none")]` gate on `render` |
 | `src/drivers/video/render.rs` | The render task: the single owner of the `Gpu` and the only caller of `flush`. `spawn`, the wake/condition flags (`notify`, `request_display_probe`, `request_re_present`), the two request/park handshakes (`job`/`Job`, `resize_blocking`), the `/dev/fb0` write-through (`request_flush_blocking`), `landings`, `running`, `render_pid` and the frame loop |
 
@@ -191,7 +191,7 @@ instead, which is the block layer's own rule. `virtio::register_block_disk` is t
 virtio-blk disk's name, major number and tree position are decided, so the two machines file the
 same disk at the same path (`uevent::VIRTIO_BLK_DEVPATH`).
 
-**The display handshake** (`drivers/drm.rs` ↔ `drivers/video/render.rs`). The render task owns the
+**The display handshake** (`drivers/drm/` ↔ `drivers/video/render.rs`). The render task owns the
 `Gpu` and is the only caller of `flush`; the DRM layer therefore cannot touch the device. Two
 request/park pairs carry work across: `render::job(Job)` for resource commands, and
 `render::resize_blocking(width, height)` for a committed mode. Both register a waiter before the
@@ -216,7 +216,7 @@ docs/uapi/ §2's rows; this section names the doors, not their contract:
 
 | Family | Device(s) | Owning code |
 |---|---|---|
-| `'d'` (DRM/KMS + `DRM_VIRTGPU_*`) | `/dev/dri/card0`, `/dev/dri/renderD128` | `drivers/drm.rs`, over `crates/gpu` |
+| `'d'` (DRM/KMS + `DRM_VIRTGPU_*`) | `/dev/dri/card0`, `/dev/dri/renderD128` | `drivers/drm/`, over `crates/gpu` |
 | `0x4600`+ (fbdev) | `/dev/fb0` | `drivers/video/`, over `drivers/virtio/gpu.rs` |
 | `'P'` (OSS) | `/dev/dsp` | `drivers/virtio/sound.rs` |
 | `'E'` (evdev) | `/dev/input/eventN` | `crates/evdev`, over `drivers/virtio/input.rs` |

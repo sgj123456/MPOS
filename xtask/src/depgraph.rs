@@ -77,7 +77,7 @@ use anyhow::{Context, Result, bail};
 /// it gives the second event the same inversion the first already had.
 ///
 /// **9 now**, after the ptrace protocol constants moved to the `abi` leaf
-/// (`NOTES.md` §13): `sched/runtime.rs` stopped naming `syscall::linux::abi`, so
+/// (`NOTES.md` §13): `sched/runtime/` stopped naming `syscall::linux::abi`, so
 /// `sched → syscall` is 0 and the `sched ↔ syscall` pair - the scheduler's
 /// register-file snapshot read against a table only the syscall layer had - went
 /// with it. The edge is the one the leaf crate was built to empty; this is the
@@ -137,7 +137,7 @@ const BASELINE_LOWER_LAYER_TO_SYSCALL: &[(&str, usize)] = &[
     ("rand", 0),
     ("uevent", 0),
     ("vfs", 0),
-    // Nothing, and it must stay nothing. `sched/runtime.rs`'s last reference to
+    // Nothing, and it must stay nothing. `sched/runtime/`'s last reference to
     // the syscall layer was the ptrace/stop block's protocol constants
     // (`PTRACE_O_*`/`PTRACE_EVENT_*`/`SYSCALL_TRAP`); those now live in the
     // arch-neutral `abi` leaf beside the clone flags, as the `Rlimit` table and

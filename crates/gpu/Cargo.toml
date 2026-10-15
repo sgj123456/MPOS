@@ -1,7 +1,7 @@
 # The GPU's pure half: the virtio-gpu wire ABI, the two DRM blobs a KMS driver
 # publishes as bytes, the cursor's composition, the sync-object state machine and
 # the `DRM_VIRTGPU_*` answers. Every one is a decision table or an encoder whose
-# reader is the driver - and `drivers/drm.rs` is machine-only, so none of it can
+# reader is the driver - and `drivers/drm/` is machine-only, so none of it can
 # be checked from there. Its own crate for that reason, and for the enforcement
 # every leaf here gets: this crate cannot name the kernel, which is what keeps a
 # decision about a command number from quietly acquiring a dependency on a task

@@ -69,7 +69,7 @@ is what took `sched → syscall` to zero (`docs/notes/` §13.2).
 |---|---|---|
 | `src/sched/mod.rs` | The facade: re-exports of `policy` and (on bare metal) `runtime`'s large export list, the `runtime` gate, the `#[cfg(not(target_os = "none"))]` one-process stand-ins, and the `unshare_uts` copy test | yes — `#[cfg(test)] mod tests` |
 | `src/sched/policy.rs` | `Scheduler` (ready queues + sleep heap), `TaskId`, `Priority` and its four bands, `Sleeper`'s wake-ordering rule, and `ARGV_MAX`/`ARGS_BYTES_MAX` | yes — `mod tests` |
-| `src/sched/runtime.rs` | The task table (`Table`, `Task`, `Shared`), `Context`/`Stack`, the `Mm` address-space carrier, `Layout`/ASLR, `spawn`/`fork`/`clone`/`vfork`/`exec_replace`, `exit`/`exit_group`/reaping, `block_until*` and `wake`, signal delivery, ptrace stops, timers and resource limits, and the user-memory and mmap accessors | **no** — `#[cfg(target_os = "none")]`, and no host tests |
+| `src/sched/runtime/` | The task table (`Table`, `Task`, `Shared`), `Context`/`Stack`, the `Mm` address-space carrier, `Layout`/ASLR, `spawn`/`fork`/`clone`/`vfork`/`exec_replace`, `exit`/`exit_group`/reaping, `block_until*` and `wake`, signal delivery, ptrace stops, timers and resource limits, and the user-memory and mmap accessors. One 9 099-line `runtime.rs` split by responsibility: `task.rs` (the table, `Task`, `Context`/`Stack`, `Layout`, the scheduler loop, timers and limits), `child_mm.rs` (the `Mm` carrier and the mmap/user-memory accessors), `child_signal.rs` (delivery, stops, the wait queues), `child_exit.rs` (`spawn`/`fork`/`clone`/`vfork`/`exec_replace` and the exit/reap path), `load.rs` (image loading, the `#!` chain and the pid-1 handoff), `trace.rs` (ptrace) and `procfs.rs` (the snapshots `/proc` reads) | **no** — `#[cfg(target_os = "none")]`, and no host tests |
 | `src/sched/signal.rs` | Signal numbers and `MAX_SIGNAL`, `Action`/`Actions`, `DefaultAction` and `default_action`, `SigInfo`/`SI_*`, `RtQueue`, `Pending` and the bit helpers, `catchable`, `AltStack` | yes — `mod tests` |
 | `src/sched/futex.rs` | The `WAITERS` table, `register`/`unregister`/`is_woken`, `mark_woken_bitset`, and the `wait`/`wait_bitset`/`wake`/`wake_bitset` entry points | yes — `mod tests` |
 | `src/sched/exit.rs` | The two hook registries (`ExitHook`/`HOOKS`, `CloexecHook`/`CLOEXEC_HOOKS`), `register`/`register_cloexec`, and the snapshot-then-walk `run`/`run_cloexec` | yes — `#[cfg(test)] mod tests` |
@@ -89,7 +89,7 @@ task from every queue so a disposed slot is never dereferenced. `Priority::new` 
 rejects. `ARGV_MAX`/`ARGS_BYTES_MAX` are here rather than in `runtime` because the syscall layer
 checks them on the host too (`runtime.rs` says so beside its import).
 
-**Task lifecycle (`src/sched/runtime.rs`).** `current`, `spawn`/`spawn_user`/`spawn_init`/
+**Task lifecycle (`src/sched/runtime/`).** `current`, `spawn`/`spawn_user`/`spawn_init`/
 `try_spawn_user`, `fork`/`vfork`/`clone`/`spawn_thread`/`exec_replace`, `exit`/`exit_group`,
 `wait_any_child`/`poll_any_child`/`block_until_child_event` and the `WaitEvent`/`WaitPark`/`WaitEnd`
 vocabulary. The invariant that matters across all of them is the aliasing one from the header: no

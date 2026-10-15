@@ -2,7 +2,7 @@
 //! filesystem error into the errno a caller reads.
 //!
 //! These two helpers were the last thing that made an ABI-layer module a
-//! dependency of layers that sit *below* it. `net/*` and `drivers/drm.rs` copy
+//! dependency of layers that sit *below* it. `net/*` and `drivers/drm/` copy
 //! bytes to and from a caller's buffer, so they must ask "is this range the
 //! caller's, and - for a fill - writable?"; and they turn a `VfsError` into the
 //! negative errno userland expects. Neither question is a *syscall* concern - it

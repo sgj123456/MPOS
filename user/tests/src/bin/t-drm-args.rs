@@ -27,7 +27,7 @@
 //! One fixture moves with it, and it is the one that makes this runnable on the
 //! second machine at all. The no-std version hardcoded `crtc_id = 34`, a number
 //! it could only have read off the first machine's card. The id is a constant
-//! *of this kernel* - `CRTC_ID` in `src/drivers/drm.rs`, one of a fixed set
+//! *of this kernel* - `CRTC_ID` in `src/drivers/drm/`, one of a fixed set
 //! `GETRESOURCES` and the `GET*` ioctls agree on - so the number is the same on
 //! both machines, but a test that asserts its own fixture is stronger than one
 //! that restates it: this program asks `GETRESOURCES` for the crtc id and then
@@ -84,7 +84,7 @@ const UNMAPPED: u64 = 0x1000;
 // --- the records, spelled as `drm.h` lays them out --------------------------
 //
 // Every one is handed over at the size the kernel's own ioctl table names for
-// its request (`src/drivers/drm.rs`, the `(size, writes)` pairs), because the
+// its request (`src/drivers/drm/`, the `(size, writes)` pairs), because the
 // handler writes the whole record - a shorter buffer is not a short copy, it is
 // a write past the caller's allocation.
 

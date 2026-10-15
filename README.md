@@ -541,7 +541,9 @@ mpos/
 │   │
 │   ├── sched/               # tasks
 │   │   ├── policy.rs        #   priority bands, round-robin, sleep queue
-│   │   ├── runtime.rs       #   task table (64 slots), switch, fork/exec/wait, teardown
+│   │   ├── runtime/         #   task table (64 slots), switch, fork/exec/wait, teardown
+│   │   │                    #     task · child_mm · child_signal · child_exit · load
+│   │   │                    #     · trace · procfs
 │   │   ├── signal.rs        #   signal numbers, pending bitmask, dispositions
 │   │   └── futex.rs         #   futex wait/wake
 │   │
@@ -581,7 +583,9 @@ mpos/
 │   │   ├── serial.rs        #   COM1: TX ring, interrupt-driven RX
 │   │   ├── rtc_dev.rs       #   /dev/rtc0 (the node; the clock is arch::x86_64::rtc)
 │   │   ├── qemu.rs          #   the isa-debug-exit test port
-│   │   ├── drm.rs           #   /dev/dri/card0: the Linux DRM/KMS UAPI
+│   │   ├── drm/             #   /dev/dri/card0: the Linux DRM/KMS UAPI
+│   │   │                    #     abi · state · ioctl · props · fb · flip · sync
+│   │   │                    #     · master · virtgpu · card
 │   │   ├── uinput.rs        #   /dev/uinput
 │   │   ├── video/           #   the render task and the present engine
 │   │   └── virtio/          #   hal · blk · net · gpu · input · console · rng

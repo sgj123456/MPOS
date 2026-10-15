@@ -512,7 +512,9 @@ mpos/
 │   │
 │   ├── sched/               # 任务
 │   │   ├── policy.rs        #   优先级带、轮转、休眠队列
-│   │   ├── runtime.rs       #   任务表（64 槽）、切换、fork/exec/wait、拆除
+│   │   ├── runtime/         #   任务表（64 槽）、切换、fork/exec/wait、拆除
+│   │   │                    #     task · child_mm · child_signal · child_exit · load
+│   │   │                    #     · trace · procfs
 │   │   ├── signal.rs        #   信号编号、挂起位掩码、处置方式
 │   │   └── futex.rs         #   futex 等待/唤醒
 │   │
@@ -552,7 +554,9 @@ mpos/
 │   │   ├── serial.rs        #   COM1：发送环、中断驱动的接收
 │   │   ├── rtc_dev.rs       #   /dev/rtc0（节点；时钟在 arch::x86_64::rtc）
 │   │   ├── qemu.rs          #   isa-debug-exit 测试端口
-│   │   ├── drm.rs           #   /dev/dri/card0：Linux DRM/KMS UAPI
+│   │   ├── drm/             #   /dev/dri/card0：Linux DRM/KMS UAPI
+│   │   │                    #     abi · state · ioctl · props · fb · flip · sync
+│   │   │                    #     · master · virtgpu · card
 │   │   ├── uinput.rs        #   /dev/uinput
 │   │   ├── video/           #   渲染任务与呈现引擎
 │   │   └── virtio/          #   hal · blk · net · gpu · input · console · rng

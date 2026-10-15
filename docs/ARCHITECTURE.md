@@ -401,7 +401,7 @@ carries the edge. Self-edges (a module's own files) are excluded.
 | arch | boot, console, date, drivers, net, sched, syscall | 1 each | `arch/x86_64/paging.rs`, `idt.rs`, `rtc.rs`, `syscall.rs` |
 | blk | mm | 1 | `blk/part.rs` |
 | console | arch, drivers, sched, vfs | 1 each | `console.rs` |
-| drivers | arch 7, mm 6, sched 7, vfs 11, console 3, blk 2, evdev 2, uevent 2, uinput 2, net 1, pci 1, rand 1, syscall 1, date 1 | 48 | `drivers/devices.rs`, `drivers/drm.rs` |
+| drivers | arch 7, mm 6, sched 7, vfs 11, console 3, blk 2, evdev 2, uevent 2, uinput 2, net 1, pci 1, rand 1, syscall 1, date 1 | 48 | `drivers/devices.rs`, `drivers/drm/ioctl.rs` |
 | evdev | sched, vfs | 1 each | `evdev.rs` |
 | logging | arch, boot, console | 1 each | `logging.rs` |
 | main | sched, syscall | 1 each | `main.rs` |
@@ -409,7 +409,7 @@ carries the edge. Self-edges (a module's own files) are excluded.
 | net | sched 5, syscall 5, vfs 4, arch 3, drivers 3, uevent 2 | 22 | `net/mod.rs`, `net/socket.rs` |
 | pci | drivers | 1 | `pci.rs` |
 | rand | arch, drivers | 1 each | `rand.rs` |
-| sched | syscall 3, mm 2, arch, binfmt, drivers, net, rand, vfs | 11 | `sched/runtime.rs`, `sched/futex.rs` |
+| sched | syscall 3, mm 2, arch, binfmt, drivers, net, rand, vfs | 11 | `sched/runtime/task.rs`, `sched/futex.rs` |
 | syscall | sched 6, vfs 5, arch 4, drivers 2, mm 2, net 2, console, rand, uinput | 24 | `syscall/linux/mod.rs`, `fs.rs` |
 | uevent | blk, net | 1 each | `uevent.rs` |
 | uinput | evdev | 1 | `uinput.rs` |
@@ -589,11 +589,11 @@ re-creates `console → vfs` from the mux's pty/tty calls. A mux-only hook inver
 `vfs`, where its pty/tty console-switch orchestration coherently belongs. The only surviving mutual
 pair is `drivers ↔ vfs` (the procfs/sysfs/9p device-state door, §11.1) — a different finding, not V-4 |
 Phase 11 D (**closed**; D.2b rejected) |
-| V-5 | A driver calls back into the syscall layer | `drivers/drm.rs` validated user pointers via `crate::syscall::buffer_ok`; **B3 closed that half — it now names `crate::uaccess::buffer_ok`.** The remaining edge is `drivers/virtio/sound.rs` naming `crate::syscall::linux::abi` for ioctl ABI constants (its former `crate::syscall::err::` refs already became `crate::err`); that is the device-ioctl-ABI concern (V-2), not the two helpers | Phase 11 B |
+| V-5 | A driver calls back into the syscall layer | `drivers/drm/` validated user pointers via `crate::syscall::buffer_ok`; **B3 closed that half — it now names `crate::uaccess::buffer_ok`.** The remaining edge is `drivers/virtio/sound.rs` naming `crate::syscall::linux::abi` for ioctl ABI constants (its former `crate::syscall::err::` refs already became `crate::err`); that is the device-ioctl-ABI concern (V-2), not the two helpers | Phase 11 B |
 | V-6 | A debug trace sat in the dispatch hot path | `syscall/linux/mod.rs::trace_msg`, self-labelled `TEMPORARY (udevd worker-channel hunt)`, wrote `[msgtrace]` lines from any failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` | **Done** (Phase 11 A) |
 | V-7 | Dead and duplicate machine modules | `arch/x86_64/serial.rs` and `arch/x86_64/qemu.rs` were not declared in `arch/x86_64/mod.rs` at all; `qemu.rs` was byte-identical to `drivers/qemu.rs`. Three PCI modules existed (`arch/x86_64/pci.rs` was a stale earlier copy of `drivers/pci.rs`), two RTC, two serial | **Done** (Phase 11 A) — all three deleted, `drivers/rtc` renamed `drivers/rtc_dev` |
 | V-8 | Cross-architecture config pointed at a missing file | `.cargo/config.toml` set `link-arg=--script=arch/aarch64/linker.ld`; only `arch/x86_64/linker.ld` exists, so the `aarch64-unknown-none` build could not link | **Done** (Phase 11 A) — the profile is gone, and `docs/notes/` §9.1 keeps what a port needs |
-| V-9 | The network layer validates user pointers with the syscall layer's helper | **Closed by B3.** `buffer_ok`/`user_accessible`/`MAX_IO`/`err_of` moved to the crate-root leaf `src/uaccess.rs`; the 99 below-`syscall` call-sites in `net/{socket,unix,packet,vsock}.rs` and `drivers/drm.rs` now name `crate::uaccess::*`, so no layer below `syscall` reaches up for a page walk or an errno mapping. `syscall` re-exports the same names for its own handlers, and the bare-metal build is green (the `cfg(target_os = "none")` split of `err_of`/`user_accessible` moved intact — V-11's lesson held) | **Done** (Phase 11 B3) |
+| V-9 | The network layer validates user pointers with the syscall layer's helper | **Closed by B3.** `buffer_ok`/`user_accessible`/`MAX_IO`/`err_of` moved to the crate-root leaf `src/uaccess.rs`; the 99 below-`syscall` call-sites in `net/{socket,unix,packet,vsock}.rs` and `drivers/drm/` now name `crate::uaccess::*`, so no layer below `syscall` reaches up for a page walk or an errno mapping. `syscall` re-exports the same names for its own handlers, and the bare-metal build is green (the `cfg(target_os = "none")` split of `err_of`/`user_accessible` moved intact — V-11's lesson held) | **Done** (Phase 11 B3) |
 | V-10 | `handoff` ABI is hand-duplicated across two crates with no shared definition | `boot/src/handoff.rs` vs `src/boot/handoff.rs` + the canary constant in `src/main.rs` | **Closed for the record** — `boot/src/handoff.rs` is gone and both sides read the one definition in the `mpos-bootinfo` leaf; the canary constant in `src/main.rs` is still spelled on both sides |
 | V-11 | A host test module sits behind a module that is never host-compiled | `src/net/socket.rs` was `#[cfg(all(test, not(target_os = "none")))]` while `src/lib.rs` gated `pub mod net` on `target_os = "none"`; 3 tests never ran. **Closed by Step F**: the module was deleted (its three claims are pinned by `user/tests/src/bin/t-sockmsg.rs`, which boots), the criterion is written down (`src/lib.rs`, `AGENTS.md` §3), and `xtask/src/gates.rs::dead_host_tests` — run at the head of `cargo xtask test` — now fails on the shape | **Done** (Phase 11 F) |
 | V-12 | The tree was mid-refactor and did not build for the host | The uncommitted work renamed `user/abitest/src/bin/t-*.rs` into `syscall/`+`integration/` and edited `vfs/ext4/*`, `vfs/tty.rs`; `cargo test --lib --target x86_64-unknown-linux-gnu` failed to compile | **Resolved** — finished and committed; the gate is green (`docs/notes/` §11.1.12) |

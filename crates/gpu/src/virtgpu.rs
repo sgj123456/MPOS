@@ -13,7 +13,7 @@
 //! same request answers `0` and `1` on the two machines. The rest of the family
 //! splits the same way - a card with no cap sets answers `GET_CAPS` `ENOSYS`
 //! while a GL card serves its sets out of [`Capset`] - and the handlers that
-//! make that split live in `drivers/drm.rs`, which is where the resource table
+//! make that split live in `drivers/drm/`, which is where the resource table
 //! and the per-open-file context are too.
 //!
 //! The answers are not "nothing", which is what the card said before: every one
@@ -36,7 +36,7 @@
 //! # What is served, and the one field that is not Linux's
 //!
 //! All eleven requests are dispatched now. `GETPARAM` and the refusals below are
-//! this module; `RESOURCE_CREATE` in `drivers/drm.rs` allocates a buffer and has
+//! this module; `RESOURCE_CREATE` in `drivers/drm/` allocates a buffer and has
 //! the render task tell the device to make a resource of it, and `RESOURCE_INFO`,
 //! `MAP`, `WAIT` and `TRANSFER_TO_HOST` answer for the handles that come back.
 //! The measurement above is why the refusals are per-request, and it is also why
@@ -55,7 +55,7 @@
 //!    a dumb buffer *is* a device resource and the field names it; here one is
 //!    the card's own pages and the device was never told about it, so the field
 //!    said the protocol's own "no resource" (`SET_SCANOUT` spells it the same
-//!    way). **Closed**: `drivers/drm.rs`'s `back_dumb_with_a_resource` makes the
+//!    way). **Closed**: `drivers/drm/`'s `back_dumb_with_a_resource` makes the
 //!    resource on the first request that addresses the handle as one, so a
 //!    client reads Linux's answer and a client that never asks - the console,
 //!    weston and the fbdev node all allocate through `CREATE_DUMB` and none of
@@ -265,7 +265,7 @@ pub fn table_mask(capsets: &[Capset]) -> u32 {
 /// `virtio-gpu-pci` card answers `ENOSYS` to every set asked for. It is **not**
 /// the family's one answer: a GL card has two sets and serves them, which is
 /// what [`Capset`] and [`caps_may_copy`] are for, and the handler that serves
-/// them is `drivers/drm.rs`. `ENOSYS` rather than an empty buffer is the
+/// them is `drivers/drm/`. `ENOSYS` rather than an empty buffer is the
 /// difference between "there is nothing here for you" and a capability word of
 /// zeroes a caller would read as a real answer.
 pub const CAPS: isize = ENOSYS;
@@ -275,7 +275,7 @@ pub const CAPS: isize = ENOSYS;
 /// Submitting a command stream is the 3D path, and a card that negotiated no
 /// `VIRGL` has no context to submit it to - which is the measured answer rather
 /// than a guess. Where there *is* a context the request is served, and
-/// `drivers/drm.rs` is where the two are told apart.
+/// `drivers/drm/` is where the two are told apart.
 pub const EXECBUFFER: isize = ENOSYS;
 
 /// `TRANSFER_FROM_HOST` on a card with no 3D: `ENOSYS`.
@@ -339,7 +339,7 @@ mod tests {
     ///
     /// Written against the literals the instrument printed rather than against
     /// the constants above, because a table checked against its own names agrees
-    /// with any numbering at all - the mistake `drivers/drm.rs` records for the
+    /// with any numbering at all - the mistake `drivers/drm/` records for the
     /// lease family.
     #[test]
     fn a_card_without_3d_answers_the_measured_row() {

@@ -149,6 +149,9 @@ One-glance status of the whole roadmap.
 - [x] the `mm`/`vfs` seam (V-13) — `MappedObject` trait (§11)
 - [x] twelve leaf crates + `mpos-blk` as the thirteenth — enforcement by compile error (§11.2 Step E, R.11.E)
 - [x] 11.4 the HAL, stages S1–S5 — machine seam enforced by the compiler (§11.4)
+- [x] the two largest files stop being single files — `sched/runtime/` and `drivers/drm/`, one child
+  per responsibility, with the two `arg_shape` rows a mechanical move dropped caught by `t-drm-args`
+  and restored (R.11.F)
 
 **ABI truthfulness (Phase 12)** — Group A landed, gate runs to a summary (§12):
 - [x] 12.0 green baseline restored (§12.4a)

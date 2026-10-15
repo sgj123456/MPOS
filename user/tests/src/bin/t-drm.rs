@@ -45,7 +45,7 @@
 //! into its neighbour without faulting; a caller who allocated exactly `len`
 //! would have had the kernel read past the end. The sizes here are `size_of`,
 //! so the request word states the same length the kernel validates against
-//! (`src/drivers/drm.rs`, `arg_shape`).
+//! (`src/drivers/drm/`, `arg_shape`).
 //!
 //! Not made on a host, for `t-drm-args`'s and `t-drm-lease`'s reason: every
 //! claim below is about *this* card's answers - one CRTC, one connector, two
@@ -142,7 +142,7 @@ const CAP_DUMB_BUFFER: u64 = 1;
 /// would ever act on.
 const EVENT_FLIP_COMPLETE: u32 = 0x02;
 /// The card's fixed object ids: the one CRTC, the connector, the primary plane
-/// and the cursor plane, as `src/drivers/drm.rs` allocates them.
+/// and the cursor plane, as `src/drivers/drm/` allocates them.
 const CRTC_ID: u32 = 34;
 const CURSOR_PLANE_ID: u32 = 37;
 /// `DRM_MODE_PAGE_FLIP_EVENT`.
@@ -160,7 +160,7 @@ const RENDER_MINOR: u32 = 128;
 // --- the records, spelled as `drm.h`/`drm_mode.h` lay them out --------------
 //
 // Every one is handed over at the size the kernel's own ioctl table names for
-// its request (`src/drivers/drm.rs`, the `arg_shape` rows), because the handler
+// its request (`src/drivers/drm/`, the `arg_shape` rows), because the handler
 // copies the whole record - a shorter buffer is not a short copy, it is a read
 // past the caller's allocation.
 
@@ -921,7 +921,7 @@ fn main() {
     // SETCRTC crtc_id/fb_id, 64x64 at 0,0. The trailing `drm_mode_modeinfo` is
     // left zeroed: this is the legacy door, and a zeroed mode is "no resize" -
     // the kernel's `set_crtc` reads the mode's `hdisplay`/`vdisplay` only to
-    // decide whether the caller is asking for a resize (`src/drivers/drm.rs`).
+    // decide whether the caller is asking for a resize (`src/drivers/drm/`).
     let mut crtc = ModeCrtc {
         crtc_id: CRTC_ID,
         fb_id,
@@ -1358,7 +1358,7 @@ fn main() {
         prop_values_ptr: prop_values.as_mut_ptr() as u64,
         // The kernel copies only when the caller's capacity covers the *whole*
         // list (Linux's rule, and this card's: `want >= count`, all or nothing -
-        // `src/drivers/drm.rs`'s `obj_get_properties`). The no-std original left
+        // `src/drivers/drm/`'s `obj_get_properties`). The no-std original left
         // this field at the total the sizing call answered and handed two-element
         // arrays, so the copy ran the total's length into the caller's two slots
         // and read the first two back out of an overflowed stack frame. Sized

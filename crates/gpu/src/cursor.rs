@@ -1,6 +1,6 @@
 //! The DRM cursor's arithmetic, in the one place a host test can reach it.
 //!
-//! `src/drivers/drm.rs` has no `cfg` gates and is never compiled for the host, so
+//! `src/drivers/drm/` has no `cfg` gates and is never compiled for the host, so
 //! anything written there is pinned only by booting a machine. Most of the card's
 //! work is bookkeeping - id tables, property values, two-call list shapes - and
 //! booting is the right instrument for it. The cursor is different: it is the one

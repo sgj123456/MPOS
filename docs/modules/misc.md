@@ -68,7 +68,7 @@ that answers "accessible" on the host, where there are no page tables and the te
 in), and `err_of` maps `VfsError` to the errno the dispatcher returns.
 
 The file's own header explains why it sits at the crate root and not in `syscall`: `net/*` and
-`drivers/drm.rs` copy bytes to and from a caller's buffer, so they must ask whether a range is the
+`drivers/drm/` copy bytes to and from a caller's buffer, so they must ask whether a range is the
 caller's and, for a fill, writable - and neither question is a *syscall* concern. The helpers happened
 to live in `syscall`, so every below-`syscall` caller had to reach *up* into it, which is the inversion
 `docs/ARCHITECTURE.md` §11.1.5 (V-9) records. `syscall` re-exports them so the paths its handlers

@@ -750,7 +750,7 @@ mod tests {
     /// Written as literals from `<linux/virtio_gpu.h>`'s own enumeration rather
     /// than by comparing the constants to each other, which is the check that
     /// caught the lease family's thirteen-too-high numbers
-    /// (`drivers/drm.rs`). A caller and a driver agreeing on a number is not
+    /// (`drivers/drm/`). A caller and a driver agreeing on a number is not
     /// evidence that the number is right.
     #[test]
     fn the_command_numbers_are_the_headers() {

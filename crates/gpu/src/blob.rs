@@ -1,9 +1,9 @@
 //! The two DRM blobs a KMS driver *publishes as bytes*: an EDID, and the
 //! `IN_FORMATS` list of which (format, modifier) pairs a plane will scan out.
 //!
-//! They are here, ungated, rather than inside `drivers/drm.rs`, for the reason
+//! They are here, ungated, rather than inside `drivers/drm/`, for the reason
 //! `AGENTS.md` §4 gives: they are pure encoders, and a host unit test can check
-//! the very bytes a real reader parses. `drivers/drm.rs` holds the card's state
+//! the very bytes a real reader parses. `drivers/drm/` holds the card's state
 //! and talks to the GPU, so nothing in it can be exercised off the machine - and
 //! an EDID one field out of place is a display no compositor can name, which is
 //! the kind of defect that only shows up as "Unknown" in somebody's settings

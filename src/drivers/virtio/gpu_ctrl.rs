@@ -150,7 +150,7 @@ pub trait GpuDevice: Send {
     /// The other present path, and the one a compositor needs on a card with 3D:
     /// [`GpuDevice::flush`] carries *this driver's* framebuffer out of guest
     /// memory, and a client's frame was never there. Which of the two a frame
-    /// wants is `drivers/drm.rs`'s `client_scanout` to say; this call is the
+    /// wants is `drivers/drm/`'s `client_scanout` to say; this call is the
     /// render task performing it.
     fn scan_out_client(&mut self, resource: u32, width: u32, height: u32) -> Result<(), Error>;
 
@@ -687,7 +687,7 @@ impl<T: Transport> Gpu<T> {
     /// pages onto the scanout is a black screen - which is exactly what every
     /// compositor on this card used to get. Naming the resource to the host instead
     /// is Linux's own shape (`virtio_gpu_cmd_set_scanout` of the framebuffer's
-    /// `hw_res_handle`, then `virtio_gpu_cmd_resource_flush`), and `drivers/drm.rs`'s
+    /// `hw_res_handle`, then `virtio_gpu_cmd_resource_flush`), and `drivers/drm/`'s
     /// `client_scanout` is who decides that this is the frame to show.
     pub fn scan_out_client(&mut self, resource: u32, width: u32, height: u32) -> Result<(), Error> {
         let rect = abi::Rect::whole(width, height);
@@ -724,7 +724,7 @@ impl<T: Transport> Gpu<T> {
     /// reads and writes the resource through.
     ///
     /// A *list* rather than one extent, because the DRM layer's buffers are
-    /// allocated one page at a time (`drivers/drm.rs`'s `Dumb`) and a resource
+    /// allocated one page at a time (`drivers/drm/`'s `Dumb`) and a resource
     /// built over them is as many extents as it has pages. That is why the
     /// request is not a fixed-size struct: `RESOURCE_ATTACH_BACKING` is followed
     /// on the wire by its `MemEntry` array, and the two go out as one buffer

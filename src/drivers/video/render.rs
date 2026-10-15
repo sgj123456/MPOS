@@ -420,7 +420,7 @@ fn perform(device: &mut dyn GpuDevice, kind: &Job) -> isize {
 /// Called once, at the top of the task, which is the only place the device is
 /// reachable from: the DRM layer's ioctl path cannot touch it, and none of these
 /// values changes after negotiation, so they are published rather than asked for
-/// per request. `drivers/drm.rs`'s `Published` is the other end.
+/// per request. `drivers/drm/`'s `Published` is the other end.
 ///
 /// The walk is bounded by the device's own `num_capsets` and fetches each set at
 /// the *version* `GET_CAPSET_INFO` reported - which is the version a caller asks

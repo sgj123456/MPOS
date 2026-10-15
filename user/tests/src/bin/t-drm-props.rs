@@ -41,7 +41,7 @@
 //!   no-std test named its offsets by hand in the same wrong place - so the two
 //!   agreed with each other and with nothing else. That is the pair this move
 //!   separates: the test now states the uapi's number, and the kernel was moved
-//!   to answer it (`src/drivers/drm.rs`, `add_fb2` and `get_fb2`). It was
+//!   to answer it (`src/drivers/drm/`, `add_fb2` and `get_fb2`). It was
 //!   invisible for as long as only `LINEAR` - which is 0 - was ever named,
 //!   because reading the padding instead of the field answers 0 either way; this
 //!   file's "refuses a modifier the plane does not list" is the claim that names
@@ -125,7 +125,7 @@ const CLIENT_CAP_ATOMIC: u64 = 3;
 /// `HOTSPOT_X`/`HOTSPOT_Y` are enumerated only for a client that has set it.
 const CLIENT_CAP_CURSOR_PLANE_HOTSPOT: u64 = 6;
 /// `PROP_PLANE_FB_ID` and `PROP_CRTC_ID`: this card's numbering for the two
-/// atomic properties the pin below looks for (`src/drivers/drm.rs`). The *name*
+/// atomic properties the pin below looks for (`src/drivers/drm/`). The *name*
 /// is the ABI and the id is this card's, so each is used only after the
 /// assertion that the list's id and the name lookup's id are the same one.
 const PROP_PLANE_FB_ID: u32 = 75;

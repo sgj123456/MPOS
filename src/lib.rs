@@ -242,7 +242,7 @@ pub use mpos_pci as pci;
 pub mod rand;
 /// The task table, priority bands, sleep/block, signals and futex. Un-gated on
 /// aarch64 by stage 3, which is when its one machine reference - the TLS `MSR`
-/// write in `sched/runtime.rs` - moves behind `hal`/`arch`.
+/// write in `sched/runtime/` - moves behind `hal`/`arch`.
 ///
 /// The predicate is "the host, or x86_64 bare metal", not "x86_64" alone:
 /// `sched` is host-compiled (it has no port I/O of its own - its machine
