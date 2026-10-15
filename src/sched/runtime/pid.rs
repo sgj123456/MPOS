@@ -34,6 +34,7 @@ use super::task::{Table, Task, with_table};
 use crate::pidns::PidNs;
 use crate::sched::policy::TaskId;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 use critical_section::Mutex;
 
@@ -127,6 +128,31 @@ pub fn resolve_pid(number: i64) -> Option<TaskId> {
 pub(crate) fn live(t: &Table, slot: usize) -> Option<TaskId> {
     t.tasks.get(slot).and_then(|entry| entry.as_ref())?;
     Some(TaskId(slot))
+}
+
+/// The numbers `slot` is known by at **every level of its own chain**, outermost
+/// first - what `/proc/<pid>/status`'s `NStgid`/`NSpid`/`NSpgid` carry, and the
+/// thing its first cut here got wrong by printing the reader's one number.
+///
+/// Linux's fields are the task "in each of the PID namespaces of which it is a
+/// member", leftmost "with respect to the PID namespace of the process that
+/// mounted this procfs, followed by the value in successively nested inner
+/// namespaces" - so the chain is the same line for every reader, and it is what
+/// the task's *own* namespace knows rather than what the reader's does
+/// (measured: `NSpid:\t43878\t3\t1` for a task two namespaces in). This
+/// kernel's procfs is the machine's, so the chain begins with the machine's
+/// numbers, which for the init namespace are the task slots themselves.
+///
+/// Empty for a slot that is no longer a task: a status file is rendered from a
+/// *snapshot* of one, and the task may have exited between the two.
+pub fn pid_numbers_of(slot: TaskId) -> Vec<u32> {
+    with_table(|t| {
+        t.tasks
+            .get(slot.0)
+            .and_then(|entry| entry.as_ref())
+            .map(|task| task.pid_ns.numbers(slot.0))
+            .unwrap_or_default()
+    })
 }
 
 /// Register a freshly created task in its namespace and every namespace above

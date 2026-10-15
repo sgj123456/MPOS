@@ -49,9 +49,10 @@ One-glance status of the whole roadmap.
   both directions of the translation and `/proc` rendered per reader (§6.3); **the task a namespace
   is spoken for by has rules of its own** — its members cannot end it (only an ancestor's
   SIGKILL/SIGSTOP, or a signal it has a handler for), and its death takes every task it speaks for,
-  nested namespaces included (§6.3, measured), and the kind's own **creation rule** is Linux's too -
-  a process makes a pid namespace **once**, and one whose init has exited takes no tasks (§6.3,
-  measured); a child cloned with
+  nested namespaces included (§6.3, measured), the kind's own **creation rule** is Linux's too - a
+  process makes a pid namespace **once**, and one whose init has exited takes no tasks (§6.3,
+  measured) - and `/proc/<pid>/status`'s `NStgid`/`NSpid`/`NSpgid`/`NSsid` carry the **chain** of
+  numbers the task is known by rather than the reader's one (§6.3, measured); a child cloned with
   `CLONE_NEWNET` gets a stack of its own - its own `lo`, no wire, and a port space the machine's
   cannot see - and the kind is served by all three calls, with **a socket remembering the stack it
   was made in** (`net`'s handle map): a socket outlives an `unshare`, an inherited descriptor keeps
@@ -185,12 +186,13 @@ In the order that keeps each step verifiable on its own:
 
 1. **namespaces** (§6.3) — UTS, MNT, PID and NET are landed, and the ladder's remaining work
    is named per rung: a **wire that can move** into a namespace (`eth0` still cannot enter one),
-   nested namespaces pinned only one level deep for the *numbers* (the zap's reach is pinned two
-   levels now), `NSpid`'s one number, the `/proc/net` reader's rows (the
-   collector filters by namespace; no test exercises it), and then the four kinds with no entry at
-   all (user, IPC, cgroup, time - four of `namespaces(7)`'s eight). The pid namespace's own
-   creation rules left this list (2026-10-15): one namespace per process, and a sealed one taking no
-   tasks, are both refused now with the errno Linux uses. `AF_UNIX` moved off this list
+   nested namespaces pin the *numbers* only one level deep (the zap's reach is pinned two levels
+   now), a record lock's `l_pid` is still the machine's number, the `/proc/net` reader's rows are
+   collected per namespace but no test exercises them, and then the four kinds with no entry at all
+   (user, IPC, cgroup, time - four of `namespaces(7)`'s eight). Two more left this list on
+   2026-10-15: the pid namespace's own creation rules (one per process, and a sealed one takes no
+   tasks - both refused now with the errno Linux uses), and `NSpid`'s single number, which is the
+   chain in all four `NS*` fields now. `AF_UNIX` moved off this list
    (2026-10-15) and vsock left it with a measurement instead of an implementation, both recorded in
    §6.3. Beside it: seccomp's one named piece, the `PTRACE_EVENT_SECCOMP` stop (§8.2).
 2. **interrupt-driven block completions** (§10.5's last row) — measured and re-scoped; §10.5

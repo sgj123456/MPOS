@@ -588,6 +588,47 @@ reports nothing on `x86_64-unknown-none`, `aarch64-unknown-none` and the host li
 depgraph` is within the ratchet, and no edge is added - `pid.rs`'s new helper is reached by `sched`'s
 own modules and by the syscall layer along edges that already exist.
 
+**`/proc/<pid>/status`'s `NS*` fields, landed: the chain, not the reader's number.** The last
+reader-relative answer `/proc` gave, and a measurement that corrects the *shape* rather than a value:
+
+```
+one namespace in:  NSpid:	43877	2
+two levels in:     NSpid:	43878	3	1
+a machine's task:  NSpid:	101
+```
+
+The field is the task "in each of the PID namespaces of which it is a member", leftmost "with respect
+to the PID namespace of the process that mounted this procfs, followed by the value in successively
+nested inner namespaces" - so it is a **chain**, and the same line for every reader. The two answers
+coincide only when the reader *is* the machine (which is why a cut that printed the reader's number
+looked right), so the case that tells them apart is a reader inside the namespace - and that is what
+the pin holds: the namespace's own init reading its own status sees two numbers ending in 1, the
+machine reads the same line *for it* with its own number first, and a task of the machine's namespace
+shows the one number it answers to.
+
+`PidNs::numbers` is the chain (outermost first; the root level is every task's, so a name always has
+at least one entry and nothing has to be invented for a level that never registered it - a property
+the crate's own test found by expecting the opposite). `NStgid`/`NSpid`/`NSpgid`/`NSsid` all read it
+through `sched::pid_numbers_of`, and the last of those replaces a hard `0`: the session id is carried
+in the chain too, and the `session` field a task already had is what feeds it. `Pid:`, `Tgid:` and
+`PPid:` are deliberately *not* changed - those are the reader's numbers, which is what the short form
+of the same file answers.
+
+**And the gate caught the one mistake in it.** The new helper compiled on bare metal and *not* on the
+host: `sched` carries stand-ins for the two translations its other modules need
+(`pid_number_of`, `resolve_pid`), and a third one needed the same. That is `ARCHITECTURE.md` §3's "a
+module has a host body and a machine body - **both move, or it does not build**" arriving as a *gate
+failure* rather than as a paragraph, and the fix is the stand-in beside the other two
+(`pid_numbers_of` answers the single number a machine with no namespaces prints).
+
+**Gate.** x86_64 `=== SUMMARY pass=173 fail=0 (173 built)` with the kernel's own
+`mpos-kunit 32 passed, 0 failed` and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32
+cases, exit 0. Neither program count moved: the new claims are three more inside `t-ns-pid`'s init
+section, whose report is twelve words now. Stage 1: 537 in the kernel library and every leaf crate
+the gate builds, `mpos-pidns` at 11 (the chain has its own test); clippy reports nothing on
+`x86_64-unknown-none`, `aarch64-unknown-none` and the host lib; `cargo xtask depgraph` is within the
+ratchet, and no edge is added - `vfs` already names `sched`.
+
 **NET: one `Stack`, and the device is the reason the list is short.** `net::NET`
 is one interface pair (`eth0` + `lo`), one address table, one route table and one
 socket registry. The record is already shaped like something a second copy would

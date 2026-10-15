@@ -95,6 +95,27 @@ fn probe_number(pid: i32) -> isize {
     }
 }
 
+/// The numbers on a `/proc/<n>/status` file's `NSpid:` line, in order.
+///
+/// Read as *text* for the same reason the `stat` field below is: the claim is
+/// about the name a reader is handed, and this field is a list of them rather
+/// than one number.
+fn ns_pid_chain(path: &str) -> Vec<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|line| line.starts_with("NSpid:"))
+                .map(|line| {
+                    line["NSpid:".len()..]
+                        .split_whitespace()
+                        .filter_map(|f| f.parse().ok())
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
 /// The first field of `/proc/<n>/stat`, which is the pid that file is about -
 /// as text, because the claim is about the name a reader is handed.
 fn stat_first_field(path: &str) -> Option<i64> {
@@ -191,7 +212,7 @@ fn wait_for_eof(ro: &OwnedFd) -> bool {
 /// in it, lets that init's own worker try to kill it, then kills it from here -
 /// an ancestor namespace - and reports what each step said, one word per step.
 fn run_init_section(verdict: &OwnedFd) {
-    let mut words = [0isize; 9];
+    let mut words = [0isize; 12];
     words[0] = if unshare(UnshareFlags::NEWPID).is_ok() {
         1
     } else {
@@ -235,6 +256,13 @@ fn run_init_section(verdict: &OwnedFd) {
                 libc::sigaddset(&mut only_usr1, libc::SIGUSR1);
                 libc::sigprocmask(libc::SIG_BLOCK, &only_usr1, std::ptr::null_mut());
             }
+            // And what `/proc` calls the task *reading this*: the chain, not the
+            // one number the reader's own namespace would give. Written before
+            // the worker exists, so the two lines this pipe carries have a fixed
+            // order.
+            let own = ns_pid_chain("/proc/self/status");
+            let line = format!("{} {}\n", own.len(), own.last().copied().unwrap_or(0));
+            let _ = write(&said_w, line.as_bytes());
             // The liveness pipe's write end must be the worker's alone, or the
             // worker's death would leave a pipe its own corpse still holds open.
             drop(life_w);
@@ -299,8 +327,38 @@ fn run_init_section(verdict: &OwnedFd) {
         drop(waited_w);
         drop(crossed_w);
         if init > 0 {
-            // The worker's two answers: one line, written in one call.
+            // Two lines on this pipe, in order: the init's own view of its
+            // chain, then the worker's answers. The first is the read that tells
+            // "the chain from where procfs was mounted" apart from "the reader's
+            // own number" - the two agree when the reader *is* the machine, and
+            // differ for a reader inside the namespace, which is the whole
+            // question this field's shape answers.
             let mut report = [0u8; REPORT_MAX];
+            let n = read(&said_r, &mut report).unwrap_or(0);
+            let inner: Vec<isize> = String::from_utf8_lossy(&report[..n])
+                .split_whitespace()
+                .filter_map(|f| f.parse().ok())
+                .collect();
+            if inner.len() >= 2 {
+                words[9] = if inner[0] == 2 && inner[1] == 1 { 1 } else { 0 };
+            }
+            // And the same task read from *here*, the machine's namespace: the
+            // same line, with the number this side knows it by first.
+            let chain = ns_pid_chain(&format!("/proc/{init}/status"));
+            words[10] = if chain.len() == 2 && chain[1] == 1 {
+                1
+            } else {
+                0
+            };
+            // This task is in the machine's namespace, so its own chain is the
+            // one number it is called by here - the shape every program on a
+            // machine that never unshared sees.
+            let mine = ns_pid_chain("/proc/self/status");
+            words[11] = if mine.len() == 1 && mine[0] == std::process::id() {
+                1
+            } else {
+                0
+            };
             let n = read(&said_r, &mut report).unwrap_or(0);
             let attempts: Vec<isize> = String::from_utf8_lossy(&report[..n])
                 .split_whitespace()
@@ -621,8 +679,8 @@ fn main() {
             .split_whitespace()
             .filter_map(|f| f.parse().ok())
             .collect();
-        r.check("the init section reports nine words", words.len() == 9);
-        if words.len() == 9 {
+        r.check("the init section reports twelve words", words.len() == 12);
+        if words.len() == 12 {
             r.check(
                 "a task in its namespace may make one for its own children",
                 words[0] == 1,
@@ -652,6 +710,18 @@ fn main() {
             r.check(
                 "and one it *blocks* arrives, because a blocked signal is never ignored",
                 words[8] == 3,
+            );
+            r.check(
+                "the init reading its own status sees the chain: two numbers, ending in 1",
+                words[9] == 1,
+            );
+            r.check(
+                "and the machine reads the same line for it, its own number first",
+                words[10] == 1,
+            );
+            r.check(
+                "while a task of the machine's namespace shows the one number it answers to",
+                words[11] == 1,
             );
         }
         let status = rustix::process::waitpid(

@@ -180,6 +180,10 @@ pub struct TaskSnapshot {
     /// what Linux reports for pid 1.
     pub ppid: usize,
     pub pgid: usize,
+    /// The session this task belongs to, named by its leader's task id, or 0 for
+    /// a task in none. `status`'s `NSsid` is this leader's chain of numbers, the
+    /// same shape as the `NSpid` family beside it.
+    pub session: usize,
     /// `R` running, `S` sleeping on something, `Z` exited and not yet
     /// collected - the letter `/proc/<pid>/stat` carries in field 3.
     pub state: char,
@@ -231,6 +235,7 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
         pid: task.tgid.0,
         ppid: task.parent.map_or(0, |p| p.0),
         pgid: task.pgid.0,
+        session: task.session.0,
         state,
         comm: comm_of(task),
         exe: task.exe.clone(),

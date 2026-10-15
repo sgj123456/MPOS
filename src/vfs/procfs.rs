@@ -684,6 +684,32 @@ fn reader_number(slot: usize) -> usize {
     crate::sched::pid_number_of(crate::sched::TaskId(slot)).map_or(slot, |n| n as usize)
 }
 
+/// The `NSpid`-style chain of numbers for a slot - every level of the task's own
+/// namespace chain, outermost first, tab-separated, which is what `status`'s
+/// `NStgid`/`NSpid`/`NSpgid` carry.
+///
+/// Deliberately not [`reader_number`]: the *reader's* number is what `Pid:`/`Tgid:`
+/// answer, while these fields list the task "in each of the PID namespaces of
+/// which it is a member", so the same file line reads the same for every reader.
+/// See `sched::pid_numbers_of` for the shape and its measurement.
+fn number_chain(slot: usize) -> String {
+    let mut out = String::new();
+    for n in crate::sched::pid_numbers_of(crate::sched::TaskId(slot)) {
+        if !out.is_empty() {
+            out.push('\t');
+        }
+        out.push_str(&alloc::format!("{n}"));
+    }
+    if out.is_empty() {
+        // Nothing answers for that id any more - a session leader the task
+        // outlived, or a task that exited between the snapshot and this render.
+        // The number itself is what Linux keeps in that case (an id outlives the
+        // process it named), and it is the same fallback [`reader_number`] makes.
+        out.push_str(&alloc::format!("{slot}"));
+    }
+    out
+}
+
 /// The slot a number written by the **reader** names, if it names a live task
 /// at all - the inverse of [`reader_number`], and where a number from another
 /// namespace stops being a name.
@@ -809,6 +835,7 @@ pub struct Process {
     pub tid: usize,
     pub ppid: usize,
     pub pgid: usize,
+    pub session: usize,
     pub threads: usize,
     pub rss_pages: usize,
 }
@@ -1172,10 +1199,10 @@ fn status_of(pid: usize) -> Option<String> {
          Gid:\t0\t0\t0\t0\n\
          FDSize:\t64\n\
          Groups:\t\n\
-         NStgid:\t{tgid}\n\
-         NSpid:\t{pid}\n\
-         NSpgid:\t{pgid}\n\
-         NSsid:\t0\n\
+         NStgid:\t{nstgid}\n\
+         NSpid:\t{nspid}\n\
+         NSpgid:\t{nspgid}\n\
+         NSsid:\t{nssid}\n\
          VmPeak:\t   {kb} kB\n\
          VmSize:\t   {kb} kB\n\
          VmLck:\t       0 kB\n\
@@ -1219,7 +1246,17 @@ fn status_of(pid: usize) -> Option<String> {
         tgid = reader_number(task.pid),
         pid = reader_number(task.pid),
         ppid = reader_number(task.ppid),
-        pgid = reader_number(task.pgid),
+        // The `NS*` fields are the *chain* the task is known by rather than the
+        // reader's one number: `4231` for a task of the machine's namespace, and
+        // `4231\t1` for one a namespace in - Linux's leftmost entry is the
+        // namespace the procfs was mounted in, and this procfs is the machine's.
+        nstgid = number_chain(task.pid),
+        nspid = number_chain(task.pid),
+        nspgid = number_chain(task.pgid),
+        // The session's chain rather than a hard `0`: Linux carries the session
+        // id in each namespace too, and a task in no session has the leader id 0,
+        // whose chain is the one zero this prints.
+        nssid = number_chain(task.session),
         threads = task.threads,
     ))
 }

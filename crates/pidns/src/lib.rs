@@ -280,6 +280,27 @@ impl PidNs {
         self.ns_id == other.ns_id || self.is_ancestor_of(other)
     }
 
+    /// The numbers `slot` is known by, **outermost first**: the numbers its
+    /// ancestors' namespaces give it, then its own.
+    ///
+    /// This is the shape `/proc/<pid>/status`'s `NSpid` carries - Linux lists
+    /// the task "in each of the PID namespaces of which [it] is a member",
+    /// starting with the one the procfs was mounted in and going inward - and
+    /// giving the *whole chain* rather than the reader's one number is the part
+    /// that field's first cut here got wrong (measured: a task one namespace in
+    /// reads `NSpid:\t43877\t2`, one two levels in `NSpid:\t43878\t3\t1`, and a
+    /// reader outside reads the same line). A slot this namespace does not know
+    /// is left out rather than guessed at.
+    pub fn numbers(&self, slot: usize) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .chain()
+            .iter()
+            .filter_map(|ns| ns.number_of(slot))
+            .collect();
+        out.reverse();
+        out
+    }
+
     /// This namespace, then its parent, and so on to the root.
     fn chain(&self) -> Vec<&PidNs> {
         let mut out = Vec::new();
@@ -488,6 +509,27 @@ mod tests {
         // it, not about the ones its readers can still name.
         assert_eq!(inner.allocate(6), 1);
         assert_eq!(inner.number_of(6), Some(1));
+    }
+
+    /// The chain a `/proc/<pid>/status` reader is shown: every level's number
+    /// for one task, outermost first - one entry for a task in the init
+    /// namespace, and the whole chain for one nested under it.
+    #[test]
+    fn the_chain_of_numbers_runs_outermost_first() {
+        let root = PidNs::root(1);
+        let outer = PidNs::child(&root, 2);
+        let inner = PidNs::child(&outer, 3);
+        // Registered at every level on the way in, as `allocate` does.
+        assert_eq!(inner.allocate(12), 1);
+        assert_eq!(inner.numbers(12), alloc::vec![12, 1, 1]);
+        assert_eq!(outer.numbers(12), alloc::vec![12, 1]);
+        // A task in the init namespace alone has one number there, which is what
+        // Linux prints for a machine that never unshared.
+        assert_eq!(root.numbers(7), alloc::vec![7]);
+        // A slot the inner levels never registered is still a member of the
+        // root - every task is - so its chain is the one number the outermost
+        // level gives it, and nothing is invented for the levels in between.
+        assert_eq!(inner.numbers(11), alloc::vec![11]);
     }
 
     /// A namespace is an ancestor of exactly the namespaces nested under it -
