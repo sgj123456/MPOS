@@ -540,35 +540,53 @@ named rather than implemented - a **traced** task does not ignore signals either
 !t->ptrace`), so a traced init may receive one where this kernel drops it; the probe for that is not
 written, and the pin says nothing about it.
 
-**And two rules about *making* a namespace that this step found and did not build.** Both measured
-against the same host, both currently served where Linux refuses, and both named in
-`docs/ROADMAP.md`/`docs/uapi/` rather than quietly depended on:
+**And the two rules about *making* a namespace, landed on the step that found them.**
+`unshare(CLONE_NEWPID)` and `clone(CLONE_NEWPID)` share one precondition, and it is
+`copy_pid_ns`'s: the caller's **own** pid namespace must be the one its children would go to. That
+holds for a task that never unshared and for one *created in* the namespace it is in - a child of an
+`unshare`, whose own numbers and whose children's namespace are the same one - and stops holding the
+moment the call succeeds, because then the two come from different namespaces. So a process makes a
+pid namespace **once**:
 
 ```
-probe_pid_ns_again.c   unshare(CLONE_NEWPID) twice in one process -> the second is EINVAL
-                       clone(CLONE_NEWPID) after one               -> EINVAL
-probe_fork_after_init.c   fork() when the children's namespace's init has exited -> ENOMEM
+probe_pid_ns_again.c     unshare(CLONE_NEWPID) twice in one process -> the second is EINVAL
+                         clone(CLONE_NEWPID) after one               -> EINVAL
+probe_fork_after_init.c  fork() when the children's namespace's init has exited -> ENOMEM
 ```
 
-The first is one rule with two faces: the caller's **own** pid namespace must be the one its children
-would go to (`copy_pid_ns`'s test), so a process may make a pid namespace once - after the first
-call its own numbers and its children's come from different namespaces, which is precisely the state
-the call refuses. It has a third consequence the pin ran into: a `fork` into a namespace whose init
-has **exited** is `ENOMEM`, so a task whose children go to a dead namespace cannot create one at all.
-`t-ns-pid`'s init section is therefore forked *before* the program unshares (its own namespace is
-still the machine's, and it makes the one it needs), and the section's claims are nine words sent
-back up. That shape is not a workaround to hide the divergence: it is the shape a program that
-respects the rule has, and the day the rule lands it is already what the pin exercises.
+The third face is not a separate rule but the same one seen from the other side, and it needed one
+new fact: a pid namespace is **sealed** by its init's death. `PidNs::seal`/`is_sealed` is that fact,
+set at the moment the zap empties the namespace - not at the init's *reap*, so no window exists in
+which a task could be created in a namespace that is already gone. Every creation path asks it
+before it allocates anything (`spawn_copy` for `fork`/`clone`/`vfork`, and `spawn_thread` for a
+thread, since a thread is allocated its pid in the same chain), which is Linux's order: the whole
+new `nsproxy` is built and swapped in at once there, so a refusal that arrived half-way through
+would leave a state no caller asked for. `unshare` asks the same precondition **first** among its
+bits, for the same reason - a word carrying `CLONE_NEWPID|CLONE_NEWNS` is refused whole rather than
+moving the mount table and then failing.
+
+What it cost in the pin is the honest part of it: `t-ns-pid` had *two* sections that forked after the
+first namespace's init had exited - the capability gate's lowered child, and the init section's own
+task - and both would now be `ENOMEM`. The capability gate moved above the `unshare` it never
+depended on, and the init section was already forked at the top of the program for the same reason.
+That is not the test bending to the kernel: a program that respects the rule has to be shaped that
+way, so the pin is now a program of that shape - which is what made it worth writing the three
+claims into it as well:
+
+```
+ok:  a second unshare(CLONE_NEWPID) in one process is EINVAL
+ok:  and clone(CLONE_NEWPID) after one is EINVAL too
+ok:  while a fork into the namespace whose init has exited is ENOMEM
+```
 
 **Gate.** x86_64 `=== SUMMARY pass=173 fail=0 (173 built)` with the kernel's own
 `mpos-kunit 32 passed, 0 failed` and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32
-cases, exit 0. Neither program count moved - the new claims are thirteen more inside `t-ns-pid`, which
-both sweeps already ran. Host suites: the kernel library's 537 and every leaf crate the gate builds
-(`mpos-pidns` is 9 now, up from 7: the crate grew `is_init`, `is_ancestor_of` and `covers` with
-their own tests), all green; clippy reports nothing on `x86_64-unknown-none`,
-`aarch64-unknown-none` and the host lib; `cargo xtask depgraph` is within the ratchet, and the
-change adds no edge to it - `child_signal` and `child_exit` reach the `pidns` leaf they already
-named.
+cases, exit 0. Neither program count moved - the new claims are three more inside `t-ns-pid`, whose
+sections were reordered rather than added to. Stage 1: the kernel library's 537 and every leaf crate
+the gate builds (`mpos-pidns` is 10 now, up from 9: the seal has its own test), all green; clippy
+reports nothing on `x86_64-unknown-none`, `aarch64-unknown-none` and the host lib; `cargo xtask
+depgraph` is within the ratchet, and no edge is added - `pid.rs`'s new helper is reached by `sched`'s
+own modules and by the syscall layer along edges that already exist.
 
 **NET: one `Stack`, and the device is the reason the list is short.** `net::NET`
 is one interface pair (`eth0` + `lo`), one address table, one route table and one

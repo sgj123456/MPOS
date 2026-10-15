@@ -58,6 +58,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 use critical_section::Mutex;
 
 /// One PID namespace: a two-way map between task slots and the numbers this
@@ -79,6 +80,19 @@ pub struct PidNs {
     /// allocated at every level of this chain, which is what lets a parent
     /// address a child that lives in a deeper namespace than its own.
     parent: Option<Arc<PidNs>>,
+    /// Whether the namespace is **sealed**: its init has exited, and nothing may
+    /// be created in it again.
+    ///
+    /// Linux's rule, measured: a task whose children go into a namespace whose
+    /// init has exited answers `ENOMEM` to `fork`
+    /// (`.workbuddy/probe_fork_after_init.c`; `docs/notes/` §6.3), and the state
+    /// is what `zap_pid_ns_processes` leaves behind - the namespace's child
+    /// reaper is gone, so there is nothing left to reap a new init or to speak
+    /// for the namespace at all. A pid namespace is therefore a *one-shot*
+    /// thing, which is also why its number 1 can never be handed out again: the
+    /// cursor only moves forward, and this flag says why that is not merely a
+    /// property of the counter.
+    sealed: AtomicBool,
     numbers: Mutex<RefCell<Numbers>>,
 }
 
@@ -118,6 +132,7 @@ impl PidNs {
         Arc::new(PidNs {
             ns_id,
             parent: None,
+            sealed: AtomicBool::new(false),
             numbers: Mutex::new(RefCell::new(Numbers::default())),
         })
     }
@@ -136,6 +151,7 @@ impl PidNs {
         Arc::new(PidNs {
             ns_id,
             parent: Some(parent.clone()),
+            sealed: AtomicBool::new(false),
             numbers: Mutex::new(RefCell::new(Numbers::default())),
         })
     }
@@ -143,6 +159,19 @@ impl PidNs {
     /// The number this namespace is known by, as `/proc/<pid>/ns/pid` prints it.
     pub fn ns_id(&self) -> u64 {
         self.ns_id
+    }
+
+    /// Seal the namespace: its init has exited, so nothing may be created in it
+    /// again. Called once, by the task that *is* the init as it dies.
+    pub fn seal(&self) {
+        self.sealed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the namespace is sealed - the question a task asks about the
+    /// namespace its next child would be born into, and the one that answers
+    /// `ENOMEM` when the answer is yes.
+    pub fn is_sealed(&self) -> bool {
+        self.sealed.load(Ordering::Relaxed)
     }
 
     /// Whether this is an init namespace - the level whose numbers are the
@@ -436,6 +465,29 @@ mod tests {
         // says so.
         assert!(root.is_init(1));
         assert!(!root.is_init(2));
+    }
+
+    /// A sealed namespace is one whose init has exited, and the state is
+    /// permanently one-way: nothing un-seals it, because a pid namespace's init
+    /// cannot be replaced (the number 1 has been spent, and Linux hands the
+    /// namespace nothing new to speak for it).
+    #[test]
+    fn sealing_is_one_way_and_per_namespace() {
+        let root = PidNs::root(1);
+        let inner = PidNs::child(&root, 2);
+        let sibling = PidNs::child(&root, 3);
+        assert!(!root.is_sealed() && !inner.is_sealed() && !sibling.is_sealed());
+        inner.seal();
+        assert!(inner.is_sealed());
+        assert!(
+            !root.is_sealed(),
+            "sealing a child is not sealing its parent"
+        );
+        assert!(!sibling.is_sealed(), "nor its sibling");
+        // And the numbers still answer: the seal is about *creating* tasks in
+        // it, not about the ones its readers can still name.
+        assert_eq!(inner.allocate(6), 1);
+        assert_eq!(inner.number_of(6), Some(1));
     }
 
     /// A namespace is an ancestor of exactly the namespaces nested under it -

@@ -48,11 +48,11 @@
 //!
 //! The init section is forked **before** this program unshares, and that is a
 //! measured rule rather than a choice: a process may make a pid namespace once
-//! (Linux answers a second `unshare(CLONE_NEWPID)` with `EINVAL`), and a `fork`
-//! into a namespace whose init has exited is `ENOMEM` - both named as gaps in
-//! `docs/notes/` §6.3, because this kernel does not refuse them yet. So the
-//! section runs in a task whose own namespace is still the machine's, and raises
-//! the namespaces it needs itself.
+//! (a second `unshare(CLONE_NEWPID)` is `EINVAL`), and a `fork` into a namespace
+//! whose init has exited is `ENOMEM`. This kernel refuses both, the pin claims
+//! both below, and the section's own placement is the shape a program that
+//! respects them has: it runs in a task whose namespace is still the machine's,
+//! and raises the namespaces it needs itself.
 //!
 //! A host run makes no claim: `CLONE_NEWPID` needs `CAP_SYS_ADMIN`, which this
 //! container's own capabilities do not hold (measured: `.workbuddy/probe_pidns.c`
@@ -395,6 +395,48 @@ fn main() {
     }
     r.check("the init section was forked", section > 0);
 
+    // ---- The capability gate, and the order it is asked in ----
+    //
+    // It runs **before** the `unshare` below, because it forks: a task whose
+    // children go to a namespace whose init has exited cannot create one at
+    // all (`ENOMEM`, the third claim of the section below), and this section's
+    // child is not the thing under test here.
+    //
+    // A lowered caller hears Linux's `EPERM` for a *served* kind, which is what
+    // tells the two refusals apart: `EOPNOTSUPP` above means "present, cannot do
+    // that", and this means "present, and you may not". The drop happens in a
+    // child so the effective id comes back with it.
+    let gate = pipe();
+    if let Ok((gate_r, gate_w)) = gate {
+        let lowered = unsafe { libc::fork() };
+        if lowered == 0 {
+            drop(gate_r);
+            unsafe { libc::syscall(libc::SYS_close, gate_w.as_raw_fd() as libc::c_long) };
+            let rc = unsafe { libc::syscall(libc::SYS_setresuid, -1i64, 65534i64, -1i64) };
+            // What a lowered caller learns is the *errno*: a served kind they
+            // may not have is `EPERM`, where an unserved one is `EOPNOTSUPP`
+            // (claimed above, as root) - which is how the two refusals are told
+            // apart. "Unshares nothing" is not observable from the caller's own
+            // pid (this call only ever moves children), so the claim is the
+            // refusal itself. (The `EOPNOTSUPP` half is claimed further down,
+            // because that word mixes in an unserved kind and this section now
+            // runs first.)
+            let ok = rc == 0 && unshare(UnshareFlags::NEWPID) == Err(Errno::PERM);
+            raw_exit(if ok { 0 } else { 1 });
+        }
+        drop(gate_w);
+        if lowered > 0 {
+            let mut word = [0u8; 1];
+            let _ = read(&gate_r, &mut word);
+            drop(gate_r);
+            let status = rustix::process::waitpid(Pid::from_raw(lowered), WaitOptions::empty());
+            r.check(
+                "an unprivileged caller is refused EPERM, and unshares nothing",
+                matches!(&status, Ok(Some((_, st))) if st.exited() && st.exit_status() == Some(0)),
+            );
+        }
+    }
+
     // ---- A word that mixes the served kind with an unserved one unshares
     //      nothing, and PID is the served half ----
     r.check(
@@ -527,40 +569,43 @@ fn main() {
         }
     }
 
-    // ---- The capability gate, and the order it is asked in ----
+    // ---- A pid namespace is made once, and a dead one takes no tasks ----
     //
-    // A lowered caller hears Linux's `EPERM` for a *served* kind, which is what
-    // tells the two refusals apart: `EOPNOTSUPP` above means "present, cannot do
-    // that", and this means "present, and you may not". The drop happens in a
-    // child so the effective id comes back with it.
-    let gate = pipe();
-    if let Ok((gate_r, gate_w)) = gate {
-        let lowered = unsafe { libc::fork() };
-        if lowered == 0 {
-            drop(gate_r);
-            unsafe { libc::syscall(libc::SYS_close, gate_w.as_raw_fd() as libc::c_long) };
-            let rc = unsafe { libc::syscall(libc::SYS_setresuid, -1i64, 65534i64, -1i64) };
-            // What a lowered caller learns is the *errno*: a served kind they
-            // may not have is `EPERM`, where an unserved one is `EOPNOTSUPP`
-            // (claimed above, as root) - which is how the two refusals are told
-            // apart. "Unshares nothing" is not observable from the caller's own
-            // pid (this call only ever moves children), so the claim is the
-            // refusal itself.
-            let ok = rc == 0 && unshare(UnshareFlags::NEWPID) == Err(Errno::PERM);
-            raw_exit(if ok { 0 } else { 1 });
-        }
-        drop(gate_w);
-        if lowered > 0 {
-            let mut word = [0u8; 1];
-            let _ = read(&gate_r, &mut word);
-            drop(gate_r);
-            let status = rustix::process::waitpid(Pid::from_raw(lowered), WaitOptions::empty());
-            r.check(
-                "an unprivileged caller is refused EPERM, and unshares nothing",
-                matches!(&status, Ok(Some((_, st))) if st.exited() && st.exit_status() == Some(0)),
-            );
-        }
-    }
+    // The three faces of one rule, and the ones this program's own structure ran
+    // into: Linux's `copy_pid_ns` asks that the caller's **own** pid namespace be
+    // the one its children would go to, so the call that makes one can only
+    // succeed while that holds - and after it has, it does not. Everything here
+    // is measured on the host (`.workbuddy/probe_pid_ns_again.c`,
+    // `.workbuddy/probe_fork_after_init.c`; `docs/notes/` §6.3), and the state
+    // this section asks from is the one the section above leaves behind: this
+    // task's children went to a namespace whose init has since exited.
+    //
+    // It is also why the init section above was forked at the *top* of the
+    // program rather than here - the shape a program that respects the rules has,
+    // which is the pin's own way of being about them.
+    r.check(
+        "a second unshare(CLONE_NEWPID) in one process is EINVAL",
+        unshare(UnshareFlags::NEWPID) == Err(Errno::INVAL),
+    );
+    let fresh = unsafe {
+        libc::syscall(
+            libc::SYS_clone,
+            (libc::SIGCHLD | libc::CLONE_NEWPID) as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    r.check(
+        "and clone(CLONE_NEWPID) after one is EINVAL too",
+        fresh < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL),
+    );
+    let sibling = unsafe { libc::fork() };
+    r.check(
+        "while a fork into the namespace whose init has exited is ENOMEM",
+        sibling < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM),
+    );
 
     // ---- The init section's verdict ----
     //

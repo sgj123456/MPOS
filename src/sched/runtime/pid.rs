@@ -152,13 +152,46 @@ pub fn adopt_pid(slot: TaskId, ns: &Arc<PidNs>) -> u32 {
 /// the parent's namespace for its children, which is the per-task `nsproxy`
 /// Linux has and the same rule [`unshare_uts`] states: `unshare` splits the
 /// caller, and a sibling that wanted to come along would have to say so.
-#[cfg(target_os = "none")]
+///
+/// The caller must satisfy [`may_mint_pid_ns`] - the syscall layer asks it
+/// before calling this, because Linux refuses the whole word rather than moving
+/// some of it.
 pub fn unshare_pid() {
     with_table(|t| {
         let me = t.current;
         let parent = Arc::clone(&t.task(me).pid_ns);
         t.task_mut(me).pid_ns_children = PidNs::child(&parent, crate::vfs::ns::mint());
     });
+}
+
+/// Whether the running task may make a **new pid namespace**: the one
+/// precondition a pid namespace has, and `unshare(CLONE_NEWPID)` and
+/// `clone(CLONE_NEWPID)` share it.
+///
+/// Linux's `copy_pid_ns` asks it, and it is a measurement rather than a reading:
+/// the caller's **own** namespace must be the one its children would go to. That
+/// holds for a task that never unshared (both are where it was born) and for one
+/// *created in* the namespace it is in (a child of an `unshare`, whose own
+/// numbers and children's namespace are the same one) - and stops holding the
+/// moment the call succeeds, because then its own numbers and its children's
+/// come from different namespaces. So a process makes a pid namespace **once**:
+/// a second `unshare(CLONE_NEWPID)` is `EINVAL`, and so is a
+/// `clone(CLONE_NEWPID)` after one (both measured:
+/// `.workbuddy/probe_pid_ns_again.c`; `docs/notes/` §6.3).
+///
+/// A task whose namespace is already sealed is refused for the same reason from
+/// the other side - there is nothing left of that namespace to make another
+/// inside - but that refusal is `ENOMEM` and belongs to task creation, not here.
+pub fn may_mint_pid_ns() -> bool {
+    with_table(|t| is_mintable(t.task(t.current)))
+}
+
+/// [`may_mint_pid_ns`]'s question about **one named task**, for the path that
+/// asks it of a task other than the running one: `clone`'s parent is a task in
+/// the table, and asking about *it* rather than about `current` keeps the call
+/// making a namespace and the call checking for it one expression.
+pub(crate) fn is_mintable(task: &Task) -> bool {
+    task.pid_ns.ns_id() == task.pid_ns_children.ns_id()
 }
 
 /// Join a PID namespace a descriptor names: `setns(fd, CLONE_NEWPID)`'s half.

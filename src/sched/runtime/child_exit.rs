@@ -260,6 +260,13 @@ pub fn exit(code: isize) -> ! {
             .flatten()
             .any(|o| o.tgid == tgid && !o.exited);
         if group_dead && ns.is_init(tgid.0) {
+            // And the namespace is **sealed** as it is emptied: its init is gone
+            // and Linux lets nothing be created in it again (a `fork` by a task
+            // whose children go there is `ENOMEM`, measured -
+            // `.workbuddy/probe_fork_after_init.c`). Sealing here rather than at
+            // the init's *reap* is what keeps a window from existing at all: the
+            // same moment that ends the tasks is the one that closes the door.
+            ns.seal();
             let mut killed = alloc::vec::Vec::new();
             for (slot, task) in t.tasks.iter_mut().enumerate() {
                 let Some(task) = task.as_mut() else { continue };
@@ -809,6 +816,33 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         return crate::err::ENOMEM;
     }
 
+    // Two refusals about the pid namespace this child would be born into, both
+    // measured, and both asked *before* a slot or a namespace is made - Linux
+    // builds the whole new `nsproxy` and swaps it in one step, so a refusal that
+    // arrived half-way through would leave a state nobody asked for.
+    //
+    // * `CLONE_NEWPID` has the same precondition `unshare(CLONE_NEWPID)` has -
+    //   `sched::may_mint_pid_ns`'s, which is one rule with two call sites: a
+    //   process makes a pid namespace **once**, and a `clone` with the flag
+    //   after one is `EINVAL`.
+    // * and the namespace the child is born into must not be **sealed**: a
+    //   namespace whose init has exited is `ENOMEM` to create a task in, which is
+    //   the state a `fork` by the task that *unshared* it finds itself in once
+    //   that namespace's init has died.
+    let refused = with_table(|t| {
+        let parent = t.task(t.current);
+        if request.flags & crate::abi::CLONE_NEWPID != 0 && !super::pid::is_mintable(parent) {
+            return crate::err::EINVAL;
+        }
+        if parent.pid_ns_children.is_sealed() {
+            return crate::err::ENOMEM;
+        }
+        0
+    });
+    if refused != 0 {
+        return refused;
+    }
+
     // Phase 2: Allocate a slot and build the child state.
     let child_id = with_table(|t| {
         let slot = t.alloc_slot();
@@ -1341,6 +1375,14 @@ pub fn clone(state: &UserFrame, request: CloneRequest) -> isize {
 /// finds its way back to the function it was asked to run: it set that up on
 /// the new stack before calling in.
 fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
+    // A thread is a task too, and Linux allocates its pid in the same chain a
+    // `fork` walks - so the same seal applies: a namespace whose init has exited
+    // takes no new tasks, a thread of a process still in it included. Asked
+    // before anything is allocated, like `spawn_copy`'s two refusals.
+    if with_table(|t| t.task(t.current).pid_ns.is_sealed()) {
+        return crate::err::ENOMEM;
+    }
+
     // A thread with no stack of its own would run on its creator's, and the
     // first thing either of them did would corrupt the other. Linux leaves
     // this to the caller; refusing is the kinder answer.

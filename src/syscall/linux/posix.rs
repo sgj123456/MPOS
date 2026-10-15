@@ -1141,6 +1141,17 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
     match super::abi::unshare_verdict(args[0], privileged, has_siblings) {
         Err(e) => e,
         Ok(bits) => {
+            // The one kind with a precondition, and it is asked **first**:
+            // Linux's `copy_pid_ns` refuses the whole word rather than moving
+            // part of it, so a caller that has already made a pid namespace
+            // hears `EINVAL` and finds every other bit of its word unmoved too.
+            // The rule itself and its measurement are
+            // [`crate::sched::may_mint_pid_ns`]'s.
+            if bits & crate::syscall::linux::nr::CLONE_NEWPID != 0
+                && !crate::sched::may_mint_pid_ns()
+            {
+                return crate::err::EINVAL;
+            }
             if bits & crate::syscall::linux::nr::CLONE_NEWUTS != 0 {
                 crate::sched::unshare_uts();
             }
