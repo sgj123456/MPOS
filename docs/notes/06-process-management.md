@@ -179,6 +179,34 @@ and properly, rather than twice. The semantics to hold, none of them optional:
 must be per-namespace, which means the pid directory for a process is a
 different name in two namespaces that both can see it.
 
+**NET's first step, measured: a socket has to remember its namespace.** Designing the fourth
+rung turned up a constraint that reorders it, and it is worth having in writing before anyone
+starts. Two readings of `net`:
+
+* `net::with(handle, f)` (`src/net/mod.rs:1032`) reaches the machine's stack *directly*
+  (`NET.borrow(cs)`), not through `with_stack` - so an fd's socket would be resolved against
+  whichever namespace is current, and a task that unshared would find its existing sockets answering
+  from the wrong stack;
+* and the handle is a **per-stack index** (`alloc_socket` -> `stack.add_tcp(..)`, and
+  `Stack.entries` is that stack's own registry), so a fresh namespace numbers its sockets from the
+  same low indices: an fd inherited across a namespace boundary would name one of the *new*
+  namespace's sockets instead of its own. A silent aliasing rather than a stale handle, which is the
+  worse half.
+
+Linux's shape is the opposite and it is deliberate: a `struct sock` holds its `sk_net`, so a live
+fd keeps working in the namespace it was made in, whoever holds it afterwards - which is what makes
+`unshare(CLONE_NEWNET)` usable at all in a process that already has connections. So the step that
+has to land **first** is the socket registry moving out of `Stack` and becoming machine-global,
+each entry recording the namespace whose stack owns its addresses, routes and timers
+(`entries`/`listeners`/`teardown` are referenced 41 times, measured, all inside
+`socket.rs`/`mod.rs`/`rtnl.rs`). It is observable on its own - a machine that never unshares is
+unchanged, and every socket test still passes - and no namespace may be entered before it. The rest
+of NET's design (one opaque `net_ns: Option<u64>` on `Task` rather than an `Arc` object, so that
+`sched` does not name `net` and turn the existing `net -> sched` recall edge into a mutual pair; the
+machine's own network namespace number minted in `vfs::ns`, which both layers may name; a fresh
+namespace's stack holding `lo`, down and unaddressed, and no wire) is unchanged and recorded in
+`.workbuddy/netns/PLAN.md` with its file/line inventory.
+
 **NET: one `Stack`, and the device is the reason the list is short.** `net::NET`
 is one interface pair (`eth0` + `lo`), one address table, one route table and one
 socket registry. The record is already shaped like something a second copy would

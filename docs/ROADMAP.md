@@ -46,8 +46,11 @@ One-glance status of the whole roadmap.
 - [x] teardown at exit, not at reap (§6, R.15)
 - [~] 6.3 Namespaces — UTS, MNT and **PID** landed, each with its pin (`t-ns-uts`, `t-ns-mnt`,
   `t-ns-pid`): the numbers a process sees are the reader's namespace's, both directions of the
-  translation, and `/proc` rendered per reader (§6.3); NET designed, unbuilt; the other five
-  kinds have no entry at all (§6.3, §6.6)
+  translation, and `/proc` rendered per reader (§6.3); NET designed, unbuilt, and its *first* step
+  is now named: a socket has to remember its namespace before one can be entered at all - the
+  registry is per-stack today and its handles are per-stack indices, so an fd inherited across a
+  namespace boundary would name one of the new namespace's sockets rather than its own (§6.3);
+  the other five kinds have no entry at all (§6.3, §6.6)
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
