@@ -5,8 +5,9 @@ use super::task::with_table;
 use super::task::{Stop, SyscallStop, Table, Task, current};
 use crate::abi::{
     PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_NONE,
-    PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEEXEC, PTRACE_O_TRACEFORK,
-    PTRACE_O_TRACESYSGOOD, PTRACE_O_TRACEVFORK, SYSCALL_TRAP,
+    PTRACE_EVENT_SECCOMP, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEEXEC,
+    PTRACE_O_TRACEFORK, PTRACE_O_TRACESECCOMP, PTRACE_O_TRACESYSGOOD, PTRACE_O_TRACEVFORK,
+    SYSCALL_TRAP,
 };
 use crate::hal;
 use crate::hal::{ABI_REG_COUNT, AbiRegs, ContextOps, UserFrame, UserFrameOps};
@@ -532,6 +533,46 @@ pub fn fork_trap(regs: &mut AbiRegs, event: u32, message: u64) {
         Stop {
             signal: signal::SIGTRAP,
             event,
+            traced: true,
+            reported: false,
+            message,
+            delivering: None,
+            syscall: entry,
+            group: false,
+        },
+    );
+}
+
+/// Whether the running task's tracer asked for the seccomp event.
+///
+/// A `SECCOMP_RET_TRACE` decision needs somewhere for the call to go: with no
+/// tracer, or a tracer that did not name `PTRACE_O_TRACESECCOMP`, there is
+/// nobody to hand it to, and Linux answers `ENOSYS` (measured on 7.2). This is
+/// the question the syscall gate asks before deciding between the stop and the
+/// refusal.
+pub fn seccomp_trace_armed() -> bool {
+    let id = current();
+    with_table(|t| {
+        let trace = &t.task(id).trace;
+        trace.tracer.is_some() && trace.options & PTRACE_O_TRACESECCOMP != 0
+    })
+}
+
+/// Hold the running task so its tracer can be told that a `SECCOMP_RET_TRACE`
+/// filter selected this call, before the call is made.
+///
+/// `message` is the filter answer's data half, which is what
+/// `PTRACE_GETEVENTMSG` answers at this stop (measured: a `RET_TRACE|0x1234` on
+/// `gettid` reported `0x1234`). The syscall record is left alone for the same
+/// reason [`fork_trap`] leaves it: the call has not run yet, and the tracer's
+/// `PTRACE_GET_SYSCALL_INFO` should describe it.
+pub fn seccomp_trap(regs: &mut AbiRegs, message: u64) {
+    let entry = with_table(|t| t.task(current()).trace.syscall);
+    park(
+        regs,
+        Stop {
+            signal: signal::SIGTRAP,
+            event: PTRACE_EVENT_SECCOMP,
             traced: true,
             reported: false,
             message,

@@ -147,7 +147,7 @@ One-glance status of the whole roadmap.
 **Security (Phase 8)**
 - [~] 8.0 allocation-failure panic — reproducing case fixed, tmpfs budget landed; global allocator still panics (§8.0, R.8)
 - [x] 8.1 ASLR · [x] 8.3 user stack canary (§8.1, §8.3)
-- [~] 8.2 seccomp — STRICT + FILTER with all eight actions measured; `PTRACE_EVENT_SECCOMP` is the one named remainder (§8.2)
+- [~] 8.2 seccomp — STRICT + FILTER with all eight actions measured and the `PTRACE_EVENT_SECCOMP` stop landed; a tracer rewriting the frame at that stop is the one named remainder (§8.2)
 
 **Performance (Phase 10)**
 - [x] 10.1 network latency — event-driven waits + MSI-X (§10.1)
@@ -199,7 +199,8 @@ In the order that keeps each step verifiable on its own:
    2026-10-15 - and its `F_OFD_*` neighbours are served, in the same record domain, from the same
    day (§3.2). `AF_UNIX` moved off this list
    (2026-10-15) and vsock left it with a measurement instead of an implementation, both recorded in
-   §6.3. Beside it: seccomp's one named piece, the `PTRACE_EVENT_SECCOMP` stop (§8.2).
+   §6.3. Beside it: seccomp's `PTRACE_EVENT_SECCOMP` stop landed (2026-10-15), and what remains is a
+   tracer rewriting the frame at that stop (§8.2).
 2. **interrupt-driven block completions** (§10.5's last row) — measured and re-scoped; §10.5
    carries the structure change, its pin and what each machine's clock can see.
 3. **what is left of the DHCP chain** (§4.5) — the raw-IP door's rules, cause and reverted

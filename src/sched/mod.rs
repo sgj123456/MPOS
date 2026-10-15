@@ -89,8 +89,8 @@ pub use runtime::{
 ///
 #[cfg(target_os = "none")]
 pub use runtime::{
-    exec_trap, fork_trap, group_stop, set_trace_fpu, set_trace_regs, stop_at_syscall, trace_fpu,
-    trace_regs, trace_signal_stop,
+    exec_trap, fork_trap, group_stop, seccomp_trace_armed, seccomp_trap, set_trace_fpu,
+    set_trace_regs, stop_at_syscall, trace_fpu, trace_regs, trace_signal_stop,
 };
 
 /// The `#NM` vector's entry, named only where the machine traps a lazy FPU.

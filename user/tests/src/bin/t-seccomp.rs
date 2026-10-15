@@ -68,6 +68,13 @@
 
 use mpos_user_tests::{Report, host_run};
 use rustix::io::Errno;
+use std::os::raw::c_long;
+
+/// The one `ptrace(2)` word musl's `libc` does not name, and the event number
+/// the stop's status carries. `TRACESECCOMP` is bit 7 of the `PTRACE_O_*` set
+/// (`linux/ptrace.h`), and the seccomp event is 7 in the `PTRACE_EVENT_*` list.
+const PTRACE_O_TRACESECCOMP: c_long = 0x80;
+const PTRACE_EVENT_SECCOMP: i32 = 7;
 
 /// The judged number, and the one the second filter below takes instead. Read
 /// from `libc`'s per-machine table rather than written down - see the header.
@@ -105,6 +112,27 @@ fn judge(nr: u32, action: u32) -> [libc::sock_filter; 4] {
         insn(RET_K, 0, 0, action),
         insn(RET_K, 0, 0, libc::SECCOMP_RET_ALLOW),
     ]
+}
+
+/// One `ptrace` call; the number is `libc::SYS_ptrace`, the per-arch table,
+/// never written down here (the reason `t-ptrace` states at length).
+fn ptrace(request: c_long, pid: libc::pid_t, addr: usize, data: usize) -> Result<isize, i32> {
+    // SAFETY: `syscall` is a libc entry point; the widths are the ABI's, and
+    // every call below passes a pointer this process owns, or null.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_ptrace,
+            request,
+            pid as c_long,
+            addr as c_long,
+            data as c_long,
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1))
+    } else {
+        Ok(rc as isize)
+    }
 }
 
 /// `seccomp(2)` through the raw door: `(operation, flags, argument)`.
@@ -196,6 +224,103 @@ fn a_child_ends_with(action: u32) -> i32 {
         return -1;
     }
     status
+}
+
+/// The `TRACE` case a tracer turns on: the event the kernel owes a tracer that
+/// asked for `PTRACE_O_TRACESECCOMP`.
+///
+/// The child hands itself over, installs a filter whose `TRACE` decision carries
+/// a data word, and makes the judged call; the parent sets the option and reads
+/// the stop that call produces. Three things are measured, each on Linux first
+/// (`docs/notes/` §8.2): the stop's status carries event 7, its signal is a
+/// plain `SIGTRAP`, and `PTRACE_GETEVENTMSG` answers the **data half** of the
+/// filter's answer (`0x1234`) rather than a pid. The call then runs normally -
+/// the stop is a notice, not a refusal - which is why the child exits 0.
+fn seccomp_stop_reaches_a_tracer(r: &mut Report) {
+    const DATA: u32 = 0x1234;
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: syscalls only between fork and `_exit`, each a straight call.
+        unsafe {
+            if ptrace(libc::PTRACE_TRACEME as c_long, 0, 0, 0) != Ok(0) {
+                libc::_exit(11);
+            }
+            // The stop the tracer needs before it can set its options.
+            libc::raise(libc::SIGSTOP);
+            if install(getpid_nr(), libc::SECCOMP_RET_TRACE | DATA).map(|v| v == 0) != Ok(true) {
+                libc::_exit(12);
+            }
+            // The judged call: the tracer sees the stop, then this runs and
+            // answers this process's own pid.
+            let me = raw_getpid();
+            libc::_exit(if me.0 > 0 { 0 } else { 13 });
+        }
+    }
+    let mut status = 0i32;
+    // SAFETY: `child` is this process's own child and `status` a local.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    r.check(
+        "the seccomp tracee stops for TRACEME first",
+        n == child && libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP,
+    );
+    if n != child {
+        return;
+    }
+    r.check(
+        "a tracer can ask for PTRACE_O_TRACESECCOMP",
+        ptrace(
+            libc::PTRACE_SETOPTIONS as c_long,
+            child,
+            0,
+            PTRACE_O_TRACESECCOMP as usize,
+        ) == Ok(0),
+    );
+    r.check(
+        "resuming the tracee from its own stop",
+        ptrace(libc::PTRACE_CONT as c_long, child, 0, 0) == Ok(0),
+    );
+
+    // The next stop is the judged call's seccomp event: `PTRACE_CONT` does not
+    // arm the syscall boundaries, so nothing else the child does stops it.
+    // SAFETY: as above.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    let stopped = n == child && libc::WIFSTOPPED(status);
+    r.check(
+        &format!(
+            "a SECCOMP_RET_TRACE call produces a seccomp stop \
+             (status {status:#x}: stopped={} event={})",
+            libc::WIFSTOPPED(status),
+            status >> 16,
+        ),
+        stopped && (status >> 16) == PTRACE_EVENT_SECCOMP,
+    );
+    r.check(
+        "the seccomp stop's signal is a plain SIGTRAP",
+        stopped && libc::WSTOPSIG(status) == libc::SIGTRAP,
+    );
+    let mut msg: u64 = 0;
+    let got = ptrace(
+        libc::PTRACE_GETEVENTMSG as c_long,
+        child,
+        0,
+        &mut msg as *mut u64 as usize,
+    );
+    r.check(
+        &format!(
+            "PTRACE_GETEVENTMSG answers the answer's data half (got {msg:#x}, want {DATA:#x})"
+        ),
+        got == Ok(0) && msg == DATA as u64,
+    );
+
+    // The stop is a notice, not a refusal: the call is made once the tracee is
+    // let go, and it answers its own pid.
+    let resumed = ptrace(libc::PTRACE_CONT as c_long, child, 0, 0) == Ok(0);
+    // SAFETY: as above.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    r.check(
+        "the traced call then runs, and the tracee exits normally",
+        resumed && n == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+    );
 }
 
 fn main() {
@@ -347,6 +472,13 @@ fn main() {
         "LOG lets the call through, exactly as ALLOW does",
         (a_child_ends_with(libc::SECCOMP_RET_LOG) >> 8) == 41,
     );
+
+    // === act two-and-a-half: the TRACE case with a tracer that asked =========
+    // The complement of the "nobody tracing" case above: a tracer that set
+    // `PTRACE_O_TRACESECCOMP` gets the event stop, and the call then runs. This
+    // comes before act three because it needs a process with no filter of its
+    // own to be the tracer, and a child that inherits none.
+    seccomp_stop_reaches_a_tracer(&mut r);
 
     // === act three: install a filter here, and read what it does =============
     match install(getpid_nr(), libc::SECCOMP_RET_ERRNO | 1) {

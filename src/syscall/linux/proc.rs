@@ -616,6 +616,29 @@ pub(crate) fn syscall_entry_stop(
     unsafe { crate::hal::syscall_args(regs_ptr) }
 }
 
+/// The tracee's half of a seccomp stop: hold the task before a
+/// `SECCOMP_RET_TRACE`-selected call is made, and let the tracer see the frame.
+///
+/// The frame is still the syscall-entry one, so the result slot is what
+/// `syscall_entry_stop` leaves there - the call's number, not a result. That is
+/// why this asks the machine for the slot rather than writing a zero: a tracer
+/// that reads `rax` at a seccomp stop on x86_64 must find the syscall number,
+/// exactly as it would at an entry stop.
+pub(crate) fn seccomp_trace_stop(regs_ptr: *mut (), nr: u64, message: u64) {
+    // A null frame is a call the kernel made on its own behalf, with no
+    // register file for a tracer to look at. The call proceeds untraced rather
+    // than faulting on the null.
+    if regs_ptr.is_null() {
+        return;
+    }
+    // SAFETY: `regs_ptr` is the gate's own frame for this task, which is the
+    // contract the callers of the syscall stops already hold.
+    let slot = unsafe { crate::hal::syscall_entry_result_slot(regs_ptr, nr as usize) };
+    let mut regs = capture_frame(regs_ptr, slot);
+    crate::sched::seccomp_trap(&mut regs, message);
+    apply_frame(regs_ptr, &regs);
+}
+
 /// The tracee's half of a syscall-exit stop. The result goes in and comes back,
 /// possibly rewritten: at this stop `rax` *is* the result, and a tracer that
 /// changed it changed what the tracee sees.

@@ -774,7 +774,8 @@ pub(crate) const PTRACE_GET_SYSCALL_INFO: usize = 0x420E;
 // `user_regs_struct`, so they are architecture, not protocol.
 pub(crate) use crate::abi::{
     PTRACE_O_EXITKILL, PTRACE_O_TRACECLONE, PTRACE_O_TRACEEXEC, PTRACE_O_TRACEEXIT,
-    PTRACE_O_TRACEFORK, PTRACE_O_TRACESYSGOOD, PTRACE_O_TRACEVFORK, PTRACE_O_TRACEVFORKDONE,
+    PTRACE_O_TRACEFORK, PTRACE_O_TRACESECCOMP, PTRACE_O_TRACESYSGOOD, PTRACE_O_TRACEVFORK,
+    PTRACE_O_TRACEVFORKDONE,
 };
 
 /// The `PTRACE_O_*` bits this kernel accepts in `PTRACE_SETOPTIONS`, and the
@@ -784,11 +785,12 @@ pub(crate) use crate::abi::{
 /// tracer whose option was silently dropped waits for a stop that never comes,
 /// which is the worst kind of wrong answer. `TRACEVFORKDONE` and `TRACEEXIT` are
 /// accepted and never reported - being told nothing is better than being refused
-/// (`crate::abi::unwatched_events`).
+/// (`crate::abi::unwatched_events`). `TRACESECCOMP` *is* reported now: a
+/// `SECCOMP_RET_TRACE` decision raises the `PTRACE_EVENT_SECCOMP` stop.
 ///
 /// It lives here rather than inline in the handler so that the rule is
-/// host-compiled and tested, and so these eight names have a reader on every
-/// machine rather than only on the one whose `ptrace` handler is built.
+/// host-compiled and tested, and so these names have a reader on every machine
+/// rather than only on the one whose `ptrace` handler is built.
 pub(crate) const PTRACE_OPTIONS_KNOWN: usize = PTRACE_O_TRACESYSGOOD
     | PTRACE_O_TRACEFORK
     | PTRACE_O_TRACEVFORK
@@ -796,6 +798,7 @@ pub(crate) const PTRACE_OPTIONS_KNOWN: usize = PTRACE_O_TRACESYSGOOD
     | PTRACE_O_TRACEEXEC
     | PTRACE_O_TRACEVFORKDONE
     | PTRACE_O_TRACEEXIT
+    | PTRACE_O_TRACESECCOMP
     | PTRACE_O_EXITKILL;
 
 /// `NT_PRSTATUS`, the register-set a `PTRACE_GETREGSET` asks for by name.
@@ -2693,7 +2696,7 @@ mod tests {
     // so the assertions below read them exactly as the handlers would.
     use crate::abi::{
         PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_NONE,
-        PTRACE_EVENT_VFORK, SYSCALL_TRAP, unwatched_events,
+        PTRACE_EVENT_SECCOMP, PTRACE_EVENT_VFORK, SYSCALL_TRAP, unwatched_events,
     };
     use crate::vfs::NodeKind;
 
@@ -4385,13 +4388,15 @@ mod tests {
         assert_eq!(PTRACE_GET_SYSCALL_INFO, 0x420E);
         assert_eq!(PTRACE_O_TRACESYSGOOD, 1);
         assert_eq!(PTRACE_O_TRACEEXEC, 0x10);
+        assert_eq!(PTRACE_O_TRACESECCOMP, 0x80);
         assert_eq!(PTRACE_O_EXITKILL, 0x0010_0000);
         // The mask `PTRACE_SETOPTIONS` admits a request against: every option
         // bit this kernel names, and nothing else. A bit missing here is a
         // tracer refused an option it asked for; a bit extra is one accepted
         // into silence - both worse than a straight answer.
-        assert_eq!(PTRACE_OPTIONS_KNOWN, 0x0010_007f);
+        assert_eq!(PTRACE_OPTIONS_KNOWN, 0x0010_00ff);
         assert_eq!(PTRACE_EVENT_EXEC, 4);
+        assert_eq!(PTRACE_EVENT_SECCOMP, 7);
         // The fork family, and the last two this kernel names but never raises.
         // Pinned for the same reason as the rest: a tracer's switch on these
         // numbers is written against them, and a wrong one there is a stop read

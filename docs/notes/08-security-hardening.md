@@ -138,8 +138,10 @@ re-examined, which is worth knowing before either is attempted.
   machine-wide armed flag that keeps an unfiltered syscall to one relaxed load,
   and a gate that acts on the answer *before* the table runs.
 
-**The eight answers were then measured**, one child per action and a control
-beside every table, because four of them were not what this kernel did:
+**The answers were then measured**, one child per action and a control
+beside every table, because four of them were not what this kernel did. The
+three `TRACE` rows are one action met three ways — no tracer, a tracer that
+asked for nothing, and a tracer that asked for the event:
 
 | Action | What Linux does (measured, 7.2.7) | Before | Now |
 |---|---|---|---|
@@ -149,6 +151,8 @@ beside every table, because four of them were not what this kernel did:
 | `KILL_THREAD` | killed by **`SIGSYS`**, not `SIGKILL` | `SIGKILL` | `SIGSYS` |
 | `KILL_PROCESS` | killed by **`SIGSYS`** | `SIGKILL` | `SIGSYS` |
 | `TRACE`, nobody tracing | the call fails with **`ENOSYS`** | allowed | `ENOSYS` |
+| `TRACE`, tracer set nothing | the call fails with **`ENOSYS`** | allowed | `ENOSYS` |
+| `TRACE`, tracer set `TRACESECCOMP` | a seccomp stop first — `SIGTRAP`, event **7**, the answer's data half in `PTRACE_GETEVENTMSG` — then the call runs | bit refused `EINVAL`; call allowed | the stop, then the call |
 | `USER_NOTIF`, no listener | the call fails with `ENOSYS` | `ENOSYS` | same |
 | anything unrecognised | killed by `SIGSYS` — the man page's "treated as `KILL_PROCESS`", confirmed here | `-ENOSYS` returned | killed |
 
@@ -182,16 +186,31 @@ answers normally — caught each in turn.
   through, then install + the `ERRNO` answer + `PR_GET_SECCOMP` reading 2 + a
   second filter judging another number (the list is cumulative) + inheritance in
   a child that installs nothing + stacking, proved by a `TRAP` installed on top
-  of an inherited `ERRNO` winning the decision. `t-posix`'s probe line — it used
+  of an inherited `ERRNO` winning the decision. The `TRACE`-with-a-tracer case is
+  pinned in the same file, before this process installs anything of its own: the
+  parent traces a child, sets `PTRACE_O_TRACESECCOMP`, and reads the child's
+  `RET_TRACE|0x1234` stop — status `0x7057f` (`WIFSTOPPED`, `SIGTRAP`, event 7),
+  `PTRACE_GETEVENTMSG` answering `0x1234`, and the call then running. `t-posix`'s probe line — it used
   to assert the empty-set answer — now expects `EOPNOTSUPP` for a word naming no
   action at all.
-- **Remaining, named: `PTRACE_EVENT_SECCOMP`.** The third case of `TRACE` is a
-  tracer that has set `PTRACE_O_TRACESECCOMP` getting its own stop, carrying the
-  action's data in `PTRACE_GETEVENTMSG`. This kernel cannot produce it, so
-  `PTRACE_SETOPTIONS` refuses the bit with the same `EINVAL` Linux gives for one
-  it does not know — every traced caller is therefore the no-option kind, whose
-  behaviour *is* Linux's. Building that stop is what would make `TRACE` mean
-  notify rather than allow.
+- **The third `TRACE` case — done.** The `PTRACE_EVENT_SECCOMP` stop now has a
+  producer (`sched::seccomp_trap`, reached from the gate's `RET_TRACE` arm
+  through `proc::seccomp_trace_stop`): a task whose tracer set
+  `PTRACE_O_TRACESECCOMP` stops at the filter's `TRACE` decision, *before* the
+  call, with event **7** and the answer's **data half** in
+  `PTRACE_GETEVENTMSG` (measured: `RET_TRACE|0x1234` on `getpid` reported
+  `0x1234`; the stop word was `0x7057f`). The call is then made normally — the
+  stop is a notice, not a refusal. `PTRACE_SETOPTIONS` now accepts the bit
+  instead of refusing it `EINVAL`, and the *other* third case — a tracer present
+  but silent, which this kernel used to let through — is now measured to fail the
+  call `ENOSYS`, Linux's answer. The stop's `syscall` record is the in-flight
+  entry one, so `PTRACE_GET_SYSCALL_INFO` describes the call.
+  - **Sub-gap, named**: a tracer that rewrites registers at this stop does not
+    change the call. On Linux a `PTRACE_SETREGS` here redirects the syscall; this
+    kernel delivers the stop, then runs the call with the number and arguments it
+    had already read. A tracer wanting to rewrite uses `PTRACE_SYSCALL`'s entry
+    stop, which *does* re-read the frame (`proc::syscall_entry_stop`). Rewrite at
+    the seccomp stop is not built.
 - **Not measured, and recorded rather than guessed**: strict mode's own violation
   signal. `seccomp(SECCOMP_SET_MODE_STRICT)` answers `EINVAL` on this machine for
   every argument shape tried, including after `PR_SET_NO_NEW_PRIVS` and with

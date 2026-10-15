@@ -139,16 +139,18 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
                     crate::sched::send_signal(crate::sched::current(), SIGSYS);
                     return nr as isize;
                 }
-                // `TRACE`: a tracer that never asked for
-                // `PTRACE_O_TRACESECCOMP` lets the call through, and that
-                // option is refused by `PTRACE_SETOPTIONS` here, so every
-                // traced caller on this machine is that kind of tracer. Nobody
-                // tracing: the call fails with `ENOSYS`, which is the measured
-                // answer and the one that is *not* what "trace" sounds like.
+                // `TRACE`: the call is handed to the tracer. A tracer that set
+                // `PTRACE_O_TRACESECCOMP` gets the stop - `PTRACE_EVENT_SECCOMP`
+                // with the answer's data half as the event message - and the
+                // call is then made normally. Nobody tracing, or a tracer that
+                // never asked: there is no one to hand it to, and the call
+                // fails with `ENOSYS`, which is the measured answer on 7.2 and
+                // the one that is *not* what "trace" sounds like.
                 sc::RET_TRACE => {
-                    if !crate::sched::has_tracer(crate::sched::current()) {
+                    if !crate::sched::seccomp_trace_armed() {
                         return err::ENOSYS;
                     }
+                    proc::seccomp_trace_stop(regs_ptr, nr, sc::action_data(answer) as u64);
                 }
                 // `USER_NOTIF` hands the call to a userspace supervisor, and
                 // this kernel has none to hand it to. Measured: Linux with no

@@ -137,6 +137,12 @@ pub const PTRACE_O_TRACECLONE: usize = 0x0000_0008;
 pub const PTRACE_O_TRACEEXEC: usize = 0x0000_0010;
 pub const PTRACE_O_TRACEVFORKDONE: usize = 0x0000_0020;
 pub const PTRACE_O_TRACEEXIT: usize = 0x0000_0040;
+/// Ask to be told when a `SECCOMP_RET_TRACE` filter selects the running
+/// syscall: the tracer gets a `PTRACE_EVENT_SECCOMP` stop before the call is
+/// made. Without it a `TRACE` decision has no tracer to hand the call to and
+/// the call fails `ENOSYS` (measured - a tracer present but silent is no
+/// better than none).
+pub const PTRACE_O_TRACESECCOMP: usize = 0x0000_0080;
 pub const PTRACE_O_EXITKILL: usize = 0x0010_0000;
 
 /// The bit `TRACESYSGOOD` sets in the reported stop signal.
@@ -163,6 +169,13 @@ pub const PTRACE_EVENT_CLONE: u32 = 3;
 /// stop, which is the question a tracer that reassembles a thread group after
 /// the leader exec'd is asking.
 pub const PTRACE_EVENT_EXEC: u32 = 4;
+
+/// The seccomp event: raised on entry to a syscall a `SECCOMP_RET_TRACE` filter
+/// selected, before the call is made. `PTRACE_GETEVENTMSG` answers the action's
+/// **data half** here (measured, `.workbuddy/probe-eventmsg-harness2.py`: a
+/// `RET_TRACE|0x1234` on `gettid` reported `0x1234`), which is the number a
+/// supervisor uses to route the call.
+pub const PTRACE_EVENT_SECCOMP: u32 = 7;
 
 /// The events this kernel accepts a name for and does not produce.
 ///
