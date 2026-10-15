@@ -149,7 +149,7 @@ One-glance status of the whole roadmap.
 **Security (Phase 8)**
 - [~] 8.0 allocation-failure panic — reproducing case fixed, tmpfs budget landed; global allocator still panics (§8.0, R.8)
 - [x] 8.1 ASLR · [x] 8.3 user stack canary (§8.1, §8.3)
-- [x] 8.2 seccomp — STRICT + FILTER with all eight actions measured, the `PTRACE_EVENT_SECCOMP` stop landed, and a tracer rewriting the frame at that stop now redirects the call (§8.2)
+- [x] 8.2 seccomp — STRICT + FILTER with all eight actions measured, the `PTRACE_EVENT_SECCOMP` stop landed, and a tracer rewriting the frame now redirects the call at that stop and at an ordinary `PTRACE_SYSCALL` entry stop (§8.2)
 
 **Performance (Phase 10)**
 - [x] 10.1 network latency — event-driven waits + MSI-X (§10.1)
@@ -202,8 +202,11 @@ In the order that keeps each step verifiable on its own:
    day (§3.2). `AF_UNIX` moved off this list
    (2026-10-15) and vsock left it with a measurement instead of an implementation, both recorded in
    §6.3. Beside it: seccomp's `PTRACE_EVENT_SECCOMP` stop landed (2026-10-15), and a tracer
-   rewriting the frame there redirects the call now (2026-10-16) - the `PTRACE_SYSCALL` entry
-   stop's number rewrite is the remaining, unnamed sliver (§8.2).
+   rewriting the frame there redirects the call now (2026-10-16) - as it does at an ordinary
+   `PTRACE_SYSCALL` entry stop, from the same day, pinned counterfactually in `t-ptrace` (§8.2:
+   the exit stop answers the parent's pid with the re-read and the tracee's own without it).
+   What stays unnamed there is a rewrite that *cancels* the call rather than replacing it
+   (Linux's `nr = -1`), which nothing measures yet (§8.2).
 2. **interrupt-driven block completions** (§10.5's last row) — measured and re-scoped; §10.5
    carries the structure change, its pin and what each machine's clock can see.
 3. **the weston pointer on the window** (R.7, §7.4) — the root cause is fixed in code: the cursor

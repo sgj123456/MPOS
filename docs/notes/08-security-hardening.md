@@ -227,9 +227,35 @@ answers normally — caught each in turn.
     pin is counterfactual: with the re-read removed, `t-seccomp` is the one red in
     the sweep (`pass=172 fail=1`); with it, x86_64 is `pass=173 fail=0` with
     `mpos-kunit 32 passed, 0 failed` and exit 33, aarch64 `pass=172 fail=0`.
-    - The `PTRACE_SYSCALL` entry stop still re-reads only the **argument**
-      registers (`proc::syscall_entry_stop`); rewriting the *number* there is a
-      separate, unnamed remainder, not part of this case.
+    - **And the same rewrite at an ordinary `PTRACE_SYSCALL` entry stop — done
+      (2026-10-16).** `proc::syscall_entry_stop` used to answer only the
+      *arguments* a tracer may have rewritten; the number it was handed was the
+      number `dispatch` made, which is why the two halves of the tracer's
+      interface disagreed - the arguments came from the frame, the call did not.
+      It now answers both, through the same `number_after_stop` the seccomp stop
+      uses, and `linux_dispatch` rebinds `nr` to it so the exit stop's report and
+      the signal delivery's restart question are about the call that runs rather
+      than the one that was asked for.
+      Linux honours this at that stop, measured on this developer's kernel first
+      (7.2, `.workbuddy/probe-ptrace-nr.c`): a judged `getpid` stopped with
+      `orig_rax = 39`, rewriting it to 110 made the tracee's call answer its
+      parent's pid (16190) rather than its own (16155), and the stop after it
+      read the *new* number back out of the same slot (`orig_rax = 110`). One
+      trap in the probe, worth recording: without `PTRACE_O_TRACESYSGOOD` a
+      syscall stop reports a plain `SIGTRAP` and is indistinguishable from a
+      signal-delivery stop, which is the whole reason that option exists.
+      Pinned in `t-ptrace`'s `entry_stop_rewrite_changes_the_call` - a tracer's
+      own version of `t-seccomp`'s claim, with no filter and no event, just the
+      syscall boundary any tracer asks for. The pin is counterfactual and the two
+      kernels differ by one number: the exit stop answers the parent's pid (14)
+      with the re-read and the tracee's own (15) without it, which is
+      `pass=173 fail=0` with `mpos-kunit 32 passed, 0 failed` and exit 33
+      against `pass=172 fail=1` with `t-ptrace` the one red; aarch64 is
+      `pass=172 fail=0`, where the slot reads 172 and the answer is the parent's
+      10.
+      - Not measured, and recorded rather than guessed: a rewrite at either stop
+        that *cancels* the call - Linux's `nr = -1` sentinel - rather than
+        replacing it with another number. Nothing in the sweep asks for it.
 - **Not measured, and recorded rather than guessed**: strict mode's own violation
   signal. `seccomp(SECCOMP_SET_MODE_STRICT)` answers `EINVAL` on this machine for
   every argument shape tried, including after `PR_SET_NO_NEW_PRIVS` and with

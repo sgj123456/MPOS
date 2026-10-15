@@ -245,7 +245,13 @@ pub unsafe fn linux_dispatch(
     // touched, which is every task on a machine whose `ptrace` handler has not
     // been ported: with no tracer there is no stop to take. The operations are
     // the machine's (`hal::Gate`), so the pair runs on both machines either way.
-    let args = linux::proc::syscall_entry_stop(regs_ptr, nr, args);
+    //
+    // The entry stop answers the number as well as the arguments, and `nr` is
+    // rebound to it: a tracer that rewrote the number slot there redirected the
+    // call, and every later use of it - the dispatch, the exit stop's report and
+    // the signal delivery's restart question - is a question about the call that
+    // runs, not the one that was asked for.
+    let (nr, args) = linux::proc::syscall_entry_stop(regs_ptr, nr, args);
     // SAFETY: the caller's contract, passed through unchanged.
     let ret = unsafe { linux::dispatch(nr, args, from_user, regs_ptr) };
     let ret = linux::proc::syscall_exit_stop(regs_ptr, nr, args, ret);

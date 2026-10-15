@@ -578,25 +578,45 @@ fn apply_frame(regs_ptr: *mut (), regs: &AbiRegs) -> usize {
     rax as usize
 }
 
-/// The tracee's half of a syscall-entry stop: show the tracer the call before it
-/// is made, and answer the arguments the tracee will actually make it with.
+/// The call's number *after* a tracer has seen the frame, written back into the
+/// frame the gate reads.
 ///
-/// Re-reading the argument registers rather than returning the ones handed in is
-/// the point of the exercise: a tracer that rewrote `rdi` at the stop meant to
+/// The write-back is the whole of making a redirect stick. On x86_64
+/// `restore_user_regs` does not carry `orig_rax` - the number and the result
+/// share `rax`, and the result is the gate's to write after the handler - so a
+/// number a tracer wrote into the register file would be dropped here, before
+/// the gate ever saw it. On aarch64 `restore_user_regs` already carried `x8`,
+/// and this writes the same value a second time rather than a different one.
+fn number_after_stop(regs_ptr: *mut (), regs: &AbiRegs) -> u64 {
+    let nr = regs[abi::uregs::NUMBER];
+    // SAFETY: the same gate frame `capture_frame` was handed.
+    unsafe { crate::hal::set_syscall_number(regs_ptr, nr) };
+    nr
+}
+
+/// The tracee's half of a syscall-entry stop: show the tracer the call before it
+/// is made, and answer the number and the arguments the tracee will actually
+/// make it with.
+///
+/// Re-reading both rather than returning what was handed in is the point of the
+/// exercise: a tracer that rewrote `rdi` - or the number - at the stop meant to
 /// change the call, and a kernel that then made the call with the old value
-/// would be ignoring it.
+/// would be ignoring it. Redirecting the number is what a syscall-table sandbox
+/// is built from, and Linux honours it at this stop (measured on the developer's
+/// 7.2 kernel: a judged `getpid` whose number slot was rewritten to `getppid`
+/// answered its parent's pid, and the stop after it read the new number back).
 pub(crate) fn syscall_entry_stop(
     regs_ptr: *mut (),
     nr: u64,
     args: [usize; ARG_COUNT],
-) -> [usize; ARG_COUNT] {
+) -> (u64, [usize; ARG_COUNT]) {
     if !crate::sched::has_tracer(crate::sched::current()) {
-        return args;
+        return (nr, args);
     }
     // A null frame is a call the kernel made on its own behalf: no register
     // file exists for a tracer to have rewritten.
     let Some(ctx) = (unsafe { crate::hal::user_context(regs_ptr, 0) }) else {
-        return args;
+        return (nr, args);
     };
     let (ip, sp) = (ctx.ip() as u64, ctx.sp() as u64);
     // What the ABI's result slot must read at *this* moment, which is not the
@@ -610,10 +630,11 @@ pub(crate) fn syscall_entry_stop(
     let wide = args.map(|arg| arg as u64);
     crate::sched::stop_at_syscall(true, &mut regs, nr, &wide, ip, sp);
     apply_frame(regs_ptr, &regs);
-    // Re-read the arguments rather than reusing `args`: a tracer that rewrote
-    // an argument register at the stop meant to change the call.
+    // Both halves of the call are the frame's now, not the ones handed in.
+    let nr = number_after_stop(regs_ptr, &regs);
     // SAFETY: the same gate frame `capture_frame` was just handed.
-    unsafe { crate::hal::syscall_args(regs_ptr) }
+    let args = unsafe { crate::hal::syscall_args(regs_ptr) };
+    (nr, args)
 }
 
 /// The tracee's half of a seccomp stop: hold the task before a
@@ -638,15 +659,9 @@ pub(crate) fn seccomp_trace_stop(regs_ptr: *mut (), nr: u64, message: u64) {
     crate::sched::seccomp_trap(&mut regs, message);
     apply_frame(regs_ptr, &regs);
     // A tracer that redirected the call rewrote the number slot, and it has to
-    // reach the frame the gate reads next. On x86_64 `restore_user_regs` does
-    // not carry `orig_rax` - the number and the result share `rax`, and the
-    // result is the gate's to write after the handler - so a redirect would be
-    // dropped here, before the gate ever saw it. Writing it back is the whole
-    // of making `PTRACE_SETREGS` at this stop change the call (measured in
-    // `docs/notes/` §8.2). On aarch64 `restore_user_regs` already carried `x8`,
-    // and this writes the same value a second time rather than a different one.
-    // SAFETY: the same gate frame `capture_frame` was handed.
-    unsafe { crate::hal::set_syscall_number(regs_ptr, regs[abi::uregs::NUMBER]) };
+    // reach the frame the gate reads next - see [`number_after_stop`] for why
+    // the frame does not carry it on its own.
+    number_after_stop(regs_ptr, &regs);
 }
 
 /// The tracee's half of a syscall-exit stop. The result goes in and comes back,
