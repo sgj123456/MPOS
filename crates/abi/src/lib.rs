@@ -268,21 +268,32 @@ pub fn rlimit_admit(old: Rlimit, new: Rlimit, is_root: bool) -> Result<Rlimit, i
 pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isize> {
     const SERVED: usize = CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID;
     let asked = flags & CLONE_NAMESPACES;
-    // A thread cannot be the init of a namespace its own process is not in, and
-    // a pid namespace's whole content *is* the number the child is given - so
-    // `CLONE_THREAD | CLONE_NEWPID` is a request whose two halves contradict
-    // each other, and Linux refuses it `EINVAL` rather than choosing one. It is
-    // decided here, before the privilege question: this is the request being
-    // impossible, not the caller lacking a capability. Not measured on this
-    // sandbox - creating a pid namespace needs `CAP_SYS_ADMIN`, which it does
-    // not have (`.workbuddy/probe_pidns.c`: `unshare(CLONE_NEWPID)` -> `EPERM`)
-    // - so this is Linux's documented rule rather than an observation, and the
-    // named divergence to check first if a caller ever disagrees.
-    if flags & CLONE_THREAD != 0 && asked & CLONE_NEWPID != 0 {
+    // The pairs Linux itself calls *invalid*, from `clone(2)`'s ERRORS list:
+    // "CLONE_NEWPID and one (or both) of CLONE_THREAD or CLONE_PARENT were
+    // specified" is `EINVAL`. A pid namespace's whole content is the number the
+    // child is given, and a thread is not given one - it belongs to its
+    // process - so the two halves of such a word contradict each other. Decided
+    // here, before the privilege question: this is the request being
+    // impossible, not the caller lacking a capability. (The rule is *documented*
+    // rather than measured here: creating a pid namespace needs `CAP_SYS_ADMIN`,
+    // which this sandbox does not have - `.workbuddy/probe_pidns.c` gets `EPERM`
+    // - so a maintainer with the capability can upgrade this to an observation.)
+    if asked & CLONE_NEWPID != 0 && flags & (CLONE_THREAD | CLONE_PARENT) != 0 {
         return Err(mpos_err::EINVAL);
     }
     if asked != 0 && !privileged {
         return Err(mpos_err::EPERM);
+    }
+    // A *thread* with a namespace of its own is something Linux serves - its
+    // `create_new_namespaces` runs for a thread too - and something this kernel
+    // cannot: `sched::spawn_thread` copies the creating process's namespaces by
+    // reference, so until now the flag was accepted by this verdict and then
+    // dropped by the thread path. That is the shape §4's rule 4 is about (a
+    // caller that asked for isolation, got none, and was told nothing), so it
+    // is refused by name: `EOPNOTSUPP` - "present, cannot do that" - and *not*
+    // `EINVAL`, because Linux does not call the request invalid.
+    if flags & CLONE_THREAD != 0 && asked & SERVED != 0 {
+        return Err(mpos_err::EOPNOTSUPP);
     }
     if asked & !SERVED != 0 {
         return Err(mpos_err::EOPNOTSUPP);
@@ -385,6 +396,29 @@ mod tests {
             clone_namespace_verdict(CLONE_THREAD | CLONE_NEWPID, true),
             Err(mpos_err::EINVAL)
         );
+        // The other half of the sentence `clone(2)` writes: `CLONE_PARENT` with
+        // a pid namespace is the same impossible request, and a thread-shaped
+        // word has to carry `SIGHAND|VM` to get past the flag validation at all,
+        // so the words below are the ones a caller would actually send.
+        assert_eq!(
+            clone_namespace_verdict(CLONE_PARENT | CLONE_NEWPID, true),
+            Err(mpos_err::EINVAL)
+        );
+        assert_eq!(
+            clone_namespace_verdict(CLONE_THREAD | CLONE_SIGHAND | CLONE_VM | CLONE_NEWPID, true),
+            Err(mpos_err::EINVAL)
+        );
+        // A *thread* with a namespace of its own: Linux serves it, this kernel
+        // cannot (`spawn_thread` copies the creating process's namespaces), so
+        // the word is refused by name instead of being accepted and dropped -
+        // which is what used to happen, silently.
+        for kind in [CLONE_NEWNS, CLONE_NEWUTS] {
+            assert_eq!(
+                clone_namespace_verdict(CLONE_THREAD | CLONE_SIGHAND | CLONE_VM | kind, true),
+                Err(mpos_err::EOPNOTSUPP),
+                "{kind:#x} was accepted for a thread and then ignored"
+            );
+        }
         assert_eq!(
             clone_namespace_verdict(CLONE_NEWNET, true),
             Err(mpos_err::EOPNOTSUPP)

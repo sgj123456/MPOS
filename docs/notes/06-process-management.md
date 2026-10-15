@@ -556,9 +556,11 @@ machine actually has). Every semantic above therefore comes from this section's 
 and Linux's rules, not from an observation here. Two consequences are *named*: the
 `si_pid` a signal carries is the **sender's own** number (Linux's `task_tgid_vnr(current)`), so
 a receiver one level out may read a number from a namespace it cannot see - Linux's own wart,
-kept rather than smoothed over; and `CLONE_THREAD | CLONE_NEWPID` is refused `EINVAL` on the
-same reasoning (a thread cannot be the init of a namespace its process is not in), decided
-before the privilege question because the *request* is impossible.
+kept rather than smoothed over; and `CLONE_THREAD | CLONE_NEWPID` is refused `EINVAL`. That last
+one is no longer *reasoned*: `clone(2)`'s ERRORS list says it outright - "CLONE_NEWPID and one
+(or both) of CLONE_THREAD or CLONE_PARENT were specified" - which is the citation the rule should
+have carried from the start, and the same sentence added `CLONE_PARENT` to it (`CLONE_PARENT` is
+itself accepted-and-ignored here, which is its own named gap below).
 
 **What the machinery caught, in order.** (1) `xtask`'s host stage names every leaf crate and
 fails when one is compiled and never tested - the new crate was left out of `LEAF_CRATES`, and
@@ -580,6 +582,26 @@ crate, named in `xtask`'s `LEAF_CRATES` - see above), 6 in `mpos-abi`, 121 in `x
 reports 0 errors on `x86_64-unknown-none`, `aarch64-unknown-none`, the host lib and the two
 touched leaf crates; `cargo xtask depgraph` is within the ratchet, which is the one thing a
 namespace does not move: the edges are the same ones, named from the same places.
+
+**The thread rule, and the wrong shape it closed.** Designing NET turned up a shape that was
+already shipping for the *served* kinds: `clone(CLONE_THREAD | CLONE_NEWNS)` was accepted by the
+verdict and then **silently dropped**, because `sched::clone` routes a thread-shaped word to
+`spawn_thread` before the namespace work and a thread here copies its process's namespaces by
+reference. A caller that asked for a thread with a namespace of its own got a thread in its
+parent's, with nothing said - §4's rule 4 exactly. Linux *serves* the pair (its
+`create_new_namespaces` runs for a thread too), so `EINVAL` would be a lie about the request; the
+honest answer for a call this kernel cannot honour is `EOPNOTSUPP`, and that is what
+`clone_namespace_verdict` now gives it, for both served kinds (`NEWNS`, `NEWUTS`) as well as PID's
+documented `EINVAL`. Both arms are pinned in `t-clone` (the word carries `SIGHAND|VM`, so the flag
+validation cannot be what refuses it) and in the leaf's own tests.
+
+Two more shapes the same pass found, **named rather than fixed** because each is its own
+question: `CLONE_PARENT` is in the validated flag mask and is not honoured, so a caller asking
+for it silently gets the caller-as-parent it would have got anyway; and `clone(CLONE_FS |
+CLONE_NEWNS)` is accepted here where `clone(2)`'s ERRORS list calls it `EINVAL` (the same list
+has `CLONE_NEWUSER | CLONE_FS` and `CLONE_NEWIPC | CLONE_SYSVSEM`, both unserved kinds here, so
+only the first pair is this kernel's to answer). The first belongs with `parent:`'s
+implementation, the second with `validate_clone_flags`'s documented-pair table.
 
 **Named gaps, each with what it waits on.** A namespace's pid 1 dying does not zap the
 namespace (Linux's `zap_pid_ns_processes`, which kills every member) - and because numbers are

@@ -247,6 +247,39 @@ fn main() {
         refused(ret, libc::EINVAL),
     );
 
+    // A *thread* with a namespace of its own. The word is well-formed - a
+    // thread-shaped clone has to carry `SIGHAND|VM` to reach the namespace
+    // question at all - so the only thing that can refuse it is the namespace
+    // rule. Linux serves the pair (its `create_new_namespaces` runs for a thread
+    // too); this kernel cannot, because a thread here copies its process's
+    // namespaces by reference, and before this claim it accepted the word and
+    // dropped the flag without saying so. `EOPNOTSUPP` is that refusal. (If the
+    // kernel ever did serve it, the "thread" would start on a null stack and
+    // take this process with it - the loudest failure this claim can produce,
+    // and the reason it is not paired with a positive control.)
+    let thread_ns = probe(
+        libc::CLONE_THREAD as usize
+            | libc::CLONE_SIGHAND as usize
+            | libc::CLONE_VM as usize
+            | libc::CLONE_NEWNS as usize,
+    );
+    r.check(
+        "clone(CLONE_THREAD|CLONE_NEWNS) is EOPNOTSUPP, not a dropped flag",
+        refused(thread_ns, libc::EOPNOTSUPP),
+    );
+    // The kind `clone(2)` itself calls invalid with a thread: a pid namespace's
+    // content is the number the child is given, and a thread is not given one.
+    let thread_pid = probe(
+        libc::CLONE_THREAD as usize
+            | libc::CLONE_SIGHAND as usize
+            | libc::CLONE_VM as usize
+            | libc::CLONE_NEWPID as usize,
+    );
+    r.check(
+        "clone(CLONE_THREAD|CLONE_NEWPID) is EINVAL, as clone(2) documents",
+        refused(thread_pid, libc::EINVAL),
+    );
+
     // CLONE_SIGHAND without CLONE_VM.
     let ret = probe(libc::CLONE_SIGHAND as usize);
     r.check(
