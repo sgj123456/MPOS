@@ -187,12 +187,14 @@ In the order that keeps each step verifiable on its own:
 1. **namespaces** (§6.3) — UTS, MNT, PID and NET are landed, and the ladder's remaining work
    is named per rung: a **wire that can move** into a namespace (`eth0` still cannot enter one),
    nested namespaces pin the *numbers* only one level deep (the zap's reach is pinned two levels
-   now), a record lock's `l_pid` is still the machine's number, the `/proc/net` reader's rows are
-   collected per namespace but no test exercises them, and then the four kinds with no entry at all
+   now), the `F_OFD_*` lock family is `EINVAL` (Linux serves it; its `l_pid` is `-1`), the
+   `/proc/net` reader's rows are collected per namespace but no test exercises them, and then the
+   four kinds with no entry at all
    (user, IPC, cgroup, time - four of `namespaces(7)`'s eight). Two more left this list on
    2026-10-15: the pid namespace's own creation rules (one per process, and a sealed one takes no
    tasks - both refused now with the errno Linux uses), and `NSpid`'s single number, which is the
-   chain in all four `NS*` fields now. `AF_UNIX` moved off this list
+   chain in all four `NS*` fields now. `F_GETLK`'s `l_pid` is the reader's number too, from
+   2026-10-15. `AF_UNIX` moved off this list
    (2026-10-15) and vsock left it with a measurement instead of an implementation, both recorded in
    §6.3. Beside it: seccomp's one named piece, the `PTRACE_EVENT_SECCOMP` stop (§8.2).
 2. **interrupt-driven block completions** (§10.5's last row) — measured and re-scoped; §10.5

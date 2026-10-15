@@ -2376,6 +2376,29 @@ fn lock_take(
     }
 }
 
+/// What `F_GETLK` reports as `l_pid` for a lock held by task `owner`: the
+/// holder's number **where the caller stands**, or 0 when it has none there.
+///
+/// The rule every pid-crossing call in this kernel follows, and Linux's
+/// `locks_translate_pid` asking `pid_nr_ns(holder, reader's namespace)` for
+/// exactly it. All three cases measured on the host
+/// (`.workbuddy/probe_getlk.c`; `docs/notes/` §6.3):
+///
+/// * a reader in the holder's namespace is handed the holder's number there - a
+///   task inside a namespace reading the init's lock sees `1`, not the init's
+///   machine slot;
+/// * a reader *outside* it is handed the holder's number out there;
+/// * a reader whose namespace has no number for the holder at all is handed
+///   **0**, which is what `pid_nr_ns` answers for a task it cannot see - the
+///   holder is outside the reader's namespace, so there is no number to give.
+///
+/// The lock table stores a task id as the owner, and this is the one place that
+/// becomes a pid the caller can act on - which is what the field is for: a
+/// program gets `l_pid` to know *which* process is in its way.
+fn holder_pid_in(owner: u64) -> i32 {
+    crate::sched::pid_number_of(crate::sched::TaskId(owner as usize)).map_or(0, |n| n as i32)
+}
+
 /// One `fcntl` locking command against `fd`: `F_GETLK` reports the first
 /// conflicting lock, `F_SETLK`/`F_SETLKW` take or drop one. `arg` is a user
 /// `struct flock *`; for `F_SETLK` the fields are read, and a conflict is the
@@ -2446,7 +2469,8 @@ fn record_lock(fd: i32, cmd: usize, arg: usize) -> isize {
                         },
                     );
                     unsafe {
-                        ((arg + flock_off::PID) as *mut i32).write_unaligned(held.owner as i32)
+                        ((arg + flock_off::PID) as *mut i32)
+                            .write_unaligned(holder_pid_in(held.owner))
                     };
                 }
                 None => write_i16(flock_off::TYPE, 2), // F_UNLCK

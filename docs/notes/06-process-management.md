@@ -629,6 +629,37 @@ the gate builds, `mpos-pidns` at 11 (the chain has its own test); clippy reports
 `x86_64-unknown-none`, `aarch64-unknown-none` and the host lib; `cargo xtask depgraph` is within the
 ratchet, and no edge is added - `vfs` already names `sched`.
 
+**`F_GETLK`'s `l_pid`, landed: the number the *reader* can act on.** The last pid-crossing call
+that still handed back the machine's slot, and it is the one call whose whole *purpose* is to name a
+process - a program asks `F_GETLK` to learn which process is in its way. Linux's
+`locks_translate_pid` asks `pid_nr_ns(holder, reader's namespace)` for it, and all three answers were
+measured on the host (`.workbuddy/probe_getlk.c`):
+
+```
+a task inside the namespace reading the init's lock:  l_pid = 1
+a lock held *outside* the namespace, read from inside: l_pid = 0
+a reader outside reading the init's lock:              l_pid = 55831 (the init's number out there)
+```
+
+The middle line is the one a "translate it, or keep the machine's number" reading gets wrong: a
+reader whose namespace has no number for the holder at all is handed **0**, because that is what
+`pid_nr_ns` answers for a task it cannot see - so the field is not a fallback but a real answer, and
+the implementation is one function in the fcntl handler (`holder_pid_in`) over the task id the lock
+table already stored. The pin's init section holds a lock from each side of the namespace and asks
+from both, which is three claims: names the holder as that namespace does, names nobody for the lock
+held outside, and hands the outside reader the holder's number out there.
+
+Two neighbours named rather than fixed: **the `F_OFD_*` family is `EINVAL`** here, where Linux serves
+it (its `l_pid` is `-1`, which is exactly why `locks_translate_pid` tests `IS_OFDLCK` before it
+translates), and a lock's owner is a task id whose liveness `locks.rs` already checks, so what the
+translation can be asked about is always a live task.
+
+**Gate.** x86_64 `=== SUMMARY pass=173 fail=0 (173 built)` with the kernel's own
+`mpos-kunit 32 passed, 0 failed` and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32
+cases, exit 0. Neither program count moved - the new claims are three more inside `t-ns-pid`'s init
+section, whose report is fifteen words now. Clippy reports nothing on either bare-metal target or the
+host lib, and `cargo xtask depgraph` is within the ratchet with no edge added.
+
 **NET: one `Stack`, and the device is the reason the list is short.** `net::NET`
 is one interface pair (`eth0` + `lo`), one address table, one route table and one
 socket registry. The record is already shaped like something a second copy would

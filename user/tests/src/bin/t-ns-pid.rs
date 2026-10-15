@@ -155,6 +155,45 @@ fn send(pid: i32, sig: i32) -> isize {
     }
 }
 
+/// Two files the init section locks, one from each side of the namespace.
+///
+/// `F_GETLK`'s `l_pid` is a pid the *reader* is meant to act on, so the answer
+/// for one lock differs between a reader inside the namespace and a reader
+/// outside it - which is the only way to tell a translated number from the
+/// machine's slot, and the reason these two exist.
+const LOCK_INNER: &str = "/tmp/t-ns-pid-inner.lock";
+const LOCK_OUTER: &str = "/tmp/t-ns-pid-outer.lock";
+
+/// One whole-file write lock, the shape `t-filelock` uses: `F_SETLK` with the
+/// range pinned to the file.
+fn lock_whole(fd: i32) -> i32 {
+    let mut want: libc::flock = unsafe { std::mem::zeroed() };
+    want.l_type = libc::F_WRLCK as i16;
+    want.l_whence = libc::SEEK_SET as i16;
+    // SAFETY: a filled `flock` for a descriptor this process owns.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETLK, &mut want as *mut libc::flock) };
+    if rc == 0 {
+        0
+    } else {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+}
+
+/// `F_GETLK` for a write lock over the whole file: answers `l_pid`, or the
+/// negated errno when the call fails - a value no pid can have.
+fn lk_pid(fd: i32) -> i32 {
+    let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+    probe.l_type = libc::F_WRLCK as i16;
+    probe.l_whence = libc::SEEK_SET as i16;
+    // SAFETY: a filled `flock` for a descriptor this process owns.
+    let rc = unsafe { libc::fcntl(fd, libc::F_GETLK, &mut probe as *mut libc::flock) };
+    if rc == 0 {
+        probe.l_pid
+    } else {
+        -std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+}
+
 /// The descriptor the init's `SIGTERM` handler writes one byte to.
 ///
 /// A handler runs on a frame the kernel made, so it may do the one thing a
@@ -212,7 +251,7 @@ fn wait_for_eof(ro: &OwnedFd) -> bool {
 /// in it, lets that init's own worker try to kill it, then kills it from here -
 /// an ancestor namespace - and reports what each step said, one word per step.
 fn run_init_section(verdict: &OwnedFd) {
-    let mut words = [0isize; 12];
+    let mut words = [0isize; 15];
     words[0] = if unshare(UnshareFlags::NEWPID).is_ok() {
         1
     } else {
@@ -236,6 +275,18 @@ fn run_init_section(verdict: &OwnedFd) {
         // serves every end of it.
         let _ = unsafe { libc::fcntl(deeper_r.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
         let _ = unsafe { libc::fcntl(waited_r.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        // The two files, opened *here* so both are inherited: the inner one is
+        // the init's to lock, the outer one this task locks now - a lock held
+        // from outside the namespace, which a reader inside it has no number
+        // for at all.
+        let _ = std::fs::remove_file(LOCK_INNER);
+        let _ = std::fs::remove_file(LOCK_OUTER);
+        let inner_file = std::fs::File::create(LOCK_INNER).ok();
+        let outer_file = std::fs::File::create(LOCK_OUTER).ok();
+        let outer_held = match &outer_file {
+            Some(file) => lock_whole(file.as_raw_fd()) == 0,
+            None => false,
+        };
         let init = unsafe { libc::fork() };
         if init == 0 {
             // The namespace's init: it arms the one thing that does cross - a
@@ -256,6 +307,13 @@ fn run_init_section(verdict: &OwnedFd) {
                 libc::sigaddset(&mut only_usr1, libc::SIGUSR1);
                 libc::sigprocmask(libc::SIG_BLOCK, &only_usr1, std::ptr::null_mut());
             }
+            // The lock this side of the namespace holds, taken before the worker
+            // exists so its ask finds it there.
+            let mut inner_held = false;
+            if let Some(file) = &inner_file {
+                inner_held = lock_whole(file.as_raw_fd()) == 0;
+            }
+            let _ = inner_held;
             // And what `/proc` calls the task *reading this*: the chain, not the
             // one number the reader's own namespace would give. Written before
             // the worker exists, so the two lines this pipe carries have a fixed
@@ -278,7 +336,12 @@ fn run_init_section(verdict: &OwnedFd) {
                 let killed = send(1, libc::SIGKILL);
                 let termed = send(1, libc::SIGTERM);
                 let blocked = send(1, libc::SIGUSR1);
-                let line = format!("{killed} {termed} {blocked}\n");
+                // And what the two locks look like from *inside* the namespace:
+                // the init's own lock should name it as this namespace does
+                // (`1`), and the lock held outside should name nobody.
+                let inner_pid = inner_file.as_ref().map_or(-999, |f| lk_pid(f.as_raw_fd()));
+                let outer_pid = outer_file.as_ref().map_or(-999, |f| lk_pid(f.as_raw_fd()));
+                let line = format!("{killed} {termed} {blocked} {inner_pid} {outer_pid}\n");
                 let _ = write(&said_w, line.as_bytes());
                 drop(said_w);
                 for _ in 0..1000 {
@@ -364,11 +427,26 @@ fn run_init_section(verdict: &OwnedFd) {
                 .split_whitespace()
                 .filter_map(|f| f.parse().ok())
                 .collect();
-            if attempts.len() >= 3 {
+            if attempts.len() >= 5 {
                 words[1] = if attempts[0] == 0 { 1 } else { 0 };
                 words[2] = if attempts[1] == 0 { 1 } else { 0 };
                 words[8] = if attempts[2] == 0 { 1 } else { 0 };
+                // Read from inside the namespace: the init's lock names the init
+                // as this side calls it, and the lock held from outside names
+                // nobody at all.
+                words[12] = if attempts[3] == 1 { 1 } else { 0 };
+                words[13] = if attempts[4] == 0 { 1 } else { 0 };
             }
+            // And the same inner lock read from *here*, outside: the same
+            // holder, named by the number this side knows it by.
+            if let Some(file) = &inner_file {
+                words[14] = if lk_pid(file.as_raw_fd()) == init as i32 {
+                    1
+                } else {
+                    0
+                };
+            }
+            let _ = outer_held;
             // The blocked one, read as data by the init itself.
             if wait_for_byte(&waited_r) {
                 words[8] |= 2;
@@ -679,8 +757,8 @@ fn main() {
             .split_whitespace()
             .filter_map(|f| f.parse().ok())
             .collect();
-        r.check("the init section reports twelve words", words.len() == 12);
-        if words.len() == 12 {
+        r.check("the init section reports fifteen words", words.len() == 15);
+        if words.len() == 15 {
             r.check(
                 "a task in its namespace may make one for its own children",
                 words[0] == 1,
@@ -722,6 +800,18 @@ fn main() {
             r.check(
                 "while a task of the machine's namespace shows the one number it answers to",
                 words[11] == 1,
+            );
+            r.check(
+                "a lock read from inside the namespace names its holder as that namespace does",
+                words[12] == 1,
+            );
+            r.check(
+                "and one held from outside the namespace names nobody there",
+                words[13] == 1,
+            );
+            r.check(
+                "while a reader outside is handed the holder's number out there",
+                words[14] == 1,
             );
         }
         let status = rustix::process::waitpid(
