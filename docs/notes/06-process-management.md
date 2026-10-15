@@ -305,8 +305,10 @@ time, and a served set written into a test is the shape that makes it happen.
 the machine's, because `ip link set eth0 netns N` needs a place to move a device *to* and this
 kernel has none. A namespace's stack is never freed - the identity carries no reference count,
 where Linux frees one with the last `struct net` (and `HOMES` is cleaned per socket, not per
-namespace). **AF_UNIX's registry and vsock's own stack stay machine-wide**, which is what makes the
-pin's cross-namespace handover possible at all; keying those per namespace is the follow-up. And a
+namespace). **vsock's own stack stays machine-wide**, which is now a *measured* shape rather than a
+gap (the paragraph below has the probe), and the unix family is split where Linux splits it - its
+**abstract** names are keyed by the socket's namespace, its **path** names are not namespaced at
+all, which is what makes the pin's cross-namespace handover possible. And a
 `/proc/net` reader sees only its own namespace's sockets, which the pin's rows do not exercise -
 the collector walks `HOMES` filtered by the reader, and one namespace is all a sweep has. The rest
 of NET's design (one opaque `net_ns: Option<u64>` on `Task` rather than an `Arc` object, so that
@@ -314,6 +316,143 @@ of NET's design (one opaque `net_ns: Option<u64>` on `Task` rather than an `Arc`
 machine's own network namespace number minted in `vfs::ns`, which both layers may name; a fresh
 namespace's stack holding `lo`, down and unaddressed, and no wire) is unchanged and recorded in
 `.workbuddy/netns/PLAN.md` with its file/line inventory.
+
+**The rung's second socket family, landed: a unix name is its namespace's, and only the abstract half of it is.**
+The follow-up the gap list named last time ("keying `AF_UNIX` per namespace") came out of a probe
+*smaller* than the plan and shaped differently, because the plan's premise was half wrong: Linux's
+unix sockets are not a namespaced family. A **path** name is not namespaced at all - a socket bound
+at a path answers that path from every namespace, both directions - and only an **abstract** name
+belongs to one. The half the plan was wrong about is the half `t-ns-net`'s descriptor handover is
+built on: it meets at a pathname *because* a pathname crosses.
+
+**And it was measurable after all, which is the rung's own lesson.** For two steps this section
+said no namespace semantic could be observed on this host, quoting `probe_netns.c`'s `EPERM` from
+`unshare(CLONE_NEWNET)`. That `EPERM` is about the call *without a user namespace*, and the
+correction is one flag - `unshare -Urn <probe>`, which creates the network namespace fine:
+
+```
+$ unshare -Urn true ; echo $?
+0
+```
+
+So the socket-family questions below moved from reasoning to observation. The lesson is the one the
+trap table already carries in another shape ("a recorded measurement is about the machine that
+made it"): **a refused probe is a measurement of the probe, not of the question** - and a probe
+that answered `EPERM` once is exactly the thing nobody re-runs.
+
+`.workbuddy/probe_unix_netns.c` + `probe_unix_netns2.c` (the first leaves for a second namespace
+and asks; the second keeps a handle on the first one, walks back, and asks from the other side):
+
+```
+namespace A = ino 4026533058
+  A bound @mpos-probe-abs-one and /tmp/mpos-probe-p1
+namespace B = ino 4026533227
+  A's abstract name, from B:      connect(@mpos-probe-abs-one) -> Connection refused
+  A's path socket, from B:        connect(/tmp/mpos-probe-p1) -> OK
+  bind(@mpos-probe-abs-one) again in B -> OK (the name is per-namespace)
+  B-only abstract name, from A:   connect(@mpos-probe-abs-two) -> Connection refused
+  B's path socket, from A:        connect(/tmp/mpos-probe-p2) -> OK
+```
+
+The same name binding a second time is the strong half of the first line: two tables, not one table
+with a filter. And `.workbuddy/probe_unix_inner.c` holds the control the sequence above cannot -
+inside the fresh namespace a socket made *there* binds a name and another socket made there connects
+and accepts (`OK`, `OK`, `OK`) - so the refusals are a boundary rather than a family that stopped
+working there.
+
+`.workbuddy/probe_unix_netns3.c` adds the question none of those can answer: **whose** namespace is
+it, the calling task's or the socket's? They differ exactly when a socket outlives an `unshare`,
+which is the case this rung has already paid for once (the IP stack's handle map):
+
+```
+A: made two sockets
+A: a new socket is listening on @mpos-where-dial
+B: standing in a second namespace
+  bind(@mpos-where-bind) on a socket made in A, from B -> OK
+    B: a socket made here connecting @mpos-where-bind -> Connection refused
+    a socket made in A connecting @mpos-where-bind (from B) -> OK
+  control: a socket made in B connecting @mpos-where-dial -> Connection refused
+back in A
+    A (back): a socket made here connecting @mpos-where-bind -> OK
+```
+
+A bind *from* B landed in A's table (a socket of B cannot see the name, a socket of A can), and a
+socket of A dials A's name while standing in B. So it is the socket's, which is Linux's `sk_net`
+and not a lookup at the call.
+
+**What landed, then, is one field and one key.** `UnixSock` records the namespace it was **made
+in** (`net` normalizes it, so a task that `setns`ed back into the machine's own spells the same
+`None` a task that never left does - otherwise a socket made after the return would be in a
+namespace nothing else can name), `by_name` is keyed by it, and `by_node` deliberately is not.
+`accept` mints the accepted socket in the **listener's** namespace rather than the accepter's
+(`alloc_in`, Linux's `unix_create1(sock_net(sk))`): the accepted socket is the server's other end,
+and a name of its own belongs in the server's table. Everything else about the registry is
+unchanged - the slot table is machine-wide, which is what `by_node` needs to be able to reach a
+socket bound in another namespace at all.
+
+**The pin.** `t-ns-net` gains a carried-child section: one `fork` carries two unix sockets (the
+machine's) into a fresh namespace, and then - the carried dialer **still reaches** the machine's
+abstract name; a socket made inside **cannot**; the very same name is **free to take again** there;
+a name planted inside is planted and answered **inside**; the parent's namespace **cannot** see the
+child's name; and the control, the machine's own name **still answers here**. The child is held
+open on a second pipe while the parent asks, because an exited child answers `ECONNREFUSED` from a
+dead socket - the same errno for the wrong reason, which would have made the claim pass without
+measuring anything.
+
+**And vsock is the item the measurement retired rather than confirmed.**
+`.workbuddy/probe_vsock2.c` asks the same question of the second family:
+
+```
+namespace A: bind(cid=ANY,port=12345) = OK
+  A (same namespace): connect(cid=1,port=12345) -> No such device
+  A (same namespace): connect(cid=2,port=4321) -> No such device
+namespace B:
+  B: connect(cid=1,port=12345) -> No such device
+  bind the same port here = Address already in use
+  bind a fresh port here  = OK
+```
+
+Two things, and the control leg is what keeps them apart. The port table is **machine-global**: a
+second namespace cannot take a port the first holds, while a fresh port binds fine - so
+"keying vsock per namespace" would be a *divergence* from Linux rather than a fix, and the roadmap
+line that asked for it is corrected rather than served. And the `ENODEV` a connect answers there is
+a **host** property, not a namespace one: it is the same answer in the original namespace (the
+first two lines), because this host has no vsock transport at all - the trap table's "a device class
+needs a *host* backend" in another register. What is genuinely unsettled - whether a fresh
+namespace has a transport - cannot be told apart from that here, so MPOS's machine-global vsock
+stack is **left as it is, named rather than changed**: a task inside a namespace reaches the
+machine's device, and whether Linux's shape would answer `ENODEV` instead needs a host with a
+transport to ask.
+
+**The pin's own defect, and the log is what found it.** The first gate run of this step came back
+green - `pass=173 fail=0`, exit 0 - and the sweep's serial log had `t-ns-net` printing **every
+claim twice**, one copy ending `FAILED`. The cause was the claim the *previous* commit added,
+"`clone(CLONE_NEWNET)` while holding a socket is served": a clone child returns 0 and must leave,
+and that claim's child did not, so it ran the whole program again. Its copy of each claim
+interleaved with the original's - including the two that a process *inside* a fresh namespace gets
+differently, which is why the doubled half failed on exactly those - and because the harness waits
+for the program's own pid, whose exit status was 0, the doubling read as a pass and the `FAILED`
+line was nobody's business until this step's log was read for the new claims. The child exits now
+(`t-ns-net`), and both arms' serial logs are free of `FAIL` markers.
+
+Two lessons, and the first one is the general shape: **a pin is evidence only if its body runs
+once** - a doubled run doubles the denominator silently, and the half that fails is the half nobody
+reads. The second is narrower and worth keeping next to the gate protocol: **a green summary line is
+a claim about what the harness read, not about what the program printed**. `=== SUMMARY pass=173
+fail=0` was true; "`t-ns-net` passed" was also true, of the copy that exited 0. Reading the log for
+the *new* claims is what separated them, which is the same discipline as "never report the gate from
+a stale run" pointed at a single program.
+
+**Gate.** x86_64 `=== SUMMARY pass=173 fail=0 (173 built)` with the kernel's own
+`mpos-kunit 32 passed, 0 failed` and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32
+cases, exit 0. Neither program count moved: the new claims are six more inside `t-ns-net`, which
+both default sweeps already ran, and each arm's serial log carries them once with no `FAIL` line
+anywhere in it. Stage 1: the kernel library's 537 and every leaf crate the gate builds (`mpos-abi`
+6, `mpos-pidns` 7, `mpos-xtask` 121 among them), all green. Clippy reports nothing on
+`x86_64-unknown-none`, `aarch64-unknown-none` and the host lib; `cargo xtask depgraph` is within the
+ratchet, and the change adds no edge to it - `unix.rs` reaches `crate::sched::current_net_ns` along
+the recorded `net -> sched`, and the namespace spelling it shares with the IP registry
+(`net::normalize`) is inside `net` itself.
 
 **NET: one `Stack`, and the device is the reason the list is short.** `net::NET`
 is one interface pair (`eth0` + `lo`), one address table, one route table and one

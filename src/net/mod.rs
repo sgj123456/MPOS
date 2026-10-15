@@ -2267,7 +2267,11 @@ static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 /// `setns`es back into it is the same key as a task that never left - which is
 /// what makes the tables comparable without asking the identity layer at every
 /// comparison.
-fn normalize(ns: Option<u64>) -> Option<u64> {
+///
+/// Shared with `unix.rs`, which keeps the family's names per namespace: the two
+/// registries have to agree on the spelling, or a unix socket made after a
+/// `setns` back would be in a namespace of its own that nothing else can name.
+pub(crate) fn normalize(ns: Option<u64>) -> Option<u64> {
     if ns == Some(crate::vfs::ns::machine_net_id()) {
         None
     } else {

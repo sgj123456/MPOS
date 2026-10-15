@@ -51,9 +51,15 @@ One-glance status of the whole roadmap.
   cannot see - and the kind is served by all three calls, with **a socket remembering the stack it
   was made in** (`net`'s handle map): a socket outlives an `unshare`, an inherited descriptor keeps
   working in a cloned child, and a descriptor handed over by `SCM_RIGHTS` arrives intact and
-  answers the sender's address (§6.3). What NET still cannot do is move a device or a non-IP
-  socket: `eth0` cannot enter a namespace, and `AF_UNIX`/vsock stay machine-wide (§6.3); the other
-  five kinds have no entry at all (§6.3, §6.6)
+  answers the sender's address (§6.3). Beside the IP stack, **`AF_UNIX`'s names are the namespace's
+  where Linux makes them so**: an abstract name belongs to the namespace of the socket that holds
+  it (the name binds again in another, and neither namespace can dial the other's), a *path* name
+  is not namespaced at all and crosses both ways, and what keys the abstract half is the socket's
+  namespace rather than the calling task's (§6.3, measured). What NET still cannot do is move a
+  device: `eth0` cannot enter a namespace, and a vsock stack stays machine-wide - which is Linux's
+  own shape, measured, with the transport question named (§6.3); the other four kinds Linux has -
+  user, IPC, cgroup and time - have no entry at all here (§6.3, §6.6), which is `vfs::ns::Kind::ALL`
+  against `namespaces(7)`'s list of eight
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
@@ -173,10 +179,15 @@ One-glance status of the whole roadmap.
 In the order that keeps each step verifiable on its own:
 
 1. **namespaces** (§6.3) — UTS, MNT, PID and NET are landed, and the ladder's remaining work
-   is named per rung: **AF_UNIX and vsock keyed per namespace** (today machine-wide, so a unix
-   socket is reachable from outside one), a **wire that can move** into a namespace, PID's own
-   named gaps (pid-1 death does not zap, nested namespaces pinned at one level, `NSpid` shows one
-   number), and then the five kinds with no entry at all. Beside it: seccomp's one named piece,
+   is named per rung: a **wire that can move** into a namespace (`eth0` still cannot enter one),
+   PID's own named gaps (pid-1 death does not zap, nested namespaces pinned at one level, `NSpid`
+   shows one number), the `/proc/net` reader's rows (the collector filters by namespace; no test
+   exercises it), and then the four kinds with no entry at all (user, IPC, cgroup, time - four of
+   `namespaces(7)`'s eight). `AF_UNIX` moved off this list (2026-10-15): its **abstract** names are
+   the socket's namespace's, as Linux's are - and its *path* names turned out not to be namespaced
+   at all, which the plan had wrong. vsock also left it, for a different reason: its port table is
+   machine-global in Linux too (measured), so keying it per namespace would be a divergence - what
+   is left there is a transport question this host cannot ask. Beside it: seccomp's one named piece,
    the `PTRACE_EVENT_SECCOMP` stop (§8.2).
 2. **interrupt-driven block completions** (§10.5's last row) — measured and re-scoped; §10.5
    carries the structure change, its pin and what each machine's clock can see.

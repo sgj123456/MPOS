@@ -17,17 +17,21 @@
 //!   **free** in the parent's namespace, and a connect to it there is refused -
 //!   the two port spaces are two;
 //! * the identity differs: `/proc/self/ns/net` names a different number in the
-//!   child than in the parent.
+//!   child than in the parent;
+//! * and the unix family's **abstract** names are the namespace's own: a socket
+//!   made here and carried across still dials the name this namespace holds, a
+//!   socket made inside the new one cannot see it, the same name binds again
+//!   there, and a name planted inside is unknown here - while a *path* name
+//!   crosses both ways, which is what the descriptor handover below needs.
 //!
-//! Three refusals come with it, and each is a decision rather than a gap:
-//! `unshare(CLONE_NEWNET)`/`setns(fd, CLONE_NEWNET)` are `EOPNOTSUPP` - moving a
-//! *live* task into another stack needs each descriptor's socket to remember the
-//! namespace it was made in, and that registry step is named in `docs/notes/`
-//! §6.3; a word mixing the served kind with an unserved one is refused whole;
-//! and a caller that already holds a **socket** is refused the clone rather than
-//! handed a namespace in which that descriptor would name one of the new
-//! namespace's sockets instead of its own (Linux has no such precondition,
-//! because a `struct sock` remembers its `sk_net` - the same registry step).
+//! One refusal comes with it, and it is a decision rather than a gap: a word
+//! mixing the served kind with an unserved one (`CLONE_NEWNET|CLONE_NEWIPC`) is
+//! refused whole. Two more used to be here and are now claims instead, because
+//! the registry step landed (`net`'s `HOMES`, the commit that made a socket
+//! remember its stack): `unshare(CLONE_NEWNET)`/`setns(fd, CLONE_NEWNET)` are
+//! served, and a caller that already holds a socket may clone a namespace -
+//! inherited descriptors are no longer a reason to refuse, since each one goes
+//! on working against the stack it was made in.
 //!
 //! # The doors
 //!
@@ -42,12 +46,15 @@
 //! here. The day a third test needs the codec it belongs in the crate's library
 //! beside `Report`; duplicating the whole of `t-netlink` would not.
 //!
-//! A host run makes no claim: creating a network namespace needs
-//! `CAP_SYS_ADMIN`, which this container's root does not hold (measured:
-//! `.workbuddy/probe_netns.c` gets `EPERM` for `unshare(CLONE_NEWNET)`, and
-//! `unshare --net` fails the same way), so the semantics here rest on Linux's
-//! rules and this kernel's design record rather than on an observation - the
-//! *pin* is what turns them into a claim about this one.
+//! A host run makes no claim: `unshare(CLONE_NEWNET)` needs `CAP_SYS_ADMIN`,
+//! which this container's own capabilities do not hold (measured:
+//! `.workbuddy/probe_netns.c` gets `EPERM`, and `unshare --net` fails the same
+//! way). That measurement is about *that* call and not about the host, though,
+//! and the difference cost this rung a false "cannot be measured here" for two
+//! steps: `unshare -Urn` (a user namespace first) creates the network namespace
+//! fine, which is how the three `probe_unix_netns*.c` transcripts in §6.3 were
+//! taken. So the *unix* half of the claims above is an observation, not a
+//! reading - and what the pin adds is that this kernel matches it.
 
 use mpos_user_tests::{Report, host_run};
 use rustix::fd::{AsRawFd, OwnedFd};
@@ -67,10 +74,11 @@ const LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 
 const REPORT_MAX: usize = 128;
 
-/// Where the two ends of the descriptor handover meet. A pathname, because the
-/// unix registry is machine-wide (`docs/notes/` §6.3): a task in a fresh network
-/// namespace can still reach it, which is exactly what makes the handover below
-/// possible at all.
+/// Where the two ends of the descriptor handover meet. A **pathname**, because a
+/// path is the half of the unix family that is *not* namespaced - a task in a
+/// fresh network namespace reaches it by name, which is exactly what makes the
+/// handover below possible at all (an abstract name would not cross; §6.3 has
+/// the measurement of both halves).
 const PATH: &str = "/tmp/t-ns-net.sock";
 
 /// `unshare(2)`, safe wrapper: single-threaded program, flags are the subject.
@@ -244,6 +252,13 @@ fn ns_number() -> Option<u64> {
     text.strip_prefix("net:[")?.strip_suffix(']')?.parse().ok()
 }
 
+/// An **abstract** `sockaddr_un`: the leading NUL and the name, which is the
+/// address the namespace split below is about. `rustix` writes the field
+/// (`new_abstract_name`), so this file carries no second copy of the encoding.
+fn abstract_addr(name: &[u8]) -> rustix::net::SocketAddrUnix {
+    rustix::net::SocketAddrUnix::new_abstract_name(name).expect("an abstract name fits its field")
+}
+
 fn main() {
     let mut r = Report::new();
 
@@ -339,6 +354,19 @@ fn main() {
     let held = socket(AddressFamily::INET, SocketType::STREAM, None);
     r.check("a socket for the clone is opened", held.is_ok());
     let with_socket = clone_word(libc::SIGCHLD as usize | libc::CLONE_NEWNET as usize);
+    // The child of a *successful* clone lands here with 0, and it has to leave:
+    // without this it ran the whole program a second time, and its copy of every
+    // claim - including this one, which is false for it, since it is not the
+    // caller and cloned nothing - interleaved with the real run's. The harness
+    // waits for the original pid, which exits 0, so it read the doubled run as a
+    // pass and the second copy's `FAILED` was never anyone's business. Measured
+    // in the sweep's own serial log before this line existed (every claim of this
+    // program printed twice, the interleaved half failing on exactly two of
+    // them), which is what makes it a defect in the pin rather than in the
+    // kernel: a pin whose body runs twice is not a pin.
+    if with_socket == 0 {
+        raw_exit(0);
+    }
     r.check(
         "clone(CLONE_NEWNET) while holding a socket is served",
         with_socket > 0,
@@ -689,6 +717,163 @@ fn main() {
                 "the child is reaped",
                 matches!(&status, Ok(Some((_, st))) if st.exited() && st.exit_status() == Some(0)),
             );
+        }
+    }
+
+    // ---- The abstract namespace belongs to the *socket's* namespace ----
+    //
+    // The unix family's two kinds of name are not namespaced the same way, and
+    // neither is namespaced by the *task*: measured on the host with the three
+    // probes beside this rung's plan (`.workbuddy/probe_unix_netns{,2,3}.c`,
+    // transcript in `docs/notes/` §6.3). An abstract name is the namespace's of
+    // the socket that holds it - a name planted in one is `ECONNREFUSED` from a
+    // socket in another, the same name binds again there, and a socket carried
+    // across an `unshare` goes on using the table it was made in. A path is not
+    // namespaced at all, which is the *other* half and the reason the handover
+    // above can meet at a pathname.
+    //
+    // One `fork` carries both of the parent's unix sockets into a fresh
+    // namespace, and then: the carried dialer must still find the name the
+    // machine holds, a socket *made here* must not, and the very name must be
+    // free to take again. The child's own name has to be invisible in the
+    // machine's namespace afterwards, so the child waits on the pipe until the
+    // parent has asked.
+    const HOME: &[u8] = b"t-ns-net-home";
+    const INNER: &[u8] = b"t-ns-net-inner";
+
+    let home = socket(AddressFamily::UNIX, SocketType::STREAM, None);
+    let carried = socket(AddressFamily::UNIX, SocketType::STREAM, None);
+    let home_ready = match (&home, &carried) {
+        (Ok(home), Ok(_)) => bind(home, &abstract_addr(HOME)).is_ok() && listen(home, 8).is_ok(),
+        _ => false,
+    };
+    r.check(
+        "the machine's namespace binds an abstract name to carry across",
+        home_ready,
+    );
+    if home_ready {
+        let report = pipe();
+        r.check("the abstract-name report pipe is made", report.is_ok());
+        if let Ok((inner_r, inner_w)) = report {
+            // A second pipe, so the child can be *held* open while this
+            // namespace asks about the name it bound: an exited child would
+            // answer `ECONNREFUSED` because its socket died, which is the same
+            // errno for the wrong reason and would make the claim below pass
+            // without measuring anything.
+            let release = pipe();
+            r.check("the release pipe is made", release.is_ok());
+            if let Ok((release_r, release_w)) = release {
+                let child = unsafe { libc::fork() };
+                if child == 0 {
+                    // The parent's end is the only writer, so the read below
+                    // ends when *it* lets go.
+                    drop(release_w);
+                    // Leave for a fresh namespace with both inherited
+                    // descriptors: the fork came first, so the sockets are the
+                    // *machine's*.
+                    let moved = unshare(UnshareFlags::NEWNET).is_ok();
+                    let carried_ok = match &carried {
+                        Ok(dialer) => connect(dialer, &abstract_addr(HOME)).is_ok(),
+                        Err(_) => false,
+                    };
+                    let stranger_refused =
+                        match socket(AddressFamily::UNIX, SocketType::STREAM, None) {
+                            Ok(fresh) => {
+                                connect(&fresh, &abstract_addr(HOME)) == Err(Errno::CONNREFUSED)
+                            }
+                            Err(_) => false,
+                        };
+                    // The same name, taken again here: a name is the namespace's.
+                    let rebind_ok = match socket(AddressFamily::UNIX, SocketType::STREAM, None) {
+                        Ok(same) => bind(&same, &abstract_addr(HOME)).is_ok(),
+                        Err(_) => false,
+                    };
+                    // And a name of this namespace's own, planted and answered
+                    // inside it - which is what makes the refusals above a
+                    // boundary rather than a socket family that stopped working.
+                    let inner_ok = match socket(AddressFamily::UNIX, SocketType::STREAM, None) {
+                        Ok(listener) => {
+                            bind(&listener, &abstract_addr(INNER)).is_ok()
+                                && listen(&listener, 4).is_ok()
+                                && match socket(AddressFamily::UNIX, SocketType::STREAM, None) {
+                                    Ok(dialer) => connect(&dialer, &abstract_addr(INNER)).is_ok(),
+                                    Err(_) => false,
+                                }
+                        }
+                        Err(_) => false,
+                    };
+                    let line = format!(
+                        "{} {} {} {} {}\n",
+                        moved as usize,
+                        carried_ok as usize,
+                        stranger_refused as usize,
+                        rebind_ok as usize,
+                        inner_ok as usize
+                    );
+                    let _ = write(&inner_w, line.as_bytes());
+                    drop(inner_w);
+                    let mut byte = [0u8; 1];
+                    let _ = read(&release_r, &mut byte);
+                    raw_exit(0);
+                }
+                r.check("the task that carries the names was forked", child > 0);
+                if child > 0 {
+                    let mut buf = [0u8; REPORT_MAX];
+                    let n = read_line(&inner_r, &mut buf);
+                    let said: Vec<isize> = String::from_utf8_lossy(&buf[..n])
+                        .split_whitespace()
+                        .filter_map(|f| f.parse().ok())
+                        .collect();
+                    r.check("the carried child reports five words", said.len() == 5);
+                    if said.len() == 5 {
+                        r.check("unshare(CLONE_NEWNET) is served there", said[0] == 1);
+                        r.check(
+                            "a socket made here and carried across still dials this namespace's abstract name",
+                            said[1] == 1,
+                        );
+                        r.check(
+                            "while a socket made inside that namespace cannot see the name",
+                            said[2] == 1,
+                        );
+                        r.check(
+                            "and the very name is free to take again there: a name is the namespace's",
+                            said[3] == 1,
+                        );
+                        r.check(
+                            "the namespace has abstract names of its own, planted and answered inside it",
+                            said[4] == 1,
+                        );
+                    }
+                    // The other direction, asked from here while the child holds
+                    // its name: the child's name is not this namespace's to find.
+                    let stranger = match socket(AddressFamily::UNIX, SocketType::STREAM, None) {
+                        Ok(probe) => {
+                            connect(&probe, &abstract_addr(INNER)) == Err(Errno::CONNREFUSED)
+                        }
+                        Err(_) => false,
+                    };
+                    r.check(
+                        "a name bound inside the fresh namespace is unknown in the machine's",
+                        stranger,
+                    );
+                    // The control: this side's own table is untouched, so the
+                    // refusal above is the boundary and not a broken registry.
+                    let mine = match socket(AddressFamily::UNIX, SocketType::STREAM, None) {
+                        Ok(probe) => connect(&probe, &abstract_addr(HOME)).is_ok(),
+                        Err(_) => false,
+                    };
+                    r.check("while the machine's own name still answers here", mine);
+                    drop(release_w);
+                    let status = rustix::process::waitpid(
+                        rustix::process::Pid::from_raw(child as i32),
+                        rustix::process::WaitOptions::empty(),
+                    );
+                    r.check(
+                        "and the child that carried the names is reaped",
+                        matches!(&status, Ok(Some((_, st))) if st.exited() && st.exit_status() == Some(0)),
+                    );
+                }
+            }
         }
     }
 

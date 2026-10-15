@@ -31,6 +31,18 @@
 //! still runs dbus on; netlink took the same detour for the same reason
 //! (`socket.rs`'s uevent socket).
 //!
+//! Network namespaces split this module's two tables, and the split is not
+//! the one the family's name suggests. An **abstract** name belongs to the
+//! namespace of the socket that holds it: a name planted in one is
+//! `ECONNREFUSED` from a socket in another, and the same name binds again
+//! there. A **path** is a filesystem object and is not namespaced at all - a
+//! socket bound at a path answers that path from every namespace, both
+//! directions. And what keys the abstract half is the *socket's* namespace
+//! rather than the calling task's, so a socket made before an `unshare` goes
+//! on binding and dialling where it was made. Measured, not read off a page:
+//! `.workbuddy/probe_unix_netns{,2,3}.c`, whose transcript is `docs/notes/`
+//! §6.3. `by_name` carries the namespace; `by_node` deliberately does not.
+//!
 //! Deliberate departures from Linux, each visible from userland:
 //! * `SOCK_SEQPACKET` over AF_UNIX opens - udevd cannot start without it -
 //!   but carries no message boundaries until a `socketpair` connects it: a
@@ -129,6 +141,29 @@ pub struct UnixSock {
     /// a named SEQPACKET is served as the stream and a paired one as the
     /// datagram (`carries_messages` picks the branch).
     typ: u16,
+    /// The network namespace this socket was **made in** - Linux's `sk_net`
+    /// on a unix socket, and the key exactly one of this module's two tables
+    /// reads.
+    ///
+    /// Which table is a measurement rather than a reading of the man page, and
+    /// the two halves of the family differ (`.workbuddy/probe_unix_netns{,2,3}.c`;
+    /// §6.3):
+    ///
+    /// * an **abstract** name belongs to the namespace of the socket that holds
+    ///   it - a name bound in one is `ECONNREFUSED` from a socket in another,
+    ///   and the *same* name binds again there. That is `by_name`;
+    /// * a **path** name is a filesystem object and is not namespaced at all: a
+    ///   socket bound at a path is reachable by that path from every namespace,
+    ///   in both directions. That is `by_node`, which is machine-wide;
+    /// * and it is the *socket's* namespace, not the calling task's: a socket
+    ///   made in one namespace and used from another binds and dials in the
+    ///   one it was made in, which is the same rule the IP stack's handle map
+    ///   keeps (`net`'s `HOMES`) - and the reason this is a field rather than a
+    ///   lookup at the call.
+    ///
+    /// `None` is the machine's own namespace, normalized on the way in, so a
+    /// task that `setns`ed back into it is the same key as one that never left.
+    net_ns: Option<u64>,
     state: Mutex<RefCell<UnixState>>,
 }
 
@@ -233,10 +268,11 @@ enum BoundName {
 }
 
 impl UnixSock {
-    fn new(id: usize, typ: u16, owner: UCred) -> Arc<UnixSock> {
+    fn new(id: usize, typ: u16, owner: UCred, net_ns: Option<u64>) -> Arc<UnixSock> {
         Arc::new(UnixSock {
             id,
             typ,
+            net_ns,
             state: Mutex::new(RefCell::new(UnixState {
                 bound: None,
                 backlog: None,
@@ -619,13 +655,19 @@ struct Registry {
     /// node and asks this map, which is how symlinks, `..` and mounts all
     /// come for free.
     by_node: BTreeMap<(u64, u64), usize>,
-    /// Which live socket holds each abstract name.
+    /// Which live socket holds each abstract name, **per network namespace**.
     ///
-    /// Separate from `by_node` because the two are separate namespaces, and
-    /// keyed on the *socket type* as well as the name because Linux is
+    /// Separate from `by_node` because the two are separate namespaces - and
+    /// separate *from each other* in scope, which is the part the family's own
+    /// shape hides: `by_node` is machine-wide (a path is a filesystem object,
+    /// reachable from every namespace) while this one is keyed by the namespace
+    /// of the socket that holds the name. Both halves measured; the field's own
+    /// note carries the numbers.
+    ///
+    /// Keyed on the *socket type* as well as the name because Linux is
     /// (measured: a datagram `bind` on a stream socket's abstract name answers
     /// 0). A path cannot be shared that way - it is one node.
-    by_name: BTreeMap<(Vec<u8>, u16), usize>,
+    by_name: BTreeMap<(Option<u64>, Vec<u8>, u16), usize>,
     /// The counter behind `autobind`'s generated names. Linux mints an abstract
     /// name for a `bind` that names nothing; the *shape* is what the caller can
     /// observe (five hex characters, `addrlen` 8 from `getsockname`), not the
@@ -639,8 +681,10 @@ struct Slot {
     /// entry without scanning paths.
     key: Option<(u64, u64)>,
     /// The `by_name` key this socket holds, if any - a socket has at most one
-    /// name, so at most one of these two is set.
-    name: Option<(Vec<u8>, u16)>,
+    /// name, so at most one of these two is set. The namespace is part of the
+    /// key, so the release removes the entry the bind made rather than scanning
+    /// the namespaces for one that matches.
+    name: Option<(Option<u64>, Vec<u8>, u16)>,
 }
 
 impl Registry {
@@ -659,12 +703,29 @@ static UNIX: Mutex<RefCell<Registry>> = Mutex::new(RefCell::new(Registry::new())
 /// A fresh socket and its registry slot. Slot numbers are never reused, so
 /// a stale id can only fail its own liveness check, never answer to a
 /// different socket.
+///
+/// The socket is born in the **caller's** network namespace - `socket(2)` is a
+/// creation, and what it makes belongs to whoever asked (Linux's
+/// `unix_create` sets `sock_net` from the same caller). Everything after that
+/// reads the field, so a socket that outlives an `unshare` keeps answering in
+/// the namespace it was made in.
 pub(crate) fn alloc(typ: u16) -> Arc<UnixSock> {
+    alloc_in(crate::net::normalize(crate::sched::current_net_ns()), typ)
+}
+
+/// The same, for a socket that belongs to a namespace the caller is not in:
+/// `accept` mints one in the **listener's** namespace, which is whose name it
+/// answers and whose table a name of its own would land in. Linux's
+/// `unix_accept` does the same (`unix_create1(sock_net(sk), ...)`), and the
+/// difference is observable the moment a namespace's server accepts and the
+/// accepted socket binds: with the accepter's namespace it would plant the name
+/// in the wrong table.
+fn alloc_in(net_ns: Option<u64>, typ: u16) -> Arc<UnixSock> {
     let owner = self_cred();
     critical_section::with(|cs| {
         let mut reg = UNIX.borrow(cs).borrow_mut();
         let id = reg.slots.len() + 1;
-        let sock = UnixSock::new(id, typ, owner);
+        let sock = UnixSock::new(id, typ, owner, net_ns);
         reg.slots.push(Some(Slot {
             socket: Arc::downgrade(&sock),
             key: None,
@@ -732,13 +793,19 @@ pub(crate) fn bind(sock: &Arc<UnixSock>, _node: Arc<dyn Inode>, path: String, ke
 /// the name a stream socket holds, because the two keys are different entries -
 /// and a socket that already has a name answers `EINVAL` whatever the second
 /// name is, which is the refusal `bind_path` makes as well.
+///
+/// The table is the **socket's** namespace's, not the caller's: a socket made in
+/// one namespace and carried into another binds its name at home (measured -
+/// `.workbuddy/probe_unix_netns3.c` bound on a socket carried across an
+/// `unshare` and a socket of the new namespace could not see the name, while a
+/// second socket of the old one could).
 pub(crate) fn bind_name(sock: &UnixSock, name: Vec<u8>) -> isize {
     if sock.is_bound() {
         return err::EINVAL;
     }
     critical_section::with(|cs| {
         let mut reg = UNIX.borrow(cs).borrow_mut();
-        let key = (name.clone(), sock.typ);
+        let key = (sock.net_ns, name.clone(), sock.typ);
         if reg.by_name.contains_key(&key) {
             return err::EADDRINUSE;
         }
@@ -764,7 +831,10 @@ pub(crate) fn bind_autobind(sock: &UnixSock) -> isize {
         loop {
             n = n.wrapping_add(1);
             let candidate = alloc::format!("{n:05x}").into_bytes();
-            if !reg.by_name.contains_key(&(candidate.clone(), sock.typ)) {
+            if !reg
+                .by_name
+                .contains_key(&(sock.net_ns, candidate.clone(), sock.typ))
+            {
                 reg.autobinds = n;
                 return candidate;
             }
@@ -773,15 +843,19 @@ pub(crate) fn bind_autobind(sock: &UnixSock) -> isize {
     bind_name(sock, name)
 }
 
-/// The live socket holding an abstract name, or `None` - which every caller
-/// turns into the answer Linux gives for a name nobody holds.
+/// The live socket holding an abstract name **in namespace `ns`**, or `None` -
+/// which every caller turns into the answer Linux gives for a name nobody
+/// holds.
 ///
-/// The socket *type* is part of the lookup, so a datagram connector cannot find
-/// a stream listener here at all; Linux refuses that pair too.
-fn live_named(name: &[u8], typ: u16) -> Option<Arc<UnixSock>> {
+/// The namespace is the *dialling socket's* own, not the calling task's
+/// (measured: a socket made before an `unshare` and used after it reaches the
+/// names of the namespace it was made in), and the socket *type* is part of the
+/// lookup, so a datagram connector cannot find a stream listener here at all;
+/// Linux refuses that pair too.
+fn live_named(ns: Option<u64>, name: &[u8], typ: u16) -> Option<Arc<UnixSock>> {
     critical_section::with(|cs| {
         let reg = UNIX.borrow(cs).borrow();
-        let id = *reg.by_name.get(&(name.to_vec(), typ))?;
+        let id = *reg.by_name.get(&(ns, name.to_vec(), typ))?;
         reg.slots
             .get(id - 1)?
             .as_ref()
@@ -799,7 +873,7 @@ pub(crate) fn connect_named(sock: &UnixSock, name: &[u8], nonblock: bool) -> isi
     if sock.end_of().is_some() || sock.dgram_connected() {
         return err::EISCONN;
     }
-    let Some(listener) = live_named(name, sock.typ) else {
+    let Some(listener) = live_named(sock.net_ns, name, sock.typ) else {
         return err::ECONNREFUSED;
     };
     let arc = sock_arc(sock);
@@ -1550,8 +1624,10 @@ pub(crate) fn send_dgram(sock: &UnixSock, data: &[u8], dest: Option<&UnixAddr>) 
                 }
                 // An abstract name has no node to resolve and no permission to
                 // check; a name nobody holds answers what a dead node answers
-                // (measured: 111 on Linux for a datagram `sendto`).
-                UnixAddr::Abstract(name) => match live_named(name, sock.typ) {
+                // (measured: 111 on Linux for a datagram `sendto`), and the
+                // name is looked up in the **sender's** namespace, which is the
+                // namespace the table it landed in belongs to.
+                UnixAddr::Abstract(name) => match live_named(sock.net_ns, name, sock.typ) {
                     Some(sock) => sock,
                     None => return err::ECONNREFUSED,
                 },
@@ -1615,7 +1691,10 @@ pub(crate) fn recv_dgram_cred(
 /// has taken its own.
 pub(crate) fn accept_face(listener: &UnixSock, nonblock: bool) -> Result<Arc<UnixSock>, isize> {
     let (end, peer) = accept_once(listener, nonblock)?;
-    let accepted = alloc(listener.typ);
+    // The listener's namespace, not the accepter's: the accepted socket is the
+    // server's other end, and it is the server's table an abstract name of its
+    // own would land in (Linux's `unix_accept` uses `sock_net` of the listener).
+    let accepted = alloc_in(listener.net_ns, listener.typ);
     accepted.with_state_connect(end, peer);
     Ok(accepted)
 }
