@@ -272,7 +272,19 @@ pub fn exit(code: isize) -> ! {
                 .is_handler()
                 || t.task(parent).blocked & sigchld_bit != 0;
             if wants_sigchld {
-                let child_pid = t.task(id).tgid.0 as i32;
+                // The child as the record names it: the number it has *in its
+                // own namespace* - Linux's `task_tgid_vnr(tsk)`. A parent in
+                // the same namespace reads back the number `getpid` gave the
+                // child; a parent one level out reads the child's own number,
+                // which is Linux's wart for a child in a deeper namespace than
+                // its reader.
+                let child_pid = {
+                    let child = t.task(id);
+                    child
+                        .pid_ns
+                        .number_of(child.tgid.0)
+                        .unwrap_or(child.tgid.0 as u32) as i32
+                };
                 queue_signal(
                     t.task_mut(parent),
                     signal::SIGCHLD,
@@ -741,6 +753,19 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
     let child_id = with_table(|t| {
         let slot = t.alloc_slot();
         drop_retired(TaskId(slot));
+        // Which namespace this child is born into - and, under
+        // `CLONE_NEWPID`, the namespace it *is*: Linux's `copy_process` puts
+        // the child in its creator's `pid_ns_for_children`, and the flag hands
+        // the child a fresh namespace of its own to be the init of. Either way
+        // the child is registered in that namespace and every one above it,
+        // which is what lets this parent `wait` for it and find it in `/proc`
+        // under a number of its own.
+        let child_pid_ns = if request.flags & crate::abi::CLONE_NEWPID != 0 {
+            crate::pidns::PidNs::child(&t.task(parent_id).pid_ns_children, crate::vfs::ns::mint())
+        } else {
+            Arc::clone(&t.task(parent_id).pid_ns_children)
+        };
+        super::adopt_pid(TaskId(slot), &child_pid_ns);
 
         let stack = Stack::new();
         // Interrupts stay off in the child until its `iretq` restores the
@@ -942,6 +967,12 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             } else {
                 Arc::clone(&t.task(parent_id).uts)
             },
+            // Born in the namespace computed above, and its own children will
+            // be born in the same one until it unshares - so both fields start
+            // out equal, which is what makes an ordinary `fork` a no-op here
+            // and `CLONE_NEWPID` the only thing that moves either.
+            pid_ns: Arc::clone(&child_pid_ns),
+            pid_ns_children: child_pid_ns,
             oom_score_adj: t.task(parent_id).oom_score_adj,
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
             nice: t.task(parent_id).nice,
@@ -1276,6 +1307,8 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         // the creator's `nsproxy` - so a thread that unshared would split from
         // its own process, which is not what a thread is.
         let uts = alloc::sync::Arc::clone(&parent.uts);
+        let pid_ns = alloc::sync::Arc::clone(&parent.pid_ns);
+        let pid_ns_children = alloc::sync::Arc::clone(&parent.pid_ns_children);
         // `CLONE_FS` is what every `pthread_create` sets: a thread that
         // `chdir`s moves its process, which is Linux's answer (measured -
         // `.workbuddy/probe_unshare_flags.c`). A raw `clone(CLONE_THREAD)`
@@ -1316,6 +1349,15 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
 
         let slot = t.alloc_slot();
         drop_retired(TaskId(slot));
+        // A thread is its process, so it is a member of the namespace the
+        // process is in - not of the one the process's *children* go to, which
+        // `unshare(CLONE_NEWPID)` may have moved somewhere else. That is the
+        // same rule `CLONE_THREAD` follows for the names above it, and why the
+        // verdict refuses `CLONE_THREAD | CLONE_NEWPID`: a thread cannot be the
+        // init of a namespace its process is not in.
+        // (`pid_ns` was cloned before the slot was taken, so this does not
+        // hold the table's immutable borrow across `alloc_slot`.)
+        super::adopt_pid(TaskId(slot), &pid_ns);
 
         let stack = Stack::new();
         // Interrupts stay off until the thread's `iretq` restores the flags it
@@ -1387,6 +1429,8 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             // under `CLONE_FS`, a copy without it.
             identity,
             uts,
+            pid_ns,
+            pid_ns_children,
             oom_score_adj,
             oom_score_adj_min,
             nice,

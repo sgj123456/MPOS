@@ -22,7 +22,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::sched::{TaskId, WaitEnd};
+use crate::sched::WaitEnd;
 use crate::syscall::{ARG_COUNT, buffer_ok, err};
 
 /// The x86_64 page size, as the memory calls here round with it.
@@ -356,8 +356,11 @@ pub fn handle_capget(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     // caller, and a name that is not a live task is ESRCH - the state of
     // nobody. The caller's own pid is accepted too, which is the shape a
     // libc's wrapper hands over.
-    if pid != 0 && pid != crate::sched::current_tgid().0 as i32 {
-        if crate::sched::snapshot(pid.unsigned_abs() as usize).is_none() {
+    // The number is the caller's namespace's: the caller's own is recognized by
+    // resolving it, and any other must name a live task *there* - which is what
+    // replaces the old "the number is a slot" test.
+    if pid != 0 && super::proc::pid_task(pid as isize) != Some(crate::sched::current_tgid()) {
+        if super::proc::pid_task(pid as isize).is_none() {
             return err::ESRCH;
         }
     }
@@ -414,7 +417,7 @@ pub fn handle_capset(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             ((header + 4) as *const i32).read_unaligned(),
         )
     };
-    if pid != 0 && pid != crate::sched::current_tgid().0 as i32 {
+    if pid != 0 && super::proc::pid_task(pid as isize) != Some(crate::sched::current_tgid()) {
         return err::EPERM;
     }
     let record_bytes = match version {
@@ -690,7 +693,10 @@ pub fn handle_getpriority(args: [usize; ARG_COUNT]) -> isize {
             let pid = if who == 0 {
                 crate::sched::current().0
             } else {
-                who
+                match super::proc::pid_task(who as isize) {
+                    Some(id) => id.0,
+                    None => return err::ESRCH,
+                }
             };
             crate::sched::nice_of(pid).map(|n| alloc::vec![n])
         }
@@ -698,8 +704,13 @@ pub fn handle_getpriority(args: [usize; ARG_COUNT]) -> isize {
             let pgid = if who == 0 {
                 crate::sched::pgid_of(crate::sched::current())
             } else {
-                Some(crate::sched::TaskId(who))
+                // A group number is the number of the task that leads it, read
+                // in the caller's namespace.
+                super::proc::pid_task(who as isize).and_then(crate::sched::pgid_of)
             };
+            if who != 0 && pgid.is_none() {
+                return err::ESRCH;
+            }
             pgid.map(|g| {
                 crate::sched::group_members(g)
                     .into_iter()
@@ -778,8 +789,12 @@ pub fn handle_setpriority(args: [usize; ARG_COUNT]) -> isize {
             let pgid = if who == 0 {
                 crate::sched::pgid_of(crate::sched::current())
             } else {
-                Some(crate::sched::TaskId(who))
+                // The group's leader, named in the caller's namespace.
+                super::proc::pid_task(who as isize).and_then(crate::sched::pgid_of)
             };
+            if who != 0 && pgid.is_none() {
+                return err::ESRCH;
+            }
             let members = pgid.map(crate::sched::group_members).unwrap_or_default();
             if members.is_empty() {
                 return err::ESRCH;
@@ -1138,6 +1153,13 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
                 // above, and `t-ns-mnt` holds both halves of the divergence.
                 crate::sched::unshare_mnt();
             }
+            if bits & crate::syscall::linux::nr::CLONE_NEWPID != 0 {
+                // The caller's *children* move into the new namespace: the
+                // first of them will be 1 there, and the caller keeps the
+                // number it had. See `sched::unshare_pid` for why the two are
+                // different fields.
+                crate::sched::unshare_pid();
+            }
             if bits & crate::syscall::linux::nr::CLONE_FS != 0 {
                 crate::sched::unshare_fs();
             }
@@ -1195,6 +1217,7 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
     }
     match namespace {
         crate::vfs::ns::Namespace::Mount(table) => crate::sched::setns_mnt(table),
+        crate::vfs::ns::Namespace::Pid(pidns) => crate::sched::setns_pid(pidns),
         crate::vfs::ns::Namespace::Uts(uts) => crate::sched::setns_uts(uts),
     }
     0
@@ -1330,16 +1353,20 @@ pub fn handle_tgkill(args: [usize; ARG_COUNT]) -> isize {
     if sig > crate::sched::signal::MAX_SIGNAL as usize {
         return err::EINVAL;
     }
-    if tid <= 0 || tid as usize >= crate::sched::MAX_TASKS {
-        return err::ESRCH;
-    }
-    let Some(snap) = crate::sched::snapshot(tid as usize) else {
+    // Both names are read in the caller's namespace: the thread's own number
+    // and the group it must belong to. Resolving each first is what makes a
+    // number from another namespace `ESRCH` rather than a signal to whichever
+    // task wears that slot.
+    let (Some(tid), Some(tgid)) = (super::proc::pid_task(tid), super::proc::pid_task(tgid)) else {
         return err::ESRCH;
     };
-    if snap.pid != tgid as usize {
+    let Some(snap) = crate::sched::snapshot(tid.0) else {
+        return err::ESRCH;
+    };
+    if snap.pid != tgid.0 {
         return err::ESRCH;
     }
-    if crate::sched::send_signal(TaskId(tid as usize), sig as u8) {
+    if crate::sched::send_signal(tid, sig as u8) {
         0
     } else {
         err::ESRCH
@@ -1363,15 +1390,19 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
         return err::EFAULT;
     }
     let si_code = unsafe { ((uinfo + 8) as *const i32).read_unaligned() };
-    if tgid != crate::sched::current_tgid().0 as isize && si_code >= 0 {
+    let target = super::proc::pid_task(tgid);
+    if target != Some(crate::sched::current_tgid()) && si_code >= 0 {
         return err::EPERM;
     }
-    if tgid <= 0 || tgid as usize >= crate::sched::MAX_TASKS {
+    let Some(target) = target else {
         return err::ESRCH;
-    }
+    };
+    // The sender, as the record names it: its *own* number, which is what Linux
+    // writes (`task_tgid_vnr(current)`) and what a receiver in the same
+    // namespace reads back as the sender's `getpid`.
     let (pid, uid) = {
         let cur = crate::sched::current_identity();
-        (crate::sched::current_tgid().0 as i32, cur.ruid as i32)
+        (crate::sched::current_pid_number() as i32, cur.ruid as i32)
     };
     // `union sigval` sits at offset 24 of `siginfo_t` on x86_64; an `SI_QUEUE`
     // sender put its word there. The buffer was validated readable above, so
@@ -1382,7 +1413,7 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     } else {
         crate::sched::signal::SigInfo::user(sig as u8, pid, uid)
     };
-    if crate::sched::send_signal_info(TaskId(tgid as usize), sig as u8, info) {
+    if crate::sched::send_signal_info(target, sig as u8, info) {
         0
     } else {
         err::ESRCH

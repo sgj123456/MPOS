@@ -667,6 +667,30 @@ fn current_pid() -> usize {
     1
 }
 
+/// The number the **reader** sees for a task, given the slot it lives in.
+///
+/// `/proc` is one tree that two readers can walk into two different answers,
+/// because a pid namespace gives one task two numbers. The rule is the whole
+/// feature in one line - *the number is the reader's* - and it is applied at
+/// the two funnels below (which names a directory has, and which directory a
+/// name resolves to) plus at every place this file *prints* an id, so that a
+/// `/proc/<pid>/status` and the directory it came from cannot disagree.
+///
+/// Falls back to the slot for a task the reader's namespace does not contain,
+/// which cannot happen for a task the reader just found in its own tree: the
+/// fallback is here so a disagreement answers a number rather than stopping the
+/// machine.
+fn reader_number(slot: usize) -> usize {
+    crate::sched::pid_number_of(crate::sched::TaskId(slot)).map_or(slot, |n| n as usize)
+}
+
+/// The slot a number written by the **reader** names, if it names a live task
+/// at all - the inverse of [`reader_number`], and where a number from another
+/// namespace stops being a name.
+fn reader_task(number: usize) -> Option<usize> {
+    crate::sched::resolve_pid(number as i64).map(|id| id.0)
+}
+
 /// Every process id, in the order the task table holds them. Threads are left
 /// out: a process *is* its leader's id, and listing a thread's tid beside it
 /// would be two names for one process.
@@ -675,7 +699,7 @@ fn process_ids() -> Vec<usize> {
     crate::sched::snapshots()
         .into_iter()
         .filter(|task| task.pid == task.tid)
-        .map(|task| task.pid)
+        .map(|task| reader_number(task.pid))
         .collect()
 }
 
@@ -814,16 +838,17 @@ fn task(_pid: usize) -> Option<Process> {
 fn stat_line(pid: usize, tid: usize) -> Option<String> {
     let task = task(tid)?;
     let shown = if tid == task.pid { task.pid } else { tid };
+    let shown = reader_number(shown);
     let kb = task.rss_pages * 4096 / 1024;
     let fields: [alloc::borrow::Cow<'_, str>; 52] = [
         Cow::Owned(alloc::format!("{}", shown)),
         Cow::Owned(alloc::format!("({})", task.comm)),
         Cow::Owned(alloc::format!("{}", task.state)),
-        Cow::Owned(alloc::format!("{}", task.ppid)),
-        Cow::Owned(alloc::format!("{}", task.pgid)),
+        Cow::Owned(alloc::format!("{}", reader_number(task.ppid))),
+        Cow::Owned(alloc::format!("{}", reader_number(task.pgid))),
         // session: no `setsid` has ever been answered with a group of its
         // own, so the process group is the closest thing there is.
-        Cow::Owned(alloc::format!("{}", task.pgid)),
+        Cow::Owned(alloc::format!("{}", reader_number(task.pgid))),
         // tty_nr: 0, "no controlling terminal". Everything on this machine
         // types at the one console, and claiming a terminal number that no
         // entry in /dev carries would send `ps` looking for a name it cannot
@@ -1191,10 +1216,10 @@ fn status_of(pid: usize) -> Option<String> {
          nonvoluntary_ctxt_switches:\t0\n",
         name = task.comm,
         state = task.state,
-        tgid = task.pid,
-        pid = task.pid,
-        ppid = task.ppid,
-        pgid = task.pgid,
+        tgid = reader_number(task.pid),
+        pid = reader_number(task.pid),
+        ppid = reader_number(task.ppid),
+        pgid = reader_number(task.pgid),
         threads = task.threads,
     ))
 }
@@ -1458,12 +1483,14 @@ impl Dynamic for Threads {
     fn names(&self) -> Vec<(String, NodeKind)> {
         thread_ids(self.pid)
             .into_iter()
-            .map(|tid| (alloc::format!("{tid}"), NodeKind::Dir))
+            .map(|tid| (alloc::format!("{}", reader_number(tid)), NodeKind::Dir))
             .collect()
     }
 
     fn node(&self, name: &str) -> Option<Arc<dyn Inode>> {
-        let tid = name.parse::<usize>().ok()?;
+        // A tid is namespaced exactly as a pid is, so the number is read in the
+        // reader's namespace and the directory it names is the thread's.
+        let tid = reader_task(name.parse::<usize>().ok()?)?;
         if !thread_ids(self.pid).contains(&tid) {
             return None;
         }
@@ -1575,8 +1602,12 @@ impl Dynamic for Processes {
     }
 
     fn node(&self, name: &str) -> Option<Arc<dyn Inode>> {
-        let pid = name.parse::<usize>().ok()?;
-        process_dir(pid)
+        // The number in the *reader's* namespace, turned back into the task it
+        // names there: `/proc/1` inside a namespace is that namespace's first
+        // child, and the same path outside names the machine's init. A number
+        // the reader's namespace does not contain is not a directory at all.
+        let number = name.parse::<usize>().ok()?;
+        process_dir(reader_task(number)?)
     }
 }
 

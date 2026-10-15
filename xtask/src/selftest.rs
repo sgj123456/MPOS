@@ -183,6 +183,7 @@ const LEAF_CRATES: &[&str] = &[
     "mpos-binfmt",
     "mpos-cred",
     "mpos-uts",
+    "mpos-pidns",
     "mpos-seccomp",
     "mpos-blk",
     "mpos-pci",

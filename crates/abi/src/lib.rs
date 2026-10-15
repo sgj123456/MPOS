@@ -266,8 +266,21 @@ pub fn rlimit_admit(old: Rlimit, new: Rlimit, is_root: bool) -> Result<Rlimit, i
 /// `sched → syscall` edge is exactly the V-* class Phase 11 keeps at zero. The
 /// namespace bits it consults are defined above, so the rule has one home.
 pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isize> {
-    const SERVED: usize = CLONE_NEWUTS | CLONE_NEWNS;
+    const SERVED: usize = CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID;
     let asked = flags & CLONE_NAMESPACES;
+    // A thread cannot be the init of a namespace its own process is not in, and
+    // a pid namespace's whole content *is* the number the child is given - so
+    // `CLONE_THREAD | CLONE_NEWPID` is a request whose two halves contradict
+    // each other, and Linux refuses it `EINVAL` rather than choosing one. It is
+    // decided here, before the privilege question: this is the request being
+    // impossible, not the caller lacking a capability. Not measured on this
+    // sandbox - creating a pid namespace needs `CAP_SYS_ADMIN`, which it does
+    // not have (`.workbuddy/probe_pidns.c`: `unshare(CLONE_NEWPID)` -> `EPERM`)
+    // - so this is Linux's documented rule rather than an observation, and the
+    // named divergence to check first if a caller ever disagrees.
+    if flags & CLONE_THREAD != 0 && asked & CLONE_NEWPID != 0 {
+        return Err(mpos_err::EINVAL);
+    }
     if asked != 0 && !privileged {
         return Err(mpos_err::EPERM);
     }
@@ -355,9 +368,22 @@ mod tests {
         // caller holds - the byte `fork` is built from is not a namespace.
         assert_eq!(clone_namespace_verdict(0, true), Ok(()));
         assert_eq!(clone_namespace_verdict(0, false), Ok(()));
+        // PID is served now (`sched::clone` gives the child a fresh namespace
+        // when the flag is set), so the refused case moved to the kinds this
+        // kernel still has no copy for - the drift a hardcoded served set always
+        // has, recorded the same way in `t-caps` and `t-posix`.
+        assert_eq!(clone_namespace_verdict(CLONE_NEWPID, true), Ok(()));
         assert_eq!(
-            clone_namespace_verdict(CLONE_NEWPID, true),
-            Err(mpos_err::EOPNOTSUPP)
+            clone_namespace_verdict(CLONE_NEWPID, false),
+            Err(mpos_err::EPERM)
+        );
+        // And the one word whose halves contradict each other: a thread cannot
+        // be the init of a namespace its own process is not in, so this is
+        // `EINVAL` - the request, not the privilege - even for a caller that
+        // holds `CAP_SYS_ADMIN`.
+        assert_eq!(
+            clone_namespace_verdict(CLONE_THREAD | CLONE_NEWPID, true),
+            Err(mpos_err::EINVAL)
         );
         assert_eq!(
             clone_namespace_verdict(CLONE_NEWNET, true),

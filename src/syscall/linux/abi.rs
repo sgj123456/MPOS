@@ -1357,11 +1357,13 @@ pub(crate) fn unshare_verdict(
         | n::CLONE_THREAD
         | n::CLONE_SYSVSEM;
 
-    /// The namespace kinds this kernel can isolate observably. Two now — the
-    /// names, and the mount table (`t-ns-mnt` holds MNT's "child differs *and*
-    /// the parent does not"). The build order and the reason for it are the
-    /// plan's §6.3; MNT landed at step 1 of that ladder.
-    const SERVED: usize = n::CLONE_NEWUTS | n::CLONE_NEWNS;
+    /// The namespace kinds this kernel can isolate observably. Three now — the
+    /// names, the mount table (`t-ns-mnt` holds MNT's "child differs *and* the
+    /// parent does not"), and the **numbers** (`t-ns-pid`, which holds the same
+    /// pair for a pid: the child's `getpid` is 1 and `/proc/1` is that child,
+    /// while the parent's number is unchanged). The build order and the reason
+    /// for it are the plan's §6.3; PID is the third rung of that ladder.
+    const SERVED: usize = n::CLONE_NEWUTS | n::CLONE_NEWNS | n::CLONE_NEWPID;
 
     // `CAP_SYS_ADMIN` is the gate on every privileged namespace kind, asked
     // of the caller's *effective capability set* — the question the credential
@@ -2125,8 +2127,14 @@ pub(crate) fn handle_prlimit64(args: [usize; crate::syscall::ARG_COUNT], from_us
         None
     };
 
+    // The number is read in the caller's namespace, like every other pid this
+    // kernel is handed: inside a namespace `getpid()` answers 1, so a caller
+    // asking about *itself* - `get_robust_list(getpid(), ..)`,
+    // `fgetaffinity(getpid(), ..)` - has to have that 1 resolved back to the
+    // slot rather than compared against one.
     #[cfg(target_os = "none")]
-    let is_self = pid == 0 || pid as usize == crate::sched::current_tgid().0;
+    let is_self =
+        pid == 0 || crate::sched::resolve_pid(pid as i64) == Some(crate::sched::current_tgid());
     // A host build has no processes, so every request is the current one.
     #[cfg(not(target_os = "none"))]
     let is_self = true;
@@ -2279,8 +2287,14 @@ pub(crate) fn handle_set_robust_list(args: [usize; crate::syscall::ARG_COUNT]) -
 /// reach.
 pub(crate) fn handle_get_robust_list(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     let (pid, head_out, len_out) = (args[0] as i32, args[1], args[2]);
+    // The number is read in the caller's namespace, like every other pid this
+    // kernel is handed: inside a namespace `getpid()` answers 1, so a caller
+    // asking about *itself* - `get_robust_list(getpid(), ..)`,
+    // `fgetaffinity(getpid(), ..)` - has to have that 1 resolved back to the
+    // slot rather than compared against one.
     #[cfg(target_os = "none")]
-    let is_self = pid == 0 || pid as usize == crate::sched::current_tgid().0;
+    let is_self =
+        pid == 0 || crate::sched::resolve_pid(pid as i64) == Some(crate::sched::current_tgid());
     // A host build has no processes, so every request is the current one.
     #[cfg(not(target_os = "none"))]
     let is_self = true;
@@ -3235,9 +3249,10 @@ mod tests {
         assert_eq!(unshare_verdict(0, true, false), Ok(0));
         assert_eq!(unshare_verdict(0, false, false), Ok(0));
 
-        // The two served namespaces — the names, and the mount table (§6.3's
-        // step 1): each granted with the privilege, refused without it, and the
-        // verdict names the bits so the handler copies exactly what was granted.
+        // The three served namespaces — the names, the mount table and the
+        // numbers (§6.3's ladder): each granted with the privilege, refused
+        // without it, and the verdict names the bits so the handler copies
+        // exactly what was granted.
         assert_eq!(
             unshare_verdict(n::CLONE_NEWUTS, true, false),
             Ok(n::CLONE_NEWUTS)
@@ -3254,6 +3269,25 @@ mod tests {
             unshare_verdict(n::CLONE_NEWNS, false, false),
             Err(err::EPERM)
         );
+        // The third rung: `unshare(CLONE_NEWPID)` renumbers the caller's
+        // children. Granting it is `Ok` with the bit, and the *handler* is what
+        // decides that only the children move (`sched::unshare_pid`).
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWPID, true, false),
+            Ok(n::CLONE_NEWPID)
+        );
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWPID, false, false),
+            Err(err::EPERM)
+        );
+        assert_eq!(
+            unshare_verdict(
+                n::CLONE_NEWUTS | n::CLONE_NEWNS | n::CLONE_NEWPID,
+                true,
+                false
+            ),
+            Ok(n::CLONE_NEWUTS | n::CLONE_NEWNS | n::CLONE_NEWPID)
+        );
         // An unserved kind asked by an unprivileged caller answers `EPERM`,
         // not `EOPNOTSUPP` — Linux's order, measured, and the reason the two
         // checks sit in this sequence above.
@@ -3267,15 +3301,19 @@ mod tests {
             Ok(n::CLONE_NEWUTS | n::CLONE_NEWNS)
         );
 
-        // The six this kernel has one of and no way to make a second. Served
-        // namespace or not, the answer is the same for both privileged and
-        // unprivileged callers: this is not a permissions answer.
+        // The five this kernel has nothing behind, so it refuses them whole
+        // rather than handing over a namespace whose contents are the old
+        // one's. Served namespace or not, the answer is the same for privileged
+        // and unprivileged callers: this is not a permissions answer.
+        //
+        // PID left this list when it was built, which is the shape §6.3 records
+        // twice: a test that hardcodes the served set goes red the moment the
+        // set grows, and the *expectation* moves with the measurement.
         for bit in [
             n::CLONE_NEWTIME,
             n::CLONE_NEWCGROUP,
             n::CLONE_NEWIPC,
             n::CLONE_NEWUSER,
-            n::CLONE_NEWPID,
             n::CLONE_NEWNET,
         ] {
             assert_eq!(
@@ -3292,13 +3330,15 @@ mod tests {
         // A word that mixes a served kind with an unserved one is refused
         // whole - `Err`, so the handler copies nothing - where Linux's
         // `ksys_unshare` would already have unshared the first part by the time
-        // the second failed.
+        // the second failed. The unserved half is `CLONE_NEWNET` because the
+        // word used to be `NEWNS | NEWPID`, which became a legal pair the
+        // moment PID landed - the same drift §6.3 records for `NEWUTS | NEWNS`.
         assert_eq!(
-            unshare_verdict(n::CLONE_NEWNS | n::CLONE_NEWPID, true, false),
+            unshare_verdict(n::CLONE_NEWPID | n::CLONE_NEWNET, true, false),
             Err(err::EOPNOTSUPP)
         );
         assert_eq!(
-            unshare_verdict(n::CLONE_NEWPID | n::CLONE_NEWNS, false, false),
+            unshare_verdict(n::CLONE_NEWNET | n::CLONE_NEWPID, false, false),
             Err(err::EPERM),
             "the privilege is consulted before the kind is — Linux's order"
         );

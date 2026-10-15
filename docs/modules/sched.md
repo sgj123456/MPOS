@@ -56,6 +56,13 @@ filter list (`HOST_SECCOMP_STRICT`, `HOST_SECCOMP_FILTERS`), the UTS namespace (
 `descriptor_numbers` answer the honest "no task table" value. `mod.rs`'s tests pin the one behaviour
 that is observable on such a build (`unshare_uts`'s copy semantics).
 
+The PID namespace's two translations are host stand-ins for a different reason: with no task table
+and no namespaces, every task is in the *init* namespace, whose numbers are the slots - so
+`pid_number_of` and `resolve_pid` are the identity there, which is exactly what they are on a
+machine that never unshares. That is what lets `/proc`'s rendering and `signalfd`'s record call the
+one rule instead of carrying a `#[cfg]` pair each (the `crates/pidns` leaf holds the tables
+themselves, and its own seven cases run under `cargo test`).
+
 The registers are deliberately *not* `sched`'s. A stopped task's register file is carried by value
 as `hal::AbiRegs`, sized by `hal::Contexts::ABI_REG_COUNT`, and the only code here that looks inside
 one does so through the machine's `to_user_regs`/`from_user_regs` — the same code is right on a

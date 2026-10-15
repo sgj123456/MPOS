@@ -393,23 +393,25 @@ fn main() {
     }
 
     // An unserved kind on `clone` answers the same refusal `unshare` gives it:
-    // PID has no second instance to hand a child yet. The word is
-    // `libc::CLONE_NEWPID` rather than a literal, and that is a correction: the
+    // the network stack has no second instance to hand a child yet. The word is
+    // `libc::CLONE_NEWNET` rather than a literal, and that is a correction: the
     // first draft wrote `0x0008_0000` here with `CLONE_NEWPID` in the comment,
     // which is `CLONE_SETTLS` — so the call started a child with a thread
     // pointer the register happened to hold, and the guest reported the child's
-    // page fault at `0xfffffffffffffff8` instead of a clean refusal. The errno
+    // page fault at `0xfffffffffffffff8` instead of a clean refusal. The word
+    // *was* `CLONE_NEWPID` until PID landed, at which point it became a served
+    // flag and this claim's subject moved to the next unserved kind. The errno
     // comes through `fix()` for the protocol reason above it.
-    let cloned_pid = fix(unsafe {
+    let cloned_net = fix(unsafe {
         libc::syscall(
             libc::SYS_clone,
-            (libc::CLONE_NEWPID as usize | libc::SIGCHLD as usize) as libc::c_long,
+            (libc::CLONE_NEWNET as usize | libc::SIGCHLD as usize) as libc::c_long,
             0isize as libc::c_long,
         )
     });
     r.check(
-        "clone(CLONE_NEWPID) is refused whole, not half-served",
-        cloned_pid == -(Errno::OPNOTSUPP.raw_os_error() as isize),
+        "clone(CLONE_NEWNET) is refused whole, not half-served",
+        cloned_net == -(Errno::OPNOTSUPP.raw_os_error() as isize),
     );
 
     r.finish()

@@ -286,8 +286,12 @@ fn main() {
     // one, and that child ran the rest of this program with whatever the
     // register happened to hold as its thread pointer. A hand-written flag table
     // is a second source of truth for a number a maintained one already has.
+    // PID left this list when it was built: `clone(CLONE_NEWPID)` now starts a
+    // child in a namespace of its own rather than refusing the word, and the
+    // pair that makes it observable - the child's `getpid` is 1 and `/proc/1`
+    // is that child while the parent's number is unchanged - is `t-ns-pid`'s
+    // subject, one program per rung of §6.3's ladder.
     let names: &[(&str, usize)] = &[
-        ("PID", libc::CLONE_NEWPID as usize),
         ("NET", libc::CLONE_NEWNET as usize),
         ("IPC", libc::CLONE_NEWIPC as usize),
     ];

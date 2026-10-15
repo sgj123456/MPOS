@@ -304,6 +304,12 @@ pub mod uaccess;
 /// nothing here needs hardware, and the wire format is worth testing
 /// on the host.
 pub mod uevent;
+/// The PID namespace: the numbers a task is known by *inside* a namespace, as
+/// the object a task holds rather than as the slot number it happens to be.
+/// Its own leaf crate (two maps and a cursor, host-tested); whose namespace is
+/// whose is the task table's, and the two directions of the translation are the
+/// syscall layer's, so both are bare metal.
+pub use mpos_pidns as pidns;
 /// uinput's interface: the requests and bitmaps a userspace program declares an
 /// input device with. Its own leaf crate, and it depends on the evdev crate for
 /// one constant - the size of a `struct input_event`, the unit both families

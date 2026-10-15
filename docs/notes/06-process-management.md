@@ -498,6 +498,102 @@ green (kernel 533, `mpos-xtask` 116); `fmt --check` clean; `clippy` clean on
 `x86_64-unknown-none`, `-linux-gnu` and `aarch64-unknown-none`; `depgraph` within
 the ratchet. `t-unshare-fs`'s nine claims pass on both machines.
 
+**Step 4, landed: PID — the numbers a process sees, and the half that keeps them from
+being a footgun.**
+
+The third rung of the ladder is built: `CLONE_NEWPID` is served by `unshare`, `setns` and
+`clone`, and the number a program reads out of `getpid(2)`, writes into `kill(2)` and walks
+`/proc/<n>` by is now *the reader's namespace's* rather than the machine's.
+
+**The object.** `crates/pidns` (a leaf, host-tested, 7 cases) holds what a PID namespace is:
+two maps - number→slot and slot→number - and a cursor. Three decisions inside it are the whole
+design. **The init namespace is an identity map that stores nothing**, so a machine that never
+unshares is byte-for-byte what it was before this crate existed (and it is Linux's own shape:
+the init namespace's numbers *are* the global ones). **A task is registered at every level of
+its chain** - its own namespace and every ancestor - which is what lets a parent one level out
+`wait` for a child that lives in a deeper namespace and find it in `/proc`. And **numbers are
+never reused**: Linux's answer to "who is this number" is a refcounted `struct pid`, which this
+kernel does not build, so the conservative half is taken instead - a released number is *spent*,
+and a caller that forgets to release one leaks a number rather than handing a stale promise to
+an unrelated task. That gap is named, not closed (§7.1's promise problem is unmoved by this).
+
+**Two fields on `Task`, because Linux has two**: `pid_ns` (the numbers the task's *own*
+`getpid` comes from) and `pid_ns_children` (where its children are created - Linux's
+`nsproxy->pid_ns_for_children`). The pair is the whole of "the call renumbers the caller's
+children and not the caller": `unshare(CLONE_NEWPID)` and `setns(fd, CLONE_NEWPID)` replace the
+second only, so the task that asked keeps answering with the number it had. A first draft of
+this step had one field and would have had to special-case the caller's own `getpid` out of a
+namespace it had just been moved into; the second field is what makes that unnecessary rather
+than merely awkward.
+
+**The half that is not optional.** Renumbering without resolving *arguments* would hand a
+correct program a footgun: inside a namespace `getpid()` answers 1, so the very next line a
+program writes - `kill(getpid(), ...)`, `waitpid(getpid(), ...)` - would be read as the machine's
+slot 1, its init. So the same commit translates every pid the caller writes, in the caller's
+namespace, and every pid it is handed back: `kill` (single and group), `tgkill`,
+`rt_sigqueueinfo`, `wait4`/`waitid` (argument and answer), `setpgid`/`getpgid`/`getsid`/`setsid`,
+`ptrace`, `process_vm_readv`/`writev`, the priority pair, the affinity pair, the robust-list
+pair, `capget`/`capset`, `timer_create`'s `SIGEV_THREAD_ID`, and the terminal's `TIOCSPGRP`/
+`TIOCGPGRP`. The `pid >= MAX_TASKS` bounds that stood in for "no such task" came out with them:
+they were the *init* namespace's spelling of that answer, and a namespace's numbers are its own.
+A number that names nothing where the caller stands is `ESRCH` (or `ECHILD` for `wait`) - never
+another task.
+
+**`/proc` is one tree with per-reader answers.** The rule is applied at two funnels - which
+names a directory has (`process_ids`, `Threads::names`) and which directory a name resolves to
+(`Processes::node`, `Threads::node`) - plus at every place the file *prints* an id (`stat`'s own
+id, its parent and its group; `status`'s `Pid`/`Tgid`/`PPid`/`NSpgid`), so a directory and the
+numbers inside it cannot disagree. `/proc/<pid>/ns/pid` is Linux's `pidns_get`: it names the
+namespace the task *is in*, while a `setns` against that descriptor moves the namespace its
+*children* go to - the asymmetry is Linux's, and it is why `setns(/proc/self/ns/pid)` is a
+working no-op.
+
+**What was reasoned rather than measured, and why that is written down.** This sandbox cannot
+create a PID namespace: `CapEff` is 0, so `unshare(CLONE_NEWPID)` answers `EPERM` for root and
+`unshare --pid --fork` fails the same way (`.workbuddy/probe_pidns.c`, which still measures what
+it can - `/proc/<pid>/status` carries `NSpid`, and `/proc/<pid>/ns` lists only the kinds the
+machine actually has). Every semantic above therefore comes from this section's design record
+and Linux's rules, not from an observation here. Two consequences are *named*: the
+`si_pid` a signal carries is the **sender's own** number (Linux's `task_tgid_vnr(current)`), so
+a receiver one level out may read a number from a namespace it cannot see - Linux's own wart,
+kept rather than smoothed over; and `CLONE_THREAD | CLONE_NEWPID` is refused `EINVAL` on the
+same reasoning (a thread cannot be the init of a namespace its process is not in), decided
+before the privilege question because the *request* is impossible.
+
+**What the machinery caught, in order.** (1) `xtask`'s host stage names every leaf crate and
+fails when one is compiled and never tested - the new crate was left out of `LEAF_CRATES`, and
+the gate said so in one line rather than letting `mpos-pidns`'s seven cases sit unrun. (2) Four
+programs had the *served set* written down as a constant and went red the moment it grew:
+`t-caps` (which asked for `EOPNOTSUPP` from `CLONE_NEWPID`), `t-ns-mnt` (which pinned
+`clone(CLONE_NEWPID)` as the refused word), `t-ns-setns` (which used `CLONE_NEWPID` as "a word
+that is no namespace bit") and `t-clone` (which listed PID among the refused kinds) - each
+moved to an unserved kind, which is the third time this file records that drift (§6.3 counted
+two for MNT). (3) The host unit tests of both verdicts named PID as refused and were moved with
+the measurement, including the mixed word (`NEWNS | NEWPID` became a legal pair, so the
+"refused whole" case moved to `NEWPID | NEWNET`).
+
+**Gate.** x86_64 `=== SUMMARY pass=172 fail=0 (172 built)` with the kernel's own
+`mpos-kunit 32 passed, 0 failed` and exit 0; aarch64 `=== SUMMARY pass=171 fail=0`, the same 32
+cases, exit 0. The new pin runs in both default sweeps, and each arm's count is one higher than
+the commit before this one. Host suites: 537 in the kernel, 7 in `mpos-pidns` (its own leaf
+crate, named in `xtask`'s `LEAF_CRATES` - see above), 6 in `mpos-abi`, 121 in `xtask`; clippy
+reports 0 errors on `x86_64-unknown-none`, `aarch64-unknown-none`, the host lib and the two
+touched leaf crates; `cargo xtask depgraph` is within the ratchet, which is the one thing a
+namespace does not move: the edges are the same ones, named from the same places.
+
+**Named gaps, each with what it waits on.** A namespace's pid 1 dying does not zap the
+namespace (Linux's `zap_pid_ns_processes`, which kills every member) - and because numbers are
+never reused here, a namespace whose init died goes on numbering rather than refusing. Nested
+namespaces work by construction but are pinned at one level only. `/proc/<pid>/status`'s `NSpid`
+still shows the reader's number rather than the whole chain. A record lock's `l_pid` is the
+machine's number of its holder (Linux stores the *setter's* number at set time, which is the
+same choice, with the same cross-namespace ambiguity). Group *numbering* is not per-namespace:
+`kill(-n)` now resolves `n` as a pid in the caller's namespace, but a group is still named by its
+leader's id, so a namespace's groups are its leaders' numbers. And a `/proc` mounted inside
+another mount namespace still lists one machine's processes - per-*reader* numbering is what this
+step built; per-*mount* was already true of the mount namespace and is not what a pid namespace
+asks for.
+
 ### 6.4 Additional Process Syscalls — **DONE**
 All wired to real handlers in `posix.rs`/`proc.rs`: `getpgrp`, `setreuid`,
 `setregid`, `getresuid`, `getresgid`, `capget`, `capset`.

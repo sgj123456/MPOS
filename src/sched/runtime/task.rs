@@ -659,6 +659,30 @@ pub(crate) struct Task {
     /// a parent renamed itself after a `fork`. `src/uts.rs` holds the object and
     /// the rule; this field is only whose it is.
     pub(crate) uts: Arc<crate::uts::Uts>,
+    /// The PID namespace this task's **own** numbers come from: what `getpid(2)`
+    /// answers, and what `kill`, `wait4` and `/proc/<n>` mean when a reader in
+    /// the same namespace asks about this task.
+    ///
+    /// Inherited by reference and *never* replaced by `unshare` - which is the
+    /// point of the field below being a second one. A task that unshares keeps
+    /// its number, so the namespace it already lives in must keep naming it.
+    /// `crates/pidns` holds the object and the rule, `sched::pid` the two
+    /// directions of the translation; this field is only whose it is.
+    pub(crate) pid_ns: Arc<crate::pidns::PidNs>,
+    /// The namespace this task's **children** are created in - Linux's
+    /// `nsproxy->pid_ns_for_children`.
+    ///
+    /// It starts as the task's own namespace, so an ordinary `fork` in a
+    /// machine that never unshares is a no-op here, and `unshare(CLONE_NEWPID)`
+    /// or `setns(fd, CLONE_NEWPID)` replaces **this** one only. That single
+    /// sentence is the whole of "the call renumbers the caller's children and
+    /// not the caller": the new namespace is empty and its first member is 1,
+    /// while the task that asked for it goes on answering with the number it
+    /// had. A child's `pid_ns` is its creator's value of this field, and the
+    /// child is registered in that namespace **and every namespace above it**,
+    /// which is what lets the parent, one level out, wait for it and find it in
+    /// `/proc`.
+    pub(crate) pid_ns_children: Arc<crate::pidns::PidNs>,
     /// The OOM-killer's score adjustment and the floor of it: the two numbers
     /// Linux keeps as `sig->oom_score_adj` and `sig->oom_score_adj_min`, and
     /// which `/proc/<pid>/oom_score_adj` reads and writes.
@@ -963,6 +987,13 @@ impl Task {
             // only the first call's is worn, and a number nothing wears is the
             // price of a leaf that cannot mint its own.
             uts: crate::uts::init(crate::vfs::ns::mint()),
+            // The machine's own PID namespace: the one a boot begins in, whose
+            // numbers are the task slots themselves. A task created here is
+            // registered nowhere - the init namespace's `task_of` is the
+            // identity - so this is the field pair every task starts with and
+            // nothing observable changes until something unshares.
+            pid_ns: super::root_ns(),
+            pid_ns_children: super::root_ns(),
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -1500,6 +1531,13 @@ impl Table {
             // only the first call's is worn, and a number nothing wears is the
             // price of a leaf that cannot mint its own.
             uts: crate::uts::init(crate::vfs::ns::mint()),
+            // The machine's own PID namespace: the one a boot begins in, whose
+            // numbers are the task slots themselves. A task created here is
+            // registered nowhere - the init namespace's `task_of` is the
+            // identity - so this is the field pair every task starts with and
+            // nothing observable changes until something unshares.
+            pid_ns: super::root_ns(),
+            pid_ns_children: super::root_ns(),
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -1746,6 +1784,10 @@ impl Table {
                 STACK_SIZE / 1024
             );
             mm::free_pages(stack.base, stack.order);
+            // Its numbers are forgotten where they were handed out, at every
+            // level of its namespace chain: a number that outlived its task
+            // would name whatever task next took the slot.
+            super::release_pid(task, slot);
             *entry = None;
         }
         // The table borrow is released, so the parent's `super::mm::Mm` is reachable now.

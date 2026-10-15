@@ -27,6 +27,7 @@ mod child_exit;
 mod child_mm;
 mod child_signal;
 mod load;
+mod pid;
 mod procfs;
 mod task;
 mod trace;
@@ -41,6 +42,7 @@ pub use child_exit::{
 pub use child_mm::*;
 pub use child_signal::*;
 pub use load::{init, resolve_script, spawn, spawn_init, spawn_user, try_spawn_user};
+pub use pid::*;
 pub use procfs::*;
 pub use task::*;
 pub use trace::*;

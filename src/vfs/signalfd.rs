@@ -160,7 +160,13 @@ impl Inode for SignalFd {
                         // to decide that a child is waiting to be reaped.
                         buf[SSI_SIGNO..SSI_SIGNO + 4].copy_from_slice(&SIGCHLD.to_ne_bytes());
                         buf[SSI_CODE..SSI_CODE + 4].copy_from_slice(&CLD_EXITED.to_ne_bytes());
-                        buf[SSI_PID..SSI_PID + 4].copy_from_slice(&(pid as u32).to_ne_bytes());
+                        // The reader's namespace's number for that child - the
+                        // same translation `/proc/<pid>` and `wait4` do, so a
+                        // `signalfd` reader inside a namespace is handed a
+                        // number it can use.
+                        let shown = crate::sched::pid_number_of(crate::sched::TaskId(pid))
+                            .unwrap_or(pid as u32);
+                        buf[SSI_PID..SSI_PID + 4].copy_from_slice(&shown.to_ne_bytes());
                     }
                     SignalRecord::From(sig, info) => {
                         buf[SSI_SIGNO..SSI_SIGNO + 4].copy_from_slice(&(sig as i32).to_ne_bytes());

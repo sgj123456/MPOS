@@ -44,8 +44,10 @@ One-glance status of the whole roadmap.
 **Process (Phase 6)**
 - [x] 6.1 ptrace (§6.1) · [x] 6.2 real rlimits incl. NOFILE/STACK (§6.2) · [x] 6.4 identity/cap calls, threads via `clone(CLONE_THREAD)` (§6.4)
 - [x] teardown at exit, not at reap (§6, R.15)
-- [~] 6.3 Namespaces — UTS and MNT landed, pins named (§6.3); PID then NET designed, unbuilt;
-  the other six kinds have no entry at all (§6.3, §6.6)
+- [~] 6.3 Namespaces — UTS, MNT and **PID** landed, each with its pin (`t-ns-uts`, `t-ns-mnt`,
+  `t-ns-pid`): the numbers a process sees are the reader's namespace's, both directions of the
+  translation, and `/proc` rendered per reader (§6.3); NET designed, unbuilt; the other five
+  kinds have no entry at all (§6.3, §6.6)
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
@@ -164,9 +166,11 @@ One-glance status of the whole roadmap.
 
 In the order that keeps each step verifiable on its own:
 
-1. **namespaces** (§6.3) — UTS and MNT are landed; what is left is the ladder's next rung,
-   **PID then NET** — designed, unbuilt. Beside it: seccomp's one named piece, the
-   `PTRACE_EVENT_SECCOMP` stop (§8.2).
+1. **namespaces** (§6.3) — UTS, MNT and PID are landed; the ladder's next rung is **NET**
+   (designed, unbuilt), and what PID deliberately left open is named in §6.3: a namespace's
+   pid-1 death does not zap the namespace, nested namespaces are pinned at one level, and
+   `/proc/<pid>/status`'s `NSpid` still shows one number. Beside it: seccomp's one named piece,
+   the `PTRACE_EVENT_SECCOMP` stop (§8.2).
 2. **interrupt-driven block completions** (§10.5's last row) — measured and re-scoped; §10.5
    carries the structure change, its pin and what each machine's clock can see.
 3. **what is left of the DHCP chain** (§4.5) — the raw-IP door's rules, cause and reverted

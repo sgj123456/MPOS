@@ -677,6 +677,13 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             // only the first call's is worn, and a number nothing wears is the
             // price of a leaf that cannot mint its own.
             uts: crate::uts::init(crate::vfs::ns::mint()),
+            // The machine's own PID namespace: the one a boot begins in, whose
+            // numbers are the task slots themselves. A task created here is
+            // registered nowhere - the init namespace's `task_of` is the
+            // identity - so this is the field pair every task starts with and
+            // nothing observable changes until something unshares.
+            pid_ns: super::root_ns(),
+            pid_ns_children: super::root_ns(),
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -753,6 +760,13 @@ pub fn try_spawn_user(
     with_table(|t| {
         let slot = t.alloc_slot();
         drop_retired(TaskId(slot));
+        // Its namespace is where its starter's children go, by reference, and
+        // it is registered there and at every level above - which is what lets
+        // the starter `wait` for it and find it in `/proc` under its own
+        // number. In a machine that never unshares this is the init namespace
+        // and the call is the identity.
+        let child_pid_ns = alloc::sync::Arc::clone(&t.task(parent).pid_ns_children);
+        super::adopt_pid(TaskId(slot), &child_pid_ns);
         let stack = Stack::new();
         let mut space = AddressSpace::new();
         let loaded = load_user(
@@ -830,6 +844,8 @@ pub fn try_spawn_user(
             // namespace of whatever started it until it unshares, which is the
             // rule `fork` follows for the same reason.
             uts: Arc::clone(&t.task(parent).uts),
+            pid_ns: alloc::sync::Arc::clone(&child_pid_ns),
+            pid_ns_children: child_pid_ns,
             oom_score_adj: t.task(parent).oom_score_adj,
             oom_score_adj_min: t.task(parent).oom_score_adj_min,
             nice: t.task(parent).nice,

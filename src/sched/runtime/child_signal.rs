@@ -557,6 +557,13 @@ pub fn ns_of(pid: usize, kind: crate::vfs::ns::Kind) -> Option<crate::vfs::ns::N
                     .unwrap_or_else(crate::vfs::mount::machine_table),
             ),
             crate::vfs::ns::Kind::Uts => crate::vfs::ns::Namespace::Uts(task.uts.clone()),
+            // Linux's `pidns_get` answers the namespace the task *is in* - the
+            // one its own number comes from - while a `setns` against this
+            // descriptor moves the namespace its *children* go to. The
+            // asymmetry is Linux's, and it is what makes `setns` on
+            // `/proc/self/ns/pid` a no-op that still means "my children stay
+            // where they are".
+            crate::vfs::ns::Kind::Pid => crate::vfs::ns::Namespace::Pid(task.pid_ns.clone()),
         })
     })
 }

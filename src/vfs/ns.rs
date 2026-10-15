@@ -21,8 +21,9 @@
 //! and the tests that pin both.
 //!
 //! **What is not here**: the namespace *objects*. A [`Namespace`] names one of
-//! the two this kernel has (the mount table and the names) as a handle to the
-//! value itself, because `setns` joins the object rather than copying it -
+//! the three this kernel has (the mount table, the numbers and the names) as a
+//! handle to the value itself, because `setns` joins the object rather than
+//! copying it -
 //! Linux's `mntns_install`/`utsns_install` point the caller at the namespace
 //! the descriptor holds, which is what makes a `setns` different from an
 //! `unshare`. The kinds this kernel does not implement have no entry at all in
@@ -37,7 +38,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The kinds `/proc/<pid>/ns` names here.
 ///
-/// Two of Linux's ten, and the two the ladder has built (§6.3). The rest are
+/// Three of Linux's ten, and the three the ladder has built (§6.3). The rest are
 /// absent, which is the honest surface: a kernel built without a namespace has
 /// no entry for it either (`/proc/self/ns/time` is `ENOENT` on a machine whose
 /// `CONFIG_TIME_NS` is off), so a reader sees a machine that has these two and
@@ -46,6 +47,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub enum Kind {
     /// `CLONE_NEWNS`: what is mounted where.
     Mount,
+    /// `CLONE_NEWPID`: the numbers a task is known by.
+    ///
+    /// The one kind whose *entry* is a namespace of its own rather than a view
+    /// of shared state: a task's number is a fact about the namespace it is in,
+    /// so two namespaces number one task differently and neither is "the"
+    /// answer.
+    Pid,
     /// `CLONE_NEWUTS`: the names `uname(2)` reports.
     Uts,
 }
@@ -55,6 +63,7 @@ impl Kind {
     pub const fn name(self) -> &'static str {
         match self {
             Kind::Mount => "mnt",
+            Kind::Pid => "pid",
             Kind::Uts => "uts",
         }
     }
@@ -66,6 +75,7 @@ impl Kind {
     pub const fn flag(self) -> usize {
         match self {
             Kind::Mount => crate::abi::CLONE_NEWNS,
+            Kind::Pid => crate::abi::CLONE_NEWPID,
             Kind::Uts => crate::abi::CLONE_NEWUTS,
         }
     }
@@ -74,6 +84,7 @@ impl Kind {
     pub fn of_flag(bit: usize) -> Option<Kind> {
         match bit {
             b if b == crate::abi::CLONE_NEWNS => Some(Kind::Mount),
+            b if b == crate::abi::CLONE_NEWPID => Some(Kind::Pid),
             b if b == crate::abi::CLONE_NEWUTS => Some(Kind::Uts),
             _ => None,
         }
@@ -84,14 +95,17 @@ impl Kind {
     pub fn of_name(name: &str) -> Option<Kind> {
         match name {
             "mnt" => Some(Kind::Mount),
+            "pid" => Some(Kind::Pid),
             "uts" => Some(Kind::Uts),
             _ => None,
         }
     }
 
     /// Every kind, in the order the directory lists them (Linux lists its ten
-    /// in name order; these two are `mnt` before `uts` for the same reason).
-    pub const ALL: &'static [Kind] = &[Kind::Mount, Kind::Uts];
+    /// in name order; these three are `mnt`, `pid`, `uts` for the same reason -
+    /// measured on a current host, where `/proc/self/ns` lists all ten
+    /// alphabetically).
+    pub const ALL: &'static [Kind] = &[Kind::Mount, Kind::Pid, Kind::Uts];
 }
 
 /// A namespace, as the object a descriptor holds and `setns` joins.
@@ -105,6 +119,7 @@ impl Kind {
 #[derive(Clone)]
 pub enum Namespace {
     Mount(Arc<crate::vfs::mount::MountTable>),
+    Pid(Arc<crate::pidns::PidNs>),
     Uts(Arc<crate::uts::Uts>),
 }
 
@@ -112,6 +127,7 @@ impl Namespace {
     pub fn kind(&self) -> Kind {
         match self {
             Namespace::Mount(_) => Kind::Mount,
+            Namespace::Pid(_) => Kind::Pid,
             Namespace::Uts(_) => Kind::Uts,
         }
     }
@@ -120,6 +136,7 @@ impl Namespace {
     pub fn id(&self) -> u64 {
         match self {
             Namespace::Mount(table) => table.ns_id(),
+            Namespace::Pid(pidns) => pidns.ns_id(),
             Namespace::Uts(uts) => uts.ns_id(),
         }
     }
@@ -168,7 +185,11 @@ mod tests {
         // checks that a descriptor's kind matches the bit it was given.
         assert_eq!(Kind::of_name("mnt"), Some(Kind::Mount));
         assert_eq!(Kind::of_name("uts"), Some(Kind::Uts));
-        assert_eq!(Kind::of_name("pid"), None);
+        assert_eq!(link_text(Kind::Pid, 4026531836), "pid:[4026531836]");
+        assert_eq!(Kind::of_name("pid"), Some(Kind::Pid));
+        // A kind this kernel does not have is not recoverable from a word: the
+        // entry does not exist, which is the whole refusal.
+        assert_eq!(Kind::of_name("net"), None);
     }
 
     #[test]
@@ -189,7 +210,7 @@ mod tests {
         }
         // A bit that is a namespace and not one of these is *not* a kind: the
         // caller hears their own word back rather than a wrong namespace.
-        assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWPID), None);
+        assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWNET), None);
         assert_eq!(Kind::of_flag(0), None);
         assert_eq!(Kind::of_flag(0x1000), None);
     }

@@ -295,8 +295,13 @@ pub(super) fn handle_yield() -> isize {
 /// Get the current process ID.
 pub(super) fn handle_getpid() -> isize {
     // The *group's* id: a process has one pid however many threads it runs.
-    // `gettid` is the call that answers a thread's own.
-    crate::sched::current_tgid().0 as isize
+    // `gettid` is the call that answers a thread's own. The number is the
+    // caller's namespace's, and the leader is a member of it by construction (a
+    // thread is in its process's namespaces), so the fallback is unreachable -
+    // it is here so a machine that somehow disagreed would answer a number
+    // rather than stop.
+    let tgid = crate::sched::current_tgid();
+    crate::sched::pid_number_of(tgid).unwrap_or_else(crate::sched::current_pid_number) as isize
 }
 
 /// `gettid()` - the calling *thread*'s own id.
@@ -305,7 +310,29 @@ pub(super) fn handle_getpid() -> isize {
 /// process was one thread and became wrong the moment threads existed: a
 /// thread that asks its own id must not be told the process's.
 pub(super) fn handle_gettid() -> isize {
-    crate::sched::current().0 as isize
+    // The thread's *own* number, in the namespace it stands in - a thread's tid
+    // is namespaced exactly as a process's pid is.
+    crate::sched::current_pid_number() as isize
+}
+
+/// The task a caller's `pid` names, **in the caller's own namespace**.
+///
+/// Every call that takes a pid goes through this instead of building a `TaskId`
+/// from the number, and that is the half of the feature that keeps a namespace
+/// from being a footgun: a pid here *is* a task-table slot, a namespace gives
+/// that slot a different number, so a number the caller wrote has to be read in
+/// the namespace the caller is standing in. Without it, a program whose
+/// `getpid()` answered 1 inside a namespace and which then called
+/// `kill(getpid(), sig)` - which is what a program does with its own pid - would
+/// reach the machine's slot 1, the boot's init.
+///
+/// `None` is "names nothing here", which every caller turns into its own refusal
+/// (`ESRCH`, or `ECHILD` for `wait`). It also replaces the old
+/// `pid >= MAX_TASKS` bounds: those were the *init* namespace's way of saying
+/// "no such task", and a namespace's numbers are its own, so the table lookup
+/// is the only honest bound.
+pub(crate) fn pid_task(pid: isize) -> Option<TaskId> {
+    crate::sched::resolve_pid(pid as i64)
 }
 
 // `prctl(option, ...)` - the miscellaneous process-control call.
@@ -403,11 +430,13 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         return err::ECHILD;
     }
 
-    // A named child. The bound keeps a wild pid from indexing the table.
-    if pid as usize >= crate::sched::MAX_TASKS {
+    // A named child, resolved in the caller's namespace: a number that names
+    // nothing there is nobody to wait for, which is `ECHILD` and not a wrong
+    // task. The old `MAX_TASKS` bound went with the translation - it was the
+    // init namespace's spelling of "no such task" (see `pid_task`).
+    let Some(id) = pid_task(pid) else {
         return err::ECHILD;
-    }
-    let id = TaskId(pid as usize);
+    };
 
     // A stop first, then a death: a tracee that stopped on its way to exiting
     // has news of both, and the stop is the earlier news and the one that
@@ -459,7 +488,16 @@ fn write_wait_status(id: TaskId, word: i32, status: usize, from_user: bool) -> i
         }
         unsafe { (status as *mut i32).write_unaligned(word) };
     }
-    id.0 as isize
+    wait_answer(id)
+}
+
+/// The pid a `wait` answers with: the child's number **in the caller's
+/// namespace**. This is the one place both wait shapes answer a pid - `wait4`'s
+/// return value and `waitid`'s record go through it - so the number a parent
+/// reads is the number it can use in `kill`, and a parent one level out reads
+/// the number it can see rather than the child's own.
+fn wait_answer(id: TaskId) -> isize {
+    crate::sched::pid_number_of(id).map_or(id.0 as isize, |n| n as isize)
 }
 
 /// The two outputs of a successful `wait`: the child's pid as the return value,
@@ -474,7 +512,7 @@ fn finish_wait(id: TaskId, code: isize, status: usize, from_user: bool) -> isize
         // it is spelled in `abi`, tested on the host.
         unsafe { (status as *mut i32).write_unaligned(abi::wait_status(code)) };
     }
-    id.0 as isize
+    wait_answer(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -651,10 +689,9 @@ pub(super) fn handle_ptrace(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         };
     }
 
-    if pid <= 0 || pid as usize >= crate::sched::MAX_TASKS {
+    let Some(id) = pid_task(pid) else {
         return err::ESRCH;
-    }
-    let id = TaskId(pid as usize);
+    };
 
     if request == abi::PTRACE_ATTACH {
         // Attaching is the pair of a `TRACEME` and a `SIGSTOP`: the link is
@@ -1080,10 +1117,9 @@ pub(super) fn handle_process_vm_readv(args: [usize; ARG_COUNT], from_user: bool)
     if flags != 0 {
         return err::EINVAL;
     }
-    if pid <= 0 || pid as usize >= crate::sched::MAX_TASKS {
+    let Some(id) = pid_task(pid) else {
         return err::ESRCH;
-    }
-    let id = TaskId(pid as usize);
+    };
     let Some(root) = crate::sched::space_root_of(id) else {
         return err::ESRCH;
     };
@@ -1122,10 +1158,9 @@ pub(super) fn handle_process_vm_writev(args: [usize; ARG_COUNT], from_user: bool
     if flags != 0 {
         return err::EINVAL;
     }
-    if pid <= 0 || pid as usize >= crate::sched::MAX_TASKS {
+    let Some(id) = pid_task(pid) else {
         return err::ESRCH;
-    }
-    let id = TaskId(pid as usize);
+    };
     let Some(root) = crate::sched::space_root_of(id) else {
         return err::ESRCH;
     };
@@ -1285,7 +1320,14 @@ fn transfer_iovs(
 /// the spawner's id, or 0 for init and the tasks nobody spawned - which is
 /// also what Linux reports for init.
 pub(super) fn handle_getppid() -> isize {
-    crate::sched::parent_of(crate::sched::current()).map_or(0, |parent| parent.0 as isize)
+    // The parent's number *in the caller's namespace* - which is Linux's rule
+    // and the one a container's init meets: the task that unshared has a parent
+    // outside the new namespace, and the new namespace has no number for it, so
+    // the answer is 0 rather than a number from a namespace the caller cannot
+    // see.
+    crate::sched::parent_of(crate::sched::current())
+        .and_then(crate::sched::pid_number_of)
+        .map_or(0, |n| n as isize)
 }
 
 /// The identity a set-uid or set-group-id exec switches to, or `None` when the
@@ -1731,12 +1773,24 @@ pub(super) fn handle_kill(args: [usize; ARG_COUNT]) -> isize {
             let pgid = if n == -1 {
                 crate::sched::current_pgid()
             } else {
-                TaskId(n.unsigned_abs())
+                // A group number is a *pid* number in the caller's namespace -
+                // the number of the process that leads the group - so it is
+                // resolved there too and the group is the one that task leads.
+                let Some(leader) = pid_task(n.unsigned_abs() as isize) else {
+                    return err::ESRCH;
+                };
+                match crate::sched::pgid_of(leader) {
+                    Some(pgid) => pgid,
+                    None => return err::ESRCH,
+                }
             };
             crate::sched::send_signal_group(pgid, sig as u8)
         }
         0 => crate::sched::send_signal_group(crate::sched::current_pgid(), sig as u8),
-        n => crate::sched::send_signal(TaskId(n as usize), sig as u8),
+        n => match pid_task(n) {
+            Some(id) => crate::sched::send_signal(id, sig as u8),
+            None => return err::ESRCH,
+        },
     };
     if delivered { 0 } else { err::ESRCH }
 }
@@ -1749,12 +1803,18 @@ pub(super) fn handle_setpgid(args: [usize; ARG_COUNT]) -> isize {
     let me = crate::sched::current();
     let target = match pid {
         0 => me,
-        n if n > 0 => TaskId(n as usize),
+        n if n > 0 => match pid_task(n) {
+            Some(id) => id,
+            None => return err::ESRCH,
+        },
         _ => return err::EINVAL,
     };
     let group = match pgid {
         0 => target,
-        n if n > 0 => TaskId(n as usize),
+        n if n > 0 => match pid_task(n) {
+            Some(id) => id,
+            None => return err::ESRCH,
+        },
         _ => return err::EINVAL,
     };
     crate::sched::set_pgid(target, group)
@@ -1784,7 +1844,8 @@ pub(super) fn handle_setsid(_args: [usize; ARG_COUNT]) -> isize {
             // immediately after; that is the whole reason the two calls
             // travel together.
             crate::sched::become_session_leader();
-            me.0 as isize
+            crate::sched::pid_number_of(me).unwrap_or_else(crate::sched::current_pid_number)
+                as isize
         }
         e => e,
     }
@@ -1800,12 +1861,17 @@ pub(super) fn handle_getsid(args: [usize; ARG_COUNT]) -> isize {
     let pid = args[0] as isize;
     let target = match pid {
         0 => crate::sched::current(),
-        n if n > 0 => TaskId(n as usize),
+        n if n > 0 => match pid_task(n) {
+            Some(id) => id,
+            None => return err::ESRCH,
+        },
         _ => return err::EINVAL,
     };
-    // Linux answers any live pid; only a dead one is ESRCH.
-    match crate::sched::pgid_of(target) {
-        Some(pgid) => pgid.0 as isize,
+    // Linux answers any live pid; only a dead one is ESRCH. The id answered is
+    // the *caller's namespace's* number for the group's leader, which is the
+    // number the caller could use in `kill(-n)`.
+    match crate::sched::pgid_of(target).and_then(crate::sched::pid_number_of) {
+        Some(n) => n as isize,
         None => err::ESRCH,
     }
 }
@@ -1815,12 +1881,15 @@ pub(super) fn handle_getpgid(args: [usize; ARG_COUNT]) -> isize {
     let pid = args[0] as isize;
     let target = match pid {
         0 => crate::sched::current(),
-        n if n > 0 => TaskId(n as usize),
+        n if n > 0 => match pid_task(n) {
+            Some(id) => id,
+            None => return err::ESRCH,
+        },
         _ => return err::EINVAL,
     };
 
-    match crate::sched::pgid_of(target) {
-        Some(pgid) => pgid.0 as isize,
+    match crate::sched::pgid_of(target).and_then(crate::sched::pid_number_of) {
+        Some(n) => n as isize,
         None => err::ESRCH,
     }
 }
@@ -2899,14 +2968,14 @@ pub(super) fn handle_timer_create(args: [usize; ARG_COUNT], from_user: bool) -> 
                 return err::EINVAL;
             }
             if kind == SIGEV_THREAD_ID {
-                if tid <= 0 {
+                // The thread the timer notifies, named in the caller's
+                // namespace; a number that names nothing there is a request
+                // this kernel cannot arm rather than a timer aimed at whichever
+                // task wears that slot.
+                let Some(thread) = pid_task(tid as isize) else {
                     return err::EINVAL;
-                }
-                (
-                    signo as u8,
-                    value,
-                    TimerNotify::Thread(TaskId(tid as usize)),
-                )
+                };
+                (signo as u8, value, TimerNotify::Thread(thread))
             } else {
                 (signo as u8, value, TimerNotify::Signal)
             }
@@ -3653,7 +3722,14 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
     // as the code, pid and status in their fields - is the ABI the libc's
     // `W` macros and `waitid` wrappers read; it is spelled in `abi`, tested
     // on the host.
-    abi::write_waitid_info(infop, pid.0 as u32, code)
+    // The child's number in the *caller's* namespace, the same answer `wait4`
+    // returns: a reader one level out sees the number it can use, and a reader
+    // inside the child's own namespace sees 1.
+    abi::write_waitid_info(
+        infop,
+        crate::sched::pid_number_of(pid).unwrap_or(pid.0 as u32),
+        code,
+    )
 }
 
 // The legacy `getrlimit`/`setrlimit` pair, `prlimit64` and `membarrier`

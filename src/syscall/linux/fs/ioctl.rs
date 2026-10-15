@@ -192,8 +192,14 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 // Zero is what a terminal with no foreground job reports, and
                 // it is a valid answer rather than an error: a shell is
                 // allowed to find out that nobody owns the terminal yet.
-                let pgid = tty.foreground().unwrap_or(crate::sched::TaskId(0));
-                unsafe { (buf as *mut i32).write_unaligned(pgid.0 as i32) };
+                // The group's leader, in the *caller's* namespace - the same
+                // number the caller would hand back to `TIOCSPGRP`. Zero stays
+                // zero: a terminal with no foreground job has no number at all.
+                let pgid = tty
+                    .foreground()
+                    .and_then(crate::sched::pid_number_of)
+                    .unwrap_or(0);
+                unsafe { (buf as *mut i32).write_unaligned(pgid as i32) };
                 return 0;
             }
 
@@ -201,20 +207,24 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 return err::EFAULT;
             }
             let pgid = unsafe { (buf as *const i32).read_unaligned() };
-            if pgid <= 0 || pgid as usize >= crate::sched::MAX_TASKS {
+            if pgid <= 0 {
                 return err::EINVAL;
             }
-            tty.set_foreground(Some(crate::sched::TaskId(pgid as usize)));
+            // A group number is a pid number in the caller's namespace: the
+            // number names the group's leader there, and one that names nothing
+            // is `EINVAL` - what a terminal says about a group it cannot be
+            // asked to hand the foreground to.
+            let Some(leader) = crate::syscall::linux::proc::pid_task(pgid as isize) else {
+                return err::EINVAL;
+            };
+            tty.set_foreground(Some(leader));
             // POSIX's `tcsetpgrp` is not only a record: it sends `SIGCONT` to
             // the group it names. That is what resumes a job that stopped
             // itself waiting to be made foreground - a shell's `fg`, and a
             // supervisor's handshake - and without it the wait is one-way: the
             // group is named the foreground and the process that was going to
             // use that answer is still stopped, for the machine's life.
-            crate::sched::send_signal_group(
-                crate::sched::TaskId(pgid as usize),
-                crate::sched::signal::SIGCONT,
-            );
+            crate::sched::send_signal_group(leader, crate::sched::signal::SIGCONT);
             0
         }
         // TIOCGSID: the session the terminal belongs to - `tcgetsid`, which a

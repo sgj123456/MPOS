@@ -283,15 +283,26 @@ fn main() {
     r.check("unshare CLONE_NEWUTS is served again", uts == 0);
     let mount = unshare(0x0002_0000);
     r.check("unshare CLONE_NEWNS is served again", mount == 0);
+    // The third served rung is the numbers: with the capability back, the
+    // caller is handed a namespace its *children* will be numbered in, and the
+    // call is `0` - the pair *this* call cannot observe (the caller keeps its
+    // own pid) is `t-ns-pid`'s subject.
+    let pid = unshare(0x2000_0000);
+    r.check(
+        "unshare CLONE_NEWPID is served once nothing else can be the reason",
+        pid == 0,
+    );
     // And the kind this machine has no way to hand over keeps its honest
     // refusal *now* that no capability gate can be the reason: EOPNOTSUPP is
     // "present, cannot do that", which is what a capable caller learns, and
     // what an unprivileged one would have heard as EPERM above. Nothing is
-    // unshared either way - the refusal is whole.
-    let pid = unshare(0x2000_0000);
+    // unshared either way - the refusal is whole. The word was `CLONE_NEWPID`
+    // until PID landed; a hardcoded served set drifts the moment it grows,
+    // which is what §6.3 records twice over.
+    let net = unshare(0x4000_0000);
     r.check(
-        "unshare CLONE_NEWPID is EOPNOTSUPP once nothing else can be the reason",
-        pid == -(libc::EOPNOTSUPP as isize),
+        "unshare CLONE_NEWNET is EOPNOTSUPP once nothing else can be the reason",
+        net == -(libc::EOPNOTSUPP as isize),
     );
 
     r.finish()

@@ -311,6 +311,7 @@ dependencies = [
  "mpos-gpu",
  "mpos-link",
  "mpos-pci",
+ "mpos-pidns",
  "mpos-seccomp",
  "mpos-term",
  "mpos-uinput",
@@ -418,6 +419,13 @@ version = "0.1.0"
 
 [[package]]
 name = "mpos-pci"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+]
+
+[[package]]
+name = "mpos-pidns"
 version = "0.1.0"
 dependencies = [
  "critical-section",
