@@ -361,6 +361,41 @@ and the witness stopped seeing the rename. That is the sixth time §6.3 records 
 is recorded rather than deleted for the reason the others are: the gate is what finds it, every
 time, and a served set written into a test is the shape that makes it happen.
 
+**TIME: the whole shape measured, none of it built (2026-10-16).** The fifth kind has no entry
+yet, and this paragraph is the measurement the implementation starts from rather than a plan.
+Taken on this developer's Linux (7.2) with five probes - `probe-timens{,2,3,4,5,6}.c` beside this
+file's other host probes, plus `probe-timens-links.sh`:
+
+| question | Linux's answer |
+|---|---|
+| `unshare(CLONE_NEWTIME)` | `0`. The caller's `/proc/self/ns/time` is **unchanged** - it is `time_ns_for_children` that becomes new - and the caller's own clocks never move, whatever the offsets are set to afterwards |
+| `clone(CLONE_NEWTIME)` | **`EINVAL`** - not a way in (a plain `clone(SIGCHLD)` in the same program succeeds, so the refusal is the flag's) |
+| a child forked after the unshare | is in the new namespace (`time:[4026532873]` against the machine's `time:[4026531834]`) |
+| the clocks that child sees | `CLOCK_MONOTONIC`, `CLOCK_MONOTONIC_RAW` and `CLOCK_BOOTTIME` shifted by the offsets; `CLOCK_REALTIME`, `CLOCK_TAI` and the two cputime clocks **not** |
+| `/proc/self/timens_offsets` of the unsharer | belongs to the *children's* namespace; reads two lines `monotonic <sec> <nsec>` / `boottime <sec> <nsec>`, and accepts the same shape |
+| writing it once a process has entered | **`EACCES`** (measured: a child forked first, then the write is refused; without the child, two writes in a row are both accepted and the later one wins) |
+| `/proc/<pid>/ns` | ten names, `time` **and `time_for_children`** among them - the same for-children split `pid`/`pid_for_children` has, which is what the second row above is |
+
+The model all of those fit is `nsproxy`'s two slots: `unshare` replaces `time_ns_for_children`
+alone, a fork installs the child in `time_ns_for_children` (which is why the child's link differs
+from its parent's), and the offsets are frozen by that first entry - which is the whole reason a
+namespace's offsets have to be set *before* anything is created in it.
+
+**One measurement that does not fit, recorded rather than reconciled.** Of the three probes that
+forked a child after setting the offsets, two show the child offset by exactly what was written
+(`+100000`/`+200000`, and `+7`/`+200000` after a second write) and one shows a child whose
+`timens_offsets` file *reads* `monotonic 7` while its `CLOCK_MONOTONIC` is not offset at all. The
+minimal shape (`probe-timens6.c`: unshare, one write, fork, both read their clocks) is
+reproducible and is the one the table above comes from; the odd one out adds a pipe, a `usleep`
+and a `readlink` of the two `ns/time` links before it reads its clocks, and neither removing the
+second write nor a pause changed its answer. What is pinned here is the minimal shape; the
+divergence is named and not explained.
+
+**And one trap in the measuring, worth its line**: a first draft of the raw-netlink-style probe
+numbered `IFLA_NET_NS_PID` 27 where `linux/if_link.h` gives 19, and *every* request answered a
+plain `0` - including the ones that should have failed. That is the same silence the netns-move
+work was written against, arriving a second time from a different direction.
+
 **Named gaps, each with what it waits on.** A namespace's stack is never freed - the
 identity carries no reference count, where Linux frees one with the last `struct net` (and
 `HOMES` is cleaned per socket, not per

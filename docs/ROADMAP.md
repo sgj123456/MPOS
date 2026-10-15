@@ -193,7 +193,12 @@ In the order that keeps each step verifiable on its own:
    an address is the namespace's and not the device's (measured on Linux first; `t-ns-net` walks a
    whole round trip, §6.3), so what is left here is the four kinds with no entry at all
    (user, IPC, cgroup, time - four of `namespaces(7)`'s eight); nested namespaces pin the
-   *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were
+   *numbers* two levels deep now, as the zap's reach already did. **TIME is the one whose whole
+   shape is measured already** (§6.3, 2026-10-16: `unshare` replaces `time_ns_for_children` alone
+   and never moves the caller, `clone(CLONE_NEWTIME)` is `EINVAL`, a child forked afterwards sees
+   `MONOTONIC`/`MONOTONIC_RAW`/`BOOTTIME` shifted by the offsets and no other clock, and the
+   offsets are frozen - `EACCES` - by the first process to enter), so it is the next of the four
+   and the one to start with. The `/proc/net` reader's rows were
    per-namespace but unexercised; `t-ns-net` reads the file on both sides of the boundary now
    (2026-10-15). Two more left this list on
    2026-10-15: the pid namespace's own creation rules (one per process, and a sealed one takes no
