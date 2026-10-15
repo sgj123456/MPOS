@@ -122,7 +122,7 @@ the build list.
 | `CLONE_NEWNS` | the mount table *and the root*: a `mount` in one namespace invisible in another, and `chroot`/`pivot_root` giving a container its own `/` | **build second** |
 | `CLONE_NEWPID` | the numbers a process *sees*: a child of the new namespace is pid 1 to itself, and `/proc` is numbered per reader | **build third - the expensive one** |
 | `CLONE_NEWNET` | interfaces, addresses, routes and the socket table: a socket bound in one namespace is not reachable from another | **build fourth** |
-| `CLONE_NEWUSER` | uid/gid mapping, and the capability set *within* the namespace | **refused** until there is a mapping to store |
+| `CLONE_NEWUSER` | uid/gid mapping, and the capability set *within* the namespace | **refused** - but the whole shape is now measured (2026-10-16); the paragraph below is what the build starts from |
 | `CLONE_NEWIPC` | SysV IPC objects and POSIX message queues | **refused**: this kernel has neither, so it isolates nothing |
 | `CLONE_NEWCGROUP` | the cgroup tree a process sees | **refused**: there is no cgroup tree here to see |
 | `CLONE_NEWTIME` | `CLOCK_MONOTONIC`/`BOOTTIME` offsets per namespace | **built** - "Step 5, landed" below |
@@ -432,6 +432,37 @@ reproducible and is the one the table above comes from; the odd one out adds a p
 and a `readlink` of the two `ns/time` links before it reads its clocks, and neither removing the
 second write nor a pause changed its answer. What is pinned here is the minimal shape; the
 divergence is named and not explained.
+
+**USER: the sixth rung's shape, measured whole and none of it built (2026-10-16).** Five probes
+(`.workbuddy/probe-userns{,2,3,4,5}.c`), each run twice - once as root and once as an unprivileged
+caller (`setpriv --reuid=65534 --clear-groups`) - because the two answer differently and the
+difference is the kind:
+
+| question | Linux's answer |
+|---|---|
+| `unshare(CLONE_NEWUSER)` as root | `0`, and the **caller itself moves** (`ns/user` 4026531837 -> 4026533165). The opposite of PID's and TIME's for-children rule, and the same shape NET has |
+| ...as an **unprivileged** caller | `0` as well - this host allows unprivileged user namespaces, which is the property that makes the kind unlike the other seven |
+| the caller's ids the instant it unshares | `getuid()` reads **65534** (the overflow id): the new namespace has an **empty map**, so the caller's own (outer) id has no inside name yet |
+| the capability set inside | **full** - `CapEff=0x1ffffffffff`, `CAP_SYS_ADMIN` set - *before* any map is written, and an unprivileged creator gets it too (`CapEff=0` outside, full inside). This is the "root inside" property: making a user namespace is itself the grant |
+| writing `uid_map` | `"0 65534 1"` (inside 0 <- the caller's own outer id, one id wide) is accepted **once**; a second write is `EPERM`; a line naming a **foreign** outer id is `EPERM`; a two-id line is `EPERM`. One line, its own id |
+| `gid_map` | refused until `/proc/<pid>/setgroups` reads `deny` - the dance `newgidmap` performs; after `deny` the same one-line write is accepted |
+| `/proc/<pid>/ns` | lists `user`, and there is **no `user_for_children`** (`ENOENT`) - a directory that grew a second name for PID and TIME grows none here |
+| `clone(CLONE_NEWUSER\|SIGCHLD)` | `0` - a real door, because the bit (`0x10000000`) sits outside `CSIGNAL` where `CLONE_NEWTIME`'s does not; a second `unshare` from inside (nesting) is also `0` |
+| `setns(fd, CLONE_NEWUSER)` | into the namespace the caller is **already in** answers `EINVAL`, not the no-op `0` every other kind gives; a namespace it lacks `CAP_SYS_ADMIN` in is unreachable - the `open` of `/proc/<pid>/ns/user` is refused `EACCES` first |
+| what a mapping *is* | a **translation at the boundary**, not a rename. The kernel keeps the outer id: with `0 <- 65534` written, `/etc/hostname` (outer id 0) reads `uid=65534` inside (unmapped -> overflow), a file the caller owns outside reads `uid=0` inside, and a file made inside reads `uid=0` inside but `uid=65534` from outside |
+
+The last row is the one that decides the implementation's size. An id is stored once, in the parent
+namespace's numbering, and every *observation* of it - `getuid`/`geteuid`, `stat` of a file, the
+owner reported by a directory read - is mapped through the observing namespace's table. A user
+namespace is therefore not one more object beside the mount table and the clock offsets; it is a
+translation applied wherever an id crosses a boundary.
+
+**Why this rung is named and not built here.** The measurement says the work is three pieces -
+(a) a mapping object and its one-line write rules, (b) id translation at every reader, and (c) the
+capability grant at creation - and (c) alone contradicts this kernel's present model, where
+`Credentials::initial()` hands every process the full set, so "full inside a namespace you made" is
+not yet distinguishable from "full because you are root". Each piece is its own measurement-and-pin,
+so the rung is recorded rather than half-built: this table is what the next commit starts from.
 
 **And one trap in the measuring, worth its line**: a first draft of the raw-netlink-style probe
 numbered `IFLA_NET_NS_PID` 27 where `linux/if_link.h` gives 19, and *every* request answered a

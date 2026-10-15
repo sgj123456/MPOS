@@ -74,7 +74,12 @@ One-glance status of the whole roadmap.
   and the cputime clocks do not, and `setns` is the second door into the same slot (`t-ns-time`
   walks it in 46 claims, the shape measured whole before any of it was built, §6.3). The other
   three kinds Linux has - user, IPC and cgroup - have no entry at all here (§6.3, §6.6), which is
-  `vfs::ns::Entry::ALL` against `namespaces(7)`'s list of eight
+  `vfs::ns::Entry::ALL` against `namespaces(7)`'s list of eight - and of those three **USER's whole
+  shape is measured now** (2026-10-16, §6.3): it moves its caller like NET, an *unprivileged*
+  caller may make one, the map starts empty so the caller lands on the overflow id, the maker holds
+  the full capability set inside at once, `uid_map` takes one self-naming line and then answers
+  `EPERM`, and the map is a **translation at every boundary** (the same file reads `uid=0` inside
+  and `uid=65534` outside) - which is what makes the rung three pieces rather than one
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
@@ -205,7 +210,15 @@ In the order that keeps each step verifiable on its own:
    **USER**: it is the only one of the three whose absence is felt by everything else (a container
    runtime's first call is `unshare(CLONE_NEWUSER)`, and uid mapping is what the other two are
    *scoped* by), which also makes it the most expensive - it touches the credential model rather
-   than adding a namespace object. IPC and CGROUP each wait on the thing they would isolate not
+   than adding a namespace object. **USER's whole shape is measured already** (§6.3, 2026-10-16,
+   five probes run as root and unprivileged: `unshare` moves the caller, an *unprivileged* caller
+   may make one, the caller lands on the overflow id because the map starts empty, it holds the
+   **full** capability set inside the moment it is made - "root inside" - `uid_map` takes a
+   single self-naming line once and nothing else, `gid_map` waits for `setgroups=deny`, there is no
+   `user_for_children`, `clone` is a door and `setns` into one's own is `EINVAL`), and the last
+   row is what sizes the work: a mapping is a **translation at every boundary** rather than a
+   rename, so the rung is three pieces - the map object, id translation at each reader, and the
+   capability grant - not one. IPC and CGROUP each wait on the thing they would isolate not
    existing yet (SysV/POSIX message queues; a cgroup tree), so they are cheap the day that lands
    and worthless before it. Nested namespaces pin the
    *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were
