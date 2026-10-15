@@ -70,6 +70,12 @@ pub const ETH_HEADER_LEN: usize = 14;
 /// detour; see the module header for the second spelling this replaced.
 pub const IPV4_ETHERTYPE: u16 = 0x0800u16.to_be();
 
+/// The wire's `08 06` for `ETH_P_ARP`, in the same spelling as
+/// [`IPV4_ETHERTYPE`]: the number whose bytes *in memory* are the frame's own
+/// two type bytes, so a comparison via `from_le_bytes` needs no host-order
+/// detour. The raw-IP door's neighbour resolver reads it (`src/net/arp.rs`).
+pub const ARP_ETHERTYPE: u16 = 0x0806u16.to_be();
+
 /// Frames kept per socket before the oldest gives way. Two pages of DHCP
 /// traffic by any measure; the number exists so a stopped reader cannot make
 /// the kernel eat memory on its behalf. Linux drops frames for a packet socket
@@ -266,6 +272,17 @@ mod tests {
         // against `0x0008`, and made a seam return on every frame.
         assert_eq!(IPV4_ETHERTYPE, u16::from_le_bytes([0x08, 0x00]));
         assert_eq!(IPV4_ETHERTYPE.to_le_bytes(), [0x08, 0x00]);
+    }
+
+    #[test]
+    fn the_arp_ethertype_is_the_wires_two_bytes() {
+        // Same rule as the IPv4 pin beside it: the constant must be the number
+        // whose little-endian bytes are the frame's `08 06`, so the raw-IP
+        // door's neighbour resolver can compare a parsed frame's type without
+        // a host-order detour.
+        assert_eq!(ARP_ETHERTYPE, u16::from_le_bytes([0x08, 0x06]));
+        assert_eq!(ARP_ETHERTYPE.to_le_bytes(), [0x08, 0x06]);
+        assert_ne!(ARP_ETHERTYPE, IPV4_ETHERTYPE);
     }
 
     #[test]

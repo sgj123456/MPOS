@@ -668,15 +668,20 @@ fn main() {
         }
     }
 
-    // And the one shape the door does not serve yet, refused by name rather
-    // than addressed to a guess: a unicast send needs the ARP/next-hop lookup
-    // this direct-to-device path does not do (§4.5's named prerequisite).
-    // The client's own next step after the discover is exactly that -
-    // `udhcpc` renews with a *unicast* REQUEST aimed at the server that
-    // answered - so the packet read above supplies the aim: rewrite the
-    // header's destination with the OFFER's source and send. A product boot
-    // measured the same stop (`bind-choosenack` reaches the refusal, not a
-    // crash); the lease half of the story remains §4.5's unicast gap.
+    // --- the unicast half: a destination that is not the broadcast ---
+    //
+    // Every socket but this one has always sent unicast, and the lookup it
+    // needs - which neighbour, on the wire or by the router - is the ARP half
+    // §4.5 named. `udhcpc`'s own next step after the discover is exactly that:
+    // it renews with a *unicast* REQUEST aimed at the server that answered, so
+    // the packet read above supplies the aim - rewrite the header's destination
+    // with the OFFER's source (the kernel recomputes the checksum) and send.
+    // The send resolves the next hop now: on-link the destination itself, off
+    // it the router a matching route names, and no route at all is
+    // `ENETUNREACH` (measured on the host). An unanswered neighbour is
+    // `EHOSTUNREACH` - the one divergence from Linux, which queues and returns
+    // a length; a synchronous stack has nowhere to queue, so it says the frame
+    // did not leave rather than returning a length for one that never did.
     let mut unicast = libc::sockaddr_in {
         sin_family: libc::AF_INET as u16,
         sin_port: 0,
@@ -685,10 +690,10 @@ fn main() {
         },
         sin_zero: [0; 8],
     };
-    if again >= 20 {
+    let req = if again >= 20 {
         let server = [rx3[12], rx3[13], rx3[14], rx3[15]];
         pkt[IP_DST..IP_DST + 4].copy_from_slice(&server);
-        let req = unsafe {
+        unsafe {
             as_raw(libc::sendto(
                 raw,
                 pkt.as_ptr().cast::<c_void>(),
@@ -697,13 +702,117 @@ fn main() {
                 (&raw mut unicast).cast::<libc::sockaddr>(),
                 core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
             ) as isize)
-        };
-        r.check(
-            &format!("a unicast through it is EOPNOTSUPP (got {req})"),
-            req == -(libc::EOPNOTSUPP as isize),
-        );
+        }
     } else {
-        r.check("a unicast through it is EOPNOTSUPP", false);
+        -1
+    };
+    r.check(
+        &format!("a unicast through the raw door goes (got {req}, want {TOTAL})"),
+        req == TOTAL as isize,
+    );
+
+    // And proof the frame actually left for a resolved neighbour, not merely
+    // that the call returned a length: an ICMP echo whose reply the peer sends
+    // back. The peer is beyond slirp, so the next hop is the *router* (the
+    // default route's gateway) rather than the destination itself, which
+    // exercises the route half of the lookup too. The IP header and the ICMP
+    // checksum are built here - the door carries the caller's packet untouched
+    // - and the reply is read off the raw-IP receive queue, which the seam
+    // fills with every IPv4 packet it delivers. Only a frame the resolved link
+    // address (the router's MAC, learned by the ARP probe the door ran) carried
+    // can bring this back. The address is the one `t-rawicmp` pings, so both
+    // tests share the one external dependency the `external` group already
+    // accepts.
+    const PEER: [u8; 4] = [110, 242, 74, 102];
+    let mut peer = libc::sockaddr_in {
+        sin_family: libc::AF_INET as u16,
+        sin_port: 0,
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_be_bytes(PEER),
+        },
+        sin_zero: [0; 8],
+    };
+    let mut echo = [0u8; 28]; // 20 IPv4 + 8 ICMP
+    echo[0] = 0x45;
+    echo[2..4].copy_from_slice(&28u16.to_be_bytes());
+    echo[8] = 64; // ttl
+    echo[9] = 1; // ICMP
+    echo[12..16].copy_from_slice(&[10, 0, 2, 15]); // our source
+    echo[16..20].copy_from_slice(&PEER); // the peer, off-link
+    let ec = cksum(&echo[0..20]).to_be_bytes();
+    echo[10..12].copy_from_slice(&ec);
+    echo[20] = 8; // ICMP echo request
+    echo[24..26].copy_from_slice(&0x504du16.to_be_bytes()); // identifier
+    echo[26..28].copy_from_slice(&1u16.to_be_bytes()); // sequence
+    let ic = cksum(&echo[20..28]).to_be_bytes();
+    echo[22..24].copy_from_slice(&ic);
+    let echo_sent = unsafe {
+        as_raw(libc::sendto(
+            raw,
+            echo.as_ptr().cast::<c_void>(),
+            echo.len(),
+            0,
+            (&raw mut peer).cast::<libc::sockaddr>(),
+            core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) as isize)
+    };
+    r.check(
+        &format!("a unicast ICMP echo through it is sent (got {echo_sent})"),
+        echo_sent == echo.len() as isize,
+    );
+
+    // The raw-IP door holds earlier answers still unread (the unicast DISCOVER
+    // may have earned one among them); drain them so the wait below is this
+    // echo's own reply and no earlier packet's.
+    let mut drain = [0u8; 640];
+    while unsafe {
+        as_raw(libc::recvfrom(
+            raw,
+            drain.as_mut_ptr().cast::<c_void>(),
+            drain.len(),
+            libc::MSG_DONTWAIT,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        ) as isize)
+    } >= 0
+    {}
+
+    let raw_echo_fd = unsafe { BorrowedFd::borrow_raw(raw) };
+    let mut waiting_echo = [PollFd::new(&raw_echo_fd, PollFlags::IN)];
+    let echo_ready = poll(&mut waiting_echo, Some(&PATIENCE));
+    r.check(
+        &format!("and the peer answers it with an echo reply ({echo_ready:?})"),
+        echo_ready == Ok(1),
+    );
+    if echo_ready == Ok(1) {
+        // Scan every readable packet, not just the first: a late DHCP answer
+        // may share the queue with the echo reply, and this claim is about the
+        // echo's own.
+        let mut reply = [0u8; 640];
+        let mut from_peer = false;
+        loop {
+            let n = unsafe {
+                as_raw(libc::recvfrom(
+                    raw,
+                    reply.as_mut_ptr().cast::<c_void>(),
+                    reply.len(),
+                    libc::MSG_DONTWAIT,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                ) as isize)
+            };
+            if n < 20 {
+                break;
+            }
+            if reply[9] == 1 && reply[12..16] == PEER {
+                from_peer = true;
+                break;
+            }
+        }
+        r.check(
+            "whose protocol is ICMP and whose source is the peer",
+            from_peer,
+        );
     }
 
     // --- a DISCOVER sent through the SOCK_RAW socket, header and all ---

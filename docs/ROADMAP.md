@@ -31,10 +31,11 @@ One-glance status of the whole roadmap.
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
 - [~] 4.3 TCP — loopback, listener and `SO_REUSEADDR` done; two options record-only (§4.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
-- [~] 4.5 `AF_PACKET` — link layer as a socket, userland DHCP can ask; both types served —
+- [x] 4.5 `AF_PACKET` — link layer as a socket, userland DHCP can ask; both types served —
   `SOCK_DGRAM` (payload shape) and `SOCK_RAW` (whole frames in, the caller's own header out) —
   and the wire format's host pin landed (`crates/link`, `fuzz/link_wire`, §4.5); the raw-IP
-  door (`IPPROTO_RAW`) is open with its unicast half the one named gap left (§4.5)
+  door (`IPPROTO_RAW`) is complete, its unicast half closing with a next-hop/ARP resolver
+  (`src/net/arp.rs`) now (§4.5)
 
 **Memory (Phase 5)**
 - [x] anonymous demand paging — a `mmap` is an address space; `mincore` reads the page tables (§5.1, §5.2)
@@ -204,20 +205,7 @@ In the order that keeps each step verifiable on its own:
    tracer rewriting the frame at that stop (§8.2).
 2. **interrupt-driven block completions** (§10.5's last row) — measured and re-scoped; §10.5
    carries the structure change, its pin and what each machine's clock can see.
-3. **what is left of the DHCP chain** (§4.5) — the raw-IP door's rules, cause and reverted
-   attempt are §4.5's; the door is open through the device path the revert demanded, and the
-   client is **verified end to end on the machine** (2026-10-13: `udhcpc: broadcasting
-   discover` → `lease of 10.0.2.15 obtained from 10.0.2.2, lease time 86400`). It took two
-   calls besides the door: the receive is an `AF_PACKET` **`recvmsg`** (measured on the host
-   with `strace`, not the `read`/`recvfrom` `t-dhcp` had been pinning), and the seam's own
-   ethertype constant was written with the wrong endian detour, so no door was ever filled.
-   `t-dhcp` now reads one answer with each of the two calls. The wire-format parsers' missing
-   host-side pin **closed** (2026-10-13): the `sockaddr_ll` decode, the Ethernet header and the
-   frame ring moved to the `crates/link` leaf (`fuzz/link_wire`). `AF_PACKET`'s **`SOCK_RAW`**
-   **closed** (2026-10-14): whole frames in, the caller's own header out, with each rule
-   measured on the host and both halves pinned by `t-dhcp` (§4.5), so what is left is the one
-   named gap: the unicast half of the raw-IP send.
-4. **the weston pointer on the window** (R.7, §7.4) — the root cause is fixed in code: the cursor
+3. **the weston pointer on the window** (R.7, §7.4) — the root cause is fixed in code: the cursor
    queue is configured when the device has one, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` is accepted
    with `HOTSPOT_X`/`HOTSPOT_Y` published per-client, and binding or moving the plane hands the
    pointer to the host over virtio-gpu `UPDATE_CURSOR`/`MOVE_CURSOR`; the software blend is now only
@@ -235,10 +223,10 @@ In the order that keeps each step verifiable on its own:
    and read the pointer rendering. The serial log should carry the new `virtio-gpu: … cursorq=1`
    token. Two residuals stay named rather than claimed: the window confirmation itself, and the
    no-cursorq fallback branch, which neither configured machine can exercise (§7.4).
-5. **the display path specifically** — §7.4 carries its own order, and its first step is not a
+4. **the display path specifically** — §7.4 carries its own order, and its first step is not a
    kernel change at all: boot a wlroots compositor on `WLR_RENDERER=pixman` and read what it
    says; it is the cheapest way to find what the analysis has wrong.
-6. **the renderer's device identity** (§7.4's last update) — niri now boots on a 3D card and the
+5. **the renderer's device identity** (§7.4's last update) — niri now boots on a 3D card and the
    card negotiates its cap sets, so the compositor's remaining refusal is Mesa's: it still picks
    `llvmpipe` and names why (`egl: failed to create dri2 screen`). The lead is the DRM node's own
    sysfs path — `/sys/devices/virtual/drm/card0` while its `device` link reaches the PCI function,

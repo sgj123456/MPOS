@@ -2917,19 +2917,33 @@ fn raw_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>) -> isize {
             packet.set_ident(RAW_IDENT.fetch_add(1, core::sync::atomic::Ordering::Relaxed));
         }
         packet.fill_checksum();
-        let dst = packet.dst_addr();
-        // One shape this door does not serve yet, refused by name rather than
-        // addressed to a guess: a *unicast* destination needs the ARP/next-hop
-        // lookup smoltcp performs for every other socket, and this path
-        // reaches the device directly. All a DHCP client sends before it has
-        // an address is broadcast, which needs no neighbour - and the client's
-        // renewal against a known server is the first caller to hit this line
-        // (measured in a product boot: `bind-choosenack` stops here, not in a
-        // crash). The prerequisite is named in §4.5.
-        if !dst.is_broadcast() {
-            return err::EOPNOTSUPP;
-        }
-        ([0xffu8; 6], packet.total_len() as usize)
+        let dst = packet.dst_addr().octets();
+        // A broadcast destination needs no neighbour: the limited broadcast is
+        // `255.255.255.255`, and a subnet's *directed* broadcast is the
+        // all-ones host of one of our own subnets. Either goes to the
+        // broadcast MAC and ARPs for nobody.
+        let dst_mac = if dst == [255, 255, 255, 255] || super::arp::is_subnet_broadcast(dst) {
+            [0xffu8; 6]
+        } else {
+            // A unicast destination needs the next hop - on-link it is the
+            // destination itself, otherwise the router a matching route names
+            // (longest prefix first), and no route at all is `ENETUNREACH`,
+            // measured on the host. Then the hop's link address, which is the
+            // ARP/next-hop lookup smoltcp performs for every socket it sends
+            // and which this direct-to-device door has to do for itself
+            // (`docs/notes/` §4.5). An unanswered probe is `EHOSTUNREACH`: a
+            // synchronous stack cannot queue the frame for a later retry, so
+            // it says the frame did not leave rather than returning a length
+            // for one that never did.
+            let Some(next) = super::arp::next_hop(dst) else {
+                return err::ENETUNREACH;
+            };
+            match super::arp::resolve(next) {
+                Ok(mac) => mac,
+                Err(e) => return e,
+            }
+        };
+        (dst_mac, packet.total_len() as usize)
     };
     match super::packet::send_frame(dst_mac, crate::link::IPV4_ETHERTYPE, &pkt[..len]) {
         Ok(n) => n as isize,

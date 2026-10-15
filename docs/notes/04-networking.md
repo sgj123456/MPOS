@@ -492,7 +492,7 @@ message.
 
 ---
 
-### 4.5 `AF_PACKET` — the link layer as a socket — **PARTIAL**, the raw-IP unicast half named
+### 4.5 `AF_PACKET` — the link layer as a socket — **CLOSED**
 
 The kernel had been the last word on the machine's address with no door for
 userland to overrule it: `10.0.2.15` was a boot-time constant and `EAFNOSUPPORT`
@@ -575,8 +575,8 @@ The named gaps, each with what it waits on:
   leases: `udhcpc: broadcasting discover` / `broadcasting select for 10.0.2.15,
   server 10.0.2.2` / `lease of 10.0.2.15 obtained from 10.0.2.2, lease time
   86400` (2026-10-13) - the address is the client's own negotiation from here,
-  over a door userland drives, and not a number this kernel decided. What is
-  left is the raw-IP door's unicast half, named below.
+  over a door userland drives, and not a number this kernel decided. The
+  raw-IP door's unicast half, once named below, is closed (2026-10-15).
 * **What a first attempt at that door measured, and why it was reverted** (2026-10-12).
   The rules were measured on the host first (`.workbuddy/probe_rawip.c`): `IP_HDRINCL`
   reads **1** on a fresh `SOCK_RAW`/`IPPROTO_RAW` socket (the protocol implies the
@@ -696,6 +696,50 @@ The named gaps, each with what it waits on:
   exactly the spelling a second copy of that constant got wrong two bullets up —
   so the parse that could not be tested is now the parse whose endianness cannot
   drift silently again.
+* **Closed (2026-10-15): the raw-IP door's unicast half — the next hop, and its
+  link address.** The door's broadcast shape (all a DHCP client sends before it
+  has an address) needs no neighbour: the frame goes to the broadcast MAC. A
+  **unicast** destination is the gap two bullets up named: it needs the route
+  and the neighbour's MAC, the lookup smoltcp performs for every socket it sends
+  and which this direct-to-device door has to do for itself. The routing rule was
+  measured on the host first (`.workbuddy/arp_probe.c`, an `IPPROTO_RAW` socket
+  over a veth pair and a route-less netns):
+
+  * **No route is `ENETUNREACH`**, synchronously. An `IPPROTO_RAW` `sendto` in a
+    namespace whose only interface shares no subnet with the destination (and has
+    no default route) answers `-1`/`ENETUNREACH` (101); with a route - the
+    destination on-link, or a default route - the same call returns the length.
+  * **A route with an unresolved neighbour returns the length anyway.** Linux
+    queues the frame and resolves ARP in the background, so `sendto` is
+    fire-and-forget for the neighbour. A synchronous stack has nowhere to queue,
+    so this door resolves in place and answers `EHOSTUNREACH` if no reply comes.
+    That is the door's one divergence from Linux, and it is the honest half of
+    the pair: a length returned for a frame that never left is the one answer
+    this kernel may not give (`AGENTS.md` §3.2).
+
+  The lookup is Linux's routing rule, not a guess: a destination inside one of
+  eth0's own subnets is on the wire (the next hop is the destination itself),
+  anything else leaves by the matching route with the longest prefix (the default
+  route's gateway, `10.0.2.2`), and no route at all is `ENETUNREACH`. The link
+  address is ARP, in `src/net/arp.rs`: a bounded cache the NIC seam fills from
+  every ARP frame (`arp::observe`, called beside `packet::deliver` and
+  `echo_to_raw_doors` - the same frame that fills smoltcp's own `NeighborCache`,
+  which is private and which this door, bypassing smoltcp, cannot reach), and a
+  cache miss runs a bounded probe (`arp::resolve`: three one-second requests, the
+  count Linux's own `ucast_solicit` uses) that drives the stack until the reply
+  arrives. A subnet's *directed* broadcast (`10.0.2.255`) is also served, by the
+  broadcast MAC and no probe. The ARP wire format is smoltcp's `ArpRepr`/
+  `ArpPacket` - the parser the IP layer already trusts - so this adds a cache and
+  a probe, not a parser, and owes no new fuzz target; the only wire fact this side
+  adds is `link::ARP_ETHERTYPE`, pinned in `crates/link` beside `IPV4_ETHERTYPE`.
+
+  `t-dhcp` pins it on both machines: the unicast DISCOVER aimed at the server now
+  returns its whole length (a broken next-hop or ARP path would answer
+  `EHOSTUNREACH` there instead), and a unicast ICMP echo - built here, so the door
+  carries the caller's packet untouched - is answered by the peer `t-rawicmp`
+  pings, which proves the frame left for the resolved link address (the router's
+  MAC, since that peer is off-link). `link`'s host test pins `ARP_ETHERTYPE ==
+  u16::from_le_bytes([0x08, 0x06])`.
 
 ---
 

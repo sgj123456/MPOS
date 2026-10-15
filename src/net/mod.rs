@@ -47,6 +47,9 @@
 //! - which is why `ping 127.0.0.1` still travels the virtual wire (and still
 //! works, through slirp) rather than the loopback.
 
+/// Neighbour resolution for the raw-IP door: the cache the seam fills and the
+/// ARP probe a unicast send runs (`docs/notes/` §4.5).
+pub mod arp;
 pub mod packet;
 /// The seam's frame counters and buffer pool (§10.4).
 ///
@@ -2419,6 +2422,13 @@ impl Device for NicDevice {
         // it is any of the IP layer's business - which is the whole point of
         // the family (see `packet`).
         packet::deliver(pending.as_slice());
+        // Learn the sender of any ARP frame before smoltcp sees it: the
+        // raw-IP door's unicast half resolves its next hop through this cache
+        // (`arp::observe`/`arp::resolve`), and the reply to its own probe is
+        // one of the frames this line is the only place to catch - smoltcp
+        // keeps its own cache private, and this stack's raw door bypasses
+        // smoltcp entirely (`docs/notes/` §4.5).
+        arp::observe(pending.as_slice());
         // The wildcard raw door (`AF_INET`+`SOCK_RAW`+`IPPROTO_RAW`) cannot
         // hold a filterless smoltcp socket - it would swallow the machine's
         // UDP and TCP delivery - so its receive queue is filled by a bounded

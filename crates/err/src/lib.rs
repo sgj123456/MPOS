@@ -125,6 +125,12 @@ pub const ENETDOWN: isize = -100;
 /// IPv6 stub answers at `connect`, so a caller walking a getaddrinfo
 /// list falls through to the IPv4 answer the way Linux lets it.
 pub const ENETUNREACH: isize = -101;
+/// EHOSTUNREACH: a route exists but no host answered for it. The raw-IP
+/// send's answer when an ARP probe for the next hop goes unanswered: the
+/// frame did not leave, and this kernel has nowhere to queue it for a
+/// later retry the way Linux's async neighbour path does (`docs/notes/`
+/// §4.5).
+pub const EHOSTUNREACH: isize = -113;
 /// ENOTCONN: the socket is not connected, and the call needs it to be.
 pub const ENOTCONN: isize = -107;
 /// EISCONN: the socket is already connected, and `connect` was asked again.
