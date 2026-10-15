@@ -63,9 +63,10 @@ One-glance status of the whole roadmap.
   where Linux makes them so**: an abstract name belongs to the namespace of the socket that holds
   it (the name binds again in another, and neither namespace can dial the other's), a *path* name
   is not namespaced at all and crosses both ways, and what keys the abstract half is the socket's
-  namespace rather than the calling task's (§6.3, measured). What NET still cannot do is move a
-  device: `eth0` cannot enter a namespace, and a vsock stack stays machine-wide - which is Linux's
-  own shape, measured, with the transport question named (§6.3); the other four kinds Linux has -
+  namespace rather than the calling task's (§6.3, measured). A device can move: `eth0` enters a
+  namespace (`ip link set eth0 netns N`, served 2026-10-16 - down and unconfigured on arrival,
+  which is Linux's shape measured, §6.3); a vsock stack stays machine-wide - which is Linux's own
+  shape, measured, with the transport question named (§6.3); the other four kinds Linux has -
   user, IPC, cgroup and time - have no entry at all here (§6.3, §6.6), which is `vfs::ns::Kind::ALL`
   against `namespaces(7)`'s list of eight
 
@@ -187,12 +188,12 @@ One-glance status of the whole roadmap.
 In the order that keeps each step verifiable on its own:
 
 1. **namespaces** (§6.3) — UTS, MNT, PID and NET are landed, and the ladder's remaining work
-   is named per rung: a **wire that can move** into a namespace (`eth0` still cannot enter one -
-   `ip link set eth0 netns N` is refused `EOPNOTSUPP` now instead of the bare `0` it returned, so
-   what remains is the move itself and not the honesty about it; 2026-10-15),
-   nested namespaces pin the *numbers* two levels deep now, as the zap's reach already did, and
-   then the four kinds with no entry at all
-   (user, IPC, cgroup, time - four of `namespaces(7)`'s eight). The `/proc/net` reader's rows were
+   is named per rung: a **wire that can move** into a namespace has landed (2026-10-16) -
+   `ip link set eth0 netns N` moves the device, and it arrives **down and unconfigured** because
+   an address is the namespace's and not the device's (measured on Linux first; `t-ns-net` walks a
+   whole round trip, §6.3), so what is left here is the four kinds with no entry at all
+   (user, IPC, cgroup, time - four of `namespaces(7)`'s eight); nested namespaces pin the
+   *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were
    per-namespace but unexercised; `t-ns-net` reads the file on both sides of the boundary now
    (2026-10-15). Two more left this list on
    2026-10-15: the pid namespace's own creation rules (one per process, and a sealed one takes no

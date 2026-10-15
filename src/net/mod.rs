@@ -430,6 +430,49 @@ impl Wire {
         let sock = self.sockets.get_mut::<tcp::Socket>(h);
         sock.connect(iface.context(), remote, local)
     }
+
+    /// Hand the wire over to another namespace: the device and the interface,
+    /// and nothing else.
+    ///
+    /// The **socket set stays behind**, and that is the whole difference between
+    /// a device and a namespace: sockets belong to the namespace they were made
+    /// in (`HOMES`) and stay in it when the wire leaves, which is what makes a
+    /// socket aimed off-box in the namespace the wire left answer
+    /// `ENETUNREACH` from here on rather than follow the device.
+    fn hand_over(&mut self) -> Option<(NicDevice, Interface)> {
+        match (self.device.take(), self.iface.take()) {
+            (Some(device), Some(iface)) => {
+                // What is left has no wire to poll.
+                self.up = false;
+                Some((device, iface))
+            }
+            // Never half a wire: a device with no interface, or the other way
+            // round, is a stack this kernel did not build, so both go back
+            // where they were and the caller hears "there is no wire here".
+            (device, iface) => {
+                self.device = device;
+                self.iface = iface;
+                None
+            }
+        }
+    }
+
+    /// Take a wire in, the way Linux hands one over: **down** and **with
+    /// nothing configured on it**.
+    ///
+    /// Down because the device is closed on its way out and does not come back
+    /// up by itself - measured on this developer's Linux (`ip link set X netns
+    /// N` lands with `IFF_UP` clear). Unconfigured because an address belongs to
+    /// the namespace holding it and not to the device: the same measurement
+    /// shows the address and the route gone on *both* sides of a move, which is
+    /// why an interface that arrives has to be configured again.
+    fn take_in(&mut self, device: NicDevice, mut iface: Interface) {
+        iface.update_ip_addrs(|addrs| addrs.clear());
+        iface.routes_mut().update(|routes| routes.clear());
+        self.device = Some(device);
+        self.iface = Some(iface);
+        self.up = false;
+    }
 }
 
 /// Everything the network stack owns, in one place behind one lock.
@@ -2333,6 +2376,59 @@ pub fn mint_namespace() -> u64 {
             .push((id, Stack::deviceless()));
     });
     id
+}
+
+/// Whether a namespace number resolves to a stack - the machine's own always
+/// does once [`init`] has run, and one minted by [`mint_namespace`] does from
+/// the moment it is handed out.
+fn stack_lives(ns: Option<u64>) -> bool {
+    with_namespace(ns, |_| true).unwrap_or(false)
+}
+
+/// Move the machine's one movable device out of the stack `from` owns and into
+/// the stack `to` owns.
+///
+/// `None` is the machine's own namespace, the spelling every task that never
+/// unshared carries. What the move means is Linux's shape, measured on this
+/// developer's kernel before any of it was written (`docs/notes/` §6.3): the
+/// device keeps its name, its MTU, its hardware address and its interface
+/// index, and it arrives **down** and **unconfigured** - because an address
+/// belongs to the namespace holding it, not to the device, both sides of a
+/// move end up with none.
+///
+/// That last part is why this is not a rename with extra steps: the namespace
+/// the wire left loses its addresses and its routes too, so a caller that
+/// moves a device and expects to go on using the network through it has to
+/// configure it again - which is what a script does on Linux for the same
+/// reason.
+pub(crate) fn move_wire(from: Option<u64>, to: Option<u64>) -> Result<(), isize> {
+    // Moving into the namespace it is already in succeeds and does nothing:
+    // Linux gets out before it touches the device (`net_eq`), which is why the
+    // address survives that call and not a real move.
+    if normalize(from) == normalize(to) {
+        return Ok(());
+    }
+    // Both doors have to exist *before* the device leaves the first one,
+    // because a wire taken out of a namespace that cannot take it in is lost -
+    // and the errno is the one Linux gives a name it cannot resolve.
+    if !stack_lives(to) {
+        return Err(crate::err::ESRCH);
+    }
+    let taken = with_namespace(from, |st| {
+        st.eth.hand_over().map(|wire| (wire, st.eth_name.clone()))
+    });
+    let Some(((device, iface), name)) = taken.flatten() else {
+        // No wire here to move: a namespace with no device, or the machine
+        // after its one device has left it.
+        return Err(crate::err::ENODEV);
+    };
+    with_namespace(to, |st| {
+        st.eth.take_in(device, iface);
+        // The name travels with the device, which is what Linux's own
+        // `dev_change_net_namespace(dev, net, pat)` carries it for.
+        st.eth_name = name;
+    });
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

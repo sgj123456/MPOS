@@ -448,6 +448,19 @@ fn le32(value: &[u8]) -> Option<u32> {
     (value.len() == 4).then(|| u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
+/// How a link request names the network namespace a device is being moved
+/// into. Only one of the two ever appears, and a caller that sends both has
+/// the last one win - which is what Linux's own parser does, since each arm
+/// writes the same variable.
+enum Move {
+    /// A pid, read in the caller's own pid namespace: the task's net namespace
+    /// is the destination. This is `ip link set eth0 netns <pid>`.
+    Pid(u32),
+    /// An open `/proc/<pid>/ns/net`: the descriptor `setns` would join, which
+    /// is what `ip link set eth0 netns <name>` passes.
+    Fd(u32),
+}
+
 /// Apply one mutation request to the live stack. Returns the errno (already
 /// negated, the kernel's convention) - zero is success.
 fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
@@ -660,19 +673,30 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
             let mut mtu: Option<u32> = None;
             let mut name: Option<Vec<u8>> = None;
             // A request to move this device into another network namespace:
-            // `ip link set eth0 netns N` carries one of these. `eth0` cannot
-            // leave the machine and this kernel has no place to move a device
-            // *to* (§6.3), so the whole request is refused rather than
-            // half-applied. Before this arm the attribute fell to the catch-all
-            // and the request answered `0`: a script that ran the command
-            // believed its wire had moved when nothing had, which is the worst
-            // answer this ABI can give. Linux serves the move; this kernel says
-            // so in its errno instead.
-            let mut move_to = false;
+            // `ip link set eth0 netns N` carries one of these, and it is served
+            // now - the wire travels, down and unconfigured, into the namespace
+            // it names (`net::move_wire`, and §6.3 for the measurement that
+            // says what "served" has to mean).
+            //
+            // Before any of that existed the attribute fell to the catch-all and
+            // the request answered `0`: a script that ran the command believed
+            // its wire had moved when nothing had, which is the worst answer
+            // this ABI can give, and why this arm was written before the move
+            // was.
+            let mut move_to = None;
             let ok = for_each_attr(body, 16, |ty, value| {
                 match ty {
                     IFLA_MTU => mtu = le32(value),
-                    IFLA_NET_NS_PID | IFLA_NET_NS_FD => move_to = true,
+                    IFLA_NET_NS_PID => {
+                        if let Some(pid) = le32(value) {
+                            move_to = Some(Move::Pid(pid));
+                        }
+                    }
+                    IFLA_NET_NS_FD => {
+                        if let Some(fd) = le32(value) {
+                            move_to = Some(Move::Fd(fd));
+                        }
+                    }
                     IFLA_IFNAME => {
                         // The NUL a label carries is part of the value, not
                         // the name.
@@ -685,8 +709,45 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
             if !ok {
                 return crate::err::EINVAL;
             }
-            if move_to {
-                return crate::err::EOPNOTSUPP;
+            if let Some(target) = move_to {
+                // `lo` is not movable at all: Linux refuses a netns-local
+                // device with `EINVAL` (measured: `ip link set lo netns N`
+                // against a live namespace of another kind answers -22).
+                if index == LO_INDEX {
+                    return crate::err::EINVAL;
+                }
+                let to = match target {
+                    // A pid read in the caller's own pid namespace, naming the
+                    // task whose net namespace is the destination.
+                    Move::Pid(pid) => {
+                        match crate::sched::ns_of(pid as usize, crate::vfs::ns::Kind::Net) {
+                            Some(crate::vfs::ns::Namespace::Net(id)) => Some(id),
+                            // A pid that names no task: `ESRCH`, which is what
+                            // Linux's `get_net_ns_by_pid` answers (measured:
+                            // -3), and the reason this is not a silent `0`.
+                            _ => return crate::err::ESRCH,
+                        }
+                    }
+                    // An open `/proc/<pid>/ns/net`, the same object `setns`
+                    // joins - so the resolution is `setns`'s, and so is the
+                    // errno for a descriptor that is not one (measured: -22).
+                    Move::Fd(fd) => {
+                        let Ok(file) = crate::sched::current_fds().clone_at(fd as i32) else {
+                            return crate::err::EBADF;
+                        };
+                        match file.inode().as_namespace() {
+                            Some(crate::vfs::ns::Namespace::Net(id)) => Some(id),
+                            _ => return crate::err::EINVAL,
+                        }
+                    }
+                };
+                // The device is looked up in the namespace the *caller* is in,
+                // which is the one that owns it - a wire that has already left
+                // answers `ENODEV` rather than following the caller around.
+                return match crate::net::move_wire(crate::sched::current_net_ns(), to) {
+                    Ok(()) => 0,
+                    Err(e) => e,
+                };
             }
             // The `ifi_change` mask is what says the request means its
             // flags: `ip link set eth0 down` sends flags with only IFF_UP

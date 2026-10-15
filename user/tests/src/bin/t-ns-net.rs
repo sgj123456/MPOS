@@ -10,11 +10,13 @@
 //!   netlink write has to land in *the writer's* namespace for the socket to
 //!   work afterwards;
 //! * and it has **no wire**: there is no `eth0` to bring up, and the link dump
-//!   has no entry for one, because a namespace cannot take the machine's only
-//!   NIC with it (`ip link set eth0 netns N` is the thing this kernel has no
-//!   place for - the first named gap of the rung) - and the machine's namespace
-//!   answers that move request with `EOPNOTSUPP` rather than a success that
-//!   moved nothing, which is the claim the parent pins below;
+//!   has no entry for one, because a namespace is born with `lo` alone. It used
+//!   to be *stuck* that way - `ip link set eth0 netns N` was the first named
+//!   gap of the rung - but the move is served now, and the last claim below
+//!   walks a whole round trip of it: the wire leaves the machine's namespace,
+//!   arrives in the child's down and unconfigured, and comes back. What the
+//!   parent pins in *this* section is what the request still refuses: `lo`,
+//!   which is netns-local (`EINVAL`), and a pid that names no task (`ESRCH`).
 //! * while the machine's stack is untouched: the very port the child holds is
 //!   **free** in the parent's namespace, and a connect to it there is refused -
 //!   the two port spaces are two;
@@ -145,6 +147,8 @@ const RTM_SETLINK: u16 = 19;
 const RTM_NEWADDR: u16 = 20;
 const NLMSG_ERROR: u16 = 2;
 const IFF_UP: u32 = 0x1;
+const RTM_NEWROUTE: u16 = 24;
+const RTA_GATEWAY: u16 = 5;
 const IFA_ADDRESS: u16 = 1;
 /// `IFLA_NET_NS_PID` (`linux/if_link.h`): the network namespace a `link set`
 /// wants to move the device into, named by a pid in the caller's namespace.
@@ -234,6 +238,33 @@ fn add_addr(index: i32, prefix: u8, ip: [u8; 4]) -> Msg {
     m
 }
 
+/// `ip route add default via <gw>` - the `rtmsg` of `rtnetlink(7)`: family,
+/// destination length (zero, which is what "default" means), then the rest of
+/// the twelve bytes, then the router. No `RTA_DST` at all: the kernel reads a
+/// missing destination as the zero prefix, and it requires `RTA_GATEWAY`.
+fn add_route(gateway: [u8; 4]) -> Msg {
+    let head = [2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut m = Msg::new(
+        RTM_NEWROUTE,
+        NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE,
+        &head,
+    );
+    m.attr(RTA_GATEWAY, &gateway);
+    m
+}
+
+/// The machine's wire as the boot configures it. The move pin has to put both
+/// back after the wire comes home, for the reason Linux makes it necessary: an
+/// address belongs to the namespace that holds it, not to the device, so a
+/// device that arrives in a namespace has none.
+const WIRE_IP: [u8; 4] = [10, 0, 2, 15];
+const WIRE_PREFIX: u8 = 24;
+const WIRE_GATEWAY: [u8; 4] = [10, 0, 2, 2];
+
+/// A pid no task answers to. `ip` refuses this itself, so the kernel's answer
+/// never reaches a script - the raw request here is what measures it.
+const NO_SUCH_PID: i32 = 999_999;
+
 /// Open a route-netlink socket.
 fn route_socket() -> Option<OwnedFd> {
     let fd = socket(AddressFamily::NETLINK, SocketType::RAW, None).ok()?;
@@ -308,6 +339,177 @@ fn proc_net_tcp_local(port: u16, state: u8) -> Option<bool> {
 /// (`new_abstract_name`), so this file carries no second copy of the encoding.
 fn abstract_addr(name: &[u8]) -> rustix::net::SocketAddrUnix {
     rustix::net::SocketAddrUnix::new_abstract_name(name).expect("an abstract name fits its field")
+}
+
+/// The machine's wire can be moved into a namespace, and comes back.
+///
+/// Linux's shape, measured on the host before any of this was written
+/// (`.workbuddy/probe-netns-move.sh` and `.workbuddy/probe-netns-errno2.py`,
+/// transcript in `docs/notes/` §6.3): the device keeps its name, its MTU, its
+/// hardware address and its interface index, and it arrives **down** and **with
+/// nothing configured on it** - an address belongs to the namespace that holds
+/// it, not to the device, so both sides of the move end up with none, and a
+/// moved interface has to be configured again.
+///
+/// Three of those halves are observable without a dump parser:
+///
+/// * the namespace it left has no `eth0` at all afterwards - `ENODEV` where the
+///   same request answered `0` a moment earlier;
+/// * the namespace it entered has one, and can give it the very address the
+///   machine had, which it could not if the address had travelled with the
+///   device (`EEXIST`);
+/// * and it comes back the same way it left, so the machine has to bring it up
+///   and address it again before it has a network.
+///
+/// The last one is why **nothing is asserted until the wire is home and
+/// configured**: a claim that failed halfway would leave the machine with no
+/// network for every test that runs after this one, and this program is one of
+/// ~180 sharing a boot.
+fn wire_moves_into_a_namespace(r: &mut Report) {
+    let to_child = pipe();
+    let to_parent = pipe();
+    r.check(
+        "the move's two pipes are made",
+        to_child.is_ok() && to_parent.is_ok(),
+    );
+    let (Ok((down_r, down_w)), Ok((up_r, up_w))) = (to_child, to_parent) else {
+        return;
+    };
+    // The child names this pid to hand the wire back, and it has to be read
+    // before the clone: the child inherits the number.
+    let parent_pid = std::process::id() as i32;
+    let child = clone_word(libc::SIGCHLD as usize | libc::CLONE_NEWNET as usize);
+    if child == 0 {
+        // SAFETY: the clone child, so nothing of `std`'s may run past it and
+        // every way out is a raw `_exit`.
+        unsafe {
+            libc::syscall(libc::SYS_close, up_r.as_raw_fd() as libc::c_long);
+            libc::syscall(libc::SYS_close, down_w.as_raw_fd() as libc::c_long);
+        }
+        let mut word = [0u8; 8];
+        // Two rounds, and the second is not optional: a wire left in a
+        // namespace whose last task is leaving it does not come home.
+        loop {
+            let n = match read(&down_r, &mut word) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+            let Some(fd) = route_socket() else {
+                break;
+            };
+            if word[0] == b'1' {
+                // This namespace holds the wire now: bringing it up and
+                // addressing it both work, where both were `ENODEV` before.
+                let here = ask(&fd, &set_link_up(ETH_INDEX));
+                let addressed = ask(&fd, &add_addr(ETH_INDEX, WIRE_PREFIX, WIRE_IP));
+                let line = format!("{here} {addressed}\n");
+                let _ = write(&up_w, line.as_bytes());
+            } else {
+                // Hand it back by naming the parent, which is in the machine's
+                // namespace. This is the caller Linux demands of the request:
+                // the device is in *this* namespace now, and a request from
+                // outside it has no standing over it.
+                let back = ask(&fd, &set_link_netns(ETH_INDEX, parent_pid));
+                let line = format!("{back}\n");
+                let _ = write(&up_w, line.as_bytes());
+                break;
+            }
+        }
+        raw_exit(0);
+    }
+    drop(down_r);
+    drop(up_w);
+    r.check("the child that will take the wire was cloned", child > 0);
+    if child <= 0 {
+        return;
+    }
+    let Some(fd) = route_socket() else {
+        r.check("the machine's route socket is made", false);
+        return;
+    };
+
+    // ---- the whole round trip, before any claim is made ----
+    let before = ask(&fd, &set_link_up(ETH_INDEX));
+    let moved = ask(&fd, &set_link_netns(ETH_INDEX, child as i32));
+    let gone = ask(&fd, &set_link_up(ETH_INDEX));
+    let _ = write(&down_w, b"1\n");
+    let mut line = [0u8; REPORT_MAX];
+    let n = read_line(&up_r, &mut line);
+    let seen: Vec<isize> = String::from_utf8_lossy(&line[..n])
+        .split_whitespace()
+        .filter_map(|f| f.parse().ok())
+        .collect();
+    let child_up = seen.first().copied().unwrap_or(-5);
+    let child_addr = seen.get(1).copied().unwrap_or(-5);
+    let _ = write(&down_w, b"2\n");
+    let n = read_line(&up_r, &mut line);
+    let back: isize = String::from_utf8_lossy(&line[..n])
+        .split_whitespace()
+        .filter_map(|f| f.parse().ok())
+        .next()
+        .unwrap_or(-5);
+    // Restoring the machine, which is what Linux's shape makes necessary: the
+    // wire came back down and unconfigured, and every test that runs after this
+    // one needs the network.
+    let up_again = ask(&fd, &set_link_up(ETH_INDEX));
+    let addressed = ask(&fd, &add_addr(ETH_INDEX, WIRE_PREFIX, WIRE_IP));
+    let routed = ask(&fd, &add_route(WIRE_GATEWAY));
+    let status = rustix::process::waitpid(
+        rustix::process::Pid::from_raw(child as i32),
+        rustix::process::WaitOptions::empty(),
+    );
+
+    // ---- and only now the claims ----
+    let enodev = -(Errno::NODEV.raw_os_error() as isize);
+    r.check(
+        &format!("the wire is up in the machine's namespace to start with (got {before})"),
+        before == 0,
+    );
+    r.check(
+        &format!("moving it into the child's namespace succeeds (got {moved})"),
+        moved == 0,
+    );
+    r.check(
+        &format!("and the namespace it left has no eth0 afterwards, ENODEV (got {gone})"),
+        gone == enodev,
+    );
+    r.check(
+        &format!("the child's namespace has the wire and can bring it up (got {child_up})"),
+        child_up == 0,
+    );
+    r.check(
+        &format!(
+            "and can give it the machine's own address, so no address travelled \
+             with the device (got {child_addr}; EEXIST would mean one had)"
+        ),
+        child_addr == 0,
+    );
+    r.check(
+        &format!("the child hands it back by naming the parent (got {back})"),
+        back == 0,
+    );
+    r.check(
+        &format!("the machine has it again and brings it up (got {up_again})"),
+        up_again == 0,
+    );
+    r.check(
+        &format!(
+            "and re-addresses it, because it came back unconfigured \
+             (got {addressed}; EEXIST would mean it had not)"
+        ),
+        addressed == 0,
+    );
+    r.check(
+        &format!("and restores its default route (got {routed})"),
+        routed == 0,
+    );
+    r.check(
+        "and the child that carried the wire is reaped",
+        matches!(&status, Ok(Some((_, st))) if st.exited() && st.exit_status() == Some(0)),
+    );
 }
 
 fn main() {
@@ -601,25 +803,37 @@ fn main() {
         drop(up_w);
         r.check("the child that gets its own stack was cloned", child > 0);
         if child > 0 {
-            // ---- The machine will not give its wire away ----
+            // ---- What the move request still refuses ----
             //
-            // `ip link set eth0 netns N` names a namespace to move the device
-            // *to*, and this kernel has no place to move one to (§6.3). The
-            // request is refused with `EOPNOTSUPP` rather than answered with a
-            // success that moved nothing - the bug this claim pins, because the
-            // attribute used to fall through the parser and the answer was `0`.
-            // The pid is the child's: it is a live task in a namespace of its
-            // own, blocked on the pipe a few lines below, so the destination is
-            // real and the refusal is the kernel's rule rather than an
-            // unresolvable name.
+            // `ip link set X netns N` is served now - the round trip below walks
+            // a whole one - but two shapes of it are refusals, and both are
+            // Linux's own answers, measured on the host with
+            // `.workbuddy/probe-netns-errno2.py`:
+            //
+            //   * `lo` is netns-local: `EINVAL` (-22) whatever it is aimed at;
+            //   * a pid that names no task is `ESRCH` (-3), which is what
+            //     `get_net_ns_by_pid` answers. `ip` refuses that one in
+            //     userland, so no script ever sees the kernel's word.
+            //
+            // Neither moves anything, which is the only reason they can be
+            // asked here in mid-flow: the round trip needs the wire to itself.
             let route = route_socket();
-            let moved = match &route {
-                Some(fd) => ask(fd, &set_link_netns(ETH_INDEX, child as i32)),
-                None => 0,
+            let (lo_moved, gone_pid) = match &route {
+                Some(fd) => (
+                    ask(fd, &set_link_netns(LO_INDEX, child as i32)),
+                    ask(fd, &set_link_netns(ETH_INDEX, NO_SUCH_PID)),
+                ),
+                None => (0, 0),
             };
             r.check(
-                &format!("and the machine refuses to hand its wire away, EOPNOTSUPP (got {moved})"),
-                moved == -(Errno::OPNOTSUPP.raw_os_error() as isize),
+                &format!("lo cannot be moved into a namespace, EINVAL (got {lo_moved})"),
+                lo_moved == -(Errno::INVAL.raw_os_error() as isize),
+            );
+            r.check(
+                &format!(
+                    "and a pid that names no task is ESRCH, not a silent success (got {gone_pid})"
+                ),
+                gone_pid == -(Errno::SRCH.raw_os_error() as isize),
             );
 
             let mine = ns_number();
@@ -977,6 +1191,13 @@ fn main() {
             }
         }
     }
+
+    // ---- The wire can enter a namespace ----
+    //
+    // Last, and deliberately so: it is the one claim here that takes the
+    // machine's only NIC away for a moment, and it puts everything back before
+    // it asserts anything.
+    wire_moves_into_a_namespace(&mut r);
 
     // ---- The identity: a namespace a descriptor can name ----
     //

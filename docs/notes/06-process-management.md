@@ -277,8 +277,8 @@ carrying `127.0.0.1/8`**, where Linux's starts down and unaddressed - because th
 change), so a namespace whose loopback started empty could never be given one and its private
 network would be unusable rather than private. The pin holds both halves: the child's loopback
 answers, and the request that would add the address is refused. And **`ip link set eth0 up` inside
-a namespace is `ENODEV`**, because there is no device at that index - a namespace has no wire, and
-moving one in is `ip link set ... netns`, which this kernel has no place for.
+a namespace is `ENODEV`**, because there is no device at that index - a namespace is born with no wire, and a wire arrives with `ip link set ... netns`, which is served
+now - see the move's own paragraph below.
 
 **And the move request itself is now refused rather than silently accepted (2026-10-15).** The
 rtnetlink `link set` handler parsed only `IFLA_MTU` and `IFLA_IFNAME`, so `ip link set eth0 netns N`
@@ -290,6 +290,47 @@ kernel cannot do it, so it says so. The pin is `t-ns-net`'s parent-side claim, w
 request from the machine's namespace with the child's own pid as the destination (a live task in a
 namespace of its own, so the name resolves) and reads back `-EOPNOTSUPP`; before this change the
 same request answered `0` and the claim fails, which is the counterfactual.
+
+**And the move itself is served (2026-10-16).** `ip link set eth0 netns N` now moves the wire:
+the device, the interface built around it and its name leave the stack that owns them and are
+handed to the stack the request names - by pid (`IFLA_NET_NS_PID`) or by an open
+`/proc/<pid>/ns/net` (`IFLA_NET_NS_FD`, resolved the way `setns` resolves one). What "served" has
+to mean was measured on this developer's Linux *first*, because the shape is not the obvious one
+(`.workbuddy/probe-netns-move.sh` and `.workbuddy/probe-netns-errno2.py`, kernel 7.2):
+
+| question | Linux's answer |
+|---|---|
+| a device moved into another namespace | `0`; it keeps its name, MTU, hardware address and interface index, and arrives **down** (`IFF_UP` cleared) and **with no address and no route** |
+| moved into the namespace it is already in | `0`, and nothing happens - the address even survives |
+| `lo`, into another namespace | `EINVAL` (netns-local) |
+| a pid that names no task | `ESRCH` |
+
+The unconfigured arrival is the surprising half, and it is what an address *belongs to* says: an
+address is the namespace's, not the device's, so both sides of a real move end up with none, which
+is why a moved interface has to be configured again. Two traps in the measuring, both worth their
+line: `ip` validates `netns <n>` in userland and refuses before the kernel ever sees it, so the
+`ESRCH` above is only reachable with a hand-built message - and a first draft of that message
+numbered `IFLA_NET_NS_PID` **27**, which is not what `linux/if_link.h` gives it (**19**, printed
+by `.workbuddy/probe-ifla.c`). Every request answered a plain `0`, including the ones that should
+have failed, which is exactly the silence this rung's earlier claim was written against.
+
+The pin is `t-ns-net`'s `wire_moves_into_a_namespace`, a whole round trip: the machine moves its
+wire into a child cloned with `CLONE_NEWNET`; the machine's next `ip link set eth0 up` is
+`ENODEV` where it had just answered `0`; the child brings the wire up **and gives it the machine's
+own address**, which answers `0` only because no address travelled with the device (`EEXIST` would
+mean one had); the child hands it back by naming the parent, which is the caller Linux requires of
+the request, since the device is in *its* namespace now and a request from outside it has no
+standing; and the machine brings it up, re-addresses it and restores its default route. Nothing
+is asserted until the wire is home and configured, because a claim that failed halfway would leave
+the machine with no network for the ~180 programs sharing this boot. Counterfactual: with the two
+`clear()`s in `Wire::take_in` removed, the three address/route claims are the red ones, answering
+`-17` (`EEXIST`) where they print `0` - `pass=172 fail=1` with `t-ns-net` the one red; with them,
+x86_64 is `pass=173 fail=0` with `mpos-kunit 32 passed, 0 failed` and exit 33, aarch64
+`pass=172 fail=0`.
+
+Not measured, and named rather than guessed: an `IFLA_NET_NS_FD` naming a descriptor that is *not*
+a net namespace. This kernel answers `EINVAL`, the word `setns` measures for the same question, but
+no probe of this one was run.
 
 **Gate (2026-10-15).** x86_64 `=== SUMMARY pass=173 fail=0` with `mpos-kunit 32 passed, 0 failed`
 and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32 cases. The program counts are
@@ -320,10 +361,7 @@ and the witness stopped seeing the rename. That is the sixth time §6.3 records 
 is recorded rather than deleted for the reason the others are: the gate is what finds it, every
 time, and a served set written into a test is the shape that makes it happen.
 
-**Named gaps, each with what it waits on.** A device cannot move into a namespace: `eth0` stays
-the machine's, because `ip link set eth0 netns N` needs a place to move a device *to* and this
-kernel has none - the request is refused with `EOPNOTSUPP` now rather than answered `0`, so what
-remains is the move itself, not the honesty about it. A namespace's stack is never freed - the
+**Named gaps, each with what it waits on.** A namespace's stack is never freed - the
 identity carries no reference count, where Linux frees one with the last `struct net` (and
 `HOMES` is cleaned per socket, not per
 namespace). **vsock's own stack stays machine-wide**, which is now a *measured* shape rather than a
