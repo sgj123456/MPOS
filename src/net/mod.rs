@@ -61,11 +61,13 @@ pub mod socket;
 pub mod unix;
 pub mod vsock;
 
+use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use critical_section::Mutex;
 use smoltcp::iface::{Config, Interface, Route, SocketHandle, SocketSet};
@@ -1029,15 +1031,14 @@ pub(crate) fn home_of(addr: IpAddress) -> Home {
 /// genuinely disjoint access to both. A panicking `f` loses the entry - and
 /// a panic ends the machine, so there is nothing left to lose it from.
 pub(crate) fn with<R>(handle: usize, f: impl FnOnce(&mut Stack, &mut Entry) -> R) -> Option<R> {
-    // The **caller's** namespace's stack, like `alloc_socket`/`adopt_socket`/
-    // `free_entry` beside it: a registry handle is an index into the entry table
-    // of the stack the socket was made in, so every door that acts on a
-    // descriptor has to resolve the *same* stack the socket was registered in.
-    // Reaching `NET` here while those reached the caller's is what produced two
-    // stacks for one socket, and the pin's `bind`/`listen`/`connect` inside a
-    // namespace is what named it (`docs/notes/` §6.3).
-    with_stack(|stack| {
-        let idx = handle.checked_sub(1)?;
+    // The stack the **socket** was made in, not the caller's: a descriptor can
+    // outlive the namespace it was made in (a task that `unshare`s keeps its
+    // sockets, and a descriptor can be handed to a task that never was in that
+    // namespace), and Linux resolves it against the socket's own `sk_net`. That
+    // is what `HOMES` records, and it is the difference between a socket that
+    // works across a namespace change and one that resolves in the wrong stack.
+    let (ns, idx) = home_of_handle(handle)?;
+    with_namespace(ns, |stack| {
         // The entry is lifted out of its slot for the duration: handing `f` a
         // reference borrowed *from* the stack would be two mutable borrows of one
         // value. A panicking `f` loses the entry - and a panic ends the machine,
@@ -1085,15 +1086,24 @@ pub(crate) fn packet_transmit(frame: &[u8]) -> Result<usize, isize> {
 /// machine's stack - so for every path that existed before namespaces this is
 /// still that one stack, unchanged.
 pub(crate) fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
-    match crate::sched::current_net_ns() {
+    with_namespace(crate::sched::current_net_ns(), f)
+}
+
+/// Run `f` with the stack of a **named** namespace - `None` for the machine's
+/// own. The one resolver every other door ends at: a socket's operations go
+/// through it with the namespace the *socket* was made in (`HOMES`), and the
+/// creation paths with the namespace the *caller* is in
+/// ([`crate::sched::current_net_ns`]).
+pub(crate) fn with_namespace<R>(ns: Option<u64>, f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
+    match ns {
         None => with_machine_stack(f),
-        // Joining the machine's own namespace (`setns` on `/proc/1/ns/net` where
-        // pid 1 is in it) is a way *back* to the machine's stack, not a lookup
-        // that cannot succeed.
+        // The machine's own number names the machine's own stack: a `setns` back
+        // to it is a way *back*, not a lookup that cannot succeed.
         Some(id) if id == crate::vfs::ns::machine_net_id() => with_machine_stack(f),
         Some(id) => critical_section::with(|cs| {
-            let mut ns = NAMESPACES.borrow(cs).borrow_mut();
-            ns.iter_mut()
+            let mut stacks = NAMESPACES.borrow(cs).borrow_mut();
+            stacks
+                .iter_mut()
                 .find(|(number, _)| *number == id)
                 .map(|(_, stack)| f(stack))
         }),
@@ -1120,71 +1130,105 @@ pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> 
         addr: IpAddress::Ipv4(Ipv4Address::new(0, 0, 0, 0)),
         port: 0,
     };
+    /// What one registry entry contributes to a row.
+    ///
+    /// The entry itself cannot be carried out of the stack it lives in - reading
+    /// the socket behind it borrows that same stack - so the connection facts
+    /// are reduced to this while the lock is held.
+    enum Shape {
+        Tcp(Home, SocketHandle, Option<IpEndpoint>),
+        Listen(IpEndpoint),
+        Udp(Option<IpEndpoint>, Option<IpEndpoint>),
+        Other,
+    }
     let row_of = |ep: IpEndpoint| -> ([u8; 4], u16) {
         match ep.addr {
             IpAddress::Ipv4(v4) => (v4.octets(), ep.port),
         }
     };
-    with_stack(|st| {
-        let mut rows = Vec::new();
-        // A handle is resolved *after* the entry borrow ends: both the entry
-        // table and the socket sets live inside this one `Stack`, so reading a
-        // socket while iterating the entries is two borrows of the same value.
-        // Collecting the TCP handles first is the whole of the fix, and UDP
-        // needs none of it - its row comes from the recorded endpoints.
-        let mut connected: Vec<(u64, Home, SocketHandle, Option<IpEndpoint>)> = Vec::new();
-        for (idx, slot) in st.entries.iter().enumerate() {
-            let Some(entry) = slot else { continue };
-            let inode = (idx + 1) as u64;
-            match &entry.channel {
-                Channel::Tcp {
-                    home,
-                    handle,
-                    local,
-                } if tcp => {
-                    connected.push((inode, *home, *handle, *local));
-                }
-                Channel::Udp { local, peer, .. } if !tcp => {
-                    // UDP reports the bound/connected endpoints the entry
-                    // records; its datagram "state" is 0, as Linux shows.
-                    rows.push(crate::vfs::procfs::NetRow {
-                        local: row_of((*local).unwrap_or_else(zero)),
-                        remote: row_of((*peer).unwrap_or_else(zero)),
-                        state: 0,
-                        uid: 0,
-                        inode,
-                    });
-                }
-                // A listener is one row, in `LISTEN`, on the address it
-                // listens on - which is where `ss`/`netstat` find a server.
-                // The pool behind it is not a connection and has no row.
-                Channel::TcpListen { local, .. } if tcp => {
-                    rows.push(crate::vfs::procfs::NetRow {
-                        local: row_of(*local),
-                        remote: row_of(zero()),
-                        state: 10,
-                        uid: 0,
-                        inode,
-                    });
-                }
-                _ => {}
-            }
+    // The reader's namespace's sockets, each under the handle its descriptor
+    // carries - which is the number `readlink /proc/<pid>/fd/N` prints, so the
+    // table and the descriptor agree. A socket made in *another* namespace is
+    // not this reader's to see, and one whose entry is gone by the time the row
+    // is built is simply skipped: the table is a snapshot of live state.
+    let mine = normalize(crate::sched::current_net_ns());
+    let mut rows = Vec::new();
+    let mut connected: Vec<(u64, Option<u64>, Home, SocketHandle, Option<IpEndpoint>)> = Vec::new();
+    let mine = normalize(mine);
+    for (handle, ns, idx) in all_homes() {
+        if ns != mine {
+            continue;
         }
-        for (inode, home, handle, local) in connected {
+        let inode = handle;
+        // What a row needs from the entry, lifted out while its namespace's
+        // stack is locked: the entry itself cannot be held across the socket
+        // read below, because the socket lives in that same stack.
+        let shape = with_namespace(ns, |st| {
+            st.entries
+                .get(idx)
+                .and_then(|slot| slot.as_ref())
+                .map(|entry| match &entry.channel {
+                    Channel::Tcp {
+                        home,
+                        handle,
+                        local,
+                    } => Shape::Tcp(*home, *handle, *local),
+                    Channel::TcpListen { local, .. } => Shape::Listen(*local),
+                    Channel::Udp { local, peer, .. } => Shape::Udp(*local, *peer),
+                    _ => Shape::Other,
+                })
+        })
+        .flatten();
+        match shape {
+            Some(Shape::Tcp(home, sock, local)) if tcp => {
+                connected.push((inode, ns, home, sock, local));
+            }
+            // A listener is one row, in `LISTEN`, on the address it listens
+            // on - which is where `ss`/`netstat` find a server. The pool
+            // behind it is not a connection and has no row.
+            Some(Shape::Listen(local)) if tcp => {
+                rows.push(crate::vfs::procfs::NetRow {
+                    local: row_of(local),
+                    remote: row_of(zero()),
+                    state: 10,
+                    uid: 0,
+                    inode,
+                });
+            }
+            // UDP reports the bound/connected endpoints the entry records;
+            // its datagram "state" is 0, as Linux shows.
+            Some(Shape::Udp(local, peer)) if !tcp => {
+                rows.push(crate::vfs::procfs::NetRow {
+                    local: row_of(local.unwrap_or_else(zero)),
+                    remote: row_of(peer.unwrap_or_else(zero)),
+                    state: 0,
+                    uid: 0,
+                    inode,
+                });
+            }
+            _ => {}
+        }
+    }
+    for (inode, ns, home, handle, local) in connected {
+        let info = with_namespace(ns, |st| {
             let sock = st.sockets_mut(home).get::<tcp::Socket>(handle);
             let local_ep = sock.local_endpoint().or(local).unwrap_or_else(zero);
             let remote_ep = sock.remote_endpoint().unwrap_or_else(zero);
-            rows.push(crate::vfs::procfs::NetRow {
-                local: row_of(local_ep),
-                remote: row_of(remote_ep),
-                state: tcp_proc_state(sock),
-                uid: 0,
-                inode,
-            });
-        }
-        rows
-    })
-    .unwrap_or_default()
+            (local_ep, remote_ep, tcp_proc_state(sock))
+        });
+        let (local_ep, remote_ep, state) = match info {
+            Some(three) => three,
+            None => continue,
+        };
+        rows.push(crate::vfs::procfs::NetRow {
+            local: row_of(local_ep),
+            remote: row_of(remote_ep),
+            state,
+            uid: 0,
+            inode,
+        });
+    }
+    rows
 }
 
 /// The per-interface counters for `/proc/net/dev`: the seam's totals beside the
@@ -1235,14 +1279,13 @@ fn tcp_proc_state(sock: &tcp::Socket) -> u8 {
 /// `protocol` is the IP protocol number for raw sockets (e.g. 1 for ICMP);
 /// ignored for TCP and UDP.
 pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize, isize> {
-    // The ***caller's*** namespace's stack, not the machine's: a socket is made
-    // in the stack the caller resolves through, and every later operation on its
-    // descriptor has to look for it in the *same* stack. Reaching `NET` here
-    // while `bind`/`connect` go through `with_stack` is what made a namespaced
-    // child's first socket register in one stack and be looked up in another -
-    // a smoltcp panic on an empty socket set, which is how this was found
-    // (`docs/notes/` §6.3).
-    with_stack(|stack| {
+    // The **caller's** namespace's stack: a socket is made in the stack the
+    // caller resolves through, and the handle it is given records that fact
+    // (`attach`), so every later operation finds it wherever it lives - even
+    // after the caller (or a task it handed the descriptor to) changes
+    // namespace.
+    let ns = crate::sched::current_net_ns();
+    with_namespace(ns, |stack| {
         let owned = match (family, typ) {
             (socket::AF_INET, socket::SOCK_STREAM) => Channel::Tcp {
                 // Created on eth0 because that is what most sockets are for;
@@ -1286,16 +1329,20 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
             channel: owned,
             opts: SockOpts::default(),
         };
-        Ok(match stack.entries.iter().position(|slot| slot.is_none()) {
+        // The slot, then the handle that names it: the handle is global (see
+        // `attach`) so a descriptor's number means one socket on the whole
+        // machine, and the mapping is what says which stack that socket is in.
+        let local = match stack.entries.iter().position(|slot| slot.is_none()) {
             Some(pos) => {
                 stack.entries[pos] = Some(entry);
-                pos + 1
+                pos
             }
             None => {
                 stack.entries.push(Some(entry));
-                stack.entries.len()
+                stack.entries.len() - 1
             }
-        })
+        };
+        Ok(attach(ns, local))
     })
     .unwrap_or(Err(crate::err::ENETDOWN))
 }
@@ -1316,25 +1363,29 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
 /// option that lets the next bind take that port back has to be read from
 /// *them* as well as from the caller (`Stack::tcp_name_taken`).
 pub(crate) fn adopt_socket(channel: Channel, typ: u16, opts: SockOpts) -> Result<usize, isize> {
-    // The caller's namespace's stack, for `alloc_socket`'s reason: an adopted
-    // socket has to be found where its operations will look for it.
-    with_stack(|stack| {
+    // The caller's namespace's stack, for `alloc_socket`'s reason.
+    let ns = crate::sched::current_net_ns();
+    with_namespace(ns, |stack| {
         let entry = Entry {
             family: socket::AF_INET,
             typ,
             channel,
             opts,
         };
-        Ok(match stack.entries.iter().position(|slot| slot.is_none()) {
+        // The slot, then the handle that names it: the handle is global (see
+        // `attach`) so a descriptor's number means one socket on the whole
+        // machine, and the mapping is what says which stack that socket is in.
+        let local = match stack.entries.iter().position(|slot| slot.is_none()) {
             Some(pos) => {
                 stack.entries[pos] = Some(entry);
-                pos + 1
+                pos
             }
             None => {
                 stack.entries.push(Some(entry));
-                stack.entries.len()
+                stack.entries.len() - 1
             }
-        })
+        };
+        Ok(attach(ns, local))
     })
     .unwrap_or(Err(crate::err::ENETDOWN))
 }
@@ -1444,15 +1495,14 @@ pub(crate) fn free_entry(handle: usize) {
         return;
     }
 
-    // The caller's namespace's stack, like every other door that acts on a
-    // descriptor: a registry handle is an index into *its* stack's entry table,
-    // so the stack it is freed from has to be the one it was made in.
-    with_stack(|stack| {
-        let idx = match handle.checked_sub(1) {
-            Some(idx) if idx < stack.entries.len() => idx,
-            _ => return,
-        };
-        let Some(entry) = stack.entries[idx].take() else {
+    // The *socket's* namespace, not the caller's: the last `close` of a
+    // descriptor may arrive from a task that changed namespace since, or never
+    // was in it, and the entry to free is the one this handle was minted for.
+    let Some((ns, idx)) = home_of_handle(handle) else {
+        return;
+    };
+    with_namespace(ns, |stack| {
+        let Some(entry) = stack.entries.get_mut(idx).and_then(|slot| slot.take()) else {
             return;
         };
         // A listener owns a *pool* of sockets and a queue of connections, not
@@ -1505,6 +1555,10 @@ pub(crate) fn free_entry(handle: usize) {
         // answer here too. `entry` is dropped with the closure, and the queue
         // goes with it - the seam holds no reference of its own.
     });
+    // The handle is spent whatever the closure did with the entry: a number
+    // that outlived its socket would name a slot the next `socket()` may take,
+    // which is the aliasing this whole mapping exists to prevent.
+    detach(handle);
 }
 
 /// Poll the interface once, unconditionally, then wake every task registered
@@ -2189,6 +2243,72 @@ pub(crate) fn with_machine_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R
 /// namespace whose last task left keeps its stack until the machine stops, where
 /// Linux frees it with the last `struct net`.
 static NAMESPACES: Mutex<RefCell<Vec<(u64, Stack)>>> = Mutex::new(RefCell::new(Vec::new()));
+
+/// Which namespace each socket descriptor's entry lives in, and where in that
+/// namespace's registry it sits.
+///
+/// The one fact a handle cannot carry: a handle is an index into *some* stack's
+/// entry table, and which stack that is is not derivable from the number. Linux
+/// keeps the same fact inside the socket itself - a `struct sock` holds its
+/// `sk_net` - and that is what lets a descriptor outlive a namespace change: a
+/// socket made before `unshare(CLONE_NEWNET)` goes on working against the stack
+/// it was made in, and one handed to a task in another namespace goes on working
+/// *there*, against that same stack. The entries live in per-namespace tables
+/// here, so the address of the entry is a side table keyed by the handle, and
+/// the handles come from **one** counter so two namespaces can never mint the
+/// same number.
+static HOMES: Mutex<RefCell<BTreeMap<u64, (Option<u64>, usize)>>> =
+    Mutex::new(RefCell::new(BTreeMap::new()));
+
+/// The next registry handle: one for the machine, not one per stack.
+static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+/// The machine's own namespace is spelled `None` everywhere, so a task that
+/// `setns`es back into it is the same key as a task that never left - which is
+/// what makes the tables comparable without asking the identity layer at every
+/// comparison.
+fn normalize(ns: Option<u64>) -> Option<u64> {
+    if ns == Some(crate::vfs::ns::machine_net_id()) {
+        None
+    } else {
+        ns
+    }
+}
+
+/// Record where a socket's entry lives, answering the handle that names it.
+fn attach(ns: Option<u64>, local: usize) -> usize {
+    let ns = normalize(ns);
+    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    critical_section::with(|cs| {
+        HOMES.borrow(cs).borrow_mut().insert(handle, (ns, local));
+    });
+    handle as usize
+}
+
+/// Where a handle's entry lives, or `None` for a handle nobody minted.
+fn home_of_handle(handle: usize) -> Option<(Option<u64>, usize)> {
+    critical_section::with(|cs| HOMES.borrow(cs).borrow().get(&(handle as u64)).copied())
+}
+
+/// Forget a handle, at the end of its socket's life.
+fn detach(handle: usize) {
+    critical_section::with(|cs| {
+        HOMES.borrow(cs).borrow_mut().remove(&(handle as u64));
+    });
+}
+
+/// Every handle and where it lives - what `/proc/net` walks, one row per socket
+/// of the reader's namespace.
+fn all_homes() -> Vec<(u64, Option<u64>, usize)> {
+    critical_section::with(|cs| {
+        HOMES
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .map(|(handle, (ns, idx))| (*handle, *ns, *idx))
+            .collect()
+    })
+}
 
 /// Make a network namespace: a number from the one pool, whose stack - `lo`, and
 /// no wire - is in the registry before the call returns.

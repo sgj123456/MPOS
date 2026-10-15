@@ -254,29 +254,105 @@ fn main() {
         r.finish()
     }
 
-    // ---- The two words this kernel refuses, and refuses whole ----
+    // ---- A word that mixes the served kinds with an unserved one is refused
+    //      whole ----
     r.check(
-        "unshare(CLONE_NEWNET) is EOPNOTSUPP: a live task cannot be moved into a stack yet",
-        unshare(UnshareFlags::NEWNET) == Err(Errno::OPNOTSUPP),
-    );
-    r.check(
-        "unshare(CLONE_NEWNET|CLONE_NEWUTS) is refused whole",
-        unshare(UnshareFlags::NEWNET | UnshareFlags::NEWUTS) == Err(Errno::OPNOTSUPP),
+        "unshare(CLONE_NEWNET|CLONE_NEWIPC) is EOPNOTSUPP, whole",
+        unshare(UnshareFlags::NEWNET | UnshareFlags::NEWIPC) == Err(Errno::OPNOTSUPP),
     );
 
-    // ---- The precondition: a caller holding a socket is refused, not aliased ----
+    // ---- A socket outlives the move, which is what makes `unshare` usable ----
     //
-    // A socket here lives in its namespace's stack, so a child handed a fresh
-    // stack while an inherited descriptor names a socket would let that fd see
-    // one of the *new* namespace's sockets. Linux has no such precondition (a
-    // `struct sock` remembers its `sk_net`); this kernel says so by refusing.
+    // `unshare(CLONE_NEWNET)` moves the **caller** (Linux's rule for this kind,
+    // and the opposite of PID's). The socket opened *before* the call therefore
+    // still belongs to the stack it was made in, and it goes on answering its
+    // own address afterwards - Linux's `sk_net`, which this kernel has as the
+    // handle map (`net`'s `HOMES`). The move happens in a child so that the rest
+    // of this program stays in the machine's namespace.
+    let report = pipe();
+    r.check("the move's report pipe is made", report.is_ok());
+    if let Ok((moved_r, moved_w)) = report {
+        let moved = unsafe { libc::fork() };
+        if moved == 0 {
+            drop(moved_r);
+            let before = socket(AddressFamily::INET, SocketType::STREAM, None);
+            let bound = match &before {
+                Ok(pipe_sock) => {
+                    let any = SocketAddrV4::new(LOOPBACK, 0);
+                    match bind(pipe_sock, &any).and_then(|()| getsockname(pipe_sock)) {
+                        Ok(addr) => SocketAddrV4::try_from(addr).map(|a| a.port()).unwrap_or(0),
+                        Err(_) => 0,
+                    }
+                }
+                Err(_) => 0,
+            };
+            let ok = unshare(UnshareFlags::NEWNET).is_ok();
+            // A socket made *after* the move is the new namespace's, while the
+            // one made before is still the old stack's.
+            let after = match &before {
+                Ok(pipe_sock) => getsockname(pipe_sock)
+                    .ok()
+                    .and_then(|a| SocketAddrV4::try_from(a).ok())
+                    .map(|a| a.port())
+                    .unwrap_or(0),
+                Err(_) => 0,
+            };
+            let line = format!("{} {} {}\n", if ok { 1 } else { 0 }, bound, after);
+            let _ = write(&moved_w, line.as_bytes());
+            unsafe { libc::syscall(libc::SYS_close, moved_w.as_raw_fd() as libc::c_long) };
+            raw_exit(0);
+        }
+        drop(moved_w);
+        r.check("the task that moves was forked", moved > 0);
+        if moved > 0 {
+            let mut buf = [0u8; 64];
+            let n = read_line(&moved_r, &mut buf);
+            let said: Vec<isize> = String::from_utf8_lossy(&buf[..n])
+                .split_whitespace()
+                .filter_map(|f| f.parse().ok())
+                .collect();
+            r.check("the child reports the move", said.len() == 3);
+            if said.len() == 3 {
+                r.check("unshare(CLONE_NEWNET) is served", said[0] == 1);
+                r.check("a socket bound before the move has a port", said[1] != 0);
+                r.check(
+                    "and it still answers that port after the move: the socket kept its stack",
+                    said[1] == said[2],
+                );
+            }
+            let status = rustix::process::waitpid(
+                rustix::process::Pid::from_raw(moved as i32),
+                rustix::process::WaitOptions::empty(),
+            );
+            r.check(
+                "and the child exits cleanly",
+                matches!(&status, Ok(Some((_, st))) if st.exited() && st.exit_status() == Some(0)),
+            );
+        }
+    }
+
+    // ---- A caller holding a socket may still clone a namespace ----
+    //
+    // Inherited descriptors are no problem any more: a socket remembers the
+    // stack it was made in, so one the child inherits goes on working against
+    // *that* stack - Linux's shape, and the reason the map exists.
     let held = socket(AddressFamily::INET, SocketType::STREAM, None);
-    r.check("a socket for the precondition is opened", held.is_ok());
+    r.check("a socket for the clone is opened", held.is_ok());
     let with_socket = clone_word(libc::SIGCHLD as usize | libc::CLONE_NEWNET as usize);
     r.check(
-        "clone(CLONE_NEWNET) with a socket open is EOPNOTSUPP",
-        with_socket == -(Errno::OPNOTSUPP.raw_os_error() as isize),
+        "clone(CLONE_NEWNET) while holding a socket is served",
+        with_socket > 0,
     );
+    if with_socket > 0 {
+        let status = rustix::process::waitpid(
+            rustix::process::Pid::from_raw(with_socket as i32),
+            rustix::process::WaitOptions::empty(),
+        );
+        r.check(
+            "and that child is reaped",
+            matches!(&status, Ok(Some((_, st))) if st.exited()),
+        );
+    }
     drop(held);
 
     // ---- A port the machine's stack has free, for the child to take ----
@@ -356,26 +432,33 @@ fn main() {
 
             // ---- A descriptor handed over from *another* namespace ----
             //
-            // The socket the parent sends was made in the machine's stack, so
-            // there is no entry for it *here*, and the index it carries names one
-            // of this namespace's own sockets - which is worse than losing it. The
-            // handover is therefore refused the way Linux refuses control data
-            // that did not fit: `MSG_CTRUNC`, with the descriptors closed rather
-            // than queued (the registry step in `docs/notes/` §6.3 is what lifts
-            // this). A pathname unix socket is the meeting point, and it works
-            // across the boundary because the unix registry is machine-wide.
+            // The socket the parent sends was made in the machine's stack. It is
+            // delivered here like any other descriptor, because a socket carries
+            // the stack it was made in (`net`'s `HOMES`) - so what arrives is a
+            // *working* socket whose address is the sender's, not one of this
+            // namespace's own sockets renumbered. Reading that address back is
+            // the claim; a pathname unix socket is the meeting point, and it
+            // works across the boundary because the unix registry is
+            // machine-wide. A leftover from an earlier run would fail the bind
+            // for a reason that is not this claim's, so the name is cleared.
+            let _ = std::fs::remove_file(PATH);
             let mut trunc = -1isize;
             let mut kept = -1isize;
-            // A leftover from an earlier run would make the bind fail for a
-            // reason that is not this claim's, so the name is cleared first.
-            let _ = std::fs::remove_file(PATH);
+            let mut port = -1isize;
             if let Ok(listener) = socket(AddressFamily::UNIX, SocketType::STREAM, None)
                 && let Ok(path) = rustix::net::SocketAddrUnix::new(PATH)
                 && bind(&listener, &path).is_ok()
                 && listen(&listener, 4).is_ok()
             {
-                // Announce the listener, then wait for the parent's call.
+                // Announce the listener, then wait for the parent's call and for
+                // the address its gift is bound on.
                 let _ = write(&up_w, b"ready\n");
+                let mut tell = [0u8; 32];
+                let told = read_line(&down_r, &mut tell);
+                let want: i64 = String::from_utf8_lossy(&tell[..told])
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
                 if let Ok(conn) = accept(&listener) {
                     let mut bytes = [0u8; 8];
                     let mut control = [0u8; 64];
@@ -387,7 +470,6 @@ fn main() {
                     msg.msg_iov = &mut iov;
                     msg.msg_iovlen = 1;
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                    // musl's `msghdr` keeps the control length in a `socklen_t`.
                     msg.msg_controllen = control.len() as u32;
                     let rc = unsafe { libc::recvmsg(conn.as_raw_fd(), &mut msg, 0) };
                     if rc >= 0 {
@@ -396,13 +478,33 @@ fn main() {
                         } else {
                             0
                         };
-                        // A descriptor that *did* arrive would show up as control
-                        // data, and its absence as a zero length.
-                        kept = if msg.msg_controllen == 0 { 0 } else { 1 };
+                        // The descriptor, if it came, is at the chain's first
+                        // record: `struct cmsghdr` is length/level/type and the
+                        // fd follows it, which is where a libc's `CMSG_DATA`
+                        // points on this target.
+                        if msg.msg_controllen >= 20 {
+                            kept = 1;
+                            let fd = i32::from_ne_bytes([
+                                control[16],
+                                control[17],
+                                control[18],
+                                control[19],
+                            ]);
+                            let borrowed = unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) };
+                            if let Ok(addr) = getsockname(borrowed)
+                                && let Ok(v4) = SocketAddrV4::try_from(addr)
+                            {
+                                // Bound by the sender, so a port here is the
+                                // sender's own state reached from this namespace.
+                                port = if v4.port() == want as u16 { 1 } else { 0 };
+                            }
+                        } else {
+                            kept = 0;
+                        }
                     }
                 }
             }
-            let second = format!("{trunc} {kept}\n");
+            let second = format!("{trunc} {kept} {port}\n");
             let _ = write(&up_w, second.as_bytes());
             unsafe { libc::syscall(libc::SYS_close, up_w.as_raw_fd() as libc::c_long) };
             raw_exit(0);
@@ -419,7 +521,6 @@ fn main() {
             );
             let tell = format!("{port}\n");
             let _ = write(&down_w, tell.as_bytes());
-            drop(down_w);
 
             let mut report = [0u8; REPORT_MAX];
             let n = read_line(&up_r, &mut report);
@@ -493,6 +594,25 @@ fn main() {
             // descriptor that would name one of the child's own sockets.
             let gift = socket(AddressFamily::INET, SocketType::STREAM, None);
             r.check("the parent's gift socket is opened", gift.is_ok());
+            // Bound here, in the machine's namespace, so the child has something
+            // to read back off it: the *sender's* address is the proof that the
+            // descriptor resolved against the sender's stack.
+            let gift_port = match &gift {
+                Ok(sock) => {
+                    let any = SocketAddrV4::new(LOOPBACK, 0);
+                    bind(sock, &any)
+                        .and_then(|()| getsockname(sock))
+                        .ok()
+                        .and_then(|a| SocketAddrV4::try_from(a).ok())
+                        .map(|a| a.port())
+                        .unwrap_or(0)
+                }
+                Err(_) => 0,
+            };
+            r.check(
+                "and bound, so the child can read its address",
+                gift_port != 0,
+            );
             let mut handover = None;
             if let Ok(gift) = &gift
                 && let Ok(path) = rustix::net::SocketAddrUnix::new(PATH)
@@ -501,6 +621,10 @@ fn main() {
             {
                 let mut ready = [0u8; 16];
                 if read_line(&up_r, &mut ready) > 0 {
+                    // Tell the child the address to expect, then hand it over.
+                    let tell = format!("{gift_port}\n");
+                    let _ = write(&down_w, tell.as_bytes());
+                    drop(down_w);
                     let mut control = [0u8; 24];
                     unsafe {
                         let hdr = control.as_mut_ptr() as *mut libc::cmsghdr;
@@ -539,11 +663,21 @@ fn main() {
                 .filter_map(|f| f.parse().ok())
                 .collect();
             drop(up_r);
-            r.check("the child reports the handover's outcome", said.len() == 2);
-            if said.len() == 2 {
+            r.check("the child reports the handover's outcome", said.len() == 3);
+            if said.len() == 3 {
                 r.check(
-                    "a descriptor from another namespace arrives as MSG_CTRUNC, not as a socket",
-                    said[0] == 1 && said[1] == 0,
+                    &format!(
+                        "a descriptor handed across namespaces arrives intact (got {} {})",
+                        said[0], said[1]
+                    ),
+                    said[0] == 0 && said[1] == 1,
+                );
+                r.check(
+                    &format!(
+                        "and it is the sender's socket, address and all (got {})",
+                        said[2]
+                    ),
+                    said[2] == 1,
                 );
             }
 

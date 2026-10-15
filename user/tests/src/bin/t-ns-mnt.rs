@@ -326,7 +326,10 @@ fn main() {
     let mixed = fix(unsafe {
         libc::syscall(
             libc::SYS_unshare,
-            (CLONE_NEWNS | libc::CLONE_NEWNET as usize) as libc::c_long,
+            // The unserved half is `IPC` because the word used to be `NET`,
+            // which became a served kind when the fourth rung landed - the drift
+            // §6.3 records over and over.
+            (CLONE_NEWNS | libc::CLONE_NEWIPC as usize) as libc::c_long,
         )
     });
     r.check(

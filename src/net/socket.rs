@@ -831,25 +831,6 @@ fn socket_handle_of_fd(fd: i32) -> Result<usize, isize> {
     Ok(handle)
 }
 
-/// Whether the calling task holds **any** socket descriptor.
-///
-/// The precondition `clone(CLONE_NEWNET)` is refused under, and it is the net
-/// layer that answers it because the net layer is what knows a socket when it
-/// sees one: the `Inode`'s `socket_handle` is the syscall layer's own way to ask
-/// (a descriptor that names a socket answers non-zero), and a file, pipe or tty
-/// answers zero. A netlink socket counts too - it is a socket to its holder, and
-/// being conservative here costs a caller nothing but a refusal it is told about.
-pub fn holds_a_socket() -> bool {
-    crate::sched::current_fds()
-        .open_files()
-        .iter()
-        .any(|(fd, _)| {
-            crate::sched::current_fds()
-                .clone_at(*fd)
-                .is_ok_and(|file| file.inode().socket_handle() != 0)
-        })
-}
-
 /// The open flags of `fd`'s description - where `O_NONBLOCK` lives.
 fn fd_status(fd: i32) -> u32 {
     crate::sched::current_fds()
@@ -1789,11 +1770,10 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
             }
         };
         if !fds.is_empty() {
-            // The sender's network namespace rides with the descriptors: the
-            // reader is the only side that can compare it with its own, and it
-            // is the fact that decides whether they can be delivered at all
-            // (see the handover's own note in the receive path).
-            on_channel(&file, |c| c.send_scm(fds, crate::sched::current_net_ns()));
+            // No namespace check on the way out: a descriptor handed to a task in
+            // another network namespace keeps working there, against the stack it
+            // was made in (`net`'s `HOMES`) - which is what Linux's `sk_net` buys.
+            on_channel(&file, |c| c.send_scm(fds));
         }
         return written;
     }
@@ -2525,26 +2505,12 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             // with, and the alternative is the deadlock it replaces.
         }
         // Pop any descriptor handover queued for this channel and decide
-        // whether the peer's credentials ride along.
-        //
-        // A handover that was sent from *another network namespace* cannot be
-        // delivered here, and the reader is told the way Linux tells a reader
-        // whose control data did not fit: `MSG_CTRUNC` below. The reason is the
-        // registry: a socket's entry lives in its namespace's stack, so a
-        // descriptor made elsewhere would be resolved against *this* namespace's
-        // stack - where an entry at that index is a different socket, which is
-        // worse than losing it. Linux carries the descriptor instead, because a
-        // `struct sock` holds its `sk_net`; the registry step in `docs/notes/`
-        // §6.3 is what lifts this. The descriptors are closed here, not queued
-        // for a later reader: they cannot become deliverable, and a stream that
-        // re-reports them would never let the reader past them.
-        let (handover, foreign) = match on_channel(&file, |c| c.take_scm()).flatten() {
-            Some((files, sender)) if sender == crate::sched::current_net_ns() => {
-                (Some(files), false)
-            }
-            Some(_) => (None, true),
-            None => (None, false),
-        };
+        // whether the peer's credentials ride along. A handover that crossed a
+        // network namespace is delivered like any other: the descriptor's socket
+        // resolves against the stack *it* was made in (`net`'s `HOMES`), so the
+        // receiver gets a working socket rather than one of its own renumbered -
+        // which is Linux's `sk_net` behaviour and the reason that mapping exists.
+        let handover = on_channel(&file, |c| c.take_scm()).flatten();
         let want_cred = match file.inode().as_any().downcast_ref::<UnixSock>() {
             Some(sock) if sock.passcred() => sock.peer_cred(),
             _ => None,
@@ -2559,12 +2525,6 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
                 from_user,
             )
         };
-        // Control data that was dropped for its namespace is control data lost,
-        // which is precisely what `MSG_CTRUNC` is for - so a caller that asks
-        // for descriptors and does not find them is told why, and one that never
-        // checks the flag is no worse off than it would be with any other
-        // truncated receive.
-        let trunc = trunc || foreign;
         unsafe {
             ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(if trunc {
                 MSG_CTRUNC

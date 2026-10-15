@@ -1160,6 +1160,15 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
                 // different fields.
                 crate::sched::unshare_pid();
             }
+            if bits & crate::syscall::linux::nr::CLONE_NEWNET != 0 {
+                // The caller **moves** into a fresh namespace, which is Linux's
+                // rule for this kind and the opposite of PID's: its address and
+                // route tables, its port space and its *future* sockets are the
+                // new stack's. Its existing sockets come with it, because each
+                // one remembers the stack it was made in (`net`'s `HOMES`) - so a
+                // connection opened before the call goes on working.
+                crate::sched::set_net_ns(Some(crate::net::mint_namespace()));
+            }
             if bits & crate::syscall::linux::nr::CLONE_FS != 0 {
                 crate::sched::unshare_fs();
             }
@@ -1217,14 +1226,11 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
     }
     match namespace {
         crate::vfs::ns::Namespace::Mount(table) => crate::sched::setns_mnt(table),
-        // The network namespace's descriptor is *nameable* - `/proc/<pid>/ns/net`
-        // exists and reads `net:[<n>]` - but joining it is not served yet: moving
-        // a live task into another stack needs each descriptor's socket to
-        // remember the namespace it was made in, which is the registry step
-        // `docs/notes/` §6.3 names. `EOPNOTSUPP` - "present, cannot do that" - is
-        // the honest half of serving the kind: the words above are checked, and
-        // this is the call that cannot be honoured.
-        crate::vfs::ns::Namespace::Net(_) => return err::EOPNOTSUPP,
+        // Joining a namespace: the caller moves into *that* stack, and its
+        // existing sockets keep working against the ones they were made in -
+        // which is what `HOMES` buys, and why this is a join by reference
+        // (Linux's `switch_task_namespaces`) rather than a copy.
+        crate::vfs::ns::Namespace::Net(id) => crate::sched::set_net_ns(Some(id)),
         crate::vfs::ns::Namespace::Pid(pidns) => crate::sched::setns_pid(pidns),
         crate::vfs::ns::Namespace::Uts(uts) => crate::sched::setns_uts(uts),
     }

@@ -75,16 +75,15 @@ becoming readable) wake a listener that no frame will ever reach.
 
 The registry contract is the handle: `alloc_socket`, `adopt_socket`, `with` and
 `with_stack` index `Stack.entries`, and every syscall resolves an fd back through
-`socket_handle()` on the `Inode` (`SocketInode`/`NlRouteInode`). **Every one of those four
-doors resolves the caller's network namespace's stack** (`with_stack`, which a task with no
-namespace of its own resolves to the machine's) - a socket is registered in the stack its
-operations will look for it in, and the machine's own stack is reached only by
-`with_machine_stack` and `init`. What that does *not* cover is a socket the caller did not
-make: a descriptor inherited across a namespace boundary, so `clone(CLONE_NEWNET)` is refused
-for a caller that already holds one (`socket::holds_a_socket`, asked through
-`socket_handle`) and an `SCM_RIGHTS` handover sent from another namespace is dropped with
-`MSG_CTRUNC` instead of delivered into the wrong stack. The step that lifts both is the
-registry moving out of the stack and carrying its namespace (`docs/notes/` §6.3). The invariant
+`socket_handle()` on the `Inode` (`SocketInode`/`NlRouteInode`). A handle comes from **one**
+machine-wide counter, and `HOMES` records where its entry lives - which namespace, and which slot
+in that namespace's table. That mapping is this layer's `struct sock::sk_net`: **a socket remembers
+the stack it was made in**. The creation paths resolve the *caller's* namespace (`with_stack`),
+and every door that acts on an existing descriptor - `with`, `free_entry`, the teardown sweep,
+`/proc/net`'s collector - resolves the *socket's*. So a socket bound before `unshare(CLONE_NEWNET)`
+keeps answering its own address, an inherited descriptor works in a cloned child, and one handed
+over by `SCM_RIGHTS` arrives intact and answers the sender's. The machine's own stack is reached
+only by `with_machine_stack`, `init` and `with_namespace(None, ..)`. The invariant
 that holds it together is that a socket belongs to exactly one `Home` from the
 first address-naming call, and that `close(2)` unbinds the descriptor immediately
 while teardown still rides the wire via the bounded `teardown` list. The socket

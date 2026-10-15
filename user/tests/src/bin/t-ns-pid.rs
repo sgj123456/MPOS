@@ -115,8 +115,11 @@ fn main() {
     // ---- A word that mixes the served kind with an unserved one unshares
     //      nothing, and PID is the served half ----
     r.check(
-        "unshare(CLONE_NEWPID|CLONE_NEWNET) is EOPNOTSUPP",
-        unshare(UnshareFlags::NEWPID | UnshareFlags::NEWNET) == Err(Errno::OPNOTSUPP),
+        // The unserved half is `IPC` because the word used to be `NET`, which
+        // became a served kind the moment the fourth rung landed - the drift
+        // §6.3 records over and over (a served set written down as a constant).
+        "unshare(CLONE_NEWPID|CLONE_NEWIPC) is EOPNOTSUPP",
+        unshare(UnshareFlags::NEWPID | UnshareFlags::NEWIPC) == Err(Errno::OPNOTSUPP),
     );
 
     // ---- The caller does not move ----

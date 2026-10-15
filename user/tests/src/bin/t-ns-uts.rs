@@ -367,8 +367,11 @@ fn main() {
             // copy the witness does not hold, and the two claims that follow
             // were the ones that went red.
             r.check(
-                "a word mixing CLONE_NEWUTS with CLONE_NEWNET is EOPNOTSUPP",
-                unshare(UnshareFlags::NEWUTS | UnshareFlags::NEWNET) == Err(Errno::OPNOTSUPP),
+                // The unserved half is `IPC` because the word used to be `NET`,
+                // which became a served kind when the fourth rung landed - the
+                // drift §6.3 records over and over.
+                "a word mixing CLONE_NEWUTS with CLONE_NEWIPC is EOPNOTSUPP",
+                unshare(UnshareFlags::NEWUTS | UnshareFlags::NEWIPC) == Err(Errno::OPNOTSUPP),
             );
             // Only now, in a namespace that must still be the one the witness
             // holds.

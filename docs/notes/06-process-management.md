@@ -243,20 +243,33 @@ stack** - `with`, `alloc_socket`, `adopt_socket` and `free_entry` joined `with_s
 machine's own stack is now reached only by `with_machine_stack` (the init namespace) and `init`
 itself. That closes the two-stacks-for-one-socket hole for every socket a task can *make*.
 
-Two things a task can hold that it did not make are then refused by name, because for those the
-caller's namespace is *not* the socket's:
+**And then the half that made the caller-relative rule unnecessary.** Resolving a descriptor in
+the *caller's* namespace is right only while every socket a task holds was made where the task is.
+Two cases break that, and both are ordinary: a socket made **before** an `unshare` (the caller
+moves, the socket does not) and a descriptor **handed over** by `SCM_RIGHTS` (the receiver never
+was in the sender's namespace, and no flag says so). The first version of this step therefore
+refused both by name - `EOPNOTSUPP` for a `clone` from a caller holding a socket (asked through
+`Inode::socket_handle`, and the pin is what corrected the first draft there: a socket inode's
+`NodeKind` is `CharDev`, not `Socket`, so a `NodeKind` test passed every descriptor and the child
+went on to re-run the test body, which is how the log showed every claim twice), and `MSG_CTRUNC`
+for a handover that crossed a namespace.
 
-* a **`clone(CLONE_NEWNET)` from a caller that already holds a socket** is `EOPNOTSUPP`. The
-  question is asked with `Inode::socket_handle` (`net::socket::holds_a_socket`), and the pin is
-  what corrected the first draft: a socket inode's `NodeKind` is `CharDev`, not `Socket`, so the
-  check as first written passed every descriptor and the clone went through - the child re-ran the
-  test body, which is how the log showed every claim twice.
-* a descriptor **handed across a namespace** by `SCM_RIGHTS` is dropped, and the reader is told
-  the way Linux tells a reader whose control data did not fit: **`MSG_CTRUNC`**. The sender's
-  namespace rides with the handover (the `Scm` record in `vfs/pipe.rs`) because neither side knows
-  both facts at one moment - and the descriptors are closed rather than queued, since they can
-  never become deliverable and a stream that re-reported them would never let the reader past
-  them.
+What replaced both is the fact Linux keeps inside the socket: **a socket remembers the stack it was
+made in.** `net`'s `HOMES` is that fact here - a side table from the registry handle to
+`(namespace, slot)`, with the handles minted from **one** counter so two namespaces can never mint
+the same number - and `with(handle)`, `free_entry` and the teardown path all resolve the stack
+*from the entry* rather than from the caller. That is what makes the three refusals go away at
+once, and each is now a claim rather than a refusal:
+
+* `unshare(CLONE_NEWNET)` and `setns(fd, CLONE_NEWNET)` are **served**, and the pin holds the
+  consequence: a socket bound *before* the move still answers its own port *after* it, because it
+  is still resolved against the stack it was made in.
+* `clone(CLONE_NEWNET)` from a caller holding a socket is served, and the child's inherited
+  descriptors keep working against *their* stacks.
+* A descriptor handed across a namespace arrives **intact**: the pin has the parent bind its gift
+  in the machine's namespace and hand it over the machine-wide unix registry, and the child (in
+  its own namespace) reads that socket's address back - the *sender's* port - which no resolution
+  against the child's own stack could produce.
 
 **Two divergences the pin pinned, both with their reason.** A fresh namespace's **`lo` comes up
 carrying `127.0.0.1/8`**, where Linux's starts down and unaddressed - because this kernel answers
@@ -278,14 +291,24 @@ namespace lookup, and the sender/receiver comparisons in the handover) and one t
 (`vfs::ns::machine_net_id`) - so no edge is new and `ARCHITECTURE.md` §2's recorded weights stay
 the snapshot they are dated (`2026-10-02`), which this change does not re-measure.
 
-**Named gaps, each with what it waits on.** The registry step, which lifts all three refusals and
-the handover divergence at once (a `struct sock` holding its `sk_net` is what Linux has and this
-kernel does not - 41 references, all inside `socket.rs`/`mod.rs`/`rtnl.rs`). A device cannot move
-into a namespace. A namespace's stack is never freed. And **AF_UNIX's registry and vsock's own
-stack stay machine-wide**, which is what made the pin's cross-namespace handover possible at all;
-keying those is the follow-up after the registry step. The attempt's own working tree, its pin and
-its plan are in `.workbuddy/netns/` (gitignored), and the shape that survived is the one described
-here. The rest
+**And the drift the mapping itself caused, in the programs rather than the kernel.** Serving
+`unshare`/`setns` for NET turned four programs red on the sweep, all for one reason: they used NET
+as the *unserved* half of a mixed word, and the half is not unserved any more. `t-caps`'s
+"`unshare(CLONE_NEWNET)` is `EOPNOTSUPP`" became `NEWIPC`, and `t-ns-mnt`, `t-ns-pid` and
+`t-ns-uts` each moved their mixed word (`NEWNS|NET`, `NEWPID|NET`, `NEWUTS|NET`) to the same kind -
+`t-ns-uts`'s *witness* claim moved with it, because a word that is now *served* really does unshare
+and the witness stopped seeing the rename. That is the sixth time §6.3 records this drift, and it
+is recorded rather than deleted for the reason the others are: the gate is what finds it, every
+time, and a served set written into a test is the shape that makes it happen.
+
+**Named gaps, each with what it waits on.** A device cannot move into a namespace: `eth0` stays
+the machine's, because `ip link set eth0 netns N` needs a place to move a device *to* and this
+kernel has none. A namespace's stack is never freed - the identity carries no reference count,
+where Linux frees one with the last `struct net` (and `HOMES` is cleaned per socket, not per
+namespace). **AF_UNIX's registry and vsock's own stack stay machine-wide**, which is what makes the
+pin's cross-namespace handover possible at all; keying those per namespace is the follow-up. And a
+`/proc/net` reader sees only its own namespace's sockets, which the pin's rows do not exercise -
+the collector walks `HOMES` filtered by the reader, and one namespace is all a sweep has. The rest
 of NET's design (one opaque `net_ns: Option<u64>` on `Task` rather than an `Arc` object, so that
 `sched` does not name `net` and turn the existing `net -> sched` recall edge into a mutual pair; the
 machine's own network namespace number minted in `vfs::ns`, which both layers may name; a fresh

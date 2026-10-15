@@ -292,17 +292,17 @@ fn main() {
         "unshare CLONE_NEWPID is served once nothing else can be the reason",
         pid == 0,
     );
-    // And the kind this machine has no way to hand over keeps its honest
+    // And the kinds this machine has no way to hand over keep their honest
     // refusal *now* that no capability gate can be the reason: EOPNOTSUPP is
     // "present, cannot do that", which is what a capable caller learns, and
     // what an unprivileged one would have heard as EPERM above. Nothing is
-    // unshared either way - the refusal is whole. The word was `CLONE_NEWPID`
-    // until PID landed; a hardcoded served set drifts the moment it grows,
-    // which is what §6.3 records twice over.
-    let net = unshare(0x4000_0000);
+    // unshared either way - the refusal is whole. This word has moved once per
+    // rung built (`CLONE_NEWPID`, then `CLONE_NEWNET`): a hardcoded served set
+    // drifts the moment it grows, which §6.3 records over and over.
+    let ipc = unshare(0x0800_0000);
     r.check(
-        "unshare CLONE_NEWNET is EOPNOTSUPP once nothing else can be the reason",
-        net == -(libc::EOPNOTSUPP as isize),
+        "unshare CLONE_NEWIPC is EOPNOTSUPP once nothing else can be the reason",
+        ipc == -(libc::EOPNOTSUPP as isize),
     );
 
     r.finish()

@@ -48,11 +48,12 @@ One-glance status of the whole roadmap.
   `t-ns-mnt`, `t-ns-pid`, `t-ns-net`): the numbers a process sees are the reader's namespace's,
   both directions of the translation and `/proc` rendered per reader (§6.3); a child cloned with
   `CLONE_NEWNET` gets a stack of its own - its own `lo`, no wire, and a port space the machine's
-  cannot see (§6.3). Three named limits on NET, all until a socket remembers its namespace (the
-  registry is per-stack today and its handles are per-stack indices): `unshare`/`setns` moving a
-  *live* task are `EOPNOTSUPP`, a `clone` from a caller that already holds a socket is
-  `EOPNOTSUPP`, and a descriptor handed across a namespace by `SCM_RIGHTS` arrives as `MSG_CTRUNC`
-  with the descriptor closed (§6.3); the other five kinds have no entry at all (§6.3, §6.6)
+  cannot see - and the kind is served by all three calls, with **a socket remembering the stack it
+  was made in** (`net`'s handle map): a socket outlives an `unshare`, an inherited descriptor keeps
+  working in a cloned child, and a descriptor handed over by `SCM_RIGHTS` arrives intact and
+  answers the sender's address (§6.3). What NET still cannot do is move a device or a non-IP
+  socket: `eth0` cannot enter a namespace, and `AF_UNIX`/vsock stay machine-wide (§6.3); the other
+  five kinds have no entry at all (§6.3, §6.6)
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
@@ -171,13 +172,12 @@ One-glance status of the whole roadmap.
 
 In the order that keeps each step verifiable on its own:
 
-1. **namespaces** (§6.3) — UTS, MNT, PID and NET are landed; NET's own next step is the
-   one its three refusals wait on (a socket remembering its namespace, so a live task can move and
-   a descriptor can cross), then AF_UNIX and vsock keyed the same way, then the remaining five
-   kinds. What PID left open is named in §6.3: a namespace's pid-1 death does not zap the
-   namespace, nested namespaces are pinned at one level, and `/proc/<pid>/status`'s `NSpid` still
-   shows one number. Beside it: seccomp's one named piece, the `PTRACE_EVENT_SECCOMP` stop
-   (§8.2).
+1. **namespaces** (§6.3) — UTS, MNT, PID and NET are landed, and the ladder's remaining work
+   is named per rung: **AF_UNIX and vsock keyed per namespace** (today machine-wide, so a unix
+   socket is reachable from outside one), a **wire that can move** into a namespace, PID's own
+   named gaps (pid-1 death does not zap, nested namespaces pinned at one level, `NSpid` shows one
+   number), and then the five kinds with no entry at all. Beside it: seccomp's one named piece,
+   the `PTRACE_EVENT_SECCOMP` stop (§8.2).
 2. **interrupt-driven block completions** (§10.5's last row) — measured and re-scoped; §10.5
    carries the structure change, its pin and what each machine's clock can see.
 3. **what is left of the DHCP chain** (§4.5) — the raw-IP door's rules, cause and reverted
