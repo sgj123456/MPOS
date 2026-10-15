@@ -26,7 +26,13 @@
 //!   members cannot end it (a sibling's `kill(1, SIGKILL)` answers 0 and is
 //!   discarded), a signal it has a **handler** for is delivered like any other,
 //!   only an **ancestor** namespace's SIGKILL lands - and its death takes every
-//!   task it speaks for, one in a namespace *nested* beneath it included.
+//!   task it speaks for, one in a namespace *nested* beneath it included;
+//! * and the `NSpid` chain in `/proc/<n>/status` has **one number per namespace
+//!   the task is a member of**: a task two levels in shows *three* - the
+//!   machine's, the namespace between's, and the `1` its own namespace gives it -
+//!   and every reader sees that same line, because it is the task's own chain
+//!   rather than the reader's number. One level (two numbers) was all this
+//!   rung's numbers were pinned at until now.
 //!
 //! # The doors
 //!
@@ -251,7 +257,7 @@ fn wait_for_eof(ro: &OwnedFd) -> bool {
 /// in it, lets that init's own worker try to kill it, then kills it from here -
 /// an ancestor namespace - and reports what each step said, one word per step.
 fn run_init_section(verdict: &OwnedFd) {
-    let mut words = [0isize; 15];
+    let mut words = [0isize; 17];
     words[0] = if unshare(UnshareFlags::NEWPID).is_ok() {
         1
     } else {
@@ -262,13 +268,21 @@ fn run_init_section(verdict: &OwnedFd) {
     let crossed = pipe();
     let deeper = pipe();
     let waited = pipe();
+    // A sixth pipe for the `NSpid` chain of the task **two** namespaces in - read
+    // while it is still alive, because the zap below takes it with the nested
+    // init. Kept apart from `said` for a reason of ordering: `said`'s two lines
+    // come from the init and its worker, in that order, and a third writer
+    // racing them would leave the section reading which line belonged to whom
+    // up to the scheduler.
+    let chain = pipe();
     if let (
         Ok((life_r, life_w)),
         Ok((said_r, said_w)),
         Ok((crossed_r, crossed_w)),
         Ok((deeper_r, deeper_w)),
         Ok((waited_r, waited_w)),
-    ) = (life, said, crossed, deeper, waited)
+        Ok((chain_r, chain_w)),
+    ) = (life, said, crossed, deeper, waited, chain)
     {
         // The nested namespace's liveness, read the same way and with the same
         // non-blocking retry: the flag belongs to the pipe, so setting it here
@@ -333,6 +347,7 @@ fn run_init_section(verdict: &OwnedFd) {
             if worker == 0 {
                 drop(crossed_w);
                 drop(deeper_w);
+                drop(chain_w);
                 let killed = send(1, libc::SIGKILL);
                 let termed = send(1, libc::SIGTERM);
                 let blocked = send(1, libc::SIGUSR1);
@@ -359,6 +374,22 @@ fn run_init_section(verdict: &OwnedFd) {
                 let nested = unsafe { libc::fork() };
                 if nested == 0 {
                     drop(crossed_w);
+                    // The task **two** namespaces in, reading its own chain
+                    // before it parks: three numbers - the machine's, this
+                    // namespace's, and the `1` the fresh namespace under it
+                    // gives it - which is the depth the rung's numbers were
+                    // not pinned at. It is the same line every reader sees,
+                    // so the section reads it back from the machine's side
+                    // below and expects these numbers unchanged.
+                    let own = ns_pid_chain("/proc/self/status");
+                    let line = format!(
+                        "{}\n",
+                        own.iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                    let _ = write(&chain_w, line.as_bytes());
                     // One byte, so that "the nested init exists" and "it died"
                     // are two different reads of one pipe: a wait for
                     // end-of-file alone would also be satisfied by an init that
@@ -371,6 +402,7 @@ fn run_init_section(verdict: &OwnedFd) {
                 }
             }
             drop(deeper_w);
+            drop(chain_w);
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             let mut patience = libc::timespec {
                 tv_sec: 3,
@@ -389,6 +421,7 @@ fn run_init_section(verdict: &OwnedFd) {
         drop(deeper_w);
         drop(waited_w);
         drop(crossed_w);
+        drop(chain_w);
         if init > 0 {
             // Two lines on this pipe, in order: the init's own view of its
             // chain, then the worker's answers. The first is the read that tells
@@ -441,6 +474,33 @@ fn run_init_section(verdict: &OwnedFd) {
             // holder, named by the number this side knows it by.
             if let Some(file) = &inner_file {
                 words[14] = if lk_pid(file.as_raw_fd()) == init as i32 {
+                    1
+                } else {
+                    0
+                };
+            }
+            // And the task **two** namespaces in, read while it is still alive
+            // (the zap below takes it with the nested init). Its own chain has
+            // three numbers - this machine's, the namespace between's, and the
+            // `1` its own namespace gives it - which is the depth the rung's
+            // numbers were pinned at only one level of until now.
+            let mut deepbuf = [0u8; REPORT_MAX];
+            let dn = read(&chain_r, &mut deepbuf).unwrap_or(0);
+            let deep: Vec<u32> = String::from_utf8_lossy(&deepbuf[..dn])
+                .split_whitespace()
+                .filter_map(|f| f.parse().ok())
+                .collect();
+            words[15] = if deep.len() == 3 && deep[2] == 1 && deep[1] != 1 {
+                1
+            } else {
+                0
+            };
+            // And the same line read from *here*, by the machine's own number
+            // for it (the chain's first entry): the field is the *task's* chain
+            // and not the reader's number, so the two reads must agree - and
+            // that first entry must be a machine slot `/proc` resolves.
+            if let Some(&machine) = deep.first() {
+                words[16] = if ns_pid_chain(&format!("/proc/{machine}/status")) == deep {
                     1
                 } else {
                     0
@@ -745,11 +805,14 @@ fn main() {
 
     // ---- The init section's verdict ----
     //
-    // Seven words: the namespace was made; a sibling's SIGKILL and its SIGTERM
-    // both answered 0; the init was alive after both; the signal it had a
-    // handler for was delivered; the ancestor's SIGKILL landed; and the
-    // namespace's other task died with it. The pair in the middle is what a
-    // "namespace" that is really a shared global fails.
+    // Seventeen words: the namespace was made; a sibling's SIGKILL and its
+    // SIGTERM both answered 0; the init was alive after both; the signal it had
+    // a handler for was delivered; the ancestor's SIGKILL landed; the
+    // namespace's other task died with it; the nested one died too; the blocked
+    // signal arrived; the three `NSpid` shapes (one level in, the machine's read
+    // of it, the machine's own); the two locks; and the depth-2 chain, read from
+    // both sides. The pair in the middle is what a "namespace" that is really a
+    // shared global fails.
     if let Some(verdict_r) = verdict_r {
         let mut report = [0u8; REPORT_MAX];
         let n = drain(&verdict_r, &mut report);
@@ -757,8 +820,11 @@ fn main() {
             .split_whitespace()
             .filter_map(|f| f.parse().ok())
             .collect();
-        r.check("the init section reports fifteen words", words.len() == 15);
-        if words.len() == 15 {
+        r.check(
+            "the init section reports seventeen words",
+            words.len() == 17,
+        );
+        if words.len() == 17 {
             r.check(
                 "a task in its namespace may make one for its own children",
                 words[0] == 1,
@@ -812,6 +878,14 @@ fn main() {
             r.check(
                 "while a reader outside is handed the holder's number out there",
                 words[14] == 1,
+            );
+            r.check(
+                "a task two namespaces in reads a chain of three, its own number last and 1",
+                words[15] == 1,
+            );
+            r.check(
+                "and the machine reading that same task by that chain's first number agrees",
+                words[16] == 1,
             );
         }
         let status = rustix::process::waitpid(

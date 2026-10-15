@@ -186,8 +186,8 @@ In the order that keeps each step verifiable on its own:
 
 1. **namespaces** (§6.3) — UTS, MNT, PID and NET are landed, and the ladder's remaining work
    is named per rung: a **wire that can move** into a namespace (`eth0` still cannot enter one),
-   nested namespaces pin the *numbers* only one level deep (the zap's reach is pinned two levels
-   now), and then the four kinds with no entry at all
+   nested namespaces pin the *numbers* two levels deep now, as the zap's reach already did, and
+   then the four kinds with no entry at all
    (user, IPC, cgroup, time - four of `namespaces(7)`'s eight). The `/proc/net` reader's rows were
    per-namespace but unexercised; `t-ns-net` reads the file on both sides of the boundary now
    (2026-10-15). Two more left this list on

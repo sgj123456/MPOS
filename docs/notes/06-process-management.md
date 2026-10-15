@@ -548,9 +548,10 @@ sibling's SIGKILL, SIGTERM and SIGUSR1 all answered 0; the init was alive after 
 had a handler for ran; the one it had *blocked* came back through `sigtimedwait`; the ancestor's
 SIGKILL landed; the namespace's other task died; and the task in the namespace nested beneath it died
 too. Two of those are the ones that fail against the implementation as it was first written (the
-nested membership, and the blocked clause), which is the counterfactual worth having. The gap is
-narrower but not closed: the numbering chain itself (one task numbered at every level, `/proc` at
-depth, `NSpid`) is still pinned only one level deep, and one clause of Linux's `sig_ignored` is
+nested membership, and the blocked clause), which is the counterfactual worth having. The gap was
+narrower, and its numbering half is closed: the numbering chain itself (one task numbered at every
+level, `/proc` at depth, `NSpid`) was pinned only one level deep here and is two now (2026-10-15,
+the chain paragraph above). What stays open is one clause of Linux's `sig_ignored` -
 named rather than implemented - a **traced** task does not ignore signals either (`return
 !t->ptrace`), so a traced init may receive one where this kernel drops it; the probe for that is not
 written, and the pin says nothing about it.
@@ -643,6 +644,24 @@ section, whose report is twelve words now. Stage 1: 537 in the kernel library an
 the gate builds, `mpos-pidns` at 11 (the chain has its own test); clippy reports nothing on
 `x86_64-unknown-none`, `aarch64-unknown-none` and the host lib; `cargo xtask depgraph` is within the
 ratchet, and no edge is added - `vfs` already names `sched`.
+
+**The chain, pinned at the depth it claims.** The paragraphs above pin the *shape* of `NSpid` with a
+task **one** namespace in - two numbers - and left "pinned at one level only" in the gap list. The
+depth-2 case is the measurement at the top of this section (`NSpid:\t43878\t3\t1` for a task two
+namespaces in), and it is closed (2026-10-15): `t-ns-pid`'s init section already stands a task two
+namespaces in - the nested init the zap takes with its parent - and that task now reads its **own**
+chain there, three numbers with its own namespace's `1` last, while the section reads the same task
+back from the machine by the chain's first number and expects the identical line. "One number per
+namespace the task is a member of" is what the field means; this is that claim at three levels
+rather than two, and the two reads agreeing is the half that rules out a reader's-number cut padded
+out to three. No kernel source changed - the chain was already built to depth - so this is the pin
+the gap list asked for, not a fix.
+
+**Gate.** x86_64 `=== SUMMARY pass=173 fail=0 (173 built)` with the kernel's own `mpos-kunit 32
+passed, 0 failed` and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32 cases, exit 0.
+Neither program count moved: the new claims are two more inside `t-ns-pid`'s init section, whose
+report is seventeen words now. Clippy and `cargo xtask depgraph` are where they were (no `src/`
+change), and `cargo fmt --check` is red only on the pre-existing `EOPNOTSUPP` note line.
 
 **`F_GETLK`'s `l_pid`, landed: the number the *reader* can act on.** The last pid-crossing call
 that still handed back the machine's slot, and it is the one call whose whole *purpose* is to name a
@@ -1102,10 +1121,11 @@ implementation, the second with `validate_clone_flags`'s documented-pair table.
 **Named gaps, each with what it waits on.** A namespace's pid 1 dying does not zap the
 namespace (Linux's `zap_pid_ns_processes`, which kills every member) - and because numbers are
 never reused here, a namespace whose init died goes on numbering rather than refusing. Nested
-namespaces work by construction but are pinned at one level only. `/proc/<pid>/status`'s `NSpid`
-still shows the reader's number rather than the whole chain. A record lock's `l_pid` is the
-machine's number of its holder (Linux stores the *setter's* number at set time, which is the
-same choice, with the same cross-namespace ambiguity). Group *numbering* is not per-namespace:
+namespaces work by construction, and the *numbers* are pinned two levels deep now (2026-10-15; the
+chain paragraph above). Two clauses this list used to carry closed with it and are recorded above
+rather than here: `/proc/<pid>/status`'s `NSpid` is the whole chain and not the reader's number, and
+a record lock's `l_pid` is the *reader's* number. What remains is group *numbering*, which is not
+per-namespace:
 `kill(-n)` now resolves `n` as a pid in the caller's namespace, but a group is still named by its
 leader's id, so a namespace's groups are its leaders' numbers. And a `/proc` mounted inside
 another mount namespace still lists one machine's processes - per-*reader* numbering is what this
