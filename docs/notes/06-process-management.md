@@ -649,10 +649,10 @@ table already stored. The pin's init section holds a lock from each side of the 
 from both, which is three claims: names the holder as that namespace does, names nobody for the lock
 held outside, and hands the outside reader the holder's number out there.
 
-Two neighbours named rather than fixed: **the `F_OFD_*` family is `EINVAL`** here, where Linux serves
-it (its `l_pid` is `-1`, which is exactly why `locks_translate_pid` tests `IS_OFDLCK` before it
-translates), and a lock's owner is a task id whose liveness `locks.rs` already checks, so what the
-translation can be asked about is always a live task.
+One neighbour named rather than fixed: a lock's owner is a task id whose liveness `locks.rs` already
+checks, so what the translation can be asked about is always a live task. The other neighbour, the
+`F_OFD_*` family, has since been served - its `l_pid` is `-1`, the one value this function must never
+be asked to translate - and its measurement and code are `docs/notes/` §3.2.
 
 **Gate.** x86_64 `=== SUMMARY pass=173 fail=0 (173 built)` with the kernel's own
 `mpos-kunit 32 passed, 0 failed` and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32

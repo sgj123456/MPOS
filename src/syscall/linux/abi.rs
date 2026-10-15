@@ -187,6 +187,19 @@ pub(super) const F_SETFL: usize = 4;
 pub(super) const F_GETLK: usize = 5;
 pub(super) const F_SETLK: usize = 6;
 pub(super) const F_SETLKW: usize = 7;
+/// The open-file-description twin of `F_GETLK`/`F_SETLK`/`F_SETLKW`: the same
+/// byte-range record lock over the same conflict domain (an OFD lock refuses a
+/// POSIX one and the reverse, measured), but owned by the **open file
+/// description** rather than the process, so two independent `open()`s of one
+/// file in one process contend while a `dup` shares.
+///
+/// The numbering is `36..=38`, straight after the commands above, and
+/// `F_OFD_GETLK` reports `l_pid = -1` for the conflicting lock - there is no
+/// process to name, which is why Linux's `locks_translate_pid` returns `-1`
+/// before it translates. All measured on the host (`.workbuddy/probe_ofd.c`).
+pub(super) const F_OFD_GETLK: usize = 36;
+pub(super) const F_OFD_SETLK: usize = 37;
+pub(super) const F_OFD_SETLKW: usize = 38;
 /// `F_DUPFD` that flags the *new* descriptor `FD_CLOEXEC` in one call - what a
 /// modern libc asks for instead of the `F_DUPFD` + `F_SETFD` pair (`musl`
 /// reaches for it on every pipe-protected spawn). It does not sit with the
@@ -4242,6 +4255,11 @@ mod tests {
             (F_GETLK, 5),
             (F_SETLK, 6),
             (F_SETLKW, 7),
+            // The open-file-description twins, `36..=38` - straight after the
+            // process-owned three, which is where `fcntl.h` puts them.
+            (F_OFD_GETLK, 36),
+            (F_OFD_SETLK, 37),
+            (F_OFD_SETLKW, 38),
         ] {
             assert_eq!(cmd, value);
         }

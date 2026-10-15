@@ -60,13 +60,21 @@ pub enum LockClass {
 ///
 /// * a **record** (`fcntl`) lock belongs to the **thread group**, so the same
 ///   process locking a range twice replaces its own lock rather than fighting
-///   itself, and any descriptor it closes drops the lot;
+///   itself, and any descriptor it closes drops the lot - *unless* `ofd` is set;
 /// * a **whole-file** (`flock`) lock belongs to the **open file description**,
 ///   so two independent `open()`s of one file in *one* process conflict, while
 ///   `dup`ing an fd keeps sharing the one lock.
 ///
-/// `pid` is the process that holds it either way - what `F_GETLK` reports as
-/// `l_pid`, and what says whether the holder is still alive.
+/// `ofd` is the third ownership model and the reason the field exists: an
+/// `F_OFD_*` request is a **record** lock in the same conflict domain as a
+/// POSIX one (it refuses and is refused by one, measured), but its `owner` is
+/// the **open file description** like `flock`'s rather than the thread group.
+/// It is also what makes `F_OFD_GETLK` answer `l_pid = -1` instead of a number:
+/// there is no process to name. `Whole` locks leave it `false`; it is only
+/// meaningful for a `Record` lock.
+///
+/// `pid` is the process that holds it either way - what POSIX `F_GETLK` reports
+/// as `l_pid`, and what says whether the holder is still alive.
 #[derive(Clone, Copy, Debug)]
 pub struct Lock {
     pub dev: u64,
@@ -77,6 +85,7 @@ pub struct Lock {
     pub kind: LockKind,
     pub start: i64,
     pub end: i64,
+    pub ofd: bool,
 }
 
 /// The stand-in for "no upper bound". Larger than any real offset, so range
@@ -202,7 +211,7 @@ pub fn find_conflict(
 /// Apply a set/unlock: drop the owner's overlapping locks in the class, then
 /// record the new one unless `kind` is `None` (an unlock). `pid` is recorded
 /// with it for `F_GETLK` and for the liveness check, whatever `owner` was
-/// keyed on.
+/// keyed on, and `ofd` says whether an OFD request is what is being recorded.
 #[allow(clippy::too_many_arguments)] // the same lock request, plus its `pid`
 pub fn apply_set(
     locks: &mut Vec<Lock>,
@@ -214,6 +223,7 @@ pub fn apply_set(
     kind: Option<LockKind>,
     lo: i64,
     hi: i64,
+    ofd: bool,
 ) {
     remove_range(locks, dev, ino, owner, class, lo, hi);
     if let Some(k) = kind {
@@ -226,6 +236,7 @@ pub fn apply_set(
             kind: k,
             start: lo,
             end: hi,
+            ofd,
         });
     }
 }
@@ -274,6 +285,7 @@ pub fn set(
     kind: Option<LockKind>,
     lo: i64,
     hi: i64,
+    ofd: bool,
 ) -> Result<(), u32> {
     critical_section::with(|cs| {
         let mut table = FILE_LOCKS.borrow(cs).borrow_mut();
@@ -283,7 +295,7 @@ pub fn set(
         {
             return Err(table[i].pid);
         }
-        apply_set(&mut table, dev, ino, owner, pid, class, kind, lo, hi);
+        apply_set(&mut table, dev, ino, owner, pid, class, kind, lo, hi, ofd);
         if kind.is_none() {
             wake_waiters(dev, ino);
         }
@@ -297,21 +309,24 @@ pub fn set(
 ///
 /// * every **record** lock the *process* holds on this file goes - POSIX's rule
 ///   and the one that surprises people, since a lock taken through one fd is
-///   lost by closing an unrelated fd to the same file;
+///   lost by closing an unrelated fd to the same file - and so does any
+///   **open-file-description** record lock (`F_OFD_*`) this description holds,
+///   which is a *different* owner in the same class;
 /// * the **whole-file** lock goes if it was this open file description's, so a
 ///   second `open()` of the same file keeps its `flock` when the first is
 ///   closed.
 ///
 /// The second half is **not** yet Linux's, and the difference is named rather
-/// than left in the code: Linux drops the description's `flock` with the *last*
-/// descriptor referring to it, so closing one of several `dup`s leaves the lock
-/// in force - measured on a current host, where `flock(a, LOCK_EX)`,
-/// `close(dup_of_a)` and then a fresh `open()` of the file still answers
-/// `EWOULDBLOCK`. Here any close naming that description drops it, because the
-/// caller passes the description's identity and nothing about how many
-/// descriptors still hold it. `docs/NOTES.md` §15.16 carries the measurement, and
-/// `user/tests/src/bin/t-filelock.rs` records why no claim of its own fails on
-/// it.
+/// than left in the code: Linux drops the description's `flock` (and its
+/// `F_OFD_*` lock) with the *last* descriptor referring to it, so closing one of
+/// several `dup`s leaves the lock in force - measured on a current host, where
+/// `flock(a, LOCK_EX)`, `close(dup_of_a)` and then a fresh `open()` of the file
+/// still answers `EWOULDBLOCK`, and the same measurement holds for an
+/// `F_OFD_SETLK` (`.workbuddy/probe_ofd.c`, case D). Here any close naming that
+/// description drops it, because the caller passes the description's identity
+/// and nothing about how many descriptors still hold it. `docs/notes/` §15.16
+/// carries the `flock` measurement, and `user/tests/src/bin/t-filelock.rs`
+/// records why no claim of its own fails on it.
 #[cfg(target_os = "none")]
 pub fn release_on_close(dev: u64, ino: u64, pid: u32, ofd: u64) {
     critical_section::with(|cs| {
@@ -321,7 +336,7 @@ pub fn release_on_close(dev: u64, ino: u64, pid: u32, ofd: u64) {
             !(l.dev == dev
                 && l.ino == ino
                 && (match l.class {
-                    LockClass::Record => l.pid == pid,
+                    LockClass::Record => l.pid == pid || l.owner == ofd,
                     LockClass::Whole => l.owner == ofd,
                 }))
         });
@@ -412,6 +427,7 @@ pub fn set_or_arm(
     kind: Option<LockKind>,
     lo: i64,
     hi: i64,
+    ofd: bool,
 ) -> bool {
     critical_section::with(|cs| {
         let mut table = FILE_LOCKS.borrow(cs).borrow_mut();
@@ -428,7 +444,7 @@ pub fn set_or_arm(
             }
             return false;
         }
-        apply_set(&mut table, dev, ino, owner, pid, class, kind, lo, hi);
+        apply_set(&mut table, dev, ino, owner, pid, class, kind, lo, hi, ofd);
         if kind.is_none() {
             wake_waiters(dev, ino);
         }
@@ -482,6 +498,7 @@ mod tests {
             kind,
             start,
             end,
+            ofd: false,
         }
     }
 
@@ -624,7 +641,7 @@ mod tests {
     fn unlock_splits_a_wide_lock_into_its_remainders() {
         let mut t = Vec::new();
         set_on(&mut t, 7, 7, LockClass::Record, LockKind::Write, 0, 100).unwrap();
-        apply_set(&mut t, 1, 1, 7, 7, LockClass::Record, None, 40, 60);
+        apply_set(&mut t, 1, 1, 7, 7, LockClass::Record, None, 40, 60, false);
         let mine: Vec<(i64, i64)> = t
             .iter()
             .filter(|l| l.owner == 7)
@@ -657,7 +674,7 @@ mod tests {
         if let Some(i) = find_conflict(t, 1, 1, owner, class, kind, lo, hi) {
             return Err(t[i].pid);
         }
-        apply_set(t, 1, 1, owner, pid, class, Some(kind), lo, hi);
+        apply_set(t, 1, 1, owner, pid, class, Some(kind), lo, hi, false);
         Ok(())
     }
 
@@ -689,5 +706,56 @@ mod tests {
             1,
             "the second replaced the first rather than joining it"
         );
+    }
+
+    /// An `F_OFD_*` lock is the third ownership model: the same *record*
+    /// conflict domain as a POSIX lock (so one refuses the other), but owned by
+    /// the open file description rather than the thread group, so two
+    /// independent `open()`s of one file inside one process contend while a
+    /// `dup` shares. The `ofd` flag is what carries that into `F_OFD_GETLK`,
+    /// which answers `l_pid = -1` instead of a number.
+    #[test]
+    fn an_ofd_lock_is_a_record_lock_owned_by_the_description() {
+        let mut t = Vec::new();
+        // Two descriptions of one file (101, 102), one pid: the OFD write lock
+        // on the first contends with the second.
+        apply_set(
+            &mut t,
+            1,
+            1,
+            101,
+            7,
+            LockClass::Record,
+            Some(LockKind::Write),
+            0,
+            INF,
+            true,
+        );
+        assert_eq!(
+            find_conflict(&t, 1, 1, 102, LockClass::Record, LockKind::Write, 0, INF),
+            Some(0),
+            "a second description of the same process contends"
+        );
+        // The description's own second request replaces its lock instead - the
+        // same "owner replaces itself" rule, with the description as owner.
+        apply_set(
+            &mut t,
+            1,
+            1,
+            101,
+            7,
+            LockClass::Record,
+            Some(LockKind::Write),
+            0,
+            INF,
+            true,
+        );
+        assert_eq!(t.len(), 1);
+        assert!(t[0].ofd, "the flag rides with the lock for `l_pid`");
+        // A POSIX lock (owner is a tgid, a different value space) is refused by
+        // the OFD lock, because both are record locks...
+        assert!(find_conflict(&t, 1, 1, 7, LockClass::Record, LockKind::Write, 0, INF).is_some());
+        // ...while the whole-file family never sees it.
+        assert!(find_conflict(&t, 1, 1, 7, LockClass::Whole, LockKind::Write, 0, INF).is_none());
     }
 }

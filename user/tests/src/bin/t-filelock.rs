@@ -17,9 +17,13 @@
 //! already appears to hold - and must not have it dropped under it when an
 //! unrelated descriptor closes.
 //!
-//! All twelve claims were run against real Linux first, in the shape this
-//! program makes them, because a pin's assertions are the first thing that can
-//! be wrong: `0, EWOULDBLOCK, 0, 0, 0, 0, 0, 0, 0, 0, F_UNLCK, 0`.
+//! All twelve `flock`/POSIX claims were run against real Linux first, in the
+//! shape this program makes them, because a pin's assertions are the first
+//! thing that can be wrong: `0, EWOULDBLOCK, 0, 0, 0, 0, 0, 0, 0, 0, F_UNLCK,
+//! 0`. The `F_OFD_*` group at the end is the third ownership model - a record
+//! lock owned by the description rather than the process - and its verdicts
+//! (`0, 0, WOULDBLOCK, 0, (F_WRLCK, -1), WOULDBLOCK, 0, 0, 0`) were measured
+//! the same way, with `.workbuddy/probe_ofd.c`.
 //!
 //! # One reading these claims do not pin, named rather than fixed here
 //!
@@ -112,6 +116,43 @@ fn getlk(fd: i32) -> Result<libc::c_short, Errno> {
         Err(Errno::from_raw_os_error(last_errno()))
     } else {
         Ok(probe.l_type)
+    }
+}
+
+/// `F_OFD_SETLK` (the whole file, `l_type` as asked): `0`, or the errno. The
+/// `F_OFD_*` family has no `rustix` binding, so this is clause (a) again - the
+/// same raw `libc::fcntl` the `F_GETLK` probe uses, with the command named.
+fn ofd_setlk(fd: i32, l_type: libc::c_short) -> Result<(), Errno> {
+    let mut want = libc::flock {
+        l_type,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    let r = unsafe { libc::fcntl(fd, libc::F_OFD_SETLK, &mut want as *mut libc::flock) };
+    if r < 0 {
+        Err(Errno::from_raw_os_error(last_errno()))
+    } else {
+        Ok(())
+    }
+}
+
+/// `F_OFD_GETLK` as the same whole-file write probe, answering the pair the
+/// claim is about: the conflicting kind, and the `l_pid` the kernel puts back.
+fn ofd_getlk(fd: i32) -> Result<(libc::c_short, i32), Errno> {
+    let mut probe = libc::flock {
+        l_type: libc::F_WRLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    let r = unsafe { libc::fcntl(fd, libc::F_OFD_GETLK, &mut probe as *mut libc::flock) };
+    if r < 0 {
+        Err(Errno::from_raw_os_error(last_errno()))
+    } else {
+        Ok((probe.l_type, probe.l_pid))
     }
 }
 
@@ -211,6 +252,59 @@ fn main() {
     r.check(
         "...and the first description can take LOCK_EX, with nothing left in the way",
         flock(&first, FlockOperation::NonBlockingLockExclusive) == Ok(()),
+    );
+
+    // --- F_OFD_*: the third ownership model ---
+    // A record lock in the same conflict domain as POSIX's, but owned by the
+    // open file description - so two `open()`s contend while a `dup` shares,
+    // exactly as `flock` behaves, and no process can be named as the holder.
+    // Every verdict here was measured on the host first (`.workbuddy/probe_ofd.c`).
+    r.check(
+        "the flock holder releases before the OFD pair",
+        flock(&first, FlockOperation::Unlock) == Ok(()),
+    );
+    let ofd_dup = match dupfd(first.as_raw_fd(), DUP_FLOOR) {
+        Ok(fd) => fd,
+        Err(_) => {
+            let _ = unlinkat(CWD, PATH, AtFlags::empty());
+            r.finish()
+        }
+    };
+    // SAFETY: a descriptor just returned by `F_DUPFD`, closed by hand below.
+    let ofd_dup = unsafe { BorrowedFd::borrow_raw(ofd_dup) };
+
+    r.check(
+        "an OFD write lock is taken through the first description",
+        ofd_setlk(first.as_raw_fd(), libc::F_WRLCK as libc::c_short) == Ok(()),
+    );
+    r.check(
+        "a second open() of the same process contends with it, description against process",
+        ofd_setlk(second.as_raw_fd(), libc::F_WRLCK as libc::c_short) == Err(Errno::WOULDBLOCK),
+    );
+    r.check(
+        "a dup shares the description's OFD lock",
+        ofd_setlk(ofd_dup.as_raw_fd(), libc::F_WRLCK as libc::c_short) == Ok(()),
+    );
+    r.check(
+        "F_OFD_GETLK names the holder as -1, since no process can name it",
+        ofd_getlk(second.as_raw_fd()) == Ok((libc::F_WRLCK as libc::c_short, -1)),
+    );
+    r.check(
+        "and a POSIX lock is refused by it, the same record domain",
+        fcntl_lock(&second, FlockOperation::NonBlockingLockExclusive) == Err(Errno::WOULDBLOCK),
+    );
+    r.check(
+        "an unlock through the shared description releases it",
+        ofd_setlk(ofd_dup.as_raw_fd(), libc::F_UNLCK as libc::c_short) == Ok(()),
+    );
+    r.check(
+        "so the process can then take its POSIX record lock",
+        fcntl_lock(&second, FlockOperation::NonBlockingLockExclusive) == Ok(()),
+    );
+    // SAFETY: the descriptor from the `F_DUPFD` above, open since.
+    r.check(
+        "the OFD dup closes clean",
+        unsafe { libc::close(ofd_dup.as_raw_fd()) } == 0,
     );
 
     let _ = flock(&first, FlockOperation::Unlock);

@@ -21,8 +21,8 @@ other kinds falling back to the `.`/`..` convention).
 ### 3.2 File Locking (fcntl F_SETLK) — **DONE**
 
 POSIX record locks are real: a global table keyed by `(dev, ino)`, each entry
-`{owner, pid, class, kind, [start,end)}`, in `src/vfs/locks.rs` (the range math,
-conflict rule and split-on-relock are host-tested). Both lock families live in
+`{owner, pid, class, kind, [start,end), ofd}`, in `src/vfs/locks.rs` (the range
+math, conflict rule and split-on-relock are host-tested). Both lock families live in
 that one table but never see each other - a `class` of `Record` (`fcntl`
 `F_SETLK`/`F_GETLK`/`F_SETLKW`) and `Whole` (`flock`) conflict only within the
 class, as Linux defines the two to be independent. `F_SETLK` takes or drops a
@@ -43,6 +43,39 @@ process's record locks", and "the flock dies with its own description" - and
 S6 batch 11, its own flock half since corrected there for the second half of the
 second rule: see §15.16) pins both, with the contending-second-`open`
 and the sharing-`dup` cases side by side.
+
+**The third ownership model, `F_OFD_*`, is a record lock the description owns.**
+Linux numbers the open-file-description twins `36..=38`, straight after
+`F_GETLK`/`F_SETLK`/`F_SETLKW`, and they are the same byte-range request in the
+*same conflict domain* - an OFD lock refuses a POSIX one and the reverse - but
+their owner is the open file description rather than the thread group, so two
+independent `open()`s of one file inside one process contend while a `dup`
+shares. Every clause was measured on the host before the shape was written
+(`.workbuddy/probe_ofd.c`): the independent second `open()` answers
+`EWOULDBLOCK`, the `dup` takes it, a POSIX lock through the second description is
+refused by the OFD holder, and `F_OFD_GETLK` reports `l_pid = -1` - there is no
+process to name, which is exactly why Linux's `locks_translate_pid` returns `-1`
+before it ever translates. The implementation is one `ofd` flag on the lock
+entry (the owner is `File::ofd()`, the same description identity `flock` keys on)
+and one arm each in the `record_lock` set and query paths; `F_OFD_GETLK` is
+`F_GETLK` minus the translation. Pinned by `t-filelock`'s nine new claims on both
+machines.
+
+The `F_OFD_*` lock inherits the named `flock` divergence above rather than
+closing it: `release_on_close` drops a description's OFD lock on **any** close of
+that description, where Linux waits for the last reference - the same
+measurement (§15.16) applies (case D of `.workbuddy/probe_ofd.c`: an OFD lock
+survives `close(dup)` on a real host), and no claim fails on it because
+`t-filelock` names the divergence instead of pinning it.
+
+**Gate.** x86_64 `=== SUMMARY pass=173 fail=0 (173 built)` with `mpos-kunit 32
+passed, 0 failed` and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32
+cases, exit 0. The program counts did not move - the new verdicts are nine more
+`ok:` lines inside `t-filelock`, whose `flock`/POSIX half is unchanged. The
+host-side lock test `an_ofd_lock_is_a_record_lock_owned_by_the_description`
+lands with the `ofd` flag; clippy reports nothing on either bare-metal target or
+the host lib, and `cargo xtask depgraph` is within the ratchet with no edge
+added.
 
 *Not a gap:* `read`/`write` do not consult the lock table, which is what Linux
 does. These are **advisory** locks: nothing refuses a `read` that walks over

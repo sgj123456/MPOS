@@ -16,10 +16,11 @@ use crate::syscall::linux::abi;
 // and their tests live in `abi`.
 use crate::syscall::linux::abi::{
     AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, EFD_NONBLOCK, EFD_SEMAPHORE,
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_SETFD, F_SETFL, F_SETLK, F_SETLKW,
-    FD_CLOEXEC, FD_SETSIZE, O_ACCMODE, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR,
-    O_TMPFILE, O_TRUNC, O_WRONLY, POLLERR, POLLFD_EVENTS, POLLFD_REVENTS, POLLFD_SIZE, POLLHUP,
-    POLLIN, POLLNVAL, POLLOUT, StatTimes, normalize_path, write_stat,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW,
+    F_SETFD, F_SETFL, F_SETLK, F_SETLKW, FD_CLOEXEC, FD_SETSIZE, O_ACCMODE, O_CLOEXEC, O_CREAT,
+    O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR, O_TMPFILE, O_TRUNC, O_WRONLY, POLLERR, POLLFD_EVENTS,
+    POLLFD_REVENTS, POLLFD_SIZE, POLLHUP, POLLIN, POLLNVAL, POLLOUT, StatTimes, normalize_path,
+    write_stat,
 };
 use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
 use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X_OK};
@@ -531,6 +532,7 @@ pub fn flock(args: [usize; ARG_COUNT]) -> isize {
             0,
             crate::vfs::locks::INF,
             op & LOCK_NB == 0,
+            false,
         )
     }
     #[cfg(not(target_os = "none"))]
@@ -2279,13 +2281,17 @@ pub fn fcntl(args: [usize; ARG_COUNT]) -> isize {
             }
             Err(e) => err_of(e),
         },
-        // POSIX record locking. The range math, the conflict rule and the
-        // split-on-relock all live in `vfs::locks`, host-tested; this resolves
-        // the caller's `struct flock` against the descriptor's file and applies
-        // it. `F_SETLK` refuses a blocked request with `EAGAIN`; `F_SETLKW`
-        // would block, and - since there is no wake-on-unlock yet - it records
-        // the grant instead of spinning, so a blocking caller never hangs.
-        F_GETLK | F_SETLK | F_SETLKW => record_lock(fd, cmd, arg),
+        // POSIX record locking, and its open-file-description twin. The range
+        // math, the conflict rule and the split-on-relock all live in
+        // `vfs::locks`, host-tested; this resolves the caller's `struct flock`
+        // against the descriptor's file and applies it. `F_SETLK` refuses a
+        // blocked request with `EAGAIN`; `F_SETLKW` would block, and - since
+        // there is no wake-on-unlock yet - it records the grant instead of
+        // spinning, so a blocking caller never hangs. The `F_OFD_*` commands
+        // are the same call with the open file description as the owner.
+        F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
+            record_lock(fd, cmd, arg)
+        }
         // memfd sealing: only a memfd has a seal state, and only under
         // `MFD_ALLOW_SEALING` can it be added to. The commands are the
         // `F_ADD_SEALS`/`F_GET_SEALS` a wl_shm pool uses to freeze its size.
@@ -2335,7 +2341,8 @@ mod flock_off {
 /// The arguments are the lock request itself - device, inode, owner, pid,
 /// class, kind and the byte range - which the two callers below already hold
 /// as separate values, plus `block`, which is the one thing `F_SETLKW` adds
-/// to `F_SETLK`.
+/// to `F_SETLK`, and `ofd`, which records whether an `F_OFD_*` request is what
+/// is being taken.
 #[allow(clippy::too_many_arguments)]
 #[cfg(target_os = "none")]
 fn lock_take(
@@ -2348,17 +2355,18 @@ fn lock_take(
     lo: i64,
     hi: i64,
     block: bool,
+    ofd: bool,
 ) -> isize {
     use crate::vfs::locks;
     if !block {
-        return match locks::set(dev, ino, owner, pid, class, kind, lo, hi) {
+        return match locks::set(dev, ino, owner, pid, class, kind, lo, hi, ofd) {
             Ok(()) => 0,
             Err(_holder) => err::EAGAIN,
         };
     }
     let me = crate::sched::current().0;
     loop {
-        if locks::set_or_arm(dev, ino, owner, pid, class, me, kind, lo, hi) {
+        if locks::set_or_arm(dev, ino, owner, pid, class, me, kind, lo, hi, ofd) {
             locks::disarm(me);
             return 0;
         }
@@ -2400,9 +2408,10 @@ fn holder_pid_in(owner: u64) -> i32 {
 }
 
 /// One `fcntl` locking command against `fd`: `F_GETLK` reports the first
-/// conflicting lock, `F_SETLK`/`F_SETLKW` take or drop one. `arg` is a user
-/// `struct flock *`; for `F_SETLK` the fields are read, and a conflict is the
-/// holder's pid (returned as `EAGAIN`).
+/// conflicting lock, `F_SETLK`/`F_SETLKW` take or drop one, and the `F_OFD_*`
+/// trio is the same with the open file description as the owner rather than the
+/// thread group. `arg` is a user `struct flock *`; for the `SET` commands the
+/// fields are read, and a conflict is the holder's pid (returned as `EAGAIN`).
 #[cfg(target_os = "none")]
 fn record_lock(fd: i32, cmd: usize, arg: usize) -> isize {
     use crate::vfs::locks::{self, F_RDLCK, F_WRLCK, LockClass};
@@ -2410,7 +2419,14 @@ fn record_lock(fd: i32, cmd: usize, arg: usize) -> isize {
         Ok(file) => file,
         Err(e) => return err_of(e),
     };
-    if arg == 0 || !crate::syscall::buffer_ok(arg, flock_off::BYTES, cmd == abi::F_GETLK, true) {
+    if arg == 0
+        || !crate::syscall::buffer_ok(
+            arg,
+            flock_off::BYTES,
+            matches!(cmd, abi::F_GETLK | abi::F_OFD_GETLK),
+            true,
+        )
+    {
         return err::EFAULT;
     }
     let read_i16 = |off: usize| unsafe { ((arg + off) as *const i16).read_unaligned() };
@@ -2425,10 +2441,19 @@ fn record_lock(fd: i32, cmd: usize, arg: usize) -> isize {
     let dev = crate::vfs::mount::fs_id_of_inode(&inode);
     let ino = meta.ino;
     let size = meta.size as i64;
-    // A record lock is the *process's*: one thread group's second request on a
-    // range it already holds replaces the first rather than deadlocking on it,
-    // and `pid` (the same value here) is what `F_GETLK` reports as `l_pid`.
-    let owner = crate::sched::current_tgid().0 as u64;
+    // A POSIX record lock is the *process's*: one thread group's second request
+    // on a range it already holds replaces the first rather than deadlocking on
+    // it, and `pid` (the same value here) is what `F_GETLK` reports as `l_pid`.
+    // An `F_OFD_*` request is the third ownership model: the same record class
+    // and conflict domain, but owned by the open file description like a
+    // `flock`, so its `owner` is the description's identity and no pid can name
+    // it - `F_OFD_GETLK` hands back `-1` for exactly that reason.
+    let ofd = matches!(cmd, abi::F_OFD_GETLK | abi::F_OFD_SETLK | abi::F_OFD_SETLKW);
+    let owner = if ofd {
+        file.ofd()
+    } else {
+        crate::sched::current_tgid().0 as u64
+    };
     let pid = crate::sched::current_tgid().0 as u32;
 
     let (lo, hi) = match locks::resolve_range(l_whence, l_start, l_len, size, file.pos() as i64) {
@@ -2437,7 +2462,7 @@ fn record_lock(fd: i32, cmd: usize, arg: usize) -> isize {
     };
 
     match cmd {
-        abi::F_GETLK => {
+        abi::F_GETLK | abi::F_OFD_GETLK => {
             // Ask as the requested kind; a lock the caller would take is
             // reported back with the holder's kind, range and pid, or cleared
             // to `F_UNLCK` when nothing is in the way.
@@ -2468,18 +2493,24 @@ fn record_lock(fd: i32, cmd: usize, arg: usize) -> isize {
                             held.end - held.start
                         },
                     );
-                    unsafe {
-                        ((arg + flock_off::PID) as *mut i32)
-                            .write_unaligned(holder_pid_in(held.owner))
+                    // An OFD holder has no process to name, so Linux answers
+                    // `-1` before it ever translates a pid - measured on the
+                    // host (`.workbuddy/probe_ofd.c`, case B).
+                    let reported = if held.ofd {
+                        -1
+                    } else {
+                        holder_pid_in(held.owner)
                     };
+                    unsafe { ((arg + flock_off::PID) as *mut i32).write_unaligned(reported) };
                 }
                 None => write_i16(flock_off::TYPE, 2), // F_UNLCK
             }
             0
         }
-        F_SETLK | F_SETLKW => {
+        F_SETLK | F_SETLKW | abi::F_OFD_SETLK | abi::F_OFD_SETLKW => {
             // An `F_UNLCK` drops the range, the others take it; `F_SETLK` is
-            // the non-blocking spelling and `F_SETLKW` waits for the range.
+            // the non-blocking spelling and `F_SETLKW` waits for the range. The
+            // `OFD` pair is the same call with the description as owner.
             let kind = match l_type {
                 F_RDLCK => Some(locks::LockKind::Read),
                 F_WRLCK => Some(locks::LockKind::Write),
@@ -2495,7 +2526,8 @@ fn record_lock(fd: i32, cmd: usize, arg: usize) -> isize {
                 kind,
                 lo,
                 hi,
-                cmd == abi::F_SETLKW,
+                matches!(cmd, abi::F_SETLKW | abi::F_OFD_SETLKW),
+                ofd,
             )
         }
         _ => err::EINVAL,
