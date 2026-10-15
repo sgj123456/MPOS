@@ -187,9 +187,10 @@ In the order that keeps each step verifiable on its own:
 1. **namespaces** (§6.3) — UTS, MNT, PID and NET are landed, and the ladder's remaining work
    is named per rung: a **wire that can move** into a namespace (`eth0` still cannot enter one),
    nested namespaces pin the *numbers* only one level deep (the zap's reach is pinned two levels
-   now), the `/proc/net` reader's rows are collected per namespace but no test exercises them, and
-   then the four kinds with no entry at all
-   (user, IPC, cgroup, time - four of `namespaces(7)`'s eight). Two more left this list on
+   now), and then the four kinds with no entry at all
+   (user, IPC, cgroup, time - four of `namespaces(7)`'s eight). The `/proc/net` reader's rows were
+   per-namespace but unexercised; `t-ns-net` reads the file on both sides of the boundary now
+   (2026-10-15). Two more left this list on
    2026-10-15: the pid namespace's own creation rules (one per process, and a sealed one takes no
    tasks - both refused now with the errno Linux uses), and `NSpid`'s single number, which is the
    chain in all four `NS*` fields now. `F_GETLK`'s `l_pid` is the reader's number too, from

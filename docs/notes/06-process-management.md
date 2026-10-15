@@ -309,8 +309,23 @@ namespace). **vsock's own stack stays machine-wide**, which is now a *measured* 
 gap (the paragraph below has the probe), and the unix family is split where Linux splits it - its
 **abstract** names are keyed by the socket's namespace, its **path** names are not namespaced at
 all, which is what makes the pin's cross-namespace handover possible. And a
-`/proc/net` reader sees only its own namespace's sockets, which the pin's rows do not exercise -
-the collector walks `HOMES` filtered by the reader, and one namespace is all a sweep has. The rest
+`/proc/net` reader sees only its own namespace's sockets - a claim now, not a reading: `t-ns-net`
+reads `/proc/net/tcp` inside the child's namespace and finds the very listener it just bound there,
+and reads the same file in the machine's namespace and finds no row for that same port (2026-10-15).
+The collector walks `HOMES` filtered by `current_net_ns()`, which is Linux's shape - a socket is a
+row of one namespace's table and no other's. Measured on the host with the `unshare -Urn` door this
+section already established (Python's `os.unshare`, no shell): a listener on `127.0.0.1:0` is a row
+of the host namespace's `/proc/net/tcp` and absent from a fresh network namespace's, whose table is
+empty -
+
+```
+port  = 37845 (0x93D5)
+host  namespace has it: True
+child namespace (unshare -Urn) has it: False
+child namespace table rows (non-header): 0
+```
+
+The rest
 of NET's design (one opaque `net_ns: Option<u64>` on `Task` rather than an `Arc` object, so that
 `sched` does not name `net` and turn the existing `net -> sched` recall edge into a mutual pair; the
 machine's own network namespace number minted in `vfs::ns`, which both layers may name; a fresh

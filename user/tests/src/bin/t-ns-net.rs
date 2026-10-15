@@ -16,6 +16,10 @@
 //! * while the machine's stack is untouched: the very port the child holds is
 //!   **free** in the parent's namespace, and a connect to it there is refused -
 //!   the two port spaces are two;
+//! * and `/proc/net/tcp` is the *reader's* table: the child's listener is a row
+//!   of the file read inside the namespace, while the file read in the machine's
+//!   namespace has no row for that same port - the collector filters on
+//!   `current_net_ns()`, and no claim read the file before this one;
 //! * the identity differs: `/proc/self/ns/net` names a different number in the
 //!   child than in the parent;
 //! * and the unix family's **abstract** names are the namespace's own: a socket
@@ -252,6 +256,32 @@ fn ns_number() -> Option<u64> {
     text.strip_prefix("net:[")?.strip_suffix(']')?.parse().ok()
 }
 
+/// Whether `/proc/net/tcp` as **this task** reads it has a row whose *local*
+/// address is `port` and whose state byte is `state`. The file is the reader's
+/// own namespace's table: the collector filters on `current_net_ns()`, so the
+/// same call in two namespaces answers about two different stacks. That
+/// per-namespace resolution is the claim below - the file is parsed here by
+/// position, which is the column layout `ss`/`netstat` read, not a shape this
+/// test invented: `sl`, then `local_address`, then `rem_address`, then `st`,
+/// and the local address is the little-endian `%08X` word, a colon, and the
+/// port as `%04X`. `None` when the file cannot be read at all, so a refusal and
+/// an empty table stay apart.
+fn proc_net_tcp_local(port: u16, state: u8) -> Option<bool> {
+    let text = std::fs::read_to_string("/proc/net/tcp").ok()?;
+    let want_port = format!(":{:04X}", port);
+    let want_state = format!("{:02X}", state);
+    Some(text.lines().skip(1).any(|line| {
+        let mut field = line.split_whitespace();
+        let _sl = field.next();
+        let local = match field.next() {
+            Some(l) => l,
+            None => return false,
+        };
+        let _rem = field.next();
+        local.ends_with(&want_port) && field.next() == Some(want_state.as_str())
+    }))
+}
+
 /// An **abstract** `sockaddr_un`: the leading NUL and the name, which is the
 /// address the namespace split below is about. `rustix` writes the field
 /// (`new_abstract_name`), so this file carries no second copy of the encoding.
@@ -452,9 +482,17 @@ fn main() {
                     }
                 }
             }
+            // This namespace's own socket table, read here: the listener just
+            // bound must be a row *of this namespace's* file. The parent picks
+            // the port because it is free in the *machine's* stack, so the same
+            // number is a row here and absent from the machine's table below -
+            // the two answers about two stacks are the whole claim.
+            let own_row = proc_net_tcp_local(port, 10)
+                .map(|present| present as isize)
+                .unwrap_or(-1);
             let line = format!(
-                "{} {} {} {} {} {}\n",
-                lo_up, addr, eth_up, listen_ok, connect_ok, accept_ok
+                "{} {} {} {} {} {} {}\n",
+                lo_up, addr, eth_up, listen_ok, connect_ok, accept_ok, own_row
             );
             let _ = write(&up_w, line.as_bytes());
 
@@ -557,8 +595,8 @@ fn main() {
                 .split_whitespace()
                 .filter_map(|f| f.parse().ok())
                 .collect();
-            r.check("the child reports six words", fields.len() == 6);
-            if fields.len() == 6 {
+            r.check("the child reports seven words", fields.len() == 7);
+            if fields.len() == 7 {
                 r.check(
                     &format!(
                         "the child's own loopback answers `ip link set lo up` (got {})",
@@ -592,7 +630,28 @@ fn main() {
                     ),
                     fields[3] == 0 && fields[4] == 0 && fields[5] == 0,
                 );
+                // The socket table, read *inside* the namespace: the listener
+                // bound a moment ago is a row of `/proc/net/tcp` here, because
+                // the collector resolves against this reader's namespace. That
+                // is the half `t-ns-net` never exercised - the file existed and
+                // the filter ran, but no claim read it.
+                r.check(
+                    &format!(
+                        "and the child's own /proc/net/tcp carries the listener it just bound (got {})",
+                        fields[6]
+                    ),
+                    fields[6] == 1,
+                );
             }
+
+            // The machine's stack, untouched: the *same* port is free here, so
+            // the machine's `/proc/net/tcp` - read *here*, in the machine's
+            // namespace - has no row for it. The same number, a table each: the
+            // rows belong to the reader's namespace and not to the machine.
+            r.check(
+                "while the machine's /proc/net/tcp has no row for the child's port",
+                proc_net_tcp_local(port, 10) == Some(false),
+            );
 
             // The machine's stack, untouched: the *same* port is free here, and
             // a connect to it is refused - the two port spaces are two.
