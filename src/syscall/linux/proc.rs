@@ -3249,11 +3249,32 @@ pub(super) fn handle_clock_gettime(args: [usize; ARG_COUNT]) -> isize {
     } else {
         crate::hal::boot_epoch()
     };
-    let secs = wall + elapsed / 1_000_000_000;
-    let nsecs = elapsed % 1_000_000_000;
+    // The caller's time namespace moves some of these clocks and none of the
+    // others, which is the whole point of the kind and is measured rather than
+    // guessed (§6.3, `.workbuddy/probe-timens5.c`/`7.c`): the three monotonic
+    // clocks that are not the coarse *raw* hardware counter all read through the
+    // monotonic offset, `BOOTTIME` through its own, and REALTIME, TAI and the
+    // two cputime clocks are untouched - a certificate's validity must not move
+    // because a namespace wanted an earlier uptime, and CPU time is not a clock
+    // anybody re-bases.
+    //
+    // The offset is added to the *nanosecond* total rather than to each half, so
+    // a negative offset cannot hand userland a negative `tv_nsec`: the
+    // normalization below is `div_euclid`/`rem_euclid`, which is what keeps the
+    // two fields in the shape a `timespec` promises. Zero for every task that
+    // never entered a namespace, so an ordinary clock read is unchanged.
+    let (monotonic_offset, boottime_offset) = crate::sched::time_offsets();
+    let offset = match clk_id {
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => monotonic_offset,
+        CLOCK_BOOTTIME => boottime_offset,
+        _ => 0,
+    };
+    let total = (wall as i64) * 1_000_000_000 + elapsed as i64 + offset;
+    let secs = total.div_euclid(1_000_000_000);
+    let nsecs = total.rem_euclid(1_000_000_000);
     unsafe {
-        (tp as *mut i64).write_unaligned(secs as i64);
-        ((tp + 8) as *mut i64).write_unaligned(nsecs as i64);
+        (tp as *mut i64).write_unaligned(secs);
+        ((tp + 8) as *mut i64).write_unaligned(nsecs);
     }
     0
 }

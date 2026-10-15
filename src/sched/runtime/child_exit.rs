@@ -861,6 +861,20 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         };
         super::adopt_pid(TaskId(slot), &child_pid_ns);
 
+        // Which time namespace this child is born into: its creator's
+        // `time_ns_children`, and that one alone fills *both* of the child's
+        // slots. There is no `CLONE_NEWTIME` branch here because a real kernel
+        // does not serve that flag to `clone` at all - it is `EINVAL`, measured,
+        // so a time namespace is only ever made by `unshare` (§6.3).
+        //
+        // Sealing it in the same breath is the freeze rule: the moment a task is
+        // in a namespace its offsets stop being writable, which is what makes
+        // "set the offsets before the first fork" a rule rather than a
+        // suggestion. The machine's namespace is born sealed and this is a
+        // no-op on it.
+        let child_time_ns = Arc::clone(&t.task(parent_id).time_ns_children);
+        child_time_ns.freeze();
+
         let stack = Stack::new();
         // Interrupts stay off in the child until its `iretq` restores the
         // parent's RFLAGS: a fork child resumes inside a syscall gate, and the
@@ -1067,6 +1081,12 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // and `CLONE_NEWPID` the only thing that moves either.
             pid_ns: Arc::clone(&child_pid_ns),
             pid_ns_children: child_pid_ns,
+            // Born in the namespace computed above, in *both* slots: it reads
+            // its own clocks through the namespace its creator was pointing its
+            // children at, and its own children will be born in the same one
+            // until it unshares.
+            time_ns: Arc::clone(&child_time_ns),
+            time_ns_children: child_time_ns,
             // The network namespace: the creator's, unless this word asked for a
             // fresh one (`CLONE_NEWNET`, minted by the syscall layer, which is the
             // layer allowed to name `net`).
@@ -1415,6 +1435,16 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         let uts = alloc::sync::Arc::clone(&parent.uts);
         let pid_ns = alloc::sync::Arc::clone(&parent.pid_ns);
         let pid_ns_children = alloc::sync::Arc::clone(&parent.pid_ns_children);
+        // A thread is its process for the clocks too, and the subtlety is that
+        // a thread reads the namespace its process is *in* - not the one the
+        // process points its children at. Those are the same namespace for every
+        // process that has not unshared, and they differ for one that has: a new
+        // thread of such a process must go on reading the clocks the process
+        // reads, which is why this is `time_ns` and not `time_ns_children`. No
+        // freeze is needed either way - the namespace a thread lands in already
+        // has a task in it (the one asking), so it was sealed before this.
+        let time_ns = alloc::sync::Arc::clone(&parent.time_ns);
+        let time_ns_children = alloc::sync::Arc::clone(&parent.time_ns_children);
         let net_ns = parent.net_ns;
         // `CLONE_FS` is what every `pthread_create` sets: a thread that
         // `chdir`s moves its process, which is Linux's answer (measured -
@@ -1538,6 +1568,9 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             uts,
             pid_ns,
             pid_ns_children,
+            // ...and the same clocks, by reference, for the reason above.
+            time_ns,
+            time_ns_children,
             // A thread is its process: the same stack, by reference - the rule
             // `CLONE_THREAD` follows for every namespace above it (and why the
             // verdict refuses a thread with a namespace of its own).

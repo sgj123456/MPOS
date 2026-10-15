@@ -297,6 +297,20 @@ pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isi
     if asked != 0 && !privileged {
         return Err(mpos_err::EPERM);
     }
+    // `CLONE_NEWTIME` is deliberately **not** ruled on here, and the reason is
+    // measured: its bit is `0x80`, entirely inside the `CSIGNAL` byte, so
+    // `clone(2)` reads it as an exit signal and a caller cannot name it through
+    // this call at all. `.workbuddy/probe-clone-timens.c` (host 7.2) shows
+    // `clone(SIGCHLD|CLONE_NEWTIME)` = `0x91` answering `EINVAL` while
+    // `clone(SIGCHLD|CLONE_NEWNET)` succeeds - and `clone(0x80)` *alone* answers
+    // `EINVAL` too, which is what fixes the explanation as the signal number
+    // rather than the namespace. `.workbuddy/probe-clone3-timens.c` agrees from
+    // the other side: `clone3`, which carries the exit signal in its own field,
+    // *creates* a task for `CLONE_NEWTIME` - so the flag is not refused as a
+    // request, it is simply unexpressible here. This kernel reaches the same
+    // `EINVAL` by the same route, from its own signal validation, so nothing is
+    // owed to a caller: `unshare` is the one door, and it is the door Linux
+    // documents (§6.3).
     // A *thread* with a namespace of its own is something Linux serves - its
     // `create_new_namespaces` runs for a thread too - and something this kernel
     // cannot: `sched::spawn_thread` copies the creating process's namespaces by

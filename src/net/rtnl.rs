@@ -720,7 +720,11 @@ fn apply(ty: u16, flags: u16, msg: &[u8]) -> isize {
                     // A pid read in the caller's own pid namespace, naming the
                     // task whose net namespace is the destination.
                     Move::Pid(pid) => {
-                        match crate::sched::ns_of(pid as usize, crate::vfs::ns::Kind::Net) {
+                        let net = crate::vfs::ns::Entry {
+                            kind: crate::vfs::ns::Kind::Net,
+                            slot: crate::vfs::ns::Slot::Own,
+                        };
+                        match crate::sched::ns_of(pid as usize, net) {
                             Some(crate::vfs::ns::Namespace::Net(id)) => Some(id),
                             // A pid that names no task: `ESRCH`, which is what
                             // Linux's `get_net_ns_by_pid` answers (measured:

@@ -1,0 +1,31 @@
+# The time namespace: the offsets a task's monotonic clocks are read through.
+#
+# Two numbers and a freeze flag, over two clocks - so it is its own leaf crate
+# on exactly the pattern `crates/uts` and `crates/pidns` set: the object a task
+# holds behind an `Arc`, the number given in from the one pool `src/vfs/ns.rs`
+# mints, and the shared-state lock gated as the kernel gates it.
+#
+# The one thing that earns it a crate of its own rather than three fields on the
+# task is the offsets **file**: `/proc/<pid>/timens_offsets` is a grammar, and a
+# grammar is the kind of thing that should be argued with by host tests rather
+# than by booting a machine. The parsing and the formatting live here, the
+# number the caller mints does not, and the shape both are pinned against is
+# measured rather than recalled (docs/notes/06 §6.3).
+[package]
+name = "mpos-timens"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The errno table: the offsets file answers with negated errnos, and the three
+# refusals are the leaf's rather than a string the syscall layer maps back.
+mpos-err = { path = "../err" }
+
+[target.'cfg(target_os = "none")'.dependencies]
+critical-section = { version = "1.2", features = ["restore-state-bool"] }
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+critical-section = { version = "1.2", features = ["std"] }
+
+[lints]
+workspace = true

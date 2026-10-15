@@ -38,11 +38,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The kinds `/proc/<pid>/ns` names here.
 ///
-/// Four of Linux's ten, and the four the ladder has built (§6.3). The rest are
-/// absent, which is the honest surface: a kernel built without a namespace has
-/// no entry for it either (`/proc/self/ns/time` is `ENOENT` on a machine whose
-/// `CONFIG_TIME_NS` is off), so a reader sees a machine that has these two and
-/// is told nothing it cannot check.
+/// Five of Linux's eight kinds - seven of its ten *names*, since PID and TIME
+/// each have a `_for_children` spelling ([`Entry`]) - and the five the ladder
+/// has built (§6.3). The rest are absent, which is the honest surface: a kernel
+/// built without a namespace has no entry for it either
+/// (`/proc/self/ns/time` is `ENOENT` on a machine whose `CONFIG_TIME_NS` is
+/// off), so a reader sees a machine that has these and is told nothing it cannot
+/// check.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     /// `CLONE_NEWNS`: what is mounted where.
@@ -66,6 +68,13 @@ pub enum Kind {
     /// `cargo xtask depgraph` counts those pairs). The number is the identity
     /// either way, and this is where the identity layer keeps it.
     Net,
+    /// `CLONE_NEWTIME`: the offsets a task's monotonic clocks are read through.
+    ///
+    /// The one kind whose *only* way in is `unshare`: `clone(CLONE_NEWTIME)` is
+    /// `EINVAL` on a real kernel (measured, §6.3), so there is no flag path
+    /// through child creation and the namespace is always made by the caller
+    /// that then hands it to its children.
+    Time,
 }
 
 impl Kind {
@@ -76,6 +85,7 @@ impl Kind {
             Kind::Net => "net",
             Kind::Pid => "pid",
             Kind::Uts => "uts",
+            Kind::Time => "time",
         }
     }
 
@@ -89,7 +99,23 @@ impl Kind {
             Kind::Net => crate::abi::CLONE_NEWNET,
             Kind::Pid => crate::abi::CLONE_NEWPID,
             Kind::Uts => crate::abi::CLONE_NEWUTS,
+            Kind::Time => crate::abi::CLONE_NEWTIME,
         }
+    }
+
+    /// Whether this kind has a *second* spelling in `/proc/<pid>/ns`, naming the
+    /// namespace the task's **children** are created in rather than the one the
+    /// task itself is in.
+    ///
+    /// True for exactly the two kinds whose entry is a children's slot:
+    /// `unshare(CLONE_NEWPID)` and `unshare(CLONE_NEWTIME)` both replace what
+    /// `nsproxy` keeps *for the next child* and leave the caller where it was,
+    /// so a reader that wants to see either has to be given a name for that
+    /// slot. `pid_for_children` and `time_for_children` are those names
+    /// (measured: a real kernel's `/proc/self/ns` lists all ten, the two of
+    /// these among them).
+    pub const fn has_children_slot(self) -> bool {
+        matches!(self, Kind::Pid | Kind::Time)
     }
 
     /// The kind a `CLONE_*` bit names, if it names one of these.
@@ -99,37 +125,140 @@ impl Kind {
             b if b == crate::abi::CLONE_NEWNET => Some(Kind::Net),
             b if b == crate::abi::CLONE_NEWPID => Some(Kind::Pid),
             b if b == crate::abi::CLONE_NEWUTS => Some(Kind::Uts),
+            b if b == crate::abi::CLONE_NEWTIME => Some(Kind::Time),
             _ => None,
         }
     }
 
     /// The kind a link's target text names, for the reader that got it from
-    /// `readlink`.
+    /// `readlink`. A `_for_children` word names the same kind - the flag and the
+    /// kind are one question, which slot is another (see [`Entry`]).
     pub fn of_name(name: &str) -> Option<Kind> {
         match name {
             "mnt" => Some(Kind::Mount),
             "net" => Some(Kind::Net),
-            "pid" => Some(Kind::Pid),
+            "pid" | "pid_for_children" => Some(Kind::Pid),
             "uts" => Some(Kind::Uts),
+            "time" | "time_for_children" => Some(Kind::Time),
             _ => None,
         }
     }
 
-    /// Every kind, in the order the directory lists them (Linux lists its ten
-    /// in name order; these four are `mnt`, `net`, `pid`, `uts` for the same
-    /// reason - measured on a current host, where `/proc/self/ns` lists all ten
-    /// alphabetically).
-    pub const ALL: &'static [Kind] = &[Kind::Mount, Kind::Net, Kind::Pid, Kind::Uts];
+    /// Every kind, in name order.
+    ///
+    /// Note that this is *not* what the directory is built from: the names
+    /// `/proc/<pid>/ns` lists are [`Entry`]s, because PID and TIME have two
+    /// names each. This is the kinds alone, which is what the flag vocabulary
+    /// and a reader that only wants "which namespaces does this machine have"
+    /// are asking for.
+    pub const ALL: &'static [Kind] = &[Kind::Mount, Kind::Net, Kind::Pid, Kind::Time, Kind::Uts];
+}
+
+/// Which namespace *slot* of a task an entry of `/proc/<pid>/ns` reads.
+///
+/// The distinction exists because two kinds have two names each: a task has a
+/// pid namespace it is *in* and a (possibly different) one its children will be
+/// created in, and the same split Linux makes for time. The task's own slot is
+/// the one that answers `getpid` and the one its own clocks come from; the
+/// children's slot is what `unshare` and `setns` replace. Naming them apart is
+/// the whole reason the directory has ten entries where it has eight kinds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Slot {
+    Own,
+    ForChildren,
+}
+
+/// One name in `/proc/<pid>/ns`: a kind, and which of its slots the name reads.
+///
+/// The listing is built from these rather than from [`Kind::ALL`] because the
+/// directory's names are not one per kind: `pid` and `pid_for_children` are two
+/// names for one kind's two slots, and so are `time` and `time_for_children`.
+/// Keeping both in the vocabulary means the reader parses a name straight to the
+/// entry it names, and a `setns` against either spelling asks the same kind
+/// question it always did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Entry {
+    pub kind: Kind,
+    pub slot: Slot,
+}
+
+impl Entry {
+    /// Every name the directory lists, in name order - which is the order a real
+    /// kernel lists them in, measured.
+    pub const ALL: &'static [Entry] = &[
+        Entry {
+            kind: Kind::Mount,
+            slot: Slot::Own,
+        },
+        Entry {
+            kind: Kind::Net,
+            slot: Slot::Own,
+        },
+        Entry {
+            kind: Kind::Pid,
+            slot: Slot::Own,
+        },
+        Entry {
+            kind: Kind::Pid,
+            slot: Slot::ForChildren,
+        },
+        Entry {
+            kind: Kind::Time,
+            slot: Slot::Own,
+        },
+        Entry {
+            kind: Kind::Time,
+            slot: Slot::ForChildren,
+        },
+        Entry {
+            kind: Kind::Uts,
+            slot: Slot::Own,
+        },
+    ];
+
+    /// The word this entry is listed and read back as.
+    pub const fn name(self) -> &'static str {
+        match (self.kind, self.slot) {
+            (Kind::Pid, Slot::ForChildren) => "pid_for_children",
+            (Kind::Time, Slot::ForChildren) => "time_for_children",
+            (kind, Slot::Own) => kind.name(),
+            // A kind with no children's slot has no such name, and
+            // [`Entry::of_name`] cannot produce one: this arm is unreachable and
+            // says so by answering the kind's own name rather than panicking in
+            // a `const fn`.
+            (kind, Slot::ForChildren) => kind.name(),
+        }
+    }
+
+    /// The entry a directory name names, for the reader that got it from the
+    /// listing or from a `readlink`.
+    pub fn of_name(name: &str) -> Option<Entry> {
+        let kind = Kind::of_name(name)?;
+        // The `_for_children` suffix is the slot, and only a kind that has that
+        // slot has the name: `mnt_for_children` is not a namespace this or any
+        // other kernel has, so it stays `None` rather than resolving to MNT.
+        let slot = if name.ends_with("_for_children") {
+            if !kind.has_children_slot() {
+                return None;
+            }
+            Slot::ForChildren
+        } else {
+            Slot::Own
+        };
+        Some(Entry { kind, slot })
+    }
 }
 
 /// A namespace, as the object a descriptor holds and `setns` joins.
 ///
 /// The handle is the value's own `Arc` rather than a copy of what it holds:
 /// joining a namespace means *sharing* it (a mount made after a `setns` is seen
-/// by everyone in that namespace, which is the point of the call), and the two
-/// arms are the two kinds this kernel has. A descriptor keeps the `Arc` alive,
-/// so a namespace outlives the process that opened it - which is why
-/// `/proc/<pid>/ns/mnt` stays openable after that process exits.
+/// by everyone in that namespace, which is the point of the call), and the arms
+/// are the kinds this kernel has - minus `net`, whose handle is the number its
+/// stack is registered under rather than the stack itself (the `Net` arm says
+/// why). A descriptor keeps the `Arc` alive, so a namespace outlives the process
+/// that opened it - which is why `/proc/<pid>/ns/mnt` stays openable after that
+/// process exits.
 #[derive(Clone)]
 pub enum Namespace {
     Mount(Arc<crate::vfs::mount::MountTable>),
@@ -137,6 +266,10 @@ pub enum Namespace {
     Net(u64),
     Pid(Arc<crate::pidns::PidNs>),
     Uts(Arc<crate::uts::Uts>),
+    /// A time namespace, as the object rather than a number: nothing else keys
+    /// state by it (the offsets *are* the whole namespace), so there is no
+    /// registry for a number to index and the `Arc` is the identity.
+    Time(Arc<crate::timens::TimeNs>),
 }
 
 impl Namespace {
@@ -146,6 +279,7 @@ impl Namespace {
             Namespace::Net(_) => Kind::Net,
             Namespace::Pid(_) => Kind::Pid,
             Namespace::Uts(_) => Kind::Uts,
+            Namespace::Time(_) => Kind::Time,
         }
     }
 
@@ -156,6 +290,7 @@ impl Namespace {
             Namespace::Net(ns_id) => *ns_id,
             Namespace::Pid(pidns) => pidns.ns_id(),
             Namespace::Uts(uts) => uts.ns_id(),
+            Namespace::Time(timens) => timens.id(),
         }
     }
 
@@ -190,6 +325,31 @@ pub fn machine_net_id() -> u64 {
     let fresh = mint();
     MACHINE_NET_ID.store(fresh, Ordering::Relaxed);
     fresh
+}
+
+/// The machine's own time namespace, made on first use from the same pool.
+///
+/// The same shape as [`machine_net_id`] and for the same reason - a task in the
+/// machine's namespace holds no namespace of its own, so `/proc/<pid>/ns/time`
+/// and `/proc/<pid>/timens_offsets` both have to answer with the machine's - but
+/// the answer is an `Arc` rather than a number, because nothing else keys state
+/// by a time namespace: the offsets are the whole of it, so the object *is* the
+/// identity and a registry would have nothing to hold.
+///
+/// It is **frozen** from the instant it exists, which is the measured rule for a
+/// namespace `init` is already in: writing `/proc/self/timens_offsets` on a
+/// machine that has never unshared answers `EACCES`, and the file reads two zero
+/// lines (§6.3).
+static MACHINE_TIME: critical_section::Mutex<
+    core::cell::RefCell<Option<Arc<crate::timens::TimeNs>>>,
+> = critical_section::Mutex::new(core::cell::RefCell::new(None));
+
+pub fn machine_time_ns() -> Arc<crate::timens::TimeNs> {
+    critical_section::with(|cs| {
+        let mut slot = MACHINE_TIME.borrow(cs).borrow_mut();
+        slot.get_or_insert_with(|| crate::timens::TimeNs::machine(mint()))
+            .clone()
+    })
 }
 
 /// The pool every kind's numbers come from.
@@ -228,9 +388,47 @@ mod tests {
         assert_eq!(Kind::of_name("pid"), Some(Kind::Pid));
         assert_eq!(link_text(Kind::Net, 4026531833), "net:[4026531833]");
         assert_eq!(Kind::of_name("net"), Some(Kind::Net));
+        assert_eq!(link_text(Kind::Time, 4026531834), "time:[4026531834]");
+        assert_eq!(Kind::of_name("time"), Some(Kind::Time));
+        // The two `_for_children` words name the same kinds as the plain ones:
+        // which *slot* they read is the entry's business, not the kind's.
+        assert_eq!(Kind::of_name("time_for_children"), Some(Kind::Time));
+        assert_eq!(Kind::of_name("pid_for_children"), Some(Kind::Pid));
         // A kind this kernel does not have is not recoverable from a word: the
         // entry does not exist, which is the whole refusal.
         assert_eq!(Kind::of_name("ipc"), None);
+        assert_eq!(Kind::of_name("user"), None);
+    }
+
+    /// The directory's names, pinned as the *complete* list against a measured
+    /// one: a real kernel lists ten (`cgroup, ipc, mnt, net, pid,
+    /// pid_for_children, time, time_for_children, user, uts`) and this one lists
+    /// the seven of those whose kinds are built, in the same order.
+    #[test]
+    fn the_directory_names_are_the_ones_a_real_kernel_lists() {
+        let names: alloc::vec::Vec<&str> = Entry::ALL.iter().map(|entry| entry.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "mnt",
+                "net",
+                "pid",
+                "pid_for_children",
+                "time",
+                "time_for_children",
+                "uts"
+            ]
+        );
+        // Every listed name parses back to the entry that produced it, so the
+        // listing and the reader cannot drift - and a `_for_children` word for a
+        // kind that has no such slot is not a name at all.
+        for entry in Entry::ALL {
+            assert_eq!(Entry::of_name(entry.name()), Some(*entry));
+        }
+        assert_eq!(Entry::of_name("mnt_for_children"), None);
+        assert_eq!(Entry::of_name("net_for_children"), None);
+        assert_eq!(Entry::of_name("uts_for_children"), None);
+        assert_eq!(Entry::of_name("cgroup"), None);
     }
 
     #[test]
@@ -256,5 +454,9 @@ mod tests {
         assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWUSER), None);
         assert_eq!(Kind::of_flag(0), None);
         assert_eq!(Kind::of_flag(0x1000), None);
+        // `CLONE_NEWTIME` is a kind now, and its bit is the one in the signal
+        // byte - which is why the value is pinned in `abi` as well.
+        assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWTIME), Some(Kind::Time));
+        assert_eq!(Kind::Time.flag(), crate::abi::CLONE_NEWTIME);
     }
 }

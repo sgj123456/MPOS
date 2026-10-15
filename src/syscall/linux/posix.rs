@@ -1087,15 +1087,18 @@ pub fn handle_clock_settime(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 
 /// `unshare(flags)` — leave namespaces.
 ///
-/// **One namespace is served: `CLONE_NEWUTS`.** Its whole effect is that the
-/// caller gets a *copy* of the two names it was reading — Linux's
-/// `copy_utsname` — so the caller goes on reporting the names it reported a
-/// moment ago and can now change them without the change being visible to the
-/// namespace it came from. `t-ns-uts` holds both halves: the child's view
-/// differs *and* the parent's does not, which is the assertion a "namespace"
-/// that is really a shared global fails. The other seven keep answering
-/// `EOPNOTSUPP`, because a namespace with nothing behind it isolates nothing;
-/// the build order and each kind's reason are the plan's §6.3.
+/// **Five kinds are served**, each with its own pin: the names
+/// (`CLONE_NEWUTS`, whose whole effect is that the caller gets a *copy* of what
+/// it was reading - `t-ns-uts` holds both halves, that the child's view differs
+/// *and* that the parent's does not), the mount table (`CLONE_NEWNS`,
+/// `t-ns-mnt`, the same pair), the **numbers** (`CLONE_NEWPID`, where the caller
+/// keeps its own and its *children* move - `t-ns-pid`), the **wire**
+/// (`CLONE_NEWNET`, where the caller itself moves and its open sockets come
+/// along - `t-ns-net`) and the **clocks** (`CLONE_NEWTIME`, the second kind
+/// whose only moved slot is the children's - `t-ns-time`). The kinds still
+/// answering `EOPNOTSUPP` are USER, IPC and CGROUP, because a namespace with
+/// nothing behind it isolates nothing; each one's reason and the order they are
+/// built in are the plan's §6.3.
 ///
 /// The flag word itself is argued with in `abi::unshare_verdict`, which is where
 /// the three refusals live: an unrecognised bit is `EINVAL` *ahead* of
@@ -1180,6 +1183,16 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
                 // connection opened before the call goes on working.
                 crate::sched::set_net_ns(Some(crate::net::mint_namespace()));
             }
+            if bits & crate::syscall::linux::nr::CLONE_NEWTIME != 0 {
+                // The caller's *children* move into a fresh, empty namespace,
+                // and the caller does **not** - the same asymmetry PID above
+                // has, and the same field pair carries it. The offsets are not
+                // set here: they are written to `/proc/self/timens_offsets`
+                // afterwards, which is the only moment they can be (the first
+                // task in the namespace freezes them), and which is why a
+                // caller's sequence is unshare, write, fork.
+                crate::sched::unshare_time();
+            }
             if bits & crate::syscall::linux::nr::CLONE_FS != 0 {
                 crate::sched::unshare_fs();
             }
@@ -1244,6 +1257,13 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
         crate::vfs::ns::Namespace::Net(id) => crate::sched::set_net_ns(Some(id)),
         crate::vfs::ns::Namespace::Pid(pidns) => crate::sched::setns_pid(pidns),
         crate::vfs::ns::Namespace::Uts(uts) => crate::sched::setns_uts(uts),
+        // Joining a time namespace replaces the caller's `time_ns_for_children`
+        // and nothing else: the caller goes on reading the clocks it was reading
+        // and its next child wakes up in the namespace the descriptor named.
+        // Measured - the same shape as `unshare` for this kind, and the one
+        // asymmetry `setns` has against `/proc/<pid>/ns/pid`, where the
+        // descriptor answers the *own* slot instead.
+        crate::vfs::ns::Namespace::Time(ns) => crate::sched::setns_time(ns),
     }
     0
 }

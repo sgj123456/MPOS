@@ -652,29 +652,46 @@ pub fn unshare_uts() {
 /// same answer one instant later, which is what a name about live state means
 /// here), and `None` for a task that has never unshared resolves to the
 /// machine's own table and names - the namespace every process starts in.
-pub fn ns_of(pid: usize, kind: crate::vfs::ns::Kind) -> Option<crate::vfs::ns::Namespace> {
+pub fn ns_of(pid: usize, entry: crate::vfs::ns::Entry) -> Option<crate::vfs::ns::Namespace> {
+    use crate::vfs::ns::Slot;
     with_table(|t| {
         let task = t.tasks.get(pid).and_then(|slot| slot.as_ref())?;
-        Some(match kind {
-            crate::vfs::ns::Kind::Mount => crate::vfs::ns::Namespace::Mount(
+        Some(match (entry.kind, entry.slot) {
+            (crate::vfs::ns::Kind::Mount, _) => crate::vfs::ns::Namespace::Mount(
                 task.fs_ns
                     .clone()
                     .unwrap_or_else(crate::vfs::mount::machine_table),
             ),
-            crate::vfs::ns::Kind::Uts => crate::vfs::ns::Namespace::Uts(task.uts.clone()),
+            (crate::vfs::ns::Kind::Uts, _) => crate::vfs::ns::Namespace::Uts(task.uts.clone()),
             // Linux's `pidns_get` answers the namespace the task *is in* - the
             // one its own number comes from - while a `setns` against this
             // descriptor moves the namespace its *children* go to. The
             // asymmetry is Linux's, and it is what makes `setns` on
             // `/proc/self/ns/pid` a no-op that still means "my children stay
-            // where they are".
-            crate::vfs::ns::Kind::Pid => crate::vfs::ns::Namespace::Pid(task.pid_ns.clone()),
+            // where they are". `/proc/<pid>/ns/pid_for_children` is the other
+            // slot and answers the other half with no asymmetry at all.
+            (crate::vfs::ns::Kind::Pid, Slot::Own) => {
+                crate::vfs::ns::Namespace::Pid(task.pid_ns.clone())
+            }
+            (crate::vfs::ns::Kind::Pid, Slot::ForChildren) => {
+                crate::vfs::ns::Namespace::Pid(task.pid_ns_children.clone())
+            }
             // A task in the machine's namespace holds no number of its own, so
             // the link names the machine's - minted in the identity layer, which
             // both this layer and `net` may name.
-            crate::vfs::ns::Kind::Net => crate::vfs::ns::Namespace::Net(
+            (crate::vfs::ns::Kind::Net, _) => crate::vfs::ns::Namespace::Net(
                 task.net_ns.unwrap_or_else(crate::vfs::ns::machine_net_id),
             ),
+            // Both slots, and here the two really do differ for a task that has
+            // unshared: `time` is the namespace its own clocks come from and
+            // `time_for_children` the one the next child will be born under,
+            // which is the namespace `/proc/<pid>/timens_offsets` writes.
+            (crate::vfs::ns::Kind::Time, Slot::Own) => {
+                crate::vfs::ns::Namespace::Time(task.time_ns.clone())
+            }
+            (crate::vfs::ns::Kind::Time, Slot::ForChildren) => {
+                crate::vfs::ns::Namespace::Time(task.time_ns_children.clone())
+            }
         })
     })
 }
@@ -711,6 +728,57 @@ pub fn setns_uts(uts: Arc<crate::uts::Uts>) {
         let me = t.current;
         t.task_mut(me).uts = uts;
     });
+}
+
+/// Give the running task's **children** a time namespace of their own:
+/// `unshare(CLONE_NEWTIME)`.
+///
+/// The new namespace is **empty** - zero offsets - and the caller does not move
+/// into it. Both halves are Linux's and both are measurable: `create_time_ns`
+/// makes a fresh one rather than a copy, and it is `time_ns_for_children` that
+/// the call replaces, so the caller's own `CLOCK_MONOTONIC` is untouched
+/// whatever the offsets are set to afterwards. That is why the order a userland
+/// caller has to use is *unshare, write the offsets, fork* - and why a test that
+/// read the caller's own clock here would see nothing and prove nothing.
+///
+/// Only the calling task's children move, the rule [`unshare_uts`] states and
+/// `unshare_pid` follows: `unshare` splits the caller, and a sibling that wanted
+/// the same namespace would have to ask too.
+#[cfg(target_os = "none")]
+pub fn unshare_time() {
+    with_table(|t| {
+        let me = t.current;
+        let fresh = crate::timens::TimeNs::fresh(crate::vfs::ns::mint());
+        t.task_mut(me).time_ns_children = fresh;
+    });
+}
+
+/// Join a time namespace a descriptor names: `setns(fd, CLONE_NEWTIME)`'s half.
+///
+/// The same slot `unshare` replaces - `nsset->nsproxy->time_ns_for_children` in
+/// Linux's `timens_install`, which is a join rather than a copy and which does
+/// **not** move the caller either. Measured: `setns` onto a namespace that
+/// already has a process in it answers `0` (the freeze governs the offsets
+/// file, not who may come in), and the caller's own clocks go on reading the
+/// namespace it was in.
+#[cfg(target_os = "none")]
+pub fn setns_time(ns: Arc<crate::timens::TimeNs>) {
+    with_table(|t| {
+        let me = t.current;
+        t.task_mut(me).time_ns_children = ns;
+    });
+}
+
+/// The offsets the running task's own clocks are read through, as
+/// `(monotonic, boottime)` nanoseconds. Zero on both for every task that never
+/// entered a time namespace, which is every ordinary task on the machine.
+///
+/// Asked of the task's `time_ns` and not of its `time_ns_children`: this is the
+/// namespace the caller is *in*, which is the one its `clock_gettime` reads, and
+/// a task that unshared sees its own clocks unmoved precisely because those two
+/// slots differ.
+pub fn time_offsets() -> (i64, i64) {
+    with_table(|t| t.task(t.current).time_ns.offset_nanos())
 }
 
 /// Charge one clock tick of CPU time to the running task's process group,

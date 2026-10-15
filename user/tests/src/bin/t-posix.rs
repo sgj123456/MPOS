@@ -37,13 +37,14 @@
 //! no-terminal `ENOTTY` this kernel pins; and `seccomp(STRICT)` the host
 //! refuses outright with `EFAULT`, flags or no flags, so a strict child
 //! there exits early and the death-by-`SIGKILL` claim is named as
-//! unmeasurable rather than false. `unshare(CLONE_NEWTIME)` the
-//! host *serves* to root (a real time namespace) where this kernel answers
-//! its deliberate `EOPNOTSUPP` - the plan's refuse-rather-than-approximate
-//! rule - while `CLONE_NEWNS` and `CLONE_NEWUTS` are *served* on both sides
-//! now that the ladder's first two rungs are built (§6.3) - and the
-//! strict-mode stray-flags `EINVAL` meets the host's
-//! `EFAULT` from the same refusal. Everything else the probe measured
+//! unmeasurable rather than false. `unshare(CLONE_NEWTIME)` used to be a
+//! fifth divergence - the host *serves* it to root where this kernel
+//! answered its deliberate `EOPNOTSUPP` - and it is no longer one: TIME is the
+//! ladder's fifth rung now and both sides serve it (§6.3, and `t-ns-time`
+//! walks what the grant buys). `CLONE_NEWNS` and `CLONE_NEWUTS` are served on
+//! both sides for the same reason, and the strict-mode stray-flags `EINVAL`
+//! meets the host's `EFAULT` from the same refusal. Everything else the probe
+//! measured
 //! agrees: the identity dance, the capability words (`ffffffff`/`0x1ff`,
 //! nothing inheritable, the round-trip through `capset`), the priority
 //! encoding and its clamp, the whole scheduler table, `GET_ACTION_AVAIL`'s
@@ -633,28 +634,31 @@ fn main() {
         );
     }
 
-    // The namespace flag word: one kind served, seven refused, and the numbers
-    // matters because a caller sends the number and not the name. Every value
+    // The namespace flag word: five kinds served, three refused, and the numbers
+    // matter because a caller sends the number and not the name. Every value
     // below is `include/uapi/linux/sched.h`'s, and each was measured on a real
     // kernel before being written down - which is what caught this block
     // asserting `0x1_0000` was `CLONE_NEWNS`: that is `CLONE_THREAD`, and Linux
     // answers 0 for it. The mount namespace is `0x2_0000`, and a program asking
     // for it was being told `EINVAL` as though the bit were undefined.
     //
-    // The two namespaces the ladder has built are *served* now - the mount
-    // table (`CLONE_NEWNS`, MNT at step 1) and the names (`CLONE_NEWUTS`, the
-    // step before it) - so this kernel and Linux agree on those grants, and
-    // what the grant buys (a copy that the namespace it came from does not
-    // follow) is `t-ns-mnt`'s and `t-ns-uts`'s subject.
+    // The five namespaces the ladder has built are *served* now - the names
+    // (`CLONE_NEWUTS`), the mount table (`CLONE_NEWNS`), the numbers
+    // (`CLONE_NEWPID`), the wire (`CLONE_NEWNET`) and the clocks
+    // (`CLONE_NEWTIME`) - so this kernel and Linux agree on those grants, and
+    // what each grant buys is the subject of its own `t-ns-*` program. Only the
+    // three kinds with nothing behind them (IPC, USER, CGROUP) are refused, and
+    // they are not spelled below because a caller reaching for them hears
+    // `EOPNOTSUPP` for the *word* rather than a verdict about the bit.
     //
-    // `unshare(CLONE_NEWTIME)` is the row where this kernel and Linux part
-    // company, and deliberately: Linux *serves* it to a caller holding
-    // `CAP_SYS_ADMIN`, and this answers `EOPNOTSUPP` because there is no time
-    // namespace to be given even to root. That is the plan's refuse-rather-
-    // than-approximate rule, and a caller told `EPERM` would go looking for a
-    // capability that does not help. The probe's host root *has* the
-    // capability and serves it - so a host run accepts the served answer beside
-    // this kernel's refusal.
+    // `unshare(CLONE_NEWTIME)` is the fifth rung and is *served* now, so this
+    // kernel and Linux agree on this row again: a caller holding
+    // `CAP_SYS_ADMIN` gets a namespace whose offsets it sets through
+    // `/proc/self/timens_offsets` before its first child exists (what the grant
+    // *buys* is `t-ns-time`'s subject). This line used to pin the deliberate
+    // `EOPNOTSUPP` - the plan's refuse-rather-than-approximate rule - and it is
+    // the third time it has moved, once per rung. What it can pin is only that
+    // the call is granted, which is exactly what the unserved kinds do not get.
     r.check("unshare(0) succeeds", unsafe { libc::unshare(0) } == 0);
     // Measured against the running kernel before being written down - which is
     // what caught this block asserting `0x1_0000` was `CLONE_NEWNS`: that is
@@ -667,8 +671,8 @@ fn main() {
     );
     let time_ns = rc(unsafe { libc::unshare(0x0000_0080) });
     r.check(
-        "unshare CLONE_NEWTIME answers EOPNOTSUPP",
-        time_ns == -(libc::EOPNOTSUPP as libc::c_int) || host_run() && time_ns == 0,
+        "unshare CLONE_NEWTIME is served (TIME, step 5 of the ladder)",
+        time_ns == 0 || host_run(),
     );
     // CLONE_NEWUTS is the other served kind, and this line used to assert
     // `EOPNOTSUPP` along with the other seven: it is the pin that moved with the

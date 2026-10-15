@@ -1393,13 +1393,16 @@ pub(crate) fn unshare_verdict(
         | n::CLONE_THREAD
         | n::CLONE_SYSVSEM;
 
-    /// The namespace kinds this kernel can isolate observably. Three now — the
+    /// The namespace kinds this kernel can isolate observably. Five now — the
     /// names, the mount table (`t-ns-mnt` holds MNT's "child differs *and* the
-    /// parent does not"), and the **numbers** (`t-ns-pid`, which holds the same
+    /// parent does not"), the **numbers** (`t-ns-pid`, which holds the same
     /// pair for a pid: the child's `getpid` is 1 and `/proc/1` is that child,
-    /// while the parent's number is unchanged). The build order and the reason
-    /// for it are the plan's §6.3; PID is the third rung of that ladder.
-    const SERVED: usize = n::CLONE_NEWUTS | n::CLONE_NEWNS | n::CLONE_NEWPID | n::CLONE_NEWNET;
+    /// while the parent's number is unchanged), the **wire** (`t-ns-net`) and
+    /// the **clocks** (`t-ns-time`, where the pair is the caller's own reading
+    /// unmoved and its child's reading offset). The build order and the reason
+    /// for it are the plan's §6.3; TIME is the fifth rung of that ladder.
+    const SERVED: usize =
+        n::CLONE_NEWUTS | n::CLONE_NEWNS | n::CLONE_NEWPID | n::CLONE_NEWNET | n::CLONE_NEWTIME;
 
     // `CAP_SYS_ADMIN` is the gate on every privileged namespace kind, asked
     // of the caller's *effective capability set* — the question the credential
@@ -3349,21 +3352,30 @@ mod tests {
             Ok(n::CLONE_NEWUTS | n::CLONE_NEWNS)
         );
 
-        // The five this kernel has nothing behind, so it refuses them whole
+        // The fifth rung: `unshare(CLONE_NEWTIME)` arms the caller's *children*
+        // slot, which is the handler's job (`sched::unshare_time`) and not this
+        // verdict's - the bit is granted here because the kernel has a namespace
+        // to hand the next child, and *which* slot it goes into is a fact about
+        // the task table rather than about the word. The whole served set is one
+        // word, too: nothing about any of the five gates another.
+        let all_five =
+            n::CLONE_NEWUTS | n::CLONE_NEWNS | n::CLONE_NEWPID | n::CLONE_NEWNET | n::CLONE_NEWTIME;
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWTIME, true, false),
+            Ok(n::CLONE_NEWTIME)
+        );
+        assert_eq!(unshare_verdict(all_five, true, false), Ok(all_five));
+
+        // The four this kernel has nothing behind, so it refuses them whole
         // rather than handing over a namespace whose contents are the old
         // one's. Served namespace or not, the answer is the same for privileged
         // and unprivileged callers: this is not a permissions answer.
         //
-        // PID and NET left this list when they were built, which is the shape
-        // §6.3 records over and over: a test that hardcodes the served set goes
-        // red the moment the set grows, and the *expectation* moves with the
-        // measurement - never the other way round.
-        for bit in [
-            n::CLONE_NEWTIME,
-            n::CLONE_NEWCGROUP,
-            n::CLONE_NEWIPC,
-            n::CLONE_NEWUSER,
-        ] {
+        // PID, NET and TIME left this list when they were built, which is the
+        // shape §6.3 records over and over: a test that hardcodes the served set
+        // goes red the moment the set grows, and the *expectation* moves with
+        // the measurement - never the other way round.
+        for bit in [n::CLONE_NEWCGROUP, n::CLONE_NEWIPC, n::CLONE_NEWUSER] {
             assert_eq!(
                 unshare_verdict(bit, true, false),
                 Err(err::EOPNOTSUPP),

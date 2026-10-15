@@ -314,6 +314,7 @@ dependencies = [
  "mpos-pidns",
  "mpos-seccomp",
  "mpos-term",
+ "mpos-timens",
  "mpos-uinput",
  "mpos-uts",
  "mpos-vm",
@@ -440,6 +441,14 @@ name = "mpos-term"
 version = "0.1.0"
 dependencies = [
  "critical-section",
+]
+
+[[package]]
+name = "mpos-timens"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "mpos-err",
 ]
 
 [[package]]

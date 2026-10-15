@@ -142,7 +142,7 @@ struct ProcLink {
     /// `/proc/<pid>/ns` is. The second kind of payload a link can carry, and
     /// asked for the same way - the walk must not splice this link either,
     /// because its target is a report (`mnt:[<id>]`) rather than a path.
-    ns: Option<(usize, crate::vfs::ns::Kind)>,
+    ns: Option<(usize, crate::vfs::ns::Entry)>,
 }
 
 impl Inode for ProcLink {
@@ -175,8 +175,8 @@ impl Inode for ProcLink {
         // that answered with what it was built from would be naming the one
         // the process left. `None` when the process is gone - the same answer
         // `readlink` gives, one instant later.
-        let (pid, kind) = self.ns?;
-        namespace_of(pid, kind)
+        let (pid, entry) = self.ns?;
+        namespace_of(pid, entry)
     }
 
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
@@ -1413,6 +1413,74 @@ fn oom_score_adj_ctl(pid: usize) -> Arc<dyn Inode> {
     })
 }
 
+/// `/proc/<pid>/timens_offsets`: the offsets the process's **children** will
+/// read their monotonic clocks through.
+///
+/// The file is the *children's* namespace's and not the process's own, which is
+/// the whole reason it is useful: `unshare(CLONE_NEWTIME)` does not move the
+/// caller, so a program that wants its children in a namespace with a different
+/// clock has exactly one moment to say by how much - after the unshare and
+/// before the fork - and this is the door it says it through. Measured on a real
+/// kernel (7.2): the file of a task that has never unshared belongs to the
+/// machine's namespace, reads two zero lines, and refuses the write with
+/// `EACCES`, because `init` is in that namespace and its offsets are therefore
+/// already frozen.
+///
+/// Three answers a caller can tell apart, and each is Linux's:
+///
+/// * **`EACCES`** for a writer that is not root. The measured file is `0644`
+///   `root:root`, so the mode is the gate and not a capability - which with one
+///   user namespace reads as "the owner must be 0". The same reading
+///   [`oom_score_adj_ctl`] applies to its own `CAP_SYS_RESOURCE` floor, and the
+///   same divergence rides with it: procfs here has no permission bits to check
+///   at `open`, so a non-root opener gets its descriptor and hears the refusal
+///   from the write rather than from the open.
+/// * **`EACCES`** again once anything is in the namespace, which is the freeze
+///   [`crate::timens::TimeNs::write_offsets`] keeps. That is a *different*
+///   EACCES from the one above and Linux spells both the same way.
+/// * **`EINVAL`** for text the grammar does not accept, and `ENOENT` for a
+///   process that has gone - which is why the read can fail rather than handing
+///   back a string, exactly as `oom_score_adj` reads.
+#[cfg(target_os = "none")]
+fn timens_offsets_ctl(pid: usize) -> Arc<dyn Inode> {
+    /// The slot this file reads and writes: the `ForChildren` one, by the same
+    /// name `/proc/<pid>/ns/time_for_children` lists.
+    const SLOT: crate::vfs::ns::Entry = crate::vfs::ns::Entry {
+        kind: crate::vfs::ns::Kind::Time,
+        slot: crate::vfs::ns::Slot::ForChildren,
+    };
+    /// The namespace, asked of the live task rather than recorded when the file
+    /// was built - a `unshare` a moment ago has to be visible to the next read.
+    fn ns(pid: usize) -> Option<Arc<crate::timens::TimeNs>> {
+        match crate::sched::ns_of(pid, SLOT) {
+            Some(crate::vfs::ns::Namespace::Time(ns)) => Some(ns),
+            _ => None,
+        }
+    }
+    Arc::new(ProcCtl {
+        ino: next_ino(),
+        read: Box::new(move || ns(pid).map(|ns| ns.offsets_text())),
+        write: Box::new(move |text: &str| {
+            let Some(ns) = ns(pid) else {
+                return Err(VfsError::NoEntry);
+            };
+            if crate::sched::current_owner().0 != 0 {
+                return Err(VfsError::Access);
+            }
+            // The two refusals the leaf can answer are both `EACCES` or
+            // `EINVAL`, and `VfsError` carries exactly one of each: a frozen
+            // namespace and a bad grammar are the file's two ways to say no.
+            ns.write_offsets(text).map_err(|e| {
+                if e == crate::err::EACCES {
+                    VfsError::Access
+                } else {
+                    VfsError::Invalid
+                }
+            })
+        }),
+    })
+}
+
 /// `/proc/<pid>`: the directory a process is described by.
 ///
 /// Built when the name is looked up and thrown away when the next lookup
@@ -1479,6 +1547,13 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     // procfs invents no file to answer it.
     #[cfg(target_os = "none")]
     node.add("oom_score_adj", NodeKind::File, oom_score_adj_ctl(pid));
+    // `/proc/<pid>/timens_offsets` - the clocks this process's children will
+    // read, and the one door a `unshare(CLONE_NEWTIME)` has for saying by how
+    // much. Named the way a real kernel names it, because the tools that write
+    // it (`nsenter`, a container runtime setting up a restored snapshot) look
+    // for exactly this path.
+    #[cfg(target_os = "none")]
+    node.add("timens_offsets", NodeKind::File, timens_offsets_ctl(pid));
     // The image and the working directory, as links: `readlink` is the only
     // way to ask for them, and their targets are facts about a process, not
     // bytes a file holds.
@@ -1568,12 +1643,12 @@ impl Dynamic for Descriptors {
 /// slots live in the scheduler's task table, which only exists on a machine
 /// with tasks.
 #[cfg(target_os = "none")]
-fn namespace_of(pid: usize, kind: crate::vfs::ns::Kind) -> Option<crate::vfs::ns::Namespace> {
-    crate::sched::ns_of(pid, kind)
+fn namespace_of(pid: usize, entry: crate::vfs::ns::Entry) -> Option<crate::vfs::ns::Namespace> {
+    crate::sched::ns_of(pid, entry)
 }
 
 #[cfg(not(target_os = "none"))]
-fn namespace_of(_pid: usize, _kind: crate::vfs::ns::Kind) -> Option<crate::vfs::ns::Namespace> {
+fn namespace_of(_pid: usize, _entry: crate::vfs::ns::Entry) -> Option<crate::vfs::ns::Namespace> {
     None
 }
 
@@ -1585,13 +1660,13 @@ fn namespace_of(_pid: usize, _kind: crate::vfs::ns::Kind) -> Option<crate::vfs::
 /// kernel's `readlink` prints), and `as_namespace` answers the object `setns`
 /// joins. Both are asked of the *live* process, so a link opened after its
 /// process unshared names the namespace it is in now.
-fn ns_link(pid: usize, kind: crate::vfs::ns::Kind) -> Arc<dyn Inode> {
+fn ns_link(pid: usize, entry: crate::vfs::ns::Entry) -> Arc<dyn Inode> {
     Arc::new(ProcLink {
         ino: next_ino(),
-        target: Box::new(move || namespace_of(pid, kind).map(|ns| ns.link_text())),
+        target: Box::new(move || namespace_of(pid, entry).map(|ns| ns.link_text())),
         pid,
         fd: None,
-        ns: Some((pid, kind)),
+        ns: Some((pid, entry)),
     })
 }
 
@@ -1599,25 +1674,31 @@ fn ns_link(pid: usize, kind: crate::vfs::ns::Kind) -> Arc<dyn Inode> {
 ///
 /// The kinds this kernel has, and *only* those: a machine built without a
 /// namespace has no entry for it either (a real kernel without `CONFIG_TIME_NS`
-/// answers `ENOENT` for `/proc/self/ns/time`), so a reader sees two names and is
-/// told nothing it cannot check. A name that is not one of them - `pid`, `net`,
-/// `user`, `cgroup`, `time` - is `ENOENT` from the directory, and `setns` never
-/// sees a descriptor for a namespace that does not exist.
+/// answers `ENOENT` for `/proc/self/ns/time`), so a reader sees the names this
+/// machine can actually isolate and is told nothing it cannot check. A name that
+/// is not one of them - `ipc`, `user`, `cgroup` - is `ENOENT` from the
+/// directory, and `setns` never sees a descriptor for a namespace that does not
+/// exist.
+///
+/// The list is of [`crate::vfs::ns::Entry`]s rather than kinds because two kinds
+/// have two names each: `pid`/`pid_for_children` and `time`/`time_for_children`
+/// are the same kind's two slots, which is what lets a reader see where its
+/// *children* would be born as well as where it is.
 struct Namespaces {
     pid: usize,
 }
 
 impl Dynamic for Namespaces {
     fn names(&self) -> Vec<(String, NodeKind)> {
-        crate::vfs::ns::Kind::ALL
+        crate::vfs::ns::Entry::ALL
             .iter()
-            .map(|kind| (String::from(kind.name()), NodeKind::Symlink))
+            .map(|entry| (String::from(entry.name()), NodeKind::Symlink))
             .collect()
     }
 
     fn node(&self, name: &str) -> Option<Arc<dyn Inode>> {
-        let kind = crate::vfs::ns::Kind::of_name(name)?;
-        Some(ns_link(self.pid, kind))
+        let entry = crate::vfs::ns::Entry::of_name(name)?;
+        Some(ns_link(self.pid, entry))
     }
 }
 

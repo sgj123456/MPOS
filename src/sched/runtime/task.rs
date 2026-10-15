@@ -702,6 +702,29 @@ pub(crate) struct Task {
     /// which is what lets the parent, one level out, wait for it and find it in
     /// `/proc`.
     pub(crate) pid_ns_children: Arc<crate::pidns::PidNs>,
+    /// The time namespace this task's **own** clocks come from: the offsets
+    /// `CLOCK_MONOTONIC`, `CLOCK_MONOTONIC_RAW`, `CLOCK_MONOTONIC_COARSE` and
+    /// `CLOCK_BOOTTIME` are read through.
+    ///
+    /// Inherited from the *creating* task's [`Task::time_ns_children`] - not
+    /// from its `time_ns` - which is the whole mechanism of the kind: a task
+    /// that `unshare(CLONE_NEWTIME)` called keeps reading its own clocks through
+    /// the namespace it was already in, and only the children it makes
+    /// afterwards wake up in the new one. The measured shape is that a caller's
+    /// own `CLOCK_MONOTONIC` never moves, whatever it sets the offsets to
+    /// (§6.3, and `.workbuddy/probe-timens*.c`).
+    pub(crate) time_ns: Arc<crate::timens::TimeNs>,
+    /// The time namespace this task's **children** are created in - Linux's
+    /// `nsproxy->time_ns_for_children`.
+    ///
+    /// Equal to [`Task::time_ns`] until something unshares, so an ordinary task
+    /// is in one namespace and creates its children in it; `unshare`/`setns`
+    /// replace **this** one alone, which is the same rule
+    /// [`Task::pid_ns_children`] follows and the reason `/proc/<pid>/ns` has a
+    /// separate `time_for_children` name. `/proc/<pid>/timens_offsets` reads and
+    /// writes *this* namespace's offsets, because they are the ones the next
+    /// child will be born under - which is what makes the file useful at all.
+    pub(crate) time_ns_children: Arc<crate::timens::TimeNs>,
     /// The OOM-killer's score adjustment and the floor of it: the two numbers
     /// Linux keeps as `sig->oom_score_adj` and `sig->oom_score_adj_min`, and
     /// which `/proc/<pid>/oom_score_adj` reads and writes.
@@ -1013,6 +1036,13 @@ impl Task {
             // nothing observable changes until something unshares.
             pid_ns: super::root_ns(),
             pid_ns_children: super::root_ns(),
+            // The machine's own time namespace, in both slots: a kernel task is
+            // in it and creates its children in it, which is the `pid_ns` pair
+            // above replayed for the clocks. It is frozen from the moment it
+            // exists - `init` is in it - which is why the offsets file refuses
+            // every write on a machine that never unshared.
+            time_ns: crate::vfs::ns::machine_time_ns(),
+            time_ns_children: crate::vfs::ns::machine_time_ns(),
             // The machine's own network namespace, which is `None`: every socket
             // call resolves to the stack the boot built.
             net_ns: None,
@@ -1560,6 +1590,13 @@ impl Table {
             // nothing observable changes until something unshares.
             pid_ns: super::root_ns(),
             pid_ns_children: super::root_ns(),
+            // The machine's own time namespace, in both slots: a kernel task is
+            // in it and creates its children in it, which is the `pid_ns` pair
+            // above replayed for the clocks. It is frozen from the moment it
+            // exists - `init` is in it - which is why the offsets file refuses
+            // every write on a machine that never unshared.
+            time_ns: crate::vfs::ns::machine_time_ns(),
+            time_ns_children: crate::vfs::ns::machine_time_ns(),
             // The machine's own network namespace, which is `None`: every socket
             // call resolves to the stack the boot built.
             net_ns: None,

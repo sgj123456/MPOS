@@ -125,7 +125,7 @@ the build list.
 | `CLONE_NEWUSER` | uid/gid mapping, and the capability set *within* the namespace | **refused** until there is a mapping to store |
 | `CLONE_NEWIPC` | SysV IPC objects and POSIX message queues | **refused**: this kernel has neither, so it isolates nothing |
 | `CLONE_NEWCGROUP` | the cgroup tree a process sees | **refused**: there is no cgroup tree here to see |
-| `CLONE_NEWTIME` | `CLOCK_MONOTONIC`/`BOOTTIME` offsets per namespace | **refused**: one tick clock, and no per-namespace offset to store |
+| `CLONE_NEWTIME` | `CLOCK_MONOTONIC`/`BOOTTIME` offsets per namespace | **built** - "Step 5, landed" below |
 
 **UTS: the state is two strings, and the cost is that they have three doors.**
 `nodename` and `domainname` are one process-wide pair today (`vfs::procfs`'s
@@ -361,25 +361,67 @@ and the witness stopped seeing the rename. That is the sixth time §6.3 records 
 is recorded rather than deleted for the reason the others are: the gate is what finds it, every
 time, and a served set written into a test is the shape that makes it happen.
 
-**TIME: the whole shape measured, none of it built (2026-10-16).** The fifth kind has no entry
-yet, and this paragraph is the measurement the implementation starts from rather than a plan.
-Taken on this developer's Linux (7.2) with five probes - `probe-timens{,2,3,4,5,6}.c` beside this
-file's other host probes, plus `probe-timens-links.sh`:
+**TIME: the fifth rung, built on a shape that was measured whole first (2026-10-16).** The
+paragraph that stood here was a measurement table rather than a plan, and the implementation
+followed it row for row - which is worth recording, because "measure the shape before building
+it" is the claim this whole section keeps testing. Where each piece went: `crates/timens` (the
+object - two offsets and the freeze flag - and the offsets file's grammar, host-tested, seven
+unit tests); `vfs::ns` (the kind, its flag, and the [`Entry`](../../src/vfs/ns.rs) that spells
+the two slots apart); the task (`time_ns` and `time_ns_children`, read by the clock reader and
+by the file respectively); `sched` (`unshare_time`, `setns_time`, `time_offsets`); procfs
+(`/proc/<pid>/timens_offsets`, and `time`/`time_for_children` in the directory); four lines of
+`clock_gettime`; and `t-ns-time`, 46 claims. Taken on this developer's Linux (7.2) with eleven
+probes - the six `probe-timens{,1..6}.c` above plus `probe-timens{7,8,9,10}.c`,
+`probe-timens-links.sh` and `probe-clone{3,}-timens.c`:
 
 | question | Linux's answer |
 |---|---|
 | `unshare(CLONE_NEWTIME)` | `0`. The caller's `/proc/self/ns/time` is **unchanged** - it is `time_ns_for_children` that becomes new - and the caller's own clocks never move, whatever the offsets are set to afterwards |
-| `clone(CLONE_NEWTIME)` | **`EINVAL`** - not a way in (a plain `clone(SIGCHLD)` in the same program succeeds, so the refusal is the flag's) |
+| `clone(CLONE_NEWTIME)` | **`EINVAL`** by way of the *signal byte*: the flag is `0x80`, entirely inside the low byte `clone(2)` reads as the exit signal, so `CLONE_NEWTIME|SIGCHLD` arrives as `0x91` and 145 is not a signal. The control that settles it: `clone(0x80)` alone is `EINVAL` too, while `clone(SIGCHLD\|CLONE_NEWNET)` starts a child - and `clone3`, which carries the signal in its own field, *creates a task* for `CLONE_NEWTIME`. So the flag is not refused as a request, it is unexpressible through `clone(2)` |
 | a child forked after the unshare | is in the new namespace (`time:[4026532873]` against the machine's `time:[4026531834]`) |
-| the clocks that child sees | `CLOCK_MONOTONIC`, `CLOCK_MONOTONIC_RAW` and `CLOCK_BOOTTIME` shifted by the offsets; `CLOCK_REALTIME`, `CLOCK_TAI` and the two cputime clocks **not** |
-| `/proc/self/timens_offsets` of the unsharer | belongs to the *children's* namespace; reads two lines `monotonic <sec> <nsec>` / `boottime <sec> <nsec>`, and accepts the same shape |
-| writing it once a process has entered | **`EACCES`** (measured: a child forked first, then the write is refused; without the child, two writes in a row are both accepted and the later one wins) |
+| the clocks that child sees | `CLOCK_MONOTONIC`, `CLOCK_MONOTONIC_RAW`, `CLOCK_MONOTONIC_COARSE` and `CLOCK_BOOTTIME` shifted; `CLOCK_REALTIME`, `CLOCK_TAI` and the two cputime clocks **not** |
+| which offset moves which clock | `MONOTONIC`/`RAW`/`COARSE` read through the **monotonic** offset, `BOOTTIME` through its own - and the two are independent: a namespace whose monotonic clock has been moved *past* its boottime clock is accepted, there is no cross-check |
+| `/proc/self/timens_offsets` of the unsharer | belongs to the *children's* namespace; reads two lines `monotonic <sec> <nsec>` / `boottime <sec> <nsec>`, 31 bytes each (`%-9s %11ld %9ld`) |
+| the grammar | either line order; leading whitespace, tabs, a missing final newline and text after the two fields all accepted; a whole-seconds field may be **negative**; the nanosecond field may not (both `-1` and `1000000000` are `EINVAL`); an unknown clock name, a name with a suffix (`monotonicX`), a missing field, and an **empty write** are all `EINVAL`; the same line twice is accepted, last wins |
+| a partial write | replaces the clock it names and **leaves the other where it was** (`monotonic 9 0` after setting both leaves `boottime` at 4) - so the parse starts from the current pair, not from zero |
+| the first write | accepted; the second, **once a process has entered the namespace**, is `EACCES` - measured: a child forked first, then the write is refused; without the child, two writes in a row are both accepted and the later one wins |
+| joining a frozen namespace | `setns(fd, CLONE_NEWTIME)` answers `0` **even when the namespace already has a process in it** - the freeze governs the offsets file, not who may come in |
+| `timens_offsets` permissions | mode `0644 root:root`, so the mode is the gate rather than a capability (and a non-root writer is refused at the `open`) |
 | `/proc/<pid>/ns` | ten names, `time` **and `time_for_children`** among them - the same for-children split `pid`/`pid_for_children` has, which is what the second row above is |
 
 The model all of those fit is `nsproxy`'s two slots: `unshare` replaces `time_ns_for_children`
 alone, a fork installs the child in `time_ns_for_children` (which is why the child's link differs
 from its parent's), and the offsets are frozen by that first entry - which is the whole reason a
 namespace's offsets have to be set *before* anything is created in it.
+
+**Step 5, landed: TIME, and the pin's two counterfactuals.** `t-ns-time` walks the whole shape -
+the machine's namespace frozen with two zero lines before anything is unshared, the caller's slot
+unmoved and the children's moved, the offsets written and read back in a real kernel's 31-byte
+shape, a forked child's three monotonic clocks and its boottime moved by exactly the offsets
+while REALTIME, TAI and the cputime clock are not, the caller's own readings unmoved, the write
+refused the instant the child exists, `clone`'s `EINVAL`, and a `setns` round trip that names a
+*resident* rather than the keeper precisely because `unshare` does not move the keeper. 46 claims,
+all green on x86_64 and aarch64.
+
+Two counterfactuals, because there are two halves and each needs its own:
+
+* **Drop the offset from `clock_gettime`** (the namespace is read and not applied) → `pass=173
+  fail=1`, `t-ns-time` the one red, and exactly the five claims that depend on the offset being
+  applied: the four moving clocks in the child and the child born after the join.
+* **Give `unshare` one slot instead of two** (`time_ns = fresh` as well, so the caller lands in
+  the very namespace it is about to write) → `pass=173 fail=1`, `t-ns-time` the one red, and the
+  claims that go red are *different* ones: "the caller's own slot does not move", "the unshare and
+  the write moved none of this process's own clocks" - whose failure prints the seven deltas,
+  `[42008378261, 42008378280, 42008378294, 3600008378317, 8378341, 8378365, 8375335]`, i.e. the
+  42 s and 3600 s offsets landing on the caller - and the four child clocks with the join.
+
+The second of those is why the file has a claim the first counterfactual could not reach, and it
+is the one worth keeping: the seven "this process's own clock never saw the offset" claims pass
+for a *second* reason on a one-slot kernel (a fresh namespace's offsets are zero, and the offsets
+were written to the other slot), so on their own they would be vacuous. `t-ns-time` therefore
+takes this process's readings *across* the unshare and the write, which is where a one-slot
+kernel shows itself, and reads the offsets back from the file afterwards as the interlock that
+says the two slots really are two.
 
 **One measurement that does not fit, recorded rather than reconciled.** Of the three probes that
 forked a child after setting the offsets, two show the child offset by exactly what was written
@@ -889,8 +931,10 @@ two halves of the same seam rather than a claim that had aged:
   `unshare(CLONE_NEWNS) == EOPNOTSUPP` "even lowered" and `t-posix` asserted the same at the top of its
   namespace block; both were true while MNT was unbuilt and false the moment it landed (a served kind
   is *gated*, so a lowered caller now hears Linux's `EPERM`). The refused-not-gated claim moved to a
-  kind that is still refused whole — `CLONE_NEWTIME` in `t-posix`, `CLONE_NEWPID` *once the capability
-  is back* in `t-caps` — and each pins the served answer beside it. `t-ns-uts` had the same shape one
+  kind that is still refused whole — first `CLONE_NEWTIME`, and when TIME landed in turn, `CLONE_NEWPID`
+  *once the capability is back* in `t-caps` — and each pins the served answer beside it. `t-posix`'s row
+  is a *served* answer now: the same drift this section keeps recording, and the same fix, the
+  expectation moving with the measurement rather than the other way round. `t-ns-uts` had the same shape one
   level down: its mixed word was `NEWUTS | NEWNS`, which became a legal pair, so the refusal moved to
   `NEWUTS | NEWNET` — what that file's own header had described all along ("the served namespace with
   an unserved one").
@@ -929,10 +973,11 @@ is second because it is the one containers actually need and because its
 prerequisite (a per-process root) is a divergence worth fixing on its own. PID
 is third because it is the most expensive and the least optional for anything
 that runs an init inside; NET fourth because a namespace with `lo` alone is
-already useful and the wire is a separate question. USER, IPC, CGROUP and TIME
-stay refused, each with the reason in the table above, and each is worth
-revisiting only when the thing it would isolate exists (§8.2's seccomp and §7.4's
-compositor work are both more urgent).
+already useful and the wire is a separate question; TIME fifth because its whole
+shape was measured before any of it was built, which made it the cheapest of the
+four left. USER, IPC and CGROUP stay refused, each with the reason in the table
+above, and each is worth revisiting only when the thing it would isolate exists
+(§8.2's seccomp and §7.4's compositor work are both more urgent).
 
 **Step 1, landed: UTS.** The shape the paragraph above predicted was the shape it
 took, which is worth recording because it is the claim this section was written
@@ -1366,11 +1411,12 @@ every other member, and the caller's root moves to the namespace's root (Linux's
 **Two things are named rather than done.** The *cwd* is not re-resolved by path
 inside the new namespace, which is what Linux does; an inode stays valid across
 the join either way, so what is missing is the re-resolution and not the safety.
-And the kinds this kernel has not (pid, net, ipc, user, cgroup, time) have **no
-entry** in `/proc/<pid>/ns` - which is the surface a real kernel built without a
-namespace has (a machine with `CONFIG_TIME_NS` off answers `ENOENT` for
-`/proc/self/ns/time`), so a reader is told two names and nothing it cannot check,
-and no descriptor for an absent namespace can exist to be handed to `setns`.
+And the kinds this kernel has not (ipc, user, cgroup) have **no entry** in
+`/proc/<pid>/ns` - which is the surface a real kernel built without a namespace
+has (a machine with `CONFIG_TIME_NS` off answers `ENOENT` for
+`/proc/self/ns/time`), so a reader is told the names this machine can isolate and
+nothing it cannot check, and no descriptor for an absent namespace can exist to
+be handed to `setns`.
 
 Two of the pin's own claims had to be corrected by the gate rather than the
 kernel, and both are worth naming because the kernel was right: a *second*

@@ -684,6 +684,11 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             // nothing observable changes until something unshares.
             pid_ns: super::root_ns(),
             pid_ns_children: super::root_ns(),
+            // The machine's own time namespace, in both slots, the same way:
+            // the first program the kernel starts reads the machine's clocks
+            // and its children would be born under them.
+            time_ns: crate::vfs::ns::machine_time_ns(),
+            time_ns_children: crate::vfs::ns::machine_time_ns(),
             // The machine's own network namespace, which is `None`: every socket
             // call resolves to the stack the boot built.
             net_ns: None,
@@ -770,6 +775,11 @@ pub fn try_spawn_user(
         // and the call is the identity.
         let child_pid_ns = alloc::sync::Arc::clone(&t.task(parent).pid_ns_children);
         super::adopt_pid(TaskId(slot), &child_pid_ns);
+        // ...and the clocks the same way: the program is born in the namespace
+        // its starter was pointing its children at, in both slots, and sealing
+        // it is the freeze that stops the offsets being written from here on.
+        let child_time_ns = alloc::sync::Arc::clone(&t.task(parent).time_ns_children);
+        child_time_ns.freeze();
         let stack = Stack::new();
         let mut space = AddressSpace::new();
         let loaded = load_user(
@@ -849,6 +859,8 @@ pub fn try_spawn_user(
             uts: Arc::clone(&t.task(parent).uts),
             pid_ns: alloc::sync::Arc::clone(&child_pid_ns),
             pid_ns_children: child_pid_ns,
+            time_ns: alloc::sync::Arc::clone(&child_time_ns),
+            time_ns_children: child_time_ns,
             // The starter's network namespace, by reference: a program the kernel
             // starts shares the stack of whatever started it, which is the rule
             // `fork` follows.

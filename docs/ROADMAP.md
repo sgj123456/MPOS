@@ -46,8 +46,9 @@ One-glance status of the whole roadmap.
 **Process (Phase 6)**
 - [x] 6.1 ptrace (§6.1) · [x] 6.2 real rlimits incl. NOFILE/STACK (§6.2) · [x] 6.4 identity/cap calls, threads via `clone(CLONE_THREAD)` (§6.4)
 - [x] teardown at exit, not at reap (§6, R.15)
-- [~] 6.3 Namespaces — UTS, MNT, **PID** and **NET** landed, each with its pin (`t-ns-uts`,
-  `t-ns-mnt`, `t-ns-pid`, `t-ns-net`): the numbers a process sees are the reader's namespace's,
+- [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET** and **TIME** landed, each with its pin
+  (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`): the numbers a process sees are the
+  reader's namespace's,
   both directions of the translation and `/proc` rendered per reader (§6.3); **the task a namespace
   is spoken for by has rules of its own** — its members cannot end it (only an ancestor's
   SIGKILL/SIGSTOP, or a signal it has a handler for), and its death takes every task it speaks for,
@@ -66,9 +67,14 @@ One-glance status of the whole roadmap.
   namespace rather than the calling task's (§6.3, measured). A device can move: `eth0` enters a
   namespace (`ip link set eth0 netns N`, served 2026-10-16 - down and unconfigured on arrival,
   which is Linux's shape measured, §6.3); a vsock stack stays machine-wide - which is Linux's own
-  shape, measured, with the transport question named (§6.3); the other four kinds Linux has -
-  user, IPC, cgroup and time - have no entry at all here (§6.3, §6.6), which is `vfs::ns::Kind::ALL`
-  against `namespaces(7)`'s list of eight
+  shape, measured, with the transport question named (§6.3); and **the clocks can be moved**:
+  `unshare(CLONE_NEWTIME)` arms the caller's *children* slot and never moves the caller, the offsets
+  are written through `/proc/self/timens_offsets` and frozen by the first task to enter, a child's
+  `MONOTONIC`/`MONOTONIC_RAW`/`MONOTONIC_COARSE`/`BOOTTIME` read through them while REALTIME, TAI
+  and the cputime clocks do not, and `setns` is the second door into the same slot (`t-ns-time`
+  walks it in 46 claims, the shape measured whole before any of it was built, §6.3). The other
+  three kinds Linux has - user, IPC and cgroup - have no entry at all here (§6.3, §6.6), which is
+  `vfs::ns::Entry::ALL` against `namespaces(7)`'s list of eight
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
@@ -187,18 +193,22 @@ One-glance status of the whole roadmap.
 
 In the order that keeps each step verifiable on its own:
 
-1. **namespaces** (§6.3) — UTS, MNT, PID and NET are landed, and the ladder's remaining work
+1. **namespaces** (§6.3) — UTS, MNT, PID, NET and TIME are landed, and the ladder's remaining work
    is named per rung: a **wire that can move** into a namespace has landed (2026-10-16) -
    `ip link set eth0 netns N` moves the device, and it arrives **down and unconfigured** because
    an address is the namespace's and not the device's (measured on Linux first; `t-ns-net` walks a
-   whole round trip, §6.3), so what is left here is the four kinds with no entry at all
-   (user, IPC, cgroup, time - four of `namespaces(7)`'s eight); nested namespaces pin the
-   *numbers* two levels deep now, as the zap's reach already did. **TIME is the one whose whole
-   shape is measured already** (§6.3, 2026-10-16: `unshare` replaces `time_ns_for_children` alone
-   and never moves the caller, `clone(CLONE_NEWTIME)` is `EINVAL`, a child forked afterwards sees
-   `MONOTONIC`/`MONOTONIC_RAW`/`BOOTTIME` shifted by the offsets and no other clock, and the
-   offsets are frozen - `EACCES` - by the first process to enter), so it is the next of the four
-   and the one to start with. The `/proc/net` reader's rows were
+   whole round trip, §6.3); and the **clocks can be moved** too (2026-10-16) - `unshare` arms the
+   caller's children slot, the offsets are written through `/proc/self/timens_offsets` and frozen
+   by the first task to enter, and `t-ns-time` walks the round trip both ways with the caller's own
+   readings pinned unmoved (§6.3). So what is left here is the **three** kinds with no entry at all
+   (user, IPC, cgroup - three of `namespaces(7)`'s eight), and of those the next one should be
+   **USER**: it is the only one of the three whose absence is felt by everything else (a container
+   runtime's first call is `unshare(CLONE_NEWUSER)`, and uid mapping is what the other two are
+   *scoped* by), which also makes it the most expensive - it touches the credential model rather
+   than adding a namespace object. IPC and CGROUP each wait on the thing they would isolate not
+   existing yet (SysV/POSIX message queues; a cgroup tree), so they are cheap the day that lands
+   and worthless before it. Nested namespaces pin the
+   *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were
    per-namespace but unexercised; `t-ns-net` reads the file on both sides of the boundary now
    (2026-10-15). Two more left this list on
    2026-10-15: the pid namespace's own creation rules (one per process, and a sealed one takes no

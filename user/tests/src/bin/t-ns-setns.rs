@@ -114,17 +114,21 @@ fn main() {
         .unwrap_or_default();
     let mut sorted = names.clone();
     sorted.sort();
-    // Four now: PID then NET joined the directory as the ladder built them
-    // (§6.3). The list is the kernel's claim about what it can isolate, so a set
-    // written down here drifts the moment it grows - which is why the probe below
-    // is the *complete* list rather than a spot check.
+    // Seven names now: TIME joined the directory as the ladder's fifth rung,
+    // and PID and TIME each brought the `_for_children` spelling of their slot
+    // with them (§6.3). The list is the kernel's claim about what it can
+    // isolate, so a set written down here drifts the moment it grows - which is
+    // why the probe below is the *complete* list rather than a spot check.
     r.check(
-        "the ns directory names the four namespaces this kernel has",
+        "the ns directory names the five namespaces this kernel has, seven names",
         sorted
             == vec![
                 "mnt".to_string(),
                 "net".to_string(),
                 "pid".to_string(),
+                "pid_for_children".to_string(),
+                "time".to_string(),
+                "time_for_children".to_string(),
                 "uts".to_string(),
             ],
     );
@@ -158,8 +162,10 @@ fn main() {
         },
     );
     // The names this machine has no namespace for are the same answer a real
-    // kernel gives for the ones it was built without: no entry at all.
-    for absent in ["ipc", "user", "cgroup", "time"] {
+    // kernel gives for the ones it was built without: no entry at all. This list
+    // has shrunk once per rung - TIME left it with the fifth, and it is the one
+    // whose *entry* the `t-ns-time` pin walks end to end.
+    for absent in ["ipc", "user", "cgroup"] {
         let path = format!("/proc/self/ns/{absent}");
         r.check(
             &format!("a namespace this kernel has not is ENOENT ({absent})"),

@@ -310,6 +310,12 @@ pub mod uevent;
 /// whose is the task table's, and the two directions of the translation are the
 /// syscall layer's, so both are bare metal.
 pub use mpos_pidns as pidns;
+/// The time namespace: the offsets a member's monotonic clocks are read
+/// through, as the object a task holds rather than as a pair of machine-wide
+/// numbers. Its own leaf crate, because the offsets *file* is a grammar and a
+/// grammar is argued with by host tests; the task table that decides whose
+/// namespace is whose, and the clock read that adds the offset, are bare metal.
+pub use mpos_timens as timens;
 /// uinput's interface: the requests and bitmaps a userspace program declares an
 /// input device with. Its own leaf crate, and it depends on the evdev crate for
 /// one constant - the size of a `struct input_event`, the unit both families

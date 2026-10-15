@@ -70,6 +70,7 @@ mpos-binfmt = { path = "crates/binfmt" }
 mpos-cred = { path = "crates/cred" }
 mpos-uts = { path = "crates/uts" }
 mpos-pidns = { path = "crates/pidns" }
+mpos-timens = { path = "crates/timens" }
 mpos-seccomp = { path = "crates/seccomp" }
 mpos-pci = { path = "crates/pci" }
 # The block layer seam: the `BlockDev` trait a filesystem reads its storage

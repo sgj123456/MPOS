@@ -184,6 +184,7 @@ const LEAF_CRATES: &[&str] = &[
     "mpos-cred",
     "mpos-uts",
     "mpos-pidns",
+    "mpos-timens",
     "mpos-seccomp",
     "mpos-blk",
     "mpos-pci",
