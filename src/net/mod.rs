@@ -376,10 +376,62 @@ fn pool_depth(backlog: usize) -> usize {
     backlog.clamp(1, LISTEN_POOL_MAX)
 }
 
+/// The wire: the NIC and the interface over it - or nothing at all.
+///
+/// A net namespace owns `lo` and, if it is the machine's own, the one NIC. A
+/// namespace made by `clone(CLONE_NEWNET)` has **no wire**: that is Linux's shape
+/// too (a fresh namespace holds `lo` alone until something moves a device in
+/// with `ip link set eth0 netns N`, which this kernel has no place for), so the
+/// device and the interface are optional and every door that needs one answers
+/// the errno a machine with no link gives.
+///
+/// The **socket set is not optional**, and that is the point: a [`Home`] names
+/// *which set* a socket lives in, so the set has to exist or the name stops
+/// meaning anything. A wire-less namespace's eth set is simply always empty -
+/// nothing can be addressed to a link that is not there.
+pub(crate) struct Wire {
+    device: Option<NicDevice>,
+    iface: Option<Interface>,
+    sockets: SocketSet<'static>,
+    up: bool,
+}
+
+impl Wire {
+    /// Advance the wire over its device, unless `ip link set eth0 down` has
+    /// taken it down. Nothing to advance without a wire, and nothing to advance
+    /// *for*: a downed link is not polled, which is what makes `down` read as
+    /// down rather than as a link that quietly keeps talking.
+    fn poll(&mut self, now: SmolInstant) {
+        if !self.up {
+            return;
+        }
+        if let (Some(device), Some(iface)) = (self.device.as_mut(), self.iface.as_mut()) {
+            iface.poll(now, device, &mut self.sockets);
+        }
+    }
+
+    /// Begin a handshake on a socket of this wire. With no wire there is nothing
+    /// to address: `Unaddressable` is smoltcp's own word for "this destination
+    /// is not reachable from here", which the caller turns into `ENETUNREACH`.
+    fn connect(
+        &mut self,
+        h: SocketHandle,
+        remote: IpEndpoint,
+        local: IpListenEndpoint,
+    ) -> Result<(), tcp::ConnectError> {
+        let Some(iface) = self.iface.as_mut() else {
+            return Err(tcp::ConnectError::Unaddressable);
+        };
+        let sock = self.sockets.get_mut::<tcp::Socket>(h);
+        sock.connect(iface.context(), remote, local)
+    }
+}
+
 /// Everything the network stack owns, in one place behind one lock.
 pub(crate) struct Stack {
-    /// eth0: the virtio NIC and QEMU's user network.
-    eth: Fabric<NicDevice>,
+    /// eth0: the virtio NIC and QEMU's user network - absent in a namespace
+    /// with no wire.
+    eth: Wire,
     /// lo: `127.0.0.0/8`, carried by smoltcp's own loopback device.
     lo: Fabric<smoltcp::phy::Loopback>,
     pub(crate) entries: Vec<Option<Entry>>,
@@ -459,7 +511,7 @@ impl Stack {
     /// unless `ip link set` has taken it down.
     fn poll_home(&mut self, home: Home, now: SmolInstant) {
         match home {
-            Home::Eth => poll_fabric(&mut self.eth, now),
+            Home::Eth => self.eth.poll(now),
             Home::Lo => poll_fabric(&mut self.lo, now),
         }
     }
@@ -695,7 +747,7 @@ impl Stack {
         local: IpListenEndpoint,
     ) -> Result<(), tcp::ConnectError> {
         match home {
-            Home::Eth => connect_in(&mut self.eth, h, remote, local),
+            Home::Eth => self.eth.connect(h, remote, local),
             Home::Lo => connect_in(&mut self.lo, h, remote, local),
         }
     }
@@ -977,15 +1029,25 @@ pub(crate) fn home_of(addr: IpAddress) -> Home {
 /// genuinely disjoint access to both. A panicking `f` loses the entry - and
 /// a panic ends the machine, so there is nothing left to lose it from.
 pub(crate) fn with<R>(handle: usize, f: impl FnOnce(&mut Stack, &mut Entry) -> R) -> Option<R> {
-    critical_section::with(|cs| {
-        let mut net = NET.borrow(cs).borrow_mut();
-        let stack = net.as_mut()?;
+    // The **caller's** namespace's stack, like `alloc_socket`/`adopt_socket`/
+    // `free_entry` beside it: a registry handle is an index into the entry table
+    // of the stack the socket was made in, so every door that acts on a
+    // descriptor has to resolve the *same* stack the socket was registered in.
+    // Reaching `NET` here while those reached the caller's is what produced two
+    // stacks for one socket, and the pin's `bind`/`listen`/`connect` inside a
+    // namespace is what named it (`docs/notes/` §6.3).
+    with_stack(|stack| {
         let idx = handle.checked_sub(1)?;
+        // The entry is lifted out of its slot for the duration: handing `f` a
+        // reference borrowed *from* the stack would be two mutable borrows of one
+        // value. A panicking `f` loses the entry - and a panic ends the machine,
+        // so there is nothing left to lose it from.
         let mut entry = stack.entries.get_mut(idx)?.take()?;
         let result = f(stack, &mut entry);
         stack.entries[idx] = Some(entry);
         Some(result)
     })
+    .flatten()
 }
 
 /// Run `f` with the stack alone - for operations that do not have a socket
@@ -993,14 +1055,15 @@ pub(crate) fn with<R>(handle: usize, f: impl FnOnce(&mut Stack, &mut Entry) -> R
 /// eth0's hardware address - the one number a packet socket's frames must
 /// carry as their source, read from the live device rather than restated.
 pub(crate) fn packet_mac() -> Option<[u8; 6]> {
-    with_stack(|st| st.eth.device.net.mac())
+    with_stack(|st| st.eth.device.as_ref().map(|d| d.net.mac())).flatten()
 }
 
 /// Hand one complete Ethernet frame to the device, outside the stack lock
 /// (the Arc outlives the borrow, and the transmit is the driver's own).
 /// `ENETDOWN` with no card; a refused queue is `EIO`, not a lost silence.
 pub(crate) fn packet_transmit(frame: &[u8]) -> Result<usize, isize> {
-    let device: Option<Arc<dyn NetDevice>> = with_stack(|st| st.eth.device.net.clone());
+    let device: Option<Arc<dyn NetDevice>> =
+        with_stack(|st| st.eth.device.as_ref().map(|d| d.net.clone())).flatten();
     match device {
         Some(device) => {
             if device.transmit(frame) {
@@ -1013,11 +1076,28 @@ pub(crate) fn packet_transmit(frame: &[u8]) -> Result<usize, isize> {
     }
 }
 
+/// Run `f` with the stack of the namespace **the caller is in**.
+///
+/// This is the whole of what a network namespace changes: the address and route
+/// tables, the port space, the listeners and the socket sets a task reaches are
+/// its own namespace's. A task that never asked for one holds no namespace
+/// number ([`crate::sched::current_net_ns`] answers `None`) and resolves to the
+/// machine's stack - so for every path that existed before namespaces this is
+/// still that one stack, unchanged.
 pub(crate) fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
-    critical_section::with(|cs| {
-        let mut net = NET.borrow(cs).borrow_mut();
-        net.as_mut().map(f)
-    })
+    match crate::sched::current_net_ns() {
+        None => with_machine_stack(f),
+        // Joining the machine's own namespace (`setns` on `/proc/1/ns/net` where
+        // pid 1 is in it) is a way *back* to the machine's stack, not a lookup
+        // that cannot succeed.
+        Some(id) if id == crate::vfs::ns::machine_net_id() => with_machine_stack(f),
+        Some(id) => critical_section::with(|cs| {
+            let mut ns = NAMESPACES.borrow(cs).borrow_mut();
+            ns.iter_mut()
+                .find(|(number, _)| *number == id)
+                .map(|(_, stack)| f(stack))
+        }),
+    }
 }
 
 /// The live socket table for `/proc/net/tcp` (`tcp` set) or `/proc/net/udp`.
@@ -1121,7 +1201,9 @@ pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> 
 /// depends on the stack existing.
 #[cfg(target_os = "none")]
 pub(crate) fn net_dev_rows() -> Vec<pool::NetDevStats> {
-    let mtu = with_stack(|st| st.eth.device.mtu).unwrap_or(MTU);
+    let mtu = with_stack(|st| st.eth.device.as_ref().map(|d| d.mtu))
+        .flatten()
+        .unwrap_or(MTU);
     pool::net_dev_stats(mtu)
 }
 
@@ -1153,11 +1235,14 @@ fn tcp_proc_state(sock: &tcp::Socket) -> u8 {
 /// `protocol` is the IP protocol number for raw sockets (e.g. 1 for ICMP);
 /// ignored for TCP and UDP.
 pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize, isize> {
-    critical_section::with(|cs| {
-        let mut net = NET.borrow(cs).borrow_mut();
-        let Some(stack) = net.as_mut() else {
-            return Err(crate::err::ENETDOWN);
-        };
+    // The ***caller's*** namespace's stack, not the machine's: a socket is made
+    // in the stack the caller resolves through, and every later operation on its
+    // descriptor has to look for it in the *same* stack. Reaching `NET` here
+    // while `bind`/`connect` go through `with_stack` is what made a namespaced
+    // child's first socket register in one stack and be looked up in another -
+    // a smoltcp panic on an empty socket set, which is how this was found
+    // (`docs/notes/` §6.3).
+    with_stack(|stack| {
         let owned = match (family, typ) {
             (socket::AF_INET, socket::SOCK_STREAM) => Channel::Tcp {
                 // Created on eth0 because that is what most sockets are for;
@@ -1212,6 +1297,7 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
             }
         })
     })
+    .unwrap_or(Err(crate::err::ENETDOWN))
 }
 
 /// Register an `Entry` for a socket that already exists and hand back its
@@ -1230,11 +1316,9 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
 /// option that lets the next bind take that port back has to be read from
 /// *them* as well as from the caller (`Stack::tcp_name_taken`).
 pub(crate) fn adopt_socket(channel: Channel, typ: u16, opts: SockOpts) -> Result<usize, isize> {
-    critical_section::with(|cs| {
-        let mut net = NET.borrow(cs).borrow_mut();
-        let Some(stack) = net.as_mut() else {
-            return Err(crate::err::ENETDOWN);
-        };
+    // The caller's namespace's stack, for `alloc_socket`'s reason: an adopted
+    // socket has to be found where its operations will look for it.
+    with_stack(|stack| {
         let entry = Entry {
             family: socket::AF_INET,
             typ,
@@ -1252,6 +1336,7 @@ pub(crate) fn adopt_socket(channel: Channel, typ: u16, opts: SockOpts) -> Result
             }
         })
     })
+    .unwrap_or(Err(crate::err::ENETDOWN))
 }
 
 /// `listen(2)` on an IPv4 socket: open the passive-open side, or re-set the
@@ -1359,9 +1444,10 @@ pub(crate) fn free_entry(handle: usize) {
         return;
     }
 
-    critical_section::with(|cs| {
-        let mut net = NET.borrow(cs).borrow_mut();
-        let Some(stack) = net.as_mut() else { return };
+    // The caller's namespace's stack, like every other door that acts on a
+    // descriptor: a registry handle is an index into *its* stack's entry table,
+    // so the stack it is freed from has to be the one it was made in.
+    with_stack(|stack| {
         let idx = match handle.checked_sub(1) {
             Some(idx) if idx < stack.entries.len() => idx,
             _ => return,
@@ -1491,7 +1577,11 @@ pub(crate) fn wake_waiters() {
 pub fn irq_service() {
     let waiters = with_stack(|stack| {
         stack.poll_once();
-        stack.eth.device.net.ack_interrupt();
+        // A namespace with no wire has no interrupt to acknowledge; the
+        // service task still walks its other interfaces.
+        if let Some(device) = stack.eth.device.as_ref() {
+            device.net.ack_interrupt();
+        }
         stack.waiters.clone()
     })
     .unwrap_or_default();
@@ -1524,6 +1614,9 @@ pub(crate) struct RouteFacts {
 /// the stack never came up - no NIC, no links worth the name.
 pub(crate) struct LinkFacts {
     pub lo_up: bool,
+    /// Whether there is a wire at all - the difference between `eth0 down` and
+    /// no `eth0`, which the link dump has to keep.
+    pub eth_present: bool,
     pub eth_up: bool,
     pub eth_name: String,
     pub mtu: u32,
@@ -1549,7 +1642,13 @@ pub(crate) fn lo_addrs() -> Vec<AddrFacts> {
 fn addrs_of(home: Home) -> Vec<AddrFacts> {
     with_stack(|st| {
         let iface = match home {
-            Home::Eth => &st.eth.iface,
+            Home::Eth => match st.eth.iface.as_ref() {
+                Some(iface) => iface,
+                // An interface that is not there has no addresses to list, and
+                // an empty list is what a `getifaddrs` walk in a wire-less
+                // namespace must see.
+                None => return Vec::new(),
+            },
             Home::Lo => &st.lo.iface,
         };
         iface
@@ -1575,8 +1674,13 @@ fn addrs_of(home: Home) -> Vec<AddrFacts> {
 /// silent rather than leaky.
 pub(crate) fn routes() -> Vec<RouteFacts> {
     with_stack(|st| {
+        // A namespace with no wire has no routing table: every entry it could
+        // hold is a way out of the machine, and there is nowhere to go.
+        let Some(wire) = st.eth.iface.as_mut() else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
-        st.eth.iface.routes_mut().update(|storage| {
+        wire.routes_mut().update(|storage| {
             for route in storage.iter() {
                 let (dst, dst_len) = match route.cidr {
                     IpCidr::Ipv4(v4) => (v4.address().octets(), v4.prefix_len()),
@@ -1605,10 +1709,15 @@ pub(crate) fn routes() -> Vec<RouteFacts> {
 pub(crate) fn link_facts() -> Option<LinkFacts> {
     with_stack(|st| LinkFacts {
         lo_up: st.lo.up,
-        eth_up: st.eth.up,
+        // A wire-less namespace has no eth0 *at all*, which is not the same
+        // report as an eth0 that is down: `eth_present` is what the link dump
+        // reads before it writes the entry, so a namespace with no wire lists
+        // `lo` and nothing else rather than a phantom NIC with no carrier.
+        eth_present: st.eth.device.is_some(),
+        eth_up: st.eth.up && st.eth.device.is_some(),
         eth_name: st.eth_name.clone(),
-        mtu: st.eth.device.mtu as u32,
-        mac: st.eth.device.net.mac(),
+        mtu: st.eth.device.as_ref().map_or(MTU as u32, |d| d.mtu as u32),
+        mac: st.eth.device.as_ref().map_or([0; 6], |d| d.net.mac()),
     })
 }
 
@@ -1616,7 +1725,13 @@ pub(crate) fn link_facts() -> Option<LinkFacts> {
 /// carries, which is what a route dump reports as `RTA_PREFSRC` and what
 /// `fastfetch` reads as the machine's local IP.
 pub(crate) fn primary_ipv4() -> Option<[u8; 4]> {
-    with_stack(|st| st.eth.iface.ipv4_addr().map(|a| a.octets())).flatten()
+    with_stack(|st| {
+        st.eth
+            .iface
+            .as_ref()
+            .and_then(|i| i.ipv4_addr().map(|a| a.octets()))
+    })
+    .flatten()
 }
 
 /// `ip addr add` on eth0: the address the interface does not yet carry. An
@@ -1629,8 +1744,13 @@ pub(crate) fn add_ipv4_addr(ip: [u8; 4], prefix: u8) -> Result<(), isize> {
             IpAddress::Ipv4(Ipv4Address::new(ip[0], ip[1], ip[2], ip[3])),
             prefix,
         );
+        let Some(iface) = st.eth.iface.as_mut() else {
+            // No wire, no device to configure: the same `ENODEV` the absent
+            // stack gives at the end of this function.
+            return Err(crate::err::ENODEV);
+        };
         let mut rc = Ok(());
-        st.eth.iface.update_ip_addrs(|addrs| {
+        iface.update_ip_addrs(|addrs| {
             if addrs.contains(&cidr) {
                 rc = Err(crate::err::EEXIST);
                 return;
@@ -1649,8 +1769,11 @@ pub(crate) fn add_ipv4_addr(ip: [u8; 4], prefix: u8) -> Result<(), isize> {
 /// `EADDRNOTAVAIL`.
 pub(crate) fn del_ipv4_addr(ip: [u8; 4]) -> Result<(), isize> {
     with_stack(|st| {
+        let Some(iface) = st.eth.iface.as_mut() else {
+            return Err(crate::err::ENODEV);
+        };
         let mut rc = Err(crate::err::EADDRNOTAVAIL);
-        st.eth.iface.update_ip_addrs(|addrs| {
+        iface.update_ip_addrs(|addrs| {
             let hit = addrs.iter().position(|a| match a {
                 IpCidr::Ipv4(v4) => v4.address().octets() == ip,
                 // See `ipv4_addrs` for why the wildcard is gated.
@@ -1680,8 +1803,11 @@ pub(crate) fn add_route(dst: [u8; 4], dst_len: u8, gateway: [u8; 4]) -> Result<(
         let via = IpAddress::Ipv4(Ipv4Address::new(
             gateway[0], gateway[1], gateway[2], gateway[3],
         ));
+        let Some(iface) = st.eth.iface.as_mut() else {
+            return Err(crate::err::ENODEV);
+        };
         let mut rc = Ok(());
-        st.eth.iface.routes_mut().update(|storage| {
+        iface.routes_mut().update(|storage| {
             if storage.iter().any(|r| r.cidr == cidr) {
                 rc = Err(crate::err::EEXIST);
                 return;
@@ -1710,8 +1836,11 @@ pub(crate) fn del_route(dst: [u8; 4], dst_len: u8) -> Result<(), isize> {
             IpAddress::Ipv4(Ipv4Address::new(dst[0], dst[1], dst[2], dst[3])),
             dst_len,
         );
+        let Some(iface) = st.eth.iface.as_mut() else {
+            return Err(crate::err::ENODEV);
+        };
         let mut rc = Err(crate::err::ESRCH);
-        st.eth.iface.routes_mut().update(|storage| {
+        iface.routes_mut().update(|storage| {
             if let Some(pos) = storage.iter().position(|r| r.cidr == want) {
                 storage.remove(pos);
                 rc = Ok(());
@@ -1733,6 +1862,12 @@ pub(crate) fn set_link_up(index: u32, up: bool) -> Result<(), isize> {
             Ok(())
         }
         2 => {
+            if st.eth.device.is_none() {
+                // `ip link set eth0 up` in a namespace that has no wire: there
+                // is no device to bring up, which is `ENODEV` and not a success
+                // that would leave the caller believing the link is running.
+                return Err(crate::err::ENODEV);
+            }
             st.eth.up = up;
             Ok(())
         }
@@ -1746,8 +1881,11 @@ pub(crate) fn set_link_up(index: u32, up: bool) -> Result<(), isize> {
 /// range is `EINVAL`.
 pub(crate) fn set_mtu(mtu: u32) -> Result<(), isize> {
     with_stack(|st| {
+        let Some(device) = st.eth.device.as_mut() else {
+            return Err(crate::err::ENODEV);
+        };
         if (MTU_FLOOR..=MTU_CEIL).contains(&(mtu as usize)) {
-            st.eth.device.mtu = mtu as usize;
+            device.mtu = mtu as usize;
             Ok(())
         } else {
             Err(crate::err::EINVAL)
@@ -1914,9 +2052,9 @@ pub fn init(dev: Arc<dyn NetDevice>) {
 
     critical_section::with(|cs| {
         *NET.borrow(cs).borrow_mut() = Some(Stack {
-            eth: Fabric {
-                iface,
-                device,
+            eth: Wire {
+                iface: Some(iface),
+                device: Some(device),
                 sockets: SocketSet::new(Vec::new()),
                 up: true,
             },
@@ -1934,6 +2072,59 @@ pub fn init(dev: Arc<dyn NetDevice>) {
             eth_name: String::from("eth0"),
         });
     });
+}
+
+impl Stack {
+    /// A namespace's own stack: `lo`, and no wire.
+    ///
+    /// The loopback is built exactly the way the machine's is - smoltcp's own
+    /// loopback device over an Ethernet medium - and it comes **up, carrying
+    /// `127.0.0.1/8`**. That is a deliberate divergence from Linux, where a fresh
+    /// namespace's `lo` is down and unaddressed until an init script runs
+    /// `ip link set lo up` and `ip addr add`, and the reason is this kernel's own
+    /// refusal: `RTM_NEWADDR` on `lo` answers `EOPNOTSUPP` (its one address is the
+    /// kernel's, not a caller's to change - `rtnl.rs`'s measurement), so a
+    /// namespace whose loopback started empty could never be given one, and its
+    /// private network would be unusable rather than private. The pin holds both
+    /// halves: the child's own loopback answers, and asking to add the address is
+    /// refused.
+    ///
+    /// eth0 is **absent** rather than down, because a namespace has no device to
+    /// bring up: moving one in is `ip link set ... netns`, which this kernel has no
+    /// place for yet.
+    pub(crate) fn deviceless() -> Stack {
+        let mut lo_device = smoltcp::phy::Loopback::new(Medium::Ethernet);
+        let mut lo_iface = Interface::new(
+            Config::new(HardwareAddress::Ethernet(EthernetAddress([
+                0x02, 0, 0, 0, 0, 0,
+            ]))),
+            &mut lo_device,
+            now(),
+        );
+        lo_iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8));
+        });
+        Stack {
+            eth: Wire {
+                device: None,
+                iface: None,
+                sockets: SocketSet::new(Vec::new()),
+                up: false,
+            },
+            lo: Fabric {
+                iface: lo_iface,
+                device: lo_device,
+                sockets: SocketSet::new(Vec::new()),
+                up: true,
+            },
+            entries: Vec::new(),
+            listeners: Vec::new(),
+            teardown: Vec::new(),
+            next_ephemeral: EPHEMERAL_MIN,
+            waiters: Vec::new(),
+            eth_name: String::from("eth0"),
+        }
+    }
 }
 
 /// Spawn the task that keeps the interface moving between userland polls.
@@ -1979,6 +2170,43 @@ fn ip_to_smoltcp_protocol(num: u8) -> IpProtocol {
 
 /// The whole stack, behind the usual kernel lock. `None` until [`init`].
 static NET: Mutex<RefCell<Option<Stack>>> = Mutex::new(RefCell::new(None));
+
+/// Run `f` with the machine's own stack - the one every boot path builds, and the
+/// init namespace's.
+pub(crate) fn with_machine_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Option<R> {
+    critical_section::with(|cs| {
+        let mut net = NET.borrow(cs).borrow_mut();
+        net.as_mut().map(f)
+    })
+}
+
+/// Every network namespace but the machine's own, keyed by the number the
+/// identity layer minted for it.
+///
+/// A `Vec` scanned linearly rather than a map: a machine has a handful of these
+/// at most, and each one is a whole stack with its own socket sets. Nothing frees
+/// one - a **named gap**, because the identity carries no reference count: a
+/// namespace whose last task left keeps its stack until the machine stops, where
+/// Linux frees it with the last `struct net`.
+static NAMESPACES: Mutex<RefCell<Vec<(u64, Stack)>>> = Mutex::new(RefCell::new(Vec::new()));
+
+/// Make a network namespace: a number from the one pool, whose stack - `lo`, and
+/// no wire - is in the registry before the call returns.
+///
+/// Both halves in one call on purpose: a caller that holds the number must be
+/// able to resolve the stack, which is what a `clone` child's first `socket`
+/// depends on. Minting the number anywhere else would leave a window where a
+/// namespace exists on paper and has nothing behind it.
+pub fn mint_namespace() -> u64 {
+    let id = crate::vfs::ns::mint();
+    critical_section::with(|cs| {
+        NAMESPACES
+            .borrow(cs)
+            .borrow_mut()
+            .push((id, Stack::deviceless()));
+    });
+    id
+}
 
 // ---------------------------------------------------------------------------
 // The smoltcp <-> virtio-net seam

@@ -155,6 +155,15 @@ struct PipeState {
 struct Scm {
     end: u64,
     files: Vec<Arc<super::File>>,
+    /// The network namespace the *sender* was in.
+    ///
+    /// It rides with the record because the two facts a handover needs - who
+    /// sent these descriptors and who is picking them up - are never known at
+    /// the same moment: the sender does not know its peer's namespace, and the
+    /// reader cannot ask a queue that has already been popped. A socket belongs
+    /// to the namespace whose stack holds its registry entry, so a descriptor
+    /// that crossed a namespace boundary cannot be resolved where it arrives.
+    ns: Option<u64>,
 }
 
 /// One end of a pipe, as an inode. Reads and writes ignore their offset: a
@@ -217,22 +226,26 @@ impl PipeEnd {
 
     /// Queue one SCM_RIGHTS handover beside the bytes just written. Any end of
     /// the shared buffer can push; the peer's read half is the one that pops.
-    pub fn push_scm(&self, fds: Vec<Arc<super::File>>) {
+    pub fn push_scm(&self, fds: Vec<Arc<super::File>>, ns: Option<u64>) {
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
             let end = st.written;
-            st.scm.push_back(Scm { end, files: fds });
+            st.scm.push_back(Scm {
+                end,
+                files: fds,
+                ns,
+            });
         });
     }
 
     /// The oldest handover whose bytes this side has now consumed. A queue that
     /// has one but is not yet due returns `None` rather than the next one down,
     /// which is what keeps the order honest.
-    pub fn take_scm(&self) -> Option<Vec<Arc<super::File>>> {
+    pub fn take_scm(&self) -> Option<(Vec<Arc<super::File>>, Option<u64>)> {
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
             if st.scm.front().is_some_and(|s| st.consumed >= s.end) {
-                return st.scm.pop_front().map(|s| s.files);
+                return st.scm.pop_front().map(|s| (s.files, s.ns));
             }
             None
         })
@@ -715,12 +728,14 @@ impl DuplexEnd {
 
     /// Queue an SCM_RIGHTS handover for the peer to pick up on its next read.
     /// It rides the writing direction, which is the buffer the peer reads.
-    pub fn send_scm(&self, fds: Vec<Arc<super::File>>) {
-        self.write.push_scm(fds);
+    /// `ns` is the sender's network namespace, kept for the reader to judge.
+    pub fn send_scm(&self, fds: Vec<Arc<super::File>>, ns: Option<u64>) {
+        self.write.push_scm(fds, ns);
     }
 
-    /// Take the handover the peer queued for this end, if any.
-    pub fn take_scm(&self) -> Option<Vec<Arc<super::File>>> {
+    /// Take the handover the peer queued for this end, if any - its descriptors
+    /// and the namespace they were sent from.
+    pub fn take_scm(&self) -> Option<(Vec<Arc<super::File>>, Option<u64>)> {
         self.read.take_scm()
     }
 
@@ -841,12 +856,18 @@ mod tests {
         assert!(a.take_scm().is_none());
         assert!(b.take_scm().is_none());
 
-        a.send_scm(vec![f1, f2]);
+        // The sender's network namespace rides with the descriptors: it is the
+        // one fact the *reader* has to compare against its own, and it cannot be
+        // asked for later - a queue that has been popped has no memory of where
+        // its records came from. A host build has one namespace, so `None` is
+        // what every record here carries.
+        a.send_scm(vec![f1, f2], Some(7));
 
         // The handover left on a's write direction, so it is not readable back
         // on a's own (inbound) side - only the peer pops what was sent to it.
         assert!(a.take_scm().is_none(), "a's send is not echoed to a");
-        let got = b.take_scm().expect("the handover arrives on b");
+        let (got, sender) = b.take_scm().expect("the handover arrives on b");
+        assert_eq!(sender, Some(7), "the sender's namespace rides with it");
         assert_eq!(got.len(), 2, "both descriptors ride one message");
         assert_eq!(Arc::as_ptr(&got[0]), p1, "in the order they were queued");
         assert_eq!(Arc::as_ptr(&got[1]), p2);

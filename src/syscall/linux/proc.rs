@@ -1731,11 +1731,36 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     // A thread's stack is its own, so `child_stack` picks where it starts; a
     // process ignores the argument and returns from the call on its own stack,
     // exactly as `fork` does.
+    // A fresh network namespace for the child, and the one **precondition** this
+    // kernel attaches to it: a socket here lives in its namespace's stack, and the
+    // registry's handles are per-stack indices - so a child handed a fresh stack
+    // while holding an *inherited* socket descriptor would let that fd name one of
+    // the new namespace's sockets instead of its own. Linux has no such
+    // precondition (a `struct sock` remembers its `sk_net`, so an inherited fd
+    // keeps working); closing the difference needs the socket registry to move out
+    // of the stack and carry its namespace, which is the step `docs/notes/` §6.3
+    // names. Until then a caller that asks while holding a socket is told
+    // `EOPNOTSUPP` rather than handed a namespace that aliases its own descriptors.
+    let net_ns = if flags & crate::abi::CLONE_NEWNET != 0 {
+        // The question is the net layer's to answer - it is the layer that knows
+        // a socket when it sees one (`Inode::socket_handle`), and the `NodeKind`
+        // a socket inode reports is `CharDev`, not `Socket`: asked that way this
+        // check silently passed every descriptor, which the pin caught.
+        if crate::net::socket::holds_a_socket() {
+            return err::EOPNOTSUPP;
+        }
+        // Minted here rather than in the scheduler: making a namespace means
+        // naming `net`, and `sched` must not (see `Task::net_ns`).
+        Some(crate::net::mint_namespace())
+    } else {
+        None
+    };
     let request = crate::sched::CloneRequest {
         flags,
         child_stack,
         child_tid,
         tls,
+        net_ns,
     };
     let child = crate::sched::clone(&ctx, request);
     if child < 0 {

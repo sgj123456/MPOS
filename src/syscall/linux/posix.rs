@@ -1217,6 +1217,14 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
     }
     match namespace {
         crate::vfs::ns::Namespace::Mount(table) => crate::sched::setns_mnt(table),
+        // The network namespace's descriptor is *nameable* - `/proc/<pid>/ns/net`
+        // exists and reads `net:[<n>]` - but joining it is not served yet: moving
+        // a live task into another stack needs each descriptor's socket to
+        // remember the namespace it was made in, which is the registry step
+        // `docs/notes/` §6.3 names. `EOPNOTSUPP` - "present, cannot do that" - is
+        // the honest half of serving the kind: the words above are checked, and
+        // this is the call that cannot be honoured.
+        crate::vfs::ns::Namespace::Net(_) => return err::EOPNOTSUPP,
         crate::vfs::ns::Namespace::Pid(pidns) => crate::sched::setns_pid(pidns),
         crate::vfs::ns::Namespace::Uts(uts) => crate::sched::setns_uts(uts),
     }

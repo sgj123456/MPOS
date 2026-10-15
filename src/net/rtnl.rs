@@ -726,16 +726,22 @@ fn dump_links(seq: u32, pid: u32) -> Vec<Vec<u8>> {
         None,
         65536,
     ));
-    v.push(link_msg(
-        seq,
-        pid,
-        ETH_INDEX,
-        &facts.eth_name,
-        flags_of(facts.eth_up, false),
-        ARPHRD_ETHER,
-        Some(&facts.mac),
-        facts.mtu,
-    ));
+    // Only where there is a wire: a namespace that has none lists `lo` and
+    // nothing else, which is what a machine with no NIC reports - an entry for a
+    // device that does not exist would be a dump disagreeing with the stack it
+    // describes.
+    if facts.eth_present {
+        v.push(link_msg(
+            seq,
+            pid,
+            ETH_INDEX,
+            &facts.eth_name,
+            flags_of(facts.eth_up, false),
+            ARPHRD_ETHER,
+            Some(&facts.mac),
+            facts.mtu,
+        ));
+    }
     v.push(done(seq, pid));
     v
 }

@@ -266,7 +266,7 @@ pub fn rlimit_admit(old: Rlimit, new: Rlimit, is_root: bool) -> Result<Rlimit, i
 /// `sched → syscall` edge is exactly the V-* class Phase 11 keeps at zero. The
 /// namespace bits it consults are defined above, so the rule has one home.
 pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isize> {
-    const SERVED: usize = CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID;
+    const SERVED: usize = CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET;
     let asked = flags & CLONE_NAMESPACES;
     // The pairs Linux itself calls *invalid*, from `clone(2)`'s ERRORS list:
     // "CLONE_NEWPID and one (or both) of CLONE_THREAD or CLONE_PARENT were
@@ -419,9 +419,14 @@ mod tests {
                 "{kind:#x} was accepted for a thread and then ignored"
             );
         }
+        // NET joined the served set when the fourth rung landed: a child given a
+        // fresh stack is the one shape this kernel can serve for that kind, while
+        // moving a *live* task into one is refused by name in `setns` and by the
+        // `unshare` verdict (`docs/notes/` §6.3).
+        assert_eq!(clone_namespace_verdict(CLONE_NEWNET, true), Ok(()));
         assert_eq!(
-            clone_namespace_verdict(CLONE_NEWNET, true),
-            Err(mpos_err::EOPNOTSUPP)
+            clone_namespace_verdict(CLONE_NEWNET, false),
+            Err(mpos_err::EPERM)
         );
         assert_eq!(
             clone_namespace_verdict(CLONE_NEWUSER, true),
@@ -430,7 +435,7 @@ mod tests {
         // Served *and* unserved in one word: nothing is half-done, so the whole
         // request is refused and the served kind is not quietly handed over.
         assert_eq!(
-            clone_namespace_verdict(CLONE_NEWUTS | CLONE_NEWNET, true),
+            clone_namespace_verdict(CLONE_NEWUTS | CLONE_NEWIPC, true),
             Err(mpos_err::EOPNOTSUPP)
         );
         assert_eq!(

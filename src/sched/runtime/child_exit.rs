@@ -625,6 +625,16 @@ pub struct CloneRequest {
     pub child_stack: usize,
     pub child_tid: usize,
     pub tls: usize,
+    /// The network namespace to give the child, or `None` to let it inherit its
+    /// creator's.
+    ///
+    /// Filled in by the *syscall* layer, and that is not an accident of layering:
+    /// making a namespace means calling `net::mint_namespace`, and `sched` must
+    /// not name `net` (it would close a mutual dependency - see
+    /// [`super::task::Task::net_ns`]). The syscall layer already decides what a
+    /// flag word means, so it decides this too and hands the scheduler an
+    /// already-made namespace.
+    pub net_ns: Option<u64>,
 }
 
 /// The thread-local storage base the **task on this CPU** is running with.
@@ -973,6 +983,10 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // and `CLONE_NEWPID` the only thing that moves either.
             pid_ns: Arc::clone(&child_pid_ns),
             pid_ns_children: child_pid_ns,
+            // The network namespace: the creator's, unless this word asked for a
+            // fresh one (`CLONE_NEWNET`, minted by the syscall layer, which is the
+            // layer allowed to name `net`).
+            net_ns: request.net_ns.or(t.task(parent_id).net_ns),
             oom_score_adj: t.task(parent_id).oom_score_adj,
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
             nice: t.task(parent_id).nice,
@@ -1309,6 +1323,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         let uts = alloc::sync::Arc::clone(&parent.uts);
         let pid_ns = alloc::sync::Arc::clone(&parent.pid_ns);
         let pid_ns_children = alloc::sync::Arc::clone(&parent.pid_ns_children);
+        let net_ns = parent.net_ns;
         // `CLONE_FS` is what every `pthread_create` sets: a thread that
         // `chdir`s moves its process, which is Linux's answer (measured -
         // `.workbuddy/probe_unshare_flags.c`). A raw `clone(CLONE_THREAD)`
@@ -1431,6 +1446,10 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             uts,
             pid_ns,
             pid_ns_children,
+            // A thread is its process: the same stack, by reference - the rule
+            // `CLONE_THREAD` follows for every namespace above it (and why the
+            // verdict refuses a thread with a namespace of its own).
+            net_ns: net_ns.clone(),
             oom_score_adj,
             oom_score_adj_min,
             nice,

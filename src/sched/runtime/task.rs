@@ -669,6 +669,25 @@ pub(crate) struct Task {
     /// `crates/pidns` holds the object and the rule, `sched::pid` the two
     /// directions of the translation; this field is only whose it is.
     pub(crate) pid_ns: Arc<crate::pidns::PidNs>,
+    /// The network namespace this task resolves and binds through, as the
+    /// number `net` knows the stack by - `None` for the machine's own, the shape
+    /// `fs_ns` above uses for "the machine's table".
+    ///
+    /// A *number* rather than an `Arc` of the object, and that is deliberate: the
+    /// stacks live in `net`'s registry, and a `sched` holding an `Arc<NetNs>`
+    /// would have to name `net` - which already names `sched` (it wakes tasks),
+    /// so that would be a mutual dependency the design does not have
+    /// (`ARCHITECTURE.md` §2/§3). Nothing else in the task table ever looks at it;
+    /// `net` resolves it when a socket call asks.
+    ///
+    /// Inherited by reference across `fork`/`clone`, and given a fresh value by
+    /// `clone(CLONE_NEWNET)`, which is where a namespace is *made* for a child.
+    /// `unshare`/`setns` moving a live task are not served yet, and the reason is
+    /// named: a socket here lives in its namespace's stack, and the registry's
+    /// handles are per-stack indices, so moving a task with sockets open would
+    /// let an inherited fd name a socket of the new namespace instead of its own
+    /// (`docs/notes/` §6.3).
+    pub(crate) net_ns: Option<u64>,
     /// The namespace this task's **children** are created in - Linux's
     /// `nsproxy->pid_ns_for_children`.
     ///
@@ -994,6 +1013,9 @@ impl Task {
             // nothing observable changes until something unshares.
             pid_ns: super::root_ns(),
             pid_ns_children: super::root_ns(),
+            // The machine's own network namespace, which is `None`: every socket
+            // call resolves to the stack the boot built.
+            net_ns: None,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -1538,6 +1560,9 @@ impl Table {
             // nothing observable changes until something unshares.
             pid_ns: super::root_ns(),
             pid_ns_children: super::root_ns(),
+            // The machine's own network namespace, which is `None`: every socket
+            // call resolves to the stack the boot built.
+            net_ns: None,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),

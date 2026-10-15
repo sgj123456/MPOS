@@ -55,7 +55,7 @@ use rustix::pipe::pipe;
 
 const CLONE_NEWNS: usize = 0x0002_0000;
 const CLONE_NEWUTS: usize = 0x0400_0000;
-const CLONE_NEWNET: usize = 0x4000_0000;
+const CLONE_NEWIPC: usize = 0x2000_0000;
 /// A path only the child's namespace has, so that seeing it is seeing *its*
 /// namespace rather than a coincidence.
 const INNER: &str = "/tmp/t-ns-setns-inner";
@@ -114,13 +114,19 @@ fn main() {
         .unwrap_or_default();
     let mut sorted = names.clone();
     sorted.sort();
-    // Three now: PID joined the directory when the numbers became a namespace
-    // (§6.3's third rung). The list is the kernel's claim about what it can
-    // isolate, so a set written down here drifts the moment it grows - which is
-    // why the probe below is the *complete* list rather than a spot check.
+    // Four now: PID then NET joined the directory as the ladder built them
+    // (§6.3). The list is the kernel's claim about what it can isolate, so a set
+    // written down here drifts the moment it grows - which is why the probe below
+    // is the *complete* list rather than a spot check.
     r.check(
-        "the ns directory names the three namespaces this kernel has",
-        sorted == vec!["mnt".to_string(), "pid".to_string(), "uts".to_string()],
+        "the ns directory names the four namespaces this kernel has",
+        sorted
+            == vec![
+                "mnt".to_string(),
+                "net".to_string(),
+                "pid".to_string(),
+                "uts".to_string(),
+            ],
     );
 
     let mnt_link = readlink("/proc/self/ns/mnt");
@@ -153,7 +159,7 @@ fn main() {
     );
     // The names this machine has no namespace for are the same answer a real
     // kernel gives for the ones it was built without: no entry at all.
-    for absent in ["net", "ipc", "user", "cgroup", "time"] {
+    for absent in ["ipc", "user", "cgroup", "time"] {
         let path = format!("/proc/self/ns/{absent}");
         r.check(
             &format!("a namespace this kernel has not is ENOENT ({absent})"),
@@ -199,12 +205,12 @@ fn main() {
         setns(raw, CLONE_NEWNS | CLONE_NEWUTS) == -22,
     );
     r.check(
-        // The word is `CLONE_NEWNET`: a member of the namespace vocabulary this
+        // The word is `CLONE_NEWIPC`: a member of the namespace vocabulary this
         // machine has no descriptor for, so the bit cannot match the kind the
-        // descriptor names. It was `CLONE_NEWPID` until PID landed, which is
-        // the same drift a hardcoded served set always has.
+        // descriptor names. It has moved once per rung built (PID, then NET),
+        // which is the drift a hardcoded served set always has.
         "setns with a word that names another namespace is EINVAL",
-        setns(raw, CLONE_NEWNET) == -22,
+        setns(raw, CLONE_NEWIPC) == -22,
     );
     r.check(
         "setns with a bit nobody knows is EINVAL",

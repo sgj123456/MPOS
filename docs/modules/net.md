@@ -51,7 +51,7 @@ wire before the machine owns an address.
 
 | File | What lives there |
 |---|---|
-| `mod.rs` | The `Stack` (both fabrics, the `entries` registry, the `listeners` pool, the `teardown` list, the `waiters` list), `Channel`/`Home`/`Entry`/`SockOpts`, `init`, `service`, `irq_service`, `subscribe`/`unsubscribe`/`wake_waiters`, `alloc_socket`/`adopt_socket`/`with`/`with_stack`, and the rtnetlink write-side helpers the ioctl/link calls drive |
+| `mod.rs` | The `Stack` (the `eth` **`Wire`** and the `lo` fabric, the `entries` registry, the `listeners` pool, the `teardown` list, the `waiters` list), `Channel`/`Home`/`Entry`/`SockOpts`, `init`, `service`, `irq_service`, `subscribe`/`unsubscribe`/`wake_waiters`, `alloc_socket`/`adopt_socket`/`with`/`with_stack`, and the rtnetlink write-side helpers the ioctl/link calls drive. The **network namespaces**: `mint_namespace` and the `NAMESPACES` registry of stacks keyed by the number `vfs::ns` minted, `Stack::deviceless()` (a namespace's own stack: `lo`, and no wire), and the `Wire` whose device and interface are optional while its socket set is not - a namespace has `lo` and no `eth0`, which is the difference the link dump keeps with `LinkFacts::eth_present` |
 | `socket.rs` | The socket syscalls (`handle_socket`, `handle_bind`, `handle_connect`, `handle_listen`, `handle_accept`/`accept4`, `handle_sendto`/`handle_sendmsg`/`handle_sendmmsg`, `handle_recvfrom`/`handle_recvmsg`/`handle_recvmmsg`, `handle_shutdown`, `handle_getsockname`/`handle_getpeername`, `handle_setsockopt`/`handle_getsockopt`, `handle_socketpair`), and the `SocketInode`/`NlRouteInode` `Inode` impls that carry a socket through the fd table |
 | `unix.rs` | `AF_UNIX`: the `UnixSock`, the bind table keyed on node identity `(dev, ino)`, `listen`/`connect`/`accept_once`, the datagram queue, `SCM_RIGHTS`, `SO_PEERCRED`/`SO_PASSCRED`, and `unbind_node` |
 | `rtnl.rs` | The route half of `AF_NETLINK`: `RTM_GET*` dumps built from the live stack and `RTM_NEW*/DEL*/SET*` mutations parsed and applied to it |
@@ -75,7 +75,16 @@ becoming readable) wake a listener that no frame will ever reach.
 
 The registry contract is the handle: `alloc_socket`, `adopt_socket`, `with` and
 `with_stack` index `Stack.entries`, and every syscall resolves an fd back through
-`socket_handle()` on the `Inode` (`SocketInode`/`NlRouteInode`). The invariant
+`socket_handle()` on the `Inode` (`SocketInode`/`NlRouteInode`). **Every one of those four
+doors resolves the caller's network namespace's stack** (`with_stack`, which a task with no
+namespace of its own resolves to the machine's) - a socket is registered in the stack its
+operations will look for it in, and the machine's own stack is reached only by
+`with_machine_stack` and `init`. What that does *not* cover is a socket the caller did not
+make: a descriptor inherited across a namespace boundary, so `clone(CLONE_NEWNET)` is refused
+for a caller that already holds one (`socket::holds_a_socket`, asked through
+`socket_handle`) and an `SCM_RIGHTS` handover sent from another namespace is dropped with
+`MSG_CTRUNC` instead of delivered into the wrong stack. The step that lifts both is the
+registry moving out of the stack and carrying its namespace (`docs/notes/` §6.3). The invariant
 that holds it together is that a socket belongs to exactly one `Home` from the
 first address-naming call, and that `close(2)` unbinds the descriptor immediately
 while teardown still rides the wire via the bounded `teardown` list. The socket

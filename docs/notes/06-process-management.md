@@ -179,6 +179,12 @@ and properly, rather than twice. The semantics to hold, none of them optional:
 must be per-namespace, which means the pid directory for a process is a
 different name in two namespaces that both can see it.
 
+**NET landed in part, and the part it refuses is written down beside it.** The fourth rung is
+served for the one shape the design named first: **`clone(CLONE_NEWNET)` gives the child a stack of
+its own** - `lo` and nothing else, a port space the machine's cannot see, and no wire. Three things
+are refused by name, all with the same root; and the root is a measurement that came out of the
+attempt itself.
+
 **NET's first step, measured: a socket has to remember its namespace.** Designing the fourth
 rung turned up a constraint that reorders it, and it is worth having in writing before anyone
 starts. Two readings of `net`:
@@ -227,8 +233,59 @@ namespace, and `with(handle)` resolves the stack *from the entry* rather than fr
 because the caller's namespace is not where an inherited descriptor's socket lives. That last
 point has a second face the clone precondition does not cover: `SCM_RIGHTS` can hand a socket
 descriptor to a task in another namespace, and nothing in the sender's or the receiver's flags says
-so. The working attempt is kept beside this note in `.workbuddy/netns/` (its diff and its pin), so
-the next pass starts from a shape that boots up to the boundary rather than from a blank page. The rest
+so.
+
+**What landed on the near side of that boundary, and how the four doors were made to agree.** The
+attempt above panicked because `alloc_socket` and `with(handle)` reached the machine's stack while
+`bind`/`listen`/`connect` went through `with_stack`. The landed fix is the other direction from
+the registry step: **every door that acts on a descriptor resolves the caller's namespace's
+stack** - `with`, `alloc_socket`, `adopt_socket` and `free_entry` joined `with_stack`, and the
+machine's own stack is now reached only by `with_machine_stack` (the init namespace) and `init`
+itself. That closes the two-stacks-for-one-socket hole for every socket a task can *make*.
+
+Two things a task can hold that it did not make are then refused by name, because for those the
+caller's namespace is *not* the socket's:
+
+* a **`clone(CLONE_NEWNET)` from a caller that already holds a socket** is `EOPNOTSUPP`. The
+  question is asked with `Inode::socket_handle` (`net::socket::holds_a_socket`), and the pin is
+  what corrected the first draft: a socket inode's `NodeKind` is `CharDev`, not `Socket`, so the
+  check as first written passed every descriptor and the clone went through - the child re-ran the
+  test body, which is how the log showed every claim twice.
+* a descriptor **handed across a namespace** by `SCM_RIGHTS` is dropped, and the reader is told
+  the way Linux tells a reader whose control data did not fit: **`MSG_CTRUNC`**. The sender's
+  namespace rides with the handover (the `Scm` record in `vfs/pipe.rs`) because neither side knows
+  both facts at one moment - and the descriptors are closed rather than queued, since they can
+  never become deliverable and a stream that re-reported them would never let the reader past
+  them.
+
+**Two divergences the pin pinned, both with their reason.** A fresh namespace's **`lo` comes up
+carrying `127.0.0.1/8`**, where Linux's starts down and unaddressed - because this kernel answers
+`EOPNOTSUPP` to `RTM_NEWADDR` naming `lo` (its one address is the kernel's, not a caller's to
+change), so a namespace whose loopback started empty could never be given one and its private
+network would be unusable rather than private. The pin holds both halves: the child's loopback
+answers, and the request that would add the address is refused. And **`ip link set eth0 up` inside
+a namespace is `ENODEV`**, because there is no device at that index - a namespace has no wire, and
+moving one in is `ip link set ... netns`, which this kernel has no place for.
+
+**Gate.** x86_64 `=== SUMMARY pass=173 fail=0 (173 built)` with the kernel's own
+`mpos-kunit 32 passed, 0 failed` and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32
+cases, exit 0. Each arm is one higher than the commit before this one, which is the new pin
+(`t-ns-net`, twelve claims) joining both default sweeps. Host suites: 537 in the kernel, 7 in
+`mpos-pidns`, 6 in `mpos-abi`, 121 in `xtask`; clippy reports 0 errors on `x86_64-unknown-none`,
+`aarch64-unknown-none`, the host lib and the touched leaf crates; `cargo xtask depgraph` is within
+the ratchet. Three references were added inside *existing* edges - three to `net -> sched` (the
+namespace lookup, and the sender/receiver comparisons in the handover) and one to `net -> vfs`
+(`vfs::ns::machine_net_id`) - so no edge is new and `ARCHITECTURE.md` §2's recorded weights stay
+the snapshot they are dated (`2026-10-02`), which this change does not re-measure.
+
+**Named gaps, each with what it waits on.** The registry step, which lifts all three refusals and
+the handover divergence at once (a `struct sock` holding its `sk_net` is what Linux has and this
+kernel does not - 41 references, all inside `socket.rs`/`mod.rs`/`rtnl.rs`). A device cannot move
+into a namespace. A namespace's stack is never freed. And **AF_UNIX's registry and vsock's own
+stack stay machine-wide**, which is what made the pin's cross-namespace handover possible at all;
+keying those is the follow-up after the registry step. The attempt's own working tree, its pin and
+its plan are in `.workbuddy/netns/` (gitignored), and the shape that survived is the one described
+here. The rest
 of NET's design (one opaque `net_ns: Option<u64>` on `Task` rather than an `Arc` object, so that
 `sched` does not name `net` and turn the existing `net -> sched` recall edge into a mutual pair; the
 machine's own network namespace number minted in `vfs::ns`, which both layers may name; a fresh

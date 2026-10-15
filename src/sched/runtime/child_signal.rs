@@ -490,6 +490,29 @@ pub fn current_uts() -> Arc<crate::uts::Uts> {
 /// One read per caller, lock held only to clone an `Arc`, exactly like
 /// [`current_uts`] - and the same reason: the caller may format strings after
 /// this returns, which allocates, which must not happen under the table lock.
+/// The network namespace the running task resolves through, or `None` for the
+/// machine's own.
+///
+/// A plain number, not the object: `net` names `sched` (it wakes the tasks parked
+/// on a socket), so `sched` returning a `net` type would make the dependency
+/// mutual - and `net` is the layer that resolves this number to a stack, which is
+/// the only place the stack needs to exist.
+#[cfg(target_os = "none")]
+pub fn current_net_ns() -> Option<u64> {
+    with_table(|t| t.task(t.current).net_ns)
+}
+
+/// Move the running task into a network namespace: the `clone(CLONE_NEWNET)`
+/// child's own assignment (the stack itself is `net`'s, minted before this is
+/// called, because the scheduler may not name that layer).
+#[cfg(target_os = "none")]
+pub fn set_net_ns(ns: Option<u64>) {
+    with_table(|t| {
+        let me = t.current;
+        t.task_mut(me).net_ns = ns;
+    });
+}
+
 #[cfg(target_os = "none")]
 pub fn current_diskstat() -> bool {
     with_table(|t| t.task(t.current).uts.diskstat())
@@ -564,6 +587,12 @@ pub fn ns_of(pid: usize, kind: crate::vfs::ns::Kind) -> Option<crate::vfs::ns::N
             // `/proc/self/ns/pid` a no-op that still means "my children stay
             // where they are".
             crate::vfs::ns::Kind::Pid => crate::vfs::ns::Namespace::Pid(task.pid_ns.clone()),
+            // A task in the machine's namespace holds no number of its own, so
+            // the link names the machine's - minted in the identity layer, which
+            // both this layer and `net` may name.
+            crate::vfs::ns::Kind::Net => crate::vfs::ns::Namespace::Net(
+                task.net_ns.unwrap_or_else(crate::vfs::ns::machine_net_id),
+            ),
         })
     })
 }

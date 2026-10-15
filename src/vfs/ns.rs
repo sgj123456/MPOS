@@ -21,9 +21,9 @@
 //! and the tests that pin both.
 //!
 //! **What is not here**: the namespace *objects*. A [`Namespace`] names one of
-//! the three this kernel has (the mount table, the numbers and the names) as a
-//! handle to the value itself, because `setns` joins the object rather than
-//! copying it -
+//! the four this kernel has (the mount table, the numbers, the names and the
+//! network stack) as a handle to the value itself, because `setns` joins the
+//! object rather than copying it -
 //! Linux's `mntns_install`/`utsns_install` point the caller at the namespace
 //! the descriptor holds, which is what makes a `setns` different from an
 //! `unshare`. The kinds this kernel does not implement have no entry at all in
@@ -38,7 +38,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The kinds `/proc/<pid>/ns` names here.
 ///
-/// Three of Linux's ten, and the three the ladder has built (§6.3). The rest are
+/// Four of Linux's ten, and the four the ladder has built (§6.3). The rest are
 /// absent, which is the honest surface: a kernel built without a namespace has
 /// no entry for it either (`/proc/self/ns/time` is `ENOENT` on a machine whose
 /// `CONFIG_TIME_NS` is off), so a reader sees a machine that has these two and
@@ -56,6 +56,16 @@ pub enum Kind {
     Pid,
     /// `CLONE_NEWUTS`: the names `uname(2)` reports.
     Uts,
+    /// `CLONE_NEWNET`: the network stack a task resolves and binds through.
+    ///
+    /// The one kind whose handle is a *number* rather than an object here: the
+    /// stacks live in `net`'s own registry, keyed by this number, because a
+    /// `sched` holding an `Arc<NetNs>` would have to name `net` - and `net`
+    /// already names `sched` (it wakes tasks), so that is a mutual dependency the
+    /// design does not have (`ARCHITECTURE.md` §2/§3; the ratchet in
+    /// `cargo xtask depgraph` counts those pairs). The number is the identity
+    /// either way, and this is where the identity layer keeps it.
+    Net,
 }
 
 impl Kind {
@@ -63,6 +73,7 @@ impl Kind {
     pub const fn name(self) -> &'static str {
         match self {
             Kind::Mount => "mnt",
+            Kind::Net => "net",
             Kind::Pid => "pid",
             Kind::Uts => "uts",
         }
@@ -75,6 +86,7 @@ impl Kind {
     pub const fn flag(self) -> usize {
         match self {
             Kind::Mount => crate::abi::CLONE_NEWNS,
+            Kind::Net => crate::abi::CLONE_NEWNET,
             Kind::Pid => crate::abi::CLONE_NEWPID,
             Kind::Uts => crate::abi::CLONE_NEWUTS,
         }
@@ -84,6 +96,7 @@ impl Kind {
     pub fn of_flag(bit: usize) -> Option<Kind> {
         match bit {
             b if b == crate::abi::CLONE_NEWNS => Some(Kind::Mount),
+            b if b == crate::abi::CLONE_NEWNET => Some(Kind::Net),
             b if b == crate::abi::CLONE_NEWPID => Some(Kind::Pid),
             b if b == crate::abi::CLONE_NEWUTS => Some(Kind::Uts),
             _ => None,
@@ -95,6 +108,7 @@ impl Kind {
     pub fn of_name(name: &str) -> Option<Kind> {
         match name {
             "mnt" => Some(Kind::Mount),
+            "net" => Some(Kind::Net),
             "pid" => Some(Kind::Pid),
             "uts" => Some(Kind::Uts),
             _ => None,
@@ -102,10 +116,10 @@ impl Kind {
     }
 
     /// Every kind, in the order the directory lists them (Linux lists its ten
-    /// in name order; these three are `mnt`, `pid`, `uts` for the same reason -
-    /// measured on a current host, where `/proc/self/ns` lists all ten
+    /// in name order; these four are `mnt`, `net`, `pid`, `uts` for the same
+    /// reason - measured on a current host, where `/proc/self/ns` lists all ten
     /// alphabetically).
-    pub const ALL: &'static [Kind] = &[Kind::Mount, Kind::Pid, Kind::Uts];
+    pub const ALL: &'static [Kind] = &[Kind::Mount, Kind::Net, Kind::Pid, Kind::Uts];
 }
 
 /// A namespace, as the object a descriptor holds and `setns` joins.
@@ -119,6 +133,8 @@ impl Kind {
 #[derive(Clone)]
 pub enum Namespace {
     Mount(Arc<crate::vfs::mount::MountTable>),
+    /// A network namespace, by the number `net` knows its stack by.
+    Net(u64),
     Pid(Arc<crate::pidns::PidNs>),
     Uts(Arc<crate::uts::Uts>),
 }
@@ -127,6 +143,7 @@ impl Namespace {
     pub fn kind(&self) -> Kind {
         match self {
             Namespace::Mount(_) => Kind::Mount,
+            Namespace::Net(_) => Kind::Net,
             Namespace::Pid(_) => Kind::Pid,
             Namespace::Uts(_) => Kind::Uts,
         }
@@ -136,6 +153,7 @@ impl Namespace {
     pub fn id(&self) -> u64 {
         match self {
             Namespace::Mount(table) => table.ns_id(),
+            Namespace::Net(ns_id) => *ns_id,
             Namespace::Pid(pidns) => pidns.ns_id(),
             Namespace::Uts(uts) => uts.ns_id(),
         }
@@ -151,6 +169,27 @@ impl Namespace {
 /// `readlink` answers (measured above).
 pub fn link_text(kind: Kind, id: u64) -> String {
     format!("{}:[{}]", kind.name(), id)
+}
+
+/// The machine's own network namespace, minted on first use from the same pool
+/// as every other kind's.
+///
+/// It lives *here* rather than in `net` because two layers need it and neither
+/// may name the other: `/proc/<pid>/ns/net` is `sched`'s to answer (for a task in
+/// the machine's namespace, which holds no number of its own), and the stack the
+/// number keys is `net`'s to keep. `sched` names `vfs` and `net` names `vfs`, so
+/// the identity belongs with the pool - which is where every other namespace's
+/// number is minted anyway.
+static MACHINE_NET_ID: AtomicU64 = AtomicU64::new(0);
+
+pub fn machine_net_id() -> u64 {
+    let id = MACHINE_NET_ID.load(Ordering::Relaxed);
+    if id != 0 {
+        return id;
+    }
+    let fresh = mint();
+    MACHINE_NET_ID.store(fresh, Ordering::Relaxed);
+    fresh
 }
 
 /// The pool every kind's numbers come from.
@@ -187,9 +226,11 @@ mod tests {
         assert_eq!(Kind::of_name("uts"), Some(Kind::Uts));
         assert_eq!(link_text(Kind::Pid, 4026531836), "pid:[4026531836]");
         assert_eq!(Kind::of_name("pid"), Some(Kind::Pid));
+        assert_eq!(link_text(Kind::Net, 4026531833), "net:[4026531833]");
+        assert_eq!(Kind::of_name("net"), Some(Kind::Net));
         // A kind this kernel does not have is not recoverable from a word: the
         // entry does not exist, which is the whole refusal.
-        assert_eq!(Kind::of_name("net"), None);
+        assert_eq!(Kind::of_name("ipc"), None);
     }
 
     #[test]
@@ -209,8 +250,10 @@ mod tests {
             assert_eq!(Kind::of_name(kind.name()), Some(*kind));
         }
         // A bit that is a namespace and not one of these is *not* a kind: the
-        // caller hears their own word back rather than a wrong namespace.
-        assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWNET), None);
+        // caller hears their own word back rather than a wrong namespace. The
+        // vocabulary is down to the kinds this kernel still has no copy of.
+        assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWIPC), None);
+        assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWUSER), None);
         assert_eq!(Kind::of_flag(0), None);
         assert_eq!(Kind::of_flag(0x1000), None);
     }
