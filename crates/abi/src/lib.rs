@@ -294,7 +294,16 @@ pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isi
     if asked & CLONE_NEWPID != 0 && flags & (CLONE_THREAD | CLONE_PARENT) != 0 {
         return Err(mpos_err::EINVAL);
     }
-    if asked != 0 && !privileged {
+    // `CLONE_NEWUSER` is exempt from the capability gate here for the same
+    // measured reason it is exempt in `unshare`: making a user namespace needs no
+    // capability, because it *is* the grant. This kernel does not serve it
+    // through `clone` yet (the child-side creation is the piece of the rung that
+    // is named and not built, §6.3), so the answer below is `EOPNOTSUPP` for
+    // privileged and unprivileged callers alike - the honest "present, cannot do
+    // that" rather than an `EPERM` that would send the caller looking for a
+    // capability which would not help.
+    let gated = asked & !CLONE_NEWUSER;
+    if gated != 0 && !privileged {
         return Err(mpos_err::EPERM);
     }
     // `CLONE_NEWTIME` is deliberately **not** ruled on here, and the reason is

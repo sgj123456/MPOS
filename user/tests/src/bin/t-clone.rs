@@ -323,7 +323,9 @@ fn main() {
     // starts a child in a namespace of its own, and `clone(CLONE_NEWNET)` gives
     // one a stack of its own. Their pins are `t-ns-pid` and `t-ns-net` - one
     // program per rung of §6.3's ladder - and what is left here is what this
-    // kernel still has nothing behind.
+    // kernel does not serve *through `clone`*: USER is built, but its child-side
+    // creation is the piece of the rung that is named and not built, so the door
+    // is refused by name rather than with a wrong errno.
     let names: &[(&str, usize)] = &[
         ("IPC", libc::CLONE_NEWIPC as usize),
         ("USER", libc::CLONE_NEWUSER as usize),

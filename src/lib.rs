@@ -321,6 +321,7 @@ pub use mpos_timens as timens;
 /// one constant - the size of a `struct input_event`, the unit both families
 /// read and write. The device that uses it is bare metal.
 pub use mpos_uinput as uinput;
+pub use mpos_userns as userns;
 /// The UTS namespace: the two names `uname(2)` reports, as the object a task
 /// holds rather than as a pair of machine-wide strings. Its own leaf crate
 /// (*ownership* over two `String`s); the task table that decides whose

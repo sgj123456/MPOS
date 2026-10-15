@@ -1,0 +1,27 @@
+# The user namespace: the table an id is translated through at every boundary.
+#
+# Not "three fields on the task" for the same reason `crates/timens` is a crate:
+# what earns it one is the **file grammar** - `/proc/<pid>/uid_map`,
+# `gid_map` and `setgroups` are three little parsers with three little rule
+# sets, and a parser is argued with by host tests rather than by booting a
+# machine. The number the namespace is known by is minted by `src/vfs/ns.rs` and
+# given in here, never made by this crate.
+[package]
+name = "mpos-userns"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The errno table: the three map files answer with negated errnos (`EPERM` for a
+# second write or a foreign id, `EINVAL` for text the grammar refuses), and those
+# are the leaf's answers rather than strings the syscall layer maps back.
+mpos-err = { path = "../err" }
+
+[target.'cfg(target_os = "none")'.dependencies]
+critical-section = { version = "1.2", features = ["restore-state-bool"] }
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+critical-section = { version = "1.2", features = ["std"] }
+
+[lints]
+workspace = true

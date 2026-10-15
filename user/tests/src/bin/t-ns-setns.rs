@@ -26,8 +26,9 @@
 //!   `lseek` is `ESPIPE` — and whose `fstat().st_ino` (148898) is *not* the
 //!   number the link reports, so the text is what a reader uses as identity;
 //! * `setns(fd, nstype)` answers `EINVAL` when the word is a *sibling* kind's
-//!   bit, when it is **two** bits at once, and when it is no namespace bit at
-//!   all (`0x10000000`) — all three `-22`, not `EPERM`;
+//!   bit, when it is **two** bits at once, and when it names a kind the
+//!   descriptor does not (`0x10000000`, `CLONE_NEWUSER`) — all three `-22`, not
+//!   `EPERM`;
 //! * a descriptor that is not a namespace is `EINVAL` (measured with a pipe, a
 //!   plain file and a directory), a number that names nothing is `EBADF`, and
 //!   `/proc/<pid>/ns/mnt` for a pid that does not exist is `ENOENT`;
@@ -114,13 +115,14 @@ fn main() {
         .unwrap_or_default();
     let mut sorted = names.clone();
     sorted.sort();
-    // Seven names now: TIME joined the directory as the ladder's fifth rung,
-    // and PID and TIME each brought the `_for_children` spelling of their slot
-    // with them (§6.3). The list is the kernel's claim about what it can
-    // isolate, so a set written down here drifts the moment it grows - which is
-    // why the probe below is the *complete* list rather than a spot check.
+    // Eight names now: USER joined the directory as the ladder's sixth rung, and
+    // it brought *one* name rather than two because it moves its caller where PID
+    // and TIME each have a `_for_children` slot (§6.3). The list is the kernel's
+    // claim about what it can isolate, so a set written down here drifts the
+    // moment it grows - which is why the probe below is the *complete* list rather
+    // than a spot check.
     r.check(
-        "the ns directory names the five namespaces this kernel has, seven names",
+        "the ns directory names the six namespaces this kernel has, eight names",
         sorted
             == vec![
                 "mnt".to_string(),
@@ -129,6 +131,7 @@ fn main() {
                 "pid_for_children".to_string(),
                 "time".to_string(),
                 "time_for_children".to_string(),
+                "user".to_string(),
                 "uts".to_string(),
             ],
     );
@@ -163,9 +166,10 @@ fn main() {
     );
     // The names this machine has no namespace for are the same answer a real
     // kernel gives for the ones it was built without: no entry at all. This list
-    // has shrunk once per rung - TIME left it with the fifth, and it is the one
-    // whose *entry* the `t-ns-time` pin walks end to end.
-    for absent in ["ipc", "user", "cgroup"] {
+    // has shrunk once per rung - TIME left it with the fifth (the `t-ns-time` pin
+    // walks that entry end to end) and USER with the sixth (`t-ns-user` does the
+    // same for its own).
+    for absent in ["ipc", "cgroup"] {
         let path = format!("/proc/self/ns/{absent}");
         r.check(
             &format!("a namespace this kernel has not is ENOENT ({absent})"),
@@ -213,13 +217,14 @@ fn main() {
     r.check(
         // The word is `CLONE_NEWIPC`: a member of the namespace vocabulary this
         // machine has no descriptor for, so the bit cannot match the kind the
-        // descriptor names. It has moved once per rung built (PID, then NET),
-        // which is the drift a hardcoded served set always has.
+        // descriptor names. It has moved once per rung built (PID, then NET,
+        // then TIME, then USER), which is the drift a hardcoded served set
+        // always has.
         "setns with a word that names another namespace is EINVAL",
         setns(raw, CLONE_NEWIPC) == -22,
     );
     r.check(
-        "setns with a bit nobody knows is EINVAL",
+        "setns with a bit that names a kind the descriptor is not is EINVAL",
         setns(raw, 0x1000_0000) == -22,
     );
     r.check(

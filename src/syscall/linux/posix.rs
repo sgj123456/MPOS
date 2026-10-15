@@ -50,26 +50,43 @@ fn live_thread(pid: isize) -> Option<usize> {
 /// stays, spelled the way the C headers spell `-1`.
 const NO_ID: usize = usize::MAX;
 
+/// The id a stored one reads back as for the running task.
+///
+/// Every `getuid`-family answer goes through here, and so will every other
+/// observation of an id. The stored ids on a task are in the **parent**
+/// namespace's numbering (the kernel keeps one id and the namespace translates
+/// it), so a task in the machine's namespace - the identity map - reads its ids
+/// unchanged, and a task that has just `unshare(CLONE_NEWUSER)`'d into a
+/// namespace with an empty table reads `65534` for everything until it writes
+/// `/proc/self/uid_map` (§6.3).
+fn shown_uid(stored: u32) -> u32 {
+    crate::sched::current_user_ns().uid_to_inner(stored)
+}
+
+fn shown_gid(stored: u32) -> u32 {
+    crate::sched::current_user_ns().gid_to_inner(stored)
+}
+
 /// `getuid()` — the real user id: who the process was started as, rather
-/// than who it is acting as now.
+/// than who it is acting as now, as the caller's user namespace shows it.
 pub fn handle_getuid(_args: [usize; ARG_COUNT]) -> isize {
-    crate::sched::current_identity().ruid as isize
+    shown_uid(crate::sched::current_identity().ruid) as isize
 }
 
 /// `geteuid()` — the effective user id: who privilege checks act as, and the
 /// word every `setuid`-family permission rule branches on.
 pub fn handle_geteuid(_args: [usize; ARG_COUNT]) -> isize {
-    crate::sched::current_identity().euid as isize
+    shown_uid(crate::sched::current_identity().euid) as isize
 }
 
 /// `getgid()` — the real group id.
 pub fn handle_getgid(_args: [usize; ARG_COUNT]) -> isize {
-    crate::sched::current_identity().rgid as isize
+    shown_gid(crate::sched::current_identity().rgid) as isize
 }
 
 /// `getegid()` — the effective group id.
 pub fn handle_getegid(_args: [usize; ARG_COUNT]) -> isize {
-    crate::sched::current_identity().egid as isize
+    shown_gid(crate::sched::current_identity().egid) as isize
 }
 
 /// `setuid(uid)` — one id with two meanings, decided by the caller's
@@ -1155,6 +1172,17 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
             {
                 return crate::err::EINVAL;
             }
+            if bits & crate::syscall::linux::nr::CLONE_NEWUSER != 0 {
+                // **The caller moves into a fresh, empty user namespace** - the
+                // shape NET above has, and the one kind whose creation asks for no
+                // capability at all (making one *is* the grant). It moves `bits`
+                // out of the way of the kinds below by being first, which mirrors
+                // Linux's own order (`create_new_namespaces` builds the user
+                // namespace before the rest). The maps start empty, so the caller
+                // reads the overflow id for everything until it writes
+                // `/proc/self/uid_map` (§6.3).
+                crate::sched::unshare_user();
+            }
             if bits & crate::syscall::linux::nr::CLONE_NEWUTS != 0 {
                 crate::sched::unshare_uts();
             }
@@ -1264,6 +1292,18 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
         // asymmetry `setns` has against `/proc/<pid>/ns/pid`, where the
         // descriptor answers the *own* slot instead.
         crate::vfs::ns::Namespace::Time(ns) => crate::sched::setns_time(ns),
+        // Joining a user namespace moves the caller into it, and both measured
+        // halves live below this line: joining the one the caller is *already*
+        // in is `EINVAL` rather than the no-op `0` every other kind gives (the
+        // scheduler answers that, since only it can compare two namespace
+        // objects), and a namespace whose owner the caller has no
+        // `CAP_SYS_ADMIN` over is out of reach - which here reduces to the
+        // capability this function already asked for above.
+        crate::vfs::ns::Namespace::User(ns) => {
+            if let Err(e) = crate::sched::setns_user(ns) {
+                return e;
+            }
+        }
     }
     0
 }

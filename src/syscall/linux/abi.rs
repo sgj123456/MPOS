@@ -1393,16 +1393,25 @@ pub(crate) fn unshare_verdict(
         | n::CLONE_THREAD
         | n::CLONE_SYSVSEM;
 
-    /// The namespace kinds this kernel can isolate observably. Five now — the
+    /// The namespace kinds this kernel can isolate observably. Six now — the
     /// names, the mount table (`t-ns-mnt` holds MNT's "child differs *and* the
     /// parent does not"), the **numbers** (`t-ns-pid`, which holds the same
     /// pair for a pid: the child's `getpid` is 1 and `/proc/1` is that child,
-    /// while the parent's number is unchanged), the **wire** (`t-ns-net`) and
-    /// the **clocks** (`t-ns-time`, where the pair is the caller's own reading
-    /// unmoved and its child's reading offset). The build order and the reason
-    /// for it are the plan's §6.3; TIME is the fifth rung of that ladder.
-    const SERVED: usize =
-        n::CLONE_NEWUTS | n::CLONE_NEWNS | n::CLONE_NEWPID | n::CLONE_NEWNET | n::CLONE_NEWTIME;
+    /// while the parent's number is unchanged), the **wire** (`t-ns-net`), the
+    /// **clocks** (`t-ns-time`, where the pair is the caller's own reading
+    /// unmoved and its child's reading offset) and the **ids** (`t-ns-user`,
+    /// where the pair is the caller's `getuid` reading the overflow id in a fresh
+    /// empty namespace and the id it mapped once the table is written). The build
+    /// order and the reason for it are the plan's §6.3; USER is the sixth rung.
+    ///
+    /// NET is in the word but has no `EOPNOTSUPP` left to carry: the caller
+    /// asks for a fresh namespace here and [`handle_unshare`] mints one.
+    const SERVED: usize = n::CLONE_NEWUTS
+        | n::CLONE_NEWNS
+        | n::CLONE_NEWPID
+        | n::CLONE_NEWNET
+        | n::CLONE_NEWTIME
+        | n::CLONE_NEWUSER;
 
     // `CAP_SYS_ADMIN` is the gate on every privileged namespace kind, asked
     // of the caller's *effective capability set* — the question the credential
@@ -1430,7 +1439,16 @@ pub(crate) fn unshare_verdict(
     // copy). A caller without `CAP_SYS_ADMIN` gets the permission answer for
     // *any* namespace word, even one this kernel would refuse on capability
     // grounds anyway; measuring it is what pinned the direction.
-    if asked != 0 && !privileged {
+    //
+    // **`CLONE_NEWUSER` is the one kind the gate does not cover**, and it is
+    // measured: on this developer's Linux an *unprivileged* caller's
+    // `unshare(CLONE_NEWUSER)` answers `0` (`probe-userns2.c`). Making a user
+    // namespace does not need a capability because it *is* the grant - inside it
+    // the caller holds the full set, which is the whole point of the kind. So the
+    // capability is asked of the other kinds and of a word that carries one of
+    // them alongside `NEWUSER`.
+    let gated = asked & !n::CLONE_NEWUSER;
+    if gated != 0 && !privileged {
         return Err(err::EPERM);
     }
     if asked & !SERVED != 0 {
@@ -3352,30 +3370,51 @@ mod tests {
             Ok(n::CLONE_NEWUTS | n::CLONE_NEWNS)
         );
 
-        // The fifth rung: `unshare(CLONE_NEWTIME)` arms the caller's *children*
-        // slot, which is the handler's job (`sched::unshare_time`) and not this
-        // verdict's - the bit is granted here because the kernel has a namespace
-        // to hand the next child, and *which* slot it goes into is a fact about
-        // the task table rather than about the word. The whole served set is one
-        // word, too: nothing about any of the five gates another.
-        let all_five =
-            n::CLONE_NEWUTS | n::CLONE_NEWNS | n::CLONE_NEWPID | n::CLONE_NEWNET | n::CLONE_NEWTIME;
+        // The sixth rung: `unshare(CLONE_NEWUSER)`, and **the bit that needs no
+        // capability** - the one place the privilege gate does not reach, because
+        // making a user namespace *is* the grant. Measured: an unprivileged
+        // caller's `unshare(CLONE_NEWUSER)` answers `0` (§6.3). That is why the
+        // word is `Ok` for a caller with no `CAP_SYS_ADMIN` as well as for root.
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWUSER, true, false),
+            Ok(n::CLONE_NEWUSER)
+        );
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWUSER, false, false),
+            Ok(n::CLONE_NEWUSER),
+            "the one kind the capability gate does not cover"
+        );
+        // ...but a word mixing it with a gated kind still needs the capability
+        // for the gated half, so the whole word is refused.
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWUSER | n::CLONE_NEWUTS, false, false),
+            Err(err::EPERM)
+        );
+
+        // The whole served set is one word, too: nothing about any of the six
+        // gates another.
+        let all_six = n::CLONE_NEWUTS
+            | n::CLONE_NEWNS
+            | n::CLONE_NEWPID
+            | n::CLONE_NEWNET
+            | n::CLONE_NEWTIME
+            | n::CLONE_NEWUSER;
         assert_eq!(
             unshare_verdict(n::CLONE_NEWTIME, true, false),
             Ok(n::CLONE_NEWTIME)
         );
-        assert_eq!(unshare_verdict(all_five, true, false), Ok(all_five));
+        assert_eq!(unshare_verdict(all_six, true, false), Ok(all_six));
 
-        // The four this kernel has nothing behind, so it refuses them whole
+        // The two this kernel has nothing behind, so it refuses them whole
         // rather than handing over a namespace whose contents are the old
         // one's. Served namespace or not, the answer is the same for privileged
         // and unprivileged callers: this is not a permissions answer.
         //
-        // PID, NET and TIME left this list when they were built, which is the
-        // shape §6.3 records over and over: a test that hardcodes the served set
-        // goes red the moment the set grows, and the *expectation* moves with
+        // PID, NET, TIME and USER left this list when they were built, which is
+        // the shape §6.3 records over and over: a test that hardcodes the served
+        // set goes red the moment the set grows, and the *expectation* moves with
         // the measurement - never the other way round.
-        for bit in [n::CLONE_NEWCGROUP, n::CLONE_NEWIPC, n::CLONE_NEWUSER] {
+        for bit in [n::CLONE_NEWCGROUP, n::CLONE_NEWIPC] {
             assert_eq!(
                 unshare_verdict(bit, true, false),
                 Err(err::EOPNOTSUPP),

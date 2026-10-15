@@ -316,6 +316,7 @@ dependencies = [
  "mpos-term",
  "mpos-timens",
  "mpos-uinput",
+ "mpos-userns",
  "mpos-uts",
  "mpos-vm",
  "rand_chacha",
@@ -471,6 +472,14 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+]
+
+[[package]]
+name = "mpos-userns"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "mpos-err",
 ]
 
 [[package]]

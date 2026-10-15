@@ -1481,6 +1481,126 @@ fn timens_offsets_ctl(pid: usize) -> Arc<dyn Inode> {
     })
 }
 
+/// The user namespace a `/proc/<pid>/uid_map`-style file belongs to.
+///
+/// Asked of the live task like [`timens_offsets_ctl`]'s, so a `unshare` a moment
+/// ago is visible to the next read, and a task that has gone answers `None`.
+#[cfg(target_os = "none")]
+fn user_ns_of(pid: usize) -> Option<Arc<crate::userns::UserNs>> {
+    /// The one slot the kind has: a user namespace moves its caller, so there is
+    /// no `user_for_children` spelling for the file to be about.
+    const SLOT: crate::vfs::ns::Entry = crate::vfs::ns::Entry {
+        kind: crate::vfs::ns::Kind::User,
+        slot: crate::vfs::ns::Slot::Own,
+    };
+    match crate::sched::ns_of(pid, SLOT) {
+        Some(crate::vfs::ns::Namespace::User(ns)) => Some(ns),
+        _ => None,
+    }
+}
+
+/// The leaf's three refusals, as the two a `VfsError` can carry.
+///
+/// The map files answer `EPERM` for a second write or an id the writer does not
+/// own, `EINVAL` for text the grammar refuses, and `EACCES` when the gid map is
+/// written before `setgroups=deny`. All three are the leaf's; this only names
+/// them.
+#[cfg(target_os = "none")]
+fn map_errno(result: Result<(), isize>) -> Result<(), VfsError> {
+    result.map_err(|e| {
+        if e == crate::err::EINVAL {
+            VfsError::Invalid
+        } else if e == crate::err::EACCES {
+            VfsError::Access
+        } else {
+            VfsError::NotPermitted
+        }
+    })
+}
+
+/// `/proc/<pid>/uid_map` and `/proc/<pid>/gid_map`: the table one side's ids are
+/// translated through.
+///
+/// One builder for both because they are the same file with two names and two
+/// capabilities behind them - `CAP_SETUID` and `CAP_SETGID` in the *parent*
+/// namespace, which is what decides whether the writer gets the one-line rule or
+/// the free one. The writer's own stored id is passed to the leaf, because that
+/// is the only id an unprivileged writer may name on the outside (§6.3), and it
+/// is the stored id and not the shown one: the outside column is the parent
+/// namespace's numbering, which is what the identity holds.
+#[cfg(target_os = "none")]
+fn uid_map_ctl(pid: usize) -> Arc<dyn Inode> {
+    map_ctl(pid, true)
+}
+
+#[cfg(target_os = "none")]
+fn gid_map_ctl(pid: usize) -> Arc<dyn Inode> {
+    map_ctl(pid, false)
+}
+
+#[cfg(target_os = "none")]
+fn map_ctl(pid: usize, uid: bool) -> Arc<dyn Inode> {
+    Arc::new(ProcCtl {
+        ino: next_ino(),
+        read: Box::new(move || {
+            user_ns_of(pid).map(|ns| {
+                if uid {
+                    ns.uid_map_text()
+                } else {
+                    ns.gid_map_text()
+                }
+            })
+        }),
+        write: Box::new(move |text: &str| {
+            let Some(ns) = user_ns_of(pid) else {
+                return Err(VfsError::NoEntry);
+            };
+            let creds = crate::sched::current_credentials();
+            let privileged = if uid {
+                creds.has_effective(crate::cred::CAP_SETUID)
+            } else {
+                creds.has_effective(crate::cred::CAP_SETGID)
+            };
+            let writer = crate::sched::current_identity().euid;
+            let result = if uid {
+                ns.write_uid_map(text, privileged, writer)
+            } else {
+                ns.write_gid_map(text, privileged, writer)
+            };
+            map_errno(result)
+        }),
+    })
+}
+
+/// `/proc/<pid>/setgroups`: whether the members may call `setgroups(2)`.
+///
+/// The file an unprivileged gid-map writer has to turn to `deny` first, which is
+/// why the gate here is *not* "root only": a process may always write its own,
+/// and that is exactly the dance `newgidmap` performs - the child denies its own
+/// supplementary groups, then the privileged helper writes the map. Anyone else
+/// needs to be root. A real kernel reaches the same two answers through the
+/// ptrace access check on `/proc/<pid>`; this kernel has the process's own
+/// number to compare, which is the same question asked of a smaller table.
+#[cfg(target_os = "none")]
+fn setgroups_ctl(pid: usize) -> Arc<dyn Inode> {
+    Arc::new(ProcCtl {
+        ino: next_ino(),
+        read: Box::new(move || {
+            user_ns_of(pid).map(|ns| alloc::string::String::from(ns.setgroups_text()))
+        }),
+        write: Box::new(move |text: &str| {
+            let Some(ns) = user_ns_of(pid) else {
+                return Err(VfsError::NoEntry);
+            };
+            let mine = crate::sched::current().0 == pid;
+            if !mine && crate::sched::current_owner().0 != 0 {
+                return Err(VfsError::Access);
+            }
+            map_errno(ns.write_setgroups(text))
+        }),
+    })
+}
+
 /// `/proc/<pid>`: the directory a process is described by.
 ///
 /// Built when the name is looked up and thrown away when the next lookup
@@ -1554,6 +1674,16 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     // for exactly this path.
     #[cfg(target_os = "none")]
     node.add("timens_offsets", NodeKind::File, timens_offsets_ctl(pid));
+    // The three files a user namespace is set up through. Linux keeps them
+    // beside one another and in this order, and the tools that write them
+    // (`newuidmap`/`newgidmap`, and every container runtime that does the work
+    // itself) look for exactly these paths.
+    #[cfg(target_os = "none")]
+    node.add("uid_map", NodeKind::File, uid_map_ctl(pid));
+    #[cfg(target_os = "none")]
+    node.add("gid_map", NodeKind::File, gid_map_ctl(pid));
+    #[cfg(target_os = "none")]
+    node.add("setgroups", NodeKind::File, setgroups_ctl(pid));
     // The image and the working directory, as links: `readlink` is the only
     // way to ask for them, and their targets are facts about a process, not
     // bytes a file holds.

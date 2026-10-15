@@ -1087,6 +1087,10 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // until it unshares.
             time_ns: Arc::clone(&child_time_ns),
             time_ns_children: child_time_ns,
+            // One value, not two: a user namespace has no children's slot, so a
+            // child is in the same one its creator is (`CLONE_NEWUSER` moves the
+            // caller, and this path is the child's side of that door being shut).
+            user_ns: Arc::clone(&t.task(parent_id).user_ns),
             // The network namespace: the creator's, unless this word asked for a
             // fresh one (`CLONE_NEWNET`, minted by the syscall layer, which is the
             // layer allowed to name `net`).
@@ -1445,6 +1449,10 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         // has a task in it (the one asking), so it was sealed before this.
         let time_ns = alloc::sync::Arc::clone(&parent.time_ns);
         let time_ns_children = alloc::sync::Arc::clone(&parent.time_ns_children);
+        // A user namespace has no children's slot, so the distinction above does
+        // not arise: a thread reads its ids through the namespace its process is
+        // in, which is this one value.
+        let user_ns = alloc::sync::Arc::clone(&parent.user_ns);
         let net_ns = parent.net_ns;
         // `CLONE_FS` is what every `pthread_create` sets: a thread that
         // `chdir`s moves its process, which is Linux's answer (measured -
@@ -1571,6 +1579,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             // ...and the same clocks, by reference, for the reason above.
             time_ns,
             time_ns_children,
+            user_ns,
             // A thread is its process: the same stack, by reference - the rule
             // `CLONE_THREAD` follows for every namespace above it (and why the
             // verdict refuses a thread with a namespace of its own).

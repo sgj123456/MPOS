@@ -58,6 +58,11 @@ pub const CAP_FULL: u64 = if CAP_LAST_CAP == 63 {
 
 /// The number of the capability `ptrace_may_access` tests for.
 pub const CAP_SYS_PTRACE: u32 = 19;
+/// `CAP_SETGID`, which an unprivileged `/proc/<pid>/gid_map` writer lacks - the
+/// capability that lifts the one-line rule there.
+pub const CAP_SETGID: u32 = 6;
+/// `CAP_SETUID`, the counterpart of [`CAP_SETGID`] for `/proc/<pid>/uid_map`.
+pub const CAP_SETUID: u32 = 7;
 /// `CAP_SETPCAP`, which `PR_CAPBSET_DROP` requires.
 pub const CAP_SETPCAP: u32 = 8;
 /// `CAP_LINUX_IMMUTABLE`, which setting or clearing the `i` and `a` inode flags

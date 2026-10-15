@@ -38,8 +38,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The kinds `/proc/<pid>/ns` names here.
 ///
-/// Five of Linux's eight kinds - seven of its ten *names*, since PID and TIME
-/// each have a `_for_children` spelling ([`Entry`]) - and the five the ladder
+/// Six of Linux's eight kinds - eight of its ten *names*, since PID and TIME
+/// each have a `_for_children` spelling ([`Entry`]) - and the six the ladder
 /// has built (§6.3). The rest are absent, which is the honest surface: a kernel
 /// built without a namespace has no entry for it either
 /// (`/proc/self/ns/time` is `ENOENT` on a machine whose `CONFIG_TIME_NS` is
@@ -75,6 +75,15 @@ pub enum Kind {
     /// through child creation and the namespace is always made by the caller
     /// that then hands it to its children.
     Time,
+    /// `CLONE_NEWUSER`: the table an id is translated through at the boundary.
+    ///
+    /// The one kind that is a *mapping* rather than a view of shared state, and
+    /// the one whose creation is itself a grant: an unprivileged caller may make
+    /// one, and the moment it does it holds the full capability set *inside*
+    /// (measured, §6.3). It moves its caller like `NET`, so it has no
+    /// `_for_children` spelling, and the object is held by `Arc` because nothing
+    /// else keys state by it.
+    User,
 }
 
 impl Kind {
@@ -86,6 +95,7 @@ impl Kind {
             Kind::Pid => "pid",
             Kind::Uts => "uts",
             Kind::Time => "time",
+            Kind::User => "user",
         }
     }
 
@@ -100,6 +110,7 @@ impl Kind {
             Kind::Pid => crate::abi::CLONE_NEWPID,
             Kind::Uts => crate::abi::CLONE_NEWUTS,
             Kind::Time => crate::abi::CLONE_NEWTIME,
+            Kind::User => crate::abi::CLONE_NEWUSER,
         }
     }
 
@@ -126,6 +137,7 @@ impl Kind {
             b if b == crate::abi::CLONE_NEWPID => Some(Kind::Pid),
             b if b == crate::abi::CLONE_NEWUTS => Some(Kind::Uts),
             b if b == crate::abi::CLONE_NEWTIME => Some(Kind::Time),
+            b if b == crate::abi::CLONE_NEWUSER => Some(Kind::User),
             _ => None,
         }
     }
@@ -140,6 +152,7 @@ impl Kind {
             "pid" | "pid_for_children" => Some(Kind::Pid),
             "uts" => Some(Kind::Uts),
             "time" | "time_for_children" => Some(Kind::Time),
+            "user" => Some(Kind::User),
             _ => None,
         }
     }
@@ -151,7 +164,14 @@ impl Kind {
     /// names each. This is the kinds alone, which is what the flag vocabulary
     /// and a reader that only wants "which namespaces does this machine have"
     /// are asking for.
-    pub const ALL: &'static [Kind] = &[Kind::Mount, Kind::Net, Kind::Pid, Kind::Time, Kind::Uts];
+    pub const ALL: &'static [Kind] = &[
+        Kind::Mount,
+        Kind::Net,
+        Kind::Pid,
+        Kind::Time,
+        Kind::User,
+        Kind::Uts,
+    ];
 }
 
 /// Which namespace *slot* of a task an entry of `/proc/<pid>/ns` reads.
@@ -209,6 +229,10 @@ impl Entry {
         Entry {
             kind: Kind::Time,
             slot: Slot::ForChildren,
+        },
+        Entry {
+            kind: Kind::User,
+            slot: Slot::Own,
         },
         Entry {
             kind: Kind::Uts,
@@ -270,6 +294,10 @@ pub enum Namespace {
     /// state by it (the offsets *are* the whole namespace), so there is no
     /// registry for a number to index and the `Arc` is the identity.
     Time(Arc<crate::timens::TimeNs>),
+    /// A user namespace, as the object for the same reason TIME's is: the maps
+    /// *are* the whole namespace, so there is nothing for a number to key and
+    /// the `Arc` is the identity.
+    User(Arc<crate::userns::UserNs>),
 }
 
 impl Namespace {
@@ -280,6 +308,7 @@ impl Namespace {
             Namespace::Pid(_) => Kind::Pid,
             Namespace::Uts(_) => Kind::Uts,
             Namespace::Time(_) => Kind::Time,
+            Namespace::User(_) => Kind::User,
         }
     }
 
@@ -291,6 +320,7 @@ impl Namespace {
             Namespace::Pid(pidns) => pidns.ns_id(),
             Namespace::Uts(uts) => uts.ns_id(),
             Namespace::Time(timens) => timens.id(),
+            Namespace::User(userns) => userns.id(),
         }
     }
 
@@ -352,6 +382,29 @@ pub fn machine_time_ns() -> Arc<crate::timens::TimeNs> {
     })
 }
 
+/// The machine's own user namespace, made on first use from the same pool.
+///
+/// The same shape as [`machine_time_ns`] and for the same reason - a task in the
+/// machine's namespace holds no namespace of its own, so `/proc/<pid>/ns/user`
+/// and the three map files all have to answer with the machine's - and the
+/// answer is an `Arc` because the maps are the whole of it.
+///
+/// It is the **identity map** (`"0 0 4294967295"`, which is what a real kernel
+/// reports here) and it is **already written**, so every id translates to itself
+/// and a write to its map is `EPERM`: the machine's ids are not a namespace's to
+/// rename.
+static MACHINE_USER: critical_section::Mutex<
+    core::cell::RefCell<Option<Arc<crate::userns::UserNs>>>,
+> = critical_section::Mutex::new(core::cell::RefCell::new(None));
+
+pub fn machine_user_ns() -> Arc<crate::userns::UserNs> {
+    critical_section::with(|cs| {
+        let mut slot = MACHINE_USER.borrow(cs).borrow_mut();
+        slot.get_or_insert_with(|| crate::userns::UserNs::machine(mint()))
+            .clone()
+    })
+}
+
 /// The pool every kind's numbers come from.
 ///
 /// Linux's numbers are per-*type* inode numbers from one allocator, which is
@@ -397,13 +450,13 @@ mod tests {
         // A kind this kernel does not have is not recoverable from a word: the
         // entry does not exist, which is the whole refusal.
         assert_eq!(Kind::of_name("ipc"), None);
-        assert_eq!(Kind::of_name("user"), None);
+        assert_eq!(Kind::of_name("user"), Some(Kind::User));
     }
 
     /// The directory's names, pinned as the *complete* list against a measured
     /// one: a real kernel lists ten (`cgroup, ipc, mnt, net, pid,
     /// pid_for_children, time, time_for_children, user, uts`) and this one lists
-    /// the seven of those whose kinds are built, in the same order.
+    /// the eight of those whose kinds are built, in the same order.
     #[test]
     fn the_directory_names_are_the_ones_a_real_kernel_lists() {
         let names: alloc::vec::Vec<&str> = Entry::ALL.iter().map(|entry| entry.name()).collect();
@@ -416,6 +469,7 @@ mod tests {
                 "pid_for_children",
                 "time",
                 "time_for_children",
+                "user",
                 "uts"
             ]
         );
@@ -451,7 +505,9 @@ mod tests {
         // caller hears their own word back rather than a wrong namespace. The
         // vocabulary is down to the kinds this kernel still has no copy of.
         assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWIPC), None);
-        assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWUSER), None);
+        assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWCGROUP), None);
+        assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWUSER), Some(Kind::User));
+        assert_eq!(Kind::User.flag(), crate::abi::CLONE_NEWUSER);
         assert_eq!(Kind::of_flag(0), None);
         assert_eq!(Kind::of_flag(0x1000), None);
         // `CLONE_NEWTIME` is a kind now, and its bit is the one in the signal

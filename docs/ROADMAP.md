@@ -46,8 +46,9 @@ One-glance status of the whole roadmap.
 **Process (Phase 6)**
 - [x] 6.1 ptrace (§6.1) · [x] 6.2 real rlimits incl. NOFILE/STACK (§6.2) · [x] 6.4 identity/cap calls, threads via `clone(CLONE_THREAD)` (§6.4)
 - [x] teardown at exit, not at reap (§6, R.15)
-- [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET** and **TIME** landed, each with its pin
-  (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`): the numbers a process sees are the
+- [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET**, **TIME** and **USER** landed, each with its pin
+  (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`): the numbers a process
+  sees are the
   reader's namespace's,
   both directions of the translation and `/proc` rendered per reader (§6.3); **the task a namespace
   is spoken for by has rules of its own** — its members cannot end it (only an ancestor's
@@ -73,13 +74,14 @@ One-glance status of the whole roadmap.
   `MONOTONIC`/`MONOTONIC_RAW`/`MONOTONIC_COARSE`/`BOOTTIME` read through them while REALTIME, TAI
   and the cputime clocks do not, and `setns` is the second door into the same slot (`t-ns-time`
   walks it in 46 claims, the shape measured whole before any of it was built, §6.3). The other
-  three kinds Linux has - user, IPC and cgroup - have no entry at all here (§6.3, §6.6), which is
-  `vfs::ns::Entry::ALL` against `namespaces(7)`'s list of eight - and of those three **USER's whole
-  shape is measured now** (2026-10-16, §6.3): it moves its caller like NET, an *unprivileged*
-  caller may make one, the map starts empty so the caller lands on the overflow id, the maker holds
-  the full capability set inside at once, `uid_map` takes one self-naming line and then answers
-  `EPERM`, and the map is a **translation at every boundary** (the same file reads `uid=0` inside
-  and `uid=65534` outside) - which is what makes the rung three pieces rather than one
+  two kinds Linux has left - IPC and cgroup - have no entry at all here (§6.3, §6.6), which is
+  `vfs::ns::Entry::ALL` against `namespaces(7)`'s list of eight. **USER joined on 2026-10-16**: it
+  moves its caller like NET, the map starts empty so the caller lands on the overflow id, `uid_map`
+  takes one self-naming line and then answers `EPERM`, and the four `getuid`-family readers
+  translate the stored id through the task's namespace (`t-ns-user`, 23 claims). What the kind's
+  last measured row leaves named is the same translation on the **`stat`** side - the inode layer
+  must learn whose ids it is rendering - and the capability grant, which this credential model
+  cannot yet tell apart from being root
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
@@ -210,15 +212,17 @@ In the order that keeps each step verifiable on its own:
    **USER**: it is the only one of the three whose absence is felt by everything else (a container
    runtime's first call is `unshare(CLONE_NEWUSER)`, and uid mapping is what the other two are
    *scoped* by), which also makes it the most expensive - it touches the credential model rather
-   than adding a namespace object. **USER's whole shape is measured already** (§6.3, 2026-10-16,
-   five probes run as root and unprivileged: `unshare` moves the caller, an *unprivileged* caller
-   may make one, the caller lands on the overflow id because the map starts empty, it holds the
-   **full** capability set inside the moment it is made - "root inside" - `uid_map` takes a
+   than adding a namespace object. **USER landed on 2026-10-16**, its whole shape measured first
+   (§6.3, five probes run as root *and* unprivileged: `unshare` moves the caller, an unprivileged
+   caller may make one, the caller lands on the overflow id because the map starts empty, it holds
+   the **full** capability set inside the moment it is made - "root inside" - `uid_map` takes a
    single self-naming line once and nothing else, `gid_map` waits for `setgroups=deny`, there is no
-   `user_for_children`, `clone` is a door and `setns` into one's own is `EINVAL`), and the last
-   row is what sizes the work: a mapping is a **translation at every boundary** rather than a
-   rename, so the rung is three pieces - the map object, id translation at each reader, and the
-   capability grant - not one. IPC and CGROUP each wait on the thing they would isolate not
+   `user_for_children`, `clone` is a door on Linux and `setns` into one's own is `EINVAL`). What
+   landed is the map object and the translation at the four `getuid`-family readers, pinned in 23
+   claims; what the measurement's last row - a mapping is a **translation at every boundary**, not a
+   rename - leaves named is the `stat`-side translation (the inode layer must learn whose ids it is
+   rendering) and the capability grant, which the present credential model cannot yet tell apart
+   from being root. IPC and CGROUP each wait on the thing they would isolate not
    existing yet (SysV/POSIX message queues; a cgroup tree), so they are cheap the day that lands
    and worthless before it. Nested namespaces pin the
    *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were

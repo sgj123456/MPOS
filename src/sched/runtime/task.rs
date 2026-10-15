@@ -725,6 +725,18 @@ pub(crate) struct Task {
     /// writes *this* namespace's offsets, because they are the ones the next
     /// child will be born under - which is what makes the file useful at all.
     pub(crate) time_ns_children: Arc<crate::timens::TimeNs>,
+    /// The user namespace this task's ids are read through: the table every
+    /// observation of an id - `getuid`'s family, and the owner a `stat` reports
+    /// - is translated by.
+    ///
+    /// **One field, not two.** Unlike PID and TIME, a user namespace has no
+    /// children's slot: `unshare(CLONE_NEWUSER)` moves the caller into the new
+    /// namespace (measured, §6.3 - the same shape `CLONE_NEWNET` has), so there
+    /// is no `user_for_children` name in `/proc/<pid>/ns` and a child simply
+    /// inherits the value its creator holds. The stored ids on this task are in
+    /// the *parent* namespace's numbering, which is why a fresh namespace shows
+    /// its own caller as [`crate::userns::NO_MAP_ID`] until the map is written.
+    pub(crate) user_ns: Arc<crate::userns::UserNs>,
     /// The OOM-killer's score adjustment and the floor of it: the two numbers
     /// Linux keeps as `sig->oom_score_adj` and `sig->oom_score_adj_min`, and
     /// which `/proc/<pid>/oom_score_adj` reads and writes.
@@ -1043,6 +1055,10 @@ impl Task {
             // every write on a machine that never unshared.
             time_ns: crate::vfs::ns::machine_time_ns(),
             time_ns_children: crate::vfs::ns::machine_time_ns(),
+            // The machine's own user namespace: the identity map, so every id
+            // reads back as itself and no reader changes until something
+            // unshares.
+            user_ns: crate::vfs::ns::machine_user_ns(),
             // The machine's own network namespace, which is `None`: every socket
             // call resolves to the stack the boot built.
             net_ns: None,
@@ -1597,6 +1613,10 @@ impl Table {
             // every write on a machine that never unshared.
             time_ns: crate::vfs::ns::machine_time_ns(),
             time_ns_children: crate::vfs::ns::machine_time_ns(),
+            // The machine's own user namespace: the identity map, so every id
+            // reads back as itself and no reader changes until something
+            // unshares.
+            user_ns: crate::vfs::ns::machine_user_ns(),
             // The machine's own network namespace, which is `None`: every socket
             // call resolves to the stack the boot built.
             net_ns: None,

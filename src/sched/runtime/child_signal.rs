@@ -371,6 +371,18 @@ pub fn current_credentials() -> crate::cred::Credentials {
     with_table(|t| t.task(t.current).mm.credentials())
 }
 
+/// The user namespace the running task reads its ids through.
+///
+/// Every observation of an id goes through this: `getuid`'s family translates
+/// the stored id it holds, and the moment the caller is in a namespace with an
+/// empty table (which is the state `unshare(CLONE_NEWUSER)` leaves it in) it
+/// reads [`crate::userns::NO_MAP_ID`] for everything, its own id included. A task
+/// on a machine that never unshared is in the machine's namespace, whose identity
+/// map makes this a pass-through.
+pub fn current_user_ns() -> Arc<crate::userns::UserNs> {
+    with_table(|t| Arc::clone(&t.task(t.current).user_ns))
+}
+
 /// Change one field of the running process's credentials in place. The
 /// read-modify-write is the table lock's, so two of these cannot interleave.
 pub fn with_current_credentials<R>(f: impl FnOnce(&mut crate::cred::Credentials) -> R) -> R {
@@ -692,6 +704,12 @@ pub fn ns_of(pid: usize, entry: crate::vfs::ns::Entry) -> Option<crate::vfs::ns:
             (crate::vfs::ns::Kind::Time, Slot::ForChildren) => {
                 crate::vfs::ns::Namespace::Time(task.time_ns_children.clone())
             }
+            // One slot, because the kind has only one: `CLONE_NEWUSER` moves the
+            // caller, so there is no `user_for_children` name and both spellings
+            // - there is only one - answer the task's own namespace.
+            (crate::vfs::ns::Kind::User, _) => {
+                crate::vfs::ns::Namespace::User(task.user_ns.clone())
+            }
         })
     })
 }
@@ -767,6 +785,48 @@ pub fn setns_time(ns: Arc<crate::timens::TimeNs>) {
         let me = t.current;
         t.task_mut(me).time_ns_children = ns;
     });
+}
+
+/// Move the running task into a user namespace of its own:
+/// `unshare(CLONE_NEWUSER)`.
+///
+/// **The caller moves** - the shape `CLONE_NEWNET` has and the opposite of the
+/// two for-children kinds - which is why this sets `user_ns` itself rather than a
+/// children's slot. The namespace it lands in is **empty**, so the caller's own
+/// ids have no inside name until it writes the map: measured, `getuid()` reads
+/// `65534` between this call and the first `uid_map` write (§6.3).
+///
+/// Nothing here grants a capability. On a real kernel the caller holds the full
+/// set the instant it is in the new namespace, but this kernel hands every
+/// process the full set already (`Credentials::initial`), so the grant is a
+/// no-op here rather than a modelled behaviour - and modelling it is the piece
+/// of this rung that is named and not built (§6.3).
+#[cfg(target_os = "none")]
+pub fn unshare_user() {
+    with_table(|t| {
+        let me = t.current;
+        let fresh = crate::userns::UserNs::fresh(crate::vfs::ns::mint());
+        t.task_mut(me).user_ns = fresh;
+    });
+}
+
+/// Join a user namespace a descriptor names: `setns(fd, CLONE_NEWUSER)`'s half.
+///
+/// A join, not a copy, and it moves the caller like [`unshare_user`] does. The
+/// one measured divergence from every other kind's `setns` is that joining the
+/// namespace the caller is **already in** is refused `EINVAL` rather than being
+/// the no-op `0` MNT's and TIME's are - which is why this answers a `Result`
+/// where its siblings answer nothing.
+#[cfg(target_os = "none")]
+pub fn setns_user(ns: Arc<crate::userns::UserNs>) -> Result<(), isize> {
+    with_table(|t| {
+        let me = t.current;
+        if Arc::ptr_eq(&t.task(me).user_ns, &ns) {
+            return Err(crate::err::EINVAL);
+        }
+        t.task_mut(me).user_ns = ns;
+        Ok(())
+    })
 }
 
 /// The offsets the running task's own clocks are read through, as

@@ -122,7 +122,7 @@ the build list.
 | `CLONE_NEWNS` | the mount table *and the root*: a `mount` in one namespace invisible in another, and `chroot`/`pivot_root` giving a container its own `/` | **build second** |
 | `CLONE_NEWPID` | the numbers a process *sees*: a child of the new namespace is pid 1 to itself, and `/proc` is numbered per reader | **build third - the expensive one** |
 | `CLONE_NEWNET` | interfaces, addresses, routes and the socket table: a socket bound in one namespace is not reachable from another | **build fourth** |
-| `CLONE_NEWUSER` | uid/gid mapping, and the capability set *within* the namespace | **refused** - but the whole shape is now measured (2026-10-16); the paragraph below is what the build starts from |
+| `CLONE_NEWUSER` | uid/gid mapping, and the capability set *within* the namespace | **built** (the maps and the translation; the "root inside" grant is named) - "Step 6, landed" below |
 | `CLONE_NEWIPC` | SysV IPC objects and POSIX message queues | **refused**: this kernel has neither, so it isolates nothing |
 | `CLONE_NEWCGROUP` | the cgroup tree a process sees | **refused**: there is no cgroup tree here to see |
 | `CLONE_NEWTIME` | `CLOCK_MONOTONIC`/`BOOTTIME` offsets per namespace | **built** - "Step 5, landed" below |
@@ -457,12 +457,57 @@ owner reported by a directory read - is mapped through the observing namespace's
 namespace is therefore not one more object beside the mount table and the clock offsets; it is a
 translation applied wherever an id crosses a boundary.
 
-**Why this rung is named and not built here.** The measurement says the work is three pieces -
+**Why this rung was measured before it was built.** The measurement said the work is three pieces -
 (a) a mapping object and its one-line write rules, (b) id translation at every reader, and (c) the
 capability grant at creation - and (c) alone contradicts this kernel's present model, where
 `Credentials::initial()` hands every process the full set, so "full inside a namespace you made" is
-not yet distinguishable from "full because you are root". Each piece is its own measurement-and-pin,
-so the rung is recorded rather than half-built: this table is what the next commit starts from.
+not yet distinguishable from "full because you are root". The first two landed on 2026-10-16 and the
+third is named in Step 6 below; this table is what that work started from.
+
+**Step 6, landed: USER, and the two pieces left named.** `t-ns-user` walks the translation end to
+end in 23 claims: the machine's map is the identity in a real kernel's exact bytes (the 33-byte line,
+`%10u %10u %10u`), an id reads as itself under it so nothing that never unshares changes, there is no
+`user_for_children` because the kind moves its caller, `unshare(CLONE_NEWUSER)` really does move it,
+the caller then reads **65534** for uid, euid and gid because the new table is empty, writing
+`uid_map` **once** with a line naming the id it is *stored* under makes it read 0, a second write is
+`EPERM`, `setgroups` goes to `deny` and cannot go back on once the gid map exists, a child born here
+reads the same mapped id and names the same namespace, `clone(CLONE_NEWUSER)` is `EOPNOTSUPP`, and
+`setns` onto the namespace the caller is already in is `EINVAL` rather than the no-op `0` every other
+kind gives.
+
+What landed, across the twelve touch points the ladder has used every rung: a leaf crate
+(`crates/userns`) whose host tests carry the parts that need a caller without `CAP_SETUID` (the
+one-line rule and the three `EPERM`s - a privilege level no task on this machine has, which is why
+they are argued with there rather than in an in-guest pin); `Kind::User` with **no** `_for_children`
+entry and **one** task field rather than two; `unshare`/`setns` that move the caller; three procfs
+files (`uid_map`, `gid_map`, `setgroups`); and the four `getuid`-family readers, which now translate
+the stored id through the task's namespace. `CLONE_NEWUSER` is also the one bit `unshare`'s capability
+gate does not cover - measured, an unprivileged caller may make one - which is a change to the
+verdict rather than to the handler.
+
+Two counterfactuals, and the first is why the claims are written the way they are:
+
+* **Drop the translation** (`shown_uid` returns the stored id, as this kernel behaved before) →
+  `t-ns-user` the one red program, three of its 23 claims red: the caller's own overflow reading, "the
+  caller reads the inside id the map gave it", and the child's. The first run of this counterfactual
+  went red in **one** place, and the reason is the trap this ladder keeps meeting: this machine stores
+  every task under id 0, so a map to 0 reads back 0 whether or not anything translated, and three
+  claims were passing vacuously. The fix was to map the inside to **7** - a number no stored id here
+  is - which is what the file now does. The three *gid* claims stay green in this run, which is
+  evidence of its own: the two readers are wired separately.
+* **Give the call the for-children shape** (`unshare_user` leaves the caller where it is, as PID's and
+  TIME's rule does) → `t-ns-user` the one red program again, but with a **different** set of eleven
+  claims: the machine-namespace claims stay green and everything that depends on the caller having
+  moved - the link, the overflow reading, the empty map, the write, the gid pair, the child - goes red
+  together.
+
+**What is named and not built, in two halves.** (a) The **file-owner** translation: `stat`'s `st_uid`
+and the owner a directory read reports are still the stored id, so a file made inside reads its inside
+id from `getuid` and its outside id from `stat`. The machinery is the same call the `getuid` family
+makes; what is left is threading the *reader's* namespace into the inode layer, which is a change to
+`vfs` rather than a line. (b) The **capability grant**: on Linux the maker holds the full set inside
+the instant the namespace exists, and this kernel hands every process the full set already, so "full
+inside a namespace you made" is not yet distinguishable from "full because you are root".
 
 **And one trap in the measuring, worth its line**: a first draft of the raw-netlink-style probe
 numbered `IFLA_NET_NS_PID` 27 where `linux/if_link.h` gives 19, and *every* request answered a
@@ -880,8 +925,10 @@ closed number - all it can learn. The design follows from the table: each
 namespace object becomes an inode whose open descriptor *is* the namespace (so
 two descriptors on one `/proc/<pid>/ns/uts` name one object, with one `st_ino`),
 `setns` checks the descriptor's type against `nstype` (a mismatch is `EINVAL`,
-Linux's answer), and `NS_GET_USERNS`/`NS_GET_PARENT` are out of scope until
-there is a user namespace for them to point at.
+Linux's answer), and `NS_GET_USERNS`/`NS_GET_PARENT` remain out of scope even now
+that a user namespace exists (2026-10-16, "Step 6" below): the two requests are a
+pair of `ioctl`s this kernel has not built, which is a separate question from the
+kind existing.
 
 **Two decisions about the call itself, rather than about a namespace.**
 
@@ -1284,7 +1331,8 @@ Two more shapes the same pass found, **named rather than fixed** because each is
 question: `CLONE_PARENT` is in the validated flag mask and is not honoured, so a caller asking
 for it silently gets the caller-as-parent it would have got anyway; and `clone(CLONE_FS |
 CLONE_NEWNS)` is accepted here where `clone(2)`'s ERRORS list calls it `EINVAL` (the same list
-has `CLONE_NEWUSER | CLONE_FS` and `CLONE_NEWIPC | CLONE_SYSVSEM`, both unserved kinds here, so
+has `CLONE_NEWUSER | CLONE_FS` and `CLONE_NEWIPC | CLONE_SYSVSEM`; IPC is unserved here and USER is
+not a door through `clone` - its child-side creation is named and not built, "Step 6" below - so
 only the first pair is this kernel's to answer). The first belongs with `parent:`'s
 implementation, the second with `validate_clone_flags`'s documented-pair table.
 

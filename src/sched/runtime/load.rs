@@ -689,6 +689,9 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             // and its children would be born under them.
             time_ns: crate::vfs::ns::machine_time_ns(),
             time_ns_children: crate::vfs::ns::machine_time_ns(),
+            // The machine's own user namespace, the identity map: `init` reads
+            // every id as the number it is stored under.
+            user_ns: crate::vfs::ns::machine_user_ns(),
             // The machine's own network namespace, which is `None`: every socket
             // call resolves to the stack the boot built.
             net_ns: None,
@@ -861,6 +864,10 @@ pub fn try_spawn_user(
             pid_ns_children: child_pid_ns,
             time_ns: alloc::sync::Arc::clone(&child_time_ns),
             time_ns_children: child_time_ns,
+            // A user namespace has no children's slot, so there is one value to
+            // inherit rather than two: the child reads its ids through the
+            // namespace of whatever started it until it unshares.
+            user_ns: alloc::sync::Arc::clone(&t.task(parent).user_ns),
             // The starter's network namespace, by reference: a program the kernel
             // starts shares the stack of whatever started it, which is the rule
             // `fork` follows.
