@@ -200,7 +200,35 @@ has to land **first** is the socket registry moving out of `Stack` and becoming 
 each entry recording the namespace whose stack owns its addresses, routes and timers
 (`entries`/`listeners`/`teardown` are referenced 41 times, measured, all inside
 `socket.rs`/`mod.rs`/`rtnl.rs`). It is observable on its own - a machine that never unshares is
-unchanged, and every socket test still passes - and no namespace may be entered before it. The rest
+unchanged, and every socket test still passes - and no namespace may be entered before it.
+
+**And that is not an argument any more: it was measured, by a booted machine.** The attempt at
+the namespace itself - `Task::net_ns`, `with_stack` following the caller, a fresh `Stack` with `lo`
+and no wire, `clone(CLONE_NEWNET)` served for a caller holding no socket - built and passed the
+host suites, and the **gate panicked inside smoltcp**:
+
+```
+KERNEL PANIC: panicked at smoltcp-0.13.1/src/iface/socket_set.rs:113:
+index out of bounds: the len is 0 but the index is 2
+```
+
+The reason is the second half of the measurement above, and it is worth stating because it fixes
+the boundary of the step: **`alloc_socket` and `with(handle)` reach the machine's stack
+directly** (`NET.borrow`, `mod.rs:1304`/`:1227` - six such sites in all), while `bind`, `listen`
+and `connect` go through `with_stack`. In a namespace those two disagree about *which* stack a
+socket lives in: the entry was registered in one and looked up in the other, and the child's
+lookup landed on an empty socket set with an index from the machine's. Every socket test in the
+suite had been passing because in the machine's namespace the two are the same stack - which is
+exactly why this cannot be half-migrated.
+
+So the step's boundary is firmer than it was: **all six** direct-`NET` sites move at once
+(`with`, `alloc_socket`, and the three registry functions beside them), the entry records its
+namespace, and `with(handle)` resolves the stack *from the entry* rather than from the caller -
+because the caller's namespace is not where an inherited descriptor's socket lives. That last
+point has a second face the clone precondition does not cover: `SCM_RIGHTS` can hand a socket
+descriptor to a task in another namespace, and nothing in the sender's or the receiver's flags says
+so. The working attempt is kept beside this note in `.workbuddy/netns/` (its diff and its pin), so
+the next pass starts from a shape that boots up to the boundary rather than from a blank page. The rest
 of NET's design (one opaque `net_ns: Option<u64>` on `Task` rather than an `Arc` object, so that
 `sched` does not name `net` and turn the existing `net -> sched` recall edge into a mutual pair; the
 machine's own network namespace number minted in `vfs::ns`, which both layers may name; a fresh

@@ -47,10 +47,11 @@ One-glance status of the whole roadmap.
 - [~] 6.3 Namespaces — UTS, MNT and **PID** landed, each with its pin (`t-ns-uts`, `t-ns-mnt`,
   `t-ns-pid`): the numbers a process sees are the reader's namespace's, both directions of the
   translation, and `/proc` rendered per reader (§6.3); NET designed, unbuilt, and its *first* step
-  is now named: a socket has to remember its namespace before one can be entered at all - the
-  registry is per-stack today and its handles are per-stack indices, so an fd inherited across a
-  namespace boundary would name one of the new namespace's sockets rather than its own (§6.3);
-  the other five kinds have no entry at all (§6.3, §6.6)
+  is now **measured**: a socket has to remember its namespace before one can be entered at all -
+  the registry is per-stack today and its handles are per-stack indices, and an attempt at the
+  namespace itself panicked inside smoltcp's socket set because `alloc_socket`/`with(handle)` reach
+  the machine's stack while `bind`/`connect` go through the caller's (§6.3); the other five kinds
+  have no entry at all (§6.3, §6.6)
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
