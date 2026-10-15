@@ -745,10 +745,7 @@ fn note_eopnotsupp(nr: u64, args: [usize; super::ARG_COUNT]) {
             // path: the sweep's own boot printed `syscall 56 (fd 536870929)`
             // for a CLONE_NEWPID probe, a number that reads like a descriptor
             // table gone wrong and is really `0x20000011`.
-            crate::print!(
-                "mpos: syscall {nr} (flags {:#x}) -> EOPNOTSUPP\n",
-                args[0]
-            );
+            crate::print!("mpos: syscall {nr} (flags {:#x}) -> EOPNOTSUPP\n", args[0]);
         } else {
             crate::print!("mpos: syscall {nr} (fd {}) -> EOPNOTSUPP\n", args[0] as i32);
         }
