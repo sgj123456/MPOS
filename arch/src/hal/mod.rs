@@ -758,6 +758,31 @@ pub trait Gate {
     /// As [`Gate::user_ip`].
     unsafe fn syscall_args(frame: *mut ()) -> [usize; 6];
 
+    /// The syscall number the frame names, in the register this machine passes
+    /// it in (`orig_rax` on x86_64, `x8` on aarch64).
+    ///
+    /// Read *after* a stop has had its chance to rewrite the frame, so a tracer
+    /// that redirected the call makes the call it meant rather than the one the
+    /// task arrived with. Which register carries the number is the machine's,
+    /// the same reason [`Gate::syscall_args`] exists.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`].
+    unsafe fn syscall_number(frame: *mut ()) -> u64;
+
+    /// Write a syscall number into the frame, so the call the gate is about to
+    /// make is `nr`.
+    ///
+    /// The inverse of [`Gate::syscall_number`], and separate from
+    /// [`Gate::restore_user_regs`] because the number is not always a word that
+    /// op carries: on x86_64 the number lives in `rax`, which
+    /// `restore_user_regs` leaves to the gate's own result write, so a tracer's
+    /// rewrite of it would otherwise be dropped before the gate read it back.
+    ///
+    /// # Safety
+    /// As [`Gate::user_ip`].
+    unsafe fn set_syscall_number(frame: *mut (), nr: u64);
+
     /// What the ABI's result slot holds at a syscall *entry* stop.
     ///
     /// The one place the two machines' register files disagree about a slot a
@@ -1477,6 +1502,25 @@ pub unsafe fn restore_user_regs(frame: *mut (), regs: &[u64], tls: &mut usize) -
 #[inline]
 pub unsafe fn syscall_args(frame: *mut ()) -> [usize; 6] {
     unsafe { <Current as Gate>::syscall_args(frame) }
+}
+
+/// The syscall number the frame names. See [`Gate::syscall_number`] - read it
+/// after a stop, so a tracer's redirect is honoured.
+///
+/// # Safety
+/// As [`Gate::user_ip`].
+#[inline]
+pub unsafe fn syscall_number(frame: *mut ()) -> u64 {
+    unsafe { <Current as Gate>::syscall_number(frame) }
+}
+
+/// Write a syscall number into the frame. See [`Gate::set_syscall_number`].
+///
+/// # Safety
+/// As [`Gate::user_ip`].
+#[inline]
+pub unsafe fn set_syscall_number(frame: *mut (), nr: u64) {
+    unsafe { <Current as Gate>::set_syscall_number(frame, nr) }
 }
 
 /// What the ABI's result slot holds at a syscall entry stop. See

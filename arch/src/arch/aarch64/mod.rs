@@ -2674,6 +2674,19 @@ impl crate::hal::Gate for crate::hal::Current {
         ]
     }
 
+    unsafe fn syscall_number(frame: *mut ()) -> u64 {
+        // SAFETY: the caller's contract.
+        let frame = unsafe { &*(frame as *const context::UserFrame) };
+        // `x8`, where the EL0 sync vector reads the number from.
+        frame.x[8]
+    }
+
+    unsafe fn set_syscall_number(frame: *mut (), nr: u64) {
+        // SAFETY: the caller's contract.
+        let frame = unsafe { &mut *(frame as *mut context::UserFrame) };
+        frame.x[8] = nr;
+    }
+
     unsafe fn syscall_entry_result_slot(frame: *mut (), _nr: usize) -> usize {
         if frame.is_null() {
             return 0;

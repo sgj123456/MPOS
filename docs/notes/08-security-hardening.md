@@ -205,12 +205,31 @@ answers normally — caught each in turn.
   but silent, which this kernel used to let through — is now measured to fail the
   call `ENOSYS`, Linux's answer. The stop's `syscall` record is the in-flight
   entry one, so `PTRACE_GET_SYSCALL_INFO` describes the call.
-  - **Sub-gap, named**: a tracer that rewrites registers at this stop does not
-    change the call. On Linux a `PTRACE_SETREGS` here redirects the syscall; this
-    kernel delivers the stop, then runs the call with the number and arguments it
-    had already read. A tracer wanting to rewrite uses `PTRACE_SYSCALL`'s entry
-    stop, which *does* re-read the frame (`proc::syscall_entry_stop`). Rewrite at
-    the seccomp stop is not built.
+  - **A rewrite at the stop changes the call — done (2026-10-16).** A
+    `PTRACE_SETREGS` at the `PTRACE_EVENT_SECCOMP` stop redirects the syscall,
+    which is the mechanism a syscall-table sandbox is built from. Measured on
+    this developer's Linux first (a throwaway x86_64 host probe, kernel 7.2): the
+    judged `getpid` stopped with `orig_rax = 39`, and rewriting that field to 110
+    made the tracee's call answer its parent's pid (10621) instead of its own
+    (10622).
+    Two halves were missing. `dispatch`'s `RET_TRACE` arm now reads the number and
+    the arguments out of the frame *after* the stop rather than reusing the ones
+    it arrived with, through `hal::Gate`'s `syscall_number`/`syscall_args`. And
+    the redirect has to reach that frame: on x86_64 `restore_user_regs` does not
+    carry `orig_rax` — the number and the result share `rax`, and the result is
+    the gate's to write after the handler — so `proc::seccomp_trace_stop` writes
+    the tracer's `uregs::NUMBER` slot back through `hal::set_syscall_number`. On
+    aarch64 the number is `x8`, which the frame conversion already carried; that
+    write is the same value a second time. Pinned in `t-seccomp`'s
+    `seccomp_stop_reaches_a_tracer`: the tracer reads the registers, rewrites the
+    number slot to `getppid`, and the tracee exits 0 only if the call that ran
+    answered its parent's pid — which the `getpid` it asked for cannot do. The
+    pin is counterfactual: with the re-read removed, `t-seccomp` is the one red in
+    the sweep (`pass=172 fail=1`); with it, x86_64 is `pass=173 fail=0` with
+    `mpos-kunit 32 passed, 0 failed` and exit 33, aarch64 `pass=172 fail=0`.
+    - The `PTRACE_SYSCALL` entry stop still re-reads only the **argument**
+      registers (`proc::syscall_entry_stop`); rewriting the *number* there is a
+      separate, unnamed remainder, not part of this case.
 - **Not measured, and recorded rather than guessed**: strict mode's own violation
   signal. `seccomp(SECCOMP_SET_MODE_STRICT)` answers `EINVAL` on this machine for
   every argument shape tried, including after `PR_SET_NO_NEW_PRIVS` and with

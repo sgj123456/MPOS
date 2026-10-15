@@ -872,6 +872,16 @@ pub(crate) mod uregs {
     pub const COUNT: usize = 27;
     pub const BYTES: usize = COUNT * 8;
 
+    /// The syscall number a tracer reads and rewrites to redirect a call:
+    /// `orig_rax`, the field Linux's own `syscall_get_nr` answers with.
+    ///
+    /// On this machine the number and the result share `rax` until the call
+    /// runs - `syscall` leaves the number there and the gate patches the result
+    /// over it - which is why [`RESULT`] *also* reads as the number at a
+    /// syscall-entry stop (see `hal::Gate::syscall_entry_result_slot`). A
+    /// tracer rewriting the call names this slot, not that one.
+    pub const NUMBER: usize = ORIG_RAX;
+
     /// The syscall's result: the slot a tracer rewrites to make a call return
     /// something else, and the one `PTRACE_GET_SYSCALL_INFO` reads an exit
     /// stop's return value out of.
@@ -899,12 +909,22 @@ pub(crate) mod uregs {
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod uregs {
     pub const X0: usize = 0;
+    pub const X8: usize = 8;
     pub const X30: usize = 30;
     pub const SP: usize = 31;
     pub const PC: usize = 32;
     pub const PSTATE: usize = 33;
     pub const COUNT: usize = 34;
     pub const BYTES: usize = COUNT * 8;
+
+    /// The syscall number a tracer reads and rewrites to redirect a call:
+    /// `x8`, the register this ABI passes the number in.
+    ///
+    /// Its own slot rather than a role the result register plays - on this
+    /// machine the number and the result are different registers (`x8` and
+    /// `x0`), which is the whole reason `hal::Gate::syscall_entry_result_slot`
+    /// has to ask the machine instead of writing `nr` into the result slot.
+    pub const NUMBER: usize = X8;
 
     /// The syscall's result. `x0` here rather than a dedicated register: this
     /// ABI returns in the first argument register, and `PTRACE_SETREGS`'s idea

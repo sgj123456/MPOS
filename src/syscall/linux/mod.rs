@@ -63,7 +63,12 @@ pub fn deliver_signal(regs_ptr: *mut (), nr: u64, ret: isize) -> bool {
 /// through the machine's own frame code, and it is dereferenced there without
 /// further checks.
 #[cfg(target_os = "none")]
-pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mut ()) -> isize {
+pub unsafe fn dispatch(
+    mut nr: u64,
+    mut args: [usize; 6],
+    from_user: bool,
+    regs_ptr: *mut (),
+) -> isize {
     // SECCOMP_MODE_STRICT is on for this thread. Only the four calls a
     // condemned process still needs survive: read, write, exit and the
     // signal-return trampoline. Anything else is fatal - the filtered call
@@ -151,6 +156,19 @@ pub unsafe fn dispatch(nr: u64, args: [usize; 6], from_user: bool, regs_ptr: *mu
                         return err::ENOSYS;
                     }
                     proc::seccomp_trace_stop(regs_ptr, nr, sc::action_data(answer) as u64);
+                    // A tracer that rewrote the frame at that stop redirected
+                    // the call, and Linux makes the call it now names: a
+                    // `PTRACE_SETREGS` there is the syscall-table sandbox's
+                    // whole mechanism. So both halves are re-read from the
+                    // frame the stop left behind, not reused from the gate.
+                    // A null frame is a call the kernel made on its own behalf,
+                    // which has no registers to redirect.
+                    if !regs_ptr.is_null() {
+                        // SAFETY: `regs_ptr` is the gate's own frame for this
+                        // task.
+                        nr = unsafe { crate::hal::syscall_number(regs_ptr) };
+                        args = unsafe { crate::hal::syscall_args(regs_ptr) };
+                    }
                 }
                 // `USER_NOTIF` hands the call to a userspace supervisor, and
                 // this kernel has none to hand it to. Measured: Linux with no

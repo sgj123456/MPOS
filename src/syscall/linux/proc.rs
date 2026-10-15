@@ -637,6 +637,16 @@ pub(crate) fn seccomp_trace_stop(regs_ptr: *mut (), nr: u64, message: u64) {
     let mut regs = capture_frame(regs_ptr, slot);
     crate::sched::seccomp_trap(&mut regs, message);
     apply_frame(regs_ptr, &regs);
+    // A tracer that redirected the call rewrote the number slot, and it has to
+    // reach the frame the gate reads next. On x86_64 `restore_user_regs` does
+    // not carry `orig_rax` - the number and the result share `rax`, and the
+    // result is the gate's to write after the handler - so a redirect would be
+    // dropped here, before the gate ever saw it. Writing it back is the whole
+    // of making `PTRACE_SETREGS` at this stop change the call (measured in
+    // `docs/notes/` §8.2). On aarch64 `restore_user_regs` already carried `x8`,
+    // and this writes the same value a second time rather than a different one.
+    // SAFETY: the same gate frame `capture_frame` was handed.
+    unsafe { crate::hal::set_syscall_number(regs_ptr, regs[abi::uregs::NUMBER]) };
 }
 
 /// The tracee's half of a syscall-exit stop. The result goes in and comes back,

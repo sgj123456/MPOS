@@ -76,6 +76,19 @@ use std::os::raw::c_long;
 const PTRACE_O_TRACESECCOMP: c_long = 0x80;
 const PTRACE_EVENT_SECCOMP: i32 = 7;
 
+/// The register file's width and the slot a tracer rewrites to redirect a
+/// syscall. Both are the machine's: x86_64's `user_regs_struct` is 27 words and
+/// names the number `orig_rax`, the 16th; aarch64's `user_pt_regs` is 34 and
+/// carries it in `x8`, the 9th. `t-ptrace` states the same two widths.
+#[cfg(not(target_arch = "aarch64"))]
+const REG_WORDS: usize = 27;
+#[cfg(target_arch = "aarch64")]
+const REG_WORDS: usize = 34;
+#[cfg(not(target_arch = "aarch64"))]
+const NUMBER_SLOT: usize = 15;
+#[cfg(target_arch = "aarch64")]
+const NUMBER_SLOT: usize = 8;
+
 /// The judged number, and the one the second filter below takes instead. Read
 /// from `libc`'s per-machine table rather than written down - see the header.
 fn getpid_nr() -> u32 {
@@ -250,10 +263,18 @@ fn seccomp_stop_reaches_a_tracer(r: &mut Report) {
             if install(getpid_nr(), libc::SECCOMP_RET_TRACE | DATA).map(|v| v == 0) != Ok(true) {
                 libc::_exit(12);
             }
-            // The judged call: the tracer sees the stop, then this runs and
-            // answers this process's own pid.
-            let me = raw_getpid();
-            libc::_exit(if me.0 > 0 { 0 } else { 13 });
+            // The judged call: the tracer sees the stop, rewrites the number
+            // slot to `getppid`, and *that* call is what runs. Reading this
+            // process's own real parent below is what tells the two apart - a
+            // `getpid` answers this process's own id, a `getppid` its parent's,
+            // and for a task that is not its own parent the two differ.
+            let redirected = raw_getpid();
+            let parent = raw_getppid();
+            libc::_exit(if redirected.0 > 0 && redirected.0 == parent.0 {
+                0
+            } else {
+                13
+            });
         }
     }
     let mut status = 0i32;
@@ -312,13 +333,39 @@ fn seccomp_stop_reaches_a_tracer(r: &mut Report) {
         got == Ok(0) && msg == DATA as u64,
     );
 
-    // The stop is a notice, not a refusal: the call is made once the tracee is
-    // let go, and it answers its own pid.
+    // ---- the redirect: rewriting the number slot changes the call. This is
+    // ---- the sub-gap §8.2 named - a `PTRACE_SETREGS` here is how a
+    // ---- syscall-table sandbox replaces a call - and the tracee's exit status
+    // ---- is the proof: it exits 0 only if the redirected `getppid` answered,
+    // ---- which the `getpid` it asked for cannot do.
+    let mut regs = [0u64; REG_WORDS];
+    r.check(
+        "the tracer can read the tracee's registers at the seccomp stop",
+        ptrace(
+            libc::PTRACE_GETREGS as c_long,
+            child,
+            0,
+            regs.as_mut_ptr() as usize,
+        ) == Ok(0),
+    );
+    // The slot is the machine's (`orig_rax` or `x8`); the number is `libc`'s
+    // per-machine `getppid`, never written down (the header's rule).
+    regs[NUMBER_SLOT] = getppid_nr() as u64;
+    r.check(
+        "the tracer can rewrite the syscall number at the seccomp stop",
+        ptrace(
+            libc::PTRACE_SETREGS as c_long,
+            child,
+            0,
+            regs.as_ptr() as usize,
+        ) == Ok(0),
+    );
+
     let resumed = ptrace(libc::PTRACE_CONT as c_long, child, 0, 0) == Ok(0);
     // SAFETY: as above.
     let n = unsafe { libc::waitpid(child, &mut status, 0) };
     r.check(
-        "the traced call then runs, and the tracee exits normally",
+        "the redirected call runs, and the tracee exits normally",
         resumed && n == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
     );
 }

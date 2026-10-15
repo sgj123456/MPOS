@@ -338,6 +338,24 @@ impl crate::hal::Gate for crate::hal::Current {
         [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9]
     }
 
+    unsafe fn syscall_number(frame: *mut ()) -> u64 {
+        // SAFETY: the caller's contract.
+        let regs = unsafe { &*(frame as *const Regs) };
+        // The number `syscall` left in `rax` - the slot `rust_syscall` reads to
+        // dispatch, and the one a tracer rewrites through `orig_rax`.
+        regs.rax as u64
+    }
+
+    unsafe fn set_syscall_number(frame: *mut (), nr: u64) {
+        // SAFETY: the caller's contract.
+        let regs = unsafe { &mut *(frame as *mut Regs) };
+        // As above. `restore_user_regs` deliberately does not write this slot -
+        // it returns the ABI's `rax` for the gate to patch after the handler,
+        // so the number and the result do not fight over one word - which is
+        // why persisting a tracer's redirect is its own operation.
+        regs.rax = nr as usize;
+    }
+
     unsafe fn syscall_entry_result_slot(_frame: *mut (), nr: usize) -> usize {
         // The number, which is what this machine's `syscall` instruction left in
         // the result slot and what a tracer reads there. See the trait's note
