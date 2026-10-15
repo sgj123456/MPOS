@@ -13,18 +13,27 @@
 //! What is implemented here is the honest subset a DHCP client needs, with
 //! the refusals Linux would give beyond it:
 //!
-//! * `SOCK_DGRAM` only. `SOCK_RAW` (frame *with* its Ethernet header) is
-//!   `EOPNOTSUPP` - the caller would have to invent a source MAC the device
-//!   does not own, and a header written by the caller's hope rather than by
-//!   the stack's fact is the approximation this kernel's rules put above
-//!   absence.
+//! * Both `AF_PACKET` shapes. `SOCK_DGRAM` (payload in, header built by the
+//!   kernel) is the one a DHCP client's *listen* socket takes; `SOCK_RAW`
+//!   (frame in, frame out, header on both) is the one an ARP resolver or a
+//!   bridge takes. A socket of any other type is `ESOCKTNOSUPPORT`, measured on
+//!   Linux.
+//! * `SOCK_RAW` sends put the caller's frame on the wire *unchanged*: the
+//!   header is the caller's to build, so `sll_addr` is ignored and the frame's
+//!   own header names the destination - measured on the host (the header's
+//!   destination won over `sll_addr`'s when the two disagreed). The one check
+//!   is that a header is there to send: shorter than `ETH_HEADER_LEN` is
+//!   `EINVAL` (measured; 14 passes, 13 does not). A send with no `sockaddr_ll`
+//!   at all is `ENXIO`, because the frame alone cannot name the interface.
 //! * The receive side taps every frame the NIC hands the stack at the seam
 //!   itself (`NicDevice::receive`), filtering by the Ethernet type the
 //!   socket was created with - `htons(0)` sees everything, as `ETH_P_ALL`
-//!   means. The payload travels without its header, which is what
-//!   `PACKET_SOCK_DGRAM` means on Linux: the header is the kernel's to add.
-//! * The send side takes a `sockaddr_ll` destination per call and builds
-//!   the header from the device's real MAC and the socket's protocol number.
+//!   means. The frame is stored whole; a `SOCK_DGRAM` reader is handed the
+//!   payload half (the header is the kernel's to add back on a send, so it is
+//!   dropped), a `SOCK_RAW` reader the frame with its header on.
+//! * The `SOCK_DGRAM` send side takes a `sockaddr_ll` destination per call and
+//!   builds the header from the device's real MAC and the socket's protocol
+//!   number.
 //! * One interface, `eth0`: `bind` records the index it is given and every
 //!   index is that one's, which is the machine's truth rather than a
 //!   narrowing of it. A `PACKET_FANOUT`, a ring (`PACKET_TXRING`) or a
@@ -57,13 +66,18 @@ use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 const ETH0_IFINDEX: i32 = 2;
 
 /// One open packet socket. The registry slot is its identity; the queue holds
-/// payload halves of tapped frames, oldest first, bounded and keeping the
-/// newest (`crate::link::Frames`).
+/// tapped frames, oldest first, bounded and keeping the newest
+/// (`crate::link::Frames`). A frame is stored whole (header first); `raw` is
+/// what the reader does with the first fourteen bytes.
 pub struct PacketSock {
     /// The Ethernet type this socket sees, as the caller's `htons` spelled
     /// it - compared byte-for-byte against the frame's own two type bytes,
     /// `0` (`ETH_P_ALL`) meaning everything.
     protocol: u16,
+    /// `true` for `SOCK_RAW`: receives hand back the whole frame (header on)
+    /// and sends carry the caller's own header. `false` for `SOCK_DGRAM`, the
+    /// payload shape. This is the one thing the socket's type changes.
+    raw: bool,
     /// The `sll_ifindex` a `bind` recorded. Recorded, not enforced: one
     /// interface exists, and see the module header for the claim.
     bound: Mutex<RefCell<i32>>,
@@ -72,13 +86,32 @@ pub struct PacketSock {
 }
 
 impl PacketSock {
-    fn new(protocol: u16) -> Arc<PacketSock> {
+    fn new(protocol: u16, raw: bool) -> Arc<PacketSock> {
         Arc::new(PacketSock {
             protocol,
+            raw,
             bound: Mutex::new(RefCell::new(0)),
             rx: Mutex::new(RefCell::new(crate::link::Frames::new())),
             waiters: Mutex::new(RefCell::new(Vec::new())),
         })
+    }
+
+    /// `true` for `SOCK_RAW`. The send door reads it to decide whether the
+    /// caller's bytes are a payload to wrap or a whole frame to pass through.
+    pub(crate) fn is_raw(&self) -> bool {
+        self.raw
+    }
+
+    /// The bytes a reader of this socket is promised, read out of one stored
+    /// frame: the whole frame (header first) for a `SOCK_RAW` socket, the
+    /// payload half for a `SOCK_DGRAM` one. The tap stores the whole frame for
+    /// both, so the two shapes differ only in where this starts.
+    pub(crate) fn received<'a>(&self, whole: &'a [u8]) -> &'a [u8] {
+        if self.raw {
+            whole
+        } else {
+            crate::link::frame_payload(whole)
+        }
     }
 
     fn holds(&self) -> bool {
@@ -157,12 +190,13 @@ impl Inode for PacketSock {
         });
     }
 
-    /// `read(2)` on the socket: the next frame's payload. A short buffer
-    /// truncates, which is what a packet socket's read means on Linux too -
-    /// and a signal that ends the wait is `EINTR`, the same answer the
-    /// `recvfrom` door above gives for the same wait.
+    /// `read(2)` on the socket: the next frame, as this socket's type promises
+    /// it. A short buffer truncates, which is what a packet socket's read means
+    /// on Linux too - and a signal that ends the wait is `EINTR`, the same
+    /// answer the `recvfrom` door above gives for the same wait.
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        let (frame, _, _) = self.recv_blocking()?;
+        let (whole, _, _) = self.recv_blocking()?;
+        let frame = self.received(&whole);
         let n = frame.len().min(buf.len());
         buf[..n].copy_from_slice(&frame[..n]);
         Ok(n)
@@ -178,12 +212,13 @@ impl Inode for PacketSock {
 /// Weak, because the last close is the retirement and nothing else.
 static SOCKETS: Mutex<RefCell<Vec<Weak<PacketSock>>>> = Mutex::new(RefCell::new(Vec::new()));
 
-/// Open a packet socket: `socket(AF_PACKET, SOCK_DGRAM, protocol)`. The
-/// protocol arrives in *network* order, as every caller spells it; the
-/// filter compares it against the frame's own two bytes, also network order,
-/// so the comparison is of the two numbers as they sit on the wire.
-pub(crate) fn open(protocol_be: u16) -> Arc<PacketSock> {
-    let sock = PacketSock::new(protocol_be);
+/// Open a packet socket: `socket(AF_PACKET, typ, protocol)`. The protocol
+/// arrives in *network* order, as every caller spells it; the filter compares
+/// it against the frame's own two bytes, also network order, so the comparison
+/// is of the two numbers as they sit on the wire. `raw` is `SOCK_RAW` rather
+/// than `SOCK_DGRAM`, the only thing the two shapes differ in.
+pub(crate) fn open(protocol_be: u16, raw: bool) -> Arc<PacketSock> {
+    let sock = PacketSock::new(protocol_be, raw);
     critical_section::with(|cs| {
         let mut v = SOCKETS.borrow(cs).borrow_mut();
         if let Some(dead) = v.iter_mut().find(|w| w.weak_count() == 0) {
@@ -222,7 +257,6 @@ pub(crate) fn deliver(frame: &[u8]) {
     };
     let ethertype = eth.ethertype;
     let src = eth.src;
-    let payload = eth.payload;
     let woke: Vec<TaskId> = critical_section::with(|cs| {
         let mut woke = Vec::new();
         let mut v = SOCKETS.borrow(cs).borrow_mut();
@@ -234,10 +268,13 @@ pub(crate) fn deliver(frame: &[u8]) {
             if sock.protocol != 0 && sock.protocol != ethertype {
                 continue;
             }
+            // The whole frame is stored for both types; a `SOCK_RAW` reader
+            // takes it as it sits, a `SOCK_DGRAM` reader drops the header
+            // (`PacketSock::received`).
             sock.rx
                 .borrow(cs)
                 .borrow_mut()
-                .push((payload.to_vec(), src, ethertype));
+                .push((frame.to_vec(), src, ethertype));
             woke.extend(sock.waiters.borrow(cs).borrow().iter().copied());
         }
         woke
@@ -261,6 +298,21 @@ pub(crate) fn send(sock: &PacketSock, dst_mac: [u8; 6], payload: &[u8]) -> Resul
         sock.protocol
     };
     send_frame(dst_mac, ethertype, payload)
+}
+
+/// `sendto` on a `SOCK_RAW` socket: the caller built the whole frame, header
+/// and all, so it goes to the device byte for byte. The kernel's one job is to
+/// see that a header is actually there - a frame shorter than
+/// [`crate::link::ETH_HEADER_LEN`] is `EINVAL`, measured on the host - and it
+/// does *not* touch the header: `sll_addr` named no destination the frame did
+/// not already carry (measured: the header won when the two disagreed), so
+/// changing it here would be the kernel overruling the caller.
+pub(crate) fn send_raw(frame: &[u8]) -> Result<usize, isize> {
+    if frame.len() < crate::link::ETH_HEADER_LEN {
+        return Err(crate::err::EINVAL);
+    }
+    crate::net::packet_transmit(frame)?;
+    Ok(frame.len())
 }
 
 /// Put one frame on the wire: the header the kernel owns - destination as given,

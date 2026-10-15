@@ -179,10 +179,27 @@ pub fn encode_ethernet(dst: [u8; 6], src: [u8; 6], ethertype: u16, payload: &[u8
     frame
 }
 
-/// One tapped frame: the payload half (the `SOCK_DGRAM` promise), and the two
+/// One tapped frame: the **whole** Ethernet frame, header first, beside the two
 /// header facts a `recvfrom` answer needs - the source MAC and the Ethernet
 /// type, as their wire patterns.
+///
+/// The frame is kept whole because the two `AF_PACKET` receive shapes differ
+/// only in where the reader starts: `SOCK_DGRAM` is promised the payload half
+/// and drops the header with [`frame_payload`], while `SOCK_RAW` is promised the
+/// frame with its header on and hands back these same bytes. The tap knows the
+/// frame and not which type each socket wanted, so it stores one shape and lets
+/// the reader slice it - the alternative, a tap that split per socket, would
+/// mean dropping and re-splitting the same header once per listener.
 pub type Frame = (Vec<u8>, [u8; 6], u16);
+
+/// The payload half of a tapped frame: everything after the Ethernet header,
+/// which is what a `SOCK_DGRAM` reader is promised. An empty slice when there is
+/// no complete header to skip - the tap never stores such a frame (it splits
+/// with [`parse_ethernet`] first), but a test may, and a read past the end is
+/// the one answer it may not give.
+pub fn frame_payload(frame: &[u8]) -> &[u8] {
+    frame.get(ETH_HEADER_LEN..).unwrap_or(&[])
+}
 
 /// The receive ring one packet socket keeps: bounded, oldest-first, and full of
 /// the newest frames when it has overflowed.
@@ -329,6 +346,27 @@ mod tests {
         assert_eq!(back.src, [7, 8, 9, 10, 11, 12]);
         assert_eq!(back.ethertype, IPV4_ETHERTYPE);
         assert_eq!(back.payload, &[0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn the_payload_half_drops_the_header() {
+        // The `SOCK_DGRAM` promise: what a reader of the payload shape gets is
+        // the frame minus its header, and nothing else - the same bytes the
+        // pre-`SOCK_RAW` tap stored directly.
+        let frame = encode_ethernet(
+            [1, 2, 3, 4, 5, 6],
+            [7, 8, 9, 10, 11, 12],
+            IPV4_ETHERTYPE,
+            &[0xaa, 0xbb],
+        );
+        assert_eq!(frame_payload(&frame), &[0xaa, 0xbb]);
+        assert_eq!(frame_payload(&frame).len(), frame.len() - ETH_HEADER_LEN);
+
+        // A frame with no complete header has no payload to hand a reader: the
+        // empty slice, not a read past the end.
+        assert_eq!(frame_payload(&[]), &[] as &[u8]);
+        assert_eq!(frame_payload(&[0u8; ETH_HEADER_LEN - 1]), &[] as &[u8]);
+        assert_eq!(frame_payload(&[0u8; ETH_HEADER_LEN]), &[] as &[u8]);
     }
 
     #[test]

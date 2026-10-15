@@ -492,7 +492,7 @@ message.
 
 ---
 
-### 4.5 `AF_PACKET` — the link layer as a socket — **PARTIAL**, two gaps named
+### 4.5 `AF_PACKET` — the link layer as a socket — **PARTIAL**, the raw-IP unicast half named
 
 The kernel had been the last word on the machine's address with no door for
 userland to overrule it: `10.0.2.15` was a boot-time constant and `EAFNOSUPPORT`
@@ -507,14 +507,46 @@ drop, and `bind`/`getsockname`/`recvfrom` answering through the same
 `sockaddr_ll` (`linux/if_packet.h`'s real offsets: 20 bytes, address at 12).
 `SOL_PACKET` membership requests succeed because the tap already sees every
 frame of the socket's type; every other level is `ENOPROTOOPT`, Linux's own
-answer.
+answer. Both `AF_PACKET` types are served now: the paragraph above is the
+`SOCK_DGRAM` shape, and `SOCK_RAW` — whole frames in, the caller's own header
+out — is recorded in the closing bullet below.
 
 The named gaps, each with what it waits on:
 
-* `SOCK_RAW` — frames *with* their header on both sides. It is `EOPNOTSUPP`
-  because a caller that writes its own header writes a source MAC this kernel
-  cannot vouch for; the honest shape needs the header passed through untouched
-  and the length checked, not invented.
+* **Closed (2026-10-14): `SOCK_RAW` — frames *with* their header on both sides.**
+  The old `EOPNOTSUPP` was wrong twice over: it refused a shape a caller (an ARP
+  resolver, a bridge, `busybox`'s own raw paths) legitimately wants, and it was
+  not even Linux's refusal for an unsupported *type* — measured on the host
+  (`.workbuddy/probe_afpacket_type.c`, run under `sudo` for `CAP_NET_RAW`), an
+  `AF_PACKET` of any type but `SOCK_DGRAM`/`SOCK_RAW` answers `ESOCKTNOSUPPORT`
+  (94), while `SOCK_RAW` itself *opens*. The shape that landed, each rule
+  measured first (`.workbuddy/probe_afpacket_raw.c`, `probe_afpacket_raw2.c`,
+  `probe_afpacket_addr.c`, over a veth pair, so the wire is real):
+
+  * On **receive** a `SOCK_RAW` socket is handed the **whole** frame, its
+    Ethernet header in front, where `SOCK_DGRAM`'s is the payload half (measured:
+    the same 8-byte payload reads back as 22 bytes, the leading 14 the two MACs
+    and `88 b5`). The seam therefore stores the frame whole and slices at the
+    reader (`PacketSock::received`, `link::frame_payload`), so the tap — which
+    knows the frame and not each socket's type — does not split per listener.
+    `sll_protocol` still reports the frame's own ethertype and `sll_halen` is 6.
+  * On **send** a `SOCK_RAW` socket carries the caller's own header, and the
+    bytes go to the wire **untouched**. `sll_addr` names nothing (measured: the
+    header's destination won when the two disagreed), `sll_protocol` is ignored
+    (the frame's own type is the frame's), the only check is that a header is
+    actually there — shorter than 14 is `EINVAL` (14 passes, 13 does not) — and
+    the `sockaddr_ll` is still required because the frame alone cannot name the
+    interface (`ENXIO` without one, measured).
+
+  `t-dhcp` pins both halves on both machines: it opens a `SOCK_RAW` socket
+  beside the `SOCK_DGRAM` one, reads the same DHCP answer through both — equal
+  but for the fourteen-byte header, and that header names the device as the
+  sender — and then builds a DISCOVER octet by octet with its *own* Ethernet
+  header, sends it through the raw socket, and gets the server to answer the
+  transaction id it wrote, which is the whole-frame path measured end to end.
+  The unsupported-type refusal is pinned there too (`SOCK_STREAM` is
+  `ESOCKTNOSUPPORT`). `link::frame_payload` carries the host unit test for the
+  slice.
 * The boot still has no *working* client, and the two halves of that sentence are
   measured separately now (2026-10-12). **The wiring is in the image and runs**:
   `assets/rootfs/core/usr/share/udhcpc/default.script` is the script `ifup` hands
@@ -544,8 +576,7 @@ The named gaps, each with what it waits on:
   server 10.0.2.2` / `lease of 10.0.2.15 obtained from 10.0.2.2, lease time
   86400` (2026-10-13) - the address is the client's own negotiation from here,
   over a door userland drives, and not a number this kernel decided. What is
-  left is `AF_PACKET`'s `SOCK_RAW` and the door's unicast half, both named
-  above and below.
+  left is the raw-IP door's unicast half, named below.
 * **What a first attempt at that door measured, and why it was reverted** (2026-10-12).
   The rules were measured on the host first (`.workbuddy/probe_rawip.c`): `IP_HDRINCL`
   reads **1** on a fresh `SOCK_RAW`/`IPPROTO_RAW` socket (the protocol implies the

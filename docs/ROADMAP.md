@@ -31,9 +31,10 @@ One-glance status of the whole roadmap.
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
 - [~] 4.3 TCP — loopback, listener and `SO_REUSEADDR` done; two options record-only (§4.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
-- [~] 4.5 `AF_PACKET` — link layer as a socket, userland DHCP can ask; the wire format's host
-  pin landed (`crates/link`, `fuzz/link_wire`, §4.5); `SOCK_RAW` frames `EOPNOTSUPP`; the
-  raw-IP door (`IPPROTO_RAW`) is open with named gaps left *(in flight)* (§4.5)
+- [~] 4.5 `AF_PACKET` — link layer as a socket, userland DHCP can ask; both types served —
+  `SOCK_DGRAM` (payload shape) and `SOCK_RAW` (whole frames in, the caller's own header out) —
+  and the wire format's host pin landed (`crates/link`, `fuzz/link_wire`, §4.5); the raw-IP
+  door (`IPPROTO_RAW`) is open with its unicast half the one named gap left (§4.5)
 
 **Memory (Phase 5)**
 - [x] anonymous demand paging — a `mmap` is an address space; `mincore` reads the page tables (§5.1, §5.2)
@@ -212,8 +213,10 @@ In the order that keeps each step verifiable on its own:
    ethertype constant was written with the wrong endian detour, so no door was ever filled.
    `t-dhcp` now reads one answer with each of the two calls. The wire-format parsers' missing
    host-side pin **closed** (2026-10-13): the `sockaddr_ll` decode, the Ethernet header and the
-   frame ring moved to the `crates/link` leaf (`fuzz/link_wire`), so what is left is the two
-   named gaps: `SOCK_RAW` frames and the unicast half of the raw send.
+   frame ring moved to the `crates/link` leaf (`fuzz/link_wire`). `AF_PACKET`'s **`SOCK_RAW`**
+   **closed** (2026-10-14): whole frames in, the caller's own header out, with each rule
+   measured on the host and both halves pinned by `t-dhcp` (§4.5), so what is left is the one
+   named gap: the unicast half of the raw-IP send.
 4. **the weston pointer on the window** (R.7, §7.4) — the root cause is fixed in code: the cursor
    queue is configured when the device has one, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` is accepted
    with `HOTSPOT_X`/`HOTSPOT_Y` published per-client, and binding or moving the plane hands the

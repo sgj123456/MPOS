@@ -55,6 +55,10 @@ use rustix::time::Timespec;
 const ETH_P_IP: i32 = 0x0008;
 /// `ARPHRD_ETHER`, the only hardware type this link has.
 const ARPHRD_ETHER: u16 = 1;
+/// `ETH_HLEN`, from `linux/if_ether.h`: two MACs and the type. A `SOCK_RAW`
+/// send shorter than this is `EINVAL` (measured), and the offset a `SOCK_RAW`
+/// read hands the payload at.
+const ETH_HEADER_LEN: usize = 14;
 
 /// `SIOCGIFINDEX` - `if_nametoindex(3)` is this request, and it is what says
 /// which interface the DISCOVER goes out on.
@@ -266,6 +270,45 @@ fn main() {
     };
     check_ok(&mut r, "bind to eth0's index succeeds", got);
 
+    // --- the family's other shape: SOCK_RAW ---
+    //
+    // A `SOCK_RAW` socket differs from the `SOCK_DGRAM` one in exactly two
+    // places, and this program checks both. On *receive* it is promised the
+    // frame with its Ethernet header on, where `SOCK_DGRAM` is promised the
+    // payload half. On *send* it carries the caller's own header, where
+    // `SOCK_DGRAM` has the kernel build one. Opened before the DISCOVER below
+    // so that its queue catches the same answer.
+    let rawpkt = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, ETH_P_IP) };
+    check_ok(
+        &mut r,
+        "socket(AF_PACKET, SOCK_RAW) opens",
+        as_raw(rawpkt as isize),
+    );
+    if rawpkt < 0 {
+        r.finish();
+    }
+    let rawpkt = unsafe { OwnedFd::from_raw_fd(rawpkt) };
+    let got = unsafe {
+        as_raw(libc::bind(
+            rawpkt.as_raw_fd(),
+            (&raw mut sll).cast::<libc::sockaddr>(),
+            core::mem::size_of::<SockaddrLl>() as libc::socklen_t,
+        ) as isize)
+    };
+    check_ok(&mut r, "and binds to eth0's index too", got);
+
+    // A type the family does not serve is `ESOCKTNOSUPPORT`, not the
+    // `EOPNOTSUPP` this door used to give every non-`SOCK_DGRAM` type: measured
+    // on the host, `SOCK_STREAM`/`SOCK_SEQPACKET`/`SOCK_RDM` are all errno 94.
+    let stream = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_STREAM, ETH_P_IP) };
+    r.check(
+        &format!(
+            "AF_PACKET SOCK_STREAM is ESOCKTNOSUPPORT (got {})",
+            as_raw(stream as isize)
+        ),
+        as_raw(stream as isize) == -libc::ESOCKTNOSUPPORT as isize,
+    );
+
     // --- a DISCOVER, octet by octet: 20 IP + 8 UDP + 264 BOOTP+options ---
     const TOTAL: usize = 292;
     // The two bases the fields are named against. The IPv4 destination is
@@ -353,14 +396,18 @@ fn main() {
     }
 
     let mut rx = [0u8; 600];
+    // The sender the DGRAM read names, kept so the raw read's header can be
+    // checked against it below: the two doors answer about the same frame.
+    let mut sender = SockaddrLl::default();
+    let mut senderlen = core::mem::size_of::<SockaddrLl>() as libc::socklen_t;
     let got = unsafe {
         as_raw(libc::recvfrom(
             sock.as_raw_fd(),
             rx.as_mut_ptr().cast::<c_void>(),
             rx.len(),
             0,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
+            (&raw mut sender).cast::<libc::sockaddr>(),
+            &raw mut senderlen,
         ) as isize)
     };
     r.check(
@@ -392,6 +439,51 @@ fn main() {
             ),
             rx[BOOTP + 28..BOOTP + 34] == mac,
         );
+
+        // The same answer again, through the raw socket that was open beside
+        // this one when the DISCOVER went out: the *same* bytes with fourteen
+        // more in front. The comparison is the claim - a raw read that
+        // returned the payload would be short by exactly the header, and one
+        // that returned a *different* frame would not end where this one does.
+        let mut rxraw = [0u8; 640];
+        let raw_got = unsafe {
+            as_raw(libc::recvfrom(
+                rawpkt.as_raw_fd(),
+                rxraw.as_mut_ptr().cast::<c_void>(),
+                rxraw.len(),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            ) as isize)
+        };
+        r.check(
+            &format!(
+                "the raw socket reads it too, with the header on (got {raw_got}, want {})",
+                got + ETH_HEADER_LEN as isize
+            ),
+            raw_got == got + ETH_HEADER_LEN as isize,
+        );
+        r.check(
+            &format!(
+                "whose type is IPv4's 08 00 ({:02x} {:02x})",
+                rxraw[12], rxraw[13]
+            ),
+            rxraw[12] == 0x08 && rxraw[13] == 0x00,
+        );
+        r.check(
+            &format!(
+                "whose source MAC is the sender the DGRAM read named ({:02x?})",
+                &sender.addr[..6]
+            ),
+            rxraw[6..12] == sender.addr[..6],
+        );
+        if raw_got > ETH_HEADER_LEN as isize {
+            let n = raw_got as usize - ETH_HEADER_LEN;
+            r.check(
+                "and whose payload half is the DGRAM reader's frame, byte for byte",
+                rxraw[ETH_HEADER_LEN..raw_got as usize] == rx[..n],
+            );
+        }
     }
 
     // --- the same DISCOVER through the door a shipping client opens first ---
@@ -612,6 +704,148 @@ fn main() {
         );
     } else {
         r.check("a unicast through it is EOPNOTSUPP", false);
+    }
+
+    // --- a DISCOVER sent through the SOCK_RAW socket, header and all ---
+    //
+    // Where the `SOCK_DGRAM` send above handed the kernel a payload, a
+    // `SOCK_RAW` send carries the caller's own Ethernet header and the bytes go
+    // to the wire untouched. Built here the way an ARP client or a bridge would,
+    // with the broadcast destination a DISCOVER needs. The `sockaddr_ll` names
+    // *no* address on purpose: a raw send takes the interface from it and the
+    // destination from the frame's own header (measured - the header won when
+    // the two disagreed), so a reply proves the header reached the wire intact.
+    const RAWPKT_XID: u32 = 0x4d504f55;
+    // The unicast section above rewrote the header's destination to the
+    // server's address and left the checksum stale; this frame is a broadcast
+    // DISCOVER again, so restore the broadcast address and recompute its
+    // checksum - a server drops a packet whose IP checksum is wrong. The
+    // checksum field is zeroed before the sum, the way the original build
+    // computed it (summing the field over itself does not).
+    pkt[IP_DST..IP_DST + 4].copy_from_slice(&[255, 255, 255, 255]);
+    pkt[10..12].copy_from_slice(&[0, 0]);
+    let ip_csum = cksum(&pkt[0..20]).to_be_bytes();
+    pkt[10..12].copy_from_slice(&ip_csum);
+    pkt[BOOTP + 4..BOOTP + 8].copy_from_slice(&RAWPKT_XID.to_be_bytes());
+
+    // The raw socket has been open through every door above, so it holds each
+    // earlier answer still unread (the first DISCOVER's was read, but the
+    // raw-IP door's was read on the *other* socket). Drain them so the read
+    // below is this send's own answer and no earlier frame's.
+    let mut scratch = [0u8; 640];
+    loop {
+        let n = unsafe {
+            as_raw(libc::recvfrom(
+                rawpkt.as_raw_fd(),
+                scratch.as_mut_ptr().cast::<c_void>(),
+                scratch.len(),
+                libc::MSG_DONTWAIT,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            ) as isize)
+        };
+        if n < 0 {
+            break;
+        }
+    }
+
+    let mut rawdst = SockaddrLl {
+        family: libc::AF_PACKET as u16,
+        protocol: ETH_P_IP as u16,
+        ifindex,
+        ..SockaddrLl::default()
+    };
+    let mut built = [0u8; ETH_HEADER_LEN + TOTAL];
+    built[0..6].copy_from_slice(&[0xff; 6]); // broadcast destination
+    built[6..12].copy_from_slice(&mac); // the device's own source
+    built[12] = 0x08;
+    built[13] = 0x00; // ETH_P_IP
+    built[ETH_HEADER_LEN..].copy_from_slice(&pkt);
+
+    // A frame with no room for a header is not a frame: `EINVAL`, measured (a
+    // 13-byte send with a real `sockaddr_ll` is refused, a 14-byte one is not).
+    let runt = unsafe {
+        as_raw(libc::sendto(
+            rawpkt.as_raw_fd(),
+            built.as_ptr().cast::<c_void>(),
+            ETH_HEADER_LEN - 1,
+            0,
+            (&raw mut rawdst).cast::<libc::sockaddr>(),
+            core::mem::size_of::<SockaddrLl>() as libc::socklen_t,
+        ) as isize)
+    };
+    r.check(
+        &format!("a raw send shorter than a header is EINVAL (got {runt})"),
+        runt == -(libc::EINVAL as isize),
+    );
+
+    // And a raw send with no `sockaddr_ll` cannot name the interface at all,
+    // even though the frame names every MAC it needs: `ENXIO`, measured. The
+    // address check runs before the length one, so this is the whole frame.
+    let headless = unsafe {
+        as_raw(libc::sendto(
+            rawpkt.as_raw_fd(),
+            built.as_ptr().cast::<c_void>(),
+            built.len(),
+            0,
+            core::ptr::null(),
+            0,
+        ) as isize)
+    };
+    r.check(
+        &format!("a raw send with no sockaddr_ll is ENXIO (got {headless})"),
+        headless == -(libc::ENXIO as isize),
+    );
+
+    let sent_raw = unsafe {
+        as_raw(libc::sendto(
+            rawpkt.as_raw_fd(),
+            built.as_ptr().cast::<c_void>(),
+            built.len(),
+            0,
+            (&raw mut rawdst).cast::<libc::sockaddr>(),
+            core::mem::size_of::<SockaddrLl>() as libc::socklen_t,
+        ) as isize)
+    };
+    r.check(
+        &format!(
+            "the whole frame goes through the raw socket (got {sent_raw}, want {})",
+            built.len()
+        ),
+        sent_raw == built.len() as isize,
+    );
+
+    // The server answers it - proof the caller's frame reached the wire
+    // unchanged, because only the header's broadcast destination and the BOOTP
+    // transaction id we wrote can have brought a reply back.
+    let mut waiting_raw = [PollFd::new(&rawpkt, PollFlags::IN)];
+    let ready_raw = poll(&mut waiting_raw, Some(&PATIENCE));
+    r.check(
+        &format!("and the raw-built DISCOVER is answered ({ready_raw:?})"),
+        ready_raw == Ok(1),
+    );
+    if ready_raw == Ok(1) {
+        let mut rxr = [0u8; 640];
+        let n = unsafe {
+            as_raw(libc::recvfrom(
+                rawpkt.as_raw_fd(),
+                rxr.as_mut_ptr().cast::<c_void>(),
+                rxr.len(),
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            ) as isize)
+        };
+        let at = ETH_HEADER_LEN + BOOTP + 4;
+        let xid = if n as usize >= at + 4 {
+            u32::from_be_bytes([rxr[at], rxr[at + 1], rxr[at + 2], rxr[at + 3]])
+        } else {
+            0
+        };
+        r.check(
+            &format!("carrying the transaction id we wrote ({xid:#x})"),
+            xid == RAWPKT_XID,
+        );
     }
 
     unsafe { libc::close(raw as i32) };

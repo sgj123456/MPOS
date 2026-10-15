@@ -1087,10 +1087,9 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
     if domain == crate::link::AF_PACKET {
         // Every packet socket needs `CAP_NET_RAW`, `SOCK_DGRAM` included:
         // measured on the host, an unprivileged caller is refused `EPERM` for
-        // both types. It is asked before this family's own refusals, so a lowered
-        // caller hears `EPERM` for a `SOCK_RAW` this kernel does not serve
-        // (`EOPNOTSUPP` for one that does hold the capability) - Linux's
-        // observable answer in both cases.
+        // both types. It is asked before this family's own refusal of an
+        // unsupported type, so a lowered caller hears `EPERM` for any type -
+        // Linux's observable answer.
         if !crate::sched::current_credentials().has_effective(crate::cred::CAP_NET_RAW) {
             return err::EPERM;
         }
@@ -1098,14 +1097,15 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         let nonblock = raw_type & SOCK_NONBLOCK != 0;
         let cloexec = raw_type & SOCK_CLOEXEC != 0;
         let typ = raw_type & !(SOCK_NONBLOCK | SOCK_CLOEXEC);
-        if typ != SOCK_DGRAM as u32 {
-            // SOCK_DGRAM only. `SOCK_RAW` would hand frames up with their
-            // Ethernet header and put that header's source MAC on the
-            // caller to invent per send; building it here is a named gap,
-            // and `EOPNOTSUPP` is the refusal the caller can branch on.
-            return err::EOPNOTSUPP;
+        // The two shapes a packet socket comes in: `SOCK_DGRAM` (payload in,
+        // header built by the kernel) and `SOCK_RAW` (frame in, frame out,
+        // header on both). Any other type is `ESOCKTNOSUPPORT`, measured on the
+        // host (94 for `SOCK_STREAM`/`SOCK_SEQPACKET`/`SOCK_RDM`), not the
+        // `EOPNOTSUPP` this door used to give every non-`SOCK_DGRAM` type.
+        if typ != SOCK_DGRAM as u32 && typ != SOCK_RAW as u32 {
+            return err::ESOCKTNOSUPPORT;
         }
-        let sock = crate::net::packet::open(args[2] as u16);
+        let sock = crate::net::packet::open(args[2] as u16, typ == SOCK_RAW as u32);
         let fd = match crate::vfs::open_inode(sock) {
             Ok(fd) => fd,
             Err(e) => return crate::uaccess::err_of(e),
@@ -1523,10 +1523,15 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
         return crate::net::rtnl::send(handle, data);
     }
     // A packet socket's send: the destination is a `sockaddr_ll` - a MAC on
-    // the link, not an endpoint in the stack - and the Ethernet header is
-    // this kernel's to build, which is what the `SOCK_DGRAM` shape of the
-    // family promises and what `parse_sll_from_user` here makes the caller
-    // name instead of writing.
+    // the link, not an endpoint in the stack. The two shapes differ here. A
+    // `SOCK_DGRAM` send hands the kernel a payload and the header is the
+    // kernel's to build, which is what `parse_sll_from_user` here makes the
+    // caller name instead of writing. A `SOCK_RAW` send carries the caller's
+    // own Ethernet header: the bytes go to the device untouched (the header's
+    // destination names the frame, not `sll_addr` - measured), the only check
+    // is that a header is there to send, and the `sockaddr_ll` is still
+    // required because the frame alone cannot name the interface (`ENXIO`
+    // without one, measured).
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
         && let Some(sock) = file.inode().as_any().downcast_ref::<PacketSock>()
     {
@@ -1534,6 +1539,21 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
             return err::EFAULT;
         }
         let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
+        if sock.is_raw() {
+            if args[4] == 0 {
+                return err::ENXIO;
+            }
+            // Parsed for its shape only - a short or wrong-family address is
+            // `EINVAL` - because the frame's own header, not this, names the
+            // destination.
+            if let Err(e) = crate::net::packet::parse_sll_from_user(args[4], args[5], from_user) {
+                return e;
+            }
+            return match crate::net::packet::send_raw(data) {
+                Ok(n) => n as isize,
+                Err(e) => e,
+            };
+        }
         let dst = if args[4] != 0 {
             match crate::net::packet::parse_sll_from_user(args[4], args[5], from_user) {
                 Ok(sll) => {
@@ -2069,10 +2089,12 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         }
         return n as isize;
     }
-    // A packet socket's receive: one frame per call, its payload only (the
-    // `SOCK_DGRAM` promise), and the sender's *link* address for the
-    // `src_addr` slots - a `sockaddr_ll` naming the frame's source MAC and
-    // type, which is how a DHCP client checks who answered.
+    // A packet socket's receive: one frame per call - the payload only for a
+    // `SOCK_DGRAM` socket (the header is the kernel's to add back on a send),
+    // the whole frame with its header on for a `SOCK_RAW` one (`sock.received`)
+    // - and the sender's *link* address for the `src_addr` slots, a
+    // `sockaddr_ll` naming the frame's source MAC and type, which is how a DHCP
+    // client checks who answered.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
         && let Some(sock) = file.inode().as_any().downcast_ref::<PacketSock>()
     {
@@ -2096,7 +2118,8 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
                 Err(e) => return crate::uaccess::err_of(e),
             }
         };
-        let (payload, src, proto) = frame;
+        let (whole, src, proto) = frame;
+        let payload = sock.received(&whole);
         let n = payload.len().min(len);
         unsafe {
             core::ptr::copy_nonoverlapping(payload.as_ptr(), buf as *mut u8, n);
@@ -2324,7 +2347,8 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
                 Err(e) => return crate::uaccess::err_of(e),
             }
         };
-        let (payload, src, proto) = frame;
+        let (whole, src, proto) = frame;
+        let payload = sock.received(&whole);
         let n = payload.len().min(len);
         unsafe {
             core::ptr::copy_nonoverlapping(payload.as_ptr(), buf as *mut u8, n);

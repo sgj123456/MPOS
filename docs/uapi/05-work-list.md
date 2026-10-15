@@ -224,8 +224,23 @@ the commit bodies), and each moved its pin in the same commit.
     reports zero until something stamps it — Linux's devtmpfs stamps one at creation, and there
     is no mount-time number here to give a node that arrives when its driver registers it. The
     directories, symlinks and socket names devfs makes, which hold no `NodePerms`, keep them too
-    now — the refusal a desktop still showed came from that same pass (`docs/notes/` §15.35) — and
+    now — the     refusal a desktop still showed came from that same pass (`docs/notes/` §15.35) — and
     the trait's default, for a node that has nowhere to keep a clock, answers `EPERM`: measured
     on the host, that is what every anonymous-inode descriptor (`eventfd`, `epoll`, `timerfd`,
     `signalfd`, `inotify`) and every `/proc` directory answer, while `EOPNOTSUPP` is not a
     refusal Linux gives this call at all.
+
+14. **`AF_PACKET` `SOCK_RAW` — the frame *with* its Ethernet header, on both sides.** The
+    family refused every type but `SOCK_DGRAM` with `EOPNOTSUPP`, which was wrong twice: a
+    caller that wants the header (an ARP resolver, a bridge, `busybox`'s own raw paths) is owed
+    it, and an unsupported *type* is `ESOCKTNOSUPPORT` (94) on Linux, not `EOPNOTSUPP`.
+    Measured on this host before the change (`.workbuddy/probe_afpacket_{raw,raw2,addr,type}.c`,
+    on a veth pair): a `SOCK_RAW` read is the whole frame with its header in front; a `SOCK_RAW`
+    send puts the caller's frame on the wire untouched — the header's destination won over
+    `sll_addr` when the two disagreed and `sll_protocol` is ignored — while a frame shorter than
+    14 is `EINVAL` and a send with no `sockaddr_ll` is `ENXIO`. Owner: `src/net/packet.rs`
+    (`PacketSock::raw`, a whole-frame ring, `received`, `send_raw`), `crates/link`
+    (`frame_payload`), `src/net/socket.rs` (create, send, both receive doors). Pin: `t-dhcp`
+    on **both** machines (a raw socket reads the same answer beside the DGRAM one, and a
+    self-built frame goes out the raw socket and draws an answer to the id it wrote) plus a
+    `link::frame_payload` host unit test. Closes `docs/notes/` §4.5.
