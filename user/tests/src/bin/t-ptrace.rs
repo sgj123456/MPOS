@@ -48,6 +48,10 @@
 //!   that rewrites the *number* at a `PTRACE_SYSCALL` entry stop changes which
 //!   call runs - the redirect's ordinary half, next to the seccomp-stop one
 //!   `t-seccomp` pins.
+//! * And the same write's two other stops: the `-1` sentinel *cancels* the call
+//!   at an entry stop - it does not run at all, and the tracee reads `-ENOSYS` -
+//!   while the same write at the *exit* stop is a no-op, because by then the
+//!   call has already run.
 
 use std::io;
 use std::os::raw::{c_long, c_void};
@@ -103,6 +107,7 @@ const NUMBER_SLOT: usize = 8;
 const ESRCH: i32 = 3;
 const EIO: i32 = 5;
 const EINVAL: i32 = 22;
+const ENOSYS: i32 = 38;
 
 /// The report shape the std-side tests share: a name, whether it held, and a
 /// failure flag the exit status is built from.
@@ -195,6 +200,8 @@ fn main() {
 
     trace_from_parent(&mut r, child);
     entry_stop_rewrite_changes_the_call(&mut r);
+    entry_stop_cancel_skips_the_call(&mut r);
+    exit_stop_number_write_is_a_no_op(&mut r);
 
     if r.failed {
         println!("t-ptrace: FAILED");
@@ -382,6 +389,310 @@ fn entry_stop_rewrite_changes_the_call(r: &mut Report) {
     r.check(
         &format!(
             "the tracee saw the redirect too (exit {})",
+            libc::WEXITSTATUS(status)
+        ),
+        n == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+    );
+}
+
+/// The other thing a `PTRACE_SETREGS` at an entry stop can do with the number
+/// slot: **cancel** the call - Linux's `nr = -1` sentinel - rather than replace
+/// it with another number.
+///
+/// Measured on this developer's Linux first (kernel 7.2,
+/// `.workbuddy/probe-ptrace-cancel.c`): writing `-1` into the number slot at a
+/// `write`'s entry stop leaves the pipe **empty**, the tracee's `syscall()`
+/// answers `-1` with `ENOSYS`, and the exit stop's result is `-ENOSYS` (`rax =
+/// -38`). The same probe showed two neighbours worth stating rather than
+/// assuming: an **out-of-range** number (`9999`) is the *same* answer - the call
+/// does not run and the result is `-ENOSYS`, so `-1` is not special, only
+/// unreachable - and a write at the **exit** stop is a no-op, because by then
+/// the call has already run.
+///
+/// The pipe is what makes this worth pinning rather than assuming: a kernel
+/// that answered `ENOSYS` *after* making the call would satisfy an errno check
+/// and still have written the bytes. Only an empty pipe proves the call was
+/// skipped.
+fn entry_stop_cancel_skips_the_call(r: &mut Report) {
+    let mut fds = [0i32; 2];
+    // SAFETY: `fds` is a local of two ints.
+    let made = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    r.check("the cancel probe's pipe is made", made == 0);
+    if made != 0 {
+        return;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+
+    // SAFETY: as `main`'s fork note - syscalls only, no allocation, `_exit`.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: as above.
+        unsafe {
+            libc::close(read_fd);
+            // The tracee's stdout becomes the pipe, so the only way bytes get
+            // into it is the very call the tracer is about to cancel.
+            if libc::dup2(write_fd, 1) < 0 {
+                libc::_exit(11);
+            }
+            libc::close(write_fd);
+            if ptrace(libc::PTRACE_TRACEME as c_long, 0, 0, 0) != Ok(0) {
+                libc::_exit(11);
+            }
+            libc::raise(libc::SIGSTOP);
+            let got = libc::syscall(libc::SYS_write, 1 as c_long, b"hello".as_ptr(), 5 as c_long);
+            let enosys =
+                got == -1 && std::io::Error::last_os_error().raw_os_error() == Some(ENOSYS);
+            libc::_exit(if enosys { 0 } else { 13 });
+        }
+    }
+    r.check("the cancel probe's tracee was forked", child > 0);
+    // The parent's own copy of the write end has to go, or the read below never
+    // reaches end-of-stream.
+    // SAFETY: this process's own descriptor.
+    unsafe { libc::close(write_fd) };
+    if child <= 0 {
+        // SAFETY: this process's own descriptor.
+        unsafe { libc::close(read_fd) };
+        return;
+    }
+
+    let mut status: libc::c_int = 0;
+    // SAFETY: `child` is this process's own child and `status` is a local.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    r.check(
+        "the cancel probe's tracee stops for TRACEME",
+        n == child && libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP,
+    );
+    if n != child {
+        // SAFETY: this process's own descriptor.
+        unsafe { libc::close(read_fd) };
+        return;
+    }
+
+    // Walk to the judged `write`'s entry stop the way the redirect above does.
+    let mut info = [0u8; SYSCALL_INFO_BYTES];
+    let base = info.as_mut_ptr() as usize;
+    let mut at_entry = false;
+    for _ in 0..8 {
+        if ptrace(libc::PTRACE_SYSCALL as c_long, child, 0, 0) != Ok(0) {
+            break;
+        }
+        // SAFETY: as above.
+        let n = unsafe { libc::waitpid(child, &mut status, 0) };
+        if n != child || !libc::WIFSTOPPED(status) {
+            break;
+        }
+        if ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base)
+            != Ok(SYSCALL_INFO_BYTES as isize)
+        {
+            break;
+        }
+        let nr = u64::from_le_bytes(info[NR..NR + 8].try_into().unwrap());
+        if info[OP] == OP_ENTRY && nr == libc::SYS_write as u64 {
+            at_entry = true;
+            break;
+        }
+    }
+    r.check("the judged write's entry stop arrives", at_entry);
+    if !at_entry {
+        // SAFETY: this process's own descriptor.
+        unsafe { libc::close(read_fd) };
+        return;
+    }
+
+    let mut regs = [0u64; REG_WORDS];
+    let read = ptrace(
+        libc::PTRACE_GETREGS as c_long,
+        child,
+        0,
+        regs.as_mut_ptr() as usize,
+    );
+    r.check_call(
+        "the tracer reads the registers at the judged write's entry stop",
+        read,
+        0,
+    );
+    // The sentinel, in the machine's slot. `-1` in the number slot is the
+    // cancel, written as the all-ones word because that is the slot's width.
+    regs[NUMBER_SLOT] = u64::MAX;
+    r.check(
+        "the tracer cancels the call by writing -1 into the number slot",
+        ptrace(
+            libc::PTRACE_SETREGS as c_long,
+            child,
+            0,
+            regs.as_ptr() as usize,
+        ) == Ok(0),
+    );
+
+    // The exit stop. At an *exit* stop the structure's second field is the
+    // *result*, not the number (`struct ptrace_syscall_info`'s union), and the
+    // measured answer for a cancelled call is `-ENOSYS`.
+    let mut saw_result = None;
+    if ptrace(libc::PTRACE_SYSCALL as c_long, child, 0, 0) == Ok(0) {
+        // SAFETY: as above.
+        let n = unsafe { libc::waitpid(child, &mut status, 0) };
+        if n == child
+            && libc::WIFSTOPPED(status)
+            && ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base)
+                == Ok(SYSCALL_INFO_BYTES as isize)
+            && info[OP] == OP_EXIT
+        {
+            saw_result = Some(i64::from_le_bytes(info[NR..NR + 8].try_into().unwrap()));
+        }
+    }
+    r.check(
+        &format!("the exit stop's result is -ENOSYS ({saw_result:?}, want -38)"),
+        saw_result == Some(-(ENOSYS as i64)),
+    );
+
+    r.check_call(
+        "PTRACE_CONT releases the cancelled tracee",
+        ptrace(libc::PTRACE_CONT as c_long, child, 0, 0),
+        0,
+    );
+    // SAFETY: as above.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    r.check(
+        &format!(
+            "the tracee read the cancel as ENOSYS (exit {})",
+            libc::WEXITSTATUS(status)
+        ),
+        n == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+    );
+
+    // The proof that the call was *skipped* rather than failed after running.
+    // Read after the tracee is gone, so its write end is closed and this cannot
+    // block.
+    let mut buf = [0u8; 16];
+    // SAFETY: this process's own descriptor and a local buffer.
+    let got = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+    r.check(
+        &format!("the cancelled call wrote nothing (read {got} bytes)"),
+        got == 0,
+    );
+    // SAFETY: this process's own descriptor.
+    unsafe { libc::close(read_fd) };
+}
+
+/// The number slot's third stop: a write at the **exit** stop is a no-op.
+///
+/// The call has already run by then, so the number names nothing that can still
+/// happen. Measured on this developer's Linux first (kernel 7.2,
+/// `.workbuddy/probe-ptrace-cancel.c`, case 4): rewriting `orig_rax` at a
+/// `getpid`'s exit stop left the tracee's answer as its own real pid. This is
+/// worth a pin because the natural way to get the cancel wrong is to apply it
+/// at the wrong stop - a kernel that treated the exit stop's `-1` as a cancel
+/// would throw away a result the tracee already earned.
+fn exit_stop_number_write_is_a_no_op(r: &mut Report) {
+    // SAFETY: as `main`'s fork note - syscalls only, no allocation, `_exit`.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: as above.
+        unsafe {
+            if ptrace(libc::PTRACE_TRACEME as c_long, 0, 0, 0) != Ok(0) {
+                libc::_exit(11);
+            }
+            libc::raise(libc::SIGSTOP);
+            // The call's own answer is the verdict: a real pid means it ran and
+            // its result survived.
+            let got = libc::syscall(libc::SYS_getpid) as isize;
+            libc::_exit(if got > 0 { 0 } else { 13 });
+        }
+    }
+    r.check("the exit-write probe's tracee was forked", child > 0);
+    if child <= 0 {
+        return;
+    }
+    let mut status: libc::c_int = 0;
+    // SAFETY: `child` is this process's own child and `status` is a local.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    r.check(
+        "the exit-write probe's tracee stops for TRACEME",
+        n == child && libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP,
+    );
+    if n != child {
+        return;
+    }
+
+    let mut info = [0u8; SYSCALL_INFO_BYTES];
+    let base = info.as_mut_ptr() as usize;
+    let mut at_entry = false;
+    for _ in 0..8 {
+        if ptrace(libc::PTRACE_SYSCALL as c_long, child, 0, 0) != Ok(0) {
+            break;
+        }
+        // SAFETY: as above.
+        let n = unsafe { libc::waitpid(child, &mut status, 0) };
+        if n != child || !libc::WIFSTOPPED(status) {
+            break;
+        }
+        if ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base)
+            != Ok(SYSCALL_INFO_BYTES as isize)
+        {
+            break;
+        }
+        let nr = u64::from_le_bytes(info[NR..NR + 8].try_into().unwrap());
+        if info[OP] == OP_ENTRY && nr == libc::SYS_getpid as u64 {
+            at_entry = true;
+            break;
+        }
+    }
+    r.check("the judged getpid's entry stop arrives", at_entry);
+    if !at_entry {
+        return;
+    }
+
+    // One boundary further: the judged call's exit stop, where the structure's
+    // second field is the result.
+    let mut saw_result = None;
+    if ptrace(libc::PTRACE_SYSCALL as c_long, child, 0, 0) == Ok(0) {
+        // SAFETY: as above.
+        let n = unsafe { libc::waitpid(child, &mut status, 0) };
+        if n == child
+            && libc::WIFSTOPPED(status)
+            && ptrace(PTRACE_GET_SYSCALL_INFO, child, SYSCALL_INFO_BYTES, base)
+                == Ok(SYSCALL_INFO_BYTES as isize)
+            && info[OP] == OP_EXIT
+        {
+            saw_result = Some(i64::from_le_bytes(info[NR..NR + 8].try_into().unwrap()));
+        }
+    }
+    r.check(
+        &format!("the exit stop reports the call's real result ({saw_result:?}, want {child})"),
+        saw_result == Some(child as i64),
+    );
+
+    let mut regs = [0u64; REG_WORDS];
+    let read = ptrace(
+        libc::PTRACE_GETREGS as c_long,
+        child,
+        0,
+        regs.as_mut_ptr() as usize,
+    );
+    r.check_call("the tracer reads the registers at the exit stop", read, 0);
+    // The same sentinel that *cancels* at an entry stop, written here.
+    regs[NUMBER_SLOT] = u64::MAX;
+    r.check(
+        "the tracer rewrites the number slot at the exit stop",
+        ptrace(
+            libc::PTRACE_SETREGS as c_long,
+            child,
+            0,
+            regs.as_ptr() as usize,
+        ) == Ok(0),
+    );
+
+    r.check_call(
+        "PTRACE_CONT releases the exit-written tracee",
+        ptrace(libc::PTRACE_CONT as c_long, child, 0, 0),
+        0,
+    );
+    // SAFETY: as above.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    r.check(
+        &format!(
+            "the tracee kept the result the call already earned (exit {})",
             libc::WEXITSTATUS(status)
         ),
         n == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,

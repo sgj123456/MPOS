@@ -253,9 +253,58 @@ answers normally — caught each in turn.
       against `pass=172 fail=1` with `t-ptrace` the one red; aarch64 is
       `pass=172 fail=0`, where the slot reads 172 and the answer is the parent's
       10.
-      - Not measured, and recorded rather than guessed: a rewrite at either stop
-        that *cancels* the call - Linux's `nr = -1` sentinel - rather than
-        replacing it with another number. Nothing in the sweep asks for it.
+      One ordering question these probes settled on the way, because the redirect
+      is what makes it matter: with a `SECCOMP_RET_ERRNO` filter judging a call, a
+      tracer at the *ordinary* entry stop still redirects it, and the filter
+      judges the number the tracer **wrote**, not the one the program asked for.
+      Measured on this developer's kernel first (7.2,
+      `.workbuddy/probe-seccomp-order.c`, three modes): a filter on `getpid` with
+      a rewrite to `getppid` ran `getppid` (the answer was a parent's pid); the
+      *same* rewrite under a filter on `getppid` was refused `EPERM`; and no
+      rewrite under the `getpid` filter was refused `EPERM`. The second mode is
+      the one that tells the two orders apart - a kernel that judged the number
+      the program asked for would have *allowed* it, since that filter never
+      names `getpid`. `dispatch`'s order is Linux's already (the entry stop
+      outside, the filter inside, both before the table), so nothing moved here.
+      - **And the `-1` sentinel at either stop: the call is *cancelled* - done
+        (2026-10-16).** A `PTRACE_SETREGS` that writes `-1` into the number slot
+        asks for something other than a redirect: the call must not run at all,
+        and the tracee reads `-ENOSYS`. Nothing in the sweep asked for it, so it
+        was recorded rather than guessed. It is measured now, and the answer is
+        that the kernel was already right - the tracer's number reaches the gate,
+        matches no arm of the table, and falls to `_ => ENOSYS` without
+        dispatching. What landed here is the *measurement* and the pin, not a
+        handler.
+        Measured on this developer's Linux first (kernel 7.2,
+        `.workbuddy/probe-ptrace-cancel.c` and `probe-seccomp-cancel.c`), four
+        shapes:
+
+        | the stop | the write | the answer |
+        |---|---|---|
+        | `PTRACE_SYSCALL` entry | `-1` | the call is skipped; `rax = -ENOSYS` |
+        | `PTRACE_SYSCALL` entry | `9999` (out of range) | the same: skipped, `-ENOSYS` |
+        | `SECCOMP_RET_TRACE` | `-1` | the same: skipped, `-ENOSYS` |
+        | `PTRACE_SYSCALL` exit | `-1` | a **no-op** - the call already ran, and its result stands |
+
+        So `-1` is not special on the way in, only *unreachable*: any number the
+        table has no arm for cancels, which is exactly what the catch-all arm
+        already does. The **exit** stop is the one that must stay a no-op, and the
+        natural way to get this feature wrong is to apply the cancel there - a
+        kernel doing that would throw away a result the tracee already earned.
+        Pinned in `t-ptrace`'s `entry_stop_cancel_skips_the_call` and
+        `exit_stop_number_write_is_a_no_op`, and in `t-seccomp`'s
+        `seccomp_stop_cancel_skips_the_call`. The entry-stop pin's verdict is not
+        the errno but the **pipe**: the judged call is a `write` to a pipe the
+        tracee's stdout was moved onto, so a kernel that answered `ENOSYS` *after*
+        making the call would satisfy an errno check and still have written five
+        bytes - only an empty pipe proves the call was skipped. Counterfactual:
+        with `linux_dispatch`'s rebinding of `nr` removed (the same break the
+        redirect's pin catches), `t-ptrace` is the one red, in five claims - the
+        redirect's two and the cancel's three, the pipe holding `5 bytes` - while
+        the exit-stop pin stays green, because its write is at the other stop.
+        The suite is `pass=175 fail=0`, `mpos-kunit 32 passed, 0 failed`, exit 33;
+        aarch64 is `pass=174 fail=0`, the number slot reading 172 where x86_64's
+        reads 39.
 - **Not measured, and recorded rather than guessed**: strict mode's own violation
   signal. `seccomp(SECCOMP_SET_MODE_STRICT)` answers `EINVAL` on this machine for
   every argument shape tried, including after `PR_SET_NO_NEW_PRIVS` and with

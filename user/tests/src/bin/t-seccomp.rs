@@ -13,7 +13,9 @@
 //! * `TRACE` with nobody tracing fails the call with `ENOSYS` rather than
 //!   allowing it, as does `USER_NOTIF` with no listener;
 //! * the availability probe compares whole words, so asking about `ERRNO|1` is
-//!   a refusal even though asking about `ERRNO` is not.
+//!   a refusal even though asking about `ERRNO` is not;
+//! * a tracer's `PTRACE_SETREGS` at a `TRACE` stop picks the call that runs -
+//!   and the `-1` sentinel there *cancels* it instead of replacing it.
 //!
 //! # The door, and the number the filter compares against
 //!
@@ -370,6 +372,119 @@ fn seccomp_stop_reaches_a_tracer(r: &mut Report) {
     );
 }
 
+/// The seccomp stop's other use of the number slot: the `-1` sentinel
+/// **cancels** the judged call rather than replacing it with another number.
+///
+/// This is the same write `entry_stop_rewrite_changes_the_call` makes at an
+/// ordinary entry stop and `seccomp_stop_reaches_a_tracer` makes here to
+/// redirect, with the one value that means "do not run this call at all".
+/// Measured on this developer's Linux first (kernel 7.2,
+/// `.workbuddy/probe-seccomp-cancel.c`): the seccomp event still arrives with
+/// the judged number in the slot, and after the tracer writes `-1` the tracee's
+/// `getpid` answers `-1` with `ENOSYS` - the call did not run, which for a
+/// `getpid` is visible because a call that *did* run answers a positive pid.
+fn seccomp_stop_cancel_skips_the_call(r: &mut Report) {
+    const DATA: u32 = 0x1234;
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        // SAFETY: syscalls only between fork and `_exit`, each a straight call.
+        unsafe {
+            if ptrace(libc::PTRACE_TRACEME as c_long, 0, 0, 0) != Ok(0) {
+                libc::_exit(11);
+            }
+            libc::raise(libc::SIGSTOP);
+            if install(getpid_nr(), libc::SECCOMP_RET_TRACE | DATA).map(|v| v == 0) != Ok(true) {
+                libc::_exit(12);
+            }
+            // The judged call, cancelled by the tracer: a call that ran would
+            // answer this process's own pid, so `-1`/`ENOSYS` is the proof it
+            // did not.
+            libc::_exit(if denied(raw_getpid(), libc::ENOSYS) {
+                0
+            } else {
+                13
+            });
+        }
+    }
+    let mut status = 0i32;
+    // SAFETY: `child` is this process's own child and `status` a local.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    r.check(
+        "the cancel tracee stops for TRACEME first",
+        n == child && libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP,
+    );
+    if n != child {
+        return;
+    }
+    r.check(
+        "a tracer can ask for PTRACE_O_TRACESECCOMP on the cancel tracee",
+        ptrace(
+            libc::PTRACE_SETOPTIONS as c_long,
+            child,
+            0,
+            PTRACE_O_TRACESECCOMP as usize,
+        ) == Ok(0),
+    );
+    r.check(
+        "resuming the cancel tracee from its own stop",
+        ptrace(libc::PTRACE_CONT as c_long, child, 0, 0) == Ok(0),
+    );
+
+    // SAFETY: as above.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    let stopped = n == child && libc::WIFSTOPPED(status);
+    r.check(
+        &format!(
+            "the judged call still produces a seccomp stop to cancel at \
+             (status {status:#x}: stopped={} event={})",
+            libc::WIFSTOPPED(status),
+            status >> 16,
+        ),
+        stopped && (status >> 16) == PTRACE_EVENT_SECCOMP,
+    );
+    if !stopped {
+        return;
+    }
+
+    let mut regs = [0u64; REG_WORDS];
+    r.check(
+        "the tracer can read the tracee's registers at the cancel stop",
+        ptrace(
+            libc::PTRACE_GETREGS as c_long,
+            child,
+            0,
+            regs.as_mut_ptr() as usize,
+        ) == Ok(0),
+    );
+    r.check(
+        &format!(
+            "the number slot reads the call the tracee asked for (got {}, want {})",
+            regs[NUMBER_SLOT],
+            getpid_nr()
+        ),
+        regs[NUMBER_SLOT] == getpid_nr() as u64,
+    );
+    // The sentinel, in the machine's slot: `-1` as the all-ones word.
+    regs[NUMBER_SLOT] = u64::MAX;
+    r.check(
+        "the tracer cancels the judged call by writing -1 at the seccomp stop",
+        ptrace(
+            libc::PTRACE_SETREGS as c_long,
+            child,
+            0,
+            regs.as_ptr() as usize,
+        ) == Ok(0),
+    );
+
+    let resumed = ptrace(libc::PTRACE_CONT as c_long, child, 0, 0) == Ok(0);
+    // SAFETY: as above.
+    let n = unsafe { libc::waitpid(child, &mut status, 0) };
+    r.check(
+        "the cancelled call does not run, and the tracee exits normally",
+        resumed && n == child && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+    );
+}
+
 fn main() {
     let mut r = Report::new();
 
@@ -526,6 +641,7 @@ fn main() {
     // comes before act three because it needs a process with no filter of its
     // own to be the tracer, and a child that inherits none.
     seccomp_stop_reaches_a_tracer(&mut r);
+    seccomp_stop_cancel_skips_the_call(&mut r);
 
     // === act three: install a filter here, and read what it does =============
     match install(getpid_nr(), libc::SECCOMP_RET_ERRNO | 1) {
