@@ -48,7 +48,9 @@ the commit bodies), and each moved its pin in the same commit.
    `src/cred.rs` holds the four capability sets, the dumpable tri-state and `KEEPCAPS`;
    the storage is the thread group's, in `sched`; and the model has **consumers**, which
    is the whole point — the effective set answers `ptrace_may_access`, the bounding set
-   is applied by `execve`, a uid/gid change re-derives the sets, and `capget`/`capset`
+   is applied by `execve`, a uid/gid change re-derives the sets, entering a user
+   namespace hands them back full (`on_enter_user_ns`, the grant `unshare`/`setns` make,
+   2026-10-16), and `capget`/`capset`
    round-trip all of it. So `PR_SET_DUMPABLE`/`GET`, `PR_SET_KEEPCAPS`/`GET` and
    `PR_CAPBSET_READ`/`DROP` are answered with the measured Linux contract rather than the
    `EINVAL` they used to share with every unmodelled option. Named divergence: this kernel

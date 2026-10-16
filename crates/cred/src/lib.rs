@@ -36,6 +36,7 @@
 //! PR_SET_DUMPABLE(0|1); (2|3|-1)       accepted; EINVAL
 //! PR_CAPBSET_READ(0..=40); (41|100)    1 or 0; EINVAL
 //! PR_CAPBSET_DROP(100), unprivileged    EPERM - the capability is asked first
+//! entering a user namespace (7.2.9)    CapEff/CapPrm/cap_bset full, CapInh 0
 //! ```
 //!
 //! The dumpable flag is reset to `SUID_DUMP_DISABLE` when the identity moves,
@@ -221,6 +222,40 @@ impl Credentials {
             self.permitted = self.bounding;
             self.effective = self.bounding;
         }
+    }
+
+    /// The capability state a task holds the instant it is in a user namespace
+    /// it entered: the effective, permitted and **bounding** sets are full
+    /// again, and nothing is inheritable.
+    ///
+    /// This is the user-namespace rung's other half - the *grant*, the
+    /// counterpart of the id translation `getuid`/`stat` do. Making a user
+    /// namespace needs no capability because it **is** the grant: inside it the
+    /// maker holds every capability, scoped to the namespace it just made, and
+    /// that is what lets an unprivileged program mount, map ids and configure a
+    /// network it owns.
+    ///
+    /// Measured on this host's Linux (7.2.9, `.workbuddy/probe-userns7.c`, run
+    /// as root and as an unprivileged caller), all four doors into a namespace:
+    /// a caller that cleared its sets with `capset(0,0,0)` reads
+    /// `CapEff=CapPrm=0x1ffffffffff` the moment it has unshared, and a
+    /// `unshare(CLONE_NEWNS)` - which needs `CAP_SYS_ADMIN` - then succeeds, so
+    /// the grant is functional and not a reporting artifact; a capability
+    /// dropped from the **bounding** set is back too (`cap_bset` full again);
+    /// an inheritable bit set before the unshare is gone after it; and
+    /// `clone(CLONE_NEWUSER)` and a `setns` into a child namespace grant it the
+    /// same way. What the grant is *not*: it does not touch the task's
+    /// identity, `dumpable` or `KEEPCAPS`, which are the namespace's business
+    /// only through the id maps, and it grants nothing in the *parent*
+    /// namespace - a capability is held in a namespace and its descendants, and
+    /// this kernel's checks ask the caller's own namespace, so a single word
+    /// models the whole of it (a scoped `capable(ns, cap)` is the named gap,
+    /// §6.3).
+    pub fn on_enter_user_ns(&mut self) {
+        self.effective = CAP_FULL;
+        self.permitted = CAP_FULL;
+        self.bounding = CAP_FULL;
+        self.inheritable = 0;
     }
 
     /// `capset`: validate one record's three sets and store them. `Err(())` is
@@ -463,6 +498,30 @@ mod tests {
         let before = c;
         c.on_exec(65534);
         assert_eq!(c, before);
+    }
+
+    #[test]
+    fn entering_a_user_namespace_grants_the_full_set() {
+        // Measured (probe-userns7.c, root and unprivileged): a caller that
+        // cleared its sets with capset(0,0,0) reads the full effective and
+        // permitted sets the instant it has unshared; a capability it had
+        // dropped from the *bounding* set is back; an inheritable bit it had
+        // set is gone. The bounding drop comes first because it needs
+        // CAP_SETPCAP, which the clear takes away.
+        let mut c = Credentials::initial();
+        c.capbset_drop(CAP_SYS_ADMIN as u64)
+            .expect("root holds CAP_SETPCAP");
+        c.capset(0, 0, 1).expect("clearing the sets");
+        assert_eq!((c.effective, c.permitted, c.inheritable), (0, 0, 1));
+        assert!(!c.has_bounding(CAP_SYS_ADMIN));
+        c.on_enter_user_ns();
+        assert_eq!(c.effective, CAP_FULL);
+        assert_eq!(c.permitted, CAP_FULL);
+        assert_eq!(c.bounding, CAP_FULL, "the bounding set comes back too");
+        assert_eq!(c.inheritable, 0, "and nothing is inheritable");
+        // The grant is the capability state and nothing else: the dumpable
+        // flag is the namespace's business through the maps, not this.
+        assert_eq!(c.dumpable, SUID_DUMP_USER);
     }
 
     #[test]

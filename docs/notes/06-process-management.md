@@ -122,7 +122,7 @@ the build list.
 | `CLONE_NEWNS` | the mount table *and the root*: a `mount` in one namespace invisible in another, and `chroot`/`pivot_root` giving a container its own `/` | **build second** |
 | `CLONE_NEWPID` | the numbers a process *sees*: a child of the new namespace is pid 1 to itself, and `/proc` is numbered per reader | **build third - the expensive one** |
 | `CLONE_NEWNET` | interfaces, addresses, routes and the socket table: a socket bound in one namespace is not reachable from another | **build fourth** |
-| `CLONE_NEWUSER` | uid/gid mapping, and the capability set *within* the namespace | **built** (the maps and the translation; the "root inside" grant is named) - "Step 6, landed" below |
+| `CLONE_NEWUSER` | uid/gid mapping, and the capability set *within* the namespace | **built** (the maps, the translation and the "root inside" grant) - "Step 6, landed" below |
 | `CLONE_NEWIPC` | SysV IPC objects and POSIX message queues | **refused**: this kernel has neither, so it isolates nothing |
 | `CLONE_NEWCGROUP` | the cgroup tree a process sees | **refused**: there is no cgroup tree here to see |
 | `CLONE_NEWTIME` | `CLOCK_MONOTONIC`/`BOOTTIME` offsets per namespace | **built** - "Step 5, landed" below |
@@ -461,8 +461,8 @@ translation applied wherever an id crosses a boundary.
 (a) a mapping object and its one-line write rules, (b) id translation at every reader, and (c) the
 capability grant at creation - and (c) alone contradicts this kernel's present model, where
 `Credentials::initial()` hands every process the full set, so "full inside a namespace you made" is
-not yet distinguishable from "full because you are root". The first two landed on 2026-10-16 and the
-third is named in Step 6 below; this table is what that work started from.
+not yet distinguishable from "full because you are root". All three landed on 2026-10-16 - the grant
+as "Step 6c" below - and this table is what that work started from.
 
 **Step 6, landed: USER, and the two pieces left named.** `t-ns-user` walks the translation end to
 end in 23 claims: the machine's map is the identity in a real kernel's exact bytes (the 33-byte line,
@@ -540,13 +540,55 @@ while the identity-map claim and the whole `getuid` half stay green. That the id
 claim survives is the point: a task that never unshares is not disturbed, which is what
 the machine's identity map is for.
 
-**What is named and not built.** The **capability grant**: on Linux the maker holds the
-full set inside the instant the namespace exists, and this kernel hands every process
-the full set already, so "full inside a namespace you made" is not yet distinguishable
-from "full because you are root". A third observation surface sits beside the two this
-rung has now, named rather than built because it is a different family: the ids a
-`SO_PEERCRED`/`SCM_CREDENTIALS` pair carries are the peer's *stored* ones here, and
-Linux maps those through the reader's namespace too.
+**Step 6c, landed: the capability grant, and "root inside" becomes distinguishable.** The
+grant was the rung's other half, and the one the first measurement called expensive: every task
+on this image starts with the full set (`Credentials::initial`), so "full inside a namespace you
+made" was indistinguishable from "full because you are root" *until the caller drops first*.
+`.workbuddy/probe-userns7.c` measures the grant on this host (7.2.9), run as root and
+unprivileged, across all four doors into a namespace:
+
+| question | Linux's answer |
+|---|---|
+| a caller that clears its sets with `capset(0,0,0)`, then `unshare(CLONE_NEWUSER)` | `CapEff=CapPrm=0x1ffffffffff` - full - the instant it is in the namespace; and a `unshare(CLONE_NEWNS)`, which needs `CAP_SYS_ADMIN`, then succeeds, so the grant is functional rather than a reporting artifact |
+| a capability dropped from the **bounding** set first | back too - `cap_bset` is full again (`PR_CAPBSET_READ(21)` reads `0` before the unshare and `1` after) |
+| an **inheritable** bit set before the unshare | gone after it (`CapInh` reads `0`) |
+| `clone(CLONE_NEWUSER)` | the child is born with the same full set |
+| `setns(fd, CLONE_NEWUSER)` into a **child** namespace, the joiner holding only `CAP_SYS_ADMIN` | full afterwards - the join grants too |
+| the task's identity, `dumpable` and `KEEPCAPS` | untouched - the grant is the capability state and nothing else |
+
+What landed is `Credentials::on_enter_user_ns` (the effective, permitted and bounding sets to
+`CAP_FULL`, inheritable to `0`) applied at the two doors this kernel serves - `unshare_user` and
+`setns_user`, beside the move so the two cannot drift apart. The pin is eight more claims in
+`t-ns-user` (35 now): a child clears its effective and permitted sets (read back empty) and a
+bounding capability, unshares a namespace nested inside this one, and reads the full set and the
+bounding capability back; and a second door joins a keeper's child namespace holding only
+`CAP_SYS_ADMIN` and reads the full set back. The claim cannot pass by accident: the sets are read
+*empty* going in, so "full coming out" is only possible if the unshare granted it.
+
+The counterfactual: with the grant's two call sites removed (the method kept, so stage 1 stays
+green) the gate runs `pass=174 fail=1` and the one red program is `t-ns-user`, red in exactly
+**three** claims - "entering the namespace hands the maker the full effective and permitted
+sets", "and a capability dropped from the bounding set is back", and "and joining hands the
+caller the full effective and permitted sets" - while every door and setup claim stays green.
+That the setup claims survive is the isolation: removing the grant breaks what the namespace
+*hands out*, not whether the doors open.
+
+**What the grant does not model, and why it is a named gap.** A capability is held *in* a
+namespace and its descendants, and Linux's `capable(ns, cap)` asks it of a *target* namespace
+that need not be the caller's; this kernel's checks all ask the caller's own namespace, so one
+capability word is the whole of it. That is correct for every operation scoped to the caller's
+own namespace - which is every gate here - and wrong for a check scoped to an *ancestor* or a
+sibling (a `setns` into a namespace the caller does not own, a signal across a namespace
+boundary). A scoped `capable_in(ns, cap)` is the named gap.
+
+**What is named and not built.** The **child-side creation** of `clone(CLONE_NEWUSER)`: Linux
+serves the door and this kernel refuses it `EOPNOTSUPP` because the child would have to be born
+in a fresh namespace (`copy_process`'s order, and what a group sharing an address space means
+for the kind), which wants its own measurement. And a third observation surface sits beside the
+two this rung has now, named rather than built because it is a different family: the ids a
+`SO_PEERCRED`/`SCM_CREDENTIALS` pair carries are the peer's *stored* ones here, and Linux maps
+those through the reader's namespace too.
+
 
 **And one trap in the measuring, worth its line**: a first draft of the raw-netlink-style probe
 numbered `IFLA_NET_NS_PID` 27 where `linux/if_link.h` gives 19, and *every* request answered a

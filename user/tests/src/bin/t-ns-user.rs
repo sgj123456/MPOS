@@ -29,6 +29,17 @@
 //! a file created before the unshare reads the stored id from the machine map and
 //! the inside id from the new one, with nothing about the file changed.
 //!
+//! # The grant, the other half of the rung
+//!
+//! Making a user namespace needs no capability, because it **is** the grant: the
+//! caller holds the full capability set the instant it is in a namespace it made,
+//! scoped to that namespace. On this single-user image every task starts with the
+//! full set, so the only way to observe the grant is to *drop* first - a child
+//! clears its effective and permitted sets (and a bounding capability), unshares
+//! a namespace nested inside this one, and reads the full set back. Without the
+//! grant the child would still be empty, which is the counterfactual the claims
+//! are written against.
+//!
 //! # The doors
 //!
 //! `rustix::thread` wraps `unshare`, but the claims here are about the *numbers*
@@ -115,6 +126,95 @@ fn unshare_user() -> isize {
         0
     } else {
         -(unsafe { *libc::__errno_location() } as isize)
+    }
+}
+
+/// The v3 capability wire shapes, as `<linux/capability.h>` spells them.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapRecord {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+#[repr(C)]
+struct CapHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+/// The uapi's `CAP_LAST_CAP` (40 capabilities, 0..=40): bits 0..=31 in the low
+/// word, the top nine in the high one, so a full set reads `u32::MAX` and
+/// `0x1ff`.
+const CAP_HIGH: u32 = (1u32 << (40 - 31)) - 1;
+
+/// `CAP_SYS_ADMIN`: the capability the namespace kinds are gated on, and the one
+/// the bounding-set half of the grant drops and looks for again.
+const CAP_SYS_ADMIN: u32 = 21;
+
+/// `capget(header, data)` through the raw door - `libc` does not wrap it on this
+/// target. The v3 version is the two-record shape.
+fn capget(data: &mut [CapRecord; 2]) -> isize {
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut CapHeader as libc::c_long,
+            data.as_mut_ptr() as libc::c_long,
+        )
+    };
+    if r < 0 {
+        -(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as isize)
+    } else {
+        r as isize
+    }
+}
+
+/// `capset(header, data)`, setting the whole v3 set at once. The high word is
+/// left empty: no capability this pins lives above bit 31.
+fn capset(effective: u32, permitted: u32, inheritable: u32) -> isize {
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let data = [
+        CapRecord {
+            effective,
+            permitted,
+            inheritable,
+        },
+        CapRecord {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &mut header as *mut CapHeader as libc::c_long,
+            data.as_ptr() as libc::c_long,
+        )
+    };
+    if r < 0 {
+        -(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as isize)
+    } else {
+        r as isize
+    }
+}
+
+/// `prctl` through the raw door, for the two bounding-set options the grant is
+/// measured against.
+fn prctl(op: libc::c_int, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
+    let r = unsafe { libc::syscall(libc::SYS_prctl, op as libc::c_long, a2, a3, a4, a5) };
+    if r < 0 {
+        -(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as isize)
+    } else {
+        r as isize
     }
 }
 
@@ -360,8 +460,16 @@ fn main() {
             0usize,
         )
     };
+    if cloned == 0 {
+        // A host that served it: the child resumes here (the raw `clone` with a
+        // null stack returns twice), in a fresh namespace with no map. It has no
+        // claim of its own to make, so it leaves rather than running the rest of
+        // the program a second time - which is what it did before this line
+        // existed, and why the host run printed everything twice.
+        unsafe { libc::_exit(0) }
+    }
     if cloned > 0 {
-        // A host that served it: reap the child and accept the divergence.
+        // The parent of a served clone: reap the child and accept the divergence.
         let mut status = 0;
         unsafe { libc::waitpid(cloned as libc::pid_t, &mut status, 0) };
     }
@@ -386,6 +494,171 @@ fn main() {
             );
         }
         Err(_) => r.check("the namespace descriptor is openable", false),
+    }
+
+    // ---- The rung's other half: entering a namespace *is* the grant ----
+    //
+    // The id translation above is one half of this kind; the other is that making
+    // a user namespace needs no capability, because it hands the maker every one
+    // of them - scoped to the namespace it just made. The claim cannot pass by
+    // accident: the caller's own effective and permitted sets are read back
+    // *empty* before the unshare and full after it, with only the unshare in
+    // between, and a capability it dropped from its bounding set is read back
+    // present afterwards. A child does this in a namespace nested inside the one
+    // above, so nothing about the main flow moves.
+    //
+    // Dropping first is what makes the claim sharp: every task on this
+    // single-user image *starts* with the full set, so "full inside" would be
+    // indistinguishable from "full because it never dropped anything" unless the
+    // caller empties itself going in.
+    if let Ok((grant_r, grant_w)) = rustix::pipe::pipe() {
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            drop(grant_r);
+            // Drop CAP_SYS_ADMIN from the bounding set while CAP_SETPCAP is
+            // still held to do it, then clear the sets outright.
+            let dropped = prctl(libc::PR_CAPBSET_DROP, CAP_SYS_ADMIN as usize, 0, 0, 0);
+            let bnd_before = prctl(libc::PR_CAPBSET_READ, CAP_SYS_ADMIN as usize, 0, 0, 0);
+            let cleared = capset(0, 0, 0);
+            let mut data = [CapRecord {
+                effective: u32::MAX,
+                permitted: u32::MAX,
+                inheritable: u32::MAX,
+            }; 2];
+            let read_before = capget(&mut data);
+            let empty = data[0].effective == 0
+                && data[1].effective == 0
+                && data[0].permitted == 0
+                && data[1].permitted == 0;
+            let moved = unshare_user();
+            let read_after = capget(&mut data);
+            let full = data[0].effective == u32::MAX
+                && data[1].effective == CAP_HIGH
+                && data[0].permitted == u32::MAX
+                && data[1].permitted == CAP_HIGH;
+            let bnd_after = prctl(libc::PR_CAPBSET_READ, CAP_SYS_ADMIN as usize, 0, 0, 0);
+            let line = format!(
+                "{} {} {} {} {} {} {} {} {}\n",
+                dropped,
+                bnd_before,
+                cleared,
+                read_before,
+                empty as i32,
+                moved,
+                read_after,
+                full as i32,
+                bnd_after
+            );
+            let _ = write(&grant_w, line.as_bytes());
+            drop(grant_w);
+            unsafe { libc::_exit(0) }
+        }
+        drop(grant_w);
+        let mut buf = [0u8; 256];
+        let n = read(&grant_r, &mut buf).unwrap_or(0);
+        drop(grant_r);
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let mut w = text.split_whitespace().map(|s| s.parse::<i64>().ok());
+        let dropped = w.next().flatten();
+        let bnd_before = w.next().flatten();
+        let cleared = w.next().flatten();
+        let read_before = w.next().flatten();
+        let empty = w.next().flatten();
+        let moved = w.next().flatten();
+        let read_after = w.next().flatten();
+        let full = w.next().flatten();
+        let bnd_after = w.next().flatten();
+        r.check(
+            "the caller empties its own effective and permitted sets",
+            dropped == Some(0) && cleared == Some(0) && read_before == Some(0) && empty == Some(1),
+        );
+        r.check(
+            "and CAP_SYS_ADMIN is out of its bounding set",
+            bnd_before == Some(0),
+        );
+        r.check(
+            "unshare(CLONE_NEWUSER) succeeds from inside a namespace (nesting)",
+            moved == Some(0),
+        );
+        r.check(
+            "entering the namespace hands the maker the full effective and permitted sets",
+            read_after == Some(0) && full == Some(1),
+        );
+        r.check(
+            "and a capability dropped from the bounding set is back",
+            bnd_after == Some(1),
+        );
+    }
+
+    // ---- The grant has a second door: setns into a child namespace ----
+    //
+    // Joining a namespace grants the same way `unshare` does (measured:
+    // probe-userns7.c scenario E). A keeper child makes a namespace to join; the
+    // caller keeps `CAP_SYS_ADMIN` alone - the one capability the join needs -
+    // and reads the full set back afterwards. This is the last section, so the
+    // caller is left in the joined namespace with nothing after it to disturb.
+    if let Ok((keep_r, keep_w)) = rustix::pipe::pipe() {
+        let keeper = unsafe { libc::fork() };
+        if keeper == 0 {
+            drop(keep_r);
+            let moved = unshare_user();
+            let _ = write(&keep_w, if moved == 0 { b"1" } else { b"0" });
+            drop(keep_w);
+            unsafe { libc::pause() };
+            unsafe { libc::_exit(0) }
+        }
+        drop(keep_w);
+        let mut ready = [0u8; 1];
+        let _ = read(&keep_r, &mut ready);
+        drop(keep_r);
+        if ready[0] == b'1' {
+            let kept = capset(1 << CAP_SYS_ADMIN, 1 << CAP_SYS_ADMIN, 0);
+            let mut data = [CapRecord {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            }; 2];
+            let read_kept = capget(&mut data);
+            let only_admin = data[0].effective == (1 << CAP_SYS_ADMIN)
+                && data[1].effective == 0
+                && data[0].permitted == (1 << CAP_SYS_ADMIN);
+            let path = format!("/proc/{keeper}/ns/user");
+            let joined = match openat(CWD, path.as_str(), OFlags::RDONLY, Mode::empty()) {
+                Ok(fd) => {
+                    let rc = unsafe {
+                        libc::setns(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::CLONE_NEWUSER)
+                    };
+                    let e = unsafe { *libc::__errno_location() };
+                    drop(fd);
+                    if rc == 0 { 0 } else { -(e as isize) }
+                }
+                Err(e) => -(e.raw_os_error() as isize),
+            };
+            let read_joined = capget(&mut data);
+            let full = data[0].effective == u32::MAX
+                && data[1].effective == CAP_HIGH
+                && data[0].permitted == u32::MAX
+                && data[1].permitted == CAP_HIGH;
+            r.check(
+                "a caller may hold CAP_SYS_ADMIN alone",
+                kept == 0 && read_kept == 0 && only_admin,
+            );
+            r.check(
+                "setns(CLONE_NEWUSER) into a child namespace succeeds",
+                joined == 0,
+            );
+            r.check(
+                "and joining hands the caller the full effective and permitted sets",
+                read_joined == 0 && full,
+            );
+        } else {
+            r.check("the keeper child made a user namespace to join", false);
+        }
+        unsafe { libc::kill(keeper, libc::SIGKILL) };
+        let mut status = 0;
+        unsafe { libc::waitpid(keeper, &mut status, 0) };
     }
 
     let _ = rustix::fs::unlink(owned);

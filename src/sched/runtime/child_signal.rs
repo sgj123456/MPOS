@@ -796,17 +796,20 @@ pub fn setns_time(ns: Arc<crate::timens::TimeNs>) {
 /// ids have no inside name until it writes the map: measured, `getuid()` reads
 /// `65534` between this call and the first `uid_map` write (§6.3).
 ///
-/// Nothing here grants a capability. On a real kernel the caller holds the full
-/// set the instant it is in the new namespace, but this kernel hands every
-/// process the full set already (`Credentials::initial`), so the grant is a
-/// no-op here rather than a modelled behaviour - and modelling it is the piece
-/// of this rung that is named and not built (§6.3).
+/// **Making the namespace is the grant.** The caller holds the full capability
+/// set the instant it is in the namespace it made, whatever it held before -
+/// which is why this door asks for no capability of its own and why an
+/// unprivileged caller can use it at all. The rule, its four measured doors
+/// and what it deliberately does *not* touch are [`crate::cred::Credentials::on_enter_user_ns`]'s;
+/// it is applied here, beside the move, so the two cannot drift apart.
 #[cfg(target_os = "none")]
 pub fn unshare_user() {
     with_table(|t| {
         let me = t.current;
+        let mm = Arc::clone(&t.task(me).mm);
         let fresh = crate::userns::UserNs::fresh(crate::vfs::ns::mint());
         t.task_mut(me).user_ns = fresh;
+        mm.with_credentials(|c| c.on_enter_user_ns());
     });
 }
 
@@ -817,6 +820,11 @@ pub fn unshare_user() {
 /// namespace the caller is **already in** is refused `EINVAL` rather than being
 /// the no-op `0` MNT's and TIME's are - which is why this answers a `Result`
 /// where its siblings answer nothing.
+///
+/// The join is a grant as well as a move: entering the namespace hands the
+/// caller the full set in it, measured the same as `unshare`'s
+/// (`on_enter_user_ns`, probe-userns7.c scenario E - a caller holding only
+/// `CAP_SYS_ADMIN`, the one the join needs, read the full set back afterwards).
 #[cfg(target_os = "none")]
 pub fn setns_user(ns: Arc<crate::userns::UserNs>) -> Result<(), isize> {
     with_table(|t| {
@@ -824,7 +832,9 @@ pub fn setns_user(ns: Arc<crate::userns::UserNs>) -> Result<(), isize> {
         if Arc::ptr_eq(&t.task(me).user_ns, &ns) {
             return Err(crate::err::EINVAL);
         }
+        let mm = Arc::clone(&t.task(me).mm);
         t.task_mut(me).user_ns = ns;
+        mm.with_credentials(|c| c.on_enter_user_ns());
         Ok(())
     })
 }
