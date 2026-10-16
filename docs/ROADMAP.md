@@ -84,7 +84,9 @@ One-glance status of the whole roadmap.
   from the machine map and the inside id from the new one, `statx` agreeing with `stat` (§6.3,
   measured on the host first). It renders what a *socket* reports too (2026-10-16): `SO_PEERCRED`
   and the `SCM_CREDENTIALS` a read carries map the peer's stored ids through the reading task's
-  namespace, at the read rather than at capture (§6.3, measured on the host first). And the rung's
+  namespace, at the read rather than at capture (§6.3, measured on the host first) - and the same
+  struct's `pid` through the reader's *pid* namespace, `pid_vnr`'s rule, so a reader inside one
+  names a peer there and reads `0` for a peer it cannot see (2026-10-16, `t-ns-pid`). And the rung's
   other half landed too: entering a namespace **is the
   grant** - `unshare`/`setns` hand the maker the full effective, permitted and bounding sets,
   measured on the host across all four doors, so a caller that drops its capabilities first reads
@@ -92,7 +94,7 @@ One-glance status of the whole roadmap.
   (2026-10-16): `clone(CLONE_NEWUSER)` makes a child born already inside a namespace of its own -
   the overflow id until its map is written, the full set at birth, and the parent's `CLONE_NEWUSER`
   lifting the capability gate for the other kinds in the same word (§6.3, measured on the host
-  first). What stays named is the `ucred` pid (a pid-namespace question) and the netlink/uevent
+  first). What stays named is the netlink/uevent
   family's own `ucred` render
 
 **ABI gaps → `ENOSYS` (remaining)**
@@ -243,8 +245,11 @@ In the order that keeps each step verifiable on its own:
    doors on the host (§6.3). The **child-side creation** of `clone(CLONE_NEWUSER)` landed the same
    day: a child born already inside a namespace of its own, the overflow id until its map is
    written, the full set at birth, and the parent's `CLONE_NEWUSER` lifting the capability gate for
-   the other kinds beside it (`t-ns-user`, 46 claims, §6.3). What stays named is
-   the `ucred` pid (a pid-namespace question), and the netlink/uevent family's own `ucred` render.
+   the other kinds beside it (`t-ns-user`, 46 claims, §6.3). And the socket's `ucred.pid` landed the
+   same day - the pid-namespace half of the same struct, rendered with `pid_vnr`'s rule so a reader
+   inside a namespace names a peer there and reads `0` for one it cannot see (`t-ns-pid`, §6.3).
+   What stays named is
+   the netlink/uevent family's own `ucred` render.
    IPC and CGROUP each wait on the thing they would isolate not
    existing yet (SysV/POSIX message queues; a cgroup tree), so they are cheap the day that lands
    and worthless before it. Nested namespaces pin the

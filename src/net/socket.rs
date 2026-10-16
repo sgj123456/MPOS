@@ -487,7 +487,8 @@ unsafe fn collect_scm_rights(
     }
 }
 
-/// Map a stored `ucred` through the **reading task's** user namespace.
+/// Map a stored `ucred` through the **reading task's** namespaces: the ids
+/// through its user namespace, the `pid` through its pid namespace.
 ///
 /// An id is stored once, in the machine's numbering, and every door that shows
 /// one to a task shows it through the namespace that task reads its ids in -
@@ -501,12 +502,26 @@ unsafe fn collect_scm_rights(
 /// surfaces move `0 -> 7` while nothing about the peer changes
 /// (`.workbuddy/probe-userns8.c`; `docs/notes/` §6.3).
 ///
-/// The `pid` is left alone: which pid a reader sees is the *pid* namespace's
-/// question, not this one.
+/// The `pid` is a *pid* namespace's question, and Linux answers it the same
+/// way: `SO_PEERCRED` fills it with `pid_vnr(u->peer_pid)` and the
+/// `SCM_CREDENTIALS` message with the sender's number, both in the reader's
+/// **active pid namespace** - the number the reader would name the peer by -
+/// and `0` when the peer is not a member of that namespace (it sits in an
+/// ancestor, which is `pid_vnr`'s own answer). Measured with a reader inside a
+/// fresh pid namespace: a peer in the same namespace reads `1`, a peer in the
+/// ancestor reads `0` (`.workbuddy/probe-ucredpid.c`; `docs/notes/` §6.3). A
+/// task that never unshares reads the stored number back, because the machine's
+/// namespace numbers a task by its own slot.
 fn observed_cred(c: crate::net::unix::UCred) -> crate::net::unix::UCred {
     let ns = crate::sched::current_user_ns();
     crate::net::unix::UCred {
-        pid: c.pid,
+        // `0` stays `0`: it is the kernel's own "no pid" (a message with no
+        // sender), and `pid_number_of` would otherwise resolve slot `0`.
+        pid: if c.pid == 0 {
+            0
+        } else {
+            crate::sched::pid_number_of(crate::sched::TaskId(c.pid as usize)).unwrap_or(0)
+        },
         uid: ns.uid_to_inner(c.uid),
         gid: ns.gid_to_inner(c.gid),
     }

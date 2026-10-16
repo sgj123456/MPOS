@@ -660,12 +660,39 @@ overflow-id read, both map writes, the inside-id read, and the helper's full-set
 `clone(CLONE_NEWUSER) creates a child` stays green (the verdict still serves the flag; only the
 namespace is wrong) and every other program is untouched.
 
-**What is named and not built.** The **pid** field of a `ucred` is left
-untranslated: Linux renders it with `pid_vnr` in the reader's *pid* namespace, which is that rung's
-question and not this one, so a peer in a different pid namespace would read the wrong number here.
-And a third `ucred` render sits in the **netlink/uevent** family (`recvmsg_netlink`), whose
-kernel-origin messages carry synthetic zero ids; whether Linux maps those through the reader's user
-namespace is a measurement of *that* family, so it is left for it.
+**Step 6f, landed: the socket's `ucred.pid`, and the pid namespace's own render.** The socket
+surface's `uid`/`gid` are the *user* namespace's question (Step 6d); the same `struct ucred`'s
+`pid` is the **pid** namespace's, and Linux answers it the same way - `SO_PEERCRED` fills it with
+`pid_vnr(u->peer_pid)` and `SCM_CREDENTIALS` with the sender's number, both in the reader's
+**active** pid namespace. `.workbuddy/probe-ucredpid.c` measures it on this host (7.2.9), run as
+root (a pid namespace needs `CAP_SYS_ADMIN`):
+
+| question | Linux's answer |
+|---|---|
+| a reader in the machine namespace, peer in the machine namespace | the peer's machine pid |
+| a reader *inside* a fresh pid namespace, peer in the same namespace | the peer's number **there** (the namespace's `1`) |
+| a reader inside the namespace, peer in the **ancestor** namespace | **0** - `pid_vnr` of a task it cannot see |
+| the same, through `SCM_CREDENTIALS` | the sender's number in the reader's namespace |
+
+What landed is one line in `observed_cred` (`net::socket`): the stored pid - a task's own slot,
+which is what the machine namespace numbers it by - is rendered with
+`crate::sched::pid_number_of`, the same translation `getppid`/`kill`/`/proc` use, and `0` when the
+peer is not a member of the reader's namespace (`pid_vnr`'s own answer). Both socket doors go
+through it, so `SO_PEERCRED` and `SCM_CREDENTIALS` cannot drift. A task that never unshares is
+unaffected: the machine namespace numbers a task by its slot, so the stored number and the rendered
+one are the same. The pin is two claims in `t-ns-pid` (the pid namespace's own program, where a
+reader inside one already stands): a peer in the ancestor namespace reads `0`, and the child's own
+socketpair reads the namespace's `1`.
+
+The counterfactual: with the line reverted to `pid: c.pid` the gate runs `pass=174 fail=1` and
+`t-ns-pid` is red in exactly those **two** claims - and nothing else moves, because every other
+reader is in the machine namespace, where the two numbers are equal.
+
+**What is named and not built.** A third `ucred` render sits in the
+**netlink/uevent** family (`recvmsg_netlink`), whose kernel-origin messages carry synthetic zero
+ids; whether Linux maps those through the reader's user namespace is a measurement of *that*
+family, so it is left for it. (The socket family's own `pid` field, which used to be named here as
+a pid-namespace question, landed on 2026-10-16 - "Step 6f" above.)
 
 
 **And one trap in the measuring, worth its line**: a first draft of the raw-netlink-style probe

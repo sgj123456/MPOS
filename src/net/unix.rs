@@ -97,10 +97,13 @@ pub const SUN_PATH_MAX: usize = 108;
 /// `SCM_CREDENTIALS` control message carry. Linux fills `pid` with the peer's
 /// thread-group id, and `uid`/`gid` with its *real* ids.
 ///
-/// These are the ids the machine **stores** - the parent namespace's numbering.
-/// What a reader sees is this mapped through the reader's own user namespace at
-/// the render, which is `socket.rs`'s `observed_cred`; a task that never
-/// unshares is in the identity map and reads exactly these back.
+/// These are the numbers the machine **stores** - the parent namespace's
+/// numbering, where a task's `pid` is its own slot. What a reader sees is this
+/// mapped through the reader's own namespaces at the render, which is
+/// `socket.rs`'s `observed_cred`: the ids through the reader's **user**
+/// namespace and the `pid` through its **pid** namespace (0 when the peer is
+/// not a member of it). A task that never unshares is in the identity map of
+/// both and reads exactly these back.
 #[derive(Clone, Copy, Default)]
 pub struct UCred {
     pub pid: u32,

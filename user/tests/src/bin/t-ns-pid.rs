@@ -33,6 +33,12 @@
 //!   and every reader sees that same line, because it is the task's own chain
 //!   rather than the reader's number. One level (two numbers) was all this
 //!   rung's numbers were pinned at until now.
+//! * and a **socket's `ucred.pid`** is a pid namespace's number as well: Linux
+//!   renders `SO_PEERCRED`'s (and `SCM_CREDENTIALS`'s) pid with `pid_vnr` in the
+//!   reader's *active* pid namespace, so a reader inside the namespace names a
+//!   peer there by the number *it* gives it (`1`), and a peer in the ancestor
+//!   namespace by `0`. The other two fields of the same `struct ucred` are the
+//!   *user* namespace's question and are pinned by `t-ns-user`.
 //!
 //! # The doors
 //!
@@ -127,6 +133,34 @@ fn ns_pid_chain(path: &str) -> Vec<u32> {
 fn stat_first_field(path: &str) -> Option<i64> {
     let text = std::fs::read_to_string(path).ok()?;
     text.split_whitespace().next()?.parse().ok()
+}
+
+/// An `AF_UNIX` `SOCK_DGRAM` pair, the shape `t-unix-scm` opens.
+fn socketpair() -> Option<[i32; 2]> {
+    let mut sv = [0i32; 2];
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sv.as_mut_ptr()) };
+    (rc == 0).then_some(sv)
+}
+
+/// `getsockopt(SO_PEERCRED)`'s `pid`: `struct ucred` is `{ pid, uid, gid }`,
+/// three 32-bit words, and the claim here is about the first.
+///
+/// The `pid` is the one field of that struct a *pid* namespace renders - Linux
+/// fills it with `pid_vnr` in the reader's active pid namespace, so a reader
+/// inside one sees the peer's number there and `0` for a peer it cannot see.
+fn peer_pid(fd: i32) -> Option<u32> {
+    let mut c = [0u32; 3];
+    let mut len = core::mem::size_of::<[u32; 3]>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            c.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    (rc == 0).then(|| c[0])
 }
 
 /// Read a pipe to end-of-file, answering the byte count.
@@ -673,6 +707,17 @@ fn main() {
         to_child.is_ok() && to_parent.is_ok(),
     );
     if let (Ok((down_r, down_w)), Ok((up_r, up_w))) = (to_child, to_parent) {
+        // A socketpair made *here*, while this task's namespace is still the
+        // machine's: the child born inside the namespace inherits it, and the
+        // peer it names - this task - is in that namespace's **ancestor**, so
+        // the pid the child reads has no number there (0). Its own pair, made
+        // after the fork, names a task *inside* and reads the number that
+        // namespace gives it (1). Both are `SO_PEERCRED`'s pid field, which
+        // Linux renders with `pid_vnr` in the reader's active pid namespace
+        // (`.workbuddy/probe-ucredpid.c`; `docs/notes/` §6.3).
+        let outer_sv = socketpair();
+        r.check("the outer socketpair is made", outer_sv.is_some());
+        let outer = outer_sv.unwrap_or([-1, -1]);
         let child = unsafe { libc::fork() };
         if child == 0 {
             // Only the ends this half must not hold: the write end of the pipe
@@ -706,8 +751,17 @@ fn main() {
             let proc_self = stat_first_field("/proc/self/stat").unwrap_or(-1);
             let own_number = probe_number(me as i32);
             let foreign_number = probe_number(foreign);
-            let line =
-                format!("{me} {parent} {proc_one} {proc_self} {own_number} {foreign_number}\n");
+            // The socket surface's `pid`: a peer in the **ancestor** namespace
+            // (the task that made the outer pair) has no number here, and the
+            // child's own pair names a task *inside* - itself - by the number
+            // this namespace gives it.
+            let outer_pid = peer_pid(outer[0]).map_or(-1, i64::from);
+            let inner_pid = socketpair()
+                .and_then(|sv| peer_pid(sv[0]))
+                .map_or(-1, i64::from);
+            let line = format!(
+                "{me} {parent} {proc_one} {proc_self} {own_number} {foreign_number} {outer_pid} {inner_pid}\n"
+            );
             let _ = write(&up_w, line.as_bytes());
             unsafe { libc::syscall(libc::SYS_close, up_w.as_raw_fd() as libc::c_long) };
             raw_exit(0);
@@ -735,8 +789,8 @@ fn main() {
                 .split_whitespace()
                 .filter_map(|f| f.parse().ok())
                 .collect();
-            r.check("the child reports six words", fields.len() == 6);
-            if fields.len() == 6 {
+            r.check("the child reports eight words", fields.len() == 8);
+            if fields.len() == 8 {
                 r.check("the first child is pid 1 to itself", fields[0] == 1);
                 r.check(
                     "its parent is outside its namespace, so getppid is 0",
@@ -751,6 +805,14 @@ fn main() {
                 r.check(
                     "while the parent's number does not name anybody there (ESRCH)",
                     fields[5] == -(Errno::SRCH.raw_os_error() as i64),
+                );
+                r.check(
+                    "a socket's peer in the ancestor namespace has no pid here (SO_PEERCRED reads 0)",
+                    fields[6] == 0,
+                );
+                r.check(
+                    "and a peer inside the namespace is named by its number there (1)",
+                    fields[7] == 1,
                 );
             }
             let status = rustix::process::waitpid(Pid::from_raw(child), WaitOptions::empty());
