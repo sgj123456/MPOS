@@ -358,6 +358,24 @@ the commit bodies), and each moved its pin in the same commit.
     (`EBADF` while it is not open) and only then refuses the empty name — `ENOENT` through a
     regular-file dirfd as well, so its kind is not asked either — which its handler now says out
     loud. Owner: `src/syscall/linux/fs/file.rs`'s `base_for` + `readlinkat`. Pin:
-    `t-at-empty-name` on **both** machines — 41 claims, one line per door over the three
-    descriptor shapes, plus the `readlinkat` exception's three. Closes `docs/uapi/` §5.2's
-    empty-name entry; what stays named there is `AT_EMPTY_PATH`'s own gap.
+    `t-at-empty-name` on **both** machines — the empty name door by door over the three descriptor
+    shapes, plus the `readlinkat` exception's three (41 of that program's claims; item 20 adds the
+    flag's fourteen). Closes `docs/uapi/` §5.2's empty-name entry.
+
+20. **`AT_EMPTY_PATH` names the descriptor — including in the two doors that would not.**
+    `AT_EMPTY_PATH` is Linux's way of saying "the descriptor is the target" for an *empty* name,
+    and six doors take it: `newfstatat`, `statx`, `fchownat`, `fchmodat2`, `utimensat` and
+    `faccessat2`. Measured on a current host (`.workbuddy/probe_at_dirfd.c`, Linux 7.2.9), every
+    one of the six answers `0` for a descriptor the caller owns — with `fchownat` and `fchmodat2`
+    setting the uid and the mode that are already there, so the answer does not depend on who is
+    running — and `EBADF` for a descriptor nothing is open on, while beside a name that is really
+    there the flag is inert and the *name* answers. Four doors were already right; the two that
+    were not are served now: **`utimensat`** took the descriptor only for the null-name spelling
+    `futimens` gives and answered `ENOENT` for this one, so the name is read once and its absence
+    is what selects the route; **`faccessat2`** refused the flag outright (`EINVAL`) where Linux
+    has taken it since 5.8, so it is in the vocabulary now and the empty name it marks asks about
+    the descriptor's inode through the same `access_check` and the same identity the flags select.
+    Owner: `src/syscall/linux/fs/file.rs`'s `utimensat` + `handle_faccessat2`. Pin:
+    `t-at-empty-name` on **both** machines — its `AT_EMPTY_PATH` section walks the six doors over
+    both descriptor shapes and pins the flag's inertness beside a real name for two of them.
+    Closes `docs/uapi/` §5.2's `AT_EMPTY_PATH` entry.

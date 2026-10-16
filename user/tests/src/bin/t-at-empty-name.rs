@@ -35,6 +35,20 @@
 //! absolute name's - which stops the descriptor being a question at all - is
 //! those two plus `t-link`. This program owns the empty name alone, so that each
 //! of the family's three answers has one home.
+//!
+//! # And the flag that reinterprets it
+//!
+//! `AT_EMPTY_PATH` is where the empty name stops being the name's answer: with
+//! it, the descriptor *is* the target, and six doors take it (`newfstatat`,
+//! `statx`, `fchownat`, `fchmodat2`, `utimensat`, `faccessat2`). Measured on the
+//! same host: every one of the six answers `0` for a descriptor the caller owns
+//! - `fchownat` and `fchmodat2` to the *same* uid and mode they already hold, so
+//! the answer does not depend on who is running - and `EBADF` for a descriptor
+//! nothing is open on. Beside a name that is really there the flag is inert: the
+//! name answers, which is pinned for two of the six. The two doors that were
+//! still wrong here when this section was written (`utimensat`, which served the
+//! descriptor only for `futimens`'s null name, and `faccessat2`, which refused
+//! the flag outright) are fixed with it, and the claims below are what said so.
 
 use mpos_user_tests::Report;
 use std::ffi::CString;
@@ -247,6 +261,121 @@ fn readlinkat(fd: i32) -> i64 {
     }
 }
 
+/// `AT_EMPTY_PATH`, the flag that makes an empty name the descriptor.
+const AT_EMPTY_PATH: usize = 0x1000;
+/// `AT_SYMLINK_NOFOLLOW`, which one inert-flag claim adds beside it.
+const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+
+/// The six doors that take `AT_EMPTY_PATH`, each asked for the descriptor with an
+/// empty name. The `_at` suffix is the flagged spelling of the door above it.
+fn newfstatat_at(fd: i32) -> i64 {
+    let mut st = [0u64; 32];
+    unsafe {
+        libc::syscall(
+            libc::SYS_newfstatat,
+            fd,
+            c("").as_ptr(),
+            st.as_mut_ptr(),
+            AT_EMPTY_PATH,
+        ) as i64
+    }
+}
+
+fn statx_at(fd: i32) -> i64 {
+    let mut st = [0u64; 64];
+    unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            fd,
+            c("").as_ptr(),
+            AT_EMPTY_PATH,
+            0x7ffu32 as usize,
+            st.as_mut_ptr(),
+        ) as i64
+    }
+}
+
+fn fchownat_at(fd: i32) -> i64 {
+    // The owner it already has, so the answer is `0` whoever is running rather
+    // than the `EPERM` a *change* would earn on a file this program owns.
+    unsafe {
+        libc::syscall(
+            libc::SYS_fchownat,
+            fd,
+            c("").as_ptr(),
+            libc::getuid() as usize,
+            libc::getgid() as usize,
+            AT_EMPTY_PATH,
+        ) as i64
+    }
+}
+
+fn fchmodat2_at(fd: i32) -> i64 {
+    let mode = libc::S_IRUSR | libc::S_IWUSR | libc::S_IRGRP | libc::S_IROTH;
+    unsafe {
+        libc::syscall(
+            SYS_FCHMODAT2,
+            fd,
+            c("").as_ptr(),
+            mode as usize,
+            AT_EMPTY_PATH,
+        ) as i64
+    }
+}
+
+fn utimensat_at(fd: i32) -> i64 {
+    unsafe {
+        libc::syscall(
+            libc::SYS_utimensat,
+            fd,
+            c("").as_ptr(),
+            0usize,
+            AT_EMPTY_PATH,
+        ) as i64
+    }
+}
+
+fn faccessat2_at(fd: i32) -> i64 {
+    unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            fd,
+            c("").as_ptr(),
+            libc::F_OK,
+            AT_EMPTY_PATH,
+        ) as i64
+    }
+}
+
+/// `newfstatat` with a *real* name and the flag, through the given dirfd: what
+/// "the flag is inert beside a name" means for one of the six.
+fn newfstatat_flag_name(fd: i32) -> i64 {
+    let mut st = [0u64; 32];
+    unsafe {
+        libc::syscall(
+            libc::SYS_newfstatat,
+            fd,
+            c("t-at-empty-name-file").as_ptr(),
+            st.as_mut_ptr(),
+            AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+        ) as i64
+    }
+}
+
+/// The same for `faccessat2`, whose flag word the claim is about as much as the
+/// name is.
+fn faccessat2_flag_name(fd: i32) -> i64 {
+    unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            fd,
+            c("t-at-empty-name-file").as_ptr(),
+            libc::F_OK,
+            AT_EMPTY_PATH,
+        ) as i64
+    }
+}
+
 fn main() {
     println!("t-at-empty-name");
     let mut r = Report::new();
@@ -354,6 +483,43 @@ fn main() {
     r.check(
         "readlinkat: and through a directory dirfd too",
         refused(readlinkat(dirfd)) == Some(libc::ENOENT),
+    );
+
+    // `AT_EMPTY_PATH`: the empty name as the descriptor. The fixture is this
+    // program's own file, so `fchownat`/`fchmodat2` set the owner and the mode
+    // that are already there and every door's `0` is the same whoever runs it.
+    let flagged: &[(&str, Door)] = &[
+        ("newfstatat", newfstatat_at),
+        ("statx", statx_at),
+        ("fchownat", fchownat_at),
+        ("fchmodat2", fchmodat2_at),
+        ("utimensat", utimensat_at),
+        ("faccessat2", faccessat2_at),
+    ];
+    for (name, door) in flagged {
+        r.check(
+            &format!(
+                "{name}: an empty name with AT_EMPTY_PATH names the descriptor, which answers 0"
+            ),
+            door(filefd) == 0,
+        );
+        r.check(
+            &format!("{name}: and a descriptor nothing is open on answers EBADF there"),
+            refused(door(BAD_FD)) == Some(libc::EBADF),
+        );
+    }
+
+    // Beside a name that is really there the flag does nothing: the name is what
+    // answers, and the dirfd has to be a real directory for the name to resolve
+    // through it (so a closed one is EBADF, which is the name route's answer and
+    // not the descriptor's).
+    r.check(
+        "newfstatat: the flag beside a name that is there is inert - the name answers",
+        newfstatat_flag_name(dirfd) == 0,
+    );
+    r.check(
+        "faccessat2: the same flag beside a name that is there is inert too",
+        faccessat2_flag_name(dirfd) == 0,
     );
 
     let _ = std::fs::remove_file(FILE);

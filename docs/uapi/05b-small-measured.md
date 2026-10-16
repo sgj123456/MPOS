@@ -5,25 +5,6 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
-- **`AT_EMPTY_PATH` names the descriptor where this kernel serves it — and is refused outright
-  where it does not.** Measured on a current host (`.workbuddy/probe_at_dirfd.c`, Linux 7.2.9),
-  the flag is Linux's way of saying "the descriptor is the target" for an *empty* name, and five
-  doors take it. Four are served here and agree with the measurement:
-  `newfstatat(fd, "", buf, AT_EMPTY_PATH)` answers `0` and `EBADF` for a descriptor that is not
-  open, and `statx`, `fchownat` and `fchmodat2` reach the descriptor the same way (the last two
-  then refused `EPERM` by their own policy, which is the proof they got there). The two that do
-  not are the gap: **`utimensat`'s empty-name spelling of the descriptor** answers `ENOENT` here
-  where Linux answers `0` — this door serves the descriptor only for the *null*-path spelling
-  `futimens` uses, and Linux measurably serves both (`utimensat(fd, "", NULL, AT_EMPTY_PATH)`
-  answers `0`; the null form is what every caller this kernel has met gives) — and **`faccessat2`
-  refuses the flag outright** (`EINVAL`, its vocabulary being the two it serves), where Linux has
-  taken it since 5.8 and answers `0` for a directory descriptor and `EBADF` for one that is not
-  open. Closing the second is one arm in the flag mask plus the `access_check` it already has; the
-  first is one branch beside the null-path one. Owner: `src/syscall/linux/fs/file.rs`'s
-  `handle_faccessat2` + `utimensat` (whose own doc names the gap). Pin: none yet — neither door has
-  a test of its own (`t-faccessat2` covers the flag word it *does* serve, and there is no
-  `t-utimens`), so this is a gap with a name and a measurement and no pin, which is why it stays
-  here rather than in §5.1. `docs/notes/` §15.17.
 - **`F_GETFL` reports no access mode.** Linux ORs the descriptor's access mode into the word
   `fcntl(F_GETFL)` returns, so a descriptor opened `O_WRONLY` reports `1` (measured on a
   current host); this kernel reports the description's stored status word, whose access bits

@@ -1215,41 +1215,51 @@ fn resolve_time(ts: &Utimespec, keep: u64, now: u64) -> Option<u64> {
 /// the everyday shape, not a corner. A null `times` sets both clocks to now; the
 /// `UTIME_NOW` / `UTIME_OMIT` sentinels resolve per clock.
 ///
-/// Linux's *other* spelling of that same request - an empty name together with
-/// `AT_EMPTY_PATH`, measured to serve the descriptor too - is not served here:
-/// an empty name is the name's own answer in `base_for` now, so this door
-/// answers `ENOENT` where Linux answers `0` or the descriptor's own refusal.
-/// Named in `docs/uapi/` §5.2 with the probe's numbers rather than papered over;
-/// the NULL form above is what every caller this kernel has met actually uses.
+/// Linux names that same request in a *second* spelling, an empty name together
+/// with `AT_EMPTY_PATH`, and this door serves both (measured on a current host,
+/// `.workbuddy/probe_at_dirfd.c`: `utimensat(fd, "", NULL, AT_EMPTY_PATH)`
+/// answers `0` for a descriptor the caller owns and `EBADF` for one nothing is
+/// open on, exactly as the NULL form does). The flag beside a name that is
+/// really there is inert - the name answers it - and an empty name *without* the
+/// flag is the name's own refusal, which `base_for` gives.
 pub fn utimensat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     let (dirfd, path_ptr, times_ptr, flags) = (args[0] as i32, args[1], args[2], args[3]);
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return err::EINVAL;
     }
-    // Resolve the node whose clocks are being set, by path or by descriptor.
-    let inode: Arc<dyn Inode> = if path_ptr == 0 {
-        match crate::sched::current_fds().clone_at(dirfd) {
+    // Read the name once, and let its *absence* be a word about the route rather
+    // than a second reading of the pointer: the descriptor is the target when
+    // there is no name (`futimens`'s spelling) and when the caller gave an empty
+    // one and said `AT_EMPTY_PATH`. Everything else resolves by name - the empty
+    // name it did *not* mark included, whose answer is `base_for`'s.
+    let path = if path_ptr == 0 {
+        None
+    } else {
+        match cstr_arg(path_ptr, true) {
+            Ok(path) => Some(path),
+            Err(e) => return e,
+        }
+    };
+    let inode: Arc<dyn Inode> = match path {
+        Some(name) if !name.is_empty() || flags & AT_EMPTY_PATH == 0 => {
+            let base = match base_for(dirfd, &name, cwd) {
+                Ok(base) => base,
+                Err(e) => return e,
+            };
+            let resolved = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                crate::vfs::resolve_no_follow_at(&name, base)
+            } else {
+                crate::vfs::resolve_opt(&name, Some(base))
+            };
+            match resolved {
+                Ok(inode) => inode,
+                Err(e) => return err_of(e),
+            }
+        }
+        _ => match crate::sched::current_fds().clone_at(dirfd) {
             Ok(file) => file.inode(),
             Err(e) => return err_of(e),
-        }
-    } else {
-        let path = match cstr_arg(path_ptr, true) {
-            Ok(path) => path,
-            Err(e) => return e,
-        };
-        let base = match base_for(dirfd, &path, cwd) {
-            Ok(base) => base,
-            Err(e) => return e,
-        };
-        let resolved = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            crate::vfs::resolve_no_follow_at(&path, base)
-        } else {
-            crate::vfs::resolve_opt(&path, Some(base))
-        };
-        match resolved {
-            Ok(inode) => inode,
-            Err(e) => return err_of(e),
-        }
+        },
     };
 
     // The two clocks. A null `times` means "now, both"; otherwise read the
@@ -5445,23 +5455,38 @@ pub fn handle_openat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, from_user:
 /// `AT_EACCESS` is accepted and indistinguishable: the real and effective
 /// IDs are one ID here, so the two questions the flag distinguishes have
 /// one answer. `AT_SYMLINK_NOFOLLOW` names the link itself and is honoured
-/// the way `lstat`'s is. The mode is validated the way `access(2)` validates
-/// it — anything outside F_OK/R_OK/W_OK/X_OK is EINVAL — and `X_OK`
-/// answers from the mode bits the filesystem stores, the only bits this
-/// kernel keeps: a directory traverses, a script with its bit clear does
-/// not, which is the question a shell's `test -x` is asking.
+/// the way `lstat`'s is. `AT_EMPTY_PATH` with an empty name asks about the
+/// *descriptor* rather than a name (Linux 5.8 added it, and the measurement
+/// agrees: `faccessat2(fd, "", F_OK, AT_EMPTY_PATH)` answers `0` for a
+/// descriptor the caller owns and `EBADF` for one nothing is open on, while
+/// the same flag beside a name that is really there is inert). The mode is
+/// validated the way `access(2)` validates it — anything outside
+/// F_OK/R_OK/W_OK/X_OK is EINVAL — and `X_OK` answers from the mode bits the
+/// filesystem stores, the only bits this kernel keeps: a directory traverses,
+/// a script with its bit clear does not, which is the question a shell's
+/// `test -x` is asking.
 pub fn handle_faccessat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     let (dirfd, path_ptr, mode, flags) = (args[0] as i32, args[1], args[2], args[3]);
     if mode & !(R_OK as usize | W_OK as usize | X_OK as usize) != 0 {
         return err::EINVAL;
     }
-    if flags & !(abi::AT_SYMLINK_NOFOLLOW | abi::AT_EACCESS) != 0 {
+    if flags & !(abi::AT_SYMLINK_NOFOLLOW | abi::AT_EACCESS | AT_EMPTY_PATH) != 0 {
         return err::EINVAL;
     }
     let path = match cstr_arg(path_ptr, true) {
         Ok(path) => path,
         Err(e) => return e,
     };
+    // The descriptor *is* the target under `AT_EMPTY_PATH`, and only there: the
+    // question is then the one the path route asks of the inode it resolved,
+    // with the same identity the flags select. An empty name the caller did not
+    // mark falls through to `base_for`, whose answer for it is the name's own.
+    if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        return match crate::sched::current_fds().clone_at(dirfd) {
+            Ok(file) => access_check(&file.inode(), mode, access_ids(flags)),
+            Err(e) => err_of(e),
+        };
+    }
     let base = match base_for(dirfd, &path, cwd) {
         Ok(base) => base,
         Err(e) => return e,
