@@ -463,13 +463,15 @@ the commit bodies), and each moved its pin in the same commit.
     **both** ends of its pipe, plus the path spelling's two refusals — and `t-truncate` is now a
     program with no per-machine branch and no named divergence of its own. The `ENODEV` those two
     tests had carried for *both* ends was the fallocate man page's word rather than either
-    machine's answer for a pipe. Two things this item left named in §5.2, and both have moved
-    since: the pipe reached by its own `/proc/<pid>/fd` name was the *same* question asked from the
-    other end — the door was acting on the link rather than on the file the name denotes — and
-    closing it (§5.1 item 24) is what settled it, the path spelling answering Linux's `EINVAL` for
-    that pipe because it now reaches the pipe's own inode; and the *other* inode that reports
-    `NodeKind::File` without being a regular file — a FIFO made by `mknod`, which is a pipe to
-    Linux and a resizable file to this kernel — is still named there.
+    machine's answer for a pipe. Two things this item left named in §5.2 have both moved since: the
+    pipe reached by its own `/proc/<pid>/fd` name was the *same* question asked from the other end
+    — the door was acting on the link rather than on the file the name denotes — and closing it
+    (§5.1 item 24) is what settled it, the path spelling answering Linux's `EINVAL` for that pipe
+    because it now reaches the pipe's own inode; and the *other* inode that reports
+    `NodeKind::File` without being a regular file — a FIFO made by `mknod` — is gone as of §5.1
+    item 25, which refuses the FIFO's creation until a channel node exists (§5.2 carries the
+    measured contract and the design), so no node this kernel can make reports `File` without
+    being one.
 
 23. **`waitid`'s record carries the child's real uid.** `si_uid` was the one field of that record
     this kernel answered with a zero, and the reason was structural rather than an oversight: the
@@ -563,3 +565,51 @@ the commit bodies), and each moved its pin in the same commit.
     belongs to another model rather than to this name: `chdir` through a directory's name serves —
     the walk's half, and it was `ENOTDIR` before — but the `getcwd` after it reads back the *string*
     the caller used where Linux canonicalises, which any symlinked `chdir` has here.
+
+25. **The `mknod` doors answer Linux's answers, ask their questions in Linux's order, and build Linux's
+    node for the type field's whole vocabulary — with `S_IFIFO` refused rather than faked.**
+    `mknodat(2)` (and the legacy `mknod`, 133 on x86_64 alone, which Linux spells
+    `do_mknodat(AT_FDCWD, …)`) is what an initramfs pre-seeds its `/dev` with and what a package makes
+    a device node with, and the type field of its mode picks the node. Measured on a current host
+    through `syscall(2)` (`.workbuddy/probe_mknod.c`, Linux 7.2.9, an unprivileged caller, and it
+    needs no privilege but for the two device types): **`S_IFREG` and a plain permission word — the
+    type `0`, including a mode of `0` — create a regular file** (`0`, mode `0000` for mode `0`);
+    **`S_IFSOCK` creates a socket node** (`0`, unprivileged); **`S_IFDIR` is `EPERM`** (the
+    privilege word, not the argument word — `mknod` does not make directories); `S_IFLNK` is
+    `EINVAL`; `S_IFCHR`/`S_IFBLK` are `EPERM` without `CAP_MKNOD` and served with it; `S_IFIFO`
+    creates a **FIFO**, whose contract is measured whole in `.workbuddy/probe_fifo.c` and recorded
+    in §5.2. **The name's own answer, measured the same way: a name that already exists is
+    `EEXIST`** — over a node of the same type, over one of a different type, over a *dangling link*
+    (the question is about the name), and through both spellings. **And the order of the call's
+    questions is Linux's, which the same probe measured from both sides**: the type's own refusals
+    come **first, before the name is even copied** (`S_IFDIR` is `EPERM` and `S_IFLNK` `EINVAL` over
+    an *empty* name, which would be `ENOENT` had the name been asked first, and over a name that
+    already exists, which would be `EEXIST`); then the name; then the name's existence; then the
+    directory's own writability (`EACCES` — measured: a device node in a directory the caller may
+    not write is `EACCES` rather than the capability's `EPERM`); and only then the kind, which is
+    the position Linux asks for a device node's `CAP_MKNOD` in. **The fixes**: `abi.rs` gains
+    `mknod_type_is_creatable` (the first question: `S_IFDIR` → `EPERM`, an uncreatable type →
+    `EINVAL`, the five it makes plus a plain mode pass) and keeps `mknod_kind` for the kind itself,
+    asked last; its unit test asserts each of Linux's answers, including the two refusals' *words*;
+    both `mknod` doors answer `EEXIST` for an existing name, asked *without following* so a dangling
+    link is the name that exists, and both ask the directory's bits after it. **`S_IFIFO` is
+    `EOPNOTSUPP`**: this kernel has no channel node yet, and a node that is a regular file under a
+    FIFO's name is a wrong *shape* — a caller cannot tell it from an empty channel — where an honest
+    refusal is one the caller can see (rule 4); it is asked last, so `mknodat(existing, S_IFIFO)` is
+    the `EEXIST` Linux answers for a type it serves. The design a real one needs is written into
+    §5.2 beside the measurement, so the next pass builds it from a contract rather than a guess.
+    Owner: `src/syscall/linux/abi.rs`, `src/syscall/linux/fs/file.rs`'s two doors. Pin: `t-mknod`
+    (22 claims as root, 21 where the device-node claim is named rather than made — the payload runs
+    as root and a hand host run need not), its `ok:` lines identical on both machines, with the
+    `S_IFIFO` claim's one text accepted for the host's answer under `MPOS_ON_HOST`. **A third fix
+    the pin forced, in the same subject**: `stat`'s permission half collapsed a stored `0000` into
+    the kind's default — `mode_of` was handed a bare `u32` and read `0` as "nobody said" — so a file
+    `mknod` was told to make with mode `0` (or one `chmod 000`ed) *enforced* its empty mode through
+    `may_as`, which asks `keeps_modes`, while *reporting* `0644`. The stat doors now pass
+    `Option<u32>` through the new `reported_mode` (`src/syscall/linux/fs/file.rs`): a filesystem that
+    keeps modes reports what it holds, **including `0000`**, and one that keeps none answers its
+    kind's default. Three things stay named in §5.2 rather than fixed: the **device number**
+    `mknod`'s `dev` argument names is not written on the node; **`CAP_MKNOD` is not checked**, so an
+    unprivileged caller can make a device node here where Linux answers `EPERM`; and the FIFO's
+    *node*, with its prerequisite spelled out (`open_replacement` takes no flags, and the direction
+    an open asked for is what picks the end).

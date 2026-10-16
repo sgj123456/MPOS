@@ -5,21 +5,72 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
-- **A FIFO made by `mknod` is a regular file to this kernel, so the size-changing calls resize
-  it.** `mknodat(S_IFIFO)` here makes a `NodeKind::File` node - `src/syscall/linux/abi.rs`'s own
-  `mknod_kind` maps `0o010000` to `File`, and its unit test pins that mapping - so it is a
-  regular file in every way the callers ask: `ftruncate`/`truncate` resize it, and `open`, `read`
-  and `write` treat it as one. Measured on a current host through `syscall(2)`
-  (`.workbuddy/probe_fsize.c`): a `mknod`'d name is a *pipe* to Linux - `truncate(name, 4)` is
-  `EINVAL`, its read end's `ftruncate` is `EINVAL` and its `fallocate` is `EBADF` (the mode check
-  again, §5.1 items 21 and 22), and a read end opened `O_NONBLOCK` with no writer at all answers
-  `0`, which is a pipe's end-of-file rather than a file's. So the remaining hole in the
-  size-changing calls is the *other* inode that reports `NodeKind::File` without being a regular
-  file: the pipe is the one `docs/uapi/` §5.1 item 22 asks `as_pipe` for, and this is the one it
-  cannot see. Owner: `abi.rs`'s `mknod_kind` and the node `handle_mknodat` builds from it - which
-  is the real decision, since a FIFO is a channel and a file-shaped node under a FIFO's name is
-  the wrong shape for both. **Our half is read from the code rather than measured** (no test
-  makes a FIFO yet), which is what makes this an entry rather than a pin.
+- **A FIFO: `mknodat(S_IFIFO)` is refused here now, and the node a real one needs is designed but
+  not built.** Until 2026-10-16 this call made a `NodeKind::File` node, so a *rendezvous* was a
+  plain file: it read end-of-file at once and `ftruncate`/`truncate` resized it, which is a wrong
+  *shape* rather than a wrong number - a caller cannot tell such a name from an empty channel. The
+  refusal (`EOPNOTSUPP`, "present, and this cannot do that") is `docs/uapi/` §5.1 item 25, and the
+  contract it stands in front of is measured whole on a current host through `syscall(2)`
+  (`.workbuddy/probe_fifo.c`, Linux 7.2.9; `probe_fsize.c` carries the file-shaped answers beside
+  it):
+  - **the name**: `S_IFIFO` and the mode it was made with (the umask applies), size `0`, `nlink`
+    1, `blocks` 0; `stat` of an *opened* description says `S_IFIFO` too, and `lseek` on it is
+    `ESPIPE`. A second `mknod` on the name is `EEXIST` whatever type it asks for (§5.1 item 25).
+  - **the rendezvous**: `open(O_RDONLY)` with no writer and `open(O_WRONLY)` with no reader both
+    **park** until a peer opens the other end; `open(O_RDWR)` does not park; `O_RDONLY|O_NONBLOCK`
+    returns at once and `O_WRONLY|O_NONBLOCK` with no reader is **`ENXIO`**. A reader parked in
+    `open` counts as a reader: measured, a writer that arrived at 200 ms opened, wrote, and the
+    parked reader's `open` returned to read those four bytes.
+  - **what each side sees**: a nonblocking reader with no writer at all reads `0` (end-of-stream),
+    with a live writer that has written nothing `EAGAIN`, and after the last writer closes `0`
+    again; the last reader closing makes a write `EPIPE`. The buffer is **discarded** when both
+    counts reach zero, so the next open starts empty.
+  - **the file-shaped calls**: `ftruncate` is `EINVAL`, `fallocate` is `EBADF`/`ESPIPE` per the
+    mode's direction (§5.1 item 22), `truncate(name)` is `EINVAL`, `execve` is `EACCES`, `poll`
+    reports the queue.
+
+  **What building it needs**, in the order it has to be decided: a node kind whose `stat` is
+  `S_IFIFO`; an **open-time** rendezvous (the open path parks on a predicate and the state wakes
+  its waiters, the shape `PipeEnd`'s read and write already use); reader/writer counts taken at
+  *open* and released at the last close of a description (not at node drop - a `dup` shares a
+  description and a `fork` shares it too, which is why the pipe's own counts are per description);
+  an end per open whose `as_pipe` is the channel, so the size-changing calls and `splice` follow
+  the pipe's rules with no second answer; and `O_RDWR` as one description that is both a reader
+  and a writer. Two of those want a decision the pipe module does not have yet: `Inode`'s
+  `open_replacement` takes no flags (it is the `/dev/ptmx` door, which mints one thing), and the
+  direction an open asked for is what picks the end. Owner: `src/vfs/` (a `fifo` module beside
+  `pipe`, `src/vfs/mount.rs`'s open path) and `src/syscall/linux/abi.rs`'s `mknod_kind`, whose
+  `S_IFIFO` arm is where the refusal lives. Pin: `t-mknod` claims the refusal and the host's
+  answer; the rendezvous has no pin yet because there is nothing to pin.
+
+- **`CAP_MKNOD` is not checked.** Linux refuses a device node to a caller without `CAP_MKNOD`
+  (`EPERM`, measured on a current host through `syscall(2)`, `.workbuddy/probe_mknod.c`), and the
+  *order* it refuses in is measured too: after the type's own answers, after the name, after the
+  name's existence (`EEXIST` wins), and after the directory's writability (a device node in a
+  directory the caller may not write is `EACCES`, not `EPERM`). This kernel has no such gate:
+  `handle_mknodat` builds the node for any caller. The impact is small and the reason it is named
+  rather than fixed is the same in both halves - a node made here routes nowhere (there is no
+  number-to-driver table, the entry above), so the node a caller should not have been able to make
+  also cannot do anything; and asking the question is not one line, because a `setuid` here does not
+  re-derive the capability sets (`src/syscall/linux/posix.rs`'s `identity_set_one` changes the ids
+  and leaves the sets alone), so a dropped-privilege process would still hold `CAP_MKNOD` and the
+  gate would answer `EPERM` for nobody. Owner: `src/syscall/linux/fs/file.rs`'s two `mknod` doors,
+  once `setuid`'s capability re-derivation lands.
+
+- **A device node made by `mknod` carries no device number.** `st_rdev` is the field `mknod(2)`'s
+  `dev` argument fills - measured on the host, `/dev/null` reports `rdev 1:3`, the number its own
+  creation passed, and an unprivileged caller cannot make a device node to watch it happen
+  (`EPERM`, measured) - and this kernel ignores the argument: `handle_mknodat` reads only the mode
+  and hands `parent.create(name, kind)` its kind, so a node made here reports `rdev 0:0`. It is
+  named rather than fixed because writing the number is not the whole of it: this kernel has no
+  table from a device number to a driver (its `/dev/null` *is* the null device, a driver-published
+  object; a node made here is a placeholder the `devtmpfs` mount later covers), so a true
+  `st_rdev` would make `stat` right and the device still absent - and it would put a fabricated
+  node in front of the rdev-keyed ioctl families (`'R'`'s entropy words, `FIONREAD`), which
+  dispatch on that word and would then answer for a device that is not there. Closing it means a
+  number-to-driver registry, which is the same prerequisite `devfs`'s birth modes want. Owner:
+  `src/syscall/linux/fs/file.rs`'s two `mknod` doors. `t-mknod` reads the type of what it made and
+  prints the `st_rdev` that came back.
 
 - **A descriptor's second name now denotes the file behind it — and what that leaves.** **Landed
   2026-10-16** (`docs/uapi/` §5.1 item 24). The entry this replaces said a pipe "cannot be named by

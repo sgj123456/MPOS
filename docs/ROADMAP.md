@@ -328,6 +328,15 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are TCP's record-only buffer sizes
 (`SO_SNDBUF`/`SO_RCVBUF`), MNT/PID/NET isolation, and the unsized-pty window divergence.
 
+**A FIFO is refused rather than faked** (`mknodat(S_IFIFO)` is `EOPNOTSUPP` since 2026-10-16,
+`docs/uapi/` §5.1 item 25): a FIFO is a *channel* and what this kernel had was a regular file under
+its name — a shape a caller cannot tell from an empty channel. The contract a real node owes is
+measured whole, and the design needed to build it is written down in `docs/uapi/` §5.2 decision by
+decision, with the one shape the pipe module does not have (`open_replacement` takes no flags, and
+the direction an open asked for is what picks the end). That entry's second half is `mknod`'s `dev`
+argument: a node made here carries no device number, because a number-to-driver table is what would
+make the number mean a device.
+
 One of those "buffer sizes" is named down to the line: a **blocking UDP send does not wait for the
 send buffer** (`EAGAIN` where Linux waits) — the gap, its tried shapes and their measurements are
 `docs/uapi/` §5.2's entry; it closes when the TX ring gets a completion wakeup. The MTU story that

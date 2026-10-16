@@ -63,6 +63,27 @@ fn observed_owner(owner: (u32, u32)) -> (u32, u32) {
     (ns.uid_to_inner(owner.0), ns.gid_to_inner(owner.1))
 }
 
+/// The stored permission word to report for `inode`, or `None` when the
+/// filesystem has nothing to say and the kind's default is the honest answer.
+///
+/// The two cases a bare `u32` collapses are different facts, and only the inode
+/// can tell them apart: a filesystem that *keeps* modes reports what it holds,
+/// **including `0000`** (a file `chmod`ed to no bits, or one `mknod` was asked
+/// for mode 0), where a filesystem that keeps none answers its kind's default
+/// so directories stay traversable and devices usable. This asks
+/// [`Inode::keeps_modes`](crate::vfs::Inode::keeps_modes) - the same question
+/// the permission checks ask, which is why the *enforcement* was right while
+/// the *report* was not: measured on a current host, a `mknodat(S_IFREG, 0)`
+/// node answers `st_mode` `0o100000` and a `chmod 000` file answers the same,
+/// where this kernel answered `0o100644` for both, because the stored word went
+/// to `abi::mode_of` as a bare `u32` and `0` read as "nobody said". A nonzero
+/// stored word is passed through as before, so a filesystem whose `mode()`
+/// answers something without claiming to keep modes is unaffected.
+fn reported_mode(inode: &Arc<dyn Inode>) -> Option<u32> {
+    let stored = inode.mode();
+    (stored != 0 || inode.keeps_modes()).then_some(stored)
+}
+
 /// The file a `linkat` source name leads to, with `AT_SYMLINK_FOLLOW`.
 ///
 /// That is now the same walk every other following door uses: the resolver
@@ -518,7 +539,7 @@ pub fn fstat(args: [usize; ARG_COUNT]) -> isize {
                     file.metadata(),
                     dev,
                     inode.rdev(),
-                    inode.mode(),
+                    reported_mode(&inode),
                     inode.nlink(),
                     inode.owner(),
                     StatTimes {
@@ -794,7 +815,7 @@ pub fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
                         file.metadata(),
                         dev,
                         inode.rdev(),
-                        inode.mode(),
+                        reported_mode(&inode),
                         inode.nlink(),
                         inode.owner(),
                         StatTimes {
@@ -829,7 +850,7 @@ pub fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             Ok(inode) => (
                 inode.metadata(),
                 inode.rdev(),
-                inode.mode(),
+                reported_mode(&inode),
                 inode.nlink(),
                 inode.owner(),
                 StatTimes {
@@ -845,7 +866,7 @@ pub fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             Ok(inode) => (
                 inode.metadata(),
                 inode.rdev(),
-                inode.mode(),
+                reported_mode(&inode),
                 inode.nlink(),
                 inode.owner(),
                 StatTimes {
@@ -915,7 +936,7 @@ pub fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
                     file.metadata(),
                     dev,
                     inode.rdev(),
-                    inode.mode(),
+                    reported_mode(&inode),
                     inode.nlink(),
                     inode.owner(),
                     StatTimes {
@@ -952,7 +973,7 @@ pub fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
                 inode.metadata(),
                 dev,
                 inode.rdev(),
-                inode.mode(),
+                reported_mode(&inode),
                 inode.nlink(),
                 inode.owner(),
                 StatTimes {
@@ -4511,19 +4532,26 @@ pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 /// The nodes an initramfs's init pre-seeds (`[ -c /dev/null ] || mknod
 /// /dev/null c 1 3`) land on the temporary root, which is a ramfs: they are
 /// placeholders the `devtmpfs` mount then covers with driver-backed devices.
-/// A name that already exists answers success - the caller wanted the node,
-/// not the call - and a filesystem that cannot hold the kind passes its own
-/// error through.
+/// The guard in that idiom is the *caller's*, and it is there because the call
+/// itself is not idempotent: measured on a current host through `syscall(2)`
+/// (`.workbuddy/probe_mknod.c`), a name that already exists is `EEXIST` — for
+/// the same type, for a different one, and through this legacy spelling and
+/// `mknodat` alike. This door answered `0` and called the caller's intent its
+/// own ("the caller wanted the node, not the call"), which is a success where
+/// Linux refuses: a script that checks whether a node exists *by making it*
+/// read a yes for a name somebody else had already made.
 pub fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    // The type is the first question, before the name is even copied - Linux's
+    // `may_mknod`, whose two answers (`S_IFDIR` `EPERM`, an uncreatable type
+    // `EINVAL`) come back over an *empty* name as readily as over an existing
+    // one, measured through `syscall(2)` (`.workbuddy/probe_mknod.c`). Linux's
+    // legacy `mknod` is `do_mknodat(AT_FDCWD, …)`, so every rule in
+    // [`handle_mknodat`] is this call's too, in the same order.
+    if let Err(e) = abi::mknod_type_is_creatable(args[1]) {
+        return e;
+    }
     let path = match cstr_arg(args[0], true) {
         Ok(p) => p,
-        Err(e) => return e,
-    };
-    // The `S_IFMT` field picks the kind; sockets and modeless modes are
-    // refused, and a FIFO is a plain file here. The mapping is spelled in
-    // `abi`, tested on the host.
-    let kind = match abi::mknod_kind(args[1]) {
-        Ok(kind) => kind,
         Err(e) => return e,
     };
     let absolute = if path.starts_with('/') {
@@ -4536,9 +4564,11 @@ pub fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             path
         ))
     };
-    // A name this kernel already serves needs no creating.
-    if crate::vfs::resolve_opt(&absolute, Some(cwd.clone())).is_ok() {
-        return 0;
+    // A name that is already there is `EEXIST`, and the question is about the
+    // *name*: asked without following, a dangling link is a name that exists
+    // and answers the same way Linux does.
+    if crate::vfs::resolve_no_follow_at(&absolute, cwd.clone()).is_ok() {
+        return err::EEXIST;
     }
     let (parent_path, name) = match absolute.rsplit_once('/') {
         Some(("", n)) => (String::from("/"), n),
@@ -4549,8 +4579,26 @@ pub fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(p) => p,
         Err(e) => return err_of(e),
     };
+    // The directory's own bits decide whether a name may be made in it, and the
+    // question comes after `EEXIST` (Linux's `may_create` asks both, in that
+    // order) - so a name that is already there is `EEXIST` even in a directory
+    // the caller may not write.
+    if let Err(e) = crate::vfs::may_create_in(&parent) {
+        return err_of(e);
+    }
+    // The kind, once the name is settled - the position Linux asks for a device
+    // node's `CAP_MKNOD` in, and where a FIFO's refusal belongs, so
+    // `mknodat(existing, S_IFIFO)` above is the `EEXIST` Linux answers for a
+    // type it serves.
+    let kind = match abi::mknod_kind(args[1]) {
+        Ok(kind) => kind,
+        Err(e) => return e,
+    };
     match parent.create(name, kind) {
-        Ok(_) => 0,
+        Ok(created) => {
+            created.set_mode(masked_mode(args[1] as u32));
+            0
+        }
         Err(e) => err_of(e),
     }
 }
@@ -5664,13 +5712,31 @@ pub fn handle_fchmodat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
 
 /// `mknodat(dirfd, path, mode, dev)` — create a node, relative to a
 /// dirfd. `mknod` is this at the caller's cwd.
+///
+/// **The `dev` argument is not written on the node**, and that is a named
+/// divergence rather than an oversight (`docs/uapi/` §5.2): `st_rdev` is the
+/// field this argument fills, and it is what makes a node *that* device -
+/// `/dev/null` reports `rdev 1:3`, the number its own creation passed
+/// (measured on a current host). What this kernel can honestly do with it is
+/// nothing yet, because it has no table from a device number to a driver: its
+/// devices are objects a driver published under a name (`/dev/null` *is* the
+/// null device; a node made here is not), so writing the number would make
+/// `stat` true and the device still absent - and would put a fabricated node
+/// in front of the rdev-keyed ioctl families, which dispatch on that word.
 pub fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
+    // The type is the first question, before the name is copied and before the
+    // dirfd is looked at - Linux's `may_mknod`, measured through `syscall(2)`
+    // (`.workbuddy/probe_mknod.c`, Linux 7.2.9): `S_IFDIR` answers `EPERM` and
+    // an uncreatable type `EINVAL` even with an *empty* name, which names
+    // nothing and would be `ENOENT` had the type been asked second, and the
+    // same two come back over a name that already exists. `t-at-empty-name`
+    // pins the other side of that order with `S_IFIFO`, a type this check
+    // passes and this kernel's kind step refuses: the empty name still wins.
+    if let Err(e) = abi::mknod_type_is_creatable(args[2]) {
+        return e;
+    }
     let path = match cstr_arg(args[1], true) {
         Ok(path) => path,
-        Err(e) => return e,
-    };
-    let kind = match abi::mknod_kind(args[2]) {
-        Ok(kind) => kind,
         Err(e) => return e,
     };
     let base = match base_for(args[0] as i32, &path, cwd) {
@@ -5685,16 +5751,36 @@ pub fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(dir) => dir,
         Err(e) => return err_of(e),
     };
-    // A name this kernel already serves needs no creating — the caller
-    // wanted the node, not the call.
+    // A name that is already there is `EEXIST` — measured on a current host,
+    // through `syscall(2)` (`.workbuddy/probe_mknod.c`): over a node of the same
+    // type, over one of a *different* type (including a type this kernel
+    // refuses, which Linux serves), over a *dangling link* (the question is
+    // about the name, so it is asked without following), and through this
+    // spelling and the legacy `mknod` alike. This door answered `0` and called
+    // the caller's intent its own ("the caller wanted the node, not the call"),
+    // which is a success where Linux refuses.
     if crate::vfs::resolve_no_follow_at(name, parent.clone()).is_ok() {
-        return 0;
+        return err::EEXIST;
     }
     // The parent's bits decide whether a name may be made here, and the mode
-    // arrives masked like every other create's.
+    // arrives masked like every other create's. Linux asks this *after* the
+    // existence check (`may_create` does both, in that order), and before the
+    // device-node capability - measured: a device node in a directory the
+    // caller may not write is `EACCES`, and one in a directory it may write is
+    // `EPERM` for want of `CAP_MKNOD`.
     if let Err(e) = crate::vfs::may_create_in(&parent) {
         return err_of(e);
     }
+    // The kind, once the name and its existence are settled: where a FIFO's
+    // refusal belongs (so the `EEXIST` above is what a second `mknodat(S_IFIFO)`
+    // over its own node answers, as Linux answers it for a type it serves), and
+    // where Linux's `CAP_MKNOD` gate for a device node sits. This kernel has no
+    // such gate yet - `docs/uapi/` §5.2 names it, with the capability
+    // re-derivation a uid change would need before it could be asked.
+    let kind = match abi::mknod_kind(args[2]) {
+        Ok(kind) => kind,
+        Err(e) => return e,
+    };
     match parent.create(name, kind) {
         Ok(created) => {
             created.set_mode(masked_mode(args[2] as u32));

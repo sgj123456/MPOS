@@ -347,12 +347,25 @@ pub(super) fn normalize_path(path: &str, base: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// The mode bits `struct stat` and `struct statx` carry for a node.
-pub(crate) fn mode_of(meta: &Metadata, stored: u32) -> u32 {
+pub(crate) fn mode_of(meta: &Metadata, stored: Option<u32>) -> u32 {
     // The format bits follow the kind - `st_mode`'s top nibble is a type
     // tag, not a permission. The permission bits are the filesystem's own
     // when it stores them (ext2 does, and OpenRC's `test -x` gate lives on
     // them); a filesystem without them gets the kind's default, which keeps
     // directories traversable and devices usable.
+    //
+    // `None` is "this filesystem has nothing to say", which is a different
+    // answer from a stored `0` and has to be: a file whose mode *is* `0000` -
+    // `chmod 000`, or a `mknod` asked for mode 0 - reports no permission bits
+    // at all on Linux, and this used to report the kind's default for it,
+    // because the stored word was passed as a bare `u32` and `0` was read as
+    // "unset". The caller is what tells the two apart, with
+    // [`Inode::keeps_modes`](crate::vfs::Inode::keeps_modes) - the same
+    // question the permission checks ask - so the door passes `None` only for a
+    // filesystem that keeps no modes at all. Measured on a current host: a
+    // `mknodat(S_IFREG, 0)` node answers `st_mode` `0o100000`, and a file whose
+    // filesystem keeps no modes answers its kind's default (a tmpfs file born
+    // by `mknod` with mode 0 is `S_IFREG` with no permission bits).
     let format = match meta.kind {
         NodeKind::File => 0o100_000,
         NodeKind::Dir => 0o040_000,
@@ -361,17 +374,16 @@ pub(crate) fn mode_of(meta: &Metadata, stored: u32) -> u32 {
         NodeKind::Symlink => 0o120_000,
         NodeKind::Socket => 0o140_000,
     };
-    if stored != 0 {
-        format | (stored & 0o7777)
-    } else {
-        match meta.kind {
+    match stored {
+        Some(stored) => format | (stored & 0o7777),
+        None => match meta.kind {
             NodeKind::File => 0o100_644,     // regular file rw-r--r--
             NodeKind::Dir => 0o040_755,      // directory rwxr-xr-x
             NodeKind::CharDev => 0o020_666,  // character device rw-rw-rw-
             NodeKind::BlockDev => 0o060_660, // block device brw-rw----
             NodeKind::Symlink => 0o120_777,  // symbolic link rwxrwxrwx
             NodeKind::Socket => 0o140_755,   // socket srwxr-xr-x until chmod
-        }
+        },
     }
 }
 
@@ -445,7 +457,7 @@ pub(crate) fn write_stat(
     meta: &Metadata,
     dev: u64,
     rdev: Option<(u32, u32)>,
-    stored: u32,
+    stored: Option<u32>,
     nlink: u64,
     owner: (u32, u32),
     times: StatTimes,
@@ -611,7 +623,7 @@ pub(crate) fn write_statx(
     mask: u32,
     meta: &Metadata,
     dev: u64,
-    stored: u32,
+    stored: Option<u32>,
     rdev: Option<(u32, u32)>,
     nlink: u64,
     owner: (u32, u32),
@@ -697,14 +709,65 @@ pub(crate) fn lseek_target(cur: i64, size: i64, offset: i64, whence: i32) -> Opt
 // mknod(2): the S_IFMT field of the mode picks the node's kind
 // ---------------------------------------------------------------------------
 
-/// The node kind a `mknod` mode names. A FIFO is a plain file here: the
-/// descriptor layer cannot tell. Anything else in the `S_IFMT` field -
-/// sockets, and every mode with no type at all - is refused.
+/// The `S_IFMT` values `mknod` will look at **before it looks at the name** -
+/// Linux's `may_mknod`.
+///
+/// The order is measured, not read: on a current host through `syscall(2)`
+/// (`.workbuddy/probe_mknod.c`, Linux 7.2.9) `S_IFDIR` is `EPERM` and an
+/// uncreatable type (`S_IFLNK`) is `EINVAL` while the *name* is still an empty
+/// string - which names nothing and would be `ENOENT` had the type been asked
+/// second - and the same two answers come back over a name that already exists
+/// (where the field's creatable values answer `EEXIST`). So this is the first
+/// question the call asks, and the five types it makes plus a plain mode (which
+/// Linux translates to a regular file) pass it.
+///
+/// The legacy `mknod` needs no separate answer: Linux's is
+/// `do_mknodat(AT_FDCWD, …)`, so every rule here is that call's.
+pub(crate) fn mknod_type_is_creatable(mode: usize) -> Result<(), isize> {
+    match mode & 0o170000 {
+        0 | 0o100000 | 0o010000 | 0o020000 | 0o060000 | 0o140000 => Ok(()),
+        0o040000 => Err(err::EPERM),
+        // `S_IFLNK`, which has `symlink(2)` of its own, and the field's
+        // remaining value, which nothing names.
+        _ => Err(err::EINVAL),
+    }
+}
+
+/// The node kind a `mknod` mode names, asked once the name and its existence
+/// are settled - the position Linux asks for `CAP_MKNOD` in (`EPERM` for a
+/// device node an unprivileged caller asks for, measured *after* `EEXIST`).
+///
+/// The `S_IFMT` field's cre***atable values all answer here: measured on a
+/// current host through `syscall(2)` (`.workbuddy/probe_mknod.c`, Linux 7.2.9),
+/// `S_IFREG` and a plain mode (including `0`) create a **regular file**,
+/// `S_IFSOCK` a **socket node** (`0`, unprivileged - a kind this kernel already
+/// has, since devfs mints socket names and `bind` owns them), and
+/// `S_IFCHR`/`S_IFBLK` a device node (which Linux gates on `CAP_MKNOD` and this
+/// kernel does not yet - `docs/uapi/` §5.2 names that, with the capability
+/// re-derivation it would need). The umask applies to the permission half
+/// beside it: `S_IFREG|0666` under a `022` mask leaves `0644`.
+///
+/// **`S_IFIFO` is refused here rather than faked** (`EOPNOTSUPP`, "present, and
+/// this cannot do that" - `docs/uapi/` §5.2 carries the whole measured contract
+/// and the design a real FIFO needs). Until this pass it created a
+/// `NodeKind::File`, which made a *rendezvous* a plain file: measured, Linux's
+/// FIFO blocks `open` until a peer opens the other end (`O_RDONLY` with no
+/// writer and `O_WRONLY` with no reader both parked; `O_RDWR` does not),
+/// answers `ENXIO` to `O_WRONLY|O_NONBLOCK` with no reader, reads `0` with no
+/// writer and `EAGAIN` with one that has written nothing, writes `EPIPE` when
+/// the last reader closes, and is `S_IFIFO` to `stat` at both the name and an
+/// opened description. A name that reads end-of-file at once is worse than a
+/// refusal, because the caller cannot tell it from an empty channel. It is
+/// asked *after* the name and its existence, so `mknodat(existing, S_IFIFO)` is
+/// the `EEXIST` Linux answers for a type it serves.
 pub(crate) fn mknod_kind(mode: usize) -> Result<NodeKind, isize> {
     match mode & 0o170000 {
+        0 | 0o100000 => Ok(NodeKind::File),
         0o020000 => Ok(NodeKind::CharDev),
         0o060000 => Ok(NodeKind::BlockDev),
-        0o010000 => Ok(NodeKind::File),
+        0o140000 => Ok(NodeKind::Socket),
+        0o010000 => Err(err::EOPNOTSUPP),
+        // The two values `mknod_type_is_creatable` refuses first, and no third.
         _ => Err(err::EINVAL),
     }
 }
@@ -2823,20 +2886,26 @@ mod tests {
     #[test]
     fn mode_of_tags_the_kind_and_honours_stored_permissions() {
         // Format bits per inode(7): S_IFREG, S_IFDIR, S_IFCHR, S_IFBLK, S_IFLNK.
-        assert_eq!(mode_of(&meta(NodeKind::File, 1, 0), 0), 0o100_644);
-        assert_eq!(mode_of(&meta(NodeKind::Dir, 1, 0), 0), 0o040_755);
-        assert_eq!(mode_of(&meta(NodeKind::CharDev, 1, 0), 0), 0o020_666);
-        assert_eq!(mode_of(&meta(NodeKind::BlockDev, 1, 0), 0), 0o060_660);
-        assert_eq!(mode_of(&meta(NodeKind::Symlink, 1, 0), 0), 0o120_777);
+        assert_eq!(mode_of(&meta(NodeKind::File, 1, 0), None), 0o100_644);
+        assert_eq!(mode_of(&meta(NodeKind::Dir, 1, 0), None), 0o040_755);
+        assert_eq!(mode_of(&meta(NodeKind::CharDev, 1, 0), None), 0o020_666);
+        assert_eq!(mode_of(&meta(NodeKind::BlockDev, 1, 0), None), 0o060_660);
+        assert_eq!(mode_of(&meta(NodeKind::Symlink, 1, 0), None), 0o120_777);
 
         // Stored permission bits replace the defaults, setuid included. In
         // the stat(2) spelling a setuid regular file is `104755`: the type
         // nibble stays `10` and the stored low byte keeps its setuid bit.
-        assert_eq!(mode_of(&meta(NodeKind::File, 1, 0), 0o755), 0o100_755);
-        assert_eq!(mode_of(&meta(NodeKind::File, 1, 0), 0o4755), 0o104_755);
+        assert_eq!(mode_of(&meta(NodeKind::File, 1, 0), Some(0o755)), 0o100_755);
+        assert_eq!(
+            mode_of(&meta(NodeKind::File, 1, 0), Some(0o4755)),
+            0o104_755
+        );
         // The format field of a stored mode does not leak through: only the
         // permission nibble is kept.
-        assert_eq!(mode_of(&meta(NodeKind::Dir, 1, 0), 0o100_700), 0o040_700);
+        assert_eq!(
+            mode_of(&meta(NodeKind::Dir, 1, 0), Some(0o100_700)),
+            0o040_700
+        );
     }
 
     /// `stat(2)`: the x86_64 `struct stat` field offsets - st_dev at 0,
@@ -2859,7 +2928,7 @@ mod tests {
             &meta(NodeKind::File, 0x1234, 257),
             0x8,          // st_dev: a filesystem id
             Some((4, 3)), // st_rdev: /dev/ttyS-style 4:3? no - a char dev
-            0o640,
+            Some(0o640),
             // A hard-linked file: three names reach the inode, and the
             // filesystem kept three distinct clocks for it.
             3,
@@ -2910,7 +2979,7 @@ mod tests {
                 &meta(NodeKind::Dir, 9, 4096),
                 0,
                 None,
-                0,
+                None,
                 0,      // nlink untracked
                 (0, 0), // and no owner: root's, which is the default
                 StatTimes {
@@ -2988,7 +3057,7 @@ mod tests {
                 0x7ff,
                 &meta(NodeKind::File, 77, 1024),
                 dev,
-                0,
+                None,
                 Some((1, 9)),
                 // A tracked count and three distinct clocks, as ext2 reports.
                 5,
@@ -3036,7 +3105,7 @@ mod tests {
                 0xfff,
                 &meta(NodeKind::Dir, 1, 0),
                 dev,
-                0,
+                None,
                 None,
                 0, // untracked -> the directory's two names
                 (0, 0),
@@ -3098,30 +3167,44 @@ mod tests {
             kind: NodeKind::Socket,
             size: 0,
         };
-        assert_eq!(mode_of(&meta, 0) & 0o170_000, 0o140_000, "S_IFSOCK");
-        assert_eq!(mode_of(&meta, 0), 0o140_755, "srwxr-xr-x by default");
+        assert_eq!(mode_of(&meta, None) & 0o170_000, 0o140_000, "S_IFSOCK");
+        assert_eq!(mode_of(&meta, None), 0o140_755, "srwxr-xr-x by default");
         assert_eq!(
-            mode_of(&meta, 0o700),
+            mode_of(&meta, Some(0o700)),
             0o140_700,
             "a stored mode keeps the tag"
         );
+        // And a stored `0000` is *zero*, not "unset": the two are different
+        // answers, and only the caller's `keeps_modes` can tell them apart.
+        assert_eq!(mode_of(&meta, Some(0)), 0o140_000);
         assert_eq!(dt_type_of(NodeKind::Socket), 12, "DT_SOCK");
     }
 
-    /// `mknod(2)`: the `S_IFMT` field picks the kind; a mode with no type
-    /// is not a node anybody asked for.
+    /// `mknod(2)`: the `S_IFMT` field picks the kind, and Linux's answer for
+    /// each of the field's eight values is a measurement rather than a reading
+    /// (`.workbuddy/probe_mknod.c`) - a plain mode and `S_IFREG` make a regular
+    /// file, a socket node is made, a directory is `EPERM` and a link `EINVAL`
+    /// **before the name is looked at all**, and a FIFO is refused here with
+    /// `EOPNOTSUPP` until the channel node exists (`docs/uapi/` §5.2).
     #[test]
     fn mknod_mode_field_picks_the_node_kind() {
+        // The five types the call makes, plus a mode with no type at all.
         assert_eq!(mknod_kind(0o020_666), Ok(NodeKind::CharDev)); // S_IFCHR
         assert_eq!(mknod_kind(0o060_660), Ok(NodeKind::BlockDev)); // S_IFBLK
-        assert_eq!(mknod_kind(0o010_644), Ok(NodeKind::File)); // S_IFIFO
-        // S_IFREG, S_IFDIR, S_IFLNK and a plain permission word name nothing
-        // `mknod` makes: sockets have no filesystem presence here, and
-        // directories have their own call.
-        assert!(mknod_kind(0o100_644).is_err());
-        assert!(mknod_kind(0o040_755).is_err());
-        assert!(mknod_kind(0o120_777).is_err());
-        assert!(mknod_kind(0o644).is_err());
+        assert_eq!(mknod_kind(0o140_644), Ok(NodeKind::Socket)); // S_IFSOCK
+        assert_eq!(mknod_kind(0o100_644), Ok(NodeKind::File)); // S_IFREG
+        assert_eq!(mknod_kind(0o644), Ok(NodeKind::File));
+        assert_eq!(mknod_kind(0), Ok(NodeKind::File));
+        // The one kind this kernel has no node for.
+        assert_eq!(mknod_kind(0o010_644), Err(crate::err::EOPNOTSUPP)); // S_IFIFO
+        // And the two the *type* check refuses before the name is asked - the
+        // order `t-at-empty-name` pins from the other side, with the type that
+        // passes it.
+        assert_eq!(mknod_type_is_creatable(0o040_755), Err(crate::err::EPERM)); // S_IFDIR
+        assert_eq!(mknod_type_is_creatable(0o120_777), Err(crate::err::EINVAL)); // S_IFLNK
+        assert_eq!(mknod_type_is_creatable(0o010_644), Ok(())); // S_IFIFO passes
+        assert_eq!(mknod_type_is_creatable(0), Ok(()));
+        assert_eq!(mknod_type_is_creatable(0o140_644), Ok(()));
     }
 
     /// `wait(2)`: a normal exit puts its code in bits 15:8 (WEXITSTATUS),
