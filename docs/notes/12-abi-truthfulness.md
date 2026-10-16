@@ -503,11 +503,12 @@ numbering they write down, and the real thing is what the run above shows.
 
 - Anything already honestly refused. `fanotify`/`keyctl`/`userfaultfd`/namespaces and the
   `_ => ENOSYS` dispatch arm are correct answers, not gaps to close here.
-- `SO_LINGER`/buffer sizes (`record-only`) and `/proc/<pid>/smaps` (its sibling
+- `SO_SNDBUF`/`SO_RCVBUF` (`record-only`) and `/proc/<pid>/smaps` (its sibling
   `maps` is answered now) — already tracked in §3.3 / the ABI board; this phase
   does not duplicate them.
   (`SO_REUSEADDR` was on this list and is not any more: it is applied at
-  `bind`/`listen`, §3.3.3.)
+  `bind`/`listen`, §3.3.3. `SO_LINGER{on, 0}` was too, and is not any more: the
+  last `close` resets, §3.3.4.)
 - Real `MSG_PEEK` over TCP/UDP, real `rseq` state, real per-task CPU accounting: named here as
   sub-gaps, planned where the prerequisite (peek-preserving delivery, the clock, the
   scheduler's own timekeeping) is scheduled.

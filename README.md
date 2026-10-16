@@ -256,9 +256,10 @@ that seam (the switchboard itself is unchanged). `docs/notes/` Phase 11 (Step B)
 driver its own contract back.
 
 Deliberate divergences from Linux are collected per subsystem in `docs/notes/` — for example
-`listen(2)` on IPv4 is `EOPNOTSUPP` (the stack is outbound-only), `SO_LINGER{on,0}` is left
-orderly rather than faked, `unshare`/`setns` validate and then refuse, and `seccomp` speaks
-`STRICT` but not `FILTER`. They are recorded there rather than hidden here.
+the unsized pty window answers `25x80` where Linux answers `0x0`, `SO_SNDBUF`/`SO_RCVBUF` are
+recorded but do not resize the stack's buffers, real `MSG_PEEK` over TCP/UDP is refused
+`EOPNOTSUPP`, and the `xattr` family validates and then refuses. They are recorded there rather
+than hidden here.
 
 ---
 

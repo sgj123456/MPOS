@@ -274,11 +274,12 @@ pool behind it is not a connection and has no row), and `poll`/`select`/`epoll`
 report a listener readable exactly when the queue is non-empty - the same
 question `accept` parks on, so a waiter that is woken cannot find the queue empty.
 
-What closing a listener does with the connections still in its queue is a
-recorded divergence: they are closed, which gets a `FIN` out through the ordinary
-teardown discipline, where Linux sends `RST`. That is the same limitation
-`SO_LINGER{on,0}` has below - smoltcp's resets are emitted in reply to an
-arriving packet, so an unsolicited reset is not something this stack can send.
+Closing a listener **resets** the connections still in its queue, which is
+Linux's answer - the client's next read is `ECONNRESET` and its next write
+`EPIPE` (measured, `.workbuddy/probe-linger.c`) - and this used to be a recorded
+divergence because the note that once justified it was wrong (see 4.3.4): the
+connections are `abort()`ed, and smoltcp's poll turns that into the `RST`. A
+connection the listener *did* hand out is untouched, exactly as on Linux.
 
 `t-tcp-listen` pins the whole shape: a server bound to `127.0.0.1:0`, a client
 that connects over the loopback, the accept with both names read back, bytes both
@@ -286,7 +287,7 @@ ways, the client's *half*-close read as end-of-stream while the other direction
 still carries, a second sequential connection (which is what fails if the pool
 never refills), and every refusal in the table above.
 
-#### 4.3.3 The options — **PARTIAL** (two still record-only)
+#### 4.3.3 The options — **PARTIAL** (buffer sizes still record-only)
 
 `setsockopt`/`getsockopt` are no longer a no-op: each socket's registry `Entry`
 carries a `SockOpts`, and the common options round-trip with the correct ABI —
@@ -352,13 +353,12 @@ with an open connection, and both serve". The whole test also runs on a Linux
 host unchanged, which is the instrument: the same assertions that the guest must
 satisfy are the ones a real kernel satisfies.
 
-*Remaining (real effect, into smoltcp):* two. `SO_LINGER` is not honoured at
-`close` - see 4.3.4 for why the reset it asks for is not something this stack can
-send. `SO_RCVBUF`/`SO_SNDBUF` cannot be honoured per socket at all until
-smoltcp's buffers stop being sized once at set construction. Three that used to
-be on this list are not: `TCP_NODELAY` reaches the live socket
-(`set_nagle_enabled`), `SO_KEEPALIVE` arms smoltcp's probe timer at Linux's
-default interval, and `SO_REUSEADDR` is the rule above.
+*Remaining (real effect, into smoltcp):* one. `SO_RCVBUF`/`SO_SNDBUF` cannot be
+honoured per socket at all until smoltcp's buffers stop being sized once at set
+construction. Four that used to be on this list are not: `TCP_NODELAY` reaches
+the live socket (`set_nagle_enabled`), `SO_KEEPALIVE` arms smoltcp's probe timer
+at Linux's default interval, `SO_REUSEADDR` is the rule above, and
+`SO_LINGER{on, 0}` now makes the last `close` a reset (4.3.4).
 
 Two named gaps ride with the rule rather than the option. The predicate lives in
 `net/mod.rs`, which is gated `target_os = "none"` (`src/lib.rs:48`), so it has no
@@ -386,28 +386,63 @@ That producer went missing once, with the consumer, the bounded list and this
 paragraph all still in place - `TEARDOWN_MAX` sitting unread was the only clue,
 and a suite that passes says nothing, because `t-tcp-close` reports `skip:` and
 passes whenever no host listener is up. Re-measured with the listener running:
-both of its connections (the orderly close and the `SO_LINGER{on,0}` one) reach
-`GOT-FIN`. The lesson is that the probe is only an instrument when somebody
-holds it: run it with the listener up before believing this section.
+its connection (the orderly close) reaches `GOT-FIN`. The lesson is that the
+probe is only an instrument when somebody holds it: run it with the listener up
+before believing this section.
 
-`SO_LINGER{l_onoff=1, l_linger=0}` - "reset, discard unread" - is the one close
-shape this stack still cannot do, and it is left orderly on purpose rather than
-faked: smoltcp 0.13's `abort()` only moves the socket to `Closed` and transmits
-nothing (its resets are reply-driven, emitted when a packet *arrives* for a
-closed socket), so calling it would make the close *silent*, which is worse than
-the `FIN` the peer gets now. Honouring it needs an actual reset on egress - the
-same missing primitive that makes closing a listener `FIN` its unaccepted queue
-instead of resetting it (4.3.2).
+`SO_LINGER{l_onoff=1, l_linger=0}` - "reset, discard unread" - **is served now
+(2026-10-16).** It used to be left orderly on purpose, and the reason written
+down was that "smoltcp 0.13's `abort()` only moves the socket to `Closed` and
+transmits nothing". That is **false**, and it was measured false before anything
+was built: smoltcp's own `test_established_abort` asserts the `RST` that
+`abort()` dispatches, `dispatch` emits one for a socket in `Closed` with its
+endpoint still named (`repr.control = TcpControl::Rst`), and `poll_at` returns
+`PollAt::Now` for that state - so the poll the socket is reaped after always
+carries it. What the note was probably seeing is the shape that *does* go
+silent: `abort()` and then removing the socket before the poll, which is exactly
+what `Stack::teardown` exists to prevent. The last close of a socket carrying
+`{on, 0}` is now an `abort()`, and the peer's observation was measured on this
+host's kernel first (`.workbuddy/probe-linger.c`):
 
-*Remaining after those:* `SO_KEEPALIVE` probe packets; and a reset on egress for
-`SO_LINGER{on, 0}`. `SO_RCVBUF`/`SO_SNDBUF` cannot be honoured per
-socket as things stand: smoltcp sizes its buffers when the socket set is built,
-so a real answer needs either a set rebuilt per requested size or a limit applied
-in the mpos read/write queue - and until one of those exists the options should
-say so rather than round-trip a number that changes nothing. `SO_REUSEADDR` used
-to be on this line and is not any more: it is applied at `bind`/`listen` now
-(§3.3.3), and the rebind allowance it gates turned out to be a rule about the
-*holder's* option as much as the caller's.
+| the close | the peer's read | the peer's next write |
+|---|---|---|
+| `{0, 0}` (the default) | `0`, end-of-stream | succeeds |
+| `{1, 0}` | `ECONNRESET` | `EPIPE` |
+| `{1, 0}`, with bytes already sent | the bytes, then `ECONNRESET` | `EPIPE` |
+| `{1, 5}` | `0`, end-of-stream | succeeds |
+| a *listener* closed with an unaccepted connection | `ECONNRESET` | `EPIPE` |
+
+Two things fall out of that table and neither is the `RST` itself. **A reset is
+not the same read as a socket that never connected.** Linux answers `ENOTCONN`
+for a socket that never carried a connection (one that was never connected, and
+one whose `connect` was refused) and `ECONNRESET` for one that was reset, and
+this kernel used to answer `ENOTCONN` for both - because smoltcp spells both
+`RecvError::InvalidState`: an incoming `RST` moves the socket to `Closed` *and
+clears its tuple*, so it is indistinguishable from a fresh one. The fact that
+the connection existed is therefore remembered on the syscall side, in
+`Channel::Tcp`'s `connected`, set by a completed `connect`, by `accept`, and by
+any read or write that finds the socket open. **A linger with a non-zero timeout
+is not a reset** (`{1, 5}`): Linux waits for the send buffer to drain and then
+closes orderly, and only the zero timeout is the reset, so `free_entry` makes
+`abort()` conditional on `linger_sec == 0` alone. And the bytes of a `{1, 0}`
+connection that were *already transmitted* still reach the peer before the
+reset - smoltcp keeps the receive buffer readable while it holds data (`may_recv`
+is true then), which is Linux's answer too.
+
+`t-tcp-listen` pins all of it in-guest, over the loopback, where both ends are
+the same process: an ordinary close reads end-of-stream, `{on, 0}` reads
+`ECONNRESET` and then writes `EPIPE`, `{on, 5}` reads end-of-stream, and a
+listener closed with an unaccepted connection resets that client. The same
+program runs on a Linux host unchanged, which is the instrument.
+
+*Remaining after those:* `SO_KEEPALIVE` probe packets. `SO_RCVBUF`/`SO_SNDBUF`
+cannot be honoured per socket as things stand: smoltcp sizes its buffers when
+the socket set is built, so a real answer needs either a set rebuilt per
+requested size or a limit applied in the mpos read/write queue - and until one
+of those exists the options should say so rather than round-trip a number that
+changes nothing. `SO_REUSEADDR` used to be on this line and is not any more: it
+is applied at `bind`/`listen` now (§3.3.3), and the rebind allowance it gates
+turned out to be a rule about the *holder's* option as much as the caller's.
 
 ### 4.4 Netlink Write Operations — **DONE**
 

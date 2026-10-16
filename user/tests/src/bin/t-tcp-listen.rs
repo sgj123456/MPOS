@@ -24,7 +24,7 @@
 use rustix::fd::OwnedFd;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::Errno;
-use rustix::net::sockopt::{set_socket_reuseaddr, socket_reuseaddr};
+use rustix::net::sockopt::{set_socket_linger, set_socket_reuseaddr, socket_reuseaddr};
 use rustix::net::{
     AddressFamily, RecvFlags, SendFlags, Shutdown, SocketAddrAny, SocketAddrV4, SocketType, accept,
     acceptfrom, bind, connect, getpeername, getsockname, listen, recvfrom, send, shutdown, socket,
@@ -674,6 +674,118 @@ fn main() {
     drop(fresh2);
     drop(held_conn);
     drop(held_client);
+
+    // --- an unsolicited reset ------------------------------------------------
+    //
+    // `SO_LINGER{on, 0}` asks the last `close` to be a reset rather than an
+    // orderly `FIN`, and a listener's `close` resets the connections still
+    // sitting in its accept queue. This stack can send both, so the peer sees
+    // Linux's answer rather than the orderly substitute it used to get.
+    // Measured on this host's kernel first (`.workbuddy/probe-linger.c`): the
+    // peer of such a close reads `ECONNRESET` and its next write is `EPIPE`,
+    // where an ordinary close is `0` (end-of-stream) and the write succeeds;
+    // and a read on a socket that never carried a connection is `ENOTCONN`,
+    // which is the answer the reset must not be confused with.
+
+    // A fresh listener on the loopback and one client connected to it, with
+    // the *accepted* end handed back for the caller to close.
+    fn connected_pair() -> (OwnedFd, OwnedFd, OwnedFd) {
+        let server = stream();
+        bind(&server, &SocketAddrV4::new(LOOPBACK, 0)).expect("a server binds the loopback");
+        listen(&server, 4).expect("the server listens");
+        let addr = as_v4(getsockname(&server).expect("its name")).expect("a v4 name");
+        let client = stream();
+        connect(&client, &addr).expect("the client connects");
+        let conn = accept(&server).expect("the connection is accepted");
+        (server, client, conn)
+    }
+
+    let mut buf = [0u8; 32];
+
+    // The control: an ordinary close is an orderly `FIN`, which the peer reads
+    // as end-of-stream.
+    let (server, client, conn) = connected_pair();
+    drop(conn);
+    match recvfrom(&client, &mut buf, RecvFlags::empty()) {
+        Ok((0, _, _)) => r.check("an ordinary close reads as end-of-stream", true),
+        Ok((n, _, _)) => r.check(
+            &format!("an ordinary close reads as end-of-stream (got {n} bytes)"),
+            false,
+        ),
+        Err(e) => r.check(
+            &format!("an ordinary close reads as end-of-stream (got {e})"),
+            false,
+        ),
+    }
+    drop(client);
+    drop(server);
+
+    // `{on, 0}`: the same close, but a reset - the peer's read is `ECONNRESET`
+    // and its write is `EPIPE`. Both are on one connection, which is what a
+    // real peer does with it.
+    let (server, client, conn) = connected_pair();
+    let lingered = set_socket_linger(&conn, Some(Duration::ZERO)).is_ok();
+    r.check("SO_LINGER{on, 0} is accepted", lingered);
+    drop(conn);
+    match recvfrom(&client, &mut buf, RecvFlags::empty()) {
+        Err(e) => r.check(
+            "SO_LINGER{on, 0} makes the peer's read ECONNRESET",
+            e == Errno::CONNRESET,
+        ),
+        Ok((n, _, _)) => r.check(
+            &format!("SO_LINGER{{on, 0}} makes the peer's read ECONNRESET (got {n} bytes)"),
+            false,
+        ),
+    }
+    match send(&client, b"x", SendFlags::empty()) {
+        Err(e) => r.check("and its write EPIPE", e == Errno::PIPE),
+        Ok(n) => r.check(&format!("and its write EPIPE (wrote {n})"), false),
+    }
+    drop(client);
+    drop(server);
+
+    // A linger with a *timeout* is not a reset: it waits for the data and then
+    // goes orderly, exactly as `{0, 0}` does. The reset is the zero timeout
+    // alone.
+    let (server, client, conn) = connected_pair();
+    let _ = set_socket_linger(&conn, Some(Duration::from_secs(5)));
+    drop(conn);
+    match recvfrom(&client, &mut buf, RecvFlags::empty()) {
+        Ok((0, _, _)) => r.check("a linger with a timeout still closes orderly", true),
+        Ok((n, _, _)) => r.check(
+            &format!("a linger with a timeout still closes orderly (got {n} bytes)"),
+            false,
+        ),
+        Err(e) => r.check(
+            &format!("a linger with a timeout still closes orderly (got {e})"),
+            false,
+        ),
+    }
+    drop(client);
+    drop(server);
+
+    // Closing a *listener* resets the connection it never handed out. The
+    // listener is closed while the connection sits in its accept queue, which
+    // is the state a poll puts it in - the same poll `getsockname` runs.
+    let server = stream();
+    bind(&server, &SocketAddrV4::new(LOOPBACK, 0)).expect("a second server binds");
+    listen(&server, 4).expect("the second server listens");
+    let addr = as_v4(getsockname(&server).expect("its name")).expect("a v4 name");
+    let client = stream();
+    connect(&client, &addr).expect("the second client connects");
+    let _ = getsockname(&client);
+    drop(server);
+    match recvfrom(&client, &mut buf, RecvFlags::empty()) {
+        Err(e) => r.check(
+            "closing a listener resets the connection it never accepted",
+            e == Errno::CONNRESET,
+        ),
+        Ok((n, _, _)) => r.check(
+            &format!("closing a listener resets the connection it never accepted (got {n} bytes)"),
+            false,
+        ),
+    }
+    drop(client);
 
     if r.failed {
         println!("FAILED");

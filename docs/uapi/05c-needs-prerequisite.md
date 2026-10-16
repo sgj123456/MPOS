@@ -13,9 +13,10 @@ Section numbers are unchanged from the original `UAPI.md`.
   stop model does not have (`docs/notes/` §8.2).
 - **Real `MSG_PEEK` over TCP/UDP.** Refused `EOPNOTSUPP` today (honest); serving it needs
   peek-preserving delivery in the stack (`docs/notes/` §12.2 B2).
-- **`SO_LINGER{on, 0}` and per-socket buffer sizes.** Both are record-only; the first needs
-  an unsolicited reset on egress, the second needs buffers not sized once at set
-  construction (`docs/notes/` §4.3.3/§4.3.4).
+- **Per-socket buffer sizes.** `SO_SNDBUF`/`SO_RCVBUF` are record-only: the answer
+  needs buffers not sized once at set construction (`docs/notes/` §4.3.3/§4.3.4).
+  (`SO_LINGER{on, 0}`'s egress reset used to be here and is served now — it turned
+  out smoltcp *can* send an unsolicited reset.)
 - **A named `SOCK_SEQPACKET` `AF_UNIX` connection** carries no message boundaries — served
   as the byte stream this family has (`docs/notes/` §4.1).
 - **Console gaps:** `console=ttyN` pinning is refused rather than approximated, and

@@ -29,7 +29,7 @@ One-glance status of the whole roadmap.
 - [x] 4.1 AF_UNIX — both socket types, with per-message credentials and fd passing; the
   abstract namespace is served, `unshare`-free lifetime and all (`t-unix`, §4.1.1)
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
-- [~] 4.3 TCP — loopback, listener and `SO_REUSEADDR` done; two options record-only (§4.3)
+- [~] 4.3 TCP — loopback, listener, `SO_REUSEADDR` and `SO_LINGER{on,0}`'s reset done; buffer sizes record-only (§4.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
 - [x] 4.5 `AF_PACKET` — link layer as a socket, userland DHCP can ask; both types served —
   `SOCK_DGRAM` (payload shape) and `SOCK_RAW` (whole frames in, the caller's own header out) —
@@ -322,8 +322,8 @@ the remaining ABI gaps below.
 The full inventory — grouped by what they block, with each refusal's reason — is
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:
 `fanotify`/`keyctl`/`userfaultfd`/rseq side-objects stay `ENOSYS`; xattrs validate then `EOPNOTSUPP`;
-the semantics still incomplete are TCP's two record-only options, `SO_LINGER`'s egress reset,
-buffer sizes, MNT/PID/NET isolation, and the unsized-pty window divergence.
+the semantics still incomplete are TCP's record-only buffer sizes
+(`SO_SNDBUF`/`SO_RCVBUF`), MNT/PID/NET isolation, and the unsized-pty window divergence.
 
 One of those "buffer sizes" is named down to the line: a **blocking UDP send does not wait for the
 send buffer** (`EAGAIN` where Linux waits) — the gap, its tried shapes and their measurements are

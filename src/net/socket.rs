@@ -1450,6 +1450,7 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
             home,
             handle: sock_handle,
             local,
+            ..
         } = &mut entry.channel
         else {
             return Err(err::ENOTSOCK);
@@ -1503,8 +1504,9 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
             let Channel::Tcp {
                 home,
                 handle: sock_handle,
+                connected,
                 ..
-            } = &entry.channel
+            } = &mut entry.channel
             else {
                 return Err(err::ENOTSOCK);
             };
@@ -1512,7 +1514,13 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
                 .sockets_mut(*home)
                 .get_mut::<tcp::Socket>(*sock_handle);
             match sock.state() {
-                tcp::State::Established | tcp::State::SynReceived => Ok(true),
+                tcp::State::Established | tcp::State::SynReceived => {
+                    // The handshake completed: this socket is a connection
+                    // now, and the record outlives it - see `Channel::Tcp`'s
+                    // `connected`.
+                    *connected = true;
+                    Ok(true)
+                }
                 tcp::State::Closed => Err(err::ECONNREFUSED),
                 _ => Ok(false),
             }
@@ -1969,8 +1977,9 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
             let Channel::Tcp {
                 home,
                 handle: sock_handle,
+                connected,
                 ..
-            } = &entry.channel
+            } = &mut entry.channel
             else {
                 return Err(err::ENOTSOCK);
             };
@@ -1982,6 +1991,9 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
                 // Writing into it reports the break, as EPIPE.
                 return Err(err::EPIPE);
             }
+            // A socket that can send is a connection this kernel has seen; see
+            // `Channel::Tcp`'s `connected`.
+            *connected = true;
             match sock.send_slice(&data[sent..]) {
                 Ok(0) => Ok(SendStep::Wait),
                 Ok(n) => {
@@ -2842,20 +2854,40 @@ fn tcp_recv(
             let Channel::Tcp {
                 home,
                 handle: sock_handle,
+                connected,
                 ..
-            } = &entry.channel
+            } = &mut entry.channel
             else {
                 return RecvStep::Err(err::ENOTSOCK);
             };
             let sock = stack
                 .sockets_mut(*home)
                 .get_mut::<tcp::Socket>(*sock_handle);
+            // A socket that is up is a connection this kernel has now seen,
+            // and the record is what tells a later reset apart from a socket
+            // that never connected - see `Channel::Tcp`'s `connected`. It
+            // covers the socket that still holds bytes a reset left behind,
+            // too: `may_recv` is true while the buffer is non-empty.
+            if sock.may_recv() {
+                *connected = true;
+            }
             match sock.recv_slice(out) {
                 Ok(0) => RecvStep::Wait,
                 Ok(n) => RecvStep::Got(n, None),
                 Err(tcp::RecvError::Finished) => RecvStep::Got(0, None),
-                // Not connected, or reset: reads report the break.
-                Err(tcp::RecvError::InvalidState) => RecvStep::Err(err::ENOTCONN),
+                // A read that cannot proceed, and the two reasons are not the
+                // same answer: a connection that was **reset** reports
+                // `ECONNRESET`, while one that never carried a connection
+                // reports `ENOTCONN` (both measured on this host's kernel,
+                // `.workbuddy/probe-linger.c`). smoltcp spells both
+                // `InvalidState` - an `RST` clears the tuple, so the socket is
+                // indistinguishable from a fresh one - which is why the
+                // `connected` record has to decide it.
+                Err(tcp::RecvError::InvalidState) => RecvStep::Err(if *connected {
+                    err::ECONNRESET
+                } else {
+                    err::ENOTCONN
+                }),
             }
         });
         match step {
@@ -3405,6 +3437,7 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
                 home,
                 handle: sock_handle,
                 local,
+                ..
             } => {
                 if local.is_some() {
                     return Err(err::EINVAL);
@@ -3787,6 +3820,7 @@ fn install_accepted(
             home,
             handle: sock_handle,
             local: None,
+            connected: true,
         },
         SOCK_STREAM,
         super::SockOpts {
@@ -4195,6 +4229,7 @@ pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {
                 home,
                 handle: sock_handle,
                 local,
+                ..
             } => match local {
                 // The name `bind` settled - the one the caller is asking
                 // about, and the one `connect` will send from.
@@ -4395,13 +4430,15 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
 /// `setsockopt(fd, level, optname, optval, optlen)`.
 ///
 /// Every option is remembered so `getsockopt` reads back what the caller set.
-/// Three of them also reach the stack: `TCP_NODELAY` switches Nagle off on the
-/// live socket, `SO_KEEPALIVE` arms its probe timer, and `SO_REUSEADDR` is read
+/// Four of them also reach the stack: `TCP_NODELAY` switches Nagle off on the
+/// live socket, `SO_KEEPALIVE` arms its probe timer, `SO_REUSEADDR` is read
 /// by `bind`'s conflict rule - where it says something about a *name* the
 /// socket holds or is refused, not about the connection
-/// (`net::Stack::tcp_name_taken`). The rest - buffer sizes and linger - are
-/// recorded only: the timeouts they ask for live in user code (`poll`), and the
-/// reset `SO_LINGER{on,0}` wants is not a packet this stack can send (§4.3.4).
+/// (`net::Stack::tcp_name_taken`) - and `SO_LINGER{on, 0}` makes the last
+/// `close` an `abort()` rather than a `close()`, which is the `RST` Linux
+/// answers that shape with (`net::Stack::free_entry`). The rest - buffer sizes,
+/// and a linger with a non-zero timeout - are recorded only: the timeouts they
+/// ask for live in user code (`poll`).
 pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
     let (fd, level, optname, optval, optlen) = (args[0] as i32, args[1], args[2], args[3], args[4]);
     // A packet socket's `SOL_PACKET` knobs: group membership, on a machine

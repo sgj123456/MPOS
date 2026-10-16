@@ -146,6 +146,21 @@ pub(crate) enum Channel {
         /// source - a stream socket has nothing to bind before it connects,
         /// so the record is kept until then.
         local: Option<IpEndpoint>,
+        /// Whether this socket ever carried a connection, set the moment one
+        /// is established and never cleared.
+        ///
+        /// It exists for one question a read has to answer: a socket whose
+        /// connection was **reset** must report `ECONNRESET`, while one that
+        /// was never connected reports `ENOTCONN` (both measured on this
+        /// host's kernel, `.workbuddy/probe-linger.c`). smoltcp cannot tell
+        /// them apart at that point - an incoming `RST` moves the socket to
+        /// `Closed` *and clears its tuple*, so `remote_endpoint()` is `None`
+        /// exactly as it is on a socket that never connected, and
+        /// `rx_fin_received` is false for both. The fact that the connection
+        /// existed therefore has to be remembered here, on the syscall side,
+        /// where it is set: a completed `connect`, an `accept`, and any
+        /// operation that observes the socket open.
+        connected: bool,
     },
     Udp {
         home: Home,
@@ -639,9 +654,9 @@ impl Stack {
             // queue leaves the pool empty on purpose: with nothing in
             // `Listen`, the next `SYN` is dropped by smoltcp rather than
             // answered and immediately refused, which is how a full backlog
-            // behaves on Linux and needs no `abort` (which this stack cannot
-            // turn into a reset anyway - smoltcp emits resets in reply to an
-            // arriving packet, not as an egress of their own).
+            // behaves on Linux. An `abort` there would be the wrong answer -
+            // it would reset a client Linux leaves waiting, not one it
+            // refuses.
             let queued = self.listeners[id]
                 .as_ref()
                 .map(|l| l.accepted.len())
@@ -718,13 +733,15 @@ impl Stack {
     /// Tear a listener down: every socket it holds goes, and the slot is
     /// freed.
     ///
-    /// The connections still in the queue are closed rather than abandoned,
-    /// which gets their `FIN` out through the ordinary teardown discipline - a
-    /// definite end for a client that connected, where Linux answers `RST`.
-    /// That divergence is the documented one (§4.3): smoltcp's resets are
-    /// emitted in reply to an arriving packet, so an unsolicited reset is not
-    /// something this stack can send at all, and a `FIN` is the honest
-    /// substitute.
+    /// The connections still in the queue are **reset**, which is Linux's
+    /// answer to closing a listening socket with an unaccepted connection
+    /// sitting on it: the client's next read is `ECONNRESET` and its next
+    /// write `EPIPE` (measured, `.workbuddy/probe-linger.c`). smoltcp's
+    /// `abort()` is what sends that `RST` - it leaves the socket `Closed`
+    /// with its endpoint named, and the poll turns that into the reset (see
+    /// `free_entry`, which makes the same call for `SO_LINGER{on, 0}`). The
+    /// old `close()` here left a `FIN`, which a client reads as a clean
+    /// end-of-stream: a divergence this stack does not have to keep.
     fn close_listener(&mut self, id: usize, reuse: bool) {
         let Some(listener) = self.listeners.get_mut(id).and_then(|slot| slot.take()) else {
             return;
@@ -740,7 +757,7 @@ impl Stack {
         // `install_accepted` does the same) - so it is the flag each of these
         // still-undelivered connections holds its name with.
         for h in listener.accepted {
-            self.tcp_socket(home, h).close();
+            self.tcp_socket(home, h).abort();
             if self.teardown.len() >= TEARDOWN_MAX
                 && let Some((old_home, oldest, _)) = self.teardown.first().copied()
             {
@@ -916,6 +933,7 @@ impl Stack {
                 home,
                 handle,
                 local,
+                ..
             } => {
                 let Some(names) = (*local).or_else(|| self.tcp_name_at(*home, *handle)) else {
                     return false;
@@ -1218,6 +1236,7 @@ pub(crate) fn collect_net_sockets(tcp: bool) -> Vec<crate::vfs::procfs::NetRow> 
                         home,
                         handle,
                         local,
+                        ..
                     } => Shape::Tcp(*home, *handle, *local),
                     Channel::TcpListen { local, .. } => Shape::Listen(*local),
                     Channel::Udp { local, peer, .. } => Shape::Udp(*local, *peer),
@@ -1340,6 +1359,7 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
                 home: Home::Eth,
                 handle: stack.add_tcp(Home::Eth),
                 local: None,
+                connected: false,
             },
             (socket::AF_INET, socket::SOCK_DGRAM) => Channel::Udp {
                 home: Home::Eth,
@@ -1471,6 +1491,7 @@ pub(crate) fn tcp_listen(handle: usize, backlog: i32) -> Option<isize> {
                 home,
                 handle,
                 local,
+                ..
             } => (*home, *handle, *local),
             _ => return crate::err::EOPNOTSUPP,
         };
@@ -1576,7 +1597,23 @@ pub(crate) fn free_entry(handle: usize) {
             // closed port. The other kinds are connectionless: nothing is
             // outstanding, and their buffers come back now.
             if matches!(&entry.channel, Channel::Tcp { .. }) {
-                stack.sockets_mut(home).get_mut::<tcp::Socket>(h).close();
+                // `SO_LINGER{on, 0}` is the one close that is *not* orderly:
+                // Linux answers it with a **reset** - the peer's next read is
+                // `ECONNRESET` and its next write `EPIPE` - and this stack can
+                // send one after all. `abort()` moves the socket to `Closed`
+                // while its endpoint is still named, which is exactly the
+                // state smoltcp's poll turns into an `RST` (its own
+                // `test_established_abort` asserts that, and `reap_teardown`
+                // below is written for it). The note that once stood here -
+                // that `abort()` "transmits nothing" - was wrong, and the
+                // `FIN` it kept sending is the one shape this option exists to
+                // ask against.
+                let sock = stack.sockets_mut(home).get_mut::<tcp::Socket>(h);
+                if entry.opts.linger_on && entry.opts.linger_sec == 0 {
+                    sock.abort();
+                } else {
+                    sock.close();
+                }
                 // Bounded, and the oldest goes first: 32 unanswered teardowns is
                 // already more than any real peer owes a machine that closed on
                 // it, and the alternative is a set that fills up and refuses new

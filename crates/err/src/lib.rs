@@ -141,6 +141,12 @@ pub const ESHUTDOWN: isize = -108;
 pub const ETIMEDOUT: isize = -110;
 /// ECONNREFUSED: the peer reset the connection attempt.
 pub const ECONNREFUSED: isize = -111;
+/// ECONNRESET: an established connection was reset by the peer, or by this
+/// side's own `SO_LINGER{on, 0}` close. A read of such a socket reports this,
+/// where one that never carried a connection reports `ENOTCONN` - the two are
+/// different answers to different questions, and both measured on this host's
+/// kernel (`docs/notes/` §4.3).
+pub const ECONNRESET: isize = -104;
 /// EALREADY: a nonblocking connect is still in flight.
 pub const EALREADY: isize = -114;
 /// EINPROGRESS: a nonblocking connect has been started and is not done.

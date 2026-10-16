@@ -105,8 +105,8 @@ The rows this module owns are in `docs/uapi/`: the `socket`/`bind`/`connect`/
 `listen`/`accept`/`send*`/`recv*`/`getsock{name,opt}` family in §1, the `SIOC*`
 (`0x89xx`) interface-ioctl row that routes through `fs/ioctl.rs`, and the
 structure-layout rows for `struct sockaddr_ll`, `struct nlmsghdr`/`rtattr`/
-`ifa*msg` and `struct ifreq` in §4. The gaps — record-only `SO_LINGER`/buffer
-sizes, `AF_PACKET` `SOCK_RAW`, the named `SOCK_SEQPACKET` stream, `MSG_PEEK` — are
+`ifa*msg` and `struct ifreq` in §4. The gaps — record-only `SO_SNDBUF`/
+`SO_RCVBUF`, `AF_PACKET` `SOCK_RAW`, the named `SOCK_SEQPACKET` stream, `MSG_PEEK` — are
 listed in docs/uapi/ §5.2, with the module gate's consequence for host
 testing in §5.4. That file is the inventory; this page does not duplicate its
 rows.
