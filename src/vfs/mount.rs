@@ -1412,19 +1412,37 @@ impl MountTable {
                             })
                         };
                         if child.metadata().kind == NodeKind::Symlink {
-                            // A link that carries a *payload* must not be
-                            // spliced: its target is a report, not a path to
-                            // reopen. Two of them - `/proc/<pid>/fd/N` (and the
-                            // `/dev/std*` links into it), whose payload is a
-                            // descriptor, and `/proc/<pid>/ns/<kind>`, whose
-                            // payload is a namespace. The walk hands the link
-                            // itself back and the opener asks what it really
-                            // names: for a descriptor it clones it, position
-                            // and flags and all (splicing would open a fresh
-                            // description of whatever the descriptor once
-                            // named), and for a namespace `setns` joins the
-                            // object the link reports.
-                            if child.as_fd().is_some() || child.as_namespace().is_some() {
+                            // A link that carries a *payload* is followed to
+                            // what it denotes rather than spliced by its
+                            // target text, because its target is a report and
+                            // not a path to reopen. A descriptor's second name
+                            // - `/proc/<pid>/fd/N`, and the `/dev/std*` links
+                            // into it - denotes the file the descriptor holds,
+                            // and that is Linux's own resolution: measured on a
+                            // current host (`.workbuddy/probe_fdlink.c`),
+                            // `stat` of such a name reports the file where
+                            // `lstat` reports the link, `truncate`/`chmod`/
+                            // `utimensat`/`access` act on the file, a name
+                            // *inside* a path continues through it
+                            // (`/proc/self/fd/<dirfd>/<name>` names the child of
+                            // the directory the descriptor holds), and a
+                            // directory's second name is a directory to
+                            // `chdir`. The walk is where that belongs: every
+                            // one of those doors comes through here, and a door
+                            // that had to ask separately would be a second
+                            // answer to one question.
+                            //
+                            // A *namespace* link is the other payload, and it
+                            // is not an inode at all: `/proc/<pid>/ns/<kind>`
+                            // denotes an object `setns` joins, so the walk hands
+                            // the link itself back and the door asks
+                            // (`Inode::as_namespace`).
+                            if let Some(fd) = child.as_fd() {
+                                let denoted = crate::vfs::file::descriptor_inode(fd)?;
+                                stack.push(denoted);
+                                continue;
+                            }
+                            if child.as_namespace().is_some() {
                                 stack.push(child);
                                 continue;
                             }

@@ -463,11 +463,13 @@ the commit bodies), and each moved its pin in the same commit.
     **both** ends of its pipe, plus the path spelling's two refusals — and `t-truncate` is now a
     program with no per-machine branch and no named divergence of its own. The `ENODEV` those two
     tests had carried for *both* ends was the fallocate man page's word rather than either
-    machine's answer for a pipe. Two things stay named in §5.2, each with its measurement: a pipe
-    reached by its own `/proc/<pid>/fd` name (Linux resolves that magic link to the inode and
-    answers `EINVAL`; here the link's target is the descriptor's display string, which is not a
-    path), and the *other* inode that reports `NodeKind::File` without being a regular file — a
-    FIFO made by `mknod`, which is a pipe to Linux and a resizable file to this kernel.
+    machine's answer for a pipe. Two things this item left named in §5.2, and both have moved
+    since: the pipe reached by its own `/proc/<pid>/fd` name was the *same* question asked from the
+    other end — the door was acting on the link rather than on the file the name denotes — and
+    closing it (§5.1 item 24) is what settled it, the path spelling answering Linux's `EINVAL` for
+    that pipe because it now reaches the pipe's own inode; and the *other* inode that reports
+    `NodeKind::File` without being a regular file — a FIFO made by `mknod`, which is a pipe to
+    Linux and a resizable file to this kernel — is still named there.
 
 23. **`waitid`'s record carries the child's real uid.** `si_uid` was the one field of that record
     this kernel answered with a zero, and the reason was structural rather than an oversight: the
@@ -496,3 +498,68 @@ the commit bodies), and each moved its pin in the same commit.
     they can be and named where they cannot — `t-posix`'s shape. 56 claims in a sweep, 49 in a host
     run, and the privilege-dependent section moves the program's own real uid, which is why it is
     the last thing the program does.
+
+24. **A descriptor's *second name* denotes the file behind it, in the walk every following door
+    comes through.** `/proc/<pid>/fd/<N>` — and `/dev/stdin`, `/dev/stdout`, `/dev/stderr` and
+    `/dev/fd/N`, which are devfs's links into it — is a "magic link": its `readlink` answers a
+    *report* (the path the descriptor was opened by, or `pipe:[<ino>]` for a channel that has no
+    name), and every path operation on it is an operation on the file the descriptor holds.
+    Measured on a current host through `syscall(2)` (`.workbuddy/probe_fdlink.c`, Linux 7.2.9 —
+    through the raw call because glibc's `stat` reaches for `statx` and its `open` rewrites, either
+    of which would measure the libc): `stat` of the name reports the **file** (regular file, the
+    file's own size and inode, `st_dev` 52 — the file's filesystem) while `lstat` reports the
+    **link** (`S_IFLNK`, `st_dev` 24 — procfs — size 64, and a mode derived from the descriptor's
+    direction: `0700` for `O_RDWR`, `0300` for write-only, `0500` for read-only); `truncate(name,
+    4)` moves the size the descriptor reads back, a directory is `EISDIR`, a pipe's two ends and a
+    character device are `EINVAL`, and a file whose *path* no longer resolves still truncates,
+    because the name is not the path; `fchmodat`/`chownat`/`utimensat`/`access` act on the file
+    (the mode and the clock read back through the descriptor follow); a name **inside** a path —
+    `/proc/self/fd/<dirfd>/<name>`, the spelling glibc's `*at` fallbacks build — resolves to the
+    child of the directory the descriptor holds; `chdir` into a directory's name works; a
+    descriptor nothing is open on is `ENOENT`, not `EBADF`; and `open` of the name is a **fresh
+    description of the file**, not a `dup` of the descriptor: `open(name, O_RDWR)` reads from
+    offset 0 while the descriptor it names stands where it was, and `open(name, O_WRONLY)` on an
+    `O_RDWR|O_APPEND` descriptor reports `F_GETFL` `0x8001`, the word the *call* asked for.
+    **What this kernel did was two shapes, and only one of them was ever right.** `open_opt` cloned
+    the descriptor — position and status flags shared, the requested mode ignored — and *every
+    other* following door acted on the **link**, so `stat` returned a success carrying the link's
+    metadata (`S_IFLNK`, size 0, procfs's `st_dev`) where Linux returns the file's, `truncate` on a
+    regular file answered `EINVAL` (§5.2's entry for that read as `ENOENT` from the code and was
+    wrong about its own half), a directory's `EISDIR` came back `EINVAL`, a name inside a path was
+    `ENOTDIR`, and a foreign process's channel was `ENOENT`. The resolver handed the link back on
+    purpose and the comment said why — "opening one has to clone the descriptor rather than reopen
+    a path" — and the measurement is what refutes it. **The fix is one owner: the walk denotes, and
+    the doors inherit it.** `MountTable::resolve_walk` replaces a descriptor's payload link with
+    the inode the descriptor holds — the new `crate::vfs::file::descriptor_inode`, which answers
+    `NoEntry` for a descriptor that is gone, Linux's `ENOENT` — and *keeps walking*, so a payload
+    link mid-path is a directory the walk descends into and one at the end is the object every door
+    acts on. A **namespace** link is the other payload and stays as it was: it denotes an object
+    `setns` joins rather than an inode, so the walk still hands the link back and the door asks
+    (`Inode::as_namespace`). `open_opt` loses its clone branch — the walk has already denoted the
+    file, so it installs a fresh description, which is Linux's own answer — and the reading the
+    clone was built on survives it, because `> /dev/stdout` still lands wherever standard output
+    goes: the *file* is what the name denotes in both kernels, and what the clone changed was the
+    half a caller cannot see. `followed_link` (linkat's `AT_SYMLINK_FOLLOW`) collapses to the plain
+    resolution the walk now performs, `descriptor_file` moves into `vfs` as the one helper, and
+    `linkat`'s `via_descriptor` test — which still asks the *no-follow* resolution, whose inode is
+    the link — is unchanged. Owner: `src/vfs/mount.rs`'s `resolve_walk`, `src/vfs/file.rs`. Pin:
+    `t-fd-name` (37 claims, green on this host first, its `ok:` lines byte-identical on both
+    machines), which
+    claims the pair `stat`/`lstat` draws, `statx` both ways, the four refusals, the mutators with
+    their answers read back through the descriptor, the name inside a path, `chdir`, the fresh
+    description with its own flags and position, the deleted file, the closed descriptor and
+    `/dev/fd/N`. **Four things stay named in §5.2**, each measured, each its own owner: a *foreign*
+    process's descriptor (this kernel's link lends a descriptor only to the caller's own thread
+    group, so a foreign one falls back to splicing its report as a path — a named file is then
+    reached by the path it reports, and a channel answers `ENOENT` where Linux hands over the
+    pipe); `st_dev` (the file's through the name on Linux, the *name's* filesystem here — the
+    limitation §5.1 item 5 already owns, and the reason `t-fd-name` compares kind, size and inode
+    and merely prints both devices); `..` after the name (Linux jumps the walk onto the file, so
+    the parent is the *file's*; here it is the name's directory, because the walk's chain is what
+    answers `..` and a jumped-to node's parent is not a fact this kernel's inodes carry); and the
+    link's own metadata (`lstat`'s mode and size: Linux derives the mode from the descriptor's
+    direction and reports 64 bytes, this kernel's `ProcLink` inherits the trait's `0` and its own
+    `size: 0`). A fifth thing the same pin measured is an entry of its own in §5.2, because it
+    belongs to another model rather than to this name: `chdir` through a directory's name serves —
+    the walk's half, and it was `ENOTDIR` before — but the `getcwd` after it reads back the *string*
+    the caller used where Linux canonicalises, which any symlinked `chdir` has here.

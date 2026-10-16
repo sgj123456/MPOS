@@ -23,7 +23,7 @@ use crate::syscall::linux::abi::{
     write_stat,
 };
 use crate::syscall::{ARG_COUNT, MAX_IO, buffer_ok, cstr_arg, err, err_of};
-use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsError, VfsResult, W_OK, X_OK};
+use crate::vfs::{FileSystem, Inode, NodeKind, R_OK, VfsResult, W_OK, X_OK};
 // The concrete node types these handlers drive: the devices, and the socket
 // families whose syscalls live here. Naming one is the *syscall* layer's job -
 // it is the layer that knows which request belongs to which device - and it is
@@ -65,26 +65,15 @@ fn observed_owner(owner: (u32, u32)) -> (u32, u32) {
 
 /// The file a `linkat` source name leads to, with `AT_SYMLINK_FOLLOW`.
 ///
-/// The ordinary walk follows stored links and stops at a *descriptor's*
-/// second name - `/proc/<pid>/fd/N` and the `/dev/std*` links into it - on
-/// purpose: opening one has to clone the descriptor rather than reopen
-/// whatever path it reports, so the resolver hands the link itself back.
-/// Following it here therefore means the file the descriptor holds, and it is
-/// reached through the descriptor table rather than through the tree.
+/// That is now the same walk every other following door uses: the resolver
+/// denotes a *descriptor's* second name - `/proc/<pid>/fd/N` and the
+/// `/dev/std*` links into it - as the file the descriptor holds, so following
+/// the source is resolving it (see `crate::vfs::file::descriptor_inode`). The
+/// flag still *means* something here, because the no-follow resolution beside
+/// it stops at the link, and the two answers differ exactly as they do for any
+/// other link.
 fn followed_link(path: &str, base: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
-    let inode = crate::vfs::resolve_at(path, base)?;
-    match inode.as_fd() {
-        Some(fd) => descriptor_file(fd),
-        None => Ok(inode),
-    }
-}
-
-/// The file a descriptor holds: what a `/proc/<pid>/fd/N` entry stands for.
-fn descriptor_file(fd: usize) -> VfsResult<Arc<dyn Inode>> {
-    let fd = i32::try_from(fd).map_err(|_| VfsError::BadFd)?;
-    crate::sched::current_fds()
-        .clone_at(fd)
-        .map(|file| file.inode())
+    crate::vfs::resolve_at(path, base)
 }
 
 /// The inode a dirfd-led name resolves from: the descriptor's directory, or the
@@ -698,8 +687,16 @@ pub fn truncate(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // inode already gets right for its tree (`Dir` is `IsDir`, everything else
     // that is not a file is `Invalid`), and this door is the one that reaches
     // every other filesystem's nodes.
+    // A pipe reports `NodeKind::File` too - the vocabulary's only word for an
+    // unnamed channel - so it is asked beside the kind, exactly as `ftruncate`
+    // asks it (§5.1 item 22). The path spelling answers Linux's `EINVAL` for
+    // *both* of a pipe's ends, measured through `syscall(2)` on a current host
+    // (`.workbuddy/probe_fdlink.c`, where the name is a pipe's own
+    // `/proc/self/fd/<N>` as well as a `mknod`'d FIFO in `.workbuddy/probe_fsize.c`),
+    // and this door is the one that reaches it now that the walk denotes a
+    // descriptor's second name as the file behind it.
     match inode.metadata().kind {
-        NodeKind::File => {}
+        NodeKind::File if inode.as_pipe().is_none() => {}
         NodeKind::Dir => return err::EISDIR,
         _ => return err::EINVAL,
     }
@@ -4410,13 +4407,12 @@ pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // `AT_SYMLINK_FOLLOW` says the source is the *file* the name leads to
     // rather than the name. Without it a link to a link is what was asked
     // for, which is the same reading `AT_SYMLINK_NOFOLLOW` gives every other
-    // call. With it there are two ways through, and the second is the whole
-    // reason the flag exists here: a stored link is resolved again following
-    // it, and a descriptor's second name under `/proc` - which resolution
-    // hands back unspliced on purpose, because opening one has to clone the
-    // descriptor rather than reopen a path - is the file that descriptor
-    // holds. That is how a file with no name of its own gets one, which is
-    // what `apk` does with the repository index it wrote through `O_TMPFILE`.
+    // call. With it a stored link is resolved again following it, and a
+    // descriptor's second name under `/proc` resolves to the file that
+    // descriptor holds - the walk denotes it, exactly as it does for `stat`
+    // and the rest (see `crate::vfs::file::descriptor_inode`). That is how a
+    // file with no name of its own gets one, which is what `apk` does with the
+    // repository index it wrote through `O_TMPFILE`.
     let followed = if args[4] & abi::AT_SYMLINK_FOLLOW != 0 {
         match followed_link(&old_path, old_base) {
             Ok(inode) => Some(inode),

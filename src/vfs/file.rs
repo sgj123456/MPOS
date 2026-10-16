@@ -713,31 +713,6 @@ pub fn open(path: &str) -> VfsResult<RawFd> {
     current_table().install(Arc::new(File::new(inode)))
 }
 
-/// [`open`](fn.open.html) with a caller-supplied start for relative paths.
-/// `None` is the root, which is what every kernel caller means.
-pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<RawFd> {
-    let inode = match start {
-        Some(dir) => super::resolve_at(path, dir)?,
-        None => resolve(path)?,
-    };
-    // A name that is a descriptor's second name opens the descriptor, not a
-    // file: `/dev/stdout` is fd 1 with its position and its flags, and a
-    // fresh description of a link node would be neither - it would be an
-    // inode with no read and write, and the first write to it would fail.
-    if let Some(fd) = inode.as_fd() {
-        let file = current_table().clone_at(fd as RawFd)?;
-        return current_table().install(file);
-    }
-    // A name can also be a door rather than a thing: opening `/dev/ptmx`
-    // mints a new pty pair and hands back that pair's master, and opening a
-    // locked pty's slave refuses. The node itself says which it is.
-    let inode = match inode.open_replacement()? {
-        Some(replacement) => replacement,
-        None => inode,
-    };
-    current_table().install(Arc::new(File::new(inode)))
-}
-
 /// Call `tell` once for each description in `files` that the batch holds every
 /// reference to, naming it by its [`File::ofd`].
 ///
@@ -767,6 +742,65 @@ pub fn for_each_last(files: &[Arc<File>], mut tell: impl FnMut(&Arc<File>, u64))
 /// Open a fresh description on an inode already in hand - a pipe end, whose
 /// channel is anonymous and has no name to resolve.
 pub fn open_inode(inode: Arc<dyn Inode>) -> VfsResult<RawFd> {
+    current_table().install(Arc::new(File::new(inode)))
+}
+
+/// The inode a *descriptor's second name* denotes: what `/proc/<pid>/fd/N` and
+/// the `/dev/stdin`, `/dev/stdout` and `/dev/stderr` links into it are a name
+/// for.
+///
+/// Opening such a name is opening the file the descriptor holds - and the walk
+/// that reaches one needs the same answer, because every *other* door that
+/// follows a name acts on what the name denotes: `stat` reports the file where
+/// `lstat` reports the link, `truncate`/`chmod`/`utimensat` change the file, and
+/// a name *inside* a path (`/proc/self/fd/<dirfd>/<name>`) is a directory the
+/// walk continues through. Measured on a current host through `syscall(2)`
+/// (`.workbuddy/probe_fdlink.c`); the one door that answers differently is
+/// `open` itself, and it differs in *which* thing it makes rather than in what
+/// it acts on - see [`open_opt`].
+///
+/// A descriptor nothing is open on is `NoEntry`, which is Linux's `ENOENT` for
+/// `/proc/self/fd/1000` rather than the `EBADF` the number alone would earn.
+pub fn descriptor_inode(fd: usize) -> VfsResult<Arc<dyn Inode>> {
+    let fd = RawFd::try_from(fd).map_err(|_| VfsError::NoEntry)?;
+    current_table()
+        .clone_at(fd)
+        .map(|file| file.inode())
+        .map_err(|_| VfsError::NoEntry)
+}
+
+/// [`open`](fn.open.html) with a caller-supplied start for relative paths.
+/// `None` is the root, which is what every kernel caller means.
+pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<RawFd> {
+    let inode = match start {
+        Some(dir) => super::resolve_at(path, dir)?,
+        None => resolve(path)?,
+    };
+    // A name that is a descriptor's second name is *already* the descriptor's
+    // file by the time it gets here: the walk denotes it (see
+    // [`descriptor_inode`]), so this installs a fresh description of the same
+    // file. That is Linux's own answer, and it is measured rather than
+    // assumed - on a current host, `open("/proc/self/fd/<N>", O_RDWR)` reads
+    // from offset 0 while the descriptor it names still stands where it was,
+    // and its `F_GETFL` is the word the *call* asked for rather than the
+    // descriptor's (`O_WRONLY` on a name whose descriptor is
+    // `O_RDWR|O_APPEND` answers `0x8001`). So it is a second open of the file
+    // and not a `dup`: no position and no status flags are shared
+    // (`.workbuddy/probe_fdlink.c`).
+    //
+    // This used to clone the descriptor instead - position, flags and all -
+    // on the reading that `> /dev/stdout` "is fd 1". A shell's `> /dev/stdout`
+    // lands wherever standard output goes either way, because the *file* is
+    // what the name denotes in both kernels; what the clone changed was the
+    // half a caller cannot see, and it changed it away from Linux's.
+    //
+    // A name can also be a door rather than a thing: opening `/dev/ptmx`
+    // mints a new pty pair and hands back that pair's master, and opening a
+    // locked pty's slave refuses. The node itself says which it is.
+    let inode = match inode.open_replacement()? {
+        Some(replacement) => replacement,
+        None => inode,
+    };
     current_table().install(Arc::new(File::new(inode)))
 }
 

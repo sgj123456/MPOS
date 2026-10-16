@@ -21,21 +21,69 @@ Section numbers are unchanged from the original `UAPI.md`.
   the wrong shape for both. **Our half is read from the code rather than measured** (no test
   makes a FIFO yet), which is what makes this an entry rather than a pin.
 
-- **A pipe cannot be named by its own descriptor's procfs link here.** `truncate(2)` is
-  `ftruncate(2)` by name, and a pipe has no name of its own - so on Linux the way to spell it is
-  the descriptor's own entry: measured through `syscall(2)` on a current host
-  (`.workbuddy/probe_fsize.c`), `truncate("/proc/self/fd/<a pipe's write end>", 4)` follows that
-  magic link to the *inode* and answers `EINVAL`, exactly as the path spelling answers for
-  `/dev/null` and as `ftruncate` does for the descriptor. Here the name does not resolve at all:
-  `/proc/<pid>/fd`'s entries are symlinks whose target is the descriptor's display name
-  (`pipe:[ino]`), which is not a path - so the same call answers `ENOENT` before any inode is
-  reached. **Our half is read from the code rather than measured** (`src/vfs/procfs.rs`'s
-  `Descriptors` builds `NodeKind::Symlink` entries and `fd_target` answers the display string for
-  an anonymous descriptor), which is what makes this a named entry rather than a pin: closing it
-  means resolving a magic link to the *description* for the descriptors that have no name -
-  `open_opt`'s `as_fd` path is where `/dev/stdout` already does that - and the question is
-  therefore about `src/vfs/procfs.rs` rather than about the size-changing calls. Owner:
-  `src/vfs/procfs.rs`'s `Descriptors`/`fd_link` + `src/vfs/mod.rs`'s resolver.
+- **A descriptor's second name now denotes the file behind it — and what that leaves.** **Landed
+  2026-10-16** (`docs/uapi/` §5.1 item 24). The entry this replaces said a pipe "cannot be named by
+  its own descriptor's procfs link here", and read the answer as `ENOENT` from the code; the
+  measurement (`.workbuddy/probe_fdlink.c`, Linux 7.2.9, through `syscall(2)`) says the call
+  answered **`EINVAL`**, and that the door was acting on the link rather than on the file the name
+  denotes. It was never only about a pipe: *every* following door acted on the link, so `stat` of
+  `/proc/self/fd/N` returned a success carrying the *link's* metadata where Linux returns the
+  file's, a name inside a path was `ENOTDIR`, and `open` cloned the descriptor where Linux opens
+  the file fresh. The walk denotes now, so the whole family is Linux's — and four things stay
+  named, each measured by the same probe or by the pin's own first run:
+
+  (a) **A *foreign* process's descriptor is not nameable here, and its channel is spliced as
+  though it were a path.** Linux names one: measured, a child's `pipe:[…]` entry under
+  `/proc/<child>/fd/N` answers `stat` as the pipe (`S_IFIFO`, the pipe's own inode) and `truncate`
+  refuses `EINVAL` like any other pipe. This kernel's link lends a descriptor only to the caller's
+  own thread group (`ProcLink::as_fd`'s gate), and a link that carries no payload is *spliced by
+  its target text* — which is right for the named file such an entry reports (it is reached by the
+  path it names) and wrong for a channel, whose report is `pipe:[<ino>]` and not a path at all, so
+  the same call is `ENOENT`. Owner: `src/vfs/procfs.rs`'s `ProcLink::as_fd` gate + the walk's
+  splice fallback; closing it means deciding what a descriptor *denotes* for a caller that may not
+  clone it, which is a permission question this kernel answers by thread group where Linux answers
+  it by ptrace access (`proc(5)`; not measured here — every descriptor the probe reached was the
+  caller's own child, and the probe ran as root).
+
+  (b) **`st_dev` through a name that denotes another filesystem is the *name's*.** Measured on the
+  host, `stat("/proc/self/fd/<file>")` reports the file's device (`st_dev` 52, the file's own
+  filesystem) beside the file's inode; here the path is what the device is looked up by, so the
+  answer is the name's filesystem's (`t-fd-name`'s guest run printed `2 by path, 3 by the name`,
+  whose `3` is the procfs `st_dev`). This is the limitation §5.1 item 5 already owns — an inode
+  does not say which filesystem it belongs to, which is why `File` records the device at `open` —
+  and the shape is older than this name: the stat doors look the device up by the caller's *path*
+  string, so any followed symlink that crosses a mount reports its own directory's filesystem (read
+  from the code rather than measured here — it wants a second mount to measure against). Owner: the
+  stat doors' `dev_of_path`.
+
+  (c) **`..` after a descriptor's second name steps back along the walk's chain, not from the
+  file.** Linux jumps the walk onto the file, so `/proc/self/fd/<a directory>/..` is that file's
+  own parent — measured, the same inode as `/tmp/..`. Here the walk's *stack* answers `..`, and the
+  stack's last directory is `/proc/self/fd`, so the parent is the name's. Reaching Linux's would
+  mean asking where the denoted node lives (`MountTable::parent_of`'s bounded search) on every
+  `..` the walk meets, which is the cost the walk's chain exists to avoid. Owner:
+  `src/vfs/mount.rs`'s `resolve_walk`.
+
+  (d) **The link's own metadata is not Linux's.** `lstat` of the name (and `readlink`) is the door
+  that *should* stop at the link, and it does — but `ProcLink` reports the trait's `mode()` of `0`
+  and its own `size: 0`, where Linux derives the mode from the descriptor's *direction* — measured
+  `0700` for `O_RDWR`, `0300` for write-only, `0500` for read-only, and a directory's descriptor
+  `0500` — beside `st_size` 64. A listing tool that colours or filters by the link's mode reads a
+  different one. Owner: `src/vfs/procfs.rs`'s `ProcLink::metadata`/`mode`.
+
+- **`getcwd` reports the path the process `chdir`'d by, where Linux canonicalises it.** Measured by
+  `t-fd-name`'s own guest run, changing into a directory through its descriptor's name: `chdir`
+  serves (`0`, the walk's half — it was `ENOTDIR` before §5.1 item 24) and the cwd then reads back
+  as the name the caller used, where the same call on the host answers the canonical `/tmp`,
+  because Linux's `getcwd` walks the dentry chain. This kernel's cwd is the path *string* `chdir`
+  stored (lexically normalised: `.`/`..` folded, no link followed) — so *any* symlinked `chdir`
+  has it, and a bind alias or a second name for one directory is one string here and one canonical
+  path there. Closing it means deriving the name from the directory instead of from the argument
+  (`MountTable::path_of`'s bounded search, the way `fchdir` already falls back to it), with the
+  two consequences that follow from that search: it can answer a *different* name for a directory
+  that has several, and it can answer `None` for a node the tree cannot name. Owner:
+  `src/syscall/linux/fs/file.rs`'s `chdir`/`adopt_cwd`. `t-fd-name` prints the path and claims only
+  that `chdir` served and that it landed in a directory.
 
 - **The reported `F_GETFL` word holds the mode and the two flags, where Linux's holds more.**
   **Landed 2026-10-16** (`docs/uapi/` §5.1 item 21) for the half a caller reads to learn a
@@ -58,7 +106,6 @@ Section numbers are unchanged from the original `UAPI.md`.
   are on Linux. Owner: `src/vfs/file.rs`'s `SETFL_MASK` and the `F_GETFL` arm, whose
   answer for `O_LARGEFILE` is a cross-machine decision (`t-open-flags` pins that this kernel
   ignores the flag on both machines today). `docs/notes/` §15.16.
-- **The reported `F_GETFL` word holds the mode and the two flags, where Linux's holds more.**
 - **`__WCLONE` is accepted and ignored, where Linux narrows with it.** Measured
   on a current host: `waitid(P_ALL, 0, &si, WEXITED|__WCLONE)` answers `ECHILD`
   (errno 10) for a child that exits with `SIGCHLD`, because the bit means
