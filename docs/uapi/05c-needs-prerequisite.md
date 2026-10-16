@@ -5,6 +5,14 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.3 Needs its prerequisite named before it can be honest
 
+- **`waitid`'s `P_PIDFD` (idtype 3).** Refused `EINVAL` today because no pidfd
+  exists here to resolve: a descriptor can name no task at all, so the honest
+  answer is "this idtype is not served". Linux resolves the descriptor through
+  its pidfd family and answers `EBADF` for one that is not a pidfd (measured,
+  fd 9999, errno 9). Prerequisite: `pidfd_open`/`clone3`'s `CLONE_PIDFD`/
+  `pidfd_send_signal` — with those, the door resolves `P_PIDFD` the way it
+  resolves `P_PID` today, and `t-waitid`'s claim moves to the host's answer.
+  Owner: nowhere yet. `docs/notes/` §15.11 (batch 18).
 - **Real-time signals `33..=64`.** `SIGRTMIN` (32) is queueable, maskable and waitable; the
   rest have no queueable number and no disposition storage. Prerequisite: a 64-bit
   disposition table and a queued-signal list per task (`docs/notes/` §2.3).

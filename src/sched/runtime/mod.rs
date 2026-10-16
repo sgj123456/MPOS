@@ -37,8 +37,8 @@ pub use child_exit::{
     clone, current_tgid, discard_exit_code, exec_replace, exit, exit_code, exit_group, fork,
     has_matching_children, poll_any_child_event, poll_child_event, read_sigchld, read_user,
     read_user_of, set_clear_tid, space_root_of, take_child_event, take_exit_code,
-    take_exit_code_current, tls_of, vfork, wait_any_child, wait_any_child_event, wait_child_event,
-    write_user, write_user_of,
+    take_exit_code_current, tls_of, vfork, wait_any_child_event, wait_child_event, write_user,
+    write_user_of,
 };
 pub use child_mm::*;
 pub use child_signal::*;

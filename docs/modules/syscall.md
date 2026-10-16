@@ -53,7 +53,7 @@ small relaxed-store ring that the panic handler dumps.
 | `linux/fs/mod.rs` | The seam between the two file halves (NOTES §11.2 Step E): `sync_nonblocking` and the re-exports, so dispatch still names `fs::<handler>` |
 | `linux/fs/file.rs` | The path-carrying calls in Linux argument shapes (the `*at` family, `read`/`write`/`readv`/`writev`, `fcntl`, `poll`, `epoll`, `futex`, the xattr entry points, dup/pipe/statfs) |
 | `linux/fs/ioctl.rs` | The device-`ioctl` entry point: `handle_ioctl` decoding the request word by its `_IOC_TYPE` magic and routing to the console/DRM/evdev/uinput/fb/rtc/netlink/interface families |
-| `linux/proc.rs` | The handlers that need a running machine: memory (`mmap`/`munmap`/`mremap`/`mprotect`/`brk`), time (`nanosleep`, `clock_gettime`, `setitimer`), identity, `execve`, `clone`/`wait4`, `futex`, and signal delivery (`deliver_signal`) |
+| `linux/proc.rs` | The handlers that need a running machine: memory (`mmap`/`munmap`/`mremap`/`mprotect`/`brk`), time (`nanosleep`, `clock_gettime`, `setitimer`), identity, `execve`, `clone`/`wait4`/`waitid` (both waits translate their subject into `sched::WaitFor` and their record through `abi`), `futex`, and signal delivery (`deliver_signal`) |
 | `linux/posix.rs` | The POSIX completion set as table answers and validations: identity and capability changes, scheduling policy, memory advice, the wall-clock setters, `pause`/`rt_sigsuspend` |
 
 ## Contracts

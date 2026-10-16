@@ -426,9 +426,9 @@ pub fn exit(code: isize) -> ! {
 /// slot has already been freed and handed to someone else.
 ///
 /// This is the kernel's look; it takes nothing, so a milestone can read the
-/// same code twice. A process collecting its child's status uses
-/// [`wait_any_child`], which consumes the record, and [`take_exit_code`] for
-/// the pid it named.
+/// same code twice. A process collecting its child's status goes through
+/// `wait_child_event` (which consumes the record) or [`take_exit_code`] for the
+/// pid it named.
 pub fn exit_code(id: TaskId) -> Option<isize> {
     critical_section::with(|cs| {
         RETIRED
@@ -543,35 +543,14 @@ pub fn read_sigchld() -> Option<usize> {
     })
 }
 
-pub fn wait_any_child(parent: TaskId) -> WaitPark<(TaskId, isize)> {
-    // The condition is the table itself, so it is asked through the borrow
-    // `block_until_on_interruptible` already holds rather than taking one of its own.
-    if matches!(
-        block_until_on_interruptible(|t| any_child_code(t, parent).is_some()),
-        WaitEnd::Interrupted
-    ) {
-        return WaitPark::Interrupted;
-    }
-    // Taken under the same borrow, not looked up again: a second lookup by pid
-    // would race the slot being handed to a new task, and the record would go
-    // to it instead.
-    match with_table(|t| {
-        any_child_code(t, parent)
-            .and_then(|(id, _)| take_exit_code_for(t, id, parent).map(|code| (id, code)))
-    }) {
-        Some(found) => WaitPark::Event(found),
-        None => WaitPark::NoChild,
-    }
-}
-
 /// The pid and code of the oldest of `parent`'s children to have exited and
 /// not yet been collected, written as a `NO_CODE` marker when the caller only
 /// wants to know that a child died.
 ///
-/// Nothing is consumed here: `wait_any_child` holds the table while it looks,
-/// and the record is taken afterwards, by pid, in [`take_exit_code`]. A
-/// read-only look keeps this function usable from the `block_until` closure,
-/// which must not wake anyone.
+/// Nothing is consumed here: the event scan holds the table while it looks, and
+/// the record is taken afterwards, by pid, in [`take_exit_code`]. A read-only
+/// look keeps this function usable from the `block_until` closure, which must
+/// not wake anyone.
 pub(crate) fn any_child_code(t: &Table, parent: TaskId) -> Option<(TaskId, isize)> {
     critical_section::with(|cs| {
         RETIRED
@@ -1855,14 +1834,24 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
         WaitEvent::Exited { id, .. } => {
             take_exit_code_for(t, id, t.current).map(|code| WaitEvent::Exited { id, code })
         }
-        WaitEvent::Stopped { id, signal, event } => {
+        WaitEvent::Stopped {
+            id,
+            signal,
+            event,
+            traced,
+        } => {
             let task = t.tasks.get_mut(id.0).and_then(Option::as_mut)?;
             let stop = task.trace.stop.as_mut()?;
             if stop.reported {
                 return None;
             }
             stop.reported = true;
-            Some(WaitEvent::Stopped { id, signal, event })
+            Some(WaitEvent::Stopped {
+                id,
+                signal,
+                event,
+                traced,
+            })
         }
         WaitEvent::Continued { id } => {
             let task = t.tasks.get_mut(id.0).and_then(Option::as_mut)?;
@@ -1876,13 +1865,15 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
 }
 
 /// Block until a child of `parent` that `sel` names has something to report,
-/// and collect it. The exit-only shape is `wait_any_child`, which this
-/// generalises.
+/// and collect it. The one door every child-waiting call goes through: `wait4`
+/// passes `WaitFor::Any` (or resolves its own pid first), `waitid` passes the
+/// selector its `idtype` named.
 pub fn wait_child_event(
     parent: TaskId,
     sel: WaitFor,
     stops: bool,
     continues: bool,
+    nowait: bool,
 ) -> WaitPark<WaitEvent> {
     if matches!(
         block_until_on_interruptible(
@@ -1894,7 +1885,11 @@ pub fn wait_child_event(
     }
     match with_table(|t| {
         let event = scan_child_event(t, parent, sel, stops, continues)?;
-        take_event(t, event)
+        if nowait {
+            Some(event)
+        } else {
+            take_event(t, event)
+        }
     }) {
         Some(event) => WaitPark::Event(event),
         None => WaitPark::NoChild,
@@ -1902,26 +1897,37 @@ pub fn wait_child_event(
 }
 
 /// The non-blocking half: is there anything to collect right now?
+///
+/// `nowait` is Linux's `WNOWAIT` (`waitid`'s bit): report what is there and
+/// leave it there, so the next wait reports it again. Nothing *in the scan*
+/// depends on it - a look is a look - so it is passed to the same take step and
+/// answers the same event either way; what the flag decides is whether the
+/// event survives the report.
 pub fn poll_child_event(
     parent: TaskId,
     sel: WaitFor,
     stops: bool,
     continues: bool,
+    nowait: bool,
 ) -> Option<WaitEvent> {
     with_table(|t| {
         let event = scan_child_event(t, parent, sel, stops, continues)?;
-        take_event(t, event)
+        if nowait {
+            Some(event)
+        } else {
+            take_event(t, event)
+        }
     })
 }
 
 /// Block until *any* child of `parent` has something to report, and collect it.
 pub fn wait_any_child_event(parent: TaskId, stops: bool, continues: bool) -> WaitPark<WaitEvent> {
-    wait_child_event(parent, WaitFor::Any, stops, continues)
+    wait_child_event(parent, WaitFor::Any, stops, continues, false)
 }
 
 /// The wildcard half of [`poll_child_event`].
 pub fn poll_any_child_event(parent: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
-    poll_child_event(parent, WaitFor::Any, stops, continues)
+    poll_child_event(parent, WaitFor::Any, stops, continues, false)
 }
 
 /// Whether `parent` has a child `sel` names at all - one still running, or one
@@ -1984,6 +1990,7 @@ fn child_event_in(
             id,
             signal: stop.signal,
             event: stop.event,
+            traced: stop.traced,
         });
     }
     if task.trace.continued && continues {

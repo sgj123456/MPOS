@@ -1206,21 +1206,50 @@ const SIGCHLD: i32 = 17;
 const CLD_EXITED: i32 = 1;
 const CLD_KILLED: i32 = 2;
 
-/// Write the `siginfo_t` describing a collected child: `SIGCHLD` as the
-/// signo, `CLD_EXITED` or `CLD_KILLED` as the code, and the pid and status
-/// in the fields `si_pid` and `si_status` occupy.
-pub(crate) fn write_waitid_info(infop: usize, pid: u32, code: isize) -> isize {
-    let (si_code, status) = if code < 0 {
-        (CLD_KILLED, -code)
+// The rest of the `CLD_*` vocabulary `si_code` carries, read out of Linux's
+// `include/uapi/asm-generic/siginfo.h`: a task that stopped under its tracer, a
+// task a `SIGSTOP`-shaped signal stopped for its parent, and a task a `SIGCONT`
+// resumed. `CLD_DUMPED` (3) is the one this kernel cannot answer - it says
+// "died and dumped core", and no core is written here - so an exit a signal
+// ended reports `CLD_KILLED` whichever it was.
+pub(crate) const CLD_TRAPPED: i32 = 4;
+pub(crate) const CLD_STOPPED: i32 = 5;
+pub(crate) const CLD_CONTINUED: i32 = 6;
+
+/// The `(si_code, si_status)` pair an exit code becomes: `CLD_EXITED` with the
+/// code itself for a normal exit, `CLD_KILLED` with the signal number for a
+/// death by signal - Linux's two answers for the two shapes a corpse has.
+///
+/// Split out from the writer because it is the half a host test can decide:
+/// what a caller reads out of the record is these two numbers.
+pub(crate) fn exit_chld(code: isize) -> (i32, i32) {
+    if code < 0 {
+        (CLD_KILLED, -code as i32)
     } else {
-        (CLD_EXITED, code)
-    };
+        (CLD_EXITED, code as i32)
+    }
+}
+
+/// Write the `siginfo_t` describing a collected child: `SIGCHLD` as the signo,
+/// the caller's `CLD_*` code and status in theirs, and the pid where `si_pid`
+/// lives.
+///
+/// The three event classes share one record and differ only in those two words
+/// (measured on a current host: a stop is `CLD_STOPPED` or `CLD_TRAPPED` with
+/// the stopping signal, a resume is `CLD_CONTINUED` with `SIGCONT`), so the
+/// code is the caller's to choose and this writes it verbatim.
+///
+/// `si_uid` is left zero, which is a *named* divergence rather than one by
+/// omission: Linux fills the child's real uid, and this kernel's record cannot
+/// - the task is gone by the time a retired record is read, and the record does
+/// not carry the uid (`docs/uapi/` §5.2 has the measurement).
+pub(crate) fn write_waitid_info(infop: usize, pid: u32, si_code: i32, status: i32) -> isize {
     unsafe {
         core::ptr::write_bytes(infop as *mut u8, 0, SIGINFO_BYTES);
         (infop as *mut i32).write_unaligned(SIGCHLD); // si_signo
         ((infop + 8) as *mut i32).write_unaligned(si_code); // si_code
         ((infop + 16) as *mut i32).write_unaligned(pid as i32); // si_pid
-        ((infop + 24) as *mut i32).write_unaligned(status as i32); // si_status
+        ((infop + 24) as *mut i32).write_unaligned(status); // si_status
     }
     0
 }
@@ -3113,7 +3142,11 @@ mod tests {
     #[test]
     fn waitid_info_reports_the_child_the_siginfo_way() {
         let mut buf = [0u8; 128];
-        assert_eq!(write_waitid_info(buf.as_mut_ptr() as usize, 42, 7), 0);
+        let (code, status) = exit_chld(7);
+        assert_eq!(
+            write_waitid_info(buf.as_mut_ptr() as usize, 42, code, status),
+            0
+        );
         let word = |at: usize| i32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
         assert_eq!(word(0), 17); // si_signo: SIGCHLD
         assert_eq!(word(8), 1); // si_code: CLD_EXITED
@@ -3122,12 +3155,47 @@ mod tests {
 
         // Killed: the status is the signal number, the code says so.
         let mut buf2 = [0u8; 128];
-        assert_eq!(write_waitid_info(buf2.as_mut_ptr() as usize, 5, -15), 0);
+        let (code, status) = exit_chld(-15);
+        assert_eq!(
+            write_waitid_info(buf2.as_mut_ptr() as usize, 5, code, status),
+            0
+        );
         let word2 = |at: usize| i32::from_le_bytes(buf2[at..at + 4].try_into().unwrap());
         assert_eq!(word2(8), 2); // CLD_KILLED
         assert_eq!(word2(24), 15);
         // Everything else is zeroed, so no stale caller byte survives.
         assert!(buf2[28..].iter().all(|&b| b == 0));
+    }
+
+    /// The two event classes that are not a death, and the word each writes.
+    ///
+    /// These are the codes measured out of a current host's kernel (`waitid`
+    /// on a stopped child, on a traced child's stop, and after a `SIGCONT`),
+    /// so the pair below is the ABI rather than this kernel's preference.
+    #[test]
+    fn waitid_info_spells_a_stop_and_a_resume_too() {
+        let word =
+            |buf: &[u8; 128], at: usize| i32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+
+        // A `WSTOPPED` record: the stopping signal is the status.
+        let mut stopped = [0u8; 128];
+        let _ = write_waitid_info(stopped.as_mut_ptr() as usize, 9, CLD_STOPPED, 19);
+        assert_eq!(word(&stopped, 0), 17);
+        assert_eq!(word(&stopped, 8), 5);
+        assert_eq!(word(&stopped, 16), 9);
+        assert_eq!(word(&stopped, 24), 19);
+
+        // The same shape under a tracer is a different code, not a different
+        // record - which is why the handler chooses and this writes verbatim.
+        let mut trapped = [0u8; 128];
+        let _ = write_waitid_info(trapped.as_mut_ptr() as usize, 9, CLD_TRAPPED, 19);
+        assert_eq!(word(&trapped, 8), 4);
+
+        // A resume: `SIGCONT` (18) is the status.
+        let mut resumed = [0u8; 128];
+        let _ = write_waitid_info(resumed.as_mut_ptr() as usize, 9, CLD_CONTINUED, 18);
+        assert_eq!(word(&resumed, 8), 6);
+        assert_eq!(word(&resumed, 24), 18);
     }
 
     /// `clone(2)`: the flag word's low byte is an exit signal, unknown bits

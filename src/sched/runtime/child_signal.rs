@@ -1,5 +1,5 @@
 use super::STARTED;
-use super::child_exit::{any_child_code, take_exit_code_for};
+use super::child_exit::any_child_code;
 use super::child_mm::child_alive;
 use super::procfs::comm_of;
 use super::task::MAX_TASKS;
@@ -40,17 +40,6 @@ pub(crate) fn table_has_deliverable(t: &Table) -> bool {
 /// interruptions and do not count, same as in [`take_deliverable_signal`].
 pub fn has_deliverable_signal() -> bool {
     with_table(|t| table_has_deliverable(t))
-}
-
-/// Take a child's exit code if one is waiting, and report `None` - not
-/// "keep waiting" - when it is not. The non-blocking half of `wait`: this is
-/// how a shell reaps jobs it started in the background without stopping for
-/// any of them.
-pub fn poll_any_child(parent: TaskId) -> Option<(TaskId, isize)> {
-    with_table(|t| {
-        any_child_code(t, parent)
-            .and_then(|(id, _)| take_exit_code_for(t, id, parent).map(|code| (id, code)))
-    })
 }
 
 /// Whether `parent` has a child at all - one still running, or one that has

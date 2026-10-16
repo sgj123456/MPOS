@@ -28,23 +28,29 @@ Section numbers are unchanged from the original `UAPI.md`.
   reuses an `F_GETFL` word for the `openat(fd, ".")` it opens a directory's descriptor with.
   Owner: `src/syscall/linux/fs/file.rs`'s `F_GETFL` arm + the `access` field already there.
   `docs/notes/` §15.16.
-- **`waitid(2)` ignores its `id`, serves two of Linux's four idtypes, and calls
-  "no event asked for" a success.** Three divergences, each measured on a
-  current host. (a) The `id` argument is not used: `P_PID` does not name the
-  child waited for, so a caller naming one child is handed whichever child
-  finishes first (`wait4` *does* honour its pid, which is what makes this
-  `waitid`'s own). (b) `P_ALL` and `P_PID` are served and `P_PGID` (2) and
-  `P_PIDFD` (3) are answered `EINVAL`, where Linux serves `P_PGID`: measured,
-  `idtype = 2` with `id = 0` is accepted and a childless caller is answered
-  `ECHILD` (errno 10). (c) A call whose `options` asks for none of
-  `WEXITED`/`WSTOPPED`/`WCONTINUED` is answered `0` with the record cleared,
-  where Linux clears the record and then refuses with `EINVAL` (errno 22) —
-  measured, and the *zeroing* is the half both machines agree on; (c) is the
-  §3.2 shape in the milder direction, a success where Linux refuses, rather
-  than a wrong number. Owner: `src/syscall/linux/proc.rs`'s `handle_waitid` (the
-  `_id` binding, the `idtype` check, and the `options & WEXITED == 0` arm).
-  `t-waitid` pins this kernel's answers on **both** machines and names each
-  host answer beside it under `MPOS_ON_HOST`. `docs/notes/` §15.11 (batch 18).
+- **`waitid`'s record leaves `si_uid` zero.** Linux fills it with the child's
+  real uid (measured: 1000 for a child of this shell); this kernel's record
+  cannot, because it outlives the task's slot — a `waitid` that finds a retired
+  record reads a pid, a code, a group and a status, and the uid was never
+  carried. Closing it is one field on `Retired`, the shape `pgid` took when
+  `P_PGID` needed one, plus the live path's `credentials_of`. Owner:
+  `src/sched/runtime/task.rs` + `src/syscall/linux/proc.rs`. Pin: `t-waitid`
+  grows the claim, as `probe_waitid.c` measured the host's answer. This is the
+  one field of that record still answered with a zero. `docs/notes/` §15.11
+  (batch 18).
+
+- **`__WCLONE` is accepted and ignored, where Linux narrows with it.** Measured
+  on a current host: `waitid(P_ALL, 0, &si, WEXITED|__WCLONE)` answers `ECHILD`
+  (errno 10) for a child that exits with `SIGCHLD`, because the bit means
+  "children cloned with an exit signal *other* than `SIGCHLD`" — and `__WALL` is
+  the word that asks for both. This kernel accepts the bit and reports the child
+  anyway, which is the treatment `wait4` has given all three Linux-only bits
+  since it landed (`.workbuddy/probe_waitid.c` also measured `__WALL` and
+  `__WNOTHREAD` served and a *undefined* bit, `0x10000000`, refused `EINVAL`).
+  Prerequisite: the clone exit signal would have to survive on the task —
+  `validate_clone_flags` reads it out of the flag word and drops it. Owner:
+  `src/sched/runtime/` + `src/syscall/linux/proc.rs`. Pins: `t-waitid`,
+  `t-wait4`. `docs/notes/` §15.11 (batch 18).
 
 - **`signalfd(2)` and `SIGCHLD`: one death, two records, and the wrong code.**
   Three divergences, each measured on a current host, all of them on the path the

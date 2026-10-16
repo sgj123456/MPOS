@@ -284,3 +284,32 @@ the commit bodies), and each moved its pin in the same commit.
     query of either answers `0` with a cleared record, an install of either is `EINVAL`) plus
     `signal.rs`'s `a_signal_is_nameable_and_installable_except_for_the_kernels_two`. Closes
     `docs/notes/` §15.11 (batch 20).
+
+17. **`waitid(2)`'s `id`, its four idtypes and its options word are Linux's.** The door had
+    three divergences, each measured on the host before it was written down
+    (`.workbuddy/probe_waitid.c`): `id` was ignored, so `P_PID` handed back whichever child
+    finished first; `P_PGID` (2) and `P_PIDFD` (3) were `EINVAL` where Linux serves the first
+    (`idtype = 2`, `id = 0` accepted, a childless caller `ECHILD`); and a call naming no event
+    class answered `0` with the record cleared, where Linux clears the record *and then* refuses
+    `EINVAL` — the one answer a caller cannot tell from "no event yet". Landing them meant one
+    thing underneath: a way to name a *set* of children, which is `sched::WaitFor` (the
+    `refactor` commit before this one), so the door now resolves `P_ALL`/`P_PID`/`P_PGID` into
+    the same selector `wait4`'s named child uses — a group through its leader's number, the way
+    `setpgid`/`getpgid` resolve one, with `0` the caller's own (a negative id is `EINVAL`, a
+    group with no child of ours `ECHILD`). `P_PIDFD` stays `EINVAL` and moves to §5.3 with its
+    prerequisite named: no pidfd family exists here to resolve a descriptor through, where Linux
+    answers `EBADF` for one that is not a pidfd. The options word is Linux's whole: the three
+    event classes are served rather than faked (`WSTOPPED` and `WCONTINUED` were a zero-filled
+    0), `WNOWAIT` reports without collecting, the three Linux-only bits are accepted and ignored,
+    and an undefined bit — or no class at all — is `EINVAL` with the record cleared first, which
+    is Linux's *order* as measured (the first draft of the fix cleared after the refusal and the
+    probe said otherwise). The record's `CLD_*` vocabulary came with it, each code measured:
+    `CLD_STOPPED` for a group stop, `CLD_TRAPPED` for the same stop under a tracer (which is why
+    `WaitEvent::Stopped` carries `traced`), `CLD_CONTINUED` with `SIGCONT` for a resume. Two
+    things stay named in §5.2 rather than guessed: `__WCLONE` narrows on Linux and this kernel
+    has no exit signal on a task to narrow with, and `si_uid` is left zero because the record
+    outlives the task's slot. Owner: `src/syscall/linux/proc.rs`'s `handle_waitid`,
+    `src/syscall/linux/abi.rs` (`exit_chld`, `write_waitid_info`, the `CLD_*` codes),
+    `src/sched/runtime/`. Pin: `t-waitid` on **both** machines, 46 `ok:` lines, every one of them
+    green on this host first, plus `abi`'s `waitid_info_reports_the_child_the_siginfo_way` and
+    `waitid_info_spells_a_stop_and_a_resume_too`. Closes `docs/notes/` §15.11 (batch 18).

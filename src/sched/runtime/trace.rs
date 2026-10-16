@@ -285,6 +285,7 @@ pub(crate) fn unreported_stop(
             id,
             signal: stop.signal,
             event: stop.event,
+            traced: stop.traced,
         });
     }
     None

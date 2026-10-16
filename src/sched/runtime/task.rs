@@ -1988,7 +1988,19 @@ pub enum WaitEvent {
     Exited { id: TaskId, code: isize },
     /// A stop to report: the signal `WSTOPSIG` names, and the `PTRACE_EVENT_*`
     /// the status word's high byte carries.
-    Stopped { id: TaskId, signal: u8, event: u32 },
+    ///
+    /// `traced` says whether a *tracer* took this stop rather than the parent's
+    /// `WUNTRACED`. The `wait4` status word does not need it - a traced stop is
+    /// already a `SIGTRAP` there - but `waitid` reports the two as different
+    /// `CLD_*` codes (`CLD_TRAPPED` and `CLD_STOPPED`), and the event word
+    /// cannot tell them apart: a ptrace signal-delivery stop carries
+    /// `PTRACE_EVENT_NONE`, exactly as a group stop does.
+    Stopped {
+        id: TaskId,
+        signal: u8,
+        event: u32,
+        traced: bool,
+    },
     /// A `SIGCONT` ended a stop. Only ever reported to a caller that asked
     /// with `WCONTINUED`.
     Continued { id: TaskId },

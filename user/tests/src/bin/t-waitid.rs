@@ -1,32 +1,53 @@
 //! t-waitid - a child's fate, described as a `siginfo_t`.
 //!
-//! Pinned here, per waitid(2): `idtype` is `P_ALL` or `P_PID` and nothing else
-//! (`EINVAL`), `WEXITED` alone reports an exit as `SIGCHLD`/`CLD_EXITED` with
-//! the child's pid in `si_pid` and its code in `si_status`, `WNOHANG` answers 0
-//! with the info zeroed when nothing is ready, options without `WEXITED` are a
-//! zero-filling no-op that answers 0, and `P_ALL` collects whichever child is
-//! ready.
+//! Pinned here, per waitid(2): `idtype` and `id` name the subject (`P_ALL`,
+//! `P_PID` and `P_PGID`, and nothing else), `WEXITED` alone reports an exit as
+//! `SIGCHLD`/`CLD_EXITED` with the child's pid in `si_pid` and its code in
+//! `si_status`, `WSTOPPED` and `WCONTINUED` report a stop and a resume as their
+//! own `CLD_*` codes, `WNOHANG` answers 0 with the info cleared when nothing is
+//! ready, `WNOWAIT` reports without collecting, and a call that asks for no
+//! event class at all - or carries a bit Linux's own options word does not
+//! define - is refused with the record cleared.
 //!
-//! Three divergences this kernel has are named here rather than hidden, each
-//! with the host's answer measured beside it (`docs/uapi/` §5.2 carries them):
+//! Every one of those is Linux's answer measured on a current host before it was
+//! written down (`.workbuddy/probe_waitid.c`), and this program carries the
+//! claims that tell the shapes apart rather than the ones that agree by
+//! accident. Three of them are worth naming, because each was a divergence this
+//! kernel had until 2026-10-16 (`docs/uapi/` §5.2 carried all three):
 //!
-//! * **`id` is ignored.** `P_PID` does not name the child waited for; the kernel
-//!   collects any ready child. Every check below is ordered so only the child
-//!   under test is ever ready, which is what the man page's `P_PID` would have
-//!   given anyway.
-//! * **Two idtypes, not four.** `P_ALL` and `P_PID` are served; the other two
-//!   Linux has (`P_PGID` 2, `P_PIDFD` 3) are answered `EINVAL`. Linux *serves*
-//!   `P_PGID`: measured on a current host, `idtype = 2` with `id = 0` is
-//!   accepted and the childless caller is answered `ECHILD` (errno 10).
-//! * **A call that asks for no event answers 0.** Linux clears the record and
-//!   then refuses the call: measured, `waitid(P_ALL, 0, info, 0)` answers `-1`
-//!   with `EINVAL` (errno 22). The *zeroing* is the half both machines agree on.
+//! * **`id` names the child.** `P_PID` used to collect any ready child, so a
+//!   caller naming one child could be handed another's record. The claim below
+//!   exists for exactly that: a zombie sibling is present while the named child
+//!   is still running, and the answer must be "none yet" (0 with `si_pid`
+//!   cleared) rather than the sibling.
+//! * **`P_PGID` selects a group.** It used to be `EINVAL`; it now resolves the
+//!   group's leader the way `setpgid`/`getpgid` do, with `id = 0` meaning the
+//!   caller's own group. The pair below is what makes the selector visible: a
+//!   zombie in *our* group is invisible to `P_PGID, <the other group>` and
+//!   visible to `P_PGID, 0`.
+//! * **A call that asks for no event is `EINVAL`.** It used to answer 0 with a
+//!   cleared record, which is the one answer a caller cannot tell from "no event
+//!   yet". Linux clears the record *and* refuses, and the measurement says the
+//!   clearing happens before the refusal for every refusal this door has - which
+//!   is why each of the three below reads the record back.
 //!
-//! A wait with no child at all is `ECHILD`, and that is pinned here: a second
-//! wait for a child already collected must answer it rather than park. The
-//! probe runs in a child with a deadline of its own, so a kernel that regressed
-//! to parking shows up as a failed check rather than a hung suite - the deadline
-//! is what a `waitid` asleep inside the probe cannot blow past.
+//! Two divergences stay, and are named rather than hidden:
+//!
+//! * **`P_PIDFD` is `EINVAL`.** Linux answers `EBADF` for a descriptor that is
+//!   not a pidfd (measured: fd 9999, errno 9) and serves a real one. This kernel
+//!   has no pidfd family - `pidfd_open`, `clone3(CLONE_PIDFD)` and
+//!   `pidfd_send_signal` are all absent - so no descriptor can name a task here,
+//!   and a refusal is the honest answer (`docs/uapi/` §5.3).
+//! * **`si_uid` is zero.** Linux fills the child's real uid (measured: 1000).
+//!   The record has to survive the task's slot being reaped, and this kernel's
+//!   record carries the pid, the code and the group but not the uid
+//!   (`docs/uapi/` §5.2).
+//!
+//! A wait with no matching child at all is `ECHILD`, and that is pinned here: a
+//! second wait for a child already collected must answer it rather than park.
+//! The probe runs in a child with a deadline of its own, so a kernel that
+//! regressed to parking shows up as a failed check rather than a hung suite -
+//! the deadline is what a `waitid` asleep inside the probe cannot blow past.
 //!
 //! The `EFAULT` for a null or short `infop` cannot be reached from these
 //! wrappers - the record handed over is never null and never short - so it is
@@ -37,8 +58,9 @@
 //! The call is the raw `SYS_waitid` (247 here, 95 on the second machine, both
 //! taken from libc's per-machine table), because the record the kernel writes
 //! *is* the claim and `rustix::process::waitid` owns its buffer: the 0xFF seed
-//! that proves a `WEXITED`-less call zeroes the info, and the fields read back
-//! out of it, have nowhere to go through a wrapper that hands over its own.
+//! that proves a refused or `WNOHANG`-empty call clears the info, and the fields
+//! read back out of it, have nowhere to go through a wrapper that hands over its
+//! own.
 //!
 //! What the raw door must not carry is this repository's memory of the record's
 //! *layout*, which is what the no-std version did - `si_pid` at byte 16 and
@@ -55,7 +77,7 @@
 //! header; arm64 is asm-generic). The offsets the no-std version wrote down were
 //! therefore right on both machines and are now unnecessary on both.
 //!
-//! The polling that watches the ECHILD probe and the child that sleeps are
+//! The polling that watches the ECHILD probe and the children that sleep are
 //! `rustix`'s `waitpid` (`wait4` with a null `rusage`, and `Ok(None)` for
 //! `WNOHANG` finding nobody ready) and `libc::nanosleep`; every child leaves
 //! through the raw `SYS_exit_group`, because a forked std child holds a copy of
@@ -122,6 +144,34 @@ fn leave(code: i32) -> ! {
     }
 }
 
+/// A child that exits with `code` at once, and its pid.
+fn child_that_exits(code: i32) -> libc::pid_t {
+    let kid = unsafe { libc::fork() };
+    if kid == 0 {
+        leave(code);
+    }
+    kid
+}
+
+/// Poll `P_PID` on `kid` until an event of the asked-for kinds is ready, with a
+/// deadline: `None` when the deadline passes first.
+///
+/// A stop and a resume are events of the *child's* making, so the parent has to
+/// wait for them to happen - on the second machine the whole sweep runs under
+/// TCG, where a child's first instruction is milliseconds away.
+fn await_event(kid: libc::pid_t, options: i32) -> Option<libc::siginfo_t> {
+    for _ in 0..400 {
+        let mut info = poisoned();
+        if waitid(libc::P_PID, kid, &mut info, options | libc::WNOHANG) == 0
+            && unsafe { info.si_pid() } == kid
+        {
+            return Some(info);
+        }
+        sleep_ms(5);
+    }
+    None
+}
+
 fn main() {
     println!("t-waitid");
     let mut r = Report::new();
@@ -133,54 +183,86 @@ fn main() {
         size_of::<libc::siginfo_t>() == 128,
     );
 
-    // idtype is P_ALL, P_PID, P_PGID or P_PIDFD on Linux; this kernel knows the
-    // first two and answers EINVAL for anything else. Linux *serves* the word
-    // this program probes with: measured on a current host, `idtype = 2`
-    // (`P_PGID`) with `id = 0` is accepted, and the childless caller is answered
-    // `ECHILD` (errno 10) rather than `EINVAL`. The payload pins this kernel's
-    // refusal and the host names the service it does not share, which is the
-    // shape `docs/uapi/` §5.2 records (the `id`-ignoring half above is the
-    // other one this program pins).
+    // The idtypes. `P_ALL`/`P_PID`/`P_PGID` are Linux's first three; the fourth,
+    // `P_PIDFD`, needs a pidfd family this kernel does not have, and an idtype
+    // outside the four is a request Linux refuses too. Measured on a current
+    // host: a caller with no children at all asking for its own group
+    // (`P_PGID`, id 0) is answered `ECHILD` (errno 10), and fd 9999 as a
+    // `P_PIDFD` is `EBADF` (errno 9) - which is the answer this kernel cannot
+    // give and names instead (`docs/uapi/` §5.3).
     let mut info = poisoned();
-    let answered = waitid(2, 0, &mut info, libc::WEXITED);
+    let answered = waitid(libc::P_PGID, 0, &mut info, libc::WEXITED | libc::WNOHANG);
     r.check(
-        "an idtype outside this kernel's two answers EINVAL",
+        "P_PGID on the caller's own group is served",
+        answered == -(libc::ECHILD as isize),
+    );
+    let mut info = poisoned();
+    r.check(
+        "P_PGID naming a group with no children is ECHILD",
+        waitid(libc::P_PGID, 4242, &mut info, libc::WEXITED | libc::WNOHANG)
+            == -(libc::ECHILD as isize),
+    );
+    let mut info = poisoned();
+    r.check(
+        "a negative P_PGID id is EINVAL",
+        waitid(libc::P_PGID, -1, &mut info, libc::WEXITED | libc::WNOHANG)
+            == -(libc::EINVAL as isize),
+    );
+    let mut info = poisoned();
+    r.check(
+        "an idtype outside Linux's four is EINVAL",
+        waitid(4, 0, &mut info, libc::WEXITED | libc::WNOHANG) == -(libc::EINVAL as isize),
+    );
+    // `P_PIDFD` is the idtype this kernel cannot answer, and the reason is the
+    // one above: no pidfd family exists here, so no descriptor can name a task
+    // and the honest answer is "this idtype is not served". Linux *does* serve
+    // it, and answers a descriptor that is not a pidfd with `EBADF` - measured,
+    // fd 9999, errno 9 - so the host run names the answer this kernel owes a
+    // prerequisite for rather than pretending to share it (`docs/uapi/` §5.3).
+    let mut info = poisoned();
+    let answered = waitid(
+        libc::P_PIDFD,
+        9999,
+        &mut info,
+        libc::WEXITED | libc::WNOHANG,
+    );
+    r.check(
+        "P_PIDFD is EINVAL here (no pidfd family to resolve a descriptor through)",
         answered
             == if mpos_user_tests::host_run() {
-                -(libc::ECHILD as isize)
+                -(libc::EBADF as isize)
             } else {
                 -(libc::EINVAL as isize)
             },
     );
 
-    // Options with no event asked for: Linux clears the record *before* it
-    // validates the options, and then refuses the call - measured on a current
-    // host, `waitid(P_ALL, 0, info, 0)` answers `-1`/`EINVAL` (errno 22) with
-    // every seeded byte of `info` cleared, which the "and zero the info" claim
-    // below reads for itself. This kernel clears the record and answers 0. The
-    // payload pins that answer and the host names Linux's refusal; the zeroing
-    // is the half the two machines agree on.
+    // A call that asks for no event class, and one carrying a bit Linux's own
+    // options word does not define: both are refused, and both clear the record
+    // *before* the refusal - Linux's order, measured, and the half a caller can
+    // read back. An unknown bit is `0x10000000`, which is none of
+    // `WNOHANG`/`WNOWAIT`/`WEXITED`/`WSTOPPED`/`WCONTINUED`/`__WNOTHREAD`/
+    // `__WALL`/`__WCLONE`.
     let mut info = poisoned();
-    let answered = waitid(libc::P_ALL, 0, &mut info, 0);
     r.check(
-        "a call asking for no event answers this kernel's 0",
-        answered
-            == if mpos_user_tests::host_run() {
-                -(libc::EINVAL as isize)
-            } else {
-                0
-            },
+        "a call asking for no event is EINVAL",
+        waitid(libc::P_ALL, 0, &mut info, 0) == -(libc::EINVAL as isize),
     );
     r.check(
-        "and zero the info (si_pid cleared)",
+        "and it cleared the record first (si_pid cleared)",
+        unsafe { info.si_pid() } == 0,
+    );
+    let mut info = poisoned();
+    r.check(
+        "an options bit Linux does not define is EINVAL",
+        waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | 0x1000_0000) == -(libc::EINVAL as isize),
+    );
+    r.check(
+        "and that refusal cleared the record too",
         unsafe { info.si_pid() } == 0,
     );
 
     // A child that exits 3: the info record carries signo, code, pid, status.
-    let kid = unsafe { libc::fork() };
-    if kid == 0 {
-        leave(3);
-    }
+    let kid = child_that_exits(3);
     r.check("a child that exits 3 was forked", kid > 0);
     if kid > 0 {
         let mut info = poisoned();
@@ -239,22 +321,82 @@ fn main() {
         }
     }
 
-    // WNOHANG while the only child is still running: 0 with the info cleared,
-    // not an error and not a blocking wait.
-    let sleeper = unsafe { libc::fork() };
-    if sleeper == 0 {
-        sleep_ms(1000);
+    // `id` names the child. A zombie sibling is present while the named child is
+    // still running: Linux reports nothing for a child that has not finished,
+    // and hands the *sibling's* record to nobody but the caller that names it.
+    // A kernel that ignores its `id` answers with the sibling here - which is
+    // exactly the divergence this claim was written for.
+    let alive = unsafe { libc::fork() };
+    if alive == 0 {
+        sleep_ms(1500);
         leave(0);
     }
-    r.check("a sleeping child was forked", sleeper > 0);
-    if sleeper > 0 {
+    let zombie = child_that_exits(4);
+    r.check(
+        "the running child and its zombie sibling were forked",
+        alive > 0 && zombie > 0,
+    );
+    if alive > 0 && zombie > 0 {
+        // Wait for the sibling to be a zombie, so the only thing that can keep
+        // the next answer honest is the `id`. `WNOWAIT` is load-bearing here:
+        // this probe must *look* at the record without collecting it, or the
+        // claim two below has nothing left to find - which is what a host run
+        // of the first draft measured.
+        let mut tries = 0;
+        let mut ready = false;
+        while !ready && tries < 400 {
+            let mut probe = poisoned();
+            ready = waitid(
+                libc::P_PID,
+                zombie,
+                &mut probe,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) == 0
+                && unsafe { probe.si_pid() } == zombie;
+            if !ready {
+                sleep_ms(5);
+            }
+            tries += 1;
+        }
+        r.check("the sibling became a zombie", ready);
+
         let mut info = poisoned();
-        let answered = waitid(
-            libc::P_PID,
-            sleeper,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG,
+        let answered = waitid(libc::P_PID, alive, &mut info, libc::WEXITED | libc::WNOHANG);
+        r.check(
+            "a zombie sibling is not the named child's event",
+            answered == 0 && unsafe { info.si_pid() } == 0,
         );
+
+        // And the sibling is still there to be collected, by name.
+        let mut info = poisoned();
+        r.check(
+            "so the sibling's own record is still waiting",
+            waitid(libc::P_PID, zombie, &mut info, libc::WEXITED) == 0
+                && unsafe { info.si_status() } == 4,
+        );
+
+        // `P_ALL` takes whichever child is ready - the running one has not
+        // finished, so this is the same "collect by any means" door `wait4`
+        // offers.
+        let any = child_that_exits(5);
+        r.check("a child that exits 5 was forked", any > 0);
+        if any > 0 {
+            let mut info = poisoned();
+            r.check(
+                "waitid(P_ALL) collects a child",
+                waitid(libc::P_ALL, 0, &mut info, libc::WEXITED) == 0,
+            );
+            r.check(
+                "P_ALL reports the child's pid",
+                unsafe { info.si_pid() } == any,
+            );
+            r.check("P_ALL reports its code", unsafe { info.si_status() } == 5);
+        }
+
+        // WNOHANG while the only child left is still running: 0 with the info
+        // cleared, not an error and not a blocking wait.
+        let mut info = poisoned();
+        let answered = waitid(libc::P_PID, alive, &mut info, libc::WEXITED | libc::WNOHANG);
         r.check(
             "WNOHANG with nothing ready answers 0, not an error",
             answered == 0,
@@ -265,27 +407,179 @@ fn main() {
         let mut info = poisoned();
         r.check(
             "the blocking wait then collects the sleeper",
-            waitid(libc::P_PID, sleeper, &mut info, libc::WEXITED) == 0,
+            waitid(libc::P_PID, alive, &mut info, libc::WEXITED) == 0,
         );
     }
 
-    // P_ALL takes whichever child is ready.
-    let any = unsafe { libc::fork() };
-    if any == 0 {
-        leave(5);
+    // `P_PGID` selects a group. A child that puts itself in a group of its own
+    // is the discriminating case: with a zombie in *our* group, a wait on the
+    // child's group must report nothing, and a wait on our own group must
+    // report the zombie. A kernel that ignores the selector answers the zombie
+    // to both, which is why the pair is here rather than one claim.
+    let grouped = unsafe { libc::fork() };
+    if grouped == 0 {
+        sleep_ms(2500);
+        leave(8);
     }
-    r.check("a child that exits 5 was forked", any > 0);
-    if any > 0 {
+    // The group is set from *both* sides, which is the idiom every shell uses
+    // and the only race-free one: whichever of the two runs first wins, and by
+    // the time the parent looks, the child is in a group of its own rather than
+    // in ours - the single fact the pair of claims below is about.
+    if grouped > 0 {
+        unsafe {
+            libc::setpgid(grouped, grouped);
+        }
+    }
+    let ours = child_that_exits(6);
+    r.check(
+        "a child in its own group and one in ours were forked",
+        grouped > 0 && ours > 0,
+    );
+    if grouped > 0 && ours > 0 {
+        let mut tries = 0;
+        let mut ready = false;
+        while !ready && tries < 400 {
+            let mut probe = poisoned();
+            ready = waitid(
+                libc::P_PGID,
+                0,
+                &mut probe,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) == 0
+                && unsafe { probe.si_pid() } == ours;
+            if !ready {
+                sleep_ms(5);
+            }
+            tries += 1;
+        }
+        r.check("the sibling in our own group became collectable", ready);
+
+        // The other group has nothing ready, and its member is not ours to
+        // mistake: `P_PGID, <that child's pid>` is that group, whose leader is
+        // the child itself.
+        let mut info = poisoned();
+        let answered = waitid(
+            libc::P_PGID,
+            grouped,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG,
+        );
+        r.check(
+            "a wait on the other group reports nothing of ours",
+            answered == 0 && unsafe { info.si_pid() } == 0,
+        );
+
+        let mut info = poisoned();
+        let answered = waitid(libc::P_PGID, 0, &mut info, libc::WEXITED);
+        r.check(
+            "and our own group collects our child",
+            answered == 0 && unsafe { info.si_pid() } == ours,
+        );
+        r.check("with the sibling's code", unsafe { info.si_status() } == 6);
+
         let mut info = poisoned();
         r.check(
-            "waitid(P_ALL) collects a child",
-            waitid(libc::P_ALL, 0, &mut info, libc::WEXITED) == 0,
+            "the grouped child is collected by pid as usual",
+            waitid(libc::P_PID, grouped, &mut info, libc::WEXITED) == 0
+                && unsafe { info.si_status() } == 8,
+        );
+    }
+
+    // A stop and a resume, as their own records: `WSTOPPED` makes a child that
+    // `SIGSTOP`s itself an event reportable to a parent that asked to hear
+    // about it, and `WCONTINUED` reports the `SIGCONT` that ends it. Both were
+    // a zero-filled 0 before 2026-10-16 - the same answer as "nothing yet",
+    // which is why a job-control parent could never see either.
+    let stopper = unsafe { libc::fork() };
+    if stopper == 0 {
+        unsafe {
+            libc::raise(libc::SIGSTOP);
+        }
+        sleep_ms(1500);
+        leave(7);
+    }
+    r.check("a child that stops itself was forked", stopper > 0);
+    if stopper > 0 {
+        match await_event(stopper, libc::WSTOPPED) {
+            Some(info) => {
+                r.check(
+                    "a stopped child is reported by WSTOPPED",
+                    info.si_signo == libc::SIGCHLD,
+                );
+                r.check("si_code says a stop", info.si_code == libc::CLD_STOPPED);
+                r.check(
+                    "si_status is the stopping signal",
+                    unsafe { info.si_status() } == libc::SIGSTOP,
+                );
+            }
+            None => {
+                r.check("a stopped child is reported by WSTOPPED", false);
+                r.check("si_code says a stop", false);
+                r.check("si_status is the stopping signal", false);
+            }
+        }
+
+        // The resume: `SIGCONT` ends the group stop, and the parent hears it
+        // only because it asked with `WCONTINUED`.
+        unsafe {
+            libc::kill(stopper, libc::SIGCONT);
+        }
+        match await_event(stopper, libc::WCONTINUED) {
+            Some(info) => {
+                r.check(
+                    "a resumed child is reported by WCONTINUED",
+                    info.si_code == libc::CLD_CONTINUED,
+                );
+                r.check(
+                    "with the continuing signal as its status",
+                    unsafe { info.si_status() } == libc::SIGCONT,
+                );
+            }
+            None => {
+                r.check("a resumed child is reported by WCONTINUED", false);
+                r.check("with the continuing signal as its status", false);
+            }
+        }
+
+        let mut info = poisoned();
+        r.check(
+            "and it still exits with its own code",
+            waitid(libc::P_PID, stopper, &mut info, libc::WEXITED) == 0
+                && unsafe { info.si_status() } == 7,
+        );
+    }
+
+    // `WNOWAIT`: report the event and leave it where it is, so the next wait
+    // finds it again - Linux's "look before you collect". A caller that reaps
+    // between the two would otherwise lose the record.
+    let kept = child_that_exits(9);
+    r.check("a child that exits 9 was forked", kept > 0);
+    if kept > 0 {
+        let mut first = poisoned();
+        let answered = waitid(libc::P_PID, kept, &mut first, libc::WEXITED | libc::WNOWAIT);
+        r.check(
+            "WNOWAIT reports the exit",
+            answered == 0 && unsafe { first.si_status() } == 9,
+        );
+
+        let mut second = poisoned();
+        let answered = waitid(
+            libc::P_PID,
+            kept,
+            &mut second,
+            libc::WEXITED | libc::WNOWAIT,
         );
         r.check(
-            "P_ALL reports the child's pid",
-            unsafe { info.si_pid() } == any,
+            "and the same exit is still there for the next look",
+            answered == 0 && unsafe { second.si_pid() } == kept,
         );
-        r.check("P_ALL reports its code", unsafe { info.si_status() } == 5);
+
+        let mut collected = poisoned();
+        r.check(
+            "while a wait without WNOWAIT collects it",
+            waitid(libc::P_PID, kept, &mut collected, libc::WEXITED) == 0
+                && unsafe { collected.si_status() } == 9,
+        );
     }
 
     r.finish()

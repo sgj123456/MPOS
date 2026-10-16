@@ -470,9 +470,12 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 fn finish_wait_event(event: crate::sched::WaitEvent, status: usize, from_user: bool) -> isize {
     match event {
         crate::sched::WaitEvent::Exited { id, code } => finish_wait(id, code, status, from_user),
-        crate::sched::WaitEvent::Stopped { id, signal, event } => {
-            write_wait_status(id, abi::stop_status(signal, event), status, from_user)
-        }
+        // `traced` is `waitid`'s question, not this door's: the status word
+        // `WSTOPSIG`/`WIFSTOPPED` read says "stopped" either way, and a traced
+        // stop's `PTRACE_EVENT_*` is what carries the rest.
+        crate::sched::WaitEvent::Stopped {
+            id, signal, event, ..
+        } => write_wait_status(id, abi::stop_status(signal, event), status, from_user),
         crate::sched::WaitEvent::Continued { id } => {
             write_wait_status(id, abi::CONTINUED_STATUS, status, from_user)
         }
@@ -3739,77 +3742,163 @@ pub(super) fn handle_clock_getres(args: [usize; ARG_COUNT]) -> isize {
 /// `waitid(idtype, id, infop, options, rusage)` — wait for one child and
 /// describe it as a `siginfo_t`.
 ///
-/// The modern wait: instead of a pid and a packed status word, `WEXITED`
-/// and friends say which transitions count and the child arrives as an
-/// info record - `si_pid`, `si_status`, and a `si_code` saying whether it
-/// exited, was killed, or was stopped. `WNOHANG` answers zero with
-/// `si_pid` cleared when no child is ready, which is how a caller polls
-/// without blocking.
+/// The modern wait: instead of a pid and a packed status word, `WEXITED` and
+/// friends say which transitions count and the child arrives as an info record
+/// - `si_pid`, `si_status`, and a `si_code` saying whether it exited, was
+/// killed, stopped or resumed. `WNOHANG` answers zero with `si_pid` cleared
+/// when no child is ready, which is how a caller polls without blocking.
+///
+/// # Which child, in Linux's four idtypes
+///
+/// `idtype` and `id` name the subject, and the three selectors Linux serves are
+/// one vocabulary here (`sched::WaitFor`), shared with `wait4`'s named child:
+/// `P_ALL` is any child, `P_PID` is that child's pid *in the caller's
+/// namespace* (`resolve_pid` - the same resolution `kill` uses), and `P_PGID`
+/// is the group `id` names, with `0` meaning the caller's own (`current_pgid`).
+/// The fourth, `P_PIDFD`, is answered `EINVAL` and named as a gap rather than
+/// guessed at: this kernel has no pidfd family to resolve a descriptor through
+/// (`docs/uapi/` §5.3), so a descriptor here names no task at all.
+///
+/// # The options word, and the two refusals it carries
+///
+/// Linux validates the whole word and the requested *event classes* before it
+/// looks at any child: an unknown bit and a call that names none of
+/// `WEXITED`/`WSTOPPED`/`WCONTINUED` are both `EINVAL` (measured on a current
+/// host, both with the record cleared), where this handler used to answer 0 to
+/// the second - a success for a wait nothing could satisfy, and the one shape a
+/// caller cannot tell from "no event yet". The record is cleared *before* the
+/// refusal, in Linux's order, so a caller that seeded one cannot read its own
+/// bytes back as an answer.
+///
+/// The three Linux-only bits (`__WNOTHREAD`, `__WALL`, `__WCLONE`) are accepted
+/// and ignored, which is `wait4`'s treatment and a named divergence: `__WCLONE`
+/// *narrows* to children cloned with an exit signal other than `SIGCHLD`, and
+/// this kernel's tasks carry no exit signal to ask (`docs/uapi/` §5.2).
 pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
-    use super::abi::SIGINFO_BYTES;
+    use super::abi::{CLD_CONTINUED, CLD_STOPPED, CLD_TRAPPED, SIGINFO_BYTES};
+    use crate::sched::{WaitFor, WaitPark, signal};
+
     const P_ALL: usize = 0;
     const P_PID: usize = 1;
-    const WNOHANG: usize = 1;
-    const WEXITED: usize = 4;
+    const P_PGID: usize = 2;
+    const WNOHANG: usize = 0x1;
+    const WSTOPPED: usize = 0x2;
+    const WEXITED: usize = 0x4;
+    const WCONTINUED: usize = 0x8;
+    const WNOWAIT: usize = 0x0100_0000;
+    const __WNOTHREAD: usize = 0x2000_0000;
+    const __WALL: usize = 0x4000_0000;
+    const __WCLONE: usize = 0x8000_0000;
+    /// Every bit Linux's own `waitid` accepts; anything else is an unknown
+    /// request rather than a request to ignore.
+    const KNOWN: usize =
+        WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WALL | __WCLONE;
+    /// The three classes of event a caller can ask to hear about. A call that
+    /// asks for none of them is refused rather than answered.
+    const CLASSES: usize = WEXITED | WSTOPPED | WCONTINUED;
 
-    let (idtype, _id, infop, options) = (args[0], args[1] as isize, args[2], args[3]);
-    if idtype != P_ALL && idtype != P_PID {
-        return err::EINVAL;
-    }
+    let (idtype, id, infop, options) = (args[0], args[1] as isize, args[2], args[3]);
     if !buffer_ok(infop, SIGINFO_BYTES, true, true) {
         return err::EFAULT;
     }
-    // Nothing asked for means nothing to report - not a blank wait.
-    if options & WEXITED == 0 {
-        unsafe {
-            core::ptr::write_bytes(infop as *mut u8, 0, SIGINFO_BYTES);
-        }
-        return 0;
+    // Cleared first, refused second - Linux's order, measured: both of the
+    // refusals below leave a zeroed record behind rather than the caller's own
+    // seeded bytes.
+    unsafe {
+        core::ptr::write_bytes(infop as *mut u8, 0, SIGINFO_BYTES);
     }
-
+    if options & !KNOWN != 0 || options & CLASSES == 0 {
+        return err::EINVAL;
+    }
     let me = crate::sched::current();
-    let collected = crate::sched::poll_any_child(me);
-    let (pid, code) = match collected {
-        Some(found) => found,
-        None if options & WNOHANG != 0 => {
-            // A poll that found nobody: success, with si_pid cleared so the
-            // caller can tell "no child yet" from "this child".
-            unsafe {
-                core::ptr::write_bytes(infop as *mut u8, 0, SIGINFO_BYTES);
+    let sel = match idtype {
+        P_ALL => WaitFor::Any,
+        P_PID => match pid_task(id) {
+            Some(id) => WaitFor::Pid(id),
+            None => return err::ECHILD,
+        },
+        // A group is named by its leader's number, resolved the way
+        // `setpgid`/`getpgid` resolve one; `0` is the caller's own group, and
+        // a negative id is not a group at all (measured: `P_PGID, -1` is
+        // `EINVAL`). A group whose leader is gone has no number to resolve
+        // here, so it reads as none of this caller's children.
+        P_PGID => {
+            if id < 0 {
+                return err::EINVAL;
             }
-            return 0;
+            let group = if id == 0 {
+                crate::sched::current_pgid()
+            } else {
+                match pid_task(id) {
+                    Some(leader) => leader,
+                    None => return err::ECHILD,
+                }
+            };
+            WaitFor::Pgid(group)
         }
-        None => {
-            // Blocking, so wait for somebody - but only if there *is*
-            // somebody. A caller with no child at all is `ECHILD`, not a
-            // sleep that nothing can ever end; `wait4` has asked this guard
-            // all along, and `waitid` was the one arm without it, so a
-            // second wait for an already-collected child parked forever.
-            if !crate::sched::has_children(me) {
-                return err::ECHILD;
-            }
-            // `poll_any_child` already reported nobody ready; park until one
-            // of them finishes.
-            match crate::sched::wait_any_child(me) {
-                crate::sched::WaitPark::Event(found) => found,
-                crate::sched::WaitPark::Interrupted => return err::EINTR,
-                crate::sched::WaitPark::NoChild => return err::ECHILD,
-            }
-        }
+        // `P_PIDFD` (3), and anything else: no pidfd family exists here, so no
+        // descriptor can name a task, and an idtype outside the four Linux
+        // defines is a request this kernel cannot read (`docs/uapi/` §5.3).
+        _ => return err::EINVAL,
     };
 
-    // The siginfo layout - SIGCHLD as the signo, CLD_EXITED or CLD_KILLED
-    // as the code, pid and status in their fields - is the ABI the libc's
-    // `W` macros and `waitid` wrappers read; it is spelled in `abi`, tested
-    // on the host.
+    let stops = options & WSTOPPED != 0;
+    let continues = options & WCONTINUED != 0;
+    let no_hang = options & WNOHANG != 0;
+    // `WNOWAIT` reports without collecting: the event stays where the next
+    // wait will find it, which is what a caller that wants to look before it
+    // reaps asked for.
+    let nowait = options & WNOWAIT != 0;
+
+    let collected = if no_hang {
+        crate::sched::poll_child_event(me, sel, stops, continues, nowait)
+    } else if crate::sched::has_matching_children(me, sel) {
+        match crate::sched::wait_child_event(me, sel, stops, continues, nowait) {
+            WaitPark::Event(event) => Some(event),
+            WaitPark::Interrupted => return err::EINTR,
+            WaitPark::NoChild => None,
+        }
+    } else {
+        None
+    };
+
+    let Some(event) = collected else {
+        // Nothing to report, and the two "nothing"s are different answers:
+        // `WNOHANG` on a child that has not done anything yet is the zero the
+        // caller polls for (with the record above left cleared), while a
+        // selector that matches no child at all is `ECHILD` - the wait could
+        // never be answered. `wait4` draws the line in the same place.
+        if no_hang && crate::sched::has_matching_children(me, sel) {
+            return 0;
+        }
+        return err::ECHILD;
+    };
+
+    // The siginfo layout, and the `CLD_*` code each event class writes, are
+    // the ABI the libc's `W` macros and `waitid` wrappers read; it is spelled
+    // in `abi`, tested on the host.
+    let (child, si_code, status) = match event {
+        crate::sched::WaitEvent::Exited { id, code } => {
+            let (si_code, status) = abi::exit_chld(code);
+            (id, si_code, status)
+        }
+        // A stop under a tracer and a stop for the parent are two codes
+        // (measured: `CLD_TRAPPED` and `CLD_STOPPED`), and the event's own word
+        // cannot tell them apart - a ptrace signal-delivery stop carries
+        // `PTRACE_EVENT_NONE`, exactly as a group stop does.
+        crate::sched::WaitEvent::Stopped {
+            id, signal, traced, ..
+        } => (
+            id,
+            if traced { CLD_TRAPPED } else { CLD_STOPPED },
+            signal as i32,
+        ),
+        crate::sched::WaitEvent::Continued { id } => (id, CLD_CONTINUED, signal::SIGCONT as i32),
+    };
     // The child's number in the *caller's* namespace, the same answer `wait4`
     // returns: a reader one level out sees the number it can use, and a reader
     // inside the child's own namespace sees 1.
-    abi::write_waitid_info(
-        infop,
-        crate::sched::pid_number_of(pid).unwrap_or(pid.0 as u32),
-        code,
-    )
+    abi::write_waitid_info(infop, wait_answer(child) as u32, si_code, status)
 }
 
 // The legacy `getrlimit`/`setrlimit` pair, `prlimit64` and `membarrier`
