@@ -7,7 +7,9 @@
 //! `st_nlink` falls back to 1. A link to a name that does not exist is
 //! ENOENT, and a link onto a name already taken is EEXIST. A missing source
 //! is refused before anything is created, which is why ENOENT and not EPERM
-//! is the answer.
+//! is the answer - and before the new descriptor is looked at, which is this
+//! call's own order: the pair of claims below tells "asked second" from "never
+//! asked", where `renameat` reads both names and then resolves.
 //!
 //! And per symlink(2)/readlink(2): the target is *stored, not checked*, so a
 //! link to a path that does not exist is made happily; `readlink` hands back
@@ -46,6 +48,7 @@
 //! the claims below are where a reader would look for it.
 
 use mpos_user_tests::Report;
+use rustix::fd::BorrowedFd;
 use rustix::fs::{
     AtFlags, CWD, FileType, Mode, OFlags, linkat, openat, readlinkat_raw, statat, symlink,
     symlinkat, unlinkat,
@@ -59,6 +62,12 @@ const B: &str = "/tmp/t-link-b";
 const S: &str = "/tmp/t-link-s";
 const S2: &str = "/tmp/t-link-s2";
 const GONE: &str = "/tmp/t-link-gone";
+/// A descriptor number nothing is open on, for the two claims about *when* a
+/// `linkat` asks its new descriptor. `t-write`, `t-chdir` and the rest of the
+/// suite write a number down the same way, because `BorrowedFd::borrow_raw`
+/// refuses a negative raw fd by contract and one branch answers every number
+/// that names nothing.
+const BAD_DIRFD: i32 = 77;
 
 /// The four bytes the source and every name for it hold, read through `path`.
 /// One claim, always made - a name that will not open is the claim failing, not
@@ -140,6 +149,30 @@ fn main() {
     r.check(
         "a link from a missing source answers ENOENT",
         linkat(CWD, GONE, CWD, B, AtFlags::empty()) == Err(Errno::NOENT),
+    );
+
+    // And that refusal comes *before* the new descriptor is looked at, which is
+    // this call's order rather than the family's: measured on a current host,
+    // `linkat(dirfd, <missing>, <unopened fd>, "b")` is ENOENT - the old name's
+    // walk is asked first - while the same shape through `renameat` is the bad
+    // descriptor's EBADF, because that call reads both names and then resolves.
+    // The second claim is what makes the first mean "asked second" rather than
+    // "never asked at all": with a source that *does* exist, the same unopened
+    // descriptor is reached.
+    //
+    // The new name is *relative* on purpose, and that is the rule this pair
+    // stands next to: `B` above is absolute, and an absolute new name would stop
+    // the new dirfd being a question at all - the claim would then be about the
+    // path' shape instead of about the descriptor.
+    let unopened = unsafe { BorrowedFd::borrow_raw(BAD_DIRFD) };
+    const NEW_NAME: &str = "t-link-new-name";
+    r.check(
+        "a missing source is ENOENT before the new dirfd is asked",
+        linkat(CWD, GONE, unopened, NEW_NAME, AtFlags::empty()) == Err(Errno::NOENT),
+    );
+    r.check(
+        "a source that exists reaches the unopened new dirfd, which answers EBADF",
+        linkat(CWD, A, unopened, NEW_NAME, AtFlags::empty()) == Err(Errno::BADF),
     );
     r.check(
         "the second name is made again",

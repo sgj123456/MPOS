@@ -7,7 +7,9 @@
 //! `AT_EMPTY_PATH` form stats the descriptor itself and must agree with `fstat`;
 //! without the flag an empty path is just an empty name (ENOENT); paths resolve
 //! relative to a directory descriptor, and a dirfd that is not open answers
-//! EBADF.
+//! EBADF. An **absolute** path consults the descriptor not at all - neither
+//! whether it is open nor what kind it is - and a name pointer the kernel cannot
+//! read answers EFAULT before either question.
 //!
 //! # The fixture is this test's own file now
 //!
@@ -36,20 +38,34 @@
 //! version's, and `t-write`, `t-chdir` and the rest of the suite use the same
 //! convention (`999` there) because the kernel's answer is one branch for every
 //! number that names nothing. It is not a number the suite's assertions depend
-//! on: the claim is EBADF, which any unopened descriptor gives.
+//! on: the *relative* claim is EBADF, which any unopened descriptor gives, and
+//! the absolute one is served, which any descriptor at all gives.
 //!
-//! # The no-std version's bad-dirfd claim was not Linux's, and its path is why
+//! # Which of the two questions is asked first, and why the path's shape decides
 //!
-//! It statted `/etc/motd` - an **absolute** path - with a dirfd nothing is open
-//! on, and this kernel answered EBADF. Linux does not: the dirfd is ignored
-//! entirely when the path is absolute, so `newfstatat(77, "/tmp", ..)` answers
-//! `0` with errno `0` there (measured on a current host). The claim below
-//! therefore names the kernel's answer with a *relative* path, which is EBADF
-//! on both, and the absolute-path behaviour is a divergence of this kernel's -
-//! the same thing would happen through `openat`, `unlinkat` and the rest of the
-//! family, because one `base_of` resolves the dirfd for all of them - named in
-//! `NOTES.md` §15.17 rather than pinned here. Fixing it is not this batch's: it
-//! is twenty call sites and every one of them would need its own answer.
+//! The no-std version statted `/etc/motd` - an **absolute** path - with a dirfd
+//! nothing is open on, and this kernel answered EBADF. That was a divergence
+//! wearing a pin: Linux does not look at the dirfd at all when the path is
+//! absolute, so `newfstatat(1000, "/tmp", buf, 0)` with 1000 not open answers `0`
+//! with errno `0` there, and the descriptor's *kind* is not a question either -
+//! measured on a current host, the same call through a dirfd open on a regular
+//! file answers `0`. Both are pinned below, and the relative claim that answers
+//! EBADF is kept beside them, because the pair is the rule: the descriptor stops
+//! being a question, not the path.
+//!
+//! The order the two questions are asked in is the other half. The kernel reads
+//! the name before it looks at the descriptor, as Linux does - the copy happens
+//! in `getname()` and `path_init()` reads the name's first character before
+//! `fdget_raw()` is reached - so a name the kernel cannot read at all answers
+//! EFAULT even when the dirfd is bad too. That claim needs `libc::syscall`:
+//! `rustix::fs::statat` takes a path, and "a path that is a bad address" is not
+//! something a `&CStr` can spell (`user/tests/Cargo.toml`'s shape clause). The
+//! machinery is the raw call alone and the number comes from `libc`'s own table,
+//! which is the machine's.
+//!
+//! The family's other members carry the same rule through their own doors; this
+//! program pins it where it was found, and `t-openat` pins the same two answers
+//! for the family's busiest member.
 
 use mpos_user_tests::Report;
 use rustix::fd::BorrowedFd;
@@ -68,7 +84,7 @@ const GONE: &str = "/no/such";
 const BAD_DIRFD: i32 = 77;
 /// The name the bad-dirfd claim hands the kernel. What it says does not matter
 /// - the descriptor is not open - but its *shape* does: it is relative, because
-/// an absolute path makes Linux ignore the dirfd altogether. See the claim.
+/// an absolute path stops the dirfd being a question at all. See the claims.
 const ANY_NAME: &str = "any";
 
 /// The bytes the fixture holds, so "a regular file with contents" is a claim
@@ -185,22 +201,63 @@ fn main() {
         }
     }
 
-    // A dirfd that is not open answers EBADF. The path is *relative* on
-    // purpose, and that is worth spelling out because the no-std version's was
-    // absolute: Linux ignores the dirfd entirely when the path is absolute -
-    // measured, `newfstatat(77, "/tmp", ..)` answers 0 with errno 0 - so an
-    // absolute path would make this claim about the path and not about the
-    // dirfd. This kernel answers EBADF either way, which is a divergence of its
-    // own, named in `NOTES.md` §15.17 rather than pinned here.
-    // SAFETY: a descriptor number nothing is open on - the kernel answers EBADF,
-    // which is the claim.
+    // The pair that is the whole rule. An absolute path does not reach the
+    // descriptor - not its state and not its kind - so both of these are
+    // served, and it is the descriptor that stops being a question rather than
+    // the path: the relative claim below still answers EBADF.
+    //
+    // SAFETY: a descriptor number nothing is open on. Two of the three claims
+    // below are *served* through it, which is what they pin.
     let missing = unsafe { BorrowedFd::borrow_raw(BAD_DIRFD) };
     r.check(
-        "a bad dirfd answers EBADF",
+        "an absolute path with a bad dirfd is served",
+        matches!(
+            statat(missing, DIR, AtFlags::empty()),
+            Ok(st) if FileType::from_raw_mode(st.st_mode).is_dir()
+        ),
+    );
+    match openat(CWD, FILE, OFlags::RDONLY, Mode::empty()) {
+        Ok(file) => r.check(
+            "an absolute path is served through a regular-file dirfd too",
+            matches!(
+                statat(&file, DIR, AtFlags::empty()),
+                Ok(st) if FileType::from_raw_mode(st.st_mode).is_dir()
+            ),
+        ),
+        Err(e) => r.check(
+            &format!("the fixture reopens for the kind claim (got {e})"),
+            false,
+        ),
+    }
+
+    // A *relative* name still goes through the descriptor, which is what the
+    // no-std version's claim was about before its absolute path hid it.
+    r.check(
+        "a bad dirfd answers EBADF for a relative name",
         matches!(
             statat(missing, ANY_NAME, AtFlags::empty()),
             Err(Errno::BADF)
         ),
+    );
+
+    // And the name is read before the descriptor is: a pointer the kernel
+    // cannot read is EFAULT even though the same dirfd is bad. Raw, because no
+    // `&CStr` may name a bad address (see the module comment). The buffer is a
+    // word array rather than `struct stat` - nothing writes it, the call fails
+    // first - and 256 bytes hold either machine's layout.
+    let mut raw = [0u64; 32];
+    let fault = unsafe {
+        libc::syscall(
+            libc::SYS_newfstatat,
+            BAD_DIRFD as libc::c_long,
+            1usize as libc::c_long,
+            raw.as_mut_ptr() as libc::c_long,
+            0,
+        )
+    };
+    r.check(
+        "an unreadable name pointer answers EFAULT, not the dirfd's EBADF",
+        fault == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EFAULT),
     );
 
     let _ = std::fs::remove_file(FILE);

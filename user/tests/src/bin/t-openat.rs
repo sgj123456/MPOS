@@ -3,8 +3,11 @@
 //! through it too (`openat(AT_FDCWD, path, O_RDONLY|O_CLOEXEC)`).
 //!
 //! Pinned here: the Linux argument shape - dirfd, NUL-terminated path, flags,
-//! mode, with no length word; AT_FDCWD relative opens; real-dirfd opens (and
-//! EBADF / ENOTDIR for dirfds that are not directories); the lowest-free-fd
+//! mode, with no length word; AT_FDCWD relative opens; real-dirfd opens (EBADF
+//! for a dirfd that is not open and ENOTDIR for one that is not a directory,
+//! both with a *relative* name - an absolute one does not consult the
+//! descriptor at all, and the same two claims pin that half); the
+//! lowest-free-fd
 //! guarantee, measured rather than assumed to be 3; O_CREAT making a missing file
 //! and O_CREAT|O_EXCL answering EEXIST for one that is there; close and its fd
 //! reuse; ENOENT for a path that does not exist; and O_NOFOLLOW refusing a
@@ -35,7 +38,9 @@ const LINK: &str = "/tmp/t-openat_link";
 const BIN: &str = "/bin";
 const SH: &str = "sh";
 const NO_SUCH: &str = "/no/such";
-/// A name that is not in any directory, for the ENOTDIR dirfd claim.
+/// A name that is not in any directory, for the two claims that need a
+/// *relative* one: the bad-dirfd claim and the ENOTDIR one. An absolute path
+/// stops the dirfd being a question at all, so it cannot spell either.
 const NOT_DIR: &str = "x";
 
 fn main() {
@@ -126,16 +131,27 @@ fn main() {
     // because `BorrowedFd::borrow_raw` refuses a negative raw fd by contract and a
     // closed number is the same kernel branch - the descriptor table has no such
     // row.
+    //
+    // The name is *relative* on purpose: an absolute path does not reach the
+    // descriptor at all, so an absolute one would make this claim about the path
+    // rather than about the descriptor. The claim after it is that half, and
+    // `t-newfstatat` pins the same pair where the divergence was found.
     let missing = unsafe { BorrowedFd::borrow_raw(999) };
     r.check(
         "a dirfd that is not open answers EBADF",
         matches!(
-            openat(missing, FILE, OFlags::RDONLY, Mode::empty()),
+            openat(missing, NOT_DIR, OFlags::RDONLY, Mode::empty()),
             Err(Errno::BADF)
         ),
     );
+    r.check(
+        "an absolute path with a bad dirfd opens",
+        openat(missing, FILE, OFlags::RDONLY, Mode::empty()).is_ok(),
+    );
 
-    // A dirfd that names a regular file is not a directory to resolve in.
+    // A dirfd that names a regular file is not a directory to resolve in - for
+    // a relative name. An absolute one is served through it, because the
+    // descriptor's *kind* stops being a question too.
     let Ok(fd) = openat(CWD, FILE, OFlags::RDONLY, Mode::empty()) else {
         r.check("a dirfd that names a regular file answers ENOTDIR", false);
         r.finish()
@@ -146,6 +162,10 @@ fn main() {
             openat(&fd, NOT_DIR, OFlags::RDONLY, Mode::empty()),
             Err(Errno::NOTDIR)
         ),
+    );
+    r.check(
+        "an absolute path through a regular-file dirfd opens",
+        openat(&fd, FILE, OFlags::RDONLY, Mode::empty()).is_ok(),
     );
     drop(fd);
 

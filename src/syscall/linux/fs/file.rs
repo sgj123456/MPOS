@@ -87,10 +87,37 @@ fn descriptor_file(fd: usize) -> VfsResult<Arc<dyn Inode>> {
         .map(|file| file.inode())
 }
 
-/// The inode a dirfd-led path resolves from: the descriptor's directory, or
-/// the caller's cwd for `AT_FDCWD`.
-fn base_of(dirfd: i32, cwd: &Arc<dyn Inode>) -> Result<Arc<dyn Inode>, isize> {
-    if dirfd == abi::AT_FDCWD {
+/// The inode a dirfd-led name resolves from: the descriptor's directory, or the
+/// caller's cwd for `AT_FDCWD` - and the cwd *without looking at the descriptor
+/// at all* when the name is absolute.
+///
+/// Linux asks the name's first character before it touches the dirfd. Measured
+/// on a current host (`.workbuddy/probe_at_dirfd.c`, Linux 7.2.9), every member
+/// of the family - `openat`, `openat2`, `newfstatat`, `statx`, `faccessat`,
+/// `faccessat2`, `readlinkat`, `utimensat`, `futimesat`, `mkdirat`, `unlinkat`,
+/// `symlinkat`, `renameat`, `renameat2`, `linkat` (both of its dirfds),
+/// `fchmodat`, `fchmodat2`, `fchownat` and `mknodat` - serves an absolute name
+/// through a descriptor nothing is open on,
+/// and the descriptor's *kind* is not a question either: one open on a regular
+/// file serves an absolute name too, where a relative name through that same
+/// descriptor is `ENOTDIR` and through a closed one `EBADF`. Resolving the dirfd
+/// first, whatever the name looked like, answered `EBADF` to a caller holding a
+/// stale descriptor with an absolute path - a fallback Linux never makes such a
+/// caller take - and the same difference was reachable through every one of
+/// those calls, because they all came through one `base_of`.
+///
+/// Reading the name first is the rule and not an implementation detail, because
+/// it is where the other half of Linux's order comes from: the name is copied in
+/// `getname()` before `path_init()` looks at the descriptor, so a name the
+/// kernel cannot read at all - a bad pointer, or a null one - is `EFAULT` rather
+/// than the descriptor's `EBADF` (measured for every member above). Callers
+/// therefore read their name *before* they ask this question.
+///
+/// The cwd this answers for an absolute name is never dereferenced: an absolute
+/// name begins at the caller's root and the resolver ignores the start it is
+/// handed, which is what makes passing the cwd here enough.
+fn base_for(dirfd: i32, path: &str, cwd: &Arc<dyn Inode>) -> Result<Arc<dyn Inode>, isize> {
+    if path.starts_with('/') || dirfd == abi::AT_FDCWD {
         return Ok(cwd.clone());
     }
     let file = crate::sched::current_fds()
@@ -436,12 +463,14 @@ pub fn open(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 
 /// `openat(dirfd, path, flags, mode)`.
 pub fn openat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let base = match base_of(args[0] as i32, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
-    };
+    // The name is read before the descriptor is looked at, because `base_for`
+    // needs it and because that is Linux's own order - see its comment.
     let path = match cstr_arg(args[1], true) {
         Ok(path) => path,
+        Err(e) => return e,
+    };
+    let base = match base_for(args[0] as i32, &path, cwd) {
+        Ok(base) => base,
         Err(e) => return e,
     };
     open_linux(&path, args[2], args[3] as u32, base)
@@ -752,7 +781,7 @@ pub fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             times,
         );
     }
-    let base = match base_of(dirfd, cwd) {
+    let base = match base_for(dirfd, &path, cwd) {
         Ok(base) => base,
         Err(e) => return e,
     };
@@ -863,7 +892,7 @@ pub fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             Err(e) => return err_of(e),
         }
     } else {
-        let base = match base_of(dirfd, cwd) {
+        let base = match base_for(dirfd, &path, cwd) {
             Ok(base) => base,
             Err(e) => return e,
         };
@@ -966,12 +995,12 @@ pub fn access(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 
 /// `faccessat(dirfd, path, mode, flags)` - the dirfd form of access.
 pub fn faccessat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let base = match base_of(args[0] as i32, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
-    };
     let path = match cstr_arg(args[1], true) {
         Ok(path) => path,
+        Err(e) => return e,
+    };
+    let base = match base_for(args[0] as i32, &path, cwd) {
+        Ok(base) => base,
         Err(e) => return e,
     };
     match crate::vfs::resolve_opt(&path, Some(base)) {
@@ -1182,12 +1211,12 @@ pub fn utimensat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             Err(e) => return err_of(e),
         }
     } else {
-        let base = match base_of(dirfd, cwd) {
-            Ok(base) => base,
-            Err(e) => return e,
-        };
         let path = match cstr_arg(path_ptr, true) {
             Ok(path) => path,
+            Err(e) => return e,
+        };
+        let base = match base_for(dirfd, &path, cwd) {
+            Ok(base) => base,
             Err(e) => return e,
         };
         let resolved = if flags & AT_SYMLINK_NOFOLLOW != 0 {
@@ -1293,12 +1322,12 @@ pub fn unlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // optimisation, it is how the caller says which of the two operations it
     // means, and getting it wrong either removes a directory that still holds
     // something or refuses a plain file.
-    let base = match base_of(args[0] as i32, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
-    };
     let path = match cstr_arg(args[1], true) {
         Ok(path) => path,
+        Err(e) => return e,
+    };
+    let base = match base_for(args[0] as i32, &path, cwd) {
+        Ok(base) => base,
         Err(e) => return e,
     };
     // The news wants the inode while it still has a name: resolve the
@@ -1397,12 +1426,12 @@ pub fn rmdir(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 
 /// `mkdirat(dirfd, path, mode)` - mode is ignored.
 pub fn mkdirat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let base = match base_of(args[0] as i32, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
-    };
     let path = match cstr_arg(args[1], true) {
         Ok(path) => path,
+        Err(e) => return e,
+    };
+    let base = match base_for(args[0] as i32, &path, cwd) {
+        Ok(base) => base,
         Err(e) => return e,
     };
     // A name that is already taken is `EEXIST`, whatever kind of thing holds
@@ -1457,20 +1486,25 @@ pub fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     {
         return err::EINVAL;
     }
-    let old_base = match base_of(args[0] as i32, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
-    };
+    // Both names are read before either *descriptor* is looked at, which is this
+    // call's shape rather than `linkat`'s: measured on a current host, a missing
+    // old name beside a bad new dirfd is that descriptor's EBADF. The two
+    // *pointers* come first of all, and that is the half that makes a name the
+    // kernel cannot read EFAULT even with a bad dirfd on either side.
     let old_path = match cstr_arg(args[1], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
-    let new_base = match base_of(args[2] as i32, cwd) {
+    let new_path = match cstr_arg(args[3], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let old_base = match base_for(args[0] as i32, &old_path, cwd) {
         Ok(base) => base,
         Err(e) => return e,
     };
-    let new_path = match cstr_arg(args[3], true) {
-        Ok(path) => path,
+    let new_base = match base_for(args[2] as i32, &new_path, cwd) {
+        Ok(base) => base,
         Err(e) => return e,
     };
     // Renaming a name onto itself is a no-op - and it has to be said so
@@ -1667,13 +1701,28 @@ pub fn readlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     if size == 0 {
         return err::EINVAL;
     }
-    if !buffer_ok(buf, size, true, true) {
-        return err::EFAULT;
-    }
     let path = match cstr_arg(args[0], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
+    readlink_named(&path, buf, size, cwd)
+}
+
+/// The tail both `readlink` and `readlinkat` end at: the name is already read,
+/// and `readlinkat` has already answered the two questions its descriptor and
+/// its name can be asked on their own.
+///
+/// The buffer is checked here rather than in either door, which is also where
+/// Linux checks it: `do_readlinkat` refuses a non-positive `bufsiz` (the
+/// `EINVAL` above) before it looks at anything else, and the buffer itself is
+/// only touched once a link has been found. Both spellings answer `EFAULT` for
+/// an unreadable buffer, so the move is invisible to a caller - but the name's
+/// and the descriptor's answers come first, which is the order `base_for`'s
+/// comment is about.
+fn readlink_named(path: &str, buf: usize, size: usize, base: &Arc<dyn Inode>) -> isize {
+    if !buffer_ok(buf, size, true, true) {
+        return err::EFAULT;
+    }
     let target: String = if path == "/proc/self/exe" {
         crate::sched::current_exe()
     } else if let Some(rest) = path.strip_prefix("/proc/self/fd/") {
@@ -1692,7 +1741,7 @@ pub fn readlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     } else {
         // The link, not what it points at: a resolver that followed it would
         // answer EINVAL for every link and the target for nothing.
-        match crate::vfs::resolve_no_follow_at(&path, cwd.clone()) {
+        match crate::vfs::resolve_no_follow_at(path, base.clone()) {
             Ok(node) => match node.readlink() {
                 Ok(target) => target,
                 Err(e) => return err_of(e),
@@ -1712,12 +1761,26 @@ pub fn readlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 /// The arguments shift by one: the dirfd sits in `args[0]` and the path in
 /// `args[1]`, so the plain `readlink` layout would read the dirfd number as
 /// the path and answer ENOENT for every caller.
+///
+/// `bufsiz` and the name are read here rather than in `readlink_named` so that
+/// the descriptor is the *third* question asked, which is where Linux asks it:
+/// an empty name with a dirfd nothing is open on is this call's one member whose
+/// answer is `EBADF` rather than `ENOENT`, because `do_readlinkat` has no
+/// empty-name check to place before the walk.
 pub fn readlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let base = match base_of(args[0] as i32, cwd) {
+    let (buf, size) = (args[2], args[3]);
+    if size == 0 {
+        return err::EINVAL;
+    }
+    let path = match cstr_arg(args[1], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let base = match base_for(args[0] as i32, &path, cwd) {
         Ok(base) => base,
         Err(e) => return e,
     };
-    readlink([args[1], args[2], args[3], 0, 0, 0], &base)
+    readlink_named(&path, buf, size, &base)
 }
 
 /// `symlink(target, linkpath)` — name a link that stands for `target`.
@@ -1734,15 +1797,22 @@ pub fn symlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
+    symlink_named(&target, &path, cwd)
+}
+
+/// The tail `symlink` and `symlinkat` share: the target and the link's name are
+/// both already read, and the caller has already asked which directory the name
+/// lands in. Nothing below depends on which door it came through.
+fn symlink_named(target: &str, path: &str, base: &Arc<dyn Inode>) -> isize {
     // The parent, not the name: the name is what this call is about to make,
     // so it must *not* be there, and asking the tree for it would only
     // discover that. Splitting it off is also what keeps a link from being
     // written in place of the link it points at.
-    let (parent_path, name) = match crate::vfs::split_parent(&path) {
+    let (parent_path, name) = match crate::vfs::split_parent(path) {
         Ok(p) => p,
         Err(e) => return err_of(e),
     };
-    let parent = match crate::vfs::resolve_opt(parent_path, Some(cwd.clone())) {
+    let parent = match crate::vfs::resolve_opt(parent_path, Some(base.clone())) {
         Ok(parent) => parent,
         Err(e) => return err_of(e),
     };
@@ -1751,7 +1821,7 @@ pub fn symlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     if let Err(e) = crate::vfs::may_create_in(&parent) {
         return err_of(e);
     }
-    match parent.symlink(name, &target) {
+    match parent.symlink(name, target) {
         Ok(_) => {
             // The new name is a symlink, so its create event is never an
             // `IN_ISDIR` one.
@@ -1767,12 +1837,25 @@ pub fn symlink(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 /// The dirfd names where the link lands: `AT_FDCWD` means the caller's
 /// directory, anything else is a directory descriptor apk keeps open across
 /// the whole extraction of a package.
+///
+/// Both strings are read before the descriptor is looked at - the *target*
+/// first, which is Linux's order for this call (`getname(oldname)` before
+/// `getname(newname)`) and the reason an unreadable target pointer is `EFAULT`
+/// rather than a bad dirfd's `EBADF`.
 pub fn symlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let base = match base_of(args[1] as i32, cwd) {
+    let target = match cstr_arg(args[0], true) {
+        Ok(target) => target,
+        Err(e) => return e,
+    };
+    let path = match cstr_arg(args[2], true) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let base = match base_for(args[1] as i32, &path, cwd) {
         Ok(base) => base,
         Err(e) => return e,
     };
-    symlink([args[0], args[2], 0, 0, 0, 0], &base)
+    symlink_named(&target, &path, &base)
 }
 
 /// `mount(source, target, fstype, flags, data)`.
@@ -4136,10 +4219,6 @@ pub fn handle_fchown(args: [usize; ARG_COUNT]) -> isize {
 /// the whole difference between `chown` and `lchown` - and a file that is not
 /// there is still an error, because the caller is naming something.
 pub fn handle_fchownat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let base = match base_of(args[0] as i32, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
-    };
     let path = match cstr_arg(args[1], true) {
         Ok(path) => path,
         Err(e) => return e,
@@ -4148,6 +4227,10 @@ pub fn handle_fchownat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
     // set the owner of whatever the fd holds, not of a path. This is how `apk`
     // gives an `O_TMPFILE` file its owner before naming it, and without it the
     // empty name resolves to nothing and the preserve fails.
+    //
+    // An empty name is answered before the dirfd is looked at, which is Linux's
+    // order for this call: under `AT_EMPTY_PATH` the descriptor *is* the target,
+    // and without it the name is the whole request.
     if path.is_empty() {
         if args[4] & AT_EMPTY_PATH == 0 {
             return err::ENOENT;
@@ -4157,6 +4240,10 @@ pub fn handle_fchownat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
             Err(e) => err_of(e),
         };
     }
+    let base = match base_for(args[0] as i32, &path, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
+    };
     let found = if args[4] & AT_SYMLINK_NOFOLLOW != 0 {
         crate::vfs::resolve_no_follow_at(&path, base)
     } else {
@@ -4198,23 +4285,25 @@ pub fn handle_lchown(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 /// support hard links, which is exactly this, so a caller's fallback -
 /// copy the file - is what it would do on a filesystem that cannot link.
 pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let old_base = match base_of(args[0] as i32, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
-    };
+    // This is the family's one door that asks its two names *in sequence*: the
+    // old name, its descriptor and its walk all come before the new name is read
+    // at all. Measured on a current host, the four combinations say so - a
+    // missing old name is ENOENT with *any* new-side answer (a bad new dirfd,
+    // which alone would be EBADF, and an unreadable new pointer, which alone
+    // would be EFAULT), while a resolvable old name beside a bad new dirfd is
+    // that descriptor's EBADF and beside an unreadable new pointer is EFAULT.
+    // Linux's sequence for this call is the same (`filename_lookup` of the old
+    // name before `getname` of the new one); `renameat2` below is the family's
+    // other shape, reading both names before it resolves either.
     let old_path = match cstr_arg(args[1], true) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let new_base = match base_of(args[2] as i32, cwd) {
+    let old_base = match base_for(args[0] as i32, &old_path, cwd) {
         Ok(base) => base,
         Err(e) => return e,
     };
-    let new_path = match cstr_arg(args[3], true) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    // Both names have to exist as paths for the request to be a request:
+    // The old name has to exist as a path for the request to be a request:
     // a link to a missing file is ENOENT, not EPERM.
     let old = match crate::vfs::resolve_no_follow_at(&old_path, old_base.clone()) {
         Ok(inode) => inode,
@@ -4237,6 +4326,14 @@ pub fn handle_linkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         }
     } else {
         None
+    };
+    let new_path = match cstr_arg(args[3], true) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let new_base = match base_for(args[2] as i32, &new_path, cwd) {
+        Ok(base) => base,
+        Err(e) => return e,
     };
     let via_descriptor = followed.is_some() && old.as_fd().is_some();
     let old = followed.unwrap_or(old);
@@ -5291,12 +5388,12 @@ pub fn handle_openat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, from_user:
     if mode != 0 && flags & (abi::O_CREAT | abi::O_TMPFILE) == 0 {
         return err::EINVAL;
     }
-    let base = match base_of(dirfd, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
-    };
     let path = match cstr_arg(path_ptr, true) {
         Ok(path) => path,
+        Err(e) => return e,
+    };
+    let base = match base_for(dirfd, &path, cwd) {
+        Ok(base) => base,
         Err(e) => return e,
     };
     open_linux(&path, flags, mode as u32, base)
@@ -5321,12 +5418,12 @@ pub fn handle_faccessat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isiz
     if flags & !(abi::AT_SYMLINK_NOFOLLOW | abi::AT_EACCESS) != 0 {
         return err::EINVAL;
     }
-    let base = match base_of(dirfd, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
-    };
     let path = match cstr_arg(path_ptr, true) {
         Ok(path) => path,
+        Err(e) => return e,
+    };
+    let base = match base_for(dirfd, &path, cwd) {
+        Ok(base) => base,
         Err(e) => return e,
     };
     let found = if flags & abi::AT_SYMLINK_NOFOLLOW != 0 {
@@ -5352,7 +5449,7 @@ pub fn handle_fchmodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize 
         Ok(path) => path,
         Err(e) => return e,
     };
-    let base = match base_of(args[0] as i32, cwd) {
+    let base = match base_for(args[0] as i32, &path, cwd) {
         Ok(base) => base,
         Err(e) => return e,
     };
@@ -5411,7 +5508,7 @@ pub fn handle_fchmodat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
             Err(e) => e,
         };
     }
-    let base = match base_of(args[0] as i32, cwd) {
+    let base = match base_for(args[0] as i32, &path, cwd) {
         Ok(base) => base,
         Err(e) => return e,
     };
@@ -5446,16 +5543,16 @@ pub fn handle_fchmodat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
 /// `mknodat(dirfd, path, mode, dev)` — create a node, relative to a
 /// dirfd. `mknod` is this at the caller's cwd.
 pub fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
-    let base = match base_of(args[0] as i32, cwd) {
-        Ok(base) => base,
-        Err(e) => return e,
-    };
     let path = match cstr_arg(args[1], true) {
         Ok(path) => path,
         Err(e) => return e,
     };
     let kind = match abi::mknod_kind(args[2]) {
         Ok(kind) => kind,
+        Err(e) => return e,
+    };
+    let base = match base_for(args[0] as i32, &path, cwd) {
+        Ok(base) => base,
         Err(e) => return e,
     };
     let (parent, name) = match crate::vfs::split_parent(&path) {
@@ -5507,12 +5604,12 @@ pub fn handle_futimesat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, from_use
             Err(e) => return err_of(e),
         }
     } else {
-        let base = match base_of(dirfd, cwd) {
-            Ok(base) => base,
-            Err(e) => return e,
-        };
         let path = match cstr_arg(path_ptr, true) {
             Ok(path) => path,
+            Err(e) => return e,
+        };
+        let base = match base_for(dirfd, &path, cwd) {
+            Ok(base) => base,
             Err(e) => return e,
         };
         match crate::vfs::resolve_opt(&path, Some(base)) {

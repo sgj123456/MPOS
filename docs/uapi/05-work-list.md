@@ -311,5 +311,35 @@ the commit bodies), and each moved its pin in the same commit.
     outlives the task's slot. Owner: `src/syscall/linux/proc.rs`'s `handle_waitid`,
     `src/syscall/linux/abi.rs` (`exit_chld`, `write_waitid_info`, the `CLD_*` codes),
     `src/sched/runtime/`. Pin: `t-waitid` on **both** machines, 46 `ok:` lines, every one of them
-    green on this host first, plus `abi`'s `waitid_info_reports_the_child_the_siginfo_way` and
+    green on this host first, plus     `abi`'s `waitid_info_reports_the_child_the_siginfo_way` and
     `waitid_info_spells_a_stop_and_a_resume_too`. Closes `docs/notes/` §15.11 (batch 18).
+
+18. **An absolute path makes the `*at` family stop asking about its dirfd — neither whether it
+    is open nor what kind it is.** Linux reads the name's first character before it touches the
+    descriptor (`path_init` before `fdget_raw`), so every member serves an absolute name through
+    a dirfd nothing is open on, and through one open on a *regular file*: measured on a current
+    host — Linux 7.2.9, `.workbuddy/probe_at_dirfd.c`, which calls each one through `syscall(2)`
+    because glibc rewrites `fchmodat`/`faccessat` into a `/proc/self/fd/<n>/<name>` open when the
+    dirfd is not `AT_FDCWD` — `newfstatat(1000, "/tmp", &st, 0)` with `1000` not open answers `0`,
+    and so do `openat`, `statx`, `faccessat2`, `readlinkat`, `utimensat`, `mkdirat`, `unlinkat`,
+    `symlinkat`, `renameat`, `renameat2`, `linkat` (both of its dirfds), `fchmodat`,
+    `fchmodat2`, `fchownat` and `mknodat`, while the same calls with a *relative* name answer
+    `EBADF` through a closed descriptor and `ENOTDIR` through a regular-file one. This kernel
+    resolved the descriptor first whatever the name looked like, so a caller holding a stale
+    dirfd and an absolute path took its fallback where Linux succeeded — and the same difference
+    was reachable through every one of those doors, because they all went through one `base_of`.
+    The name is read before the descriptor is now, and that order carries Linux's other half
+    with it: the name is copied in `getname()` before `path_init()`, so a name pointer the
+    kernel cannot read at all (a bad one, or a null one) is `EFAULT` rather than the descriptor's
+    `EBADF` — measured for every one of the nineteen doors. The two-name calls split into the two
+    shapes Linux has, both measured: `renameat`/`renameat2` read both *pointers* before either
+    descriptor (a missing old name beside a bad new dirfd is that descriptor's `EBADF`, while an
+    unreadable pointer is `EFAULT` on either side), and `linkat` asks its old name, its descriptor
+    and its walk *before it reads the new name at all*, so a missing old name is `ENOENT` with any
+    new-side answer — a bad new dirfd included, which alone would be `EBADF`. Owner:
+    `src/syscall/linux/fs/file.rs`'s `base_for` and its nineteen call sites. Pin: `t-newfstatat` on
+    **both** machines (the served pair, the relative `EBADF` kept beside them, and the `EFAULT`
+    order through a raw `libc::syscall`), `t-openat` (the same pair for the family's busiest
+    member) and `t-link` (the old-name-before-the-new-dirfd pair, whose two claims tell "asked
+    second" from "never asked"). Closes `docs/notes/` §15.17, except for the *empty* name's
+    precedence, which stays named in §5.2.

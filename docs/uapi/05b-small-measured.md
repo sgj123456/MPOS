@@ -5,17 +5,24 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
-- **An absolute path does not make the `*at` family ignore its dirfd.** Linux's rule is that
-  when the path is absolute the dirfd is not used at all, and it is the *dirfd* that stops
-  being a question rather than the path: measured here, `newfstatat(77, "/tmp", buf, 0)` with
-  `77` not open answers `0`, errno `0`. This kernel resolves the dirfd first whatever the path
-  looks like — one `base_of` does it for the whole family — so the same call answers `EBADF`.
-  Not a §3.2 defect (an honest refusal rather than a wrong number), but a caller holding a
-  stale dirfd and an absolute path takes its fallback where Linux succeeded, and the *same*
-  difference is reachable through `openat`, `unlinkat`, `linkat` and the rest. Owner:
-  `src/syscall/linux/fs/file.rs`'s `base_of` and its twenty call sites. `t-newfstatat`'s
-  bad-dirfd claim therefore names its path *relatively*, which is `EBADF` on both machines,
-  and does not pin this either way (S6 batch 12). `docs/notes/` §15.17.
+- **An empty name is answered `ENOENT` before the dirfd is looked at — by every door but one.**
+  Measured on a current host (`.workbuddy/probe_at_dirfd.c`, Linux 7.2.9, across all nineteen doors
+  this family reaches the kernel through): `newfstatat(1000, "", &st, 0)` with `1000` not open
+  answers `ENOENT`, and so do `statx` (without `AT_EMPTY_PATH`), `openat`, `openat2`, `faccessat`,
+  `faccessat2`, `utimensat`, `futimesat`, `mkdirat`, `unlinkat`, `symlinkat`, `renameat`,
+  `renameat2`, `linkat`, `fchmodat`, `fchmodat2`, `fchownat` and `mknodat` — an empty name has a
+  name-shaped answer of its own, and the descriptor is not consulted for it. `readlinkat` is the
+  one door that answers `EBADF` there, because its walk has no empty-name check in front of it;
+  `statx` under `AT_EMPTY_PATH` answers `EBADF` for a different reason, the descriptor being exactly
+  what it was asked to describe. This kernel reads the name first now (§5.1's item 18), so it has
+  the order right in one direction only: an empty name still reaches the descriptor, which answers
+  `EBADF` where the descriptor is bad and `ENOENT` from the walk where it is good — except in the
+  four handlers that already checked emptiness before the base (`newfstatat`, `statx`, `fchownat`,
+  `fchmodat2`), which answer `ENOENT` either way. Closing it is an empty-name check per handler,
+  before `base_for`, in each of the fourteen that has one on Linux — a per-call answer rather than
+  a mechanism, which is why it is named here instead of folded into that reorder. Owner:
+  `src/syscall/linux/fs/file.rs`'s `cstr_arg` callers. Pin: none yet — the claim lives in the probe
+  alone. `docs/notes/` §15.17.
 - **`F_GETFL` reports no access mode.** Linux ORs the descriptor's access mode into the word
   `fcntl(F_GETFL)` returns, so a descriptor opened `O_WRONLY` reports `1` (measured on a
   current host); this kernel reports the description's stored status word, whose access bits
