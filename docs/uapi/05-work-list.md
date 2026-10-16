@@ -343,3 +343,21 @@ the commit bodies), and each moved its pin in the same commit.
     member) and `t-link` (the old-name-before-the-new-dirfd pair, whose two claims tell "asked
     second" from "never asked"). Closes `docs/notes/` §15.17, except for the *empty* name's
     precedence, which stays named in §5.2.
+
+19. **An empty name is answered by the name — `ENOENT` — before the descriptor is asked
+    anything.** Measured on a current host across all nineteen doors of the family
+    (`.workbuddy/probe_at_dirfd.c`, Linux 7.2.9): an empty name answers `ENOENT` through a dirfd
+    nothing is open on, through one open on a *regular file* and through one open on a directory,
+    where the relative name beside it answers `EBADF`, `ENOTDIR` and the walk's `ENOENT`
+    respectively. This kernel reached the descriptor first, so the same call was `EBADF` (a stale
+    descriptor) or `ENOTDIR` (one naming a regular file) — a statement about the descriptor where
+    Linux's is about the name. It is the same rule the item above is, so it lives in the same
+    place: the refusal is in `base_for`, and every door inherits it from the one helper they all
+    come through rather than from a check of its own. `readlinkat` is the one door that must *not*
+    come through it with an empty name, and Linux is why: that call consults its descriptor first
+    (`EBADF` while it is not open) and only then refuses the empty name — `ENOENT` through a
+    regular-file dirfd as well, so its kind is not asked either — which its handler now says out
+    loud. Owner: `src/syscall/linux/fs/file.rs`'s `base_for` + `readlinkat`. Pin:
+    `t-at-empty-name` on **both** machines — 41 claims, one line per door over the three
+    descriptor shapes, plus the `readlinkat` exception's three. Closes `docs/uapi/` §5.2's
+    empty-name entry; what stays named there is `AT_EMPTY_PATH`'s own gap.

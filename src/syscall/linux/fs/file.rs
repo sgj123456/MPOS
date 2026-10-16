@@ -116,7 +116,22 @@ fn descriptor_file(fd: usize) -> VfsResult<Arc<dyn Inode>> {
 /// The cwd this answers for an absolute name is never dereferenced: an absolute
 /// name begins at the caller's root and the resolver ignores the start it is
 /// handed, which is what makes passing the cwd here enough.
+///
+/// **An empty name is refused here too**, and for the same reason: it is a
+/// question the *name* answers, so it comes before the descriptor is asked
+/// anything - neither whether it is open nor what kind it is. Measured for all
+/// nineteen doors (`.workbuddy/probe_at_dirfd.c`), an empty name answers
+/// `ENOENT` through a closed dirfd, one open on a regular file *and* one open on
+/// a directory, where the relative name beside it answers `EBADF`, `ENOTDIR` and
+/// the walk's `ENOENT` respectively. This kernel reached the descriptor first,
+/// so an empty name was `EBADF` or `ENOTDIR` - answers about the descriptor
+/// where Linux's is about the name. `readlinkat` is the one caller that must not
+/// come through here with an empty name and says so in its own comment: Linux
+/// consults *its* descriptor first and only then refuses the name.
 fn base_for(dirfd: i32, path: &str, cwd: &Arc<dyn Inode>) -> Result<Arc<dyn Inode>, isize> {
+    if path.is_empty() {
+        return Err(err::ENOENT);
+    }
     if path.starts_with('/') || dirfd == abi::AT_FDCWD {
         return Ok(cwd.clone());
     }
@@ -1199,6 +1214,13 @@ fn resolve_time(ts: &Utimespec, keep: u64, now: u64) -> Option<u64> {
 /// opens its target and then futimens it, so a NULL path with a plain-file fd is
 /// the everyday shape, not a corner. A null `times` sets both clocks to now; the
 /// `UTIME_NOW` / `UTIME_OMIT` sentinels resolve per clock.
+///
+/// Linux's *other* spelling of that same request - an empty name together with
+/// `AT_EMPTY_PATH`, measured to serve the descriptor too - is not served here:
+/// an empty name is the name's own answer in `base_for` now, so this door
+/// answers `ENOENT` where Linux answers `0` or the descriptor's own refusal.
+/// Named in `docs/uapi/` §5.2 with the probe's numbers rather than papered over;
+/// the NULL form above is what every caller this kernel has met actually uses.
 pub fn utimensat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     let (dirfd, path_ptr, times_ptr, flags) = (args[0] as i32, args[1], args[2], args[3]);
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
@@ -1767,6 +1789,14 @@ fn readlink_named(path: &str, buf: usize, size: usize, base: &Arc<dyn Inode>) ->
 /// an empty name with a dirfd nothing is open on is this call's one member whose
 /// answer is `EBADF` rather than `ENOENT`, because `do_readlinkat` has no
 /// empty-name check to place before the walk.
+///
+/// That is also why the empty name is answered here instead of in `base_for`,
+/// which refuses it for every other door: Linux consults *this* door's
+/// descriptor first (`EBADF` when it is not open) and then refuses the name, so
+/// the answer is `ENOENT` once the descriptor is open *whatever* it is - a
+/// regular file included, where `base_for`'s kind check would answer `ENOTDIR`
+/// and Linux does not (measured; `.workbuddy/probe_at_dirfd.c`). Each of the
+/// three shapes is pinned in `t-at-empty-name`.
 pub fn readlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     let (buf, size) = (args[2], args[3]);
     if size == 0 {
@@ -1776,6 +1806,16 @@ pub fn readlinkat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(path) => path,
         Err(e) => return e,
     };
+    // The name first, then this door's descriptor - only *whether* it is open,
+    // not what it names - and then the empty name's own answer.
+    if path.is_empty() {
+        if args[0] as i32 != abi::AT_FDCWD {
+            if let Err(e) = crate::sched::current_fds().clone_at(args[0] as i32) {
+                return err_of(e);
+            }
+        }
+        return err::ENOENT;
+    }
     let base = match base_for(args[0] as i32, &path, cwd) {
         Ok(base) => base,
         Err(e) => return e,
