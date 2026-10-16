@@ -58,17 +58,7 @@ Section numbers are unchanged from the original `UAPI.md`.
   are on Linux. Owner: `src/vfs/file.rs`'s `SETFL_MASK` and the `F_GETFL` arm, whose
   answer for `O_LARGEFILE` is a cross-machine decision (`t-open-flags` pins that this kernel
   ignores the flag on both machines today). `docs/notes/` §15.16.
-- **`waitid`'s record leaves `si_uid` zero.** Linux fills it with the child's
-  real uid (measured: 1000 for a child of this shell); this kernel's record
-  cannot, because it outlives the task's slot — a `waitid` that finds a retired
-  record reads a pid, a code, a group and a status, and the uid was never
-  carried. Closing it is one field on `Retired`, the shape `pgid` took when
-  `P_PGID` needed one, plus the live path's `credentials_of`. Owner:
-  `src/sched/runtime/task.rs` + `src/syscall/linux/proc.rs`. Pin: `t-waitid`
-  grows the claim, as `probe_waitid.c` measured the host's answer. This is the
-  one field of that record still answered with a zero. `docs/notes/` §15.11
-  (batch 18).
-
+- **The reported `F_GETFL` word holds the mode and the two flags, where Linux's holds more.**
 - **`__WCLONE` is accepted and ignored, where Linux narrows with it.** Measured
   on a current host: `waitid(P_ALL, 0, &si, WEXITED|__WCLONE)` answers `ECHILD`
   (errno 10) for a child that exits with `SIGCHLD`, because the bit means

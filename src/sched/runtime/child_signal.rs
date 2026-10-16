@@ -386,6 +386,22 @@ pub fn credentials_of(id: TaskId) -> Option<crate::cred::Credentials> {
     })
 }
 
+/// Another task's user and group identity, or `None` when no such task is
+/// live.
+///
+/// The shape [`credentials_of`] has, and it exists for the same reason: the
+/// caller is not the task, so `current_identity` cannot answer. `waitid`
+/// writes a *stopped* or *continued* child's real uid into its record, and
+/// those two events are reported while the child is still in the table - a
+/// death, which is not, carries the uid on the record instead
+/// ([`crate::sched::Retired`]).
+pub fn identity_of(id: TaskId) -> Option<Identity> {
+    with_table(|t| {
+        let task = t.tasks.get(id.0).and_then(Option::as_ref)?;
+        (!task.exited).then(|| task.identity.clone())
+    })
+}
+
 /// May the running task inspect `target` - the question `PTRACE_ATTACH` and
 /// `process_vm_readv`/`writev` both ask? The policy is
 /// [`crate::cred::ptrace_may_access`]; this gathers the two sides of it.

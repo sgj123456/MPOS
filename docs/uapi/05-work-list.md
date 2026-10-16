@@ -468,3 +468,31 @@ the commit bodies), and each moved its pin in the same commit.
     answers `EINVAL`; here the link's target is the descriptor's display string, which is not a
     path), and the *other* inode that reports `NodeKind::File` without being a regular file — a
     FIFO made by `mknod`, which is a pipe to Linux and a resizable file to this kernel.
+
+23. **`waitid`'s record carries the child's real uid.** `si_uid` was the one field of that record
+    this kernel answered with a zero, and the reason was structural rather than an oversight: the
+    record outlives the task's slot, and the uid was never carried on it, so a *death* had nothing
+    to read it from (`docs/uapi/` §5.2, and `docs/notes/` §15.11's batch 18, which named it rather
+    than guessing). Measured on a current host before the fix (`.workbuddy/probe_waitid.c`, through
+    `syscall(2)`): `si_uid` is the child's uid for **every** event class — `CLD_EXITED`,
+    `CLD_TRACED`, `CLD_STOPPED` and `CLD_CONTINUED` all carry it — while a call that faces no event
+    at all is a *cleared* record instead, so the zero written here was indistinguishable from
+    "nothing happened yet". Linux's answer is `task_uid(tsk)`, which is `cred->uid`: the **real**
+    uid, not the effective one. **The fix is the field that entry prescribed.** `Retired` grows a
+    `uid` (the shape `pgid` took when `P_PGID` needed one), taken at exit from the task's own
+    identity, and the *live* path — a stop or a resume, reported while the child is still in the
+    table — asks the new `sched::identity_of(id)` for it, the shape `credentials_of` has. The uid
+    rides `WaitEvent::Exited` too, because a collection takes the record out of the table before the
+    caller sees the event: `take_retired_for` now hands back the whole record rather than its code
+    (with `take_exit_code_current` the thin view `wait4` keeps, whose status word has no room for a
+    uid), and `write_waitid_info` writes it where the host record's own dump put it — `si_uid` at
+    offset 20, with its unit test reading that word back. Pin: `t-waitid`, whose record claims now
+    read `si_uid` for an exited, a stopped and a resumed child — each against the uid the child
+    actually ran as, so the claim means the same thing on either machine — plus three claims that
+    need a child which *moved* an id, because that is the one way to tell a real uid from an
+    effective one (and from the zero a record that never filled the field also carries). Moving an
+    id needs `CAP_SETUID`: the payload runs as root and has it, a hand host run often does not
+    (measured: this sandbox's shell has an empty effective capability set), so those are made where
+    they can be and named where they cannot — `t-posix`'s shape. 56 claims in a sweep, 49 in a host
+    run, and the privilege-dependent section moves the program's own real uid, which is why it is
+    the last thing the program does.

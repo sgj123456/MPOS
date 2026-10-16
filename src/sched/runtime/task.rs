@@ -325,6 +325,18 @@ pub(crate) struct Retired {
     /// its whole task; this kernel's record keeps the one field a selector
     /// needs.
     pub(crate) pgid: TaskId,
+    /// The real user id this task ran as when it exited.
+    ///
+    /// Carried for the same reason `pgid` is: the slot is free by the time a
+    /// record is read, and `waitid` owes the child's uid in the record it
+    /// writes. Linux reports `task_uid(tsk)` - `cred->uid`, the *real* id, not
+    /// the effective one - for every event class (measured on a current host:
+    /// `CLD_EXITED`, `CLD_STOPPED`, `CLD_TRACED` and `CLD_CONTINUED` all carry
+    /// it, while a call that faces no event at all is a cleared record
+    /// instead). This kernel answered a zero here until `docs/uapi/` §5.1
+    /// item 23, which is why the field is on the record rather than read from
+    /// the task.
+    pub(crate) uid: u32,
     /// The tracer this task died under, if any. A traced task's death is the
     /// tracer's to collect: the tracer reaps the corpse first, and only its
     /// taking releases the record to the real parent - the same
@@ -1985,7 +1997,12 @@ impl WaitFor {
 #[derive(Clone, Copy)]
 pub enum WaitEvent {
     /// A death to collect.
-    Exited { id: TaskId, code: isize },
+    ///
+    /// The uid rides the event because the record does not reach the caller: a
+    /// collection takes the record out of the table, and `waitid` owes the
+    /// child's real uid beside the code it writes. A stop or a resume needs no
+    /// such field - the child is alive, so its identity is still in the table.
+    Exited { id: TaskId, code: isize, uid: u32 },
     /// A stop to report: the signal `WSTOPSIG` names, and the `PTRACE_EVENT_*`
     /// the status word's high byte carries.
     ///

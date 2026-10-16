@@ -469,7 +469,9 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// way its `W`-macro decodes it: a death, a stop, or a resume.
 fn finish_wait_event(event: crate::sched::WaitEvent, status: usize, from_user: bool) -> isize {
     match event {
-        crate::sched::WaitEvent::Exited { id, code } => finish_wait(id, code, status, from_user),
+        crate::sched::WaitEvent::Exited { id, code, .. } => {
+            finish_wait(id, code, status, from_user)
+        }
         // `traced` is `waitid`'s question, not this door's: the status word
         // `WSTOPSIG`/`WIFSTOPPED` read says "stopped" either way, and a traced
         // stop's `PTRACE_EVENT_*` is what carries the rest.
@@ -3877,10 +3879,18 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
     // The siginfo layout, and the `CLD_*` code each event class writes, are
     // the ABI the libc's `W` macros and `waitid` wrappers read; it is spelled
     // in `abi`, tested on the host.
-    let (child, si_code, status) = match event {
-        crate::sched::WaitEvent::Exited { id, code } => {
+    //
+    // `si_uid` comes with the event, and the two paths have it differently: a
+    // death outlives its task slot, so the record it was collected from carries
+    // the uid, while a stop or a resume names a child that is still in the
+    // table and is asked through its identity. Linux fills it for all three
+    // (measured: `CLD_EXITED`, `CLD_STOPPED`, `CLD_TRACED` and `CLD_CONTINUED`
+    // all report the child's real uid) and reports `cred->uid` - the real id,
+    // not the effective one.
+    let (child, si_code, status, uid) = match event {
+        crate::sched::WaitEvent::Exited { id, code, uid } => {
             let (si_code, status) = abi::exit_chld(code);
-            (id, si_code, status)
+            (id, si_code, status, uid)
         }
         // A stop under a tracer and a stop for the parent are two codes
         // (measured: `CLD_TRAPPED` and `CLD_STOPPED`), and the event's own word
@@ -3892,13 +3902,26 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
             id,
             if traced { CLD_TRAPPED } else { CLD_STOPPED },
             signal as i32,
+            live_uid(id),
         ),
-        crate::sched::WaitEvent::Continued { id } => (id, CLD_CONTINUED, signal::SIGCONT as i32),
+        crate::sched::WaitEvent::Continued { id } => {
+            (id, CLD_CONTINUED, signal::SIGCONT as i32, live_uid(id))
+        }
     };
     // The child's number in the *caller's* namespace, the same answer `wait4`
     // returns: a reader one level out sees the number it can use, and a reader
     // inside the child's own namespace sees 1.
-    abi::write_waitid_info(infop, wait_answer(child) as u32, si_code, status)
+    abi::write_waitid_info(infop, wait_answer(child) as u32, uid, si_code, status)
+}
+
+/// The real uid of a child that is still in the task table, for the two event
+/// classes that are reported while it is alive. Zero when there is nothing left
+/// to ask - a task that exited and was reaped between the event and this read
+/// - which is the same zero a cleared record carries.
+fn live_uid(id: crate::sched::TaskId) -> u32 {
+    crate::sched::identity_of(id)
+        .map(|identity| identity.ruid)
+        .unwrap_or(0)
 }
 
 // The legacy `getrlimit`/`setrlimit` pair, `prlimit64` and `membarrier`

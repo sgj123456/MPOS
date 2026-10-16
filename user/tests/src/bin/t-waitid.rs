@@ -31,17 +31,34 @@
 //!   clearing happens before the refusal for every refusal this door has - which
 //!   is why each of the three below reads the record back.
 //!
-//! Two divergences stay, and are named rather than hidden:
+//! One divergence stays, and it is named rather than hidden:
 //!
 //! * **`P_PIDFD` is `EINVAL`.** Linux answers `EBADF` for a descriptor that is
 //!   not a pidfd (measured: fd 9999, errno 9) and serves a real one. This kernel
 //!   has no pidfd family - `pidfd_open`, `clone3(CLONE_PIDFD)` and
 //!   `pidfd_send_signal` are all absent - so no descriptor can name a task here,
 //!   and a refusal is the honest answer (`docs/uapi/` §5.3).
-//! * **`si_uid` is zero.** Linux fills the child's real uid (measured: 1000).
-//!   The record has to survive the task's slot being reaped, and this kernel's
-//!   record carries the pid, the code and the group but not the uid
-//!   (`docs/uapi/` §5.2).
+//!
+//! **`si_uid` is the child's real uid, and it is the record's now** (`docs/uapi/`
+//! §5.1 item 23): the kernel carries it on `Retired`, because a death outlives
+//! the task's slot, and asks the live identity for a stop or a resume, which are
+//! reported while the child is still in the table. Measured on a current host
+//! before the claims were written (`.workbuddy/probe_waitid.c`): `CLD_EXITED`,
+//! `CLD_TRACED`, `CLD_STOPPED` and `CLD_CONTINUED` all report the child's uid,
+//! while a call that faces no event at all is a cleared record instead.
+//!
+//! The last section adds the claims that tell that uid from the zero the bug
+//! wrote, and it needs a *privilege* to make them: it moves the program's own
+//! real uid (to `MOVED`) while keeping its effective one, so the children it
+//! forks from there on have two different ids for the record to choose between -
+//! a record that reports the real uid answers `MOVED` where one that reports the
+//! effective id, or never filled the field, answers 0. Moving an id needs
+//! `CAP_SETUID`, which the payload has (it runs as root) and a hand host run
+//! often does not (measured: this sandbox's shell has an empty effective
+//! capability set, and its uid is already `MOVED`, so nothing there would move
+//! anyway); that section is therefore made where it can be and named where it
+//! cannot, in `t-posix`'s shape rather than hidden behind the flag. Everything
+//! before it runs under the identity the runner handed over.
 //!
 //! A wait with no matching child at all is `ECHILD`, and that is pinned here: a
 //! second wait for a child already collected must answer it rather than park.
@@ -149,6 +166,43 @@ fn child_that_exits(code: i32) -> libc::pid_t {
     let kid = unsafe { libc::fork() };
     if kid == 0 {
         leave(code);
+    }
+    kid
+}
+
+/// The same, with one of its uids moved first - the child that tells `si_uid`'s
+/// *real* id from its effective one. `None` leaves that id alone, which is what
+/// `setresuid`'s `-1` says, and the child leaves with `2` when the move is
+/// refused so a claim that reads `si_status` cannot pass vacuously on a child
+/// that never moved anything.
+fn child_with_ids(real: Option<u32>, effective: Option<u32>) -> libc::pid_t {
+    let kid = unsafe { libc::fork() };
+    if kid == 0 {
+        let none = -1i32 as libc::uid_t;
+        let stored = |id: Option<u32>| id.map_or(none, |uid| uid as libc::uid_t);
+        let moved = unsafe { libc::setresuid(stored(real), stored(effective), none) };
+        leave(if moved == 0 { 0 } else { 2 });
+    }
+    kid
+}
+
+/// The same with a `SIGSTOP` after the move, so the *live* path - the record a
+/// stop writes while the child is still in the task table - reports the moved
+/// id too.
+fn child_with_ids_stopping(real: Option<u32>) -> libc::pid_t {
+    let kid = unsafe { libc::fork() };
+    if kid == 0 {
+        let none = -1i32 as libc::uid_t;
+        let stored = |id: Option<u32>| id.map_or(none, |uid| uid as libc::uid_t);
+        let moved = unsafe { libc::setresuid(stored(real), none, none) };
+        if moved != 0 {
+            leave(2);
+        }
+        unsafe {
+            libc::raise(libc::SIGSTOP);
+        }
+        sleep_ms(1500);
+        leave(0);
     }
     kid
 }
@@ -276,6 +330,10 @@ fn main() {
         r.check(
             "si_status is the exit code 3",
             unsafe { info.si_status() } == 3,
+        );
+        r.check(
+            "si_uid is the uid the child ran as",
+            unsafe { info.si_uid() } == unsafe { libc::getuid() },
         );
 
         // A second wait for a child already collected: no child is left, so
@@ -511,11 +569,19 @@ fn main() {
                     "si_status is the stopping signal",
                     unsafe { info.si_status() } == libc::SIGSTOP,
                 );
+                // A stop is reported while the child is still in the task
+                // table, so its uid comes from the live identity rather than
+                // from a record - and Linux fills it here too (measured).
+                r.check(
+                    "si_uid is the stopped child's uid",
+                    unsafe { info.si_uid() } == unsafe { libc::getuid() },
+                );
             }
             None => {
                 r.check("a stopped child is reported by WSTOPPED", false);
                 r.check("si_code says a stop", false);
                 r.check("si_status is the stopping signal", false);
+                r.check("si_uid is the stopped child's uid", false);
             }
         }
 
@@ -534,10 +600,15 @@ fn main() {
                     "with the continuing signal as its status",
                     unsafe { info.si_status() } == libc::SIGCONT,
                 );
+                r.check(
+                    "si_uid is the resumed child's uid",
+                    unsafe { info.si_uid() } == unsafe { libc::getuid() },
+                );
             }
             None => {
                 r.check("a resumed child is reported by WCONTINUED", false);
                 r.check("with the continuing signal as its status", false);
+                r.check("si_uid is the resumed child's uid", false);
             }
         }
 
@@ -580,6 +651,104 @@ fn main() {
             waitid(libc::P_PID, kept, &mut collected, libc::WEXITED) == 0
                 && unsafe { collected.si_status() } == 9,
         );
+    }
+
+    // ---- `si_uid` is the child's *real* id, and only an asymmetry makes that
+    // ---- a claim
+    //
+    // Linux documents `si_uid` as "the real user ID of the process" and fills
+    // it for every event class - measured on a current host with
+    // `.workbuddy/probe_waitid.c`: `CLD_EXITED`, `CLD_TRACED`, `CLD_STOPPED`
+    // and `CLD_CONTINUED` all carry the child's uid, while a call that faces no
+    // event at all is a cleared record instead. The three checks above read it
+    // off a child that changed nothing, which a record left at zero would also
+    // pass.
+    //
+    // Moving an id does not fix that on its own: the payload runs as **root**,
+    // so a child moved to some other uid would still be compared against the
+    // zero the bug writes. What makes the difference is an *asymmetry* - a
+    // process whose real and effective ids differ - and the payload can have
+    // one, because root may move its own real id while keeping its effective
+    // one: after the call below this program is `ruid = MOVED, euid = 0`, and
+    // every child it forks from here on inherits exactly that. So a record that
+    // reports the *real* uid answers `MOVED`, while one that reports the
+    // effective id - or never filled the field - answers 0, which is the
+    // counterfactual these claims are written against. Moving an id needs
+    // `CAP_SETUID`, which the payload has and a hand host run often does not
+    // (measured: this sandbox's shell has an empty effective capability set,
+    // and its uid is already `MOVED`, so nothing here would move); the claims
+    // are therefore made where they can be and named where they cannot, in
+    // `t-posix`'s shape.
+    //
+    // Nothing has to exist under `MOVED` or `ELSEWHERE`: what is pinned is that
+    // the *number* in the record is the one the child's real id became.
+    const MOVED: u32 = 1000;
+    const ELSEWHERE: u32 = 1234;
+
+    if mpos_user_tests::host_run() {
+        println!(
+            "note: a child's uid cannot be moved without CAP_SETUID, so the si_uid claims below are not made on this host run"
+        );
+    } else {
+        // `u32::MAX` is `setresuid`'s "-1": leave that id alone.
+        let asymmetric = unsafe { libc::setresuid(MOVED, u32::MAX, u32::MAX) } == 0;
+        r.check(
+            "the program can move its own real uid (CAP_SETUID) and keep euid 0",
+            asymmetric,
+        );
+        if asymmetric {
+            // An ordinary child, whose inherited real id is `MOVED` and whose
+            // effective id is root's: the real one is what the record owes.
+            let inherited = child_with_ids(None, None);
+            r.check("an asymmetric child was forked", inherited > 0);
+            if inherited > 0 {
+                let mut info = poisoned();
+                r.check(
+                    "si_uid is the child's real uid, not its effective one",
+                    waitid(libc::P_PID, inherited, &mut info, libc::WEXITED) == 0
+                        && unsafe { info.si_status() } == 0
+                        && unsafe { info.si_uid() } == MOVED,
+                );
+            }
+
+            // The same child moving its real id once more, so what is pinned is
+            // that the field follows the real id rather than the value it started
+            // at.
+            let moved_again = child_with_ids(Some(ELSEWHERE), None);
+            r.check(
+                "a child that moves its real uid again was forked",
+                moved_again > 0,
+            );
+            if moved_again > 0 {
+                let mut info = poisoned();
+                r.check(
+                    "and the record follows it: the moved id is the one reported",
+                    waitid(libc::P_PID, moved_again, &mut info, libc::WEXITED) == 0
+                        && unsafe { info.si_status() } == 0
+                        && unsafe { info.si_uid() } == ELSEWHERE,
+                );
+            }
+
+            // The live path: a *stopped* child's record is written while it is
+            // still in the task table, so its uid is asked of the task rather than
+            // carried on a record - and it is the same real id.
+            let stopped = child_with_ids_stopping(None);
+            r.check("an asymmetric child that stops was forked", stopped > 0);
+            if stopped > 0 {
+                match await_event(stopped, libc::WSTOPPED) {
+                    Some(info) => r.check(
+                        "a stopped child's si_uid is its real id too",
+                        info.si_code == libc::CLD_STOPPED && unsafe { info.si_uid() } == MOVED,
+                    ),
+                    None => r.check("a stopped child's si_uid is its real id too", false),
+                }
+                unsafe {
+                    libc::kill(stopped, libc::SIGKILL);
+                    let mut info = poisoned();
+                    let _ = waitid(libc::P_PID, stopped, &mut info, libc::WEXITED);
+                }
+            }
+        }
     }
 
     r.finish()

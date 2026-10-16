@@ -1243,16 +1243,29 @@ pub(crate) fn exit_chld(code: isize) -> (i32, i32) {
 /// the stopping signal, a resume is `CLD_CONTINUED` with `SIGCONT`), so the
 /// code is the caller's to choose and this writes it verbatim.
 ///
-/// `si_uid` is left zero, which is a *named* divergence rather than one by
-/// omission: Linux fills the child's real uid, and this kernel's record cannot
-/// - the task is gone by the time a retired record is read, and the record does
-/// not carry the uid (`docs/uapi/` §5.2 has the measurement).
-pub(crate) fn write_waitid_info(infop: usize, pid: u32, si_code: i32, status: i32) -> isize {
+/// `si_uid` is the child's real user id, and the caller hands it in because no
+/// single accessor can answer for both paths: a *stop* or a *resume* names a
+/// child that is still in the task table (`sched::identity_of`), while a
+/// *death* outlives its slot and carries the uid on the record it came from
+/// (`WaitEvent::Exited`). Linux fills it for every event class - `task_uid`
+/// is `cred->uid`, the real id rather than the effective one, and measured on
+/// a current host, `CLD_EXITED`, `CLD_STOPPED`, `CLD_TRACED` and
+/// `CLD_CONTINUED` all carry it - while a call that faces no event at all is a
+/// cleared record instead. This kernel answered a zero here until `docs/uapi/`
+/// §5.1 item 23.
+pub(crate) fn write_waitid_info(
+    infop: usize,
+    pid: u32,
+    uid: u32,
+    si_code: i32,
+    status: i32,
+) -> isize {
     unsafe {
         core::ptr::write_bytes(infop as *mut u8, 0, SIGINFO_BYTES);
         (infop as *mut i32).write_unaligned(SIGCHLD); // si_signo
         ((infop + 8) as *mut i32).write_unaligned(si_code); // si_code
         ((infop + 16) as *mut i32).write_unaligned(pid as i32); // si_pid
+        ((infop + 20) as *mut i32).write_unaligned(uid as i32); // si_uid
         ((infop + 24) as *mut i32).write_unaligned(status); // si_status
     }
     0
@@ -3140,32 +3153,34 @@ mod tests {
         }
     }
 
-    /// `waitid(2)`: the siginfo_t fields `si_signo`, `si_code`, `si_pid`
-    /// and `si_status` at their struct offsets, with the CLD_* code
+    /// `waitid(2)`: the siginfo_t fields `si_signo`, `si_code`, `si_pid`,
+    /// `si_uid` and `si_status` at their struct offsets, with the CLD_* code
     /// distinguishing an exit from a kill.
     #[test]
     fn waitid_info_reports_the_child_the_siginfo_way() {
         let mut buf = [0u8; 128];
         let (code, status) = exit_chld(7);
         assert_eq!(
-            write_waitid_info(buf.as_mut_ptr() as usize, 42, code, status),
+            write_waitid_info(buf.as_mut_ptr() as usize, 42, 1000, code, status),
             0
         );
         let word = |at: usize| i32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
         assert_eq!(word(0), 17); // si_signo: SIGCHLD
         assert_eq!(word(8), 1); // si_code: CLD_EXITED
         assert_eq!(word(16), 42); // si_pid
+        assert_eq!(word(20), 1000); // si_uid: the child's real uid
         assert_eq!(word(24), 7); // si_status: the exit code
 
         // Killed: the status is the signal number, the code says so.
         let mut buf2 = [0u8; 128];
         let (code, status) = exit_chld(-15);
         assert_eq!(
-            write_waitid_info(buf2.as_mut_ptr() as usize, 5, code, status),
+            write_waitid_info(buf2.as_mut_ptr() as usize, 5, 0, code, status),
             0
         );
         let word2 = |at: usize| i32::from_le_bytes(buf2[at..at + 4].try_into().unwrap());
         assert_eq!(word2(8), 2); // CLD_KILLED
+        assert_eq!(word2(20), 0); // a root child's uid is zero, and is written
         assert_eq!(word2(24), 15);
         // Everything else is zeroed, so no stale caller byte survives.
         assert!(buf2[28..].iter().all(|&b| b == 0));
@@ -3181,24 +3196,27 @@ mod tests {
         let word =
             |buf: &[u8; 128], at: usize| i32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
 
-        // A `WSTOPPED` record: the stopping signal is the status.
+        // A `WSTOPPED` record: the stopping signal is the status, and the
+        // child's uid rides beside its number.
         let mut stopped = [0u8; 128];
-        let _ = write_waitid_info(stopped.as_mut_ptr() as usize, 9, CLD_STOPPED, 19);
+        let _ = write_waitid_info(stopped.as_mut_ptr() as usize, 9, 1000, CLD_STOPPED, 19);
         assert_eq!(word(&stopped, 0), 17);
         assert_eq!(word(&stopped, 8), 5);
         assert_eq!(word(&stopped, 16), 9);
+        assert_eq!(word(&stopped, 20), 1000);
         assert_eq!(word(&stopped, 24), 19);
 
         // The same shape under a tracer is a different code, not a different
         // record - which is why the handler chooses and this writes verbatim.
         let mut trapped = [0u8; 128];
-        let _ = write_waitid_info(trapped.as_mut_ptr() as usize, 9, CLD_TRAPPED, 19);
+        let _ = write_waitid_info(trapped.as_mut_ptr() as usize, 9, 1000, CLD_TRAPPED, 19);
         assert_eq!(word(&trapped, 8), 4);
 
         // A resume: `SIGCONT` (18) is the status.
         let mut resumed = [0u8; 128];
-        let _ = write_waitid_info(resumed.as_mut_ptr() as usize, 9, CLD_CONTINUED, 18);
+        let _ = write_waitid_info(resumed.as_mut_ptr() as usize, 9, 1000, CLD_CONTINUED, 18);
         assert_eq!(word(&resumed, 8), 6);
+        assert_eq!(word(&resumed, 20), 1000);
         assert_eq!(word(&resumed, 24), 18);
     }
 

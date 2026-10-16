@@ -205,7 +205,16 @@ pub fn exit(code: isize) -> ! {
             crate::hal::halt();
         }
         t.task_mut(id).exited = true;
-        record_retired(id, code, t.task(id).pgid, t.task(id).trace.tracer);
+        record_retired(
+            id,
+            code,
+            t.task(id).pgid,
+            t.task(id).trace.tracer,
+            // The real uid, taken here because the slot is what holds it: the
+            // record outlives the task, and `waitid` reads its answer from the
+            // record (`Retired::uid`).
+            t.task(id).identity.ruid,
+        );
 
         // Linux's `forget_original_parent`: a process that exits hands every
         // child that was still its own to init. Without this a zombie keeps a
@@ -453,7 +462,7 @@ pub fn exit_code(id: TaskId) -> Option<isize> {
 /// parent to release to, and leaving the record in place would report the same
 /// death a second time to the same waiter, whose tcb is already gone. It comes
 /// out instead.
-pub(crate) fn take_exit_code_for(t: &Table, id: TaskId, me: TaskId) -> Option<isize> {
+pub(crate) fn take_retired_for(t: &Table, id: TaskId, me: TaskId) -> Option<Retired> {
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
         let at = retired.iter().rposition(|retired| retired.id == id)?;
@@ -466,16 +475,16 @@ pub(crate) fn take_exit_code_for(t: &Table, id: TaskId, me: TaskId) -> Option<is
                 .is_none_or(|task| task.parent == Some(me));
         if also_parent {
             SIGCHLD_PENDING.borrow(cs).borrow_mut().retain(|p| *p != id);
-            return Some(retired.remove(at).code);
+            return Some(retired.remove(at));
         }
         if retired[at].tracer == Some(me) {
             retired[at].tracer = None;
-            return Some(retired[at].code);
+            return Some(retired[at]);
         }
         // The code is collected - so the signal about it can never be read
         // again, and a stale entry must not name a slot a new task owns.
         SIGCHLD_PENDING.borrow(cs).borrow_mut().retain(|p| *p != id);
-        Some(retired.remove(at).code)
+        Some(retired.remove(at))
     })
 }
 
@@ -581,7 +590,7 @@ pub fn discard_exit_code(id: TaskId) {
     take_exit_code(id);
 }
 
-fn record_retired(id: TaskId, code: isize, pgid: TaskId, tracer: Option<TaskId>) {
+fn record_retired(id: TaskId, code: isize, pgid: TaskId, tracer: Option<TaskId>, uid: u32) {
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
         if retired.len() == RETIRED_CAP {
@@ -596,6 +605,7 @@ fn record_retired(id: TaskId, code: isize, pgid: TaskId, tracer: Option<TaskId>)
             id,
             code,
             pgid,
+            uid,
             tracer,
         });
         // The signal the exit carries: pending until a signalfd reader takes
@@ -1819,6 +1829,7 @@ fn scan_child_event(
             .map(|retired| WaitEvent::Exited {
                 id: retired.id,
                 code: retired.code,
+                uid: retired.uid,
             })
     })
 }
@@ -1832,7 +1843,11 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
         // is the one taken here, because between the look and the take another
         // waiter could have collected it.
         WaitEvent::Exited { id, .. } => {
-            take_exit_code_for(t, id, t.current).map(|code| WaitEvent::Exited { id, code })
+            take_retired_for(t, id, t.current).map(|retired| WaitEvent::Exited {
+                id,
+                code: retired.code,
+                uid: retired.uid,
+            })
         }
         WaitEvent::Stopped {
             id,
@@ -2028,16 +2043,27 @@ pub fn block_until_child_event(id: TaskId, stops: bool, continues: bool) -> Wait
     if let Some(event) = take_child_event(id, stops, continues) {
         return WaitPark::Event(event);
     }
-    match take_exit_code_current(id) {
-        Some(code) => WaitPark::Event(WaitEvent::Exited { id, code }),
+    match take_retired_current(id) {
+        Some(retired) => WaitPark::Event(WaitEvent::Exited {
+            id,
+            code: retired.code,
+            uid: retired.uid,
+        }),
         None => WaitPark::NoChild,
     }
 }
 
-/// [`take_exit_code_for`] for the running task - the shape a `waitpid(pid)`
+/// [`take_retired_for`] for the running task - the shape a `waitpid(pid)`
 /// call lands in, where the collector is the caller itself.
+pub(crate) fn take_retired_current(id: TaskId) -> Option<Retired> {
+    with_table(|t| take_retired_for(t, id, t.current))
+}
+
+/// The code alone, for the door that collects nothing but it: `wait4`'s status
+/// word has no field for the uid `waitid` wants, and taking the record is what
+/// makes the code this collector's.
 pub fn take_exit_code_current(id: TaskId) -> Option<isize> {
-    with_table(|t| take_exit_code_for(t, id, t.current))
+    take_retired_current(id).map(|retired| retired.code)
 }
 
 /// The paging root `id` runs on: its own address space's, or its thread group's
