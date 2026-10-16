@@ -22,6 +22,13 @@
 //!   `setgroups` to `deny` is what lets an unprivileged writer set the gid map -
 //!   and once the gid map exists `setgroups` cannot be turned back on.
 //!
+//! The same rule governs what a *file* reports: an id is stored once, in the
+//! parent namespace's numbering, and `stat`'s `st_uid`/`st_gid` (and `statx`'s
+//! `stx_uid`/`stx_gid`) are that stored id mapped through the **reader's** table.
+//! The two halves are one mechanism observed twice, so this program asks both -
+//! a file created before the unshare reads the stored id from the machine map and
+//! the inside id from the new one, with nothing about the file changed.
+//!
 //! # The doors
 //!
 //! `rustix::thread` wraps `unshare`, but the claims here are about the *numbers*
@@ -50,7 +57,7 @@
 //! which is where a rule that needs two privilege levels belongs.
 
 use mpos_user_tests::{Report, host_run};
-use rustix::fs::{CWD, Mode, OFlags, openat};
+use rustix::fs::{AtFlags, CWD, Mode, OFlags, StatxFlags, openat};
 use rustix::io::{Errno, read, write};
 
 /// The ids of a real kernel's identity map, as the map file prints them.
@@ -156,6 +163,34 @@ fn main() {
         outer == unsafe { libc::geteuid() } as u32,
     );
 
+    // ---- The other half of the same translation: what a *file* reports ----
+    //
+    // `getuid` reads the ids the task stores about itself; `stat` reads the ids
+    // an inode stores, and an inode keeps the id it was stamped with. Creating
+    // the file *before* the unshare is what makes the boundary sharp: from here
+    // the machine map is the identity, so its owner reads back as the stored id,
+    // and the same file read from inside the new namespace reads the inside id -
+    // the only thing that moved is the observer.
+    let owned = "/tmp/mpos-userns-owner";
+    let mut created = false;
+    if let Ok(fd) = openat(
+        CWD,
+        owned,
+        OFlags::CREATE | OFlags::WRONLY | OFlags::TRUNC,
+        Mode::from_raw_mode(0o644),
+    ) {
+        created = true;
+        let _ = write(&fd, b"owned\n");
+    }
+    let before = rustix::fs::lstat(owned).ok();
+    r.check(
+        "a file's owner reads back as the stored id under the identity map",
+        created
+            && before
+                .as_ref()
+                .is_some_and(|m| m.st_uid == outer && m.st_gid == outer),
+    );
+
     // The machine's map is already written, so a write to it is refused - there
     // is nothing left for it to say.
     r.check(
@@ -230,6 +265,48 @@ fn main() {
         "setgroups cannot be turned back on once the gid map exists",
         write_file("/proc/self/setgroups", "allow\n") == -(libc::EPERM as isize),
     );
+
+    // ---- The same file, observed from inside the new namespace ----
+    //
+    // The claim cannot pass by accident: the inside id is **7**, a number no
+    // stored id here is, so `st_uid == 7` is only possible if the kernel mapped
+    // the stored id through the namespace's table. Without the translation this
+    // reports the stored id (`0` here, `outer` on a host), which is exactly the
+    // counterfactual the `getuid` half was written against.
+    let inside = rustix::fs::lstat(owned).ok();
+    r.check(
+        "the same file, read from inside, reports the inside id the map gave it",
+        inside
+            .as_ref()
+            .is_some_and(|m| m.st_uid == 7 && m.st_gid == 7),
+    );
+
+    // A file created *inside* is stamped with the caller's stored id too, and is
+    // observed the same way - creation and observation agree.
+    let made_inside = "/tmp/mpos-userns-created-inside";
+    let created_inside = openat(
+        CWD,
+        made_inside,
+        OFlags::CREATE | OFlags::WRONLY | OFlags::TRUNC,
+        Mode::from_raw_mode(0o644),
+    )
+    .is_ok();
+    r.check(
+        "a file made inside reads the same inside id",
+        created_inside
+            && rustix::fs::lstat(made_inside).is_ok_and(|m| m.st_uid == 7 && m.st_gid == 7),
+    );
+    let _ = rustix::fs::unlink(made_inside);
+
+    // `statx` is the other door to the same question, and two answers to one
+    // question that disagree are worse than two that are both approximate.
+    match rustix::fs::statx(CWD, owned, AtFlags::empty(), StatxFlags::BASIC_STATS) {
+        Ok(x) => r.check(
+            &format!("statx agrees ({}, {})", x.stx_uid, x.stx_gid),
+            x.stx_uid == 7 && x.stx_gid == 7,
+        ),
+        Err(_) => r.check("statx agrees with stat", false),
+    }
 
     // ---- A child born here is in the same namespace, reading the same ids ----
     let report = rustix::pipe::pipe();
@@ -311,6 +388,7 @@ fn main() {
         Err(_) => r.check("the namespace descriptor is openable", false),
     }
 
+    let _ = rustix::fs::unlink(owned);
     let _ = Errno::INVAL;
     r.finish();
 }

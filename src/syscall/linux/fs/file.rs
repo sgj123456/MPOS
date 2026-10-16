@@ -44,6 +44,25 @@ use crate::drivers::uinput::Uinput;
 #[cfg(target_os = "none")]
 use crate::drivers::virtio::input::EvdevNode;
 
+/// The owner an inode reports as, translated through the *reading* task's user
+/// namespace: an id is stored once, in the parent namespace's numbering, and
+/// every observation of it is mapped at the boundary (§6.3, USER - a mapping is
+/// a translation, not a rename).
+///
+/// The translation belongs here rather than in `vfs` because it is the *reader*
+/// that is being rendered: `Inode::owner()` is the stored id and stays the
+/// stored id, since every permission check compares it against the caller's
+/// stored identity (`vfs::may_as`, the sticky-bit rule in `may_remove`), and a
+/// `vfs` that translated its own answers would refuse the wrong callers. The
+/// boundary the map applies at is the ABI write, and `stat`, `fstat`,
+/// `fstatat` and `statx` all render the stored id through here. A task that
+/// never unshares reads its own ids back unmoved, because the machine's map is
+/// the identity.
+fn observed_owner(owner: (u32, u32)) -> (u32, u32) {
+    let ns = crate::sched::current_user_ns();
+    (ns.uid_to_inner(owner.0), ns.gid_to_inner(owner.1))
+}
+
 /// The file a `linkat` source name leads to, with `AT_SYMLINK_FOLLOW`.
 ///
 /// The ordinary walk follows stored links and stops at a *descriptor's*
@@ -476,7 +495,16 @@ pub fn fstat(args: [usize; ARG_COUNT]) -> isize {
             }
             Err(e) => return err_of(e),
         };
-    write_stat(buf, &meta, dev, rdev, stored, nlink, owner, times)
+    write_stat(
+        buf,
+        &meta,
+        dev,
+        rdev,
+        stored,
+        nlink,
+        observed_owner(owner),
+        times,
+    )
 }
 
 /// `flock(fd, operation)` - the advisory whole-file lock `apk` takes on its
@@ -713,7 +741,16 @@ pub fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
                 }
                 Err(e) => return err_of(e),
             };
-        return write_stat(buf, &meta, dev, rdev, stored, nlink, owner, times);
+        return write_stat(
+            buf,
+            &meta,
+            dev,
+            rdev,
+            stored,
+            nlink,
+            observed_owner(owner),
+            times,
+        );
     }
     let base = match base_of(dirfd, cwd) {
         Ok(base) => base,
@@ -756,7 +793,16 @@ pub fn newfstatat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         }
     };
     let dev = crate::vfs::mount::dev_of_path(&absolute(&path));
-    write_stat(buf, &meta, dev, rdev, stored, nlink, owner, times)
+    write_stat(
+        buf,
+        &meta,
+        dev,
+        rdev,
+        stored,
+        nlink,
+        observed_owner(owner),
+        times,
+    )
 }
 
 /// `statx(dirfd, path, flags, mask, buf)` - the extended stat uutils calls.
@@ -858,7 +904,17 @@ pub fn statx(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // `STATX_BASIC_STATS` mask answer - is the ABI, and lives in `abi` where the
     // host tests can walk it field by field. This side only resolves what the
     // struct says.
-    abi::write_statx(buf, mask, &meta, dev, stored, rdev, nlink, owner, times)
+    abi::write_statx(
+        buf,
+        mask,
+        &meta,
+        dev,
+        stored,
+        rdev,
+        nlink,
+        observed_owner(owner),
+        times,
+    )
 }
 
 /// The `access` question, for all three spellings: may the process whose ids

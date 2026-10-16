@@ -78,10 +78,13 @@ One-glance status of the whole roadmap.
   `vfs::ns::Entry::ALL` against `namespaces(7)`'s list of eight. **USER joined on 2026-10-16**: it
   moves its caller like NET, the map starts empty so the caller lands on the overflow id, `uid_map`
   takes one self-naming line and then answers `EPERM`, and the four `getuid`-family readers
-  translate the stored id through the task's namespace (`t-ns-user`, 23 claims). What the kind's
-  last measured row leaves named is the same translation on the **`stat`** side - the inode layer
-  must learn whose ids it is rendering - and the capability grant, which this credential model
-  cannot yet tell apart from being root
+  translate the stored id through the task's namespace (`t-ns-user`, 27 claims). The same
+  translation renders what a *file* reports now: `stat`/`fstat`/`fstatat`/`statx` map the stored
+  owner through the reader's namespace, so a file created before an unshare reads the stored id
+  from the machine map and the inside id from the new one, `statx` agreeing with `stat` (§6.3,
+  measured on the host first). What stays named is the capability grant, which this credential
+  model cannot yet tell apart from being root, and the `SO_PEERCRED`/`SCM_CREDENTIALS` pair, a
+  different family carrying the same stored-id shape
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
@@ -219,10 +222,12 @@ In the order that keeps each step verifiable on its own:
    single self-naming line once and nothing else, `gid_map` waits for `setgroups=deny`, there is no
    `user_for_children`, `clone` is a door on Linux and `setns` into one's own is `EINVAL`). What
    landed is the map object and the translation at the four `getuid`-family readers, pinned in 23
-   claims; what the measurement's last row - a mapping is a **translation at every boundary**, not a
-   rename - leaves named is the `stat`-side translation (the inode layer must learn whose ids it is
-   rendering) and the capability grant, which the present credential model cannot yet tell apart
-   from being root. IPC and CGROUP each wait on the thing they would isolate not
+   claims, and then the same translation at the four `stat`-family doors (2026-10-16) - a file
+   created before an unshare reads the stored id from the machine map and the inside id from the
+   new one, `statx` agreeing with `stat` (§6.3, measured on the host first). What stays named is the
+   capability grant, which the present credential model cannot yet tell apart from being root, and
+   the `SO_PEERCRED`/`SCM_CREDENTIALS` pair, which carries the same stored-id shape from a different
+   family. IPC and CGROUP each wait on the thing they would isolate not
    existing yet (SysV/POSIX message queues; a cgroup tree), so they are cheap the day that lands
    and worthless before it. Nested namespaces pin the
    *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were

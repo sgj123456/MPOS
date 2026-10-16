@@ -501,13 +501,52 @@ Two counterfactuals, and the first is why the claims are written the way they ar
   moved - the link, the overflow reading, the empty map, the write, the gid pair, the child - goes red
   together.
 
-**What is named and not built, in two halves.** (a) The **file-owner** translation: `stat`'s `st_uid`
-and the owner a directory read reports are still the stored id, so a file made inside reads its inside
-id from `getuid` and its outside id from `stat`. The machinery is the same call the `getuid` family
-makes; what is left is threading the *reader's* namespace into the inode layer, which is a change to
-`vfs` rather than a line. (b) The **capability grant**: on Linux the maker holds the full set inside
-the instant the namespace exists, and this kernel hands every process the full set already, so "full
-inside a namespace you made" is not yet distinguishable from "full because you are root".
+**Step 6b, landed: the file-owner translation, and the two halves become one.** The
+`getuid` family reads the ids a task stores *about itself*; `stat` reads the ids an
+*inode* stores, and one rule governs both - an id is stored once, in the parent
+namespace's numbering, and every observation of it is mapped through the observing
+namespace's table. `.workbuddy/probe-userns6.c` measures the second half on this host,
+run twice (root and `setpriv --reuid=1000`, which pick different stored ids for the map
+line to name):
+
+| question | Linux's answer |
+|---|---|
+| a file made *before* the unshare, read under the identity map | `st_uid=1000` - the stored id |
+| the **same file**, read from inside a namespace mapped `7 <- 1000` | `st_uid=7 st_gid=7` - the inside id, and nothing about the file changed |
+| a file made *inside* the namespace | `st_uid=7 st_gid=7` |
+| `/etc/hostname` (stored root, which the unprivileged map `7 <- 1000` does not cover) | `st_uid=65534 st_gid=65534` - the overflow id |
+| `statx` on the same file | `stx_uid=7 stx_gid=7`, agreeing with `stat` |
+| an **outside** reader (a child that never unshared) | `st_uid=1000` - the stored id, from the same file the inside reads as 7 |
+
+What landed is smaller than the plan predicted. The plan said threading the reader's
+namespace into the inode layer made this "a change to `vfs` rather than a line"; the
+measurement above says the boundary is the **ABI write**, not the inode. `Inode::owner()`
+stays the *stored* id on purpose - every permission check compares it against the
+caller's stored identity (`vfs::may_as`, the sticky-bit rule in `may_remove`), so a
+`vfs` that translated its own answers would refuse the wrong callers - and the syscall
+layer renders that id through `crate::sched::current_user_ns()` at each of the four
+`stat`-family doors (`stat`/`fstat`/`fstatat`/`statx`, one helper, `observed_owner`).
+The pin is four more claims in `t-ns-user`: a file created *before* the unshare reads
+the stored id from the machine map, the same file from inside reads the inside id,
+a file made inside reads it too, and `statx` agrees with `stat` - the inside id is
+`7`, a number no stored id on this machine is, so the claim cannot pass by accident.
+What remains of the rung is therefore the second half alone.
+
+The counterfactual is the measured one this rung has used twice before: with the
+translation dropped (the helper returning its argument) the gate runs `pass=174 fail=1`
+and the one red program is `t-ns-user`, red in exactly **three** claims - the same file
+from inside, the file made inside, and `statx` (`statx agrees (0, 0)`, the stored id) -
+while the identity-map claim and the whole `getuid` half stay green. That the identity
+claim survives is the point: a task that never unshares is not disturbed, which is what
+the machine's identity map is for.
+
+**What is named and not built.** The **capability grant**: on Linux the maker holds the
+full set inside the instant the namespace exists, and this kernel hands every process
+the full set already, so "full inside a namespace you made" is not yet distinguishable
+from "full because you are root". A third observation surface sits beside the two this
+rung has now, named rather than built because it is a different family: the ids a
+`SO_PEERCRED`/`SCM_CREDENTIALS` pair carries are the peer's *stored* ones here, and
+Linux maps those through the reader's namespace too.
 
 **And one trap in the measuring, worth its line**: a first draft of the raw-netlink-style probe
 numbered `IFLA_NET_NS_PID` 27 where `linux/if_link.h` gives 19, and *every* request answered a
