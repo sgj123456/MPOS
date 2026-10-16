@@ -170,8 +170,12 @@ pub(super) const O_TMPFILE: usize = 0o2000_0000;
 /// a caller uses to refuse opening something a symlink points at (the classic
 /// `/tmp` world-writable-dir defence). Measured on the host:
 /// `open(symlink, O_NOFOLLOW)` is `ELOOP`, `open(regular, O_NOFOLLOW)`
-/// succeeds. It is an open-only bit, not a status flag: it never shows back in
-/// `F_GETFL`'s value, so it is consumed at the open and not stored.
+/// succeeds. This kernel consumes the bit at the open and stores nothing, so it
+/// never shows back in *this* kernel's `F_GETFL` value - but that is not the
+/// bit's nature, and the difference was measured: on the host, `open(regular,
+/// O_NOFOLLOW)` followed by `fcntl(F_GETFL)` reports the bit back (`0x28000`,
+/// beside `O_LARGEFILE`). What Linux's word carries and this one does not is
+/// named in `docs/uapi/` §5.2.
 #[cfg(not(target_arch = "aarch64"))]
 pub(super) const O_NOFOLLOW: usize = 0o40_0000;
 

@@ -5,18 +5,42 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
-- **`F_GETFL` reports no access mode.** Linux ORs the descriptor's access mode into the word
-  `fcntl(F_GETFL)` returns, so a descriptor opened `O_WRONLY` reports `1` (measured on a
-  current host); this kernel reports the description's stored status word, whose access bits
-  are always zero, and keeps the mode separately (`src/vfs/file.rs`'s `ACC_*`, which the
-  read/write `EBADF` refusal reads). A caller that reads `F_GETFL` to learn which way a
-  descriptor opens is told `O_RDONLY` for every one of them. Not a §3.2 defect — the answer
-  is a zero rather than a wrong number — but a divergence a program can see, and `t-fcntl`
-  pins the current answer on **both** machines (S6 batch 11). Closing it means folding the
-  access bits into the reported word, which has its own blast radius: `rustix::fs::Dir`
-  reuses an `F_GETFL` word for the `openat(fd, ".")` it opens a directory's descriptor with.
-  Owner: `src/syscall/linux/fs/file.rs`'s `F_GETFL` arm + the `access` field already there.
-  `docs/notes/` §15.16.
+- **A pipe's write end answers this kernel's own errno to the two size-changing calls.** Measured
+  on a current host through `syscall(2)` (`.workbuddy/probe_getfl.c`, Linux 7.2.9): a pipe's
+  *read* end answers `EINVAL` to `ftruncate` and `EBADF` to `fallocate` — the access mode refuses
+  both before the file type is asked, which is that kernel's `!(f_mode & FMODE_WRITE)` check — and
+  its *write* end answers `EINVAL` to `ftruncate` (a pipe inode has no `setattr`) and `ESPIPE` to
+  `fallocate`. This kernel answers Linux's two read-end errnos now, because the mode refuses them
+  (`docs/uapi/` §5.1 item 21); the write end still reaches this kernel's VFS defaults —
+  `EOPNOTSUPP` for `ftruncate` and `ENODEV` for `fallocate` — because a pipe here is built out of
+  a `File` inode and the handlers' "not a regular file" tests do not catch it. (The `ENODEV` is
+  the fallocate man page's word, which is what the pin used to carry for *both* ends; neither
+  machine answers it for a pipe.) Owner: `src/syscall/linux/fs/file.rs`'s
+  `handle_ftruncate`/`handle_fallocate`, or the pipe inode whose `truncate` default answers one of
+  them. Pins: `t-truncate` and `t-fallocate`, each of which now claims both ends — the read end on
+  both machines, the write end named per machine.
+
+- **The reported `F_GETFL` word holds the mode and the two flags, where Linux's holds more.**
+  **Landed 2026-10-16** (`docs/uapi/` §5.1 item 21) for the half a caller reads to learn a
+  descriptor's direction: the access mode the description was made under is in the word - a path
+  `open`, a `pipe2` end and an `inotify` queue all answer Linux's mode - and `F_SETFL` no longer
+  clears it. What is left is the *rest* of `filp->f_flags`, and it is measured rather than
+  recalled: on a current host through `syscall(2)` (`.workbuddy/probe_getfl.c`, Linux 7.2.9),
+  `open(O_RDONLY)` reports `0x8000` and `open(O_WRONLY)` `0x8001`, where `0x8000` is
+  `O_LARGEFILE` - the kernel *adds* that bit to every path open, and machine-dependently
+  (`0o100000` on x86_64, `0o20000` on arm64, where this repository's own uapi table deliberately
+  defines neither). Beside it the open keeps what it was asked for:
+  `open(dir, O_RDONLY|O_DIRECTORY)` reports `0x18000`, `open(O_RDONLY|O_NOFOLLOW)` reports
+  `0x28000` - `O_NOFOLLOW` *is* reported, so the bit is not open-only on Linux, which
+  `src/syscall/linux/abi.rs`'s comment about it used to say it was - `open(path, O_PATH)` reports
+  `0x200000`, and `O_SYNC`/`O_DSYNC`, `O_ASYNC`, `O_DIRECT` and `O_NOATIME` each come back the
+  same way. This kernel stores none of them: its word is the access mode plus `O_APPEND` and
+  `O_NONBLOCK`. A caller that compares the whole word against what it opened with therefore sees
+  a difference - the shape `rustix::fs::Dir` would meet if it reopened a directory from the word
+  it read, though for the `O_RDONLY` dirfd it reads those extra bits are as harmless here as they
+  are on Linux. Owner: `src/vfs/file.rs`'s `SETFL_MASK` and the `F_GETFL` arm, whose
+  answer for `O_LARGEFILE` is a cross-machine decision (`t-open-flags` pins that this kernel
+  ignores the flag on both machines today). `docs/notes/` §15.16.
 - **`waitid`'s record leaves `si_uid` zero.** Linux fills it with the child's
   real uid (measured: 1000 for a child of this shell); this kernel's record
   cannot, because it outlives the task's slot — a `waitid` that finds a retired

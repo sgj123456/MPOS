@@ -43,25 +43,37 @@ pub const O_NONBLOCK: u32 = 0o4000;
 /// which is what made the guest's log file a single line long for ever.
 pub const O_APPEND: u32 = 0o2000;
 
-/// The bits of an open's flag word that outlive the open: the access mode,
-/// and the two flags the read and write paths consult. The creation flags
-/// (`O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_NOCTTY`) are spent by the open itself
-/// and are not file status - Linux's `F_GETFL` does not report them either.
-pub const OPEN_STATUS_FLAGS: u32 = 0o3 | O_APPEND | O_NONBLOCK;
-
-/// The access mode an open description was made under, as the low two bits of
-/// `O_ACCMODE`. `File::read`/`File::write` refuse a mismatch with `EBADF`, which
-/// is Linux's answer for `write()` on an `O_RDONLY` descriptor and the reverse.
+/// The bits `fcntl(F_SETFL)` may replace - Linux's own `SETFL_MASK`, minus the
+/// members this kernel does not implement (`O_DIRECT`, `O_NOATIME`): the two
+/// flags the read and write paths consult, and the whole of what an open's flag
+/// word keeps here.
 ///
-/// The default is [`ACC_RDWR`] - permissive - because only a path `open` records
-/// a real mode. Descriptions made another way (a socket via `socket`, a pipe end,
-/// an `eventfd`/`timerfd`/`signalfd`/`memfd`) inherit the default and stay
-/// readable and writable, which is right for objects whose direction is not an
-/// `O_ACCMODE` at all. A forgotten `set_access` therefore leaves the description
-/// permissive rather than wrongly refusing.
-const ACC_RDONLY: u8 = 0;
-const ACC_WRONLY: u8 = 1;
-const ACC_RDWR: u8 = 2;
+/// The access mode is deliberately not a member. It is [`File::access`], the
+/// one owner of that fact, and [`File::open_flags`] reports it *beside* this
+/// word rather than inside it - which is what makes a caller's `F_SETFL` unable
+/// to move it, as Linux's mask makes it unable to move `filp->f_flags`' mode.
+/// The creation flags (`O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_NOCTTY`) are not
+/// members either: they are spent by the open itself, and Linux's `F_GETFL`
+/// does not report them. Neither is `O_LARGEFILE`, which that kernel adds to
+/// every path open and this one does not carry at all (`docs/uapi/` §5.2).
+pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK;
+
+/// The access mode a description was made under, as the low two bits of
+/// `O_ACCMODE`. `File::read`/`File::write` refuse a mismatch with `EBADF`, which
+/// is Linux's answer for `write()` on an `O_RDONLY` descriptor and the reverse,
+/// and it is half of the word `fcntl(F_GETFL)` reports - so this is the *one*
+/// owner of the fact, and nothing keeps a second copy of it in the status word.
+///
+/// The default is [`ACC_RDWR`] - permissive - because only the doors that know
+/// a direction record one: a path `open`, `pipe2`'s two ends, and a door that
+/// mints a readable-only description (`inotify_init1`). Everything else Linux
+/// itself mints read-write (a socket, an `eventfd`, a `timerfd`, a `signalfd`,
+/// an `epoll`, a `memfd`) inherits the default, which is the answer the host
+/// gives those descriptors too. A forgotten `set_access` therefore leaves the
+/// description permissive rather than wrongly refusing.
+pub const ACC_RDONLY: u32 = 0;
+pub const ACC_WRONLY: u32 = 1;
+pub const ACC_RDWR: u32 = 2;
 
 /// An open file description: an inode plus where the next read/write lands.
 pub struct File {
@@ -78,8 +90,9 @@ pub struct File {
     /// mode it was opened under.
     opened_for_write: core::sync::atomic::AtomicBool,
     /// The `O_ACCMODE` this description was opened under, for the read/write
-    /// `EBADF` refusal. [`ACC_RDWR`] unless a path `open` recorded a narrower
-    /// mode; see the `ACC_*` constants.
+    /// `EBADF` refusal and for the half of `fcntl(F_GETFL)` it answers.
+    /// [`ACC_RDWR`] unless a path `open`, a pipe end or a readable-only door
+    /// recorded a narrower mode; see the `ACC_*` constants.
     access: AtomicU8,
     /// The path this description was opened by, when the caller that made it
     /// knew one.
@@ -121,7 +134,7 @@ impl File {
             inode,
             pos: AtomicU64::new(0),
             opened_for_write: core::sync::atomic::AtomicBool::new(false),
-            access: AtomicU8::new(ACC_RDWR),
+            access: AtomicU8::new(ACC_RDWR as u8),
             status: core::sync::atomic::AtomicU32::new(0),
             label: Mutex::new(RefCell::new(None)),
             dev: core::sync::atomic::AtomicU64::new(DEV_UNSET),
@@ -201,14 +214,41 @@ impl File {
         self as *const File as u64
     }
 
-    /// The open flag word, as `fcntl(F_GETFL)` reports it.
+    /// The open flag word, as `fcntl(F_GETFL)` reports it: the access mode the
+    /// description was made under, OR'd with the changeable flags it carries.
+    ///
+    /// Linux reports `filp->f_flags`, and the access mode is the half a caller
+    /// most often reads the word for - glibc's streams ask
+    /// `fcntl(F_GETFL) & O_ACCMODE` to learn which way a stream is open. Its
+    /// word also carries `O_LARGEFILE` and whatever else the open recorded
+    /// (`O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_SYNC`...); those are named in
+    /// `docs/uapi/` §5.2 rather than invented here, since this kernel neither
+    /// implements them nor stores them.
+    pub fn open_flags(&self) -> u32 {
+        self.status() | self.access()
+    }
+
+    /// The changeable open flags the description carries - what
+    /// `fcntl(F_SETFL)` and `ioctl(FIONBIO)` write, and the half of
+    /// [`Self::open_flags`] that is theirs to change.
     pub fn status(&self) -> u32 {
         self.status.load(Ordering::Relaxed)
     }
 
-    /// Replace the open flag word, as `fcntl(F_SETFL)` does.
+    /// Replace the flags `fcntl(F_SETFL)` may change.
+    ///
+    /// Only [`SETFL_MASK`] is replaced, which is Linux's rule rather than a
+    /// simplification of it: `filp->f_flags` is rewritten as
+    /// `(arg & SETFL_MASK) | (old & ~SETFL_MASK)`, so a caller can neither
+    /// change the access mode (the mask has no member for it) nor clear it.
+    /// Measured on a current host: an `O_WRONLY` descriptor asked for
+    /// `O_NONBLOCK` alone still reports `O_WRONLY|O_NONBLOCK` from `F_GETFL`,
+    /// and one asked for `O_RDWR` or `O_RDONLY` reports `O_WRONLY` unchanged.
+    /// A word-wide store instead reopens the description's direction to
+    /// `O_RDONLY` for the reading, and `F_SETFL(O_RDWR)` reports a write the
+    /// description is not allowed to do.
     pub fn set_status(&self, flags: u32) {
-        self.status.store(flags, Ordering::Relaxed);
+        self.status.store(flags & SETFL_MASK, Ordering::Relaxed);
     }
 
     pub fn pos(&self) -> u64 {
@@ -252,12 +292,20 @@ impl File {
             .store(write, core::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Record the `O_ACCMODE` a path `open` made this description under, so the
-    /// read/write entry points can refuse a mismatch with `EBADF` as Linux does.
+    /// Record the `O_ACCMODE` a path `open` - or a door that knows a direction
+    /// itself, `pipe2`'s two ends and `inotify_init1` - made this description
+    /// under, so the read/write entry points can refuse a mismatch with `EBADF`
+    /// as Linux does and so `fcntl(F_GETFL)` reports the mode it was made with.
     /// The argument is the low two bits of the open flags (`0` read, `1` write,
     /// `2` read-write).
     pub fn set_access(&self, accmode: u32) {
         self.access.store((accmode & 0o3) as u8, Ordering::Relaxed);
+    }
+
+    /// The `O_ACCMODE` this description was made under - the write half of
+    /// [`Self::open_flags`], and the question [`Self::may_write`] answers.
+    pub fn access(&self) -> u32 {
+        self.access.load(Ordering::Relaxed) as u32
     }
 
     /// The `read(2)` door refuses an `O_WRONLY` descriptor with `EBADF` - Linux's
@@ -266,7 +314,7 @@ impl File {
     /// short-circuits first only when the mode permits reading at all; Linux
     /// refuses the wrong-mode `read(2, buf, 0)` with `EBADF` too.
     fn check_readable(&self) -> VfsResult<()> {
-        if self.access.load(Ordering::Relaxed) == ACC_WRONLY {
+        if self.access() == ACC_WRONLY {
             return Err(VfsError::BadFd);
         }
         Ok(())
@@ -293,7 +341,7 @@ impl File {
     /// write-shaped operation - comes to be enforced in one place and missed in
     /// the other.
     pub(crate) fn may_write(&self) -> bool {
-        self.access.load(Ordering::Relaxed) != ACC_RDONLY
+        self.access() != ACC_RDONLY
     }
 
     /// Whether this description was opened for writing.
@@ -803,13 +851,18 @@ mod tests {
         assert_eq!(&buf[..n], b"XYcdef");
     }
 
-    /// The two flag bits the description keeps are the ones the headers
-    /// spell: `O_APPEND` is `0o2000` and `O_NONBLOCK` is `0o4000`.
+    /// The flag bits the description keeps are the ones the headers spell:
+    /// `O_APPEND` is `0o2000`, `O_NONBLOCK` is `0o4000`, and the access mode is
+    /// *not* one of them - it lives in [`File::access`], and the reported word
+    /// is composed from both.
     #[test]
     fn the_status_flag_bits_match_the_headers() {
         assert_eq!(super::O_APPEND, 0o2000);
         assert_eq!(super::O_NONBLOCK, 0o4000);
-        assert_eq!(super::OPEN_STATUS_FLAGS, 0o3 | 0o2000 | 0o4000);
+        assert_eq!(super::SETFL_MASK, 0o2000 | 0o4000);
+        assert_eq!(super::ACC_RDONLY, 0);
+        assert_eq!(super::ACC_WRONLY, 1);
+        assert_eq!(super::ACC_RDWR, 2);
     }
     #[test]
     fn descriptions_over_one_inode_read_independently() {
@@ -929,8 +982,9 @@ mod tests {
     /// Before this, `File::read`/`write` never consulted the mode, so an `O_RDONLY`
     /// description happily took a write - the silent-success this pins against.
     /// The default (no `set_access`) is read-write, which is what keeps a
-    /// description made by anything other than a path `open` - a socket, a pipe
-    /// end, an `eventfd` - permissive, since its direction is not an `O_ACCMODE`.
+    /// description whose direction Linux itself mints as read-write - a socket,
+    /// an `eventfd`, a `timerfd` - permissive, and is the answer the host gives
+    /// those descriptors too.
     #[test]
     fn access_mode_is_enforced_after_open() {
         let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
@@ -942,7 +996,7 @@ mod tests {
         // Opened read-only: the write is refused before anything is touched, and
         // even a zero-length write cannot sneak past the mode check.
         let rd = File::new(inode.clone());
-        rd.set_access(0); // O_RDONLY
+        rd.set_access(super::ACC_RDONLY);
         assert_eq!(rd.write(b"x").err(), Some(VfsError::BadFd));
         assert_eq!(rd.write(b"").err(), Some(VfsError::BadFd));
         assert!(!rd.may_write(), "and the fact is one question, not two");
@@ -951,9 +1005,54 @@ mod tests {
 
         // Opened write-only: the read is refused, the write is not.
         let wr = File::new(inode);
-        wr.set_access(1); // O_WRONLY
+        wr.set_access(super::ACC_WRONLY);
         assert_eq!(wr.read(&mut buf).err(), Some(VfsError::BadFd));
         assert_eq!(wr.write(b"y").unwrap(), 1);
         assert!(wr.may_write(), "write-only may still write");
+    }
+
+    /// `F_GETFL` reports the access mode the description was made under, and
+    /// `F_SETFL` cannot move it: Linux rewrites `filp->f_flags` as
+    /// `(arg & SETFL_MASK) | (old & ~SETFL_MASK)`, and `SETFL_MASK` has no
+    /// member for the access mode, so a caller that asks for `O_NONBLOCK` alone
+    /// keeps the direction it opened with. Measured on a current host: an
+    /// `O_WRONLY` descriptor asked for `O_NONBLOCK` reports `1|0o4000`, and one
+    /// asked for `O_RDWR` still reports `1`.
+    #[test]
+    fn the_reported_word_keeps_the_access_mode_setfl_cannot_change() {
+        let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
+        let file = File::new(inode);
+        assert_eq!(
+            file.open_flags(),
+            super::ACC_RDWR,
+            "a description no door gave a direction to is read-write"
+        );
+
+        file.set_access(super::ACC_WRONLY);
+        assert_eq!(file.open_flags(), super::ACC_WRONLY);
+
+        file.set_status(super::O_NONBLOCK);
+        assert_eq!(file.open_flags(), super::ACC_WRONLY | super::O_NONBLOCK);
+
+        // A word that names another access mode cannot move the one the
+        // description has, and cannot clear it either.
+        file.set_status(super::ACC_RDWR);
+        assert_eq!(file.open_flags(), super::ACC_WRONLY);
+        file.set_status(super::O_APPEND);
+        assert_eq!(
+            file.open_flags(),
+            super::ACC_WRONLY | super::O_APPEND,
+            "the one bit replaced was O_NONBLOCK, and O_APPEND arrived"
+        );
+
+        // The other direction, and it is a replacement rather than a merge:
+        // the open-only flags (`O_CREAT|O_EXCL|O_NOCTTY|O_TRUNC`, `0o1700`)
+        // were spent by the open and are not file status, so a word that
+        // carries them and nothing else clears `O_APPEND` - measured, a host
+        // `F_SETFL(0o1700)` on an `O_WRONLY|O_APPEND` descriptor answers
+        // `O_WRONLY` - while the access mode, which the caller cannot name,
+        // is untouched.
+        file.set_status(0o1700);
+        assert_eq!(file.open_flags(), super::ACC_WRONLY);
     }
 }

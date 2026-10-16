@@ -10,12 +10,16 @@
 //! it. Linux behaves exactly this way, and so does mpos: the hole reads as
 //! zeros and the size is the write's end, not the write's length.
 //!
-//! One mpos divergence, named where it is checked: `ftruncate` on a pipe is
-//! EOPNOTSUPP here rather than Linux's EINVAL. mpos builds a pipe out of a
-//! `File` inode, so the handler's "not a regular file" test does not catch
-//! it, and the refusal comes from the VFS's default `truncate` instead. On
-//! real Linux the same call answers EINVAL (measured here), so the hosted
-//! run accepts either truthful refusal and says which machine answered.
+//! One mpos divergence, named where it is checked, and it is one *end* of a
+//! pipe rather than the pipe: `ftruncate` on a pipe's write end is EOPNOTSUPP
+//! here rather than Linux's EINVAL. mpos builds a pipe out of a `File` inode,
+//! so the handler's "not a regular file" test does not catch it, and the
+//! refusal comes from the VFS's default `truncate` instead. The read end is
+//! read-only, so the mode refuses it first and answers Linux's own EINVAL.
+//! Measured on real Linux through `syscall(2)`: EINVAL for *both* ends, the
+//! write end by way of "no `setattr`" (`.workbuddy/probe_getfl.c`), so the
+//! hosted run accepts either truthful refusal on the write end and says which
+//! machine answered.
 //!
 //! Pure rustix beside one raw door: `rustix::fs::{truncate, ftruncate}`
 //! bind the calls, but the *negative length* claim cannot be spelled
@@ -88,15 +92,27 @@ fn main() {
         refused(neg as isize, libc::EINVAL),
     );
 
-    // A descriptor that is not a regular file. The named divergence: Linux
-    // answers EINVAL for a pipe, mpos answers EOPNOTSUPP from its VFS.
+    // A descriptor that is not a regular file, asked about *both* ends of a
+    // pipe. The read end is read-only, so the mode refuses it first and the
+    // answer is Linux's own `EINVAL` - measured through `syscall(2)` on this
+    // host (`.workbuddy/probe_getfl.c`), which is also what that kernel's
+    // `!(f_mode & FMODE_WRITE)` answers for `ftruncate`. The write end is
+    // writable and reaches the filesystem, and that is where the remaining
+    // divergence lives: Linux answers `EINVAL` there too (a pipe inode has no
+    // `setattr`), while mpos answers `EOPNOTSUPP` from its VFS, because a pipe
+    // here is built out of a `File` inode and the handler's "not a regular
+    // file" test does not catch it.
     let pipes = pipe_with(PipeFlags::empty());
     match &pipes {
         Ok(p) => {
             r.check("the pipe pair is made", true);
-            let e = ftrunc(&p.0, 4).err();
             r.check(
-                "a pipe's ftruncate is refused (EOPNOTSUPP on mpos, EINVAL on Linux)",
+                "a pipe's read end refuses ftruncate with EINVAL, as Linux does",
+                ftrunc(&p.0, 4).err() == Some(Errno::INVAL),
+            );
+            let e = ftrunc(&p.1, 4).err();
+            r.check(
+                "a pipe's write end is refused (EOPNOTSUPP on mpos, EINVAL on Linux)",
                 e == Some(Errno::NOTSUP)
                     || (mpos_user_tests::host_run() && e == Some(Errno::INVAL)),
             );
@@ -104,7 +120,11 @@ fn main() {
         Err(_) => {
             r.check("the pipe pair is made", false);
             r.check(
-                "a pipe's ftruncate is refused (EOPNOTSUPP on mpos, EINVAL on Linux)",
+                "a pipe's read end refuses ftruncate with EINVAL, as Linux does",
+                false,
+            );
+            r.check(
+                "a pipe's write end is refused (EOPNOTSUPP on mpos, EINVAL on Linux)",
                 false,
             );
         }

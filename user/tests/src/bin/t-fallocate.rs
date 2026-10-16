@@ -5,10 +5,14 @@
 //! before a thing is touched, an unknown mode bit is EOPNOTSUPP the way Linux
 //! answers a mode word from a newer kernel, a punch without KEEP_SIZE is EINVAL
 //! (and the punch itself is the unsupported interior operation this kernel
-//! answers EOPNOTSUPP for), a descriptor that is not a file is the man page's
-//! ENODEV, and KEEP_SIZE inside an existing file changes nothing - the flag's
-//! promise is about the writes that come, and on this kernel they cannot fail
-//! for lack of room anyway.
+//! answers EOPNOTSUPP for), a descriptor that is not a file is refused, and
+//! KEEP_SIZE inside an existing file changes nothing - the flag's promise is
+//! about the writes that come, and on this kernel they cannot fail for lack of
+//! room anyway. The non-file pair is a pipe's two ends, and the man page's
+//! `ENODEV` is not what either machine answers for one: the read end is
+//! read-only and gets `EBADF` on both, and the write end is `ENODEV` here
+//! beside Linux's `ESPIPE` (both measured through `syscall(2)`,
+//! `.workbuddy/probe_getfl.c`).
 //!
 //! # Why this one is all `rustix`
 //!
@@ -152,21 +156,35 @@ fn main() {
         }
     }
 
-    // A descriptor that is not a file: the pipe gets the man page's ENODEV, and
-    // a number nothing is open on gets EBADF. Each pair reports both claims
-    // whether or not the setup call worked, so a failure here still says which
-    // two things were being asked.
+    // A descriptor that is not a file, asked about *both* ends of a pipe, and
+    // the measurement corrected this pair twice over. The read end is
+    // read-only, so the mode refuses it first with Linux's own `EBADF` (that
+    // kernel's `!(f_mode & FMODE_WRITE)` answers `EBADF` for `fallocate` the
+    // way it answers `EINVAL` for `ftruncate`) - measured through `syscall(2)`
+    // on this host, `.workbuddy/probe_getfl.c`. The write end is writable and
+    // reaches the handler: `ENODEV` here, and `ESPIPE` on Linux - so the man
+    // page's `ENODEV` this test used to pin for *both* ends was the man page's
+    // word rather than either machine's answer for a pipe.
     match pipe_with(PipeFlags::empty()) {
-        Ok((read_end, _write_end)) => {
+        Ok((read_end, write_end)) => {
             r.check("the pipe pair is made", true);
             r.check(
-                "a pipe answers ENODEV",
-                fallocate(&read_end, FallocateFlags::empty(), 0, 1) == Err(Errno::NODEV),
+                "a pipe's read end answers EBADF, as Linux does",
+                fallocate(&read_end, FallocateFlags::empty(), 0, 1) == Err(Errno::BADF),
+            );
+            let e = fallocate(&write_end, FallocateFlags::empty(), 0, 1).err();
+            r.check(
+                "a pipe's write end answers ENODEV on mpos, ESPIPE on Linux",
+                e == Some(Errno::NODEV) || (mpos_user_tests::host_run() && e == Some(Errno::SPIPE)),
             );
         }
         Err(_) => {
             r.check("the pipe pair is made", false);
-            r.check("a pipe answers ENODEV", false);
+            r.check("a pipe's read end answers EBADF, as Linux does", false);
+            r.check(
+                "a pipe's write end answers ENODEV on mpos, ESPIPE on Linux",
+                false,
+            );
         }
     }
     // The number is not part of the claim, the descriptor table's empty row is;

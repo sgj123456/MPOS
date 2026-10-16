@@ -379,3 +379,53 @@ the commit bodies), and each moved its pin in the same commit.
     `t-at-empty-name` on **both** machines — its `AT_EMPTY_PATH` section walks the six doors over
     both descriptor shapes and pins the flag's inertness beside a real name for two of them.
     Closes `docs/uapi/` §5.2's `AT_EMPTY_PATH` entry.
+
+21. **`fcntl(F_GETFL)` answers the access mode the description was made under, and `F_SETFL`
+    cannot change it.** Linux reports `filp->f_flags`, which is two halves: the `O_ACCMODE` the
+    caller opened with, and the status bits the description kept. `F_SETFL` writes that word as
+    `(arg & SETFL_MASK) | (old & ~SETFL_MASK)`, and `SETFL_MASK` has no member for the mode — so a
+    caller that asks for `O_NONBLOCK` alone keeps its direction, and one that asks for `O_RDWR`
+    does not get to read. Measured on a current host through `syscall(2)`
+    (`.workbuddy/probe_getfl.c`, Linux 7.2.9, so no libc's rewrite is mistaken for the kernel's
+    rule): `open(O_RDONLY)` answers `0x8000`, `open(O_WRONLY)` `0x8001`, `open(O_RDWR)` `0x8002`
+    (`0x8000` is `O_LARGEFILE`, which that kernel adds to every path open and this one does not
+    carry at all); `F_SETFL(O_NONBLOCK)` on the `O_WRONLY` one answers `0x8801` — mode intact, flag
+    set — and `F_SETFL(O_RDONLY)` or `F_SETFL(O_RDWR)` answer `0x8001` unchanged; a `pipe()` read
+    end answers `0` where its write end answers `1`; a `socketpair` end, a socket, an `eventfd`, a
+    `timerfd`, a `signalfd`, an `epoll` and a `memfd` answer `2`; an `inotify` queue answers `0`.
+    **What this kernel answered before was two divergences, and the entry that named them was
+    wrong about its own subject.** `docs/uapi/` §5.2 and `docs/notes/` §15.16(a) claimed the
+    reported word's access bits were "always zero" and that every descriptor therefore read as
+    `O_RDONLY`; but the open had stored `flags & OPEN_STATUS_FLAGS` — a mask that has carried `0o3`
+    since `b659a62` (and is named `SETFL_MASK` now that it is nothing else) — so a *path* open has
+    reported its mode all along, and `t-fcntl`'s claim (which pinned `0` on stdout) could not have
+    caught it either way. What was really wrong is the pair a word-wide store hides: the doors that mint their own direction
+    recorded none (a `pipe2` write end reported `0` where Linux reports `1`; `inotify_init1`'s
+    queue reported `2` where Linux reports `0`), and `F_SETFL` stored the caller's word *whole*, so
+    `fcntl(fd, F_SETFL, O_NONBLOCK)` on an `O_WRONLY` descriptor **cleared the mode** — the
+    direction the kernel still enforced, but a word a caller reads to decide whether it may read
+    or write would have lied to it. **The fix is one owner for the fact and one mask for the
+    door.** The mode lives only in `src/vfs/file.rs`'s `access` field — the field the read/write
+    `EBADF` refusal already asked — and `File::open_flags` composes the reported word from it and
+    the status flags, so there is no second copy to drift; `File::set_status` keeps only
+    `SETFL_MASK` (`O_APPEND | O_NONBLOCK`), which is Linux's rule rather than a simplification of
+    it, and that constant lost the `0o3` that made it two spellings of one fact.
+    `pipe2` records `ACC_RDONLY` on its read end and `ACC_WRONLY` on its write end, and
+    `handle_inotify_init1` records `ACC_RDONLY` on the queue — which is also what makes `write` on
+    a pipe's read end and `read` on its write end answer `EBADF`, Linux's answer, rather than
+    whatever the description happened to permit, and what moves two errnos toward Linux: a pipe's
+    read end now answers `EINVAL` to `ftruncate` and `EBADF` to `fallocate`, because the mode
+    refuses before the file type is asked — Linux's own order, measured — leaving only the *write*
+    end's `EOPNOTSUPP`/`ENODEV` named in §5.2. Owner: `src/vfs/file.rs`, and
+    `src/syscall/linux/fs/file.rs`'s `F_GETFL`/`F_SETFL` arms, `pipe2` and `handle_inotify_init1`.
+    Pins: `t-fcntl`, whose `F_GETFL` section is rewritten onto descriptors the program *makes* —
+    a file opened each way, a `pipe2` pair with and without `O_NONBLOCK`, a `socketpair` end — so
+    the section measures the same thing under `MPOS_ON_HOST=1` as it does in a sweep (22 claims,
+    green on this host first), plus the host unit test
+    `vfs::file::tests::the_reported_word_keeps_the_access_mode_setfl_cannot_change`. **What is
+    named rather than implemented** is the rest of Linux's word: it carries `O_LARGEFILE` (added
+    to every path open, machine-dependent — `0o100000` on x86_64, `0o20000` on arm64, and this
+    kernel deliberately defines neither) and whatever else the open recorded (`O_DIRECTORY`,
+    `O_NOFOLLOW`, `O_PATH`, `O_SYNC`/`O_DSYNC`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME`), none of which
+    this kernel stores or implements. `docs/uapi/` §5.2 carries that set with the probe's
+    transcript, which is §15.16(a) corrected.

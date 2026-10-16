@@ -388,10 +388,10 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                 // Record the `O_ACCMODE` itself, not just "wrote-ish": `File::read`
                 // and `File::write` refuse a mismatch with `EBADF` from here on,
                 // which is Linux's answer for `write()` on an `O_RDONLY` fd and the
-                // reverse. The `status` word also keeps these bits for
-                // `F_GETFL`, but the enforcement reads this dedicated field so a
-                // later `F_SETFL` (which must not be able to change the access mode)
-                // cannot reopen a refused direction.
+                // reverse. This field is the one owner of the fact - `F_GETFL`
+                // composes its answer from it, and `F_SETFL` cannot reach it, which
+                // is what stops a caller that changes the status flags from
+                // reopening a direction that was refused.
                 file.set_access((flags & O_ACCMODE) as u32);
                 crate::vfs::inotify::emit(&file.inode(), crate::vfs::inotify::IN_OPEN, "");
                 // An evdev client's read position starts here, at the
@@ -410,17 +410,19 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             if flags & O_CLOEXEC != 0 {
                 let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
             }
-            // The half of the open's flag word that outlives the open: the
-            // access mode, `O_APPEND` and `O_NONBLOCK`, which is what
-            // `fcntl(F_GETFL)` reports and what the read and write paths ask.
+            // The half of the open's flag word that outlives the open and is
+            // the caller's to change later: `O_APPEND` and `O_NONBLOCK`.
             // Storing it here is what makes `O_APPEND` bite at all - a
             // description that never learned it writes at its cursor, which
             // for a fresh open is the start of the file, so a log writer
             // overwrites the beginning of its own log instead of appending.
+            // `set_status` keeps only those bits, and the access mode is
+            // already recorded in the field `F_GETFL` composes its word from.
             if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
-                let status = (flags as u32) & crate::vfs::file::OPEN_STATUS_FLAGS;
-                file.set_status(status);
-                sync_nonblocking(&file, status);
+                file.set_status(flags as u32);
+                // What landed is the masked word, and the bit with teeth is
+                // `O_NONBLOCK`: it has to reach the node that does the blocking.
+                sync_nonblocking(&file, file.status());
             }
             // `O_TRUNC` empties an existing file as part of the open, which is
             // what a writer that reopens a name is promising: what it writes
@@ -2380,9 +2382,11 @@ pub fn handle_chroot(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 /// `fcntl(fd, cmd, arg)` - descriptor flags are stored, the rest is a stub.
 ///
 /// `F_GETFD`/`F_SETFD` round-trip through the fd table: startup code probes
-/// them and reads back what it wrote. `F_GETFL` answers `O_RDONLY` - opens
-/// here are untyped - and `F_SETFL` accepts and forgets. A command Linux has
-/// no meaning for answers `EINVAL`, not success.
+/// them and reads back what it wrote. `F_GETFL` answers the description's open
+/// word - the access mode it was made under, OR'd with the flags it carries -
+/// and `F_SETFL` replaces only the bits Linux lets a caller change, so the
+/// mode survives it. A command Linux has no meaning for answers `EINVAL`, not
+/// success.
 ///
 /// `F_GETLK`/`F_SETLK`/`F_SETLKW` are permissive stubs: this kernel has one
 /// user and, in practice, one locker at a time, so every lock is granted and
@@ -2445,18 +2449,24 @@ pub fn fcntl(args: [usize; ARG_COUNT]) -> isize {
             Ok(()) => 0,
             Err(e) => err_of(e),
         },
-        // `F_GETFL` reports the open flag word the description carries -
-        // which, since sockets arrived, is where `O_NONBLOCK` lives, and a
-        // DNS resolver reads it back to know how its sockets will behave.
-        // `F_SETFL` stores the word; the flag bits a caller may not change
-        // (the access mode) are accepted here rather than filtered, because
-        // opens are untyped and the access bits are always zero anyway.
+        // `F_GETFL` reports the description's open word: the access mode it was
+        // made under, OR'd with the status flags it carries. The flags are
+        // where `O_NONBLOCK` lives, which a DNS resolver reads back to know how
+        // its sockets will behave, and the mode is the half glibc's streams ask
+        // for (`F_GETFL & O_ACCMODE`) to learn which way one is open. Measured
+        // on a current host: an `O_WRONLY` descriptor answers `1`, a pipe's
+        // write end answers `1` where its read end answers `0`, and a socket
+        // answers `2` - the word belongs to the description, not to the file.
         F_GETFL => match crate::sched::current_fds().clone_at(fd) {
-            Ok(file) => file.status() as isize,
+            Ok(file) => file.open_flags() as isize,
             Err(e) => err_of(e),
         },
         F_SETFL => match crate::sched::current_fds().clone_at(fd) {
             Ok(file) => {
+                // Only the bits Linux lets a caller change are replaced - the
+                // access mode is not one of them, which is why a caller that
+                // asks for `O_NONBLOCK` alone does not lose it (`File::set_status`
+                // carries the measurement).
                 file.set_status(arg as u32);
                 // The one stored flag with teeth is O_NONBLOCK, and on a pipe
                 // the behaviour lives in the inode: sync the bit, so a
@@ -3664,6 +3674,22 @@ pub fn handle_pipe(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         }
     };
     let fds = [fd0, fd1];
+    // A pipe's two ends are the one description whose direction the kernel
+    // mints rather than the caller's open: measured on a current host,
+    // `fcntl(F_GETFL)` reports the read end as `O_RDONLY` and the write end as
+    // `O_WRONLY`, and the same asymmetry is what makes `write` on the read end
+    // and `read` on the write end answer `EBADF` there.
+    {
+        let table = crate::sched::current_fds();
+        for (fd, mode) in [
+            (fd0, crate::vfs::file::ACC_RDONLY),
+            (fd1, crate::vfs::file::ACC_WRONLY),
+        ] {
+            if let Ok(file) = table.clone_at(fd) {
+                file.set_access(mode);
+            }
+        }
+    }
     if flags & O_CLOEXEC != 0 {
         let table = crate::sched::current_fds();
         for fd in fds {
@@ -4791,6 +4817,14 @@ pub fn handle_inotify_init1(args: [usize; ARG_COUNT]) -> isize {
         Ok(fd) => fd,
         Err(e) => return err_of(e),
     };
+    // An inotify queue is readable and nothing else, and Linux says so in the
+    // word a caller can read back: measured on a current host,
+    // `fcntl(F_GETFL)` on this descriptor answers `O_RDONLY` (0) where a
+    // `timerfd`, an `eventfd`, a `signalfd`, an `epoll` and a socket all answer
+    // `O_RDWR` (2). The description is what carries the direction here.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        file.set_access(crate::vfs::file::ACC_RDONLY);
+    }
     if flags & crate::vfs::inotify::IN_CLOEXEC != 0 {
         let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
     }
