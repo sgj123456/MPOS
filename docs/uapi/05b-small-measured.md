@@ -5,20 +5,37 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
-- **A pipe's write end answers this kernel's own errno to the two size-changing calls.** Measured
-  on a current host through `syscall(2)` (`.workbuddy/probe_getfl.c`, Linux 7.2.9): a pipe's
-  *read* end answers `EINVAL` to `ftruncate` and `EBADF` to `fallocate` — the access mode refuses
-  both before the file type is asked, which is that kernel's `!(f_mode & FMODE_WRITE)` check — and
-  its *write* end answers `EINVAL` to `ftruncate` (a pipe inode has no `setattr`) and `ESPIPE` to
-  `fallocate`. This kernel answers Linux's two read-end errnos now, because the mode refuses them
-  (`docs/uapi/` §5.1 item 21); the write end still reaches this kernel's VFS defaults —
-  `EOPNOTSUPP` for `ftruncate` and `ENODEV` for `fallocate` — because a pipe here is built out of
-  a `File` inode and the handlers' "not a regular file" tests do not catch it. (The `ENODEV` is
-  the fallocate man page's word, which is what the pin used to carry for *both* ends; neither
-  machine answers it for a pipe.) Owner: `src/syscall/linux/fs/file.rs`'s
-  `handle_ftruncate`/`handle_fallocate`, or the pipe inode whose `truncate` default answers one of
-  them. Pins: `t-truncate` and `t-fallocate`, each of which now claims both ends — the read end on
-  both machines, the write end named per machine.
+- **A FIFO made by `mknod` is a regular file to this kernel, so the size-changing calls resize
+  it.** `mknodat(S_IFIFO)` here makes a `NodeKind::File` node - `src/syscall/linux/abi.rs`'s own
+  `mknod_kind` maps `0o010000` to `File`, and its unit test pins that mapping - so it is a
+  regular file in every way the callers ask: `ftruncate`/`truncate` resize it, and `open`, `read`
+  and `write` treat it as one. Measured on a current host through `syscall(2)`
+  (`.workbuddy/probe_fsize.c`): a `mknod`'d name is a *pipe* to Linux - `truncate(name, 4)` is
+  `EINVAL`, its read end's `ftruncate` is `EINVAL` and its `fallocate` is `EBADF` (the mode check
+  again, §5.1 items 21 and 22), and a read end opened `O_NONBLOCK` with no writer at all answers
+  `0`, which is a pipe's end-of-file rather than a file's. So the remaining hole in the
+  size-changing calls is the *other* inode that reports `NodeKind::File` without being a regular
+  file: the pipe is the one `docs/uapi/` §5.1 item 22 asks `as_pipe` for, and this is the one it
+  cannot see. Owner: `abi.rs`'s `mknod_kind` and the node `handle_mknodat` builds from it - which
+  is the real decision, since a FIFO is a channel and a file-shaped node under a FIFO's name is
+  the wrong shape for both. **Our half is read from the code rather than measured** (no test
+  makes a FIFO yet), which is what makes this an entry rather than a pin.
+
+- **A pipe cannot be named by its own descriptor's procfs link here.** `truncate(2)` is
+  `ftruncate(2)` by name, and a pipe has no name of its own - so on Linux the way to spell it is
+  the descriptor's own entry: measured through `syscall(2)` on a current host
+  (`.workbuddy/probe_fsize.c`), `truncate("/proc/self/fd/<a pipe's write end>", 4)` follows that
+  magic link to the *inode* and answers `EINVAL`, exactly as the path spelling answers for
+  `/dev/null` and as `ftruncate` does for the descriptor. Here the name does not resolve at all:
+  `/proc/<pid>/fd`'s entries are symlinks whose target is the descriptor's display name
+  (`pipe:[ino]`), which is not a path - so the same call answers `ENOENT` before any inode is
+  reached. **Our half is read from the code rather than measured** (`src/vfs/procfs.rs`'s
+  `Descriptors` builds `NodeKind::Symlink` entries and `fd_target` answers the display string for
+  an anonymous descriptor), which is what makes this a named entry rather than a pin: closing it
+  means resolving a magic link to the *description* for the descriptors that have no name -
+  `open_opt`'s `as_fd` path is where `/dev/stdout` already does that - and the question is
+  therefore about `src/vfs/procfs.rs` rather than about the size-changing calls. Owner:
+  `src/vfs/procfs.rs`'s `Descriptors`/`fd_link` + `src/vfs/mod.rs`'s resolver.
 
 - **The reported `F_GETFL` word holds the mode and the two flags, where Linux's holds more.**
   **Landed 2026-10-16** (`docs/uapi/` §5.1 item 21) for the half a caller reads to learn a

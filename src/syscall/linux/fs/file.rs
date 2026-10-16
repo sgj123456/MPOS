@@ -634,8 +634,15 @@ pub fn ftruncate(args: [usize; ARG_COUNT]) -> isize {
     };
     // Linux refuses to resize anything but a regular file, and `EINVAL` is
     // what a caller reads as "this descriptor is not that": a pipe, a
-    // terminal, a socket.
-    if file.metadata().kind != NodeKind::File {
+    // terminal, a socket. A pipe's inode reports [`NodeKind::File`] - the
+    // vocabulary's only word for an unnamed channel, and the word `epoll`'s
+    // pollable test reads it by - so the pipe is asked about separately, or the
+    // refusal comes from the node's default `truncate` as `EOPNOTSUPP`.
+    // Measured on the host (`.workbuddy/probe_fsize.c`): `ftruncate` answers
+    // `EINVAL` on *both* ends of a pipe - the read end through the write-mode
+    // check below, and the write end because a pipe's inode has no `setattr`
+    // for the resize to reach.
+    if file.metadata().kind != NodeKind::File || file.inode().as_pipe().is_some() {
         return err::EINVAL;
     }
     // `ftruncate` is a write, so a descriptor opened read-only is refused - and
@@ -681,6 +688,21 @@ pub fn truncate(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(inode) => inode,
         Err(e) => return err_of(e),
     };
+    // Only a regular file has a size to set, and Linux's two answers for what
+    // is not one are the ones `setattr_prepare` gives: a directory is `EISDIR`,
+    // and anything else that is not a regular file is `EINVAL` - measured
+    // through `syscall(2)` on the host (`.workbuddy/probe_fsize.c`), where
+    // `/tmp` answers `EISDIR` and `/dev/null` answers `EINVAL`. The question is
+    // asked here rather than left to the node, because the node's default
+    // `truncate` answers `EOPNOTSUPP` - the refusing shape `src/vfs/ext4/`'s own
+    // inode already gets right for its tree (`Dir` is `IsDir`, everything else
+    // that is not a file is `Invalid`), and this door is the one that reaches
+    // every other filesystem's nodes.
+    match inode.metadata().kind {
+        NodeKind::File => {}
+        NodeKind::Dir => return err::EISDIR,
+        _ => return err::EINVAL,
+    }
     // Emptying a file is a write to it, whatever the caller's descriptor
     // situation: Linux asks for write permission here, and `truncate` on a
     // file the caller may only read is EACCES rather than a silent success.
@@ -5103,14 +5125,19 @@ pub fn handle_fallocate(args: [usize; ARG_COUNT]) -> isize {
         return err::EBADF;
     }
     match file.metadata().kind {
-        // A pipe's metadata answers `File` - the vocabulary's only word for
-        // an unnamed channel - but it has no byte range to lay out, so it
-        // lands in the ENODEV arm with the other non-files.
-        NodeKind::File if file.inode().as_pipe().is_none() => {}
+        // A pipe's metadata answers `File` - the vocabulary's only word for an
+        // unnamed channel - and it is told apart here by the node, because its
+        // answer is *not* the `ENODEV` below: measured on the host
+        // (`.workbuddy/probe_fsize.c`), a writable pipe end answers `ESPIPE`
+        // where a socket, an anon-inode descriptor and a character device all
+        // answer `ENODEV`. The unwritable end never reaches this match - the
+        // write-mode check above answers `EBADF`, which is Linux's own order.
+        NodeKind::File if file.inode().as_pipe().is_some() => return err::ESPIPE,
+        NodeKind::File => {}
         NodeKind::Dir => return err::EISDIR,
-        // A pipe, a terminal, a socket: no byte range to lay out. The
-        // man page's ENODEV line about descriptors that are neither
-        // files nor directories lands here.
+        // A socket, an anon-inode descriptor, a character device: no byte range
+        // to lay out. The man page's ENODEV line about descriptors that are
+        // neither files nor directories lands here.
         _ => return err::ENODEV,
     }
     // A range past the end of what an offset can name is EFBIG, the

@@ -429,3 +429,42 @@ the commit bodies), and each moved its pin in the same commit.
     `O_NOFOLLOW`, `O_PATH`, `O_SYNC`/`O_DSYNC`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME`), none of which
     this kernel stores or implements. `docs/uapi/` §5.2 carries that set with the probe's
     transcript, which is §15.16(a) corrected.
+
+22. **The size-changing calls tell what is not a regular file apart, with Linux's own errnos.**
+    `ftruncate(2)`, `truncate(2)` and `fallocate(2)` all mean "this descriptor's file changes
+    size", and all three asked the *kind* of the node here — which a pipe answers
+    `NodeKind::File`, the vocabulary's only word for an unnamed channel (and the word `epoll`'s
+    pollable test reads it by), so a pipe slipped past the "not a regular file" refusals and
+    reached the VFS default `truncate`'s `EOPNOTSUPP`; `truncate(path)` had no kind test at all,
+    so a *directory* and a character device reached it too. Measured on a current host through
+    `syscall(2)` (`.workbuddy/probe_fsize.c`, Linux 7.2.9 — the whole descriptor zoo in one run).
+    **The descriptor spelling**: `ftruncate` answers `EINVAL` for every non-file (a pipe's two
+    ends, a socket, a `socketpair` end, an `eventfd`, a `timerfd`, a `signalfd`, an `inotify`
+    queue, an `epoll`, a character device, a directory) and `0` for a regular file and a `memfd`;
+    `fallocate` answers `EBADF` when the *mode* refuses first (a pipe's read end,
+    `inotify_init1`'s readable-only queue, a directory opened `O_RDONLY`), `ESPIPE` for a FIFO
+    whose mode permits the write, and `ENODEV` for everything else that is not a file. **The path
+    spelling answers differently**, which is why it is its own measurement: a directory is
+    `EISDIR` (where `ftruncate` on one is `EINVAL`, because its write-mode check answers first
+    and a directory cannot be opened for writing), and everything else that is not a regular file
+    is `EINVAL`. So the divergences were one per call, per end and per door: `ftruncate` on a
+    pipe's write end answered `EOPNOTSUPP` here (`t-truncate` had named it since batch 15) where
+    Linux answers `EINVAL`; `fallocate` on it answered `ENODEV` where Linux answers `ESPIPE`; and
+    `truncate(path)` answered `EOPNOTSUPP` for a directory and for a device. The two *read*-end
+    answers had already moved to Linux's in §5.1 item 21, because the description's mode refuses
+    them before the type is asked — Linux's own order, and the probe is what says so. **The fix
+    asks the node** where the kind lies, and asks directly where there was no test: `ftruncate`
+    takes `as_pipe` beside the kind (`EINVAL`), `handle_fallocate` answers a pipe `ESPIPE` (the
+    `ENODEV` arm keeps the rest), and `truncate(path)` gained the pair of refusals
+    `src/vfs/ext4/`'s own inode already spelled for its tree (`Dir` → `EISDIR`, else `EINVAL`).
+    Nothing else in the zoo moved: a socket, an anon-inode descriptor and a character device all
+    report `NodeKind::CharDev` here, so the kind tests already told them apart, and a `memfd` is a
+    real file on both machines. Pins: `t-truncate` (31 claims) and `t-fallocate`, each claiming
+    **both** ends of its pipe, plus the path spelling's two refusals — and `t-truncate` is now a
+    program with no per-machine branch and no named divergence of its own. The `ENODEV` those two
+    tests had carried for *both* ends was the fallocate man page's word rather than either
+    machine's answer for a pipe. Two things stay named in §5.2, each with its measurement: a pipe
+    reached by its own `/proc/<pid>/fd` name (Linux resolves that magic link to the inode and
+    answers `EINVAL`; here the link's target is the descriptor's display string, which is not a
+    path), and the *other* inode that reports `NodeKind::File` without being a regular file — a
+    FIFO made by `mknod`, which is a pipe to Linux and a resizable file to this kernel.

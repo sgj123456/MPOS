@@ -9,10 +9,10 @@
 //! KEEP_SIZE inside an existing file changes nothing - the flag's promise is
 //! about the writes that come, and on this kernel they cannot fail for lack of
 //! room anyway. The non-file pair is a pipe's two ends, and the man page's
-//! `ENODEV` is not what either machine answers for one: the read end is
-//! read-only and gets `EBADF` on both, and the write end is `ENODEV` here
-//! beside Linux's `ESPIPE` (both measured through `syscall(2)`,
-//! `.workbuddy/probe_getfl.c`).
+//! `ENODEV` is not what a pipe answers on either machine: the read end is
+//! read-only and gets `EBADF`, and the write end is a FIFO, which is the one
+//! non-file Linux answers `ESPIPE` to - both measured through `syscall(2)`
+//! (`.workbuddy/probe_fsize.c`), and both this kernel's answer now.
 //!
 //! # Why this one is all `rustix`
 //!
@@ -160,11 +160,12 @@ fn main() {
     // the measurement corrected this pair twice over. The read end is
     // read-only, so the mode refuses it first with Linux's own `EBADF` (that
     // kernel's `!(f_mode & FMODE_WRITE)` answers `EBADF` for `fallocate` the
-    // way it answers `EINVAL` for `ftruncate`) - measured through `syscall(2)`
-    // on this host, `.workbuddy/probe_getfl.c`. The write end is writable and
-    // reaches the handler: `ENODEV` here, and `ESPIPE` on Linux - so the man
-    // page's `ENODEV` this test used to pin for *both* ends was the man page's
-    // word rather than either machine's answer for a pipe.
+    // way it answers `EINVAL` for `ftruncate`). The write end is writable and
+    // reaches the inode, where a FIFO is the one non-file Linux answers
+    // `ESPIPE` to rather than `ENODEV` (measured through `syscall(2)` on this
+    // host, `.workbuddy/probe_fsize.c`) - so the man page's `ENODEV` this test
+    // used to pin for *both* ends was the man page's word rather than either
+    // machine's answer.
     match pipe_with(PipeFlags::empty()) {
         Ok((read_end, write_end)) => {
             r.check("the pipe pair is made", true);
@@ -172,19 +173,15 @@ fn main() {
                 "a pipe's read end answers EBADF, as Linux does",
                 fallocate(&read_end, FallocateFlags::empty(), 0, 1) == Err(Errno::BADF),
             );
-            let e = fallocate(&write_end, FallocateFlags::empty(), 0, 1).err();
             r.check(
-                "a pipe's write end answers ENODEV on mpos, ESPIPE on Linux",
-                e == Some(Errno::NODEV) || (mpos_user_tests::host_run() && e == Some(Errno::SPIPE)),
+                "a pipe's write end answers ESPIPE, as Linux does",
+                fallocate(&write_end, FallocateFlags::empty(), 0, 1) == Err(Errno::SPIPE),
             );
         }
         Err(_) => {
             r.check("the pipe pair is made", false);
             r.check("a pipe's read end answers EBADF, as Linux does", false);
-            r.check(
-                "a pipe's write end answers ENODEV on mpos, ESPIPE on Linux",
-                false,
-            );
+            r.check("a pipe's write end answers ESPIPE, as Linux does", false);
         }
     }
     // The number is not part of the claim, the descriptor table's empty row is;
