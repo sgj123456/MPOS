@@ -35,7 +35,8 @@
 //! **What is not here**: the number the namespace is known by (`src/vfs/ns.rs`
 //! mints it, from the one pool every kind draws from), the slot on the task that
 //! holds one of these, and the readers that ask it to translate (the `getuid`
-//! family, and - not yet - `stat`). This is the value and its grammar; those are
+//! family, `stat`'s four doors, and the unix socket's
+//! `SO_PEERCRED`/`SCM_CREDENTIALS`). This is the value and its grammar; those are
 //! whose it is and who reads it.
 
 extern crate alloc;

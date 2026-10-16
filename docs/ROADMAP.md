@@ -78,16 +78,19 @@ One-glance status of the whole roadmap.
   `vfs::ns::Entry::ALL` against `namespaces(7)`'s list of eight. **USER joined on 2026-10-16**: it
   moves its caller like NET, the map starts empty so the caller lands on the overflow id, `uid_map`
   takes one self-naming line and then answers `EPERM`, and the four `getuid`-family readers
-  translate the stored id through the task's namespace (`t-ns-user`, 35 claims). The same
+  translate the stored id through the task's namespace (`t-ns-user`, 40 claims). The same
   translation renders what a *file* reports now: `stat`/`fstat`/`fstatat`/`statx` map the stored
   owner through the reader's namespace, so a file created before an unshare reads the stored id
   from the machine map and the inside id from the new one, `statx` agreeing with `stat` (§6.3,
-  measured on the host first). And the rung's other half landed too: entering a namespace **is the
+  measured on the host first). It renders what a *socket* reports too (2026-10-16): `SO_PEERCRED`
+  and the `SCM_CREDENTIALS` a read carries map the peer's stored ids through the reading task's
+  namespace, at the read rather than at capture (§6.3, measured on the host first). And the rung's
+  other half landed too: entering a namespace **is the
   grant** - `unshare`/`setns` hand the maker the full effective, permitted and bounding sets,
   measured on the host across all four doors, so a caller that drops its capabilities first reads
   them back the instant it is in a namespace it made (§6.3). What stays named is the child-side
-  creation of `clone(CLONE_NEWUSER)` and the `SO_PEERCRED`/`SCM_CREDENTIALS` pair, a different
-  family carrying the same stored-id shape
+  creation of `clone(CLONE_NEWUSER)`, the `ucred` pid (a pid-namespace question), and the
+  netlink/uevent family's own `ucred` render
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
@@ -227,13 +230,16 @@ In the order that keeps each step verifiable on its own:
    landed is the map object and the translation at the four `getuid`-family readers, pinned in 23
    claims, and then the same translation at the four `stat`-family doors (2026-10-16) - a file
    created before an unshare reads the stored id from the machine map and the inside id from the
-   new one, `statx` agreeing with `stat` (§6.3, measured on the host first). And the rung's other
+   new one, `statx` agreeing with `stat` (§6.3, measured on the host first). A third surface, the
+   socket's, landed on 2026-10-16: `SO_PEERCRED` and the `SCM_CREDENTIALS` a read carries map the
+   peer's stored ids through the reading task's namespace, at the read rather than at capture
+   (§6.3, measured on the host first). And the rung's other
    half, the **capability grant**, landed on 2026-10-16 as well: entering a namespace is itself the
    grant, so `unshare`/`setns` hand the maker the full effective, permitted and bounding sets
-   (`t-ns-user`, 35 claims, a caller that drops first reads them back), measured across all four
-   doors on the host (§6.3). What stays named is the child-side creation of `clone(CLONE_NEWUSER)`
-   and the `SO_PEERCRED`/`SCM_CREDENTIALS` pair, which carries the same stored-id shape from a
-   different family. IPC and CGROUP each wait on the thing they would isolate not
+   (`t-ns-user`, 40 claims, a caller that drops first reads them back), measured across all four
+   doors on the host (§6.3). What stays named is the child-side creation of `clone(CLONE_NEWUSER)`,
+   the `ucred` pid (a pid-namespace question), and the netlink/uevent family's own `ucred` render.
+   IPC and CGROUP each wait on the thing they would isolate not
    existing yet (SysV/POSIX message queues; a cgroup tree), so they are cheap the day that lands
    and worthless before it. Nested namespaces pin the
    *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were

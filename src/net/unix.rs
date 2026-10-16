@@ -96,6 +96,11 @@ pub const SUN_PATH_MAX: usize = 108;
 /// `struct ucred`, the credential payload `SO_PEERCRED` and the
 /// `SCM_CREDENTIALS` control message carry. Linux fills `pid` with the peer's
 /// thread-group id, and `uid`/`gid` with its *real* ids.
+///
+/// These are the ids the machine **stores** - the parent namespace's numbering.
+/// What a reader sees is this mapped through the reader's own user namespace at
+/// the render, which is `socket.rs`'s `observed_cred`; a task that never
+/// unshares is in the identity map and reads exactly these back.
 #[derive(Clone, Copy, Default)]
 pub struct UCred {
     pub pid: u32,

@@ -487,6 +487,31 @@ unsafe fn collect_scm_rights(
     }
 }
 
+/// Map a stored `ucred` through the **reading task's** user namespace.
+///
+/// An id is stored once, in the machine's numbering, and every door that shows
+/// one to a task shows it through the namespace that task reads its ids in -
+/// the same rule `stat`'s `st_uid` follows (`syscall::linux::fs::file`'s
+/// `observed_owner`). `SO_PEERCRED` and `SCM_CREDENTIALS` are the socket doors
+/// to that rule: Linux stores the peer's or sender's ids as kernel ids and
+/// renders them with `from_kuid_munged(current_user_ns(), ...)` at the *read*,
+/// so a reader inside a namespace sees its own table's number - and
+/// [`crate::userns::NO_MAP_ID`] for an id its table does not cover. Measured
+/// with a reader that reads once before it unshares and again after: both
+/// surfaces move `0 -> 7` while nothing about the peer changes
+/// (`.workbuddy/probe-userns8.c`; `docs/notes/` §6.3).
+///
+/// The `pid` is left alone: which pid a reader sees is the *pid* namespace's
+/// question, not this one.
+fn observed_cred(c: crate::net::unix::UCred) -> crate::net::unix::UCred {
+    let ns = crate::sched::current_user_ns();
+    crate::net::unix::UCred {
+        pid: c.pid,
+        uid: ns.uid_to_inner(c.uid),
+        gid: ns.gid_to_inner(c.gid),
+    }
+}
+
 /// Build the `recvmsg` control chain for a unix/Socketpair read: an optional
 /// `SCM_CREDENTIALS` (when the reader set `SO_PASSCRED`) then the queued
 /// descriptors as `SCM_RIGHTS`, installing each into the reader's table.
@@ -508,7 +533,7 @@ unsafe fn emit_unix_control(
         let mut used = 0usize;
         let mut trunc = false;
 
-        if let Some(c) = want_cred {
+        if let Some(c) = want_cred.map(observed_cred) {
             let need = cmsg_space(UCREN_LEN);
             if writable && used + need <= capacity {
                 let m = control as *mut u8;
@@ -4589,6 +4614,9 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
             return err::EINVAL;
         }
         if cred {
+            // The stored peer's ids are mapped through *this* reader's user
+            // namespace at the read, which is where Linux renders them.
+            let c = observed_cred(c);
             unsafe {
                 if cap >= 4 {
                     (optval as *mut u32).write_unaligned(c.pid);

@@ -581,13 +581,48 @@ own namespace - which is every gate here - and wrong for a check scoped to an *a
 sibling (a `setns` into a namespace the caller does not own, a signal across a namespace
 boundary). A scoped `capable_in(ns, cap)` is the named gap.
 
+**Step 6d, landed: the socket surface, and the third reader of the same table.** The two surfaces
+above read an id a task stores about *itself* (`getuid`) and an id an *inode* stores (`stat`); a
+socket is the third - the ids a *peer* or a *message* carries, which `SO_PEERCRED` and
+`SCM_CREDENTIALS` hand the reader as a `struct ucred`. `.workbuddy/probe-userns8.c` measures the
+shape on this host (7.2.9), run as root and unprivileged, with a reader that reads once *before* it
+unshares and again *after*, so capture-time and read-time translation are told apart:
+
+| question | Linux's answer |
+|---|---|
+| `SO_PEERCRED` on a pair, read in the machine namespace | `uid=gid=<stored>` - the creator's ids, which for a pair are both ends' peer |
+| the **same** read, after `unshare(CLONE_NEWUSER)` and a map `7 <- <stored>` | `uid=gid=7` - the stored id mapped through the reader's table |
+| `SCM_CREDENTIALS` a read carries, read in the machine namespace | the *sender's* stored ids |
+| the **same** message, read inside the namespace | `uid=gid=7` |
+
+Two facts decide the implementation. The translation is at the **read**, not at capture - the
+second read of an unchanged pair moves - so the boundary is again the ABI write and not the socket
+object, exactly as Step 6b found for the inode. And the *pid* in the same `ucred` is a **pid**
+namespace's question, not this one: it is left alone here and named below.
+
+What landed is one helper, `observed_cred`, applied at the two doors a unix socket renders a
+`ucred` through - `emit_unix_control`'s `SCM_CREDENTIALS` and the `SO_PEERCRED` `getsockopt` (both
+the `UnixSock` and the anonymous `DuplexEnd` pair) - beside the four `stat` doors that use the same
+rule. The pin is four more claims in `t-ns-user` (40 now): the pair reads the stored id under the
+machine's identity map, the overflow id with the table still empty, and the inside `7` after the
+maps exist, on both `SO_PEERCRED` and `SCM_CREDENTIALS` - the inside id is `7`, a number no stored
+id on this machine is, so none of them can pass by accident.
+
+The counterfactual: with the two call sites removed (the helper kept, so stage 1 stays green) the
+gate runs `pass=174 fail=1` and the one red program is `t-ns-user`, red in exactly **three** claims
+- the empty-map read, and the two after the map - while the identity-map claim stays green. That it
+survives is the same isolation Step 6b's counterfactual showed: a task that never unshares is not
+disturbed.
+
 **What is named and not built.** The **child-side creation** of `clone(CLONE_NEWUSER)`: Linux
 serves the door and this kernel refuses it `EOPNOTSUPP` because the child would have to be born
 in a fresh namespace (`copy_process`'s order, and what a group sharing an address space means
-for the kind), which wants its own measurement. And a third observation surface sits beside the
-two this rung has now, named rather than built because it is a different family: the ids a
-`SO_PEERCRED`/`SCM_CREDENTIALS` pair carries are the peer's *stored* ones here, and Linux maps
-those through the reader's namespace too.
+for the kind), which wants its own measurement. The **pid** field of a `ucred` is left
+untranslated: Linux renders it with `pid_vnr` in the reader's *pid* namespace, which is that rung's
+question and not this one, so a peer in a different pid namespace would read the wrong number here.
+And a third `ucred` render sits in the **netlink/uevent** family (`recvmsg_netlink`), whose
+kernel-origin messages carry synthetic zero ids; whether Linux maps those through the reader's user
+namespace is a measurement of *that* family, so it is left for it.
 
 
 **And one trap in the measuring, worth its line**: a first draft of the raw-netlink-style probe

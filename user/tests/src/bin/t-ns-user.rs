@@ -29,6 +29,13 @@
 //! a file created before the unshare reads the stored id from the machine map and
 //! the inside id from the new one, with nothing about the file changed.
 //!
+//! A *socket* is the third surface, and the same rule: `SO_PEERCRED` and the
+//! `SCM_CREDENTIALS` a read carries hand the reader the peer's or sender's
+//! **stored** ids, mapped through the reading task's namespace. One pair, made
+//! before the unshare, reads the stored id under the machine map, the overflow id
+//! with the table still empty, and the inside id once the maps exist - three
+//! answers from an unchanged pair, differing only in the observer.
+//!
 //! # The grant, the other half of the rung
 //!
 //! Making a user namespace needs no capability, because it **is** the grant: the
@@ -218,6 +225,69 @@ fn prctl(op: libc::c_int, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
     }
 }
 
+/// A `SOCK_DGRAM` unix pair, as the two descriptor numbers, or `None` when the
+/// pair could not be made. The third observation surface this rung has - what a
+/// *socket* carries - is asked through it.
+fn socketpair_dgram() -> Option<[i32; 2]> {
+    let mut sv = [0i32; 2];
+    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sv.as_mut_ptr()) };
+    (rc == 0).then_some(sv)
+}
+
+/// `getsockopt(SO_PEERCRED)`, as the `(uid, gid)` a reader sees. `struct ucred`
+/// is `{ pid, uid, gid }`, three 32-bit words; the `pid` is a *pid* namespace's
+/// question and is not read here.
+fn peer_cred(fd: i32) -> Option<(u32, u32)> {
+    let mut c = [0u32; 3];
+    let mut len = core::mem::size_of::<[u32; 3]>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            c.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    (rc == 0).then(|| (c[1], c[2]))
+}
+
+/// Receive one datagram and answer the `(uid, gid)` of the `SCM_CREDENTIALS`
+/// control message the kernel attached, or `None` when none arrived. The header
+/// is read field by field - a `size_t` at 0, the level at 8, the type at 12, the
+/// `struct ucred` at 16 - because the two libcs disagree about `cmsghdr`'s shape
+/// while the kernel writes one layout regardless.
+fn recv_ucred(fd: i32, buf: &mut [u8]) -> Option<(u32, u32)> {
+    #[repr(C, align(8))]
+    struct Ctrl {
+        w: [usize; 6],
+    }
+    let mut ctrl = Ctrl { w: [0; 6] };
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctrl.w.as_mut_ptr().cast();
+    msg.msg_controllen = core::mem::size_of::<Ctrl>() as _;
+    let rc = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+    if rc < 0 {
+        return None;
+    }
+    let base = ctrl.w.as_ptr().cast::<u8>();
+    let level = unsafe { base.add(8).cast::<i32>().read_unaligned() };
+    let ctype = unsafe { base.add(12).cast::<i32>().read_unaligned() };
+    if level != libc::SOL_SOCKET || ctype != libc::SCM_CREDENTIALS {
+        return None;
+    }
+    Some((
+        unsafe { base.add(20).cast::<u32>().read_unaligned() },
+        unsafe { base.add(24).cast::<u32>().read_unaligned() },
+    ))
+}
+
 fn main() {
     let mut r = Report::new();
 
@@ -262,6 +332,26 @@ fn main() {
         "an id reads as itself under the identity map",
         outer == unsafe { libc::geteuid() } as u32,
     );
+
+    // ---- The third observation surface: what a *socket* carries ----
+    //
+    // A pair made here - before the unshare - stores the creator's ids, exactly
+    // as a connected socket stores its peer's at connect. Read now, under the
+    // identity map, the peer reads back as the stored id: a task that never
+    // unshares is not disturbed, which is the same property the file below has.
+    // The pair is kept for the two reads that come after the unshare, so the
+    // only thing that moves between them is the observer.
+    let sock = socketpair_dgram();
+    r.check(
+        "a socketpair for the credential read is made",
+        sock.is_some(),
+    );
+    if let Some([a, _b]) = sock {
+        r.check(
+            "a socket peer reads back as the stored id under the identity map",
+            peer_cred(a) == Some((outer, outer)),
+        );
+    }
 
     // ---- The other half of the same translation: what a *file* reports ----
     //
@@ -319,6 +409,16 @@ fn main() {
         read_file("/proc/self/uid_map").as_deref() == Some(""),
     );
 
+    // The socket door to the same empty table: the pair's stored ids are still
+    // the creator's, and a reader with no map sees the overflow id for them -
+    // the socket equivalent of the `getuid` reading just above.
+    if let Some([a, _b]) = sock {
+        r.check(
+            "with an empty map, a socket peer reads the overflow id",
+            peer_cred(a) == Some((NO_MAP_ID, NO_MAP_ID)),
+        );
+    }
+
     // ---- The map is what gives the inside an id a name ----
     //
     // The line names the id the caller is *stored* under, which is the machine's
@@ -365,6 +465,41 @@ fn main() {
         "setgroups cannot be turned back on once the gid map exists",
         write_file("/proc/self/setgroups", "allow\n") == -(libc::EPERM as isize),
     );
+
+    // ---- And now the same socket reads the inside id ----
+    //
+    // Nothing about the pair changed; only the observer's table did. `SO_PEERCRED`
+    // and the `SCM_CREDENTIALS` a read carries are mapped through the reading
+    // task's namespace, so the stored `outer` the socket holds reads as the inside
+    // `7` - a number no stored id on this machine is, so the claim cannot pass by
+    // accident. This is the third surface the rung's ladder named, beside `getuid`
+    // and `stat`.
+    if let Some([a, b]) = sock {
+        r.check(
+            "the same socket peer now reads the inside id",
+            peer_cred(a) == Some((7, 7)),
+        );
+        // The control-message door to the same stored id: set `SO_PASSCRED` on
+        // the reader, send a datagram from the far end, and read the record the
+        // kernel attaches - the sender's stored ids, rendered here.
+        let one: libc::c_int = 1;
+        let passcred = unsafe {
+            libc::setsockopt(
+                b,
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                (&one as *const libc::c_int).cast(),
+                core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        let sent = unsafe { libc::send(a, b"c".as_ptr().cast(), 1, 0) };
+        let mut buf = [0u8; 8];
+        let cred = recv_ucred(b, &mut buf);
+        r.check(
+            "SCM_CREDENTIALS on the same socket reads the inside id",
+            passcred == 0 && sent == 1 && cred == Some((7, 7)),
+        );
+    }
 
     // ---- The same file, observed from inside the new namespace ----
     //
