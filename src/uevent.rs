@@ -11,7 +11,12 @@
 //! (`add@/devices/...`), then `KEY=VALUE` entries, each NUL-terminated. The
 //! kernel sends it to every socket that asked for the group, and the receiver
 //! recognises kernel origin - not by trusting a field, but by the credentials
-//! the kernel stamps on what it sends: `uid 0`, `nl_pid 0`.
+//! the kernel stamps on what it sends: `uid 0`, `nl_pid 0`. Those are the ids as
+//! *stored*; a read renders them through the reader's own user namespace, the
+//! way every other id this kernel shows is rendered (`net::socket`'s
+//! `observed_event_cred`), so a listener that recognises the kernel by `uid 0`
+//! is in the machine namespace. Measured, and Linux's own rule
+//! (`.workbuddy/probe-nluevent.c`; `docs/notes/` §6.3).
 //!
 //! **And userland sends on it too, which is the other half of udev.** The
 //! device manager hands each event to one of its workers with a *unicast* to
@@ -219,13 +224,21 @@ pub struct Message {
     pub from_pid: u32,
     /// The group the message was broadcast to, or 0 if it was unicast.
     pub group: u32,
-    /// The sender's credentials. All zero for the kernel's own messages, which
-    /// is how a listener tells kernel origin from a peer's.
+    /// The sender's credentials, as stored. All zero for the kernel's own
+    /// messages, which is how a listener tells kernel origin from a peer's - a
+    /// read renders the ids through the reader's user namespace, so the zero a
+    /// machine-namespace listener reads is the *stored* one.
     pub cred: Cred,
 }
 
 /// `struct ucred`: who sent a message. The uevent family's own copy of the
 /// type, because `net::unix` is bare-metal only and this module is not.
+///
+/// The numbers are the ones the machine **stores**: `uid`/`gid` as kernel ids,
+/// and `pid` as the sender's number in the sender's *own* pid namespace (Linux
+/// resolves it once, at send). A read maps the ids through the reader's user
+/// namespace (`net::socket`'s `observed_event_cred`); the pid is already
+/// resolved and is left alone.
 #[derive(Clone, Copy, Default)]
 pub struct Cred {
     pub pid: u32,

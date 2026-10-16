@@ -49,9 +49,20 @@ use crate::vfs::{Inode, Metadata, NodeKind, Ready, VfsError};
 /// under the event bus, and the bus that carries `/sys` announcements keeps
 /// its host build free of a task table by never reaching up for one. Read
 /// outside any socket lock, the way `net::unix::self_cred` does.
+///
+/// The pid is the number the **sender's own** namespace gives it - what
+/// `getpid` answers for the sender - because that is what Linux stores in both
+/// places this pair is used: `scm_set_cred`'s `pid_vnr(task_tgid(current))` for
+/// the `ucred` pid, and `netlink_autobind`'s `task_tgid_vnr(current)` for the
+/// port id a zero-`nl_pid` bind prefers. Measured: a sender inside a fresh pid
+/// namespace reads its number *there* (`1`) in a peer's `ucred`, and the port
+/// id its own bind is given is that same `1` (`.workbuddy/probe-nlpid.c`;
+/// `docs/notes/` §6.3). The machine namespace numbers a task by its slot, so
+/// only a sender that has unshared sees a difference.
 fn task_identity() -> (crate::uevent::Cred, u32) {
     let (uid, gid) = crate::sched::current_real_owner();
-    let pid = crate::sched::current_tgid().0 as u32;
+    let pid = crate::sched::pid_number_of(crate::sched::current_tgid())
+        .unwrap_or_else(crate::sched::current_pid_number);
     (crate::uevent::Cred { pid, uid, gid }, pid)
 }
 
@@ -527,6 +538,32 @@ fn observed_cred(c: crate::net::unix::UCred) -> crate::net::unix::UCred {
     }
 }
 
+/// Map a stored uevent `Cred` through the **reading task's** user namespace.
+///
+/// The netlink family renders its ids the way the unix family does
+/// ([`observed_cred`]): stored once as kernel ids, mapped through the reader's
+/// table at the read. Measured with a reader in a user namespace that maps the
+/// stored uid to another id - a peer's ids and the **kernel's own zero ids**
+/// both move to the reader's number (`.workbuddy/probe-nlcred.c`,
+/// `.workbuddy/probe-nluevent.c`; `docs/notes/` §6.3). That is why a listener
+/// that recognises kernel origin by `uid 0` is in the machine namespace,
+/// exactly as on Linux: the zero is the *stored* id, and a reader whose table
+/// does not cover it is told [`crate::userns::NO_MAP_ID`].
+///
+/// The `pid` is **not** the reader's to render. Linux computes it once, at
+/// send, as the sender's number in the sender's own pid namespace
+/// (`scm_set_cred`'s `pid_vnr`), so a reader in a different pid namespace reads
+/// the sender's number and not its own - `task_identity` stores that number,
+/// and this leaves it alone.
+fn observed_event_cred(c: crate::uevent::Cred) -> crate::uevent::Cred {
+    let ns = crate::sched::current_user_ns();
+    crate::uevent::Cred {
+        pid: c.pid,
+        uid: ns.uid_to_inner(c.uid),
+        gid: ns.gid_to_inner(c.gid),
+    }
+}
+
 /// Build the `recvmsg` control chain for a unix/Socketpair read: an optional
 /// `SCM_CREDENTIALS` (when the reader set `SO_PASSCRED`) then the queued
 /// descriptors as `SCM_RIGHTS`, installing each into the reader's table.
@@ -749,7 +786,9 @@ fn park_until(ready: impl Fn() -> bool) -> isize {
 ///     peer is told "this came from the kernel", and the sender's own port id
 ///     for a message another process sent - which is what a worker compares
 ///     against the sender its manager told it to trust.
-///   * `SCM_CREDENTIALS` - `uid 0, gid 0, pid 0` for a kernel event.
+///   * `SCM_CREDENTIALS` - `uid 0, gid 0, pid 0` for a kernel event, with the
+///     ids rendered through the **reader's** user namespace (the peer's or the
+///     kernel's stored ids, mapped at the read; `observed_event_cred`).
 ///     `nlplug-findfs` drops every message that arrives without credentials,
 ///     which makes this the difference between an initramfs that finds its
 ///     root and one that waits forever; libudev's monitor demands the record
@@ -835,10 +874,13 @@ fn recvmsg_netlink(
             (at as *mut u64).write_unaligned(CMSG_LEN as u64); // cmsg_len
             (at.add(8) as *mut i32).write_unaligned(SOL_SOCKET); // cmsg_level
             (at.add(12) as *mut i32).write_unaligned(SCM_CREDENTIALS); // cmsg_type
-            // struct ucred { pid, uid, gid }.
-            (at.add(16) as *mut i32).write_unaligned(message.cred.pid as i32);
-            (at.add(20) as *mut u32).write_unaligned(message.cred.uid);
-            (at.add(24) as *mut u32).write_unaligned(message.cred.gid);
+            // struct ucred { pid, uid, gid }, with the ids rendered through
+            // *this* reader's user namespace, the same rule the unix family's
+            // `observed_cred` follows.
+            let cred = observed_event_cred(message.cred);
+            (at.add(16) as *mut i32).write_unaligned(cred.pid as i32);
+            (at.add(20) as *mut u32).write_unaligned(cred.uid);
+            (at.add(24) as *mut u32).write_unaligned(cred.gid);
             ((msghdr + 40) as *mut usize).write_unaligned(CMSG_LEN);
         }
     } else if control_len != 0 {

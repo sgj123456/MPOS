@@ -94,8 +94,10 @@ One-glance status of the whole roadmap.
   (2026-10-16): `clone(CLONE_NEWUSER)` makes a child born already inside a namespace of its own -
   the overflow id until its map is written, the full set at birth, and the parent's `CLONE_NEWUSER`
   lifting the capability gate for the other kinds in the same word (§6.3, measured on the host
-  first). What stays named is the netlink/uevent
-  family's own `ucred` render
+  first). And the **netlink/uevent family's own `ucred`** landed (2026-10-16): its ids render
+  through the reading task's user namespace - the kernel's synthetic zero record included - and its
+  pid is the *sender's* number in the sender's own pid namespace, resolved once at send, which is
+  also the port id a zero-`nl_pid` bind prefers (`t-uevent`, §6.3)
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
@@ -248,8 +250,11 @@ In the order that keeps each step verifiable on its own:
    the other kinds beside it (`t-ns-user`, 46 claims, §6.3). And the socket's `ucred.pid` landed the
    same day - the pid-namespace half of the same struct, rendered with `pid_vnr`'s rule so a reader
    inside a namespace names a peer there and reads `0` for one it cannot see (`t-ns-pid`, §6.3).
-   What stays named is
-   the netlink/uevent family's own `ucred` render.
+   The **netlink/uevent family's own `ucred`** followed (2026-10-16): its ids render through the
+   reading task's user namespace - the kernel's synthetic zero record included - and its pid is the
+   *sender's* number in the sender's own pid namespace, resolved once at send, which is also the
+   port id a zero-`nl_pid` bind prefers (three probes; `t-uevent`, §6.3). So nothing of the `ucred`
+   stays named now.
    IPC and CGROUP each wait on the thing they would isolate not
    existing yet (SysV/POSIX message queues; a cgroup tree), so they are cheap the day that lands
    and worthless before it. Nested namespaces pin the

@@ -161,12 +161,12 @@ fn send_to(fd: libc::c_int, payload: &[u8], dest: &SockAddrNl, namelen: u32) -> 
     fix(unsafe { libc::sendmsg(fd, &msg, 0) } as libc::c_long)
 }
 
-/// The `(pid, uid)` of the one `SCM_CREDENTIALS` at the head of a control
+/// The `(pid, uid, gid)` of the one `SCM_CREDENTIALS` at the head of a control
 /// buffer, or `None` when the record is not there or is not that. Parsed by
 /// hand because the length the kernel wrote back is part of the claim:
 /// `cmsg_len` is a `size_t` on Linux, so the two words after it are `level`
 /// and `type`.
-fn credentials(ctl: &[u8], controllen: usize) -> Option<(i32, u32)> {
+fn credentials(ctl: &[u8], controllen: usize) -> Option<(i32, u32, u32)> {
     const HDR: usize = std::mem::size_of::<usize>();
     let ucred = std::mem::size_of::<libc::ucred>();
     if controllen < HDR + 8 + ucred {
@@ -184,7 +184,8 @@ fn credentials(ctl: &[u8], controllen: usize) -> Option<(i32, u32)> {
     }
     let pid = i32::from_ne_bytes(ctl[at..at + 4].try_into().ok()?);
     let uid = u32::from_ne_bytes(ctl[at + 4..at + 8].try_into().ok()?);
-    Some((pid, uid))
+    let gid = u32::from_ne_bytes(ctl[at + 8..at + 12].try_into().ok()?);
+    Some((pid, uid, gid))
 }
 
 fn has(haystack: &[u8], needle: &[u8]) -> bool {
@@ -382,7 +383,7 @@ fn main() {
     r.check(
         "and the sender's credentials, which is what a monitor demands",
         credentials(&ctl, controllen)
-            .map(|(cred_pid, uid)| cred_pid == unsafe { libc::getpid() } && uid == 0)
+            .map(|(cred_pid, uid, _gid)| cred_pid == unsafe { libc::getpid() } && uid == 0)
             .unwrap_or(false),
     );
 
@@ -431,6 +432,230 @@ fn main() {
         "and the sender is not told about its own broadcast",
         nothing == -(libc::EAGAIN as isize),
     );
+
+    // ---------------------------------------------------------------------
+    // The ids are *stored*, and a read renders them through the reader's own
+    // user namespace - the rule every id this kernel shows follows, and
+    // Linux's for this family too. A reader in a namespace that maps the
+    // stored `0` to `7` is told `7` for a peer's message and for the kernel's
+    // own zero record alike, so a listener that recognises kernel origin by
+    // `uid 0` is in the machine namespace, exactly as on Linux
+    // (`.workbuddy/probe-nlcred.c`, `.workbuddy/probe-nluevent.c`; §6.3).
+    //
+    // The reader is a child, because `unshare(CLONE_NEWUSER)` moves the
+    // *caller* and it is the machine-namespace root that announces the device.
+    // ---------------------------------------------------------------------
+    let ns_manager = nl_socket();
+    let ns_worker = nl_socket();
+    let ns_kernel = nl_socket();
+    r.check(
+        "a manager, a worker and a kernel listener open for the namespace section",
+        ns_manager >= 0 && ns_worker >= 0 && ns_kernel >= 0,
+    );
+    if ns_manager < 0 || ns_worker < 0 || ns_kernel < 0 {
+        r.finish();
+    }
+    r.check(
+        "and bind, the listener to the kernel group",
+        nl_bind(ns_manager, &unspecific)
+            + nl_bind(ns_worker, &unspecific)
+            + nl_bind(ns_kernel, &nl_addr(0, UEVENT_GROUP_KERNEL))
+            == 0,
+    );
+    for fd in [ns_manager, ns_worker, ns_kernel] {
+        let one: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                &one as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+    let mut ns_worker_addr = SockAddrNl::default();
+    let _ = sockname(ns_worker, &mut ns_worker_addr);
+
+    let mut ready = [0 as libc::c_int; 2];
+    let mut said = [0 as libc::c_int; 2];
+    let pipes_ok = unsafe { libc::pipe(ready.as_mut_ptr()) } == 0
+        && unsafe { libc::pipe(said.as_mut_ptr()) } == 0;
+    r.check("the two handshake pipes are made", pipes_ok);
+
+    let reader = if pipes_ok {
+        unsafe { libc::fork() }
+    } else {
+        -1
+    };
+    if reader == 0 {
+        // The reader, in a user namespace that maps the stored uid/gid 0 to 7.
+        unsafe {
+            libc::close(ready[0]);
+            libc::close(said[0]);
+        }
+        let moved = unsafe { libc::unshare(libc::CLONE_NEWUSER) } == 0;
+        let uid_ok = std::fs::write("/proc/self/uid_map", "7 0 1\n").is_ok();
+        let _ = std::fs::write("/proc/self/setgroups", "deny\n");
+        let gid_ok = std::fs::write("/proc/self/gid_map", "7 0 1\n").is_ok();
+        let hello = [moved as u8, uid_ok as u8, gid_ok as u8];
+        let _ = unsafe { libc::write(ready[1], hello.as_ptr().cast(), hello.len()) };
+        let mut nbuf = [0u8; 512];
+        let mut nctl = [0u8; 128];
+        let mut nname = SockAddrNl::default();
+        let _ = receive_from(ns_worker, &mut nbuf, 0, &mut nctl, &mut nname);
+        let peer = credentials(&nctl, nctl.len());
+        let _ = receive_from(ns_kernel, &mut nbuf, 0, &mut nctl, &mut nname);
+        let kern = credentials(&nctl, nctl.len());
+        let line = format!(
+            "{} {} {} {}\n",
+            peer.map_or(-1, |c| c.1 as i64),
+            peer.map_or(-1, |c| c.2 as i64),
+            kern.map_or(-1, |c| c.1 as i64),
+            kern.map_or(-1, |c| c.2 as i64),
+        );
+        let _ = unsafe { libc::write(said[1], line.as_ptr().cast(), line.len()) };
+        unsafe { libc::_exit(0) };
+    }
+    unsafe {
+        libc::close(ready[1]);
+        libc::close(said[1]);
+    }
+    r.check("the reader child started", reader > 0);
+    if reader > 0 {
+        let mut hello = [0u8; 3];
+        let hn = unsafe { libc::read(ready[0], hello.as_mut_ptr().cast(), 3) };
+        r.check(
+            "the reader is inside a user namespace that maps 0 to 7",
+            hn == 3 && hello[0] == 1 && hello[1] == 1 && hello[2] == 1,
+        );
+        let payload2 = b"namespace\0";
+        r.check(
+            "the manager sends a peer's message to the namespace's worker",
+            send_to(ns_manager, payload2, &ns_worker_addr, 12) == payload2.len() as isize,
+        );
+        let announced = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&trigger)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(b"add")
+            })
+            .is_ok();
+        r.check(
+            "and a device is announced for the namespace's listener",
+            announced,
+        );
+        let mut line = [0u8; 64];
+        let n = unsafe { libc::read(said[0], line.as_mut_ptr().cast(), line.len()) };
+        let words: Vec<i64> = String::from_utf8_lossy(&line[..n.max(0) as usize])
+            .split_whitespace()
+            .filter_map(|w| w.parse().ok())
+            .collect();
+        r.check("the reader reports four ids", words.len() == 4);
+        if words.len() == 4 {
+            r.check(
+                "a peer's uid and gid are rendered through the reader's namespace (0 -> 7)",
+                words[0] == 7 && words[1] == 7,
+            );
+            r.check(
+                "and the kernel's own zero record is rendered too (0 -> 7)",
+                words[2] == 7 && words[3] == 7,
+            );
+        }
+        let mut status: libc::c_int = 0;
+        unsafe {
+            libc::waitpid(reader, &mut status, 0);
+            libc::close(ns_manager);
+            libc::close(ns_worker);
+            libc::close(ns_kernel);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // The pid, the other half of the same record, is the *sender's* number in
+    // the sender's own namespace - resolved once at send (Linux's
+    // `scm_set_cred`'s `pid_vnr`), and the port id a zero-`nl_pid` bind is
+    // given comes from the same number (`netlink_autobind`'s
+    // `task_tgid_vnr`). A sender inside a pid namespace is named there by the
+    // number it knows itself by, and the port id its own bind is given is that
+    // number too (`.workbuddy/probe-nlpid.c`; §6.3). The *reader's* namespace
+    // does not move it: a peer in an ancestor namespace reads the sender's own
+    // number and not `0` (`.workbuddy/probe-nlcred.c`).
+    //
+    // A pid namespace renumbers children, so the sender has to be the
+    // namespace's init: the test moves its children in, and the init - pid 1 -
+    // owns both sockets and does the send and the read itself.
+    // ---------------------------------------------------------------------
+    let moved_pid = unsafe { libc::unshare(libc::CLONE_NEWPID) } == 0;
+    r.check(
+        "the test moves its children into a pid namespace",
+        moved_pid,
+    );
+    if moved_pid {
+        let mut told = [0 as libc::c_int; 2];
+        let told_ok = unsafe { libc::pipe(told.as_mut_ptr()) } == 0;
+        let init = if told_ok { unsafe { libc::fork() } } else { -1 };
+        if init == 0 {
+            unsafe { libc::close(told[0]) };
+            let sender = nl_socket();
+            let receiver = nl_socket();
+            let mut sender_addr = SockAddrNl::default();
+            let mut receiver_addr = SockAddrNl::default();
+            let _ = nl_bind(sender, &unspecific);
+            let _ = nl_bind(receiver, &unspecific);
+            let _ = sockname(sender, &mut sender_addr);
+            let _ = sockname(receiver, &mut receiver_addr);
+            let one: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(
+                    receiver,
+                    libc::SOL_SOCKET,
+                    libc::SO_PASSCRED,
+                    &one as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+            let _ = send_to(sender, b"pidns\0", &nl_addr(receiver_addr.pid, 0), 12);
+            let mut nbuf = [0u8; 512];
+            let mut nctl = [0u8; 128];
+            let mut nname = SockAddrNl::default();
+            let _ = receive_from(receiver, &mut nbuf, 0, &mut nctl, &mut nname);
+            let named = credentials(&nctl, nctl.len()).map_or(-1, |c| c.0 as i64);
+            let line = format!(
+                "{} {} {}\n",
+                unsafe { libc::getpid() } as i64,
+                sender_addr.pid as i64,
+                named
+            );
+            let _ = unsafe { libc::write(told[1], line.as_ptr().cast(), line.len()) };
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(told[1]) };
+        r.check("the namespace's init started", init > 0);
+        if init > 0 {
+            let mut line = [0u8; 64];
+            let n = unsafe { libc::read(told[0], line.as_mut_ptr().cast(), line.len()) };
+            let words: Vec<i64> = String::from_utf8_lossy(&line[..n.max(0) as usize])
+                .split_whitespace()
+                .filter_map(|w| w.parse().ok())
+                .collect();
+            r.check("the init reports three numbers", words.len() == 3);
+            if words.len() == 3 {
+                r.check(
+                    "a sender in a pid namespace is its own number 1",
+                    words[0] == 1,
+                );
+                r.check(
+                    "and the port id a zero-`nl_pid` bind gives it is that number",
+                    words[1] == 1,
+                );
+                r.check("and a peer's ucred names it by that number", words[2] == 1);
+            }
+            let mut status: libc::c_int = 0;
+            unsafe { libc::waitpid(init, &mut status, 0) };
+        }
+    }
 
     unsafe {
         libc::close(member);

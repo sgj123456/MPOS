@@ -688,11 +688,52 @@ The counterfactual: with the line reverted to `pid: c.pid` the gate runs `pass=1
 `t-ns-pid` is red in exactly those **two** claims - and nothing else moves, because every other
 reader is in the machine namespace, where the two numbers are equal.
 
-**What is named and not built.** A third `ucred` render sits in the
-**netlink/uevent** family (`recvmsg_netlink`), whose kernel-origin messages carry synthetic zero
-ids; whether Linux maps those through the reader's user namespace is a measurement of *that*
-family, so it is left for it. (The socket family's own `pid` field, which used to be named here as
-a pid-namespace question, landed on 2026-10-16 - "Step 6f" above.)
+**Step 6g, landed: the netlink family's `ucred`, both halves.** Step 6f closed the *socket* family's
+`ucred`; the same `struct ucred` is handed to a reader by the **netlink** door (`recvmsg_netlink`,
+the device-event socket udev and `nlplug-findfs` listen on), and it renders differently enough to be
+its own measurement. Three probes, all run as root (a pid namespace needs `CAP_SYS_ADMIN`, and the
+uevent one needs `CAP_NET_ADMIN` to announce a device; `NETLINK_USERSOCK` stands in for the peer
+path because the credential handling is the protocol-independent `netlink_sendmsg`/`netlink_recvmsg`
+code):
+
+| question | Linux's answer |
+|---|---|
+| a peer's `uid`/`gid`, read by a reader in a user namespace mapping the stored id to 7 | **7** - rendered through the *reader's* user namespace (`.workbuddy/probe-nlcred.c`) |
+| the kernel's own zero `uid`/`gid`, read by that same reader | **7** - the zero is the *stored* id and is rendered too (`.workbuddy/probe-nluevent.c`) |
+| a peer's `pid`, read by a reader in a *pid* namespace the sender is not in | the sender's number, **not** `0` - the reader's pid namespace does not move it |
+| a sender inside a pid namespace, read by a peer in the same one | the sender's number **there** (`1`) (`.workbuddy/probe-nlpid.c`) |
+| a socket bound with `nl_pid == 0` by a sender inside a pid namespace | the port id is that same `1` |
+
+The two halves are stored at *send* and rendered at *read*, and only the ids are the reader's to
+render: `scm_set_cred` stores `uid`/`gid` as kernel ids - mapped at the read with
+`from_kuid_munged(current_user_ns(), …)` - but the `pid` as `pid_vnr(task_tgid(current))`, the
+*sender's* number in the *sender's* active pid namespace, resolved once and never re-rendered. So a
+listener that recognises kernel origin by `uid 0` is in the machine namespace, exactly as on Linux:
+the zero is the stored id, and a reader whose table does not cover it is told `65534`.
+
+What landed is `observed_event_cred` (`net::socket`): the queued `Cred`'s ids go through the
+reader's user namespace, the pid is left alone. And `task_identity` now stores the sender's own
+number (`pid_number_of(current_tgid())`, which is what `getpid` answers for it) rather than its
+slot, for the `ucred` pid and the port id a zero-`nl_pid` bind prefers alike - Linux uses
+`task_tgid_vnr` for both. A machine-namespace sender is unaffected: its slot *is* its number, and
+the machine's identity map renders an id to itself.
+
+The pin is sixteen more claims in `t-uevent`: a child in a user namespace mapping `0 -> 7` reads a
+peer's ids and the kernel's own zero record as `7` (ten claims, the handshake and the announcement
+around the four), and a child in a pid namespace reads its own `getpid`, the port id its bind is
+given, and a peer's `ucred` as the same `1` (six).
+
+The counterfactual: with `observed_event_cred` replaced by the raw `Cred` and `task_identity`'s pid
+back to the slot, the gate runs `pass=174 fail=1` and `t-uevent` is red in exactly **four** claims -
+the two render pairs and the two pid ones - while `getpid() == 1` stays green (that is the pid
+namespace's own answer, not `task_identity`'s) and nothing else moves.
+
+**What is named and not built.** Nothing of the `ucred` now: both families' doors render it, and
+both halves of the netlink record are the measurement above - the last item the socket surface had
+named. What stays named on this rung is the two namespace objects with no entry at all (IPC and
+cgroup, which wait on the object they would isolate not existing). (The socket family's own `pid`
+field landed on 2026-10-16 - "Step 6f"; the netlink family's, and the user-namespace render, on
+2026-10-16 - "Step 6g".)
 
 
 **And one trap in the measuring, worth its line**: a first draft of the raw-netlink-style probe

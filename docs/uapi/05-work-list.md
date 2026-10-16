@@ -52,7 +52,8 @@ the commit bodies), and each moved its pin in the same commit.
    namespace hands them back full (`on_enter_user_ns`, the grant `unshare`/`setns` and a
    child's own `clone(CLONE_NEWUSER)` birth all make, 2026-10-16), the user namespace is also
    the table an id is read through — `stat`'s four
-   doors and the unix socket's `SO_PEERCRED`/`SCM_CREDENTIALS` map a stored id through the
+   doors and the socket families' `SO_PEERCRED`/`SCM_CREDENTIALS` (the unix family's and the
+   device-event socket's) map a stored id through the
    reader's namespace (2026-10-16) — and `capget`/`capset`
    round-trip all of it. So `PR_SET_DUMPABLE`/`GET`, `PR_SET_KEEPCAPS`/`GET` and
    `PR_CAPBSET_READ`/`DROP` are answered with the measured Linux contract rather than the
