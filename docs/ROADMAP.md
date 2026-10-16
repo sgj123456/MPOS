@@ -338,10 +338,21 @@ that open stays named rather than faked: a **fatal** signal while a task is park
 argument — a node made here carries no device number, because a number-to-driver table is what would
 make the number mean a device.
 
-One of those "buffer sizes" is named down to the line: a **blocking UDP send does not wait for the
-send buffer** (`EAGAIN` where Linux waits) — the gap, its tried shapes and their measurements are
-`docs/uapi/` §5.2's entry; it closes when the TX ring gets a completion wakeup. The MTU story that
-program also caught is a test-side lesson, not a gap: it lives with §10.4's measurement.
+One of those "buffer sizes" is served now, and the *blocking* half of it was the last of it: a
+**blocking UDP send waits for the send buffer** (`docs/uapi/` §5.1 item 27, landed 2026-10-16) — the
+wakeup source it was waiting for turned out to be the stack's own poll rather than a TX completion
+interrupt, and what the two earlier shapes got wrong was the *condition* (the metadata ring alone,
+which is true while the enqueue still refuses on the payload ring — a park that returns at once, and
+so spins). Measured whole on a current host first: with the buffer full behind a neighbour that never
+answers ARP, three datagrams go in and the fourth blocking send sleeps 3072-3098 ms and then returns
+it, where the non-blocking one is `EAGAIN` at once. Three things stay named: Linux's `EMSGSIZE` line
+is the maximum UDP datagram (65507), not the send buffer, so a datagram wider than `SO_SNDBUF` is
+taken there and refused here — that is the buffer-size item below, since this kernel's payload ring
+is 4 KiB; the park is **bounded** at three seconds (the window Linux's own neighbour resolution
+takes), because smoltcp keeps a datagram its egress could not dispatch where Linux's device drops the
+frame and releases the charge, so an unbounded park would be a hang; and the ring's wraparound, which
+the condition cannot see and which clears as the buffer drains. The MTU story that program also caught
+is a test-side lesson, not a gap: it lives with §10.4's measurement.
 
 ---
 

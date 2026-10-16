@@ -187,35 +187,49 @@ Section numbers are unchanged from the original `UAPI.md`.
   entry's "two records for one death" deterministic rather than
   neighbourhood-dependent. `docs/notes/` §6.
 
-- **A UDP send's full buffer answered `EMSGSIZE`, so a burst stopped at four —
-  and the blocking half of Linux's rule is not implemented yet, by name.** A
-  socket's send buffer is finite, so a burst outruns it; what the caller hears
-  then is Linux's question, and Linux's answer has two halves — a *blocking*
-  sender waits for room, a non-blocking one is `EAGAIN` — with `EMSGSIZE` kept
-  for the datagram wider than the buffer that would have to hold it. This kernel
-  had one mapping for both of `smoltcp`'s meanings of `BufferFull` ("wider than
-  the buffer" and "no room at this instant") and answered **`EMSGSIZE`** to each,
-  so a perfectly ordinary 1400-byte datagram was refused as though it were
-  oversized. Measured by `t-netstats`, which sends 256 of them back to back:
-  **four were accepted** — the depth of the virtio TX ring — and every send after
-  that was refused, so `tx_packets` moved by four and the burst's rate said
-  nothing. `src/net/socket.rs`'s `udp_send` now asks which case it is
-  (`data.len() > sock.payload_send_capacity()` keeps `EMSGSIZE`) and answers
-  **`EAGAIN`** to the momentary full. **The wait is not implemented, and that is
-  the named half**: the buffer drains into the device's TX ring, the ring drains
-  when the device completes descriptors, and this driver takes no interrupt for a
-  completion — so there is no event a blocking sender could wait on, and a park
-  there sleeps until something else happens to poll the stack. Both shapes were
-  tried and measured: a park with no deadline stopped the sweep dead at
-  `t-netstats`'s first parked send, and a tick-bounded park spun at **97% CPU**
-  because the wait's own readiness answer (`can_send()`, the metadata ring) was
-  true while `enqueue` still refused on the payload ring — a wait that can never
-  end. **Follow-up, and the way this closes**: give the TX ring a completion
-  wakeup (a TX interrupt, or a wake from the driver's `transmit`) and the blocking
-  sender can wait as Linux's does. Until then `t-netstats`'s burst retries on
-  `EAGAIN` (a bound, not a tolerance) and prints the retry count as a measurement,
-  and its exactness pair — one `sendto` moves `tx_packets` by exactly one and
-  `tx_bytes` by exactly the frame's size — is the pin. `docs/notes/` §10.4.
+- **A UDP send's full buffer answered `EMSGSIZE`, so a burst stopped at four — and the blocking
+  half of Linux's rule is served now, with its bound named.** A socket's send buffer is finite, so a
+  burst outruns it; what the caller hears then is Linux's question, and Linux's answer has two halves
+  — a *blocking* sender waits for room, a non-blocking one is `EAGAIN` — with `EMSGSIZE` kept for the
+  datagram wider than the buffer that would have to hold it. This kernel had one mapping for both of
+  `smoltcp`'s meanings of `BufferFull` ("wider than the buffer" and "no room at this instant") and
+  answered **`EMSGSIZE`** to each, so a perfectly ordinary 1400-byte datagram was refused as though it
+  were oversized. Measured by `t-netstats`, which sends 256 of them back to back: **four were
+  accepted** — the depth of the virtio TX ring — and every send after that was refused, so
+  `tx_packets` moved by four and the burst's rate said nothing. `src/net/socket.rs`'s `udp_send` now
+  asks which case it is (`data.len() > sock.payload_send_capacity()` keeps `EMSGSIZE`) and answers
+  **`EAGAIN`** to the momentary full. **The wait is served too**, and it is §5.1 item 27: the state a
+  full buffer puts a caller in is one Linux's blocking sender *parks* out of, and the park's wakeup
+  source turned out to be the stack's own poll — the wake list every poll wakes, which is exactly the
+  event that drains a socket's send buffer — so what it needed was a condition true only when the
+  buffer can really take the datagram. Both earlier shapes failed on that condition rather than on the
+  wakeup: a park with no deadline stopped the sweep dead at `t-netstats`'s first parked send, and a
+  tick-bounded park spun at **97% CPU** because the wait's own readiness answer (`can_send()`, the
+  metadata ring) was true while `enqueue` still refused on the payload ring — a park whose condition
+  holds returns at once, so the caller retried, was refused and parked again without ever sleeping.
+  The condition now asks **both** of `enqueue`'s questions: the packet count and the payload window
+  (`udp_room_for`), whose one blind spot — the ring's wraparound — clears as the buffer drains and
+  costs one more turn of a loop bounded by the four packet slots. **Measured whole on a current host
+  first** (`.workbuddy/probe-udpblock*.c`, Linux 7.2.9): with `SO_SNDBUF` at its floor and an on-link
+  neighbour that never answers ARP holding the charge, three 1400-byte datagrams go in, the fourth
+  *blocking* send sleeps **3072-3098 ms** until the neighbour gives up and then returns the datagram,
+  and the non-blocking send at the same point is `EAGAIN` at once; a signal inside the park answers
+  `EINTR` without `SA_RESTART` and is swallowed — the send restarted and completed — with it.
+  **Three things stay named rather than served**, and two of them are the *size* question rather than
+  the room one: **Linux's `EMSGSIZE` line is the maximum UDP datagram** (65507 accepted, 65508
+  refused, measured), not the send buffer, so a datagram *wider* than `SO_SNDBUF` is still taken
+  (5600 bytes into a 4608-byte buffer) — where this kernel refuses it, because its payload ring is
+  4 KiB and the datagram can never be enqueued; that is the buffer-size item the ROADMAP carries
+  (`SO_SNDBUF`/`SO_RCVBUF` record-only), and it moves the line the day the ring does. **The park is
+  bounded** at `DRAIN_WAIT_MS` (three seconds, the window Linux's own neighbour resolution takes):
+  past it the answer is `EAGAIN`, because smoltcp *keeps* a datagram its egress could not dispatch —
+  an unknown neighbour's silent second, a datagram the MTU cannot carry, a link taken down — where
+  Linux's device drops the frame and releases the charge, so an unbounded park here would be a hang
+  rather than a wait; the bound's worst case is the behaviour this pass replaced. And the
+  **wraparound** above. Until then `t-netstats`'s burst retries on `EAGAIN` (a bound, not a tolerance)
+  and prints the retry count as a measurement, and its exactness pair — one `sendto` moves
+  `tx_packets` by exactly one and `tx_bytes` by exactly the frame's size — is the pin. The park
+  itself is `t-udpblock`. `docs/notes/` §10.4.
 
 - **A terminal's foreground group, and a pty's number: two conventions this kernel
   answers its own way.** (a) *Whose signals a terminal carries.* Linux keeps a

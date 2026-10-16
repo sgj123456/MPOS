@@ -668,3 +668,59 @@ the commit bodies), and each moved its pin in the same commit.
     becomes after it returns. `t-fifo` therefore *releases* every parked opener (a peer arrives)
     rather than killing it, and the residual lives in `Channel::rendezvous`'s doc and §5.2.
 
+27. **A blocking UDP send waits for the send buffer: `EAGAIN` is the non-blocking answer, and a park
+    is the blocking one.** A datagram socket's send buffer is finite, so a burst outruns it, and what
+    the caller hears then is the caller's question. Linux answers it two ways and this kernel answered
+    one of them to both: the §5.2 entry named the second half — "the wait is not implemented, and that
+    is the named half" — and the reason it gave was that there is no event to wait on, because the
+    driver takes no interrupt for a TX completion. What that reasoning got wrong is the wakeup
+    source's shape rather than its existence: `park_until` registers the sender with the wake list
+    **every stack poll** wakes (the background service task each tick, `irq_service` on a device
+    interrupt), and a poll is exactly the event that drains a socket's send buffer. So the wait had a
+    wakeup all along; what it needed was a condition true only when the buffer can really take the
+    datagram — and both earlier shapes failed on *that*: a park with no deadline stopped the sweep
+    dead at `t-netstats`'s first parked send, and a tick-bounded park spun at **97% CPU** because the
+    condition (`can_send()`, the **metadata** ring) was true while `enqueue` still refused on the
+    **payload** ring, and a park whose condition holds returns at once — so the caller retried, was
+    refused and parked again without ever sleeping.
+    **The contract was measured whole on a current host first** (`.workbuddy/probe-udpblock*.c`, Linux
+    7.2.9), in the one state that fills the buffer without root: an **on-link neighbour that never
+    answers ARP** holds the first datagram, and an skb sitting in that queue keeps its
+    `sk_wmem_alloc` charge, so the socket's send buffer fills behind it exactly as it would behind a
+    slow device — and the neighbour gives up about three seconds later, which is also when a parked
+    sender's room appears. With `SO_SNDBUF` at its floor (2048 asked, 4608 reported) and 1400-byte
+    datagrams: **three went in**, the fourth *blocking* send slept **3072-3098 ms** and then returned
+    the datagram, and the non-blocking send at the same point answered `EAGAIN` at once. A signal
+    inside the park answers **`EINTR`** when the handler has no `SA_RESTART` and is swallowed — the
+    send restarted and completed — when it has one; measured with the handler's own timestamp, and
+    the measurement that caught a probe bug worth its own note: glibc's `signal()` defaults to
+    `SA_RESTART`, so the "no restart" arm was silently restarting until a **pipe-write control** (a
+    blocking write to a full pipe, `EINTR` at exactly the alarm's 300 ms) proved the delivery setup
+    was sound. Two further answers separate the *size* question from the *room* one, and this kernel
+    does not serve either: Linux's `EMSGSIZE` line is the **maximum UDP datagram** — 65507 accepted,
+    65508 refused — not the send buffer, and a datagram *wider* than `SO_SNDBUF` is still taken (5600
+    bytes into a 4608-byte buffer, measured).
+    **The fix** is `udp_send`'s loop: the buffer-full arm is no longer one answer for both modes but a
+    park for a blocking caller and `EAGAIN` for a non-blocking one, over
+    [`park_until_deadline`]'s registration. The condition is [`udp_room_for`], which asks **both**
+    questions `PacketBuffer::enqueue` asks — the packet count (`can_send()`, four slots here whatever
+    their size) and the payload window (`payload_send_capacity() - send_queue()`, what a burst of
+    MTU-sized datagrams fills first) — because a predicate that is true while the enqueue still
+    refuses is a wait that cannot end. The one case it cannot see is the ring's wraparound, which
+    clears as the buffer drains, so it costs one more turn of a loop bounded by the four packet slots.
+    Owner: `src/net/socket.rs`'s `udp_send`, `udp_room_for`, `park_until_deadline` and `DRAIN_WAIT_MS`.
+    Pin: `t-udpblock` — the fill with per-send `MSG_DONTWAIT` (so the fill itself does not park), the
+    non-blocking answer at once, the blocking send's park cut short by a `SIGALRM` with no
+    `SA_RESTART` (answered `EINTR` after the alarm's own delay, which is what makes it a *wait*
+    rather than a refusal wearing a park's clothes), the same send restarted under `SA_RESTART` and
+    then answered `EAGAIN` after the bound, and a fresh socket still sending afterwards.
+    **Three residuals are named rather than hidden.** (a) The **`EMSGSIZE` boundary is this kernel's
+    payload ring** (4 KiB), not Linux's 65507: a datagram wider than the ring can never be enqueued,
+    so it is refused as oversized where Linux takes it and lets it exceed the soft limit — that is
+    the buffer-size item (`SO_SNDBUF`), which §5.2 and the ROADMAP carry separately, and it moves the
+    line the day the ring does. (b) The park is **bounded**, at `DRAIN_WAIT_MS` (three seconds, the
+    window Linux's own neighbour resolution takes): past it the answer is `EAGAIN`, because smoltcp
+    *keeps* a datagram its egress could not dispatch — an unknown neighbour's silent second, a
+    datagram the MTU cannot carry, a link taken down — where Linux's device drops the frame and
+    releases the charge, so an unbounded park here is a hang rather than a wait. The bound's worst
+    case is the behaviour this pass replaced, which is what makes it safe. (c) The wraparound above.

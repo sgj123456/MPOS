@@ -776,6 +776,35 @@ fn park_until(ready: impl Fn() -> bool) -> isize {
     }
 }
 
+/// [`park_until`] with a clock on the wait: the same registration, the same
+/// wakeup source, and a third ending - the deadline passing.
+///
+/// The three answers are the caller's, and the third one exists because an
+/// unbounded park is a hang. `udp_send` is the caller: a datagram socket's
+/// send buffer drains only when the stack's egress takes the datagram out of
+/// it, and smoltcp *keeps* a datagram its egress could not dispatch - where
+/// Linux's device drops the frame and releases the charge. So the state a
+/// Linux sender waits its way out of (a neighbour resolving, measured at
+/// 3072-3098 ms) is a state this kernel's egress may never leave at all, and
+/// the wait for it has to be able to give an answer rather than sleep
+/// forever. The answer is `EAGAIN`, which is what this kernel gave before it
+/// could park at all: the bound's worst case is the old behaviour.
+fn park_until_deadline(ready: impl Fn() -> bool, deadline: u64) -> isize {
+    let me = crate::sched::current();
+    super::subscribe(me);
+    let end = crate::sched::block_until_deadline(ready, deadline);
+    super::unsubscribe(me);
+    match end {
+        crate::sched::WaitEnd::Interrupted => err::EINTR,
+        // The condition held: the caller retries and the send goes out.
+        crate::sched::WaitEnd::Condition => 0,
+        // The clock ran out with the condition still false: the egress is not
+        // draining, and the honest answer is the one the caller would have
+        // got from a non-blocking socket.
+        crate::sched::WaitEnd::Deadline => err::EAGAIN,
+    }
+}
+
 /// Receive one device event, or one message a peer sent on the same socket.
 ///
 /// Three things go back beyond the payload, and a real listener needs all
@@ -2057,24 +2086,38 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
 ///
 /// The socket's send buffer is finite, so a burst outruns it, and what the
 /// caller hears then is the caller's question rather than the kernel's. Two
-/// answers, and this kernel gives the second:
+/// answers, and this kernel now gives both of Linux's:
 ///
-/// * the datagram is **wider than the buffer that would hold it** —
+/// * the datagram is **wider than the buffer that would hold it** -
 ///   `EMSGSIZE`, whatever the mode says, because waiting cannot make it fit;
-/// * the buffer has **no room at this instant** — `EAGAIN`, which is Linux's
-///   answer to a non-blocking sender. Linux's *blocking* sender would instead
-///   wait for the buffer to drain, and **this kernel deliberately does not**,
-///   because there is no wakeup source to wait on: the buffer drains into the
-///   device's TX ring, the ring drains when the device completes descriptors,
-///   and this driver takes no interrupt for a completion — so a parked sender
-///   would sleep until something else happened to poll the stack. Both shapes
-///   were measured: a park with no deadline stopped the sweep dead at
-///   `t-netstats`'s first parked send, and a tick-bounded park spun at 97% CPU
-///   because the wait's own readiness answer (`can_send()`) was true while
-///   `enqueue` still refused — a wait that can never end. `EAGAIN` is the
-///   honest answer until the ring has a completion event (named in `docs/uapi/`
-///   §5.2 and `docs/notes/` §4.3); a caller retries, which is what the burst in
-///   `t-netstats` now does.
+/// * the buffer has **no room at this instant** - `EAGAIN` for a non-blocking
+///   sender, and a **park** for a blocking one, which is Linux's answer.
+///   Measured on a current host: with `SO_SNDBUF` at its floor and a neighbour
+///   that never answers ARP holding the charge, three 1400-byte datagrams go
+///   in and the fourth *blocking* send sleeps 3072-3098 ms until the neighbour
+///   gives up and releases it, then returns the datagram; the non-blocking
+///   send at the same point is `EAGAIN`
+///   (`.workbuddy/probe-udpblock*.c`, Linux 7.2.9).
+///
+/// The park is what this kernel used to refuse to do, and the reason it gave
+/// was that there is nothing to wait *on*: the buffer drains into the device's
+/// TX ring, the ring drains when the device completes descriptors, and the
+/// driver takes no interrupt for a completion. What was wrong with that
+/// reasoning is the wakeup source's shape, not its existence - [`park_until`]
+/// registers the sender with the wake list that **every stack poll** wakes
+/// (the background service task each tick, `irq_service` on a device
+/// interrupt), and a poll is exactly the event that drains a socket's send
+/// buffer. So the wait has a wakeup, and what it needs is a condition that is
+/// true only when the buffer can really take the datagram.
+///
+/// That condition is the whole difficulty, and both earlier shapes failed on
+/// it: a park with no deadline stopped the sweep dead at `t-netstats`'s first
+/// parked send, and a tick-bounded park spun at 97% CPU because the wait's own
+/// readiness answer (`can_send()`, the **metadata** ring) was true while
+/// `enqueue` still refused on the **payload** ring - and a park whose
+/// condition holds returns at once, so the caller retried, was refused, and
+/// parked again without ever sleeping. [`udp_room_for`] is the condition that
+/// asks both questions `PacketBuffer::enqueue` asks.
 ///
 /// This replaces a single mapping from smoltcp's `BufferFull` to `EMSGSIZE`,
 /// which was wrong in the *common* case: smoltcp reports that one error for "no
@@ -2082,68 +2125,144 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
 /// burst of ordinary 1400-byte datagrams was refused as though each were
 /// oversized after four sends — the depth of the virtio TX ring. Measured by
 /// `t-netstats`, whose 256-datagram burst is the pin.
+/// How long a datagram sender may wait for the egress to take its datagram out
+/// of the socket's send buffer before the answer becomes `EAGAIN`.
+///
+/// The bound is Linux's own neighbour resolution: measured on a current host, a
+/// datagram queued behind a neighbour that never answers ARP is released
+/// 3072-3098 ms later, when the neighbour goes FAILED and drops the queue
+/// (`.workbuddy/probe-udpblock*.c`). This kernel cannot release a datagram that
+/// way, because smoltcp keeps one its egress could not dispatch in the socket's
+/// buffer; so a sender whose egress never drains would sleep forever, and the
+/// wait gives up after the same window Linux resolves in. See
+/// [`park_until_deadline`].
+const DRAIN_WAIT_MS: u64 = 3000;
+
 fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool) -> isize {
-    // The mode does not change the answer here: a full buffer is `EAGAIN` for a
-    // blocking caller too, because there is nothing to wait on (the doc above
-    // says why). Kept in the signature because that is the decision this
-    // function owns the day the ring grows a completion event.
-    let _ = nonblock;
-    let sent = super::with(handle, |stack, entry| {
-        stack.poll_once();
-        let Channel::Udp {
-            home,
-            handle: sock_handle,
-            peer,
-            bound,
-            ..
-        } = &mut entry.channel
-        else {
-            return Err(err::ENOTSOCK);
-        };
-        let Some(target) = dst.or(*peer) else {
-            return Err(err::EDESTADDRREQ);
-        };
-        if !*bound {
-            // The destination decides the interface for a socket that was
-            // never bound - the implicit bind on first send is the first
-            // address it is given, so it settles here exactly as a real
-            // `bind` would.
-            let want = super::home_of(target.addr);
-            stack.settle_udp(home, sock_handle, want);
-            let port = stack.ephemeral();
+    // The mode decides what a full buffer means: `EAGAIN` for a caller that
+    // asked not to wait, a park for one that did. The loop is the park - the
+    // doc above says what each turn costs and why the condition has to ask
+    // both of `enqueue`'s questions. The deadline is taken once, before the
+    // first attempt, so a wait that has to end ends on the whole call.
+    let deadline =
+        crate::hal::ticks().saturating_add(DRAIN_WAIT_MS * crate::hal::TICK_HZ as u64 / 1000);
+    loop {
+        let sent = super::with(handle, |stack, entry| {
+            stack.poll_once();
+            let Channel::Udp {
+                home,
+                handle: sock_handle,
+                peer,
+                bound,
+                ..
+            } = &mut entry.channel
+            else {
+                return Err(err::ENOTSOCK);
+            };
+            let Some(target) = dst.or(*peer) else {
+                return Err(err::EDESTADDRREQ);
+            };
+            if !*bound {
+                // The destination decides the interface for a socket that was
+                // never bound - the implicit bind on first send is the first
+                // address it is given, so it settles here exactly as a real
+                // `bind` would.
+                let want = super::home_of(target.addr);
+                stack.settle_udp(home, sock_handle, want);
+                let port = stack.ephemeral();
+                let sock = stack
+                    .sockets_mut(*home)
+                    .get_mut::<udp::Socket>(*sock_handle);
+                if sock.bind(IpListenEndpoint { addr: None, port }).is_err() {
+                    return Err(err::EADDRINUSE);
+                }
+                *bound = true;
+            }
             let sock = stack
                 .sockets_mut(*home)
                 .get_mut::<udp::Socket>(*sock_handle);
-            if sock.bind(IpListenEndpoint { addr: None, port }).is_err() {
-                return Err(err::EADDRINUSE);
+            let buffer_bytes = sock.payload_send_capacity();
+            match sock.send_slice(data, target) {
+                Ok(()) => {
+                    // Queued is not sent: the extra poll puts the datagram on
+                    // the wire with this call instead of at the next poll tick.
+                    stack.poll_once();
+                    Ok(data.len() as isize)
+                }
+                // Wider than the buffer that would have to hold it: no amount of
+                // retrying fits it, and Linux names that rather than hanging.
+                Err(udp::SendError::BufferFull) if data.len() > buffer_bytes => Err(err::EMSGSIZE),
+                // Full *now*: a non-blocking caller is told so, and a blocking
+                // one parks below until room appears.
+                Err(udp::SendError::BufferFull) => Err(err::EAGAIN),
+                Err(udp::SendError::Unaddressable) => Err(err::EINVAL),
             }
-            *bound = true;
-        }
-        let sock = stack
-            .sockets_mut(*home)
-            .get_mut::<udp::Socket>(*sock_handle);
-        let buffer_bytes = sock.payload_send_capacity();
-        match sock.send_slice(data, target) {
-            Ok(()) => {
-                // Queued is not sent: the extra poll puts the datagram on
-                // the wire with this call instead of at the next poll tick.
-                stack.poll_once();
-                Ok(data.len() as isize)
+        });
+        match sent {
+            Some(Ok(n)) => return n,
+            Some(Err(e)) if e == err::EAGAIN && nonblock => return e,
+            Some(Err(err::EAGAIN)) => {
+                // Park until the buffer has room for this datagram, a catchable
+                // signal ends the wait, or the egress proves it is not draining.
+                // A fatal signal ends the task inside the park, which is what
+                // `block_until_deadline` does with it.
+                let e = park_until_deadline(|| udp_room_for(handle, data.len()), deadline);
+                if e != 0 {
+                    return e;
+                }
             }
-            // Wider than the buffer that would have to hold it: no amount of
-            // retrying fits it, and Linux names that rather than hanging.
-            Err(udp::SendError::BufferFull) if data.len() > buffer_bytes => Err(err::EMSGSIZE),
-            // Full *now*: the caller retries (the doc above says why this is
-            // not a park).
-            Err(udp::SendError::BufferFull) => Err(err::EAGAIN),
-            Err(udp::SendError::Unaddressable) => Err(err::EINVAL),
+            Some(Err(e)) => return e,
+            None => return err::EBADF,
         }
-    });
-    match sent {
-        Some(Ok(n)) => n,
-        Some(Err(e)) => e,
-        None => err::EBADF,
     }
+}
+
+/// Whether the socket's send buffer has room for a datagram of `size` bytes.
+///
+/// This is the question a parked sender re-asks after every wake, and it has
+/// to be the *same* question `PacketBuffer::enqueue` answers, because a
+/// predicate that is true while the enqueue still refuses is a wait that
+/// cannot end: the park returns the instant the condition holds, the caller
+/// retries, the enqueue refuses, and the loop turns at full speed (the 97% CPU
+/// `udp_send`'s doc measures). Two numbers decide it, and neither alone is
+/// enough:
+///
+/// * the **packet count** - `can_send()` is the metadata ring, which holds
+///   four datagrams here whatever their size, so a burst of small datagrams
+///   fills it while the payload ring is still empty;
+/// * the **payload window** - `payload_send_capacity() - send_queue()`, the
+///   bytes still free, which is what a burst of MTU-sized datagrams fills
+///   first while the packet count still has slots left.
+///
+/// The one case this cannot see is the ring's wraparound: `enqueue` also
+/// refuses when the free window is split across the ring's end with less slack
+/// on the far side than the datagram needs. That state clears as the buffer
+/// drains - each poll's dispatch takes one datagram out and moves the read
+/// point forward, and an empty ring is reset to contiguous - so the worst it
+/// costs is one more turn of `udp_send`'s loop, bounded by the four packet
+/// slots each of those polls takes one of.
+fn udp_room_for(handle: usize, size: usize) -> bool {
+    super::with(handle, |stack, entry| {
+        let Channel::Udp {
+            home,
+            handle: sock_handle,
+            ..
+        } = &entry.channel
+        else {
+            return true;
+        };
+        let sock = stack.sockets(*home).get::<udp::Socket>(*sock_handle);
+        let capacity = sock.payload_send_capacity();
+        // A datagram wider than the whole ring can never be enqueued, and
+        // `udp_send` has already answered `EMSGSIZE` for it: there is no room
+        // to wait for, so the condition stays false rather than parking a
+        // caller whose datagram cannot ever fit. The subtraction is saturating
+        // because the queued count is the ring's own length, which is bounded
+        // by its capacity - and a wait whose predicate panics is worse than one
+        // that never ends.
+        sock.can_send() && capacity >= size && capacity.saturating_sub(sock.send_queue()) >= size
+    })
+    .unwrap_or(true)
 }
 
 // ---------------------------------------------------------------------------

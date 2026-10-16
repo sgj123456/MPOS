@@ -402,6 +402,52 @@ way, so the failing run still yields its number. Both figures come from operator
 runs of the same command (`cargo xtask test`, whose report prints the
 `self-test (netstat)` line this table quotes).
 
+**And the send buffer's *blocking* half, measured whole on the host before it was built**
+(§5.1 item 27). The gap was named in this section's own entry — a blocking UDP send answered
+`EAGAIN` where Linux waits — and the reason it gave was that there is no event to wait on, because
+the driver takes no interrupt for a TX completion. That reasoning is wrong about the *shape* of the
+wakeup source rather than its existence: the stack's wake list is woken by **every** poll (the
+background service task each tick, `irq_service` on a device interrupt), and a poll is exactly the
+event that drains a socket's send buffer. The state was measured on a current host
+(`.workbuddy/probe-udpblock*.c`, Linux 7.2.9) in the one shape that fills the buffer without root —
+an **on-link neighbour that never answers ARP**, whose queue holds the first datagram and whose skb
+keeps its `sk_wmem_alloc` charge, so the buffer fills behind it exactly as it would behind a slow
+device, and the neighbour gives up about three seconds later:
+
+| the host's answer, `SO_SNDBUF` at its floor (2048 asked, 4608 reported) | measured |
+|---|---|
+| 1400-byte datagrams accepted before the buffer is full | **3** (the fourth's truesize overruns the soft limit) |
+| the fourth *blocking* send | parked **3072-3098 ms**, then **returned the datagram** |
+| the *non-blocking* send at the same point | `EAGAIN`, latency 0.001-0.004 ms |
+| a signal inside the park, handler with no `SA_RESTART` | `-1/EINTR` at **exactly the alarm's 300.0 ms** |
+| the same, handler with `SA_RESTART` | the send **restarted** and completed at the neighbour's timeout |
+| a datagram wider than the whole buffer | `EMSGSIZE` at **65508**, accepted at **65507** — the maximum UDP datagram, not `SO_SNDBUF` |
+| a datagram wider than `SO_SNDBUF` but under the maximum | **taken** (5600 bytes into a 4608-byte buffer) — the soft limit is a limit a single datagram may exceed |
+
+The signal measurement carries its own instrument lesson, which is why the pipe control exists: the
+first probe used glibc's `signal()`, which defaults to `SA_RESTART`, so its "no restart" arm was
+silently *restarting* and both arms returned success after the full park. A control — a blocking
+write to a full pipe, whose interruptibility is textbook — answered `EINTR` at exactly 300.0 ms with
+the same setup, which proved the delivery was sound and the UDP park really was restarting. The
+corrected probe then measured `EINTR` at 300.0 ms for the UDP send too. **A wait that cannot be
+interrupted is a wait that cannot be measured.**
+
+The guest's pin is `t-udpblock`, and its numbers are the same shape on a smaller buffer: **2**
+datagrams of 1400 bytes fit (the payload ring is 4 KiB), the non-blocking send is `EAGAIN` at
+0.004 ms, the blocking send parks and is answered `EINTR` by a 100 ms alarm at **98.3 ms**, the same
+send under `SA_RESTART` waits the bound out and answers `EAGAIN` at **3096.2 ms**, and a fresh socket
+still sends afterwards. The bound is `DRAIN_WAIT_MS` (three seconds, the window Linux's own neighbour
+resolution takes): past it the answer is `EAGAIN`, because smoltcp *keeps* a datagram its egress could
+not dispatch — an unknown neighbour's silent second, a datagram the MTU cannot carry, a link taken
+down — where Linux's device drops the frame and releases the charge. That is the one divergence the
+pin encodes, and it is the direction that makes the park safe: its worst case is the behaviour this
+pass replaced.
+
+**The counterfactual** is the condition, not the park: `udp_room_for`'s payload-window half removed
+leaves the metadata-only predicate that spun at 97% CPU on the host, and the guest pin's blocking
+claim then answers `EAGAIN` at once instead of parking — which is the old behaviour, and is what the
+`wait lasted the alarm's delay` claim catches.
+
 ### 10.5 Filesystem and Block Read Path — **PARTIAL** (the verifiable one landed; the disk-backed instrument now stands too)
 
 **Why**: ext4's cache was a 512-slot direct-mapped array that thrashes on large

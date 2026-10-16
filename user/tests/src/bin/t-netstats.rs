@@ -22,12 +22,13 @@
 //!   quietly inflating the rate below. A datagram lost on a full queue still
 //!   counts: Linux's `tx_packets` counts frames handed to the driver, and UDP
 //!   over slirp is lossy by contract, so the claim holds whether or not the
-//!   host answers. **The burst retries `EAGAIN`**, because this kernel answers
-//!   that when the socket's send buffer is momentarily full rather than waiting
-//!   for the device to drain (it has no wakeup source for a completion —
-//!   `docs/uapi/` §5.2, `docs/notes/` §4.3); the retries are printed as a
-//!   measurement, not asserted, and a bounded runaway is a failure rather than
-//!   a hang.
+//!   host answers. **The burst retries `EAGAIN`**, and after `docs/uapi/` §5.1
+//!   item 27 a retry means the *bound* ran out rather than the buffer being
+//!   full: a blocking sender now parks until the stack's own poll drains the
+//!   buffer (measured on a current host first — 3072-3098 ms behind a neighbour
+//!   that never answers ARP — and pinned by `t-udpblock`), so a burst on a
+//!   healthy link sees none. The retries are printed as a measurement, not
+//!   asserted, and a bounded runaway is a failure rather than a hang.
 //! * **The numbers move only where the kernel says they may**: reading twice
 //!   with no traffic between keeps every counter steady (a machine whose poll
 //!   loop fabricated frames would fail this), and `lo` stays zero while eth0
@@ -189,19 +190,39 @@ fn lo_row() -> Option<EthCounters> {
 
 /// Send `BURST` datagrams and hand back `(accepted, retries)`.
 ///
-/// The retry is the point: when the socket's send buffer is full this kernel
-/// answers `EAGAIN` — it has nothing to wait *on* for the device's completion,
-/// which is the divergence `docs/uapi/` §5.2 and `docs/notes/` §4.3 carry —
-/// where Linux's blocking sender waits for room. A caller does what any caller
-/// does with `EAGAIN`: tries again. The retries are returned rather than
-/// asserted, because a machine whose ring keeps up answers none.
+/// The retry is the bound's own measurement: a blocking sender now parks until
+/// the stack's poll drains the socket's send buffer (`docs/uapi/` §5.1 item 27,
+/// `t-udpblock`), so on a healthy link the burst sees no `EAGAIN` at all — and
+/// a retry then means the park's three-second bound ran out, which is the state
+/// `t-udpblock` builds deliberately and this burst would only reach if the link
+/// stopped draining. A caller does what any caller does with `EAGAIN`: tries
+/// again. The retries are returned rather than asserted, because a machine
+/// whose ring keeps up answers none.
+///
+/// One shape the park added, and the reason this loop has two modes: the first
+/// `EAGAIN` is the interesting one (it means the buffer was full and the
+/// three-second bound ran out, which is the state `t-udpblock` builds on
+/// purpose), but every retry after it would pay that bound again — 1000 of them
+/// is fifty minutes, and a sweep that takes fifty minutes to fail has hung by
+/// another name. So the burst *records* the first wait and finishes its
+/// remaining datagrams with `MSG_DONTWAIT`, which is the non-blocking answer
+/// and costs microseconds. The counters this program is here to measure are
+/// unaffected: an `EAGAIN` and a parked send both leave `tx_packets` alone.
 fn burst(fd: &rustix::fd::OwnedFd, payload: &[u8], peer: &SocketAddrV4) -> (usize, usize) {
     let mut accepted = 0usize;
     let mut retries = 0usize;
+    let mut waited = false;
     for _ in 0..BURST {
         let mut attempts = 0usize;
         loop {
-            match sendto(fd, payload, SendFlags::empty(), peer) {
+            // Blocking until the buffer has once refused a datagram, and
+            // non-blocking after that: see the comment above.
+            let flags = if waited {
+                SendFlags::DONTWAIT
+            } else {
+                SendFlags::empty()
+            };
+            match sendto(fd, payload, flags, peer) {
                 Ok(n) if n == payload.len() => {
                     accepted += 1;
                     break;
@@ -209,6 +230,7 @@ fn burst(fd: &rustix::fd::OwnedFd, payload: &[u8], peer: &SocketAddrV4) -> (usiz
                 Err(Errno::AGAIN) if attempts < RETRY_LIMIT => {
                     attempts += 1;
                     retries += 1;
+                    waited = true;
                 }
                 _ => return (accepted, retries),
             }
