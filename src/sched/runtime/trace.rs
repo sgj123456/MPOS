@@ -2,7 +2,7 @@ use super::WaitEvent;
 use super::child_signal::queue_signal;
 use super::task::schedule;
 use super::task::with_table;
-use super::task::{Stop, SyscallStop, Table, Task, current};
+use super::task::{Stop, SyscallStop, Table, Task, WaitFor, current};
 use crate::abi::{
     PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_NONE,
     PTRACE_EVENT_SECCOMP, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEEXEC,
@@ -234,7 +234,8 @@ pub fn continued_report_pending(id: TaskId) -> bool {
     })
 }
 
-/// The oldest unreported stop among `parent`'s children, if one is reportable.
+/// The oldest unreported stop among `parent`'s children **that `sel` names**,
+/// if one is reportable.
 ///
 /// `requested` is `WUNTRACED`, and it is not the whole condition: a traced
 /// child's stop is reported to its *tracer* whether or not the tracer asked for
@@ -242,11 +243,16 @@ pub fn continued_report_pending(id: TaskId) -> bool {
 /// that could not hear about one would deadlock on its first `wait`. That is
 /// what `stop.traced` says, and it is why `strace`'s very first `waitpid` - with
 /// no option bits at all - still returns.
-pub(crate) fn unreported_stop(t: &Table, parent: TaskId, requested: bool) -> Option<WaitEvent> {
+pub(crate) fn unreported_stop(
+    t: &Table,
+    parent: TaskId,
+    sel: WaitFor,
+    requested: bool,
+) -> Option<WaitEvent> {
     for (slot, task) in t.tasks.iter().enumerate() {
         let Some(task) = task.as_ref() else { continue };
         let id = TaskId(slot);
-        if !waitable(task, parent) || id == parent {
+        if !waitable(task, parent) || id == parent || !sel.names_task(id, task) {
             continue;
         }
         let Some(stop) = task.trace.stop else {

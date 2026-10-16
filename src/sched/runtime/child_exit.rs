@@ -3,12 +3,14 @@ use super::WaitEnd;
 use super::WaitEvent;
 use super::WaitPark;
 use super::child_mm::Mm;
-use super::child_mm::{populate_user_page_at, resolve_anon_fault, resolve_cow_fault};
+use super::child_mm::{
+    child_alive_for, populate_user_page_at, resolve_anon_fault, resolve_cow_fault,
+};
 use super::child_signal::{current_credentials, force_signal, queue_signal};
 use super::load::{initial_stack_rsp, interpreter_bytes, load_user, write_arg_block};
 use super::task::{
     RETIRED, RETIRED_CAP, Retired, SIGCHLD_PENDING, SpawnError, Stack, TIMER_SLOTS, Table, Task,
-    Tracing, block_until_on_interruptible, current, new_layout, schedule, with_table,
+    Tracing, WaitFor, block_until_on_interruptible, current, new_layout, schedule, with_table,
 };
 use super::trace::{attach_new_child, fork_event, unreported_stop, waitable};
 use crate::abi::PTRACE_EVENT_CLONE;
@@ -203,7 +205,7 @@ pub fn exit(code: isize) -> ! {
             crate::hal::halt();
         }
         t.task_mut(id).exited = true;
-        record_retired(id, code, t.task(id).trace.tracer);
+        record_retired(id, code, t.task(id).pgid, t.task(id).trace.tracer);
 
         // Linux's `forget_original_parent`: a process that exits hands every
         // child that was still its own to init. Without this a zombie keeps a
@@ -600,7 +602,7 @@ pub fn discard_exit_code(id: TaskId) {
     take_exit_code(id);
 }
 
-fn record_retired(id: TaskId, code: isize, tracer: Option<TaskId>) {
+fn record_retired(id: TaskId, code: isize, pgid: TaskId, tracer: Option<TaskId>) {
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
         if retired.len() == RETIRED_CAP {
@@ -611,7 +613,12 @@ fn record_retired(id: TaskId, code: isize, tracer: Option<TaskId>) {
                 .borrow_mut()
                 .retain(|p| *p != dropped.id);
         }
-        retired.push(Retired { id, code, tracer });
+        retired.push(Retired {
+            id,
+            code,
+            pgid,
+            tracer,
+        });
         // The signal the exit carries: pending until a signalfd reader takes
         // it, independent of who eventually collects the code.
         let mut pending = SIGCHLD_PENDING.borrow(cs).borrow_mut();
@@ -1772,25 +1779,34 @@ pub(crate) extern "C" fn task_entry(slot: usize) -> ! {
     panic!("task {slot} has neither a body nor a user image")
 }
 
-/// Is there something to report about one of `parent`'s children, given what
-/// the caller asked to hear about? `t` is borrowed rather than taken because
-/// this is also the blocking condition, which must not change anything.
+/// Is there something to report about one of `parent`'s children **that `sel`
+/// names**, given what the caller asked to hear about? `t` is borrowed rather
+/// than taken because this is also the blocking condition, which must not
+/// change anything.
 ///
 /// The order is stops, then deaths, then resumes. A death comes last of the
 /// three because it cannot be reported at all until a stop that precedes it has
 /// been; a resume comes last because it is the least interesting thing that can
 /// have happened, and a tracer that is told about one when a stop was waiting
 /// has lost the stop.
-fn any_child_event(t: &Table, parent: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
+fn scan_child_event(
+    t: &Table,
+    parent: TaskId,
+    sel: WaitFor,
+    stops: bool,
+    continues: bool,
+) -> Option<WaitEvent> {
     let children = || {
         t.tasks.iter().enumerate().filter_map(|(slot, task)| {
             let task = task.as_ref()?;
             // A slot this task's own id names is not its child: `any_child_code`
             // makes the same exclusion for the same reason.
-            (waitable(task, parent) && TaskId(slot) != parent).then_some((TaskId(slot), task))
+            let id = TaskId(slot);
+            (waitable(task, parent) && id != parent && sel.names_task(id, task))
+                .then_some((id, task))
         })
     };
-    if let Some(stopped) = unreported_stop(t, parent, stops) {
+    if let Some(stopped) = unreported_stop(t, parent, sel, stops) {
         return Some(stopped);
     }
     if continues {
@@ -1817,7 +1833,9 @@ fn any_child_event(t: &Table, parent: TaskId, stops: bool, continues: bool) -> O
                     || t.tasks[id.0]
                         .as_ref()
                         .is_some_and(|task| waitable(task, parent));
-                ours && id != parent && retired.tracer.is_none_or(|tracer| tracer == parent)
+                ours && id != parent
+                    && sel.names_retired(retired)
+                    && retired.tracer.is_none_or(|tracer| tracer == parent)
             })
             .map(|retired| WaitEvent::Exited {
                 id: retired.id,
@@ -1857,17 +1875,25 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
     }
 }
 
-/// Block until a child of `parent` has something to report, and collect it.
-/// The exit-only shape is `wait_any_child`, which this generalises.
-pub fn wait_any_child_event(parent: TaskId, stops: bool, continues: bool) -> WaitPark<WaitEvent> {
+/// Block until a child of `parent` that `sel` names has something to report,
+/// and collect it. The exit-only shape is `wait_any_child`, which this
+/// generalises.
+pub fn wait_child_event(
+    parent: TaskId,
+    sel: WaitFor,
+    stops: bool,
+    continues: bool,
+) -> WaitPark<WaitEvent> {
     if matches!(
-        block_until_on_interruptible(|t| any_child_event(t, parent, stops, continues).is_some()),
+        block_until_on_interruptible(
+            |t| scan_child_event(t, parent, sel, stops, continues).is_some()
+        ),
         WaitEnd::Interrupted
     ) {
         return WaitPark::Interrupted;
     }
     match with_table(|t| {
-        let event = any_child_event(t, parent, stops, continues)?;
+        let event = scan_child_event(t, parent, sel, stops, continues)?;
         take_event(t, event)
     }) {
         Some(event) => WaitPark::Event(event),
@@ -1876,10 +1902,52 @@ pub fn wait_any_child_event(parent: TaskId, stops: bool, continues: bool) -> Wai
 }
 
 /// The non-blocking half: is there anything to collect right now?
-pub fn poll_any_child_event(parent: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
+pub fn poll_child_event(
+    parent: TaskId,
+    sel: WaitFor,
+    stops: bool,
+    continues: bool,
+) -> Option<WaitEvent> {
     with_table(|t| {
-        let event = any_child_event(t, parent, stops, continues)?;
+        let event = scan_child_event(t, parent, sel, stops, continues)?;
         take_event(t, event)
+    })
+}
+
+/// Block until *any* child of `parent` has something to report, and collect it.
+pub fn wait_any_child_event(parent: TaskId, stops: bool, continues: bool) -> WaitPark<WaitEvent> {
+    wait_child_event(parent, WaitFor::Any, stops, continues)
+}
+
+/// The wildcard half of [`poll_child_event`].
+pub fn poll_any_child_event(parent: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
+    poll_child_event(parent, WaitFor::Any, stops, continues)
+}
+
+/// Whether `parent` has a child `sel` names at all - one still running, or one
+/// whose record is waiting to be collected.
+///
+/// This is the question between `ECHILD` and a wait that parks for ever: a
+/// selector that matches nobody can never be answered, and a caller told to
+/// sleep would sleep with nothing coming. Linux asks the same thing of the same
+/// selector, which is why `P_PGID` naming a group with no child of ours is a
+/// measurement (`ECHILD`) rather than a design choice.
+pub fn has_matching_children(parent: TaskId, sel: WaitFor) -> bool {
+    with_table(|t| {
+        child_alive_for(t, parent, sel)
+            || critical_section::with(|cs| {
+                RETIRED.borrow(cs).borrow().iter().any(|retired| {
+                    let id = retired.id;
+                    let free = t.tasks[id.0].is_none();
+                    let ours = free
+                        || t.tasks[id.0]
+                            .as_ref()
+                            .is_some_and(|task| waitable(task, parent));
+                    ours && id != parent
+                        && sel.names_retired(retired)
+                        && retired.tracer.is_none_or(|tracer| tracer == parent)
+                })
+            })
     })
 }
 

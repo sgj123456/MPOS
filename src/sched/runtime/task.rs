@@ -317,6 +317,14 @@ pub type Redirect = (RawFd, RawFd);
 pub(crate) struct Retired {
     pub(crate) id: TaskId,
     pub(crate) code: isize,
+    /// The process group this task was in when it exited.
+    ///
+    /// Carried here rather than looked up because the slot is free by the time
+    /// a `waitid(P_PGID, ...)` asks: the task is gone, and a group selector has
+    /// nothing left in the table to read the answer from. Linux's zombie keeps
+    /// its whole task; this kernel's record keeps the one field a selector
+    /// needs.
+    pub(crate) pgid: TaskId,
     /// The tracer this task died under, if any. A traced task's death is the
     /// tracer's to collect: the tracer reaps the corpse first, and only its
     /// taking releases the record to the real parent - the same
@@ -1931,6 +1939,46 @@ pub fn current_fds() -> Arc<FdTable> {
 pub fn current_exe() -> alloc::string::String {
     let id = current();
     with_table(|t| t.task(id).exe.clone())
+}
+
+/// Which of a task's children a wait is about.
+///
+/// Linux's two wait doors name their subject in three ways - `wait4`'s pid
+/// argument and `waitid`'s `idtype` are two spellings of the same three
+/// selectors - and this is the one vocabulary both are translated into, so the
+/// two doors cannot disagree about *which* child an answer describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitFor {
+    /// Every child: `wait4`'s `-1` and `waitid`'s `P_ALL`.
+    Any,
+    /// One child by id: `wait4`'s positive pid and `waitid`'s `P_PID`.
+    Pid(TaskId),
+    /// Every child in one process group: `waitid`'s `P_PGID`, whose `id` is a
+    /// group rather than a task. `wait4`'s `0` and negative pids name the same
+    /// selector - the caller's own group - which that door does not ask yet.
+    Pgid(TaskId),
+}
+
+impl WaitFor {
+    /// Whether the task in slot `id` is one this selector names.
+    pub(crate) fn names_task(self, id: TaskId, task: &Task) -> bool {
+        match self {
+            WaitFor::Any => true,
+            WaitFor::Pid(want) => id == want,
+            WaitFor::Pgid(group) => task.pgid == group,
+        }
+    }
+
+    /// The same question about a *record*: its own task is gone (the slot was
+    /// freed, or handed to a new tenant), so a group answer is read out of the
+    /// record itself - which is why [`Retired`] carries a `pgid`.
+    pub(crate) fn names_retired(self, retired: &Retired) -> bool {
+        match self {
+            WaitFor::Any => true,
+            WaitFor::Pid(want) => retired.id == want,
+            WaitFor::Pgid(group) => retired.pgid == group,
+        }
+    }
 }
 
 /// What happened to one child, as `wait(2)` reports it.

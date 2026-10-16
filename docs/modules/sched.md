@@ -98,8 +98,9 @@ checks them on the host too (`runtime.rs` says so beside its import).
 
 **Task lifecycle (`src/sched/runtime/`).** `current`, `spawn`/`spawn_user`/`spawn_init`/
 `try_spawn_user`, `fork`/`vfork`/`clone`/`spawn_thread`/`exec_replace`, `exit`/`exit_group`,
-`wait_any_child`/`poll_any_child`/`block_until_child_event` and the `WaitEvent`/`WaitPark`/`WaitEnd`
-vocabulary. The invariant that matters across all of them is the aliasing one from the header: no
+`wait_any_child`/`poll_any_child`/`block_until_child_event`, the child-event scan the two wait doors
+share (`WaitFor`'s `Any`/`Pid`/`Pgid` selectors, `scan_child_event`, `poll_child_event`,
+`wait_child_event`, `has_matching_children`), and the `WaitEvent`/`WaitPark`/`WaitEnd` vocabulary. The invariant that matters across all of them is the aliasing one from the header: no
 borrow outlives a switch. `block_until_deadline`/`block_until_interruptible` are where a waiting task
 parks; `wake` is the "you have a message" half that a condition's owner calls after making the
 condition true.
