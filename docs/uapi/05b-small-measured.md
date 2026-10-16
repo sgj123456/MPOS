@@ -5,43 +5,28 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
-- **A FIFO: `mknodat(S_IFIFO)` is refused here now, and the node a real one needs is designed but
-  not built.** Until 2026-10-16 this call made a `NodeKind::File` node, so a *rendezvous* was a
-  plain file: it read end-of-file at once and `ftruncate`/`truncate` resized it, which is a wrong
-  *shape* rather than a wrong number - a caller cannot tell such a name from an empty channel. The
-  refusal (`EOPNOTSUPP`, "present, and this cannot do that") is `docs/uapi/` §5.1 item 25, and the
-  contract it stands in front of is measured whole on a current host through `syscall(2)`
-  (`.workbuddy/probe_fifo.c`, Linux 7.2.9; `probe_fsize.c` carries the file-shaped answers beside
-  it):
-  - **the name**: `S_IFIFO` and the mode it was made with (the umask applies), size `0`, `nlink`
-    1, `blocks` 0; `stat` of an *opened* description says `S_IFIFO` too, and `lseek` on it is
-    `ESPIPE`. A second `mknod` on the name is `EEXIST` whatever type it asks for (§5.1 item 25).
-  - **the rendezvous**: `open(O_RDONLY)` with no writer and `open(O_WRONLY)` with no reader both
-    **park** until a peer opens the other end; `open(O_RDWR)` does not park; `O_RDONLY|O_NONBLOCK`
-    returns at once and `O_WRONLY|O_NONBLOCK` with no reader is **`ENXIO`**. A reader parked in
-    `open` counts as a reader: measured, a writer that arrived at 200 ms opened, wrote, and the
-    parked reader's `open` returned to read those four bytes.
-  - **what each side sees**: a nonblocking reader with no writer at all reads `0` (end-of-stream),
-    with a live writer that has written nothing `EAGAIN`, and after the last writer closes `0`
-    again; the last reader closing makes a write `EPIPE`. The buffer is **discarded** when both
-    counts reach zero, so the next open starts empty.
-  - **the file-shaped calls**: `ftruncate` is `EINVAL`, `fallocate` is `EBADF`/`ESPIPE` per the
-    mode's direction (§5.1 item 22), `truncate(name)` is `EINVAL`, `execve` is `EACCES`, `poll`
-    reports the queue.
+- **A FIFO is served now — and the one shape its `open` leaves behind.** **Landed 2026-10-16**
+  (`docs/uapi/` §5.1 item 26). The entry this replaces said `mknodat(S_IFIFO)` was refused
+  (`EOPNOTSUPP`) and designed the node a real one needed; the design is built. The name is a
+  `S_IFIFO` node (size `0`, `nlink` 1) and its `open` runs Linux's **rendezvous**: a reader and a
+  writer meet at the name, a reader with no writer and a writer with no reader both park (a parked
+  reader counts as a reader, so the arriving writer releases it), `O_RDWR` is its own peer and does
+  not park, `O_RDONLY|O_NONBLOCK` returns at once, `O_WRONLY|O_NONBLOCK` with no reader is
+  **`ENXIO`**, the buffer is **discarded** when both counts reach zero, and an opened description
+  reports `S_IFIFO` (and `ESPIPE`s a seek). The whole measured contract (`.workbuddy/probe_fifo.c`,
+  Linux 7.2.9) is §5.1 item 26's, and `t-fifo` (33 claims) is its pin.
 
-  **What building it needs**, in the order it has to be decided: a node kind whose `stat` is
-  `S_IFIFO`; an **open-time** rendezvous (the open path parks on a predicate and the state wakes
-  its waiters, the shape `PipeEnd`'s read and write already use); reader/writer counts taken at
-  *open* and released at the last close of a description (not at node drop - a `dup` shares a
-  description and a `fork` shares it too, which is why the pipe's own counts are per description);
-  an end per open whose `as_pipe` is the channel, so the size-changing calls and `splice` follow
-  the pipe's rules with no second answer; and `O_RDWR` as one description that is both a reader
-  and a writer. Two of those want a decision the pipe module does not have yet: `Inode`'s
-  `open_replacement` takes no flags (it is the `/dev/ptmx` door, which mints one thing), and the
-  direction an open asked for is what picks the end. Owner: `src/vfs/` (a `fifo` module beside
-  `pipe`, `src/vfs/mount.rs`'s open path) and `src/syscall/linux/abi.rs`'s `mknod_kind`, whose
-  `S_IFIFO` arm is where the refusal lives. Pin: `t-mknod` claims the refusal and the host's
-  answer; the rendezvous has no pin yet because there is nothing to pin.
+  **One residual stays named rather than hidden**: a **fatal** signal (`SIGKILL`) delivered while a
+  task is parked in a FIFO's `open` ends the task inside the wait, so the count that open took is
+  never given back and the FIFO remembers a peer that never arrived — where Linux rolls the count
+  back on `ERESTARTSYS`. Closing it means owning the pending open by something the exit pass drops,
+  and an `open` only becomes such a thing *after* it returns (the fd table is what would own it, and
+  the fd is installed only on success) — so the rollback wants a place to hold a not-yet-installed
+  open across the park. Owner: `src/vfs/pipe.rs`'s `Channel::open` rollback path (whose
+  `Channel::rendezvous` doc carries the same note). The rendezvous claims in `t-fifo` therefore
+  *release* every parked opener — a peer arrives — rather than killing one, so the pin does not
+  depend on this residual.
+
 
 - **`CAP_MKNOD` is not checked.** Linux refuses a device node to a caller without `CAP_MKNOD`
   (`EPERM`, measured on a current host through `syscall(2)`, `.workbuddy/probe_mknod.c`), and the

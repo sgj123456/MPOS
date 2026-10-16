@@ -373,6 +373,7 @@ pub(crate) fn mode_of(meta: &Metadata, stored: Option<u32>) -> u32 {
         NodeKind::BlockDev => 0o060_000,
         NodeKind::Symlink => 0o120_000,
         NodeKind::Socket => 0o140_000,
+        NodeKind::Fifo => 0o010_000,
     };
     match stored {
         Some(stored) => format | (stored & 0o7777),
@@ -383,6 +384,7 @@ pub(crate) fn mode_of(meta: &Metadata, stored: Option<u32>) -> u32 {
             NodeKind::BlockDev => 0o060_660, // block device brw-rw----
             NodeKind::Symlink => 0o120_777,  // symbolic link rwxrwxrwx
             NodeKind::Socket => 0o140_755,   // socket srwxr-xr-x until chmod
+            NodeKind::Fifo => 0o010_644,     // FIFO prw-r--r--
         },
     }
 }
@@ -676,6 +678,7 @@ pub(crate) fn dt_type_of(kind: NodeKind) -> u8 {
         NodeKind::BlockDev => 6, // DT_BLK
         NodeKind::Symlink => 10, // DT_LNK
         NodeKind::Socket => 12,  // DT_SOCK
+        NodeKind::Fifo => 1,     // DT_FIFO
     }
 }
 
@@ -747,26 +750,20 @@ pub(crate) fn mknod_type_is_creatable(mode: usize) -> Result<(), isize> {
 /// re-derivation it would need). The umask applies to the permission half
 /// beside it: `S_IFREG|0666` under a `022` mask leaves `0644`.
 ///
-/// **`S_IFIFO` is refused here rather than faked** (`EOPNOTSUPP`, "present, and
-/// this cannot do that" - `docs/uapi/` §5.2 carries the whole measured contract
-/// and the design a real FIFO needs). Until this pass it created a
-/// `NodeKind::File`, which made a *rendezvous* a plain file: measured, Linux's
-/// FIFO blocks `open` until a peer opens the other end (`O_RDONLY` with no
-/// writer and `O_WRONLY` with no reader both parked; `O_RDWR` does not),
-/// answers `ENXIO` to `O_WRONLY|O_NONBLOCK` with no reader, reads `0` with no
-/// writer and `EAGAIN` with one that has written nothing, writes `EPIPE` when
-/// the last reader closes, and is `S_IFIFO` to `stat` at both the name and an
-/// opened description. A name that reads end-of-file at once is worse than a
-/// refusal, because the caller cannot tell it from an empty channel. It is
-/// asked *after* the name and its existence, so `mknodat(existing, S_IFIFO)` is
-/// the `EEXIST` Linux answers for a type it serves.
+/// **`S_IFIFO` makes a FIFO** - a node whose `open(2)` runs a rendezvous and
+/// whose reads and writes are a pipe's, rather than the regular file this call
+/// used to make (which read end-of-file at once, a shape the caller cannot tell
+/// from an empty channel). `docs/uapi/` §5.2 carries the whole measured
+/// contract and `vfs::pipe::Channel` the machinery. It is asked *after* the
+/// name and its existence, so `mknodat(existing, S_IFIFO)` is the `EEXIST`
+/// Linux answers for a type it serves (asked above, before this).
 pub(crate) fn mknod_kind(mode: usize) -> Result<NodeKind, isize> {
     match mode & 0o170000 {
         0 | 0o100000 => Ok(NodeKind::File),
         0o020000 => Ok(NodeKind::CharDev),
         0o060000 => Ok(NodeKind::BlockDev),
         0o140000 => Ok(NodeKind::Socket),
-        0o010000 => Err(err::EOPNOTSUPP),
+        0o010000 => Ok(NodeKind::Fifo),
         // The two values `mknod_type_is_creatable` refuses first, and no third.
         _ => Err(err::EINVAL),
     }
@@ -3196,7 +3193,7 @@ mod tests {
         assert_eq!(mknod_kind(0o644), Ok(NodeKind::File));
         assert_eq!(mknod_kind(0), Ok(NodeKind::File));
         // The one kind this kernel has no node for.
-        assert_eq!(mknod_kind(0o010_644), Err(crate::err::EOPNOTSUPP)); // S_IFIFO
+        assert_eq!(mknod_kind(0o010_644), Ok(NodeKind::Fifo)); // S_IFIFO
         // And the two the *type* check refuses before the name is asked - the
         // order `t-at-empty-name` pins from the other side, with the type that
         // passes it.

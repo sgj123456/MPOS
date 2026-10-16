@@ -328,13 +328,14 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are TCP's record-only buffer sizes
 (`SO_SNDBUF`/`SO_RCVBUF`), MNT/PID/NET isolation, and the unsized-pty window divergence.
 
-**A FIFO is refused rather than faked** (`mknodat(S_IFIFO)` is `EOPNOTSUPP` since 2026-10-16,
-`docs/uapi/` §5.1 item 25): a FIFO is a *channel* and what this kernel had was a regular file under
-its name — a shape a caller cannot tell from an empty channel. The contract a real node owes is
-measured whole, and the design needed to build it is written down in `docs/uapi/` §5.2 decision by
-decision, with the one shape the pipe module does not have (`open_replacement` takes no flags, and
-the direction an open asked for is what picks the end). That entry's second half is `mknod`'s `dev`
-argument: a node made here carries no device number, because a number-to-driver table is what would
+**A FIFO is a channel now, not a file** (`mknodat(S_IFIFO)` served 2026-10-16, `docs/uapi/` §5.1
+item 26): its `open` runs Linux's **rendezvous** — a reader and a writer meet at the name, a
+peerless open parks (or is `ENXIO` under `O_NONBLOCK`), a parked reader counts as a reader so the
+arriving writer releases it, and the buffer is discarded when both counts reach zero. One shape of
+that open stays named rather than faked: a **fatal** signal while a task is parked ends the task
+*inside the wait*, so the count it took is never rolled back (Linux rolls it back on `ERESTARTSYS`)
+— `docs/uapi/` §5.1 item 26 and §5.2 name it. Still unwritten, and separate: `mknod`'s `dev`
+argument — a node made here carries no device number, because a number-to-driver table is what would
 make the number mean a device.
 
 One of those "buffer sizes" is named down to the line: a **blocking UDP send does not wait for the

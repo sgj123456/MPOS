@@ -2500,7 +2500,7 @@ impl Inode for ControllingTty {
     /// terminal for every process that has bound one, which is what
     /// [`Inode::open_replacement`] exists for.
     #[cfg(target_os = "none")]
-    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+    fn open_replacement(&self, _flags: usize) -> VfsResult<Option<Arc<dyn Inode>>> {
         let Some(dev_id) = crate::sched::controlling_tty_of_current() else {
             return Err(VfsError::NoDevice);
         };
@@ -2512,7 +2512,7 @@ impl Inode for ControllingTty {
     /// No scheduler on the host, so no process to ask; the pair tests drive
     /// terminals directly rather than through this name.
     #[cfg(not(target_os = "none"))]
-    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+    fn open_replacement(&self, _flags: usize) -> VfsResult<Option<Arc<dyn Inode>>> {
         Err(VfsError::NoDevice)
     }
 }
@@ -2588,7 +2588,7 @@ impl Inode for Tty0 {
     /// console mux and no foreground console to name, which is the same answer
     /// [`ControllingTty`] gives for the same reason.
     #[cfg(target_os = "none")]
-    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+    fn open_replacement(&self, _flags: usize) -> VfsResult<Option<Arc<dyn Inode>>> {
         let shown = crate::term::vc::active();
         let tty = super::pty::lookup(shown)
             .map(|pty| pty.slave().clone())
@@ -2597,7 +2597,7 @@ impl Inode for Tty0 {
     }
 
     #[cfg(not(target_os = "none"))]
-    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+    fn open_replacement(&self, _flags: usize) -> VfsResult<Option<Arc<dyn Inode>>> {
         Err(VfsError::NoDevice)
     }
 }

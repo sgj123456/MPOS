@@ -580,7 +580,7 @@ impl Inode for Ptmx {
         Some(PTMX_DEV_ID)
     }
 
-    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+    fn open_replacement(&self, _flags: usize) -> VfsResult<Option<Arc<dyn Inode>>> {
         let pty = allocate_dynamic()?;
         Ok(Some(Arc::new(PtyMaster { pty })))
     }
@@ -708,7 +708,7 @@ impl Inode for PtySlave {
         Some(self.pty.slave_dev_id())
     }
 
-    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+    fn open_replacement(&self, _flags: usize) -> VfsResult<Option<Arc<dyn Inode>>> {
         if self.pty.locked() {
             return Err(VfsError::Corrupt);
         }
@@ -813,11 +813,11 @@ mod tests {
         // Locked as minted: `grantpt`'s job is to clear this.
         assert!(pty.locked());
         assert_eq!(
-            slave.open_replacement().err(),
+            slave.open_replacement(0).err(),
             Some(crate::vfs::VfsError::Corrupt)
         );
         pty.set_locked(false);
-        assert!(slave.open_replacement().unwrap().is_none());
+        assert!(slave.open_replacement(0).unwrap().is_none());
     }
 
     #[test]
@@ -825,8 +825,8 @@ mod tests {
         // Other tests mint pairs concurrently, so the count only has to move
         // forward by two, not land exactly there.
         let before = open_count();
-        let a = Ptmx.open_replacement().unwrap().unwrap();
-        let b = Ptmx.open_replacement().unwrap().unwrap();
+        let a = Ptmx.open_replacement(0).unwrap().unwrap();
+        let b = Ptmx.open_replacement(0).unwrap().unwrap();
         assert!(open_count() >= before + 2, "each open is a new pair");
 
         let (a, b) = (a.as_pty().unwrap().number(), b.as_pty().unwrap().number());

@@ -24,9 +24,9 @@
 //! way), where the node's default `truncate` answered `EOPNOTSUPP` for both.
 //! The one file-shaped inode this handler could not tell apart is gone rather
 //! than named: a FIFO made by `mknod` was a `NodeKind::File` node here, and
-//! since 2026-10-16 `mknodat(S_IFIFO)` is refused until a channel node exists
-//! (`docs/uapi/` §5.1 item 25, whose §5.2 entry carries the measured contract).
-//! So no node this kernel can make reports `File` without being one.
+//! `mknodat(S_IFIFO)` now makes a real `S_IFIFO` node (`docs/uapi/` §5.1
+//! item 26), which this handler answers `EINVAL` like any other non-file. So
+//! no node this kernel can make reports `File` without being one.
 //!
 //! Pure rustix beside one raw door: `rustix::fs::{truncate, ftruncate}`
 //! bind the calls, but the *negative length* claim cannot be spelled

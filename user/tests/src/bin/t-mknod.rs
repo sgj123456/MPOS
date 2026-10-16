@@ -30,28 +30,23 @@
 //!     name, which would be `ENOENT` had the name been asked first), then the
 //!     name, then the name's existence (`EEXIST`), then the directory's own
 //!     writability, and only then the kind - which is why `S_IFIFO` over an
-//!     existing name is `EEXIST` here and not the refusal below, and why
+//!     existing name is `EEXIST`: the type passes the *first* question now
+//!     (it is creatable), so the name's existence is what answers, and why
 //!     `t-at-empty-name` pins the other half of the order with this very type.
 //!   * **the umask masks the permission half**: `mknodat(…|0666)` under a `027`
 //!     mask leaves `0640`, so the mode a caller reads back is the mode it asked
 //!     for minus the mask - `t-umask`'s subject, in this call's shape.
 //!
-//! # What this kernel refuses, and why the pin names it rather than hiding it
+//! # The FIFO, and where its rendezvous is pinned
 //!
-//! **`S_IFIFO` is `EOPNOTSUPP` here and served by Linux**, and that is this
-//! program's one named divergence - accepted under `MPOS_ON_HOST=1` with the
-//! host's own answer printed. A FIFO is a *rendezvous*, and the whole of its
-//! contract was measured before the refusal was written down (the probe's
-//! second half): Linux blocks `open` until a peer opens the other end
-//! (`O_RDONLY` with no writer and `O_WRONLY` with no reader both park, `O_RDWR`
-//! does not), answers `ENXIO` to `O_WRONLY|O_NONBLOCK` with no reader, reads
-//! `0` with no writer and `EAGAIN` with a live writer that has written nothing,
-//! writes `EPIPE` once the last reader closes, discards its buffer when both
-//! counts reach zero, and is `S_IFIFO` to `stat` at the name *and* at an opened
-//! description. Until a node with those semantics exists, a name that reads
-//! end-of-file at once is the wrong *shape* - the caller cannot tell it from an
-//! empty channel - and `docs/uapi/` §5.2 records the refusal, the measurement
-//! and the design a real one needs.
+//! `S_IFIFO` makes a **FIFO** here now, as it does on Linux - the claim below
+//! reads the node (`stat` reports `S_IFIFO`). Until this pass it made a regular
+//! file, which read end-of-file at once: a *rendezvous* turned into a file, a
+//! shape the caller cannot tell from an empty channel. The rest of the FIFO's
+//! contract - the `open`-time park, `ENXIO`, `EAGAIN`, `EPIPE`, the buffer
+//! discarded when both counts reach zero, and `S_IFIFO` at an *opened*
+//! description - is the node's own subject and is pinned in `t-fifo`; the whole
+//! measured shape is `docs/uapi/` §5.2 (`.workbuddy/probe_fifo.c`).
 //!
 //! # What this kernel does not write on the node, and what it does not check
 //!
@@ -83,7 +78,7 @@
 //! leaves it on this target (`-1` with the number beside it). The reads of what
 //! was made are `rustix`'s, because those are not the subject.
 
-use mpos_user_tests::{Report, host_run};
+use mpos_user_tests::Report;
 use rustix::fs::{AtFlags, CWD, FileType, Mode, statat, unlinkat};
 use rustix::process::{geteuid, umask};
 
@@ -265,33 +260,25 @@ fn main() {
         r.check("and a dangling link is a name that exists too", false);
     }
 
-    // ---- the FIFO: this kernel's refusal, Linux's node ---------------------
+    // ---- the FIFO: a node, on both machines now ----------------------------
     //
-    // One claim text on either machine, so a sweep's `ok:` lines and a host
-    // run's are the same words; what differs is the *expectation*, and the note
-    // says which answer came back. The counterfactual is exact: before this
-    // pass `S_IFIFO` made a regular file, and both of these claims read
-    // `errno 0` with a file under the name.
+    // `mknodat(S_IFIFO)` makes a FIFO here and on the host: `stat` reports
+    // `S_IFIFO` at the name, and `open(2)` on it runs a rendezvous. What the
+    // *call* promises is only the node - the rendezvous is the node's own
+    // subject, and `t-fifo` is where it is pinned (the whole measured contract
+    // is `docs/uapi/` §5.2). The counterfactual is exact: before this pass the
+    // call made a **regular file**, so the timing below read `S_IFREG` under
+    // the name - a shape no caller can tell from an empty channel.
     let (made, e) = mknodat(S_IFIFO | 0o644, 0, "/tmp/t-mknod-fifo");
-    // The numbers go in a printed line rather than in the claim: the claim's
-    // words have to be the same on both machines, and this is the one place
-    // where the *answer* is not.
-    if host_run() {
-        println!(
-            "     note: S_IFIFO is served by Linux (got {made}); this kernel refuses it, and the \
-             header says why"
-        );
-    } else {
-        println!("     the FIFO refusal came back as (got {made}, errno {e})");
-    }
-    let fifo_refused = if host_run() {
-        made == 0
-    } else {
-        made == -1 && e == libc::EOPNOTSUPP
-    };
     r.check(
-        "S_IFIFO is answered the way this program's header names",
-        fifo_refused,
+        &format!("S_IFIFO makes a FIFO node (got {made}, errno {e})"),
+        made == 0 && kind_of("/tmp/t-mknod-fifo") == Some(FileType::Fifo),
+    );
+    r.check(
+        "and the name's type is S_IFIFO to stat",
+        statat(CWD, "/tmp/t-mknod-fifo", AtFlags::empty())
+            .ok()
+            .is_some_and(|st| st.st_mode as u32 & 0o170000 == S_IFIFO),
     );
     let _ = unlinkat(CWD, "/tmp/t-mknod-fifo", AtFlags::empty());
     r.check(

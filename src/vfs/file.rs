@@ -771,7 +771,12 @@ pub fn descriptor_inode(fd: usize) -> VfsResult<Arc<dyn Inode>> {
 
 /// [`open`](fn.open.html) with a caller-supplied start for relative paths.
 /// `None` is the root, which is what every kernel caller means.
-pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<RawFd> {
+///
+/// `flags` is the open's own flag word, carried through because a *door* may
+/// need it: a FIFO's open takes its direction from `O_ACCMODE` and its
+/// blocking behaviour from `O_NONBLOCK`, and it is `open_replacement` that runs
+/// that rendezvous (see [`Inode::open_replacement`]).
+pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>, flags: usize) -> VfsResult<RawFd> {
     let inode = match start {
         Some(dir) => super::resolve_at(path, dir)?,
         None => resolve(path)?,
@@ -797,7 +802,7 @@ pub fn open_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<RawFd> {
     // A name can also be a door rather than a thing: opening `/dev/ptmx`
     // mints a new pty pair and hands back that pair's master, and opening a
     // locked pty's slave refuses. The node itself says which it is.
-    let inode = match inode.open_replacement()? {
+    let inode = match inode.open_replacement(flags)? {
         Some(replacement) => replacement,
         None => inode,
     };

@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use critical_section::Mutex;
 
-use super::{Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
+use super::{Ino, Inode, Metadata, NodeKind, Ready, VfsError, VfsResult};
 use crate::sched::policy::TaskId;
 
 /// Writes up to this many bytes never split across a blocking point, which is
@@ -77,6 +77,14 @@ impl Ring {
 
     fn is_empty(&self) -> bool {
         self.bytes.len() == self.start
+    }
+
+    /// Forget everything, keeping the allocation. A closed FIFO's buffer is
+    /// discarded when its last end goes, so the next open starts empty - see
+    /// [`PipeState::discard_buffer`].
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.start = 0;
     }
 
     /// Take up to `want` bytes into `buf`, answering how many were taken.
@@ -141,6 +149,52 @@ struct PipeState {
     waiting_readers: Vec<TaskId>,
     #[cfg_attr(not(target_os = "none"), allow(dead_code))]
     waiting_writers: Vec<TaskId>,
+    /// Tasks parked in a FIFO's **open-time rendezvous** - an `open(O_RDONLY)`
+    /// with no writer, or an `open(O_WRONLY)` with no reader, on a name whose
+    /// channel is nothing yet. Kept apart from the two above because the
+    /// condition they wait on is the *count*, not the buffer: an arriving peer
+    /// wakes them, and the one that arrived re-checks its own count. A plain
+    /// pipe never fills this list.
+    #[cfg_attr(not(target_os = "none"), allow(dead_code))]
+    waiting_open: Vec<TaskId>,
+}
+
+impl PipeState {
+    /// Forget the buffer, as closing the last end of a FIFO does: the bytes a
+    /// gone pipeline left behind do not belong to whoever opens the name next.
+    /// Linux discards a FIFO's buffer when both its read and write counts reach
+    /// zero (measured, `.workbuddy/probe_fifo.c`), and the two offsets go with
+    /// it so a queued SCM_RIGHTS record cannot survive either.
+    fn discard_buffer(&mut self) {
+        self.data.clear();
+        self.scm.clear();
+        self.written = 0;
+        self.consumed = 0;
+    }
+}
+
+/// Which directions one end of a channel is open in.
+///
+/// A plain pipe hands out two ends, one each way, so it only ever uses `Read`
+/// and `Write`. A FIFO's `open(O_RDWR)` is the case that needs `Both`: one
+/// description that is a reader *and* a writer of the same buffer, so the
+/// counts it takes and gives back are two, and it is the only end whose
+/// `shut_read` and `shut_write` are both real.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    Read,
+    Write,
+    Both,
+}
+
+impl Role {
+    fn reads(self) -> bool {
+        matches!(self, Role::Read | Role::Both)
+    }
+
+    fn writes(self) -> bool {
+        matches!(self, Role::Write | Role::Both)
+    }
 }
 
 /// One SCM_RIGHTS handover, tagged with the stream position the send that
@@ -161,11 +215,16 @@ struct Scm {
 /// pipe is a stream, and the cursor an fd keeps is meaningless for it.
 pub struct PipeEnd {
     state: Arc<Mutex<RefCell<PipeState>>>,
-    writing: bool,
+    /// Which directions this end is open in - what its `read`/`write` will do,
+    /// which count it took on the way in, and which count its drop gives back.
+    role: Role,
     /// Set when this end has left the count, by a half-close or by its own
     /// drop - whichever came first. Both have to be idempotent, since a
-    /// `shutdown` can be asked for twice and the drop always follows it.
-    closed: AtomicBool,
+    /// `shutdown` can be asked for twice and the drop always follows it. Two
+    /// bits rather than one, because a `Role::Both` end (a FIFO opened
+    /// `O_RDWR`) leaves two counts and each may be half-closed on its own.
+    closed_read: AtomicBool,
+    closed_write: AtomicBool,
     /// `O_NONBLOCK`, as `pipe2(2)` is born with it and `fcntl(F_SETFL)` sets
     /// it: an operation that would wait answers `EAGAIN` instead. It lives
     /// here rather than in the descriptor, because the wait is here - testing
@@ -173,6 +232,13 @@ pub struct PipeEnd {
     /// race-free, where a descriptor checked beforehand could have the data
     /// it saw taken by another reader before its own turn comes.
     nonblocking: AtomicBool,
+    /// The node kind `stat` reports for a description of this end. `File` for an
+    /// anonymous pipe; `Fifo` for one opened through a FIFO's name, whose
+    /// description Linux reports as `S_IFIFO` like the name itself.
+    kind: NodeKind,
+    /// The inode a FIFO's end reports, so `fstat` of an opened FIFO names the
+    /// node the name does. Zero for an anonymous pipe, which has none.
+    ino: Ino,
 }
 
 /// POSIX's floor for record writes, held at compile time, and a buffer that is
@@ -193,20 +259,208 @@ pub fn pair() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
         writers: 1,
         waiting_readers: Vec::new(),
         waiting_writers: Vec::new(),
+        waiting_open: Vec::new(),
     })));
-    let read_end = Arc::new(PipeEnd {
-        state: state.clone(),
-        writing: false,
-        closed: AtomicBool::new(false),
-        nonblocking: AtomicBool::new(false),
-    });
-    let write_end = Arc::new(PipeEnd {
-        state,
-        writing: true,
-        closed: AtomicBool::new(false),
-        nonblocking: AtomicBool::new(false),
-    });
-    (read_end, write_end)
+    let end = |role: Role| {
+        Arc::new(PipeEnd {
+            state: state.clone(),
+            role,
+            closed_read: AtomicBool::new(false),
+            closed_write: AtomicBool::new(false),
+            nonblocking: AtomicBool::new(false),
+            kind: NodeKind::File,
+            ino: 0,
+        })
+    };
+    (end(Role::Read), end(Role::Write))
+}
+
+/// The channel behind a **FIFO**: one buffer that *opens* may join, rather than
+/// a `pair` born with both ends already in hand.
+///
+/// The difference that makes it a channel and not a pipe is the rendezvous at
+/// `open(2)`. A pipe's two ends exist the moment `pipe(2)` returns; a FIFO is a
+/// *name* whose ends are opened one at a time, by processes that may never have
+/// met, and Linux parks an `open` until the other side shows up. The counts that
+/// make that possible are the same two the pipe already keeps - `readers` and
+/// `writers` - which is why an end minted here is a plain [`PipeEnd`]: it takes
+/// its count on the way in, gives it back on drop, and its reads and writes see
+/// the same EOF and `EPIPE` a pipe's do.
+pub struct Channel {
+    state: Arc<Mutex<RefCell<PipeState>>>,
+    kind: NodeKind,
+    ino: Ino,
+}
+
+impl Channel {
+    /// A FIFO nobody has open: both counts start at zero, so the first `open`
+    /// is the one that finds no peer and may park.
+    pub fn new(kind: NodeKind, ino: Ino) -> Channel {
+        Channel {
+            state: Arc::new(Mutex::new(RefCell::new(PipeState {
+                data: Ring::new(),
+                scm: VecDeque::new(),
+                written: 0,
+                consumed: 0,
+                readers: 0,
+                writers: 0,
+                waiting_readers: Vec::new(),
+                waiting_writers: Vec::new(),
+                waiting_open: Vec::new(),
+            }))),
+            kind,
+            ino,
+        }
+    }
+
+    /// Open one end of the FIFO, running Linux's rendezvous.
+    ///
+    /// Measured on a current host through `syscall(2)` (`.workbuddy/probe_fifo.c`,
+    /// Linux 7.2.9), and the whole shape is in `docs/uapi/` §5.2:
+    /// `open(O_RDONLY)` with no writer and `open(O_WRONLY)` with no reader both
+    /// **park** until a peer opens the other end; `open(O_RDWR)` does not park
+    /// (it is its own peer); `O_RDONLY|O_NONBLOCK` returns at once; and
+    /// `O_WRONLY|O_NONBLOCK` with no reader is **`ENXIO`**. A reader parked
+    /// here counts as a reader, so the writer that arrives finds `readers > 0`
+    /// and returns at once - which is how the arriving side releases the parked
+    /// one rather than deadlocking behind it.
+    pub fn open(&self, role: Role, nonblocking: bool) -> VfsResult<Arc<PipeEnd>> {
+        // Take the count(s) first: a parked reader has to count as a reader for
+        // the peer that arrives to see it, which is Linux's rule and the reason
+        // the two sides do not deadlock.
+        critical_section::with(|cs| {
+            let mut st = self.state.borrow(cs).borrow_mut();
+            if role.reads() {
+                st.readers += 1;
+            }
+            if role.writes() {
+                st.writers += 1;
+            }
+        });
+        // A peer may already be here (the count went up), so tell anyone parked
+        // to re-check; the arriving side is released by the same news.
+        self.wake_open();
+
+        match self.rendezvous(role, nonblocking) {
+            Rendezvous::Ready => {}
+            outcome => {
+                // Give the count back and answer. `Refused` is `O_WRONLY|
+                // O_NONBLOCK` with no reader (`ENXIO`); `Interrupted` is a
+                // catchable signal that ended the park, which Linux answers
+                // `EINTR` - and the count has to go back or the FIFO would
+                // remember a peer that never arrived.
+                critical_section::with(|cs| {
+                    let mut st = self.state.borrow(cs).borrow_mut();
+                    if role.reads() {
+                        st.readers -= 1;
+                    }
+                    if role.writes() {
+                        st.writers -= 1;
+                    }
+                });
+                return Err(match outcome {
+                    Rendezvous::Interrupted => VfsError::Interrupted,
+                    _ => VfsError::NoDevice,
+                });
+            }
+        }
+
+        Ok(Arc::new(PipeEnd {
+            state: self.state.clone(),
+            role,
+            closed_read: AtomicBool::new(false),
+            closed_write: AtomicBool::new(false),
+            nonblocking: AtomicBool::new(nonblocking),
+            kind: self.kind,
+            ino: self.ino,
+        }))
+    }
+
+    /// Wait until this open's peer condition holds. [`Rendezvous::Ready`] means
+    /// the open may return; `Refused` is the non-blocking writer with no reader
+    /// (`ENXIO`); `Interrupted` is a catchable signal (`EINTR`).
+    ///
+    /// The signal is *not* consumed here - the syscall gate delivers it on the
+    /// way out - which is why `EINTR` is a return value rather than a death.
+    /// Naming a residual: a **fatal** signal (`SIGKILL`) while parked ends the
+    /// task inside the wait (`block_until_deadline` calls `exit`), so the count
+    /// this open took is never given back and the FIFO remembers a peer that
+    /// never arrived. Linux rolls the count back on `ERESTARTSYS`; making this
+    /// do the same wants the pending open owned by something the exit pass
+    /// drops, which the fd table only becomes after the open returns - named in
+    /// `docs/uapi/` §5.2 rather than faked.
+    fn rendezvous(&self, role: Role, nonblocking: bool) -> Rendezvous {
+        // A reader needs a writer; a writer needs a reader; `Both` is its own
+        // peer, so it needs nothing.
+        let ready = || {
+            critical_section::with(|cs| {
+                let st = self.state.borrow(cs).borrow();
+                (!role.reads() || st.writers > 0) && (!role.writes() || st.readers > 0)
+            })
+        };
+        if ready() {
+            return Rendezvous::Ready;
+        }
+        if nonblocking {
+            // A non-blocking reader with no writer succeeds (its reads will see
+            // end-of-stream); a non-blocking writer with no reader is `ENXIO`.
+            return if role.reads() {
+                Rendezvous::Ready
+            } else {
+                Rendezvous::Refused
+            };
+        }
+        #[cfg(target_os = "none")]
+        {
+            let id = crate::sched::current();
+            critical_section::with(|cs| {
+                let mut st = self.state.borrow(cs).borrow_mut();
+                if !st.waiting_open.contains(&id) {
+                    st.waiting_open.push(id);
+                }
+            });
+            let end = crate::sched::block_until_interruptible(ready);
+            critical_section::with(|cs| {
+                self.state
+                    .borrow(cs)
+                    .borrow_mut()
+                    .waiting_open
+                    .retain(|&w| w != id);
+            });
+            match end {
+                crate::sched::WaitEnd::Interrupted => Rendezvous::Interrupted,
+                _ => Rendezvous::Ready,
+            }
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            panic!("a FIFO's open-time rendezvous needs the kernel scheduler");
+        }
+    }
+
+    /// Wake every task parked in the rendezvous: a count changed, so each one's
+    /// `ready` may have gone true.
+    fn wake_open(&self) {
+        #[cfg(target_os = "none")]
+        {
+            let ids =
+                critical_section::with(|cs| self.state.borrow(cs).borrow().waiting_open.clone());
+            for id in ids {
+                crate::sched::wake(id);
+            }
+        }
+    }
+}
+
+/// How a FIFO's open-time rendezvous ended.
+#[derive(Clone, Copy)]
+enum Rendezvous {
+    /// The peer condition holds (or a non-blocking reader with no writer).
+    Ready,
+    /// A non-blocking writer with no reader: `ENXIO`.
+    Refused,
+    /// A catchable signal ended the park: `EINTR`.
+    Interrupted,
 }
 
 impl PipeEnd {
@@ -409,9 +663,13 @@ impl PipeEnd {
     /// Idempotent: the count may only drop once, and the [`Drop`] that follows
     /// must not drop it again.
     pub fn shut_write(&self) {
-        if self.writing && !self.closed.swap(true, Ordering::Relaxed) {
+        if self.role.writes() && !self.closed_write.swap(true, Ordering::Relaxed) {
             critical_section::with(|cs| {
-                self.state.borrow(cs).borrow_mut().writers -= 1;
+                let mut st = self.state.borrow(cs).borrow_mut();
+                st.writers -= 1;
+                if st.readers == 0 && st.writers == 0 {
+                    st.discard_buffer();
+                }
             });
             self.wake_all();
         }
@@ -420,9 +678,13 @@ impl PipeEnd {
     /// Half-close the other direction: this end's reads report end-of-stream,
     /// and the peer's writes fail the way a write to a closed pipe does.
     pub fn shut_read(&self) {
-        if !self.writing && !self.closed.swap(true, Ordering::Relaxed) {
+        if self.role.reads() && !self.closed_read.swap(true, Ordering::Relaxed) {
             critical_section::with(|cs| {
-                self.state.borrow(cs).borrow_mut().readers -= 1;
+                let mut st = self.state.borrow(cs).borrow_mut();
+                st.readers -= 1;
+                if st.readers == 0 && st.writers == 0 {
+                    st.discard_buffer();
+                }
             });
             self.wake_all();
         }
@@ -453,25 +715,46 @@ impl PipeEnd {
     fn wake_all(&self) {
         self.wake_waiters(true);
         self.wake_waiters(false);
+        // A count changed, so anyone parked in a FIFO's open-time rendezvous has
+        // to re-check whether their peer is here now.
+        #[cfg(target_os = "none")]
+        {
+            let ids =
+                critical_section::with(|cs| self.state.borrow(cs).borrow().waiting_open.clone());
+            for id in ids {
+                crate::sched::wake(id);
+            }
+        }
     }
 }
 
 impl Drop for PipeEnd {
     fn drop(&mut self) {
-        if self.closed.swap(true, Ordering::Relaxed) {
-            // A half-close already took this end out of the count.
-            return;
-        }
+        let mut changed = false;
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
-            if self.writing {
-                st.writers -= 1;
-            } else {
+            if self.role.reads() && !self.closed_read.swap(true, Ordering::Relaxed) {
                 st.readers -= 1;
+                changed = true;
+            }
+            if self.role.writes() && !self.closed_write.swap(true, Ordering::Relaxed) {
+                st.writers -= 1;
+                changed = true;
+            }
+            // The last end of a FIFO going takes the buffer with it, so the next
+            // open of the name starts empty rather than reading a dead
+            // pipeline's leftovers. A pipe's ends never both reach zero here -
+            // its two counts fall together only when the whole pipe is gone -
+            // so the rule is a no-op for one.
+            if st.readers == 0 && st.writers == 0 {
+                st.discard_buffer();
             }
         });
-        // Counts changed, so EOF/EPIPE may have become true for the other end.
-        self.wake_all();
+        if changed {
+            // Counts changed, so EOF/EPIPE may have become true for the other
+            // end - and an open parked in the rendezvous may now have a peer.
+            self.wake_all();
+        }
     }
 }
 
@@ -522,13 +805,11 @@ impl Inode for PipeEnd {
     fn poll_subscribe(&self, id: TaskId) {
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
-            let queue = if self.writing {
-                &mut st.waiting_writers
-            } else {
-                &mut st.waiting_readers
-            };
-            if !queue.contains(&id) {
-                queue.push(id);
+            if self.role.writes() && !st.waiting_writers.contains(&id) {
+                st.waiting_writers.push(id);
+            }
+            if self.role.reads() && !st.waiting_readers.contains(&id) {
+                st.waiting_readers.push(id);
             }
         });
     }
@@ -536,19 +817,15 @@ impl Inode for PipeEnd {
     fn poll_unsubscribe(&self, id: TaskId) {
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
-            let queue = if self.writing {
-                &mut st.waiting_writers
-            } else {
-                &mut st.waiting_readers
-            };
-            queue.retain(|&w| w != id);
+            st.waiting_writers.retain(|&w| w != id);
+            st.waiting_readers.retain(|&w| w != id);
         });
     }
 
     fn metadata(&self) -> Metadata {
         Metadata {
-            ino: 0,
-            kind: NodeKind::File,
+            ino: self.ino,
+            kind: self.kind,
             size: self.buffered() as u64,
         }
     }
@@ -809,8 +1086,8 @@ mod tests {
     use alloc::sync::Arc;
     use alloc::vec;
 
-    use super::{CAPACITY, DuplexEnd, PIPE_BUF, pair};
-    use crate::vfs::{File, Inode, VfsError};
+    use super::{CAPACITY, Channel, DuplexEnd, PIPE_BUF, Role, pair};
+    use crate::vfs::{File, Inode, NodeKind, VfsError};
 
     #[test]
     fn a_socketpair_carries_bytes_both_ways() {
@@ -1049,6 +1326,83 @@ mod tests {
         let (read_end, write_end) = pair();
         assert_eq!(read_end.read_at(0, &mut []).unwrap(), 0);
         assert_eq!(write_end.write_at(0, b"").unwrap(), 0);
+    }
+
+    /// A FIFO's rendezvous, at the one place the host can drive it without
+    /// blocking: the *non-blocking* doors. A non-blocking writer with no reader
+    /// is refused (`ENXIO`) rather than parked, and a non-blocking reader with
+    /// no writer opens (its reads will see end-of-stream) - both measured on a
+    /// current host in `.workbuddy/probe_fifo.c`, and the shape the whole
+    /// rendezvous turns on.
+    #[test]
+    fn a_fifo_channel_refuses_a_lonely_nonblocking_writer() {
+        let ch = Channel::new(NodeKind::Fifo, 7);
+
+        // No reader anywhere: a non-blocking writer hears ENXIO, and taking the
+        // count is rolled back so the FIFO remembers no writer either.
+        assert_eq!(ch.open(Role::Write, true).err(), Some(VfsError::NoDevice));
+        // Which the next reader proves: it opens (its own non-blocking reader
+        // path) and reads end-of-stream, not the EAGAIN a live writer would give.
+        let rd = ch.open(Role::Read, true).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(rd.read_once(&mut buf).unwrap(), Some(0), "no writer at all");
+    }
+
+    /// The reader parks first (non-blocking, so it returns), and the writer that
+    /// arrives finds it - the property that keeps the two sides from deadlocking.
+    /// The writer's open is *blocking* and returns at once, because the parked
+    /// reader already counts as a reader.
+    #[test]
+    fn a_fifo_channel_pairs_a_reader_and_a_writer() {
+        let ch = Channel::new(NodeKind::Fifo, 9);
+        let rd = ch.open(Role::Read, true).unwrap();
+        // Blocking, and it must *return* - the reader is already counted.
+        let wr = ch.open(Role::Write, false).unwrap();
+
+        assert_eq!(wr.write_at(0, b"hey").unwrap(), 3);
+        let mut buf = [0u8; 8];
+        assert_eq!(rd.read_at(0, &mut buf).unwrap(), 3);
+        assert_eq!(&buf[..3], b"hey");
+    }
+
+    /// `O_RDWR` is one description that is both ends, so it is its own peer and
+    /// never waits - and its `metadata` reports the FIFO, not an anonymous pipe.
+    #[test]
+    fn a_fifo_open_readwrite_is_its_own_peer() {
+        let ch = Channel::new(NodeKind::Fifo, 11);
+        let both = ch.open(Role::Both, false).unwrap();
+
+        assert_eq!(both.metadata().kind, NodeKind::Fifo);
+        assert_eq!(both.metadata().ino, 11);
+        assert!(!both.seekable(), "a FIFO is ESPIPE");
+        // It writes to, and reads back from, the one buffer.
+        assert_eq!(both.write_at(0, b"round").unwrap(), 5);
+        let mut buf = [0u8; 8];
+        assert_eq!(both.read_at(0, &mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"round");
+    }
+
+    /// The buffer is discarded when both counts reach zero - the reader here
+    /// closes while the writer still holds it (so nothing is discarded), and the
+    /// writer's close takes both to zero and drops the two unread bytes.
+    #[test]
+    fn closing_a_fifos_last_two_ends_discards_the_buffer() {
+        let ch = Channel::new(NodeKind::Fifo, 13);
+        let rd = ch.open(Role::Read, true).unwrap();
+        let wr = ch.open(Role::Write, true).unwrap();
+        assert_eq!(wr.write_at(0, b"xy").unwrap(), 2);
+
+        // Reader gone, writer alive: the bytes stay for whoever is left, which
+        // is nobody - but the buffer is not discarded yet.
+        drop(rd);
+        assert_eq!(wr.metadata().size, 2, "not discarded while a writer lives");
+        // The last end goes: both counts are zero, and the buffer with them.
+        drop(wr);
+
+        let fresh = ch.open(Role::Read, true).unwrap();
+        assert_eq!(fresh.metadata().size, 0, "the next open starts empty");
+        let mut buf = [0u8; 4];
+        assert_eq!(fresh.read_once(&mut buf).unwrap(), Some(0));
     }
 
     /// `pipe_poll`'s two conditions, and the one that is easy to get wrong:

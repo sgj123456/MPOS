@@ -774,8 +774,103 @@ impl Inode for RamSocket {
     /// The file doors do not reach the queue behind a socket name:
     /// `open(2)` answers Linux's ENXIO, the same refusal `/dev/tty`
     /// gives a process it has no answer for.
-    fn open_replacement(&self) -> VfsResult<Option<Arc<dyn Inode>>> {
+    fn open_replacement(&self, _flags: usize) -> VfsResult<Option<Arc<dyn Inode>>> {
         Err(VfsError::NoDevice)
+    }
+
+    counts_its_names!();
+    names_live_in_dirs!();
+}
+
+/// A FIFO: a *name* two processes meet at, whose bytes cross through a
+/// [`Channel`](crate::vfs::pipe::Channel) rather than through storage.
+///
+/// The node carries the name's identity - `stat` type, mode, owner, clock,
+/// unlink - and the channel it hands out. It holds no bytes itself: `open(2)`
+/// runs the rendezvous (an `open(O_RDONLY)` with no writer parks, and the
+/// reverse) and returns the end the direction asks for, so the reads and writes
+/// behind the name are a pipe's. `docs/uapi/` §5.2 carries the measured
+/// contract; `.workbuddy/probe_fifo.c` is where it was measured.
+struct RamFifo {
+    ino: Ino,
+    /// How many names reach it - the `mknod`ed name, and any `link` of it.
+    links: Mutex<Cell<u64>>,
+    mode: Mutex<Cell<Option<u32>>>,
+    owner: Mutex<Cell<(u32, u32)>>,
+    mtime: Mutex<Cell<u64>>,
+    flags: NodeFlags,
+    /// The channel every open of this name joins. It lives exactly as long as
+    /// the name does; each open takes a count on the way in and gives it back
+    /// on close, and the buffer is discarded when both counts reach zero.
+    channel: Arc<crate::vfs::pipe::Channel>,
+}
+
+impl Inode for RamFifo {
+    fn flags(&self) -> VfsResult<u32> {
+        Ok(self.flags.get())
+    }
+
+    fn set_flags(&self, flags: u32) -> VfsResult<()> {
+        self.flags.set(flags)
+    }
+
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            ino: self.ino,
+            kind: NodeKind::Fifo,
+            size: 0,
+        }
+    }
+
+    fn mtime(&self) -> u64 {
+        critical_section::with(|cs| self.mtime.borrow(cs).get())
+    }
+
+    fn set_times(&self, _atime: u64, mtime: u64) -> VfsResult<()> {
+        critical_section::with(|cs| self.mtime.borrow(cs).set(mtime));
+        Ok(())
+    }
+
+    fn mode(&self) -> u32 {
+        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0) & MODE_BITS
+    }
+
+    fn set_mode(&self, mode: u32) {
+        critical_section::with(|cs| {
+            self.mode.borrow(cs).set(Some(mode & MODE_BITS));
+        });
+    }
+
+    fn keeps_modes(&self) -> bool {
+        critical_section::with(|cs| self.mode.borrow(cs).get()).is_some()
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).get())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).set((uid, gid)));
+    }
+
+    /// Opening a FIFO's name is opening one end of its channel, and the open's
+    /// direction decides which: `O_RDONLY` a reader, `O_WRONLY` a writer,
+    /// `O_RDWR` one description that is both (`Role::Both`), and `O_NONBLOCK`
+    /// decides whether a peerless open parks or answers `ENXIO`. The whole
+    /// shape is Linux's, measured in `docs/uapi/` §5.2.
+    fn open_replacement(&self, flags: usize) -> VfsResult<Option<Arc<dyn Inode>>> {
+        // The access mode is the low two bits of the flag word - 0 read, 1
+        // write, 2 read-write - the same three-way choice `File::set_access`
+        // records. Not `O_ACCMODE` from the syscall layer: the filesystem has
+        // no business naming the ABI, and the numbers are POSIX's.
+        let role = match flags & 0o3 {
+            1 => crate::vfs::pipe::Role::Write,
+            2 => crate::vfs::pipe::Role::Both,
+            _ => crate::vfs::pipe::Role::Read,
+        };
+        let nonblocking = flags as u32 & crate::vfs::file::O_NONBLOCK != 0;
+        let end = self.channel.open(role, nonblocking)?;
+        Ok(Some(end as Arc<dyn Inode>))
     }
 
     counts_its_names!();
@@ -916,6 +1011,21 @@ impl Inode for RamDir {
                 owner: Mutex::new(Cell::new(owner)),
                 flags: NodeFlags::new(),
             }),
+            // A FIFO: a name whose channel a `mknod(S_IFIFO)` made. The channel
+            // is born with the node and outlives every open of it; the birth
+            // mode below is a default the caller's `mknod` mode overrides.
+            NodeKind::Fifo => {
+                let ino = fresh_ino();
+                Arc::new(RamFifo {
+                    ino,
+                    links: Mutex::new(Cell::new(1)),
+                    mode: Mutex::new(Cell::new(birth)),
+                    owner: Mutex::new(Cell::new(owner)),
+                    mtime: Mutex::new(Cell::new(at)),
+                    flags: NodeFlags::new(),
+                    channel: Arc::new(crate::vfs::pipe::Channel::new(NodeKind::Fifo, ino)),
+                })
+            }
             // A link is made with `Inode::symlink`, which carries the one thing
             // a link cannot exist without: what it points at.
             NodeKind::Symlink => return Err(VfsError::Unsupported),

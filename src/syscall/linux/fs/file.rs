@@ -259,7 +259,7 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
     {
         return err::ELOOP;
     }
-    let opened = match crate::vfs::open_opt(path, Some(base.clone())) {
+    let opened = match crate::vfs::open_opt(path, Some(base.clone()), flags) {
         Ok(fd) => Ok(fd),
         Err(crate::vfs::VfsError::NoEntry) if flags & O_CREAT != 0 => {
             // O_EXCL names an existing file EEXIST; a missing directory, no
@@ -301,7 +301,7 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             {
                 created.set_mode(masked_mode(mode));
             }
-            crate::vfs::open_opt(path, Some(base))
+            crate::vfs::open_opt(path, Some(base), flags)
         }
         Err(e) => Err(e),
     };
@@ -4142,7 +4142,7 @@ pub fn handle_fsync(args: [usize; ARG_COUNT]) -> isize {
         // anonymous family - a pty, an eventfd, a timerfd, an epoll, an
         // inotify, a signalfd - is a character device here, so this one arm
         // answers for all of it.
-        NodeKind::CharDev | NodeKind::Socket => err::EINVAL,
+        NodeKind::CharDev | NodeKind::Socket | NodeKind::Fifo => err::EINVAL,
     }
 }
 
@@ -5179,6 +5179,10 @@ pub fn handle_fallocate(args: [usize; ARG_COUNT]) -> isize {
         NodeKind::File if file.inode().as_pipe().is_some() => return err::ESPIPE,
         NodeKind::File => {}
         NodeKind::Dir => return err::EISDIR,
+        // A FIFO is a channel, not storage: Linux answers `ESPIPE` for a
+        // `fallocate` on one (measured, `.workbuddy/probe_fifo.c`), the same
+        // refusal a pipe's writable end gets one arm above.
+        NodeKind::Fifo => return err::ESPIPE,
         // A socket, an anon-inode descriptor, a character device: no byte range
         // to lay out. The man page's ENODEV line about descriptors that are
         // neither files nor directories lands here.
@@ -5730,8 +5734,8 @@ pub fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // an uncreatable type `EINVAL` even with an *empty* name, which names
     // nothing and would be `ENOENT` had the type been asked second, and the
     // same two come back over a name that already exists. `t-at-empty-name`
-    // pins the other side of that order with `S_IFIFO`, a type this check
-    // passes and this kernel's kind step refuses: the empty name still wins.
+    // pins the other side of that order with `S_IFIFO`: the type passes this
+    // check and the empty name is the next question, so `ENOENT` still wins.
     if let Err(e) = abi::mknod_type_is_creatable(args[2]) {
         return e;
     }
@@ -5771,12 +5775,13 @@ pub fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     if let Err(e) = crate::vfs::may_create_in(&parent) {
         return err_of(e);
     }
-    // The kind, once the name and its existence are settled: where a FIFO's
-    // refusal belongs (so the `EEXIST` above is what a second `mknodat(S_IFIFO)`
-    // over its own node answers, as Linux answers it for a type it serves), and
-    // where Linux's `CAP_MKNOD` gate for a device node sits. This kernel has no
-    // such gate yet - `docs/uapi/` §5.2 names it, with the capability
-    // re-derivation a uid change would need before it could be asked.
+    // The kind, once the name and its existence are settled: the position
+    // `mknod_kind` answers `S_IFIFO` in (a FIFO, so the `EEXIST` above is what
+    // a second `mknodat(S_IFIFO)` over its own node answers - Linux's answer
+    // for a type it serves), and where Linux's `CAP_MKNOD` gate for a device
+    // node sits. This kernel has no such gate yet - `docs/uapi/` §5.2 names it,
+    // with the capability re-derivation a uid change would need before it could
+    // be asked.
     let kind = match abi::mknod_kind(args[2]) {
         Ok(kind) => kind,
         Err(e) => return e,

@@ -468,9 +468,10 @@ the commit bodies), and each moved its pin in the same commit.
     — the door was acting on the link rather than on the file the name denotes — and closing it
     (§5.1 item 24) is what settled it, the path spelling answering Linux's `EINVAL` for that pipe
     because it now reaches the pipe's own inode; and the *other* inode that reports
-    `NodeKind::File` without being a regular file — a FIFO made by `mknod` — is gone as of §5.1
-    item 25, which refuses the FIFO's creation until a channel node exists (§5.2 carries the
-    measured contract and the design), so no node this kernel can make reports `File` without
+    `NodeKind::File` without being a regular file — a FIFO made by `mknod` — is gone: §5.1 item 25
+    stopped `mknod` making a `File` there, and §5.1 item 26 now makes a real `S_IFIFO` node (and
+    refuses the size-changing calls to it by kind), so no node this kernel can make reports `File`
+    without
     being one.
 
 23. **`waitid`'s record carries the child's real uid.** `si_uid` was the one field of that record
@@ -592,24 +593,78 @@ the commit bodies), and each moved its pin in the same commit.
     `EINVAL`, the five it makes plus a plain mode pass) and keeps `mknod_kind` for the kind itself,
     asked last; its unit test asserts each of Linux's answers, including the two refusals' *words*;
     both `mknod` doors answer `EEXIST` for an existing name, asked *without following* so a dangling
-    link is the name that exists, and both ask the directory's bits after it. **`S_IFIFO` is
-    `EOPNOTSUPP`**: this kernel has no channel node yet, and a node that is a regular file under a
+    link is the name that exists, and both ask the directory's bits after it. **`S_IFIFO` was
+    `EOPNOTSUPP` here** (superseded by §5.1 item 26, which builds the node): this kernel had no
+    channel node yet, and a node that is a regular file under a
     FIFO's name is a wrong *shape* — a caller cannot tell it from an empty channel — where an honest
     refusal is one the caller can see (rule 4); it is asked last, so `mknodat(existing, S_IFIFO)` is
-    the `EEXIST` Linux answers for a type it serves. The design a real one needs is written into
-    §5.2 beside the measurement, so the next pass builds it from a contract rather than a guess.
+    the `EEXIST` Linux answers for a type it serves. The design a real one needs was written into
+    §5.2 beside the measurement, so the next pass built it from a contract rather than a guess (and
+    that is item 26).
     Owner: `src/syscall/linux/abi.rs`, `src/syscall/linux/fs/file.rs`'s two doors. Pin: `t-mknod`
     (22 claims as root, 21 where the device-node claim is named rather than made — the payload runs
-    as root and a hand host run need not), its `ok:` lines identical on both machines, with the
-    `S_IFIFO` claim's one text accepted for the host's answer under `MPOS_ON_HOST`. **A third fix
+    as root and a hand host run need not), its `ok:` lines identical on both machines; the `S_IFIFO`
+    section claims the node on both machines now that item 26 serves it. **A third fix
     the pin forced, in the same subject**: `stat`'s permission half collapsed a stored `0000` into
     the kind's default — `mode_of` was handed a bare `u32` and read `0` as "nobody said" — so a file
     `mknod` was told to make with mode `0` (or one `chmod 000`ed) *enforced* its empty mode through
     `may_as`, which asks `keeps_modes`, while *reporting* `0644`. The stat doors now pass
     `Option<u32>` through the new `reported_mode` (`src/syscall/linux/fs/file.rs`): a filesystem that
     keeps modes reports what it holds, **including `0000`**, and one that keeps none answers its
-    kind's default. Three things stay named in §5.2 rather than fixed: the **device number**
-    `mknod`'s `dev` argument names is not written on the node; **`CAP_MKNOD` is not checked**, so an
-    unprivileged caller can make a device node here where Linux answers `EPERM`; and the FIFO's
-    *node*, with its prerequisite spelled out (`open_replacement` takes no flags, and the direction
-    an open asked for is what picks the end).
+    kind's default. Two things stay named in §5.2 rather than fixed: the **device number**
+    `mknod`'s `dev` argument names is not written on the node; and **`CAP_MKNOD` is not checked**, so
+    an unprivileged caller can make a device node here where Linux answers `EPERM`. The FIFO's
+    *node*, which this item left as `EOPNOTSUPP` with its prerequisite spelled out
+    (`open_replacement` takes no flags, and the direction an open asked for is what picks the end),
+    is built by item 26, which meets that prerequisite.
+
+26. **A FIFO is a channel, not a file: `mknodat(S_IFIFO)` makes one, and its `open` runs Linux's
+    rendezvous.** Until this pass the `S_IFIFO` arm of `mknod_kind` was `EOPNOTSUPP` (item 25), and the
+    pass before that even made a **regular file** under the name — and a rendezvous that is a regular
+    file is a wrong *shape*: it reads end-of-file at once, where Linux parks the caller until a peer
+    opens the other end, a difference no caller can read off the number alone (rule 4). The contract
+    was measured whole on a current host through `syscall(2)` (`.workbuddy/probe_fifo.c`, Linux 7.2.9)
+    before any of it was built. **The node**: `mknodat(S_IFIFO)` makes a node whose `stat` is
+    `S_IFIFO`, size `0`, `nlink` 1, and a second `mknod` on the name is `EEXIST` (item 25's half).
+    **The rendezvous**: `open(O_RDONLY)` with no writer and `open(O_WRONLY)` with no reader both
+    **park** until a peer opens the other end — and a reader parked in `open` counts as a reader, so
+    the arriving writer releases it; `open(O_RDWR)` is its own peer and does not park;
+    `O_RDONLY|O_NONBLOCK` returns at once and `O_WRONLY|O_NONBLOCK` with no reader is **`ENXIO`**.
+    **The stream**: a nonblocking reader with no writer reads `0`, with a live writer that wrote
+    nothing `EAGAIN`, and after the last writer closes `0` again; the last reader closing makes a
+    write `EPIPE`; and the buffer is **discarded** when both counts reach zero, so the next open
+    starts empty. **The file-shaped answers**: `ftruncate` and `truncate(name)` are `EINVAL`,
+    `fallocate` is `ESPIPE`, `lseek` on an opened end is `ESPIPE`, an *opened* description's `stat` is
+    `S_IFIFO` too, and `execve` of the name is `EACCES`. **The fix is a channel that lives as long as
+    the name, plus a rendezvous at open**, and it needed three things the pipe module did not have: a
+    `NodeKind::Fifo` — the vocabulary's new word, which `mode_of`/`dt_type_of` answer `S_IFIFO`/
+    `DT_FIFO` for and which `fsync`/`fallocate`/the size-changing calls refuse by (items 21–22);
+    a `Channel` in `src/vfs/pipe.rs` carrying the pipe's `PipeState` and `Ring`, but **minted at the
+    name** and joined by every open, with reader/writer counts taken at **open** and given back at
+    the last close of a *description* (not at node drop — a `dup` and a `fork` share a description,
+    which is why the pipe's counts are already per description); and `Inode::open_replacement` gains
+    the open's `flags`, because the **direction** an open asked for is what picks the end —
+    `O_RDONLY` a reader, `O_WRONLY` a writer, `O_RDWR` one `Role::Both` description, `O_NONBLOCK`
+    deciding park-versus-`ENXIO`. The end an open returns *is* a `PipeEnd`, so `as_pipe`, the
+    size-changing calls and `splice` follow the pipe's rules with no second answer, and the end's
+    `metadata()` reports the FIFO's own kind and ino — which is how an opened description's `fstat`
+    says `S_IFIFO`. The rendezvous is `sched::block_until_interruptible` over a `ready` predicate
+    plus a `waiting_open` set that every count change wakes, the shape `PipeEnd`'s read and write
+    already use — and `open_replacement` reaching `flags` touched every node that mints on open
+    (`/dev/ptmx`, the ptys, the console tty, the socket node), each passing `_flags` it does not read.
+    Owner: `src/vfs/pipe.rs` (`Role`, `Channel`, `rendezvous`, the discard), `src/vfs/ramfs.rs`'s
+    `RamFifo`, `src/vfs/mod.rs`'s `NodeKind::Fifo` + the `open_replacement` signature,
+    `src/syscall/linux/abi.rs`'s `mode_of`/`dt_type_of`/`mknod_kind`,
+    `src/syscall/linux/fs/file.rs`'s `open_linux` (passing `flags`) and its `fsync`/`fallocate` arms.
+    Pin: `t-fifo` (33 claims, byte-identical on both machines, green on this host first) for the whole
+    contract, and `t-mknod`'s `S_IFIFO` section for the node — each claimed, not described, and the
+    pipe's four new host tests (`a_fifo_channel_refuses_a_lonely_nonblocking_writer`,
+    `a_fifo_channel_pairs_a_reader_and_a_writer`, `a_fifo_open_readwrite_is_its_own_peer`,
+    `closing_a_fifos_last_two_ends_discards_the_buffer`) hold the pure halves. **One residual is named
+    rather than hidden**: a **fatal** signal (`SIGKILL`) delivered while a task is parked in a FIFO's
+    `open` ends the task inside the wait, so the count that open took is never given back and the FIFO
+    remembers a peer that never arrived — Linux rolls the count back on `ERESTARTSYS`, and doing the
+    same here wants the pending open owned by something the exit pass drops, which an `open` only
+    becomes after it returns. `t-fifo` therefore *releases* every parked opener (a peer arrives)
+    rather than killing it, and the residual lives in `Channel::rendezvous`'s doc and §5.2.
+

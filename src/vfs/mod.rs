@@ -130,6 +130,14 @@ pub enum NodeKind {
     /// opening a socket path answers `ENXIO` here and `connect` reaches the
     /// socket layer through the bind table.
     Socket,
+    /// A FIFO: a *name* two processes meet at, whose bytes cross through a
+    /// [`pipe::Channel`] rather than through storage. It is a node - `stat`
+    /// reports `S_IFIFO`, `mknod(2)` makes it, `unlink` retires the name -
+    /// but it holds no bytes of its own: `open(2)` runs Linux's rendezvous
+    /// (a reader parks until a writer arrives and the reverse) and hands the
+    /// opener a [`pipe::PipeEnd`], so the reads and writes behind the name
+    /// are a pipe's. `docs/uapi/` §5.2 carries the whole measured contract.
+    Fifo,
 }
 
 /// What a descriptor can do right now, for `poll(2)`.
@@ -478,7 +486,14 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// `Ok(None)` - the default - opens the node itself; a locked pty's slave
     /// answers [`VfsError::Corrupt`] (`EIO`), which is exactly what Linux
     /// opens with.
-    fn open_replacement(&self) -> VfsResult<Option<alloc::sync::Arc<dyn Inode>>> {
+    ///
+    /// The open's own *flags* ride along because some doors need them: a FIFO's
+    /// direction decides which end of its channel the open takes (a reader, a
+    /// writer, or - `O_RDWR` - one description that is both), and `O_NONBLOCK`
+    /// decides whether a peerless open parks or answers. A door that mints the
+    /// same thing whatever it was asked for (`ptmx`) ignores the word.
+    fn open_replacement(&self, flags: usize) -> VfsResult<Option<alloc::sync::Arc<dyn Inode>>> {
+        let _ = flags;
         Ok(None)
     }
 
