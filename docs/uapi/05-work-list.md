@@ -250,3 +250,19 @@ the commit bodies), and each moved its pin in the same commit.
     on **both** machines (a raw socket reads the same answer beside the DGRAM one, and a
     self-built frame goes out the raw socket and draws an answer to the id it wrote) plus a
     `link::frame_payload` host unit test. Closes `docs/notes/` §4.5.
+
+15. **A description's `flock` and `F_OFD_*` lock die with the *last* descriptor, not any
+    close.** Linux releases a lock owned by the open file description when the last
+    descriptor referring to it goes, so closing a `dup` leaves the lock in force — measured
+    on this host before the change: `flock(a, LOCK_EX)`, `close(dup_of_a)`, then a fresh
+    `open()` of the file still answers `EWOULDBLOCK`, and case D of `.workbuddy/probe_ofd.c`
+    is the same measurement for an `F_OFD_SETLK`. This kernel dropped both on *any* close
+    naming the description, so a process that dups its lock descriptor and closes the dup
+    silently lost its lock and a second process could take it — what `apk`'s database lock
+    exists to prevent. Owner: `src/vfs/locks.rs` (`drop_on_close` for the process's POSIX
+    record locks on any close, `drop_with_description` for the description's own on the last)
+    and `src/syscall/linux/fs/file.rs`'s close path, which asks the second from the
+    description's reference count after the descriptor is gone. Pin: `t-filelock` on **both**
+    machines (26 `ok:` lines, byte-identical — each class held through a description whose
+    `dup` is closed, and a fresh `open()` refused) plus three host unit tests over the two
+    pure halves. Closes `docs/notes/` §15.16 (b).

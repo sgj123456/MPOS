@@ -12,10 +12,10 @@
 //!
 //! The store is one global table under a `critical_section` mutex, every entry
 //! keyed by `(dev, ino)` so two files sharing an inode number on different
-//! mounts cannot collide, and owned by a thread-group id - the thing that
-//! survives `dup` and threads. (Linux keys `flock` by the open file description
-//! rather than the process; the per-process model here is a simplification the
-//! single-locker workloads do not distinguish, and is noted where it matters.)
+//! mounts cannot collide, and carrying its owner - the thread group for a
+//! record lock, the open file description for a `flock` or an `F_OFD_*` lock.
+//! The owner is what decides both who a request contends with and which close
+//! releases it: see [`drop_on_close`] and [`drop_with_description`].
 
 use alloc::vec::Vec;
 #[cfg(target_os = "none")]
@@ -303,43 +303,61 @@ pub fn set(
     })
 }
 
-/// Release the locks that go away when one descriptor closes.
+/// Drop the locks that **any** close of this process's descriptor takes with
+/// it: the process's own POSIX record locks on the file.
 ///
-/// The two classes drop differently, because they are owned differently:
+/// This is the rule that surprises people, and it is Linux's: a lock taken
+/// through one descriptor is lost by closing an *unrelated* descriptor to the
+/// same file, because a POSIX record lock belongs to the thread group rather
+/// than to the descriptor it was taken through. The two owners that do *not*
+/// die here are the open file description's own - its `flock` and its
+/// `F_OFD_*` record lock - because the description is still open when one of
+/// its descriptors closes; they go with the last one, through
+/// [`drop_with_description`].
+pub fn drop_on_close(locks: &mut Vec<Lock>, dev: u64, ino: u64, pid: u32) {
+    locks.retain(|l| {
+        !(l.dev == dev && l.ino == ino && l.class == LockClass::Record && !l.ofd && l.pid == pid)
+    });
+}
+
+/// Drop the locks that die with the **last** descriptor referring to an open
+/// file description: its `flock` and its `F_OFD_*` record locks.
 ///
-/// * every **record** lock the *process* holds on this file goes - POSIX's rule
-///   and the one that surprises people, since a lock taken through one fd is
-///   lost by closing an unrelated fd to the same file - and so does any
-///   **open-file-description** record lock (`F_OFD_*`) this description holds,
-///   which is a *different* owner in the same class;
-/// * the **whole-file** lock goes if it was this open file description's, so a
-///   second `open()` of the same file keeps its `flock` when the first is
-///   closed.
-///
-/// The second half is **not** yet Linux's, and the difference is named rather
-/// than left in the code: Linux drops the description's `flock` (and its
-/// `F_OFD_*` lock) with the *last* descriptor referring to it, so closing one of
-/// several `dup`s leaves the lock in force - measured on a current host, where
-/// `flock(a, LOCK_EX)`, `close(dup_of_a)` and then a fresh `open()` of the file
-/// still answers `EWOULDBLOCK`, and the same measurement holds for an
-/// `F_OFD_SETLK` (`.workbuddy/probe_ofd.c`, case D). Here any close naming that
-/// description drops it, because the caller passes the description's identity
-/// and nothing about how many descriptors still hold it. `docs/notes/` §15.16
-/// carries the `flock` measurement, and `user/tests/src/bin/t-filelock.rs`
-/// records why no claim of its own fails on it.
+/// Both are owned by the description (`owner` is `File::ofd()`) rather than by
+/// the process, so a `dup` shares them and closing that `dup` leaves them in
+/// force - measured on a current host, where `flock(a, LOCK_EX)`,
+/// `close(dup_of_a)` and then a fresh `open()` of the file still answers
+/// `EWOULDBLOCK`, and the same measurement holds for an `F_OFD_SETLK`
+/// (`.workbuddy/probe_ofd.c`, case D). *Which* close is the last one is the
+/// caller's question and not this function's: the close path answers it from
+/// the description's reference count after the descriptor is gone, the same
+/// test its evdev read position and its DRM master already use.
+pub fn drop_with_description(locks: &mut Vec<Lock>, dev: u64, ino: u64, ofd: u64) {
+    locks.retain(|l| !(l.dev == dev && l.ino == ino && l.owner == ofd));
+}
+
+/// Apply [`drop_on_close`] to the live table, waking anyone parked on a lock it
+/// frees.
 #[cfg(target_os = "none")]
-pub fn release_on_close(dev: u64, ino: u64, pid: u32, ofd: u64) {
+pub fn release_on_close(dev: u64, ino: u64, pid: u32) {
     critical_section::with(|cs| {
         let mut table = FILE_LOCKS.borrow(cs).borrow_mut();
         let before = table.len();
-        table.retain(|l| {
-            !(l.dev == dev
-                && l.ino == ino
-                && (match l.class {
-                    LockClass::Record => l.pid == pid || l.owner == ofd,
-                    LockClass::Whole => l.owner == ofd,
-                }))
-        });
+        drop_on_close(&mut table, dev, ino, pid);
+        if table.len() != before {
+            wake_waiters(dev, ino);
+        }
+    });
+}
+
+/// Apply [`drop_with_description`] to the live table - the last descriptor's
+/// half of the same close.
+#[cfg(target_os = "none")]
+pub fn release_description(dev: u64, ino: u64, ofd: u64) {
+    critical_section::with(|cs| {
+        let mut table = FILE_LOCKS.borrow(cs).borrow_mut();
+        let before = table.len();
+        drop_with_description(&mut table, dev, ino, ofd);
         if table.len() != before {
             wake_waiters(dev, ino);
         }
@@ -659,6 +677,89 @@ mod tests {
         let mut ranges: Vec<(i64, i64)> = t.iter().map(|l| (l.start, l.end)).collect();
         ranges.sort();
         assert_eq!(ranges, vec![(0, 80), (80, 100)]);
+    }
+
+    /// A whole-file entry as the kernel's two writers build them: a `flock`
+    /// carries the description as its owner, a POSIX record lock the thread
+    /// group, and an `F_OFD_*` lock the description with `ofd` set.
+    fn held(owner: u64, pid: u32, class: LockClass, ofd: bool) -> Lock {
+        Lock {
+            dev: 1,
+            ino: 1,
+            owner,
+            pid,
+            class,
+            kind: LockKind::Write,
+            start: 0,
+            end: INF,
+            ofd,
+        }
+    }
+
+    /// A close takes the *process's* POSIX record locks and nothing else: not
+    /// the description's `flock`, not its `F_OFD_*` lock (both outlive one
+    /// descriptor), and not another process's lock.
+    #[test]
+    fn a_close_takes_the_processs_record_locks_and_no_more() {
+        let mut t = vec![
+            // The process's POSIX record lock: the close's to take.
+            held(7, 7, LockClass::Record, false),
+            // The same process's OFD record lock - a different owner in the
+            // same class, and the description's to keep.
+            held(0x1000, 7, LockClass::Record, true),
+            // Its `flock`, the description's too.
+            held(0x1000, 7, LockClass::Whole, false),
+            // Another process's record lock, which this close cannot name.
+            held(8, 8, LockClass::Record, false),
+        ];
+        drop_on_close(&mut t, 1, 1, 7);
+        let left: Vec<(u64, LockClass, bool)> =
+            t.iter().map(|l| (l.owner, l.class, l.ofd)).collect();
+        assert_eq!(
+            left,
+            vec![
+                (0x1000, LockClass::Record, true),
+                (0x1000, LockClass::Whole, false),
+                (8, LockClass::Record, false),
+            ]
+        );
+    }
+
+    /// The last descriptor's close takes the description's own locks - its
+    /// `flock` and its `F_OFD_*` record lock - and leaves every other holder,
+    /// the process's POSIX record locks among them.
+    #[test]
+    fn the_last_close_takes_the_descriptions_own_locks() {
+        let mut t = vec![
+            held(0x1000, 7, LockClass::Whole, false),
+            held(0x1000, 7, LockClass::Record, true),
+            // The same process's POSIX lock: the *process's*, so a description
+            // closing is not what releases it.
+            held(7, 7, LockClass::Record, false),
+            // Another description's `flock`, on the same file.
+            held(0x2000, 8, LockClass::Whole, false),
+        ];
+        drop_with_description(&mut t, 1, 1, 0x1000);
+        let left: Vec<(u64, LockClass)> = t.iter().map(|l| (l.owner, l.class)).collect();
+        assert_eq!(
+            left,
+            vec![(7, LockClass::Record), (0x2000, LockClass::Whole)]
+        );
+    }
+
+    /// The two halves divide the table exactly: every entry the first close
+    /// leaves, the last close then takes - no lock is released twice and none
+    /// survives both.
+    #[test]
+    fn the_two_closes_divide_the_table_between_them() {
+        let mut t = vec![
+            held(0x1000, 7, LockClass::Whole, false),
+            held(0x1000, 7, LockClass::Record, true),
+            held(7, 7, LockClass::Record, false),
+        ];
+        drop_on_close(&mut t, 1, 1, 7);
+        drop_with_description(&mut t, 1, 1, 0x1000);
+        assert!(t.is_empty(), "nothing may survive both closes: {t:?}");
     }
 
     // A table-local `set` for the pure tests (the real one takes the global).

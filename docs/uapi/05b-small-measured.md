@@ -28,17 +28,6 @@ Section numbers are unchanged from the original `UAPI.md`.
   reuses an `F_GETFL` word for the `openat(fd, ".")` it opens a directory's descriptor with.
   Owner: `src/syscall/linux/fs/file.rs`'s `F_GETFL` arm + the `access` field already there.
   `docs/notes/` §15.16.
-- **A `flock` dies on *any* close of its description, not the last.** Linux releases the
-  description's `flock` when the last descriptor referring to it closes, so closing one of
-  several `dup`s leaves the lock in force — measured on a current host: `flock(a, LOCK_EX)`,
-  `close(dup_of_a)`, then a fresh `open()` of the file still answers `EWOULDBLOCK`. This
-  kernel releases it on any close naming that description, because the close path passes the
-  description's identity and nothing about how many descriptors still hold it — so a process
-  that dups its lock descriptor and closes the dup silently loses its lock, and a second
-  process can take it. `src/vfs/locks.rs`'s own `release_on_close` record already states the
-  Linux rule, so the code and its documentation disagree. Owner: `src/syscall/linux/fs/file.rs`'s
-  close path (which already tests `Arc::strong_count` after the close for the evdev half) and
-  `src/vfs/locks.rs`. `docs/notes/` §15.16.
 - **`waitid(2)` ignores its `id`, serves two of Linux's four idtypes, and calls
   "no event asked for" a success.** Three divergences, each measured on a
   current host. (a) The `id` argument is not used: `P_PID` does not name the

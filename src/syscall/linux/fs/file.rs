@@ -514,8 +514,8 @@ pub fn fstat(args: [usize; ARG_COUNT]) -> isize {
 /// rule and the one that makes `flock` usable for the `apk` database lock: two
 /// independent `open()`s of one file in *one* process contend with each other,
 /// while a `dup`ed descriptor shares the lock its original was given. So the
-/// owner below is the description's identity, and only `release_on_close` knows
-/// which locks die with it.
+/// owner below is the description's identity, and only `release_description`
+/// knows which locks die with it.
 pub fn flock(args: [usize; ARG_COUNT]) -> isize {
     let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
         Ok(file) => file,
@@ -3289,7 +3289,6 @@ pub fn handle_close(args: [usize; ARG_COUNT]) -> isize {
             crate::vfs::mount::fs_id_of_inode(&inode),
             file.metadata().ino,
             crate::sched::current_tgid().0 as u32,
-            Arc::as_ptr(&file) as u64,
         );
     }
     match crate::vfs::close(fd) {
@@ -3345,6 +3344,22 @@ pub fn handle_close(args: [usize; ARG_COUNT]) -> isize {
         {
             crate::vfs::vcmux::abandon(vc);
         }
+        // The description's *own* locks - its `flock` and its `F_OFD_*` record
+        // locks - die here and not in the `release_on_close` above, because
+        // they belong to the description rather than to the process: Linux
+        // releases them when the last descriptor referring to the description
+        // closes, so closing one of several `dup`s leaves them in force
+        // (measured on a current host: `flock(a, LOCK_EX)`, `close(dup_of_a)`,
+        // then a fresh `open()` still answers `EWOULDBLOCK` - `docs/notes/`
+        // §15.16, `user/tests/src/bin/t-filelock.rs`). Asked after the close,
+        // where "last" is knowable, exactly like the evdev read position and
+        // the DRM master above.
+        let inode = file.inode();
+        crate::vfs::locks::release_description(
+            crate::vfs::mount::fs_id_of_inode(&inode),
+            file.metadata().ino,
+            file.ofd(),
+        );
     }
     0
 }

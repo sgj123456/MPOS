@@ -60,7 +60,7 @@ Grouped by area, because "where do I put this change" is the question the page e
 | `src/vfs/inotify.rs` | `InotifyInstance`, the global `(dev, ino)` watch registry, `emit`/`emit_write`, encoded event records |
 | `src/vfs/memfd.rs` | `Memfd`, real shareable pages, `MFD_*`, `F_SEAL_*` (gated `target_os = "none"`) |
 | `src/vfs/dmabuf.rs` | `DmaBuf`: exporter page references, the geometry a GEM import needs (gated `target_os = "none"`) |
-| `src/vfs/locks.rs` | The advisory-lock table: `fcntl` record locks and `flock` whole-file locks, range resolution, `release_on_close`/`release_process`/`release_on_process_exit` |
+| `src/vfs/locks.rs` | The advisory-lock table: `fcntl` record locks and `flock` whole-file locks, range resolution, `drop_on_close`/`drop_with_description` (the two release rules) with the `release_on_close`/`release_description`/`release_process`/`release_on_process_exit` wrappers |
 | **Terminals** | |
 | `src/vfs/tty.rs` | `Tty` (the line discipline state machine `LineDiscipline`, blocking/interruptible reads, `VMIN`/`VTIME`, foreground pgrp, window size, `kd_ioctl`, `vt_ioctl`), `Attached`, `VtCaller`, `ControllingTty`, `Tty0`, the `init`/`global`/`by_dev_id` registry |
 | `src/vfs/termios.rs` | The `Termios` structure and the `struct termios`/`termios2` layouts (`SIZE`, `TERMIOS2_SIZE`, `NCCS`), and the `TCGETS`/`TCSETS` flag vocabulary |

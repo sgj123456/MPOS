@@ -36,13 +36,18 @@ next grant/query.
 `owner` is deliberately *not* the same thing in the two classes, because Linux
 draws the line in two places: a record lock is owned by the thread group, a
 `flock` by the open file description (the `Arc<File>` the fd table shares, so a
-`dup` shares the lock and a second `open()` does not). `release_on_close`
-applies the two different rules - POSIX's "closing any descriptor drops the
-process's record locks", and "the flock dies with its own description" - and
-`user/tests/src/bin/t-filelock.rs` (`user/abitest/src/bin/t-filelock.rs` before
-S6 batch 11, its own flock half since corrected there for the second half of the
-second rule: see §15.16) pins both, with the contending-second-`open`
-and the sharing-`dup` cases side by side.
+`dup` shares the lock and a second `open()` does not). The two owners are
+released by two different events, and the close path asks both: `drop_on_close`
+takes the process's POSIX record locks on **any** close of a descriptor to the
+file (the rule that surprises people), and `drop_with_description` takes the
+description's own - its `flock` and its `F_OFD_*` lock - on the close of the
+**last** descriptor referring to it, which the close path knows from the
+description's reference count after the descriptor is gone. The second half is
+Linux's since 2026-10-16 (§15.16 carried the divergence and its measurement
+first, and `t-filelock` now pins the rule: a fresh `open()` still finds each
+class in the way after a `dup`'s close). `t-filelock`
+(`user/abitest/src/bin/t-filelock.rs` before S6 batch 11) pins both, with the
+contending-second-`open` and the sharing-`dup` cases side by side.
 
 **The third ownership model, `F_OFD_*`, is a record lock the description owns.**
 Linux numbers the open-file-description twins `36..=38`, straight after
@@ -61,12 +66,11 @@ and one arm each in the `record_lock` set and query paths; `F_OFD_GETLK` is
 `F_GETLK` minus the translation. Pinned by `t-filelock`'s nine new claims on both
 machines.
 
-The `F_OFD_*` lock inherits the named `flock` divergence above rather than
-closing it: `release_on_close` drops a description's OFD lock on **any** close of
-that description, where Linux waits for the last reference - the same
-measurement (§15.16) applies (case D of `.workbuddy/probe_ofd.c`: an OFD lock
-survives `close(dup)` on a real host), and no claim fails on it because
-`t-filelock` names the divergence instead of pinning it.
+The `F_OFD_*` lock shares the `flock`'s release rule rather than needing one of
+its own: both are the description's, so both go with the **last** descriptor
+(`drop_with_description`, the same call the close path makes for the `flock`) -
+case D of `.workbuddy/probe_ofd.c` is the measurement (an OFD lock survives
+`close(dup)` on a real host), and `t-filelock` pins it beside the `flock`'s.
 
 **Gate.** x86_64 `=== SUMMARY pass=173 fail=0 (173 built)` with `mpos-kunit 32
 passed, 0 failed` and exit 33; aarch64 `=== SUMMARY pass=172 fail=0`, the same 32
@@ -76,6 +80,17 @@ host-side lock test `an_ofd_lock_is_a_record_lock_owned_by_the_description`
 lands with the `ofd` flag; clippy reports nothing on either bare-metal target or
 the host lib, and `cargo xtask depgraph` is within the ratchet with no edge
 added.
+
+**Gate, 2026-10-16 (the release rule).** x86_64 `=== SUMMARY pass=175 fail=0
+(175 built)` with `mpos-kunit 32 passed, 0 failed` and exit 33; aarch64
+`=== SUMMARY pass=174 fail=0`, the same 32 cases. The program counts did not
+move again - `t-filelock` is 26 `ok:` lines on both machines, byte-identical -
+and three host unit tests land with the two pure release functions
+(`a_close_takes_the_processs_record_locks_and_no_more`,
+`the_last_close_takes_the_descriptions_own_locks`,
+`the_two_closes_divide_the_table_between_them`). The counterfactual is exact:
+with the description's release moved back to any close, `t-filelock` is the
+sweep's one red and the two new claims are precisely the two that fail.
 
 *Not a gap:* `read`/`write` do not consult the lock table, which is what Linux
 does. These are **advisory** locks: nothing refuses a `read` that walks over

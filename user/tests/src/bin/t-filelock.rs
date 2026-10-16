@@ -17,27 +17,28 @@
 //! already appears to hold - and must not have it dropped under it when an
 //! unrelated descriptor closes.
 //!
-//! All twelve `flock`/POSIX claims were run against real Linux first, in the
+//! All the `flock`/POSIX claims were run against real Linux first, in the
 //! shape this program makes them, because a pin's assertions are the first
 //! thing that can be wrong: `0, EWOULDBLOCK, 0, 0, 0, 0, 0, 0, 0, 0, F_UNLCK,
-//! 0`. The `F_OFD_*` group at the end is the third ownership model - a record
-//! lock owned by the description rather than the process - and its verdicts
+//! 0`. The `F_OFD_*` group is the third ownership model - a record lock owned
+//! by the description rather than the process - and its verdicts
 //! (`0, 0, WOULDBLOCK, 0, (F_WRLCK, -1), WOULDBLOCK, 0, 0, 0`) were measured
 //! the same way, with `.workbuddy/probe_ofd.c`.
 //!
-//! # One reading these claims do not pin, named rather than fixed here
+//! # The description's locks outlive a `dup`'s close
 //!
-//! On Linux a `flock` dies with the **last** descriptor of its description, so
-//! closing a `dup` leaves the description's lock in force - measured with a raw
-//! model: `flock(a, LOCK_EX)`, `close(dup_of_a)`, then a fresh `open()` of the
-//! file still answers `EWOULDBLOCK`. This kernel drops the description's lock on
-//! **any** close of that description, which `vfs/locks.rs`'s own
-//! `release_on_close` documentation says it must not do. The last claim below
-//! answers 0 under either reading - Linux converts the description's shared lock
-//! to exclusive, this kernel has nothing left to convert - so the difference is
-//! a gap in the code rather than in this program's verdict, and
-//! `docs/NOTES.md` §15.16 names it with its measurement instead of a claim
-//! pinning it that no program would fail.
+//! A `flock` and an `F_OFD_*` lock are the **open file description's**, so
+//! Linux releases them when the *last* descriptor referring to it closes -
+//! measured on a current host, `flock(a, LOCK_EX)`, `close(dup_of_a)`, then a
+//! fresh `open()` of the file still answers `EWOULDBLOCK`, and an
+//! `F_OFD_SETLK` behaves the same (`.workbuddy/probe_ofd.c`, case D). This
+//! kernel used to drop them on **any** close of the description, so a process
+//! that dups its lock descriptor and closes the dup silently lost its lock -
+//! and a second process could take it, which is exactly what `apk`'s database
+//! lock exists to prevent. Two claims pin the Linux reading now: each class is
+//! held through a description whose `dup` is then closed, and a *fresh*
+//! `open()` must still find it in the way (`vfs/locks.rs`'s `drop_on_close` and
+//! `drop_with_description` are the two halves of the rule, host-tested).
 //!
 //! # Which library each door comes from
 //!
@@ -239,8 +240,9 @@ fn main() {
         flock(dup, FlockOperation::NonBlockingLockShared) == Ok(()),
     );
     // Closing a description drops the process's *record* locks wherever they
-    // were taken (POSIX's rule) and this description's *flock* with it - which
-    // is the pair to check together, because they look like opposites.
+    // were taken (POSIX's rule) - but the description's *flock* is the
+    // description's, and the description is still open, so it stays. The two
+    // look like opposites and are the pair to check together.
     r.check(
         "closing that unrelated descriptor...",
         unsafe { libc::close(dup.as_raw_fd()) } == 0,
@@ -249,8 +251,23 @@ fn main() {
         "...drops the record lock taken through a different fd",
         getlk(first.as_raw_fd()) == Ok(libc::F_UNLCK as libc::c_short),
     );
+    // A *fresh* description, not the `dup`: the claim is about what a program
+    // arriving afterwards finds, which is the whole point of a lock. Measured
+    // on a current host - the description's shared `flock` is still in the way.
+    // The probe's own descriptor is dropped immediately afterwards, so a kernel
+    // that wrongly *handed* it the lock cannot leave it holding one and make
+    // the next claim fail for this one's reason.
+    let fresh = openat(CWD, PATH, OFlags::RDWR, Mode::empty());
     r.check(
-        "...and the first description can take LOCK_EX, with nothing left in the way",
+        "...but the description's flock survives the dup's close: a fresh open() is refused",
+        matches!(
+            &fresh,
+            Ok(fd) if flock(fd, FlockOperation::NonBlockingLockExclusive) == Err(Errno::WOULDBLOCK)
+        ),
+    );
+    drop(fresh);
+    r.check(
+        "...and the first description converts its own shared lock to exclusive",
         flock(&first, FlockOperation::NonBlockingLockExclusive) == Ok(()),
     );
 
@@ -293,6 +310,34 @@ fn main() {
         "and a POSIX lock is refused by it, the same record domain",
         fcntl_lock(&second, FlockOperation::NonBlockingLockExclusive) == Err(Errno::WOULDBLOCK),
     );
+    // The OFD lock is the description's too, so a `dup`'s close does not
+    // release it - the same rule as the `flock` above, measured the same way
+    // (`.workbuddy/probe_ofd.c`, case D).
+    let ofd_survivor = match dupfd(first.as_raw_fd(), DUP_FLOOR) {
+        Ok(fd) => fd,
+        Err(_) => {
+            let _ = unlinkat(CWD, PATH, AtFlags::empty());
+            r.finish()
+        }
+    };
+    // SAFETY: a descriptor just returned by `F_DUPFD`, closed by hand below.
+    let ofd_survivor = unsafe { BorrowedFd::borrow_raw(ofd_survivor) };
+    r.check(
+        "a second dup of the description closes clean",
+        unsafe { libc::close(ofd_survivor.as_raw_fd()) } == 0,
+    );
+    let fresh2 = openat(CWD, PATH, OFlags::RDWR, Mode::empty());
+    r.check(
+        "the description's OFD lock survives it: a fresh open() is refused",
+        matches!(
+            &fresh2,
+            Ok(fd) if ofd_setlk(fd.as_raw_fd(), libc::F_WRLCK as libc::c_short)
+                == Err(Errno::WOULDBLOCK)
+        ),
+    );
+    // The same discipline as the `flock` probe above: drop the probe's
+    // descriptor so a kernel that wrongly granted it the lock releases it here.
+    drop(fresh2);
     r.check(
         "an unlock through the shared description releases it",
         ofd_setlk(ofd_dup.as_raw_fd(), libc::F_UNLCK as libc::c_short) == Ok(()),

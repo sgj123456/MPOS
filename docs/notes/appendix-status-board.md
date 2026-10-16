@@ -32,9 +32,11 @@ are not restated in the phase sections above.
         and `FBIO_WAITFORVSYNC`, which discards its `WaitEnd` so a signal cannot
         end it at all (§2.5)
   - [x] `flock` owned by the open file description, record locks by the process
-        (`t-filelock`) · read/write deliberately *not* enforced: Linux advisory
-        locks never refuse an `open`ed read, and mandatory mode is a deprecated
-        per-file opt-in (§3.2)
+        (`t-filelock`) — and each released by the event Linux uses: the process's
+        record locks on *any* close of a descriptor to the file, the description's
+        `flock`/`F_OFD_*` lock on the close of the *last* one · read/write
+        deliberately *not* enforced: Linux advisory locks never refuse an `open`ed
+        read, and mandatory mode is a deprecated per-file opt-in (§3.2)
   - [x] ext4 `atime` bumped on read, with Linux's `relatime` rule so a read
         that sees no change costs no device write (§3.3)
   - [~] inode attribute flags — `FS_IOC_GETFLAGS`/`SETFLAGS`, `lsattr`/`chattr`'s
