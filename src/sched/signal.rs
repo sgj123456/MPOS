@@ -214,10 +214,25 @@ impl Actions {
     }
 }
 
-/// Whether `sig` can have a disposition at all: Linux refuses signal 0, the
-/// numbers above `_NSIG` (64), and the two the kernel reserves for itself.
+/// Whether `sig` names a signal at all: Linux's `valid_signal`, the range
+/// `1..=_NSIG` (64). Signal 0 and the numbers above `_NSIG` are not signals,
+/// and a call naming one is refused whether or not it hands over a
+/// disposition.
+pub fn is_signal(sig: usize) -> bool {
+    (1..SIGNALS).contains(&sig)
+}
+
+/// Whether `sig` can be *given* a disposition: every signal but the two the
+/// kernel keeps for itself.
+///
+/// Linux asks this only when one is being set - `act && sig_kernel_only(sig)`
+/// in `do_sigaction` - so a bare query of `SIGKILL`/`SIGSTOP` is served and
+/// reports `SIG_DFL` (measured on a current host:
+/// `rt_sigaction(SIGKILL, NULL, &old, 8)` answers `0` and clears the record),
+/// while an install of either is `EINVAL`. A process must not be able to make
+/// itself unkillable or unstoppable, but it may ask what would happen.
 pub fn catchable(sig: usize) -> bool {
-    (1..SIGNALS).contains(&sig) && sig != SIGKILL as usize && sig != SIGSTOP as usize
+    is_signal(sig) && sig != SIGKILL as usize && sig != SIGSTOP as usize
 }
 
 /// What a signal does when no handler is installed for it.
@@ -553,6 +568,23 @@ mod tests {
         assert!(catchable(SIGTRAP as usize));
         assert!(catchable(SIGCONT as usize));
         assert!(catchable(SIGTSTP as usize));
+    }
+
+    /// The two questions `rt_sigaction` asks *separately*: is this a signal at
+    /// all, and may it be given a disposition. They differ on exactly the
+    /// kernel's two - nameable but not installable - which is what makes a
+    /// bare query of either a served call rather than `EINVAL`.
+    #[test]
+    fn a_signal_is_nameable_and_installable_except_for_the_kernels_two() {
+        assert!(is_signal(SIGKILL as usize) && !catchable(SIGKILL as usize));
+        assert!(is_signal(SIGSTOP as usize) && !catchable(SIGSTOP as usize));
+        // Neither question's subject at all: both answer no.
+        assert!(!is_signal(0) && !catchable(0));
+        assert!(!is_signal(65) && !catchable(65));
+        // The rest of the range is both, the real-time span included.
+        for sig in [SIGTERM as usize, 32, 64, SIGTRAP as usize, SIGCONT as usize] {
+            assert!(is_signal(sig) && catchable(sig), "signal {sig}");
+        }
     }
 
     #[test]

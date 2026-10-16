@@ -55,14 +55,17 @@
 //! overwriting them changes the runtime this program runs inside rather than a
 //! fixture of its own.
 //!
-//! # A divergence this pin surfaced, named rather than fixed
+//! # The two the kernel keeps for itself, and the query still served
 //!
 //! Linux refuses `SIGKILL`/`SIGSTOP` only when a disposition is being *set* -
 //! `act && sig_kernel_only(sig)` in `do_sigaction` - so a bare query of either
-//! answers 0 there (measured on this host). This kernel refuses the query too.
-//! `docs/uapi/` §5.2 carries it; the two claims below pin this kernel's
-//! answer on the payload and take the host's under `MPOS_ON_HOST`, each with a
-//! printed note, which is the shape batch 13 gave the same kind of claim.
+//! is served and reports `SIG_DFL` (measured on this host, and on both machines
+//! now). This kernel refused the query too until 2026-10-16, which is the
+//! shape a caller that probes a disposition before setting one cannot recover
+//! from: it takes a fallback it did not need. The claims below pin Linux's
+//! split on **both** machines - a null-act query of either is `0` with a
+//! cleared record, an install of either is `EINVAL` - and `docs/uapi/` §5.2
+//! no longer carries the divergence.
 
 use mpos_user_tests::Report;
 use rustix::mm::{MapFlags, ProtFlags, mmap_anonymous, munmap};
@@ -204,11 +207,14 @@ fn main() {
 
     // --- the refusal set ---------------------------------------------------
     //
-    // Signal 0 and 65 are outside `1..=_NSIG` (64) and are refused whether or
-    // not a record was handed over, so those two need no remark. SIGKILL and
-    // SIGSTOP are the pair Linux refuses only an *install* of: its rule is
-    // `act && sig_kernel_only(sig)`, so the bare query below answers 0 there -
-    // measured on this host - where this kernel answers EINVAL.
+    // Two questions, and Linux asks them separately: is this a *signal*
+    // (`1..=_NSIG`, 64) - asked whether or not a record is handed over, since
+    // signal 0 and the numbers past `_NSIG` name nothing at all - and may it
+    // be *given* a disposition - asked only when `act` is non-null, because
+    // `SIGKILL`/`SIGSTOP` are the kernel's own. A bare query of either is
+    // served and reports `SIG_DFL` (measured on this host:
+    // `rt_sigaction(SIGKILL, NULL, &old, 8)` answers 0 and clears the record),
+    // while an install of either is `EINVAL`.
     r.check(
         "rt_sigaction on signal 0 is EINVAL",
         refused(
@@ -216,20 +222,6 @@ fn main() {
             libc::EINVAL,
         ),
     );
-    for (name, sig) in [("SIGKILL", libc::SIGKILL), ("SIGSTOP", libc::SIGSTOP)] {
-        let ret = rt_sigaction(sig, core::ptr::null(), core::ptr::null_mut());
-        let refused_here = refused(ret, libc::EINVAL);
-        if !refused_here {
-            println!(
-                "note: a null-act query of {name} answered {ret} - Linux's \
-                 `act && sig_kernel_only(sig)` reading, not mpos's EINVAL"
-            );
-        }
-        r.check(
-            &format!("rt_sigaction on {name} is EINVAL"),
-            refused_here || mpos_user_tests::host_run(),
-        );
-    }
     r.check(
         "rt_sigaction past _NSIG (64) is EINVAL",
         refused(
@@ -237,6 +229,30 @@ fn main() {
             libc::EINVAL,
         ),
     );
+    for (name, sig) in [("SIGKILL", libc::SIGKILL), ("SIGSTOP", libc::SIGSTOP)] {
+        let mut old = seeded();
+        r.check(
+            &format!("a bare query of {name} is served"),
+            rt_sigaction(sig, core::ptr::null(), &mut old) == 0,
+        );
+        r.check(
+            &format!("...and it reports SIG_DFL with clear flags and mask"),
+            old.handler == libc::SIG_DFL && old.flags == 0 && old.mask == 0,
+        );
+        let install = KernelSigaction {
+            handler: handler_addr,
+            flags: SA_RESTORER,
+            restorer: restorer_addr,
+            mask: 0,
+        };
+        r.check(
+            &format!("installing a disposition on {name} is EINVAL"),
+            refused(
+                rt_sigaction(sig, &install, core::ptr::null_mut()),
+                libc::EINVAL,
+            ),
+        );
+    }
 
     // --- the range stage A/B opened ----------------------------------------
     //

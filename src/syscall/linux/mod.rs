@@ -880,11 +880,19 @@ struct UserSigAction {
 #[cfg(target_os = "none")]
 fn sigaction(args: [usize; 6]) -> isize {
     let (sig, act, old) = (args[0], args[1], args[2]);
-    // Linux's refusal set: signal 0 is not a signal, numbers above `_NSIG` (64)
-    // are not signals, and SIGKILL/SIGSTOP cannot be given a disposition by
-    // anyone. The real-time range `32..=64` is nameable and installable here, as
-    // on Linux (`catchable` now spans it).
-    if !crate::sched::signal::catchable(sig) {
+    // Two questions, and Linux asks them separately: is this a *signal* at all
+    // - signal 0 and the numbers past `_NSIG` (64) name nothing, so they are
+    // `EINVAL` whether or not a disposition is handed over - and may it be
+    // *given* one, which is only asked when `act` is non-null. `SIGKILL` and
+    // `SIGSTOP` are the kernel's own, so an install of either is `EINVAL`,
+    // while a bare query is served and reports `SIG_DFL` (measured on a
+    // current host: `rt_sigaction(SIGKILL, NULL, &old, 8)` answers `0` and
+    // clears the record - Linux's `act && sig_kernel_only(sig)`). The
+    // real-time range `32..=64` is nameable and installable here, as on Linux.
+    if !crate::sched::signal::is_signal(sig) {
+        return err::EINVAL;
+    }
+    if act != 0 && !crate::sched::signal::catchable(sig) {
         return err::EINVAL;
     }
     let id = crate::sched::current();

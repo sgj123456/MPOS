@@ -266,3 +266,21 @@ the commit bodies), and each moved its pin in the same commit.
     machines (26 `ok:` lines, byte-identical — each class held through a description whose
     `dup` is closed, and a fresh `open()` refused) plus three host unit tests over the two
     pure halves. Closes `docs/notes/` §15.16 (b).
+
+16. **`rt_sigaction` serves a bare *query* of `SIGKILL`/`SIGSTOP`; only an install is
+    refused.** Linux's rule is `!valid_signal(sig) || sig < 1 || (act && sig_kernel_only(sig))`
+    (`do_sigaction`), so the two questions are asked *separately*: the number is validated
+    whether or not a disposition is handed over, and "may it be given one" only when `act` is
+    non-null. Measured on a current host — Linux 7.2.9,
+    `.workbuddy/probe_sigaction_query.c`, which declares the kernel's 32-byte record rather than a
+    libc's: `rt_sigaction(SIGKILL, NULL, &old, 8)` answers `0` with `handler=0` (`SIG_DFL`),
+    `flags=0`, `mask=0`, while the same number with a non-null `act` answers `-1`/`EINVAL`; `0` and
+    `65` are `EINVAL` either way. This kernel validated the number with `catchable` before it looked
+    at `act`, so the query was refused too, and a caller that probes a disposition before
+    installing one took a fallback it did not need. `sched::signal` spells the two questions out
+    now (`is_signal` is Linux's `valid_signal`; `catchable` is that answer minus the kernel's own
+    two), and the handler asks the second only when `act != 0`. Owner: `src/sched/signal.rs` +
+    `src/syscall/linux/mod.rs`'s `sigaction`. Pin: `t-rt-sigaction` on **both** machines (a bare
+    query of either answers `0` with a cleared record, an install of either is `EINVAL`) plus
+    `signal.rs`'s `a_signal_is_nameable_and_installable_except_for_the_kernels_two`. Closes
+    `docs/notes/` §15.11 (batch 20).

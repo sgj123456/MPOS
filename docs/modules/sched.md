@@ -77,7 +77,7 @@ is what took `sched → syscall` to zero (`docs/notes/` §13.2).
 | `src/sched/mod.rs` | The facade: re-exports of `policy` and (on bare metal) `runtime`'s large export list, the `runtime` gate, the `#[cfg(not(target_os = "none"))]` one-process stand-ins, and the `unshare_uts` copy test | yes — `#[cfg(test)] mod tests` |
 | `src/sched/policy.rs` | `Scheduler` (ready queues + sleep heap), `TaskId`, `Priority` and its four bands, `Sleeper`'s wake-ordering rule, and `ARGV_MAX`/`ARGS_BYTES_MAX` | yes — `mod tests` |
 | `src/sched/runtime/` | The task table (`Table`, `Task`, `Shared`), `Context`/`Stack`, the `Mm` address-space carrier, `Layout`/ASLR, `spawn`/`fork`/`clone`/`vfork`/`exec_replace`, `exit`/`exit_group`/reaping, `block_until*` and `wake`, signal delivery, ptrace stops, timers and resource limits, and the user-memory and mmap accessors. One 9 099-line `runtime.rs` split by responsibility: `task.rs` (the table, `Task`, `Context`/`Stack`, `Layout`, the scheduler loop, timers and limits), `child_mm.rs` (the `Mm` carrier and the mmap/user-memory accessors), `child_signal.rs` (delivery, stops, the wait queues), `child_exit.rs` (`spawn`/`fork`/`clone`/`vfork`/`exec_replace` and the exit/reap path), `load.rs` (image loading, the `#!` chain and the pid-1 handoff), `trace.rs` (ptrace) and `procfs.rs` (the snapshots `/proc` reads) | **no** — `#[cfg(target_os = "none")]`, and no host tests |
-| `src/sched/signal.rs` | Signal numbers and `MAX_SIGNAL`, `Action`/`Actions`, `DefaultAction` and `default_action`, `SigInfo`/`SI_*`, `RtQueue`, `Pending` and the bit helpers, `catchable`, `AltStack` | yes — `mod tests` |
+| `src/sched/signal.rs` | Signal numbers and `MAX_SIGNAL`, `Action`/`Actions`, `DefaultAction` and `default_action`, `SigInfo`/`SI_*`, `RtQueue`, `Pending` and the bit helpers, `is_signal`, `catchable`, `AltStack` | yes — `mod tests` |
 | `src/sched/futex.rs` | The `WAITERS` table, `register`/`unregister`/`is_woken`, `mark_woken_bitset`, and the `wait`/`wait_bitset`/`wake`/`wake_bitset` entry points | yes — `mod tests` |
 | `src/sched/exit.rs` | The two hook registries (`ExitHook`/`HOOKS`, `CloexecHook`/`CLOEXEC_HOOKS`), `register`/`register_cloexec`, and the snapshot-then-walk `run`/`run_cloexec` | yes — `#[cfg(test)] mod tests` |
 
@@ -108,8 +108,10 @@ condition true.
 bit arithmetic (`Pending`, `bit`/`add`/`take`, `from_wire`/`to_wire`, `RtQueue`); the runtime owns
 delivery. The rules the vocabulary encodes: standard signals coalesce, real-time signals
 (`is_rt`) queue every copy in `RtQueue` (bounded, dropping silently on overflow — a named
-divergence from Linux's per-user `RLIMIT_SIGPENDING`, stated in the file); `catchable` refuses 0,
-`_NSIG`+1, `SIGKILL` and `SIGSTOP`; and `default_action` is a table rather than a single "fatal"
+divergence from Linux's per-user `RLIMIT_SIGPENDING`, stated in the file); `is_signal` refuses 0
+and `_NSIG`+1 and `catchable` is that answer minus the kernel's own `SIGKILL`/`SIGSTOP` — two
+questions `rt_sigaction` asks separately, since Linux refuses the kernel's two only when a
+disposition is being *set*; and `default_action` is a table rather than a single "fatal"
 answer, because `SIGSTOP` must stop and `SIGCONT` must resume. The pending set uses Linux's
 canonical layout (signal *n* at bit *n-1*), so the wire conversion is the identity — which is why
 the ABI tests, not host tests, pin the wire half by number.
@@ -148,7 +150,7 @@ does when it wakes.
 | Pin | Kind | What it would fail on |
 |---|---|---|
 | `src/sched/policy.rs` `mod tests` — `round_robin_cycles_within_a_band`, `a_higher_band_runs_before_a_lower_one`, `a_task_wakes_on_the_tick_it_asked_for`, `wake_order_follows_deadlines`, `a_tie_breaks_on_priority_then_id`, `sleeping_zero_ticks_still_waits_for_the_clock`, `ready_and_empty_answer_different_questions`, `waking_a_sleeper_pulls_it_out_of_the_sleep_queue`, `a_woken_sleeper_rejoins_its_own_band`, `waking_a_task_that_is_not_sleeping_reports_failure`, `sleep_saturates_so_u64_max_means_until_woken` | host | The band/round-robin policy, the sleep/wake ordering and its saturation rule |
-| `src/sched/signal.rs` `mod tests` — `numbers_are_pinned`, `the_default_action_table_matches_signal_7`, `only_uncatchable_signals_are_refused_a_disposition`, `take_returns_the_lowest_signal_first`, `adding_twice_still_takes_once`, `siginfo_codes_are_pinned`, `is_rt_spans_only_the_real_time_range`, `rt_queue_delivers_every_copy_in_fifo_order_with_its_own_value`, `rt_queue_keeps_numbers_independent_and_ordered`, `rt_queue_drops_and_reports_when_full`, `rt_queue_starts_empty` | host | The signal numbers, the default-action table, `catchable`, and the real-time queue's FIFO/independence/bound |
+| `src/sched/signal.rs` `mod tests` — `numbers_are_pinned`, `the_default_action_table_matches_signal_7`, `only_uncatchable_signals_are_refused_a_disposition`, `a_signal_is_nameable_and_installable_except_for_the_kernels_two`, `take_returns_the_lowest_signal_first`, `adding_twice_still_takes_once`, `siginfo_codes_are_pinned`, `is_rt_spans_only_the_real_time_range`, `rt_queue_delivers_every_copy_in_fifo_order_with_its_own_value`, `rt_queue_keeps_numbers_independent_and_ordered`, `rt_queue_drops_and_reports_when_full`, `rt_queue_starts_empty` | host | The signal numbers, the default-action table, `is_signal`/`catchable`, and the real-time queue's FIFO/independence/bound |
 | `src/sched/futex.rs` `mod tests` — `a_wake_reaches_only_the_address_it_names_and_only_as_many_as_asked`, `a_bitset_wake_reaches_only_intersecting_sleepers`, `a_wake_that_arrives_before_the_sleep_is_not_lost`, `a_task_that_never_waited_is_never_woken` | host | The address-scoped, count-bounded and bitset-filtered wake, and the register-before-recheck ordering |
 | `src/sched/exit.rs` `mod tests` — `hooks_run_in_registration_order_and_an_empty_list_is_not_a_special_case` | host | Registration order, the empty-list no-op, and the exit/cloexec list separation |
 | `src/sched/mod.rs` `mod tests` — `unshare_gives_a_copy_of_the_names_and_not_the_names_themselves` | host | The one-process `unshare(CLONE_NEWUTS)` copy semantics |

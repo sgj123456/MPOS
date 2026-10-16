@@ -46,20 +46,6 @@ Section numbers are unchanged from the original `UAPI.md`.
   `t-waitid` pins this kernel's answers on **both** machines and names each
   host answer beside it under `MPOS_ON_HOST`. `docs/notes/` §15.11 (batch 18).
 
-- **`rt_sigaction` refuses a bare *query* of `SIGKILL`/`SIGSTOP`.** Linux's rule
-  is `act && sig_kernel_only(sig)` — a disposition cannot be *set* for either,
-  but a call that hands over no `act` and merely asks what is in force is
-  served: measured on a current host, `rt_sigaction(SIGKILL, NULL, NULL, 8)`
-  answers `0`, and `t-rt-sigaction`'s two claims print the note that records it
-  under `MPOS_ON_HOST`. This kernel validates the signal number before it looks
-  at `act` at all (`sched::signal::catchable`), so the same call answers
-  `EINVAL`. Not a §3.2 defect — an honest refusal where Linux succeeds, the mild
-  direction — but a caller that probes a disposition before setting one takes a
-  fallback it did not need. Owner: `src/syscall/linux/mod.rs`'s `sigaction`,
-  where the `catchable` check would split into "is this a signal" (unconditional)
-  and "may it be given a disposition" (only when `act != 0`). `t-rt-sigaction`
-  pins this kernel's answer on **both** machines. `docs/notes/` §15.11 (batch 20).
-
 - **`signalfd(2)` and `SIGCHLD`: one death, two records, and the wrong code.**
   Three divergences, each measured on a current host, all of them on the path the
   compositor-shaped caller this descriptor exists for walks. (a) A child's exit

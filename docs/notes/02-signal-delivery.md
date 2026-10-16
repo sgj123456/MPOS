@@ -56,7 +56,8 @@ fixed `SI_USER`.
 64-bit map (signal `n` at bit `n-1`, so the libc wire set and the kernel's
 internal set are one shape), the disposition table spans `1..=64` so `rt_sigaction`
 installs a real-time signal and `kill`/`tgkill`/`rt_sigqueueinfo`/`timer_create`
-accept the range (only `0`, `>64`, `SIGKILL`/`SIGSTOP` refused, as Linux), and
+accept the range (the refusals are `0` and `>64` at every door plus `SIGKILL`/`SIGSTOP`
+for an `rt_sigaction` *install* — a bare query of either is served, §15.11 — as Linux), and
 real-time signals are **queued** — a per-task bounded FIFO ring carries every copy
 of `SIGRTMIN..=SIGRTMAX` in order with its own `si_value`, whether raised by
 `sigqueue` or `kill`, while standard `1..=31` still coalesce. This closes the
