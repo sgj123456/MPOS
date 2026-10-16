@@ -861,6 +861,23 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         };
         super::adopt_pid(TaskId(slot), &child_pid_ns);
 
+        // Which user namespace this child is *born* in. Unlike the pid kind
+        // there is no children's slot: `CLONE_NEWUSER` moves whoever is in it,
+        // and this path is the child's side of that door - the child is the
+        // first holder of a namespace of its own. Linux's `create_user_ns` runs
+        // for the child (`copy_creds`), so the child starts *already in* the
+        // fresh namespace, its stored ids inherited from the parent but its
+        // table empty: measured, its own `getuid` reads the overflow id until a
+        // map is written, and either the parent (in the namespace's parent) or
+        // the child itself may write it (`t-ns-user`'s child-side claims, the
+        // observation in `.workbuddy/probe-userns9.c`). Without the flag the
+        // reference is handed on, as every fork since the beginning did.
+        let child_user_ns = if request.flags & crate::abi::CLONE_NEWUSER != 0 {
+            crate::userns::UserNs::fresh(crate::vfs::ns::mint())
+        } else {
+            Arc::clone(&t.task(parent_id).user_ns)
+        };
+
         // Which time namespace this child is born into: its creator's
         // `time_ns_children`, and that one alone fills *both* of the child's
         // slots. There is no `CLONE_NEWTIME` branch here because a real kernel
@@ -992,6 +1009,17 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
                 // them: a process that had dropped a bounding capability or
                 // become non-dumpable must not hand its child the full set.
                 mm.set_credentials(t.task(parent_id).mm.credentials());
+                // `CLONE_NEWUSER`: the child is born in the namespace this
+                // word made, and *making* a user namespace is the grant - the
+                // full capability set, scoped to it. Applied to the credentials
+                // just inherited, through the same call `unshare`'s and `setns`'
+                // doors make (`Credentials::on_enter_user_ns`), so the three
+                // cannot drift. Measured: the child reads the full set the
+                // instant it exists, before any map is written
+                // (`.workbuddy/probe-userns9.c`).
+                if request.flags & crate::abi::CLONE_NEWUSER != 0 {
+                    mm.with_credentials(|c| c.on_enter_user_ns());
+                }
                 mm
             },
             released: false,
@@ -1088,9 +1116,9 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             time_ns: Arc::clone(&child_time_ns),
             time_ns_children: child_time_ns,
             // One value, not two: a user namespace has no children's slot, so a
-            // child is in the same one its creator is (`CLONE_NEWUSER` moves the
-            // caller, and this path is the child's side of that door being shut).
-            user_ns: Arc::clone(&t.task(parent_id).user_ns),
+            // child is born in the one computed above - its creator's, or the
+            // fresh namespace `CLONE_NEWUSER` made for it.
+            user_ns: child_user_ns,
             // The network namespace: the creator's, unless this word asked for a
             // fresh one (`CLONE_NEWNET`, minted by the syscall layer, which is the
             // layer allowed to name `net`).

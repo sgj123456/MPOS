@@ -49,8 +49,9 @@ the commit bodies), and each moved its pin in the same commit.
    the storage is the thread group's, in `sched`; and the model has **consumers**, which
    is the whole point — the effective set answers `ptrace_may_access`, the bounding set
    is applied by `execve`, a uid/gid change re-derives the sets, entering a user
-   namespace hands them back full (`on_enter_user_ns`, the grant `unshare`/`setns` make,
-   2026-10-16), the user namespace is also the table an id is read through — `stat`'s four
+   namespace hands them back full (`on_enter_user_ns`, the grant `unshare`/`setns` and a
+   child's own `clone(CLONE_NEWUSER)` birth all make, 2026-10-16), the user namespace is also
+   the table an id is read through — `stat`'s four
    doors and the unix socket's `SO_PEERCRED`/`SCM_CREDENTIALS` map a stored id through the
    reader's namespace (2026-10-16) — and `capget`/`capset`
    round-trip all of it. So `PR_SET_DUMPABLE`/`GET`, `PR_SET_KEEPCAPS`/`GET` and

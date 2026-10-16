@@ -78,7 +78,7 @@ One-glance status of the whole roadmap.
   `vfs::ns::Entry::ALL` against `namespaces(7)`'s list of eight. **USER joined on 2026-10-16**: it
   moves its caller like NET, the map starts empty so the caller lands on the overflow id, `uid_map`
   takes one self-naming line and then answers `EPERM`, and the four `getuid`-family readers
-  translate the stored id through the task's namespace (`t-ns-user`, 40 claims). The same
+  translate the stored id through the task's namespace (`t-ns-user`, 46 claims). The same
   translation renders what a *file* reports now: `stat`/`fstat`/`fstatat`/`statx` map the stored
   owner through the reader's namespace, so a file created before an unshare reads the stored id
   from the machine map and the inside id from the new one, `statx` agreeing with `stat` (§6.3,
@@ -88,9 +88,12 @@ One-glance status of the whole roadmap.
   other half landed too: entering a namespace **is the
   grant** - `unshare`/`setns` hand the maker the full effective, permitted and bounding sets,
   measured on the host across all four doors, so a caller that drops its capabilities first reads
-  them back the instant it is in a namespace it made (§6.3). What stays named is the child-side
-  creation of `clone(CLONE_NEWUSER)`, the `ucred` pid (a pid-namespace question), and the
-  netlink/uevent family's own `ucred` render
+  them back the instant it is in a namespace it made (§6.3). And the **child-side creation** landed
+  (2026-10-16): `clone(CLONE_NEWUSER)` makes a child born already inside a namespace of its own -
+  the overflow id until its map is written, the full set at birth, and the parent's `CLONE_NEWUSER`
+  lifting the capability gate for the other kinds in the same word (§6.3, measured on the host
+  first). What stays named is the `ucred` pid (a pid-namespace question) and the netlink/uevent
+  family's own `ucred` render
 
 **ABI gaps → `ENOSYS` (remaining)**
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
@@ -216,11 +219,11 @@ In the order that keeps each step verifiable on its own:
    whole round trip, §6.3); and the **clocks can be moved** too (2026-10-16) - `unshare` arms the
    caller's children slot, the offsets are written through `/proc/self/timens_offsets` and frozen
    by the first task to enter, and `t-ns-time` walks the round trip both ways with the caller's own
-   readings pinned unmoved (§6.3). So what is left here is the **three** kinds with no entry at all
-   (user, IPC, cgroup - three of `namespaces(7)`'s eight), and of those the next one should be
-   **USER**: it is the only one of the three whose absence is felt by everything else (a container
+   readings pinned unmoved (§6.3). So what is left here is the **two** kinds with no entry at all
+   (IPC and cgroup - two of `namespaces(7)`'s eight), and of the three this item once named, the one
+   it picked is the one whose absence is felt by everything else (a container
    runtime's first call is `unshare(CLONE_NEWUSER)`, and uid mapping is what the other two are
-   *scoped* by), which also makes it the most expensive - it touches the credential model rather
+   *scoped* by), which also made it the most expensive - it touched the credential model rather
    than adding a namespace object. **USER landed on 2026-10-16**, its whole shape measured first
    (§6.3, five probes run as root *and* unprivileged: `unshare` moves the caller, an unprivileged
    caller may make one, the caller lands on the overflow id because the map starts empty, it holds
@@ -236,8 +239,11 @@ In the order that keeps each step verifiable on its own:
    (§6.3, measured on the host first). And the rung's other
    half, the **capability grant**, landed on 2026-10-16 as well: entering a namespace is itself the
    grant, so `unshare`/`setns` hand the maker the full effective, permitted and bounding sets
-   (`t-ns-user`, 40 claims, a caller that drops first reads them back), measured across all four
-   doors on the host (§6.3). What stays named is the child-side creation of `clone(CLONE_NEWUSER)`,
+   (`t-ns-user`, a caller that drops first reads them back), measured across all four
+   doors on the host (§6.3). The **child-side creation** of `clone(CLONE_NEWUSER)` landed the same
+   day: a child born already inside a namespace of its own, the overflow id until its map is
+   written, the full set at birth, and the parent's `CLONE_NEWUSER` lifting the capability gate for
+   the other kinds beside it (`t-ns-user`, 46 claims, §6.3). What stays named is
    the `ucred` pid (a pid-namespace question), and the netlink/uevent family's own `ucred` render.
    IPC and CGROUP each wait on the thing they would isolate not
    existing yet (SysV/POSIX message queues; a cgroup tree), so they are cheap the day that lands

@@ -98,13 +98,18 @@
 //! hidden.
 //!
 //! The namespace kinds are the third thing the flag word decides, and the
-//! answer is settled *before* anything is created: the two kinds this kernel
-//! serves - `CLONE_NEWUTS` and `CLONE_NEWNS` (§6.3's ladder, MNT at step 1) -
-//! give the child a *copy* of the caller's names or mount table, while every
-//! other kind is refused whole with `EOPNOTSUPP` rather than handed a child
-//! that shares what its flags said it got its own of. The word is the scheduler's
-//! to answer (`abi::clone_namespace_verdict`), which is why the syscall layer
-//! must pass these bits through rather than read them as unknown.
+//! answer is settled *before* anything is created: the kinds this kernel
+//! serves - `CLONE_NEWUTS` (a copy of the caller's names), `CLONE_NEWNS` (a copy
+//! of the mount table), `CLONE_NEWPID` (a namespace to be the child's own init),
+//! `CLONE_NEWNET` (a fresh stack) and `CLONE_NEWUSER` (a fresh user namespace
+//! the child is *born* in) - give the child its own of what the flag names,
+//! while every other kind (`CLONE_NEWIPC`, `CLONE_NEWCGROUP`) is refused whole
+//! with `EOPNOTSUPP` rather than handed a child that shares what its flags said
+//! it got its own of. The word is the scheduler's to answer
+//! (`abi::clone_namespace_verdict`), which is why the syscall layer must pass
+//! these bits through rather than read them as unknown. Each served kind has its
+//! own rung's program (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`,
+//! `t-ns-user`), so what is left *here* is the refusal the shared verdict makes.
 //!
 //! A third divergence is *avoided* rather than gated, because a request that
 //! means different things on the two machines cannot be one claim: the no-std
@@ -319,16 +324,17 @@ fn main() {
     // one, and that child ran the rest of this program with whatever the
     // register happened to hold as its thread pointer. A hand-written flag table
     // is a second source of truth for a number a maintained one already has.
-    // PID and NET left this list when they were built: `clone(CLONE_NEWPID)`
-    // starts a child in a namespace of its own, and `clone(CLONE_NEWNET)` gives
-    // one a stack of its own. Their pins are `t-ns-pid` and `t-ns-net` - one
-    // program per rung of §6.3's ladder - and what is left here is what this
-    // kernel does not serve *through `clone`*: USER is built, but its child-side
-    // creation is the piece of the rung that is named and not built, so the door
-    // is refused by name rather than with a wrong errno.
+    // PID, NET and USER left this list when they were built: `clone(CLONE_NEWPID)`
+    // starts a child in a namespace of its own, `clone(CLONE_NEWNET)` gives one a
+    // stack of its own, and `clone(CLONE_NEWUSER)` gives one a user namespace of
+    // its own to be born in. Their pins are `t-ns-pid`, `t-ns-net` and
+    // `t-ns-user` - one program per rung of §6.3's ladder - and what is left here
+    // is what this kernel does not serve *through `clone`*: IPC and cgroup are
+    // still named and not built, so the door is refused by name rather than with
+    // a wrong errno.
     let names: &[(&str, usize)] = &[
         ("IPC", libc::CLONE_NEWIPC as usize),
-        ("USER", libc::CLONE_NEWUSER as usize),
+        ("CGROUP", libc::CLONE_NEWCGROUP as usize),
     ];
     for (name, bit) in names {
         let ret = probe(libc::SIGCHLD as usize | bit);

@@ -122,7 +122,7 @@ the build list.
 | `CLONE_NEWNS` | the mount table *and the root*: a `mount` in one namespace invisible in another, and `chroot`/`pivot_root` giving a container its own `/` | **build second** |
 | `CLONE_NEWPID` | the numbers a process *sees*: a child of the new namespace is pid 1 to itself, and `/proc` is numbered per reader | **build third - the expensive one** |
 | `CLONE_NEWNET` | interfaces, addresses, routes and the socket table: a socket bound in one namespace is not reachable from another | **build fourth** |
-| `CLONE_NEWUSER` | uid/gid mapping, and the capability set *within* the namespace | **built** (the maps, the translation and the "root inside" grant) - "Step 6, landed" below |
+| `CLONE_NEWUSER` | uid/gid mapping, and the capability set *within* the namespace | **built** (the maps, the translation, the "root inside" grant, and both doors that create one) - "Step 6"/"Step 6e, landed" below |
 | `CLONE_NEWIPC` | SysV IPC objects and POSIX message queues | **refused**: this kernel has neither, so it isolates nothing |
 | `CLONE_NEWCGROUP` | the cgroup tree a process sees | **refused**: there is no cgroup tree here to see |
 | `CLONE_NEWTIME` | `CLOCK_MONOTONIC`/`BOOTTIME` offsets per namespace | **built** - "Step 5, landed" below |
@@ -471,7 +471,8 @@ end in 23 claims: the machine's map is the identity in a real kernel's exact byt
 the caller then reads **65534** for uid, euid and gid because the new table is empty, writing
 `uid_map` **once** with a line naming the id it is *stored* under makes it read 0, a second write is
 `EPERM`, `setgroups` goes to `deny` and cannot go back on once the gid map exists, a child born here
-reads the same mapped id and names the same namespace, `clone(CLONE_NEWUSER)` is `EOPNOTSUPP`, and
+reads the same mapped id and names the same namespace, `clone(CLONE_NEWUSER)` is `EOPNOTSUPP`
+(the child-side creation Step 6e, below, is what closed that), and
 `setns` onto the namespace the caller is already in is `EINVAL` rather than the no-op `0` every other
 kind gives.
 
@@ -557,8 +558,9 @@ unprivileged, across all four doors into a namespace:
 | the task's identity, `dumpable` and `KEEPCAPS` | untouched - the grant is the capability state and nothing else |
 
 What landed is `Credentials::on_enter_user_ns` (the effective, permitted and bounding sets to
-`CAP_FULL`, inheritable to `0`) applied at the two doors this kernel serves - `unshare_user` and
-`setns_user`, beside the move so the two cannot drift apart. The pin is eight more claims in
+`CAP_FULL`, inheritable to `0`) applied at the two doors this kernel served then - `unshare_user`
+and `setns_user`, beside the move so the two cannot drift apart (the third, a child's own birth,
+is Step 6e below). The pin is eight more claims in
 `t-ns-user` (35 now): a child clears its effective and permitted sets (read back empty) and a
 bounding capability, unshares a namespace nested inside this one, and reads the full set and the
 bounding capability back; and a second door joins a keeper's child namespace holding only
@@ -603,7 +605,7 @@ namespace's question, not this one: it is left alone here and named below.
 What landed is one helper, `observed_cred`, applied at the two doors a unix socket renders a
 `ucred` through - `emit_unix_control`'s `SCM_CREDENTIALS` and the `SO_PEERCRED` `getsockopt` (both
 the `UnixSock` and the anonymous `DuplexEnd` pair) - beside the four `stat` doors that use the same
-rule. The pin is four more claims in `t-ns-user` (40 now): the pair reads the stored id under the
+rule. The pin is four more claims in `t-ns-user` (40 then; 46 after Step 6e): the pair reads the stored id under the
 machine's identity map, the overflow id with the table still empty, and the inside `7` after the
 maps exist, on both `SO_PEERCRED` and `SCM_CREDENTIALS` - the inside id is `7`, a number no stored
 id on this machine is, so none of them can pass by accident.
@@ -614,10 +616,51 @@ gate runs `pass=174 fail=1` and the one red program is `t-ns-user`, red in exact
 survives is the same isolation Step 6b's counterfactual showed: a task that never unshares is not
 disturbed.
 
-**What is named and not built.** The **child-side creation** of `clone(CLONE_NEWUSER)`: Linux
-serves the door and this kernel refuses it `EOPNOTSUPP` because the child would have to be born
-in a fresh namespace (`copy_process`'s order, and what a group sharing an address space means
-for the kind), which wants its own measurement. The **pid** field of a `ucred` is left
+**Step 6e, landed: the child-side creation, and the door `clone` was refusing.** `unshare` and
+`setns` move a *live* task into a namespace; `clone(CLONE_NEWUSER)` makes a child that is born
+already inside one of its own - Linux's `create_user_ns` running for the new task. It was the one
+door of this rung Linux serves and this kernel answered `EOPNOTSUPP` to, because a child born in a
+fresh namespace is a different construction from a caller that moves. `.workbuddy/probe-userns9.c`
+measures the shape on this host (7.2.9), run as root and unprivileged:
+
+| question | Linux's answer |
+|---|---|
+| a child born by `clone(CLONE_NEWUSER)` | in a **fresh** namespace (`/proc/<child>/ns/user` differs from the parent's), its table **empty** |
+| the child's own `getuid`/`getgid` before any map | `65534` - the overflow id, exactly as after `unshare` |
+| the child's capability set at birth | the **full** set (`capeff=1ff:ffffffff`), the grant applied to the child too |
+| who may write the child's map | the **parent** (in the namespace's parent) or the **child itself**, with the same one-line rule `7 <outer> 1` |
+
+And `.workbuddy/probe-userns10.c` measures what the flag word does to the *other* kinds: a word
+carrying `CLONE_NEWUSER` **lifts** the capability gate for the rest of it - `NEWUSER|NEWUTS`,
+`|NEWNS`, `|NEWPID`, `|NEWNET`, `|NEWIPC` and `|NEWCGROUP` all succeed unprivileged, while each of
+those kinds *alone* is `EPERM`. That is why `clone_namespace_verdict`'s gate is two rules: a word
+without `CLONE_NEWUSER` is checked against the caller's own namespace, one with it against the
+fresh namespace the child already holds the full set in.
+
+What landed is a namespace minted in `spawn_copy` for the child when the flag is set (mirroring
+`child_pid_ns`, and the only place a user namespace is created for a *new* task) and one grant line
+- `Credentials::on_enter_user_ns` applied to the credentials the child just inherited, the same
+call `unshare`'s and `setns`' doors make, so the three cannot drift. The verdict (`crates/abi`)
+gained `CLONE_NEWUSER` in its served set and the two-rule gate above; `t-clone`'s refusal list lost
+`USER` (its pin moved to `t-ns-user`, where the child's own view is the claim) and gained `CGROUP`,
+so the refusal claim still names what is left. The pin is six more claims in `t-ns-user` (46 now):
+the child is born in a fresh namespace, reads the overflow id with the table empty, the parent
+writes its uid and gid maps with the one-line rule, the child then reads the inside `7`, and - in a
+forked helper whose own sets are emptied first - a child born this way still holds the full set.
+The helper exists because every task on this image starts with everything: without a parent that
+holds nothing, "full at birth" is indistinguishable from "full because it inherited everything".
+The drop cannot live in the main process, because a **root** caller that has emptied its sets may
+not write a uid map at all (measured, `.workbuddy/probe-userns13.c` - the child's own write is
+`EPERM` there while the unprivileged one succeeds), so the grant is pinned with no map write and
+the maps by a caller that still holds what it takes.
+
+The counterfactual: with the two `spawn_copy` sites disabled the gate runs `pass=174 fail=1` and
+the one red program is `t-ns-user`, red in exactly **six** claims - the fresh-namespace read, the
+overflow-id read, both map writes, the inside-id read, and the helper's full-set claim - while
+`clone(CLONE_NEWUSER) creates a child` stays green (the verdict still serves the flag; only the
+namespace is wrong) and every other program is untouched.
+
+**What is named and not built.** The **pid** field of a `ucred` is left
 untranslated: Linux renders it with `pid_vnr` in the reader's *pid* namespace, which is that rung's
 question and not this one, so a peer in a different pid namespace would read the wrong number here.
 And a third `ucred` render sits in the **netlink/uevent** family (`recvmsg_netlink`), whose
@@ -1446,11 +1489,11 @@ validation cannot be what refuses it) and in the leaf's own tests.
 Two more shapes the same pass found, **named rather than fixed** because each is its own
 question: `CLONE_PARENT` is in the validated flag mask and is not honoured, so a caller asking
 for it silently gets the caller-as-parent it would have got anyway; and `clone(CLONE_FS |
-CLONE_NEWNS)` is accepted here where `clone(2)`'s ERRORS list calls it `EINVAL` (the same list
-has `CLONE_NEWUSER | CLONE_FS` and `CLONE_NEWIPC | CLONE_SYSVSEM`; IPC is unserved here and USER is
-not a door through `clone` - its child-side creation is named and not built, "Step 6" below - so
-only the first pair is this kernel's to answer). The first belongs with `parent:`'s
-implementation, the second with `validate_clone_flags`'s documented-pair table.
+CLONE_NEWNS)` is accepted here where `clone(2)`'s ERRORS list calls it `EINVAL`. That list also
+names `CLONE_NEWUSER | CLONE_FS` and `CLONE_NEWIPC | CLONE_SYSVSEM`: IPC is unserved here, and
+`CLONE_NEWUSER` is a door through `clone` now (Step 6e, above), so both pairs are this kernel's to
+answer and are named rather than fixed. The first belongs with `parent:`'s implementation, the
+second with `validate_clone_flags`'s documented-pair table.
 
 **Named gaps, each with what it waits on.** A namespace's pid 1 dying does not zap the
 namespace (Linux's `zap_pid_ns_processes`, which kills every member) - and because numbers are

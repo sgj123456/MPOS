@@ -36,6 +36,15 @@
 //! with the table still empty, and the inside id once the maps exist - three
 //! answers from an unchanged pair, differing only in the observer.
 //!
+//! The fourth door is the **child-side creation**: `clone(CLONE_NEWUSER)` does
+//! not move the caller, it makes a child that is *born* already inside a
+//! namespace of its own - Linux's `create_user_ns` running for the new task.
+//! The child is the first holder of a table that starts empty, so its own
+//! `getuid` reads the overflow id and its capability set is full the instant it
+//! exists; the parent, sitting in the namespace's parent, is who writes the
+//! map. The ids the child is *stored* under never moved - only which namespace
+//! renders them, exactly as for the three surfaces above.
+//!
 //! # The grant, the other half of the rung
 //!
 //! Making a user namespace needs no capability, because it **is** the grant: the
@@ -60,11 +69,9 @@
 //!
 //! Most of it, and that is unusual for this ladder: unprivileged user namespaces
 //! are enabled on the host this was written against, so `unshare(CLONE_NEWUSER)`
-//! really answers `0` there and the moves below are observable. The one claim
-//! that differs on a real kernel is `clone(CLONE_NEWUSER)`, which Linux *serves*
-//! and this kernel refuses with `EOPNOTSUPP` because the child-side creation is
-//! the piece of this rung that is named and not built (§6.3); that claim accepts
-//! the host's served answer only under `host_run()`.
+//! really answers `0` there and the moves below are observable. Every claim here
+//! now holds on both - the child-side creation of `clone(CLONE_NEWUSER)` landed,
+//! so there is no longer a door this kernel refuses that a host serves.
 //!
 //! # What is *not* pinned here, and why
 //!
@@ -74,7 +81,7 @@
 //! crate's host tests (`crates/userns`, `an_unprivileged_writer_may_name_only_itself_once`),
 //! which is where a rule that needs two privilege levels belongs.
 
-use mpos_user_tests::{Report, host_run};
+use mpos_user_tests::Report;
 use rustix::fs::{AtFlags, CWD, Mode, OFlags, StatxFlags, openat};
 use rustix::io::{Errno, read, write};
 
@@ -353,6 +360,186 @@ fn main() {
         );
     }
 
+    // ---- The fourth door: a child born *inside* a namespace of its own ----
+    //
+    // `unshare(CLONE_NEWUSER)` below *moves* the caller; `clone(CLONE_NEWUSER)`
+    // makes a child that is born already inside a fresh namespace - the
+    // child-side creation, Linux's `create_user_ns` running for the new task.
+    // The child is the first holder of a table that starts empty, so its own
+    // `getuid` reads the overflow id and its capability set is full the instant
+    // it exists; the parent, sitting in the namespace's parent, is who writes
+    // the map. Nothing about the parent moves, and the ids the child is *stored*
+    // under are the parent's - only the rendering namespace differs.
+    //
+    // This runs before the `unshare` below so both sides are in the machine
+    // namespace and the map line names the machine's stored id, exactly as the
+    // probe measured (`.workbuddy/probe-userns9.c`). Two pipes carry the
+    // handshake: the child reports its "before" view, the parent writes the maps
+    // and releases the child, the child reports its "after" view.
+    //
+    // This section keeps the caller's sets intact, and that is deliberate: the
+    // child's own capability set is checked in the helper section *below*,
+    // against a parent whose sets are empty, because every task on this image
+    // starts with everything and the grant would otherwise be invisible. The
+    // maps here must be written by a caller that still holds what it takes - a
+    // root caller that has emptied its own sets may not write a uid map at all
+    // (measured, `.workbuddy/probe-userns13.c`), so the drop cannot live in
+    // this process.
+    if let Ok((ready_r, ready_w)) = rustix::pipe::pipe() {
+        if let Ok((go_r, go_w)) = rustix::pipe::pipe() {
+            let cloned = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    libc::CLONE_NEWUSER | libc::SIGCHLD,
+                    0usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                )
+            };
+            if cloned == 0 {
+                // The child: born in the fresh namespace, before any map. The
+                // raw `clone` with a null stack returns twice, so this is the
+                // child's entry - it reports and leaves rather than running the
+                // rest of the program a second time.
+                drop(ready_r);
+                drop(go_w);
+                let link = readlink("/proc/self/ns/user").unwrap_or_default();
+                let before = format!(
+                    "{} {} {}\n",
+                    unsafe { libc::getuid() },
+                    unsafe { libc::getgid() },
+                    link
+                );
+                let _ = write(&ready_w, before.as_bytes());
+                // Wait for the parent to write the map, then report the inside id.
+                let mut b = [0u8; 1];
+                let _ = read(&go_r, &mut b);
+                let after = format!("{} {}\n", unsafe { libc::getuid() }, unsafe {
+                    libc::getgid()
+                });
+                let _ = write(&ready_w, after.as_bytes());
+                unsafe { libc::_exit(0) }
+            }
+            // The parent: read the child's "before" view, write its map, release
+            // it, read its "after" view.
+            drop(ready_w);
+            drop(go_r);
+            let mut buf = [0u8; 512];
+            let n = read(&ready_r, &mut buf).unwrap_or(0);
+            let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let mut w = text.split_whitespace();
+            let child_uid = w.next().and_then(|s| s.parse::<u32>().ok());
+            let child_gid = w.next().and_then(|s| s.parse::<u32>().ok());
+            let child_ns = w.next().unwrap_or_default().to_string();
+            let mapped = write_file(
+                &format!("/proc/{cloned}/uid_map"),
+                &format!("7 {outer} 1\n"),
+            );
+            let denied = write_file(&format!("/proc/{cloned}/setgroups"), "deny\n");
+            let mapped_gid = write_file(
+                &format!("/proc/{cloned}/gid_map"),
+                &format!("7 {outer} 1\n"),
+            );
+            let _ = write(&go_w, b"g");
+            drop(go_w);
+            let mut buf2 = [0u8; 128];
+            let n2 = read(&ready_r, &mut buf2).unwrap_or(0);
+            drop(ready_r);
+            let after = String::from_utf8_lossy(&buf2[..n2]).into_owned();
+            let mut aw = after.split_whitespace();
+            let inside_uid = aw.next().and_then(|s| s.parse::<u32>().ok());
+            let inside_gid = aw.next().and_then(|s| s.parse::<u32>().ok());
+            let mut status = 0;
+            unsafe { libc::waitpid(cloned as libc::pid_t, &mut status, 0) };
+
+            r.check("clone(CLONE_NEWUSER) creates a child", cloned > 0);
+            r.check(
+                "the child is born in a fresh namespace, not its parent's",
+                !child_ns.is_empty() && Some(child_ns.as_str()) != machine_link.as_deref(),
+            );
+            r.check(
+                "the child reads the overflow id for its own uid and gid, its table empty",
+                child_uid == Some(NO_MAP_ID) && child_gid == Some(NO_MAP_ID),
+            );
+            r.check(
+                "the parent writes the child's uid map with the one-line rule",
+                mapped == 0,
+            );
+            r.check(
+                "...and, after denying setgroups, its gid map too",
+                denied == 0 && mapped_gid == 0,
+            );
+            r.check(
+                "and then the child reads the inside ids the maps gave it",
+                inside_uid == Some(7) && inside_gid == Some(7),
+            );
+        }
+    }
+
+    // ---- The same grant, at the child-side door ----
+    //
+    // `create_user_ns` hands the full set to the child too, and that is only
+    // observable against a parent that holds nothing: every task on this image
+    // starts with everything, so a child that merely inherits its parent's sets
+    // is full either way. A helper empties its own sets and *then* clones; the
+    // child it makes must still read the full set, and would read the empty one
+    // it inherited without the grant. No map is written here on purpose - a root
+    // caller that has emptied its sets may not write a uid map at all (measured,
+    // `.workbuddy/probe-userns13.c`), so the claim is the child's own view and
+    // nothing else.
+    if let Ok((grant_r, grant_w)) = rustix::pipe::pipe() {
+        let helper = unsafe { libc::fork() };
+        if helper == 0 {
+            drop(grant_r);
+            let cleared = capset(0, 0, 0);
+            let cloned = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    libc::CLONE_NEWUSER | libc::SIGCHLD,
+                    0usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                )
+            };
+            if cloned == 0 {
+                let mut data = [CapRecord {
+                    effective: 0,
+                    permitted: 0,
+                    inheritable: 0,
+                }; 2];
+                let cg = capget(&mut data);
+                let full = data[0].effective == u32::MAX
+                    && data[1].effective == CAP_HIGH
+                    && data[0].permitted == u32::MAX
+                    && data[1].permitted == CAP_HIGH;
+                let line = format!("{} {} {}\n", cleared, cg, full as i32);
+                let _ = write(&grant_w, line.as_bytes());
+                drop(grant_w);
+                unsafe { libc::_exit(0) }
+            }
+            let mut status = 0;
+            unsafe { libc::waitpid(cloned as libc::pid_t, &mut status, 0) };
+            unsafe { libc::_exit(0) }
+        }
+        drop(grant_w);
+        let mut buf = [0u8; 128];
+        let n = read(&grant_r, &mut buf).unwrap_or(0);
+        drop(grant_r);
+        let mut status = 0;
+        unsafe { libc::waitpid(helper, &mut status, 0) };
+        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let mut w = text.split_whitespace().map(|s| s.parse::<i64>().ok());
+        let cleared = w.next().flatten();
+        let cg = w.next().flatten();
+        let full = w.next().flatten();
+        r.check(
+            "a child born by clone(CLONE_NEWUSER) holds the full set its emptied parent lacked",
+            cleared == Some(0) && cg == Some(0) && full == Some(1),
+        );
+    }
+
     // ---- The other half of the same translation: what a *file* reports ----
     //
     // `getuid` reads the ids the task stores about itself; `stat` reads the ids
@@ -577,42 +764,6 @@ fn main() {
                 && libc::WEXITSTATUS(status) == 0,
         );
     }
-
-    // ---- The one door this kernel does not serve ----
-    //
-    // `clone(CLONE_NEWUSER)` is a real door on Linux (its bit, `0x10000000`, is
-    // outside the signal byte, so unlike `CLONE_NEWTIME` a caller *can* name it),
-    // and this kernel refuses it by name because the child-side creation is the
-    // part of the rung that is named and not built (§6.3). The claim accepts the
-    // host's served answer only when the run says it is on a host.
-    let cloned = unsafe {
-        libc::syscall(
-            libc::SYS_clone,
-            libc::CLONE_NEWUSER | libc::SIGCHLD,
-            0usize,
-            0usize,
-            0usize,
-            0usize,
-        )
-    };
-    if cloned == 0 {
-        // A host that served it: the child resumes here (the raw `clone` with a
-        // null stack returns twice), in a fresh namespace with no map. It has no
-        // claim of its own to make, so it leaves rather than running the rest of
-        // the program a second time - which is what it did before this line
-        // existed, and why the host run printed everything twice.
-        unsafe { libc::_exit(0) }
-    }
-    if cloned > 0 {
-        // The parent of a served clone: reap the child and accept the divergence.
-        let mut status = 0;
-        unsafe { libc::waitpid(cloned as libc::pid_t, &mut status, 0) };
-    }
-    r.check(
-        "clone(CLONE_NEWUSER) is EOPNOTSUPP here - Linux serves it, mpos does not yet",
-        cloned == -1 && unsafe { *libc::__errno_location() } == libc::EOPNOTSUPP
-            || (host_run() && cloned > 0),
-    );
 
     // ---- Joining the namespace the caller is already in ----
     //

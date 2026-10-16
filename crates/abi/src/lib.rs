@@ -262,12 +262,25 @@ pub fn rlimit_admit(old: Rlimit, new: Rlimit, is_root: bool) -> Result<Rlimit, i
 /// What a `clone`'s flag word asks *of the new task's namespaces*, decided
 /// before anything is created. Linux creates the child inside copied
 /// namespaces (`create_new_namespaces`, one flag per kind, behind
-/// `CAP_SYS_ADMIN` checked there too); this kernel serves the two kinds whose
-/// copies are wired into the child's construction — the mount table (the child
-/// starts in a copy; `t-ns-mnt`) and the names (Linux's `copy_utsname` on
-/// exactly this flag; `t-clone` pins it) — and refuses every other kind whole.
-/// A caller asking for PID isolation gets the same answer from here as
-/// `unshare` gives it: nothing to hand over yet.
+/// `CAP_SYS_ADMIN` checked there too); this kernel serves the kinds whose
+/// copies are wired into the child's construction — the names (`copy_utsname`;
+/// `t-clone`), the mount table (the child starts in a copy; `t-ns-mnt`), a pid
+/// namespace to be the child's own init, a fresh network stack, and a fresh
+/// **user** namespace the child is *born* in (`t-ns-user`'s child-side claims)
+/// — and refuses every other kind whole. A caller asking for IPC or cgroup
+/// isolation gets `EOPNOTSUPP`: nothing to hand over yet.
+///
+/// The capability gate is two rules, and the split is measured. A word
+/// **without** `CLONE_NEWUSER` asks for its kinds against the caller's own
+/// namespace, so an unprivileged caller is `EPERM` (`.workbuddy/probe-userns10.c`:
+/// `CLONE_NEWUTS` and `CLONE_NEWNS` alone are, and so is every other kind
+/// alone). A word **carrying** `CLONE_NEWUSER` asks against the fresh namespace
+/// the child is already in — and making a user namespace *is* the grant, so
+/// that namespace's holder has the full set and every kind beside it is
+/// created: measured, `CLONE_NEWUSER` beside each of `NEWUTS`, `NEWNS`,
+/// `NEWPID`, `NEWNET`, `NEWIPC` and `NEWCGROUP` all succeed unprivileged. So
+/// `CLONE_NEWUSER` does not merely pass the gate, it **lifts** it for the rest
+/// of the word.
 ///
 /// The unserved-kind refusal is `EOPNOTSUPP`, not `EINVAL`: the bit is a real
 /// namespace flag (an unknown bit is the caller's own validation job, upstream
@@ -279,7 +292,7 @@ pub fn rlimit_admit(old: Rlimit, new: Rlimit, is_root: bool) -> Result<Rlimit, i
 /// `sched → syscall` edge is exactly the V-* class Phase 11 keeps at zero. The
 /// namespace bits it consults are defined above, so the rule has one home.
 pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isize> {
-    const SERVED: usize = CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET;
+    const SERVED: usize = CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWUSER;
     let asked = flags & CLONE_NAMESPACES;
     // The pairs Linux itself calls *invalid*, from `clone(2)`'s ERRORS list:
     // "CLONE_NEWPID and one (or both) of CLONE_THREAD or CLONE_PARENT were
@@ -294,16 +307,16 @@ pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isi
     if asked & CLONE_NEWPID != 0 && flags & (CLONE_THREAD | CLONE_PARENT) != 0 {
         return Err(mpos_err::EINVAL);
     }
-    // `CLONE_NEWUSER` is exempt from the capability gate here for the same
-    // measured reason it is exempt in `unshare`: making a user namespace needs no
-    // capability, because it *is* the grant. This kernel does not serve it
-    // through `clone` yet (the child-side creation is the piece of the rung that
-    // is named and not built, §6.3), so the answer below is `EOPNOTSUPP` for
-    // privileged and unprivileged callers alike - the honest "present, cannot do
-    // that" rather than an `EPERM` that would send the caller looking for a
-    // capability which would not help.
+    // `CLONE_NEWUSER` is exempt from the capability gate for the same measured
+    // reason it is exempt in `unshare`: making a user namespace needs no
+    // capability, because it *is* the grant. And because the child is *born*
+    // in that fresh namespace, holding the full set there, the *other* kinds in
+    // the same word are checked against the new namespace too: measured,
+    // `clone(CLONE_NEWUSER|CLONE_NEWUTS)` succeeds unprivileged while
+    // `clone(CLONE_NEWUTS)` alone is `EPERM` (`.workbuddy/probe-userns10.c`).
+    // So the gate applies only to a word that does *not* carry `CLONE_NEWUSER`.
     let gated = asked & !CLONE_NEWUSER;
-    if gated != 0 && !privileged {
+    if asked & CLONE_NEWUSER == 0 && gated != 0 && !privileged {
         return Err(mpos_err::EPERM);
     }
     // `CLONE_NEWTIME` is deliberately **not** ruled on here, and the reason is
@@ -392,14 +405,14 @@ mod tests {
     }
 
     #[test]
-    fn the_clone_namespace_verdict_serves_two_kinds_and_refuses_whole() {
-        // The rule the scheduler asks before it creates anything: the two kinds
-        // whose copies are wired into a child's construction are served, every
-        // other kind is refused *whole* (`EOPNOTSUPP` - "present, cannot do
-        // that") rather than half-served with a child that shares what its flags
-        // said it got its own of, and a caller without `CAP_SYS_ADMIN` is
-        // refused `EPERM` first, for *any* namespace word (Linux's order:
-        // privilege, then what can be served).
+    fn the_clone_namespace_verdict_serves_its_kinds_and_refuses_whole() {
+        // The rule the scheduler asks before it creates anything: the kinds whose
+        // copies are wired into a child's construction are served, every other
+        // kind is refused *whole* (`EOPNOTSUPP` - "present, cannot do that")
+        // rather than half-served with a child that shares what its flags said it
+        // got its own of, and a caller without `CAP_SYS_ADMIN` is refused `EPERM`
+        // first, for any namespace word that does *not* carry `CLONE_NEWUSER`
+        // (Linux's order: privilege, then what can be served).
         //
         // This pin exists because its absence was measured: the verdict landed
         // with no test of its own *and* behind a syscall-layer mask that read
@@ -415,15 +428,13 @@ mod tests {
         // caller holds - the byte `fork` is built from is not a namespace.
         assert_eq!(clone_namespace_verdict(0, true), Ok(()));
         assert_eq!(clone_namespace_verdict(0, false), Ok(()));
-        // PID is served now (`sched::clone` gives the child a fresh namespace
-        // when the flag is set), so the refused case moved to the kinds this
-        // kernel still has no copy for - the drift a hardcoded served set always
-        // has, recorded the same way in `t-caps` and `t-posix`.
+        // PID and NET are served (`sched::clone` gives the child a fresh
+        // namespace when the flag is set), so the refused case moved to the
+        // kinds this kernel still has no copy for - the drift a hardcoded served
+        // set always has, recorded the same way in `t-caps` and `t-posix`.
+        // Their unprivileged case is the lift loop below, with every other kind.
         assert_eq!(clone_namespace_verdict(CLONE_NEWPID, true), Ok(()));
-        assert_eq!(
-            clone_namespace_verdict(CLONE_NEWPID, false),
-            Err(mpos_err::EPERM)
-        );
+        assert_eq!(clone_namespace_verdict(CLONE_NEWNET, true), Ok(()));
         // And the one word whose halves contradict each other: a thread cannot
         // be the init of a namespace its own process is not in, so this is
         // `EINVAL` - the request, not the privilege - even for a caller that
@@ -448,38 +459,50 @@ mod tests {
         // cannot (`spawn_thread` copies the creating process's namespaces), so
         // the word is refused by name instead of being accepted and dropped -
         // which is what used to happen, silently.
-        for kind in [CLONE_NEWNS, CLONE_NEWUTS] {
+        for kind in [CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWUSER] {
             assert_eq!(
                 clone_namespace_verdict(CLONE_THREAD | CLONE_SIGHAND | CLONE_VM | kind, true),
                 Err(mpos_err::EOPNOTSUPP),
                 "{kind:#x} was accepted for a thread and then ignored"
             );
         }
-        // NET joined the served set when the fourth rung landed: a child given a
-        // fresh stack is the one shape this kernel can serve for that kind, while
-        // moving a *live* task into one is refused by name in `setns` and by the
-        // `unshare` verdict (`docs/notes/` §6.3).
-        assert_eq!(clone_namespace_verdict(CLONE_NEWNET, true), Ok(()));
-        assert_eq!(
-            clone_namespace_verdict(CLONE_NEWNET, false),
-            Err(mpos_err::EPERM)
-        );
-        assert_eq!(
-            clone_namespace_verdict(CLONE_NEWUSER, true),
-            Err(mpos_err::EOPNOTSUPP)
-        );
+        // USER is served now: `sched::clone` gives the child a fresh namespace to
+        // be born in, and it needs no capability - the namespace *is* the grant -
+        // so an unprivileged caller gets it too (`t-ns-user`'s child-side claims
+        // pin the child's view on both machines).
+        assert_eq!(clone_namespace_verdict(CLONE_NEWUSER, true), Ok(()));
+        assert_eq!(clone_namespace_verdict(CLONE_NEWUSER, false), Ok(()));
+        // The measured split the doc comment above describes: a word carrying
+        // `CLONE_NEWUSER` has its other kinds checked against the fresh
+        // namespace, so they are served to an unprivileged caller; the same kind
+        // *alone* is gated on the caller's own `CAP_SYS_ADMIN`.
+        // `.workbuddy/probe-userns10.c` is the observation.
+        for kind in [CLONE_NEWUTS, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWNET] {
+            assert_eq!(
+                clone_namespace_verdict(CLONE_NEWUSER | kind, false),
+                Ok(()),
+                "CLONE_NEWUSER should lift the gate for {kind:#x}"
+            );
+            assert_eq!(
+                clone_namespace_verdict(kind, false),
+                Err(mpos_err::EPERM),
+                "{kind:#x} alone should still be gated"
+            );
+        }
         // Served *and* unserved in one word: nothing is half-done, so the whole
         // request is refused and the served kind is not quietly handed over.
+        // `CLONE_NEWUSER` lifts the *gate*, not the served set: IPC beside it is
+        // still `EOPNOTSUPP`.
         assert_eq!(
             clone_namespace_verdict(CLONE_NEWUTS | CLONE_NEWIPC, true),
             Err(mpos_err::EOPNOTSUPP)
         );
         assert_eq!(
-            clone_namespace_verdict(CLONE_NEWNS, false),
-            Err(mpos_err::EPERM)
+            clone_namespace_verdict(CLONE_NEWUSER | CLONE_NEWIPC, false),
+            Err(mpos_err::EOPNOTSUPP)
         );
         assert_eq!(
-            clone_namespace_verdict(CLONE_NEWPID, false),
+            clone_namespace_verdict(CLONE_NEWNS, false),
             Err(mpos_err::EPERM)
         );
     }
