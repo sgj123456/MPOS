@@ -1349,4 +1349,59 @@ the commit bodies), and each moved its pin in the same commit.
     control passes on both kernels (`chmod 0640 on the caller's own file`, `the owner's own uid is
     still served`, "a world-writable file is served the now form", and `chmod on root's 0600 file is
     EPERM for a stranger`). **What stays named rather than landed** is the same capability's other
-    door — a **write** to a set-uid file, which is §5.2's newest entry and has its own measurement.
+    door — a **write** to a set-uid file, which was §5.2's newest entry and is item 41's.
+
+41. **A change to a file's bytes costs it the set-id bits, and `CAP_FSETID` is the only thing that
+    spares them.** The third door of the capability item 40 put behind `chmod`'s set-group-id bit,
+    and the reason a set-uid program cannot be handed to somebody by being edited in place: Linux's
+    `file_remove_privs` runs the two bits off a **write** and a **resize** as it does off a `chown`,
+    so the file's authority belongs to whoever owned it when the bytes were written and a caller that
+    rewrites them has not been granted it. This kernel's write path touched neither bit.
+    **Measured whole on a current host first** (`.workbuddy/probe_suid_write.c`, Linux 7.2.9, a root
+    caller with the one capability dropped, fixtures carrying both bits):
+
+    ```text
+                                        whole set  -CAP_FSETID
+    write 1 byte to a 4755 file            4755        0755
+    write 1 byte to a 2755 file            2755        0755
+    write 0 bytes to a 4755 file           4755        4755
+    write 1 byte to another's 4666         4666        0666
+    truncate a 4755 file to 0              4755        0755
+    ftruncate a 4755 file up to 8          4755        0755
+    open a 4755 file with O_TRUNC          4755        0755
+    write 1 byte to a 2644 (no group-x)    2644        2644
+    ```
+
+    Three things beside the capability. A write that writes **nothing** costs nothing, so the strip
+    is the bytes' and not the door's. Being the file's owner buys nothing and owning nothing costs
+    nothing — the only question is the capability, and a caller writing another user's
+    world-writable file loses the bits too, which is where this door differs from `chmod`'s (there,
+    being in the group spares the bit). And the set-group-id-with-no-group-execute shape is the same
+    exception the `chown` door honours and the `chmod` door does not. **The fix is one shared helper
+    and four doors.** `crate::vfs::without_set_id` holds the two clauses — the set-uid bit always,
+    the set-group-id bit only where the group may execute — so `chown_apply` and the write path
+    cannot drift apart; `remove_privs` is Linux's `file_remove_privs`, asking `CAP_FSETID` through
+    the same `Overrides` item 40 gave the two new bits, and `remove_privs_as` is its rule of a caller
+    a host unit test can name. The four doors are [`File::write`](crate::vfs::file::File::write)
+    (every write, `writev`, `pwrite` and `pwritev` funnels through it, and it asks only once `n` is
+    not zero), `ftruncate`, `truncate` and the `O_TRUNC` of an `open`. The caller is asked only once
+    the node is known to carry a bit, because `current_caller` reads the task's whole group set.
+    Owner: `src/vfs/mod.rs` (the three helpers) and the two files above. Pin: `t-caps`' six new
+    claims (the whole set's write and resize keep the bits; `CAP_FSETID` dropped costs a `4755` file
+    both of them on a write *and* on a resize; the locking-mark shape is nobody's to take; and a
+    `CAP_FOWNER`-dropped caller still keeps them, the control that puts the door on the right
+    capability) beside the host unit test
+    `a_change_to_the_bytes_costs_the_set_id_bits_and_only_fsetid_spares_them`. Gate: x86_64
+    `pass=181 fail=0 (181 built)`, `mpos-kunit 32 passed, 0 failed` (181 staged, 11 left out); the
+    second machine's arm is `pass=180 fail=0`, `mpos-kunit 32 passed, 0 failed` (180 staged, 12 left
+    out); `t-caps`' 76 `ok:` lines are byte-identical across the two. The counterfactual is exact:
+    with only the four call sites removed (two files) and the pins kept, the sweep is `pass=180
+    fail=1 (181 built)` with `mpos-kunit` unmoved at 32 passed, 0 failed — the one red program is
+    `t-caps` and its two red claims are exactly the discriminating ones (`FAIL: FSETID dropped: a
+    write costs a 4755 file both set-id bits (got 4755)` and `FAIL: FSETID dropped: and so does a
+    resize (got 4755)`), while every control passes on both kernels (the whole set's two rows and
+    the `CAP_FOWNER`-dropped one). The locking-mark row is green on both by construction — there is
+    nothing for either kernel to take — which is what makes the other two the ones that carry it.
+    **Two shapes stay named in §5.2**: `fallocate`'s resize, which reaches `Inode::truncate` without
+    going through either truncate door and was not measured; and a write through a mapping, which
+    Linux does not strip either.

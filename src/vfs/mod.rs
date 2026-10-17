@@ -1776,6 +1776,82 @@ pub fn in_group_or_capable(caller: Caller, gid: u32) -> bool {
     caller.gid == gid || current_groups().contains(&gid) || caller.overrides.fsetid
 }
 
+/// What is left of `mode` once the two set-id bits that are an **authority**
+/// have been taken away.
+///
+/// Both doors that take them away take them the same way - a `chown` (item
+/// 40's `ATTR_KILL_SUID`/`ATTR_KILL_SGID`) and a change to the file's bytes
+/// (Linux's `should_remove_suid`) - and the rule is two clauses rather than
+/// one, measured on a current host (`.workbuddy/probe_chown_bits.c`,
+/// `.workbuddy/probe_suid_write.c`): the set-uid bit **always** goes, even off
+/// a file that carries no execute bit at all (`4644` stores `0644`), while the
+/// set-group-id bit goes only where the group may execute (`6755` stores
+/// `0755`, `6644` keeps its `2644`) - because a set-group-id with no group
+/// execute is a mandatory locking mark and not an authority, so there is
+/// nothing for anybody to take.
+pub fn without_set_id(mode: u32) -> u32 {
+    let mut next = mode & !S_ISUID;
+    if mode & S_IXGRP != 0 {
+        next &= !S_ISGID;
+    }
+    next
+}
+
+/// Take a node's set-id bits away, which is what changing its **bytes** costs
+/// it: `CAP_FSETID` is the only thing that spares them.
+///
+/// Linux's `file_remove_privs`, and the reason it exists is the reason a
+/// set-uid program cannot be handed to somebody by being edited in place: the
+/// file's authority belongs to whoever owned it when the bytes were written,
+/// and a caller that rewrites them has not been granted it. Measured whole on a
+/// current host (`.workbuddy/probe_suid_write.c`, a root caller with one
+/// capability dropped, fixtures carrying both bits):
+///
+/// ```text
+///                                     whole set  -CAP_FSETID
+/// write 1 byte to a 4755 file             4755        0755
+/// write 1 byte to a 2755 file             2755        0755
+/// write 0 bytes to a 4755 file            4755        4755
+/// write 1 byte to another's 4666          4666        0666
+/// truncate a 4755 file to 0               4755        0755
+/// ftruncate a 4755 file up to 8           4755        0755
+/// open a 4755 file with O_TRUNC           4755        0755
+/// write 1 byte to a 2644 (no group-x)     2644        2644
+/// ```
+///
+/// So three things beside the capability. A write that writes **nothing** costs
+/// nothing - the strip is the bytes' and not the door's, which is why
+/// [`File::write`](crate::vfs::file::File::write) asks it only once `n` is not
+/// zero. Being the file's owner buys nothing and owning nothing costs nothing:
+/// the only question is the capability, and a caller writing another user's
+/// world-writable file loses the bits too. And the set-group-id-without-execute
+/// shape is the same exception the other door honours.
+///
+/// The caller is asked *only* once the node is known to carry a bit, because
+/// [`current_caller`] reads the task's whole group set and this runs on every
+/// write to a file that has one.
+pub fn remove_privs(inode: &Arc<dyn Inode>) {
+    if !inode.keeps_modes() || inode.mode() & (S_ISUID | S_ISGID) == 0 {
+        return;
+    }
+    remove_privs_as(inode, current_caller());
+}
+
+/// [`remove_privs`]'s rule, of a caller the caller names - which is what a
+/// host unit test walks the measured table with, since a unit test has no task
+/// to ask.
+pub fn remove_privs_as(inode: &Arc<dyn Inode>, caller: Caller) {
+    if !inode.keeps_modes() || caller.overrides.fsetid {
+        return;
+    }
+    let mode = inode.mode();
+    let next = without_set_id(mode);
+    if next != mode {
+        inode.set_mode(next);
+        inotify::emit(inode, inotify::IN_ATTRIB, "");
+    }
+}
+
 /// The running task as the permission checks see it: its effective ids, and the
 /// overrides its credentials carry in the namespace the node's filesystem
 /// belongs to ([`Overrides::of`]).
@@ -2501,5 +2577,67 @@ mod tests {
         assert!(!in_group_or_capable(Caller::ids(11, 11), 10));
         assert!(in_group_or_capable(fsetid, 10));
         assert!(!in_group_or_capable(Caller::ids(0, 0), 10));
+    }
+
+    /// A change to a file's **bytes** costs it the set-id bits, and `CAP_FSETID`
+    /// is the only thing that spares them.
+    ///
+    /// Measured on a current host with `.workbuddy/probe_suid_write.c` (root,
+    /// the one capability dropped, fixtures carrying both bits): a one-byte
+    /// write to `04755` stores `0755` and the same write with the bit held
+    /// stores `04755`; a write that wrote *nothing* costs nothing; and the
+    /// set-group-id that carries no group execute is a locking mark rather than
+    /// an authority, so no caller's write takes it.
+    #[test]
+    fn a_change_to_the_bytes_costs_the_set_id_bits_and_only_fsetid_spares_them() {
+        let vfs = MountTable::new();
+        let fs = crate::vfs::ramfs::RamFs::new();
+        vfs.mount_root(fs.clone());
+        let root = vfs.resolve("/").unwrap();
+        let fsetid = Caller {
+            uid: 0,
+            gid: 0,
+            overrides: Overrides {
+                fsetid: true,
+                ..Overrides::NONE
+            },
+        };
+        let nobody = Caller::ids(0, 0);
+
+        // Both bits, with group execute: the ordinary case, and the one the
+        // whole rule exists for.
+        let both = root.create("b", NodeKind::File).unwrap();
+        both.set_owner(0, 3000);
+        both.set_mode(0o6755);
+        remove_privs_as(&both, nobody);
+        assert_eq!(
+            both.mode(),
+            0o0755,
+            "writing a set-uid file without CAP_FSETID takes both bits"
+        );
+        both.set_mode(0o6755);
+        remove_privs_as(&both, fsetid);
+        assert_eq!(both.mode(), 0o6755, "and the capability spares them");
+
+        // A set-uid with no execute bit at all: still an authority, still gone.
+        let suid = root.create("s", NodeKind::File).unwrap();
+        suid.set_mode(0o4644);
+        remove_privs_as(&suid, nobody);
+        assert_eq!(suid.mode(), 0o0644);
+
+        // A set-group-id with no group execute: a locking mark, and nobody's
+        // to take.
+        let mark = root.create("m", NodeKind::File).unwrap();
+        mark.set_owner(0, 3000);
+        mark.set_mode(0o2644);
+        remove_privs_as(&mark, nobody);
+        assert_eq!(mark.mode(), 0o2644, "a locking mark is not an authority");
+
+        // A filesystem that keeps no modes is not asked, as everywhere else:
+        // `RamFs::new`'s own root is one, and nothing is taken from a node that
+        // had nothing to take.
+        assert!(!root.keeps_modes());
+        remove_privs_as(&root, nobody);
+        assert_eq!(root.mode(), 0);
     }
 }

@@ -548,7 +548,7 @@ Section numbers are unchanged from the original `UAPI.md`.
     same capability's third door, below.
 
 - **A write to a set-uid file leaves the bit, and `CAP_FSETID` is what would have taken it.**
-  **Named 2026-10-18** (`docs/uapi/` §5.1 item 40's measurement; not landed). Linux's
+  **Landed 2026-10-18** (`docs/uapi/` §5.1 item 41). Linux's
   `file_remove_privs` runs the same two bits off a **write** and a **truncate** as it does off a
   `chown`, which is the whole reason a set-uid program cannot be handed to somebody by editing it
   in place - and it is `CAP_FSETID` that spares them, so this is the same capability's third door.
@@ -560,11 +560,10 @@ Section numbers are unchanged from the original `UAPI.md`.
   being in the group spares the bit; here only the capability does). A `truncate` to zero does the
   same thing, because it is the same helper. The one shape the rule leaves alone is the
   set-group-id with no group execute - `02644` stays `02644` - the same locking-mark clause a
-  `chown` honours and a `chmod` does not. This kernel's write path touches neither bit, so a caller
-  that dropped the capability keeps an authority Linux would have taken away. Owner: the write and
-  `truncate` paths (`src/vfs/file.rs`'s `File::write` and the truncate doors in
-  `src/syscall/linux/fs/file.rs`), which would ask `Caller::overrides.fsetid` and clear `S_ISUID`,
-  plus `S_ISGID` where `S_IXGRP` is set. Pin: none yet - a `t-caps` row writing to a `04755`
-  fixture with `CAP_FSETID` dropped is the shape a pin would take, and it needs the same "the whole
-  set puts the fixture back" discipline item 40's table uses, since the row that measures it
-  destroys the bit.
+  `chown` honours and a `chmod` does not. This kernel's write path touched neither bit, so a caller
+  that dropped the capability kept an authority Linux would have taken away. It asks now, through
+  `crate::vfs::remove_privs` (and the `without_set_id` two clauses it shares with item 40's `chown`
+  door), at the four doors Linux reaches: `File::write`, `ftruncate`, `truncate` and an `open`'s
+  `O_TRUNC`. **Two shapes stay named**: `fallocate`'s resize, which reaches `Inode::truncate`
+  without going through either truncate door and was not measured (a probe row is what closes it);
+  and a write through a mapping, which Linux does not strip either.

@@ -172,6 +172,29 @@ fn mode_of(path: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// Write one byte to `path` and read the mode back - the *write* door of the
+/// set-id rule, which Linux's `file_remove_privs` runs off a write as it does
+/// off a `chown`. Opened for writing **without** `O_TRUNC`, so what is being
+/// measured is the bytes and not the resize (the resize is its own door, below).
+fn write_one(path: &str) -> u32 {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = f.write_all(b"x");
+    }
+    mode_of(path)
+}
+
+/// Cut `path` back to nothing and read the mode back - the resize door, which
+/// costs the file the same two bits (measured: `truncate` and `ftruncate` both
+/// store `0755` where the file carried `4755`).
+fn truncate_it(path: &str) -> u32 {
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path);
+    mode_of(path)
+}
+
 /// `klogctl(type, buf, len)` - `syslog(2)`'s raw door, the same one
 /// `t-syslog` drives.
 fn klogctl(kind: i32) -> isize {
@@ -638,6 +661,14 @@ fn main() {
     // (`.workbuddy/probe_capable_scope.c`, whose `times_matrix` reads
     // `other0600`/`other0666` while its chown rows read `other`).
     let timesfile = "/tmp/t-caps-times";
+    // Three more fixtures for the set-id bits' *other* door: changing a file's
+    // bytes costs it the two bits, and `CAP_FSETID` is the only thing that
+    // spares them (`.workbuddy/probe_suid_write.c`). One carries both bits with
+    // group execute (the ordinary case), one a set-group-id with no group
+    // execute (a locking mark, which nobody takes), and one is the resize door.
+    let wbits = "/tmp/t-caps-wbits";
+    let wmark = "/tmp/t-caps-wmark";
+    let wtrunc = "/tmp/t-caps-wtrunc";
     // The four fixtures the set-id rows below turn on, each in a group this
     // caller is not in: a file carrying both bits, a file whose set-group-id
     // carries no group execute (a locking mark rather than an authority), a
@@ -649,7 +680,9 @@ fn main() {
     let bitsmark = "/tmp/t-caps-bitsmark";
     let bitssuid = "/tmp/t-caps-bitssuid";
     let bitsdir = "/tmp/t-caps-bitsdir";
-    for path in [other, mine, minegid, timesfile, bits, bitsmark, bitssuid] {
+    for path in [
+        other, mine, minegid, timesfile, bits, bitsmark, bitssuid, wbits, wmark, wtrunc,
+    ] {
         let _ = std::fs::remove_file(path);
     }
     let _ = std::fs::remove_dir_all(bitsdir);
@@ -657,6 +690,9 @@ fn main() {
         && std::fs::File::create(mine).is_ok()
         && std::fs::File::create(minegid).is_ok()
         && std::fs::File::create(timesfile).is_ok()
+        && std::fs::File::create(wbits).is_ok()
+        && std::fs::File::create(wmark).is_ok()
+        && std::fs::File::create(wtrunc).is_ok()
         && std::fs::File::create(bits).is_ok()
         && std::fs::File::create(bitsmark).is_ok()
         && std::fs::File::create(bitssuid).is_ok()
@@ -679,7 +715,10 @@ fn main() {
         && std::fs::set_permissions(bits, std::fs::Permissions::from_mode(0o6755)).is_ok()
         && std::fs::set_permissions(bitsmark, std::fs::Permissions::from_mode(0o6644)).is_ok()
         && std::fs::set_permissions(bitssuid, std::fs::Permissions::from_mode(0o4644)).is_ok()
-        && std::fs::set_permissions(bitsdir, std::fs::Permissions::from_mode(0o6755)).is_ok();
+        && std::fs::set_permissions(bitsdir, std::fs::Permissions::from_mode(0o6755)).is_ok()
+        && std::fs::set_permissions(wbits, std::fs::Permissions::from_mode(0o4755)).is_ok()
+        && std::fs::set_permissions(wmark, std::fs::Permissions::from_mode(0o2644)).is_ok()
+        && std::fs::set_permissions(wtrunc, std::fs::Permissions::from_mode(0o4755)).is_ok();
     r.check("another user's file, and two of this caller's", owned);
 
     // What a row leaves behind, put back while the whole set is held: the rows
@@ -702,6 +741,9 @@ fn main() {
         let _ = std::fs::set_permissions(bitsmark, std::fs::Permissions::from_mode(0o6644));
         let _ = std::fs::set_permissions(bitssuid, std::fs::Permissions::from_mode(0o4644));
         let _ = std::fs::set_permissions(bitsdir, std::fs::Permissions::from_mode(0o6755));
+        let _ = std::fs::set_permissions(wbits, std::fs::Permissions::from_mode(0o4755));
+        let _ = std::fs::set_permissions(wmark, std::fs::Permissions::from_mode(0o2644));
+        let _ = std::fs::set_permissions(wtrunc, std::fs::Permissions::from_mode(0o4755));
     };
     let explicit = [libc::timespec {
         tv_sec: 1_000_000_000,
@@ -721,6 +763,9 @@ fn main() {
         strip_mark: u32,
         strip_suid: u32,
         strip_dir: u32,
+        write_bits: u32,
+        write_mark: u32,
+        trunc_bits: u32,
     }
 
     // One row: the effective set with `clear` lowered, the calls the
@@ -760,6 +805,12 @@ fn main() {
             let _ = chown_errno(bitsdir, u32::MAX, u32::MAX);
             mode_of(bitsdir)
         };
+        // The other door: the file's bytes. A write that writes a byte, a write
+        // to the locking-mark shape, and a resize - each of which costs the file
+        // the same two bits unless `CAP_FSETID` is held.
+        let write_bits = write_one(wbits);
+        let write_mark = write_one(wmark);
+        let trunc_bits = truncate_it(wtrunc);
         let mut back = *whole;
         capset(&mut header, &mut back);
         restore();
@@ -776,6 +827,9 @@ fn main() {
             strip_mark,
             strip_suid,
             strip_dir,
+            write_bits,
+            write_mark,
+            trunc_bits,
         }
     };
     let whole_set = own_row(&mut r, "the whole set", &[], &whole);
@@ -833,6 +887,24 @@ fn main() {
         ),
         whole_set.strip_dir == 0o6755,
     );
+    // The same two bits, taken by the file's **bytes** instead of by a `chown`:
+    // a write and a resize each cost them, and `CAP_FSETID` is the only thing
+    // that spares them - a set-group-id with no group execute is a locking mark
+    // and is nobody's to take either way.
+    r.check(
+        &format!(
+            "whole set: a write leaves a 4755 file's bits alone (got {:04o})",
+            whole_set.write_bits
+        ),
+        whole_set.write_bits == 0o4755,
+    );
+    r.check(
+        &format!(
+            "whole set: and a resize leaves them alone (got {:04o})",
+            whole_set.trunc_bits
+        ),
+        whole_set.trunc_bits == 0o4755,
+    );
     let no_fowner = own_row(&mut r, "CAP_FOWNER dropped", &[3], &whole);
     r.check(
         &format!(
@@ -869,6 +941,16 @@ fn main() {
         ),
         no_fowner.strip_file == 0o0755,
     );
+    // The control for the door: this one is `CAP_FSETID`'s and not
+    // `CAP_FOWNER`'s, so a caller that dropped the latter still keeps the bits
+    // its write would otherwise have cost it.
+    r.check(
+        &format!(
+            "FOWNER dropped: a write still keeps the set-id bits (got {:04o})",
+            no_fowner.write_bits
+        ),
+        no_fowner.write_bits == 0o4755,
+    );
     let no_fsetid = own_row(&mut r, "CAP_FSETID dropped", &[4], &whole);
     r.check(
         &format!(
@@ -890,6 +972,27 @@ fn main() {
             no_fsetid.strip_mark
         ),
         no_fsetid.strip_mark == 0o2644,
+    );
+    r.check(
+        &format!(
+            "FSETID dropped: a write costs a 4755 file both set-id bits (got {:04o})",
+            no_fsetid.write_bits
+        ),
+        no_fsetid.write_bits == 0o0755,
+    );
+    r.check(
+        &format!(
+            "FSETID dropped: and so does a resize (got {:04o})",
+            no_fsetid.trunc_bits
+        ),
+        no_fsetid.trunc_bits == 0o0755,
+    );
+    r.check(
+        &format!(
+            "FSETID dropped: the locking mark is nobody's to take (got {:04o})",
+            no_fsetid.write_mark
+        ),
+        no_fsetid.write_mark == 0o2644,
     );
     let no_chown = own_row(&mut r, "CAP_CHOWN dropped", &[0], &whole);
     r.check(
@@ -914,7 +1017,9 @@ fn main() {
         no_chown.strip_file == 0o0755,
     );
 
-    for path in [other, mine, minegid, timesfile, bits, bitsmark, bitssuid] {
+    for path in [
+        other, mine, minegid, timesfile, bits, bitsmark, bitssuid, wbits, wmark, wtrunc,
+    ] {
         let _ = std::fs::remove_file(path);
     }
     let _ = std::fs::remove_dir_all(bitsdir);

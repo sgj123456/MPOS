@@ -385,7 +385,15 @@ explicit pair (`EPERM`). The same pass measured what a `chown` does to the two s
 found this kernel's rule wrong in the other direction: they go for **every** caller, capability or
 not — even a `chown` that names nothing at all, and even root holding the whole set — with two
 exceptions, a set-group-id that carries no group execute (a locking mark, not an authority) and a
-directory. One door of `CAP_FSETID` stays named in §5.2: a **write** to a set-uid file.
+directory. **And the same capability's third door landed with it** (`docs/uapi/` §5.1 item 41): a
+**write** to a file costs it the set-uid and set-group-id bits — a write, a `truncate`, an
+`ftruncate` and an `open`'s `O_TRUNC` alike — and `CAP_FSETID` is the only thing that spares them,
+which is the reason a set-uid program cannot be handed over by being edited in place. Measured,
+three things belong to the rule rather than to the caller: a write that writes *nothing* costs
+nothing, owning the file buys nothing (a caller writing another user's world-writable file loses the
+bits too), and a set-group-id that carries no group execute is a mandatory locking mark that no door
+takes — the clause a `chown` honours and a `chmod` does not. Two shapes stay named in §5.2:
+`fallocate`'s resize and a write through a mapping.
 
 **A child's death is one `SIGCHLD` record, and it is Linux's** (`docs/uapi/` §5.1 item 29, landed
 2026-10-17): the second book this kernel kept for "an exit whose signal is unread" is deleted — the

@@ -385,6 +385,14 @@ impl File {
         // here, so the event is said once. Kernel-internal writers that must
         // not report (the rename copy) call `Inode::write_at` directly.
         if n > 0 {
+            // Bytes moved, so the set-id bits go unless `CAP_FSETID` spares
+            // them - Linux's `file_remove_privs`, and the reason a set-uid
+            // program cannot be handed over by being edited in place. A write
+            // that wrote *nothing* costs nothing, which is why this sits inside
+            // the `n > 0`: measured on a current host
+            // (`.workbuddy/probe_suid_write.c`), a zero-length write leaves
+            // `4755` where a one-byte one stores `0755`.
+            crate::vfs::remove_privs(&self.inode);
             crate::vfs::inotify::emit_write(&self.inode);
         }
         Ok(n)

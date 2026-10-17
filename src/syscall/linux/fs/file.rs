@@ -453,7 +453,11 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
                         let _ = crate::vfs::close(fd);
                         return err_of(e);
                     }
+                    // `O_TRUNC` is a resize, and Linux's `do_open` reaches the
+                    // same `do_truncate` for it - measured, opening a `4755`
+                    // file with it stores `0755`.
                     let _ = inode.truncate(0);
+                    crate::vfs::remove_privs(&inode);
                 }
             }
             fd as isize
@@ -677,6 +681,10 @@ pub fn ftruncate(args: [usize; ARG_COUNT]) -> isize {
     }
     match file.inode().truncate(length as u64) {
         Ok(()) => {
+            // A resize is a change to the bytes, whichever way it goes - down
+            // or up - so the set-id bits go with it (`.workbuddy/probe_suid_write.c`:
+            // both directions of `ftruncate` on a `4755` file store `0755`).
+            crate::vfs::remove_privs(&file.inode());
             crate::vfs::inotify::emit(&file.inode(), crate::vfs::inotify::IN_MODIFY, "");
             0
         }
@@ -732,6 +740,9 @@ pub fn truncate(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     }
     match inode.truncate(length as u64) {
         Ok(()) => {
+            // The same door as `ftruncate`'s, reached by name rather than by
+            // descriptor: the resize costs the file its set-id bits.
+            crate::vfs::remove_privs(&inode);
             crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_MODIFY, "");
             0
         }
@@ -4429,11 +4440,11 @@ fn chown_apply(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> isize {
     // an id. The one thing that spares the set-group-id bit is the absence of
     // group execute, and the one thing that spares both is being a directory.
     if inode.keeps_modes() && inode.metadata().kind != crate::vfs::NodeKind::Dir {
+        // The two clauses are [`crate::vfs::without_set_id`]'s, which the
+        // write path asks too: the set-uid bit always, the set-group-id bit
+        // only where the group may execute.
         let mode = inode.mode();
-        let mut next = mode & !crate::vfs::S_ISUID;
-        if mode & crate::vfs::S_IXGRP != 0 {
-            next &= !crate::vfs::S_ISGID;
-        }
+        let next = crate::vfs::without_set_id(mode);
         if next != mode {
             inode.set_mode(next);
         }
