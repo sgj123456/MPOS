@@ -562,10 +562,11 @@ the commit bodies), and each moved its pin in the same commit.
     answers `..` and a jumped-to node's parent is not a fact this kernel's inodes carry); and the
     link's own metadata (`lstat`'s mode and size: Linux derives the mode from the descriptor's
     direction and reports 64 bytes, this kernel's `ProcLink` inherits the trait's `0` and its own
-    `size: 0`). A fifth thing the same pin measured is an entry of its own in §5.2, because it
-    belongs to another model rather than to this name: `chdir` through a directory's name serves —
-    the walk's half, and it was `ENOTDIR` before — but the `getcwd` after it reads back the *string*
-    the caller used where Linux canonicalises, which any symlinked `chdir` has here.
+    `size: 0`). A fifth thing the same pin measured became an entry of its own in §5.2, because it
+    belonged to another model rather than to this name: `chdir` through a directory's name serves —
+    the walk's half, and it was `ENOTDIR` before — while the `getcwd` after it read back the *string*
+    the caller used where Linux canonicalises, a divergence any symlinked `chdir` had here, which
+    item 31 has since closed.
 
 25. **The `mknod` doors answer Linux's answers, ask their questions in Linux's order, and build Linux's
     node for the type field's whole vocabulary — with `S_IFIFO` refused rather than faked.**
@@ -840,3 +841,25 @@ the commit bodies), and each moved its pin in the same commit.
     directory's `ENOTTY`. **Two kinds stay named in §5.2** from the same measurement: a *socket*
     (a `socketpair` end or a network socket) answers its queued bytes and a *tty* (pty included)
     answers `0` on Linux, neither of which this kernel answers yet.
+
+31. **`getcwd` derives the cwd's name from the directory, not from the argument `chdir` was given.**
+    §5.2 named this: this kernel's cwd was the path *string* `chdir` stored (lexically normalised,
+    no link followed), so a `chdir` through a symlink - or through a descriptor's
+    `/proc/self/fd/N` name - read back as the name the caller used, where Linux canonicalises by
+    walking the dentry chain. Measured whole on a current host first (`.workbuddy/probe_getcwd.c`,
+    Linux 7.2.9): a regular path is itself; a **symlink** at the end *or* in the middle of the
+    argument answers the target; a **descriptor's name** and a **`fchdir` through a symlinked
+    descriptor** answer the canonical path too; a `..` taken after a link that **crosses to
+    another parent** climbs from the *target's* parent, not the link's; a path with `./` and a
+    trailing `..` folds; the root answers `/`; and a cwd removed underneath the caller makes
+    `getcwd` answer `ENOENT`. **The fix is one place**: `adopt_cwd` - the single writer of the cwd
+    - now stores the name `MountTable::path_of` finds for the directory (the same bounded search
+    `/proc/mounts` uses, and the one `fchdir` used to run for itself, since deleted), falling back
+    to the caller's spelling when the tree cannot name the node. That fixed the `..`-through-a-link
+    half as well, because relative resolution reads the same string. Owner:
+    `src/syscall/linux/fs/file.rs`'s `chdir`/`fchdir`/`adopt_cwd`. Pin: `t-fd-name`'s new claims -
+    the descriptor's name after a `chdir`, a symlink, a cross-parent link, and the `..` it takes.
+    **Two consequences stay named**: the search can answer a *different* name for a directory the
+    tree reaches several ways, or `None` for a cwd deeper than its visit budget (the caller's
+    spelling is kept then); and a cwd **removed underneath the caller** is `ENOENT` on Linux, where
+    this kernel keeps no parent edge to notice the disconnect and answers the stale name.

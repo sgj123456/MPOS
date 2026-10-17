@@ -62,11 +62,12 @@
 //!     instead — `/proc/self/fd` — because the parent a jumped-to node has is
 //!     not a fact this kernel's inodes carry.
 //!   * **what `getcwd` reports afterwards.** `chdir` through the name is
-//!     claimed — it is the walk's own half — but the path read back is printed
-//!     rather than compared: Linux canonicalises it (`/tmp`), because its
-//!     `getcwd` walks the dentry chain, while this kernel's cwd is the string
-//!     `chdir` was handed. Measured here, and a property of the cwd model
-//!     rather than of a descriptor's second name.
+//!     claimed — it is the walk's own half — and the path read back is claimed
+//!     too: it canonicalises to `/tmp`, because Linux's `getcwd` walks the
+//!     dentry chain and this kernel's cwd now stores the name *derived from the
+//!     directory* rather than the argument `chdir` was handed (`adopt_cwd`). A
+//!     later section pins the shape a symlinked `chdir` has, and the `..` Linux
+//!     takes from the target's parent.
 //!
 //! # Why `rustix` beside one raw door
 //!
@@ -83,13 +84,15 @@
 //! unnamed channel) and reached the node's default `truncate` — the very test
 //! §5.1 item 22 added to `ftruncate` and not to this door, which the denotation
 //! is what made reachable; and the `getcwd` claim above, which the measurement
-//! turned into a named divergence instead of an assertion.
+//! turned into a named divergence (`docs/uapi/` §5.2) instead of an assertion —
+//! and which is an assertion again now that the cwd stores the directory's own
+//! name.
 
 use mpos_user_tests::Report;
 use rustix::fd::{AsRawFd, OwnedFd};
 use rustix::fs::{
     Access, AtFlags, CWD, FileType, Mode, OFlags, Stat, StatxFlags, Timespec, Timestamps, accessat,
-    chownat, fstat, openat, statat, statx, unlinkat, utimensat,
+    chownat, fstat, mkdirat, openat, statat, statx, unlinkat, utimensat,
 };
 use rustix::io::{Errno, read, write};
 use rustix::pipe::{PipeFlags, pipe_with};
@@ -156,6 +159,13 @@ fn procfs_root(r: &mut Report) -> Option<&'static str> {
 /// The name of a descriptor: `{root}/self/fd/{raw}`.
 fn name_of(root: &str, fd: &OwnedFd) -> String {
     format!("{root}/self/fd/{}", fd.as_raw_fd())
+}
+
+/// The cwd as a `String`, or `None` when `getcwd` itself fails.
+fn cwd_string() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
 }
 
 fn main() {
@@ -412,15 +422,11 @@ fn main() {
     //
     // The *walk* half is the claim: before the walk denoted a descriptor's
     // second name, this was `ENOTDIR`, because the name was a link and a link
-    // is not a directory to descend into. What `getcwd` then reports is
-    // *printed* rather than claimed, and the reason is a divergence this
-    // program's own run on the kernel measured: Linux canonicalises (measured
-    // on a current host, this same call answers `/tmp`), because its `getcwd`
-    // walks the dentry chain, while this kernel's cwd is the path string
-    // `chdir` was given, so it reads back the name the caller used. That is a
-    // property of the cwd model rather than of a descriptor's second name -
-    // any symlinked `chdir` has it - and it is named in `docs/uapi/` §5.2
-    // with this number.
+    // is not a directory to descend into. What `getcwd` then reports is a claim
+    // too: Linux canonicalises it (measured on a current host, this same call
+    // answers `/tmp`), because its `getcwd` walks the dentry chain, and this
+    // kernel's cwd stores the name derived from the directory rather than the
+    // `/proc/self/fd/N` spelling it was handed.
     match &dir {
         Ok(d) => {
             let dir_name = name_of(root, d);
@@ -428,13 +434,10 @@ fn main() {
                 "chdir into a directory's name succeeds",
                 rustix::process::chdir(&dir_name).is_ok(),
             );
-            match std::env::current_dir() {
-                Ok(here) => println!(
-                    "     cwd after chdir through the name: {} (Linux canonicalises to {DIR})",
-                    here.display()
-                ),
-                Err(e) => println!("     cwd after chdir through the name: unreadable ({e})"),
-            }
+            r.check(
+                &format!("getcwd after it is the directory's own name ({DIR}), not the name used"),
+                cwd_string() == Some(String::from(DIR)),
+            );
             r.check(
                 "and the directory it entered is a directory",
                 std::fs::metadata(".").ok().map(|m| m.is_dir()) == Some(true),
@@ -442,9 +445,68 @@ fn main() {
         }
         Err(_) => {
             r.check("chdir into a directory's name succeeds", false);
+            r.check(
+                &format!("getcwd after it is the directory's own name ({DIR}), not the name used"),
+                false,
+            );
             r.check("and the directory it entered is a directory", false);
         }
     }
+
+    // ---- the cwd is the *directory's* name, not the argument's -------------
+    //
+    // Linux's `getcwd` walks the dentry chain, so a `chdir` through a symlink
+    // reads back the target's canonical path, and a `..` taken afterwards climbs
+    // from the *target's* parent - not the link's. Measured whole on the host
+    // (`.workbuddy/probe_getcwd.c`, Linux 7.2.9) before any of it was made. The
+    // shapes below are the two that separate the models: a symlink at the end of
+    // the argument, and one that crosses to a *different* parent (where a cwd
+    // that kept the argument lands a later `..` in the wrong directory).
+    {
+        const REAL: &str = "/tmp/t-fd-name-real";
+        const LINK: &str = "/tmp/t-fd-name-link";
+        const CROSS: &str = "/tmp/t-fd-name-cross";
+        const CROSS_LINK: &str = "/tmp/t-fd-name-cross/x";
+        for link in [LINK, CROSS_LINK] {
+            let _ = unlinkat(CWD, link, AtFlags::empty());
+        }
+        for dir in [REAL, CROSS] {
+            let _ = unlinkat(CWD, dir, AtFlags::REMOVEDIR);
+        }
+        let made = mkdirat(CWD, REAL, Mode::from(0o755)).is_ok()
+            && mkdirat(CWD, CROSS, Mode::from(0o755)).is_ok()
+            && std::os::unix::fs::symlink(REAL, LINK).is_ok()
+            && std::os::unix::fs::symlink(REAL, CROSS_LINK).is_ok();
+        if made {
+            let _ = rustix::process::chdir(LINK);
+            r.check(
+                "chdir through a symlink reads back the target's own name",
+                cwd_string() == Some(String::from(REAL)),
+            );
+            // The link now crosses to a different parent: Linux takes `..` from
+            // `/tmp/t-fd-name-real`'s parent, `/tmp`, where a cwd that kept the
+            // argument would climb to the link's parent, `/tmp/t-fd-name-cross`.
+            let _ = rustix::process::chdir(CROSS_LINK);
+            r.check(
+                "chdir through a cross-parent link reads back the target too",
+                cwd_string() == Some(String::from(REAL)),
+            );
+            let _ = rustix::process::chdir("..");
+            r.check(
+                "and `..` then climbs from the target's parent, not the link's",
+                cwd_string() == Some(String::from("/tmp")),
+            );
+        } else {
+            r.check("the symlink fixtures are made", false);
+        }
+        for link in [LINK, CROSS_LINK] {
+            let _ = unlinkat(CWD, link, AtFlags::empty());
+        }
+        for dir in [REAL, CROSS] {
+            let _ = unlinkat(CWD, dir, AtFlags::REMOVEDIR);
+        }
+    }
+
     let _ = match &start {
         Some(dir) => rustix::process::chdir(dir.as_path()),
         None => rustix::process::chdir("/"),

@@ -109,19 +109,20 @@ Section numbers are unchanged from the original `UAPI.md`.
   `0500` — beside `st_size` 64. A listing tool that colours or filters by the link's mode reads a
   different one. Owner: `src/vfs/procfs.rs`'s `ProcLink::metadata`/`mode`.
 
-- **`getcwd` reports the path the process `chdir`'d by, where Linux canonicalises it.** Measured by
-  `t-fd-name`'s own guest run, changing into a directory through its descriptor's name: `chdir`
-  serves (`0`, the walk's half — it was `ENOTDIR` before §5.1 item 24) and the cwd then reads back
-  as the name the caller used, where the same call on the host answers the canonical `/tmp`,
-  because Linux's `getcwd` walks the dentry chain. This kernel's cwd is the path *string* `chdir`
-  stored (lexically normalised: `.`/`..` folded, no link followed) — so *any* symlinked `chdir`
-  has it, and a bind alias or a second name for one directory is one string here and one canonical
-  path there. Closing it means deriving the name from the directory instead of from the argument
-  (`MountTable::path_of`'s bounded search, the way `fchdir` already falls back to it), with the
-  two consequences that follow from that search: it can answer a *different* name for a directory
-  that has several, and it can answer `None` for a node the tree cannot name. Owner:
-  `src/syscall/linux/fs/file.rs`'s `chdir`/`adopt_cwd`. `t-fd-name` prints the path and claims only
-  that `chdir` served and that it landed in a directory.
+- **`getcwd` derives the cwd's name from the directory. Landed 2026-10-17** (`docs/uapi/` §5.1
+  item 31). This entry used to read that `getcwd` reported the path the process `chdir`'d by where
+  Linux canonicalises it, because this kernel's cwd was the path *string* `chdir` stored; the fix
+  makes `adopt_cwd` - the one writer of the cwd - store the name `MountTable::path_of` finds for
+  the directory instead of the argument, with the caller's spelling kept as the fallback for a node
+  the tree cannot name. Measured whole on a current host first (`.workbuddy/probe_getcwd.c`, Linux
+  7.2.9): a symlink at the end and in the middle of the argument answers the target, a descriptor's
+  `/proc/self/fd/N` name and a `fchdir` through a symlinked descriptor answer the canonical path,
+  and a `..` taken after a link that crosses to another parent climbs from the *target's* parent.
+  `t-fd-name` claims the descriptor-name, symlink and cross-parent shapes now. **Two consequences
+  stay named**: the search can answer a *different* name for a directory the tree reaches several
+  ways, or `None` for a cwd deeper than its visit budget; and a cwd **removed underneath the
+  caller** is `ENOENT` on Linux, where this kernel - keeping no parent edge - answers the stale
+  name. Owner: `src/syscall/linux/fs/file.rs`'s `chdir`/`fchdir`/`adopt_cwd`.
 
 - **The reported `F_GETFL` word holds the mode and the two flags, where Linux's holds more.**
   **Landed 2026-10-16** (`docs/uapi/` §5.1 item 21) for the half a caller reads to learn a

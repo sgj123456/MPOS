@@ -3754,7 +3754,20 @@ pub fn handle_pipe(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     0
 }
 
-/// `getcwd(buf, size)` — write cwd path into buffer.
+/// `getcwd(buf, size)` — write the cwd's path into the buffer.
+///
+/// The path is the one [`adopt_cwd`] derived from the directory - Linux's
+/// canonical answer - or the spelling `chdir`/`fchdir` was handed when the
+/// tree could not name the cwd ([`MountTable::path_of`]'s `None`).
+///
+/// One case the derivation does not reach, measured on the host
+/// (`.workbuddy/probe_getcwd.c`): a cwd removed underneath the caller answers
+/// `ENOENT` there, because its dentry chain no longer reaches the root, where
+/// this kernel - which keeps no parent edge to notice the disconnect from -
+/// still answers the name the directory had. Named in `docs/uapi/` §5.2 rather
+/// than faked.
+///
+/// [`MountTable::path_of`]: crate::vfs::mount::MountTable::path_of
 pub fn handle_getcwd(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (buf, size) = (args[0], args[1]);
     if !buffer_ok(buf, size, true, from_user) || size < 2 {
@@ -3782,14 +3795,14 @@ pub fn handle_fchdir(args: [usize; ARG_COUNT]) -> isize {
         return err::ENOTDIR;
     }
     let inode = file.inode();
-    // The name the description was opened by is exact; the search is only for
-    // a directory arrived at some other way - an inherited descriptor, or one
-    // opened before names were recorded at all.
-    let path = file
+    // The directory's own name is what `adopt_cwd` derives; the name the
+    // description was opened by is only the *fallback*, for a node the
+    // caller's tree cannot name - an inherited descriptor, or one opened
+    // before names were recorded at all.
+    let fallback = file
         .label()
-        .or_else(|| path_of(&inode))
         .unwrap_or_else(|| alloc::string::String::from("/"));
-    adopt_cwd(inode, path);
+    adopt_cwd(inode, fallback);
     0
 }
 
@@ -3927,63 +3940,35 @@ pub fn handle_readv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     total
 }
 
-/// Walk `/` looking for a path that reaches `target` - the fallback `fchdir`
-/// uses for a directory whose descriptor never recorded a name.
+/// Record the cwd inode + the name `getcwd` reads back.
 ///
-/// The visit budget is the real bound, not the depth: a tree search that has
-/// looked at this many directories has left the region where an answer is
-/// plausible, and a caller waiting on `fchdir` is owed one either way.
-fn path_of(target: &Arc<dyn Inode>) -> Option<alloc::string::String> {
-    use crate::vfs::NodeKind;
-
-    const MAX_DEPTH: usize = 16;
-    const MAX_VISITS: usize = 4096;
-
-    fn walk(
-        dir: &Arc<dyn Inode>,
-        prefix: &str,
-        target: &Arc<dyn Inode>,
-        depth: usize,
-        visits: &mut usize,
-    ) -> Option<alloc::string::String> {
-        if Arc::ptr_eq(dir, target) {
-            return Some(alloc::string::String::from(prefix));
-        }
-        if depth == 0 {
-            return None;
-        }
-        for (name, kind) in dir.read_dir().ok()? {
-            // `.` and `..` lead back to directories already on the path being
-            // built. Following them spends the whole depth budget on a name
-            // like `/./././etc`, which is how this search used to fail.
-            if kind != NodeKind::Dir || name == "." || name == ".." {
-                continue;
-            }
-            if *visits == 0 {
-                return None;
-            }
-            *visits -= 1;
-            let child = if prefix == "/" {
-                alloc::format!("/{name}")
-            } else {
-                alloc::format!("{prefix}/{name}")
-            };
-            if let Ok(inode) = crate::vfs::resolve(&child)
-                && let Some(found) = walk(&inode, &child, target, depth - 1, visits)
-            {
-                return Some(found);
-            }
-        }
-        None
-    }
-    let root = crate::vfs::global().root_inode();
-    let mut visits = MAX_VISITS;
-    walk(&root, "/", target, MAX_DEPTH, &mut visits)
-}
-
-/// Record the cwd inode + path together, so `getcwd` reads back the path
-/// the user wrote.
-fn adopt_cwd(dir: Arc<dyn Inode>, path: alloc::string::String) {
+/// The name is derived from the *directory*, not kept from the argument the
+/// caller spelled, because that is Linux's answer: `getcwd(2)` walks the dentry
+/// chain and reports the canonical path, so `chdir("/x/link")` through a link to
+/// `/y/real` reads back `/y/real` there - and a later `..` climbs from the
+/// target's parent, not from the link's. Measured whole on a current host
+/// (`.workbuddy/probe_getcwd.c`, Linux 7.2.9): a link at the end or in the
+/// middle of the argument, a descriptor's `/proc/self/fd/N` name, and a
+/// `fchdir` through a symlinked descriptor all canonicalise; a `..` taken after
+/// a link that crosses to another parent lands on the *target's* parent; a name
+/// with `./` and a trailing `..` folds; and a cwd removed underneath the caller
+/// makes `getcwd` answer `ENOENT` (a case this kernel still approximates, see
+/// the arm in `handle_getcwd`).
+///
+/// The search is [`MountTable::path_of`] - the bounded walk from the caller's
+/// root that `/proc/mounts` already uses - and it can answer a *different* name
+/// for a directory the tree reaches several ways, or `None` for a node the
+/// caller's tree cannot name (a cwd deeper than its visit budget, a mount's root
+/// reached from outside). `fallback` is the caller's own spelling for that case,
+/// so the answer is never worse than the string the argument named. It is also
+/// what `fchdir` used to search for itself; doing it here is the one place the
+/// cwd is written, so the two doors can no longer disagree.
+///
+/// [`MountTable::path_of`]: crate::vfs::mount::MountTable::path_of
+fn adopt_cwd(dir: Arc<dyn Inode>, fallback: alloc::string::String) {
+    let path = crate::vfs::mount::caller_table()
+        .path_of(&dir)
+        .unwrap_or(fallback);
     crate::sched::set_cwd(dir);
     crate::sched::set_cwd_path(path);
 }
