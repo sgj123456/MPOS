@@ -22,6 +22,10 @@
 //!     arrives, then releasing it the ABI's way; `open(O_RDWR)` does not park;
 //!     `O_RDONLY|O_NONBLOCK` returns at once; `O_WRONLY|O_NONBLOCK` with no
 //!     reader is **`ENXIO`**;
+//!   * an opener **killed inside that park** gives its count back: the FIFO is
+//!     left with no peer, so a later writer is `ENXIO` rather than a success off
+//!     a reader that is gone, and a later reader sees end-of-stream rather than
+//!     the `EAGAIN` a live writer owes;
 //!   * what a **reader** and a **writer** each see: end-of-stream with no
 //!     writer, `EAGAIN` with a live writer that wrote nothing, the bytes after a
 //!     write, `EPIPE` once the last reader closes;
@@ -30,15 +34,30 @@
 //!   * the **file-shaped calls**: `ftruncate` `EINVAL`, `fallocate` `ESPIPE`,
 //!     `truncate(name)` `EINVAL`, `execve` `EACCES`, `poll` reporting the queue.
 //!
-//! # One residual, named rather than hidden
+//! # The parked opener that dies, which used to be this file's named residual
 //!
-//! A **fatal** signal (`SIGKILL`) delivered while a task is parked in a FIFO's
-//! `open` ends the task inside the wait, so the read/write count that open took
-//! is never given back and the FIFO remembers a peer that never arrived. Linux
-//! rolls the count back on `ERESTARTSYS`; doing the same here wants the pending
-//! open owned by something the exit pass drops, which an `open` only becomes
-//! after it returns. `docs/uapi/` §5.2 names it. The rendezvous claims below
-//! therefore *release* every parked opener rather than killing it.
+//! A FIFO's `open` takes its read/write count *before* it parks — it has to, or
+//! the peer that arrives would not see it — so a task that dies inside the park
+//! takes a count with it, and the FIFO goes on counting a peer that never
+//! arrived. That was named rather than faked in `docs/uapi/` §5.2 when the
+//! rendezvous landed, and every claim below *released* its parked opener so as
+//! not to depend on it. It is served now, and the section that says so kills its
+//! openers. Measured on a current host before it was built
+//! (`.workbuddy/probe_fifo_park.c`, Linux 7.2.9): a reader parked in
+//! `open(O_RDONLY)` and killed inside the park leaves `open(O_WRONLY|O_NONBLOCK)`
+//! answering **`ENXIO`**, and a parked **writer**'s death leaves a reader
+//! reading **`0`** — both the answers above with no peer at all, and both what
+//! this kernel answers now. The mechanism is Linux's own: the park *ends* for a
+//! fatal signal and the death happens at the syscall gate, so the count is given
+//! back first (`docs/uapi/` §5.1 item 28).
+//!
+//! The killer there is the opener's **own `ITIMER_REAL`**, armed before the open
+//! rather than a `kill` from the parent: the open cannot return without a peer
+//! and no peer is ever opened, so the timer is the only thing that can end the
+//! park — which is what makes "it died inside the park" a measurement rather
+//! than a hope. `setitimer` is the door both machines have (`alarm(2)` has no
+//! aarch64 number), and the same program therefore claims the same thing in a
+//! sweep and on the host.
 //!
 //! # Why the raw syscall
 //!
@@ -55,6 +74,13 @@ const PATH: &str = "/tmp/t-fifo";
 
 const AT_FDCWD: libc::c_long = -100;
 const S_IFIFO: u32 = 0o010000;
+
+/// `ITIMER_REAL`, the wall-clock timer the doomed opener arms. Written here
+/// rather than named through `libc`, which defines `ITIMER_REAL` for fuchsia,
+/// hurd, aix and nto and for no `linux_like` target — the same note `t-wait-eintr`'s
+/// helper carries. `setitimer` rather than `alarm(2)`: the latter has no aarch64
+/// number, and this program claims the same thing on both machines.
+const ITIMER_REAL: libc::c_int = 0;
 
 fn c(s: &str) -> std::ffi::CString {
     std::ffi::CString::new(s).unwrap()
@@ -241,6 +267,63 @@ fn report_within(r: i32, limit_ms: i32) -> Option<[i32; 4]> {
     if n == 16 { Some(rec) } else { None }
 }
 
+/// Arm `ITIMER_REAL` to fire once, `ms` from now.
+fn arm_timer(ms: u64) -> bool {
+    // `as _` at the field rather than the field's own alias: this libc
+    // deprecates `time_t`/`suseconds_t` for a reason that is not this file's
+    // (the note `t-sa-restart`'s helper carries).
+    let next = libc::itimerval {
+        it_interval: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: libc::timeval {
+            tv_sec: (ms / 1000) as i64 as _,
+            tv_usec: ((ms % 1000) * 1000) as i64 as _,
+        },
+    };
+    let mut spent = next;
+    // SAFETY: two `itimerval`s this process owns, and the one clock named.
+    unsafe { libc::setitimer(ITIMER_REAL, &next, &mut spent) == 0 }
+}
+
+/// Fork a child that arms `ITIMER_REAL` for `ms` and then parks in a *blocking*
+/// `open(flags)`. Its report pipe carries a record only if the open **returns**,
+/// so a parent that reads nothing knows it never did — and no peer is ever
+/// opened, so the timer is the only thing that can end that park. A child the
+/// timer killed instead leaves `waitpid` a signal death.
+fn spawn_doomed_opener(flags: i32, ms: u64) -> (libc::pid_t, i32) {
+    let mut p = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+    let (r, w) = (p[0], p[1]);
+    let kid = unsafe { libc::fork() };
+    if kid == 0 {
+        unsafe { libc::close(r) };
+        // An unarmed timer would leave this child parked for ever and the
+        // parent's `waitpid` with it, which is a test that hangs rather than
+        // fails - so a timer that would not arm leaves *visibly*, and the
+        // parent's `reaped_by` reports the exit instead of the death.
+        if !arm_timer(ms) {
+            unsafe { libc::_exit(70) };
+        }
+        let (fd, e) = openat(PATH, flags);
+        let rec = [fd as i32, e, 0, 0];
+        unsafe {
+            libc::write(w, rec.as_ptr() as *const libc::c_void, 16);
+            libc::_exit(0);
+        }
+    }
+    unsafe { libc::close(w) };
+    (kid, r)
+}
+
+/// Reap `kid` and answer whether `sig` is what ended it.
+fn reaped_by(kid: libc::pid_t, sig: i32) -> bool {
+    let mut st = 0;
+    unsafe { libc::waitpid(kid, &mut st, 0) };
+    libc::WIFSIGNALED(st) && libc::WTERMSIG(st) == sig
+}
+
 fn main() {
     println!("t-fifo");
     let mut r = Report::new();
@@ -347,6 +430,85 @@ fn main() {
     );
     if rd >= 0 {
         close(rd as i32);
+    }
+    unsafe { libc::close(rep) };
+    unsafe { libc::waitpid(kid, std::ptr::null_mut(), 0) };
+
+    // ---- an opener killed inside the park gives its count back -------------
+    //
+    // The residual this file used to name, and the reason every claim above
+    // *released* its parked opener: the count an open takes before it parks is
+    // what the arriving peer sees, so a task that dies inside the park must give
+    // it back. Both scenarios start from a FIFO with no ends (the two rendezvous
+    // claims released and closed theirs) and leave one, and the third claim of
+    // each pair is the question a phantom peer would answer differently.
+    let (kid, rep) = spawn_doomed_opener(libc::O_RDONLY, 200);
+    r.check(
+        "a doomed reader's open does not return (it is parked)",
+        report_within(rep, 150).is_none(),
+    );
+    r.check(
+        "and the fatal signal ends it inside the park",
+        reaped_by(kid, libc::SIGALRM),
+    );
+    let (w, e) = openat(PATH, libc::O_WRONLY | libc::O_NONBLOCK);
+    r.check(
+        &format!("a dead parked reader counts for nothing: ENXIO (got {w}, errno {e})"),
+        w == -1 && e == libc::ENXIO,
+    );
+    unsafe { libc::close(rep) };
+
+    let (kid, rep) = spawn_doomed_opener(libc::O_WRONLY, 200);
+    r.check(
+        "a doomed writer's open does not return (it is parked)",
+        report_within(rep, 150).is_none(),
+    );
+    r.check(
+        "and the fatal signal ends it inside the park",
+        reaped_by(kid, libc::SIGALRM),
+    );
+    let (rd, e) = openat(PATH, libc::O_RDONLY | libc::O_NONBLOCK);
+    let rd = rd as i32;
+    let mut buf = [0u8; 8];
+    let (n, e2) = read_fd(rd, &mut buf);
+    r.check(
+        &format!(
+            "a dead parked writer counts for nothing: the reader reads 0 (open {rd}, errno {e}, read {n}, errno {e2})"
+        ),
+        n == 0,
+    );
+    close(rd);
+    unsafe { libc::close(rep) };
+
+    // And the counts are *zero*, not merely one short: a blocking reader parks
+    // again - a writer left behind by either death would release it at once -
+    // and the rendezvous still completes.
+    let (kid, rep) = spawn_opener(libc::O_RDONLY, true);
+    r.check(
+        "after both deaths a blocking reader parks again",
+        report_within(rep, 150).is_none(),
+    );
+    // The writer stays open until the reader's report arrives, and that order is
+    // load-bearing rather than tidy: what releases a parked reader is the *count*
+    // going up, so a writer closed before the reader was ever scheduled takes the
+    // release back with it - a park whose peer has come and gone is a park for
+    // ever. (This section's first draft did close first, and the sweep hung on
+    // it; the rendezvous claims above have the same shape for the same reason.)
+    let (w, e) = openat(PATH, libc::O_WRONLY);
+    r.check(
+        &format!("and a writer's arrival still returns (got {w}, errno {e})"),
+        w >= 0,
+    );
+    if w >= 0 {
+        write_fd(w as i32, b"z");
+    }
+    let back = report_within(rep, 1000);
+    r.check(
+        "the reader's open then returns with the byte",
+        back.as_ref().is_some_and(|rec| rec[0] >= 0 && rec[2] == 1),
+    );
+    if w >= 0 {
+        close(w as i32);
     }
     unsafe { libc::close(rep) };
     unsafe { libc::waitpid(kid, std::ptr::null_mut(), 0) };

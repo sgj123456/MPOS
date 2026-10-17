@@ -331,12 +331,13 @@ the semantics still incomplete are TCP's record-only buffer sizes
 **A FIFO is a channel now, not a file** (`mknodat(S_IFIFO)` served 2026-10-16, `docs/uapi/` §5.1
 item 26): its `open` runs Linux's **rendezvous** — a reader and a writer meet at the name, a
 peerless open parks (or is `ENXIO` under `O_NONBLOCK`), a parked reader counts as a reader so the
-arriving writer releases it, and the buffer is discarded when both counts reach zero. One shape of
-that open stays named rather than faked: a **fatal** signal while a task is parked ends the task
-*inside the wait*, so the count it took is never rolled back (Linux rolls it back on `ERESTARTSYS`)
-— `docs/uapi/` §5.1 item 26 and §5.2 name it. Still unwritten, and separate: `mknod`'s `dev`
-argument — a node made here carries no device number, because a number-to-driver table is what would
-make the number mean a device.
+arriving writer releases it, and the buffer is discarded when both counts reach zero — and the one
+shape that open used to leave behind is closed too (`docs/uapi/` §5.1 item 28, landed 2026-10-17): a
+**fatal** signal now *ends* the park instead of ending the task inside it, so the count comes back
+before the death, which happens at the syscall gate — Linux's own order, where `err_rd:` runs on
+`ERESTARTSYS` and the task dies after the syscall has unwound. Still unwritten, and separate:
+`mknod`'s `dev` argument — a node made here carries no device number, because a number-to-driver
+table is what would make the number mean a device.
 
 One of those "buffer sizes" is served now, and the *blocking* half of it was the last of it: a
 **blocking UDP send waits for the send buffer** (`docs/uapi/` §5.1 item 27, landed 2026-10-16) — the

@@ -2250,6 +2250,61 @@ pub fn block_until_interruptible(cond: impl Fn() -> bool) -> WaitEnd {
     block_until_deadline(cond, u64::MAX)
 }
 
+/// [`block_until_interruptible`] for a caller that has something to give back
+/// before the task dies.
+///
+/// The one difference between the two is what a **fatal** signal does. Every
+/// wait above takes a fatal signal as `exit`, in its loop's first line, so a
+/// blocked task dies *inside* its own park - which is right for a park that took
+/// nothing, because a woken task with nothing to undo has no use for the frame
+/// it would have woken into. A park that *took* something cannot die there: the
+/// give-back is the code after the park, and a death inside the park skips it.
+/// The FIFO's open-time rendezvous is that caller - it takes a read or write
+/// count so the peer it is waiting for can see it, and gives the count back on
+/// every way out except the one where the task is ended mid-wait — the shape
+/// that was named in `docs/uapi/` §5.2 and is served now (`docs/uapi/` §5.1 item
+/// 28; `.workbuddy/probe_fifo_park.c` is the measurement).
+///
+/// So a fatal signal **ends this wait** and is left pending, exactly as a
+/// catchable one is, and the death happens where Linux's does: the syscall gate
+/// finds the signal still pending on its way out and takes its default action
+/// (`syscall::linux::proc::deliver_signal`), which for every fatal signal is
+/// `exit(-sig)` - the same death, of the same number, one syscall frame later
+/// than before. Linux's own order, one `goto` away: `fifo_open`'s
+/// `wait_event_interruptible` returns `-ERESTARTSYS` for `SIGKILL` too, the
+/// `err_rd:` label gives the count back, and the task dies after the syscall has
+/// unwound rather than in the middle of it.
+///
+/// Nothing about the call being interrupted changes for the caller: it still
+/// reads [`WaitEnd::Interrupted`], and it is still the gate that acts on the
+/// signal - including for a *traced* task, which now gets the signal-delivery
+/// stop Linux gives it rather than dying without one.
+pub fn block_until_interruptible_rolling_back(cond: impl Fn() -> bool) -> WaitEnd {
+    loop {
+        // The condition first, and not the fatal check: Linux's own precedence.
+        // `wait_for_partner` leaves its loop when the count it watches changed
+        // even with a fatal signal pending, so the open *succeeds* and the task
+        // dies afterwards with its descriptor installed - and that path needs no
+        // rollback at all, because the last close gives the count back.
+        if cond() {
+            return WaitEnd::Condition;
+        }
+        if with_table(|t| table_has_deliverable(t)) {
+            return WaitEnd::Interrupted;
+        }
+        schedule(|t| {
+            let done = cond() || table_has_deliverable(t);
+            if done {
+                t.requeue_current();
+            } else {
+                let id = t.current;
+                let priority = t.task(id).priority;
+                t.sched.sleep(id, priority, u64::MAX);
+            }
+        });
+    }
+}
+
 pub fn pause() -> ! {
     block_until(|| false);
     unreachable!("a task blocked on `false` is only ever woken to die")

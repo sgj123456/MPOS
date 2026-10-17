@@ -5,8 +5,8 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
-- **A FIFO is served now — and the one shape its `open` leaves behind.** **Landed 2026-10-16**
-  (`docs/uapi/` §5.1 item 26). The entry this replaces said `mknodat(S_IFIFO)` was refused
+- **A FIFO is served now, parked `open` and all.** **Landed 2026-10-16** (`docs/uapi/` §5.1 item 26).
+  The entry this replaces said `mknodat(S_IFIFO)` was refused
   (`EOPNOTSUPP`) and designed the node a real one needed; the design is built. The name is a
   `S_IFIFO` node (size `0`, `nlink` 1) and its `open` runs Linux's **rendezvous**: a reader and a
   writer meet at the name, a reader with no writer and a writer with no reader both park (a parked
@@ -14,18 +14,20 @@ Section numbers are unchanged from the original `UAPI.md`.
   not park, `O_RDONLY|O_NONBLOCK` returns at once, `O_WRONLY|O_NONBLOCK` with no reader is
   **`ENXIO`**, the buffer is **discarded** when both counts reach zero, and an opened description
   reports `S_IFIFO` (and `ESPIPE`s a seek). The whole measured contract (`.workbuddy/probe_fifo.c`,
-  Linux 7.2.9) is §5.1 item 26's, and `t-fifo` (33 claims) is its pin.
+  Linux 7.2.9) is §5.1 item 26's, and `t-fifo` (42 claims) is its pin.
 
-  **One residual stays named rather than hidden**: a **fatal** signal (`SIGKILL`) delivered while a
-  task is parked in a FIFO's `open` ends the task inside the wait, so the count that open took is
-  never given back and the FIFO remembers a peer that never arrived — where Linux rolls the count
-  back on `ERESTARTSYS`. Closing it means owning the pending open by something the exit pass drops,
-  and an `open` only becomes such a thing *after* it returns (the fd table is what would own it, and
-  the fd is installed only on success) — so the rollback wants a place to hold a not-yet-installed
-  open across the park. Owner: `src/vfs/pipe.rs`'s `Channel::open` rollback path (whose
-  `Channel::rendezvous` doc carries the same note). The rendezvous claims in `t-fifo` therefore
-  *release* every parked opener — a peer arrives — rather than killing one, so the pin does not
-  depend on this residual.
+  **The one residual this entry used to carry is closed (2026-10-17, `docs/uapi/` §5.1 item 28).** It
+  said a **fatal** signal delivered while a task is parked in a FIFO's `open` ends the task inside the
+  wait, so the count that open took is never given back and the FIFO remembers a peer that never
+  arrived. It is not the count that has to be owned by something the exit pass drops, as this entry
+  first read the problem: the *wait* is what had to change, and Linux's own order is the answer —
+  the park ends for a fatal signal like it does for a catchable one, the `open` runs the give-back it
+  already had, and the death happens at the syscall gate, exactly where `fifo_open`'s `err_rd:` runs
+  on `ERESTARTSYS`. Measured on a current host first (`.workbuddy/probe_fifo_park.c`, Linux 7.2.9): a
+  parked reader killed inside the park leaves `open(O_WRONLY|O_NONBLOCK)` at **`ENXIO`**, a parked
+  writer's death leaves a reader reading **`0`**, and `t-fifo`'s killed-opener section pins both on
+  both machines — so the rendezvous claims no longer need to release their openers to stay honest,
+  though they still do, because a released opener is the claim they are about.
 
 
 - **`CAP_MKNOD` is not checked.** Linux refuses a device node to a caller without `CAP_MKNOD`

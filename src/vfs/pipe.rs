@@ -346,9 +346,12 @@ impl Channel {
             outcome => {
                 // Give the count back and answer. `Refused` is `O_WRONLY|
                 // O_NONBLOCK` with no reader (`ENXIO`); `Interrupted` is a
-                // catchable signal that ended the park, which Linux answers
-                // `EINTR` - and the count has to go back or the FIFO would
-                // remember a peer that never arrived.
+                // signal that ended the park, which Linux answers `EINTR` - and
+                // the count has to go back or the FIFO would remember a peer
+                // that never arrived. That give-back is what the rendezvous's
+                // own wait is chosen for: it runs for a *fatal* signal too, so
+                // this line is reached before the task dies rather than skipped
+                // by a death inside the park (`Channel::rendezvous`).
                 critical_section::with(|cs| {
                     let mut st = self.state.borrow(cs).borrow_mut();
                     if role.reads() {
@@ -378,17 +381,27 @@ impl Channel {
 
     /// Wait until this open's peer condition holds. [`Rendezvous::Ready`] means
     /// the open may return; `Refused` is the non-blocking writer with no reader
-    /// (`ENXIO`); `Interrupted` is a catchable signal (`EINTR`).
+    /// (`ENXIO`); `Interrupted` is a signal (`EINTR`).
     ///
     /// The signal is *not* consumed here - the syscall gate delivers it on the
-    /// way out - which is why `EINTR` is a return value rather than a death.
-    /// Naming a residual: a **fatal** signal (`SIGKILL`) while parked ends the
-    /// task inside the wait (`block_until_deadline` calls `exit`), so the count
-    /// this open took is never given back and the FIFO remembers a peer that
-    /// never arrived. Linux rolls the count back on `ERESTARTSYS`; making this
-    /// do the same wants the pending open owned by something the exit pass
-    /// drops, which the fd table only becomes after the open returns - named in
-    /// `docs/uapi/` §5.2 rather than faked.
+    /// way out - which is why `EINTR` is a return value rather than a death. The
+    /// wait is [`block_until_interruptible_rolling_back`] rather than the plain
+    /// interruptible one, and that choice is this open's whole contract: it takes
+    /// a count *before* it parks, so a death inside the park would skip the
+    /// give-back and leave the FIFO remembering a peer that never arrived. The
+    /// rolling-back wait ends for a **fatal** signal too and leaves it pending,
+    /// so the give-back runs and the death happens at the syscall gate - Linux's
+    /// own order, where `fifo_open`'s `err_rd:` label is reached because
+    /// `wait_event_interruptible` answers `-ERESTARTSYS` for `SIGKILL` as well.
+    /// Measured on a current host before it was built
+    /// (`.workbuddy/probe_fifo_park.c`, Linux 7.2.9): a reader parked in
+    /// `open(O_RDONLY)` and killed inside the park leaves `open(O_WRONLY|
+    /// O_NONBLOCK)` answering `ENXIO` (errno 6) rather than a success off a
+    /// reader that is gone, and a parked *writer*'s death leaves a reader
+    /// reading `0` (end of stream) rather than the `EAGAIN` a live writer owes.
+    ///
+    /// [`block_until_interruptible_rolling_back`]:
+    ///     crate::sched::block_until_interruptible_rolling_back
     fn rendezvous(&self, role: Role, nonblocking: bool) -> Rendezvous {
         // A reader needs a writer; a writer needs a reader; `Both` is its own
         // peer, so it needs nothing.
@@ -419,7 +432,7 @@ impl Channel {
                     st.waiting_open.push(id);
                 }
             });
-            let end = crate::sched::block_until_interruptible(ready);
+            let end = crate::sched::block_until_interruptible_rolling_back(ready);
             critical_section::with(|cs| {
                 self.state
                     .borrow(cs)

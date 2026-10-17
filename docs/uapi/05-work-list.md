@@ -660,13 +660,12 @@ the commit bodies), and each moved its pin in the same commit.
     contract, and `t-mknod`'s `S_IFIFO` section for the node — each claimed, not described, and the
     pipe's four new host tests (`a_fifo_channel_refuses_a_lonely_nonblocking_writer`,
     `a_fifo_channel_pairs_a_reader_and_a_writer`, `a_fifo_open_readwrite_is_its_own_peer`,
-    `closing_a_fifos_last_two_ends_discards_the_buffer`) hold the pure halves. **One residual is named
-    rather than hidden**: a **fatal** signal (`SIGKILL`) delivered while a task is parked in a FIFO's
-    `open` ends the task inside the wait, so the count that open took is never given back and the FIFO
-    remembers a peer that never arrived — Linux rolls the count back on `ERESTARTSYS`, and doing the
-    same here wants the pending open owned by something the exit pass drops, which an `open` only
-    becomes after it returns. `t-fifo` therefore *releases* every parked opener (a peer arrives)
-    rather than killing it, and the residual lives in `Channel::rendezvous`'s doc and §5.2.
+    `closing_a_fifos_last_two_ends_discards_the_buffer`) hold the pure halves. **One residual was
+    named rather than hidden**, and item 28 closes it: a **fatal** signal (`SIGKILL`) delivered while
+    a task is parked in a FIFO's `open` ended the task inside the wait, so the count that open took
+    was never given back and the FIFO remembered a peer that never arrived. `t-fifo`'s rendezvous
+    claims therefore *release* every parked opener (a peer arrives) rather than killing it; the
+    section item 28 added is the one that kills them, and the answer it claims is Linux's.
 
 27. **A blocking UDP send waits for the send buffer: `EAGAIN` is the non-blocking answer, and a park
     is the blocking one.** A datagram socket's send buffer is finite, so a burst outruns it, and what
@@ -724,3 +723,37 @@ the commit bodies), and each moved its pin in the same commit.
     datagram the MTU cannot carry, a link taken down — where Linux's device drops the frame and
     releases the charge, so an unbounded park here is a hang rather than a wait. The bound's worst
     case is the behaviour this pass replaced, which is what makes it safe. (c) The wraparound above.
+
+28. **A FIFO's parked `open` gives its count back when the task dies inside the park.** Item 26's
+    residual, and the last thing the rendezvous left named: the count an open takes *before* it parks
+    is what the arriving peer sees, so a task ended inside that park took a count with it and the
+    FIFO went on counting a peer that never arrived — every later writer opening into a reader that
+    was gone, every later reader reading `EAGAIN` against a writer that had died. **Measured on a
+    current host first** (`.workbuddy/probe_fifo_park.c`, Linux 7.2.9), in the one state a fixture can
+    build without a peer: an opener arms its own `ITIMER_REAL` and then parks in a *blocking* `open`,
+    so the clock is the only thing that can end the park. A reader killed there leaves
+    `open(O_WRONLY|O_NONBLOCK)` answering **`ENXIO`** (errno 6, printed) where a phantom reader would
+    have made it a success, and a parked **writer**'s death leaves a reader reading **`0`** (end of
+    stream; errno 0, printed) where a phantom writer owes `EAGAIN`; a third scenario confirms the
+    premise the whole item rests on — while the child is *parked*, `open(O_WRONLY|O_NONBLOCK)`
+    succeeds, because a parked reader counts as a reader — and a fourth that after both deaths the
+    rendezvous still pairs (writer's blocking open `3`, one byte written, the reader reads it).
+    **The fix is Linux's own order, and it is one wait rather than a new owner.**
+    `Channel::rendezvous` parks on the new [`block_until_interruptible_rolling_back`] instead of
+    `block_until_interruptible`: the two differ in exactly one thing, and it is the whole item — a
+    **fatal** signal *ends* that park and stays pending instead of ending the task inside it, so the
+    give-back `Channel::open` already runs for a catchable signal runs for `SIGKILL` too, and the
+    death happens where Linux's does, at the syscall gate, which finds the signal pending on its way
+    out and takes its default action. Linux's `fifo_open` is the same shape one `goto` away: its
+    `wait_event_interruptible` returns `-ERESTARTSYS` for a fatal signal as well, the `err_rd:` label
+    gives the count back, and the task dies after the syscall has unwound rather than in the middle of
+    it. The parked opener's *record* of itself in `waiting_open` is cleaned by the same path, since
+    the retain after the wait is now reached. Nothing about the death changes: the same number ends
+    the task, with the same exit code, and a traced task now gets the signal-delivery stop Linux gives
+    it rather than dying without one. Owner: `src/sched/runtime/task.rs`'s
+    `block_until_interruptible_rolling_back` (+ its export in `src/sched/mod.rs`) and
+    `src/vfs/pipe.rs`'s `Channel::rendezvous`. Pin: `t-fifo`'s killed-opener section (nine claims:
+    the parkedness, the death, and the FIFO's answer for each direction, plus the three that prove the
+    counts are back to zero), and the counterfactual is exact — with the park put back to
+    `block_until_interruptible`, the section's answers are the phantom peer's (`ENXIO` becomes a
+    success, `0` becomes `EAGAIN`, and the blocking reader no longer parks).
