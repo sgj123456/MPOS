@@ -54,6 +54,15 @@ type Entries = Mutex<RefCell<BTreeMap<String, (Arc<dyn Inode>, NodeKind)>>>;
 struct ProcFile {
     ino: Ino,
     generate: Generator,
+    /// The permission bits Linux gives *this* file, when they are not the
+    /// read-only default every generated file here carries. Zero means that
+    /// default, which is what every file but `/proc/<pid>/environ` reports.
+    mode: u32,
+    /// The file's own `st_size`, when the answer is known before the file is
+    /// read. Zero means the default: Linux reports no size for a file whose
+    /// contents are generated on the read, because the length is not known
+    /// until it is asked for and asking is the work.
+    size: u64,
 }
 
 impl Inode for ProcFile {
@@ -61,11 +70,23 @@ impl Inode for ProcFile {
         // Size zero, as Linux reports for the files it generates: the answer
         // is not known until it is asked for, and asking is the work. A
         // generator that ran here would run during every directory listing -
-        // and /proc/mounts' generator walks the tree, which walks /proc.
+        // and /proc/mounts' generator walks the tree, which walks /proc. The
+        // one file whose length *is* known when the tree is built says so
+        // instead: `/proc/cmdline` is the command line the machine booted
+        // with, and Linux reports its length (measured on a current host: 86
+        // bytes, the file's own content including its newline).
         Metadata {
             ino: self.ino,
             kind: NodeKind::File,
-            size: 0,
+            size: self.size,
+        }
+    }
+
+    fn mode(&self) -> u32 {
+        if self.mode == 0 {
+            PROC_RO_FILE_MODE
+        } else {
+            self.mode
         }
     }
 
@@ -102,6 +123,10 @@ impl Inode for ProcCtl {
             kind: NodeKind::File,
             size: 0,
         }
+    }
+
+    fn mode(&self) -> u32 {
+        PROC_RW_FILE_MODE
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -251,8 +276,8 @@ struct ProcDir {
     /// The children that are not in `entries` because they are not fixed.
     dynamic: Option<Arc<dyn Dynamic>>,
     /// The permission bits Linux gives *this* directory, when they are not the
-    /// kind's default. Zero means the default, which is what every proc
-    /// directory but `/proc/<pid>/fd` reports here.
+    /// tree's own (`0555`). Zero means the tree's, which is what every proc
+    /// directory but `/proc/<pid>/fd` and `/proc/<pid>/ns` reports here.
     mode: u32,
     /// Whether the directory's own size is the number of entries it lists,
     /// which is Linux's rule for `/proc/<pid>/fd` alone (`st_size` there is
@@ -265,7 +290,7 @@ impl ProcDir {
         ProcDir::own(dynamic, 0, false)
     }
 
-    /// A directory whose own metadata is Linux's rather than the kind's
+    /// A directory whose own metadata is Linux's rather than the tree's
     /// default: its permission bits, and whether its size is the number of
     /// entries it lists.
     fn own(dynamic: Option<Arc<dyn Dynamic>>, mode: u32, size_is_count: bool) -> Arc<ProcDir> {
@@ -298,7 +323,7 @@ impl Inode for ProcDir {
             // `/proc/<pid>/fd` alone (3 descriptors answer 3, 23 answer 23,
             // and a hole is a *number* rather than a span, so fds 0 and 200
             // with one more open answer 3): every other proc directory reports
-            // zero and the kind's own permission bits.
+            // zero, and the tree's own permission word rather than the kind's.
             size: if self.size_is_count {
                 self.read_dir()
                     .map(|listed| listed.len() as u64)
@@ -310,7 +335,11 @@ impl Inode for ProcDir {
     }
 
     fn mode(&self) -> u32 {
-        self.mode
+        if self.mode == 0 {
+            PROC_DIR_MODE
+        } else {
+            self.mode
+        }
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
@@ -379,6 +408,15 @@ impl Inode for MirrorDir {
         }
     }
 
+    fn mode(&self) -> u32 {
+        // A proc directory and nothing else: it reports the tree's own word,
+        // and the *name* Linux answers for this path is a different node -
+        // `/proc/self` and `/proc/thread-self` are `0777` links there, and
+        // `docs/uapi/` §5.2 carries that kind divergence rather than this half
+        // of it.
+        PROC_DIR_MODE
+    }
+
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
         (self.resolve)().ok_or(VfsError::NoEntry)?.lookup(name)
     }
@@ -404,6 +442,8 @@ fn file(generate: impl Fn() -> String + Send + Sync + 'static) -> Arc<dyn Inode>
     Arc::new(ProcFile {
         ino: next_ino(),
         generate: Box::new(move || Some(generate())),
+        mode: 0,
+        size: 0,
     })
 }
 
@@ -412,6 +452,47 @@ fn maybe_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> 
     Arc::new(ProcFile {
         ino: next_ino(),
         generate: Box::new(generate),
+        mode: 0,
+        size: 0,
+    })
+}
+
+/// The one read-only file whose own permission word is narrower than the
+/// tree's: `/proc/<pid>/environ`, which Linux makes `0400` because a process's
+/// environment can carry secrets and the file belongs to its owner.
+///
+/// A [`maybe_file`] whose word is said out loud rather than a knob on every
+/// node: the generator answers nothing for a process that has gone, exactly as
+/// its siblings' do, so this file's *shape* is ordinary and only the bits it
+/// reports are its own. Measured on a current host, beside
+/// `/proc/<pid>/cmdline`'s `0444`.
+fn env_file(generate: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn Inode> {
+    Arc::new(ProcFile {
+        ino: next_ino(),
+        generate: Box::new(generate),
+        mode: 0o400,
+        size: 0,
+    })
+}
+
+/// A file whose length is known when the tree is built rather than when it is
+/// read.
+///
+/// `/proc/cmdline` is the one node of that shape: the command line the machine
+/// booted with cannot change, so its length is a fact the node can report -
+/// and Linux reports it (a current host answers 86 for its own, which is the
+/// file's whole content including its newline). Every other generated file
+/// leaves the size at zero, because a generator that ran to measure it would
+/// run during every directory listing.
+fn file_of_size(
+    size: u64,
+    generate: impl Fn() -> String + Send + Sync + 'static,
+) -> Arc<dyn Inode> {
+    Arc::new(ProcFile {
+        ino: next_ino(),
+        generate: Box::new(move || Some(generate())),
+        mode: 0,
+        size,
     })
 }
 
@@ -867,6 +948,43 @@ fn fd_target(pid: usize, fd: usize) -> Option<String> {
 fn fd_target(_pid: usize, _fd: usize) -> Option<String> {
     None
 }
+
+/// The permission bits a proc directory reports about itself.
+///
+/// Not the kind's `0755`. Measured whole on a current host
+/// (`.workbuddy/probe_proc_node_modes.c`, Linux 7.2.9, `lstat` through
+/// `syscall(2)`, over every path this tree builds): `/proc`, `/proc/sys`,
+/// `/proc/sys/kernel`, `/proc/net`, `/proc/bus`, `/proc/bus/pci`, every
+/// `/proc/<pid>` and `/proc/<pid>/task` answer `0555` - a reader of the tree
+/// may look inside it and may not write to it, and the `w` bit is absent from
+/// all three triads. The two directories whose own word is narrower are the
+/// two named where they are built: `/proc/<pid>/fd` (`0500`) and
+/// `/proc/<pid>/ns` (`0511`).
+const PROC_DIR_MODE: u32 = 0o555;
+
+/// The permission bits a generated file that cannot be written reports.
+///
+/// Linux creates a proc file with `S_IRUGO` when it names no mode of its own,
+/// and that is most of them: measured on a current host, `/proc/version`,
+/// `/proc/meminfo`, `/proc/self/status`, `/proc/net/tcp` and
+/// `/proc/sys/kernel/random/poolsize` all answer `0444` where this kernel
+/// reported its kind's `0644`. The word follows the node's *shape* here - a
+/// file nothing can write is `0444` - which is why the handful of files Linux
+/// made writable and this kernel did not (`/proc/sys/kernel/pid_max`,
+/// `/proc/<pid>/comm`, ...) report the read-only word: the file refuses the
+/// write, and the word says so (`docs/uapi/` §5.2).
+const PROC_RO_FILE_MODE: u32 = 0o444;
+
+/// The permission bits a file that can be read *and* written reports: the
+/// sysctls, the map files, and the process's own `/proc/bus/pci/<bus>/<dev>`
+/// configuration space.
+///
+/// `0644` is Linux's word for every one of them - measured on a current host
+/// for `/proc/sys/kernel/hostname`, `/proc/sys/fs/protected_hardlinks`,
+/// `/proc/<pid>/oom_score_adj`, `/proc/<pid>/uid_map`, `/proc/net/ipv4/...`
+/// and `/proc/bus/pci/00/00.0`, each of which this kernel builds as a
+/// `ProcCtl` or a `ProcConfig`.
+const PROC_RW_FILE_MODE: u32 = 0o644;
 
 /// The size an `/proc/<pid>/fd/<N>` link reports about itself.
 ///
@@ -1471,12 +1589,9 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
         maybe_file(move || cmdline_of(tid)),
     );
     // Same file as the process's, under the thread's own name - a thread
-    // shares its process's environment, and Linux answers it here too.
-    node.add(
-        "environ",
-        NodeKind::File,
-        maybe_file(move || environ_of(tid)),
-    );
+    // shares its process's environment, and Linux answers it here too, with
+    // the same `0400`.
+    node.add("environ", NodeKind::File, env_file(move || environ_of(tid)));
     node.add("status", NodeKind::File, maybe_file(move || status_of(tid)));
     node.add(
         "children",
@@ -1773,11 +1888,12 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     );
     // The environment beside the command line, because they are one block on
     // one stack and a program that reads the second usually reads the first.
-    node.add(
-        "environ",
-        NodeKind::File,
-        maybe_file(move || environ_of(pid)),
-    );
+    //
+    // Its own permission word is `0400` rather than the read-only default
+    // (measured on a current host: `/proc/<pid>/environ` answers `0400`, and
+    // `/proc/<pid>/cmdline` beside it `0444`): an environment can carry
+    // secrets, so Linux gives this node the owner's read and nothing else.
+    node.add("environ", NodeKind::File, env_file(move || environ_of(pid)));
     node.add("status", NodeKind::File, maybe_file(move || status_of(pid)));
     // `/proc/<pid>/oom_score_adj` - the OOM-killer's score adjustment, which
     // `udevd`'s workers push down on every boot so the device database is not
@@ -1833,7 +1949,11 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     // `/proc/<pid>/ns`: one link per namespace the process is in, naming the
     // namespace the way `readlink` reports it and handing `setns` the object
     // when it is opened.
-    let namespaces = ProcDir::new(Some(Arc::new(Namespaces { pid })));
+    //
+    // `0511` rather than the tree's `0555`, which is Linux's own word for this
+    // one directory (measured on a current host): the names may be *reached*
+    // - `setns` opens one - but the directory does not list what is in it.
+    let namespaces = ProcDir::own(Some(Arc::new(Namespaces { pid })), 0o511, false);
     node.add("ns", NodeKind::Dir, namespaces);
 
     Some(node)
@@ -2089,6 +2209,13 @@ impl Inode for ProcConfig {
             kind: NodeKind::File,
             size: crate::pci::CFG_SIZE,
         }
+    }
+
+    fn mode(&self) -> u32 {
+        // Measured on a current host: `/proc/bus/pci/00/00.0` answers `0644` -
+        // the configuration space is read by anyone and written by whoever may
+        // touch the device, which is the read-write file's own word.
+        PROC_RW_FILE_MODE
     }
 
     #[cfg(all(target_os = "none", mpos_pci_config))]
@@ -2428,10 +2555,17 @@ impl ProcFs {
         );
         // The command line the machine was booted with. An initramfs's init
         // reads it to learn `root=`, which is how it knows what to mount.
+        //
+        // Its own `st_size` is that command line's length, which is Linux's
+        // answer for this one file (`/proc/<pid>/cmdline` beside it reports
+        // zero): the text cannot change after the boot, so the length is known
+        // when the tree is built rather than when the file is read.
+        let cmdline = alloc::format!("{}\n", crate::boot::cmdline());
+        let cmdline_len = cmdline.len() as u64;
         self.root.add(
             "cmdline",
             NodeKind::File,
-            file(|| alloc::format!("{}\n", crate::boot::cmdline())),
+            file_of_size(cmdline_len, move || cmdline.clone()),
         );
         self.root.add(
             "loadavg",
@@ -2515,9 +2649,11 @@ impl ProcFs {
                 |name| {
                     // On Linux this write is gated by the file's own mode
                     // (`/proc/sys/kernel/*` is 0644), and procfs here keeps no
-                    // per-node modes to enforce - so the capability the adjacent
-                    // syscall checks is checked here too, and a non-root writer
-                    // is refused by the door as well as by `sethostname(2)`.
+                    // modes to *enforce* - it reports each node's own word
+                    // (this file's is 0644, matching Linux's) but polices
+                    // nothing, so the capability the adjacent syscall checks is
+                    // checked here too, and a non-root writer is refused by the
+                    // door as well as by `sethostname(2)`.
                     // `EACCES` is Linux's answer for this door, and it is what
                     // `VfsError::Access` carries. `current_owner` is the
                     // effective id, which is the one a capability is about.
@@ -2834,6 +2970,40 @@ mod tests {
         // The two halves are bits, so the both-ways word is their union rather
         // than a third value - the shape a socketpair's end reports.
         assert_eq!(fd_link_mode(ACC_RDONLY) | fd_link_mode(ACC_WRONLY), 0o700);
+    }
+
+    /// The word a procfs node reports about itself is its own shape's, not the
+    /// kind's default, and the three nodes whose word is narrower than their
+    /// shape say so - each measured on a current host
+    /// (`.workbuddy/probe_proc_node_modes.c`).
+    #[test]
+    fn a_proc_nodes_own_mode_follows_its_shape() {
+        // A directory in the tree is `0555`, not the kind's `0755`; the two
+        // whose own word is narrower are `/proc/<pid>/fd` and
+        // `/proc/<pid>/ns`.
+        assert_eq!(ProcDir::new(None).mode(), PROC_DIR_MODE);
+        assert_eq!(ProcDir::own(None, 0o500, true).mode(), 0o500);
+        assert_eq!(ProcDir::own(None, 0o511, false).mode(), 0o511);
+        // A generated file nothing can write is `0444`; a `ProcCtl` and the
+        // configuration-space window are `0644`; and the environment is
+        // `0400`, which is the one node whose word is its own.
+        assert_eq!(file(|| String::new()).mode(), PROC_RO_FILE_MODE);
+        assert_eq!(maybe_file(|| None).mode(), PROC_RO_FILE_MODE);
+        assert_eq!(env_file(|| None).mode(), 0o400);
+        assert_eq!(
+            ctl(|| String::new(), |_| Ok(())).mode(),
+            PROC_RW_FILE_MODE,
+            "a sysctl is read-write"
+        );
+        // The size is zero for a file whose contents are generated, and the
+        // node's own where it is known before the read.
+        assert_eq!(file(|| String::new()).metadata().size, 0);
+        assert_eq!(
+            file_of_size(9, || String::from("nine byt\n"))
+                .metadata()
+                .size,
+            9
+        );
     }
 
     /// `/proc/net/tcp` is parsed by fixed column positions, so its address byte

@@ -132,15 +132,38 @@ Section numbers are unchanged from the original `UAPI.md`.
   `ProcLink::mode`/`metadata` report the link's half, `ProcDir` gained the two fields that let one
   directory answer the other, and the direction is read off the live description
   (`sched::descriptor_access`, the one record of what the open asked for), so the answer follows a
-  descriptor reopened or closed between two stats. **Two things stay named.** An `O_PATH`
-  descriptor — a flag this kernel drops, serving the open it was asked for — would report the
-  direction the open actually got where Linux reports neither bit. And every *other* proc/sys node
-  still answers the kind's default where Linux answers the node's own mode: measured, directories
-  are `0555` (`/proc/<pid>/ns` `0511`, `map_files` `0500`), read-only files `0444`, writable ones
-  `0644`, `/proc/self/mem` `0600`, and `/proc/cmdline` reports its own line's length as `st_size`
-  where this kernel reports `0` — a classification of the whole tree rather than of one link, and
-  its own owner. Owner: `src/vfs/procfs.rs`'s `ProcLink`/`ProcDir`,
+  descriptor reopened or closed between two stats. **One thing stays named** (the entry's other
+  residual — the rest of both trees — landed as its own item below): an `O_PATH` descriptor, a flag
+  this kernel drops and serves as the open it was asked for, would report the direction the open
+  actually got where Linux reports neither bit. Owner: `src/vfs/procfs.rs`'s `ProcLink`/`ProcDir`,
   `src/sched/runtime/procfs.rs`'s `descriptor_access`. Pin: `t-fd-name`.
+
+- **Every other procfs/sysfs node reports its own word. Landed 2026-10-17** (`docs/uapi/` §5.1
+  item 37) — the entry (d) above used to name this as its remaining half. Measured whole on a
+  current host first (`.workbuddy/probe_proc_node_modes.c`, Linux 7.2.9, `lstat` through
+  `syscall(2)`, over every path this kernel's two trees build): a proc directory is `0555`
+  (`/proc` itself, `/proc/sys/...`, every `/proc/<pid>`, `/proc/<pid>/task`,
+  `/proc/bus/pci/<bus>`); a generated file nothing can write is `0444` (`/proc/version`,
+  `/proc/meminfo`, `/proc/<pid>/status`, `/proc/net/tcp`); a file that *can* be written is `0644`
+  (the sysctls, `/proc/<pid>/oom_score_adj` and `uid_map`, and the live configuration space
+  `/proc/bus/pci/<bus>/<dev>.<func>`); `/proc/<pid>/environ` is `0400` where its neighbour
+  `cmdline` is `0444`; `/proc/<pid>/ns` is `0511`; and `/proc/cmdline`'s own `st_size` is the length
+  of the line it answers. In `/sys`, the tree's root is `0555` while every directory under it is the
+  kind's `0755`, a read-only attribute is `0444` (`dev`, `size`, a function's `vendor`) and the
+  attribute that can be written — a device's `uevent`, the door `udevadm trigger` writes — is
+  `0644`. **The word follows each node's *shape***, which is Linux's own rule for both trees
+  (`proc_create` with no mode means `S_IRUGO`; `DEVICE_ATTR_RO` against `DEVICE_ATTR_RW`), and three
+  consequences are named rather than hidden. First, the nodes Linux makes writable and this kernel
+  did not — `/proc/sys/kernel/pid_max`, `threads-max`, `pty/max`, `/proc/<pid>/comm` — report the
+  read-only word, because the file refuses the write and the word says so. Second, the word is a
+  *report* and not a gate: procfs keeps no modes to enforce, so an `0400` node is readable by any
+  caller exactly as its `0444` neighbours are — the mode-less filesystem's own limit, unchanged by
+  this pass. Third, three names differ in *kind* before the mode can: Linux answers `0777` links for
+  `/proc/self`, `/proc/thread-self` and `/proc/mounts`, where this kernel answers a directory (a
+  mirror of the process, and a mount table), so their word follows from the shape and stays as it
+  is. Owner: `src/vfs/procfs.rs`'s node types
+  (`ProcFile`/`ProcCtl`/`ProcDir`/`MirrorDir`/`ProcConfig`) and `src/vfs/sysfs.rs`'s
+  (`SysDir`/`SysFile`/`SysConfig`/`SysPciEvent`/`SysEventAttr`). Pin: `t-proc-modes`.
 
 - **`getcwd` derives the cwd's name from the directory. Landed 2026-10-17** (`docs/uapi/` §5.1
   item 31). This entry used to read that `getcwd` reported the path the process `chdir`'d by where
@@ -464,3 +487,19 @@ Section numbers are unchanged from the original `UAPI.md`.
   which is why the number is where it is. Owner: `src/sched/signal.rs`'s `RT_QUEUE_LEN`, named in
   its own doc. Pinned incidentally by `abi.rs`'s row-11 test, which reads the default against the
   ring.
+
+- **A mount point answers the directory it *covers*, to the no-follow door. Named 2026-10-17**
+  (`docs/uapi/` §5.1 item 37's measurement; not fixed). `resolve_no_follow` splits the last name off
+  its parent, resolves the parent, and looks the final component up *in it* — so the mount crossing
+  the walking resolver performs on every child it looks up never happens for the last component, and
+  `lstat("/proc")` answers the ramfs directory the initramfs created (measured on the payload:
+  `0755`, where the same name through the *following* door answers the mounted root's `0555` — which
+  is Linux's answer for both doors, because a mount covers its mount point and `lstat` crosses it
+  exactly as `stat` does). The doors that reach it are every `AT_SYMLINK_NOFOLLOW` stat door
+  (`lstat`, `fstatat`, `statx`) and the name-shaped mutators, which find what to operate on through
+  the same helper — and that is why this is not a two-line fix: the stat doors want the crossing,
+  while the mutators want the covered name (Linux's `rmdir` of a mount point is `EBUSY`, not the
+  removal of the mounted root), and one helper answers both questions today. `t-proc-modes` claims
+  the two mount names through the crossing door, and this entry is the measurement of the other
+  one. Owner: `src/vfs/mount.rs`'s `resolve_no_follow`/`split_last`. Pin: none yet — the two
+  behavioral halves (a crossed `lstat`, an `EBUSY` `rmdir`) are what a pin would have to claim.

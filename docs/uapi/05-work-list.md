@@ -1091,3 +1091,64 @@ the commit bodies), and each moved its pin in the same commit.
     `capable(CAP_MKNOD)`, which is the **initial** user namespace, where this kernel's checks ask the
     caller's own — measured (`.workbuddy/probe_mknod_userns.sh`), and the capability model's own named
     gap rather than this call's.
+
+37. **A procfs/sysfs node reports its own word, and it is the word its own *shape* is worth.** §5.2's
+    second and last named residual of item 24 ("every other proc/sys node still answers the kind's
+    default where Linux answers the node's own mode") — the tree was a filesystem that keeps no
+    modes, so every directory answered `0755`, every file `0644` and every link `0777`, whatever
+    Linux's creator had said about the node. **Measured whole on a current host first**
+    (`.workbuddy/probe_proc_node_modes.c`, Linux 7.2.9, `lstat` through `syscall(2)`, over every path
+    this kernel's two trees build, plus a `find`-shaped tally of both trees by kind and word):
+    a proc directory is **`0555`** — `/proc` itself, `/proc/sys/...`, `/proc/net`, `/proc/bus/pci`,
+    every `/proc/<pid>` and `/proc/<pid>/task` — with the `w` bit absent from all three triads; a
+    generated file nothing can write is **`0444`** (`/proc/version`, `/proc/meminfo`,
+    `/proc/<pid>/status`, `/proc/net/tcp`, `/proc/sys/kernel/random/poolsize`); a file that *can* be
+    written is **`0644`** (every sysctl this kernel builds — `hostname`, `protected_hardlinks`,
+    `tcp_syncookies`, the whole `conf/*` block — beside `/proc/<pid>/oom_score_adj`, `uid_map`,
+    `gid_map`, `timens_offsets` and the live configuration space `/proc/bus/pci/<bus>/<dev>.<func>`);
+    `/proc/<pid>/environ` is **`0400`** where its neighbour `cmdline` is `0444`; `/proc/<pid>/ns` is
+    **`0511`** (reachable by name, not listable — the door `setns` walks); and `/proc/cmdline`'s own
+    `st_size` is **the length of the line it answers** (86 for this host's own, its whole content
+    with the newline, where `/proc/<pid>/cmdline` beside it reports zero). In `/sys`, the tree's root
+    is **`0555`** while every directory under it is the kind's `0755` (`class`, `bus`, `devices`,
+    `dev`, `kernel`), a read-only attribute is **`0444`** (a block device's `dev`, `size` and
+    `partition`; a PCI function's `vendor`, `device`, `class`, `irq`, `modalias`, `resource`,
+    `power_state`; an input node's `name`) and the attributes that can be written — a device's
+    `uevent`, which is the door `udevadm trigger` writes, and a function's `config` — are **`0644`**.
+    **The fix is the word following the node, and it turns out to be Linux's own rule on both
+    trees**: `proc_create` with no mode means `S_IRUGO`, `DEVICE_ATTR_RO` and `DEVICE_ATTR_RW` are
+    the two sysfs words, and a directory carries what its creator asked for. So the *types* answer —
+    `ProcCtl` and `ProcConfig` `0644`, `ProcFile` `0444`, `ProcDir` and `MirrorDir` `0555`, the sysfs
+    attribute types `0444`/`0644`, and `SysDir` the kind's own unless it is the root — with the
+    nodes whose word is narrower than their shape saying it themselves: `env_file` for
+    `/proc/<pid>/environ` (`0400`, both spellings under the process's directory and the thread's),
+    `ProcDir::own(.., 0o511, false)` for `/proc/<pid>/ns`, and `file_of_size` for `/proc/cmdline`,
+    which is the one generated file whose length is known before it is read — the command line cannot
+    change after the boot — so its `st_size` is a fact rather than the generator being run during a
+    listing. **Three things are named in §5.2 rather than hidden.** The nodes Linux makes writable
+    and this kernel did not (`/proc/sys/kernel/pid_max`, `threads-max`, `pty/max`, `/proc/<pid>/comm`)
+    report the **read-only** word, because the file refuses the write and the word now says so. The
+    word is a *report* and not a gate: procfs keeps no modes to enforce, so an `0400` node is readable
+    by any caller exactly as its `0444` neighbours are — the mode-less filesystem's own limit,
+    unchanged by this pass. And three names differ in *kind* before the mode can: Linux answers `0777`
+    links for `/proc/self`, `/proc/thread-self` and `/proc/mounts`, where this kernel answers a
+    directory, so their word follows the shape they actually have. Owner: `src/vfs/procfs.rs`'s
+    `ProcFile`/`ProcCtl`/`ProcDir`/`MirrorDir`/`ProcConfig` and `src/vfs/sysfs.rs`'s
+    `SysDir`/`SysFile`/`SysConfig`/`SysPciEvent`/`SysEventAttr`. Pin: `t-proc-modes` (18 claims, the
+    same on both machines and green on this host first), plus two host unit tests for the mapping
+    itself (`a_proc_nodes_own_mode_follows_its_shape`, and sysfs's
+    `a_sysfs_node_reports_its_own_mode_rather_than_the_trees_kind_default`), and both fixtures — which
+    block device, which PCI bus — are *asked for* by walking rather than named, so the same claims
+    hold on a machine whose disks are `vda` and on one with `nvme0n1`. **The pass' own first gate run
+    found one more divergence, and it is now named in §5.2**: the two *mount names* (`/proc` and
+    `/sys` themselves) went red at `0755` — the word of the directory the mount *covers*, because
+    `resolve_no_follow` splits the last name off its parent and never crosses the mount for it, so
+    the program claims those two through the door that does cross (`stat`). Gate: x86_64 `pass=181
+    fail=0 (181 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33; the second machine's arm of the
+    same gate is `pass=180 fail=0`, `mpos-kunit 32 passed, 0 failed`. The counterfactual is exact:
+    with only the kernel half reverted (two source files) and the pin kept, the sweep is `pass=180
+    fail=1 (181 built)` with the kernel's own line unmoved — the one red program is `t-proc-modes`
+    and its twelve red claims are exactly the words this pass changed, while the six that pass on
+    both kernels are the shape guards (the sysctl `0644`, `oom_score_adj` `0644`, the
+    configuration-space window `0644`, `/sys/class` and `/sys/class/block` `0755`, and `uevent`
+    `0644`).

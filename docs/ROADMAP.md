@@ -340,6 +340,23 @@ before the death, which happens at the syscall gate — Linux's own order, where
 `mknod`'s `dev` argument — a node made here carries no device number, because a number-to-driver
 table is what would make the number mean a device.
 
+**A procfs/sysfs node reports its own word, not the kind's default** (`docs/uapi/` §5.1 item 37,
+landed 2026-10-17): both trees are filesystems that keep no modes, so every directory answered
+`0755`, every file `0644` and every link `0777` whatever Linux's creator had said about the node.
+Measured whole on a current host first, the word now follows each node's own *shape* — which turns
+out to be Linux's rule on both trees (`proc_create` with no mode means `S_IRUGO`; `DEVICE_ATTR_RO`
+against `DEVICE_ATTR_RW`): a proc directory `0555`, a file nothing can write `0444`, one that can
+`0644`, `/proc/<pid>/environ` `0400` where its neighbour `cmdline` is `0444`, `/proc/<pid>/ns`
+`0511`, the live `/proc/bus/pci/<bus>/<dev>.<func>` window `0644`, `/proc/cmdline`'s `st_size` its
+own line's length, `/sys` itself `0555` while every directory under it is `0755`, a read-only
+attribute `0444` and a writable one (`uevent`, the door `udevadm trigger` writes) `0644`. Three
+things stay named in `docs/uapi/` §5.2: the read-only nodes Linux makes writable, the fact that a
+word here is a *report* rather than a gate (procfs polices nothing), and the three names whose
+*kind* is a directory here where Linux answers a link. The same pass' measurement turned up a fourth
+divergence of its own, now named in §5.2: the no-follow resolution splits the last name off its
+parent, so the final component's mount crossing never happens and `lstat("/proc")` answers the
+directory the mount covers.
+
 **A device node asks `CAP_MKNOD` now** (`docs/uapi/` §5.1 item 36, landed 2026-10-17): exactly the
 two device types do — `S_IFREG`/`S_IFIFO`/`S_IFSOCK` nodes are served to a caller holding not one
 capability — in Linux's place in the order (after the type, the name, the name's existence `EEXIST`

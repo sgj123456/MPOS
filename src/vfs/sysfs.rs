@@ -32,19 +32,49 @@ use super::{FileSystem, Ino, Inode, Metadata, NodeKind, VfsError, VfsResult};
 use crate::pci::Device;
 use crate::uevent::{Event, Numbering};
 
+/// The permission bits a sysfs attribute reports about itself: the read-only
+/// one, and the one that can also be written.
+///
+/// Linux's own split - `DEVICE_ATTR_RO` against `DEVICE_ATTR_RW` - measured
+/// on a current host over the attributes this tree builds. `0444`: a PCI
+/// function's `vendor`, `device`, `class`, `irq`, `modalias`, `resource` and
+/// `power_state`, a block device's `dev`, `size` and `partition`, an input
+/// node's `name`, and a DRM node's `dev`. `0644`: `uevent` on either (writing
+/// it is how `udevadm trigger` re-announces a device) and the configuration
+/// space window `config`. This kernel reported its kind's default `0644` for
+/// every one of them, so each read-only attribute claimed a write it does not
+/// answer (`docs/uapi/` §5.2).
+const SYS_RO_ATTR_MODE: u32 = 0o444;
+const SYS_RW_ATTR_MODE: u32 = 0o644;
+
 /// A sysfs directory. Its entries are fixed at mount time: what the kernel
 /// has is what the kernel has, and a directory that grew one on demand would
 /// be a second device registry.
 struct SysDir {
     ino: Ino,
     entries: Mutex<RefCell<BTreeMap<String, Arc<dyn Inode>>>>,
+    /// The permission bits Linux gives *this* directory, when they are not the
+    /// kind's default (`0755`). Zero means the default, which is what every
+    /// sysfs directory but the tree's own root reports.
+    mode: u32,
 }
 
 impl SysDir {
     fn new(ino: Ino) -> Arc<SysDir> {
+        SysDir::own(ino, 0)
+    }
+
+    /// A directory whose own word is Linux's rather than the kind's default.
+    ///
+    /// Measured on a current host, `/sys` itself is `0555` while every
+    /// directory under it - `/sys/class`, `/sys/bus`, `/sys/devices`,
+    /// `/sys/kernel`, `/sys/dev` - is the `0755` of the kind, so this
+    /// constructor has exactly one caller.
+    fn own(ino: Ino, mode: u32) -> Arc<SysDir> {
         Arc::new(SysDir {
             ino,
             entries: Mutex::new(RefCell::new(BTreeMap::new())),
+            mode,
         })
     }
 
@@ -78,6 +108,10 @@ impl Inode for SysDir {
             kind: NodeKind::Dir,
             size: 0,
         }
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
@@ -115,6 +149,10 @@ impl Inode for SysFile {
             kind: NodeKind::File,
             size: self.content.len() as u64,
         }
+    }
+
+    fn mode(&self) -> u32 {
+        SYS_RO_ATTR_MODE
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -179,6 +217,10 @@ impl Inode for SysConfig {
         }
     }
 
+    fn mode(&self) -> u32 {
+        SYS_RW_ATTR_MODE
+    }
+
     #[cfg(all(target_os = "none", mpos_pci_config))]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         Ok(crate::drivers::pci::config_read(
@@ -220,6 +262,10 @@ impl Inode for SysPciEvent {
             kind: NodeKind::File,
             size: self.keys.len() as u64,
         }
+    }
+
+    fn mode(&self) -> u32 {
+        SYS_RW_ATTR_MODE
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -278,6 +324,10 @@ impl Inode for SysEventAttr {
             // the work: report zero, as Linux does for generated attributes.
             size: 0,
         }
+    }
+
+    fn mode(&self) -> u32 {
+        SYS_RW_ATTR_MODE
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
@@ -366,7 +416,10 @@ impl SysFs {
     /// a host test can put a machine of its own choosing behind it.
     pub fn with(numbering: Numbering, pci_devices: Vec<Device>) -> Arc<SysFs> {
         let fs = Arc::new(SysFs {
-            root: SysDir::new(0),
+            // The tree's own root, and the one sysfs directory Linux does not
+            // leave at the kind's `0755`: measured on a current host, `/sys`
+            // is `0555` while every directory under it is `0755`.
+            root: SysDir::own(0, 0o555),
         });
 
         // `/bus` and `/class` are the two places a listener walks to find the
@@ -1332,6 +1385,30 @@ mod tests {
 
     fn block_dir(fs: &Arc<SysFs>) -> Arc<dyn Inode> {
         fs.root().lookup("class").unwrap().lookup("block").unwrap()
+    }
+
+    #[test]
+    fn a_sysfs_node_reports_its_own_mode_rather_than_the_trees_kind_default() {
+        // Measured on a current host (`.workbuddy/probe_proc_node_modes.c`):
+        // `/sys` is `0555` while every directory under it is `0755`, a
+        // read-only attribute is `0444`, and the two attributes that can be
+        // written - a device's `uevent` and a function's `config` - are `0644`.
+        let fs = fs();
+        assert_eq!(fs.root().mode(), 0o555, "the tree's own root");
+        // A directory under it leaves the word to its kind: zero is "the kind's
+        // default", which the stat door renders as the directory's `0755`.
+        assert_eq!(fs.root().lookup("class").unwrap().mode(), 0);
+        let disk = resolve(&fs, "/sys/class/block/vda");
+        assert_eq!(disk.lookup("dev").unwrap().mode(), SYS_RO_ATTR_MODE);
+        assert_eq!(disk.lookup("size").unwrap().mode(), SYS_RO_ATTR_MODE);
+        assert_eq!(disk.lookup("uevent").unwrap().mode(), SYS_RW_ATTR_MODE);
+        // A partition's entry carries the same three, reached through its own
+        // directory under the disk.
+        let partition = resolve(&fs, "/sys/class/block/vda1");
+        assert_eq!(
+            partition.lookup("partition").unwrap().mode(),
+            SYS_RO_ATTR_MODE
+        );
     }
 
     #[test]
