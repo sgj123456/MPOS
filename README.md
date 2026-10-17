@@ -256,10 +256,9 @@ that seam (the switchboard itself is unchanged). `docs/notes/` Phase 11 (Step B)
 driver its own contract back.
 
 Deliberate divergences from Linux are collected per subsystem in `docs/notes/` — for example
-the unsized pty window answers `25x80` where Linux answers `0x0`, `SO_SNDBUF`/`SO_RCVBUF` are
-recorded but do not resize the stack's buffers, real `MSG_PEEK` over TCP/UDP is refused
-`EOPNOTSUPP`, and the `xattr` family validates and then refuses. They are recorded there rather
-than hidden here.
+`SO_SNDBUF`/`SO_RCVBUF` are recorded but do not resize the stack's buffers, real `MSG_PEEK`
+over TCP/UDP is refused `EOPNOTSUPP`, and the `xattr` family validates and then refuses. They
+are recorded there rather than hidden here.
 
 ---
 

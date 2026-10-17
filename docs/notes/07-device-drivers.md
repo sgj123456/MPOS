@@ -155,7 +155,8 @@ same thing as a boot that merely keeps its log on the serial wire (§7.1c).
 where the kernel *cannot* know the size: a terminal emulator in userspace - one
 inside weston, say - opens a `/dev/ptmx` pair and names its window, and the
 program it runs reads that back on the slave. So a pty keeps a window of its own
-(25x80 until an emulator says otherwise) and reports it, while the console
+(0x0 until an emulator says otherwise — Linux's own answer for an unsized pair,
+`t-pty`) and reports it, while the console
 stores a set size and goes on answering its screen - the screen is what is being
 painted, and a number that disagreed with it would be the same lie the
 corner-drawing bug came from. A *change* raises `SIGWINCH` to the foreground

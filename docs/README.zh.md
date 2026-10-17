@@ -247,9 +247,9 @@ graph LR
 `fs.rs` 中解析，这正是该文件有 6300 行的原因。`docs/notes/` Phase 11（Step B）就是把这些契约
 交还给各自驱动的计划。
 
-与 Linux 有意为之的分歧按子系统收集在 `docs/notes/` 中——例如未设定尺寸的 pty 窗口回答
-`25x80` 而 Linux 回答 `0x0`，`SO_SNDBUF`/`SO_RCVBUF` 会被记录但不会调整协议栈缓冲区的大小，
-TCP/UDP 上的真实 `MSG_PEEK` 被以 `EOPNOTSUPP` 拒绝，`xattr` 族先校验再拒绝。
+与 Linux 有意为之的分歧按子系统收集在 `docs/notes/` 中——例如 `SO_SNDBUF`/`SO_RCVBUF`
+会被记录但不会调整协议栈缓冲区的大小，TCP/UDP 上的真实 `MSG_PEEK` 被以 `EOPNOTSUPP` 拒绝，
+`xattr` 族先校验再拒绝。
 它们记录在那里，而不是藏在这里。
 
 ---

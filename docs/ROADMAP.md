@@ -326,7 +326,7 @@ The full inventory — grouped by what they block, with each refusal's reason �
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:
 `fanotify`/`keyctl`/`userfaultfd`/rseq side-objects stay `ENOSYS`; xattrs validate then `EOPNOTSUPP`;
 the semantics still incomplete are TCP's record-only buffer sizes
-(`SO_SNDBUF`/`SO_RCVBUF`), MNT/PID/NET isolation, and the unsized-pty window divergence.
+(`SO_SNDBUF`/`SO_RCVBUF`) and MNT/PID/NET isolation.
 
 **A FIFO is a channel now, not a file** (`mknodat(S_IFIFO)` served 2026-10-16, `docs/uapi/` §5.1
 item 26): its `open` runs Linux's **rendezvous** — a reader and a writer meet at the name, a
