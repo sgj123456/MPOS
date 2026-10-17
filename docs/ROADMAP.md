@@ -314,7 +314,8 @@ In the order that keeps each step verifiable on its own:
 Two machines boot the same flow to a real Alpine userland; the ABI answers Linux's shape across
 syscalls, signals, filesystems, networking, memory, devices and security, with the honest refusals
 named. What is true today — counts, measurements, gates — is in [`notes/`](notes/index.md); this
-section states direction only: the frontier is namespaces (PID/NET), the second compositor family
+section states direction only: the frontier is the two namespace kinds with no entry left (IPC and
+cgroup), the second compositor family
 (3D/virgl verification and the weston write fault), the block layer's completion path, and closing
 the remaining ABI gaps below.
 
@@ -326,7 +327,7 @@ The full inventory — grouped by what they block, with each refusal's reason �
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:
 `fanotify`/`keyctl`/`userfaultfd`/rseq side-objects stay `ENOSYS`; xattrs validate then `EOPNOTSUPP`;
 the semantics still incomplete are TCP's record-only buffer sizes
-(`SO_SNDBUF`/`SO_RCVBUF`) and MNT/PID/NET isolation.
+(`SO_SNDBUF`/`SO_RCVBUF`); the two namespace kinds with no entry at all are IPC and cgroup.
 
 **A FIFO is a channel now, not a file** (`mknodat(S_IFIFO)` served 2026-10-16, `docs/uapi/` §5.1
 item 26): its `open` runs Linux's **rendezvous** — a reader and a writer meet at the name, a
