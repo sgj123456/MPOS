@@ -418,3 +418,16 @@ Section numbers are unchanged from the original `UAPI.md`.
   `src/syscall/linux/proc.rs`'s `handle_waitid`. Measured: `.workbuddy/probe_wait4_rusage.c`
   scenarios O (a bad `rusage` leaves the `siginfo_t` untouched, `0xAAAAAAAA`) and the same probe's
   ordering finding for `wait4`'s `*status`.
+
+- **A raised `RLIMIT_SIGPENDING` buys no room past the ring.** **Landed 2026-10-17** (`docs/uapi/`
+  §5.1 item 35): the queue's bound is the resource now, in Linux's shape — the target user's total
+  against the target's `RLIMIT_SIGPENDING`, with `sigqueue` answering `EAGAIN` and `kill` dropping
+  the copy. The one corner the storage leaves: the records live in a fixed per-task ring of
+  `RT_QUEUE_LEN` (16), so the resource's **default** is 16 rather than Linux's `max_threads / 2`,
+  and a caller that *raises* the limit (root may raise the hard one) still meets the ring — it gets
+  `EAGAIN` at 16 anyway, which is honest about what this machine can hold but is not Linux's count.
+  It is a corner rather than a hole because nothing is lost silently and the refusal is a signal a
+  caller can see; growing the ring is bounded memory per task (the worst-case rule, `AGENTS.md` §4),
+  which is why the number is where it is. Owner: `src/sched/signal.rs`'s `RT_QUEUE_LEN`, named in
+  its own doc. Pinned incidentally by `abi.rs`'s row-11 test, which reads the default against the
+  ring.

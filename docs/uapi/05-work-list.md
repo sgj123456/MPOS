@@ -1004,3 +1004,49 @@ the commit bodies), and each moved its pin in the same commit.
     delta, the counters, the `EFAULT`, the stop and the resume in `t-wait4`; the exit fill in
     `t-waitid`), while the shape guards — the `WNOHANG` no-report half, the stop/resume records, and
     `waitid`'s report — pass on both kernels.
+
+35. **A full real-time signal queue is `EAGAIN` from `sigqueue`, and the limit is `RLIMIT_SIGPENDING`.**
+    Stage C's last named divergence, and the one that lost data rather than merely reporting oddly:
+    the per-task ring dropped a copy past `RT_QUEUE_LEN` and every door answered **success**, so a
+    caller's queued signal was gone with nothing to tell it (the §3 rule-2 shape — silence where
+    Linux has an errno). **Measured whole on a current host first**
+    (`.workbuddy/probe_sigpending{1,5,7,8,9,10}.c`, Linux 7.2), one scenario per process so no
+    scenario's quota leaked into the next: with `RLIMIT_SIGPENDING`'s soft limit at N, exactly N
+    `sigqueue`s of one real-time number are taken and the **N+1th is `EAGAIN`** (N=8 and N=4, at
+    errno 11); the quantity is the **user's total** — filling one number to the limit refuses a
+    *different* number, and a same-uid child that queued nothing is refused while the parent holds
+    the quota (the same child queues its own N again once the parent drains); the limit that governs
+    is the **target's**, not the sender's (a sender lowered to 1 still delivered to a target whose
+    limit was 4, while a send to *itself* was refused); a standard signal is never refused
+    (`sigqueue(SIGUSR1)` succeeds at the limit and the bit is pending); and **`kill` never reports**
+    — at the same moment it returns 0 and its extra copies are simply not queued. **The fix is one
+    enum at the send door and one resource row.** `send_signal_info` now answers Linux's `Sent`
+    (`Taken`/`NoTask`/`QueueFull`) instead of a bool, `enqueue` answers whether the ring took the
+    copy, and the budget is decided before the mutable borrow because the count walks the table:
+    `queued_for_user(ruid)` sums `RtQueue::queued()` over every task of the **target's** real uid,
+    compared against the **target's** `rlimits[RLIMIT_SIGPENDING]`, after the "discarded anyway"
+    rules (an ignored signal needs no slot — Linux's `prepare_signal` discards before the allocation
+    that can fail). `rt_sigqueueinfo` maps `QueueFull` to `EAGAIN`; `kill`/`tgkill` and both
+    group/process fan-outs keep answering 0, which is the measured split. The resource row gets a
+    budget in `mpos_abi::default_rlimits`: row 11, `RT_QUEUE_LEN` both ways, because the records
+    live in that ring — so `getrlimit` tells a caller the truth about this machine, and Linux's own
+    default (`max_threads / 2`) is policy rather than ABI. Owner: `crates/abi`
+    (`RLIMIT_SIGPENDING`, the default), `src/sched/runtime/child_signal.rs` (`Sent`, the budget
+    check, `queued_for_user`), `src/sched/signal.rs` (`RtQueue::queued`), `src/syscall/linux/posix.rs`
+    (the door's `EAGAIN`). Pin: `t-rt-signal-queue` — the fill stopping at the lowered limit, the
+    copy past it `EAGAIN`, a second RT number meeting the same total, `kill` answering 0 at the same
+    moment, a forked sibling with an empty queue refused too, and the soft limit restored — plus
+    `abi.rs`'s `rlimits_report_the_startup_defaults_and_refuse_unknown_rows`, which reads row 11
+    against `RT_QUEUE_LEN` itself, and `mpos_abi`'s default-table test. Note the pin lowers only the
+    **soft** limit: the hard one cannot be raised back without privilege even on this host, so a
+    claim that needed that would not be the program's to make. `t-rt-signal-queue`'s earlier three
+    sections are what empty the queue first (their own drain claims are the evidence), which is why
+    the fill meets the limit exactly. Gate: `pass=180 fail=0 (180 built)`, `mpos-kunit 32 passed, 0
+    failed`, exit 33 (aarch64, which these `[default]`-group pins also run under: `pass=179 fail=0`,
+    `mpos-kunit 32 passed, 0 failed`). The counterfactual is exact: with only the kernel half
+    reverted (the six source files) and the pin kept, the sweep is `pass=179 fail=1 (180 built)` with
+    the kernel's `mpos-kunit` line unmoved — the red program is `t-rt-signal-queue`, and the four red
+    claims are all new (the fill's stop, its `EAGAIN`, the second number, the sibling), while every
+    shape guard (the FIFO drain, the two kills, the handler-per-copy, `kill`'s 0, the setrlimit and
+    its restore) passes on both kernels. The one corner left standing — a caller that raises the
+    limit past the ring still meets the ring — is named in §5.2.

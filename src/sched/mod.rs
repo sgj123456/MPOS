@@ -38,8 +38,8 @@ pub use runtime::spawn_init;
 pub use runtime::{
     CloneRequest, INIT_PID, ITIMER_PROF, ITIMER_REAL, ITIMER_VIRTUAL, Identity, ItimerSnapshot,
     ItimerState, MAX_TASKS, MapFacts, Redirect, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD_ID,
-    STACK_ORDER, SpawnError, Stop, TIMER_ABSTIME, TaskSnapshot, TimerNotify, WaitEnd, WaitEvent,
-    WaitFor, WaitPark, acquire_controlling_tty, adopt_pid, arm_diskstat_boot_namespace,
+    STACK_ORDER, Sent, SpawnError, Stop, TIMER_ABSTIME, TaskSnapshot, TimerNotify, WaitEnd,
+    WaitEvent, WaitFor, WaitPark, acquire_controlling_tty, adopt_pid, arm_diskstat_boot_namespace,
     become_session_leader, block_until, block_until_child_event, block_until_code,
     block_until_deadline, block_until_interruptible, block_until_interruptible_rolling_back, brk,
     charge_cpu, check_itimer, child_event, child_event_pending, claim_anon_gaps, clone,

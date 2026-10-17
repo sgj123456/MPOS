@@ -62,12 +62,31 @@ real-time signals are **queued** — a per-task bounded FIFO ring carries every 
 of `SIGRTMIN..=SIGRTMAX` in order with its own `si_value`, whether raised by
 `sigqueue` or `kill`, while standard `1..=31` still coalesce. This closes the
 "`rt_sigaction` answers `EINVAL` for `32..=64`" and "`33..=64` have no queueable
-number" gaps. One bounded divergence remains and is named, not hidden: the ring is
-fixed-length per task, so a flood beyond `RT_QUEUE_LEN` drops the extra copy
-silently, where Linux's limit is a per-user `RLIMIT_SIGPENDING` and a full
-`sigqueue` returns `EAGAIN`. Pinned by `t-rt-signal-queue` (three `sigqueue`s
-drained FIFO with distinct values, two `kill`s yielding two copies, a handler run
-once per queued copy) and the `RtQueue` host unit tests.
+number" gaps.
+
+*The queue's bound — landed 2026-10-17:* the last named divergence above (the
+silent drop) is closed, in Linux's shape. The quantity is the **target user's**
+queued total — across that user's tasks and across signal numbers — and the limit
+is the **target's** `RLIMIT_SIGPENDING`; `sigqueue`/`rt_sigqueueinfo` answer
+`EAGAIN` at it, while `kill`/`tgkill` drop the copy and still answer 0. Measured
+on Linux 7.2 before it was built (`.workbuddy/probe_sigpending{1,5,7,9,10}.c`):
+with the soft limit at N, N `sigqueue`s of one number are taken and the N+1th is
+`EAGAIN`; a *second* RT number meets the same total; a same-uid sibling that
+queued nothing is refused while the filler holds the quota; a sender whose own
+limit is 1 still delivers to a target whose limit is 4; a standard signal is
+never refused (a second copy coalesces instead of allocating); and `kill` at the
+same moment returns 0. The storage is still the per-task ring, so the resource's
+*default* is the ring's size (`RT_QUEUE_LEN`) rather than Linux's policy value
+(`max_threads / 2`, ~125k), and a caller that raises the limit past the ring buys
+no more room — the one bounded corner left, named where the ring lives.
+
+Pinned by `t-rt-signal-queue` (three `sigqueue`s drained FIFO with distinct
+values, two `kill`s yielding two copies, a handler run once per queued copy, and
+the bound's own claims: the fill stops at the limit, the copy past it is
+`EAGAIN`, a second number meets the same total, a sibling is refused, `kill` is
+not) and the `RtQueue` host unit tests. The resource's row is pinned by
+`abi.rs`'s `rlimits_report_the_startup_defaults_and_refuse_unknown_rows`, which
+reads the default against `RT_QUEUE_LEN` itself.
 
 ### 2.4 Verification
 

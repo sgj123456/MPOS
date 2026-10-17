@@ -16,10 +16,22 @@
 //!   * a handler installed on an RT number runs once per queued copy, each time
 //!     reading its own `si_value` (the `take_deliverable_siginfo` path).
 //!
-//! Every one of the three is *queued* rather than delivered, which is what makes
-//! the queue observable: the RT numbers are blocked for the whole first half, so
-//! each send lands in the pending record, and the second half unblocks the one
-//! number whose three copies must reach the handler in turn.
+//! A fourth pins where the queue *stops*: the bound is the target user's
+//! `RLIMIT_SIGPENDING`, and `sigqueue` is the door that reports `EAGAIN` at it.
+//! Measured on Linux 7.2 (`.workbuddy/probe_sigpending{1,7,9,10}.c`) before it
+//! was written: with the soft limit at N, N `sigqueue`s are taken and the N+1th
+//! is `EAGAIN`; the quantity is the **user's** total (a sibling process of the
+//! same uid that queued nothing is refused while this one holds the quota, and
+//! so is a *different* RT number); the limit that governs is the **target's**,
+//! not the sender's; and a standard signal is never refused, because a second
+//! copy of it coalesces instead of allocating. `kill` at the same moment still
+//! answers 0 — it drops the copy rather than reporting it, which is why only
+//! `sigqueue` is asked about the refusal below.
+//!
+//! Every one of the first three is *queued* rather than delivered, which is what
+//! makes the queue observable: the RT numbers are blocked for the whole first
+//! half, so each send lands in the pending record, and the second half unblocks
+//! the one number whose three copies must reach the handler in turn.
 //!
 //! # The door
 //!
@@ -48,6 +60,8 @@ const RTMIN: i32 = 32;
 const SIG_A: i32 = RTMIN + 3; // 35: the sigtimedwait FIFO
 const SIG_B: i32 = RTMIN + 4; // 36: the two kills
 const SIG_C: i32 = RTMIN + 5; // 37: the handler's three copies
+const SIG_D: i32 = RTMIN + 6; // 38: the queue the bound fills
+const SIG_E: i32 = RTMIN + 7; // 39: the *second* number, refused by the same total
 
 /// Handler path: how many copies arrived, and the sum of their `si_value`s.
 /// Two distinct copies of the same number summing to `0x101+0x102+0x103` is the
@@ -102,6 +116,43 @@ fn queue(sig: i32, value: u64) {
     // SAFETY: signalling this process, which has nothing to lose by it.
     let rc = unsafe { libc::sigqueue(libc::getpid(), sig, val) };
     assert!(rc == 0, "sigqueue of {sig} failed");
+}
+
+/// The same send, answering the errno instead of asserting it — what the bound
+/// is asked about.
+fn try_queue(sig: i32, value: u64) -> i32 {
+    let val = libc::sigval {
+        sival_ptr: value as usize as *mut libc::c_void,
+    };
+    // SAFETY: signalling this process.
+    let rc = unsafe { libc::sigqueue(libc::getpid(), sig, val) };
+    if rc == 0 {
+        0
+    } else {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+}
+
+/// The standing `RLIMIT_SIGPENDING` pair as `(soft, hard)`.
+fn sigpending_limit() -> (u64, u64) {
+    let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: `rl` is a record this process owns.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_SIGPENDING, &mut rl) };
+    assert!(rc == 0, "getrlimit(RLIMIT_SIGPENDING) failed");
+    (rl.rlim_cur as u64, rl.rlim_max as u64)
+}
+
+/// Lower the *soft* limit, leaving the hard one where it is: raising the hard
+/// one back is root's alone even here, so a claim that had to do that would not
+/// be this program's to make.
+fn set_sigpending_soft(cur: u64) -> bool {
+    let (_, max) = sigpending_limit();
+    let rl = libc::rlimit {
+        rlim_cur: cur as libc::rlim_t,
+        rlim_max: max as libc::rlim_t,
+    };
+    // SAFETY: `rl` is this process's own word, and `cur <= max`.
+    unsafe { libc::setrlimit(libc::RLIMIT_SIGPENDING, &rl) == 0 }
 }
 
 /// A zero timeout: "look once", which is the shape a drain wants.
@@ -211,6 +262,74 @@ fn main() {
         "and read all three distinct payloads (sum)",
         SUM.load(Ordering::Relaxed) as isize == 0x101 + 0x102 + 0x103,
     );
+
+    // --- 4. the queue's bound is the target user's RLIMIT_SIGPENDING ---
+    //
+    // The three sections above drained what they queued (the "no fourth copy",
+    // "seen == 2" and handler-count claims are that drain), so the user's queued
+    // total is zero here and the fill below meets the limit exactly.
+    block(SIG_D);
+    block(SIG_E);
+    const BOUND: u64 = 4;
+    r.check(
+        "lowering RLIMIT_SIGPENDING's soft limit is served",
+        set_sigpending_soft(BOUND),
+    );
+    let mut taken = 0u64;
+    while taken < 64 && try_queue(SIG_D, 0x200 + taken) == 0 {
+        taken += 1;
+    }
+    r.check(
+        "the limit is where sigqueue stops taking real-time copies",
+        taken == BOUND,
+    );
+    r.check(
+        "and the copy past it is EAGAIN",
+        try_queue(SIG_D, 0x999) == libc::EAGAIN,
+    );
+    // The quantity is the *user's* total, not one number's: a different real-time
+    // number meets the same wall with nothing queued of its own.
+    r.check(
+        "a second RT number meets the same total (EAGAIN, none of its own queued)",
+        try_queue(SIG_E, 0x998) == libc::EAGAIN,
+    );
+    // The door that does not report: `kill` drops the copy and still says 0.
+    let killed = unsafe { libc::kill(libc::getpid(), SIG_D) };
+    r.check(
+        "kill at the same moment answers 0 (it drops the copy, not reports it)",
+        killed == 0,
+    );
+    // And the count is the user's across *tasks*: the child forks with an empty
+    // queue of its own (fork clears pending signals), so a per-task bound would
+    // take this copy and a per-user one refuses it.
+    let kid = unsafe { libc::fork() };
+    if kid == 0 {
+        let code = if try_queue(SIG_E, 0x997) == libc::EAGAIN {
+            7
+        } else {
+            9
+        };
+        // SAFETY: the child is a fork of this program with nothing left to do;
+        // `_exit` runs no destructor that could touch the parent's state.
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0;
+    // SAFETY: `kid` is the child just forked, and `status` is this frame's.
+    unsafe { libc::waitpid(kid, &mut status, 0) };
+    r.check(
+        "a sibling of the same user, with an empty queue, is refused too",
+        status == 7 << 8,
+    );
+    // Leave the process as it was found: the soft limit goes back up to the
+    // standing hard one, and the copies below are drained rather than delivered.
+    r.check(
+        "the soft limit goes back to where it stood",
+        set_sigpending_soft(sigpending_limit().1),
+    );
+    for sig in [SIG_D, SIG_E] {
+        let set = set_of(&[sig]);
+        while take(&set).0 != -1 {}
+    }
 
     r.finish()
 }

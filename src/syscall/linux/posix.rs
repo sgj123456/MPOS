@@ -1465,6 +1465,11 @@ pub fn handle_tgkill(args: [usize; ARG_COUNT]) -> isize {
 /// and sending that to somebody else is EPERM. An `SI_QUEUE` record carries
 /// its payload's `si_value` word to the target's handler; any other code
 /// arrives as the kernel's own SI_USER record.
+///
+/// It is also the door that reports a full queue: when the target's user holds
+/// `RLIMIT_SIGPENDING` real-time records already, this is `EAGAIN` where
+/// `kill` would drop the copy and answer 0. The same signal is *delivered* by
+/// both doors — what differs is only whether the caller hears that it was not.
 pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     const SIGINFO_BYTES: usize = 128;
     let (tgid, sig, uinfo) = (args[0] as isize, args[1], args[2]);
@@ -1498,10 +1503,14 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     } else {
         crate::sched::signal::SigInfo::user(sig as u8, pid, uid)
     };
-    if crate::sched::send_signal_info(target, sig as u8, info) {
-        0
-    } else {
-        err::ESRCH
+    match crate::sched::send_signal_info(target, sig as u8, info) {
+        crate::sched::Sent::NoTask => err::ESRCH,
+        // Linux's `send_sigqueue` answer when the target's queued-signal
+        // budget (`RLIMIT_SIGPENDING`) is full. This is the door that reports
+        // it; `kill`/`tgkill` drop the copy and answer 0 (measured,
+        // `.workbuddy/probe_sigpending.c`).
+        crate::sched::Sent::QueueFull => err::EAGAIN,
+        crate::sched::Sent::Taken => 0,
     }
 }
 

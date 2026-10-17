@@ -81,7 +81,7 @@ rather than returning constants:
 - `/proc/<pid>/limits` renders the table in the `ulimit` layout.
 - The pure rule + defaults are host-tested (`setrlimit_admits_by_privilege`).
 
-*Both remaining resources are now enforced:*
+*Three of the resources are enforced, beyond the pair above:*
 - **`RLIMIT_NOFILE`**: the descriptor table carries the soft ceiling (seeded 1024,
   synced from `setrlimit(7)` - 7 is `asm-generic/resource.h`'s number, and this
   said 5 until §15.13, which is `RLIMIT_RSS`'s; copied on fork);
@@ -93,6 +93,15 @@ rather than returning constants:
 - **`RLIMIT_STACK`**: `resolve_stack_growth` reads the faulting task's soft limit
   as the stack floor (SIGSEGV beyond it; capped at the reserved region for a
   raised/infinite one).
+- **`RLIMIT_SIGPENDING`** (11, landed 2026-10-17, `docs/uapi/` §5.1 item 35): the
+  queued real-time records a **user** may hold, counted by the scheduler's send
+  path over every task of the *target's* real uid, against the *target's* soft
+  limit - Linux's own shape, measured (`send_signal_info`'s `Sent::QueueFull`).
+  `sigqueue`/`rt_sigqueueinfo` answer `EAGAIN` at it; `kill`/`tgkill` drop the
+  copy and answer 0. The records themselves live in the per-task `RtQueue`, so
+  the resource's default is that ring's size (`RT_QUEUE_LEN`, 16) rather than
+  Linux's `max_threads / 2`: raising the limit past the ring buys no room, which
+  is the one corner `docs/uapi/` §5.2 names.
 
 ### 6.3 Namespace Support — **UTS BUILT; THE OTHER THREE DESIGNED**
 

@@ -108,8 +108,9 @@ condition true.
 **Signals (`src/sched/signal.rs` + `runtime.rs`'s delivery).** `signal.rs` is the vocabulary and the
 bit arithmetic (`Pending`, `bit`/`add`/`take`, `from_wire`/`to_wire`, `RtQueue`); the runtime owns
 delivery. The rules the vocabulary encodes: standard signals coalesce, real-time signals
-(`is_rt`) queue every copy in `RtQueue` (bounded, dropping silently on overflow — a named
-divergence from Linux's per-user `RLIMIT_SIGPENDING`, stated in the file); `is_signal` refuses 0
+(`is_rt`) queue every copy in `RtQueue` — bounded by the target user's `RLIMIT_SIGPENDING`
+(the ring's own size is that resource's default), with `sigqueue` reporting `EAGAIN` at the
+bound and `kill` dropping the copy and answering 0, Linux's measured split; `is_signal` refuses 0
 and `_NSIG`+1 and `catchable` is that answer minus the kernel's own `SIGKILL`/`SIGSTOP` — two
 questions `rt_sigaction` asks separately, since Linux refuses the kernel's two only when a
 disposition is being *set*; and `default_action` is a table rather than a single "fatal"

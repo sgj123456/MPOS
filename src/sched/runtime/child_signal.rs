@@ -141,61 +141,97 @@ pub(crate) fn force_signal(task: &mut Task, sig: u8) {
 
 /// Put a raised signal where its ABI says it belongs. A standard signal
 /// coalesces into `siginfo[sig]` — a second copy before the first is handled
-/// changes nothing. A real-time signal is pushed onto the per-task FIFO ring so
-/// every copy survives with its own `si_value`, and its `Pending` bit stays set
-/// while the ring still holds one of that number. A real-time push onto a full
-/// ring is dropped: the bound that keeps a `sigqueue` flood from growing memory
-/// (the worst-case rule).
-fn enqueue(task: &mut Task, sig: u8, mut info: crate::sched::signal::SigInfo) {
+/// changes nothing, and a `sigqueue` of a standard signal is never refused
+/// (measured: at `RLIMIT_SIGPENDING` itself, `sigqueue(SIGUSR1)` succeeds and
+/// the signal is pending). A real-time signal is pushed onto the per-task FIFO
+/// ring so every copy survives with its own `si_value`, and its `Pending` bit
+/// stays set while the ring still holds one of that number.
+///
+/// Answers whether the copy was taken. `false` is only reachable for a
+/// real-time signal whose ring is full, and the caller reads it as the door it
+/// came through reads it: see [`Sent`].
+fn enqueue(task: &mut Task, sig: u8, mut info: crate::sched::signal::SigInfo) -> bool {
     if crate::sched::signal::is_rt(sig) {
         // Stamp the number so `RtQueue::pop`/`holds` can match it later; a
         // user `siginfo_t` could otherwise carry an unrelated `si_signo`.
         info.signo = sig as i32;
         if task.rtq.push(info) {
             crate::sched::signal::add(&mut task.signals, sig);
+            return true;
         }
-    } else {
-        crate::sched::signal::add(&mut task.signals, sig);
-        if (sig as usize) < crate::sched::signal::SIGINFO_SLOTS {
-            task.siginfo[sig as usize] = info;
-        }
+        return false;
     }
+    crate::sched::signal::add(&mut task.signals, sig);
+    if (sig as usize) < crate::sched::signal::SIGINFO_SLOTS {
+        task.siginfo[sig as usize] = info;
+    }
+    true
+}
+
+/// What a [`send_signal_info`] found at the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sent {
+    /// The target took the signal, or discarded it as its own disposition said
+    /// (an ignored signal, an orphaned group's stop, a namespace init's). Every
+    /// one of those is a success to the sender, which is what Linux answers.
+    Taken,
+    /// No such task, or it has already exited: the syscall layer answers
+    /// `ESRCH`.
+    NoTask,
+    /// The target's queued-signal budget is full, so the copy was **not**
+    /// queued. Only `sigqueue`/`rt_sigqueueinfo` report this (`EAGAIN`);
+    /// `kill`/`tgkill` drop the copy and still answer 0, which is Linux's
+    /// measured split (`.workbuddy/probe_sigpending.c`, `probe_sigpending8.c`).
+    QueueFull,
 }
 
 /// Send `sig` to `id` with an `SI_USER` record naming the caller. The plain
 /// `kill`/`tgkill` shape; a `sigqueue` goes through [`send_signal_info`] so it
 /// can carry a payload.
+///
+/// A full queue is not an error here: Linux's `kill` reports nothing for one,
+/// and dropping the copy is what it does with it.
 pub fn send_signal(id: TaskId, sig: u8) -> bool {
     let (pid, uid) = with_table(|t| {
         let cur = t.task(t.current);
         (cur.tgid.0 as i32, cur.identity.ruid as i32)
     });
-    send_signal_info(id, sig, crate::sched::signal::SigInfo::user(sig, pid, uid))
+    send_signal_info(id, sig, crate::sched::signal::SigInfo::user(sig, pid, uid)) != Sent::NoTask
 }
 
 /// Send `sig` to `id`, recording `info` as the `siginfo_t` a handler will read.
 ///
-/// Returns `false` when the task does not exist or has already exited, which
-/// the syscall layer reports as `ESRCH`.
+/// `NoTask` when the task does not exist or has already exited, which the
+/// syscall layer reports as `ESRCH`; `QueueFull` when its queued-signal budget
+/// refused the copy, which only the `sigqueue` door reports.
 ///
 /// `sig` of 0 is the POSIX existence probe: it delivers nothing and only
 /// reports liveness. With no handler machinery there is nothing to deliver to
 /// anyway: the bit waits in the task's pending set, and the task dies at its
 /// next blocking point.
-pub fn send_signal_info(id: TaskId, sig: u8, info: crate::sched::signal::SigInfo) -> bool {
+///
+/// The budget is `RLIMIT_SIGPENDING`, and it is Linux's in three ways measured
+/// on a real kernel (`.workbuddy/probe_sigpending{5,7,9,10}.c`): the quantity is
+/// the *user's* queued total, counted across that user's tasks and across signal
+/// numbers (a sibling that queued nothing is refused while the caller holds the
+/// quota); the limit is the **target's**, not the sender's (a sender with a
+/// limit of 1 still delivered to a target whose limit was 4); and a standard
+/// signal is never charged at all, because a second copy of it coalesces
+/// instead of allocating.
+pub fn send_signal_info(id: TaskId, sig: u8, info: crate::sched::signal::SigInfo) -> Sent {
     with_table(|t| {
         // The first look is immutable: whether the signal is delivered,
         // discarded or refused, the answer is read off the same facts.
         let Some(task) = t.tasks.get(id.0).and_then(Option::as_ref) else {
-            return false;
+            return Sent::NoTask;
         };
         if task.exited {
-            return false;
+            return Sent::NoTask;
         }
         if sig == 0 {
             // The existence probe delivers nothing. Every answer it has is in
-            // the `true` above.
-            return true;
+            // the `Taken` above.
+            return Sent::Taken;
         }
         // POSIX 2.4.3: a stop signal generated for a member of an orphaned
         // process group is discarded. The group is one whose members' parents
@@ -211,7 +247,7 @@ pub fn send_signal_info(id: TaskId, sig: u8, info: crate::sched::signal::SigInfo
             && sig != crate::sched::signal::SIGSTOP
             && orphaned_group(t, task.pgid)
         {
-            return true;
+            return Sent::Taken;
         }
         // And a namespace's init is not endable from inside its own namespace.
         // The `forced` half is Linux's: a sender in an **ancestor** namespace
@@ -223,20 +259,37 @@ pub fn send_signal_info(id: TaskId, sig: u8, info: crate::sched::signal::SigInfo
         // Linux gives, and a `kill` dropped this way still returns 0.
         let forced = t.task(t.current).pid_ns.is_ancestor_of(&task.pid_ns);
         if init_discards(task, sig, forced) {
-            return true;
+            return Sent::Taken;
+        }
+        // The queued-signal budget, read while the borrow is still shared - the
+        // count walks every task of the target's user, and the mutable borrow
+        // below would have taken the table. It comes after the "discarded
+        // anyway" rules above because a copy that is about to be thrown away
+        // never needs a slot, and Linux agrees: `prepare_signal` discards
+        // before the allocation that can fail.
+        if crate::sched::signal::is_rt(sig)
+            && !discarded_when_generated(task, sig)
+            && queued_for_user(t, task.identity.ruid)
+                >= task.rlimits[crate::abi::RLIMIT_SIGPENDING].cur
+        {
+            return Sent::QueueFull;
         }
         let Some(task) = t.tasks.get_mut(id.0).and_then(Option::as_mut) else {
-            return false;
+            return Sent::NoTask;
         };
         // An ignored signal is discarded as it is generated: the process has
         // said it does not want it, and a bit left pending would come back to
         // life - with its *default* action - the moment the disposition
         // changed. `SIGCONT` is exempt, and the state change it carries is
         // below this: ignoring a resume does not mean "stay stopped".
-        if !discarded_when_generated(task, sig) {
-            enqueue(task, sig, info);
+        if !discarded_when_generated(task, sig) && !enqueue(task, sig, info) {
+            // The target's own ring, which the user budget above has not
+            // already refused: only reachable when the limit was raised past
+            // the storage, and still an honest "no room" rather than a drop.
+            return Sent::QueueFull;
         }
-        // `SIGCONT` is the one signal whose effect is on the *state* of a task        // rather than on its pending set, and this is the only place a task's
+        // `SIGCONT` is the one signal whose effect is on the *state* of a task
+        // rather than on its pending set, and this is the only place a task's
         // state can be changed from outside it.
         if sig == crate::sched::signal::SIGCONT {
             // It cancels the stop signals still queued, so that a task woken
@@ -270,8 +323,26 @@ pub fn send_signal_info(id: TaskId, sig: u8, info: crate::sched::signal::SigInfo
         if !held {
             t.sched.wake(id);
         }
-        true
+        Sent::Taken
     })
+}
+
+/// The queued real-time records the user `ruid` holds, across every one of that
+/// user's tasks and across signal numbers.
+///
+/// This is the quantity Linux's `RLIMIT_SIGPENDING` bounds — its
+/// `user_struct::sigpending`, charged in `__sigqueue_alloc` from the *target*
+/// task's credentials. Measured on a real kernel (`.workbuddy/probe_sigpending7.c`):
+/// filling one number to the limit refuses a `sigqueue` of a different number,
+/// and a sibling process of the same uid is refused while the filler holds the
+/// quota (`.workbuddy/probe_sigpending.c`).
+fn queued_for_user(t: &Table, ruid: u32) -> u64 {
+    t.tasks
+        .iter()
+        .flatten()
+        .filter(|other| other.identity.ruid == ruid)
+        .map(|other| other.rtq.queued() as u64)
+        .sum()
 }
 
 /// Whether `pgid` is an orphaned process group: no live member has a live

@@ -103,7 +103,7 @@ One-glance status of the whole roadmap.
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
 - [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
-- [x] real-time signals `32..=64` — queued with per-copy `si_value`, bounded ring (§2.3)
+- [x] real-time signals `32..=64` — queued with per-copy `si_value`, bounded by the target user's `RLIMIT_SIGPENDING` (a full `sigqueue` is `EAGAIN`, `kill` drops and answers 0) (§2.3)
 - [x] POSIX timers 222–226 — routed, tick-scanned, musl's `SIGEV_THREAD_ID` shape works (§R.Remaining)
 - [ ] `io_uring_setup`/`enter`/`register` — deferred by design (§1.3)
 

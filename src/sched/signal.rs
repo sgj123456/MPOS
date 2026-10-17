@@ -513,10 +513,14 @@ impl SigInfo {
     }
 }
 
-/// How many queued real-time records one task can hold. Linux bounds this per
-/// *user* by `RLIMIT_SIGPENDING`; a per-task fixed ring is the kernel-space
-/// stand-in, chosen so ordinary use never reaches it and a flood cannot grow
-/// memory (the worst-case rule, `AGENTS.md` §4).
+/// How many queued real-time records one task can hold. This ring is where the
+/// records live, so it is also the ceiling on what a caller can queue: the
+/// resource limit (`RLIMIT_SIGPENDING`) may *lower* the bound but the storage
+/// cannot be raised past this without growing memory per task (the worst-case
+/// rule, `AGENTS.md` §4). `default_rlimits()` budgets the resource at exactly
+/// this number so a caller reading `getrlimit` is told the truth about it, and
+/// the host test `rlimits_report_the_startup_defaults_and_refuse_unknown_rows`
+/// pins the two together.
 pub const RT_QUEUE_LEN: usize = 16;
 
 /// A bounded FIFO of pending real-time signal records.
@@ -547,6 +551,13 @@ impl RtQueue {
         self.len == 0
     }
 
+    /// How many records are queued. This is the quantity `RLIMIT_SIGPENDING`
+    /// bounds, counted across every task of one user — Linux's per-user
+    /// `user_struct::sigpending`.
+    pub const fn queued(&self) -> usize {
+        self.len
+    }
+
     /// Is at least one queued record for `sig` still pending? The caller keeps
     /// the `Pending` bit set exactly while this is true, so a blocked wait is
     /// woken once per copy and the bit clears when the number drains.
@@ -554,9 +565,14 @@ impl RtQueue {
         self.q[..self.len].iter().any(|e| e.signo == sig as i32)
     }
 
-    /// Append a record. `false` when the ring is full — the copy is dropped
-    /// (Linux's limit is a per-user `RLIMIT_SIGPENDING`; a full ring here drops
-    /// silently and the caller does not report `EAGAIN`, a named divergence).
+    /// Append a record. `false` when the ring is full, and the caller turns
+    /// that into the answer its door owes: `sigqueue`/`rt_sigqueueinfo` are
+    /// **`EAGAIN`** (Linux's `send_sigqueue`), while `kill`/`tgkill` deliver
+    /// nothing and still report success — measured: at `RLIMIT_SIGPENDING` a
+    /// `kill` of a real-time number returns 0 (`.workbuddy/probe_sigpending.c`)
+    /// and the extra copies are dropped. The `false` here is the whole of the
+    /// "the queue could not take it" fact; which door reports it is the
+    /// syscall layer's business.
     ///
     /// ```
     /// use mpos::sched::signal::{RT_QUEUE_LEN, RtQueue, SigInfo};
@@ -566,6 +582,7 @@ impl RtQueue {
     /// for _ in 0..RT_QUEUE_LEN {
     ///     assert!(q.push(SigInfo::user(34, 1, 0))); // queued, room left
     /// }
+    /// assert_eq!(q.queued(), RT_QUEUE_LEN);
     /// assert!(!q.push(SigInfo::user(34, 1, 0))); // the ring is bounded, not grown
     /// ```
     pub fn push(&mut self, info: SigInfo) -> bool {

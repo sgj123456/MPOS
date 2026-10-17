@@ -205,6 +205,12 @@ pub mod unwatched_events {
 /// `getrlimit(RLIMIT_NOFILE)` with the process-count budget and `RLIMIT_RSS`
 /// with the descriptor one.
 pub const RLIM_NLIMITS: usize = 16;
+/// `RLIMIT_SIGPENDING` (11 in `asm-generic/resource.h`): how many queued
+/// real-time signal records one **user** may hold. It is the row the two
+/// `sigqueue` doors are held to — `sigqueue`/`rt_sigqueueinfo` answer `EAGAIN`
+/// at it and `kill`/`tgkill` drop the copy and answer 0, which is Linux's
+/// measured split (`docs/notes/` §2.3).
+pub const RLIMIT_SIGPENDING: usize = 11;
 /// `RLIM_INFINITY`: what an unlimited limit reads as.
 pub const RLIM_INFINITY: u64 = u64::MAX;
 
@@ -217,30 +223,33 @@ pub struct Rlimit {
 }
 
 /// The limits a fresh process starts with: an 8 MiB stack, a descriptor
-/// ceiling, a process count, and infinity for the rows nothing budgets. Every
-/// other resource reads these until `setrlimit` says otherwise.
+/// ceiling, a process count, a queued-signal ceiling, and infinity for the
+/// rows nothing budgets. Every other resource reads these until `setrlimit`
+/// says otherwise.
 ///
 /// ```
 /// use mpos_abi::{Rlimit, RLIM_INFINITY, default_rlimits};
 ///
 /// let t = default_rlimits();
-/// // The three budgeted rows sit at `asm-generic/resource.h`'s numbers:
-/// // RLIMIT_STACK (3), RLIMIT_NPROC (6), RLIMIT_NOFILE (7) - so a caller
-/// // asking for the descriptor ceiling reads the descriptor ceiling.
+/// // The four budgeted rows sit at `asm-generic/resource.h`'s numbers:
+/// // RLIMIT_STACK (3), RLIMIT_NPROC (6), RLIMIT_NOFILE (7) and
+/// // RLIMIT_SIGPENDING (11) - so a caller asking for the descriptor ceiling
+/// // reads the descriptor ceiling.
 /// assert_eq!((t[3].cur, t[3].max), (8 * 1024 * 1024, 8 * 1024 * 1024));
 /// assert_eq!((t[6].cur, t[6].max), (4096, 4096));
 /// assert_eq!((t[7].cur, t[7].max), (1024, 1_048_576));
+/// assert_eq!((t[11].cur, t[11].max), (16, 16));
 /// // And the row the descriptor ceiling used to sit on (RLIMIT_RSS, 5)
 /// // reads infinity - the two must never swap back.
 /// assert_eq!(t[5], Rlimit { cur: RLIM_INFINITY, max: RLIM_INFINITY });
 /// ```
 ///
-/// The three rows are `RLIMIT_STACK` (3), `RLIMIT_NPROC` (6) and
-/// `RLIMIT_NOFILE` (7) - the numbers `asm-generic/resource.h` gives, and so the
-/// ones a caller's `getrlimit`/`setrlimit`/`prlimit64` speaks. They were written
-/// at `5` and `7` (Linux's `RLIMIT_RSS` and `RLIMIT_NPROC` rows), which made a
-/// caller asking for the descriptor ceiling read the process count and left the
-/// real `RLIMIT_NOFILE` row holding it.
+/// The four rows are `RLIMIT_STACK` (3), `RLIMIT_NPROC` (6), `RLIMIT_NOFILE`
+/// (7) and `RLIMIT_SIGPENDING` (11) - the numbers `asm-generic/resource.h`
+/// gives, and so the ones a caller's `getrlimit`/`setrlimit`/`prlimit64`
+/// speaks. They were written at `5` and `7` (Linux's `RLIMIT_RSS` and
+/// `RLIMIT_NPROC` rows), which made a caller asking for the descriptor ceiling
+/// read the process count and left the real `RLIMIT_NOFILE` row holding it.
 pub fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
     let mut t = [Rlimit {
         cur: RLIM_INFINITY,
@@ -258,6 +267,16 @@ pub fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
         cur: 1024,
         max: 1_048_576,
     }; // RLIMIT_NOFILE
+    // RLIMIT_SIGPENDING (11): the queued real-time records one user may hold.
+    // It is *not* infinity, because the row is a real bound here: the records
+    // live in a fixed per-task ring and `RT_QUEUE_LEN` is its size, so this is
+    // what the kernel can actually hold. Linux's own default is policy
+    // (`max_threads / 2`, ~125k) rather than ABI; a caller that reads this row
+    // and queues that many is told the truth. `RT_QUEUE_LEN` cannot be named
+    // from this leaf crate, so the number is spelled here and a host test in
+    // the kernel (`rlimits_report_the_startup_defaults_and_refuse_unknown_rows`)
+    // pins the two together.
+    t[11] = Rlimit { cur: 16, max: 16 }; // RLIMIT_SIGPENDING
     t
 }
 
@@ -771,13 +790,14 @@ mod tests {
     }
 
     #[test]
-    fn default_rlimits_budgets_stack_nofile_and_nproc() {
+    fn default_rlimits_budgets_stack_nofile_nproc_and_sigpending() {
         let t = default_rlimits();
         assert_eq!(t.len(), RLIM_NLIMITS);
-        // The three rows that are finite are the ones a static musl binary
-        // needs to start; everything else reads infinity. Which three they are
-        // is the point: `asm-generic/resource.h`'s numbers, so that a caller
-        // asking for RLIMIT_NOFILE gets the descriptor ceiling.
+        // The four rows that are finite are the ones a static musl binary needs
+        // to start, plus the queued-signal bound; everything else reads
+        // infinity. Which four they are is the point:
+        // `asm-generic/resource.h`'s numbers, so that a caller asking for
+        // RLIMIT_NOFILE gets the descriptor ceiling.
         assert_eq!(
             t[3],
             Rlimit {
@@ -799,6 +819,13 @@ mod tests {
                 max: 1_048_576
             }
         );
+        // `RLIMIT_SIGPENDING` (11) is finite on purpose: it is where the queued
+        // real-time records are actually held, so a caller that reads it and
+        // queues that many is told the truth. The kernel's host test
+        // `rlimits_report_the_startup_defaults_and_refuse_unknown_rows` pins
+        // the number to `sched::signal::RT_QUEUE_LEN`, which this leaf cannot
+        // name.
+        assert_eq!(t[RLIMIT_SIGPENDING], Rlimit { cur: 16, max: 16 });
         // `RLIMIT_RSS` (5) is the row the descriptor ceiling used to sit on, and
         // nothing budgets it - the assertion that keeps the two from swapping
         // back.

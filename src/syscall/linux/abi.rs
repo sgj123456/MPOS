@@ -4168,9 +4168,9 @@ mod tests {
     }
 
     /// `getrlimit(2)`/`prlimit64(2)`: the resources a static binary reads -
-    /// an 8 MiB stack, a descriptor ceiling, a process ceiling, infinity for
-    /// the rest - written as the `rlim_cur, rlim_max` pair the struct
-    /// spells, with `EINVAL` past the table.
+    /// an 8 MiB stack, a descriptor ceiling, a process ceiling, the queued-signal
+    /// bound, infinity for the rest - written as the `rlim_cur, rlim_max` pair
+    /// the struct spells, with `EINVAL` past the table.
     #[test]
     fn rlimits_report_the_startup_defaults_and_refuse_unknown_rows() {
         let mut buf = [0u8; 16];
@@ -4200,6 +4200,19 @@ mod tests {
         buf = [0u8; 16];
         assert_eq!(pair(6, buf.as_mut_ptr() as usize), (0, 0));
         assert_eq!(words(&buf), (4096, 4096));
+        // RLIMIT_SIGPENDING (11): the queued real-time records one user may
+        // hold. The bound is real here - the records live in a fixed per-task
+        // ring - and this is the row a caller's `sigqueue` meets, so it reads
+        // the ring's size rather than infinity.
+        buf = [0u8; 16];
+        assert_eq!(pair(11, buf.as_mut_ptr() as usize), (0, 0));
+        assert_eq!(
+            words(&buf),
+            (
+                crate::sched::signal::RT_QUEUE_LEN as u64,
+                crate::sched::signal::RT_QUEUE_LEN as u64
+            )
+        );
         // An unlisted resource reports RLIM_INFINITY both ways.
         buf = [0u8; 16];
         assert_eq!(pair(0, buf.as_mut_ptr() as usize), (0, 0));
