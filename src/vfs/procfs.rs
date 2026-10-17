@@ -997,6 +997,27 @@ pub struct MapLine {
 /// Linux's layout exactly - `start-end perms offset dev inode name` - because
 /// the file is parsed rather than read: `pmap`, `lsof`-style tools and every
 /// crash reporter split it on whitespace and index into it.
+///
+/// ```
+/// use mpos::vfs::procfs::{MapLine, format_maps};
+/// use mpos_vm::MapFlags;
+///
+/// let line = MapLine {
+///     start: 0x55_5555_4000,
+///     end: 0x55_5555_8000,
+///     prot: MapFlags::READ | MapFlags::EXEC,
+///     shared: false,
+///     offset: 0x1000,
+///     dev: (0x08, 0x01),
+///     inode: 12345,
+///     name: Some(String::from("/bin/sh")),
+/// };
+/// let text = format_maps(&[line]);
+/// assert!(text.starts_with("5555554000-5555558000 r-xp 00001000 08:01 12345 "));
+/// // The name column starts at a fixed offset, which is what a parser indexes.
+/// assert_eq!(text.find("/bin/sh"), Some(73));
+/// assert!(text.ends_with('\n'));
+/// ```
 pub fn format_maps(lines: &[MapLine]) -> String {
     let mut out = String::new();
     for line in lines {

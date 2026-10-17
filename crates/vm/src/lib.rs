@@ -33,6 +33,15 @@ pub const PAGE_SHIFT: usize = 12;
 pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 
 /// Round `value` up to a multiple of `align`, which must be a power of two.
+///
+/// ```
+/// use mpos_vm::{PAGE_SIZE, align_down, align_up};
+///
+/// assert_eq!(align_up(0x1234, PAGE_SIZE), 0x2000);
+/// assert_eq!(align_down(0x1234, PAGE_SIZE), 0x1000);
+/// // An aligned value moves nowhere:
+/// assert_eq!(align_up(0x2000, PAGE_SIZE), 0x2000);
+/// ```
 pub const fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
@@ -67,6 +76,16 @@ impl MapFlags {
     /// among them: a walk of the hardware bits reports what the CPU enforces,
     /// and a copy-on-write page is enforced as read-only whether or not it will
     /// later be copied. Callers that need the state ask for it by name.
+    ///
+    /// ```
+    /// use mpos_vm::MapFlags;
+    ///
+    /// // COW is deliberately outside PERM: a hardware walk reports what the CPU
+    /// // enforces, and a COW page is enforced as read-only.
+    /// assert!(!MapFlags::PERM.contains(MapFlags::COW));
+    /// let cow = MapFlags::READ | MapFlags::WRITE | MapFlags::COW;
+    /// assert_eq!(cow.intersection(MapFlags::PERM), MapFlags::READ | MapFlags::WRITE);
+    /// ```
     pub const PERM: MapFlags = MapFlags::READ
         .union(MapFlags::WRITE)
         .union(MapFlags::EXEC)
@@ -106,6 +125,8 @@ impl Mapping {
         self.virt + self.length
     }
 
+    /// A mapping covers its half-open range `[virt, end)`: the first page is
+    /// inside, the byte at `end()` belongs to whatever comes next.
     pub fn covers(&self, virt: usize) -> bool {
         self.virt <= virt && virt < self.end()
     }

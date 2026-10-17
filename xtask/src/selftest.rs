@@ -174,6 +174,12 @@ fn check_boot_openings() -> Result<()> {
 /// green number that silently means less than it did. `mpos-fdt` was in exactly
 /// that state - eight tests, never run. [`tests::every_leaf_crate_is_tested`]
 /// pins the list against the directory, so this is the last time.
+///
+/// The same list is walked twice: once for the unit tests and once for the
+/// doctests, which `--doc` cannot be combined with `--lib` to reach (cargo
+/// refuses to mix a documentation target with a target selection). A package
+/// named here is therefore exercised as both, which is deliberate - a leaf
+/// crate's doc examples are as much a pin as its `#[cfg(test)]` module.
 const LEAF_CRATES: &[&str] = &[
     "mpos-err",
     "mpos-bootinfo",
@@ -217,6 +223,30 @@ fn run_unit_tests() -> Result<()> {
     }
     cmd.current_dir(&root);
     utils::run_status(&mut cmd, "the kernel's host unit tests")?;
+
+    // The doctests are the same contracts again, as the examples a reader of
+    // the source meets: every fenced block in `src/` and `crates/*/src` is
+    // compiled and run, so an example that has drifted from the function it
+    // documents fails the gate instead of misinforming the next reader. They
+    // are a second invocation because `--doc` cannot be combined with `--lib`,
+    // and the package list is the host suite's own - a leaf crate added for the
+    // unit tests is covered here too, and [`tests::every_leaf_crate_is_tested`]
+    // keeps that list honest.
+    println!("Doc tests: the kernel and its leaf crates (host)");
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "test",
+        "--doc",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+        "-p",
+        "mpos",
+    ]);
+    for crate_name in LEAF_CRATES {
+        cmd.arg("-p").arg(crate_name);
+    }
+    cmd.current_dir(&root);
+    utils::run_status(&mut cmd, "the kernel's host doctests")?;
 
     println!("Unit tests: xtask");
     let mut cmd = Command::new("cargo");

@@ -45,6 +45,15 @@ impl<'a> Iterator for Components<'a> {
 /// path *means*, and the caller that needs it most is `statfs`: the filesystem
 /// serving a path is found by matching mountpoint prefixes, and a mountpoint
 /// is never spelled `.`.
+///
+/// ```
+/// use mpos::vfs::path::normalize;
+///
+/// assert_eq!(normalize("/etc/../etc/passwd"), "/etc/passwd"); // .. folds back
+/// assert_eq!(normalize("//a/./b//"), "/a/b"); // slashes collapse, . drops
+/// assert_eq!(normalize(""), "/"); // the empty path means the root
+/// assert_eq!(normalize("/.."), "/"); // nothing escapes above the root
+/// ```
 pub fn normalize(path: &str) -> alloc::string::String {
     let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
     for component in path.split('/') {

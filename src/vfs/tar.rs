@@ -51,6 +51,26 @@ pub struct Entries<'a> {
 
 /// Parse an archive. Malformed bytes are not an error case: the iterator
 /// simply stops there, and the unpacker reports how much it got.
+///
+/// ```
+/// use mpos::vfs::tar::{BLOCK, EntryKind, entries};
+///
+/// // One ustar member built the way tar would: header block plus data block.
+/// let mut archive = vec![0u8; BLOCK * 2];
+/// archive[..4].copy_from_slice(b"init");
+/// archive[124..135].copy_from_slice(b"00000000004"); // size = 4, octal
+/// archive[156] = b'0'; // regular file
+/// archive[257..263].copy_from_slice(b"ustar\0");
+/// archive[263..265].copy_from_slice(b"00");
+/// archive[BLOCK..BLOCK + 4].copy_from_slice(b"#!/b");
+///
+/// let mut it = entries(&archive);
+/// let e = it.next().expect("the member parses");
+/// assert_eq!(e.path, "init"); // a ./ prefix would be stripped; none is kept
+/// assert_eq!(e.kind, EntryKind::File);
+/// assert_eq!(e.data, b"#!/b");
+/// assert!(it.next().is_none()); // padding ends the archive - no error either
+/// ```
 pub fn entries(archive: &[u8]) -> Entries<'_> {
     Entries { rest: archive }
 }

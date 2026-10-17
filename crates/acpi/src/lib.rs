@@ -77,6 +77,15 @@ pub const ECAM_BUS_BYTES: u64 = 1 << 20;
 /// The sum of every byte of a table is zero when its checksum holds. One
 /// function for both the root pointer and a table, because the rule is one
 /// rule.
+///
+/// ```
+/// use mpos_acpi::checksum_ok;
+///
+/// // A wrapping sum: bytes that overflow past 255 still come back to zero.
+/// assert!(checksum_ok(&[0x01, 0x02, 0xFD]));
+/// assert!(!checksum_ok(&[0x01, 0x02, 0xFC]));
+/// assert!(checksum_ok(&[])); // the empty sum is already zero
+/// ```
 pub fn checksum_ok(bytes: &[u8]) -> bool {
     bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) == 0
 }
@@ -153,6 +162,19 @@ pub struct SdtHeader {
 /// much, and then calls [`parse_header`] on the whole of it. A caller that
 /// trusted this instead of validating would be believing a number the firmware
 /// wrote.
+///
+/// ```
+/// use mpos_acpi::declared_length;
+///
+/// // A header's length field at offset 4, little-endian - read without any
+/// // validation, which is exactly why parse_header must still be called.
+/// let mut bytes = [0u8; 36];
+/// bytes[..4].copy_from_slice(b"APIC");
+/// bytes[4..8].copy_from_slice(&0x100u32.to_le_bytes());
+/// assert_eq!(declared_length(&bytes), Some(0x100));
+/// // Fewer than the header's own 36 bytes answer nothing at all.
+/// assert_eq!(declared_length(&[0u8; 7]), None);
+/// ```
 pub fn declared_length(bytes: &[u8]) -> Option<u32> {
     if bytes.len() < SDT_HEADER_LEN {
         return None;
@@ -166,6 +188,29 @@ pub fn declared_length(bytes: &[u8]) -> Option<u32> {
 /// header itself, is refused rather than clamped: the length is what every
 /// reader after this one will stride by, so a wrong one is not a table this
 /// crate can describe.
+///
+/// ```
+/// use mpos_acpi::{SDT_HEADER_LEN, parse_header};
+///
+/// // A minimal valid table: signature, length = the whole 36-byte header,
+/// // and a checksum byte that makes the sum of all bytes wrap to zero.
+/// let mut bytes = [0u8; SDT_HEADER_LEN];
+/// bytes[..4].copy_from_slice(b"APIC");
+/// bytes[4..8].copy_from_slice(&(SDT_HEADER_LEN as u32).to_le_bytes());
+/// bytes[8] = 1; // revision
+/// bytes[SDT_HEADER_LEN - 1] = 0u8.wrapping_sub(
+///     bytes[..SDT_HEADER_LEN - 1].iter().fold(0u8, |s, b| s.wrapping_add(*b)),
+/// );
+/// let h = parse_header(&bytes).expect("a whole table");
+/// assert_eq!(&h.signature, b"APIC");
+/// assert_eq!(h.length, SDT_HEADER_LEN as u32);
+/// // The same header claiming more bytes than arrived is refused, not clamped.
+/// bytes[4..8].copy_from_slice(&64u32.to_le_bytes());
+/// assert_eq!(parse_header(&bytes), None);
+/// // And so is one claiming fewer than the header's own length.
+/// bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+/// assert_eq!(parse_header(&bytes), None);
+/// ```
 pub fn parse_header(bytes: &[u8]) -> Option<SdtHeader> {
     if bytes.len() < SDT_HEADER_LEN {
         return None;

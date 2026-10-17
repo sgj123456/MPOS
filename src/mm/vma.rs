@@ -163,6 +163,27 @@ impl MappedRange {
 /// pieces with the same permissions and the same name are one range. An
 /// image's text segment is usually two of them (`r--` then `r-x`) and its data
 /// two more, which is exactly how Linux prints them.
+///
+/// ```
+/// use mpos::mm::vma::{MappedRange, merge_ranges};
+/// use mpos_vm::MapFlags;
+///
+/// let rw = MapFlags::READ | MapFlags::WRITE;
+/// // Out of order, and the second continues the first: sorted, then folded.
+/// let merged = merge_ranges(vec![
+///     MappedRange { start: 0x2000, end: 0x3000, prot: rw, name: None },
+///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None },
+/// ]);
+/// assert_eq!(merged.len(), 1);
+/// assert_eq!((merged[0].start, merged[0].end), (0x1000, 0x3000));
+/// // A permission change ends the run even when the addresses abut.
+/// let rx = MapFlags::READ | MapFlags::EXEC;
+/// let merged = merge_ranges(vec![
+///     MappedRange { start: 0x1000, end: 0x2000, prot: rw, name: None },
+///     MappedRange { start: 0x2000, end: 0x3000, prot: rx, name: None },
+/// ]);
+/// assert_eq!(merged.len(), 2);
+/// ```
 pub fn merge_ranges(mut ranges: Vec<MappedRange>) -> Vec<MappedRange> {
     ranges.sort_unstable_by_key(|r| r.start);
     let mut merged: Vec<MappedRange> = Vec::with_capacity(ranges.len());

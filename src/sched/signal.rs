@@ -98,6 +98,15 @@ pub const SIGRTMAX: u8 = 64;
 /// real-time signals `32..=64` are queued — Linux delivers every `sigqueue`'d
 /// copy, in order, each with its own payload. The queue that makes that true is
 /// [`RtQueue`].
+///
+/// ```
+/// use mpos::sched::signal::{is_rt, SIGRTMIN, SIGRTMAX, SIGTERM};
+///
+/// assert!(!is_rt(SIGTERM)); // 15 — a standard signal, coalesced
+/// assert!(is_rt(SIGRTMIN)); // 32 — the first queued one
+/// assert!(is_rt(SIGRTMAX)); // 64 — the last bit the pending word can hold
+/// assert!(!is_rt(31)); // the boundary: 31 is standard, 32 is real-time
+/// ```
 pub fn is_rt(sig: u8) -> bool {
     (SIGRTMIN..=SIGRTMAX).contains(&sig)
 }
@@ -189,6 +198,17 @@ impl Action {
     /// The mask a handler runs under: what the caller had blocked, plus what
     /// the disposition asks for, plus the signal itself - which cannot arrive
     /// again while it is being handled unless `SA_NODEFER` says otherwise.
+    ///
+    /// ```
+    /// use mpos::sched::signal::{Action, SA_NODEFER, SIGINT, bit};
+    ///
+    /// let action = Action { handler: 0x1000, ..Action::default() };
+    /// let mask = action.handler_mask(SIGINT, bit(3)); // caller had SIGQUIT blocked
+    /// assert_eq!(mask & bit(SIGINT), bit(SIGINT)); // the handled signal blocks itself
+    /// assert_ne!(mask & bit(3), 0); // and the caller's own block stays
+    /// let nodefer = Action { flags: SA_NODEFER, ..action };
+    /// assert_eq!(nodefer.handler_mask(SIGINT, 0), 0); // unless SA_NODEFER says otherwise
+    /// ```
     pub fn handler_mask(&self, sig: u8, blocked: Pending) -> Pending {
         let mut mask = blocked | self.mask as Pending;
         if self.flags & SA_NODEFER == 0 {
@@ -218,6 +238,15 @@ impl Actions {
 /// `1..=_NSIG` (64). Signal 0 and the numbers above `_NSIG` are not signals,
 /// and a call naming one is refused whether or not it hands over a
 /// disposition.
+///
+/// ```
+/// use mpos::sched::signal::{is_signal, MAX_SIGNAL, SIGKILL};
+///
+/// assert!(is_signal(SIGKILL as usize)); // 9 is a signal
+/// assert!(!is_signal(0)); // the kill-existence probe, never pending
+/// assert!(is_signal(MAX_SIGNAL as usize)); // 64 = _NSIG, still in range
+/// assert!(!is_signal(65)); // above _NSIG there is no name to give one
+/// ```
 pub fn is_signal(sig: usize) -> bool {
     (1..SIGNALS).contains(&sig)
 }
@@ -231,6 +260,15 @@ pub fn is_signal(sig: usize) -> bool {
 /// `rt_sigaction(SIGKILL, NULL, &old, 8)` answers `0` and clears the record),
 /// while an install of either is `EINVAL`. A process must not be able to make
 /// itself unkillable or unstoppable, but it may ask what would happen.
+///
+/// ```
+/// use mpos::sched::signal::{SIGINT, SIGKILL, SIGSTOP, catchable};
+///
+/// assert!(catchable(SIGINT as usize));
+/// assert!(!catchable(SIGKILL as usize)); // no disposition, queryable all the same
+/// assert!(!catchable(SIGSTOP as usize));
+/// assert!(!catchable(0)); // not a signal at all
+/// ```
 pub fn catchable(sig: usize) -> bool {
     is_signal(sig) && sig != SIGKILL as usize && sig != SIGSTOP as usize
 }
@@ -264,6 +302,20 @@ pub enum DefaultAction {
 /// Everything not named terminates: that is the honest default for the
 /// signals this kernel can name, and the ones a program actually catches
 /// (`SIGINT`, `SIGTERM`, `SIGPIPE`, `SIGALRM`) are in that group.
+///
+/// ```
+/// use mpos::sched::signal::{
+///     DefaultAction, SIGCHLD, SIGCONT, SIGINT, SIGSTOP, SIGWINCH, default_action,
+/// };
+///
+/// assert_eq!(default_action(SIGINT), DefaultAction::Terminate);
+/// assert_eq!(default_action(SIGSTOP), DefaultAction::Stop);
+/// assert_eq!(default_action(SIGCONT), DefaultAction::Continue);
+/// // The table's two "do nothing": a wait(2) needs no signal to be woken,
+/// // and a resized window is nobody's business unless they catch it.
+/// assert_eq!(default_action(SIGCHLD), DefaultAction::Ignore);
+/// assert_eq!(default_action(SIGWINCH), DefaultAction::Ignore);
+/// ```
 pub fn default_action(sig: u8) -> DefaultAction {
     match sig {
         SIGCHLD | SIGWINCH => DefaultAction::Ignore,
@@ -470,6 +522,17 @@ impl RtQueue {
     /// Append a record. `false` when the ring is full — the copy is dropped
     /// (Linux's limit is a per-user `RLIMIT_SIGPENDING`; a full ring here drops
     /// silently and the caller does not report `EAGAIN`, a named divergence).
+    ///
+    /// ```
+    /// use mpos::sched::signal::{RT_QUEUE_LEN, RtQueue, SigInfo};
+    ///
+    /// let mut q = RtQueue::new();
+    /// assert!(q.empty());
+    /// for _ in 0..RT_QUEUE_LEN {
+    ///     assert!(q.push(SigInfo::user(34, 1, 0))); // queued, room left
+    /// }
+    /// assert!(!q.push(SigInfo::user(34, 1, 0))); // the ring is bounded, not grown
+    /// ```
     pub fn push(&mut self, info: SigInfo) -> bool {
         if self.len == RT_QUEUE_LEN {
             return false;
@@ -481,6 +544,24 @@ impl RtQueue {
 
     /// Remove and return the oldest queued record for `sig`, preserving the
     /// order of the rest. `None` when `sig` has nothing queued.
+    ///
+    /// ```
+    /// use mpos::sched::signal::{RtQueue, SigInfo};
+    ///
+    /// let mut q = RtQueue::new();
+    /// // Two copies of 34 (each with its own payload) and one of 35 between them.
+    /// q.push(SigInfo::queue(34, 1, 0, 7));
+    /// q.push(SigInfo::queue(35, 1, 0, 8));
+    /// q.push(SigInfo::queue(34, 1, 0, 9));
+    /// // Real-time signals are queued, not coalesced: FIFO per number, and the
+    /// // bit stays held while any copy remains — which is what `holds` answers.
+    /// assert_eq!(q.pop(34).map(|i| i.value), Some(7));
+    /// assert!(q.holds(34));
+    /// assert_eq!(q.pop(34).map(|i| i.value), Some(9));
+    /// assert!(!q.holds(34));
+    /// assert!(q.pop(34).is_none());
+    /// assert_eq!(q.pop(35).map(|i| i.value), Some(8)); // its turn was not skipped
+    /// ```
     pub fn pop(&mut self, sig: u8) -> Option<SigInfo> {
         let at = self.q[..self.len]
             .iter()
@@ -513,6 +594,15 @@ pub type Pending = u64;
 /// Canonical Linux layout: signal *n* is bit *n-1*, so signals `1..=64` fill the
 /// `u64` end to end (`_NSIG`), with no spare bit and no collision. Signal 0 has no
 /// bit (it is the `kill`-existence probe, never pending).
+///
+/// ```
+/// use mpos::sched::signal::{SIGRTMAX, bit};
+///
+/// assert_eq!(bit(1), 1); // signal n is bit n-1, not bit n
+/// assert_eq!(bit(9), 1 << 8);
+/// assert_eq!(bit(SIGRTMAX), 1u64 << 63); // signal 64 fills the word's last bit
+/// assert_eq!(bit(0), 0); // the existence probe has no bit
+/// ```
 pub fn bit(sig: u8) -> Pending {
     if sig == 0 { 0 } else { 1u64 << (sig - 1) }
 }
@@ -540,6 +630,19 @@ pub fn to_wire(set: Pending) -> u64 {
 }
 
 /// Take the lowest-numbered pending signal out of the set, if any.
+///
+/// ```
+/// use mpos::sched::signal::{SIGINT, SIGKILL, add, bit, take};
+///
+/// let mut set = 0;
+/// assert_eq!(take(&mut set), None); // nothing pending
+/// add(&mut set, SIGKILL);
+/// add(&mut set, SIGINT);
+/// assert_eq!(take(&mut set), Some(SIGINT)); // lowest number first
+/// assert_eq!(set, bit(SIGKILL)); // and only what was taken leaves
+/// assert_eq!(take(&mut set), Some(SIGKILL));
+/// assert_eq!(take(&mut set), None);
+/// ```
 pub fn take(set: &mut Pending) -> Option<u8> {
     if *set == 0 {
         return None;

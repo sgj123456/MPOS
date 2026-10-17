@@ -296,6 +296,25 @@ impl Credentials {
     /// `cap` is the raw argument word rather than a `u32`, so a value too
     /// large to be a capability number is still refused rather than truncated
     /// into one.
+    ///
+    /// ```
+    /// use mpos_cred::{CAP_LAST_CAP, CAP_SETPCAP, CapErr, Credentials};
+    ///
+    /// let mut creds = Credentials::initial();
+    /// // A root process drops a capability it holds: accepted, and gone from the set.
+    /// assert_eq!(creds.capbset_drop(CAP_SETPCAP as u64), Ok(()));
+    /// assert!(!creds.has_bounding(CAP_SETPCAP));
+    /// // A number past CAP_LAST_CAP is EINVAL - but only asked *after* the
+    /// // privilege question: for a caller without CAP_SETPCAP the same call
+    /// // is EPerm whatever the number says.
+    /// assert_eq!(
+    ///     creds.capbset_drop(CAP_LAST_CAP as u64 + 1),
+    ///     Err(CapErr::Invalid)
+    /// );
+    /// let mut lowered = Credentials::initial();
+    /// lowered.effective &= !(1 << CAP_SETPCAP);
+    /// assert_eq!(lowered.capbset_drop(0), Err(CapErr::Perm));
+    /// ```
     pub fn capbset_drop(&mut self, cap: u64) -> Result<(), CapErr> {
         if !self.has_effective(CAP_SETPCAP) {
             return Err(CapErr::Perm);

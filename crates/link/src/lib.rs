@@ -125,6 +125,19 @@ pub fn parse_sll(raw: &[u8]) -> Option<SockaddrLl> {
 /// caller - which is the only side that knows whether the destination is user
 /// memory - copies it out. `ifindex` is an argument rather than a constant
 /// because it is the machine's fact, not the wire format's.
+///
+/// ```
+/// use mpos_link::{SOCKADDR_LL_LEN, encode_sll, parse_sll};
+///
+/// let raw = encode_sll(0x0800u16.to_be(), 3, &[0xaa; 6]);
+/// let sll = parse_sll(&raw).expect("our own encode parses");
+/// assert_eq!(sll.ifindex, 3);
+/// assert_eq!(sll.halen, 6);
+/// assert_eq!(&sll.addr[..6], &[0xaa; 6]);
+/// // The protocol word crosses byte-for-byte - the caller's htons is kept.
+/// assert_eq!(&raw[2..4], &0x0800u16.to_be().to_ne_bytes());
+/// assert_eq!(SOCKADDR_LL_LEN, 20);
+/// ```
 pub fn encode_sll(protocol: u16, ifindex: i32, addr: &[u8; 6]) -> [u8; SOCKADDR_LL_LEN] {
     let mut out = [0u8; SOCKADDR_LL_LEN];
     out[0..2].copy_from_slice(&AF_PACKET.to_ne_bytes());
@@ -155,6 +168,19 @@ pub struct EthFrame<'a> {
 /// `None` for a frame shorter than [`ETH_HEADER_LEN`]: a caller-fed length may
 /// not be trusted to have a header, and the honest answer to a runt is that
 /// there is no frame here rather than a read past the end.
+///
+/// ```
+/// use mpos_link::{IPV4_ETHERTYPE, parse_ethernet};
+///
+/// let mut frame = vec![0u8; 15];
+/// frame[6..12].copy_from_slice(&[1, 2, 3, 4, 5, 6]); // source MAC
+/// frame[12..14].copy_from_slice(&IPV4_ETHERTYPE.to_le_bytes());
+/// let f = parse_ethernet(&frame).expect("a whole header");
+/// assert_eq!(f.ethertype, IPV4_ETHERTYPE); // compared without a host-order detour
+/// assert_eq!(f.src, [1, 2, 3, 4, 5, 6]);
+/// assert_eq!(f.payload, &[0]); // one byte after the fourteen
+/// assert_eq!(parse_ethernet(&frame[..13]), None); // a runt has no header
+/// ```
 pub fn parse_ethernet(frame: &[u8]) -> Option<EthFrame<'_>> {
     if frame.len() < ETH_HEADER_LEN {
         return None;
@@ -231,6 +257,19 @@ impl Frames {
     }
 
     /// Queue one frame, dropping the oldest while the ring is over capacity.
+    ///
+    /// ```
+    /// use mpos_link::Frames;
+    ///
+    /// let mut ring = Frames::with_capacity(2);
+    /// for n in 0..3u8 {
+    ///     // A Frame is (whole bytes, source MAC, ethertype) - only the first
+    ///     // element matters to the ring's rule.
+    ///     ring.push((vec![n], [0; 6], 0));
+    /// }
+    /// assert_eq!(ring.len(), 2); // bounded: the newest two survive
+    /// assert_eq!(ring.pop().map(|f| f.0[0]), Some(1)); // oldest of those first
+    /// ```
     pub fn push(&mut self, frame: Frame) {
         self.queue.push_back(frame);
         while self.queue.len() > self.capacity {

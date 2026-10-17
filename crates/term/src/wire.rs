@@ -96,6 +96,20 @@ impl Stream {
 ///
 /// `0` means not even the first sequence fits, which is a cut before it starts
 /// - and the whole chunk is then better off unsent than sent half of.
+///
+/// ```
+/// use mpos_term::wire::cut;
+///
+/// // Plain text can be cut anywhere.
+/// assert_eq!(cut(b"hello", 3), 3);
+/// // A cut that would land inside a CSI stops *before* its ESC: sending the
+/// // parameters alone would leave the far end interpreting half a sequence.
+/// let stream = b"abc\x1b[1;24rdef";
+/// assert_eq!(cut(stream, 5), 3); // one byte into the CSI
+/// assert_eq!(cut(stream, 10), 10); // the terminator completes it
+/// // A limit shorter than the first sequence cuts nothing.
+/// assert_eq!(cut(b"\x1b[1;24r", 3), 0);
+/// ```
 pub fn cut(bytes: &[u8], limit: usize) -> usize {
     let mut state = Stream::Ground;
     let mut safe = 0;

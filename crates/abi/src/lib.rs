@@ -220,6 +220,21 @@ pub struct Rlimit {
 /// ceiling, a process count, and infinity for the rows nothing budgets. Every
 /// other resource reads these until `setrlimit` says otherwise.
 ///
+/// ```
+/// use mpos_abi::{Rlimit, RLIM_INFINITY, default_rlimits};
+///
+/// let t = default_rlimits();
+/// // The three budgeted rows sit at `asm-generic/resource.h`'s numbers:
+/// // RLIMIT_STACK (3), RLIMIT_NPROC (6), RLIMIT_NOFILE (7) - so a caller
+/// // asking for the descriptor ceiling reads the descriptor ceiling.
+/// assert_eq!((t[3].cur, t[3].max), (8 * 1024 * 1024, 8 * 1024 * 1024));
+/// assert_eq!((t[6].cur, t[6].max), (4096, 4096));
+/// assert_eq!((t[7].cur, t[7].max), (1024, 1_048_576));
+/// // And the row the descriptor ceiling used to sit on (RLIMIT_RSS, 5)
+/// // reads infinity - the two must never swap back.
+/// assert_eq!(t[5], Rlimit { cur: RLIM_INFINITY, max: RLIM_INFINITY });
+/// ```
+///
 /// The three rows are `RLIMIT_STACK` (3), `RLIMIT_NPROC` (6) and
 /// `RLIMIT_NOFILE` (7) - the numbers `asm-generic/resource.h` gives, and so the
 /// ones a caller's `getrlimit`/`setrlimit`/`prlimit64` speaks. They were written
@@ -249,6 +264,31 @@ pub fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
 /// `setrlimit`'s one rule, returned as the errno a refusal carries (or the
 /// accepted pair): the soft limit may not exceed the hard, and only root may
 /// lift the hard ceiling above where it stands.
+///
+/// ```
+/// use mpos_abi::{Rlimit, rlimit_admit};
+///
+/// let standing = Rlimit { cur: 100, max: 200 };
+/// // A soft above the *new* hard is refused whatever else the pair says.
+/// assert_eq!(
+///     rlimit_admit(standing, Rlimit { cur: 300, max: 200 }, true),
+///     Err(mpos_err::EINVAL)
+/// );
+/// // Lowering within the standing hard is accepted for anyone.
+/// assert_eq!(
+///     rlimit_admit(standing, Rlimit { cur: 50, max: 60 }, false),
+///     Ok(Rlimit { cur: 50, max: 60 })
+/// );
+/// // Raising the hard ceiling above where it stands is root's alone.
+/// assert_eq!(
+///     rlimit_admit(standing, Rlimit { cur: 10, max: 300 }, false),
+///     Err(mpos_err::EPERM)
+/// );
+/// assert_eq!(
+///     rlimit_admit(standing, Rlimit { cur: 10, max: 300 }, true),
+///     Ok(Rlimit { cur: 10, max: 300 })
+/// );
+/// ```
 pub fn rlimit_admit(old: Rlimit, new: Rlimit, is_root: bool) -> Result<Rlimit, isize> {
     if new.cur > new.max {
         return Err(mpos_err::EINVAL);
@@ -291,6 +331,28 @@ pub fn rlimit_admit(old: Rlimit, new: Rlimit, is_root: bool) -> Result<Rlimit, i
 /// scheduler — `sched::clone` answers it before creating anything, and a
 /// `sched → syscall` edge is exactly the V-* class Phase 11 keeps at zero. The
 /// namespace bits it consults are defined above, so the rule has one home.
+///
+/// ```
+/// use mpos_abi::{CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_THREAD,
+///                clone_namespace_verdict};
+///
+/// // A served kind needs CAP_SYS_ADMIN against the caller's own namespace.
+/// assert_eq!(clone_namespace_verdict(CLONE_NEWNS, true), Ok(()));
+/// assert_eq!(clone_namespace_verdict(CLONE_NEWNS, false), Err(mpos_err::EPERM));
+/// // Making a user namespace *is* the grant, so it passes unprivileged and
+/// // lifts the gate for every other served kind in the same word.
+/// assert_eq!(clone_namespace_verdict(CLONE_NEWUSER, false), Ok(()));
+/// assert_eq!(
+///     clone_namespace_verdict(CLONE_NEWUSER | CLONE_NEWNS, false),
+///     Ok(())
+/// );
+/// // A pid namespace beside a thread is the request being impossible, not a
+/// // missing capability - EINVAL even for root.
+/// assert_eq!(
+///     clone_namespace_verdict(CLONE_THREAD | CLONE_NEWPID, true),
+///     Err(mpos_err::EINVAL)
+/// );
+/// ```
 pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isize> {
     const SERVED: usize = CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWUSER;
     let asked = flags & CLONE_NAMESPACES;
@@ -390,6 +452,17 @@ pub const CLD_CONTINUED: i32 = 6;
 /// a silently different number, because reproducing it means modelling which
 /// signals dump at all (`sig_kernel_coredump`'s set) and saying so in the
 /// `wait4` status word and the `waitid` record together.
+///
+/// ```
+/// use mpos_abi::{CLD_EXITED, CLD_KILLED, exit_chld};
+///
+/// assert_eq!(exit_chld(7), (CLD_EXITED, 7));
+/// assert_eq!(exit_chld(-9), (CLD_KILLED, 9));
+/// // The same number, two meanings: `si_status` is the exit code for an exit
+/// // and the signal for a death, so `si_code` is the field to branch on.
+/// assert_eq!(exit_chld(9).1, exit_chld(-9).1);
+/// assert_ne!(exit_chld(9).0, exit_chld(-9).0);
+/// ```
 pub fn exit_chld(code: isize) -> (i32, i32) {
     if code < 0 {
         (CLD_KILLED, -code as i32)

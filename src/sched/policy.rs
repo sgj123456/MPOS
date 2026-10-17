@@ -54,6 +54,17 @@ impl Priority {
 
     /// Clamped rather than rejected: a priority outside the bands has no queue to
     /// go in, and the alternatives are a panic or silently dropping a task.
+    ///
+    /// ```
+    /// use mpos::sched::policy::{Priority, BANDS};
+    ///
+    /// assert_eq!(BANDS, 4);
+    /// // Inside the bands the number is the band; outside it lands on the top.
+    /// assert_eq!(Priority::new(1), Priority::NORMAL);
+    /// assert_eq!(Priority::new(3), Priority::CRITICAL);
+    /// assert_eq!(Priority::new(9), Priority::CRITICAL);
+    /// assert_eq!(Priority::new(9).band(), BANDS - 1);
+    /// ```
     pub const fn new(band: u8) -> Priority {
         if band as usize >= BANDS {
             Priority((BANDS - 1) as u8)

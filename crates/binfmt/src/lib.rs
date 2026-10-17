@@ -40,6 +40,18 @@ pub const SHEBANG_HOPS_MAX: usize = 4;
 ///
 /// `None` for a file that does not open with `#!`, and for one whose `#!` is
 /// followed by nothing but space: neither names anything to run.
+///
+/// ```
+/// use mpos_binfmt::shebang;
+///
+/// assert_eq!(
+///     shebang(b"#!/bin/sh -e -x\n"),
+///     Some((String::from("/bin/sh"), Some(String::from("-e -x"))))
+/// ); // the whole tail is ONE argument, not a command line split again
+/// assert_eq!(shebang(b"#!/bin/python3"), Some((String::from("/bin/python3"), None)));
+/// assert_eq!(shebang(b"\x7fELF..."), None); // not a script at all
+/// assert_eq!(shebang(b"#!   \n"), None); // names nothing to run
+/// ```
 pub fn shebang(bytes: &[u8]) -> Option<(String, Option<String>)> {
     if !bytes.starts_with(b"#!") {
         return None;

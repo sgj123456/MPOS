@@ -2808,6 +2808,19 @@ pub const AUDIO_BUF_INFO_SIZE: usize = 16;
 /// the listed ones - the rounding OSS does rather than refusing, and the
 /// caller is answered with what was *settled on*, which is the same contract.
 /// `None` when the device offers nothing to round to.
+///
+/// ```
+/// use mpos::syscall::linux::abi::oss_round_rate;
+///
+/// let rates = [8000u32, 11_025, 16_000, 22_050, 44_100, 48_000];
+/// // The distance is relative, not absolute: a request for 44.1 kHz lands on
+/// // 44.1 kHz exactly, and one for 40 kHz goes to 44.1 rather than to the
+/// // numerically nearer 48 - a linear minimum would always answer 48000 here.
+/// assert_eq!(oss_round_rate(44_100, &rates), Some(44_100));
+/// assert_eq!(oss_round_rate(40_000, &rates), Some(44_100));
+/// assert_eq!(oss_round_rate(9_000, &rates), Some(8_000));
+/// assert_eq!(oss_round_rate(44_100, &[]), None);
+/// ```
 pub fn oss_round_rate(requested: u32, supported: &[u32]) -> Option<u32> {
     /// Relative distance, in thousandths: 8 kHz away from 44.1 kHz and 48 kHz
     /// away from 44.1 kHz are not the same complaint, and a linear-absolute

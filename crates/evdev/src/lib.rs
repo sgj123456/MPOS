@@ -235,6 +235,21 @@ impl Records {
     /// claim by someone else while it is held - Linux's `EBUSY`. Dropping is
     /// never refused, and a release by a description that does not hold the
     /// device leaves it exactly as it was, as on Linux.
+    ///
+    /// ```
+    /// use mpos_evdev::Records;
+    ///
+    /// let mut r = Records::new();
+    /// assert!(r.set_grab(true, 7)); // the compositor claims the device
+    /// assert_eq!(r.grabbed_by(), 7);
+    /// assert!(r.set_grab(true, 7), "re-claiming what you hold is not EBUSY");
+    /// assert!(!r.set_grab(true, 9), "a second claimant is refused");
+    /// // A client under a grab takes nothing: zero bytes, never the grabber's records.
+    /// assert_eq!(r.take(9, &mut [0u8; 24]), Some(0));
+    /// assert!(r.set_grab(false, 9), "dropping is never refused...");
+    /// assert_eq!(r.grabbed_by(), 7, "...and by a non-holder changes nothing");
+    /// assert!(r.set_grab(false, 7));
+    /// ```
     pub fn set_grab(&mut self, on: bool, ofd: u64) -> bool {
         if !on {
             if self.grab == ofd {
@@ -316,6 +331,21 @@ impl Records {
 
     /// Whether `ofd`'s access has been revoked - the fact the read and ioctl
     /// paths turn into `ENODEV`.
+    ///
+    /// ```
+    /// use mpos_evdev::Records;
+    ///
+    /// let mut r = Records::new();
+    /// // A revoke can arrive before the client ever read: it marks a client
+    /// // for ofd, making one if needed.
+    /// r.set_revoked(5, true);
+    /// assert!(r.is_revoked(5));
+    /// assert!(!r.is_revoked(6)); // a sibling keeps its access
+    /// // A revoked reader takes nothing, whatever is in the window.
+    /// assert_eq!(r.take(5, &mut [0u8; 24]), Some(0));
+    /// r.set_revoked(5, false);
+    /// assert!(!r.is_revoked(5));
+    /// ```
     pub fn is_revoked(&self, ofd: u64) -> bool {
         self.clients
             .iter()

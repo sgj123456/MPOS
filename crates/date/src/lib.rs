@@ -33,6 +33,16 @@ pub const DAYS_MAX: i64 = days_from_civil(YEAR_MAX, 12, 31);
 /// The year is clamped into [`YEAR_MIN`]..=[`YEAR_MAX`] first; a date outside
 /// that is not a date, and the sum has to say so by returning the nearest one
 /// rather than by overflowing.
+///
+/// ```
+/// use mpos_date::{YEAR_MAX, days_from_civil};
+///
+/// assert_eq!(days_from_civil(1970, 1, 1), 0); // the epoch anchor
+/// assert_eq!(days_from_civil(2024, 2, 29), 19_782); // a leap day counts
+/// assert_eq!(days_from_civil(1900, 3, 1), -25_508); // 1900 was NOT a leap year
+/// // Outside the calendar the answer is the nearest date, never an overflow:
+/// assert_eq!(days_from_civil(i64::MAX, 6, 15), days_from_civil(YEAR_MAX, 6, 15));
+/// ```
 pub const fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if y < YEAR_MIN {
         YEAR_MIN
@@ -58,6 +68,16 @@ pub const fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// reason the year is clamped going forwards - within that range the two
 /// directions are exact inverses of each other, and outside it there is
 /// nothing to be exact about.
+///
+/// ```
+/// use mpos_date::{civil_from_epoch, days_from_civil};
+///
+/// assert_eq!(civil_from_epoch(0), (1970, 1, 1));
+/// assert_eq!(civil_from_epoch(-1), (1969, 12, 31)); // the day before the epoch
+/// // Inside the domain the pair round-trips exactly:
+/// assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+/// assert_eq!(civil_from_epoch(11_017), (2000, 3, 1));
+/// ```
 pub fn civil_from_epoch(days: i64) -> (i64, u32, u32) {
     let days = days.clamp(DAYS_MIN, DAYS_MAX);
     let z = days + 719_468;

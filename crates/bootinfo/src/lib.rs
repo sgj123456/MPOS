@@ -187,6 +187,19 @@ impl MemKind {
     /// the boot stack as allocatable memory (`NOTES.md` §13.17), so a loader that
     /// disagreed about it stops by name instead of handing the kernel the stack it
     /// is standing on.
+    ///
+    /// ```
+    /// use mpos_bootinfo::MemKind;
+    ///
+    /// assert!(MemKind::Usable.is_allocatable());
+    /// // The exclusions are the contract, not an inference: the boot stack is
+    /// // memory this kernel is still running on, and unparsed ACPI tables are
+    /// // memory something else still owns.
+    /// assert!(!MemKind::BootloaderReclaimable.is_allocatable());
+    /// assert!(!MemKind::AcpiReclaimable.is_allocatable());
+    /// assert!(!MemKind::KernelAndModules.is_allocatable());
+    /// assert!(!MemKind::Framebuffer.is_allocatable());
+    /// ```
     pub fn is_allocatable(self) -> bool {
         matches!(self, MemKind::Usable)
     }

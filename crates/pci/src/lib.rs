@@ -148,6 +148,23 @@ pub const PCI_ERROR_RESPONSE: u32 = 0xffff_ffff;
 /// BAR, but not to a bridge's window registers, and the two are described by
 /// different functions in Linux. [`bar_range`] is the one that describes a BAR
 /// and so is the one that adds it.
+///
+/// ```
+/// use mpos_pci::{IORESOURCE_IO, IORESOURCE_MEM, IORESOURCE_MEM_64, bar_flags};
+///
+/// // An I/O BAR keeps its space indicator in the flags; second element says
+/// // there is no upper half to read.
+/// let (flags, wide) = bar_flags(0x0000_e001);
+/// assert_eq!(flags & IORESOURCE_IO, IORESOURCE_IO);
+/// assert!(!wide);
+/// // A 64-bit memory BAR folds bit 2 into IORESOURCE_MEM_64 - dropping it
+/// // would describe a different device than Linux does - and asks for the
+/// // next register as its upper half.
+/// let (flags, wide) = bar_flags(0x0000_0004);
+/// assert_eq!(flags & IORESOURCE_MEM, IORESOURCE_MEM);
+/// assert_eq!(flags & IORESOURCE_MEM_64, IORESOURCE_MEM_64);
+/// assert!(wide);
+/// ```
 pub fn bar_flags(low: u32) -> (u32, bool) {
     if low & 1 == 1 {
         // An I/O BAR: the low two bits are the space indicator and the
@@ -174,6 +191,12 @@ pub fn bar_flags(low: u32) -> (u32, bool) {
 /// devices that answer nonsense: a mask of zero means nothing to size, and a
 /// base that equals its own mask with an incomplete one means the BAR is
 /// already programmed with all ones, which no size can be read from.
+///
+/// ```text
+/// pci_size(0,           0xffff_f000, 0xffff_f000) == 4096  // a 4 KiB BAR's read-back
+/// pci_size(0x1000,      0,           0)           == 0     // nothing to size
+/// pci_size(0xffff_fff0, 0xffff_fff0, 0xffff_fff0) == 0     // all-ones programming
+/// ```
 pub fn pci_size(base: u64, maxbase: u64, mask: u64) -> u64 {
     let size = mask & maxbase;
     if size == 0 {

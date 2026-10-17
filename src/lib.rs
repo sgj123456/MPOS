@@ -3,7 +3,9 @@
 //! The crate is split so that everything which does not touch machine state
 //! lives in this library and can be unit-tested on the host:
 //!
-//!     cargo test --lib --target x86_64-unknown-linux-gnu
+//! ```text
+//! cargo test --lib --target x86_64-unknown-linux-gnu
+//! ```
 //!
 //! Machine-dependent code (`arch`, the console, the boot handoff) is compiled
 //! only for `target_os = "none"`, which is what keeps the host build free of

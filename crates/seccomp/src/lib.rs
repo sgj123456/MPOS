@@ -459,6 +459,20 @@ fn load(data: &[u8; DATA_BYTES], offset: usize, size: u16) -> Option<u32> {
 /// `0x8000_0000`, so as an `i32` it is the smallest value there is and outranks
 /// every other action, while `ALLOW` (`0x7fff_0000`) is the largest. A plain
 /// unsigned minimum would let `ALLOW` beat a kill.
+///
+/// ```
+/// use mpos_seccomp::{RET_ALLOW, RET_ERRNO, RET_KILL_PROCESS, more_restrictive};
+///
+/// // The signed comparison is what makes KILL_PROCESS (0x8000_0000) outrank
+/// // ALLOW (0x7fff_0000); an unsigned min would let ALLOW win a kill.
+/// assert_eq!(more_restrictive(RET_ALLOW, RET_KILL_PROCESS), RET_KILL_PROCESS);
+/// assert_eq!(more_restrictive(RET_KILL_PROCESS, RET_ALLOW), RET_KILL_PROCESS);
+/// // Ties return the first argument, and its data half travels with it -
+/// // two ERRNO answers for different errnos are equally restrictive.
+/// let eperm = RET_ERRNO | 1;
+/// let einval = RET_ERRNO | 22;
+/// assert_eq!(more_restrictive(eperm, einval), eperm);
+/// ```
 pub fn more_restrictive(a: u32, b: u32) -> u32 {
     if (a & ACTION_FULL) as i32 <= (b & ACTION_FULL) as i32 {
         a
@@ -499,6 +513,19 @@ pub fn action_data(ret: u32) -> u32 {
 /// because Linux treats an action it does not know as `KILL_PROCESS`, so a
 /// program asks *before* it relies on one; answering yes to something not
 /// implemented lets a filter kill its own process instead of falling back.
+///
+/// ```
+/// use mpos_seccomp::{RET_ALLOW, RET_ERRNO, RET_USER_NOTIF, supported};
+///
+/// assert!(supported(RET_ALLOW));
+/// assert!(supported(RET_ERRNO)); // the bare action, no data half
+/// // USER_NOTIF is the one action this kernel has no supervisor for.
+/// assert!(!supported(RET_USER_NOTIF));
+/// // And any word with anything in its data half is refused - measured on
+/// // Linux, where asking about ERRNO|1 is a "no". The probe is a question
+/// // about eight whole words, not their high halves.
+/// assert!(!supported(RET_ERRNO | 1));
+/// ```
 pub fn supported(ret: u32) -> bool {
     matches!(
         ret,

@@ -1419,6 +1419,31 @@ pub fn may_alter(inode: &Arc<dyn Inode>) -> VfsResult<()> {
 ///
 /// The returned word carries the owned bits over as they stand, so a filesystem
 /// cannot lose its layout by trusting the caller's argument.
+///
+/// ```
+/// use mpos::vfs::{FS_APPEND_FL, FS_EXTENT_FL, FS_IMMUTABLE_FL, apply_flag_change};
+///
+/// // Setting a modifiable bit is accepted, and comes back in the stored word.
+/// assert_eq!(apply_flag_change(0, FS_IMMUTABLE_FL, 0), Ok(FS_IMMUTABLE_FL));
+/// // Clearing it works the same way - old had it, new does not.
+/// assert_eq!(apply_flag_change(FS_APPEND_FL, 0, 0), Ok(0));
+/// // A bit this kernel cannot hold is refused - EOPNOTSUPP, the answer chattr
+/// // prints and the one that sends the caller to its fallback.
+/// assert!(apply_flag_change(0, 1 << 30, 0).is_err());
+/// // A *change* to an owned bit is refused rather than quietly ignored: a
+/// // caller trying to set or clear the extent tree gets the refusal. Note the
+/// // rule's shape - it compares old against new, so a caller that merely
+/// // repeats an owned bit it already had passes the gate (last line below).
+/// assert!(apply_flag_change(0, FS_EXTENT_FL, FS_EXTENT_FL).is_err());
+/// assert!(apply_flag_change(FS_EXTENT_FL, 0, FS_EXTENT_FL).is_err());
+/// // The carry-over only shows when the new word simply omits what was never
+/// // asked about: the old un-modifiable half survives into the stored word
+/// // even though `new` did not name it.
+/// assert_eq!(
+///     apply_flag_change(FS_EXTENT_FL, FS_IMMUTABLE_FL, 0),
+///     Ok(FS_EXTENT_FL | FS_IMMUTABLE_FL)
+/// );
+/// ```
 pub fn apply_flag_change(old: u32, new: u32, owned: u32) -> VfsResult<u32> {
     if new & !(INODE_FL_MODIFIABLE | owned) != 0 {
         return Err(VfsError::Unsupported);
