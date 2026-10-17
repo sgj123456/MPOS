@@ -283,12 +283,25 @@ Section numbers are unchanged from the original `UAPI.md`.
   host's under `MPOS_ON_HOST`, printing what the host said. `docs/notes/` §15.11
   (batch 22).
 
-- **`FIONREAD` on a regular file and on a pipe.** Linux answers `0` and the bytes
-  remaining/queued; this kernel answers `ENOTTY` for everything that is not the entropy
-  pair. The `ENOTTY` is an honest "this descriptor has no queue-length story here" rather
-  than a wrong number, so it is not a §3.2 defect — but it is a divergence a program can
-  see. Closing it needs a per-descriptor byte count (a pipe has one; a file has
-  `size - offset`). Owner: `fs.rs` + the node's own `poll` story.
+- **`FIONREAD` answers Linux's per-type byte count on a regular file and a pipe. Landed
+  2026-10-17** (`docs/uapi/` §5.1 item 30). The entry this replaces said this kernel answered
+  `ENOTTY` for everything that is not the entropy pair, and that closing it needs a
+  per-descriptor byte count (a pipe has one; a file has `size - offset`). Measured on a current
+  host first (`.workbuddy/probe_fionread.c`, Linux 7.2.9), the answer is one rule *per file
+  type*: a regular file is `i_size - f_pos` and is **not clamped** (a 10-byte file at offset 20
+  answers `-10`, because Linux's `put_user(i_size_read(inode) - file->f_pos, int __user *)`
+  truncates the wide subtraction to a signed 32-bit word; a `/proc` file, a regular file by
+  `S_ISREG` with size 0, answers `-f_pos`), a pipe is its queued bytes on *both* ends, and the
+  two entropy devices are `EINVAL`; a directory, an `eventfd`, `/dev/null` and `/dev/zero` are
+  `ENOTTY`. The file and the pipe are served now, each through the node's own answer
+  (`as_pipe()` for the queue, the description's position and `NodeKind::File` for the rest).
+  **Two kinds stay named**, each measured by the same probe and each a queue-length story this
+  kernel has not built: a **socket** (a `socketpair` end reports its queued bytes - 3 after a
+  three-byte write - and so does a network socket) and a **tty/pty** (0 on both ends). Both are
+  refused `ENOTTY` here, which is a divergence a caller can see. Owner for the socket half:
+  `src/net/socket.rs` and `src/vfs/pipe.rs`'s `DuplexEnd`; for the tty half: `src/vfs/tty.rs`.
+  Owner for the pair that landed: `src/syscall/linux/fs/ioctl.rs`'s `0x541B` arm, pinned by
+  `t-ioctl`.
 - **`RNDRESEEDCRNG` provenance.** Now that the reseed is real, `RNDGETENTCNT`'s 4096 stays
   a constant across it; a caller that reseeds and re-reads sees the same figure Linux shows,
   so no change is needed — recorded so the next reader does not "fix" it into a lie.

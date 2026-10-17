@@ -815,3 +815,28 @@ the commit bodies), and each moved its pin in the same commit.
     **`CLD_DUMPED`/`WCOREDUMP`** half — where the measurement also corrects a *reason*: the core bit
     is not about a file being written (a `SIGSEGV` child reports it with `RLIMIT_CORE` 0), so
     `wait_status`'s comment that said "mpos writes no core files" was explaining the wrong thing.
+
+30. **`FIONREAD` answers Linux's per-type byte count on a regular file and a pipe.** The request
+    means "how many bytes can I read before I would block", and Linux answers it per *file type*
+    rather than with one rule; this kernel answered `ENOTTY` to everything but the entropy pair,
+    which §5.2 named as a divergence a caller can see. Measured whole on a current host first
+    (`.workbuddy/probe_fionread.c`, Linux 7.2.9, the descriptor zoo in one run): a **regular file**
+    answers `i_size - f_pos` — `10` at offset 0 of a ten-byte file, `6` after a four-byte read, `0`
+    at end of file, and **`-10`** at offset 20, because Linux's
+    `put_user(i_size_read(inode) - file->f_pos, int __user *)` truncates the wide subtraction to a
+    signed 32-bit word instead of clamping it (and a `/proc` file, a regular file by `S_ISREG`
+    with size 0, answers `-f_pos`); a **pipe** answers its queued bytes, on *both* ends (`5` after
+    a five-byte write, and the same for a FIFO, whose opened end is the same `PipeEnd`); the two
+    **entropy devices** answer `EINVAL` before the argument is read (item 1); and a **directory**,
+    an `eventfd`, `/dev/null` and `/dev/zero` answer `ENOTTY`. The pointer is looked at only where
+    there is a value to write — the same bad pointer is `EFAULT` on a file and a pipe, `ENOTTY` on
+    a directory and `EINVAL` on the pool. **The fix is the one dispatch the node already answers**:
+    `as_pipe()` gives the queued bytes, and the description's own position and `NodeKind::File`
+    give `size - pos` — written as `size.wrapping_sub(pos) as u32 as i32`, which is Linux's
+    truncation — while everything else keeps the honest `ENOTTY`. Owner:
+    `src/syscall/linux/fs/ioctl.rs`'s `0x541B` arm. Pin: `t-ioctl`'s new section (nine claims,
+    green on this host first) — the file's four offsets (the negative included, the counterfactual
+    against a saturating subtraction), the pipe's two ends, the bad-pointer `EFAULT`, and the
+    directory's `ENOTTY`. **Two kinds stay named in §5.2** from the same measurement: a *socket*
+    (a `socketpair` end or a network socket) answers its queued bytes and a *tty* (pty included)
+    answers `0` on Linux, neither of which this kernel answers yet.

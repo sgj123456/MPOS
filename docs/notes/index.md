@@ -38,7 +38,7 @@ A bare `§N` (no `.M`) means the whole phase — file N's top section. A `(§N)`
 - **§13.1–§13.31**: the numbered *entries* are checklist items in
   [appendix-status-board.md](appendix-status-board.md); [13-machine-seam.md](13-machine-seam.md) holds
   the phase's plan and measured starting state (§13.x as table rows). Search both.
-- **§15.10–§15.45**: these entries are table rows inside [15-boot-flow.md](15-boot-flow.md), not
+- **§15.10–§15.46**: these entries are table rows inside [15-boot-flow.md](15-boot-flow.md), not
   headings. §15.8/§15.9/§15.12/§15.13 sit at the *end* of that file (they were appended after the
   appendix when the notes grew, and the split moved them back).
 - **§12.4a** appears twice by history (the step-1 diagnosis, and the two-reds closure); keep both.

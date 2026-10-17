@@ -730,29 +730,71 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         }
         0x541B => {
             // FIONREAD: "how many bytes can I read before I would block".
-            // The two entropy devices are the case this arm is reached for,
-            // and Linux refuses them: measured on 7.2.7 (2026-10-01), both
-            // `/dev/random` and `/dev/urandom` answer `EINVAL` - root and
-            // unprivileged, `O_RDONLY` and `O_WRONLY`, and *before* the
-            // argument is looked at (a NULL or unmapped pointer is still
-            // `EINVAL`, not `EFAULT`). The 512 this arm used to write was a
-            // divergence, and the reason it was written down for was false:
-            // OpenRC's `seedrng` never asks `FIONREAD` - the binary in this
-            // image sends one ioctl, the `RNDADDENTROPY` credit below, and
-            // takes its seed length from `/proc/sys/kernel/random/poolsize`.
-            // Other descriptors keep their own queue-length story for a later
-            // day; here a pipe or socket asking is answered the honest
-            // `ENOTTY` rather than a borrowed zero. (A regular file and a pipe
-            // *would* answer 0 with their remaining/queued bytes on Linux;
-            // that is a named divergence in `docs/uapi/` §5.2, not this arm's.)
+            //
+            // Linux answers this one *per file type* rather than with one rule,
+            // and the whole zoo was measured on a current host before any of it
+            // was written (`.workbuddy/probe_fionread.c`, Linux 7.2.9):
+            //
+            //   * a **regular file** answers `i_size - f_pos`: 10 at offset 0 of
+            //     a 10-byte file, 6 after a four-byte read, 0 at end of file,
+            //     and **-10** at offset 20 - the subtraction is *not* clamped.
+            //     Linux computes it as `put_user(i_size_read(inode) -
+            //     file->f_pos, int __user *)`, so the wide result is truncated
+            //     to a signed 32-bit word rather than saturated, and a `/proc`
+            //     file (a regular file by `S_ISREG`, size 0) answers `-f_pos`;
+            //   * a **pipe** answers its queued bytes, on *both* ends (5 after
+            //     a five-byte write) - and so does a FIFO, whose opened end is
+            //     the same `PipeEnd`;
+            //   * the two **entropy devices** answer `EINVAL`: measured on
+            //     7.2.7, root and unprivileged, `O_RDONLY` and `O_WRONLY`, and
+            //     *before* the argument is looked at (a NULL or unmapped
+            //     pointer is still `EINVAL`, not `EFAULT`). The 512 this arm
+            //     used to write was a divergence whose stated reason was false:
+            //     OpenRC's `seedrng` never asks `FIONREAD` - the binary in this
+            //     image sends one ioctl, the `RNDADDENTROPY` credit below, and
+            //     takes its seed length from `/proc/sys/kernel/random/poolsize`;
+            //   * a **directory**, an `eventfd`, `/dev/null` and `/dev/zero`
+            //     answer `ENOTTY`.
+            //
+            // The pointer is looked at only where there is a value to write:
+            // with the same bad pointer, a regular file and a pipe answer
+            // `EFAULT`, while a directory stays `ENOTTY` and an entropy device
+            // `EINVAL` - Linux's order, measured. Two node kinds this kernel
+            // serves still have no answer here and stay named in `docs/uapi/`
+            // §5.2 rather than borrowed: a **socket** (a `socketpair` end, or a
+            // network socket) answers its queued bytes on Linux, and a **tty**
+            // (and pty) answers `0`; both are refused `ENOTTY` here.
             let file = match crate::sched::current_fds().clone_at(fd) {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
             };
-            match file.inode().rdev() {
-                Some((1, 8)) | Some((1, 9)) => err::EINVAL,
-                _ => err::ENOTTY,
+            let inode = file.inode();
+            // The entropy devices refuse before the argument is read (measured).
+            if matches!(inode.rdev(), Some((1, 8)) | Some((1, 9))) {
+                return err::EINVAL;
             }
+            let value = if let Some(pipe) = inode.as_pipe() {
+                pipe.buffered() as i32
+            } else if inode.as_duplex().is_some() || inode.socket_handle() != 0 {
+                // A socket: Linux's queued-bytes answer is not built here yet
+                // (`docs/uapi/` §5.2), and a made-up number would be worse than
+                // the refusal. Ask before the kind below, because a `socketpair`
+                // end reports `NodeKind::File` like a regular file does.
+                return err::ENOTTY;
+            } else if inode.metadata().kind == crate::vfs::NodeKind::File {
+                // Linux's `put_user(i_size - f_pos, int __user *)`: the wide
+                // subtraction truncated to a signed 32-bit word, not clamped.
+                inode.metadata().size.wrapping_sub(file.pos()) as u32 as i32
+            } else {
+                // A directory, an anonymous-inode descriptor, a character or
+                // block device that is not the pool: `ENOTTY` on Linux too.
+                return err::ENOTTY;
+            };
+            if !buffer_ok(buf, 4, true, from_user) {
+                return err::EFAULT;
+            }
+            unsafe { (buf as *mut i32).write_unaligned(value) };
+            0
         }
         // The entropy-pool ioctls (`'R'`-typed), answered on the two device
         // numbers the pool's names carry. A `'R'` word on any other descriptor

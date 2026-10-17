@@ -63,7 +63,8 @@ use std::ffi::c_void;
 
 use mpos_user_tests::{Report, host_run};
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
-use rustix::fs::{CWD, Mode, OFlags, openat};
+use rustix::fs::{AtFlags, CWD, Mode, OFlags, SeekFrom, openat, seek, unlinkat};
+use rustix::io::write;
 use rustix::process::{geteuid, getuid};
 
 // The request words. The terminal trio and FIONREAD come from libc's
@@ -445,6 +446,101 @@ fn main() {
         errno,
         libc::EINVAL,
     );
+
+    // ---- FIONREAD on the descriptors that have a queue-length story ----
+    //
+    // Linux answers this request per file type, measured on the host first
+    // (`.workbuddy/probe_fionread.c`, Linux 7.2.9) before any of it was made:
+    // a regular file reports `i_size - f_pos` - 10 at the start of a ten-byte
+    // file, 6 after a four-byte read, 0 at end of file, and **-10** at offset
+    // 20, because the wide subtraction is truncated to `int` rather than
+    // clamped - and a pipe reports its queued bytes on **both** ends. Both used
+    // to be `ENOTTY` here, which the `docs/uapi/` §5.2 entry named as the
+    // divergence this section closes. The same probe measured what stays named
+    // rather than claimed: a socket (a `socketpair` end or a network socket)
+    // reports its queued bytes and a tty (pty included) reports 0 on Linux,
+    // neither of which this kernel answers yet; a directory reports `ENOTTY`
+    // there too, which the last claim pins.
+    let tmp = "/tmp/t-ioctl-fionread";
+    match openat(
+        CWD,
+        tmp,
+        OFlags::CREATE | OFlags::RDWR | OFlags::TRUNC,
+        Mode::from(0o600),
+    ) {
+        Ok(f) => {
+            write(&f, b"0123456789").expect("write the ten-byte fixture");
+            let mut n: i32 = -1;
+            seek(&f, SeekFrom::Start(0)).expect("rewind the fixture");
+            let (rc, _) = ioctl_fd(&f, FIONREAD, &raw mut n as *mut c_void);
+            r.check(
+                "FIONREAD on a regular file at offset 0 reports 10",
+                rc == 0 && n == 10,
+            );
+            let mut b = [0u8; 4];
+            let _ = rustix::io::read(&f, &mut b);
+            let (rc, _) = ioctl_fd(&f, FIONREAD, &raw mut n as *mut c_void);
+            r.check(
+                "after a four-byte read it reports the remaining 6",
+                rc == 0 && n == 6,
+            );
+            seek(&f, SeekFrom::End(0)).expect("seek to end of file");
+            let (rc, _) = ioctl_fd(&f, FIONREAD, &raw mut n as *mut c_void);
+            r.check("at end of file it reports 0", rc == 0 && n == 0);
+            // The one shape a saturating subtraction would get wrong: past the
+            // end, Linux writes a negative count rather than stopping at zero.
+            seek(&f, SeekFrom::Start(20)).expect("seek past the end");
+            let (rc, _) = ioctl_fd(&f, FIONREAD, &raw mut n as *mut c_void);
+            r.check(
+                "past the end the subtraction is truncated, not clamped (-10)",
+                rc == 0 && n == -10,
+            );
+            let (_, errno) = ioctl_fd(&f, FIONREAD, core::ptr::null_mut());
+            err_is(
+                &mut r,
+                "a NULL destination on a regular file is EFAULT, not ENOTTY",
+                errno,
+                libc::EFAULT,
+            );
+            let _ = unlinkat(CWD, tmp, AtFlags::empty());
+        }
+        Err(e) => r.check(&format!("the FIONREAD fixture opens ({e:?})"), false),
+    }
+
+    // A pipe reports its queued bytes, and it is the *same* buffer both ends
+    // count - the write end included.
+    match rustix::pipe::pipe() {
+        Ok((rd, wr)) => {
+            let mut n: i32 = -1;
+            let (rc, _) = ioctl_fd(&rd, FIONREAD, &raw mut n as *mut c_void);
+            r.check("FIONREAD on an empty pipe reports 0", rc == 0 && n == 0);
+            write(&wr, b"abcde").expect("write the five bytes");
+            let (rc, _) = ioctl_fd(&rd, FIONREAD, &raw mut n as *mut c_void);
+            r.check(
+                "the pipe's read end reports the five queued bytes",
+                rc == 0 && n == 5,
+            );
+            let (rc, _) = ioctl_fd(&wr, FIONREAD, &raw mut n as *mut c_void);
+            r.check("and its write end reports them too", rc == 0 && n == 5);
+        }
+        Err(e) => r.check(&format!("a pipe is made ({e:?})"), false),
+    }
+
+    // A directory has no queue-length story on either kernel.
+    if let Ok(dir) = openat(
+        CWD,
+        "/tmp",
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+    ) {
+        let (_, errno) = ioctl_fd(&dir, FIONREAD, &raw mut word as *mut c_void);
+        err_is(
+            &mut r,
+            "FIONREAD on a directory is ENOTTY",
+            errno,
+            libc::ENOTTY,
+        );
+    }
 
     // The mutating family and the capability dance need CAP_SYS_ADMIN or root;
     // a hosted unprivileged run meets EPERM at every door (measured), so the
