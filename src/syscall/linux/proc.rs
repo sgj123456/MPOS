@@ -79,6 +79,8 @@ fn build_frame(
             uid: info.uid,
             value: info.value,
             status: info.status,
+            utime: info.utime,
+            stime: info.stime,
         },
         alt: alt.map(|stack| (stack.sp, stack.size)),
         on_alt: action.flags & crate::sched::signal::SA_ONSTACK != 0,
@@ -2123,6 +2125,8 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
                     uid: record.uid,
                     value: record.value,
                     status: record.status,
+                    utime: record.utime,
+                    stime: record.stime,
                 };
                 unsafe {
                     core::ptr::write_bytes(info as *mut u8, 0, SIGINFO_BYTES);
@@ -2133,6 +2137,13 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
                     ((info + 20) as *mut i32).write_unaligned(record.uid); // si_uid
                     if wire.chld_union() {
                         ((info + 24) as *mut i32).write_unaligned(record.status); // si_status
+                        // The child's CPU, the rest of the `_sigchld` member:
+                        // `si_utime`/`si_stime`, each an 8-byte `clock_t`, at
+                        // Linux's offsets 32 and 40. `sigtimedwait` renders the
+                        // same record a handler's frame does, so both must carry
+                        // them - the record is the sender's, the door is not.
+                        ((info + 32) as *mut u64).write_unaligned(record.utime); // si_utime
+                        ((info + 40) as *mut u64).write_unaligned(record.stime); // si_stime
                     } else {
                         // The `union sigval`, at the offset the `si_value` of a
                         // queued signal lives in the ABI's layout - the same
@@ -3627,8 +3638,14 @@ pub(super) fn handle_time(args: [usize; ARG_COUNT]) -> isize {
 /// is the `CLK_TCK` musl hardcodes and hands to `sysconf(_SC_CLK_TCK)`, so a
 /// caller converting ticks to seconds divides by 100 and must get the same unit
 /// back from the kernel - otherwise its CPU arithmetic is off by `TICK_HZ/100`.
+///
+/// The rule now lives in `crates/abi` (`clock_ticks_to_user_hz`), because the
+/// scheduler's exit path asks the same question for a `SIGCHLD` record's
+/// `si_utime`/`si_stime` and cannot name this module. This is the machine's
+/// `TICK_HZ` supplied to that leaf, so the two report one unit - a second
+/// multiply here is how a `times(2)` total and a child's record come to differ.
 fn clock_ticks_to_user_hz(ticks: u64) -> u64 {
-    ticks * 100 / crate::hal::TICK_HZ as u64
+    crate::abi::clock_ticks_to_user_hz(ticks, crate::hal::TICK_HZ as u64)
 }
 
 /// `times(buf)` — this process's CPU time, in clock ticks.

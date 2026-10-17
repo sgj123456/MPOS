@@ -380,6 +380,14 @@ pub struct SigInfo {
     /// `siginfo_t` and a `signalfd`'s `ssi_status`) read them apart; the class
     /// test lives in one place, `crate::hal::SignalInfo::chld_union`.
     pub status: i32,
+    /// The child's CPU time in `USER_HZ` ticks - `si_utime`/`si_stime`, the
+    /// other half of the `_sigchld` member, and zero for every other sender
+    /// (no other class has these fields). They are stored **already
+    /// converted** from this kernel's internal ticks, because the sender
+    /// computes them once at the child's death and every renderer writes the
+    /// same unit; the conversion is `crate::abi::clock_ticks_to_user_hz`.
+    pub utime: u64,
+    pub stime: u64,
 }
 
 impl SigInfo {
@@ -392,6 +400,8 @@ impl SigInfo {
         uid: 0,
         value: 0,
         status: 0,
+        utime: 0,
+        stime: 0,
     };
 
     /// A `kill`/`tgkill` record: `SI_USER`, from `pid`/`uid`, no payload.
@@ -404,6 +414,8 @@ impl SigInfo {
             uid,
             value: 0,
             status: 0,
+            utime: 0,
+            stime: 0,
         }
     }
 
@@ -417,6 +429,8 @@ impl SigInfo {
             uid,
             value,
             status: 0,
+            utime: 0,
+            stime: 0,
         }
     }
 
@@ -430,6 +444,8 @@ impl SigInfo {
             uid: 0,
             value: 0,
             status: 0,
+            utime: 0,
+            stime: 0,
         }
     }
 
@@ -443,6 +459,8 @@ impl SigInfo {
             uid: 0,
             value: 0,
             status: 0,
+            utime: 0,
+            stime: 0,
         }
     }
 
@@ -467,10 +485,19 @@ impl SigInfo {
     /// `uid` is the child's **real** id, which is what Linux fills here
     /// (`task_uid`, not the effective one) and what the retired record carries
     /// for `waitid`'s `si_uid` as well, so the two doors name the same owner.
-    /// `si_utime`/`si_stime` are not part of this record: Linux fills them with
-    /// the child's CPU in clock ticks, and this kernel leaves them zero
-    /// (`docs/uapi/` §5.2's note).
-    pub fn child(pid: i32, uid: i32, code: isize, dumped: bool) -> SigInfo {
+    ///
+    /// `utime`/`stime` are the child's CPU in `USER_HZ` ticks, `si_utime` and
+    /// `si_stime`. Linux's `do_notify_parent` fills them from
+    /// `nsec_to_clock_t(tsk->utime + tsk->signal->utime)` (and the system
+    /// pair), so the group's totals are the wrong-side-up thing to read: the
+    /// caller hands them in already converted, because the sender computes them
+    /// once at the death where the `mm` still holds the counters. Measured on a
+    /// current host (`.workbuddy/probe_sigchld_cputime.c`, Linux 7.2.9): a child
+    /// that burns ~100 ms arrives as `si_utime` 9, a child that only exits as
+    /// `0`/`0`, the same pair through a handler's `siginfo_t` and a `signalfd`
+    /// read - and `waitid` does **not** carry them, its record having no such
+    /// field (the probe reads zero through every `waitid` door).
+    pub fn child(pid: i32, uid: i32, code: isize, dumped: bool, utime: u64, stime: u64) -> SigInfo {
         let (code, status) = crate::abi::exit_chld(code, dumped);
         SigInfo {
             signo: SIGCHLD as i32,
@@ -480,6 +507,8 @@ impl SigInfo {
             uid,
             value: 0,
             status,
+            utime,
+            stime,
         }
     }
 }

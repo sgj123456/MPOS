@@ -223,11 +223,17 @@ impl SignalFrame for Current {
         put_i32(out, SIGINFO + 16, info.pid);
         put_i32(out, SIGINFO + 20, info.uid);
         // Which union member that word is depends on the code's class, and the
-        // rule is `hal`'s - a child's death puts `si_status` there (with the
-        // `_sigchld` member's times left zero, which is `docs/uapi/` §5.2's
-        // named residual), every other sender puts the `sigval`.
+        // rule is `hal`'s - a child's death puts `si_status` there, every other
+        // sender puts the `sigval`.
         if info.chld_union() {
             put_i32(out, SIGINFO + 24, info.status);
+            // And the rest of the `_sigchld` member: the child's CPU in
+            // `USER_HZ` ticks, `si_utime` at offset 32 and `si_stime` at 40 -
+            // Linux x86_64's own offsets, where the 8-byte `clock_t`s sit after
+            // the 4-byte status. The frame buffer is zeroed before this runs, so
+            // a record whose sender left them zero writes nothing here.
+            put(out, SIGINFO + 32, info.utime);
+            put(out, SIGINFO + 40, info.stime);
         } else {
             put(out, SIGINFO + 24, info.value);
         }

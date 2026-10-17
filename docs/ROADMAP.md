@@ -344,12 +344,14 @@ table is what would make the number mean a device.
 2026-10-17): the second book this kernel kept for "an exit whose signal is unread" is deleted — the
 exit queues the real signal with `CLD_EXITED`/`CLD_KILLED` and the status beside it, and a death the
 parent never asked to be signalled for leaves nothing readable (measured on a host first, all four
-dispositions). Two semantics stay named there: an **ignored** child is reaped by Linux and kept as a
-zombie here, and `si_utime`/`si_stime` stay zero. The third this paragraph used to name is closed:
-a signalled death is now **`CLD_DUMPED` with `WCOREDUMP`** when the signal's default action dumps
-core *and the child was dumpable* (`docs/uapi/` §5.1 item 32, landed 2026-10-17) — a bit that
-follows the signal rather than a file written, which is what the measurement corrected in this
-kernel's own comment about it.
+dispositions). One semantics stays named there: an **ignored** child is reaped by Linux and kept as a
+zombie here. Two more this paragraph used to name are closed: a record now carries the child's CPU in
+**`si_utime`/`si_stime`** (`docs/uapi/` §5.1 item 33, landed 2026-10-17 — `USER_HZ` ticks, through
+the descriptor, a handler's frame and `sigtimedwait`, while `waitid` carries none, which is Linux's
+own answer), and a signalled death is
+now **`CLD_DUMPED` with `WCOREDUMP`** when the signal's default action dumps core *and the child was
+dumpable* (`docs/uapi/` §5.1 item 32, landed 2026-10-17) — a bit that follows the signal rather than
+a file written, which is what the measurement corrected in this kernel's own comment about it.
 
 One of those "buffer sizes" is served now, and the *blocking* half of it was the last of it: a
 **blocking UDP send waits for the send buffer** (`docs/uapi/` §5.1 item 27, landed 2026-10-16) — the

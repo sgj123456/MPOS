@@ -183,27 +183,27 @@ Section numbers are unchanged from the original `UAPI.md`.
     the record. This kernel reported the exit whatever the mask said, which is
     what the no-std version had relied on.
 
-  `t-signalfd` is the pin — 46 claims, no per-machine branch left, green on a
-  current host first (44 with two notes there, where the real uid cannot be
-  moved: `t-waitid`'s shape for that field) — and it claims both halves of the disposition rule
+  `t-signalfd` is the pin — 46 claims at this landing, **62** after the CPU pair
+  below (60 with two notes on a host run, where the real uid cannot be moved:
+  `t-waitid`'s shape for that field), no per-machine branch left, green on a
+  current host first — and it claims both halves of the disposition rule
   (the unblocked death is `EAGAIN`; the sigkill record is `CLD_KILLED` with the
   signal in the status) plus the frame's rendering of the same record.
 
-  **Two residuals stay named rather than hidden.** (a) A child whose `SIGCHLD`
-  is **ignored** is reaped by the kernel on Linux (`waitpid(WNOHANG)` measured as
-  `ECHILD`); this kernel keeps the zombie, so a parent that ignores the signal
-  and never waits holds a slot where Linux holds none. Closing it means skipping
-  the retired record for such a parent *and* making the reap prompt, which is a
-  second behaviour rather than a line of this one. (b) **`si_utime`/`si_stime`
-  stay zero**: Linux fills them with the child's CPU in clock ticks (measured:
-  `utime=6` for a child that burned 60 ms, `0` for one that only exited — so the
-  gap shows on a child that worked, and this kernel has the totals, it simply
-  does not carry them on the record). Owner for both: `src/sched/runtime/`'s exit
-  path and `crate::abi::exit_chld`. `docs/notes/` §15.11 (batch 21, where the
-  divergences were named) and §15.44 (the landing). **A third residual this entry
-  named, `CLD_DUMPED`/`WCOREDUMP`, has since landed — the entry below carries
-  it** — and it is the one whose measurement also corrected the *reason* this tree
-  used to give, so it is worth reading beside the paragraph above.
+  **One residual stays named rather than hidden.** A child whose `SIGCHLD` is
+  **ignored** is reaped by the kernel on Linux (`waitpid(WNOHANG)` measured as
+  `ECHILD`); this kernel keeps the zombie, so a parent that ignores the signal and
+  never waits holds a slot where Linux holds none. Closing it means skipping the
+  retired record for such a parent *and* making the reap prompt, which is a second
+  behaviour rather than a line of this one. Owner: `src/sched/runtime/`'s exit
+  path. `docs/notes/` §15.11 (batch 21, where the divergences were named) and
+  §15.44 (the landing). **The other two residuals this entry named have since
+  landed:** the record's `si_utime`/`si_stime` (Linux's are the child's CPU in
+  ticks — `9` for a 100 ms child, `0`/`0` for one that only exited; now carried,
+  §5.1 item **33**) and `CLD_DUMPED`/`WCOREDUMP` (§5.1 item **32** — the entry
+  below carries it, and it is the one whose measurement also corrected the
+  *reason* this tree used to give, so it is worth reading beside the paragraph
+  above).
 
 - **A death by a core-dumping signal is `CLD_DUMPED` with `WCOREDUMP` — when the
   child was dumpable.** **Landed 2026-10-17** (`docs/uapi/` §5.1 item 32). The

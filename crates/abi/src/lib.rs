@@ -537,6 +537,49 @@ pub fn exit_chld(code: isize, dumped: bool) -> (i32, i32) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CPU time, in the unit a caller reads it in
+// ---------------------------------------------------------------------------
+
+/// `USER_HZ`: the clock-tick rate the Linux userspace ABI speaks, whatever the
+/// kernel's own timer runs at. musl hardcodes `100` and hands it to
+/// `sysconf(_SC_CLK_TCK)`, and both machines this kernel serves use the generic
+/// `100`, so a caller converting a tick count to seconds divides by exactly
+/// this - `times(2)`, a `struct rusage` and a `SIGCHLD` record's
+/// `si_utime`/`si_stime` are one unit.
+pub const USER_HZ: u64 = 100;
+
+/// Convert this kernel's internal tick count into the `USER_HZ` ticks a caller
+/// reads: `ticks * USER_HZ / tick_hz`, **truncated**, one division.
+///
+/// Linux's own conversion is `nsec_to_clock_t` - `x * USER_HZ / NSEC_PER_SEC`,
+/// truncated - and this is the same division one unit up: the machine's timer
+/// runs at `tick_hz` (the PIT's `250`, the generic timer's own rate) rather than
+/// at nanoseconds, and the answer a caller must get back is the same one. Every
+/// field that reports CPU time goes through here, so a `times(2)` total and a
+/// `SIGCHLD` record's `si_utime` cannot come to different units.
+///
+/// The `u128` intermediate is deliberate rather than decorative: a long uptime's
+/// tick count times `USER_HZ` would wrap a `u64` for no reason, and the cost is
+/// a single wide multiply. `tick_hz` is a caller-supplied machine constant
+/// rather than a value read here, because this crate is a leaf and names no
+/// machine (`AGENTS.md` §3's downward-only rule) - the kernel passes
+/// `crate::hal::TICK_HZ`, which is never zero.
+///
+/// ```
+/// use mpos_abi::{USER_HZ, clock_ticks_to_user_hz};
+///
+/// // 250 Hz internal ticks: 250 ticks is one second, 100 USER_HZ ticks.
+/// assert_eq!(clock_ticks_to_user_hz(250, 250), USER_HZ);
+/// // The division truncates, as Linux's does - not rounds.
+/// assert_eq!(clock_ticks_to_user_hz(2, 250), 0);
+/// assert_eq!(clock_ticks_to_user_hz(3, 250), 1);
+/// assert_eq!(clock_ticks_to_user_hz(0, 250), 0);
+/// ```
+pub fn clock_ticks_to_user_hz(ticks: u64, tick_hz: u64) -> u64 {
+    (ticks as u128 * USER_HZ as u128 / tick_hz as u128) as u64
+}
+
 /// The signal numbers [`signal_dumps_core`] names, taken from the Linux
 /// `signal.h` table. Named here rather than in the predicate so a reader can
 /// see the set and a test can hold it to that set.
@@ -855,6 +898,33 @@ mod tests {
         assert_eq!(
             rlimit_admit(low, Rlimit { cur: 10, max: 30 }, true),
             Ok(Rlimit { cur: 10, max: 30 })
+        );
+    }
+
+    #[test]
+    fn a_tick_count_converts_to_the_unit_a_caller_reads() {
+        // The one conversion every CPU-time field goes through, held to Linux's
+        // `nsec_to_clock_t` shape one unit up: the machine's timer rate in,
+        // `USER_HZ` out, truncated. `100` is what musl hardcodes and what both
+        // machines' `sysconf(_SC_CLK_TCK)` answers, so a caller dividing by it
+        // must get the same unit back.
+        assert_eq!(USER_HZ, 100);
+        assert_eq!(clock_ticks_to_user_hz(250, 250), 100); // 250 Hz: 1 s = 100
+        assert_eq!(clock_ticks_to_user_hz(500, 250), 200);
+        assert_eq!(clock_ticks_to_user_hz(0, 250), 0);
+        // Truncation, not rounding: 3/250 s is 1.2 USER_HZ ticks -> 1, and
+        // 2/250 s is 0.8 -> 0. A `round` here is the bug this pins.
+        assert_eq!(clock_ticks_to_user_hz(3, 250), 1);
+        assert_eq!(clock_ticks_to_user_hz(2, 250), 0);
+        // The conversion is the *machine's* rate, not a fixed multiply: a
+        // 1000 Hz timer answers the same seconds from a different count.
+        assert_eq!(clock_ticks_to_user_hz(1000, 1000), 100);
+        assert_eq!(clock_ticks_to_user_hz(1, 1000), 0);
+        // No wrap on a long uptime: a tick count whose `* USER_HZ` overflows a
+        // `u64` still converts, which is the `u128` intermediate's whole job.
+        assert_eq!(
+            clock_ticks_to_user_hz(u64::MAX, 250),
+            (u64::MAX as u128 * 100 / 250) as u64
         );
     }
 }

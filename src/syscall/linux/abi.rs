@@ -1313,6 +1313,18 @@ pub use crate::abi::{CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOP
 /// `CLD_CONTINUED` all carry it - while a call that faces no event at all is a
 /// cleared record instead. This kernel answered a zero here until `docs/uapi/`
 /// §5.1 item 23.
+///
+/// `si_utime`/`si_stime` are deliberately **not** filled here, and that is
+/// Linux's answer rather than an omission: `struct waitid_info` has no such
+/// field, the syscall writes exactly the six words above, and it leaves the
+/// caller's other bytes alone. So a caller initialising its buffer to zero reads
+/// zero through this door - measured (`.workbuddy/probe_sigchld_cputime.c`, Linux
+/// 7.2.9: `waitid` answers `0`/`0` for a child that burned 100 ms, where the same
+/// death through a `SIGCHLD` record is `si_utime` 9). A `SIGCHLD` *record* carries
+/// the CPU (`signal::SigInfo::child`); `waitid` does not. This function clears the
+/// whole record where Linux writes six words - the difference is only observable
+/// if the caller seeded the buffer with something else, and this side of it is
+/// the closer-to-harmless one, noted rather than papered over.
 pub(crate) fn write_waitid_info(
     infop: usize,
     pid: u32,

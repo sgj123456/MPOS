@@ -54,6 +54,12 @@ const SSI_PID: usize = 12;
 const SSI_UID: usize = 16;
 const SSI_STATUS: usize = 40;
 const SSI_PTR: usize = 48;
+/// `ssi_utime`/`ssi_stime`: the child's CPU in `USER_HZ` ticks, the `_sigchld`
+/// half of the record. Unlike `siginfo_t`, `signalfd_siginfo` is a flat struct
+/// with no union, so these sit at their own offsets and are written for every
+/// sender (zero for the ones that have no such field).
+const SSI_UTIME: usize = 56;
+const SSI_STIME: usize = 64;
 
 pub struct SignalFd {
     ino: Ino,
@@ -144,6 +150,10 @@ impl Inode for SignalFd {
                 // is where Linux's `CLD_EXITED`/`CLD_KILLED` pair is decided).
                 // Zero for every other sender, which is Linux's answer too.
                 buf[SSI_STATUS..SSI_STATUS + 4].copy_from_slice(&info.status.to_ne_bytes());
+                // The child's CPU, in the `_sigchld` member's own slots. Zero
+                // for every other sender, whose record has no such field.
+                buf[SSI_UTIME..SSI_UTIME + 8].copy_from_slice(&info.utime.to_ne_bytes());
+                buf[SSI_STIME..SSI_STIME + 8].copy_from_slice(&info.stime.to_ne_bytes());
                 // The `union sigval` sits where the ABI puts it, so a timer's
                 // payload survives the trip through the wire.
                 buf[SSI_PTR..SSI_PTR + 8].copy_from_slice(&info.value.to_ne_bytes());

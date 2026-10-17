@@ -809,14 +809,15 @@ the commit bodies), and each moved its pin in the same commit.
     record field by field (`ssi_status`, the real uid, the pid), the unblocked death's `EAGAIN`, the
     `SIGKILL` record's `CLD_KILLED`, and the frame's rendering of the same record through a handler.
     Two of those are named rather than made on a **host** run, where the real uid cannot be moved
-    (`t-waitid`'s shape for the same field): 46 claims in a sweep, 44 with two notes there. **Two
-    residuals stay named rather than hidden** (§5.2 carries them with the measurements): the
-    **ignored** child's auto-reap (`ECHILD` on Linux, a zombie here) and `si_utime`/`si_stime`
-    staying zero (Linux's are the child's CPU in ticks — `6` for a 60 ms child). The third this
-    paragraph used to name, the **`CLD_DUMPED`/`WCOREDUMP`** half, has since landed (item 32) — and
-    the measurement that closed it also corrected a *reason*: the core bit is not about a file being
-    written (a `SIGSEGV` child reports it with `RLIMIT_CORE` 0), so `wait_status`'s comment that said
-    "mpos writes no core files" was explaining the wrong thing.
+    (`t-waitid`'s shape for the same field): 46 claims in a sweep, 44 with two notes there (**62**/
+    **60** after item 33's CPU claims — measured). Two residuals of this paragraph have since landed:
+    the record's `si_utime`/`si_stime` (the child's CPU in ticks — item **33**) and the
+    **`CLD_DUMPED`/`WCOREDUMP`** half (item **32**), whose measurement also corrected a *reason*: the
+    core bit is not about a file being written (a `SIGSEGV` child reports it with `RLIMIT_CORE` 0),
+    so `wait_status`'s comment that said "mpos writes no core files" was explaining the wrong thing.
+    **One residual stays named rather than hidden** (§5.2 carries it with the measurement): the
+    **ignored** child's auto-reap (`ECHILD` on Linux, a zombie here) — the only one of the three
+    left.
 
 30. **`FIONREAD` answers Linux's per-type byte count on a regular file and a pipe.** The request
     means "how many bytes can I read before I would block", and Linux answers it per *file type*
@@ -916,3 +917,41 @@ the commit bodies), and each moved its pin in the same commit.
     `mpos-kunit 32 passed, 0 failed` — and the two reds are exactly the new claims:
     `t-signalfd`'s `FAIL: as CLD_DUMPED, not CLD_KILLED, with the signal in ssi_status` and
     `t-wait4`'s `FAIL: and WCOREDUMP (0x80) is set for a core-dumping signal`.
+
+33. **A `SIGCHLD` record carries the child's CPU in `si_utime`/`si_stime`.** Item 29's second
+    residual, and the last of the `_sigchld` member this kernel left unfilled: Linux puts the
+    child's CPU in the two `clock_t`s (in `USER_HZ` ticks) and this kernel wrote zero on the one
+    record every door renders. **Measured whole on a current host first**
+    (`.workbuddy/probe_sigchld_cputime.c`, Linux 7.2.9, `_SC_CLK_TCK` 100): a child that burns
+    ~100 ms of CPU arrives as `si_utime` **9**, `si_stime` **0** through a blocked-`SIGCHLD`
+    `sigwait`, through a `signalfd` read and through a `SA_SIGINFO` handler's frame — where a child
+    that only exits is `0`/`0`, so the gap is a child that *worked* (the totals exist here; the
+    record simply did not carry them). The probe also settled the door that does **not** carry them,
+    and that is a finding rather than an omission: **`waitid` never fills these**. `struct
+    waitid_info` has no such field, the syscall writes exactly six words
+    (signo/errno/code/pid/uid/status), and it leaves the caller's other bytes alone — the probe
+    reads `0` through every `waitid` for the same 100 ms child the record reports as 9. So
+    `t-waitid`'s record stays zero, which is Linux's answer. **The fix is one conversion and one
+    field pair carried to every renderer.** The `USER_HZ` conversion — `ticks * 100 / TICK_HZ`,
+    truncated, Linux's `nsec_to_clock_t` one unit up — moves into the leaf crate
+    (`abi::clock_ticks_to_user_hz`/`USER_HZ`, a `u128` intermediate so a long uptime cannot wrap,
+    with a host test), and `proc.rs`'s private `times()` copy delegates to it so a `times(2)` total
+    and a child's record cannot come to different units. `signal::SigInfo` gains `utime`/`stime`
+    (already converted — the sender computes them once), the exit path fills them from the group's
+    `Mm::cpu_all()` where the `mm` still holds the counters (the group's totals are Linux's
+    `tsk->utime + tsk->signal->utime`, a dead thread already folded in), and the three doors write
+    them: `signalfd`'s `ssi_utime`/`ssi_stime` at offsets 56/64, and the `siginfo_t` `_sigchld`
+    member's `si_utime`/`si_stime` at 32/40 for a handler's frame and `sigtimedwait` alike. Owner:
+    `crates/abi`'s `clock_ticks_to_user_hz`/`USER_HZ`, `src/sched/signal.rs`'s `SigInfo`,
+    `src/sched/runtime/child_exit.rs`'s exit path, `arch/src/hal/mod.rs`'s `SignalInfo`, the two
+    machines' `signal.rs` frame writers, `src/vfs/signalfd.rs`'s `read_at`, and
+    `src/syscall/linux/proc.rs`'s `sigtimedwait`. Pin: `t-signalfd` — a child that only exits is
+    `0`/`0` (a shape guard that passes either way), a child that burns 100 ms is `ssi_utime > 0`
+    through the descriptor and `si_utime > 0` through the handler's frame (the counterfactual pair)
+    — green on a current host first, plus a host test on the conversion in `mpos-abi`. The
+    counterfactual is exact: with only the kernel half reverted and the pin kept, the sweep is
+    `pass=179 fail=1 (180 built)` and the kernel's line unmoved at `mpos-kunit 32 passed, 0 failed`,
+    with exactly the two new claims red — `FAIL: the record carries the child's CPU (ssi_utime > 0)`
+    and `FAIL: and the frame carries the child's CPU (si_utime > 0)` (the `0`/`0` guard passes on
+    both, being a description rather than a pin). Gate: `pass=180 fail=0 (180 built)`,
+    `mpos-kunit 32 passed, 0 failed`, exit 33.

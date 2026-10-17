@@ -358,6 +358,12 @@ impl SignalFrame for Current {
         // sender the `sigval`.
         if info.chld_union() {
             put_i32(out, SIGINFO + 24, info.status);
+            // The rest of the `_sigchld` member: the child's CPU in `USER_HZ`
+            // ticks, `si_utime` at 32 and `si_stime` at 40 - the same offsets
+            // arm64's own `static_assert`s pin and x86_64 uses. The frame is
+            // zeroed before this runs, so a zero sender writes nothing.
+            put(out, SIGINFO + 32, info.utime);
+            put(out, SIGINFO + 40, info.stime);
         } else {
             put(out, SIGINFO + 24, info.value);
         }

@@ -61,11 +61,14 @@
 //!     used to be shaped around: this kernel kept the exit in a second table
 //!     and queued a generated `SIGCHLD` beside it, so one death arrived twice.
 //!
-//! `si_utime`/`si_stime` are the one part of Linux's record this kernel leaves
-//! zero (measured: 6 ticks for a child that burned 60 ms of CPU; `docs/uapi/`
-//! §5.2). The `CLD_DUMPED` half of a signalled death is *answered* now - the
-//! section below the `SIGKILL` block pins that a core-dumping signal reports
-//! `CLD_DUMPED` where `SIGKILL` reports `CLD_KILLED`.
+//! `si_utime`/`si_stime` are answered too now: a queued `SIGCHLD` record
+//! carries the child's CPU in `USER_HZ` ticks, the same pair through the
+//! descriptor and through a handler's `siginfo_t` (measured on a current host,
+//! `.workbuddy/probe_sigchld_cputime.c`: `9` for a child that burned 100 ms,
+//! `0`/`0` for one that only exited; `docs/uapi/` §5.2). The `CLD_DUMPED` half
+//! of a signalled death is *answered* now as well - the section below the
+//! `SIGKILL` block pins that a core-dumping signal reports `CLD_DUMPED` where
+//! `SIGKILL` reports `CLD_KILLED`.
 //!
 //! The rest of the program is the named calls: the reads are
 //! `rustix::io::read` (a plain `read`, with the `EINVAL` for a short buffer and
@@ -91,6 +94,9 @@ static HANDLED: AtomicI32 = AtomicI32::new(0);
 static HANDLED_CODE: AtomicI32 = AtomicI32::new(-1);
 static HANDLED_STATUS: AtomicI32 = AtomicI32::new(-1);
 static HANDLED_PID: AtomicI32 = AtomicI32::new(-1);
+/// The child's CPU, read out of the frame's `siginfo_t` through its own
+/// `si_utime()` accessor. `AtomicI64` because `clock_t` is a `long`.
+static HANDLED_UTIME: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
 /// The `SIGCHLD` handler: the frame's `siginfo_t`, which is the *same* record
 /// the descriptor hands over - the claim is that it carries the same two words,
@@ -106,6 +112,10 @@ extern "C" fn chld_handler(_sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: 
             // same split `t-waitid` reads its record through.
             HANDLED_STATUS.store((*info).si_status(), Ordering::Relaxed);
             HANDLED_PID.store((*info).si_pid(), Ordering::Relaxed);
+            // `si_utime()`/`si_stime()` are the musl accessors on the union's
+            // `_sigchld` member, the same pair the descriptor's flat record
+            // carries.
+            HANDLED_UTIME.store((*info).si_utime(), Ordering::Relaxed);
             HANDLED.store(1, Ordering::Relaxed);
         }
     }
@@ -172,6 +182,39 @@ fn sleep_ms(ms: i64) {
     };
     // SAFETY: a `timespec` this call owns, and the second pointer is null.
     unsafe { libc::nanosleep(&req, std::ptr::null_mut()) };
+}
+
+/// Burn CPU in the calling task for about `ms` milliseconds of wall time, in a
+/// loop that spends almost all of it in **user** mode - one `clock_gettime` per
+/// million arithmetic ops - so a `SIGCHLD` record's `si_utime` is the half that
+/// grows where `si_stime` stays small. Wall-clock-bounded rather than a fixed
+/// iteration count, so the claim is about a child that *worked* whatever the
+/// emulated CPU's speed.
+fn burn_cpu_ms(ms: i64) {
+    fn now_ns() -> i64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a `timespec` this call owns.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+    }
+    let start = now_ns();
+    let mut acc: u64 = 0;
+    loop {
+        for i in 0..1_000_000u64 {
+            acc = acc
+                .wrapping_add(i)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left(7)
+                ^ acc;
+        }
+        std::hint::black_box(acc);
+        if now_ns() - start >= ms * 1_000_000 {
+            return;
+        }
+    }
 }
 
 /// Leave through `exit_group`: the code is the claim, and the child's inherited
@@ -299,6 +342,14 @@ fn main() {
             "and its ssi_status is the exit code (7)",
             exit.ssi_status == 7,
         );
+        // The child only left - it burned no CPU - so the record carries none:
+        // the fields are the *child's*, not something copied from the parent or
+        // left at a filler. Linux answers `0`/`0` here; the burn block below is
+        // the other half.
+        r.check(
+            "a child that only exits carries no CPU (ssi_utime/ssi_stime 0)",
+            exit.ssi_utime == 0 && exit.ssi_stime == 0,
+        );
         r.check(
             "it names the child (ssi_pid, not siginfo_t's si_pid)",
             exit.ssi_pid == kid as u32,
@@ -336,6 +387,59 @@ fn main() {
             "and the exit code is 7",
             reaped.and_then(WaitStatus::exit_status) == Some(7),
         );
+    }
+
+    // ---- the record carries the child's CPU --------------------------------
+    //
+    // `ssi_utime`/`ssi_stime`, the rest of the `_sigchld` member: Linux fills
+    // them with the child's CPU in `USER_HZ` ticks (`do_notify_parent`'s
+    // `nsec_to_clock_t(tsk->utime + tsk->signal->utime)`), and this kernel used
+    // to leave both zero. Measured on a current host
+    // (`.workbuddy/probe_sigchld_cputime.c`, Linux 7.2.9): a child that burns
+    // ~100 ms of CPU arrives as `si_utime` 9 through the descriptor, through a
+    // handler's `siginfo_t` and through `sigtimedwait`, where a child that only
+    // exits is `0`/`0` - the claim the block above makes. A busy *user* loop is
+    // the fixture because that is the half that must grow; the kernel charges
+    // per timer interrupt, so the count can trail the true value by a tick, and
+    // this claims only that the record carries *the child's* CPU rather than a
+    // count. The handler-frame half is pinned in the last block, where a
+    // `SA_SIGINFO` handler is already installed.
+    {
+        r.check(
+            "blocking SIGCHLD succeeds",
+            mask_change(libc::SIG_BLOCK, &child_mask),
+        );
+        // SAFETY: the child burns user CPU for ~100 ms and leaves through the
+        // raw `exit_group`, so no inherited stdout buffer is flushed.
+        let kid = unsafe { libc::fork() };
+        if kid == 0 {
+            burn_cpu_ms(100);
+            leave(0);
+        }
+        r.check("a CPU-burning child was forked", kid > 0);
+        if kid > 0 {
+            let mut got = Err(Errno::AGAIN);
+            let mut tries = 0;
+            while tries < 400 {
+                got = read(&fd, &mut buf);
+                if got == Ok(128) {
+                    break;
+                }
+                sleep_ms(1);
+                tries += 1;
+            }
+            r.check("its death arrives through the descriptor", got == Ok(128));
+            let burned = record_of(&buf);
+            r.check(
+                "the record carries the child's CPU (ssi_utime > 0)",
+                burned.ssi_utime > 0,
+            );
+            r.check(
+                "and it is that child's death (ssi_pid)",
+                burned.ssi_pid == kid as u32,
+            );
+            let _ = waitpid(Pid::from_raw(kid), WaitOptions::empty());
+        }
     }
 
     // ---- a death the parent never asked to be signalled for ----------------
@@ -561,6 +665,7 @@ fn main() {
     // the payload there would read 0 where this claims the exit code.
     {
         HANDLED.store(0, Ordering::Relaxed);
+        HANDLED_UTIME.store(-1, Ordering::Relaxed);
         r.check(
             "installing a SIGCHLD handler succeeds",
             install_chld_handler(),
@@ -569,16 +674,26 @@ fn main() {
             "unblocking SIGCHLD succeeds",
             mask_change(libc::SIG_UNBLOCK, &child_mask),
         );
-        // SAFETY: the child exits immediately and allocates nothing.
+        // SAFETY: the child burns user CPU for ~100 ms, then leaves through the
+        // raw `exit_group` so no inherited stdout buffer is flushed. It burns so
+        // that the frame's `si_utime` has something to carry: a child that only
+        // exits gives `0`, which pins nothing here.
         let kid = unsafe { libc::fork() };
         if kid == 0 {
+            burn_cpu_ms(100);
             leave(5);
         }
-        r.check("a child was forked", kid > 0);
+        r.check("a CPU-burning child was forked", kid > 0);
         if kid > 0 {
             // A syscall is where a handler runs: the delivery path needs the
-            // register frame only a syscall boundary has.
-            sleep_ms(30);
+            // register frame only a syscall boundary has. The wait is bounded
+            // and longer than the burn, so the handler has run by the time the
+            // claims below read its atomics.
+            let mut tries = 0;
+            while tries < 500 && HANDLED.load(Ordering::Relaxed) != 1 {
+                sleep_ms(1);
+                tries += 1;
+            }
             r.check(
                 "the handler ran for the child's death",
                 HANDLED.load(Ordering::Relaxed) == 1,
@@ -591,6 +706,13 @@ fn main() {
             r.check(
                 "naming the child",
                 HANDLED_PID.load(Ordering::Relaxed) == kid,
+            );
+            // The `_sigchld` member's CPU half through the *frame*, where the
+            // record goes through a `siginfo_t` rather than the flat
+            // `signalfd_siginfo` - the same value at the same offset either way.
+            r.check(
+                "and the frame carries the child's CPU (si_utime > 0)",
+                HANDLED_UTIME.load(Ordering::Relaxed) > 0,
             );
             let want = Pid::from_raw(kid);
             let _ = waitpid(want, WaitOptions::empty());

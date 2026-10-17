@@ -378,10 +378,27 @@ pub fn exit(code: isize) -> ! {
                         child.identity.ruid as i32,
                     )
                 };
+                // The child's CPU time, in the `USER_HZ` ticks `si_utime`/
+                // `si_stime` carry. Linux's `do_notify_parent` fills them from
+                // `nsec_to_clock_t(tsk->utime + tsk->signal->utime)`, and the
+                // group's counters here are the same sum: `cpu_utime`/
+                // `cpu_stime` are group-wide, so a thread that already exited
+                // has been folded in and a single-threaded child's totals are
+                // its own. The `mm`'s `Arc` outlives `release_exited` above -
+                // only its frames are freed - and a task with `exited` set is
+                // never scheduled again, so no further tick is charged and the
+                // number read here is final. Measured with
+                // `.workbuddy/probe_sigchld_cputime.c` (Linux 7.2.9): ~100 ms of
+                // CPU is `si_utime` 9, a child that only exits is `0`/`0`, and
+                // the same pair comes back through a handler frame and a
+                // `signalfd` read.
+                let (utime, stime, _, _) = t.task(id).mm.cpu_all();
+                let utime = crate::abi::clock_ticks_to_user_hz(utime, crate::hal::TICK_HZ as u64);
+                let stime = crate::abi::clock_ticks_to_user_hz(stime, crate::hal::TICK_HZ as u64);
                 queue_signal(
                     t.task_mut(parent),
                     signal::SIGCHLD,
-                    signal::SigInfo::child(child_pid, child_uid, code, dumped),
+                    signal::SigInfo::child(child_pid, child_uid, code, dumped, utime, stime),
                 );
             }
             // The console goes back to the parent's group as the child leaves

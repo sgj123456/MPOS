@@ -468,6 +468,12 @@ pub struct SignalInfo {
     /// The child's exit code, or the signal that ended it: `si_status`, for the
     /// one sender that has one.
     pub status: i32,
+    /// The child's CPU time in `USER_HZ` ticks: `si_utime`/`si_stime`, the other
+    /// half of the `_sigchld` member. Zero for every other sender, and already
+    /// converted by the caller (`crate::abi::clock_ticks_to_user_hz`), so a
+    /// machine's frame writer has one unit to write on both.
+    pub utime: u64,
+    pub stime: u64,
 }
 
 impl SignalInfo {
