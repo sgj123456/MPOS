@@ -219,17 +219,25 @@ pub fn exit(code: isize) -> ! {
             && crate::abi::signal_dumps_core((-code) as i32)
             && t.task(id).mm.credentials().dumpable != 0;
 
-        record_retired(
+        // The CPU a `wait`'s `struct rusage` will report for this child, read
+        // here while the `mm` is still the live group's and carried on the
+        // record: the slot - and with it the counters - is free by the time a
+        // `wait` collects the death.
+        let (utime, stime) = t.task(id).mm.cpu_both();
+
+        record_retired(Retired {
             id,
             code,
-            t.task(id).pgid,
-            t.task(id).trace.tracer,
+            pgid: t.task(id).pgid,
             // The real uid, taken here because the slot is what holds it: the
             // record outlives the task, and `waitid` reads its answer from the
             // record (`Retired::uid`).
-            t.task(id).identity.ruid,
+            uid: t.task(id).identity.ruid,
             dumped,
-        );
+            utime,
+            stime,
+            tracer: t.task(id).trace.tracer,
+        });
 
         // Linux's `forget_original_parent`: a process that exits hands every
         // child that was still its own to init. Without this a zombie keeps a
@@ -574,27 +582,13 @@ pub fn discard_exit_code(id: TaskId) {
     take_exit_code(id);
 }
 
-fn record_retired(
-    id: TaskId,
-    code: isize,
-    pgid: TaskId,
-    tracer: Option<TaskId>,
-    uid: u32,
-    dumped: bool,
-) {
+fn record_retired(record: Retired) {
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
         if retired.len() == RETIRED_CAP {
             retired.remove(0);
         }
-        retired.push(Retired {
-            id,
-            code,
-            pgid,
-            uid,
-            dumped,
-            tracer,
-        });
+        retired.push(record);
     });
 }
 
@@ -1782,7 +1776,8 @@ fn scan_child_event(
     if continues {
         for (id, task) in children() {
             if task.trace.continued {
-                return Some(WaitEvent::Continued { id });
+                let (utime, stime) = task.mm.cpu_both();
+                return Some(WaitEvent::Continued { id, utime, stime });
             }
         }
     }
@@ -1812,6 +1807,8 @@ fn scan_child_event(
                 code: retired.code,
                 uid: retired.uid,
                 dumped: retired.dumped,
+                utime: retired.utime,
+                stime: retired.stime,
             })
     })
 }
@@ -1830,6 +1827,8 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
                 code: retired.code,
                 uid: retired.uid,
                 dumped: retired.dumped,
+                utime: retired.utime,
+                stime: retired.stime,
             })
         }
         WaitEvent::Stopped {
@@ -1837,6 +1836,8 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
             signal,
             event,
             traced,
+            utime,
+            stime,
         } => {
             let task = t.tasks.get_mut(id.0).and_then(Option::as_mut)?;
             let stop = task.trace.stop.as_mut()?;
@@ -1849,15 +1850,17 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
                 signal,
                 event,
                 traced,
+                utime,
+                stime,
             })
         }
-        WaitEvent::Continued { id } => {
+        WaitEvent::Continued { id, utime, stime } => {
             let task = t.tasks.get_mut(id.0).and_then(Option::as_mut)?;
             if !task.trace.continued {
                 return None;
             }
             task.trace.continued = false;
-            Some(WaitEvent::Continued { id })
+            Some(WaitEvent::Continued { id, utime, stime })
         }
     }
 }
@@ -1984,15 +1987,22 @@ fn child_event_in(
             stops
         })
     {
+        // Read here, inside the table borrow, so the CPU is the stopped child's
+        // and not whatever the slot is doing a moment later - the same reason
+        // its identity is read in the borrow.
+        let (utime, stime) = task.mm.cpu_both();
         return Some(WaitEvent::Stopped {
             id,
             signal: stop.signal,
             event: stop.event,
             traced: stop.traced,
+            utime,
+            stime,
         });
     }
     if task.trace.continued && continues {
-        return Some(WaitEvent::Continued { id });
+        let (utime, stime) = task.mm.cpu_both();
+        return Some(WaitEvent::Continued { id, utime, stime });
     }
     None
 }
@@ -2032,6 +2042,8 @@ pub fn block_until_child_event(id: TaskId, stops: bool, continues: bool) -> Wait
             code: retired.code,
             uid: retired.uid,
             dumped: retired.dumped,
+            utime: retired.utime,
+            stime: retired.stime,
         }),
         None => WaitPark::NoChild,
     }

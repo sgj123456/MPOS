@@ -1478,6 +1478,24 @@ impl Mm {
         )
     }
 
+    /// The CPU a `wait`'s `struct rusage` reports for this group, as
+    /// `(utime, stime)` in internal clock ticks: its own totals **plus the CPU
+    /// its own reaped children folded in**.
+    ///
+    /// That sum is Linux's `RUSAGE_BOTH` - the direction `getrusage(p,
+    /// RUSAGE_BOTH, ...)` is asked for when `wait4` or `waitid` reports a
+    /// child - and the reason a grandchild's CPU reaches the child's parent
+    /// through the child that reaped it (measured,
+    /// `.workbuddy/probe_wait4_rusage.c` scenario D, Linux 7.2.9: 200 ms burnt
+    /// by a grandchild reads as 200 ms in the reaping child's `ru_utime`). It is
+    /// deliberately *not* the pair a `SIGCHLD` record carries: Linux's
+    /// `do_notify_parent` fills `si_utime`/`si_stime` from the group's own
+    /// totals with no child term, and the two doors were measured apart.
+    pub(crate) fn cpu_both(&self) -> (u64, u64) {
+        let (utime, stime, cutime, cstime) = self.cpu_all();
+        (utime.saturating_add(cutime), stime.saturating_add(cstime))
+    }
+
     /// Fold a reaped child's CPU into this process's child totals - Linux's
     /// accounting on `wait`: the parent's `cutime` grows by the child's own
     /// `utime` plus the child's own `cutime` (its children, already folded in),

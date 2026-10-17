@@ -281,11 +281,14 @@ pub(crate) fn unreported_stop(
         // The scan is ascending, so the first match is the lowest id: two
         // children stopping in the same tick are reported in a fixed order
         // rather than whichever order the table happened to hand out.
+        let (utime, stime) = task.mm.cpu_both();
         return Some(WaitEvent::Stopped {
             id,
             signal: stop.signal,
             event: stop.event,
             traced: stop.traced,
+            utime,
+            stime,
         });
     }
     None

@@ -395,6 +395,11 @@ pub(super) fn handle_set_tid_address(args: [usize; ARG_COUNT]) -> isize {
 /// can be asked about.
 pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (pid, status, options) = (args[0] as isize, args[1], args[2]);
+    // `wait4`'s fourth argument is where the child's `struct rusage` goes. It is
+    // read here and threaded to every answer a **report** produces - a death, a
+    // stop and a resume alike - because Linux fills it for all three; the
+    // "nothing yet" zero and the refusals leave it alone. See `write_wait_rusage`.
+    let rusage = args[3];
     let me = crate::sched::current();
     let no_hang = options & abi::WNOHANG != 0;
     // `WUNTRACED` is what a *parent* needs to hear about a stop; a *tracer* does
@@ -423,7 +428,7 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             None
         };
         if let Some(event) = collected {
-            return finish_wait_event(event, status, from_user);
+            return finish_wait_event(event, status, rusage, from_user);
         }
         // Nothing to report: an error only when there is nobody left to
         // wait for, and otherwise the "none yet" zero.
@@ -445,14 +450,22 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     // has news of both, and the stop is the earlier news and the one that
     // gates everything after it.
     if let Some(event) = crate::sched::take_child_event(id, stops, continues) {
-        return finish_wait_event(event, status, from_user);
+        return finish_wait_event(event, status, rusage, from_user);
     }
     // A code already on file means the child is a zombie: it is collected now,
     // blocking or not. Tracer-owned records stay with the tracer: this caller
     // collecting through a tracer's corpse is the double-report that hung
     // strace.
     if let Some(retired) = crate::sched::take_retired_current(id) {
-        return finish_wait(id, retired.code, retired.dumped, status, from_user);
+        return finish_wait(
+            id,
+            retired.code,
+            retired.dumped,
+            (retired.utime, retired.stime),
+            status,
+            rusage,
+            from_user,
+        );
     }
     if !crate::sched::is_child(id, me) {
         return err::ECHILD;
@@ -462,7 +475,7 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     }
 
     match crate::sched::block_until_child_event(id, stops, continues) {
-        crate::sched::WaitPark::Event(event) => finish_wait_event(event, status, from_user),
+        crate::sched::WaitPark::Event(event) => finish_wait_event(event, status, rusage, from_user),
         crate::sched::WaitPark::Interrupted => err::EINTR,
         crate::sched::WaitPark::NoChild => err::ECHILD,
     }
@@ -470,33 +483,73 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 
 /// The three shapes a successful `wait` returns, each encoded into `*status` the
 /// way its `W`-macro decodes it: a death, a stop, or a resume.
-fn finish_wait_event(event: crate::sched::WaitEvent, status: usize, from_user: bool) -> isize {
+///
+/// All three also fill the caller's `struct rusage` when it asked for one - the
+/// event carries the child's CPU for exactly that (`WaitEvent`'s own note).
+fn finish_wait_event(
+    event: crate::sched::WaitEvent,
+    status: usize,
+    rusage: usize,
+    from_user: bool,
+) -> isize {
     match event {
         crate::sched::WaitEvent::Exited {
-            id, code, dumped, ..
-        } => finish_wait(id, code, dumped, status, from_user),
+            id,
+            code,
+            dumped,
+            utime,
+            stime,
+            ..
+        } => finish_wait(id, code, dumped, (utime, stime), status, rusage, from_user),
         // `traced` is `waitid`'s question, not this door's: the status word
         // `WSTOPSIG`/`WIFSTOPPED` read says "stopped" either way, and a traced
         // stop's `PTRACE_EVENT_*` is what carries the rest.
         crate::sched::WaitEvent::Stopped {
-            id, signal, event, ..
-        } => write_wait_status(id, abi::stop_status(signal, event), status, from_user),
-        crate::sched::WaitEvent::Continued { id } => {
-            write_wait_status(id, abi::CONTINUED_STATUS, status, from_user)
-        }
+            id,
+            signal,
+            event,
+            utime,
+            stime,
+            ..
+        } => write_wait_status(
+            id,
+            abi::stop_status(signal, event),
+            (utime, stime),
+            status,
+            rusage,
+            from_user,
+        ),
+        crate::sched::WaitEvent::Continued { id, utime, stime } => write_wait_status(
+            id,
+            abi::CONTINUED_STATUS,
+            (utime, stime),
+            status,
+            rusage,
+            from_user,
+        ),
     }
 }
 
 /// Encode an already-formed status word and answer the child's pid. The
 /// counterpart of [`finish_wait`] for the two events that are not a death.
-fn write_wait_status(id: TaskId, word: i32, status: usize, from_user: bool) -> isize {
+fn write_wait_status(
+    id: TaskId,
+    word: i32,
+    cpu: (u64, u64),
+    status: usize,
+    rusage: usize,
+    from_user: bool,
+) -> isize {
     if status != 0 {
         if !buffer_ok(status, 4, true, from_user) {
             return err::EFAULT;
         }
         unsafe { (status as *mut i32).write_unaligned(word) };
     }
-    wait_answer(id)
+    match write_wait_rusage(rusage, cpu, from_user) {
+        Some(e) => e,
+        None => wait_answer(id),
+    }
 }
 
 /// The pid a `wait` answers with: the child's number **in the caller's
@@ -515,7 +568,22 @@ fn wait_answer(id: TaskId) -> isize {
 /// `dumped` is the death's core-dump classification, taken off the record with
 /// the code: the `WCOREDUMP` bit is the same `CLD_DUMPED` fact `waitid` writes
 /// into `si_code`, so one death cannot read two ways.
-fn finish_wait(id: TaskId, code: isize, dumped: bool, status: usize, from_user: bool) -> isize {
+///
+/// `cpu` is the dead group's own-plus-children tick pair, off the record for the
+/// same reason. `rusage` goes after `*status`, which is the order Linux's own
+/// wrapper uses (`copy_to_user` runs once the child is reported, after the wait
+/// wrote the status) - so a caller that hands an unwritable `rusage` pointer is
+/// answered `EFAULT` with its status word already written and the child already
+/// collected. Measured, `.workbuddy/probe_wait4_rusage.c` scenario N.
+fn finish_wait(
+    id: TaskId,
+    code: isize,
+    dumped: bool,
+    cpu: (u64, u64),
+    status: usize,
+    rusage: usize,
+    from_user: bool,
+) -> isize {
     if status != 0 {
         if !buffer_ok(status, 4, true, from_user) {
             return err::EFAULT;
@@ -524,7 +592,60 @@ fn finish_wait(id: TaskId, code: isize, dumped: bool, status: usize, from_user: 
         // it is spelled in `abi`, tested on the host.
         unsafe { (status as *mut i32).write_unaligned(abi::wait_status(code, dumped)) };
     }
-    wait_answer(id)
+    match write_wait_rusage(rusage, cpu, from_user) {
+        Some(e) => e,
+        None => wait_answer(id),
+    }
+}
+
+/// Fill the caller's `struct rusage` for a child a `wait` just reported, or
+/// answer `None` when there is nothing to do.
+///
+/// A null pointer is "not interested" on both wait doors - the shape rustix's
+/// `waitpid` passes - and writes nothing. Otherwise the child's own-plus-
+/// children CPU goes into the two opening `timeval`s; see [`write_rusage`].
+///
+/// Only a *report* fills it. Linux's `wait4` copies the struct when the wait
+/// returned a pid and `waitid` when it reported an event, so the `WNOHANG`
+/// "nothing yet" zero and `ECHILD` leave the caller's bytes alone (measured,
+/// `.workbuddy/probe_wait4_rusage.c` scenarios J, K, L and M, Linux 7.2.9: all
+/// four leave a 0xAA-filled struct untouched).
+fn write_wait_rusage(ptr: usize, cpu: (u64, u64), from_user: bool) -> Option<isize> {
+    if ptr == 0 {
+        return None;
+    }
+    write_rusage(ptr, cpu.0, cpu.1, from_user)
+}
+
+/// Write `struct rusage` from a pair of internal clock ticks: the two opening
+/// `struct timeval`s (`ru_utime` then `ru_stime`) over an otherwise zeroed
+/// struct.
+///
+/// Both wait doors and `getrusage` call this, because seconds-and-microseconds
+/// off a tick count is one derivation and not three. The fourteen `long`
+/// byte/page counters stay zero - this kernel measures CPU and nothing else, so
+/// an honest zero rather than a plausible number, which is the residual
+/// `getrusage` has carried since it landed and now carries here too.
+///
+/// `None` when the struct was written, or the errno to answer with when the
+/// pointer is not writeable. A failed check leaves the caller's bytes alone; the
+/// zeroing happens after it.
+fn write_rusage(usage: usize, utime: u64, stime: u64, from_user: bool) -> Option<isize> {
+    const RUSAGE_BYTES: usize = 144; // 2 timevals + 14 longs
+    if !buffer_ok(usage, RUSAGE_BYTES, true, from_user) {
+        return Some(err::EFAULT);
+    }
+    let hz = crate::hal::TICK_HZ as u64;
+    unsafe {
+        core::ptr::write_bytes(usage as *mut u8, 0, RUSAGE_BYTES);
+        let put = |off: usize, ticks: u64| {
+            ((usage + off) as *mut i64).write_unaligned((ticks / hz) as i64);
+            ((usage + off + 8) as *mut i64).write_unaligned(((ticks % hz) * 1_000_000 / hz) as i64);
+        };
+        put(0, utime); // ru_utime {sec, usec}
+        put(16, stime); // ru_stime {sec, usec}
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3703,17 +3824,15 @@ pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
     // is what the migrated `t-times` pins.
     const RUSAGE_SELF: i32 = 0;
     const RUSAGE_CHILDREN: i32 = -1;
-    const RUSAGE_SIZE: usize = 144; // 2 timevals + 14 longs
     let (who, usage) = (args[0] as u32 as i32, args[1]);
     if who != RUSAGE_SELF && who != RUSAGE_CHILDREN {
         return err::EINVAL;
     }
-    if !buffer_ok(usage, RUSAGE_SIZE, true, true) {
-        return err::EFAULT;
-    }
-    unsafe {
-        core::ptr::write_bytes(usage as *mut u8, 0, RUSAGE_SIZE);
-    }
+    // A null `usage` here is not "not interested" as it is on the wait doors -
+    // `getrusage` has no other answer to give - so it goes to the writer like
+    // any other pointer and comes back `EFAULT` from the check, which is what
+    // Linux's own `copy_to_user` answers.
+    //
     // `RUSAGE_SELF` is the process's own split CPU; `RUSAGE_CHILDREN` is the
     // CPU of children already waited for, which the reap folded into the
     // parent's child totals.
@@ -3727,16 +3846,7 @@ pub(super) fn handle_getrusage(args: [usize; ARG_COUNT]) -> isize {
             (cu, cs)
         }
     };
-    let hz = crate::hal::TICK_HZ as u64;
-    unsafe {
-        let put = |off: usize, ticks: u64| {
-            ((usage + off) as *mut i64).write_unaligned((ticks / hz) as i64);
-            ((usage + off + 8) as *mut i64).write_unaligned(((ticks % hz) * 1_000_000 / hz) as i64);
-        };
-        put(0, utime); // ru_utime {sec, usec}
-        put(16, stime); // ru_stime {sec, usec}
-    }
-    0
+    write_rusage(usage, utime, stime, true).unwrap_or_default()
 }
 
 /// `clock_getres(clk_id, res)` — the resolution a clock can deliver.
@@ -3816,7 +3926,16 @@ pub(super) fn handle_clock_getres(args: [usize; ARG_COUNT]) -> isize {
 /// and ignored, which is `wait4`'s treatment and a named divergence: `__WCLONE`
 /// *narrows* to children cloned with an exit signal other than `SIGCHLD`, and
 /// this kernel's tasks carry no exit signal to ask (`docs/uapi/` §5.2).
-pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
+///
+/// # The fifth argument
+///
+/// `rusage` is filled like `wait4`'s for the same events and the same way (see
+/// [`write_wait_rusage`]) - with one ordering difference, and it is Linux's own:
+/// the `struct rusage` is copied **before** the info record, so an unwritable
+/// `rusage` pointer is `EFAULT` with the record left as the caller wrote it,
+/// where `wait4` has by then already written `*status` (measured,
+/// `.workbuddy/probe_wait4_rusage.c` scenarios N and O, Linux 7.2.9).
+pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     use super::abi::{CLD_CONTINUED, CLD_STOPPED, CLD_TRAPPED, SIGINFO_BYTES};
     use crate::sched::{WaitFor, WaitPark, signal};
 
@@ -3840,7 +3959,8 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
     const CLASSES: usize = WEXITED | WSTOPPED | WCONTINUED;
 
     let (idtype, id, infop, options) = (args[0], args[1] as isize, args[2], args[3]);
-    if !buffer_ok(infop, SIGINFO_BYTES, true, true) {
+    let rusage = args[4];
+    if !buffer_ok(infop, SIGINFO_BYTES, true, from_user) {
         return err::EFAULT;
     }
     // Cleared first, refused second - Linux's order, measured: both of the
@@ -3927,32 +4047,54 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
     // (measured: `CLD_EXITED`, `CLD_STOPPED`, `CLD_TRACED` and `CLD_CONTINUED`
     // all report the child's real uid) and reports `cred->uid` - the real id,
     // not the effective one.
-    let (child, si_code, status, uid) = match event {
+    let (child, si_code, status, uid, cpu) = match event {
         crate::sched::WaitEvent::Exited {
             id,
             code,
             uid,
             dumped,
+            utime,
+            stime,
         } => {
             let (si_code, status) = abi::exit_chld(code, dumped);
-            (id, si_code, status, uid)
+            (id, si_code, status, uid, (utime, stime))
         }
         // A stop under a tracer and a stop for the parent are two codes
         // (measured: `CLD_TRAPPED` and `CLD_STOPPED`), and the event's own word
         // cannot tell them apart - a ptrace signal-delivery stop carries
         // `PTRACE_EVENT_NONE`, exactly as a group stop does.
         crate::sched::WaitEvent::Stopped {
-            id, signal, traced, ..
+            id,
+            signal,
+            traced,
+            utime,
+            stime,
+            ..
         } => (
             id,
             if traced { CLD_TRAPPED } else { CLD_STOPPED },
             signal as i32,
             live_uid(id),
+            (utime, stime),
         ),
-        crate::sched::WaitEvent::Continued { id } => {
-            (id, CLD_CONTINUED, signal::SIGCONT as i32, live_uid(id))
-        }
+        crate::sched::WaitEvent::Continued { id, utime, stime } => (
+            id,
+            CLD_CONTINUED,
+            signal::SIGCONT as i32,
+            live_uid(id),
+            (utime, stime),
+        ),
     };
+    // The rusage goes first, which is Linux's order and not this handler's:
+    // its wrapper copies the struct and only then writes the record, so a caller
+    // whose `rusage` pointer cannot be written is answered `EFAULT` before the
+    // record is touched. The record has, however, been *cleared* above - mpos
+    // clears up front to get the refusal paths right - so the bytes that survive
+    // are zeros rather than the caller's own, the one visible difference this
+    // ordering leaves and the reason the clear is not simply moved here.
+    if let Some(e) = write_wait_rusage(rusage, cpu, from_user) {
+        return e;
+    }
     // The child's number in the *caller's* namespace, the same answer `wait4`
     // returns: a reader one level out sees the number it can use, and a reader
     // inside the child's own namespace sees 1.

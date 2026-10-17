@@ -79,7 +79,7 @@
 //! close-on-exec read-back is `rustix`'s `fcntl_getfd`/`FdFlags` - the pair
 //! `t-fcntl` pins.
 
-use mpos_user_tests::Report;
+use mpos_user_tests::{Report, burn_cpu_ms};
 use rustix::fd::{AsRawFd, OwnedFd};
 use rustix::io::{Errno, FdFlags, fcntl_getfd, read};
 use rustix::process::{Pid, WaitOptions, WaitStatus, waitpid};
@@ -182,39 +182,6 @@ fn sleep_ms(ms: i64) {
     };
     // SAFETY: a `timespec` this call owns, and the second pointer is null.
     unsafe { libc::nanosleep(&req, std::ptr::null_mut()) };
-}
-
-/// Burn CPU in the calling task for about `ms` milliseconds of wall time, in a
-/// loop that spends almost all of it in **user** mode - one `clock_gettime` per
-/// million arithmetic ops - so a `SIGCHLD` record's `si_utime` is the half that
-/// grows where `si_stime` stays small. Wall-clock-bounded rather than a fixed
-/// iteration count, so the claim is about a child that *worked* whatever the
-/// emulated CPU's speed.
-fn burn_cpu_ms(ms: i64) {
-    fn now_ns() -> i64 {
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: a `timespec` this call owns.
-        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-        ts.tv_sec * 1_000_000_000 + ts.tv_nsec
-    }
-    let start = now_ns();
-    let mut acc: u64 = 0;
-    loop {
-        for i in 0..1_000_000u64 {
-            acc = acc
-                .wrapping_add(i)
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .rotate_left(7)
-                ^ acc;
-        }
-        std::hint::black_box(acc);
-        if now_ns() - start >= ms * 1_000_000 {
-            return;
-        }
-    }
 }
 
 /// Leave through `exit_group`: the code is the claim, and the child's inherited

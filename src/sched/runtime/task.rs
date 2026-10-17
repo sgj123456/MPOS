@@ -348,6 +348,19 @@ pub(crate) struct Retired {
     /// `crate::abi::exit_chld`, and `.workbuddy/probe_wcore_dumpable.c` beside
     /// it for the second half.
     pub(crate) dumped: bool,
+    /// The CPU the dying group had used by the time it died, in internal clock
+    /// ticks: its own `utime`/`stime` **plus the CPU its own reaped children
+    /// folded in**.
+    ///
+    /// That sum is what Linux's `getrusage(p, RUSAGE_BOTH, ...)` reports for a
+    /// child, which is what a `wait4`/`waitid` caller's `struct rusage` carries
+    /// (measured, `.workbuddy/probe_wait4_rusage.c` scenario D, Linux 7.2.9: a
+    /// grandchild's 200 ms lands in the reaping child's `ru_utime`, not only in
+    /// the grandchild's own). Carried on the record for `uid`'s reason: the
+    /// slot is free by the time a `wait` reads it, and the group's counters go
+    /// with it.
+    pub(crate) utime: u64,
+    pub(crate) stime: u64,
     /// The tracer this task died under, if any. A traced task's death is the
     /// tracer's to collect: the tracer reaps the corpse first, and only its
     /// taking releases the record to the real parent - the same
@@ -1993,14 +2006,23 @@ impl WaitFor {
 }
 
 /// What happened to one child, as `wait(2)` reports it.
+///
+/// Every variant carries the child's reported CPU as `utime`/`stime` in internal
+/// clock ticks (own plus its own reaped children - `Retired::utime`'s pair),
+/// because `wait4` and `waitid` both fill their `struct rusage` argument on
+/// *every* event they report and not only on a death: Linux copies it from the
+/// same `getrusage(p, RUSAGE_BOTH, ...)` call on the stop and the resume paths
+/// (measured, `.workbuddy/probe_wait4_rusage.c` scenarios C, H and I, Linux
+/// 7.2.9 - a stop, a `waitid(WSTOPPED)` and a resume each fill it). A death
+/// carries it off the record, where the group is gone; a stop or a resume reads
+/// the still-live group.
 #[derive(Clone, Copy)]
 pub enum WaitEvent {
     /// A death to collect.
     ///
     /// The uid rides the event because the record does not reach the caller: a
     /// collection takes the record out of the table, and `waitid` owes the
-    /// child's real uid beside the code it writes. A stop or a resume needs no
-    /// such field - the child is alive, so its identity is still in the table.
+    /// child's real uid beside the code it writes.
     ///
     /// `dumped` is the same carry for the same reason: the core-dump
     /// classification (`CLD_DUMPED`/`WCOREDUMP`) is a fact about the *dead*
@@ -2011,6 +2033,9 @@ pub enum WaitEvent {
         code: isize,
         uid: u32,
         dumped: bool,
+        /// The death's CPU, off the record - see the enum's own note.
+        utime: u64,
+        stime: u64,
     },
     /// A stop to report: the signal `WSTOPSIG` names, and the `PTRACE_EVENT_*`
     /// the status word's high byte carries.
@@ -2026,10 +2051,18 @@ pub enum WaitEvent {
         signal: u8,
         event: u32,
         traced: bool,
+        /// The stopped child's CPU so far - see the enum's own note.
+        utime: u64,
+        stime: u64,
     },
     /// A `SIGCONT` ended a stop. Only ever reported to a caller that asked
     /// with `WCONTINUED`.
-    Continued { id: TaskId },
+    Continued {
+        id: TaskId,
+        /// The resumed child's CPU so far - see the enum's own note.
+        utime: u64,
+        stime: u64,
+    },
 }
 
 pub fn yield_now() {

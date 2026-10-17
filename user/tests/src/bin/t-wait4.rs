@@ -34,13 +34,25 @@
 //! child was `/bin/sleep 2`, and the second machine's `/bin` carries no `sleep`
 //! at all - measured, its farm is a fixed applet list (`xtask/src/initramfs.rs`'s
 //! `AARCH64_APPLETS`: sh, mount, umount, switch_root, pivot_root, mkdir, cat,
-//! echo, ls, true, false). `/bin/true` and `/bin/false` are on both machines, so
+//! echo, ls, true, false), `/bin/true` and `/bin/false` are on both machines, so
 //! those two children stay; the sleeper is now this test's own forked child,
 //! asleep long enough that the `WNOHANG` below finds it running - which is the
 //! cleaner probe anyway, the claim being about `wait4` on a running child rather
 //! than about `sleep`.
+//!
+//! # The fourth argument
+//!
+//! The man page's four things are all about the *return* value and `*status`;
+//! `wait4`'s fourth argument, the caller's `struct rusage`, is `NULL` in every
+//! shell and in `rustix`'s `waitpid` alike, and this kernel used not to read it
+//! at all - a caller that asked for the child's CPU was handed success and a
+//! record it had to fill itself. It is filled now, for every event the call
+//! *reports* (a death, a stop, a resume) and not for the "nothing yet" zero, and
+//! the claims below are the shapes that tell those apart. Their measurements,
+//! including the two orderings that differ from `waitid`'s, are in
+//! `.workbuddy/probe_wait4_rusage.c`.
 
-use mpos_user_tests::Report;
+use mpos_user_tests::{Report, Rusage, burn_cpu_ms, host_run};
 use rustix::io::Errno;
 use rustix::process::{Pid, WaitOptions, WaitStatus, waitpid};
 use std::ffi::CStr;
@@ -83,6 +95,88 @@ fn start(prog: &CStr, arg0: &CStr) -> i32 {
 
 /// How long the "still running" child stays asleep.
 const SLEEP_MS: i64 = 500;
+
+/// `wait4(pid, *status, options, *rusage)` through the raw door, with the
+/// caller's own record. Returns `(answer, status word)`.
+///
+/// The fourth argument is the reason this is not `rustix`'s `waitpid`: that
+/// wrapper *is* this call with a null `rusage` (`t-wait4`'s header says so), so
+/// every claim about what the kernel puts in the record is outside its shape -
+/// clause (a) of the crate's rule.
+fn wait4_rusage(pid: i32, options: i32, rusage: *mut Rusage) -> (isize, i32) {
+    let mut status: i32 = 0;
+    let answer = unsafe {
+        libc::syscall(
+            libc::SYS_wait4,
+            pid as libc::c_long,
+            &mut status as *mut i32 as libc::c_long,
+            options as libc::c_long,
+            rusage as libc::c_long,
+        )
+    };
+    (answer as isize, status)
+}
+
+/// `getrusage(RUSAGE_CHILDREN)` over the uapi's record: the running total a
+/// reaped child's CPU is folded into, which is what the `wait4` answer has to
+/// agree with.
+fn children_rusage() -> Rusage {
+    let mut ru: Rusage = unsafe { core::mem::zeroed() };
+    unsafe {
+        libc::syscall(
+            libc::SYS_getrusage,
+            libc::RUSAGE_CHILDREN,
+            &mut ru as *mut Rusage,
+        )
+    };
+    ru
+}
+
+/// What the parent should read when a reaped child's CPU arrives in the record,
+/// as one whole microsecond count - `ru_utime`.
+fn utime_micros(ru: &Rusage) -> i64 {
+    ru.ru_utime.micros()
+}
+
+/// A child that burns `ms` of CPU and then exits 0, leaving through
+/// `exit_group` so it never flushes the stdout copy it inherited.
+fn start_burner(ms: i64) -> i32 {
+    let pid = unsafe { libc::fork() };
+    if pid != 0 {
+        return pid;
+    }
+    burn_cpu_ms(ms);
+    unsafe {
+        libc::syscall(libc::SYS_exit_group, 0 as libc::c_long);
+        libc::_exit(0)
+    }
+}
+
+/// A child that burns `ms` of CPU and then stops itself, for the two claims that
+/// a *stop* and a *resume* report the record too. A stopper with no work behind
+/// it would make "the child's CPU arrived" and "the record was merely zeroed"
+/// the same answer, which is exactly the pair of shapes these claims exist to
+/// tell apart.
+fn start_burner_then_stop(ms: i64) -> i32 {
+    let pid = unsafe { libc::fork() };
+    if pid != 0 {
+        return pid;
+    }
+    burn_cpu_ms(ms);
+    unsafe {
+        libc::raise(libc::SIGSTOP);
+    }
+    // Sit under the stop until the parent's `SIGCONT`, then leave.
+    let nap = libc::timespec {
+        tv_sec: 2,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::nanosleep(&nap, core::ptr::null_mut());
+        libc::syscall(libc::SYS_exit_group, 0 as libc::c_long);
+        libc::_exit(0)
+    }
+}
 
 /// The "still running" child, with no program behind it (see the migration note
 /// above), and no flush on the way out.
@@ -179,6 +273,159 @@ fn main() {
             "the sleeping child exited 0",
             status.and_then(WaitStatus::exit_status) == Some(0),
         );
+    }
+
+    // ---- the fourth argument: `struct rusage` ------------------------------
+    //
+    // `wait4(pid, *status, options, *rusage)` fills the record with the reaped
+    // child's CPU, and it does so for **every** event it reports - a death, a
+    // stop and a resume alike - while leaving the caller's bytes alone when it
+    // reports nothing. Every shape below was measured against real Linux first
+    // (`.workbuddy/probe_wait4_rusage.c`, Linux 7.2.9): a child that burnt
+    // 200 ms answers `ru_utime` 0.1997, the *same* number
+    // `getrusage(RUSAGE_CHILDREN)` reports once the reap has folded it in; a
+    // `WNOHANG` that finds nothing and an `ECHILD` both leave a seeded record
+    // untouched; a grandchild's CPU reaches the record through the child that
+    // reaped it (Linux's `RUSAGE_BOTH`, not the child's own totals alone); and
+    // an unwritable pointer is `EFAULT` with the child already collected.
+    let burner = start_burner(150);
+    r.check("a CPU-burning child was started", burner > 0);
+    if burner > 0 {
+        // Read the running total first: `RUSAGE_CHILDREN` accumulates across
+        // every child this process has reaped, so the claim is about what
+        // *this* reap moved it by.
+        let before = children_rusage().cpu_micros();
+        let mut ru = Rusage::seeded();
+        let (answer, _status) = wait4_rusage(burner, 0, &mut ru);
+        r.check(
+            "wait4 returns the burning child's pid beside the record",
+            answer == burner as isize,
+        );
+        r.check(
+            "the record carries the child's CPU (ru_utime > 0)",
+            utime_micros(&ru) > 0,
+        );
+        // The running total has to *agree* with what the record says, and two
+        // things make that less than an equality. The two sides truncate
+        // nanoseconds to microseconds independently - the running total is read
+        // once before the reap and once after - so the difference carries that
+        // rounding and nothing else: measured, 200 reaps land in 0..=2 us
+        // (`.workbuddy/probe_wait4_delta.c`). And the fold itself runs on the
+        // scheduler's *next* turn here rather than inside the wait - Linux
+        // accumulates in `wait_task_zombie`, this kernel in `reap()`, which
+        // `t-times` records for the same claim - so the re-read is a bounded
+        // loop that burns a little CPU between attempts to let a tick fire.
+        let mut grew = children_rusage().cpu_micros() - before;
+        for _ in 0..40 {
+            if grew >= ru.cpu_micros() {
+                break;
+            }
+            burn_cpu_ms(2);
+            grew = children_rusage().cpu_micros() - before;
+        }
+        r.check(
+            "and it is the CPU the reap folded into RUSAGE_CHILDREN",
+            (0..=2).contains(&(grew - ru.cpu_micros())),
+        );
+        // The fourteen counters are not measured by this kernel, and the whole
+        // record is zeroed before the two `timeval`s are filled - an honest
+        // "nothing measured" rather than a plausible number. Linux fills
+        // several of them from the child (`ru_maxrss`, the fault counts, the
+        // context switches), so this is mpos's answer and is named rather than
+        // made on a host run.
+        if host_run() {
+            r.check(
+                "note: the host fills ru_maxrss/fault/switch counters from the child; this \
+                 kernel measures the CPU and leaves them zero",
+                true,
+            );
+        } else {
+            r.check(
+                "the unmeasured counters are zero, not the caller's own seed",
+                ru.counters.iter().all(|c| *c == 0),
+            );
+        }
+    }
+
+    // A wait that reports *nothing* writes nothing: `WNOHANG` on a child that
+    // has not exited is the zero the caller polls for, not a report, and the
+    // caller's own record survives it (measured, scenario J).
+    let peeker = start_sleeper();
+    r.check("a child to peek at was started", peeker > 0);
+    if peeker > 0 {
+        let mut ru = Rusage::seeded();
+        let (answer, _) = wait4_rusage(peeker, libc::WNOHANG, &mut ru);
+        r.check("WNOHANG with nothing ready answers 0", answer == 0);
+        r.check("and leaves the caller's record untouched", !ru.written());
+        // Collect it: a fixture left running would be reaped by a later claim
+        // and fold its (small) CPU into the running child total.
+        let _ = wait4_rusage(peeker, 0, core::ptr::null_mut());
+    }
+
+    // An unwritable `rusage` pointer is `EFAULT`, and the child is collected
+    // anyway - Linux writes `*status` inside the wait and copies the record
+    // afterwards, so the failure lands on the record alone, and a second wait
+    // finds nobody left (measured, scenario N).
+    let gone = start_burner(0);
+    r.check("a child for the EFAULT claim was started", gone > 0);
+    if gone > 0 {
+        let bad = wait4_rusage(gone, 0, 1usize as *mut Rusage);
+        r.check(
+            "an unwritable rusage pointer is EFAULT",
+            bad.0 == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EFAULT),
+        );
+        r.check(
+            "while the status word beside it was written (the child was reaped)",
+            bad.1 & 0x7f == 0,
+        );
+        let again = wait4_rusage(gone, libc::WNOHANG, core::ptr::null_mut());
+        r.check(
+            "and a second wait for it is ECHILD",
+            again.0 == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+        );
+    }
+
+    // A stop and a resume are *reports* like a death, and Linux fills the record
+    // for both (measured, scenarios C and I: a child that burnt 150 ms and then
+    // stopped answers 0.149642, and the resume that ends the stop answers the
+    // same). This is the half of the change that needed the wait's stop and
+    // resume events to carry the child's CPU at all - and it comes off the
+    // *live* group, because the child is still in the task table when the report
+    // is made, unlike a death whose record has to carry it.
+    let halter = start_burner_then_stop(120);
+    r.check(
+        "a child that burns CPU and then stops was started",
+        halter > 0,
+    );
+    if halter > 0 {
+        let mut ru = Rusage::seeded();
+        let (answer, status) = wait4_rusage(halter, libc::WUNTRACED, &mut ru);
+        r.check(
+            "WUNTRACED reports the stop",
+            answer == halter as isize
+                && status & 0xff == 0x7f
+                && (status >> 8) & 0xff == libc::SIGSTOP,
+        );
+        r.check(
+            "and the stopped child's CPU is in the record",
+            utime_micros(&ru) > 0,
+        );
+
+        // The resume, which is the same report for the same reason.
+        unsafe { libc::kill(halter, libc::SIGCONT) };
+        let mut ru = Rusage::seeded();
+        let (answer, status) = wait4_rusage(halter, libc::WCONTINUED, &mut ru);
+        r.check(
+            "WCONTINUED reports the resume (the all-ones status word)",
+            answer == halter as isize && status == 0xffff,
+        );
+        r.check(
+            "and the resumed child's CPU is in the record too",
+            utime_micros(&ru) > 0,
+        );
+
+        // Collect it, so the fixture cannot be reaped by a later claim.
+        let _ = wait4_rusage(halter, 0, core::ptr::null_mut());
     }
 
     // ---- a death by signal: the status word classifies it ------------------

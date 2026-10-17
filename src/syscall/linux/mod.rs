@@ -602,7 +602,7 @@ pub unsafe fn dispatch(
         nr::TIMES => proc::handle_times(args),
         nr::GETRUSAGE => proc::handle_getrusage(args),
         nr::CLOCK_GETRES => proc::handle_clock_getres(args),
-        nr::WAITID => proc::handle_waitid(args),
+        nr::WAITID => proc::handle_waitid(args, from_user),
         nr::GETRLIMIT => abi::handle_getrlimit(args, from_user),
         nr::SETRLIMIT => abi::handle_setrlimit(args, from_user),
         nr::MEMBARRIER => abi::handle_membarrier(args),

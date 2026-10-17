@@ -955,3 +955,52 @@ the commit bodies), and each moved its pin in the same commit.
     and `FAIL: and the frame carries the child's CPU (si_utime > 0)` (the `0`/`0` guard passes on
     both, being a description rather than a pin). Gate: `pass=180 fail=0 (180 built)`,
     `mpos-kunit 32 passed, 0 failed`, exit 33.
+
+34. **`wait4`/`waitid` fill their `struct rusage`: the child's CPU, for every event they *report*.**
+    Item 29's last residual, and the one a caller could not work around — both doors read their
+    status/record arguments and never touched the fourth/fifth, so a program that asked for the
+    child's CPU was handed a success and a record it had to fill itself. `rustix`'s `waitpid`
+    hardcodes `NULL` there, which is why no sweep ever saw it. **Measured whole on a current host
+    first** (`.workbuddy/probe_wait4_rusage.c`, Linux 7.2.9, `sizeof(struct rusage)` 144, fourteen
+    scenarios each in its own forked child): a **death** fills it with the child's own **plus its own
+    reaped children** — Linux's `RUSAGE_BOTH`, which a grandchild's 200 ms of CPU shows arriving
+    through the child that reaped it — and the number is *exactly* what `getrusage(RUSAGE_CHILDREN)`
+    reports once the reap has folded it in (0.199640 both ways); a **stop** (`WUNTRACED`, 0.149642)
+    and a **resume** (`WCONTINUED`) fill it too, and so does `waitid` through `WEXITED`, `WSTOPPED`
+    and `WCONTINUED`; a `WNOHANG` that finds nothing running, and an `ECHILD`, both leave a
+    0xAA-seeded record **untouched**; a `NULL` rusage is "not interested", not an error. **The two
+    doors also differ, and that is Linux's own order**: `wait4` writes `*status` inside the wait and
+    copies the record afterwards, so an unwritable `rusage` pointer is `EFAULT` with the status word
+    already written and the child already collected; `waitid` copies the record **before** it writes
+    the six-word `siginfo_t`, so the same bad pointer leaves the caller's own bytes there. **The fix
+    is one writer and one carried pair.** `proc.rs` gains one `write_rusage` (two opening `timeval`s
+    off a tick count, the rest zeroed) which `handle_getrusage` now calls too, so
+    seconds-and-microseconds off a tick count has one owner rather than two; `wait4` reads `args[3]`
+    and `waitid` `args[4]`, and the write happens only where an event was *reported* — after
+    `*status` in `finish_wait`/`write_wait_status`, before the record in `handle_waitid` (which also
+    takes the caller's provenance for its own pointer checks now, as `wait4` always did). The CPU
+    rides the event: `Retired` and all three `WaitEvent` variants gain `utime`/`stime` in raw
+    internal ticks (a `rusage` is a microsecond `timeval`, so a `USER_HZ` pair would be the wrong
+    unit), a death takes them off the record — read at the exit where the `mm` is still the live
+    group's — and a stop or a resume reads them from the live table inside the scan's own borrow,
+    through a new `Mm::cpu_both()` beside `cpu_all()`. The fourteen byte/page counters stay zero,
+    which is the residual `getrusage` has carried since it landed. Owner:
+    `src/syscall/linux/proc.rs`'s `handle_wait`/`handle_waitid`/`handle_getrusage`,
+    `src/sched/runtime/{task,child_exit,child_mm,trace}.rs`. Pin: `t-wait4` — the death fill, the
+    `RUSAGE_CHILDREN` delta the same reap moved (two independently truncated readings, and here the
+    fold lands on the scheduler's next turn rather than inside the wait, so it is a bounded re-read:
+    measured, 200 reaps land within 0..=2 us, `.workbuddy/probe_wait4_delta.c`), the unmeasured
+    counters reading zero, a `WNOHANG` that leaves the seed, a `WUNTRACED` stop and a `WCONTINUED`
+    resume each filled, and the `EFAULT` order with the child already collected — and `t-waitid`,
+    the exit fill and the `WNOHANG` no-report half. Both green on a current host first. The record
+    itself moved to the crate's lib (`mpos_user_tests::Rusage`) because a second and third program
+    needed it, and the CPU burner with it. The two corners left standing are named in §5.2. Gate:
+    `pass=180 fail=0 (180 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33 (the aarch64 arm, which
+    these `[default]`-group pins also run under, is `pass=179 fail=0`, `mpos-kunit 32 passed, 0
+    failed`, exit 0). The counterfactual is exact: with only the kernel half reverted (the six source
+    files) and the pins kept, the sweep is
+    `pass=178 fail=2 (180 built)` with the kernel's `mpos-kunit` line unmoved — the two red programs
+    are `t-wait4` and `t-waitid`, and every red claim is new (the fill and its `RUSAGE_CHILDREN`
+    delta, the counters, the `EFAULT`, the stop and the resume in `t-wait4`; the exit fill in
+    `t-waitid`), while the shape guards — the `WNOHANG` no-report half, the stop/resume records, and
+    `waitid`'s report — pass on both kernels.

@@ -44,11 +44,12 @@
 //! The `times` record is `libc::tms`, which *is* the uapi's four `clock_t`s.
 //! The `getrusage` record is **not** `libc::rusage`: measured, that struct is
 //! **272** bytes on this target - a generic-unix superset, thirty `long`s to the
-//! uapi's fourteen - so this file spells the 144-byte record itself, the way
+//! uapi's fourteen - so the 144-byte record is spelled out, the way
 //! `t-unix-scm` reads `cmsghdr` at its offsets because the two libcs disagree
 //! about that struct while the kernel writes one layout regardless. A size
 //! claim about `libc::rusage` would be false rather than tight; the real wire
-//! claim is the one about every byte coming back written.
+//! claim is the one about every byte coming back written. (It was spelled here
+//! until the wait tests needed it too; it is `mpos_user_tests`' now.)
 //!
 //! # What the migration changed
 //!
@@ -59,7 +60,7 @@
 //! what it pins is the kernel's write. Measured on a host Linux
 //! (`.workbuddy/probe_times.c`): the whole 144 bytes come back zero.
 
-use mpos_user_tests::Report;
+use mpos_user_tests::{Report, Rusage, Timeval};
 use rustix::io::Errno;
 use rustix::thread::NanosleepRelativeResult;
 use rustix::time::Timespec;
@@ -71,39 +72,6 @@ const MAX_CHUNKS: u32 = 500;
 
 /// The uapi's `struct tms` is four `clock_t`s, and `libc::tms` is that.
 const TMS_BYTES: usize = 32;
-
-/// The uapi's `struct rusage`: two `timeval`s, then fourteen `long` counters.
-const RUSAGE_BYTES: usize = 144;
-
-/// The uapi's `struct rusage`, spelled here rather than taken from `libc`.
-///
-/// `libc::rusage` is a generic-unix superset and 272 bytes on this target, so
-/// using it would mean a buffer larger than the wire - safe, but unable to say
-/// anything about the wire's size or about a byte the kernel did not write.
-/// Only the two named fields are read here; the fourteen counters are the tail
-/// the "every byte was written" claim is about.
-#[repr(C)]
-struct Rusage {
-    ru_utime: Timeval,
-    ru_stime: Timeval,
-    counters: [libc::c_long; 14],
-}
-
-/// The uapi's `struct timeval`: two `__kernel_long_t`s. Spelled with
-/// `libc::c_long` rather than `libc::time_t`/`suseconds_t`, which `libc`
-/// deprecates on musl for a 32-bit-time change that does not reach these two
-/// 64-bit targets - where those aliases *are* `c_long`.
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct Timeval {
-    tv_sec: libc::c_long,
-    tv_usec: libc::c_long,
-}
-
-/// The record is exactly the uapi's 144 bytes, and that is not decoration: the
-/// kernel writes all of it, so a shorter buffer would be written past its end.
-/// A claim the compiler can make is better than one a run has to.
-const _: () = assert!(core::mem::size_of::<Rusage>() == RUSAGE_BYTES);
 
 /// `times(2)`: the elapsed clock, and optionally the four CPU counters.
 fn times(buf: Option<&mut libc::tms>) -> libc::clock_t {

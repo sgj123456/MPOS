@@ -47,6 +47,13 @@
 //! `CLD_TRACED`, `CLD_STOPPED` and `CLD_CONTINUED` all report the child's uid,
 //! while a call that faces no event at all is a cleared record instead.
 //!
+//! **The fifth argument, `struct rusage`, is filled** (`docs/uapi/` §5.1 item
+//! 34): Linux copies the child's `RUSAGE_BOTH` CPU into it for every event the
+//! call *reports*, and leaves the caller's bytes alone when it reports nothing.
+//! This door used to ignore the pointer entirely - the two claims below are what
+//! tells a report from the zero a polling parent gets, and `t-wait4` carries the
+//! CPU value and the bad-pointer orderings for the shape both doors share.
+//!
 //! The last section adds the claims that tell that uid from the zero the bug
 //! wrote, and it needs a *privilege* to make them: it moves the program's own
 //! real uid (to `MOVED`) while keeping its effective one, so the children it
@@ -100,7 +107,7 @@
 //! through the raw `SYS_exit_group`, because a forked std child holds a copy of
 //! the parent's buffered stdout and only a non-flushing exit leaves it behind.
 
-use mpos_user_tests::Report;
+use mpos_user_tests::{Report, Rusage, burn_cpu_ms};
 use rustix::process::{Pid, WaitOptions, waitpid};
 use std::mem::size_of;
 
@@ -108,6 +115,20 @@ use std::mem::size_of;
 /// caller's own record. Returns the answer, or the negative errno the no-std
 /// harness reported.
 fn waitid(idtype: u32, id: i32, info: &mut libc::siginfo_t, options: i32) -> isize {
+    waitid_rusage(idtype, id, info, options, core::ptr::null_mut())
+}
+
+/// [`waitid`] with the fifth argument spelled: the `struct rusage` the call
+/// fills whenever it *reports* an event, which is what the claims about the
+/// record's CPU read - and, with a seed in place, what tells a report from the
+/// "nothing yet" zero.
+fn waitid_rusage(
+    idtype: u32,
+    id: i32,
+    info: &mut libc::siginfo_t,
+    options: i32,
+    rusage: *mut Rusage,
+) -> isize {
     let r = unsafe {
         libc::syscall(
             libc::SYS_waitid,
@@ -115,7 +136,7 @@ fn waitid(idtype: u32, id: i32, info: &mut libc::siginfo_t, options: i32) -> isi
             id as libc::c_long,
             info as *mut libc::siginfo_t as libc::c_long,
             options as libc::c_long,
-            0 as libc::c_long,
+            rusage as libc::c_long,
         )
     };
     if r < 0 {
@@ -166,6 +187,31 @@ fn child_that_exits(code: i32) -> libc::pid_t {
     let kid = unsafe { libc::fork() };
     if kid == 0 {
         leave(code);
+    }
+    kid
+}
+
+/// A child that burns `ms` of CPU and then exits 0 - the fixture a claim about
+/// the CPU *in* the record needs, since a child that merely exits has used
+/// almost none and "the CPU arrived" would be indistinguishable from "the record
+/// was zeroed".
+fn child_that_burns(ms: i64) -> libc::pid_t {
+    let kid = unsafe { libc::fork() };
+    if kid == 0 {
+        burn_cpu_ms(ms);
+        leave(0);
+    }
+    kid
+}
+
+/// A child that is still running while the claim beside it is made, and leaves
+/// on its own after `ms` - the fixture for "a call that reports nothing writes
+/// nothing".
+fn child_that_sleeps(ms: i64) -> libc::pid_t {
+    let kid = unsafe { libc::fork() };
+    if kid == 0 {
+        sleep_ms(ms);
+        leave(0);
     }
     kid
 }
@@ -650,6 +696,71 @@ fn main() {
             "while a wait without WNOWAIT collects it",
             waitid(libc::P_PID, kept, &mut collected, libc::WEXITED) == 0
                 && unsafe { collected.si_status() } == 9,
+        );
+    }
+
+    // ---- the fifth argument: `struct rusage` -------------------------------
+    //
+    // `waitid(..., *rusage)` fills the caller's record for every event it
+    // *reports* - an exit, a stop and a resume alike - and leaves the caller's
+    // bytes alone when it reports nothing. Linux's own order is what shows in a
+    // bad pointer: its wrapper copies the `struct rusage` **before** it writes
+    // the six-word record, so an unwritable `rusage` is `EFAULT` with the info
+    // record still the caller's own - where `wait4` has by then already written
+    // `*status`. Measured, `.workbuddy/probe_wait4_rusage.c` scenarios E, H, I,
+    // K, M and O, Linux 7.2.9. (Only the fill and the no-report half are pinned
+    // here; `t-wait4` carries the CPU value and the pointer-refusal claims for
+    // the shape both doors share, and the stop/resume records are above.)
+    let worker = child_that_burns(150);
+    r.check(
+        "a CPU-burning child was forked for the rusage claim",
+        worker > 0,
+    );
+    if worker > 0 {
+        let mut info = poisoned();
+        let mut ru = Rusage::seeded();
+        let answered = waitid_rusage(libc::P_PID, worker, &mut info, libc::WEXITED, &mut ru);
+        r.check(
+            "waitid reports the exit when it was asked for a rusage",
+            answered == 0 && unsafe { info.si_status() } == 0,
+        );
+        r.check(
+            "and the record carries the child's CPU",
+            ru.ru_utime.micros() > 0,
+        );
+    }
+
+    // A call that reports *nothing* writes nothing, and `WNOHANG` finding the
+    // child still running is that call - the zero a polling parent gets is not
+    // an event (measured, scenario K).
+    let napper = child_that_sleeps(1500);
+    r.check(
+        "a still-running child was forked for the WNOHANG claim",
+        napper > 0,
+    );
+    if napper > 0 {
+        let mut info = poisoned();
+        let mut ru = Rusage::seeded();
+        let answered = waitid_rusage(
+            libc::P_PID,
+            napper,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG,
+            &mut ru,
+        );
+        r.check("WNOHANG with nothing to report answers 0", answered == 0);
+        r.check(
+            "and leaves the caller's rusage record untouched",
+            !ru.written(),
+        );
+        // Collect it, so no later claim inherits a running child.
+        let mut done = poisoned();
+        let _ = waitid_rusage(
+            libc::P_PID,
+            napper,
+            &mut done,
+            libc::WEXITED,
+            core::ptr::null_mut(),
         );
     }
 

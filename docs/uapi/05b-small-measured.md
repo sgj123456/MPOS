@@ -401,3 +401,20 @@ Section numbers are unchanged from the original `UAPI.md`.
   served), so what is missing is need rather than design, and each refusal is a signal a caller
   can see rather than silence. Owner: `arch/src/arch/aarch64/vectors.rs`'s `el0_sys`, whose own
   doc names each. `docs/notes/` §15.36.
+
+- **The two wait doors' validation order, and where a bad `rusage` pointer leaves the record.**
+  **Landed 2026-10-17** (`docs/uapi/` §5.1 item 34): both doors fill the caller's `struct rusage`
+  now, for every event they report. Two corners of that are Linux's shape and are *not* built, and
+  they are one sentence each because they are visible only to a caller that passes a pointer the
+  kernel cannot write to. (i) **`waitid` clears its `siginfo_t` before it waits**, where Linux
+  validates and writes at the end: with a bad `rusage` pointer this kernel leaves a *zeroed* record
+  where Linux leaves the caller's own bytes — the refusal itself (`EFAULT`, record untouched) is
+  right, only the record's contents differ. (ii) The same clearing means a bad `infop` is `EFAULT`
+  *before* the wait, where Linux waits first and refuses after: a caller that asks for an event with
+  an unwritable record gets its error either way, and in one of the two this kernel has not yet
+  collected the child Linux would have. Both come from clearing up front, which is what makes the
+  three refusal paths (§5.1 item 17) leave the zeroed record Linux leaves, so the fix is a
+  restructure of the record path rather than a line — named here rather than approximated. Owner:
+  `src/syscall/linux/proc.rs`'s `handle_waitid`. Measured: `.workbuddy/probe_wait4_rusage.c`
+  scenarios O (a bad `rusage` leaves the `siginfo_t` untouched, `0xAAAAAAAA`) and the same probe's
+  ordering finding for `wait4`'s `*status`.

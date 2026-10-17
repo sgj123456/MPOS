@@ -66,6 +66,86 @@ pub fn host_run() -> bool {
     std::env::var_os("MPOS_ON_HOST").is_some()
 }
 
+/// The uapi's `struct rusage`: two `timeval`s, then fourteen `long` counters.
+pub const RUSAGE_BYTES: usize = 144;
+
+/// The uapi's `struct rusage`, spelled here rather than taken from `libc`.
+///
+/// `libc::rusage` is a generic-unix superset and 272 bytes on this target, so
+/// using it would mean a buffer larger than the wire - safe, but unable to say
+/// anything about the wire's size or about a byte the kernel did not write. The
+/// two named `timeval`s are what a caller reads; the fourteen counters are both
+/// the tail a "the kernel wrote the whole record" claim is about and the tail
+/// this kernel leaves zero because it measures CPU and nothing else.
+///
+/// One definition and three readers: `t-times` pins `getrusage`'s answers, and
+/// `t-wait4`/`t-waitid` pin the `rusage` both wait doors fill. The record was
+/// spelled in `t-times` alone until the second and third reader arrived.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Rusage {
+    pub ru_utime: Timeval,
+    pub ru_stime: Timeval,
+    pub counters: [libc::c_long; 14],
+}
+
+/// The uapi's `struct timeval`: two `__kernel_long_t`s. Spelled with
+/// `libc::c_long` rather than `libc::time_t`/`suseconds_t`, which `libc`
+/// deprecates on musl for a 32-bit-time change that does not reach these two
+/// 64-bit targets - where those aliases *are* `c_long`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Timeval {
+    pub tv_sec: libc::c_long,
+    pub tv_usec: libc::c_long,
+}
+
+impl Timeval {
+    /// The pair as one whole microsecond count.
+    pub fn micros(self) -> i64 {
+        self.tv_sec * 1_000_000 + self.tv_usec
+    }
+}
+
+impl Rusage {
+    /// A record no kernel would produce: `-1` in every field. "The kernel wrote
+    /// this struct" is then one predicate on every machine and every event
+    /// class: Linux fills `ru_maxrss`, `ru_minflt` and `ru_nvcsw` from the
+    /// child, this kernel measures only the CPU and zeroes the rest, and both
+    /// differ from the seed.
+    pub fn seeded() -> Self {
+        Self {
+            ru_utime: Timeval {
+                tv_sec: -1,
+                tv_usec: -1,
+            },
+            ru_stime: Timeval {
+                tv_sec: -1,
+                tv_usec: -1,
+            },
+            counters: [-1; 14],
+        }
+    }
+
+    /// Whether a kernel has written this record since it was [`seeded`].
+    ///
+    /// [`seeded`]: Rusage::seeded
+    pub fn written(&self) -> bool {
+        self.counters.iter().any(|c| *c != -1)
+    }
+
+    /// `ru_utime + ru_stime` as one whole microsecond count - the CPU a wait
+    /// reports, on the machine and on the host alike.
+    pub fn cpu_micros(&self) -> i64 {
+        self.ru_utime.micros() + self.ru_stime.micros()
+    }
+}
+
+/// The record is exactly the uapi's 144 bytes, and that is not decoration: the
+/// kernel writes all of it, so a shorter buffer would be written past its end.
+/// A claim the compiler can make is better than one a run has to.
+const _: () = assert!(core::mem::size_of::<Rusage>() == RUSAGE_BYTES);
+
 /// Copy §10.5's ext4 fixture onto the SATA disk, through the block door.
 ///
 /// Both programs of that instrument need the filesystem *on* the disk before they
@@ -113,5 +193,43 @@ pub fn lay_ext4_fixture(source: &str, disk: &str) -> std::io::Result<u64> {
             done += k;
         }
         copied += n as u64;
+    }
+}
+
+/// Burn `ms` of *user* CPU in this thread and return.
+///
+/// Time-bounded rather than counted, because the guest runs under TCG where a
+/// fixed iteration count is a different amount of work on each machine - and
+/// because several claims need "this process has some CPU behind it", which only
+/// the clock can promise. The arithmetic is opaque to the optimiser on purpose;
+/// a burner that folded away would take every claim built on it with it.
+///
+/// One definition and three readers: `t-signalfd` needs a child with CPU in it
+/// before a signal lands, and `t-wait4`/`t-waitid` need one whose CPU a `wait`
+/// has to report. Each carried its own copy until the second and third arrived.
+pub fn burn_cpu_ms(ms: i64) {
+    fn now_ns() -> i64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a `timespec` this call owns.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+    }
+    let start = now_ns();
+    let mut acc: u64 = 0;
+    loop {
+        for i in 0..1_000_000u64 {
+            acc = acc
+                .wrapping_add(i)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left(7)
+                ^ acc;
+        }
+        std::hint::black_box(acc);
+        if now_ns() - start >= ms * 1_000_000 {
+            return;
+        }
     }
 }
