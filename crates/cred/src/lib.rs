@@ -78,6 +78,13 @@ pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_BOOT: u32 = 22;
 /// `CAP_SYS_TTY_CONFIG`, which `vhangup(2)` requires.
 pub const CAP_SYS_TTY_CONFIG: u32 = 26;
+/// `CAP_MKNOD`, which a **device** node's `mknod(2)` requires - and only a
+/// device node's: `S_IFREG`, `S_IFIFO` and `S_IFSOCK` nodes are served to a
+/// caller holding nothing, as is a character node whose `dev` is `0` (the
+/// whiteout shape). Measured unprivileged rather than recalled
+/// (`.workbuddy/probe_mknod_cap.c`); `mknod_needs_capability` in the kernel's
+/// ABI module is the question this bit answers.
+pub const CAP_MKNOD: u32 = 27;
 /// `CAP_SYSLOG`, which every `syslog(2)` type requires - the gate Linux
 /// checks *before* the type, so even an unknown type answers `EPERM` from a
 /// caller without it.

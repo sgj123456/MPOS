@@ -604,7 +604,8 @@ the commit bodies), and each moved its pin in the same commit.
     that is item 26).
     Owner: `src/syscall/linux/abi.rs`, `src/syscall/linux/fs/file.rs`'s two doors. Pin: `t-mknod`
     (22 claims as root, 21 where the device-node claim is named rather than made — the payload runs
-    as root and a hand host run need not), its `ok:` lines identical on both machines; the `S_IFIFO`
+    as root and a hand host run need not; now 36 as root and 33 as an ordinary user, item 36's
+    capability section), its `ok:` lines identical on both machines; the `S_IFIFO`
     section claims the node on both machines now that item 26 serves it. **A third fix
     the pin forced, in the same subject**: `stat`'s permission half collapsed a stored `0000` into
     the kind's default — `mode_of` was handed a bare `u32` and read `0` as "nobody said" — so a file
@@ -613,7 +614,8 @@ the commit bodies), and each moved its pin in the same commit.
     `Option<u32>` through the new `reported_mode` (`src/syscall/linux/fs/file.rs`): a filesystem that
     keeps modes reports what it holds, **including `0000`**, and one that keeps none answers its
     kind's default. Two things stay named in §5.2 rather than fixed: the **device number**
-    `mknod`'s `dev` argument names is not written on the node; and **`CAP_MKNOD` is not checked**, so
+    `mknod`'s `dev` argument names is not written on the node; and **`CAP_MKNOD` is not checked**
+    (superseded by item 36, which asks it), so
     an unprivileged caller can make a device node here where Linux answers `EPERM`. The FIFO's
     *node*, which this item left as `EOPNOTSUPP` with its prerequisite spelled out
     (`open_replacement` takes no flags, and the direction an open asked for is what picks the end),
@@ -1050,3 +1052,40 @@ the commit bodies), and each moved its pin in the same commit.
     shape guard (the FIFO drain, the two kills, the handler-per-copy, `kill`'s 0, the setrlimit and
     its restore) passes on both kernels. The one corner left standing — a caller that raises the
     limit past the ring still meets the ring — is named in §5.2.
+
+36. **A device node asks for `CAP_MKNOD` — and only a device node does, asked last, of the caller's
+    effective set.** Item 25 named the half of `mknod`'s answers it left standing: Linux refuses a
+    device node to a caller without `CAP_MKNOD` (`EPERM`) where this kernel built the node for anyone,
+    and it recorded *why* that was not a one-line gate — a `setuid` here did not re-derive the
+    capability sets, so a dropped-privilege process would still have held the capability and the gate
+    would have refused nobody. That prerequisite landed on its own (item 4: a uid/gid change
+    re-derives the sets through `Credentials::on_identity_change`, the measured `cap_emulate_setxuid`
+    rule `t-caps` drives), so this pass asks the question. **Measured whole on a current host first**
+    (`.workbuddy/probe_mknod_cap.c`, Linux 7.2.9, an unprivileged caller, one scenario per answer):
+    `S_IFCHR` and `S_IFBLK` are `EPERM`; `S_IFREG`, `S_IFIFO` and `S_IFSOCK` are **served** to a
+    caller holding not one capability; the character node whose `dev` is `0` is served too — the
+    *whiteout* overlayfs spells that way — and the exception is the character type's alone
+    (`makedev(0, 1)`, `makedev(1, 0)` and a *block* node with the same `0` are all `EPERM`); and the
+    refusal comes **after every one above**, so an existing name is still `EEXIST`, an unwritable
+    directory still `EACCES` and a path that is not there still `ENOENT`. **The fix is one predicate
+    and one gate per door**: `abi::mknod_needs_capability(mode, dev)` (the mode's type, and the low 32
+    bits that are the whole of the uapi's `dev` argument), asked after `may_create_in` — the last
+    question the call has — against `current_credentials().has_effective(CAP_MKNOD)`, with `crates/cred`
+    gaining the constant. Owner: `crates/cred`, `src/syscall/linux/abi.rs`, and the two doors in
+    `src/syscall/linux/fs/file.rs`. Pin: `t-mknod`'s capability section (14 new claims — the window's two
+    directories, the name it finds already there, the node a *capable* caller makes, the lowering, the
+    character and block refusals, the whiteout with the block-`0` refusal beside it, the three types
+    that need none, the three ordering refusals, and the raise-back with the same node served again),
+    which runs on both machines *and* on this host — where it makes the same claims as an ordinary
+    user, since a host run is already without the capability — plus `abi.rs`'s
+    `mknod_mode_field_picks_the_node_kind` for the predicate itself. Gate: x86_64 `pass=180 fail=0
+    (180 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33; aarch64 `pass=179 fail=0`, `mpos-kunit 32
+    passed, 0 failed`, and its `ok:` lines are identical to the first machine's. The counterfactual is
+    exact: with the three kernel files reverted and the pin kept, the sweep is `pass=179 fail=1 (180
+    built)` with the kernel's `mpos-kunit` line unmoved — the red program is `t-mknod` and the three
+    red claims are the device refusals themselves (each answered `0`, the wrong-shape success this
+    pass removes), while the whiteout, the three no-capability types and all three ordering claims
+    stay green on both kernels. One corner is named in §5.2 rather than fixed: Linux asks
+    `capable(CAP_MKNOD)`, which is the **initial** user namespace, where this kernel's checks ask the
+    caller's own — measured (`.workbuddy/probe_mknod_userns.sh`), and the capability model's own named
+    gap rather than this call's.

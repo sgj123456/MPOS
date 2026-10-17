@@ -30,19 +30,32 @@ Section numbers are unchanged from the original `UAPI.md`.
   though they still do, because a released opener is the claim they are about.
 
 
-- **`CAP_MKNOD` is not checked.** Linux refuses a device node to a caller without `CAP_MKNOD`
-  (`EPERM`, measured on a current host through `syscall(2)`, `.workbuddy/probe_mknod.c`), and the
-  *order* it refuses in is measured too: after the type's own answers, after the name, after the
-  name's existence (`EEXIST` wins), and after the directory's writability (a device node in a
-  directory the caller may not write is `EACCES`, not `EPERM`). This kernel has no such gate:
-  `handle_mknodat` builds the node for any caller. The impact is small and the reason it is named
-  rather than fixed is the same in both halves - a node made here routes nowhere (there is no
-  number-to-driver table, the entry above), so the node a caller should not have been able to make
-  also cannot do anything; and asking the question is not one line, because a `setuid` here does not
-  re-derive the capability sets (`src/syscall/linux/posix.rs`'s `identity_set_one` changes the ids
-  and leaves the sets alone), so a dropped-privilege process would still hold `CAP_MKNOD` and the
-  gate would answer `EPERM` for nobody. Owner: `src/syscall/linux/fs/file.rs`'s two `mknod` doors,
-  once `setuid`'s capability re-derivation lands.
+- **The device-node capability is asked now, in Linux's place in the order.** **Landed 2026-10-17**
+  (`docs/uapi/` §5.1 item 36). The entry this replaces said both `mknod` doors built a device node for
+  **any** caller where Linux answers `EPERM` without `CAP_MKNOD`, and that the gate was not one line
+  because a `setuid` here did not re-derive the capability sets. That prerequisite landed on its own in
+  the meantime (`set_current_identity` runs `Credentials::on_identity_change`, the measured
+  `cap_emulate_setxuid` rule `t-caps` pins), so the gate is asked now — of the caller's **effective
+  set**, and of exactly one kind of node. Measured whole on a current host first
+  (`.workbuddy/probe_mknod_cap.c`, Linux 7.2.9, an unprivileged caller, one scenario per answer):
+  `S_IFCHR` and `S_IFBLK` are **`EPERM`**; `S_IFREG`, `S_IFIFO` and `S_IFSOCK` are **served** to a
+  caller holding not one capability; the character node whose `dev` is **`0`** is served too — that is
+  how overlayfs spells a *whiteout*, and the exception is the character type's alone, since a *block*
+  node with the same `0` is `EPERM`; and the question comes **last**, after the type, the name, the
+  name's existence (`EEXIST` wins) and the directory's writability (a device node in a directory the
+  caller may not write is `EACCES`, not `EPERM`). `abi::mknod_needs_capability` holds the rule and
+  `t-mknod`'s capability section pins all of it from both sides — a root caller that lowers its
+  effective id for the duration, and an ordinary user, which is what a host run is.
+
+  **One corner is named rather than fixed: which namespace the capability is held in.** Linux's
+  `vfs_mknod` asks `capable(CAP_MKNOD)`, and `capable` is the **initial** user namespace — so a caller
+  that has entered a user namespace, is uid 0 in it and reads the whole set back *still* cannot make a
+  device node on a filesystem the parent namespace owns (measured: `.workbuddy/probe_mknod_userns.sh`,
+  Linux 7.2.9 — `touch` in the same directory answers `0` while `mknod c 1 3` answers `EPERM`, and the
+  `dev 0` whiteout is served there as it is outside). This kernel's checks ask the caller's own
+  namespace, so that caller *is* served here. The gap is the capability model's rather than this
+  call's — it is the scoped `capable(ns, cap)` `crates/cred` names as its own (its
+  `on_enter_user_ns`, §6.3), and it is named there because that is where a fix would go.
 
 - **A device node made by `mknod` carries no device number.** `st_rdev` is the field `mknod(2)`'s
   `dev` argument fills - measured on the host, `/dev/null` reports `rdev 1:3`, the number its own

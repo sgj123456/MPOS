@@ -590,7 +590,14 @@ that need not be the caller's; this kernel's checks all ask the caller's own nam
 capability word is the whole of it. That is correct for every operation scoped to the caller's
 own namespace - which is every gate here - and wrong for a check scoped to an *ancestor* or a
 sibling (a `setns` into a namespace the caller does not own, a signal across a namespace
-boundary). A scoped `capable_in(ns, cap)` is the named gap.
+boundary). A scoped `capable_in(ns, cap)` is the named gap. **The `mknod` device-node gate is the
+first caller-visible consequence of it, measured** (2026-10-17, `docs/uapi/` §5.1 item 36): Linux's
+`vfs_mknod` asks `capable(CAP_MKNOD)`, which is the *initial* namespace, so a caller that has entered
+a user namespace - uid 0 in it, the whole set read back - still cannot make a device node on a
+filesystem the parent namespace owns (`.workbuddy/probe_mknod_userns.sh`: `touch` in the same
+directory answers `0` while `mknod c 1 3` answers `EPERM`, and the `dev 0` whiteout is served there
+as it is outside), where this kernel's gate, asking the caller's own namespace, serves it. The
+earlier gates' scoping was not measured this way; this one was.
 
 **Step 6d, landed: the socket surface, and the third reader of the same table.** The two surfaces
 above read an id a task stores about *itself* (`getuid`) and an id an *inode* stores (`stat`); a

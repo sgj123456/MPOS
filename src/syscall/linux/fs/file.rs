@@ -4579,6 +4579,23 @@ pub fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(kind) => kind,
         Err(e) => return e,
     };
+    // Linux's `CAP_MKNOD`, and the last question this call has: only a *device*
+    // node asks for it, and the caller it asks about is the one running -
+    // its **effective set**, never its name. Measured as an unprivileged caller
+    // on a current host through `syscall(2)` (`.workbuddy/probe_mknod_cap.c`,
+    // Linux 7.2.9, and beside the type field: `.workbuddy/probe_mknod.c`): a
+    // character or block node is `EPERM` there, a `S_IFREG`/`S_IFIFO`/`S_IFSOCK`
+    // node is served to a caller holding nothing, and the refusals above
+    // answer first - `EEXIST` over a name that exists, `EACCES` in a directory
+    // the caller may not write, `ENOENT` for a path that is not there. The one
+    // device node that needs none is the character node whose `dev` is `0`,
+    // which is how overlayfs spells a whiteout; `abi::mknod_needs_capability`
+    // holds that rule and its measurement.
+    if abi::mknod_needs_capability(args[1], args[2])
+        && !crate::sched::current_credentials().has_effective(crate::cred::CAP_MKNOD)
+    {
+        return err::EPERM;
+    }
     match parent.create(name, kind) {
         Ok(created) => {
             created.set_mode(masked_mode(args[1] as u32));
@@ -5763,14 +5780,25 @@ pub fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // The kind, once the name and its existence are settled: the position
     // `mknod_kind` answers `S_IFIFO` in (a FIFO, so the `EEXIST` above is what
     // a second `mknodat(S_IFIFO)` over its own node answers - Linux's answer
-    // for a type it serves), and where Linux's `CAP_MKNOD` gate for a device
-    // node sits. This kernel has no such gate yet - `docs/uapi/` §5.2 names it,
-    // with the capability re-derivation a uid change would need before it could
-    // be asked.
+    // for a type it serves).
     let kind = match abi::mknod_kind(args[2]) {
         Ok(kind) => kind,
         Err(e) => return e,
     };
+    // Linux's `CAP_MKNOD`, the position the comment above reserved for it and
+    // the last question this call has: only a *device* node asks, and it is the
+    // **effective set** of the running caller that answers. Measured as an
+    // unprivileged caller on a current host (`.workbuddy/probe_mknod_cap.c`,
+    // Linux 7.2.9): a character or block node is `EPERM`, a
+    // `S_IFREG`/`S_IFIFO`/`S_IFSOCK` node is served, the character node whose
+    // `dev` is `0` (an overlayfs whiteout) is served too, and every refusal
+    // above comes first - `EEXIST`, `EACCES` in a directory the caller may not
+    // write, `ENOENT` for a path that is not there.
+    if abi::mknod_needs_capability(args[2], args[3])
+        && !crate::sched::current_credentials().has_effective(crate::cred::CAP_MKNOD)
+    {
+        return err::EPERM;
+    }
     match parent.create(name, kind) {
         Ok(created) => {
             created.set_mode(masked_mode(args[2] as u32));

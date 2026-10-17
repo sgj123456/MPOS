@@ -745,10 +745,10 @@ pub(crate) fn mknod_type_is_creatable(mode: usize) -> Result<(), isize> {
 /// `S_IFREG` and a plain mode (including `0`) create a **regular file**,
 /// `S_IFSOCK` a **socket node** (`0`, unprivileged - a kind this kernel already
 /// has, since devfs mints socket names and `bind` owns them), and
-/// `S_IFCHR`/`S_IFBLK` a device node (which Linux gates on `CAP_MKNOD` and this
-/// kernel does not yet - `docs/uapi/` §5.2 names that, with the capability
-/// re-derivation it would need). The umask applies to the permission half
-/// beside it: `S_IFREG|0666` under a `022` mask leaves `0644`.
+/// `S_IFCHR`/`S_IFBLK` a device node (which Linux gates on `CAP_MKNOD` - the
+/// gate is [`mknod_needs_capability`]'s, and the doors ask it below this).
+/// The umask applies to the permission half beside it: `S_IFREG|0666` under a
+/// `022` mask leaves `0644`.
 ///
 /// **`S_IFIFO` makes a FIFO** - a node whose `open(2)` runs a rendezvous and
 /// whose reads and writes are a pipe's, rather than the regular file this call
@@ -766,6 +766,36 @@ pub(crate) fn mknod_kind(mode: usize) -> Result<NodeKind, isize> {
         0o010000 => Ok(NodeKind::Fifo),
         // The two values `mknod_type_is_creatable` refuses first, and no third.
         _ => Err(err::EINVAL),
+    }
+}
+
+/// Whether a `mknod(2)` of this `mode` - with this `dev` - asks for
+/// `CAP_MKNOD`: Linux's `vfs_mknod` question, and the only capability `mknod`
+/// asks for at all.
+///
+/// Measured on a current host through `syscall(2)` as an **unprivileged**
+/// caller (`.workbuddy/probe_mknod_cap.c`, Linux 7.2.9): `S_IFCHR` and
+/// `S_IFBLK` are `EPERM`, and every other creatable type is served - `S_IFREG`,
+/// `S_IFIFO` and `S_IFSOCK` make their node for a caller holding not one
+/// capability, so the gate is a *device* node's rather than a create's.
+///
+/// One device node is excepted, and the exception is Linux's own spelling of
+/// an overlayfs *whiteout*: a **character** node whose `dev` is `0`. Measured
+/// beside the rest - `mknod(S_IFCHR|0600, 0)` answered `0` (and `stat` read the
+/// node back as a character device with `rdev 0:0`) where `makedev(0, 1)`,
+/// `makedev(1, 0)` and a *block* node with the same `0` were all `EPERM`. The
+/// comparison is on the low 32 bits, which are the whole of the uapi's `dev`
+/// argument (`unsigned` in Linux's `do_mknodat`, whatever the register's upper
+/// half happens to hold).
+///
+/// This is Linux's *question*, not its position: both `mknod` doors in
+/// `fs/file.rs` ask it after the name, the name's existence and the
+/// directory's own writability, and each names that order where it asks.
+pub(crate) fn mknod_needs_capability(mode: usize, dev: usize) -> bool {
+    match mode & 0o170000 {
+        0o060000 => true,            // S_IFBLK, whose `dev` is never a whiteout
+        0o020000 => dev as u32 != 0, // S_IFCHR, except the whiteout's `0`
+        _ => false,                  // every other creatable type
     }
 }
 
@@ -3206,8 +3236,8 @@ mod tests {
     /// each of the field's eight values is a measurement rather than a reading
     /// (`.workbuddy/probe_mknod.c`) - a plain mode and `S_IFREG` make a regular
     /// file, a socket node is made, a directory is `EPERM` and a link `EINVAL`
-    /// **before the name is looked at all**, and a FIFO is refused here with
-    /// `EOPNOTSUPP` until the channel node exists (`docs/uapi/` §5.2).
+    /// **before the name is looked at all**, and a FIFO is the channel node
+    /// `docs/uapi/` §5.1 item 26 built.
     #[test]
     fn mknod_mode_field_picks_the_node_kind() {
         // The five types the call makes, plus a mode with no type at all.
@@ -3227,6 +3257,19 @@ mod tests {
         assert_eq!(mknod_type_is_creatable(0o010_644), Ok(())); // S_IFIFO passes
         assert_eq!(mknod_type_is_creatable(0), Ok(()));
         assert_eq!(mknod_type_is_creatable(0o140_644), Ok(()));
+
+        // And *who* may make which of them: only the two device types ask for
+        // `CAP_MKNOD`, and the character node whose `dev` is `0` does not (a
+        // whiteout, which Linux serves unprivileged - measured in
+        // `.workbuddy/probe_mknod_cap.c` beside the rest).
+        assert!(mknod_needs_capability(0o020_666, 0x0103)); // S_IFCHR
+        assert!(mknod_needs_capability(0o060_660, 0x0700)); // S_IFBLK
+        assert!(!mknod_needs_capability(0o020_666, 0)); // the whiteout's `dev`
+        assert!(mknod_needs_capability(0o060_660, 0)); // ...which a block node is not
+        assert!(!mknod_needs_capability(0o100_644, 0)); // S_IFREG
+        assert!(!mknod_needs_capability(0o010_644, 0)); // S_IFIFO
+        assert!(!mknod_needs_capability(0o140_644, 0)); // S_IFSOCK
+        assert!(!mknod_needs_capability(0, 0)); // a plain mode
     }
 
     /// `wait(2)`: a normal exit puts its code in bits 15:8 (WEXITSTATUS),

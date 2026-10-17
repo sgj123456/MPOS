@@ -48,7 +48,7 @@
 //! description - is the node's own subject and is pinned in `t-fifo`; the whole
 //! measured shape is `docs/uapi/` §5.2 (`.workbuddy/probe_fifo.c`).
 //!
-//! # What this kernel does not write on the node, and what it does not check
+//! # What this kernel does not write on the node
 //!
 //! A device node made here carries **no device number**: `st_rdev` is the field
 //! `mknod`'s `dev` argument fills, and this kernel ignores the argument. That is
@@ -59,15 +59,28 @@
 //! `stat` true and the device still absent. The claims below therefore read the
 //! *type*, and the section prints the number that came back.
 //!
-//! And it asks **no capability** for one: Linux refuses a device node to a
-//! caller without `CAP_MKNOD` (`EPERM`, measured on the current host, and
-//! measured in its place in the order - after the name, after `EEXIST`, after
-//! the directory's own `EACCES`), where this kernel builds the node for any
-//! caller. That is named in `docs/uapi/` §5.2 rather than claimed here, and the
-//! reason it is not a one-line gate is recorded with it: a `setuid` here does
-//! not re-derive the capability sets, so a dropped-privilege process would
-//! still hold `CAP_MKNOD` and the gate would refuse nobody. The claim below
-//! therefore reads the node and prints what Linux asks for beside it.
+//! # The one privilege question this call asks
+//!
+//! `mknod` asks for exactly one capability, and asks it for exactly one kind of
+//! node: **`CAP_MKNOD` for a device node**. Measured on a current host through
+//! `syscall(2)` as an **unprivileged** caller (`.workbuddy/probe_mknod_cap.c`,
+//! Linux 7.2.9): `S_IFCHR` and `S_IFBLK` are `EPERM`, and every other creatable
+//! type is served to a caller holding nothing - `S_IFREG`, `S_IFIFO` and
+//! `S_IFSOCK` make their node. One device node is excepted and it is the
+//! character node whose `dev` is **`0`**, which is how overlayfs spells a
+//! *whiteout*: `makedev(0, 1)`, `makedev(1, 0)` and a *block* node with the same
+//! `0` were all `EPERM` beside it. In the order above the question comes last: a
+//! name that already exists is still `EEXIST`, a directory the caller may not
+//! write is still `EACCES`, and a path that is not there is still `ENOENT`.
+//!
+//! Root holds the capability, so the refusal is only visible from *without* it,
+//! and the window below is `t-caps`'s own: lower the **effective** id to an
+//! ordinary user while the saved one stays root's, which clears the effective
+//! set and leaves the permitted one full (the measured `cap_emulate_setxuid`
+//! rule), make the claims, then raise the effective id back through the saved
+//! one. A hand run on the host is *already* without the capability - it never
+//! held one - so the same claims are made there as well, which is why this
+//! section has no host-run hole in it.
 //!
 //! # Why the raw syscall
 //!
@@ -88,13 +101,28 @@ const PLAIN: &str = "/tmp/t-mknod-plain";
 const NONE: &str = "/tmp/t-mknod-mode0";
 const SOCK: &str = "/tmp/t-mknod-sock";
 const CHR: &str = "/tmp/t-mknod-chr";
+/// The node the capability section makes *after* it has the capability back.
+const CHR_AGAIN: &str = "/tmp/t-mknod-chr-again";
 const MISSING: &str = "/tmp/t-mknod-no-dir/node";
+
+/// The capability section's writable directory (`0777`, so the lowered caller
+/// may still make a name in it) and the one it may not write (`0555`) - the
+/// pair whose answers separate a missing capability's `EPERM` from a
+/// directory's own `EACCES`.
+const CAP_DIR: &str = "/tmp/t-mknod-cap";
+const RO_DIR: &str = "/tmp/t-mknod-ro";
+
+/// A name inside [`CAP_DIR`], where the lowered caller's claims live.
+fn cap_dir(name: &str) -> String {
+    format!("{CAP_DIR}/{name}")
+}
 
 const AT_FDCWD: i32 = -100;
 /// `S_IFMT`'s eight values, and the permission halves the claims use.
 const S_IFIFO: u32 = 0o010000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFDIR: u32 = 0o040000;
+const S_IFBLK: u32 = 0o060000;
 const S_IFREG: u32 = 0o100000;
 const S_IFLNK: u32 = 0o120000;
 const S_IFSOCK: u32 = 0o140000;
@@ -106,6 +134,21 @@ fn mknodat(mode: u32, dev: u64, path: &str) -> (isize, i32) {
     let r = unsafe { libc::syscall(libc::SYS_mknodat, AT_FDCWD, c.as_ptr(), mode, dev) } as isize;
     let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
     (r, if r < 0 { e } else { 0 })
+}
+
+/// `setresuid(r, e, s)` raw, answering the errno (or `0`).
+///
+/// Through `libc::syscall` rather than the typed wrapper, which takes a `uid_t`
+/// and so cannot name `-1` ("keep this one") - the same reason `t-fsflags` uses
+/// this door. Only the effective id moves: the real and saved ones stay root's,
+/// which is what makes the drop reversible from inside the process.
+fn setresuid(r: libc::c_long, e: libc::c_long, s: libc::c_long) -> i32 {
+    let rc = unsafe { libc::syscall(libc::SYS_setresuid, r, e, s) };
+    if rc < 0 {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 /// What a name is now, or `None` when nothing answers to it.
@@ -122,11 +165,19 @@ fn mode_of(path: &str) -> Option<u32> {
 }
 
 /// Remove every fixture, so each claim starts from a free name whatever the
-/// last run left behind.
+/// last run left behind. The capability section's directory has to be emptied
+/// before it can go, which is why the names inside it are listed too.
 fn clear() {
-    for path in [NODE, PLAIN, NONE, SOCK, CHR] {
+    for path in [NODE, PLAIN, NONE, SOCK, CHR, CHR_AGAIN] {
         let _ = unlinkat(CWD, path, AtFlags::empty());
     }
+    for name in [
+        "chr", "blk", "whiteout", "blk0", "fifo", "reg", "sock", "exists",
+    ] {
+        let _ = unlinkat(CWD, cap_dir(name).as_str(), AtFlags::empty());
+    }
+    let _ = rustix::fs::rmdir(CAP_DIR);
+    let _ = rustix::fs::rmdir(RO_DIR);
 }
 
 fn main() {
@@ -293,29 +344,143 @@ fn main() {
         made == -1 && e == libc::ENOENT,
     );
 
-    // ---- a device node, and the number it does not carry -------------------
+    // ---- a device node: what the caller holds decides -----------------------
+    //
+    // The last question the call asks, and the only one whose answer is the
+    // *caller's* rather than the call's own shape. The whole measured contract
+    // is in the header; what this section does is stage both sides of it - a
+    // caller that holds `CAP_MKNOD` and a caller that does not - and then walk
+    // the order, because the capability is asked *after* every refusal above.
+    let was_root = geteuid().is_root();
 
-    if geteuid().is_root() {
+    // The two directories the window needs, made while the caller is still
+    // root: one the lowered caller may write in, one it may not. A `mkdir`
+    // arrives masked by the umask, so the mode is set again explicitly - the
+    // pair is the whole point of the fixture.
+    let staged = rustix::fs::mkdir(CAP_DIR, Mode::from_bits_retain(0o777)).is_ok()
+        && rustix::fs::chmod(CAP_DIR, Mode::from_bits_retain(0o777)).is_ok()
+        && rustix::fs::mkdir(RO_DIR, Mode::from_bits_retain(0o555)).is_ok()
+        && rustix::fs::chmod(RO_DIR, Mode::from_bits_retain(0o555)).is_ok();
+    r.check(
+        "the window's two directories are staged (one writable, one not)",
+        staged,
+    );
+
+    // A name that is already there, for the `EEXIST` claim below: made now,
+    // while the caller still may.
+    let (made, e) = mknodat(S_IFREG | 0o600, 0, cap_dir("exists").as_str());
+    r.check(
+        &format!("and a name the window will find already there (got {made}, errno {e})"),
+        made == 0,
+    );
+
+    if was_root {
         let (made, e) = mknodat(S_IFCHR | 0o666, 0x0103, CHR);
-
         r.check(
-            &format!("a character node is made (got {made}, errno {e})"),
+            &format!(
+                "a character node is made by a caller that holds CAP_MKNOD (got {made}, errno {e})"
+            ),
             made == 0 && kind_of(CHR) == Some(FileType::CharacterDevice),
         );
-
         let number = statat(CWD, CHR, AtFlags::empty()).ok().map(|st| st.st_rdev);
         println!(
             "     the character node's st_rdev: {number:?} - Linux reports the dev argument \
              (1:3); this kernel does not write it, docs/uapi/ §5.2"
         );
-        println!(
-            "     note: Linux asks CAP_MKNOD for this node (EPERM unprivileged, measured); this \
-             kernel checks no capability, and docs/uapi/ §5.2 names that too"
-        );
     } else {
         println!(
-            "     not root: the device-node claim is named, not made - Linux's answer for an \
-             unprivileged caller is EPERM, which this kernel does not check yet (§5.2)"
+            "     not root: the node a *capable* caller makes is named here, and Linux's `EPERM` \
+             half is measured below as this ordinary user"
+        );
+    }
+
+    // The window itself. Root lowers only its **effective** id, so the measured
+    // `cap_emulate_setxuid` rule clears the effective set while the permitted
+    // one survives (the saved id is still root's) - and an ordinary user, which
+    // is what a hand run on the host is, never held the capability to begin
+    // with. Either way the claims below are the same ones.
+    let dropped = if was_root { setresuid(-1, 1000, -1) } else { 0 };
+    let how = if was_root {
+        format!("the effective id is lowered to 1000, root's saved one kept (got {dropped})")
+    } else {
+        String::from("the caller is an ordinary user, which never holds CAP_MKNOD")
+    };
+    r.check(&how, dropped == 0);
+
+    if dropped == 0 {
+        let (chr, ec) = mknodat(S_IFCHR | 0o600, 0x0103, cap_dir("chr").as_str());
+        r.check(
+            &format!("a character node is EPERM without CAP_MKNOD (got {chr}, errno {ec})"),
+            chr == -1 && ec == libc::EPERM,
+        );
+        let (blk, eb) = mknodat(S_IFBLK | 0o600, 0x0700, cap_dir("blk").as_str());
+        r.check(
+            &format!("and a block node too (got {blk}, errno {eb})"),
+            blk == -1 && eb == libc::EPERM,
+        );
+        // The control the two above need: the same caller, in the same
+        // directory, making a node the gate does not cover - so their `EPERM`s
+        // are the capability's and not a directory it may not write in.
+        let (white, ew) = mknodat(S_IFCHR | 0o600, 0, cap_dir("whiteout").as_str());
+        r.check(
+            &format!(
+                "the character node whose dev is 0 (a whiteout) needs no capability (got {white}, errno {ew})"
+            ),
+            white == 0 && kind_of(cap_dir("whiteout").as_str()) == Some(FileType::CharacterDevice),
+        );
+        let (b0, e0) = mknodat(S_IFBLK | 0o600, 0, cap_dir("blk0").as_str());
+        r.check(
+            &format!(
+                "but the exception is the character type's: a block node with dev 0 is EPERM (got {b0}, errno {e0})"
+            ),
+            b0 == -1 && e0 == libc::EPERM,
+        );
+        let (fifo, ef) = mknodat(S_IFIFO | 0o600, 0, cap_dir("fifo").as_str());
+        let (reg, er) = mknodat(S_IFREG | 0o600, 0, cap_dir("reg").as_str());
+        let (sock, es) = mknodat(S_IFSOCK | 0o600, 0, cap_dir("sock").as_str());
+        r.check(
+            &format!(
+                "and a name that is no device needs none: S_IFIFO, S_IFREG and S_IFSOCK are served \
+                 (got {fifo}/{ef}, {reg}/{er}, {sock}/{es})"
+            ),
+            fifo == 0 && reg == 0 && sock == 0,
+        );
+        // The order, from the side that makes it visible: each of the refusals
+        // above answers *before* the capability is asked.
+        let (exists, ee) = mknodat(S_IFCHR | 0o600, 0x0103, cap_dir("exists").as_str());
+        r.check(
+            &format!("a name that is already there is EEXIST before the capability (got {exists}, errno {ee})"),
+            exists == -1 && ee == libc::EEXIST,
+        );
+        let (ro, ero) = mknodat(S_IFCHR | 0o600, 0x0103, &format!("{RO_DIR}/chr"));
+        r.check(
+            &format!(
+                "and a directory the caller may not write is its own EACCES (got {ro}, errno {ero})"
+            ),
+            ro == -1 && ero == libc::EACCES,
+        );
+        let (gone, eg) = mknodat(S_IFCHR | 0o600, 0x0103, "/tmp/t-mknod-no-dir/chr");
+        r.check(
+            &format!("and a path that is not there is ENOENT (got {gone}, errno {eg})"),
+            gone == -1 && eg == libc::ENOENT,
+        );
+    }
+
+    // ...and the way back, which is the other half of a gate: the same call
+    // refused a moment ago is *served* once the capability is back, so the
+    // `EPERM`s above were the capability's and not a missing feature.
+    if was_root && dropped == 0 {
+        let back = setresuid(-1, 0, -1);
+        r.check(
+            &format!("raising the effective id back through the saved one (got {back})"),
+            back == 0,
+        );
+        let (again, ea) = mknodat(S_IFCHR | 0o666, 0x0103, CHR_AGAIN);
+        r.check(
+            &format!(
+                "and the same character node is served once CAP_MKNOD is back (got {again}, errno {ea})"
+            ),
+            again == 0 && kind_of(CHR_AGAIN) == Some(FileType::CharacterDevice),
         );
     }
 

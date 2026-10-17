@@ -340,6 +340,15 @@ before the death, which happens at the syscall gate — Linux's own order, where
 `mknod`'s `dev` argument — a node made here carries no device number, because a number-to-driver
 table is what would make the number mean a device.
 
+**A device node asks `CAP_MKNOD` now** (`docs/uapi/` §5.1 item 36, landed 2026-10-17): exactly the
+two device types do — `S_IFREG`/`S_IFIFO`/`S_IFSOCK` nodes are served to a caller holding not one
+capability — in Linux's place in the order (after the type, the name, the name's existence `EEXIST`
+and the directory's own `EACCES`), with the character node whose `dev` is `0` served too, because
+that is how overlayfs spells a whiteout. One corner is named in `docs/uapi/` §5.2 rather than fixed:
+Linux asks `capable(CAP_MKNOD)`, which is the **initial** user namespace, where this kernel's checks
+ask the caller's own — the capability model's own gap (§6.3), and the first place it is visible to a
+caller.
+
 **A child's death is one `SIGCHLD` record, and it is Linux's** (`docs/uapi/` §5.1 item 29, landed
 2026-10-17): the second book this kernel kept for "an exit whose signal is unread" is deleted — the
 exit queues the real signal with `CLD_EXITED`/`CLD_KILLED` and the status beside it, and a death the
