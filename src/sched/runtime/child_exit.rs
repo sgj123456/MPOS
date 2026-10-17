@@ -9,8 +9,8 @@ use super::child_mm::{
 use super::child_signal::{current_credentials, force_signal, queue_signal};
 use super::load::{initial_stack_rsp, interpreter_bytes, load_user, write_arg_block};
 use super::task::{
-    RETIRED, RETIRED_CAP, Retired, SIGCHLD_PENDING, SpawnError, Stack, TIMER_SLOTS, Table, Task,
-    Tracing, WaitFor, block_until_on_interruptible, current, new_layout, schedule, with_table,
+    RETIRED, RETIRED_CAP, Retired, SpawnError, Stack, TIMER_SLOTS, Table, Task, Tracing, WaitFor,
+    block_until_on_interruptible, current, new_layout, schedule, with_table,
 };
 use super::trace::{attach_new_child, fork_event, unreported_stop, waitable};
 use crate::abi::PTRACE_EVENT_CLONE;
@@ -219,9 +219,8 @@ pub fn exit(code: isize) -> ! {
         // Linux's `forget_original_parent`: a process that exits hands every
         // child that was still its own to init. Without this a zombie keeps a
         // `parent` naming a *slot* — and slots are reused, so the next process
-        // to occupy this one inherits the dead process's children: `read_sigchld`
-        // filters by `task.parent == Some(me)`, and `wait4`'s tables do the same
-        // by number. Measured, once the sweep's program count grew: `t-signalfd`
+        // to occupy this one inherits the dead process's children: `wait4`'s
+        // tables filter by `task.parent == Some(me)`. Measured, once the sweep's program count grew: `t-signalfd`
         // was handed four records for one death, three of them naming slots 8
         // and 10 — unreaped orphans of an *earlier* occupant of its own slot —
         // and the read before its fork answered a record where the claim is
@@ -323,40 +322,51 @@ pub fn exit(code: isize) -> ! {
             // on a futex and lets its SIGCHLD handler do the waking.
             //
             // Queued when a handler would run, *and* when the parent has
-            // SIGCHLD blocked - Linux's `sig_ignored()` discards a generated
-            // signal only if it is unblocked and ignored, and says outright
-            // that a blocked signal is never ignored. The second case is what
-            // a blocked `sigtimedwait`/`sigwait`/`signalfd` on SIGCHLD needs;
-            // without it a handler-less waiter hangs. Measured on Linux
-            // 7.2.8: a process with no handler that blocks SIGCHLD, forks,
-            // and calls `sigtimedwait` gets the signal back (`rc=17`,
-            // `si_code=1`, `si_pid` the child), where the handler-only rule
-            // used to leave it asleep for ever.
+            // SIGCHLD blocked - and never when the parent ignores it, whatever
+            // the mask says. All three measured on a current host with
+            // `.workbuddy/probe_signalfd_chld.c` (Linux 7.2.9), one scenario
+            // each, because the rule is not what either half alone suggests:
+            //
+            //   * `SIG_IGN`, blocked or not: **no record at all**, and the
+            //     child is reaped by the kernel (`waitpid(WNOHANG)` is
+            //     `ECHILD`). So the ignore is asked *first*; a blocked signal
+            //     is "never ignored" only where delivery is concerned, and this
+            //     is generation;
+            //   * `SIG_DFL` and *unblocked*: no record either (the child is a
+            //     zombie that `wait(2)` still collects);
+            //   * `SIG_DFL` and **blocked**: one record. That is what a
+            //     handler-less `sigtimedwait`/`sigwait`/`signalfd` on SIGCHLD
+            //     needs; without it such a waiter sleeps for ever.
+            //
+            // The auto-reap half stays named rather than done (`docs/uapi/`
+            // §5.2): this kernel keeps the zombie, so a parent that ignores
+            // SIGCHLD and never waits holds a slot where Linux holds none.
             let sigchld_bit = signal::bit(signal::SIGCHLD);
-            let wants_sigchld = t
-                .task(parent)
-                .dispositions
-                .get(signal::SIGCHLD)
-                .is_handler()
-                || t.task(parent).blocked & sigchld_bit != 0;
+            let disposition = t.task(parent).dispositions.get(signal::SIGCHLD);
+            let wants_sigchld = !disposition.is_ignore()
+                && (disposition.is_handler() || t.task(parent).blocked & sigchld_bit != 0);
             if wants_sigchld {
                 // The child as the record names it: the number it has *in its
                 // own namespace* - Linux's `task_tgid_vnr(tsk)`. A parent in
                 // the same namespace reads back the number `getpid` gave the
                 // child; a parent one level out reads the child's own number,
                 // which is Linux's wart for a child in a deeper namespace than
-                // its reader.
-                let child_pid = {
+                // its reader. The uid is the child's real one, the same field
+                // the retired record carries for `waitid`'s `si_uid`.
+                let (child_pid, child_uid) = {
                     let child = t.task(id);
-                    child
-                        .pid_ns
-                        .number_of(child.tgid.0)
-                        .unwrap_or(child.tgid.0 as u32) as i32
+                    (
+                        child
+                            .pid_ns
+                            .number_of(child.tgid.0)
+                            .unwrap_or(child.tgid.0 as u32) as i32,
+                        child.identity.ruid as i32,
+                    )
                 };
                 queue_signal(
                     t.task_mut(parent),
                     signal::SIGCHLD,
-                    signal::SigInfo::user(signal::SIGCHLD, child_pid, 0),
+                    signal::SigInfo::child(child_pid, child_uid, code),
                 );
             }
             // The console goes back to the parent's group as the child leaves
@@ -474,16 +484,12 @@ pub(crate) fn take_retired_for(t: &Table, id: TaskId, me: TaskId) -> Option<Reti
                 .as_ref()
                 .is_none_or(|task| task.parent == Some(me));
         if also_parent {
-            SIGCHLD_PENDING.borrow(cs).borrow_mut().retain(|p| *p != id);
             return Some(retired.remove(at));
         }
         if retired[at].tracer == Some(me) {
             retired[at].tracer = None;
             return Some(retired[at]);
         }
-        // The code is collected - so the signal about it can never be read
-        // again, and a stale entry must not name a slot a new task owns.
-        SIGCHLD_PENDING.borrow(cs).borrow_mut().retain(|p| *p != id);
         Some(retired.remove(at))
     })
 }
@@ -494,61 +500,7 @@ pub fn take_exit_code(id: TaskId) -> Option<isize> {
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
         let at = retired.iter().rposition(|retired| retired.id == id)?;
-        SIGCHLD_PENDING.borrow(cs).borrow_mut().retain(|p| *p != id);
         Some(retired.remove(at).code)
-    })
-}
-
-/// Block the caller until one of its children exits, then take that child's
-/// pid and code. A child that is already gone is reaped from the records
-/// without blocking; with none gone, the caller sleeps and is woken by
-/// [`exit`]'s parent wake.
-///
-/// The caller must be a task: this is `wait`'s core, and nothing else calls
-/// it.
-/// Whether a child of the running task has exited and not yet been
-/// collected - the question a `signalfd` for `SIGCHLD` answers. Nothing is
-/// consumed: `wait(2)` is what collects.
-/// Whether a child of the running task has an unread `SIGCHLD` - the question
-/// a `signalfd` answers when polled. Nothing is consumed here.
-pub fn child_exited_unreaped() -> Option<usize> {
-    let me = current();
-    with_table(|t| {
-        critical_section::with(|cs| {
-            SIGCHLD_PENDING
-                .borrow(cs)
-                .borrow()
-                .iter()
-                .rev()
-                .find_map(|id| {
-                    // The named child must still be ours: a slot a new task
-                    // took over describes nobody's child any more.
-                    t.tasks[id.0]
-                        .as_ref()
-                        .is_some_and(|task| task.parent == Some(me))
-                        .then(|| id.0)
-                })
-        })
-    })
-}
-
-/// Read one pending `SIGCHLD` of the running task, as a `signalfd` read does:
-/// the signal goes to the caller and is no longer pending, while the exit
-/// code itself stays on file for `wait(2)` to collect. `None` when no child
-/// of this task has an unread signal.
-pub fn read_sigchld() -> Option<usize> {
-    let me = current();
-    with_table(|t| {
-        critical_section::with(|cs| {
-            let mut pending = SIGCHLD_PENDING.borrow(cs).borrow_mut();
-            let at = pending.iter().rposition(|id| {
-                t.tasks[id.0]
-                    .as_ref()
-                    .is_some_and(|task| task.parent == Some(me))
-            })?;
-            let id = pending.remove(at);
-            Some(id.0)
-        })
     })
 }
 
@@ -594,12 +546,7 @@ fn record_retired(id: TaskId, code: isize, pgid: TaskId, tracer: Option<TaskId>,
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
         if retired.len() == RETIRED_CAP {
-            let dropped = retired.remove(0);
-            // A code nobody will collect has no signal left to read either.
-            SIGCHLD_PENDING
-                .borrow(cs)
-                .borrow_mut()
-                .retain(|p| *p != dropped.id);
+            retired.remove(0);
         }
         retired.push(Retired {
             id,
@@ -608,12 +555,6 @@ fn record_retired(id: TaskId, code: isize, pgid: TaskId, tracer: Option<TaskId>,
             uid,
             tracer,
         });
-        // The signal the exit carries: pending until a signalfd reader takes
-        // it, independent of who eventually collects the code.
-        let mut pending = SIGCHLD_PENDING.borrow(cs).borrow_mut();
-        if !pending.contains(&id) {
-            pending.push(id);
-        }
     });
 }
 

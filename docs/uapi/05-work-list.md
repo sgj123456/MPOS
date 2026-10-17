@@ -757,3 +757,61 @@ the commit bodies), and each moved its pin in the same commit.
     counts are back to zero), and the counterfactual is exact — with the park put back to
     `block_until_interruptible`, the section's answers are the phantom peer's (`ENXIO` becomes a
     success, `0` becomes `EAGAIN`, and the blocking reader no longer parks).
+
+29. **A child's death is one `SIGCHLD` record, and it is Linux's record.** §5.2's
+    `signalfd`/`SIGCHLD` entry named three divergences on the path a descriptor reader walks, and
+    this pass serves all three — which meant deleting a table rather than adding a branch.
+    **Measured whole on a current host first** (`.workbuddy/probe_signalfd_chld.c`, Linux 7.2.9),
+    one scenario per disposition, **each in its own forked child because the first draft measured
+    its own leftovers** (a handler installed by scenario 3 was still installed in scenario 8's
+    reading, and the record it captured named the *previous* scenario's child — a fixture bug that
+    read exactly like a kernel one):
+
+    * blocked `SIG_DFL`, a child exits 7 → **one** record
+      `signo=17 code=1[CLD_EXITED] pid uid=1000 status=7 ptr=0 utime=0 stime=0`, then `EAGAIN`;
+      `wait4` still collects it, and the read does *not* collect it (the record survives the reap);
+    * the same with a child that burned 60 ms of CPU → `utime=6`, `stime=0`;
+    * unblocked `SIG_DFL` → **nothing**, before or after the reap (the embarrassing half: the entry
+      this replaces read its own refusal as "measured", and this is the door that says otherwise);
+    * blocked + a handler → one record, and the read **consumes** it: the handler never runs, even
+      after the unblock;
+    * `SIG_IGN` (blocked or not) → nothing, and `waitpid(WNOHANG)` is **`ECHILD`** — the kernel reaped
+      the child;
+    * a child that takes `SIGKILL` → `code=2[CLD_KILLED] status=9`;
+    * a child that takes `SIGSEGV`, `RLIMIT_CORE` 0 → `code=3[CLD_DUMPED] status=11`, and `wait4`'s
+      status word carries `WCOREDUMP`;
+    * the same death through a handler's `siginfo_t` and through `sigtimedwait` → `si_code=1`,
+      `si_status=7`, `si_pid` the child, `si_uid` its uid (the word at offset 24 is the status, not a
+      `sigval`).
+
+    **The fix is Linux's shape: the pending queue is the one table.** `SIGCHLD_PENDING`, the second
+    book this kernel kept for "an exit whose signal is still unread" (with `read_sigchld` and
+    `child_exited_unreaped`, the descriptor's synthetic `ChildExit` record, and the retains in
+    `take_retired_for`/`take_exit_code`/`record_retired`) is **deleted**; the exit path queues the
+    real signal instead, and it queues Linux's record for it — `signal::SigInfo::child(pid, ruid,
+    code)`, whose `(si_code, si_status)` pair is `crate::abi::exit_chld`'s, the same function
+    `waitid`'s record uses, moved into the leaf crate so the scheduler and the syscall layer cannot
+    come to spell a child's death two ways. The predicate is refined to the measured rule: **never
+    for a parent that ignores `SIGCHLD`**, otherwise a handler *or* a blocked signal — the entry this
+    replaces had the ignore case wrong (it queued for a blocked `SIG_IGN`), and the `is_ignore()`
+    test comes first, because generation and delivery ask different questions. The status travels to
+    every door that renders it: `signalfd`'s `ssi_status` (offset 40), and the `siginfo_t` union at
+    offset 24 for a handler's frame and for `sigtimedwait` — where the class test (`1..=6` is the
+    `_sigchld` member, everything else the `_kill`/`_rt` one) is now one function,
+    `hal::SignalInfo::chld_union`, instead of two machines' worth of `if` and a third in the syscall
+    layer. Owner: `src/sched/runtime/child_exit.rs`'s exit path and `src/sched/runtime/task.rs`
+    (the deleted table), `src/sched/signal.rs`'s `SigInfo::child`/`status`,
+    `crates/abi`'s `exit_chld`/`CLD_*`, `src/vfs/signalfd.rs`'s `take_signal`, `arch/src/hal/mod.rs`'s
+    `chld_union`, the two machines' `SignalInfo` writers and `src/syscall/linux/proc.rs`'s
+    `sigtimedwait`. Pin: `t-signalfd`, 46 claims with **no per-machine branch left** (the count it
+    used to claim with a `note:` is now `1` on both), green on a current host first — it claims the
+    record field by field (`ssi_status`, the real uid, the pid), the unblocked death's `EAGAIN`, the
+    `SIGKILL` record's `CLD_KILLED`, and the frame's rendering of the same record through a handler.
+    Two of those are named rather than made on a **host** run, where the real uid cannot be moved
+    (`t-waitid`'s shape for the same field): 46 claims in a sweep, 44 with two notes there. **Three residuals
+    are named rather than hidden** (§5.2 carries them with the measurements): the **ignored**
+    child's auto-reap (`ECHILD` on Linux, a zombie here), `si_utime`/`si_stime` staying zero
+    (Linux's are the child's CPU in ticks — `6` for a 60 ms child), and the
+    **`CLD_DUMPED`/`WCOREDUMP`** half — where the measurement also corrects a *reason*: the core bit
+    is not about a file being written (a `SIGSEGV` child reports it with `RLIMIT_CORE` 0), so
+    `wait_status`'s comment that said "mpos writes no core files" was explaining the wrong thing.

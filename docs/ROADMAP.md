@@ -339,6 +339,15 @@ before the death, which happens at the syscall gate — Linux's own order, where
 `mknod`'s `dev` argument — a node made here carries no device number, because a number-to-driver
 table is what would make the number mean a device.
 
+**A child's death is one `SIGCHLD` record, and it is Linux's** (`docs/uapi/` §5.1 item 29, landed
+2026-10-17): the second book this kernel kept for "an exit whose signal is unread" is deleted — the
+exit queues the real signal with `CLD_EXITED`/`CLD_KILLED` and the status beside it, and a death the
+parent never asked to be signalled for leaves nothing readable (measured on a host first, all four
+dispositions). Three semantics stay named there: an **ignored** child is reaped by Linux and kept as
+a zombie here, `si_utime`/`si_stime` stay zero, and a signalled death is `CLD_KILLED` where Linux
+says `CLD_DUMPED` and sets `WCOREDUMP` — a bit that follows the signal rather than a file written,
+which is what the measurement corrected in this kernel's own comment about it.
+
 One of those "buffer sizes" is served now, and the *blocking* half of it was the last of it: a
 **blocking UDP send waits for the send buffer** (`docs/uapi/` §5.1 item 27, landed 2026-10-16) — the
 wakeup source it was waiting for turned out to be the stack's own poll rather than a TX completion

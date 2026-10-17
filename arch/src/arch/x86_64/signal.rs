@@ -213,16 +213,24 @@ impl SignalFrame for Current {
         put(out, UCONTEXT + UCONTEXT_SIGMASK, delivery.blocked_wire);
 
         // A `siginfo_t`: signo, errno, code, and - for a signal that names a
-        // sender - the pid and uid, with the `sigqueue` payload in the union at
-        // offset 24. The offsets are Linux x86_64's, so a handler written
-        // against `<signal.h>` reads the right fields.
+        // sender - the pid and uid, with the union at offset 24. The offsets
+        // are Linux x86_64's, so a handler written against `<signal.h>` reads
+        // the right fields.
         let info = &delivery.info;
         out[SIGINFO..SIGINFO + 4].copy_from_slice(&info.signo.to_le_bytes());
         out[SIGINFO + 4..SIGINFO + 8].copy_from_slice(&info.errno.to_le_bytes());
         out[SIGINFO + 8..SIGINFO + 12].copy_from_slice(&info.code.to_le_bytes());
         put_i32(out, SIGINFO + 16, info.pid);
         put_i32(out, SIGINFO + 20, info.uid);
-        put(out, SIGINFO + 24, info.value);
+        // Which union member that word is depends on the code's class, and the
+        // rule is `hal`'s - a child's death puts `si_status` there (with the
+        // `_sigchld` member's times left zero, which is `docs/uapi/` §5.2's
+        // named residual), every other sender puts the `sigval`.
+        if info.chld_union() {
+            put_i32(out, SIGINFO + 24, info.status);
+        } else {
+            put(out, SIGINFO + 24, info.value);
+        }
 
         // Enter the handler with the three arguments the ABI gives it: the
         // signal number, a `siginfo_t`, and the `ucontext` to hand back. The

@@ -354,18 +354,6 @@ pub(crate) struct Retired {
 pub(crate) static RETIRED: Mutex<RefCell<Vec<Retired>>> = Mutex::new(RefCell::new(Vec::new()));
 pub(crate) const RETIRED_CAP: usize = 32;
 
-/// The exits whose `SIGCHLD` is still unread.
-///
-/// Two books, one per consumer: the exit *code* belongs to `wait(2)`, which
-/// takes it exactly once, while the *signal* belongs to a `signalfd`, whose
-/// reader may be a different caller - and draining one must not starve the
-/// other. `nlplug-findfs` leans on exactly that split: it reads the signal
-/// off its descriptor and then reaps the child through `waitpid`, and a
-/// signal read that also consumed the code would leave the reaper looking at
-/// an empty table.
-pub(crate) static SIGCHLD_PENDING: Mutex<RefCell<Vec<TaskId>>> =
-    Mutex::new(RefCell::new(Vec::new()));
-
 /// Descriptions an exited process held, waiting to be dropped.
 ///
 /// [`Table::release_exited`] runs with the task table borrowed, and dropping a

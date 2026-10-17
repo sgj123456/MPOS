@@ -350,6 +350,54 @@ pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isi
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// A child's death, as the `CLD_*` vocabulary spells it
+// ---------------------------------------------------------------------------
+
+/// `si_code` for a child that exited normally, and one a signal ended.
+///
+/// The two halves of the `_sigchld` union `siginfo_t` carries - which is why
+/// they live here rather than in either reader: a child's death is a *fact*
+/// about the exit code, not about the door it is read through. The scheduler
+/// queues it as the `SIGCHLD` record when the parent wants the signal
+/// (`src/sched/runtime/`), and the syscall layer writes it into the
+/// `siginfo_t` a collected `waitid(2)` hands over; both ask this.
+pub const CLD_EXITED: i32 = 1;
+pub const CLD_KILLED: i32 = 2;
+
+/// The rest of the vocabulary, for the readers that name an event class:
+/// a task that stopped under its tracer, one a `SIGSTOP`-shaped signal stopped
+/// for its parent, and one a `SIGCONT` resumed.
+pub const CLD_TRAPPED: i32 = 4;
+pub const CLD_STOPPED: i32 = 5;
+pub const CLD_CONTINUED: i32 = 6;
+
+/// The `(si_code, si_status)` pair an exit code becomes: `CLD_EXITED` with the
+/// code itself for a normal exit, `CLD_KILLED` with the signal number for a
+/// death by signal - Linux's two answers for the two shapes a corpse has, and
+/// the whole reason `si_status` is not simply the exit code.
+///
+/// **`CLD_DUMPED` (3) is the one code this cannot answer, and the measurement
+/// says its reason is not the one this used to give.** A signalled death whose
+/// default action dumps core is `CLD_DUMPED` on Linux - and it is `CLD_DUMPED`
+/// even with the core limit at zero, which is what `.workbuddy/probe_signalfd_chld.c`
+/// attached to this change measured on a current host (Linux 7.2.9,
+/// `RLIMIT_CORE` set to 0 and read back as 0: a `SIGSEGV` death answered
+/// `CLD_DUMPED` with `si_status` 11, and `wait4`'s status word carried
+/// `WCOREDUMP`). So the bit follows the *signal*, not a file that was written;
+/// "no core is written here" - the reason this kernel's comments used to give -
+/// is not what Linux's answer is about. What is left is a named gap rather than
+/// a silently different number, because reproducing it means modelling which
+/// signals dump at all (`sig_kernel_coredump`'s set) and saying so in the
+/// `wait4` status word and the `waitid` record together.
+pub fn exit_chld(code: isize) -> (i32, i32) {
+    if code < 0 {
+        (CLD_KILLED, -code as i32)
+    } else {
+        (CLD_EXITED, code as i32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,6 +620,24 @@ mod tests {
                 max: RLIM_INFINITY
             }
         );
+    }
+
+    #[test]
+    fn a_childs_death_is_the_cld_pair_linux_reports() {
+        // Measured with `.workbuddy/probe_signalfd_chld.c` on a current host:
+        // a child that exits 7 is `CLD_EXITED` with `si_status` 7 through the
+        // signalfd, through a handler's `siginfo_t` and through `sigtimedwait`
+        // alike, and a child killed by `SIGKILL` is `CLD_KILLED` with
+        // `si_status` 9.
+        assert_eq!(exit_chld(7), (CLD_EXITED, 7));
+        assert_eq!(exit_chld(-9), (CLD_KILLED, 9));
+        // The same number, two meanings: `si_status` is the exit code for an
+        // exit and the *signal* for a death, so a caller that reads the status
+        // alone cannot tell "exited 9" from "killed by 9" - which is the whole
+        // reason `si_code` is the field to branch on.
+        assert_eq!(exit_chld(9).1, exit_chld(-9).1);
+        assert_ne!(exit_chld(9).0, exit_chld(-9).0);
+        assert_eq!((CLD_EXITED, CLD_KILLED), (1, 2));
     }
 
     #[test]

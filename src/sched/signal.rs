@@ -317,6 +317,17 @@ pub struct SigInfo {
     pub uid: i32,
     /// The `union sigval` a `sigqueue` sent, or zero for a plain `kill`.
     pub value: u64,
+    /// `si_status`: the exit code of a child that exited, or the signal that
+    /// ended one. Zero for every other sender.
+    ///
+    /// It shares its word of the union with [`value`](Self::value) - the ABI
+    /// puts `si_status` and `si_value` at the same offset - so which one a
+    /// record carries is decided by its [`code`](Self::code)'s class rather
+    /// than by which field is set. Both are carried here rather than
+    /// overlapped, because the two doors that render this record (a handler's
+    /// `siginfo_t` and a `signalfd`'s `ssi_status`) read them apart; the class
+    /// test lives in one place, `crate::hal::SignalInfo::chld_union`.
+    pub status: i32,
 }
 
 impl SigInfo {
@@ -328,6 +339,7 @@ impl SigInfo {
         pid: 0,
         uid: 0,
         value: 0,
+        status: 0,
     };
 
     /// A `kill`/`tgkill` record: `SI_USER`, from `pid`/`uid`, no payload.
@@ -339,6 +351,7 @@ impl SigInfo {
             pid,
             uid,
             value: 0,
+            status: 0,
         }
     }
 
@@ -351,6 +364,7 @@ impl SigInfo {
             pid,
             uid,
             value,
+            status: 0,
         }
     }
 
@@ -363,6 +377,7 @@ impl SigInfo {
             pid: 0,
             uid: 0,
             value: 0,
+            status: 0,
         }
     }
 
@@ -375,6 +390,38 @@ impl SigInfo {
             pid: 0,
             uid: 0,
             value: 0,
+            status: 0,
+        }
+    }
+
+    /// The record a **child's death** carries to its parent as `SIGCHLD`.
+    ///
+    /// `code` is the kernel's own record of the death - the exit code, or the
+    /// negated signal number - and the `(si_code, si_status)` pair it becomes
+    /// is `crate::abi::exit_chld`'s, the same pair `waitid(2)` hands over for
+    /// the same corpse: `CLD_EXITED` with the code, or `CLD_KILLED` with the
+    /// signal. Measured on a current host through every door that renders it
+    /// (`.workbuddy/probe_signalfd_chld.c`, Linux 7.2.9): a child that exits 7
+    /// is `CLD_EXITED` with `si_status` 7 in a `signalfd` record, in a
+    /// handler's `siginfo_t` and in `sigtimedwait`'s, and a child killed by
+    /// `SIGKILL` is `CLD_KILLED` with `si_status` 9.
+    ///
+    /// `uid` is the child's **real** id, which is what Linux fills here
+    /// (`task_uid`, not the effective one) and what the retired record carries
+    /// for `waitid`'s `si_uid` as well, so the two doors name the same owner.
+    /// `si_utime`/`si_stime` are not part of this record: Linux fills them with
+    /// the child's CPU in clock ticks, and this kernel leaves them zero
+    /// (`docs/uapi/` §5.2's note).
+    pub fn child(pid: i32, uid: i32, code: isize) -> SigInfo {
+        let (code, status) = crate::abi::exit_chld(code);
+        SigInfo {
+            signo: SIGCHLD as i32,
+            errno: 0,
+            code,
+            pid,
+            uid,
+            value: 0,
+            status,
         }
     }
 }

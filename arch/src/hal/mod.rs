@@ -465,6 +465,24 @@ pub struct SignalInfo {
     pub uid: i32,
     /// The `union sigval` a `sigqueue` sent, or zero for a plain `kill`.
     pub value: u64,
+    /// The child's exit code, or the signal that ended it: `si_status`, for the
+    /// one sender that has one.
+    pub status: i32,
+}
+
+impl SignalInfo {
+    /// Whether this record's union member is the `_sigchld` one, which decides
+    /// what the word at offset 24 holds: the *status*, or the `sigval`.
+    ///
+    /// Linux's own switch: `copy_siginfo_to_user` picks the union by the
+    /// code's class, and the `CLD_*` codes are the positive ones 1..=6 - a
+    /// normal `SI_USER` is 0, `SI_KERNEL` 0x80, and every other sender's code
+    /// is negative. It lives here because both machines lay a frame out and
+    /// the rule is neither machine's: two writers spelling `1..=6` themselves
+    /// is how one of them comes to spell it `1..=5`.
+    pub fn chld_union(&self) -> bool {
+        (1..=6).contains(&self.code)
+    }
 }
 
 /// What the ABI layer has decided about the handler about to run: everything

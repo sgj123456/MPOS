@@ -78,6 +78,7 @@ fn build_frame(
             pid: info.pid,
             uid: info.uid,
             value: info.value,
+            status: info.status,
         },
         alt: alt.map(|stack| (stack.sp, stack.size)),
         on_alt: action.flags & crate::sched::signal::SA_ONSTACK != 0,
@@ -2100,11 +2101,25 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
                 //
                 // The `union` at offset 16 is written in the shape every
                 // sender here uses - `si_pid`/`si_uid` for a `kill`, and the
-                // `union sigval` at 24 for both that and a timer, which is
-                // where both variants put it. A `SI_TIMER` record's
-                // `si_tid`/`si_overrun` slots (16 and 20) are left zero: no
-                // caller in this image reads them, and `timer_getoverrun` is
-                // the ABI the count is asked through.
+                // word at 24 that its *class* selects: the `union sigval` for
+                // every sender that names one, and `si_status` for a child's
+                // death, which is the record a blocked `SIGCHLD` carries
+                // (`signal::SigInfo::child`). The class test is the same one
+                // the machines' frame writers use (`hal::SignalInfo::chld_union`),
+                // because it is one rule about one struct.
+                //
+                // A `SI_TIMER` record's `si_tid`/`si_overrun` slots (16 and 20)
+                // are left zero: no caller in this image reads them, and
+                // `timer_getoverrun` is the ABI the count is asked through.
+                let wire = crate::hal::SignalInfo {
+                    signo: record.signo,
+                    errno: record.errno,
+                    code: record.code,
+                    pid: record.pid,
+                    uid: record.uid,
+                    value: record.value,
+                    status: record.status,
+                };
                 unsafe {
                     core::ptr::write_bytes(info as *mut u8, 0, SIGINFO_BYTES);
                     (info as *mut i32).write_unaligned(record.signo); // si_signo
@@ -2112,10 +2127,14 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
                     ((info + 8) as *mut i32).write_unaligned(record.code); // si_code
                     ((info + 16) as *mut i32).write_unaligned(record.pid); // si_pid
                     ((info + 20) as *mut i32).write_unaligned(record.uid); // si_uid
-                    // The `union sigval`, at the offset the `si_value` of a
-                    // queued signal lives in the ABI's layout - the same word
-                    // `sigqueue`'s handler reads.
-                    ((info + 24) as *mut u64).write_unaligned(record.value);
+                    if wire.chld_union() {
+                        ((info + 24) as *mut i32).write_unaligned(record.status); // si_status
+                    } else {
+                        // The `union sigval`, at the offset the `si_value` of a
+                        // queued signal lives in the ABI's layout - the same
+                        // word `sigqueue`'s handler reads.
+                        ((info + 24) as *mut u64).write_unaligned(record.value);
+                    }
                 }
             }
             return sig as isize;

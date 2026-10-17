@@ -1660,7 +1660,14 @@ on the reparenting direction).
 
 The pins are `t-signalfd`'s two claims — "a read with no child exited answers
 `EAGAIN`" before the fork, and "a child's death is reported once" (this kernel's
-two records, Linux's one) — which are exactly the claims the strays broke.
+two records, Linux's one) — which are exactly the claims the strays broke. The
+second of those two records is history now: `SIGCHLD_PENDING` and the descriptor's
+synthetic `ChildExit` record are deleted, so **one** death is one record on both
+sides of the seam and that claim reads `1` on both machines (`docs/uapi/` §5.1
+item 29, 2026-10-17). What this row measured — an unreaped orphan's slot being
+*reused* by the next process — is untouched by that, and so is the fix it records:
+the handover in the exit path is what keeps a dead process's children from naming
+a slot that has been handed on.
 
 ### 6.6 A namespace a descriptor can name — `setns` + `/proc/<pid>/ns/*` — **LANDED**
 

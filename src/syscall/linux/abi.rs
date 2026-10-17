@@ -780,8 +780,18 @@ pub(crate) fn mknod_kind(mode: usize) -> Result<NodeKind, isize> {
 /// so the sign is what carries the distinction here.
 pub(crate) fn wait_status(code: isize) -> i32 {
     if code < 0 {
-        // Killed by a signal: its number fills the low byte. The core-dump bit
-        // stays clear - mpos writes no core files.
+        // Killed by a signal: its number fills the low byte, and the core-dump
+        // bit (0x80) stays clear.
+        //
+        // That bit is **not** about whether a core file was written, which is
+        // what this comment used to say: measured on a current host
+        // (`.workbuddy/probe_signalfd_chld.c`, Linux 7.2.9), a child killed by
+        // `SIGSEGV` reports `WCOREDUMP` **with `RLIMIT_CORE` set to zero and
+        // read back as zero** - so the bit follows the signal, and the same
+        // death is `CLD_DUMPED` rather than `CLD_KILLED` in the record beside
+        // it. This kernel leaves both clear and says the word `CLD_KILLED`
+        // instead; that is a named gap (`crate::abi::exit_chld`), not a
+        // different reason.
         (-code & 0x7f) as i32
     } else {
         // A normal exit: the low byte of the code, in bits 15:8.
@@ -1267,32 +1277,16 @@ pub(crate) fn write_syscall_info(
 /// `sizeof(siginfo_t)`: 128 bytes, the whole struct on x86_64.
 pub(super) const SIGINFO_BYTES: usize = 128;
 const SIGCHLD: i32 = 17;
-const CLD_EXITED: i32 = 1;
-const CLD_KILLED: i32 = 2;
 
-// The rest of the `CLD_*` vocabulary `si_code` carries, read out of Linux's
-// `include/uapi/asm-generic/siginfo.h`: a task that stopped under its tracer, a
-// task a `SIGSTOP`-shaped signal stopped for its parent, and a task a `SIGCONT`
-// resumed. `CLD_DUMPED` (3) is the one this kernel cannot answer - it says
-// "died and dumped core", and no core is written here - so an exit a signal
-// ended reports `CLD_KILLED` whichever it was.
-pub(crate) const CLD_TRAPPED: i32 = 4;
-pub(crate) const CLD_STOPPED: i32 = 5;
-pub(crate) const CLD_CONTINUED: i32 = 6;
-
-/// The `(si_code, si_status)` pair an exit code becomes: `CLD_EXITED` with the
-/// code itself for a normal exit, `CLD_KILLED` with the signal number for a
-/// death by signal - Linux's two answers for the two shapes a corpse has.
-///
-/// Split out from the writer because it is the half a host test can decide:
-/// what a caller reads out of the record is these two numbers.
-pub(crate) fn exit_chld(code: isize) -> (i32, i32) {
-    if code < 0 {
-        (CLD_KILLED, -code as i32)
-    } else {
-        (CLD_EXITED, code as i32)
-    }
-}
+// The `CLD_*` vocabulary and the `(si_code, si_status)` pair an exit code
+// becomes are the **leaf crate's** now (`crate::abi`), and the reason is the
+// second reader: the scheduler queues this same record as the parent's
+// `SIGCHLD` when the parent wants the signal, so a child's death has to be
+// spelled the same way on both sides of the seam. That crate's own header says
+// why a fact both halves need lives there; this module re-exports rather than
+// redefines, exactly as it does for the `clone(2)` bits above.
+pub use crate::abi::exit_chld;
+pub use crate::abi::{CLD_CONTINUED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, CLD_TRAPPED};
 
 /// Write the `siginfo_t` describing a collected child: `SIGCHLD` as the signo,
 /// the caller's `CLD_*` code and status in theirs, and the pid where `si_pid`

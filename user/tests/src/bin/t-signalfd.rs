@@ -40,28 +40,31 @@
 //! which is why the size handed to the kernel is 8 and the record's other 120
 //! bytes never leave this side.
 //!
-//! # The fixture moved, and the reason is a divergence
+//! # A child's death is a queued `SIGCHLD`, and the fixture blocks it
 //!
-//! The no-std version never blocked `SIGCHLD`, and on this kernel it did not
-//! have to: a child's exit is reported whatever the caller's mask says, so the
-//! record was readable either way. Linux discards a generated signal that is
-//! *unblocked* and whose disposition is the ignoring default, and `SIGCHLD`'s
-//! default action is exactly that: measured on this host, the same pair answers
-//! `-1/EAGAIN` unblocked and the 128-byte record blocked. So the block is part
-//! of this program's fixture now - which is also what the file's own contract
-//! for the *other* half already said, that a signal is reported here when it is
-//! blocked by the reading task and named in the mask.
+//! The three divergences this program used to name and work around are closed
+//! (`docs/uapi/` §5.1 item 29), and what replaced them is Linux's own shape: a
+//! child's death *is* the `SIGCHLD` record - `CLD_EXITED` with the exit code,
+//! `CLD_KILLED` with the signal that ended it - queued on the parent's pending
+//! set, and this descriptor hands that one record over like any other. Two
+//! consequences are claims of their own below, because each is the half a wrong
+//! kernel passes the other half of:
 //!
-//! With the block in place a second divergence shows, and the drain below is
-//! shaped around it (`docs/uapi/` §5.2 carries both): this kernel keeps a
-//! child's exit in one table and queues a generated `SIGCHLD` in another when
-//! the caller has it blocked, so one death is handed over as **two** records -
-//! the queued copy first, whose `ssi_code` is `SI_USER`, and then the exit
-//! record itself, `CLD_EXITED` with the child's pid. Linux's queue is the one
-//! table, so its single record for the death is `CLD_EXITED`. The count is
-//! therefore the claim that differs between the machines, and it says so with
-//! the note it prints; the claims about the *exit* record are made against the
-//! last record the descriptor hands over, which is the exit on both.
+//!   * a death the parent never asked to be **signalled** for leaves nothing
+//!     here. `SIGCHLD` is queued for a handler, or for a *blocked* signal; an
+//!     unblocked `SIG_DFL` parent is told nothing at all (the corpse is still
+//!     `wait(2)`'s), and a parent that ignores it gets nothing *and* has the
+//!     child reaped for it. Measured on a current host, all four dispositions,
+//!     with `.workbuddy/probe_signalfd_chld.c`: unblocked `-1`/`EAGAIN`,
+//!     blocked one 128-byte record, `SIG_IGN` nothing and `ECHILD`;
+//!   * one death is therefore **one** record, which is what the drain below
+//!     used to be shaped around: this kernel kept the exit in a second table
+//!     and queued a generated `SIGCHLD` beside it, so one death arrived twice.
+//!
+//! `si_utime`/`si_stime` are the one part of Linux's record this kernel leaves
+//! zero (measured: 6 ticks for a child that burned 60 ms of CPU), and the
+//! `CLD_DUMPED`/`WCOREDUMP` half of a signalled death is named rather than
+//! answered - both in `docs/uapi/` §5.2.
 //!
 //! The rest of the program is the named calls: the reads are
 //! `rustix::io::read` (a plain `read`, with the `EINVAL` for a short buffer and
@@ -78,6 +81,54 @@ use rustix::io::{Errno, FdFlags, fcntl_getfd, read};
 use rustix::process::{Pid, WaitOptions, WaitStatus, waitpid};
 use std::mem::size_of;
 use std::os::fd::FromRawFd;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+/// What the `SIGCHLD` handler at the end of the program saw. `printf` is not
+/// async-signal-safe, so the handler records and the program reads it back -
+/// the shape `t-sa-restart`'s handler and `t-udpblock`'s alarm use.
+static HANDLED: AtomicI32 = AtomicI32::new(0);
+static HANDLED_CODE: AtomicI32 = AtomicI32::new(-1);
+static HANDLED_STATUS: AtomicI32 = AtomicI32::new(-1);
+static HANDLED_PID: AtomicI32 = AtomicI32::new(-1);
+
+/// The `SIGCHLD` handler: the frame's `siginfo_t`, which is the *same* record
+/// the descriptor hands over - the claim is that it carries the same two words,
+/// including the one that shares its slot with every other sender's `sigval`.
+extern "C" fn chld_handler(_sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+    // SAFETY: the kernel hands a handler a live `siginfo_t` for its signal, and
+    // this one only reads the three fields the claim is about.
+    unsafe {
+        if !info.is_null() {
+            HANDLED_CODE.store((*info).si_code, Ordering::Relaxed);
+            // `si_pid`/`si_status` are the libc's *accessors* on this target
+            // (they read the union), where `si_code` is a plain field - the
+            // same split `t-waitid` reads its record through.
+            HANDLED_STATUS.store((*info).si_status(), Ordering::Relaxed);
+            HANDLED_PID.store((*info).si_pid(), Ordering::Relaxed);
+            HANDLED.store(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Install [`chld_handler`] with `SA_SIGINFO`, the shape a handler that reads
+/// the record's fields needs.
+fn install_chld_handler() -> bool {
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = chld_handler
+        as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+        as usize;
+    sa.sa_flags = libc::SA_SIGINFO;
+    // SAFETY: a `sigaction` this process owns, and no old one is wanted.
+    unsafe { libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut()) == 0 }
+}
+
+/// Restore `SIG_DFL` for `SIGCHLD`, so the handler cannot outlive its section.
+fn restore_chld_default() -> bool {
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = libc::SIG_DFL;
+    // SAFETY: as above.
+    unsafe { libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut()) == 0 }
+}
 
 /// The wire `sigset_t` as the libc spells it, built through the libc's own
 /// `sigaddset` so the bit arithmetic stays the machine's business.
@@ -177,13 +228,39 @@ fn main() {
         read(&fd, &mut buf) == Err(Errno::AGAIN),
     );
 
-    // A child exits; its death becomes readable through the descriptor.
-    // `SIGCHLD` is *blocked* first, and that is this migration's one fixture
-    // change: Linux discards a generated signal that is unblocked and whose
-    // disposition is the ignoring default - which is `SIGCHLD`'s - so a
-    // descriptor that is to see the exit needs the signal held. Measured on
-    // this host with the pair a child's exit makes: unblocked the read answers
-    // `-1/EAGAIN`, blocked it answers the 128-byte record.
+    // A child exits; its death becomes readable through the descriptor, as the
+    // one 128-byte record it is. `SIGCHLD` is **blocked** first, and that is
+    // Linux's own requirement rather than a fixture this kernel needs: a
+    // generated signal is queued for a handler or for a blocked signal, and an
+    // unblocked `SIG_DFL` parent is told nothing at all - the claim two
+    // sections down, and the one a kernel that reports the exit whatever the
+    // mask says fails.
+    // The record carries the child's **real** uid, and the only way to tell that
+    // from the effective one - or from the zero a field nobody filled carries -
+    // is to make the two differ: root may move its own real id while keeping its
+    // effective one, and every child forked from here on inherits exactly that.
+    // `CAP_SETUID` is what the move needs; the payload has it and a hand host run
+    // often does not (this sandbox's shell has an empty effective capability set
+    // and is already that uid, so the call below would be a no-op success and the
+    // claim would be about nothing), so the claims are made where they can be and
+    // **named** where they cannot - `t-waitid`'s shape for the same field, and
+    // deliberately not a claim the flag can pass on its own.
+    const MOVED: u32 = 1000;
+    let mut moved = false;
+    if mpos_user_tests::host_run() {
+        println!(
+            "note: a child's real uid cannot be moved without CAP_SETUID, so the ssi_uid claims \
+             below are not made on this host run"
+        );
+    } else {
+        // `u32::MAX` is `setresuid`'s "-1": leave that id alone.
+        moved = unsafe { libc::setresuid(MOVED, u32::MAX, u32::MAX) } == 0;
+        r.check(
+            "the program can move its own real uid (CAP_SETUID) and keep its effective one",
+            moved,
+        );
+    }
+
     r.check(
         "blocking SIGCHLD before the fork succeeds",
         mask_change(libc::SIG_BLOCK, &child_mask),
@@ -195,15 +272,8 @@ fn main() {
     }
     r.check("a child was forked", kid > 0);
     if kid > 0 {
-        // The drain, because the two machines disagree about how many records
-        // one death makes (`docs/uapi/` §5.2): Linux reports it once, out of
-        // the pending queue, with `ssi_code` `CLD_EXITED`; this kernel keeps
-        // the exit in its own table *and* queues a generated `SIGCHLD` for a
-        // caller that blocked it, so it hands over the queued copy (an
-        // `SI_USER` record) and then the exit. Reading every record the
-        // descriptor has is what lets the claims about the *exit* record be
-        // made on both machines - it is the last one either way - and the
-        // count, which is where they differ, is claimed below with a note.
+        // A bounded wait for the record: the retries cover the child's own
+        // scheduling, not a second source of records.
         let mut got = Err(Errno::AGAIN);
         let mut tries = 0;
         while tries < 200 {
@@ -218,46 +288,34 @@ fn main() {
             "the child's exit arrives as a 128-byte record",
             got == Ok(128),
         );
-        let mut records = 0u32;
-        let mut queued_code = 0;
-        let mut exit = record_of(&buf);
-        while records < 4 {
-            if records == 1 {
-                // The second pass: the record read first was the queued copy,
-                // and the one in `buf` now is the exit.
-                queued_code = exit.ssi_code;
-            }
-            records += 1;
-            exit = record_of(&buf);
-            if read(&fd, &mut buf) != Ok(128) {
-                break;
-            }
-        }
+        let exit = record_of(&buf);
         r.check(
             "the record's signo is SIGCHLD",
             exit.ssi_signo == libc::SIGCHLD as u32,
         );
+        r.check("its code is CLD_EXITED", exit.ssi_code == libc::CLD_EXITED);
         r.check(
-            "the exit record's code is CLD_EXITED",
-            exit.ssi_code == libc::CLD_EXITED,
+            "and its ssi_status is the exit code (7)",
+            exit.ssi_status == 7,
         );
         r.check(
-            "the exit record names the child (ssi_pid, not siginfo_t's si_pid)",
+            "it names the child (ssi_pid, not siginfo_t's si_pid)",
             exit.ssi_pid == kid as u32,
         );
-        r.check(
-            "a child's death is reported once",
-            records == if mpos_user_tests::host_run() { 1 } else { 2 },
-        );
-        if records > 1 {
+        if moved {
+            r.check(
+                &format!("and carries the child's real uid, not its effective one ({MOVED})"),
+                exit.ssi_uid == MOVED,
+            );
+        } else {
             println!(
-                "note: {records} records for one death - the first carries `ssi_code` \
-                 {queued_code}, this kernel's queued generated SIGCHLD, where Linux's \
-                 one record for the death is `CLD_EXITED`"
+                "note: the record's ssi_uid reads {} - not claimed on this run, where the real \
+                 id could not be moved",
+                exit.ssi_uid
             );
         }
         r.check(
-            "and the descriptor is empty afterwards (the next read is EAGAIN)",
+            "one death is one record (the next read is EAGAIN)",
             read(&fd, &mut buf) == Err(Errno::AGAIN),
         );
 
@@ -276,6 +334,166 @@ fn main() {
         r.check(
             "and the exit code is 7",
             reaped.and_then(WaitStatus::exit_status) == Some(7),
+        );
+    }
+
+    // ---- a death the parent never asked to be signalled for ----------------
+    //
+    // With `SIGCHLD` unblocked and at its default disposition, Linux queues
+    // nothing: the child is a zombie `wait(2)` collects, and a descriptor
+    // watching `SIGCHLD` learns nothing from the death.
+    //
+    // The **read comes before the reap**, and that order is the claim: the
+    // reap is what took the exit out of the second table this kernel used to
+    // keep for it, so claiming afterwards would pass on either kernel. What
+    // establishes the death instead is the clock - 50 ms is many ticks for a
+    // child whose whole body is one `_exit` - with the reap right after as the
+    // corroboration that it really did die.
+    {
+        r.check(
+            "unblocking SIGCHLD succeeds",
+            mask_change(libc::SIG_UNBLOCK, &child_mask),
+        );
+        // SAFETY: the child exits immediately and allocates nothing.
+        let kid = unsafe { libc::fork() };
+        if kid == 0 {
+            leave(9);
+        }
+        r.check("a child was forked", kid > 0);
+        if kid > 0 {
+            sleep_ms(50);
+            r.check(
+                "its death was never queued for this descriptor (EAGAIN)",
+                read(&fd, &mut buf) == Err(Errno::AGAIN),
+            );
+            let want = Pid::from_raw(kid);
+            let code = match waitpid(want, WaitOptions::empty()) {
+                Ok(Some((got, status))) if Some(got) == want => status.exit_status(),
+                _ => None,
+            };
+            r.check(
+                "and the unblocked child is still reaped, with its code (9)",
+                code == Some(9),
+            );
+        }
+    }
+
+    // ---- a child killed by a signal: CLD_KILLED, with the signal -----------
+    //
+    // The other half of the record: `si_status` is the exit code for an exit
+    // and the *signal* for a death, and `si_code` is what tells the two apart -
+    // `CLD_KILLED` here. Measured on a current host: a child that takes
+    // `SIGKILL` arrives as `code=2`, `status=9`.
+    {
+        r.check(
+            "blocking SIGCHLD succeeds",
+            mask_change(libc::SIG_BLOCK, &child_mask),
+        );
+        let Ok((rd, wr)) = rustix::pipe::pipe() else {
+            r.check("a pipe the doomed child can park on", false);
+            r.finish();
+        };
+        // SAFETY: the child parks in a `read` that can never return - the
+        // parent holds the only write end and never writes - so the `SIGKILL`
+        // below is what ends it, inside a syscall.
+        let kid = unsafe { libc::fork() };
+        if kid == 0 {
+            drop(wr);
+            let mut one = [0u8; 1];
+            let _ = read(&rd, &mut one);
+            leave(0); // unreachable: nothing is ever written
+        }
+        drop(rd);
+        r.check("a child was forked", kid > 0);
+        if kid > 0 {
+            // A moment for it to reach the `read`, so the kill lands on a task
+            // that is parked rather than racing its own start.
+            sleep_ms(20);
+            // SAFETY: a live child of this process, and a signal number.
+            r.check(
+                "SIGKILL to the child succeeds",
+                unsafe { libc::kill(kid, libc::SIGKILL) } == 0,
+            );
+            let want = Pid::from_raw(kid);
+            let how = match waitpid(want, WaitOptions::empty()) {
+                Ok(Some((got, status))) if Some(got) == want => {
+                    (status.signaled(), status.terminating_signal())
+                }
+                _ => (false, None),
+            };
+            r.check(
+                "the child died of the signal rather than exiting",
+                how == (true, Some(libc::SIGKILL)),
+            );
+            let mut got = Err(Errno::AGAIN);
+            let mut tries = 0;
+            while tries < 200 {
+                got = read(&fd, &mut buf);
+                if got == Ok(128) {
+                    break;
+                }
+                sleep_ms(1);
+                tries += 1;
+            }
+            r.check("its death arrives through the descriptor", got == Ok(128));
+            let killed = record_of(&buf);
+            r.check(
+                "as CLD_KILLED, with the signal in ssi_status",
+                killed.ssi_code == libc::CLD_KILLED && killed.ssi_status == libc::SIGKILL,
+            );
+            r.check(
+                "and the same child in ssi_pid",
+                killed.ssi_pid == kid as u32,
+            );
+        }
+        drop(wr);
+    }
+
+    // ---- the same record through a handler --------------------------------
+    //
+    // A queued `SIGCHLD` is also the signal a *handler* runs on, so the frame's
+    // `siginfo_t` must carry the same two words - including the status, which
+    // shares its slot with every other sender's `sigval`. A kernel that wrote
+    // the payload there would read 0 where this claims the exit code.
+    {
+        HANDLED.store(0, Ordering::Relaxed);
+        r.check(
+            "installing a SIGCHLD handler succeeds",
+            install_chld_handler(),
+        );
+        r.check(
+            "unblocking SIGCHLD succeeds",
+            mask_change(libc::SIG_UNBLOCK, &child_mask),
+        );
+        // SAFETY: the child exits immediately and allocates nothing.
+        let kid = unsafe { libc::fork() };
+        if kid == 0 {
+            leave(5);
+        }
+        r.check("a child was forked", kid > 0);
+        if kid > 0 {
+            // A syscall is where a handler runs: the delivery path needs the
+            // register frame only a syscall boundary has.
+            sleep_ms(30);
+            r.check(
+                "the handler ran for the child's death",
+                HANDLED.load(Ordering::Relaxed) == 1,
+            );
+            r.check(
+                "and the frame's siginfo_t carries CLD_EXITED with the code",
+                HANDLED_CODE.load(Ordering::Relaxed) == libc::CLD_EXITED
+                    && HANDLED_STATUS.load(Ordering::Relaxed) == 5,
+            );
+            r.check(
+                "naming the child",
+                HANDLED_PID.load(Ordering::Relaxed) == kid,
+            );
+            let want = Pid::from_raw(kid);
+            let _ = waitpid(want, WaitOptions::empty());
+        }
+        r.check(
+            "putting SIGCHLD back to its default succeeds",
+            restore_chld_default(),
         );
     }
 

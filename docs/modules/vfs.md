@@ -56,7 +56,7 @@ Grouped by area, because "where do I put this change" is the question the page e
 | `src/vfs/epoll.rs` | `Epoll`, the interest list keyed by descriptor *and* open file description, `EPOLLET`/`EPOLLONESHOT`, `poll_ready` scanning |
 | `src/vfs/timerfd.rs` | `TimerFd`, the tick-deadline/interval/count state machine, `TFD_TIMER_ABSTIME`, `TFD_TIMER_CANCEL_ON_SET`, the timespec conversions |
 | `src/vfs/eventfd.rs` | `EventFd`, the counter, `EFD_NONBLOCK` |
-| `src/vfs/signalfd.rs` | `SignalFd`: blocked-and-masked signals read as `signalfd_siginfo`, including the child-exit record |
+| `src/vfs/signalfd.rs` | `SignalFd`: blocked-and-masked signals read as `signalfd_siginfo` — a child's death among them, because it *is* the queued `SIGCHLD` (no second table; `docs/uapi/` §5.1 item 29) |
 | `src/vfs/inotify.rs` | `InotifyInstance`, the global `(dev, ino)` watch registry, `emit`/`emit_write`, encoded event records |
 | `src/vfs/memfd.rs` | `Memfd`, real shareable pages, `MFD_*`, `F_SEAL_*` (gated `target_os = "none"`) |
 | `src/vfs/dmabuf.rs` | `DmaBuf`: exporter page references, the geometry a GEM import needs (gated `target_os = "none"`) |

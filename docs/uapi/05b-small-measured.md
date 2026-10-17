@@ -157,37 +157,57 @@ Section numbers are unchanged from the original `UAPI.md`.
   `src/sched/runtime/` + `src/syscall/linux/proc.rs`. Pins: `t-waitid`,
   `t-wait4`. `docs/notes/` §15.11 (batch 18).
 
-- **`signalfd(2)` and `SIGCHLD`: one death, two records, and the wrong code.**
-  Three divergences, each measured on a current host, all of them on the path the
-  compositor-shaped caller this descriptor exists for walks. (a) A child's exit
-  lives in one table (`sched::read_sigchld`) and a generated `SIGCHLD` is *also*
-  queued when the caller has it blocked (`sched::runtime`'s `wants_sigchld`), so
-  a descriptor whose mask names `SIGCHLD` hands over **two** records for one
-  death: the queued copy first, then the exit record. Linux's pending queue is
-  the one table, so one death is one record. (b) That queued copy's `ssi_code`
-  is `SI_USER` (`SigInfo::user`), where Linux's record for a child's exit is
-  `CLD_EXITED`, with the status beside it — the divergence `sched::runtime`'s own
-  comment measured (`si_code=1`) without implementing. (c) An *unblocked*
-  `SIGCHLD` is discarded by Linux (`sig_ignored()`, and `SIGCHLD`'s default
-  action is the ignoring one), so a `signalfd` watching it sees nothing until the
-  caller blocks it — measured with the pair one child's exit makes: unblocked the
-  read answers `-1`/`EAGAIN` (errno 11), blocked it answers the 128-byte record.
-  This kernel reports the exit whatever the mask says, which is what let the
-  no-std version pass without blocking anything. Owner: `src/sched/runtime/`'s
-  `queue_signal` call (the record's code, and the second table) with
-  `src/vfs/signalfd.rs`'s `take_signal` (which source wins). `t-signalfd` blocks
-  `SIGCHLD` the way its own contract says, claims the *count* of records with
-  this kernel's answer on the payload and Linux's under `MPOS_ON_HOST`, and pins
-  the exit record's `CLD_EXITED` and pid on **both** machines. `docs/notes/` §15.11
-  (batch 21). **Re-measured after the program count grew, and the count had
-  drifted to four**: the three extra records named *other* slots (`8`, `10`) and
-  the read before the test's own fork already answered one, because an unreaped
-  child kept a `parent` that names a **slot** — and a slot is reused, so the next
-  process to occupy it was handed the dead process's orphans. Fixed where Linux
-  fixes it (`forget_original_parent`: a process that exits gives its remaining
-  children to init, `src/sched/runtime/`'s exit path), which also makes this
-  entry's "two records for one death" deterministic rather than
-  neighbourhood-dependent. `docs/notes/` §6.
+- **`signalfd(2)` and `SIGCHLD`: the three divergences are served, and what the
+  record still leaves.** **Landed 2026-10-17** (`docs/uapi/` §5.1 item 29), after
+  the whole contract was re-measured on a current host with
+  `.workbuddy/probe_signalfd_chld.c` (Linux 7.2.9) — a scenario per disposition,
+  each in its own forked child, because the first draft of that probe measured
+  its own leftovers. The entry this replaces named three divergences; all three
+  are gone, and the measurement is what replaced them:
+
+  * **one death is one record.** A child's death *is* the `SIGCHLD` record —
+    Linux's pending queue is the one table — and the second table this kernel
+    kept for it (`sched::read_sigchld`, read by the descriptor as a synthetic
+    child-exit record) is deleted. Measured, blocked `SIG_DFL`: exactly one
+    record, `code=1[CLD_EXITED] pid uid status=7`, then `EAGAIN`;
+  * **that record is Linux's**, with the exit code in `si_status`:
+    `CLD_EXITED`+7 for an exit, `CLD_KILLED`+9 for a child that takes `SIGKILL`,
+    the child's pid and its real uid — through the descriptor, through a
+    handler's `siginfo_t` and through `sigtimedwait` alike (all three measured,
+    and all three now render the status the same way);
+  * **a death the parent never asked to be signalled for leaves nothing**.
+    Measured, the four dispositions: unblocked `SIG_DFL` → **nothing** (the
+    zombie is still `wait(2)`'s), blocked `SIG_DFL` → the one record,
+    `SIG_IGN` → nothing *and* `waitpid(WNOHANG)` is `ECHILD`, and a handler →
+    the record. This kernel reported the exit whatever the mask said, which is
+    what the no-std version had relied on.
+
+  `t-signalfd` is the pin — 46 claims, no per-machine branch left, green on a
+  current host first (44 with two notes there, where the real uid cannot be
+  moved: `t-waitid`'s shape for that field) — and it claims both halves of the disposition rule
+  (the unblocked death is `EAGAIN`; the sigkill record is `CLD_KILLED` with the
+  signal in the status) plus the frame's rendering of the same record.
+
+  **Three residuals stay named rather than hidden.** (a) A child whose `SIGCHLD`
+  is **ignored** is reaped by the kernel on Linux (`waitpid(WNOHANG)` measured as
+  `ECHILD`); this kernel keeps the zombie, so a parent that ignores the signal
+  and never waits holds a slot where Linux holds none. Closing it means skipping
+  the retired record for such a parent *and* making the reap prompt, which is a
+  second behaviour rather than a line of this one. (b) **`si_utime`/`si_stime`
+  stay zero**: Linux fills them with the child's CPU in clock ticks (measured:
+  `utime=6` for a child that burned 60 ms, `0` for one that only exited — so the
+  gap shows on a child that worked, and this kernel has the totals, it simply
+  does not carry them on the record). (c) **`CLD_DUMPED` and `WCOREDUMP`**: a
+  signalled death whose default action dumps core is `code=3` with the status in
+  the signal, and the `wait4` status word sets its core bit — measured on a child
+  that took `SIGSEGV` **with `RLIMIT_CORE` set to zero and read back as zero**,
+  which corrects the reason this kernel's `wait_status` comment used to give
+  ("mpos writes no core files"): the bit follows the signal, not a file that was
+  written. One boundary is named with it, because this host cannot separate the
+  two: its `core_pattern` is a *pipe* (`|/usr/lib/systemd/systemd-coredump …`),
+  so a dump is attempted whatever the limit says. Owner for all three:
+  `src/sched/runtime/`'s exit path and `crate::abi::exit_chld`. `docs/notes/`
+  §15.11 (batch 21, where the divergences were named) and §15.44 (the landing).
 
 - **A UDP send's full buffer answered `EMSGSIZE`, so a burst stopped at four — and the blocking
   half of Linux's rule is served now, with its bound named.** A socket's send buffer is finite, so a

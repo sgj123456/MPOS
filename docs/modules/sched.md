@@ -175,5 +175,8 @@ The heap-anchor randomisation gap `t-aslr` names (this kernel's `brk` anchor is 
 Linux draws it): `docs/ROADMAP.md` and `docs/notes/` §15.11 (batch 35). Feature status (signals,
 ptrace, resource limits, namespaces) is on the board in `docs/ROADMAP.md` (Phases 2 and 6), and the
 userspace verdicts are `docs/uapi/`'s rows. `runtime.rs`'s own named divergences — among them the
-dropped real-time record on a full `RtQueue` and the `signalfd` double-record for one child death
-attributed to `queue_signal` — are recorded in docs/uapi/ §5.2 and `docs/notes/`, not here.
+dropped real-time record on a full `RtQueue` — are recorded in docs/uapi/ §5.2 and `docs/notes/`,
+not here. The `signalfd` double-record for one child death used to be one of them and is served now:
+a child's death *is* the queued `SIGCHLD`, carrying `crate::abi::exit_chld`'s pair, and the second
+book this module kept beside it (`SIGCHLD_PENDING` with `read_sigchld` and
+`child_exited_unreaped`) is deleted (`docs/uapi/` §5.1 item 29).

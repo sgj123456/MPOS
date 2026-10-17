@@ -344,16 +344,23 @@ impl SignalFrame for Current {
         put_u32(out, reserved + fpsimd::BYTES + ctx::SIZE, 0);
 
         // A `siginfo_t`: signo, errno, code, and - for a signal that names a
-        // sender - the pid and uid, with the `sigqueue` payload in the union at
-        // offset 24. These are the offsets the kernel's own `static_assert`s pin
-        // for arm64, and the ones x86_64 uses.
+        // sender - the pid and uid, with the union at offset 24. These are the
+        // offsets the kernel's own `static_assert`s pin for arm64, and the ones
+        // x86_64 uses.
         let info = &delivery.info;
         out[SIGINFO..SIGINFO + 4].copy_from_slice(&info.signo.to_le_bytes());
         out[SIGINFO + 4..SIGINFO + 8].copy_from_slice(&info.errno.to_le_bytes());
         out[SIGINFO + 8..SIGINFO + 12].copy_from_slice(&info.code.to_le_bytes());
         put_i32(out, SIGINFO + 16, info.pid);
         put_i32(out, SIGINFO + 20, info.uid);
-        put(out, SIGINFO + 24, info.value);
+        // Which union member that word is depends on the code's class, and the
+        // rule is `hal`'s: a child's death puts `si_status` there, every other
+        // sender the `sigval`.
+        if info.chld_union() {
+            put_i32(out, SIGINFO + 24, info.status);
+        } else {
+            put(out, SIGINFO + 24, info.value);
+        }
 
         // Enter the handler: the signal number in `x0`, the `siginfo_t` and the
         // `ucontext` in `x1`/`x2`, the restorer in `x30`, the unwind record in
