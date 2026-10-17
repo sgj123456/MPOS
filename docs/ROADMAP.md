@@ -369,9 +369,13 @@ caller's own), and the four gates whose Linux rule is `capable()` ask it — `mk
 at the driver's/`fileattr_set`'s door, `reboot` and `syslog` — measured one namespace at a time
 (a user-namespace root is served `chroot` and `unshare(CLONE_NEWNS)` and refused those four). Three
 scopes the one word cannot express stay named in §5.2 with their measurements: `setns`'s and
-`AF_PACKET`'s ask the *object's* namespace, and `CAP_DAC_OVERRIDE` asks the *file's* filesystem's,
-where this kernel's permission model still asks uid 0 outright — a divergence of the permission
-model rather than of a gate.
+`AF_PACKET`'s ask the *object's* namespace, and `CAP_DAC_OVERRIDE` asks the *file's* filesystem's —
+**whose DAC half landed the same day** (`docs/uapi/` §5.1 item 39): the permission model's override
+is now Linux's two capabilities (`CAP_DAC_OVERRIDE` for a read and a write on a non-directory
+whatever its bits are, `CAP_DAC_READ_SEARCH` for a read on its own, execute only where some execute
+bit exists) asked of the file's namespace through `Credentials::capable`, which is where the two
+passes meet; the *owner-shaped* calls (`chmod`, `chown`, `utimes` — `CAP_FOWNER`, and
+`CAP_FSETID` for the set-group-id bit) are the same shape and stay named for their own pass.
 
 **A child's death is one `SIGCHLD` record, and it is Linux's** (`docs/uapi/` §5.1 item 29, landed
 2026-10-17): the second book this kernel kept for "an exit whose signal is unread" is deleted — the

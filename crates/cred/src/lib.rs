@@ -59,6 +59,18 @@ pub const CAP_FULL: u64 = if CAP_LAST_CAP == 63 {
 
 /// The number of the capability `ptrace_may_access` tests for.
 pub const CAP_SYS_PTRACE: u32 = 19;
+/// `CAP_DAC_OVERRIDE`, which the permission checks offer the triads they
+/// refuse - and which grants a **read or write on a non-directory whatever the
+/// bits are**, the clause that once required some triad to carry one having
+/// gone from Linux (measured, `.workbuddy/probe_capable_scope.sh dac`).
+pub const CAP_DAC_OVERRIDE: u32 = 1;
+/// `CAP_DAC_READ_SEARCH`, the read-and-search half of the same override: it
+/// grants a read on its own, and everything on a directory but a write.
+pub const CAP_DAC_READ_SEARCH: u32 = 2;
+/// `CAP_FOWNER`, which the sticky-bit rule asks
+/// (`capable_wrt_inode_uidgid(dir, CAP_FOWNER)`) and the owner-shaped calls -
+/// `chmod`, `chown`, `utimes` on a node the caller does not own - ask.
+pub const CAP_FOWNER: u32 = 3;
 /// `CAP_SETGID`, which an unprivileged `/proc/<pid>/gid_map` writer lacks - the
 /// capability that lifts the one-line rule there.
 pub const CAP_SETGID: u32 = 6;

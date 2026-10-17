@@ -525,19 +525,24 @@ Section numbers are unchanged from the original `UAPI.md`.
     user namespace (the net namespace is still the machine's, whose owner is the initial one) and
     **served** inside a user namespace made *with* `CLONE_NEWNET` (its owner is that user
     namespace). This kernel asks the caller's own, so the bare case is served where Linux refuses.
-  - **`CAP_DAC_OVERRIDE` asks the *file's* filesystem's user namespace** —
-    `capable_wrt_inode_uidgid` — and the same distinction applies to `CAP_FOWNER` and the rest of
-    that family. Measured, and the sharpest of the three: a caller whose credential has uid 0
-    mapped to the *outside* root reads a `0600` file owned by the outside user (`/tmp/…`) as
-    **`EACCES`** on Linux, because the file's filesystem belongs to the initial namespace and the
-    credential's does not — where this kernel's permission model asks `uid 0` outright
-    (`src/vfs/mod.rs`'s root branch), so it would allow it. That is a divergence of the *permission
-    model* rather than of a syscall gate, and its fix is a capability question where a uid question
-    is today. Two smaller members of the family are named with it: `reboot`'s rule is one step
-    finer than `capable()` — `ns_capable(task_active_pid_ns(current)->user_ns, CAP_SYS_BOOT)`, the
-    *pid* namespace's owner, which agrees with the initial namespace for every caller this kernel
-    has — and it asks the capability *before* the magic, where this kernel answers `EINVAL` for a
-    bad magic first (measured by the same probe, which passes an invalid magic and gets `EPERM`);
-    and `/proc/<pid>/uid_map`'s writer rule is the **parent** namespace's `CAP_SETUID` or the writer
-    being the map's owner, where this kernel's `map_ctl` asks the caller's own (§6.3 carries the
-    one self-naming line the owner rule is measured by).
+  - **`CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` ask the *file's* filesystem's user namespace**
+    - `capable_wrt_inode_uidgid` - and they are the reason a check is not "is the
+    caller root". **Landed 2026-10-17** (`docs/uapi/` §5.1 item 39). Measured whole on a current
+    host first (`.workbuddy/probe_capable_scope.sh dac`, root with each capability dropped from the
+    effective set in turn, against mode `0000` and `0444` fixtures): `CAP_DAC_OVERRIDE` grants a
+    read *and* a write on a non-directory **whatever its bits are** - the clause that required some
+    triad to carry the bit is gone from Linux, so a `chmod 000` file is readable and writable by a
+    caller holding it, where this kernel refused both - and grants execute only where some execute
+    bit exists (`S_IXUGO`), which is what makes `access(X_OK)` on a `0644` file `EACCES` even for
+    root and the compound `R_OK|W_OK|X_OK` refused where `R_OK|W_OK` is granted;
+    `CAP_DAC_READ_SEARCH` grants a read on its own and everything on a directory but a write; and a
+    caller whose credentials are *not* in the file's namespace - uid 0 mapped to the outside root,
+    the probe's fourth block - is refused by both. **What is named rather than landed** is the rest
+    of the family, which is the same shape with its own capabilities: the *owner-shaped* calls
+    (`chmod`, `chown`, the `utimes` family) still ask "is the caller root or the owner" where Linux
+    asks `inode_owner_or_capable` = `fsuid == owner || capable_wrt_inode_uidgid(CAP_FOWNER)`, and
+    `chmod`'s set-group-id rule asks `capable_wrt_inode_uidgid(CAP_FSETID)` beside the caller's
+    groups where this kernel asks `uid 0`; both are measured the same way and are their own pass,
+    since each adds a capability and (for the setgid bit) a group test. Owner:
+    `src/vfs/mod.rs`'s `Caller`/`Overrides`/`may_as`. Pin: `t-caps`'s DAC table, `t-faccessat`'s
+    `access(2)` rows and a host unit test.

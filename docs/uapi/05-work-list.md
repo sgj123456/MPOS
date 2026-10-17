@@ -1212,3 +1212,60 @@ the commit bodies), and each moved its pin in the same commit.
     the two controls (`an ordinary file in the same directory is served`, `a bit needing no
     capability is served there`) pass on both kernels, which is what keeps the refusals on the
     capability rather than on the namespace.
+
+39. **The DAC override is two capabilities asked of the file's namespace, and never "is the caller
+    root".** §5.2's third capability scope, and the one with teeth: this kernel's permission model
+    answered a `chmod 000` file, a `0444` file's write and a `0000` directory's search with *uid 0*
+    and a "some triad carries the bit" clause, where Linux asks
+    `capable_wrt_inode_uidgid(idmap, inode, cap)` - **two** capabilities, of the *file's*
+    filesystem's user namespace, with no triad clause at all. So a caller that had entered a user
+    namespace (uid 0 in it, the whole set read back) read what Linux refuses it, and root could not
+    read what Linux lets it. **Measured whole on a current host first**
+    (`.workbuddy/probe_capable_scope.sh dac`, Linux 7.2.9: root, each capability dropped from the
+    effective set in turn, mode `0000` and `0444` fixtures, and a `1777` directory whose file and
+    directory both belong to another user). The table: `CAP_DAC_OVERRIDE` grants a read **and a
+    write** on a non-directory whatever its bits are (`0` on both, and `EACCES` for both once it is
+    dropped) and grants execute only where `S_IXUGO` (`access(X_OK)` is `EACCES` on a `0644` file
+    even with the whole set, and `0` on another user's `0700` one); `CAP_DAC_READ_SEARCH` grants a
+    read on its own (`access(R_OK)` on a `0000` file is `0` with `OVERRIDE` dropped, and with
+    `READ_SEARCH` dropped the write answers too, so the two cover each other) and everything on a
+    directory but a write; the compound masks follow from the execute clause (`R_OK|W_OK` is `0`
+    where `R_OK|W_OK|X_OK` is `EACCES`); and with **both** dropped every row is `EACCES`. The
+    sticky-bit rule is the same family: `check_sticky`'s last clause is
+    `capable_wrt_inode_uidgid(dir, CAP_FOWNER)`, measured by removing another user's file from
+    another user's `1777` directory - `0` with `CAP_FOWNER`, `EPERM` without it. **The fix is a
+    caller-shaped identity and a rule that reads the table.** `may_as` takes a `Caller` (the two ids
+    the door asked about, plus `Overrides` - the three capabilities this family consults) instead of
+    a bare id pair, because the ids are the *door's* (`access(2)` asks about the real pair,
+    `AT_EACCESS` about the effective one) while the capabilities are the caller's either way; the
+    triads are asked first and only what they refuse is offered to `overrides_allow`, which is the
+    measured per-kind rule; `may_remove`'s sticky half asks `CAP_FOWNER` rather than uid 0; and
+    `root_override()` - the vestigial `true` whose doc admitted the predicate lived elsewhere - is
+    gone, its prose folded into the two new types. `Overrides::of` reads the three capabilities
+    through `Credentials::capable`, which is item 38's initial-namespace question, so the *scope*
+    comes for free: a caller inside a user namespace holds none of them **for a file whose
+    filesystem belongs to the machine**, which is what the probe's mapped-root block measured and
+    what `t-caps` pins from inside a namespace. **Two things stay named in §5.2**: the *owner-shaped*
+    calls (`chmod`, `chown`, the `utimes` family) still ask "is the caller root or the owner" where
+    Linux asks `inode_owner_or_capable` = `fsuid == owner || capable_wrt_inode_uidgid(CAP_FOWNER)`,
+    and `chmod`'s set-group-id rule asks `CAP_FSETID` beside the caller's groups where this kernel
+    asks `uid 0` - the same shape, each with its own capability, and each needing its own
+    measurement. Owner: `src/vfs/mod.rs`'s `Caller`/`Overrides`/`overrides_allow`/`may_as`, and
+    `crates/cred`'s three new capability constants. Pin: `t-caps`'s DAC table (eleven claims: the
+    three fixtures, the whole-set rows, each capability dropped, both dropped, the sticky pair and
+    the namespace pair) and `t-faccessat`'s two `access(2)` rows that separate `R_OK` from
+    `R_OK|W_OK|X_OK`, beside a host unit test that walks the same table
+    (`the_dac_overrides_are_linuxs_two_capabilities_and_not_a_uid`, which replaced the old rule's
+    own test). Gate: x86_64 `pass=181 fail=0 (181 built)`, `mpos-kunit` 32 passed, 0
+    failed, exit 33 (181 staged, 11 left out); the second machine's arm of the same gate is
+    `pass=180 fail=0`, `mpos-kunit` 32 passed, 0 failed (180 staged, 12 left out). The counterfactual is exact: with only the kernel
+    half reverted (the leaf crate's constants, `may_as`, `may_remove` and the three test call sites
+    - five files) and the pins kept, the sweep is `pass=179 fail=2 (181 built)` with the kernel's
+    own `mpos-kunit` line unmoved at 32 passed, 0 failed - the two red programs are exactly
+    `t-caps` and `t-faccessat`, and their nine red claims are the rows the old rule got wrong: five
+    of them read `got 13` (EACCES where the capability grants `0` - the `0000` read, the `0444`
+    write, and each of `OVERRIDE`- and `READ_SEARCH`-dropped's rows), one is `t-caps`'s namespace
+    row **served** (`got 0`) where no capability is held in the file's namespace, one is the sticky
+    row, and two are `t-faccessat`'s `R_OK` and `R_OK|W_OK` rows - while every control passes on
+    both kernels (`access(X_OK)` on the `0644` file, the compound mask, "the whole set removes it",
+    "the file the namespace's own uid owns is served", and the stranger's `EACCES`)..

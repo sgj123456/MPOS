@@ -1017,7 +1017,11 @@ fn access_check(inode: &Arc<dyn Inode>, mode: usize, me: (u32, u32)) -> isize {
     if mode == 0 {
         return 0;
     }
-    match crate::vfs::may_as(me, inode, mode as u32) {
+    // The ids are the door's (`access(2)`'s real pair, or the effective one
+    // under `AT_EACCESS`), and the capabilities are the caller's current ones
+    // either way - Linux's `capable()` reads `current_cred()` whatever ids the
+    // door chose, which is [`crate::vfs::caller_as`]'s whole reason.
+    match crate::vfs::may_as(crate::vfs::caller_as(me.0, me.1), inode, mode as u32) {
         Ok(()) => 0,
         Err(e) => err_of(e),
     }

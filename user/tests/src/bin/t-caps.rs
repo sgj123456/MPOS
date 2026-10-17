@@ -34,7 +34,9 @@
 //! below is named and not made (`t-pty`'s mint rule). This program's
 //! evidence lives in the guest, where the machine is root's to lower.
 
-use mpos_user_tests::{Report, host_run};
+use std::os::unix::fs::PermissionsExt;
+
+use mpos_user_tests::{Report, host_run, in_user_namespace};
 
 /// `capget(header, data)` through the raw door - `libc` does not wrap it on
 /// this target, and the v3 wire shape (two records) is the claim.
@@ -53,6 +55,61 @@ fn capget(header: &mut CapHeader, data: &mut [CapRecord; 2]) -> isize {
     } else {
         r as isize
     }
+}
+
+/// `capset(header, data)` through the same raw door, the setter of the v3
+/// wire: what this program lowers and raises its own capabilities with.
+fn capset(header: &mut CapHeader, data: &mut [CapRecord; 2]) -> isize {
+    // SAFETY: both pointers are this program's own memory, which outlives the
+    // call, and the records are the two the version names.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            header as *mut CapHeader as libc::c_long,
+            data.as_mut_ptr() as libc::c_long,
+        )
+    };
+    if r < 0 {
+        -(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as isize)
+    } else {
+        r as isize
+    }
+}
+
+/// The errno `open(2)` answers, or `0` - the DAC table's rows are "what did the
+/// call say", so the number is the claim and not a boolean.
+fn open_errno(path: &str, flags: libc::c_int) -> i32 {
+    match std::ffi::CString::new(path) {
+        Ok(p) => {
+            let fd = unsafe { libc::open(p.as_ptr(), flags) };
+            if fd < 0 {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            } else {
+                unsafe { libc::close(fd) };
+                0
+            }
+        }
+        Err(_) => libc::EINVAL,
+    }
+}
+
+/// The errno `access(2)` answers, or `0`.
+fn access_errno(path: &str, mode: libc::c_int) -> i32 {
+    match std::ffi::CString::new(path) {
+        Ok(p) => {
+            if unsafe { libc::access(p.as_ptr(), mode) } == 0 {
+                0
+            } else {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            }
+        }
+        Err(_) => libc::EINVAL,
+    }
+}
+
+/// The v3 wire's bit for `cap`, in the low word the first 32 live in.
+fn bit_of(cap: u32) -> u32 {
+    1u32 << (cap % 32)
 }
 
 /// `klogctl(type, buf, len)` - `syslog(2)`'s raw door, the same one
@@ -304,6 +361,198 @@ fn main() {
         "unshare CLONE_NEWIPC is EOPNOTSUPP once nothing else can be the reason",
         ipc == -(libc::EOPNOTSUPP as isize),
     );
+
+    // ---- the DAC override is two capabilities, not the uid ----
+    //
+    // `may_as`'s override is Linux's `capable_wrt_inode_uidgid`, which is asked
+    // of the **file's** filesystem's user namespace and is *two* capabilities
+    // rather than one. Measured on a current host
+    // (`.workbuddy/probe_capable_scope.sh dac`, root with each capability
+    // dropped from the effective set in turn, against mode `0000` and `0444`
+    // fixtures): `CAP_DAC_OVERRIDE` grants a read and a write on a file
+    // **whatever its bits are** - the clause that required some triad to carry
+    // the bit is gone from Linux - `CAP_DAC_READ_SEARCH` grants a read on its
+    // own, and `X_OK` is the one kind that needs an execute bit *somewhere*,
+    // which is why the same capabilities refuse `access(R_OK|W_OK|X_OK)` on a
+    // `0000` file where they grant `access(R_OK)`. The fixtures are this
+    // program's own files with their modes cleared, so the triads refuse them
+    // to everyone and only a capability can answer.
+    let zero = "/tmp/t-caps-zero";
+    let four = "/tmp/t-caps-four";
+    let sixfour = "/tmp/t-caps-0644";
+    for path in [zero, four, sixfour] {
+        let _ = std::fs::remove_file(path);
+    }
+    let made = std::fs::File::create(zero).is_ok()
+        && std::fs::File::create(four).is_ok()
+        && std::fs::File::create(sixfour).is_ok();
+    let flagged = made
+        && std::fs::set_permissions(zero, std::fs::Permissions::from_mode(0o000)).is_ok()
+        && std::fs::set_permissions(four, std::fs::Permissions::from_mode(0o444)).is_ok()
+        && std::fs::set_permissions(sixfour, std::fs::Permissions::from_mode(0o644)).is_ok();
+    r.check("three fixtures with their modes set", flagged);
+
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let mut whole = [CapRecord {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    let read_back = capget(&mut header, &mut whole) == 0;
+    r.check("the whole set read back for the table", read_back);
+
+    // One row of the table: the effective set with `clear` lowered, and the
+    // calls the measurement makes.
+    let mut row = |r: &mut Report, label: &str, clear: &[u32], whole: &[CapRecord; 2]| {
+        let mut data = *whole;
+        for &cap in clear {
+            data[0].effective &= !bit_of(cap);
+        }
+        let lowered = capset(&mut header, &mut data) == 0;
+        r.check(&format!("{label}: the set is lowered"), lowered);
+        let read = open_errno(zero, libc::O_RDONLY);
+        let write = open_errno(four, libc::O_WRONLY);
+        let exec = access_errno(sixfour, libc::X_OK);
+        // Put the effective set back, so the next row starts from the whole one.
+        let mut restore = *whole;
+        capset(&mut header, &mut restore);
+        (read, write, exec)
+    };
+
+    let (read, write, exec) = row(&mut r, "the whole set", &[], &whole);
+    r.check(
+        &format!("whole set: a 0000 file is readable (got {read})"),
+        read == 0,
+    );
+    r.check(
+        &format!("whole set: a 0444 file is writable (got {write})"),
+        write == 0,
+    );
+    r.check(
+        &format!("whole set: access(X_OK) on a 0644 file is EACCES (got {exec})"),
+        exec == libc::EACCES,
+    );
+    let (read, write, _) = row(&mut r, "CAP_DAC_OVERRIDE dropped", &[1], &whole);
+    r.check(
+        &format!("OVERRIDE dropped: the read still answers, READ_SEARCH's (got {read})"),
+        read == 0,
+    );
+    r.check(
+        &format!("OVERRIDE dropped: the write is refused (got {write})"),
+        write == libc::EACCES,
+    );
+    let (read, write, _) = row(&mut r, "CAP_DAC_READ_SEARCH dropped", &[2], &whole);
+    r.check(
+        &format!("READ_SEARCH dropped: the read still answers, OVERRIDE's (got {read})"),
+        read == 0,
+    );
+    r.check(
+        &format!("READ_SEARCH dropped: and the write answers too (got {write})"),
+        write == 0,
+    );
+    let (read, write, _) = row(&mut r, "both DAC capabilities dropped", &[1, 2], &whole);
+    r.check(
+        &format!("both dropped: the read is refused (got {read})"),
+        read == libc::EACCES,
+    );
+    r.check(
+        &format!("both dropped: and so is the write (got {write})"),
+        write == libc::EACCES,
+    );
+
+    // The sticky half of the same family - `check_sticky`'s last clause is
+    // `capable_wrt_inode_uidgid(dir, CAP_FOWNER)`, and not "is the caller
+    // root". The directory is `1777` and *another user's*, and the file inside
+    // it is another user's too, so neither id arm answers and only the
+    // capability can.
+    let sticky = "/tmp/t-caps-sticky";
+    let _ = std::fs::remove_dir_all(sticky);
+    let mut fixture = std::fs::create_dir_all(sticky).is_ok();
+    fixture &= std::fs::set_permissions(sticky, std::fs::Permissions::from_mode(0o1777)).is_ok();
+    let inside = format!("{sticky}/f");
+    fixture &= std::fs::File::create(&inside).is_ok();
+    fixture &= unsafe {
+        let dir = std::ffi::CString::new(sticky).unwrap();
+        let file = std::ffi::CString::new(inside.as_str()).unwrap();
+        libc::chown(dir.as_ptr(), 1000, 1000) == 0 && libc::chown(file.as_ptr(), 1000, 1000) == 0
+    };
+    r.check(
+        "a 1777 directory and a file in it, both another user's",
+        fixture,
+    );
+    let served = std::fs::remove_file(&inside).is_ok();
+    r.check("the whole set removes it (CAP_FOWNER's answer)", served);
+    // The recreated file is *this* caller's until it is handed over again: the
+    // sticky rule's first arm is the file's own owner, so a fixture that stayed
+    // root's would answer yes for the id and never reach the capability.
+    let remade = std::fs::File::create(&inside).is_ok()
+        && match std::ffi::CString::new(inside.as_str()) {
+            Ok(path) => unsafe { libc::chown(path.as_ptr(), 1000, 1000) == 0 },
+            Err(_) => false,
+        };
+    let mut without_fowner = whole;
+    without_fowner[0].effective &= !bit_of(3);
+    let lowered = capset(&mut header, &mut without_fowner) == 0;
+    let refused = std::fs::remove_file(&inside).is_err();
+    capset(&mut header, &mut whole);
+    r.check(
+        "with CAP_FOWNER dropped the same removal is refused",
+        remade && lowered && refused,
+    );
+
+    // And the namespace half of the same question, which is what makes it a
+    // capability and not an id. Inside a user namespace the caller holds the
+    // whole set *in it* (the rung's measured grant, §6.3) - and the file below
+    // is one whose triads refuse it, because it belongs to another uid, so the
+    // *only* thing that could answer a read is a capability in the namespace
+    // the file's filesystem belongs to. There is none: a capability is held in
+    // a namespace and its descendants, and this file's filesystem is the
+    // initial one's. Measured (`.workbuddy/probe_capable_scope.sh`, the
+    // mapped-root row): `EACCES`. The file beside it, owned by the namespace's
+    // own stored uid, is the control - the child does read what it owns.
+    let foreign = "/tmp/t-caps-foreign-0600";
+    let own = "/tmp/t-caps-own-0644";
+    for path in [foreign, own] {
+        let _ = std::fs::remove_file(path);
+    }
+    let made = std::fs::File::create(foreign).is_ok() && std::fs::File::create(own).is_ok();
+    let owned = made
+        && std::fs::set_permissions(foreign, std::fs::Permissions::from_mode(0o600)).is_ok()
+        && std::fs::set_permissions(own, std::fs::Permissions::from_mode(0o644)).is_ok()
+        && match std::ffi::CString::new(foreign) {
+            Ok(path) => unsafe { libc::chown(path.as_ptr(), 1000, 1000) == 0 },
+            Err(_) => false,
+        };
+    r.check("a 0600 file owned by another user, and a 0644 one", owned);
+    // Two answers through the helper's one word: both are small errnos.
+    let packed = in_user_namespace(|| {
+        let other = open_errno(foreign, libc::O_RDONLY);
+        let mine = open_errno(own, libc::O_RDONLY);
+        (other << 16) | (mine & 0xffff)
+    })
+    .unwrap_or(-1);
+    let (foreign_read, own_read) = (packed >> 16, packed & 0xffff);
+    r.check(
+        &format!(
+            "inside a user namespace the other user's 0600 file is refused (got {foreign_read})"
+        ),
+        foreign_read == libc::EACCES,
+    );
+    r.check(
+        &format!("and the file the namespace's own uid owns is served (got {own_read})"),
+        own_read == 0,
+    );
+    for path in [foreign, own] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    for path in [zero, four, sixfour] {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir_all(sticky);
 
     r.finish()
 }

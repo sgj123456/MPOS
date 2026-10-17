@@ -1107,7 +1107,7 @@ mod tests {
         assert!(node.keeps_modes(), "a device node keeps what it is told");
         assert_eq!(node.mode(), 0o666, "and is born at the Linux stream mode");
 
-        let writable_by_anyone = (1u32, 1u32);
+        let writable_by_anyone = crate::vfs::Caller::ids(1, 1);
         assert!(crate::vfs::may_as(writable_by_anyone, &node, crate::vfs::W_OK).is_ok());
 
         node.set_mode(0o600);
@@ -1118,7 +1118,7 @@ mod tests {
             "the tightened mode is what the next check sees"
         );
         assert!(
-            crate::vfs::may_as((0, 0), &node, crate::vfs::W_OK).is_ok(),
+            crate::vfs::may_as(crate::vfs::Caller::root(), &node, crate::vfs::W_OK).is_ok(),
             "and root still reaches it, the way CAP_DAC_OVERRIDE does"
         );
 

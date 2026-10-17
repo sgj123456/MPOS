@@ -1207,7 +1207,7 @@ mod tests {
     use alloc::vec;
 
     use super::{CHUNK, Chunked, RamFs, Usage};
-    use crate::vfs::{FileSystem, NodeKind, R_OK, VfsError, X_OK, may_as};
+    use crate::vfs::{Caller, FileSystem, NodeKind, R_OK, VfsError, X_OK, may_as};
 
     /// The flags are kept, and a caller reads back what it set.
     ///
@@ -1744,7 +1744,10 @@ mod tests {
         // the directory - both are the other triad's bits, and `0644` would
         // have neither. That is the difference between a `/tmp` names can be
         // reached through and one they cannot.
-        assert_eq!(may_as((1000, 1000), &dir, X_OK | R_OK).ok(), Some(()));
+        assert_eq!(
+            may_as(Caller::ids(1000, 1000), &dir, X_OK | R_OK).ok(),
+            Some(())
+        );
         // And the mask is honoured rather than hardcoded: at 0077 the same
         // create leaves a directory nobody but its owner can walk into or list.
         crate::sched::set_current_umask(0o077);
@@ -1752,7 +1755,7 @@ mod tests {
         crate::sched::set_current_umask(crate::abi::DEFAULT_UMASK);
         assert_eq!(private.mode(), 0o700, "the creator's mask decides");
         assert_eq!(
-            may_as((1000, 1000), &private, X_OK | R_OK).err(),
+            may_as(Caller::ids(1000, 1000), &private, X_OK | R_OK).err(),
             Some(VfsError::Access)
         );
     }

@@ -1411,7 +1411,7 @@ pub fn may_modify(inode: &Arc<dyn Inode>) -> VfsResult<()> {
 /// stored mode exactly as every other check does.
 pub fn may_write(inode: &Arc<dyn Inode>) -> VfsResult<()> {
     may_modify(inode)?;
-    may_as(crate::sched::current_owner(), inode, W_OK)
+    may_as(current_caller(), inode, W_OK)
 }
 
 /// Whether the running process may change `inode`'s *extent*: cut it short or
@@ -1510,71 +1510,177 @@ fn permitted(mode: u32, owner: (u32, u32), want: u32, me: (u32, u32), groups: &[
 /// even for the superuser. mpos used to drop that exception, on the reasoning
 /// that a single-user image whose root does the packaging has no use for a
 /// check that can tell it "you may not run this". A distribution's tree
-/// changed what the exception costs: Alpine ships real modes everywhere, and
-/// the outright pass answers *success* where Linux answers `EACCES`, which is
-/// the one thing a caller cannot fall back around. So the exception stands,
-/// and its exact predicate lives in [`may_as`]'s root branch.
-fn root_override() -> bool {
-    true
+/// The capabilities a permission check consults, each asked of the user
+/// namespace the **node's** filesystem belongs to.
+///
+/// Linux spells this `capable_wrt_inode_uidgid(idmap, inode, cap)`, and it is
+/// the reason a check is not simply "is the caller root": the answer turns on
+/// the *file's* filesystem's namespace, so a caller whose credentials are
+/// scoped to a child user namespace is refused a node the machine's root owns -
+/// measured, and the sharpest answer in the table below. Every filesystem here
+/// was made by the machine's root, so that namespace is the initial one, which
+/// is [`Credentials::capable`](crate::cred::Credentials::capable); a filesystem
+/// made by another namespace's owner would need the scoped question §5.2 names.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Overrides {
+    /// `CAP_DAC_OVERRIDE` (1).
+    pub dac_override: bool,
+    /// `CAP_DAC_READ_SEARCH` (2).
+    pub dac_read_search: bool,
+    /// `CAP_FOWNER` (3), which the sticky-bit rule and the owner-shaped calls
+    /// ask.
+    pub fowner: bool,
+}
+
+impl Overrides {
+    /// A caller holding none of them - what a filesystem that keeps no modes is
+    /// not policed by, and what a user-space test asks about the triads with.
+    pub const NONE: Overrides = Overrides {
+        dac_override: false,
+        dac_read_search: false,
+        fowner: false,
+    };
+    /// The machine's root's three: the state a fresh process starts in, where
+    /// no capability has been lowered.
+    pub const ALL: Overrides = Overrides {
+        dac_override: true,
+        dac_read_search: true,
+        fowner: true,
+    };
+
+    /// The three a credential holds in the **initial** user namespace, which is
+    /// the namespace every filesystem here belongs to.
+    pub fn of(creds: &crate::cred::Credentials) -> Overrides {
+        Overrides {
+            dac_override: creds.capable(crate::cred::CAP_DAC_OVERRIDE),
+            dac_read_search: creds.capable(crate::cred::CAP_DAC_READ_SEARCH),
+            fowner: creds.capable(crate::cred::CAP_FOWNER),
+        }
+    }
+}
+
+/// Who the caller is, as the permission checks see it.
+///
+/// The ids are a parameter rather than something read here because the `access`
+/// calls disagree about which pair to use: `access(2)` asks about the **real**
+/// ids - "would *this user* be able to" - while `faccessat2` with `AT_EACCESS`
+/// asks about the effective ones. The overrides are one fact about the caller
+/// either way, because Linux's `capable()` reads `current_cred()` whatever ids
+/// the door chose.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Caller {
+    pub uid: u32,
+    pub gid: u32,
+    pub overrides: Overrides,
+}
+
+impl Caller {
+    /// A caller holding none of the overrides: the triads alone.
+    pub const fn ids(uid: u32, gid: u32) -> Caller {
+        Caller {
+            uid,
+            gid,
+            overrides: Overrides::NONE,
+        }
+    }
+
+    /// The machine's root: uid 0 and the whole set, which is what a fresh
+    /// process starts in and what every payload test runs as.
+    pub const fn root() -> Caller {
+        Caller {
+            uid: 0,
+            gid: 0,
+            overrides: Overrides::ALL,
+        }
+    }
 }
 
 /// The permission bits the checks may conclude from `inode`'s mode word.
 ///
 /// A filesystem that keeps modes stores the low twelve bits and nothing
 /// else - ext4 masks its on-disk word, devtmpfs' `NodePerms` holds a plain
-/// number - so a zero there *is* `chmod 000`: every triad empty, nothing
-/// permitted, root included, because Linux's `CAP_DAC_OVERRIDE` grants
-/// read/write only where some triad carries the bit and execute only where
-/// some execute bit exists. A filesystem that keeps no modes answers zero
-/// for a different reason - it has no permissions for a check to conclude
-/// anything about - and [`may_as`] passes those nodes untouched; refusing
-/// them would invent permissions nobody set. The tell is `keeps_modes()`,
-/// not the number: the same word means two things, and a check cannot tell
-/// them apart by looking at it.
+/// number - so a zero there *is* `chmod 000`: every triad empty, which is a
+/// statement about the triads and not about a capability. A filesystem that
+/// keeps no modes answers zero for a different reason - it has no permissions
+/// for a check to conclude anything about - and [`may_as`] passes those nodes
+/// untouched; refusing them would invent permissions nobody set. The tell is
+/// `keeps_modes()`, not the number: the same word means two things, and a check
+/// cannot tell them apart by looking at it.
 pub fn effective_mode(inode: &Arc<dyn Inode>) -> u32 {
     inode.mode()
 }
 
-/// Whether the process whose ids are `me` may do `want` to `node`.
+/// Whether the caller's capabilities override the triads for `want` on `node`.
 ///
-/// The identity is a parameter rather than something read here, because the
-/// `access` calls disagree about which pair to use: `access(2)` asks about the
-/// **real** ids - "would *this user* be able to" - while `faccessat2` with
-/// `AT_EACCESS` asks about the effective ones. Everything else asks with the
-/// effective pair, which is what the wrappers below do.
-pub fn may_as(me: (u32, u32), inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()> {
+/// Linux's `generic_permission` after the triad comparison failed, measured
+/// whole on a current host (`.workbuddy/probe_capable_scope.sh dac`, which
+/// drops each capability from a root caller's effective set and makes the same
+/// calls against mode `0000` and `0444` fixtures):
+///
+/// ```text
+///                                   whole set   -OVERRIDE  -READ_SEARCH  -both
+/// read   a 0000 file                    0        EACCES        0        EACCES
+/// write  a 0444 file                    0        EACCES        0        EACCES
+/// access(R_OK) on a 0000 file           0            0         0        EACCES
+/// access(R_OK|W_OK) on a 0000 file      0            0         0        EACCES
+/// access(X_OK) on a 0000 file        EACCES       EACCES    EACCES      EACCES
+/// access(X_OK) on another's 0700 file   0        EACCES    EACCES      EACCES
+/// access(X_OK) on a 0644 file        EACCES       EACCES    EACCES      EACCES
+/// list   a 0000 directory               0            0         0        EACCES
+/// ```
+///
+/// So three things are read off it, and the first is what the previous rule got
+/// wrong: `CAP_DAC_OVERRIDE` grants **read and write on a non-directory
+/// unconditionally** - the clause that required some triad to carry the bit is
+/// gone from Linux, and a `chmod 000` file is readable and writable by a caller
+/// that holds it (the row above is `0`, not `EACCES`) -
+/// `CAP_DAC_READ_SEARCH` grants a **read on its own** and everything on a
+/// directory but a write, and the two are separate capabilities, so a caller
+/// that dropped one still has the other's answers. `X_OK` is the one kind with
+/// a shape of its own: it needs an execute bit *somewhere* (`S_IXUGO`), which
+/// is why the same two capabilities refuse it for a `0644` file and grant it
+/// for a `0700` one, and why the compound `R_OK|W_OK|X_OK` is refused where
+/// `R_OK|W_OK` is granted.
+fn overrides_allow(overrides: Overrides, dir: bool, mode: u32, want: u32) -> bool {
+    /// `S_IXUGO`: an execute bit in any triad.
+    const ANY_EXECUTE: u32 = 0o111;
+    if !(overrides.dac_override || overrides.dac_read_search) {
+        return false;
+    }
+    if dir {
+        // A directory: read and search are `READ_SEARCH`'s, a write is
+        // `OVERRIDE`'s - which is Linux's split, and why an unreadable
+        // directory is still passable by either capability.
+        (want & W_OK == 0 && overrides.dac_read_search) || overrides.dac_override
+    } else {
+        // Everything else, with the execute clause: `OVERRIDE` grants read and
+        // write whatever the bits are, and execute only where some execute bit
+        // exists; `READ_SEARCH` then grants a read on its own.
+        ((want & X_OK == 0 || mode & ANY_EXECUTE != 0) && overrides.dac_override)
+            || (want == R_OK && overrides.dac_read_search)
+    }
+}
+
+/// Whether `caller` may do `want` to `node`.
+///
+/// The tiers are Linux's, in Linux's order: a filesystem that keeps no modes is
+/// not policed at all, the triads decide, and only what the triads refuse is
+/// offered to the overrides ([`overrides_allow`], with the measured table).
+pub fn may_as(caller: Caller, inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()> {
     // A filesystem that keeps no modes is not policed: refusing would mean
     // inventing permissions for nodes nobody set any on.
     if !inode.keeps_modes() {
         return Ok(());
     }
-    // Neither is root: uid 0 passes every check - Linux's
-    // `capable(CAP_DAC_OVERRIDE)` in `fs/namei.c`, spelled below. Read/write
-    // whenever any triad carries the bit, execute only when some execute bit
-    // exists: a node whose every bit of the requested kind is missing stays
-    // denied to root too, which is what the rule says - and a `chmod 000` file
-    // is exactly that, because a filesystem that keeps modes stores the twelve
-    // bits and nothing else, so its zero word means "no permission for
-    // anyone", not "no answer". Asked for several kinds at once
-    // (`may_create_in`'s write+search), it passes when *each* requested kind
-    // has its somewhere - the same sentence one bit at a time. The shape that
-    // genuinely carries no answer, a filesystem that keeps no modes, was
-    // returned from above rather than read as a zero here.
-    let allowed = if me.0 == 0 && root_override() {
-        let mode = effective_mode(inode);
-        let any = (mode >> 6) | (mode >> 3) | mode;
-        (want & R_OK == 0 || any & 4 != 0)
-            && (want & W_OK == 0 || any & 2 != 0)
-            && (want & X_OK == 0 || any & 1 != 0)
-    } else {
-        permitted(
-            effective_mode(inode),
-            inode.owner(),
+    let mode = effective_mode(inode);
+    let me = (caller.uid, caller.gid);
+    let allowed = permitted(mode, inode.owner(), want, me, &current_groups())
+        || overrides_allow(
+            caller.overrides,
+            inode.metadata().kind == NodeKind::Dir,
+            mode,
             want,
-            me,
-            &current_groups(),
-        )
-    };
+        );
     if allowed {
         Ok(())
     } else {
@@ -1582,10 +1688,33 @@ pub fn may_as(me: (u32, u32), inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()
     }
 }
 
+/// The running task as the permission checks see it: its effective ids, and the
+/// overrides its credentials carry in the namespace the node's filesystem
+/// belongs to ([`Overrides::of`]).
+pub fn current_caller() -> Caller {
+    let (uid, gid) = crate::sched::current_owner();
+    Caller {
+        uid,
+        gid,
+        overrides: Overrides::of(&crate::sched::current_credentials()),
+    }
+}
+
+/// The same caller, judged by a *different* id pair - what `access(2)` needs,
+/// whose ids are the real ones while the capabilities it is judged by are the
+/// current ones either way.
+pub fn caller_as(uid: u32, gid: u32) -> Caller {
+    Caller {
+        uid,
+        gid,
+        overrides: Overrides::of(&crate::sched::current_credentials()),
+    }
+}
+
 /// The group list permission checks consult: the running task's three saved
 /// gids, straight from `sched` - whose host build answers the empty list a
-/// kernel caller that runs as no task would. Root's override makes it moot
-/// either way.
+/// kernel caller that runs as no task would. The overrides make it moot for a
+/// caller that holds them either way.
 fn current_groups() -> [u32; 3] {
     crate::sched::current_groups()
 }
@@ -1593,7 +1722,7 @@ fn current_groups() -> [u32; 3] {
 /// Whether the running process may do `want` to `node`, asked for its
 /// effective ids - the check every syscall that touches a path makes.
 pub fn may_access(inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()> {
-    may_as(crate::sched::current_owner(), inode, want)
+    may_as(current_caller(), inode, want)
 }
 
 /// Whether the running process may **search** `dir`: look a name up in it.
@@ -1647,15 +1776,22 @@ pub fn may_remove(parent: &Arc<dyn Inode>, target: &Arc<dyn Inode>) -> VfsResult
     if is_append_only(parent) {
         return Err(VfsError::NotPermitted);
     }
-    let me = crate::sched::current_owner();
+    let caller = current_caller();
     // Write permission on the directory, through the same core every other
-    // check uses - so root passes here as everywhere, and the kernel's own
-    // paths, which run as root, are not refused the mount table's writes.
-    may_as(me, parent, W_OK)?;
+    // check uses - so a caller holding `CAP_DAC_OVERRIDE` passes here as
+    // everywhere, and the kernel's own paths, which run as the machine's root,
+    // are not refused the mount table's writes.
+    may_as(caller, parent, W_OK)?;
     // The sticky half reads the directory's own mode rather than its triads,
-    // so it is asked directly; root is not subject to it.
+    // so it is asked directly: the file's owner, the directory's owner, or a
+    // caller holding `CAP_FOWNER` - Linux's `check_sticky`, whose last clause
+    // is `capable_wrt_inode_uidgid(dir, CAP_FOWNER)` and not "is this root".
     let mode = parent.mode();
-    if mode & S_ISVTX != 0 && me.0 != 0 && me.0 != target.owner().0 && me.0 != parent.owner().0 {
+    if mode & S_ISVTX != 0
+        && caller.uid != target.owner().0
+        && caller.uid != parent.owner().0
+        && !caller.overrides.fowner
+    {
         return Err(VfsError::NotPermitted);
     }
     Ok(())
@@ -2040,14 +2176,16 @@ mod tests {
         file.set_mode(0o600);
         file.set_owner(10, 10);
 
-        // The owner may read it, a stranger may not. Root's answer is no
-        // longer "regardless" - that reading was the pass-everything shape
-        // `root_passes_where_any_bit_of_the_kind_exists` replaced: uid 0 here
-        // passes because the *owner* triad carries the read bit, which is
-        // Linux's `CAP_DAC_OVERRIDE` sentence, not an exception to it.
-        assert_eq!(may_as((10, 10), &file, R_OK).ok(), Some(()));
-        assert_eq!(may_as((11, 11), &file, R_OK).err(), Some(VfsError::Access));
-        assert_eq!(may_as((0, 0), &file, R_OK).ok(), Some(()));
+        // The owner may read it, a stranger may not. The machine's root here
+        // passes because it holds the overrides, and *not* because uid 0 is an
+        // exception: the same ids without them are refused (see
+        // `the_dac_overrides_are_linuxs_two_capabilities_and_not_a_uid`).
+        assert_eq!(may_as(Caller::ids(10, 10), &file, R_OK).ok(), Some(()));
+        assert_eq!(
+            may_as(Caller::ids(11, 11), &file, R_OK).err(),
+            Some(VfsError::Access)
+        );
+        assert_eq!(may_as(Caller::root(), &file, R_OK).ok(), Some(()));
         // A node the filesystem kept no mode for is not policed. A created
         // node now *has* a birth mode, so the shape has to be said: an
         // explicit zero word means `chmod 000`, and only a filesystem that
@@ -2055,85 +2193,138 @@ mod tests {
         // own root directory is exactly one - `RamFs::new` builds it before
         // any create runs, and its word stays unset.
         assert!(!root.keeps_modes());
-        assert_eq!(may_as((11, 11), &root, R_OK | W_OK | X_OK).ok(), Some(()));
+        assert_eq!(
+            may_as(Caller::ids(11, 11), &root, R_OK | W_OK | X_OK).ok(),
+            Some(())
+        );
     }
 
+    /// The DAC override is **two capabilities** asked of the node's
+    /// filesystem's namespace, and never "is the caller root".
+    ///
+    /// Measured on a current host with `.workbuddy/probe_capable_scope.sh dac`
+    /// (root, each capability dropped from the effective set in turn, against
+    /// mode `0000` and `0444` fixtures): `CAP_DAC_OVERRIDE` grants a read and a
+    /// write on a non-directory **whatever the bits are** - the clause that
+    /// required some triad to carry the bit is gone from Linux - and grants
+    /// execute only where some execute bit exists; `CAP_DAC_READ_SEARCH` grants
+    /// a read on its own, and everything on a directory but a write; and
+    /// neither reaches a caller whose credentials are not in the file's
+    /// namespace, which for every filesystem here is `Caller::ids(0, 0)` with
+    /// no overrides - uid 0 and refused.
     #[test]
-    fn root_passes_where_any_bit_of_the_kind_exists() {
-        // The measured Linux rule (`capable(CAP_DAC_OVERRIDE)` in
-        // `fs/namei.c`): superuser read/write passes when *any* triad carries
-        // the bit, execute only when some execute bit exists. This kernel's
-        // override used to be "uid 0 passes every check outright", and on a
-        // single-user image whose root does everything that reads the same -
-        // until a distribution's tree arrives with real modes. Alpine's `/bin`
-        // is `0755` and every component of a path root walks carries its
-        // owner-read bit, so the old shape and the new one agree there; what
-        // changed is the fine print, and the old exception-less pass made it
-        // *less* honest, not more: it answered success for an execute nobody
-        // set. The pin is the counterfactual: without the branch, `(0,0)`
-        // against these nodes is `Access` where Linux says yes, and `Ok`
-        // where Linux says no.
+    fn the_dac_overrides_are_linuxs_two_capabilities_and_not_a_uid() {
         let vfs = MountTable::new();
         let fs = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
 
-        let dir = root.create("d", NodeKind::Dir).unwrap();
-        dir.set_mode(0o644); // owner rw-, group r--, other r--: no x anywhere
-        assert_eq!(
-            may_as((0, 0), &dir, X_OK).err(),
-            Some(VfsError::Access),
-            "root gets no exception where no execute bit exists at all"
-        );
-        dir.set_mode(0o645); // other gains --x
-        assert_eq!(
-            may_as((0, 0), &dir, X_OK).ok(),
-            Some(()),
-            "one execute bit anywhere is enough for root"
-        );
+        let none = Caller::ids(0, 0); // uid 0, no overrides: a caller in a child namespace
+        let override_only = Caller {
+            uid: 0,
+            gid: 0,
+            overrides: Overrides {
+                dac_override: true,
+                ..Overrides::NONE
+            },
+        };
+        let search_only = Caller {
+            uid: 0,
+            gid: 0,
+            overrides: Overrides {
+                dac_read_search: true,
+                ..Overrides::NONE
+            },
+        };
 
         let file = root.create("f", NodeKind::File).unwrap();
-        file.set_mode(0o600); // owner rw- only
+        file.set_mode(0o000);
+        // The row that the previous rule got wrong, both ways round: a `chmod
+        // 000` file is readable *and* writable to a caller holding the
+        // override, and not readable to the same ids without it.
+        for (want, what) in [(R_OK, "read"), (W_OK, "write"), (R_OK | W_OK, "read+write")] {
+            assert_eq!(
+                may_as(Caller::root(), &file, want).ok(),
+                Some(()),
+                "the machine's root {what}s a 0000 file"
+            );
+            assert_eq!(
+                may_as(override_only, &file, want).ok(),
+                Some(()),
+                "CAP_DAC_OVERRIDE alone {what}s it"
+            );
+            assert_eq!(
+                may_as(none, &file, want).err(),
+                Some(VfsError::Access),
+                "uid 0 without it does not"
+            );
+        }
+        // And the execute clause is the one kind with a shape of its own: no
+        // execute bit anywhere, so neither capability reaches it - which is
+        // what `access(X_OK)` on a 0644 file gets as root too.
         assert_eq!(
-            may_as((0, 0), &file, R_OK).ok(),
-            Some(()),
-            "root reads what any triad can read"
+            may_as(Caller::root(), &file, X_OK).err(),
+            Some(VfsError::Access)
         );
         assert_eq!(
-            may_as((0, 0), &file, W_OK).ok(),
-            Some(()),
-            "and writes what any triad can write"
-        );
-        assert_eq!(
-            may_as((0, 0), &file, X_OK).err(),
+            may_as(Caller::root(), &file, R_OK | W_OK | X_OK).err(),
             Some(VfsError::Access),
-            "but never invents an execute permission"
+            "and the compound mask that includes it"
         );
-        // A non-root caller falls through to triads exactly as before:
-        // this is the half that must not move.
-        assert_eq!(may_as((11, 11), &file, R_OK).err(), Some(VfsError::Access));
-        assert_eq!(may_as((11, 11), &dir, X_OK).err(), Some(VfsError::Access));
+        file.set_mode(0o100); // another user's --x
+        assert_eq!(
+            may_as(Caller::root(), &file, X_OK).ok(),
+            Some(()),
+            "one execute bit anywhere is enough for the override"
+        );
 
-        // The sentence one bit at a time: `may_create_in` asks write *and*
-        // search together, and Linux's override passes it when each kind has
-        // its somewhere - here write in the owner triad, execute only in
-        // other's. An all-or-nothing reading of the pair would refuse what
-        // `link_path_walk` grants.
-        dir.set_mode(0o601);
+        // `CAP_DAC_READ_SEARCH` is the read half: a read on its own, and on a
+        // directory everything but a write.
+        let unreadable = root.create("u", NodeKind::File).unwrap();
+        unreadable.set_mode(0o000);
+        assert_eq!(may_as(search_only, &unreadable, R_OK).ok(), Some(()));
         assert_eq!(
-            may_as((0, 0), &dir, W_OK | X_OK).ok(),
-            Some(()),
-            "each requested kind needs only its own bit to exist"
+            may_as(search_only, &unreadable, R_OK | W_OK).err(),
+            Some(VfsError::Access)
         );
-        // And a node that stores no bits at all stays outside the check even
-        // under a filesystem that keeps modes once they are said - the shape
-        // the kernel's own trees carry before anything chmods them.
-        let untouched = crate::vfs::ramfs::RamFs::new();
-        assert!(!untouched.root().keeps_modes());
         assert_eq!(
-            may_as((0, 0), &untouched.root(), X_OK).ok(),
+            may_as(search_only, &unreadable, W_OK).err(),
+            Some(VfsError::Access)
+        );
+        let dir = root.create("d", NodeKind::Dir).unwrap();
+        dir.set_mode(0o000);
+        assert_eq!(
+            may_as(search_only, &dir, X_OK).ok(),
             Some(()),
-            "a root nobody set a mode on is not refused to root"
+            "a directory is searchable by READ_SEARCH alone"
+        );
+        assert_eq!(may_as(search_only, &dir, R_OK).ok(), Some(()));
+        assert_eq!(
+            may_as(search_only, &dir, W_OK).err(),
+            Some(VfsError::Access)
+        );
+        assert_eq!(
+            may_as(override_only, &dir, W_OK | X_OK).ok(),
+            Some(()),
+            "and a write on one is the override's"
+        );
+        assert_eq!(may_as(none, &dir, X_OK).err(), Some(VfsError::Access));
+
+        // The triads still have the first word, and they are what answers when
+        // the overrides are not held at all: a stranger's read of a file its
+        // owner may read.
+        let owned = root.create("o", NodeKind::File).unwrap();
+        owned.set_mode(0o600);
+        owned.set_owner(10, 10);
+        assert_eq!(may_as(Caller::ids(10, 10), &owned, R_OK).ok(), Some(()));
+        assert_eq!(
+            may_as(Caller::ids(11, 11), &owned, R_OK).err(),
+            Some(VfsError::Access)
+        );
+        assert_eq!(
+            may_as(none, &owned, R_OK).err(),
+            Some(VfsError::Access),
+            "and uid 0 with no overrides is a stranger to it too"
         );
     }
 }

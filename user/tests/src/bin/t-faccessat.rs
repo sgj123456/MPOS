@@ -137,13 +137,38 @@ fn main() {
         accessat(CWD, FILE, Access::EXEC_OK, AtFlags::empty()) == Err(Errno::ACCESS),
     );
 
-    // And a mode no one is granted at all: refused outright, still agreed by
-    // all three calls.
+    // A mode no one is granted at all. What root gets there is **two**
+    // capabilities and not an exception: measured on a current host
+    // (`.workbuddy/probe_capable_scope.sh dac`), `CAP_DAC_OVERRIDE` grants a
+    // read and a write on a file whatever its bits are and
+    // `CAP_DAC_READ_SEARCH` grants a read on its own - so `R_OK` alone and
+    // `R_OK|W_OK` are `Ok` for root where the compound mask including `X_OK` is
+    // refused, because execute needs an execute bit *somewhere*.
     r.check(
         "chmod 0000 succeeds",
         chmod(FILE, Mode::from(0o000)).is_ok(),
     );
+    //
+    // The two rows that need the capabilities *held* are root's, so a host run
+    // - an ordinary user, which never has them - names them and does not make
+    // them (`t-caps`'s rule for the same reason).
+    if unsafe { libc::geteuid() } == 0 {
+        r.check(
+            "access(2) R_OK on 0000 is allowed for root (CAP_DAC_READ_SEARCH)",
+            access(FILE, Access::READ_OK) == Ok(()),
+        );
+        r.check(
+            "access(2) R_OK|W_OK on 0000 is allowed for root (CAP_DAC_OVERRIDE)",
+            access(FILE, Access::READ_OK | Access::WRITE_OK) == Ok(()),
+        );
+    } else {
+        println!(
+            "note: not root, so the two rows where the 0000 file is *readable* are named and not made"
+        );
+    }
     let all = Access::READ_OK | Access::WRITE_OK | Access::EXEC_OK;
+    // `EACCES` here is the *execute* clause's answer and not "0000 is refused
+    // outright" - the three spellings still agree, which is the claim.
     r.check(
         "access(2) R_OK|W_OK|X_OK on 0000 is EACCES for root",
         access(FILE, all) == Err(Errno::ACCESS),
