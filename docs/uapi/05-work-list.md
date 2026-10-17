@@ -1269,3 +1269,84 @@ the commit bodies), and each moved its pin in the same commit.
     row, and two are `t-faccessat`'s `R_OK` and `R_OK|W_OK` rows - while every control passes on
     both kernels (`access(X_OK)` on the `0644` file, the compound mask, "the whole set removes it",
     "the file the namespace's own uid owns is served", and the stranger's `EACCES`)..
+
+40. **The owner-shaped calls ask a capability of the file's namespace, and never "is the caller
+    root" — and what a `chown` takes away is nobody's to buy back.** The half of
+    `inode_owner_or_capable` item 39 left for its own pass, and it is four rules rather than one.
+    `chmod` on a node asks `inode_owner_or_capable` — the caller's `fsuid` is the node's owner, **or**
+    `CAP_FOWNER` — where this kernel asked "`me.0 != 0 && me.0 != owner.0`"; the set-group-id bit
+    that `chmod` may keep asks `in_group_or_capable`, whose stand-in is `CAP_FSETID` and *not* the uid
+    `0` this kernel asked (an owner is outside a group it is not in); `chown` asks `CAP_CHOWN`, and
+    the ids being the ones the node already holds is not a standing either; and the timestamps family
+    is **two** questions, not one, split by the *shape* of the request. **Measured whole on a current
+    host first** (`.workbuddy/probe_capable_scope.sh own` — a root caller with one capability dropped
+    from the effective set at a time, every fixture belonging to uid 1000 so no row can pass on the id
+    arm):
+
+    ```text
+                                          whole set  -FOWNER  -CHOWN  -FSETID
+    chmod  0600 on another's file               0     EPERM      0       0
+    chmod  0640 on my own file                  0       0        0       0
+    chmod  2755 on my own, foreign group      2755    2755     2755    0755
+    chown to a uid (another's file)             0       0     EPERM      0
+    chgrp to a group (my own file)              0       0     EPERM      0
+    utimensat, explicit times (another's)       0     EPERM      0       0
+    utimensat, both clocks to *now*             0       0        0       0
+    ```
+
+    Two things are read off it beyond the capabilities themselves. The **owner arm is the uid**, not a
+    privilege: a stranger that owns the node passes every row with the whole set gone, which is what
+    keeps the refusals on the capability rather than on being root. And the two times rows are two
+    different questions — `utimensat`'s null-pointer form is Linux's `ATTR_TOUCH` and accepts **write
+    permission** (a `-FOWNER` caller touches another user's `0666` file, and its refusal on a `0600`
+    one is `EACCES`, the bits' answer), while any pointer that names a clock is `ATTR_TIMES_SET` and
+    is `EPERM` whatever the bits say; a pointer naming `UTIME_OMIT` for **both** clocks asks nothing
+    at all and is served. **The `chown` half is not a caller's question in either direction**, which is
+    what this kernel had wrong the other way: it stripped the set-uid and set-group-id bits only for a
+    caller whose uid was not `0` and only when an id actually moved. Measured
+    (`.workbuddy/probe_chown_bits.c`, the same root caller, four fixtures carrying both bits):
+
+    ```text
+                                          whole set  -FSETID  -CHOWN  -FOWNER
+    chown(0,-1)  6755 own group (no change)    0755     0755    0755     0755
+    chown(-1,-1) 6755 (nothing named at all)   0755     0755    0755     0755
+    chown(0,-1)  6644 (sgid, no group-x)       2644     2644    2644     2644
+    chown(0,-1)  4644 (suid, no exec)          0644     0644    0644     0644
+    chown(0,-1)  6755 directory                6755     6755    6755     6755
+    ```
+
+    Naming an id is not required and neither is changing one — `chown(-1, -1)` takes them away too —
+    so the test is not "did the owner move". The set-uid bit goes whatever else is true, even on a file
+    with no execute bit at all. The set-group-id bit goes only where the group may execute, because
+    without it the bit is mandatory locking and not an authority. And a directory keeps both. **The
+    fix**: `crates/cred` gains `CAP_CHOWN` (0) and `CAP_FSETID` (4); `Overrides` grows the two beside
+    the DAC pair and `Overrides::of` reads them through item 38's `capable`, so the scope is the
+    file's namespace for free; `src/vfs/mod.rs` gains `may_setattr` (the ownership question, `EPERM`),
+    `may_touch` (the same question with write permission standing in, `EACCES`) and
+    `in_group_or_capable` (the group's stand-in), plus `S_IXGRP`, which is what separates an authority
+    from a locking mark; and `src/syscall/linux/fs/file.rs` routes all three owners through them —
+    `chmod_mode`, `chown_allowed`'s two arms (an owner may name the uid it already has, and the gid it
+    already has or one of its own groups), and a `TimesShape`/`store_times` pair that the three
+    timestamps handlers now share, so the two questions cannot drift apart the way three copies of
+    them could. Owner: those three files. Pin: `t-caps`'s owner-shaped table (four rows — the whole
+    set and each capability dropped — 18 claims, including the four `chown(-1, -1)` shapes) and
+    `t-faccessat`'s stranger's rows (nine claims, which are the same two questions asked from a
+    caller that owns nothing: a `chmod` and both `chown` arms are `EPERM`, and the two timestamps
+    forms are `EACCES` and `EPERM` on the *same* world-writable file), beside the host unit test
+    `the_owner_shaped_questions_are_a_capability_and_not_the_uid`. Gate: x86_64 `pass=181 fail=0 (181
+    built)`, `mpos-kunit` 32 passed, 0 failed (181 staged, 11 left out); the second machine's arm is
+    `pass=180 fail=0`, `mpos-kunit` 32 passed, 0 failed (180 staged, 12 left out); `t-caps`' 70 `ok:`
+    lines and `t-faccessat`'s 27 are byte-identical across the two. The counterfactual is exact: with
+    only the kernel half reverted (the leaf crate's two constants, the three `vfs` questions and the
+    three call sites — three files) and the pins kept, the sweep is `pass=179 fail=2 (181 built)` with
+    `mpos-kunit` unmoved at 32 passed, 0 failed — the two red programs are exactly `t-caps` and
+    `t-faccessat`, and their sixteen red claims are the rows the old rule got wrong: eleven in
+    `t-caps` (three of the four `chown(-1,-1)` shapes reading `got 6755`/`got 6644`/`got 4644`, the
+    `FOWNER`-dropped `chmod` and explicit-times rows both `served`, the `FSETID`-dropped `2755`
+    storing `2755`, the `CHOWN`-dropped uid row served, and the three "the chown still takes both
+    bits" rows) and five in `t-faccessat` (both `chown` arms naming the ids already held, the
+    `EACCES`/`EPERM` split between the two timestamps forms, and the explicit pair) — while every
+    control passes on both kernels (`chmod 0640 on the caller's own file`, `the owner's own uid is
+    still served`, "a world-writable file is served the now form", and `chmod on root's 0600 file is
+    EPERM for a stranger`). **What stays named rather than landed** is the same capability's other
+    door — a **write** to a set-uid file, which is §5.2's newest entry and has its own measurement.

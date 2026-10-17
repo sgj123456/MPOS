@@ -53,7 +53,12 @@
 #     `t-chdir` pin through `libc::getcwd`. The same clause a third time:
 #     `rustix::fs::openat2` writes `size_of::<open_how>()` itself, so 23 and 25 -
 #     the two halves of the version handshake that *are* `t-openat2`'s subject -
-#     are unreachable through it.
+#     are unreachable through it. The same clause a fourth time:
+#     `rustix::fs::utimensat` takes a `&Timestamps`, so the *null-pointer* shape -
+#     Linux's `ATTR_TOUCH`, which is the one a `touch` and a `futimens(NULL)`
+#     send and the one write permission buys - cannot be sent through it at all,
+#     and the two questions that shape separates are what `t-faccessat` pins
+#     through `libc::utimensat` (`docs/uapi/` §5.1 item 40).
 #
 # Two ways of "cannot express it" look alike and are not, and only the second is
 # a reason to leave `rustix`. A rustix **bitflags** type carries bitflags'

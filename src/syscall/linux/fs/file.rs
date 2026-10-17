@@ -1238,6 +1238,88 @@ struct Utimespec {
 const UTIME_NOW: i64 = (1 << 30) - 1;
 const UTIME_OMIT: i64 = (1 << 30) - 2;
 
+/// Which of Linux's timestamps questions a call is asking.
+///
+/// The three handlers below take their clocks in three different structs, and
+/// what the permission check turns on is not the struct but the *shape* of the
+/// request: a null pointer means both clocks to `now`, and Linux spells that
+/// `ATTR_TOUCH`; a pointer means at least one clock named, which is
+/// `ATTR_TIMES_SET` - and the two are asked of different questions, so a
+/// caller that may write a file somebody else owns may still not name a time
+/// for it.
+///
+/// Measured whole on a current host (`.workbuddy/probe_capable_scope.sh own`,
+/// as a root caller with its capabilities dropped one at a time, against files
+/// that belong to uid 1000):
+///
+/// ```text
+///                                       whole set  -CAP_FOWNER  -FOWNER,-DAC_OVERRIDE
+/// utimensat(NULL) on another's 0600          0          0            EACCES
+/// utimensat(NULL) on another's 0666          0          0               0
+/// utimensat({NOW, NOW}) on 0600/0666         0          0         EACCES / 0
+/// utimensat({NOW, OMIT}) on either           0        EPERM           EPERM
+/// utimensat({explicit, explicit}) on either  0        EPERM           EPERM
+/// utimensat({OMIT, OMIT}) on either          0          0               0
+/// ```
+///
+/// So three things: the `now` form accepts **write permission** (the third
+/// column's `0666` row is `0` with no capability at all, and its refusal is
+/// `EACCES` - the bits' answer), the named form does not (both its rows are
+/// `EPERM` whatever the bits say), and a call that names nothing but
+/// `UTIME_OMIT` changes nothing and is asked nothing. One clock named and one
+/// omitted takes the named form's answer, so it is the pointer that decides
+/// rather than the values.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TimesShape {
+    /// A null pointer: both clocks to now - Linux's `ATTR_TOUCH`.
+    BothToNow,
+    /// A pointer, and something to set - Linux's `ATTR_TIMES_SET`.
+    Setting,
+    /// A pointer naming `UTIME_OMIT` for both clocks: nothing to ask.
+    Nothing,
+}
+
+/// The permission half of the three timestamp handlers' shared tail, asked in
+/// whichever of its two shapes the call is: the caller's standing on the node.
+///
+/// The node's own flags are [`crate::vfs::may_modify`]'s question, asked beside
+/// this one rather than inside it - an immutable inode refuses the clocks with
+/// `EPERM` whatever the caller's standing is, which is the answer `chattr(1)`
+/// shows, and the one this kernel gave before either question existed.
+fn may_set_times(inode: &Arc<dyn Inode>, shape: TimesShape) -> Result<(), isize> {
+    let caller = crate::vfs::current_caller();
+    match shape {
+        TimesShape::Nothing => Ok(()),
+        TimesShape::BothToNow => crate::vfs::may_touch(caller, inode),
+        TimesShape::Setting => crate::vfs::may_setattr(caller, inode),
+    }
+    .map_err(err_of)
+}
+
+/// The tail all three timestamps handlers share: the node's flags, the
+/// caller's standing on it, and the store.
+///
+/// It really is one tail now - `utimensat`, `futimesat` and `utime` differ
+/// only in which struct they read the clocks out of and in which sentinels
+/// that struct can carry, so the two questions every one of them asks live here
+/// rather than in three copies that can drift apart.
+fn store_times(inode: &Arc<dyn Inode>, atime: u64, mtime: u64, shape: TimesShape) -> isize {
+    // The clocks are metadata, so an immutable inode refuses them.
+    if let Err(e) = crate::vfs::may_modify(inode) {
+        return err_of(e);
+    }
+    if let Err(e) = may_set_times(inode, shape) {
+        return e;
+    }
+    match inode.set_times(atime, mtime) {
+        Ok(()) => {
+            crate::vfs::inotify::emit(inode, crate::vfs::inotify::IN_ATTRIB, "");
+            0
+        }
+        Err(e) => err_of(e),
+    }
+}
+
 /// One clock's new value from a `timespec`, resolving the sentinels: `keep` is
 /// what the node holds now (`UTIME_OMIT`), and a plain value is its seconds.
 /// A nanosecond field that is neither in range nor a sentinel is refused with
@@ -1268,6 +1350,11 @@ fn resolve_time(ts: &Utimespec, keep: u64, now: u64) -> Option<u64> {
 /// open on, exactly as the NULL form does). The flag beside a name that is
 /// really there is inert - the name answers it - and an empty name *without* the
 /// flag is the name's own refusal, which `base_for` gives.
+///
+/// Who may is *two* questions rather than one, and which applies is the shape
+/// of the request rather than the values in it ([`TimesShape`]): write
+/// permission buys the null-pointer form and not a pair of named times, and a
+/// pair of `UTIME_OMIT`s asks nothing at all.
 pub fn utimensat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     let (dirfd, path_ptr, times_ptr, flags) = (args[0] as i32, args[1], args[2], args[3]);
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
@@ -1309,38 +1396,38 @@ pub fn utimensat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     };
 
     // The two clocks. A null `times` means "now, both"; otherwise read the
-    // pair, refusing an unreadable pointer and an out-of-range nanosecond.
-    let (atime, mtime) = if times_ptr == 0 {
+    // pair, refusing an unreadable pointer and an out-of-range nanosecond. The
+    // *shape* of the request is read off the same words, because the permission
+    // question turns on it ([`TimesShape`]): the pointer is what separates
+    // "now" from "this value", and a pair of `UTIME_OMIT`s is neither.
+    let (atime, mtime, shape) = if times_ptr == 0 {
         let now = wall_now();
-        (now, now)
+        (now, now, TimesShape::BothToNow)
     } else {
         if !buffer_ok(times_ptr, 32, false, true) {
             return err::EFAULT;
         }
         let pair = unsafe { &*(times_ptr as *const [Utimespec; 2]) };
+        let nothing = pair[0].nsec == UTIME_OMIT && pair[1].nsec == UTIME_OMIT;
         let now = wall_now();
         match (
             resolve_time(&pair[0], inode.atime(), now),
             resolve_time(&pair[1], inode.mtime(), now),
         ) {
-            (Some(a), Some(m)) => (a, m),
+            (Some(a), Some(m)) => (
+                a,
+                m,
+                if nothing {
+                    TimesShape::Nothing
+                } else {
+                    TimesShape::Setting
+                },
+            ),
             _ => return err::EINVAL,
         }
     };
 
-    // The clocks are metadata, so an immutable inode refuses them - and it is
-    // asked here, at the one call all three of `utimensat`, `futimesat` and
-    // `utime` end at, rather than at each of them.
-    if let Err(e) = crate::vfs::may_modify(&inode) {
-        return err_of(e);
-    }
-    match inode.set_times(atime, mtime) {
-        Ok(()) => {
-            crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
-            0
-        }
-        Err(e) => err_of(e),
-    }
+    store_times(&inode, atime, mtime, shape)
 }
 
 /// `chdir(path)`.
@@ -4137,13 +4224,24 @@ pub fn handle_fsync(args: [usize; ARG_COUNT]) -> isize {
 
 /// The mode a `chmod` is allowed to store, or the errno that refuses it.
 ///
-/// Two rules, both Linux's. Only the owner of a node - or root - may change
-/// its mode: the bits are the owner's to set, and letting anyone rewrite them
-/// is letting anyone hand themselves the file. And an unprivileged caller
-/// changing a node whose group is not one of theirs loses the set-group-id
-/// bit, because that bit says "run me as this group" and a caller outside the
-/// group has no standing to grant it - which is exactly the hole a `chmod
-/// g+s` on somebody else's file would otherwise open.
+/// Two rules, both Linux's, and neither of them is "is the caller root". Only
+/// the owner of a node - or a caller holding `CAP_FOWNER` - may change its
+/// mode: the bits are the owner's to set, and letting anyone rewrite them is
+/// letting anyone hand themselves the file. And a caller changing a node whose
+/// group is not one of theirs loses the set-group-id bit, *owner or not*:
+/// that bit says "run me as this group", so a caller outside the group has no
+/// standing to grant it, and what stands in for the group is `CAP_FSETID`
+/// rather than an id - which is exactly the hole a `chmod g+s` on somebody
+/// else's file would otherwise open.
+///
+/// Both rules were measured on a current host
+/// (`.workbuddy/probe_capable_scope.sh own`, one capability dropped at a time
+/// from a root caller against fixtures that belong to uid 1000): with
+/// `CAP_FOWNER` gone the `chmod` of another user's file is `EPERM` and the
+/// `chmod` of the caller's own is served, and with `CAP_FSETID` gone
+/// `chmod 2755` on the caller's own file stores **`0755`** - the call succeeds
+/// and the group is dropped, because uid 0 is not a standing to grant a group
+/// the caller is not in.
 fn chmod_mode(inode: &Arc<dyn Inode>, mode: u32) -> Result<u32, isize> {
     // The inode's own flags first, and before the caller's identity: the bits
     // *are* the node's metadata, and `chattr +i` protects them whatever the
@@ -4154,13 +4252,12 @@ fn chmod_mode(inode: &Arc<dyn Inode>, mode: u32) -> Result<u32, isize> {
     if crate::vfs::is_immutable(inode) {
         return Err(err::EPERM);
     }
-    let me = crate::sched::current_owner();
-    let owner = inode.owner();
-    if me.0 != 0 && me.0 != owner.0 {
+    let caller = crate::vfs::current_caller();
+    if crate::vfs::may_setattr(caller, inode).is_err() {
         return Err(err::EPERM);
     }
     let mut mode = mode & 0o7777;
-    if me.0 != 0 && !crate::sched::current_groups().contains(&owner.1) {
+    if !crate::vfs::in_group_or_capable(caller, inode.owner().1) {
         mode &= !crate::vfs::S_ISGID;
     }
     Ok(mode)
@@ -4169,9 +4266,10 @@ fn chmod_mode(inode: &Arc<dyn Inode>, mode: u32) -> Result<u32, isize> {
 /// `chmod(2)` / `fchmod(2)` — set permission bits.
 ///
 /// Two rules decide who may, both Linux's, and they live in [`chmod_mode`]:
-/// the owner of the node (or root) is the only one who may rewrite its bits,
-/// and an unprivileged caller changing a node whose group is not one of
-/// theirs does not get to keep the set-group-id bit. The bits are *stored*,
+/// the owner of the node - or a caller holding `CAP_FOWNER` - is who may
+/// rewrite its bits, and a caller changing a node whose group is not one of
+/// theirs does not get to keep the set-group-id bit, `CAP_FSETID` being what
+/// stands in for the group. The bits are *stored*,
 /// not merely accepted: it is how a package install marks its setuid helpers
 /// and its scripts, and a kernel that forgets them hands back a tree where
 /// `doas` says "not installed setuid" and every service script fails
@@ -4227,19 +4325,30 @@ pub fn handle_fchmod(args: [usize; ARG_COUNT]) -> isize {
 ///
 /// Linux's rules, and the asymmetry is the point. Changing the **owner** needs
 /// privilege: the uid is the identity a file's permissions are measured
-/// against, so naming somebody else is handing them the file, and only root
-/// may. Changing the **group** needs less - the file's owner may do it, but
-/// only to a group they are themselves in, because the group is what a
-/// set-group-id file runs with and naming a group you are not in would be
-/// granting yourself its authority. Root may name any group.
+/// against, so naming somebody else is handing them the file, and what holds
+/// that privilege is `CAP_CHOWN` - *not* the uid `0` that used to stand in for
+/// it. Changing the **group** needs less - the file's owner may do it, but only
+/// to a group they are themselves in, because the group is what a set-group-id
+/// file runs with and naming a group you are not in would be granting yourself
+/// its authority; `CAP_CHOWN` may name any group.
+///
+/// The ids being *the ones the node already holds* is not a standing either,
+/// and that is the half the id-shaped rule got wrong. Measured
+/// (`.workbuddy/probe_capable_scope.sh own`): a caller that owns neither an
+/// unchanging call - `chown(2)` naming the owner the file already has, or
+/// `chgrp(2)` naming its existing group - is `EPERM`, because it is still
+/// naming an owner it has no standing over, while the file's own owner naming
+/// *itself* is served with every capability gone. Nothing named at all
+/// (`chown(path, -1, -1)`) asks nothing: neither attribute is set, so Linux
+/// runs neither arm of this rule and answers `0` even to a caller holding
+/// nothing.
 ///
 /// A `-1` means "leave this one alone", which is how a caller changes one id
 /// without having to know the other.
 fn chown_allowed(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> Result<(u32, u32), isize> {
     let current = inode.owner();
-    let me = crate::sched::current_owner();
-    let privileged = me.0 == 0;
-    let owner = me.0 == current.0;
+    let caller = crate::vfs::current_caller();
+    let mine = caller.uid == current.0;
 
     let uid = if uid_arg == -1 {
         current.0
@@ -4252,10 +4361,17 @@ fn chown_allowed(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> Result<(
         gid_arg as u32
     };
 
-    if !privileged && uid != current.0 {
+    // The uid arm: the node's own owner naming the id it already has, or
+    // `CAP_CHOWN`. A caller that is not the owner is refused even when the id
+    // it names is the one already there.
+    if uid_arg != -1 && !(caller.overrides.chown || (mine && uid == current.0)) {
         return Err(err::EPERM);
     }
-    if !privileged && gid != current.1 && (!owner || !crate::sched::current_groups().contains(&gid))
+    // The gid arm: the same owner, naming one of their own groups or the group
+    // the node already has, or `CAP_CHOWN`.
+    if gid_arg != -1
+        && !(caller.overrides.chown
+            || (mine && (gid == current.1 || crate::sched::current_groups().contains(&gid))))
     {
         return Err(err::EPERM);
     }
@@ -4269,6 +4385,29 @@ fn chown_allowed(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> Result<(
 /// Those two bits are the authority the file runs with. A caller who could
 /// rewrite who a file belongs to *and* keep them would be choosing its own
 /// privileges, which is the whole of what the rule prevents.
+///
+/// It is not, however, a rule about the *caller*, which is what this kernel
+/// wrote down (`uid != 0`). Measured whole on a current host
+/// (`.workbuddy/probe_chown_bits.c`, a root caller with one capability dropped
+/// at a time against fixtures carrying both bits):
+///
+/// ```text
+///                                            whole set  -FSETID  -CHOWN  -FOWNER
+/// chown(0,-1)  6755 own group (no change)      0755      0755     0755    0755
+/// chown(-1,0)  6755 own group (no change)      0755      0755     0755    0755
+/// chown(-1,-1) 6755 (nothing named at all)     0755      0755     0755    0755
+/// chown(0,-1)  6644 (sgid, no group-x)         2644      2644     2644    2644
+/// chown(0,-1)  4644 (suid, no exec)            0644      0644     0644    0644
+/// chown(0,-1)  6755 directory                  6755      6755     6755    6755
+/// ```
+///
+/// Four things, none of them a capability's. Naming an id is not required -
+/// `chown(-1,-1)` takes the bits away too - and neither is *changing* one, so
+/// the test is not "did the owner move". The set-uid bit goes whatever else is
+/// true, even on a file with no execute bit at all. The set-group-id bit goes
+/// only where the group may execute, because without it the bit is a locking
+/// mark rather than an authority. And a directory keeps both, since neither
+/// means an authority there.
 fn chown_apply(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> isize {
     // The same refusal as `chmod`, and for the same reason: the owner is
     // metadata, and an immutable inode's metadata is what the flag protects.
@@ -4277,18 +4416,27 @@ fn chown_apply(inode: &Arc<dyn Inode>, uid_arg: i32, gid_arg: i32) -> isize {
     if crate::vfs::is_immutable(inode) {
         return err::EPERM;
     }
-    let before = inode.owner();
     let (uid, gid) = match chown_allowed(inode, uid_arg, gid_arg) {
         Ok(ids) => ids,
         Err(e) => return e,
     };
     inode.set_owner(uid, gid);
     crate::vfs::inotify::emit(inode, crate::vfs::inotify::IN_ATTRIB, "");
-    if crate::sched::current_owner().0 != 0
-        && (uid != before.0 || gid != before.1)
-        && inode.keeps_modes()
-    {
-        inode.set_mode(inode.mode() & !(crate::vfs::S_ISUID | crate::vfs::S_ISGID));
+    // What the chown takes away - see the function's table. Nothing here asks
+    // the caller's ids or its capabilities, because the measurement says no
+    // caller's does: the two bits go for root holding the whole set as they do
+    // for anybody else, and for a call that named nothing as for one that moved
+    // an id. The one thing that spares the set-group-id bit is the absence of
+    // group execute, and the one thing that spares both is being a directory.
+    if inode.keeps_modes() && inode.metadata().kind != crate::vfs::NodeKind::Dir {
+        let mode = inode.mode();
+        let mut next = mode & !crate::vfs::S_ISUID;
+        if mode & crate::vfs::S_IXGRP != 0 {
+            next &= !crate::vfs::S_ISGID;
+        }
+        if next != mode {
+            inode.set_mode(next);
+        }
     }
     0
 }
@@ -5858,10 +6006,13 @@ pub fn handle_futimesat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, from_use
     };
     // `futimesat` carries `struct timeval times[2]`; the microseconds are
     // validated but dropped, since an inode clock is whole seconds. A null
-    // `tvp` means "now, both".
-    let (atime, mtime) = if tvp == 0 {
+    // `tvp` means "now, both" - and it is also the `ATTR_TOUCH` shape of the
+    // permission question, where a non-null pair names times and is
+    // `ATTR_TIMES_SET` ([`TimesShape`], and `utimes`' specs have no sentinel to
+    // name nothing with).
+    let (atime, mtime, shape) = if tvp == 0 {
         let now = wall_now();
-        (now, now)
+        (now, now, TimesShape::BothToNow)
     } else {
         if !buffer_ok(tvp, 32, false, from_user) {
             return err::EFAULT;
@@ -5878,21 +6029,10 @@ pub fn handle_futimesat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, from_use
         (
             unsafe { (tvp as *const i64).read_unaligned() } as u64,
             unsafe { ((tvp + 16) as *const i64).read_unaligned() } as u64,
+            TimesShape::Setting,
         )
     };
-    // The clocks are metadata, so an immutable inode refuses them - and it is
-    // asked here, at the one call all three of `utimensat`, `futimesat` and
-    // `utime` end at, rather than at each of them.
-    if let Err(e) = crate::vfs::may_modify(&inode) {
-        return err_of(e);
-    }
-    match inode.set_times(atime, mtime) {
-        Ok(()) => {
-            crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
-            0
-        }
-        Err(e) => err_of(e),
-    }
+    store_times(&inode, atime, mtime, shape)
 }
 
 /// `creat(path, mode)` — open, spelled the way the 1970s spelled it:
@@ -5914,8 +6054,9 @@ pub fn handle_creat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 
 /// `utime(path, times)` — the seconds-only spelling of the timestamps
 /// call. NULL `times` means now; the `utimbuf` the pointer names is two
-/// `time_t`s, access time then modification time. Timestamps are not
-/// kept, so both spellings land on the resolution's answer.
+/// `time_t`s, access time then modification time. Both spellings land on
+/// [`store_times`], which is where the clocks are kept and where the two
+/// questions a timestamps call asks live.
 pub fn handle_utime(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, from_user: bool) -> isize {
     let (path_ptr, times) = (args[0], args[1]);
     if times != 0 && !buffer_ok(times, 16, false, from_user) {
@@ -5930,29 +6071,21 @@ pub fn handle_utime(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>, from_user: b
         Err(e) => return err_of(e),
     };
     // `struct utimbuf { time_t actime; time_t modtime; }`; a null pointer sets
-    // both clocks to now, exactly as `utime(path, NULL)` says.
-    let (atime, mtime) = if times == 0 {
+    // both clocks to now, exactly as `utime(path, NULL)` says - and it is the
+    // two shapes of the permission question: "now" is `ATTR_TOUCH` and a pair
+    // of values is `ATTR_TIMES_SET` ([`TimesShape`]). A `time_t` has no room
+    // for `UTIME_OMIT`, so this spelling can never name nothing.
+    let (atime, mtime, shape) = if times == 0 {
         let now = wall_now();
-        (now, now)
+        (now, now, TimesShape::BothToNow)
     } else {
         (
             unsafe { (times as *const i64).read_unaligned() } as u64,
             unsafe { ((times + 8) as *const i64).read_unaligned() } as u64,
+            TimesShape::Setting,
         )
     };
-    // The clocks are metadata, so an immutable inode refuses them - and it is
-    // asked here, at the one call all three of `utimensat`, `futimesat` and
-    // `utime` end at, rather than at each of them.
-    if let Err(e) = crate::vfs::may_modify(&inode) {
-        return err_of(e);
-    }
-    match inode.set_times(atime, mtime) {
-        Ok(()) => {
-            crate::vfs::inotify::emit(&inode, crate::vfs::inotify::IN_ATTRIB, "");
-            0
-        }
-        Err(e) => err_of(e),
-    }
+    store_times(&inode, atime, mtime, shape)
 }
 
 // ---------------------------------------------------------------------------

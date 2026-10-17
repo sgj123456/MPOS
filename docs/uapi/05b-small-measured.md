@@ -537,12 +537,34 @@ Section numbers are unchanged from the original `UAPI.md`.
     root and the compound `R_OK|W_OK|X_OK` refused where `R_OK|W_OK` is granted;
     `CAP_DAC_READ_SEARCH` grants a read on its own and everything on a directory but a write; and a
     caller whose credentials are *not* in the file's namespace - uid 0 mapped to the outside root,
-    the probe's fourth block - is refused by both. **What is named rather than landed** is the rest
-    of the family, which is the same shape with its own capabilities: the *owner-shaped* calls
-    (`chmod`, `chown`, the `utimes` family) still ask "is the caller root or the owner" where Linux
-    asks `inode_owner_or_capable` = `fsuid == owner || capable_wrt_inode_uidgid(CAP_FOWNER)`, and
-    `chmod`'s set-group-id rule asks `capable_wrt_inode_uidgid(CAP_FSETID)` beside the caller's
-    groups where this kernel asks `uid 0`; both are measured the same way and are their own pass,
-    since each adds a capability and (for the setgid bit) a group test. Owner:
-    `src/vfs/mod.rs`'s `Caller`/`Overrides`/`may_as`. Pin: `t-caps`'s DAC table, `t-faccessat`'s
-    `access(2)` rows and a host unit test.
+    the probe's fourth block - is refused by both. **The rest of the family landed 2026-10-18**
+    (`docs/uapi/` §5.1 item 40) - the *owner-shaped* calls asked "is the caller root or the owner"
+    where Linux asks `inode_owner_or_capable` = `fsuid == owner || capable_wrt_inode_uidgid(
+    CAP_FOWNER)`, and `chmod`'s set-group-id rule asked `uid 0` where Linux asks
+    `in_group_or_capable(.., CAP_FSETID)`. Both are measured the same way and were their own pass,
+    which is what this entry said; it is done now, together with `CAP_CHOWN` (which `chown`'s two
+    arms ask) and the discovery that the timestamps call is *two* questions rather than one
+    (`ATTR_TOUCH` accepts write permission, `ATTR_TIMES_SET` does not). **What stays named** is the
+    same capability's third door, below.
+
+- **A write to a set-uid file leaves the bit, and `CAP_FSETID` is what would have taken it.**
+  **Named 2026-10-18** (`docs/uapi/` §5.1 item 40's measurement; not landed). Linux's
+  `file_remove_privs` runs the same two bits off a **write** and a **truncate** as it does off a
+  `chown`, which is the whole reason a set-uid program cannot be handed to somebody by editing it
+  in place - and it is `CAP_FSETID` that spares them, so this is the same capability's third door.
+  Measured on a current host (`.workbuddy/probe_suid_write.c`, Linux 7.2.9, a root caller writing
+  one byte to fixtures carrying the bits): with the whole set held a write to `04755` leaves
+  `04755` and one to `02755` leaves `02755`, and with `CAP_FSETID` dropped alone both come back
+  storing **`0755`** - the set-uid bit **and** the set-group-id bit, including the set-group-id of
+  a file in a group the caller is *not* in, which is where this door differs from `chmod`'s (there,
+  being in the group spares the bit; here only the capability does). A `truncate` to zero does the
+  same thing, because it is the same helper. The one shape the rule leaves alone is the
+  set-group-id with no group execute - `02644` stays `02644` - the same locking-mark clause a
+  `chown` honours and a `chmod` does not. This kernel's write path touches neither bit, so a caller
+  that dropped the capability keeps an authority Linux would have taken away. Owner: the write and
+  `truncate` paths (`src/vfs/file.rs`'s `File::write` and the truncate doors in
+  `src/syscall/linux/fs/file.rs`), which would ask `Caller::overrides.fsetid` and clear `S_ISUID`,
+  plus `S_ISGID` where `S_IXGRP` is set. Pin: none yet - a `t-caps` row writing to a `04755`
+  fixture with `CAP_FSETID` dropped is the shape a pin would take, and it needs the same "the whole
+  set puts the fixture back" discipline item 40's table uses, since the row that measures it
+  destroys the bit.

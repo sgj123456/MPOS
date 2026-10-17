@@ -59,6 +59,12 @@ pub const CAP_FULL: u64 = if CAP_LAST_CAP == 63 {
 
 /// The number of the capability `ptrace_may_access` tests for.
 pub const CAP_SYS_PTRACE: u32 = 19;
+/// `CAP_CHOWN`, which a `chown` that names **another** owner asks - and which
+/// is a *different* bit from the uid `0` that used to stand for it: measured on
+/// a current host (`.workbuddy/probe_capable_scope.sh own`), a root caller that
+/// dropped this one bit is refused `chown` to a uid while one that dropped
+/// `CAP_FOWNER` instead is served.
+pub const CAP_CHOWN: u32 = 0;
 /// `CAP_DAC_OVERRIDE`, which the permission checks offer the triads they
 /// refuse - and which grants a **read or write on a non-directory whatever the
 /// bits are**, the clause that once required some triad to carry one having
@@ -71,6 +77,12 @@ pub const CAP_DAC_READ_SEARCH: u32 = 2;
 /// (`capable_wrt_inode_uidgid(dir, CAP_FOWNER)`) and the owner-shaped calls -
 /// `chmod`, `chown`, `utimes` on a node the caller does not own - ask.
 pub const CAP_FOWNER: u32 = 3;
+/// `CAP_FSETID`, which decides what a `chmod` does with the
+/// **set-group-id** bit: a caller outside the node's group loses it, and an
+/// owner's uid saves nothing - the same probe drops this one bit from a root
+/// caller and `chmod 2755` comes back storing `0755`. `setattr_should_drop_suidgid`
+/// asks the same clause on the write path.
+pub const CAP_FSETID: u32 = 4;
 /// `CAP_SETGID`, which an unprivileged `/proc/<pid>/gid_map` writer lacks - the
 /// capability that lifts the one-line rule there.
 pub const CAP_SETGID: u32 = 6;

@@ -22,6 +22,17 @@
 //! exists at all. X_OK on `0600` is therefore `EACCES` even for the superuser,
 //! which is the fine print this kernel used to drop.
 //!
+//! And the *owner-shaped* family gets the same two-sided treatment, because it
+//! is the same question asked of a different noun: `chmod`, `chown` and the
+//! timestamps all turn on whether the caller owns the node, so a stranger's
+//! rows are made here after the same drop. Two things those rows pin that a
+//! single case could not: the timestamps call asks **two** questions - write
+//! permission buys the "both clocks to now" form and not an explicit pair, so
+//! one file is refused `EACCES` and the other `EPERM` - and a `chown` naming
+//! the ids a node *already holds* is still a `chown` rather than a no-op a
+//! stranger may make. Both were measured on a current host
+//! (`.workbuddy/probe_capable_scope.sh own`, the owner-shaped table).
+//!
 //! # The two calls this program does not make through `rustix`
 //!
 //! `faccessat2` is driven through `libc::syscall` with `libc::SYS_faccessat2`.
@@ -59,10 +70,11 @@
 
 use mpos_user_tests::Report;
 use rustix::fs::{
-    Access, AtFlags, CWD, Mode, OFlags, access, accessat, chmod, fchmod, openat, unlinkat,
+    Access, AtFlags, CWD, Mode, OFlags, Timespec, Timestamps, access, accessat, chmod, chown,
+    fchmod, openat, unlinkat, utimensat,
 };
 use rustix::io::Errno;
-use rustix::process::Uid;
+use rustix::process::{Gid, Uid};
 use rustix::thread::set_thread_uid;
 use std::ffi::{CStr, CString};
 use std::io;
@@ -71,10 +83,57 @@ use std::io;
 /// on: `0600` while the override is being asked, `0000` afterwards.
 const FILE: &str = "/tmp/t-faccessat.f";
 
+/// The two files the *owner-shaped* claims below turn on, both root's: one
+/// nobody but its owner may write, and one anybody may. Together they separate
+/// the two questions Linux's timestamps call asks - write permission buys the
+/// "both clocks to now" form and not the explicit pair - which is why the pair
+/// has to be two files rather than one.
+const PRIVATE: &str = "/tmp/t-faccessat.p";
+const WRITABLE: &str = "/tmp/t-faccessat.w";
+
+/// The file the stranger *does* own, written after the drop so its owner is
+/// the id the claim is about.
+const MINE: &str = "/tmp/t-faccessat.mine";
+
 /// The id this program drops to for the questions the override does not reach.
 /// Any non-zero uid answers the same way here - the file stays root-owned, so
 /// the caller is `other` either way.
 const OTHER: u32 = 1000;
+
+/// `utimensat(2)` with a **null** `times` pointer: the "both clocks to now"
+/// shape, which Linux spells `ATTR_TOUCH` and answers with write permission as
+/// well as ownership.
+///
+/// `rustix::fs::utimensat` takes a `&Timestamps` and therefore cannot send a
+/// null pointer at all, so the shape this program's claim turns on is one the
+/// safe wrapper cannot express - the `libc` rule's clause (c)
+/// (`user/tests/Cargo.toml`). The explicit pair beside it goes through `rustix`
+/// as everything else here does.
+fn utimensat_now(path: &CStr) -> Result<(), Errno> {
+    // SAFETY: `path` is a live NUL-terminated C string, and a null `times` is
+    // the shape being asked about rather than a pointer to dereference.
+    let r = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), std::ptr::null(), 0) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(Errno::from_raw_os_error(
+            io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ))
+    }
+}
+
+/// A pair of times this test does not vary: the claims about it are about
+/// whether the *pair* may be named at all, not about the values.
+fn epoch() -> Timestamps {
+    let t = Timespec {
+        tv_sec: 1_600_000_000,
+        tv_nsec: 0,
+    };
+    Timestamps {
+        last_access: t,
+        last_modification: t,
+    }
+}
 
 /// `faccessat2(dirfd, path, mode, flags)`, with the dirfd and the flag word this
 /// program does not vary: every call below is `AT_FDCWD` and no flags, and the
@@ -182,6 +241,24 @@ fn main() {
         faccessat2(&cpath, libc::R_OK | libc::W_OK | libc::X_OK) == Err(Errno::ACCESS),
     );
 
+    // The two fixtures the owner-shaped claims below need, made while this
+    // process is still root: the drop that follows is one-way (`set_thread_uid`
+    // moves the effective id and nothing here moves it back), so every owner
+    // and mode those claims turn on has to be in place first. The modes are set
+    // explicitly rather than left to `open`'s word, because the suite's umask is
+    // not this test's.
+    for path in [PRIVATE, WRITABLE] {
+        let _ = std::fs::remove_file(path);
+    }
+    let mut made = true;
+    for (path, mode) in [(PRIVATE, 0o600), (WRITABLE, 0o666)] {
+        match openat(CWD, path, OFlags::CREATE | OFlags::RDWR, Mode::from(mode)) {
+            Ok(fd) => made &= fchmod(&fd, Mode::from(mode)).is_ok(),
+            Err(_) => made = false,
+        }
+    }
+    r.check("root's 0600 and 0666 fixtures are made", made);
+
     // The other side of the same file: a caller the override does not cover.
     // Dropping below also proves the refusal is about the ids and not the node
     // - the very calls that answered 0 above now answer EACCES.
@@ -205,11 +282,72 @@ fn main() {
         access(FILE, Access::EXISTS) == Ok(()),
     );
 
+    // The owner-shaped family, on the same side of the drop: `chmod`, `chown`
+    // and the timestamps all ask whether the caller owns the node, and the
+    // answer is not always the shape the triads give. Measured on a current
+    // host (`.workbuddy/probe_capable_scope.sh own`):
+    //
+    // ```text
+    //                                       another's 0600  another's 0666
+    // utimensat(NULL), both clocks to now        EACCES             0
+    // utimensat(explicit times)                  EPERM           EPERM
+    // chown/chgrp naming the ids it already has  EPERM
+    // ```
+    //
+    // So the *refusal* itself differs between the two timestamps forms -
+    // `EACCES` for the one write permission buys, `EPERM` for the one it does
+    // not - and naming the ids a node already holds is a `chown` like any other
+    // rather than a no-op a stranger may make.
+    r.check(
+        "chmod on root's 0600 file is EPERM for a stranger",
+        chmod(PRIVATE, Mode::from(0o644)) == Err(Errno::PERM),
+    );
+    r.check(
+        "chown naming the uid the file already has is EPERM for a stranger",
+        chown(PRIVATE, Some(Uid::from_raw(0)), None) == Err(Errno::PERM),
+    );
+    r.check(
+        "chgrp naming the gid the file already has is EPERM too",
+        chown(PRIVATE, None, Some(Gid::from_raw(0))) == Err(Errno::PERM),
+    );
+    let cprivate = CString::new(PRIVATE).expect("the path has no interior NUL");
+    let cwritable = CString::new(WRITABLE).expect("the path has no interior NUL");
+    r.check(
+        "utimensat(NULL) on root's 0600 file is EACCES for a stranger",
+        utimensat_now(&cprivate) == Err(Errno::ACCESS),
+    );
+    r.check(
+        "utimensat(NULL) on a world-writable file is served - write permission",
+        utimensat_now(&cwritable) == Ok(()),
+    );
+    r.check(
+        "utimensat(explicit times) on that same writable file is EPERM",
+        utimensat(CWD, WRITABLE, &epoch(), AtFlags::empty()) == Err(Errno::PERM),
+    );
+    r.check(
+        "and explicit times on the 0600 file are EPERM rather than EACCES",
+        utimensat(CWD, PRIVATE, &epoch(), AtFlags::empty()) == Err(Errno::PERM),
+    );
+    // The control for the id arm, on a file this caller *does* own - written
+    // after the drop, so it is uid 1000's own, and naming its own uid is the
+    // one `chown` an owner may make without a capability.
+    let _ = std::fs::remove_file(MINE);
+    let mine_made = openat(CWD, MINE, OFlags::CREATE | OFlags::RDWR, Mode::from(0o600)).is_ok();
+    r.check("a file of this stranger's own is made", mine_made);
+    r.check(
+        "chown naming the owner's own uid is served",
+        chown(MINE, Some(Uid::from_raw(OTHER)), None) == Ok(()),
+    );
+
     // Best effort, and expected to fail: the file is root's and the caller is
     // not, so the unlink is refused. The claim above is the last one that needs
     // the file, so the residue costs the run nothing - and both sweeps build
     // their `/tmp` from scratch (a tmpfs the runner mounts), so the next run
-    // starts with an empty one either way.
+    // starts with an empty one either way. The stranger's own file *is*
+    // removable, which is the same rule read from the other side.
     let _ = unlinkat(CWD, FILE, AtFlags::empty());
+    let _ = unlinkat(CWD, PRIVATE, AtFlags::empty());
+    let _ = unlinkat(CWD, WRITABLE, AtFlags::empty());
+    let _ = unlinkat(CWD, MINE, AtFlags::empty());
     r.finish()
 }

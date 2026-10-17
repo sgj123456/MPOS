@@ -374,8 +374,18 @@ scopes the one word cannot express stay named in §5.2 with their measurements: 
 is now Linux's two capabilities (`CAP_DAC_OVERRIDE` for a read and a write on a non-directory
 whatever its bits are, `CAP_DAC_READ_SEARCH` for a read on its own, execute only where some execute
 bit exists) asked of the file's namespace through `Credentials::capable`, which is where the two
-passes meet; the *owner-shaped* calls (`chmod`, `chown`, `utimes` — `CAP_FOWNER`, and
-`CAP_FSETID` for the set-group-id bit) are the same shape and stay named for their own pass.
+passes meet. **And the *owner-shaped* calls landed on 2026-10-18** (`docs/uapi/` §5.1 item 40):
+`chmod`, `chown` and the `utimes` family ask `inode_owner_or_capable` — the node's own uid, or
+`CAP_FOWNER` — rather than "is the caller root"; `CAP_CHOWN` is what a `chown` naming *another*
+owner asks, and naming the ids the node already holds is still a `chown` rather than a no-op;
+`CAP_FSETID`, not the uid `0`, is what stands in for being in a file's group when a `chmod` would
+keep the set-group-id bit; and the timestamps call turned out to be **two** questions, since write
+permission buys the "both clocks to now" form (`EACCES` when it is refused) and nothing buys an
+explicit pair (`EPERM`). The same pass measured what a `chown` does to the two set-id bits and
+found this kernel's rule wrong in the other direction: they go for **every** caller, capability or
+not — even a `chown` that names nothing at all, and even root holding the whole set — with two
+exceptions, a set-group-id that carries no group execute (a locking mark, not an authority) and a
+directory. One door of `CAP_FSETID` stays named in §5.2: a **write** to a set-uid file.
 
 **A child's death is one `SIGCHLD` record, and it is Linux's** (`docs/uapi/` §5.1 item 29, landed
 2026-10-17): the second book this kernel kept for "an exit whose signal is unread" is deleted — the

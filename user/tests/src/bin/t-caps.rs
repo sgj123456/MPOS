@@ -112,6 +112,66 @@ fn bit_of(cap: u32) -> u32 {
     1u32 << (cap % 32)
 }
 
+/// The errno `chmod(2)` answers, or `0` - the owner-shaped table's rows are the
+/// same shape of claim as the DAC rows, so they read the number too.
+fn chmod_errno(path: &str, mode: libc::mode_t) -> i32 {
+    match std::ffi::CString::new(path) {
+        Ok(p) => {
+            if unsafe { libc::chmod(p.as_ptr(), mode) } == 0 {
+                0
+            } else {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            }
+        }
+        Err(_) => libc::EINVAL,
+    }
+}
+
+/// The errno `chown(2)` answers, or `0`. `u32::MAX` is the family's "leave this
+/// one alone", which is how a row asks about one id at a time.
+fn chown_errno(path: &str, uid: libc::uid_t, gid: libc::gid_t) -> i32 {
+    match std::ffi::CString::new(path) {
+        Ok(p) => {
+            if unsafe { libc::chown(p.as_ptr(), uid, gid) } == 0 {
+                0
+            } else {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            }
+        }
+        Err(_) => libc::EINVAL,
+    }
+}
+
+/// The errno `utimensat(2)` answers, or `0`. A null `times` is the "both clocks
+/// to now" form - the one Linux spells `ATTR_TOUCH` and the one write
+/// permission buys - and an explicit pair is the form it does not.
+fn utimensat_errno(path: &str, times: Option<&[libc::timespec; 2]>) -> i32 {
+    let ptr = match times {
+        Some(t) => t.as_ptr(),
+        None => std::ptr::null(),
+    };
+    match std::ffi::CString::new(path) {
+        Ok(p) => {
+            if unsafe { libc::utimensat(libc::AT_FDCWD, p.as_ptr(), ptr, 0) } == 0 {
+                0
+            } else {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            }
+        }
+        Err(_) => libc::EINVAL,
+    }
+}
+
+/// The permission bits a node carries *now* - what a row about a `chmod` that
+/// was allowed to succeed has to read back, since the call's own return says
+/// nothing about which bits survived.
+fn mode_of(path: &str) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .map(|m| m.mode() & 0o7777)
+        .unwrap_or(0)
+}
+
 /// `klogctl(type, buf, len)` - `syslog(2)`'s raw door, the same one
 /// `t-syslog` drives.
 fn klogctl(kind: i32) -> isize {
@@ -549,6 +609,315 @@ fn main() {
         let _ = std::fs::remove_file(path);
     }
 
+    // ---- the owner-shaped calls ask a capability, not the uid ----
+    //
+    // The same shape of question one noun over: `chmod`, `chown` and the
+    // timestamps all turn on `inode_owner_or_capable` - the node's own uid, or
+    // `CAP_FOWNER` - with `in_group_or_capable(CAP_FSETID)` deciding the
+    // set-group-id bit and `CAP_CHOWN` an owner change. Measured on a current
+    // host (`.workbuddy/probe_capable_scope.sh own`, one capability dropped at
+    // a time from a root caller, against fixtures belonging to uid 1000): with
+    // `CAP_FOWNER` gone, another user's file is refused a `chmod` while the
+    // caller's own is served; with `CAP_FSETID` gone, `chmod 2755` on the
+    // caller's own file stores `0755`; with `CAP_CHOWN` gone, a `chown` naming
+    // a **uid** is refused while one naming the caller's own is served; and an
+    // explicit pair of times is refused where the "now" form goes through the
+    // DAC override.
+    //
+    // Every row keeps the caller's uid at `0` and moves only the effective
+    // set, which is what makes each of these a capability question: the
+    // id-shaped rule they replace answered `0` to all four.
+    let other = "/tmp/t-caps-other";
+    let mine = "/tmp/t-caps-mine";
+    let minegid = "/tmp/t-caps-minegid";
+    // The timestamps rows need a fixture of their own, and not the one the
+    // `chown` rows use: a `chown` naming a uid is *served* to a caller holding
+    // `CAP_CHOWN` even with `CAP_FOWNER` gone, so the moment a row has made it
+    // the file is this caller's and the ownership question is no longer being
+    // asked. Separate files are how the host probe keeps the two apart too
+    // (`.workbuddy/probe_capable_scope.c`, whose `times_matrix` reads
+    // `other0600`/`other0666` while its chown rows read `other`).
+    let timesfile = "/tmp/t-caps-times";
+    // The four fixtures the set-id rows below turn on, each in a group this
+    // caller is not in: a file carrying both bits, a file whose set-group-id
+    // carries no group execute (a locking mark rather than an authority), a
+    // file whose set-uid carries no execute at all, and a directory, where
+    // neither bit means an authority. What a `chown` takes away is *not* a
+    // capability's question, so these four shapes are how the clauses are told
+    // apart (`.workbuddy/probe_chown_bits.c`).
+    let bits = "/tmp/t-caps-bits";
+    let bitsmark = "/tmp/t-caps-bitsmark";
+    let bitssuid = "/tmp/t-caps-bitssuid";
+    let bitsdir = "/tmp/t-caps-bitsdir";
+    for path in [other, mine, minegid, timesfile, bits, bitsmark, bitssuid] {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir_all(bitsdir);
+    let made = std::fs::File::create(other).is_ok()
+        && std::fs::File::create(mine).is_ok()
+        && std::fs::File::create(minegid).is_ok()
+        && std::fs::File::create(timesfile).is_ok()
+        && std::fs::File::create(bits).is_ok()
+        && std::fs::File::create(bitsmark).is_ok()
+        && std::fs::File::create(bitssuid).is_ok()
+        && std::fs::create_dir_all(bitsdir).is_ok();
+    // The owner is set first and the mode after, because a `chown` clears the
+    // set-id bits - and `minegid` exists to have one to lose. `minegid` is this
+    // caller's own file in a group it is *not* in, which is the only shape the
+    // set-group-id row can turn on.
+    let owned = made
+        && std::fs::set_permissions(other, std::fs::Permissions::from_mode(0o644)).is_ok()
+        && std::fs::set_permissions(mine, std::fs::Permissions::from_mode(0o644)).is_ok()
+        && std::fs::set_permissions(minegid, std::fs::Permissions::from_mode(0o644)).is_ok()
+        && chown_errno(other, 1000, 1000) == 0
+        && chown_errno(timesfile, 1000, 1000) == 0
+        && chown_errno(minegid, 0, 3000) == 0
+        && chown_errno(bits, 0, 3000) == 0
+        && chown_errno(bitsmark, 0, 3000) == 0
+        && chown_errno(bitssuid, 0, 3000) == 0
+        && chown_errno(bitsdir, 0, 3000) == 0
+        && std::fs::set_permissions(bits, std::fs::Permissions::from_mode(0o6755)).is_ok()
+        && std::fs::set_permissions(bitsmark, std::fs::Permissions::from_mode(0o6644)).is_ok()
+        && std::fs::set_permissions(bitssuid, std::fs::Permissions::from_mode(0o4644)).is_ok()
+        && std::fs::set_permissions(bitsdir, std::fs::Permissions::from_mode(0o6755)).is_ok();
+    r.check("another user's file, and two of this caller's", owned);
+
+    // What a row leaves behind, put back while the whole set is held: the rows
+    // that are *served* change the fixtures, and a row measured against the
+    // last one's residue would be measuring the wrong file.
+    let restore = || {
+        let _ = std::fs::set_permissions(other, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::set_permissions(mine, std::fs::Permissions::from_mode(0o644));
+        let _ = std::fs::set_permissions(minegid, std::fs::Permissions::from_mode(0o644));
+        let _ = chown_errno(other, 1000, 1000);
+        let _ = chown_errno(timesfile, 1000, 1000);
+        let _ = chown_errno(minegid, 0, 3000);
+        // The set-id fixtures: the owner before the mode, for the same reason
+        // they were made that way.
+        let _ = chown_errno(bits, 0, 3000);
+        let _ = chown_errno(bitsmark, 0, 3000);
+        let _ = chown_errno(bitssuid, 0, 3000);
+        let _ = chown_errno(bitsdir, 0, 3000);
+        let _ = std::fs::set_permissions(bits, std::fs::Permissions::from_mode(0o6755));
+        let _ = std::fs::set_permissions(bitsmark, std::fs::Permissions::from_mode(0o6644));
+        let _ = std::fs::set_permissions(bitssuid, std::fs::Permissions::from_mode(0o4644));
+        let _ = std::fs::set_permissions(bitsdir, std::fs::Permissions::from_mode(0o6755));
+    };
+    let explicit = [libc::timespec {
+        tv_sec: 1_000_000_000,
+        tv_nsec: 0,
+    }; 2];
+
+    struct OwnerAnswers {
+        foreign_chmod: i32,
+        own_chmod: i32,
+        setgid_call: i32,
+        setgid_stored: u32,
+        named_uid: i32,
+        own_uid: i32,
+        explicit_times: i32,
+        now_times: i32,
+        strip_file: u32,
+        strip_mark: u32,
+        strip_suid: u32,
+        strip_dir: u32,
+    }
+
+    // One row: the effective set with `clear` lowered, the calls the
+    // measurement makes, and the whole set put back.
+    let mut own_row = |r: &mut Report, label: &str, clear: &[u32], whole: &[CapRecord; 2]| {
+        let mut data = *whole;
+        for &cap in clear {
+            data[0].effective &= !bit_of(cap);
+        }
+        let lowered = capset(&mut header, &mut data) == 0;
+        r.check(&format!("{label}: the set is lowered"), lowered);
+        let foreign_chmod = chmod_errno(other, 0o600);
+        let own_chmod = chmod_errno(mine, 0o640);
+        let setgid_call = chmod_errno(minegid, 0o2755);
+        let setgid_stored = mode_of(minegid);
+        let named_uid = chown_errno(other, 0, u32::MAX);
+        let own_uid = chown_errno(mine, 0, u32::MAX);
+        // The two timestamps forms, on the fixture no `chown` row has touched.
+        let explicit_times = utimensat_errno(timesfile, Some(&explicit));
+        let now_times = utimensat_errno(timesfile, None);
+        // What a `chown` takes away. Naming nothing at all - `chown(path, -1,
+        // -1)` - is the purest form of the question: no id is named and none is
+        // moved, so whatever happens to the bits is the chown's own doing.
+        let strip_file = {
+            let _ = chown_errno(bits, u32::MAX, u32::MAX);
+            mode_of(bits)
+        };
+        let strip_mark = {
+            let _ = chown_errno(bitsmark, u32::MAX, u32::MAX);
+            mode_of(bitsmark)
+        };
+        let strip_suid = {
+            let _ = chown_errno(bitssuid, u32::MAX, u32::MAX);
+            mode_of(bitssuid)
+        };
+        let strip_dir = {
+            let _ = chown_errno(bitsdir, u32::MAX, u32::MAX);
+            mode_of(bitsdir)
+        };
+        let mut back = *whole;
+        capset(&mut header, &mut back);
+        restore();
+        OwnerAnswers {
+            foreign_chmod,
+            own_chmod,
+            setgid_call,
+            setgid_stored,
+            named_uid,
+            own_uid,
+            explicit_times,
+            now_times,
+            strip_file,
+            strip_mark,
+            strip_suid,
+            strip_dir,
+        }
+    };
+    let whole_set = own_row(&mut r, "the whole set", &[], &whole);
+    r.check(
+        &format!(
+            "whole set: another user's file is chmod'able (got {})",
+            whole_set.foreign_chmod
+        ),
+        whole_set.foreign_chmod == 0,
+    );
+    r.check(
+        &format!(
+            "whole set: 2755 on the caller's own file is stored (got {} / {:04o})",
+            whole_set.setgid_call, whole_set.setgid_stored
+        ),
+        whole_set.setgid_call == 0 && whole_set.setgid_stored == 0o2755,
+    );
+    r.check(
+        &format!(
+            "whole set: explicit times on another's file are served (got {})",
+            whole_set.explicit_times
+        ),
+        whole_set.explicit_times == 0,
+    );
+    // A `chown` naming nothing at all still takes the two set-id bits away: not
+    // one of the rows below is allowed to buy them back, and the four shapes
+    // are the clauses - both bits on a file, a set-group-id with no group
+    // execute (a locking mark, which stays), a set-uid with no execute at all
+    // (which goes anyway), and a directory (where both stay).
+    r.check(
+        &format!(
+            "whole set: a chown naming nothing takes both set-id bits (got {:04o})",
+            whole_set.strip_file
+        ),
+        whole_set.strip_file == 0o0755,
+    );
+    r.check(
+        &format!(
+            "whole set: it leaves a set-group-id that carries no group execute (got {:04o})",
+            whole_set.strip_mark
+        ),
+        whole_set.strip_mark == 0o2644,
+    );
+    r.check(
+        &format!(
+            "whole set: it takes the set-uid off a file with no execute at all (got {:04o})",
+            whole_set.strip_suid
+        ),
+        whole_set.strip_suid == 0o0644,
+    );
+    r.check(
+        &format!(
+            "whole set: and it leaves a directory's bits alone (got {:04o})",
+            whole_set.strip_dir
+        ),
+        whole_set.strip_dir == 0o6755,
+    );
+    let no_fowner = own_row(&mut r, "CAP_FOWNER dropped", &[3], &whole);
+    r.check(
+        &format!(
+            "FOWNER dropped: another user's file is refused the chmod (got {})",
+            no_fowner.foreign_chmod
+        ),
+        no_fowner.foreign_chmod == libc::EPERM,
+    );
+    r.check(
+        &format!(
+            "FOWNER dropped: the caller's own file is still served (got {})",
+            no_fowner.own_chmod
+        ),
+        no_fowner.own_chmod == 0,
+    );
+    r.check(
+        &format!(
+            "FOWNER dropped: an explicit pair of times is refused (got {})",
+            no_fowner.explicit_times
+        ),
+        no_fowner.explicit_times == libc::EPERM,
+    );
+    r.check(
+        &format!(
+            "FOWNER dropped: the now form still answers, the DAC override's (got {})",
+            no_fowner.now_times
+        ),
+        no_fowner.now_times == 0,
+    );
+    r.check(
+        &format!(
+            "FOWNER dropped: the chown still takes both set-id bits (got {:04o})",
+            no_fowner.strip_file
+        ),
+        no_fowner.strip_file == 0o0755,
+    );
+    let no_fsetid = own_row(&mut r, "CAP_FSETID dropped", &[4], &whole);
+    r.check(
+        &format!(
+            "FSETID dropped: 2755 comes back storing 0755 (got {} / {:04o})",
+            no_fsetid.setgid_call, no_fsetid.setgid_stored
+        ),
+        no_fsetid.setgid_call == 0 && no_fsetid.setgid_stored == 0o755,
+    );
+    r.check(
+        &format!(
+            "FSETID dropped: the chown still takes both set-id bits (got {:04o})",
+            no_fsetid.strip_file
+        ),
+        no_fsetid.strip_file == 0o0755,
+    );
+    r.check(
+        &format!(
+            "FSETID dropped: and still leaves the locking mark (got {:04o})",
+            no_fsetid.strip_mark
+        ),
+        no_fsetid.strip_mark == 0o2644,
+    );
+    let no_chown = own_row(&mut r, "CAP_CHOWN dropped", &[0], &whole);
+    r.check(
+        &format!(
+            "CHOWN dropped: a chown naming a uid is refused (got {})",
+            no_chown.named_uid
+        ),
+        no_chown.named_uid == libc::EPERM,
+    );
+    r.check(
+        &format!(
+            "CHOWN dropped: the owner's own uid is still served (got {})",
+            no_chown.own_uid
+        ),
+        no_chown.own_uid == 0,
+    );
+    r.check(
+        &format!(
+            "CHOWN dropped: the chown still takes both set-id bits (got {:04o})",
+            no_chown.strip_file
+        ),
+        no_chown.strip_file == 0o0755,
+    );
+
+    for path in [other, mine, minegid, timesfile, bits, bitsmark, bitssuid] {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir_all(bitsdir);
     for path in [zero, four, sixfour] {
         let _ = std::fs::remove_file(path);
     }

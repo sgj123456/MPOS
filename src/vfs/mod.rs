@@ -1234,6 +1234,13 @@ const S_ISVTX: u32 = 0o1000;
 /// is not in a file's group cannot grant the group's authority to it.
 pub const S_ISUID: u32 = 0o4000;
 pub const S_ISGID: u32 = 0o2000;
+/// The **group** triad's execute bit, which is what decides whether a node's
+/// set-group-id bit is an authority or a mark: set together, they say "run me
+/// as this group", and with this one absent the set-group-id bit is only
+/// mandatory locking, which no rule about authority has anything to take away.
+/// Measured - a `chown` on `06644` leaves `02644`, where one on `06755` leaves
+/// `00755` (`.workbuddy/probe_chown_bits.c`).
+pub const S_IXGRP: u32 = 0o010;
 
 // ---------------------------------------------------------------------------
 // The inode attribute flags: `lsattr`'s columns, and `FS_IOC_GETFLAGS`' word.
@@ -1523,6 +1530,8 @@ fn permitted(mode: u32, owner: (u32, u32), want: u32, me: (u32, u32), groups: &[
 /// made by another namespace's owner would need the scoped question §5.2 names.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Overrides {
+    /// `CAP_CHOWN` (0), which a `chown` naming another owner asks.
+    pub chown: bool,
     /// `CAP_DAC_OVERRIDE` (1).
     pub dac_override: bool,
     /// `CAP_DAC_READ_SEARCH` (2).
@@ -1530,31 +1539,40 @@ pub struct Overrides {
     /// `CAP_FOWNER` (3), which the sticky-bit rule and the owner-shaped calls
     /// ask.
     pub fowner: bool,
+    /// `CAP_FSETID` (4), which decides whether a `chmod` keeps the
+    /// set-group-id bit.
+    pub fsetid: bool,
 }
 
 impl Overrides {
     /// A caller holding none of them - what a filesystem that keeps no modes is
     /// not policed by, and what a user-space test asks about the triads with.
     pub const NONE: Overrides = Overrides {
+        chown: false,
         dac_override: false,
         dac_read_search: false,
         fowner: false,
+        fsetid: false,
     };
-    /// The machine's root's three: the state a fresh process starts in, where
-    /// no capability has been lowered.
+    /// The machine's root's whole set: the state a fresh process starts in,
+    /// where no capability has been lowered.
     pub const ALL: Overrides = Overrides {
+        chown: true,
         dac_override: true,
         dac_read_search: true,
         fowner: true,
+        fsetid: true,
     };
 
-    /// The three a credential holds in the **initial** user namespace, which is
+    /// The five a credential holds in the **initial** user namespace, which is
     /// the namespace every filesystem here belongs to.
     pub fn of(creds: &crate::cred::Credentials) -> Overrides {
         Overrides {
+            chown: creds.capable(crate::cred::CAP_CHOWN),
             dac_override: creds.capable(crate::cred::CAP_DAC_OVERRIDE),
             dac_read_search: creds.capable(crate::cred::CAP_DAC_READ_SEARCH),
             fowner: creds.capable(crate::cred::CAP_FOWNER),
+            fsetid: creds.capable(crate::cred::CAP_FSETID),
         }
     }
 }
@@ -1686,6 +1704,76 @@ pub fn may_as(caller: Caller, inode: &Arc<dyn Inode>, want: u32) -> VfsResult<()
     } else {
         Err(VfsError::Access)
     }
+}
+
+/// Whether `caller` may rewrite `node`'s **attributes**: its mode, its owner,
+/// or one clock of its timestamps.
+///
+/// Linux's `inode_owner_or_capable`, and the question is not "is the caller
+/// root". Measured whole on a current host (`.workbuddy/probe_capable_scope.sh
+/// own`, which drops one bit at a time from a root caller against fixtures that
+/// belong to uid 1000, so no row can pass on the id arm):
+///
+/// ```text
+///                                whole set  -FOWNER  -CHOWN  -FSETID  -everything
+/// chmod  0600 on another's file      0       EPERM   EPERM   EPERM     EPERM
+/// chmod  0640 on my own file         0        0       0       0         0
+/// chown to a uid (another's file)    0        0      EPERM    0        EPERM
+/// chgrp  to a group (my own file)    0        0      EPERM    0        EPERM
+/// utimensat, explicit times          0       EPERM    0       0        EPERM
+/// utimensat, both clocks to *now*    0        0       0       0        EACCES
+/// ```
+///
+/// Three things are read off it. The owner arm is the caller's **uid**, not a
+/// capability - a stranger that owns the node passes every row with the whole
+/// set gone. `CAP_FOWNER` stands in for that ownership, and *only* for it: a
+/// root caller that dropped the bit is refused another user's file while a
+/// caller that dropped `CAP_CHOWN` instead is refused the same owner change,
+/// so the two are separate capabilities rather than two names for privilege.
+/// And the refusal is `EPERM` - "the operation is refused for a reason the bits
+/// cannot express" - where the triads' own answer is `EACCES`.
+pub fn may_setattr(caller: Caller, inode: &Arc<dyn Inode>) -> VfsResult<()> {
+    if caller.uid == inode.owner().0 || caller.overrides.fowner {
+        Ok(())
+    } else {
+        Err(VfsError::NotPermitted)
+    }
+}
+
+/// Whether `caller` may set a node's timestamps to **now**: the same ownership
+/// question, with write permission standing in for it.
+///
+/// Linux splits the timestamps call in two, and this is the half that accepts
+/// the triads: `utimes_common`'s null-pointer form sets `ATTR_TOUCH`, and
+/// `setattr_prepare` answers it with `inode_owner_or_capable() ||
+/// inode_permission(MAY_WRITE)`. So a caller may touch a file it may write even
+/// when somebody else owns it - the everyday `touch` on a shared file - and the
+/// refusal, when it comes, is `EACCES` (the bits' answer) rather than
+/// `EPERM`. [`may_setattr`] is the other half, and the difference is visible in
+/// the table there: an explicit pair of times is refused for a caller that may
+/// write.
+///
+/// The write is asked through [`may_as`], so `CAP_DAC_OVERRIDE` reaches here as
+/// it does everywhere - measured, the `-FOWNER` row above answers `0` on a
+/// `0600` file for exactly that reason.
+pub fn may_touch(caller: Caller, inode: &Arc<dyn Inode>) -> VfsResult<()> {
+    if caller.uid == inode.owner().0 || caller.overrides.fowner {
+        return Ok(());
+    }
+    may_as(caller, inode, W_OK)
+}
+
+/// Whether `caller`'s groups cover `gid`, or `CAP_FSETID` stands in for them.
+///
+/// Linux's `in_group_or_capable`, which is what decides whether the
+/// **set-group-id** bit survives a `chmod`: the bit says "run me as this
+/// group", so a caller outside the group has no standing to keep it, and being
+/// the file's owner does not help - measured, a root caller with this one bit
+/// dropped stores `0755` where `chmod 2755` was asked for, and the same call
+/// with the bit held stores `2755`. The bit is *cleared from the mode*, not
+/// refused: the call succeeds and the group cannot be granted.
+pub fn in_group_or_capable(caller: Caller, gid: u32) -> bool {
+    caller.gid == gid || current_groups().contains(&gid) || caller.overrides.fsetid
 }
 
 /// The running task as the permission checks see it: its effective ids, and the
@@ -2326,5 +2414,92 @@ mod tests {
             Some(VfsError::Access),
             "and uid 0 with no overrides is a stranger to it too"
         );
+    }
+
+    /// The owner-shaped questions are a capability and the node's own uid, and
+    /// the two timestamps forms are two different questions.
+    ///
+    /// Measured on a current host with `.workbuddy/probe_capable_scope.sh own`
+    /// (root, each capability dropped in turn, against fixtures owned by uid
+    /// 1000): `CAP_FOWNER` - not the uid `0` - is what stands in for owning a
+    /// node, `CAP_FSETID` - not the uid `0` - is what stands in for being in
+    /// its group, an explicit pair of times is refused `EPERM` where write
+    /// permission buys nothing, and the `now` form is refused `EACCES` where
+    /// write permission does buy the call.
+    #[test]
+    fn the_owner_shaped_questions_are_a_capability_and_not_the_uid() {
+        let vfs = MountTable::new();
+        let fs = crate::vfs::ramfs::RamFs::new();
+        vfs.mount_root(fs.clone());
+        let root = vfs.resolve("/").unwrap();
+
+        let fowner = Caller {
+            uid: 0,
+            gid: 0,
+            overrides: Overrides {
+                fowner: true,
+                ..Overrides::NONE
+            },
+        };
+        let fsetid = Caller {
+            uid: 0,
+            gid: 0,
+            overrides: Overrides {
+                fsetid: true,
+                ..Overrides::NONE
+            },
+        };
+
+        let owned = root.create("o", NodeKind::File).unwrap();
+        owned.set_mode(0o600);
+        owned.set_owner(10, 10);
+        // The owner's arm is the uid, and it holds with the whole set gone.
+        assert_eq!(may_setattr(Caller::ids(10, 10), &owned).ok(), Some(()));
+        // A stranger's refusal is `EPERM` - "the operation is refused for a
+        // reason the bits cannot express" - and not the triads' `EACCES`.
+        assert_eq!(
+            may_setattr(Caller::ids(11, 11), &owned).err(),
+            Some(VfsError::NotPermitted)
+        );
+        // The capability stands in for the ownership, and *only* for it: uid 0
+        // without the bit is exactly as refused as uid 11.
+        assert_eq!(may_setattr(fowner, &owned).ok(), Some(()));
+        assert_eq!(
+            may_setattr(Caller::ids(0, 0), &owned).err(),
+            Some(VfsError::NotPermitted),
+            "uid 0 without CAP_FOWNER is a stranger to this file"
+        );
+
+        // The `now` form of the same question accepts the triads, so its
+        // refusal is the bits' `EACCES` rather than the standing's `EPERM`.
+        let writable = root.create("w", NodeKind::File).unwrap();
+        writable.set_mode(0o666);
+        writable.set_owner(10, 10);
+        assert_eq!(may_touch(Caller::ids(11, 11), &writable).ok(), Some(()));
+        assert_eq!(may_touch(fowner, &owned).ok(), Some(()));
+        assert_eq!(
+            may_touch(Caller::ids(11, 11), &owned).err(),
+            Some(VfsError::Access),
+            "no write bit and no CAP_FOWNER: EACCES, where may_setattr says EPERM"
+        );
+        assert_eq!(
+            may_setattr(Caller::ids(11, 11), &writable).err(),
+            Some(VfsError::NotPermitted),
+            "and write permission buys nothing for the explicit form"
+        );
+        // A read bit is not a write bit: the touch form asks for W_OK.
+        writable.set_mode(0o644);
+        assert_eq!(
+            may_touch(Caller::ids(11, 11), &writable).err(),
+            Some(VfsError::Access)
+        );
+
+        // The group half: the caller's own group, or the capability. The node's
+        // group is not consulted here - that is the mode word's business - so
+        // what is asked is whether *this* gid is one the caller holds.
+        assert!(in_group_or_capable(Caller::ids(11, 10), 10));
+        assert!(!in_group_or_capable(Caller::ids(11, 11), 10));
+        assert!(in_group_or_capable(fsetid, 10));
+        assert!(!in_group_or_capable(Caller::ids(0, 0), 10));
     }
 }
