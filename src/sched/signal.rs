@@ -451,12 +451,18 @@ impl SigInfo {
     /// `code` is the kernel's own record of the death - the exit code, or the
     /// negated signal number - and the `(si_code, si_status)` pair it becomes
     /// is `crate::abi::exit_chld`'s, the same pair `waitid(2)` hands over for
-    /// the same corpse: `CLD_EXITED` with the code, or `CLD_KILLED` with the
-    /// signal. Measured on a current host through every door that renders it
+    /// the same corpse: `CLD_EXITED` with the code, or `CLD_KILLED`/`CLD_DUMPED`
+    /// with the signal. `dumped` is the death's core-dump classification, which
+    /// `exit_chld` needs because it is not a fact about `code` alone (the
+    /// signal's default action *and* the child's `dumpable`); the death path
+    /// computes it once for both this record and the retired one behind
+    /// `waitid`. Measured on a current host through every door that renders it
     /// (`.workbuddy/probe_signalfd_chld.c`, Linux 7.2.9): a child that exits 7
     /// is `CLD_EXITED` with `si_status` 7 in a `signalfd` record, in a
-    /// handler's `siginfo_t` and in `sigtimedwait`'s, and a child killed by
-    /// `SIGKILL` is `CLD_KILLED` with `si_status` 9.
+    /// handler's `siginfo_t` and in `sigtimedwait`'s, a child killed by
+    /// `SIGKILL` is `CLD_KILLED` with `si_status` 9, and one killed by a
+    /// core-dumping signal is `CLD_DUMPED` with the signal
+    /// (`.workbuddy/probe_coredump_signals.c`).
     ///
     /// `uid` is the child's **real** id, which is what Linux fills here
     /// (`task_uid`, not the effective one) and what the retired record carries
@@ -464,8 +470,8 @@ impl SigInfo {
     /// `si_utime`/`si_stime` are not part of this record: Linux fills them with
     /// the child's CPU in clock ticks, and this kernel leaves them zero
     /// (`docs/uapi/` §5.2's note).
-    pub fn child(pid: i32, uid: i32, code: isize) -> SigInfo {
-        let (code, status) = crate::abi::exit_chld(code);
+    pub fn child(pid: i32, uid: i32, code: isize, dumped: bool) -> SigInfo {
+        let (code, status) = crate::abi::exit_chld(code, dumped);
         SigInfo {
             signo: SIGCHLD as i32,
             errno: 0,

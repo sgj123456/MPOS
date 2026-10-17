@@ -337,6 +337,17 @@ pub(crate) struct Retired {
     /// item 23, which is why the field is on the record rather than read from
     /// the task.
     pub(crate) uid: u32,
+    /// Whether the death was one the kernel's coredump path classified -
+    /// `CLD_DUMPED` in `waitid`'s record and the `WCOREDUMP` bit in `wait4`'s
+    /// status word.
+    ///
+    /// Computed at the death and carried rather than re-derived, because it is
+    /// not a fact about the exit code alone: it is the signal's default action
+    /// **and** the dying process's own `dumpable` flag, and the flag is gone by
+    /// the time a `wait` reads the record (the task is). See
+    /// `crate::abi::exit_chld`, and `.workbuddy/probe_wcore_dumpable.c` beside
+    /// it for the second half.
+    pub(crate) dumped: bool,
     /// The tracer this task died under, if any. A traced task's death is the
     /// tracer's to collect: the tracer reaps the corpse first, and only its
     /// taking releases the record to the real parent - the same
@@ -1990,7 +2001,17 @@ pub enum WaitEvent {
     /// collection takes the record out of the table, and `waitid` owes the
     /// child's real uid beside the code it writes. A stop or a resume needs no
     /// such field - the child is alive, so its identity is still in the table.
-    Exited { id: TaskId, code: isize, uid: u32 },
+    ///
+    /// `dumped` is the same carry for the same reason: the core-dump
+    /// classification (`CLD_DUMPED`/`WCOREDUMP`) is a fact about the *dead*
+    /// child's `dumpable` flag, which is gone once the task is, so the record
+    /// holds it and this hands it on.
+    Exited {
+        id: TaskId,
+        code: isize,
+        uid: u32,
+        dumped: bool,
+    },
     /// A stop to report: the signal `WSTOPSIG` names, and the `PTRACE_EVENT_*`
     /// the status word's high byte carries.
     ///

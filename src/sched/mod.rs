@@ -70,15 +70,22 @@ pub use runtime::{
     setns_mnt, setns_pid, setns_time, setns_user, setns_uts, signal_action, signal_alt_stack,
     sleep_ticks, snapshot, snapshots, space_root_of, spawn, spawn_permanent, spawn_user, started,
     stop_of, take_child_event, take_continued_report, take_deliverable_siginfo,
-    take_deliverable_signal, take_exit_code, take_exit_code_current, take_fatal_signal,
-    take_pending_event, take_signal_in_set, take_stop_report, take_vmas, task_count,
-    thread_group_has_siblings, thread_snapshots, time_offsets, timer_alloc, timer_arm,
-    timer_overrun, timer_remove, timer_state, tls_of, trace_options, trace_syscall, tracer_of,
-    try_spawn_user, uid_members, unmap_user, unshare_files, unshare_fs, unshare_mnt, unshare_pid,
-    unshare_time, unshare_user, unshare_uts, user_frame_at, user_mapped, vfork, vma_gaps,
-    vma_kind_at, vma_prot_at, vma_range_free, wait_any_child_event, wait_child_event,
-    wait_for_interrupt, wake, with_current_credentials, write_user, write_user_of, yield_now,
+    take_deliverable_signal, take_exit_code, take_fatal_signal, take_pending_event,
+    take_signal_in_set, take_stop_report, take_vmas, task_count, thread_group_has_siblings,
+    thread_snapshots, time_offsets, timer_alloc, timer_arm, timer_overrun, timer_remove,
+    timer_state, tls_of, trace_options, trace_syscall, tracer_of, try_spawn_user, uid_members,
+    unmap_user, unshare_files, unshare_fs, unshare_mnt, unshare_pid, unshare_time, unshare_user,
+    unshare_uts, user_frame_at, user_mapped, vfork, vma_gaps, vma_kind_at, vma_prot_at,
+    vma_range_free, wait_any_child_event, wait_child_event, wait_for_interrupt, wake,
+    with_current_credentials, write_user, write_user_of, yield_now,
 };
+
+/// The `wait(2)` doors read the whole retired record, not just its code: a
+/// death's core-dump classification (`CLD_DUMPED`/`WCOREDUMP`) is the child's
+/// `dumpable` flag at death, which no live task holds any more. Re-exported
+/// `pub(crate)` because it names the crate-private record type.
+#[cfg(target_os = "none")]
+pub(crate) use runtime::take_retired_current;
 
 /// The stop accessors and the register-file snapshot are the machine's to build
 /// (`NOTES.md` §13): their `runtime` definitions carry a register file sized by

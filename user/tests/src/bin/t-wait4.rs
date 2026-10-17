@@ -181,5 +181,99 @@ fn main() {
         );
     }
 
+    // ---- a death by signal: the status word classifies it ------------------
+    //
+    // `WIFSIGNALED` is true and `WTERMSIG` is the signal; and the core-dump bit
+    // (0x80, `WCOREDUMP`) follows the *signal*, not a core file written -
+    // measured on this host with `.workbuddy/probe_coredump_signals.c` at
+    // `RLIMIT_CORE` 0, which walks every fatal signal: `SIGSEGV` and the other
+    // nine core-dumping signals set the bit while `SIGKILL`, `SIGTERM` and the
+    // rest do not. `rustix`'s `WaitStatus` exposes the signal but not the bit,
+    // so the claim reads the raw word the way a libc's `WCOREDUMP` macro does.
+    //
+    // The bit is the signal's default action **and** the dying child's own
+    // `dumpable` flag: `.workbuddy/probe_wcore_dumpable.c` shows the same
+    // `SIGSEGV` death clearing the bit under `PR_SET_DUMPABLE 0`, which is the
+    // gate this kernel would otherwise miss - the "core-dumping signal" half
+    // alone is not the rule. The non-dumpable case below pins it.
+    fn start_doomed(sig: libc::c_int) -> i32 {
+        start_doomed_as(sig, None)
+    }
+
+    /// The same death, with the child first moving its own `dumpable` flag when
+    /// `dumpable` names one - `0` is `SUID_DUMP_DISABLE`,
+    /// `PR_SET_DUMPABLE 0`, the flag `do_coredump()` checks first.
+    fn start_doomed_as(sig: libc::c_int, dumpable: Option<libc::c_int>) -> i32 {
+        let pid = unsafe { libc::fork() };
+        if pid != 0 {
+            return pid;
+        }
+        unsafe {
+            if let Some(flag) = dumpable {
+                libc::prctl(libc::PR_SET_DUMPABLE, flag, 0, 0, 0);
+            }
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+            // Reached only when the signal did not end the child.
+            libc::syscall(libc::SYS_exit_group, 111 as libc::c_long);
+            libc::_exit(111)
+        }
+    }
+
+    let sigsegv = start_doomed(libc::SIGSEGV);
+    r.check("a child that will take SIGSEGV was started", sigsegv > 0);
+    if sigsegv > 0 {
+        let status = collect(sigsegv);
+        r.check(
+            "a SIGSEGV death is a signal death, not an exit",
+            status.is_some_and(WaitStatus::signaled),
+        );
+        r.check(
+            "WTERMSIG reads back SIGSEGV",
+            status.and_then(WaitStatus::terminating_signal) == Some(libc::SIGSEGV),
+        );
+        r.check(
+            "and WCOREDUMP (0x80) is set for a core-dumping signal",
+            status.is_some_and(|s| s.as_raw() & 0x80 != 0),
+        );
+    }
+
+    let sigterm = start_doomed(libc::SIGTERM);
+    r.check("a child that will take SIGTERM was started", sigterm > 0);
+    if sigterm > 0 {
+        let status = collect(sigterm);
+        r.check(
+            "WTERMSIG reads back SIGTERM",
+            status.and_then(WaitStatus::terminating_signal) == Some(libc::SIGTERM),
+        );
+        r.check(
+            "and WCOREDUMP stays clear for a plain termination",
+            status.is_some_and(|s| s.as_raw() & 0x80 == 0),
+        );
+    }
+
+    // The gate: the *same* core-dumping signal for a child that turned its own
+    // `dumpable` off is a plain kill, bit clear - the second half of the rule.
+    let nodump = start_doomed_as(libc::SIGSEGV, Some(0));
+    r.check(
+        "a non-dumpable child that will take SIGSEGV was started",
+        nodump > 0,
+    );
+    if nodump > 0 {
+        let status = collect(nodump);
+        r.check(
+            "a non-dumpable SIGSEGV death is still a signal death",
+            status.is_some_and(WaitStatus::signaled),
+        );
+        r.check(
+            "WTERMSIG still reads back SIGSEGV",
+            status.and_then(WaitStatus::terminating_signal) == Some(libc::SIGSEGV),
+        );
+        r.check(
+            "but WCOREDUMP stays clear: the bit needs the child to be dumpable",
+            status.is_some_and(|s| s.as_raw() & 0x80 == 0),
+        );
+    }
+
     r.finish()
 }

@@ -205,6 +205,20 @@ pub fn exit(code: isize) -> ! {
             crate::hal::halt();
         }
         t.task_mut(id).exited = true;
+
+        // The death's core-dump classification, computed here because it is a
+        // fact about the *dying* process's own `dumpable` flag, which
+        // `release_exited` below takes away: Linux's `WCOREDUMP`/`CLD_DUMPED`
+        // is the signal's default action (`crate::abi::signal_dumps_core`)
+        // **and** that flag - `.workbuddy/probe_wcore_dumpable.c` measures the
+        // second half, a `SIGSEGV` death being `CLD_DUMPED` at dumpable 1 or 2
+        // and `CLD_KILLED` at `PR_SET_DUMPABLE 0`. Derived once and carried on
+        // both records, so a `wait4` reader and a `waitid` reader cannot
+        // classify one death two ways.
+        let dumped = code < 0
+            && crate::abi::signal_dumps_core((-code) as i32)
+            && t.task(id).mm.credentials().dumpable != 0;
+
         record_retired(
             id,
             code,
@@ -214,6 +228,7 @@ pub fn exit(code: isize) -> ! {
             // record outlives the task, and `waitid` reads its answer from the
             // record (`Retired::uid`).
             t.task(id).identity.ruid,
+            dumped,
         );
 
         // Linux's `forget_original_parent`: a process that exits hands every
@@ -366,7 +381,7 @@ pub fn exit(code: isize) -> ! {
                 queue_signal(
                     t.task_mut(parent),
                     signal::SIGCHLD,
-                    signal::SigInfo::child(child_pid, child_uid, code),
+                    signal::SigInfo::child(child_pid, child_uid, code, dumped),
                 );
             }
             // The console goes back to the parent's group as the child leaves
@@ -542,7 +557,14 @@ pub fn discard_exit_code(id: TaskId) {
     take_exit_code(id);
 }
 
-fn record_retired(id: TaskId, code: isize, pgid: TaskId, tracer: Option<TaskId>, uid: u32) {
+fn record_retired(
+    id: TaskId,
+    code: isize,
+    pgid: TaskId,
+    tracer: Option<TaskId>,
+    uid: u32,
+    dumped: bool,
+) {
     critical_section::with(|cs| {
         let mut retired = RETIRED.borrow(cs).borrow_mut();
         if retired.len() == RETIRED_CAP {
@@ -553,6 +575,7 @@ fn record_retired(id: TaskId, code: isize, pgid: TaskId, tracer: Option<TaskId>,
             code,
             pgid,
             uid,
+            dumped,
             tracer,
         });
     });
@@ -1771,6 +1794,7 @@ fn scan_child_event(
                 id: retired.id,
                 code: retired.code,
                 uid: retired.uid,
+                dumped: retired.dumped,
             })
     })
 }
@@ -1788,6 +1812,7 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
                 id,
                 code: retired.code,
                 uid: retired.uid,
+                dumped: retired.dumped,
             })
         }
         WaitEvent::Stopped {
@@ -1989,6 +2014,7 @@ pub fn block_until_child_event(id: TaskId, stops: bool, continues: bool) -> Wait
             id,
             code: retired.code,
             uid: retired.uid,
+            dumped: retired.dumped,
         }),
         None => WaitPark::NoChild,
     }
@@ -1996,15 +2022,13 @@ pub fn block_until_child_event(id: TaskId, stops: bool, continues: bool) -> Wait
 
 /// [`take_retired_for`] for the running task - the shape a `waitpid(pid)`
 /// call lands in, where the collector is the caller itself.
+///
+/// Returns the whole record, not just the code, because `wait4`'s status word
+/// owes the same core-dump classification (`Retired::dumped`) `waitid` reads
+/// into `si_code`: `finish_wait` needs both fields, and taking the record is
+/// what makes them this collector's.
 pub(crate) fn take_retired_current(id: TaskId) -> Option<Retired> {
     with_table(|t| take_retired_for(t, id, t.current))
-}
-
-/// The code alone, for the door that collects nothing but it: `wait4`'s status
-/// word has no field for the uid `waitid` wants, and taking the record is what
-/// makes the code this collector's.
-pub fn take_exit_code_current(id: TaskId) -> Option<isize> {
-    take_retired_current(id).map(|retired| retired.code)
 }
 
 /// The paging root `id` runs on: its own address space's, or its thread group's

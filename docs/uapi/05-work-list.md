@@ -809,13 +809,14 @@ the commit bodies), and each moved its pin in the same commit.
     record field by field (`ssi_status`, the real uid, the pid), the unblocked death's `EAGAIN`, the
     `SIGKILL` record's `CLD_KILLED`, and the frame's rendering of the same record through a handler.
     Two of those are named rather than made on a **host** run, where the real uid cannot be moved
-    (`t-waitid`'s shape for the same field): 46 claims in a sweep, 44 with two notes there. **Three residuals
-    are named rather than hidden** (§5.2 carries them with the measurements): the **ignored**
-    child's auto-reap (`ECHILD` on Linux, a zombie here), `si_utime`/`si_stime` staying zero
-    (Linux's are the child's CPU in ticks — `6` for a 60 ms child), and the
-    **`CLD_DUMPED`/`WCOREDUMP`** half — where the measurement also corrects a *reason*: the core bit
-    is not about a file being written (a `SIGSEGV` child reports it with `RLIMIT_CORE` 0), so
-    `wait_status`'s comment that said "mpos writes no core files" was explaining the wrong thing.
+    (`t-waitid`'s shape for the same field): 46 claims in a sweep, 44 with two notes there. **Two
+    residuals stay named rather than hidden** (§5.2 carries them with the measurements): the
+    **ignored** child's auto-reap (`ECHILD` on Linux, a zombie here) and `si_utime`/`si_stime`
+    staying zero (Linux's are the child's CPU in ticks — `6` for a 60 ms child). The third this
+    paragraph used to name, the **`CLD_DUMPED`/`WCOREDUMP`** half, has since landed (item 32) — and
+    the measurement that closed it also corrected a *reason*: the core bit is not about a file being
+    written (a `SIGSEGV` child reports it with `RLIMIT_CORE` 0), so `wait_status`'s comment that said
+    "mpos writes no core files" was explaining the wrong thing.
 
 30. **`FIONREAD` answers Linux's per-type byte count on a regular file and a pipe.** The request
     means "how many bytes can I read before I would block", and Linux answers it per *file type*
@@ -870,3 +871,48 @@ the commit bodies), and each moved its pin in the same commit.
     tree reaches several ways, or `None` for a cwd deeper than its visit budget (the caller's
     spelling is kept then); and a cwd **removed underneath the caller** is `ENOENT` on Linux, where
     this kernel keeps no parent edge to notice the disconnect and answers the stale name.
+
+32. **A signalled death is `CLD_DUMPED`/`WCOREDUMP` when the signal dumps core *and the child was
+    dumpable*.** §5.2 (and item 29) named this as the third residual of the `SIGCHLD` landing: this
+    kernel answered `CLD_KILLED` and left `wait4`'s status-word bit clear for *every* signalled
+    death, where Linux tells two apart. **Measured whole on a current host first**, in two probes,
+    because the rule turned out to have two halves. `.workbuddy/probe_coredump_signals.c` (Linux
+    7.2.9, `RLIMIT_CORE` 0) walks every signal whose default action ends a task and reads back both
+    the `wait4` status word and `waitid`'s `si_code`: exactly **`SIGQUIT`, `SIGILL`, `SIGTRAP`,
+    `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGSEGV`, `SIGXCPU`, `SIGXFSZ`, `SIGSYS`** are
+    `code=3[CLD_DUMPED]` with the bit set, and every other fatal signal (`SIGKILL`, `SIGTERM`,
+    `SIGPIPE`, …) is `code=2[CLD_KILLED]` with it clear — the set is `sig_kernel_coredump`'s. That
+    probe also killed the *reason* this kernel's `wait_status` comment gave ("mpos writes no core
+    files"): a `SIGSEGV` child reports the bit with **`RLIMIT_CORE` 0 and read back as 0**, so the
+    bit is not about a file having been written. The second probe,
+    `.workbuddy/probe_wcore_dumpable.c`, then separated *signal* from *dump attempted*: this host's
+    `core_pattern` is a **pipe** (`|/usr/lib/systemd/systemd-coredump …`), so `RLIMIT_CORE` cannot
+    stop a dump being attempted — but `PR_SET_DUMPABLE 0` can, because `do_coredump()` bails at its
+    first `__get_dumpable()` check. Under it the *same* `SIGSEGV` death is `CLD_KILLED`/bit-clear,
+    while `dumpable` **1** reports `CLD_DUMPED`/bit-set, and a child that sets its own flag back to
+    1 under a non-dumpable parent reports `CLD_DUMPED` too — so the flag is the *child's* and the
+    gate is `!= 0`. (The kernel's own `SUID_DUMP_ROOT` value, 2, is *not* settable through
+    `PR_SET_DUMPABLE` — Linux answers `EINVAL`, measured — so 1-versus-0 is the only pair the door
+    can show; the predicate reads `!= 0`, which is `__get_dumpable`'s comparison.) **The fix threads
+    the classification, computed once at the death.** The signal half is the leaf crate's
+    `abi::signal_dumps_core` (the ten-signal set above, host-tested exhaustively over `1..=31`), and
+    `abi::exit_chld` now takes a `dumped: bool` beside the code — because *neither* half can be
+    recovered from the code once the child is gone.
+    The exit path (`src/sched/runtime/child_exit.rs`) computes `dumped = code < 0 &&
+    signal_dumps_core(-code) && child's dumpable != 0` while the `mm` is still there (it reads the
+    child's credentials before `release_exited`), and carries it on both records a `wait` reads: the
+    retired one (`Retired` and `WaitEvent::Exited` gained the field, with `take_retired_current`
+    handed over whole rather than as a bare code) and the `SIGCHLD` one (`signal::SigInfo::child`
+    gained it). `wait4`'s `abi::wait_status` and `waitid`'s record both read that one value, so the
+    two doors cannot classify one death two ways. Owner: `crates/abi`'s
+    `signal_dumps_core`/`exit_chld`/`CLD_DUMPED`, `src/syscall/linux/abi.rs`'s `wait_status`,
+    `src/sched/runtime/child_exit.rs`'s exit path, `src/sched/runtime/task.rs`'s
+    `Retired`/`WaitEvent`, `src/sched/signal.rs`'s `SigInfo::child`, and `src/syscall/linux/proc.rs`'s
+    `finish_wait`/`waitid`. Pins: `t-wait4` (a dumpable `SIGSEGV` death sets `WCOREDUMP`, `SIGTERM`
+    clears it, and a `PR_SET_DUMPABLE 0` `SIGSEGV` clears it too) and `t-signalfd` (the same death is
+    `CLD_DUMPED` through the descriptor, and `CLD_KILLED` when the child is non-dumpable), both green
+    on this host first. The counterfactual is exact: with only the kernel half reverted and both
+    programs kept, the sweep comes back `pass=178 fail=2 (180 built)`, the kernel's line unmoved at
+    `mpos-kunit 32 passed, 0 failed` — and the two reds are exactly the new claims:
+    `t-signalfd`'s `FAIL: as CLD_DUMPED, not CLD_KILLED, with the signal in ssi_status` and
+    `t-wait4`'s `FAIL: and WCOREDUMP (0x80) is set for a core-dumping signal`.

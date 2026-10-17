@@ -449,8 +449,8 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     // blocking or not. Tracer-owned records stay with the tracer: this caller
     // collecting through a tracer's corpse is the double-report that hung
     // strace.
-    if let Some(code) = crate::sched::take_exit_code_current(id) {
-        return finish_wait(id, code, status, from_user);
+    if let Some(retired) = crate::sched::take_retired_current(id) {
+        return finish_wait(id, retired.code, retired.dumped, status, from_user);
     }
     if !crate::sched::is_child(id, me) {
         return err::ECHILD;
@@ -470,9 +470,9 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// way its `W`-macro decodes it: a death, a stop, or a resume.
 fn finish_wait_event(event: crate::sched::WaitEvent, status: usize, from_user: bool) -> isize {
     match event {
-        crate::sched::WaitEvent::Exited { id, code, .. } => {
-            finish_wait(id, code, status, from_user)
-        }
+        crate::sched::WaitEvent::Exited {
+            id, code, dumped, ..
+        } => finish_wait(id, code, dumped, status, from_user),
         // `traced` is `waitid`'s question, not this door's: the status word
         // `WSTOPSIG`/`WIFSTOPPED` read says "stopped" either way, and a traced
         // stop's `PTRACE_EVENT_*` is what carries the rest.
@@ -509,14 +509,18 @@ fn wait_answer(id: TaskId) -> isize {
 /// The two outputs of a successful `wait`: the child's pid as the return value,
 /// and the exit encoded into `*status`. A null `status` is "not interested" and
 /// writes nothing, which is what the man page says.
-fn finish_wait(id: TaskId, code: isize, status: usize, from_user: bool) -> isize {
+///
+/// `dumped` is the death's core-dump classification, taken off the record with
+/// the code: the `WCOREDUMP` bit is the same `CLD_DUMPED` fact `waitid` writes
+/// into `si_code`, so one death cannot read two ways.
+fn finish_wait(id: TaskId, code: isize, dumped: bool, status: usize, from_user: bool) -> isize {
     if status != 0 {
         if !buffer_ok(status, 4, true, from_user) {
             return err::EFAULT;
         }
         // The W-exit-status encoding is the ABI the libc's macros decode;
         // it is spelled in `abi`, tested on the host.
-        unsafe { (status as *mut i32).write_unaligned(abi::wait_status(code)) };
+        unsafe { (status as *mut i32).write_unaligned(abi::wait_status(code, dumped)) };
     }
     wait_answer(id)
 }
@@ -3907,8 +3911,13 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT]) -> isize {
     // all report the child's real uid) and reports `cred->uid` - the real id,
     // not the effective one.
     let (child, si_code, status, uid) = match event {
-        crate::sched::WaitEvent::Exited { id, code, uid } => {
-            let (si_code, status) = abi::exit_chld(code);
+        crate::sched::WaitEvent::Exited {
+            id,
+            code,
+            uid,
+            dumped,
+        } => {
+            let (si_code, status) = abi::exit_chld(code, dumped);
             (id, si_code, status, uid)
         }
         // A stop under a tracer and a stop for the parent are two codes

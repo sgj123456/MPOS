@@ -62,9 +62,10 @@
 //!     and queued a generated `SIGCHLD` beside it, so one death arrived twice.
 //!
 //! `si_utime`/`si_stime` are the one part of Linux's record this kernel leaves
-//! zero (measured: 6 ticks for a child that burned 60 ms of CPU), and the
-//! `CLD_DUMPED`/`WCOREDUMP` half of a signalled death is named rather than
-//! answered - both in `docs/uapi/` §5.2.
+//! zero (measured: 6 ticks for a child that burned 60 ms of CPU; `docs/uapi/`
+//! §5.2). The `CLD_DUMPED` half of a signalled death is *answered* now - the
+//! section below the `SIGKILL` block pins that a core-dumping signal reports
+//! `CLD_DUMPED` where `SIGKILL` reports `CLD_KILLED`.
 //!
 //! The rest of the program is the named calls: the reads are
 //! `rustix::io::read` (a plain `read`, with the `EINVAL` for a short buffer and
@@ -447,6 +448,109 @@ fn main() {
             );
         }
         drop(wr);
+    }
+
+    // ---- a core-dumping signal: CLD_DUMPED, not CLD_KILLED -----------------
+    //
+    // The third code. `CLD_KILLED` is *not* what Linux says for every signalled
+    // death: the ten signals whose default action dumps core report
+    // `CLD_DUMPED` instead, measured on a current host with
+    // `.workbuddy/probe_coredump_signals.c`, which walks every fatal signal and
+    // reads back both this code and `wait4`'s `WCOREDUMP` bit. `SIGSEGV` is one
+    // of the ten; the `SIGKILL` block above is the control that stays
+    // `CLD_KILLED`. The bit follows the *signal*, not a core file written - the
+    // probe runs at `RLIMIT_CORE` 0 and the death still answers `CLD_DUMPED`.
+    //
+    // The child sets its own `dumpable` to 1 explicitly, for the same reason the
+    // block below sets 0: the code needs the signal **and** the child's flag
+    // (`.workbuddy/probe_wcore_dumpable.c`), and this program moved its real uid
+    // earlier, which on this kernel also resets the flag - so pinning the
+    // *signal* half means asking for a dumpable child on purpose rather than
+    // inheriting whatever the parent happens to hold.
+    {
+        r.check(
+            "blocking SIGCHLD succeeds",
+            mask_change(libc::SIG_BLOCK, &child_mask),
+        );
+        // SAFETY: the child does one thing - take a signal whose default action
+        // ends it - and neither the raise nor the exit allocates.
+        let kid = unsafe { libc::fork() };
+        if kid == 0 {
+            unsafe {
+                libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::raise(libc::SIGSEGV);
+            }
+            leave(120); // reachable only if SIGSEGV failed to end the child
+        }
+        r.check("a child that will take SIGSEGV was forked", kid > 0);
+        if kid > 0 {
+            let mut got = Err(Errno::AGAIN);
+            let mut tries = 0;
+            while tries < 200 {
+                got = read(&fd, &mut buf);
+                if got == Ok(128) {
+                    break;
+                }
+                sleep_ms(1);
+                tries += 1;
+            }
+            r.check("its death arrives through the descriptor", got == Ok(128));
+            let dumped = record_of(&buf);
+            r.check(
+                "as CLD_DUMPED, not CLD_KILLED, with the signal in ssi_status",
+                dumped.ssi_code == libc::CLD_DUMPED && dumped.ssi_status == libc::SIGSEGV,
+            );
+            r.check(
+                "and the same child in ssi_pid",
+                dumped.ssi_pid == kid as u32,
+            );
+            let _ = waitpid(Pid::from_raw(kid), WaitOptions::empty());
+        }
+    }
+
+    // ---- ...but the bit needs the child to be dumpable ---------------------
+    //
+    // The signal is only half the rule. `.workbuddy/probe_wcore_dumpable.c`
+    // (Linux 7.2.9) measures the other half: a child under `PR_SET_DUMPABLE 0`
+    // dies `CLD_KILLED`, not `CLD_DUMPED`, of the *same* `SIGSEGV` - because
+    // `do_coredump()` bails at its first check and never classifies the death.
+    // A kernel that keyed the code on the signal alone would answer
+    // `CLD_DUMPED` here, which is the failure this pins.
+    {
+        let kid = unsafe { libc::fork() };
+        if kid == 0 {
+            unsafe {
+                libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::raise(libc::SIGSEGV);
+            }
+            leave(121); // reachable only if SIGSEGV failed to end the child
+        }
+        r.check(
+            "a non-dumpable child that will take SIGSEGV was forked",
+            kid > 0,
+        );
+        if kid > 0 {
+            let mut got = Err(Errno::AGAIN);
+            let mut tries = 0;
+            while tries < 200 {
+                got = read(&fd, &mut buf);
+                if got == Ok(128) {
+                    break;
+                }
+                sleep_ms(1);
+                tries += 1;
+            }
+            r.check("its death arrives through the descriptor", got == Ok(128));
+            let plain = record_of(&buf);
+            r.check(
+                "as CLD_KILLED, not CLD_DUMPED: the child's dumpable gates the code",
+                plain.ssi_code == libc::CLD_KILLED && plain.ssi_status == libc::SIGSEGV,
+            );
+            r.check("and the same child in ssi_pid", plain.ssi_pid == kid as u32);
+            let _ = waitpid(Pid::from_raw(kid), WaitOptions::empty());
+        }
     }
 
     // ---- the same record through a handler --------------------------------

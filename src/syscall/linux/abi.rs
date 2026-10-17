@@ -778,21 +778,27 @@ pub(crate) fn mknod_kind(mode: usize) -> Result<NodeKind, isize> {
 /// mpos records a death by signal as the negated signal number, because that is
 /// the shape the rest of the kernel wants; the word Linux reports is different,
 /// so the sign is what carries the distinction here.
-pub(crate) fn wait_status(code: isize) -> i32 {
+pub(crate) fn wait_status(code: isize, dumped: bool) -> i32 {
     if code < 0 {
         // Killed by a signal: its number fills the low byte, and the core-dump
-        // bit (0x80) stays clear.
+        // bit (0x80) is set when `dumped` says the death was one the kernel's
+        // coredump path classified.
         //
         // That bit is **not** about whether a core file was written, which is
         // what this comment used to say: measured on a current host
         // (`.workbuddy/probe_signalfd_chld.c`, Linux 7.2.9), a child killed by
         // `SIGSEGV` reports `WCOREDUMP` **with `RLIMIT_CORE` set to zero and
-        // read back as zero** - so the bit follows the signal, and the same
+        // read back as zero** - so the bit follows the *signal*, and the same
         // death is `CLD_DUMPED` rather than `CLD_KILLED` in the record beside
-        // it. This kernel leaves both clear and says the word `CLD_KILLED`
-        // instead; that is a named gap (`crate::abi::exit_chld`), not a
-        // different reason.
-        (-code & 0x7f) as i32
+        // it. It follows the signal **and** the child's `dumpable` flag
+        // (`.workbuddy/probe_wcore_dumpable.c`): the death path computes the
+        // pair once and hands it here as `dumped`, and `crate::abi::exit_chld`
+        // reads the same value for `waitid`'s record, so a `wait` reader and a
+        // `waitid` reader cannot classify one death two ways. The strip is
+        // `& 0x7f` because the signal's number fits under the bit.
+        let sig = -code as i32;
+        let core = if dumped { 0x80 } else { 0 };
+        ((sig & 0x7f) | core) as i32
     } else {
         // A normal exit: the low byte of the code, in bits 15:8.
         ((code & 0xff) << 8) as i32
@@ -1286,7 +1292,7 @@ const SIGCHLD: i32 = 17;
 // why a fact both halves need lives there; this module re-exports rather than
 // redefines, exactly as it does for the `clone(2)` bits above.
 pub use crate::abi::exit_chld;
-pub use crate::abi::{CLD_CONTINUED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, CLD_TRAPPED};
+pub use crate::abi::{CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, CLD_TRAPPED};
 
 /// Write the `siginfo_t` describing a collected child: `SIGCHLD` as the signo,
 /// the caller's `CLD_*` code and status in theirs, and the pid where `si_pid`
@@ -3216,27 +3222,51 @@ mod tests {
     #[test]
     fn wait_status_encodes_exits_the_wmacros_decode_them() {
         // Exit code 3: WIFEXITED true, WEXITSTATUS 3.
-        let s = wait_status(3);
+        let s = wait_status(3, false);
         assert_eq!(s, 3 << 8);
         assert_eq!(s & 0x7f, 0, "WIFEXITED requires the low 7 bits clear");
         assert_eq!((s >> 8) & 0xff, 3);
 
         // Killed by SIGKILL (mpos records it as -9): WIFSIGNALED, WTERMSIG 9.
-        let s = wait_status(-9);
+        let s = wait_status(-9, false);
         assert_eq!(s & 0x7f, 9);
         assert_ne!(s & 0x7f, 0);
 
         // Exit codes carry only their low byte, as WEXITSTATUS reads them.
-        assert_eq!(wait_status(256), 0);
-        assert_eq!(wait_status(257), 1 << 8);
+        assert_eq!(wait_status(256, false), 0);
+        assert_eq!(wait_status(257, false), 1 << 8);
 
-        // No core-dump bit is ever set: mpos writes no core files.
-        for code in [-1isize, -9, 0, 7, 255] {
+        // `WCOREDUMP` (bit 0x80) is the death path's classification, not a core
+        // file written: for a dumpable child the coredumping signals set it
+        // where `SIGKILL` and `SIGTERM` do not, and a `SIGSEGV` death's low bits
+        // still read back as 11 under the mask's `& 0x7f`. Measured on a current
+        // host with `.workbuddy/probe_coredump_signals.c`, RLIMIT_CORE 0
+        // throughout; the dumpable half with `.workbuddy/probe_wcore_dumpable.c`.
+        assert_eq!(
+            wait_status(-11, true) & 0x80,
+            0x80,
+            "SIGSEGV is a core dump"
+        );
+        assert_eq!(wait_status(-11, true) & 0x7f, 11);
+        assert_eq!(wait_status(-6, true) & 0x80, 0x80, "SIGABRT is a core dump");
+        // A non-coredumping signal's death carries `dumped` false from the
+        // death path, so the bit stays clear.
+        assert_eq!(wait_status(-9, false) & 0x80, 0, "SIGKILL is not");
+        assert_eq!(wait_status(-15, false) & 0x80, 0, "SIGTERM is not");
+        assert_eq!(wait_status(-1, false) & 0x80, 0, "SIGHUP is not");
+        // And the dumpable gate: the *same* signal is a plain kill when the
+        // death path says the process was not dumpable.
+        assert_eq!(wait_status(-11, false) & 0x80, 0);
+        assert_eq!(wait_status(-11, false) & 0x7f, 11);
+        // An ordinary exit never carries it, whatever the code - and `dumped`
+        // is ignored for one.
+        for code in [0isize, 7, 255] {
             assert_eq!(
-                wait_status(code) & 0x80,
+                wait_status(code, false) & 0x80,
                 0,
-                "WCOREDUMP must stay clear for {code}"
+                "WCOREDUMP must stay clear for the exit {code}"
             );
+            assert_eq!(wait_status(code, true) & 0x80, 0);
         }
     }
 
@@ -3246,7 +3276,7 @@ mod tests {
     #[test]
     fn waitid_info_reports_the_child_the_siginfo_way() {
         let mut buf = [0u8; 128];
-        let (code, status) = exit_chld(7);
+        let (code, status) = exit_chld(7, false);
         assert_eq!(
             write_waitid_info(buf.as_mut_ptr() as usize, 42, 1000, code, status),
             0
@@ -3260,7 +3290,7 @@ mod tests {
 
         // Killed: the status is the signal number, the code says so.
         let mut buf2 = [0u8; 128];
-        let (code, status) = exit_chld(-15);
+        let (code, status) = exit_chld(-15, false);
         assert_eq!(
             write_waitid_info(buf2.as_mut_ptr() as usize, 5, 0, code, status),
             0
@@ -3271,6 +3301,18 @@ mod tests {
         assert_eq!(word2(24), 15);
         // Everything else is zeroed, so no stale caller byte survives.
         assert!(buf2[28..].iter().all(|&b| b == 0));
+
+        // The third code: a core-dumping signal is `CLD_DUMPED`, and `si_status`
+        // is still the signal's number - the same slot an exit spells a code in.
+        let mut buf3 = [0u8; 128];
+        let (code, status) = exit_chld(-11, true);
+        assert_eq!(
+            write_waitid_info(buf3.as_mut_ptr() as usize, 6, 0, code, status),
+            0
+        );
+        let word3 = |at: usize| i32::from_le_bytes(buf3[at..at + 4].try_into().unwrap());
+        assert_eq!(word3(8), 3); // CLD_DUMPED
+        assert_eq!(word3(24), 11); // si_status: SIGSEGV
     }
 
     /// The two event classes that are not a death, and the word each writes.

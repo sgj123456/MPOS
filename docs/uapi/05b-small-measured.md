@@ -189,7 +189,7 @@ Section numbers are unchanged from the original `UAPI.md`.
   (the unblocked death is `EAGAIN`; the sigkill record is `CLD_KILLED` with the
   signal in the status) plus the frame's rendering of the same record.
 
-  **Three residuals stay named rather than hidden.** (a) A child whose `SIGCHLD`
+  **Two residuals stay named rather than hidden.** (a) A child whose `SIGCHLD`
   is **ignored** is reaped by the kernel on Linux (`waitpid(WNOHANG)` measured as
   `ECHILD`); this kernel keeps the zombie, so a parent that ignores the signal
   and never waits holds a slot where Linux holds none. Closing it means skipping
@@ -198,17 +198,37 @@ Section numbers are unchanged from the original `UAPI.md`.
   stay zero**: Linux fills them with the child's CPU in clock ticks (measured:
   `utime=6` for a child that burned 60 ms, `0` for one that only exited — so the
   gap shows on a child that worked, and this kernel has the totals, it simply
-  does not carry them on the record). (c) **`CLD_DUMPED` and `WCOREDUMP`**: a
-  signalled death whose default action dumps core is `code=3` with the status in
-  the signal, and the `wait4` status word sets its core bit — measured on a child
-  that took `SIGSEGV` **with `RLIMIT_CORE` set to zero and read back as zero**,
-  which corrects the reason this kernel's `wait_status` comment used to give
-  ("mpos writes no core files"): the bit follows the signal, not a file that was
-  written. One boundary is named with it, because this host cannot separate the
-  two: its `core_pattern` is a *pipe* (`|/usr/lib/systemd/systemd-coredump …`),
-  so a dump is attempted whatever the limit says. Owner for all three:
-  `src/sched/runtime/`'s exit path and `crate::abi::exit_chld`. `docs/notes/`
-  §15.11 (batch 21, where the divergences were named) and §15.44 (the landing).
+  does not carry them on the record). Owner for both: `src/sched/runtime/`'s exit
+  path and `crate::abi::exit_chld`. `docs/notes/` §15.11 (batch 21, where the
+  divergences were named) and §15.44 (the landing). **A third residual this entry
+  named, `CLD_DUMPED`/`WCOREDUMP`, has since landed — the entry below carries
+  it** — and it is the one whose measurement also corrected the *reason* this tree
+  used to give, so it is worth reading beside the paragraph above.
+
+- **A death by a core-dumping signal is `CLD_DUMPED` with `WCOREDUMP` — when the
+  child was dumpable.** **Landed 2026-10-17** (`docs/uapi/` §5.1 item 32). The
+  third residual of the `SIGCHLD` entry above, closed. Two probes, because the
+  rule has two halves. `.workbuddy/probe_coredump_signals.c` (Linux 7.2.9,
+  `RLIMIT_CORE` 0) walks every fatal signal and reads back both the `wait4`
+  status word and `waitid`'s `si_code`: exactly **`SIGQUIT`, `SIGILL`, `SIGTRAP`,
+  `SIGABRT`, `SIGBUS`, `SIGFPE`, `SIGSEGV`, `SIGXCPU`, `SIGXFSZ`, `SIGSYS`** dump
+  (`sig_kernel_coredump`'s set) and every other fatal signal is `CLD_KILLED` —
+  and the bit ignores `RLIMIT_CORE`, which is what made the "mpos writes no core
+  files" reason this kernel's comment gave the *wrong* reason: a `SIGSEGV` child
+  reports the bit with the limit at 0 and read back as 0. The second probe,
+  `.workbuddy/probe_wcore_dumpable.c`, then split *signal* from *dump attempted*:
+  under `PR_SET_DUMPABLE 0` — which makes `do_coredump()` bail at its first check,
+  where this host's **pipe** `core_pattern` defeats `RLIMIT_CORE` — the *same*
+  `SIGSEGV` death is `CLD_KILLED`/bit-clear, while `dumpable` 1 sets it, and the
+  flag is the *child's* (the kernel's own `SUID_DUMP_ROOT` value, 2, is not
+  settable through this door — Linux answers `EINVAL` — so 1-versus-0 is the pair
+  the door can show). Served by computing the classification once at the
+  death (the signal's `abi::signal_dumps_core` **and** the child's `dumpable`) and
+  threading it through `abi::exit_chld`/`abi::wait_status` on both records, so
+  `wait4` and `waitid` agree about one death. Pins: `t-wait4` (a dumpable
+  `SIGSEGV` sets the bit, `SIGTERM` clears it, and a `PR_SET_DUMPABLE 0`
+  `SIGSEGV` clears it) and `t-signalfd` (`CLD_DUMPED` through the descriptor,
+  `CLD_KILLED` when the child is non-dumpable). `docs/notes/` §15.49.
 
 - **A UDP send's full buffer answered `EMSGSIZE`, so a burst stopped at four — and the blocking
   half of Linux's rule is served now, with its bound named.** A socket's send buffer is finite, so a
