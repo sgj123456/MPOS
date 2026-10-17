@@ -435,6 +435,27 @@ pub fn descriptors_of(pid: usize) -> alloc::vec::Vec<(usize, alloc::string::Stri
         .collect()
 }
 
+/// The direction the descriptor `fd` of `pid` was opened in - one of the
+/// `ACC_*` words the description records - or `None` when it is not open.
+///
+/// `/proc/<pid>/fd/<N>`'s *own* mode is derived from this and from nothing else
+/// (measured on a current host: Linux reports `0500` for a read-only
+/// descriptor, `0300` for a write-only one and `0700` for both, so the two
+/// directions are bits of the link's mode rather than a value), which is why
+/// the fact is read off the file description rather than remembered on the
+/// link.
+pub fn descriptor_access(pid: usize, fd: usize) -> Option<u32> {
+    with_table(|t| match t.tasks.get(pid).and_then(Option::as_ref) {
+        Some(task) if task.user => task
+            .fds
+            .open_files()
+            .into_iter()
+            .find(|(number, _file)| *number as usize == fd)
+            .map(|(_number, file)| file.access()),
+        _ => None,
+    })
+}
+
 /// The descriptor numbers `pid` has open, without asking for any of their
 /// names.
 ///

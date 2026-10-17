@@ -546,23 +546,25 @@ the commit bodies), and each moved its pin in the same commit.
     resolution the walk now performs, `descriptor_file` moves into `vfs` as the one helper, and
     `linkat`'s `via_descriptor` test — which still asks the *no-follow* resolution, whose inode is
     the link — is unchanged. Owner: `src/vfs/mount.rs`'s `resolve_walk`, `src/vfs/file.rs`. Pin:
-    `t-fd-name` (37 claims, green on this host first, its `ok:` lines byte-identical on both
+    `t-fd-name` (49 claims, green on this host first, its `ok:` lines byte-identical on both
     machines), which
     claims the pair `stat`/`lstat` draws, `statx` both ways, the four refusals, the mutators with
     their answers read back through the descriptor, the name inside a path, `chdir`, the fresh
     description with its own flags and position, the deleted file, the closed descriptor and
-    `/dev/fd/N`. **Four things stay named in §5.2**, each measured, each its own owner: a *foreign*
+    `/dev/fd/N`. **Three things stay named in §5.2**, each measured, each its own owner: a *foreign*
     process's descriptor (this kernel's link lends a descriptor only to the caller's own thread
     group, so a foreign one falls back to splicing its report as a path — a named file is then
     reached by the path it reports, and a channel answers `ENOENT` where Linux hands over the
     pipe); `st_dev` (the file's through the name on Linux, the *name's* filesystem here — the
     limitation §5.1 item 5 already owns, and the reason `t-fd-name` compares kind, size and inode
-    and merely prints both devices); `..` after the name (Linux jumps the walk onto the file, so
+    and merely prints both devices); and `..` after the name (Linux jumps the walk onto the file, so
     the parent is the *file's*; here it is the name's directory, because the walk's chain is what
-    answers `..` and a jumped-to node's parent is not a fact this kernel's inodes carry); and the
-    link's own metadata (`lstat`'s mode and size: Linux derives the mode from the descriptor's
-    direction and reports 64 bytes, this kernel's `ProcLink` inherits the trait's `0` and its own
-    `size: 0`). A fifth thing the same pin measured became an entry of its own in §5.2, because it
+    answers `..` and a jumped-to node's parent is not a fact this kernel's inodes carry). The
+    fourth it named — the link's own metadata — has since been closed by a commit of its own: the
+    link answers the mode its descriptor's direction gives and the 64 bytes Linux reports, and the
+    descriptor *directory* beside it answers `0500` and the number of descriptors it lists (this
+    pin grew by eight claims for it, green on both machines). A fifth thing the same pin
+    measured became an entry of its own in §5.2, because it
     belonged to another model rather than to this name: `chdir` through a directory's name serves —
     the walk's half, and it was `ENOTDIR` before — while the `getcwd` after it read back the *string*
     the caller used where Linux canonicalises, a divergence any symlinked `chdir` had here, which

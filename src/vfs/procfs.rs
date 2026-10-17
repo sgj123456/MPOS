@@ -150,7 +150,28 @@ impl Inode for ProcLink {
         Metadata {
             ino: self.ino,
             kind: NodeKind::Symlink,
-            size: 0,
+            // The size Linux gives this link's own `stat`, not the length of
+            // the text `readlink` answers: measured on a current host, an
+            // `/proc/<pid>/fd/<N>` link is **64 bytes** whatever it names - a
+            // 9-byte `/dev/null` entry, a pathless socket's `socket:[…]` and a
+            // 33-byte `exe`-style target alike. Every other link here reports
+            // zero, which is what Linux reports for `exe`, `cwd`, `root`,
+            // `ns/*` and `/proc/self`.
+            size: if self.fd.is_some() { FD_LINK_SIZE } else { 0 },
+        }
+    }
+
+    fn mode(&self) -> u32 {
+        // The link's own permission bits, which is the half `stat` never sees:
+        // `stat` follows the name to the file (item 24's whole point) and
+        // `lstat` stops here. Linux gives a descriptor's second name the
+        // direction the descriptor was opened in and every other magic link
+        // `0777` (measured, `.workbuddy/probe_proclink_mode.c`).
+        match self.fd {
+            Some(fd) => {
+                fd_link_mode(fd_access(self.pid, fd).unwrap_or(crate::vfs::file::ACC_RDONLY))
+            }
+            None => 0o777,
         }
     }
 
@@ -229,14 +250,31 @@ struct ProcDir {
     entries: Entries,
     /// The children that are not in `entries` because they are not fixed.
     dynamic: Option<Arc<dyn Dynamic>>,
+    /// The permission bits Linux gives *this* directory, when they are not the
+    /// kind's default. Zero means the default, which is what every proc
+    /// directory but `/proc/<pid>/fd` reports here.
+    mode: u32,
+    /// Whether the directory's own size is the number of entries it lists,
+    /// which is Linux's rule for `/proc/<pid>/fd` alone (`st_size` there is
+    /// the descriptor count) and no other directory in this tree.
+    size_is_count: bool,
 }
 
 impl ProcDir {
     fn new(dynamic: Option<Arc<dyn Dynamic>>) -> Arc<ProcDir> {
+        ProcDir::own(dynamic, 0, false)
+    }
+
+    /// A directory whose own metadata is Linux's rather than the kind's
+    /// default: its permission bits, and whether its size is the number of
+    /// entries it lists.
+    fn own(dynamic: Option<Arc<dyn Dynamic>>, mode: u32, size_is_count: bool) -> Arc<ProcDir> {
         Arc::new(ProcDir {
             ino: next_ino(),
             entries: Mutex::new(RefCell::new(BTreeMap::new())),
             dynamic,
+            mode,
+            size_is_count,
         })
     }
 
@@ -255,8 +293,24 @@ impl Inode for ProcDir {
         Metadata {
             ino: self.ino,
             kind: NodeKind::Dir,
-            size: 0,
+            // Linux gives a directory its own size only where the number of
+            // things it holds is the whole of what it is - measured for
+            // `/proc/<pid>/fd` alone (3 descriptors answer 3, 23 answer 23,
+            // and a hole is a *number* rather than a span, so fds 0 and 200
+            // with one more open answer 3): every other proc directory reports
+            // zero and the kind's own permission bits.
+            size: if self.size_is_count {
+                self.read_dir()
+                    .map(|listed| listed.len() as u64)
+                    .unwrap_or(0)
+            } else {
+                0
+            },
         }
+    }
+
+    fn mode(&self) -> u32 {
+        self.mode
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
@@ -811,6 +865,55 @@ fn fd_target(pid: usize, fd: usize) -> Option<String> {
 
 #[cfg(not(target_os = "none"))]
 fn fd_target(_pid: usize, _fd: usize) -> Option<String> {
+    None
+}
+
+/// The size an `/proc/<pid>/fd/<N>` link reports about itself.
+///
+/// 64 on Linux, for every descriptor and whatever it names - measured on a
+/// current host with `.workbuddy/probe_proclink_mode.c` (`lstat` through
+/// `syscall(2)`, Linux 7.2.9): the read-only link to a 9-byte `/dev/null`, the
+/// `O_RDWR` one, and one whose target is a pathless socket all answer 64, while
+/// `readlink` answers the target's *text* and the same call on `exe`/`cwd`/
+/// `root` answers 0. It is procfs's own constant rather than a property of the
+/// file the descriptor holds, which is why it lives here and not on the
+/// description.
+const FD_LINK_SIZE: u64 = 64;
+
+/// The permission bits an `/proc/<pid>/fd/<N>` link reports about itself, from
+/// the direction its descriptor was opened in.
+///
+/// Measured on a current host (`.workbuddy/probe_proclink_mode.c`, `lstat`
+/// through `syscall(2)`, one descriptor per direction): `0500` read-only,
+/// `0300` write-only, `0700` both - the two halves are *bits*, so a descriptor
+/// opened both ways carries both - and `0` for one opened with neither, which is
+/// what an `O_PATH` descriptor reports. This kernel has no `O_PATH` (its `open`
+/// drops the bit and serves the open it was asked for), so the zero case is
+/// named in `docs/uapi/` §5.2 rather than reachable here.
+///
+/// A descriptor that is not open answers the read half. That is a default
+/// rather than a measurement: by the time a caller could see it the name is
+/// `ENOENT`, because the entry is minted per lookup from the descriptor list.
+fn fd_link_mode(access: u32) -> u32 {
+    use crate::vfs::file::{ACC_RDONLY, ACC_WRONLY};
+    match access {
+        ACC_WRONLY => 0o300,
+        ACC_RDONLY => 0o500,
+        _ => 0o700,
+    }
+}
+
+/// The direction the descriptor `fd` of `pid` was opened in, or `None` when it
+/// is not open.
+#[cfg(target_os = "none")]
+fn fd_access(pid: usize, fd: usize) -> Option<u32> {
+    crate::sched::descriptor_access(pid, fd)
+}
+
+/// The host build has no task table, so no descriptor has a direction; the
+/// shape tests that reach here get the read-only word.
+#[cfg(not(target_os = "none"))]
+fn fd_access(_pid: usize, _fd: usize) -> Option<u32> {
     None
 }
 
@@ -1725,8 +1828,7 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
 
     // `/proc/<pid>/fd`: one link per open descriptor, whose target is the
     // path it was opened by.
-    let fds = ProcDir::new(Some(Arc::new(Descriptors { pid })));
-    node.add("fd", NodeKind::Dir, fds);
+    node.add("fd", NodeKind::Dir, descriptor_dir(pid));
 
     // `/proc/<pid>/ns`: one link per namespace the process is in, naming the
     // namespace the way `readlink` reports it and handing `setns` the object
@@ -1764,6 +1866,20 @@ impl Dynamic for Threads {
 /// The open descriptors of one process, as `/proc/<pid>/fd` names them.
 struct Descriptors {
     pid: usize,
+}
+
+/// `/proc/<pid>/fd`, built with the metadata Linux gives that directory rather
+/// than the kind's default.
+///
+/// It is the one proc directory whose own mode and size are about its contents:
+/// measured on a current host (`.workbuddy/probe_proclink_mode.c`), `lstat`
+/// answers `S_IFDIR | 0500` - not the `0555` every other proc directory carries
+/// - and a size that is the number of descriptors it lists, so opening another
+/// descriptor moves it by one and closing one moves it back. A listing tool
+/// that filters or colours by the mode reads that `0500`, and a `du`-shaped
+/// reader of `st_size` reads the count.
+fn descriptor_dir(pid: usize) -> Arc<ProcDir> {
+    ProcDir::own(Some(Arc::new(Descriptors { pid })), 0o500, true)
 }
 
 impl Dynamic for Descriptors {
@@ -2705,6 +2821,20 @@ impl FileSystem for ProcFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/proc/<pid>/fd/<N>`'s own permission bits come from the direction its
+    /// descriptor was opened in, and the three directions are the three words
+    /// measured on a current host (`.workbuddy/probe_proclink_mode.c`).
+    #[test]
+    fn an_fd_links_own_mode_is_the_direction_it_was_opened_in() {
+        use crate::vfs::file::{ACC_RDONLY, ACC_RDWR, ACC_WRONLY};
+        assert_eq!(fd_link_mode(ACC_RDONLY), 0o500);
+        assert_eq!(fd_link_mode(ACC_WRONLY), 0o300);
+        assert_eq!(fd_link_mode(ACC_RDWR), 0o700);
+        // The two halves are bits, so the both-ways word is their union rather
+        // than a third value - the shape a socketpair's end reports.
+        assert_eq!(fd_link_mode(ACC_RDONLY) | fd_link_mode(ACC_WRONLY), 0o700);
+    }
 
     /// `/proc/net/tcp` is parsed by fixed column positions, so its address byte
     /// order (`127.0.0.1` -> `0100007F`) and the state byte must be exact.

@@ -239,9 +239,91 @@ fn main() {
                 "lstat by the name names the link",
                 kind_of(&st) == FileType::Symlink,
             );
+            // The link's *own* metadata, which is what `lstat` is for and what
+            // `stat` above cannot see: Linux gives a descriptor's second name
+            // the direction its descriptor was opened in, as two bits (this
+            // fixture is `O_RDWR`, so both), and 64 bytes whatever the target's
+            // text is. Both measured (`.workbuddy/probe_proclink_mode.c`).
+            r.check(
+                "and its own mode is the direction the descriptor was opened in",
+                st.st_mode & 0o7777 == 0o700,
+            );
+            r.check("and it is 64 bytes of its own", st.st_size == 64);
         }
-        Err(e) => r.check(&format!("lstat by the name answers (got {e})"), false),
+        Err(e) => {
+            r.check(&format!("lstat by the name answers (got {e})"), false);
+            r.check(
+                "and its own mode is the direction the descriptor was opened in",
+                false,
+            );
+            r.check("and it is 64 bytes of its own", false);
+        }
     }
+
+    // ---- the two other directions, and the link that is not a descriptor ---
+    //
+    // The read and write halves are *bits*, so the three directions are three
+    // words rather than a value: measured on a current host, a pipe's read end
+    // is `0500` and its write end `0300`, while a magic link that names
+    // something other than a descriptor - `exe`, `cwd`, `root`, `/proc/self` -
+    // is `0777`.
+    let ends = pipe_with(PipeFlags::empty());
+    match &ends {
+        Ok(p) => {
+            for (end, want, what) in [
+                (&p.0, 0o500u32, "a read end's link is read-only"),
+                (&p.1, 0o300u32, "a write end's link is write-only"),
+            ] {
+                let mode = statat(CWD, name_of(root, end), AtFlags::SYMLINK_NOFOLLOW)
+                    .ok()
+                    .map(|st| st.st_mode & 0o7777);
+                r.check(&format!("{what} (got {mode:x?})"), mode == Some(want));
+            }
+        }
+        Err(e) => {
+            r.check(&format!("a pipe opens (got {e})"), false);
+            r.check("a write end's link is write-only", false);
+        }
+    }
+    drop(ends);
+    let exe = format!("{root}/self/exe");
+    match statat(CWD, &exe, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => r.check(
+            "a link that names no descriptor is 0777 and no bytes",
+            st.st_mode & 0o7777 == 0o777 && st.st_size == 0,
+        ),
+        Err(e) => r.check(&format!("{exe} stats (got {e})"), false),
+    }
+
+    // ---- the descriptor *directory* also has metadata of its own -----------
+    //
+    // `/proc/<pid>/fd` is the one proc directory Linux does not leave at the
+    // kind's default: measured, it is `0500` rather than `0555`, and its size is
+    // the number of descriptors it lists - so opening one more moves the size by
+    // one, which is the property claimed rather than a count that would depend
+    // on how many the runner happens to hold.
+    let dir_name = format!("{root}/self/fd");
+    let before = statat(CWD, &dir_name, AtFlags::SYMLINK_NOFOLLOW).ok();
+    match &before {
+        Some(st) => {
+            r.check(
+                "the descriptor directory names a directory",
+                kind_of(st) == FileType::Directory,
+            );
+            r.check("and its own mode is 0500", st.st_mode & 0o7777 == 0o500);
+        }
+        None => {
+            r.check("the descriptor directory names a directory", false);
+            r.check("and its own mode is 0500", false);
+        }
+    }
+    let extra = openat(CWD, NULL_DEV, OFlags::RDONLY, Mode::empty());
+    let after = statat(CWD, &dir_name, AtFlags::SYMLINK_NOFOLLOW).ok();
+    r.check(
+        "and opening one more descriptor moves its size by one",
+        matches!((&before, &after), (Some(b), Some(a)) if a.st_size == b.st_size + 1),
+    );
+    drop(extra);
 
     // ---- statx agrees, both ways ------------------------------------------
     match statx(CWD, &name, AtFlags::empty(), StatxFlags::BASIC_STATS) {

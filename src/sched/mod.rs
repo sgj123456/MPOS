@@ -50,34 +50,34 @@ pub use runtime::{
     current_net_ns, current_owner, current_pending, current_pgid, current_pid_number,
     current_real_owner, current_rlimit, current_root, current_stack_range, current_tgid,
     current_tls, current_umask, current_user_ns, current_uts, deliver_pending_signal,
-    descriptor_numbers, descriptors_of, detach_traced, discard_exit_code, exec_replace, exit,
-    exit_code, exit_group, fork, frames_range_free, get_mmap_cursor, group_members, has_children,
-    has_deliverable_signal, has_live_child, has_matching_children, has_seccomp_filter, has_tracer,
-    identity_of, init, insert_vma, is_child, is_running, is_stopped, itimer_snapshot, itimer_swap,
-    kernel_lazy_accessible, madvise_dontneed, map_anon, map_facts, map_frames, mapping_name_at,
-    may_inspect, may_mint_pid_ns, membarrier_registrations, move_eager_ranges, move_user_page,
-    munmap_user, nice_of, ns_of, oom_score_adj_of, parent_of, pause, pgid_of, pid_number_of,
-    pid_numbers_of, poll_any_child_event, poll_child_event, populate_user_page_at, preempt,
-    process_members, protect_user, protect_user_range, read_user, read_user_of, record_eager_range,
-    register_membarrier, release_pid, release_user_frames, reset_disposition, resolve_anon_fault,
-    resolve_cow_fault, resolve_pid, resolve_script, resolve_stack_growth, resume_traced,
-    rlimits_of, robust_head, root_ns, run_seccomp_filters, send_signal, send_signal_group,
-    send_signal_info, send_signal_process, session_of_tty, set_brk_base, set_clear_tid,
-    set_current_blocked, set_current_comm, set_current_identity, set_current_rlimit,
-    set_current_tls, set_current_umask, set_cwd, set_cwd_path, set_mmap_cursor, set_net_ns,
-    set_nice, set_oom_score_adj, set_pgid, set_robust_head, set_root, set_seccomp_filter,
-    set_seccomp_strict, set_signal_action, set_signal_alt_stack, set_trace_options, set_tracer,
-    setns_mnt, setns_pid, setns_time, setns_user, setns_uts, signal_action, signal_alt_stack,
-    sleep_ticks, snapshot, snapshots, space_root_of, spawn, spawn_permanent, spawn_user, started,
-    stop_of, take_child_event, take_continued_report, take_deliverable_siginfo,
-    take_deliverable_signal, take_exit_code, take_fatal_signal, take_pending_event,
-    take_signal_in_set, take_stop_report, take_vmas, task_count, thread_group_has_siblings,
-    thread_snapshots, time_offsets, timer_alloc, timer_arm, timer_overrun, timer_remove,
-    timer_state, tls_of, trace_options, trace_syscall, tracer_of, try_spawn_user, uid_members,
-    unmap_user, unshare_files, unshare_fs, unshare_mnt, unshare_pid, unshare_time, unshare_user,
-    unshare_uts, user_frame_at, user_mapped, vfork, vma_gaps, vma_kind_at, vma_prot_at,
-    vma_range_free, wait_any_child_event, wait_child_event, wait_for_interrupt, wake,
-    with_current_credentials, write_user, write_user_of, yield_now,
+    descriptor_access, descriptor_numbers, descriptors_of, detach_traced, discard_exit_code,
+    exec_replace, exit, exit_code, exit_group, fork, frames_range_free, get_mmap_cursor,
+    group_members, has_children, has_deliverable_signal, has_live_child, has_matching_children,
+    has_seccomp_filter, has_tracer, identity_of, init, insert_vma, is_child, is_running,
+    is_stopped, itimer_snapshot, itimer_swap, kernel_lazy_accessible, madvise_dontneed, map_anon,
+    map_facts, map_frames, mapping_name_at, may_inspect, may_mint_pid_ns, membarrier_registrations,
+    move_eager_ranges, move_user_page, munmap_user, nice_of, ns_of, oom_score_adj_of, parent_of,
+    pause, pgid_of, pid_number_of, pid_numbers_of, poll_any_child_event, poll_child_event,
+    populate_user_page_at, preempt, process_members, protect_user, protect_user_range, read_user,
+    read_user_of, record_eager_range, register_membarrier, release_pid, release_user_frames,
+    reset_disposition, resolve_anon_fault, resolve_cow_fault, resolve_pid, resolve_script,
+    resolve_stack_growth, resume_traced, rlimits_of, robust_head, root_ns, run_seccomp_filters,
+    send_signal, send_signal_group, send_signal_info, send_signal_process, session_of_tty,
+    set_brk_base, set_clear_tid, set_current_blocked, set_current_comm, set_current_identity,
+    set_current_rlimit, set_current_tls, set_current_umask, set_cwd, set_cwd_path, set_mmap_cursor,
+    set_net_ns, set_nice, set_oom_score_adj, set_pgid, set_robust_head, set_root,
+    set_seccomp_filter, set_seccomp_strict, set_signal_action, set_signal_alt_stack,
+    set_trace_options, set_tracer, setns_mnt, setns_pid, setns_time, setns_user, setns_uts,
+    signal_action, signal_alt_stack, sleep_ticks, snapshot, snapshots, space_root_of, spawn,
+    spawn_permanent, spawn_user, started, stop_of, take_child_event, take_continued_report,
+    take_deliverable_siginfo, take_deliverable_signal, take_exit_code, take_fatal_signal,
+    take_pending_event, take_signal_in_set, take_stop_report, take_vmas, task_count,
+    thread_group_has_siblings, thread_snapshots, time_offsets, timer_alloc, timer_arm,
+    timer_overrun, timer_remove, timer_state, tls_of, trace_options, trace_syscall, tracer_of,
+    try_spawn_user, uid_members, unmap_user, unshare_files, unshare_fs, unshare_mnt, unshare_pid,
+    unshare_time, unshare_user, unshare_uts, user_frame_at, user_mapped, vfork, vma_gaps,
+    vma_kind_at, vma_prot_at, vma_range_free, wait_any_child_event, wait_child_event,
+    wait_for_interrupt, wake, with_current_credentials, write_user, write_user_of, yield_now,
 };
 
 /// The `wait(2)` doors read the whole retired record, not just its code: a
@@ -296,6 +296,14 @@ pub fn membarrier_registrations() -> usize {
 #[cfg(not(target_os = "none"))]
 pub fn descriptor_numbers(_pid: usize) -> alloc::vec::Vec<usize> {
     alloc::vec::Vec::new()
+}
+
+/// And for the direction `/proc/<pid>/fd/<N>`'s own mode is derived from: no
+/// descriptor is open, so no direction is recorded. The machine build reads the
+/// live description in `runtime`.
+#[cfg(not(target_os = "none"))]
+pub fn descriptor_access(_pid: usize, _fd: usize) -> Option<u32> {
+    None
 }
 
 #[cfg(not(target_os = "none"))]

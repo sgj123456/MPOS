@@ -115,12 +115,32 @@ Section numbers are unchanged from the original `UAPI.md`.
   `..` the walk meets, which is the cost the walk's chain exists to avoid. Owner:
   `src/vfs/mount.rs`'s `resolve_walk`.
 
-  (d) **The link's own metadata is not Linux's.** `lstat` of the name (and `readlink`) is the door
-  that *should* stop at the link, and it does — but `ProcLink` reports the trait's `mode()` of `0`
-  and its own `size: 0`, where Linux derives the mode from the descriptor's *direction* — measured
-  `0700` for `O_RDWR`, `0300` for write-only, `0500` for read-only, and a directory's descriptor
-  `0500` — beside `st_size` 64. A listing tool that colours or filters by the link's mode reads a
-  different one. Owner: `src/vfs/procfs.rs`'s `ProcLink::metadata`/`mode`.
+  (d) **The link's own metadata is Linux's now. Landed 2026-10-17** (`docs/uapi/` §5.1 item 24).
+  The entry this replaces said `ProcLink` reported the trait's `mode()` of `0` and its own
+  `size: 0`, and the *observable* was the kind's default in both fields — `lstat` answered
+  `S_IFLNK | 0777` and size `0`, because `reported_mode` reads a filesystem that keeps no modes as
+  its kind's default, so the `0` was never what a caller saw (the counterfactual run reads back
+  `got Some(1ff)`). Measured whole on a current host first (`.workbuddy/probe_proclink_mode.c`,
+  Linux 7.2.9, `lstat` through `syscall(2)`): the link's mode is the *direction* its descriptor was
+  opened in, as two bits — `0500` read-only, `0300` write-only, `0700` both, and `0` for a
+  descriptor with neither (`O_PATH`) — its `st_size` is **64** whatever the target's text is
+  (`readlink` on the same name answers the *target*: 9 bytes for `/dev/null`), and every other magic
+  link (`exe`, `cwd`, `root`, `ns/*`, `/proc/self`) is `0777` with size `0`. The directory those
+  links live in has metadata of its own too: `/proc/<pid>/fd` is `S_IFDIR | 0500` rather than the
+  kind's `0755`, with a size that is **the number of descriptors it lists** (3 answer 3, 23 answer
+  23, and a hole is a number rather than a span — fds 0 and 200 with one more open answer 3).
+  `ProcLink::mode`/`metadata` report the link's half, `ProcDir` gained the two fields that let one
+  directory answer the other, and the direction is read off the live description
+  (`sched::descriptor_access`, the one record of what the open asked for), so the answer follows a
+  descriptor reopened or closed between two stats. **Two things stay named.** An `O_PATH`
+  descriptor — a flag this kernel drops, serving the open it was asked for — would report the
+  direction the open actually got where Linux reports neither bit. And every *other* proc/sys node
+  still answers the kind's default where Linux answers the node's own mode: measured, directories
+  are `0555` (`/proc/<pid>/ns` `0511`, `map_files` `0500`), read-only files `0444`, writable ones
+  `0644`, `/proc/self/mem` `0600`, and `/proc/cmdline` reports its own line's length as `st_size`
+  where this kernel reports `0` — a classification of the whole tree rather than of one link, and
+  its own owner. Owner: `src/vfs/procfs.rs`'s `ProcLink`/`ProcDir`,
+  `src/sched/runtime/procfs.rs`'s `descriptor_access`. Pin: `t-fd-name`.
 
 - **`getcwd` derives the cwd's name from the directory. Landed 2026-10-17** (`docs/uapi/` §5.1
   item 31). This entry used to read that `getcwd` reported the path the process `chdir`'d by where
