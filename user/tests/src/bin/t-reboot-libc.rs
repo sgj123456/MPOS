@@ -25,14 +25,19 @@
 //! Two facts worth naming. The call goes through `libc::reboot`, which is what
 //! a C program - busybox init included - reaches for, and musl's wrapper is
 //! what supplies the two magic words, so the test pins the *entry point* the
-//! boot uses rather than this file's memory of the pair. And the kernel does
-//! not ask who is calling: Linux requires `CAP_SYS_BOOT` and answers `EPERM` to
-//! an unprivileged caller, where this handler answers `0` to anyone. That
-//! divergence is pre-existing on both machines, is named here rather than
-//! hidden, and is why the test asserts `0` only as root - which is the identity
-//! a test sweep runs as.
+//! boot uses rather than this file's memory of the pair. And the gate is
+//! `CAP_SYS_BOOT`, asked of the **initial** user namespace - `capable()`, not
+//! the caller's own: measured on a current host
+//! (`.workbuddy/probe_capable_scope.sh`), a user-namespace root holding the
+//! whole capability set *in it* is refused every command, which is the claim
+//! the last section below makes. (This header used to say the kernel asked
+//! nobody, which stopped being true when the gate landed.) The policy words are
+//! therefore asserted `0` only as root - the identity a test sweep runs as -
+//! and a non-root run says so instead of pinning the refusal twice.
 
 use std::ffi::c_int;
+
+use mpos_user_tests::in_user_namespace;
 
 /// What the test reports: a name, and whether the claim held.
 struct Report {
@@ -63,10 +68,29 @@ fn main() {
     println!("t-reboot-libc");
     let mut r = Report { failed: false };
 
+    // ---- the namespace the capability belongs to ---------------------------
+    //
+    // `capable(CAP_SYS_BOOT)` is the initial user namespace, so a caller that
+    // has entered one of its own is refused every command - including the two
+    // policy words this program exists for, which it may not reach by being in
+    // a namespace rather than by lacking the capability. Measured on a current
+    // host first (`.workbuddy/probe_capable_scope.sh`). Linux's own rule is one
+    // step finer - `ns_capable(task_active_pid_ns(current)->user_ns, ...)`, the
+    // *pid* namespace's owner - and `docs/uapi/` §5.2 names that refinement;
+    // every caller this kernel can have is in the initial pid namespace, where
+    // the two rules agree.
+    let denied = in_user_namespace(|| reboot(libc::LINUX_REBOOT_CMD_CAD_OFF).err().unwrap_or(0));
+    r.check(
+        &format!("CAD_OFF inside a user namespace is EPERM (got {denied:?})"),
+        denied == Some(libc::EPERM),
+    );
+
     if unsafe { libc::geteuid() } != 0 {
-        // Linux's own answer for an unprivileged caller would be `EPERM`, and
-        // this kernel does not model the capability - so the pin would be
-        // asserting a divergence rather than the contract.
+        // The policy words are *served* to a caller holding `CAP_SYS_BOOT`,
+        // which a sweep runs as; an unprivileged caller is refused on both
+        // kernels, so a run as one would be pinning the refusal and not the
+        // words. The user-namespace half of the same question is claimed below
+        // and is refused here as well - it is the namespace, not the uid.
         println!("skip:  not root, so the policy words are not this kernel's to answer");
         println!("PASS");
         return;

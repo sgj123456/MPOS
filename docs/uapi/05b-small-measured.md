@@ -47,15 +47,17 @@ Section numbers are unchanged from the original `UAPI.md`.
   `t-mknod`'s capability section pins all of it from both sides — a root caller that lowers its
   effective id for the duration, and an ordinary user, which is what a host run is.
 
-  **One corner is named rather than fixed: which namespace the capability is held in.** Linux's
-  `vfs_mknod` asks `capable(CAP_MKNOD)`, and `capable` is the **initial** user namespace — so a caller
-  that has entered a user namespace, is uid 0 in it and reads the whole set back *still* cannot make a
-  device node on a filesystem the parent namespace owns (measured: `.workbuddy/probe_mknod_userns.sh`,
-  Linux 7.2.9 — `touch` in the same directory answers `0` while `mknod c 1 3` answers `EPERM`, and the
-  `dev 0` whiteout is served there as it is outside). This kernel's checks ask the caller's own
-  namespace, so that caller *is* served here. The gap is the capability model's rather than this
-  call's — it is the scoped `capable(ns, cap)` `crates/cred` names as its own (its
-  `on_enter_user_ns`, §6.3), and it is named there because that is where a fix would go.
+  **Which namespace the capability is held in — landed 2026-10-17** (`docs/uapi/` §5.1 item 38).
+  Linux's `vfs_mknod` asks `capable(CAP_MKNOD)`, and `capable` is the **initial** user namespace —
+  so a caller that has entered a user namespace, is uid 0 in it and reads the whole set back *still*
+  cannot make a device node on a filesystem the parent namespace owns (measured:
+  `.workbuddy/probe_mknod_userns.sh`, Linux 7.2.9 — `touch` in the same directory answers `0` while
+  `mknod c 1 3` answers `EPERM`, and the `dev 0` whiteout is served there as it is outside). The
+  entry this replaces said this kernel's checks ask the caller's own namespace, so that caller was
+  served here, and named the gap as the capability model's. It is closed for the four call sites
+  whose Linux rule is `capable()` — `mknod`'s `CAP_MKNOD`, `fileattr_set`'s `CAP_LINUX_IMMUTABLE`,
+  `reboot`'s `CAP_SYS_BOOT` and `syslog`'s `CAP_SYSLOG` — through `Credentials::capable`
+  (`crates/cred`), with the three *other* shapes named below rather than approximated.
 
 - **A device node made by `mknod` carries no device number.** `st_rdev` is the field `mknod(2)`'s
   `dev` argument fills - measured on the host, `/dev/null` reports `rdev 1:3`, the number its own
@@ -503,3 +505,39 @@ Section numbers are unchanged from the original `UAPI.md`.
   the two mount names through the crossing door, and this entry is the measurement of the other
   one. Owner: `src/vfs/mount.rs`'s `resolve_no_follow`/`split_last`. Pin: none yet — the two
   behavioral halves (a crossed `lstat`, an `EBUSY` `rmdir`) are what a pin would have to claim.
+
+- **Three capability scopes this kernel's one word cannot express. Named 2026-10-17** (`docs/uapi/`
+  §5.1 item 38's measurement; `crates/cred`'s `Credentials::user_ns_initial`). The landed change
+  gives the model the two questions Linux's own call sites ask — the caller's *own* namespace
+  (`has_effective`, what `unshare`'s `CAP_SYS_ADMIN` and `chroot`'s `CAP_SYS_CHROOT` ask) and the
+  **initial** one (`capable`, what `mknod`'s, `fileattr_set`'s, `syslog`'s and `reboot`'s ask,
+  measured in `.workbuddy/probe_capable_scope.sh`: a user-namespace root is served the first two and
+  refused the last four). Linux has three more shapes, and each site below asks one of them:
+
+  - **`setns` asks the namespace being *joined*** — `ns_capable(ns->user_ns, CAP_SYS_ADMIN)` — and
+    the check comes *before* the "already in it" no-op. Measured (the probe's `setns` mode): a
+    credential scoped to a child user namespace, holding the whole set in it, is `EPERM` when it
+    joins a mount namespace owned by the initial one. This kernel asks the caller's own, so such a
+    caller is allowed where Linux refuses. The fix is not this word: it needs the *object's*
+    namespace, which the object carries and the credential does not.
+  - **`AF_PACKET` asks the *network* namespace's owner** — `ns_capable(sock_net(sk)->user_ns,
+    CAP_NET_RAW)` — which is why the measurement splits the two ways it does: `EPERM` inside a bare
+    user namespace (the net namespace is still the machine's, whose owner is the initial one) and
+    **served** inside a user namespace made *with* `CLONE_NEWNET` (its owner is that user
+    namespace). This kernel asks the caller's own, so the bare case is served where Linux refuses.
+  - **`CAP_DAC_OVERRIDE` asks the *file's* filesystem's user namespace** —
+    `capable_wrt_inode_uidgid` — and the same distinction applies to `CAP_FOWNER` and the rest of
+    that family. Measured, and the sharpest of the three: a caller whose credential has uid 0
+    mapped to the *outside* root reads a `0600` file owned by the outside user (`/tmp/…`) as
+    **`EACCES`** on Linux, because the file's filesystem belongs to the initial namespace and the
+    credential's does not — where this kernel's permission model asks `uid 0` outright
+    (`src/vfs/mod.rs`'s root branch), so it would allow it. That is a divergence of the *permission
+    model* rather than of a syscall gate, and its fix is a capability question where a uid question
+    is today. Two smaller members of the family are named with it: `reboot`'s rule is one step
+    finer than `capable()` — `ns_capable(task_active_pid_ns(current)->user_ns, CAP_SYS_BOOT)`, the
+    *pid* namespace's owner, which agrees with the initial namespace for every caller this kernel
+    has — and it asks the capability *before* the magic, where this kernel answers `EINVAL` for a
+    bad magic first (measured by the same probe, which passes an invalid magic and gets `EPERM`);
+    and `/proc/<pid>/uid_map`'s writer rule is the **parent** namespace's `CAP_SETUID` or the writer
+    being the map's owner, where this kernel's `map_ctl` asks the caller's own (§6.3 carries the
+    one self-naming line the owner rule is measured by).

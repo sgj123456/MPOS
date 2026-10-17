@@ -45,7 +45,7 @@
 //! is unchanged. The host run's divergence is now two gates agreeing on
 //! placement and differing only on who holds the key.
 
-use mpos_user_tests::{Report, host_run};
+use mpos_user_tests::{Report, host_run, in_user_namespace};
 
 /// `syslog(type, buf, len)` through the raw door: the byte count, `0`,
 /// or `-errno` on failure - the syscall's own answers.
@@ -161,6 +161,31 @@ fn main() {
     r.check(
         "an unknown type answers EINVAL",
         unknown == -(libc::EINVAL as isize) || privileged_host(unknown),
+    );
+
+    // ---- the namespace the capability belongs to ---------------------------
+    //
+    // The gate is `capable(CAP_SYSLOG)` - the **initial** user namespace - and
+    // not the caller's own. The two differ for a caller that has entered a user
+    // namespace of its own, which holds the whole capability set *in it* (the
+    // rung's measured grant, §6.3) and is refused the ring anyway. Measured on
+    // a current host first (`.workbuddy/probe_capable_scope.sh`), where the
+    // answer is `EPERM` both outside and inside - the initial namespace's own
+    // caller holds no `CAP_SYSLOG` in this sandbox either, so the *pair* is
+    // what discriminates: inside the namespace the capability is demonstrably
+    // held (the same child may `unshare(CLONE_NEWNS)`) and the refusal stands.
+    let size = in_user_namespace(|| syslog(10, core::ptr::null_mut(), 0) as i32);
+    r.check(
+        &format!("the ring's size inside a user namespace is EPERM (got {size:?})"),
+        size == Some(-libc::EPERM),
+    );
+    // And the same refusal for a type that is *not* a type: the capability is
+    // asked before the type is, which is the ordering the section above pins
+    // from the privileged side.
+    let unknown = in_user_namespace(|| syslog(99, core::ptr::null_mut(), 0) as i32);
+    r.check(
+        &format!("and so is an unknown type there, before EINVAL (got {unknown:?})"),
+        unknown == Some(-libc::EPERM),
     );
 
     r.finish()

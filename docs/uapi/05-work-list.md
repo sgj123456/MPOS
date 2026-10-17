@@ -1152,3 +1152,63 @@ the commit bodies), and each moved its pin in the same commit.
     both kernels are the shape guards (the sysctl `0644`, `oom_score_adj` `0644`, the
     configuration-space window `0644`, `/sys/class` and `/sys/class/block` `0755`, and `uevent`
     `0644`).
+
+38. **A capability is held *in* a namespace, and the two questions Linux asks about that are two
+    different ones.** Item 36's named corner (`docs/uapi/` §5.2): `vfs_mknod` asks
+    `capable(CAP_MKNOD)`, which is the **initial** user namespace, where this kernel asked the
+    caller's own — so a caller that had entered a user namespace, was uid 0 in it and read the whole
+    capability set back was served a device node that Linux refuses (§15.53's measurement,
+    `.workbuddy/probe_mknod_userns.sh`). The corner was named as the *capability model's* rather
+    than that call's, and this pass closes it where the model can: `Credentials` gains the
+    distinction, and the four call sites whose Linux rule is `capable()` ask the new question.
+    **Measured whole on a current host first** (`.workbuddy/probe_capable_scope.{c,sh}`, Linux
+    7.2.9, one table per namespace — unprivileged in the initial one, uid 0 in a user namespace,
+    uid 0 in a user namespace made *with* a network namespace, and root in a user namespace whose
+    `0` is mapped to the outside root): a user-namespace root, `CapEff` `0x1ffffffffff`, is
+    **served** `chroot` (`0`) and `unshare(CLONE_NEWNS)` (`0`) and **refused** `mknod(c 1 3)`
+    (`EPERM`), `reboot` with an invalid magic (`EPERM`), `syslog`'s ring size (`EPERM`) and
+    `FS_IOC_SETFLAGS` with `FS_IMMUTABLE_FL` on a file it owns (`EPERM`); the ordinary file beside
+    the device node is served (`0`) and the `dev 0` whiteout too (`0`), so the refusal is the
+    capability and not the namespace's unmapped ids. Three more answers fall out of the same table
+    and are what makes the split visible rather than assumed: `AF_PACKET` is `EPERM` in a *bare*
+    user namespace and **served** in one made with `CLONE_NEWNET` (Linux asks the *network*
+    namespace's owner), `setns` into a mount namespace owned by the initial one is `EPERM` from a
+    child namespace (Linux asks the namespace *being joined*), and a file owned by the outside user
+    is `EACCES` to a caller whose uid 0 is mapped to the outside root (Linux asks the *file's*
+    filesystem's namespace, `capable_wrt_inode_uidgid`). **The fix is one field and one predicate,
+    and it is deliberately not a namespace pointer.** `Credentials::user_ns_initial` records
+    whether the sets are held in the initial namespace at all — a flag rather than a level or an id,
+    because every door here moves a caller *deeper* (`unshare`, `clone(CLONE_NEWUSER)`, and a
+    `setns` that refuses a caller's own namespace with `EINVAL`), so it can only ever go from true
+    to false; `on_enter_user_ns` clears it beside the grant it already makes. `capable(cap)` is the
+    initial-namespace question and `has_effective(cap)` — whose doc now says which namespace it is
+    asked of — stays the caller's own. The four sites switch: `mknod`'s two doors (`CAP_MKNOD`),
+    `FS_IOC_SETFLAGS`' immutable and append bits (`CAP_LINUX_IMMUTABLE`), `reboot`
+    (`CAP_SYS_BOOT`) and `syslog` (`CAP_SYSLOG`). **Three shapes stay named in §5.2** because this
+    word cannot express them, each with the measurement above: `setns`'s and `AF_PACKET`'s ask the
+    *object's* namespace, and `CAP_DAC_OVERRIDE` asks the *file's* filesystem's (the permission
+    model's root branch, which asks uid 0 rather than a capability — its own item). Two smaller
+    members of that family are named with them: `reboot`'s rule is one step finer than `capable()`
+    (`ns_capable(task_active_pid_ns(current)->user_ns, …)`, which agrees with the initial namespace
+    for every caller here) and asks the capability *before* the magic where this kernel asks the
+    magic first; and `/proc/<pid>/uid_map`'s writer rule is the *parent* namespace's `CAP_SETUID`
+    or the map's owner. Owner: `crates/cred`'s `Credentials::capable`/`user_ns_initial`, and the
+    four gates (`src/syscall/linux/fs/file.rs`, `fs/ioctl.rs`, `proc.rs`). Pin: four programs, seven
+    new claims (five refusals and two controls), all built on one new
+    `mpos_user_tests::in_user_namespace` — `t-mknod` (a device node inside a user namespace is
+    `EPERM`, an ordinary file in the same directory is served), `t-fsflags` (`IMMUTABLE` is `EPERM`
+    there, `NODUMP` is served), `t-reboot-libc` (`CAD_OFF` is `EPERM` there) and `t-syslog` (the
+    ring's size, and an unknown type *before* its `EINVAL`) — beside a host unit test in
+    `crates/cred` for the mapping itself — the five refusals and the two controls, identical
+    `ok:` lines on both machines. Gate: x86_64 `pass=181 fail=0 (181 built)`, `mpos-kunit` 32
+    passed, 0 failed, exit 33 (181 staged, 11 left out); the second machine's arm of the same gate
+    is `pass=180 fail=0`, `mpos-kunit` 32 passed, 0 failed (180 staged, 12 left out). The
+    counterfactual is exact: with only the kernel half reverted (the leaf crate and the four
+    gates) and the pins kept, the sweep is `pass=177 fail=4 (181 built)` with the kernel's own
+    `mpos-kunit` line unmoved at 32 passed, 0 failed — the four red programs are exactly the four
+    pins, and their five red claims are the refusals themselves, each served with the namespace's
+    capability (`got Some(0)` for `IMMUTABLE`, the device node and `CAD_OFF`; `got Some(16384)`,
+    the ring's size, for `syslog`; and `got Some(-22)` where the type check came first) — while
+    the two controls (`an ordinary file in the same directory is served`, `a bit needing no
+    capability is served there`) pass on both kernels, which is what keeps the refusals on the
+    capability rather than on the namespace.

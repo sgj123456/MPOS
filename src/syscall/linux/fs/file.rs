@@ -4590,9 +4590,15 @@ pub fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // the caller may not write, `ENOENT` for a path that is not there. The one
     // device node that needs none is the character node whose `dev` is `0`,
     // which is how overlayfs spells a whiteout; `abi::mknod_needs_capability`
-    // holds that rule and its measurement.
+    // holds that rule and its measurement - and the capability is asked of the
+    // **initial** user namespace, which is Linux's `capable(CAP_MKNOD)` rather
+    // than `ns_capable(current_user_ns(), ...)`: measured
+    // (`.workbuddy/probe_capable_scope.sh`), a caller that has entered a user
+    // namespace is uid 0 *in it*, reads `CapEff` `0x1ffffffffff` back, and is
+    // refused a device node in a directory the *parent* namespace owns while an
+    // ordinary file in that same directory is served.
     if abi::mknod_needs_capability(args[1], args[2])
-        && !crate::sched::current_credentials().has_effective(crate::cred::CAP_MKNOD)
+        && !crate::sched::current_credentials().capable(crate::cred::CAP_MKNOD)
     {
         return err::EPERM;
     }
@@ -5786,16 +5792,19 @@ pub fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Err(e) => return e,
     };
     // Linux's `CAP_MKNOD`, the position the comment above reserved for it and
-    // the last question this call has: only a *device* node asks, and it is the
-    // **effective set** of the running caller that answers. Measured as an
-    // unprivileged caller on a current host (`.workbuddy/probe_mknod_cap.c`,
-    // Linux 7.2.9): a character or block node is `EPERM`, a
-    // `S_IFREG`/`S_IFIFO`/`S_IFSOCK` node is served, the character node whose
-    // `dev` is `0` (an overlayfs whiteout) is served too, and every refusal
-    // above comes first - `EEXIST`, `EACCES` in a directory the caller may not
-    // write, `ENOENT` for a path that is not there.
+    // the last question this call has: only a *device* node asks, and the
+    // namespace that answers is the **initial** one - `capable()`, not the
+    // caller's own. Measured as an unprivileged caller on a current host
+    // (`.workbuddy/probe_mknod_cap.c`, Linux 7.2.9): a character or block node
+    // is `EPERM`, a `S_IFREG`/`S_IFIFO`/`S_IFSOCK` node is served, the character
+    // node whose `dev` is `0` (an overlayfs whiteout) is served too, and every
+    // refusal above comes first - `EEXIST`, `EACCES` in a directory the caller
+    // may not write, `ENOENT` for a path that is not there. Measured again from
+    // inside a user namespace (`.workbuddy/probe_capable_scope.sh`): the
+    // device-node refusal survives the namespace's capability grant, which is
+    // what makes this the initial-namespace question and not the caller's.
     if abi::mknod_needs_capability(args[2], args[3])
-        && !crate::sched::current_credentials().has_effective(crate::cred::CAP_MKNOD)
+        && !crate::sched::current_credentials().capable(crate::cred::CAP_MKNOD)
     {
         return err::EPERM;
     }
@@ -6075,8 +6084,10 @@ pub fn handle_syslog(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     // `CAP_SYSLOG` answers `EPERM` even for a type it would otherwise refuse
     // (host-measured: the container's unknown type 99 came back `EPERM`, not
     // `EINVAL`, `NOTES.md` §15.11 batch 29). The check is first for exactly
-    // that ordering.
-    if !crate::sched::current_credentials().has_effective(crate::cred::CAP_SYSLOG) {
+    // that ordering, and the namespace it asks is the **initial** one - measured
+    // (`.workbuddy/probe_capable_scope.sh`): a user-namespace root, holding the
+    // whole set in its own namespace, is still refused the ring's size.
+    if !crate::sched::current_credentials().capable(crate::cred::CAP_SYSLOG) {
         return err::EPERM;
     }
     const READ: usize = 2;

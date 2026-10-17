@@ -155,13 +155,39 @@ pub struct Credentials {
     pub dumpable: u8,
     /// `PR_SET_KEEPCAPS`: whether a full uid drop keeps the permitted set.
     pub keepcaps: bool,
+    /// Whether the sets above are held in the **initial** user namespace.
+    ///
+    /// A capability is held *in* a namespace and the namespaces below it, and
+    /// Linux's `cap_capable` answers by walking from the namespace being asked
+    /// about *up* to `current_cred()->user_ns` - so the two questions this
+    /// kernel asks are two different ones about the same word:
+    /// [`has_effective`](Credentials::has_effective) is the caller's own
+    /// namespace (which is what `ns_capable(current_user_ns(), cap)` asks, and
+    /// what most checks here want - `unshare`'s `CAP_SYS_ADMIN`, `chroot`'s
+    /// `CAP_SYS_CHROOT`), and [`capable`](Credentials::capable) is
+    /// `capable(cap)`, true only for a credential that never left the initial
+    /// one. Measured on a current host (`.workbuddy/probe_capable_scope.{c,sh}`):
+    /// a user-namespace root - uid 0 in it, `CapEff` `0x1ffffffffff` - is
+    /// **served** `chroot` and `unshare(CLONE_NEWNS)` and **refused**
+    /// `mknod(c 1 3)`, `reboot`, `syslog` and `FS_IOC_SETFLAGS`, so those four
+    /// ask `capable()` where the first two ask the caller's own namespace.
+    ///
+    /// A flag rather than a namespace pointer, because of which way the doors
+    /// run: every door into a namespace here (`unshare`, `clone(CLONE_NEWUSER)`
+    /// and `setns`, which refuses a caller's *own* namespace with `EINVAL`)
+    /// moves a caller **deeper**, so this can only ever go from true to false.
+    /// The general question - a capability held in some other namespace, an
+    /// ancestor's or a sibling's - is not expressible in this word, and
+    /// `docs/uapi/` §5.2 names the two call sites that need it (`setns`'s and
+    /// `AF_PACKET`'s, which Linux asks of the *object's* namespace).
+    pub user_ns_initial: bool,
 }
 
 impl Credentials {
     /// The state a fresh process starts in: every capability held and in the
     /// bounding set, nothing inheritable (Linux's own default - the
     /// `CapInh` word a login shell carries is set by `pam`, not by the
-    /// kernel), dumpable by its own user.
+    /// kernel), dumpable by its own user, and in the initial user namespace.
     pub const fn initial() -> Self {
         Credentials {
             effective: CAP_FULL,
@@ -170,13 +196,39 @@ impl Credentials {
             bounding: CAP_FULL,
             dumpable: SUID_DUMP_USER,
             keepcaps: false,
+            user_ns_initial: true,
         }
     }
 
     /// Whether `cap` is in the effective set - the question every privilege
     /// check in Linux is really asking.
+    ///
+    /// The namespace this is asked *of* is the caller's own, which is
+    /// `ns_capable(current_user_ns(), cap)`: the sets are scoped to exactly
+    /// that namespace when they are granted, so holding the bit *is* holding it
+    /// there. A check whose Linux rule is `capable(cap)` - the initial user
+    /// namespace - asks [`capable`](Credentials::capable) instead.
     pub fn has_effective(self, cap: u32) -> bool {
         cap <= CAP_LAST_CAP && self.effective & (1u64 << cap) != 0
+    }
+
+    /// Whether `cap` is held in the **initial** user namespace: `capable(cap)`,
+    /// which is what `vfs_mknod`, `fileattr_set`'s immutable bit and `syslog`'s
+    /// reader gate ask outright, and what `reboot`'s answer comes to for a
+    /// caller with no pid namespace of its own (Linux asks *that* one -
+    /// `ns_capable(task_active_pid_ns(current)->user_ns, CAP_SYS_BOOT)`, which
+    /// `docs/uapi/` §5.2 names as the refinement this word cannot express).
+    ///
+    /// The measured difference between this and
+    /// [`has_effective`](Credentials::has_effective) is the whole
+    /// user-namespace rung: entering one hands the caller every capability *in
+    /// it*, and a capability held in a child namespace is not one held in the
+    /// parent - so a user-namespace root passes the checks that ask its own
+    /// namespace and fails these
+    /// ([`user_ns_initial`](Credentials::user_ns_initial) carries the
+    /// measurements).
+    pub fn capable(self, cap: u32) -> bool {
+        self.user_ns_initial && self.has_effective(cap)
     }
 
     /// Whether `cap` is in the bounding set, which is what `PR_CAPBSET_READ`
@@ -254,15 +306,20 @@ impl Credentials {
     /// same way. What the grant is *not*: it does not touch the task's
     /// identity, `dumpable` or `KEEPCAPS`, which are the namespace's business
     /// only through the id maps, and it grants nothing in the *parent*
-    /// namespace - a capability is held in a namespace and its descendants, and
-    /// this kernel's checks ask the caller's own namespace, so a single word
-    /// models the whole of it (a scoped `capable(ns, cap)` is the named gap,
-    /// §6.3).
+    /// namespace - a capability is held in a namespace and the namespaces below
+    /// it, so the sets are the *new* namespace's and
+    /// [`capable`](Credentials::capable) - the initial-namespace question -
+    /// answers false from here on. That is the whole of the scoping a caller
+    /// can observe through this kernel's doors: none of them opens *upward*
+    /// (`setns` refuses a caller's own namespace with `EINVAL`, and Linux's own
+    /// rule is that the credential must be in an ancestor of the namespace it
+    /// joins), so this flag moves one way only.
     pub fn on_enter_user_ns(&mut self) {
         self.effective = CAP_FULL;
         self.permitted = CAP_FULL;
         self.bounding = CAP_FULL;
         self.inheritable = 0;
+        self.user_ns_initial = false;
     }
 
     /// `capset`: validate one record's three sets and store them. `Err(())` is
@@ -548,6 +605,46 @@ mod tests {
         // The grant is the capability state and nothing else: the dumpable
         // flag is the namespace's business through the maps, not this.
         assert_eq!(c.dumpable, SUID_DUMP_USER);
+    }
+
+    #[test]
+    fn the_two_capability_questions_are_the_initial_namespace_and_the_callers_own() {
+        // Measured on a current host (`.workbuddy/probe_capable_scope.sh`, one
+        // call per namespace): a user-namespace root - uid 0 in it, `CapEff`
+        // `0x1ffffffffff` read back - is *served* `chroot` and
+        // `unshare(CLONE_NEWNS)` and *refused* `mknod(c 1 3)`, `reboot`,
+        // `syslog` and `FS_IOC_SETFLAGS`. So the first two are the caller's own
+        // namespace (the bit) and the other four are the initial one (the bit
+        // *and* the flag).
+        let mut c = Credentials::initial();
+        assert!(c.capable(CAP_MKNOD) && c.has_effective(CAP_MKNOD));
+        c.on_enter_user_ns();
+        assert!(
+            c.has_effective(CAP_MKNOD),
+            "the grant is a capability held in the namespace entered"
+        );
+        assert!(
+            !c.capable(CAP_MKNOD),
+            "and it is nothing in the namespace that was left"
+        );
+        // A capability the *bounding* set no longer holds is false for both,
+        // inside and outside a namespace: the grant is the namespace's, not a
+        // licence to hold what nothing holds.
+        let mut c = Credentials::initial();
+        c.capbset_drop(CAP_MKNOD as u64)
+            .expect("root holds CAP_SETPCAP");
+        c.capset(0, 0, 0).expect("clearing the sets");
+        assert!(!c.capable(CAP_MKNOD) && !c.has_effective(CAP_MKNOD));
+        // And the flag moves one way only: nothing this kernel can do puts a
+        // credential back in the initial namespace (`setns` refuses a caller's
+        // own namespace with `EINVAL`, and every other door moves deeper).
+        c.on_enter_user_ns();
+        assert!(!c.user_ns_initial);
+        c.on_enter_user_ns();
+        assert!(
+            !c.user_ns_initial,
+            "a second namespace is still not the first"
+        );
     }
 
     #[test]

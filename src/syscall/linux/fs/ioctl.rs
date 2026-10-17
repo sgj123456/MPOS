@@ -1297,12 +1297,15 @@ fn fs_flags_ioctl(fd: i32, request: u32, buf: usize, from_user: bool) -> isize {
             // is on the change rather than on the word, so writing back the
             // flags a file already has is always allowed - which is what every
             // `chattr` run does, since it reads the word, edits one bit and
-            // writes the whole thing back.
+            // writes the whole thing back. The namespace asked is the
+            // **initial** one - `capable()`, Linux's `fileattr_set`: measured
+            // (`.workbuddy/probe_capable_scope.sh`), a user-namespace root
+            // (uid 0 in it, the whole capability set read back) is refused this
+            // ioctl on a file it owns.
             let old = crate::vfs::flags_of(&inode);
             let privileged = crate::vfs::FS_IMMUTABLE_FL | crate::vfs::FS_APPEND_FL;
             if (flags ^ old) & privileged != 0
-                && !crate::sched::current_credentials()
-                    .has_effective(crate::cred::CAP_LINUX_IMMUTABLE)
+                && !crate::sched::current_credentials().capable(crate::cred::CAP_LINUX_IMMUTABLE)
             {
                 return err::EPERM;
             }

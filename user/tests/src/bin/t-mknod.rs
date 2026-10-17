@@ -91,7 +91,7 @@
 //! leaves it on this target (`-1` with the number beside it). The reads of what
 //! was made are `rustix`'s, because those are not the subject.
 
-use mpos_user_tests::Report;
+use mpos_user_tests::{Report, in_user_namespace};
 use rustix::fs::{AtFlags, CWD, FileType, Mode, statat, unlinkat};
 use rustix::process::{geteuid, umask};
 
@@ -172,7 +172,7 @@ fn clear() {
         let _ = unlinkat(CWD, path, AtFlags::empty());
     }
     for name in [
-        "chr", "blk", "whiteout", "blk0", "fifo", "reg", "sock", "exists",
+        "chr", "blk", "whiteout", "blk0", "fifo", "reg", "sock", "exists", "ns-chr", "ns-reg",
     ] {
         let _ = unlinkat(CWD, cap_dir(name).as_str(), AtFlags::empty());
     }
@@ -483,6 +483,35 @@ fn main() {
             again == 0 && kind_of(CHR_AGAIN) == Some(FileType::CharacterDevice),
         );
     }
+
+    // ---- the namespace the capability belongs to ---------------------------
+    //
+    // `vfs_mknod` asks `capable(CAP_MKNOD)` - the **initial** user namespace -
+    // and not `ns_capable(current_user_ns(), ...)`. The two answers differ for
+    // a caller that has entered a user namespace of its own, which holds the
+    // whole capability set *in it* (the rung's own measured grant, §6.3) and is
+    // still refused a device node on a directory the parent namespace owns.
+    // Measured on a current host first (`.workbuddy/probe_capable_scope.sh`),
+    // and the ordinary file in the same directory is the control that keeps the
+    // refusal on the capability rather than on the namespace's own ids: the
+    // child reads uid 65534 (an empty map) and may still make a plain name in a
+    // `0777` directory.
+    let device = in_user_namespace(|| {
+        let (rc, e) = mknodat(S_IFCHR | 0o666, 0x0103, cap_dir("ns-chr").as_str());
+        if rc == 0 { 0 } else { e }
+    });
+    let ordinary = in_user_namespace(|| {
+        let (rc, e) = mknodat(S_IFREG | 0o644, 0, cap_dir("ns-reg").as_str());
+        if rc == 0 { 0 } else { e }
+    });
+    r.check(
+        &format!("a device node inside a user namespace is EPERM (got {device:?})"),
+        device == Some(libc::EPERM),
+    );
+    r.check(
+        &format!("but an ordinary file in the same directory is served (got {ordinary:?})"),
+        ordinary == Some(0),
+    );
 
     clear();
     r.finish()

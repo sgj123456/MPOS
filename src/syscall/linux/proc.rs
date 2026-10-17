@@ -2130,7 +2130,19 @@ pub(super) fn handle_reboot(args: [usize; ARG_COUNT]) -> isize {
     // Linux's gate, after the magic and before the command (`CAP_SYS_BOOT`):
     // a caller without it answers `EPERM` for every command, the CAD policy
     // included. Everything in this image that reboots is root and holds it.
-    if !crate::sched::current_credentials().has_effective(crate::cred::CAP_SYS_BOOT) {
+    //
+    // The namespace is the **initial** one for every caller this kernel can
+    // have, which is the measured half of Linux's rule: `ns_capable` asks the
+    // *pid* namespace's owner, and a caller with no pid namespace of its own -
+    // which is every task here, and what the probe ran as - is refused by the
+    // initial one (`.workbuddy/probe_capable_scope.sh`: a user-namespace root
+    // gets `EPERM` for any command). The refinement is named in `docs/uapi/`
+    // §5.2: a task in a pid namespace of its own asks *that* namespace's owner,
+    // which this word cannot express. Nor is the order Linux's own, and that is
+    // measured too: the same probe answers `EPERM` for a command whose magic is
+    // invalid, so Linux asks the capability *before* the magic where this
+    // kernel asks the magic first (also named in §5.2).
+    if !crate::sched::current_credentials().capable(crate::cred::CAP_SYS_BOOT) {
         return err::EPERM;
     }
     if let abi::RebootCmd::Policy = cmd {

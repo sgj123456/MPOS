@@ -361,10 +361,17 @@ directory the mount covers.
 two device types do — `S_IFREG`/`S_IFIFO`/`S_IFSOCK` nodes are served to a caller holding not one
 capability — in Linux's place in the order (after the type, the name, the name's existence `EEXIST`
 and the directory's own `EACCES`), with the character node whose `dev` is `0` served too, because
-that is how overlayfs spells a whiteout. One corner is named in `docs/uapi/` §5.2 rather than fixed:
-Linux asks `capable(CAP_MKNOD)`, which is the **initial** user namespace, where this kernel's checks
-ask the caller's own — the capability model's own gap (§6.3), and the first place it is visible to a
-caller.
+that is how overlayfs spells a whiteout. The corner this paragraph used to name — Linux asks
+`capable(CAP_MKNOD)`, which is the **initial** user namespace, where this kernel's checks asked the
+caller's own — **closed 2026-10-17** (`docs/uapi/` §5.1 item 38): the capability model now carries
+the two questions Linux asks (`capable()` for the initial namespace, `has_effective()` for the
+caller's own), and the four gates whose Linux rule is `capable()` ask it — `mknod`, `FS_IOC_SETFLAGS`
+at the driver's/`fileattr_set`'s door, `reboot` and `syslog` — measured one namespace at a time
+(a user-namespace root is served `chroot` and `unshare(CLONE_NEWNS)` and refused those four). Three
+scopes the one word cannot express stay named in §5.2 with their measurements: `setns`'s and
+`AF_PACKET`'s ask the *object's* namespace, and `CAP_DAC_OVERRIDE` asks the *file's* filesystem's,
+where this kernel's permission model still asks uid 0 outright — a divergence of the permission
+model rather than of a gate.
 
 **A child's death is one `SIGCHLD` record, and it is Linux's** (`docs/uapi/` §5.1 item 29, landed
 2026-10-17): the second book this kernel kept for "an exit whose signal is unread" is deleted — the

@@ -77,12 +77,16 @@
 
 use std::ffi::c_void;
 
-use mpos_user_tests::{Report, host_run};
-use rustix::fd::{AsFd, AsRawFd, OwnedFd};
+use mpos_user_tests::{Report, host_run, in_user_namespace};
+use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{CWD, FileType, Mode, OFlags, SeekFrom, openat, seek, stat};
 use rustix::io::{Errno, read, write};
 use rustix::pipe::pipe_with;
 use rustix::process::{geteuid, getuid};
+
+/// The namespace section's own file: owned by this process, opened `O_RDWR`
+/// before any `fork`, and never left behind.
+const NS_FILE: &str = "/tmp/t-fsflags-ns";
 
 /// `_IOR('f', 0x01, long)`: read the attribute word.
 const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
@@ -637,6 +641,54 @@ fn main() {
         }
         let _ = rustix::fs::unlink(OWNED);
     }
+
+    // ---- the namespace the capability belongs to ---------------------------
+    //
+    // `fileattr_set` asks `capable(CAP_LINUX_IMMUTABLE)` - the **initial** user
+    // namespace - so a caller that has entered one of its own is refused the
+    // same way the unprivileged uid above was, even though entering it handed
+    // that caller the whole capability set *in it* (the rung's own measured
+    // grant, §6.3). Measured on a current host first
+    // (`.workbuddy/probe_capable_scope.sh`). The descriptor is this process's
+    // own `O_RDWR` one, inherited across the `fork`: the ioctl needs a writable
+    // descriptor, and the namespace's ids are unmapped, so a file it could open
+    // by name is one nobody wrote for this test. `NODUMP` beside `IMMUTABLE` is
+    // the control - the ioctl itself is served inside the namespace, and only
+    // the privileged bit is refused.
+    let _ = rustix::fs::unlink(NS_FILE);
+    let ns_fd = match openat(
+        CWD,
+        NS_FILE,
+        OFlags::CREATE | OFlags::RDWR | OFlags::TRUNC | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    ) {
+        Ok(fd) => fd,
+        Err(e) => {
+            r.check(&format!("a file for the namespace section ({e:?})"), false);
+            r.finish();
+        }
+    };
+    let raw = ns_fd.as_raw_fd();
+    let refused = in_user_namespace(move || {
+        // SAFETY: `raw` is this process's own descriptor, open across the call.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+        setflags(borrowed, FS_IMMUTABLE_FL)
+    });
+    let served = in_user_namespace(move || {
+        // SAFETY: as above; the second child inherits the same descriptor.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
+        setflags(borrowed, FS_NODUMP_FL)
+    });
+    r.check(
+        &format!("IMMUTABLE inside a user namespace is EPERM (got {refused:?})"),
+        refused == Some(libc::EPERM),
+    );
+    r.check(
+        &format!("but a bit needing no capability is served there (got {served:?})"),
+        served == Some(0),
+    );
+    drop(ns_fd);
+    let _ = rustix::fs::unlink(NS_FILE);
 
     r.finish();
 }

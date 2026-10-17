@@ -233,3 +233,63 @@ pub fn burn_cpu_ms(ms: i64) {
         }
     }
 }
+
+/// Run `f` in a child that has entered a **user namespace** of its own, and
+/// answer what it returned - or `None` if no namespace could be made.
+///
+/// `unshare(CLONE_NEWUSER)` *moves the caller*, so a claim about what a
+/// capability means inside a namespace needs a process of its own: the parent
+/// stays in the machine's namespace, with its own claims and its own buffered
+/// report intact, and the child answers through a pipe and leaves through the
+/// raw `exit`.
+///
+/// What the child is. The namespace's rules are the ones the rung measured
+/// (`docs/notes/` §6.3): entering it hands the caller the **whole** capability
+/// set in it, at birth, whatever it held before - so a call refused inside is
+/// refused for the namespace and not for want of a capability - and its id map
+/// is empty, so the child reads every id as the overflow one and owns nothing
+/// by id. A closure built on this therefore asks about *where it is*, and a
+/// fixture it needs must be one a stranger may use (a `0777` directory, a
+/// world-readable file).
+pub fn in_user_namespace(f: impl FnOnce() -> i32) -> Option<i32> {
+    let mut pipe = [0i32; 2];
+    // SAFETY: a two-element array this call owns.
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `fork` is what this helper exists to make.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        // SAFETY: both ends are open and neither is used again.
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        return None;
+    }
+    if pid == 0 {
+        // SAFETY: the child owns the write end; the parent reads the read end
+        // and nothing else touches either.
+        unsafe {
+            libc::close(pipe[0]);
+            if libc::unshare(libc::CLONE_NEWUSER) == 0 {
+                let bytes = f().to_ne_bytes();
+                libc::write(pipe[1], bytes.as_ptr().cast(), bytes.len());
+            }
+            libc::_exit(0);
+        }
+    }
+    // SAFETY: the parent owns the read end, and reads exactly the one word the
+    // child writes; a short read means the child never entered a namespace.
+    let answer = unsafe {
+        libc::close(pipe[1]);
+        let mut bytes = [0u8; 4];
+        let n = libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len());
+        libc::close(pipe[0]);
+        (n == 4).then(|| i32::from_ne_bytes(bytes))
+    };
+    let mut status = 0;
+    // SAFETY: a child this call made, whose status nothing needs.
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    answer
+}
