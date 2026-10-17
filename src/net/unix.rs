@@ -479,6 +479,13 @@ impl UnixSock {
         critical_section::with(|cs| !self.state.borrow(cs).borrow().pending.is_empty())
     }
 
+    /// Whether `listen` has been called on this socket - `FIONREAD` tells a
+    /// listener (which refuses) from a fresh, unconnected socket (which
+    /// answers 0), the two both having no channel.
+    pub fn is_listening(&self) -> bool {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().backlog.is_some())
+    }
+
     /// Whether a `bind` has planted a name on this socket. Linux refuses a
     /// second bind on the grounds that the first is what the fd answers by.
     pub fn is_bound(&self) -> bool {
@@ -521,6 +528,38 @@ impl Inode for UnixSock {
 
     fn unix_end(&self) -> Option<Arc<DuplexEnd>> {
         self.end_of()
+    }
+
+    /// `FIONREAD` on a unix socket. A **message-carrying** one (`SOCK_DGRAM`,
+    /// `SOCK_SEQPACKET`) reports its *first* pending datagram's length, which is
+    /// the front of the queue rather than the sum - measured on the host
+    /// (`probe_fionread2.c`: 5 then 9 queued answers 5, and an empty queue
+    /// answers 0). A **stream** one with a channel reports through it, the same
+    /// `DuplexEnd` a socketpair end is, so its queued bytes are the peer's
+    /// unread writes. A stream one with *no* channel is either a **listener**,
+    /// which Linux refuses with `EINVAL` before any value, or a fresh,
+    /// unconnected socket, which holds nothing and answers 0 - both measured
+    /// (`probe_unixinq.c`, Linux 7.2.9).
+    fn fionread(&self) -> Option<VfsResult<usize>> {
+        if self.carries_messages() {
+            let queued = critical_section::with(|cs| {
+                self.state
+                    .borrow(cs)
+                    .borrow()
+                    .recvq
+                    .front()
+                    .map(|d| d.data.len())
+                    .unwrap_or(0)
+            });
+            return Some(Ok(queued));
+        }
+        if let Some(end) = self.end_of() {
+            return end.fionread();
+        }
+        if self.is_listening() {
+            return Some(Err(VfsError::Invalid));
+        }
+        Some(Ok(0))
     }
 
     /// The byte doors. A stream answers through its channel - the same

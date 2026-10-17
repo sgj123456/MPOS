@@ -18,7 +18,9 @@
 //! eth0's fabric and moved to the loopback's when the first address it is
 //! given says so, because smoltcp has no way to move one between socket sets.
 //! A stack that forgot the move would queue the datagram on an interface with
-//! no route to `127.0.0.1` and it would never arrive.
+//! no route to `127.0.0.1` and it would never arrive. `FIONREAD` is pinned at
+//! the end: a datagram socket reports the length of the *first* pending message,
+//! which is the front of the queue rather than their sum.
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::net::{
@@ -168,6 +170,40 @@ fn main() {
     r.check(
         "a datagram to a port nobody holds is answered by nothing",
         !readable_within(&client, 300),
+    );
+
+    // FIONREAD on a datagram socket reports the length of the **first** pending
+    // datagram, not the sum: a datagram socket is a queue of whole messages, and
+    // Linux reports the one `recv` would hand back. Measured on the host first
+    // (`.workbuddy/probe_netinq.c`, Linux 7.2.9: 5 then 9 queued answers 5, and
+    // an empty queue answers 0).
+    r.check(
+        "a 5-byte datagram is sent",
+        sendto(&client, b"12345", SendFlags::empty(), &to_server).is_ok_and(|n| n == 5),
+    );
+    r.check(
+        "a 4-byte datagram is sent behind it",
+        sendto(&client, b"6789", SendFlags::empty(), &to_server).is_ok_and(|n| n == 4),
+    );
+    // The stack advances on a poll, so wait for the queue to fill before asking.
+    let _ = readable_within(&server, 2000);
+    r.check(
+        "FIONREAD reports only the first pending datagram (5, not 9)",
+        rustix::io::ioctl_fionread(&server).is_ok_and(|n| n == 5),
+    );
+    let mut one = [0u8; 8];
+    r.check(
+        "recv takes the first datagram whole",
+        recvfrom(&server, &mut one, RecvFlags::empty()).is_ok_and(|(n, _, _)| n == 5),
+    );
+    r.check(
+        "and FIONREAD then reports the second (4)",
+        rustix::io::ioctl_fionread(&server).is_ok_and(|n| n == 4),
+    );
+    let _ = recvfrom(&server, &mut one, RecvFlags::empty());
+    r.check(
+        "an empty datagram queue reports 0",
+        rustix::io::ioctl_fionread(&server).is_ok_and(|n| n == 0),
     );
 
     if r.failed {

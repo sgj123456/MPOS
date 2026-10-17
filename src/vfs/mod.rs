@@ -693,6 +693,33 @@ pub trait Inode: Send + Sync + core::any::Any {
         None
     }
 
+    /// The byte count `FIONREAD` (`0x541B`) reports for this node, when the
+    /// node owns the queue the answer comes from.
+    ///
+    /// Linux answers the request per node kind rather than with one rule, and
+    /// the whole zoo was measured on a current host before any of it was
+    /// written (`.workbuddy/probe_fionread.c`, `probe_fionread2.c`,
+    /// `probe_ttyinq.c`, `probe_netinq.c`): a regular file reports `size -
+    /// pos`, a pipe reports its buffered bytes on both ends, a **stream**
+    /// channel (a `SOCK_STREAM` socketpair end, a connected unix stream, TCP)
+    /// reports the bytes queued in its receive buffer, a **datagram** one (a
+    /// `SOCK_DGRAM` pair, UDP) reports the length of its **first** pending
+    /// datagram, a terminal reports the bytes sitting in its input queue, and a
+    /// pty **master** reports what the slave has printed. Every one of those is
+    /// state the node holds and the syscall layer cannot see through an
+    /// `Arc<dyn Inode>`, so the node is asked - the same shape as
+    /// [`Self::as_pipe`] and [`Self::as_tty`].
+    ///
+    /// `Ok(n)` is the count. `Err` is the errno Linux answers for a channel
+    /// that has a queue but no readable bytes (a *listening* TCP socket is
+    /// `EINVAL`, measured). `None` means the node has no queue of its own and
+    /// the caller decides from its kind - a regular file's `size - pos`, and
+    /// `ENOTTY` for everything else (a directory, an eventfd, `/dev/null`, a
+    /// netlink socket).
+    fn fionread(&self) -> Option<VfsResult<usize>> {
+        None
+    }
+
     /// What this node can do without blocking, for `poll(2)`.
     ///
     /// The default is "everything": a node that never blocks - a file, a

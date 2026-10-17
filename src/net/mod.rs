@@ -2130,6 +2130,56 @@ pub(crate) fn socket_ready(handle: usize) -> crate::vfs::Ready {
     polled.unwrap_or(crate::vfs::Ready::NONE)
 }
 
+/// `FIONREAD`'s byte count for the network socket `handle`.
+///
+/// Linux answers the request per socket type, and this mirrors it: a **stream**
+/// socket (`tcp::Socket`) reports the bytes queued in its receive buffer
+/// (`recv_queue`), a **datagram** one reports the length of its **first**
+/// pending datagram (`peek`, not the whole queue) - both measured on the host
+/// (`.workbuddy/probe_netinq.c`, Linux 7.2.9: 5 then 9 sent to a UDP socket
+/// answers 5; a TCP connection answers its whole readable stream, 10 then 6
+/// after a 4-byte read). A **listening** stream socket has no connection of its
+/// own and Linux refuses with `EINVAL`, not a count (measured). `None` is a
+/// channel this registry has no byte answer for - a raw socket, whose Linux
+/// answer is unmeasured here, or a handle from another table (the netlink and
+/// uevent sockets number their own, and Linux refuses `FIONREAD` on them with
+/// `ENOTTY`) - and the caller falls back to the node kind.
+///
+/// The stack is polled first, exactly as [`socket_ready`] and the read path do:
+/// a datagram delivered to the device but not yet processed is not yet in the
+/// socket's queue, and a caller asking "how many bytes can I read" means *now*.
+pub(crate) fn fionread(handle: usize) -> Option<crate::vfs::VfsResult<usize>> {
+    with(handle, |stack, entry| {
+        stack.poll_once();
+        match &entry.channel {
+            Channel::Tcp {
+                home, handle: h, ..
+            } => {
+                let sock = stack.sockets_mut(*home).get_mut::<tcp::Socket>(*h);
+                Some(Ok(sock.recv_queue()))
+            }
+            Channel::Udp {
+                home, handle: h, ..
+            } => {
+                let sock = stack.sockets_mut(*home).get_mut::<udp::Socket>(*h);
+                Some(Ok(sock.peek().map(|(data, _)| data.len()).unwrap_or(0)))
+            }
+            // A listener carries no connection's bytes; Linux's answer is a
+            // refusal, and `EINVAL` is the number it uses (measured).
+            Channel::TcpListen { .. } => Some(Err(crate::vfs::VfsError::Invalid)),
+            // The IPv6 stub can hold nothing: a socket on it answers 0, which is
+            // what Linux gives an unconnected IPv4 socket too.
+            Channel::Inet6 => Some(Ok(0)),
+            // A raw socket's Linux answer is a datagram length, but the socket
+            // is unreachable to a caller here (nothing holds its description but
+            // the kernel's own DHCP/ARP path), so the question is left to the
+            // node kind rather than guessed at.
+            Channel::Raw { .. } => None,
+        }
+    })
+    .flatten()
+}
+
 /// Bring the stack up over `dev`, the machine's network adapter: build the
 /// interface around it and stamp in the static QEMU-user configuration.
 ///

@@ -831,16 +831,23 @@ the commit bodies), and each moved its pin in the same commit.
     **entropy devices** answer `EINVAL` before the argument is read (item 1); and a **directory**,
     an `eventfd`, `/dev/null` and `/dev/zero` answer `ENOTTY`. The pointer is looked at only where
     there is a value to write — the same bad pointer is `EFAULT` on a file and a pipe, `ENOTTY` on
-    a directory and `EINVAL` on the pool. **The fix is the one dispatch the node already answers**:
-    `as_pipe()` gives the queued bytes, and the description's own position and `NodeKind::File`
-    give `size - pos` — written as `size.wrapping_sub(pos) as u32 as i32`, which is Linux's
-    truncation — while everything else keeps the honest `ENOTTY`. Owner:
-    `src/syscall/linux/fs/ioctl.rs`'s `0x541B` arm. Pin: `t-ioctl`'s new section (nine claims,
-    green on this host first) — the file's four offsets (the negative included, the counterfactual
-    against a saturating subtraction), the pipe's two ends, the bad-pointer `EFAULT`, and the
-    directory's `ENOTTY`. **Two kinds stay named in §5.2** from the same measurement: a *socket*
-    (a `socketpair` end or a network socket) answers its queued bytes and a *tty* (pty included)
-    answers `0` on Linux, neither of which this kernel answers yet.
+    a directory and `EINVAL` on the pool. **The fix is one trait method and the dispatch that reads
+    it**: the node that holds the queue answers through `Inode::fionread` — a pipe its queued
+    bytes, a connected stream socket the whole readable stream (`3 + 4` written answers `7`), a
+    datagram one its **first** pending message (`5` then `9` queued answers `5`), a terminal its
+    input queue (a completed canonical line counts, the line still being typed does not, and raw
+    mode counts every byte) — while the arm keeps the two answers only it can give, the regular
+    file's `size - pos` (written as `size.wrapping_sub(pos) as u32 as i32`, Linux's truncation) and
+    the kind refusal (`ENOTTY` for a directory, an eventfd, a **netlink** socket). A **listener**
+    (TCP or AF_UNIX) has no connection and therefore refuses `EINVAL`, and a fresh unconnected
+    socket answers `0`. Owner: `src/syscall/linux/fs/ioctl.rs`'s `0x541B` arm and the
+    `Inode::fionread` overrides in `src/vfs/pipe.rs`, `src/vfs/tty.rs`, `src/vfs/pty.rs`,
+    `src/net/socket.rs`, `src/net/unix.rs`, `src/net/mod.rs`. Pins: `t-ioctl` (regular file, pipe,
+    `socketpair` stream + datagram), `t-pty`, `t-tcp-listen`, `t-udp-loopback`, all green on this
+    host first. A **raw** socket's Linux answer stays unmeasured and it is refused `ENOTTY` rather
+    than guessed (§5.2 names it). The earlier text's claim that a tty "answers `0`" was a
+    canonical-mode artifact and is corrected: an earlier probe had left raw bytes in the line
+    buffer, so the clean per-case measurement is the one above.
 
 31. **`getcwd` derives the cwd's name from the directory, not from the argument `chdir` was given.**
     §5.2 named this: this kernel's cwd was the path *string* `chdir` stored (lexically normalised,

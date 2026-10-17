@@ -292,6 +292,14 @@ impl Pty {
         critical_section::with(|cs| !self.state.borrow(cs).borrow().to_master.is_empty())
     }
 
+    /// The bytes `FIONREAD` reports on a pty **master**: what the slave has
+    /// printed and this end has not read - the `to_master` queue. Measured on
+    /// the host (`.workbuddy/probe_ttyinq.c`, Linux 7.2.9): three bytes written
+    /// to the slave answer 3 on the master.
+    pub fn master_buffered(&self) -> usize {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().to_master.len())
+    }
+
     /// Take up to `want` bytes the slave printed, if any.
     pub fn take_master(&self, want: usize) -> Option<Vec<u8>> {
         let taken = critical_section::with(|cs| {
@@ -612,6 +620,14 @@ impl Inode for PtyMaster {
         Some(&self.pty)
     }
 
+    /// `FIONREAD` on a pty master reports what the slave has printed and this
+    /// end has not read - measured on the host (`.workbuddy/probe_ttyinq.c`:
+    /// three bytes written to the slave answer 3 here). Not the slave's input
+    /// queue, which is what the master's `as_tty` face would otherwise lend it.
+    fn fionread(&self) -> Option<VfsResult<usize>> {
+        Some(Ok(self.pty.master_buffered()))
+    }
+
     /// The master answers the terminal ioctls, as it does on Linux: a pty pair
     /// is *one* terminal with two ends, so its termios, its window size and
     /// its foreground process group belong to the pair rather than to an end.
@@ -702,6 +718,12 @@ impl Inode for PtySlave {
 
     fn as_tty(&self) -> Option<&Tty> {
         Some(self.pty.slave())
+    }
+
+    /// `FIONREAD` on a pty slave reports the slave terminal's input queue - the
+    /// same answer its `as_tty` node gives, since the slave *is* a terminal.
+    fn fionread(&self) -> Option<VfsResult<usize>> {
+        Some(Ok(self.pty.slave().readable_bytes()))
     }
 
     fn rdev(&self) -> Option<(u32, u32)> {

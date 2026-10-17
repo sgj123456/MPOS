@@ -15,7 +15,10 @@
 //! *window* is the pair's too - `TIOCSWINSZ` on the master is what
 //! `TIOCGWINSZ` on the slave reports, which is how an emulator sizes the
 //! programs inside it - and a *change* to it is announced, which is the one
-//! thing a full-screen program cannot notice for itself.
+//! thing a full-screen program cannot notice for itself. The pair's queues are
+//! pinned too: `FIONREAD` answers the *input* queue of whichever end is asked -
+//! a completed canonical line at the slave, every byte in raw mode, and what
+//! the slave has printed at the master.
 //!
 //! # The doors
 //!
@@ -62,7 +65,10 @@
 use mpos_user_tests::Report;
 use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::fs::{Mode, OFlags, open};
-use rustix::termios::{SpecialCodeIndex, Winsize, tcgetattr, tcgetwinsize, tcsetwinsize};
+use rustix::termios::{
+    LocalModes, OptionalActions, SpecialCodeIndex, Winsize, tcgetattr, tcgetwinsize, tcsetattr,
+    tcsetwinsize,
+};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
@@ -156,6 +162,54 @@ fn mint() -> Option<(OwnedFd, u32)> {
 /// `ptsname` does.
 fn slave_path(number: u32) -> CString {
     CString::new(format!("/dev/pts/{number}")).expect("a path with no NUL in it")
+}
+
+/// Put `fd` into canonical or raw mode, the way `stty` does - the line
+/// discipline's own switch, which is what `FIONREAD`'s answer turns on.
+fn set_canon(fd: BorrowedFd<'_>, on: bool) {
+    if let Ok(mut t) = tcgetattr(fd) {
+        if on {
+            t.local_modes.insert(LocalModes::ICANON);
+        } else {
+            t.local_modes.remove(LocalModes::ICANON);
+        }
+        let _ = tcsetattr(fd, OptionalActions::Now, &t);
+    }
+}
+
+/// `FIONREAD` on `fd`: `(rc, errno, value)`.
+fn fionread(fd: BorrowedFd<'_>) -> (libc::c_long, i32, i32) {
+    let mut n: i32 = -1;
+    let (rc, err) = ioctl(
+        fd.as_raw_fd(),
+        libc::FIONREAD as libc::c_ulong,
+        &mut n as *mut i32 as usize,
+    );
+    (rc, err, n)
+}
+
+/// `FIONREAD` on `fd`, retried until it reads `want` or a short deadline
+/// passes.
+///
+/// On the host a pty *master*'s write reaches the slave's line discipline
+/// through a flip buffer that is processed asynchronously, so an immediate
+/// query outruns it - measured: `slave=0` right after the write, `3` after
+/// 30 ms (`.workbuddy/probe_ttyasync.c`). The guest is synchronous, so this
+/// answers at once there and retries only on the host; a caller that wants a
+/// *zero* must prove delivery another way (the echo, below).
+fn fionread_want(fd: BorrowedFd<'_>, want: i32) -> i32 {
+    let mut last = i32::MIN;
+    for _ in 0..40 {
+        let (rc, _, n) = fionread(fd);
+        if rc == 0 {
+            last = n;
+            if n == want {
+                return n;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    last
 }
 
 /// Leave through `exit_group`: the code is the claim, and the child's inherited
@@ -479,6 +533,93 @@ fn main() {
         "the signal that arrived is SIGWINCH",
         report.signo == libc::SIGWINCH,
     );
+
+    // FIONREAD on a pty. A pair is one terminal and the request answers the
+    // *input* queue of whichever end it is asked of, measured on the host
+    // (`.workbuddy/probe_ttyinq.c`, Linux 7.2.9) - which corrects a claim this
+    // tree carried that a terminal answers `0`. On the **slave** a *completed*
+    // canonical line counts and the line still being typed does not, while in
+    // raw mode every byte counts; on the **master** it is what the slave has
+    // printed. Each case mints a fresh pair, because the line discipline's
+    // buffer is exactly the state under test and the sections above have filled
+    // it.
+    let fresh_pair = || -> Option<(OwnedFd, OwnedFd)> {
+        let (m, n) = mint()?;
+        let s = open(
+            slave_path(n).as_c_str(),
+            OFlags::RDWR | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+        .ok()?;
+        Some((m, s))
+    };
+    match fresh_pair() {
+        Some((m, s)) => {
+            set_canon(s.as_fd(), true);
+            rustix::io::write(&m, b"hi").expect("type an incomplete canonical line");
+            // Prove the line discipline has seen the bytes before believing the
+            // slave's 0: the echo of the two characters lands on the master, and
+            // it is the same delivery pass. Otherwise a 0 here would only mean
+            // "not yet" - which is exactly the host's race.
+            let echoed = fionread_want(m.as_fd(), 2);
+            r.check(
+                "the incomplete line's echo reaches the master (2)",
+                echoed == 2,
+            );
+            let (_, _, n) = fionread(s.as_fd());
+            r.check(
+                "FIONREAD excludes the incomplete canonical line ('hi' answers 0)",
+                n == 0,
+            );
+            rustix::io::write(&m, b"\n").expect("finish the line");
+            r.check(
+                "a completed canonical line counts ('hi\\n' answers 3)",
+                fionread_want(s.as_fd(), 3) == 3,
+            );
+        }
+        None => r.check("a fresh pty pair is minted for the canonical case", false),
+    }
+    match fresh_pair() {
+        Some((m, s)) => {
+            set_canon(s.as_fd(), true);
+            rustix::io::write(&m, b"ab\ncd\n").expect("type two complete lines");
+            r.check(
+                "two completed canonical lines report 6",
+                fionread_want(s.as_fd(), 6) == 6,
+            );
+        }
+        None => r.check("a fresh pty pair is minted for the two-line case", false),
+    }
+    match fresh_pair() {
+        Some((m, s)) => {
+            set_canon(s.as_fd(), false);
+            rustix::io::write(&m, b"hello").expect("type five raw bytes");
+            r.check(
+                "in raw mode every typed byte counts ('hello' answers 5)",
+                fionread_want(s.as_fd(), 5) == 5,
+            );
+            let mut two = [0u8; 2];
+            alarm(Some(400));
+            let got = rustix::io::read(&s, &mut two);
+            alarm(None);
+            r.check("the two-byte raw read takes two", got == Ok(2));
+            r.check(
+                "after the read the remaining three count",
+                fionread_want(s.as_fd(), 3) == 3,
+            );
+        }
+        None => r.check("a fresh pty pair is minted for the raw case", false),
+    }
+    match fresh_pair() {
+        Some((m, s)) => {
+            rustix::io::write(&s, b"out").expect("print three bytes at the slave");
+            r.check(
+                "FIONREAD on the master reports what the slave printed (3)",
+                fionread_want(m.as_fd(), 3) == 3,
+            );
+        }
+        None => r.check("a fresh pty pair is minted for the master case", false),
+    }
 
     drop(slave);
     drop(master);

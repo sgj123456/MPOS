@@ -1131,6 +1131,16 @@ impl LineDiscipline {
         self.tio.cc[VTIME]
     }
 
+    /// The bytes `FIONREAD` reports for a terminal: everything a read would
+    /// return right now - a queued answer, plus the completed lines (canonical)
+    /// or raw bytes (non-canonical) in `out`. The line still being typed is
+    /// **not** counted, which is Linux's shape: measured on the host
+    /// (`.workbuddy/probe_ttyinq.c`, Linux 7.2.9), a canonical `"hi"` with no
+    /// newline answers 0 and `"hi\n"` answers 3, while raw `"hello"` answers 5.
+    pub fn readable_bytes(&self) -> usize {
+        self.answer.len() + self.out.len()
+    }
+
     /// Whether the queue holds the bytes a read considers ready.
     ///
     /// An answer and an end of input come first: a shell that asked where the
@@ -2136,6 +2146,12 @@ impl Tty {
         critical_section::with(|cs| self.ld.borrow(cs).borrow().has_ready())
     }
 
+    /// The bytes `FIONREAD` reports for this terminal - see
+    /// [`LineDiscipline::readable_bytes`] for the measured shape.
+    pub(crate) fn readable_bytes(&self) -> usize {
+        critical_section::with(|cs| self.ld.borrow(cs).borrow().readable_bytes())
+    }
+
     /// Whether an input byte has landed since `base` was read. The wake predicate
     /// a clock-restarting non-canonical read parks on, so a partial byte that
     /// re-anchors its `VTIME` clock ends the park instead of being swallowed.
@@ -2606,6 +2622,16 @@ impl Inode for Tty {
     /// See [`ControllingTty`]: no position, so `lseek` is `ESPIPE`.
     fn seekable(&self) -> bool {
         false
+    }
+
+    /// `FIONREAD` on a terminal reports its input queue: the completed lines
+    /// (canonical) or raw bytes (non-canonical) a read would return, plus any
+    /// queued answer. The line still being typed is excluded - measured on the
+    /// host (`.workbuddy/probe_ttyinq.c`, Linux 7.2.9): a canonical `"hi"` with
+    /// no newline answers 0, `"hi\n"` answers 3. Same answer at the pty slave
+    /// and at a virtual console, which is the same node here.
+    fn fionread(&self) -> Option<VfsResult<usize>> {
+        Some(Ok(self.readable_bytes()))
     }
 
     fn metadata(&self) -> Metadata {

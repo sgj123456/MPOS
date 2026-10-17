@@ -726,6 +726,16 @@ impl Inode for SocketInode {
         self.handle
     }
 
+    /// `FIONREAD`: the socket's own byte-queue answer, through the stack's
+    /// per-type rule ([`super::fionread`]) - a stream's readable bytes, a
+    /// datagram's first-message length, a listener's `EINVAL`. A handle the
+    /// stack does not know (a uevent or netlink socket carried by this same
+    /// inode type) leaves the question to the node kind, which is Linux's own
+    /// `ENOTTY` for those.
+    fn fionread(&self) -> Option<crate::vfs::VfsResult<usize>> {
+        super::fionread(self.handle)
+    }
+
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, VfsError> {
         Err(VfsError::Unsupported)
     }

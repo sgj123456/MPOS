@@ -733,7 +733,9 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             //
             // Linux answers this one *per file type* rather than with one rule,
             // and the whole zoo was measured on a current host before any of it
-            // was written (`.workbuddy/probe_fionread.c`, Linux 7.2.9):
+            // was written (`.workbuddy/probe_fionread.c`, `probe_fionread2.c`,
+            // `probe_ttyinq.c`, `probe_netinq.c`, `probe_unixinq.c`, Linux
+            // 7.2.9):
             //
             //   * a **regular file** answers `i_size - f_pos`: 10 at offset 0 of
             //     a 10-byte file, 6 after a four-byte read, 0 at end of file,
@@ -745,6 +747,25 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             //   * a **pipe** answers its queued bytes, on *both* ends (5 after
             //     a five-byte write) - and so does a FIFO, whose opened end is
             //     the same `PipeEnd`;
+            //   * a **socket** answers its own receive queue, and *which* queue
+            //     that is belongs to the socket rather than the descriptor: a
+            //     connected **stream** end (a `socketpair` stream half, an
+            //     AF_UNIX stream, a TCP connection) answers the **whole**
+            //     readable stream (3 + 4 written answers 7, and 7 again across
+            //     the peer's half-close), a **datagram** end answers only its
+            //     **first** pending message (5 then 9 queued answers 5, an
+            //     empty queue 0), a fresh unconnected stream answers 0, and a
+            //     **listener** refuses `EINVAL`. Every one of those is state
+            //     the *node* holds ([`Inode::fionread`]), so the node is asked;
+            //   * a **terminal** answers its input queue: a completed line
+            //     (canonical) or raw bytes (non-canonical) a read would return
+            //     now, plus a queued answer, but **not** the line still being
+            //     typed - a canonical `"hi"` answers 0 and `"hi\n"` answers 3,
+            //     while raw `"hello"` answers 5. A pty *master* answers what
+            //     the slave has printed instead (3 written to the slave answer
+            //     3). This corrects a claim this tree carried: a tty was said
+            //     to answer 0, which is only the canonical case where nothing
+            //     complete is queued;
             //   * the two **entropy devices** answer `EINVAL`: measured on
             //     7.2.7, root and unprivileged, `O_RDONLY` and `O_WRONLY`, and
             //     *before* the argument is looked at (a NULL or unmapped
@@ -754,16 +775,19 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             //     image sends one ioctl, the `RNDADDENTROPY` credit below, and
             //     takes its seed length from `/proc/sys/kernel/random/poolsize`;
             //   * a **directory**, an `eventfd`, `/dev/null` and `/dev/zero`
-            //     answer `ENOTTY`.
+            //     answer `ENOTTY`; so does a **netlink** socket (measured on a
+            //     route socket), and a **raw** socket, whose Linux answer is
+            //     unmeasured here, is refused the same way rather than guessed.
             //
+            // Two answers stay *here* rather than on a node, because they are
+            // not a queue the node holds: a regular file's `size - pos` (the
+            // syscall layer holds the file position) and the node-kind refusal.
             // The pointer is looked at only where there is a value to write:
             // with the same bad pointer, a regular file and a pipe answer
             // `EFAULT`, while a directory stays `ENOTTY` and an entropy device
-            // `EINVAL` - Linux's order, measured. Two node kinds this kernel
-            // serves still have no answer here and stay named in `docs/uapi/`
-            // §5.2 rather than borrowed: a **socket** (a `socketpair` end, or a
-            // network socket) answers its queued bytes on Linux, and a **tty**
-            // (and pty) answers `0`; both are refused `ENOTTY` here.
+            // `EINVAL` - Linux's order, measured. A node's own refusal (the
+            // listener's `EINVAL`) comes before the pointer too, as Linux's
+            // `tcp_ioctl` checks the state before its `put_user`.
             let file = match crate::sched::current_fds().clone_at(fd) {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
@@ -773,13 +797,17 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             if matches!(inode.rdev(), Some((1, 8)) | Some((1, 9))) {
                 return err::EINVAL;
             }
-            let value = if let Some(pipe) = inode.as_pipe() {
-                pipe.buffered() as i32
-            } else if inode.as_duplex().is_some() || inode.socket_handle() != 0 {
-                // A socket: Linux's queued-bytes answer is not built here yet
-                // (`docs/uapi/` §5.2), and a made-up number would be worse than
-                // the refusal. Ask before the kind below, because a `socketpair`
-                // end reports `NodeKind::File` like a regular file does.
+            let value = if let Some(answer) = inode.fionread() {
+                match answer {
+                    Ok(n) => n as i32,
+                    Err(e) => return err_of(e),
+                }
+            } else if inode.socket_handle() != 0 {
+                // A socket the stack has no byte answer for here - a raw
+                // socket, or a netlink/uevent one. Linux refuses these rather
+                // than inventing a count, and refusing by shape keeps the
+                // regular-file rule below from ever reading a socket's
+                // placeholder size.
                 return err::ENOTTY;
             } else if inode.metadata().kind == crate::vfs::NodeKind::File {
                 // Linux's `put_user(i_size - f_pos, int __user *)`: the wide

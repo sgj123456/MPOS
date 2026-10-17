@@ -19,7 +19,8 @@
 //! `accept` on a bound-but-not-listening socket is `EINVAL`, `accept` on an
 //! empty non-blocking listener is `EAGAIN`, `recv` and `getpeername` on a
 //! listener are `ENOTCONN`, and `listen` on an unbound socket *succeeds* by
-//! implicitly binding `0.0.0.0` and an ephemeral port.
+//! implicitly binding `0.0.0.0` and an ephemeral port. `FIONREAD` joins them:
+//! a connection reports its readable queue and a *listener* refuses `EINVAL`.
 
 use rustix::fd::OwnedFd;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
@@ -27,7 +28,8 @@ use rustix::io::Errno;
 use rustix::net::sockopt::{set_socket_linger, set_socket_reuseaddr, socket_reuseaddr};
 use rustix::net::{
     AddressFamily, RecvFlags, SendFlags, Shutdown, SocketAddrAny, SocketAddrV4, SocketType, accept,
-    acceptfrom, bind, connect, getpeername, getsockname, listen, recvfrom, send, shutdown, socket,
+    acceptfrom, bind, connect, getpeername, getsockname, listen, recv, recvfrom, send, shutdown,
+    socket,
 };
 use std::net::Ipv4Addr;
 use std::thread;
@@ -786,6 +788,70 @@ fn main() {
         ),
     }
     drop(client);
+
+    // --- FIONREAD on a connection and on a listener --------------------------
+    //
+    // A TCP socket answers the bytes ready in its receive queue - the whole
+    // readable stream, not the first write - and a **listener** refuses with
+    // `EINVAL`, because it carries no connection of its own. Both measured on
+    // this host's kernel first (`.workbuddy/probe_netinq.c`, Linux 7.2.9).
+    let (server, client, conn) = connected_pair();
+    r.check(
+        "FIONREAD on a fresh connection reports 0",
+        rustix::io::ioctl_fionread(&conn).is_ok_and(|n| n == 0),
+    );
+    r.check(
+        "the client's eight bytes go out",
+        send(&client, b"AAAABBBB", SendFlags::empty()).is_ok_and(|n| n == 8),
+    );
+    r.check(
+        "FIONREAD reports the whole 8 queued bytes, not the first write",
+        rustix::io::ioctl_fionread(&conn).is_ok_and(|n| n == 8),
+    );
+    let mut four = [0u8; 4];
+    r.check(
+        "a four-byte read takes four",
+        recv(&conn, &mut four, RecvFlags::empty()).is_ok_and(|(n, _)| n == 4),
+    );
+    r.check(
+        "and FIONREAD now reports the remaining 4",
+        rustix::io::ioctl_fionread(&conn).is_ok_and(|n| n == 4),
+    );
+    // The writer half-closes with two more bytes sent: half-close adds no bytes
+    // of its own, so the queue is the 4 + 2, and the still-readable end of
+    // stream does not drop the count. The poll that carries the FIN may need a
+    // beat, which is what the bounded retry waits for.
+    r.check(
+        "the client sends two more and half-closes",
+        send(&client, b"CC", SendFlags::empty()).is_ok_and(|n| n == 2)
+            && shutdown(&client, Shutdown::Write).is_ok(),
+    );
+    let mut queued = 0;
+    for _ in 0..20 {
+        queued = rustix::io::ioctl_fionread(&conn).unwrap_or(0);
+        if queued == 6 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    r.check(
+        &format!("half-close leaves the queued bytes readable (6, got {queued})"),
+        queued == 6,
+    );
+    // A listener has no connection, so Linux's answer is a refusal, not 0.
+    match rustix::io::ioctl_fionread(&server) {
+        Err(e) => r.check(
+            &format!("FIONREAD on a listener is EINVAL (got {e})"),
+            e == Errno::INVAL,
+        ),
+        Ok(n) => r.check(
+            &format!("FIONREAD on a listener is EINVAL (got {n})"),
+            false,
+        ),
+    }
+    drop(conn);
+    drop(client);
+    drop(server);
 
     if r.failed {
         println!("FAILED");

@@ -776,6 +776,13 @@ impl Inode for PipeEnd {
         Some(self)
     }
 
+    /// `FIONREAD` on a pipe reports its queued bytes, and it is the *same*
+    /// buffer both ends count: a write end answers what its peer could read,
+    /// measured on the host (`.workbuddy/probe_fionread.c`, Linux 7.2.9).
+    fn fionread(&self) -> Option<VfsResult<usize>> {
+        Some(Ok(self.buffered()))
+    }
+
     /// A pipe has no position: `lseek(2)` on one is `ESPIPE`, which is how a
     /// reader learns it cannot push back the bytes it over-read.
     fn seekable(&self) -> bool {
@@ -1072,6 +1079,15 @@ impl Inode for DuplexEnd {
 
     fn as_duplex(&self) -> Option<&DuplexEnd> {
         Some(self)
+    }
+
+    /// `FIONREAD` on a `SOCK_STREAM` socketpair end reports the bytes queued in
+    /// its *receive* half - what the peer has written and this end has not read.
+    /// Measured on the host (`probe_fionread2.c`: 3 + 4 written answers 7, the
+    /// whole stream rather than the first write). The writer's own end has an
+    /// empty queue and answers 0.
+    fn fionread(&self) -> Option<VfsResult<usize>> {
+        Some(Ok(self.read.buffered()))
     }
 
     fn metadata(&self) -> Metadata {

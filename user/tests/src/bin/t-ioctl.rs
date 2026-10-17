@@ -65,6 +65,7 @@ use mpos_user_tests::{Report, host_run};
 use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::fs::{AtFlags, CWD, Mode, OFlags, SeekFrom, openat, seek, unlinkat};
 use rustix::io::write;
+use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 use rustix::process::{geteuid, getuid};
 
 // The request words. The terminal trio and FIONREAD come from libc's
@@ -450,17 +451,19 @@ fn main() {
     // ---- FIONREAD on the descriptors that have a queue-length story ----
     //
     // Linux answers this request per file type, measured on the host first
-    // (`.workbuddy/probe_fionread.c`, Linux 7.2.9) before any of it was made:
-    // a regular file reports `i_size - f_pos` - 10 at the start of a ten-byte
-    // file, 6 after a four-byte read, 0 at end of file, and **-10** at offset
-    // 20, because the wide subtraction is truncated to `int` rather than
-    // clamped - and a pipe reports its queued bytes on **both** ends. Both used
-    // to be `ENOTTY` here, which the `docs/uapi/` §5.2 entry named as the
-    // divergence this section closes. The same probe measured what stays named
-    // rather than claimed: a socket (a `socketpair` end or a network socket)
-    // reports its queued bytes and a tty (pty included) reports 0 on Linux,
-    // neither of which this kernel answers yet; a directory reports `ENOTTY`
-    // there too, which the last claim pins.
+    // (`.workbuddy/probe_fionread.c`, `probe_fionread2.c`, Linux 7.2.9) before
+    // any of it was made: a regular file reports `i_size - f_pos` - 10 at the
+    // start of a ten-byte file, 6 after a four-byte read, 0 at end of file, and
+    // **-10** at offset 20, because the wide subtraction is truncated to `int`
+    // rather than clamped - and a pipe reports its queued bytes on **both**
+    // ends. Those were the divergence the `docs/uapi/` §5.2 entry named; this
+    // section closes it for the two *node-held* queues beside them too: a
+    // **socketpair** end answers its socket's receive queue (a stream end the
+    // whole readable stream, a datagram end only its first pending message) -
+    // the same node-held answer `t-pty` pins for a terminal and `t-tcp-listen`/
+    // `t-udp-loopback` for the network. What stays refused is the *kind* part
+    // below: a directory answers `ENOTTY` here too, and so does a netlink
+    // socket, neither of which this kernel has a queue answer for.
     let tmp = "/tmp/t-ioctl-fionread";
     match openat(
         CWD,
@@ -524,6 +527,56 @@ fn main() {
             r.check("and its write end reports them too", rc == 0 && n == 5);
         }
         Err(e) => r.check(&format!("a pipe is made ({e:?})"), false),
+    }
+
+    // A `socketpair` end answers its socket's receive queue. A **stream** end
+    // is the whole readable stream - 3 + 4 written answers 7, not just the
+    // first write - and the writer's own end (whose receive queue is empty)
+    // answers 0. A **datagram** end is only the **first** pending message: the
+    // queue carries whole messages, and Linux reports the length at the front
+    // rather than their sum (`.workbuddy/probe_fionread2.c`, Linux 7.2.9).
+    match socketpair(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::empty(),
+        None,
+    ) {
+        Ok((a, b)) => {
+            let mut n: i32 = -1;
+            let (rc, _) = ioctl_fd(&a, FIONREAD, &raw mut n as *mut c_void);
+            r.check(
+                "FIONREAD on an idle stream end reports 0",
+                rc == 0 && n == 0,
+            );
+            write(&a, b"AAA").expect("write three to the stream pair");
+            write(&a, b"BBBB").expect("write four more");
+            let (rc, _) = ioctl_fd(&b, FIONREAD, &raw mut n as *mut c_void);
+            r.check(
+                "the stream end opposite reports the whole 7 queued bytes",
+                rc == 0 && n == 7,
+            );
+            let (rc, _) = ioctl_fd(&a, FIONREAD, &raw mut n as *mut c_void);
+            r.check("and the writer's own end reports 0", rc == 0 && n == 0);
+        }
+        Err(e) => r.check(&format!("an AF_UNIX stream pair is made ({e:?})"), false),
+    }
+    match socketpair(
+        AddressFamily::UNIX,
+        SocketType::DGRAM,
+        SocketFlags::empty(),
+        None,
+    ) {
+        Ok((a, b)) => {
+            let mut n: i32 = -1;
+            write(&a, b"12345").expect("send the five-byte first message");
+            write(&a, b"6789").expect("send the four-byte second");
+            let (rc, _) = ioctl_fd(&b, FIONREAD, &raw mut n as *mut c_void);
+            r.check(
+                "a datagram end reports only its first pending message (5, not 9)",
+                rc == 0 && n == 5,
+            );
+        }
+        Err(e) => r.check(&format!("an AF_UNIX datagram pair is made ({e:?})"), false),
     }
 
     // A directory has no queue-length story on either kernel.
