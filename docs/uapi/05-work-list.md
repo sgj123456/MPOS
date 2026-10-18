@@ -1132,18 +1132,21 @@ the commit bodies), and each moved its pin in the same commit.
     by any caller exactly as its `0444` neighbours are — the mode-less filesystem's own limit,
     unchanged by this pass. And three names differ in *kind* before the mode can: Linux answers `0777`
     links for `/proc/self`, `/proc/thread-self` and `/proc/mounts`, where this kernel answers a
-    directory, so their word follows the shape they actually have. Owner: `src/vfs/procfs.rs`'s
+    directory, so their word follows the shape they actually have.     Owner: `src/vfs/procfs.rs`'s
     `ProcFile`/`ProcCtl`/`ProcDir`/`MirrorDir`/`ProcConfig` and `src/vfs/sysfs.rs`'s
-    `SysDir`/`SysFile`/`SysConfig`/`SysPciEvent`/`SysEventAttr`. Pin: `t-proc-modes` (18 claims, the
-    same on both machines and green on this host first), plus two host unit tests for the mapping
+    `SysDir`/`SysFile`/`SysConfig`/`SysPciEvent`/`SysEventAttr`. Pin: `t-proc-modes` (18 claims at
+    this landing - **20** since item 45, the same on both machines and green on this host first),
+    plus two host unit tests for the mapping
     itself (`a_proc_nodes_own_mode_follows_its_shape`, and sysfs's
     `a_sysfs_node_reports_its_own_mode_rather_than_the_trees_kind_default`), and both fixtures — which
     block device, which PCI bus — are *asked for* by walking rather than named, so the same claims
-    hold on a machine whose disks are `vda` and on one with `nvme0n1`. **The pass' own first gate run
-    found one more divergence, and it is now named in §5.2**: the two *mount names* (`/proc` and
-    `/sys` themselves) went red at `0755` — the word of the directory the mount *covers*, because
-    `resolve_no_follow` splits the last name off its parent and never crosses the mount for it, so
-    the program claims those two through the door that does cross (`stat`). Gate: x86_64 `pass=181
+    hold on a machine whose disks are `vda` and on one with `nvme0n1`.     **The pass' own first gate run
+    found one more divergence, and it was named in §5.2 until item 45 closed it**: the two *mount
+    names* (`/proc` and `/sys` themselves) went red at `0755` — the word of the directory the mount
+    *covers*, because the no-follow resolver split the last name off its parent and never crossed
+    the mount for it — so the program claimed those two through the door that does cross (`stat`)
+    alone. Both doors agree now, so each of the two is claimed twice, and the count above moved with
+    it. Gate: x86_64 `pass=181
     fail=0 (181 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33; the second machine's arm of the
     same gate is `pass=180 fail=0`, `mpos-kunit 32 passed, 0 failed`. The counterfactual is exact:
     with only the kernel half reverted (two source files) and the pin kept, the sweep is `pass=180
@@ -1558,3 +1561,86 @@ the commit bodies), and each moved its pin in the same commit.
     the pre-existing claims of the whole file. One shape stays named in §5.2 with the same
     measurement: the mode is still a *report* rather than a gate (procfs keeps no modes), so the
     write-ish refusal here is the inode's own rule and not the bits'.
+
+## item 45 — a mount point answers the mount, and a name a mount sits on may not be taken away
+
+    §5.2's last named divergence in the filesystem's own resolution, and the one its own entry said
+    was "not a two-line fix" because one helper answered two questions. Both halves are the same
+    fact seen from two sides: a mount **covers** the name it sits on. **Measured whole on a current
+    host first** (`.workbuddy/probe_mountpoint_doors.c`, Linux 7.2.9, root; transcript beside it),
+    with a tmpfs over a `0755` directory and a file bind, so one mode word and one `st_dev` say
+    which of the two inodes answered:
+
+    * **the reading and altering doors cross the mount** - `lstat`, `stat`, `statx` with *and*
+      without `AT_SYMLINK_NOFOLLOW`, `newfstatat`, `open`, `faccessat2`, `chmod` and `utimensat` all
+      answer the mounted root (`dev 61 ino 1 mode 0705` against the covered `dev 52 ino ... 0755`),
+      and `open(mount point, O_NOFOLLOW)` succeeds. The crossing is **not** what `LOOKUP_NOFOLLOW`
+      turns off: the flag is about links, and a mount is stepped into whatever the flag says;
+    * **a plain bind covers it up** - inside `mount --bind` of the parent (no `MS_REC` clones no
+      submounts) the *same* name answers the covered directory again (`ino 9433 mode 0755` where the
+      outer spelling answers the tmpfs `ino 1 mode 0705`), which is why the crossing has to come
+      from the walk's own state rather than from a lookup in the table;
+    * **the make-or-remove doors refuse the name** - `rmdir`, `unlinkat(AT_REMOVEDIR)` and `rename`
+      are `EBUSY` (16); `mkdir`, `mknod` and `symlink` at the name are `EEXIST` (17) because it is
+      taken;
+    * **and the type and permission questions come first** - `rename(file, mounted dir)` is `EISDIR`
+      (21) where `rename(dir, mounted dir)` is `EBUSY`, `rename(mounted dir, file)` is `ENOTDIR`
+      (20) where `rename(mounted dir, dir)` is `EBUSY`, and an unprivileged caller in a `0555`
+      directory holding a mount point reads **`EACCES` (13)** for all three of `rmdir`, `unlink` and
+      `rename` - while `mkdir` of that taken name is still `EEXIST` (17), so the order is per-door
+      rather than one rule.
+
+    **The fix is one mode on the walk and one question in the refusal.** `resolve_walk` gains a
+    trailing-link mode (`LastLink::Follow`/`NoFollow`, Linux's `LOOKUP_FOLLOW` against
+    `LOOKUP_NOFOLLOW` for the last name only), and the no-follow resolver becomes that walk, so the
+    crossing happens with the walk's own bind state and the payload-link substitution is skipped
+    exactly as `lstat` and `readlink` need (`src/vfs/mount.rs`). The old parent-and-lookup body
+    survives as `resolve_entry`/`resolve_entry_at` - "the entry this directory holds under the
+    name" - for the three doors whose question is a *name* rather than a path: `mkdirat`'s,
+    `mknod`'s and `mknodat`'s `EEXIST` probes, which reach it through the caller's table. The
+    refusal is `MountTable::is_mount_point` (a fact about the **node**, which is Linux's own
+    `d_mountpoint` rather than an approximation of it), asked at the *end* of `may_remove` - after
+    the immutable/append-only and permission halves, which is the measured `EACCES`-before-`EBUSY`
+    order - so `unlink`, `rmdir` and their callers refuse together; and `renameat2` gains the type
+    pair the measurement names, before its existing `may_remove`/`may_create_in`, then the refusal
+    on either end. Owner: `src/vfs/mount.rs` (the walk's mode, the entry door, the mount-point
+    question), `src/vfs/mod.rs` (`may_remove`), `src/syscall/linux/fs/file.rs` (three probes moved
+    to the entry door; `renameat2`). Pin: **`t-mountpoint`** - a new program that mounts its own
+    tmpfs (whose root this kernel makes `01777`, so it needs no fixture from the boot), **37 claims**
+    on both machines and green on this host first: the reading doors and their `st_dev`, the five
+    refusals, the type pair twice (over a plain directory and over a mount point), the altering door
+    on the mounted root with the covered directory's own stamp intact after the umount, the alias's
+    covered answer beside the outer spelling's mounted one, the same name's `EBUSY` inside the alias,
+    and four answers from a forked **stranger**. Beside it `t-proc-modes` claims `/proc` and `/sys`
+    through **both** doors now (**20** claims, was 18), and three host unit tests hold the mechanism
+    with no machine under it. Gate: x86_64 `pass=182 fail=0 (182 built)`, `mpos-kunit 32 passed, 0
+    failed`, exit 33 (182 staged, 11 left out by `tests.toml`); the second machine's arm is
+    `pass=181 fail=0`, `mpos-kunit 32 passed, 0 failed` (181 staged, 12 left out). Both programs'
+    `ok:` lines are byte-identical across the two machines (diffed, carriage returns aside).
+    Counterfactual, one mechanism at a time: with the no-follow resolver put back to the entry
+    resolver (one method, every pin left in place) the sweep is `pass=180 fail=2 (182 built)` with
+    `mpos-kunit` unmoved - the two red programs are `t-mountpoint` and `t-proc-modes` and the
+    **seven** red claims are exactly the crossing ones (`lstat of the mount point answers the mounted
+    root`, `fstatat with AT_SYMLINK_NOFOLLOW answers the mounted root`, `statx with
+    AT_SYMLINK_NOFOLLOW answers it too`, `while the outer spelling still answers the mounted root`,
+    `and its own stamp, untouched by the mount that covered it` - the altering door had stamped the
+    *covered* directory - and `/proc`/`/sys` `reports 0555 for a directory (got 0755)`), while `stat`,
+    `open`, every refusal and both alias controls pass on both kernels. With the refusal taken back
+    out (`may_remove`'s question and `renameat2`'s new-end one) the sweep is `pass=181 fail=1 (182
+    built)`, one red program, and the first red claim is the one that matters: `rmdir of the mount
+    point (ok)` - the name went, and the nine claims after it are the consequence: `rename of the
+    mount point` is `ENOENT`, `mkdir` of the freed name **succeeds**, and the umount has no mount
+    point to peel, so the tree a later `t-` program would walk is one a mount was lifted out of.
+    A third run places the reverted method on the *other* half of the pair (`resolve_no_follow`, the
+    machine-rooted walk, instead of the caller-shaped one the doors use) and shows the host stage
+    catching it alone: `556 passed; 2 failed`, the two unit tests named for the crossing, before any
+    QEMU boots.
+
+    **Two findings from the probe stay named rather than served.** A plain bind's clone is a
+    *different mount*, so Linux answers **`EXDEV` (18)** for a `rename` between a view and the outer
+    tree (`rename(alias2/e, outer/...)` measured) - the check is `old_path.mnt != new_path.mnt`, and
+    this kernel has no per-view mount identity to compare, so a rename across an alias is still
+    served here. And a **file mount point** - the one case where `unlink`'s half of the refusal is
+    reachable on Linux - cannot exist in this kernel at all, because every mount it can make lands
+    on a directory (`bind` of a file is `EINVAL`, `mount_new` is `ENOTDIR`); the question is asked of
+    the node anyway, because it is Linux's rule and it costs a comparison.

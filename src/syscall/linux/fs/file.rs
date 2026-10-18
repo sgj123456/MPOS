@@ -245,14 +245,17 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
         return err::EEXIST;
     }
     // O_NOFOLLOW: the caller asked that the open not traverse a symbolic link
-    // at the final component. Walk to the parent and look the last name up
-    // without following it; if it is a link, ELOOP (measured on the host:
+    // at the final component. Resolve the path without following its last name
+    // - a *walk*, so a mount covering that name is crossed exactly as it is
+    // without the flag, which is Linux's answer for `lstat` and for this door
+    // alike (measured, `.workbuddy/probe_mountpoint_doors.c`: `open(mount
+    // point, O_NOFOLLOW)` succeeds and reads the mounted root) - and if what it
+    // lands on is a link, ELOOP (measured on the host:
     // open(symlink, O_NOFOLLOW) is ELOOP, open(regular, O_NOFOLLOW) succeeds,
-    // and intermediate links are still followed by the no-follow resolver's
-    // parent walk). The old handler defined no O_NOFOLLOW at all, so the bit
-    // was silently dropped and the open followed the very link the caller said
-    // to stop at - the classic `/tmp` defence, and a §4.2 accept-and-drop with
-    // security meaning.
+    // and intermediate links are still followed). The old handler defined no
+    // O_NOFOLLOW at all, so the bit was silently dropped and the open followed
+    // the very link the caller said to stop at - the classic `/tmp` defence,
+    // and a §4.2 accept-and-drop with security meaning.
     if flags & O_NOFOLLOW != 0
         && let Ok(inode) = crate::vfs::resolve_no_follow_at(path, base.clone())
         && inode.metadata().kind == NodeKind::Symlink
@@ -1617,8 +1620,13 @@ pub fn mkdirat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // `-p` creates a path by walking *up* it and stopping at the first
     // ancestor that is already there, so an `EINVAL` where an `EEXIST`
     // belonged sent it all the way to `mkdir("/")` and aborted the whole
-    // command with "can't create directory '/'".
-    if crate::vfs::resolve_no_follow_at(&path, base.clone()).is_ok() {
+    // command with "can't create directory '/'". The question is about the
+    // *name*, so it is asked of the directory that holds it rather than by
+    // walking it - a name a mount covers is still a taken name, and Linux
+    // answers `EEXIST` for it just the same (measured,
+    // `.workbuddy/probe_mountpoint_doors.c`); [`resolve_entry_at`] is that
+    // question and [`resolve_no_follow_at`] is the other one.
+    if crate::vfs::resolve_entry_at(&path, base.clone()).is_ok() {
         return err::EEXIST;
     }
     let (parent, name) = match crate::vfs::split_parent(&path) {
@@ -1718,12 +1726,6 @@ pub fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         Ok(ino) => ino,
         Err(e) => return err_of(e),
     };
-    // Renaming takes the old name out of its directory, so the rule that
-    // governs `unlink` governs this too: without it, a rename is a way around
-    // the permission check - and a rename is what `mv` is.
-    if let Err(e) = crate::vfs::may_remove(&old_dir, &old_inode) {
-        return err_of(e);
-    }
 
     // Where the new name goes. A path with a slash names its own parent; a
     // bare name has none, and the directory it is created in is the one the
@@ -1742,11 +1744,57 @@ pub fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         }
         None => (new_base.clone(), new_path.clone()),
     };
+    // What already holds the new name, if anything - the entry this rename
+    // would replace. Asked of the directory that holds the name rather than by
+    // walking it, which is the same question every make-or-remove asks.
+    let existing = dir.lookup(&name).ok();
+
+    // Both names are resolved before either rule is asked, because the *shapes*
+    // come first and they need both of them: renaming a file onto a directory
+    // is `EISDIR` and a directory onto a file is `ENOTDIR`, and each of those
+    // beats the mount refusal and the permission check. Measured on a current
+    // host (`.workbuddy/probe_mountpoint_doors.c` §5): `rename(file, mounted
+    // dir)` answers `EISDIR` where `rename(dir, mounted dir)` answers `EBUSY`,
+    // and `rename(mounted dir, file)` answers `ENOTDIR` where
+    // `rename(mounted dir, dir)` answers `EBUSY` - so the type is asked first
+    // and the mount point second.
+    if let Some(target) = &existing {
+        let old_is_dir = old_inode.metadata().kind == NodeKind::Dir;
+        let new_is_dir = target.metadata().kind == NodeKind::Dir;
+        if !old_is_dir && new_is_dir {
+            return err::EISDIR;
+        }
+        if old_is_dir && !new_is_dir {
+            return err::ENOTDIR;
+        }
+    }
+
+    // Renaming takes the old name out of its directory, so the rule that
+    // governs `unlink` governs this too: without it, a rename is a way around
+    // the permission check - and a rename is what `mv` is. It is also where the
+    // old end's mount point is refused (`may_remove` asks the same question an
+    // `unlink` does, for the same reason).
+    if let Err(e) = crate::vfs::may_remove(&old_dir, &old_inode) {
+        return err_of(e);
+    }
+
     // The new name is an entry being made in `dir`, so the directory's bits
     // decide - the same rule a create follows. Without it a rename is a way to
     // put a name somewhere the caller could not have created one.
     if let Err(e) = crate::vfs::may_create_in(&dir) {
         return err_of(e);
+    }
+    // And the new end's mount point, refused for the reason Linux refuses it:
+    // the filesystem mounted on that name is not this call's to lift. It is
+    // asked *after* the two rules above, which is Linux's order and the one an
+    // unprivileged caller can see - `rename(mounted, x)` in a directory it may
+    // not write is `EACCES` and not `EBUSY` (measured, same probe §9). Without
+    // this the name went, the mounted filesystem was orphaned, and the table
+    // kept an entry whose mount point no longer had a name.
+    if let Some(target) = &existing
+        && crate::vfs::is_mount_point(target)
+    {
+        return err::EBUSY;
     }
 
     // What `create` owes the caller when the name is taken: the name is
@@ -4713,9 +4761,11 @@ pub fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         ))
     };
     // A name that is already there is `EEXIST`, and the question is about the
-    // *name*: asked without following, a dangling link is a name that exists
-    // and answers the same way Linux does.
-    if crate::vfs::resolve_no_follow_at(&absolute, cwd.clone()).is_ok() {
+    // *name* rather than about a path: asked of the directory that holds it, a
+    // dangling link is a name that exists and answers the same way Linux does -
+    // and so is a name a mount covers, which is why this is [`resolve_entry_at`]
+    // and not the no-follow *walk* beside it.
+    if crate::vfs::resolve_entry_at(&absolute, cwd.clone()).is_ok() {
         return err::EEXIST;
     }
     let (parent_path, name) = match absolute.rsplit_once('/') {
@@ -5930,11 +5980,11 @@ pub fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // through `syscall(2)` (`.workbuddy/probe_mknod.c`): over a node of the same
     // type, over one of a *different* type (including a type this kernel
     // refuses, which Linux serves), over a *dangling link* (the question is
-    // about the name, so it is asked without following), and through this
-    // spelling and the legacy `mknod` alike. This door answered `0` and called
-    // the caller's intent its own ("the caller wanted the node, not the call"),
-    // which is a success where Linux refuses.
-    if crate::vfs::resolve_no_follow_at(name, parent.clone()).is_ok() {
+    // about the name, so it is asked of the directory that holds it), and
+    // through this spelling and the legacy `mknod` alike. This door answered `0`
+    // and called the caller's intent its own ("the caller wanted the node, not
+    // the call"), which is a success where Linux refuses.
+    if crate::vfs::resolve_entry_at(name, parent.clone()).is_ok() {
         return err::EEXIST;
     }
     // The parent's bits decide whether a name may be made here, and the mode

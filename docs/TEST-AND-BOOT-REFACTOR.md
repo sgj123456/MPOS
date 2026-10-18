@@ -173,6 +173,8 @@ FAIL: a bind under a plain file is ENOTDIR, whatever occupies its name (got -13,
 
 对照 `Vfs::resolve_no_follow`（同文件 1515 行）——它有 `if parent.metadata().kind != NodeKind::Dir { return Err(VfsError::NotDir) }`。**同一份"父必须是目录"的规则，一处写了、三处没写。**
 
+> 后记（2026-10-18）：这条判定现在在 `resolve_entry`/`resolve_caller_entry` 上——`resolve_no_follow` 已改为普通遍历加一个"最后一个名字不跟随符号链接"的模式，好让被挂载覆盖的名字穿过挂载点，见 `docs/uapi/` §5.1 item 45。
+
 ### 3.2 改动
 
 **`src/vfs/mod.rs`**：新增一处判定，供所有"造名/删名"的入口共用：

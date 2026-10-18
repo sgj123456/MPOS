@@ -27,6 +27,31 @@ use super::{FileSystem, Inode, NodeKind, VfsError, VfsResult, resolve_opt};
 /// Linux's own limit is 40.
 const SYMLINK_HOPS: usize = 40;
 
+/// Whether a walk *follows* a symbolic link that turns out to be the **last**
+/// name - Linux's `LOOKUP_FOLLOW` against `LOOKUP_NOFOLLOW` on the trailing
+/// component, which is the flag `lstat`, `readlink` and `open(..., O_NOFOLLOW)`
+/// turn off.
+///
+/// It says nothing about mounts. Linux's walk crosses a mount under either
+/// flag (the crossing is part of *stepping into* the name, before anything
+/// looks at whether the thing stepped into is a link), so a name a mount
+/// covers answers the mounted root to `lstat` exactly as it does to `stat` -
+/// measured on a current host, `.workbuddy/probe_mountpoint_doors.c`: a tmpfs
+/// over a `0755` directory answers its own root to `lstat`, `stat`, `statx`
+/// with and without `AT_SYMLINK_NOFOLLOW`, `newfstatat`, `open` and `access`.
+/// The two questions are therefore two arguments rather than one, and the
+/// crossing is not one of the things this flag turns off.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LastLink {
+    /// The ordinary walk: a link in the last name is a step like any other.
+    Follow,
+    /// The last name is looked up (and crossed, if a mount covers it) and
+    /// handed back as it is. Interior links are still followed - only the
+    /// trailing one stops the walk, which is the whole difference between
+    /// `lstat` and `stat`.
+    NoFollow,
+}
+
 /// One mount as `/proc/mounts` and `/proc/self/mountinfo` print it: the mount
 /// point's node, the source and filesystem name `mount(2)` was given, and the
 /// two flags that decide how the line reads.
@@ -1155,7 +1180,7 @@ impl MountTable {
     /// Walk `path` from the root, crossing mounts as they are met.
     pub(crate) fn resolve(&self, path: &str) -> VfsResult<Arc<dyn Inode>> {
         let root = self.root_opt().ok_or(VfsError::NoRoot)?;
-        self.resolve_walk(path, root.clone(), Some(root), self)
+        self.resolve_walk(path, root.clone(), Some(root), self, LastLink::Follow)
     }
 
     /// The root inode as it stands, or `None` before a filesystem is mounted -
@@ -1193,7 +1218,7 @@ impl MountTable {
     /// syscall reaches with its caller's cwd. Keeping the two apart is what
     /// makes "resolved against the caller" mean the same thing everywhere.
     pub fn resolve_caller(&self, path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
-        self.resolve_walk(path, start, self.caller_root(), self)
+        self.resolve_walk(path, start, self.caller_root(), self, LastLink::Follow)
     }
 
     /// [`Vfs::resolve_caller`] handing back the directory the last name lives
@@ -1224,22 +1249,25 @@ impl MountTable {
     }
 
     /// [`Vfs::resolve_caller`] without following a symbolic link in the **last**
-    /// component - what `lstat`, `readlink` and `symlink` need. Same rules as
-    /// [`Vfs::resolve_no_follow`], jailed like every other caller-shaped walk.
+    /// component - what `lstat`, `readlink` and `open(..., O_NOFOLLOW)` need.
+    /// Same rules as [`Vfs::resolve_no_follow`], jailed like every other
+    /// caller-shaped walk.
+    ///
+    /// A walk rather than a parent-and-lookup, and the mount crossing is why:
+    /// `lstat` of a name a mount covers answers the mounted root (Linux crosses
+    /// the mount under `LOOKUP_NOFOLLOW` exactly as under `LOOKUP_FOLLOW`,
+    /// measured in `.workbuddy/probe_mountpoint_doors.c`), and *where* the
+    /// crossing applies depends on where the walk has been - a plain bind clones
+    /// no submounts, so the same name reached through an alias answers the
+    /// covered directory. Only the walk knows that ([`LastLink`] says the rest).
+    /// A door whose question is the *name* rather than the path wants
+    /// [`Vfs::resolve_entry`] instead.
     pub fn resolve_caller_no_follow(
         &self,
         path: &str,
         start: Arc<dyn Inode>,
     ) -> VfsResult<Arc<dyn Inode>> {
-        let (parent_path, name) = split_last(path);
-        if name.is_empty() || name == "." || name == ".." {
-            return self.resolve_caller(path, start);
-        }
-        let parent = self.resolve_caller(parent_path, start)?;
-        if parent.metadata().kind != NodeKind::Dir {
-            return Err(VfsError::NotDir);
-        }
-        parent.lookup(name)
+        self.resolve_walk(path, start, self.caller_root(), self, LastLink::NoFollow)
     }
 
     /// Walk `path` from `start` instead of the root - which is what a
@@ -1257,7 +1285,7 @@ impl MountTable {
         path: &str,
         start: Arc<dyn Inode>,
     ) -> VfsResult<Arc<dyn Inode>> {
-        self.resolve_walk(path, start, self.root_opt(), self)
+        self.resolve_walk(path, start, self.root_opt(), self, LastLink::Follow)
     }
 
     /// Walk `path` from `start`, treating `jail` as the root: the directory an
@@ -1278,13 +1306,19 @@ impl MountTable {
     /// arguments because they are two facts a task carries together
     /// (`process_fs_context`) and a resolution that crossed mounts in the
     /// machine's table while jailing to a private root would show one namespace's
-    /// mounts inside another's tree.
+    /// mounts inside another's tree. `last` says whether a link in the **last**
+    /// name is followed ([`LastLink`]) - and the walk is where that has to
+    /// live, rather than in a parent-and-lookup helper beside it, because the
+    /// crossing above needs the walk's own state: a plain bind clones no
+    /// submounts, so a name inside an alias is *not* a mount point even when
+    /// its spelling outside one is.
     fn resolve_walk(
         &self,
         path: &str,
         start: Arc<dyn Inode>,
         jail: Option<Arc<dyn Inode>>,
         table: &MountTable,
+        last: LastLink,
     ) -> VfsResult<Arc<dyn Inode>> {
         let absolute = path.starts_with('/');
         let start = if absolute {
@@ -1421,6 +1455,28 @@ impl MountTable {
                             })
                         };
                         if child.metadata().kind == NodeKind::Symlink {
+                            // A link in the **last** name, under `NoFollow`, is
+                            // the answer rather than a step: `lstat` wants the
+                            // link, `readlink` wants its target text, and
+                            // `open(..., O_NOFOLLOW)` wants `ELOOP` - none of
+                            // which the walk can reach if it splices the target
+                            // in front of what is left (there is nothing left)
+                            // or resolves a link that carries a payload. This
+                            // is asked *before* the payload arm below for that
+                            // reason: `lstat("/proc/self/ns/mnt")` must answer
+                            // the procfs link and not the namespace file the
+                            // following door hands on.
+                            //
+                            // `todo.is_empty()` is what "last" means here, and
+                            // it stays true through the splicing a *link in an
+                            // interior name* does: the names a target brings
+                            // with it are pushed in front of the ones that
+                            // followed, so a name is last exactly when nothing
+                            // is behind it.
+                            if last == LastLink::NoFollow && todo.is_empty() {
+                                stack.push(child);
+                                break;
+                            }
                             // A link that carries a *payload* is followed to
                             // what it denotes rather than spliced by its
                             // target text, because its target is a report and
@@ -1796,26 +1852,50 @@ impl MountTable {
     }
 
     /// Resolve `path` without following a symbolic link in its **last**
-    /// component - what `lstat`, `readlink` and `symlink` need, and the one
-    /// thing the ordinary walk cannot give them.
+    /// component - what `lstat`, `readlink` and `open(..., O_NOFOLLOW)` need,
+    /// and the one thing the ordinary walk cannot give them.
     ///
     /// Everything before the last name is walked normally, links and all, so
     /// `a/b/c` really looks inside the `b` that `a` leads to. The last name is
-    /// then looked up in its parent and handed back unfollowed. That
-    /// distinction is the whole point: `lstat` on a link must answer for the
-    /// link, and `symlink` onto a name that is already a link must report the
-    /// name as taken rather than quietly writing beside its target.
+    /// then reached by the same walk and handed back unfollowed - a mount
+    /// covering it is crossed first, because Linux crosses a mount whatever the
+    /// flag says about links: a tmpfs mounted over a directory answers its own
+    /// root to `lstat`, `stat`, `statx` with and without
+    /// `AT_SYMLINK_NOFOLLOW`, `newfstatat`, `open` and `access` alike (measured,
+    /// `.workbuddy/probe_mountpoint_doors.c`).
     ///
     /// `.` and `..` are the two names that are not entries of the directory
     /// they appear in - `.` *is* that directory, and neither can be a link -
     /// so resolving them is ordinary resolution. They are also the names every
     /// directory-listing tool asks for, which is why treating them as
-    /// unnameable broke `ls -l`.
+    /// unnameable broke `ls -l`. The walk handles both without a special case.
     pub fn resolve_no_follow(
         &self,
         path: &str,
         start: Arc<dyn Inode>,
     ) -> VfsResult<Arc<dyn Inode>> {
+        self.resolve_walk(path, start, self.root_opt(), self, LastLink::NoFollow)
+    }
+
+    /// The entry this directory holds **under** a name, without crossing a
+    /// mount that covers it and without following a link the name turns out to
+    /// be - Linux's `lookup_one` shape, what a caller that already has the
+    /// parent reaches for.
+    ///
+    /// This is the other half of [`Vfs::resolve_no_follow`], and the two are
+    /// the two questions a name can be asked. `resolve_no_follow` asks about a
+    /// *path*: it walks, so it crosses the mount covering the name, which is
+    /// what `lstat` and `open` owe. This asks about a *name in its directory*:
+    /// it looks the name up where the directory holds it, so a mount point
+    /// answers the directory it *covers* - which is what every make-or-remove
+    /// door needs, because those act on the name (`mkdir` of a mount point is
+    /// `EEXIST`, and `rmdir` of one is `EBUSY` rather than the removal of the
+    /// mounted root; both measured, same probe).
+    ///
+    /// `.` and `..` are resolved rather than looked up, being names no
+    /// directory holds as entries (`mkdir(".")` is `EEXIST`, and `mkdir("/")`
+    /// is too - the case that made `mkdir -p` abort).
+    pub fn resolve_entry(&self, path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
         let (parent_path, name) = split_last(path);
         if name.is_empty() || name == "." || name == ".." {
             return self.resolve_from(path, start);
@@ -1825,6 +1905,41 @@ impl MountTable {
             return Err(VfsError::NotDir);
         }
         parent.lookup(name)
+    }
+
+    /// [`Vfs::resolve_entry`] jailed to the caller's own root, for the syscall
+    /// doors that reach it with a `dirfd` or a cwd.
+    pub fn resolve_caller_entry(
+        &self,
+        path: &str,
+        start: Arc<dyn Inode>,
+    ) -> VfsResult<Arc<dyn Inode>> {
+        let (parent_path, name) = split_last(path);
+        if name.is_empty() || name == "." || name == ".." {
+            return self.resolve_caller(path, start);
+        }
+        let parent = self.resolve_caller(parent_path, start)?;
+        if parent.metadata().kind != NodeKind::Dir {
+            return Err(VfsError::NotDir);
+        }
+        parent.lookup(name)
+    }
+
+    /// Whether some mount in this table sits on `inode` - the mount-point test
+    /// `may_remove` and `rename` refuse with, and Linux's `d_mountpoint`.
+    ///
+    /// Asked of the node rather than of a position in the walk, deliberately:
+    /// the refusal is `EBUSY` in an alias view too, where the *crossing* does
+    /// not happen and the reading doors answer the covered directory
+    /// (measured, `.workbuddy/probe_mountpoint_doors.c` §8).
+    pub fn is_mount_point(&self, inode: &Arc<dyn Inode>) -> bool {
+        critical_section::with(|cs| {
+            self.mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .any(|m| Arc::ptr_eq(&m.at, inode))
+        })
     }
 }
 
@@ -2085,7 +2200,7 @@ pub fn chroot_target(path: &str, cwd: &Arc<dyn Inode>) -> VfsResult<Arc<dyn Inod
     let (table, root) = process_fs_context();
     let table = table.unwrap_or_else(machine_table);
     let jail = root.or_else(|| table.root_opt());
-    let inode = table.resolve_walk(path, cwd.clone(), jail, &table)?;
+    let inode = table.resolve_walk(path, cwd.clone(), jail, &table, LastLink::Follow)?;
     if inode.metadata().kind != NodeKind::Dir {
         return Err(VfsError::NotDir);
     }
@@ -2144,11 +2259,46 @@ pub fn resolve_parent_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<(Arc<dy
 /// *following* walks were caller-routed already. Inside a namespace with a
 /// filesystem mounted, `stat("/mnt/f")` saw the mount and `lstat("/mnt/f")` did
 /// not — the same path, two answers, and the wrong one for every `ls -l` in a
-/// container.
+/// container. Both doors agree now, and for the same reason the *entry* door
+/// beside them exists: the walk crosses mounts, so the two questions are "the
+/// path" here and "the name" in [`resolve_entry_at`].
 pub fn resolve_no_follow_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
     let (table, _) = process_fs_context();
     let table = table.unwrap_or_else(machine_table);
     table.resolve_caller_no_follow(path, start)
+}
+
+/// The entry a name stands for in the directory holding it, through the
+/// caller's table - [`Vfs::resolve_caller_entry`], and the door every
+/// make-or-remove syscall asks its existence question through.
+///
+/// The difference from [`resolve_no_follow_at`] above is the mount crossing and
+/// nothing else: this looks the name up where its directory holds it, so a name
+/// a mount covers answers the *covered* node - which is what `mkdir`, `mknod`
+/// and `symlink` are asking when they answer `EEXIST`, and what `unlink`,
+/// `rmdir` and `rename` mean by the name they act on.
+pub fn resolve_entry_at(path: &str, start: Arc<dyn Inode>) -> VfsResult<Arc<dyn Inode>> {
+    let (table, _) = process_fs_context();
+    let table = table.unwrap_or_else(machine_table);
+    table.resolve_caller_entry(path, start)
+}
+
+/// Whether some mount in the caller's table sits on `inode` - Linux's
+/// `d_mountpoint`, and the question a make-or-remove asks before it takes a
+/// name away.
+///
+/// The test is on the **node** and not on the view, which is Linux's own shape
+/// rather than an approximation of it: the refusal is `EBUSY` for `rmdir`,
+/// `unlink` and `rename` of a mount point *including* inside a plain bind alias,
+/// where the reading doors answer the covered directory and there is no mount in
+/// that view at all (measured, `.workbuddy/probe_mountpoint_doors.c` §8: a
+/// second tree's `rmdir(alias2/e)` is `EBUSY` while `lstat(alias2/e)` there
+/// answers the covered directory). So the walk's bind state, which the crossing
+/// *does* need, is not needed here.
+pub fn is_mount_point(inode: &Arc<dyn Inode>) -> bool {
+    let (table, _) = process_fs_context();
+    let table = table.unwrap_or_else(machine_table);
+    table.is_mount_point(inode)
 }
 
 /// The filesystem serving `inode` **in the caller's table** - the identity test
@@ -2410,6 +2560,102 @@ mod tests {
         // And both names are the same filesystem instance, st_dev and all:
         // the record the alias adds borrows the root's id.
         assert_eq!(vfs.fs_of_path("/b/run").0, vfs.fs_of_path("/run/..").0);
+    }
+
+    /// A mount is stepped into whatever `LOOKUP_NOFOLLOW` says about links, so
+    /// the no-follow walk **crosses** it - and the door whose question is the
+    /// *name* does not. That difference is the whole of what separates the two
+    /// helpers, and it is what makes `lstat` and `open(..., O_NOFOLLOW)` agree
+    /// with `stat` about a mount point (measured on a current host,
+    /// `.workbuddy/probe_mountpoint_doors.c`) while `mkdir` still answers
+    /// `EEXIST` for the covered directory.
+    #[test]
+    fn a_no_follow_walk_crosses_a_mount_where_the_entry_door_does_not() {
+        let vfs = tree_with_root();
+        let root = vfs.resolve("/").unwrap();
+        let covered = root.create("d", NodeKind::Dir).unwrap();
+        covered.set_mode(0o755);
+        let inner = RamFs::new();
+        inner.root().set_mode(0o705);
+        vfs.mount("/d", inner.clone()).unwrap();
+
+        // The crossing is not a thing `NoFollow` turns off: `lstat` of the
+        // mount point answers the mounted root, mode and all.
+        let no_follow = vfs.resolve_no_follow("/d", root.clone()).unwrap();
+        assert!(Arc::ptr_eq(&no_follow, &inner.root()));
+        assert_eq!(no_follow.mode() & 0o7777, 0o705);
+        // And the following door agrees, which is the property that was missing.
+        assert!(Arc::ptr_eq(&vfs.resolve("/d").unwrap(), &inner.root()));
+
+        // The entry door answers the directory the mount *covers* - the name a
+        // make-or-remove acts on, and the one Linux refuses to take away.
+        let entry = vfs.resolve_entry("/d", root).unwrap();
+        assert!(Arc::ptr_eq(&entry, &covered));
+        assert_eq!(entry.mode() & 0o7777, 0o755);
+    }
+
+    /// The same name inside a plain bind of its parent is not a mount point, so
+    /// the no-follow walk answers the covered directory there - which a crossing
+    /// keyed on the table rather than on the walk's own state could not do. The
+    /// alias test above says the same for the following walk; this is the half
+    /// that used to be missing, and it is why the no-follow resolver is a *walk*
+    /// rather than a parent-and-lookup.
+    #[test]
+    fn a_no_follow_walk_inside_a_bind_alias_answers_the_covered_directory() {
+        let vfs = tree_with_root();
+        let root = vfs.resolve("/").unwrap();
+        let under = root.create("run", NodeKind::Dir).unwrap();
+        let live = RamFs::new();
+        vfs.mount("/run", live.clone()).unwrap();
+        root.create("b", NodeKind::Dir).unwrap();
+        let b = vfs.resolve("/b").unwrap();
+        vfs.bind_mount(b, root.clone(), "/", false).unwrap();
+
+        let aliased = vfs.resolve_no_follow("/b/run", root.clone()).unwrap();
+        assert!(Arc::ptr_eq(&aliased, &under), "no submounts in the clone");
+        // The outer spelling still crosses.
+        let outer = vfs.resolve_no_follow("/run", root).unwrap();
+        assert!(Arc::ptr_eq(&outer, &live.root()));
+    }
+
+    /// A name a mount sits on is a **mount point**, and the question is asked of
+    /// the node rather than of the view: `rmdir` of the same name inside a bind
+    /// alias is refused even though the reading door there answers the covered
+    /// directory, which is Linux's own `d_mountpoint` (measured,
+    /// `.workbuddy/probe_mountpoint_doors.c` §8).
+    ///
+    /// The refusal itself is `may_remove`'s, and that is a *syscall-side* claim:
+    /// `may_remove` asks the caller's table, so only a guest program can show the
+    /// end to end - `t-mountpoint` is where the five refusals are claimed. What
+    /// is pinned here is the question every one of them is built on, and that the
+    /// table keeps its entry across a peel.
+    #[test]
+    fn a_name_a_mount_sits_on_is_a_mount_point() {
+        let vfs = tree_with_root();
+        let root = vfs.resolve("/").unwrap();
+        let d = root.create("d", NodeKind::Dir).unwrap();
+        root.create("b", NodeKind::Dir).unwrap();
+        let b = vfs.resolve("/b").unwrap();
+        vfs.mount("/d", RamFs::new()).unwrap();
+        assert!(vfs.is_mount_point(&d));
+        assert!(
+            !vfs.is_mount_point(&root),
+            "the tree's own root is not a mount *point*"
+        );
+
+        // Reached through the alias, the entry door still finds the covered
+        // directory - and the node it finds is the one the mount is recorded on,
+        // which is what makes the refusal view-independent.
+        vfs.bind_mount(b, root.clone(), "/", false).unwrap();
+        let through_alias = vfs.resolve_entry("/b/d", root.clone()).unwrap();
+        assert!(Arc::ptr_eq(&through_alias, &d));
+        assert!(vfs.is_mount_point(&through_alias));
+
+        // The peel leaves the tree as it was: the node is a plain directory
+        // again and the name is its own.
+        assert!(vfs.unmount("/d").is_ok());
+        assert!(!vfs.is_mount_point(&d));
+        assert!(Arc::ptr_eq(&vfs.resolve_entry("/d", root).unwrap(), &d));
     }
 
     #[test]

@@ -1836,7 +1836,9 @@ probe, `fchownat`, `linkat`'s two (the source's resolution and the identity test
 `O_NOFOLLOW`/`ELOOP` probe. Two of those carried a *second* defect: `mkdirat`'s and
 `mknodat`'s probes called `MountTable::resolve_no_follow`, whose walk starts at the
 machine's **root** — so a chrooted task was refused a directory it did not have
-because the machine's root had one. `path_of`'s render jail (`/proc/<pid>/cwd`
+because the machine's root had one. (Those two probes, and `mknod`'s, moved to
+`resolve_entry_at` later — the same caller's-table rule, asked by the door whose
+question is the *name* rather than the path: `docs/uapi/` §5.1 item 45.) `path_of`'s render jail (`/proc/<pid>/cwd`
 naming an inode from a root) is a *different* question — whose root a path is
 *rendered* against, not which tree it resolves in — and is left named rather than
 moved with these; it wants its own reading and its own pin.

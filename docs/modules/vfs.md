@@ -36,7 +36,7 @@ Grouped by area, because "where do I put this change" is the question the page e
 | File | What lives there |
 |---|---|
 | `src/vfs/mod.rs` | The `Inode` and `FileSystem` traits, `NodeKind`, `Metadata`, `Ready`, `VfsError`, `FsStats`, `Ino`, the `MappedInode` bridge to `mm`, the permission checks (`may_access`, `may_as`, `may_search`, `may_create_in`, `may_remove`, `may_modify`, `may_write`, `may_alter`), the inode-attribute flag vocabulary (`FS_*`, `INODE_FL_VISIBLE`, `INODE_FL_MODIFIABLE`, `apply_flag_change`) and the `read_file`/`read_dir`/`create_file`/`split_parent` convenience layer |
-| `src/vfs/mount.rs` | `Vfs`: the mount table, `Mount`/`MountRecord`/`MountPoint`, `mount_at`, `bind_mount`, `remount`, `unmount`, `move_root`/`move_mount`, `pivot_root`, `resolve`/`resolve_from`/`resolve_walk`, `resolve_no_follow`, `resolve_parent`, `path_of`/`parent_of`, `mount_records`, and the `st_dev`/filesystem-identity answers (`dev_of_path`, `dev_of_inode`, `fs_of_path`, `fs_serving_inode`, `fs_id_of_inode`, `fstype_of_inode`), plus the free-function kernel table |
+| `src/vfs/mount.rs` | `Vfs`: the mount table, `Mount`/`MountRecord`/`MountPoint`, `mount_at`, `bind_mount`, `remount`, `unmount`, `move_root`/`move_mount`, `pivot_root`, `resolve`/`resolve_from`/`resolve_walk` (and its `LastLink` mode), `resolve_no_follow`, `resolve_entry`, `resolve_parent`, `is_mount_point`, `path_of`/`parent_of`, `mount_records`, and the `st_dev`/filesystem-identity answers (`dev_of_path`, `dev_of_inode`, `fs_of_path`, `fs_serving_inode`, `fs_id_of_inode`, `fstype_of_inode`), plus the free-function kernel table |
 | `src/vfs/path.rs` | `components` (walkable names, `.`/`..` handed through) and `normalize` (the spelling `statfs` matches mountpoints by — *not* resolution) |
 | `src/vfs/file.rs` | `File` (an inode plus a cursor, status flags, access mode, open label and `st_dev`), `FdTable` (slots, per-fd `FD_CLOEXEC` word, `RLIMIT_NOFILE` ceiling), `kernel_fds`/`current_table`, `for_each_last`, and the `open`/`open_opt`/`open_inode`/`read`/`write`/`close`/`dup2` entry points |
 | **Real filesystems** | |
@@ -97,8 +97,13 @@ spellings of it over the kernel's one table. The notable invariants each one kee
 - **`resolve_walk`** is the single walker. It carries the logical chain from the root in a stack,
   which is what makes `..` correct across a mount and across a symlink splice; `resolve_at` jails
   an absolute path to the *calling task's* root while `resolve`/`resolve_from` use the machine's.
-  `resolve_no_follow` and `resolve_parent` stop before the last name, because `lstat`, `readlink`,
-  `symlink` and `unlink` act on the *name*, not what it points at.
+  Its `LastLink` argument is whether a link in the **last** name is followed — `lstat`, `readlink`
+  and `open(..., O_NOFOLLOW)` say no — and the walk is where that has to live, because the mount
+  crossing is not part of the same question: a mount is stepped into under either flag, and where
+  the crossing applies depends on where the walk has been (a plain bind clones no submounts).
+  `resolve_no_follow` is that walk; `resolve_entry` is the other question a name can be asked — the
+  entry its directory holds under it, *without* the crossing — which is what the make-or-remove
+  doors's `EEXIST` probes and `resolve_parent`'s callers mean.
 - **The mount table** records two different numbers and the difference is load-bearing: `Mount::id`
   is the serving *instance* (what `EXDEV` and `linkat` ask by, shared by a bind), and `Mount::dev`
   is what `stat`'s `st_dev` reports (the device's own number, or an anonymous one for a

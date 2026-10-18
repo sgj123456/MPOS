@@ -65,10 +65,13 @@
 //! is where the shape is named.
 //!
 //! The two **mount names themselves** - `/proc` and `/sys` - are claimed
-//! through the door that crosses their mount point (`stat`), because the
-//! no-follow door answers the directory a mount *covers* here rather than the
-//! filesystem mounted on it, which is a divergence of its own and is named in
-//! §5.2 beside its measurement.
+//! through either door, and used to be the one pair this program had to claim
+//! through `stat` alone: the no-follow door answered the directory a mount
+//! *covers* here rather than the filesystem mounted on it, which was a
+//! divergence of its own, named in §5.2 beside its measurement. The mount
+//! crossing is in the no-follow walk now, so `lstat` and `stat` agree about a
+//! mount point, and `t-mountpoint` is the program that claims the rule with a
+//! mount point of its own making.
 //!
 //! A host run makes every claim: the words above are Linux's, measured there
 //! first, and the two fixtures a machine has to be asked for - which block
@@ -83,24 +86,43 @@ use rustix::fs::{AtFlags, CWD, FileType, statat};
 /// One claim per node, and the failure names what came back rather than only
 /// that something did not match: the number *is* this program's subject.
 fn claims(r: &mut Report, path: &str, kind: FileType, mode: u32) {
-    claims_through(r, path, kind, mode, AtFlags::SYMLINK_NOFOLLOW);
+    claims_through(r, path, kind, mode, AtFlags::SYMLINK_NOFOLLOW, "");
 }
 
 /// The same claim for a name that is a **mount point** - `/proc` and `/sys` are
-/// covered by the filesystem mounted on them.
+/// covered by the filesystem mounted on them - made through **both** doors.
 ///
-/// Made through the door that *crosses*: `stat` follows the path into the
-/// mounted filesystem, which is Linux's resolution for a mount point and this
-/// kernel's too. The no-follow door beside it answers the covered directory
-/// here (the `/proc` init made, `0755` of ramfs) where Linux answers the
-/// mounted root - `docs/uapi/` §5.2 names that divergence with its measurement,
-/// and it is not this program's subject.
+/// `stat` follows the path into the mounted filesystem, and `lstat` *crosses*
+/// the mount without following a link: a mount is stepped into whatever
+/// `LOOKUP_NOFOLLOW` says about links (measured on a current host,
+/// `.workbuddy/probe_mountpoint_doors.c`). This pair used to be the program's
+/// one exception - the no-follow door answered the covered directory here, so
+/// only `stat` was claimed (`docs/uapi/` §5.2 named the divergence) - and the
+/// crossing is in the no-follow walk now, which is what makes two claims where
+/// there was one.
 fn claims_mounted(r: &mut Report, path: &str, kind: FileType, mode: u32) {
-    claims_through(r, path, kind, mode, AtFlags::empty());
+    claims_through(r, path, kind, mode, AtFlags::SYMLINK_NOFOLLOW, "");
+    claims_through(
+        r,
+        path,
+        kind,
+        mode,
+        AtFlags::empty(),
+        " through the following door",
+    );
 }
 
-fn claims_through(r: &mut Report, path: &str, kind: FileType, mode: u32, flags: AtFlags) {
-    let want = format!("{path} reports {mode:04o} for a {}", name_of(kind));
+/// One claim, through one door: `door` names which of the two it was, so the
+/// pair above reads as two claims rather than one made twice.
+fn claims_through(
+    r: &mut Report,
+    path: &str,
+    kind: FileType,
+    mode: u32,
+    flags: AtFlags,
+    door: &str,
+) {
+    let want = format!("{path}{door} reports {mode:04o} for a {}", name_of(kind));
     let got = statat(CWD, path, flags)
         .ok()
         .map(|st| (FileType::from_raw_mode(st.st_mode), st.st_mode & 0o7777));

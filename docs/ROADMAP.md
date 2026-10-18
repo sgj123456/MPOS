@@ -445,6 +445,37 @@ is a second place to drift; `t-ns-net`'s section walks both doors in one child. 
 the capability is still asked **before** the protocol is judged, and a root caller is privileged
 over the machine's own network namespace, so no guest answer that existed before changed.
 
+**A mount point answers the mount, and a name a mount sits on may not be taken away**  
+(`docs/uapi/` §5.1 item 45, landed 2026-10-18) — the last named divergence in the filesystem's own  
+resolution, and the one §5.2's entry had called "not a two-line fix" because one helper answered two  
+questions: the no-follow resolver looked the last name up *in its parent*, so the crossing the  
+walking resolver performs on every child it looks up never happened for the final component  
+(`lstat("/proc")` answered the ramfs directory the initramfs made, `0755`, where `stat` answered the  
+mounted root's `0555`), while the make-or-remove doors want that same covered name — Linux's `rmdir`  
+of a mount point is `EBUSY`, not the removal of the mounted root. **Measured whole on a current host  
+first**, in nine sections (`.workbuddy/probe_mountpoint_doors.c`, Linux 7.2.9): the reading and  
+altering doors *cross* the mount — `lstat`, `stat`, `statx` with and without  
+`AT_SYMLINK_NOFOLLOW`, `newfstatat`, `open`, `faccessat2`, `chmod`, `utimensat` — because the  
+crossing is not what `LOOKUP_NOFOLLOW` turns off (the flag is about links, and a mount is stepped  
+into whatever the flag says); a plain bind covers the crossing up, since a non-recursive bind clones  
+no submounts, which is why the crossing has to come from the walk's own state; the make-or-remove  
+doors answer `EBUSY` for the name (`rmdir`, `unlinkat(AT_REMOVEDIR)`, `rename`) and `EEXIST` for a  
+make (`mkdir`, `mknod`, `symlink`); and the questions ahead of that refusal are ordered — the type  
+pair first (`rename(file, mounted dir)` is `EISDIR`, `rename(mounted dir, file)` `ENOTDIR`), then the  
+permission half, then the mount point, which is what an unprivileged caller in a `0555` directory  
+holding a mount point reads as `EACCES` for all of `rmdir`, `unlink` and `rename`. What landed is  
+one mode on the walk (`resolve_walk`'s `LastLink::Follow`/`NoFollow`, which the no-follow resolver  
+now *is*) plus one question at the refusal (`is_mount_point`, a fact about the node rather than the  
+view, asked last in `may_remove` and on either end of `renameat2`); the old parent-and-lookup body  
+stays as `resolve_entry`, which is exactly what the three doors whose question is a *name* want.  
+`t-mountpoint` is the new pin, 37 claims on both machines — it mounts its own tmpfs, so it needs no  
+fixture from the boot — and `t-proc-modes` now claims `/proc` and `/sys` through both doors (20  
+claims, was 18). Two findings stay named rather than served: a `rename` between a bind's own view  
+and the outer tree is `EXDEV` on Linux and is still served here, and a *file* mount point — the only  
+case where `unlink`'s half of the refusal is reachable — cannot exist in this kernel at all, because  
+every mount it can make lands on a directory.
+
+
 **A child's death is one `SIGCHLD` record, and it is Linux's** (`docs/uapi/` §5.1 item 29, landed  
 2026-10-17): the second book this kernel kept for "an exit whose signal is unread" is deleted — the  
 exit queues the real signal with `CLD_EXITED`/`CLD_KILLED` and the status beside it, and a death the  

@@ -96,8 +96,11 @@ lowest-risk kind, and the most direct violation of §4. Land with a host test an
   `lstat` of `slink -> /does-not-exist` must answer the *link* (`S_IFLNK`), not `ENOENT` for its
   missing target, and `O_NOFOLLOW` on it must be `ELOOP`, not a followed open. Measured on a current
   host (`stat(path, AT_SYMLINK_NOFOLLOW)` and `os.stat(follow_symlinks=False)` both succeed). It
-  holds here because `resolve_no_follow` looks the last name up with `Inode::lookup`, which never
-  reads a target, and ramfs stores the link node itself — pinned by the host
+  holds here because the no-follow resolver stops at the link instead of reading a target: it is the
+  ordinary walk with `LastLink::NoFollow` on its last name now (`docs/uapi/` §5.1 item 45, which is
+  what made it cross a mount on that name too), and before that it looked the last name up with
+  `Inode::lookup`, which read no target either — in both shapes ramfs hands back the link node
+  itself, and the walk's checkpoint is the one that says so generically. Pinned by the host
   `resolving_a_name_without_following_it_still_handles_dot`, now extended with the dangling link so
   the property is asserted rather than assumed.
 

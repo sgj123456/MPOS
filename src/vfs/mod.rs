@@ -93,8 +93,8 @@ pub mod vcmux;
 
 pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write};
 pub use mount::{
-    fs_serving_inode_of, global, mount, mount_root, pivot_root, resolve, resolve_at,
-    resolve_no_follow_at, resolve_parent_at, unmount,
+    fs_serving_inode_of, global, is_mount_point, mount, mount_root, pivot_root, resolve,
+    resolve_at, resolve_entry_at, resolve_no_follow_at, resolve_parent_at, unmount,
 };
 
 use alloc::string::String;
@@ -1961,6 +1961,20 @@ pub fn may_remove(parent: &Arc<dyn Inode>, target: &Arc<dyn Inode>) -> VfsResult
         && !caller.overrides.fowner
     {
         return Err(VfsError::NotPermitted);
+    }
+    // And last, the one refusal that is about the *name* rather than about the
+    // caller: a name a mount sits on cannot be taken away, whatever the
+    // directory's bits say, because the filesystem mounted there is not the
+    // entry's to give up. Linux answers `EBUSY` (`d_mountpoint`), and it is
+    // Linux's *order* that puts it here rather than first: measured on a
+    // current host, an unprivileged caller in a `0555` directory holding a
+    // mount point reads `EACCES` for `rmdir`, `unlink` and `rename` alike, and
+    // `EBUSY` only once the permission half has passed
+    // (`.workbuddy/probe_mountpoint_doors.c` §9). Without this the name goes and
+    // the mount table keeps an entry whose mount point no longer has one - the
+    // ghost a `rename` onto a mount point used to leave.
+    if crate::vfs::is_mount_point(target) {
+        return Err(VfsError::Busy);
     }
     Ok(())
 }

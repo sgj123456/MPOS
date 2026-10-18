@@ -490,21 +490,34 @@ Section numbers are unchanged from the original `UAPI.md`.
   its own doc. Pinned incidentally by `abi.rs`'s row-11 test, which reads the default against the
   ring.
 
-- **A mount point answers the directory it *covers*, to the no-follow door. Named 2026-10-17**
-  (`docs/uapi/` §5.1 item 37's measurement; not fixed). `resolve_no_follow` splits the last name off
-  its parent, resolves the parent, and looks the final component up *in it* — so the mount crossing
-  the walking resolver performs on every child it looks up never happens for the last component, and
-  `lstat("/proc")` answers the ramfs directory the initramfs created (measured on the payload:
-  `0755`, where the same name through the *following* door answers the mounted root's `0555` — which
-  is Linux's answer for both doors, because a mount covers its mount point and `lstat` crosses it
-  exactly as `stat` does). The doors that reach it are every `AT_SYMLINK_NOFOLLOW` stat door
-  (`lstat`, `fstatat`, `statx`) and the name-shaped mutators, which find what to operate on through
-  the same helper — and that is why this is not a two-line fix: the stat doors want the crossing,
-  while the mutators want the covered name (Linux's `rmdir` of a mount point is `EBUSY`, not the
-  removal of the mounted root), and one helper answers both questions today. `t-proc-modes` claims
-  the two mount names through the crossing door, and this entry is the measurement of the other
-  one. Owner: `src/vfs/mount.rs`'s `resolve_no_follow`/`split_last`. Pin: none yet — the two
-  behavioral halves (a crossed `lstat`, an `EBUSY` `rmdir`) are what a pin would have to claim.
+- **A mount point answers the mount, and a name a mount sits on may not be taken away. Landed
+  2026-10-18** (`docs/uapi/` §5.1 item 45). Named 2026-10-17 by §5.1 item 37's own gate run, which
+  is where the first half was seen: the no-follow resolver split the last name off its parent,
+  resolved the parent, and looked the final component up *in it* — so the mount crossing the walking
+  resolver performs on every child it looks up never happened for the last component, and
+  `lstat("/proc")` answered the ramfs directory the initramfs created (`0755`, where the same name
+  through the *following* door answered the mounted root's `0555`). This entry's own sentence about
+  why it was not a two-line fix is what the landing turned on: one helper answered both questions,
+  and the stat doors want the crossing while the make-or-remove doors want the covered **name**
+  (Linux's `rmdir` of a mount point is `EBUSY`, not the removal of the mounted root). Measured whole
+  on a current host first, in nine sections (`.workbuddy/probe_mountpoint_doors.c`, Linux 7.2.9,
+  root) with a tmpfs over a `0755` directory and a file bind so one mode word and one `st_dev` say
+  which inode answered; the tables, the orderings and the tokens are in §5.1 item 45 and in
+  `docs/notes/` §15.63. **What landed is the split the sentence implied**: `resolve_walk` gained a
+  trailing-link mode (Linux's `LOOKUP_FOLLOW` against `LOOKUP_NOFOLLOW` for the last name only —
+  the flag says nothing about mounts, which are crossed under either, which is exactly why the two
+  questions are two arguments), the no-follow resolver *became* that walk so the crossing happens
+  with the walk's own bind state, and the old parent-and-lookup body survives as
+  `resolve_entry`/`resolve_entry_at` for the three doors whose question is a name (`mkdirat`'s,
+  `mknod`'s and `mknodat`'s `EEXIST` probes). The refusal is `is_mount_point` — a fact about the
+  node, Linux's own `d_mountpoint` — asked at the end of `may_remove` (after the permission half,
+  where the measurement puts `EACCES` before `EBUSY`) and on either end of `renameat2`, whose type
+  pair (`EISDIR`/`ENOTDIR`) comes first for the same reason. Pin: `t-mountpoint` (37 claims, both
+  machines, green on this host first) beside `t-proc-modes`' 20 and three host unit tests. **Two
+  things the probe found stay named**: a `rename` between a bind's own view and the outer tree is
+  `EXDEV` on Linux (`old_path.mnt != new_path.mnt`) and is still served here, and the *file* mount
+  point — the only case where `unlink`'s half of the refusal is reachable — cannot exist in this
+  kernel, since every mount it can make lands on a directory.
 
 - **The three capability scopes this kernel's one word could not express. Named 2026-10-17, all
   three landed by 2026-10-18** (`docs/uapi/`
