@@ -315,5 +315,48 @@ fn main() {
         libc::close(q[1]);
     }
 
+    // ---- a wait with no descriptors -------------------------------------
+    //
+    // `nfds` of zero is a *wait*, not a no-op. Linux sleeps for the timeout
+    // (`poll(NULL, 0, 100)` measured at `100.1 ms` on a current host,
+    // `.workbuddy/probe_poll0.c`) and `ppoll(NULL, 0, NULL)` never returns
+    // without a signal. That second shape is not academic: **`pause()` is that
+    // call on arm64**, where musl builds it as `ppoll(NULL, 0, NULL, NULL, 0)`
+    // (measured: `llvm-objdump` of musl's `pause.lo` for
+    // `aarch64-unknown-linux-musl` shows syscall 73 with every argument zero) -
+    // so a kernel that answers 0 at once is one where `pause()` returns
+    // immediately and a program idling that way spins.
+    let started = std::time::Instant::now();
+    r.check(
+        "a poll with no descriptors waits out its timeout",
+        poll(&mut [], 100) == 0 && started.elapsed() >= std::time::Duration::from_millis(90),
+    );
+    let started = std::time::Instant::now();
+    r.check(
+        "while a zero timeout answers at once",
+        poll(&mut [], 0) == 0 && started.elapsed() < std::time::Duration::from_millis(50),
+    );
+    // The wait with no timeout at all ends only on a signal, and a child is
+    // what proves it without this sweep ever parking: the parent looks in and
+    // finds it still there, then ends it.
+    let waiter = unsafe { libc::fork() };
+    if waiter == 0 {
+        poll(&mut [], -1);
+        std::process::exit(0);
+    }
+    r.check("a child for the no-timeout wait was forked", waiter > 0);
+    if waiter > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut status = 0i32;
+        let done =
+            unsafe { libc::wait4(waiter, &mut status, libc::WNOHANG, core::ptr::null_mut()) };
+        r.check(
+            "and the no-timeout wait does not return on its own",
+            done == 0,
+        );
+        unsafe { libc::kill(waiter, libc::SIGKILL) };
+        unsafe { libc::wait4(waiter, &mut status, 0, core::ptr::null_mut()) };
+    }
+
     r.finish()
 }

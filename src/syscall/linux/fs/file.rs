@@ -3014,14 +3014,23 @@ fn deadline_in_ticks(ms: u64) -> u64 {
 /// turned into the instant it names.
 fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
     let (fds, nfds) = (args[0], args[1]);
-    if nfds == 0 {
-        return 0;
-    }
     let len = match nfds.checked_mul(POLLFD_SIZE) {
         Some(len) => len,
         None => return err::EINVAL,
     };
-    if !buffer_ok(fds, len, true, true) {
+    // An `nfds` of zero is a *wait*, not a no-op: Linux's `poll(NULL, 0, ms)`
+    // sleeps for the timeout (measured on a current host,
+    // `.workbuddy/probe_poll0.c`: `100.1 ms` for a 100 ms timeout) and
+    // `ppoll(NULL, 0, NULL)` never returns without a signal. That second shape
+    // is not academic - **`pause()` is that call on arm64**, where musl builds it
+    // as `ppoll(NULL, 0, NULL, NULL, 0)` (measured: `llvm-objdump` of musl's
+    // `pause.lo` for `aarch64-unknown-linux-musl` shows syscall 73 with every
+    // argument zero) - so answering zero at once is a `pause()` that returns
+    // immediately and a program idling that way spinning.
+    //
+    // The array is validated only when there is one: a zero-length range needs
+    // no page, and the null `fds` the spelling above uses names none.
+    if len > 0 && !buffer_ok(fds, len, true, true) {
         return err::EFAULT;
     }
 

@@ -2348,3 +2348,47 @@ the commit bodies), and each moved its pin in the same commit.
     `Rss` needs), and the module's `sched` re-export. What stays named: `numa_maps` and
     `smaps_rollup` (§5.2), and the three `Pss_*` lines `smaps_rollup` has and `smaps`
     does not.
+
+## item 55 — a `poll` with no descriptors is a *wait*, and `pause()` is that call on arm64
+
+    A zero-`nfds` `poll`/`ppoll` answered `0` at once, where Linux waits out the timeout
+    and waits for ever when there is none. Measured whole on a current host first
+    (`.workbuddy/probe_poll0.c`, Linux 7.2.11): `poll(NULL, 0, 100)` answers `0` after
+    **100.1 ms**, `poll(NULL, 0, 0)` and `ppoll(NULL, 0, {0,0})` answer at once, and
+    `ppoll(NULL, 0, NULL)` answers only when a signal arrives — that probe's `SIGALRM` at
+    1000 ms, with the call answering `-1` and the errno of an interrupted wait.
+
+    What makes it more than a corner: **`pause()` *is* that call on arm64.** Linux has no
+    `pause` syscall number there, so musl builds it as `ppoll(NULL, 0, NULL, NULL, 0)` —
+    measured by disassembling the toolchain's own archive (`llvm-objdump -d pause.lo` out
+    of `aarch64-unknown-linux-musl`'s `libc.a`: syscall 73, with every argument register
+    zero) — so a program that idles in `pause()` returned immediately instead of parking.
+    It was found the hard way: `/proc/<pid>/smaps`' pin parks a child, the child exited
+    with status 0 on the second machine where the same program parked on the first, and
+    every `Rss` in the child's file read `0` because its frames had gone with it
+    (`docs/uapi/` §5.1 item 54, `docs/notes/` §15.73).
+
+    The fix is at the one place both calls are made of (`poll_wait`): the array is
+    validated only when there is one — an `nfds` of zero *is* the null `fds` that spelling
+    uses, and a zero-length range needs no page — and the wait then runs with an empty
+    watch list, which the loop already handles: it parks to the deadline or, with none,
+    until a signal ends it. Nothing else moved: a wait with descriptors takes the same
+    path it did.
+
+    Pin: `t-poll`'s **four new claims** (24 in the file) — the timeout is waited out
+    (`≥ 90 ms` of a 100 ms wait), a zero timeout answers at once, and a forked child is
+    still sitting in the no-timeout wait 200 ms later. All four green on a current host
+    first, where Linux answers exactly that.
+
+    Gate: x86_64 `pass=184 fail=0 (184 built)`, aarch64 `pass=183 fail=0`, `mpos-kunit 32
+    passed, 0 failed` on both machines; both machines' `t-poll` `ok:` lines byte-identical
+    (24 and 24, `diff` empty).
+
+    Counterfactual: the early `return 0` put back for a zero `nfds` (the shape that was
+    here) is `pass=183 fail=1 (184 built)` with `FAIL t-poll exit=1` and **two** claims red
+    by name — `a poll with no descriptors waits out its timeout` and `and the no-timeout
+    wait does not return on its own`. The zero-timeout control stays green either way: a
+    *zero* timeout is answered at once by both shapes, and that is exactly what makes it a
+    control rather than a claim. `t-smaps` stays green there too, because its child parks
+    in a sleep loop and does not depend on this call - the dependency would have hidden
+    which landing the failure belonged to.
