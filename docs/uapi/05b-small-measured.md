@@ -682,9 +682,54 @@ Section numbers are unchanged from the original `UAPI.md`.
   that dropped the capability kept an authority Linux would have taken away. It asks now, through
   `crate::vfs::remove_privs` (and the `without_set_id` two clauses it shares with item 40's `chown`
   door), at the four doors Linux reaches: `File::write`, `ftruncate`, `truncate` and an `open`'s
-  `O_TRUNC`. **Two shapes stay named**: `fallocate`'s resize, which reaches `Inode::truncate`
-  without going through either truncate door and was not measured (a probe row is what closes it);
-  and a write through a mapping, which Linux does not strip either.
+  `O_TRUNC`. **One shape stays named**: a write through a mapping, which Linux does not strip
+  either. The other one - `fallocate`'s resize, which reached `Inode::truncate` without passing any
+  of those doors - is measured and closed one bullet down (§5.1 item 52), and it turned out to be
+  wider than a resize: the flag question and the clocks were missing on every successful call, the
+  ones that grow nothing included.
+
+- **`fallocate` is a write even when it writes no byte: it costs the file its set-id bits and
+  stamps its clocks. Landed 2026-10-18** (`docs/uapi/` §5.1 item 52). Item 41 gave the write path
+  Linux's `file_remove_privs` at four doors and named this one as unmeasured. Measuring it widened
+  the question: Linux's `vfs_fallocate` ends **every** successful path in `file_modified`, and that
+  is three facts at once - the set-id bits go unless `CAP_FSETID` spares them, `mtime`/`ctime`
+  move, `IN_MODIFY` is reported - while the immutable flag refuses the call before anything is
+  allocated. This door reached `Inode::truncate` directly, so it passed none of them, and the two
+  paths that grow nothing (`KEEP_SIZE`, a range already inside the file) passed nothing at all
+  because they never reached the truncate. Measured whole on a current host first
+  (`.workbuddy/probe_fallocate_mode.c`, Linux 7.2.9, on ext4 under `/home` and on tmpfs under
+  `/tmp`, the two agreeing):
+
+  * **the bits go on every successful call, not only on a resize**: a `4755` file stores `0755` for
+    a grow (A), a `KEEP_SIZE` that leaves the length at 4 (B), a range starting past the end (C),
+    a `KEEP_SIZE` past the end (D) and a range already inside the file (E), and a `2755` set-gid
+    file stores `0755` too (F). The rule is the call's, not the size change's;
+  * **the clock moves on the same set and on no other**: with `mtime` pinned to `1000000000` by
+    `utimensat`, all six successful calls come back reporting the current second, and a refused one
+    (J: `EPERM` on an immutable file) leaves both the pinned second and the 4-byte size exactly
+    where they were - so the stamp belongs to the success arm, not to the call;
+  * **the capability is what spares the bits, and only them**: as root, which holds `CAP_FSETID`,
+    the same grow leaves `4755` and *still* moves `mtime` (H). Two rules, two questions;
+  * **the immutable flag refuses this door, and the append-only flag does not**: a descriptor
+    opened before `chattr +i` answers `EPERM` with the size unchanged (J), while an append-only
+    file serves both the growing range and one inside the file (I, K). That is
+    `crate::vfs::may_modify` and **not** `may_alter`, which would have refused the `a` file Linux
+    serves - the measurement is the whole reason the narrower predicate is the right one.
+
+  Implemented as a flag question where Linux asks it (after the descriptor's write mode, before the
+  kind) and one helper at both success arms: `fallocate_modified` runs `remove_privs`, then
+  `set_times(atime, now)` - the `ctime` rides with it, as `set_times` promises - then the
+  `IN_MODIFY` event, which is `file_modified`'s order.
+
+  Pin: **13 claims** - `t-fallocate` 9 (the pinned clock, the allocation that cannot change the
+  length, the moved `mtime`, the length that did not move, the re-pin, the refused `EINVAL` and its
+  untouched clock), `t-caps` 2 (the set-id bits with `CAP_FSETID` dropped, beside the whole set's
+  control) and `t-fsflags` 2 (the `EPERM` and the size it left alone). Host: every one of the nine
+  `t-fallocate` claims green on a current host under `MPOS_ON_HOST=1`; the `t-caps` and
+  `t-fsflags` ones are the gated kind (a dropped capability, an immutable file), and both files
+  name that and stop on an unprivileged host - which is what the sweep, running as root, measures.
+  Gate: x86_64 `pass=183 fail=0 (183 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33; aarch64 `pass=182 fail=0 (182 built)`, kunit 32/0; both machines' `ok:` lines for the three programs identical claim by claim (diffed, carriage returns aside). Counterfactual (both halves put back - no flag question, no
+  `fallocate_modified`): stage 1 unchanged (`565 passed; 0 failed` - no unit test asks this question, and the writers are not what moved), and the sweep `pass=180 fail=3 (183 built)` with `FAIL t-caps`, `FAIL t-fallocate` and `FAIL t-fsflags`, **three** red claims by name: `FSETID dropped: an allocation costs the same two bits (got 4755)`, `an allocation moves mtime off the pinned second`, and `fallocate is EPERM (got errno 0, want 1)`. The other two new claims are controls and saying so is the point: `whole set: and so does an allocation` holds on the old kernel because root keeps the bits either way, and `and the file did not grow` holds because the request was `KEEP_SIZE`, so the size never depended on the fix.
 
 - **A namespace descriptor *is* the namespace, and the pin is what makes `setns` a
   join. Named 2026-10-18, landed the same day** (`docs/uapi/` §5.1 item 44;

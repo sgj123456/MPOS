@@ -195,6 +195,29 @@ fn truncate_it(path: &str) -> u32 {
     mode_of(path)
 }
 
+/// Lay out 8192 bytes in `path` and read the mode back - the preallocation
+/// door, which is a write to the file's blocks without a byte going through
+/// the caller's buffer. `fallocate` on a `4755` file stores `0755` unless
+/// `CAP_FSETID` is held, and it does so whether or not the length moves
+/// (measured: `.workbuddy/probe_fallocate_mode.c` A, B, D and E).
+fn fallocate_it(path: &str) -> u32 {
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is open for writing and the range is inside
+        // what the filesystem can hold.
+        let _ = unsafe {
+            libc::syscall(
+                libc::SYS_fallocate,
+                f.as_raw_fd() as libc::c_long,
+                0 as libc::c_long,
+                0 as libc::c_long,
+                8192 as libc::c_long,
+            )
+        };
+    }
+    mode_of(path)
+}
+
 /// `klogctl(type, buf, len)` - `syslog(2)`'s raw door, the same one
 /// `t-syslog` drives.
 fn klogctl(kind: i32) -> isize {
@@ -669,6 +692,10 @@ fn main() {
     let wbits = "/tmp/t-caps-wbits";
     let wmark = "/tmp/t-caps-wmark";
     let wtrunc = "/tmp/t-caps-wtrunc";
+    // The fourth byte-door fixture: `fallocate` lays out blocks rather than
+    // writing bytes, and it costs the file the same two bits - measured on a
+    // current host (`.workbuddy/probe_fallocate_mode.c` A against H).
+    let wfalloc = "/tmp/t-caps-wfalloc";
     // The four fixtures the set-id rows below turn on, each in a group this
     // caller is not in: a file carrying both bits, a file whose set-group-id
     // carries no group execute (a locking mark rather than an authority), a
@@ -681,7 +708,7 @@ fn main() {
     let bitssuid = "/tmp/t-caps-bitssuid";
     let bitsdir = "/tmp/t-caps-bitsdir";
     for path in [
-        other, mine, minegid, timesfile, bits, bitsmark, bitssuid, wbits, wmark, wtrunc,
+        other, mine, minegid, timesfile, bits, bitsmark, bitssuid, wbits, wmark, wtrunc, wfalloc,
     ] {
         let _ = std::fs::remove_file(path);
     }
@@ -693,6 +720,7 @@ fn main() {
         && std::fs::File::create(wbits).is_ok()
         && std::fs::File::create(wmark).is_ok()
         && std::fs::File::create(wtrunc).is_ok()
+        && std::fs::File::create(wfalloc).is_ok()
         && std::fs::File::create(bits).is_ok()
         && std::fs::File::create(bitsmark).is_ok()
         && std::fs::File::create(bitssuid).is_ok()
@@ -718,7 +746,8 @@ fn main() {
         && std::fs::set_permissions(bitsdir, std::fs::Permissions::from_mode(0o6755)).is_ok()
         && std::fs::set_permissions(wbits, std::fs::Permissions::from_mode(0o4755)).is_ok()
         && std::fs::set_permissions(wmark, std::fs::Permissions::from_mode(0o2644)).is_ok()
-        && std::fs::set_permissions(wtrunc, std::fs::Permissions::from_mode(0o4755)).is_ok();
+        && std::fs::set_permissions(wtrunc, std::fs::Permissions::from_mode(0o4755)).is_ok()
+        && std::fs::set_permissions(wfalloc, std::fs::Permissions::from_mode(0o4755)).is_ok();
     r.check("another user's file, and two of this caller's", owned);
 
     // What a row leaves behind, put back while the whole set is held: the rows
@@ -744,6 +773,7 @@ fn main() {
         let _ = std::fs::set_permissions(wbits, std::fs::Permissions::from_mode(0o4755));
         let _ = std::fs::set_permissions(wmark, std::fs::Permissions::from_mode(0o2644));
         let _ = std::fs::set_permissions(wtrunc, std::fs::Permissions::from_mode(0o4755));
+        let _ = std::fs::set_permissions(wfalloc, std::fs::Permissions::from_mode(0o4755));
     };
     let explicit = [libc::timespec {
         tv_sec: 1_000_000_000,
@@ -766,6 +796,7 @@ fn main() {
         write_bits: u32,
         write_mark: u32,
         trunc_bits: u32,
+        alloc_bits: u32,
     }
 
     // One row: the effective set with `clear` lowered, the calls the
@@ -811,6 +842,9 @@ fn main() {
         let write_bits = write_one(wbits);
         let write_mark = write_one(wmark);
         let trunc_bits = truncate_it(wtrunc);
+        // The third byte-door question: an allocation that changes the size
+        // without writing a byte.
+        let alloc_bits = fallocate_it(wfalloc);
         let mut back = *whole;
         capset(&mut header, &mut back);
         restore();
@@ -830,6 +864,7 @@ fn main() {
             write_bits,
             write_mark,
             trunc_bits,
+            alloc_bits,
         }
     };
     let whole_set = own_row(&mut r, "the whole set", &[], &whole);
@@ -904,6 +939,13 @@ fn main() {
             whole_set.trunc_bits
         ),
         whole_set.trunc_bits == 0o4755,
+    );
+    r.check(
+        &format!(
+            "whole set: and so does an allocation (got {:04o})",
+            whole_set.alloc_bits
+        ),
+        whole_set.alloc_bits == 0o4755,
     );
     let no_fowner = own_row(&mut r, "CAP_FOWNER dropped", &[3], &whole);
     r.check(
@@ -989,6 +1031,13 @@ fn main() {
     );
     r.check(
         &format!(
+            "FSETID dropped: an allocation costs the same two bits (got {:04o})",
+            no_fsetid.alloc_bits
+        ),
+        no_fsetid.alloc_bits == 0o0755,
+    );
+    r.check(
+        &format!(
             "FSETID dropped: the locking mark is nobody's to take (got {:04o})",
             no_fsetid.write_mark
         ),
@@ -1018,7 +1067,7 @@ fn main() {
     );
 
     for path in [
-        other, mine, minegid, timesfile, bits, bitsmark, bitssuid, wbits, wmark, wtrunc,
+        other, mine, minegid, timesfile, bits, bitsmark, bitssuid, wbits, wmark, wtrunc, wfalloc,
     ] {
         let _ = std::fs::remove_file(path);
     }

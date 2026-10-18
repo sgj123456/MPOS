@@ -79,7 +79,9 @@ use std::ffi::c_void;
 
 use mpos_user_tests::{Report, host_run, in_user_namespace};
 use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use rustix::fs::{CWD, FileType, Mode, OFlags, SeekFrom, openat, seek, stat};
+use rustix::fs::{
+    CWD, FallocateFlags, FileType, Mode, OFlags, SeekFrom, fallocate, fstat, openat, seek, stat,
+};
 use rustix::io::{Errno, read, write};
 use rustix::pipe::pipe_with;
 use rustix::process::{geteuid, getuid};
@@ -416,6 +418,31 @@ fn main() {
             .err()
             .map_or(0, |e| e.raw_os_error()),
         libc::EPERM,
+    );
+    // `fallocate` is the third door to the same bytes, and the one that reaches
+    // the inode without going through a write or a resize: Linux gates it on
+    // this flag too, because `vfs_fallocate` ends in `file_modified` (measured
+    // on a current host, `.workbuddy/probe_fallocate_mode.c` J - the descriptor
+    // has to be opened *before* the flag, since `open(O_RDWR)` is itself EPERM
+    // once it is on, which is exactly the shape here). A `KEEP_SIZE` request is
+    // used because it cannot be refused for the range's sake: this is the flag
+    // and nothing else.
+    let before = fstat(&fd).map(|s| s.st_size).unwrap_or(i64::MAX);
+    err_is(
+        &mut r,
+        "fallocate is EPERM",
+        fallocate(&fd, FallocateFlags::KEEP_SIZE, 0, 4096)
+            .err()
+            .map_or(0, |e| e.raw_os_error()),
+        libc::EPERM,
+    );
+    r.check(
+        &format!(
+            "and the file did not grow ({} -> {})",
+            before,
+            fstat(&fd).map(|s| s.st_size).unwrap_or(i64::MAX)
+        ),
+        fstat(&fd).map(|s| s.st_size).ok() == Some(before),
     );
     // `chmod` is metadata, and metadata is what the flag protects.
     err_is(

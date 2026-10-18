@@ -483,8 +483,16 @@ which is the reason a set-uid program cannot be handed over by being edited in p
 three things belong to the rule rather than to the caller: a write that writes *nothing* costs  
 nothing, owning the file buys nothing (a caller writing another user's world-writable file loses the  
 bits too), and a set-group-id that carries no group execute is a mandatory locking mark that no door  
-takes — the clause a `chown` honours and a `chmod` does not. Two shapes stay named in §5.2:  
-`fallocate`'s resize and a write through a mapping.
+takes — the clause a `chown` honours and a `chmod` does not. Two shapes stayed named in §5.2 that  
+night: `fallocate`'s resize and a write through a mapping. **The first of them closed the next day,  
+and turned out to be wider than a resize** (`docs/uapi/` §5.1 item 52): `fallocate` is a write even  
+when it writes no byte. Linux's `vfs_fallocate` ends **every** successful path in `file_modified`,  
+so the set-id bits go and the clocks move for a `KEEP_SIZE` allocation and for a range already  
+inside the file exactly as for a grow — measured with the `mtime` pinned to a known second first,  
+on ext4 and tmpfs agreeing — while an immutable file refuses the call with `EPERM` before anything  
+is allocated and an append-only one is served, which is `may_modify`'s question and not  
+`may_alter`'s. This door reached the inode's `truncate` directly and passed none of it. One shape  
+stays named: a write through a mapping, which Linux does not strip either.
 
 **And the two object-shaped scopes landed the same night** (`docs/uapi/` §5.1 item 42): a capability
 question about a namespace *object* asks that object's owner, not the caller's own standing —

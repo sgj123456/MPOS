@@ -2086,3 +2086,67 @@ the commit bodies), and each moved its pin in the same commit.
     outranks the refusal`, `and outranks ECHILD...`, and the `EINVAL`/`ECHILD` pairs) passes on the
     old kernel too, because refusing *before* the wait still answers `EFAULT` — only "what happened
     to the child" tells the two shapes apart, which is why those claims are the pin.
+
+## item 52 — `fallocate` is a write: it costs the set-id bits and stamps the clocks, on every successful call
+
+    §5.2's entry, and item 41's one named corner. Item 41 gave the write path Linux's
+    `file_remove_privs` at four doors — `File::write`, `ftruncate`, `truncate` and an `open`'s
+    `O_TRUNC` — and left `fallocate`'s resize named as "reaches `Inode::truncate` without going
+    through either truncate door, and was not measured". Measuring it widened the question rather
+    than closing it: Linux's `vfs_fallocate` ends **every** successful path in `file_modified`, and
+    that is three facts at once — the set-id bits go unless `CAP_FSETID` spares them, `mtime` and
+    `ctime` move, `IN_MODIFY` is reported — while the immutable flag refuses the call before
+    anything is allocated. This door reached `Inode::truncate` directly and passed none of them,
+    and the two paths that *grow nothing* (`KEEP_SIZE`, a range already inside the file) passed
+    nothing at all, because they never reached the truncate.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_fallocate_mode.c`, Linux 7.2.9,
+    raw `SYS_fallocate`, `mtime` pinned to `1000000000` by `utimensat` before each call so "moved"
+    and "kept" are one comparison apart; run on ext4 under `/home` and on tmpfs under `/tmp`, which
+    agree on every row):
+
+    * **A — grow, `4755` file, mode 0**: `0`, size 4 → 8192, mode **`0755`**, `mtime` → now;
+    * **B — `KEEP_SIZE`, `4755` file**: `0`, size stays **4**, mode **`0755`**, `mtime` → now. The
+      length did not move and the bits went anyway;
+    * **C, D — a range starting past the end, with and without `KEEP_SIZE`**: both `0755`, `mtime`
+      → now, sizes 8192 and 4;
+    * **E — a range already inside a 16-byte file, mode 0**: `0`, size stays 16, mode **`0755`**,
+      `mtime` → now. Nothing was allocated and the call was still a write;
+    * **F — a `2755` file**: stores `0755` — the set-group-id half goes by the same rule;
+    * **H — the same grow as root**, which holds `CAP_FSETID`: mode stays **`4755`** and `mtime`
+      still moves. Two rules, two questions — the bits are the capability's, the clock is not;
+    * **J — a descriptor opened *before* `chattr +i`**: **`EPERM`**, size still 4, `mtime` still
+      the pinned `1000000000`. The flag refuses this door, and a refusal is not a write. (G: after
+      the flag, `open(O_RDWR)` is itself `EPERM`, which is why the descriptor has to exist first —
+      the same shape `t-fsflags` uses);
+    * **I, K — `chattr +a`**: served, both for a growing range and for one inside the file. So the
+      flag question here is `crate::vfs::may_modify` and **not** `may_alter`, which would have
+      refused a file Linux serves. The measurement is the whole reason the narrower predicate is
+      the right one.
+
+    Implemented as the flag question where Linux asks it — after the descriptor's write mode
+    (`EBADF`) and before the kind — and one helper at **both** success arms:
+    `fallocate_modified` runs `crate::vfs::remove_privs`, then `set_times(atime, now)` (the `ctime`
+    rides with it, which is `set_times`' own promise), then the `IN_MODIFY` event. That is
+    `file_modified`'s order, and putting it on both arms is what makes the `KEEP_SIZE` case a write
+    rather than a no-op.
+
+    Pins: **13 claims** — `t-fallocate` 9 (the clock pinned, an allocation that cannot change the
+    length, `fstat` after it, the moved `mtime`, the length that did not move, the re-pin, the
+    refused `EINVAL`, `fstat` after the refusal, the clock that stayed pinned), `t-caps` 2 (the
+    set-id bits with `CAP_FSETID` dropped, beside the whole set's control — `t-caps`' row, because
+    the sweep runs as root and the bits only go for a caller that dropped the capability) and
+    `t-fsflags` 2 (the `EPERM` on an immutable file, and the size it left alone). Host: all nine
+    `t-fallocate` claims green under `MPOS_ON_HOST=1`; the other four are the gated kind (a dropped
+    capability, an immutable file), and both files already name that class and stop on an
+    unprivileged host.
+
+    Gate: x86_64 `pass=183 fail=0 (183 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33; aarch64 `pass=182 fail=0 (182 built)`, kunit 32/0; both machines' `ok:` lines for the three programs identical claim by claim (diffed, carriage returns aside).
+
+    Counterfactual (both halves put back — no flag question, no `fallocate_modified`):
+    stage 1 unchanged (`565 passed; 0 failed` - no unit test asks this question, and the writers are not what moved), and the sweep `pass=180 fail=3 (183 built)` with `FAIL t-caps`, `FAIL t-fallocate` and `FAIL t-fsflags`, **three** red claims by name: `FSETID dropped: an allocation costs the same two bits (got 4755)`, `an allocation moves mtime off the pinned second`, and `fallocate is EPERM (got errno 0, want 1)`. The other two new claims are controls and saying so is the point: `whole set: and so does an allocation` holds on the old kernel because root keeps the bits either way, and `and the file did not grow` holds because the request was `KEEP_SIZE`, so the size never depended on the fix.
+
+    Still named, one shape over: `fallocate`'s **interior** operations (punch, collapse, insert,
+    zero-range) are `EOPNOTSUPP` in this kernel, so the bits-and-clocks rule has no other arm to
+    reach; if one is ever implemented it inherits this helper rather than the truncate's door. The
+    mapping-write half of item 41's tail is untouched and remains Linux's own exception.

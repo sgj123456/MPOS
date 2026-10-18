@@ -5,10 +5,17 @@
 //! before a thing is touched, an unknown mode bit is EOPNOTSUPP the way Linux
 //! answers a mode word from a newer kernel, a punch without KEEP_SIZE is EINVAL
 //! (and the punch itself is the unsupported interior operation this kernel
-//! answers EOPNOTSUPP for), a descriptor that is not a file is refused, and
+//! answers EOPNOTSUPP for), a descriptor that is not a file is refused, that
 //! KEEP_SIZE inside an existing file changes nothing - the flag's promise is
 //! about the writes that come, and on this kernel they cannot fail for lack of
-//! room anyway. The non-file pair is a pipe's two ends, and the man page's
+//! room anyway - and that the call is a *write* even when it writes no byte:
+//! a successful allocation stamps the modification clock whether or not the
+//! length moved, and a refused one does not.
+//!
+//! The set-id half of that last sentence is not here: it turns on
+//! `CAP_FSETID`, which the sweep holds, so the fixture can only lose its bits
+//! in a run that has dropped the capability - `t-caps`' own row, one file
+//! over. The non-file pair is a pipe's two ends, and the man page's
 //! `ENODEV` is not what a pipe answers on either machine: the read end is
 //! read-only and gets `EBADF`, and the write end is a FIFO, which is the one
 //! non-file Linux answers `ESPIPE` to - both measured through `syscall(2)`
@@ -44,7 +51,10 @@
 
 use mpos_user_tests::Report;
 use rustix::fd::BorrowedFd;
-use rustix::fs::{AtFlags, CWD, FallocateFlags, Mode, OFlags, fallocate, fstat, openat, unlinkat};
+use rustix::fs::{
+    AtFlags, CWD, FallocateFlags, Mode, OFlags, Timespec, Timestamps, fallocate, fstat, openat,
+    unlinkat, utimensat,
+};
 use rustix::io::{Errno, read};
 use rustix::pipe::{PipeFlags, pipe_with};
 
@@ -153,6 +163,85 @@ fn main() {
         Err(_) => {
             r.check("fstat still succeeds", false);
             r.check("KEEP_SIZE changed nothing", false);
+        }
+    }
+
+    // ---- the call is a write, and the file's clocks say so ----
+    //
+    // Laying out blocks writes no byte through the caller's buffer and still
+    // changes the file. Linux's `vfs_fallocate` ends every successful path in
+    // `file_modified`, which stamps the modification clock - measured on a
+    // current host with the clock pinned to a known second first
+    // (`.workbuddy/probe_fallocate_mode.c`, Linux 7.2.9, ext4 and tmpfs
+    // agreeing): the pinned `1000000000` becomes the current second on all six
+    // successful shapes, *including* the `KEEP_SIZE` that allocates without
+    // moving the length and the range that already sits inside the file (B, D,
+    // E), while a refused call leaves it where it was (J). So the claim is not
+    // "a resize stamps it" - a call that resizes nothing does too.
+    const PINNED: i64 = 1_000_000_000;
+    let stamp = Timestamps {
+        last_access: Timespec {
+            tv_sec: PINNED,
+            tv_nsec: 0,
+        },
+        last_modification: Timespec {
+            tv_sec: PINNED,
+            tv_nsec: 0,
+        },
+    };
+    r.check(
+        "the file's times can be pinned to a known second",
+        utimensat(CWD, PATH, &stamp, AtFlags::empty()).is_ok(),
+    );
+    // A range already inside the file, so nothing about the length can be what
+    // moves the clock.
+    r.check(
+        "an allocation that cannot change the length succeeds",
+        fallocate(&fd, FallocateFlags::KEEP_SIZE, 0, 8).is_ok(),
+    );
+    match fstat(&fd) {
+        Ok(st) => {
+            r.check("fstat after the allocation succeeds", true);
+            r.check(
+                "an allocation moves mtime off the pinned second",
+                st.st_mtime != PINNED,
+            );
+            r.check(
+                "and leaves the length alone, which is the flag's promise",
+                st.st_size == ALLOCATED,
+            );
+        }
+        Err(_) => {
+            r.check("fstat after the allocation succeeds", false);
+            r.check("an allocation moves mtime off the pinned second", false);
+            r.check(
+                "and leaves the length alone, which is the flag's promise",
+                false,
+            );
+        }
+    }
+    // The other half of the same measurement: a *refused* call is not a write,
+    // so it must leave the clock alone. Re-pinned first, because the call above
+    // is what moved it.
+    r.check(
+        "the times can be pinned again",
+        utimensat(CWD, PATH, &stamp, AtFlags::empty()).is_ok(),
+    );
+    r.check(
+        "a refused allocation is still EINVAL",
+        fallocate(&fd, FallocateFlags::empty(), 0, 0) == Err(Errno::INVAL),
+    );
+    match fstat(&fd) {
+        Ok(st) => {
+            r.check("fstat after the refusal succeeds", true);
+            r.check(
+                "a refused allocation leaves mtime pinned",
+                st.st_mtime == PINNED,
+            );
+        }
+        Err(_) => {
+            r.check("fstat after the refusal succeeds", false);
+            r.check("a refused allocation leaves mtime pinned", false);
         }
     }
 

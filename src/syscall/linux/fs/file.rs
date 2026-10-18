@@ -5398,6 +5398,18 @@ pub fn handle_fallocate(args: [usize; ARG_COUNT]) -> isize {
     if !file.may_write() {
         return err::EBADF;
     }
+    // Then the file's own immutable flag - the one `chattr` bit Linux gates
+    // this door on: an `i` file refuses the allocation with `EPERM` and changes
+    // nothing, where an `a` file is *served*, because a range that grows the
+    // file is an append and Linux does not refuse the interior case either
+    // (measured, `.workbuddy/probe_fallocate_mode.c` J, I and K, on a
+    // descriptor opened *before* the flag was set, since `open(O_RDWR)` is
+    // itself `EPERM` afterwards). That is [`crate::vfs::may_modify`] and not
+    // [`crate::vfs::may_alter`]: the latter would refuse an append-only file,
+    // and Linux does not.
+    if let Err(e) = crate::vfs::may_modify(&file.inode()) {
+        return err_of(e);
+    }
     match file.metadata().kind {
         // A pipe's metadata answers `File` - the vocabulary's only word for an
         // unnamed channel - and it is told apart here by the node, because its
@@ -5427,11 +5439,48 @@ pub fn handle_fallocate(args: [usize; ARG_COUNT]) -> isize {
     };
     if mode & FALLOC_FL_KEEP_SIZE == 0 && end as u64 > file.metadata().size {
         return match file.inode().truncate(end as u64) {
-            Ok(()) => 0,
+            Ok(()) => {
+                fallocate_modified(&file.inode());
+                0
+            }
             Err(e) => err_of(e),
         };
     }
+    // Nothing about the length changes here, and the call is still a write:
+    // Linux's `vfs_fallocate` ends every successful path in `file_modified`,
+    // so a `KEEP_SIZE` allocation and a range already inside the file cost the
+    // set-id bits and stamp the clocks exactly as a growing one does
+    // (`.workbuddy/probe_fallocate_mode.c` B, D and E - a `4755` file stores
+    // `0755` in all three, with `mtime` moved off the value `utimensat` had
+    // pinned).
+    fallocate_modified(&file.inode());
     0
+}
+
+/// What a successful `fallocate` does to the file besides laying out blocks:
+/// Linux's `file_modified`, in its order.
+///
+/// Three things, and each was measured rather than assumed
+/// (`.workbuddy/probe_fallocate_mode.c`, Linux 7.2.9, ext4 and tmpfs agreeing):
+///
+/// * the set-id bits go, and `CAP_FSETID` is the only thing that spares them -
+///   a root caller keeps `4755` where the same call as an ordinary user stores
+///   `0755` (A against H). This is [`crate::vfs::remove_privs`], the same rule
+///   a write and both `truncate` doors follow;
+/// * `mtime` moves, on every successful call and on none of the refused ones
+///   (J: an immutable file's `EPERM` leaves the pinned `mtime` where it was),
+///   and `ctime` rides with it - which is `set_times`' own promise here;
+/// * `IN_MODIFY` is reported, the event a write emits.
+///
+/// A caller that only preallocates still changed the file: the bits say who
+/// may run it and the clock says when it last changed, so "nothing was
+/// written" is not a defence either of them accepts.
+fn fallocate_modified(inode: &Arc<dyn crate::vfs::Inode>) {
+    crate::vfs::remove_privs(inode);
+    // The atime is not this call's business - a read is - so it is carried
+    // through as it stands, exactly as Linux's `file_update_time` does.
+    let _ = inode.set_times(inode.atime(), wall_now());
+    crate::vfs::inotify::emit(inode, crate::vfs::inotify::IN_MODIFY, "");
 }
 
 // ---------------------------------------------------------------------------
