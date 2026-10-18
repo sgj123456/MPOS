@@ -595,10 +595,11 @@ named a scoped `capable_in(ns, cap)` as the gap. **Both halves are closed** - th
 first among them) and the *object's* by §15.60 (`docs/uapi/` §5.1 item 42, 2026-10-18: `vfs::ns`
 records whose each namespace is *made* its owner - a user namespace its own, Linux's
 `ns_common::user_ns` - and `setns` and `AF_PACKET` ask `userns::Caller::capable_in` about that
-owner rather than about their own set). One shape of the rung stays named with its own
-measurement: a namespace descriptor here does not **pin** the namespace it named, so a re-join
-through one is the no-op a copy would give (`docs/uapi/` §5.2's descriptor entry,
-`.workbuddy/probe_ns_fd_pin.c`). **The `mknod` device-node gate is the
+owner rather than about their own set). The rung's third named shape - a namespace descriptor that
+did **not** pin the namespace it named, so a re-join through one was the no-op a copy would give -
+was closed the same day: the descriptor is the namespace-shaped file `docs/uapi/` §5.1 item 44
+describes (`vfs::ns::NsFile`; `.workbuddy/probe_ns_fd_stat.c` for the file's own shape,
+`.workbuddy/probe_ns_fd_pin.c` for the pin). **The `mknod` device-node gate is the
 first caller-visible consequence of it, measured** (2026-10-17, `docs/uapi/` §5.1 item 36): Linux's
 `vfs_mknod` asks `capable(CAP_MKNOD)`, which is the *initial* namespace, so a caller that has entered
 a user namespace - uid 0 in it, the whole set read back - still cannot make a device node on a
@@ -1171,16 +1172,19 @@ physical device between namespaces is a later question and is refused until
 there is a place to move it to.
 
 **`setns`, and how a namespace is named.** Linux reaches a namespace through a
-descriptor opened on `/proc/<pid>/ns/<kind>`; no namespace here can be named
-that way, so the call answers `EINVAL` for an open descriptor and `EBADF` for a
-closed number - all it can learn. The design follows from the table: each
-namespace object becomes an inode whose open descriptor *is* the namespace (so
-two descriptors on one `/proc/<pid>/ns/uts` name one object, with one `st_ino`),
-`setns` checks the descriptor's type against `nstype` (a mismatch is `EINVAL`,
-Linux's answer), and `NS_GET_USERNS`/`NS_GET_PARENT` remain out of scope even now
-that a user namespace exists (2026-10-16, "Step 6" below): the two requests are a
-pair of `ioctl`s this kernel has not built, which is a separate question from the
-kind existing.
+descriptor opened on `/proc/<pid>/ns/<kind>`, and the design below follows from
+the table: each namespace object becomes an inode whose open descriptor *is* the
+namespace (so two descriptors on one `/proc/<pid>/ns/uts` name one object, with
+one `st_ino`), `setns` checks the descriptor's type against `nstype` (a mismatch
+is `EINVAL`, Linux's answer), and `NS_GET_USERNS`/`NS_GET_PARENT` remain out of
+scope even now that a user namespace exists (2026-10-16, "Step 6" below): the two
+requests are a pair of `ioctl`s this kernel has not built, which is a separate
+question from the kind existing. **When this paragraph was written the call had no
+door at all** - `setns` answered `EINVAL` for an open descriptor and `EBADF` for a
+closed number, all it could learn - and the descriptor only became the inode this
+paragraph describes on 2026-10-18, when the pinning and the file's own shape landed
+(`docs/uapi/` §5.1 item 44; `st_ino` is the namespace's own number, which is that
+sentence's "one `st_ino`", measured).
 
 **Two decisions about the call itself, rather than about a namespace.**
 

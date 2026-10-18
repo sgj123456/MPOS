@@ -544,10 +544,14 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// `/proc/<pid>/ns/<kind>` is a *magic* link in the same sense
     /// [`Inode::as_fd`] is: its `readlink` answers a report (`mnt:[<id>]`, which
     /// is not a path anybody can reopen) and what opening it really means is
-    /// the namespace object itself, which `setns` then joins. Resolution hands
-    /// the link's own inode back for it, exactly as it does for a descriptor's
-    /// second name - the one condition the walk tests is "does this link carry
-    /// a payload", and this is the second kind of payload.
+    /// the namespace object itself, which `setns` then joins. Two inodes answer
+    /// this, and they are the two sides of one split: the *link* (a
+    /// `procfs` name) resolves the object by asking the live process, so a
+    /// `readlink` or a fresh `open` names the namespace that process is in
+    /// *now*; and the namespace-shaped file the walk hands on for a followed
+    /// name (`crate::vfs::ns::NsFile`) answers with the object it pinned when
+    /// it was resolved, so a descriptor keeps naming the namespace it was
+    /// opened in. That split is Linux's own, measured (`.workbuddy/probe_ns_fd_stat.c`).
     fn as_namespace(&self) -> Option<crate::vfs::ns::Namespace> {
         None
     }

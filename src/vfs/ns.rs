@@ -11,8 +11,18 @@
 //! `kind:[<n>]`, the numbers drawn from **one pool shared by every kind** (that
 //! host's `net`, `uts`, `ipc`, `pid`, `user`, `mnt`, `cgroup` and `time` hold
 //! 4026531833 down to 4026531832 - consecutive, in the order the namespaces
-//! were made), and the *opened* descriptor reporting a different `st_ino`
-//! (148898) than the link's text, so the text is the identity a reader uses.
+//! were made), and the *opened* descriptor reporting the **namespace's own
+//! number** as its `st_ino` (4026531832 for `mnt:[4026531832]`), which is the
+//! number the text carries and the reason two names of one namespace agree on
+//! it. The procfs *link* keeps an inode number of its own (the procfs counter),
+//! which is what `lstat` reports.
+//!
+//! This module is the two facts both halves need: the pool, and the text. The
+//! pool is one counter because the measurement is one pool; the text is written
+//! here rather than at the renderer because three places have to agree on it -
+//! the link's `readlink`, the `setns` validation that parses the kind back out,
+//! and the tests that pin both. The third fact - what an *opened* descriptor is
+//! - is [`NsFile`], the file the walk denotes for a followed name.
 //!
 //! This module is the two facts both halves need: the pool, and the text. The
 //! pool is one counter because the measurement is one pool; the text is written
@@ -362,6 +372,103 @@ impl Namespace {
     }
 }
 
+/// The file an opened namespace descriptor is: the namespace it named, pinned.
+///
+/// `/proc/<pid>/ns/<kind>` is a procfs *link*, and what opening it means is the
+/// object it names - Linux resolves that at the open and hands back an `nsfs`
+/// inode whose private data is the namespace itself, so the descriptor names
+/// that namespace for as long as it is held. That is what makes `setns(fd)` a
+/// join rather than a question about where the maker stands *now*, and what
+/// lets a namespace outlive the process that opened it.
+///
+/// This inode is the shape that was missing (measured on a current host before
+/// any of it was written, `.workbuddy/probe_ns_fd_stat.c`, Linux 7.2.9, as root
+/// and as an unprivileged caller):
+///
+/// | the door | Linux | this kernel, before |
+/// |---|---|---|
+/// | `lstat` of the name | symlink `0777`, the procfs inode's own number | the same |
+/// | `stat` of the name (followed) | regular `0444`, size 0 | the link again |
+/// | `fstat` of the opened descriptor | regular `0444`, `st_ino` the **namespace's own number** | the link again |
+/// | `read` | `EINVAL` | `EINVAL` |
+/// | `lseek` | `ESPIPE` | `ESPIPE` |
+/// | `open` with `O_WRONLY`, `O_RDWR` or `O_TRUNC` | `EPERM`, root and unprivileged alike | served |
+/// | `open` with `O_APPEND` | served | served |
+/// | open, then `unshare(CLONE_NEWNS)`, then `setns(fd)` | back in the namespace the descriptor named | left in the copy |
+///
+/// The inode number is the namespace's own, which is Linux's arrangement rather
+/// than a coincidence: two names of one namespace (`/proc/self/ns/mnt` and
+/// `/proc/1/ns/mnt`) report the same `st_ino` there, and it is the number the
+/// link's text carries. `readlink` is untouched by any of this - it answers by
+/// asking the live process, which is the *link's* own question.
+pub struct NsFile {
+    /// Resolved when the name was opened, and held from then on.
+    ns: Namespace,
+}
+
+/// `0444`: the word Linux's `nsfs` inode carries. This kernel only *reports*
+/// it - procfs keeps no modes to police (`docs/uapi/` §5.2) - which is why the
+/// write-ish refusal below is the inode's own rule and not the bits'.
+const NS_FILE_MODE: u32 = 0o444;
+
+/// The open flags that ask for write access to a file that has none: an access
+/// mode that is not `O_RDONLY` (the low two bits: `O_WRONLY` is 1, `O_RDWR` is
+/// 2) and `O_TRUNC`, which Linux's `may_open` treats as a write whatever the
+/// mode word says. The numbers are POSIX's and are written here rather than
+/// imported from the ABI for the reason `ramfs`'s FIFO open gives: a filesystem
+/// has no business naming the syscall layer.
+const WRITE_ACCESS: usize = 0o3 | 0o1000;
+
+impl NsFile {
+    /// The inode a name under `/proc/<pid>/ns` denotes once it is known.
+    pub fn opened(ns: Namespace) -> Arc<dyn crate::vfs::Inode> {
+        Arc::new(NsFile { ns })
+    }
+}
+
+impl crate::vfs::Inode for NsFile {
+    fn metadata(&self) -> crate::vfs::Metadata {
+        crate::vfs::Metadata {
+            ino: self.ns.id(),
+            kind: crate::vfs::NodeKind::File,
+            size: 0,
+        }
+    }
+
+    fn mode(&self) -> u32 {
+        NS_FILE_MODE
+    }
+
+    fn as_namespace(&self) -> Option<Namespace> {
+        Some(self.ns.clone())
+    }
+
+    fn open_replacement(
+        &self,
+        flags: usize,
+    ) -> crate::vfs::VfsResult<Option<Arc<dyn crate::vfs::Inode>>> {
+        // A namespace is not writable through, and Linux refuses a write-ish
+        // open with `EPERM` whatever the caller's standing is (measured: the
+        // same answer for root and for an unprivileged caller, which is what
+        // says it is not the mode bits' `EACCES`). `O_APPEND` alone asks for
+        // no write and is served, also measured.
+        if flags & WRITE_ACCESS != 0 {
+            return Err(crate::vfs::VfsError::NotPermitted);
+        }
+        Ok(None)
+    }
+
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> crate::vfs::VfsResult<usize> {
+        // A namespace is not bytes, and `EINVAL` is Linux's answer rather than
+        // a zero-length read.
+        Err(crate::vfs::VfsError::Invalid)
+    }
+
+    fn seekable(&self) -> bool {
+        false
+    }
+}
+
 /// One entry per namespace ever minted: the number, and whose it is. Its own
 /// alias because the type is three deep and the two readers below are clearer
 /// for it.
@@ -557,12 +664,77 @@ mod tests {
         assert_eq!(Entry::of_name("cgroup"), None);
     }
 
+    /// The pool hands out a new number every time.
     #[test]
     fn the_pool_hands_out_a_new_number_every_time() {
         let a = mint();
         let b = mint();
         assert_ne!(a, b);
         assert!(b > a);
+    }
+
+    /// The opened descriptor's *shape*, walked row by row against the host
+    /// measurement in [`NsFile`]'s own table: a regular file of size zero whose
+    /// inode number is the namespace's, `0444`, readable as nothing (`EINVAL`),
+    /// unseekable - and a write-ish open refused `EPERM` while `O_APPEND`, which
+    /// asks for no write, is left to the opener.
+    ///
+    /// The kind is `Net` because a *number* is the whole of that namespace: the
+    /// shape does not depend on which kind it is, and this is the one a host
+    /// build can make without a mount table or a task table behind it.
+    #[test]
+    fn an_opened_namespace_descriptor_has_the_shape_a_host_measured() {
+        use crate::vfs::{Inode, NodeKind, VfsError};
+        let id = 4026531833;
+        let file = NsFile::opened(Namespace::Net(id));
+
+        let meta = file.metadata();
+        assert_eq!(
+            meta.ino, id,
+            "the descriptor's inode number is the namespace's"
+        );
+        assert_eq!(
+            meta.kind,
+            NodeKind::File,
+            "`stat` reports a regular file, not the link"
+        );
+        assert_eq!(meta.size, 0, "and no size, as Linux reports");
+        assert_eq!(file.mode(), 0o444, "the word Linux's nsfs inode carries");
+        assert!(!file.seekable(), "`lseek` is ESPIPE");
+
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            file.read_at(0, &mut buf),
+            Err(VfsError::Invalid),
+            "`read` is EINVAL"
+        );
+
+        // The pin: what the descriptor answers is the namespace it was made
+        // with, whatever the process has done since.
+        match file.as_namespace() {
+            Some(Namespace::Net(held)) => assert_eq!(held, id),
+            Some(other) => panic!("the descriptor names the wrong kind: {:?}", other.kind()),
+            None => panic!("the descriptor must name a namespace at all"),
+        }
+
+        // The write-ish open, measured as `EPERM` for root and for an
+        // unprivileged caller alike - so it is the inode's rule and not the
+        // mode bits' `EACCES` - with the two controls that must *not* refuse.
+        for flags in [1, 2, 0o1000, 0o1001, 0o1002, 0o4001] {
+            assert_eq!(
+                file.open_replacement(flags).err(),
+                Some(VfsError::NotPermitted),
+                "open flags {flags:#o} ask for write access and must be EPERM"
+            );
+        }
+        // `O_APPEND` alone asks for none - and `O_NONBLOCK` with it changes
+        // nothing, because a namespace descriptor never parks.
+        for flags in [0, 0o4000, 0o2000, 0o6000] {
+            assert!(
+                matches!(file.open_replacement(flags), Ok(None)),
+                "open flags {flags:#o} ask for no write and must be served"
+            );
+        }
     }
 
     /// Every kind's name and bit, in one place, so the three readers of the

@@ -58,7 +58,7 @@
 //! `setns`. The `ENOENT` half is therefore a claim here, not an absence.
 
 use mpos_user_tests::{Report, host_run};
-use rustix::fs::{CWD, Mode, OFlags, mkdirat, openat};
+use rustix::fs::{CWD, FileType, Mode, OFlags, mkdirat, openat};
 use rustix::io::Errno;
 use rustix::mount::{MountFlags, UnmountFlags, mount, unmount};
 use rustix::pipe::pipe;
@@ -225,6 +225,99 @@ fn main() {
     r.check(
         "and seeking on it is ESPIPE",
         rustix::fs::seek(&own_mnt, rustix::fs::SeekFrom::Start(0)) == Err(Errno::SPIPE),
+    );
+
+    // ---- What that descriptor *is*, and what it pins ----
+    //
+    // The name is a procfs symlink; what a caller holds after opening it is a
+    // namespace *file* - Linux serves one from `nsfs` - and that file is what
+    // `setns` joins. Measured on a current host (`.workbuddy/probe_ns_fd_stat.c`,
+    // Linux 7.2.9, as root and as an unprivileged caller): `lstat` reports the
+    // link (`0777`), `stat` and `fstat` report a regular `0444` file of size 0
+    // whose `st_ino` is the namespace's *own* number - the one the link's text
+    // carries, and the same for `/proc/self/ns/mnt` and `/proc/1/ns/mnt` - a
+    // write-ish open (`O_WRONLY`, `O_RDWR`, `O_TRUNC`) is `EPERM` whatever the
+    // caller's standing is, and `O_APPEND`, which asks for no write, is served.
+    let link_stat = rustix::fs::lstat("/proc/self/ns/mnt").ok();
+    let followed = rustix::fs::stat("/proc/self/ns/mnt").ok();
+    let held = rustix::fs::fstat(&own_mnt).ok();
+    let namespace_id = mnt_link
+        .as_deref()
+        .and_then(|t| t.strip_prefix("mnt:["))
+        .and_then(|t| t.strip_suffix(']'))
+        .and_then(|t| t.parse::<u64>().ok());
+    let kind = |st: &rustix::fs::Stat| FileType::from_raw_mode(st.st_mode as _);
+    r.check(
+        "the name itself is a symlink, as `lstat` reports of the link",
+        link_stat
+            .as_ref()
+            .is_some_and(|st| kind(st) == FileType::Symlink && st.st_mode & 0o7777 == 0o777),
+    );
+    r.check(
+        "and following it gives the namespace file, which is what `stat` reports",
+        followed
+            .as_ref()
+            .is_some_and(|st| kind(st) == FileType::RegularFile),
+    );
+    r.check(
+        "and the descriptor that open gave is that same regular file, 0444 and no size",
+        held.as_ref().is_some_and(|st| {
+            kind(st) == FileType::RegularFile && st.st_mode & 0o7777 == 0o444 && st.st_size == 0
+        }),
+    );
+    // The identity is the *object's*, not a fresh inode number per open - which
+    // is why two names of one namespace agree on it, and why a reader that has
+    // the link's text can recognise the file behind it.
+    r.check(
+        "whose inode number is the namespace's own, the number the link's text carries",
+        match (held.as_ref(), namespace_id) {
+            (Some(st), Some(id)) => st.st_ino == id,
+            _ => false,
+        },
+    );
+    // A namespace is not writable through, and Linux refuses the *open* rather
+    // than the write: the same `EPERM` for root and for an unprivileged caller,
+    // which is what says it is not the mode bits answering.
+    let write_open = |flags: OFlags| -> Option<Errno> {
+        openat(CWD, "/proc/self/ns/mnt", flags, Mode::empty()).err()
+    };
+    r.check(
+        "and a write-ish open of the name is EPERM, whichever word asked",
+        write_open(OFlags::WRONLY) == Some(Errno::PERM)
+            && write_open(OFlags::RDWR) == Some(Errno::PERM)
+            && write_open(OFlags::RDONLY | OFlags::TRUNC) == Some(Errno::PERM),
+    );
+    r.check(
+        "but O_APPEND, which asks for no write, is served",
+        write_open(OFlags::RDONLY | OFlags::APPEND).is_none(),
+    );
+
+    // ---- The descriptor pins the namespace it named ----
+    //
+    // The reason a namespace descriptor is an *object* rather than a second name
+    // for a process: open the link, move the caller into a copy with `unshare`,
+    // then `setns` back through the descriptor - and land in the namespace the
+    // descriptor named rather than wherever the caller stands by then. Linux's
+    // three readlinks for that sequence are the probe's (`mnt:[4026531832]`, the
+    // copy's own number, `mnt:[4026531832]` again); a kernel that re-resolves
+    // the link at `setns` time answers the copy's number twice, and the join is
+    // the no-op it would have been with no descriptor at all.
+    let opened_at = readlink("/proc/self/ns/mnt");
+    let moved = unshare(CLONE_NEWNS);
+    let in_the_copy = readlink("/proc/self/ns/mnt");
+    let joined = setns(std::os::fd::AsRawFd::as_raw_fd(&own_mnt), 0);
+    let after = readlink("/proc/self/ns/mnt");
+    r.check(
+        "unshare(CLONE_NEWNS) moves the caller into a copy of its own",
+        moved == 0 && in_the_copy.is_some() && in_the_copy != opened_at,
+    );
+    r.check(
+        "and setns through the descriptor opened *before* it is served",
+        joined == 0,
+    );
+    r.check(
+        "and lands in the namespace the descriptor named, not in the copy",
+        after.is_some() && after == opened_at,
     );
 
     // ---- setns's flag word, and what is not a namespace (all measured) ----
@@ -467,11 +560,16 @@ fn main() {
             "and the way back is the machine's own link (/proc/1), which takes the child's mount away",
             back_home == 0 && std::fs::read_to_string(OWNED_MARKER).is_err(),
         );
-        // And the descriptor that was opened before all of this now answers
-        // where the caller stands, which is the same fact from the other side.
+        // And the descriptor opened at *this* process's own link, used again
+        // from a caller that has been through two other namespaces: it still
+        // names the machine's namespace, which is where the caller already
+        // stands by now - so this is the no-op a join to where you are is, and
+        // the marker's absence is what says the caller did not end up back in
+        // the child's. That the descriptor names what it was *opened* at is the
+        // pin above; this is the shape guard beside it.
         let again = setns(std::os::fd::AsRawFd::as_raw_fd(&own_mnt), 0);
         r.check(
-            "the descriptor it came through answers where it stands now (a descriptor follows its maker)",
+            "the descriptor opened at the machine's own link still names it",
             again == 0 && std::fs::read_to_string(OWNED_MARKER).is_err(),
         );
     }

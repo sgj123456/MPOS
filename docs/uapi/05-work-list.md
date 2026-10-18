@@ -1504,3 +1504,57 @@ the commit bodies), and each moved its pin in the same commit.
     discriminating one (`FAIL: and so is an AF_INET raw socket, the same question asked of the same
     owner`), while the served half (`and a raw IP socket too`) passes on both kernels, which is
     what keeps the claim on the namespace's owner rather than on the socket's type.
+
+## item 44 — a namespace descriptor *is* the namespace, so it pins what it named
+
+    §5.2's last named gap on the namespace rung, and the one whose absence was visible from the
+    outside: `/proc/<pid>/ns/<kind>` opened here was the procfs *link*, so `setns` re-resolved
+    `(pid, entry)` and joined whatever that process was in **then**. Linux hands back an `nsfs`
+    inode whose private data is the namespace itself, so the descriptor names the namespace it was
+    opened in for as long as it is held — which is what makes `setns(fd)` a join rather than a
+    question about where the maker stands now, and what lets a namespace outlive the process that
+    made it by descriptor alone.
+    **Measured whole on a current host first**, in two probes, because the gap was two shapes.
+    `.workbuddy/probe_ns_fd_stat.c` (Linux 7.2.9, run as root *and* as an unprivileged caller) for
+    the file:
+
+    ```text
+    lstat /proc/self/ns/mnt        -> symlink 0777 size 0 ino 126330      (the procfs link's own number)
+    stat  /proc/self/ns/mnt        -> regular 0444 size 0 ino 4026531832  (the namespace's own number)
+    fstat of the descriptor        -> regular 0444 size 0 ino 4026531832
+    read  -> EINVAL                 lseek -> ESPIPE
+    open O_WRONLY / O_RDWR / O_RDONLY|O_TRUNC -> EPERM (root and unprivileged alike)
+    open O_RDONLY|O_APPEND         -> served
+    ```
+
+    and `.workbuddy/probe_ns_fd_pin.c` for the object: open `/proc/self/ns/mnt` (the link reads
+    `mnt:[4026531832]`), `unshare(CLONE_NEWNS)` (into a copy, `mnt:[4026532932]`), then `setns`
+    through the descriptor — `0`, and the readlink is `mnt:[4026531832]` **again**. The identity is
+    the object's own number, which is why `/proc/self/ns/mnt` and `/proc/1/ns/mnt` report one
+    `st_ino` — `4026531832` in both rows above.
+    **The fix is one file kind and one line of the walk.** `vfs::ns::NsFile` holds the resolved
+    `Namespace` and is what the walk denotes for a followed namespace name (the substitution beside
+    the descriptor link's, in `src/vfs/mount.rs`); it reports the namespace's own number, kind
+    `File`, size 0 and mode `0444`, refuses a write-ish open with `EPERM` in the place
+    `Inode::open_replacement` exists for, answers `EINVAL` for a read and `ESPIPE` for a seek, and
+    hands `as_namespace()` the object it pinned — which is what `setns` and `ip link set … netns
+    <fd>` read, unchanged. `lstat`/`readlink` are untouched: they stop at the link, which is the
+    split Linux makes. Pin: `t-ns-setns`' descriptor section (9 claims: the `lstat` link, the
+    followed file, the descriptor, the inode number, the write-ish refusal with `O_APPEND` as its
+    control, and the three-readlink pin with the unshare and the join's own control), beside the
+    host unit test `an_opened_namespace_descriptor_has_the_shape_a_host_measured`, which walks the
+    table above with no machine under it. Gate: x86_64 `pass=181 fail=0 (181 built)`,
+    `mpos-kunit 32 passed, 0 failed` (11 staged out by `tests.toml`); aarch64 `pass=180 fail=0`,
+    `mpos-kunit 32 passed, 0 failed` (12 staged out). `t-ns-setns` is 52 claims now (was 43), and
+    its `ok:` lines are byte-identical across the two machines. The counterfactual is exact: with
+    only the walk's substitution put back (one file, `NsFile` and every pin left in place) the sweep
+    is `pass=180 fail=1` with `mpos-kunit` unmoved — the one red program is `t-ns-setns` and its
+    **five** red claims are exactly the discriminating ones (`and following it gives the namespace
+    file, which is what stat reports`, `and the descriptor that open gave is that same regular file,
+    0444 and no size`, `whose inode number is the namespace's own, the number the link's text
+    carries`, `and a write-ish open of the name is EPERM, whichever word asked`, and `and lands in
+    the namespace the descriptor named, not in the copy`) — while every control passes on both
+    kernels: the `lstat` link, `O_APPEND`, the unshare moving the caller, the join being served, and
+    the pre-existing claims of the whole file. One shape stays named in §5.2 with the same
+    measurement: the mode is still a *report* rather than a gate (procfs keeps no modes), so the
+    write-ish refusal here is the inode's own rule and not the bits'.

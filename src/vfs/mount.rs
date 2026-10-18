@@ -1441,18 +1441,26 @@ impl MountTable {
                             // that had to ask separately would be a second
                             // answer to one question.
                             //
-                            // A *namespace* link is the other payload, and it
-                            // is not an inode at all: `/proc/<pid>/ns/<kind>`
-                            // denotes an object `setns` joins, so the walk hands
-                            // the link itself back and the door asks
-                            // (`Inode::as_namespace`).
+                            // A *namespace* link is the second payload, and what
+                            // it denotes is the namespace object itself - so the
+                            // walk resolves it here and hands on the
+                            // namespace-shaped file that *pins* it
+                            // ([`crate::vfs::ns::NsFile`]): the object is
+                            // resolved once, at the door that asked for it, and
+                            // every later reader of that descriptor (a `setns`
+                            // above all) acts on the namespace that was named
+                            // rather than on wherever the process is by then.
+                            // This is Linux's own split between the two doors:
+                            // `lstat`/`readlink` stop at the procfs link and keep
+                            // answering live, while `stat` and `open` see the
+                            // nsfs file (measured, `.workbuddy/probe_ns_fd_stat.c`).
                             if let Some(fd) = child.as_fd() {
                                 let denoted = crate::vfs::file::descriptor_inode(fd)?;
                                 stack.push(denoted);
                                 continue;
                             }
-                            if child.as_namespace().is_some() {
-                                stack.push(child);
+                            if let Some(ns) = child.as_namespace() {
+                                stack.push(crate::vfs::ns::NsFile::opened(ns));
                                 continue;
                             }
                             // Splice the target in front of whatever was still

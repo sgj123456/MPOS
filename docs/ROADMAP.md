@@ -421,11 +421,17 @@ made inside its own. `vfs::ns`'s new owner table records whose each namespace is
 with a user namespace its own owner, Linux's `ns_common::user_ns` — and `userns::Caller::capable_in`
 is the walk: the target is the caller's and the set is the answer; the machine's own reached from
 below is not privileged over it; the caller *made* the next one down and holds every capability in
-it whether or not its own set carries the bit; otherwise up one rung. One thing this kernel cannot
-express yet, and §5.2 now names with its measurement: a *real* re-join, because a namespace
-descriptor here follows its maker instead of pinning the namespace it named
-(`.workbuddy/probe_ns_fd_pin.c`: Linux's three readlinks answer the number the descriptor was
-opened in; this kernel answers the copy's).
+it whether or not its own set carries the bit; otherwise up one rung. That rung's last named gap
+was **closed the same day** (`docs/uapi/` §5.1 item 44): a namespace descriptor *is* the namespace
+now — the procfs link's followed name denotes a namespace-shaped file (`vfs::ns::NsFile`) holding
+the object resolved at the open, so `setns` joins the namespace the descriptor named rather than
+wherever its maker stands by then, and `stat`/`fstat` report a regular `0444` file whose `st_ino`
+is the namespace's **own** number, which is what Linux's `nsfs` inode is
+(`.workbuddy/probe_ns_fd_stat.c`: `lstat` symlink `0777`, `stat`/`fstat` regular `0444` with
+`st_ino` `4026531832`, size 0, `read` `EINVAL`, `lseek` `ESPIPE`, a write-ish open `EPERM` for
+root and unprivileged callers alike and `O_APPEND` served; `.workbuddy/probe_ns_fd_pin.c`: the
+three readlinks `4026531832`/`4026532932`/`4026531832`). `lstat` and `readlink` keep answering
+live, because they stop at the link — the split Linux makes.
 
 **And the third raw door was measured and closed with it** (`docs/uapi/` §5.1 item 43): the *same*
 question in the door `ping` and a DHCP client take — `AF_INET`'s `SOCK_RAW` — which asked the

@@ -584,26 +584,29 @@ Section numbers are unchanged from the original `UAPI.md`.
   without going through either truncate door and was not measured (a probe row is what closes it);
   and a write through a mapping, which Linux does not strip either.
 
-- **A namespace descriptor does not pin the namespace it named. Named 2026-10-18**
-  (item 42's measurement, `.workbuddy/probe_ns_fd_pin.c`, Linux 7.2.9). Linux's
-  `/proc/<pid>/ns/<kind>` is an `nsfs` *inode*: opening the link mints a file whose
-  private data is the namespace object itself, so the descriptor names the
-  namespace it was opened in for as long as it is open - which is what makes
-  `setns(fd)` a join rather than a question about where the maker is standing now,
-  and what lets a namespace outlive the process that made it by descriptor alone.
-  Measured: a caller that opens `/proc/self/ns/mnt`, unshares `CLONE_NEWNS` (moving
-  into a copy) and then `setns`es through the descriptor answers `0` and ends up
-  **back in the namespace the descriptor was opened in** - the probe's three
-  readlinks are `4026531832`, `4026532932`, `4026531832`. This kernel's
-  `ProcLink::as_namespace` re-resolves the `(pid, entry)` pair **at setns time**
-  ("asked at open time, not recorded at build time", which is the right rule for
-  `readlink` and the wrong one for the object), so the same three readlinks answer
-  the *copy*'s number twice and the join is the no-op it would have been without
-  the descriptor. The fix is a namespace-shaped file: `open` on the link would
-  carry the resolved `Namespace` (the six kinds' objects, by reference) where
-  `readlink` keeps answering live, and `setns` would read it back instead of
-  asking `sched::ns_of` again. Owner: `src/vfs/procfs.rs`'s `ProcLink` and whatever
-  file kind a namespace descriptor is. Pin: none yet - `t-ns-setns`' owner section
-  carries the *behaviour* the gap costs (its "served" half is a no-op join where
-  Linux's is a real one, said out loud in the test's comment), and the shape a pin
-  would take is the probe's three readlinks.
+- **A namespace descriptor *is* the namespace, and the pin is what makes `setns` a
+  join. Named 2026-10-18, landed the same day** (`docs/uapi/` §5.1 item 44;
+  `.workbuddy/probe_ns_fd_pin.c` for the pin, `.workbuddy/probe_ns_fd_stat.c` for
+  the file's shape, Linux 7.2.9). Linux's `/proc/<pid>/ns/<kind>` is a procfs *link*
+  whose target is an `nsfs` inode - opening it resolves the object **once**, and the
+  descriptor names that namespace for as long as it is held. That is what makes
+  `setns(fd)` a join rather than a question about where the maker stands now, and
+  what lets a namespace outlive the process that made it. Measured as the probe's
+  three readlinks - `4026531832`, the copy's `4026532932` after an `unshare`, then
+  `4026531832` again - and as the file's own shape: `lstat` reports the link
+  (`symlink 0777`, the procfs inode's own number), `stat` and `fstat` report a
+  **regular `0444` file of size 0 whose `st_ino` is the namespace's own number**
+  (two names of one namespace agree on it), `read` is `EINVAL`, `lseek` `ESPIPE`,
+  and a write-ish open (`O_WRONLY`, `O_RDWR`, `O_TRUNC`) is `EPERM` for root and
+  unprivileged callers alike, while `O_APPEND` alone is served. This kernel handed
+  the *link* back for the opened descriptor, so `setns` re-resolved the `(pid,
+  entry)` pair and the same three readlinks answered the copy's number twice - and
+  `stat` of a namespace name reported the link rather than the file it is followed
+  to. Both are the same missing thing, closed in one pass: `vfs::ns::NsFile` is the
+  file the walk now denotes for a followed namespace name (owner: `src/vfs/ns.rs`,
+  the substitution in `src/vfs/mount.rs`'s walk, the doc contract on
+  `Inode::as_namespace`), with `readlink`/`lstat` untouched because they stop at the
+  link, which is the split Linux makes. Pin: `t-ns-setns`' descriptor section - the
+  five discriminating claims are the two shapes, the inode number, the write-ish
+  refusal, and the join landing in the descriptor's namespace rather than the copy -
+  beside the host unit test `an_opened_namespace_descriptor_has_the_shape_a_host_measured`.

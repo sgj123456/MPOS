@@ -216,11 +216,15 @@ impl Inode for ProcLink {
     }
 
     fn as_namespace(&self) -> Option<crate::vfs::ns::Namespace> {
-        // Asked at open time, not recorded at build time: a process that
-        // unshared a moment ago is in a different namespace now, and a link
-        // that answered with what it was built from would be naming the one
-        // the process left. `None` when the process is gone - the same answer
-        // `readlink` gives, one instant later.
+        // Asked when the object is wanted, and answered with the namespace the
+        // process is in *at that instant*: a process that unshared a moment ago
+        // is in a different namespace now, and a link that answered with what
+        // it was built from would be naming the one the process left. `None`
+        // when the process is gone - the same answer `readlink` gives, one
+        // instant later. What the walk then hands on is a
+        // [`crate::vfs::ns::NsFile`] holding *this* answer, so the pinning is
+        // the resolution's and not this method's: the link stays live, the
+        // descriptor it was opened through does not.
         let (pid, entry) = self.ns?;
         namespace_of(pid, entry)
     }
