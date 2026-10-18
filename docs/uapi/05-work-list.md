@@ -2216,3 +2216,135 @@ the commit bodies), and each moved its pin in the same commit.
     of them stays green, because a range copy that wrote its head still refuses; that asymmetry is
     the item in one sentence: an error code alone cannot tell "refused before writing" from "refused
     after writing what it could reach". Only the bytes can.
+
+## item 54 — `/proc/<pid>/smaps`: Linux's field set, and the three numbers this kernel cannot derive
+
+    §5.2's entry said it in one line — "`maps` is served in Linux's exact format; the two
+    siblings are unwritten" — and `smaps` is the one every memory-reporting tool reads:
+    `smem`, `ps_mem`, and a compositor asking how much of a client's `wl_shm` buffer is
+    resident. What such a reader depends on is two things at once, and the measurement
+    below is about both: a record *is* the `maps` line for its mapping, byte for byte,
+    followed by Linux's field lines in Linux's order.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_smaps.c` for the shape,
+    `probe_smaps_shapes.c` for the accounting, Linux 7.2.11):
+
+    * the field set is twenty-four `label: value` lines in this order — `Size`,
+      `KernelPageSize`, `MMUPageSize`, `Rss`, `Pss`, `Pss_Dirty`, `Shared_Clean`,
+      `Shared_Dirty`, `Private_Clean`, `Private_Dirty`, `Referenced`, `Anonymous`, `KSM`,
+      `LazyFree`, `AnonHugePages`, `ShmemPmdMapped`, `FilePmdMapped`, `Shared_Hugetlb`,
+      `Private_Hugetlb`, `Swap`, `SwapPss`, `Locked`, `THPeligible`, `ProtectionKey` —
+      and then a `VmFlags` word list. The last three are the exceptions a copy from a
+      table gets wrong: `THPeligible` and `ProtectionKey` carry no unit, and every
+      `VmFlags` word is followed by a space, so that line ends in one (`VmFlags: rd mr mw
+      me \n`);
+    * **every value ends in column 24 whatever its width** — `8`, `136` and `1516` all do,
+      which is `seq_printf`'s `%8lu` behind a sixteen-column label, and what makes the
+      file readable by position as well as by name;
+    * **every record's header is one of the lines `maps` prints, byte for byte.** Measured
+      over a process whose mappings covered every shape the two probes could make (34 of
+      34 records agreed), and the property a reader that maps one file onto the other
+      depends on — which is why `maps` and `smaps` here are two renderings of *one*
+      gatherer (`procfs::mapping_lines`);
+    * `/proc/<pid>/smaps_rollup` is a different field set again — the same lines minus
+      `THPeligible`/`ProtectionKey`/`VmFlags`, plus three this file does not have
+      (`Pss_Anon`, `Pss_File`, `Pss_Shmem`) under a `[rollup]` header — and
+      `/proc/<pid>/numa_maps` is a different format (`<start> default [file=…] [anon=N]
+      [dirty=N] [mapped=N] [mapmax=N] [active=N] N0=N kernelpagesize_kB=4`, with spaces in
+      a name escaped as `\040`). **Both stay named in §5.2**: they are the same
+      accounting question in two other spellings, and neither is what a tool reaches for
+      first.
+
+    **What this kernel cannot derive, and the rule it answers with instead.** The probes
+    are also what said the accounting numbers are not derivable here, and each has a
+    reason in this kernel's model rather than in effort:
+
+    * `Pss` is a page's size divided by how many address spaces map it, and **no mapcount
+      exists here** — `Mm.frames` is a flat list of frames with no virtual key and no
+      users, `MappedObject::same_as` compares identity rather than counting, and `fork`
+      copies the VMA table without counting anything. Measured on the host: one page two
+      address spaces share reads `Rss: 4 kB` with `Pss: 2 kB`, and a private read of the
+      same page reads `Pss: 4 kB`;
+    * `Shared_*`/`Private_Clean`/`Private_Dirty` need a dirty bit **and a page cache to be
+      clean against**, and this kernel has neither: nothing records whether a page has
+      been written (a user write goes straight to the frame), and a file is read *in*
+      rather than paged, so there is no clean page to compare against. The host's own
+      four buckets are its page cache's and its COW states': a written anonymous page
+      reads `Private_Dirty` + `Anonymous`, a shared `memfd` page reads `Private_Dirty`
+      with `Anonymous: 0`, a private read of a tmpfs file reads `Private_Dirty` with
+      `Anonymous: 0`, and a page a `fork` shares reads `Shared_Dirty` with `Anonymous: 4`
+      and a halved `Pss` — four shapes, and no rule that produces them from what is here;
+    * `Referenced` is the hardware accessed bit, which nothing here reads or clears;
+    * `Locked` is `mlock`'s bookkeeping, and `mlock` here is a no-op that takes no lock
+      (its own entry in §5.1 says so), so zero is the *truth* rather than a placeholder.
+
+    So the file answers Linux's lines with the one rule this kernel's model can state,
+    and the rest of the fields are zero because the feature behind them does not exist:
+
+    **every resident page is this mapping's own, and it is dirty.**
+
+    That makes `Pss` and `Pss_Dirty` equal to `Rss`, `Private_Dirty` equal to `Rss` and
+    `Shared_*`/`Private_Clean` zero; `Referenced` equal to `Rss`, because a page becomes
+    resident here only by being faulted in, so every resident page has been accessed;
+    `Anonymous` equal to `Rss` for a mapping with no object behind it and zero for one
+    whose pages an object owns (`memfd`, dma-buf, the framebuffer, a DRM dumb buffer) —
+    which is Linux's *own* answer for the two shared shapes measured, and the reason the
+    flag comes from the mapping's kind rather than from a count; and `Locked`, `Swap`,
+    `SwapPss`, `KSM`, `LazyFree`, `AnonHugePages`, `ShmemPmdMapped`, `FilePmdMapped`,
+    `Shared_Hugetlb`, `Private_Hugetlb`, `THPeligible` and `ProtectionKey` zero because
+    there is no lock, no swap, no KSM, no huge page, no pmd-mapped page, no pkey and no
+    transparent-hugepage eligibility to report.
+
+    `VmFlags` is the same grant `/proc/<pid>/maps`' permission column is (item 54's
+    neighbour, `docs/notes/` §15.72): `rd`/`wr`/`ex` from the three permission bits,
+    `sh`/`ms` from the sharing bit, and `mr`/`mw`/`me` unconditionally — Linux's
+    `VM_MAY*`, which `mprotect` here grants without asking a may-question, so a
+    `PROT_NONE` guard page prints `mr mw me` exactly as Linux's does. Two words Linux
+    prints are deliberately **absent**: `ac` (overcommit accounting) and `sd`
+    (soft-dirty), because printing either would claim a state nothing here keeps.
+
+    **Three fixture lessons, because the gate charged for each.** Adjacent mappings with
+    equal flags are **one VMA** — the first draft's two anonymous fixtures came back from
+    the host as a single five-page record, so every fixture is now bounded by a
+    `PROT_NONE` page on both sides and a record is found by *containing* an address rather
+    than by starting at one. **Reading a file can move the heap**: `[heap]`'s own range
+    changed between two reads of the two files, because the buffer the reader allocates is
+    itself a mapping — so the header comparison is made over the records two `smaps` reads
+    agree on, and the buffers are sized before the reads. And **a claim keyed on numbers a
+    fixture happens to have is a claim about the whole address space**: the child's
+    mapping was first found by "a record of 12 kB with 8 kB resident", which the child's
+    own heap can satisfy by accident — it passed on the first machine and failed on the
+    second. The child now reports the address it got down a pipe, and the parent asks
+    about *that* mapping.
+
+    Pins: `t-smaps`, **34 claims**, all green on a current host first (`MPOS_ON_HOST=1`,
+    where the `ok:` lines come out byte-identical to the sweep's: the one divergence a
+    host run has is the two extra `VmFlags` words, and the claim filters exactly those and
+    prints the host's own list beside this kernel's when anything else differs). Four host unit tests hold the
+    renderer: the whole record byte for byte against the host's own lines
+    (`a_smaps_record_has_linuxs_lines_in_linuxs_order`), a wider value in the same column
+    (`a_wider_value_keeps_the_column_linux_puts_it_in`), nothing resident being every
+    number zero (`a_record_with_nothing_resident_is_all_zeroes`), and the flag words per
+    shape (`the_flags_are_the_words_this_kernel_can_stand_behind`).
+
+    Gate: x86_64 `all 184 user tests passed` (`pass=184 fail=0 (184 built)`), aarch64
+    `pass=183 fail=0`, `mpos-kunit 32 passed, 0 failed` on both machines; both machines'
+    `t-smaps` `ok:` lines byte-identical (34 and 34, `diff` empty).
+
+    Counterfactual: `sched::resident_pages` answering the whole range as resident — the
+    shape that would make the file a statement about the *description* rather than about
+    the pages — is `pass=182 fail=2 (184 built)`: `FAIL t-smaps exit=1` with **nine**
+    claims red by name, every one of them `Rss`'s or derived from it — `Rss counts the
+    pages that faulted in`, `Pss is Rss`, `Pss_Dirty follows Pss`, `the four
+    shared/private buckets`, `Referenced is the resident set`, `Anonymous is the resident
+    set`, `an untouched mapping is Size without Rss`, `a guard page is mapped without a
+    resident page`, and the child's own mapping — while the four renderer unit tests stay
+    green, because they pin the *lines* and this moves the *number*. (The run's second red
+    was `t-aslr`'s `the stack does not start at the same page twice`, which has nothing to
+    do with the file: it passed on the immediate re-run, the randomization flake kind.)
+
+    Owner: `src/vfs/procfs.rs` (`SmapsLine`, `format_smaps`, `mapping_lines`, the node),
+    `src/sched/runtime/child_mm.rs` (`resident_pages`, the page-table walk a named pid's
+    `Rss` needs), and the module's `sched` re-export. What stays named: `numa_maps` and
+    `smaps_rollup` (§5.2), and the three `Pss_*` lines `smaps_rollup` has and `smaps`
+    does not.

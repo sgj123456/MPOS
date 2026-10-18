@@ -434,8 +434,43 @@ Section numbers are unchanged from the original `UAPI.md`.
 - **`RNDRESEEDCRNG` provenance.** Now that the reseed is real, `RNDGETENTCNT`'s 4096 stays
   a constant across it; a caller that reseeds and re-reads sees the same figure Linux shows,
   so no change is needed — recorded so the next reader does not "fix" it into a lie.
-- **`/proc/<pid>/smaps` and `numa_maps`.** `maps` is served in Linux's exact format; the
-  two siblings are unwritten. Owner: `src/vfs/procfs.rs`.
+- **`/proc/<pid>/smaps` is served, and the three numbers this kernel cannot derive are a
+  rule rather than a guess. Landed 2026-10-18** (`docs/uapi/` §5.1 item 54). The entry this
+  replaces said `maps` was served in Linux's exact format while the two siblings were
+  unwritten. `smaps` is the one `smem`, `ps_mem` and every compositor asking how much of a
+  client's `wl_shm` buffer is resident read, and it is now served in Linux's own shape:
+  each record *is* the `maps` line for its mapping byte for byte (measured over a process
+  covering every shape: 34 of 34 records agreed), then Linux's twenty-four field lines in
+  Linux's order, each value ending in column 24 whatever its width, with `THPeligible` and
+  `ProtectionKey` carrying no unit and `VmFlags`' words each followed by a space.
+
+  What is *not* Linux's is three of the accounting numbers, because this kernel has none of
+  what Linux computes them from — no mapcount (`Pss`), no dirty bit and no page cache (the
+  four shared/private buckets), no accessed bit (`Referenced`) — and each divergence is
+  measured on both sides rather than asserted. The file answers with one rule: **every
+  resident page is this mapping's own, and it is dirty**, so `Pss`, `Pss_Dirty` and
+  `Private_Dirty` are `Rss`, `Shared_*`/`Private_Clean` are zero, `Referenced` is `Rss`
+  (a page here becomes resident only by being faulted in), and `Anonymous` is the resident
+  set exactly when no object owns the pages — which is Linux's own answer for the two
+  shared shapes measured (`memfd`, shared anon: `Private_Dirty`, `Anonymous: 0`). Everything
+  else is zero because the feature behind it does not exist: no KSM, no huge page, no pmd-mapped
+  page, no hugetlb, no swap, no pkey, and `Locked` because `mlock` here takes no lock.
+  `VmFlags` carries the same *grant* the `maps` permission column does — `rd`/`wr`/`ex`,
+  `sh`/`ms`, and `mr`/`mw`/`me` unconditionally — with Linux's `ac` and `sd` deliberately
+  absent, since printing either would claim a state nothing here keeps. Pin: `t-smaps`, 34
+  claims, green on this host first, beside four renderer unit tests; `docs/notes/` §15.73
+  carries the gates, the counterfactual and the two fixture lessons.
+
+- **`/proc/<pid>/numa_maps` and `/proc/<pid>/smaps_rollup`** are the two spellings of the
+  same accounting that stay unwritten, and their formats are measured so the next landing
+  does not have to re-derive them: `numa_maps` is `<start> default [file=…] [anon=N]
+  [dirty=N] [mapped=N] [mapmax=N] [active=N] N0=N kernelpagesize_kB=4` with spaces inside a
+  name escaped as `\040` (its `anon`/`dirty`/`mapmax` numbers are the mapcount/dirty-bit
+  question `smaps` just named), and `smaps_rollup` is one record for the whole address space
+  under a `[rollup]` header, carrying the same lines minus
+  `THPeligible`/`ProtectionKey`/`VmFlags` and plus three `smaps` does not have
+  (`Pss_Anon`, `Pss_File`, `Pss_Shmem`) — which are exactly the split this kernel's `Pss`
+  cannot make. Owner: `src/vfs/procfs.rs`.
 - **`devfs` birth modes.** Devices are born `0666 root:root`; `devtmpfs` births `0600`
   and lets udev widen it. Needs per-class birth modes and group-name resolution, not a new
   mechanism (`docs/notes/` §3.4).

@@ -89,6 +89,58 @@ pub fn user_frame_at(virt: usize) -> Option<usize> {
     })
 }
 
+/// How many pages of `start..end` have a frame behind them in the address space
+/// of the task `pid` names - the per-mapping `Rss` `/proc/<pid>/smaps` reports.
+///
+/// The same page-table question [`user_frame_at`] asks, asked of a *named* task
+/// rather than of the caller. It is asked one page at a time for the reason
+/// `/proc/<pid>/smaps` cannot ask it any other way: this kernel's resident set
+/// is the page tables (`Mm.frames` holds the frames, not the addresses they are
+/// mapped at), so there is no structure to walk, and the answer is
+/// `phys_for_virt` per page - which is exactly what `mincore` does for one
+/// range. The table's critical section is therefore *not* held across the walk:
+/// a process with a gigabyte mapped makes this 262144 pages, and interrupts
+/// must not be off for that (AGENTS.md §3's rule 5, the bound on work a user
+/// can steer).
+///
+/// The walk starts at the page `start` falls in, which is the page the range's
+/// own first byte would fault: `mmap` returns page-aligned addresses, so the
+/// rounding can only ever matter for a range that is not.
+pub fn resident_pages(pid: usize, start: usize, end: usize) -> usize {
+    let mut count = 0;
+    let mut page = start & !(PAGE_SIZE - 1);
+    while page < end && page >= start {
+        if user_frame_at_task(pid, page).is_some() {
+            count += 1;
+        }
+        // The wraparound guard is the loop's, not a caller's: a range ending at
+        // the top of the address space would otherwise step past it.
+        match page.checked_add(PAGE_SIZE) {
+            Some(next) => page = next,
+            None => break,
+        }
+    }
+    count
+}
+
+/// [`user_frame_at`] for a task named by its id rather than by being current,
+/// with the group's space resolved the same way: a thread owns no address space
+/// of its own, so asking the thread's own slot would answer "nothing is mapped"
+/// for every page of a process that has one.
+///
+/// The slot is checked before the leader is asked for its space, because the
+/// reader is a *file*: `/proc/<pid>/smaps` of a process that exits between two
+/// of its pages is a reading that has to stop answering rather than a reason to
+/// panic (`Table::task` panics on a slot nothing holds, which is right for a
+/// caller that holds the same lock it named the task under).
+fn user_frame_at_task(pid: usize, virt: usize) -> Option<usize> {
+    with_table(|t| {
+        t.tasks.get(pid)?.as_ref()?;
+        let owner = t.space_owner(TaskId(pid));
+        t.task(owner).space.as_ref()?.phys_for_virt(virt)
+    })
+}
+
 /// Whether no VMA describes any part of `virt..virt + len`.
 ///
 /// This asks the question a range claim needs: that nothing belongs to the

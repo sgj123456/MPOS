@@ -1266,6 +1266,15 @@ pub struct MapLine {
 /// assert!(text.ends_with('\n'));
 /// ```
 pub fn format_maps(lines: &[MapLine]) -> String {
+    format_map_lines(lines.iter())
+}
+
+/// The body of [`format_maps`] and of every `smaps` record's header.
+///
+/// An iterator of borrows rather than a slice, so the file that *owns* its
+/// records (`smaps`, whose field lines are rendered from the same records) does
+/// not clone them to print their headers.
+fn format_map_lines<'a>(lines: impl Iterator<Item = &'a MapLine>) -> String {
     let mut out = String::new();
     for line in lines {
         let perms = [
@@ -1314,7 +1323,211 @@ pub fn format_maps(lines: &[MapLine]) -> String {
     out
 }
 
-/// `/proc/<pid>/maps`: every range in the process's address space.
+/// One record of `/proc/<pid>/smaps`: the [`MapLine`] both files' headers are,
+/// plus the two facts only this file's field lines need.
+///
+/// The fields are resolved before the formatting for the reason `MapLine`'s
+/// are: [`format_smaps`] is the ABI and is compiled for the host, while
+/// gathering them asks the page tables, which only exist on the machine.
+pub struct SmapsLine {
+    pub map: MapLine,
+    /// Resident pages of the range, counted from the page tables - the same
+    /// fact `mincore` reads, per mapping instead of per caller's buffer.
+    pub rss_pages: usize,
+    /// Whether the pages belong to this address space alone: true for a range
+    /// with no object behind it (an anonymous VMA, or a file the kernel read
+    /// in), false for one whose pages a `memfd`/dma-buf/device owns and this
+    /// mapping only aliases.
+    ///
+    /// This is Linux's `Anonymous` question - "is the page's content held
+    /// anywhere but here" - and it is answered by the mapping's *kind* rather
+    /// than by a count, because this kernel keeps no mapcount. Measured on a
+    /// current host: a shared anonymous mapping and a `memfd`'s are both 0 kB
+    /// anonymous (their page belongs to the object), a forked private anon page
+    /// is 4 kB (`probe_smaps_shapes.c`).
+    pub anonymous: bool,
+}
+
+/// Render `/proc/<pid>/smaps`: for each mapping, the `maps` line, then Linux's
+/// field lines.
+///
+/// The field set, its order and its layout are Linux's `show_smap` exactly -
+/// twenty-four `label: value` lines and a `VmFlags` word list, in the order
+/// measured on a current host (`.workbuddy/probe_smaps.c`), with every value
+/// right-aligned so that it ends in column 24 whatever its width. A parser that
+/// reads this file as a map (one `name -> value` per record) is the whole
+/// reason the layout is not this kernel's own.
+///
+/// What is not Linux's, and is named in `docs/uapi/` §5.2 with the measurement
+/// beside it, is where three of the accounting numbers come from. This kernel
+/// keeps no mapcount, no dirty bit and no page cache, so Linux's four
+/// shared/private buckets and its proportional set size are not derivable; the
+/// rule this file applies instead is one sentence - **every resident page is
+/// this mapping's own, and it is dirty** - which makes `Pss`, `Pss_Dirty` and
+/// `Private_Dirty` all `Rss`, and `Shared_*`/`Private_Clean` zero. It is the
+/// only rule this kernel's model can state: a page becomes resident because
+/// this address space faulted it in (`mm`'s demand paging), a private frame is
+/// nobody else's until a `fork` shares it, and whether anything wrote a file
+/// copy is not recorded anywhere.
+///
+/// The remaining lines are zero because the thing behind them does not exist
+/// here: no KSM, no huge pages, no soft-dirty tracking's `THPeligible` page, no
+/// pkeys, no swap, and no locked page - `mlock` is served as the no-op it is,
+/// so `Locked` is the truth rather than a placeholder.
+///
+/// ```
+/// use mpos::vfs::procfs::{MapLine, SmapsLine, format_smaps};
+/// use mpos_vm::MapFlags;
+///
+/// let line = SmapsLine {
+///     map: MapLine {
+///         start: 0x7f_0000_0000,
+///         end: 0x7f_0000_4000,
+///         prot: MapFlags::READ | MapFlags::WRITE,
+///         shared: false,
+///         offset: 0,
+///         dev: (0, 0),
+///         inode: 0,
+///         name: None,
+///     },
+///     rss_pages: 1,
+///     anonymous: true,
+/// };
+/// let text = format_smaps(&[line]);
+/// assert!(text.starts_with("7f00000000-7f00004000 rw-p 00000000 00:00 0 \nSize:"));
+/// assert!(text.contains("\nSize:                 16 kB\n"));
+/// assert!(text.contains("\nRss:                   4 kB\n"));
+/// assert!(text.contains("\nPrivate_Dirty:         4 kB\n"));
+/// assert!(text.contains("\nAnonymous:             4 kB\n"));
+/// assert!(text.ends_with("VmFlags: rd wr mr mw me \n"));
+/// ```
+pub fn format_smaps(lines: &[SmapsLine]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(&format_map_lines(core::iter::once(&line.map)));
+        let rss_kb = line.rss_pages as u64 * PAGE_KB;
+        // The range's length in kilobytes, the way Linux's `show_smap` computes
+        // it - `(vm_end - vm_start) / 1024`, not a page count times the frame
+        // size, because a range need not be a whole number of frames.
+        let size_kb = (line.map.end - line.map.start) as u64 / 1024;
+        smaps_kb(&mut out, "Size:", size_kb);
+        smaps_kb(&mut out, "KernelPageSize:", PAGE_KB);
+        smaps_kb(&mut out, "MMUPageSize:", PAGE_KB);
+        smaps_kb(&mut out, "Rss:", rss_kb);
+        smaps_kb(&mut out, "Pss:", rss_kb);
+        smaps_kb(&mut out, "Pss_Dirty:", rss_kb);
+        smaps_kb(&mut out, "Shared_Clean:", 0);
+        smaps_kb(&mut out, "Shared_Dirty:", 0);
+        smaps_kb(&mut out, "Private_Clean:", 0);
+        smaps_kb(&mut out, "Private_Dirty:", rss_kb);
+        smaps_kb(&mut out, "Referenced:", rss_kb);
+        smaps_kb(
+            &mut out,
+            "Anonymous:",
+            if line.anonymous { rss_kb } else { 0 },
+        );
+        for absent in [
+            "KSM:",
+            "LazyFree:",
+            "AnonHugePages:",
+            "ShmemPmdMapped:",
+            "FilePmdMapped:",
+            "Shared_Hugetlb:",
+            "Private_Hugetlb:",
+            "Swap:",
+            "SwapPss:",
+            "Locked:",
+        ] {
+            smaps_kb(&mut out, absent, 0);
+        }
+        // These two are numbers rather than "kB" counts - `THPeligible` a flag
+        // and `ProtectionKey` a pkey - and Linux prints them without a unit.
+        smaps_number(&mut out, "THPeligible:", 0);
+        smaps_number(&mut out, "ProtectionKey:", 0);
+        // Linux writes the label, a space, and then every word *followed* by a
+        // space - so the line ends in one ("VmFlags: rd mr mw me \n"), which is
+        // the shape a reader splitting on spaces sees.
+        out.push_str("VmFlags: ");
+        for word in vma_flags(&line.map) {
+            out.push_str(word);
+            out.push(' ');
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The frame size in kilobytes, for the three lines that report it.
+///
+/// Both machines' frames are 4096 bytes (`mpos_vm`'s `PAGE_SIZE`, which is the
+/// one definition), and the renderer is compiled for the host as well as for
+/// the machine, so the number comes from that leaf crate rather than from the
+/// port.
+const PAGE_KB: u64 = (crate::mm::pframe::PAGE_SIZE / 1024) as u64;
+
+/// One `label: value kB` line, laid out the way Linux's `seq_printf` lays it
+/// out: the label padded to sixteen columns and the number ending in column 24.
+///
+/// Measured rather than assumed (`probe_smaps.c`): `Size:` prints `8` and
+/// `136` with both ending in the same column, which is what makes the file
+/// readable by a fixed-column reader.
+fn smaps_kb(out: &mut String, label: &str, kb: u64) {
+    out.push_str(&alloc::format!("{label:<16}{kb:>8} kB\n"));
+}
+
+/// The same layout for the two lines Linux prints a bare number on.
+fn smaps_number(out: &mut String, label: &str, value: u64) {
+    out.push_str(&alloc::format!("{label:<16}{value:>8}\n"));
+}
+
+/// The `VmFlags` words this kernel can stand behind, in Linux's order.
+///
+/// Linux's vocabulary is its `vm_flags` bitset's, and most of it describes
+/// features this kernel does not have (huge pages, soft-dirty, pkeys, mlock,
+/// accounting, write-notify). What is printed here is the subset whose
+/// condition this kernel really meets, each with its reason:
+///
+/// * `rd`/`wr`/`ex` are the mapping's *protection* as the caller was granted it
+///   (`granted` resolves the VMA's "present" bit into the grant), which is the
+///   permission Linux's `VM_READ`/`VM_WRITE`/`VM_EXEC` also describe;
+/// * `sh` is `MAP_SHARED`, which is the same bit `/proc/<pid>/maps` prints as
+///   the fourth permission character;
+/// * `mr`/`mw`/`me` are Linux's `VM_MAY*` - what the mapping *could* be given -
+///   and they are unconditional here because `mprotect` asks no may-question:
+///   any mapping this kernel has can be given any protection (measured against
+///   this kernel's `VmaTable::set_prot`, which has no may-check to fail). A
+///   `PROT_NONE` guard page therefore prints `mr mw me` exactly as Linux's does;
+/// * `ms` is `VM_MAYSHARE`, which is the same sharing bit for the same reason
+///   as `sh`: nothing here can turn a private mapping shared or the reverse.
+///
+/// The words that are *absent* are the named half of this file's divergence
+/// (`docs/uapi/` §5.2): `sd` (soft-dirty) would claim a state nothing here
+/// records, `ac` (accounted) an overcommit accounting that does not exist, and
+/// `lo` (locked) a lock `mlock` does not take.
+fn vma_flags(line: &MapLine) -> alloc::vec::Vec<&'static str> {
+    let mut words = alloc::vec::Vec::new();
+    if line.prot.contains(MapFlags::READ) {
+        words.push("rd");
+    }
+    if line.prot.contains(MapFlags::WRITE) {
+        words.push("wr");
+    }
+    if line.prot.contains(MapFlags::EXEC) {
+        words.push("ex");
+    }
+    if line.shared {
+        words.push("sh");
+    }
+    words.push("mr");
+    words.push("mw");
+    words.push("me");
+    if line.shared {
+        words.push("ms");
+    }
+    words
+}
+
+/// Every range of `pid`'s address space, as both `maps` and `smaps` report it.
 ///
 /// Three sources, because the address space is recorded in three places: the
 /// VMA table holds what `mmap`, `mprotect` and `brk` put there, the loader's
@@ -1322,13 +1535,17 @@ pub fn format_maps(lines: &[MapLine]) -> String {
 /// eagerly (neither leaves a VMA - see [`crate::mm::vma::MappedRange`]), and the
 /// program break is what names the heap.
 ///
+/// The residency a [`SmapsLine`] carries is left at zero here: `maps` does not
+/// report it, and counting it is one page-table walk per mapped page, so the
+/// caller that wants it asks for it.
+///
 /// What this cannot report, and does not pretend to: a mapping's `offset` and
 /// `inode` when the pages are a *copy* of a file rather than the file's own
 /// pages. This kernel reads such a file in rather than paging it, so there is
 /// no object left to name - the mapping gets the file's name and zeroes for the
-/// two columns, and `NOTES.md` §7.4 records the gap.
+/// two columns, and `docs/notes/` §7.4 records the gap.
 #[cfg(target_os = "none")]
-fn maps_of(pid: usize) -> Option<String> {
+fn mapping_lines(pid: usize) -> Option<Vec<SmapsLine>> {
     use crate::mm::vma::{Vma, VmaKind};
 
     let facts = crate::sched::map_facts(pid)?;
@@ -1341,7 +1558,7 @@ fn maps_of(pid: usize) -> Option<String> {
         (vma.start >= start && vma.end <= end && vma.name.is_none()).then(|| String::from("[heap]"))
     };
 
-    let mut lines: Vec<MapLine> = Vec::new();
+    let mut lines: Vec<SmapsLine> = Vec::new();
     for vma in facts.vmas.iter() {
         let (offset, dev, inode, shared) = match &vma.kind {
             VmaKind::Anon => (0, (0, 0), 0, false),
@@ -1364,38 +1581,83 @@ fn maps_of(pid: usize) -> Option<String> {
             Some(name) => Some(String::from(&**name)),
             None => heap_name(vma),
         };
-        lines.push(MapLine {
-            start: vma.start,
-            end: vma.end,
-            prot: granted(vma.prot),
-            shared,
-            offset,
-            dev,
-            inode,
-            name,
+        lines.push(SmapsLine {
+            map: MapLine {
+                start: vma.start,
+                end: vma.end,
+                prot: granted(vma.prot),
+                shared,
+                offset,
+                dev,
+                inode,
+                name,
+            },
+            rss_pages: 0,
+            anonymous: matches!(&vma.kind, VmaKind::Anon),
         });
     }
     for range in &facts.eager {
-        lines.push(MapLine {
-            start: range.start,
-            end: range.end,
-            prot: granted(range.prot),
-            // Eagerly-filled ranges are a private copy or an image: `private`,
-            // which is what Linux prints for both.
-            shared: false,
-            offset: 0,
-            dev: (0, 0),
-            inode: 0,
-            name: range.name.as_deref().map(String::from),
+        lines.push(SmapsLine {
+            map: MapLine {
+                start: range.start,
+                end: range.end,
+                prot: granted(range.prot),
+                // Eagerly-filled ranges are a private copy or an image: `private`,
+                // which is what Linux prints for both.
+                shared: false,
+                offset: 0,
+                dev: (0, 0),
+                inode: 0,
+                name: range.name.as_deref().map(String::from),
+            },
+            rss_pages: 0,
+            // An eager range is a file's bytes read into this process's own
+            // frames, with nothing of the file left behind: the pages are
+            // nobody else's, which is the question `Anonymous` asks.
+            anonymous: true,
         });
     }
 
-    lines.sort_by_key(|line| (line.start, line.end));
-    Some(format_maps(&lines))
+    lines.sort_by_key(|line| (line.map.start, line.map.end));
+    Some(lines)
+}
+
+/// `/proc/<pid>/maps`: every range of the address space, one line each.
+#[cfg(target_os = "none")]
+fn maps_of(pid: usize) -> Option<String> {
+    Some(format_map_lines(
+        mapping_lines(pid)?.iter().map(|line| &line.map),
+    ))
+}
+
+/// `/proc/<pid>/smaps`: the same records with per-mapping accounting.
+///
+/// `maps` with a field block under each line, which is Linux's file and the one
+/// every memory-reporting tool reads (`smem`, `ps_mem`, and a compositor asking
+/// how much of its client's buffer is resident). The header of each record is
+/// the `maps` line byte for byte - measured on a current host over a process
+/// whose mappings cover every shape (`probe_smaps_shapes.c`: 34 of 34 records
+/// agreed) - so a reader may compare the two files.
+///
+/// The residency is counted page by page in `sched::resident_pages`, which is
+/// the only way it can be counted here: this kernel's resident set *is* the page
+/// tables.
+#[cfg(target_os = "none")]
+fn smaps_of(pid: usize) -> Option<String> {
+    let mut lines = mapping_lines(pid)?;
+    for line in lines.iter_mut() {
+        line.rss_pages = crate::sched::resident_pages(pid, line.map.start, line.map.end);
+    }
+    Some(format_smaps(&lines))
 }
 
 #[cfg(not(target_os = "none"))]
 fn maps_of(_pid: usize) -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "none"))]
+fn smaps_of(_pid: usize) -> Option<String> {
     None
 }
 
@@ -1885,6 +2147,10 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     );
     node.add("statm", NodeKind::File, maybe_file(move || statm_line(pid)));
     node.add("maps", NodeKind::File, maybe_file(move || maps_of(pid)));
+    // `smaps` is `maps` with a field block under each line, and its records'
+    // headers *are* the `maps` lines - which is what lets a reader compare the
+    // two files, and what `t-smaps` pins.
+    node.add("smaps", NodeKind::File, maybe_file(move || smaps_of(pid)));
     // The mount table, in both spellings, under *every* process rather than
     // once at the top of `/proc`.
     //
@@ -3478,6 +3744,177 @@ mod tests {
             name: None,
         }]);
         assert_eq!(text, "7f9132fd1000-7f9132fd3000 ---p 00000000 00:00 0 \n");
+    }
+
+    /// One whole `smaps` record, byte for byte against the record real Linux
+    /// printed for the same shape (host, 2026-10-18: a private anonymous
+    /// mapping of two pages with one of them resident, `.workbuddy/probe_smaps.c`).
+    ///
+    /// Every line, the order of them and the column each number ends in are the
+    /// file's whole contract: its readers are parsers (`smem`, `ps_mem`, and
+    /// everything that asks how much of a compositor's buffer is resident), so a
+    /// missing or renamed line is the difference between this kernel's memory
+    /// being visible and it not being there.
+    ///
+    /// The one line that is *not* Linux's own is `VmFlags`, and what it leaves
+    /// out are the two words this kernel cannot stand behind: `ac` (this mapping
+    /// is overcommit-accounted) and `sd` (soft-dirty tracking, a state nothing
+    /// here records). Both are named in `docs/uapi/` §5.2 with Linux's own line
+    /// beside them; the words that remain are `vma_flags`' documented rule.
+    #[test]
+    fn a_smaps_record_has_linuxs_lines_in_linuxs_order() {
+        let text = format_smaps(&[SmapsLine {
+            map: MapLine {
+                start: 0x7f_3ab9_6ca000,
+                end: 0x7f_3ab9_6cc000,
+                prot: MapFlags::READ | MapFlags::WRITE,
+                shared: false,
+                offset: 0,
+                dev: (0, 0),
+                inode: 0,
+                name: None,
+            },
+            rss_pages: 1,
+            anonymous: true,
+        }]);
+        assert_eq!(
+            text,
+            concat!(
+                "7f3ab96ca000-7f3ab96cc000 rw-p 00000000 00:00 0 \n",
+                "Size:                  8 kB\n",
+                "KernelPageSize:        4 kB\n",
+                "MMUPageSize:           4 kB\n",
+                "Rss:                   4 kB\n",
+                "Pss:                   4 kB\n",
+                "Pss_Dirty:             4 kB\n",
+                "Shared_Clean:          0 kB\n",
+                "Shared_Dirty:          0 kB\n",
+                "Private_Clean:         0 kB\n",
+                "Private_Dirty:         4 kB\n",
+                "Referenced:            4 kB\n",
+                "Anonymous:             4 kB\n",
+                "KSM:                   0 kB\n",
+                "LazyFree:              0 kB\n",
+                "AnonHugePages:         0 kB\n",
+                "ShmemPmdMapped:        0 kB\n",
+                "FilePmdMapped:         0 kB\n",
+                "Shared_Hugetlb:        0 kB\n",
+                "Private_Hugetlb:       0 kB\n",
+                "Swap:                  0 kB\n",
+                "SwapPss:               0 kB\n",
+                "Locked:                0 kB\n",
+                "THPeligible:           0\n",
+                "ProtectionKey:         0\n",
+                "VmFlags: rd wr mr mw me \n",
+            ),
+            "the record's lines are Linux's, in Linux's order"
+        );
+    }
+
+    /// A value wider than one digit ends in the *same* column, which is the
+    /// half of the layout a test with one-digit numbers cannot see: Linux
+    /// prints `8` and `1516` with both ending in column 24, and a reader that
+    /// splits the file on whitespace still finds the number in the same field.
+    #[test]
+    fn a_wider_value_keeps_the_column_linux_puts_it_in() {
+        // The two lines are copied from the host's own file (`probe_smaps.out`,
+        // the `[heap]` record and a library record).
+        let one = "Size:                136 kB";
+        let four = "Size:               1516 kB";
+        assert_eq!(one.len(), 27);
+        assert_eq!(four.len(), 27);
+        let line = |start, end| SmapsLine {
+            map: MapLine {
+                start,
+                end,
+                prot: MapFlags::READ | MapFlags::WRITE,
+                shared: false,
+                offset: 0,
+                dev: (0, 0),
+                inode: 0,
+                name: None,
+            },
+            rss_pages: 0,
+            anonymous: true,
+        };
+        let text = format_smaps(&[line(0x55f4_db03_6000, 0x55f4_db05_8000)]);
+        assert!(text.contains(one), "{text:?}");
+        let text = format_smaps(&[line(0x7f42_7140_0000, 0x7f42_7157_b000)]);
+        assert!(text.contains(four), "{text:?}");
+    }
+
+    /// Nothing resident is every number zero - including `Anonymous`, whose
+    /// subject is the *kind* of page rather than how many there are: a mapping
+    /// whose pages have never arrived is mapped, and unmaterialised.
+    #[test]
+    fn a_record_with_nothing_resident_is_all_zeroes() {
+        let text = format_smaps(&[SmapsLine {
+            map: MapLine {
+                start: 0x7f_0000_0000,
+                end: 0x7f_0002_0000,
+                prot: MapFlags::READ,
+                shared: false,
+                offset: 0,
+                dev: (0, 0),
+                inode: 0,
+                name: None,
+            },
+            rss_pages: 0,
+            anonymous: true,
+        }]);
+        // Size is the mapping's own length; every accounting line is zero.
+        assert!(text.contains("Size:                128 kB\n"), "{text:?}");
+        for zero in [
+            "Rss:",
+            "Pss:",
+            "Pss_Dirty:",
+            "Shared_Clean:",
+            "Shared_Dirty:",
+            "Private_Clean:",
+            "Private_Dirty:",
+            "Referenced:",
+            "Anonymous:",
+            "Swap:",
+            "Locked:",
+        ] {
+            let needle = alloc::format!("{zero:<16}{:>8} kB\n", 0);
+            assert!(text.contains(&needle), "{zero} is zero in {text:?}");
+        }
+    }
+
+    /// The `VmFlags` words this kernel prints, per shape, against Linux's own
+    /// (measured, `probe_smaps.out`): a guard page prints `mr mw me` because
+    /// `mprotect` may grant any protection, a shared mapping adds `sh` and `ms`,
+    /// and an executable one adds `ex` - and the trailing space before the
+    /// newline is Linux's, because each word is written followed by one.
+    #[test]
+    fn the_flags_are_the_words_this_kernel_can_stand_behind() {
+        let flags = |prot, shared| {
+            vma_flags(&MapLine {
+                start: 0,
+                end: 4096,
+                prot,
+                shared,
+                offset: 0,
+                dev: (0, 0),
+                inode: 0,
+                name: None,
+            })
+            .join(" ")
+        };
+        assert_eq!(
+            flags(MapFlags::READ | MapFlags::WRITE, false),
+            "rd wr mr mw me"
+        );
+        assert_eq!(
+            flags(MapFlags::READ | MapFlags::EXEC, false),
+            "rd ex mr mw me"
+        );
+        assert_eq!(flags(MapFlags::USER, true), "sh mr mw me ms");
+        assert_eq!(
+            flags(MapFlags::READ | MapFlags::WRITE | MapFlags::USER, true),
+            "rd wr sh mr mw me ms"
+        );
     }
 
     /// An unnamed mapping is the prefix and the space a name would have
