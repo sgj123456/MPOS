@@ -1351,26 +1351,73 @@ pub use crate::abi::{CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOP
 /// zero through this door - measured (`.workbuddy/probe_sigchld_cputime.c`, Linux
 /// 7.2.9: `waitid` answers `0`/`0` for a child that burned 100 ms, where the same
 /// death through a `SIGCHLD` record is `si_utime` 9). A `SIGCHLD` *record* carries
-/// the CPU (`signal::SigInfo::child`); `waitid` does not. This function clears the
-/// whole record where Linux writes six words - the difference is only observable
-/// if the caller seeded the buffer with something else, and this side of it is
-/// the closer-to-harmless one, noted rather than papered over.
+/// the CPU (`signal::SigInfo::child`); `waitid` does not.
+///
+/// # Six words, in Linux's order, and no clear
+///
+/// Linux's `do_waitid` writes six `int`s one `put_user` at a time -
+/// `si_signo`, `si_errno`, `si_code`, `si_pid`, `si_uid`, `si_status` - and
+/// touches nothing else in the 128 bytes; `__pad0` at 12 and everything from 28
+/// on stay whatever the caller left there. This function does the same, which
+/// costs it a page check per word: the check is *per word* rather than for the
+/// record, and that is measurable, not cosmetic
+/// (`.workbuddy/probe_waitid_record.c`, Linux 7.2.9). A record whose second half
+/// is unmapped but whose six words all land is **accepted** (scenario X: `0`,
+/// record written), and a record whose *third* word straddles the boundary is
+/// `EFAULT` with the two words before it already written (scenario AG:
+/// `si_signo` 17, `si_errno` 0, `si_code` untouched). A whole-record check
+/// answers both of those the other way round.
+///
+/// The return is "every word landed": `false` is the caller's `EFAULT`.
+/// `docs/uapi/` §5.1 item 51.
 pub(crate) fn write_waitid_info(
     infop: usize,
     pid: u32,
     uid: u32,
     si_code: i32,
     status: i32,
-) -> isize {
-    unsafe {
-        core::ptr::write_bytes(infop as *mut u8, 0, SIGINFO_BYTES);
-        (infop as *mut i32).write_unaligned(SIGCHLD); // si_signo
-        ((infop + 8) as *mut i32).write_unaligned(si_code); // si_code
-        ((infop + 16) as *mut i32).write_unaligned(pid as i32); // si_pid
-        ((infop + 20) as *mut i32).write_unaligned(uid as i32); // si_uid
-        ((infop + 24) as *mut i32).write_unaligned(status); // si_status
+    from_user: bool,
+) -> bool {
+    put_siginfo_word(infop, SI_SIGNO, SIGCHLD, from_user)
+        && put_siginfo_word(infop, SI_ERRNO, 0, from_user)
+        && put_siginfo_word(infop, SI_CODE, si_code, from_user)
+        && put_siginfo_word(infop, SI_PID, pid as i32, from_user)
+        && put_siginfo_word(infop, SI_UID, uid as i32, from_user)
+        && put_siginfo_word(infop, SI_STATUS, status, from_user)
+}
+
+/// The same six words, all zero: the record a `waitid` leaves when it has no
+/// event to describe - a refusal, an interrupted wait, or `WNOHANG` with nothing
+/// yet - and `si_signo` included, because Linux's `signo` is zero unless the
+/// wait reported something.
+pub(crate) fn write_waitid_empty(infop: usize, from_user: bool) -> bool {
+    put_siginfo_word(infop, SI_SIGNO, 0, from_user)
+        && put_siginfo_word(infop, SI_ERRNO, 0, from_user)
+        && put_siginfo_word(infop, SI_CODE, 0, from_user)
+        && put_siginfo_word(infop, SI_PID, 0, from_user)
+        && put_siginfo_word(infop, SI_UID, 0, from_user)
+        && put_siginfo_word(infop, SI_STATUS, 0, from_user)
+}
+
+// The six offsets `waitid` writes, and the gap it leaves: `si_signo`,
+// `si_errno` and `si_code` open the record, `__pad0` at 12 is padding no store
+// reaches, and the `_sigchld` arm of the union holds the three that follow.
+const SI_SIGNO: usize = 0;
+const SI_ERRNO: usize = 4;
+const SI_CODE: usize = 8;
+const SI_PID: usize = 16;
+const SI_UID: usize = 20;
+const SI_STATUS: usize = 24;
+
+/// One word of the record, at one offset, refused rather than faulting when the
+/// caller's page is not writable - the per-word half of the note above.
+fn put_siginfo_word(infop: usize, offset: usize, value: i32, from_user: bool) -> bool {
+    let at = infop + offset;
+    if !crate::uaccess::buffer_ok(at, 4, true, from_user) {
+        return false;
     }
-    0
+    unsafe { (at as *mut i32).write_unaligned(value) };
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -3332,10 +3379,14 @@ mod tests {
     fn waitid_info_reports_the_child_the_siginfo_way() {
         let mut buf = [0u8; 128];
         let (code, status) = exit_chld(7, false);
-        assert_eq!(
-            write_waitid_info(buf.as_mut_ptr() as usize, 42, 1000, code, status),
-            0
-        );
+        assert!(write_waitid_info(
+            buf.as_mut_ptr() as usize,
+            42,
+            1000,
+            code,
+            status,
+            false
+        ));
         let word = |at: usize| i32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
         assert_eq!(word(0), 17); // si_signo: SIGCHLD
         assert_eq!(word(8), 1); // si_code: CLD_EXITED
@@ -3346,28 +3397,83 @@ mod tests {
         // Killed: the status is the signal number, the code says so.
         let mut buf2 = [0u8; 128];
         let (code, status) = exit_chld(-15, false);
-        assert_eq!(
-            write_waitid_info(buf2.as_mut_ptr() as usize, 5, 0, code, status),
-            0
-        );
+        assert!(write_waitid_info(
+            buf2.as_mut_ptr() as usize,
+            5,
+            0,
+            code,
+            status,
+            false
+        ));
         let word2 = |at: usize| i32::from_le_bytes(buf2[at..at + 4].try_into().unwrap());
         assert_eq!(word2(8), 2); // CLD_KILLED
         assert_eq!(word2(20), 0); // a root child's uid is zero, and is written
         assert_eq!(word2(24), 15);
-        // Everything else is zeroed, so no stale caller byte survives.
-        assert!(buf2[28..].iter().all(|&b| b == 0));
 
         // The third code: a core-dumping signal is `CLD_DUMPED`, and `si_status`
         // is still the signal's number - the same slot an exit spells a code in.
         let mut buf3 = [0u8; 128];
         let (code, status) = exit_chld(-11, true);
-        assert_eq!(
-            write_waitid_info(buf3.as_mut_ptr() as usize, 6, 0, code, status),
-            0
-        );
+        assert!(write_waitid_info(
+            buf3.as_mut_ptr() as usize,
+            6,
+            0,
+            code,
+            status,
+            false
+        ));
         let word3 = |at: usize| i32::from_le_bytes(buf3[at..at + 4].try_into().unwrap());
         assert_eq!(word3(8), 3); // CLD_DUMPED
         assert_eq!(word3(24), 11); // si_status: SIGSEGV
+    }
+
+    /// The record is six words and nothing else: a caller that seeded its buffer
+    /// reads its own bytes back from every other offset, including `__pad0` at
+    /// 12 and the whole tail from 28 on. Linux writes exactly this much, and the
+    /// difference is visible - a caller can tell "the kernel cleared my buffer"
+    /// from "the kernel filled six fields" (measured,
+    /// `.workbuddy/probe_waitid_record.c` scenarios S and AG, Linux 7.2.9).
+    #[test]
+    fn waitid_info_leaves_the_bytes_it_does_not_own() {
+        let mut buf = [0xAAu8; 128];
+        let (code, status) = exit_chld(7, false);
+        assert!(write_waitid_info(
+            buf.as_mut_ptr() as usize,
+            42,
+            1000,
+            code,
+            status,
+            false
+        ));
+        // The five words it writes, plus `si_errno` which it zeroes.
+        for (at, want) in [
+            (0usize, 17i32),
+            (4, 0),
+            (8, 1),
+            (16, 42),
+            (20, 1000),
+            (24, 7),
+        ] {
+            let got = i32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+            assert_eq!(got, want, "word at {at}");
+        }
+        // `__pad0` and everything from `si_status`'s end on: the caller's.
+        assert_eq!(buf[12..16], [0xAA; 4], "si_* pad at 12 is not a field");
+        assert!(
+            buf[28..].iter().all(|&b| b == 0xAA),
+            "the tail of the record is the caller's own memory"
+        );
+
+        // The no-event shape is the same six words, all zero - the difference
+        // between a refusal and a report is in the words, not in the reach.
+        let mut empty = [0xAAu8; 128];
+        assert!(write_waitid_empty(empty.as_mut_ptr() as usize, false));
+        for at in [0usize, 4, 8, 16, 20, 24] {
+            let got = i32::from_le_bytes(empty[at..at + 4].try_into().unwrap());
+            assert_eq!(got, 0, "word at {at}");
+        }
+        assert_eq!(empty[12..16], [0xAA; 4]);
+        assert!(empty[28..].iter().all(|&b| b == 0xAA));
     }
 
     /// The two event classes that are not a death, and the word each writes.
@@ -3383,7 +3489,14 @@ mod tests {
         // A `WSTOPPED` record: the stopping signal is the status, and the
         // child's uid rides beside its number.
         let mut stopped = [0u8; 128];
-        let _ = write_waitid_info(stopped.as_mut_ptr() as usize, 9, 1000, CLD_STOPPED, 19);
+        let _ = write_waitid_info(
+            stopped.as_mut_ptr() as usize,
+            9,
+            1000,
+            CLD_STOPPED,
+            19,
+            false,
+        );
         assert_eq!(word(&stopped, 0), 17);
         assert_eq!(word(&stopped, 8), 5);
         assert_eq!(word(&stopped, 16), 9);
@@ -3393,12 +3506,26 @@ mod tests {
         // The same shape under a tracer is a different code, not a different
         // record - which is why the handler chooses and this writes verbatim.
         let mut trapped = [0u8; 128];
-        let _ = write_waitid_info(trapped.as_mut_ptr() as usize, 9, 1000, CLD_TRAPPED, 19);
+        let _ = write_waitid_info(
+            trapped.as_mut_ptr() as usize,
+            9,
+            1000,
+            CLD_TRAPPED,
+            19,
+            false,
+        );
         assert_eq!(word(&trapped, 8), 4);
 
         // A resume: `SIGCONT` (18) is the status.
         let mut resumed = [0u8; 128];
-        let _ = write_waitid_info(resumed.as_mut_ptr() as usize, 9, 1000, CLD_CONTINUED, 18);
+        let _ = write_waitid_info(
+            resumed.as_mut_ptr() as usize,
+            9,
+            1000,
+            CLD_CONTINUED,
+            18,
+            false,
+        );
         assert_eq!(word(&resumed, 8), 6);
         assert_eq!(word(&resumed, 20), 1000);
         assert_eq!(word(&resumed, 24), 18);

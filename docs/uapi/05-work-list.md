@@ -2003,3 +2003,86 @@ the commit bodies), and each moved its pin in the same commit.
     naming - `the default wait returns the forked child, not the clone one` (only the forked child
     had exited yet), and the two that follow a claim which collected the fixture early (a cascade,
     not agreement).
+
+## item 51 — a wait's two writes sit where Linux's sit: the wait, the rusage, then the record
+
+    §5.2's entry, and the two corners item 34 measured and left unbuilt. Item 34 gave both wait
+    doors the caller's `struct rusage`; what it left was *where* the writes sit — relative to the
+    wait and to each other — and that is visible only to a caller that hands over a pointer the
+    kernel cannot write to. Linux's `do_waitid` collects (or refuses) inside `kernel_waitid`, copies
+    the `struct rusage` when — and only when — it has an event to report, and writes the six-word
+    `siginfo_t` **last**, on every path, with that copy's own `EFAULT` outranking whatever the wait
+    said. This door cleared the whole record up front, which produced exactly the two divergences
+    item 34 named: a bad `rusage` left *zeros* where Linux leaves the caller's own bytes, and a bad
+    record was `EFAULT` *before* the wait, so the child Linux collects was still here.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_waitid_record.c`, Linux 7.2.9, raw
+    `SYS_wait4`/`SYS_waitid`, every scenario in its own forked child, so no reap leaks into the
+    next):
+
+    * **P — a bad `rusage` on a ready death**: `EFAULT`, the record **untouched** (all `0xAA`), and
+      the child **collected** (the next wait is `ECHILD`);
+    * **Q — a bad record with a good `rusage`**: `EFAULT`, the rusage **filled**, the child
+      **collected** — the other half of the same order;
+    * **R — both bad**: `EFAULT` (the rusage's, being first), child collected;
+    * **S — the `EINVAL` for a word that asks for no event class**: the record's **six words
+      zeroed**, while `__pad0` at 12 and everything from 28 on stay the caller's `0xAA`. This is
+      what a 128-byte clear gets wrong, and what a caller can *see*;
+    * **T, U, AD — the same refusal with an unwritable record**: **`EFAULT`, not `EINVAL`** — for the
+      no-class word, for an unknown bit, and for an idtype this kernel does not serve;
+    * **V — `ECHILD` with an unwritable record**: **`EFAULT`** as well; **AE** — `ECHILD` with a
+      writable seeded record: `ECHILD`, six zeros written;
+    * **W — a null record**: accepted, `0`, and the child collected — the caller that wants only the
+      reap;
+    * **AC, AF — `WNOHANG` with nothing to report**: the zero, with the rusage untouched (AC) but
+      the record still written, so a bad one is `EFAULT` (AF). "Nothing yet" is not "nothing to
+      write";
+    * **AB — `EINVAL` with a bad rusage and a good record**: `EINVAL`, so the rusage is copied only
+      when an event was reported;
+    * **X — a record whose tail is unmapped** (64 bytes in the page, 64 past it): **`0`**, six words
+      written, the bytes from 28 to 64 untouched. A whole-record range check answers `EFAULT`;
+    * **AG — a record whose third word straddles the boundary**: `EFAULT` with `si_signo` 17 and
+      `si_errno` 0 **already written** and `si_code` untouched. The check is per word;
+    * **AH — a `rusage` straddling the boundary**: `EFAULT` with its mapped **head written** —
+      Linux's copy is a range copy (`copy_to_user`), not a check-then-write;
+    * **Z, AA — the `wait4` controls**: a bad `*status` is `EFAULT` with the rusage untouched and
+      the child collected, and a bad rusage is `EFAULT` with `*status` already written. That door
+      was already in this order, and the pair is what keeps the reds on the door that moved.
+
+    **The fix is a split and three writers.** `waitid_collect` does the word, the selector and the
+    collection and returns a `WaitIdAnswer` — an errno, plus the event when there is one — touching
+    no caller pointer; `handle_waitid` runs the two writers afterwards in Linux's order and lets the
+    record's `EFAULT` win over the answer, which is why `EINVAL` and `ECHILD` become `EFAULT` for a
+    record that cannot be written. `abi::write_waitid_info` and `write_waitid_empty` write the same
+    six words through one `put_siginfo_word`, which checks that word's own four bytes — that is what
+    makes X and AG come out right, and what a 128-byte `buffer_ok` cannot express — and touch
+    nothing else in the record. `write_rusage` builds its 144 bytes and hands them to
+    `sched::write_user`, the page-by-page copy that *is* Linux's `copy_to_user`; the old
+    range-check-then-write refused a straddling rusage whole, which was the same mistake one door
+    over.
+
+    Pins: `t-waitid` — **34 new claims** (102 in the file), every reachable one green on a current
+    host first (`MPOS_ON_HOST=1`, 95 of them; the seven it cannot make move a child's ids, which
+    needs a privilege, and none of the new ones does). Host unit tests: one per writer shape — the
+    six words, the untouched `__pad0` and tail, and the no-event zeros.
+
+    Gate: x86_64 `pass=183 fail=0 (183 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33; aarch64
+    `pass=182 fail=0 (182 built)`, kunit 32/0; both machines' `ok:` lines byte-identical for the
+    file (diffed, carriage returns aside).
+
+    Counterfactual, and it is sweep-only for the same reason item 50's was: with **both** writers put
+    back — the 128-byte clear and the whole-record `buffer_ok` in `handle_waitid`, and
+    `write_rusage`'s range-check-then-write — stage 1 is untouched (`565 passed; 0 failed`: the unit
+    tests pin the *writers'* shape, and that is not what moved), while the sweep is `pass=182 fail=1
+    (183 built)` with `FAIL t-waitid` and **eleven** red claims by name: `and leaves the record as
+    the caller wrote it, because the record is written last`, `with the rusage already filled,
+    because it is written first`, `and the child collected before either refusal`, `while the pad at
+    12 and the tail from 28 stay the caller's`, `a null record is accepted and answers 0`, `and it
+    collected the child`, `a record whose tail is unmapped is still written, because every word it
+    writes landed`, `with the child's own pid in it`, `with the words before it already written`,
+    `with its mapped head already written, because the copy is a range`, and `and the child collected
+    before that refusal too` — the last a cascade of the null-record refusal rather than a second
+    corner. Worth naming what *stays green* there: every precedence claim (`an unwritable record
+    outranks the refusal`, `and outranks ECHILD...`, and the `EINVAL`/`ECHILD` pairs) passes on the
+    old kernel too, because refusing *before* the wait still answers `EFAULT` — only "what happened
+    to the child" tells the two shapes apart, which is why those claims are the pin.

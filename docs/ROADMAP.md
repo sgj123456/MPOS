@@ -357,6 +357,22 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are TCP's record-only buffer sizes  
 (`SO_SNDBUF`/`SO_RCVBUF`); the two namespace kinds with no entry at all are IPC and cgroup.
 
+**A wait's two writes go where Linux's go — the wait, the rusage, then the record** (`docs/uapi/`  
+§5.1 item 51, landed 2026-10-18): item 34 gave both wait doors the caller's `struct rusage`; what it  
+left was *where* the writes sit, which only a caller with a pointer the kernel cannot write to can  
+see. Linux collects (or refuses) first, copies the rusage when it has an event to report, and writes  
+the six-word `siginfo_t` last on every path — so a bad pointer costs the caller its `EFAULT`  
+*after* the child is gone, a refusal still writes the record (six zeros, and nothing else: the pad  
+at 12 and every byte from 28 on stay the caller's), and the record's own `EFAULT` outranks `EINVAL`  
+and `ECHILD`. This door cleared 128 bytes up front and refused before the wait, which is exactly the  
+two divergences the entry named — a zeroed record where Linux leaves the caller's bytes, and a child  
+still uncollected. The handler is now a collector that touches no pointer plus two writers in  
+Linux's order; the record is written word by word (a record whose tail is unmapped is still served,  
+and one whose word straddles the boundary stops there with the words before it written), and the  
+rusage goes through the page-by-page copy that is `copy_to_user`, so a straddling one leaves its  
+head written. That door's `*status` was already in this order; `wait4`'s own four-byte word is the  
+one shape left named in `docs/uapi/` §5.2.
+
 **`__WCLONE` narrows a wait to the kind of child `clone` named** (`docs/uapi/` §5.1 item 50, landed  
 2026-10-18): `clone`'s low byte is the signal a child's death should report, and Linux reads it back  
 at the other end — a child born to report `SIGCHLD` and one born to report nothing or something else  

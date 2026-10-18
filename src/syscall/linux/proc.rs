@@ -678,20 +678,36 @@ fn write_wait_rusage(ptr: usize, cpu: (u64, u64), from_user: bool) -> Option<isi
 /// zeroing happens after it.
 fn write_rusage(usage: usize, utime: u64, stime: u64, from_user: bool) -> Option<isize> {
     const RUSAGE_BYTES: usize = 144; // 2 timevals + 14 longs
-    if !buffer_ok(usage, RUSAGE_BYTES, true, from_user) {
-        return Some(err::EFAULT);
-    }
     let hz = crate::hal::TICK_HZ as u64;
-    unsafe {
-        core::ptr::write_bytes(usage as *mut u8, 0, RUSAGE_BYTES);
-        let put = |off: usize, ticks: u64| {
-            ((usage + off) as *mut i64).write_unaligned((ticks / hz) as i64);
-            ((usage + off + 8) as *mut i64).write_unaligned(((ticks % hz) * 1_000_000 / hz) as i64);
-        };
-        put(0, utime); // ru_utime {sec, usec}
-        put(16, stime); // ru_stime {sec, usec}
-    }
-    None
+    // The record is built in wire form first and then copied out, because the
+    // copy is Linux's `copy_to_user`: a *range* copy that writes the pages it
+    // can and answers `EFAULT` for the one it cannot. A record that straddles
+    // into an unmapped page therefore leaves its mapped head written
+    // (measured, `.workbuddy/probe_waitid_record.c` scenario AH, Linux 7.2.9),
+    // where a check-then-write would refuse the whole thing and write nothing.
+    let mut wire = [0u8; RUSAGE_BYTES];
+    let secs = (utime / hz) as i64;
+    let usecs = ((utime % hz) * 1_000_000 / hz) as i64;
+    wire[0..8].copy_from_slice(&secs.to_le_bytes()); // ru_utime.tv_sec
+    wire[8..16].copy_from_slice(&usecs.to_le_bytes()); // ru_utime.tv_usec
+    let secs = (stime / hz) as i64;
+    let usecs = ((stime % hz) * 1_000_000 / hz) as i64;
+    wire[16..24].copy_from_slice(&secs.to_le_bytes()); // ru_stime.tv_sec
+    wire[24..32].copy_from_slice(&usecs.to_le_bytes()); // ru_stime.tv_usec
+
+    // `write_user` is that range copy: page by page, refusing a page it cannot
+    // have after writing the ones before it. The host build has no page tables
+    // and no user walk, so the tests' own memory is written directly - the same
+    // split `buffer_ok` makes, for the same reason.
+    let written = if from_user {
+        crate::sched::write_user(usage, &wire)
+    } else {
+        unsafe {
+            core::ptr::copy_nonoverlapping(wire.as_ptr(), usage as *mut u8, RUSAGE_BYTES);
+        }
+        true
+    };
+    if written { None } else { Some(err::EFAULT) }
 }
 
 // ---------------------------------------------------------------------------
@@ -4015,28 +4031,6 @@ pub(super) fn handle_clock_getres(args: [usize; ARG_COUNT]) -> isize {
 /// where `wait4` has by then already written `*status` (measured,
 /// `.workbuddy/probe_wait4_rusage.c` scenarios N and O, Linux 7.2.9).
 pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    use super::abi::{CLD_CONTINUED, CLD_STOPPED, CLD_TRAPPED, SIGINFO_BYTES};
-    use crate::sched::{WaitFor, WaitPark, signal};
-
-    const P_ALL: usize = 0;
-    const P_PID: usize = 1;
-    const P_PGID: usize = 2;
-    const WNOHANG: usize = 0x1;
-    const WSTOPPED: usize = 0x2;
-    const WEXITED: usize = 0x4;
-    const WCONTINUED: usize = 0x8;
-    const WNOWAIT: usize = 0x0100_0000;
-    const __WNOTHREAD: usize = 0x2000_0000;
-    const __WALL: usize = 0x4000_0000;
-    const __WCLONE: usize = 0x8000_0000;
-    /// Every bit Linux's own `waitid` accepts; anything else is an unknown
-    /// request rather than a request to ignore.
-    const KNOWN: usize =
-        WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WALL | __WCLONE;
-    /// The three classes of event a caller can ask to hear about. A call that
-    /// asks for none of them is refused rather than answered.
-    const CLASSES: usize = WEXITED | WSTOPPED | WCONTINUED;
-
     // `which`, `upid` and `options` are `int`s in Linux's signature
     // (`SYSCALL_DEFINE5(waitid, int, which, pid_t, upid, ...)`), so the upper
     // half of each register is not part of the argument - `wait4`'s note beside
@@ -4048,24 +4042,131 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         args[3] as u32 as usize,
     );
     let rusage = args[4];
-    if !buffer_ok(infop, SIGINFO_BYTES, true, from_user) {
-        return err::EFAULT;
+
+    // The wait first, the caller's memory second. Linux's `do_waitid` collects
+    // (or refuses) inside `kernel_waitid` and copies out afterwards, so the
+    // child is already gone when an `EFAULT` comes back, and a refusal that
+    // never reached a child still writes the record. Measured whole,
+    // `.workbuddy/probe_waitid_record.c`, Linux 7.2.9: P (a bad `rusage` still
+    // collects), Q (a bad record still fills the rusage and still collects),
+    // T/U/V/AD (a refusal still gets the record written).
+    let answer = waitid_collect(idtype, id, options);
+
+    // The rusage second, and only when something was *reported*: Linux guards
+    // its copy with "the wait returned an event", so `EINVAL`, `ECHILD` and the
+    // `WNOHANG` "nothing yet" leave the caller's struct alone (AB, AC, AE) while
+    // a reported death fills it *before* the record is touched - which is what
+    // leaves the record exactly as the caller wrote it when the rusage pointer
+    // is the one that cannot be written (P).
+    if let Some(reported) = &answer.reported {
+        if let Some(e) = write_wait_rusage(rusage, reported.cpu, from_user) {
+            return e;
+        }
     }
-    // Cleared first, refused second - Linux's order, measured: both of the
-    // refusals below leave a zeroed record behind rather than the caller's own
-    // seeded bytes.
-    unsafe {
-        core::ptr::write_bytes(infop as *mut u8, 0, SIGINFO_BYTES);
+
+    // The record last, on every path: a report writes the event, and a
+    // refusal, an interrupted wait and the `WNOHANG` zero write the same six
+    // words as zeros. Its own failure outranks the answer - Linux returns the
+    // copy's `EFAULT` whatever the wait said - so `EINVAL`, `ECHILD` and the
+    // "nothing yet" zero all become `EFAULT` when the record cannot be written
+    // (T, U, V, AD, AF), where this handler used to refuse up front and never
+    // write. A null record is "not interested" and legal: the caller that owns
+    // nothing but the reap (W).
+    if infop != 0 {
+        let written = match &answer.reported {
+            Some(reported) => abi::write_waitid_info(
+                infop,
+                wait_answer(reported.child) as u32,
+                reported.uid,
+                reported.si_code,
+                reported.status,
+                from_user,
+            ),
+            None => abi::write_waitid_empty(infop, from_user),
+        };
+        if !written {
+            return err::EFAULT;
+        }
     }
+    answer.code
+}
+
+/// What one `waitid` found, before any of the caller's memory is touched.
+///
+/// The two halves are independent, and keeping them apart is the whole of this
+/// item: a call that is *refused* still writes the record (as zeros), and a
+/// call that *reports* an event can still end in `EFAULT` from a pointer it
+/// cannot write. Returning the errno from the middle of the handler - which is
+/// what this door used to do - cannot express either.
+struct WaitIdAnswer {
+    /// What the door returns once the caller's pointers are served: zero for a
+    /// report and for `WNOHANG`'s "nothing yet", an errno for a refusal.
+    code: isize,
+    /// The event to describe, when something was collected.
+    reported: Option<Reported>,
+}
+
+impl WaitIdAnswer {
+    fn refused(errno: isize) -> Self {
+        Self {
+            code: errno,
+            reported: None,
+        }
+    }
+}
+
+/// One collected event, already in the vocabulary `siginfo_t` speaks.
+struct Reported {
+    child: TaskId,
+    si_code: i32,
+    status: i32,
+    uid: u32,
+    cpu: (u64, u64),
+}
+
+// `waitid`'s option word, and the two sets this kernel reads out of it.
+//
+// The four `P_*` idtypes are Linux's; `P_PIDFD` (3) is answered `EINVAL` and
+// named as a gap rather than guessed at, because this kernel has no pidfd
+// family to resolve a descriptor through (`docs/uapi/` §5.3).
+const P_ALL: usize = 0;
+const P_PID: usize = 1;
+const P_PGID: usize = 2;
+const WNOHANG: usize = 0x1;
+const WSTOPPED: usize = 0x2;
+const WEXITED: usize = 0x4;
+const WCONTINUED: usize = 0x8;
+const WNOWAIT: usize = 0x0100_0000;
+const __WNOTHREAD: usize = 0x2000_0000;
+const __WALL: usize = 0x4000_0000;
+const __WCLONE: usize = 0x8000_0000;
+/// Every bit Linux's own `waitid` accepts; anything else is an unknown request
+/// rather than a request to ignore.
+const KNOWN: usize =
+    WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WALL | __WCLONE;
+/// The three classes of event a caller can ask to hear about. A call that asks
+/// for none of them is refused rather than answered.
+const CLASSES: usize = WEXITED | WSTOPPED | WCONTINUED;
+
+/// The wait half of `waitid`: validate the word, resolve the selector, collect,
+/// and classify what came back - touching no caller pointer at all.
+///
+/// Split out of [`handle_waitid`] for exactly that reason: the two writers that
+/// do touch the caller run *after* this, in Linux's order, and a middle return
+/// here is an answer that still has to be recorded.
+fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
+    use super::abi::{CLD_CONTINUED, CLD_STOPPED, CLD_TRAPPED};
+    use crate::sched::{WaitFor, WaitPark, signal};
+
     if options & !KNOWN != 0 || options & CLASSES == 0 {
-        return err::EINVAL;
+        return WaitIdAnswer::refused(err::EINVAL);
     }
     let me = crate::sched::current();
     let sel = match idtype {
         P_ALL => WaitFor::Any,
         P_PID => match pid_task(id) {
             Some(id) => WaitFor::Pid(id),
-            None => return err::ECHILD,
+            None => return WaitIdAnswer::refused(err::ECHILD),
         },
         // A group is named by its leader's number, resolved the way
         // `setpgid`/`getpgid` resolve one; `0` is the caller's own group, and
@@ -4074,14 +4175,14 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         // here, so it reads as none of this caller's children.
         P_PGID => {
             if id < 0 {
-                return err::EINVAL;
+                return WaitIdAnswer::refused(err::EINVAL);
             }
             let group = if id == 0 {
                 crate::sched::current_pgid()
             } else {
                 match pid_task(id) {
                     Some(leader) => leader,
-                    None => return err::ECHILD,
+                    None => return WaitIdAnswer::refused(err::ECHILD),
                 }
             };
             WaitFor::Pgid(group)
@@ -4089,7 +4190,7 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         // `P_PIDFD` (3), and anything else: no pidfd family exists here, so no
         // descriptor can name a task, and an idtype outside the four Linux
         // defines is a request this kernel cannot read (`docs/uapi/` §5.3).
-        _ => return err::EINVAL,
+        _ => return WaitIdAnswer::refused(err::EINVAL),
     };
 
     let stops = options & WSTOPPED != 0;
@@ -4108,7 +4209,7 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     } else if crate::sched::has_matching_children(me, sel, kind) {
         match crate::sched::wait_child_event(me, sel, kind, stops, continues, nowait) {
             WaitPark::Event(event) => Some(event),
-            WaitPark::Interrupted => return err::EINTR,
+            WaitPark::Interrupted => return WaitIdAnswer::refused(err::EINTR),
             WaitPark::NoChild => None,
         }
     } else {
@@ -4118,13 +4219,16 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     let Some(event) = collected else {
         // Nothing to report, and the two "nothing"s are different answers:
         // `WNOHANG` on a child that has not done anything yet is the zero the
-        // caller polls for (with the record above left cleared), while a
-        // selector that matches no child at all is `ECHILD` - the wait could
-        // never be answered. `wait4` draws the line in the same place.
+        // caller polls for, while a selector that matches no child at all is
+        // `ECHILD` - the wait could never be answered. `wait4` draws the line
+        // in the same place.
         if no_hang && crate::sched::has_matching_children(me, sel, kind) {
-            return 0;
+            return WaitIdAnswer {
+                code: 0,
+                reported: None,
+            };
         }
-        return err::ECHILD;
+        return WaitIdAnswer::refused(err::ECHILD);
     };
 
     // The siginfo layout, and the `CLD_*` code each event class writes, are
@@ -4135,7 +4239,7 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     // death outlives its task slot, so the record it was collected from carries
     // the uid, while a stop or a resume names a child that is still in the
     // table and is asked through its identity. Linux fills it for all three
-    // (measured: `CLD_EXITED`, `CLD_STOPPED`, `CLD_TRACED` and `CLD_CONTINUED`
+    // (measured: `CLD_EXITED`, `CLD_STOPPED`, `CLD_TRAPPED` and `CLD_CONTINUED`
     // all report the child's real uid) and reports `cred->uid` - the real id,
     // not the effective one.
     let (child, si_code, status, uid, cpu) = match event {
@@ -4176,20 +4280,17 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
             (utime, stime),
         ),
     };
-    // The rusage goes first, which is Linux's order and not this handler's:
-    // its wrapper copies the struct and only then writes the record, so a caller
-    // whose `rusage` pointer cannot be written is answered `EFAULT` before the
-    // record is touched. The record has, however, been *cleared* above - mpos
-    // clears up front to get the refusal paths right - so the bytes that survive
-    // are zeros rather than the caller's own, the one visible difference this
-    // ordering leaves and the reason the clear is not simply moved here.
-    if let Some(e) = write_wait_rusage(rusage, cpu, from_user) {
-        return e;
+
+    WaitIdAnswer {
+        code: 0,
+        reported: Some(Reported {
+            child,
+            si_code,
+            status,
+            uid,
+            cpu,
+        }),
     }
-    // The child's number in the *caller's* namespace, the same answer `wait4`
-    // returns: a reader one level out sees the number it can use, and a reader
-    // inside the child's own namespace sees 1.
-    abi::write_waitid_info(infop, wait_answer(child) as u32, uid, si_code, status)
 }
 
 /// The real uid of a child that is still in the task table, for the two event

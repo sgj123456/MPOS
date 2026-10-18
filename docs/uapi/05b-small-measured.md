@@ -501,22 +501,70 @@ Section numbers are unchanged from the original `UAPI.md`.
   can see rather than silence. Owner: `arch/src/arch/aarch64/vectors.rs`'s `el0_sys`, whose own
   doc names each. `docs/notes/` §15.36.
 
-- **The two wait doors' validation order, and where a bad `rusage` pointer leaves the record.**
-  **Landed 2026-10-17** (`docs/uapi/` §5.1 item 34): both doors fill the caller's `struct rusage`
-  now, for every event they report. Two corners of that are Linux's shape and are *not* built, and
-  they are one sentence each because they are visible only to a caller that passes a pointer the
-  kernel cannot write to. (i) **`waitid` clears its `siginfo_t` before it waits**, where Linux
-  validates and writes at the end: with a bad `rusage` pointer this kernel leaves a *zeroed* record
-  where Linux leaves the caller's own bytes — the refusal itself (`EFAULT`, record untouched) is
-  right, only the record's contents differ. (ii) The same clearing means a bad `infop` is `EFAULT`
-  *before* the wait, where Linux waits first and refuses after: a caller that asks for an event with
-  an unwritable record gets its error either way, and in one of the two this kernel has not yet
-  collected the child Linux would have. Both come from clearing up front, which is what makes the
-  three refusal paths (§5.1 item 17) leave the zeroed record Linux leaves, so the fix is a
-  restructure of the record path rather than a line — named here rather than approximated. Owner:
-  `src/syscall/linux/proc.rs`'s `handle_waitid`. Measured: `.workbuddy/probe_wait4_rusage.c`
-  scenarios O (a bad `rusage` leaves the `siginfo_t` untouched, `0xAAAAAAAA`) and the same probe's
-  ordering finding for `wait4`'s `*status`.
+- **The two wait doors' writers sit where Linux's sit: the wait, then the rusage, then
+  the record — and a refusal writes the record too. Landed 2026-10-18** (`docs/uapi/`
+  §5.1 item 51). Item 34 gave both doors the caller's `struct rusage`; what it left was
+  *where* the writes sit relative to the wait and to each other, and that is visible only
+  to a caller that hands over a pointer the kernel cannot write to. Linux's `do_waitid`
+  collects (or refuses) inside `kernel_waitid`, copies the `struct rusage` when — and
+  only when — it has an event to report, and writes the six-word `siginfo_t` **last**, on
+  every path, with that copy's own `EFAULT` outranking whatever the wait said. This door
+  cleared the whole record up front, which made a bad `rusage` leave *zeros* where Linux
+  leaves the caller's bytes, and made a bad record refuse *before* the wait — so the child
+  Linux collects was still there. Measured whole on a current host first
+  (`.workbuddy/probe_waitid_record.c`, Linux 7.2.9, scenarios P–Z and AA–AH):
+
+  * **the wait comes first, and its child is gone by the time anything is refused**: a bad
+    `rusage` (P), a bad record (Q), both (R) and a *straddling* rusage (AH) all leave the
+    child collected — the second wait is `ECHILD`;
+  * **the rusage is copied only when something was reported**: `EINVAL` (AB) and the
+    `WNOHANG` "nothing yet" (AC) leave it untouched, where a reported death fills it
+    *before* the record is touched — which is why a bad `rusage` leaves a writable record
+    exactly as the caller wrote it (P: all `0xAA`);
+  * **the record is written on every path**: a report writes the event, and `EINVAL`
+    (S, AE for `ECHILD`), an interrupted wait and the `WNOHANG` zero write **six zeros** —
+    and nothing else, so `__pad0` at 12 and every byte from 28 on stay the caller's own
+    (S: `si_signo`/`si_errno`/`si_code`/`si_pid`/`si_uid`/`si_status` zero, the tail still
+    `0xAA`);
+  * **the record's refusal outranks the wait's**: `EINVAL` (T, U), `ECHILD` (V), a bad
+    idtype (AD) and the `WNOHANG` zero (AF) all answer **`EFAULT`** when the record cannot
+    be written — Linux writes the record after the wait and returns the write's error;
+  * **a null record is legal**, and collects (W) — the caller that wants only the reap;
+  * **the check is per word, not for the record**: a record whose *tail* is unmapped but
+    whose six words all land is written and answers 0 (X), and one whose third word
+    straddles the boundary is `EFAULT` with the two words before it already written
+    (AG: `si_signo` 17, `si_errno` 0, `si_code` untouched). A whole-record check answers
+    both the other way round;
+  * **the rusage is a range copy, and it shows**: one that straddles into the unmapped
+    page leaves its mapped head written and answers `EFAULT` (AH). This kernel refused the
+    whole range before writing a byte, which was the same mistake one door over and is why
+    the writer changed with the record's.
+
+  Implemented as a split, not a reordering: `waitid_collect` does the word, the selector
+  and the collection and returns a `WaitIdAnswer` (an errno, plus the event when there is
+  one), touching no caller pointer; `handle_waitid` then runs the two writers in Linux's
+  order and lets the last one's `EFAULT` win. `abi::write_waitid_info` /
+  `write_waitid_empty` write the six words through one `put_siginfo_word`, which checks
+  the word's own four bytes — that is what makes X and AG come out right — and
+  `write_rusage` builds the 144 bytes and hands them to `sched::write_user`, the page-by-
+  page copy Linux's `copy_to_user` is. Host unit tests: one per writer shape (the six
+  words, the untouched `__pad0` and tail, the no-event zeros).
+
+  Pin: `t-waitid`, **34 new claims** (102 in the file), every one of the reachable ones
+  green on a current host first (`MPOS_ON_HOST=1`, 95 of them; the other seven move a
+  child's ids, which needs a privilege, and none of the new ones does). Gate: x86_64
+  183/0, aarch64 182/0, kunit 32/0, both machines' `ok:` lines byte-identical.
+  Counterfactual (both writers put back): stage 1 unchanged at 565/0 — the unit tests pin the
+  writers' *shape*, and that is not what moved — and the sweep `182/1` with `FAIL t-waitid` and
+  **eleven** red claims by name. The precedence claims stay green there on purpose: refusing
+  *before* the wait still answers `EFAULT`, so only "what happened to the child" tells the two
+  shapes apart, and those are the claims that do.
+
+  Named, not built: `wait4`'s `*status` is still a whole-word `buffer_ok` before the write
+  (a four-byte word can straddle a page end only when the caller's pointer does, and
+  Linux's `put_user` faults atomically there — the same shape as AG, unmeasured on this
+  door); and the `si_uid` line `/proc/<pid>/status` prints is still the constant it always
+  was, which is item 50's leftover rather than this one's.
 
 - **A raised `RLIMIT_SIGPENDING` buys no room past the ring.** **Landed 2026-10-17** (`docs/uapi/`
   §5.1 item 35): the queue's bound is the resource now, in Linux's shape — the target user's total
