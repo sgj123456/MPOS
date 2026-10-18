@@ -12,6 +12,11 @@
 //! `inotify_rm_watch` retires a live wd (an unknown one is EINVAL, and the
 //! queue then says IGNORED).
 //!
+//! The read and write doors report `IN_ACCESS` and `IN_MODIFY` once per
+//! *call* however many iovecs or chunks the call took - a two-iovec `readv`
+//! or `writev` is one record, and so is a copy cut into 4 KiB chunks. Those
+//! claims live in the two sections at the end.
+//!
 //! # The raw door is the record layout
 //!
 //! rustix binds none of the family (clause (a)), so every call is
@@ -27,7 +32,9 @@ use rustix::fs::{
     AtFlags, CWD, Mode, OFlags, SeekFrom, copy_file_range, mkdirat, openat, seek, sendfile,
     unlinkat,
 };
-use rustix::io::{IoSliceMut, pread, read, readv, write};
+use rustix::io::{
+    IoSlice, IoSliceMut, ReadWriteFlags, pread, pwritev, pwritev2, read, readv, write, writev,
+};
 use rustix::pipe::{SpliceFlags, pipe, splice};
 
 const IN_ACCESS: u32 = 0x0001;
@@ -594,6 +601,146 @@ fn main() {
     let _ = unlinkat(CWD, "/tmp/ino-access", AtFlags::empty());
     let _ = std::fs::remove_dir("/tmp/ino-dir2");
     unsafe { libc::close(q2) };
+
+    // ------------------------------------------------------------------
+    // IN_MODIFY - the record a write of a watched file produces, one per
+    // call however many pieces the call took.
+    //
+    // Measured on a current host first (`.workbuddy/probe_inotify_modify.c`,
+    // Linux 7.2.11): a scalar write, a two-iovec
+    // writev/pwritev/pwritev2, a 10 KB sendfile (three chunks), a 10 KB
+    // copy_file_range and a pipe-to-file splice each answer exactly one
+    // IN_MODIFY on the file they wrote - not one per iovec or chunk. The
+    // source of a copy is read, not written, so it hears no IN_MODIFY; a
+    // write that moved nothing reports nothing; and a watch whose mask lacks
+    // the bit is not told.
+    // ------------------------------------------------------------------
+    let mod_path = "/tmp/ino-modify";
+    let mod_seed = openat(
+        CWD,
+        mod_path,
+        OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY,
+        Mode::from_bits_retain(0o644),
+    );
+    if let Ok(f) = &mod_seed {
+        let filler = [b'M'; 10000];
+        let _ = write(f, &filler);
+    }
+    drop(mod_seed);
+    let wmod = add_watch(q, mod_path, IN_MODIFY);
+    r.check("a watch for IN_MODIFY takes a wd", wmod >= 0);
+    // A second queue that did not ask for IN_MODIFY.
+    let q3 = init1(IN_NONBLOCK) as i32;
+    let _ = add_watch(q3, mod_path, IN_ACCESS);
+
+    let mw = openat(CWD, mod_path, OFlags::RDWR, Mode::empty());
+    r.check("the modify file opens for read-write", mw.is_ok());
+    if let Ok(f) = &mw {
+        let _ = drain(q, &mut buf);
+        let _ = drain(q3, &mut buf);
+        // The scalar door: one write, one record.
+        r.check("a write moved bytes", write(f, b"hello").is_ok());
+        r.check(
+            "a plain write reports one IN_MODIFY",
+            count_mask(q, IN_MODIFY) == 1,
+        );
+        // A vectored write is one write of the file, so one record.
+        let (a, b2) = ([b'o'; 4], [b't'; 4]);
+        let iov = [IoSlice::new(&a), IoSlice::new(&b2)];
+        r.check("a two-iovec writev moved bytes", writev(f, &iov).is_ok());
+        r.check(
+            "a two-iovec writev reports one IN_MODIFY",
+            count_mask(q, IN_MODIFY) == 1,
+        );
+        let iov2 = [IoSlice::new(&a), IoSlice::new(&b2)];
+        r.check(
+            "a two-iovec pwritev moved bytes",
+            pwritev(f, &iov2, 100).is_ok(),
+        );
+        r.check(
+            "a two-iovec pwritev reports one IN_MODIFY",
+            count_mask(q, IN_MODIFY) == 1,
+        );
+        let iov3 = [IoSlice::new(&a), IoSlice::new(&b2)];
+        r.check(
+            "a two-iovec pwritev2 moved bytes",
+            pwritev2(f, &iov3, 200, ReadWriteFlags::empty()).is_ok(),
+        );
+        r.check(
+            "a two-iovec pwritev2 reports one IN_MODIFY",
+            count_mask(q, IN_MODIFY) == 1,
+        );
+        // A zero-length write moves nothing.
+        r.check("a zero-length write is a no-op", write(f, b"").is_ok());
+        r.check(
+            "a zero-length write reports nothing",
+            count_mask(q, IN_MODIFY) == 0,
+        );
+        // The filter: a queue that did not ask for IN_MODIFY is not told.
+        r.check(
+            "a watch that did not ask for IN_MODIFY is not told",
+            count_mask(q3, IN_MODIFY) == 0,
+        );
+    }
+    drop(mw);
+
+    // The copy doors' write side: a destination file watched for IN_MODIFY.
+    // Each copy is 10 KB, so each takes three 4 KiB chunks - and each reports
+    // one record, on the destination rather than the source.
+    let dst_path = "/tmp/ino-modify-dst";
+    let dst_seed = openat(
+        CWD,
+        dst_path,
+        OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY,
+        Mode::from_bits_retain(0o644),
+    );
+    drop(dst_seed);
+    let wdst = add_watch(q, dst_path, IN_MODIFY);
+    r.check("the destination watch takes a wd", wdst >= 0);
+    let src = openat(CWD, mod_path, OFlags::RDONLY, Mode::empty());
+    let dst = openat(CWD, dst_path, OFlags::WRONLY, Mode::empty());
+    if let (Ok(s), Ok(d)) = (&src, &dst) {
+        let _ = drain(q, &mut buf);
+        r.check(
+            "a 10 KB sendfile moved bytes",
+            sendfile(d, s, None, 10000) == Ok(10000),
+        );
+        r.check(
+            "a 10 KB sendfile reports one IN_MODIFY",
+            count_mask(q, IN_MODIFY) == 1,
+        );
+        let mut oi = 0u64;
+        let mut oo = 0u64;
+        r.check(
+            "a 10 KB copy_file_range moved bytes",
+            copy_file_range(s, Some(&mut oi), d, Some(&mut oo), 10000) == Ok(10000),
+        );
+        r.check(
+            "a 10 KB copy_file_range reports one IN_MODIFY on the destination",
+            count_mask(q, IN_MODIFY) == 1,
+        );
+        if let Ok((pr, pw)) = pipe() {
+            let mut soff = 0u64;
+            r.check(
+                "the file-to-pipe splice moved bytes",
+                splice(s, Some(&mut soff), &pw, None, 10000, SpliceFlags::empty()) == Ok(10000),
+            );
+            let mut doff = 0u64;
+            r.check(
+                "a pipe-to-file splice moved bytes",
+                splice(&pr, None, d, Some(&mut doff), 10000, SpliceFlags::empty()) == Ok(10000),
+            );
+            r.check(
+                "a pipe-to-file splice reports one IN_MODIFY",
+                count_mask(q, IN_MODIFY) == 1,
+            );
+        }
+    }
+    drop(src);
+    drop(dst);
+    let _ = unlinkat(CWD, dst_path, AtFlags::empty());
+    let _ = unlinkat(CWD, mod_path, AtFlags::empty());
+    unsafe { libc::close(q3) };
 
     // The queues of this test's directories are gone with the dirs.
     let _ = std::fs::remove_dir("/tmp/ino-dir");

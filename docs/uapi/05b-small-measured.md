@@ -979,6 +979,27 @@ Section numbers are unchanged from the original `UAPI.md`.
   (`notice_access`, the single call-site helper the three read doors and the three copy doors
   ask) over `vfs::inotify::emit_access`. Pin: `t-inotify`'s 22 new claims (24 → 46) beside the
   host unit test `emit_access_reports_a_read_only_to_a_watch_that_asked`; item 60 carries the
-  gates and the counterfactual. One shape stays named: a *write* made by
-  `copy_file_range`/`splice` is still invisible to `IN_MODIFY` (both write through
-  `Inode::write_at`, below the reporting chokepoint).
+  gates and the counterfactual. The one shape it named as still open — a *write* made by a copy
+  door was invisible to `IN_MODIFY` — is closed by the entry below (item 61).
+
+- **A write of a watched file reports `IN_MODIFY` once per call — the write half of the record
+  above. Landed 2026-10-19** (`docs/uapi/` §5.1 item 61). The entry item 60 named as still open:
+  a `copy_file_range` or a pipe→file `splice` wrote through `Inode::write_at`, below the
+  `File::write` chokepoint that reports, so a watcher on the destination heard nothing — and the
+  `File::write` comment claiming every copy door reached it "so the event is said once" was
+  simply false. Measuring on a current host first (`.workbuddy/probe_inotify_modify.c`, Linux
+  7.2.11) found the rule is the one `IN_ACCESS` already follows — *one `IN_MODIFY` per call
+  however many pieces carried it*: a two-iovec `writev`/`pwritev`/`pwritev2` reports **one**, and
+  so does a 10 KB `sendfile` (three 4 KiB chunks), a 10 KB `copy_file_range` and a pipe→file
+  `splice`; the source of a copy is read and hears none; a zero-length write moves nothing; and a
+  watch whose mask lacks the bit is not told. Only the scalar `write`/`pwrite` doors already
+  reported correctly, through `File::write`. The fix is a `write_quiet` on `File`
+  (`write_reporting(buf, false)` — `remove_privs` still runs, only the report is held) that the
+  vectored and copy doors write their call through, each saying the one event itself from the
+  syscall layer's `notice_modify(fd)`, the mirror of `notice_access`: the `handle_writev` wrapper
+  (whose body moved to `writev_inner`, so `writev`/`pwritev`/`pwritev2` share it), and
+  `handle_sendfile`/`handle_copy_file_range`/`handle_splice` (the last only when its output is
+  not a pipe). Pin: `t-inotify` grows **21 claims** (46 → 67) beside the host unit test
+  `write_quiet_moves_bytes_without_reporting_modify`; item 61 carries the gates and the
+  counterfactual. The module's other two departures — `IN_UNMOUNT`, and a watched directory's
+  `IN_MOVE_SELF` — are unchanged.

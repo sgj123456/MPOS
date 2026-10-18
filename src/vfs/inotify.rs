@@ -29,6 +29,14 @@
 //! half a lie; the ext4 read path has since grown the `relatime` bump, and
 //! a read *is* an access whatever the inode's stored time then says.)
 //!
+//! [`IN_MODIFY`] rides the same rule on the write side. The scalar
+//! `write`/`pwrite` doors reach `File::write`, which reports; the vectored
+//! and copy doors write their call in pieces and report the one event from
+//! the syscall layer instead, so a two-iovec `writev` or a three-chunk
+//! `copy_file_range` is one record and not two or three - Linux's
+//! `fsnotify_modify`, once per call (measured,
+//! `.workbuddy/probe_inotify_modify.c`).
+//!
 //! The deliberate departures from Linux that remain, each visible from
 //! userland: `IN_UNMOUNT` is not emitted (unmount does not track watches; a
 //! stale one simply stops matching); a watched directory's `IN_MOVE_SELF`
@@ -748,9 +756,11 @@ pub fn emit_child(dir: &Arc<dyn Inode>, mask: u32, name: &str, child_is_dir: boo
     emit_rec(key_of(dir), mask, name, 0, child_is_dir);
 }
 
-/// Report a data change with the inode's own key already in hand - the
-/// `File::write` chokepoint has the inode, and taking its key is the whole
-/// cost.
+/// Report a data change, `IN_MODIFY`. The scalar `write`/`pwrite` doors reach
+/// it from `File::write`, which has the inode in hand; the vectored and copy
+/// doors call it once per *call* from the syscall layer's `notice_modify`,
+/// because Linux reports one `fsnotify_modify` per call and not per iovec or
+/// chunk (measured, `.workbuddy/probe_inotify_modify.c`).
 pub fn emit_write(inode: &Arc<dyn Inode>) {
     emit(inode, IN_MODIFY, "");
 }
@@ -1253,6 +1263,40 @@ mod tests {
         assert!(
             !other.pending(),
             "a watch that did not ask for IN_ACCESS stays silent"
+        );
+    }
+
+    /// `write_quiet` moves the bytes and advances the cursor exactly as `write`
+    /// does, and differs only in the report: `write` queues the one `IN_MODIFY`
+    /// a watcher hears, `write_quiet` leaves the queue empty. The vectored and
+    /// copy doors write their call through it and report the one event
+    /// themselves (`notice_modify`), so what is pinned here is that the pieces
+    /// of a single call do not each report.
+    #[test]
+    fn write_quiet_moves_bytes_without_reporting_modify() {
+        let (node, instance) = instance_node();
+        let file_inode = crate::vfs::ramfs::RamFs::new()
+            .root()
+            .create("writable", NodeKind::File)
+            .unwrap();
+        add_watch(&node, node.metadata().ino, key_of(&file_inode), IN_MODIFY);
+        let file = crate::vfs::File::new(file_inode.clone());
+
+        assert_eq!(file.write(b"one").unwrap(), 3);
+        assert!(instance.pending(), "a plain write reports IN_MODIFY");
+        let mut buf = [0u8; 16];
+        assert_eq!(instance.read_at(0, &mut buf).unwrap(), 16);
+        assert_eq!(
+            u32::from_ne_bytes(buf[4..8].try_into().unwrap()),
+            IN_MODIFY,
+            "the record is the modify the watcher asked for"
+        );
+
+        assert_eq!(file.write_quiet(b"two").unwrap(), 3);
+        assert_eq!(file_inode.metadata().size, 6, "the quiet write still wrote");
+        assert!(
+            !instance.pending(),
+            "a quiet write reports nothing; its door says the one event"
         );
     }
 

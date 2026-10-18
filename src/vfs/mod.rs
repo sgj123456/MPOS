@@ -91,7 +91,7 @@ pub mod tty;
 #[cfg(target_os = "none")]
 pub mod vcmux;
 
-pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write};
+pub use file::{File, RawFd, close, dup2, open, open_inode, open_opt, read, write, write_quiet};
 pub use mount::{
     fs_serving_inode_of, global, is_mount_point, mount, mount_root, pivot_root, resolve,
     resolve_at, resolve_entry_at, resolve_no_follow_at, resolve_parent_at, unmount,

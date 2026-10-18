@@ -2758,3 +2758,67 @@ the commit bodies), and each moved its pin in the same commit.
     `IN_UNMOUNT` and a watched directory's `IN_MOVE_SELF` remain the two named departures the
     module header keeps.
 
+## item 61 — a write of a watched file reports `IN_MODIFY`, once per call
+
+    Item 60's own named residual, and the write half of the same rule. The entry it closes: a
+    `copy_file_range` or a pipe→file `splice` moved bytes through `Inode::write_at`, *below*
+    `File::write` — the one chokepoint that reports `IN_MODIFY` — so a watcher on the
+    destination heard nothing at all, and the `File::write` comment claiming every
+    `write`/`writev`/`pwrite`/`splice`/`copy` handler reached it "so the event is said once" was
+    false for two of them.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_inotify_modify.c`, Linux
+    7.2.11, one scenario per forked child with its own queue). The rule turned out to be
+    exactly the one `IN_ACCESS` already follows — *one `IN_MODIFY` per successful write-family
+    or copy call, however many pieces the call wrote*:
+
+    * **U — the scalar door**: `write` reports one, and one only;
+    * **R, S, T — a vectored write is *one* write**: a two-iovec `writev`, `pwritev` and
+      `pwritev2` each report **one** `IN_MODIFY`, not one per iovec;
+    * **O — `sendfile` counts per *call*, not per chunk**: a 10 KB copy (three 4 KiB chunks)
+      reports one on the destination, the same as an 8-byte one;
+    * **N — `copy_file_range` likewise**: one on the destination at both sizes, and **Q** — the
+      *source* of the copy, being read and not written, reports none;
+    * **P — a pipe→file `splice`**: one on the output file, at both sizes.
+
+    **The fix is one quiet write and one symmetric helper.** `File::write` splits into
+    `write_reporting(buf, report)`; `write_quiet` is the `report = false` form — `remove_privs`
+    still runs (a set-id file is still stripped), only the `IN_MODIFY` is held — and
+    `vfs::write_quiet(fd, buf)` is its free-function form. The vectored and copy doors write
+    their whole call through it and say the one event themselves, from
+    `syscall::linux::fs::file::notice_modify(fd)` — the mirror of item 60's `notice_access`:
+    it looks the description up and reports `emit_write` on its inode. The call sites are the
+    `handle_writev` wrapper, whose body moved to `writev_inner` so `writev`/`pwritev`/
+    `pwritev2` share one report, and `handle_sendfile`/`handle_copy_file_range`/`handle_splice`
+    (the last only when its output is not a pipe — the input-pipe case is item 60's
+    `IN_ACCESS`). The scalar `write`/`pwrite` doors are untouched: they reach `File::write`,
+    which already reports once, and `notice_modify` is not called near them. The `File::write`
+    comment is corrected, and the inotify header and `emit_write` doc now name the rule.
+
+    Pin: `t-inotify` grows **21 claims** (46 → 67): the mask filter, the scalar write, a
+    two-iovec `writev`/`pwritev`/`pwritev2` each reporting one, a zero-length write reporting
+    nothing, and a 10 KB `sendfile`/`copy_file_range`/pipe→file-`splice` each reporting one on
+    the destination. Every one is Linux's answer, so `MPOS_ON_HOST=1` is the measurement: 67 of
+    67 on this host first, and the sweep is the pin. Plus the host unit test
+    `write_quiet_moves_bytes_without_reporting_modify`, which pins that a quiet write still
+    moves the bytes and advances the cursor and reports nothing.
+
+    Gate: x86_64 `pass=186 fail=0 (186 built)`, `mpos-kunit 32 passed, 0 failed`, exit 0 (186
+    staged, 11 left out by `tests.toml`); aarch64 `pass=185 fail=0`, `mpos-kunit 32 passed, 0
+    failed`, exit 0 (185 staged, 12 left out); and the program's 67 `ok:` lines are
+    byte-identical across the two machines (diffed, carriage returns aside).
+
+    Counterfactual, sweep-only for the same reason as item 60's (the unit test calls
+    `write_quiet` directly and never reaches a door): with `notice_modify` made a no-op (every
+    call site kept, the unit test still calling `write_quiet`), stage 1 is untouched — `573
+    passed; 0 failed` — and the sweep is `pass=185 fail=1 (186 built)` with `FAIL t-inotify`
+    and **six** red claims by name, one per door that reports: `a two-iovec writev reports one
+    IN_MODIFY`, `a two-iovec pwritev reports one IN_MODIFY`, `a two-iovec pwritev2 reports one
+    IN_MODIFY`, `a 10 KB sendfile reports one IN_MODIFY`, `a 10 KB copy_file_range reports one
+    IN_MODIFY on the destination`, and `a pipe-to-file splice reports one IN_MODIFY`. The
+    controls — the scalar `a plain write reports one IN_MODIFY`, the zero-length write and the
+    wrong-mask watch — stay green, which keeps the reds on the emit rather than on the write.
+
+    Nothing new is left named for the write side; the module's other two departures
+    (`IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`) are unchanged.
+

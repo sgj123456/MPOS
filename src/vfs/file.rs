@@ -437,7 +437,31 @@ impl File {
             .load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Write at the description's cursor, advancing it.
+    ///
+    /// Reports the `IN_MODIFY` a watcher on the file hears: one write is one
+    /// event. Doors that write their call in several pieces (a vectored write,
+    /// a copy cut into chunks) call [`Self::write_quiet`] instead and report
+    /// the single event themselves.
     pub fn write(&self, buf: &[u8]) -> VfsResult<usize> {
+        self.write_reporting(buf, true)
+    }
+
+    /// [`Self::write`] with the `IN_MODIFY` report suppressed.
+    ///
+    /// The vectored and copy doors write their whole call through this and say
+    /// the one event themselves, because Linux's `fsnotify_modify` is once per
+    /// *call* however many iovecs or chunks it wrote - measured on a current
+    /// host (`.workbuddy/probe_inotify_modify.c`): a two-iovec `writev`/
+    /// `pwritev`/`pwritev2`, a 10 KB `copy_file_range` (three chunks),
+    /// `sendfile` and a pipe-to-file `splice` each answer exactly one record,
+    /// where the same kernel reports one *per* iovec when the pieces are
+    /// separate calls.
+    pub(crate) fn write_quiet(&self, buf: &[u8]) -> VfsResult<usize> {
+        self.write_reporting(buf, false)
+    }
+
+    fn write_reporting(&self, buf: &[u8], report: bool) -> VfsResult<usize> {
         // Wrong-mode first, as for `read`: Linux answers a `write(2)` on an
         // `O_RDONLY` descriptor with `EBADF`, including for a zero-length write.
         self.check_writable()?;
@@ -467,10 +491,10 @@ impl File {
         };
         let n = self.inode.write_at_client(pos, buf, self.ofd())?;
         self.pos.fetch_add(n as u64, Ordering::Relaxed);
-        // The one IN_MODIFY chokepoint of the userland write paths: every
-        // write/writev/pwrite/splice/copy handler reaches the inode through
-        // here, so the event is said once. Kernel-internal writers that must
-        // not report (the rename copy) call `Inode::write_at` directly.
+        // `remove_privs` on every write that moved bytes, and the `IN_MODIFY`
+        // report unless the calling door owns the one event of its whole call
+        // (`report = false` above). Kernel-internal writers that must report
+        // nothing at all (the rename copy) call `Inode::write_at` directly.
         if n > 0 {
             // Bytes moved, so the set-id bits go unless `CAP_FSETID` spares
             // them - Linux's `file_remove_privs`, and the reason a set-uid
@@ -480,7 +504,9 @@ impl File {
             // (`.workbuddy/probe_suid_write.c`), a zero-length write leaves
             // `4755` where a one-byte one stores `0755`.
             crate::vfs::remove_privs(&self.inode);
-            crate::vfs::inotify::emit_write(&self.inode);
+            if report {
+                crate::vfs::inotify::emit_write(&self.inode);
+            }
         }
         Ok(n)
     }
@@ -912,6 +938,13 @@ pub fn read(fd: RawFd, buf: &mut [u8]) -> VfsResult<usize> {
 /// Write at the description's cursor, advancing it.
 pub fn write(fd: RawFd, buf: &[u8]) -> VfsResult<usize> {
     current_table().get(fd)?.write(buf)
+}
+
+/// [`write`] with the `IN_MODIFY` report suppressed, for a door that writes its
+/// whole call in several pieces and reports the one event itself. See
+/// [`File::write_quiet`].
+pub fn write_quiet(fd: RawFd, buf: &[u8]) -> VfsResult<usize> {
+    current_table().get(fd)?.write_quiet(buf)
 }
 
 /// Release an fd, in the caller's own table.

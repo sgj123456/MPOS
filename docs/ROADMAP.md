@@ -510,8 +510,24 @@ nothing for a read at EOF, a zero-length read, a failed read, a directory read, 
 fault, and `IN_MODIFY` (no `IN_ACCESS`) for the pipe→file `splice`. The owner is the syscall layer  
 (`syscall::linux::fs::file::notice_access`, one helper the three read doors and the three copy doors  
 ask) over `vfs::inotify::emit_access`; pinned by `t-inotify`'s 22 new claims (24 → 46, byte-identical  
-on both machines) beside the host unit test. One shape stays named in `docs/uapi/` §5.2: a write made  
-by `copy_file_range`/`splice` is still invisible to `IN_MODIFY`.
+on both machines) beside the host unit test. The shape it named as still open — a write made by  
+`copy_file_range`/`splice` invisible to `IN_MODIFY` — is closed by item 61 below.
+
+**A write of a watched file reports `IN_MODIFY`, once per call** (`docs/uapi/` §5.1 item 61, landed  
+2026-10-19): the write half of the same rule, and item 60's own named residual. A `copy_file_range`  
+or a pipe→file `splice` wrote through `Inode::write_at`, below the `File::write` chokepoint that  
+reports, so a watcher on the destination heard nothing — and the `File::write` comment claiming every  
+copy door reached it "so the event is said once" was false for two of them. Measured whole on a  
+current host first (`.workbuddy/probe_inotify_modify.c`, Linux 7.2.11): one `IN_MODIFY` per call,  
+however many pieces carried it — a two-iovec `writev`/`pwritev`/`pwritev2` reports one (not per  
+iovec), a 10 KB `sendfile` (three chunks) one, a 10 KB `copy_file_range` one on the destination while  
+its source reports none, and a pipe→file `splice` one. The fix is a `write_quiet` on `File`  
+(`remove_privs` still runs, only the report is held) the vectored and copy doors write their call  
+through, each saying the one event itself from the syscall layer's `notice_modify(fd)`, the mirror of  
+`notice_access` (`handle_writev`, its body moved to `writev_inner`, plus `handle_sendfile`,  
+`handle_copy_file_range`, `handle_splice` when the output is not a pipe). Pinned by `t-inotify`'s 21  
+new claims (46 → 67, byte-identical on both machines) beside the host unit test. The module's other  
+two departures (`IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`) stay named in `docs/uapi/` §5.2.
 
 **The `F_GETFL` word is the caller's own** (`docs/uapi/` §5.1 item 49, landed 2026-10-18): Linux  
 answers `filp->f_flags`, so a caller that compares the word against what it opened with agrees — its  

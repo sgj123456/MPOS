@@ -2435,7 +2435,7 @@ pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isiz
         if n == 0 {
             break;
         }
-        let w = match out.write(&chunk[..n]) {
+        let w = match out.write_quiet(&chunk[..n]) {
             Ok(w) => w,
             Err(e) => {
                 if sent > 0 {
@@ -2463,6 +2463,12 @@ pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     // rather than a read door, so nothing else here reports it.
     if sent > 0 {
         super::fs::notice_access(in_fd);
+        // The destination was written, so a watcher on it hears `IN_MODIFY`,
+        // also once per call - measured, `.workbuddy/probe_inotify_modify.c`
+        // scenario O (a 10 KB sendfile is three chunks and one record). The
+        // chunks are written through `write_quiet` so they do not each report
+        // their own, and the one event is said here.
+        super::fs::notice_modify(out_fd);
     }
     sent as isize
 }

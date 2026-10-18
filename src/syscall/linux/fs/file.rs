@@ -3560,6 +3560,19 @@ pub(crate) fn notice_access(fd: i32) {
     }
 }
 
+/// Report `IN_MODIFY` for a descriptor whose write moved bytes - the write-side
+/// twin of [`notice_access`], and the same shape for the same reason: Linux's
+/// `fsnotify_modify` is once per successful write-family or copy call, so a
+/// door that writes chunk by chunk (a vectored write, a copy) writes through
+/// [`crate::vfs::write_quiet`] and says the one event here when it is done.
+/// The scalar `write`/`pwrite` doors reach `File::write`, which reports on its
+/// own, so they do not call this.
+pub(crate) fn notice_modify(fd: i32) {
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        crate::vfs::inotify::emit_write(&file.inode());
+    }
+}
+
 /// `read(2)` — read up to `buf.len()` bytes from `fd` into `buf`.
 pub fn handle_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, buf, len) = (args[0], args[1], args[2]);
@@ -3996,6 +4009,21 @@ pub fn handle_fchdir(args: [usize; ARG_COUNT]) -> isize {
 
 /// `writev(fd, iov, iovcnt)` — scatter write.
 pub fn handle_writev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let fd = args[0] as i32;
+    let n = writev_inner(args, from_user);
+    // One `IN_MODIFY` for the whole call, not one per iovec: Linux reports a
+    // write, and a vectored write is one however many iovecs carried it
+    // (measured, `.workbuddy/probe_inotify_modify.c` - a two-iovec `writev`
+    // answers one record). This is also the body `pwritev`/`pwritev2` run
+    // through, so all three get it once, and the inner writes run through
+    // `write_quiet` so they do not each report their own.
+    if n > 0 {
+        notice_modify(fd);
+    }
+    n
+}
+
+fn writev_inner(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, iov_ptr, iov_cnt) = (args[0] as i32, args[1], args[2]);
     if iov_cnt > 1024 {
         return err::EINVAL;
@@ -4046,7 +4074,7 @@ pub fn handle_writev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             continue;
         }
         let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-        match crate::vfs::write(fd, bytes) {
+        match crate::vfs::write_quiet(fd, bytes) {
             Ok(n) => total += n as isize,
             Err(e) => {
                 if total > 0 {
@@ -5655,6 +5683,12 @@ pub fn handle_copy_file_range(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     // per call, as Linux's `vfs_copy_file_range` reports it.
     if copied > 0 {
         notice_access(in_fd);
+        // And the destination was written, so a watcher on it hears
+        // `IN_MODIFY`, also one per call however many chunks the copy took -
+        // measured, `.workbuddy/probe_inotify_modify.c` scenario N. Emitted
+        // here because the copy writes through `Inode::write_at` and never
+        // reaches `File::write`, the write doors' reporter.
+        notice_modify(out_fd);
     }
     copied as isize
 }
@@ -6354,12 +6388,22 @@ pub fn handle_splice(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     }
     splice_finish(&input, off_in, pos_in, from_user);
     splice_finish(&output, off_out, pos_out, from_user);
-    // Only the file→pipe direction reads a file: the input side being a pipe
-    // means the file (if any) is the *output*, written rather than read, and
-    // Linux reports `IN_MODIFY` there, not `IN_ACCESS`. Measured both ways -
-    // `.workbuddy/probe_inotify_access.c` scenarios K and M.
-    if moved > 0 && !in_is_pipe {
-        notice_access(in_fd);
+    // A file on the *input* side was read, so a watcher on it hears
+    // `IN_ACCESS`; a file on the *output* side was written, so a watcher on it
+    // hears `IN_MODIFY` - one record per call either way. At most one side is
+    // a file, because a splice needs a pipe on one end (two pipes is the
+    // pipe-to-pipe move, which reports nothing). Measured both directions in
+    // `.workbuddy/probe_inotify_access.c` scenarios K and M, and the write
+    // side again in `.workbuddy/probe_inotify_modify.c` scenario P. The write
+    // goes through `Inode::write_at`, below `File::write`'s reporter, so the
+    // one `IN_MODIFY` is said here.
+    if moved > 0 {
+        if !in_is_pipe {
+            notice_access(in_fd);
+        }
+        if !out_is_pipe {
+            notice_modify(out_fd);
+        }
     }
     moved as isize
 }
