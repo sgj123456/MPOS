@@ -419,6 +419,46 @@ pub fn controlling_tty_of_current() -> Option<(u32, u32)> {
     with_table(|t| t.task(t.current).ctty)
 }
 
+/// Whether the running task leads its own session.
+///
+/// The session field names the leader, so a leader is the task whose own id it
+/// is - the identity [`become_session_leader`] writes. `TIOCNOTTY` asks it
+/// because the two askers are answered differently: the leader gives up the
+/// session's terminal, and anybody else gives up only its own record of it.
+pub fn current_is_session_leader() -> bool {
+    with_table(|t| {
+        let me = t.current;
+        t.task(me).session == me
+    })
+}
+
+/// Hand the running task's controlling terminal back.
+///
+/// `TIOCNOTTY` has two shapes, and Linux tells them apart by who asks. A
+/// session leader gives up the *session's* terminal: every task still naming it
+/// loses the name - which is what makes the whole session's `/dev/tty` stop
+/// opening - and the terminal itself is left with no foreground group. Any
+/// other task gives up only its own record, and the session keeps the line.
+///
+/// Both halves are measurements, not readings of `tty_ioctl` (a current host,
+/// `.workbuddy/probe_tty_notty.c`): a child's `TIOCNOTTY` leaves the leader's
+/// `/proc/<pid>/stat` `tty_nr` unchanged and the terminal still answer
+/// `TIOCGPGRP` with the leader's group, while a leader's leaves `tty_nr` at
+/// zero, `tcgetpgrp` at `ENOTTY` and `/dev/tty` at `ENXIO`.
+pub fn release_controlling_tty(dev_id: (u32, u32), session_wide: bool) {
+    with_table(|t| {
+        if session_wide {
+            for task in t.tasks.iter_mut().flatten() {
+                if task.ctty == Some(dev_id) {
+                    task.ctty = None;
+                }
+            }
+        } else {
+            t.task_mut(t.current).ctty = None;
+        }
+    });
+}
+
 /// The identity of the running task: the real, effective and saved ids of
 /// its user and group. This is what `getuid`'s family reads and what
 /// `setuid`'s family writes, after the syscall layer has applied the man

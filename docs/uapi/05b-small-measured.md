@@ -412,16 +412,20 @@ Section numbers are unchanged from the original `UAPI.md`.
   own session is `SIGTTIN`'s business on Linux (measured: the reader is stopped, its
   read never completes), which is a signal this kernel does not raise either. Neither
   is reachable from the fixture, which puts its reader in another session precisely so
-  both sides of the boundary are the shapes measured. `TIOCNOTTY` is measured but not
-  served here (Linux hangs up the session with `SIGHUP`); it is named in §5.1 item 56
-  and stays outside this entry.
+  both sides of the boundary are the shapes measured. `TIOCNOTTY` is served now
+  (§5.1 item 57): the leader's call gives the *session's* terminal back - its foreground
+  group hears a `SIGCONT` and a `SIGHUP`, the terminal keeps no foreground, `/dev/tty`
+  stops opening for every task that named it, and the pair is not hung up - while any
+  other member's call clears only its own record and the session keeps the line.
 
   Owner: `src/vfs/tty.rs`'s `read`/`foreground` (the claim is gone), the `0x540F`/`0x5410`
-  arm of `src/syscall/linux/fs/ioctl.rs` (the session questions and the order of the
-  refusals), and `src/sched/runtime/child_signal.rs`'s `session_of` beside the existing
-  `session_of_tty`. Pin: `t-pty`'s two foreground sections, **17 claims** (54 in the
-  file, was 37), all green on a current host first. `docs/notes/` §15.75 carries the
-  gates, the counterfactual and the two fixture lessons.
+  and `0x5422` arms of `src/syscall/linux/fs/ioctl.rs` (the session questions, the order
+  of the refusals, and the hand-back), and `src/sched/runtime/child_signal.rs`'s
+  `session_of`, `session_of_tty` and `release_controlling_tty`. Pin: `t-pty`'s three
+  sections - the two foreground ones, **17 claims** (54 in the file, was 37), and the
+  hand-back's **18** (72 now) - all 67 printed claims green on a current host first.
+  `docs/notes/` §15.75 and §15.76 carry the gates, the counterfactuals and the fixture
+  lessons.
 
 - **`FIONREAD` answers Linux's per-type byte count on a regular file, a pipe, a socket and a
   terminal. Landed 2026-10-17** (`docs/uapi/` §5.1 item 30). The entry this replaces said this

@@ -271,6 +271,72 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             crate::sched::send_signal_group(leader, crate::sched::signal::SIGCONT);
             0
         }
+        0x5422 => {
+            // TIOCNOTTY: give the controlling terminal back - the call a
+            // daemon makes on its way out of the session it was started in,
+            // and the other half of `setsid`'s contract.
+            //
+            // Only a terminal the caller *holds* can be given back, and Linux
+            // compares the descriptor's terminal with the caller's record of
+            // it: the master end of a pair is a different terminal, so a caller
+            // that owns the slave and asks through the master is refused
+            // (measured, `.workbuddy/probe_tty_notty.c`, Linux 7.2.11). Every
+            // other shape - no controlling terminal at all, a session leader
+            // that never claimed one, a plain process that opened the slave
+            // `O_NOCTTY` - is the same `ENOTTY`.
+            let file = match crate::sched::current_fds().clone_at(fd) {
+                Ok(f) => f,
+                Err(e) => return err_of(e),
+            };
+            let inode = file.inode();
+            let Some(tty) = inode.as_tty() else {
+                return err::ENOTTY;
+            };
+            // A pair is one terminal, but a *master* is not the terminal the
+            // session bound: the name `TIOCSCTTY` records is the slave's, so a
+            // caller that holds the slave and asks through the master is
+            // refused - measured on a current host, and the same rule that
+            // makes `TIOCGPGRP` answer `0` rather than a group on that end.
+            if inode.as_pty().is_some() {
+                return err::ENOTTY;
+            }
+            let Some(dev_id) = inode.rdev() else {
+                return err::ENOTTY;
+            };
+            if crate::sched::controlling_tty_of_current() != Some(dev_id) {
+                return err::ENOTTY;
+            }
+            // Two askers, two answers. A session leader gives up the
+            // *session's* terminal: the terminal's foreground group hears a
+            // `SIGCONT` and a `SIGHUP` - the pair that tells a shell its line
+            // is going and lets an already-stopped job see it - and the
+            // terminal keeps no foreground after. The signal follows the
+            // *group*, not the caller: measured, a leader that is not itself
+            // in the foreground group hears nothing while the group hears
+            // both. Anybody else clears only its own record, and the session
+            // keeps the line (measured: the leader's `/proc/<pid>/stat`
+            // `tty_nr` is unchanged and the terminal still answers
+            // `TIOCGPGRP` with the leader's group).
+            //
+            // Giving the terminal back does **not** hang it up: measured, the
+            // pair stays a terminal - `read` answers `EAGAIN` rather than
+            // `EIO`, and a `write` still lands.
+            let leader = crate::sched::current_is_session_leader();
+            if leader {
+                if let Some(fg) = tty.foreground() {
+                    // The resume first, then the hangup: measured, a host
+                    // delivers the pair in that order to the group (both from
+                    // the one call, and the same when no `TIOCSPGRP` could have
+                    // sent the `SIGCONT`), which is what lets a job that was
+                    // stopped see the hangup it is being sent.
+                    crate::sched::send_signal_group(fg, crate::sched::signal::SIGCONT);
+                    crate::sched::send_signal_group(fg, crate::sched::signal::SIGHUP);
+                }
+                tty.set_foreground(None);
+            }
+            crate::sched::release_controlling_tty(dev_id, leader);
+            0
+        }
         // TIOCGSID: the session the terminal belongs to - `tcgetsid`, which a
         // job-control shell asks before it decides whether this terminal is
         // *its* terminal to claim. Only the session leader that owns the line

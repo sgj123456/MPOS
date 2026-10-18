@@ -14,6 +14,10 @@
 //! does when the task has no handler is the [`default_action`] table, which is
 //! why that table exists at all rather than a single "fatal" answer.
 
+/// Hangup: the terminal a process was using is going away. The default
+/// action is the table's plain terminate - which is what makes a session's
+/// `TIOCNOTTY` a way to end the jobs left on a line.
+pub const SIGHUP: u8 = 1;
 /// Interrupt from the keyboard, once there is a keyboard.
 pub const SIGINT: u8 = 2;
 /// The hardware's trap, and the signal `ptrace` reports a stop with. Every

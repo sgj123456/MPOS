@@ -631,6 +631,416 @@ fn read_record(fd: BorrowedFd<'_>, buf: &mut [u8]) -> usize {
     filled
 }
 
+// ---------------------------------------------------------------------------
+// TIOCNOTTY: giving the terminal back
+// ---------------------------------------------------------------------------
+
+/// The signals a hangup delivered, in the order they arrived, and a count of
+/// each. Atomics of their own because the handler is what writes them - a
+/// plain static would let the main line's read of it sit in a register.
+static NOTTY_HUP: AtomicI32 = AtomicI32::new(0);
+static NOTTY_CONT: AtomicI32 = AtomicI32::new(0);
+extern "C" fn on_hup(_sig: libc::c_int, _info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+    NOTTY_HUP.fetch_add(1, Ordering::SeqCst);
+}
+
+extern "C" fn on_cont(_sig: libc::c_int, _info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+    NOTTY_CONT.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Catch `SIGHUP` and `SIGCONT` - the two a hangup delivers, and the default of
+/// the first is to die, so a process that wants to *report* one has to catch it.
+fn arm_hangup_handlers() -> i32 {
+    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    act.sa_sigaction =
+        on_hup as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as usize;
+    act.sa_flags = libc::SA_SIGINFO;
+    // SAFETY: a fully filled `sigaction` for two numbers the wrapper serves,
+    // and no old record wanted.
+    let hup = unsafe { libc::sigaction(libc::SIGHUP, &act, std::ptr::null_mut()) };
+    act.sa_sigaction =
+        on_cont as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) as usize;
+    let cont = unsafe { libc::sigaction(libc::SIGCONT, &act, std::ptr::null_mut()) };
+    (hup == 0 && cont == 0) as i32
+}
+
+/// `/dev/tty` as this process would open it: `(rc, errno)` with `rc` the
+/// descriptor on success. The one question that says whether the caller still
+/// has a controlling terminal.
+fn dev_tty() -> (i32, i32) {
+    match open("/dev/tty", OFlags::RDWR, Mode::empty()) {
+        Ok(fd) => {
+            drop(fd);
+            (1, 0)
+        }
+        Err(e) => (-1, e.raw_os_error()),
+    }
+}
+
+/// What the getty saw when it gave the terminal back.
+#[derive(Clone, Copy, Default)]
+struct NottyLeader {
+    /// `TIOCSCTTY`'s return code.
+    ctty_rc: i32,
+    /// `TIOCNOTTY` asked through the *master*: a different terminal.
+    master_rc: i32,
+    master_errno: i32,
+    /// `/dev/tty` after that refusal - the claim it refused to touch is whole.
+    claim_survived: i32,
+    /// The move that puts the job in front, and the call under test.
+    spgrp_rc: i32,
+    notty_rc: i32,
+    /// What each side heard: the caller is *not* in the foreground group.
+    caller_hup: i32,
+    caller_cont: i32,
+    kid_hup: i32,
+    kid_cont: i32,
+    /// `TIOCGPGRP` on the same descriptor afterwards.
+    pgrp_rc: i32,
+    pgrp_errno: i32,
+    /// `/dev/tty` afterwards, and a second `TIOCNOTTY`.
+    devtty_rc: i32,
+    devtty_errno: i32,
+    second_rc: i32,
+    second_errno: i32,
+    /// A byte written to the slave after the call: the pair is still a
+    /// terminal, not a hung-up line.
+    write_rc: i32,
+}
+
+const NOTTY_WORDS: usize = 17;
+
+impl NottyLeader {
+    fn words(self) -> [i32; NOTTY_WORDS] {
+        [
+            self.ctty_rc,
+            self.master_rc,
+            self.master_errno,
+            self.claim_survived,
+            self.spgrp_rc,
+            self.notty_rc,
+            self.caller_hup,
+            self.caller_cont,
+            self.kid_hup,
+            self.kid_cont,
+            self.pgrp_rc,
+            self.pgrp_errno,
+            self.devtty_rc,
+            self.devtty_errno,
+            self.second_rc,
+            self.second_errno,
+            self.write_rc,
+        ]
+    }
+
+    fn from_words(w: &[i32; NOTTY_WORDS]) -> Self {
+        Self {
+            ctty_rc: w[0],
+            master_rc: w[1],
+            master_errno: w[2],
+            claim_survived: w[3],
+            spgrp_rc: w[4],
+            notty_rc: w[5],
+            caller_hup: w[6],
+            caller_cont: w[7],
+            kid_hup: w[8],
+            kid_cont: w[9],
+            pgrp_rc: w[10],
+            pgrp_errno: w[11],
+            devtty_rc: w[12],
+            devtty_errno: w[13],
+            second_rc: w[14],
+            second_errno: w[15],
+            write_rc: w[16],
+        }
+    }
+}
+
+fn read_words<const N: usize>(fd: BorrowedFd<'_>) -> [i32; N] {
+    let mut bytes = [0u8; 128];
+    let bytes = &mut bytes[..N * 4];
+    let _ = read_record(fd, bytes);
+    let mut words = [0i32; N];
+    for (i, word) in words.iter_mut().enumerate() {
+        *word = i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    words
+}
+
+fn write_words<const N: usize>(fd: BorrowedFd<'_>, words: [i32; N]) {
+    let mut bytes = [0u8; 128];
+    for (i, word) in words.into_iter().enumerate() {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+    let _ = rustix::io::write(fd, &bytes[..N * 4]);
+}
+
+/// The session leader's half: it holds the slave, a job of its own session
+/// stands in front of the terminal, and then it gives the terminal back.
+///
+/// The job is what makes the signal's recipient a claim: the caller is in a
+/// group of its own (`setsid`), so anything it heard would be its own - and on
+/// Linux it hears nothing while the foreground group hears both.
+fn notty_leader(master: BorrowedFd<'_>, path: &std::ffi::CStr) -> NottyLeader {
+    let (read_end, write_end) = rustix::pipe::pipe().expect("a pipe for the getty's report");
+    // SAFETY: the child writes one fixed-size record to a pipe it owns and
+    // exits; it touches nothing the parent will read back.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        drop(read_end);
+        let mut report = NottyLeader::default();
+        // SAFETY: `setsid` only fails for a process that is already a group
+        // leader, and this one is a fresh child of the test.
+        if unsafe { libc::setsid() } >= 0 {
+            // SAFETY: the child opens a terminal it will hold as its own.
+            if let Ok(slave) = open(path, OFlags::RDWR, Mode::empty()) {
+                let raw = slave.as_fd().as_raw_fd();
+                let (rc, _) = ioctl(raw, libc::TIOCSCTTY as libc::c_ulong, 0);
+                report.ctty_rc = rc as i32;
+                let _ = arm_hangup_handlers();
+                // The master end is a different terminal: the same pair, but
+                // not the name the session bound.
+                let (rc, errno) = ioctl(master.as_raw_fd(), libc::TIOCNOTTY as libc::c_ulong, 0);
+                report.master_rc = rc as i32;
+                report.master_errno = errno;
+                let (held, _) = dev_tty();
+                report.claim_survived = held;
+
+                // A job of this session in a group of its own, made the
+                // foreground - `tcsetpgrp`'s ordinary shape.
+                let (kid_read, kid_write) =
+                    rustix::pipe::pipe().expect("a pipe for the job's report");
+                let kid = unsafe { libc::fork() };
+                if kid == 0 {
+                    drop(kid_read);
+                    // SAFETY: `setpgid` on the child's own pid, into a group
+                    // it makes.
+                    unsafe { libc::setpgid(0, 0) };
+                    let me = unsafe { libc::getpgrp() };
+                    write_words(kid_write.as_fd(), [me]);
+                    // Long enough for the parent's `TIOCSPGRP` - which itself
+                    // sends this group a `SIGCONT` - to have gone out before
+                    // the handlers exist, so the sequence below is the
+                    // *hangup's* and nothing else.
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    if arm_hangup_handlers() != 1 {
+                        leave(1);
+                    }
+                    write_words(kid_write.as_fd(), [1]);
+                    // Wait until both have landed. The claim is the *set* - a
+                    // job left on a line being taken away hears the hangup and
+                    // a resume - and not their order: measured on a current
+                    // host, the pair arrives as `SIGCONT` and then `SIGHUP`,
+                    // both from the one call (`.workbuddy/probe_tty_notty.c`'s
+                    // sixth scenario, where the group was already in front so
+                    // no `tcsetpgrp` could have sent the `SIGCONT`). Bounded,
+                    // so a kernel that sends neither fails instead of hanging.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(400);
+                    while std::time::Instant::now() < deadline
+                        && (NOTTY_HUP.load(Ordering::SeqCst) == 0
+                            || NOTTY_CONT.load(Ordering::SeqCst) == 0)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    write_words(
+                        kid_write.as_fd(),
+                        [
+                            NOTTY_HUP.load(Ordering::SeqCst),
+                            NOTTY_CONT.load(Ordering::SeqCst),
+                        ],
+                    );
+                    leave(0);
+                }
+                drop(kid_write);
+                let kid_pgid = read_words::<1>(kid_read.as_fd())[0];
+                // SAFETY: `setpgid` on a child of this process, into the group
+                // that child just made; a refused call is reported by the
+                // claim on the terminal, not here.
+                unsafe { libc::setpgid(kid, kid_pgid) };
+                report.spgrp_rc = setpgrp_ioctl(raw, kid_pgid).0 as i32;
+                // The job arms its handlers only after the move above, so what
+                // it counts is the hangup's signals and not the `SIGCONT` that
+                // move sent.
+                let _armed = read_words::<1>(kid_read.as_fd())[0];
+                if report.spgrp_rc == 0 {
+                    report.notty_rc = ioctl(raw, libc::TIOCNOTTY as libc::c_ulong, 0).0 as i32;
+                    // The signals are delivered on the way out of a syscall, so
+                    // one more call is what lets this process observe its own.
+                    // SAFETY: `getpid` reads the caller's own process id.
+                    unsafe { libc::syscall(libc::SYS_getpid) };
+                    report.caller_hup = NOTTY_HUP.load(Ordering::SeqCst);
+                    report.caller_cont = NOTTY_CONT.load(Ordering::SeqCst);
+
+                    let (rc, errno, _) = getpgrp(raw);
+                    report.pgrp_rc = rc as i32;
+                    report.pgrp_errno = errno;
+                    let (held, held_errno) = dev_tty();
+                    report.devtty_rc = held;
+                    report.devtty_errno = held_errno;
+                    let (rc, errno) = ioctl(raw, libc::TIOCNOTTY as libc::c_ulong, 0);
+                    report.second_rc = rc as i32;
+                    report.second_errno = errno;
+                    report.write_rc = rustix::io::write(slave.as_fd(), b"x")
+                        .map(|n| n as i32)
+                        .unwrap_or(-1);
+                }
+                let heard = read_words::<2>(kid_read.as_fd());
+                report.kid_hup = heard[0];
+                report.kid_cont = heard[1];
+                // SAFETY: the job has reported and exited; its status is not
+                // the claim.
+                unsafe { libc::waitpid(kid, std::ptr::null_mut(), 0) };
+            }
+        }
+        write_words(write_end.as_fd(), report.words());
+        leave(0);
+    }
+    drop(write_end);
+    let words = read_words::<NOTTY_WORDS>(read_end.as_fd());
+    // SAFETY: the child has reported and exited; its status is not the claim.
+    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+    NottyLeader::from_words(&words)
+}
+
+/// What a *member* of the session saw: it holds the same terminal, it is not
+/// the leader, and its call is the one that clears only its own record.
+#[derive(Clone, Copy, Default)]
+struct NottyMember {
+    /// `/dev/tty` in the member before the call, and after it.
+    before_rc: i32,
+    after_rc: i32,
+    after_errno: i32,
+    /// The member's `TIOCNOTTY`.
+    notty_rc: i32,
+    /// And the leader, still holding: `/dev/tty` and the group the terminal
+    /// names.
+    leader_rc: i32,
+    leader_group: i32,
+}
+
+const MEMBER_WORDS: usize = 6;
+
+impl NottyMember {
+    fn words(self) -> [i32; MEMBER_WORDS] {
+        [
+            self.before_rc,
+            self.after_rc,
+            self.after_errno,
+            self.notty_rc,
+            self.leader_rc,
+            self.leader_group,
+        ]
+    }
+
+    fn from_words(w: &[i32; MEMBER_WORDS]) -> Self {
+        Self {
+            before_rc: w[0],
+            after_rc: w[1],
+            after_errno: w[2],
+            notty_rc: w[3],
+            leader_rc: w[4],
+            leader_group: w[5],
+        }
+    }
+}
+
+fn notty_member(path: &std::ffi::CStr) -> NottyMember {
+    let (read_end, write_end) = rustix::pipe::pipe().expect("a pipe for the session's report");
+    // SAFETY: the child writes one fixed-size record to a pipe it owns and
+    // exits; it touches nothing the parent will read back.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        drop(read_end);
+        let mut report = NottyMember::default();
+        // SAFETY: `setsid` only fails for a process that is already a group
+        // leader, and this one is a fresh child of the test.
+        if unsafe { libc::setsid() } >= 0 {
+            // SAFETY: the child opens a terminal it will hold as its own.
+            if let Ok(slave) = open(path, OFlags::RDWR, Mode::empty()) {
+                let raw = slave.as_fd().as_raw_fd();
+                ioctl(raw, libc::TIOCSCTTY as libc::c_ulong, 0);
+                let (kid_read, kid_write) =
+                    rustix::pipe::pipe().expect("a pipe for the member's report");
+                let member = unsafe { libc::fork() };
+                if member == 0 {
+                    drop(kid_read);
+                    let (before, _) = dev_tty();
+                    let (rc, _) = ioctl(raw, libc::TIOCNOTTY as libc::c_ulong, 0);
+                    let (after, after_errno) = dev_tty();
+                    write_words(kid_write.as_fd(), [before, after, after_errno, rc as i32]);
+                    leave(0);
+                }
+                drop(kid_write);
+                let heard = read_words::<4>(kid_read.as_fd());
+                report.before_rc = heard[0];
+                report.after_rc = heard[1];
+                report.after_errno = heard[2];
+                report.notty_rc = heard[3];
+                // SAFETY: the member has reported and exited; its status is
+                // not the claim.
+                unsafe { libc::waitpid(member, std::ptr::null_mut(), 0) };
+                let (held, _) = dev_tty();
+                report.leader_rc = held;
+                let (_, _, group) = getpgrp(raw);
+                report.leader_group = group;
+            }
+        }
+        write_words(write_end.as_fd(), report.words());
+        leave(0);
+    }
+    drop(write_end);
+    let words = read_words::<MEMBER_WORDS>(read_end.as_fd());
+    // SAFETY: the child has reported and exited; its status is not the claim.
+    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+    NottyMember::from_words(&words)
+}
+
+/// What the two callers *without* the terminal saw, in a process that is in no
+/// session of its own: a plain process with no controlling terminal, and a
+/// session leader that never claimed one.
+fn notty_strangers(path: &std::ffi::CStr) -> [i32; 4] {
+    let (read_end, write_end) = rustix::pipe::pipe().expect("a pipe for the strangers' report");
+    // SAFETY: the child writes one fixed-size record to a pipe it owns and
+    // exits; it touches nothing the parent will read back.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        drop(read_end);
+        let mut words = [0i32; 4];
+        // SAFETY: an open of the slave that deliberately does not claim it.
+        if let Ok(slave) = open(path, OFlags::RDWR | OFlags::NOCTTY, Mode::empty()) {
+            let (rc, errno) = ioctl(
+                slave.as_fd().as_raw_fd(),
+                libc::TIOCNOTTY as libc::c_ulong,
+                0,
+            );
+            words[0] = rc as i32;
+            words[1] = errno;
+        }
+        // And a leader of a session that never took a terminal.
+        // SAFETY: `setsid` only fails for a process that is already a group
+        // leader, and this one is a fresh child of the test.
+        if unsafe { libc::setsid() } >= 0 {
+            if let Ok(slave) = open(path, OFlags::RDWR | OFlags::NOCTTY, Mode::empty()) {
+                let (rc, errno) = ioctl(
+                    slave.as_fd().as_raw_fd(),
+                    libc::TIOCNOTTY as libc::c_ulong,
+                    0,
+                );
+                words[2] = rc as i32;
+                words[3] = errno;
+            }
+        }
+        write_words(write_end.as_fd(), words);
+        leave(0);
+    }
+    drop(write_end);
+    let words = read_words::<4>(read_end.as_fd());
+    // SAFETY: the child has reported and exited; its status is not the claim.
+    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+    words
+}
+
 fn main() {
     println!("t-pty");
     let mut r = Report::new();
@@ -905,6 +1315,95 @@ fn main() {
     r.check(
         "and reading it does not make the reader the foreground group",
         reader.after == reader.claimed,
+    );
+
+    // Fourth: giving the terminal back is the session's act, and only the
+    // session's. The getty holds the slave, a job of its own session stands in
+    // front of the terminal, and the call that gives it back is measured on
+    // every side at once - the pair's own state, both processes' signals, and
+    // the two doors that name the terminal.
+    let gave_back = notty_leader(master.as_fd(), path.as_c_str());
+    r.check(
+        "the getty's TIOCSCTTY succeeded before it gave the line back",
+        gave_back.ctty_rc == 0,
+    );
+    r.check(
+        "the master end is not the terminal a session gives back",
+        gave_back.master_rc == -1 && gave_back.master_errno == libc::ENOTTY,
+    );
+    r.check(
+        "and that refusal left the claim whole",
+        gave_back.claim_survived == 1,
+    );
+    r.check(
+        "the job was put in front of the terminal",
+        gave_back.spgrp_rc == 0,
+    );
+    r.check(
+        "a session leader's TIOCNOTTY is served",
+        gave_back.notty_rc == 0,
+    );
+    r.check(
+        "the caller, standing outside the foreground group, hears nothing",
+        gave_back.caller_hup == 0 && gave_back.caller_cont == 0,
+    );
+    // The pair goes to the *group*: the hangup, and the resume with it. Their
+    // order is not the claim - measured on a current host the two arrive as
+    // `SIGCONT` and then `SIGHUP`, both from the one call.
+    r.check(
+        "the foreground group hears the hangup and a SIGCONT with it",
+        gave_back.kid_hup >= 1 && gave_back.kid_cont >= 1,
+    );
+    r.check(
+        "the terminal has no foreground group to report afterwards",
+        gave_back.pgrp_rc == -1 && gave_back.pgrp_errno == libc::ENOTTY,
+    );
+    r.check(
+        "/dev/tty no longer opens for the caller",
+        gave_back.devtty_rc == -1 && gave_back.devtty_errno == libc::ENXIO,
+    );
+    r.check(
+        "a second TIOCNOTTY is ENOTTY",
+        gave_back.second_rc == -1 && gave_back.second_errno == libc::ENOTTY,
+    );
+    // Giving the terminal back is not hanging it up: measured on a host, a
+    // `read` answers `EAGAIN` (not `EIO`) and a `write` still lands.
+    r.check(
+        "and the pair is still a terminal - a write lands",
+        gave_back.write_rc == 1,
+    );
+
+    // A member of the session, holding the same terminal: its call clears only
+    // its own record, and the session keeps the line.
+    let member = notty_member(path.as_c_str());
+    r.check(
+        "a member of the session holds /dev/tty before its TIOCNOTTY",
+        member.before_rc == 1,
+    );
+    r.check("and its TIOCNOTTY is served", member.notty_rc == 0);
+    r.check(
+        "the member's own /dev/tty stops opening",
+        member.after_rc == -1 && member.after_errno == libc::ENXIO,
+    );
+    r.check(
+        "while the session keeps the line: the leader's /dev/tty still opens",
+        member.leader_rc == 1,
+    );
+    r.check(
+        "and the terminal still names the leader's group",
+        member.leader_group > 0,
+    );
+
+    // Nobody to give anything back: no controlling terminal at all, and a
+    // session leader that never claimed one.
+    let strangers = notty_strangers(path.as_c_str());
+    r.check(
+        "TIOCNOTTY with no controlling terminal is ENOTTY",
+        strangers[0] == -1 && strangers[1] == libc::ENOTTY,
+    );
+    r.check(
+        "and a session leader that never claimed one is ENOTTY too",
+        strangers[2] == -1 && strangers[3] == libc::ENOTTY,
     );
 
     // FIONREAD on a pty. A pair is one terminal and the request answers the

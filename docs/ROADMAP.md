@@ -357,6 +357,24 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are TCP's record-only buffer sizes  
 (`SO_SNDBUF`/`SO_RCVBUF`); the two namespace kinds with no entry at all are IPC and cgroup.
 
+**Giving the terminal back is the session's act, and only the session's** (`docs/uapi/` §5.1  
+item 57, landed 2026-10-18): `TIOCNOTTY` is the residual item 56 named and did not serve. Linux  
+answers two different things about *who* asks, measured whole on a current host first  
+(`.workbuddy/probe_tty_notty.c`, six scenarios, each in a session of its own): a session leader's  
+call gives up the **session's** terminal - its foreground group hears a `SIGCONT` and a `SIGHUP`  
+(in that order, and again with the group already in front so no `TIOCSPGRP` could have sent the  
+`SIGCONT`), the caller itself hears nothing when it is not in that group, the terminal keeps no  
+foreground, `/dev/tty` is `ENXIO` for every task that still named it, a second call is `ENOTTY`,  
+and the pair is **not** hung up (a `read` answers `EAGAIN`, a `write` lands) - while any other  
+member's call is `0` too and clears only its own record, leaving the leader's `/dev/tty` opening  
+and the terminal still naming the session's group. A descriptor that is not the held terminal is  
+`ENOTTY`: the master end of the pair (a different terminal from the one `TIOCSCTTY` bound), a  
+process with no controlling terminal, and a leader that never claimed one. The arm is `0x5422`,  
+`sched::release_controlling_tty` does the writing (session-wide for the leader, caller-only  
+otherwise), and `signal::SIGHUP` joins the vocabulary. Pin: `t-pty`'s fourth section, 18 claims  
+(67 printed in the file, was 49); counterfactually six of them go red by name and the two  
+refusal rows stay green.
+
 **A terminal's foreground group is the session's, and a reader is not its owner** (`docs/uapi/`  
 §5.1 item 56, landed 2026-10-18): the last divergence §5.2's terminal entry carried. Linux keeps a  
 tty's foreground group strictly as *session state* — set when a session leader makes the tty its  
@@ -379,6 +397,21 @@ is ignored (this kernel sends no terminal-generated `SIGTTOU`), and a background
 terminal's own session is `SIGTTIN`'s business. `t-pty` gains 17 claims (54 in the file, was 37),  
 all green on a current host first; the counterfactual puts back the two old halves and turns  
 exactly nine of them red, including the reader's.
+
+**A `poll` with no descriptors is a wait, and `pause()` is that call on arm64** (`docs/uapi/` §5.1  
+item 55, landed 2026-10-18): a zero-`nfds` `poll`/`ppoll` answered `0` at once where Linux waits  
+out the timeout (`poll(NULL, 0, 100)` answers after 100.1 ms; with no timeout it waits for ever).  
+It mattered because musl builds `pause()` as exactly that call on aarch64 - Linux has no `pause`  
+number there - so a program idling in `pause()` returned immediately and spun. Found by item 54's  
+fixture, whose parked child exited at once on the second machine while every `Rss` in its file  
+read zero.
+
+**`/proc/<pid>/smaps` is served, and the three numbers this kernel cannot derive are a rule**  
+(`docs/uapi/` §5.1 item 54, landed 2026-10-18): each record's header is that mapping's `maps` line  
+byte for byte (both renderings of one gatherer, `procfs::mapping_lines`), then Linux's twenty-four  
+field lines in Linux's order. `Pss`, the shared/private resident buckets and `Referenced` are the  
+three this kernel's model cannot answer - no mapcount, no dirty bit with a page cache, no accessed  
+bit - and each reads what the model does support rather than a fabricated number.
 
 **A wait's two writes go where Linux's go — the wait, the rusage, then the record** (`docs/uapi/`  
 §5.1 item 51, landed 2026-10-18): item 34 gave both wait doors the caller's `struct rusage`; what it  

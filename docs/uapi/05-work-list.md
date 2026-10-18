@@ -2478,3 +2478,62 @@ the commit bodies), and each moved its pin in the same commit.
     zeroes. It looked like a kernel difference (green under the new kernel, red under
     the old one) and was the loop; `t-pty` now has one `read_record` that retries
     `EINTR`, and the counterfactual's red list is the one above rather than eleven.
+
+## item 57 — giving the terminal back is the session's act, and only the session's
+
+    `TIOCNOTTY` is the residual item 56 named and did not serve. Linux's rule is
+    two facts about *who* asks, and both were measured on a current host before
+    anything was written (`.workbuddy/probe_tty_notty.c`, Linux 7.2.11, six
+    scenarios, each forked into a session of its own):
+
+    * **the leader gives up the session's terminal.** Its call is `0`, and the
+      terminal's **foreground group** hears a `SIGCONT` and a `SIGHUP` - in that
+      order, measured twice, the second time with the group already in front so
+      that no `TIOCSPGRP` could have sent the `SIGCONT`. A leader that is *not*
+      in the foreground group itself hears nothing, which is what makes the
+      recipient a claim about the group rather than about the caller. Afterwards
+      the terminal has no foreground (`tcgetpgrp` is `ENOTTY`), `/dev/tty` is
+      `ENXIO` for every task that still named it, a second call is `ENOTTY`, and
+      the pair is **not** hung up: a `read` answers `EAGAIN` rather than `EIO`,
+      and a `write` still lands;
+    * **anybody else clears only its own record.** A member of the session that
+      holds the same terminal gets `0` too, and after it its own `/dev/tty` is
+      `ENXIO` while the leader's still opens and the terminal still answers
+      `TIOCGPGRP` with the leader's group - the session kept the line;
+    * **a descriptor that is not the held terminal is `ENOTTY`**: the same caller
+      asking through a pair's *master* (a different terminal from the one
+      `TIOCSCTTY` bound, even though both ends are one pair), a process with no
+      controlling terminal, and a session leader that never claimed one. The
+      master's refusal leaves the claim whole.
+
+    Implementation: the `0x5422` arm of `src/syscall/linux/fs/ioctl.rs` asks
+    Linux's two questions - is this descriptor the terminal the caller holds (the
+    slave end, not a supervisor's master) and is the caller its session's leader
+    - and `sched::release_controlling_tty(dev, session_wide)` does the writing:
+    the leader's call clears every task still naming the device, everybody
+    else's clears only the caller's. `sched::current_is_session_leader` is the
+    question, and `signal::SIGHUP` (1) joins the vocabulary with the default
+    action table's plain terminate behind it.
+
+    Pin: `t-pty`'s fourth section, **18 claims** (the file's `r.check` count 54 ->
+    72, its printed rows 49 -> 67) - three on the master's refusal and the claim
+    it left, seven on the leader's call (its return, both sides' signals, the
+    group it emptied, `/dev/tty`, the second call, and the write that says the
+    pair is not hung up), four on the member's, two on the callers who hold
+    nothing, and the move that put a job in front. All 67 printed claims green on
+    a current host first.
+
+    Gate: x86_64 `pass=184 fail=0 (184 built)`, `mpos-kunit 32 passed, 0 failed`,
+    exit 0; aarch64 `pass=183 fail=0 (183 built)`, kunit 32/0, exit 0; both
+    machines' `t-pty` `ok:` lines identical (67 and 67, `diff` clean after the
+    carriage returns).
+
+    Counterfactual (the arm returning `ENOTTY` and nothing else, the test kept):
+    `pass=183 fail=1 (184 built)` with `FAIL t-pty` and **six** claims red by
+    name - `a session leader's TIOCNOTTY is served`, `the foreground group hears
+    the hangup and a SIGCONT with it`, `the terminal has no foreground group to
+    report afterwards`, `/dev/tty no longer opens for the caller`, `and its
+    TIOCNOTTY is served`, `the member's own /dev/tty stops opening`. The two
+    refusal rows stay green, which is what they are for: an arm that does not
+    exist refuses everything, and those two are the shapes it is *supposed* to
+    refuse.
