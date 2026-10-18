@@ -357,6 +357,29 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are TCP's record-only buffer sizes  
 (`SO_SNDBUF`/`SO_RCVBUF`); the two namespace kinds with no entry at all are IPC and cgroup.
 
+**A terminal's foreground group is the session's, and a reader is not its owner** (`docs/uapi/`  
+§5.1 item 56, landed 2026-10-18): the last divergence §5.2's terminal entry carried. Linux keeps a  
+tty's foreground group strictly as *session state* — set when a session leader makes the tty its  
+controlling terminal (`__proc_set_tty`) or by `TIOCSPGRP` from that session, and never by a read —  
+while this kernel answered with the reader: `Tty::read` recorded the reading task's group as the  
+terminal's foreground, so a program that read a tty it never claimed *became* its owner (the typed  
+`SIGINT`/`SIGQUIT`/`SIGTSTP` and the resize `SIGWINCH` reached it, and `tcgetpgrp` named it), and  
+a pair no session held answered `0` and accepted any group from anyone. Measured whole on a current  
+host first (`.workbuddy/probe_tty_fg.c`, `probe_tty_fg2.c`, Linux 7.2.11, every scenario in a  
+session of its own): a pair nobody holds answers `ENOTTY` on the *slave* and `0` on its *master*  
+(Linux asks the controlling-terminal question of the slave end only, which is what lets a  
+supervisor holding only the master learn whether it may do job control), `TIOCSPGRP` is `ENOTTY`  
+there and from any process in another session, and from the owning session the refusals are ordered  
+and distinguishable — `EFAULT` for a bad pointer, `EINVAL` for a negative number, `ESRCH` for one  
+that names no process, `EPERM` for a group in another session, with the group it would not take  
+left where it was. Reading is not claiming: a process in another session reads the slave and the  
+answer does not move. Two shapes stay named rather than built, both measured: a background group  
+that tries to change the terminal is `ENOTTY` when its group is orphaned and served when `SIGTTOU`  
+is ignored (this kernel sends no terminal-generated `SIGTTOU`), and a background *read* of the  
+terminal's own session is `SIGTTIN`'s business. `t-pty` gains 17 claims (54 in the file, was 37),  
+all green on a current host first; the counterfactual puts back the two old halves and turns  
+exactly nine of them red, including the reader's.
+
 **A wait's two writes go where Linux's go — the wait, the rusage, then the record** (`docs/uapi/`  
 §5.1 item 51, landed 2026-10-18): item 34 gave both wait doors the caller's `struct rusage`; what it  
 left was *where* the writes sit, which only a caller with a pointer the kernel cannot write to can  

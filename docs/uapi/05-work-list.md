@@ -2392,3 +2392,89 @@ the commit bodies), and each moved its pin in the same commit.
     control rather than a claim. `t-smaps` stays green there too, because its child parks
     in a sleep loop and does not depend on this call - the dependency would have hidden
     which landing the failure belonged to.
+
+## item 56 — a terminal's foreground group is the *session's*, and a reader is not its owner
+
+    The divergence `docs/uapi/` §5.2 carried: Linux keeps a terminal's foreground
+    group strictly as session state, while this kernel answered with the reader -
+    `Tty::read` recorded the reading task's group as the terminal's foreground
+    ("the same answer for a program that never asks"), so a program that read a
+    tty it never claimed *became* its owner: the typed `SIGINT`/`SIGQUIT`/
+    `SIGTSTP` and the resize `SIGWINCH` reached it, and `tcgetpgrp` named it. And
+    the pair of doors refused nothing: a pair no session held answered `0` and
+    accepted any group from anyone.
+
+    Measured whole on a current host first (`.workbuddy/probe_tty_fg.c` and
+    `probe_tty_fg2.c`, Linux 7.2.11, every scenario in a session of its own, the
+    fork's own `setsid` isolated so one row cannot leak into the next):
+
+    * **a pair nobody holds has no foreground group**: `TIOCGPGRP` on the slave is
+      `ENOTTY`, `TIOCSPGRP` is `ENOTTY` on either end, and `TIOCSWINSZ` on the
+      master succeeds with nobody to tell. The *master's* `TIOCGPGRP` answers `0`
+      instead - Linux asks the controlling-terminal question of the slave end only
+      (`tty == real_tty && current->signal->tty != real_tty`), because a supervisor
+      holding nothing but the master has no other way to learn whether it may do
+      job control at all;
+    * **being a session leader is not holding it**: the same refusals after
+      `setsid` until `TIOCSCTTY` lands, and then the group is the leader's own - on
+      both ends, since a pair is one terminal;
+    * **the refusals are ordered and distinguishable**, from the owning session:
+      `EFAULT` for a bad pointer (asked *after* the session question, so an
+      unowned terminal answers `ENOTTY` to a null pointer too), `EINVAL` for a
+      negative number, `ESRCH` for one that names no process (zero included),
+      `EPERM` for a group in another session - and the group it would not take is
+      exactly where it was;
+    * **reading is not claiming**: a process in *another* session reads the slave
+      and the answer does not move. This is the row the old kernel failed, and the
+      fixture puts the reader there for a second reason - a reader in a *background
+      group of the terminal's own session* is stopped by `SIGTTIN` on Linux (the
+      probe's first draft did exactly that and hung, `--- stopped by SIGTTIN ---`),
+      which is a signal this kernel does not raise;
+    * **the move that is allowed** is a group of the same session, and the terminal
+      answers it afterwards.
+
+    Implementation: the read-side claim is *deleted* (`Tty::read` no longer touches
+    `foreground`, and its comment says why the session is the only writer); the
+    `0x540F`/`0x5410` arm asks the two questions Linux asks - "is this the caller's
+    controlling terminal" (`controlling_tty_of_current` against the pair's *slave*
+    device id, which is the name `TIOCSCTTY` recorded) and "is the named group in
+    the terminal's session" (`sched::session_of` beside `session_of_tty`). The
+    master end skips the first question for `TIOCGPGRP` only. Error order is the
+    measurement's, and `EINVAL` became `ESRCH` for a number that names nothing.
+
+    Two shapes stay *named* rather than built, and both are measured: a background
+    group that tries to change the terminal is `ENOTTY` when its group is orphaned
+    (with `SIGTTOU` caught) and served when `SIGTTOU` is ignored - this kernel has
+    no terminal-generated `SIGTTOU` to send, so it serves the call; and the
+    background *read* above is `SIGTTIN`'s. `TIOCNOTTY` is measured (Linux hangs the
+    session up with `SIGHUP`) and is not served here. The two scheduler hand-backs
+    stay as well (`load.rs`'s fork hook, `child_exit.rs`'s return to the parent's
+    group): they only fire when a group is *already* the foreground, so they move it
+    within the session rather than minting one, which is what this item removed.
+
+    Pin: `t-pty`'s two new sections, **17 claims** (54 in the file, was 37) - four on
+    a pair nobody holds, ten inside the getty child (the claimed group, the four
+    ordered refusals, that they moved nothing, and the one allowed move), and three
+    on the outsider reader. All 49 printed claims green on a current host first.
+
+    Gate: x86_64 `pass=184 fail=0 (184 built)`, `mpos-kunit 32 passed, 0 failed`,
+    exit 0; aarch64 `pass=183 fail=0 (183 built)`, kunit 32/0. Both machines' `t-pty`
+    `ok:` lines identical claim by claim (49 and 49, `diff` clean after the carriage
+    returns).
+
+    Counterfactual (the read-side claim and the old arm put back, the test kept):
+    `pass=183 fail=1 (184 built)` with `FAIL t-pty` and **nine** claims red by name -
+    `a pair nobody holds has no foreground group to report`, `and its master answers
+    zero rather than refusing` (the parent's own earlier reads had made it the
+    owner, so the master named its group), `handing a group to a pair nobody holds
+    is ENOTTY`, `and the refused hand left no group behind`, the two `ESRCH` rows
+    (the old arm said `EINVAL`), `a group in another session is EPERM`, `the four
+    refusals moved nothing` (one of them *succeeded* and moved it to the parent's
+    group), and `and reading it does not make the reader the foreground group`.
+
+    One trap worth carrying: the record each child reports down a pipe was read with
+    a bare `read`, and the child's exit delivers a signal to the reading process - so
+    a parked read could come back interrupted, which the fixture read as fifteen
+    zeroes. It looked like a kernel difference (green under the new kernel, red under
+    the old one) and was the loop; `t-pty` now has one `read_record` that retries
+    `EINTR`, and the counterfactual's red list is the one above rather than eleven.

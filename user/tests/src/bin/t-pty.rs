@@ -40,20 +40,32 @@
 //! # The fixture, and the one claim that is this kernel's own
 //!
 //! Each end is opened `O_NOCTTY`, so the test process cannot acquire a
-//! terminal by accident - and that is also why the window half runs in a child
-//! that *does* acquire the slave, as a session leader whose controlling
+//! terminal by accident - and that is also why the session halves run in a
+//! child that *does* acquire the slave, as a session leader whose controlling
 //! terminal it becomes (`setsid` + open + `TIOCSCTTY`, the getty's own
 //! sequence). Linux sends `SIGWINCH` to a terminal's *foreground process
 //! group*, and a pair nobody has claimed has none: measured on a current host,
 //! `TIOCSWINSZ` on a fresh pair's master with no session behind it runs no
-//! handler at all, and `tcsetpgrp` on a tty that is not the caller's own
-//! answers `ENOTTY` (errno 25). This kernel answers the same question with the
-//! *reader*: `Tty::read` records the reading task's group as the terminal's
-//! foreground (`src/vfs/tty.rs`, "the same answer for a program that never
-//! asks"), which is why the no-std version passed without a session. The getty
-//! sequence is used here so that the claim holds on **both** machines rather
-//! than on one: the divergence itself is named in `docs/uapi/` §5.2 and is
-//! not what this program pins.
+//! handler at all.
+//!
+//! The foreground group itself is **session state**, which is what the two
+//! halves of the section below pin: a pair nobody holds has none (`TIOCGPGRP`
+//! on the slave is `ENOTTY`, on the master `0`, `TIOCSPGRP` is `ENOTTY`), and a
+//! session that holds it keeps it whoever is reading. This kernel used to
+//! answer the second half with the *reader* - `Tty::read` recorded the reading
+//! task's group as the terminal's foreground - so a program that read a
+//! terminal it never claimed received the typed signals and read as the
+//! owner through `tcgetpgrp`. It is Linux's answer now
+//! (`.workbuddy/probe_tty_fg.c`, `probe_tty_fg2.c`), and the claim that a
+//! parked reader does not move the group is the one that failed before.
+//!
+//! What stays outside this program: Linux also refuses `TIOCSPGRP` from a
+//! background group of an *orphaned* process group (`ENOTTY`, via
+//! `tty_check_change`'s `EIO`), and sends `SIGTTOU` to a background group that
+//! tries to change the terminal - measured (the same two probes: with
+//! `SIGTTOU` caught an orphaned group's leader reads `ENOTTY`, with it ignored
+//! the same call is served) and named in `docs/uapi/` §5.2 rather than built,
+//! because this kernel has no terminal-generated `SIGTTOU` to send.
 //!
 //! `TIOCGPTN`'s *number* is the one claim that is this kernel's own. This
 //! kernel mints pair numbers past its six virtual consoles (`src/vfs/pty.rs`
@@ -336,18 +348,287 @@ fn resize_child(
     }
     drop(write_end);
     let mut bytes = [0u8; 24];
-    let mut filled = 0;
-    while filled < bytes.len() {
-        match rustix::io::read(&read_end, &mut bytes[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(_) => break,
-        }
-    }
+    let _ = read_record(read_end.as_fd(), &mut bytes);
     // SAFETY: the child has reported and exited; its status is not the claim,
     // the report is.
     unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
     decode(&bytes)
+}
+
+/// What the foreground child saw: one word per answer, because the question is
+/// session state and every row has to come from inside a session that holds the
+/// terminal. The parent reads one fixed record rather than a stream.
+#[derive(Clone, Copy, Default)]
+struct ForegroundReport {
+    /// The child's own group, read back after `setsid`.
+    pgid: i32,
+    /// `TIOCSCTTY`'s return code.
+    ctty_rc: i32,
+    /// `TIOCGPGRP` on the slave once the session holds it.
+    after_ctty: i32,
+    /// The four refusals, asked while the leader is still the foreground.
+    zero_rc: i32,
+    negative_rc: i32,
+    unknown_rc: i32,
+    foreign_rc: i32,
+    /// Their errnos, in the same order.
+    zero_errno: i32,
+    negative_errno: i32,
+    unknown_errno: i32,
+    foreign_errno: i32,
+    /// `TIOCGPGRP` after the four - they moved nothing.
+    final_group: i32,
+    /// The group of the child the one allowed move names, its return code, and
+    /// the answer the terminal leaves behind.
+    kid: i32,
+    to_kid_rc: i32,
+    after_move: i32,
+}
+
+impl ForegroundReport {
+    fn words(self) -> [i32; 15] {
+        [
+            self.pgid,
+            self.ctty_rc,
+            self.after_ctty,
+            self.zero_rc,
+            self.negative_rc,
+            self.unknown_rc,
+            self.foreign_rc,
+            self.zero_errno,
+            self.negative_errno,
+            self.unknown_errno,
+            self.foreign_errno,
+            self.final_group,
+            self.kid,
+            self.to_kid_rc,
+            self.after_move,
+        ]
+    }
+
+    fn from_words(w: &[i32; 15]) -> Self {
+        Self {
+            pgid: w[0],
+            ctty_rc: w[1],
+            after_ctty: w[2],
+            zero_rc: w[3],
+            negative_rc: w[4],
+            unknown_rc: w[5],
+            foreign_rc: w[6],
+            zero_errno: w[7],
+            negative_errno: w[8],
+            unknown_errno: w[9],
+            foreign_errno: w[10],
+            final_group: w[11],
+            kid: w[12],
+            to_kid_rc: w[13],
+            after_move: w[14],
+        }
+    }
+}
+
+/// `TIOCGPGRP` on `fd`: `(rc, errno, the group it answered)`.
+fn getpgrp(fd: libc::c_int) -> (libc::c_long, i32, i32) {
+    let mut group: i32 = -1;
+    let (rc, errno) = ioctl(
+        fd,
+        libc::TIOCGPGRP as libc::c_ulong,
+        &mut group as *mut i32 as usize,
+    );
+    (rc, errno, group)
+}
+
+/// `TIOCSPGRP` on `fd`, naming `group`: `(rc, errno)`.
+fn setpgrp_ioctl(fd: libc::c_int, group: i32) -> (libc::c_long, i32) {
+    ioctl(
+        fd,
+        libc::TIOCSPGRP as libc::c_ulong,
+        &group as *const i32 as usize,
+    )
+}
+
+/// The foreground half, in a child of its own that is the getty: a session
+/// leader whose controlling terminal is the slave.
+///
+/// The order matters and is the measurement's: the four refusals are asked
+/// while the leader still holds the foreground, and the one move that succeeds
+/// comes last - so every row is a shape Linux answers the same way from the
+/// same position, and none of them is the background rule this kernel does not
+/// implement.
+fn foreground_child(path: &std::ffi::CStr, parent_pgid: i32) -> ForegroundReport {
+    let (read_end, write_end) = rustix::pipe::pipe().expect("a pipe for the child's report");
+    // SAFETY: the child writes one fixed-size record to a pipe it owns and
+    // exits; it touches nothing the parent will read back.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        drop(read_end);
+        let mut report = ForegroundReport::default();
+        // SAFETY: `setsid` only fails for a process that is already a group
+        // leader, and this one is a fresh child of the test.
+        if unsafe { libc::setsid() } >= 0 {
+            report.pgid = unsafe { libc::getpgrp() };
+            if let Ok(slave) = open(path, OFlags::RDWR, Mode::empty()) {
+                let raw = slave.as_fd().as_raw_fd();
+                let (rc, _) = ioctl(raw, libc::TIOCSCTTY as libc::c_ulong, 0);
+                report.ctty_rc = rc as i32;
+                let (_, _, group) = getpgrp(raw);
+                report.after_ctty = group;
+
+                // The four refusals, from the foreground group.
+                let (rc, errno) = setpgrp_ioctl(raw, 0);
+                report.zero_rc = rc as i32;
+                report.zero_errno = errno;
+                let (rc, errno) = setpgrp_ioctl(raw, -1);
+                report.negative_rc = rc as i32;
+                report.negative_errno = errno;
+                let (rc, errno) = setpgrp_ioctl(raw, 999_999);
+                report.unknown_rc = rc as i32;
+                report.unknown_errno = errno;
+                // The test process is in another session: no terminal of this
+                // one may be handed its group.
+                let (rc, errno) = setpgrp_ioctl(raw, parent_pgid);
+                report.foreign_rc = rc as i32;
+                report.foreign_errno = errno;
+                let (_, _, group) = getpgrp(raw);
+                report.final_group = group;
+
+                // And the move that is allowed: a child of this session, in a
+                // group of its own. It never reads - a background read is
+                // `SIGTTIN`'s business, which is named and not built here.
+                let kid = unsafe { libc::fork() };
+                if kid == 0 {
+                    // SAFETY: `setpgid` on the child's own pid, into a group it
+                    // makes; `pause` parks it until the leader kills it.
+                    unsafe { libc::setpgid(0, 0) };
+                    unsafe { libc::pause() };
+                    leave(0);
+                }
+                // SAFETY: `setpgid` on a child of this process, into the group
+                // that child just made; a refused call is what the claim reads.
+                unsafe { libc::setpgid(kid, kid) };
+                report.kid = kid;
+                let (rc, _) = setpgrp_ioctl(raw, kid);
+                report.to_kid_rc = rc as i32;
+                let (_, _, group) = getpgrp(raw);
+                report.after_move = group;
+                // SAFETY: the child is parked and this one can end it.
+                unsafe { libc::kill(kid, libc::SIGKILL) };
+                unsafe { libc::waitpid(kid, std::ptr::null_mut(), 0) };
+            }
+        }
+        let mut bytes = [0u8; 60];
+        for (i, word) in report.words().into_iter().enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let _ = rustix::io::write(&write_end, &bytes);
+        leave(0);
+    }
+    drop(write_end);
+    let mut bytes = [0u8; 60];
+    let _ = read_record(read_end.as_fd(), &mut bytes);
+    // SAFETY: the child has reported and exited; its status is not the claim.
+    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+    let mut words = [0i32; 15];
+    for (i, word) in words.iter_mut().enumerate() {
+        *word = i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+    }
+    ForegroundReport::from_words(&words)
+}
+
+/// Who the terminal belongs to after a process in *another session* has read
+/// it.
+///
+/// This is the claim the old kernel failed: `Tty::read` recorded the reading
+/// task's group as the terminal's foreground, so a program that read a
+/// terminal it never claimed became its owner - it received the typed signals
+/// and `tcgetpgrp` named it. Linux's answer is that reading is not claiming:
+/// the group stays where the session put it.
+///
+/// The reader is this, the test process - which is in the harness's session and
+/// whose controlling terminal is not this pair - so it is on the right side of
+/// Linux's `SIGTTIN` rule: a reader in a *background group of the terminal's own
+/// session* is stopped there rather than served (`docs/uapi/` §5.2 names that,
+/// and this kernel has no such signal to send).
+#[derive(Clone, Copy, Default)]
+struct ReaderReport {
+    /// The group the claiming child's session put on the terminal.
+    claimed: i32,
+    /// What the outsider's `read` of the slave answered.
+    served: i32,
+    /// The group the terminal reports afterwards.
+    after: i32,
+}
+
+fn outsider_reader(master: BorrowedFd<'_>, path: &std::ffi::CStr) -> ReaderReport {
+    let (read_end, write_end) = rustix::pipe::pipe().expect("a pipe for the claimer's report");
+    // SAFETY: the child writes one word to a pipe it owns and parks; it exits
+    // only when this process kills it.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        drop(read_end);
+        let mut claimed: i32 = -1;
+        // SAFETY: `setsid` only fails for a process that is already a leader.
+        if unsafe { libc::setsid() } >= 0 {
+            if let Ok(slave) = open(path, OFlags::RDWR, Mode::empty()) {
+                ioctl(
+                    slave.as_fd().as_raw_fd(),
+                    libc::TIOCSCTTY as libc::c_ulong,
+                    0,
+                );
+                let (_, _, group) = getpgrp(slave.as_fd().as_raw_fd());
+                claimed = group;
+            }
+        }
+        let _ = rustix::io::write(&write_end, &claimed.to_le_bytes());
+        // SAFETY: parked until the parent kills it; the parent owns the
+        // sequence, so the terminal cannot lose its session mid-measurement.
+        unsafe { libc::pause() };
+        leave(0);
+    }
+    drop(write_end);
+    let mut word = [0u8; 4];
+    let _ = read_record(read_end.as_fd(), &mut word);
+    let claimed = i32::from_le_bytes(word);
+    // A line is queued first, so the read below completes instead of parking:
+    // the claim is about who the terminal names, not about a blocking call.
+    let mut report = ReaderReport {
+        claimed,
+        served: -1,
+        after: -1,
+    };
+    if let Ok(slave) = open(path, OFlags::RDWR | OFlags::NOCTTY, Mode::empty()) {
+        let _ = rustix::io::write(&master, b"y\n");
+        let mut byte = [0u8; 1];
+        if let Ok(n) = rustix::io::read(&slave, &mut byte) {
+            report.served = n as i32;
+        }
+        let (_, _, group) = getpgrp(master.as_raw_fd());
+        report.after = group;
+    }
+    // SAFETY: the child is parked and this process can end it.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+    report
+}
+
+/// Fill `buf` from `fd`, or as much as arrives before the writer closes.
+///
+/// A bare `read` here is a race with the child's exit: this process is parked in
+/// the read when the child's own death delivers a signal to it, and an
+/// interrupted read is not an empty record. Measured the hard way - the record
+/// came back as fifteen zeroes under the old kernel and as fifteen answers under
+/// the new one, which looked like a kernel difference and was this loop.
+fn read_record(fd: BorrowedFd<'_>, buf: &mut [u8]) -> usize {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match rustix::io::read(fd, &mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e == rustix::io::Errno::INTR => continue,
+            Err(_) => break,
+        }
+    }
+    filled
 }
 
 fn main() {
@@ -511,6 +792,37 @@ fn main() {
         got == Ok(5) && &printed[..5] == b"out\r\n",
     );
 
+    // The foreground group is *session state*, and these are its two halves.
+    //
+    // First, a pair nobody holds: it has no foreground to report and none to
+    // hand anywhere. Measured on a current host (`.workbuddy/probe_tty_fg.c`,
+    // Linux 7.2.11), the *slave* answers `ENOTTY` while the *master* answers
+    // `0` - Linux asks the controlling-terminal question of the slave end only,
+    // because a supervisor that holds nothing but the master has no other way
+    // to learn whether it can do job control at all.
+    let (rc, errno, _) = getpgrp(slave.as_fd().as_raw_fd());
+    r.check(
+        "a pair nobody holds has no foreground group to report",
+        rc != 0 && errno == libc::ENOTTY,
+    );
+    let (rc, _, group) = getpgrp(master.as_fd().as_raw_fd());
+    r.check(
+        "and its master answers zero rather than refusing",
+        rc == 0 && group == 0,
+    );
+    // SAFETY: `getpgrp` reads the caller's own group.
+    let own = unsafe { libc::getpgrp() };
+    let (rc, errno) = setpgrp_ioctl(slave.as_fd().as_raw_fd(), own);
+    r.check(
+        "handing a group to a pair nobody holds is ENOTTY",
+        rc != 0 && errno == libc::ENOTTY,
+    );
+    let (rc, _, group) = getpgrp(master.as_fd().as_raw_fd());
+    r.check(
+        "and the refused hand left no group behind",
+        rc == 0 && group == 0,
+    );
+
     // SIGWINCH: a *change* to the window is announced. The signal goes to the
     // terminal's foreground group - which is a session leader's own group once
     // the slave is its controlling terminal, the getty's arrangement described
@@ -532,6 +844,67 @@ fn main() {
     r.check(
         "the signal that arrived is SIGWINCH",
         report.signo == libc::SIGWINCH,
+    );
+
+    // Second: the session that holds it. `TIOCSCTTY` is what puts a group
+    // there (`__proc_set_tty`), and nothing else does - in particular not a
+    // read. The child parks a reader in a group of its own and asks again: the
+    // answer is still the leader's group, which is the whole difference between
+    // session state and "whoever is reading".
+    let report = foreground_child(path.as_c_str(), own);
+    r.check(
+        "the getty child is a session leader in a group of its own",
+        report.pgid > 0 && report.pgid == report.after_ctty,
+    );
+    r.check("claiming the terminal succeeded", report.ctty_rc == 0);
+    r.check(
+        "the group a session claims the terminal with is its own",
+        report.after_ctty == report.pgid && report.pgid > 0,
+    );
+    r.check(
+        "a group number that names nothing is ESRCH",
+        report.zero_rc == -1 && report.zero_errno == libc::ESRCH,
+    );
+    r.check(
+        "a group number past the last process is ESRCH too",
+        report.unknown_rc == -1 && report.unknown_errno == libc::ESRCH,
+    );
+    r.check(
+        "a negative group number is EINVAL",
+        report.negative_rc == -1 && report.negative_errno == libc::EINVAL,
+    );
+    r.check(
+        "a group in another session is EPERM",
+        report.foreign_rc == -1 && report.foreign_errno == libc::EPERM,
+    );
+    r.check(
+        "the four refusals moved nothing",
+        report.final_group == report.pgid,
+    );
+    r.check(
+        "the move to a group of the same session is served",
+        report.to_kid_rc == 0,
+    );
+    r.check(
+        "and the terminal answers the group it was handed",
+        report.after_move == report.kid,
+    );
+
+    // Third: reading is not claiming. A process in another session - this one -
+    // reads the slave, and the group the owning session put there is still the
+    // answer afterwards. The old kernel made the reader the owner here.
+    let reader = outsider_reader(master.as_fd(), path.as_c_str());
+    r.check(
+        "the claiming child's group is what the terminal names",
+        reader.claimed > 0 && reader.claimed != own,
+    );
+    r.check(
+        "a process in another session reads the slave",
+        reader.served == 1,
+    );
+    r.check(
+        "and reading it does not make the reader the foreground group",
+        reader.after == reader.claimed,
     );
 
     // FIONREAD on a pty. A pair is one terminal and the request answers the

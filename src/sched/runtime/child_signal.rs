@@ -382,6 +382,16 @@ pub fn pgid_of(id: TaskId) -> Option<TaskId> {
     with_table(|t| t.tasks.get(id.0)?.as_ref().map(|task| task.pgid))
 }
 
+/// The session a task belongs to, by the ABI's number.
+///
+/// A *group* has one too - every member of a group is in the same session, so
+/// the leader's answer is the group's - and that is the question `TIOCSPGRP`
+/// asks before it moves a terminal's foreground: a terminal carries the
+/// signals of its own session, not of any group that names it.
+pub fn session_of(id: TaskId) -> usize {
+    with_table(|t| t.task(id).session.0)
+}
+
 /// Bind the running task's controlling terminal, by the terminal's device id.
 ///
 /// `TIOCSCTTY` is the caller. Binding is two facts at once: `/dev/tty` opens

@@ -373,35 +373,55 @@ Section numbers are unchanged from the original `UAPI.md`.
   `tx_packets` by exactly one and `tx_bytes` by exactly the frame's size — is the pin. The park
   itself is `t-udpblock`. `docs/notes/` §10.4.
 
-- **A terminal's foreground group, and a pty's number: two conventions this kernel
-  answers its own way.** (a) *Whose signals a terminal carries.* Linux keeps a
-  terminal's foreground group strictly as session state: it is set when a session
-  leader makes the tty its controlling terminal (`__proc_set_tty`) or by
-  `TIOCSPGRP` from that session, and a terminal no session holds has none -
-  measured on a current host, `TIOCSWINSZ` on a fresh pair's master runs no
-  handler at all (five setups probed: nothing claimed, `tcsetpgrp` without a
-  session, a read first, and a session leader with the slave as its ctty - only
-  the last two deliver, and the third only on this kernel), `TIOCGPGRP` on its
-  slave answers `-1`/`ENOTTY` (errno 25) and `tcsetpgrp(slave, getpgrp())` is
-  refused with the same number. This kernel answers "the reader": `Tty::read`
-  records the reading task's group as the terminal's foreground
-  (`src/vfs/tty.rs`, "the same answer for a program that never asks"), and
-  `TIOCGPGRP` reports zero rather than refusing when nobody owns the terminal
-  (`src/syscall/linux/fs/ioctl.rs`'s `0x540F`/`0x5410` arm). A program that reads
-  a tty it never claimed therefore *receives* the typed `SIGINT` and the resize
-  `SIGWINCH` here, where Linux would aim at nobody, and a supervisor asking
-  `tcgetpgrp` on a pair no session holds reads `0` here and an error there.
-  Owner: `src/vfs/tty.rs`'s `read`/`foreground` and `src/sched/runtime/`'s ctty
-  bookkeeping. `t-pty` pins the *delivery* on **both** machines by giving the pair
-  a session the ABI's way - a getty's `setsid` + open + `TIOCSCTTY` - and names
-  this rule in its comment instead of pinning it. (b) *The number `TIOCGPTN`
-  mints.* This kernel numbers its pairs past the six virtual consoles
-  (`src/vfs/pty.rs`'s counter starts at `VC_COUNT + 1`); Linux's `devpts` numbers
-  from 0 - measured on a current host, which answered 5. Both name a real slave,
-  so no caller is misled, but a program that hard-codes a first number does not
-  meet it here. `t-pty` pins this kernel's answer on the payload and accepts the
-  host's under `MPOS_ON_HOST`, printing what the host said. `docs/notes/` §15.11
-  (batch 22).
+- **A terminal's foreground group is *session state*, and a reader is not its owner.
+  Landed 2026-10-18** (`docs/uapi/` §5.1 item 56). The entry that stood here had two
+  halves; the second - the number `TIOCGPTN` mints past the six virtual consoles - is
+  this kernel's own and stays pinned as its own (`t-pty`: the payload under the sweep,
+  the host's number printed under `MPOS_ON_HOST`). The first was the divergence, and it
+  is closed: Linux keeps a terminal's foreground group strictly as the *session's*
+  answer, set when a session leader makes the tty its controlling terminal
+  (`__proc_set_tty`) or by `TIOCSPGRP` from that session, and reading never sets it.
+  This kernel answered with the reader - `Tty::read` recorded the reading task's group
+  as the terminal's foreground ("the same answer for a program that never asks") - so a
+  program that read a tty it never claimed became its owner: it received the typed
+  `SIGINT`/`SIGQUIT`/`SIGTSTP` and the resize `SIGWINCH`, and `tcgetpgrp` named it.
+  Measured whole on a current host first (`.workbuddy/probe_tty_fg.c` and
+  `probe_tty_fg2.c`, Linux 7.2.11, every scenario in a session of its own):
+
+  * **a pair nobody holds has no group**: `TIOCGPGRP` on the *slave* is `ENOTTY`
+    (errno 25) and on its *master* answers `0`; `TIOCSPGRP` is `ENOTTY` on either end,
+    and `TIOCSWINSZ` succeeds with nobody to tell. The master's answer is not an
+    oversight - Linux asks the controlling-terminal question of the slave end only
+    (`tty == real_tty && current->signal->tty != real_tty`), because a supervisor that
+    holds nothing but the master has no other way to learn whether it can do job
+    control at all;
+  * **being a session leader is not holding it**: the same answers after `setsid`
+    until `TIOCSCTTY` lands, and then the group is the leader's own - on both ends,
+    since a pair is one terminal;
+  * **the refusals are ordered and distinguishable**: from the owning session
+    `TIOCSPGRP` answers `EFAULT` for a bad pointer, `EINVAL` for a negative number,
+    `ESRCH` for one that names no process (zero included), `EPERM` for a group in
+    another session - and the group it would not take is where it was;
+  * **reading is not claiming**: a process in *another session* reads the slave and the
+    answer does not move. That is the row the old kernel failed.
+
+  Two more measured shapes are named rather than built: a background group that tries
+  to change the terminal is refused `ENOTTY` when its group is orphaned (with `SIGTTOU`
+  caught) and served when `SIGTTOU` is ignored - this kernel has no terminal-generated
+  `SIGTTOU` to send, so it serves the call; and a *background read* of the terminal's
+  own session is `SIGTTIN`'s business on Linux (measured: the reader is stopped, its
+  read never completes), which is a signal this kernel does not raise either. Neither
+  is reachable from the fixture, which puts its reader in another session precisely so
+  both sides of the boundary are the shapes measured. `TIOCNOTTY` is measured but not
+  served here (Linux hangs up the session with `SIGHUP`); it is named in §5.1 item 56
+  and stays outside this entry.
+
+  Owner: `src/vfs/tty.rs`'s `read`/`foreground` (the claim is gone), the `0x540F`/`0x5410`
+  arm of `src/syscall/linux/fs/ioctl.rs` (the session questions and the order of the
+  refusals), and `src/sched/runtime/child_signal.rs`'s `session_of` beside the existing
+  `session_of_tty`. Pin: `t-pty`'s two foreground sections, **17 claims** (54 in the
+  file, was 37), all green on a current host first. `docs/notes/` §15.75 carries the
+  gates, the counterfactual and the two fixture lessons.
 
 - **`FIONREAD` answers Linux's per-type byte count on a regular file, a pipe, a socket and a
   terminal. Landed 2026-10-17** (`docs/uapi/` §5.1 item 30). The entry this replaces said this

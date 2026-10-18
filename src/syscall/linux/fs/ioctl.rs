@@ -176,6 +176,23 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             //
             // TIOCSPGRP is 0x5410 on x86_64 - 0x541E is TIOCSETD, and routing
             // the pair there was why every `tcsetpgrp` read back ENOTTY.
+            //
+            // The group is **session state**, and that is the whole of the
+            // rule this arm asks: a terminal has a foreground group because a
+            // session claimed it with `TIOCSCTTY` (`__proc_set_tty`), and only
+            // that session may move it. A pair nobody holds has no foreground
+            // to report and no group to hand anywhere - measured on a current
+            // host (`.workbuddy/probe_tty_fg.c`, `probe_tty_fg2.c`, Linux
+            // 7.2.11): `TIOCGPGRP` on the *slave* of a fresh pair is `ENOTTY`,
+            // and on its *master* answers `0` (Linux asks the controlling-
+            // terminal question of the slave end only); `TIOCSPGRP` is
+            // `ENOTTY` on either end with nobody holding the pair, and from a
+            // process in another session; and a session that does hold it
+            // answers `EFAULT` for a bad pointer, `EINVAL` for a negative
+            // number, `ESRCH` for one that names nothing, and `EPERM` for a
+            // group that lives in another session. This kernel used to make
+            // the *reader* the foreground (`Tty::read`), which is a different
+            // answer to a question no reader asked.
             let file = match crate::sched::current_fds().clone_at(fd) {
                 Ok(f) => f,
                 Err(e) => return err_of(e),
@@ -184,17 +201,31 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             let Some(tty) = inode.as_tty() else {
                 return err::ENOTTY;
             };
+            // The name a session binds is the *slave*'s: `TIOCSCTTY` records
+            // the slave's device id, and both ends of a pty are one terminal,
+            // so the master asks under the same name.
+            let dev_id = match inode.as_pty() {
+                Some(pty) => Some(pty.slave_dev_id()),
+                None => inode.rdev(),
+            };
+            let held =
+                dev_id.is_some_and(|d| crate::sched::controlling_tty_of_current() == Some(d));
 
             if request == 0x540F {
+                // Only the slave end carries the question. A supervisor that
+                // holds nothing but the master asks this pair to learn whether
+                // it can do job control at all, which is why the master has to
+                // answer.
+                if inode.as_pty().is_none() && !held {
+                    return err::ENOTTY;
+                }
                 if !buffer_ok(buf, 4, true, from_user) {
                     return err::EFAULT;
                 }
-                // Zero is what a terminal with no foreground job reports, and
-                // it is a valid answer rather than an error: a shell is
-                // allowed to find out that nobody owns the terminal yet.
                 // The group's leader, in the *caller's* namespace - the same
                 // number the caller would hand back to `TIOCSPGRP`. Zero stays
-                // zero: a terminal with no foreground job has no number at all.
+                // zero: a terminal whose session has no foreground group (or a
+                // master whose pair nobody holds) has no number at all.
                 let pgid = tty
                     .foreground()
                     .and_then(crate::sched::pid_number_of)
@@ -203,20 +234,33 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 return 0;
             }
 
+            // `TIOCSPGRP` is the session's own door, on both ends.
+            if !held {
+                return err::ENOTTY;
+            }
             if !buffer_ok(buf, 4, false, from_user) {
                 return err::EFAULT;
             }
             let pgid = unsafe { (buf as *const i32).read_unaligned() };
-            if pgid <= 0 {
+            if pgid < 0 {
                 return err::EINVAL;
             }
             // A group number is a pid number in the caller's namespace: the
             // number names the group's leader there, and one that names nothing
-            // is `EINVAL` - what a terminal says about a group it cannot be
+            // is `ESRCH` - what a terminal says about a group it cannot be
             // asked to hand the foreground to.
             let Some(leader) = crate::syscall::linux::proc::pid_task(pgid as isize) else {
-                return err::EINVAL;
+                return err::ESRCH;
             };
+            // A terminal carries the signals of *its* session: a group from
+            // another one would be handed a line its members cannot read and
+            // would be sent signals they never asked for.
+            let Some(session) = dev_id.and_then(crate::sched::session_of_tty) else {
+                return err::ENOTTY;
+            };
+            if crate::sched::session_of(leader) != session {
+                return err::EPERM;
+            }
             tty.set_foreground(Some(leader));
             // POSIX's `tcsetpgrp` is not only a record: it sends `SIGCONT` to
             // the group it names. That is what resumes a job that stopped

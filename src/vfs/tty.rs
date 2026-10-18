@@ -2179,17 +2179,16 @@ impl Tty {
         let id = crate::sched::current();
         // The waiter is registered inside `read_blocking`, re-armed on every
         // pass, rather than once here - see the reason there.
-        // While this task is reading, an interrupt typed at the console is
-        // meant for its process group - not for whatever waits on it. A shell
-        // that has claimed the terminal with `TIOCSPGRP` has already said who
-        // that is; this is the same answer for a program that never asks.
-        // The kernel's own boot task has no process group; recording its
-        // id would name a group that can never be signalled, and every
-        // later `tcgetpgrp` on this terminal would read the poison.
-        let fg = crate::sched::pgid_of(id).unwrap_or(id);
-        if fg != crate::sched::TaskId(0) {
-            self.set_foreground(Some(fg));
-        }
+        //
+        // Reading does not make the reader the terminal's foreground group.
+        // The foreground is *session state*: a session puts a group there with
+        // `TIOCSCTTY` or `TIOCSPGRP` and nowhere else, so a program that reads
+        // a terminal it never claimed is a background reader - it gets the
+        // bytes and none of the typed signals, which is Linux's answer and
+        // what `tcgetpgrp` has to be able to report (`.workbuddy/probe_tty_fg.c`
+        // measured the pair-nobody-holds case as `ENOTTY` on the slave). The
+        // interrupt, quit and suspend paths below read `foreground` for what
+        // the session said, never for who happens to be blocked in here.
         let got = self.read_blocking(buf);
         critical_section::with(|cs| {
             self.waiters.borrow(cs).borrow_mut().retain(|&w| w != id);
