@@ -1118,7 +1118,7 @@ the commit bodies), and each moved its pin in the same commit.
     **The fix is the word following the node, and it turns out to be Linux's own rule on both
     trees**: `proc_create` with no mode means `S_IRUGO`, `DEVICE_ATTR_RO` and `DEVICE_ATTR_RW` are
     the two sysfs words, and a directory carries what its creator asked for. So the *types* answer —
-    `ProcCtl` and `ProcConfig` `0644`, `ProcFile` `0444`, `ProcDir` and `MirrorDir` `0555`, the sysfs
+    `ProcCtl` and `ProcConfig` `0644`, `ProcFile` `0444`, `ProcDir` `0555`, the sysfs
     attribute types `0444`/`0644`, and `SysDir` the kind's own unless it is the root — with the
     nodes whose word is narrower than their shape saying it themselves: `env_file` for
     `/proc/<pid>/environ` (`0400`, both spellings under the process's directory and the thread's),
@@ -1131,12 +1131,13 @@ the commit bodies), and each moved its pin in the same commit.
     word is a *report* and not a gate: procfs keeps no modes to enforce, so an `0400` node is readable
     by any caller exactly as its `0444` neighbours are — the mode-less filesystem's own limit,
     unchanged by this pass. And three names differ in *kind* before the mode can: Linux answers `0777`
-    links for `/proc/self`, `/proc/thread-self` and `/proc/mounts`, where this kernel answers a
-    directory, so their word follows the shape they actually have.     Owner: `src/vfs/procfs.rs`'s
-    `ProcFile`/`ProcCtl`/`ProcDir`/`MirrorDir`/`ProcConfig` and `src/vfs/sysfs.rs`'s
+    links for `/proc/self`, `/proc/thread-self` and `/proc/mounts`, where this kernel answered a
+    directory — **closed by item 46**, which deleted the `MirrorDir` node those two names were built
+    from.     Owner: `src/vfs/procfs.rs`'s
+    `ProcFile`/`ProcCtl`/`ProcDir`/`ProcConfig` and `src/vfs/sysfs.rs`'s
     `SysDir`/`SysFile`/`SysConfig`/`SysPciEvent`/`SysEventAttr`. Pin: `t-proc-modes` (18 claims at
-    this landing - **20** since item 45, the same on both machines and green on this host first),
-    plus two host unit tests for the mapping
+    this landing - **20** since item 45, **35** since item 46, the same on both machines and green on
+    this host first), plus two host unit tests for the mapping
     itself (`a_proc_nodes_own_mode_follows_its_shape`, and sysfs's
     `a_sysfs_node_reports_its_own_mode_rather_than_the_trees_kind_default`), and both fixtures — which
     block device, which PCI bus — are *asked for* by walking rather than named, so the same claims
@@ -1644,3 +1645,61 @@ the commit bodies), and each moved its pin in the same commit.
     reachable on Linux - cannot exist in this kernel at all, because every mount it can make lands
     on a directory (`bind` of a file is `EINVAL`, `mount_new` is `ENOTDIR`); the question is asked of
     the node anyway, because it is Linux's rule and it costs a comparison.
+
+## item 46 — the three procfs names Linux makes links are links
+
+    §5.2's third and last named consequence of item 37, and the shortest one to state: Linux answers a
+    `0777` **symlink** for `/proc/self`, `/proc/thread-self` and `/proc/mounts`, where this kernel
+    answered a directory (a `MirrorDir`, forwarding to the reading process's own directory) for the
+    first two and a plain `0444` file for the third. Item 37 named it as a consequence rather than
+    fixing it - "their word follows from the shape and stays as it is" - and `t-proc-modes`' header
+    carried the same sentence from the other side, which is what made this the last of that pass'
+    three.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_proc_self_links.c`, Linux 7.2.9,
+    root for the namespace half), and the fourth question is the one a table cannot guess:
+
+    * **the shape and the target** - `lstat` is `0777` for each of the three; `readlink` answers
+      `95884`, `95884/task/95884` and `self/mounts`; `stat` *follows* them to a directory (`0555`), a
+      directory and a regular file (`0444`); and a `/proc` listing labels all three `DT_LNK`;
+    * **the number is the reader's, in the pid namespace the *procfs instance* belongs to** - a
+      process whose `getpid()` is `1` inside a fresh pid namespace still reads `95886` from the
+      *machine's* `/proc`, and reads `1` from a `/proc` it mounts itself inside that namespace. So
+      the rule is `pid_nr_ns(pid, proc_pid_ns(inode))` rather than "the reader's own number";
+    * **and the size follows how the name was made, not what it answers** - `st_size` is **0** for
+      `/proc/self` and `/proc/thread-self` (registered with an empty target, whatever number they
+      hand back) and **11** for `/proc/mounts`, the length of the text it was registered with.
+
+    **The fix is a node that was already here.** `ProcLink` is "a link whose target is a fact rather
+    than a stored string" - `exe`, `cwd`, `root`, `fd/<n>`, `ns/<entry>` - and its mode is `0777` for
+    everything but a descriptor's second name, which is this measurement's answer. Two things were
+    added to it: a `registered` length (the size Linux sets from the text a name was *made* with, so
+    the two live names report 0 and `/proc/mounts` reports 11) and a `fixed_link(target)` helper for
+    the one name whose target is a path. `/proc/self` is then `link(|| reader_number(current_pid()))`
+    and `/proc/thread-self` is `link(|| "<pid>/task/<tid>")`, both through **the number this tree
+    names the reader by** (the pid namespace's "the number is the reader's" rule) so the link and the
+    directory it leads to cannot disagree; `MirrorDir` is deleted with its last two callers. Nothing
+    else moved: the walk follows a plain link by splicing its text beside the link's own parent, so
+    every name *through* the link (`/proc/self/status`, `/proc/self/fd/N`, `/proc/self/mountinfo`,
+    `/dev/stdin`'s `/proc/self/fd/0`) reaches the same node it reached before, and `readlink`'s
+    shortcut for `exe` and `fd/<n>` compares path *text* and is untouched.
+
+    Pin: `t-proc-modes`, which owns the shape of every node in this tree and used to *exclude* these
+    three by name - **15 new claims**, the kind and mode of each, each followed answer, the target
+    text against the reader's own `getpid`/`gettid`, the registered `st_size`, and the `DT_LNK` a
+    listing hands out (read through `libc::readdir`, since `d_type` is a different answer from
+    `lstat`), beside two host unit tests for the node itself. 35 claims now (was 20), the same on both
+    machines and green on this host first. The reader's *own* number is not the same on two machines,
+    so the two claims that name it put the values in the label only when they disagree - a passing
+    line has to stay diffable. Gate: x86_64 `pass=182 fail=0 (182 built)`, `mpos-kunit 32 passed, 0
+    failed`, exit 33 (182 staged, 11 left out by `tests.toml`) - run twice, the same line both times;
+    the second machine's arm is `pass=181 fail=0`, `mpos-kunit 32 passed, 0 failed` (181 staged, 12
+    left out). The counterfactual is exact: with only `src/vfs/procfs.rs` put back (the pin kept) the
+    sweep is `pass=181 fail=1 (182 built)` with `mpos-kunit` unmoved - the one red program is
+    `t-proc-modes`, and its **ten** red claims are the old shapes by name (`/proc/self reports 0777
+    for a link (got 0555 for a directory)`, the same for `thread-self`, `/proc/mounts reports 0777 for
+    a link (got 0444 for a file)`, all three `readlink`s `got None`, `/proc/mounts`'s `st_size` `got
+    Some(0), want 11`, and the three listings `got Some(4)`/`Some(4)`/`Some(8)` - `DT_DIR`, `DT_DIR`,
+    `DT_REG`) - while every control passes on both kernels: the two followed-door claims for the
+    directories, the two `st_size == 0` claims (zero either way, which is why `/proc/mounts`'s 11 is
+    the discriminating one), and every `/proc/self/...` claim the file already had.

@@ -161,10 +161,13 @@ Section numbers are unchanged from the original `UAPI.md`.
   *report* and not a gate: procfs keeps no modes to enforce, so an `0400` node is readable by any
   caller exactly as its `0444` neighbours are — the mode-less filesystem's own limit, unchanged by
   this pass. Third, three names differ in *kind* before the mode can: Linux answers `0777` links for
-  `/proc/self`, `/proc/thread-self` and `/proc/mounts`, where this kernel answers a directory (a
-  mirror of the process, and a mount table), so their word follows from the shape and stays as it
-  is. Owner: `src/vfs/procfs.rs`'s node types
-  (`ProcFile`/`ProcCtl`/`ProcDir`/`MirrorDir`/`ProcConfig`) and `src/vfs/sysfs.rs`'s
+  `/proc/self`, `/proc/thread-self` and `/proc/mounts`, where this kernel answered a directory (a
+  mirror of the process, and a mount table), so their word followed from the shape - and that
+  consequence **landed on 2026-10-18** (`docs/uapi/` §5.1 item 46): the shapes are Linux's now, the
+  `MirrorDir` node those two names were built from is deleted, and the same program claims the kind,
+  the target text, the registered `st_size` and the `DT_LNK` a listing hands out. Owner:
+  `src/vfs/procfs.rs`'s node types
+  (`ProcFile`/`ProcCtl`/`ProcDir`/`ProcConfig`) and `src/vfs/sysfs.rs`'s
   (`SysDir`/`SysFile`/`SysConfig`/`SysPciEvent`/`SysEventAttr`). Pin: `t-proc-modes`.
 
 - **`getcwd` derives the cwd's name from the directory. Landed 2026-10-17** (`docs/uapi/` §5.1

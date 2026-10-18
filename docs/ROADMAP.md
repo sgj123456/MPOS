@@ -475,6 +475,28 @@ and the outer tree is `EXDEV` on Linux and is still served here, and a *file* mo
 case where `unlink`'s half of the refusal is reachable — cannot exist in this kernel at all, because  
 every mount it can make lands on a directory.
 
+**The three procfs names Linux makes links are links** (`docs/uapi/` §5.1 item 46, landed  
+2026-10-18) — the third and last named consequence of item 37, and the one that program's own header  
+carried from the other side: `/proc/self`, `/proc/thread-self` and `/proc/mounts` are `0777` links  
+on Linux, where this kernel answered a directory (a mirror of the reading process) for the first two  
+and a plain `0444` file for the third. **Measured whole on a current host first**  
+(`.workbuddy/probe_proc_self_links.c`), and two of its questions are the ones a table cannot guess.  
+The target text is the reader's number **in the pid namespace the procfs instance belongs to** — a  
+process whose `getpid()` is 1 inside a fresh pid namespace still reads the outer number from the  
+machine's `/proc`, and reads `1` from a `/proc` it mounts itself inside it. And the `st_size` follows  
+how the name was *made* rather than what it answers: 0 for the two live targets (registered empty)  
+and 11 for `/proc/mounts`, the length of `self/mounts`. The node was already here — `ProcLink`,  
+whose `0777` mode and live target are this measurement's answer — so the landing is a `registered`  
+length, a `fixed_link` helper, the two names built from `link(|| ...)` through the number this tree  
+names the reader by, and the deletion of `MirrorDir` with its last two callers; every name reached  
+*through* a link (`/proc/self/status`, `/proc/self/fd/N`, `/dev/stdin`) reaches the node it reached  
+before. `t-proc-modes` gains 15 claims (35 in the file, was 20), `DT_LNK` in the listing included,  
+and all of them pass on a current host first. One residual stays named: this tree's `/proc` names a  
+task by the *reader's* pid namespace throughout, where Linux keys an instance to the namespace it  
+was mounted for — the same answer for the container case, and different for a task reading a `/proc`  
+mounted outside its own namespace.
+
+
 
 **A child's death is one `SIGCHLD` record, and it is Linux's** (`docs/uapi/` §5.1 item 29, landed  
 2026-10-17): the second book this kernel kept for "an exit whose signal is unread" is deleted — the  

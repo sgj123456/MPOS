@@ -168,6 +168,19 @@ struct ProcLink {
     /// asked for the same way - the walk must not splice this link either,
     /// because its target is a report (`mnt:[<id>]`) rather than a path.
     ns: Option<(usize, crate::vfs::ns::Entry)>,
+    /// The `st_size` of a link that is **not** a descriptor's second name.
+    ///
+    /// Linux's `proc_symlink(name, parent, target)` stores the text and sets the
+    /// inode's size to its length *at build time*, so the number follows the
+    /// text that was registered rather than the text `readlink` later answers -
+    /// and the two are not the same thing for a name whose answer depends on who
+    /// reads it. Measured on a current host
+    /// (`.workbuddy/probe_proc_self_links.c`): `/proc/self` and
+    /// `/proc/thread-self` are **0**, because they were registered with an empty
+    /// target whatever number they hand back, while `/proc/mounts` is **11** -
+    /// the length of `self/mounts`, the only target in this tree that was
+    /// registered as a path. `exe`, `cwd`, `root` and `ns/*` are 0 too.
+    registered: u64,
 }
 
 impl Inode for ProcLink {
@@ -179,10 +192,15 @@ impl Inode for ProcLink {
             // the text `readlink` answers: measured on a current host, an
             // `/proc/<pid>/fd/<N>` link is **64 bytes** whatever it names - a
             // 9-byte `/dev/null` entry, a pathless socket's `socket:[…]` and a
-            // 33-byte `exe`-style target alike. Every other link here reports
-            // zero, which is what Linux reports for `exe`, `cwd`, `root`,
-            // `ns/*` and `/proc/self`.
-            size: if self.fd.is_some() { FD_LINK_SIZE } else { 0 },
+            // 33-byte `exe`-style target alike. A link that is not a descriptor's
+            // second name reports what its name was *registered* with, which is
+            // zero for every live target here and the text's own length for the
+            // one fixed one (`/proc/mounts`).
+            size: if self.fd.is_some() {
+                FD_LINK_SIZE
+            } else {
+                self.registered
+            },
         }
     }
 
@@ -390,46 +408,6 @@ impl Inode for ProcDir {
     }
 }
 
-/// A directory that is whichever directory the closure answers, decided at
-/// every lookup.
-///
-/// `/proc/self` is why this exists: it names a different process's directory
-/// depending on who reads it, so it cannot be built when the tree is built.
-/// Every operation forwards to whatever is true now, and a process that has
-/// gone answers `NoEntry` - the same thing `ls /proc/self` says on Linux for
-/// a pid that no longer exists.
-struct MirrorDir {
-    ino: Ino,
-    resolve: Box<dyn Fn() -> Option<Arc<dyn Inode>> + Send + Sync>,
-}
-
-impl Inode for MirrorDir {
-    fn metadata(&self) -> Metadata {
-        Metadata {
-            ino: self.ino,
-            kind: NodeKind::Dir,
-            size: 0,
-        }
-    }
-
-    fn mode(&self) -> u32 {
-        // A proc directory and nothing else: it reports the tree's own word,
-        // and the *name* Linux answers for this path is a different node -
-        // `/proc/self` and `/proc/thread-self` are `0777` links there, and
-        // `docs/uapi/` §5.2 carries that kind divergence rather than this half
-        // of it.
-        PROC_DIR_MODE
-    }
-
-    fn lookup(&self, name: &str) -> VfsResult<Arc<dyn Inode>> {
-        (self.resolve)().ok_or(VfsError::NoEntry)?.lookup(name)
-    }
-
-    fn read_dir(&self) -> VfsResult<Vec<(String, NodeKind)>> {
-        (self.resolve)().ok_or(VfsError::NoEntry)?.read_dir()
-    }
-}
-
 /// Inode numbers, shared by the whole filesystem rather than kept per mount.
 ///
 /// `/proc`'s nodes are made on demand - a directory per process, built when
@@ -533,6 +511,24 @@ fn link(target: impl Fn() -> Option<String> + Send + Sync + 'static) -> Arc<dyn 
         pid: 0,
         fd: None,
         ns: None,
+        registered: 0,
+    })
+}
+
+/// A link whose target is a **fixed path**, made the way Linux makes one.
+///
+/// `proc_symlink(name, parent, target)` stores the text and sets `st_size` to its
+/// length, so this link reports 11 where a live target reports 0 - measured, and
+/// the reason `/proc/mounts`' size is 11 while `/proc/self`'s is 0
+/// (`.workbuddy/probe_proc_self_links.c`).
+fn fixed_link(target: &'static str) -> Arc<dyn Inode> {
+    Arc::new(ProcLink {
+        ino: next_ino(),
+        target: Box::new(move || Some(alloc::string::String::from(target))),
+        pid: 0,
+        fd: None,
+        ns: None,
+        registered: target.len() as u64,
     })
 }
 
@@ -549,6 +545,7 @@ fn fd_link(
         pid,
         fd: Some(fd),
         ns: None,
+        registered: 0,
     })
 }
 
@@ -2058,6 +2055,7 @@ fn ns_link(pid: usize, entry: crate::vfs::ns::Entry) -> Arc<dyn Inode> {
         pid,
         fd: None,
         ns: Some((pid, entry)),
+        registered: 0,
     })
 }
 
@@ -2482,8 +2480,12 @@ impl ProcFs {
     /// decided, so the file and the fact it reports stay next to each other.
     fn build(&self) {
         // What is mounted where: the only record of it that userland can
-        // read, and the thing `mountinfo` and `mount -a` stand on.
-        self.root.add("mounts", NodeKind::File, file(mounts_text));
+        // read, and the thing `mountinfo` and `mount -a` stand on. Linux makes
+        // this name a **link** to the per-process file (`self/mounts`) and this
+        // is a link to the same place, so a reader arrives at one file by either
+        // spelling - and the file it arrives at is the one `libmount` opens.
+        self.root
+            .add("mounts", NodeKind::Symlink, fixed_link("self/mounts"));
         // Which filesystem types a mount(2) may name. The `nodev` mark is
         // not decoration: a caller mounting a *device* - busybox's mount,
         // probing for the type it was not told - tries the unmarked entries
@@ -2758,28 +2760,34 @@ impl ProcFs {
         });
 
         // `/proc/self`: whichever process is reading, which is not knowable
-        // when the tree is built. The link's *reading* is short-circuited in
-        // the readlink handler for the two names that need a shortcut -
-        // `exe` and `fd/<n>` - but every other name has to resolve through
-        // the process's own directory to be answered at all.
-        let self_dir: Arc<dyn Inode> = Arc::new(MirrorDir {
-            ino: next_ino(),
-            resolve: Box::new(|| process_dir(current_pid())),
-        });
-        self.root.add("self", NodeKind::Dir, self_dir);
+        // when the tree is built - and the shape Linux answers it with is a
+        // **link** to that process's number, not a directory that mirrors it.
+        // The number is the one this tree *names* the reader by
+        // ([`reader_number`], the rule the pid namespace made "the reader's"),
+        // so the link and the directory it leads to cannot disagree; a process
+        // that has gone answers `NoEntry` from the follow, which is the same
+        // thing `ls -l /proc/self` says on Linux for a pid that no longer
+        // exists.
+        self.root.add(
+            "self",
+            NodeKind::Symlink,
+            link(|| Some(alloc::format!("{}", reader_number(current_pid())))),
+        );
         // `/proc/thread-self` is the same idea for the calling *thread*, and
         // exists because a threaded program asking about itself gets a tid,
         // not a pid - `pthread_self` and `gettid` agree with each other and
         // with this, and not with `getpid`.
-        let thread_self: Arc<dyn Inode> = Arc::new(MirrorDir {
-            ino: next_ino(),
-            resolve: Box::new(|| {
-                let tid = current_tid();
-                let pid = current_pid();
-                Some(thread_dir(pid, tid))
+        self.root.add(
+            "thread-self",
+            NodeKind::Symlink,
+            link(|| {
+                Some(alloc::format!(
+                    "{}/task/{}",
+                    reader_number(current_pid()),
+                    reader_number(current_tid())
+                ))
             }),
-        });
-        self.root.add("thread-self", NodeKind::Dir, thread_self);
+        );
     }
 }
 
@@ -2974,6 +2982,81 @@ mod tests {
         // The two halves are bits, so the both-ways word is their union rather
         // than a third value - the shape a socketpair's end reports.
         assert_eq!(fd_link_mode(ACC_RDONLY) | fd_link_mode(ACC_WRONLY), 0o700);
+    }
+
+    /// The three names Linux answers as **links** are links here, with the two
+    /// sizes it reports for them - measured on a current host
+    /// (`.workbuddy/probe_proc_self_links.c`): a live target is registered with
+    /// an empty text and so reports `st_size` **0** even though `readlink`
+    /// answers several bytes, where a fixed target reports **11**, the length of
+    /// `self/mounts`.
+    #[test]
+    fn the_three_names_linux_makes_links_are_links() {
+        let live = link(|| Some(String::from("1234")));
+        assert_eq!(live.metadata().kind, NodeKind::Symlink);
+        assert_eq!(live.mode(), 0o777);
+        assert_eq!(live.metadata().size, 0, "a live target is registered empty");
+        assert_eq!(live.readlink().as_deref(), Ok("1234"));
+
+        let fixed = fixed_link("self/mounts");
+        assert_eq!(fixed.metadata().kind, NodeKind::Symlink);
+        assert_eq!(fixed.mode(), 0o777);
+        assert_eq!(
+            fixed.metadata().size,
+            "self/mounts".len() as u64,
+            "a fixed target's size is the text it was registered with"
+        );
+        assert_eq!(fixed.readlink().as_deref(), Ok("self/mounts"));
+
+        // A link to a process that is gone is `ENOENT`, which is what
+        // `/proc/self` says on Linux after the process it named is reaped.
+        assert_eq!(link(|| None).readlink().err(), Some(VfsError::NoEntry));
+    }
+
+    /// `/proc/self` and `/proc/thread-self` answer the reader's *number*, and
+    /// the number is the one this tree names that reader by - the rule the pid
+    /// namespace made "the reader's" ([`reader_number`]) - so the link and the
+    /// directory it leads to cannot disagree. The second name is the first
+    /// name's, plus its own thread's, which is the shape Linux's
+    /// `<pid>/task/<tid>` has.
+    #[test]
+    fn the_self_names_name_the_reader() {
+        let fs = ProcFs::new();
+        let root = fs.root();
+
+        let self_link = root.lookup("self").expect("a self name");
+        assert_eq!(self_link.metadata().kind, NodeKind::Symlink);
+        let number = self_link.readlink().expect("a live target");
+        assert!(
+            number.chars().all(|c| c.is_ascii_digit()),
+            "the target is the reader's number: {number}"
+        );
+        assert_eq!(
+            number,
+            alloc::format!("{}", reader_number(current_pid())),
+            "and it is the number this tree names the reader by"
+        );
+
+        let thread = root
+            .lookup("thread-self")
+            .expect("a thread-self name")
+            .readlink()
+            .expect("a live target");
+        let want = alloc::format!(
+            "{}/task/{}",
+            reader_number(current_pid()),
+            reader_number(current_tid())
+        );
+        assert_eq!(thread, want);
+        assert!(
+            thread.starts_with(&alloc::format!("{number}/task/")),
+            "the thread's name begins with the process's: {thread}"
+        );
+
+        let mounts = root.lookup("mounts").expect("a mounts name");
+        assert_eq!(mounts.metadata().kind, NodeKind::Symlink);
+        assert_eq!(mounts.metadata().size, "self/mounts".len() as u64);
+        assert_eq!(mounts.readlink().as_deref(), Ok("self/mounts"));
     }
 
     /// The word a procfs node reports about itself is its own shape's, not the

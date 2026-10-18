@@ -58,11 +58,13 @@
 //! itself - it refuses the write - and §5.2 names the difference from Linux's
 //! node beside the measurement.
 //!
-//! `/proc/self` and `/proc/mounts` are not claimed either, and for a third
-//! reason: the *kind* differs before the mode does. Linux answers a `0777` link
-//! for both names, and this kernel answers a directory (a mirror of the
-//! process, and a mount table) - so the mode follows from the shape, and §5.2
-//! is where the shape is named.
+//! `/proc/self`, `/proc/thread-self` and `/proc/mounts` were the third
+//! exception, and are not one any more: the *kind* differed before the mode
+//! could, because Linux answers a `0777` **link** for all three where this
+//! kernel answered a directory (a mirror of the reading process, and a mount
+//! table) - so `§5.2` carried the shape and these names were left unclaimed.
+//! The shapes are Linux's now and the three are claimed below, target text and
+//! `st_size` included (`docs/uapi/` §5.1 item 46).
 //!
 //! The two **mount names themselves** - `/proc` and `/sys` - are claimed
 //! through either door, and used to be the one pair this program had to claim
@@ -280,7 +282,150 @@ fn main() {
         None => r.check("a block device is listed under /sys/class/block", false),
     }
 
+    // ---- the three names Linux answers as links ---------------------------
+    //
+    // A mount point is not the only place the *shape* decides the answer:
+    // `/proc/self`, `/proc/thread-self` and `/proc/mounts` are `0777` links on
+    // Linux, where this kernel answered a directory (a mirror of the reading
+    // process, and a mount table) for all three. Measured whole on a current
+    // host (`.workbuddy/probe_proc_self_links.c`): `lstat` is `0777` for each of
+    // them, the target text is the reader's own number, `<pid>/task/<tid>` and
+    // `self/mounts`, `stat` follows them to a directory, a directory and a
+    // regular file, and a directory listing labels all three `DT_LNK`. The
+    // *sizes* differ by how the name was made, which is the one thing here that
+    // a table cannot guess: a live target was registered empty and reports
+    // **0** however many bytes `readlink` answers, while the fixed one reports
+    // the length of its text.
+    const MOUNTS_TARGET: &str = "self/mounts";
+    for (path, followed_kind, followed_mode) in [
+        ("/proc/self", FileType::Directory, 0o555),
+        ("/proc/thread-self", FileType::Directory, 0o555),
+        ("/proc/mounts", FileType::RegularFile, 0o444),
+    ] {
+        claims(&mut r, path, FileType::Symlink, 0o777);
+        claims_through(
+            &mut r,
+            path,
+            followed_kind,
+            followed_mode,
+            AtFlags::empty(),
+            " through the following door",
+        );
+    }
+    let pid = std::process::id();
+    let tid = unsafe { libc::gettid() } as u32;
+    claims_text(
+        &mut r,
+        "/proc/self reads back the reader's own number",
+        "/proc/self",
+        &pid.to_string(),
+    );
+    claims_text(
+        &mut r,
+        "/proc/thread-self reads back the reader's own thread",
+        "/proc/thread-self",
+        &format!("{pid}/task/{tid}"),
+    );
+    claims_text(
+        &mut r,
+        "/proc/mounts reads back the file it points at",
+        "/proc/mounts",
+        MOUNTS_TARGET,
+    );
+    // The size, which is the length of the text the name was *made* with: an
+    // empty one for the two live names, and this text's own for the fixed one.
+    for (path, want) in [
+        ("/proc/self", 0i64),
+        ("/proc/thread-self", 0),
+        ("/proc/mounts", MOUNTS_TARGET.len() as i64),
+    ] {
+        let got = statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)
+            .ok()
+            .map(|st| st.st_size);
+        r.check(
+            &format!(
+                "{path}'s own st_size is the registered target's length (got {got:?}, want {want})"
+            ),
+            got == Some(want),
+        );
+    }
+    // And the kind a *listing* hands out, which procfs stores beside the node:
+    // a directory that reports a link whose entry says `DT_DIR` is the mistake
+    // this claim exists for.
+    for name in ["self", "thread-self", "mounts"] {
+        let listed = listed_kind("/proc", name);
+        r.check(
+            &format!(
+                "/proc lists {name} as {} (got {listed:?})",
+                dirent_kind_name(libc::DT_LNK as u8)
+            ),
+            listed == Some(libc::DT_LNK as u8),
+        );
+    }
+
     r.finish();
+}
+
+/// Claim that `path`'s link reads back `want`.
+///
+/// The *passing* label has to be the same on every machine that runs this - the
+/// harness diffs the two machines' `ok:` lines - and the reader's own number is
+/// not the same on two boots, let alone two machines. So the two values go into
+/// the label only when they disagree, where a diagnosis is worth more than a
+/// diffable line.
+fn claims_text(r: &mut Report, what: &str, path: &str, want: &str) {
+    let got = link_target(path);
+    if got.as_deref() == Some(want) {
+        r.check(what, true);
+    } else {
+        r.check(&format!("{what} (got {got:?}, want {want:?})"), false);
+    }
+}
+
+/// What `readlink` answers, as text.
+fn link_target(path: &str) -> Option<String> {
+    std::fs::read_link(path)
+        .ok()
+        .map(|target| target.to_string_lossy().into_owned())
+}
+
+/// The `d_type` a listing gives `name` under `dir` - the filesystem's own label
+/// for the entry, which is a different answer from what `lstat` says.
+fn listed_kind(dir: &str, name: &str) -> Option<u8> {
+    let dir = std::ffi::CString::new(dir).ok()?;
+    let want = std::ffi::CString::new(name).ok()?;
+    // SAFETY: `opendir`'s handle is closed on every path out, and each
+    // `readdir` result is read before the next call.
+    unsafe {
+        let stream = libc::opendir(dir.as_ptr());
+        if stream.is_null() {
+            return None;
+        }
+        let mut found = None;
+        loop {
+            let entry = libc::readdir(stream);
+            if entry.is_null() {
+                break;
+            }
+            if libc::strcmp((*entry).d_name.as_ptr(), want.as_ptr()) == 0 {
+                found = Some((*entry).d_type);
+                break;
+            }
+        }
+        libc::closedir(stream);
+        found
+    }
+}
+
+/// A `d_type`'s name, for a failure that says which label came back.
+fn dirent_kind_name(kind: u8) -> &'static str {
+    match kind {
+        libc::DT_DIR => "DT_DIR",
+        libc::DT_REG => "DT_REG",
+        libc::DT_LNK => "DT_LNK",
+        libc::DT_CHR => "DT_CHR",
+        _ => "another kind",
+    }
 }
 
 /// Whether a name under `/proc/bus/pci` is a bus: the directory of functions,
