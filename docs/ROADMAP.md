@@ -353,6 +353,13 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are TCP's record-only buffer sizes  
 (`SO_SNDBUF`/`SO_RCVBUF`); the two namespace kinds with no entry at all are IPC and cgroup.
 
+**A directory is not a byte stream** (`docs/uapi/` §5.1 item 47, landed 2026-10-18): its four read  
+doors answer `EISDIR` — the *kind* before the *count*, so even a zero-length read of one is refused  
+where the same count on a file is `0` — where this kernel answered `EOPNOTSUPP`, and `sendfile`'s  
+*source* question answers `EINVAL` beside it, a different word for a different reason (the copy is  
+a splice, and a directory has none). The write half needs no word of its own: a directory cannot be  
+opened writable at all, and that refusal is where its `EISDIR` comes from.
+
 **A FIFO is a channel now, not a file** (`mknodat(S_IFIFO)` served 2026-10-16, `docs/uapi/` §5.1  
 item 26): its `open` runs Linux's **rendezvous** — a reader and a writer meet at the name, a  
 peerless open parks (or is `ENXIO` under `O_NONBLOCK`), a parked reader counts as a reader so the  

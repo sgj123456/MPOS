@@ -2325,6 +2325,18 @@ pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     if count == 0 {
         return 0;
     }
+    // A directory is not a source, and its answer is this call's rather than its
+    // own read's: measured on a current host (`.workbuddy/probe_dir_io.c`, Linux
+    // 7.2.9), `sendfile(/dev/null, dir, NULL, 16)` answers **`EINVAL`** (22)
+    // where `read(dir, buf, 16)` on the same descriptor is `EISDIR` (21) - the
+    // copy goes through the source's splice path, and a directory has none, so
+    // the caller hears "this source cannot be sent" rather than "that is a
+    // directory". The count is asked first for the same reason the probe
+    // separates the two: `sendfile(..., 0)` is `0` on both kinds. Asked here,
+    // before the loop, so the answer does not depend on how the chunking falls.
+    if input.inode().metadata().kind == crate::vfs::NodeKind::Dir {
+        return err::EINVAL;
+    }
 
     let mut pos: u64 = if offset_ptr != 0 {
         if !buffer_ok(offset_ptr, 8, true, from_user) {

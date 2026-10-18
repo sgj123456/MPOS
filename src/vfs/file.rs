@@ -263,6 +263,23 @@ impl File {
         // Wrong-mode first, before the empty-buffer short-circuit: Linux answers a
         // `read(2)` on an `O_WRONLY` descriptor with `EBADF` even for length 0.
         self.check_readable()?;
+        // Then the kind, and still before the buffer: a directory is not a byte
+        // stream, and Linux asks *which kind* before it asks how many bytes -
+        // measured on a current host (`.workbuddy/probe_dir_io.c`, Linux 7.2.9),
+        // `read(dir, buf, 0)` answers `EISDIR` (21) exactly as `read(dir, buf,
+        // 16)` does, where the same zero count on a file is `0`. The rule is
+        // Linux's directory `f_op`'s own reader (`read = generic_read_dir`,
+        // which returns `-EISDIR`) rather than a decision any door makes, and
+        // this is the one door `read`, `pread64`, `readv` and `preadv` all come
+        // through - which is why it is asked here instead of in four callers.
+        // The write half needs no twin, and that is measured rather than
+        // assumed: a directory cannot be *opened* for writing at all
+        // (`open(dir, O_RDWR)` and `open(dir, O_WRONLY)` are both `EISDIR`,
+        // refused where the description is made), so `EBADF` from
+        // [`Self::check_writable`] is the whole of what a caller meets there.
+        if self.inode.metadata().kind == NodeKind::Dir {
+            return Err(VfsError::IsDir);
+        }
         // A zero-length read is `vfs_read`'s own short-circuit: the file is not
         // touched at all, and here that is a rule with a consequence rather
         // than a courtesy. A *message* - what a datagram socket holds - is
@@ -863,6 +880,36 @@ mod tests {
         assert_eq!(back.read(&mut buf).unwrap(), 11);
         assert_eq!(&buf[..11], b"hello world");
         assert_eq!(file.read(&mut buf).unwrap(), 0);
+    }
+
+    /// A directory is not a byte stream, and the question is its *kind* before
+    /// it is the buffer: measured on a current host
+    /// (`.workbuddy/probe_dir_io.c`, Linux 7.2.9), `read(dir, buf, 0)` answers
+    /// `EISDIR` exactly as `read(dir, buf, 16)` does, where the same zero count
+    /// on a file is `0`. Linux's own reader for the kind is
+    /// `generic_read_dir` - `read = generic_read_dir` in the directory `f_op` -
+    /// so this is not a door's decision but the kind's, and every byte-read
+    /// door (`read`, `pread64`, `readv`, `preadv`) arrives here.
+    #[test]
+    fn a_directory_has_no_byte_reader() {
+        let dir = RamFs::new().root().create("d", NodeKind::Dir).unwrap();
+        assert_eq!(
+            dir.metadata().kind,
+            NodeKind::Dir,
+            "the fixture is a directory"
+        );
+        let description = File::new(dir);
+
+        let mut buf = [0u8; 16];
+        assert_eq!(description.read(&mut buf).unwrap_err(), VfsError::IsDir);
+        // And with no room asked for: the kind outranks the count.
+        assert_eq!(description.read(&mut []).unwrap_err(), VfsError::IsDir);
+
+        // The controls: the same two questions against a regular file, so a
+        // refusal above is the kind rather than the fixture.
+        let file = File::new(RamFs::new().root().create("f", NodeKind::File).unwrap());
+        assert_eq!(file.read(&mut buf).unwrap(), 0);
+        assert_eq!(file.read(&mut []).unwrap(), 0);
     }
 
     /// `O_APPEND` lands every write at the end of the file, and it is the

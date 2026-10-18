@@ -628,23 +628,27 @@ Section numbers are unchanged from the original `UAPI.md`.
   beside the host unit test `an_opened_namespace_descriptor_has_the_shape_a_host_measured`.
 
 - **A directory's `read(2)` answers `EOPNOTSUPP` where Linux answers `EISDIR` — and
-  `sendfile(2)` from one answers `EOPNOTSUPP` where Linux answers `EINVAL`.** Measured on a
-  current host first (Linux 7.2.9, `read(2)` through `ctypes`: `-1`, errno **21** `Is a
-  directory`, and `python3`'s `os.read` agreeing; `sendfile(1, dirfd, NULL, 16)`: `-1`, errno
-  **22** `Invalid argument`, while the same call from a regular file copies the bytes it was
-  asked for) and then in this kernel's own words on a booted machine (2026-10-18, `cat` on a
-  directory: `mpos: syscall 0 (fd 3) -> EOPNOTSUPP`, `cat: read error: Not supported`, with
-  `mpos: syscall 40 (fd 1) -> EOPNOTSUPP` for the `sendfile` attempt that preceded it). Both
-  are the *shape* rule of §3: `EOPNOTSUPP` tells a caller "this kind of file cannot be read
-  that way", and Linux's two answers tell it *what it named* — a program that probes a path
-  with `read` (a shell's `test`, `find`, a listing fallback) branches on the two differently.
-  The owner of the first is `src/vfs/mod.rs`'s `Inode::read_at` default, which is
-  `Err(VfsError::Unsupported)` and which a directory does not override (a directory overrides
-  the *listing* door): Linux's rule lives in the directory's own `f_op` (`read =
-  generic_read_dir`, which returns `-EISDIR`), so this is a kind-wide answer and `Inode::kind`
-  is where the tree already spells those. The second is the `sendfile` arm itself, whose Linux
-  shape validates the source's kind before it reaches any read. Not landed: the pin each wants
-  is one `t-` claim (a directory descriptor read, and a `sendfile` from one), and the kind-wide
-  answer is the half to place first — the same read is a door `getdents` does not share, so the
-  rule is "a `Dir` node has no byte reader", not "a directory cannot be opened".
+  `sendfile(2)` from one answers `EOPNOTSUPP` where Linux answers `EINVAL`. Landed 2026-10-18**
+  (`docs/uapi/` §5.1 item 47). Measured on a current host first (Linux 7.2.9, `read(2)`
+  through `ctypes`: `-1`, errno **21** `Is a directory`, and `python3`'s `os.read` agreeing;
+  `sendfile(1, dirfd, NULL, 16)`: `-1`, errno **22** `Invalid argument`, while the same call
+  from a regular file copies the bytes it was asked for) and then in this kernel's own words
+  on a booted machine (2026-10-18, `cat` on a directory: `mpos: syscall 0 (fd 3) ->
+  EOPNOTSUPP`, `cat: read error: Not supported`, with `mpos: syscall 40 (fd 1) -> EOPNOTSUPP`
+  for the `sendfile` attempt that preceded it). Both are the *shape* rule of §3:
+  `EOPNOTSUPP` tells a caller "this kind of file cannot be read that way", and Linux's two
+  answers tell it *what it named* — a program that probes a path with `read` branches on the
+  two differently. The owner of the first was the trait's default (`Inode::read_at` is
+  `Err(VfsError::Unsupported)`, and a directory overrides the *listing* door rather than this
+  one): Linux's rule lives in the directory's own `f_op` (`read = generic_read_dir`, which
+  returns `-EISDIR`), so it is a kind-wide answer, and the landing spelled it once in the door
+  every read reaches (`File::read`, after the mode check and *before* the empty-buffer
+  short-circuit — measured, a directory's zero-length read is refused too, where a file's is
+  `0`). The second is `sendfile`'s own source question (`EINVAL`), asked after its own
+  count-0 return (measured: `0`), and the write half needs no twin: a directory cannot be
+  *opened* writable at all (`open(dir, O_RDWR)`/`O_WRONLY` are `EISDIR`), so a caller only ever
+  meets a read-only description's `EBADF`. The whole table — five read doors, the two
+  `sendfile` answers, the open refusals and the controls on a regular file — is
+  `.workbuddy/probe_dir_io.c`, and the pin is `t-dir-io` (14 claims) beside the host unit test
+  `a_directory_has_no_byte_reader`; item 47 carries the gates and the counterfactual.
 

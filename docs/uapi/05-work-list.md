@@ -1703,3 +1703,55 @@ the commit bodies), and each moved its pin in the same commit.
     `DT_REG`) - while every control passes on both kernels: the two followed-door claims for the
     directories, the two `st_size == 0` claims (zero either way, which is why `/proc/mounts`'s 11 is
     the discriminating one), and every `/proc/self/...` claim the file already had.
+
+## item 47 — a directory is not a byte stream: `EISDIR` from its read doors, and `EINVAL` from `sendfile`'s source
+
+    §5.2's newest entry, and it began as one line of a boot log rather than as a plan: reading a
+    *symlink to a directory* to see where it pointed printed `cat: read error: Not supported` beside
+    the kernel's own `mpos: syscall 0 (fd 3) -> EOPNOTSUPP` and, for the `sendfile` busybox's `cat`
+    tries first, `mpos: syscall 40 (fd 1) -> EOPNOTSUPP`. Linux's answer for the same two calls is
+    measured, and it is two *different* words - which is the whole item, because `EOPNOTSUPP` tells
+    a caller "this kind of file cannot be read that way" where Linux's tells it *what it named*.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_dir_io.c`, Linux 7.2.9, one line
+    per door, because two cases were slices of a table):
+
+    * **the read doors are `EISDIR` (21)** - `read(dir, buf, 16)`, `pread64(dir, buf, 16, 0)`,
+      `readv(dir, iov)`, `preadv(dir, iov, 0)` - and so is `read(dir, buf, 0)`: the *kind* is asked
+      before the count, where the same zero count on a regular file answers `0`. Linux's owner for
+      it is the directory's own file operations (`read = generic_read_dir`, whose body is
+      `return -EISDIR`), so the rule is the kind's rather than a door's;
+    * **`sendfile(out, dir, NULL, 16)` is `EINVAL` (22)** - the copy goes through the *source's*
+      splice path and a directory has none, so the caller hears "this source cannot be sent" rather
+      than the read's "that is a directory" - while `sendfile(out, dir, NULL, 0)` is **`0`**: this
+      call's own count is asked before its kind, which is why its answer is not the read's;
+    * **the write half has no such word to give, and that is why it is a control rather than a
+      fourth case**: a directory cannot be *opened* writable at all (`open(dir, O_RDWR)` and
+      `open(dir, O_WRONLY)` are both `EISDIR`, measured, refused where the description is made), so
+      the only write a caller can reach is a read-only description's `EBADF` (9). The same
+      measurement is why `copy_file_range` and `splice` are untouched: both already ask the source's
+      kind first and answer `EINVAL` (`copy_file_range` requires `kind == File`, `splice` a pipe on
+      one end), which is Linux's answer for a directory beside `sendfile`'s.
+
+    **The fix is two conditions on the two doors the probe named.** `File::read` asks the kind
+    after the mode check and *before* the empty-buffer short-circuit - the measured order, and the
+    one door `read`, `pread64`, `readv` and `preadv` all arrive at, which is why the answer is
+    spelled once rather than in four callers; `handle_sendfile` asks its own kind question after its
+    own count-0 return and before its loop, so the answer does not depend on how the chunking falls.
+    Nothing else moved: the write half is unreachable by construction (above), and both copy doors
+    were already right.
+
+    Pin: `t-dir-io` (**14 claims**), green on a current host first and with no per-machine branch -
+    each claim is Linux's answer, so a host run is the measurement and the sweep is the pin - beside
+    the host unit test `a_directory_has_no_byte_reader`, which asks the kind question and its
+    zero-length form against a directory and against a file. Gate: x86_64 `pass=183 fail=0 (183
+    built)`, `mpos-kunit 32 passed, 0 failed`, exit 33 (183 staged, 11 left out by `tests.toml`);
+    the second machine's arm is `pass=182 fail=0`, `mpos-kunit 32 passed, 0 failed` (182 staged, 12
+    left out). **The counterfactual is two measurements, because the host stage is a pin too**: with
+    both conditions removed and both pins kept, `cargo xtask test` stops at stage 1 (`560 passed; 1
+    failed` - the unit test, by name) and the sweep never starts; with the two host assertions held
+    aside so the sweep could reach the guest, the same tree is `pass=182 fail=1 (183 built)` with
+    `FAIL t-dir-io` and **six** red claims by name - the five read doors and `sendfile`'s `EINVAL` -
+    while every control passes on both kernels (`sendfile`'s count-0 `0`, the two open refusals, the
+    read-only description's `EBADF` and all four claims against a regular file).
+
