@@ -291,9 +291,18 @@ impl MountTable {
     /// `Arc<dyn FileSystem>` values travel by reference, so a file written
     /// through one table's mount is visible through the other's, exactly as it
     /// is across a fork today. Namespaces isolate names, not data.
-    pub fn copy(&self) -> Arc<MountTable> {
+    ///
+    /// `owner` is the user namespace the namespace belongs to - the one its
+    /// maker stands in (see [`crate::vfs::ns::Namespace::owner`]). It is given
+    /// here rather than at the first read of [`Self::ns_id`] because by then the
+    /// maker is not on the call stack any more: the table would have to guess
+    /// who made it, and a `setns` into it would be asked about the wrong
+    /// namespace.
+    pub fn copy(&self, owner: Arc<crate::userns::UserNs>) -> Arc<MountTable> {
         let fresh = Arc::new(MountTable::new());
         critical_section::with(|cs| {
+            // Minted now, and *owned* now, for the reason above.
+            *fresh.ns_id.borrow(cs).borrow_mut() = crate::vfs::ns::mint_owned(owner);
             *fresh.root.borrow(cs).borrow_mut() = self.root.borrow(cs).borrow().clone();
             *fresh.mounts.borrow(cs).borrow_mut() = self
                 .mounts

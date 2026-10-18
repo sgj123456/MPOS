@@ -2454,8 +2454,15 @@ fn all_homes() -> Vec<(u64, Option<u64>, usize)> {
 /// able to resolve the stack, which is what a `clone` child's first `socket`
 /// depends on. Minting the number anywhere else would leave a window where a
 /// namespace exists on paper and has nothing behind it.
-pub fn mint_namespace() -> u64 {
-    let id = crate::vfs::ns::mint();
+///
+/// `owner` is the user namespace the maker stands in, and it is the answer to
+/// `AF_PACKET`'s question: Linux asks `ns_capable(sock_net(sk)->user_ns,
+/// CAP_NET_RAW)` - the *network* namespace's owner - which is why a bare user
+/// namespace is refused a packet socket (its net namespace is still the
+/// machine's) and one that made its own is served (measured,
+/// `.workbuddy/probe_ns_owner.c`).
+pub fn mint_namespace(owner: Arc<crate::userns::UserNs>) -> u64 {
+    let id = crate::vfs::ns::mint_owned(owner);
     critical_section::with(|cs| {
         NAMESPACES
             .borrow(cs)

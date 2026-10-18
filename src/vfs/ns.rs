@@ -328,6 +328,78 @@ impl Namespace {
     pub fn link_text(&self) -> String {
         link_text(self.kind(), self.id())
     }
+
+    /// The user namespace this namespace belongs to: the one its maker stood in
+    /// when it was made.
+    ///
+    /// A capability question about a namespace *object* is asked of that
+    /// object's owner, not of the caller's own - Linux's
+    /// `ns_capable(ns->user_ns, cap)`, whose walk and measurements are
+    /// [`crate::userns::Caller::capable_in`]. Measured on a current host
+    /// (`.workbuddy/probe_ns_owner.c`): a caller inside a bare user namespace is
+    /// `EPERM` joining the mount namespace it is standing in, and served joining
+    /// one made inside its own.
+    ///
+    /// The owner is kept **here**, beside the pool that numbers the namespace,
+    /// rather than on the six objects: a mount table, a pid namespace, a uts
+    /// namespace, a time namespace, a stack's number and a user namespace live
+    /// in five crates, and the alternative is six fields and five dependencies
+    /// for one fact that is only ever read through the number. A namespace that
+    /// is not in the table was made before anybody unshared, so its owner is the
+    /// machine's.
+    ///
+    /// The one kind that is **its own** owner is `USER`: Linux's
+    /// `struct ns_common` carries `user_ns`, and a user namespace's own points
+    /// at itself - `setns` into one asks the namespace itself rather than the
+    /// one it was made from, which is why joining a *sibling* from inside one
+    /// is `EPERM` while joining one made *inside* it is served (the walk's
+    /// third clause, [`crate::userns::Caller::capable_in`]).
+    pub fn owner(&self) -> Arc<crate::userns::UserNs> {
+        match self {
+            crate::vfs::ns::Namespace::User(ns) => Arc::clone(ns),
+            _ => owner_of(self.id()),
+        }
+    }
+}
+
+/// One entry per namespace ever minted: the number, and whose it is. Its own
+/// alias because the type is three deep and the two readers below are clearer
+/// for it.
+type OwnerTable = critical_section::Mutex<
+    core::cell::RefCell<alloc::vec::Vec<(u64, Arc<crate::userns::UserNs>)>>,
+>;
+
+/// Whose each namespace is, by the number it was given.
+///
+/// Written once, where a namespace is *made* - [`mint_owned`] is the only
+/// writer - and read by [`Namespace::owner`]. One entry per namespace ever
+/// minted, which is the same lifetime the number has: a namespace outlives the
+/// process that made it, because a descriptor can hold it open.
+static OWNERS: OwnerTable =
+    critical_section::Mutex::new(core::cell::RefCell::new(alloc::vec::Vec::new()));
+
+/// Mint a number for a namespace made by a caller standing in `owner`.
+pub fn mint_owned(owner: Arc<crate::userns::UserNs>) -> u64 {
+    let id = mint();
+    critical_section::with(|cs| OWNERS.borrow(cs).borrow_mut().push((id, owner)));
+    id
+}
+
+/// The user namespace that owns the namespace numbered `id`.
+///
+/// The machine's own for one that was never registered, which is every
+/// namespace that exists before the first `unshare`: those are the machine's
+/// tables, and the machine's user namespace is the only owner they can have.
+pub fn owner_of(id: u64) -> Arc<crate::userns::UserNs> {
+    let found = critical_section::with(|cs| {
+        OWNERS
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .find(|(held, _)| *held == id)
+            .map(|(_, owner)| Arc::clone(owner))
+    });
+    found.unwrap_or_else(machine_user_ns)
 }
 
 /// The link's target text: `kind:[<id>]`, which is what a real kernel's

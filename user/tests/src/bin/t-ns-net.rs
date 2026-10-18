@@ -41,6 +41,14 @@
 //! inherited descriptors are no longer a reason to refuse, since each one goes
 //! on working against the stack it was made in.
 //!
+//! The last section asks **whose** capability a packet socket is: `AF_PACKET`'s
+//! `CAP_NET_RAW` is asked of the *network namespace's* owner, not of the
+//! caller's own standing - measured on a current host
+//! (`.workbuddy/probe_ns_owner.c`), where a caller holding the whole set inside
+//! a bare user namespace is still `EPERM` in the machine's network namespace
+//! and served in one it made itself. That is the same walk `setns` asks about
+//! the namespace being joined, and `t-ns-setns` pins that half.
+//!
 //! # The doors
 //!
 //! `rustix::thread::unshare_unsafe`, `rustix::net::{socket, bind, listen,
@@ -81,6 +89,11 @@ use std::net::Ipv4Addr;
 const LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 
 const REPORT_MAX: usize = 128;
+
+/// The sixth rung, which `rustix`'s `UnshareFlags` does not carry: the user
+/// namespace the packet-socket question at the bottom of this file is asked
+/// through.
+const CLONE_NEWUSER: usize = 0x1000_0000;
 
 /// Where the two ends of the descriptor handover meet. A **pathname**, because a
 /// path is the half of the unix family that is *not* namespaced - a task in a
@@ -1198,6 +1211,96 @@ fn main() {
     // machine's only NIC away for a moment, and it puts everything back before
     // it asserts anything.
     wire_moves_into_a_namespace(&mut r);
+
+    // ---- Whose capability a packet socket asks for ----
+    //
+    // `AF_PACKET` is the one door in this file that asks a *capability*, and
+    // the question is not "does the caller hold `CAP_NET_RAW`" but "is the
+    // caller privileged over the **network namespace it is standing in**" -
+    // Linux's `ns_capable(sock_net(sk)->user_ns, CAP_NET_RAW)`. Measured on a
+    // current host (`.workbuddy/probe_ns_owner.c`): a caller inside a bare user
+    // namespace - holding the whole set *in that namespace* - is still
+    // `EPERM`, because the network namespace it is in is the machine's, and
+    // served the moment it has made a network namespace of its own, because
+    // that one's owner is the caller. A child does the whole dance, because the
+    // caller of this test cannot move itself into a user namespace and back.
+    let packet_go = pipe();
+    r.check("the packet pipe is made", packet_go.is_ok());
+    if let Ok((from_child, to_child)) = packet_go {
+        let child = clone_word(libc::SIGCHLD as usize);
+        if child == 0 {
+            // The read end is the parent's to read: this side writes and then
+            // parks nowhere at all - it exits as soon as the report is out.
+            drop(from_child);
+            let unshare_word = |word: usize| -> isize {
+                let rc = unsafe { libc::syscall(libc::SYS_unshare, word as libc::c_long) };
+                if rc < 0 {
+                    -(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as isize)
+                } else {
+                    rc as isize
+                }
+            };
+            let packet = |_: usize| -> isize {
+                let rc = unsafe {
+                    libc::socket(
+                        libc::AF_PACKET,
+                        libc::SOCK_DGRAM,
+                        libc::htons(libc::ETH_P_ALL as u16) as i32,
+                    )
+                };
+                if rc < 0 {
+                    -(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as isize)
+                } else {
+                    rc as isize
+                }
+            };
+            // A user namespace of its own: empty maps, and the whole capability
+            // set *in it* - which is the point, because the set is not the
+            // question any more.
+            let made_user = unshare_word(CLONE_NEWUSER);
+            // Still the machine's network namespace, so its owner is the
+            // machine's user namespace, and the caller is not privileged over
+            // that one from below it.
+            let bare = packet(0);
+            // One of its own, owned by the namespace it stands in.
+            let made_net = unshare_word(libc::CLONE_NEWNET as usize);
+            let own = packet(0);
+            let line = format!("{made_user}\n{bare}\n{made_net}\n{own}\n");
+            let _ = write(&to_child, line.as_bytes());
+            drop(to_child);
+            raw_exit(0);
+        }
+        r.check("the packet child is forked", child > 0);
+        drop(to_child);
+        let mut buf = [0u8; 64];
+        let n = read(&from_child, &mut buf).unwrap_or(0);
+        let fields: Vec<isize> = String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        let get = |i: usize| fields.get(i).copied();
+        r.check(
+            "the child made a user namespace of its own",
+            get(0) == Some(0),
+        );
+        r.check(
+            "and a packet socket is EPERM while it stands in the machine's network namespace",
+            get(1) == Some(-(libc::EPERM as isize)),
+        );
+        r.check(
+            "the child made a network namespace of its own",
+            get(2) == Some(0),
+        );
+        // Served, with the same set in the same caller: the question was asked
+        // of the namespace's owner, and that owner is now the caller's own.
+        r.check(
+            "and the same caller, the same set, opens a packet socket in it",
+            get(3).is_some_and(|fd| fd >= 0),
+        );
+        let mut status = 0;
+        let reaped = unsafe { libc::waitpid(child as i32, &mut status, 0) };
+        r.check("the packet child is reaped", reaped == child as i32);
+    }
 
     // ---- The identity: a namespace a descriptor can name ----
     //

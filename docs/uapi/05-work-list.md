@@ -1405,3 +1405,60 @@ the commit bodies), and each moved its pin in the same commit.
     **Two shapes stay named in §5.2**: `fallocate`'s resize, which reaches `Inode::truncate` without
     going through either truncate door and was not measured; and a write through a mapping, which
     Linux does not strip either.
+
+## item 42 — a capability question about a namespace object is asked of that object's owner
+
+    The two object-shaped scopes item 38's measurement named in §5.2, landed together because they
+    are one question: whose the *object* is. `setns` asked "does the caller hold `CAP_SYS_ADMIN`"
+    where Linux asks `ns_capable(ns->user_ns, CAP_SYS_ADMIN)` about the namespace being **joined**,
+    and `AF_PACKET` asked the same of the caller where Linux asks it of the network namespace the
+    socket is opened in. Both doors had the same hole: a caller inside a bare user namespace,
+    holding the whole set *in it*, was allowed where Linux refuses.
+    **Measured whole on a current host first** (`.workbuddy/probe_ns_owner.c`, Linux 7.2.9, a root
+    caller placed in each of four positions):
+
+    ```text
+                                      the machine's root   inside a bare user ns   inside one it made
+    setns into the machine's mnt ns            0                     EPERM                  —
+    setns into an mnt ns made inside it        —                       0                    0
+    setns into a child user ns                 0                      —                     —
+    setns into a sibling user ns               —                      EPERM                  —
+    setns into a parent user ns                —                       —                   EPERM
+    AF_PACKET (SOCK_DGRAM or SOCK_RAW)         0                     EPERM                  0
+    ```
+
+    The two rows that carry it are the second column's: the whole set held *in the caller's own
+    namespace* is not the question, and the "already in it" no-op is not reached first either —
+    the bare caller is refused joining the mount namespace it is standing in, which every other
+    kind answers `0` for. The third row is the reason a namespace is a *grant* rather than a view:
+    the machine's root joins a child user namespace it made, and a caller inside one joins a
+    namespace made inside it, while a sibling and a parent are out of reach from below.
+    **The fix is one table and one walk.** `vfs::ns::mint_owned` records whose each namespace is
+    where it is *made* — a mount table's copy, a pid namespace, a uts namespace, a time namespace,
+    a stack's number and a user namespace — and `Namespace::owner` reads it back, with `USER` its
+    own owner, which is Linux's `ns_common::user_ns` and what separates the sibling row from the
+    "made inside it" row. `userns::Caller::capable_in` is the walk Linux's `cap_capable` performs:
+    the target itself is the caller's, and the answer is the set; the machine's own reached from
+    below is not privileged over it; the caller *made* the next one down and holds every capability
+    in it whether or not its own set carries the bit; otherwise up one rung. Both doors ask it
+    through `sched::ns_capable_of`, which reads the three facts off the running task. Owner:
+    `crates/userns` (the walk, its unit test, and `UserNs`'s new `parent`/`owner`), `src/vfs/ns.rs`
+    (the table), `src/vfs/mount.rs` (`copy` takes its owner), the six mint sites, and the two doors
+    in `src/syscall/linux/posix.rs` and `src/net/socket.rs`. Pin: `t-ns-setns`' new section — the
+    child is `EPERM` on the no-op and `0` on the same no-op once the namespace is its own, and the
+    machine's root is served joining a namespace its child user namespace owns (it *made* that
+    namespace) — beside `t-ns-net`'s, where the same child holding the same set is `EPERM` on a
+    packet socket in the machine's network namespace and served in one it made. **One thing this
+    kernel cannot express yet, and §5.2 now names**: a *real* re-join, because a namespace
+    descriptor here follows the process instead of pinning the namespace it named
+    (`.workbuddy/probe_ns_fd_pin.c`: Linux answers the number the descriptor was opened in, this
+    kernel answers the copy's). Gate: x86_64 `pass=181 fail=0 (181 built)`, `mpos-kunit 32 passed, 0
+    failed` (11 staged out by `tests.toml`); the second machine's arm is `pass=180 fail=0`,
+    `mpos-kunit 32 passed, 0 failed` (12 staged out). `t-ns-setns`' 43 `ok:` lines and `t-ns-net`'s
+    66 are byte-identical across the two machines. The counterfactual is exact: with only the two
+    doors put back to asking the caller's own set (two files, the owner table and every pin left in
+    place) the sweep is `pass=179 fail=2` with `mpos-kunit` unmoved at 32 passed, 0 failed — the two
+    red programs are the two pins and the two red claims are exactly the discriminating ones
+    (`FAIL: and is EPERM joining the mount namespace it is standing in (the no-op every other kind
+    serves)` and `FAIL: and a packet socket is EPERM while it stands in the machine's network
+    namespace`), while the served halves and every control pass on both kernels.

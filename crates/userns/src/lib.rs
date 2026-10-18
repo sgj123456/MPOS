@@ -107,6 +107,22 @@ pub struct UserNs {
     /// The number this namespace is known by: `user:[<id>]` in
     /// `/proc/<pid>/ns/user`, and what `setns` compares two of them by.
     id: u64,
+    /// The namespace this one was made *in*: `None` only for the machine's own,
+    /// which is the root of the ladder and has nothing above it.
+    ///
+    /// The ladder is what a capability question walks (see [`Caller`]): a
+    /// namespace is owned by the one its maker stood in at the moment of the
+    /// call, never by the one it ends up holding - which is why a user
+    /// namespace's parent is the namespace it was *made from* rather than
+    /// itself.
+    parent: Option<Arc<UserNs>>,
+    /// The uid that made this namespace, as the **parent** numbers it.
+    ///
+    /// Linux keeps it beside the parent for one reason: the owner of a
+    /// namespace holds every capability over it and everything below it, whether
+    /// or not its own effective set carries the bit - the clause
+    /// [`Caller::capable_in`] spells out.
+    owner: u32,
     uid: Mutex<RefCell<Vec<MapLine>>>,
     gid: Mutex<RefCell<Vec<MapLine>>>,
     /// Whether `setgroups(2)` is still permitted for the members.
@@ -128,9 +144,15 @@ impl UserNs {
     /// `unshare(CLONE_NEWUSER)` produces - Linux's `create_user_ns` makes one
     /// with no extents - and it is exactly why the caller reads [`NO_MAP_ID`]
     /// until it writes the map.
-    pub fn fresh(id: u64) -> Arc<UserNs> {
+    ///
+    /// `parent` is the namespace the maker is standing in when it calls, and
+    /// `owner` that maker's uid as the parent numbers it: the two facts a
+    /// capability question walks up (see [`Caller`]).
+    pub fn fresh(id: u64, parent: Arc<UserNs>, owner: u32) -> Arc<UserNs> {
         Arc::new(UserNs {
             id,
+            parent: Some(parent),
+            owner,
             uid: Mutex::new(RefCell::new(Vec::new())),
             gid: Mutex::new(RefCell::new(Vec::new())),
             setgroups_allowed: AtomicBool::new(true),
@@ -148,7 +170,18 @@ impl UserNs {
     /// start for the same reason: a write to the machine's map is `EPERM`,
     /// because there is nothing left for it to say.
     pub fn machine(id: u64) -> Arc<UserNs> {
-        let ns = UserNs::fresh(id);
+        let ns = Arc::new(UserNs {
+            id,
+            // The machine's own: the root of the ladder, made by nobody, so
+            // there is no parent to walk up to and no owner to consult.
+            parent: None,
+            owner: 0,
+            uid: Mutex::new(RefCell::new(Vec::new())),
+            gid: Mutex::new(RefCell::new(Vec::new())),
+            setgroups_allowed: AtomicBool::new(true),
+            uid_written: AtomicBool::new(false),
+            gid_written: AtomicBool::new(false),
+        });
         let identity = MapLine {
             inside: 0,
             outside: 0,
@@ -165,6 +198,17 @@ impl UserNs {
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The namespace this one was made in: `None` for the machine's own, which
+    /// is the top of the ladder.
+    pub fn parent(&self) -> Option<Arc<UserNs>> {
+        self.parent.as_ref().map(Arc::clone)
+    }
+
+    /// The uid that made this namespace, as the parent numbers it.
+    pub fn owner(&self) -> u32 {
+        self.owner
     }
 
     fn uid_snapshot(&self) -> Vec<MapLine> {
@@ -292,6 +336,78 @@ impl UserNs {
     }
 }
 
+/// What a caller brings to a capability question about *another* object.
+///
+/// Three facts, because the question is not "does the caller hold the bit" -
+/// that one needs no namespace at all - but "is the caller privileged over
+/// *this* namespace", and Linux answers it by walking from the namespace being
+/// asked about up to the caller's own (`cap_capable`). The three are the things
+/// that walk reads: where the caller stands, who it is, and what it holds.
+pub struct Caller {
+    /// The namespace the caller's capability sets are scoped to.
+    pub ns: Arc<UserNs>,
+    /// The caller's effective uid, **as the machine stores it** - the numbering
+    /// [`UserNs::owner`] is kept in, so the two can be compared.
+    pub euid: u32,
+    /// The caller's effective capability set, held *in* [`Self::ns`].
+    pub effective: u64,
+}
+
+impl Caller {
+    /// `ns_capable(target, cap)`: is this caller privileged over `target`?
+    ///
+    /// Measured on a current host (`.workbuddy/probe_ns_owner.c`, Linux 7.2.9,
+    /// a root caller in each of four places) before any of this was written:
+    ///
+    /// | the caller | the namespace being asked about | answer |
+    /// |---|---|---|
+    /// | the machine's root | a mount namespace the machine owns | served |
+    /// | inside a **bare** user namespace | the mount namespace it stands in | `EPERM` |
+    /// | inside a user namespace | one made **inside** it | served |
+    /// | the machine's root | a child user namespace | served |
+    /// | inside a user namespace | a **sibling** of it | `EPERM` |
+    /// | inside a user namespace | one made inside it | served |
+    /// | inside a user namespace | its **parent** | `EPERM` |
+    ///
+    /// The walk that produces that table, and the reason a "is the caller
+    /// root" question cannot:
+    ///
+    /// 1. the namespace being asked about *is* the caller's - the answer is the
+    ///    capability set, and nothing else consults it;
+    /// 2. the machine's own is reached without meeting the caller's, so a
+    ///    namespace below it is not privileged over it (the `EPERM` in row two
+    ///    and the sibling's, and the reason a user-namespace root cannot reach
+    ///    back out);
+    /// 3. the caller **owns** the next one down - it made that namespace, so it
+    ///    holds every capability in it and below it *whether or not its own set
+    ///    carries the bit*;
+    /// 4. otherwise up one rung, and around again.
+    ///
+    /// Clause three is the one worth stating twice: it is what makes a
+    /// namespace a *grant* rather than a view, and it is why a caller whose
+    /// effective set is empty can still join what it made.
+    pub fn capable_in(&self, target: &Arc<UserNs>, cap: u32) -> bool {
+        if cap > mpos_cred::CAP_LAST_CAP {
+            return false;
+        }
+        let mut node = Arc::clone(target);
+        loop {
+            if Arc::ptr_eq(&node, &self.ns) {
+                return self.effective & (1u64 << cap) != 0;
+            }
+            let Some(parent) = node.parent() else {
+                // The machine's own namespace, reached from below: the walk is
+                // over and the caller is not privileged over it.
+                return false;
+            };
+            if Arc::ptr_eq(&parent, &self.ns) && node.owner() == self.euid {
+                return true;
+            }
+            node = parent;
+        }
+    }
+}
+
 /// One direction of the translation, over a table, with [`NO_MAP_ID`] for an id
 /// the table does not cover (`inner` selects the direction: true is
 /// stored-to-seen, false is seen-to-stored).
@@ -380,6 +496,13 @@ fn overlaps(a: u32, alen: u32, b: u32, blen: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// A namespace made inside the machine's own by root: the fixture every row
+    /// below wants, and the shape `unshare(CLONE_NEWUSER)` produces for a caller
+    /// that was root outside it.
+    fn child(id: u64) -> Arc<UserNs> {
+        UserNs::fresh(id, UserNs::machine(0), 0)
+    }
+
     /// The text is what a real kernel prints, pinned against the measurement
     /// rather than against this module's own formatter: `/proc/self/uid_map` on
     /// this developer's Linux reads exactly this, 33 bytes with the newline.
@@ -392,7 +515,7 @@ mod tests {
         assert_eq!(machine.setgroups_text(), "allow\n");
         // And a fresh one reads empty, which is the state the caller of an
         // unshare is in.
-        assert_eq!(UserNs::fresh(2).uid_map_text(), "");
+        assert_eq!(child(2).uid_map_text(), "");
     }
 
     /// The machine's identity map translates every id to itself, both ways - the
@@ -418,7 +541,7 @@ mod tests {
     /// table.
     #[test]
     fn an_empty_table_shows_the_overflow_id() {
-        let ns = UserNs::fresh(1);
+        let ns = child(1);
         assert_eq!(ns.uid_to_inner(0), NO_MAP_ID);
         assert_eq!(ns.uid_to_inner(65534), NO_MAP_ID);
         assert_eq!(ns.uid_to_stored(0), NO_MAP_ID);
@@ -431,7 +554,7 @@ mod tests {
     /// row - a mapping is a translation at the boundary.
     #[test]
     fn a_mapping_translates_at_the_boundary_and_not_as_a_rename() {
-        let ns = UserNs::fresh(1);
+        let ns = child(1);
         assert_eq!(ns.write_uid_map("0 65534 1\n", true, 0), Ok(()));
         assert_eq!(ns.uid_map_text(), "         0      65534          1\n");
         assert_eq!(ns.uid_to_inner(65534), 0);
@@ -448,7 +571,7 @@ mod tests {
     /// once. Each is `EPERM` and each leaves the table unchanged.
     #[test]
     fn an_unprivileged_writer_may_name_only_itself_once() {
-        let ns = UserNs::fresh(1);
+        let ns = child(1);
         // A foreign outside id.
         assert_eq!(
             ns.write_uid_map("0 0 1\n", false, 65534),
@@ -474,7 +597,7 @@ mod tests {
     /// but still only once.
     #[test]
     fn a_privileged_writer_may_map_freely_but_still_once() {
-        let ns = UserNs::fresh(1);
+        let ns = child(1);
         assert_eq!(ns.write_uid_map("0 1000 1\n1 2000 10\n", true, 0), Ok(()));
         assert_eq!(ns.uid_to_inner(1000), 0);
         assert_eq!(ns.uid_to_inner(2000), 1);
@@ -486,7 +609,7 @@ mod tests {
     /// The gid map waits for `setgroups=deny` - measured in that order.
     #[test]
     fn the_gid_map_waits_for_setgroups_deny() {
-        let ns = UserNs::fresh(1);
+        let ns = child(1);
         assert_eq!(
             ns.write_gid_map("0 65534 1\n", false, 65534),
             Err(mpos_err::EPERM),
@@ -498,7 +621,7 @@ mod tests {
         // Turning it back on once a gid map exists is refused.
         assert_eq!(ns.write_setgroups("allow\n"), Err(mpos_err::EPERM));
         // A privileged writer does not need the dance.
-        let ns = UserNs::fresh(2);
+        let ns = child(2);
         assert_eq!(ns.write_gid_map("0 0 1\n", true, 0), Ok(()));
     }
 
@@ -515,7 +638,7 @@ mod tests {
             "0 0 1\n0 0 1\n", // the same run twice: overlapping
             "0 0 2\n1 5 1\n", // inside runs overlap
         ] {
-            let ns = UserNs::fresh(1);
+            let ns = child(1);
             assert_eq!(
                 ns.write_uid_map(text, true, 0),
                 Err(mpos_err::EINVAL),
@@ -529,10 +652,101 @@ mod tests {
     /// machine's own map is the case that matters.
     #[test]
     fn a_run_that_reaches_the_top_of_the_id_space_does_not_wrap() {
-        let ns = UserNs::fresh(1);
+        let ns = child(1);
         assert_eq!(ns.write_uid_map("0 0 4294967295\n", true, 0), Ok(()));
         assert_eq!(ns.uid_to_inner(0), 0);
         assert_eq!(ns.uid_to_inner(1), 1);
         assert_eq!(ns.uid_to_inner(65534), 65534);
+    }
+
+    /// The measured walk, one row per clause: a caller in the machine's own
+    /// namespace is asked about its own set, and a caller inside a child is not
+    /// privileged over the machine's - the `EPERM` a user namespace buys by
+    /// being below the thing it wants.
+    #[test]
+    fn a_namespace_below_the_machines_is_not_privileged_over_it() {
+        let machine = UserNs::machine(1);
+        let mine = UserNs::fresh(2, Arc::clone(&machine), 0);
+        let root_outside = Caller {
+            ns: Arc::clone(&machine),
+            euid: 0,
+            effective: 1 << mpos_cred::CAP_SYS_ADMIN,
+        };
+        // Its own: the capability set decides, and it holds the bit.
+        assert!(root_outside.capable_in(&machine, mpos_cred::CAP_SYS_ADMIN));
+        // ...and one made inside it, which is row one of the measured table.
+        assert!(root_outside.capable_in(&mine, mpos_cred::CAP_SYS_ADMIN));
+        // Without the bit, its *own* namespace refuses it - there the set is
+        // the whole answer - but the one it made does not: owning a namespace
+        // is the capability, and the set is not consulted (the clause the next
+        // test pins).
+        let dropped = Caller {
+            effective: 0,
+            ..root_outside
+        };
+        assert!(!dropped.capable_in(&machine, mpos_cred::CAP_SYS_ADMIN));
+        assert!(dropped.capable_in(&mine, mpos_cred::CAP_SYS_ADMIN));
+
+        // Inside the child, holding the whole set in it: its own namespace is
+        // served, the machine's is not (row seven of the table - `EPERM`), and
+        // neither is a *sibling* of it (row five), which is the same walk
+        // stopping one rung later.
+        let inside = Caller {
+            ns: Arc::clone(&mine),
+            euid: 0,
+            effective: !0,
+        };
+        assert!(inside.capable_in(&mine, mpos_cred::CAP_SYS_ADMIN));
+        assert!(!inside.capable_in(&machine, mpos_cred::CAP_SYS_ADMIN));
+        let sibling = child(3);
+        assert!(!inside.capable_in(&sibling, mpos_cred::CAP_SYS_ADMIN));
+    }
+
+    /// The clause that makes a namespace a grant: the owner of one holds every
+    /// capability in it and below it **whether or not its own set carries the
+    /// bit** - so a caller with an empty effective set is served a namespace it
+    /// made, and refused one it did not.
+    #[test]
+    fn owning_a_namespace_is_the_capability_regardless_of_the_set() {
+        let machine = UserNs::machine(1);
+        let grandchild = child(4);
+        let mine = UserNs::fresh(5, machine.clone(), 0);
+        let grandchild_of_mine = UserNs::fresh(6, mine.clone(), 0);
+        // Empty-handed, and made them both: served for each.
+        let owner = Caller {
+            ns: Arc::clone(&machine),
+            euid: 0,
+            effective: 0,
+        };
+        assert!(owner.capable_in(&mine, mpos_cred::CAP_SYS_ADMIN));
+        assert!(owner.capable_in(&grandchild_of_mine, mpos_cred::CAP_SYS_ADMIN));
+        // A namespace made by *another* uid is not owned, so it comes down to
+        // the set - and that one is empty.
+        let theirs = UserNs::fresh(7, Arc::clone(&machine), 1000);
+        assert!(!owner.capable_in(&theirs, mpos_cred::CAP_SYS_ADMIN));
+        // Nor is one that is merely somewhere else in the tree.
+        assert!(!owner.capable_in(&grandchild, mpos_cred::CAP_SYS_ADMIN));
+        // A caller the owner's clause does not describe still needs the bit:
+        // uid 1000, empty-handed, is refused its own child made by root.
+        let other = Caller {
+            ns: Arc::clone(&machine),
+            euid: 1000,
+            effective: 0,
+        };
+        assert!(!other.capable_in(&mine, mpos_cred::CAP_SYS_ADMIN));
+    }
+
+    /// A bit no capability has is not held anywhere, whatever the walk says.
+    #[test]
+    fn a_capability_that_does_not_exist_is_not_held() {
+        let machine = UserNs::machine(1);
+        let caller = Caller {
+            ns: Arc::clone(&machine),
+            euid: 0,
+            effective: !0,
+        };
+        assert!(caller.capable_in(&machine, mpos_cred::CAP_SYS_ADMIN));
+        assert!(!caller.capable_in(&machine, mpos_cred::CAP_LAST_CAP + 1));
+        assert!(!caller.capable_in(&machine, 999));
     }
 }

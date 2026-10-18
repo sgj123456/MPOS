@@ -506,8 +506,9 @@ Section numbers are unchanged from the original `UAPI.md`.
   one. Owner: `src/vfs/mount.rs`'s `resolve_no_follow`/`split_last`. Pin: none yet — the two
   behavioral halves (a crossed `lstat`, an `EBUSY` `rmdir`) are what a pin would have to claim.
 
-- **Three capability scopes this kernel's one word cannot express. Named 2026-10-17** (`docs/uapi/`
-  §5.1 item 38's measurement; `crates/cred`'s `Credentials::user_ns_initial`). The landed change
+- **The three capability scopes this kernel's one word could not express. Named 2026-10-17, all
+  three landed by 2026-10-18** (`docs/uapi/`
+  §5.1 items 38, 39, 40 and 42; `crates/cred`'s `Credentials::user_ns_initial`). The landed change
   gives the model the two questions Linux's own call sites ask — the caller's *own* namespace
   (`has_effective`, what `unshare`'s `CAP_SYS_ADMIN` and `chroot`'s `CAP_SYS_CHROOT` ask) and the
   **initial** one (`capable`, what `mknod`'s, `fileattr_set`'s, `syslog`'s and `reboot`'s ask,
@@ -517,14 +518,27 @@ Section numbers are unchanged from the original `UAPI.md`.
   - **`setns` asks the namespace being *joined*** — `ns_capable(ns->user_ns, CAP_SYS_ADMIN)` — and
     the check comes *before* the "already in it" no-op. Measured (the probe's `setns` mode): a
     credential scoped to a child user namespace, holding the whole set in it, is `EPERM` when it
-    joins a mount namespace owned by the initial one. This kernel asks the caller's own, so such a
-    caller is allowed where Linux refuses. The fix is not this word: it needs the *object's*
-    namespace, which the object carries and the credential does not.
+    joins a mount namespace owned by the initial one. This kernel asked the caller's own, so such a
+    caller was allowed where Linux refused. **Landed 2026-10-18** (`docs/uapi/` §5.1 item 42):
+    `Namespace::owner` holds whose each namespace is — written where one is *made*
+    (`vfs::ns::mint_owned`), with `USER` its own owner, which is Linux's `ns_common::user_ns` and
+    the reason joining a *sibling* from inside one is `EPERM` while joining one made *inside* it is
+    served — and `userns::Caller::capable_in` is the four-clause walk that answers it, whose third
+    clause (the caller *made* the next one down) is what makes a namespace a grant rather than a
+    view: a caller with an empty set can still join what it made. The whole table is a host unit
+    test in `crates/userns`, and `t-ns-setns` pins the two halves on the machine — `EPERM` for the
+    no-op the machine's own namespace is served, and `0` for the same no-op once the namespace is
+    the caller's own (a *real* re-join is not expressible here yet: a descriptor in this kernel
+    follows the process, which is the entry at the bottom of this file).
   - **`AF_PACKET` asks the *network* namespace's owner** — `ns_capable(sock_net(sk)->user_ns,
     CAP_NET_RAW)` — which is why the measurement splits the two ways it does: `EPERM` inside a bare
     user namespace (the net namespace is still the machine's, whose owner is the initial one) and
     **served** inside a user namespace made *with* `CLONE_NEWNET` (its owner is that user
-    namespace). This kernel asks the caller's own, so the bare case is served where Linux refuses.
+    namespace). This kernel asked the caller's own, so the bare case was served where Linux
+    refuses. **Landed 2026-10-18** (§5.1 item 42, the same `owner` table): the door asks
+    `ns_capable_of(owner_of(current_net_ns))`, and `t-ns-net` pins both halves in one child — the
+    whole set held inside a bare user namespace still hears `EPERM`, and the same caller opens the
+    same socket in a namespace it made.
   - **`CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` ask the *file's* filesystem's user namespace**
     - `capable_wrt_inode_uidgid` - and they are the reason a check is not "is the
     caller root". **Landed 2026-10-17** (`docs/uapi/` §5.1 item 39). Measured whole on a current
@@ -544,8 +558,10 @@ Section numbers are unchanged from the original `UAPI.md`.
     `in_group_or_capable(.., CAP_FSETID)`. Both are measured the same way and were their own pass,
     which is what this entry said; it is done now, together with `CAP_CHOWN` (which `chown`'s two
     arms ask) and the discovery that the timestamps call is *two* questions rather than one
-    (`ATTR_TOUCH` accepts write permission, `ATTR_TIMES_SET` does not). **What stays named** is the
-    same capability's third door, below.
+    (`ATTR_TOUCH` accepts write permission, `ATTR_TIMES_SET` does not). The two object-shaped
+    scopes above — the namespace being joined and the network namespace a packet socket is opened
+    in — landed together on 2026-10-18 (§5.1 item 42), because they are one question: whose the
+    *object* is. **What stays named** is the same capability's third door, below.
 
 - **A write to a set-uid file leaves the bit, and `CAP_FSETID` is what would have taken it.**
   **Landed 2026-10-18** (`docs/uapi/` §5.1 item 41). Linux's
@@ -567,3 +583,27 @@ Section numbers are unchanged from the original `UAPI.md`.
   `O_TRUNC`. **Two shapes stay named**: `fallocate`'s resize, which reaches `Inode::truncate`
   without going through either truncate door and was not measured (a probe row is what closes it);
   and a write through a mapping, which Linux does not strip either.
+
+- **A namespace descriptor does not pin the namespace it named. Named 2026-10-18**
+  (item 42's measurement, `.workbuddy/probe_ns_fd_pin.c`, Linux 7.2.9). Linux's
+  `/proc/<pid>/ns/<kind>` is an `nsfs` *inode*: opening the link mints a file whose
+  private data is the namespace object itself, so the descriptor names the
+  namespace it was opened in for as long as it is open - which is what makes
+  `setns(fd)` a join rather than a question about where the maker is standing now,
+  and what lets a namespace outlive the process that made it by descriptor alone.
+  Measured: a caller that opens `/proc/self/ns/mnt`, unshares `CLONE_NEWNS` (moving
+  into a copy) and then `setns`es through the descriptor answers `0` and ends up
+  **back in the namespace the descriptor was opened in** - the probe's three
+  readlinks are `4026531832`, `4026532932`, `4026531832`. This kernel's
+  `ProcLink::as_namespace` re-resolves the `(pid, entry)` pair **at setns time**
+  ("asked at open time, not recorded at build time", which is the right rule for
+  `readlink` and the wrong one for the object), so the same three readlinks answer
+  the *copy*'s number twice and the join is the no-op it would have been without
+  the descriptor. The fix is a namespace-shaped file: `open` on the link would
+  carry the resolved `Namespace` (the six kinds' objects, by reference) where
+  `readlink` keeps answering live, and `setns` would read it back instead of
+  asking `sched::ns_of` again. Owner: `src/vfs/procfs.rs`'s `ProcLink` and whatever
+  file kind a namespace descriptor is. Pin: none yet - `t-ns-setns`' owner section
+  carries the *behaviour* the gap costs (its "served" half is a no-op join where
+  Linux's is a real one, said out loud in the test's comment), and the shape a pin
+  would take is the probe's three readlinks.

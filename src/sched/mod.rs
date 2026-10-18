@@ -136,6 +136,32 @@ pub fn current_owner() -> (u32, u32) {
     (0, 0)
 }
 
+/// A host build has one process and it has never unshared, so it stands in the
+/// machine's own user namespace - the identity map, whose parent is nobody.
+#[cfg(not(target_os = "none"))]
+pub fn current_user_ns() -> alloc::sync::Arc<crate::userns::UserNs> {
+    crate::vfs::ns::machine_user_ns()
+}
+
+/// `ns_capable(ns, cap)`: is the running caller privileged over the namespace
+/// `ns`?
+///
+/// The question Linux asks of an *object* - a namespace being joined by
+/// `setns`, or the network namespace a packet socket is opened in - and the one
+/// [`crate::cred::Credentials::has_effective`] cannot answer, because it is
+/// asked of the caller's own namespace where this is asked of the object's.
+/// The walk, its four clauses and the measured table are
+/// [`crate::userns::Caller::capable_in`]'s; this is the three facts it needs,
+/// read off the running task.
+pub fn ns_capable_of(ns: &alloc::sync::Arc<crate::userns::UserNs>, cap: u32) -> bool {
+    crate::userns::Caller {
+        ns: current_user_ns(),
+        euid: current_owner().0,
+        effective: current_credentials().effective,
+    }
+    .capable_in(ns, cap)
+}
+
 /// A host build has no task table, so a process's credentials are one value -
 /// the state a fresh process starts in. That is exactly what the `prctl`,
 /// `capget`/`capset` and ptrace unit tests want to manipulate, and it reduces
@@ -404,9 +430,10 @@ pub fn current_fs_context() -> (
 pub fn unshare_mnt() {
     critical_section::with(|cs| {
         let mut slot = HOST_MNT.borrow(cs).borrow_mut();
+        let owner = current_user_ns();
         let copied = match &*slot {
-            Some(table) => table.copy(),
-            None => crate::vfs::mount::global().copy(),
+            Some(table) => table.copy(owner),
+            None => crate::vfs::mount::global().copy(owner),
         };
         *slot = Some(copied);
     });

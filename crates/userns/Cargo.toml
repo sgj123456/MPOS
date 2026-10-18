@@ -16,6 +16,11 @@ edition = "2024"
 # second write or a foreign id, `EINVAL` for text the grammar refuses), and those
 # are the leaf's answers rather than strings the syscall layer maps back.
 mpos-err = { path = "../err" }
+# The capability set's width, and nothing else: [`Caller::capable_in`] reads one
+# bit out of a word the credential model defines, so the walk asks the crate that
+# owns the number rather than repeating it. `mpos-cred` is dependency-free and
+# stays that way - the dependency runs this way round.
+mpos-cred = { path = "../cred" }
 
 [target.'cfg(target_os = "none")'.dependencies]
 critical-section = { version = "1.2", features = ["restore-state-bool"] }

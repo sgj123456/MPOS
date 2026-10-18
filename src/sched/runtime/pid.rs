@@ -186,7 +186,11 @@ pub fn unshare_pid() {
     with_table(|t| {
         let me = t.current;
         let parent = Arc::clone(&t.task(me).pid_ns);
-        t.task_mut(me).pid_ns_children = PidNs::child(&parent, crate::vfs::ns::mint());
+        // Its owner is the user namespace the caller stands in, for the reason
+        // [`crate::vfs::ns::Namespace::owner`] gives: `setns` into it asks
+        // *that* namespace, not the caller's own.
+        let owner = Arc::clone(&t.task(me).user_ns);
+        t.task_mut(me).pid_ns_children = PidNs::child(&parent, crate::vfs::ns::mint_owned(owner));
     });
 }
 

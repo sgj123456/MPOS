@@ -37,7 +37,16 @@
 //!   while the mismatched ones were refused `EINVAL`. What the sandbox would not
 //!   let it reach is a *successful* join — this host refuses `setns` into one's
 //!   own namespace (`EPERM`) — so the success this kernel answers is this
-//!   kernel's own shape, named here rather than pinned as Linux's.
+//!   kernel's own shape, named here rather than pinned as Linux's;
+//! * **whose** capability it is was measured separately
+//!   (`.workbuddy/probe_ns_owner.c`, a root caller in four places): Linux's
+//!   `ns_capable(ns->user_ns, CAP_SYS_ADMIN)` asks the namespace being joined
+//!   about its *owner*, so a caller inside a bare user namespace is `EPERM`
+//!   joining the mount namespace it is standing in — the no-op every other kind
+//!   answers `0` for, which is what fixes the question's place before the
+//!   "already in it" shortcut — served joining one made inside its own, and the
+//!   machine's root is served joining a *child* user namespace while a caller
+//!   inside one is `EPERM` joining a sibling and `EPERM` joining its parent.
 //!
 //! # What this kernel has, and what it therefore names
 //!
@@ -57,6 +66,9 @@ use rustix::pipe::pipe;
 const CLONE_NEWNS: usize = 0x0002_0000;
 const CLONE_NEWUTS: usize = 0x0400_0000;
 const CLONE_NEWIPC: usize = 0x2000_0000;
+/// The sixth rung, and the one this file's last section is about: the namespace
+/// the capability question is asked *of*.
+const CLONE_NEWUSER: usize = 0x1000_0000;
 /// A path only the child's namespace has, so that seeing it is seeing *its*
 /// namespace rather than a coincidence.
 const INNER: &str = "/tmp/t-ns-setns-inner";
@@ -64,12 +76,27 @@ const INNER: &str = "/tmp/t-ns-setns-inner";
 /// after the join is the difference between joining a namespace and joining an
 /// empty copy of one.
 const MARKER: &str = "/tmp/t-ns-setns-inner/inside";
+/// The mount the *owner* section's child makes inside a namespace of its own:
+/// the object whose maker is the question.
+const OWNED: &str = "/tmp/t-ns-setns-owned";
+const OWNED_MARKER: &str = "/tmp/t-ns-setns-owned/inside";
 
 /// `setns(fd, nstype)` through the raw door: the answer is the kernel's, and
 /// the errno is read back beside it (musl's `-1` protocol, the shape the other
 /// namespace tests carry).
 fn setns(fd: i32, nstype: usize) -> isize {
     let r = unsafe { libc::syscall(libc::SYS_setns, fd as libc::c_long, nstype as libc::c_long) };
+    if r < 0 {
+        -(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as isize)
+    } else {
+        r as isize
+    }
+}
+
+/// `unshare(flags)` through the raw door, in the same shape: musl's `-1`
+/// protocol, with the errno read back beside it.
+fn unshare(flags: usize) -> isize {
+    let r = unsafe { libc::syscall(libc::SYS_unshare, flags as libc::c_long) };
     if r < 0 {
         -(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as isize)
     } else {
@@ -255,6 +282,206 @@ fn main() {
             "note: the sandbox refuses setns into one's own namespace (EPERM), so the joins above are this kernel's shape; the refusals are the host's own"
         );
     }
+
+    // ---- Whose capability the gate asks for ----
+    //
+    // The gate above asked *whether* the caller holds `CAP_SYS_ADMIN`; this
+    // section asks **of whom**, which is the half the host probe measured and
+    // this kernel had wrong: Linux's `ns_capable(ns->user_ns, CAP_SYS_ADMIN)`
+    // asks the namespace being **joined** about its owner, so a caller inside a
+    // bare user namespace is refused joining the mount namespace it is
+    // *standing in* - the no-op every other kind answers `0` for, which is what
+    // proves the question comes before the "already in it" shortcut - and served
+    // joining one made inside its own. A child does all of it and reports over
+    // the pipe, because the caller of this test cannot make a user namespace
+    // for itself and then be inside it.
+    //
+    // Two pipes, not one, and the reason is this file's own lesson: the child
+    // parks on the *second* one. A child that parks on the pipe it just wrote
+    // its report into can consume the report's first byte before the parent has
+    // read it, which is a race this section lost the first time it was run.
+    let report_go = pipe();
+    let stop_go = pipe();
+    let (report_r, report_w) = match report_go {
+        Ok(pair) => pair,
+        Err(_) => {
+            r.check("the report pipes are made", false);
+            r.finish();
+        }
+    };
+    let (stop_r, stop_w) = match stop_go {
+        Ok(pair) => pair,
+        Err(_) => {
+            r.check("the stop pipes are made", false);
+            r.finish();
+        }
+    };
+    let owner = unsafe { libc::fork() };
+    if owner == 0 {
+        // The child: one user namespace of its own - empty maps, and the full
+        // capability set *in it*, which is what `unshare(CLONE_NEWUSER)` hands
+        // its maker - and then a mount namespace of its own, owned by it.
+        drop(report_r);
+        drop(stop_w);
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("user:{}", unshare(CLONE_NEWUSER)));
+        // The refusing half: the mount namespace the child is standing in is
+        // the machine's, so its owner is the machine's user namespace, and the
+        // child is not privileged over it from below. The same call from the
+        // machine's own namespace is the `0` above, which is what makes this
+        // the order's claim rather than a plain refusal.
+        let machine_mnt = open_ns("/proc/self/ns/mnt");
+        lines.push(format!(
+            "machine-mnt:{}",
+            match &machine_mnt {
+                Some(fd) => setns(std::os::fd::AsRawFd::as_raw_fd(fd), 0),
+                None => -(libc::ENOENT as isize),
+            }
+        ));
+        // A namespace of its own: a copy of the machine's table, whose owner is
+        // the namespace the child stands in, with one mount only it can see.
+        lines.push(format!("own-mnt:{}", unshare(CLONE_NEWNS)));
+        let _ = mkdirat(CWD, OWNED, Mode::from_raw_mode(0o755));
+        let mounted = match mount("tmpfs", OWNED, "tmpfs", MountFlags::empty(), None) {
+            Ok(()) => None,
+            Err(e) => Some(e),
+        };
+        let marker = match openat(
+            CWD,
+            OWNED_MARKER,
+            OFlags::CREATE | OFlags::WRONLY,
+            Mode::from_raw_mode(0o644),
+        ) {
+            Ok(file) => rustix::io::write(&file, b"owned\n").err(),
+            Err(e) => Some(e),
+        };
+        lines.push(match (mounted, marker) {
+            (None, None) => "mounted:0".to_string(),
+            (None, Some(e)) => format!("mounted-no-marker:{}", e.raw_os_error()),
+            (Some(e), _) => format!("!mounted:{}", e.raw_os_error()),
+        });
+        // The serving half, and it is the *same* no-op the machine's namespace
+        // answers `0` for: the question is whose the namespace is, and now it is
+        // the child's own. The join is a no-op here because a descriptor in this
+        // kernel names the namespace its maker is standing in *now* rather than
+        // the one it was opened in - the divergence §5.2 names - so the
+        // discriminating pair is this `0` against the `machine-mnt` row above,
+        // both asked of the same caller with the same set.
+        lines.push(format!(
+            "own-join:{}",
+            match open_ns("/proc/self/ns/mnt") {
+                Some(fd) => setns(std::os::fd::AsRawFd::as_raw_fd(&fd), 0),
+                None => -(libc::ENOENT as isize),
+            }
+        ));
+        let _ = rustix::io::write(&report_w, lines.join("\n").as_bytes());
+        drop(report_w);
+        // Parked on the *other* pipe, whose write end the parent holds: the
+        // parent reads the report above and kills this process when it is done
+        // looking at the namespace the child is standing in.
+        let mut go = [0u8; 1];
+        let _ = rustix::io::read(&stop_r, &mut go);
+        raw_exit(0);
+    }
+    r.check("the owner child is forked", owner > 0);
+    drop(report_w);
+    drop(stop_r);
+    let mut said = [0u8; 256];
+    let n = rustix::io::read(&report_r, &mut said).unwrap_or(0);
+    let lines: Vec<String> = String::from_utf8_lossy(&said[..n])
+        .split('\n')
+        .map(|s| s.to_string())
+        .collect();
+    let field = |name: &str| -> Option<isize> {
+        lines
+            .iter()
+            .find(|l| l.starts_with(&format!("{name}:")))
+            .and_then(|l| l.split_once(':').and_then(|(_, v)| v.parse().ok()))
+    };
+    r.check(
+        "the child made a user namespace of its own",
+        field("user") == Some(0),
+    );
+    // The order the probe measured: the flag word and the descriptor come
+    // first, and *then* this question - so the answer here is `EPERM`, not the
+    // `EINVAL` a wrong word gives, from a caller that could not have joined
+    // anything anyway.
+    r.check(
+        "and is EPERM joining the mount namespace it is standing in (the no-op every other kind serves)",
+        field("machine-mnt") == Some(-(libc::EPERM as isize)),
+    );
+    r.check(
+        "the child made a mount namespace of its own",
+        field("own-mnt") == Some(0),
+    );
+    r.check(
+        "and mounted inside it, where only it can see",
+        field("mounted") == Some(0),
+    );
+    r.check(
+        "and is served joining that namespace, which is its own",
+        field("own-join") == Some(0),
+    );
+    if field("user").is_none() || field("machine-mnt").is_none() {
+        println!("  the child said: {}", lines.join(" | "));
+    }
+    // The other direction, from here: the machine's root *made* the child's
+    // user namespace, so it holds every capability in it and below it - the
+    // walk's third clause, and the reason the answer is the opposite of the one
+    // a plain "is the caller root" question would give. The two claims that
+    // look at the child's mount need the child to have made one, which is the
+    // child's own report's business: a host run's container refuses a mount
+    // inside a user namespace, and a claim read against a mount that was never
+    // made would pin nothing.
+    let owned_by_child = open_ns(&format!("/proc/{owner}/ns/mnt"));
+    let joined_owned = match &owned_by_child {
+        Some(fd) => setns(std::os::fd::AsRawFd::as_raw_fd(fd), 0),
+        None => -(libc::ENOENT as isize),
+    };
+    r.check(
+        "the machine's root is served joining a namespace its child user namespace owns",
+        joined_owned == 0,
+    );
+    if field("mounted") != Some(0) {
+        println!(
+            "note: the child's mount inside its own namespace did not happen here, so the two claims about seeing it are not made"
+        );
+    } else {
+        r.check(
+            "and the child's mount is visible from there",
+            std::fs::read_to_string(OWNED_MARKER).ok().as_deref() == Some("owned\n"),
+        );
+        // The way home is **another process's** link, and that is the pinning
+        // gap §5.2 names made visible: the descriptor this caller came through
+        // answers the namespace the caller is *standing in* now, so joining it
+        // again is the no-op it would have been if it had named the machine's.
+        // `/proc/1` is the machine's own - the one place a caller outside its
+        // namespace can still name it - and the marker going away is what says
+        // the move happened rather than that a door answered `0`.
+        let home = open_ns("/proc/1/ns/mnt");
+        let back_home = match &home {
+            Some(fd) => setns(std::os::fd::AsRawFd::as_raw_fd(fd), 0),
+            None => -(libc::ENOENT as isize),
+        };
+        r.check(
+            "and the way back is the machine's own link (/proc/1), which takes the child's mount away",
+            back_home == 0 && std::fs::read_to_string(OWNED_MARKER).is_err(),
+        );
+        // And the descriptor that was opened before all of this now answers
+        // where the caller stands, which is the same fact from the other side.
+        let again = setns(std::os::fd::AsRawFd::as_raw_fd(&own_mnt), 0);
+        r.check(
+            "the descriptor it came through answers where it stands now (a descriptor follows its maker)",
+            again == 0 && std::fs::read_to_string(OWNED_MARKER).is_err(),
+        );
+    }
+    unsafe {
+        libc::kill(owner, libc::SIGKILL);
+    }
+    let mut owner_status = 0;
+    let owner_reaped = unsafe { libc::waitpid(owner, &mut owner_status, 0) };
+    r.check("the owner child is reaped", owner_reaped == owner);
+    let _ = std::fs::remove_dir_all(OWNED);
 
     // ---- The point of the surface: a descriptor *shares* a namespace ----
     //

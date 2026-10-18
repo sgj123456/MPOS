@@ -1918,7 +1918,8 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     // does on Linux. Minted here rather than in the scheduler, because making a
     // namespace means naming `net` and `sched` must not (see `Task::net_ns`).
     let net_ns = if flags & crate::abi::CLONE_NEWNET != 0 {
-        Some(crate::net::mint_namespace())
+        // Made by the calling task, so owned by the user namespace it stands in.
+        Some(crate::net::mint_namespace(crate::sched::current_user_ns()))
     } else {
         None
     };

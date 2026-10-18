@@ -1209,7 +1209,15 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
                 // new stack's. Its existing sockets come with it, because each
                 // one remembers the stack it was made in (`net`'s `HOMES`) - so a
                 // connection opened before the call goes on working.
-                crate::sched::set_net_ns(Some(crate::net::mint_namespace()));
+                // The stack is made by the caller, so it belongs to the user
+                // namespace the caller stands in - which after a
+                // `unshare(CLONE_NEWUSER|CLONE_NEWNET)` is the *new* one,
+                // because USER is served first (Linux's order, and the reason
+                // `AF_PACKET` is served inside such a namespace and refused in
+                // a bare one).
+                crate::sched::set_net_ns(Some(crate::net::mint_namespace(
+                    crate::sched::current_user_ns(),
+                )));
             }
             if bits & crate::syscall::linux::nr::CLONE_NEWTIME != 0 {
                 // The caller's *children* move into a fresh, empty namespace,
@@ -1272,8 +1280,13 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
     if let Err(e) = super::abi::setns_verdict(namespace.kind(), args[1]) {
         return e;
     }
-    let privileged = crate::sched::current_credentials().has_effective(crate::cred::CAP_SYS_ADMIN);
-    if !privileged {
+    // `ns_capable(ns->user_ns, CAP_SYS_ADMIN)`: the namespace being **joined**,
+    // not the caller's own. Measured on a current host
+    // (`.workbuddy/probe_ns_owner.c`): a caller inside a bare user namespace is
+    // `EPERM` joining the mount namespace it is standing in - which is the shape
+    // that pins the order, since the same call from the machine's own namespace
+    // is the no-op `0` - and served joining one made inside its own.
+    if !crate::sched::ns_capable_of(&namespace.owner(), crate::cred::CAP_SYS_ADMIN) {
         return err::EPERM;
     }
     match namespace {

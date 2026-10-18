@@ -726,7 +726,15 @@ pub fn arm_diskstat_boot_namespace() {
 #[cfg(target_os = "none")]
 pub fn unshare_uts() {
     with_table(|t| {
-        let fresh = t.task(t.current).uts.copied(crate::vfs::ns::mint());
+        // The namespace is made by the caller, so it belongs to the user
+        // namespace the caller is standing in *now* - which is the new one when
+        // this is the second half of an `unshare(CLONE_NEWUSER|CLONE_NEWUTS)`,
+        // because USER is served first (Linux's own order).
+        let owner = Arc::clone(&t.task(t.current).user_ns);
+        let fresh = t
+            .task(t.current)
+            .uts
+            .copied(crate::vfs::ns::mint_owned(owner));
         t.task_mut(t.current).uts = fresh;
     });
 }
@@ -842,7 +850,8 @@ pub fn setns_uts(uts: Arc<crate::uts::Uts>) {
 pub fn unshare_time() {
     with_table(|t| {
         let me = t.current;
-        let fresh = crate::timens::TimeNs::fresh(crate::vfs::ns::mint());
+        let owner = Arc::clone(&t.task(me).user_ns);
+        let fresh = crate::timens::TimeNs::fresh(crate::vfs::ns::mint_owned(owner));
         t.task_mut(me).time_ns_children = fresh;
     });
 }
@@ -883,7 +892,19 @@ pub fn unshare_user() {
     with_table(|t| {
         let me = t.current;
         let mm = Arc::clone(&t.task(me).mm);
-        let fresh = crate::userns::UserNs::fresh(crate::vfs::ns::mint());
+        // The namespace being made belongs to the one the caller is standing in
+        // *now*, which is the parent of the one it is about to move into: a
+        // user namespace's owner is its parent, and that is the rung `setns`
+        // into one is measured to ask about (`.workbuddy/probe_ns_owner.c`:
+        // joining a child user namespace from the machine's own is served,
+        // joining a *sibling* from inside one is `EPERM`).
+        let parent = Arc::clone(&t.task(me).user_ns);
+        let owner_uid = t.task(me).identity.euid;
+        let fresh = crate::userns::UserNs::fresh(
+            crate::vfs::ns::mint_owned(Arc::clone(&parent)),
+            parent,
+            owner_uid,
+        );
         t.task_mut(me).user_ns = fresh;
         mm.with_credentials(|c| c.on_enter_user_ns());
     });

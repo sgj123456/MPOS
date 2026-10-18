@@ -584,19 +584,28 @@ caller the full effective and permitted sets" - while every door and setup claim
 That the setup claims survive is the isolation: removing the grant breaks what the namespace
 *hands out*, not whether the doors open.
 
-**What the grant does not model, and why it is a named gap.** A capability is held *in* a
+**What the grant does not model, and the gap it named.** A capability is held *in* a
 namespace and its descendants, and Linux's `capable(ns, cap)` asks it of a *target* namespace
-that need not be the caller's; this kernel's checks all ask the caller's own namespace, so one
-capability word is the whole of it. That is correct for every operation scoped to the caller's
-own namespace - which is every gate here - and wrong for a check scoped to an *ancestor* or a
-sibling (a `setns` into a namespace the caller does not own, a signal across a namespace
-boundary). A scoped `capable_in(ns, cap)` is the named gap. **The `mknod` device-node gate is the
+that need not be the caller's; every check in this tree asked the caller's own namespace, so one
+capability word was the whole of it. That is correct for every operation scoped to the caller's
+own namespace and wrong for a check scoped to an *ancestor* or a sibling (a `setns` into a
+namespace the caller does not own, a signal across a namespace boundary), and this paragraph
+named a scoped `capable_in(ns, cap)` as the gap. **Both halves are closed** - the
+*initial*-namespace question by §15.56 (the four gates whose Linux rule is `capable()`, `mknod`
+first among them) and the *object's* by §15.60 (`docs/uapi/` §5.1 item 42, 2026-10-18: `vfs::ns`
+records whose each namespace is *made* its owner - a user namespace its own, Linux's
+`ns_common::user_ns` - and `setns` and `AF_PACKET` ask `userns::Caller::capable_in` about that
+owner rather than about their own set). One shape of the rung stays named with its own
+measurement: a namespace descriptor here does not **pin** the namespace it named, so a re-join
+through one is the no-op a copy would give (`docs/uapi/` §5.2's descriptor entry,
+`.workbuddy/probe_ns_fd_pin.c`). **The `mknod` device-node gate is the
 first caller-visible consequence of it, measured** (2026-10-17, `docs/uapi/` §5.1 item 36): Linux's
 `vfs_mknod` asks `capable(CAP_MKNOD)`, which is the *initial* namespace, so a caller that has entered
 a user namespace - uid 0 in it, the whole set read back - still cannot make a device node on a
 filesystem the parent namespace owns (`.workbuddy/probe_mknod_userns.sh`: `touch` in the same
 directory answers `0` while `mknod c 1 3` answers `EPERM`, and the `dev 0` whiteout is served there
-as it is outside), where this kernel's gate, asking the caller's own namespace, serves it. The
+as it is outside), where this kernel's gate, asking the caller's own namespace, served it (§15.56
+is where that became the initial-namespace question). The
 earlier gates' scoping was not measured this way; this one was.
 
 **Step 6d, landed: the socket surface, and the third reader of the same table.** The two surfaces

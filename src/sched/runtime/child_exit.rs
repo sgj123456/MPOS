@@ -826,7 +826,13 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         // which is what lets this parent `wait` for it and find it in `/proc`
         // under a number of its own.
         let child_pid_ns = if request.flags & crate::abi::CLONE_NEWPID != 0 {
-            crate::pidns::PidNs::child(&t.task(parent_id).pid_ns_children, crate::vfs::ns::mint())
+            // Owned by the *creating* task's user namespace: the child is made
+            // by its parent, and `setns` into it is asked about that one.
+            let owner = Arc::clone(&t.task(parent_id).user_ns);
+            crate::pidns::PidNs::child(
+                &t.task(parent_id).pid_ns_children,
+                crate::vfs::ns::mint_owned(owner),
+            )
         } else {
             Arc::clone(&t.task(parent_id).pid_ns_children)
         };
@@ -844,7 +850,14 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         // observation in `.workbuddy/probe-userns9.c`). Without the flag the
         // reference is handed on, as every fork since the beginning did.
         let child_user_ns = if request.flags & crate::abi::CLONE_NEWUSER != 0 {
-            crate::userns::UserNs::fresh(crate::vfs::ns::mint())
+            // The parent's namespace is the one being *left*, so it is the
+            // child's owner - the same rung a `setns` into the child asks about.
+            let parent = Arc::clone(&t.task(parent_id).user_ns);
+            crate::userns::UserNs::fresh(
+                crate::vfs::ns::mint_owned(Arc::clone(&parent)),
+                parent,
+                t.task(parent_id).identity.euid,
+            )
         } else {
             Arc::clone(&t.task(parent_id).user_ns)
         };
@@ -1042,11 +1055,13 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // lands here while CLONE_FS-style separation stays parked with the
             // shared-group handle.
             fs_ns: if request.flags & crate::abi::CLONE_NEWNS != 0 {
+                // Made by the parent, so owned by the parent's user namespace.
+                let owner = Arc::clone(&t.task(parent_id).user_ns);
                 match &t.task(parent_id).fs_ns {
-                    Some(table) => Some(table.copy()),
+                    Some(table) => Some(table.copy(owner)),
                     // The machine's table copied: a child of an unshared
                     // parent gets its own private view of the same world.
-                    None => Some(crate::vfs::mount::machine_table().copy()),
+                    None => Some(crate::vfs::mount::machine_table().copy(owner)),
                 }
             } else {
                 t.task(parent_id).fs_ns.clone()
@@ -1070,7 +1085,10 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // flag the reference is handed on, as every fork since the
             // beginning did. Pinned by `t-clone`.
             uts: if request.flags & crate::abi::CLONE_NEWUTS != 0 {
-                t.task(parent_id).uts.copied(crate::vfs::ns::mint())
+                let owner = Arc::clone(&t.task(parent_id).user_ns);
+                t.task(parent_id)
+                    .uts
+                    .copied(crate::vfs::ns::mint_owned(owner))
             } else {
                 Arc::clone(&t.task(parent_id).uts)
             },

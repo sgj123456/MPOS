@@ -127,9 +127,13 @@ pub fn thread_group_has_siblings() -> bool {
 pub fn unshare_mnt() {
     with_table(|t| {
         let fresh = t.task(t.current).fs_ns.clone();
+        // The copy belongs to the user namespace the caller stands in, which is
+        // what a `setns` into it is asked about (Linux's
+        // `ns_capable(mnt_ns->user_ns, CAP_SYS_ADMIN)`).
+        let owner = crate::sched::current_user_ns();
         let copied = match fresh {
-            Some(table) => table.copy(),
-            None => crate::vfs::mount::global().copy(),
+            Some(table) => table.copy(owner),
+            None => crate::vfs::mount::global().copy(owner),
         };
         t.task_mut(t.current).fs_ns = Some(copied);
     });

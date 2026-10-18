@@ -1211,7 +1211,17 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         // both types. It is asked before this family's own refusal of an
         // unsupported type, so a lowered caller hears `EPERM` for any type -
         // Linux's observable answer.
-        if !crate::sched::current_credentials().has_effective(crate::cred::CAP_NET_RAW) {
+        //
+        // Asked of the **network namespace's** owner, not the caller's own:
+        // Linux's `ns_capable(sock_net(sk)->user_ns, CAP_NET_RAW)`, measured
+        // (`.workbuddy/probe_ns_owner.c`) - a caller inside a *bare* user
+        // namespace is refused, because the network namespace it is in is still
+        // the machine's, while one that made a network namespace of its own is
+        // served, because that one's owner is the caller.
+        let net_owner = crate::vfs::ns::owner_of(
+            crate::sched::current_net_ns().unwrap_or_else(crate::vfs::ns::machine_net_id),
+        );
+        if !crate::sched::ns_capable_of(&net_owner, crate::cred::CAP_NET_RAW) {
             return err::EPERM;
         }
         let raw_type = args[1] as u32;
