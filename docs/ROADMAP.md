@@ -529,6 +529,36 @@ through, each saying the one event itself from the syscall layer's `notice_modif
 new claims (46 → 67, byte-identical on both machines) beside the host unit test. The module's other  
 two departures (`IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`) stay named in `docs/uapi/` §5.2.
 
+**`numa_maps` and `smaps_rollup`: the two other spellings of `smaps`' accounting** (`docs/uapi/`  
+§5.1 item 62, landed 2026-10-19): `/proc/<pid>` had `maps` and, since item 54, `smaps` — and  
+neither of the two files `docs/uapi/` §5.2 had already measured, so `numastat -p`, `numactl` and  
+every reader that wants a total rather than a walk found no file. Measured whole on a current host  
+first (`.workbuddy/probe_numamaps*.c`, `probe_rollup.c`, Linux 7.2.11, one node), with two probes'  
+worth of care about the fixture: **`/tmp` is tmpfs here**, so a "file" mapping made there is a shmem  
+mapping whose folios are dirty from the moment the probe wrote them (a read-only mapping reported  
+`dirty=4`), and **adjacent anonymous mappings merge**, so two shapes became one VMA and one of them  
+looked absent — every shape is fenced by `PROT_NONE` pages now. `numa_maps` is one line per mapping  
+in `maps`' order (the gate VMA excepted, and that is Linux's own: `[vsyscall]` is not a VMA of the  
+address space): the **start alone, with no `-end`**, the policy — `default`, since `set_mempolicy`  
+is not served — and then the name, which is `file=<path>` (a space `\\040`, a tab `\\011`), `heap`,  
+`stack`, or nothing at all for a name that is not a path. A range with no resident page prints the  
+policy and **no number at all**, not `N0=0`. `smaps_rollup` is one record for the whole address  
+space: a header that is the **bounds** of the space — `<first start>-<last end> ---p 00000000  
+00:00 0`, `[rollup]` in the same column 73 a `maps` line names its mapping — then twenty-two field  
+lines, which is `smaps`' twenty-five less the three per-mapping sizes and the three per-mapping  
+flags, plus `Pss_Anon`/`Pss_File`/`Pss_Shmem`. Its numbers are the sums of `smaps`' (`Rss` exactly,  
+2096 and 2096; `Pss` not — 278 against 281, because each record's is rounded before it is added).  
+Both renderers sit over the records `maps` already gathers and `resident_lines` is the one place  
+the residency is counted, so the three files cannot disagree. Pins: `t-numamaps`, a new program, 20  
+claims, and `t-smaps`' ten more (33 → 43) — all green on a current host first and byte-identical on  
+both machines; the counterfactual (the two nodes unregistered) turns sixteen of them red by name.  
+Named rather than approximated: `mapped=` and `mapmax=` are absent (no mapcount, the fact `Pss`  
+already names), the `stack` word is absent (this kernel names the heap only), a read-only  
+object-backed range says `dirty=N` where Linux says `mapped=N` (no dirty bit), and `Pss_Shmem` is  
+zero (a `memfd`'s pages are an object's here). One divergence runs the other way and is worth its  
+own sentence: **reading an anonymous page gathers nothing on Linux** — the read fault is satisfied  
+with the shared zero page — where this kernel materialises a frame and reports it.
+
 **The `F_GETFL` word is the caller's own** (`docs/uapi/` §5.1 item 49, landed 2026-10-18): Linux  
 answers `filp->f_flags`, so a caller that compares the word against what it opened with agrees — its  
 mode, `O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_SYNC`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME` — where  

@@ -544,16 +544,73 @@ Section numbers are unchanged from the original `UAPI.md`.
   claims, green on this host first, beside four renderer unit tests; `docs/notes/` §15.73
   carries the gates, the counterfactual and the two fixture lessons.
 
-- **`/proc/<pid>/numa_maps` and `/proc/<pid>/smaps_rollup`** are the two spellings of the
-  same accounting that stay unwritten, and their formats are measured so the next landing
-  does not have to re-derive them: `numa_maps` is `<start> default [file=…] [anon=N]
-  [dirty=N] [mapped=N] [mapmax=N] [active=N] N0=N kernelpagesize_kB=4` with spaces inside a
-  name escaped as `\040` (its `anon`/`dirty`/`mapmax` numbers are the mapcount/dirty-bit
-  question `smaps` just named), and `smaps_rollup` is one record for the whole address space
-  under a `[rollup]` header, carrying the same lines minus
-  `THPeligible`/`ProtectionKey`/`VmFlags` and plus three `smaps` does not have
-  (`Pss_Anon`, `Pss_File`, `Pss_Shmem`) — which are exactly the split this kernel's `Pss`
-  cannot make. Owner: `src/vfs/procfs.rs`.
+- **`/proc/<pid>/numa_maps` and `/proc/<pid>/smaps_rollup` are served — the two
+  other spellings of `smaps`' accounting. Landed 2026-10-19** (`docs/uapi/` §5.1 item
+  62). The entry that stood here had both files' formats written down and neither
+  file written: "`numa_maps` is `<start> default [file=…] [anon=N] [dirty=N]
+  [mapped=N] [mapmax=N] [active=N] N0=N kernelpagesize_kB=4` with spaces inside a
+  name escaped as `\040`", and "`smaps_rollup` is one record for the whole address
+  space under a `[rollup]` header". Both are now served, and both were measured
+  again rather than taken from that note — because two of the measurements are
+  mistakes a probe makes before it knows better:
+
+  * **`/tmp` is tmpfs on this host**, so a "file" mapping made there is a shmem
+    mapping whose folios are dirty from the moment the probe wrote them: a
+    *read-only* mapping reported `dirty=4`. The files moved to ext4 and the answer
+    changed shape.
+  * **adjacent anonymous mappings merge**, so two shapes became one VMA and one of
+    them looked absent. Every shape is fenced by `PROT_NONE` pages now, and the
+    `maps` line beside every answer proves it.
+
+  What `numa_maps` says, one line per mapping in `maps`' order (the gate VMA
+  excepted: `[vsyscall]` has a `maps` line and no `numa_maps` one, because it is not
+  a VMA of the address space at all): the **start alone, no `-end`**, then the
+  policy — `default` for every mapping, since `set_mempolicy`/`mbind` are not served
+  — then the name, which is `file=<path>` when a path is known, `heap` for the heap
+  and `stack` for the stack, and **nothing at all** for a name that is not a path
+  (`[vdso]`, `[vvar_vclock]`: measured, they print no name either). A path's space is
+  `\040` and its tab `\011`; a backslash is left alone. Then, **only when the range
+  holds a page**: `anon=` for a range whose pages are the mapping's own, `dirty=` for
+  any the kernel counted dirty, `mapped=` where Linux's own `anon`+`file` counts do
+  not add up to its total, `mapmax=` when some page's mapcount exceeds one,
+  `active=`, one `N<node>=` per node, and `kernelpagesize_kB=4`. A range with no
+  resident page prints the policy and no number at all — not `N0=0`.
+
+  Two of those are the reason this kernel's line is shorter than Linux's, and both
+  are named: **`mapped=` and `mapmax=` are absent**, because the first is a question
+  about Linux's own two counters and the second is a mapcount — the same fact
+  `smaps`' `Pss` already names. So is the **`stack`** word: this kernel names the
+  heap and not the stack. And a *read-only* object-backed range answers `dirty=N`
+  where Linux answers `mapped=N`, because nothing here records whether a page was
+  written — item 54's rule, "every resident page is this mapping's own, and it is
+  dirty", applied once more. `active=0` is the honest number: the count is the pages
+  on Linux's active LRU list and this kernel keeps no LRU, and Linux prints the field
+  for every range whose count differs from its total, which is every range holding a
+  page.
+
+  **One divergence is the other way round and is worth a sentence of its own:
+  reading an anonymous page gathers nothing on Linux.** A read fault is satisfied
+  with the shared zero page, which is not a page it counts, so a two-page read of a
+  private anonymous range came back with no counts at all — where this kernel
+  materialises a real frame and reports `anon=1 dirty=1`. It is named rather than
+  claimed (`t-numamaps`' header carries it), because a claim has to be true on both.
+
+  `smaps_rollup` is one record for the whole address space: a header that is the
+  **bounds** of the space rather than one mapping's — `<first start>-<last end>
+  ---p 00000000 00:00 0`, with `[rollup]` in the same column 73 a `maps` line names
+  its mapping — and then twenty-two field lines, which is `smaps`' twenty-five with
+  three taken out and three put in: out go `Size`, `KernelPageSize`, `MMUPageSize`
+  and `THPeligible`, `ProtectionKey`, `VmFlags` (all one mapping's); in come
+  `Pss_Anon`, `Pss_File` and `Pss_Shmem`. Its numbers are the sums of `smaps`' —
+  `Rss` measured exactly (`smaps` 2096, rollup 2096) where `Pss` is not (278 against
+  281, because each record's is rounded before it is added).
+
+  Owner: `src/vfs/procfs.rs`'s `format_numa_maps`, `push_escaped_path`,
+  `format_smaps_rollup` (the ABI, compiled for the host) and `resident_lines` (the one
+  place the residency is counted, so the three files cannot disagree), and the two
+  nodes beside `smaps` in `/proc/<pid>`. Pins: **`t-numamaps`**, a new program, 20
+  claims, and `t-smaps`' ten more (33 → 43) — every one run against a current host
+  first, and byte-identical across the two machines.
 - **`devfs` birth modes.** Devices are born `0666 root:root`; `devtmpfs` births `0600`
   and lets udev widen it. Needs per-class birth modes and group-name resolution, not a new
   mechanism (`docs/notes/` §3.4).

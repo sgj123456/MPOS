@@ -2345,9 +2345,10 @@ the commit bodies), and each moved its pin in the same commit.
 
     Owner: `src/vfs/procfs.rs` (`SmapsLine`, `format_smaps`, `mapping_lines`, the node),
     `src/sched/runtime/child_mm.rs` (`resident_pages`, the page-table walk a named pid's
-    `Rss` needs), and the module's `sched` re-export. What stays named: `numa_maps` and
-    `smaps_rollup` (§5.2), and the three `Pss_*` lines `smaps_rollup` has and `smaps`
-    does not.
+    `Rss` needs), and the module's `sched` re-export. What stayed named here —
+    `numa_maps` and `smaps_rollup`, and the three `Pss_*` lines the rollup has and
+    `smaps` does not — is **served by item 62** (2026-10-19), over the same records
+    this item's `mapping_lines` gathers.
 
 ## item 55 — a `poll` with no descriptors is a *wait*, and `pause()` is that call on arm64
 
@@ -2822,3 +2823,113 @@ the commit bodies), and each moved its pin in the same commit.
     Nothing new is left named for the write side; the module's other two departures
     (`IN_UNMOUNT`, a watched directory's `IN_MOVE_SELF`) are unchanged.
 
+
+## item 62 — `numa_maps` and `smaps_rollup`: the two other spellings of `smaps`' accounting
+
+    Item 54 gave `/proc/<pid>/smaps` Linux's shape and named the three numbers this
+    kernel cannot derive. What it left were the two files `docs/uapi/` §5.2 had already
+    measured and never written - the entry said so ("their formats are measured so the
+    next landing does not have to re-derive them") and both stayed absent, so
+    `numastat -p`, `numactl` and every reader that wants a total rather than a walk
+    found no file at all.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_numamaps.c`,
+    `probe_numamaps2.c`, `probe_rollup.c`, Linux 7.2.11, one node). Three of the
+    measurements are the ones that decided the shape, and two of them are mistakes
+    the first draft of the probe made:
+
+    * **`/tmp` is tmpfs on this host**, so every "file" mapping made there is a shmem
+      mapping whose folios are dirty from the moment the probe wrote them - `dirty=4`
+      for a read-only mapping, meaning nothing. The files moved to ext4 and the answer
+      changed shape.
+    * **adjacent anonymous mappings merge**, so two shapes became one VMA and one of
+      them looked absent. Every shape is fenced by `PROT_NONE` pages now, and the
+      `maps` line beside every answer proves it.
+
+    The rest is what Linux prints:
+
+    * **the line is `<start> default` and then the name, and the address carries no
+      `-end`** - unlike a `maps` line - with the policy word `default` for every mapping
+      a task that never called `set_mempolicy` has;
+    * **a range with no resident page prints the policy and no number at all**, not a
+      count of zero (an untouched mapping, and a `PROT_NONE` guard beside it);
+    * **`anon=` and `dirty=` are the whole resident count** for the two shapes this
+      kernel has: `anon=1 dirty=1 active=0 N0=1 kernelpagesize_kB=4` for a written
+      private anonymous page (and `heap anon=5 dirty=5 …` / `stack anon=11 dirty=11 …`
+      for the two named ranges), and `dirty=1` with no `anon=` for a written `memfd`
+      page, which is an object's and not the address space's;
+    * **`dirty=` versus `mapped=` turned on one shape, and only that shape could say
+      which**: a file mapping that is *writable but never written* prints `mapped=4`,
+      and the same mapping written prints `dirty=4` - so it is dirtiness and not the
+      mapping being writable. A read-only file mapping prints `mapped=4` too;
+    * **reading an anonymous page gathers nothing on Linux** - a read fault is
+      satisfied with the shared zero page, which is not a page it counts - and that is
+      the one place this kernel's answer differs, since a read fault here materialises
+      a real frame. Named rather than claimed;
+    * **a path's space is `\040` and its tab `\011`** (`seq_file_path`'s octal escape,
+      measured with a path carrying both; a backslash is left alone), and a name that
+      is not a path - `[vdso]`, `[vvar_vclock]` - is not printed at all;
+    * **`mapmax=` is a mapcount** (it appeared at 26, 104, 112, 115 across a real
+      process) and **`mapped=` appears exactly where Linux's own `anon`+`file` counts
+      do not add up to the total**, which is a clean file-backed range.
+
+    `smaps_rollup` is one record for the whole address space: a header that is the
+    *bounds* of the space - `<first start>-<last end> ---p 00000000 00:00 0`, with
+    `[rollup]` in the same column 73 a `maps` line names its mapping - and then
+    twenty-two field lines, which is `smaps`' twenty-five with three taken out and
+    three put in: out go `Size`, `KernelPageSize`, `MMUPageSize` (one mapping's) and
+    `THPeligible`, `ProtectionKey`, `VmFlags` (one mapping's flags); in come
+    `Pss_Anon`, `Pss_File` and `Pss_Shmem`. The gate VMA is the one exception the
+    bounds have, and it is Linux's own: `[vsyscall]` has a `maps` line and is in
+    neither bound, because it is not a VMA of the address space. Its numbers are the
+    sums of `smaps`' - `Rss` measured exactly (`smaps` 2096, rollup 2096) where `Pss`
+    is not (278 against 281, because each record's is rounded before it is added).
+
+    **The fix is two renderers over the records `maps` already gathers.**
+    `procfs::format_numa_maps` and `procfs::format_smaps_rollup` are the ABI and are
+    compiled for the host, like `format_smaps`; `resident_lines` is the one place the
+    residency is counted, so the three files that are `maps` plus accounting cannot
+    disagree; `push_escaped_path` is the octal escape. The two nodes sit beside
+    `smaps` in `/proc/<pid>`.
+
+    What is deliberately **not** Linux's, each named rather than approximated:
+    `mapped=` and `mapmax=` are absent (no mapcount - the same fact `Pss` names), the
+    `stack` word is absent (this kernel names the heap and not the stack), a
+    *read-only* object-backed range answers `dirty=N` where Linux answers `mapped=N`
+    (no dirty bit), and `Pss_Shmem` is zero (a `memfd`'s pages are an object's here,
+    and Linux's shmem/file split is a split about its page cache). `Pss_Anon` and
+    `Pss_File` *are* the split this kernel can make, because it is the question
+    `Anonymous` already answers.
+
+    Pin: **`t-numamaps`**, a new program, **20 claims** - the shape (a start and the
+    policy, no `-end`, one line per mapping and in `maps`' order, the gate VMA
+    excepted), an untouched range's policy with no number, a written anonymous range's
+    three counts of three, `active=0`, the 4 kB frame, the absence of `mapped`/`mapmax`,
+    the same residency `smaps` reports, an object's page as `dirty` and not `anon`,
+    the heap's word, and a pid nothing answers to - and **`t-smaps`' ten new claims**
+    (33 → 43): the `[rollup]` name in column 73, the bounds read out of `maps`, the
+    `---p 00000000 00:00 0` word, Linux's twenty-two lines in Linux's order, `Rss` and
+    `Anonymous` as the sums of the same fields over every record, the features that
+    answer zero in the total, and a pid nothing answers to. Every claim was run against
+    a current host first (`MPOS_ON_HOST=1`: 20 of 20 and 43 of 43, three times each,
+    because a total and a sum only agree while the address space is still), plus two
+    host unit tests (`a_numa_maps_line_is_the_start_the_policy_and_the_resident_count`,
+    `the_rollup_is_one_record_for_the_whole_space`) and the escaping's own
+    (`a_numa_maps_path_escapes_what_would_break_the_line`), which is where a claim
+    needing a filesystem that can hold a space belongs.
+
+    Gate: x86_64 `pass=187 fail=0 (198 built)`, `mpos-kunit 32 passed, 0 failed`, exit 0
+    (11 left out by `tests.toml`); aarch64 `pass=186 fail=0`, `mpos-kunit 32 passed, 0
+    failed`, exit 0 (12 left out); and both programs' `ok:` lines are byte-identical
+    across the two machines (20 and 43, diffed, carriage returns aside).
+
+    Counterfactual: with the two nodes unregistered - the kernel this item started
+    from, everything else kept - the sweep is `pass=185 fail=2 (187 built)` with
+    `FAIL t-numamaps` and `FAIL t-smaps` and **sixteen** red claims by name, eight in
+    each program: the file's own existence and every shape claim in one, and the
+    rollup's header, bounds, field list and both sums in the other. The two
+    "a pid nothing answers to" claims stay green, which is what keeps the reds on the
+    files rather than on the reading.
+
+    Nothing new is left named for either file; the four divergences above are the
+    list, and each is a consequence of a fact `smaps` already carries.

@@ -1527,6 +1527,248 @@ fn vma_flags(line: &MapLine) -> alloc::vec::Vec<&'static str> {
     words
 }
 
+/// Render `/proc/<pid>/numa_maps`: one line per mapping - the policy, the name,
+/// and the page counts per node.
+///
+/// Linux's line is `<start> <policy>[ file=<path>| heap| stack] anon=N dirty=N
+/// mapped=N mapmax=N active=N N<node>=N kernelpagesize_kB=4`, and every one of
+/// those was measured on a current host before this file was written
+/// (`.workbuddy/probe_numamaps.c`, `probe_numamaps2.c`, Linux 7.2.11, one node).
+/// What the measurement says, and what this kernel can stand behind:
+///
+/// * **the address is the start alone** - no `-end`, unlike a `maps` line - and
+///   it is followed by the policy word, which is `default` for every mapping
+///   here because `set_mempolicy`/`mbind` are not served and `default` is the
+///   policy a task has when it never asked for one;
+/// * **the name is `file=<path>` when a path is known, `heap` for the heap, and
+///   nothing at all otherwise** - `[vdso]` and `[vvar_vclock]` print no name on
+///   Linux either, measured; a space in the path is `\040` and a tab `\011`
+///   (`seq_file_path`'s octal escape, measured with a path carrying both);
+/// * **a range with no resident page prints the policy and the name and nothing
+///   else** (measured: an untouched mapping, and a read-only anonymous one whose
+///   read fault Linux satisfied with the shared zero page);
+/// * **`anon=` and `dirty=` are the whole count** - every resident page here is
+///   this mapping's own and dirty, which is the same rule `smaps` applies
+///   (`format_smaps`) for the same reason: no mapcount, no dirty bit, no page
+///   cache. Linux prints `anon=N` only for a range whose pages are anonymous and
+///   `dirty=N` for any dirty ones, which is what this kernel's own two kinds map
+///   onto;
+/// * **`active=0`** - the count is the pages on Linux's active LRU list and this
+///   kernel keeps no LRU, so the number it can state is zero, and Linux prints
+///   the field whenever that count differs from the total, which is every range
+///   that holds a page;
+/// * **`N0=` is the node's count** and there is one node, so it is the resident
+///   count; `kernelpagesize_kB` is the frame size, 4 kB on both machines.
+///
+/// Two of Linux's fields are **not** printed, and both are named rather than
+/// guessed: `mapped=` (Linux prints it where its `anon`+`file` counts do not add
+/// up to the total - a clean file-backed range - and this kernel cannot tell a
+/// clean page from a written one) and `mapmax=` (the highest mapcount of any page
+/// in the range, and there is no mapcount - the same fact `smaps`' `Pss` names).
+/// Linux's `stack` word is absent too: this kernel names the heap and not the
+/// stack, so the stack's range prints no name where Linux prints `stack`.
+///
+/// ```
+/// use mpos::vfs::procfs::{MapLine, SmapsLine, format_numa_maps};
+/// use mpos_vm::MapFlags;
+///
+/// let anon = SmapsLine {
+///     map: MapLine {
+///         start: 0x7f_0000_0000,
+///         end: 0x7f_0000_4000,
+///         prot: MapFlags::READ | MapFlags::WRITE,
+///         shared: false,
+///         offset: 0,
+///         dev: (0, 0),
+///         inode: 0,
+///         name: None,
+///     },
+///     rss_pages: 2,
+///     anonymous: true,
+/// };
+/// let untouched = SmapsLine {
+///     map: MapLine {
+///         start: 0x55_5555_4000,
+///         end: 0x55_5555_8000,
+///         prot: MapFlags::READ,
+///         shared: false,
+///         offset: 0,
+///         dev: (0, 0),
+///         inode: 7,
+///         name: Some(String::from("/bin/sh")),
+///     },
+///     rss_pages: 0,
+///     anonymous: false,
+/// };
+/// let text = format_numa_maps(&[anon, untouched]);
+/// assert_eq!(text.lines().next().unwrap(),
+///            "7f00000000 default anon=2 dirty=2 active=0 N0=2 kernelpagesize_kB=4");
+/// // A range with no resident page says the name and the policy, and no number.
+/// assert_eq!(text.lines().nth(1).unwrap(), "5555554000 default file=/bin/sh");
+/// ```
+pub fn format_numa_maps(lines: &[SmapsLine]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        // `%08lx`: eight digits at least, and every digit the address needs.
+        out.push_str(&alloc::format!("{:08x} default", line.map.start));
+        match line.map.name.as_deref() {
+            // The heap's spelling is a word of its own, not a path - measured.
+            Some("[heap]") => out.push_str(" heap"),
+            Some(path) if path.starts_with('/') => {
+                out.push_str(" file=");
+                push_escaped_path(&mut out, path);
+            }
+            // A name that is not a path (`[vdso]`, `[vvar]`) is not printed at
+            // all, which is what Linux prints for those too.
+            _ => {}
+        }
+        let pages = line.rss_pages;
+        if pages > 0 {
+            if line.anonymous {
+                out.push_str(&alloc::format!(" anon={pages}"));
+            }
+            out.push_str(&alloc::format!(" dirty={pages}"));
+            out.push_str(" active=0");
+            out.push_str(&alloc::format!(" N0={pages}"));
+            out.push_str(" kernelpagesize_kB=4");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// A path with the four characters `seq_file_path` escapes written as `\NNN`.
+///
+/// Measured rather than taken from the header: a path carrying a space comes
+/// back `a\040b`, one carrying a tab `a\011b`, and a backslash is left alone.
+fn push_escaped_path(out: &mut String, path: &str) {
+    for ch in path.chars() {
+        match ch {
+            ' ' => out.push_str("\\040"),
+            '\t' => out.push_str("\\011"),
+            '\n' => out.push_str("\\012"),
+            other => out.push(other),
+        }
+    }
+}
+
+/// Render `/proc/<pid>/smaps_rollup`: one record for the whole address space.
+///
+/// The same accounting `smaps` prints, summed, under a header that is the
+/// *bounds* of the space rather than one mapping's - `<first start>-<last end>
+/// ---p 00000000 00:00 0` and then `[rollup]` in the name column, at the same
+/// column a `maps` line names its mapping (73, measured). It exists because
+/// `smaps` costs a walk of every mapping and a reader that only wants the total
+/// - Android's low-memory killer, a compositor asking what its clients hold -
+/// was reading the whole file to add it up.
+///
+/// Its field list is `smaps`' with three taken out and three put in (measured on
+/// a current host, `.workbuddy/probe_rollup.c`): out go the three that belong to
+/// one mapping (`Size`, `KernelPageSize`, `MMUPageSize`) and the three that are
+/// per-mapping flags (`THPeligible`, `ProtectionKey`, `VmFlags`); in come
+/// `Pss_Anon`, `Pss_File` and `Pss_Shmem`, the split of the proportional set
+/// size. Twenty-two lines, in Linux's order, in `smaps`' layout.
+///
+/// The numbers are the sums of the same numbers `smaps` prints, and they are
+/// therefore this kernel's own answers to the same three questions
+/// (`format_smaps` carries the measurement): `Pss` and `Pss_Dirty` are `Rss`,
+/// the four shared/private buckets collapse into `Private_Dirty`, and
+/// `Referenced` is `Rss`. Of the three that `smaps` has no room for, `Pss_Anon`
+/// is the sum over the ranges that are anonymous and `Pss_File` the sum over the
+/// rest - which is the one split this kernel *can* make, since it is the
+/// question `Anonymous` already answers - and `Pss_Shmem` is **zero**, because a
+/// `memfd`'s pages are an object's here and Linux's shmem/file distinction is a
+/// distinction about its page cache. That is named rather than approximated.
+///
+/// ```
+/// use mpos::vfs::procfs::{MapLine, SmapsLine, format_smaps_rollup};
+/// use mpos_vm::MapFlags;
+///
+/// let line = |start: usize, end: usize, pages: usize, anonymous: bool| SmapsLine {
+///     map: MapLine {
+///         start, end,
+///         prot: MapFlags::READ | MapFlags::WRITE,
+///         shared: false, offset: 0, dev: (0, 0), inode: 0, name: None,
+///     },
+///     rss_pages: pages,
+///     anonymous,
+/// };
+/// let text = format_smaps_rollup(&[
+///     line(0x1000, 0x2000, 1, true),
+///     line(0x2000, 0x3000, 2, false),
+/// ]);
+/// // The header is the bounds of the whole space, not one mapping's.
+/// assert!(text.starts_with("00001000-00003000 ---p 00000000 00:00 0 "));
+/// assert_eq!(text.find("[rollup]"), Some(73));
+/// assert!(text.contains("\nRss:                  12 kB\n"));
+/// assert!(text.contains("\nPss_Anon:              4 kB\n"));
+/// assert!(text.contains("\nPss_File:              8 kB\n"));
+/// // The three per-mapping lines are gone, and so are the three flags.
+/// assert!(!text.contains("Size:"));
+/// assert!(!text.contains("THPeligible:"));
+/// assert!(!text.contains("VmFlags:"));
+/// ```
+pub fn format_smaps_rollup(lines: &[SmapsLine]) -> String {
+    let mut out = String::new();
+    // The header is the space's bounds: the first range's start and the last
+    // one's end, which is what Linux prints (measured against `maps`' own first
+    // and last line). An address space with no mapping at all has no bounds,
+    // and Linux answers the empty string for one.
+    if let (Some(first), Some(last)) = (lines.first(), lines.last()) {
+        let header = MapLine {
+            start: first.map.start,
+            end: last.map.end,
+            prot: MapFlags::empty(),
+            shared: false,
+            offset: 0,
+            dev: (0, 0),
+            inode: 0,
+            name: Some(String::from("[rollup]")),
+        };
+        out.push_str(&format_map_lines(core::iter::once(&header)));
+    }
+
+    let mut rss_kb = 0u64;
+    let mut anon_kb = 0u64;
+    let mut file_kb = 0u64;
+    for line in lines {
+        let kb = line.rss_pages as u64 * PAGE_KB;
+        rss_kb += kb;
+        if line.anonymous {
+            anon_kb += kb;
+        } else {
+            file_kb += kb;
+        }
+    }
+    smaps_kb(&mut out, "Rss:", rss_kb);
+    smaps_kb(&mut out, "Pss:", rss_kb);
+    smaps_kb(&mut out, "Pss_Dirty:", rss_kb);
+    smaps_kb(&mut out, "Pss_Anon:", anon_kb);
+    smaps_kb(&mut out, "Pss_File:", file_kb);
+    smaps_kb(&mut out, "Pss_Shmem:", 0);
+    smaps_kb(&mut out, "Shared_Clean:", 0);
+    smaps_kb(&mut out, "Shared_Dirty:", 0);
+    smaps_kb(&mut out, "Private_Clean:", 0);
+    smaps_kb(&mut out, "Private_Dirty:", rss_kb);
+    smaps_kb(&mut out, "Referenced:", rss_kb);
+    smaps_kb(&mut out, "Anonymous:", anon_kb);
+    for absent in [
+        "KSM:",
+        "LazyFree:",
+        "AnonHugePages:",
+        "ShmemPmdMapped:",
+        "FilePmdMapped:",
+        "Shared_Hugetlb:",
+        "Private_Hugetlb:",
+        "Swap:",
+        "SwapPss:",
+        "Locked:",
+    ] {
+        smaps_kb(&mut out, absent, 0);
+    }
+    out
+}
+
 /// Every range of `pid`'s address space, as both `maps` and `smaps` report it.
 ///
 /// Three sources, because the address space is recorded in three places: the
@@ -1642,13 +1884,38 @@ fn maps_of(pid: usize) -> Option<String> {
 /// The residency is counted page by page in `sched::resident_pages`, which is
 /// the only way it can be counted here: this kernel's resident set *is* the page
 /// tables.
+/// The records with their residency counted - what the three files that are
+/// `maps` plus accounting all read.
+///
+/// Counting is one page-table walk per mapped page, which is why `maps` does not
+/// do it: `numa_maps` and the two `smaps` spellings are the only callers.
 #[cfg(target_os = "none")]
-fn smaps_of(pid: usize) -> Option<String> {
+fn resident_lines(pid: usize) -> Option<Vec<SmapsLine>> {
     let mut lines = mapping_lines(pid)?;
     for line in lines.iter_mut() {
         line.rss_pages = crate::sched::resident_pages(pid, line.map.start, line.map.end);
     }
-    Some(format_smaps(&lines))
+    Some(lines)
+}
+
+#[cfg(target_os = "none")]
+fn smaps_of(pid: usize) -> Option<String> {
+    Some(format_smaps(&resident_lines(pid)?))
+}
+
+/// `/proc/<pid>/numa_maps`: the policy and the per-node counts, one line per
+/// mapping. The counts are the same residency `smaps` reports; see
+/// [`format_numa_maps`] for what is and is not Linux's.
+#[cfg(target_os = "none")]
+fn numa_maps_of(pid: usize) -> Option<String> {
+    Some(format_numa_maps(&resident_lines(pid)?))
+}
+
+/// `/proc/<pid>/smaps_rollup`: one record for the whole address space, for the
+/// reader that wants the total and not the walk. See [`format_smaps_rollup`].
+#[cfg(target_os = "none")]
+fn smaps_rollup_of(pid: usize) -> Option<String> {
+    Some(format_smaps_rollup(&resident_lines(pid)?))
 }
 
 #[cfg(not(target_os = "none"))]
@@ -1658,6 +1925,16 @@ fn maps_of(_pid: usize) -> Option<String> {
 
 #[cfg(not(target_os = "none"))]
 fn smaps_of(_pid: usize) -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "none"))]
+fn numa_maps_of(_pid: usize) -> Option<String> {
+    None
+}
+
+#[cfg(not(target_os = "none"))]
+fn smaps_rollup_of(_pid: usize) -> Option<String> {
     None
 }
 
@@ -2151,6 +2428,20 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     // headers *are* the `maps` lines - which is what lets a reader compare the
     // two files, and what `t-smaps` pins.
     node.add("smaps", NodeKind::File, maybe_file(move || smaps_of(pid)));
+    // The other two spellings of the same accounting, so that a reader asking
+    // for one of them by name finds it: `numa_maps` (one line per mapping) and
+    // `smaps_rollup` (one record for the whole space). Both read the same
+    // records `smaps` does, in the same order.
+    node.add(
+        "numa_maps",
+        NodeKind::File,
+        maybe_file(move || numa_maps_of(pid)),
+    );
+    node.add(
+        "smaps_rollup",
+        NodeKind::File,
+        maybe_file(move || smaps_rollup_of(pid)),
+    );
     // The mount table, in both spellings, under *every* process rather than
     // once at the top of `/proc`.
     //
@@ -4063,5 +4354,159 @@ mod tests {
         assert_eq!(config.metadata().size, 256);
 
         crate::pci::publish(Vec::new());
+    }
+
+    /// A `numa_maps` line is the start alone - no `-end`, unlike `maps` - and
+    /// the counts are the resident pages and nothing else: `anon` only for a
+    /// range whose pages are the mapping's own, `dirty` always (the rule
+    /// `smaps` applies), `active=0` because there is no LRU to be active on,
+    /// and `N0` the resident count because there is one node. All measured on
+    /// a current host first (`.workbuddy/probe_numamaps2.c`, Linux 7.2.11):
+    /// `7f9092bdf000 default anon=1 dirty=1 active=0 N0=1 kernelpagesize_kB=4`.
+    #[test]
+    fn a_numa_maps_line_is_the_start_the_policy_and_the_resident_count() {
+        let line = |start, pages, anonymous, name| SmapsLine {
+            map: MapLine {
+                start,
+                end: start + 0x4000,
+                prot: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+                shared: false,
+                offset: 0,
+                dev: (0, 0),
+                inode: 0,
+                name,
+            },
+            rss_pages: pages,
+            anonymous,
+        };
+        let text = format_numa_maps(&[
+            line(0x7f90_92bd_f000, 1, true, None),
+            line(0x7f90_92bb_5000, 1, false, Some(String::from("/bin/sh"))),
+            line(0x7f90_92ba_9000, 0, false, Some(String::from("/bin/sh"))),
+            line(0x55_5555_4000, 3, true, Some(String::from("[heap]"))),
+            line(0x7f90_92b0_0000, 2, true, Some(String::from("[vdso]"))),
+        ]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "7f9092bdf000 default anon=1 dirty=1 active=0 N0=1 kernelpagesize_kB=4"
+        );
+        assert_eq!(
+            lines[1],
+            "7f9092bb5000 default file=/bin/sh dirty=1 active=0 N0=1 kernelpagesize_kB=4"
+        );
+        // A range with nothing resident says the name and the policy, and no
+        // number at all - which is what the host printed for an untouched
+        // mapping of a file it could still name.
+        assert_eq!(lines[2], "7f9092ba9000 default file=/bin/sh");
+        assert_eq!(
+            lines[3],
+            "5555554000 default heap anon=3 dirty=3 active=0 N0=3 kernelpagesize_kB=4"
+        );
+        // A name that is not a path is not printed: `[vdso]` carries no
+        // `file=` on Linux either.
+        assert_eq!(
+            lines[4],
+            "7f9092b00000 default anon=2 dirty=2 active=0 N0=2 kernelpagesize_kB=4"
+        );
+    }
+
+    /// A path's space and tab are written `\040` and `\011` - measured, with a
+    /// path carrying both - because a `numa_maps` line is whitespace-separated
+    /// and a name that broke it would break the count a reader is after.
+    #[test]
+    fn a_numa_maps_path_escapes_what_would_break_the_line() {
+        let text = format_numa_maps(&[SmapsLine {
+            map: MapLine {
+                start: 0x1000,
+                end: 0x2000,
+                prot: MapFlags::READ | MapFlags::USER,
+                shared: true,
+                offset: 0,
+                dev: (0, 0),
+                inode: 0,
+                name: Some(String::from("/tmp/a b\tc.bin")),
+            },
+            rss_pages: 1,
+            anonymous: false,
+        }]);
+        assert!(
+            text.starts_with("00001000 default file=/tmp/a\\040b\\011c.bin"),
+            "{text:?}"
+        );
+    }
+
+    /// `smaps_rollup` is the *bounds* of the address space under a `[rollup]`
+    /// name, then the twenty-two field lines that survive the summing: the
+    /// three per-mapping sizes and the three per-mapping flags drop out, and
+    /// the three `Pss_*` that only a total can carry come in. Measured on a
+    /// current host (`.workbuddy/probe_rollup.c`).
+    #[test]
+    fn the_rollup_is_one_record_for_the_whole_space() {
+        let line = |start, end, pages, anonymous| SmapsLine {
+            map: MapLine {
+                start,
+                end,
+                prot: MapFlags::READ | MapFlags::WRITE | MapFlags::USER,
+                shared: false,
+                offset: 0,
+                dev: (0, 0),
+                inode: 0,
+                name: None,
+            },
+            rss_pages: pages,
+            anonymous,
+        };
+        let text = format_smaps_rollup(&[
+            line(0x0000_1000, 0x0000_2000, 1, true),
+            line(0x0000_2000, 0x0000_3000, 2, false),
+        ]);
+        let mut lines = text.lines();
+        let header = lines.next().expect("a header");
+        assert_eq!(
+            header,
+            "00001000-00003000 ---p 00000000 00:00 0                                  [rollup]"
+        );
+        // The name is in the same column a `maps` line names its mapping,
+        // which is what lets one parser read both.
+        assert_eq!(header.find("[rollup]"), Some(MAPS_NAME_COLUMN));
+
+        let keys: Vec<&str> = lines
+            .filter_map(|l| l.split_once(':').map(|(k, _)| k))
+            .collect();
+        assert_eq!(
+            keys,
+            alloc::vec![
+                "Rss",
+                "Pss",
+                "Pss_Dirty",
+                "Pss_Anon",
+                "Pss_File",
+                "Pss_Shmem",
+                "Shared_Clean",
+                "Shared_Dirty",
+                "Private_Clean",
+                "Private_Dirty",
+                "Referenced",
+                "Anonymous",
+                "KSM",
+                "LazyFree",
+                "AnonHugePages",
+                "ShmemPmdMapped",
+                "FilePmdMapped",
+                "Shared_Hugetlb",
+                "Private_Hugetlb",
+                "Swap",
+                "SwapPss",
+                "Locked",
+            ]
+        );
+        // The numbers are the sums of the same numbers `smaps` prints: 12 kB
+        // resident in all, 4 of it anonymous and 8 of it an object's.
+        assert!(text.contains("Rss:                  12 kB\n"), "{text:?}");
+        assert!(text.contains("Pss_Anon:              4 kB\n"), "{text:?}");
+        assert!(text.contains("Pss_File:              8 kB\n"), "{text:?}");
+        assert!(text.contains("Anonymous:             4 kB\n"), "{text:?}");
+        assert!(text.contains("Private_Dirty:        12 kB\n"), "{text:?}");
     }
 }

@@ -178,6 +178,72 @@ fn read_proc(path: &str) -> String {
     text
 }
 
+/// Read a whole `/proc` file into a buffer the caller keeps and reuses.
+///
+/// A read that allocated can add a mapping of its own, and the rollup's claim
+/// below is that a total and a sum of the same thing agree - which a mapping
+/// appearing between the two reads would break. The buffer is therefore the
+/// caller's, sized once, and the first pass is thrown away.
+fn read_into(path: &str, into: &mut String) {
+    into.clear();
+    if let Ok(mut file) = std::fs::File::open(path) {
+        let _ = std::io::Read::read_to_string(&mut file, into);
+    }
+}
+
+/// Linux's `smaps_rollup` field lines, in Linux's order - twenty-two of them,
+/// measured on a current host (`.workbuddy/probe_rollup.c`).
+///
+/// It is `smaps`' list with three taken out and three put in: a total has no
+/// `Size`, `KernelPageSize` or `MMUPageSize` to report, and no `THPeligible`,
+/// `ProtectionKey` or `VmFlags` - those are one mapping's - and it is the only
+/// spelling that carries `Pss_Anon`, `Pss_File` and `Pss_Shmem`, the split of
+/// the proportional set size.
+const ROLLUP_ORDER: [&str; 22] = [
+    "Rss",
+    "Pss",
+    "Pss_Dirty",
+    "Pss_Anon",
+    "Pss_File",
+    "Pss_Shmem",
+    "Shared_Clean",
+    "Shared_Dirty",
+    "Private_Clean",
+    "Private_Dirty",
+    "Referenced",
+    "Anonymous",
+    "KSM",
+    "LazyFree",
+    "AnonHugePages",
+    "ShmemPmdMapped",
+    "FilePmdMapped",
+    "Shared_Hugetlb",
+    "Private_Hugetlb",
+    "Swap",
+    "SwapPss",
+    "Locked",
+];
+
+/// The number on one `label: value kB` line of a file, summed over every line
+/// that carries the label - which is one per record, and therefore the total.
+fn total_kb(text: &str, label: &str) -> u64 {
+    let needle = format!("{label}:");
+    text.lines()
+        .filter(|line| line.starts_with(needle.as_str()))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .filter_map(|word| word.parse::<u64>().ok())
+        .sum()
+}
+
+/// The number on one line of the rollup, which has one line per label.
+fn rollup_kb(text: &str, label: &str) -> Option<u64> {
+    let needle = format!("{label}:");
+    text.lines()
+        .find(|line| line.starts_with(needle.as_str()))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|word| word.parse::<u64>().ok())
+}
+
 /// A fixture bounded by `PROT_NONE` pages: `pages` of `prot` in the middle of a
 /// span nobody can merge with, and the address of the middle's first page.
 ///
@@ -435,6 +501,112 @@ fn main() {
             }
         }
     }
+
+    // ---- the rollup: one record for the whole address space -------------
+    //
+    // The spelling a reader that wants the total and not the walk reads. Its
+    // header is the *bounds* of the space rather than one mapping's, and its
+    // field lines are the sums of the ones above - which is the property the
+    // last two claims here are about.
+    //
+    // The reads are warmed up first: a read that allocated could add a mapping
+    // of its own, and a total read before the addition cannot equal a sum read
+    // after it. The buffer `read_proc` takes is sized once and dropped, so the
+    // allocator hands the same memory to the next read and the space settles.
+    let mut every = String::with_capacity(64 * 1024);
+    let mut rollup = String::with_capacity(64 * 1024);
+    read_into("/proc/self/smaps", &mut every);
+    read_into("/proc/self/smaps_rollup", &mut rollup);
+    read_into("/proc/self/smaps", &mut every);
+    read_into("/proc/self/smaps_rollup", &mut rollup);
+    r.check(
+        "reading /proc/self/smaps_rollup answered something",
+        !rollup.is_empty(),
+    );
+
+    let header = rollup.lines().next().unwrap_or("");
+    // The name is in the same column a `maps` line names its mapping, which is
+    // what lets one parser read all three files.
+    r.check(
+        "the rollup's header names it [rollup], in maps' name column",
+        header.find("[rollup]") == Some(73),
+    );
+    // And the header is the bounds: the first mapping's start and the last
+    // one's end. The gate VMA is the exception and it is Linux's own -
+    // `[vsyscall]` is not a VMA of the address space, so it has a `maps` line
+    // and is not part of either bound (measured on a current host).
+    let maps_now = read_proc("/proc/self/maps");
+    let bounds = |last: bool| -> Option<String> {
+        let lines: Vec<&str> = maps_now
+            .lines()
+            .filter(|line| !line.ends_with("[vsyscall]"))
+            .collect();
+        let line = if last {
+            *lines.last()?
+        } else {
+            *lines.first()?
+        };
+        let field = line.split_whitespace().next()?;
+        Some(String::from(if last {
+            field.split('-').nth(1)?
+        } else {
+            field.split('-').next()?
+        }))
+    };
+    let ours: Vec<&str> = header.split_whitespace().collect();
+    let start = ours.first().and_then(|f| f.split('-').next());
+    let end = ours.first().and_then(|f| f.split('-').nth(1));
+    r.check(
+        "and those bounds are the first and last mapping's, from maps",
+        start.is_some()
+            && start == bounds(false).as_deref()
+            && end.is_some()
+            && end == bounds(true).as_deref(),
+    );
+    // `---p 00000000 00:00 0`: a record that is the whole space is not one
+    // mapping's protection, offset, device or inode.
+    r.check(
+        "and the rest of the header is the empty word Linux prints",
+        header.contains(" ---p 00000000 00:00 0 "),
+    );
+
+    let keys: Vec<&str> = rollup
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':').map(|(k, _)| k))
+        .collect();
+    r.check(
+        "the rollup's field lines are Linux's, in Linux's order",
+        keys == ROLLUP_ORDER,
+    );
+    // The whole point of the file: each number is the sum of the same number
+    // over every record above. `Rss` is the one that cannot be fudged, and
+    // `Anonymous` the one this kernel's own rule has to survive (the anon/file
+    // split is a split this kernel can make - it is the question `Anonymous`
+    // already answers).
+    r.check(
+        "the rollup's Rss is the sum of Rss over every record",
+        rollup_kb(&rollup, "Rss") == Some(total_kb(&every, "Rss")),
+    );
+    r.check(
+        "and its Anonymous is the sum of Anonymous over every record",
+        rollup_kb(&rollup, "Anonymous") == Some(total_kb(&every, "Anonymous")),
+    );
+    // The features this kernel does not have answer zero in the total for the
+    // same reason they do in a record: no KSM, no huge pages, no swap, no lock.
+    r.check(
+        "and the features this kernel does not have answer zero in the total",
+        rollup_kb(&rollup, "KSM") == Some(0)
+            && rollup_kb(&rollup, "AnonHugePages") == Some(0)
+            && rollup_kb(&rollup, "Swap") == Some(0)
+            && rollup_kb(&rollup, "SwapPss") == Some(0)
+            && rollup_kb(&rollup, "Locked") == Some(0),
+    );
+
+    r.check(
+        "and a pid nothing answers to has no rollup either",
+        std::fs::read_to_string("/proc/424242/smaps_rollup").is_err(),
+    );
 
     // ---- the file is the *pid*'s, not the reader's ----------------------
     //
