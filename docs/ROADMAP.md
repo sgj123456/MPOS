@@ -357,6 +357,17 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are TCP's record-only buffer sizes  
 (`SO_SNDBUF`/`SO_RCVBUF`); the two namespace kinds with no entry at all are IPC and cgroup.
 
+**The `F_GETFL` word is the caller's own** (`docs/uapi/` §5.1 item 49, landed 2026-10-18): Linux  
+answers `filp->f_flags`, so a caller that compares the word against what it opened with agrees — its  
+mode, `O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_SYNC`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME` — where  
+this kernel answered the mode plus `O_APPEND` and `O_NONBLOCK` and nothing else. The open now records  
+the word it was asked for (`File::born`), minus exactly what the open *spends* (the creation flags  
+and `O_CLOEXEC`, which is a descriptor flag), and `F_SETFL` still reaches only its own two bits — the  
+split Linux's mask makes rather than a rule of this kernel. Two members of Linux's word stay  
+deliberately missing and named in `docs/uapi/` §5.2: `O_LARGEFILE`, which this kernel neither defines  
+nor invents, and the three bits its `SETFL_MASK` is narrower by (`O_ASYNC`, `O_DIRECT`, `O_NOATIME`  
+are reported when an open asked for them but cannot be set afterwards).
+
 **The device tree removes a directory it made** (`docs/uapi/` §5.1 item 48, landed 2026-10-18): the  
 `mpos: syscall 84 (path /dev/dri/by-path) -> EOPNOTSUPP` a boot printed once per boot was udev's  
 per-boot idiom — remove that directory, then publish the `by-path` links under it again — meeting a  

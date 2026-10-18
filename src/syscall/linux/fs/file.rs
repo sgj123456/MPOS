@@ -433,6 +433,15 @@ fn open_linux(path: &str, flags: usize, mode: u32, base: Arc<dyn Inode>) -> isiz
             // already recorded in the field `F_GETFL` composes its word from.
             if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
                 file.set_status(flags as u32);
+                // And the other half of the word: everything the caller asked
+                // for that the open answered without spending it -
+                // `O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_SYNC` and the rest
+                // of `O_*`, which Linux's `F_GETFL` reports back because its
+                // `filp->f_flags` kept them. Without this a caller that
+                // compares the word against what it opened with sees a
+                // disagreement on Linux's answer for every one of them
+                // (`docs/uapi/` §5.2 carried it as a gap; item 49 closes it).
+                file.set_born(flags as u32);
                 // What landed is the masked word, and the bit with teeth is
                 // `O_NONBLOCK`: it has to reach the node that does the blocking.
                 sync_nonblocking(&file, file.status());

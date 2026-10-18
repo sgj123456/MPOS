@@ -189,23 +189,27 @@ Section numbers are unchanged from the original `UAPI.md`.
   **Landed 2026-10-16** (`docs/uapi/` §5.1 item 21) for the half a caller reads to learn a
   descriptor's direction: the access mode the description was made under is in the word - a path
   `open`, a `pipe2` end and an `inotify` queue all answer Linux's mode - and `F_SETFL` no longer
-  clears it. What is left is the *rest* of `filp->f_flags`, and it is measured rather than
-  recalled: on a current host through `syscall(2)` (`.workbuddy/probe_getfl.c`, Linux 7.2.9),
-  `open(O_RDONLY)` reports `0x8000` and `open(O_WRONLY)` `0x8001`, where `0x8000` is
-  `O_LARGEFILE` - the kernel *adds* that bit to every path open, and machine-dependently
-  (`0o100000` on x86_64, `0o20000` on arm64, where this repository's own uapi table deliberately
-  defines neither). Beside it the open keeps what it was asked for:
-  `open(dir, O_RDONLY|O_DIRECTORY)` reports `0x18000`, `open(O_RDONLY|O_NOFOLLOW)` reports
-  `0x28000` - `O_NOFOLLOW` *is* reported, so the bit is not open-only on Linux, which
-  `src/syscall/linux/abi.rs`'s comment about it used to say it was - `open(path, O_PATH)` reports
-  `0x200000`, and `O_SYNC`/`O_DSYNC`, `O_ASYNC`, `O_DIRECT` and `O_NOATIME` each come back the
-  same way. This kernel stores none of them: its word is the access mode plus `O_APPEND` and
-  `O_NONBLOCK`. A caller that compares the whole word against what it opened with therefore sees
-  a difference - the shape `rustix::fs::Dir` would meet if it reopened a directory from the word
-  it read, though for the `O_RDONLY` dirfd it reads those extra bits are as harmless here as they
-  are on Linux. Owner: `src/vfs/file.rs`'s `SETFL_MASK` and the `F_GETFL` arm, whose
-  answer for `O_LARGEFILE` is a cross-machine decision (`t-open-flags` pins that this kernel
-  ignores the flag on both machines today). `docs/notes/` §15.16.
+  clears it. **The other half landed 2026-10-18** (`docs/uapi/` §5.1 item 49): what the open was
+  *asked* for comes back too, because Linux reports `filp->f_flags` and `F_SETFL` only rewrites the
+  `SETFL_MASK` member of it. Measured on a current host through `syscall(2)`
+  (`.workbuddy/probe_getfl.c`, Linux 7.2.11): `open(O_RDONLY)` reports `0x8000` and
+  `open(O_WRONLY)` `0x8001`, where `0x8000` is `O_LARGEFILE` - the kernel *adds* that bit to every
+  path open, machine-dependently (`0o100000` on x86_64, `0o20000` on arm64, where this repository's
+  own uapi table deliberately defines neither) - and beside it every flag the caller named:
+  `open(dir, O_RDONLY|O_DIRECTORY)` `0x18000`, `open(O_RDONLY|O_NOFOLLOW)` `0x28000` (`O_NOFOLLOW`
+  *is* reported, so the bit is not open-only on Linux, which `src/syscall/linux/abi.rs`'s comment
+  about it used to say it was), `open(O_PATH)` `0x200000`, `O_SYNC`/`O_DSYNC` `0x109001`,
+  `O_ASYNC` `0xa000`, `O_DIRECT` `0xc002`, `O_NOATIME` `0x48000` - while `O_CREAT`/`O_TRUNC` and
+  `O_CLOEXEC` are **not** reported, the first pair being spent by the open and the last being a
+  *descriptor* flag (`F_GETFD`'s word). Two members of Linux's word stay deliberately missing here:
+  `O_LARGEFILE`, which this kernel neither defines nor invents (`t-open-flags` pins that it is
+  ignored on both machines), and the three bits `SETFL_MASK` is narrower by - `O_ASYNC`,
+  `O_DIRECT` and `O_NOATIME` are **reported** when an open asked for them but cannot be *set*
+  through `F_SETFL`, where Linux's mask allows all three. A caller that compares the whole word
+  against what it opened with now agrees on everything it can ask for, which is what `rustix::fs`'s
+  `Dir` and any reopened `/proc/self/fd` entry read it for. Owner: `src/vfs/file.rs`'s
+  `File::born`/`set_born` and `open_flags`, set at the one open path. `docs/notes/` §15.16,
+  §15.67.
 - **`__WCLONE` is accepted and ignored, where Linux narrows with it.** Measured
   on a current host: `waitid(P_ALL, 0, &si, WEXITED|__WCLONE)` answers `ECHILD`
   (errno 10) for a child that exits with `SIGCHLD`, because the bit means

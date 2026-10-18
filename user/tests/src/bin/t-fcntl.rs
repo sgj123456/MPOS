@@ -48,6 +48,15 @@
 //! F_SETFL(O_NONBLOCK) on an O_WRONLY fd   F_GETFL = 0x8801   still accmode 1
 //! F_SETFL(O_RDWR)     on an O_WRONLY fd   F_GETFL = 0x8001   still accmode 1
 //! F_SETFL(O_RDONLY)   on an O_WRONLY fd   F_GETFL = 0x8001   still accmode 1
+//! open(dir, O_RDONLY|O_DIRECTORY)         F_GETFL = 0x18000  O_DIRECTORY
+//! open(O_RDONLY|O_NOFOLLOW)               F_GETFL = 0x28000  O_NOFOLLOW
+//! open(O_PATH)                            F_GETFL = 0x200000 O_PATH
+//! open(O_WRONLY|O_SYNC)                   F_GETFL = 0x109001 O_SYNC|O_DSYNC
+//! open(O_RDONLY|O_ASYNC)                  F_GETFL = 0xa000   O_ASYNC
+//! open(O_RDONLY|O_NOATIME)                F_GETFL = 0x48000  O_NOATIME
+//! open(O_RDWR|O_DIRECT)                   F_GETFL = 0xc002   O_DIRECT
+//! open(O_WRONLY|O_CREAT|O_TRUNC)          F_GETFL = 0x8001   neither reported
+//! open(O_WRONLY|O_CLOEXEC)                F_GETFL = 0x8001   not reported
 //! pipe()      read end 0 (0x0), write end 1 (0x1)
 //! socketpair() end 2 (0x2);  eventfd/timerfd/signalfd/epoll 2;  inotify 0
 //! ```
@@ -58,11 +67,21 @@
 //! for the mode - so a caller that asks for `O_NONBLOCK` alone keeps its
 //! direction, and one that asks for `O_RDWR` does not get to read.
 //!
+//! The open's own flags are the half this kernel did not keep: its word was the
+//! mode plus `O_APPEND` and `O_NONBLOCK`, so a caller comparing `F_GETFL`
+//! against what it opened with disagreed on Linux's answer for every flag that
+//! is not one of those three. Closed 2026-10-18 (`docs/uapi/` §5.1 item 49): the
+//! open records the word it was asked for (`File::set_born`), the bits it
+//! *spends* - the creation flags and `O_CLOEXEC`, which is a descriptor flag
+//! - are dropped, and `F_SETFL` cannot reach the rest. The two claims about a
+//! word that names an open-only bit are what tell the two halves apart.
+//!
 //! (`0x8000` in each line is `O_LARGEFILE`, which that kernel adds to every
-//! path open and which this one does not carry at all; the rest of what Linux's
-//! word holds and this kernel's does not - `O_DIRECTORY`, `O_NOFOLLOW`,
-//! `O_PATH`, `O_SYNC`, `O_DSYNC`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME` - is
-//! named in `docs/uapi/` §5.2.)
+//! path open and which this one does not carry at all - the one member of
+//! Linux's word that stays missing, named in `docs/uapi/` §5.2, together with
+//! what this kernel's `SETFL_MASK` is narrower by: `O_ASYNC`, `O_DIRECT` and
+//! `O_NOATIME` are reported when an open asked for them but cannot be set
+//! through `F_SETFL`, which Linux's `SETFL_MASK` does allow.)
 //!
 //! Every descriptor these claims are made about is one this program *made* -
 //! a file it opens, a pipe it mints, a socketpair it makes - so the section
@@ -115,7 +134,8 @@ const BEYOND_CLOEXEC: u32 = 0xFFFF_FFFF;
 /// Linux's carries more than the mode: it adds `O_LARGEFILE` to every *path*
 /// open (`0x8000` in the probe's transcript), and keeps whatever else the open
 /// recorded (`O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_SYNC`...). This kernel
-/// carries none of those - `docs/uapi/` §5.2 names them - and a pipe end, a
+/// keeps those too now (`docs/uapi/` §5.1 item 49) - `O_LARGEFILE` is the one
+/// member of Linux's word it does not carry, named in §5.2 - and a pipe end, a
 /// socket and a `pipe2` word have no extra bits on either, which is why those
 /// three claims below are stated whole.
 const ACCMODE: OFlags = OFlags::from_bits_retain(0o3);
@@ -226,6 +246,117 @@ fn main() {
     r.check(
         "F_GETFL reports O_RDWR for a file opened O_RDWR",
         mode_of(&rw) == Some(OFlags::RDWR),
+    );
+
+    // ---- what the open *asked for* comes back too. Linux's word is
+    // ---- `filp->f_flags`, so every flag the open recorded is in it - not just
+    // ---- the two `F_SETFL` may change. This kernel kept the mode and those
+    // ---- two and nothing else, which is what made a caller comparing the word
+    // ---- against what it opened with disagree on Linux's answer
+    // ---- (`docs/uapi/` §5.1 item 49). The host table is the doc comment above;
+    // ---- every claim here is Linux's answer, so a host run measures it.
+
+    /// One flag's own bit, as `OFlags`, for the flags `rustix`'s type does not
+    /// name. `libc` supplies the machine's number, which is the point: the four
+    /// flags that differ between the two machines are the ones this program
+    /// must not write down itself.
+    fn oflag(bits: libc::c_int) -> OFlags {
+        OFlags::from_bits_retain(bits as u32)
+    }
+
+    match openat(
+        CWD,
+        FILE,
+        OFlags::RDONLY | oflag(libc::O_NOFOLLOW),
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            r.check(
+                "F_GETFL reports O_NOFOLLOW: the bit is not open-only",
+                fcntl_getfl(&fd).is_ok_and(|f| f.contains(oflag(libc::O_NOFOLLOW))),
+            );
+            // The split, claimed on one descriptor: `F_SETFL` rewrites the
+            // status half and leaves the open's own flags alone.
+            let set = fcntl_setfl(&fd, OFlags::NONBLOCK).is_ok();
+            r.check(
+                "and a status write beside it keeps both",
+                set && fcntl_getfl(&fd).is_ok_and(|f| {
+                    f.contains(oflag(libc::O_NOFOLLOW)) && f.contains(OFlags::NONBLOCK)
+                }),
+            );
+            let cleared = fcntl_setfl(&fd, OFlags::empty()).is_ok();
+            r.check(
+                "... while clearing the status half leaves the open's flag standing",
+                cleared
+                    && fcntl_getfl(&fd).is_ok_and(|f| {
+                        f.contains(oflag(libc::O_NOFOLLOW)) && !f.contains(OFlags::NONBLOCK)
+                    }),
+            );
+        }
+        Err(_) => {
+            for label in [
+                "F_GETFL reports O_NOFOLLOW: the bit is not open-only",
+                "and a status write beside it keeps both",
+                "... while clearing the status half leaves the open's flag standing",
+            ] {
+                r.check(label, false);
+            }
+        }
+    }
+    r.check(
+        "F_GETFL reports O_DIRECTORY for a directory opened with the demand",
+        openat(
+            CWD,
+            "/tmp",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .is_ok_and(|fd| fcntl_getfl(&fd).is_ok_and(|f| f.contains(OFlags::DIRECTORY))),
+    );
+    r.check(
+        "F_GETFL reports O_SYNC (and its O_DSYNC half) for a writer that asked for it",
+        openat(
+            CWD,
+            FILE,
+            OFlags::WRONLY | oflag(libc::O_SYNC),
+            Mode::empty(),
+        )
+        .is_ok_and(|fd| {
+            fcntl_getfl(&fd)
+                .is_ok_and(|f| f.contains(oflag(libc::O_SYNC)) && f.contains(oflag(libc::O_DSYNC)))
+        }),
+    );
+    r.check(
+        "F_GETFL reports O_NOATIME, which no status write could restore",
+        openat(
+            CWD,
+            FILE,
+            OFlags::RDONLY | oflag(libc::O_NOATIME),
+            Mode::empty(),
+        )
+        .is_ok_and(|fd| fcntl_getfl(&fd).is_ok_and(|f| f.contains(oflag(libc::O_NOATIME)))),
+    );
+    r.check(
+        "F_GETFL reports O_ASYNC, though nothing here delivers the signal",
+        openat(
+            CWD,
+            FILE,
+            OFlags::RDONLY | oflag(libc::O_ASYNC),
+            Mode::empty(),
+        )
+        .is_ok_and(|fd| fcntl_getfl(&fd).is_ok_and(|f| f.contains(oflag(libc::O_ASYNC)))),
+    );
+    // The two that are *not* the description's: `O_CLOEXEC` is a descriptor
+    // flag (`F_GETFD`'s word), and `O_TRUNC` was spent by the open.
+    r.check(
+        "F_GETFL does not report O_CLOEXEC, which belongs to the descriptor",
+        openat(CWD, FILE, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty())
+            .is_ok_and(|fd| fcntl_getfl(&fd).is_ok_and(|f| !f.contains(OFlags::CLOEXEC))),
+    );
+    r.check(
+        "nor O_TRUNC, which the open spent",
+        openat(CWD, FILE, OFlags::WRONLY | OFlags::TRUNC, Mode::empty())
+            .is_ok_and(|fd| fcntl_getfl(&fd).is_ok_and(|f| !f.contains(OFlags::TRUNC))),
     );
 
     // `F_SETFL` replaces only the bits Linux lets a caller change, so the mode

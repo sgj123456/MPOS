@@ -1833,3 +1833,72 @@ the commit bodies), and each moved its pin in the same commit.
     - every clock claim, `mkdir` served, `EEXIST`, `so the name it removed is gone`, `ENOENT` and
     `rmdir of a name nothing made` - pass on both kernels, which is what keeps the reds on the
     removal doors rather than on the directory the test makes.
+
+## item 49 — the `F_GETFL` word is the caller's own, minus what the open spends
+
+    §5.2's entry, and the second half of one item 21 already half-closed: the *access mode* has been
+    in the word since 2026-10-16, and what stayed missing was the rest of `filp->f_flags`. Linux
+    answers the word the open recorded, so a caller that compares `F_GETFL` against what it opened
+    with agrees; this kernel answered the mode plus `O_APPEND` and `O_NONBLOCK` and nothing else, so
+    the comparison disagreed on every other flag the caller had named.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_getfl.c`, Linux 7.2.11, every call
+    through `syscall(2)` so no libc's rewrite is mistaken for the kernel's rule):
+
+    * **what the open keeps**: `open(O_RDONLY)` `0x8000`, `open(O_WRONLY)` `0x8001`,
+      `open(O_RDWR)` `0x8002` - and `0x8000` is `O_LARGEFILE`, which that kernel *adds* to every
+      path open (`0o100000` on x86_64, `0o20000` on arm64: the one member this kernel does not
+      carry, and `t-open-flags` pins that it is ignored here on both machines);
+    * **every flag the caller named comes back**: `open(dir, O_RDONLY|O_DIRECTORY)` `0x18000`,
+      `open(O_RDONLY|O_NOFOLLOW)` `0x28000` - so the bit is *not* open-only, which `abi.rs`'s
+      comment about it used to say it was - `open(O_PATH)` `0x200000`,
+      `open(O_WRONLY|O_SYNC)` `0x109001` (both `O_SYNC` and its `O_DSYNC` half),
+      `open(O_RDONLY|O_ASYNC)` `0xa000`, `open(O_RDWR|O_DIRECT)` `0xc002`,
+      `open(O_RDONLY|O_NOATIME)` `0x48000`;
+    * **what the open spends is not reported**: `open(O_WRONLY|O_CREAT|O_TRUNC)` answers `0x8001`
+      and `open(O_WRONLY|O_CLOEXEC)` `0x8001` - the creation flags are answered by the open itself,
+      and `O_CLOEXEC` is a *descriptor* flag (`F_GETFD`'s word);
+    * **the two halves are separate**, which is the whole reason `F_SETFL` takes a mask: on one
+      `O_WRONLY` description, `F_SETFL(0)` leaves `0x8001` (mode kept, status cleared),
+      `F_SETFL(O_NONBLOCK)` gives `0x8801`, and `F_SETFL(0xFFFFFFFF)` gives `0x4cc01` - Linux's own
+      `SETFL_MASK` is `O_APPEND|O_ASYNC|O_DIRECT|O_NOATIME|O_NONBLOCK`, so those four survive and
+      the creation bits in the same word store nothing (`F_SETFL(O_CREAT|O_EXCL|O_NOCTTY|O_TRUNC)`
+      answers `0x8001`);
+    * **the doors that mint their own direction already agree**: `pipe()`'s ends `0` and `1`,
+      `pipe2(O_NONBLOCK)`'s `0x800` and `0x801`, a socket/socketpair/`eventfd`/`timerfd`/
+      `signalfd`/`epoll` `2`, `inotify_init1` `0`, and `memfd_create` `0x8002` - the last one only
+      because that descriptor's own `O_LARGEFILE` is in the answer, so this kernel's `2` there is
+      the same `O_LARGEFILE` gap and not a second finding.
+
+    **The fix is one field and one call.** `File::born` keeps the word the open was asked for,
+    minus `SPENT_AT_OPEN` - the access mode, the four creation flags and `O_CLOEXEC` -
+    `File::open_flags` composes `access | status | born`, and the one path-`open` records it beside
+    `set_status`. `F_SETFL` still reaches `status` alone, which is Linux's mask making the split
+    rather than a rule about this kernel. Nothing else moved: the doors that mint a description
+    without a flag word leave `born` at zero, which is what Linux reports for all of them.
+
+    Pin: `t-fcntl`'s new **nine claims** (31 in the file, was 22) - `O_NOFOLLOW` reported, a status
+    write beside it keeping both, the status clear leaving it standing, `O_DIRECTORY`,
+    `O_SYNC|O_DSYNC`, `O_NOATIME`, `O_ASYNC`, and the two controls that say the word is not
+    everything (`O_CLOEXEC` and `O_TRUNC` are not reported) - beside the host unit test
+    `the_reported_word_holds_what_the_open_asked_for`, which walks the split with no machine under
+    it. Every claim is Linux's answer, so `MPOS_ON_HOST=1` is the measurement: **31 of 31 on this
+    host first**, and the sweep is the pin. The four flags whose *numbers* differ between the two
+    machines are taken from `libc` in the program rather than written down, which is what lets one
+    file pin both.
+
+    Gate: x86_64 `pass=183 fail=0 (183 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33 (183
+    staged, 11 left out by `tests.toml`); the second machine's arm is `pass=182 fail=0`,
+    `mpos-kunit 32 passed, 0 failed` (182 staged, 12 left out), and the program's 31 `ok:` lines are
+    byte-identical across the two machines (diffed, carriage returns aside).
+
+    The counterfactual is sweep-only, and that is the shape of the change rather than a shortcut:
+    the field, the composition and the unit test are the *mechanism*, and the mechanism is one line
+    at the call site. With only that line put back (`file.set_born(flags as u32)` commented out; the
+    field, the unit test and all 31 claims kept) stage 1 is untouched - the unit test calls the
+    setter itself - and the sweep is `pass=182 fail=1 (183 built)` with `FAIL t-fcntl` and **seven**
+    red claims by name: the five reported flags (`O_NOFOLLOW`, `O_DIRECTORY`, `O_SYNC`+`O_DSYNC`,
+    `O_NOATIME`, `O_ASYNC`) and the two that only pass because one of them survives a status write
+    (`and a status write beside it keeps both`, `... while clearing the status half leaves the
+    open's flag standing`). The two controls - `O_CLOEXEC` and `O_TRUNC` not reported - pass on both
+    kernels, which is what keeps the reds on the recording rather than on the doors.

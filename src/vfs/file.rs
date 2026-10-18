@@ -58,6 +58,37 @@ pub const O_APPEND: u32 = 0o2000;
 /// every path open and this one does not carry at all (`docs/uapi/` §5.2).
 pub const SETFL_MASK: u32 = O_APPEND | O_NONBLOCK;
 
+/// The access-mode field: the two low bits of every open's flag word, which say
+/// which way the description opens. [`File::access`] is their one owner, and
+/// [`File::open_flags`] puts them back into the word it reports.
+pub const O_ACCMODE: u32 = 0o3;
+
+/// The bits an open's flag word spends on the *call* rather than on the
+/// description, and which `fcntl(F_GETFL)` therefore does not report back: the
+/// access mode (kept in [`File::access`]), the creation flags `O_CREAT`,
+/// `O_EXCL`, `O_NOCTTY` and `O_TRUNC` (answered by the open itself, then
+/// meaningless), and `O_CLOEXEC` - a *descriptor* flag, which is why `F_GETFD`
+/// is the door that reports it.
+///
+/// What is *not* here is the measured half of the rule, and it is the reason
+/// this constant exists at all. On a current host (`.workbuddy/probe_getfl.c`,
+/// every call through `syscall(2)`) every one of these is absent from the word
+/// an open reports, while everything else the caller asked for comes back:
+/// `O_DIRECTORY` (`0x18000` for a directory opened `O_RDONLY|O_DIRECTORY`),
+/// `O_NOFOLLOW` (`0x28000`), `O_PATH` (`0x200000`), `O_SYNC`
+/// (`O_SYNC|O_DSYNC` both, `0x109001`), `O_ASYNC` (`0xa000`), `O_DIRECT`
+/// (`0xc002`) and `O_NOATIME` (`0x48000`). The `0x8000` beside them is
+/// `O_LARGEFILE`, which that kernel *adds* to every path open and this one
+/// does not carry at all - so it is not in the word here, and `docs/uapi/` §5.2
+/// says so.
+pub const SPENT_AT_OPEN: u32 = O_ACCMODE
+    // O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC: the creation flags, which are the
+    // same four numbers on both machines (the machine-specific ones are
+    // O_DIRECTORY/O_NOFOLLOW/O_DIRECT/O_LARGEFILE, and none of those is spent).
+    | 0o100 | 0o200 | 0o400 | 0o1000
+    // O_CLOEXEC.
+    | 0o200_0000;
+
 /// The access mode a description was made under, as the low two bits of
 /// `O_ACCMODE`. `File::read`/`File::write` refuse a mismatch with `EBADF`, which
 /// is Linux's answer for `write()` on an `O_RDONLY` descriptor and the reverse,
@@ -83,6 +114,19 @@ pub struct File {
     /// changes behavior; the rest are stored so a caller reads back what it
     /// wrote.
     status: core::sync::atomic::AtomicU32,
+    /// The flags the open itself was asked for, minus [`SPENT_AT_OPEN`] - the
+    /// half of `F_GETFL`'s word that no later call can change.
+    ///
+    /// Linux reports `filp->f_flags`, and `F_SETFL` rewrites it as
+    /// `(arg & SETFL_MASK) | (old & ~SETFL_MASK)`: the flags an open recorded
+    /// and `F_SETFL` has no member for are exactly the ones that stay. Keeping
+    /// them here rather than in [`Self::status`] is what makes that split a
+    /// fact of the structure rather than a mask applied on every read - and
+    /// what makes a caller that compares `F_GETFL` against the word it opened
+    /// with (rustix's `Dir`, a reopened `/proc/self/fd` entry) see its own
+    /// flags instead of two of them. Measured on a current host first: see
+    /// [`SPENT_AT_OPEN`].
+    born: core::sync::atomic::AtomicU32,
     /// Whether this description was opened for writing - the question
     /// `close(2)` answers with `IN_CLOSE_WRITE` rather than
     /// `IN_CLOSE_NOWRITE`, recorded once at open because the flags word a
@@ -136,6 +180,7 @@ impl File {
             opened_for_write: core::sync::atomic::AtomicBool::new(false),
             access: AtomicU8::new(ACC_RDWR as u8),
             status: core::sync::atomic::AtomicU32::new(0),
+            born: core::sync::atomic::AtomicU32::new(0),
             label: Mutex::new(RefCell::new(None)),
             dev: core::sync::atomic::AtomicU64::new(DEV_UNSET),
         }
@@ -215,17 +260,42 @@ impl File {
     }
 
     /// The open flag word, as `fcntl(F_GETFL)` reports it: the access mode the
-    /// description was made under, OR'd with the changeable flags it carries.
+    /// description was made under, OR'd with the flags it carries.
     ///
     /// Linux reports `filp->f_flags`, and the access mode is the half a caller
     /// most often reads the word for - glibc's streams ask
-    /// `fcntl(F_GETFL) & O_ACCMODE` to learn which way a stream is open. Its
-    /// word also carries `O_LARGEFILE` and whatever else the open recorded
-    /// (`O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_SYNC`...); those are named in
-    /// `docs/uapi/` §5.2 rather than invented here, since this kernel neither
-    /// implements them nor stores them.
+    /// `fcntl(F_GETFL) & O_ACCMODE` to learn which way a stream is open. The
+    /// rest of its word is *the caller's own*: `O_DIRECTORY`, `O_NOFOLLOW`,
+    /// `O_PATH`, `O_SYNC` and the others come back because the open recorded
+    /// them, which is why a caller that compares the word against what it
+    /// opened with agrees on Linux. Here the word is composed of three owners
+    /// rather than one - the access mode, the [`SETFL_MASK`] half a later
+    /// `F_SETFL` may replace, and the [`File::born`] half it may not - and the
+    /// only thing Linux's word carries that this one does not is
+    /// `O_LARGEFILE`, which this kernel neither defines nor invents
+    /// (`docs/uapi/` §5.2).
     pub fn open_flags(&self) -> u32 {
-        self.status() | self.access()
+        self.access() | (self.status() & SETFL_MASK) | self.born()
+    }
+
+    /// The flags the open recorded that no later call can change - the half of
+    /// [`Self::open_flags`] that survives an `F_SETFL`.
+    pub fn born(&self) -> u32 {
+        self.born.load(Ordering::Relaxed) & !SETFL_MASK
+    }
+
+    /// Record the flag word the open was asked for. [`SPENT_AT_OPEN`]'s bits
+    /// are dropped, because Linux's `F_GETFL` does not report them: the
+    /// creation flags are answered by the open itself, `O_CLOEXEC` lives on the
+    /// *descriptor* (`FD_CLOEXEC`), and the access mode is already the field
+    /// [`Self::access`] owns.
+    ///
+    /// A door that mints a description without knowing a flag word - a socket,
+    /// an `eventfd`, a pipe end - leaves this at zero, which is what Linux
+    /// reports for all of them (measured: `pipe()`'s ends answer `0` and `1`,
+    /// a socket and an `eventfd` `2`, an `inotify` `0`).
+    pub fn set_born(&self, flags: u32) {
+        self.born.store(flags & !SPENT_AT_OPEN, Ordering::Relaxed);
     }
 
     /// The changeable open flags the description carries - what
@@ -1148,5 +1218,86 @@ mod tests {
         // is untouched.
         file.set_status(0o1700);
         assert_eq!(file.open_flags(), super::ACC_WRONLY);
+    }
+
+    /// The other half of `F_GETFL`'s word: what the open was *asked* for comes
+    /// back, minus the bits the open spends, and a later `F_SETFL` cannot reach
+    /// it.
+    ///
+    /// The table this walks is a host's (`.workbuddy/probe_getfl.c`, Linux
+    /// 7.2.11, every call through `syscall(2)`):
+    ///
+    /// ```text
+    /// open(dir, O_RDONLY|O_DIRECTORY)  F_GETFL = 0x18000  O_DIRECTORY
+    /// open(O_RDONLY|O_NOFOLLOW)        F_GETFL = 0x28000  O_NOFOLLOW
+    /// open(O_PATH)                     F_GETFL = 0x200000 O_PATH
+    /// open(O_WRONLY|O_SYNC)            F_GETFL = 0x109001 O_SYNC|O_DSYNC
+    /// open(O_RDONLY|O_ASYNC)           F_GETFL = 0xa000   O_ASYNC
+    /// open(O_RDONLY|O_NOATIME)         F_GETFL = 0x48000  O_NOATIME
+    /// open(O_WRONLY|O_CREAT|O_TRUNC)   F_GETFL = 0x8001   neither reported
+    /// open(O_WRONLY|O_CLOEXEC)         F_GETFL = 0x8001   not reported
+    /// ```
+    ///
+    /// (`0x8000` on each line is `O_LARGEFILE`, which Linux adds and this
+    /// kernel does not carry - the one member of Linux's word that stays
+    /// missing, named in `docs/uapi/` §5.2.)
+    #[test]
+    fn the_reported_word_holds_what_the_open_asked_for() {
+        // The bits used here are the ones both machines number the same way
+        // (`asm-generic`'s: `O_SYNC`, `O_ASYNC`, `O_NOATIME`). The
+        // machine-specific pair - `O_DIRECTORY` and `O_NOFOLLOW`, which this
+        // kernel's ABI table gives different numbers per machine - is pinned
+        // from userspace by `t-fcntl`, where `libc` supplies the numbers.
+        const O_SYNC: u32 = 0o4010000;
+        const O_ASYNC: u32 = 0o20000;
+        const O_NOATIME: u32 = 0o1000000;
+
+        let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
+
+        let file = File::new(inode.clone());
+        file.set_access(super::ACC_WRONLY);
+        file.set_born(O_SYNC);
+        file.set_status(super::O_APPEND);
+        assert_eq!(
+            file.open_flags(),
+            super::ACC_WRONLY | O_SYNC | super::O_APPEND,
+            "both halves of the word are there: what the open asked for and \
+             what `F_SETFL` wrote"
+        );
+
+        // `F_SETFL` replaces the status half and nothing else: a word that
+        // names neither half leaves the open's own flags where they were.
+        file.set_status(0);
+        assert_eq!(
+            file.open_flags(),
+            super::ACC_WRONLY | O_SYNC,
+            "the status half was cleared and the open's half was not"
+        );
+
+        // And the reverse direction: a status write cannot *add* to the open's
+        // half by naming it, because `SETFL_MASK` has no member for those bits.
+        file.set_status(O_ASYNC | O_NOATIME);
+        assert_eq!(
+            file.open_flags(),
+            super::ACC_WRONLY | O_SYNC,
+            "a status word naming the open-only bits stores none of them"
+        );
+
+        // The bits the open spends never get in, whatever is handed over: the
+        // creation flags, `O_CLOEXEC`, and the access mode itself.
+        let spent = File::new(inode);
+        spent.set_access(super::ACC_WRONLY);
+        spent.set_born(0o1700 | 0o200_0000 | super::O_ACCMODE);
+        assert_eq!(
+            spent.open_flags(),
+            super::ACC_WRONLY,
+            "the open spent those, and `F_GETFL` is not where they are counted"
+        );
+
+        // ... and the word really is the whole of what was asked for, not a
+        // whitelist: a bit no table here names is still the caller's.
+        let odd = File::new(RamFs::new().root().create("g", NodeKind::File).unwrap());
+        odd.set_born(0x0080_0000);
+        assert_eq!(odd.open_flags(), super::ACC_RDWR | 0x0080_0000);
     }
 }
