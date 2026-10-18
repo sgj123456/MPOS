@@ -661,6 +661,9 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             fs: crate::sched::FsStruct::new(crate::abi::DEFAULT_UMASK),
             fs_ns: None,
             parent: None,
+            // Init is nobody's child, so its own kind is unobservable; it is
+            // what a `fork` child looks like, which is what its own are.
+            exit_signal: signal::SIGCHLD,
             // init leads the first process group, so a command started
             // before any job control exists still has a group to land in.
             pgid: INIT_PID,
@@ -852,6 +855,9 @@ pub fn try_spawn_user(
             fs: t.task(parent).fs.copy(),
             fs_ns: t.task(parent).fs_ns.clone(),
             parent: Some(parent),
+            // A program the kernel starts is collected by `wait` the way a
+            // `fork` child is, so it is born to report `SIGCHLD`.
+            exit_signal: signal::SIGCHLD,
             pgid: t.task(parent).pgid,
             session: t.task(parent).session,
             ctty: t.task(parent).ctty,

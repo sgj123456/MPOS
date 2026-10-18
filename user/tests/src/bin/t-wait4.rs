@@ -522,5 +522,167 @@ fn main() {
         );
     }
 
+    // ---- which *kind* of child a wait may be answered about ----------------
+    //
+    // `clone`'s low byte is not a flag: it is the signal the child's death
+    // should report, and it is what tells the two kinds of child apart at the
+    // other end. `fork` is `clone(SIGCHLD)` - a "non-clone" child - and a
+    // `clone(0)` is a "clone" child; `wait4` may only be answered about the
+    // second kind when the caller sets `__WCLONE`, or `__WALL` for both. The
+    // narrowing is not a hint: a caller that did not ask is answered `ECHILD`,
+    // the same word as having no child at all - not `WNOHANG`'s 0, and not a
+    // park. Measured on a current host first (`.workbuddy/probe_wclone.c`,
+    // Linux 7.2.9), and these claims are that file's B, D and G scenarios.
+    //
+    // Both `__W*` bits are Linux's own private spelling rather than the man
+    // page's: they are what the kernel reads, and `docs/uapi/` §3 spells them
+    // the same way for the same reason.
+    const WCLONE: i32 = 0x8000_0000u32 as i32;
+    const WALL: i32 = 0x4000_0000u32 as i32;
+    /// The code the clone-kind children exit with, so the status word proves
+    /// *which* child was collected and not merely that one was.
+    const CLONE_CODE: i32 = 7;
+
+    /// A child started through raw `clone` with `sig` in the low byte - the
+    /// byte `fork` always sets to `SIGCHLD` and which is the whole difference
+    /// between the two kinds. `code` `None` leaves the child paused until the
+    /// parent kills it, which is the fixture for the shapes that are about a
+    /// *live* child a wait cannot see.
+    ///
+    /// Raw `clone` rather than `libc::fork` because `fork` cannot choose the
+    /// byte: it is `clone(SIGCHLD)` and nothing else, on every libc.
+    fn start_clone(sig: i32, code: Option<i32>) -> i32 {
+        let pid = unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                sig as libc::c_long,
+                0 as libc::c_long,
+                0 as libc::c_long,
+                0 as libc::c_long,
+                0 as libc::c_long,
+            )
+        };
+        if pid != 0 {
+            return pid as i32;
+        }
+        match code {
+            Some(code) => unsafe {
+                // `exit_group` rather than `_exit`: this child inherited the
+                // parent's buffered stdout and must not flush a second copy.
+                libc::syscall(libc::SYS_exit_group, code as libc::c_long);
+                libc::_exit(code)
+            },
+            None => loop {
+                unsafe { libc::pause() };
+            },
+        }
+    }
+
+    // A clone child that exits on its own: invisible to a wait that did not ask
+    // for that kind, whatever selector it uses.
+    let clone_child = start_clone(0, Some(CLONE_CODE));
+    r.check("a clone(0) child was started", clone_child > 0);
+    if clone_child > 0 {
+        // Let it die before asking, so "invisible" cannot be confused with "not
+        // dead yet".
+        let nap = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 60 * 1_000_000,
+        };
+        unsafe { libc::nanosleep(&nap, core::ptr::null_mut()) };
+        let (answer, _) = wait4_rusage(-1, libc::WNOHANG, core::ptr::null_mut());
+        r.check(
+            "WNOHANG finds no child to report: a clone child is not one a plain wait sees",
+            answer == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+        );
+        // Named or not: the option word is what admits a kind, and `waitpid`
+        // does not widen it.
+        let (answer, _) = wait4_rusage(clone_child, libc::WNOHANG, core::ptr::null_mut());
+        r.check(
+            "and naming the clone child does not widen it either",
+            answer == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+        );
+        let (answer, status) = wait4_rusage(-1, WCLONE, core::ptr::null_mut());
+        r.check(
+            "__WCLONE collects it, with its own exit code",
+            answer == clone_child as isize
+                && status & 0x7f == 0
+                && (status >> 8) & 0xff == CLONE_CODE,
+        );
+    }
+
+    // The mixed set, which is the shape that tells a filter from a widening: a
+    // forked child and a clone child, both alive. The default wait must return
+    // the forked one and then say there is nobody left, while the clone child is
+    // still running - the answer Linux gives (`.workbuddy/probe_wclone.c` D1,
+    // D2).
+    let forked = start(cstr(FALSE_PROG), cstr(FALSE_ARG0));
+    let mixed = start_clone(0, None);
+    r.check(
+        "a forked child and a clone child were started together",
+        forked > 0 && mixed > 0,
+    );
+    if forked > 0 && mixed > 0 {
+        // `false` exits 1, not 3: the code is what `FALSE_PROG` gives, and the
+        // claim below reads it rather than assuming one.
+        let (answer, status) = wait4_rusage(-1, 0, core::ptr::null_mut());
+        r.check(
+            "the default wait returns the forked child, not the clone one",
+            answer == forked as isize && status & 0x7f == 0,
+        );
+        let (answer, _) = wait4_rusage(-1, libc::WNOHANG, core::ptr::null_mut());
+        r.check(
+            "and then answers ECHILD with the clone child still alive",
+            answer == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+        );
+        unsafe { libc::kill(mixed, libc::SIGKILL) };
+        let (answer, _) = wait4_rusage(-1, libc::WNOHANG, core::ptr::null_mut());
+        r.check(
+            "which stays invisible after it has died too",
+            answer == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+        );
+        // `__WALL` is the word that asks for both kinds, and it is also what
+        // `strace` waits with.
+        let (answer, status) = wait4_rusage(-1, WALL, core::ptr::null_mut());
+        r.check(
+            "__WALL collects it, and the status word says it was killed",
+            answer == mixed as isize && status & 0x7f == libc::SIGKILL,
+        );
+    }
+
+    // The blocking shape, which is the one a scan can get wrong while every
+    // non-blocking answer is right: a wait that may not see its only child must
+    // answer at once. The alarm is the guard rather than a hang - a kernel that
+    // parks is woken by `SIGALRM` with `EINTR`, which is a failure the claim can
+    // report instead of a sweep that stops dead.
+    extern "C" fn on_alarm(_sig: libc::c_int) {}
+    let parked_only = start_clone(0, None);
+    r.check(
+        "a lone clone child was started for the blocking claim",
+        parked_only > 0,
+    );
+    if parked_only > 0 {
+        let echild = unsafe {
+            let mut act: libc::sigaction = core::mem::zeroed();
+            act.sa_sigaction = on_alarm as *const () as usize;
+            libc::sigemptyset(&mut act.sa_mask);
+            // No `SA_RESTART`: the point is for the alarm to *interrupt* the
+            // wait if it parked.
+            act.sa_flags = 0;
+            libc::sigaction(libc::SIGALRM, &act, core::ptr::null_mut());
+            libc::alarm(2);
+            let (answer, _) = wait4_rusage(-1, 0, core::ptr::null_mut());
+            let code = std::io::Error::last_os_error().raw_os_error();
+            libc::alarm(0);
+            answer == -1 && code == Some(libc::ECHILD)
+        };
+        r.check(
+            "a blocking wait4 with only a clone child answers ECHILD instead of parking",
+            echild,
+        );
+        unsafe { libc::kill(parked_only, libc::SIGKILL) };
+        let _ = wait4_rusage(-1, WALL, core::ptr::null_mut());
+    }
+
     r.finish()
 }

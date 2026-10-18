@@ -114,6 +114,13 @@ use std::mem::size_of;
 /// `waitid(idtype, id, infop, options, rusage)` through the raw door, with the
 /// caller's own record. Returns the answer, or the negative errno the no-std
 /// harness reported.
+///
+/// `options` is an `i32` here for the reason Linux declares it one: `__WCLONE` is
+/// bit 31, so a C caller passes a *negative* `int`, the register arrives
+/// sign-extended, and the kernel is owed the low 32 bits and nothing else. The
+/// `__WCLONE` claims below are what caught this kernel reading the whole
+/// register - the call was `EINVAL`, because the upper half looked like an
+/// undefined option bit.
 fn waitid(idtype: u32, id: i32, info: &mut libc::siginfo_t, options: i32) -> isize {
     waitid_rusage(idtype, id, info, options, core::ptr::null_mut())
 }
@@ -860,6 +867,87 @@ fn main() {
                 }
             }
         }
+    }
+
+    // ---- `__WCLONE` and `__WALL`: which kind of child this door may report ---
+    //
+    // The two bits narrow by the byte `clone` was given, and `waitid` reads them
+    // the way `wait4` does - a "clone" child (born to report nothing or something
+    // other than `SIGCHLD`) is `ECHILD` to a call that did not ask for that kind,
+    // and for the kinds it *does* ask about the record is written exactly as
+    // before. Measured on a current host first (`.workbuddy/probe_wclone.c`,
+    // Linux 7.2.9: scenarios A and B are these four claims).
+    const WCLONE: i32 = 0x8000_0000u32 as i32;
+    const WALL: i32 = 0x4000_0000u32 as i32;
+
+    /// A child started through raw `clone` with `sig` in the low byte: `fork`
+    /// cannot choose that byte - it is `clone(SIGCHLD)` and nothing else.
+    fn start_clone(sig: i32, code: i32) -> libc::pid_t {
+        let pid = unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                sig as libc::c_long,
+                0 as libc::c_long,
+                0 as libc::c_long,
+                0 as libc::c_long,
+                0 as libc::c_long,
+            )
+        };
+        if pid != 0 {
+            return pid as libc::pid_t;
+        }
+        unsafe {
+            // `exit_group`, so this child does not flush the stdout copy it
+            // inherited.
+            libc::syscall(libc::SYS_exit_group, code as libc::c_long);
+            libc::_exit(code)
+        }
+    }
+
+    // A forked child is a non-clone child, and `__WCLONE` alone does not admit
+    // it - while `__WALL` does. One child, two calls, so the pair differs in the
+    // option word and nothing else.
+    let wchild = child_that_exits(6);
+    r.check(
+        "a forked child for the __WCLONE claims was forked",
+        wchild > 0,
+    );
+    if wchild > 0 {
+        sleep_ms(60);
+        let mut info = poisoned();
+        r.check(
+            "waitid(P_ALL, WEXITED|__WCLONE) is ECHILD for a SIGCHLD child",
+            waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | WCLONE) == -(libc::ECHILD as isize),
+        );
+        let mut info = poisoned();
+        r.check(
+            "while __WALL reports it, with its code",
+            waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | WALL) == 0
+                && unsafe { info.si_pid() } == wchild
+                && unsafe { info.si_status() } == 6,
+        );
+    }
+
+    // A clone(0) child: invisible without `__WCLONE`, reported with it - and
+    // `WNOHANG` answers `ECHILD` rather than the "nothing yet" zero, because the
+    // child is not one this call could ever hear.
+    let kchild = start_clone(0, 8);
+    r.check("a clone(0) child was started", kchild > 0);
+    if kchild > 0 {
+        sleep_ms(60);
+        let mut info = poisoned();
+        r.check(
+            "waitid(P_ALL, WEXITED|WNOHANG) is ECHILD for a clone child",
+            waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOHANG)
+                == -(libc::ECHILD as isize),
+        );
+        let mut info = poisoned();
+        r.check(
+            "__WCLONE reports it, with its own code",
+            waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | WCLONE) == 0
+                && unsafe { info.si_pid() } == kchild
+                && unsafe { info.si_status() } == 8,
+        );
     }
 
     r.finish()

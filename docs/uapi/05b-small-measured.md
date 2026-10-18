@@ -210,18 +210,52 @@ Section numbers are unchanged from the original `UAPI.md`.
   `Dir` and any reopened `/proc/self/fd` entry read it for. Owner: `src/vfs/file.rs`'s
   `File::born`/`set_born` and `open_flags`, set at the one open path. `docs/notes/` §15.16,
   §15.67.
-- **`__WCLONE` is accepted and ignored, where Linux narrows with it.** Measured
-  on a current host: `waitid(P_ALL, 0, &si, WEXITED|__WCLONE)` answers `ECHILD`
-  (errno 10) for a child that exits with `SIGCHLD`, because the bit means
-  "children cloned with an exit signal *other* than `SIGCHLD`" — and `__WALL` is
-  the word that asks for both. This kernel accepts the bit and reports the child
-  anyway, which is the treatment `wait4` has given all three Linux-only bits
-  since it landed (`.workbuddy/probe_waitid.c` also measured `__WALL` and
-  `__WNOTHREAD` served and a *undefined* bit, `0x10000000`, refused `EINVAL`).
-  Prerequisite: the clone exit signal would have to survive on the task —
-  `validate_clone_flags` reads it out of the flag word and drops it. Owner:
-  `src/sched/runtime/` + `src/syscall/linux/proc.rs`. Pins: `t-waitid`,
-  `t-wait4`. `docs/notes/` §15.11 (batch 18).
+- **`__WCLONE` narrows the wait to the kind of child `clone`'s low byte named, and
+  the byte survives on the task. Landed 2026-10-18** (`docs/uapi/` §5.1 item 50).
+  The bit is not a hint: Linux reads `clone`'s low byte at the *other* end and
+  splits children into two kinds — born to report `SIGCHLD` ("non-clone") and born
+  to report nothing or something else ("clone") — and a wait may only be answered
+  about the kind its option word admits. `__WCLONE` is the clone kind alone,
+  `__WALL` both, and neither is the non-clone kind alone. This kernel accepted the
+  bit and reported every child, so the two doors disagreed with Linux about which
+  children the caller has — measured whole on a current host first
+  (`.workbuddy/probe_wclone.c` and `probe_wclone_block.c`, Linux 7.2.9):
+
+  * **a "clone" child is not a child a plain wait has**: `clone(0)` child exited,
+    `wait4(-1, WNOHANG)` is `ECHILD` (**not** `WNOHANG`'s 0) — and so is
+    `wait4(clone_pid, WNOHANG)` and `waitid(P_PID, clone_pid, WEXITED)`: naming a
+    child does not widen the option word. `__WCLONE` collects it, status word and
+    all;
+  * **the mixed set is the shape that tells a filter from a widening**: with a
+    forked child and a live `clone(0)` child, `wait4(-1, 0)` returns the *forked*
+    one, and the next `wait4(-1, WNOHANG)` is `ECHILD` with the clone child still
+    alive — and stays `ECHILD` after it dies. `__WALL` is what collects it;
+  * **a non-`SIGCHLD` signal makes a clone child too**: `clone(SIGTERM)` is
+    invisible to a plain wait and visible to `__WCLONE` (`__WALL` collects it);
+  * **the blocking shapes answer at once**: with only a live clone child,
+    `wait4(-1, 0)` and `waitid(P_ALL, WEXITED)` are `ECHILD` immediately rather
+    than parking — the half a scan can get wrong while every non-blocking answer
+    is right;
+  * **`__WALL` wins over `__WCLONE`** when both bits are set (a `SIGCHLD` child is
+    reported by `__WALL|__WCLONE`, where `__WCLONE` alone is `ECHILD`);
+  * **the delivery half is still missing, and now measured rather than assumed**:
+    Linux uses the same byte to notify the parent, so a `clone(SIGTERM)` child's
+    death puts a `SIGTERM` with `si_code` 2 and the child's pid in the parent's
+    queue (scenario C2). This kernel delivers nothing on any death but
+    `SIGCHLD`, which is the *other* end of the same field and is named rather than
+    implemented — nothing in this system clones with a non-`SIGCHLD` signal.
+    `__WNOTHREAD` also stays accepted-and-ignored (there is no second scan for it
+    to exclude a sibling group from), and `/proc/<pid>/status`'s `exit_signal`
+    line is still the constant it has always been, which is a rendering nothing
+    pins.
+
+  Owner: `src/sched/runtime/task.rs`'s `ChildKind` and `Task::exit_signal`,
+  threaded through the one eligibility rule (`trace.rs::waitable`) and the record
+  (`Retired::exit_signal`), and `src/syscall/linux/proc.rs`'s
+  `wait_child_kind` — one decoder for both doors. Pins: `t-wait4` (11 claims,
+  51 in the file) and `t-waitid` (5, 68 in the file), every one of them green on
+  a current host before it was green here (61 of the 68 are reachable there; the
+  rest move a child's ids, which needs a privilege). `docs/notes/` §15.68.
 
 - **`signalfd(2)` and `SIGCHLD`: the three divergences are served, and what the
   record still leaves.** **Landed 2026-10-17** (`docs/uapi/` §5.1 item 29), after

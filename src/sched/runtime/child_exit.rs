@@ -9,10 +9,10 @@ use super::child_mm::{
 use super::child_signal::{current_credentials, force_signal, queue_signal};
 use super::load::{initial_stack_rsp, interpreter_bytes, load_user, write_arg_block};
 use super::task::{
-    RETIRED, RETIRED_CAP, Retired, SpawnError, Stack, TIMER_SLOTS, Table, Task, Tracing, WaitFor,
-    block_until_on_interruptible, current, new_layout, schedule, with_table,
+    ChildKind, RETIRED, RETIRED_CAP, Retired, SpawnError, Stack, TIMER_SLOTS, Table, Task, Tracing,
+    WaitFor, block_until_on_interruptible, current, new_layout, schedule, with_table,
 };
-use super::trace::{attach_new_child, fork_event, unreported_stop, waitable};
+use super::trace::{attach_new_child, fork_event, kind_visible, unreported_stop, waitable};
 use crate::abi::PTRACE_EVENT_CLONE;
 use crate::hal;
 use crate::hal::{AddressSpace, ContextOps, UserFrame, UserFrameOps};
@@ -229,6 +229,10 @@ pub fn exit(code: isize) -> ! {
             id,
             code,
             pgid: t.task(id).pgid,
+            // Which kind of child this was, for the `__WCLONE`/`__WALL` half of
+            // a wait's option word (`ChildKind`) - the record is what a
+            // wildcard wait asks, and the task is gone by then.
+            exit_signal: t.task(id).exit_signal,
             // The real uid, taken here because the slot is what holds it: the
             // record outlives the task, and `waitid` reads its answer from the
             // record (`Retired::uid`).
@@ -552,7 +556,11 @@ pub fn take_exit_code(id: TaskId) -> Option<isize> {
 /// the record is taken afterwards, by pid, in [`take_exit_code`]. A read-only
 /// look keeps this function usable from the `block_until` closure, which must
 /// not wake anyone.
-pub(crate) fn any_child_code(t: &Table, parent: TaskId) -> Option<(TaskId, isize)> {
+pub(crate) fn any_child_code(
+    t: &Table,
+    parent: TaskId,
+    kind: ChildKind,
+) -> Option<(TaskId, isize)> {
     critical_section::with(|cs| {
         RETIRED
             .borrow(cs)
@@ -568,8 +576,10 @@ pub(crate) fn any_child_code(t: &Table, parent: TaskId) -> Option<(TaskId, isize
                 let ours = free
                     || t.tasks[id.0]
                         .as_ref()
-                        .is_some_and(|task| waitable(task, parent));
-                ours && id != parent && retired.tracer.is_none_or(|tracer| tracer == parent)
+                        .is_some_and(|task| waitable(task, parent, kind));
+                ours && id != parent
+                    && kind.sees(retired.exit_signal)
+                    && retired.tracer.is_none_or(|tracer| tracer == parent)
             })
             .map(|retired| (retired.id, retired.code))
     })
@@ -620,7 +630,17 @@ pub(crate) fn drop_retired(id: TaskId) {
 
 /// The running task.
 pub fn fork(state: &UserFrame) -> isize {
-    spawn_copy(state, CloneRequest::default())
+    // Linux's `fork` is `clone(SIGCHLD)`: the child exists to be waited for, and
+    // the byte it is born to report is what makes it a "non-clone" child on the
+    // other end (`ChildKind`). A default request carries no byte - a bare
+    // `clone(0)` - which is a *different* call and a different kind.
+    spawn_copy(
+        state,
+        CloneRequest {
+            exit_signal: signal::SIGCHLD,
+            ..CloneRequest::default()
+        },
+    )
 }
 
 /// `vfork(2)`: the same copy of the calling process, labelled for the tracer.
@@ -636,6 +656,9 @@ pub fn vfork(state: &UserFrame) -> isize {
         state,
         CloneRequest {
             flags: crate::abi::CLONE_VFORK,
+            // `CLONE_VM|CLONE_VFORK|SIGCHLD` is the whole word on Linux, and the
+            // byte is the half `wait` reads back.
+            exit_signal: signal::SIGCHLD,
             ..CloneRequest::default()
         },
     )
@@ -663,6 +686,15 @@ pub struct CloneRequest {
     /// flag word means, so it decides this too and hands the scheduler an
     /// already-made namespace.
     pub net_ns: Option<u64>,
+    /// The signal the child is born to report - `clone`'s low byte, which the
+    /// syscall layer split off the flag word before it got here
+    /// (`abi::validate_clone_flags`) and which `wait` reads back through
+    /// [`ChildKind`]. `fork`/`vfork` pass `SIGCHLD`; a bare `CloneRequest`
+    /// carries `0`, which is `clone(0)`'s own answer - a child that reports
+    /// nothing, and so a "clone" child. `CLONE_THREAD` never reaches the field:
+    /// [`spawn_thread`] gives the thread `SIGCHLD` for the reason its own
+    /// `exit_signal` line gives.
+    pub exit_signal: u8,
 }
 
 /// The thread-local storage base the **task on this CPU** is running with.
@@ -1067,6 +1099,11 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
                 t.task(parent_id).fs_ns.clone()
             },
             parent: Some(parent_id),
+            // The byte the caller's flag word carried - the `clone` door's own
+            // low byte, and what `wait`'s `__WCLONE`/`__WALL` read back at the
+            // other end (`ChildKind`). `fork`/`vfork` hand in `SIGCHLD`, which
+            // is the same call on Linux.
+            exit_signal: request.exit_signal,
             pgid: t.task(parent_id).pgid,
             // A fork child is in the same session as its parent and holds the
             // same controlling terminal - the identity `/dev/tty` opens for
@@ -1581,6 +1618,15 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             // Not a child: `wait` collects processes, and a thread is not one.
             // The process becomes collectable when its leader exits.
             parent: None,
+            // A thread never notifies anyone of its death on Linux, so
+            // `copy_process` rewrites this byte away for `CLONE_THREAD`
+            // whatever `pthread_create` passed - and musl passes a word with
+            // no signal at all. This kernel's threads are not children either
+            // (the line above), so the byte is unobservable through `wait`;
+            // it is `SIGCHLD` so that the one place a thread *does* leave a
+            // record (its group's `Retired`) cannot be read as a "clone"
+            // child's by a default `wait` that names its slot.
+            exit_signal: signal::SIGCHLD,
             pgid,
             // A thread is its process: the same session, the same controlling
             // terminal its creator's group holds.
@@ -1762,9 +1808,9 @@ pub(crate) extern "C" fn task_entry(slot: usize) -> ! {
 }
 
 /// Is there something to report about one of `parent`'s children **that `sel`
-/// names**, given what the caller asked to hear about? `t` is borrowed rather
-/// than taken because this is also the blocking condition, which must not
-/// change anything.
+/// names and `kind` admits**, given what the caller asked to hear about? `t` is
+/// borrowed rather than taken because this is also the blocking condition, which
+/// must not change anything.
 ///
 /// The order is stops, then deaths, then resumes. A death comes last of the
 /// three because it cannot be reported at all until a stop that precedes it has
@@ -1775,6 +1821,7 @@ fn scan_child_event(
     t: &Table,
     parent: TaskId,
     sel: WaitFor,
+    kind: ChildKind,
     stops: bool,
     continues: bool,
 ) -> Option<WaitEvent> {
@@ -1784,11 +1831,11 @@ fn scan_child_event(
             // A slot this task's own id names is not its child: `any_child_code`
             // makes the same exclusion for the same reason.
             let id = TaskId(slot);
-            (waitable(task, parent) && id != parent && sel.names_task(id, task))
+            (waitable(task, parent, kind) && id != parent && sel.names_task(id, task))
                 .then_some((id, task))
         })
     };
-    if let Some(stopped) = unreported_stop(t, parent, sel, stops) {
+    if let Some(stopped) = unreported_stop(t, parent, sel, kind, stops) {
         return Some(stopped);
     }
     if continues {
@@ -1815,9 +1862,9 @@ fn scan_child_event(
                 let ours = free
                     || t.tasks[id.0]
                         .as_ref()
-                        .is_some_and(|task| waitable(task, parent));
+                        .is_some_and(|task| waitable(task, parent, kind));
                 ours && id != parent
-                    && sel.names_retired(retired)
+                    && sel.names_retired(retired, kind)
                     && retired.tracer.is_none_or(|tracer| tracer == parent)
             })
             .map(|retired| WaitEvent::Exited {
@@ -1890,20 +1937,21 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
 pub fn wait_child_event(
     parent: TaskId,
     sel: WaitFor,
+    kind: ChildKind,
     stops: bool,
     continues: bool,
     nowait: bool,
 ) -> WaitPark<WaitEvent> {
     if matches!(
         block_until_on_interruptible(
-            |t| scan_child_event(t, parent, sel, stops, continues).is_some()
+            |t| scan_child_event(t, parent, sel, kind, stops, continues).is_some()
         ),
         WaitEnd::Interrupted
     ) {
         return WaitPark::Interrupted;
     }
     match with_table(|t| {
-        let event = scan_child_event(t, parent, sel, stops, continues)?;
+        let event = scan_child_event(t, parent, sel, kind, stops, continues)?;
         if nowait {
             Some(event)
         } else {
@@ -1925,12 +1973,13 @@ pub fn wait_child_event(
 pub fn poll_child_event(
     parent: TaskId,
     sel: WaitFor,
+    kind: ChildKind,
     stops: bool,
     continues: bool,
     nowait: bool,
 ) -> Option<WaitEvent> {
     with_table(|t| {
-        let event = scan_child_event(t, parent, sel, stops, continues)?;
+        let event = scan_child_event(t, parent, sel, kind, stops, continues)?;
         if nowait {
             Some(event)
         } else {
@@ -1940,13 +1989,23 @@ pub fn poll_child_event(
 }
 
 /// Block until *any* child of `parent` has something to report, and collect it.
-pub fn wait_any_child_event(parent: TaskId, stops: bool, continues: bool) -> WaitPark<WaitEvent> {
-    wait_child_event(parent, WaitFor::Any, stops, continues, false)
+pub fn wait_any_child_event(
+    parent: TaskId,
+    kind: ChildKind,
+    stops: bool,
+    continues: bool,
+) -> WaitPark<WaitEvent> {
+    wait_child_event(parent, WaitFor::Any, kind, stops, continues, false)
 }
 
 /// The wildcard half of [`poll_child_event`].
-pub fn poll_any_child_event(parent: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
-    poll_child_event(parent, WaitFor::Any, stops, continues, false)
+pub fn poll_any_child_event(
+    parent: TaskId,
+    kind: ChildKind,
+    stops: bool,
+    continues: bool,
+) -> Option<WaitEvent> {
+    poll_child_event(parent, WaitFor::Any, kind, stops, continues, false)
 }
 
 /// Whether `parent` has a child `sel` names at all - one still running, or one
@@ -1957,9 +2016,9 @@ pub fn poll_any_child_event(parent: TaskId, stops: bool, continues: bool) -> Opt
 /// sleep would sleep with nothing coming. Linux asks the same thing of the same
 /// selector, which is why `P_PGID` naming a group with no child of ours is a
 /// measurement (`ECHILD`) rather than a design choice.
-pub fn has_matching_children(parent: TaskId, sel: WaitFor) -> bool {
+pub fn has_matching_children(parent: TaskId, sel: WaitFor, kind: ChildKind) -> bool {
     with_table(|t| {
-        child_alive_for(t, parent, sel)
+        child_alive_for(t, parent, sel, kind)
             || critical_section::with(|cs| {
                 RETIRED.borrow(cs).borrow().iter().any(|retired| {
                     let id = retired.id;
@@ -1967,9 +2026,9 @@ pub fn has_matching_children(parent: TaskId, sel: WaitFor) -> bool {
                     let ours = free
                         || t.tasks[id.0]
                             .as_ref()
-                            .is_some_and(|task| waitable(task, parent));
+                            .is_some_and(|task| waitable(task, parent, kind));
                     ours && id != parent
-                        && sel.names_retired(retired)
+                        && sel.names_retired(retired, kind)
                         && retired.tracer.is_none_or(|tracer| tracer == parent)
                 })
             })
@@ -1978,8 +2037,8 @@ pub fn has_matching_children(parent: TaskId, sel: WaitFor) -> bool {
 
 /// The same question for one named child, which is what `waitpid` asks. The
 /// asker is the running task; `child_event` says what *it* may hear.
-pub fn child_event(id: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
-    with_table(|t| child_event_in(t, id, t.current, stops, continues))
+pub fn child_event(id: TaskId, kind: ChildKind, stops: bool, continues: bool) -> Option<WaitEvent> {
+    with_table(|t| child_event_in(t, id, t.current, kind, stops, continues))
 }
 
 /// [`child_event`] against a table the caller already holds - the shape the
@@ -1988,10 +2047,17 @@ fn child_event_in(
     t: &Table,
     id: TaskId,
     me: TaskId,
+    kind: ChildKind,
     stops: bool,
     continues: bool,
 ) -> Option<WaitEvent> {
     let task = t.tasks.get(id.0).and_then(Option::as_ref)?;
+    // The named door asks the kind here rather than at its caller: a "clone"
+    // child is not something a wait without `__WCLONE` may be answered about,
+    // stop or death alike (measured, `.workbuddy/probe_wclone.c` B2/B3).
+    if !kind_visible(task, me, kind) {
+        return None;
+    }
     if let Some(stop) = task.trace.stop
         && !stop.reported
         // Who may hear this stop - the same rule `unreported_stop` applies to
@@ -2026,14 +2092,19 @@ fn child_event_in(
 }
 
 /// Collect `id`'s stop or resume, if there is one waiting.
-pub fn take_child_event(id: TaskId, stops: bool, continues: bool) -> Option<WaitEvent> {
-    let event = child_event(id, stops, continues)?;
+pub fn take_child_event(
+    id: TaskId,
+    kind: ChildKind,
+    stops: bool,
+    continues: bool,
+) -> Option<WaitEvent> {
+    let event = child_event(id, kind, stops, continues)?;
     with_table(|t| take_event(t, event))
 }
 
 /// Whether `id` has anything a `wait` with these flags could report.
-pub fn child_event_pending(id: TaskId, stops: bool, continues: bool) -> bool {
-    child_event(id, stops, continues).is_some()
+pub fn child_event_pending(id: TaskId, kind: ChildKind, stops: bool, continues: bool) -> bool {
+    child_event(id, kind, stops, continues).is_some()
 }
 
 /// Block the running task until `id` has something to report, then collect it.
@@ -2042,16 +2113,22 @@ pub fn child_event_pending(id: TaskId, stops: bool, continues: bool) -> bool {
 /// through the borrow `block_until_on` already holds for the same reason it is
 /// there: a closure taking its own critical section inside `schedule`'s would
 /// nest one inside another and hand interrupts back early.
-pub fn block_until_child_event(id: TaskId, stops: bool, continues: bool) -> WaitPark<WaitEvent> {
+pub fn block_until_child_event(
+    id: TaskId,
+    kind: ChildKind,
+    stops: bool,
+    continues: bool,
+) -> WaitPark<WaitEvent> {
     if matches!(
         block_until_on_interruptible(|t| {
-            exit_code(id).is_some() || child_event_in(t, id, t.current, stops, continues).is_some()
+            exit_code(id).is_some()
+                || child_event_in(t, id, t.current, kind, stops, continues).is_some()
         }),
         WaitEnd::Interrupted
     ) {
         return WaitPark::Interrupted;
     }
-    if let Some(event) = take_child_event(id, stops, continues) {
+    if let Some(event) = take_child_event(id, kind, stops, continues) {
         return WaitPark::Event(event);
     }
     match take_retired_current(id) {

@@ -9,7 +9,7 @@ use crate::mm::vma::{MappedRange, Vma, VmaKind, VmaTable, merge_ranges};
 use core::cell::RefCell;
 use critical_section::Mutex;
 
-use super::task::{STACK_GROWTH_SLACK, Table, WaitFor, current};
+use super::task::{ChildKind, STACK_GROWTH_SLACK, Table, WaitFor, current};
 use crate::hal;
 use crate::mm::vm::{MapFlags, Mapping};
 use crate::mm::{self, PAGE_SIZE, pframe};
@@ -858,18 +858,24 @@ pub fn is_running(id: TaskId) -> bool {
 
 /// [`has_live_child`] against a table the caller already holds.
 pub(crate) fn child_alive(t: &Table, parent: TaskId) -> bool {
-    child_alive_for(t, parent, WaitFor::Any)
+    child_alive_for(t, parent, WaitFor::Any, ChildKind::Either)
 }
 
-/// Whether one of `parent`'s children that `sel` names is still running. The
-/// selector half of [`child_alive`], and the live half of
-/// `has_matching_children`: a group selector asks every child's own `pgid`,
-/// which is why the field is read here rather than at the door.
-pub(crate) fn child_alive_for(t: &Table, parent: TaskId, sel: WaitFor) -> bool {
+/// Whether one of `parent`'s children that `sel` names and `kind` admits is
+/// still running. The selector half of [`child_alive`], and the live half of
+/// `has_matching_children`: a group selector asks every child's own `pgid`, and
+/// the kind asks the signal it was born to report - a live "clone" child a
+/// default wait cannot be answered about is not a reason to park, it is the
+/// `ECHILD` Linux answers (measured, `.workbuddy/probe_wclone.c` G1).
+pub(crate) fn child_alive_for(t: &Table, parent: TaskId, sel: WaitFor, kind: ChildKind) -> bool {
     t.tasks.iter().enumerate().any(|(slot, task)| {
         let id = TaskId(slot);
         task.as_ref().is_some_and(|task| {
-            !task.exited && task.parent == Some(parent) && id != parent && sel.names_task(id, task)
+            !task.exited
+                && task.parent == Some(parent)
+                && id != parent
+                && sel.names_task(id, task)
+                && kind.sees(task.exit_signal)
         })
     })
 }

@@ -325,6 +325,11 @@ pub(crate) struct Retired {
     /// its whole task; this kernel's record keeps the one field a selector
     /// needs.
     pub(crate) pgid: TaskId,
+    /// The signal this task was born to report: the byte its `clone` carried,
+    /// carried on the record for `pgid`'s reason - a `waitid` with `__WCLONE`
+    /// or `__WALL` asks a *record* which kind of child died, and the task that
+    /// held the answer is gone by the time it asks. See [`Task::exit_signal`].
+    pub(crate) exit_signal: u8,
     /// The real user id this task ran as when it exited.
     ///
     /// Carried for the same reason `pgid` is: the slot is free by the time a
@@ -652,6 +657,26 @@ pub(crate) struct Task {
     /// The task that spawned this one in ring 3, if any. Its `wait` blocks on
     /// this task's exit; kernel-spawned tasks have none.
     pub(crate) parent: Option<TaskId>,
+    /// The signal this task's `clone` was born to report - the low byte of the
+    /// flag word, which is not a flag at all.
+    ///
+    /// It is what tells the two kinds of child apart at the *other* end: a task
+    /// born to report `SIGCHLD` is a "non-clone" child, one born to report
+    /// nothing (`0`) or something else is a "clone" child, and `wait`'s
+    /// `__WCLONE`/`__WALL` bits choose which of the two a caller may hear
+    /// ([`ChildKind`]). Kept as the byte the caller passed rather than as a
+    /// boolean because the byte is also what Linux *delivers* on the death
+    /// (measured: `clone(SIGTERM)` puts a `SIGTERM` with `si_code` 2 and the
+    /// child's pid in the parent's queue, `.workbuddy/probe_wclone.c` C2) - that
+    /// half is still named in `docs/uapi/` §5.2, and this field is its first
+    /// half.
+    ///
+    /// `fork` and `vfork` are `clone(SIGCHLD)` on Linux and set it here too;
+    /// a thread is given `SIGCHLD` whatever its word said, because Linux forces
+    /// a thread's exit signal away (it never notifies) and this kernel's threads
+    /// do retire a record for their creator - rewriting the byte there would
+    /// turn every `pthread_create` into a child a default `wait` could not see.
+    pub(crate) exit_signal: u8,
     /// The process group this task belongs to, named by its leader's id.
     ///
     /// It is what a terminal's interrupt is aimed at: Ctrl-C is not sent to
@@ -1062,6 +1087,10 @@ impl Task {
             fs: crate::sched::FsStruct::new(crate::abi::DEFAULT_UMASK),
             fs_ns: None,
             parent: None,
+            // Nothing waits for a kernel task, so the kind it was "born to
+            // report" is unobservable; `SIGCHLD` is the shape a `fork` child
+            // has, which is what these tasks are descended from.
+            exit_signal: signal::SIGCHLD,
             pgid: TaskId(0),
             session: TaskId(0),
             ctty: None,
@@ -1620,6 +1649,10 @@ impl Table {
             fs: crate::sched::FsStruct::new(crate::abi::DEFAULT_UMASK),
             fs_ns: None,
             parent: None,
+            // Nothing waits for a kernel task, so the kind it was "born to
+            // report" is unobservable; `SIGCHLD` is the shape a `fork` child
+            // has, which is what these tasks are descended from.
+            exit_signal: signal::SIGCHLD,
             pgid: TaskId(0),
             session: TaskId(0),
             ctty: None,
@@ -1995,12 +2028,59 @@ impl WaitFor {
 
     /// The same question about a *record*: its own task is gone (the slot was
     /// freed, or handed to a new tenant), so a group answer is read out of the
-    /// record itself - which is why [`Retired`] carries a `pgid`.
-    pub(crate) fn names_retired(self, retired: &Retired) -> bool {
+    /// record itself - which is why [`Retired`] carries a `pgid` and the
+    /// signal the task was born to report.
+    ///
+    /// The kind is asked here rather than at the callers because it is the same
+    /// question: Linux's `wait_consider_task` narrows by `exit_signal` in the
+    /// one place that decides whether a child counts at all, so a selector and a
+    /// kind that could disagree would be two spellings of one filter.
+    pub(crate) fn names_retired(self, retired: &Retired, kind: ChildKind) -> bool {
+        kind.sees(retired.exit_signal)
+            && match self {
+                WaitFor::Any => true,
+                WaitFor::Pid(want) => retired.id == want,
+                WaitFor::Pgid(group) => retired.pgid == group,
+            }
+    }
+}
+
+/// Which of a task's children a wait is allowed to be *answered* about, which is
+/// a second question from which one it names.
+///
+/// `clone`'s low byte is not a flag but a signal - what the child's death should
+/// send its parent - and Linux reads that byte back at the other end: a child
+/// born to report `SIGCHLD` is a "non-clone" child, one born to report nothing
+/// or something else is a "clone" child, and `wait`'s option word picks which of
+/// the two it can hear (`wait(2)`: `__WCLONE` is clone children only, `__WALL`
+/// is both, neither is non-clone children only). Measured on a current host
+/// (`.workbuddy/probe_wclone.c`, Linux 7.2.9) - and the byte is what decides,
+/// not the flag word alone: `clone(SIGTERM)` is a clone child too
+/// (`.workbuddy/probe_wclone.c` C1).
+///
+/// The narrowing is not a hint. A wait that cannot see a child is answered
+/// `ECHILD` — the same word as having no child at all, blocking or not
+/// (measured: B1/B2/B3/G1/G2) — so a kernel that stores the byte and never asks
+/// it hands a caller a child Linux would say it does not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildKind {
+    /// No `__WCLONE`, no `__WALL`: only the children born to report `SIGCHLD`.
+    NonClone,
+    /// `__WCLONE` alone: only the children born to report nothing or something
+    /// other than `SIGCHLD`.
+    Clone,
+    /// `__WALL`: both kinds. `__WALL` wins when both bits are set, measured.
+    Either,
+}
+
+impl ChildKind {
+    /// Whether a child born to report `exit_signal` is one a wait with these
+    /// options can be answered about.
+    pub(crate) fn sees(self, exit_signal: u8) -> bool {
         match self {
-            WaitFor::Any => true,
-            WaitFor::Pid(want) => retired.id == want,
-            WaitFor::Pgid(group) => retired.pgid == group,
+            ChildKind::NonClone => exit_signal == signal::SIGCHLD,
+            ChildKind::Clone => exit_signal != signal::SIGCHLD,
+            ChildKind::Either => true,
         }
     }
 }

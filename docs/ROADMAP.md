@@ -357,6 +357,22 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are TCP's record-only buffer sizes  
 (`SO_SNDBUF`/`SO_RCVBUF`); the two namespace kinds with no entry at all are IPC and cgroup.
 
+**`__WCLONE` narrows a wait to the kind of child `clone` named** (`docs/uapi/` §5.1 item 50, landed  
+2026-10-18): `clone`'s low byte is the signal a child's death should report, and Linux reads it back  
+at the other end — a child born to report `SIGCHLD` and one born to report nothing or something else  
+are two kinds, and `wait4`/`waitid` only answer about the kind the option word admits (`__WCLONE` the  
+clone kind alone, `__WALL` both, neither the non-clone kind alone). This kernel accepted the bit and  
+reported every child, so a clone child was a child Linux says the caller does not have. The byte now  
+survives on the task (and on the retired record, for the wildcard wait), and `sched::ChildKind` rides  
+in the one eligibility rule every scan asks, so the seven places that look for "my children" cannot  
+disagree. `fork`/`vfork` are `clone(SIGCHLD)` and unchanged, which is why every existing wait answers  
+as it did. The narrowing is `ECHILD` — not `WNOHANG`'s 0 and not a park — so the blocking shape is  
+pinned too. Two things stay named in `docs/uapi/` §5.2: the same byte is *delivered* as a signal to  
+the parent on Linux (measured, and this kernel still only ever delivers `SIGCHLD`), and `__WNOTHREAD`  
+is still accepted-and-ignored. The pin also caught a bug beside it: both doors read `options` as a  
+whole register, where Linux declares it an `int` — so a C caller's `__WCLONE` (bit 31, sign-extended)  
+was `EINVAL`, and the word is narrowed to 32 bits now.
+
 **The `F_GETFL` word is the caller's own** (`docs/uapi/` §5.1 item 49, landed 2026-10-18): Linux  
 answers `filp->f_flags`, so a caller that compares the word against what it opened with agrees — its  
 mode, `O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_SYNC`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME` — where  

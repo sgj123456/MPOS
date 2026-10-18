@@ -1902,3 +1902,104 @@ the commit bodies), and each moved its pin in the same commit.
     (`and a status write beside it keeps both`, `... while clearing the status half leaves the
     open's flag standing`). The two controls - `O_CLOEXEC` and `O_TRUNC` not reported - pass on both
     kernels, which is what keeps the reds on the recording rather than on the doors.
+
+## item 50 — `__WCLONE` narrows a wait to the kind of child `clone`'s low byte named
+
+    §5.2's entry, and the last of the three Linux-only wait bits to be read rather than waved
+    through. `clone`'s low byte is not a flag: it is the signal a child's death should report,
+    and Linux reads that byte at the other end to split children into two kinds — born to report
+    `SIGCHLD` ("non-clone") and born to report nothing or something else ("clone") — with
+    `wait(2)`'s option word choosing which kind the caller may be answered about (`__WCLONE` the
+    clone kind alone, `__WALL` both, neither the non-clone kind alone). This kernel accepted the
+    bit and reported every child, so both doors disagreed with Linux about which children the
+    caller has: the pid was a real child's, and Linux says `ECHILD`. The prerequisite the entry
+    named — "the clone exit signal would have to survive on the task" — was the whole of the work.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_wclone.c` and
+    `probe_wclone_block.c`, Linux 7.2.9, raw `clone` so the byte is chosen rather than inherited
+    from a libc's `fork`):
+
+    * **A — a `SIGCHLD` child is invisible to `__WCLONE`**: `waitid(P_ALL, 0, WEXITED|__WCLONE)`
+      is `ECHILD`, and the same call with `__WALL` reports it (`si_code` 2, `si_pid` the child).
+      The old `probe_waitid.c` measurement, confirmed on a second kernel;
+    * **B — a `clone(0)` child is invisible to everything but `__WCLONE`**: `wait4(-1, WNOHANG)`
+      `ECHILD`, `wait4(clone_pid, WNOHANG)` `ECHILD`, `waitid(P_PID, ..., WEXITED)` `ECHILD`, and
+      `wait4(-1, __WCLONE)` collects it with its status word. `ECHILD`, not `WNOHANG`'s 0 — a
+      child the call cannot see is not a child it is waiting for;
+    * **C — a non-`SIGCHLD` signal makes a clone child too**: `clone(SIGTERM)` is `ECHILD` to a
+      plain wait and collected by `__WCLONE`; and the same byte is *delivered* — `sigtimedwait`
+      reads a `SIGTERM` with `si_code` 2 and the child's pid (the half below that is still named);
+    * **D — the mixed set**: with a forked child and a live clone child, `wait4(-1, 0)` returns the
+      *forked* one, and the next `WNOHANG` is `ECHILD` while the clone child is still alive — and
+      after it dies too. `__WCLONE` then collects exactly it. This is the shape that tells a
+      filter from a widening: a kernel that merely *preferred* `SIGCHLD` children would pass every
+      single-child claim above and fail this one;
+    * **E — two clone children, then nothing**: `__WCLONE` reaps both in turn, and the third call
+      is `ECHILD`;
+    * **F — `__WALL` wins when both bits are set**: a `SIGCHLD` child is reported by
+      `__WALL|__WCLONE`, which `__WCLONE` alone refuses;
+    * **G — the blocking shapes**: with only a live clone child, `wait4(-1, 0)` and
+      `waitid(P_ALL, WEXITED)` answer `ECHILD` at once, and `__WALL` collects it once it exits.
+      Without this half, a kernel that filtered only the *answers* would park a caller for ever.
+
+    **The fix is a field, a type, and one eligibility rule.** `Task::exit_signal` keeps the byte
+    `validate_clone_flags` had been splitting off and dropping; `Retired::exit_signal` carries it
+    past the task's death, for the reason `pgid` is carried — a wildcard wait reads the record,
+    and the task is gone. `sched::ChildKind` (`NonClone`/`Clone`/`Either`) is the option word's
+    second dimension, and it rides in `trace::waitable` — the one rule every scan already asks —
+    so the seven places that look for "my children" (`scan_child_event`, the live and retired
+    halves of `has_matching_children`, `has_children`, `child_alive_for`, `unreported_stop`, and
+    the by-id `child_event_in`) cannot disagree. A task some tracer holds is exempt: Linux draws
+    the `__WCLONE` line for children, not for tracees, and `PTRACE_ATTACH` can be aimed at a task
+    this caller never cloned.
+
+    `fork` and `vfork` pass `SIGCHLD` explicitly — they *are* `clone(SIGCHLD)` — so every child
+    this system already had is a non-clone child and every existing `wait` answers as before; a
+    bare `CloneRequest` keeps 0, which is what `clone(0)` asked for. A `CLONE_THREAD` child is
+    given `SIGCHLD` whatever its word said: Linux forces a thread's exit signal away (it never
+    notifies), and this kernel's threads are not their creator's children either, which is the
+    line `spawn_thread` already draws.
+
+    Both doors decode the word through one function (`wait_child_kind`), because the bits mean the
+    same thing in `wait4`'s and `waitid`'s words and two decodings could drift. `wait4`'s *named*
+    form asks the kind before it looks at anything, because a record is read without a scan and
+    would otherwise be handed to a caller Linux says has no such child.
+
+    Pin: `t-wait4` — **11 new claims** (51 in the file) — and `t-waitid` — **5** (61 in the file):
+    the forks, the two `ECHILD` shapes, the `__WCLONE` collection with its own exit code, the mixed
+    set's four answers in order, and the blocking claim guarded by a `SIGALRM` that turns a park
+    into a readable `EINTR` rather than a sweep that stops dead. Both binaries were run on a
+    current host first (`MPOS_ON_HOST=1`, 51/51 and 61/61 green), so every claim is Linux's own
+    answer and not this kernel's shape.
+
+    **And the pin caught a bug beside the item, in the same word.** Both doors read `options` as the
+    whole register. Linux declares it an `int` (`SYSCALL_DEFINE4(wait4, pid_t, upid, int __user *,
+    stat_addr, int, options, ...)`), and that is not a formality here: `__WCLONE` is bit 31, so a C
+    caller passes a *negative* `int`, the compiler sign-extends it into the 64-bit register, and a
+    door that reads all 64 bits sees bits Linux never defined - so
+    `waitid(P_ALL, 0, WEXITED|__WCLONE)` from a program was `EINVAL`, while the same call through a
+    32-bit-clean word was `ECHILD`. Both doors narrow now (`as u32 as usize` for the option words,
+    `as i32 as isize` for the `int`-shaped ids), and the test helper says why its own `options`
+    argument is an `i32`: the two `__WCLONE` claims are the ones that failed first, and they are what
+    keeps a door from reading a register where Linux passes an `int`.
+
+    Gate: x86_64 `pass=183 fail=0 (183 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33 (183
+    staged, 11 left out by `tests.toml`); the second machine's arm is `pass=182 fail=0`, `mpos-kunit
+    32 passed, 0 failed` (182 staged, 12 left out), and both programs' `ok:` lines are byte-identical
+    across the two machines (diffed, carriage returns aside).
+
+    Counterfactual, and it is sweep-only because the rule is one predicate: with `ChildKind::sees`
+    made to answer `true` - the old kernel, which stores the byte and never asks it, everything else
+    kept - stage 1 is untouched (no host unit test asks the rule directly, which is why the rule is
+    pinned where a caller can see it) and the sweep is `pass=181 fail=2 (183 built)` with `FAIL
+    t-wait4` and `FAIL t-waitid`, **nine** red claims by name: `WNOHANG finds no child to report: a
+    clone child is not one a plain wait sees`, `__WCLONE collects it, with its own exit code`, `and
+    then answers ECHILD with the clone child still alive`, `which stays invisible after it has died
+    too`, `a blocking wait4 with only a clone child answers ECHILD instead of parking`,
+    `waitid(P_ALL, WEXITED|__WCLONE) is ECHILD for a SIGCHLD child`, `while __WALL reports it, with
+    its code`, `waitid(P_ALL, WEXITED|WNOHANG) is ECHILD for a clone child` and `__WCLONE reports
+    it, with its own code`. The blocking claim goes red as `EINTR` rather than as a hang, which is
+    what the alarm is there for; and three claims *pass* on the old kernel for a reason worth
+    naming - `the default wait returns the forked child, not the clone one` (only the forked child
+    had exited yet), and the two that follow a claim which collected the fixture early (a cascade,
+    not agreement).

@@ -1,10 +1,10 @@
 use super::STARTED;
 use super::child_exit::any_child_code;
-use super::child_mm::child_alive;
+use super::child_mm::child_alive_for;
 use super::procfs::comm_of;
 use super::task::MAX_TASKS;
 use super::task::with_table;
-use super::task::{Identity, Table, Task};
+use super::task::{ChildKind, Identity, Table, Task, WaitFor};
 use crate::sched::policy::TaskId;
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
@@ -47,9 +47,14 @@ pub fn has_deliverable_signal() -> bool {
 ///
 /// `wait` needs the distinction to tell `WNOHANG`'s two "nothing to report"
 /// answers apart: a child that has simply not exited yet is a 0, while having no
-/// child at all is `ECHILD`.
-pub fn has_children(parent: TaskId) -> bool {
-    with_table(|t| child_alive(t, parent) || any_child_code(t, parent).is_some())
+/// child at all is `ECHILD`. The kind is the option word's: a "clone" child is
+/// not a child as far as a wait without `__WCLONE` is concerned, so it must not
+/// keep this answer true (measured, `.workbuddy/probe_wclone.c` G1: Linux
+/// answers `ECHILD` rather than parking).
+pub fn has_children(parent: TaskId, kind: ChildKind) -> bool {
+    with_table(|t| {
+        child_alive_for(t, parent, WaitFor::Any, kind) || any_child_code(t, parent, kind).is_some()
+    })
 }
 fn discarded_when_generated(task: &Task, sig: u8) -> bool {
     sig != crate::sched::signal::SIGCONT && task.dispositions.get(sig).is_ignore()

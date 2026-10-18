@@ -2,7 +2,7 @@ use super::WaitEvent;
 use super::child_signal::queue_signal;
 use super::task::schedule;
 use super::task::with_table;
-use super::task::{Stop, SyscallStop, Table, Task, WaitFor, current};
+use super::task::{ChildKind, Stop, SyscallStop, Table, Task, WaitFor, current};
 use crate::abi::{
     PTRACE_EVENT_CLONE, PTRACE_EVENT_EXEC, PTRACE_EVENT_FORK, PTRACE_EVENT_NONE,
     PTRACE_EVENT_SECCOMP, PTRACE_EVENT_VFORK, PTRACE_O_TRACECLONE, PTRACE_O_TRACEEXEC,
@@ -247,12 +247,13 @@ pub(crate) fn unreported_stop(
     t: &Table,
     parent: TaskId,
     sel: WaitFor,
+    kind: ChildKind,
     requested: bool,
 ) -> Option<WaitEvent> {
     for (slot, task) in t.tasks.iter().enumerate() {
         let Some(task) = task.as_ref() else { continue };
         let id = TaskId(slot);
-        if !waitable(task, parent) || id == parent || !sel.names_task(id, task) {
+        if !waitable(task, parent, kind) || id == parent || !sel.names_task(id, task) {
             continue;
         }
         let Some(stop) = task.trace.stop else {
@@ -302,17 +303,47 @@ pub(crate) fn unreported_stop(
 /// the only way that task's stops and death can be collected is by waiting for
 /// them. Having one rule means the six places that scan for "my children" do
 /// not each grow a second predicate, and cannot disagree with each other.
-pub(crate) fn waitable(task: &Task, me: TaskId) -> bool {
-    task.parent == Some(me) || task.trace.tracer == Some(me)
+///
+/// The third thing is the **kind** (`ChildKind`): `wait`'s `__WCLONE`/`__WALL`
+/// bits narrow a caller to one kind of child, and a child of the other kind does
+/// not count as "no event yet" but as "no child at all" (`ECHILD`, measured in
+/// `.workbuddy/probe_wclone.c` G1/G2). It rides here rather than in each scan
+/// for the same reason the tracer rule does.
+pub(crate) fn waitable(task: &Task, me: TaskId, kind: ChildKind) -> bool {
+    (task.parent == Some(me) || task.trace.tracer == Some(me)) && kind_visible(task, me, kind)
+}
+
+/// The kind half of [`waitable`], on its own: may a wait with these options be
+/// answered about `task` whatever the parentage says?
+///
+/// A task some tracer holds is visible whatever signal it was born to report:
+/// Linux draws the `__WCLONE` line for children, not for tracees, and a tracer
+/// that could not hear the task it attached to would deadlock on its first
+/// `wait` - `PTRACE_ATTACH` can be aimed at a task this caller never cloned, and
+/// the byte that task was born with is not the caller's business.
+pub(crate) fn kind_visible(task: &Task, me: TaskId, kind: ChildKind) -> bool {
+    task.trace.tracer == Some(me) || kind.sees(task.exit_signal)
+}
+
+/// Whether a wait with these options may be answered about `id` at all - what
+/// `wait4`'s named form asks before it looks at a record, since a record is read
+/// before any scan runs and a "clone" child's death must be `ECHILD` to a caller
+/// that did not name `__WCLONE` (measured: `.workbuddy/probe_wclone.c` B2/B3).
+pub fn child_visible_to(id: TaskId, kind: ChildKind) -> bool {
+    with_table(|t| {
+        t.tasks[id.0]
+            .as_ref()
+            .is_some_and(|task| kind_visible(task, t.current, kind))
+    })
 }
 
 /// Whether `id` is a child of `parent` - the check that keeps a `wait` from
 /// blocking on someone else's child.
-pub fn is_child(id: TaskId, parent: TaskId) -> bool {
+pub fn is_child(id: TaskId, parent: TaskId, kind: ChildKind) -> bool {
     with_table(|t| {
         t.tasks[id.0]
             .as_ref()
-            .is_some_and(|task| !task.exited && waitable(task, parent))
+            .is_some_and(|task| !task.exited && waitable(task, parent, kind))
     })
 }
 

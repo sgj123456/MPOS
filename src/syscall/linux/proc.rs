@@ -364,6 +364,29 @@ pub(super) fn handle_set_tid_address(args: [usize; ARG_COUNT]) -> isize {
     crate::sched::current().0 as isize
 }
 
+/// Which kind of child a `wait4`/`waitid` option word lets the caller be
+/// answered about.
+///
+/// `clone`'s low byte is the signal a child is born to report, and the two
+/// `__W*` bits pick which of the two kinds the caller may hear
+/// (`sched::ChildKind`). One function for both doors, because the bits mean the
+/// same thing in both words and two decodings could drift.
+///
+/// `__WALL` wins when both are set: measured rather than assumed
+/// (`.workbuddy/probe_wclone.c` F1, a `__WALL|__WCLONE` wait on a `SIGCHLD`
+/// child answered with that child, which `__WCLONE` alone answers `ECHILD`
+/// for).
+fn wait_child_kind(options: usize) -> crate::sched::ChildKind {
+    use crate::sched::ChildKind;
+    if options & abi::__WALL != 0 {
+        ChildKind::Either
+    } else if options & abi::__WCLONE != 0 {
+        ChildKind::Clone
+    } else {
+        ChildKind::NonClone
+    }
+}
+
 /// `wait4(pid, status, options)` — collect a child's exit.
 ///
 /// Linux's contract, which this follows: the *return value* is the pid of the
@@ -389,12 +412,25 @@ pub(super) fn handle_set_tid_address(args: [usize; ARG_COUNT]) -> isize {
 /// What there is to report is wider than "it died". A child that was traced and
 /// stopped, or that stopped on a `SIGSTOP` the caller asked to hear about with
 /// `WUNTRACED`, is also an answer - and for a tracer that is the *usual* answer,
-/// since a traced child spends most of its life stopped. `__WALL` and the other
-/// Linux-only option bits arrive in the same word and need no interpreting here:
-/// they widen which children count, and this kernel already counts every one it
-/// can be asked about.
+/// since a traced child spends most of its life stopped.
+///
+/// `__WCLONE` and `__WALL` are read, not waved through: they name which *kind*
+/// of child the caller may be answered about (`sched::ChildKind`), and a child
+/// of the other kind is `ECHILD` here - not "nothing yet" - exactly as Linux
+/// answers (measured, `.workbuddy/probe_wclone.c`: B1-B3 for the non-blocking
+/// shapes, G1-G3 for the blocking ones, D for the mixed set where the default
+/// wait must return the `SIGCHLD` child and then say there is nobody left while
+/// a clone child is still alive). `__WALL` wins when both bits are set (`F1`).
 pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
-    let (pid, status, options) = (args[0] as isize, args[1], args[2]);
+    // `pid` and `options` are `int`s in Linux's own signature
+    // (`SYSCALL_DEFINE4(wait4, pid_t, upid, int __user *, stat_addr, int,
+    // options, ...)`), so the library half of the register is not part of the
+    // argument. It matters: `__WCLONE` is bit 31, a C caller passes it as a
+    // negative `int`, and a compiler sign-extends that into the 64-bit register
+    // - read whole, the word carries bits Linux never defined, and the same
+    // `waitid` call is `EINVAL` here and a narrowing there (measured by the pin
+    // itself: `t-waitid`'s `__WCLONE` claims were the first thing to notice).
+    let (pid, status, options) = (args[0] as i32 as isize, args[1], args[2] as u32 as usize);
     // `wait4`'s fourth argument is where the child's `struct rusage` goes. It is
     // read here and threaded to every answer a **report** produces - a death, a
     // stop and a resume alike - because Linux fills it for all three; the
@@ -409,6 +445,8 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     // half of the question.
     let stops = options & abi::WUNTRACED != 0;
     let continues = options & abi::WCONTINUED != 0;
+    // Which kind of child this word lets the caller hear (`wait_child_kind`).
+    let kind = wait_child_kind(options);
 
     // Every child: the pid == -1 form, and every other group form this kernel
     // cannot tell apart for lack of process groups.
@@ -417,9 +455,9 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // answers ECHILD, and blocking here would sleep forever - OpenRC
         // parks exactly that way after its last helper exits.
         let collected: Option<crate::sched::WaitEvent> = if no_hang {
-            crate::sched::poll_any_child_event(me, stops, continues)
-        } else if crate::sched::has_children(me) {
-            match crate::sched::wait_any_child_event(me, stops, continues) {
+            crate::sched::poll_any_child_event(me, kind, stops, continues)
+        } else if crate::sched::has_children(me, kind) {
+            match crate::sched::wait_any_child_event(me, kind, stops, continues) {
                 crate::sched::WaitPark::Event(event) => Some(event),
                 crate::sched::WaitPark::NoChild => None,
                 crate::sched::WaitPark::Interrupted => return err::EINTR,
@@ -432,7 +470,7 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         }
         // Nothing to report: an error only when there is nobody left to
         // wait for, and otherwise the "none yet" zero.
-        if no_hang && crate::sched::has_children(me) {
+        if no_hang && crate::sched::has_children(me, kind) {
             return 0;
         }
         return err::ECHILD;
@@ -445,11 +483,19 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let Some(id) = pid_task(pid) else {
         return err::ECHILD;
     };
+    // The kind is the option word's, not the selector's: naming the child does
+    // not make a "clone" child one a wait without `__WCLONE` may be answered
+    // about, and the answer is `ECHILD` rather than a park (measured:
+    // `.workbuddy/probe_wclone.c` B2/B3). Asked before anything below, because
+    // a record is read without a scan and would otherwise be handed over.
+    if !crate::sched::child_visible_to(id, kind) {
+        return err::ECHILD;
+    }
 
     // A stop first, then a death: a tracee that stopped on its way to exiting
     // has news of both, and the stop is the earlier news and the one that
     // gates everything after it.
-    if let Some(event) = crate::sched::take_child_event(id, stops, continues) {
+    if let Some(event) = crate::sched::take_child_event(id, kind, stops, continues) {
         return finish_wait_event(event, status, rusage, from_user);
     }
     // A code already on file means the child is a zombie: it is collected now,
@@ -467,14 +513,14 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             from_user,
         );
     }
-    if !crate::sched::is_child(id, me) {
+    if !crate::sched::is_child(id, me, kind) {
         return err::ECHILD;
     }
     if no_hang {
         return 0;
     }
 
-    match crate::sched::block_until_child_event(id, stops, continues) {
+    match crate::sched::block_until_child_event(id, kind, stops, continues) {
         crate::sched::WaitPark::Event(event) => finish_wait_event(event, status, rusage, from_user),
         crate::sched::WaitPark::Interrupted => err::EINTR,
         crate::sched::WaitPark::NoChild => err::ECHILD,
@@ -1897,11 +1943,15 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
         Err(e) => return e,
     };
     // A fork child is announced by its parent's `wait`, not by a signal, so the
-    // exit signal is accepted and not acted on. `wait4` is how every caller in
-    // this system collects a child; the byte is kept in the ABI rather than
-    // honoured because there is no delivery path a shell could not get from
-    // waiting anyway.
-    let _ = exit_signal;
+    // byte is not *delivered* on a death here - that half stays named in
+    // `docs/uapi/` §5.2. It is not discarded either: it is the child's *kind*,
+    // and `wait`'s `__WCLONE`/`__WALL` bits read it back at the other end, where
+    // a "clone" child (born to report nothing or something other than
+    // `SIGCHLD`) is `ECHILD` to a wait that did not ask for one
+    // (`sched::ChildKind`, measured in `.workbuddy/probe_wclone.c`).
+    // `CLONE_THREAD` is the one word whose byte is not a statement about a
+    // waitable child - Linux rewrites it away, and a thread here is not its
+    // creator's child at all - so the thread door's own literal sets that one.
 
     // SAFETY: the caller hands the gate's own frame for this task.
     let ctx = match unsafe { crate::hal::user_context(regs_ptr, 0) } {
@@ -1924,6 +1974,7 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
         None
     };
     let request = crate::sched::CloneRequest {
+        exit_signal: exit_signal as u8,
         flags,
         child_stack,
         child_tid,
@@ -3947,10 +3998,13 @@ pub(super) fn handle_clock_getres(args: [usize; ARG_COUNT]) -> isize {
 /// refusal, in Linux's order, so a caller that seeded one cannot read its own
 /// bytes back as an answer.
 ///
-/// The three Linux-only bits (`__WNOTHREAD`, `__WALL`, `__WCLONE`) are accepted
-/// and ignored, which is `wait4`'s treatment and a named divergence: `__WCLONE`
-/// *narrows* to children cloned with an exit signal other than `SIGCHLD`, and
-/// this kernel's tasks carry no exit signal to ask (`docs/uapi/` §5.2).
+/// Two of the three Linux-only bits are read: `__WCLONE` *narrows* to children
+/// cloned with no exit signal or one other than `SIGCHLD`, `__WALL` widens to
+/// both kinds, and neither means the non-clone children only
+/// (`sched::ChildKind`) - the same reading `wait4` gives the same word, measured
+/// in `.workbuddy/probe_wclone.c`. `__WNOTHREAD` is still accepted and ignored,
+/// and it is the only one that is: this kernel has no second `wait` scan to
+/// exclude a sibling group's children from.
 ///
 /// # The fifth argument
 ///
@@ -3983,7 +4037,16 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     /// asks for none of them is refused rather than answered.
     const CLASSES: usize = WEXITED | WSTOPPED | WCONTINUED;
 
-    let (idtype, id, infop, options) = (args[0], args[1] as isize, args[2], args[3]);
+    // `which`, `upid` and `options` are `int`s in Linux's signature
+    // (`SYSCALL_DEFINE5(waitid, int, which, pid_t, upid, ...)`), so the upper
+    // half of each register is not part of the argument - `wait4`'s note beside
+    // its own unpacking says why that is a bug and not a formality.
+    let (idtype, id, infop, options) = (
+        args[0] as u32 as usize,
+        args[1] as i32 as isize,
+        args[2],
+        args[3] as u32 as usize,
+    );
     let rusage = args[4];
     if !buffer_ok(infop, SIGINFO_BYTES, true, from_user) {
         return err::EFAULT;
@@ -4031,6 +4094,9 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 
     let stops = options & WSTOPPED != 0;
     let continues = options & WCONTINUED != 0;
+    // The same narrowing `wait4` reads out of its word - one function, so the
+    // two doors cannot disagree about which children a `__W*` bit admits.
+    let kind = wait_child_kind(options);
     let no_hang = options & WNOHANG != 0;
     // `WNOWAIT` reports without collecting: the event stays where the next
     // wait will find it, which is what a caller that wants to look before it
@@ -4038,9 +4104,9 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     let nowait = options & WNOWAIT != 0;
 
     let collected = if no_hang {
-        crate::sched::poll_child_event(me, sel, stops, continues, nowait)
-    } else if crate::sched::has_matching_children(me, sel) {
-        match crate::sched::wait_child_event(me, sel, stops, continues, nowait) {
+        crate::sched::poll_child_event(me, sel, kind, stops, continues, nowait)
+    } else if crate::sched::has_matching_children(me, sel, kind) {
+        match crate::sched::wait_child_event(me, sel, kind, stops, continues, nowait) {
             WaitPark::Event(event) => Some(event),
             WaitPark::Interrupted => return err::EINTR,
             WaitPark::NoChild => None,
@@ -4055,7 +4121,7 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         // caller polls for (with the record above left cleared), while a
         // selector that matches no child at all is `ECHILD` - the wait could
         // never be answered. `wait4` draws the line in the same place.
-        if no_hang && crate::sched::has_matching_children(me, sel) {
+        if no_hang && crate::sched::has_matching_children(me, sel, kind) {
             return 0;
         }
         return err::ECHILD;
