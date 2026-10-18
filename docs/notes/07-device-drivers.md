@@ -3309,7 +3309,30 @@ a `SIGSEGV` handler — report, `send_signal(11)`, return — so which caller an
 named. The two instruction sites are the lead, and they recur (a third run, `rip=0x7dc7095aa680`,
 the same `0x4` access at a different ASLR base).
 
-**Left unmeasured.** Whether `sway` can come up on this card at all once the IPC question is
-answered; and the pointer (item 3), which needs a pointer *moved* on a window a session does not
-have — `run` wires `-monitor none`, so neither `screendump` nor `input-send-event` is reachable from
-the host side, and the window confirmation stays an eye's until a QEMU monitor is wired to one.
+**The control channel is wired now, and what it answered** (2026-10-18, the same day: `xtask`'s
+`qemu.rs` binds `build/<arch>-9p-share/qmp.sock`, `server=on,wait=off`, the console socket's shape).
+`info mice` names the machine's pointers — `Mouse #2: QEMU PS/2 Mouse` and `* Mouse #4: QEMU Virtio
+Tablet (absolute)`, the tablet being the *active* one — and `input-send-event` moves it: two `abs`
+events per position (this QEMU's schema wants `{"axis": "x"|"y", "value": …}`, one axis per event)
+are answered `{}`. So *driving* a compositor's pointer from a session is solved.
+
+**Reading it back is not, and the obstacle is QEMU's.** `screendump` answers
+`GenericError: no surface` on *both* display backends this tree wires for the GL card —
+`egl-headless` (terminal mode) and `sdl,gl=on` (mirror) — because a GL-accelerated scanout lives in
+a texture QEMU's dump path does not expose. A readable surface needs a **non-GL** display: the 2D
+card (`sdl` without `gl`), VNC, or a host-side capture of the window. Which of those also exercises
+the cursor queue is a *question and not an answer*: weston on the 2D card renders with llvmpipe
+(measured, §7.4's earlier rounds), but whether its pointer takes that card's cursor queue or the
+software blend is what the card's own `cursorq` token would say — and the quotes above elide that
+token for the 2D card, which is the first thing a 2D-card boot should read.
+ Two session facts beside it: an SDL window **grabs the session's pointer** (its title
+becomes `QEMU - Press Ctrl-Alt-G to exit grab`), so a mirror/gui session takes the operator's mouse
+until the window loses focus — which is why `terminal` mode stayed the driveable one — and the
+window's own size is the host's, narrated by this kernel as `host wants 952x1135; still driving
+1280x800 until a compositor commits it`, which is the resize item above working.
+
+**And one gap the same boot walked into.** udev maintains `/dev/dri/by-path` by removing the
+directory and publishing its links again, and the removal is refused here:
+`mpos: syscall 84 (path /dev/dri/by-path) -> EOPNOTSUPP` (84 is `rmdir`). `docs/uapi/` §5.2 carries
+the measurement and the asymmetry — `devfs`'s `create` accepts a directory, its `remove` is the
+trait's default.

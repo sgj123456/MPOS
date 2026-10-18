@@ -309,11 +309,15 @@ In the order that keeps each step verifiable on its own:
    is the one measurement a `t-*` program cannot make: boot against the window (`cargo xtask run --mode gui`, or `--mode terminal` with root on the serial line as §15.36 drove it), start weston,  
    and read the pointer rendering. The serial log should carry the new `virtio-gpu: … cursorq=1`  
    token — and it does (2026-10-18, the GL card: `virtio-gpu: virgl=1 context_init=1 cursorq=1  
-   capsets=2 cached=2 mask=0x6`, weston's `cursor planes: yes` beside it, §7.4). What no session can  
-   do yet is *move* a pointer and read it back: `run` wires `-monitor none`, so neither `screendump`  
-   nor `input-send-event` is reachable from the host side — the confirmation stays an eye's until a  
-   monitor is wired to one. The other residual stays named rather than claimed — the no-cursorq  
-   fallback branch, which neither configured machine can exercise (§7.4).
+   capsets=2 cached=2 mask=0x6`, weston's `cursor planes: yes` beside it, §7.4). The *driving* half  
+   is solved too — `run` now binds a QMP socket (`build/<arch>-9p-share/qmp.sock`), `info mice` names  
+   the absolute tablet and `input-send-event` moves it — but **reading it back is not**: `screendump`  
+   answers `no surface` on both display backends a GL card gets (`egl-headless` and `sdl,gl=on`), so  
+   the read-back needs a non-GL surface — the 2D card, VNC, or a host-side capture of the window.  
+   Whether the 2D card's pointer takes that card's cursor queue or its software blend is the question  
+   its own `cursorq` token answers, and §7.4 elides the token for it. The other residual stays named  
+   rather than claimed — the no-cursorq fallback branch, which neither configured machine can  
+   exercise (§7.4).
 4. **the display path specifically** — §7.4 carries its own order, and the step it named first is a  
    **dead end, measured 2026-10-18**: a wlroots compositor on `WLR_RENDERER=pixman` stops in  
    `wlr_allocator_autocreate` (`[wlr] [render/allocator/allocator.c:168] Failed to create  

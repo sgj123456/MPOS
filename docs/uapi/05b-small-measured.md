@@ -652,3 +652,18 @@ Section numbers are unchanged from the original `UAPI.md`.
   `.workbuddy/probe_dir_io.c`, and the pin is `t-dir-io` (14 claims) beside the host unit test
   `a_directory_has_no_byte_reader`; item 47 carries the gates and the counterfactual.
 
+
+- **`rmdir` inside the device tree answers `EOPNOTSUPP`, where Linux's `devtmpfs` removes the
+  directory.** Measured in this kernel's own words on a booted machine (2026-10-18, the first
+  machine's GL card): `mpos: syscall 84 (path /dev/dri/by-path) -> EOPNOTSUPP`, which is udev doing
+  what it does to that directory at every boot — remove it, then publish the `by-path` links again —
+  while a current host serves the same call (measured as root on devtmpfs: `mkdir /dev/<name>` and
+  `rmdir /dev/<name>` both answer 0), which is why the host's own database entry carries a `by-path`
+  symlink beside the node (§7.4). The asymmetry is this tree's rather than the kind's: `devfs`'s
+  `create` *does* accept a directory (`DevDirNode`, `src/vfs/devfs.rs`), so `mkdir` there is served,
+  while its directory node inherits the trait's default `remove` — `Unsupported` — so the *second*
+  half of udev's idiom is refused, and a compositor or a by-path reader finds the directory only if
+  the kernel itself published it. Owner: `src/vfs/devfs.rs`'s `DevDirNode`, whose `remove` should
+  mirror the `create` beside it (the driver-owned *nodes* stay undestroyable, which is what that
+  create's `_ => Unsupported` arm is for). Not landed; the pin it wants is one `t-` claim —
+  `mkdir` a name under `/dev`, then `rmdir` it — beside the host column above.
