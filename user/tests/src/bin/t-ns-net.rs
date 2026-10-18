@@ -1212,18 +1212,21 @@ fn main() {
     // it asserts anything.
     wire_moves_into_a_namespace(&mut r);
 
-    // ---- Whose capability a packet socket asks for ----
+    // ---- Whose capability a raw socket asks for ----
     //
-    // `AF_PACKET` is the one door in this file that asks a *capability*, and
-    // the question is not "does the caller hold `CAP_NET_RAW`" but "is the
+    // The two raw doors in this file that ask a *capability* - `AF_PACKET`, and
+    // `AF_INET`'s `SOCK_RAW` a program reaches for as `ping` and a DHCP client -
+    // and the question is not "does the caller hold `CAP_NET_RAW`" but "is the
     // caller privileged over the **network namespace it is standing in**" -
-    // Linux's `ns_capable(sock_net(sk)->user_ns, CAP_NET_RAW)`. Measured on a
-    // current host (`.workbuddy/probe_ns_owner.c`): a caller inside a bare user
-    // namespace - holding the whole set *in that namespace* - is still
-    // `EPERM`, because the network namespace it is in is the machine's, and
-    // served the moment it has made a network namespace of its own, because
-    // that one's owner is the caller. A child does the whole dance, because the
-    // caller of this test cannot move itself into a user namespace and back.
+    // Linux's `ns_capable(sock_net(sk)->user_ns, CAP_NET_RAW)` for both.
+    // Measured on a current host, one probe per door in the same three
+    // positions (`.workbuddy/probe_ns_owner.c`, `.workbuddy/probe_rawip_ns.c`,
+    // Linux 7.2.9): a caller inside a bare user namespace - holding the whole
+    // set *in that namespace* - is still `EPERM` for both, because the network
+    // namespace it is in is the machine's, and served for both the moment it has
+    // made a network namespace of its own, because that one's owner is the
+    // caller. A child does the whole dance, because the caller of this test
+    // cannot move itself into a user namespace and back.
     let packet_go = pipe();
     r.check("the packet pipe is made", packet_go.is_ok());
     if let Ok((from_child, to_child)) = packet_go {
@@ -1240,19 +1243,24 @@ fn main() {
                     rc as isize
                 }
             };
-            let packet = |_: usize| -> isize {
-                let rc = unsafe {
-                    libc::socket(
-                        libc::AF_PACKET,
-                        libc::SOCK_DGRAM,
-                        libc::htons(libc::ETH_P_ALL as u16) as i32,
-                    )
-                };
+            let answer = |rc: i32| -> isize {
                 if rc < 0 {
                     -(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as isize)
                 } else {
                     rc as isize
                 }
+            };
+            let packet = |_: usize| -> isize {
+                answer(unsafe {
+                    libc::socket(
+                        libc::AF_PACKET,
+                        libc::SOCK_DGRAM,
+                        libc::htons(libc::ETH_P_ALL as u16) as i32,
+                    )
+                })
+            };
+            let raw_ip = |_: usize| -> isize {
+                answer(unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP) })
             };
             // A user namespace of its own: empty maps, and the whole capability
             // set *in it* - which is the point, because the set is not the
@@ -1262,10 +1270,12 @@ fn main() {
             // machine's user namespace, and the caller is not privileged over
             // that one from below it.
             let bare = packet(0);
+            let bare_raw = raw_ip(0);
             // One of its own, owned by the namespace it stands in.
             let made_net = unshare_word(libc::CLONE_NEWNET as usize);
             let own = packet(0);
-            let line = format!("{made_user}\n{bare}\n{made_net}\n{own}\n");
+            let own_raw = raw_ip(0);
+            let line = format!("{made_user}\n{bare}\n{bare_raw}\n{made_net}\n{own}\n{own_raw}\n");
             let _ = write(&to_child, line.as_bytes());
             drop(to_child);
             raw_exit(0);
@@ -1287,16 +1297,24 @@ fn main() {
             "and a packet socket is EPERM while it stands in the machine's network namespace",
             get(1) == Some(-(libc::EPERM as isize)),
         );
+        // The same question, the other raw door: a bare user namespace is
+        // refused an `AF_INET` raw socket too, which is the claim `AF_PACKET`
+        // alone could not make.
+        r.check(
+            "and so is an AF_INET raw socket, the same question asked of the same owner",
+            get(2) == Some(-(libc::EPERM as isize)),
+        );
         r.check(
             "the child made a network namespace of its own",
-            get(2) == Some(0),
+            get(3) == Some(0),
         );
         // Served, with the same set in the same caller: the question was asked
         // of the namespace's owner, and that owner is now the caller's own.
         r.check(
             "and the same caller, the same set, opens a packet socket in it",
-            get(3).is_some_and(|fd| fd >= 0),
+            get(4).is_some_and(|fd| fd >= 0),
         );
+        r.check("and a raw IP socket too", get(5).is_some_and(|fd| fd >= 0));
         let mut status = 0;
         let reaped = unsafe { libc::waitpid(child as i32, &mut status, 0) };
         r.check("the packet child is reaped", reaped == child as i32);

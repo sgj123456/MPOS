@@ -1462,3 +1462,45 @@ the commit bodies), and each moved its pin in the same commit.
     (`FAIL: and is EPERM joining the mount namespace it is standing in (the no-op every other kind
     serves)` and `FAIL: and a packet socket is EPERM while it stands in the machine's network
     namespace`), while the served halves and every control pass on both kernels.
+
+## item 43 — the third raw door asks the network namespace's owner too
+
+    The same question as item 42, in the *other* door that asks `CAP_NET_RAW`: `AF_INET`'s
+    `SOCK_RAW` — the socket `ping` and a DHCP client open — asked the caller's own effective set
+    (`Credentials::has_effective`), where Linux asks `ns_capable(sock_net(sk)->user_ns,
+    CAP_NET_RAW)`, exactly as `AF_PACKET` does. The hole is the one item 42 closed on the other
+    side of the same family: a caller inside a bare user namespace, holding the whole set *in it*,
+    was served an `AF_INET` raw socket where Linux refuses one.
+    **Measured whole on a current host first** (`.workbuddy/probe_rawip_ns.c`, Linux 7.2.9, a root
+    caller in the same three positions item 42's probe used — the machine's own namespaces, a bare
+    user namespace, and a user namespace that made a network namespace of its own):
+
+    ```text
+                                          the machine's root   inside a bare user ns   inside one with its own net ns
+    socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)       0                     EPERM                          0
+    socket(AF_PACKET, SOCK_DGRAM)                 0                     EPERM                          0
+    ```
+
+    The two rows are the point: the *same* three answers for the two doors, so the refusal is not
+    about the capability the caller holds — the bare row holds the whole set *in its own*
+    namespace — and not about what a user namespace may do, since the third column is served. It is
+    asked of the owner, and the owner changes when the namespace does.
+    **The fix is one helper and one call site.** `net::socket`'s new `net_ns_capable(cap)` reads
+    the two facts the question needs — `vfs::ns::owner_of(current_net_ns)` and
+    `sched::ns_capable_of`'s walk about it — and **both** raw doors now ask it, because a second
+    copy of one question is a second place for the two to drift apart: the `AF_PACKET` door's
+    inline pair of lines became the same call. The capability's *place* in the order does not move
+    (it is still asked before the protocol is judged, `docs/uapi/` §4.1's row), and a root caller
+    is privileged over the machine's own network namespace, so no answer that existed before this
+    commit changed. Pin: `t-ns-net`'s raw-door section — the child that already walks a bare user
+    namespace and then one of its own now asks both doors at both points, so one file pins the
+    pair together (68 `ok:` lines, was 66). Gate: x86_64 `pass=181 fail=0 (181 built)`,
+    `mpos-kunit 32 passed, 0 failed` (11 staged out by `tests.toml`); the second machine's arm is
+    `pass=180 fail=0`, `mpos-kunit 32 passed, 0 failed` (12 staged out), and both programs' `ok:`
+    lines are byte-identical across the two machines. The counterfactual is exact: with only this
+    door put back to the caller's own set (one call site; the helper and the `AF_PACKET` door left
+    as they are) the sweep is `pass=180 fail=1 (181 built)` with `mpos-kunit` unmoved at 32 passed,
+    0 failed — the one red program is `t-ns-net` and its one red claim is exactly the
+    discriminating one (`FAIL: and so is an AF_INET raw socket, the same question asked of the same
+    owner`), while the served half (`and a raw IP socket too`) passes on both kernels, which is
+    what keeps the claim on the namespace's owner rather than on the socket's type.

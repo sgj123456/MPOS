@@ -427,6 +427,18 @@ descriptor here follows its maker instead of pinning the namespace it named
 (`.workbuddy/probe_ns_fd_pin.c`: Linux's three readlinks answer the number the descriptor was
 opened in; this kernel answers the copy's).
 
+**And the third raw door was measured and closed with it** (`docs/uapi/` §5.1 item 43): the *same*
+question in the door `ping` and a DHCP client take — `AF_INET`'s `SOCK_RAW` — which asked the
+caller's own effective set for `CAP_NET_RAW` where Linux asks the network namespace's owner, exactly
+as `AF_PACKET` does. The measurement is the other probe in the same three positions
+(`.workbuddy/probe_rawip_ns.c`, Linux 7.2.9): the machine's root served, a caller inside a bare user
+namespace holding the whole set *in it* refused `EPERM`, the same caller served the moment it has a
+network namespace of its own — so the refusal was never about the set. Both raw doors now ask one
+helper (`net::socket`'s `net_ns_capable`), because the two are one question and a second copy of it
+is a second place to drift; `t-ns-net`'s section walks both doors in one child. Nothing else moved:
+the capability is still asked **before** the protocol is judged, and a root caller is privileged
+over the machine's own network namespace, so no guest answer that existed before changed.
+
 **A child's death is one `SIGCHLD` record, and it is Linux's** (`docs/uapi/` §5.1 item 29, landed  
 2026-10-17): the second book this kernel kept for "an exit whose signal is unread" is deleted — the  
 exit queues the real signal with `CLD_EXITED`/`CLD_KILLED` and the status beside it, and a death the  

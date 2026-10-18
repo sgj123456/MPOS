@@ -1071,6 +1071,30 @@ fn validate_source_slot(src: Option<(usize, usize)>) -> Result<(), isize> {
 // socket(), close-time teardown
 // ---------------------------------------------------------------------------
 
+/// Is the running caller privileged over the **network namespace it stands
+/// in** - Linux's `ns_capable(sock_net(sk)->user_ns, cap)`?
+///
+/// The question both of this file's raw doors ask, and not the caller's own
+/// set: a caller inside a *bare* user namespace, holding the whole set *in it*,
+/// is still refused, because the network namespace it is in is the machine's,
+/// whose owner is the initial one - and the same caller is served the moment it
+/// has made a network namespace of its own, because then the owner is the
+/// namespace it stands in. Measured for both doors, in the same three positions
+/// (`.workbuddy/probe_ns_owner.c` for `AF_PACKET`, `.workbuddy/probe_rawip_ns.c`
+/// for `AF_INET`'s `SOCK_RAW`): served in the machine's namespaces, `EPERM` in a
+/// bare user namespace, served again in one that made its own.
+///
+/// It lives here rather than in `sched` or `vfs::ns` because the *question* is
+/// this family's - a socket's capability - while the two facts it is asked with
+/// (whose the namespace is, and whether the caller is privileged over it) are
+/// theirs.
+fn net_ns_capable(cap: u32) -> bool {
+    let owner = crate::vfs::ns::owner_of(
+        crate::sched::current_net_ns().unwrap_or_else(crate::vfs::ns::machine_net_id),
+    );
+    crate::sched::ns_capable_of(&owner, cap)
+}
+
 /// `socket(domain, type, protocol)`.
 ///
 /// The type word carries the flag bits Linux lets callers fold in: a DNS
@@ -1218,10 +1242,7 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
         // namespace is refused, because the network namespace it is in is still
         // the machine's, while one that made a network namespace of its own is
         // served, because that one's owner is the caller.
-        let net_owner = crate::vfs::ns::owner_of(
-            crate::sched::current_net_ns().unwrap_or_else(crate::vfs::ns::machine_net_id),
-        );
-        if !crate::sched::ns_capable_of(&net_owner, crate::cred::CAP_NET_RAW) {
+        if !net_ns_capable(crate::cred::CAP_NET_RAW) {
             return err::EPERM;
         }
         let raw_type = args[1] as u32;
@@ -1263,11 +1284,18 @@ pub(crate) fn handle_socket(args: [usize; 6], _from_user: bool) -> isize {
     // at the protocol: measured on the host (`.workbuddy/probe_rawip.c`, a
     // caller that has dropped to an unprivileged id), ICMP, TCP and a protocol
     // number nothing has are *all* `EPERM`. So the gate is not something a caller
-    // can read off one refusal's errno, and it is asked of the caller's effective
-    // set the way the namespace gates are (`docs/notes/` §15.18).
-    if typ == SOCK_RAW
-        && !crate::sched::current_credentials().has_effective(crate::cred::CAP_NET_RAW)
-    {
+    // can read off one refusal's errno.
+    //
+    // Asked of the **network namespace's** owner, the same question and the same
+    // walk as `AF_PACKET`'s gate above - Linux's
+    // `ns_capable(sock_net(sk)->user_ns, CAP_NET_RAW)` - where this door asked
+    // the caller's own effective set until 2026-10-18. The two answers differ
+    // exactly where the namespace does: measured in the same three positions for
+    // this door (`.workbuddy/probe_rawip_ns.c`, Linux 7.2.9), the machine's root
+    // is served, a caller inside a *bare* user namespace holding the whole set
+    // *in it* is `EPERM`, and the same caller is served once it has made a
+    // network namespace of its own.
+    if typ == SOCK_RAW && !net_ns_capable(crate::cred::CAP_NET_RAW) {
         return err::EPERM;
     }
 
