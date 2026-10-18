@@ -370,8 +370,13 @@ still uncollected. The handler is now a collector that touches no pointer plus t
 Linux's order; the record is written word by word (a record whose tail is unmapped is still served,  
 and one whose word straddles the boundary stops there with the words before it written), and the  
 rusage goes through the page-by-page copy that is `copy_to_user`, so a straddling one leaves its  
-head written. That door's `*status` was already in this order; `wait4`'s own four-byte word is the  
-one shape left named in `docs/uapi/` §5.2.
+head written. That door's `*status` was already in this order, and the `wait4` four-byte word it left  
+named in `docs/uapi/` §5.2 was measured rather than assumed (`docs/uapi/` §5.1 item 53, landed  
+2026-10-18): Linux's `put_user` there is **atomic** — a word that straddles the page end is `EFAULT`  
+with not one byte written, where the record beside it is the range copy that leaves its head behind —  
+so this door's whole-word check followed by one store was already the right shape and no kernel code  
+moved. The fourteen shapes are claims in `t-wait4` now (33 new, 84 in the file), which is what keeps  
+a later "just copy four bytes" from landing quietly.
 
 **`__WCLONE` narrows a wait to the kind of child `clone` named** (`docs/uapi/` §5.1 item 50, landed  
 2026-10-18): `clone`'s low byte is the signal a child's death should report, and Linux reads it back  

@@ -9,6 +9,18 @@
 //! the exit code itself would look fine in a shell that only prints `$?`, and
 //! would break every libc that calls `WIFEXITED` on the status word.
 //!
+//! # Where the status word lands
+//!
+//! `*status` is four bytes written with one `put_user`, and Linux checks that
+//! reach **atomically**: a word that starts inside the caller's mapping and ends
+//! outside it is `EFAULT` with not one byte written, where the `struct rusage`
+//! beside it is a range copy that leaves its head behind. The two answers that
+//! are not reports - the `WNOHANG` zero and `ECHILD` - are decided before the
+//! word is reached at all, so an unwritable pointer costs nothing there; a
+//! refusal that *does* reach a report has already taken the event, which is why
+//! a refused stop is gone on the next look. Those are the fourteen shapes
+//! `.workbuddy/probe_wait4_status.c` walked, and the claims below pin them.
+//!
 //! # The migration
 //!
 //! `rustix::process::waitpid` *is* this call - its linux_raw backend issues
@@ -383,6 +395,342 @@ fn main() {
             "and a second wait for it is ECHILD",
             again.0 == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
         );
+    }
+
+    // ---- the other half: `*status` is a word, not a range ------------------
+    //
+    // The record above is a range copy, so a pointer that runs off the end of
+    // the mapping leaves its head behind. `*status` is not: Linux writes it
+    // with one `put_user`, and a word that starts inside the mapping and ends
+    // outside is `EFAULT` with **not one byte** written - measured,
+    // `.workbuddy/probe_wait4_status.c` scenarios B, C and D, against scenario
+    // AH of `probe_waitid_record.c` for the contrast. Both doors here answer
+    // that way already (a whole-word `buffer_ok` before a single write), which
+    // is what the shapes below pin: they are the fourteen that probe walked,
+    // kept so that a later "just copy four bytes" cannot land quietly.
+    use core::ffi::c_void;
+
+    /// `wait4` with the caller's own `*status` *pointer*, so that the pointer
+    /// can be one the kernel has to refuse. The word is not read back through
+    /// a `&mut i32` - the addresses below are not one.
+    fn wait4_at(pid: i32, status: *mut i32, options: i32, rusage: *mut Rusage) -> (isize, i32) {
+        let answer = unsafe {
+            libc::syscall(
+                libc::SYS_wait4,
+                pid as libc::c_long,
+                status as libc::c_long,
+                options as libc::c_long,
+                rusage as libc::c_long,
+            )
+        };
+        // `errno` is only the call's when the call failed - a successful
+        // `wait4` leaves it exactly as it found it, so reading it here would
+        // pin whatever the previous failure happened to leave, which is how
+        // the first draft of these claims went red on this very host.
+        let err = if answer == -1 {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
+        (answer as isize, err)
+    }
+
+    /// A child that leaves with `code`, for the control shape: a word of zero
+    /// would not tell "the kernel wrote it" from "the kernel never reached it".
+    fn start_exiting(code: i32) -> i32 {
+        let pid = unsafe { libc::fork() };
+        if pid != 0 {
+            return pid;
+        }
+        unsafe {
+            libc::syscall(libc::SYS_exit_group, code as libc::c_long);
+            libc::_exit(code)
+        }
+    }
+
+    const PAGE: usize = 4096;
+    // The seed every byte the kernel did not write has to read back as. Zero
+    // would not tell "left alone" from "written zero", which is the whole
+    // difference between an atomic word and a partial copy.
+    const SEED: u8 = 0xa5;
+
+    // Two pages, the second one unwritable: the four-byte word can then be
+    // made to straddle the boundary, to fit before it, or to lie wholly
+    // inside it.
+    let pair = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            2 * PAGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    r.check(
+        "two pages for the status-word fixtures were mapped",
+        pair != libc::MAP_FAILED,
+    );
+    if pair != libc::MAP_FAILED {
+        let base = pair as *mut u8;
+        let rc = unsafe { libc::mprotect(base.add(PAGE) as *mut c_void, PAGE, libc::PROT_NONE) };
+        r.check("the second page was made unwritable", rc == 0);
+        unsafe { core::ptr::write_bytes(base, SEED, PAGE) };
+
+        // The control, and the one claim whose subject is a word the kernel
+        // *can* reach: it lands in the writable page and reads back the exit
+        // status the caller would decode (measured, scenario A, where a child
+        // exiting 7 leaves `0x700`). Without it the section could pin a refusal
+        // at every pointer and never show the write it is refusing.
+        let control = start_exiting(7);
+        r.check("a child for the control status was started", control > 0);
+        if control > 0 {
+            let good = base as *mut i32;
+            let (answer, err) = wait4_at(control, good, 0, core::ptr::null_mut());
+            r.check(
+                "a status word wholly inside the writable page is written",
+                answer == control as isize && err == 0 && unsafe { core::ptr::read(good) } == 0x700,
+            );
+        }
+
+        // Two bytes in, two out - the shape that tells an atomic word from a
+        // copy that writes what it can reach.
+        let straddle = unsafe { base.add(PAGE - 2) } as *mut i32;
+        let half = start_burner(0);
+        r.check("a child for the straddling status was started", half > 0);
+        if half > 0 {
+            let (answer, err) = wait4_at(half, straddle, 0, core::ptr::null_mut());
+            r.check(
+                "a status word that runs off the end of the mapping is EFAULT",
+                answer == -1 && err == libc::EFAULT,
+            );
+            r.check(
+                "and not one byte of it was written",
+                unsafe { core::ptr::read(base.add(PAGE - 2)) } == SEED
+                    && unsafe { core::ptr::read(base.add(PAGE - 1)) } == SEED,
+            );
+            // The refusal lands *after* the collection, which is the ordering
+            // the record's own `EFAULT` has: the child is gone either way.
+            let (again, again_err) = wait4_at(
+                half,
+                core::ptr::null_mut(),
+                libc::WNOHANG,
+                core::ptr::null_mut(),
+            );
+            r.check(
+                "though the child had already been collected",
+                again == -1 && again_err == libc::ECHILD,
+            );
+        }
+
+        // The same rule at the other two splits - one byte in and three out,
+        // then three in and one out (measured, scenarios C and D) - because the
+        // refusal is about where the *word* ends and not about how much of it
+        // the caller's mapping happens to hold: each leaves every reachable byte
+        // exactly as the caller wrote it.
+        let split_c = unsafe { base.add(PAGE - 1) } as *mut i32;
+        let one_in = start_burner(0);
+        r.check("a child for the one-byte-in status was started", one_in > 0);
+        if one_in > 0 {
+            let (answer, err) = wait4_at(one_in, split_c, 0, core::ptr::null_mut());
+            r.check(
+                "a status word one byte inside the mapping is EFAULT",
+                answer == -1 && err == libc::EFAULT,
+            );
+            r.check(
+                "and that one reachable byte was not written either",
+                unsafe { core::ptr::read(base.add(PAGE - 1)) } == SEED,
+            );
+        }
+
+        let split_d = unsafe { base.add(PAGE - 3) } as *mut i32;
+        let three_in = start_burner(0);
+        r.check(
+            "a child for the three-byte-in status was started",
+            three_in > 0,
+        );
+        if three_in > 0 {
+            let (answer, err) = wait4_at(three_in, split_d, 0, core::ptr::null_mut());
+            r.check(
+                "a status word three bytes inside the mapping is EFAULT",
+                answer == -1 && err == libc::EFAULT,
+            );
+            r.check(
+                "and all three reachable bytes were left alone",
+                (0..3).all(|i| unsafe { core::ptr::read(base.add(PAGE - 3 + i)) } == SEED),
+            );
+        }
+
+        // Wholly inside the unwritable page: there is nothing to read back,
+        // only the refusal.
+        let inside = unsafe { base.add(PAGE) } as *mut i32;
+        let unreachable = start_burner(0);
+        r.check(
+            "a child for the unwritable-page status was started",
+            unreachable > 0,
+        );
+        if unreachable > 0 {
+            let (answer, err) = wait4_at(unreachable, inside, 0, core::ptr::null_mut());
+            r.check(
+                "a status word wholly inside an unwritable page is EFAULT",
+                answer == -1 && err == libc::EFAULT,
+            );
+        }
+
+        // A refused status does not touch the record beside it: the two writes
+        // happen in that order, `*status` first (measured, scenario G - the
+        // mirror of the claim above, where the record is the refused one).
+        let paired = start_burner(0);
+        r.check(
+            "a child for the refused-status pair was started",
+            paired > 0,
+        );
+        if paired > 0 {
+            let mut ru = Rusage::seeded();
+            let (answer, err) = wait4_at(paired, straddle, 0, &mut ru);
+            r.check(
+                "a refused status word leaves the record beside it untouched",
+                answer == -1 && err == libc::EFAULT && !ru.written(),
+            );
+        }
+
+        // Both pointers refused at once (measured, scenario I): the word is
+        // written first, so its own refusal is the answer and the record is
+        // never reached - the two claims above are each half of this, and this
+        // is the shape that says the order is what decides which is asked.
+        let both = start_burner(0);
+        r.check("a child for the both-refused shape was started", both > 0);
+        if both > 0 {
+            let mut ru = Rusage::seeded();
+            let (answer, err) = wait4_at(both, straddle, 0, &mut ru);
+            r.check(
+                "both pointers refused is EFAULT and touches neither",
+                answer == -1
+                    && err == libc::EFAULT
+                    && !ru.written()
+                    && unsafe { core::ptr::read(base.add(PAGE - 2)) } == SEED
+                    && unsafe { core::ptr::read(base.add(PAGE - 1)) } == SEED,
+            );
+        }
+
+        unsafe { libc::munmap(pair, 2 * PAGE) };
+    }
+
+    // A page the caller may read but not write: the word is inside a mapping
+    // and still refused, which is the *write* half of the reach rather than the
+    // *mapped* half.
+    let ro = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            PAGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    r.check(
+        "a page for the read-only status was mapped",
+        ro != libc::MAP_FAILED,
+    );
+    if ro != libc::MAP_FAILED {
+        unsafe { core::ptr::write_bytes(ro as *mut u8, SEED, PAGE) };
+        let rc = unsafe { libc::mprotect(ro, PAGE, libc::PROT_READ) };
+        r.check("and made read-only", rc == 0);
+        let unwritable = start_burner(0);
+        r.check(
+            "a child for the read-only status was started",
+            unwritable > 0,
+        );
+        if unwritable > 0 {
+            let (answer, err) = wait4_at(unwritable, ro as *mut i32, 0, core::ptr::null_mut());
+            r.check(
+                "a status word in a read-only page is EFAULT",
+                answer == -1 && err == libc::EFAULT,
+            );
+            r.check(
+                "and the page still holds the caller's own bytes",
+                unsafe { core::ptr::read(ro as *const u8) } == SEED,
+            );
+        }
+        unsafe { libc::munmap(ro, PAGE) };
+    }
+
+    // A null `*status` is "not interested", not an error: the child is reaped
+    // and the answer is its pid (measured, scenario F).
+    let mute = start_burner(0);
+    r.check("a child for the null-status claim was started", mute > 0);
+    if mute > 0 {
+        let (answer, err) = wait4_at(mute, core::ptr::null_mut(), 0, core::ptr::null_mut());
+        r.check(
+            "a null status pointer is not an error",
+            answer == mute as isize && err == 0,
+        );
+    }
+
+    // The two answers that are not *reports* never reach the word: the
+    // `WNOHANG` zero and `ECHILD` are decided before anything is written, so a
+    // pointer the kernel could not write to costs nothing (scenarios J and K).
+    let waiting = start_sleeper();
+    r.check(
+        "a running child for the WNOHANG shape was started",
+        waiting > 0,
+    );
+    if waiting > 0 {
+        let (answer, err) = wait4_at(
+            waiting,
+            1usize as *mut i32,
+            libc::WNOHANG,
+            core::ptr::null_mut(),
+        );
+        r.check(
+            "WNOHANG with nothing ready answers 0 even with an unwritable status",
+            answer == 0 && err == 0,
+        );
+        let _ = wait4_at(waiting, core::ptr::null_mut(), 0, core::ptr::null_mut());
+    }
+    let (answer, err) = wait4_at(
+        unsafe { libc::getpid() },
+        1usize as *mut i32,
+        0,
+        core::ptr::null_mut(),
+    );
+    r.check(
+        "ECHILD comes before the status word is reached",
+        answer == -1 && err == libc::ECHILD,
+    );
+
+    // A refused *stop* is consumed like a refused death: the event was taken
+    // before the word was written, so the second look finds nothing (measured,
+    // scenario L - where the loss is the point, not an accident).
+    let stopper = start_burner_then_stop(10);
+    r.check(
+        "a child that stops was started for the refused-stop claim",
+        stopper > 0,
+    );
+    if stopper > 0 {
+        let (answer, err) = wait4_at(
+            stopper,
+            1usize as *mut i32,
+            libc::WUNTRACED,
+            core::ptr::null_mut(),
+        );
+        r.check(
+            "a refused status word on a stop is EFAULT",
+            answer == -1 && err == libc::EFAULT,
+        );
+        let (again, again_err) = wait4_at(
+            stopper,
+            core::ptr::null_mut(),
+            libc::WUNTRACED | libc::WNOHANG,
+            core::ptr::null_mut(),
+        );
+        r.check(
+            "and the stop does not come back a second time",
+            again == 0 && again_err == 0,
+        );
+        unsafe { libc::kill(stopper, libc::SIGCONT) };
+        let _ = wait4_at(stopper, core::ptr::null_mut(), 0, core::ptr::null_mut());
     }
 
     // A stop and a resume are *reports* like a death, and Linux fills the record

@@ -560,11 +560,47 @@ Section numbers are unchanged from the original `UAPI.md`.
   *before* the wait still answers `EFAULT`, so only "what happened to the child" tells the two
   shapes apart, and those are the claims that do.
 
-  Named, not built: `wait4`'s `*status` is still a whole-word `buffer_ok` before the write
-  (a four-byte word can straddle a page end only when the caller's pointer does, and
-  Linux's `put_user` faults atomically there — the same shape as AG, unmeasured on this
-  door); and the `si_uid` line `/proc/<pid>/status` prints is still the constant it always
-  was, which is item 50's leftover rather than this one's.
+  The `*status` half of that question is its own entry below (`docs/uapi/` §5.1 item 53) and was
+  measured rather than assumed; the `si_uid` line `/proc/<pid>/status` prints is still the constant
+  it always was, which is item 50's leftover rather than this one's.
+
+- **A `wait4` status word is one `put_user`, and this door already answered it that way. Landed
+  2026-10-18** (`docs/uapi/` §5.1 item 53). Item 51 named it as the neighbour it had not measured:
+  `*status` was checked with a whole-word `buffer_ok` before a single write, and the open question
+  was whether Linux's `put_user` there is **atomic** or a range copy that leaves its head behind the
+  way `struct rusage` does (AG). Measured on a current host first
+  (`.workbuddy/probe_wait4_status.c`, Linux 7.2.9, fourteen scenarios A–N), and the answer is
+  atomic — so this door's shape was right and nothing in the kernel changed. With the whole page
+  filled `0xAA` before every call:
+
+  * **a word that straddles the page end is `EFAULT` with nothing written** — B, C and D (two bytes
+    in and two out, one in and three out, three in and one out) all leave both reachable bytes
+    `0xaa`, where the record's own range copy in the same call leaves its head behind
+    (`probe_waitid_record.c` AH). The word goes whole or not at all;
+  * **the reach is "mapped" *and* "writable"**: wholly inside `PROT_NONE` (E) and inside a page the
+    caller made read-only (N) are both `EFAULT`, and the read-only page still holds its seeded byte
+    afterwards, so the check is the permission and not just the mapping;
+  * **a null pointer is "not interested"** (F): the child is reaped and the answer is its pid;
+  * **`*status` is written before the record**: a refused word leaves a good `rusage` untouched (G),
+    which is the mirror of item 51's own pair, where a refused record leaves the word written (H);
+  * **the two answers that are not reports never reach the word**: the `WNOHANG` zero (J) is still
+    `0` and `ECHILD` (K) is still `ECHILD`, both with a pointer the kernel could not write to;
+  * **a refusal that does reach a report has already taken the event**: a refused death leaves the
+    second wait `ECHILD` (M), and a refused *stop* is gone on the next look (L) — the loss is
+    Linux's own behaviour here, not an accident of this kernel.
+
+  Pin: `t-wait4`, **33 new claims** (84 in the file, was 51), all green on a current host first
+  (`MPOS_ON_HOST=1`, and none of them needs a privilege) — every one of the fourteen scenarios the
+  probe walked is a claim now, the control (A), the other two splits (C, D) and the both-refused
+  shape (I) included. Gate: x86_64 `pass=183 fail=0 (183 built)`, aarch64 `pass=182 fail=0`,
+  `mpos-kunit 32 passed, 0 failed` on both, exit 0; both machines' `ok:` lines byte-identical (84
+  and 84, diffed clean), and equal to this host's own run but for item 34's one named divergence
+  line about `ru_maxrss` and the fault/switch counters. Counterfactual: writing the word byte by
+  byte with each byte passing its own `buffer_ok` — the range-copy shape, i.e. the shape the record
+  has — is `pass=182 fail=1 (183 built)` with `FAIL t-wait4 exit=1` and **four** claims red by name:
+  the three reachable-byte claims (B, C, D) and the both-refused one (I). Each of their own `EFAULT`
+  claims stays green either way, and that asymmetry is the point: an error alone cannot distinguish
+  "refused atomically" from "refused after writing what it could reach".
 
 - **A raised `RLIMIT_SIGPENDING` buys no room past the ring.** **Landed 2026-10-17** (`docs/uapi/`
   §5.1 item 35): the queue's bound is the resource now, in Linux's shape — the target user's total

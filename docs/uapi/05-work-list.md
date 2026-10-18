@@ -2150,3 +2150,69 @@ the commit bodies), and each moved its pin in the same commit.
     zero-range) are `EOPNOTSUPP` in this kernel, so the bits-and-clocks rule has no other arm to
     reach; if one is ever implemented it inherits this helper rather than the truncate's door. The
     mapping-write half of item 41's tail is untouched and remains Linux's own exception.
+
+## item 53 — `wait4`'s `*status` is one `put_user`, and this door already answered that way
+
+    Item 51's own trailing sentence, measured and closed rather than built. Item 51 put the two
+    wait writes in Linux's order — the wait, the record, then the `siginfo_t` — and named one
+    corner it had not looked at: `wait4`'s four-byte `*status` was (and is) checked with a
+    whole-word `buffer_ok` before a single write, and the question was whether Linux's `put_user`
+    there faults **atomically** or copies what it can reach the way `struct rusage` does (item 51's
+    scenario AH, where the head of the record is already written when the tail faults).
+
+    **Measured whole on a current host first** (`.workbuddy/probe_wait4_status.c`, Linux 7.2.9,
+    fourteen scenarios A–N; every reachable byte seeded `0xAA` before the call and read back with
+    `read_unaligned`, so a fixture never depends on the kernel having written anything):
+
+    * **A — the control**: a word wholly inside a writable page answers the pid and `0x700` — the
+      write the rest of the section refuses, which a pin made only of refusals would never show;
+    * **B, C, D — the word straddling the page end**: two bytes in and two out, one in and three
+      out, three in and one out — **all three `EFAULT`, both reachable bytes still `aa`**. Not one
+      byte is written, which is `put_user`'s atomicity and not a range copy's;
+    * **E — wholly inside `PROT_NONE`**: `EFAULT`;
+    * **F — a null pointer**: a *report*, not an error — the child is reaped and the answer is its
+      pid, the shape `rustix`'s `waitpid` passes;
+    * **G — a refused word with a good `rusage`**: `EFAULT` and the record untouched, so the word
+      is written *first*;
+    * **H — a good word with a refused `rusage`**: `EFAULT` and the word **written** (`0x700`) —
+      the mirror image, already pinned from item 51's side;
+    * **I — both refused**: `EFAULT`, nothing written — and the record is never reached, because the
+      word is asked first;
+    * **J — the `WNOHANG` zero with a refused word**: `0`, not `EFAULT` — the zero is decided
+      before the word is reached;
+    * **K — `ECHILD` with a refused word**: `ECHILD`, same reason;
+    * **L — a refused *stop***: `EFAULT`, and the next `WUNTRACED|WNOHANG` answers `0`. The event
+      was taken before the word was written, so the stop is gone — Linux loses it exactly the same
+      way, which is why the claim says so instead of calling it a leak;
+    * **M — a refused death**: `EFAULT`, and the second `WNOHANG` wait is `ECHILD` — the child was
+      collected before the refusal landed;
+    * **N — a page the caller made read-only**: `EFAULT`, and the page still holds the seed
+      afterwards. The question the check asks is the *write* permission, not the mapping.
+
+    **Nothing in the kernel changed**: this door's whole-word `buffer_ok` followed by one
+    `write_unaligned` *is* the atomic shape, and the measurement is what says so rather than the
+    reading of the code. What the item buys is the claim — every one of the fourteen shapes is a
+    claim in `t-wait4` now (the four a first draft of this entry left to the probe — A, C, D and I,
+    the control, the other two splits and the both-refused shape — included), so a later "just copy
+    four bytes" cannot land quietly.
+
+    Pins: **33 new claims** in `t-wait4` (84 in the file, was 51), all green on a current host
+    first (`MPOS_ON_HOST=1`; none needs a privilege). The two-page fixture is built inside the test
+    with `mmap` + `mprotect` rather than read out of a `/proc` the host and the guest spell
+    differently, and the pointer is handed to the syscall directly — a `&mut i32` cannot name a word
+    that starts two bytes before a page end.
+
+    Gate: x86_64 `pass=183 fail=0 (183 built)`, aarch64 `pass=182 fail=0`, `mpos-kunit 32 passed, 0
+    failed` on both machines, exit 0; both machines' `t-wait4` `ok:` lines byte-identical (84 and
+    84, `diff` empty), and equal to this host's own run but for the one named divergence line item
+    34 recorded about `ru_maxrss` and the fault/switch counters.
+
+    Counterfactual — the word written byte by byte, each byte passing its own `buffer_ok`, which is
+    the range-copy shape `struct rusage` has: stage one is untouched (nothing here is host-compiled
+    and no unit test asks this question), and the sweep is `pass=182 fail=1 (183 built)` with
+    `FAIL t-wait4 exit=1` and **four** claims red by name — "and not one byte of it was written",
+    "and that one reachable byte was not written either", "and all three reachable bytes were left
+    alone" and "both pointers refused is EFAULT and touches neither". The `EFAULT` claim beside each
+    of them stays green, because a range copy that wrote its head still refuses; that asymmetry is
+    the item in one sentence: an error code alone cannot tell "refused before writing" from "refused
+    after writing what it could reach". Only the bytes can.
