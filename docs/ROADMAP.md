@@ -470,11 +470,32 @@ survives on the task (and on the retired record, for the wildcard wait), and `sc
 in the one eligibility rule every scan asks, so the seven places that look for "my children" cannot  
 disagree. `fork`/`vfork` are `clone(SIGCHLD)` and unchanged, which is why every existing wait answers  
 as it did. The narrowing is `ECHILD` — not `WNOHANG`'s 0 and not a park — so the blocking shape is  
-pinned too. Two things stay named in `docs/uapi/` §5.2: the same byte is *delivered* as a signal to  
-the parent on Linux (measured, and this kernel still only ever delivers `SIGCHLD`), and `__WNOTHREAD`  
-is still accepted-and-ignored. The pin also caught a bug beside it: both doors read `options` as a  
+pinned too. One thing stays named in `docs/uapi/` §5.2 — `__WNOTHREAD` is still
+accepted-and-ignored — and the byte's *delivery* half, item 50's other end, **landed 2026-10-18**
+(`docs/uapi/` §5.1 item 59): a child's death now carries the signal its `clone` byte named rather
+than a constant `SIGCHLD`. The pin also caught a bug beside it: both doors read `options` as a  
 whole register, where Linux declares it an `int` — so a C caller's `__WCLONE` (bit 31, sign-extended)  
 was `EINVAL`, and the word is narrowed to 32 bits now.
+
+**A `clone` child's own exit signal is what its death reports** (`docs/uapi/` §5.1 item 59, landed  
+2026-10-18): item 50 read `clone`'s low byte at the *waiting* end; this is the other end — Linux's  
+`do_notify_parent` sends the byte's own signal, so a `fork`'s child reports `SIGCHLD`, a  
+`clone(SIGTERM)` child reports a `SIGTERM` with the child's pid, real uid and exit code, and a  
+`clone(0)` child reports **nothing**, where this kernel raised `SIGCHLD` through every door. Measured  
+whole on a current host first (`.workbuddy/probe_exitsig.c`, Linux 7.2.11, one scenario per  
+disposition, the byte the only variable): the delivery predicate is not what either half of it  
+suggests — `SIG_IGN` **drops** a non-`SIGCHLD` byte even when blocked (the one place "a blocked  
+signal is never ignored" does not hold) while a blocked `SIGCHLD` is queued, and the set of exit  
+signals Linux ignores by default is exactly `sig_kernel_ignore` (`{SIGCHLD, SIGURG, SIGWINCH}`), so  
+a `clone(SIGURG)` death is dropped at `SIG_DFL` unblocked while a `clone(SIGTERM)` death at `SIG_DFL`  
+unblocked **kills** the parent — and `SIGCONT` is *not* in it, which only its own probe can show (a  
+`clone(SIGCONT)` child's death resumes a **stopped** parent; `probe_exitsig_cont.c`). Served by  
+`sched::notify_parent_of_death` (the rule and the measurement) beside `signal::ignored_by_default`;  
+pinned by the new program `t-clone-exit` (29 claims, green on a host first, byte-identical on both  
+machines). The wake in the death path is unconditional and stays so — a parent parked in  
+`wait4(__WCLONE)` for a `clone(0)` child is woken by nothing else. One residual stays named in  
+`docs/uapi/` §5.2: `/proc/<pid>/status`'s `exit_signal` line is still the constant it has always  
+been.
 
 **The `F_GETFL` word is the caller's own** (`docs/uapi/` §5.1 item 49, landed 2026-10-18): Linux  
 answers `filp->f_flags`, so a caller that compares the word against what it opened with agrees — its  

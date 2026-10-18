@@ -144,6 +144,70 @@ pub(crate) fn force_signal(task: &mut Task, sig: u8) {
     enqueue(task, sig, crate::sched::signal::SigInfo::kernel(sig));
 }
 
+/// Queue the signal a dying child was born to report to the parent it leaves
+/// behind - Linux's `do_notify_parent`, and the delivery half of `clone`'s low
+/// byte whose *kind* half is [`ChildKind`].
+///
+/// `sig` is the child's `exit_signal`, the byte its `clone` carried, which is
+/// **not** always `SIGCHLD`. Answers whether the record was queued; the caller
+/// wakes the parent regardless, because a `wait` parked for a child no signal
+/// will ever announce still has to be let go.
+///
+/// Whether the parent is told is the parent's own decision, and the rule is not
+/// what either half of it suggests. Measured one scenario per disposition on a
+/// host (`.workbuddy/probe_exitsig.c`), the child's byte the only variable:
+///
+///   * `0`: nothing, whatever the parent's mask - "no signal" is the request
+///     (C1: a `SIGCHLD`-blocked parent reads nothing, while `__WCLONE` still
+///     collects the corpse);
+///   * the byte is `SIGCHLD` (17): the pre-existing special case, unchanged -
+///     queued when the parent has a handler *or* has it **blocked**, never when
+///     it is `SIG_IGN` ("a blocked signal is never ignored" holds everywhere
+///     except here, where the ignore is asked first - K1);
+///   * any other signal: queued when the parent has a handler, **or** has it
+///     blocked, **or** its default action is not one Linux ignores. So a
+///     `SIG_IGN` parent that blocks it still gets the record (F1: a blocked,
+///     ignored `SIGTERM` is delivered where the `SIGCHLD` shape is dropped), a
+///     `SIG_DFL` parent gets it only while blocked (G1/H1: `clone(SIGURG)` is
+///     dropped unblocked and delivered blocked), and a `SIG_DFL`, unblocked
+///     parent is **killed** by a `clone(SIGTERM)` child's death (I1) - the
+///     reason the byte has to be delivered rather than folded into `SIGCHLD`.
+///     `SIGCONT` is one of these and not an ignored-by-default signal: a
+///     `clone(SIGCONT)` child's death is delivered, and on Linux it *resumes* a
+///     stopped parent (`.workbuddy/probe_exitsig_cont.c`). This path `enqueue`s
+///     the record as it does every other byte's; the state change that resume
+///     is - Linux's sender-side `signal_wake_up` - lives in the `kill` path and
+///     is not done for a death record, which is named rather than pretended.
+///
+/// The namespace-init protection ([`init_discards`]) applies here as it does to
+/// a `kill`, so a parent that is the init of its pid namespace is not ended by
+/// a child of its own. `discarded_when_generated` deliberately does **not**:
+/// that predicate drops every `SIG_IGN` signal, which would erase F1 above
+/// before the rule that wants it ran.
+pub(crate) fn notify_parent_of_death(
+    parent: &mut Task,
+    sig: u8,
+    info: crate::sched::signal::SigInfo,
+) -> bool {
+    if sig == 0 {
+        return false;
+    }
+    let action = parent.dispositions.get(sig);
+    let blocked = parent.blocked & crate::sched::signal::bit(sig) != 0;
+    let deliver = if action.is_ignore() {
+        // `SIG_IGN` asks first for `SIGCHLD` and last for everything else: only
+        // a blocked signal is "never ignored", and `SIGCHLD` is the one signal
+        // exempted from that (K1 against F1).
+        sig != crate::sched::signal::SIGCHLD && blocked
+    } else {
+        !action.is_default() || blocked || !crate::sched::signal::ignored_by_default(sig)
+    };
+    if !deliver || init_discards(parent, sig, false) {
+        return false;
+    }
+    enqueue(parent, sig, info)
+}
+
 /// Put a raised signal where its ABI says it belongs. A standard signal
 /// coalesces into `siginfo[sig]` — a second copy before the first is handled
 /// changes nothing, and a `sigqueue` of a standard signal is never refused

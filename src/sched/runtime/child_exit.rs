@@ -6,7 +6,7 @@ use super::child_mm::Mm;
 use super::child_mm::{
     child_alive_for, populate_user_page_at, resolve_anon_fault, resolve_cow_fault,
 };
-use super::child_signal::{current_credentials, force_signal, queue_signal};
+use super::child_signal::{current_credentials, force_signal, notify_parent_of_death};
 use super::load::{initial_stack_rsp, interpreter_bytes, load_user, write_arg_block};
 use super::task::{
     ChildKind, RETIRED, RETIRED_CAP, Retired, SpawnError, Stack, TIMER_SLOTS, Table, Task, Tracing,
@@ -341,78 +341,66 @@ pub fn exit(code: isize) -> ! {
         let parent = t.task(id).parent;
         if let Some(parent) = parent {
             t.sched.wake(parent);
-            // The real SIGCHLD, not just the wake. A parent sitting in
-            // `wait(2)` needs only the wake - the code it waits for is on
-            // file here - but a parent waiting any other way (a futex, a
-            // handler of its own, `sigtimedwait`) is ended by the signal, and
-            // without it such a caller sleeps for ever: musl's waitpid blocks
-            // on a futex and lets its SIGCHLD handler do the waking.
-            //
-            // Queued when a handler would run, *and* when the parent has
-            // SIGCHLD blocked - and never when the parent ignores it, whatever
-            // the mask says. All three measured on a current host with
-            // `.workbuddy/probe_signalfd_chld.c` (Linux 7.2.9), one scenario
-            // each, because the rule is not what either half alone suggests:
-            //
-            //   * `SIG_IGN`, blocked or not: **no record at all**, and the
-            //     child is reaped by the kernel (`waitpid(WNOHANG)` is
-            //     `ECHILD`). So the ignore is asked *first*; a blocked signal
-            //     is "never ignored" only where delivery is concerned, and this
-            //     is generation;
-            //   * `SIG_DFL` and *unblocked*: no record either (the child is a
-            //     zombie that `wait(2)` still collects);
-            //   * `SIG_DFL` and **blocked**: one record. That is what a
-            //     handler-less `sigtimedwait`/`sigwait`/`signalfd` on SIGCHLD
-            //     needs; without it such a waiter sleeps for ever.
+            // The signal the child was born to report, not just the wake. A
+            // parent sitting in `wait(2)` needs only the wake - the code it
+            // waits for is on file here - but a child's `clone` byte says
+            // *which* signal its death should carry, and Linux's
+            // `do_notify_parent` sends that one: a `fork`'s child reports
+            // `SIGCHLD`, a `clone(SIGTERM)` child reports `SIGTERM`, and a
+            // `clone(0)` child reports nothing at all. This kernel used to send
+            // `SIGCHLD` through every door whatever the byte said - the half
+            // `docs/uapi/` §5.2 named - so a `clone(0)` death raised a spurious
+            // `SIGCHLD` and a `clone(SIGTERM)` death announced the wrong
+            // signal. [`notify_parent_of_death`] now asks the parent's own
+            // disposition and mask; its doc carries the rule and the
+            // measurement (`.workbuddy/probe_exitsig.c`). The **wake** above is
+            // unconditional and stays so: a parent parked in `wait4(__WCLONE)`
+            // for a `clone(0)` child - which no signal will ever reach - is
+            // woken by nothing else.
             //
             // The auto-reap half stays named rather than done (`docs/uapi/`
-            // §5.2): this kernel keeps the zombie, so a parent that ignores
-            // SIGCHLD and never waits holds a slot where Linux holds none.
-            let sigchld_bit = signal::bit(signal::SIGCHLD);
-            let disposition = t.task(parent).dispositions.get(signal::SIGCHLD);
-            let wants_sigchld = !disposition.is_ignore()
-                && (disposition.is_handler() || t.task(parent).blocked & sigchld_bit != 0);
-            if wants_sigchld {
-                // The child as the record names it: the number it has *in its
-                // own namespace* - Linux's `task_tgid_vnr(tsk)`. A parent in
-                // the same namespace reads back the number `getpid` gave the
-                // child; a parent one level out reads the child's own number,
-                // which is Linux's wart for a child in a deeper namespace than
-                // its reader. The uid is the child's real one, the same field
-                // the retired record carries for `waitid`'s `si_uid`.
-                let (child_pid, child_uid) = {
-                    let child = t.task(id);
-                    (
-                        child
-                            .pid_ns
-                            .number_of(child.tgid.0)
-                            .unwrap_or(child.tgid.0 as u32) as i32,
-                        child.identity.ruid as i32,
-                    )
-                };
-                // The child's CPU time, in the `USER_HZ` ticks `si_utime`/
-                // `si_stime` carry. Linux's `do_notify_parent` fills them from
-                // `nsec_to_clock_t(tsk->utime + tsk->signal->utime)`, and the
-                // group's counters here are the same sum: `cpu_utime`/
-                // `cpu_stime` are group-wide, so a thread that already exited
-                // has been folded in and a single-threaded child's totals are
-                // its own. The `mm`'s `Arc` outlives `release_exited` above -
-                // only its frames are freed - and a task with `exited` set is
-                // never scheduled again, so no further tick is charged and the
-                // number read here is final. Measured with
-                // `.workbuddy/probe_sigchld_cputime.c` (Linux 7.2.9): ~100 ms of
-                // CPU is `si_utime` 9, a child that only exits is `0`/`0`, and
-                // the same pair comes back through a handler frame and a
-                // `signalfd` read.
-                let (utime, stime, _, _) = t.task(id).mm.cpu_all();
-                let utime = crate::abi::clock_ticks_to_user_hz(utime, crate::hal::TICK_HZ as u64);
-                let stime = crate::abi::clock_ticks_to_user_hz(stime, crate::hal::TICK_HZ as u64);
-                queue_signal(
-                    t.task_mut(parent),
-                    signal::SIGCHLD,
-                    signal::SigInfo::child(child_pid, child_uid, code, dumped, utime, stime),
-                );
-            }
+            // §5.2): this kernel keeps the zombie, so a parent that ignores its
+            // death signal and never waits holds a slot where Linux holds none.
+            //
+            // The child as the record names it: the number it has *in its own
+            // namespace* - Linux's `task_tgid_vnr(tsk)`. A parent in the same
+            // namespace reads back the number `getpid` gave the child; a parent
+            // one level out reads the child's own number, which is Linux's wart
+            // for a child in a deeper namespace than its reader. The uid is the
+            // child's real one, the same field the retired record carries for
+            // `waitid`'s `si_uid`.
+            let (child_pid, child_uid) = {
+                let child = t.task(id);
+                (
+                    child
+                        .pid_ns
+                        .number_of(child.tgid.0)
+                        .unwrap_or(child.tgid.0 as u32) as i32,
+                    child.identity.ruid as i32,
+                )
+            };
+            // The child's CPU time, in the `USER_HZ` ticks `si_utime`/
+            // `si_stime` carry. Linux's `do_notify_parent` fills them from
+            // `nsec_to_clock_t(tsk->utime + tsk->signal->utime)`, and the
+            // group's counters here are the same sum: `cpu_utime`/`cpu_stime`
+            // are group-wide, so a thread that already exited has been folded
+            // in and a single-threaded child's totals are its own. The `mm`'s
+            // `Arc` outlives `release_exited` above - only its frames are freed
+            // - and a task with `exited` set is never scheduled again, so no
+            // further tick is charged and the number read here is final.
+            // Measured with `.workbuddy/probe_sigchld_cputime.c` (Linux 7.2.9):
+            // ~100 ms of CPU is `si_utime` 9, a child that only exits is
+            // `0`/`0`, and the same pair comes back through a handler frame and
+            // a `signalfd` read.
+            let (utime, stime, _, _) = t.task(id).mm.cpu_all();
+            let utime = crate::abi::clock_ticks_to_user_hz(utime, crate::hal::TICK_HZ as u64);
+            let stime = crate::abi::clock_ticks_to_user_hz(stime, crate::hal::TICK_HZ as u64);
+            let sig = t.task(id).exit_signal;
+            notify_parent_of_death(
+                t.task_mut(parent),
+                sig,
+                signal::SigInfo::child(sig, child_pid, child_uid, code, dumped, utime, stime),
+            );
             // The console goes back to the parent's group as the child leaves
             // it: a shell waits, gets its prompt back, and reads again. A
             // job-controlled shell has already taken the terminal back with

@@ -2595,3 +2595,94 @@ the commit bodies), and each moved its pin in the same commit.
     machine; and a floor buffer admits three datagrams here against Linux's two, this
     kernel charging the payload where Linux charges each skb's truesize.
 
+## item 59 — a `clone` child's own exit signal is what its death reports (item 50's other half)
+
+    §5.2's entry, and the half item 50 named and did not build. `clone`'s low byte is the
+    signal a child's death should report; item 50 read it at the *waiting* end, this reads it
+    at the *dying* end, where Linux's `do_notify_parent` sends that signal verbatim: a `fork`'s
+    child reports `SIGCHLD`, a `clone(SIGTERM)` child reports a `SIGTERM`, and a `clone(0)`
+    child reports **nothing at all**. This kernel raised `SIGCHLD` through every door whatever
+    the byte said — the whole of what the entry left named — so a `clone(0)` death raised a
+    spurious `SIGCHLD` and a `clone(SIGTERM)` death announced the wrong signal.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_exitsig.c`, Linux 7.2.11, the
+    child's byte the only variable, each scenario in its own forked child and the parent's
+    queue seeded first):
+
+    * **A1–B1 — the byte is the signal**: a `clone(SIGTERM)` child's death is read by a blocked
+      `rt_sigtimedwait` as `si_signo` `SIGTERM` (15), a `clone(SIGUSR2)` child's as `SIGUSR2`
+      (12), each with `si_code` **`CLD_EXITED`** (1), the child's pid in `si_pid`, its real uid
+      in `si_uid` and its exit code in `si_status` (A2 confirms the uid is the parent's own);
+      beside it a plain `wait4` that is `ECHILD` and a `__WCLONE` that collects the corpse
+      (item 50's halves, unmoved);
+    * **C1 — `exit_signal == 0` delivers nothing**, whatever the mask: a `clone(0)` child with
+      the parent's `SIGCHLD` pinned leaves the queue empty, while `__WCLONE` still collects it;
+    * **E1, F1 — `SIG_IGN` asks first, and *blocking* brings the record back** for anything but
+      `SIGCHLD`: an unblocked, ignored `SIGTERM` death delivers nothing, a blocked one **is**
+      delivered — where K1's blocked, ignored `SIGCHLD` is still dropped, the one place "a
+      blocked signal is never ignored" does not hold;
+    * **G1, H1 — the `SIG_DFL` shape**: `clone(SIGURG)` delivers nothing unblocked and arrives
+      (as `SIGURG`, 23) once blocked;
+    * **I1 — the consequence that makes the byte have to be delivered**: a `SIG_DFL`, unblocked
+      parent is **killed by the `SIGTERM`** its `clone(SIGTERM)` child's death sends;
+    * **J — the default-ignored set**: as the exit byte at `SIG_DFL` unblocked, `SIGURG` (23)
+      and `SIGWINCH` (28) are dropped while `SIGIO` (29), `SIGUSR1` (10) and `SIGHUP` (1) are
+      delivered — so the set is `{SIGCHLD, SIGURG, SIGWINCH}`. **J cannot see `SIGCONT`**, whose
+      own default is *resume* rather than a fatal no-op: a second probe
+      (`.workbuddy/probe_exitsig_cont.c`, same kernel) stops the helper with `SIGSTOP` and asks
+      whether the child's death resumes it — it does, so `SIGCONT` is **delivered** and is *not*
+      in the set, whatever the J row's "helper survived" reads like.
+
+    **The fix is a predicate, one constant and a widened record.** `sched::signal` gains
+    `SIGURG` (23), `default_action`'s `Ignore` arm takes it beside `SIGCHLD`/`SIGWINCH` (Linux's
+    `sig_kernel_ignore`), and `ignored_by_default` is exactly that arm — the three signals, not
+    `SIGCONT`, whose default is a *state change* and which the second probe shows delivered.
+    `SigInfo::child` takes the signal as its first argument, because the record's `si_signo` is
+    the death's signal and not a constant `SIGCHLD`. `sched::notify_parent_of_death` asks the
+    parent's disposition and mask — `0` never; `SIGCHLD` when `!SIG_IGN && (handler || blocked)`;
+    any other signal when `SIG_IGN ⇒ blocked`, else `!default || blocked ||
+    !ignored_by_default` — and `child_exit.rs` calls it with `t.task(id).exit_signal`. It uses
+    the private `enqueue` rather than `queue_signal`, because `discarded_when_generated` would
+    drop an ignored signal *before* F1's blocked-ignored rule could keep it; the namespace-init
+    guard still applies. `hal::SignalInfo::chld_union` already keys on `si_code ∈ 1..=6`, so a
+    non-`SIGCHLD` death record renders its fields with no further change.
+
+    Pin: **`t-clone-exit`**, a new program, **29 claims** — the record's four fields for a
+    `clone(SIGTERM)`; the plain-`wait4` `ECHILD` and the `__WCLONE` collection beside it;
+    `clone(0)`'s silence under a blocked `SIGCHLD`; the `clone(SIGCHLD)` control; the `SIG_IGN`
+    pair (unblocked dropped, blocked delivered — F1); the `SIGURG` pair (default dropped,
+    blocked delivered as `SIGURG`, not `SIGCHLD`); the `SIGCONT` blocked claim (delivered, not
+    an ignored-by-default signal); the `SIGCHLD` blocked-ignore control (K1); and a must-die
+    helper that does not catch the `SIGTERM` a `clone(SIGTERM)` child's death sends a `SIG_DFL`,
+    unblocked parent. Every claim is Linux's answer, so `MPOS_ON_HOST=1` is the measurement:
+    29 of 29 on this host first, and the sweep is the pin. Plus the host unit test
+    `only_the_three_sig_kernel_ignore_signals_are_ignored_by_default`, which walks the set.
+
+    Gate: x86_64 `pass=186 fail=0 (186 built)`, `mpos-kunit 32 passed, 0 failed`, exit 0 (186
+    staged, 11 left out by `tests.toml`); the second machine's arm is `pass=185 fail=0`,
+    `mpos-kunit 32 passed, 0 failed`, exit 0 (185 staged, 12 left out); and the program's 29
+    `ok:` lines are byte-identical across the two machines (diffed, carriage returns aside).
+
+    Counterfactual, and it is sweep-only because the change is one byte at the call site: with
+    the old kernel's byte put back (`let sig = signal::SIGCHLD;`, every pin kept) stage 1 is
+    untouched - `571 passed; 0 failed` - and the sweep is `pass=185 fail=1 (186 built)` with
+    `FAIL t-clone-exit` and **ten** red claims by name: `its death delivers a SIGTERM, not a
+    SIGCHLD`, `with CLD_EXITED in si_code`, `the child's exit code in si_status`, `the child's
+    pid in si_pid`, `the child's real uid in si_uid`, `clone(0) delivers nothing at all, even
+    with SIGCHLD blocked`, `a blocked, ignored SIGTERM death **is** delivered`, `blocked, the
+    death arrives as SIGURG - its own number, not SIGCHLD`, `SIGCONT is not ignored by default:
+    blocked, the death arrives`, and `a SIG_DFL, unblocked parent is killed by its
+    clone(SIGTERM) child's death`. The controls pass on both kernels, which is what keeps the
+    reds on the delivery rather than on the wait: `a plain wait4 still does not see a clone
+    child (ECHILD)`, `__WCLONE still collects it`, `clone(SIGCHLD) blocked still delivers
+    SIGCHLD`, and `an ignored SIGCHLD death is dropped even when blocked`. The first five reds
+    are one wait that timed out (only `SIGCHLD` was ever queued, so the `SIGTERM` read is
+    `EAGAIN` and the five field claims read the zeroed record); the last five are the
+    dispositions the old constant got wrong.
+
+    Still named, and measured: `/proc/<pid>/status`'s `exit_signal` line renders the constant
+    `17` rather than the task's byte (a rendering nothing pins), `__WNOTHREAD` stays
+    accepted-and-ignored (item 50's own), and the *state change* a death `SIGCONT` carries —
+    Linux's sender-side resume of a stopped parent, measured — is the `kill` path's alone and
+    is not performed for a death record.
+

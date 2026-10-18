@@ -238,12 +238,24 @@ Section numbers are unchanged from the original `UAPI.md`.
     is right;
   * **`__WALL` wins over `__WCLONE`** when both bits are set (a `SIGCHLD` child is
     reported by `__WALL|__WCLONE`, where `__WCLONE` alone is `ECHILD`);
-  * **the delivery half is still missing, and now measured rather than assumed**:
-    Linux uses the same byte to notify the parent, so a `clone(SIGTERM)` child's
-    death puts a `SIGTERM` with `si_code` 2 and the child's pid in the parent's
-    queue (scenario C2). This kernel delivers nothing on any death but
-    `SIGCHLD`, which is the *other* end of the same field and is named rather than
-    implemented — nothing in this system clones with a non-`SIGCHLD` signal.
+  * **the delivery half landed 2026-10-18, and the whole rule was measured rather
+    than assumed** (`docs/uapi/` §5.1 item 59): Linux uses the same byte to notify
+    the parent, so a `clone(SIGTERM)` child's death puts a `SIGTERM` —
+    **not** a `SIGCHLD` — with `si_code` `CLD_EXITED` (1), the child's pid and real
+    uid and the exit code in the parent's queue. Measured one scenario per
+    disposition on a current host first (`.workbuddy/probe_exitsig.c`, Linux
+    7.2.11): a `clone(0)` child delivers **nothing** whatever the mask; the byte
+    is the signal, not a flag; and the predicate has two named halves — `SIG_IGN`
+    **drops** a non-`SIGCHLD` byte even when blocked, the one place "a blocked
+    signal is never ignored" does not hold (F1 against K1), and the set of exit
+    signals Linux ignores by default is exactly `sig_kernel_ignore`
+    (`{SIGCHLD, SIGURG, SIGWINCH}`), so a `clone(SIGURG)` death is dropped at
+    `SIG_DFL` unblocked while a `clone(SIGTERM)` death at `SIG_DFL` unblocked
+    **kills** the parent. `SIGCONT` is *not* in that set, which a second probe
+    settles the only way it can be seen — its default is *resume*, so a
+    `clone(SIGCONT)` child's death resumes a **stopped** parent
+    (`.workbuddy/probe_exitsig_cont.c`), and the record is delivered. Served by
+    `sched::notify_parent_of_death`, pinned by `t-clone-exit`.
     `__WNOTHREAD` also stays accepted-and-ignored (there is no second scan for it
     to exclude a sibling group from), and `/proc/<pid>/status`'s `exit_signal`
     line is still the constant it has always been, which is a rendering nothing
@@ -255,7 +267,11 @@ Section numbers are unchanged from the original `UAPI.md`.
   `wait_child_kind` — one decoder for both doors. Pins: `t-wait4` (11 claims,
   51 in the file) and `t-waitid` (5, 68 in the file), every one of them green on
   a current host before it was green here (61 of the 68 are reachable there; the
-  rest move a child's ids, which needs a privilege). `docs/notes/` §15.68.
+  rest move a child's ids, which needs a privilege). `docs/notes/` §15.68. The
+  delivery half is `src/sched/runtime/child_signal.rs`'s `notify_parent_of_death`
+  (the rule and its measurement), called from `child_exit.rs` with
+  `signal::SigInfo::child`, `sched::signal::ignored_by_default` beside
+  `default_action`, and the pin `t-clone-exit` (29 claims); `docs/notes/` §15.78.
 
 - **`signalfd(2)` and `SIGCHLD`: the three divergences are served, and what the
   record still leaves.** **Landed 2026-10-17** (`docs/uapi/` §5.1 item 29), after

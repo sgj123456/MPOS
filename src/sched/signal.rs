@@ -71,9 +71,18 @@ pub const SIGSTOP: u8 = 19;
 pub const SIGTSTP: u8 = 20;
 pub const SIGTTIN: u8 = 21;
 pub const SIGTTOU: u8 = 22;
+/// Urgent data on a socket, or an asynchronous I/O event. Nothing happens by
+/// default - Linux's `sig_kernel_ignore` names it beside `SIGCHLD` and
+/// `SIGWINCH` - and that default is the reason it is here at all: a
+/// `clone` child may be born to report it, and the death-notify rule asks
+/// whether a `SIG_DFL` disposition would ignore it ([`ignored_by_default`]).
+/// Measured on a host (`.workbuddy/probe_exitsig.c`): a `clone(SIGURG)` child's
+/// death is dropped at `SIG_DFL` unblocked and delivered while blocked.
+pub const SIGURG: u8 = 23;
 /// The terminal's window changed size. Nothing happens by default - a program
 /// that cares catches it and redraws, and one that does not carries on - which
-/// is why it joins `SIGCHLD` as the table's other "do nothing".
+/// is why it is one of the table's three "do nothing" rows, beside `SIGCHLD`
+/// and `SIGURG`.
 pub const SIGWINCH: u8 = 28;
 
 /// How many signal numbers a process can hold a disposition for: the zero slot
@@ -309,20 +318,27 @@ pub enum DefaultAction {
 ///
 /// ```
 /// use mpos::sched::signal::{
-///     DefaultAction, SIGCHLD, SIGCONT, SIGINT, SIGSTOP, SIGWINCH, default_action,
+///     DefaultAction, SIGCHLD, SIGCONT, SIGINT, SIGSTOP, SIGURG, SIGWINCH, default_action,
 /// };
 ///
 /// assert_eq!(default_action(SIGINT), DefaultAction::Terminate);
 /// assert_eq!(default_action(SIGSTOP), DefaultAction::Stop);
 /// assert_eq!(default_action(SIGCONT), DefaultAction::Continue);
-/// // The table's two "do nothing": a wait(2) needs no signal to be woken,
-/// // and a resized window is nobody's business unless they catch it.
+/// // The table's "do nothing" rows: a wait(2) needs no signal to be woken, and
+/// // a resized window or a socket's urgent data are nobody's business unless
+/// // they catch it.
 /// assert_eq!(default_action(SIGCHLD), DefaultAction::Ignore);
+/// assert_eq!(default_action(SIGURG), DefaultAction::Ignore);
 /// assert_eq!(default_action(SIGWINCH), DefaultAction::Ignore);
 /// ```
 pub fn default_action(sig: u8) -> DefaultAction {
     match sig {
-        SIGCHLD | SIGWINCH => DefaultAction::Ignore,
+        // Linux's `sig_kernel_ignore`: the signals whose default action is to
+        // do nothing. `SIGCONT`'s default is a *state change* - it resumes a
+        // stopped task - and so is a row of its own below. `SIGURG` is here
+        // because `ignored_by_default` must answer it, not because this kernel
+        // raises it anywhere.
+        SIGCHLD | SIGURG | SIGWINCH => DefaultAction::Ignore,
         SIGCONT => DefaultAction::Continue,
         SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => DefaultAction::Stop,
         _ => DefaultAction::Terminate,
@@ -332,6 +348,35 @@ pub fn default_action(sig: u8) -> DefaultAction {
 /// Whether `sig`'s default action is to stop the task.
 pub fn stops_by_default(sig: u8) -> bool {
     default_action(sig) == DefaultAction::Stop
+}
+
+/// Whether a signal with **no handler** and **nothing blocking it** would be
+/// discarded rather than acted on: Linux's `sig_kernel_ignore`.
+///
+/// The set is `{SIGCHLD, SIGURG, SIGWINCH}` - the [`DefaultAction::Ignore`]
+/// rows of the table above - and one caller turns on every member of it: the
+/// signal a dying `clone` child reports to its parent names `SIG_DFL` here to
+/// mean "do not bother my parent with this" ([`SigInfo::child`]'s delivery rule
+/// lives in `sched::runtime::child_signal::notify_parent_of_death`).
+///
+/// Measured one exit signal at a time on a host, `SIG_DFL` and unblocked:
+/// `SIGURG` and `SIGWINCH` deliver nothing (`.workbuddy/probe_exitsig.c`, G1
+/// and J), while `SIGTERM` and `SIGUSR1` kill and **`SIGCONT` resumes a stopped
+/// parent** (`.workbuddy/probe_exitsig_cont.c` - the one J cannot see, because a
+/// delivered `SIGCONT` has no fatal default and its helper survives either
+/// way). So `SIGCONT` is *not* in the set, whatever its "resume" disposition
+/// might suggest, and the predicate is not "the action is `Ignore` *or*
+/// `Continue`".
+///
+/// ```
+/// use mpos::sched::signal::{SIGCONT, SIGTERM, SIGWINCH, ignored_by_default};
+///
+/// assert!(ignored_by_default(SIGWINCH)); // a DefaultAction::Ignore row
+/// assert!(!ignored_by_default(SIGCONT)); // resumes a stopped task, not a no-op
+/// assert!(!ignored_by_default(SIGTERM)); // terminates at SIG_DFL
+/// ```
+pub fn ignored_by_default(sig: u8) -> bool {
+    default_action(sig) == DefaultAction::Ignore
 }
 
 /// The alternate stack `sigaltstack` installs, if any.
@@ -468,7 +513,13 @@ impl SigInfo {
         }
     }
 
-    /// The record a **child's death** carries to its parent as `SIGCHLD`.
+    /// The record a **child's death** carries to its parent.
+    ///
+    /// `sig` is not always `SIGCHLD`: it is the child's own `exit_signal`, the
+    /// low byte its `clone` carried, which Linux's `do_notify_parent` sends
+    /// verbatim (`SIGTERM` for a `clone(SIGTERM)` child, `SIGCHLD` for a
+    /// `fork`'s). The byte `0` never reaches here - a child born to report
+    /// nothing delivers nothing - so this is always a real number.
     ///
     /// `code` is the kernel's own record of the death - the exit code, or the
     /// negated signal number - and the `(si_code, si_status)` pair it becomes
@@ -501,10 +552,18 @@ impl SigInfo {
     /// `0`/`0`, the same pair through a handler's `siginfo_t` and a `signalfd`
     /// read - and `waitid` does **not** carry them, its record having no such
     /// field (the probe reads zero through every `waitid` door).
-    pub fn child(pid: i32, uid: i32, code: isize, dumped: bool, utime: u64, stime: u64) -> SigInfo {
+    pub fn child(
+        sig: u8,
+        pid: i32,
+        uid: i32,
+        code: isize,
+        dumped: bool,
+        utime: u64,
+        stime: u64,
+    ) -> SigInfo {
         let (code, status) = crate::abi::exit_chld(code, dumped);
         SigInfo {
-            signo: SIGCHLD as i32,
+            signo: sig as i32,
             errno: 0,
             code,
             pid,
@@ -727,6 +786,7 @@ mod tests {
         assert_eq!(SIGCONT, 18);
         assert_eq!(SIGSTOP, 19);
         assert_eq!(SIGTSTP, 20);
+        assert_eq!(SIGURG, 23);
         assert_eq!(SIGWINCH, 28);
     }
 
@@ -743,6 +803,9 @@ mod tests {
         // A resize must not kill the program being resized, so this is the
         // other number whose default action is to do nothing.
         assert_eq!(default_action(SIGWINCH), DefaultAction::Ignore);
+        // And urgent data on a socket is nobody's business either - the third
+        // `sig_kernel_ignore` row, which `ignored_by_default` needs.
+        assert_eq!(default_action(SIGURG), DefaultAction::Ignore);
         assert_eq!(default_action(SIGCONT), DefaultAction::Continue);
         // The console's handover signals kill a session that did not install a
         // handler, and that is the point: `VT_SETMODE(VT_PROCESS)` is a
@@ -755,6 +818,23 @@ mod tests {
             assert!(stops_by_default(sig));
         }
         assert!(!stops_by_default(SIGINT));
+    }
+
+    /// The set the death-notify rule reads: a `clone` child's exit signal whose
+    /// default a parent would ignore is dropped at `SIG_DFL` and delivered once
+    /// blocked. Linux's `sig_kernel_ignore` is `SIGCHLD`, `SIGURG` and
+    /// `SIGWINCH` - measured one helper per signal on a host
+    /// (`.workbuddy/probe_exitsig.c` J) - and `SIGCONT` is deliberately not one
+    /// of them: a `clone(SIGCONT)` child's death *resumes* a stopped parent on
+    /// Linux (`.workbuddy/probe_exitsig_cont.c`), so it is delivered.
+    #[test]
+    fn only_the_three_sig_kernel_ignore_signals_are_ignored_by_default() {
+        for sig in [SIGCHLD, SIGURG, SIGWINCH] {
+            assert!(ignored_by_default(sig), "signal {sig} is not ignored");
+        }
+        for sig in [SIGCONT, SIGUSR1, SIGHUP, SIGTERM, SIGINT] {
+            assert!(!ignored_by_default(sig), "signal {sig} is ignored");
+        }
     }
 
     /// `SIGKILL` and `SIGSTOP` are the two the kernel keeps for itself: a
