@@ -291,6 +291,26 @@ fn main() {
     r.check("a shared mapping is made", shared.is_ok());
     let shared = shared.map(|p| p as usize).unwrap_or(0);
 
+    // --- a mapping nobody may touch ---
+    //
+    // `PROT_NONE` is what a reservation and a guard page are, and Linux prints
+    // `---p` for it (measured, `.workbuddy/probe_maps_prot.c`: a two-page
+    // reservation, and a `PROT_NONE`/`rw-p`/`PROT_NONE` span). This kernel's VMA
+    // keeps its "the range is present" fact in the same `READ` bit a grant would
+    // use, so the column has to be the *grant*: read off the internal bit, this
+    // mapping answered `r--p`, which a tool deciding whether it may read a range
+    // cannot tell from a readable one.
+    let guard = unsafe {
+        mmap_anonymous(
+            core::ptr::null_mut(),
+            2 * 4096,
+            ProtFlags::empty(),
+            MapFlags::PRIVATE,
+        )
+    };
+    r.check("a PROT_NONE reservation is made", guard.is_ok());
+    let guard = guard.map(|p| p as usize).unwrap_or(0);
+
     // --- a memfd mapping, which is what a `wl_shm` pool is ---
     let mapped = (|| -> Option<usize> {
         let mfd = memfd_create("t-maps-buf", MemfdFlags::empty()).ok()?;
@@ -352,6 +372,14 @@ fn main() {
                     );
                 }
                 None => r.check("the shared mapping is listed", false),
+            }
+
+            match line_at(&maps, guard) {
+                Some(line) => r.check(
+                    "a PROT_NONE reservation is reported with no permission at all",
+                    line.perms == b"---p",
+                ),
+                None => r.check("the PROT_NONE reservation is listed", false),
             }
 
             match line_at(&maps, mapped) {

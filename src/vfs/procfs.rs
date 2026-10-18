@@ -1189,6 +1189,30 @@ fn statm_line(pid: usize) -> Option<String> {
 /// whatever the address width.
 const MAPS_NAME_COLUMN: usize = 73;
 
+/// What a mapping's *caller* may do with it - the permission both files'
+/// permission column and `smaps`' `VmFlags` `rd`/`wr`/`ex` words are about.
+///
+/// A VMA's `READ` bit is "this range is present", not "the caller may read it":
+/// `mmap` and `mprotect` both record `READ` and add the `USER` bit only when the
+/// caller asked for a non-empty protection (`syscall::linux::proc`'s two
+/// conversions). `USER` is what makes a page reachable from ring 3 - it is the
+/// first thing `Vma::permits` asks, and every mapping the loader, the stack
+/// installer or an ordinary `mmap` makes sets it.
+///
+/// So the report is the grant, and the difference is one a reader acts on:
+/// printed from the internal bit, a `PROT_NONE` reservation read `r--p` where
+/// Linux prints `---p` (measured over a two-page reservation and a
+/// `PROT_NONE`/`rw-p`/`PROT_NONE` span, `.workbuddy/probe_maps_prot.c`), and a
+/// tool that decided it could read the range on that word would take the fault
+/// Linux's own answer tells it not to try.
+fn granted(prot: MapFlags) -> MapFlags {
+    if prot.contains(MapFlags::USER) {
+        prot & (MapFlags::READ | MapFlags::WRITE | MapFlags::EXEC)
+    } else {
+        MapFlags::empty()
+    }
+}
+
 /// One line of `/proc/<pid>/maps`, with every field already resolved.
 ///
 /// The fields are resolved *before* the formatting because the two halves
@@ -1199,7 +1223,8 @@ const MAPS_NAME_COLUMN: usize = 73;
 pub struct MapLine {
     pub start: usize,
     pub end: usize,
-    /// The permissions bits, as `mmap` left them.
+    /// The permissions *granted* to the caller, as [`granted`] resolves them,
+    /// which is what Linux's four permission characters name.
     pub prot: MapFlags,
     /// `MAP_SHARED`, which is the fourth permission character.
     pub shared: bool,
@@ -1342,7 +1367,7 @@ fn maps_of(pid: usize) -> Option<String> {
         lines.push(MapLine {
             start: vma.start,
             end: vma.end,
-            prot: vma.prot,
+            prot: granted(vma.prot),
             shared,
             offset,
             dev,
@@ -1354,7 +1379,7 @@ fn maps_of(pid: usize) -> Option<String> {
         lines.push(MapLine {
             start: range.start,
             end: range.end,
-            prot: range.prot,
+            prot: granted(range.prot),
             // Eagerly-filled ranges are a private copy or an image: `private`,
             // which is what Linux prints for both.
             shared: false,
@@ -3408,6 +3433,51 @@ mod tests {
             "the name column is reached with spaces: {:?}",
             &text[prefix..MAPS_NAME_COLUMN]
         );
+    }
+
+    /// The permission column is the *grant*, not the bit this kernel records
+    /// "the range is present" in: a mapping nobody may touch prints `---p`,
+    /// which is the line Linux prints for the same reservation (measured,
+    /// `.workbuddy/probe_maps_prot.c`: `7f9132fd1000-7f9132fd3000 ---p
+    /// 00000000 00:00 0`).
+    ///
+    /// The counterfactual is the shape this replaced: printed from the internal
+    /// `READ` bit, a `PROT_NONE` reservation read `r--p`, and a tool that
+    /// branches on that column would try to read a range whose every access
+    /// takes a fault - the divergence `t-maps` pins.
+    #[test]
+    fn a_permission_column_is_the_grant_and_not_the_present_bit() {
+        let user = MapFlags::USER;
+        assert_eq!(granted(user | MapFlags::READ), MapFlags::READ);
+        assert_eq!(
+            granted(user | MapFlags::READ | MapFlags::WRITE),
+            MapFlags::READ | MapFlags::WRITE
+        );
+        assert_eq!(
+            granted(user | MapFlags::READ | MapFlags::EXEC),
+            MapFlags::READ | MapFlags::EXEC
+        );
+        assert_eq!(
+            granted(MapFlags::READ),
+            MapFlags::empty(),
+            "PROT_NONE is present and grants nothing"
+        );
+        assert_eq!(
+            granted(MapFlags::READ | MapFlags::WRITE | MapFlags::COW),
+            MapFlags::empty(),
+            "the copy-on-write bit is not a permission either"
+        );
+        let text = format_maps(&[MapLine {
+            start: 0x7f91_32fd_1000,
+            end: 0x7f91_32fd_3000,
+            prot: granted(MapFlags::READ),
+            shared: false,
+            offset: 0,
+            dev: (0, 0),
+            inode: 0,
+            name: None,
+        }]);
+        assert_eq!(text, "7f9132fd1000-7f9132fd3000 ---p 00000000 00:00 0 \n");
     }
 
     /// An unnamed mapping is the prefix and the space a name would have
