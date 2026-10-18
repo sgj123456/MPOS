@@ -653,17 +653,25 @@ Section numbers are unchanged from the original `UAPI.md`.
   `a_directory_has_no_byte_reader`; item 47 carries the gates and the counterfactual.
 
 
-- **`rmdir` inside the device tree answers `EOPNOTSUPP`, where Linux's `devtmpfs` removes the
-  directory.** Measured in this kernel's own words on a booted machine (2026-10-18, the first
-  machine's GL card): `mpos: syscall 84 (path /dev/dri/by-path) -> EOPNOTSUPP`, which is udev doing
-  what it does to that directory at every boot — remove it, then publish the `by-path` links again —
-  while a current host serves the same call (measured as root on devtmpfs: `mkdir /dev/<name>` and
-  `rmdir /dev/<name>` both answer 0), which is why the host's own database entry carries a `by-path`
-  symlink beside the node (§7.4). The asymmetry is this tree's rather than the kind's: `devfs`'s
-  `create` *does* accept a directory (`DevDirNode`, `src/vfs/devfs.rs`), so `mkdir` there is served,
-  while its directory node inherits the trait's default `remove` — `Unsupported` — so the *second*
-  half of udev's idiom is refused, and a compositor or a by-path reader finds the directory only if
-  the kernel itself published it. Owner: `src/vfs/devfs.rs`'s `DevDirNode`, whose `remove` should
-  mirror the `create` beside it (the driver-owned *nodes* stay undestroyable, which is what that
-  create's `_ => Unsupported` arm is for). Not landed; the pin it wants is one `t-` claim —
-  `mkdir` a name under `/dev`, then `rmdir` it — beside the host column above.
+- **`rmdir` inside the device tree answered `EOPNOTSUPP`, where Linux's `devtmpfs` removes the
+  directory. Landed 2026-10-18** (`docs/uapi/` §5.1 item 48). Measured in this kernel's own words on
+  a booted machine (2026-10-18, the first machine's GL card): `mpos: syscall 84 (path
+  /dev/dri/by-path) -> EOPNOTSUPP`, which is udev doing what it does to that directory at every boot
+  — remove it, then publish the `by-path` links again — while a current host serves the same call
+  (measured as root on devtmpfs: `mkdir /dev/<name>` and `rmdir /dev/<name>` both answer 0), which is
+  why the host's own database entry carries a `by-path` symlink beside the node (§7.4). The
+  asymmetry was this tree's rather than the kind's, and it was wider than the one line that found
+  it: `devfs`'s `create` *did* accept a directory (`DevDirNode`, `src/vfs/devfs.rs`), so `mkdir`
+  there was served, while neither node had an `rmdir` at all **and** each `unlink` was a plain map
+  removal that took a directory as readily as a node — so the two doors were not a split, and the
+  trait's default `Unsupported` answered the call udev makes. Both nodes own the door now
+  (`check_empty_dir` asks the kind and then the emptiness, *before* the name goes, which is what
+  makes a refused `rmdir` leave the directory where it was), `unlink` gained the `EISDIR` it lacked,
+  and the mount-point half needed nothing: `may_remove` already refused it with `EBUSY` (§5.1 item
+  45). Pin: `t-devtmpfs`'s removal section, **14 claims** (44 in the file, was 30) beside two host
+  unit tests over the same table; item 48 carries the measured host table, the gates and the
+  counterfactual, and the boot that logged this line is quiet now — `/dev/dri/by-path` published, and
+  no `mpos: syscall` line in the whole console. One shape stays named: a regular file and a symlink
+  under `/dev` are removable through `unlink`, as on Linux, but a driver's own *node* cannot be
+  re-made through `mknod` here — the device tree's names come from the drivers, which is a property
+  of the tree rather than of the removal doors.

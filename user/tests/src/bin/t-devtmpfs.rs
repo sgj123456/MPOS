@@ -1,4 +1,5 @@
-//! t-devtmpfs - a node under `/dev` keeps the clocks it is given.
+//! t-devtmpfs - what the device tree serves: a node under `/dev` keeps the
+//! clocks it is given, and a directory made under `/dev` comes back out.
 //!
 //! `utimensat`'s path-taking shapes all end in one place on the node:
 //! `Inode::set_times`. A filesystem that does not implement it answers the
@@ -39,9 +40,25 @@
 //! this test uses would stamp the target and not the link - the host suite's
 //! `path_named_nodes_keep_the_clocks_they_are_given` pins `DevSymlinkNode`
 //! directly instead.
+//!
+//! The filesystem's other half is its *removal* pair, and the same program
+//! claims it because the claims are about this filesystem rather than about a
+//! syscall: `mkdir` of a name under `/dev` and `rmdir` of it back are the two
+//! calls udev runs over `/dev/dri/by-path` at every boot, and the second half
+//! answered `EOPNOTSUPP` here (`mpos: syscall 84 (path /dev/dri/by-path) ->
+//! EOPNOTSUPP` on the wire) until the door existed - which left that directory
+//! reachable only if the kernel itself had published it. The words the section
+//! below claims are a host's, measured as root on a machine whose `/dev` *is* a
+//! devtmpfs (`.workbuddy/probe_devfs_doors.c`, Linux 7.2.9): `mkdir` and
+//! `rmdir` of one name both answer 0, a directory that still holds something is
+//! `ENOTEMPTY`, a device node is `ENOTDIR` from this door and served by the
+//! other, and `unlink` of a directory is `EISDIR`.
 
 use mpos_user_tests::Report;
-use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_OMIT, stat, utimensat};
+use rustix::fs::{
+    AtFlags, CWD, Mode, Timespec, Timestamps, UTIME_OMIT, mkdirat, stat, unlinkat, utimensat,
+};
+use rustix::io::Errno;
 
 /// The clock the test sets. Far from any boot time, so a node that answered
 /// "now" - or the epoch - cannot pass as this value.
@@ -60,6 +77,23 @@ const MTIME: i64 = 1_600_000_007;
 /// is pinned - so the first that `stat`s is the one claimed, and its name is
 /// printed with the result.
 const BLOCK_NODES: [&str; 4] = ["/dev/sda", "/dev/vda2", "/dev/vda1", "/dev/vda"];
+
+/// The names the removal section makes for itself, and one nothing ever makes.
+///
+/// Under `/dev` rather than under `/tmp`, which is where the rest of the suite
+/// keeps its scratch: what these claims are about is the *filesystem* - a tmpfs
+/// has no `create` for a `rmdir` to be the other half of, and no device nodes
+/// to be `ENOTDIR` about.
+const DIR: &str = "/dev/t-devtmpfs_d";
+const INNER: &str = "/dev/t-devtmpfs_d/inner";
+/// The same test's directory inside one a display driver published - the nested
+/// door udev's by-path pass lands on.
+const NESTED: &str = "/dev/dri/t-devtmpfs_d";
+/// A name nothing has made.
+const GONE: &str = "/dev/t-devtmpfs_gone";
+/// One user, no permission bits to exercise: the mode is a formality here, as
+/// it is in `t-mkdirat`.
+const DIR_MODE: Mode = Mode::from_bits_truncate(0o755);
 
 /// Both clocks, as a caller that means them both sends them.
 fn both(atime: i64, mtime: i64) -> Timestamps {
@@ -136,6 +170,95 @@ fn claim(r: &mut Report, path: &str) {
     }
 }
 
+/// The two removal doors, on names this test makes and removes itself.
+///
+/// The pair is one idiom - `mkdir` a name under `/dev`, then `rmdir` it back -
+/// and it is what udev's by-path pass runs at every boot. `rmdir` answered
+/// `EOPNOTSUPP` here until the filesystem's directory node gained the door, and
+/// so did a `cat` on a directory's earlier gap; the words around it are a
+/// host's, measured as root on a machine whose `/dev` *is* a devtmpfs
+/// (`.workbuddy/probe_devfs_doors.c`, Linux 7.2.9).
+fn removal(r: &mut Report) {
+    // A first-run claim should be about the call rather than about the last
+    // run's leftovers, and this program may be run twice on one machine.
+    let _ = unlinkat(CWD, DIR, AtFlags::REMOVEDIR);
+
+    let made = mkdirat(CWD, DIR, DIR_MODE);
+    r.check(
+        &format!("mkdir of a name under /dev is served ({made:?})"),
+        made.is_ok(),
+    );
+    r.check(
+        "mkdir of the same name again is EEXIST",
+        mkdirat(CWD, DIR, DIR_MODE) == Err(Errno::EXIST),
+    );
+
+    // The door that is *not* for directories refuses the kind, and the refusal
+    // takes nothing away - which is what makes the two doors a split rather
+    // than two spellings of one removal.
+    r.check(
+        "unlink of a directory is EISDIR",
+        unlinkat(CWD, DIR, AtFlags::empty()) == Err(Errno::ISDIR),
+    );
+    r.check("... and the refused name is still there", stat(DIR).is_ok());
+
+    // A directory that still holds something: ENOTEMPTY, and again nothing
+    // moves - which is the whole reason `rmdir` is not a recursive delete.
+    r.check(
+        "mkdir of a child inside it is served",
+        mkdirat(CWD, INNER, DIR_MODE).is_ok(),
+    );
+    r.check(
+        "rmdir of a directory that still holds something is ENOTEMPTY",
+        unlinkat(CWD, DIR, AtFlags::REMOVEDIR) == Err(Errno::NOTEMPTY),
+    );
+    r.check(
+        "... and that refusal left it where it was",
+        stat(DIR).is_ok(),
+    );
+
+    // The idiom's second half, from the inside out.
+    r.check(
+        "rmdir of the empty child is served",
+        unlinkat(CWD, INNER, AtFlags::REMOVEDIR).is_ok(),
+    );
+    r.check(
+        "and then rmdir of the directory itself is served",
+        unlinkat(CWD, DIR, AtFlags::REMOVEDIR).is_ok(),
+    );
+    r.check("so the name it removed is gone", stat(DIR).is_err());
+
+    // The kinds that are not directories, and a name nothing ever made.
+    r.check(
+        "rmdir of a device node is ENOTDIR",
+        unlinkat(CWD, "/dev/null", AtFlags::REMOVEDIR) == Err(Errno::NOTDIR),
+    );
+    r.check(
+        "rmdir of a name nothing made is ENOENT",
+        unlinkat(CWD, GONE, AtFlags::REMOVEDIR) == Err(Errno::NOENT),
+    );
+
+    // The nested door, which is where the pass that found this actually lands:
+    // `/dev/dri` is a directory the kernel published, and udev removes
+    // `by-path` inside it. Present only where a display driver registered, so
+    // its absence is noted rather than failed - the root's own door above is
+    // `DevRoot`'s, and this one is `DevDirNode`'s.
+    if stat("/dev/dri").is_ok() {
+        let made = mkdirat(CWD, NESTED, DIR_MODE);
+        r.check(
+            &format!("mkdir inside a directory the kernel published ({made:?})"),
+            made.is_ok(),
+        );
+        let taken = unlinkat(CWD, NESTED, AtFlags::REMOVEDIR);
+        r.check(
+            &format!("and rmdir of it, the pass udev runs ({taken:?})"),
+            taken.is_ok(),
+        );
+    } else {
+        println!("  (no /dev/dri on this machine, so the nested door is not claimed)");
+    }
+}
+
 fn main() {
     println!("t-devtmpfs");
     let mut r = Report::new();
@@ -173,6 +296,10 @@ fn main() {
         Ok(_) => claim(&mut r, "/dev/dri"),
         Err(_) => println!("  (no /dev/dri on this machine)"),
     }
+
+    // The filesystem's other half: the two removal doors, on names this test
+    // makes and removes itself.
+    removal(&mut r);
 
     r.finish()
 }

@@ -357,6 +357,18 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are TCP's record-only buffer sizes  
 (`SO_SNDBUF`/`SO_RCVBUF`); the two namespace kinds with no entry at all are IPC and cgroup.
 
+**The device tree removes a directory it made** (`docs/uapi/` §5.1 item 48, landed 2026-10-18): the  
+`mpos: syscall 84 (path /dev/dri/by-path) -> EOPNOTSUPP` a boot printed once per boot was udev's  
+per-boot idiom — remove that directory, then publish the `by-path` links under it again — meeting a  
+filesystem that had no `rmdir` at all and an `unlink` that took a directory as readily as a device  
+node, so the two doors were not a split. Both nodes own the door now, with Linux's order in front of  
+the name going (`ENOTDIR` for a kind that is not a directory, `ENOTEMPTY` for one that still holds  
+something), a refused `rmdir` therefore takes nothing away, `unlink` answers `EISDIR` where it used to  
+remove, and the mount point's `EBUSY` was already the mount layer's (item 45). The boot that logged  
+the line is quiet now and its `by-path` links are published. One shape stays named in `docs/uapi/`  
+§5.2: a driver's own node cannot be re-made through `mknod` here — the device tree's names come from  
+the drivers.
+
 **A directory is not a byte stream** (`docs/uapi/` §5.1 item 47, landed 2026-10-18): its four read  
 doors answer `EISDIR` — the *kind* before the *count*, so even a zero-length read of one is refused  
 where the same count on a file is `0` — where this kernel answered `EOPNOTSUPP`, and `sendfile`'s  

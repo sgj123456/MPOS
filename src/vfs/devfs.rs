@@ -398,6 +398,27 @@ fn window_for(offset: u64, len: u64, end: u64) -> (u64, u64) {
     (first, (wanted.min(end) - first).max(SECTOR))
 }
 
+/// The two questions an `rmdir` asks about a name before the name is taken
+/// away: that it is a directory, and that nothing is under it.
+///
+/// One function for the two directories an `rmdir` can name - `/dev` itself and
+/// a directory under it - because the answers are the same at either level,
+/// and they are Linux's: measured on a host whose `/dev` is a devtmpfs
+/// (`.workbuddy/probe_devfs_doors.c`), a populated directory is `ENOTEMPTY`
+/// (39) whether it is the root's child or a child's, and a device node, a
+/// regular file, and a symlink are all `ENOTDIR` (20), since `rmdir` does not
+/// follow the last name. Emptiness is asked *before* the name is dropped, which
+/// is what makes a refused `rmdir` leave the directory where it was.
+fn check_empty_dir(node: &Arc<dyn Inode>) -> VfsResult<()> {
+    if node.metadata().kind != NodeKind::Dir {
+        return Err(VfsError::NotDir);
+    }
+    if !node.read_dir()?.is_empty() {
+        return Err(VfsError::NotEmpty);
+    }
+    Ok(())
+}
+
 /// The one directory, holding every device by name.
 struct DevRoot {
     clocks: Clocks,
@@ -513,7 +534,44 @@ impl Inode for DevRoot {
     /// Drop the child called `name`. `rm -f` in mdev's link script needs this,
     /// and a name that was registered by a driver goes with it - the driver
     /// still owns the device, the name was just one way to reach it.
+    ///
+    /// A *directory* is refused, with Linux's word for it: `unlink` removes a
+    /// name whose contents are bytes, and a directory's contents are its
+    /// children, so this is the door [`Self::rmdir`] exists to be told no.
+    /// Measured on a host whose `/dev` *is* a devtmpfs
+    /// (`.workbuddy/probe_devfs_doors.c`): `unlink` of a device node, a regular
+    /// file or a symlink is served, and `unlink` of a directory - a mount point
+    /// among them - answers `EISDIR` (21).
     fn unlink(&self, name: &str) -> VfsResult<()> {
+        critical_section::with(|cs| {
+            let mut inodes = self.inodes.borrow(cs).borrow_mut();
+            match inodes.get(name).map(|node| node.metadata().kind) {
+                None => Err(VfsError::NoEntry),
+                Some(NodeKind::Dir) => Err(VfsError::IsDir),
+                Some(_) => {
+                    inodes.remove(name);
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    /// Remove the **empty** directory called `name`.
+    ///
+    /// The second half of the idiom udev runs over `/dev/dri/by-path` at every
+    /// boot - remove the directory, then publish the `by-path` links under it
+    /// again - and the half this filesystem refused, which is what a boot
+    /// printed once per boot: `mpos: syscall 84 (path /dev/dri/by-path) ->
+    /// EOPNOTSUPP`, leaving that directory reachable only if the kernel itself
+    /// had published it (`docs/uapi/` §5.2). `create` makes one and this takes
+    /// it back, and the questions between them are Linux's, measured on a host
+    /// whose `/dev` is a devtmpfs (`.workbuddy/probe_devfs_doors.c`): a name
+    /// that is not a directory is `ENOTDIR` (20) whatever it is instead, one
+    /// that still holds something is `ENOTEMPTY` (39), and a name nothing
+    /// answers to is `ENOENT` (2). Both questions are asked *before* the name
+    /// goes, so a refused `rmdir` leaves the directory where it was.
+    fn rmdir(&self, name: &str) -> VfsResult<()> {
+        check_empty_dir(&self.lookup(name)?)?;
         critical_section::with(|cs| {
             self.inodes
                 .borrow(cs)
@@ -731,7 +789,31 @@ impl Inode for DevDirNode {
         })
     }
 
+    /// Drop the child called `name`, with the same refusal its `create` above
+    /// is the other half of: a *directory* is `EISDIR` here, because a name
+    /// whose contents are children is removed by [`Self::rmdir`] and by nothing
+    /// else (`docs/uapi/` §5.2; `.workbuddy/probe_devfs_doors.c` measured the
+    /// word on a host).
     fn unlink(&self, name: &str) -> VfsResult<()> {
+        critical_section::with(|cs| {
+            let mut children = self.children.borrow(cs).borrow_mut();
+            match children.get(name).map(|node| node.metadata().kind) {
+                None => Err(VfsError::NoEntry),
+                Some(NodeKind::Dir) => Err(VfsError::IsDir),
+                Some(_) => {
+                    children.remove(name);
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    /// Remove the **empty** directory called `name` - this directory's own
+    /// `create`'s other half, and the door the boot's `/dev/dri/by-path` pass
+    /// needed. The measurement behind the words, and the same two questions
+    /// asked of the root's own children, are on `DevRoot`'s `rmdir` above.
+    fn rmdir(&self, name: &str) -> VfsResult<()> {
+        check_empty_dir(&self.lookup(name)?)?;
         critical_section::with(|cs| {
             self.children
                 .borrow(cs)
@@ -1157,6 +1239,86 @@ mod tests {
         fs.root().unlink("log").unwrap();
         assert_eq!(fs.root().lookup("log").err(), Some(VfsError::NoEntry));
         assert!(fs.root().create("log", NodeKind::Socket).is_ok());
+    }
+
+    #[test]
+    fn a_made_directory_is_removable_and_unlink_refuses_one() {
+        // The idiom a desktop runs at every boot: udev removes
+        // `/dev/dri/by-path` and then publishes the `by-path` links under it
+        // again. This filesystem served the `mkdir` and refused the `rmdir`
+        // (`EOPNOTSUPP` on the wire, once per boot), so the directory was
+        // reachable only if the kernel itself had published it - the gap
+        // `docs/uapi/` §5.2 carried. The claims below follow the host's table
+        // (`.workbuddy/probe_devfs_doors.c`, a `/dev` that is a devtmpfs):
+        // both calls answer 0, the second `mkdir` of one name is EEXIST, and
+        // the *other* removal door refuses the kind.
+        let fs = DevFs::new();
+        let root = fs.root();
+
+        let dir = root.create("disk", NodeKind::Dir).expect("mkdir /dev/disk");
+        assert_eq!(
+            root.create("disk", NodeKind::Dir).err(),
+            Some(VfsError::Exists)
+        );
+        assert_eq!(
+            root.lookup("disk").unwrap().metadata().ino,
+            dir.metadata().ino,
+            "the name reaches the node mkdir handed back"
+        );
+
+        // A directory is what `unlink` refuses: Linux's EISDIR, and the reason
+        // the trait has two removal entries rather than one.
+        assert_eq!(root.unlink("disk").err(), Some(VfsError::IsDir));
+        assert!(root.lookup("disk").is_ok(), "the refusal took nothing away");
+
+        assert_eq!(root.rmdir("disk"), Ok(()));
+        assert_eq!(root.lookup("disk").err(), Some(VfsError::NoEntry));
+        assert_eq!(root.rmdir("disk"), Err(VfsError::NoEntry));
+    }
+
+    #[test]
+    fn the_removal_doors_answer_for_the_other_kinds() {
+        // The rest of that table: what the two doors say about a directory
+        // that still holds something, about a device node, about a link to a
+        // directory, and about a name nothing ever made.
+        let _bus = crate::uevent::test_bus::take();
+        let fs = DevFs::new();
+        fs.register("null", sink());
+        let root = fs.root();
+
+        // A directory holding a child: ENOTEMPTY, and the name survives. That
+        // is the whole reason `rmdir` is not a recursive delete.
+        let dri = root.create("dri", NodeKind::Dir).expect("mkdir /dev/dri");
+        dri.create("by-path", NodeKind::Dir)
+            .expect("mkdir /dev/dri/by-path");
+        assert_eq!(root.rmdir("dri"), Err(VfsError::NotEmpty));
+        assert!(
+            root.lookup("dri").is_ok(),
+            "a refused rmdir takes nothing away"
+        );
+
+        // The nested door, which is exactly where udev's pass lands and the
+        // half `DevDirNode`'s own `create` had no answer for.
+        assert_eq!(dri.unlink("by-path").err(), Some(VfsError::IsDir));
+        assert_eq!(dri.rmdir("by-path"), Ok(()));
+        assert_eq!(root.rmdir("dri"), Ok(()));
+
+        // A device node: ENOTDIR from this door, and `unlink` - not `rmdir` -
+        // is the one that retires the name. Both are the host's answers.
+        assert_eq!(root.rmdir("null").err(), Some(VfsError::NotDir));
+        assert_eq!(root.unlink("null"), Ok(()));
+
+        // A link to a directory is refused too: `rmdir` does not follow the
+        // last name, so the link's own kind is what answers.
+        root.create("target", NodeKind::Dir)
+            .expect("mkdir /dev/target");
+        root.symlink("link", "/dev/target").expect("symlink");
+        assert_eq!(root.rmdir("link").err(), Some(VfsError::NotDir));
+        assert_eq!(root.unlink("link"), Ok(()));
+        assert_eq!(root.rmdir("target"), Ok(()));
+
+        // And a name nothing ever made.
+        assert_eq!(root.rmdir("gone").err(), Some(VfsError::NoEntry));
     }
 
     /// The clocks claim, made of whichever device node the caller hands in:

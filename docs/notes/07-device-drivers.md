@@ -3331,8 +3331,12 @@ until the window loses focus — which is why `terminal` mode stayed the driveab
 window's own size is the host's, narrated by this kernel as `host wants 952x1135; still driving
 1280x800 until a compositor commits it`, which is the resize item above working.
 
-**And one gap the same boot walked into.** udev maintains `/dev/dri/by-path` by removing the
-directory and publishing its links again, and the removal is refused here:
-`mpos: syscall 84 (path /dev/dri/by-path) -> EOPNOTSUPP` (84 is `rmdir`). `docs/uapi/` §5.2 carries
-the measurement and the asymmetry — `devfs`'s `create` accepts a directory, its `remove` is the
-trait's default.
+**And one gap the same boot walked into — closed 2026-10-18.** udev maintains `/dev/dri/by-path` by
+removing the directory and publishing its links again, and the removal was refused here:
+`mpos: syscall 84 (path /dev/dri/by-path) -> EOPNOTSUPP` (84 is `rmdir`). `devfs` served the
+`mkdir` (its `create` accepted a directory) while the `remove` it inherited was the trait's default,
+so only the second half of the idiom was missing — and the same door split was missing on `unlink`,
+which took a directory as readily as a device node. Both nodes own `rmdir` now and `unlink` answers
+`EISDIR` (`docs/uapi/` §5.1 item 48, `t-devtmpfs`); a boot of the same image prints no `mpos: syscall`
+line at all and `/dev/dri/by-path` holds its two links, so the pass that makes that directory and
+then removes it again runs whole.

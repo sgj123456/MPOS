@@ -1755,3 +1755,81 @@ the commit bodies), and each moved its pin in the same commit.
     while every control passes on both kernels (`sendfile`'s count-0 `0`, the two open refusals, the
     read-only description's `EBADF` and all four claims against a regular file).
 
+## item 48 — the device tree removes a directory it made: `rmdir` served, and `unlink` refuses one with `EISDIR`
+
+    §5.2's entry, and it began as one line of a boot log: `mpos: syscall 84 (path
+    /dev/dri/by-path) -> EOPNOTSUPP`, once per boot. That is udev doing to that directory what it
+    does at every boot - remove it, then publish the `by-path` links again - and the boot went on to
+    publish them anyway, leaving a directory that only ever grew. Linux's devtmpfs serves the pair;
+    this tree served the `mkdir` (`DevDirNode`'s `create`) and had **no `rmdir` at all**, and its
+    `unlink` was a plain map removal that took a *directory* as readily as a node - so the two doors
+    were not a split, and the trait's default `Unsupported` answered the call udev makes.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_devfs_doors.c`, Linux 7.2.9, run as
+    root on a machine whose `/dev` *is* a devtmpfs, so the answers are devtmpfs's rather than a
+    tmpfs's over one):
+
+    * **the make-and-remove pair is served at both levels** - `mkdir("/dev/probe-mkdir")` `0`, the
+      same name again `EEXIST` (17), `mkdir` under a caller-made directory `0` **and under a driver's
+      own `/dev/dri` `0`**; `rmdir` of the empty one `0` at either level, and of one that still holds
+      something `ENOTEMPTY` (39);
+    * **the two doors answer differently for every kind that is not a directory**: a character node
+      (`/dev/null`), a regular file and a symlink to a directory are all `ENOTDIR` (20) from `rmdir` -
+      it does not follow the last name, so the *link's* kind answers - where `unlink` serves all three
+      (`0`);
+    * **a directory is `EISDIR` (21) from `unlink`**, which is the word that makes the pair a split
+      rather than two spellings of one removal;
+    * **a name nothing ever made is `ENOENT` (2)** from either door, and the two cleanup controls
+      answer `2` again - nothing above was left behind;
+    * **the mount-shaped rows are the mount layer's**, measured here as controls: `rmdir("/dev")` and
+      `rmdir("/dev/shm")` are `EBUSY` (16) and `unlink("/dev/shm")` is `EISDIR` (21), which is what
+      `may_remove` already answers (item 45) before the filesystem is asked anything.
+
+    **The fix is one helper and four methods.** `check_empty_dir` asks the two questions in Linux's
+    order - kind (`ENOTDIR`), then emptiness (`ENOTEMPTY`) - and both `rmdir`s call it *before* the
+    name goes, which is what makes a refused `rmdir` leave the directory where it was; the two
+    `unlink`s gained the kind check they never had (`EISDIR`), the rest of their bodies unchanged, so
+    a driver-registered *name* still goes (mdev's link script unlinks those; the driver keeps the
+    device, the name was one way to reach it) while a directory cannot be taken through that door at
+    all. Nothing in the mount layer moved: the two `EBUSY` rows above were already right.
+
+    Pin: `t-devtmpfs`'s removal section - **14 new claims** (44 in the file, was 30), the six-per-node
+    clock section it already owned untouched - beside two host unit tests over the same table
+    (`a_made_directory_is_removable_and_unlink_refuses_one`: mkdir, `EEXIST`, the inode the name
+    reaches, `unlink`'s `EISDIR` taking nothing away, `rmdir` served then `ENOENT`;
+    `the_removal_doors_answer_for_the_other_kinds`: `ENOTEMPTY` leaving the name, the nested
+    `DevDirNode` door, a device node's `ENOTDIR`, a symlink to a directory's `ENOTDIR` with `unlink`
+    serving it, and `ENOENT`). The nested half is claimed on the guest only where a display driver
+    published `/dev/dri` - else the program notes its absence rather than failing - because
+    `/dev/dri` is the driver's directory and `DevDirNode`'s door is a different one from `DevRoot`'s,
+    which is the half udev's pass lands on. All 44 claims are byte-identical across the two machines
+    (diffed, carriage returns aside).
+
+    Gate: x86_64 `pass=183 fail=0 (183 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33 (183 staged,
+    11 left out by `tests.toml`); the second machine's arm is `pass=182 fail=0`, `mpos-kunit 32
+    passed, 0 failed` (182 staged, 12 left out).
+
+    **The boot it came from is quiet now, and that is a measurement of its own**: `cargo xtask run
+    --mode terminal` on the installed image runs OpenRC's "Populating /dev with existing devices
+    through uevents" and "Waiting for uevents to be processed", and afterwards `/dev/dri/by-path`
+    holds both links (`pci-0000:00:04.0-card -> ../card0`, `...-render -> ../renderD128`) with **no
+    `mpos: syscall` line anywhere in the console** - the pass that makes that directory and then
+    removes it again ran, and neither half was refused.
+
+    Counterfactual, two measurements because the host stage is a pin too: with the two `rmdir`s and
+    the two `unlink`s put back to their old bodies (the pins kept - both host tests and the whole
+    `t-devtmpfs` section), `cargo xtask test` stops at stage 1 with `561 passed; 2 failed`, the two
+    unit tests named by name, and the sweep never starts; with those two held aside (`#[ignore]`) so
+    the sweep could reach the guest, the same tree is `pass=182 fail=1 (183 built)` with `FAIL
+    t-devtmpfs` and **nine** red claims, the first of them the root: `unlink of a directory is
+    EISDIR` - the old body *took* the directory - and the eight after it are its cascade, which is
+    what makes the split the item rather than the missing method: `... and the refused name is still
+    there`, `mkdir of a child inside it is served` (the parent was gone), `rmdir of a directory that
+    still holds something is ENOTEMPTY`, `... and that refusal left it where it was`, `rmdir of the
+    empty child is served`, `and then rmdir of the directory itself is served`, `rmdir of a device
+    node is ENOTDIR` (the trait's default), and `and rmdir of it, the pass udev runs
+    (Err(Os { code: 95, kind: Unsupported, message: "Not supported" }))` - the boot's own
+    `EOPNOTSUPP`, in the guest's words, on the exact claim udev's pass lands on. The other 35 claims
+    - every clock claim, `mkdir` served, `EEXIST`, `so the name it removed is gone`, `ENOENT` and
+    `rmdir of a name nothing made` - pass on both kernels, which is what keeps the reds on the
+    removal doors rather than on the directory the test makes.
