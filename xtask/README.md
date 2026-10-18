@@ -396,6 +396,21 @@ as `weston` has a marker nothing reads any more; each costs the one refresh, and
 > terminal transcript, but the window always repaints at frame rate and the mux
 > never stalls behind the wire. For a lossless full serial log, use `terminal`.
 
+> **每台机都有一个控制通道 | Every booted machine carries a control socket.** 启动
+> 时 QEMU 会在 `build/<arch>-9p-share/qmp.sock` 上绑一个 **QMP** 通道
+> （`server=on,wait=off`，没人连它就静静放着，和旁边的 `console.sock` 一个道理）。
+> 会话因此可以 `screendump` 截屏、`input-send-event` 注入指针与按键——这两条**只有
+> QMP 有**，HMP 里没有。这是「把合成器的指针从窗口读回来」唯一可能的入口：光标队列
+> 画进的是设备合成的那张扫描输出，不在 guest 内存里，guest 自己看不见它。
+> `-monitor none` 仍然保留——那是另一个 chardev。
+> The launcher binds a **QMP** channel at `build/<arch>-9p-share/qmp.sock`
+> (`server=on,wait=off`, the console socket's shape: it waits for a holder that may
+> never come). A session can therefore `screendump` the machine and
+> `input-send-event` a pointer or a key - neither of which exists in HMP - and that
+> is the only way a compositor's pointer can be read back: the cursor queue draws
+> into the scanout the *device* composites, not into guest memory, so nothing
+> inside the guest can see it. `-monitor none` stays; that is the other chardev.
+
 ---
 
 ## 在 `run` 的虚拟机里操作 | Interacting with the running guest

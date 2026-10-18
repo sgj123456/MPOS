@@ -429,7 +429,31 @@ pub fn machine_args(
     // is why `run` had no way to stop except killing the emulator. The test
     // boot reads the same port for its verdict, so it belongs to every machine
     // this builds, not to the harness alone.
-    args.extend(["-monitor".into(), "none".into(), "-no-reboot".into()]);
+    //
+    // Beside it, a **control channel**, and the console socket above is its
+    // precedent: a host-side socket nothing has to be listening on
+    // (`wait=off`), which a test - or an operator - may hold. This one is QMP
+    // rather than HMP because the one measurement neither a `t-` program nor
+    // the guest itself can make is *reading a compositor's pointer back off the
+    // host's side of the card*: the cursor queue is drawn into the scanout the
+    // device composites, not into guest memory, and the two commands that reach
+    // it - `screendump` and `input-send-event` - exist only in QMP
+    // (`docs/ROADMAP.md`'s pointer item, whose last step was an eye's until
+    // this). `-monitor none` stays: it is the *other* chardev, and a machine
+    // that named only the QMP socket would still get QEMU's default monitor
+    // wherever stdio already carries the serial line. 9p shares files and not
+    // sockets, so the path sitting in the exported directory is not a door the
+    // guest can reach.
+    args.extend([
+        "-monitor".into(),
+        "none".into(),
+        "-qmp".into(),
+        format!(
+            "unix:{},server=on,wait=off",
+            share_dir.join("qmp.sock").display()
+        ),
+        "-no-reboot".into(),
+    ]);
     args.extend([
         "-device".into(),
         "isa-debug-exit,iobase=0xf4,iosize=0x04".into(),
@@ -686,6 +710,16 @@ pub fn virt_machine_args(
         config.memory.clone(),
         "-monitor".into(),
         "none".into(),
+        // The control channel the first machine's arm carries too, at this
+        // machine's own path: `-monitor none` is the *other* chardev, so both
+        // are named. See that arm for what it is for (the pointer a guest
+        // cannot read back) and why a socket in the exported directory is not a
+        // door the guest can reach.
+        "-qmp".into(),
+        format!(
+            "unix:{},server=on,wait=off",
+            share.join("qmp.sock").display()
+        ),
         "-no-reboot".into(),
         // Two flash banks, the way EDK2 expects to find itself: the code bank
 
@@ -1236,6 +1270,35 @@ mod tests {
             &Console::File("/build/aarch64-serial.log".to_string()),
             Path::new("/build/aarch64-9p-share"),
         )
+    }
+
+    /// A booted machine carries a QMP control socket, and it rides *beside*
+    /// `-monitor none` rather than replacing it: the two are separate chardevs,
+    /// so a machine that named only the QMP socket would still get QEMU's
+    /// default monitor wherever stdio already carries the serial line. The
+    /// socket is what `screendump` and `input-send-event` are reached through -
+    /// neither exists in HMP - and therefore the reason a compositor's pointer
+    /// can be read back off the host's side of the card at all.
+    #[test]
+    fn a_booted_machine_carries_a_control_socket() {
+        let config = config("256", 1, &[]);
+
+        let first = args(&config, Boot::Image(PathBuf::from("/build/mpos.img")));
+        assert_eq!(after(&first, "-monitor").as_deref(), Some("none"));
+        assert_eq!(
+            after(&first, "-qmp").as_deref(),
+            Some("unix:/build/9p-share/qmp.sock,server=on,wait=off"),
+            "the first machine's control socket"
+        );
+
+        let second = aarch64_args(&config);
+        assert_eq!(after(&second, "-monitor").as_deref(), Some("none"));
+        assert_eq!(
+            after(&second, "-qmp").as_deref(),
+            Some("unix:/build/aarch64-9p-share/qmp.sock,server=on,wait=off"),
+            "and the second machine's, at its own path: one arch's boot must not \
+             open the other's socket"
+        );
     }
 
     /// The marker search reads bytes, because the second machine's log is not
