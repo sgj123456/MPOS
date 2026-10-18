@@ -2457,6 +2457,13 @@ pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isiz
         }
         unsafe { (offset_ptr as *mut u64).write_unaligned(pos) };
     }
+    // A copy out of a file is a read of it to a watcher: Linux's `do_sendfile`
+    // ends in `fsnotify_access`, one record per call however many chunks it
+    // cut the copy into. The source is read through `read_at`/`File::read`
+    // rather than a read door, so nothing else here reports it.
+    if sent > 0 {
+        super::fs::notice_access(in_fd);
+    }
     sent as isize
 }
 

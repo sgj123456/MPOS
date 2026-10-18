@@ -3545,6 +3545,21 @@ fn socket_write(_args: [usize; ARG_COUNT], _from_user: bool) -> isize {
     err::ENOTTY
 }
 
+/// Report `IN_ACCESS` for a descriptor whose read moved bytes.
+///
+/// Linux calls `fsnotify_access` once per successful read-family or copy
+/// call, so this sits at the doors and not inside `vfs::read` - a two-iovec
+/// `readv` is one read of the file and reports one record, and the kernel's
+/// own readers (`read_file`, the `execve` ELF load) reach `File::read`
+/// without reporting at all. The file description is looked up rather than
+/// threaded in because the watchers key on the inode's `(dev, ino)` and the
+/// doors carry a number.
+pub(crate) fn notice_access(fd: i32) {
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
+        crate::vfs::inotify::emit_access(&file.inode());
+    }
+}
+
 /// `read(2)` — read up to `buf.len()` bytes from `fd` into `buf`.
 pub fn handle_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, buf, len) = (args[0], args[1], args[2]);
@@ -3573,7 +3588,12 @@ pub fn handle_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     }
     let bytes = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
     match crate::vfs::read(fd as i32, bytes) {
-        Ok(n) => n as isize,
+        Ok(n) => {
+            if n > 0 {
+                notice_access(fd as i32);
+            }
+            n as isize
+        }
         Err(e) => err_of(e),
     }
 }
@@ -4041,6 +4061,19 @@ pub fn handle_writev(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 
 /// `readv(fd, iov, iovcnt)` — scatter read.
 pub fn handle_readv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let fd = args[0] as i32;
+    let n = readv_inner(args, from_user);
+    // One `IN_ACCESS` for the whole call, not one per iovec: Linux reports a
+    // read, and a vectored read is one (measured, `.workbuddy/probe_inotify_access.c`
+    // scenario L - two full iovecs still answer one record). This is also the
+    // body `preadv`/`preadv2` run through, so all three get it once.
+    if n > 0 {
+        notice_access(fd);
+    }
+    n
+}
+
+fn readv_inner(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, iov_ptr, iov_cnt) = (args[0] as i32, args[1], args[2]);
     if iov_cnt > 1024 {
         return err::EINVAL;
@@ -4187,7 +4220,12 @@ pub fn handle_pread64(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     at_position(fd, offset, || {
         let bytes = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
         match crate::vfs::read(fd, bytes) {
-            Ok(n) => n as isize,
+            Ok(n) => {
+                if n > 0 {
+                    notice_access(fd);
+                }
+                n as isize
+            }
             Err(e) => err_of(e),
         }
     })
@@ -5613,6 +5651,11 @@ pub fn handle_copy_file_range(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     // named one, into the descriptor's cursor when it did not.
     splice_finish(&input, off_in, pos_in, from_user);
     splice_finish(&output, off_out, pos_out, from_user);
+    // The source was read, so a watcher on it hears `IN_ACCESS` - one record
+    // per call, as Linux's `vfs_copy_file_range` reports it.
+    if copied > 0 {
+        notice_access(in_fd);
+    }
     copied as isize
 }
 
@@ -6311,6 +6354,13 @@ pub fn handle_splice(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     }
     splice_finish(&input, off_in, pos_in, from_user);
     splice_finish(&output, off_out, pos_out, from_user);
+    // Only the file→pipe direction reads a file: the input side being a pipe
+    // means the file (if any) is the *output*, written rather than read, and
+    // Linux reports `IN_MODIFY` there, not `IN_ACCESS`. Measured both ways -
+    // `.workbuddy/probe_inotify_access.c` scenarios K and M.
+    if moved > 0 && !in_is_pipe {
+        notice_access(in_fd);
+    }
     moved as isize
 }
 

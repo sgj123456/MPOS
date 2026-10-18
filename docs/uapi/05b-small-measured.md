@@ -960,3 +960,25 @@ Section numbers are unchanged from the original `UAPI.md`.
   under `/dev` are removable through `unlink`, as on Linux, but a driver's own *node* cannot be
   re-made through `mknod` here — the device tree's names come from the drivers, which is a property
   of the tree rather than of the removal doors.
+
+- **A read of a watched file reports `IN_ACCESS` — at the doors, not inside `File::read`.
+  Landed 2026-10-19** (`docs/uapi/` §5.1 item 60). The inotify module's header had carried
+  `IN_ACCESS` as a deliberate non-event since it landed, on a rationale that had gone stale:
+  "the read path does not bump atime, so the event would be half a lie". The read path *does*
+  bump atime now (ext4's `relatime` bump, §3.3), and Linux's answer is unconditional — one
+  `IN_ACCESS` per successful read-family or copy call that moved bytes, whatever the stored
+  time then says. Measured whole on a current host first (`.workbuddy/probe_inotify_access.c`,
+  Linux 7.2.11, one scenario per leaf): a `read` reports one record with an empty name, and so
+  do `pread`, a two-iovec `readv` (**one**, not two), `sendfile` (either offset form),
+  `copy_file_range`'s source and a file→pipe `splice`; a read at EOF, a zero-length read, a
+  failed read, a directory read (`EISDIR`) and an **`mmap` page fault** all report nothing; a
+  pipe→file `splice` reports `IN_MODIFY` instead; and a watch that did not ask for the bit is
+  silent. Where the emit sits is the measured half: Linux's `fsnotify_access` is at the syscall
+  boundary, because the kernel's own readers (`read_file`, the `execve` load) reach
+  `File::read` too and `kernel_read` reports nothing — so the owner is the syscall layer
+  (`notice_access`, the single call-site helper the three read doors and the three copy doors
+  ask) over `vfs::inotify::emit_access`. Pin: `t-inotify`'s 22 new claims (24 → 46) beside the
+  host unit test `emit_access_reports_a_read_only_to_a_watch_that_asked`; item 60 carries the
+  gates and the counterfactual. One shape stays named: a *write* made by
+  `copy_file_range`/`splice` is still invisible to `IN_MODIFY` (both write through
+  `Inode::write_at`, below the reporting chokepoint).

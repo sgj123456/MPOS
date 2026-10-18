@@ -17,12 +17,22 @@
 //! inode not at all - `(dev, ino)` is the whole identity, the same key the
 //! lock table uses (`src/vfs/locks.rs`), so a deleted file pins nothing.
 //!
-//! The deliberate departures from Linux, each visible from userland:
-//! `IN_ACCESS` is never emitted (the read path does not bump atime, so the
-//! event would be half a lie, and no target daemon watches for it);
-//! `IN_UNMOUNT` is not emitted (unmount does not track watches; a stale
-//! one simply stops matching); a watched directory's `IN_MOVE_SELF` is
-//! unreachable while `renameat2` refuses directory renames; and a rename
+//! [`IN_ACCESS`] is emitted now, by the read doors rather than by the VFS
+//! itself: an `IN_ACCESS` is one per successful read-family or copy call
+//! that moved bytes - `read`/`pread`/`readv`/`preadv`/`preadv2`, and the
+//! three copy doors `sendfile`/`copy_file_range`/`splice` - which is
+//! Linux's `fsnotify_access`. The reason it sits at those doors and not
+//! inside `File::read` is that the kernel's own readers (`read_file`, the
+//! `execve` ELF load) reach `File::read` too and Linux's `kernel_read` does
+//! not report, so the syscall boundary is the honest one. (The entry this
+//! replaces said the read path did not bump atime, so the event would be
+//! half a lie; the ext4 read path has since grown the `relatime` bump, and
+//! a read *is* an access whatever the inode's stored time then says.)
+//!
+//! The deliberate departures from Linux that remain, each visible from
+//! userland: `IN_UNMOUNT` is not emitted (unmount does not track watches; a
+//! stale one simply stops matching); a watched directory's `IN_MOVE_SELF`
+//! is unreachable while `renameat2` refuses directory renames; and a rename
 //! that replaces a name really does unlink the old inode here, so the
 //! replaced name truthfully reports `IN_DELETE` before `IN_CREATE`.
 //! `IN_EXCL_UNLINK` is honoured at the unlink boundary itself - the one
@@ -745,6 +755,18 @@ pub fn emit_write(inode: &Arc<dyn Inode>) {
     emit(inode, IN_MODIFY, "");
 }
 
+/// Report a read that moved bytes - the record a daemon watching a file
+/// hears when somebody reads it, Linux's `fsnotify_access`. The same shape
+/// as [`emit_write`]; what differs is only where the calls sit, which is the
+/// syscall layer: a read is news to a watcher once per *call*, however many
+/// chunks a vectored or copy door cuts it into (measured,
+/// `.workbuddy/probe_inotify_access.c`, scenario L: a two-iovec `readv` is
+/// one `IN_ACCESS`), and a read the kernel makes for itself is no news at
+/// all.
+pub fn emit_access(inode: &Arc<dyn Inode>) {
+    emit(inode, IN_ACCESS, "");
+}
+
 /// Report one rename: the pair of directory events share the cookie the
 /// reader joins them by, and the moved inode itself reports
 /// `IN_MOVE_SELF`. `moved` is the inode that travelled.
@@ -1194,6 +1216,44 @@ mod tests {
         assert_eq!(i32::from_ne_bytes(buf[..4].try_into().unwrap()), 1, "wd");
         let mask = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
         assert_eq!(mask, IN_CREATE | IN_ISDIR, "directory events say so");
+    }
+
+    /// `emit_access` reports exactly a read: one `IN_ACCESS` with an empty
+    /// name and no `IN_ISDIR`, delivered only to a watch that asked for it.
+    /// The door that calls it is the syscall layer's (`notice_access`), so
+    /// what is pinned here is the record the read produces.
+    #[test]
+    fn emit_access_reports_a_read_only_to_a_watch_that_asked() {
+        let (node, instance) = instance_node();
+        let file = crate::vfs::ramfs::RamFs::new()
+            .root()
+            .create("read-me", NodeKind::File)
+            .unwrap();
+        add_watch(&node, node.metadata().ino, key_of(&file), IN_ACCESS);
+        // A second watch on the same file that did *not* ask for access.
+        let (other_node, other) = instance_node();
+        add_watch(
+            &other_node,
+            other_node.metadata().ino,
+            key_of(&file),
+            IN_OPEN,
+        );
+
+        emit_access(&file);
+        assert!(instance.pending(), "the watch that asked hears the read");
+        let mut buf = [0u8; 32];
+        let n = instance.read_at(0, &mut buf).unwrap();
+        assert_eq!(n, 16, "an empty-name record is the header alone");
+        assert_eq!(i32::from_ne_bytes(buf[..4].try_into().unwrap()), 1, "wd");
+        assert_eq!(
+            u32::from_ne_bytes(buf[4..8].try_into().unwrap()),
+            IN_ACCESS,
+            "a file's access carries no IN_ISDIR"
+        );
+        assert!(
+            !other.pending(),
+            "a watch that did not ask for IN_ACCESS stays silent"
+        );
     }
 
     /// `IN_ONESHOT`: a delivered event spends the watch, and the spending

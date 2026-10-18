@@ -497,6 +497,22 @@ machines). The wake in the death path is unconditional and stays so — a parent
 `docs/uapi/` §5.2: `/proc/<pid>/status`'s `exit_signal` line is still the constant it has always  
 been.
 
+**A read of a watched file reports `IN_ACCESS`** (`docs/uapi/` §5.1 item 60, landed 2026-10-19):  
+the inotify module's own header had carried `IN_ACCESS` as a deliberate non-event since it landed,  
+on a rationale that had gone stale — "the read path does not bump atime" — while the ext4 read path  
+had since grown the `relatime` bump, and a read is an access whatever the stored time then says.  
+Linux's `fsnotify_access` sits at the syscall boundary, not in the VFS, because the kernel's own  
+readers (`read_file`, the `execve` ELF load) reach `File::read` too and `kernel_read` reports  
+nothing. Measured whole on a current host first (`.workbuddy/probe_inotify_access.c`, Linux 7.2.11),  
+one `IN_ACCESS` per successful read-family or copy call that moved bytes — `read`/`pread`/a  
+two-iovec `readv` (one, not per iovec)/`sendfile`/`copy_file_range`/file→pipe `splice` — with  
+nothing for a read at EOF, a zero-length read, a failed read, a directory read, or an `mmap` page  
+fault, and `IN_MODIFY` (no `IN_ACCESS`) for the pipe→file `splice`. The owner is the syscall layer  
+(`syscall::linux::fs::file::notice_access`, one helper the three read doors and the three copy doors  
+ask) over `vfs::inotify::emit_access`; pinned by `t-inotify`'s 22 new claims (24 → 46, byte-identical  
+on both machines) beside the host unit test. One shape stays named in `docs/uapi/` §5.2: a write made  
+by `copy_file_range`/`splice` is still invisible to `IN_MODIFY`.
+
 **The `F_GETFL` word is the caller's own** (`docs/uapi/` §5.1 item 49, landed 2026-10-18): Linux  
 answers `filp->f_flags`, so a caller that compares the word against what it opened with agrees — its  
 mode, `O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_SYNC`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME` — where  

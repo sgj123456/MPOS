@@ -23,8 +23,12 @@
 //! back with a tmpfs.
 
 use mpos_user_tests::Report;
-use rustix::fs::{AtFlags, CWD, Mode, OFlags, mkdirat, openat, unlinkat};
-use rustix::io::write;
+use rustix::fs::{
+    AtFlags, CWD, Mode, OFlags, SeekFrom, copy_file_range, mkdirat, openat, seek, sendfile,
+    unlinkat,
+};
+use rustix::io::{IoSliceMut, pread, read, readv, write};
+use rustix::pipe::{SpliceFlags, pipe, splice};
 
 const IN_ACCESS: u32 = 0x0001;
 const IN_MODIFY: u32 = 0x0002;
@@ -99,6 +103,20 @@ fn foreach_record(buf: &[u8], mut f: impl FnMut(&EventHeader, &[u8])) {
         f(hdr, name);
         off = name_start + hdr.name_len as usize;
     }
+}
+
+/// Drain the queue and count the records whose mask carries `want`. The
+/// per-operation claims below read one op at a time, so a single drain of a
+/// small queue is the whole of it.
+fn count_mask(fd: i32, want: u32) -> usize {
+    let mut buf = [0u8; 4096];
+    let mut n = 0usize;
+    foreach_record(drain(fd, &mut buf), |hdr, _| {
+        if hdr.mask & want != 0 {
+            n += 1;
+        }
+    });
+    n
 }
 
 fn main() {
@@ -414,6 +432,168 @@ fn main() {
         }
     });
     r.check("the retirement reports IGNORED", retired);
+
+    // ------------------------------------------------------------------
+    // IN_ACCESS - the record a read of a watched file produces.
+    //
+    // Measured whole on a current host first
+    // (`.workbuddy/probe_inotify_access.c`, Linux 7.2.11): one IN_ACCESS per
+    // successful read-family or copy call that moved bytes, with an empty
+    // name; nothing for a read that moved none (a read at EOF, a zero count),
+    // a read that failed, a directory read (`EISDIR`), or a mapping's page
+    // fault; and nothing to a watch whose mask did not ask for the bit.
+    // ------------------------------------------------------------------
+    let acc_path = "/tmp/ino-access";
+    let seed = openat(
+        CWD,
+        acc_path,
+        OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY,
+        Mode::from_bits_retain(0o644),
+    );
+    if let Ok(f) = &seed {
+        let _ = write(f, b"0123");
+    }
+    drop(seed);
+    let wacc = add_watch(q, acc_path, IN_ACCESS);
+    r.check("a watch for IN_ACCESS takes a wd", wacc >= 0);
+    // A second, independent queue that did not ask for IN_ACCESS.
+    let q2 = init1(IN_NONBLOCK) as i32;
+    let _ = add_watch(q2, acc_path, IN_OPEN);
+
+    let ar = openat(CWD, acc_path, OFlags::RDONLY, Mode::empty());
+    r.check("the access file opens for reading", ar.is_ok());
+    if let Ok(f) = &ar {
+        let _ = drain(q, &mut buf); // any birth news before the first read
+        let mut b = [0u8; 4];
+        let n = read(f, &mut b).unwrap_or(0);
+        r.check("the read moved four bytes", n == 4);
+        r.check(
+            "a read reports one IN_ACCESS",
+            count_mask(q, IN_ACCESS) == 1,
+        );
+        r.check(
+            "a watch that did not ask for IN_ACCESS is not told",
+            count_mask(q2, IN_ACCESS) == 0,
+        );
+        // The four-byte file is now spent, so the next read is at EOF and
+        // moves nothing.
+        let mut big = [0u8; 16];
+        let _ = read(f, &mut big);
+        r.check(
+            "a read at EOF reports nothing",
+            count_mask(q, IN_ACCESS) == 0,
+        );
+        // A zero-length read moves nothing.
+        let mut zero = [0u8; 0];
+        let _ = read(f, &mut zero[..]);
+        r.check(
+            "a zero-length read reports nothing",
+            count_mask(q, IN_ACCESS) == 0,
+        );
+        // Rewind so the copy doors below have bytes to move.
+        let _ = seek(f, SeekFrom::Start(0));
+        // One record for a vectored read, however many iovecs it filled.
+        let (mut a1, mut a2) = ([0u8; 4], [0u8; 4]);
+        let mut iov = [IoSliceMut::new(&mut a1), IoSliceMut::new(&mut a2)];
+        r.check(
+            "the two-iovec readv moved bytes",
+            readv(f, &mut iov).is_ok(),
+        );
+        r.check(
+            "a two-iovec readv reports one IN_ACCESS",
+            count_mask(q, IN_ACCESS) == 1,
+        );
+        // `pread` is a read too.
+        let mut p = [0u8; 2];
+        r.check("the pread moved bytes", pread(f, &mut p, 0).is_ok());
+        r.check(
+            "a pread reports one IN_ACCESS",
+            count_mask(q, IN_ACCESS) == 1,
+        );
+        // A copy out of the file is a read of it: sendfile, splice, and the
+        // kernel copy. Each reports one record per call.
+        if let Ok((pr, pw)) = pipe() {
+            let mut so = 0u64;
+            r.check(
+                "sendfile moved bytes",
+                sendfile(&pw, f, Some(&mut so), 4) == Ok(4),
+            );
+            r.check(
+                "sendfile reports one IN_ACCESS",
+                count_mask(q, IN_ACCESS) == 1,
+            );
+            let mut off = 0u64;
+            let sp = splice(&f, Some(&mut off), &pw, None, 4, SpliceFlags::empty());
+            r.check("a file-to-pipe splice moved bytes", sp == Ok(4));
+            r.check(
+                "a file-to-pipe splice reports one IN_ACCESS",
+                count_mask(q, IN_ACCESS) == 1,
+            );
+            drop(pr);
+        }
+        let dst = openat(
+            CWD,
+            "/tmp/ino-access-dst",
+            OFlags::CREATE | OFlags::TRUNC | OFlags::WRONLY,
+            Mode::from_bits_retain(0o644),
+        );
+        if let Ok(d) = &dst {
+            let mut oi = 0u64;
+            let mut oo = 0u64;
+            let cfr = copy_file_range(f, Some(&mut oi), d, Some(&mut oo), 4);
+            r.check("the kernel copy moved bytes", cfr == Ok(4));
+            r.check(
+                "a copy_file_range source reports one IN_ACCESS",
+                count_mask(q, IN_ACCESS) == 1,
+            );
+        }
+        drop(dst);
+    }
+    drop(ar);
+    let _ = unlinkat(CWD, "/tmp/ino-access-dst", AtFlags::empty());
+
+    // A read that fails moves nothing: a write-only descriptor answers EBADF.
+    let wref = openat(CWD, acc_path, OFlags::WRONLY, Mode::empty());
+    if let Ok(f) = &wref {
+        let _ = drain(q, &mut buf);
+        let mut b = [0u8; 4];
+        r.check(
+            "a read on a write-only descriptor fails",
+            read(f, &mut b).is_err(),
+        );
+        r.check(
+            "a failed read reports nothing",
+            count_mask(q, IN_ACCESS) == 0,
+        );
+    }
+    drop(wref);
+
+    // A directory is not a byte stream: its read is EISDIR, not an access.
+    let _ = mkdirat(CWD, "/tmp/ino-dir2", Mode::from_bits_retain(0o755));
+    let wdir2 = add_watch(q, "/tmp/ino-dir2", IN_ACCESS);
+    r.check("a directory can be watched for IN_ACCESS", wdir2 >= 0);
+    let dr = openat(
+        CWD,
+        "/tmp/ino-dir2",
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+    );
+    if let Ok(d) = &dr {
+        let _ = drain(q, &mut buf);
+        let mut db = [0u8; 64];
+        r.check(
+            "a directory read fails with EISDIR",
+            read(d, &mut db).is_err(),
+        );
+        r.check(
+            "a directory read reports no IN_ACCESS",
+            count_mask(q, IN_ACCESS) == 0,
+        );
+    }
+    drop(dr);
+    let _ = unlinkat(CWD, "/tmp/ino-access", AtFlags::empty());
+    let _ = std::fs::remove_dir("/tmp/ino-dir2");
+    unsafe { libc::close(q2) };
 
     // The queues of this test's directories are gone with the dirs.
     let _ = std::fs::remove_dir("/tmp/ino-dir");

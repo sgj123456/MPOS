@@ -2686,3 +2686,75 @@ the commit bodies), and each moved its pin in the same commit.
     Linux's sender-side resume of a stopped parent, measured — is the `kill` path's alone and
     is not performed for a death record.
 
+## item 60 — a read of a watched file reports `IN_ACCESS`, at the doors and not in the VFS
+
+    §5.2's entry, and the divergence the inotify module's own header had carried since it
+    landed: `IN_ACCESS` was never emitted, on a rationale that had gone stale — "the read path
+    does not bump atime, so the event would be half a lie". The read path *does* bump atime now
+    (the ext4 `relatime` bump, §3.3), and a read is an access whatever the stored time then
+    says, so the honest thing was to emit it. *Where* it belongs took measuring, and the answer
+    is not the VFS: Linux's `fsnotify_access` sits at the syscall boundary, because the kernel's
+    own readers (`read_file`, the `execve` ELF load) reach `File::read` too and Linux's
+    `kernel_read` reports nothing.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_inotify_access.c`, Linux
+    7.2.11, each scenario in its own forked child with its own queue):
+
+    * **A — one `IN_ACCESS` per successful read that moved bytes**, mask `0x1`, empty name:
+      `read(4)` then `read(4)` report two, `pread` reports one, and a **read at EOF (0 bytes)**
+      and a **zero-length read** report nothing; a read on an `O_WRONLY` descriptor (`EBADF`)
+      and a directory read (`EISDIR`) report nothing; and a **`mmap` page fault reports
+      nothing** (D: touching a mapped page queues only `OPEN` and `CLOSE_NOWRITE`);
+    * **B, C — the life, in order**: `IN_OPEN` on the open, `IN_ACCESS` on each read,
+      `IN_CLOSE_NOWRITE` on the close;
+    * **L — a vectored read is *one* read**: a two-iovec `readv` that fills both reports
+      **one** `IN_ACCESS`, and a two-iovec `preadv` one — the record belongs to the call, not
+      the iovec;
+    * **E, I, J, K — the copy doors count**: `sendfile` reports one whether its offset is
+      `NULL` (the cursor, E) or a caller's word (I); `copy_file_range`'s source reports one
+      (J); and a file→pipe `splice` reports one (K) — while a **pipe→file `splice` reports
+      `IN_MODIFY` (0x2) and no `IN_ACCESS`** (M), because the file is written, not read;
+    * **F — the identity is the inode**: two descriptions of one file each report their own
+      read; and **the mask filters**: a watch that did not ask for `IN_ACCESS` is silent
+      through it all.
+
+    **The fix is a chokepoint at the doors, not in the VFS.** `vfs::inotify::emit_access` is
+    the record (the shape of `emit_write`), and `syscall::linux::fs::file::notice_access(fd)`
+    is the one call-site helper — it looks the description up and reports on its inode — asked
+    by the three read-family doors (`handle_read`, `handle_pread64`, and `handle_readv`, whose
+    body moved into `readv_inner` so the wrapper can report once for `readv`/`preadv`/
+    `preadv2` together), and by the three copy doors (`handle_sendfile`,
+    `handle_copy_file_range`, and `handle_splice` when its input is not a pipe). It sits there
+    and not in `File::read` because `read_file`/`read_file_opt` — the loader's way in — reach
+    `File::read` and Linux's `kernel_read` does not report. The inotify module's header drops
+    the stale `IN_ACCESS` sentence and keeps the three divergences that remain.
+
+    Pin: `t-inotify` grows **22 claims** (24 → 46): the one-record read, the wrong-mask
+    control, EOF, zero-length, the two-iovec `readv`, `pread`, `sendfile`, the file→pipe
+    `splice`, `copy_file_range`, the failed read and the directory read, beside the shape
+    claims. Every one is Linux's answer, so `MPOS_ON_HOST=1` is the measurement: 46 of 46 on
+    this host first, and the sweep is the pin. Plus the host unit test
+    `emit_access_reports_a_read_only_to_a_watch_that_asked`, which pins the record's shape and
+    the mask filter.
+
+    Gate: x86_64 `pass=186 fail=0 (186 built)`, `mpos-kunit 32 passed, 0 failed`, exit 0 (186
+    staged, 11 left out by `tests.toml`); aarch64 `pass=185 fail=0`, `mpos-kunit 32 passed, 0
+    failed`, exit 0 (185 staged, 12 left out); and the program's 46 `ok:` lines are
+    byte-identical across the two machines (diffed, carriage returns aside).
+
+    Counterfactual, and it is sweep-only because stage 1 does not touch the doors: with
+    `notice_access` made a no-op (every call site kept, the unit test still calling
+    `emit_access` directly), stage 1 is untouched — `572 passed; 0 failed` — and the sweep is
+    `pass=185 fail=1 (186 built)` with `FAIL t-inotify` and **six** red claims by name, one per
+    door that reports: `a read reports one IN_ACCESS`, `a two-iovec readv reports one
+    IN_ACCESS`, `a pread reports one IN_ACCESS`, `sendfile reports one IN_ACCESS`, `a
+    file-to-pipe splice reports one IN_ACCESS`, and `a copy_file_range source reports one
+    IN_ACCESS`. The controls — EOF, zero-length, the failed read, the directory read and the
+    wrong-mask watch — stay green, which keeps the reds on the emit rather than on the read.
+
+    Named, and measured rather than fixed: a *write* made by `copy_file_range`/`splice` is
+    still invisible to `IN_MODIFY` (both write through `Inode::write_at`, below the
+    `File::write` chokepoint that reports), where Linux reports `IN_MODIFY` on the output;
+    `IN_UNMOUNT` and a watched directory's `IN_MOVE_SELF` remain the two named departures the
+    module header keeps.
+
