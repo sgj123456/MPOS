@@ -56,18 +56,18 @@
 //!
 //! # Why not on the host
 //!
-//! The buffer being filled is this kernel's own size (four packet slots and a
-//! 4 KiB payload ring, `src/net/mod.rs`'s `add_udp`), and the host's default
-//! `SO_SNDBUF` is 212992 - the same program on a host would have to shrink it
-//! to see anything, and then it would be measuring the host's buffer rather
-//! than this kernel's. The claim is about this kernel's answer, so a host run
-//! says so and stops.
+//! The buffer being filled is this kernel's ring (sixteen packet slots and a
+//! 16 KiB payload pool, `src/net/mod.rs`'s `add_udp`), and the park's answer is
+//! this kernel's bound (`DRAIN_WAIT_MS`), which the host does not have - the
+//! same program on a host would be measuring Linux's own release. The claim is
+//! about this kernel's answer, so a host run says so and stops.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use mpos_user_tests::{Report, host_run};
 use rustix::io::Errno;
+use rustix::net::sockopt::{set_socket_send_buffer_size, socket_send_buffer_size};
 use rustix::net::{AddressFamily, SendFlags, SocketAddrV4, SocketType, sendto, socket};
 use rustix::time::{ClockId, clock_gettime};
 
@@ -78,8 +78,8 @@ const LIVE: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 /// discard(9): nothing listens, and an unanswered datagram is still a
 /// transmitted frame, which is all the send buffer's accounting needs.
 const PORT: u16 = 9;
-/// One datagram's payload: MTU-sized, so a few of them fill the 4 KiB payload
-/// ring and the fill is a handful of sends rather than a hundred.
+/// One datagram's payload: MTU-sized, so a few of them fill the send buffer
+/// and the fill is a handful of sends rather than a hundred.
 const PAYLOAD: usize = 1400;
 /// How long before the alarm fires into the park. Short enough that the
 /// program stays quick, long enough that a park is unmistakably a park: the
@@ -96,7 +96,7 @@ const PARK_HIGH_MS: f64 = 2000.0;
 const BOUND_LOW_MS: f64 = 1500.0;
 const BOUND_HIGH_MS: f64 = 8000.0;
 /// How many non-blocking sends may go in before the fill gives up. A bound, not
-/// a tolerance: the buffer is four packet slots deep, so a fill that has not
+/// a tolerance: the ring is sixteen packet slots deep, so a fill that has not
 /// filled it after this many is a stack that is draining, and the program must
 /// say so rather than loop.
 const FILL_LIMIT: usize = 32;
@@ -152,7 +152,7 @@ fn main() {
     // comment says why). Named and not made.
     if host_run() {
         println!(
-            "note: the send buffer being filled is this kernel's own size (4 slots x 4 KiB); a host run measures the host's 212992-byte SO_SNDBUF instead - named and not made"
+            "note: the send buffer being filled is this kernel's own ring (16 slots x 16 KiB); a host run measures the host's 212992-byte SO_SNDBUF instead - named and not made"
         );
         r.finish();
     }
@@ -173,6 +173,14 @@ fn main() {
     //    per-send `MSG_DONTWAIT` is what makes this the non-blocking answer -
     //    and what keeps the fill from parking, which is the very thing the
     //    blocking send below is there to observe.
+    // The buffer is shrunk to its floor first, so what stops the fill is the
+    // number the caller asked for rather than the ring behind it: 2048 asked
+    // reads back 4608 (Linux doubles every ask, `t-sockbuf` pins the rule), and
+    // 4608 bytes holds three 1400-byte datagrams, not the eleven a fresh
+    // socket's ring would.
+    let buffer_ok =
+        set_socket_send_buffer_size(&fd, 2048).is_ok() && socket_send_buffer_size(&fd) == Ok(4608);
+    r.check("the send buffer shrinks to its floor (4608)", buffer_ok);
     let mut filled = 0usize;
     let mut fill_errno = None;
     while filled < FILL_LIMIT {
@@ -193,6 +201,15 @@ fn main() {
         fill_errno == Some(Errno::AGAIN),
     );
     println!("note: {filled} datagrams of {PAYLOAD} bytes fit before the refusal");
+    // The stop point is the buffer's number: the count is the largest whose
+    // payload still fits in 4608, which is three. Linux stops at two for the
+    // same number because it charges each skb's truesize rather than the
+    // payload (`docs/uapi/` §5.2 names that), so the count is this kernel's and
+    // the *rule* is Linux's.
+    r.check(
+        "the fill stops where the send buffer's number says",
+        filled * PAYLOAD <= 4608 && (filled + 1) * PAYLOAD > 4608,
+    );
 
     // 2. The non-blocking send in the filled state: `EAGAIN`, at once. This is
     //    the answer the kernel gave to *every* caller before the park existed.

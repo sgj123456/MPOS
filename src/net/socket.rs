@@ -2230,6 +2230,27 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool)
                 .sockets_mut(*home)
                 .get_mut::<udp::Socket>(*sock_handle);
             let buffer_bytes = sock.payload_send_capacity();
+            // The **send buffer's** own bound, asked before the enqueue because
+            // the ring behind it is the larger of the two: a socket asked for
+            // 4608 bytes must refuse its fourth 1400-byte datagram even though
+            // the ring would still hold seven more. `SO_SNDBUF` is a memory
+            // figure Linux doubles and clamps (`super::sock_buffer_size`) and
+            // what a sender is really refused by, and the grace for an empty
+            // queue is Linux's too - the accounting compares what is already
+            // queued against the buffer *before* the new datagram is charged, so
+            // one datagram goes in whatever its size (measured: 5600 bytes into
+            // a socket reading 4608).
+            //
+            // `EAGAIN` here is the same answer the ring's full case gives, which
+            // is what makes the two halves one rule: a non-blocking caller hears
+            // it at once, and a blocking one parks on `udp_room_for`, whose
+            // predicate asks this same question - a park whose predicate ignored
+            // the buffer would return at once, retry, be refused here, and turn
+            // the loop at full speed.
+            let queued = sock.send_queue();
+            if queued != 0 && queued.saturating_add(data.len()) > entry.opts.sndbuf as usize {
+                return Err(err::EAGAIN);
+            }
             match sock.send_slice(data, target) {
                 Ok(()) => {
                     // Queued is not sent: the extra poll puts the datagram on
@@ -2287,8 +2308,8 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool)
 /// on the far side than the datagram needs. That state clears as the buffer
 /// drains - each poll's dispatch takes one datagram out and moves the read
 /// point forward, and an empty ring is reset to contiguous - so the worst it
-/// costs is one more turn of `udp_send`'s loop, bounded by the four packet
-/// slots each of those polls takes one of.
+/// costs is one more turn of `udp_send`'s loop, bounded by the packet slots
+/// each of those polls takes one of.
 fn udp_room_for(handle: usize, size: usize) -> bool {
     super::with(handle, |stack, entry| {
         let Channel::Udp {
@@ -2301,6 +2322,7 @@ fn udp_room_for(handle: usize, size: usize) -> bool {
         };
         let sock = stack.sockets(*home).get::<udp::Socket>(*sock_handle);
         let capacity = sock.payload_send_capacity();
+        let queued = sock.send_queue();
         // A datagram wider than the whole ring can never be enqueued, and
         // `udp_send` has already answered `EMSGSIZE` for it: there is no room
         // to wait for, so the condition stays false rather than parking a
@@ -2308,7 +2330,25 @@ fn udp_room_for(handle: usize, size: usize) -> bool {
         // because the queued count is the ring's own length, which is bounded
         // by its capacity - and a wait whose predicate panics is worse than one
         // that never ends.
-        sock.can_send() && capacity >= size && capacity.saturating_sub(sock.send_queue()) >= size
+        let ring_room = capacity >= size && capacity.saturating_sub(queued) >= size;
+        // The second half is the **send buffer the caller asked for**, which is
+        // a different number from the ring: `SO_SNDBUF` is a memory figure
+        // Linux doubles and clamps (`super::sock_buffer_size`), and it is what a
+        // sender is actually refused by. The grace for an empty queue is
+        // Linux's own: the accounting compares what is *already queued* against
+        // the buffer before the new datagram is charged, so one datagram goes in
+        // whatever its size - measured, a 5600-byte datagram into a socket whose
+        // `SO_SNDBUF` reads 4608.
+        //
+        // What is counted is the payload, where Linux counts each skb's
+        // truesize (payload plus headers and structure, about 2.2 KiB for a
+        // 1400-byte datagram there against 1.4 KiB here), so the same buffer
+        // number admits three of them here and two there. The shape is the
+        // claim - a bigger buffer admits more, a smaller one refuses sooner -
+        // and `docs/uapi/` §5.2 names the accounting difference.
+        let buffer = entry.opts.sndbuf as usize;
+        let buffer_room = queued == 0 || queued.saturating_add(size) <= buffer;
+        sock.can_send() && ring_room && buffer_room
     })
     .unwrap_or(true)
 }
@@ -3992,7 +4032,7 @@ fn install_accepted(
         SOCK_STREAM,
         super::SockOpts {
             reuseaddr,
-            ..Default::default()
+            ..super::SockOpts::new(SOCK_STREAM)
         },
     ) {
         Ok(handle) => handle,
@@ -4757,14 +4797,10 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
                 }
             }
             (SOL_SOCKET, SO_SNDBUF) => {
-                if val > 0 {
-                    entry.opts.sndbuf = val as u32;
-                }
+                entry.opts.sndbuf = super::sock_buffer_size(val, super::SOCK_MIN_SNDBUF);
             }
             (SOL_SOCKET, SO_RCVBUF) => {
-                if val > 0 {
-                    entry.opts.rcvbuf = val as u32;
-                }
+                entry.opts.rcvbuf = super::sock_buffer_size(val, super::SOCK_MIN_RCVBUF);
             }
             (SOL_SOCKET, SO_LINGER) => {
                 let t = unsafe { ((optval + 4) as *const i32).read_unaligned() };

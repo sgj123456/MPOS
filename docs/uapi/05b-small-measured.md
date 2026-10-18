@@ -373,6 +373,49 @@ Section numbers are unchanged from the original `UAPI.md`.
   `tx_packets` by exactly one and `tx_bytes` by exactly the frame's size — is the pin. The park
   itself is `t-udpblock`. `docs/notes/` §10.4.
 
+- **The buffer numbers are Linux's, and a datagram socket's send queue is the number it
+  names. Landed 2026-10-18** (`docs/uapi/` §5.1 item 58). What stood here was
+  "`SO_SNDBUF`/`SO_RCVBUF` are record-only": this kernel stored the caller's figure
+  unchanged, read it back unchanged, and let the ring behind it answer for capacity.
+  Measured whole on a current host first (`.workbuddy/probe_sockbuf.c`, Linux 7.2.11,
+  `net.core.wmem_max` and `rmem_max` both 4194304, their `*_default` both 212992):
+  `setsockopt` stores **twice** the ask (2304 reads 4608, 10000 reads 20000, 100000 reads
+  200000); the doubling is clamped from below at each option's own floor - `SO_SNDBUF`
+  4608, which is why asking 100, 1 or 0 all read 4608, and `SO_RCVBUF` 2304, whose
+  doubling is visible again at 2048 -> 4096; the ceiling is the sysctl maximum applied to
+  the *ask*, which is why ten million reads back 8388608; and a **negative** ask is not an
+  error at all - read as unsigned it is capped at the maximum, so `setsockopt(-1)` answers
+  0 and the option reads 8388608. A fresh socket reports its family's own default: 212992
+  for both datagram options and 16384/131072 for a stream (`tcp_wmem`/`tcp_rmem`'s first
+  entries). The queue behind the number was measured too, with the dead-neighbour fill
+  `docs/notes/` §10.4 uses: 1400-byte datagrams from an unread buffer stop after **2** at
+  the floor, 4 at 9216, 9 at 20000 and 57 at 131072 - about 2.2 KiB charged per datagram,
+  and a 5600-byte datagram is *accepted* into a socket whose buffer reads 4608, so the
+  send buffer is not the datagram line.
+
+  Both halves are served now. The number is Linux's (`net::sock_buffer_size`, its floors
+  and its 4 MiB ceiling), and for a datagram socket it is what a sender is **refused by**:
+  `udp_send` asks the buffer before the enqueue and `udp_room_for` asks the same question,
+  so a socket at the floor admits three 1400-byte datagrams and one at the default admits
+  the ring's eleven. Linux's grace rides with it - an empty queue admits one datagram
+  whatever its size. The ring rose from 4 KiB to 16 KiB for this to be possible at all (a
+  ring smaller than the smallest buffer a caller can ask for could never be the one that
+  binds) and from 4 packet slots to 16, so the pool can hold the eleven.
+
+  **What stays named.** `SO_RCVBUF` is the number a caller reads and not a window this
+  kernel resizes: the receive ring is fixed at 16 KiB, so a socket that asks for less does
+  not shrink it (Linux drops at delivery once the queue passes the buffer). The
+  datagram-too-big line is still the ring's rather than Linux's 65507 - this stack has no
+  IP fragmentation, so a datagram wider than a frame cannot leave, and `EMSGSIZE` is the
+  honest answer where a queue entry would die at dispatch. And the count a floor buffer
+  admits is 3 here against Linux's 2, because this kernel charges the payload where Linux
+  charges each skb's truesize.
+
+  Pins: `t-sockbuf`, a new program with **12 claims** - the transformations, runnable on a
+  host as well as in the guest because the floors and the ceiling are the same numbers on
+  both - and `t-udpblock`'s `the fill stops where the send buffer's number says`, which is
+  the governing half. `docs/notes/` §15.77 carries the gates and the counterfactual.
+
 - **A terminal's foreground group is *session state*, and a reader is not its owner.
   Landed 2026-10-18** (`docs/uapi/` §5.1 item 56). The entry that stood here had two
   halves; the second - the number `TIOCGPTN` mints past the six virtual consoles - is

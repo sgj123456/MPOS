@@ -127,11 +127,18 @@ pub(crate) type EchoQueue = alloc::sync::Arc<
     critical_section::Mutex<core::cell::RefCell<alloc::collections::VecDeque<alloc::vec::Vec<u8>>>>,
 >;
 
-/// Datagrams the receive side can hold at once, and the shared byte pool
-/// behind them. A DNS answer fits in under a kilobyte; four slots cover a
-/// resolver that fires at two servers at once.
-const UDP_PACKET_SLOTS: usize = 4;
-const UDP_PAYLOAD_BYTES: usize = 4 * 1024;
+/// Datagrams a datagram socket's ring can hold at once, and the shared byte
+/// pool behind them.
+///
+/// The byte pool is what `SO_SNDBUF`/`SO_RCVBUF` are measured against, so it
+/// has to be larger than the smallest buffer a caller can ask for (4608) or the
+/// option could never bind - a four-kilobyte ring was that mistake, and it also
+/// refused a datagram a caller had a right to send. Sixteen kilobytes holds
+/// eleven MTU-sized datagrams, which puts the ring above every legal buffer and
+/// leaves the buffer in charge of when a sender is refused
+/// (`docs/uapi/` §5.1 item 58).
+const UDP_PACKET_SLOTS: usize = 16;
+const UDP_PAYLOAD_BYTES: usize = 16 * 1024;
 
 /// How one open socket is wired into the stack: which smoltcp socket it owns,
 /// and the endpoint state the syscalls layered on top of it maintain.
@@ -287,12 +294,46 @@ pub(crate) struct SockOpts {
     pub sndbuf: u32,
 }
 
-/// The receive/transmit buffer size a fresh socket reports until it is asked to
-/// change - `smoltcp`'s own default window, rounded to a round number.
-const SOCK_BUF_DEFAULT: u32 = 64 * 1024;
+/// The two sizes a fresh socket of each family reports before anyone asks.
+///
+/// These are Linux's own defaults rather than this kernel's taste, because the
+/// number is the caller's *expectation*: `net.core.wmem_default` and
+/// `rmem_default` (212992 on the host this was measured against,
+/// `.workbuddy/probe_sockbuf.c`, Linux 7.2.11) for a datagram socket, and
+/// `net.ipv4.tcp_wmem`/`tcp_rmem`'s first entries - 16384 and 131072 - for a
+/// stream. A caller that reads one back and computes `buf / 2` for a datagram
+/// size gets the number Linux gives it.
+const SOCK_DGRAM_SNDBUF_DEFAULT: u32 = 212_992;
+const SOCK_DGRAM_RCVBUF_DEFAULT: u32 = 212_992;
+const SOCK_STREAM_SNDBUF_DEFAULT: u32 = 16 * 1024;
+const SOCK_STREAM_RCVBUF_DEFAULT: u32 = 128 * 1024;
 
-impl Default for SockOpts {
-    fn default() -> SockOpts {
+/// Linux's floors, and the ceiling both options share.
+///
+/// `sock_setsockopt` stores **twice** what the caller asked for (the number is
+/// a *memory* figure and half of it is reserved for overhead) and clamps the
+/// doubled figure from below at `SOCK_MIN_SNDBUF`/`SOCK_MIN_RCVBUF`, which are
+/// 4608 and 2304 - measured: asking 100 for `SO_SNDBUF` reads back 4608, asking
+/// 4608 reads back 9216, and asking 100 for `SO_RCVBUF` reads back 2304. The
+/// ceiling is the sysctl maximum (`net.core.wmem_max`/`rmem_max`), applied to
+/// the *asked* number before the doubling, so an ask of ten million reads back
+/// twice four mebibytes. A negative ask is not an error: Linux reads it as an
+/// unsigned number, which the ceiling then caps, so it means "the largest" -
+/// measured, `setsockopt(SO_SNDBUF, -1)` answers `0` and reads back 8388608.
+pub(crate) const SOCK_MIN_SNDBUF: u32 = 4608;
+pub(crate) const SOCK_MIN_RCVBUF: u32 = 2304;
+pub(crate) const SOCK_MEM_MAX: u32 = 4 * 1024 * 1024;
+
+impl SockOpts {
+    /// The state a fresh socket of `typ` starts with. Datagram and stream
+    /// sockets report different defaults because Linux's two sysctl families do
+    /// (`SOCK_DGRAM_SNDBUF_DEFAULT` above says which and why).
+    pub(crate) fn new(typ: u16) -> SockOpts {
+        let (sndbuf, rcvbuf) = if typ == crate::net::socket::SOCK_STREAM {
+            (SOCK_STREAM_SNDBUF_DEFAULT, SOCK_STREAM_RCVBUF_DEFAULT)
+        } else {
+            (SOCK_DGRAM_SNDBUF_DEFAULT, SOCK_DGRAM_RCVBUF_DEFAULT)
+        };
         SockOpts {
             reuseaddr: false,
             keepalive: false,
@@ -300,10 +341,23 @@ impl Default for SockOpts {
             recv_ttl: false,
             linger_on: false,
             linger_sec: 0,
-            rcvbuf: SOCK_BUF_DEFAULT,
-            sndbuf: SOCK_BUF_DEFAULT,
+            rcvbuf,
+            sndbuf,
         }
     }
+}
+
+/// The number `setsockopt` stores for a buffer-size option, in Linux's shape.
+///
+/// One rule for both options (the floors differ, the shape does not): the ask
+/// is read as unsigned - so a negative amount means "as much as allowed" -
+/// capped at `SOCK_MEM_MAX`, doubled, then clamped from below at `floor`. This
+/// is the whole of what the two options *mean* to `getsockopt`; whether the
+/// number also governs a buffer is the transport's question
+/// (`src/net/socket.rs`'s `udp_room_for` asks it for a datagram socket).
+pub(crate) fn sock_buffer_size(asked: i32, floor: u32) -> u32 {
+    let capped = (asked as u32).min(SOCK_MEM_MAX);
+    (capped.saturating_mul(2)).max(floor)
 }
 
 /// One interface, the device that carries it and the sockets that live on it.
@@ -1393,7 +1447,7 @@ pub(crate) fn alloc_socket(family: u16, typ: u16, protocol: u32) -> Result<usize
             family,
             typ,
             channel: owned,
-            opts: SockOpts::default(),
+            opts: SockOpts::new(typ),
         };
         // The slot, then the handle that names it: the handle is global (see
         // `attach`) so a descriptor's number means one socket on the whole

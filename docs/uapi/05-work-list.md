@@ -2537,3 +2537,61 @@ the commit bodies), and each moved its pin in the same commit.
     refusal rows stay green, which is what they are for: an arm that does not
     exist refuses everything, and those two are the shapes it is *supposed* to
     refuse.
+
+## item 58 — a socket's buffer size is Linux's number, and a datagram queue is the size it names
+
+    `SO_SNDBUF`/`SO_RCVBUF` were the pair the ROADMAP called record-only, and both halves
+    of that were wrong: the figure stored was the caller's (not Linux's), and the figure
+    governed nothing. Measured whole on a current host first (`.workbuddy/probe_sockbuf.c`,
+    Linux 7.2.11, `wmem_max`/`rmem_max` 4194304 and their defaults 212992):
+
+    * `setsockopt` stores **twice** the ask, and `getsockopt` reports it: 2304 -> 4608,
+      10000 -> 20000, 100000 -> 200000;
+    * each option has its own floor, applied to the doubled figure: `SO_SNDBUF` 4608 (100,
+      1 and 0 all read 4608) and `SO_RCVBUF` 2304 (100 reads 2304, while 2048 reads 4096 -
+      the doubling again above half the floor);
+    * the ceiling is the sysctl maximum applied to the *ask*, so ten million reads back
+      8388608 (twice four mebibytes);
+    * a **negative** ask is not an error: Linux reads the `int` as unsigned, the maximum
+      caps it, and `setsockopt(-1)` answers 0 with 8388608 behind it;
+    * the number governs the queue. With the dead-neighbour fill (`docs/notes/` §10.4's
+      shape), 1400-byte datagrams stop after 2 at the floor, 4 at 9216, 9 at 20000 and 57 at
+      131072 - and a 5600-byte datagram is accepted into a socket reading 4608, because the
+      accounting compares what is *queued* before the new datagram is charged.
+
+    Implementation: `net::sock_buffer_size` is the rule (cap the ask at
+    `SOCK_MEM_MAX`, double, then clamp at the option's floor), `SockOpts::new(typ)` gives a
+    fresh socket its family's default (212992/212992 for a datagram socket,
+    16384/131072 for a stream), and the two `setsockopt` arms store the result, so
+    `getsockopt` needs no change. The governing half is two questions of one number:
+    `udp_send` asks it before `send_slice` and answers `EAGAIN` (the same answer the full
+    ring gives, which is what makes non-blocking and blocking one rule), and
+    `udp_room_for` asks it again so the park's predicate cannot come true while the
+    enqueue would still refuse. Linux's grace is in both: an empty queue admits one
+    datagram whatever its size. The datagram ring rose from 4 KiB to **16 KiB** and from 4
+    packet slots to **16**, which is what lets the buffer be the smaller of the two
+    numbers - a ring under 4608 could never be the one that binds.
+
+    Pin: `t-sockbuf`, a new program, **12 claims** (the four transformations on both
+    options, the two floors, the ceiling a negative ask names, the two family defaults and
+    the doubling on a stream socket), all green on a current host first - the floors and
+    the ceiling are the host's sysctls there and this kernel's constants here, which is why
+    one program pins both. Plus `t-udpblock`'s `the fill stops where the send buffer's
+    number says`: with the buffer set to its floor, three 1400-byte datagrams go in and the
+    fourth is refused (`3 * 1400 <= 4608 < 4 * 1400`).
+
+    Gate: x86_64 `pass=185 fail=0 (185 built)`, `mpos-kunit 32 passed, 0 failed`, exit 0;
+    aarch64 `pass=185 fail=0 (185 built)`; both machines' `t-sockbuf` and `t-udpblock` `ok:`
+    lines identical (12 and 16).
+
+    Counterfactual (`sock_buffer_size` back to storing the ask unchanged, the tests kept):
+    `FAIL t-sockbuf` and `FAIL t-udpblock` - the doubling claims, the floors and the fill's
+    stop point all red by name.
+
+    Still named, and measured: `SO_RCVBUF` is the number a caller reads and not a window
+    this kernel resizes (the receive ring is a fixed 16 KiB, so a smaller ask does not
+    shrink it); the datagram-too-big line remains the ring's rather than Linux's 65507,
+    because this stack has no IP fragmentation and a wider datagram could not leave the
+    machine; and a floor buffer admits three datagrams here against Linux's two, this
+    kernel charging the payload where Linux charges each skb's truesize.
+

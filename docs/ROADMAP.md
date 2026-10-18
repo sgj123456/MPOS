@@ -354,8 +354,34 @@ layer's completion path, and closing the remaining ABI gaps below.
 The full inventory — grouped by what they block, with each refusal's reason — is  
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
 `fanotify`/`keyctl`/`userfaultfd`/rseq side-objects stay `ENOSYS`; xattrs validate then `EOPNOTSUPP`;  
-the semantics still incomplete are TCP's record-only buffer sizes  
-(`SO_SNDBUF`/`SO_RCVBUF`); the two namespace kinds with no entry at all are IPC and cgroup.
+the semantics still incomplete are a datagram socket's `SO_RCVBUF` - reported in Linux's  
+shape but not what sizes the receive ring (item 58) - and the datagram line itself, which  
+is the ring's rather than Linux's 65507 until this stack fragments IP; the two namespace  
+kinds with no entry at all are IPC and cgroup.  
+
+**A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
+(`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
+record-only was wrong in both halves - the figure stored was the caller's rather than Linux's,  
+and the figure governed nothing. Measured whole on a current host first  
+(`.workbuddy/probe_sockbuf.c`, Linux 7.2.11): `setsockopt` stores **twice** the ask and  
+`getsockopt` reports it (2304 -> 4608, 10000 -> 20000, 100000 -> 200000), each option has its  
+own floor applied to the doubled figure (`SO_SNDBUF` 4608, `SO_RCVBUF` 2304 - asking 2048 for  
+the receive side reads 4096, the doubling again above half the floor), the ceiling is the  
+sysctl maximum applied to the *ask* (ten million reads back twice four mebibytes), and a  
+negative ask is not an error but "as much as allowed" (`-1` answers 0 and reads 8388608). A  
+fresh socket reports its family's own default - 212992 for both datagram options, 16384 and  
+131072 for a stream. The governing half is measured too, with the dead-neighbour fill: 1400-  
+byte datagrams stop after 2 at the floor, 4 at 9216, 9 at 20000 and 57 at 131072, while a  
+5600-byte datagram is accepted into a socket reading 4608 - so the buffer bounds the queue and  
+is not the datagram line. `net::sock_buffer_size` is the rule, `udp_send` asks it before the  
+enqueue and `udp_room_for` asks it again (the park's predicate and the refusal must be one  
+question), the datagram ring rose from 4 KiB to 16 KiB and from four packet slots to sixteen so  
+that the buffer can be the smaller number, and the grace for an empty queue is Linux's. Pins:  
+`t-sockbuf` (a new program, 12 claims, green on a host and on both machines) and `t-udpblock`'s  
+fill, which now stops where the buffer's number says. Named: `SO_RCVBUF` is a number and not a  
+window (the receive ring is a fixed 16 KiB), the datagram-too-big line is still the ring's  
+rather than 65507 (no IP fragmentation), and a floor buffer admits three here against Linux's  
+two (payload accounting against skb truesize).
 
 **Giving the terminal back is the session's act, and only the session's** (`docs/uapi/` §5.1  
 item 57, landed 2026-10-18): `TIOCNOTTY` is the residual item 56 named and did not serve. Linux  
