@@ -626,3 +626,25 @@ Section numbers are unchanged from the original `UAPI.md`.
   five discriminating claims are the two shapes, the inode number, the write-ish
   refusal, and the join landing in the descriptor's namespace rather than the copy -
   beside the host unit test `an_opened_namespace_descriptor_has_the_shape_a_host_measured`.
+
+- **A directory's `read(2)` answers `EOPNOTSUPP` where Linux answers `EISDIR` — and
+  `sendfile(2)` from one answers `EOPNOTSUPP` where Linux answers `EINVAL`.** Measured on a
+  current host first (Linux 7.2.9, `read(2)` through `ctypes`: `-1`, errno **21** `Is a
+  directory`, and `python3`'s `os.read` agreeing; `sendfile(1, dirfd, NULL, 16)`: `-1`, errno
+  **22** `Invalid argument`, while the same call from a regular file copies the bytes it was
+  asked for) and then in this kernel's own words on a booted machine (2026-10-18, `cat` on a
+  directory: `mpos: syscall 0 (fd 3) -> EOPNOTSUPP`, `cat: read error: Not supported`, with
+  `mpos: syscall 40 (fd 1) -> EOPNOTSUPP` for the `sendfile` attempt that preceded it). Both
+  are the *shape* rule of §3: `EOPNOTSUPP` tells a caller "this kind of file cannot be read
+  that way", and Linux's two answers tell it *what it named* — a program that probes a path
+  with `read` (a shell's `test`, `find`, a listing fallback) branches on the two differently.
+  The owner of the first is `src/vfs/mod.rs`'s `Inode::read_at` default, which is
+  `Err(VfsError::Unsupported)` and which a directory does not override (a directory overrides
+  the *listing* door): Linux's rule lives in the directory's own `f_op` (`read =
+  generic_read_dir`, which returns `-EISDIR`), so this is a kind-wide answer and `Inode::kind`
+  is where the tree already spells those. The second is the `sendfile` arm itself, whose Linux
+  shape validates the source's kind before it reaches any read. Not landed: the pin each wants
+  is one `t-` claim (a directory descriptor read, and a `sendfile` from one), and the kind-wide
+  answer is the half to place first — the same read is a door `getdents` does not share, so the
+  rule is "a `Dir` node has no byte reader", not "a directory cannot be opened".
+

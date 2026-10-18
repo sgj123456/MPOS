@@ -308,18 +308,27 @@ In the order that keeps each step verifiable on its own:
    gamma request's `EINVAL`, and the test read it as a refusal to remove the buffer. What remains  
    is the one measurement a `t-*` program cannot make: boot against the window (`cargo xtask run --mode gui`, or `--mode terminal` with root on the serial line as §15.36 drove it), start weston,  
    and read the pointer rendering. The serial log should carry the new `virtio-gpu: … cursorq=1`  
-   token. Two residuals stay named rather than claimed: the window confirmation itself, and the  
-   no-cursorq fallback branch, which neither configured machine can exercise (§7.4).
-4. **the display path specifically** — §7.4 carries its own order, and its first step is not a  
-   kernel change at all: boot a wlroots compositor on `WLR_RENDERER=pixman` and read what it  
-   says; it is the cheapest way to find what the analysis has wrong.
-5. **the renderer's device identity** (§7.4's last update) — niri now boots on a 3D card and the  
-   card negotiates its cap sets, so the compositor's remaining refusal is Mesa's: it still picks  
-   `llvmpipe` and names why (`egl: failed to create dri2 screen`). The lead is the DRM node's own  
-   sysfs path — `/sys/devices/virtual/drm/card0` while its `device` link reaches the PCI function,  
-   and libudev's parent walk follows the devpath. Beside it, the GL card cannot be the gate's  
-   default yet: the sweep passes on it but QEMU returns no clean debug exit. Both are §7.4's, with  
-   the numbers.
+   token — and it does (2026-10-18, the GL card: `virtio-gpu: virgl=1 context_init=1 cursorq=1  
+   capsets=2 cached=2 mask=0x6`, weston's `cursor planes: yes` beside it, §7.4). What no session can  
+   do yet is *move* a pointer and read it back: `run` wires `-monitor none`, so neither `screendump`  
+   nor `input-send-event` is reachable from the host side — the confirmation stays an eye's until a  
+   monitor is wired to one. The other residual stays named rather than claimed — the no-cursorq  
+   fallback branch, which neither configured machine can exercise (§7.4).
+4. **the display path specifically** — §7.4 carries its own order, and the step it named first is a  
+   **dead end, measured 2026-10-18**: a wlroots compositor on `WLR_RENDERER=pixman` stops in  
+   `wlr_allocator_autocreate` (`[wlr] [render/allocator/allocator.c:168] Failed to create  
+   allocator` / `[sway/server.c:306]`) on the image's `wlroots 0.20.2` — that renderer is the one  
+   with no allocator to be handed, while the same binary with its default renderer gets past the  
+   line. What the same session found in its place: `sway 1.12` fails `Unable to bind IPC socket` on  
+   the DRM backend and headless alike (the errno is the next measurement), and takes a user-mode  
+   NULL dereference it survives (§7.4 carries both instruction sites).
+5. **the renderer's device identity** — **answered** (2026-10-18). The devpath this item's own lead  
+   named has landed (2026-10-13: `/sys/devices/pci0000:00/0000:00:04.0/drm/card0`, which `udevadm  
+   info -a -n /dev/dri/card0` walks up to `SUBSYSTEMS=="pci" / DRIVERS=="virtio-pci"`), and Mesa is  
+   on the card rather than on llvmpipe: `virgl (AMD Radeon 780M Graphics (radeonsi, phoenix, ACO,  
+   DR...))`, Mesa 26.2.4, with weston's `Using GL renderer` behind it (§7.4). What keeps the GL card  
+   from being the gate's default is the *host's* Mesa teardown crash, not a refusal this kernel  
+   could answer (`machine.toml`'s key and §7.4 carry it), so the split stays.
 
 ---
 
@@ -328,10 +337,10 @@ In the order that keeps each step verifiable on its own:
 Two machines boot the same flow to a real Alpine userland; the ABI answers Linux's shape across  
 syscalls, signals, filesystems, networking, memory, devices and security, with the honest refusals  
 named. What is true today — counts, measurements, gates — is in [`notes/`](notes/index.md); this  
-section states direction only: the frontier is the two namespace kinds with no entry left (IPC and  
-cgroup), the second compositor family  
-(3D/virgl verification and the weston write fault), the block layer's completion path, and closing  
-the remaining ABI gaps below.
+section states direction only: the frontier is the two namespace kinds with no entry left (IPC and
+cgroup), the second compositor family (the wlroots one, whose first compositor to come up here is
+still unfound — `sway` binds no IPC socket and the GL card is already Mesa's, §7.4), the block
+layer's completion path, and closing the remaining ABI gaps below.
 
 ---
 

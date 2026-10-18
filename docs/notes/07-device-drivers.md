@@ -3223,3 +3223,93 @@ beat). A first draft put the claim in `t-drm` and the aarch64 sweep caught it:
 
 - which is the gate saying that a claim about a compositor's state cannot live in a
 program that never has one. Recorded (with the gate) as `15-boot-flow.md` §15.39.
+
+## A session's own two prerequisites, and what the GL card answers on it — the pixman probe the plan named is a dead end
+
+Measured 2026-10-18 on this host, the first machine, `cargo xtask run --arch x86_64 --mode terminal`
+with a root shell on the serial line, against the image baked 2026-10-17 00:59 — 25 commits behind
+`HEAD`, and every card fact below is one that image carries: the whole GL-card thread this section
+ends on (the devpath, the resource/handle and `VERSION` fixes) landed on 2026-10-13..15, before it.
+
+**Two prerequisites stand between a session and a boot on a host in this state, and neither is
+written down here yet.** The host's **running** kernel has no `nbd` — `uname -r` says
+`7.2.9-arch1-1` while `/lib/modules` carries `7.2.11-arch1-1`'s — so `qemu-nbd` cannot be attached
+and `run`'s privileged refresh stops early, verbatim: `modprobe: FATAL: Module nbd not found in
+directory /lib/modules/7.2.9-arch1-1` / `Error: nbd is not registered in /proc/devices` /
+`Error: The privileged part of the build failed`. And `qemu.vsock = true` makes the first machine's
+wiring attach `vhost-vsock-pci,guest-cid=3` **unconditionally**, so QEMU refuses to start at all:
+`Could not open '/dev/vhost-vsock': No such file or directory` (this host's node is a stale one
+renamed aside; the *second* machine's arm asks before attaching — `qemu.rs`'s
+`Path::new("/dev/vhost-vsock").exists()` — and `machine.toml`'s key documents itself as the switch
+for the first). The session booted by touching the image's stamp and turning the vsock key off for
+the length of it, and `xtask` said what the stamp move costs: `run: warning:
+.../mpos-uefi-x86_64.img predates .../mpos — it boots the code from before that build, which will
+look like a fix that changed nothing.` Neither prerequisite blocks `cargo xtask test`, whose payload
+does not ride the installed image; what they block is a session with the Alpine root.
+
+**What the card answers — the part the plan had wrong.** On this boot the GL card is Mesa's, not
+llvmpipe's:
+
+    virtio-gpu: 1280x800, 4000 KiB at /dev/fb0
+    virtio-gpu: virgl=1 context_init=1 cursorq=1 capsets=2 cached=2 mask=0x6
+    OpenGL core profile renderer: virgl (AMD Radeon 780M Graphics (radeonsi, phoenix, ACO, DR...))
+    OpenGL core profile version: 4.3 (Core Profile) Mesa 26.2.4
+
+and `weston` comes up whole on it — `Using GL renderer`, `cursor planes: yes`, `Output 'Virtual-1'
+enabled with head(s) Virtual-1`, `Loading module '/usr/lib/weston/desktop-shell.so'`, both helpers
+launched — where this section's earlier boots had `llvmpipe` under two `failed to create dri2
+screen` lines. That `cursorq=1` is the token the pointer item wanted, and the card stops churning
+once it is idle: the 39 `RESOURCE_CREATE` lines of its startup are all the session produced (0 more
+over the next 20 s). The sysfs shape libudev reads is Linux's too, measured in the guest:
+`/sys/class/drm/card0` resolves to `/sys/devices/pci0000:00/0000:00:04.0/drm/card0`, `card0/device`
+to the function, `device/vendor` is `0x1af4` and `device/device` `0x1050`, `device/subsystem`
+reaches `../../../bus/pci`, and `udevadm info -a -n /dev/dri/card0` walks up to
+`SUBSYSTEMS=="pci" / DRIVERS=="virtio-pci"` carrying both ids — so the parent walk the devpath fix
+was for really does resolve. `/sys/dev/char/226:0` also resolves to the card and its `device/drm/`
+lists `card0` and `renderD128`, which is the directory libdrm's render-node lookup
+(`drmGetRenderDeviceNameFromFd`) opens. **One attribute is worth a second look**: the function's
+`enable` reads `0` where Linux's reads `1` for a device whose memory decoding is on.
+
+**The plan's next step for the display path is a dead end, and this is the measurement that says
+so.** The roadmap's item 4 read "boot a wlroots compositor on `WLR_RENDERER=pixman` and read what it
+says; it is the cheapest way to find what the analysis has wrong". On this image it stops before it
+renders anything:
+
+    WLR_RENDERER=pixman sway
+    00:00:00.041 [ERROR] [wlr] [render/allocator/allocator.c:168] Failed to create allocator
+    00:00:00.041 [ERROR] [sway/server.c:306] Failed to create allocator
+
+The image carries `wlroots0.20-0.20.2-r1`, and the *same binary with its default renderer* gets past
+that line (to the different failure below) — so what refuses here is the pixman renderer: it is the
+one with no allocator for `wlr_allocator_autocreate` to hand back. A probe that cannot reach the
+renderer measures nothing about it.
+
+**And a wlroots compositor still does not come up here, for a reason that is not the renderer.**
+`sway 1.12` on the same boot, with the DRM backend and with `WLR_BACKENDS=headless` alike:
+
+    00:00:00.128 [ERROR] [sway/ipc-server.c:106] Unable to bind IPC socket
+
+The line carries no `: <strerror>` suffix — what `wlr_log_errno` appends when it has one — and the
+sequence it stands for is `unlink` of a stale path then `bind` of
+`$XDG_RUNTIME_DIR/sway-ipc.<uid>.<pid>.sock` (`/run/user/0` exists, root, mode 0700). So the next
+measurement is that errno, from `strace -f /usr/bin/sway` — the image has `strace`, and the
+`/root/*.log` files beside it are an earlier session's own. Each of the same runs also takes a
+user-mode page fault at address 0 and *survives* it:
+
+    user #PF at 0x4 code=PageFaultErrorCode(USER_MODE) rip=0x7e49c621b680
+    PFDIAG page=0x0 NOT MAPPED task=18 rip=0x7e49c621b680 mapped=[0x0..0x1000) bytes=[44, 8b, 46, 04, 89, c2, 31, c0, 41, 39, c0, 7e, 17, 48, 8b, 4e]
+    user #PF at 0x8c code=PageFaultErrorCode(USER_MODE) rip=0x7d54933974a4
+    PFDIAG page=0x0 NOT MAPPED task=38 rip=0x7d54933974a4 mapped=[0x0..0x1000) bytes=[8b, 85, 8c, 00, 00, 00, 31, db, 85, c0, 0f, 89, e5, 00, 00, 00]
+
+The bytes name the accesses — `mov r8d, [rsi+4]` with `rsi` 0, and `mov eax, [rbp+0x8c]` with `rbp`
+0 — and `mapped=[0x0..0x1000)` is the empty run around the hole rather than a VMA at zero, so both
+are plain NULL dereferences of a pointer some call answered 0 for. The tasks are still alive
+afterwards (`pgrep` finds the same pids), which is this kernel's own path for a task that installed
+a `SIGSEGV` handler — report, `send_signal(11)`, return — so which caller answered 0 is not yet
+named. The two instruction sites are the lead, and they recur (a third run, `rip=0x7dc7095aa680`,
+the same `0x4` access at a different ASLR base).
+
+**Left unmeasured.** Whether `sway` can come up on this card at all once the IPC question is
+answered; and the pointer (item 3), which needs a pointer *moved* on a window a session does not
+have — `run` wires `-monitor none`, so neither `screendump` nor `input-send-event` is reachable from
+the host side, and the window confirmation stays an eye's until a QEMU monitor is wired to one.
