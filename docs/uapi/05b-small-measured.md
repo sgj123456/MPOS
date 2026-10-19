@@ -5,6 +5,60 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **A task's `children` are its own, and the parent a record names is its group.** **Landed
+  2026-10-19** (`docs/uapi/` §5.1 item 65) — item 64's own residual, and the entry it replaces is
+  the paragraph at the end of item 64's below, which said `children` was the *task's* list on
+  Linux and the process's here. Both halves of one link were wrong, and one probe settled both
+  (`.workbuddy/probe_children_owner.c`, Linux 7.2.11, a leader forking a child beside a thread
+  forking another, three identical runs):
+
+  * **the file is the `task/` set's alone.** `/proc/<pid>/children` and `/proc/<tid>/children`
+    are both `ENOENT` *even for a task that has children* — the name is one of the ones Linux's
+    `tid_base_stuff` carries and `base_stuff` does not — so a reader reaches it through the group
+    and no other way;
+  * **the list is one task's**: with the leader `42204` forking `42205`/`42206` while the thread
+    `42207` forked `42208`, the leader's file was `"42205 42206 "` and the thread's `"42208 "` —
+    neither held the other's child, and a `pthread_create`d thread appears on neither;
+  * **the bytes are Linux's**: `<pid> ` per child, no newline, and a **zero-byte** file for a
+    task that has forked nobody;
+  * **a corpse stays until it is reaped**, not until it exits;
+  * and **the parent a record *names* is the group**: the thread's child read `getppid`,
+    `status`'s `PPid` and `stat`'s field 4 as `42204`, the group's leader, where the thread that
+    forked it was `42207`.
+
+  Served by `vfs::procfs::child_slots` (the list rule: keyed on the link, leaders only, a zombie
+  included), `children_of` (Linux's own separator, and the *task's* directory clause as its gate
+  — item 64's `tid_has_a_directory`, which is what retired `pid_exists`), a
+  `sched::TaskSnapshot` that carries the link beside a `ppid` that is now the parent's **group**
+  (`sched::runtime::procfs::parent_group`), and `getppid` asking the new
+  `sched::parent_group_of`. Pin: **`t-tid-dir`'s 11 new claims** (26 → 37) and the host unit test
+  `a_children_file_lists_the_children_the_task_itself_forked`.
+
+  **What stays named** is the link's *other* end: a **thread's** own parent. Linux's
+  `copy_process` gives a `CLONE_THREAD` task its creator's parent — "threads share the parent", so
+  `CLONE_THREAD` implies `CLONE_PARENT` — where this kernel's clone stores the creating task, so a
+  thread's own `PPid`/`getppid` reads its creator. Measured on a current host in the same probe:
+  the forking thread read `42203`, the group's *parent*, through all three doors while its own tid
+  was `42207`. It is not a rendering — that is what this item stopped at — and **three** behaviours
+  move with the link, each measured and each needing its own landing:
+
+  * **a thread's death notifies nobody** (measured: a `fork` child's death queues `SIGCHLD` with the
+    signal blocked, a thread's death queues nothing; this kernel's death path notifies the parent
+    whatever the task's shape, `child_exit.rs`'s unconditional wake by design);
+  * **a task's exit hands its children to an alive thread of its group** before init (measured: the
+    thread's child moved to the leader's list the moment the thread exited, its own three doors
+    unmoved; this kernel reparents to `INIT_PID`);
+  * and **`wait` asks a different question again**: Linux's `do_wait` walks every thread of the
+    caller's group (`while (tsk != current->group_leader)`), so with the forking thread still alive
+    the *leader's* `waitpid(child, WNOHANG)` answered `0` — not `ECHILD` — and a blocking wait
+    collected the child outright (its pid and status `7`), where this kernel's one eligibility rule
+    asks `task.parent == Some(me)`, the calling task, so the same call is `ECHILD`. A missing child
+    a program forked on a worker thread and waits for on the main one is this divergence.
+
+  Owners: `src/sched/runtime/child_exit.rs`'s clone line and `forget_original_parent`,
+  `src/sched/runtime/child_signal.rs`'s `notify_parent_of_death`, and
+  `src/sched/runtime/trace.rs`'s `waitable`.
+
 - **A thread's tid names a `/proc` directory now, and the clause that came with it.** **Landed
   2026-10-19** (`docs/uapi/` §5.1 item 64) — found by item 63's pin, which claimed a thread's
   `exit_signal` through the one spelling this kernel served and measured the other on the host in
@@ -43,13 +97,12 @@ Section numbers are unchanged from the original `UAPI.md`.
   `vfs::procfs::tid_has_a_directory(state, tid, pid)`, asked at the two funnels that *name* a task
   (`process_dir` and `thread_ids`).
 
-  Pin: **`t-tid-dir`**, a new program, 26 claims, and `t-clone-exit`'s one more (41 → 42), which
-  now reads the tid's own spelling beside the group's. **What stays named** is the file the two
-  spellings disagree about by *ownership*: `children` is the *task's* child list on Linux and the
-  process's here (`child_ids` filters by pid and `children_of` ignores the tid), measured on a
-  current host — a child forked by a non-leader thread appears under that thread's
-  `/proc/<pid>/task/<tid>/children` alone — so this tree answers the group's for a thread that
-  forked. Owner: `src/vfs/procfs.rs`'s `children_of`/`child_ids`.
+  Pin: **`t-tid-dir`**, a new program, 26 claims at this landing (37 after item 65's section, which
+  is the file the two spellings disagree about by *ownership* — the one thing this entry named and
+  left standing), and `t-clone-exit`'s one more (41 → 42), which now reads the tid's own spelling
+  beside the group's. **The residual this entry carried is served now** (2026-10-19, `docs/uapi/`
+  §5.1 item 65, the entry above): `children` is the *task's* child list, keyed on the link, with
+  Linux's bytes — and the parent a record names is the group.
 
 - **A FIFO is served now, parked `open` and all.** **Landed 2026-10-16** (`docs/uapi/` §5.1 item 26).
   The entry this replaces said `mknodat(S_IFIFO)` was refused

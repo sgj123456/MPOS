@@ -156,8 +156,41 @@ pub fn set_cwd_path(path: alloc::string::String) {
     with_table(|t| t.task(t.current).fs.set_cwd_path(path));
 }
 
-/// The task `id` was spawned by, when it has one in ring 3. This is what
-/// `getppid` reads through.
+/// The group of the task that forked `task`: the parent every record *names*.
+///
+/// Linux reads it where the link is kept
+/// (`task_tgid_nr_ns(rcu_dereference(p->real_parent))`), which is why one link
+/// answers two questions: `children` lists by the *task* and the `PPid`-shaped
+/// fields name its *group*.
+///
+/// `None` is one answer with two causes, and both mean there is no parent to
+/// name: a task nobody forked (init), and a parent slot the table no longer
+/// holds. The second should be unreachable for a live child - a task hands its
+/// children to another parent *at its exit* rather than at its reap
+/// (`child_exit`'s `forget_original_parent`, which reparents to `INIT_PID`) -
+/// and the fallback is there so a stale link answers "nobody" rather than a
+/// stranger's group.
+fn parent_group(t: &Table, task: &Task) -> Option<TaskId> {
+    let parent = task.parent?;
+    t.tasks.get(parent.0)?.as_ref().map(|parent| parent.tgid)
+}
+
+/// The group of the task that forked `id`, for the doors that ask the question
+/// about somebody without building a whole snapshot (`getppid`).
+pub fn parent_group_of(id: TaskId) -> Option<TaskId> {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)?
+            .as_ref()
+            .and_then(|task| parent_group(t, task))
+    })
+}
+
+/// The task `id` was spawned by, when it has one in ring 3: the **link**
+/// itself, not the number a record names (that is [`parent_group_of`]).
+///
+/// The readers are the ones that ask *which task*: the `ptrace` access check
+/// (`a parent may trace its child`), and `children`, which lists by the link.
 pub fn parent_of(id: TaskId) -> Option<TaskId> {
     with_table(|t| t.tasks.get(id.0)?.as_ref().and_then(|task| task.parent))
 }
@@ -180,8 +213,26 @@ pub struct TaskSnapshot {
     /// The process id - the thread group leader's tid, which is what `getpid`
     /// answers from any thread and what a directory in `/proc` is named after.
     pub pid: usize,
-    /// The parent, or 0 for a process with none: init's own ppid, which is
-    /// what Linux reports for pid 1.
+    /// The task that **forked** this one, by its own id: the *link*, and the
+    /// key a `children` file lists by. `None` for the task nobody forked
+    /// (init), which is why this is an `Option` while the number a record
+    /// prints is `0`.
+    ///
+    /// Only one file reads it, and that is the point: the link is the
+    /// scheduler's (`real_parent`) while the number a record *names* is
+    /// [`TaskSnapshot::ppid`], because Linux names the group there.
+    pub parent: Option<usize>,
+    /// The number a `/proc` record names as this task's parent: the **group**
+    /// of the task that forked it - Linux's `task_tgid_nr_ns(real_parent)` -
+    /// or `0` for a task nobody forked, which is what Linux reports for pid 1.
+    ///
+    /// Not the forking task's own id, and the difference is measurable rather
+    /// than a nicety: a child forked by a *non-leader thread* is named to that
+    /// thread's **group** on Linux, while the link names the thread. Measured
+    /// on a current host (`.workbuddy/probe_children_owner.c`, Linux 7.2.11):
+    /// the child of a thread read `getppid`, `status`'s `PPid` and `stat`'s
+    /// field 4 as `42093`, the group's number, where the thread that forked it
+    /// was `42096`.
     pub ppid: usize,
     pub pgid: usize,
     /// The session this task belongs to, named by its leader's task id, or 0 for
@@ -245,7 +296,8 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
     TaskSnapshot {
         tid: id.0,
         pid: task.tgid.0,
-        ppid: task.parent.map_or(0, |p| p.0),
+        parent: task.parent.map(|parent| parent.0),
+        ppid: parent_group(t, task).map_or(0, |group| group.0),
         pgid: task.pgid.0,
         session: task.session.0,
         state,

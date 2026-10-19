@@ -732,6 +732,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
     // release it before any mutations.
     let (
         parent_id,
+        space_owner,
         parent_has_space,
         parent_priority,
         parent_fds,
@@ -749,7 +750,14 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
     ) = with_table(|t| {
         let parent_id = t.current;
         let parent = t.task(parent_id);
-        let parent_has_space = parent.space.is_some();
+        // The address space a `fork` copies is the *group's*, and a thread owns
+        // none of its own: asking the calling task's slot answers "no space" for
+        // every non-leader thread, which is `ENOMEM` to a `fork` Linux serves.
+        // The same lookup `resolve_cow_fault` and `/proc` make (`space_owner`),
+        // so the three cannot disagree about whose memory the group runs on.
+        let space_owner = t.space_owner(parent_id);
+        let owner = t.task(space_owner);
+        let parent_has_space = owner.space.is_some();
         let parent_priority = parent.priority;
         let parent_fds = Arc::clone(&parent.fds);
         let parent_fs = Arc::clone(&parent.fs);
@@ -765,7 +773,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         // Collect the parent's user page mappings. We need to do this while
         // holding the borrow, then release it before calling into AddressSpace.
         let mut parent_pages = Vec::new();
-        if let Some(space) = &parent.space {
+        if let Some(space) = &owner.space {
             space.walk_user_pages(|virt, phys, flags| {
                 parent_pages.push((virt, phys, flags));
             });
@@ -783,6 +791,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         let parent_eager = parent.mm.eager_ranges();
         (
             parent_id,
+            space_owner,
             parent_has_space,
             parent_priority,
             parent_fds,
@@ -965,7 +974,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         // large process. Nothing runs on this address space between the first
         // `set_cow_bit_quietly` and the flush, because this *is* the task that
         // owns it, inside its own syscall.
-        if let Some(parent_space) = &mut t.task_mut(parent_id).space {
+        if let Some(parent_space) = &mut t.task_mut(space_owner).space {
             for &(virt, _phys, flags) in &parent_pages {
                 if flags.contains(MapFlags::COW) || !flags.contains(MapFlags::WRITE) {
                     continue;
@@ -1875,7 +1884,17 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
         // is the one taken here, because between the look and the take another
         // waiter could have collected it.
         WaitEvent::Exited { id, .. } => {
-            take_retired_for(t, id, t.current).map(|retired| WaitEvent::Exited {
+            let retired = take_retired_for(t, id, t.current)?;
+            // The slot goes with the record, as Linux's `release_task` runs
+            // inside `do_wait`: once a `wait` has answered for a child, the
+            // child is gone - out of `/proc`, and off its parent's `children`
+            // file. This kernel's reaper only buries what has no record left,
+            // so without this the corpse lingered until the next scheduler
+            // turn, and a reading taken in between still saw it. Measured on
+            // the sweep (`t-tid-dir`'s "the reap is what takes it off" and the
+            // leader's `children` file, both red before this line existed).
+            t.reap();
+            Some(WaitEvent::Exited {
                 id,
                 code: retired.code,
                 uid: retired.uid,
@@ -2140,7 +2159,16 @@ pub fn block_until_child_event(
 /// into `si_code`: `finish_wait` needs both fields, and taking the record is
 /// what makes them this collector's.
 pub(crate) fn take_retired_current(id: TaskId) -> Option<Retired> {
-    with_table(|t| take_retired_for(t, id, t.current))
+    with_table(|t| {
+        let retired = take_retired_for(t, id, t.current)?;
+        // The slot goes with the record, as Linux's `release_task` runs inside
+        // `do_wait`: once a `wait` has answered for a child, the child is gone -
+        // out of `/proc`, and off its parent's `children` file. This is the
+        // path a *blocking* `wait4(pid)` takes, which does not go through
+        // `take_event`; both doors reap here for the same reason.
+        t.reap();
+        Some(retired)
+    })
 }
 
 /// The paging root `id` runs on: its own address space's, or its thread group's

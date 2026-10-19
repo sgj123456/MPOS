@@ -870,18 +870,6 @@ fn process_ids() -> Vec<usize> {
     Vec::new()
 }
 
-#[cfg(target_os = "none")]
-fn pid_exists(pid: usize) -> bool {
-    crate::sched::snapshot(pid)
-        .map(|task| task.pid == pid)
-        .unwrap_or(false)
-}
-
-#[cfg(not(target_os = "none"))]
-fn pid_exists(_pid: usize) -> bool {
-    false
-}
-
 /// Whether a task this tree still holds has a tid that names a directory.
 ///
 /// Linux unhooks a task from the namespace it was numbered in **at its exit**,
@@ -924,20 +912,48 @@ fn thread_ids(_pid: usize) -> Vec<usize> {
     Vec::new()
 }
 
-/// The direct children of `pid`, as `children` reports them.
-#[cfg(target_os = "none")]
-fn child_ids(pid: usize) -> Vec<usize> {
-    let mut ids: Vec<usize> = crate::sched::snapshots()
-        .into_iter()
-        .filter(|task| task.pid == task.tid && task.ppid == pid)
+/// The children a task's `children` file lists: the tasks **that task**
+/// forked.
+///
+/// Keyed on the *forking task* and not on the process, which is Linux's own
+/// link (`real_parent`) and the whole of what item 64's residual named.
+/// Measured on a current host (`.workbuddy/probe_children_owner.c`, Linux
+/// 7.2.11, a live thread of a live group): a child forked by a **non-leader
+/// thread** is listed under `/proc/<pid>/task/<tid>/children` alone - the
+/// group's file held the leader's own child and not the thread's, and the
+/// thread's file the other way round, in the same instant.
+///
+/// Two clauses belong to the file rather than to the link:
+///
+///   * a **thread is not a child**: a `CLONE_THREAD` task goes on no
+///     `children` list at all (Linux's `copy_process` asks
+///     `thread_group_leader`), which is why the filter wants a leader - and
+///     it is measured: the leader's file listed its forked child while a
+///     `pthread_create`d thread of the same group stood beside it, nowhere on
+///     the list.
+///   * a **corpse stays**: a task that has exited but has not been reaped is
+///     still its parent's child, and leaves the list at the reap rather than at
+///     the exit (measured: an unreaped child that had exited was listed beside
+///     the live ones, and the reading after its `waitpid` no longer carried it).
+fn child_slots(tasks: &[Process], slot: usize) -> Vec<usize> {
+    let mut ids: Vec<usize> = tasks
+        .iter()
+        .filter(|task| task.pid == task.tid && task.parent == Some(slot))
         .map(|task| task.pid)
         .collect();
     ids.sort_unstable();
     ids
 }
 
+/// The children of the task in `slot`, as `children` reports them - the rule
+/// above over the live task table.
+#[cfg(target_os = "none")]
+fn child_ids(slot: usize) -> Vec<usize> {
+    child_slots(&crate::sched::snapshots(), slot)
+}
+
 #[cfg(not(target_os = "none"))]
-fn child_ids(_pid: usize) -> Vec<usize> {
+fn child_ids(_slot: usize) -> Vec<usize> {
     Vec::new()
 }
 
@@ -1083,6 +1099,7 @@ pub struct Process {
     pub state: char,
     pub pid: usize,
     pub tid: usize,
+    pub parent: Option<usize>,
     pub ppid: usize,
     pub pgid: usize,
     pub session: usize,
@@ -2152,21 +2169,36 @@ fn status_of(slot: usize) -> Option<String> {
     ))
 }
 
-/// `/proc/<pid>/task/<tid>/children`: the process's direct children, space
+/// `/proc/<pid>/task/<tid>/children`: the children **this task** forked, space
 /// separated, as `pstree` reads it to walk the tree without scanning /proc.
-fn children_of(pid: usize, tid: usize) -> Option<String> {
-    if !pid_exists(pid) {
+///
+/// The file belongs to the *thread* set, so it is reached through `task/` and
+/// nowhere else: measured on a current host
+/// (`.workbuddy/probe_children_owner.c`, Linux 7.2.11), `/proc/<pid>/children`
+/// and `/proc/<tid>/children` are both `ENOENT` even for a task that has
+/// children - `children` is one of the names Linux's `tid_base_stuff` carries
+/// and `base_stuff` does not - which is why [`process_dir`] adds none, and why
+/// the tid's own directory ([`process_dir`]'s set) has none either.
+///
+/// The text is Linux's exactly, byte for byte: `<pid> ` per child and
+/// **nothing at all** for a task that has forked nobody. Measured in the same
+/// run: two children answered `"42205 42206 "` - each id followed by a space -
+/// one child `"42208 "`, and a childless task a **zero-byte** file rather than
+/// a blank line.
+fn children_of(slot: usize) -> Option<String> {
+    // The gate is the *task's* own, the same clause its directory answers
+    // ([`tid_has_a_directory`]) rather than the leader's `pid_exists`: a thread
+    // that has exited takes its tid's directory with it (item 64), so its
+    // `children` file has to leave with it too - and a zombie *process* keeps
+    // both, which is the half `wait` reads a record out of.
+    let this = task(slot)?;
+    if !tid_has_a_directory(this.state, this.tid, this.pid) {
         return None;
     }
-    let _ = tid;
     let mut out = String::new();
-    for id in child_ids(pid) {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(&alloc::format!("{id}"));
+    for id in child_ids(slot) {
+        out.push_str(&alloc::format!("{} ", reader_number(id)));
     }
-    out.push('\n');
     Some(out)
 }
 
@@ -2220,15 +2252,18 @@ fn limits_of_pid(pid: usize) -> Option<String> {
 /// `/proc/<pid>/task/<tid>`: one thread's directory, and a *narrower* set than
 /// the tid's own `/proc/<tid>` answers with.
 ///
-/// The same files a process has, named for the thread, plus `children` - which
-/// Linux puts under `task` because children belong to the process, not to
-/// whichever thread is listed. The narrower set is Linux's own (`base_stuff`
-/// against `tid_base_stuff`), measured whole on a current host
-/// (`.workbuddy/probe_tid_dir.c`, Linux 7.2.11): the `task/` spelling carries
-/// `children` where `/proc/<tid>` does not, and the other way round lacks
-/// `autogroup`, `coredump_filter`, `map_files`, `mountstats`, `task`,
-/// `timens_offsets`, `timers` and `timerslack_ns`. Which is why the tid's own
-/// directory is not built here: [`process_dir`] is that set.
+/// The same files a process has, named for the thread, plus `children` - the
+/// one name this set carries and the *process* set does not, which is Linux's
+/// own split (`base_stuff` against `tid_base_stuff`) rather than a statement
+/// about whose children they are. It is the *thread's* list, and its doc
+/// carries the measurement: a child forked by a non-leader thread is listed
+/// here and on the leader's file nowhere. Measured whole on a current host
+/// (`.workbuddy/probe_tid_dir.c`, `.workbuddy/probe_children_owner.c`, Linux
+/// 7.2.11): the `task/` spelling carries `children` where `/proc/<tid>` does
+/// not, and the other way round lacks `autogroup`, `coredump_filter`,
+/// `map_files`, `mountstats`, `task`, `timens_offsets`, `timers` and
+/// `timerslack_ns`. Which is why the tid's own directory is not built here:
+/// [`process_dir`] is that set.
 fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     let node = dir();
     node.add(
@@ -2254,7 +2289,7 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     node.add(
         "children",
         NodeKind::File,
-        maybe_file(move || children_of(pid, tid)),
+        maybe_file(move || children_of(tid)),
     );
     // A thread sees the same mounts its process does, and asks at its own
     // name: `/proc/thread-self/mountinfo` is where a threaded program looks.
@@ -2515,9 +2550,10 @@ fn setgroups_ctl(pid: usize) -> Arc<dyn Inode> {
 /// convenience.
 fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
     // A tid names a **thread**, and a thread is a task this tree may describe -
-    // which is the one thing `pid_exists` (a *leader's* question, still asked
-    // where children are) is not. So the gate is the table's own: is there a
-    // user task in this slot at all? `leader` is the group's, and it is what
+    // which `process_ids` (the *listing*'s filter, which asks for a leader) is
+    // not, and which the leader's old `pid_exists` gate could not answer at
+    // all. So the gate is the table's own: is there a user task in this slot at
+    // all? `leader` is the group's, and it is what
     // the names whose Linux owner is the *thread group* are asked of - `task`
     // (one listing for the group) and `limits`/`oom_score_adj` (Linux keeps
     // both in the group's `signal_struct`). Everything else is the *task's* and
@@ -4713,5 +4749,86 @@ mod tests {
         assert!(text.contains("Pss_File:              8 kB\n"), "{text:?}");
         assert!(text.contains("Anonymous:             4 kB\n"), "{text:?}");
         assert!(text.contains("Private_Dirty:        12 kB\n"), "{text:?}");
+    }
+
+    /// One process record for the test below: the fields the rule reads, and
+    /// the defaults the rest of the file never asks a fixture for.
+    ///
+    /// `group` is what the record's `pid` carries (the thread group leader's
+    /// id) while `ppid` is the **group of the task that forked it** - the two
+    /// numbers this item keeps apart, so a fixture that set one from the other
+    /// would hide the rule it is a fixture for. The host's `Process` is the
+    /// same shape the machine's snapshot is, which is the point of the mirror.
+    fn process(
+        group: usize,
+        tid: usize,
+        parent: Option<usize>,
+        ppid: usize,
+        state: char,
+    ) -> Process {
+        Process {
+            comm: alloc::string::String::from("t"),
+            exe: alloc::string::String::new(),
+            argv: Default::default(),
+            env: Default::default(),
+            cwd: alloc::string::String::from("/"),
+            state,
+            pid: group,
+            tid,
+            parent,
+            ppid,
+            pgid: group,
+            session: 0,
+            threads: 1,
+            rss_pages: 0,
+            exit_signal: 17,
+        }
+    }
+
+    /// A task's `children` file lists the children **it** forked - by the link
+    /// and not by the group - which is item 64's residual and the rule one
+    /// probe settled. Measured on a current host
+    /// (`.workbuddy/probe_children_owner.c`, Linux 7.2.11): a child forked by a
+    /// non-leader thread was listed under that thread's `task/<tid>/children`
+    /// alone, while the leader's file carried the leader's own child.
+    ///
+    /// The two other clauses are the file's: a **thread** goes on no list (the
+    /// measurement's `pthread_create`d thread was on neither file), and a
+    /// **corpse stays** until it is reaped - `Z` is what the exit writes, so the
+    /// state letter is the only thing telling the two apart from a live child.
+    #[test]
+    fn a_children_file_lists_the_children_the_task_itself_forked() {
+        // The leader 40 (nobody forked it); a thread 41 of that group, whose
+        // own parent is the leader; a child the leader forked 42; a child the
+        // *thread* forked 43 - whose `parent` is the thread 41 while its `ppid`
+        // is the group 40, which is the whole point; and 42's own child 44, a
+        // corpse.
+        let table = alloc::vec![
+            process(40, 40, None, 0, 'S'),
+            process(40, 41, Some(40), 40, 'S'),
+            process(42, 42, Some(40), 40, 'S'),
+            process(43, 43, Some(41), 40, 'S'),
+            process(44, 44, Some(42), 42, 'Z'),
+        ];
+        assert_eq!(
+            child_slots(&table, 40),
+            alloc::vec![42],
+            "the leader's own child, and not the thread's nor the thread itself"
+        );
+        assert_eq!(
+            child_slots(&table, 41),
+            alloc::vec![43],
+            "the forking thread's own child"
+        );
+        assert_eq!(child_slots(&table, 42), alloc::vec![44], "a corpse stays");
+        assert_eq!(
+            child_slots(&table, 43),
+            alloc::vec![],
+            "and a task that forked nobody has an empty list"
+        );
+        // The filter is the *link*: a task whose parent is nobody is on no
+        // file, and asking for a slot nobody holds answers nothing.
+        assert_eq!(child_slots(&table, 44), alloc::vec![]);
+        assert_eq!(child_slots(&table, 99), alloc::vec![]);
     }
 }

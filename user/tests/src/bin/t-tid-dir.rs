@@ -53,6 +53,29 @@
 //! Every claim below is made while the thread is **alive** except the two that
 //! are about it having gone, so none of them is a reading of a task that was
 //! already on its way out.
+//!
+//! # The `children` file's owner, and the parent a record names (item 65)
+//!
+//! `children` is the one name the `task/` set carries and the process set does
+//! not, which makes it the second half of what this program is about: it is
+//! reached through the group, it answers for **one task**, and the records it
+//! sits beside name a parent differently from its own list. Measured in the same
+//! session on the same fixture shape (`.workbuddy/probe_children_owner.c`,
+//! Linux 7.2.11): the leader's child is listed under the leader alone and a
+//! **thread's** child under that thread alone; `/proc/<pid>/children` and
+//! `/proc/<tid>/children` are both `ENOENT`; the text is `<pid> ` per child and
+//! a **zero-byte** file for a task that has forked nobody; a corpse stays on the
+//! list until it is reaped; and a child forked by a thread reads `getppid`,
+//! `status`'s `PPid` and `stat`'s field 4 as the **group**, not as the tid that
+//! forked it.
+//!
+//! One shape this fixture *sees* and deliberately does not claim, because it is
+//! the parent **link** rather than a record: a thread's own parent is its
+//! creator here and its group's parent on Linux (there `CLONE_THREAD` implies
+//! `CLONE_PARENT`; measured, the forking thread read the group's parent through
+//! all three doors - `42056` where its own tid was `42060`). So a *thread's* own
+//! `PPid` is the one number on this fixture that is still not Linux's, and
+//! `docs/uapi/` §5.2 names it with that measurement.
 
 use mpos_user_tests::Report;
 
@@ -140,6 +163,29 @@ fn lists(dir: &str, number: i32) -> bool {
     names(dir).is_some_and(|list| list.iter().any(|name| name == &number.to_string()))
 }
 
+/// Collect `pid` within about two seconds, and answer whether it went.
+///
+/// Bounded rather than a blocking `waitpid`, because this program's fixtures
+/// are processes that leave when a pipe closes, and *this* program must not be
+/// the thing that hangs the sweep: a claim that never gets printed reads as a
+/// hang, which is worse than a claim that fails. A `-1` answers at once - that
+/// is `ECHILD`, which is what a wait for a task that is not this thread's child
+/// answers.
+fn reap_within(pid: i32) -> bool {
+    for _ in 0..400 {
+        let mut status = 0;
+        let got = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if got == pid {
+            return true;
+        }
+        if got == -1 {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
+}
+
 fn main() {
     println!("t-tid-dir");
     let mut r = Report::new();
@@ -155,10 +201,39 @@ fn main() {
     // It splits its own filesystem context and its own descriptor table off the
     // group's **before** it reports, because those are the two structures whose
     // owner the claims below discriminate: a directory built from the leader
-    // would answer the group's for both. Then it parks, so every reading is
-    // taken from a live thread.
-    let (report_tx, report_rx) = std::sync::mpsc::channel::<(i64, i32)>();
+    // would answer the group's for both. Then it forks a child of its own and
+    // parks, so every reading is taken from a live thread - and that child is
+    // what tells a *task's* children from its group's.
+    let (report_tx, report_rx) = std::sync::mpsc::channel::<(i64, i32, i32, i32)>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+    // The pipe the two children park on, and the one the thread's child writes
+    // its own `getppid` through. Both are made *before* the fork sites, because
+    // a forked child inherits whatever is open at the moment it is forked.
+    let mut park = [0i32; 2];
+    let mut b_report = [0i32; 2];
+    if unsafe { libc::pipe(park.as_mut_ptr()) } != 0
+        || unsafe { libc::pipe(b_report.as_mut_ptr()) } != 0
+    {
+        r.check("a pipe to park the children on", false);
+        r.finish()
+    }
+    let (park_read, park_write) = (park[0], park[1]);
+    let child_a = unsafe { libc::fork() };
+    if child_a == 0 {
+        // The leader's own child: it reports nothing, holds the read end, and
+        // leaves when the parent closes the write end. Closing *its own* copy
+        // of that end first is what makes the release reach it at all.
+        unsafe {
+            libc::close(park_write);
+            libc::close(b_report[0]);
+            libc::close(b_report[1]);
+            let mut byte = [0u8; 1];
+            let _ = libc::read(park_read, byte.as_mut_ptr().cast(), 1);
+            libc::_exit(0);
+        }
+    }
+
     let worker = std::thread::spawn(move || {
         unsafe { libc::syscall(libc::SYS_unshare, libc::CLONE_FS as libc::c_long) };
         let _ = std::env::set_current_dir("/tmp");
@@ -168,13 +243,43 @@ fn main() {
             .as_ref()
             .map(std::os::fd::AsRawFd::as_raw_fd)
             .unwrap_or(-1);
-        let _ = report_tx.send((my_tid(), fd));
+        // The thread's own child - forked *by the thread*, which is the shape
+        // that tells the two `children` files apart.
+        let child_b = unsafe { libc::fork() };
+        if child_b == 0 {
+            unsafe {
+                libc::close(park_write);
+                libc::close(b_report[0]);
+                let ppid = libc::getppid();
+                let _ = libc::write(b_report[1], std::ptr::from_ref(&ppid).cast(), 4);
+                libc::close(b_report[1]);
+                let mut byte = [0u8; 1];
+                let _ = libc::read(park_read, byte.as_mut_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        // Its own copy of the write end has to go, or the children never see
+        // the release: `unshare(CLONE_FILES)` above gave this thread a
+        // descriptor table of its own, and a reader holding a writer waits for
+        // ever. The same goes for the report pipe - a child that never reached
+        // its `write` would leave the group's read parked on *this* copy.
+        unsafe { libc::close(park_write) };
+        unsafe { libc::close(b_report[1]) };
+        let _ = report_tx.send((my_tid(), fd, child_b, b_report[0]));
         let _ = release_rx.recv();
+        // The thread's own child is *this thread's* to reap, which is the one
+        // place this program does what the *link* says rather than what Linux's
+        // `wait` does: `do_wait` walks every thread of the caller's group, so the
+        // leader collects it there (measured - the leader's `WNOHANG` was `0`
+        // while it lived and a blocking wait returned its pid and status), while
+        // this kernel's `waitable` asks the *calling task*, so a group-wide reap
+        // is `ECHILD` here and named rather than claimed (`docs/uapi/` §5.2).
+        reap_within(child_b);
         // Held until the group has read `/proc/<tid>/fd`: a dropped descriptor
         // would take the number out of the listing the claim is about.
         drop(own);
     });
-    let (tid, fd) = match report_rx.recv() {
+    let (tid, fd, child_b, b_read) = match report_rx.recv() {
         Ok(working) => working,
         Err(_) => {
             r.check("the thread under test reported", false);
@@ -185,6 +290,10 @@ fn main() {
         "the thread under test started",
         tid > 0 && pid as i64 != tid,
     );
+    // The read end of the thread's child's report is the parent's now, and its
+    // write end is the child's alone - closed here so a child that never
+    // reported answers an empty read rather than parking this program.
+    unsafe { libc::close(b_report[1]) };
 
     let tid_dir = format!("/proc/{tid}");
     let pid_dir = format!("/proc/{pid}");
@@ -321,6 +430,105 @@ fn main() {
         "and the leader's does not - the tables are two",
         fd >= 0 && in_child(|| !lists(&pid_fds, fd)),
     );
+
+    // ---- children: the list is the task's, and the parent is the group -----
+    //
+    // The two fixtures above are the shape §5.1 item 65 was measured on: the
+    // leader forked `child_a`, the worker thread forked `child_b`, and both are
+    // alive. `children` is the one name the `task/` set carries and the process
+    // set does not, so it is reached through the group and answers about *one
+    // task* - while the records beside it name that task's parent as its
+    // **group**.
+    let leader_children = format!("{pid_dir}/task/{pid}/children");
+    let thread_children = format!("{task_dir}/children");
+    let text = |path: &str| std::fs::read_to_string(path).ok();
+
+    r.check(
+        "the process's own directory carries no children file",
+        text(&format!("{pid_dir}/children")).is_none(),
+    );
+    r.check(
+        "nor does the tid's - the file is the task set's alone",
+        text(&format!("{tid_dir}/children")).is_none(),
+    );
+    // The bytes are the claim, not just the set: Linux writes `<pid> ` per
+    // child, and the length that follows is the part a "who is in there"
+    // reading would miss.
+    r.check(
+        "the leader's children file is the child the leader forked",
+        text(&leader_children).as_deref() == Some(format!("{child_a} ").as_str()),
+    );
+    r.check(
+        "and the thread's is the child the thread forked, not the leader's",
+        text(&thread_children).as_deref() == Some(format!("{child_b} ").as_str()),
+    );
+    r.check(
+        "a task that has forked nobody has a zero-byte children file",
+        text(&format!("/proc/{child_b}/task/{child_b}/children")).as_deref() == Some(""),
+    );
+
+    // The parent a record *names* is the fork-parent's group, which is what
+    // makes a thread's child answer the process rather than the thread. All
+    // three doors are asked, because they are three readers of one rule.
+    let group = pid.to_string();
+    r.check(
+        "a child forked by a thread names the group in stat's field 4",
+        field(&format!("/proc/{child_b}/stat"), 4).as_deref() == Some(group.as_str()),
+    );
+    r.check(
+        "and the same group in status's PPid",
+        status_line(&format!("/proc/{child_b}/status"), "PPid").as_deref() == Some(group.as_str()),
+    );
+    let mut raw = [0u8; 4];
+    let got = unsafe { libc::read(b_read, raw.as_mut_ptr().cast(), 4) };
+    unsafe { libc::close(b_read) };
+    r.check(
+        "and its own getppid(2) answers the group too",
+        got == 4 && i32::from_ne_bytes(raw) == pid as i32,
+    );
+    // The control, and it is one: a child the *leader* forked names the leader,
+    // which is that same group - so this claim holds before and after item 65
+    // and is here to keep the thread's own answer from being read as the
+    // general one.
+    r.check(
+        "while the child the leader forked names the leader, the same number",
+        field(&format!("/proc/{child_a}/stat"), 4).as_deref() == Some(group.as_str()),
+    );
+
+    // A corpse is still a child until it is reaped, which is the reap and not
+    // the exit that takes it off the list.
+    let dead = unsafe { libc::fork() };
+    if dead == 0 {
+        unsafe { libc::_exit(0) };
+    }
+    let listed = |pid: i32| {
+        std::fs::read_to_string(&leader_children)
+            .map(|text| text.split_whitespace().any(|id| id == pid.to_string()))
+            .unwrap_or(false)
+    };
+    // Polled rather than slept on: the exit and the listing are two events, and
+    // the corpse is only interesting once `stat` says `Z` - a live child is on
+    // the list either way, so a reading that did not wait for the letter would
+    // claim nothing.
+    let mut corpse = false;
+    for _ in 0..200 {
+        if field(&format!("/proc/{dead}/stat"), 3).as_deref() == Some("Z") && listed(dead) {
+            corpse = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    r.check("an unreaped corpse stays on its parent's list", corpse);
+    let mut dead_status = 0;
+    unsafe { libc::waitpid(dead, &mut dead_status, 0) };
+    r.check("and the reap is what takes it off", !listed(dead));
+
+    // Release the two children: closing the write end is what their reads are
+    // waiting for, and each held its own copy until then. Child A is this
+    // thread's to reap; child B is the *worker's*, and the worker does it - see
+    // the note there, which is also a divergence this program does not claim.
+    unsafe { libc::close(park_write) };
+    reap_within(child_a);
 
     // ---- and a thread that has gone takes its tid with it -----------------
     //

@@ -3126,3 +3126,101 @@ the commit bodies), and each moved its pin in the same commit.
     leader's own directory from the leader and found it there. The two descriptor claims are
     taken from a **forked child** now, where the transient descriptor lives in the child, and
     the helper says why.
+
+## item 65 — a task's `children` are its own, and the parent a record names is its group
+
+    Item 64's residual, and the last word on *which task* a record points at. Two things were
+    wrong and one probe settled both, because they are the two answers one link gives:
+    `children` was the *process's* list through every tid's file (`child_ids` filtered the task
+    table by `ppid` and `children_of` ignored the tid it was handed), and the parent a record
+    *names* was the forking task's own slot - so a child forked by a non-leader thread was told
+    its parent was that thread, where Linux names the **group**.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_children_owner.c`, Linux
+    7.2.11, a leader forking one child beside a thread forking another, both alive, three
+    identical runs):
+
+    * **the file is the `task/` set's, and only its.** `/proc/<pid>/children` and
+      `/proc/<tid>/children` are both `ENOENT` **even for a task that has children** - so
+      `children` is one of the names Linux's `tid_base_stuff` carries and `base_stuff` does not
+      (which is item 64's 54-against-47 measured from the other side), and a reader reaches it
+      through the group and no other way.
+    * **the list is one task's.** With the leader `42204` forking `42205` and `42206` while the
+      thread `42207` forked `42208`: `/proc/42204/task/42204/children` was `"42205 42206 "` and
+      `/proc/42204/task/42207/children` was `"42208 "` - neither file held the other's child,
+      and a `pthread_create`d thread appears on neither (Linux's `copy_process` puts a
+      `CLONE_THREAD` task on no `children` list at all).
+    * **the bytes are Linux's, and the empty case is the one a guess gets wrong**: each id
+      followed by a space and no newline, and a task that has forked nobody answers a
+      **zero-byte** file (`""`, 0 bytes) rather than a blank line - measured on the thread's own
+      child, which had none.
+    * **a corpse stays until it is reaped.** An exited child that has not been waited for was
+      still on its parent's list (`"42205 42206 42209 "`), and the reading *after* the `waitpid`
+      no longer carried it - so the list is the reap's, not the exit's.
+    * **and the parent a record names is the group.** The child of the *thread* read `getppid`,
+      `status`'s `PPid` and `stat`'s field 4 as **`42204`** - the group's leader - where the
+      thread that forked it was `42207`, while the child of the *leader* read `42205`'s group,
+      which is the same number as its forking task's. Three doors, one rule: Linux's
+      `task_tgid_nr_ns(real_parent)`.
+
+    The fix is one link, one key and one rendering. `sched::TaskSnapshot` gains `parent:
+    Option<usize>` (the scheduler's own `real_parent`, which only `children` reads) beside a
+    `ppid` that is now the parent's **group** (`sched::runtime::procfs::parent_group`, Linux's
+    `task_tgid_nr_ns` read where the link is kept); `vfs::procfs::child_slots` is the list rule
+    - keyed on the link, leaders only, a zombie included - and `child_ids` is that rule over the
+    live table, so the file's own gate can ask the *task's* directory clause
+    (`tid_has_a_directory`, item 64's) rather than the leader's `pid_exists`, which is deleted
+    with this landing because nothing asks a leader's question any more; `children_of` writes
+    each id through `reader_number` and Linux's own separator; and `syscall::linux::proc`'s
+    `getppid` asks the new `sched::parent_group_of`, so the three doors cannot disagree.
+
+    **The pin's own fixture then found two kernel defects, and both are Linux's answer rather
+    than a test-side shape.** (a) **`fork` from a non-leader thread was `ENOMEM`**:
+    `spawn_copy` asked the *calling task's* `space`, and a thread has none - the group's
+    address space is the leader's slot - so a program that forked on a worker thread was
+    refused a call Linux serves, which is exactly the fixture's shape (a thread forking a child
+    is what tells the two `children` files apart). The fix is the lookup the kernel already
+    makes in two other places, `Table::space_owner` - the same one `resolve_cow_fault` and
+    `/proc` ask - used for the page walk, the `parent_has_space` test and the COW hardening of
+    the parent's writable pages. (b) **A reaped child lingered in the table**: Linux's
+    `release_task` runs *inside* `do_wait`, so a child leaves `/proc` and its parent's
+    `children` list the moment a `wait` answers for it, where this kernel took the record but
+    left the slot for the scheduler's next `reap()` - so a reading taken in between still saw
+    the corpse (the leader's file carried an extra pid, and "the reap is what takes it off"
+    failed). Both doors that collect (`take_event`, and `take_retired_current` for the blocking
+    `wait4(pid)` path) now reap after taking the record.
+
+    Pin: **`t-tid-dir`'s 11 new claims** (26 → 37) - the two spellings that carry no file, the
+    two per-task lists, the zero-byte empty case, the group read through three doors, the
+    leader-side control, and the corpse pair - every one green on a current host first
+    (`MPOS_ON_HOST=1`, 37 of 37, three runs), beside the host unit test
+    `a_children_file_lists_the_children_the_task_itself_forked`, which walks the rule (a
+    thread's child, a corpse, a task with none) with no machine under it.
+
+    The counterfactuals are one per half, each with every pin kept, and each moves the
+    *machine-side* wiring rather than the rule the unit test calls: the `ppid` half put back to
+    the forking task's own slot turns **two** claims red by name - `a child forked by a thread
+    names the group in stat's field 4` and `and the same group in status's PPid` - while the
+    `children` claims stay green; keying the thread's file on the group instead turns exactly
+    the ownership claim red, `and the thread's is the child the thread forked, not the leader's`.
+
+    One thing stays named rather than served, and it is the link's *other* end: a **thread's**
+    own parent is the task that created it here, where Linux's `copy_process` gives a
+    `CLONE_THREAD` task its creator's parent ("threads share the parent", so `CLONE_THREAD`
+    implies `CLONE_PARENT`) - measured in the same probe, the forking thread read `42203`, the
+    group's *parent*, through all three doors while its own tid was `42207`. It is not a
+    rendering, which is why this item stops at the record: moving the link moves three things
+    that need their own measurement first, and all three are measured.
+
+    A thread's death must stop notifying anybody - a `fork` child's death queues `SIGCHLD` with
+    the signal blocked while a thread's death queues nothing, where this kernel's death path
+    notifies the parent whatever the task's shape (read from `child_exit.rs`, whose wake is
+    unconditional by design). A task's exit must hand its children to an *alive thread of its
+    group* before init - the thread's child moved to the leader's list the moment the thread
+    exited, its own three doors unmoved - where this kernel reparents to `INIT_PID`. And
+    **`wait` asks a different question again**: Linux's `do_wait` walks every thread of the
+    caller's group (`while (tsk != current->group_leader)`), so with the forking thread still
+    alive the *leader's* `waitpid` answered `0` from `WNOHANG` and then collected the child
+    outright (pid and status `7`), while this kernel's one eligibility rule asks
+    `task.parent == Some(me)` - the calling task - so the same call is `ECHILD`. All three are
+    named in `docs/uapi/` §5.2 with those readings.

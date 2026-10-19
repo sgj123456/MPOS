@@ -619,6 +619,31 @@ the tid-names-nothing claim — it is the *live* readings that carry the item. O
 `docs/uapi/` §5.2: `children` is the *task's* child list on Linux and the process's here, measured —  
 a child forked by a non-leader thread appears under that thread's `task/<tid>/children` alone.
 
+**A task's `children` are its own, and the parent a record names is its group** (`docs/uapi/` §5.1  
+item 65, landed 2026-10-19): item 64's residual, and the last word on *which task* a record points  
+at. `children` is reached through the *group* — `/proc/<pid>/children` and `/proc/<tid>/children` are  
+both `ENOENT` even for a task that has children, because the name is the thread set's alone — and it  
+lists the children **that task** forked, where this kernel answered the process's through every tid's  
+file. The same probe settled the link's other half, which no entry had measured: a child forked by a  
+non-leader thread is named to its **group** — `status`'s `PPid`, `stat`'s field 4 and `getppid` all  
+read the group's number (`.workbuddy/probe_children_owner.c`, Linux 7.2.11) — where this kernel named  
+the forking thread's tid. `vfs::procfs::child_slots` is the rule (keyed on the link, leaders only, a  
+corpse included until the reap), `children_of` writes Linux's own bytes (`<pid> ` per child, a  
+zero-byte file for none) and asks the *task's* directory clause as its gate, which retired  
+`pid_exists`, `sched::TaskSnapshot` carries the link beside a `ppid` that is now the parent's group,  
+and `getppid` asks the new `sched::parent_group_of`. The fixture itself then found **two kernel  
+defects**, both fixed here and both Linux's answer: `fork` from a non-leader thread answered  
+`ENOMEM` (it asked the calling task's `space`, which a thread does not own — the group's is the  
+leader's slot), and a reaped child lingered in the table until the next scheduler `reap()`, where  
+Linux's `release_task` runs inside `do_wait`. Pin: `t-tid-dir`'s **11 new claims** (26 → 37),  
+green on a current host first (37 of 37, three runs), plus the host unit test  
+`a_children_file_lists_the_children_the_task_itself_forked` (the gate figures are §15.84's). One  
+thing stays named in `docs/uapi/` §5.2: a **thread's** own parent is its creator here and its  
+group's parent on Linux (`CLONE_THREAD` implies `CLONE_PARENT` — measured, a thread reads the  
+group's parent through all three doors), so a thread's own `PPid` is still the creator, with the two  
+behaviours a link change moves measured and named beside it (a thread's death notifies nobody; a  
+task's exit hands its children to an alive thread of its group before init).
+
 **The `F_GETFL` word is the caller's own** (`docs/uapi/` §5.1 item 49, landed 2026-10-18): Linux  
 answers `filp->f_flags`, so a caller that compares the word against what it opened with agrees — its  
 mode, `O_DIRECTORY`, `O_NOFOLLOW`, `O_PATH`, `O_SYNC`, `O_ASYNC`, `O_DIRECT`, `O_NOATIME` — where  

@@ -1562,13 +1562,21 @@ fn transfer_iovs(
 /// The task table records who spawned whom in ring 3, so the answer is real:
 /// the spawner's id, or 0 for init and the tasks nobody spawned - which is
 /// also what Linux reports for init.
+///
+/// The *group* of the spawner, because that is the word Linux answers with:
+/// `getppid` is `task_tgid_vnr(current->real_parent)`, so a child forked by a
+/// non-leader thread is named to its **group** rather than to that thread's
+/// own tid. Measured on a current host (`.workbuddy/probe_children_owner.c`,
+/// Linux 7.2.11): the child of a thread read `getppid` as the group's leader,
+/// and the same number through `status`'s `PPid` and `stat`'s field 4 - which
+/// is why one accessor (`sched::parent_group_of`) answers all three.
 pub(super) fn handle_getppid() -> isize {
     // The parent's number *in the caller's namespace* - which is Linux's rule
     // and the one a container's init meets: the task that unshared has a parent
     // outside the new namespace, and the new namespace has no number for it, so
     // the answer is 0 rather than a number from a namespace the caller cannot
     // see.
-    crate::sched::parent_of(crate::sched::current())
+    crate::sched::parent_group_of(crate::sched::current())
         .and_then(crate::sched::pid_number_of)
         .map_or(0, |n| n as isize)
 }
