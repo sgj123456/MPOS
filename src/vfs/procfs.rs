@@ -1060,6 +1060,7 @@ pub struct Process {
     pub session: usize,
     pub threads: usize,
     pub rss_pages: usize,
+    pub exit_signal: u8,
 }
 
 /// One process, by pid. `None` when nothing answers to it.
@@ -1076,6 +1077,39 @@ fn task(_pid: usize) -> Option<Process> {
 // ---------------------------------------------------------------------------
 // /proc/<pid>: the files a process is described by.
 // ---------------------------------------------------------------------------
+
+/// `/proc/<pid>/stat`'s field 38, `exit_signal`: the signal this task's death
+/// reports, as Linux prints it.
+///
+/// Linux stores the byte `clone` carried on the task, rewrites that byte to
+/// **`-1`** for a task created with `CLONE_THREAD` (its `copy_process`: a
+/// thread never notifies anyone of its death), and prints what it stored - so
+/// the field is a *signed* word carrying a number no signal byte can. Measured
+/// whole on a current host first (`.workbuddy/probe_exit_signal_field.c`, Linux
+/// 7.2.11), the byte the only variable: a `fork`'s child reports `17`, a raw
+/// `clone(0)` child `0`, a `clone(SIGTERM)` child `15` (its own number, which
+/// is what makes this a report rather than a constant), a **thread** `-1`
+/// through both `/proc/<pid>/task/<tid>/stat` and the tid's own
+/// `/proc/<tid>/stat`, the *leader* of a threaded process its own `17`, and a
+/// zombie keeps the byte it died with. The file is `stat` and not `status`:
+/// `/proc/<pid>/status` has no such line at all on Linux, which the same run
+/// measured and which corrects the name `docs/ROADMAP.md` and `docs/uapi/` §5.2
+/// carried for this field (`docs/uapi/` §5.1 item 63 is the landing).
+///
+/// This kernel's threads **store** `SIGCHLD` instead of `-1`, deliberately: the
+/// one place a thread does leave a record is its group's `Retired`, and a
+/// `wait` that named that slot must not read it as a "clone" child's (the
+/// creation site in `sched::runtime::child_exit` says so in full). So the
+/// report is derived from the task's own shape rather than read off the stored
+/// byte, and the caller asks that shape the way Linux does: a task whose id is
+/// not its group's is a thread, which is Linux's own `p->pid != p->tgid`.
+fn exit_signal_field(exit_signal: u8, is_thread: bool) -> i32 {
+    if is_thread {
+        -1
+    } else {
+        i32::from(exit_signal)
+    }
+}
 
 /// The one line `/proc/<pid>/stat` is, in Linux's own field order.
 ///
@@ -1136,21 +1170,27 @@ fn stat_line(pid: usize, tid: usize) -> Option<String> {
         Cow::Borrowed("0"),                          // wchan
         Cow::Borrowed("0"),                          // nswap
         Cow::Borrowed("0"),                          // cnswap
-        Cow::Borrowed("17"),                         // exit_signal: SIGCHLD
-        Cow::Borrowed("0"),                          // processor
-        Cow::Borrowed("0"),                          // rt_priority
-        Cow::Borrowed("0"),                          // policy
-        Cow::Borrowed("0"),                          // delayacct_blkio_ticks
-        Cow::Borrowed("0"),                          // guest_time
-        Cow::Borrowed("0"),                          // cguest_time
-        Cow::Borrowed("0"),                          // start_data
-        Cow::Borrowed("0"),                          // end_data
-        Cow::Borrowed("0"),                          // start_brk
-        Cow::Borrowed("0"),                          // arg_start
-        Cow::Borrowed("0"),                          // arg_end
-        Cow::Borrowed("0"),                          // env_start
-        Cow::Borrowed("0"),                          // env_end
-        Cow::Borrowed("0"),                          // exit_code
+        // exit_signal: this task's own byte, and `-1` where it is a thread -
+        // see `exit_signal_field` for the measurement and for why the report is
+        // derived rather than read off the stored byte.
+        Cow::Owned(alloc::format!(
+            "{}",
+            exit_signal_field(task.exit_signal, task.tid != task.pid)
+        )),
+        Cow::Borrowed("0"), // processor
+        Cow::Borrowed("0"), // rt_priority
+        Cow::Borrowed("0"), // policy
+        Cow::Borrowed("0"), // delayacct_blkio_ticks
+        Cow::Borrowed("0"), // guest_time
+        Cow::Borrowed("0"), // cguest_time
+        Cow::Borrowed("0"), // start_data
+        Cow::Borrowed("0"), // end_data
+        Cow::Borrowed("0"), // start_brk
+        Cow::Borrowed("0"), // arg_start
+        Cow::Borrowed("0"), // arg_end
+        Cow::Borrowed("0"), // env_start
+        Cow::Borrowed("0"), // env_end
+        Cow::Borrowed("0"), // exit_code
     ];
     let mut out = String::new();
     for (index, field) in fields.iter().enumerate() {
@@ -3564,6 +3604,31 @@ mod tests {
         // The two halves are bits, so the both-ways word is their union rather
         // than a third value - the shape a socketpair's end reports.
         assert_eq!(fd_link_mode(ACC_RDONLY) | fd_link_mode(ACC_WRONLY), 0o700);
+    }
+
+    /// `/proc/<pid>/stat`'s field 38 is the signal this task's death reports,
+    /// and a **thread**'s is `-1` - a number no signal byte can carry, and the
+    /// reason the field is signed. Measured whole on a current host
+    /// (`.workbuddy/probe_exit_signal_field.c`, Linux 7.2.11): `17` for a
+    /// `fork`'s child, `0` for a raw `clone(0)` child, `15` for a
+    /// `clone(SIGTERM)` child, `-1` for a thread, and the leader of a threaded
+    /// process keeps its own byte.
+    ///
+    /// The `-1` is the *rendering*'s and not the storage's here, because this
+    /// kernel's threads store `SIGCHLD` on purpose (its group's `Retired` must
+    /// not be readable as a "clone" child's) - which is what makes the rule
+    /// worth a test that needs no machine under it.
+    #[test]
+    fn a_tasks_exit_signal_field_is_its_byte_or_minus_one_for_a_thread() {
+        assert_eq!(exit_signal_field(17, false), 17, "a fork's child");
+        assert_eq!(exit_signal_field(0, false), 0, "a clone(0) child");
+        assert_eq!(exit_signal_field(15, false), 15, "a clone(SIGTERM) child");
+        assert_eq!(
+            exit_signal_field(17, true),
+            -1,
+            "a thread, whatever byte its creation passed"
+        );
+        assert_eq!(exit_signal_field(0, true), -1);
     }
 
     /// The three names Linux answers as **links** are links here, with the two

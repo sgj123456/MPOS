@@ -212,6 +212,14 @@ pub struct TaskSnapshot {
     /// Frames behind the group's user mappings. `stat` wants resident pages,
     /// `status` wants kilobytes, and both are this number.
     pub rss_pages: usize,
+    /// The signal this task's death reports - the byte its `clone` carried,
+    /// held as the byte rather than as a boolean because Linux *delivers* it
+    /// and prints it. `/proc/<pid>/stat`'s field 38 is the one report of it,
+    /// and it needs one fact this field does not carry: whether the task is a
+    /// *thread*, whose report is `-1` on Linux. See
+    /// `vfs::procfs::exit_signal_field`, which owns the rendering rule and its
+    /// measurement.
+    pub exit_signal: u8,
 }
 
 /// The facts about `task`, in the shape `/proc` reports them.
@@ -251,6 +259,7 @@ pub(crate) fn snapshot_of(t: &Table, id: TaskId, task: &Task) -> TaskSnapshot {
             .unwrap_or_else(|| alloc::string::String::from("/")),
         threads: task.mm.live.load(core::sync::atomic::Ordering::Relaxed),
         rss_pages,
+        exit_signal: task.exit_signal,
     }
 }
 

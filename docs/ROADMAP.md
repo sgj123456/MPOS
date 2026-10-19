@@ -491,11 +491,12 @@ a `clone(SIGURG)` death is dropped at `SIG_DFL` unblocked while a `clone(SIGTERM
 unblocked **kills** the parent — and `SIGCONT` is *not* in it, which only its own probe can show (a  
 `clone(SIGCONT)` child's death resumes a **stopped** parent; `probe_exitsig_cont.c`). Served by  
 `sched::notify_parent_of_death` (the rule and the measurement) beside `signal::ignored_by_default`;  
-pinned by the new program `t-clone-exit` (29 claims, green on a host first, byte-identical on both  
-machines). The wake in the death path is unconditional and stays so — a parent parked in  
-`wait4(__WCLONE)` for a `clone(0)` child is woken by nothing else. One residual stays named in  
-`docs/uapi/` §5.2: `/proc/<pid>/status`'s `exit_signal` line is still the constant it has always  
-been.
+pinned by the new program `t-clone-exit` (41 claims now — 29 here, plus item 63's twelve — green on  
+a host first, byte-identical on both machines). The wake in the death path is unconditional and stays  
+so — a parent parked in `wait4(__WCLONE)` for a `clone(0)` child is woken by nothing else. The  
+residual this paragraph used to name is closed: **the record's own byte as a *report* landed  
+2026-10-19** (`docs/uapi/` §5.1 item 63) — `/proc/<pid>/stat`'s field 38 carries the task's own  
+byte, and `-1` for a thread.
 
 **A read of a watched file reports `IN_ACCESS`** (`docs/uapi/` §5.1 item 60, landed 2026-10-19):  
 the inotify module's own header had carried `IN_ACCESS` as a deliberate non-event since it landed,  
@@ -558,6 +559,32 @@ object-backed range says `dirty=N` where Linux says `mapped=N` (no dirty bit), a
 zero (a `memfd`'s pages are an object's here). One divergence runs the other way and is worth its  
 own sentence: **reading an anonymous page gathers nothing on Linux** — the read fault is satisfied  
 with the shared zero page — where this kernel materialises a frame and reports it.
+
+**`/proc/<pid>/stat`'s `exit_signal` is the task's own byte, and a thread's is `-1`** (`docs/uapi/`  
+§5.1 item 63, landed 2026-10-19): the field item 50 and item 59 both named and left standing ("a  
+rendering nothing pins"), and the last named thing on the `clone` byte's ladder. Linux stores the byte  
+`clone` carried on the task, rewrites it to **`-1`** for a task created with `CLONE_THREAD` (a thread  
+never notifies anyone of its death), and prints what it stored — so the field is a *signed* word  
+carrying a number no signal byte can. Measured whole on a current host first  
+(`.workbuddy/probe_exit_signal_field.c`, Linux 7.2.11), the byte the only variable: a `fork`'s child  
+`17`, a raw `clone(0)` child `0`, a `clone(SIGTERM)` child `15`, a **thread** `-1` (the same answer  
+its `task/<tid>` spelling and, on Linux, the tid's own `/proc/<tid>/stat` give), the *leader* of a  
+threaded process its own `17`, and a **zombie** keeps the byte it died with. This kernel answered the  
+constant `17` through every record, so a supervisor reading a `clone(0)` child's record or a thread's  
+was told a `SIGCHLD` no death of theirs would ever deliver. The report is *derived* rather than read  
+off the stored byte, because this kernel's threads deliberately store `SIGCHLD` (the one place a  
+thread does leave a record is its group's `Retired`, and a default `wait` that named that slot must  
+not read it as a "clone" child's) — so `vfs::procfs::exit_signal_field(byte, is_thread)` is the rule  
+and `sched::TaskSnapshot` carries the byte: one field, one predicate, one rendering. The file is  
+`stat` and not `status`: the two paragraphs that named this said "`/proc/<pid>/status`'s  
+`exit_signal` line", and Linux's `status` has **no such line at all** (measured in the same run),  
+which is corrected here and in `docs/uapi/`. Pin: `t-clone-exit`'s 12 new claims (29 → 41 — each  
+record read from a **live** child, the leader's control, the thread's `-1`, and the zombie's  
+state-and-byte pair) plus the host unit test  
+`a_tasks_exit_signal_field_is_its_byte_or_minus_one_for_a_thread`, which needs no machine under it.  
+Named rather than served, with the measurement beside it: a thread has no `/proc/<tid>` directory  
+here, where Linux serves one — this tree's `/proc` directory is a *leader*'s, so a thread's record is  
+reachable through `<pid>/task/<tid>/stat` alone (`docs/uapi/` §5.2).
 
 **The `F_GETFL` word is the caller's own** (`docs/uapi/` §5.1 item 49, landed 2026-10-18): Linux  
 answers `filp->f_flags`, so a caller that compares the word against what it opened with agrees — its  

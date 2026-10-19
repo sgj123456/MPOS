@@ -7,6 +7,22 @@
 //! which *kind* of child a `wait4(__WCLONE|__WALL)` may be answered about - and
 //! this program pins the delivery, the half `docs/uapi/` §5.2 named until now.
 //!
+//! # The same byte as a *report*
+//!
+//! `clone`'s byte is not only what a death delivers: Linux stores it on the
+//! task and prints it in `/proc/<pid>/stat`'s field 38, with one rewrite - a
+//! task created with `CLONE_THREAD` has it stored as **-1** (a thread never
+//! notifies anyone), so the field is a *signed* word carrying a number no
+//! signal byte can. This program pins that report too, from a **live** child's
+//! record: `17` for a `fork`'s child, `0` for a `clone(0)` child, `15` for a
+//! `clone(SIGTERM)` child, `-1` for a thread, the leader's own byte beside it,
+//! and a zombie keeps the byte it died with. Measured in the same first pass
+//! (`.workbuddy/probe_exit_signal_field.c`), which also checked that Linux's
+//! `/proc/<pid>/status` has no such line at all - the field is `stat`'s. A
+//! thread's record is read through `<pid>/task/<tid>/stat`, the one spelling
+//! this kernel serves it under (Linux also answers `/proc/<tid>`; `docs/uapi/`
+//! §5.2 names the gap).
+//!
 //! # The rule, and why it is not one rule
 //!
 //! Whether the parent is told is the parent's own disposition and mask, and the
@@ -180,6 +196,53 @@ fn wait4_opts(pid: i32, options: i32) -> (isize, i32) {
 /// The errno the last syscall left, if it failed.
 fn errno() -> Option<i32> {
     std::io::Error::last_os_error().raw_os_error()
+}
+
+/// Start a child through raw `clone` with `sig` in the low byte that **stays
+/// alive** until it is killed, for the `/proc/<pid>/stat` claims below - those
+/// need a live task's record, not a corpse's.
+///
+/// It runs the same way [`spawn`]'s child starts (no `CLONE_VM`, so its own
+/// address space, on the stack `clone` was handed) and then parks in
+/// `libc::pause()` for ever. It must never reach a line of Rust's own: this
+/// process's stdout is buffered, so a child that ran any would flush a second
+/// copy of the report before it died.
+fn spawn_alive(sig: libc::c_int) -> i32 {
+    let pid = unsafe {
+        libc::syscall(
+            libc::SYS_clone,
+            sig as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    if pid != 0 {
+        return pid as i32;
+    }
+    loop {
+        unsafe { libc::pause() };
+    }
+}
+
+/// Field `n` of the `stat` file at `path`, `proc(5)`'s numbering (1-based).
+///
+/// The comm field is parenthesised and may itself hold spaces, so the count
+/// starts after the **last** `)` - which is the rule the probe used, and the
+/// reason a field number can be asked for at all.
+fn stat_field(path: &str, n: usize) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let rest = &text[text.rfind(')')? + 1..];
+    rest.split_whitespace().nth(n - 3).map(str::to_string)
+}
+
+/// Field 38 of a `stat` file - `exit_signal` - as a signed number.
+///
+/// Signed because Linux's is: a thread's reads **-1**, a number no signal byte
+/// can carry and the reason the field is a word rather than a byte.
+fn exit_signal_of(path: &str) -> Option<i64> {
+    stat_field(path, 38)?.parse().ok()
 }
 
 fn main() {
@@ -377,6 +440,149 @@ fn main() {
     }
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
     restore(&old);
+
+    // ---- the same byte as a *report* ---------------------------------------
+    //
+    // The byte is not only what a death delivers: Linux stores it on the task
+    // and prints it in `/proc/<pid>/stat`'s field 38, with one rewrite - a task
+    // created with `CLONE_THREAD` has it stored as **-1** (a thread never
+    // notifies anyone of its death), so the field is a signed word and carries
+    // a number no signal byte can. Measured whole on a current host first
+    // (`.workbuddy/probe_exit_signal_field.c`, Linux 7.2.11), the byte the only
+    // variable: a `fork`'s child `17`, a raw `clone(0)` child `0`, a
+    // `clone(SIGTERM)` child `15`, a thread `-1`, the *leader* of a threaded
+    // process its own `17`, and a zombie keeps the byte it died with. The file
+    // is `stat` and not `status`: Linux's `/proc/<pid>/status` has no such line
+    // at all, which that probe checked in the same run. Every record below is
+    // read from a **live** child, and each child is cleaned up at the end.
+    let fork_pid = unsafe { libc::fork() };
+    if fork_pid == 0 {
+        loop {
+            unsafe { libc::pause() };
+        }
+    }
+    r.check(
+        "a fork child was started for the record claims",
+        fork_pid > 0,
+    );
+    if fork_pid > 0 {
+        r.check(
+            "a fork child's stat field 38 is SIGCHLD",
+            exit_signal_of(&format!("/proc/{fork_pid}/stat")) == Some(libc::SIGCHLD as i64),
+        );
+    }
+
+    let zero_pid = spawn_alive(0);
+    r.check(
+        "a clone(0) child was started for the record claim",
+        zero_pid > 0,
+    );
+    if zero_pid > 0 {
+        r.check(
+            "a clone(0) child's is 0 - the byte it was born with, not a constant",
+            exit_signal_of(&format!("/proc/{zero_pid}/stat")) == Some(0),
+        );
+    }
+
+    let term_pid = spawn_alive(libc::SIGTERM);
+    r.check(
+        "a clone(SIGTERM) child was started for the record claim",
+        term_pid > 0,
+    );
+    if term_pid > 0 {
+        r.check(
+            "a clone(SIGTERM) child's is its own number",
+            exit_signal_of(&format!("/proc/{term_pid}/stat")) == Some(libc::SIGTERM as i64),
+        );
+    }
+
+    // The leader of a group that has threads is *not* a thread: its own byte
+    // stands, which is what keeps the -1 below on the task's shape.
+    r.check(
+        "a threaded process's own record still carries its fork's byte",
+        exit_signal_of(&format!("/proc/{}/stat", std::process::id())) == Some(libc::SIGCHLD as i64),
+    );
+
+    // A thread's is -1, through the only name this kernel serves a thread's
+    // record under: Linux also answers `/proc/<tid>/stat` for the tid itself,
+    // which is a gap this kernel keeps and names (`docs/uapi/` §5.2) - a
+    // `/proc` directory here is a *leader*'s.
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+        let _ = tid_tx.send(tid);
+        let _ = go_rx.recv();
+    });
+    let tid = tid_rx.recv().unwrap_or(0);
+    r.check("a thread was started for the record claim", tid > 0);
+    if tid > 0 {
+        r.check(
+            "a thread's stat field 38 is -1, the number no byte can carry",
+            exit_signal_of(&format!("/proc/{}/task/{tid}/stat", std::process::id())) == Some(-1),
+        );
+    }
+    let _ = go_tx.send(());
+    let _ = handle.join();
+
+    // And a corpse keeps it: the field is the task's stored byte and not
+    // something the exit path recomputes. The child is left *unreaped* - the
+    // state claim is what says its record is a zombie's and not a live task's.
+    let dead = unsafe { libc::fork() };
+    if dead == 0 {
+        unsafe { libc::_exit(0) };
+    }
+    r.check("a child was forked to die for the zombie claim", dead > 0);
+    if dead > 0 {
+        let path = format!("/proc/{dead}/stat");
+        let mut state = None;
+        for _ in 0..200 {
+            state = stat_field(&path, 3);
+            if state.as_deref() == Some("Z") {
+                break;
+            }
+            let nap = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 10_000_000,
+            };
+            unsafe { libc::nanosleep(&nap, core::ptr::null_mut()) };
+        }
+        r.check(
+            "the dead child's record reads state Z",
+            state.as_deref() == Some("Z"),
+        );
+        r.check(
+            "and its field 38 is still the byte it was born with",
+            exit_signal_of(&path) == Some(libc::SIGCHLD as i64),
+        );
+        let mut status: i32 = 0;
+        unsafe { libc::waitpid(dead, &mut status, 0) };
+    }
+
+    // Clean-up, so a sweep is not left with stragglers - and the reason it is
+    // not one loop. Killing the `clone(SIGTERM)` child *is* a death, and a death
+    // reports its byte: the `SIGKILL` this process sends brings a `SIGTERM`
+    // back to it, which is the rule the first section pins read from the other
+    // end. So that kill happens with `SIGTERM` blocked and the record it queues
+    // is taken rather than delivered - this program's first draft ended right
+    // here, killed by its own test subject.
+    let old = block(libc::SIGTERM);
+    if term_pid > 0 {
+        unsafe { libc::kill(term_pid, libc::SIGKILL) };
+        let _ = wait4_opts(term_pid, WCLONE);
+        let _ = take(&one(libc::SIGTERM));
+    }
+    restore(&old);
+    // The other two are quiet: a `fork`'s child reports `SIGCHLD` (whose
+    // `SIG_DFL` is a no-op) and a `clone(0)` child reports nothing at all. Each
+    // is collected through the door its *kind* needs, `__WCLONE` for the raw
+    // clone whose byte is not `SIGCHLD`.
+    for (pid, options) in [(fork_pid, 0), (zero_pid, WCLONE)] {
+        if pid > 0 {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = wait4_opts(pid, options);
+        }
+    }
 
     // ---- the consequence: a SIG_DFL parent dies of it ----------------------
     //

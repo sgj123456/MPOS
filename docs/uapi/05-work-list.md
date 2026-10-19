@@ -2681,11 +2681,13 @@ the commit bodies), and each moved its pin in the same commit.
     `EAGAIN` and the five field claims read the zeroed record); the last five are the
     dispositions the old constant got wrong.
 
-    Still named, and measured: `/proc/<pid>/status`'s `exit_signal` line renders the constant
-    `17` rather than the task's byte (a rendering nothing pins), `__WNOTHREAD` stays
+    Still named, and measured: `__WNOTHREAD` stays
     accepted-and-ignored (item 50's own), and the *state change* a death `SIGCONT` carries —
     Linux's sender-side resume of a stopped parent, measured — is the `kill` path's alone and
-    is not performed for a death record.
+    is not performed for a death record. The third thing this paragraph used to name — the
+    record's own byte as a *report*, `/proc/<pid>/stat`'s `exit_signal` — **landed 2026-10-19**
+    (item **63**), and the file it named was wrong: it is `stat` and not `status`, since Linux's
+    `status` has no such line at all (measured).
 
 ## item 60 — a read of a watched file reports `IN_ACCESS`, at the doors and not in the VFS
 
@@ -2933,3 +2935,83 @@ the commit bodies), and each moved its pin in the same commit.
 
     Nothing new is left named for either file; the four divergences above are the
     list, and each is a consequence of a fact `smaps` already carries.
+
+## item 63 — `/proc/<pid>/stat`'s `exit_signal` is the task's own byte, and a thread's is `-1`
+
+    The last named thing on the `clone` byte's ladder, and the one both item 50 and item 59
+    left standing in the same words: "a rendering nothing pins". `/proc/<pid>/stat`'s field
+    38 answered the constant **`17`** through every record, so a supervisor reading a
+    `clone(0)` child's record, or a thread's, was told a `SIGCHLD` no death of theirs would
+    ever deliver.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_exit_signal_field.c`, Linux
+    7.2.11), the `clone` byte the only variable and every record read from a **live** child:
+
+    * **a `fork`'s child is `17`** — `SIGCHLD`, the byte `fork` is;
+    * **a raw `clone(0)` child is `0`** and **a `clone(SIGTERM)` child `15`** — its own
+      number, which is what makes the field a report rather than a constant;
+    * **a thread is `-1`** — a number no signal byte can carry, because Linux's
+      `copy_process` *rewrites the byte away* for a task created with `CLONE_THREAD` (a
+      thread never notifies anyone of its death) and then prints what it stored. So the
+      field is a **signed** word, and the same `-1` comes back from `/proc/<pid>/task/<tid>/
+      stat` **and** from the tid's own `/proc/<tid>/stat`;
+    * **the *leader* of a threaded process keeps its own byte** (`17`), which is what keeps
+      the `-1` on the task's *shape* rather than on the process having threads;
+    * **a zombie keeps the byte it died with** — the field is the task's stored byte, not
+      something the exit path recomputes;
+    * and **`/proc/<pid>/status` has no such line at all**, which the same probe checked: the
+      two paragraphs that named this field said "`status`'s `exit_signal` line", and the file
+      is `stat`. The naming is corrected here, in `docs/uapi/` §5.2 and in `docs/ROADMAP.md`.
+
+    **The fix is one field, one predicate and one rendering.** `sched::TaskSnapshot` carries
+    the byte (`exit_signal`, filled from `Task::exit_signal`), and
+    `vfs::procfs::exit_signal_field(byte, is_thread)` is the rule. The report is *derived*
+    from the task's shape rather than read off the stored byte, and that is deliberate: this
+    kernel's threads **store** `SIGCHLD`, because the one place a thread does leave a record
+    is its group's `Retired` and a default `wait` that named that slot must not read it as a
+    "clone" child's (the creation site's own comment says so in full) - where Linux stores
+    `-1` because nothing there reads its byte at all. So printing the stored byte would have
+    reported a thread as a `SIGCHLD` child: what has to match Linux is the *answer*, and the
+    task's own shape is the fact both kernels agree on (`p->pid != p->tgid`). Owner:
+    `src/sched/runtime/procfs.rs`'s
+    `TaskSnapshot`/`snapshot_of` and `src/vfs/procfs.rs`'s `exit_signal_field` and field 38.
+
+    Pin: **`t-clone-exit`'s 12 new claims** (29 → 41) — the five records (each from a live
+    child), the leader's control, the thread's `-1`, and the zombie's state-and-byte pair -
+    every one green on a current host first (`MPOS_ON_HOST=1`, 41 of 41, run three times
+    because a claim read out of a live task's file is read while the machine moves), beside
+    the host unit test `a_tasks_exit_signal_field_is_its_byte_or_minus_one_for_a_thread`,
+    which walks the table with no machine under it. Every claim is Linux's answer, so a host
+    run is the measurement and the sweep is the pin.
+
+    Gate: x86_64 `pass=187 fail=0 (187 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33
+    (187 staged, 11 left out by `tests.toml`); aarch64 `pass=186 fail=0`, `mpos-kunit 32
+    passed, 0 failed`, exit 0 (186 staged, 12 left out); and the program's 41 `ok:` lines are
+    byte-identical across the two machines (diffed, carriage returns aside).
+
+    Counterfactual (`Cow::Borrowed("17")` put back for field 38 - the kernel this item
+    started from, the field, the predicate, the unit test and all 41 claims kept): stage 1 is
+    **untouched** (`577 passed; 0 failed`), because the unit test calls `exit_signal_field`
+    itself and never reaches the rendering, and the sweep is `pass=186 fail=1 (187 built)`
+    with `FAIL t-clone-exit` and **three** red claims by name - `a clone(0) child's is 0 - the
+    byte it was born with, not a constant`, `a clone(SIGTERM) child's is its own number` and
+    `a thread's stat field 38 is -1, the number no byte can carry`. The other nine new claims
+    pass on both kernels *by construction*, and saying which is the point: the `fork` child, the
+    leader and the zombie all report `17` either way, and the four "was started" claims plus the
+    zombie's state are preconditions rather than pins. It is the two `clone` bytes and the `-1`
+    that carry the item, and each of them is a value the constant cannot produce.
+
+    One shape stays named rather than served, with its measurement in the same probe: a
+    thread has **no `/proc/<tid>` directory** here, where Linux serves one - the field and
+    everything beside it are reachable through `<pid>/task/<tid>/stat` alone, because this
+    tree's `/proc` directory is a *leader*'s (`pid_exists` asks `snapshot(pid).pid == pid`).
+    Owner: `src/vfs/procfs.rs`'s `pid_exists`/`process_dir` lookup, and `docs/uapi/` §5.2
+    carries it.
+
+    The pin's own first draft failed in a way worth recording, because the failure *is* item
+    59's rule: the clean-up killed the `clone(SIGTERM)` child with `SIGKILL`, and that child's
+    death delivered a `SIGTERM` to the test process - which had `SIGTERM` at `SIG_DFL` by then
+    - so the program was killed by its own test subject after 39 of its 41 claims. The kill
+    now happens with `SIGTERM` blocked and the record it queues is taken rather than
+    delivered, and the comment says why.
+

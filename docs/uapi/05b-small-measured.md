@@ -5,6 +5,23 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **A thread has no `/proc/<tid>` directory here, where Linux serves one.** Found by item 63's
+  pin, which claimed a thread's `exit_signal` through the one spelling this kernel serves and
+  measured the other on the host in the same run (`.workbuddy/probe_exit_signal_field.c`, Linux
+  7.2.11). On Linux a tid names a `/proc` directory with the whole file set: `/proc/<tid>/stat`
+  answers that thread's own record - field 38 `-1`, byte for byte the answer its
+  `<pid>/task/<tid>/stat` gives - and the tid is listed under the process's `task/` beside it.
+  This kernel's `/proc` directory is a **leader**'s (`pid_exists` asks `snapshot(pid).pid == pid`,
+  `src/vfs/procfs.rs`), so a thread's record is reachable through `<pid>/task/<tid>/stat` alone
+  and `/proc/<tid>` is `ENOENT`. It is named rather than fixed because the fix is the *lookup*
+  and everything it lets through rather than one field: `process_dir` for a non-leader tid, the
+  number a reader names such a task by (`reader_number` is "the reader's number", and a thread's
+  own is its tid), and the `NSpid`-shaped fields whose first entry would be the tid's. The
+  question worth measuring before it is built is which of the two names a *program* uses -
+  `procps` and `libc`'s `gettid`-based paths take the `task/` spelling, while a debugger reading
+  `/proc/<tid>` is the shape Linux's own `thread-self` link hands out. Owner: `src/vfs/procfs.rs`.
+  Pin: today's half is `t-clone-exit`'s thread claim, which reads the served spelling.
+
 - **A FIFO is served now, parked `open` and all.** **Landed 2026-10-16** (`docs/uapi/` §5.1 item 26).
   The entry this replaces said `mknodat(S_IFIFO)` was refused
   (`EOPNOTSUPP`) and designed the node a real one needed; the design is built. The name is a
@@ -257,9 +274,12 @@ Section numbers are unchanged from the original `UAPI.md`.
     (`.workbuddy/probe_exitsig_cont.c`), and the record is delivered. Served by
     `sched::notify_parent_of_death`, pinned by `t-clone-exit`.
     `__WNOTHREAD` also stays accepted-and-ignored (there is no second scan for it
-    to exclude a sibling group from), and `/proc/<pid>/status`'s `exit_signal`
-    line is still the constant it has always been, which is a rendering nothing
-    pins.
+    to exclude a sibling group from). The record's own byte as a *report* — the
+    last thing this entry named — **landed 2026-10-19** (`docs/uapi/` §5.1 item
+    **63**): the file is `/proc/<pid>/stat`'s field 38, not the `status` line this
+    entry named (Linux's `status` has no such line at all, measured), it carries
+    the task's own byte with **`-1`** for a thread, and `t-clone-exit` pins the
+    five records.
 
   Owner: `src/sched/runtime/task.rs`'s `ChildKind` and `Task::exit_signal`,
   threaded through the one eligibility rule (`trace.rs::waitable`) and the record
