@@ -398,6 +398,26 @@ pub fn machine_args(
         ]);
     }
 
+    // One PCIe function for the extended configuration space to be asked
+    // about, on the test machine only. Every device q35 attaches by itself is
+    // conventional PCI - measured on the gate's own machine, 2026-10-19: none
+    // of its fourteen functions carries capability id 0x10 - so without this
+    // the 4096-byte path has no device to answer for it and `t-pci` could pin
+    // only the 256 side.
+    //
+    // A bare `pcie-root-port` is not enough, measured the same day: QEMU
+    // answers its 0x100 with the standard header repeated, which is the
+    // aliasing case Linux refuses (`pci_ext_cfg_is_aliased`) and this kernel
+    // rightly keeps at 256. An NVMe controller is the device QEMU gives a real
+    // extended space to - AER at 0x100 - and with no `drive=` it has no
+    // namespace, so no block device appears and no driver here claims it. It
+    // is added last so the addresses of the devices above stay where the
+    // surrounding notes and probes expect them, and an installed disk does not
+    // get it because this is the bus the pins describe.
+    if let Boot::Esp(_) = &boot {
+        args.extend(["-device".into(), "nvme,serial=mpos-pci-ext".into()]);
+    }
+
     // The display and the wire, from the one decision both machines share
     // (`wiring`). A boot that renders nowhere still gets a display argument: a
     // `virtio-gpu-gl-pci` device refuses `-display none` outright - QEMU answers

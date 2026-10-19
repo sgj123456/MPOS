@@ -284,9 +284,9 @@ this page states the shape and points there rather than restating a number.
 - **Configuration space, and which mechanism reads it.** `docs/notes/` §7.6 (the ACPI tables, the
   MCFG reserved word a fixture agreed with the bug about) and §7.6a (the switch itself: one
   address over two mechanisms, a bus's mebibyte mapped on first access, and the both-ways walk
-  that has to agree before the window is trusted). Its open half is named in `docs/ROADMAP.md`:
-  a function's space is 4 KiB and `CFG_SIZE` is still the port mechanism's 256, so PCIe extended
-  capabilities are outside every reader.
+  that has to agree before the window is trusted), and §7.6b (the other 3840 bytes: the
+  device's own `cfg_size`, probed at 0x100 and served through `/sys` and `/proc`, with the
+  eight-bit mask that folded an extended offset back onto 0x000 as the trap the gate found).
 - **The seam and the aarch64 classes.** `docs/notes/` §9.1 (`map_mmio_window` taking the last
   x86_64-only call out of `HalImpl`; the virtio-rng over MMIO as the drivers stage's first
   device), §13.4 (the network stack holds the adapter as a contract), §13.24 (the input registry),

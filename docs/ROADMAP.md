@@ -127,7 +127,10 @@ One-glance status of the whole roadmap.
 - [x] `/dev/uinput` — a virtual input device from userspace, with its node and `add` uevent (§7.2)
 - [x] the `/dev` node set is assembled by the drivers that own it (§7.5)
 - [x] configuration space over MMIO (ECAM/MMCONFIG), refused unless both mechanisms agree (§7.6a)
-- [ ] **the window's other 3840 bytes**: PCIe extended capabilities are outside every reader (§7.6a)
+- [x] **the window's other 3840 bytes**: a function publishes `dev->cfg_size` — 256, or the
+  full 4096 when the device answers for its extended space at 0x100 and is not aliasing its
+  standard header — through `/sys/.../config` and `/proc/bus/pci`, read and written at the
+  extended offsets (§7.6a, `t-pci`)
 
 **Wayland compositor (weston) support** — verified by `t-*`; GUI end-to-end is `cargo xtask run --mode gui`:
 

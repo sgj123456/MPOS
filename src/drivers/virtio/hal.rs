@@ -105,11 +105,11 @@ mod pci_transport {
 
     impl ConfigurationAccess for IoCam {
         fn read_word(&self, df: DeviceFunction, register: u8) -> u32 {
-            pci::read32(df.bus, df.device, df.function, register)
+            pci::read32(df.bus, df.device, df.function, u16::from(register))
         }
 
         fn write_word(&mut self, df: DeviceFunction, register: u8, data: u32) {
-            pci::write32(df.bus, df.device, df.function, register, data)
+            pci::write32(df.bus, df.device, df.function, u16::from(register), data)
         }
 
         unsafe fn unsafe_clone(&self) -> Self {

@@ -198,14 +198,15 @@ impl Inode for SysSymlink {
 /// which is the difference between `lspci -vv` describing the machine as it
 /// is and describing it as it was.
 ///
-/// It is 256 bytes because that is `cfg_size` here: the address register of
-/// mechanism 1 has eight bits of offset, and the 4096-byte extended space
-/// PCIe added is not reachable through it at all.
+/// Its length is the function's own `cfg_size`: 256 for a conventional
+/// function, 4096 when the device answered for the extended space. It is not a
+/// constant, because the space is the device's and not the mechanism's.
 struct SysConfig {
     ino: Ino,
     bus: u8,
     dev: u8,
     func: u8,
+    size: u64,
 }
 
 impl Inode for SysConfig {
@@ -213,7 +214,7 @@ impl Inode for SysConfig {
         Metadata {
             ino: self.ino,
             kind: NodeKind::File,
-            size: crate::pci::CFG_SIZE,
+            size: self.size,
         }
     }
 
@@ -224,14 +225,14 @@ impl Inode for SysConfig {
     #[cfg(all(target_os = "none", mpos_pci_config))]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         Ok(crate::drivers::pci::config_read(
-            self.bus, self.dev, self.func, offset, buf,
+            self.bus, self.dev, self.func, self.size, offset, buf,
         ))
     }
 
     #[cfg(all(target_os = "none", mpos_pci_config))]
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
         Ok(crate::drivers::pci::config_write(
-            self.bus, self.dev, self.func, offset, buf,
+            self.bus, self.dev, self.func, self.size, offset, buf,
         ))
     }
 }
@@ -1271,6 +1272,7 @@ fn add_pci_attributes(
             bus: device.bus,
             dev: device.dev,
             func: device.func,
+            size: device.cfg_size,
         }),
     );
     next += 1;
@@ -1742,7 +1744,8 @@ mod tests {
         bridge.subclass = 0x04;
         bridge.header_type = 0x01;
         bridge.bridge = Some(0x01);
-        let behind = a_function(1, 0, 0);
+        let mut behind = a_function(1, 0, 0);
+        behind.cfg_size = crate::pci::CFG_EXT_SIZE;
 
         SysFs::with(
             Numbering {
@@ -2086,14 +2089,16 @@ mod tests {
     }
 
     #[test]
-    fn the_config_attribute_is_the_size_mechanism_one_can_address() {
-        // 256 bytes, and not a byte more: the address register of mechanism 1
-        // has eight bits of offset. Reporting 4096 would invite a reader to
-        // read PCIe extended capabilities that cannot be reached.
+    fn the_config_attribute_is_as_long_as_the_device_says() {
+        // A conventional function publishes the standard 256 bytes; the
+        // function behind the bridge answered for its extended space at boot,
+        // and its file is the full 4 KiB (`Device::cfg_size`).
         let fs = pci_fs();
         let config = resolve(&fs, "/sys/bus/pci/devices/0000:00:03.0/config");
         assert_eq!(config.metadata().kind, NodeKind::File);
         assert_eq!(config.metadata().size, 256);
+        let extended = resolve(&fs, "/sys/bus/pci/devices/0000:01:00.0/config");
+        assert_eq!(extended.metadata().size, 4096);
     }
 
     #[test]

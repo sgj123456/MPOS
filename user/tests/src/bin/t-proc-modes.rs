@@ -237,10 +237,11 @@ fn main() {
 
     // ---- a process's own configuration space ------------------------------
     //
-    // `/proc/bus/pci/<bus>/<dev>.<func>` is the live 256-byte window on a
-    // device, readable and writable, and Linux makes it `0644` - the word the
-    // file's own read-write shape is worth. Which bus the machine's first
-    // function sits on is asked for rather than named.
+    // `/proc/bus/pci/<bus>/<dev>.<func>` is the live configuration window on a
+    // device (256 bytes, or 4096 when the device publishes extended space:
+    // `t-pci` asks that), readable and writable, and Linux makes it `0644` -
+    // the word the file's own read-write shape is worth. Which bus the
+    // machine's first function sits on is asked for rather than named.
     let function = first_in("/proc/bus/pci", path_is_a_bus)
         .and_then(|bus| first_in(&bus, |path| path.contains('.')));
     match &function {

@@ -62,15 +62,114 @@ pub const IORESOURCE_ROM_ENABLE: u32 = 0x0000_0001;
 /// reading the same number Linux would have given it.
 pub const PCI_REGION_FLAG_MASK: u32 = 0x0f;
 
-/// How many bytes of configuration space a device has.
-///
-/// 256, always: this kernel reaches configuration space through mechanism 1
-/// (ports 0xcf8/0xcfc), whose address register has eight bits of offset. The
-/// 4096-byte extended space PCIe added is not reachable that way at all, so a
-/// device here honestly has 256 bytes and the PCIe extended capabilities are
-/// simply not visible. Reporting 4096 and reading zeros would be a lie that
-/// makes pciutils print capability headers that are not there.
+/// The standard configuration space: 256 bytes, the reach of mechanism 1's
+/// eight-bit offset register.
 pub const CFG_SIZE: u64 = 256;
+
+/// The extended configuration space PCIe added: 4096 bytes per function, one
+/// page, reachable through ECAM's one-page-per-function window. Linux calls
+/// this `PCI_CFG_SPACE_EXP_SIZE`.
+pub const CFG_EXT_SIZE: u64 = 4096;
+
+/// `PCI_STATUS_CAP_LIST`: the status register's bit 4, which says a standard
+/// capability list exists.
+pub const PCI_STATUS_CAP_LIST: u16 = 0x0010;
+/// `PCI_CAPABILITY_LIST`: where a normal or bridge header's capability list
+/// begins.
+pub const PCI_CAPABILITY_LIST: u8 = 0x34;
+/// `PCI_CB_CAPABILITY_LIST`: the same word in a CardBus bridge's header.
+pub const PCI_CB_CAPABILITY_LIST: u8 = 0x14;
+/// `PCI_CAP_ID_PCIX`: the PCI-X capability.
+pub const PCI_CAP_ID_PCIX: u8 = 0x07;
+/// `PCI_CAP_ID_EXP`: the PCI Express capability, which is what makes a
+/// function a PCIe one.
+pub const PCI_CAP_ID_PCIE: u8 = 0x10;
+/// `PCI_X_STATUS`: the PCI-X status dword, four bytes into its capability.
+pub const PCI_X_STATUS: u8 = 0x04;
+/// `PCI_X_STATUS_266MHZ` and `PCI_X_STATUS_533MHZ`: the two bits that say a
+/// PCI-X bridge can carry extended configuration cycles.
+pub const PCI_X_STATUS_266MHZ: u32 = 0x0000_0002;
+pub const PCI_X_STATUS_533MHZ: u32 = 0x0000_0001;
+/// `PCI_CLASS_BRIDGE_HOST`: base class 0x06 (bridge), subclass 0x00 (host).
+/// Linux compares it against the class code less its programming interface.
+pub const PCI_CLASS_BRIDGE_HOST: u32 = 0x0600;
+
+/// Linux's `pci_find_capability`: the offset of capability `id` in the
+/// standard list, or `None`.
+///
+/// `status` is the status register and `header_type` the header byte, both
+/// already read; `read8` reaches one byte of configuration space. The list is
+/// a chain of dword-aligned nodes whose second byte points at the next, and
+/// the walk is bounded the way Linux's is (48 nodes) because a malformed
+/// pointer may point backwards.
+pub fn find_capability(
+    status: u16,
+    header_type: u8,
+    id: u8,
+    mut read8: impl FnMut(u8) -> u8,
+) -> Option<u8> {
+    if status & PCI_STATUS_CAP_LIST == 0 {
+        return None;
+    }
+    let start = match header_type {
+        0x00 | 0x01 => PCI_CAPABILITY_LIST,
+        0x02 => PCI_CB_CAPABILITY_LIST,
+        _ => return None,
+    };
+    let mut pos = read8(start) & 0xfc;
+    for _ in 0..48 {
+        if pos == 0 {
+            return None;
+        }
+        let cap = read8(pos);
+        if cap == id {
+            return Some(pos);
+        }
+        if cap == 0 {
+            return None;
+        }
+        pos = read8(pos + 1) & 0xfc;
+    }
+    None
+}
+
+/// Linux's `pci_cfg_space_size`: how many bytes of configuration space a
+/// function publishes.
+///
+/// The standard space is 256; a PCIe function, a host bridge and a PCI-X mode
+/// 2 function may have the 4096-byte extended space, but "may" is asked of the
+/// device rather than assumed. `read32` reads one configuration dword, and is
+/// called only for those functions: an all-ones answer at 0x100 is the
+/// machine saying the extended space is not reachable, and a function whose
+/// whole extended space is the standard header repeated is a bridge aliasing
+/// its low 256 bytes (`pci_ext_cfg_is_aliased`), which is not extended space
+/// either.
+///
+/// `class` is the 24-bit class code, `pcie` whether the PCI Express capability
+/// is present, and `pcix_mode_2` whether the PCI-X capability's status reports
+/// 266 MHz or 533 MHz.
+pub fn cfg_space_size(
+    class: u32,
+    pcie: bool,
+    pcix_mode_2: bool,
+    mut read32: impl FnMut(u16) -> u32,
+) -> u64 {
+    if (class >> 8) != PCI_CLASS_BRIDGE_HOST && !pcie && !pcix_mode_2 {
+        return CFG_SIZE;
+    }
+    if read32(0x100) == PCI_ERROR_RESPONSE {
+        return CFG_SIZE;
+    }
+    let header = read32(0);
+    let mut at = 0x100u16;
+    while at < CFG_EXT_SIZE as u16 {
+        if read32(at) != header {
+            return CFG_EXT_SIZE;
+        }
+        at += CFG_SIZE as u16;
+    }
+    CFG_SIZE
+}
 
 /// One base address register (or the expansion ROM), as Linux models it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -356,6 +455,15 @@ pub struct Device {
     /// BAR0..BAR5 and the expansion ROM, in that order. A BAR the device does
     /// not implement, and a bridge's bridge registers, are [`Bar::EMPTY`].
     pub bars: [Bar; 7],
+    /// How many bytes of configuration space the function publishes:
+    /// [`CFG_SIZE`] or [`CFG_EXT_SIZE`], Linux's `dev->cfg_size`.
+    ///
+    /// Probed once, at enumeration, because the answer is the device's and
+    /// not the mechanism's: a function that may have extended space is asked
+    /// at 0x100, and keeps 4096 only when the answer is real. A machine with
+    /// no memory-mapped window therefore answers 256 for every function, the
+    /// same way Linux's probe does over the port pair alone.
+    pub cfg_size: u64,
     /// The driver that bound this function, for `lspci -k`. `None` until
     /// something claims it - see [`claim`].
     pub driver: Option<&'static str>,
@@ -570,6 +678,7 @@ impl Device {
             subsys_id: 0x0002,
             irq: 0x0b,
             bars: [Bar::EMPTY; 7],
+            cfg_size: CFG_SIZE,
             driver: None,
             drm_card: false,
         }
@@ -700,6 +809,7 @@ mod tests {
                 Bar::EMPTY,
                 Bar::EMPTY,
             ],
+            cfg_size: CFG_SIZE,
             driver: None,
             drm_card: false,
         }
@@ -725,6 +835,7 @@ mod tests {
             subsys_id: 0x0000,
             irq: 0x00,
             bars: [Bar::EMPTY; 7],
+            cfg_size: CFG_SIZE,
             driver: None,
             drm_card: false,
         }
@@ -1136,5 +1247,110 @@ mod tests {
             "the claim went with the snapshot"
         );
         publish(Vec::new());
+    }
+
+    #[test]
+    fn a_capability_list_is_walked_to_the_id_asked_for() {
+        // 0x40 power management, then 0x60 PCI Express, then the end.
+        let read = |off: u8| match off {
+            0x34 => 0x40,
+            0x40 => 0x01,
+            0x41 => 0x60,
+            0x60 => PCI_CAP_ID_PCIE,
+            0x61 => 0x00,
+            _ => 0x00,
+        };
+        assert_eq!(
+            find_capability(PCI_STATUS_CAP_LIST, 0x00, PCI_CAP_ID_PCIE, read),
+            Some(0x60)
+        );
+        assert_eq!(
+            find_capability(PCI_STATUS_CAP_LIST, 0x00, 0x05, read),
+            None,
+            "a list with no such capability ends at the id that is zero"
+        );
+        assert_eq!(
+            find_capability(0, 0x00, PCI_CAP_ID_PCIE, read),
+            None,
+            "without the status bit the word at 0x34 is not a list"
+        );
+        // A CardBus header keeps its list somewhere else, and Linux reads
+        // that word rather than the normal one.
+        let cardbus = |off: u8| match off {
+            0x14 => 0x40,
+            0x40 => PCI_CAP_ID_PCIE,
+            _ => 0,
+        };
+        assert_eq!(
+            find_capability(PCI_STATUS_CAP_LIST, 0x02, PCI_CAP_ID_PCIE, cardbus),
+            Some(0x40)
+        );
+    }
+
+    #[test]
+    fn a_cycle_in_the_list_stops_at_linuxs_bound_rather_than_hanging() {
+        // 0x40 points at itself. Linux walks at most 48 nodes and answers
+        // "not found"; a walk that trusted the pointer would never return.
+        let read = |off: u8| match off {
+            0x34 => 0x40,
+            0x40 => 0x01,
+            0x41 => 0x40,
+            _ => 0,
+        };
+        assert_eq!(
+            find_capability(PCI_STATUS_CAP_LIST, 0x00, PCI_CAP_ID_PCIE, read),
+            None
+        );
+    }
+
+    #[test]
+    fn extended_space_is_asked_of_the_device_and_not_assumed() {
+        // A conventional endpoint is not asked at all: one read of 0x100 on a
+        // bridge that aliases would be harmless, but Linux does not make it,
+        // and the size is 256 without a question.
+        assert_eq!(
+            cfg_space_size(0x0200_00, false, false, |_| panic!("not probed")),
+            CFG_SIZE
+        );
+
+        // A PCIe function whose 0x100 answers all ones has no extended space
+        // reachable through this machine's mechanism.
+        let size = cfg_space_size(0x0200_00, true, false, |off| {
+            assert_eq!(off, 0x100);
+            PCI_ERROR_RESPONSE
+        });
+        assert_eq!(size, CFG_SIZE);
+
+        // A real extended capability header at 0x100: 4096.
+        let read = |off: u16| match off {
+            0x0 => 0x1af4_1001,
+            0x100 => 0x0000_000b,
+            _ => 0,
+        };
+        assert_eq!(cfg_space_size(0x0200_00, true, false, read), CFG_EXT_SIZE);
+
+        // A host bridge is probed even with no PCIe capability, because its
+        // extended space is what the machine's own root complex publishes.
+        let host = |off: u16| if off == 0 { 0x1022_14e8 } else { 0 };
+        assert_eq!(cfg_space_size(0x0600_00, false, false, host), CFG_EXT_SIZE);
+
+        // PCI-X mode 2 is the other door: a bridge that carries extended
+        // cycles can have the space without being PCIe.
+        assert_eq!(
+            cfg_space_size(0x0604_00, false, true, |off| if off == 0 {
+                0x1022_14ed
+            } else {
+                0
+            }),
+            CFG_EXT_SIZE
+        );
+
+        // A bridge that drops the extended register bits answers the standard
+        // header at every 0x100 boundary; that is an alias, not extended space
+        // (`pci_ext_cfg_is_aliased`), and Linux keeps 256.
+        assert_eq!(
+            cfg_space_size(0x0604_00, true, false, |_| 0x1022_14ed),
+            CFG_SIZE
+        );
     }
 }

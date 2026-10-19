@@ -17,17 +17,20 @@
 //! # Two mechanisms, and why the choice is made at boot
 //!
 //! Mechanism 1 reaches 256 bytes of configuration space per function: its
-//! address register has eight bits of offset. That is why a device here has
-//! [`crate::pci::CFG_SIZE`] bytes and no PCIe extended capabilities. A PCIe
-//! machine may instead decode configuration space as *memory* - ECAM, or
-//! MMCONFIG: one 4 KiB page per function, one 1 MiB window per bus, at an address
-//! its ACPI MCFG table names - and Linux prefers that, because the window reaches
-//! the whole 4 KiB. `docs/NOTES.md` §7.6 reads the firmware's tables; this module
-//! is what uses what they said. The window reaches all 4 KiB, but this kernel
-//! still publishes [`crate::pci::CFG_SIZE`] bytes per function - the port
-//! mechanism's reach - so that a `/sys` file's size does not depend on which
-//! mechanism the firmware happened to name; §7.6a carries the extended
-//! capabilities as the follow-on.
+//! address register has eight bits of offset. A PCIe machine may instead decode
+//! configuration space as *memory* - ECAM, or MMCONFIG: one 4 KiB page per
+//! function, one 1 MiB window per bus, at an address its ACPI MCFG table names -
+//! and Linux prefers that, because the window reaches the whole 4 KiB.
+//! `docs/NOTES.md` §7.6 reads the firmware's tables; this module is what uses
+//! what they said.
+//!
+//! A function's *published* size is the device's answer rather than the
+//! mechanism's: [`cfg_size`] asks a PCIe function, a host bridge or a PCI-X mode
+//! 2 bridge for the dword at 0x100 and keeps 4096 only when that answers
+//! something real and the extended space is not the standard header repeated.
+//! Linux's `pci_cfg_space_size` is the rule, step for step; on a machine with
+//! only the port pair the probe reads all ones and every function stays 256,
+//! which is Linux's answer there too.
 //!
 //! The window is *mapped a bus at a time*, on the first access to that bus
 //! ([`slice`]): this machine's MCFG covers 256 buses - 256 MiB of address space -
@@ -44,8 +47,9 @@ use critical_section::Mutex;
 use crate::acpi::EcamRange;
 use crate::boot::BootInfo;
 use crate::pci::{
-    Bar, CFG_SIZE, Device, PCI_ERROR_RESPONSE, PCI_ROM_ADDRESS_MASK, ROM_INDEX, bar_flags,
-    bar_range, rom_bar,
+    Bar, Device, PCI_CAP_ID_PCIE, PCI_CAP_ID_PCIX, PCI_ERROR_RESPONSE, PCI_ROM_ADDRESS_MASK,
+    PCI_X_STATUS, PCI_X_STATUS_266MHZ, PCI_X_STATUS_533MHZ, ROM_INDEX, bar_flags, bar_range,
+    rom_bar,
 };
 
 /// Mechanism 1's address and data ports: only an x86_64 machine has an I/O
@@ -142,7 +146,7 @@ fn slice(bus: u8) -> Option<usize> {
 ///
 /// The layout is [`crate::acpi::function_offset`]'s - written down beside the
 /// reader that validated the table it came from, and not a second time here.
-fn window_byte(bus: u8, dev: u8, func: u8, off: u8) -> Option<usize> {
+fn window_byte(bus: u8, dev: u8, func: u8, off: u16) -> Option<usize> {
     let slice = slice(bus)?;
     Some(slice + crate::acpi::function_offset(dev, func)? as usize + off as usize)
 }
@@ -289,24 +293,32 @@ mod ports {
 ///
 /// Through the window this is one aligned load of device memory - the whole
 /// reason ECAM exists is that a 4 KiB page per function can be addressed as
-/// memory - and `off & 0xfc` is the same mask mechanism 1's address register
-/// applies, so the two mechanisms reach the same register for the same argument.
-pub fn read32(bus: u8, slot: u8, func: u8, off: u8) -> u32 {
-    match window_byte(bus, slot, func, off & 0xfc) {
+/// memory - and the mask clears the same two address bits mechanism 1's
+/// register does. The mask is twelve bits wide because an extended offset is:
+/// `0xfc` would clear bits 8..15 and fold 0x100 back onto 0x000, which is what
+/// an aliasing bridge looks like.
+pub fn read32(bus: u8, slot: u8, func: u8, off: u16) -> u32 {
+    match window_byte(bus, slot, func, off & !0x3) {
         // SAFETY: the window is device memory the firmware named and this module
         // mapped, and the address is four-byte aligned inside its page.
         Some(address) => unsafe { core::ptr::read_volatile(address as *const u32) },
-        None => ports::read32(bus, slot, func, off),
+        // Beyond the port pair's reach there is no third mechanism: the
+        // extended space is a window's alone, and an access with no window
+        // answers what an absent function answers rather than reading the
+        // low 256 bytes twice.
+        None if off > 0xff => PCI_ERROR_RESPONSE,
+        None => ports::read32(bus, slot, func, off as u8),
     }
 }
 
 /// Write a configuration dword. See [`read32`] for the two mechanisms.
-pub fn write32(bus: u8, slot: u8, func: u8, off: u8, value: u32) {
-    match window_byte(bus, slot, func, off & 0xfc) {
+pub fn write32(bus: u8, slot: u8, func: u8, off: u16, value: u32) {
+    match window_byte(bus, slot, func, off & !0x3) {
         // SAFETY: as `read32`, and the register was read through the same address
         // arithmetic before anything wrote to it.
         Some(address) => unsafe { core::ptr::write_volatile(address as *mut u32, value) },
-        None => ports::write32(bus, slot, func, off, value),
+        None if off > 0xff => {}
+        None => ports::write32(bus, slot, func, off as u8, value),
     }
 }
 
@@ -315,12 +327,13 @@ pub fn write32(bus: u8, slot: u8, func: u8, off: u8, value: u32) {
 /// A *byte* access under either mechanism, which is what makes a byte read see
 /// what a byte write wrote: the port pair's data port reaches only the bytes a
 /// narrower access names, and a memory window is byte-addressable outright.
-pub fn read8(bus: u8, slot: u8, func: u8, off: u8) -> u8 {
+pub fn read8(bus: u8, slot: u8, func: u8, off: u16) -> u8 {
     match window_byte(bus, slot, func, off) {
         // SAFETY: device memory this module mapped; a byte load has no alignment
         // requirement.
         Some(address) => unsafe { core::ptr::read_volatile(address as *const u8) },
-        None => ports::read8(bus, slot, func, off),
+        None if off > 0xff => 0xff,
+        None => ports::read8(bus, slot, func, off as u8),
     }
 }
 
@@ -332,30 +345,33 @@ pub fn read8(bus: u8, slot: u8, func: u8, off: u8) -> u8 {
 /// word is the *status* word, whose error bits are cleared by writing ones.
 /// A read-modify-write there would silently throw away every error flag the
 /// device had raised.
-pub fn write8(bus: u8, slot: u8, func: u8, off: u8, value: u8) {
+pub fn write8(bus: u8, slot: u8, func: u8, off: u16, value: u8) {
     match window_byte(bus, slot, func, off) {
         // SAFETY: as `read8`.
         Some(address) => unsafe { core::ptr::write_volatile(address as *mut u8, value) },
-        None => ports::write8(bus, slot, func, off, value),
+        None if off > 0xff => {}
+        None => ports::write8(bus, slot, func, off as u8, value),
     }
 }
 
 /// Read a 16-bit configuration register. `off` must be even.
-pub fn read16(bus: u8, slot: u8, func: u8, off: u8) -> u16 {
-    match window_byte(bus, slot, func, off & 0xfe) {
+pub fn read16(bus: u8, slot: u8, func: u8, off: u16) -> u16 {
+    match window_byte(bus, slot, func, off & !0x1) {
         // SAFETY: device memory this module mapped, at an even address inside its
         // page.
         Some(address) => unsafe { core::ptr::read_volatile(address as *const u16) },
-        None => ports::read16(bus, slot, func, off),
+        None if off > 0xff => 0xffff,
+        None => ports::read16(bus, slot, func, off as u8),
     }
 }
 
 /// Write a 16-bit configuration register. `off` must be even.
-pub fn write16(bus: u8, slot: u8, func: u8, off: u8, value: u16) {
-    match window_byte(bus, slot, func, off & 0xfe) {
+pub fn write16(bus: u8, slot: u8, func: u8, off: u16, value: u16) {
+    match window_byte(bus, slot, func, off & !0x1) {
         // SAFETY: as `read16`.
         Some(address) => unsafe { core::ptr::write_volatile(address as *mut u16, value) },
-        None => ports::write16(bus, slot, func, off, value),
+        None if off > 0xff => {}
+        None => ports::write16(bus, slot, func, off as u8, value),
     }
 }
 
@@ -372,46 +388,45 @@ pub fn write16(bus: u8, slot: u8, func: u8, off: u8, value: u16) {
 /// configuration space and zero past it - a caller reads the end of the file
 /// the same way it reads the end of any other.
 ///
-/// The bound is [`CFG_SIZE`] under *both* mechanisms, although a window reaches a
-/// full 4 KiB per function. The extra 3840 bytes are PCIe extended capabilities,
-/// which this kernel does not read yet, and making a file's size depend on which
-/// mechanism the firmware named would be a machine difference in a Linux ABI
-/// (`docs/NOTES.md` §7.6a names the follow-on).
-pub fn config_read(bus: u8, dev: u8, func: u8, offset: u64, buf: &mut [u8]) -> usize {
-    if offset >= CFG_SIZE || buf.is_empty() {
+/// `size` is the function's own published length, [`Device::cfg_size`]: 256 for
+/// a conventional function, 4096 for one whose extended space the device
+/// answered for. Linux's `pci_read_config` clamps to `dev->cfg_size` the same
+/// way.
+pub fn config_read(bus: u8, dev: u8, func: u8, size: u64, offset: u64, buf: &mut [u8]) -> usize {
+    if offset >= size || buf.is_empty() {
         return 0;
     }
-    let count = buf.len().min((CFG_SIZE - offset) as usize);
+    let count = buf.len().min((size - offset) as usize);
     let mut at = offset as u32;
     let mut done = 0usize;
 
     if at & 1 == 1 && done < count {
-        buf[done] = read8(bus, dev, func, at as u8);
+        buf[done] = read8(bus, dev, func, at as u16);
         at += 1;
         done += 1;
     }
     if at & 3 != 0 && count - done > 2 {
-        let value = read16(bus, dev, func, at as u8);
+        let value = read16(bus, dev, func, at as u16);
         buf[done] = value as u8;
         buf[done + 1] = (value >> 8) as u8;
         at += 2;
         done += 2;
     }
     while count - done > 3 {
-        let value = read32(bus, dev, func, at as u8);
+        let value = read32(bus, dev, func, at as u16);
         buf[done..done + 4].copy_from_slice(&value.to_le_bytes());
         at += 4;
         done += 4;
     }
     if count - done >= 2 {
-        let value = read16(bus, dev, func, at as u8);
+        let value = read16(bus, dev, func, at as u16);
         buf[done] = value as u8;
         buf[done + 1] = (value >> 8) as u8;
         at += 2;
         done += 2;
     }
     if done < count {
-        buf[done] = read8(bus, dev, func, at as u8);
+        buf[done] = read8(bus, dev, func, at as u16);
         done += 1;
     }
     done
@@ -425,39 +440,39 @@ pub fn config_read(bus: u8, dev: u8, func: u8, offset: u64, buf: &mut [u8]) -> u
 /// registers beside the one named, and some of them - a status word, an
 /// interrupt line - are not the caller's to change. Returns how many bytes
 /// were stored.
-pub fn config_write(bus: u8, dev: u8, func: u8, offset: u64, buf: &[u8]) -> usize {
-    if offset >= CFG_SIZE || buf.is_empty() {
+pub fn config_write(bus: u8, dev: u8, func: u8, size: u64, offset: u64, buf: &[u8]) -> usize {
+    if offset >= size || buf.is_empty() {
         return 0;
     }
-    let count = buf.len().min((CFG_SIZE - offset) as usize);
+    let count = buf.len().min((size - offset) as usize);
     let mut at = offset as u32;
     let mut done = 0usize;
 
     if at & 1 == 1 && done < count {
-        write8(bus, dev, func, at as u8, buf[done]);
+        write8(bus, dev, func, at as u16, buf[done]);
         at += 1;
         done += 1;
     }
     if at & 3 != 0 && count - done > 2 {
         let value = u16::from_le_bytes([buf[done], buf[done + 1]]);
-        write16(bus, dev, func, at as u8, value);
+        write16(bus, dev, func, at as u16, value);
         at += 2;
         done += 2;
     }
     while count - done > 3 {
         let value = u32::from_le_bytes([buf[done], buf[done + 1], buf[done + 2], buf[done + 3]]);
-        write32(bus, dev, func, at as u8, value);
+        write32(bus, dev, func, at as u16, value);
         at += 4;
         done += 4;
     }
     if count - done >= 2 {
         let value = u16::from_le_bytes([buf[done], buf[done + 1]]);
-        write16(bus, dev, func, at as u8, value);
+        write16(bus, dev, func, at as u16, value);
         at += 2;
         done += 2;
     }
     if done < count {
-        write8(bus, dev, func, at as u8, buf[done]);
+        write8(bus, dev, func, at as u16, buf[done]);
         done += 1;
     }
     done
@@ -626,6 +641,33 @@ fn secondary_bus(device: &Device, parent: u8) -> Option<u8> {
     Some(secondary)
 }
 
+/// Linux's `pci_cfg_space_size`: how many bytes of configuration space this
+/// function publishes.
+///
+/// Only a function that may have extended space is asked: a PCIe function, a
+/// host bridge (whose root complex can publish it without a PCIe capability)
+/// and a PCI-X mode 2 bridge. The question is the device's, and on a machine
+/// with no memory-mapped window the read at 0x100 answers all ones, so every
+/// function stays 256 - Linux's answer over the port pair alone, too.
+fn cfg_size(bus: u8, dev: u8, func: u8, class: u32) -> u64 {
+    let status = read16(bus, dev, func, 0x06);
+    let header_type = (read16(bus, dev, func, 0x0e) & 0x7f) as u8;
+    let find = |id| {
+        crate::pci::find_capability(status, header_type, id, |off| {
+            read8(bus, dev, func, off as u16)
+        })
+    };
+    let pcie = find(PCI_CAP_ID_PCIE).is_some();
+    let pcix_mode_2 = find(PCI_CAP_ID_PCIX)
+        .map(|pos| {
+            read32(bus, dev, func, pos as u16 + PCI_X_STATUS as u16)
+                & (PCI_X_STATUS_266MHZ | PCI_X_STATUS_533MHZ)
+                != 0
+        })
+        .unwrap_or(false);
+    crate::pci::cfg_space_size(class, pcie, pcix_mode_2, |off| read32(bus, dev, func, off))
+}
+
 /// Read one function's identity, class, interrupt line and BARs.
 fn read_function(bus: u8, dev: u8, func: u8) -> Option<Device> {
     let identity = read32(bus, dev, func, 0x00);
@@ -683,14 +725,15 @@ fn read_function(bus: u8, dev: u8, func: u8) -> Option<Device> {
         subsys_id,
         irq,
         bars: read_bars(bus, dev, func, header_type),
+        cfg_size: cfg_size(bus, dev, func, class_revision >> 8),
         driver: None,
         drm_card: false,
     })
 }
 
 /// The configuration register holding BAR `index`.
-fn bar_register(index: usize) -> u8 {
-    0x10 + (index as u8) * 4
+fn bar_register(index: usize) -> u16 {
+    0x10 + (index as u16) * 4
 }
 
 /// The BARs a device implements, and how much address space each decodes.
@@ -702,7 +745,7 @@ fn bar_register(index: usize) -> u8 {
 fn read_bars(bus: u8, dev: u8, func: u8, header_type: u8) -> [Bar; 7] {
     let mut bars = [Bar::EMPTY; 7];
     let (count, rom) = match header_type {
-        0x00 => (6usize, 0x30u8),
+        0x00 => (6usize, 0x30u16),
         0x01 => (2, 0x38),
         0x02 => (1, 0),
         // An unknown header type is a device this kernel cannot describe -
@@ -962,6 +1005,27 @@ fn discover_ecam_acpi(info: &BootInfo) -> Option<EcamRange> {
     None
 }
 
+/// Whether two walks describe the same machine, with the one field that is the
+/// *mechanism's* answer left out.
+///
+/// `cfg_size` is the device's length as reachable through whoever asked: the
+/// port pair cannot address 0x100, so its walk reads every function as 256
+/// where the window may read 4096. That is not a disagreement about the
+/// machine, and comparing it would make every PCIe machine refuse its own
+/// window.
+fn same_hardware(a: &Device, b: &Device) -> bool {
+    let mut a = *a;
+    let mut b = *b;
+    a.cfg_size = 0;
+    b.cfg_size = 0;
+    a == b
+}
+
+/// The same comparison over a whole snapshot.
+fn same_machine(a: &[Device], b: &[Device]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_hardware(a, b))
+}
+
 /// Where two snapshots of the same bus first disagree, as a phrase for [`init`]'s
 /// log line.
 ///
@@ -970,7 +1034,7 @@ fn discover_ecam_acpi(info: &BootInfo) -> Option<EcamRange> {
 /// same number of them.
 fn first_difference(over_ports: &[Device], over_mmio: &[Device]) -> alloc::string::String {
     for (ports, mmio) in over_ports.iter().zip(over_mmio) {
-        if ports != mmio {
+        if !same_hardware(ports, mmio) {
             return alloc::format!(
                 " at bus {} dev {} func {}: the ports read {:04x}:{:04x}, the window {:04x}:{:04x}",
                 ports.bus,
@@ -1173,7 +1237,7 @@ pub fn init(info: &BootInfo) -> usize {
     use_window(ecam);
     let over_mmio = enumerate();
     if let Some(over_ports) = over_ports {
-        if over_mmio != over_ports {
+        if !same_machine(&over_mmio, &over_ports) {
             crate::println!(
                 "pci: ECAM disagrees with the port pair{}; ports kept",
                 first_difference(&over_ports, &over_mmio)

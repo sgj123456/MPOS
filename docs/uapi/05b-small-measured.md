@@ -5,6 +5,24 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **A function's configuration space is as long as its device says.** **Landed 2026-10-19**
+  (`docs/uapi/` §5.1 item 69) — §7.6a's follow-on: the ECAM window reached 4 KiB per function
+  and every reader still stopped at 256. The doubt it recorded, that the file's size would
+  depend on which mechanism the firmware named, was the wrong question: Linux sizes the file
+  from the **device**, and the probe uses whatever mechanism is in use. Measured on a current
+  host first (`.workbuddy/probe_pci_ext.c`, Linux 7.2.11): `/sys/.../config` is 4096 for PCIe
+  functions and host bridges and 256 for an IOMMU, an SMBus controller and an LPC bridge;
+  as root a 4096-byte file answers at 0x100, 0xfff and 0xff8 (8 bytes of 16), with 0x1000
+  EOF, while a 256-byte file is EOF at 0x100. Linux's `pci_cfg_space_size` is the rule: only
+  a PCIe function, a host bridge or a PCI-X mode 2 bridge is asked at 0x100, all ones means
+  the machine cannot reach the extended space, and the standard header repeated at every
+  0x100 boundary is a bridge aliasing its low 256 bytes. Served by `crate::pci::cfg_space_size`
+  and `find_capability`, `Device::cfg_size` probed once at enumeration, twelve-bit offsets in
+  the accessors, and the function's size carried by both config nodes. Pin: `t-pci`'s seven
+  claims, with the gate's machine carrying one NVMe controller (no namespace) because all
+  fourteen of q35's own functions are conventional PCI. Named, not copied: Linux clamps a
+  non-`CAP_SYS_ADMIN` reader to 64 bytes, which this kernel does not do.
+
 - **A framebuffer is its description's object, and it has no properties.** **Landed
   2026-10-19** (`docs/uapi/` §5.1 item 68) — the entry §7.4 carried as "a framebuffer
   object's own properties" was two facts, and the empty list it asked for was the wrong

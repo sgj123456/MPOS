@@ -3440,3 +3440,67 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     Gate: x86_64 `pass=188 fail=0 (188 built)`, `mpos-kunit 32 passed, 0 failed`, exit
     33; aarch64 `pass=187 fail=0`, `mpos-kunit 32 passed, 0 failed`, `=== END`; both
     machines' `t-drm` blocks byte-identical.
+
+## item 69 — a function's configuration space is as long as its device says
+
+    §7.6a closed with a size rather than a smell: the ECAM window reaches 4 KiB per
+    function and every reader still stopped at 256 (`crate::pci::CFG_SIZE`). The doubt
+    the note recorded — that a `/sys/.../config` file's size would start depending on
+    which mechanism the firmware named — was answered by the measurement: the size is
+    the *device's*, and the probe that asks it uses the mechanism in use, so a
+    port-only machine answers 256 for every function exactly as it should.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_pci_ext.c`, Linux
+    7.2.11, as root):
+
+    * `/sys/bus/pci/devices/*/config` is **4096** for every PCIe function and every
+      host bridge (class `0x0600`), and **256** for the IOMMU, the SMBus controller
+      and the LPC bridge — the three that are neither;
+    * a 4096-byte file answers at 0x100, at 0xfff (1 byte), and at 0xff8 (8 of 16
+      bytes); 0x1000 is EOF; a 256-byte file is EOF at 0x100;
+    * Linux's rule is `pci_cfg_space_size`: only a PCIe function, a host bridge and a
+      PCI-X mode 2 bridge are asked; the dword at 0x100 must not be all ones, and the
+      extended space must not be the standard header repeated at every 0x100 boundary
+      (`pci_ext_cfg_is_aliased`); everything else is 256 without a question.
+
+    The same probe found a second rule, **named and not copied**: without
+    `CAP_SYS_ADMIN` in the initial user namespace Linux clamps every config file to its
+    first **64** bytes (`pci_read_config`). `t-pci` states it and does not claim it.
+
+    **Served** by `crate::pci::cfg_space_size` (the rule, host-tested over synthetic
+    probes including the alias), `crate::pci::find_capability` (the standard list, 48
+    nodes), `Device::cfg_size` (probed once at enumeration, Linux's `dev->cfg_size`),
+    the six accessors widened to twelve-bit offsets, and `config_read`/`config_write`
+    taking the function's size. Both `/sys` and `/proc` nodes carry it. With no window,
+    an access above 0xff answers the absent-function value rather than aliasing the low
+    256 bytes.
+
+    **Two traps the gate found, both ours.** First, the alignment masks in `read32`
+    and `read16` were still `0xfc`/`0xfe` — eight-bit literals that compile after the
+    offset is widened and clear bits 8..15, folding every extended read onto 0x000; the
+    0x100 probe then read the vendor/device dword and the rule called it an alias. They
+    are `!0x3`/`!0x1`. Second, q35's own fourteen functions are all conventional PCI
+    (none carries capability id 0x10), and a bare `pcie-root-port` aliases its 0x100
+    in QEMU — so the test machine now carries one `nvme,serial=...` controller (no
+    `drive=`, so no namespace), whose AER capability at 0x100 is a real extended
+    answer. It is added last, and an installed disk does not get it.
+
+    Pin: **`t-pci`**, seven claims on the gate's machine — the aggregate length rule,
+    a conventional file's EOF at 0x100, a PCIe function's 4096, the extended space
+    being real rather than an alias, 0xfff/0x1000/0xff8, the extended capability
+    chain, and `/proc` publishing the same length and bytes. On aarch64 it skips, and
+    names why: that machine's config files have no read path (`mpos_pci_config` is
+    x86_64's), which is a pre-existing limit.
+
+    **Three counterfactuals, each with every other pin kept**:
+
+    | reverted | result |
+    |---|---|
+    | `Device::cfg_size` back to the constant 256 | `pass=188 fail=1`; red: `15 config attributes are as long as their device says, 256 or 4096` |
+    | the eight-bit masks `0xfc`/`0xfe` restored | `pass=188 fail=1`; red: `15 config attributes are as long as their device says, 256 or 4096` |
+    | `/proc`'s node size back to the constant 256 | `pass=188 fail=1`; red: `/proc/bus/pci publishes the same length and the same extended bytes` |
+
+    Gate: x86_64 `pass=189 fail=0 (189 built)`, `mpos-kunit 32 passed, 0 failed`, exit
+    33; aarch64 `pass=188 fail=0`, `mpos-kunit 32 passed, 0 failed`, `=== END`; host
+    tests `mpos-pci` 19 → 22; `cargo fmt --check` clean; clippy 77/82 (the standing
+    baseline); `depgraph` within the ratchet.

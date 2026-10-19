@@ -2950,6 +2950,7 @@ impl Dynamic for PciBuses {
                     bus: device.bus,
                     dev: device.dev,
                     func: device.func,
+                    size: device.cfg_size,
                 }),
             );
         }
@@ -2963,14 +2964,15 @@ impl Dynamic for PciBuses {
 /// what a reader sees is the live registers and what `setpci` writes really
 /// does change the device - which is the whole point of the file existing.
 ///
-/// 256 bytes, the same as the `config` attribute in `/sys` and for the same
-/// reason: mechanism 1's address register has eight bits of offset, and the
-/// 4096-byte extended space is not reachable through it.
+/// As long as the function's own `cfg_size`, the same as the `config`
+/// attribute in `/sys`: 256 bytes for a conventional function, 4096 when the
+/// device answered for its extended space.
 struct ProcConfig {
     ino: Ino,
     bus: u8,
     dev: u8,
     func: u8,
+    size: u64,
 }
 
 impl Inode for ProcConfig {
@@ -2978,7 +2980,7 @@ impl Inode for ProcConfig {
         Metadata {
             ino: self.ino,
             kind: NodeKind::File,
-            size: crate::pci::CFG_SIZE,
+            size: self.size,
         }
     }
 
@@ -2992,14 +2994,14 @@ impl Inode for ProcConfig {
     #[cfg(all(target_os = "none", mpos_pci_config))]
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         Ok(crate::drivers::pci::config_read(
-            self.bus, self.dev, self.func, offset, buf,
+            self.bus, self.dev, self.func, self.size, offset, buf,
         ))
     }
 
     #[cfg(all(target_os = "none", mpos_pci_config))]
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
         Ok(crate::drivers::pci::config_write(
-            self.bus, self.dev, self.func, offset, buf,
+            self.bus, self.dev, self.func, self.size, offset, buf,
         ))
     }
 }

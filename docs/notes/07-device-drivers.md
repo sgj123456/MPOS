@@ -2875,12 +2875,61 @@ was red at `HEAD`: the two previous commits had landed unformatted code
 touches anyway; the last two are their own commit, because a formatter pass and a mechanism
 switch have no common *why* (`AGENTS.md` §3's one-intent rule).
 
-**What is still open, and it is a size rather than a smell.** A function's configuration
-space is 4 KiB and this kernel still publishes `CFG_SIZE` = 256 - the *port* mechanism's
-reach - so PCIe extended capabilities are outside every reader even now that the window
-could reach them. Deliberately not joined to this one: a `/sys/.../config` file's size would
-start depending on which mechanism the firmware named, and "the window makes it possible" is
-not "the window makes it right". It is a `docs/ROADMAP.md` item of its own.
+### 7.6b The other 3840 bytes: the device says how long its configuration space is — **LANDED**
+
+The follow-on §7.6a named was written as "a size rather than a smell": the window reaches a
+full 4 KiB per function, and every reader still stopped at 256. The doubt it recorded - that
+a `/sys/.../config` file's size would start depending on which mechanism the firmware named -
+dissolved once the rule was measured: Linux's size is the **device's** answer, and the probe
+that asks it uses whichever mechanism is in use. A port-only machine therefore answers 256
+for every function, exactly as a machine with no window should.
+
+**Measured on a current host first** (`.workbuddy/probe_pci_ext.c`, Linux 7.2.11). Of the
+host's functions, `/sys/bus/pci/devices/*/config` was 4096 bytes for every PCIe function and
+every host bridge (class `0x0600`), and 256 for the IOMMU, the SMBus controller and the LPC
+bridge - the three that are neither. As root, the 4096-byte files answered at 0x100, 0xfff
+and 0xff8 (a 16-byte read at 0xff8 returned 8), and 0x1000 was EOF; a 256-byte file was EOF
+at 0x100. The kernel source says why (`drivers/pci/probe.c`, `pci_cfg_space_size`): a PCIe
+function, a host bridge and a PCI-X mode 2 bridge are asked for the dword at 0x100; all ones
+means the extended space is not reachable, and the standard header repeated at every 0x100
+boundary means a bridge is aliasing its low 256 bytes (`pci_ext_cfg_is_aliased`). Everything
+else is 256 without a question. The same probe found the second, unclaimed rule: a caller
+without `CAP_SYS_ADMIN` in the initial user namespace is clamped to the first **64** bytes
+(`pci_read_config`'s `size = 64`), which this kernel does not copy and `t-pci` names.
+
+**Served** by `crate::pci::cfg_space_size` (the rule, host-tested with synthetic probes and
+the alias case), `crate::pci::find_capability` (the standard capability list, 48 nodes),
+`Device::cfg_size` (probed once at enumeration, Linux's `dev->cfg_size`), and the six
+accessors widened to twelve-bit offsets. `config_read`/`config_write` take the function's
+size; `/sys/.../config` and `/proc/bus/pci/...` carry it in their metadata and pass it
+through. With no window, an access above 0xff answers the absent-function value (all ones,
+or a dropped write) rather than folding onto the low 256 bytes.
+
+**Two traps the machine found, and both were ours.**
+
+* **The alignment masks were still eight bits wide.** `window_byte` was correct, but
+  `read32` masked the offset with `0xfc` and `read16` with `0xfe` - literals that were fine
+  while an offset was a `u8` and that clear bits 8..15 once it is not. Every extended read
+  folded back onto 0x000, so the 0x100 probe answered the vendor/device dword and the rule
+  called it an alias. The masks are `!0x3`/`!0x1` now, and restoring the old ones turns
+  `t-pci` red (counterfactual below). This is the one shape a widened type can hide: the
+  arithmetic compiled, the address looked right, and the device answered - with the wrong
+  register.
+* **q35's own devices publish no extended space.** Measured on the gate: all fourteen of its
+  pre-existing functions are conventional PCI (none carries capability id 0x10), so `t-pci`
+  could pin only the 256 side. A bare `pcie-root-port` does not help either - QEMU answers
+  its 0x100 with the standard header repeated, the aliasing case the rule *should* refuse.
+  The test machine now carries one `nvme,serial=...` controller (no `drive=`, so no
+  namespace and no block device); its AER capability at 0x100 is a real extended answer. An
+  installed disk does not get it: this is the bus the pins describe.
+
+**Measured.** x86_64 `cargo xtask test`: `pass=189 fail=0 (189 built)` - `t-pci`'s seven
+claims all `ok:` - `mpos-kunit 32 passed, 0 failed`, exit 33. aarch64 `pass=188 fail=0`,
+`mpos-kunit 32 passed, 0 failed`, `=== END`; `t-pci` skips there because that machine's
+`config` files have no read path (`mpos_pci_config` is x86_64's), which is a pre-existing
+limit this item names rather than moves. Host tests `mpos-pci` 19 → 22. `cargo fmt --check`
+clean; clippy 77 (x86_64) and 82 (aarch64), the standing baseline; `depgraph` within the
+ratchet.
 
 
 ---

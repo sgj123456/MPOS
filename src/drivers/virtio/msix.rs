@@ -69,7 +69,7 @@ fn find_cap(func: &pci::Func, id: u8) -> Option<u8> {
         let this = next;
         // The header reads as one dword: id in the low byte, next pointer
         // behind it. Both lists are dword-aligned by construction.
-        let header = pci::read32(bus, slot, function, this);
+        let header = pci::read32(bus, slot, function, u16::from(this));
         next = (header >> 8) as u8;
         if (header & 0xff) as u8 == id {
             return Some(this);
@@ -81,7 +81,7 @@ fn find_cap(func: &pci::Func, id: u8) -> Option<u8> {
 /// The capability after `cap`, for a walk that is already underway.
 fn find_next(func: &pci::Func, cap: u8) -> Option<u8> {
     let (bus, slot, function) = func.bdf();
-    let next = (pci::read32(bus, slot, function, cap) >> 8) as u8;
+    let next = (pci::read32(bus, slot, function, u16::from(cap)) >> 8) as u8;
     (next != 0).then_some(next)
 }
 
@@ -95,7 +95,7 @@ fn find_next(func: &pci::Func, cap: u8) -> Option<u8> {
 /// 64-bit spelling, and it is the one this must not miss.
 fn bar_address(func: &pci::Func, bir: u8) -> Option<usize> {
     let (bus, slot, function) = func.bdf();
-    let bar = pci::read32(bus, slot, function, 0x10 + 4 * bir);
+    let bar = pci::read32(bus, slot, function, u16::from(0x10 + 4 * bir));
     // Bit 0 chooses I/O over memory; the low four bits of a memory BAR are
     // flags and the address is the rest.
     if bar & 1 != 0 {
@@ -108,7 +108,7 @@ fn bar_address(func: &pci::Func, bir: u8) -> Option<usize> {
         if bir >= 5 {
             return None;
         }
-        base |= u64::from(pci::read32(bus, slot, function, 0x14 + 4 * bir)) << 32;
+        base |= u64::from(pci::read32(bus, slot, function, u16::from(0x14 + 4 * bir))) << 32;
     }
     Some(base as usize)
 }
@@ -137,10 +137,10 @@ fn vendor_cap_window(func: &pci::Func, want: u8) -> Option<usize> {
         let (bus, slot, function) = func.bdf();
         // The vendor capability's private half: cap_len, cfg_type, then the
         // BAR and offset of the structure (virtio 1.0, 4.1.4.3).
-        let header = pci::read32(bus, slot, function, this);
+        let header = pci::read32(bus, slot, function, u16::from(this));
         let cfg_type = (header >> 24) as u8;
-        let bar = pci::read32(bus, slot, function, this + 4) as u8 & 0x7;
-        let offset = pci::read32(bus, slot, function, this + 8);
+        let bar = pci::read32(bus, slot, function, u16::from(this) + 4) as u8 & 0x7;
+        let offset = pci::read32(bus, slot, function, u16::from(this) + 8);
         cap = find_next(func, this);
         if cfg_type == want {
             let addr = bar_address(func, bar)?;
@@ -171,9 +171,9 @@ pub fn enable(func: &pci::Func, vector: u8) -> bool {
         return false;
     };
     let (bus, slot, function) = func.bdf();
-    let control = pci::read16(bus, slot, function, cap + 2);
+    let control = pci::read16(bus, slot, function, u16::from(cap) + 2);
     // The table's whereabouts: which BAR, and how far into it.
-    let table = pci::read32(bus, slot, function, cap + 4);
+    let table = pci::read32(bus, slot, function, u16::from(cap) + 4);
     let bir = (table & 0x7) as u8;
     let offset = (table & !0x7) as usize;
     let Some(bar) = bar_address(func, bir) else {
@@ -201,7 +201,7 @@ pub fn enable(func: &pci::Func, vector: u8) -> bool {
         bus,
         slot,
         function,
-        cap + 2,
+        u16::from(cap) + 2,
         (control | MSIX_ENABLE) & !MSIX_FUNCTION_MASK,
     );
     true
