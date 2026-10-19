@@ -2931,6 +2931,62 @@ limit this item names rather than moves. Host tests `mpos-pci` 19 → 22. `cargo
 clean; clippy 77 (x86_64) and 82 (aarch64), the standing baseline; `depgraph` within the
 ratchet.
 
+### 7.6c The second machine's configuration space too: the capability was the missing word — **LANDED**
+
+§7.6b closed with one skip named: on aarch64 `t-pci` printed `skip: this machine's
+configuration space is not readable through this path`, because `mpos_pci_config` was the
+first machine's flag. The skip was honest and the reason was not the bus. The boot log
+already said
+
+    pci: the tree names ECAM at 0x4010000000, buses 0..=255, 256 MiB
+    pci: ECAM is this machine's only mechanism and the walk read 2 functions through it
+
+so enumeration, the `Device` model, `cfg_size`, `/sys/bus/pci` and `/proc/bus/pci` were
+already the second machine's; only the read/write halves of the two `config` attributes were
+compiled out, and the trait's default body answered `EOPNOTSUPP` (the kernel's own line on
+the red run below is `mpos: syscall 67 (fd 3) -> EOPNOTSUPP`, 67 being `pread64`).
+
+**The missing word, not a mechanism.** `--cfg mpos_pci_config` joins aarch64's rustflags in
+`.cargo/config.toml`. The mechanism was already the machine's: x86_64 has mechanism 1's port
+pair and usually a firmware-named window, aarch64 has the window its device tree names, and
+the accessors already answer an absent function when neither serves an access. The comment
+that said "a `virt` machine has no PCI on the MMIO path this port drives" was true before
+`discover_ecam_dt` and is false now; it names the window and the capability's meaning
+instead, and §15's capability table loses its fourth missing entry.
+
+**One PCIe function for the second machine's pin.** Once the files were readable, the
+machine's functions were the host bridge (asked by the rule, with an empty extended space)
+and the `ich9-ahci` controller (conventional PCI, 256 bytes) - neither can pin "a PCIe
+function publishes 4096 bytes". The test boot now attaches `nvme,serial=mpos-pci-ext` with no
+`drive=` (so no namespace and no block device), the same device and reason as the first
+machine's `Boot::Esp` arm. It rides a `test_machine` parameter threaded through
+`virt_machine_args`/`boot_args`: the sweep's boot gets it, a session boots the installed
+machine's device list and does not, and the parameter has its own host test
+(`the_second_machines_test_boot_carries_one_pcie_function`, 123 xtask tests in all).
+
+**The skip was the wrong shape for a machine that publishes a bus.** `t-pci` used to return
+early when the first `config` file could not be read. It makes that a claim now - `every
+published function's configuration space is readable through this path` - because a machine
+that enumerates functions and then answers nothing for their registers is publishing a tree
+it cannot serve. The only skip left is the host's own `CAP_SYS_ADMIN` clamp, guarded by
+`host_run()`; the claim and the length rule are the two that go red on the counterfactual.
+
+**Measured.** aarch64 `cargo xtask test`: `=== SUMMARY pass=188 fail=0`, `mpos-kunit 32
+passed, 0 failed`, `=== END`; `t-pci`'s **eight** claims all `ok:` against **3** functions,
+the NVMe's included (`a PCIe function publishes the 4096-byte extended space`), and the boot
+line is `pci: ECAM is this machine's only mechanism and the walk read 3 functions through
+it`. x86_64 unchanged and green: `pass=189 fail=0 (189 built)`, `t-pci`'s eight claims
+against 15 functions. Host tests 579; `mpos-xtask` 123. `cargo fmt --check` clean; clippy 77
+(x86_64) and **80** (aarch64 - two fewer than §7.6b's 82, because the capability makes the
+config pair live code rather than dead); `depgraph` within the ratchet, mutual pairs 8/8.
+
+**Counterfactual, every other pin kept.** Removing `--cfg mpos_pci_config` from aarch64 and
+re-running the sweep: `pass=187 fail=1`, `=== FAIL t-pci`, and exactly the pair above is red
+(`every published function's configuration space is readable through this path`, `3 config
+attributes are as long as their device says, 256 or 4096`); the conventional and extended
+claims then skip, because no file could be read to classify. Green source restored
+byte-for-byte (`diff -q`) and the final aarch64 run repeats `pass=188 fail=0`.
+
 
 ---
 

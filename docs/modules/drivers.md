@@ -286,7 +286,9 @@ this page states the shape and points there rather than restating a number.
   address over two mechanisms, a bus's mebibyte mapped on first access, and the both-ways walk
   that has to agree before the window is trusted), and §7.6b (the other 3840 bytes: the
   device's own `cfg_size`, probed at 0x100 and served through `/sys` and `/proc`, with the
-  eight-bit mask that folded an extended offset back onto 0x000 as the trap the gate found).
+  eight-bit mask that folded an extended offset back onto 0x000 as the trap the gate found),
+  and §7.6c (the same space on the second machine: the capability word was what was missing,
+  and `t-pci`'s unreadable-file skip became a claim).
 - **The seam and the aarch64 classes.** `docs/notes/` §9.1 (`map_mmio_window` taking the last
   x86_64-only call out of `HalImpl`; the virtio-rng over MMIO as the drivers stage's first
   device), §13.4 (the network stack holds the adapter as a contract), §13.24 (the input registry),

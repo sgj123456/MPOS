@@ -588,6 +588,7 @@ pub fn run_qemu(
         &image,
         &Console::Run(mode),
         &share,
+        false,
     )?;
 
     // Printed because a boot that goes wrong is usually read off this line.
@@ -687,11 +688,20 @@ pub fn find_firmware(arch: Arch) -> Result<Firmware> {
 /// [`machine_args`] is here:
 /// the two machines' wiring is one question - how this build boots a machine -
 /// and the values both read come from one `machine.toml`. What does *not* come
-/// from that file is the device list below, and that is deliberate: every
-/// transport here is the MMIO form because this machine discovers its devices by
-/// walking its own device tree, so a `-pci` device would be one the kernel cannot
-/// reach. That is the machine's fact rather than a setting, and the file says so
-/// in its own note.
+/// from that file is the device list below, and that is deliberate: the virtio
+/// transports here are the MMIO form because this machine's virtio probe walks
+/// its own device tree's `virtio,mmio` windows. The PCI bus is a *separate*
+/// discovery path (`drivers::pci`'s `discover_ecam_dt` reads the tree's
+/// `pci-host-ecam-generic` window), which is why the SATA controller below and
+/// the test machine's NVMe ride it; a `virtio-*-pci` device would be one the
+/// virtio probe does not reach.
+///
+/// `test_machine` is the sweep's boot rather than a session's. It carries the
+/// devices the pins describe and an installed machine does not: today the one
+/// PCIe function whose extended configuration space `t-pci` asks about. It is a
+/// parameter rather than a `machine.toml` key because it is not a property of
+/// the machine - the same `virt` boots both - and the x86_64 arm makes the same
+/// distinction with [`Boot::Esp`].
 ///
 /// Taken from the boot that works, flag by flag, so what this function returns is
 /// the machine the port was measured on. The reasons worth keeping are on the
@@ -704,6 +714,7 @@ pub fn virt_machine_args(
     blk: &Path,
     console: &Console,
     share: &Path,
+    test_machine: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         // `acpi=off` is what makes this firmware describe the machine the way
@@ -780,11 +791,10 @@ pub fn virt_machine_args(
         // check could only say "these look like transports". With one attached,
         // it reads a `DeviceID` the machine did not have to be told and names it.
         //
-        // The MMIO variant on purpose, and not `-pci`: the ESP's own disk is a
-        // `virtio-blk-pci` behind the PCIe bridge, which is a *different*
-        // discovery path (configuration space, not a fixed window), and a check
-        // that a PCI device answered would not say anything about the window the
-        // tree describes.
+        // The MMIO variant on purpose, and not `-pci`: a PCI disk would be a
+        // *different* discovery path (configuration space, not a fixed window),
+        // and a check that a PCI device answered would not say anything about
+        // the window the tree describes.
         "-device".into(),
         "virtio-rng-device".into(),
         // The second block device: a raw image carrying a known sector pattern,
@@ -890,6 +900,20 @@ pub fn virt_machine_args(
         "ide-hd,drive=sd0,bus=ahci.0".into(),
     ]);
 
+    // One PCIe function for the extended configuration space to be asked
+    // about, on the test machine only - the same device and the same reason as
+    // the first machine's `Boot::Esp` arm. The `ich9-ahci` above is
+    // conventional PCI and publishes 256 bytes, and the host bridge, although
+    // the rule asks it, has no extended capability to answer with; neither can
+    // pin "a PCIe function publishes the 4096-byte extended space". An NVMe
+    // controller is the device QEMU gives a real extended space to (AER at
+    // 0x100); with no `drive=` it has no namespace, so no block device appears
+    // and no driver here claims it. Added after the SATA devices so the
+    // addresses the notes and probes above expect stay where they are.
+    if test_machine {
+        args.extend(["-device".into(), "nvme,serial=mpos-pci-ext".into()]);
+    }
+
     // The display and the wire, from the one decision both machines share
     // (`wiring`). This machine names its window backend in its own half of
     // `machine.toml` (`none`: the session is the PL011, and the kernel's
@@ -992,6 +1016,11 @@ pub fn virt_machine_args(
 /// question - this disk, this firmware, this serial line - and the answer's
 /// shape, which is why they are two arms of one function rather than two
 /// functions a caller has to choose between.
+///
+/// `test_machine` is the sweep's boot rather than a session's; the second
+/// machine's arm passes it through to the device list (`virt_machine_args`),
+/// and the first machine's arm answers the same question from `Boot` at its
+/// own call site, where the ESP names that boot.
 pub fn boot_args(
     arch: Arch,
     config: &QemuConfig,
@@ -1000,6 +1029,7 @@ pub fn boot_args(
     image: &Path,
     console: &Console,
     share: &Path,
+    test_machine: bool,
 ) -> Result<Vec<String>> {
     match arch {
         Arch::X86_64 => Ok(machine_args(
@@ -1021,6 +1051,7 @@ pub fn boot_args(
             &crate::disk::blk_image(image.parent().expect("the image has a directory"), arch),
             console,
             share,
+            test_machine,
         )),
     }
 }
@@ -1086,6 +1117,7 @@ pub fn boot(
         image,
         &Console::File(log.display().to_string()),
         &share,
+        true,
     )?;
     eprintln!("+ {} {}", arch.qemu_binary(), args.join(" "));
     let mut qemu = Command::new(arch.qemu_binary());
@@ -1281,6 +1313,12 @@ mod tests {
     /// The second machine's line, as a *headless* boot builds it: the wire to a
     /// file, which is the shape every evidence-producing boot has.
     fn aarch64_args(config: &QemuConfig) -> Vec<String> {
+        aarch64_args_for(config, false)
+    }
+
+    /// The same line for a sweep's boot (`test_machine`), whose device list
+    /// carries what the pins read.
+    fn aarch64_args_for(config: &QemuConfig, test_machine: bool) -> Vec<String> {
         virt_machine_args(
             config,
             &firmware(),
@@ -1289,6 +1327,7 @@ mod tests {
             Path::new("/build/aarch64-blk.img"),
             &Console::File("/build/aarch64-serial.log".to_string()),
             Path::new("/build/aarch64-9p-share"),
+            test_machine,
         )
     }
 
@@ -1423,10 +1462,13 @@ mod tests {
         );
     }
 
-    /// Every device the second machine drives arrives on the **MMIO** transport,
-    /// because that is how it finds its devices - by walking its own device
-    /// tree. A `-pci` device here would be one the kernel cannot reach, which is
-    /// why the transports are the machine's rather than a `machine.toml` key.
+    /// Every *virtio* device the second machine drives arrives on the **MMIO**
+    /// transport, because that is how its virtio probe finds them - by walking
+    /// its own device tree. A `virtio-*-pci` device here would be one the probe
+    /// does not reach, which is why the transports are the machine's rather
+    /// than a `machine.toml` key. The PCI bus is still enumerated for the SATA
+    /// controller below and the test machine's NVMe; it is the *virtio* probe
+    /// that reads the tree instead.
     #[test]
     fn the_second_machines_devices_are_the_mmio_forms() {
         let mut config = config("256", 1, &[]);
@@ -1463,6 +1505,33 @@ mod tests {
         // The machine's own `extra_args` come last, the way the first machine's
         // wiring puts them.
         assert_eq!(args[args.len() - 2..], ["-vga", "none"]);
+    }
+
+    /// The test machine carries one PCIe function whose extended configuration
+    /// space `t-pci` asks about, and a session's machine does not - the same
+    /// rule as the first machine's `Boot::Esp` arm. A bare controller with no
+    /// `drive=` has no namespace, so no block device appears and no driver here
+    /// claims it.
+    #[test]
+    fn the_second_machines_test_boot_carries_one_pcie_function() {
+        let config = config("256", 1, &[]);
+        assert!(
+            !aarch64_args(&config)
+                .iter()
+                .any(|arg| arg.starts_with("nvme")),
+            "a session boots the installed machine's device list"
+        );
+        let test = aarch64_args_for(&config, true);
+        assert!(
+            test.iter().any(|arg| arg == "nvme,serial=mpos-pci-ext"),
+            "the sweep has no PCIe function to pin the extended space with: {test:?}"
+        );
+        assert!(
+            !test
+                .iter()
+                .any(|arg| arg.starts_with("nvme") && arg.contains("drive=")),
+            "an NVMe with a drive would become a block device nobody asked for: {test:?}"
+        );
     }
 
     /// The vsock device needs the host's vhost module, and a machine that names

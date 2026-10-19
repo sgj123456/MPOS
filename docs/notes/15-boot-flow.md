@@ -39,18 +39,19 @@ The goal of this phase is that the machine-independent half of the boot has **on
 | the `init` callback's signature | `fn(&BootInfo) -> !` | `fn(*const u8, usize) -> !` (the archive is stashed *before* the address-space switch) | a fork in `mpos_arch::arch::boot`'s own seam |
 | the root switch | **userland**: the initramfs's `/init` mounts `root=` and `switch_root`s | **kernel**: `check_disk_root` mounts the disk at `/mnt`, `switch_root` pivots, `/init` runs from the disk | the largest duplication: the first machine's flow is a script the second machine has no copy of |
 | `M0`–`M8` milestone checks | the boot's verdict | a different set, and they run on **every** boot (in front of a distribution's `init`) | §13.14's rule applies: a check that changes shared state damages the machine it checks |
-| capabilities (`.cargo/config.toml`) | `mpos_msi`, `mpos_serial_ring`, `mpos_fpu_trap`, `mpos_signal_frame`, `mpos_framebuffer_console`, `mpos_net`, `mpos_qemu_debug_exit`, `mpos_pci_config`, `mpos_input_registry` | `mpos_console_input`, `mpos_serial_ring`, `mpos_net`, `mpos_signal_frame`, `mpos_input_registry`, `mpos_framebuffer_console` | the seam works; four of the first machine's nine are missing here (`mpos_msi`, `mpos_fpu_trap`, `mpos_qemu_debug_exit`, `mpos_pci_config`), and `mpos_input_registry` + `mpos_framebuffer_console` moved across in §13.24/§13.26 |
+| capabilities (`.cargo/config.toml`) | `mpos_msi`, `mpos_serial_ring`, `mpos_fpu_trap`, `mpos_signal_frame`, `mpos_framebuffer_console`, `mpos_net`, `mpos_qemu_debug_exit`, `mpos_pci_config`, `mpos_input_registry` | `mpos_console_input`, `mpos_serial_ring`, `mpos_net`, `mpos_signal_frame`, `mpos_pci_config`, `mpos_input_registry`, `mpos_framebuffer_console` | the seam works; three of the first machine's nine are missing here (`mpos_msi`, `mpos_fpu_trap`, `mpos_qemu_debug_exit`), and `mpos_pci_config` + `mpos_input_registry` + `mpos_framebuffer_console` moved across (the last two in §13.24/§13.26, the config pair in §7.6c) |
 | device discovery | PCI enumeration | device tree + virtio-MMIO windows | genuinely the machine's; both answer `hal::map_mmio_window` |
 
-Of the four missing capabilities, three are hardware absence on this port and one is port work:
+Of the three still missing, two are hardware absence on this port and one is an emulator fact:
 `mpos_msi` and `mpos_fpu_trap` have no counterpart here (a `virt` machine with a GIC and no `#NM` -
-both honest "absent", not stubs), and `mpos_qemu_debug_exit` is an emulator exit port AAVMF does not
-answer. `mpos_pci_config` is *not*: the bus is there, but it is not the bus this port drives its
-devices over - the device tree is. The three that *have* crossed over are the ones whose device was
-already reachable over that tree: `mpos_input_registry` (§13.24), the console (§13.25) and
-`mpos_framebuffer_console` (§13.26, on the `virtio-gpu` card the same MMIO transports carry) - each
-by handing the same device to the shared driver instead of opening it, reading its identity and
-dropping it.
+both honest "absent", not stubs), and `mpos_qemu_debug_exit` is an exit port AAVMF does not answer.
+`mpos_pci_config` was the fourth and crossed on 2026-10-19 (§7.6c): the bus was always there - the
+device tree's `pci-host-ecam-generic` window enumerated two functions before the change - so what
+was missing was the capability *word*, not a mechanism. The four that have crossed over are that
+flag and the three whose device was already reachable over the tree: `mpos_input_registry` (§13.24),
+the console (§13.25) and `mpos_framebuffer_console` (§13.26, on the `virtio-gpu` card the same MMIO
+transports carry) - each by handing the same device to the shared driver instead of opening it,
+reading its identity and dropping it.
 
 ### The target shape
 

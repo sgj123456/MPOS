@@ -131,6 +131,11 @@ One-glance status of the whole roadmap.
   full 4096 when the device answers for its extended space at 0x100 and is not aliasing its
   standard header — through `/sys/.../config` and `/proc/bus/pci`, read and written at the
   extended offsets (§7.6a, `t-pci`)
+- [x] **the second machine's configuration space too**: aarch64 declares `mpos_pci_config` now
+  that the device tree's ECAM window reaches the bus — the config nodes answer 256 or 4096
+  bytes per device there as here, read and written through the window rather than a port pair,
+  and the test machine carries one NVMe function so the PCIe half is pinned on both machines
+  (§7.6c, `t-pci`)
 
 **Wayland compositor (weston) support** — verified by `t-*`; GUI end-to-end is `cargo xtask run --mode gui`:
 

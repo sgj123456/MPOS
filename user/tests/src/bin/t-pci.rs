@@ -21,14 +21,22 @@
 //! this program does not claim: a caller without `CAP_SYS_ADMIN` in the initial
 //! user namespace has every config file clamped to its first 64 bytes.
 //!
-//! The gate's machine carries one PCIe function by construction - an
-//! `nvme` controller with no drive, because every device q35 attaches by
-//! itself is conventional PCI (measured: none of the fourteen carries
-//! capability id 0x10) and a bare `pcie-root-port` answers its 0x100 with the
-//! standard header repeated, the alias this program refuses below. That
-//! function's 4096 bytes are what the claims ask about; the host-bridge half
+//! The gate's machines each carry one PCIe function by construction - an
+//! `nvme` controller with no drive. On the first machine every device q35
+//! attaches by itself is conventional PCI (measured: none of the fourteen
+//! carries capability id 0x10) and a bare `pcie-root-port` answers its 0x100
+//! with the standard header repeated, the alias this program refuses below; the
+//! second machine's `ich9-ahci` is conventional PCI too, and its host bridge,
+//! although the rule asks it, answers an empty extended space. That
+//! controller's 4096 bytes are what the claims ask about; the host-bridge half
 //! of the rule is a unit test in `crates/pci`, where a synthetic device can
 //! answer.
+//!
+//! A machine that publishes functions and then cannot read their registers is
+//! a failure here, not a reason to skip: the second machine was exactly that
+//! until its device tree's ECAM window reached `/sys` (2026-10-19). The one
+//! skip left is the host's own - Linux clamps a config file to 64 bytes for a
+//! caller without `CAP_SYS_ADMIN` in the initial user namespace.
 
 use mpos_user_tests::Report;
 use std::fs::{self, File};
@@ -102,18 +110,24 @@ fn main() {
 
     // A host run as an ordinary user is clamped to 64 bytes by Linux, which is
     // a different rule from this program's subject; the payload runs as root.
+    // On the kernel a published function *is* readable through this path, and
+    // that is a claim below rather than a reason to skip: a machine that
+    // enumerates a bus and then answers nothing for its registers is publishing
+    // a tree it cannot serve.
     let first = format!("{dir}/{}/config", names[0]);
     let mut probe = [0u8; 256];
-    if File::open(&first)
-        .and_then(|file| file.read_at(&mut probe, 0))
-        .unwrap_or(0)
-        != 256
+    if mpos_user_tests::host_run()
+        && File::open(&first)
+            .and_then(|file| file.read_at(&mut probe, 0))
+            .unwrap_or(0)
+            != 256
     {
-        println!("skip: this machine's configuration space is not readable through this path");
+        println!("skip: Linux clamps a config file to 64 bytes without CAP_SYS_ADMIN");
         return;
     }
 
     let mut every_size = true;
+    let mut readable = true;
     let mut any_conventional = false;
     let mut any_extended = false;
     let mut any_pcie = false;
@@ -127,15 +141,18 @@ fn main() {
     for name in &names {
         let path = format!("{dir}/{name}/config");
         let Ok(file) = File::open(&path) else {
+            readable = false;
             every_size = false;
             continue;
         };
         let Ok(meta) = file.metadata() else {
+            readable = false;
             every_size = false;
             continue;
         };
         let mut cfg = [0u8; 256];
         if file.read_at(&mut cfg, 0).unwrap_or(0) != 256 {
+            readable = false;
             every_size = false;
             continue;
         }
@@ -276,6 +293,10 @@ fn main() {
         }
     }
 
+    r.check(
+        "every published function's configuration space is readable through this path",
+        readable,
+    );
     r.check(
         &format!(
             "{names_len} config attributes are as long as their device says, 256 or 4096",

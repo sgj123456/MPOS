@@ -55,17 +55,19 @@ rustflags = [
     # Two more of the same kind, declared here because the machine is where the
     # difference lives. `mpos_pci_config` is "this machine has a PCI bus whose
     # configuration space can be read and written" - the `/proc/bus/pci` and
-    # `/sys/bus/pci` config nodes' read/write halves, which go through port I/O
-    # here and have no aarch64 counterpart (a `virt` machine has no PCI on the
-    # MMIO path this port drives). The *tree* is built from the machine-neutral
-    # `crate::pci` model on both machines; on a machine without the capability
-    # the enumeration is empty, so no such node is built and the absent method is
-    # unreachable rather than faked. `mpos_input_registry` is "this machine
-    # publishes an evdev registry that `/sys/class/input` can enumerate" - this
-    # machine's input stack's, whose nodes `udev` and `libinput` read to classify
-    # a keyboard. aarch64 declares it too since §15.2 - it reaches the same
-    # registry through the `InputDevice` contract, opening its own virtio-input
-    # over MMIO - so the class directory means the same thing on both machines.
+    # `/sys/bus/pci` config nodes' read/write halves. The *mechanism* is the
+    # machine's own and the capability says nothing about it: this machine has
+    # mechanism 1's port pair and usually the firmware-named ECAM window, and
+    # aarch64 has the window its device tree names. The *tree* is built from the
+    # machine-neutral `crate::pci` model on both machines; on a machine with no
+    # bus the enumeration is empty, so no such node is built and the absent
+    # method is unreachable rather than faked. `mpos_input_registry` is "this
+    # machine publishes an evdev registry that `/sys/class/input` can enumerate" -
+    # this machine's input stack's, whose nodes `udev` and `libinput` read to
+    # classify a keyboard. aarch64 declares it too since §15.2 - it reaches the
+    # same registry through the `InputDevice` contract, opening its own
+    # virtio-input over MMIO - so the class directory means the same thing on
+    # both machines.
     "--cfg", "mpos_pci_config",
     "--cfg", "mpos_input_registry",
 ]
@@ -98,6 +100,16 @@ rustflags = [
 # 3b, so `mpos_signal_frame` is declared here too. It has no MSI controller and
 # no lazy FPU trap, so it declares none of the other x86_64 flags.
 #
+# `mpos_pci_config` is here because the bus is reachable, measured rather than
+# assumed: `virt` publishes its host bridge as `pci-host-ecam-generic` at
+# `0x40_1000_0000`, and the boot reads its functions through that window
+# (`pci: ECAM is this machine's only mechanism and the walk read 2 functions`).
+# The capability is about the *configuration space* and not the mechanism: this
+# machine has no port pair, so the window is the only door and an access that
+# finds none answers an absent function. Until 2026-10-19 the flag was absent
+# and the config attributes answered nothing even though the tree and their
+# lengths were already right.
+#
 # `mpos_input_registry` is here since §15.2: the machine opens its
 # `virtio-keyboard-device` over the MMIO transport and hands it to the shared
 # evdev registry, so `/dev/input/event0`, `/sys/class/input` and the uinput door
@@ -115,6 +127,7 @@ rustflags = [
     "--cfg", "mpos_serial_ring",
     "--cfg", "mpos_net",
     "--cfg", "mpos_signal_frame",
+    "--cfg", "mpos_pci_config",
     "--cfg", "mpos_input_registry",
     "--cfg", "mpos_framebuffer_console",
 ]

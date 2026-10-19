@@ -59,17 +59,20 @@ pub mod pipe;
 /// machine-specific sit behind capability flags rather than an architecture
 /// gate - the PCI config-space read/write pair behind `mpos_pci_config`, since a
 /// machine may truthfully have no PCI bus - so a machine without one builds the
-/// tree from the neutral `crate::pci` model (empty on aarch64) and never reaches
-/// the absent method.
+/// tree from the neutral `crate::pci` model, which is that machine's own
+/// enumeration (empty on a machine with no bus), and never reaches the absent
+/// method. Both machines declare the flag now: x86_64 reads through its port
+/// pair or the firmware's window, aarch64 through the window its device tree
+/// names.
 pub mod procfs;
 pub mod pty;
 pub mod ramfs;
 pub mod signalfd;
 /// `/sys`: the device tree `udev` and every `/sys/class` reader walk. Same
 /// machine arrangement as `procfs`: the class directories are shared, and the
-/// leaves that are x86_64's - the PCI config pair and the evdev registry
+/// machine-dependent leaves - the PCI config pair and the evdev registry
 /// `/sys/class/input` enumerates - sit behind `mpos_pci_config` and
-/// `mpos_input_registry`.
+/// `mpos_input_registry`, which both machines declare.
 pub mod sysfs;
 pub mod tar;
 pub mod termios;

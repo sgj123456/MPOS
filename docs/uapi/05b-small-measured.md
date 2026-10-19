@@ -5,6 +5,18 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **The second machine's configuration space, and a skip that was a claim.** **Landed
+  2026-10-19** (`docs/uapi/` §5.1 item 70) — aarch64 already enumerated its bus through the
+  device tree's `pci-host-ecam-generic` window (`pci: ECAM is this machine's only mechanism
+  and the walk read 2 functions`), but `mpos_pci_config` was x86_64's flag: both `config`
+  nodes existed with the right lengths and `pread64` answered `EOPNOTSUPP`. Declaring the
+  flag is the whole fix; the mechanism was already the machine's. The test boot now carries
+  one `nvme,serial=...` with no drive, so the PCIe half has a device on both machines
+  (§7.6c). `t-pci`'s unreadable-file skip became a claim — a machine that publishes functions
+  and cannot read them is red — and the one skip left is the host's 64-byte clamp. Pin:
+  `t-pci`'s eight claims on both gates; the counterfactual removes the aarch64 flag and reads
+  `pass=187 fail=1`, with the readability and length claims red.
+
 - **A function's configuration space is as long as its device says.** **Landed 2026-10-19**
   (`docs/uapi/` §5.1 item 69) — §7.6a's follow-on: the ECAM window reached 4 KiB per function
   and every reader still stopped at 256. The doubt it recorded, that the file's size would
@@ -18,10 +30,11 @@ Section numbers are unchanged from the original `UAPI.md`.
   the machine cannot reach the extended space, and the standard header repeated at every
   0x100 boundary is a bridge aliasing its low 256 bytes. Served by `crate::pci::cfg_space_size`
   and `find_capability`, `Device::cfg_size` probed once at enumeration, twelve-bit offsets in
-  the accessors, and the function's size carried by both config nodes. Pin: `t-pci`'s seven
-  claims, with the gate's machine carrying one NVMe controller (no namespace) because all
-  fourteen of q35's own functions are conventional PCI. Named, not copied: Linux clamps a
-  non-`CAP_SYS_ADMIN` reader to 64 bytes, which this kernel does not do.
+  the accessors, and the function's size carried by both config nodes. Pin: `t-pci` (seven
+  claims when it landed; eight after item 70's readability claim), with the gate's machine
+  carrying one NVMe controller (no namespace) because all fourteen of q35's own functions
+  are conventional PCI. Named, not copied: Linux clamps a non-`CAP_SYS_ADMIN` reader to 64
+  bytes, which this kernel does not do.
 
 - **A framebuffer is its description's object, and it has no properties.** **Landed
   2026-10-19** (`docs/uapi/` §5.1 item 68) — the entry §7.4 carried as "a framebuffer
@@ -784,10 +797,11 @@ Section numbers are unchanged from the original `UAPI.md`.
   and which the kernel's standard descriptors are) under the name the psABI gives that
   machine's first serial port, which is also the name `console=` spells. `mount -t proc` and
   `mount -t sysfs` are served on **both** machines (a real init mounts and reads them); the
-  parts that are x86_64's - PCI config-space read/write, the evdev registry `/sys/class/input`
+  machine-dependent parts - PCI config-space read/write, the evdev registry `/sys/class/input`
   enumerates - sit behind the `mpos_pci_config`/`mpos_input_registry` capability flags, so a
-  machine without one builds the tree from the neutral model (empty on aarch64) instead of
-  refusing the filesystem.
+  machine without one builds the tree from the neutral model instead of refusing the filesystem.
+  Both flags are declared by both machines now: aarch64 reaches PCI configuration space through
+  the device tree's ECAM window and its virtio-input through the MMIO transport (§7.6c, §13.24).
 - **`open(2)`'s flag *numbers* are the machine's, and four differ.** arm64's
   `asm/fcntl.h` overrides `O_DIRECTORY` (`0x4000` vs x86_64's `0x10000`), `O_NOFOLLOW`
   (`0x8000` vs `0x20000`), `O_DIRECT` (`0x10000` vs `0x4000`) and `O_LARGEFILE` (`0x20000`

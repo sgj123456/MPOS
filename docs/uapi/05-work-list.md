@@ -3504,3 +3504,54 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     33; aarch64 `pass=188 fail=0`, `mpos-kunit 32 passed, 0 failed`, `=== END`; host
     tests `mpos-pci` 19 → 22; `cargo fmt --check` clean; clippy 77/82 (the standing
     baseline); `depgraph` within the ratchet.
+
+## item 70 — the second machine's configuration space, and the skip that was a claim
+
+    §7.6b named one skip: aarch64's `t-pci` stopped at "this machine's configuration
+    space is not readable through this path" because `mpos_pci_config` was x86_64's.
+    The doubt was whether the *bus* was reachable there. The boot log answered it
+    before this item was written: `pci: the tree names ECAM at 0x4010000000, buses
+    0..=255, 256 MiB` and `pci: ECAM is this machine's only mechanism and the walk read
+    2 functions through it`. Enumeration, the `Device` model, `cfg_size` and both trees
+    were already the second machine's; only the two `Inode` methods were compiled out,
+    and the trait's default body answered `EOPNOTSUPP` (67, `pread64`, in the
+    counterfactual's own kernel line).
+
+    **Served** by declaring `--cfg mpos_pci_config` for `aarch64-unknown-none` in
+    `.cargo/config.toml`. The mechanism was already there and stays the machine's: the
+    device tree's `pci-host-ecam-generic` window on aarch64, the port pair or the
+    firmware's window on x86_64, and the absent-function answer where neither serves.
+    The comment that said the second machine has "no PCI on the MMIO path this port
+    drives" was true before `discover_ecam_dt` and is replaced rather than kept; §15's
+    capability table loses its fourth missing entry.
+
+    **One device for the pin.** The second machine's own functions were a host bridge
+    (asked by the rule, empty extended space) and a conventional `ich9-ahci`; neither
+    can pin "a PCIe function publishes 4096 bytes". The test boot now attaches
+    `nvme,serial=mpos-pci-ext` with no `drive=` - the same device and reason as the
+    first machine's test ESP - through a `test_machine` parameter on
+    `virt_machine_args`/`boot_args`; a session's boot keeps the installed machine's
+    device list and does not get it, and the parameter has its own host test.
+
+    **The skip was the wrong shape for a machine that publishes a bus.** `t-pci` used
+    to return early when the first `config` file could not be read. It makes that a
+    claim now - `every published function's configuration space is readable through
+    this path` - and the only remaining skip is the host's `CAP_SYS_ADMIN` clamp,
+    guarded by `host_run()`. A machine that offers a tree it cannot serve is red, not
+    quiet.
+
+    Pin: **`t-pci`**, eight claims on both gates - the readability claim added to item
+    69's seven. aarch64's boot enumerates **3** functions and the NVMe's AER is the
+    4096-byte answer; x86_64's 15 are unchanged.
+
+    **Counterfactual, every other pin kept**:
+
+    | reverted | result |
+    |---|---|
+    | `--cfg mpos_pci_config` removed from aarch64 | `pass=187 fail=1`, `=== FAIL t-pci`; red: `every published function's configuration space is readable through this path` and `3 config attributes are as long as their device says, 256 or 4096`; the kernel's own line is `mpos: syscall 67 (fd 3) -> EOPNOTSUPP` |
+
+    Gate: aarch64 `pass=188 fail=0`, `mpos-kunit 32 passed, 0 failed`, `=== END`;
+    x86_64 `pass=189 fail=0 (189 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33;
+    host tests 579, `mpos-xtask` 123; `cargo fmt --check` clean; clippy 77/80 (aarch64
+    two below §7.6b's 82 because the config pair became live code); `depgraph` within
+    the ratchet.
