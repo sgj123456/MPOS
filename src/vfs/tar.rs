@@ -164,7 +164,7 @@ pub fn unpack_into(vfs: &MountTable, archive: &[u8]) -> VfsResult<usize> {
                 if parent.lookup(name).is_ok() {
                     return Err(VfsError::Exists);
                 }
-                let file = parent.create(name, NodeKind::File)?;
+                let file = parent.create(name, NodeKind::File, None)?;
                 file.set_mode(entry.mode);
                 file.write_at(0, entry.data)?;
             }
@@ -201,7 +201,7 @@ fn ensure_dir(vfs: &MountTable, path: &str) -> VfsResult<Arc<dyn Inode>> {
                 // a directory under one name. Either way, refuse.
                 return Err(VfsError::Exists);
             }
-            parent.create(name, NodeKind::Dir)
+            parent.create(name, NodeKind::Dir, None)
         }
         Err(e) => Err(e),
     }

@@ -731,8 +731,8 @@ mod tests {
     fn ctl_refuses_files_and_directories_like_linux() {
         let (table, ep, epfd) = epoll_fd();
         let root = RamFs::new().root();
-        let ffd = watch(&table, root.create("f", NodeKind::File).unwrap());
-        let dfd = watch(&table, root.create("d", NodeKind::Dir).unwrap());
+        let ffd = watch(&table, root.create("f", NodeKind::File, None).unwrap());
+        let dfd = watch(&table, root.create("d", NodeKind::Dir, None).unwrap());
 
         assert_eq!(
             ep.ctl(&table, epfd, EPOLL_CTL_ADD, ffd, EPOLLIN, 0),

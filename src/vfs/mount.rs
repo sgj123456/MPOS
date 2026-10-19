@@ -2374,13 +2374,13 @@ mod tests {
         for vfs in [&a, &b] {
             vfs.resolve("/")
                 .unwrap()
-                .create("mnt", NodeKind::Dir)
+                .create("mnt", NodeKind::Dir, None)
                 .expect("the shared mountpoint directory");
         }
         let tmp_a = RamFs::new();
         tmp_a
             .root()
-            .create("from-a", NodeKind::File)
+            .create("from-a", NodeKind::File, None)
             .expect("the mounted fs is writable");
         a.mount("/mnt", tmp_a).unwrap();
 
@@ -2411,11 +2411,11 @@ mod tests {
         let vfs = tree_with_root();
         vfs.resolve("/")
             .unwrap()
-            .create("a", NodeKind::Dir)
+            .create("a", NodeKind::Dir, None)
             .unwrap();
         vfs.resolve("/a")
             .unwrap()
-            .create("f", NodeKind::File)
+            .create("f", NodeKind::File, None)
             .unwrap();
 
         let f = vfs.resolve("/a/./f").unwrap();
@@ -2439,15 +2439,15 @@ mod tests {
         // why the search is not something a `..` can lean on. The count is the
         // budget's own: `parent_of` stops after `VISITS_MAX` directories.
         for i in 0..600 {
-            root.create(&alloc::format!("d{i:04}"), NodeKind::Dir)
+            root.create(&alloc::format!("d{i:04}"), NodeKind::Dir, None)
                 .unwrap();
         }
-        let a = root.create("a", NodeKind::Dir).unwrap();
-        let b = a.create("b", NodeKind::Dir).unwrap();
-        let target = b.create("target", NodeKind::Dir).unwrap();
-        target.create("file", NodeKind::File).unwrap();
-        let c = b.create("c", NodeKind::Dir).unwrap();
-        let deep = c.create("deep", NodeKind::Dir).unwrap();
+        let a = root.create("a", NodeKind::Dir, None).unwrap();
+        let b = a.create("b", NodeKind::Dir, None).unwrap();
+        let target = b.create("target", NodeKind::Dir, None).unwrap();
+        target.create("file", NodeKind::File, None).unwrap();
+        let c = b.create("c", NodeKind::Dir, None).unwrap();
+        let deep = c.create("deep", NodeKind::Dir, None).unwrap();
         // `/a/b/c/deep/link` names `/a/b/target`, which is the shape every
         // `/sys/dev/char/N:M/device` link has: a target that climbs out of the
         // directory the link sits in. Walking it needs the two ancestors `../..`
@@ -2481,7 +2481,7 @@ mod tests {
         let mnt_dir = vfs
             .resolve("/")
             .unwrap()
-            .create("mnt", NodeKind::Dir)
+            .create("mnt", NodeKind::Dir, None)
             .unwrap();
         // The mountpoint is walked *through* on the way back in, and a
         // directory created by hand keeps no mode until something says one.
@@ -2494,7 +2494,7 @@ mod tests {
         // top - so give this one the same bits rather than lean on "unset
         // means unpoliced" for a directory the test walks through.
         inner.root().set_mode(0o755);
-        inner.root().create("hello", NodeKind::File).unwrap();
+        inner.root().create("hello", NodeKind::File, None).unwrap();
         vfs.mount("/mnt", inner.clone()).unwrap();
 
         let mnt = vfs.resolve("/mnt").unwrap();
@@ -2533,15 +2533,15 @@ mod tests {
         let under = vfs
             .resolve("/")
             .unwrap()
-            .create("run", NodeKind::Dir)
+            .create("run", NodeKind::Dir, None)
             .unwrap();
-        under.create("stale", NodeKind::File).unwrap();
+        under.create("stale", NodeKind::File, None).unwrap();
         let live = RamFs::new();
-        live.root().create("openrc", NodeKind::Dir).unwrap();
+        live.root().create("openrc", NodeKind::Dir, None).unwrap();
         vfs.mount("/run", live.clone()).unwrap();
         vfs.resolve("/")
             .unwrap()
-            .create("b", NodeKind::Dir)
+            .create("b", NodeKind::Dir, None)
             .unwrap();
         let b = vfs.resolve("/b").unwrap();
         vfs.bind_mount(b, vfs.resolve("/").unwrap(), "/", false)
@@ -2573,7 +2573,7 @@ mod tests {
     fn a_no_follow_walk_crosses_a_mount_where_the_entry_door_does_not() {
         let vfs = tree_with_root();
         let root = vfs.resolve("/").unwrap();
-        let covered = root.create("d", NodeKind::Dir).unwrap();
+        let covered = root.create("d", NodeKind::Dir, None).unwrap();
         covered.set_mode(0o755);
         let inner = RamFs::new();
         inner.root().set_mode(0o705);
@@ -2604,10 +2604,10 @@ mod tests {
     fn a_no_follow_walk_inside_a_bind_alias_answers_the_covered_directory() {
         let vfs = tree_with_root();
         let root = vfs.resolve("/").unwrap();
-        let under = root.create("run", NodeKind::Dir).unwrap();
+        let under = root.create("run", NodeKind::Dir, None).unwrap();
         let live = RamFs::new();
         vfs.mount("/run", live.clone()).unwrap();
-        root.create("b", NodeKind::Dir).unwrap();
+        root.create("b", NodeKind::Dir, None).unwrap();
         let b = vfs.resolve("/b").unwrap();
         vfs.bind_mount(b, root.clone(), "/", false).unwrap();
 
@@ -2633,8 +2633,8 @@ mod tests {
     fn a_name_a_mount_sits_on_is_a_mount_point() {
         let vfs = tree_with_root();
         let root = vfs.resolve("/").unwrap();
-        let d = root.create("d", NodeKind::Dir).unwrap();
-        root.create("b", NodeKind::Dir).unwrap();
+        let d = root.create("d", NodeKind::Dir, None).unwrap();
+        root.create("b", NodeKind::Dir, None).unwrap();
         let b = vfs.resolve("/b").unwrap();
         vfs.mount("/d", RamFs::new()).unwrap();
         assert!(vfs.is_mount_point(&d));
@@ -2663,11 +2663,11 @@ mod tests {
         let vfs = tree_with_root();
         vfs.resolve("/")
             .unwrap()
-            .create("d", NodeKind::Dir)
+            .create("d", NodeKind::Dir, None)
             .unwrap();
         vfs.resolve("/")
             .unwrap()
-            .create("f", NodeKind::File)
+            .create("f", NodeKind::File, None)
             .unwrap();
         let inner = RamFs::new();
 
@@ -2692,9 +2692,9 @@ mod tests {
         let bin = vfs
             .resolve("/")
             .unwrap()
-            .create("bin", NodeKind::Dir)
+            .create("bin", NodeKind::Dir, None)
             .unwrap();
-        let busybox = bin.create("busybox", NodeKind::File).unwrap();
+        let busybox = bin.create("busybox", NodeKind::File, None).unwrap();
         busybox.write_at(0, b"busybox").unwrap();
         bin.symlink("ls", "/bin/busybox").unwrap();
         bin.symlink("sh", "busybox").unwrap();
@@ -2766,7 +2766,7 @@ mod tests {
     fn a_parent_that_is_not_a_directory_is_not_dir() {
         let vfs = tree_with_root();
         let root = vfs.resolve("/").unwrap();
-        root.create("plain", NodeKind::File).unwrap();
+        root.create("plain", NodeKind::File, None).unwrap();
         // Absolute resolution, the door `bind` and `unlink` come through.
         assert_eq!(vfs.resolve_parent("/plain/x").err(), Some(VfsError::NotDir));
         // And the cwd-relative door a `dirfd` call uses, which resolves the
@@ -2809,12 +2809,12 @@ mod tests {
     fn the_deepest_mountpoint_serves_the_path_under_it() {
         let vfs = tree_with_root();
         let root = vfs.resolve("/").unwrap();
-        root.create("mnt", NodeKind::Dir).unwrap();
+        root.create("mnt", NodeKind::Dir, None).unwrap();
         vfs.mount("/mnt", RamFs::new()).unwrap();
         // `usb` is made *inside* the mount, which is the only place it can be
         // seen once the filesystem is on top of `/mnt`.
         let mnt = vfs.resolve("/mnt").unwrap();
-        mnt.create("usb", NodeKind::Dir).unwrap();
+        mnt.create("usb", NodeKind::Dir, None).unwrap();
         vfs.mount("/mnt/usb", RamFs::new()).unwrap();
 
         // Ids are handed out in mount order, and 0 is the root's.
@@ -2832,8 +2832,8 @@ mod tests {
     fn a_mountpoint_does_not_serve_a_name_it_only_prefixes() {
         let vfs = tree_with_root();
         let root = vfs.resolve("/").unwrap();
-        root.create("mnt", NodeKind::Dir).unwrap();
-        root.create("mntx", NodeKind::Dir).unwrap();
+        root.create("mnt", NodeKind::Dir, None).unwrap();
+        root.create("mntx", NodeKind::Dir, None).unwrap();
         vfs.mount("/mnt", RamFs::new()).unwrap();
 
         assert_eq!(vfs.fs_of_path("/mnt").0, 1);
@@ -2850,7 +2850,7 @@ mod tests {
     fn a_path_is_normalized_before_the_mountpoint_match() {
         let vfs = tree_with_root();
         let root = vfs.resolve("/").unwrap();
-        root.create("mnt", NodeKind::Dir).unwrap();
+        root.create("mnt", NodeKind::Dir, None).unwrap();
         vfs.mount("/mnt", RamFs::new()).unwrap();
 
         for spelling in [
@@ -2882,7 +2882,7 @@ mod tests {
         let vfs = tree_with_root();
         vfs.resolve("/")
             .unwrap()
-            .create("mnt", NodeKind::Dir)
+            .create("mnt", NodeKind::Dir, None)
             .unwrap();
         let at = vfs.mountpoint_at("/mnt", None).unwrap();
         vfs.mount_at(
@@ -2930,8 +2930,8 @@ mod tests {
     fn two_pseudo_filesystems_get_two_anonymous_numbers() {
         let vfs = tree_with_root();
         let root = vfs.resolve("/").unwrap();
-        root.create("proc", NodeKind::Dir).unwrap();
-        root.create("sys", NodeKind::Dir).unwrap();
+        root.create("proc", NodeKind::Dir, None).unwrap();
+        root.create("sys", NodeKind::Dir, None).unwrap();
         for (path, fstype) in [("/proc", "proc"), ("/sys", "sysfs")] {
             let at = vfs.mountpoint_at(path, None).unwrap();
             vfs.mount_at(at, RamFs::new(), fstype, fstype, false, None)
@@ -2966,7 +2966,7 @@ mod tests {
         let vfs = tree_with_root();
         vfs.resolve("/")
             .unwrap()
-            .create("mnt", NodeKind::Dir)
+            .create("mnt", NodeKind::Dir, None)
             .unwrap();
         let at = vfs.mountpoint_at("/mnt", None).unwrap();
         vfs.mount_at(
@@ -3027,7 +3027,7 @@ mod tests {
         let vfs = tree_with_root();
         vfs.resolve("/")
             .unwrap()
-            .create("new", NodeKind::Dir)
+            .create("new", NodeKind::Dir, None)
             .unwrap();
         let at = vfs.mountpoint_at("/new", None).unwrap();
         vfs.mount_at(
@@ -3073,15 +3073,15 @@ mod cwd_tests {
         vfs.mount_root(RamFs::new());
         vfs.resolve("/")
             .unwrap()
-            .create("bin", NodeKind::Dir)
+            .create("bin", NodeKind::Dir, None)
             .unwrap();
         vfs.resolve("/bin")
             .unwrap()
-            .create("cat", NodeKind::File)
+            .create("cat", NodeKind::File, None)
             .unwrap();
         vfs.resolve("/")
             .unwrap()
-            .create("etc", NodeKind::Dir)
+            .create("etc", NodeKind::Dir, None)
             .unwrap();
 
         let bin = vfs.resolve("/bin").unwrap();

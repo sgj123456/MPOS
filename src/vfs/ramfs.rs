@@ -429,8 +429,13 @@ macro_rules! counts_its_names {
 /// holds names, so every other node says so in one word through this.
 macro_rules! names_live_in_dirs {
     () => {
-        fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
-            let _ = (name, kind);
+        fn create(
+            &self,
+            name: &str,
+            kind: NodeKind,
+            rdev: Option<(u32, u32)>,
+        ) -> VfsResult<Arc<dyn Inode>> {
+            let _ = (name, kind, rdev);
             Err(VfsError::NotDir)
         }
         fn create_tmpfile(&self) -> VfsResult<Arc<dyn Inode>> {
@@ -642,15 +647,37 @@ impl Inode for RamSymlink {
     names_live_in_dirs!();
 }
 
-/// A device node a `mknod` made: a name carrying a device kind.
+/// A device node a `mknod` made: a name carrying a kind **and a number**.
 ///
-/// No driver stands behind it - on this machine the nodes an initramfs's init
-/// pre-seeds (`/dev/null`, `/dev/ptmx`) are placeholders that live exactly as
-/// long as it takes the `devtmpfs` mount to cover them with real devices.
-/// Reads answer end of file and writes vanish, which is the honest behaviour
-/// of a null device and a harmless one for anything nobody has opened yet.
+/// No driver stands behind it. Linux's does stand behind its own, because there
+/// a number reaches the driver that registered it - measured, a node made with
+/// `mknod(path, S_IFCHR|0666, makedev(1, 3))` in any tree opens the *real*
+/// `/dev/null` on this host - so the same node made there and here is the same
+/// node doing different things, and the difference is the number's meaning
+/// rather than the number's existence. What this kernel can report honestly is
+/// one half of it: the node keeps what `mknod` said - its kind, its number, its
+/// word - and `open(2)` of it refuses `ENXIO`, which is Linux's answer for a
+/// number no driver owns and therefore the answer for **every** number here
+/// (`.workbuddy/probe_mknod_rdev.c`, Linux 7.2.11).
+///
+/// Answering anything else would be the lie this replaced: the node used to
+/// open, read end-of-file and swallow writes, which is exactly what
+/// `/dev/null` does - so a caller could not tell a device that is not there
+/// from the one device that is.
 struct RamDev {
     ino: Ino,
+    /// Which of the two device types `mknod` asked for. They are different
+    /// nodes on Linux and were the same node here: every placeholder reported
+    /// a *character* device, so `stat` of a node made with `S_IFBLK` named a
+    /// kind the caller never asked for.
+    kind: NodeKind,
+    /// The number `mknod`'s `dev` argument named, decoded from its word.
+    dev: (u32, u32),
+    /// The permission bits and the ids, which `mknod` hands the node it makes
+    /// exactly as `open(O_CREAT)` hands them a file - masked by the caller's
+    /// umask, and reported back by `stat` rather than invented from the kind.
+    mode: Mutex<Cell<Option<u32>>>,
+    owner: Mutex<Cell<(u32, u32)>>,
     /// The clock `utimensat` hands it - a device node made by `mknod` keeps one
     /// on Linux, the same as one devtmpfs published does. Like every node in
     /// this filesystem it keeps *one* word: the atime is accepted and dropped
@@ -665,17 +692,54 @@ impl Inode for RamDev {
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: self.ino,
-            kind: NodeKind::CharDev,
+            kind: self.kind,
             size: 0,
         }
     }
 
-    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
-        Ok(0)
+    /// What `st_rdev` reports: the number this node was *made* with. The other
+    /// three stat doors reach it through here, so none of them can disagree
+    /// with what `mknod` wrote.
+    fn rdev(&self) -> Option<(u32, u32)> {
+        Some(self.dev)
     }
 
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
-        Ok(buf.len())
+    fn mode(&self) -> u32 {
+        critical_section::with(|cs| self.mode.borrow(cs).get()).unwrap_or(0) & MODE_BITS
+    }
+
+    fn set_mode(&self, mode: u32) {
+        critical_section::with(|cs| {
+            self.mode.borrow(cs).set(Some(mode & MODE_BITS));
+        });
+    }
+
+    fn keeps_modes(&self) -> bool {
+        critical_section::with(|cs| self.mode.borrow(cs).get()).is_some()
+    }
+
+    fn owner(&self) -> (u32, u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).get())
+    }
+
+    fn set_owner(&self, uid: u32, gid: u32) {
+        critical_section::with(|cs| self.owner.borrow(cs).set((uid, gid)));
+    }
+
+    /// None of the file doors reach a node no driver answers for, and `open(2)`
+    /// of one is Linux's `ENXIO` - the refusal a socket node already gives for
+    /// the same reason seen from the other side (there, the name is real and
+    /// the bytes are not; here, neither is).
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+        Err(VfsError::NoDevice)
+    }
+
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> VfsResult<usize> {
+        Err(VfsError::NoDevice)
+    }
+
+    fn open_replacement(&self, _flags: usize) -> VfsResult<Option<Arc<dyn Inode>>> {
+        Err(VfsError::NoDevice)
     }
 
     fn mtime(&self) -> u64 {
@@ -955,7 +1019,12 @@ impl Inode for RamDir {
         })
     }
 
-    fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
+    fn create(
+        &self,
+        name: &str,
+        kind: NodeKind,
+        rdev: Option<(u32, u32)>,
+    ) -> VfsResult<Arc<dyn Inode>> {
         let at = now();
         // The birth mode, as every filesystem that stores modes gives one: a
         // new node is born with the kind's default minus the caller's mask
@@ -991,12 +1060,19 @@ impl Inode for RamDir {
                 flags: NodeFlags::new(),
                 entries: Mutex::new(RefCell::new(BTreeMap::new())),
             }),
-            // A device node mknod made: a placeholder until a devtmpfs mount
-            // covers the directory with driver-backed devices. It keeps no
-            // mode - see `birth_mode`.
+            // A device node `mknod` made. The number is the whole of why this
+            // arm exists rather than being a node with nothing in it: `mknod`
+            // *names* a device, so a node that keeps neither its number nor its
+            // word is a name that answers `stat` about a device nobody made.
+            // The pair is the argument's, decoded at the door, and the mode and
+            // ids are the call's own - see `RamDev`.
             NodeKind::CharDev | NodeKind::BlockDev => Arc::new(RamDev {
                 ino: fresh_ino(),
+                kind,
+                dev: rdev.unwrap_or((0, 0)),
                 links: Mutex::new(Cell::new(1)),
+                mode: Mutex::new(Cell::new(birth)),
+                owner: Mutex::new(Cell::new(owner)),
                 mtime: Mutex::new(Cell::new(at)),
             }),
             // A socket name, made by `bind` alone. Its clock is the bind;
@@ -1220,7 +1296,7 @@ mod tests {
     fn the_attribute_flags_are_kept_and_read_back() {
         use crate::vfs::{FS_APPEND_FL, FS_IMMUTABLE_FL, FS_NODUMP_FL};
         let fs = RamFs::new();
-        let file = fs.root().create("f", NodeKind::File).unwrap();
+        let file = fs.root().create("f", NodeKind::File, None).unwrap();
         assert_eq!(file.flags().unwrap(), 0, "nothing set on a fresh file");
 
         file.set_flags(FS_IMMUTABLE_FL | FS_NODUMP_FL).unwrap();
@@ -1245,7 +1321,7 @@ mod tests {
     fn a_flag_this_cannot_keep_is_refused_and_not_stored() {
         use crate::vfs::{FS_COMPR_FL, FS_ENCRYPT_FL, FS_NODUMP_FL};
         let fs = RamFs::new();
-        let file = fs.root().create("f", NodeKind::File).unwrap();
+        let file = fs.root().create("f", NodeKind::File, None).unwrap();
         assert_eq!(
             file.set_flags(FS_COMPR_FL).err(),
             Some(VfsError::Unsupported)
@@ -1273,7 +1349,7 @@ mod tests {
         use crate::vfs::{FS_IMMUTABLE_FL, may_alter, may_modify, may_remove};
         let fs = RamFs::new();
         let dir = fs.root();
-        let file = dir.create("f", NodeKind::File).unwrap();
+        let file = dir.create("f", NodeKind::File, None).unwrap();
         let handle = crate::vfs::file::File::new(file.clone());
 
         // First with no flags set, so each refusal below is the flag's doing
@@ -1307,7 +1383,7 @@ mod tests {
         use crate::vfs::FS_APPEND_FL;
         use crate::vfs::may_alter;
         let fs = RamFs::new();
-        let file = fs.root().create("log", NodeKind::File).unwrap();
+        let file = fs.root().create("log", NodeKind::File, None).unwrap();
         let handle = crate::vfs::file::File::new(file.clone());
         file.set_flags(FS_APPEND_FL).unwrap();
 
@@ -1336,8 +1412,8 @@ mod tests {
     fn an_append_only_directory_takes_names_and_gives_none_up() {
         use crate::vfs::{FS_APPEND_FL, may_create_in, may_remove};
         let fs = RamFs::new();
-        let dir = fs.root().create("d", NodeKind::Dir).unwrap();
-        let old = dir.create("old", NodeKind::File).unwrap();
+        let dir = fs.root().create("d", NodeKind::Dir, None).unwrap();
+        let old = dir.create("old", NodeKind::File, None).unwrap();
 
         // With no flags, both doors are open.
         may_create_in(&dir).unwrap();
@@ -1358,7 +1434,7 @@ mod tests {
     fn a_full_mount_answers_enospc_instead_of_growing() {
         let fs = RamFs::with_usage(Usage::with_limit(4096));
         let root = fs.root();
-        let file = root.create("big", NodeKind::File).unwrap();
+        let file = root.create("big", NodeKind::File, None).unwrap();
         assert_eq!(file.write_at(0, &vec![0u8; 2048]).unwrap(), 2048);
         assert_eq!(file.write_at(2048, &vec![0u8; 2048]).unwrap(), 2048);
         assert_eq!(file.write_at(4096, &[0u8]).err(), Some(VfsError::NoSpace));
@@ -1377,7 +1453,7 @@ mod tests {
         let fs = RamFs::with_usage(usage.clone());
         let root = fs.root();
 
-        let file = root.create("a", NodeKind::File).unwrap();
+        let file = root.create("a", NodeKind::File, None).unwrap();
         file.write_at(0, &vec![7u8; 3000]).unwrap();
         assert_eq!(usage.used(), 3000);
         file.truncate(100).unwrap();
@@ -1389,7 +1465,7 @@ mod tests {
         // A deleted-but-open file still occupies its room - the bytes are
         // reachable through the descriptor - and only the last reference gives
         // them up.
-        let dropped = root.create("b", NodeKind::File).unwrap();
+        let dropped = root.create("b", NodeKind::File, None).unwrap();
         dropped.write_at(0, &vec![0u8; 500]).unwrap();
         root.unlink("b").unwrap();
         assert!(
@@ -1469,7 +1545,7 @@ mod tests {
     fn create_and_lookup_round_trips_names() {
         let fs = RamFs::new();
         let root = fs.root();
-        root.create("etc", NodeKind::Dir).unwrap();
+        root.create("etc", NodeKind::Dir, None).unwrap();
         let etc = root.lookup("etc").unwrap();
         assert_eq!(etc.metadata().kind, NodeKind::Dir);
         assert_eq!(root.lookup("nope").err(), Some(VfsError::NoEntry));
@@ -1479,9 +1555,9 @@ mod tests {
     fn creating_an_existing_name_is_an_error_and_keeps_the_old_node() {
         let fs = RamFs::new();
         let root = fs.root();
-        let first = root.create("f", NodeKind::File).unwrap();
+        let first = root.create("f", NodeKind::File, None).unwrap();
         assert_eq!(
-            root.create("f", NodeKind::File).err(),
+            root.create("f", NodeKind::File, None).err(),
             Some(VfsError::Exists)
         );
         let again = root.lookup("f").unwrap();
@@ -1491,7 +1567,7 @@ mod tests {
     #[test]
     fn files_read_and_write_at_offsets_and_track_size() {
         let fs = RamFs::new();
-        let file = fs.root().create("f", NodeKind::File).unwrap();
+        let file = fs.root().create("f", NodeKind::File, None).unwrap();
 
         assert_eq!(file.write_at(0, b"hello").unwrap(), 5);
         assert_eq!(file.metadata().size, 5);
@@ -1508,7 +1584,7 @@ mod tests {
     #[test]
     fn short_reads_report_where_the_file_ends() {
         let fs = RamFs::new();
-        let file = fs.root().create("f", NodeKind::File).unwrap();
+        let file = fs.root().create("f", NodeKind::File, None).unwrap();
         file.write_at(0, b"abc").unwrap();
 
         let mut buf = [0u8; 8];
@@ -1519,7 +1595,7 @@ mod tests {
     #[test]
     fn truncate_shrinks_drops_the_tail_and_grows_a_hole() {
         let fs = RamFs::new();
-        let file = fs.root().create("f", NodeKind::File).unwrap();
+        let file = fs.root().create("f", NodeKind::File, None).unwrap();
         file.write_at(0, b"0123456789").unwrap();
 
         file.truncate(4).unwrap();
@@ -1547,12 +1623,12 @@ mod tests {
         // A file is not a directory, and `rmdir` is not `unlink` by another
         // name: the two have to stay apart or a recursive delete is one typo
         // away from a file.
-        root.create("f", NodeKind::File).unwrap();
+        root.create("f", NodeKind::File, None).unwrap();
         assert_eq!(root.rmdir("f").err(), Some(VfsError::NotDir));
         assert!(root.lookup("f").is_ok(), "and the file is untouched");
 
-        let dir = root.create("d", NodeKind::Dir).unwrap();
-        dir.create("inner", NodeKind::File).unwrap();
+        let dir = root.create("d", NodeKind::Dir, None).unwrap();
+        dir.create("inner", NodeKind::File, None).unwrap();
         assert_eq!(root.rmdir("d").err(), Some(VfsError::NotEmpty));
         assert!(root.lookup("d").is_ok(), "the directory is still there");
 
@@ -1582,8 +1658,8 @@ mod tests {
     fn read_dir_names_every_entry_with_its_kind() {
         let fs = RamFs::new();
         let root = fs.root();
-        root.create("b", NodeKind::Dir).unwrap();
-        root.create("a", NodeKind::File).unwrap();
+        root.create("b", NodeKind::Dir, None).unwrap();
+        root.create("a", NodeKind::File, None).unwrap();
 
         let listed = root.read_dir().unwrap();
         assert_eq!(listed.len(), 2, "every entry appears exactly once");
@@ -1599,7 +1675,7 @@ mod tests {
     fn a_second_name_raises_the_link_count_and_unlinking_lowers_it() {
         let fs = RamFs::new();
         let root = fs.root();
-        let file = root.create("a", NodeKind::File).unwrap();
+        let file = root.create("a", NodeKind::File, None).unwrap();
         assert_eq!(file.nlink(), 1, "a created file has the one name");
 
         root.link("b", &file).unwrap();
@@ -1615,11 +1691,11 @@ mod tests {
 
         // A `mknod` placeholder and a bound socket name are counted too: they
         // are nodes like any other, and a link to one is a real second name.
-        let dev = root.create("d", NodeKind::CharDev).unwrap();
+        let dev = root.create("d", NodeKind::CharDev, None).unwrap();
         assert_eq!(dev.nlink(), 1);
         root.link("d2", &dev).unwrap();
         assert_eq!(dev.nlink(), 2);
-        let sock = root.create("s", NodeKind::Socket).unwrap();
+        let sock = root.create("s", NodeKind::Socket, None).unwrap();
         assert_eq!(sock.nlink(), 1);
         root.link("s2", &sock).unwrap();
         assert_eq!(sock.nlink(), 2);
@@ -1634,9 +1710,9 @@ mod tests {
         // this is the one place the distinction can be pinned.
         let fs = RamFs::new();
         let root = fs.root();
-        let file = root.create("f", NodeKind::File).unwrap();
+        let file = root.create("f", NodeKind::File, None).unwrap();
         assert_eq!(
-            file.create("x", NodeKind::File).err(),
+            file.create("x", NodeKind::File, None).err(),
             Some(VfsError::NotDir)
         );
         assert_eq!(file.create_tmpfile().err(), Some(VfsError::NotDir));
@@ -1648,13 +1724,13 @@ mod tests {
         // A link is refused the same way, and so is a bound socket's name.
         let link = root.symlink("l", "nowhere").unwrap();
         assert_eq!(
-            link.create("x", NodeKind::File).err(),
+            link.create("x", NodeKind::File, None).err(),
             Some(VfsError::NotDir)
         );
         assert_eq!(link.unlink("l").err(), Some(VfsError::NotDir));
-        let sock = root.create("s", NodeKind::Socket).unwrap();
+        let sock = root.create("s", NodeKind::Socket, None).unwrap();
         assert_eq!(
-            sock.create("x", NodeKind::File).err(),
+            sock.create("x", NodeKind::File, None).err(),
             Some(VfsError::NotDir)
         );
         assert_eq!(sock.unlink("s").err(), Some(VfsError::NotDir));
@@ -1664,7 +1740,7 @@ mod tests {
     fn unlink_removes_the_name_and_frees_it_for_reuse() {
         let fs = RamFs::new();
         let root = fs.root();
-        let file = root.create("f", NodeKind::File).unwrap();
+        let file = root.create("f", NodeKind::File, None).unwrap();
         file.write_at(0, b"x").unwrap();
 
         root.unlink("f").unwrap();
@@ -1672,7 +1748,7 @@ mod tests {
         // The name is gone but the node survives behind the Arc, writable.
         assert_eq!(file.write_at(0, b"y").unwrap(), 1);
         // The freed name can be created again, as a fresh node.
-        let fresh = root.create("f", NodeKind::File).unwrap();
+        let fresh = root.create("f", NodeKind::File, None).unwrap();
         assert!(!Arc::ptr_eq(&file, &fresh));
         // Removing a name that is not there answers NoEntry.
         assert_eq!(root.unlink("f").err(), None);
@@ -1683,7 +1759,7 @@ mod tests {
     fn nodes_carry_a_clock_that_writes_and_utimensat_move() {
         let fs = RamFs::new();
         let root = fs.root();
-        let file = root.create("f", NodeKind::File).unwrap();
+        let file = root.create("f", NodeKind::File, None).unwrap();
 
         let born = file.mtime();
         assert_ne!(born, 0, "a new file is not from 1970");
@@ -1707,8 +1783,8 @@ mod tests {
         // the folding, was the divergence a caller tripped over.
         for (what, node) in [
             ("symlink", link.clone()),
-            ("socket", root.create("s", NodeKind::Socket).unwrap()),
-            ("device", root.create("d", NodeKind::CharDev).unwrap()),
+            ("socket", root.create("s", NodeKind::Socket, None).unwrap()),
+            ("device", root.create("d", NodeKind::CharDev, None).unwrap()),
         ] {
             node.set_times(111, 222).unwrap();
             assert_eq!(node.mtime(), 222, "a ramfs {what} takes the caller's value");
@@ -1735,8 +1811,8 @@ mod tests {
         let _lock = crate::sched::test_lock::take();
         let fs = RamFs::new();
         let root = fs.root();
-        let dir = root.create("d", NodeKind::Dir).unwrap();
-        let file = root.create("f", NodeKind::File).unwrap();
+        let dir = root.create("d", NodeKind::Dir, None).unwrap();
+        let file = root.create("f", NodeKind::File, None).unwrap();
         // Host umask is the default 022, so 0777 -> 0755 and 0644 unchanged.
         assert_eq!(dir.mode(), 0o755, "mkdir(2)'s S_IALLUGO less the mask");
         assert_eq!(file.mode(), 0o644, "a regular file keeps rw-r--r--");
@@ -1751,7 +1827,7 @@ mod tests {
         // And the mask is honoured rather than hardcoded: at 0077 the same
         // create leaves a directory nobody but its owner can walk into or list.
         crate::sched::set_current_umask(0o077);
-        let private = root.create("p", NodeKind::Dir).unwrap();
+        let private = root.create("p", NodeKind::Dir, None).unwrap();
         crate::sched::set_current_umask(crate::abi::DEFAULT_UMASK);
         assert_eq!(private.mode(), 0o700, "the creator's mask decides");
         assert_eq!(
@@ -1770,7 +1846,7 @@ mod tests {
         let _lock = crate::sched::test_lock::take();
         let fs = RamFs::new();
         let root = fs.root();
-        let sock = root.create("x.sock", NodeKind::Socket).unwrap();
+        let sock = root.create("x.sock", NodeKind::Socket, None).unwrap();
         assert_eq!(sock.metadata().kind, NodeKind::Socket);
         assert_ne!(sock.mtime(), 0, "the bind moment is the node's birthday");
         // The birth mode, not an unset word: `create` stamps Linux's default
@@ -1790,13 +1866,122 @@ mod tests {
         assert!(root.lookup("x.sock").is_err());
     }
 
+    /// A device node `mknod` made: the number it was made with, the kind it was
+    /// made with, and the word the caller stamps afterwards. Three answers this
+    /// node used to invent - `st_rdev` was zero for every node, a `S_IFBLK`
+    /// node answered as a *character* device, and the mode came from the kind
+    /// rather than from the call.
+    ///
+    /// Measured on a current host (`.workbuddy/probe_mknod_rdev.c`, Linux
+    /// 7.2.11, a tmpfs and an ext4 agreeing on every row): `mknod(p,
+    /// S_IFCHR|0666, makedev(136, 300))` leaves `st_rdev` `0x0010882c`, which
+    /// decodes back to `136:300`; `S_IFBLK` leaves a **block** node; and `0666`
+    /// under `umask 027` leaves `0640`.
+    #[test]
+    fn a_device_node_keeps_the_number_its_kind_and_the_callers_mode() {
+        let fs = RamFs::new();
+        let root = fs.root();
+        let chr = root
+            .create("null", NodeKind::CharDev, Some((1, 3)))
+            .unwrap();
+        let wide = root
+            .create("pts-300", NodeKind::CharDev, Some((136, 300)))
+            .unwrap();
+        let blk = root
+            .create("sda", NodeKind::BlockDev, Some((254, 70_000)))
+            .unwrap();
+
+        // The pair survives whole - which is the part keeping the *word*
+        // instead of the numbers would lose: a minor above eight bits was
+        // folded onto another device's number rather than reported as its own.
+        assert_eq!(chr.rdev(), Some((1, 3)));
+        assert_eq!(wide.rdev(), Some((136, 300)));
+        assert_eq!(blk.rdev(), Some((254, 70_000)));
+        // And the pair is the answer `st_rdev` is built from rather than the
+        // answer itself: the word those two bytes *become* is
+        // `abi::new_encode_dev`'s business, and `abi`'s own tests pin every row
+        // of it. This node's claim stops at the pair - which is the layer's own
+        // edge, the graph a memory filesystem may name (see xtask's depgraph
+        // ratchet), and the honest place to stop: the encoding is a question
+        // about the ABI, not about a node.
+        assert_eq!(chr.rdev(), Some((1, 3)));
+        assert_eq!(wide.rdev(), Some((136, 300)));
+        assert_eq!(blk.rdev(), Some((254, 70_000)));
+        // The two device kinds are two nodes, not one: a name made with
+        // `S_IFBLK` reporting a character device to `stat` was a kind nobody
+        // asked this kernel for.
+        assert_eq!(chr.metadata().kind, NodeKind::CharDev);
+        assert_eq!(wide.metadata().kind, NodeKind::CharDev);
+        assert_eq!(blk.metadata().kind, NodeKind::BlockDev);
+        // The mode: none at birth, the caller's afterwards. There is no default
+        // a device node could be born with that would be the caller's answer,
+        // so it is born keeping none and takes the word `mknodat` stamps -
+        // `0000` included, which is not the same thing as keeping none.
+        assert!(!chr.keeps_modes(), "born with no mode of its own");
+        chr.set_mode(0o640);
+        assert_eq!(chr.mode(), 0o640, "0666 less a caller's 027 mask");
+        assert!(chr.keeps_modes());
+        blk.set_mode(0);
+        assert_eq!(blk.mode(), 0, "a mknod asked for no bits gets none");
+        assert!(blk.keeps_modes(), "the word is empty, not absent");
+    }
+
+    /// A device node no driver answers for: `open(2)` of it is Linux's `ENXIO`,
+    /// and none of the file doors reaches it either.
+    ///
+    /// Which is what makes the number above honest rather than decorative. On
+    /// Linux a number reaches the driver that registered it - measured beside
+    /// the rows above (`.workbuddy/probe_mknod_rdev.c`, Linux 7.2.11): in a
+    /// tree that permits devices, a node made with `makedev(1, 3)` opens the
+    /// **real** `/dev/null`, one made with `makedev(4095, 4095)` answers
+    /// `ENXIO`, and a block node nobody owns is `ENXIO` too. Behind every
+    /// number this kernel can be given there stands nothing, so `ENXIO` -
+    /// [`VfsError::NoDevice`] - is the answer for all of them, `0:0` included:
+    /// even the whiteout's number names a device no driver here owns.
+    ///
+    /// Opening, reading end-of-file and swallowing writes was what this node
+    /// did before, which is what `/dev/null` does - so a caller could not tell
+    /// the device that is not there from the one that is.
+    #[test]
+    fn a_device_node_no_driver_answers_for_refuses_every_file_door() {
+        let fs = RamFs::new();
+        let root = fs.root();
+        for (name, kind, rdev) in [
+            ("whiteout", NodeKind::CharDev, (0, 0)),
+            ("null-shape", NodeKind::CharDev, (1, 3)),
+            ("blk-big", NodeKind::BlockDev, (254, 70_000)),
+        ] {
+            let node = root.create(name, kind, Some(rdev)).unwrap();
+            assert_eq!(node.rdev(), Some(rdev));
+            assert_eq!(
+                node.open_replacement(0).err(),
+                Some(VfsError::NoDevice),
+                "open(2) of {name} is ENXIO"
+            );
+            let mut buf = [0u8; 4];
+            assert_eq!(
+                node.read_at(0, &mut buf).err(),
+                Some(VfsError::NoDevice),
+                "read(2) of {name}"
+            );
+            assert_eq!(
+                node.write_at(0, b"x").err(),
+                Some(VfsError::NoDevice),
+                "write(2) of {name}"
+            );
+        }
+        // The one door a name always answers: it can be taken away again.
+        assert!(root.unlink("null-shape").is_ok());
+        assert!(root.lookup("null-shape").is_err());
+    }
+
     #[test]
     fn deep_trees_nest_through_the_trait_alone() {
         let fs = RamFs::new();
         let root = fs.root();
-        let a = root.create("a", NodeKind::Dir).unwrap();
-        let b = a.create("b", NodeKind::Dir).unwrap();
-        let f = b.create("f", NodeKind::File).unwrap();
+        let a = root.create("a", NodeKind::Dir, None).unwrap();
+        let b = a.create("b", NodeKind::Dir, None).unwrap();
+        let f = b.create("f", NodeKind::File, None).unwrap();
         f.write_at(0, b"deep").unwrap();
         assert_eq!(
             root.lookup("a")

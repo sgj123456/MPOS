@@ -1651,7 +1651,7 @@ pub fn mkdirat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     if let Err(e) = crate::vfs::may_create_in(&parent) {
         return err_of(e);
     }
-    match parent.create(name, NodeKind::Dir) {
+    match parent.create(name, NodeKind::Dir, None) {
         Ok(created) => {
             created.set_mode(masked_mode(args[2] as u32));
             let is_dir = created.metadata().kind == crate::vfs::NodeKind::Dir;
@@ -1849,7 +1849,7 @@ pub fn renameat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
         }
         // A regular file: copy the bytes, then drop the old name.
         NodeKind::File => {
-            let inode = claim_name!(dir.create(&name, NodeKind::File));
+            let inode = claim_name!(dir.create(&name, NodeKind::File, None));
             // The copy is the kernel moving bytes between two names of the
             // same file, not a write anyone made: `write_at` stands outside
             // the `File::write` IN_MODIFY chokepoint on purpose. Copy in
@@ -4899,7 +4899,21 @@ pub fn handle_mknod(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     {
         return err::EPERM;
     }
-    match parent.create(name, kind) {
+    // The number goes to the node with the kind, because they are one answer:
+    // Linux's `vfs_mknod` writes the pair the `dev` argument names into the
+    // new inode's `i_rdev`, and `st_rdev` reads it back out - measured on a
+    // current host (`.workbuddy/probe_mknod_rdev.c`, Linux 7.2.11, a tmpfs and
+    // an ext4 agreeing): `makedev(136, 300)` reports `0x10882c` and is read
+    // back as `136:300`, and only the argument's **low 32 bits** are the
+    // number (`0x10300000103` leaves `1:3`). Every other kind carries none, so
+    // the two have to be asked together or not at all - which is why
+    // `Inode::create` takes them as one rather than having a second door a
+    // device node could be made through without a number.
+    let rdev = match kind {
+        NodeKind::CharDev | NodeKind::BlockDev => Some(abi::new_decode_dev(args[2])),
+        _ => None,
+    };
+    match parent.create(name, kind, rdev) {
         Ok(created) => {
             created.set_mode(masked_mode(args[1] as u32));
             0
@@ -6082,16 +6096,21 @@ pub fn handle_fchmodat2(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize
 /// `mknodat(dirfd, path, mode, dev)` — create a node, relative to a
 /// dirfd. `mknod` is this at the caller's cwd.
 ///
-/// **The `dev` argument is not written on the node**, and that is a named
-/// divergence rather than an oversight (`docs/uapi/` §5.2): `st_rdev` is the
-/// field this argument fills, and it is what makes a node *that* device -
-/// `/dev/null` reports `rdev 1:3`, the number its own creation passed
-/// (measured on a current host). What this kernel can honestly do with it is
-/// nothing yet, because it has no table from a device number to a driver: its
-/// devices are objects a driver published under a name (`/dev/null` *is* the
-/// null device; a node made here is not), so writing the number would make
-/// `stat` true and the device still absent - and would put a fabricated node
-/// in front of the rdev-keyed ioctl families, which dispatch on that word.
+/// `mknod` for a *device* node writes the pair its `dev` argument encodes into
+/// the node's own `i_rdev`, and `st_rdev` reads that pair back out - which is
+/// what makes a node *that* device: `/dev/null` reports `rdev 1:3`, the number
+/// its own creation passed (measured on a current host). The pair is kept whole
+/// rather than as the argument's word, because the two disagree for every minor
+/// that does not fit in eight bits - see [`abi::new_encode_dev`], whose rules and
+/// measurement this door shares.
+///
+/// What the number does **not** buy here is the device: no driver answers to any
+/// number `mknod` can be given, because this kernel's devices are objects a
+/// driver published under a name rather than entries in a table keyed by that
+/// word (`/dev/null` *is* the null device; a node made here stands in front of
+/// nothing). So `stat` reporting the number is honest and `open(2)` of the node
+/// is Linux's own `ENXIO` for a number nobody owns - the pair of answers
+/// `docs/uapi/` §5.1 item 71 claims, both measured before either was written.
 pub fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     // The type is the first question, before the name is copied and before the
     // dirfd is looked at - Linux's `may_mknod`, measured through `syscall(2)`
@@ -6165,7 +6184,18 @@ pub fn handle_mknodat(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
     {
         return err::EPERM;
     }
-    match parent.create(name, kind) {
+    // The number rides with the kind - `i_rdev` is written from the same
+    // argument the capability question read, and only the low 32 bits of it
+    // are the number (see the `mknodat` door above, whose measurement this
+    // shares). Both doors are `do_mknodat`, so they are one answer written
+    // twice rather than two.
+    let rdev = match kind {
+        crate::vfs::NodeKind::CharDev | crate::vfs::NodeKind::BlockDev => {
+            Some(abi::new_decode_dev(args[3]))
+        }
+        _ => None,
+    };
+    match parent.create(name, kind, rdev) {
         Ok(created) => {
             created.set_mode(masked_mode(args[2] as u32));
             let is_dir = created.metadata().kind == crate::vfs::NodeKind::Dir;

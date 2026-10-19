@@ -405,6 +405,27 @@ with the dying thread's code and uid and the leader's byte), `trace::group_has_l
 `is_child`/`child_alive_for` admitting a zombie leader, and `exit_group`'s reparent walk for a  
 sibling's children. Pin: `t-exit-group` 4 → 22 claims, four counterfactuals one per rule.
 
+**A device node made by `mknod` carries the number `mknod` was given** (`docs/uapi/` §5.1
+item 71, landed 2026-10-20): the last thing standing in front of the call's `dev` argument, and one
+§5.2 had charged to a prerequisite it does not need — a number-to-driver table, which is what would
+make a number *mean* a device and not what it takes to keep one. Made here, such a node used to
+report `st_rdev` `0:0` whatever number the caller named, was called a **character** device even
+when asked for from `S_IFBLK`, and opened to read end-of-file and swallow writes — which is what
+`/dev/null` does exactly, so a caller could not tell the device that is not there from the one that
+is. Measured on a current host first (`.workbuddy/probe_mknod_rdev.c`, Linux 7.2.11, every row on a
+tmpfs and again on an ext4): `makedev(136, 300)` reports `st_rdev` `0x0010882c` and decodes back to
+`136:300` — the row the old packing would have read as `136:44`, another device's number, as every
+pts above 255 is — `254:70000` reports `0x1110fe70` on a node `stat` calls a *block* device, only
+the argument's low 32 bits are the number at all, `4095:1048575` fills the word whole, `statx`'s two
+unencoded halves agree, and `0666` under `umask 027` leaves `0640` with the type field untouched.
+The pair rides with the kind through `Inode::create` — one door rather than two, because a device
+node made without one answers `stat` about a device nobody made — both `mknod` doors unpack the
+argument with Linux's `new_decode_dev`, `struct stat` writes it through the inverse, and the node
+that keeps it answers **`ENXIO`** from every file door: Linux's own word for a number no driver
+owns, and here for all of them, since reaching a driver is still what this kernel's number does not
+do. Pins: `t-mknod`'s five new claims (its `ok:` lines identical on the two machines, and every one
+of them green on the host's Linux first) and `vfs::ramfs`'s two new unit tests.
+
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
 record-only was wrong in both halves - the figure stored was the caller's rather than Linux's,  
@@ -728,9 +749,9 @@ arriving writer releases it, and the buffer is discarded when both counts reach 
 shape that open used to leave behind is closed too (`docs/uapi/` §5.1 item 28, landed 2026-10-17): a  
 **fatal** signal now *ends* the park instead of ending the task inside it, so the count comes back  
 before the death, which happens at the syscall gate — Linux's own order, where `err_rd:` runs on  
-`ERESTARTSYS` and the task dies after the syscall has unwound. Still unwritten, and separate:  
-`mknod`'s `dev` argument — a node made here carries no device number, because a number-to-driver  
-table is what would make the number mean a device.
+`ERESTARTSYS` and the task dies after the syscall has unwound. `mknod`'s `dev` argument **carried no device number until item 71 landed on 2026-10-20** — a node
+made here now reports the pair the caller named and `open(2)` of it answers `ENXIO`, no driver stands behind any number `mknod` can be given — this kernel's devices are objects a
+driver published under a name, rather than entries in a table keyed by that word.
 
 **A procfs/sysfs node reports its own word, not the kind's default** (`docs/uapi/` §5.1 item 37,  
 landed 2026-10-17): both trees are filesystems that keep no modes, so every directory answered  

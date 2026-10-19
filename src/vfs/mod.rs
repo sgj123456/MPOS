@@ -372,8 +372,22 @@ pub trait Inode: Send + Sync + core::any::Any {
 
     /// Create a child of this directory. The kind is advisory: a filesystem
     /// that cannot represent a kind returns [`VfsError::Unsupported`].
-    fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
-        let _ = (name, kind);
+    ///
+    /// `rdev` is the device number a **char or block** node carries - the pair
+    /// `mknod(2)`'s `dev` argument names once it has been decoded, and nothing
+    /// at all for every other kind. Linux asks it to be there: `vfs_mknod`
+    /// hands the new inode its `i_rdev`, and a filesystem that invented a
+    /// device node with no number would be handing `stat` a device it cannot
+    /// name (`docs/uapi/` §5.1 item 71). Passing `None` for a device kind is
+    /// therefore not an option a caller has - the doors ask for the pair or do
+    /// not make the node.
+    fn create(
+        &self,
+        name: &str,
+        kind: NodeKind,
+        rdev: Option<(u32, u32)>,
+    ) -> VfsResult<Arc<dyn Inode>> {
+        let _ = (name, kind, rdev);
         Err(VfsError::Unsupported)
     }
 
@@ -1167,7 +1181,7 @@ pub(crate) fn split_parent(path: &str) -> VfsResult<(&str, &str)> {
 /// name is taken.
 pub fn create_file(path: &str) -> VfsResult<Arc<dyn Inode>> {
     let (parent, name) = split_parent(path)?;
-    resolve(parent)?.create(name, NodeKind::File)
+    resolve(parent)?.create(name, NodeKind::File, None)
 }
 
 /// Remove the name `path`. `NoEntry` when nothing answers to it.
@@ -1224,7 +1238,7 @@ pub fn read_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Vec
 /// [`create_file`](fn.create_file.html) with a caller-supplied start.
 pub fn create_file_opt(path: &str, start: Option<Arc<dyn Inode>>) -> VfsResult<Arc<dyn Inode>> {
     let (parent, name) = split_parent(path)?;
-    resolve_opt(parent, start)?.create(name, NodeKind::File)
+    resolve_opt(parent, start)?.create(name, NodeKind::File, None)
 }
 
 /// The bit set `open(2)` and `access(2)` share: read, write, execute - the
@@ -2143,9 +2157,9 @@ mod tests {
         let fs = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
-        let here = root.create("here", NodeKind::Dir).unwrap();
-        let sub = here.create("sub", NodeKind::Dir).unwrap();
-        let inside = here.create("f", NodeKind::File).unwrap();
+        let here = root.create("here", NodeKind::Dir, None).unwrap();
+        let sub = here.create("sub", NodeKind::Dir, None).unwrap();
+        let inside = here.create("f", NodeKind::File, None).unwrap();
         // The fixture's own root is a filesystem built before any create ran,
         // so it keeps no mode and stands outside the check. This test walks
         // *out* of directories - `..` asks their search bit on the way, and a
@@ -2246,8 +2260,8 @@ mod tests {
         let fs = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
-        let here = root.create("here", NodeKind::Dir).unwrap();
-        here.create("f", NodeKind::File).unwrap();
+        let here = root.create("here", NodeKind::Dir, None).unwrap();
+        here.create("f", NodeKind::File, None).unwrap();
 
         assert!(Arc::ptr_eq(
             &vfs.resolve_no_follow(".", here.clone()).unwrap(),
@@ -2313,9 +2327,9 @@ mod tests {
         let fs = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
-        let usr = root.create("usr", NodeKind::Dir).unwrap();
-        let lib = usr.create("lib", NodeKind::Dir).unwrap();
-        let real = lib.create("libcap.so.2.78", NodeKind::File).unwrap();
+        let usr = root.create("usr", NodeKind::Dir, None).unwrap();
+        let lib = usr.create("lib", NodeKind::Dir, None).unwrap();
+        let real = lib.create("libcap.so.2.78", NodeKind::File, None).unwrap();
         lib.symlink("libcap.so.2", "libcap.so.2.78").unwrap();
 
         assert!(
@@ -2357,7 +2371,7 @@ mod tests {
         let fs = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(fs.clone());
         let root = vfs.resolve("/").unwrap();
-        let file = root.create("f", NodeKind::File).unwrap();
+        let file = root.create("f", NodeKind::File, None).unwrap();
         file.set_mode(0o600);
         file.set_owner(10, 10);
 
@@ -2422,7 +2436,7 @@ mod tests {
             },
         };
 
-        let file = root.create("f", NodeKind::File).unwrap();
+        let file = root.create("f", NodeKind::File, None).unwrap();
         file.set_mode(0o000);
         // The row that the previous rule got wrong, both ways round: a `chmod
         // 000` file is readable *and* writable to a caller holding the
@@ -2465,7 +2479,7 @@ mod tests {
 
         // `CAP_DAC_READ_SEARCH` is the read half: a read on its own, and on a
         // directory everything but a write.
-        let unreadable = root.create("u", NodeKind::File).unwrap();
+        let unreadable = root.create("u", NodeKind::File, None).unwrap();
         unreadable.set_mode(0o000);
         assert_eq!(may_as(search_only, &unreadable, R_OK).ok(), Some(()));
         assert_eq!(
@@ -2476,7 +2490,7 @@ mod tests {
             may_as(search_only, &unreadable, W_OK).err(),
             Some(VfsError::Access)
         );
-        let dir = root.create("d", NodeKind::Dir).unwrap();
+        let dir = root.create("d", NodeKind::Dir, None).unwrap();
         dir.set_mode(0o000);
         assert_eq!(
             may_as(search_only, &dir, X_OK).ok(),
@@ -2498,7 +2512,7 @@ mod tests {
         // The triads still have the first word, and they are what answers when
         // the overrides are not held at all: a stranger's read of a file its
         // owner may read.
-        let owned = root.create("o", NodeKind::File).unwrap();
+        let owned = root.create("o", NodeKind::File, None).unwrap();
         owned.set_mode(0o600);
         owned.set_owner(10, 10);
         assert_eq!(may_as(Caller::ids(10, 10), &owned, R_OK).ok(), Some(()));
@@ -2547,7 +2561,7 @@ mod tests {
             },
         };
 
-        let owned = root.create("o", NodeKind::File).unwrap();
+        let owned = root.create("o", NodeKind::File, None).unwrap();
         owned.set_mode(0o600);
         owned.set_owner(10, 10);
         // The owner's arm is the uid, and it holds with the whole set gone.
@@ -2569,7 +2583,7 @@ mod tests {
 
         // The `now` form of the same question accepts the triads, so its
         // refusal is the bits' `EACCES` rather than the standing's `EPERM`.
-        let writable = root.create("w", NodeKind::File).unwrap();
+        let writable = root.create("w", NodeKind::File, None).unwrap();
         writable.set_mode(0o666);
         writable.set_owner(10, 10);
         assert_eq!(may_touch(Caller::ids(11, 11), &writable).ok(), Some(()));
@@ -2627,7 +2641,7 @@ mod tests {
 
         // Both bits, with group execute: the ordinary case, and the one the
         // whole rule exists for.
-        let both = root.create("b", NodeKind::File).unwrap();
+        let both = root.create("b", NodeKind::File, None).unwrap();
         both.set_owner(0, 3000);
         both.set_mode(0o6755);
         remove_privs_as(&both, nobody);
@@ -2641,14 +2655,14 @@ mod tests {
         assert_eq!(both.mode(), 0o6755, "and the capability spares them");
 
         // A set-uid with no execute bit at all: still an authority, still gone.
-        let suid = root.create("s", NodeKind::File).unwrap();
+        let suid = root.create("s", NodeKind::File, None).unwrap();
         suid.set_mode(0o4644);
         remove_privs_as(&suid, nobody);
         assert_eq!(suid.mode(), 0o0644);
 
         // A set-group-id with no group execute: a locking mark, and nobody's
         // to take.
-        let mark = root.create("m", NodeKind::File).unwrap();
+        let mark = root.create("m", NodeKind::File, None).unwrap();
         mark.set_owner(0, 3000);
         mark.set_mode(0o2644);
         remove_privs_as(&mark, nobody);

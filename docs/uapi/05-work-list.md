@@ -3555,3 +3555,90 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     host tests 579, `mpos-xtask` 123; `cargo fmt --check` clean; clippy 77/80 (aarch64
     two below §7.6b's 82 because the config pair became live code); `depgraph` within
     the ratchet.
+
+## item 71 — a device node made by `mknod` carries the number `mknod` was given
+
+    §5.2's entry said this kernel ignores `mknod`'s `dev` argument, so a device node
+    made here reports `st_rdev` `0:0` whatever number the caller named, and charged
+    closing it to a prerequisite it does not need: a number-to-driver registry, "the
+    same prerequisite `devfs`'s birth modes want". The number can be kept without a
+    registry. What a registry would buy is a *driver behind* the number, and that
+    absence already has an answer Linux wrote: `ENXIO`, for a device nobody owns.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_mknod_rdev.c`, Linux
+    7.2.11, every row read through `stat` and again through `statx`, on a tmpfs and on
+    an ext4 - which agree, and separate the answer from one filesystem's `mknod`
+    method):
+
+    | asked of Linux | the answer |
+    |---|---|
+    | `mknod(p, S_IFCHR\|0666, makedev(1, 3))` | `st_rdev` `0x00000103`, decoded back to `1:3` |
+    | `makedev(136, 300)` — a minor above eight bits | `0x0010882c`, decoded back to `136:300` |
+    | `makedev(226, 128)` — virtio-gpu's render node | `0x0000e280` |
+    | `makedev(4095, 1048575)` — the whole field | `0xffffffff`, decoded back unchanged |
+    | a **block** node, `makedev(254, 70000)` | `0x1110fe70`, and `stat` calls it a block node |
+    | a `dev` wider than 32 bits (`0x10300000103`) | `1:3` — only the low word is the number |
+    | `0666` under `umask 027` | mode `0640`, the type field untouched |
+    | `statx` beside `stat` on the same node | `stx_rdev_major` 136, `stx_rdev_minor` 300, mode `0644` |
+
+    **Three things were wrong here, and the middle one is not about the number.**
+    `write_stat` packed a pair as `(major << 8) | (minor & 0xff)`, so a node asked for
+    `136:300` would have reported `136:44` — *another* device's number, as every pts
+    above 255 and every wide minor is; `RamDev` reported `NodeKind::CharDev` whatever
+    kind `mknod` was handed, so a name made from `S_IFBLK` answered `stat` about a
+    device nobody asked for - the kind, and not the number, being the half a caller
+    reads first; and it opened, read end-of-file and swallowed writes, which is what
+    `/dev/null` does exactly - a caller could not tell the device that is not there
+    from the one that is.
+
+    **Served** by carrying the pair through the one door that can make such a node.
+    `Inode::create` takes it beside the kind, because a device node reached through any
+    other door is a name answering `stat` about a device nobody made; both `mknod` doors
+    unpack the argument's low 32 bits with `abi::new_decode_dev` — Linux's own inverse,
+    whose four rows ride in that function's unit test next to the six above — and
+    `abi::new_encode_dev` is what `st_rdev` is written with now, so `struct stat` and
+    `statx`'s two unencoded halves cannot disagree. `RamDev` keeps the pair, the kind,
+    the caller's mode and its ids, and answers `VfsError::NoDevice` — Linux's `ENXIO`,
+    and therefore the answer for **every** number this kernel can be given, `0:0`'s
+    whiteout included, since no driver stands behind any of them. Three filesystems
+    that cannot keep a number (`ext4`, `9p`, `devfs`) refuse a device node rather than
+    inventing one, which is what they already did for a kind they cannot publish.
+
+    **Two answers stay named rather than claimed in the pin**, because each belongs to
+    the machine reading them and not to the rule: **what `open(2)` of such a node
+    answers** — on a `nodev` mount Linux answers `EACCES` for every device node before
+    it consults the number (this host's `/tmp` is one), while off one the number is what
+    answers: `makedev(1, 3)` opens the **real** `/dev/null`, `136:300` answers `EIO`
+    from a pts driver with no line behind it, `4095:4095` answers `ENXIO`, and `O_PATH`
+    succeeds in every case, being the one door that asks no driver for anything — and
+    **whether the number reaches a driver at all**. It still does not. What the device
+    would need is §5.2's registry, and this kernel's devices remain objects a driver
+    published under a name; a node made by `mknod` is a name with a number now, where it
+    used to be a name pretending to be the one device that is.
+
+    **Pin**: `t-mknod`'s five new claims, made by a caller holding `CAP_MKNOD` — the
+    node carries the number it was made with (`1:3` is `0x103`), a minor that does not
+    fit in eight bits survives (`136:300` is `0x0010882c`), a block node keeps a
+    twenty-bit minor (`254:70000` is `0x1110fe70`) *and* is called a block device, and
+    the whiteout's zero is `0:0` through the same field — beside two host unit tests in
+    `vfs::ramfs` (`a_device_node_keeps_the_number_its_kind_and_the_callers_mode`,
+    `a_device_node_no_driver_answers_for_refuses_every_file_door`) which pin the pair,
+    the two kinds and the `ENXIO` at the layer that makes them. Every row was green on
+    this host's Linux first — the whole program run as root through `syscall(2)`, which
+    is also why no claim here is about the inode when the host does not write it.
+
+    **The depgraph ratchet caught one thing worth keeping**: the first draft of those
+    unit tests encoded the pair with `abi::new_encode_dev` to prove the word matches,
+    and `xtask`'s Phase-11 ratchet refused it — `vfs names crate::syscall:: 2 times, up
+    from the recorded 0`, and a ninth mutual pair. The edge was real and the ratchet was
+    right: the encoding is a question about the ABI and `abi`'s own tests answer it, so
+    the filesystem's claim stops at the pair it keeps.
+
+    **Counterfactual, every other pin kept**:
+
+    | reverted | result |
+    |---|---|
+    | the two `mknod` doors' argument, replaced by a literal `0` (`src/syscall/linux/fs/file.rs`; `RamDev` untouched) | `pass=188 fail=1 (189 built)`, and the one red program is **`t-mknod`** - reproducibly, two runs - while every control passes on both kernels and the host unit tests stay 582 green, because the node still holds its pair and it is the door that stopped handing it one. Putting the argument back gives `pass=189 fail=0 (189 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33, command exit 0 |
+
+    Gate: x86_64 `pass=189 fail=0 (189 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33 (11 of 200 left out by `tests.toml`); aarch64 `pass=188 fail=0`, `mpos-kunit 32 passed, 0 failed`, reaching `=== END` (12 left out); host unit tests 582 passed (up 3), `mpos-xtask` 123; `cargo fmt --check` clean; clippy's warning set unmoved by this change on both bare-metal targets; `cargo xtask depgraph` back within the ratchet
+

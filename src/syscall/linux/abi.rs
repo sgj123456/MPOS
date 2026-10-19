@@ -444,6 +444,49 @@ pub(crate) fn nlink_of(meta: &Metadata, tracked: u64) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// device numbers: the word `st_rdev` carries, and `mknod(2)`'s `dev` argument
+// ---------------------------------------------------------------------------
+
+/// Pack a device number the way Linux's `st_rdev` packs it: the minor's low
+/// eight bits at 0..8, twelve bits of major at 8..20, and the minor's high
+/// twelve bits at 12..32 - Linux's `new_encode_dev`, and the inverse of
+/// [`new_decode_dev`].
+///
+/// Measured on a current host through `syscall(2)`
+/// (`.workbuddy/probe_mknod_rdev.c`, Linux 7.2.11, on a tmpfs and on ext4
+/// alike): `mknod(path, S_IFCHR|0666, makedev(136, 300))` reports
+/// `st_rdev` `0x0010882c` and reads back as `136:300`; `4095:1048575` - the
+/// whole field - reports `0xffffffff`; and a *block* node's `254:70000`
+/// reports `0x1110fe70`. `statx` carries the same pair unencoded in
+/// `stx_rdev_major`/`stx_rdev_minor`, which is why those two need no rule.
+///
+/// The packing this replaced kept the minor's low byte alone, so every device
+/// whose minor carries a high part answered with a number belonging to a
+/// *different* device - a pts above 255, and anything else with a wide minor.
+pub(crate) fn new_encode_dev(dev: Option<(u32, u32)>) -> u64 {
+    match dev {
+        Some((major, minor)) => {
+            ((minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12)) as u64
+        }
+        None => 0,
+    }
+}
+
+/// Unpack `mknod(2)`'s `dev` argument into the pair it names - Linux's
+/// `new_decode_dev`, asked of the argument's **low 32 bits**, which are the
+/// whole of the uapi's `unsigned dev`.
+///
+/// Measured beside the encoding above: a `dev` whose upper word is set
+/// (`0x0000010300000103`) leaves a node reporting `1:3`, so the high half is
+/// not part of the number - it is the register's, not the argument's.
+pub(crate) fn new_decode_dev(dev: usize) -> (u32, u32) {
+    let word = dev as u32;
+    let major = (word & 0x000f_ff00) >> 8;
+    let minor = (word & 0xff) | ((word >> 12) & 0x000f_ff00);
+    (major, minor)
+}
+
 /// Write the calling ABI's `struct stat` for `meta` - [`STAT_BYTES`] bytes of
 /// it, and not one byte more.
 ///
@@ -470,12 +513,10 @@ pub(crate) fn write_stat(
     let nlink = nlink_of(meta, nlink);
     let size = meta.size;
     let blocks: u64 = size.div_ceil(512);
-    // The device number a character device node carries, packed the way
-    // `makedev` lays it out: major in the high bytes, minor in the low.
-    let packed_rdev = match rdev {
-        Some((major, minor)) => ((major as u64) << 8) | (minor as u64 & 0xff) | 0,
-        None => 0,
-    };
+    // `st_rdev`: Linux's `new_encode_dev`, whose rule and measurement
+    // [`new_encode_dev`] carries. Anything else puts a minor's high part where
+    // a caller reads another device's number.
+    let packed_rdev = new_encode_dev(rdev);
 
     unsafe {
         core::ptr::write_bytes(buf as *mut u8, 0, STAT_BYTES);
@@ -3317,6 +3358,48 @@ mod tests {
         assert!(!mknod_needs_capability(0o010_644, 0)); // S_IFIFO
         assert!(!mknod_needs_capability(0o140_644, 0)); // S_IFSOCK
         assert!(!mknod_needs_capability(0, 0)); // a plain mode
+    }
+
+    /// The number a device node carries: `mknod(2)`'s `dev` argument is a
+    /// **word**, not a pair, and the pair it names comes out of it by
+    /// Linux's `new_decode_dev` - which is what makes a minor above eight
+    /// bits reachable at all.
+    ///
+    /// Every row below is a node made and read back on a current host
+    /// (`.workbuddy/probe_mknod_rdev.c`, Linux 7.2.11) rather than a
+    /// rearrangement of the arithmetic: the word is what `stat` reported for
+    /// exactly that `mknod`, on a tmpfs and on ext4 alike.
+    #[test]
+    fn a_mknod_dev_argument_is_the_word_the_pair_encodes() {
+        // (pair the caller meant, the word `mknod` was given and `st_rdev`
+        // reported back verbatim)
+        let measured: [((u32, u32), u32); 6] = [
+            ((0, 0), 0x0000_0000),          // the overlayfs whiteout
+            ((1, 3), 0x0000_0103),          // /dev/null's own number
+            ((136, 300), 0x0010_882c),      // a pts above 255: the minor's high part
+            ((226, 128), 0x0000_e280),      // renderD128
+            ((4095, 1048575), 0xffff_ffff), // the whole field
+            ((254, 70000), 0x1110_fe70),    // a block node whose minor needs three bytes
+        ];
+        for (pair, word) in measured {
+            assert_eq!(new_decode_dev(word as usize), pair, "decode {word:#010x}");
+            assert_eq!(new_encode_dev(Some(pair)), word as u64, "encode {pair:?}");
+        }
+        // A node with no number at all reports zero, which is every kind that
+        // is not a device - `stat` of a regular file has no number to name.
+        assert_eq!(new_encode_dev(None), 0);
+        // The argument is `unsigned`: only its low half is the number. Measured
+        // beside the rest - `0x0000010300000103` left the node reporting `1:3`.
+        assert_eq!(new_decode_dev(0x0000_0103_0000_0103usize), (1, 3));
+        // And the encode is the decode's inverse for any word at all, because
+        // the two halves - twelve bits of major, twenty of minor - are the
+        // whole of what a `u32` can say.
+        for word in [0u32, 1, 0xff, 0x100, 0x0f_ff_ff, 0x8000_0000, u32::MAX] {
+            assert_eq!(
+                new_encode_dev(Some(new_decode_dev(word as usize))),
+                word as u64
+            );
+        }
     }
 
     /// `wait(2)`: a normal exit puts its code in bits 15:8 (WEXITSTATUS),

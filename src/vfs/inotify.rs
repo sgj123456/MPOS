@@ -1148,7 +1148,7 @@ mod tests {
     fn watched_dir() -> Arc<dyn Inode> {
         crate::vfs::ramfs::RamFs::new()
             .root()
-            .create("watched", NodeKind::Dir)
+            .create("watched", NodeKind::Dir, None)
             .unwrap()
     }
 
@@ -1237,7 +1237,7 @@ mod tests {
         let (node, instance) = instance_node();
         let file = crate::vfs::ramfs::RamFs::new()
             .root()
-            .create("read-me", NodeKind::File)
+            .create("read-me", NodeKind::File, None)
             .unwrap();
         add_watch(&node, node.metadata().ino, key_of(&file), IN_ACCESS);
         // A second watch on the same file that did *not* ask for access.
@@ -1277,7 +1277,7 @@ mod tests {
         let (node, instance) = instance_node();
         let file_inode = crate::vfs::ramfs::RamFs::new()
             .root()
-            .create("writable", NodeKind::File)
+            .create("writable", NodeKind::File, None)
             .unwrap();
         add_watch(&node, node.metadata().ino, key_of(&file_inode), IN_MODIFY);
         let file = crate::vfs::File::new(file_inode.clone());

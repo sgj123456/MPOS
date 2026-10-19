@@ -882,7 +882,15 @@ mod device {
             fs.read_dir(self.fid()?)
         }
 
-        fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
+        /// Create a name here, with the number a device node would carry - a
+        /// number this dialect cannot send, so one asked for is refused rather
+        /// than made without it (`docs/uapi/` §5.1 item 71).
+        fn create(
+            &self,
+            name: &str,
+            kind: NodeKind,
+            rdev: Option<(u32, u32)>,
+        ) -> VfsResult<Arc<dyn Inode>> {
             let fs = self.up()?;
             let (perm, mode) = match kind {
                 NodeKind::File => (0o644, O_RDWR),
@@ -891,6 +899,9 @@ mod device {
                 // answered one would be a driver inventing a protocol.
                 _ => return Err(VfsError::Unsupported),
             };
+            if rdev.is_some() {
+                return Err(VfsError::Unsupported);
+            }
             // A throwaway of the directory, because Tcreate turns the fid
             // it is given into the new file's.
             let (dir_clone, _) = fs.walk(self.fid()?, &[])?;

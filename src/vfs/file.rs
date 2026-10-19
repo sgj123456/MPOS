@@ -968,7 +968,10 @@ mod tests {
 
     #[test]
     fn a_file_cursor_walks_what_it_writes_then_hits_eof() {
-        let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
+        let inode = RamFs::new()
+            .root()
+            .create("f", NodeKind::File, None)
+            .unwrap();
         let file = File::new(inode.clone());
 
         assert_eq!(file.write(b"hello").unwrap(), 5);
@@ -995,7 +998,10 @@ mod tests {
     /// door (`read`, `pread64`, `readv`, `preadv`) arrives here.
     #[test]
     fn a_directory_has_no_byte_reader() {
-        let dir = RamFs::new().root().create("d", NodeKind::Dir).unwrap();
+        let dir = RamFs::new()
+            .root()
+            .create("d", NodeKind::Dir, None)
+            .unwrap();
         assert_eq!(
             dir.metadata().kind,
             NodeKind::Dir,
@@ -1010,7 +1016,12 @@ mod tests {
 
         // The controls: the same two questions against a regular file, so a
         // refusal above is the kind rather than the fixture.
-        let file = File::new(RamFs::new().root().create("f", NodeKind::File).unwrap());
+        let file = File::new(
+            RamFs::new()
+                .root()
+                .create("f", NodeKind::File, None)
+                .unwrap(),
+        );
         assert_eq!(file.read(&mut buf).unwrap(), 0);
         assert_eq!(file.read(&mut []).unwrap(), 0);
     }
@@ -1023,7 +1034,10 @@ mod tests {
     /// over the start of the previous one.
     #[test]
     fn a_description_opened_for_append_writes_at_the_end() {
-        let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
+        let inode = RamFs::new()
+            .root()
+            .create("f", NodeKind::File, None)
+            .unwrap();
         let first = File::new(inode.clone());
         assert_eq!(first.write(b"one\n").unwrap(), 4);
 
@@ -1039,7 +1053,12 @@ mod tests {
 
         // Without the flag the same fresh description writes at its cursor,
         // which is the behaviour the flag exists to change.
-        let overwriting = File::new(RamFs::new().root().create("g", NodeKind::File).unwrap());
+        let overwriting = File::new(
+            RamFs::new()
+                .root()
+                .create("g", NodeKind::File, None)
+                .unwrap(),
+        );
         overwriting.write(b"abcdef").unwrap();
         let plain = File::new(overwriting.inode());
         plain.write(b"XY").unwrap();
@@ -1063,7 +1082,10 @@ mod tests {
     }
     #[test]
     fn descriptions_over_one_inode_read_independently() {
-        let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
+        let inode = RamFs::new()
+            .root()
+            .create("f", NodeKind::File, None)
+            .unwrap();
         let writer = File::new(inode.clone());
         let reader = File::new(inode);
         assert_eq!(writer.write(b"abcd").unwrap(), 4);
@@ -1085,7 +1107,7 @@ mod tests {
         crate::vfs::mount_root(RamFs::new());
         crate::vfs::resolve("/")
             .unwrap()
-            .create("f", NodeKind::File)
+            .create("f", NodeKind::File, None)
             .unwrap();
 
         let fd = open("/f").unwrap();
@@ -1107,7 +1129,10 @@ mod tests {
     }
 
     fn file_on(name: &str) -> Arc<File> {
-        let inode = RamFs::new().root().create(name, NodeKind::File).unwrap();
+        let inode = RamFs::new()
+            .root()
+            .create(name, NodeKind::File, None)
+            .unwrap();
         Arc::new(File::new(inode))
     }
 
@@ -1184,7 +1209,10 @@ mod tests {
     /// those descriptors too.
     #[test]
     fn access_mode_is_enforced_after_open() {
-        let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
+        let inode = RamFs::new()
+            .root()
+            .create("f", NodeKind::File, None)
+            .unwrap();
 
         // A fresh description is permissive: this is the anonymous-object case.
         let both = File::new(inode.clone());
@@ -1217,7 +1245,10 @@ mod tests {
     /// asked for `O_RDWR` still reports `1`.
     #[test]
     fn the_reported_word_keeps_the_access_mode_setfl_cannot_change() {
-        let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
+        let inode = RamFs::new()
+            .root()
+            .create("f", NodeKind::File, None)
+            .unwrap();
         let file = File::new(inode);
         assert_eq!(
             file.open_flags(),
@@ -1285,7 +1316,10 @@ mod tests {
         const O_ASYNC: u32 = 0o20000;
         const O_NOATIME: u32 = 0o1000000;
 
-        let inode = RamFs::new().root().create("f", NodeKind::File).unwrap();
+        let inode = RamFs::new()
+            .root()
+            .create("f", NodeKind::File, None)
+            .unwrap();
 
         let file = File::new(inode.clone());
         file.set_access(super::ACC_WRONLY);
@@ -1329,7 +1363,12 @@ mod tests {
 
         // ... and the word really is the whole of what was asked for, not a
         // whitelist: a bit no table here names is still the caller's.
-        let odd = File::new(RamFs::new().root().create("g", NodeKind::File).unwrap());
+        let odd = File::new(
+            RamFs::new()
+                .root()
+                .create("g", NodeKind::File, None)
+                .unwrap(),
+        );
         odd.set_born(0x0080_0000);
         assert_eq!(odd.open_flags(), super::ACC_RDWR | 0x0080_0000);
     }

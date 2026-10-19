@@ -1932,7 +1932,7 @@ mod tests {
         let vfs = crate::vfs::mount::MountTable::new();
         let root = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(root.clone());
-        root.root().create("sys", NodeKind::Dir).unwrap();
+        root.root().create("sys", NodeKind::Dir, None).unwrap();
         vfs.mount("/sys", fs.clone()).unwrap();
         vfs.resolve(path)
             .unwrap_or_else(|e| panic!("{path} did not resolve: {e:?}"))
@@ -1949,10 +1949,10 @@ mod tests {
         let vfs = crate::vfs::mount::MountTable::new();
         let root = crate::vfs::ramfs::RamFs::new();
         vfs.mount_root(root.clone());
-        root.root().create("sys", NodeKind::Dir).unwrap();
+        root.root().create("sys", NodeKind::Dir, None).unwrap();
         for i in 0..fillers {
             root.root()
-                .create(&alloc::format!("d{i:04}"), NodeKind::Dir)
+                .create(&alloc::format!("d{i:04}"), NodeKind::Dir, None)
                 .unwrap();
         }
         vfs.mount("/sys", fs.clone()).unwrap();

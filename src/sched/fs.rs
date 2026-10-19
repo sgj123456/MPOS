@@ -150,7 +150,7 @@ mod tests {
     fn dir() -> alloc::sync::Arc<dyn crate::vfs::Inode> {
         let fs = RamFs::new();
         fs.root()
-            .create("d", NodeKind::Dir)
+            .create("d", NodeKind::Dir, None)
             .expect("a directory to move into")
     }
 

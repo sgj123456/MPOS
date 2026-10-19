@@ -965,8 +965,23 @@ impl Inode for Ext4Ino {
         Ok(self.wrap(child))
     }
 
-    fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
+    /// Create a name in this directory.
+    ///
+    /// A device node is refused, and with it the number [`Inode::create`]
+    /// carries: this layout keeps no `i_rdev`, so a device node made here would
+    /// be a number this filesystem has nowhere to put rather than a device with
+    /// one. `docs/uapi/` §5.1 item 71 names that as the honest half - the nodes
+    /// a memory filesystem makes carry the pair, and this one makes none.
+    fn create(
+        &self,
+        name: &str,
+        kind: NodeKind,
+        rdev: Option<(u32, u32)>,
+    ) -> VfsResult<Arc<dyn Inode>> {
         self.fs.writable()?;
+        if rdev.is_some() {
+            return Err(VfsError::Unsupported);
+        }
         if matches!(
             kind,
             NodeKind::CharDev | NodeKind::Symlink | NodeKind::Socket
@@ -1763,7 +1778,7 @@ mod tests {
         let fs = Ext4Fs::mount(dev).expect("mount");
         let root = fs.root();
         let file = root
-            .create("default.theme", NodeKind::File)
+            .create("default.theme", NodeKind::File, None)
             .expect("create");
         let mut body: Vec<u8> = Vec::new();
         for name in [
@@ -1864,7 +1879,9 @@ mod tests {
         let dev = Arc::new(format());
         let fs = mounted(dev.clone());
         let root = fs.root();
-        let out = root.create("out.bin", NodeKind::File).expect("create");
+        let out = root
+            .create("out.bin", NodeKind::File, None)
+            .expect("create");
         let bytes: Vec<u8> = (0..LEN).map(pattern).collect();
         assert_eq!(out.write_at(0, &bytes).unwrap(), LEN);
         // Rewriting a middle chunk in place must not disturb its neighbours.
@@ -1903,7 +1920,7 @@ mod tests {
             .map(|i| alloc::format!("f{i:02}-{}", "x".repeat(54)))
             .collect();
         for name in &names {
-            root.create(name, NodeKind::File)
+            root.create(name, NodeKind::File, None)
                 .unwrap_or_else(|e| panic!("create {name}: {e:?}"));
         }
         for name in &names {
@@ -1926,7 +1943,7 @@ mod tests {
         assert_eq!(free_counts(&dev), (115, 62));
         let fs = mounted(dev.clone());
         let root = fs.root();
-        let file = root.create("log", NodeKind::File).expect("create");
+        let file = root.create("log", NodeKind::File, None).expect("create");
         // Three blocks' worth, so the tail is real blocks rather than bytes
         // inside the block the head lives in.
         let long = vec![b'x'; 3 * 1024];
@@ -1949,7 +1966,7 @@ mod tests {
         let dev = Arc::new(format());
         let fs = mounted(dev.clone());
         let root = fs.root();
-        let file = root.create("stamp", NodeKind::File).expect("create");
+        let file = root.create("stamp", NodeKind::File, None).expect("create");
         let ctime_before = file.ctime();
         file.set_times(111, 222).expect("set_times");
         assert_eq!(file.atime(), 111, "st_atime took the caller's value");
@@ -1971,7 +1988,9 @@ mod tests {
         let dev = Arc::new(format());
         let fs = mounted(dev.clone());
         let root = fs.root();
-        let file = root.create("watched", NodeKind::File).expect("create");
+        let file = root
+            .create("watched", NodeKind::File, None)
+            .expect("create");
         file.write_at(0, b"payload").unwrap();
         let stale = file.atime();
         assert!(
@@ -2004,7 +2023,7 @@ mod tests {
         let dev = Arc::new(format());
         let fs = mounted(dev.clone());
         let root = fs.root();
-        let file = root.create("cut", NodeKind::File).expect("create");
+        let file = root.create("cut", NodeKind::File, None).expect("create");
         file.write_at(0, &vec![b'a'; 2500]).unwrap();
         file.write_at(2500, b"tail that goes away").unwrap();
 
@@ -2022,7 +2041,7 @@ mod tests {
     fn truncating_upward_grows_a_hole_that_reads_as_zeros() {
         let fs = mounted(Arc::new(format()));
         let root = fs.root();
-        let file = root.create("grow", NodeKind::File).expect("create");
+        let file = root.create("grow", NodeKind::File, None).expect("create");
         file.write_at(0, b"head").unwrap();
         file.truncate(4096).expect("grow");
 
@@ -2040,7 +2059,7 @@ mod tests {
     fn truncate_refuses_what_is_not_a_file() {
         let fs = mounted(Arc::new(format()));
         let root = fs.root();
-        let dir = root.create("d", NodeKind::Dir).expect("create dir");
+        let dir = root.create("d", NodeKind::Dir, None).expect("create dir");
         assert_eq!(dir.truncate(0).err(), Some(VfsError::IsDir));
         assert_eq!(root.truncate(0).err(), Some(VfsError::IsDir));
     }
@@ -2137,7 +2156,7 @@ mod tests {
         let root = fs.root();
         let root_links = fs.core.read_inode(ROOT_INO).links;
 
-        let dir = root.create("d", NodeKind::Dir).expect("create dir");
+        let dir = root.create("d", NodeKind::Dir, None).expect("create dir");
         // A new subdirectory is a name in its parent *and* a `..` pointing
         // back at it, so the parent gains a link as well as the child.
         assert_eq!(fs.core.read_inode(ROOT_INO).links, root_links + 1);
@@ -2146,7 +2165,9 @@ mod tests {
         // Not empty, and it must say so rather than take what is inside with
         // it: that is the whole difference between `rmdir` and a recursive
         // delete wearing the wrong name.
-        let inner = dir.create("inner", NodeKind::File).expect("create inner");
+        let inner = dir
+            .create("inner", NodeKind::File, None)
+            .expect("create inner");
         inner.write_at(0, b"x").unwrap();
         assert_eq!(root.rmdir("d").err(), Some(VfsError::NotEmpty));
         assert!(root.lookup("d").is_ok(), "the directory is still there");
@@ -2166,7 +2187,7 @@ mod tests {
         );
 
         // A file is not a directory, and a name that is not there is not one.
-        root.create("f", NodeKind::File).expect("create file");
+        root.create("f", NodeKind::File, None).expect("create file");
         assert_eq!(root.rmdir("f").err(), Some(VfsError::NotDir));
         assert_eq!(root.rmdir("gone").err(), Some(VfsError::NoEntry));
     }
@@ -2176,7 +2197,7 @@ mod tests {
         let dev = Arc::new(format());
         let fs = mounted(dev);
         let root = fs.root();
-        let file = root.create("sparse", NodeKind::File).expect("create");
+        let file = root.create("sparse", NodeKind::File, None).expect("create");
         assert_eq!(file.write_at(5000, b"abc").unwrap(), 3);
         assert_eq!(file.metadata().size, 5003);
 
@@ -2191,13 +2212,15 @@ mod tests {
         let dev = Arc::new(format());
         let fs = mounted(dev.clone());
         let root = fs.root();
-        let dir = root.create("d", NodeKind::Dir).expect("create dir");
+        let dir = root.create("d", NodeKind::Dir, None).expect("create dir");
         assert_eq!(
-            root.create("d", NodeKind::Dir).err(),
+            root.create("d", NodeKind::Dir, None).err(),
             Some(VfsError::Exists)
         );
 
-        let inner = dir.create("f", NodeKind::File).expect("create in dir");
+        let inner = dir
+            .create("f", NodeKind::File, None)
+            .expect("create in dir");
         assert_eq!(inner.write_at(0, b"nested").unwrap(), 6);
         assert_eq!(dir.metadata().kind, NodeKind::Dir);
         // A directory's size is the byte length of its dirent blocks - what
@@ -2234,8 +2257,10 @@ mod tests {
     fn read_dir_walks_every_entry_including_the_dots() {
         let fs = mounted(Arc::new(format()));
         let root = fs.root();
-        root.create("note", NodeKind::File).expect("create file");
-        root.create("docs", NodeKind::Dir).expect("create dir");
+        root.create("note", NodeKind::File, None)
+            .expect("create file");
+        root.create("docs", NodeKind::Dir, None)
+            .expect("create dir");
 
         let listed = root.read_dir().expect("list the root");
         // "." and ".." come with the block, as POSIX readdir reports them.
@@ -2266,7 +2291,9 @@ mod tests {
 
         let fs = mounted(dev.clone());
         let root = fs.root();
-        let out = root.create("out.bin", NodeKind::File).expect("create");
+        let out = root
+            .create("out.bin", NodeKind::File, None)
+            .expect("create");
         let bytes: Vec<u8> = (0..LEN).map(pattern).collect();
         assert_eq!(out.write_at(0, &bytes).unwrap(), LEN);
         assert_eq!(free_counts(&dev), (115 - 21, 61), "20 data, one indirect");
@@ -2296,14 +2323,16 @@ mod tests {
         let dev = Arc::new(format());
         let fs = mounted(dev);
         let root = fs.root();
-        let file = root.create("scratch", NodeKind::File).expect("create");
+        let file = root
+            .create("scratch", NodeKind::File, None)
+            .expect("create");
         assert_eq!(file.write_at(0, b"first").unwrap(), 5);
         root.unlink("scratch").expect("unlink");
 
         // What a second boot over the same image does: the create must not
         // answer Exists, and the inode it is handed must be a clean one.
         let again = root
-            .create("scratch", NodeKind::File)
+            .create("scratch", NodeKind::File, None)
             .expect("create the same name again");
         assert_eq!(again.metadata().size, 0, "the reused inode starts empty");
         assert_eq!(read_all(&*again, 16), Vec::new());
@@ -2313,7 +2342,7 @@ mod tests {
     fn unlink_refuses_directories_and_unknown_names() {
         let fs = mounted(Arc::new(format()));
         let root = fs.root();
-        root.create("d", NodeKind::Dir).expect("create dir");
+        root.create("d", NodeKind::Dir, None).expect("create dir");
         assert_eq!(root.unlink("d").err(), Some(VfsError::IsDir));
         assert_eq!(root.unlink("nope").err(), Some(VfsError::NoEntry));
 
@@ -2420,9 +2449,9 @@ mod tests {
         vfs.mount_root(alloc::sync::Arc::new(fs));
 
         let root = vfs.resolve("/").expect("root");
-        root.create("usr", NodeKind::Dir).expect("usr");
+        root.create("usr", NodeKind::Dir, None).expect("usr");
         let usr = root.lookup("usr").expect("usr");
-        usr.create("lib", NodeKind::Dir).expect("lib");
+        usr.create("lib", NodeKind::Dir, None).expect("lib");
         let lib = usr.lookup("lib").expect("lib");
 
         let tmpname = ".apk.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -2433,7 +2462,7 @@ mod tests {
         lib.symlink(tmpname, "libllhttp.so.9.4.1")
             .expect("symlinkat the temp name");
         let body = lib
-            .create(bodytmp, NodeKind::File)
+            .create(bodytmp, NodeKind::File, None)
             .expect("the real library's temp file");
         crate::vfs::File::new(body.clone())
             .write(&vec![0x42u8; 63088])
@@ -2508,7 +2537,7 @@ mod tests {
         let ino = {
             let fs = mounted(dev.clone());
             fs.root()
-                .create("d", NodeKind::Dir)
+                .create("d", NodeKind::Dir, None)
                 .expect("mkdir")
                 .metadata()
                 .ino as u32
@@ -2568,7 +2597,7 @@ mod tests {
             .map(|i| alloc::format!("entry-{i:04}-padpadpad"))
             .collect();
         for name in &names {
-            dir.create(name, NodeKind::File).expect("insert");
+            dir.create(name, NodeKind::File, None).expect("insert");
         }
         for name in &names {
             dir.lookup(name).expect("every name is findable");
@@ -2609,7 +2638,7 @@ mod tests {
         let name = |i: usize| alloc::format!("n{:0>99}", i);
         let mut inserted = 0;
         loop {
-            match dir.create(&name(inserted), NodeKind::File) {
+            match dir.create(&name(inserted), NodeKind::File, None) {
                 Ok(_) => inserted += 1,
                 Err(VfsError::NoSpace) => break,
                 Err(e) => panic!("unexpected error at {inserted}: {e:?}"),
@@ -2622,7 +2651,7 @@ mod tests {
             dir.lookup(&name(i)).expect("still there");
         }
         assert!(matches!(
-            dir.create(&name(inserted), NodeKind::File),
+            dir.create(&name(inserted), NodeKind::File, None),
             Err(VfsError::NoSpace)
         ));
     }
@@ -2635,7 +2664,7 @@ mod tests {
             .map(|i| alloc::format!("victim-{i:03}-padding"))
             .collect();
         for name in &names {
-            dir.create(name, NodeKind::File).expect("insert");
+            dir.create(name, NodeKind::File, None).expect("insert");
         }
         let root_block = inode_word(&dev, ino, 40);
         let count_before = critical_section::with(|cs| {
@@ -2678,7 +2707,7 @@ mod tests {
             fs.root().lookup("d").expect("the directory")
         };
 
-        dir.create("after", NodeKind::File)
+        dir.create("after", NodeKind::File, None)
             .expect("a bad index does not stop inserts");
         dir.lookup("after").expect("the name is there");
         // The flag went with the fallback, and the directory is linear now.
@@ -2750,7 +2779,7 @@ mod tests {
         // lands in the last leaf - full - with the node above it full too,
         // and the root (one entry, limit 124) holding the only slot. The
         // insert has to split the node, restart, and split the leaf.
-        dir.create("new-name", NodeKind::File)
+        dir.create("new-name", NodeKind::File, None)
             .expect("the insert goes through the two splits");
         dir.lookup("new-name").expect("the name is findable");
 
@@ -3130,7 +3159,7 @@ mod tests {
         let core = &fs.core;
         let file = fs
             .root()
-            .create("grown", NodeKind::File)
+            .create("grown", NodeKind::File, None)
             .expect("the file is created");
         // Six extents nowhere near each other - near ones would merge into a
         // run - so the inode's four are outgrown: the fifth has to split it
@@ -3164,7 +3193,7 @@ mod tests {
         let core = &fs.core;
         let file = fs
             .root()
-            .create("run", NodeKind::File)
+            .create("run", NodeKind::File, None)
             .expect("the file is created");
         // Six blocks written one at a time, and the allocator hands them out
         // in a row: five entries saying so would be a list where one run
@@ -3195,7 +3224,7 @@ mod tests {
         let fs = mounted(Arc::new(format_ext4()));
         let file = fs
             .root()
-            .create("sparse", NodeKind::File)
+            .create("sparse", NodeKind::File, None)
             .expect("the file is created");
         // Four extents nowhere near each other, then a fifth that belongs
         // *before* all of them. The split has to hand the new one to the half
@@ -3223,7 +3252,7 @@ mod tests {
         let fs = mounted(dev.clone());
         let file = fs
             .root()
-            .create("grown", NodeKind::File)
+            .create("grown", NodeKind::File, None)
             .expect("the file is created");
         // Six extents nowhere near each other, so the tree has to split and
         // grow: six data blocks, the sibling the split made, and the block
@@ -3249,7 +3278,10 @@ mod tests {
         // no allocation proportional to the file.
         let dev = Arc::new(format_ext4());
         let fs = mounted(dev.clone());
-        let file = fs.root().create("tail", NodeKind::File).expect("create");
+        let file = fs
+            .root()
+            .create("tail", NodeKind::File, None)
+            .expect("create");
         for l in 0..5u64 {
             let page = vec![b'a' + l as u8; 1024];
             file.write_at(l * 1024, &page).expect("write");
@@ -3292,7 +3324,10 @@ mod tests {
         ext4_feature(&dev, 1024 + 100, ROCOMPAT_METADATA_CSUM);
         let fs = mounted(dev.clone());
         assert!(!fs.read_only(), "checksums we maintain mean writes");
-        let file = fs.root().create("summed", NodeKind::File).expect("create");
+        let file = fs
+            .root()
+            .create("summed", NodeKind::File, None)
+            .expect("create");
         file.write_at(0, b"checksum payload").expect("write");
         drop(fs);
         let again = mounted(dev);
@@ -3502,7 +3537,10 @@ mod tests {
         );
 
         // Six blocks, one extent each - the fifth and sixth force a split.
-        let grown = fs.root().create("grown", NodeKind::File).expect("create");
+        let grown = fs
+            .root()
+            .create("grown", NodeKind::File, None)
+            .expect("create");
         for l in 0..6u64 {
             let page = vec![b'a' + l as u8; 1024];
             assert_eq!(grown.write_at(l * 1024, &page).expect("write"), 1024);
@@ -3549,7 +3587,10 @@ mod tests {
         let dev: Arc<dyn BlockDev> = Arc::new(FileDev { file, sectors });
         let fs = mounted(dev);
 
-        let flagged = fs.root().create("flagged", NodeKind::File).expect("create");
+        let flagged = fs
+            .root()
+            .create("flagged", NodeKind::File, None)
+            .expect("create");
         let fresh = flagged.flags().expect("a file on ext4 has flags");
         assert_eq!(
             fresh & crate::vfs::FS_EXTENT_FL,

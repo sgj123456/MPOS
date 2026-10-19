@@ -482,7 +482,20 @@ impl Inode for DevRoot {
     /// devtmpfs permits `bind(2)` of a `SOCK_FILE` here, and busybox syslog
     /// does exactly that for `/dev/log` on every boot. Device nodes stay the
     /// driver's decision; a fifo would need a pipe face to be worth making.
-    fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
+    ///
+    /// The number [`Inode::create`] carries is refused rather than ignored: the
+    /// nodes this tree publishes are the drivers' own, each with the number its
+    /// driver declared, and a device node made from a name alone would be a
+    /// second kind of device with nothing behind it.
+    fn create(
+        &self,
+        name: &str,
+        kind: NodeKind,
+        rdev: Option<(u32, u32)>,
+    ) -> VfsResult<Arc<dyn Inode>> {
+        if rdev.is_some() {
+            return Err(VfsError::Unsupported);
+        }
         match kind {
             NodeKind::Dir | NodeKind::Socket => {}
             _ => return Err(VfsError::Unsupported),
@@ -743,7 +756,17 @@ impl Inode for DevDirNode {
         })
     }
 
-    fn create(&self, name: &str, kind: NodeKind) -> VfsResult<Arc<dyn Inode>> {
+    /// The same two kinds, in a directory a driver planted under `/dev`. The
+    /// device number is refused here too - see the parent's `create`.
+    fn create(
+        &self,
+        name: &str,
+        kind: NodeKind,
+        rdev: Option<(u32, u32)>,
+    ) -> VfsResult<Arc<dyn Inode>> {
+        if rdev.is_some() {
+            return Err(VfsError::Unsupported);
+        }
         match kind {
             NodeKind::Dir | NodeKind::Socket => {}
             _ => return Err(VfsError::Unsupported),
@@ -1216,29 +1239,29 @@ mod tests {
         let fs = DevFs::new();
         // A device node - and any other kind - is still the driver's decision.
         assert_eq!(
-            fs.root().create("node", NodeKind::CharDev).err(),
+            fs.root().create("node", NodeKind::CharDev, None).err(),
             Some(VfsError::Unsupported)
         );
         assert_eq!(
-            fs.root().create("plain", NodeKind::File).err(),
+            fs.root().create("plain", NodeKind::File, None).err(),
             Some(VfsError::Unsupported)
         );
         // A socket name is the caller's: bind(2) of /dev/log arrives here.
-        let sock = fs.root().create("log", NodeKind::Socket).unwrap();
+        let sock = fs.root().create("log", NodeKind::Socket, None).unwrap();
         assert_eq!(sock.metadata().kind, NodeKind::Socket);
         assert_eq!(
             fs.root().lookup("log").unwrap().metadata().ino,
             sock.metadata().ino
         );
         assert_eq!(
-            fs.root().create("log", NodeKind::Socket).err(),
+            fs.root().create("log", NodeKind::Socket, None).err(),
             Some(VfsError::Exists)
         );
         // unlink retires the name, and the same name is bindable again -
         // syslog's restart path is create, unlink, create.
         fs.root().unlink("log").unwrap();
         assert_eq!(fs.root().lookup("log").err(), Some(VfsError::NoEntry));
-        assert!(fs.root().create("log", NodeKind::Socket).is_ok());
+        assert!(fs.root().create("log", NodeKind::Socket, None).is_ok());
     }
 
     #[test]
@@ -1255,9 +1278,11 @@ mod tests {
         let fs = DevFs::new();
         let root = fs.root();
 
-        let dir = root.create("disk", NodeKind::Dir).expect("mkdir /dev/disk");
+        let dir = root
+            .create("disk", NodeKind::Dir, None)
+            .expect("mkdir /dev/disk");
         assert_eq!(
-            root.create("disk", NodeKind::Dir).err(),
+            root.create("disk", NodeKind::Dir, None).err(),
             Some(VfsError::Exists)
         );
         assert_eq!(
@@ -1288,8 +1313,10 @@ mod tests {
 
         // A directory holding a child: ENOTEMPTY, and the name survives. That
         // is the whole reason `rmdir` is not a recursive delete.
-        let dri = root.create("dri", NodeKind::Dir).expect("mkdir /dev/dri");
-        dri.create("by-path", NodeKind::Dir)
+        let dri = root
+            .create("dri", NodeKind::Dir, None)
+            .expect("mkdir /dev/dri");
+        dri.create("by-path", NodeKind::Dir, None)
             .expect("mkdir /dev/dri/by-path");
         assert_eq!(root.rmdir("dri"), Err(VfsError::NotEmpty));
         assert!(
@@ -1310,7 +1337,7 @@ mod tests {
 
         // A link to a directory is refused too: `rmdir` does not follow the
         // last name, so the link's own kind is what answers.
-        root.create("target", NodeKind::Dir)
+        root.create("target", NodeKind::Dir, None)
             .expect("mkdir /dev/target");
         root.symlink("link", "/dev/target").expect("symlink");
         assert_eq!(root.rmdir("link").err(), Some(VfsError::NotDir));
@@ -1381,7 +1408,7 @@ mod tests {
         let fs = DevFs::new();
         fs.register_dir("dri");
         fs.register_symlink("root", "vda1");
-        let sock = fs.root().create("log", NodeKind::Socket).unwrap();
+        let sock = fs.root().create("log", NodeKind::Socket, None).unwrap();
 
         keeps_the_clocks(&fs.root(), "/dev itself");
         keeps_the_clocks(&fs.root().lookup("dri").unwrap(), "/dev/dri");

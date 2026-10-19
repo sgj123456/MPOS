@@ -48,16 +48,31 @@
 //! description - is the node's own subject and is pinned in `t-fifo`; the whole
 //! measured shape is `docs/uapi/` §5.2 (`.workbuddy/probe_fifo.c`).
 //!
-//! # What this kernel does not write on the node
+//! # The number the node carries
 //!
-//! A device node made here carries **no device number**: `st_rdev` is the field
-//! `mknod`'s `dev` argument fills, and this kernel ignores the argument. That is
-//! named in `docs/uapi/` §5.2 rather than claimed, because what it can honestly
-//! do with the number is nothing yet - it has no table from a device number to
-//! a driver (its `/dev/null` *is* the null device; a node made here is a
-//! placeholder the `devtmpfs` mount later covers), so writing it would make
-//! `stat` true and the device still absent. The claims below therefore read the
-//! *type*, and the section prints the number that came back.
+//! `st_rdev` is the field `mknod`'s `dev` argument fills, and this kernel ignored
+//! the argument: every device node it made read `0` back out of it, whichever
+//! number the caller named. What the field holds is not the argument's word but
+//! the **(major, minor)** pair that word encodes, re-encoded the way Linux lays
+//! it out - which is the same word for a pair whose minor fits in eight bits and
+//! a *different* one for a pair whose minor does not, so the row worth claiming
+//! is a wide minor. Measured before it was written
+//! (`.workbuddy/probe_mknod_rdev.c`, Linux 7.2.11, a tmpfs and an ext4 agreeing
+//! on every row): `makedev(136, 300)` reports `0x0010882c` and decodes back to
+//! `136:300`; a *block* node keeps its own number (`makedev(254, 70000)` →
+//! `0x1110fe70`) **and** reports a block node, which this kernel did not - every
+//! device node it made answered as a character device; a `dev` wider than 32
+//! bits contributes nothing, only its low word being the number; and the
+//! whiteout's `0` reports `0:0`. Each of those rows is claimed below.
+//!
+//! What is *not* claimed here is opening one, because that errno belongs to the
+//! machine rather than to the rule: on a `nodev` mount Linux answers `EACCES`
+//! for **every** device node before it consults the number (this host's `/tmp`
+//! is one), and off one the number is what answers - the real `/dev/null` for
+//! `makedev(1, 3)`, `ENXIO` for a number nobody owns. No driver here answers to
+//! any number `mknod` can be given, so this kernel's own answer - `ENXIO`, from
+//! the node rather than from a mount - is pinned where it is made, in
+//! `vfs::ramfs`'s tests.
 //!
 //! # The one privilege question this call asks
 //!
@@ -101,6 +116,12 @@ const PLAIN: &str = "/tmp/t-mknod-plain";
 const NONE: &str = "/tmp/t-mknod-mode0";
 const SOCK: &str = "/tmp/t-mknod-sock";
 const CHR: &str = "/tmp/t-mknod-chr";
+/// The number's shadow: the same node made with a minor above eight bits, and
+/// one asked for from `S_IFBLK` - the two rows the encoding is not the identity
+/// on, and the reason a device node that keeps the argument's *word* instead of
+/// the pair names another device.
+const CHR_WIDE: &str = "/tmp/t-mknod-chr-wide";
+const BLK: &str = "/tmp/t-mknod-blk";
 /// The node the capability section makes *after* it has the capability back.
 const CHR_AGAIN: &str = "/tmp/t-mknod-chr-again";
 const MISSING: &str = "/tmp/t-mknod-no-dir/node";
@@ -164,11 +185,30 @@ fn mode_of(path: &str) -> Option<u32> {
         .map(|st| st.st_mode as u32 & 0o7777)
 }
 
+/// What `st_rdev` reports for a name, or `None` when nothing answers to it.
+fn rdev_of(path: &str) -> Option<u64> {
+    statat(CWD, path, AtFlags::empty())
+        .ok()
+        .map(|st| st.st_rdev)
+}
+
+/// The word `st_rdev` holds for a pair - Linux's `new_encode_dev`: the minor's
+/// low eight bits, twelve bits of major above them, and the minor's high twelve
+/// bits at the top of the word.
+///
+/// This program hands `mknodat` the word rather than a pair because that is what
+/// the uapi does (`dev` is `unsigned`), and reads the same word back - which is
+/// the round trip the claims are about. The rows themselves are measured on a
+/// host (`.workbuddy/probe_mknod_rdev.c`) rather than derived from this sum.
+fn encode(major: u32, minor: u32) -> u64 {
+    ((minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12)) as u64
+}
+
 /// Remove every fixture, so each claim starts from a free name whatever the
 /// last run left behind. The capability section's directory has to be emptied
 /// before it can go, which is why the names inside it are listed too.
 fn clear() {
-    for path in [NODE, PLAIN, NONE, SOCK, CHR, CHR_AGAIN] {
+    for path in [NODE, PLAIN, NONE, SOCK, CHR, CHR_WIDE, BLK, CHR_AGAIN] {
         let _ = unlinkat(CWD, path, AtFlags::empty());
     }
     for name in [
@@ -382,10 +422,16 @@ fn main() {
             ),
             made == 0 && kind_of(CHR) == Some(FileType::CharacterDevice),
         );
-        let number = statat(CWD, CHR, AtFlags::empty()).ok().map(|st| st.st_rdev);
-        println!(
-            "     the character node's st_rdev: {number:?} - Linux reports the dev argument \
-             (1:3); this kernel does not write it, docs/uapi/ §5.2"
+        // The number it was made with, which is the one answer this kernel had
+        // nothing to say about until this pass: `st_rdev` read `0` for every
+        // device node whatever number the caller named. Linux's own answer for
+        // `1:3` is beside it in the header's measurement, and it is `/dev/null`'s
+        // number - the row every spelling of the encoding agrees on, which makes
+        // it the control rather than the interesting one.
+        let number = rdev_of(CHR);
+        r.check(
+            &format!("the node carries the number it was made with (got rdev {number:?})"),
+            number == Some(encode(1, 3)),
         );
     } else {
         println!(
@@ -481,6 +527,55 @@ fn main() {
                 "and the same character node is served once CAP_MKNOD is back (got {again}, errno {ea})"
             ),
             again == 0 && kind_of(CHR_AGAIN) == Some(FileType::CharacterDevice),
+        );
+
+        // ---- the number a device node carries, and the kind beside it -------
+        //
+        // Both while the capability is held, because a *device* node is the only
+        // thing it gates. `1:3` above is the control - `/dev/null`'s own number,
+        // and one whose minor fits in the eight bits every spelling of the
+        // encoding agrees on. What settles the question is a pair that does not
+        // fit, and a node asked for from the other device type: those two rows
+        // are where keeping the argument's **word** instead of the pair names
+        // another device, and where reporting one kind for both devices shows.
+        // Measured on a current host first, on a tmpfs and an ext4 agreeing
+        // (`.workbuddy/probe_mknod_rdev.c`, Linux 7.2.11).
+        let (wide, ew2) = mknodat(S_IFCHR | 0o666, encode(136, 300), CHR_WIDE);
+        let wide_number = rdev_of(CHR_WIDE);
+        r.check(
+            &format!(
+                "a character node keeps a minor that does not fit in eight bits (got {wide}, errno {ew2}, rdev {wide_number:?})"
+            ),
+            wide == 0 && wide_number == Some(encode(136, 300)),
+        );
+        r.check(
+            &format!("and its number is the word Linux reports: 136:300 is 0x0010882c (got {wide_number:?})"),
+            wide_number == Some(0x0010_882c),
+        );
+        let (blk_node, eb2) = mknodat(S_IFBLK | 0o660, encode(254, 70_000), BLK);
+        let blk_number = rdev_of(BLK);
+        r.check(
+            &format!(
+                "a block node keeps a twenty-bit minor too (got {blk_node}, errno {eb2}, rdev {blk_number:?})"
+            ),
+            blk_node == 0 && blk_number == Some(encode(254, 70_000)),
+        );
+        r.check(
+            &format!("254:70000 is 0x1110fe70 (got {blk_number:?})"),
+            blk_number == Some(0x1110_fe70),
+        );
+        // The kind is the number's other half and it was wrong here too: every
+        // device node `mknod` made reported a *character* device, so a block
+        // node's own name answered `stat` about a device nobody asked for.
+        r.check(
+            "and stat calls the node made from S_IFBLK a block device",
+            kind_of(BLK) == Some(FileType::BlockDevice),
+        );
+        // The number nobody asked for: the whiteout's `0`, made above without
+        // the capability, which is `0:0` through this same field.
+        r.check(
+            "and the whiteout's zero is 0:0 through the same field",
+            rdev_of(cap_dir("whiteout").as_str()) == Some(0),
         );
     }
 

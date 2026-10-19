@@ -1483,7 +1483,7 @@ pub(crate) fn bind_path(sock: &UnixSock, path: &str) -> isize {
     if let Err(e) = crate::vfs::may_create_in(&parent) {
         return crate::uaccess::err_of(e);
     }
-    let node = match parent.create(name, NodeKind::Socket) {
+    let node = match parent.create(name, NodeKind::Socket, None) {
         Ok(created) => created,
         Err(VfsError::Exists) => return err::EADDRINUSE,
         Err(VfsError::Unsupported) => return err::EOPNOTSUPP,

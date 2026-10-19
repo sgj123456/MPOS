@@ -68,7 +68,9 @@ static WRITER_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 fn ensure_child(dir: &Arc<dyn Inode>, name: &str, kind: NodeKind) -> Arc<dyn Inode> {
     match dir.lookup(name) {
         Ok(child) => child,
-        Err(_) => dir.create(name, kind).expect("create the scratch file"),
+        Err(_) => dir
+            .create(name, kind, None)
+            .expect("create the scratch file"),
     }
 }
 
@@ -82,7 +84,7 @@ fn ramfs_file(_info: &crate::boot::BootInfo) -> Result<(), String> {
         Ok(dir) => dir,
         Err(_) => vfs::resolve("/")
             .map_err(|e| alloc::format!("the bootstrap root does not resolve as `/`: {e:?}"))?
-            .create("etc", NodeKind::Dir)
+            .create("etc", NodeKind::Dir, None)
             .map_err(|e| alloc::format!("could not create /etc: {e:?}"))?,
     };
     ensure_child(&etc, "mpos-hostname", NodeKind::File);
@@ -138,7 +140,7 @@ fn mounted_tree_multi_task(_info: &crate::boot::BootInfo) -> Result<(), String> 
     // collide with: it is a new root, not the tree behind the mount.
     vfs::resolve("/tmp")
         .map_err(|e| alloc::format!("resolve /tmp: {e:?}"))?
-        .create("shared", NodeKind::File)
+        .create("shared", NodeKind::File, None)
         .map_err(|e| alloc::format!("create /tmp/shared: {e:?}"))?;
 
     sched::spawn(

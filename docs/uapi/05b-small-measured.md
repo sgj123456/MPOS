@@ -234,20 +234,46 @@ Section numbers are unchanged from the original `UAPI.md`.
   `reboot`'s `CAP_SYS_BOOT` and `syslog`'s `CAP_SYSLOG` — through `Credentials::capable`
   (`crates/cred`), with the three *other* shapes named below rather than approximated.
 
-- **A device node made by `mknod` carries no device number.** `st_rdev` is the field `mknod(2)`'s
-  `dev` argument fills - measured on the host, `/dev/null` reports `rdev 1:3`, the number its own
-  creation passed, and an unprivileged caller cannot make a device node to watch it happen
-  (`EPERM`, measured) - and this kernel ignores the argument: `handle_mknodat` reads only the mode
-  and hands `parent.create(name, kind)` its kind, so a node made here reports `rdev 0:0`. It is
-  named rather than fixed because writing the number is not the whole of it: this kernel has no
-  table from a device number to a driver (its `/dev/null` *is* the null device, a driver-published
-  object; a node made here is a placeholder the `devtmpfs` mount later covers), so a true
-  `st_rdev` would make `stat` right and the device still absent - and it would put a fabricated
-  node in front of the rdev-keyed ioctl families (`'R'`'s entropy words, `FIONREAD`), which
-  dispatch on that word and would then answer for a device that is not there. Closing it means a
-  number-to-driver registry, which is the same prerequisite `devfs`'s birth modes want. Owner:
-  `src/syscall/linux/fs/file.rs`'s two `mknod` doors. `t-mknod` reads the type of what it made and
-  prints the `st_rdev` that came back.
+- **A device node made by `mknod` carries the number `mknod` was given — landed
+  2026-10-20** (`docs/uapi/` §5.1 item 71). `st_rdev` is the field `mknod(2)`'s
+  `dev` argument fills - measured on the host, `/dev/null` reports `rdev 1:3`, the
+  number its own creation passed - and this kernel ignored the argument, so every
+  device node made here reported `rdev 0:0` whatever number the caller named. **The
+  pair now travels with the kind**: `Inode::create` takes it, because a device node
+  reached through any other door would be a node answering `stat` about a device
+  nobody made; both `mknod` doors unpack the argument's low 32 bits into a `(major,
+  minor)` pair with Linux's `new_decode_dev`; and the memory filesystem keeps the
+  **pair** rather than the word, because the two are not the same number for every
+  device whose minor carries a high part - the packing this replaced kept only a
+  minor's low byte, so `136:300` would have been read back as `136:44`, another
+  device's number. A node made from `S_IFBLK` reports a **block** node now, where
+  every device node used to answer as a character one; the mode is the caller's word
+  less its umask; and `open(2)` of the node is Linux's **`ENXIO`**, because no driver
+  here answers to any number `mknod` can be given - this kernel's `/dev/null` *is*
+  the null device, an object a driver published under a name, so what the old node
+  did there (opened, read end-of-file, swallowed writes) was `/dev/null`'s own answer
+  coming back for a device that was not there.
+
+  **Measured whole before it was written** (`.workbuddy/probe_mknod_rdev.c`, Linux
+  7.2.11, a tmpfs and an ext4 agreeing on every row): `makedev(136, 300)` reports
+  `st_rdev` `0x0010882c` and decodes back to `136:300`; a block node's
+  `makedev(254, 70000)` reports `0x1110fe70`; `4095:1048575` - the whole field -
+  reports `0xffffffff`; a `dev` whose upper word is set contributes nothing beyond
+  its low 32 bits (a node made with `0x10300000103` reports `1:3`); `st_rdev`'s pair
+  survives the round trip through both stat doors and through `statx`, whose
+  `stx_rdev_major`/`minor` carry it unencoded; and `0666` under `umask 027` leaves
+  `0640`, the type untouched. **What cannot be claimed here is opening one**, because
+  that answer belongs to the machine rather than to the rule: on a `nodev` mount
+  Linux answers `EACCES` for *every* device node before it consults the number (this
+  host's `/tmp` is one), while off one the number is what answers - `makedev(1, 3)`
+  opens the **real** `/dev/null` there, `136:300` answers `EIO` from a pts driver with
+  no tty behind it, and an unowned number answers `ENXIO`; `O_PATH` succeeds in every
+  case, which is the one door that asks no driver for anything. So `t-mknod` claims
+  the pair, the kind and the mode - identical on both machines - and the kernel's own
+  `ENXIO` is pinned where it is made, in `vfs::ramfs`'s host tests. Survivors, named:
+  a number still reaches no driver, so this kernel's devices remain objects published
+  under a name; and the filesystems that cannot keep a number (ext4, 9p, devfs) refuse
+  a device node as they did before rather than inventing one.
 
 - **A descriptor's second name now denotes the file behind it — and what that leaves.** **Landed
   2026-10-16** (`docs/uapi/` §5.1 item 24). The entry this replaces said a pipe "cannot be named by
