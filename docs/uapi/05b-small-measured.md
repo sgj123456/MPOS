@@ -5,22 +5,51 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
-- **A thread has no `/proc/<tid>` directory here, where Linux serves one.** Found by item 63's
-  pin, which claimed a thread's `exit_signal` through the one spelling this kernel serves and
-  measured the other on the host in the same run (`.workbuddy/probe_exit_signal_field.c`, Linux
-  7.2.11). On Linux a tid names a `/proc` directory with the whole file set: `/proc/<tid>/stat`
-  answers that thread's own record - field 38 `-1`, byte for byte the answer its
-  `<pid>/task/<tid>/stat` gives - and the tid is listed under the process's `task/` beside it.
-  This kernel's `/proc` directory is a **leader**'s (`pid_exists` asks `snapshot(pid).pid == pid`,
-  `src/vfs/procfs.rs`), so a thread's record is reachable through `<pid>/task/<tid>/stat` alone
-  and `/proc/<tid>` is `ENOENT`. It is named rather than fixed because the fix is the *lookup*
-  and everything it lets through rather than one field: `process_dir` for a non-leader tid, the
-  number a reader names such a task by (`reader_number` is "the reader's number", and a thread's
-  own is its tid), and the `NSpid`-shaped fields whose first entry would be the tid's. The
-  question worth measuring before it is built is which of the two names a *program* uses -
-  `procps` and `libc`'s `gettid`-based paths take the `task/` spelling, while a debugger reading
-  `/proc/<tid>` is the shape Linux's own `thread-self` link hands out. Owner: `src/vfs/procfs.rs`.
-  Pin: today's half is `t-clone-exit`'s thread claim, which reads the served spelling.
+- **A thread's tid names a `/proc` directory now, and the clause that came with it.** **Landed
+  2026-10-19** (`docs/uapi/` §5.1 item 64) — found by item 63's pin, which claimed a thread's
+  `exit_signal` through the one spelling this kernel served and measured the other on the host in
+  the same run. The entry this replaces said a tid named no directory here, where Linux serves
+  one, and named what the fix turned on (`process_dir` for a non-leader tid, the number a reader
+  names such a task by, the `NSpid`-shaped fields). It also named the question worth measuring
+  *first* — which of the two names a **program** uses — and that is measured now
+  (`.workbuddy/probe_tid_dir.c`, Linux 7.2.11): under `strace`, `ps -eLf` walks the group (306
+  opens of the *relative* name `task`, beside not one absolute `/proc/<pid>/task/<tid>` path)
+  while `gdb -p <tid>` opens **`/proc/<tid>/status`** outright. Both spellings have a program
+  behind them, and the tid's own is a debugger's.
+
+  So the directory is built for the *task* rather than for its leader: `process_dir(slot)` takes
+  the slot the name resolved to, `stat`'s field 1 and `status`'s `Pid`/`NSpid` are the tid's
+  while `Tgid`/`NStgid` stay the group's, and the names whose Linux owner is the *thread group*
+  (`task`, `limits`, `oom_score_adj`) are asked of the leader. Measured whole in the same probe:
+
+  * the tid's directory carries the **process** file set — its names are the leader's exactly, 54
+    against 54 — where `/proc/<pid>/task/<tid>` is the narrower *thread* set (47: `children` in,
+    eight process-only names out). That split is Linux's own (`base_stuff` against
+    `tid_base_stuff`), which is why `/proc/<tid>/children` is `ENOENT` where the `task/` spelling
+    answers it;
+  * `readdir /proc` still lists no tid — a listing carries processes, and the tid is looked *up*;
+  * and the *task's own* structures are what the tid's directory reads, which is the half a
+    leader-shaped answer gets wrong: a thread that `unshare(CLONE_FS)`s and `chdir`s reports its
+    own `cwd` through `/proc/<tid>/cwd` while its leader's still reports the old one, and one that
+    `unshare(CLONE_FILES)`s lists its new descriptor under `/proc/<tid>/fd` alone.
+
+  **One clause came with it, because a lookup has to be Linux's gate and not merely a wider one.**
+  Linux unhooks a task from the namespace it was numbered in **at its exit** unless it leads its
+  group (`__unhash_process`'s `thread_group_leader`), so a dead thread's tid names nothing at all
+  where a zombie *process* keeps its `/proc/<pid>` — measured in the same probe (a thread that
+  returned from its start routine is out of `/proc/<pid>/task` in the same instant, joined or
+  not). This kernel's table needs the clause said in the tree's own words, because it holds a dead
+  thread's **slot** until the slot is reused (the thread's retired record is what holds it): it is
+  `vfs::procfs::tid_has_a_directory(state, tid, pid)`, asked at the two funnels that *name* a task
+  (`process_dir` and `thread_ids`).
+
+  Pin: **`t-tid-dir`**, a new program, 26 claims, and `t-clone-exit`'s one more (41 → 42), which
+  now reads the tid's own spelling beside the group's. **What stays named** is the file the two
+  spellings disagree about by *ownership*: `children` is the *task's* child list on Linux and the
+  process's here (`child_ids` filters by pid and `children_of` ignores the tid), measured on a
+  current host — a child forked by a non-leader thread appears under that thread's
+  `/proc/<pid>/task/<tid>/children` alone — so this tree answers the group's for a thread that
+  forked. Owner: `src/vfs/procfs.rs`'s `children_of`/`child_ids`.
 
 - **A FIFO is served now, parked `open` and all.** **Landed 2026-10-16** (`docs/uapi/` §5.1 item 26).
   The entry this replaces said `mknodat(S_IFIFO)` was refused

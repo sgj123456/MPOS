@@ -882,11 +882,39 @@ fn pid_exists(_pid: usize) -> bool {
     false
 }
 
-/// The ids of every thread in the process `pid`, leader included.
+/// Whether a task this tree still holds has a tid that names a directory.
+///
+/// Linux unhooks a task from the namespace it was numbered in **at its exit**,
+/// unless it leads its thread group - `__unhash_process` asks
+/// `thread_group_leader`, which is `pid == tgid`. That one clause is why a dead
+/// *process* keeps its `/proc/<pid>` until it is reaped (a `ps` reads a
+/// zombie's record, and item 63's pin reads a zombie's byte through it) while a
+/// dead *thread*'s tid names nothing at all. Measured on a current host
+/// (`.workbuddy/probe_tid_dir.c`, Linux 7.2.11): a thread that returns from its
+/// start routine - joined or not, and in the same instant - is gone from
+/// `/proc/<pid>/task`, and `/proc/<tid>` is `ENOENT`, with its leader still
+/// listed beside it.
+///
+/// The question is asked of the *state letter* because that is what a snapshot
+/// carries: `snapshot_of` writes `Z` for `exited` and nothing else does.
+///
+/// This kernel keeps a dead thread's slot until the slot is reused (its retired
+/// record is what holds it), which is a fact about the task table rather than
+/// about `/proc` - so the clause is applied at the two funnels that *name* a
+/// task ([`process_dir`] and [`thread_ids`]) instead of being left to the
+/// table's own liveness.
+fn tid_has_a_directory(state: char, tid: usize, pid: usize) -> bool {
+    !(state == 'Z' && tid != pid)
+}
+
+/// The ids of every thread in the process `pid`, leader included - and, like
+/// Linux's own listing, the *live* ones: a thread that has left takes its tid
+/// out of the group with it ([`tid_has_a_directory`]).
 #[cfg(target_os = "none")]
 fn thread_ids(pid: usize) -> Vec<usize> {
     crate::sched::thread_snapshots(pid)
         .into_iter()
+        .filter(|task| tid_has_a_directory(task.state, task.tid, task.pid))
         .map(|task| task.tid)
         .collect()
 }
@@ -2024,8 +2052,22 @@ fn environ_of(pid: usize) -> Option<String> {
 
 /// `/proc/<pid>/status`: the same facts `stat` carries, in the long form a
 /// human or a `top` reads.
-fn status_of(pid: usize) -> Option<String> {
-    let task = task(pid)?;
+///
+/// `slot` is the task the file is about, and the two id lines are the pair
+/// Linux prints rather than one number twice: `Tgid` is the *group's* and
+/// `Pid` is the *task's*, so a thread's own directory reports the tid where its
+/// leader's reports the pid. Measured on a current host
+/// (`.workbuddy/probe_tid_dir.c`, Linux 7.2.11) for a live thread of a live
+/// group: `Tgid 16084 / Pid 16085 / NStgid 16084 / NSpid 16085 / NSpgid 16082 /
+/// NSsid 16075`, with the `NS*` chains running the same way - `NStgid` the
+/// leader's chain and `NSpid` the task's. `Name` is the task's own `comm`,
+/// which a thread may have set for itself (`PR_SET_NAME`: the probe's thread
+/// says `wdthread` where its leader says `probe_tid_dir`), and `Threads` is the
+/// group's either way. A leader is the case where the two ids coincide, which
+/// is why this was invisible through `/proc/<pid>` alone.
+fn status_of(slot: usize) -> Option<String> {
+    let task = task(slot)?;
+    let leader = task.pid;
     let kb = task.rss_pages * 4096 / 1024;
     let state_name = match task.state {
         'R' => "running",
@@ -2090,15 +2132,17 @@ fn status_of(pid: usize) -> Option<String> {
          nonvoluntary_ctxt_switches:\t0\n",
         name = task.comm,
         state = task.state,
-        tgid = reader_number(task.pid),
-        pid = reader_number(task.pid),
+        tgid = reader_number(leader),
+        pid = reader_number(slot),
         ppid = reader_number(task.ppid),
         // The `NS*` fields are the *chain* the task is known by rather than the
         // reader's one number: `4231` for a task of the machine's namespace, and
         // `4231\t1` for one a namespace in - Linux's leftmost entry is the
         // namespace the procfs was mounted in, and this procfs is the machine's.
-        nstgid = number_chain(task.pid),
-        nspid = number_chain(task.pid),
+        // `NStgid` chains the *group* and `NSpid` the task, exactly as the
+        // reader's pair above does.
+        nstgid = number_chain(leader),
+        nspid = number_chain(slot),
         nspgid = number_chain(task.pgid),
         // The session's chain rather than a hard `0`: Linux carries the session
         // id in each namespace too, and a task in no session has the leader id 0,
@@ -2173,9 +2217,18 @@ fn limits_of_pid(pid: usize) -> Option<String> {
     Some(out)
 }
 
-/// One thread's directory: the same files a process has, named for the
-/// thread, plus `children` - which Linux puts under `task` because children
-/// belong to the process, not to whichever thread is listed.
+/// `/proc/<pid>/task/<tid>`: one thread's directory, and a *narrower* set than
+/// the tid's own `/proc/<tid>` answers with.
+///
+/// The same files a process has, named for the thread, plus `children` - which
+/// Linux puts under `task` because children belong to the process, not to
+/// whichever thread is listed. The narrower set is Linux's own (`base_stuff`
+/// against `tid_base_stuff`), measured whole on a current host
+/// (`.workbuddy/probe_tid_dir.c`, Linux 7.2.11): the `task/` spelling carries
+/// `children` where `/proc/<tid>` does not, and the other way round lacks
+/// `autogroup`, `coredump_filter`, `map_files`, `mountstats`, `task`,
+/// `timens_offsets`, `timers` and `timerslack_ns`. Which is why the tid's own
+/// directory is not built here: [`process_dir`] is that set.
 fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
     let node = dir();
     node.add(
@@ -2445,29 +2498,63 @@ fn setgroups_ctl(pid: usize) -> Arc<dyn Inode> {
     })
 }
 
-/// `/proc/<pid>`: the directory a process is described by.
+/// `/proc/<pid>`: the directory a task is described by - a process at its
+/// leader's number, and a **thread** at its tid, which Linux serves the same
+/// file set under.
 ///
 /// Built when the name is looked up and thrown away when the next lookup
 /// finds the process gone - a process's `/proc` entry is not a thing the
 /// filesystem keeps, it is a view of the task table, and a view kept after the
 /// process left would be a directory of files all answering nothing.
-fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
-    if !pid_exists(pid) {
+///
+/// The tid spelling is `/proc/<tid>`, and it is what a debugger reads: measured
+/// on a current host under `strace`, `gdb -p <tid>` opens `/proc/<tid>/status`
+/// outright, while `ps -eLf` reaches threads the other way - 306 opens of the
+/// *relative* name `task` beside not one absolute `/proc/<pid>/task/<tid>`
+/// path. So both spellings have a program behind them and neither is a
+/// convenience.
+fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
+    // A tid names a **thread**, and a thread is a task this tree may describe -
+    // which is the one thing `pid_exists` (a *leader's* question, still asked
+    // where children are) is not. So the gate is the table's own: is there a
+    // user task in this slot at all? `leader` is the group's, and it is what
+    // the names whose Linux owner is the *thread group* are asked of - `task`
+    // (one listing for the group) and `limits`/`oom_score_adj` (Linux keeps
+    // both in the group's `signal_struct`). Everything else is the *task's* and
+    // is asked of `slot`, which is what Linux does even where the two answers
+    // agree by construction: `maps`, `fd` and `ns` name the task's own
+    // structures, and a thread that unshared one is the case that tells them
+    // apart. Measured whole on a current host first
+    // (`.workbuddy/probe_tid_dir.c`, Linux 7.2.11, a live thread of a live
+    // group): `/proc/<tid>` carries the *process* file set - its names are the
+    // leader's exactly - while `/proc/<pid>/task/<tid>` is the narrower
+    // *thread* set, which is `children` against eight process-only names
+    // (`autogroup`, `coredump_filter`, `map_files`, `mountstats`, `task`,
+    // `timens_offsets`, `timers`, `timerslack_ns`). That is why the tid's
+    // directory is built here and not by [`thread_dir`], which is the `task/`
+    // spelling's set.
+    let this = task(slot)?;
+    if !tid_has_a_directory(this.state, this.tid, this.pid) {
         return None;
     }
+    let leader = this.pid;
     let node = dir();
 
     node.add(
         "stat",
         NodeKind::File,
-        maybe_file(move || stat_line(pid, pid)),
+        maybe_file(move || stat_line(leader, slot)),
     );
-    node.add("statm", NodeKind::File, maybe_file(move || statm_line(pid)));
-    node.add("maps", NodeKind::File, maybe_file(move || maps_of(pid)));
+    node.add(
+        "statm",
+        NodeKind::File,
+        maybe_file(move || statm_line(slot)),
+    );
+    node.add("maps", NodeKind::File, maybe_file(move || maps_of(slot)));
     // `smaps` is `maps` with a field block under each line, and its records'
     // headers *are* the `maps` lines - which is what lets a reader compare the
     // two files, and what `t-smaps` pins.
-    node.add("smaps", NodeKind::File, maybe_file(move || smaps_of(pid)));
+    node.add("smaps", NodeKind::File, maybe_file(move || smaps_of(slot)));
     // The other two spellings of the same accounting, so that a reader asking
     // for one of them by name finds it: `numa_maps` (one line per mapping) and
     // `smaps_rollup` (one record for the whole space). Both read the same
@@ -2475,12 +2562,12 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     node.add(
         "numa_maps",
         NodeKind::File,
-        maybe_file(move || numa_maps_of(pid)),
+        maybe_file(move || numa_maps_of(slot)),
     );
     node.add(
         "smaps_rollup",
         NodeKind::File,
-        maybe_file(move || smaps_rollup_of(pid)),
+        maybe_file(move || smaps_rollup_of(slot)),
     );
     // The mount table, in both spellings, under *every* process rather than
     // once at the top of `/proc`.
@@ -2497,17 +2584,17 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     node.add(
         "limits",
         NodeKind::File,
-        maybe_file(move || limits_of_pid(pid)),
+        maybe_file(move || limits_of_pid(leader)),
     );
     node.add(
         "comm",
         NodeKind::File,
-        maybe_file(move || Some(alloc::format!("{}\n", task(pid)?.comm))),
+        maybe_file(move || Some(alloc::format!("{}\n", task(slot)?.comm))),
     );
     node.add(
         "cmdline",
         NodeKind::File,
-        maybe_file(move || cmdline_of(pid)),
+        maybe_file(move || cmdline_of(slot)),
     );
     // The environment beside the command line, because they are one block on
     // one stack and a program that reads the second usually reads the first.
@@ -2516,8 +2603,16 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     // (measured on a current host: `/proc/<pid>/environ` answers `0400`, and
     // `/proc/<pid>/cmdline` beside it `0444`): an environment can carry
     // secrets, so Linux gives this node the owner's read and nothing else.
-    node.add("environ", NodeKind::File, env_file(move || environ_of(pid)));
-    node.add("status", NodeKind::File, maybe_file(move || status_of(pid)));
+    node.add(
+        "environ",
+        NodeKind::File,
+        env_file(move || environ_of(slot)),
+    );
+    node.add(
+        "status",
+        NodeKind::File,
+        maybe_file(move || status_of(slot)),
+    );
     // `/proc/<pid>/oom_score_adj` - the OOM-killer's score adjustment, which
     // `udevd`'s workers push down on every boot so the device database is not
     // the first thing killed. Linux keeps a *pair* here: the value, and the
@@ -2529,24 +2624,24 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     // hear `EOPNOTSUPP`: their `fopen(..., "w")` is an `open(O_CREAT)`, and
     // procfs invents no file to answer it.
     #[cfg(target_os = "none")]
-    node.add("oom_score_adj", NodeKind::File, oom_score_adj_ctl(pid));
+    node.add("oom_score_adj", NodeKind::File, oom_score_adj_ctl(leader));
     // `/proc/<pid>/timens_offsets` - the clocks this process's children will
     // read, and the one door a `unshare(CLONE_NEWTIME)` has for saying by how
     // much. Named the way a real kernel names it, because the tools that write
     // it (`nsenter`, a container runtime setting up a restored snapshot) look
     // for exactly this path.
     #[cfg(target_os = "none")]
-    node.add("timens_offsets", NodeKind::File, timens_offsets_ctl(pid));
+    node.add("timens_offsets", NodeKind::File, timens_offsets_ctl(slot));
     // The three files a user namespace is set up through. Linux keeps them
     // beside one another and in this order, and the tools that write them
     // (`newuidmap`/`newgidmap`, and every container runtime that does the work
     // itself) look for exactly these paths.
     #[cfg(target_os = "none")]
-    node.add("uid_map", NodeKind::File, uid_map_ctl(pid));
+    node.add("uid_map", NodeKind::File, uid_map_ctl(slot));
     #[cfg(target_os = "none")]
-    node.add("gid_map", NodeKind::File, gid_map_ctl(pid));
+    node.add("gid_map", NodeKind::File, gid_map_ctl(slot));
     #[cfg(target_os = "none")]
-    node.add("setgroups", NodeKind::File, setgroups_ctl(pid));
+    node.add("setgroups", NodeKind::File, setgroups_ctl(slot));
     // The image and the working directory, as links: `readlink` is the only
     // way to ask for them, and their targets are facts about a process, not
     // bytes a file holds.
@@ -2554,20 +2649,26 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
         "exe",
         NodeKind::Symlink,
         link(move || {
-            let exe = task(pid)?.exe;
+            let exe = task(slot)?.exe;
             if exe.is_empty() { None } else { Some(exe) }
         }),
     );
-    node.add("cwd", NodeKind::Symlink, link(move || Some(task(pid)?.cwd)));
+    node.add(
+        "cwd",
+        NodeKind::Symlink,
+        link(move || Some(task(slot)?.cwd)),
+    );
     node.add("root", NodeKind::Symlink, link(|| Some(String::from("/"))));
 
-    // `/proc/<pid>/task`: one directory per thread, the leader among them.
-    let tasks = ProcDir::new(Some(Arc::new(Threads { pid })));
+    // `/proc/<pid>/task`: one directory per thread, the leader among them -
+    // and the *group's* list, which is why a tid's own directory lists what
+    // its leader's does rather than one entry.
+    let tasks = ProcDir::new(Some(Arc::new(Threads { pid: leader })));
     node.add("task", NodeKind::Dir, tasks);
 
     // `/proc/<pid>/fd`: one link per open descriptor, whose target is the
     // path it was opened by.
-    node.add("fd", NodeKind::Dir, descriptor_dir(pid));
+    node.add("fd", NodeKind::Dir, descriptor_dir(slot));
 
     // `/proc/<pid>/ns`: one link per namespace the process is in, naming the
     // namespace the way `readlink` reports it and handing `setns` the object
@@ -2576,7 +2677,7 @@ fn process_dir(pid: usize) -> Option<Arc<dyn Inode>> {
     // `0511` rather than the tree's `0555`, which is Linux's own word for this
     // one directory (measured on a current host): the names may be *reached*
     // - `setns` opens one - but the directory does not list what is in it.
-    let namespaces = ProcDir::own(Some(Arc::new(Namespaces { pid })), 0o511, false);
+    let namespaces = ProcDir::own(Some(Arc::new(Namespaces { pid: slot })), 0o511, false);
     node.add("ns", NodeKind::Dir, namespaces);
 
     Some(node)
@@ -2713,13 +2814,21 @@ impl Dynamic for Namespaces {
     }
 }
 
-/// The processes themselves, as `/proc` names them.
+/// The processes themselves, as `/proc` names them - a *listing* that holds
+/// leaders alone beside a *lookup* that answers a tid too.
 ///
-/// A name is looked up as a number and answered only when a process answers
-/// to that number: `/proc` holds a great many names that are not pids
+/// A name is looked up as a number and answered only when a task answers to
+/// that number: `/proc` holds a great many names that are not pids
 /// (`mounts`, `uptime`, `self`), and a file that claimed every number was a
 /// process would turn `mounts` into a directory and break the first tool that
 /// asked for it.
+///
+/// The two halves are deliberately different questions, and Linux's are too
+/// (measured: `readdir /proc` on a current host, 367 entries with the live
+/// thread's tid **absent** and its leader listed). A listing that carried every
+/// thread would make `ps -e` count a process once per thread; a lookup that
+/// refused a tid would make `/proc/<tid>/status` - the path `gdb -p <tid>`
+/// reads - `ENOENT`, which is the gap this directory closes.
 struct Processes;
 
 impl Dynamic for Processes {
@@ -2734,7 +2843,9 @@ impl Dynamic for Processes {
         // The number in the *reader's* namespace, turned back into the task it
         // names there: `/proc/1` inside a namespace is that namespace's first
         // child, and the same path outside names the machine's init. A number
-        // the reader's namespace does not contain is not a directory at all.
+        // the reader's namespace does not contain is not a directory at all -
+        // and a number that names a *thread* of a group it does contain is one,
+        // which is the whole of what the tid spelling adds.
         let number = name.parse::<usize>().ok()?;
         process_dir(reader_task(number)?)
     }
@@ -3629,6 +3740,35 @@ mod tests {
             "a thread, whatever byte its creation passed"
         );
         assert_eq!(exit_signal_field(0, true), -1);
+    }
+
+    /// A dead task keeps its directory only when it leads the group - Linux's
+    /// `__unhash_process`, and the clause that lets a tid's directory be served
+    /// at all without serving one for a thread that has left.
+    ///
+    /// Measured whole on a current host (`.workbuddy/probe_tid_dir.c`, Linux
+    /// 7.2.11): a thread that returned from its start routine - joined or not -
+    /// is out of `/proc/<pid>/task` and `/proc/<tid>` is `ENOENT`, while the
+    /// zombie *process* of item 63's pin still answers its own `stat`.
+    ///
+    /// Like its neighbour above, this is a rule about what the *tree* says and
+    /// not about what the table holds, which is why it needs no machine under
+    /// it: this kernel's dead thread does stay in the table until its slot is
+    /// reused.
+    #[test]
+    fn a_dead_threads_tid_names_nothing_and_a_zombie_leaders_does() {
+        assert!(tid_has_a_directory('R', 42, 42), "a running leader");
+        assert!(tid_has_a_directory('S', 42, 42), "a sleeping leader");
+        assert!(tid_has_a_directory('Z', 42, 42), "a zombie *process*");
+        assert!(tid_has_a_directory('S', 42, 41), "a live thread");
+        assert!(
+            tid_has_a_directory('T', 42, 41),
+            "a stopped thread is a task"
+        );
+        assert!(
+            !tid_has_a_directory('Z', 42, 41),
+            "a thread that has exited has no tid of its own any more"
+        );
     }
 
     /// The three names Linux answers as **links** are links here, with the two

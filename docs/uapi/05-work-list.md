@@ -3001,12 +3001,12 @@ the commit bodies), and each moved its pin in the same commit.
     zombie's state are preconditions rather than pins. It is the two `clone` bytes and the `-1`
     that carry the item, and each of them is a value the constant cannot produce.
 
-    One shape stays named rather than served, with its measurement in the same probe: a
-    thread has **no `/proc/<tid>` directory** here, where Linux serves one - the field and
-    everything beside it are reachable through `<pid>/task/<tid>/stat` alone, because this
+    One shape stayed named rather than served, with its measurement in the same probe: a
+    thread had **no `/proc/<tid>` directory** here, where Linux serves one - the field and
+    everything beside it were reachable through `<pid>/task/<tid>/stat` alone, because this
     tree's `/proc` directory is a *leader*'s (`pid_exists` asks `snapshot(pid).pid == pid`).
-    Owner: `src/vfs/procfs.rs`'s `pid_exists`/`process_dir` lookup, and `docs/uapi/` §5.2
-    carries it.
+    It was closed the next day by **item 64**, the item below, which serves the tid's own
+    directory; the field is now claimed through both spellings.
 
     The pin's own first draft failed in a way worth recording, because the failure *is* item
     59's rule: the clean-up killed the `clone(SIGTERM)` child with `SIGKILL`, and that child's
@@ -3015,3 +3015,114 @@ the commit bodies), and each moved its pin in the same commit.
     now happens with `SIGTERM` blocked and the record it queues is taken rather than
     delivered, and the comment says why.
 
+
+## item 64 — a thread's tid names a `/proc` directory, and a dead thread names nothing
+
+    The gap item 63's pin found and §5.2 carried: this tree's `/proc` directory was a
+    *leader*'s - `pid_exists` asked `snapshot(pid).pid == pid` - so `/proc/<tid>` was `ENOENT`
+    for every thread, and a thread's record was reachable through `<pid>/task/<tid>/stat`
+    alone. Item 63's own entry named the fix as "the *lookup* and everything it lets through
+    rather than one field", and §5.2 named the question to settle first: **which of the two
+    names a program uses**.
+
+    **That question is measured now**, on a current host under `strace`
+    (`.workbuddy/probe_tid_dir.c`, Linux 7.2.11): `ps -eLf` walks the group - **306** opens of
+    the *relative* name `task`, beside not one absolute `/proc/<pid>/task/<tid>` path - while
+    `gdb -p <tid>` opens **`/proc/<tid>/status`** outright. Both spellings have a program
+    behind them; the `task/` one is `procps`'s and the tid's own is a debugger's, which is also
+    the shape `/proc/thread-self` hands out (its target text is `<pid>/task/<tid>`, and what it
+    *means* is the tid's directory).
+
+    **Measured whole in the same probe**, a live thread of a live group:
+
+    * **the two spellings are different file sets, and it is Linux's own split.**
+      `/proc/<tid>` carries the **process** set - its names are the leader's exactly, **54
+      against 54** - while `/proc/<pid>/task/<tid>` is the narrower **thread** set (**47**):
+      `children` in, and `autogroup`, `coredump_filter`, `map_files`, `mountstats`, `task`,
+      `timens_offsets`, `timers`, `timerslack_ns` out. That is `base_stuff` against
+      `tid_base_stuff`, and it is why `/proc/<tid>/children` is `ENOENT` where the `task/`
+      spelling answers it;
+    * **`readdir /proc` lists no tid**, with its leader listed: a listing carries processes and
+      a tid is looked *up* (367 entries, the tid absent);
+    * **`stat`'s field 1 is the tid** and **field 38 is `-1`**, where the leader's own record
+      says the pid and its own byte - item 63's rule, reached through the name it could not use;
+    * **`status` is the pair, not one number twice**: `Tgid 16084 / Pid 16085 / NStgid 16084 /
+      NSpid 16085 / NSpgid 16082 / NSsid 16075`;
+    * **the *task's own* structures are what the tid's directory reads** - the half a
+      leader-shaped answer gets wrong. A thread that `unshare(CLONE_FS)`s and `chdir`s reports
+      its own `cwd` through `/proc/<tid>/cwd` (`/tmp`) while its leader still reports the one the
+      group kept, and a thread that `unshare(CLONE_FILES)`s lists its new descriptor under
+      `/proc/<tid>/fd` alone (`6` entries against the leader's `5`);
+    * and **a thread that has exited takes its tid with it**: it is out of `/proc/<pid>/task` and
+      `/proc/<tid>` is `ENOENT` in the same instant, joined or not - Linux's
+      `__unhash_process` unhooks a task at exit **unless it leads its group**, which is exactly
+      why the zombie *process* of item 63's pin keeps its record. Two probes settle it rather
+      than one reading: the tid's own directory is `ENOENT` after the thread returned, and a
+      `/proc/<pid>/task` listing holds the leader alone.
+
+    **The clause that came with it is the same measurement's.** A lookup has to be Linux's gate
+    and not merely a wider one, and this kernel's table holds a dead thread's **slot** until the
+    slot is reused (the thread's retired record is what holds it) - so `/proc/<tid>` would have
+    answered for a task Linux had already unhooked. It is
+    `vfs::procfs::tid_has_a_directory(state, tid, pid)`, one clause (`Z` **and** `tid != pid`),
+    asked at the two funnels that *name* a task: `process_dir` and `thread_ids`. The question is
+    asked of the *state letter* because that is what a snapshot carries - `snapshot_of` writes
+    `Z` for `exited` and nothing else does.
+
+    **The fix is the lookup plus the task-shaped fields, and nothing else moved.**
+    `process_dir(slot)` is built for the **task** the name resolved to: `stat`'s field 1 and
+    `status`'s `Pid`/`NSpid` are the tid's while `Tgid`/`NStgid` stay the group's, and the names
+    whose Linux owner is the *thread group* are asked of the leader - `task` (one listing for the
+    group), `limits` and `oom_score_adj` (Linux keeps both in the group's `signal_struct`).
+    Every other file is the task's and is asked of the slot, which is what Linux does even where
+    the two agree by construction: `maps`, `fd` and `ns` name the task's own structures, and the
+    split-structure pair above is the case that tells them apart. The `task/` spelling keeps its
+    own narrower set, which is why the tid's directory is *not* built by `thread_dir`. Owner:
+    `src/vfs/procfs.rs`'s `process_dir`/`thread_dir`, `thread_ids`/`tid_has_a_directory`,
+    `status_of`'s id pair and `Processes`' two halves.
+
+    Pin: **`t-tid-dir`**, a new program, **26 claims** - the directory and its word, the name
+    set, the listing, the two `stat` fields beside their two controls, the four `status` id
+    lines, the group-shaped names reached through the tid, the split-structure pair, and the two
+    dead-thread readings - every one green on a current host first (`MPOS_ON_HOST=1`, 26 of 26,
+    run **five** times with identical `ok:` lines, because a claim is read out of a live task's
+    file while the machine moves). `t-clone-exit` gains one more claim (**41 → 42**): item 63's
+    `-1` is now read through **both** spellings, which is the whole of what this item closes.
+    Beside the host unit test `a_dead_threads_tid_names_nothing_and_a_zombie_leaders_does`, which
+    walks the rule with no machine under it (this kernel's dead thread *is* still in the table,
+    which is why the rule is worth one).
+
+    Gate: x86_64 `pass=188 fail=0 (188 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33 (11 of
+    199 left out by `tests.toml`); aarch64 `pass=187 fail=0`, `mpos-kunit 32 passed, 0 failed`
+    (12 left out); stage 1 `578 passed; 0 failed` (577 before, the new unit test), and the new
+    program's **26 `ok:` lines are byte-identical across the two machines** (diffed, carriage
+    returns aside) **and equal to this host's own run**. fmt clean, clippy's warning set
+    unmoved (245), `cargo xtask depgraph` within the ratchet.
+
+    Counterfactual (the lookup put back to `pid_exists` and the `thread_ids` filter dropped -
+    the kernel this item started from, with the rule, its unit test, the new program and every
+    claim kept): stage 1 is **untouched** (`578 passed; 0 failed`, because the unit test calls
+    `tid_has_a_directory` itself and never reaches the lookup), and the sweep is
+    `pass=186 fail=2 (188 built)` with `FAIL t-tid-dir` and **17** red claims by name and
+    `FAIL t-clone-exit` with **one** - `and the tid's own directory reads the same record`. The
+    nine that stay green say what the item is: *where the leader's own record still names the
+    process*, *and the leader's is not `-1`*, *readdir /proc holds the leader*, *and does not
+    hold the thread*, the two leader-side halves of the split pair, `the thread under test
+    started`, and - the one worth a sentence - **`and its tid names no directory at all`**, which
+    passes on the old kernel too because the tid never named one. It is the *live* readings that
+    carry the item, and the claim about a tid naming nothing is a control rather than a pin.
+
+    One thing stays named rather than served, and it is where the two spellings disagree about
+    *ownership*: **`children` is the task's on Linux and the process's here.** Measured on a
+    current host: a child forked by a non-leader thread appears under **that thread's**
+    `/proc/<pid>/task/<tid>/children` alone, while this kernel's `children_of` ignores the tid
+    and `child_ids` filters by pid - so a thread that forked is answered the group's list. Owner:
+    `src/vfs/procfs.rs`'s `children_of`/`child_ids`.
+
+    The pin's own first draft failed in a way worth recording, because it is a property of the
+    file rather than a slip: **`read_dir` of a process's *own* `/proc/<pid>/fd` holds a
+    descriptor open while it lists**, so the number it adds to the listing is one that process
+    has - and the claim "the leader's fd does not list the thread's new descriptor" read the
+    leader's own directory from the leader and found it there. The two descriptor claims are
+    taken from a **forked child** now, where the transient descriptor lives in the child, and
+    the helper says why.

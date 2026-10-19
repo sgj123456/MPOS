@@ -19,9 +19,12 @@
 //! and a zombie keeps the byte it died with. Measured in the same first pass
 //! (`.workbuddy/probe_exit_signal_field.c`), which also checked that Linux's
 //! `/proc/<pid>/status` has no such line at all - the field is `stat`'s. A
-//! thread's record is read through `<pid>/task/<tid>/stat`, the one spelling
-//! this kernel serves it under (Linux also answers `/proc/<tid>`; `docs/uapi/`
-//! §5.2 names the gap).
+//! thread's record is reachable two ways - through the group, at
+//! `<pid>/task/<tid>/stat`, and at the tid's own `/proc/<tid>/stat` - and this
+//! program claims the `-1` through **both**, because they are one record reached
+//! two ways and a program that read only the group's would not have noticed that
+//! the other name answered nothing. That other name was the gap `docs/uapi/`
+//! §5.2 named here until item 64 served it (`t-tid-dir` is its own pin).
 //!
 //! # The rule, and why it is not one rule
 //!
@@ -503,10 +506,13 @@ fn main() {
         exit_signal_of(&format!("/proc/{}/stat", std::process::id())) == Some(libc::SIGCHLD as i64),
     );
 
-    // A thread's is -1, through the only name this kernel serves a thread's
-    // record under: Linux also answers `/proc/<tid>/stat` for the tid itself,
-    // which is a gap this kernel keeps and names (`docs/uapi/` §5.2) - a
-    // `/proc` directory here is a *leader*'s.
+    // A thread's is -1, through **both** names a thread's record has. The
+    // tid's own `/proc/<tid>/stat` is the spelling a debugger reads (measured
+    // under `strace` on a current host: `gdb -p <tid>` opens
+    // `/proc/<tid>/status` outright, where `ps -eLf` walks the group's `task/`;
+    // `.workbuddy/probe_tid_dir.c`), and until item 64 this kernel answered a
+    // tid with `ENOENT` - a `/proc` directory here was a *leader*'s
+    // (`docs/uapi/` §5.2 named the gap, `t-tid-dir` is its pin).
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
     let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
@@ -520,6 +526,10 @@ fn main() {
         r.check(
             "a thread's stat field 38 is -1, the number no byte can carry",
             exit_signal_of(&format!("/proc/{}/task/{tid}/stat", std::process::id())) == Some(-1),
+        );
+        r.check(
+            "and the tid's own directory reads the same record",
+            exit_signal_of(&format!("/proc/{tid}/stat")) == Some(-1),
         );
     }
     let _ = go_tx.send(());

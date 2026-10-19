@@ -582,9 +582,42 @@ which is corrected here and in `docs/uapi/`. Pin: `t-clone-exit`'s 12 new claims
 record read from a **live** child, the leader's control, the thread's `-1`, and the zombie's  
 state-and-byte pair) plus the host unit test  
 `a_tasks_exit_signal_field_is_its_byte_or_minus_one_for_a_thread`, which needs no machine under it.  
-Named rather than served, with the measurement beside it: a thread has no `/proc/<tid>` directory  
-here, where Linux serves one — this tree's `/proc` directory is a *leader*'s, so a thread's record is  
-reachable through `<pid>/task/<tid>/stat` alone (`docs/uapi/` §5.2).
+The named shape this paragraph used to carry — a thread has no `/proc/<tid>` directory — is served  
+now, by item 64 below.
+
+**A thread's tid names a `/proc` directory, and a dead thread names nothing** (`docs/uapi/` §5.1 item  
+64, landed 2026-10-19): the gap item 63's pin found and §5.2 carried, and the last name a thread's  
+record had. This tree's `/proc` directory was a *leader*'s (`pid_exists` asked `snapshot(pid).pid ==  
+pid`), so `/proc/<tid>` was `ENOENT` and a thread's record was reachable through  
+`<pid>/task/<tid>/stat` alone. The question §5.2 said to settle first — which of the two names a  
+*program* uses — is measured, on a current host under `strace` (`.workbuddy/probe_tid_dir.c`, Linux  
+7.2.11): `ps -eLf` walks the group, with **306** opens of the *relative* name `task` beside not one  
+absolute `/proc/<pid>/task/<tid>` path, while `gdb -p <tid>` opens **`/proc/<tid>/status`** outright —  
+so the `task/` spelling is `procps`'s and the tid's own is a debugger's. Measured whole in the same  
+probe, a live thread of a live group: the tid's directory carries the **process** file set — its names  
+are the leader's exactly, 54 against 54 — where the `task/` spelling is the narrower *thread* set  
+(47: `children` in, eight process-only names out), which is Linux's own  
+`base_stuff`/`tid_base_stuff` split; `readdir /proc` still lists no tid; `stat`'s field 1 is the tid  
+and field 38 `-1`, where the leader's record says the pid and its own byte; `status` is the pair  
+(`Tgid` the group, `Pid`/`NSpid` the thread); and the *task's own* structures are what the tid's  
+directory reads — a thread that `unshare(CLONE_FS)`s and `chdir`s reports its own `cwd` there while  
+its leader keeps the group's, and one that `unshare(CLONE_FILES)`s lists its new descriptor under  
+`/proc/<tid>/fd` alone, which is the half a leader-shaped answer gets wrong. A lookup also has to be  
+Linux's gate rather than merely a wider one, so the measurement came with a clause: a task is  
+unhooked from the namespace it was numbered in **at its exit** unless it leads its group  
+(`__unhash_process`), so a dead thread is out of `/proc/<pid>/task` and its tid names nothing —  
+`vfs::procfs::tid_has_a_directory`, one clause, asked at the two funnels that *name* a task  
+(`process_dir` and `thread_ids`), because this kernel's table holds a dead thread's *slot* until the  
+slot is reused. Pin: **`t-tid-dir`**, a new program, **26 claims**, green on a current host first  
+(26 of 26, five identical runs) and byte-identical on both machines, plus `t-clone-exit`'s one more  
+(41 → 42 — item 63's `-1` is now read through *both* spellings) and the host unit test  
+`a_dead_threads_tid_names_nothing_and_a_zombie_leaders_does`. Gate: x86_64 `pass=188 fail=0 (188  
+built)`, aarch64 `pass=187 fail=0`, `mpos-kunit 32 passed, 0 failed` on both. Counterfactual (the  
+lookup back to `pid_exists`, the filter dropped): stage 1 untouched at 578, the sweep  
+`pass=186 fail=2 (188 built)` with 18 red claims by name, and the one that stays green either way is  
+the tid-names-nothing claim — it is the *live* readings that carry the item. One thing stays named in  
+`docs/uapi/` §5.2: `children` is the *task's* child list on Linux and the process's here, measured —  
+a child forked by a non-leader thread appears under that thread's `task/<tid>/children` alone.
 
 **The `F_GETFL` word is the caller's own** (`docs/uapi/` §5.1 item 49, landed 2026-10-18): Linux  
 answers `filp->f_flags`, so a caller that compares the word against what it opened with agrees — its  
