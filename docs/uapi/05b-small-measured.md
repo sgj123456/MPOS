@@ -66,6 +66,24 @@ Section numbers are unchanged from the original `UAPI.md`.
   carries the table). **What stays named**: a non-leader's `exit_group(2)` still records nothing
   for the group and announces nothing to its parent.
 
+- **The group's last thread is the process's death, and the parent hears the leader.** **Landed
+  2026-10-19** (`docs/uapi/` §5.1 item 67) — item 66's named residual. Linux's `group_dead` is the
+  group's **last** thread leaving, so a non-leader's `exit_group(2)` is the process's death — the
+  parent reaps the **leader**, with the dying thread's code — and a leader that leaves first is a
+  zombie (`Z`, `WNOHANG` 0, not `ECHILD`) until its group ends. Measured on a current host first
+  (`.workbuddy/probe_exit_group_thread.c`, Linux 7.2.11, five scenarios): a worker's
+  `exit_group(7)` reaps the leader with 7 (A); the leader's own `exit_group(3)` with a worker
+  alive reaps it with 3 (B); a leader that `pthread_exit`s first is reaped only when the group
+  dies, with the *last thread's* code (7 under `exit_group`, 5 under plain `exit`) (C, C2); a
+  `clone(SIGUSR1)` group's death is invisible to a plain wait and collected by `__WCLONE`, and
+  its death delivers the **leader's** byte, SIGUSR1, not SIGCHLD (D); and a thread's child is
+  handed to a live task outside the group (init here, the nearest subreaper on that host) (E).
+  Served by `exit`'s `group_dead` gate (the record names `tgid`, takes the dying thread's code
+  and uid and the leader's byte and tracer), `trace::group_has_live_task` with `is_child` and
+  `child_alive_for` admitting a zombie leader whose group still runs, and `exit_group`'s reparent
+  walk for a sibling's children. Pin: **`t-exit-group`'s 18 new claims** (4 → 22), green on a
+  current host first; four counterfactuals, one per rule (`docs/notes/` §15.86).
+
 - **A thread's tid names a `/proc` directory now, and the clause that came with it.** **Landed
   2026-10-19** (`docs/uapi/` §5.1 item 64) — found by item 63's pin, which claimed a thread's
   `exit_signal` through the one spelling this kernel served and measured the other on the host in

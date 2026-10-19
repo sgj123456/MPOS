@@ -54,6 +54,9 @@ One-glance status of the whole roadmap.
 - [x] a thread is its group's child — its parent is the group's parent, its death notifies nobody,
   a dying task hands its children to an alive task of its group, and a wait walks the caller's
   group (§15.85)
+- [x] a group's death is its last thread's — a worker's `exit_group` is reaped as the leader, a
+  leader's own exit is a zombie until its group ends, and the death carries the leader's byte
+  (§15.86)
 - [ ] [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET**, **TIME** and **USER** landed, each with its pin  
   (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`): the numbers a process  
   sees are the  
@@ -373,8 +376,24 @@ needed its own probe); and `wait` walks every thread of the caller's group, so t
 collects a child its worker forked. Served by the clone-path link, `waitable`'s group-and-leader  
 rule (and `child_alive_for` asking the same question), a leader gate on the death path's  
 notify/wake/console, `alive_thread_of`'s reaper choice, and a reap-time CPU fold only for  
-leaders. Pin: `t-tid-dir` 37 → 45 claims, four counterfactuals one per half. Named: a  
-non-leader's `exit_group(2)` still announces nothing to its parent.
+leaders. Pin: `t-tid-dir` 37 → 45 claims, four counterfactuals one per half. What it named — a  
+non-leader's `exit_group(2)` announcing nothing to its parent — landed as item 67 below.
+
+**The group's last thread is the process's death** (`docs/uapi/` §5.1 item 67, landed  
+2026-10-19): item 66's named residual, and the answer to *when* a process exists to be waited  
+for. Linux's `group_dead` is the group's **last** thread leaving, so a non-leader's  
+`exit_group(2)` is the process's death — the parent reaps the **leader**, with the dying thread's  
+code — and a leader that leaves first on the thread door is a zombie (`Z`, `WNOHANG` 0, not  
+`ECHILD`) until its group ends. Measured on a current host first  
+(`.workbuddy/probe_exit_group_thread.c`, Linux 7.2.11, five scenarios): a worker's  
+`exit_group(7)` reaps the leader with 7; a leader that `pthread_exit`s first is reaped only at  
+the group's death and with the **last thread's** code (7 under `exit_group`, 5 under plain  
+`exit`); a `clone(SIGUSR1)` group's death is invisible to a plain wait, collected by `__WCLONE`,  
+and delivers the **leader's** byte (SIGUSR1, not SIGCHLD); and a thread's child is handed to a  
+live task outside the dead group. Served by `exit`'s `group_dead` gate (the record names `tgid`,  
+with the dying thread's code and uid and the leader's byte), `trace::group_has_live_task` with  
+`is_child`/`child_alive_for` admitting a zombie leader, and `exit_group`'s reparent walk for a  
+sibling's children. Pin: `t-exit-group` 4 → 22 claims, four counterfactuals one per rule.
 
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  

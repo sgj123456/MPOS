@@ -332,6 +332,29 @@ fn group_of(t: &Table, id: TaskId) -> Option<TaskId> {
     t.tasks.get(id.0)?.as_ref().map(|task| task.tgid)
 }
 
+/// Whether `tgid`'s group still has a task that has not exited.
+///
+/// This is the difference between a **process's** death and a thread's, and it
+/// is what makes a leader's own exit not the process's: Linux's `group_dead` is
+/// the group's last thread leaving, and everything a parent can see waits for
+/// that moment. Measured on a current host
+/// (`.workbuddy/probe_exit_group_thread.c`):
+///
+/// * a leader that leaves on `pthread_exit` while a worker runs is a zombie in
+///   `/proc` (`Z`) but **not reapable** - `waitpid(leader, WNOHANG)` answers
+///   `0`, not `ECHILD` - and the parent collects it only when the group dies,
+///   with the *last thread's* code (scenarios C and C2);
+/// * a worker that exits while the group lives leaves nothing behind at all.
+///
+/// So "exited, but its group is still alive" is a state a wait must treat as a
+/// child that has not reported yet, not as a task that is gone.
+pub(crate) fn group_has_live_task(t: &Table, tgid: TaskId) -> bool {
+    t.tasks
+        .iter()
+        .flatten()
+        .any(|task| task.tgid == tgid && !task.exited)
+}
+
 /// Whether `task` was forked by a task of `group` - the parent test
 /// [`waitable`] asks, and the one `child_alive_for` asks of a live child.
 ///
@@ -374,9 +397,16 @@ pub fn child_visible_to(id: TaskId, kind: ChildKind) -> bool {
 /// blocking on someone else's child.
 pub fn is_child(id: TaskId, parent: TaskId, kind: ChildKind) -> bool {
     with_table(|t| {
-        t.tasks[id.0]
-            .as_ref()
-            .is_some_and(|task| !task.exited && waitable(t, id, parent, kind))
+        t.tasks[id.0].as_ref().is_some_and(|task| {
+            // A group leader that has exited while its threads still run is
+            // the process's zombie: not reportable yet, but still a child a
+            // wait may park on - Linux's `waitpid(leader, WNOHANG)` answers
+            // `0` there, and the blocking form waits for the group's last
+            // thread (`.workbuddy/probe_exit_group_thread.c`, C/C2). A thread
+            // that exited is nothing at all, and stays invisible.
+            (!task.exited || (task.tgid == id && group_has_live_task(t, task.tgid)))
+                && waitable(t, id, parent, kind)
+        })
     })
 }
 

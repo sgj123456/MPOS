@@ -3309,4 +3309,85 @@ has to be that grandparent, which is why the fixture is two forks deep.
 kernel's `exit_group` marks the siblings exited and runs the caller's exit path, and the leader
 gate now says so on purpose; Linux reports the group's leader. It is a shape this item neither
 introduced nor closed, and the one place a multithreaded program's parent can be told `ECHILD`
-where Linux hands it the leader's status.
+where Linux hands it the leader's status. (Item 67 below closes it.)
+
+## item 67 — the group's last thread is the process's death, and the parent hears the leader
+
+    Item 66's named residual, and the answer to *when* a process exists to be waited for. Linux's
+    `group_dead` is the group's **last** thread leaving: everything a parent can see hangs on that
+    moment - the zombie, the record, the signal - and the process it names is its **leader**. This
+    kernel had two shapes wrong, and the same probe measured both. `exit_group` from a worker
+    marked the siblings exited and ran the caller's own exit path, where item 66's leader gate then
+    recorded and announced nothing - so a multithreaded program's parent was told `ECHILD` where
+    Linux hands it the leader's status. And a leader that left first (on the thread door) was
+    announced and made reapable at once, while a live worker still ran.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_exit_group_thread.c`, Linux
+    7.2.11; five scenarios in one run, repeated):
+
+    * **A. a worker's `exit_group(7)` while the leader pauses**: the parent's `waitpid(leader)`
+      returned the **leader's** pid with status `0x700`; one `SIGCHLD` record carried
+      `si_pid` = the leader, `si_status` 7; the worker's own tid answered `ECHILD`.
+    * **B. the control**: the leader's `exit_group(3)` with a worker alive returned the leader
+      and 3.
+    * **C. the leader leaves first on `pthread_exit`**: `/proc/<leader>/stat` said `Z` while the
+      worker ran, `waitpid(leader, WNOHANG)` answered **0** (not `ECHILD`), and only the group's
+      death answered - with the **last thread's** code, `7` from the worker's `exit_group(7)`.
+    * **C2. the last thread leaves on the plain thread door** (`SYS_exit(5)` while the leader is
+      already a zombie): the wait answered the leader with **5**. The status is the dying
+      thread's `exit_code`, not the leader's own.
+    * **D. the exit byte is the leader's**: a group born through `clone(SIGUSR1)`, ended by a
+      worker's `exit_group(7)`, was invisible to a plain `wait4` (`ECHILD`) and collected by
+      `__WCLONE` as the leader with 7, and the parent held a pending **SIGUSR1** - not a
+      `SIGCHLD`. Linux stores `-1` on a thread's own byte precisely so its death announces
+      nothing; the process's byte is the one it was forked with.
+    * **E. a thread's child when the whole group ends**: the child (forked by a worker) named the
+      group leader while it lived, and a live task outside the group the moment the group died -
+      the nearest **child subreaper** on that host; this kernel, which has none, names init. The
+      pin makes the same claim for a child forked by a **sibling** of the thread that ends the
+      group: that sibling never runs the exit path, so only `exit_group`'s own walk can hand the
+      child on (counterfactual 4 panics without it).
+
+    The implementation turns on one fact and reads every field from the task that owns it.
+    `exit` computes `group_dead` after marking the dying task exited, and only then records and
+    announces the process's death - as the **leader's** id, with the dying thread's `code`, core-
+    dump classification and real uid (`si_status`/`si_uid` are `tsk`'s), the **leader's** `pgid`,
+    `exit_signal` and tracer, and the group's CPU (`si_utime`/`si_stime` are
+    `tsk->utime + tsk->signal->utime`). A thread that is not last records nothing and notifies
+    nobody. `trace::group_has_live_task` is the client side of the same fact: `trace::is_child`
+    and `child_alive_for` count an exited **leader** whose group still has a live task as a child
+    a wait may park on, so `WNOHANG` answers 0 and a blocking wait sleeps until the record
+    appears. And `exit_group` hands every ended sibling's **children** to init before the group's
+    last task leaves: a thread ended there never runs the exit path, so its children would
+    otherwise keep a link to a slot the group is about to release - and a child whose parent slot
+    is gone is collected by no `wait`, because the parentage test reads through that slot.
+
+    Pin: **`t-exit-group`'s 18 new claims** (4 -> 22) - the worker-ended group reaped as the
+    leader with its code, the worker's tid `ECHILD`, the zombie leader whose `WNOHANG` is 0 and
+    whose group's death answers with the last thread's code, the `clone(SIGUSR1)` group's kind
+    (invisible to a plain wait, collected by `__WCLONE`) and its pending `SIGUSR1`/absent
+    `SIGCHLD`, and the thread's child and the sibling's child each naming a live task outside the
+    dead group - every one green on a current host first (`MPOS_ON_HOST=1`, 22 of 22, repeated).
+
+    **`t-leader-outlived`'s premise was corrected with it, and the first gate run is why.** That
+    program expected the shell to collect a compositor's pid *while its threads still ran* - the
+    shape this kernel served until now. Linux does not: measured in the same probe (C/C2), the
+    leader is a zombie and `waitpid(leader, WNOHANG)` answers 0 until the group's last thread
+    leaves, so the old `waitpid(pid, 0)` blocks for ever. The gate hung exactly there. The test now
+    pins Linux's halves - the threads running while the leader is a dead, unreapable zombie, the
+    counter still moving on the space the leader owns, and the group's end collected as the leader
+    with the last thread's code - and its claim count went 2 → 6.
+
+    **Four counterfactuals, one per rule, each with every pin kept**:
+
+    | reverted | red claims by name |
+    |---|---|
+    | the record's id (the dying task's, not the leader's) | `pass=186 fail=2`; **eleven** red - `t-exit-group`'s nine (the leader is not reaped, its code, the worker's tid, the zombie's answer, both last-thread codes, `__WCLONE`'s leader and code, the child fixture) and `t-leader-outlived`'s two (the group's end, its code) |
+    | the zombie's admission (`is_child`/`child_alive_for` back to `!exited`) | `pass=186 fail=2`; **six** red - `t-exit-group`'s `but not reapable yet`, `the group's death then answers for it` and `with the last thread's code`, and `t-leader-outlived`'s same three |
+    | the exit byte (the dying thread's, not the leader's) | `pass=187 fail=1`; **two** red - `SIGUSR1 is pending` and `not SIGCHLD` (a thread is born with `SIGCHLD` here) |
+    | `exit_group`'s reparent walk removed | the sibling's-child claim reds and the machine **panics** at `src/sched/runtime/task.rs:1174` with `there is no task 9` (QEMU 35, no summary) |
+
+    Gate: stage 1 `579 passed; 0 failed`, `xtask` 122; x86_64 `pass=188 fail=0 (188 built)`,
+    `mpos-kunit 32 passed, 0 failed`, exit 33 (11 of 199 left out by `tests.toml`); aarch64
+    `pass=187 fail=0`, `mpos-kunit 32 passed, 0 failed`, `=== END` (12 left out); both machines'
+    per-claim lines byte-identical - `t-exit-group` 22, `t-leader-outlived` 6.

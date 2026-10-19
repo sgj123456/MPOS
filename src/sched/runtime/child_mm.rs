@@ -935,7 +935,14 @@ pub(crate) fn child_alive_for(t: &Table, parent: TaskId, sel: WaitFor, kind: Chi
     t.tasks.iter().enumerate().any(|(slot, task)| {
         let id = TaskId(slot);
         task.as_ref().is_some_and(|task| {
-            !task.exited
+            // An exited leader whose group still runs is a child a wait can
+            // still park on: the process's death is its **last** thread's, and
+            // until then Linux answers "nothing yet" rather than `ECHILD`
+            // (`.workbuddy/probe_exit_group_thread.c`, C/C2). Once the group is
+            // dead the record exists instead, so there is no gap between the
+            // two: the last thread's exit writes the record in the same
+            // critical section that clears this clause.
+            (!task.exited || super::trace::group_has_live_task(t, task.tgid))
                 && task.tgid == id
                 && super::trace::forked_in_group(t, task, group)
                 && id != parent

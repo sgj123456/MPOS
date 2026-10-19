@@ -206,6 +206,24 @@ pub fn exit(code: isize) -> ! {
         }
         t.task_mut(id).exited = true;
 
+        // Whether this is the **process's** death or only a thread's. Linux's
+        // `group_dead` is the group's last thread leaving, and the parent hears
+        // about the process only then - a thread that is not last leaves no
+        // corpse, no record and no signal, and a leader that is not last is the
+        // process's zombie, unreapable until the group ends. Measured whole on
+        // a current host (`.workbuddy/probe_exit_group_thread.c`): a worker's
+        // `exit_group(7)` makes the parent reap the *leader* with `7` (A), the
+        // control's leader does the same (B), a leader that leaves on
+        // `pthread_exit` first is reaped only when the group dies and with the
+        // *last thread's* code - `7` under an `exit_group`, `5` under a plain
+        // `exit` (C and C2).
+        let tgid = t.task(id).tgid;
+        let group_dead = !t
+            .tasks
+            .iter()
+            .flatten()
+            .any(|other| other.tgid == tgid && !other.exited);
+
         // The death's core-dump classification, computed here because it is a
         // fact about the *dying* process's own `dumpable` flag, which
         // `release_exited` below takes away: Linux's `WCOREDUMP`/`CLD_DUMPED`
@@ -225,23 +243,37 @@ pub fn exit(code: isize) -> ! {
         // `wait` collects the death.
         let (utime, stime) = t.task(id).mm.cpu_both();
 
-        record_retired(Retired {
-            id,
-            code,
-            pgid: t.task(id).pgid,
-            // Which kind of child this was, for the `__WCLONE`/`__WALL` half of
-            // a wait's option word (`ChildKind`) - the record is what a
-            // wildcard wait asks, and the task is gone by then.
-            exit_signal: t.task(id).exit_signal,
-            // The real uid, taken here because the slot is what holds it: the
-            // record outlives the task, and `waitid` reads its answer from the
-            // record (`Retired::uid`).
-            uid: t.task(id).identity.ruid,
-            dumped,
-            utime,
-            stime,
-            tracer: t.task(id).trace.tracer,
-        });
+        // The process's death is recorded once, when its last thread leaves,
+        // and it is **the leader's** record: the pid a parent can name is the
+        // process's, not whichever thread happened to be last. The code and the
+        // core-dump classification are the dying thread's - Linux's
+        // `do_notify_parent` reads `tsk->exit_code` from the task that is
+        // leaving, while `si_pid` is `task_tgid_nr_ns(tsk)` - and so is the
+        // real uid (`task_uid(tsk)`). The **exit signal is the leader's**: a
+        // thread is born with `-1` on Linux precisely so its death cannot
+        // announce anything, and the measurement is a `clone(SIGUSR1)` group
+        // whose worker ends it - the parent holds a `SIGUSR1`, not a `SIGCHLD`
+        // (scenario D). A thread that is not last records nothing at all.
+        if group_dead {
+            let leader = t.task(tgid);
+            record_retired(Retired {
+                id: tgid,
+                code,
+                pgid: leader.pgid,
+                // Which kind of child this was, for the `__WCLONE`/`__WALL`
+                // half of a wait's option word (`ChildKind`) - the record is
+                // what a wildcard wait asks, and the task is gone by then.
+                exit_signal: leader.exit_signal,
+                // The real uid, taken here because the slot is what holds it:
+                // the record outlives the task, and `waitid` reads its answer
+                // from the record (`Retired::uid`).
+                uid: t.task(id).identity.ruid,
+                dumped,
+                utime,
+                stime,
+                tracer: leader.trace.tracer,
+            });
+        }
 
         // A pid namespace's init takes its namespace with it - Linux's
         // `zap_pid_ns_processes`. The membership it tests is the part worth
@@ -269,12 +301,6 @@ pub fn exit(code: isize) -> ! {
         // the namespace is empty, because a task killed in the middle of a
         // `fork` can leave a child behind. This is one pass over the table.
         let ns = Arc::clone(&t.task(id).pid_ns);
-        let tgid = t.task(id).tgid;
-        let group_dead = !t
-            .tasks
-            .iter()
-            .flatten()
-            .any(|o| o.tgid == tgid && !o.exited);
         if group_dead && ns.is_init(tgid.0) {
             // And the namespace is **sealed** as it is emptied: its init is gone
             // and Linux lets nothing be created in it again (a `fork` by a task
@@ -318,15 +344,20 @@ pub fn exit(code: isize) -> ! {
         // has not slept yet and will find the code on its next look, or it is
         // in the sleep queue this wake empties. There is no third state.
         //
-        // Only a **group leader's** death is the process's death. A thread's
-        // `parent` link is its group's parent (`CLONE_THREAD` implies
-        // `CLONE_PARENT`), so the link alone would announce every worker's
-        // exit as a child's; Linux gates the announcement on
-        // `thread_group_leader` (`do_notify_parent`), and the measurement is
-        // the pair in `.workbuddy/probe_children_owner.c`: a `fork` child's
-        // death queues `SIGCHLD`, a thread's queues nothing.
-        let leader = t.task(id).tgid == id;
-        let parent = if leader { t.task(id).parent } else { None };
+        // Only the group's **last** thread is the process's death, and the
+        // parent is the leader's. A thread's `parent` link is its group's
+        // parent (`CLONE_THREAD` implies `CLONE_PARENT`), so the link alone
+        // would announce every worker's exit as a child's; Linux gates the
+        // announcement on `group_dead` (measured: a `fork` child's death
+        // queues `SIGCHLD`, a thread's queues nothing -
+        // `.workbuddy/probe_children_owner.c`), and the process's own death is
+        // announced with the leader's pid even when a worker was the last to
+        // leave (`.workbuddy/probe_exit_group_thread.c` A and C).
+        let parent = if group_dead {
+            t.task(tgid).parent
+        } else {
+            None
+        };
         if let Some(parent) = parent {
             t.sched.wake(parent);
             // The signal the child was born to report, not just the wake. A
@@ -350,20 +381,19 @@ pub fn exit(code: isize) -> ! {
             // §5.2): this kernel keeps the zombie, so a parent that ignores its
             // death signal and never waits holds a slot where Linux holds none.
             //
-            // The child as the record names it: the number it has *in its own
-            // namespace* - Linux's `task_tgid_vnr(tsk)`. A parent in the same
-            // namespace reads back the number `getpid` gave the child; a parent
-            // one level out reads the child's own number, which is Linux's wart
-            // for a child in a deeper namespace than its reader. The uid is the
-            // child's real one, the same field the retired record carries for
-            // `waitid`'s `si_uid`.
+            // The child as the record names it: the number the **group leader**
+            // has *in the dying task's own namespace* - Linux's
+            // `task_tgid_vnr(tsk)` read from the last thread, which is the
+            // leader's number because a thread carries its group's `tgid`. A
+            // parent in the same namespace reads back the number `getpid` gave
+            // the process; a parent one level out reads the group's own number,
+            // which is Linux's wart for a child in a deeper namespace than its
+            // reader. The uid is the dying task's real one, the same field the
+            // retired record carries for `waitid`'s `si_uid` (`task_uid(tsk)`).
             let (child_pid, child_uid) = {
                 let child = t.task(id);
                 (
-                    child
-                        .pid_ns
-                        .number_of(child.tgid.0)
-                        .unwrap_or(child.tgid.0 as u32) as i32,
+                    child.pid_ns.number_of(tgid.0).unwrap_or(tgid.0 as u32) as i32,
                     child.identity.ruid as i32,
                 )
             };
@@ -383,7 +413,13 @@ pub fn exit(code: isize) -> ! {
             let (utime, stime, _, _) = t.task(id).mm.cpu_all();
             let utime = crate::abi::clock_ticks_to_user_hz(utime, crate::hal::TICK_HZ as u64);
             let stime = crate::abi::clock_ticks_to_user_hz(stime, crate::hal::TICK_HZ as u64);
-            let sig = t.task(id).exit_signal;
+            // The leader's byte, not the dying thread's: a `CLONE_THREAD` task
+            // is born with no exit signal on Linux precisely so its death
+            // announces nothing, and the process's byte is the one it was
+            // forked with. Measured with a `clone(SIGUSR1)` group whose worker
+            // ends it - the parent holds a SIGUSR1, not a SIGCHLD
+            // (`.workbuddy/probe_exit_group_thread.c`, D).
+            let sig = t.task(tgid).exit_signal;
             notify_parent_of_death(
                 t.task_mut(parent),
                 sig,
@@ -420,7 +456,6 @@ pub fn exit(code: isize) -> ! {
         // its own (`t-signalfd` was handed four records for one death, three
         // naming earlier tenants of the slot).
         if id != INIT_PID {
-            let tgid = t.task(id).tgid;
             let reaper = alive_thread_of(t, tgid, id).unwrap_or(INIT_PID);
             let mut adopted = false;
             for task in t.tasks.iter_mut().flatten() {
@@ -1750,10 +1785,23 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
 /// thread with it. The siblings are marked exited here; the release pass
 /// accounts for each of them, so the group's memory goes when the last one has
 /// been accounted for, exactly as if they had all returned on their own.
+///
+/// The caller need not be the group's leader, and the parent's answer does not
+/// depend on which thread it was: the group's death is announced from the
+/// caller's `exit` as the **leader's**, with the caller's code, exactly once
+/// (`.workbuddy/probe_exit_group_thread.c` A: a worker's `exit_group(7)` is
+/// reaped as the leader with `7`). What the caller's own exit cannot do is
+/// reparent a *sibling's* children - a thread ended here never runs the exit
+/// path - so that walk is done here, before the group's last task leaves: no
+/// task of the group will be alive to adopt them, which is why they go to init
+/// (scenario E of `.workbuddy/probe_exit_group_thread.c` measured the rule on a
+/// current host for the caller's own child; `t-exit-group` pins the sibling's
+/// case, which is the one that needs this walk).
 pub fn exit_group(code: isize) -> ! {
     let me = current();
     let tgid = current_tgid();
     with_table(|t| {
+        let mut ended: Vec<TaskId> = Vec::new();
         for slot in 0..t.tasks.len() {
             let id = TaskId(slot);
             if id == me {
@@ -1772,6 +1820,25 @@ pub fn exit_group(code: isize) -> ! {
             // not by a turn it never gets.
             task.exited = true;
             t.sched.retire(id);
+            ended.push(id);
+        }
+        // A sibling ended above never runs the exit path, so this is the only
+        // place its children can be handed on. No task of the group will be
+        // alive when the caller's own `exit` runs, and a child whose parent
+        // slot is gone is collected by no `wait` - the parentage test reads
+        // through that slot - so they go to init, the nearest thing this
+        // kernel has to Linux's child subreaper (scenario E of
+        // `.workbuddy/probe_exit_group_thread.c`, and `t-exit-group`'s
+        // sibling fixture for the case this walk alone covers).
+        let mut adopted = false;
+        for task in t.tasks.iter_mut().flatten() {
+            if task.parent.is_some_and(|parent| ended.contains(&parent)) {
+                task.parent = Some(INIT_PID);
+                adopted = true;
+            }
+        }
+        if adopted {
+            t.sched.wake(INIT_PID);
         }
     });
     exit(code)
