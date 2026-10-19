@@ -3204,23 +3204,109 @@ the commit bodies), and each moved its pin in the same commit.
     `children` claims stay green; keying the thread's file on the group instead turns exactly
     the ownership claim red, `and the thread's is the child the thread forked, not the leader's`.
 
-    One thing stays named rather than served, and it is the link's *other* end: a **thread's**
-    own parent is the task that created it here, where Linux's `copy_process` gives a
-    `CLONE_THREAD` task its creator's parent ("threads share the parent", so `CLONE_THREAD`
-    implies `CLONE_PARENT`) - measured in the same probe, the forking thread read `42203`, the
-    group's *parent*, through all three doors while its own tid was `42207`. It is not a
-    rendering, which is why this item stops at the record: moving the link moves three things
-    that need their own measurement first, and all three are measured.
+    One thing stayed named rather than served, and it was the link's *other* end: a **thread's**
+    own parent. Linux's `copy_process` gives a `CLONE_THREAD` task its creator's parent ("threads
+    share the parent", so `CLONE_THREAD` implies `CLONE_PARENT`) - measured in the same probe, the
+    forking thread read `42203`, the group's *parent*, through all three doors while its own tid
+    was `42207`. This kernel's thread carried **no link at all** (`parent: None`), so all three
+    doors read `0` - not its creator, as this item's own first draft said: that sentence was read
+    from the `fork` path and had never been measured against the tree. It is not a rendering,
+    which is why this item stopped at the record: moving the link moves three things that need
+    their own measurement first, and all three are measured.
 
     A thread's death must stop notifying anybody - a `fork` child's death queues `SIGCHLD` with
-    the signal blocked while a thread's death queues nothing, where this kernel's death path
-    notifies the parent whatever the task's shape (read from `child_exit.rs`, whose wake is
-    unconditional by design). A task's exit must hand its children to an *alive thread of its
-    group* before init - the thread's child moved to the leader's list the moment the thread
-    exited, its own three doors unmoved - where this kernel reparents to `INIT_PID`. And
-    **`wait` asks a different question again**: Linux's `do_wait` walks every thread of the
-    caller's group (`while (tsk != current->group_leader)`), so with the forking thread still
-    alive the *leader's* `waitpid` answered `0` from `WNOHANG` and then collected the child
-    outright (pid and status `7`), while this kernel's one eligibility rule asks
+    the signal blocked while a thread's death queues nothing, where a thread with a link would
+    reach the death path's `notify_parent_of_death` for its group's parent (the path itself is
+    unconditional; the missing link is what spared it). A task's exit must hand its children to
+    an *alive thread of its group* before init - the thread's child moved to the leader's list
+    the moment the thread exited, its own three doors unmoved - where this kernel reparents to
+    `INIT_PID`. And **`wait` asks a different question again**: Linux's `do_wait` walks every
+    thread of the caller's group (`while (tsk != current->group_leader)`), so with the forking
+    thread still alive the *leader's* `waitpid` answered `0` from `WNOHANG` and then collected
+    the child outright (pid and status `7`), while this kernel's one eligibility rule asks
     `task.parent == Some(me)` - the calling task - so the same call is `ECHILD`. All three are
-    named in `docs/uapi/` §5.2 with those readings.
+    named in `docs/uapi/` §5.2 with those readings, and all three land as **item 66**.
+
+## item 66 — a thread is its group's child: the link, and the three questions that read it
+
+Item 65's residual, and the other end of the same link. Linux's `kernel_clone` turns
+`CLONE_THREAD` into `CLONE_PARENT`, so a thread's `real_parent` is the parent of the group it
+joined - "threads share the parent" - and every door that reads a parent sees that one number.
+This kernel's `spawn_thread` gave a thread **no link at all** (`parent: None`), so `getppid`,
+`status`'s `PPid` and `stat`'s field 4 all read `0` for a live worker.
+
+**Measured whole on a current host first** (`.workbuddy/probe_children_owner.c`, Linux 7.2.11):
+the leader `87096`, whose own parent was `87094`, started the worker `87099`; the worker read
+`87094` - its *group's* parent, not the tid that created it - through all three doors, while its
+own tid was the one it ran as. Three behaviours move with that link, and the same session
+measured all three:
+
+* **a thread's death notifies nobody.** With `SIGCHLD` blocked and `sigpending(2)` polled, a
+  `fork` child's death queued one record and a thread's queued none - Linux's `do_notify_parent`
+  is gated on `thread_group_leader`.
+* **a dying task hands its children to an alive task of its group before init.** The thread's
+  child moved onto the leader's `children` list the moment the thread exited, its own three
+  doors unmoved. The mirror needed its own probe, which item 65 had not taken:
+  `.workbuddy/probe_leader_exit.c` has the *leader* leave on `pthread_exit` while its worker
+  still runs, and the child moves onto the **worker's** list - its `PPid` still reading the
+  group, because that is the worker's `tgid`. So the candidate is "any alive task of the group,
+  the leader preferred", not "init unless the dying task is a thread".
+* **`wait` walks every thread of the caller's group.** With the forking thread still alive the
+  leader's `waitpid(child, WNOHANG)` answered `0` (not `ECHILD`), and a blocking wait collected
+  the child outright - pid and status `7` - which is `while (tsk != current->group_leader)` read
+  from the other end.
+
+The implementation is four changes and one predicate.
+
+* `spawn_thread` stores the creator's **parent** (Linux's `CLONE_PARENT`), not the creator.
+* `trace::waitable` asks the caller's **group** (`forked_in_group`: a child forked on a sibling
+  thread is the leader's to collect) and admits only a **group leader** as a child (a thread is
+  on no `children` list, and its death is nobody's), with a tracer the one exception.
+  `child_alive_for` asks the same two questions, so the live half of a wait and the record half
+  cannot disagree; the scan sites thread the table and the task's own id through, because
+  leadership is a fact about the slot (`task.tgid == id`).
+* `exit` announces and hands the console back only when `tgid == id` - the leader gate that
+  keeps the new link from turning every worker's exit into a `SIGCHLD` - and the reparent walk
+  (the file's two walks consolidated into one, no `!exited` filter, so a zombie's link moves
+  too) picks `alive_thread_of(t, tgid, id)`: the leader first, a live sibling next, init only
+  when the group has no live task.
+* `Task::reap` folds a child's CPU into its parent only for a **leader**: `cpu_all` is the
+  group's, so a collected thread would otherwise charge the whole group's work to the parent
+  once per thread. `trace::park` gates its parent wake the same way - a thread's stop is its
+  group's, and Linux reports one from the leader.
+
+Pin: **`t-tid-dir`'s 8 new claims** (37 → 45) - the thread's own three parent doors, the
+leader's `WNOHANG` over a sibling's child, the adopted child on the leader's list, the leader's
+wait collecting that death with the code it exited by, the list losing it, and a two-fork-deep
+notification fixture: the observer blocks `SIGCHLD`, forks the group, the group starts and joins
+a thread and stays alive, so the only record the observer could hold is the thread's. Every one
+green on a current host first (`MPOS_ON_HOST=1`, 45 of 45, repeated), beside item 65's host unit
+test which this item leaves untouched (the wait rule has no host-reachable table).
+
+Gate: x86_64 `pass=188 fail=0 (188 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33 (11 of 199
+left out by `tests.toml`); aarch64 `pass=187 fail=0`, `mpos-kunit 32 passed, 0 failed`, exit 33
+(12 left out); stage 1 `579 passed; 0 failed`; both machines' 45 `ok:` lines byte-identical
+(diffed, carriage returns aside). Static: `fmt --check` clean; clippy's warning set unmoved (77
+on `x86_64-unknown-none`, 74 on `aarch64-unknown-none`, 3 in `mpos-xtask`); `cargo xtask
+depgraph` within the ratchet (8/8 mutual pairs, no new edges).
+
+**Four counterfactuals, one per half, each with every pin kept**, and each red exactly where it
+should be:
+
+| reverted | red claims by name |
+|---|---|
+| the thread's link (`parent: None`) | the three parent doors: `a thread's own getppid(2) is its group's parent`, `and the tid's status PPid is the same number`, `and its stat field 4 agrees with the other two doors` |
+| the wait rule (the caller's slot, not its group) | `the leader may wait for a child its thread forked: WNOHANG answers 0, not ECHILD` |
+| the reparent rule (always `INIT_PID`) | `so the child it forked is on the leader's children file now`, `and the leader's wait collects it, with the code it exited by` |
+| the leader gate on the death path | `a thread's death queues no SIGCHLD for its group's parent` |
+
+The last fixture is the item's own lesson: its first draft observed the *group* and stayed green
+on the broken kernel, because a thread's parent link names its **group's** parent - the observer
+has to be that grandparent, which is why the fixture is two forks deep.
+
+**What stays named** is the shape this item deliberately does not move: a non-leader's
+`exit_group(2)` still records nothing for the group and announces nothing to its parent. This
+kernel's `exit_group` marks the siblings exited and runs the caller's exit path, and the leader
+gate now says so on purpose; Linux reports the group's leader. It is a shape this item neither
+introduced nor closed, and the one place a multithreaded program's parent can be told `ECHILD`
+where Linux hands it the leader's status.

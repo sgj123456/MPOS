@@ -69,13 +69,35 @@
 //! `status`'s `PPid` and `stat`'s field 4 as the **group**, not as the tid that
 //! forked it.
 //!
-//! One shape this fixture *sees* and deliberately does not claim, because it is
-//! the parent **link** rather than a record: a thread's own parent is its
-//! creator here and its group's parent on Linux (there `CLONE_THREAD` implies
-//! `CLONE_PARENT`; measured, the forking thread read the group's parent through
-//! all three doors - `42056` where its own tid was `42060`). So a *thread's* own
-//! `PPid` is the one number on this fixture that is still not Linux's, and
-//! `docs/uapi/` §5.2 names it with that measurement.
+//! # The link's other end: a thread is its group's child (item 66)
+//!
+//! Item 65 stopped at the record and named the link: a thread's own parent is
+//! its creator's parent on Linux - `kernel_clone` turns `CLONE_THREAD` into
+//! `CLONE_PARENT`, so "threads share the parent" - where this kernel's thread
+//! carried **no** link at all, so all three doors read `0`. Measured in the
+//! same session (`.workbuddy/probe_children_owner.c`, Linux 7.2.11, the leader
+//! `87096` whose own parent was `87094`): the worker thread `87099` read
+//! `getppid`, `status`'s `PPid` and `stat`'s field 4 as `87094` - its *group's*
+//! parent, not the tid that created it.
+//!
+//! Three behaviours move with that link, and all three are measured:
+//!
+//!   * a **thread's death notifies nobody** - the same probe blocked `SIGCHLD`
+//!     and asked `sigpending`: a `fork` child's death queued a record, a
+//!     thread's queued none;
+//!   * a dying task **hands its children to an alive task of its group** before
+//!     init - the thread's child moved onto the leader's `children` list the
+//!     moment the thread exited, and the mirror is measured too
+//!     (`.workbuddy/probe_leader_exit.c`: a leader that leaves on `pthread_exit`
+//!     while its worker runs gives the *worker* its child, whose `PPid` still
+//!     reads the group because that is the worker's `tgid`);
+//!   * and **`wait` walks every thread of the caller's group** - with the
+//!     forking thread still alive the leader's `waitpid(child, WNOHANG)` was
+//!     `0`, not `ECHILD`, and a blocking wait collected it outright.
+//!
+//! So the fixture below no longer reaps the thread's child itself: the leader
+//! does, both while the thread lives and after it has gone. That is the half
+//! Linux's `do_wait` (`while (tsk != current->group_leader)`) buys a program.
 
 use mpos_user_tests::Report;
 
@@ -172,18 +194,24 @@ fn lists(dir: &str, number: i32) -> bool {
 /// is `ECHILD`, which is what a wait for a task that is not this thread's child
 /// answers.
 fn reap_within(pid: i32) -> bool {
+    wait_within(pid).is_some()
+}
+
+/// [`reap_within`] that keeps the status word, for the claim that the leader
+/// collected the thread's child *with the code the child exited by*.
+fn wait_within(pid: i32) -> Option<i32> {
     for _ in 0..400 {
         let mut status = 0;
         let got = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if got == pid {
-            return true;
+            return Some(status);
         }
         if got == -1 {
-            return false;
+            return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    false
+    None
 }
 
 fn main() {
@@ -204,7 +232,7 @@ fn main() {
     // would answer the group's for both. Then it forks a child of its own and
     // parks, so every reading is taken from a live thread - and that child is
     // what tells a *task's* children from its group's.
-    let (report_tx, report_rx) = std::sync::mpsc::channel::<(i64, i32, i32, i32)>();
+    let (report_tx, report_rx) = std::sync::mpsc::channel::<(i64, i32, i32, i32, i32)>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
 
     // The pipe the two children park on, and the one the thread's child writes
@@ -255,7 +283,9 @@ fn main() {
                 libc::close(b_report[1]);
                 let mut byte = [0u8; 1];
                 let _ = libc::read(park_read, byte.as_mut_ptr().cast(), 1);
-                libc::_exit(0);
+                // A code the leader's `wait` reads back: the claim that a
+                // group-wide wait collects the *record*, not just a pid.
+                libc::_exit(7);
             }
         }
         // Its own copy of the write end has to go, or the children never see
@@ -265,21 +295,20 @@ fn main() {
         // its `write` would leave the group's read parked on *this* copy.
         unsafe { libc::close(park_write) };
         unsafe { libc::close(b_report[1]) };
-        let _ = report_tx.send((my_tid(), fd, child_b, b_report[0]));
+        let thread_ppid = unsafe { libc::getppid() };
+        let _ = report_tx.send((my_tid(), thread_ppid, fd, child_b, b_report[0]));
         let _ = release_rx.recv();
-        // The thread's own child is *this thread's* to reap, which is the one
-        // place this program does what the *link* says rather than what Linux's
-        // `wait` does: `do_wait` walks every thread of the caller's group, so the
-        // leader collects it there (measured - the leader's `WNOHANG` was `0`
-        // while it lived and a blocking wait returned its pid and status), while
-        // this kernel's `waitable` asks the *calling task*, so a group-wide reap
-        // is `ECHILD` here and named rather than claimed (`docs/uapi/` §5.2).
-        reap_within(child_b);
+        // The thread does **not** reap its child: `do_wait` walks every thread
+        // of the caller's group, so the leader collects it - while the thread
+        // lives, and after it has gone (a dying task hands its children to an
+        // alive task of its group). Doing it here would leave the leader's
+        // claims nothing to collect.
+        //
         // Held until the group has read `/proc/<tid>/fd`: a dropped descriptor
         // would take the number out of the listing the claim is about.
         drop(own);
     });
-    let (tid, fd, child_b, b_read) = match report_rx.recv() {
+    let (tid, thread_ppid, fd, child_b, b_read) = match report_rx.recv() {
         Ok(working) => working,
         Err(_) => {
             r.check("the thread under test reported", false);
@@ -289,6 +318,30 @@ fn main() {
     r.check(
         "the thread under test started",
         tid > 0 && pid as i64 != tid,
+    );
+
+    // ---- a thread's own parent is its group's (item 66) -------------------
+    //
+    // `CLONE_THREAD` implies `CLONE_PARENT` on Linux, so a thread's parent is
+    // its creator's parent - the same number the leader reads - and the three
+    // doors are one rule. Measured: the worker `87099` read `87094` through all
+    // three while the leader `87096`'s own parent was `87094`
+    // (`.workbuddy/probe_children_owner.c`).
+    let leader_ppid = status_line(&format!("/proc/{pid}/status"), "PPid")
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(-1);
+    r.check(
+        "a thread's own getppid(2) is its group's parent",
+        leader_ppid > 0 && thread_ppid == leader_ppid,
+    );
+    r.check(
+        "and the tid's status PPid is the same number",
+        status_line(&format!("/proc/{tid}/status"), "PPid").as_deref()
+            == Some(leader_ppid.to_string().as_str()),
+    );
+    r.check(
+        "and its stat field 4 agrees with the other two doors",
+        field(&format!("/proc/{tid}/stat"), 4).as_deref() == Some(leader_ppid.to_string().as_str()),
     );
     // The read end of the thread's child's report is the parent's now, and its
     // write end is the child's alone - closed here so a child that never
@@ -495,6 +548,18 @@ fn main() {
         field(&format!("/proc/{child_a}/stat"), 4).as_deref() == Some(group.as_str()),
     );
 
+    // A wait is the group's, not the forking thread's: `do_wait` walks every
+    // thread of the caller's group, so the leader sees a child its worker
+    // forked - and `WNOHANG` answers "not yet" (`0`), not `ECHILD`, because
+    // the child exists. Measured: `.workbuddy/probe_children_owner.c` read the
+    // leader's `waitpid(child B, WNOHANG)` as `0`.
+    let mut probe_status = 0;
+    let probe = unsafe { libc::waitpid(child_b, &mut probe_status, libc::WNOHANG) };
+    r.check(
+        "the leader may wait for a child its thread forked: WNOHANG answers 0, not ECHILD",
+        probe == 0,
+    );
+
     // A corpse is still a child until it is reaped, which is the reap and not
     // the exit that takes it off the list.
     let dead = unsafe { libc::fork() };
@@ -523,24 +588,24 @@ fn main() {
     unsafe { libc::waitpid(dead, &mut dead_status, 0) };
     r.check("and the reap is what takes it off", !listed(dead));
 
-    // Release the two children: closing the write end is what their reads are
-    // waiting for, and each held its own copy until then. Child A is this
-    // thread's to reap; child B is the *worker's*, and the worker does it - see
-    // the note there, which is also a divergence this program does not claim.
-    unsafe { libc::close(park_write) };
-    reap_within(child_a);
-
-    // ---- and a thread that has gone takes its tid with it -----------------
+    // ---- the link's other end: the group adopts what the thread left ------
     //
-    // Linux unhooks a task from the namespace it was numbered in at exit
-    // *unless it leads its group* - so a dead thread's tid names nothing while a
-    // zombie process keeps its `/proc/<pid>` (which item 63's pin reads a byte
-    // out of). This kernel keeps a dead thread's *slot* until it is reused, so
-    // the clause is the tree's to apply; both readings below are Linux's answer.
+    // The worker leaves while child B is still parked, and Linux's
+    // `forget_original_parent` hands a dying task's children to an alive task
+    // of its group before init - measured: the thread's child moved onto the
+    // leader's `children` list (`probe_children_owner.c`). The mirror is
+    // measured too (`.workbuddy/probe_leader_exit.c`): a leader that leaves on
+    // `pthread_exit` under a live worker gives the *worker* its child.
     //
-    // Two claims, and the first is the one that cannot be fooled by a slot being
-    // handed to somebody else: a reused slot belongs to another group, so it
-    // would not appear in *this* process's `task` listing either way.
+    // A dead thread also takes its tid with it: Linux unhooks a task from the
+    // namespace it was numbered in at exit *unless it leads its group* - so a
+    // dead thread's tid names nothing while a zombie process keeps its
+    // `/proc/<pid>` (which item 63's pin reads a byte out of). This kernel keeps
+    // a dead thread's *slot* until it is reused, so the clause is the tree's to
+    // apply; both readings below are Linux's answer. The first cannot be fooled
+    // by a slot being handed to somebody else: a reused slot belongs to another
+    // group, so it would not appear in *this* process's `task` listing either
+    // way.
     let _ = release_tx.send(());
     let _ = worker.join();
     r.check(
@@ -551,6 +616,109 @@ fn main() {
     r.check(
         "and its tid names no directory at all",
         mode_of(&tid_dir).is_none(),
+    );
+    r.check(
+        "so the child it forked is on the leader's children file now",
+        text(&leader_children).as_deref() == Some(format!("{child_a} {child_b} ").as_str()),
+    );
+
+    // Release both children: closing the write end is what their reads wait
+    // for, and each held its own copy until then. Child A is the leader's own;
+    // child B is the one it adopted, and the status word must be *that* death's
+    // - the code child B exits by is 7.
+    unsafe { libc::close(park_write) };
+    reap_within(child_a);
+    let b_status = wait_within(child_b);
+    r.check(
+        "and the leader's wait collects it, with the code it exited by",
+        b_status.is_some_and(|status| libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 7),
+    );
+    r.check(
+        "which takes it off the leader's children file",
+        !listed(child_b),
+    );
+
+    // ---- a thread's death notifies nobody ---------------------------------
+    //
+    // The link's other consequence: only a group leader's death is the
+    // process's, so a worker's exit queues no `SIGCHLD` for the group's parent
+    // (`do_notify_parent`'s `thread_group_leader` clause). Measured with the
+    // signal *blocked*, which is the only way a record that was never queued
+    // can be told from one that was delivered: a `fork` child's death queues
+    // one, a thread's queues nothing (`.workbuddy/probe_children_owner.c`).
+    //
+    // The observer must be the group's **parent**, not the group: a thread's
+    // `parent` link is the parent of its process, so the record a missing
+    // leader gate would queue lands one level up. The fixture is therefore two
+    // forks deep: this `in_child` process is the observer, it blocks `SIGCHLD`,
+    // then forks the group; the group starts and joins a thread and reports
+    // that the thread has died while it stays alive, so the only `SIGCHLD` the
+    // observer could be holding is the thread's.
+    //
+    // Blocked is the only way to tell "never queued" from "delivered": the
+    // probe measured a `fork` child's death as one queued record and a thread's
+    // as none (`.workbuddy/probe_children_owner.c`), and it had to do the same
+    // scenario in a child of its own for the same reason.
+    let quiet = in_child(|| {
+        let mut chld: libc::sigset_t = unsafe { core::mem::zeroed() };
+        let mut old: libc::sigset_t = unsafe { core::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut chld);
+            libc::sigaddset(&mut chld, libc::SIGCHLD);
+            libc::sigprocmask(libc::SIG_BLOCK, &chld, &mut old);
+        }
+        let mut ready = [0i32; 2];
+        let mut go = [0i32; 2];
+        if unsafe { libc::pipe(ready.as_mut_ptr()) } != 0
+            || unsafe { libc::pipe(go.as_mut_ptr()) } != 0
+        {
+            return false;
+        }
+        let group = unsafe { libc::fork() };
+        if group == 0 {
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(go[1]);
+            }
+            let thread = std::thread::spawn(|| {});
+            let _ = thread.join();
+            unsafe {
+                let byte = [1u8; 1];
+                let _ = libc::write(ready[1], byte.as_ptr().cast(), 1);
+                let mut release = [0u8; 1];
+                let _ = libc::read(go[0], release.as_mut_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(go[0]);
+            let mut seen = [0u8; 1];
+            let _ = libc::read(ready[0], seen.as_mut_ptr().cast(), 1);
+        }
+        // The death and the queueing are two events; poll rather than sleep
+        // once, so a slow machine cannot pass the claim by being early.
+        let mut queued = false;
+        for _ in 0..40 {
+            let mut pending: libc::sigset_t = unsafe { core::mem::zeroed() };
+            unsafe { libc::sigpending(&mut pending) };
+            if unsafe { libc::sigismember(&pending, libc::SIGCHLD) } == 1 {
+                queued = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        unsafe {
+            let byte = [1u8; 1];
+            let _ = libc::write(go[1], byte.as_ptr().cast(), 1);
+            let mut status = 0;
+            libc::waitpid(group, &mut status, 0);
+        }
+        !queued
+    });
+    r.check(
+        "a thread's death queues no SIGCHLD for its group's parent",
+        quiet,
     );
 
     r.finish()

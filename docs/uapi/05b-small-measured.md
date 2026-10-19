@@ -34,30 +34,37 @@ Section numbers are unchanged from the original `UAPI.md`.
   `sched::parent_group_of`. Pin: **`t-tid-dir`'s 11 new claims** (26 → 37) and the host unit test
   `a_children_file_lists_the_children_the_task_itself_forked`.
 
-  **What stays named** is the link's *other* end: a **thread's** own parent. Linux's
-  `copy_process` gives a `CLONE_THREAD` task its creator's parent — "threads share the parent", so
-  `CLONE_THREAD` implies `CLONE_PARENT` — where this kernel's clone stores the creating task, so a
-  thread's own `PPid`/`getppid` reads its creator. Measured on a current host in the same probe:
-  the forking thread read `42203`, the group's *parent*, through all three doors while its own tid
-  was `42207`. It is not a rendering — that is what this item stopped at — and **three** behaviours
-  move with the link, each measured and each needing its own landing:
+  **The link's *other* end landed the same day** (`docs/uapi/` §5.1 item 66, the entry below):
+  a thread's own parent is its group's parent, its death notifies nobody, a dying task hands its
+  children to an alive task of its group, and `wait` walks the caller's group.
 
-  * **a thread's death notifies nobody** (measured: a `fork` child's death queues `SIGCHLD` with the
-    signal blocked, a thread's death queues nothing; this kernel's death path notifies the parent
-    whatever the task's shape, `child_exit.rs`'s unconditional wake by design);
-  * **a task's exit hands its children to an alive thread of its group** before init (measured: the
-    thread's child moved to the leader's list the moment the thread exited, its own three doors
-    unmoved; this kernel reparents to `INIT_PID`);
-  * and **`wait` asks a different question again**: Linux's `do_wait` walks every thread of the
-    caller's group (`while (tsk != current->group_leader)`), so with the forking thread still alive
-    the *leader's* `waitpid(child, WNOHANG)` answered `0` — not `ECHILD` — and a blocking wait
-    collected the child outright (its pid and status `7`), where this kernel's one eligibility rule
-    asks `task.parent == Some(me)`, the calling task, so the same call is `ECHILD`. A missing child
-    a program forked on a worker thread and waits for on the main one is this divergence.
+- **A thread is its group's child: `CLONE_THREAD` implies `CLONE_PARENT`.** **Landed 2026-10-19**
+  (`docs/uapi/` §5.1 item 66) — item 65's own residual, and the correction of the sentence above
+  that said "this kernel's clone stores the creating task": `spawn_thread` gave a thread **no
+  link** (`parent: None`), so `getppid`, `status`'s `PPid` and `stat`'s field 4 read `0`. Measured
+  on a current host (`.workbuddy/probe_children_owner.c`, Linux 7.2.11): the leader `87096`, whose
+  own parent was `87094`, started the worker `87099`, and the worker read `87094` through all
+  three doors. The three behaviours that move with the link were measured in the same session,
+  and the leader-exit mirror in a second probe (`.workbuddy/probe_leader_exit.c`):
 
-  Owners: `src/sched/runtime/child_exit.rs`'s clone line and `forget_original_parent`,
-  `src/sched/runtime/child_signal.rs`'s `notify_parent_of_death`, and
-  `src/sched/runtime/trace.rs`'s `waitable`.
+  * **a thread's death notifies nobody** — a `fork` child's death queues `SIGCHLD` with the signal
+    blocked, a thread's queues none;
+  * **a dying task hands its children to an alive task of its group before init** — the thread's
+    child moved onto the leader's list; a leader that leaves on `pthread_exit` under a live
+    worker gives the **worker** its child, whose `PPid` still names the group (the worker's
+    `tgid`);
+  * and **`wait` walks every thread of the caller's group** — the leader's
+    `waitpid(child, WNOHANG)` over a worker's child answered `0`, then the blocking call collected
+    it (pid and status `7`).
+
+  Served by `spawn_thread`'s `parent: parent.parent`, `trace::waitable` asking the caller's
+  **group** and admitting only a **leader** (a tracer the exception), the same question in
+  `child_alive_for`, a leader gate on the death path's notify/wake/console and on `trace::park`,
+  `alive_thread_of`'s reaper choice, and a reap-time fold only for leaders (a thread's `cpu_all`
+  is the group's). Pin: **`t-tid-dir`'s 8 new claims** (37 → 45), green on a current host first;
+  four counterfactuals, one per half, each red on exactly its own claims (`docs/notes/` §15.85
+  carries the table). **What stays named**: a non-leader's `exit_group(2)` still records nothing
+  for the group and announces nothing to its parent.
 
 - **A thread's tid names a `/proc` directory now, and the clause that came with it.** **Landed
   2026-10-19** (`docs/uapi/` §5.1 item 64) — found by item 63's pin, which claimed a thread's

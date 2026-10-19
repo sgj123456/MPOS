@@ -920,11 +920,24 @@ pub(crate) fn child_alive(t: &Table, parent: TaskId) -> bool {
 /// default wait cannot be answered about is not a reason to park, it is the
 /// `ECHILD` Linux answers (measured, `.workbuddy/probe_wclone.c` G1).
 pub(crate) fn child_alive_for(t: &Table, parent: TaskId, sel: WaitFor, kind: ChildKind) -> bool {
+    // The caller's **group**, not its slot: a child forked on a worker thread is
+    // still the leader's to wait for (`do_wait` walks every thread of the
+    // caller's group), and a thread is not a child at all. Both halves live in
+    // `trace::waitable`, and this is the live half of the same question.
+    let Some(group) = t
+        .tasks
+        .get(parent.0)
+        .and_then(Option::as_ref)
+        .map(|task| task.tgid)
+    else {
+        return false;
+    };
     t.tasks.iter().enumerate().any(|(slot, task)| {
         let id = TaskId(slot);
         task.as_ref().is_some_and(|task| {
             !task.exited
-                && task.parent == Some(parent)
+                && task.tgid == id
+                && super::trace::forked_in_group(t, task, group)
                 && id != parent
                 && sel.names_task(id, task)
                 && kind.sees(task.exit_signal)

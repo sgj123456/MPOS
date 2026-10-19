@@ -243,28 +243,7 @@ pub fn exit(code: isize) -> ! {
             tracer: t.task(id).trace.tracer,
         });
 
-        // Linux's `forget_original_parent`: a process that exits hands every
-        // child that was still its own to init. Without this a zombie keeps a
-        // `parent` naming a *slot* — and slots are reused, so the next process
-        // to occupy this one inherits the dead process's children: `wait4`'s
-        // tables filter by `task.parent == Some(me)`. Measured, once the sweep's program count grew: `t-signalfd`
-        // was handed four records for one death, three of them naming slots 8
-        // and 10 — unreaped orphans of an *earlier* occupant of its own slot —
-        // and the read before its fork answered a record where the claim is
-        // `EAGAIN`.
-        //
-        // Init is always alive (the kernel stops the machine rather than let it
-        // exit, below), so it is the only candidate. Linux also gives a dead
-        // child to its *tracer* when one is attached, and sends SIGHUP+SIGCONT
-        // to an orphaned process group; neither is modelled here, and this walk
-        // is where the first of them would go.
-        for slot in t.tasks.iter_mut().flatten() {
-            if slot.parent == Some(id) {
-                slot.parent = Some(INIT_PID);
-            }
-        }
-
-        // And a pid namespace's init takes its namespace with it - Linux's
+        // A pid namespace's init takes its namespace with it - Linux's
         // `zap_pid_ns_processes`. The membership it tests is the part worth
         // stating, because the obvious reading of it is wrong: a task dies when
         // it is **numbered in** the dying namespace, which includes every
@@ -338,7 +317,16 @@ pub fn exit(code: isize) -> ! {
         // the same critical section that made the condition true: either it
         // has not slept yet and will find the code on its next look, or it is
         // in the sleep queue this wake empties. There is no third state.
-        let parent = t.task(id).parent;
+        //
+        // Only a **group leader's** death is the process's death. A thread's
+        // `parent` link is its group's parent (`CLONE_THREAD` implies
+        // `CLONE_PARENT`), so the link alone would announce every worker's
+        // exit as a child's; Linux gates the announcement on
+        // `thread_group_leader` (`do_notify_parent`), and the measurement is
+        // the pair in `.workbuddy/probe_children_owner.c`: a `fork` child's
+        // death queues `SIGCHLD`, a thread's queues nothing.
+        let leader = t.task(id).tgid == id;
+        let parent = if leader { t.task(id).parent } else { None };
         if let Some(parent) = parent {
             t.sched.wake(parent);
             // The signal the child was born to report, not just the wake. A
@@ -414,24 +402,35 @@ pub fn exit(code: isize) -> ! {
         }
 
         // Its children outlive it, and a dead task cannot be anyone's parent -
-        // nor wait for anyone. They go to init, which waits for everything.
-        // Init itself is exempt: it has no parent to lose.
+        // nor wait for anyone. Linux's `forget_original_parent` hands them to
+        // an **alive task of the dying task's group** when one is left, and to
+        // init otherwise; both halves are measured on a current host.
+        // `.workbuddy/probe_children_owner.c` has a thread exit with its child
+        // still running: the child moved onto the leader's `children` list and
+        // its three parent doors went on naming the group.
+        // `.workbuddy/probe_leader_exit.c` is the mirror - a leader leaves on
+        // `pthread_exit` while its worker still runs, and the child moves onto
+        // the *worker's* list, its `PPid` still reading the group because that
+        // is the worker's `tgid`. Init is the last resort, and init itself is
+        // exempt: it has no parent to lose.
+        //
+        // No `!task.exited` filter: a zombie child's parent names a slot too,
+        // and slots are reused - the next process to occupy this one would
+        // inherit the dead process's children, which `wait4`'s tables read as
+        // its own (`t-signalfd` was handed four records for one death, three
+        // naming earlier tenants of the slot).
         if id != INIT_PID {
-            let orphans: Vec<TaskId> = t
-                .tasks
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, task)| {
-                    let task = task.as_ref()?;
-                    (task.parent == Some(id) && !task.exited).then_some(TaskId(slot))
-                })
-                .collect();
-            let adopted = !orphans.is_empty();
-            for orphan in orphans {
-                t.task_mut(orphan).parent = Some(INIT_PID);
+            let tgid = t.task(id).tgid;
+            let reaper = alive_thread_of(t, tgid, id).unwrap_or(INIT_PID);
+            let mut adopted = false;
+            for task in t.tasks.iter_mut().flatten() {
+                if task.parent == Some(id) {
+                    task.parent = Some(reaper);
+                    adopted = true;
+                }
             }
             if adopted {
-                t.sched.wake(INIT_PID);
+                t.sched.wake(reaper);
             }
         }
 
@@ -469,6 +468,32 @@ pub fn exit(code: isize) -> ! {
         });
     });
     unreachable!("an exited task is never picked again")
+}
+
+/// An alive task of the group `tgid` other than `dying`, preferring the leader.
+///
+/// The candidate list `forget_original_parent` looks for: a thread that exits
+/// hands its children to the leader (measured), a leader that exits hands them
+/// to a worker, and only a group with no live task left lets init take them.
+/// Preferring the leader is not a preference for its own sake - it is the
+/// answer a reader then *names*, since `parent_group` reports the adopter's
+/// `tgid`, and the leader's `tgid` is the group.
+fn alive_thread_of(t: &Table, tgid: TaskId, dying: TaskId) -> Option<TaskId> {
+    let alive = |slot: usize| {
+        slot != dying.0
+            && t.tasks
+                .get(slot)
+                .and_then(Option::as_ref)
+                .is_some_and(|task| !task.exited && task.tgid == tgid)
+    };
+    if alive(tgid.0) {
+        return Some(tgid);
+    }
+    t.tasks
+        .iter()
+        .enumerate()
+        .find(|(slot, _)| alive(*slot))
+        .map(|(slot, _)| TaskId(slot))
 }
 
 /// The exit code of the most recent task with this id to have exited, if any.
@@ -564,7 +589,7 @@ pub(crate) fn any_child_code(
                 let ours = free
                     || t.tasks[id.0]
                         .as_ref()
-                        .is_some_and(|task| waitable(task, parent, kind));
+                        .is_some_and(|_| waitable(t, id, parent, kind));
                 ours && id != parent
                     && kind.sees(retired.exit_signal)
                     && retired.tracer.is_none_or(|tracer| tracer == parent)
@@ -1468,6 +1493,9 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
     let child_id = with_table(|t| {
         let parent_id = t.current;
         let parent = t.task(parent_id);
+        // Read before the slot is taken: the task literal that follows is built
+        // after `alloc_slot` has borrowed the table mutably.
+        let inherited_parent = parent.parent;
         let mm = parent.mm.clone();
         // A thread shares its process's descriptor *table* under `CLONE_FILES`
         // - which is what a libc's thread creation asks for, and the whole
@@ -1612,9 +1640,15 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             // and unsharing a mount namespace from within a thread group is left
             // to the task that asks (`unshare` moves only the caller).
             fs_ns: parent_fs_ns,
-            // Not a child: `wait` collects processes, and a thread is not one.
-            // The process becomes collectable when its leader exits.
-            parent: None,
+            // The creator's parent, not the creator: Linux's `kernel_clone`
+            // turns `CLONE_THREAD` into `CLONE_PARENT`, so "threads share the
+            // parent". The link answers the `PPid`-shaped doors - and only
+            // those, because a thread is on no `children` list and its death
+            // notifies nobody (`wait`'s rule asks `task.tgid == id`).
+            // Measured on a current host (`.workbuddy/probe_children_owner.c`):
+            // a worker thread read its *group's* parent through `getppid`,
+            // `status` and `stat` while its own tid was the one it ran as.
+            parent: inherited_parent,
             // A thread never notifies anyone of its death on Linux, so
             // `copy_process` rewrites this byte away for `CLONE_THREAD`
             // whatever `pthread_create` passed - and musl passes a word with
@@ -1828,7 +1862,7 @@ fn scan_child_event(
             // A slot this task's own id names is not its child: `any_child_code`
             // makes the same exclusion for the same reason.
             let id = TaskId(slot);
-            (waitable(task, parent, kind) && id != parent && sel.names_task(id, task))
+            (waitable(t, id, parent, kind) && id != parent && sel.names_task(id, task))
                 .then_some((id, task))
         })
     };
@@ -1859,7 +1893,7 @@ fn scan_child_event(
                 let ours = free
                     || t.tasks[id.0]
                         .as_ref()
-                        .is_some_and(|task| waitable(task, parent, kind));
+                        .is_some_and(|_| waitable(t, id, parent, kind));
                 ours && id != parent
                     && sel.names_retired(retired, kind)
                     && retired.tracer.is_none_or(|tracer| tracer == parent)
@@ -2033,7 +2067,7 @@ pub fn has_matching_children(parent: TaskId, sel: WaitFor, kind: ChildKind) -> b
                     let ours = free
                         || t.tasks[id.0]
                             .as_ref()
-                            .is_some_and(|task| waitable(task, parent, kind));
+                            .is_some_and(|_| waitable(t, id, parent, kind));
                     ours && id != parent
                         && sel.names_retired(retired, kind)
                         && retired.tracer.is_none_or(|tracer| tracer == parent)

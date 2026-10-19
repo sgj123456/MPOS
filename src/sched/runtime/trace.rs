@@ -253,7 +253,7 @@ pub(crate) fn unreported_stop(
     for (slot, task) in t.tasks.iter().enumerate() {
         let Some(task) = task.as_ref() else { continue };
         let id = TaskId(slot);
-        if !waitable(task, parent, kind) || id == parent || !sel.names_task(id, task) {
+        if !waitable(t, id, parent, kind) || id == parent || !sel.names_task(id, task) {
             continue;
         }
         let Some(stop) = task.trace.stop else {
@@ -309,8 +309,41 @@ pub(crate) fn unreported_stop(
 /// not count as "no event yet" but as "no child at all" (`ECHILD`, measured in
 /// `.workbuddy/probe_wclone.c` G1/G2). It rides here rather than in each scan
 /// for the same reason the tracer rule does.
-pub(crate) fn waitable(task: &Task, me: TaskId, kind: ChildKind) -> bool {
-    (task.parent == Some(me) || task.trace.tracer == Some(me)) && kind_visible(task, me, kind)
+///
+/// "Being `me`'s child" is a question about `me`'s **group**, not its slot, and
+/// the fourth thing is that only a group leader is a child at all. Both halves
+/// are Linux's and both are measured: `do_wait` walks every thread of the
+/// caller's group (`while (tsk != current->group_leader)`), so a child forked
+/// on a worker thread is the leader's to collect - `.workbuddy/probe_children_owner.c`
+/// read the leader's `waitpid(child, WNOHANG)` as `0` and then collected the
+/// child outright - while a `CLONE_THREAD` task is on no `children` list and its
+/// death notifies nobody (`probe_children_owner.c`: a thread's death queues no
+/// `SIGCHLD`). A tracer is the exception to the leader half, for the reason
+/// [`kind_visible`] gives.
+pub(crate) fn waitable(t: &Table, id: TaskId, me: TaskId, kind: ChildKind) -> bool {
+    let task = t.task(id);
+    let in_my_group = group_of(t, me).is_some_and(|group| forked_in_group(t, task, group));
+    let leader = task.tgid == id;
+    ((in_my_group && leader) || task.trace.tracer == Some(me)) && kind_visible(task, me, kind)
+}
+
+/// The group `id` is in, or `None` when the slot holds nothing.
+fn group_of(t: &Table, id: TaskId) -> Option<TaskId> {
+    t.tasks.get(id.0)?.as_ref().map(|task| task.tgid)
+}
+
+/// Whether `task` was forked by a task of `group` - the parent test
+/// [`waitable`] asks, and the one `child_alive_for` asks of a live child.
+///
+/// The link is the *task* that forked it (what `children` lists by), so a child
+/// of a worker thread is still reachable from the group: its parent's `tgid` is
+/// the group the caller belongs to. A thread's own parent is the group's parent
+/// rather than the thread that created it (`CLONE_THREAD` implies
+/// `CLONE_PARENT`), which is why this lookup is by group and not by slot.
+pub(crate) fn forked_in_group(t: &Table, task: &Task, group: TaskId) -> bool {
+    task.parent
+        .and_then(|parent| group_of(t, parent))
+        .is_some_and(|parent_group| parent_group == group)
 }
 
 /// The kind half of [`waitable`], on its own: may a wait with these options be
@@ -343,7 +376,7 @@ pub fn is_child(id: TaskId, parent: TaskId, kind: ChildKind) -> bool {
     with_table(|t| {
         t.tasks[id.0]
             .as_ref()
-            .is_some_and(|task| !task.exited && waitable(task, parent, kind))
+            .is_some_and(|task| !task.exited && waitable(t, id, parent, kind))
     })
 }
 
@@ -382,7 +415,13 @@ pub(crate) fn park(regs: &mut AbiRegs, stop: Stop) {
             let task = t.task_mut(id);
             task.trace.stop = Some(stop);
             task.trace.regs = Some(snapshot);
-            (task.trace.tracer, task.parent)
+            // A thread's stop is its group's, and Linux reports a stop to the
+            // real parent from the leader alone (`do_notify_parent`'s
+            // `thread_group_leader` clause). A thread's `parent` link is the
+            // group's parent now, so an ungated wake would hand it a stop it
+            // cannot collect.
+            let leader = task.tgid == id;
+            (task.trace.tracer, if leader { task.parent } else { None })
         };
         if let Some(tracer) = tracer {
             t.sched.wake(tracer);

@@ -1915,7 +1915,14 @@ impl Table {
             // applied after the loop, because `self.tasks[parent]` cannot be
             // borrowed while `iter_mut` holds the table. Kernel/boot tasks have
             // no parent, so nothing is folded for them.
-            if let Some(parent) = task.parent {
+            //
+            // A **thread** is not a waited child, and its `mm` counters are the
+            // group's (`cpu_all`), so folding one would charge the whole
+            // group's work to the parent once per thread that happened to be
+            // collected. Only the leader's slot is a process to hand up.
+            if task.tgid.0 == slot
+                && let Some(parent) = task.parent
+            {
                 folds.push((parent, task.mm.cpu_all()));
             }
 

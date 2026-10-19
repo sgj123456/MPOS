@@ -51,6 +51,9 @@ One-glance status of the whole roadmap.
 
 - [x] 6.1 ptrace (§6.1) · [x] 6.2 real rlimits incl. NOFILE/STACK (§6.2) · [x] 6.4 identity/cap calls, threads via `clone(CLONE_THREAD)` (§6.4)
 - [x] teardown at exit, not at reap (§6, R.15)
+- [x] a thread is its group's child — its parent is the group's parent, its death notifies nobody,
+  a dying task hands its children to an alive task of its group, and a wait walks the caller's
+  group (§15.85)
 - [ ] [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET**, **TIME** and **USER** landed, each with its pin  
   (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`): the numbers a process  
   sees are the  
@@ -359,6 +362,20 @@ shape but not what sizes the receive ring (item 58) - and the datagram line itse
 is the ring's rather than Linux's 65507 until this stack fragments IP; the two namespace  
 kinds with no entry at all are IPC and cgroup.  
 
+**A thread is its group's child: `CLONE_THREAD` implies `CLONE_PARENT`** (`docs/uapi/` §5.1  
+item 66, landed 2026-10-19): item 65's own residual. A thread's `real_parent` on Linux is the  
+parent of the group it joined, so a worker's `getppid`, `status`'s `PPid` and `stat`'s field 4  
+all name the group's parent — where this kernel's thread carried no link at all and all three  
+read `0`. Three behaviours move with the link and all three were measured on a current host  
+first: a thread's death notifies nobody; a dying task hands its children to an alive task of its  
+group before init (a thread's child to the leader, a leader's to a live worker — the mirror  
+needed its own probe); and `wait` walks every thread of the caller's group, so the leader  
+collects a child its worker forked. Served by the clone-path link, `waitable`'s group-and-leader  
+rule (and `child_alive_for` asking the same question), a leader gate on the death path's  
+notify/wake/console, `alive_thread_of`'s reaper choice, and a reap-time CPU fold only for  
+leaders. Pin: `t-tid-dir` 37 → 45 claims, four counterfactuals one per half. Named: a  
+non-leader's `exit_group(2)` still announces nothing to its parent.
+
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
 record-only was wrong in both halves - the figure stored was the caller's rather than Linux's,  
@@ -638,11 +655,12 @@ leader's slot), and a reaped child lingered in the table until the next schedule
 Linux's `release_task` runs inside `do_wait`. Pin: `t-tid-dir`'s **11 new claims** (26 → 37),  
 green on a current host first (37 of 37, three runs), plus the host unit test  
 `a_children_file_lists_the_children_the_task_itself_forked` (the gate figures are §15.84's). One  
-thing stays named in `docs/uapi/` §5.2: a **thread's** own parent is its creator here and its  
-group's parent on Linux (`CLONE_THREAD` implies `CLONE_PARENT` — measured, a thread reads the  
-group's parent through all three doors), so a thread's own `PPid` is still the creator, with the two  
-behaviours a link change moves measured and named beside it (a thread's death notifies nobody; a  
-task's exit hands its children to an alive thread of its group before init).
+thing stayed named in `docs/uapi/` §5.2: a **thread's** own parent — this kernel's thread carried  
+no link at all (`parent: None`, so its three doors read `0`), where Linux gives it its group's  
+parent (`CLONE_THREAD` implies `CLONE_PARENT` — measured, a thread reads the group's parent  
+through all three doors). It landed the next day as item 66 (§15.85), with the behaviours a link  
+change moves: a thread's death notifies nobody, a task's exit hands its children to an alive task  
+of its group, and `wait` walks every thread of the caller's group.
 
 **The `F_GETFL` word is the caller's own** (`docs/uapi/` §5.1 item 49, landed 2026-10-18): Linux  
 answers `filp->f_flags`, so a caller that compares the word against what it opened with agrees — its  
