@@ -5,6 +5,26 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **A framebuffer is its description's object, and it has no properties.** **Landed
+  2026-10-19** (`docs/uapi/` §5.1 item 68) — the entry §7.4 carried as "a framebuffer
+  object's own properties" was two facts, and the empty list it asked for was the wrong
+  half of both. Measured on a current host first (`.workbuddy/probe_drm_fb_owner.c`,
+  `probe_fb_props.c`, Linux 7.2.11): `GETRESOURCES`'s `count_fbs`/`fb_id_ptr` are the
+  **open file description's** — a child that made fb 464 read 1, its own, while the
+  parent on a second description read 0; after the parent made 465 its own list read 1
+  and the child's stayed 464 — because `drm_mode_getresources` walks `file_priv->fbs`
+  while the crtc/connector/encoder lists are the card's. And `OBJ_GETPROPERTIES` on an
+  fb answers **`EINVAL`** — the description's own, another description's, and the same
+  id under `OBJECT_ANY` alike — because a framebuffer has no property list; the
+  `width`, `height`, `format` and `modifier` the old note called fb properties are
+  `struct drm_framebuffer` fields, and `GETFB2` is the request that reports them.
+  Served by `get_resources` filtering on `Framebuffer::owner` (the description
+  `ADDFB`/`ADDFB2` already record and the release path already prunes) and by removing
+  the framebuffer arm from `obj_get_properties`, leaving the `_ => None` that is
+  `EINVAL`. The niri failure the empty list worked around was the device-wide list, not
+  a missing property: it walked the ids `GETRESOURCES` gave it and found kmscube's fb
+  100, an object it may not name. Pin: `t-drm`'s four claims, each red on the rule it pins.
+
 - **A task's `children` are its own, and the parent a record names is its group.** **Landed
   2026-10-19** (`docs/uapi/` §5.1 item 65) — item 64's own residual, and the entry it replaces is
   the paragraph at the end of item 64's below, which said `children` was the *task's* list on

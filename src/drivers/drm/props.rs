@@ -154,7 +154,7 @@ pub(crate) fn set_version(arg: usize) -> isize {
     0
 }
 
-pub(crate) fn get_resources(arg: usize) -> isize {
+pub(crate) fn get_resources(arg: usize, ofd: u64) -> isize {
     // struct drm_mode_card_res: fb@0,crtc@8,conn@16,enc@24 (u64 ptrs);
     // count_fbs@32, crtcs@36, conns@40, encoders@44, widths/heights@48..
     //
@@ -198,10 +198,28 @@ pub(crate) fn get_resources(arg: usize) -> isize {
             };
             // count_fbs is set by the caller to its buffer size; the kernel
             // reports how many there are and fills fb ids when space allows.
+            //
+            // The list is the *description's* own, not the card's: Linux's
+            // `drm_mode_getresources` walks `file_priv->fbs`, and every other
+            // list in the reply is device-wide (the three below are, with the
+            // lease filter). Measured on a current host
+            // (`.workbuddy/probe_drm_fb_owner.c`, Linux 7.2.11): a child that
+            // made fb 464 read 1 fb - its own - while the parent holding a
+            // second description answered 0; after the parent made fb 465 its
+            // own answer became 1 and the child's remained 464. The
+            // device-wide answer is what niri stopped on: it walked the ids
+            // `GETRESOURCES` gave it and found kmscube's framebuffer (fb 100),
+            // which is another client's object and not one it may name. The
+            // ownership is the one `ADDFB`/`ADDFB2` already record
+            // (`Framebuffer::owner`, the open file description), and the
+            // release path already prunes it, so this filter and that table
+            // are one fact rather than two.
             let fbs: Vec<u32> = st
                 .fbs
                 .iter()
-                .filter_map(|f| f.as_ref().map(|f| f.id))
+                .filter_map(|f| f.as_ref())
+                .filter(|f| f.owner == ofd)
+                .map(|f| f.id)
                 .collect();
             let c = ((arg + 32) as *const u32).read_unaligned();
             if !fbs.is_empty() && c >= fbs.len() as u32 {
@@ -2435,26 +2453,25 @@ pub(crate) fn obj_get_properties(arg: usize, ofd: u64) -> isize {
             // Linux's own answer for an object that exists is a count and
             // nothing to fill, which is what this arm gives.
             (OBJECT_ENCODER, ENCODER_ID) => Some(([0; 16], [0u64; 16], 0)),
-            // A **framebuffer** is an object a client walks too, and this card has
-            // to answer for it: smithay's `add_props`/`map_props` walks every handle
-            // `GETRESOURCES` listed - crtcs, connectors, encoders, planes *and
-            // framebuffers* - and a refusal there is not an empty list to it, it is
-            // the primary node failing to open. Measured: with a framebuffer alive
-            // (kmscube still running, its fb 100), niri said
+            // A **framebuffer** is an object a client can name, but it carries
+            // no property list: Linux's `drm_mode_obj_get_properties_ioctl`
+            // resolves the id and then refuses an object whose
+            // `base.properties` is null, which every framebuffer's is. Measured
+            // on a current host (`.workbuddy/probe_fb_props.c` and
+            // `probe_drm_fb_owner.c`, Linux 7.2.11): an fb this description
+            // made, an fb another description made, and the same id under
+            // `OBJECT_ANY` all answer **`EINVAL`** - the reply this card used
+            // to give only for an unrecognised type, and which it now gives
+            // for the fb too. The empty list this arm used to return was a
+            // workaround for the device-wide `GETRESOURCES` list above: once
+            // that list is the description's own, a client is never handed an
+            // fb it did not make, and Linux's answer is the honest one.
             //
-            //     [dbg] obj_get_properties: unknown object type=0xfbfbfbfb id=100
-            //     WARN error adding primary node device, display-only devices may not
-            //       work: ... Error reading properties on device `Some("/dev/dri/card0")`
-            //       (Invalid argument (os error 22))
-            //
-            // and with no framebuffer alive at that moment the same walk passes -
-            // which is why this only showed up with two clients in one boot. An empty
-            // list is **not** Linux's answer for an fb (it publishes `width`,
-            // `height`, `format` and `modifier` on one), and that is a named gap: this
-            // card's framebuffer objects carry no properties yet, and the count here is
-            // what keeps a client that *walks* the card working while that is true
-            // (`docs/notes/` §7.4).
-            (OBJECT_FB, _) => Some(([0; 16], [0u64; 16], 0)),
+            // What is *not* true is the shape this file's note used to carry -
+            // that Linux publishes `width`, `height`, `format` and `modifier`
+            // on an fb. It does not: those are `struct drm_framebuffer`
+            // fields, and `GETFB2` is the request that reports them. The
+            // measurement corrected that paragraph rather than building it.
             _ => None,
         };
         let (mut ids, mut values, count) = list?;

@@ -179,7 +179,7 @@ pub fn drm_request(fd: i32, nr: u32, arg: usize) -> isize {
         }
         NR_PRIME_HANDLE_TO_FD => prime_handle_to_fd(arg, ofd),
         NR_PRIME_FD_TO_HANDLE => prime_fd_to_handle(arg, ofd),
-        NR_GETRESOURCES => get_resources(arg),
+        NR_GETRESOURCES => get_resources(arg, ofd),
         NR_GETCRTC => get_crtc(arg),
         NR_SETCRTC => set_crtc(arg, card.lease()),
         NR_GETENCODER => get_encoder(arg),

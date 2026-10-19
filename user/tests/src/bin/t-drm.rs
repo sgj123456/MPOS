@@ -113,6 +113,8 @@ const NR_GETPLANERESOURCES: u32 = 0xb5;
 const NR_GETPLANE: u32 = 0xb6;
 const NR_ADDFB2: u32 = 0xb8;
 const NR_OBJ_GETPROPERTIES: u32 = 0xb9;
+/// `DRM_MODE_OBJECT_FB`, the tag an fb id is named under.
+const OBJECT_FB: u32 = 0xfbfb_fbfb;
 const NR_GETFB2: u32 = 0xce;
 /// The `DRM_VIRTGPU_*` pair a dumb buffer has to answer as Linux's does: the
 /// resource it names, and the copy into the device that this request makes.
@@ -917,6 +919,90 @@ fn main() {
     check_is(&mut r, "ADDFB succeeds", got, 0);
     let fb_id = fb.fb_id;
     check_true(&mut r, "a framebuffer id is returned", fb_id != 0);
+
+    // The framebuffer list belongs to the open file description, and an fb has
+    // no property list. Both are Linux's, measured on a current host
+    // (`.workbuddy/probe_drm_fb_owner.c`, Linux 7.2.11): a child that made fb
+    // 464 read 1 fb - its own - while the parent on a second description read
+    // 0; after the parent made 465 its own list became 1 and the child's
+    // stayed 464. The device-wide list was what niri walked into: it found
+    // kmscube's fb 100 through `GETRESOURCES` and failed on the object it was
+    // never given. And `OBJ_GETPROPERTIES` on an fb - this description's or
+    // another's, typed or under `OBJECT_ANY` - is `EINVAL` there, because a
+    // framebuffer has no properties; the fields this file's note once called
+    // fb properties (`width`, `height`, `format`, `modifier`) are what
+    // `GETFB2` reports, not a property list.
+    let mut own_ids = [0u32; 1];
+    let mut own = CardRes {
+        fb_id_ptr: own_ids.as_mut_ptr() as u64,
+        count_fbs: 1,
+        ..CardRes::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_GETRESOURCES, 64),
+            (&raw mut own) as *mut c_void,
+        )
+    };
+    check_is(&mut r, "GETRESOURCES answers the fb list", got, 0);
+    check_true(
+        &mut r,
+        "this description sees the framebuffer it made",
+        own.count_fbs == 1 && own_ids[0] == fb_id,
+    );
+
+    let other: OwnedFd = match rustix::fs::open("/dev/dri/card0", OFlags::RDWR, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(e) => {
+            r.check(&format!("a second card description opens ({e:?})"), false);
+            r.finish();
+        }
+    };
+    let mut other_ids = [0u32; 1];
+    let mut theirs = CardRes {
+        fb_id_ptr: other_ids.as_mut_ptr() as u64,
+        count_fbs: 1,
+        ..CardRes::default()
+    };
+    let got = unsafe {
+        ioctl(
+            other.as_raw_fd(),
+            ioc_d(NR_GETRESOURCES, 64),
+            (&raw mut theirs) as *mut c_void,
+        )
+    };
+    check_is(
+        &mut r,
+        "the second description's GETRESOURCES succeeds",
+        got,
+        0,
+    );
+    check_true(
+        &mut r,
+        "and it does not see another description's framebuffer",
+        theirs.count_fbs == 0,
+    );
+    drop(other);
+
+    let mut props = ObjGetProperties {
+        obj_id: fb_id,
+        obj_type: OBJECT_FB,
+        ..ObjGetProperties::default()
+    };
+    let got = unsafe {
+        ioctl(
+            fd,
+            ioc_d(NR_OBJ_GETPROPERTIES, 32),
+            (&raw mut props) as *mut c_void,
+        )
+    };
+    check_refused(
+        &mut r,
+        "OBJ_GETPROPERTIES on a framebuffer is EINVAL, as Linux's is",
+        got,
+        Errno::INVAL,
+    );
 
     // SETCRTC crtc_id/fb_id, 64x64 at 0,0. The trailing `drm_mode_modeinfo` is
     // left zeroed: this is the legacy door, and a zeroed mode is "no resize" -

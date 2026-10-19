@@ -175,9 +175,11 @@ One-glance status of the whole roadmap.
   `bind`, `array_size`, `last_level`, `nr_samples` or `flags` a virgl client asks for — the  
   host's GL answered that mismatch with `GL_INVALID_OPERATION` (1282) and dropped kmscube's draws  
   (device pixels for one of its framebuffers: 0 → 4020654, and the three `vrend` lines gone)
-- [ ] [~] a framebuffer object's own properties: `OBJ_GETPROPERTIES` answers for one (an empty  
-  list, which is what keeps a client walking the card working — niri after kmscube needed it),  
-  where Linux publishes `width`, `height`, `format` and `modifier` on an fb (§7.4)
+- [x] a framebuffer is the description's object, and it has no properties: Linux's
+  `GETRESOURCES` walks `file_priv->fbs`, so another client's framebuffer is not in the
+  list at all, and `OBJ_GETPROPERTIES` on an fb is `EINVAL` (`width`/`height`/`format`/
+  `modifier` are `struct drm_framebuffer` fields, reported by `GETFB2`) — the empty-list
+  answer this card used for the device-wide list was the wrong half of both (§7.4, item 68)
 - [x] the picture itself, in the window: **kmscube's cube and weston's desktop are both visible on  
   the GL card** (watched, 2026-10-14) — a client that renders into a client resource and has the  
   kernel scan it out, and a compositor whose pixels are the guest's, each through its own present  

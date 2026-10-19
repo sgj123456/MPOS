@@ -3391,3 +3391,52 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `mpos-kunit 32 passed, 0 failed`, exit 33 (11 of 199 left out by `tests.toml`); aarch64
     `pass=187 fail=0`, `mpos-kunit 32 passed, 0 failed`, `=== END` (12 left out); both machines'
     per-claim lines byte-identical - `t-exit-group` 22, `t-leader-outlived` 6.
+
+## item 68 — a framebuffer is its description's object, and it has no properties
+
+    §7.4's "framebuffer object's own properties" was one note with two premises, and a
+    current host says both are false. The card had answered `OBJ_GETPROPERTIES` for an
+    fb with an empty list, because Linux was believed to publish `width`, `height`,
+    `format` and `modifier` on one; the reading came from the fields of
+    `struct drm_framebuffer`, which are not properties at all.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_drm_fb_owner.c`,
+    `.workbuddy/probe_fb_props.c`, Linux 7.2.11):
+
+    * **the list is the open file description's.** `GETRESOURCES`'s
+      `count_fbs`/`fb_id_ptr` walked `file_priv->fbs` in Linux: a child that made fb 464
+      read `1`/`464`, the parent on a second description read `0`, and after the parent
+      made fb 465 its own list read `1`/`465` while the child's stayed `464`. The
+      crtc/connector/encoder lists beside it are the card's (with the lease filter).
+    * **an fb has no property list.** `OBJ_GETPROPERTIES` on the description's own fb,
+      on another description's, and on the same id under `OBJECT_ANY` all answered
+      **`EINVAL`** (errno 22). `GETFB2` is the request that reports an fb's geometry and
+      format.
+
+    The niri failure the empty list was written for was the first fact, not the second:
+    it walks every id `GETRESOURCES` gives it, and the device-wide list handed it
+    **kmscube's** fb 100 - another client's object, which its own list would not contain
+    on Linux. Answering for it kept the walk alive over a name that should never have
+    been there.
+
+    `get_resources` filters `st.fbs` on `Framebuffer::owner` (the open file description
+    `ADDFB`/`ADDFB2` already record and the release path already prunes), and the
+    `(OBJECT_FB, _)` arm is gone from `obj_get_properties`: the match falls to
+    `_ => None`, which is `EINVAL`. `object_kind` still resolves an fb id, so
+    `OBJECT_ANY` reaches the same refusal Linux gives.
+
+    Pin: **`t-drm`'s four new claims** - `GETRESOURCES answers the fb list`, `this
+    description sees the framebuffer it made`, `and it does not see another
+    description's framebuffer`, and `OBJ_GETPROPERTIES on a framebuffer is EINVAL, as
+    Linux's is` - green on both machines (`ok:` lines byte-identical).
+
+    **Two counterfactuals, one per rule, each with every other pin kept**:
+
+    | reverted | result |
+    |---|---|
+    | the owner filter (the list back to `st.fbs` device-wide) | `pass=187 fail=1`; red: `and it does not see another description's framebuffer` |
+    | the `(OBJECT_FB, _)` empty-list arm restored | `pass=187 fail=1`; red: `OBJ_GETPROPERTIES on a framebuffer is EINVAL, as Linux's is (got 0, want -22)` |
+
+    Gate: x86_64 `pass=188 fail=0 (188 built)`, `mpos-kunit 32 passed, 0 failed`, exit
+    33; aarch64 `pass=187 fail=0`, `mpos-kunit 32 passed, 0 failed`, `=== END`; both
+    machines' `t-drm` blocks byte-identical.
