@@ -55,10 +55,9 @@
 //!   `@/tmp/.X11-unix/X0` - reached for it, which is the measurement that
 //!   retired the old reason ("no target daemon reaches for it"); the rules
 //!   come from `.workbuddy/probe_unix_abstract.c` rather than from a man
-//!   page. Two narrow rules remain this kernel's own: a path with bytes
-//!   *after* its terminator is `EINVAL` here where Linux ignores them, and
-//!   the name is `String`-free bytes for the abstract case but a `String`
-//!   for a path, so the *path* half still refuses non-UTF-8.
+//!   page. One narrow rule remains this kernel's own: the name is
+//!   `String`-free bytes for the abstract case but a `String` for a path,
+//!   so the *path* half still refuses non-UTF-8.
 //! * a bound *stream* socket that was never `listen`ed answers
 //!   `ECONNREFUSED`; Linux's implicit rendezvous at a socket nobody
 //!   listened on is state this kernel declines to model, and both daemons
@@ -1555,9 +1554,12 @@ pub(crate) enum UnixAddr {
 /// * anything else is a path: NUL-terminated, or the full field with no NUL -
 ///   Linux's one exception for a path that fills the struct.
 ///
-/// A path that has bytes *after* its terminator is still `EINVAL` here and
-/// ignored on Linux; that divergence is named in the module header rather than
-/// served, because the bytes after a terminator are not part of any name.
+/// A path's bytes *after* its terminator are ignored, because Linux's
+/// `unix_mkname` takes `strnlen` and stops there: they are the caller's
+/// storage, not part of the name. Measured (`.workbuddy/probe_unix_path_tail.c`,
+/// Linux 7.2.11): binding `"abc\0XYZ"` succeeds and `getsockname` answers the
+/// six bytes `family + "abc" + NUL`, while a 108-byte field with no NUL is
+/// taken whole and echoed as 111 bytes.
 pub(crate) enum UnixAddrParse {
     Name(UnixAddr),
     Autobind,
@@ -1589,9 +1591,6 @@ pub(crate) fn sockaddr_un_addr(raw: &[u8]) -> Result<UnixAddrParse, isize> {
             return Ok(UnixAddrParse::Name(UnixAddr::Path(name.to_string())));
         }
     };
-    if body[end + 1..].iter().any(|&b| b != 0) {
-        return einval(); // an interior NUL with bytes after it
-    }
     let name = core::str::from_utf8(&body[..end]).map_err(|_| crate::err::EINVAL)?;
     Ok(UnixAddrParse::Name(UnixAddr::Path(name.to_string())))
 }

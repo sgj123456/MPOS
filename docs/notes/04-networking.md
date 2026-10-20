@@ -155,9 +155,11 @@ sender's abstract name reaches the receiver's `recvfrom`; and the reader's lower
 bound moved from `3` to `2`, which is the gate that made the autobind case
 unreachable at first (it was written for the old parser's "family + one NUL").
 
-**Two narrow rules stay named**: a path with bytes *after* its terminator is
-`EINVAL` here where Linux ignores them, and a *path* is still a `String`, so the
-path half refuses non-UTF-8 (the abstract half does not - its name is bytes).
+**One narrow rule stays named**: a *path* is still a `String`, so the path half
+refuses non-UTF-8 (the abstract half does not - its name is bytes). The other
+rule this section used to carry - "a path with bytes *after* its terminator is
+`EINVAL` here where Linux ignores them" - is **gone** (§4.1.5): the `EINVAL`
+was a refusal of a name Linux accepts, and the bytes are the caller's storage.
 
 **Pinned by `t-unix`**, whose old claim said the opposite: the program asserted
 "the abstract namespace answers `EINVAL`" (with a host branch naming Linux's
@@ -306,6 +308,56 @@ Served since: item 80 made a *path* naming another socket type `EPROTOTYPE` whil
 name of another type stays `ECONNREFUSED`, and item 81 made the no-peer seqpacket rows
 `ENOTCONN`, with `sendto`'s 129-byte `EINVAL` and `sendmsg`'s import-only validation pinned
 separately (`t-unix-dgram` 49 -> 57, `t-unix-seqpacket` 69 -> 88 host-run claims).
+
+#### 4.1.5 A path's bytes after its terminator are the caller's storage — **SERVED** (2026-10-22)
+
+§4.1.1's last named divergence, and the one shape a socket library gets wrong by
+refusing rather than by omitting. Linux's `unix_mkname` is `strnlen(sun_path, len)`
+over the caller's `addrlen`: a path **ends** at the first NUL, and whatever the
+caller left behind it is storage, not part of the name. This kernel answered
+`EINVAL` - an error for a name Linux serves, which is the wrong shape a caller
+cannot fall back from (AGENTS.md §3).
+
+**Measured whole on a current host first** (`.workbuddy/probe_unix_path_tail.c`,
+Linux 7.2.11), one fresh name per scenario:
+
+| The address | Linux 7.2.11 |
+|---|---|
+| `"abc"` + NUL + `"XYZ"`, `addrlen` covers all 7 | `bind` 0; `getsockname` answers `family + "abc" + NUL`, `addrlen` 6 |
+| `"abc2"` + NUL + a zero tail, `addrlen` 12 | `bind` 0; `getsockname` `family + "abc2" + NUL`, `addrlen` 7 |
+| `"abc3"`, no NUL, `addrlen` exactly its 4 bytes | `bind` 0; `getsockname` `family + "abc3" + NUL`, `addrlen` 7 |
+| a 107-byte name with no NUL, `addrlen` 2+107 | `bind` 0; `addrlen` answered 110 |
+| the whole 108-byte field non-NUL, `addrlen` 2+108 | `bind` 0; `addrlen` answered **111** - one past the field |
+| `addrlen` 2+109 (past the struct) | `EINVAL` |
+| `connect` to `"abc"` after `"abc\0XYZ"` was bound | `ECONNREFUSED` - the *name* is the prefix, and nothing listened |
+| a datagram `sendto` naming `"abc\0tail"` | `ECONNREFUSED`, the same key |
+| abstract `"\0abc\0XYZ"`, `addrlen` 8 | 0, and `getsockname` echoes **all eight** name bytes - the abstract half is length-delimited, so its NULs *are* the name |
+
+**The rule that fell out is one deletion**: a path is `sun_path` up to its first
+NUL (or the whole field when there is none), and nothing after it is looked at.
+The interior-NUL check in `sockaddr_un_addr` was the only thing standing between
+the parser and that rule; `UnixAddr::Path` already stores the prefix,
+`sockaddr_un_bytes` already writes the prefix plus its own terminator, and
+`bind_path` already keys the table on the resolved *node* - so the node, the
+`EADDRINUSE` arbitration, the `getsockname` echo and the connect all followed
+without a second change. What the deletion did *not* move is the parser's own
+bound: an `addrlen` past the struct is still `EINVAL`, and it is pinned as its
+own claim.
+
+**Pinned by `t-unix`**, 74 → 80 claims: the tail bind, its short echo, the node
+being the prefix's (and *not* `…sockXYZ`), a second bind of the bare prefix
+answering `EADDRINUSE`, the listener accepting a connection spelled with the same
+trailing bytes, and the 108-byte field's whole-field echo with its 111-byte
+`addrlen`. The last one is what a host run is for: a first draft claimed the
+reported terminator was *written*, and Linux writes only `min(len, ulen)` bytes
+while still reporting 111 - so the echoed bytes are the field and only the count
+is one longer. Every claim green on a current host first (`MPOS_ON_HOST=1`, 80 of
+80), and the same 80 `ok:` lines on both machines.
+
+**What stays named** is the one thing this item did not touch: the path half is
+still a `String`, so a path that is not UTF-8 is refused here where Linux takes
+any bytes. That is a type change (`UnixAddr::Path(Vec<u8>)` and every path door
+under it), not a rule, and §4.1.1 names it beside the parser.
 
 ### 4.2 ICMP Improvements — **DONE**
 

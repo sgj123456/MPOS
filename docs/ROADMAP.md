@@ -30,7 +30,8 @@ One-glance status of the whole roadmap.
 **Networking (Phase 4)**
 
 - [x] 4.1 AF_UNIX — both socket types, with per-message credentials and fd passing; the  
-  abstract namespace is served, `unshare`-free lifetime and all (`t-unix`, §4.1.1)
+  abstract namespace is served, `unshare`-free lifetime and all (`t-unix`, §4.1.1) — and  
+  a path ends at its first NUL, the bytes behind it being the caller's storage (§4.1.5)
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
 - [ ] [~] 4.3 TCP — loopback, listener, `SO_REUSEADDR` and `SO_LINGER{on,0}`'s reset done; buffer sizes are Linux's numbers, with `SO_RCVBUF` not sizing the ring (§4.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)

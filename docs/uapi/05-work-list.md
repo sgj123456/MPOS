@@ -4359,3 +4359,52 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `pass=192 fail=1`, exactly the 17 message-door claims red with `ENOTSOCK` (88),
     while `write` stays green at `ENOTCONN` - the byte door was never the gap. The
     sweep completes because every claim refuses immediately.
+
+## item 82 — A `sockaddr_un` path ends at its first NUL, and the bytes after it are storage
+
+    §4.1.1's last named divergence, and the only one in the AF_UNIX family that was
+    an *error* rather than a gap: the parser answered `EINVAL` for a path carrying
+    bytes behind its terminator, which Linux accepts. Linux's `unix_mkname` is
+    `strnlen(sun_path, len)` over the caller's `addrlen`, so a path ends at the
+    first NUL and whatever follows is the caller's own storage.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_unix_path_tail.c`,
+    Linux 7.2.11, one fresh name per scenario):
+
+    * `"abc"` + NUL + `"XYZ"` under an `addrlen` covering all of it: `bind` 0, and
+      `getsockname` answers `family + "abc" + NUL` with `addrlen` 6;
+    * a 108-byte field with **no NUL anywhere** binds whole, and the reported
+      `addrlen` is **111** - one past the field - because `move_addr_to_user` copies
+      `min(len, ulen)` bytes and reports the used length regardless;
+    * `addrlen` 2+109 (past the struct) is `EINVAL`, which is the parser's own bound
+      and not part of this rule;
+    * a `connect` spelled with the same trailing bytes reaches the listener, and
+      `"abc"` alone answers `ECONNREFUSED`: the key is the prefix, and nothing was
+      listening there;
+    * an **abstract** name is length-delimited, so `"\0abc\0XYZ"` has interior NULs
+      that *are* its name and echoes all eight bytes - the half this rule must not
+      touch.
+
+    Served by deleting the interior-NUL refusal in `net::unix::sockaddr_un_addr`.
+    Everything below the parser already agreed with Linux and needed no change:
+    `UnixAddr::Path` stores the prefix, `sockaddr_un_bytes` writes the prefix plus
+    its own terminator, and `bind_path` keys the table on the resolved *node*, so
+    the `EADDRINUSE` arbitration and the `getsockname` echo followed for free.
+
+    **Pins**: `t-unix`, 74 -> 80 claims - the tail bind, its short echo, the node
+    being the prefix's (and *not* `…sockXYZ`), a second bind of the bare prefix
+    answering `EADDRINUSE`, a connection spelled with the same trailing bytes
+    accepted, and the full 108-byte field's whole-field echo with its 111-byte
+    `addrlen`. All six green on a current host first (`MPOS_ON_HOST=1`, 80 of 80),
+    and the same 80 `ok:` lines on both machines. The first draft claimed the
+    reported terminator was *written* into the caller's field and failed on the
+    host - which is what a host run is for.
+
+    Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32
+    passed, 0 failed on both. Counterfactual (the refusal restored, every pin kept):
+    the six new claims go red, the bind one first with `EINVAL` (22), and the
+    short-circuited accept keeps the sweep moving.
+
+    **What stays named**: the path half is still a `String`, so a non-UTF-8 *path*
+    is refused here where Linux takes any bytes. That is a type change
+    (`UnixAddr::Path(Vec<u8>)` and every path door under it), not a rule.

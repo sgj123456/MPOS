@@ -81,6 +81,24 @@ Section numbers are unchanged from the original `UAPI.md`.
   through `recvmsg` here where Linux answers `EAGAIN` (the existing `empty_handover` trade).
   (`NETLINK` and `AF_PACKET` were served by item 77, the bullet above.)
 
+- **A `sockaddr_un` path ends at its first NUL, and the bytes after it are the caller's
+  storage.** **Landed 2026-10-22** (`docs/uapi/` §5.1 item 82) - the last divergence §4.1.1
+  carried, and the one shape that was an *error* rather than a gap: `bind`/`connect`/`sendto`
+  answered `EINVAL` for an address Linux serves, so a caller got a refusal it could not fall
+  back from. Measured whole on a current host first (`.workbuddy/probe_unix_path_tail.c`, Linux
+  7.2.11): `bind` with `"abc"` + NUL + `"XYZ"` succeeds and `getsockname` answers
+  `family + "abc" + NUL` (six bytes); a 108-byte field with no NUL anywhere is taken whole and
+  reported as **111** bytes, one past the field, because `move_addr_to_user` copies
+  `min(len, ulen)` and reports the used length; a `connect` spelled with the same trailing bytes
+  reaches that listener, and `"abc"` alone does not (the name is the prefix); an abstract name is
+  length-delimited, so its interior NULs *are* the name and it echoes all of them. Served by
+  deleting the interior-NUL refusal in `net::unix::sockaddr_un_addr` - the parser's own bound
+  (`addrlen` past the struct is still `EINVAL`) and everything below it already agreed with
+  Linux. Pin: **`t-unix`**, 74 → 80 claims, green on a host first and `ok:` for `ok:` identical
+  on both machines. Gate: x86_64 `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit`
+  32/0 on both. Named: the path half is still a `String`, so a non-UTF-8 *path* is refused here
+  where Linux takes any bytes - a type change, not a rule.
+
 - **Real `MSG_PEEK` over TCP/UDP is served, and `MSG_TRUNC` is the message's own length.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet this replaces said the flag
   was refused `EOPNOTSUPP` because serving it needed peek-preserving delivery in the stack; the

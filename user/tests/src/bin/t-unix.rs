@@ -426,6 +426,140 @@ fn main() {
             got == Err(Errno::NOENT) || got == Err(Errno::NOTDIR),
         );
     }
+
+    // --- a path's bytes after its terminator -----------------------------
+    //
+    // Linux's `unix_mkname` takes `strnlen` and stops at the first NUL, so
+    // whatever the caller left after the terminator is storage, not part of
+    // the name. Measured on a current host first
+    // (`.workbuddy/probe_unix_path_tail.c`, Linux 7.2.11): `bind` succeeds,
+    // `getsockname` echoes the prefix with the short length, the node on disk
+    // is the prefix's, and a connection spelled with the same trailing bytes
+    // reaches the listener. The 108-byte boundary is the other half of the
+    // same rule - a field with no NUL at all is taken whole - and `addrlen`
+    // past the struct is the one `EINVAL` the parser still owes.
+    let tail_path = "/tmp/t-unix-tail.sock";
+    let tail_prefix = b"/tmp/t-unix-tail.sock";
+    let _ = unlinkat(CWD, tail_path, AtFlags::empty());
+    let _ = unlinkat(CWD, "/tmp/t-unix-tail.sockXYZ", AtFlags::empty());
+    let tail_addr = |extra: &[u8]| {
+        let mut st = Storage {
+            family: 1,
+            pad: [0; 108],
+        };
+        st.pad[..tail_prefix.len()].copy_from_slice(tail_prefix);
+        // `pad` is zeroed, so the byte after the name is the terminator; the
+        // caller's extra bytes sit behind it, exactly like the probe's
+        // literal `"abc\0XYZ"`.
+        st.pad[tail_prefix.len() + 1..tail_prefix.len() + 1 + extra.len()].copy_from_slice(extra);
+        st
+    };
+    let with_tail = tail_addr(b"XYZ");
+    let exact = tail_addr(b"");
+    let tail_fd = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    r.check(
+        "a path with bytes after its terminator binds",
+        bind_raw(
+            tail_fd.as_raw_fd(),
+            &with_tail,
+            (2 + tail_prefix.len() + 1 + 3) as u32,
+        ) == 0,
+    );
+    let mut tail_echo = Storage {
+        family: 0,
+        pad: [0; 108],
+    };
+    let mut tail_echo_len = 128u32;
+    let echoed = getsockname_raw(tail_fd.as_raw_fd(), &mut tail_echo, &mut tail_echo_len);
+    r.check(
+        "and getsockname echoes the name before it",
+        echoed == 0
+            && tail_echo_len as usize == 2 + tail_prefix.len() + 1
+            && tail_echo.pad[..tail_prefix.len()] == tail_prefix[..],
+    );
+    r.check(
+        "the node it planted is the prefix, not the tail",
+        stat(tail_path).is_ok() && stat("/tmp/t-unix-tail.sockXYZ").is_err(),
+    );
+    let tail_second = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    r.check(
+        "so a second bind of the prefix is EADDRINUSE",
+        bind_raw(
+            tail_second.as_raw_fd(),
+            &exact,
+            (2 + tail_prefix.len() + 1) as u32,
+        ) == -libc::EADDRINUSE as isize,
+    );
+    r.check(
+        "the trailing-garbage listener listens",
+        listen(&tail_fd, 4).is_ok(),
+    );
+    let tail_cli = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    let tail_connected = connect_raw(
+        tail_cli.as_raw_fd(),
+        &with_tail,
+        (2 + tail_prefix.len() + 1 + 3) as u32,
+    ) == 0;
+    r.check(
+        "a connect spelled with the same trailing bytes reaches it",
+        tail_connected,
+    );
+    r.check(
+        "and the listener accepts that connection",
+        // Short-circuited: a kernel that refused the bind never completed the
+        // connect, and a blocking accept there would park the sweep instead
+        // of turning the claim red.
+        tail_connected && accept_with(&tail_fd, SocketFlags::empty()).is_ok(),
+    );
+    drop(tail_cli);
+    drop(tail_fd);
+    let _ = unlinkat(CWD, tail_path, AtFlags::empty());
+
+    // A field with no NUL anywhere is the *whole* field, and the echo is one
+    // byte longer than the field because Linux appends its own terminator -
+    // except that the terminator has nowhere to land: `move_addr_to_user`
+    // copies `min(len, ulen)` and reports the used length, so a 108-byte
+    // `sun_path` comes back full and the count still says 111.
+    let mut full_name = [b'f'; 108];
+    full_name[..5].copy_from_slice(b"/tmp/");
+    let mut full = Storage {
+        family: 1,
+        pad: [0; 108],
+    };
+    full.pad.copy_from_slice(&full_name);
+    let full_fd = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    r.check(
+        "a 108-byte field with no NUL binds whole",
+        bind_raw(full_fd.as_raw_fd(), &full, 2 + 108) == 0,
+    );
+    let mut full_echo = Storage {
+        family: 0,
+        pad: [0; 108],
+    };
+    let mut full_echo_len = 128u32;
+    let full_echoed = getsockname_raw(full_fd.as_raw_fd(), &mut full_echo, &mut full_echo_len);
+    r.check(
+        "a full-field bind reports the field plus one NUL",
+        full_echoed == 0 && full_echo_len as usize == 2 + 108 + 1,
+    );
+    r.check(
+        "and copies only what the caller's field holds",
+        full_echoed == 0 && full_echo.pad == full_name,
+    );
+    drop(full_fd);
+    let _ = unlinkat(
+        CWD,
+        core::str::from_utf8(&full_name).unwrap(),
+        AtFlags::empty(),
+    );
+    // `addrlen` past the struct is refused before the name is looked at -
+    // the parser's own bound, and the one refusal this rule leaves standing.
+    let past = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    r.check(
+        "an addrlen past the struct is EINVAL",
+        bind_raw(past.as_raw_fd(), &exact, (2 + 108 + 1) as u32) == -libc::EINVAL as isize,
+    );
+
     let _ = unlinkat(CWD, "/tmp/t-unix-notdir", AtFlags::empty());
 
     // getsockname echoes the bound path, and reports the length used - the
