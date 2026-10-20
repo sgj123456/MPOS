@@ -157,6 +157,16 @@ Section numbers are unchanged from the original `UAPI.md`.
   `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Counterfactual:
   `pass=192 fail=1`, the two unconnected claims red.
 
+- **The "implicit rendezvous" was never Linux's shape.** **Corrected 2026-10-22** (`docs/uapi/`
+  §5.1 item 87). The AF_UNIX module header carried a divergence that was never measured: "a bound
+  stream socket that was never `listen`ed answers `ECONNREFUSED` where Linux meets the caller in an
+  implicit rendezvous". Measured on a current host (`.workbuddy/probe_unix_unlistened{,2}.c`, Linux
+  7.2.11): `SO_ACCEPTCONN` is 0, `connect` is `ECONNREFUSED` (111), the same name connects once
+  `listen` runs, a sequenced-packet socket answers the same, and a bound datagram socket connects
+  without any `listen`. Both machines already agreed; the record was the only thing wrong, and two
+  test claims had been written to accept the invented shape. The claims are now exact on both
+  machines and the divergence list drops the entry.
+
 - **Real `MSG_PEEK` over TCP/UDP is served, and `MSG_TRUNC` is the message's own length.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet this replaces said the flag
   was refused `EOPNOTSUPP` because serving it needed peek-preserving delivery in the stack; the

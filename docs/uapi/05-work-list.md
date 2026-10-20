@@ -4581,3 +4581,37 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     every pin kept): `pass=192 fail=1`, and the two red claims are
     `shutdown on an unconnected stream socket answers 0` and
     `shutdown on a datagram socket answers 0`.
+
+## item 87 — The "implicit rendezvous" was never Linux's shape
+
+    The AF_UNIX module header carried a divergence since the family was written:
+    "a bound *stream* socket that was never `listen`ed answers `ECONNREFUSED`;
+    Linux's implicit rendezvous at a socket nobody listened on is state this
+    kernel declines to model". It was a *record*, not a measurement, and it made
+    a correct answer look like a gap - `t-unix-rustix` asserted it as
+    "(divergence: Linux joins)" and `t-unix` accepted either answer under
+    `MPOS_ON_HOST`.
+
+    **Measured on a current host first** (`.workbuddy/probe_unix_unlistened{,2}.c`,
+    Linux 7.2.11):
+
+    * `SO_ACCEPTCONN` on a bound, never-`listen`ed stream socket is 0;
+    * `connect` to it is `ECONNREFUSED` (111);
+    * the same name connects (0) the moment `listen(fd, 4)` runs;
+    * a bound, never-`listen`ed **sequenced-packet** socket is `ECONNREFUSED`
+      too;
+    * a bound **datagram** socket connects (0) - a datagram needs no `listen`.
+
+    So both machines already agreed; what was wrong was the record. `t-unix`'s
+    claim loses its `host_run()` escape and asserts the refusal on every
+    machine, `t-unix-rustix`'s loses the "(divergence: Linux joins)" text, and
+    the module header and §4.1's divergence list drop the entry.
+
+    Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32
+    passed, 0 failed on both.
+
+    **What this is worth recording as**: the trap `AGENTS.md` §5 names - "a
+    recorded measurement is about the machine that made it" - in its other
+    direction. A *claim* that was never measured became a permanent-looking
+    refusal, and two tests were built to accept it. The tell was the claim
+    naming no probe, no register and no run.

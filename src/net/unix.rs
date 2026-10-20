@@ -59,14 +59,16 @@
 //!   `String`-free bytes for the abstract case but a `String` for a path,
 //!   so the *path* half still refuses non-UTF-8.
 //! * a bound *stream* socket that was never `listen`ed answers
-//!   `ECONNREFUSED`; Linux's implicit rendezvous at a socket nobody
-//!   listened on is state this kernel declines to model, and both daemons
-//!   call `listen`. A `listen` with a *zero* backlog is a different thing
-//!   and is modelled: Linux's admission test is `queue_len > backlog`, so
-//!   `listen(fd, 0)` is a queue of one - which is the call eudev's control
-//!   socket makes ([`admits_one_more`] has the measurement). A
-//!   bound *datagram* socket needs no `listen` - there is nothing to
-//!   queue up to; its queue is open from the bind.
+//!   `ECONNREFUSED`, and that is **not** a divergence: unix(7)'s "implicit
+//!   rendezvous" is a shape no current kernel has (measured -
+//!   `.workbuddy/probe_unix_unlistened{,2}.c`: `SO_ACCEPTCONN` 0 and `connect`
+//!   111 for a stream socket and a sequenced-packet one, and the same name
+//!   connects the moment `listen` runs). A `listen` with a *zero* backlog is
+//!   a different thing and is modelled: Linux's admission test is
+//!   `queue_len > backlog`, so `listen(fd, 0)` is a queue of one - which is
+//!   the call eudev's control socket makes ([`admits_one_more`] has the
+//!   measurement). A bound *datagram* socket needs no `listen` - there is
+//!   nothing to queue up to; its queue is open from the bind.
 //! * a datagram queue holds [`RECVQ_MAX`] messages and refuses more with
 //!   `EAGAIN` to the sender; Linux grows the queue against the receiver's
 //!   socket buffer, and one fixed, generous cap is this kernel's shape.

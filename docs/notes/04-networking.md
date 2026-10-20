@@ -22,11 +22,12 @@ socket file. Permissions: bind needs write+search on the parent (the
 mkdirat rule), connect needs `W_OK` on the node.
 
 Deliberate divergences from Linux (each asserted in `t-unix`/
-`t-unix-rustix`): a connect to a
-bound-but-never-listened name is `ECONNREFUSED` rather than Linux's
-implicit rendezvous at a socket nobody listened on; ext4 refuses socket
-nodes (`EOPNOTSUPP` - `/run` is ramfs); `mknod(S_IFSOCK)` still refuses, so
-only `bind` creates a socket name. `SOCK_DGRAM` unix sockets are
+`t-unix-rustix`): ext4 refuses socket nodes (`EOPNOTSUPP` - `/run` is ramfs);
+`mknod(S_IFSOCK)` still refuses, so only `bind` creates a socket name. What
+used to head this list - "a connect to a bound-but-never-listened name is
+`ECONNREFUSED` rather than Linux's implicit rendezvous" - was retired by
+measurement in §4.1.10: Linux refuses it too, so the claim is now Linux's
+answer and not this kernel's shape. `SOCK_DGRAM` unix sockets are
 served whole-message (`t-unix-dgram`), and so is a `SOCK_SEQPACKET` *pair*;
 a *named* `SOCK_SEQPACKET` connection kept no message boundary until item 78,
 which now serves it as the same message pair a `socketpair` half is
@@ -539,6 +540,40 @@ what the claim is about, and `rustix`'s enum cannot spell 3 or -1).
 **Counterfactual** (the `ENOTCONN` arm restored, every pin kept): `pass=192
 fail=1`, and the two red claims are `shutdown on an unconnected stream socket
 answers 0` and `shutdown on a datagram socket answers 0`.
+
+#### 4.1.10 The "implicit rendezvous" was never Linux's shape — **CORRECTED** (2026-10-22)
+
+This module's header carried a divergence since the family was written: "a bound
+*stream* socket that was never `listen`ed answers `ECONNREFUSED`; Linux's
+implicit rendezvous at a socket nobody listened on is state this kernel declines
+to model". It was a *record*, not a measurement, and it made a correct answer
+look like a gap - `t-unix-rustix` asserted it as "(divergence: Linux joins)" and
+`t-unix` accepted either answer under `MPOS_ON_HOST`.
+
+**Measured on a current host first** (`.workbuddy/probe_unix_unlistened{,2}.c`,
+Linux 7.2.11):
+
+| The call | Linux 7.2.11 |
+|---|---|
+| `SO_ACCEPTCONN` on a bound, never-`listen`ed stream socket | 0 |
+| `connect` to it | `ECONNREFUSED` (111) |
+| the same name after `listen(fd, 4)` runs | connects (0) |
+| `connect` to a bound, never-`listen`ed **sequenced-packet** socket | `ECONNREFUSED` (111) |
+| `connect` to a bound **datagram** socket | 0 - a datagram needs no `listen` |
+
+So both machines already agreed; what was wrong was the record. `t-unix`'s claim
+loses its `host_run()` escape and asserts the refusal on every machine,
+`t-unix-rustix`'s claim loses the "(divergence: Linux joins)" text, and the
+module header and §4.1's divergence list drop the entry.
+
+**Pinned by the same claims, tightened**: `t-unix`'s unlistened-connect claim and
+`t-unix-rustix`'s are now exact on both machines rather than forgiving on one.
+
+**What this is worth recording as**: the trap `AGENTS.md` §5 names - "a recorded
+measurement is about the machine that made it" - in its other direction. A
+*claim* that was never measured became a permanent-looking refusal, and two
+tests were built to accept it. The tell was the claim naming no probe, no
+register and no run.
 
 ### 4.2 ICMP Improvements — **DONE**
 

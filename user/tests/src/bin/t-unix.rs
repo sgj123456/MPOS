@@ -1057,9 +1057,13 @@ fn main() {
         Err(e) => Err(*e),
     };
     r.check("binding a never-listened socket succeeds", b.is_ok());
-    // Nonblocking: a connect to a bound-but-never-listened name must answer,
-    // not park (measured: the blocking form hangs on this host's rendezvous
-    // wait before it reaches the refusal).
+    // A connect to a bound-but-never-listened name is `ECONNREFUSED`, and that
+    // is Linux's answer rather than this kernel's: unix(7)'s "implicit
+    // rendezvous" is a shape no current kernel has (measured -
+    // `.workbuddy/probe_unix_unlistened{,2}.c`: `SO_ACCEPTCONN` 0 and `connect`
+    // 111 for a stream socket and a sequenced-packet one, and the same name
+    // connects the moment `listen` runs). The nonblocking spelling keeps the
+    // claim from parking on a kernel that did model the rendezvous.
     let reacher = socket_with(
         AddressFamily::UNIX,
         SocketType::STREAM,
@@ -1070,7 +1074,7 @@ fn main() {
         let c = connect(reacher, &na);
         r.check(
             "connect to a bound, unlistened name is ECONNREFUSED",
-            mpos_user_tests::host_run() || c == Err(Errno::CONNREFUSED),
+            c == Err(Errno::CONNREFUSED),
         );
         // An unconnected unix socket reads as ENOTCONN - the answer the file
         // doors owe a socket whose channel is not there. On a host where the

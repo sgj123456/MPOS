@@ -110,15 +110,17 @@ fn main() {
         r.check("listen opens the queue", true);
     }
 
-    // A bound, never-listened name: Linux would meet the caller in an
-    // implicit backlog-0 rendezvous; this kernel says refused - the
-    // divergence the milestone records, asserted rather than discovered.
+    // A bound, never-listened name is refused - and it is *not* a divergence:
+    // unix(7)'s "implicit rendezvous" is a shape Linux does not have either,
+    // measured on a current host (`SO_ACCEPTCONN` 0, `connect` `ECONNREFUSED`
+    // 111, for a stream socket and a sequenced-packet one alike), so both
+    // machines agree and the claim is Linux's answer.
     let lone = unix_stream().expect("lone socket");
     bind(&lone, &other_addr).expect("bind the second name");
     let probe = unix_stream().expect("probe socket");
     let err = connect(&probe, &other_addr).unwrap_err();
     r.check_errno(
-        "connect to a bound, unlistened name is ECONNREFUSED (divergence: Linux joins)",
+        "connect to a bound, unlistened name is ECONNREFUSED",
         err,
         Errno::CONNREFUSED,
     );
