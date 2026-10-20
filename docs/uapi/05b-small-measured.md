@@ -136,6 +136,17 @@ Section numbers are unchanged from the original `UAPI.md`.
   **`t-unix`** 90 → 91. Gate: x86_64 `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit`
   32/0 on both. Counterfactual: `pass=192 fail=1`, the second-connect claim red with `EISCONN`.
 
+- **`listen` is the named call, and a connected socket is not a listener.** **Landed 2026-10-22**
+  (`docs/uapi/` §5.1 item 85). `listen` accepted anything that was not a datagram socket, so a
+  fresh unbound stream socket opened a queue nothing could reach. Measured on a current host first
+  (`.workbuddy/probe_unix_listen{,2}.c`, Linux 7.2.11): an unbound `SOCK_STREAM` or
+  `SOCK_SEQPACKET` socket is `EINVAL` (22); a bound or abstract-bound one is 0, as is a second
+  `listen`; a **connected** socket and an **accepted** end are `EINVAL`; and a datagram socket,
+  bound or not, is `EOPNOTSUPP` (95). Served by two refusals in `net::unix::listen` - no address,
+  and a channel. Pin: **`t-unix`** 91 → 96 claims. Gate: x86_64 `pass=193 fail=0`, aarch64
+  `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Counterfactual: `pass=192 fail=1`, the two unbound
+  claims red.
+
 - **Real `MSG_PEEK` over TCP/UDP is served, and `MSG_TRUNC` is the message's own length.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet this replaces said the flag
   was refused `EOPNOTSUPP` because serving it needed peek-preserving delivery in the stack; the

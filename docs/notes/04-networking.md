@@ -471,6 +471,42 @@ kept): `pass=192 fail=1`, and the one red claim is `t-unix-dgram`'s
 `a datagram socket connects a second time, and its peer moves (got Socket is
 connected (os error 106))`.
 
+#### 4.1.8 `listen` is the named call, and a connected socket is not a listener — **SERVED** (2026-10-22)
+
+`listen` accepted anything that was not a datagram socket: a fresh, unbound
+stream socket opened an accept queue nothing could ever reach. Linux's
+`unix_listen` asks the socket's **address** first and answers `EINVAL` when
+there is none, and asks its **state** as well, so a connected socket and an
+accepted end are refused too.
+
+**Measured whole on a current host first** (`.workbuddy/probe_unix_listen.c`,
+`probe_unix_listen2.c`, Linux 7.2.11):
+
+| The call | Linux 7.2.11 |
+|---|---|
+| `listen` on a fresh, unbound `SOCK_STREAM` socket | `EINVAL` (22) |
+| `listen` on a fresh, unbound `SOCK_SEQPACKET` socket | `EINVAL` (22) |
+| `listen` on a bound stream socket | 0 |
+| `listen` on an **abstract**-bound stream socket | 0 - the rule is the address, not the filesystem |
+| `listen` again | 0 - it only replaces the backlog |
+| `listen` with a negative backlog / with 0 | 0 |
+| `listen` on a **connected** stream socket | `EINVAL` |
+| `listen` on an **accepted** end | `EINVAL` |
+| `listen` on a datagram socket, bound or not | `EOPNOTSUPP` (95) |
+
+**The fix is two refusals in `net::unix::listen`**: a socket with no address
+(`local_addr().is_none()`) is `EINVAL`, and so is one with a channel
+(`end_of().is_some()`). The datagram refusal was already there and already
+Linux's number; it is now pinned bound and unbound rather than only unbound.
+
+**Pinned by `t-unix`** 91 → 96 claims: the two unbound refusals, the datagram
+one, an abstract-bound socket listening (the address and not the path), and a
+second `listen` succeeding on a bound socket.
+
+**Counterfactual** (both new refusals removed, every pin kept): `pass=192
+fail=1`, and the red claims are `listen on an unbound stream socket is EINVAL`
+and `listen on an unbound seqpacket socket is EINVAL`.
+
 ### 4.2 ICMP Improvements — **DONE**
 
 `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` is served by a raw smoltcp socket

@@ -1544,9 +1544,27 @@ fn accept_blocking_step(_sock: &UnixSock) -> AcceptStep {
 pub(crate) fn listen(sock: &UnixSock, backlog: i32) -> Result<(), isize> {
     // `listen` is the stream call: it opens an accept queue, and a
     // datagram socket has no such thing - its queue is its queue, already
-    // open from the moment the socket was. Linux answers `EOPNOTSUPP`.
+    // open from the moment the socket was. Linux answers `EOPNOTSUPP` (95),
+    // bound or not (measured on a current host).
     if sock.typ == SOCK_DGRAM {
         return Err(err::EOPNOTSUPP);
+    }
+    // And it is the *named* call: Linux's `unix_listen` asks
+    // `unix_sk(sk)->addr` and answers `EINVAL` (22) when there is none, so a
+    // listener is always reachable by something. Measured on a current host
+    // for a fresh stream socket and a fresh sequenced-packet one alike; a
+    // socket that has an address - bound, abstract-bound, autobound - listens,
+    // and so does one that is already listening (a second `listen` only
+    // replaces the backlog).
+    if sock.local_addr().is_none() {
+        return Err(err::EINVAL);
+    }
+    // A *connected* socket is not a listener either: Linux asks the state and
+    // answers `EINVAL` for a connected stream socket and for an accepted end
+    // (measured), which are the two shapes that reach here with an address and
+    // a channel.
+    if sock.end_of().is_some() {
+        return Err(err::EINVAL);
     }
     let cap = clamp_backlog(backlog);
     critical_section::with(|cs| {

@@ -562,6 +562,69 @@ fn main() {
 
     let _ = unlinkat(CWD, "/tmp/t-unix-notdir", AtFlags::empty());
 
+    // --- `listen` is the *named* call --------------------------------
+    //
+    // Linux's `unix_listen` asks the socket's address and answers `EINVAL`
+    // when there is none, so a listener is always reachable by something; a
+    // datagram socket has no accept queue at all and answers `EOPNOTSUPP`
+    // (95), bound or not. A connected socket and an accepted end are `EINVAL`
+    // too - they have an address and a channel, and neither is a listener.
+    // Measured on a current host first (`.workbuddy/probe_unix_listen{,2}.c`,
+    // Linux 7.2.11).
+    let unbound_stream = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    r.check(
+        "listen on an unbound stream socket is EINVAL",
+        listen(&unbound_stream, 4) == Err(Errno::INVAL),
+    );
+    drop(unbound_stream);
+    let unbound_packet = socket(AddressFamily::UNIX, SocketType::SEQPACKET, None).unwrap();
+    r.check(
+        "listen on an unbound seqpacket socket is EINVAL",
+        listen(&unbound_packet, 4) == Err(Errno::INVAL),
+    );
+    drop(unbound_packet);
+    let dgram = socket(AddressFamily::UNIX, SocketType::DGRAM, None).unwrap();
+    r.check(
+        "listen on a datagram socket is EOPNOTSUPP",
+        listen(&dgram, 4) == Err(Errno::OPNOTSUPP),
+    );
+    drop(dgram);
+    // An abstract-bound socket has an address, so it listens - the rule is
+    // the address and not the filesystem.
+    let abs_listen = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    let mut abs_addr = Storage {
+        family: 1,
+        pad: [0; 108],
+    };
+    abs_addr.pad[0] = 0;
+    abs_addr.pad[1..12].copy_from_slice(b"t-unix-lstn");
+    r.check(
+        "an abstract-bound socket listens",
+        bind_raw(abs_listen.as_raw_fd(), &abs_addr, 3 + 11) == 0 && listen(&abs_listen, 4).is_ok(),
+    );
+    drop(abs_listen);
+    // A second `listen` only replaces the backlog.
+    let twice = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    let mut twice_addr = Storage {
+        family: 1,
+        pad: [0; 108],
+    };
+    let twice_name = b"/tmp/t-unix-twice.sock";
+    twice_addr.pad[..twice_name.len()].copy_from_slice(twice_name);
+    let _ = unlinkat(CWD, "/tmp/t-unix-twice.sock", AtFlags::empty());
+    r.check(
+        "a bound socket listens, and a second listen only replaces the backlog",
+        bind_raw(
+            twice.as_raw_fd(),
+            &twice_addr,
+            (2 + twice_name.len() + 1) as u32,
+        ) == 0
+            && listen(&twice, 4).is_ok()
+            && listen(&twice, 8).is_ok(),
+    );
+    drop(twice);
+    let _ = unlinkat(CWD, "/tmp/t-unix-twice.sock", AtFlags::empty());
+
     // --- the three addresses a socket can answer with --------------------
     //
     // Linux keeps "what is my address" and "did `bind` plant a name" apart,

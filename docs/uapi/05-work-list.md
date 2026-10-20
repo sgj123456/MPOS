@@ -4516,3 +4516,39 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     both types, every pin kept): `pass=192 fail=1`, and the one red claim is
     `a datagram socket connects a second time, and its peer moves (got Socket is
     connected (os error 106))`.
+
+## item 85 — `listen` is the named call, and a connected socket is not a listener
+
+    `listen` accepted anything that was not a datagram socket: a fresh, unbound
+    stream socket opened an accept queue nothing could ever reach. Linux's
+    `unix_listen` asks the socket's **address** first - `EINVAL` when there is
+    none - and its **state** as well, so a connected socket and an accepted end
+    are refused too.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_unix_listen.c`,
+    `probe_unix_listen2.c`, Linux 7.2.11):
+
+    * `listen` on a fresh, unbound `SOCK_STREAM` or `SOCK_SEQPACKET` socket is
+      `EINVAL` (22);
+    * on a bound one, and on an **abstract**-bound one, it is 0 - the rule is
+      the address and not the filesystem;
+    * a second `listen` is 0 and only replaces the backlog; a negative backlog
+      and 0 are 0 too;
+    * on a **connected** stream socket and on an **accepted** end it is
+      `EINVAL`;
+    * on a datagram socket, bound or not, it is `EOPNOTSUPP` (95).
+
+    Served by two refusals in `net::unix::listen`: no address
+    (`local_addr().is_none()`) is `EINVAL`, and a channel
+    (`end_of().is_some()`) is `EINVAL`. The datagram refusal was already
+    Linux's number and is now pinned bound and unbound rather than only
+    unbound.
+
+    **Pins**: `t-unix` 91 -> 96 claims - the two unbound refusals, the datagram
+    one, an abstract-bound socket listening, and a second `listen` succeeding.
+
+    Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32
+    passed, 0 failed on both. Counterfactual (both refusals removed, every pin
+    kept): `pass=192 fail=1`, and the red claims are
+    `listen on an unbound stream socket is EINVAL` and
+    `listen on an unbound seqpacket socket is EINVAL`.
