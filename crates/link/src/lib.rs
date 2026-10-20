@@ -282,6 +282,12 @@ impl Frames {
         self.queue.pop_front()
     }
 
+    /// The oldest queued frame, cloned rather than taken - the look a
+    /// `MSG_PEEK` asks for. The next [`pop`](Self::pop) answers it again.
+    pub fn peek(&self) -> Option<Frame> {
+        self.queue.front().cloned()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
@@ -437,6 +443,25 @@ mod tests {
         assert_eq!(ring.pop().expect("the newest").0, vec![2]);
         assert!(ring.pop().is_none());
         assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn a_peek_shows_the_front_and_leaves_the_queue_alone() {
+        // `MSG_PEEK`'s half of the receive contract, at the ring: looking is
+        // repeatable, the next look answers the same frame, and the pop after
+        // them is still that frame - a peek that took would give the caller a
+        // number and lose the message it asked about.
+        let mut ring = Frames::new();
+        assert!(ring.peek().is_none());
+
+        ring.push((vec![1], [0; 6], 1));
+        ring.push((vec![2], [0; 6], 2));
+
+        assert_eq!(ring.peek().expect("the oldest").0, vec![1]);
+        assert_eq!(ring.peek().expect("still there").0, vec![1]);
+        assert_eq!(ring.len(), 2);
+        assert_eq!(ring.pop().expect("the one that was looked at").0, vec![1]);
+        assert_eq!(ring.peek().expect("the new front").0, vec![2]);
     }
 
     #[test]

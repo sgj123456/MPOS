@@ -731,12 +731,12 @@ fn dontwait(fd: i32, flags: usize) -> bool {
 /// back as `EINTR` (the error arm) rather than being slept through - a
 /// netlink reader with an event loop is the ordinary caller of this family,
 /// and `ip`'s own retry loop is one.
-fn rtnl_answer(handle: usize, flags: usize, fd: i32) -> Result<Option<Vec<u8>>, isize> {
+fn rtnl_answer(handle: usize, flags: usize, fd: i32, look: bool) -> Result<Option<Vec<u8>>, isize> {
     let dontwait = flags & MSG_DONTWAIT != 0 || fd_status(fd) & crate::vfs::file::O_NONBLOCK != 0;
     if dontwait && !crate::net::rtnl::ready(handle) {
         return Ok(None);
     }
-    crate::net::rtnl::recv_blocking(handle).map_err(crate::uaccess::err_of)
+    crate::net::rtnl::recv_blocking(handle, look).map_err(crate::uaccess::err_of)
 }
 
 /// A route-netlink socket: a queue of answers to the dump requests its
@@ -908,7 +908,8 @@ fn park_until_deadline(ready: impl Fn() -> bool, deadline: u64) -> isize {
 ///     too, and drops a message whose sender is not root. So a peer's message
 ///     carries the peer's real ids, and no message can claim an origin it did
 ///     not come from.
-///   * `msg_flags`, cleared: nothing here is truncated or exceptional.
+///   * `msg_flags`, carrying `MSG_TRUNC` when the copy was cut - whether or
+///     not the caller asked for that report.
 fn recvmsg_netlink(
     msghdr: usize,
     buf: usize,
@@ -917,6 +918,8 @@ fn recvmsg_netlink(
     namelen: u32,
     handle: usize,
     dontwait: bool,
+    peek: bool,
+    truncate: bool,
 ) -> isize {
     // A blocking read on an empty queue *waits*: that is what a device listener
     // is - udevd's workers and `udevadm monitor` park here between events and
@@ -947,7 +950,11 @@ fn recvmsg_netlink(
     // on receiving the same bytes, the initramfs stopped finding its block
     // devices at all. A listener that wants a netlink frame is the open
     // question; the boot is not the place to answer it.
-    let Some(message) = crate::uevent::recv(handle) else {
+    let Some(message) = (if peek {
+        crate::uevent::peek(handle)
+    } else {
+        crate::uevent::recv(handle)
+    }) else {
         return err::EAGAIN;
     };
     let _ = message.seq;
@@ -1004,9 +1011,13 @@ fn recvmsg_netlink(
     }
 
     unsafe {
-        ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(0);
+        // `MSG_TRUNC` is the report a short count cannot make: a block that
+        // did not fit. A peek reports it too - the copy was still short even
+        // though the event stays queued.
+        let flags = if n < event.len() { MSG_TRUNC } else { 0 };
+        ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags as i32);
     }
-    n as isize
+    (if truncate { event.len() } else { n }) as isize
 }
 
 // ---------------------------------------------------------------------------
@@ -2446,8 +2457,13 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
             return err::EFAULT;
         }
         // args[3] is the flags word: `MSG_DONTWAIT` here means the caller
-        // wants an answer only if one is queued.
-        let msg = match rtnl_answer(handle, args[3], fd) {
+        // wants an answer only if one is queued; `MSG_PEEK` leaves the answer
+        // where it is, and `MSG_TRUNC` makes the return the answer's own
+        // length rather than the part that fitted. Measured on a current
+        // host (`.workbuddy/probe_netlink_peek.c`).
+        let peek = args[3] & MSG_PEEK != 0;
+        let truncate = args[3] & MSG_TRUNC as usize != 0;
+        let msg = match rtnl_answer(handle, args[3], fd, peek) {
             Ok(Some(msg)) => msg,
             Ok(None) => return err::EAGAIN,
             // `EINTR`: a signal ended the wait for an answer.
@@ -2467,7 +2483,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
                 }
             }
         }
-        return n as isize;
+        return if truncate { msg.len() } else { n } as isize;
     }
     // A packet socket's receive: one frame per call - the payload only for a
     // `SOCK_DGRAM` socket (the header is the kernel's to add back on a send),
@@ -2481,16 +2497,28 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
         }
-        if args[3] & MSG_PEEK != 0 {
-            return err::EOPNOTSUPP;
-        }
+        // The flag word means here what it means on every other receive door:
+        // `MSG_PEEK` looks at the front frame without taking it, and
+        // `MSG_TRUNC` makes the return the frame's own length. Both were
+        // refused or ignored until this landing; measured on a current host
+        // (`.workbuddy/probe_packet_peek.c`).
+        let peek = args[3] & MSG_PEEK != 0;
+        let truncate = args[3] & MSG_TRUNC as usize != 0;
         let frame = if dontwait(fd, args[3]) {
-            match sock.try_recv() {
+            match if peek {
+                sock.try_peek()
+            } else {
+                sock.try_recv()
+            } {
                 Some(frame) => frame,
                 None => return err::EAGAIN,
             }
         } else {
-            match sock.recv_blocking() {
+            match if peek {
+                sock.peek_blocking()
+            } else {
+                sock.recv_blocking()
+            } {
                 Ok(frame) => frame,
                 // A catchable signal ended the wait for a frame, having taken
                 // nothing - the shape `udhcpc`'s own retry loop is built on,
@@ -2515,7 +2543,7 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
                 }
             }
         }
-        return n as isize;
+        return if truncate { payload.len() } else { n } as isize;
     }
     // The datagram receive: one message per call, the sender's name for
     // the `src_addr` slots - which is the whole reason `recvfrom` exists
@@ -2680,8 +2708,13 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             Err(e) => return e,
         };
         // args[2] is the flags word: `MSG_DONTWAIT` here means the caller
-        // wants an answer only if one is queued.
-        let msg = match rtnl_answer(handle, args[2], fd) {
+        // wants an answer only if one is queued; `MSG_PEEK` leaves the answer
+        // in the queue, and `MSG_TRUNC` makes the return the answer's own
+        // length. Measured on a current host
+        // (`.workbuddy/probe_netlink_peek.c`).
+        let peek = args[2] & MSG_PEEK != 0;
+        let truncate = args[2] & MSG_TRUNC as usize != 0;
+        let msg = match rtnl_answer(handle, args[2], fd, peek) {
             Ok(Some(msg)) => msg,
             Ok(None) => return err::EAGAIN,
             Err(e) => return e,
@@ -2693,7 +2726,8 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         unsafe {
             // `msg_flags` says what a short count cannot: the message did not
             // fit, so the rest of it is gone. Written either way, so a caller
-            // never reads back a stale word.
+            // never reads back a stale word. A `MSG_PEEK` reports the same cut:
+            // the copy was still short even though the message stays.
             let flags = if n < msg.len() { MSG_TRUNC } else { 0 };
             ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags as i32);
             if name != 0 && namelen != 0 {
@@ -2704,7 +2738,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
                 ((msghdr + 8) as *mut u32).write_unaligned(12);
             }
         }
-        return n as isize;
+        return if truncate { msg.len() } else { n } as isize;
     }
     // A packet socket's receive in scatter-gather form: one frame's payload
     // into the caller's whole data room, the sender's *link* address into
@@ -2733,16 +2767,27 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             Ok(room) => room,
             Err(e) => return e,
         };
-        if args[2] & MSG_PEEK != 0 {
-            return err::EOPNOTSUPP;
-        }
+        // The same flag word as every other receive door: `MSG_PEEK` looks at
+        // the front frame without taking it, and `MSG_TRUNC` makes the return
+        // the frame's own length. Measured on a current host
+        // (`.workbuddy/probe_packet_peek.c`).
+        let peek = args[2] & MSG_PEEK != 0;
+        let truncate = args[2] & MSG_TRUNC as usize != 0;
         let frame = if dontwait(fd, args[2]) {
-            match sock.try_recv() {
+            match if peek {
+                sock.try_peek()
+            } else {
+                sock.try_recv()
+            } {
                 Some(frame) => frame,
                 None => return err::EAGAIN,
             }
         } else {
-            match sock.recv_blocking() {
+            match if peek {
+                sock.peek_blocking()
+            } else {
+                sock.recv_blocking()
+            } {
                 Ok(frame) => frame,
                 // A catchable signal ended the wait having taken nothing - the
                 // shape `udhcpc`'s own retry loop is built on.
@@ -2774,11 +2819,12 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             // checksum check, so an empty buffer costs it a check it was
             // prepared to make anyway.
             ((msghdr + MSGHDR_CONTROLLEN) as *mut usize).write_unaligned(0);
-            // `MSG_TRUNC`: the report a short buffer cannot make for itself.
+            // `MSG_TRUNC`: the report a short buffer cannot make for itself -
+            // and a peek reports it too, because the copy was still short.
             let flags = if n < payload.len() { MSG_TRUNC } else { 0 };
             ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags);
         }
-        return n as isize;
+        return if truncate { payload.len() } else { n } as isize;
     }
     // The datagram receive in scatter-gather form: one message into the
     // first iovec (the stack wants contiguity, and a syslog-sized message
@@ -3065,6 +3111,8 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
                 namelen,
                 handle,
                 dontwait(fd, args[2]),
+                args[2] & MSG_PEEK != 0,
+                args[2] & MSG_TRUNC as usize != 0,
             );
             if n < 0 { Err(n) } else { Ok((n as usize, n)) }
         });

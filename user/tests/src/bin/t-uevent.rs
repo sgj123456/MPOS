@@ -40,6 +40,8 @@ const AF_NETLINK: libc::c_int = 16;
 const SOCK_RAW: libc::c_int = 3;
 const NETLINK_KOBJECT_UEVENT: libc::c_int = 15;
 const MSG_DONTWAIT: libc::c_int = 0x40;
+/// `MSG_PEEK`: look at the front without taking it.
+const MSG_PEEK: libc::c_int = 0x02;
 /// The one group kernel-originated events go to: `1 << KOBJ_UEVENT_KERNEL_GROUP`.
 const UEVENT_GROUP_KERNEL: u32 = 1;
 /// The one udev's own monitors use.
@@ -130,7 +132,7 @@ fn receive_from(
     flags: libc::c_int,
     ctl: &mut [u8],
     name: &mut SockAddrNl,
-) -> (isize, u32, usize) {
+) -> (isize, u32, usize, i32) {
     let mut iov = [libc::iovec {
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
@@ -143,7 +145,12 @@ fn receive_from(
     msg.msg_control = ctl.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = ctl.len() as u32;
     let got = fix(unsafe { libc::recvmsg(fd, &mut msg, flags) } as libc::c_long);
-    (got, msg.msg_namelen, msg.msg_controllen as usize)
+    (
+        got,
+        msg.msg_namelen,
+        msg.msg_controllen as usize,
+        msg.msg_flags,
+    )
 }
 
 /// `sendmsg` of one payload to one address, with `namelen` the caller's - the
@@ -250,7 +257,7 @@ fn main() {
     let mut buf = [0u8; 512];
     let mut ctl = [0u8; 128];
     let mut name = SockAddrNl::default();
-    let (got, _, _) = receive_from(fd, &mut buf, MSG_DONTWAIT, &mut ctl, &mut name);
+    let (got, _, _, _) = receive_from(fd, &mut buf, MSG_DONTWAIT, &mut ctl, &mut name);
     r.check(
         "an empty queue answers MSG_DONTWAIT with EAGAIN",
         got == -(libc::EAGAIN as isize),
@@ -277,7 +284,7 @@ fn main() {
     }
     r.check("the announcing child started", pid > 0);
 
-    let (got, _, _) = receive_from(fd, &mut buf, 0, &mut ctl, &mut name);
+    let (got, _, _, _) = receive_from(fd, &mut buf, 0, &mut ctl, &mut name);
     r.check(
         "a blocking recvmsg waits for the event and returns it",
         got > 0,
@@ -366,7 +373,44 @@ fn main() {
     );
 
     let mut small = [0u8; 256];
-    let (got, namelen, controllen) =
+    // The receive doors look without taking, and `MSG_TRUNC` names the block's
+    // own length. Both were ignored here until this landing: a `MSG_PEEK`
+    // consumed the event it was asked to look at, and the return was always
+    // the copy's. Measured on a current host first
+    // (`.workbuddy/probe_netlink_peek.c`, Linux 7.2.11, over a `NETLINK_ROUTE`
+    // dump - the flag word is the socket layer's, so one measurement answers
+    // both netlink families): a peek answers the message's length and leaves
+    // it, a zero-length peek answers 0 and leaves it, a short room answers the
+    // room and consumes, and `msg_flags` carries `MSG_TRUNC` whenever a copy
+    // was cut whether or not the caller asked.
+    let mut look = [0u8; 8];
+    let (peeked, _, _, peek_flags) = receive_from(
+        worker,
+        &mut look,
+        MSG_PEEK | libc::MSG_TRUNC,
+        &mut ctl,
+        &mut name,
+    );
+    r.check(
+        "a peek with MSG_TRUNC answers the block's own length through 8 bytes",
+        peeked == payload.len() as isize,
+    );
+    r.check(
+        "and reports the cut in msg_flags",
+        peek_flags & libc::MSG_TRUNC != 0,
+    );
+    let (looked, _, _, _) = receive_from(worker, &mut small, MSG_PEEK, &mut ctl, &mut name);
+    r.check(
+        "a peek through a room that fits answers the same bytes and leaves them",
+        looked == payload.len() as isize && &small[..payload.len()] == payload,
+    );
+    let (empty, _, _, empty_flags) = receive_from(worker, &mut [], MSG_PEEK, &mut ctl, &mut name);
+    r.check(
+        "a zero-length peek answers 0 and reports the cut",
+        empty == 0 && empty_flags & libc::MSG_TRUNC != 0,
+    );
+
+    let (got, namelen, controllen, _) =
         receive_from(worker, &mut small, MSG_DONTWAIT, &mut ctl, &mut name);
     r.check(
         "the worker receives the handoff whole",
@@ -385,6 +429,20 @@ fn main() {
         credentials(&ctl, controllen)
             .map(|(cred_pid, uid, _gid)| cred_pid == unsafe { libc::getpid() } && uid == 0)
             .unwrap_or(false),
+    );
+
+    // A zero-length receive is the other half of the same rule: it takes the
+    // message and answers 0, and the message word says that a copy was cut.
+    let sent_again = send_to(manager, payload, &nl_addr(theirs.pid, 0), 12);
+    r.check(
+        "a second handoff is accepted",
+        sent_again == payload.len() as isize,
+    );
+    let (empty, _, _, empty_flags) = receive_from(worker, &mut [], 0, &mut ctl, &mut name);
+    let (after, _, _, _) = receive_from(worker, &mut small, MSG_DONTWAIT, &mut ctl, &mut name);
+    r.check(
+        "a zero-length receive answers 0 and consumes the block",
+        empty == 0 && empty_flags & libc::MSG_TRUNC != 0 && after == -(libc::EAGAIN as isize),
     );
 
     // The refusals udev's own error handling is written against: nobody at
@@ -422,12 +480,12 @@ fn main() {
         "a broadcast is accepted",
         send_to(manager, payload, &nl_addr(0, UDEV_GROUP), 12) == payload.len() as isize,
     );
-    let (got, _, _) = receive_from(member, &mut small, MSG_DONTWAIT, &mut ctl, &mut name);
+    let (got, _, _, _) = receive_from(member, &mut small, MSG_DONTWAIT, &mut ctl, &mut name);
     r.check(
         "the group's member is told, on the group it was sent to",
         got == payload.len() as isize && name.groups == UDEV_GROUP,
     );
-    let (nothing, _, _) = receive_from(manager, &mut small, MSG_DONTWAIT, &mut ctl, &mut name);
+    let (nothing, _, _, _) = receive_from(manager, &mut small, MSG_DONTWAIT, &mut ctl, &mut name);
     r.check(
         "and the sender is not told about its own broadcast",
         nothing == -(libc::EAGAIN as isize),

@@ -43,7 +43,12 @@
 //! sweeps.
 
 use mpos_user_tests::{Report, host_run};
-use rustix::net::{AddressFamily, SocketType};
+use rustix::fd::OwnedFd;
+use rustix::io::{Errno, IoSliceMut};
+use rustix::net::netlink::SocketAddrNetlink;
+use rustix::net::{
+    AddressFamily, RecvAncillaryBuffer, RecvFlags, ReturnFlags, SendFlags, SocketType,
+};
 
 // The wire words, spelled as `linux/netlink.h` and `linux/rtnetlink.h` spell
 // them. Identical on both machines - these are not syscall numbers.
@@ -320,6 +325,36 @@ fn mutation_report<F: rustix::fd::AsFd + Copy>(fd: F, req: &Msg) -> isize {
     report_of(&ans, n).unwrap_or(-1) as isize
 }
 
+/// A fresh route socket with one `RTM_GETLINK` dump's answers queued - the
+/// fixture every receive-door claim below starts from, so each one sees the
+/// same two answers in the same order.
+fn socket_with_dump() -> Option<OwnedFd> {
+    let fd = rustix::net::socket(AddressFamily::NETLINK, SocketType::RAW, None).ok()?;
+    rustix::net::bind(&fd, &SocketAddrNetlink::new(0, 0)).ok()?;
+    let req = dump(RTM_GETLINK);
+    rustix::net::send(&fd, &req.buf[..req.len], SendFlags::empty()).ok()?;
+    Some(fd)
+}
+
+/// One `recvmsg` through a single iovec: the syscall's answer, the
+/// `msg_flags` word it left, and the refusal when there was one. The message
+/// word is what a short receive's claim reads - `MSG_TRUNC` there says a copy
+/// was cut, which no return value can.
+fn door(fd: &OwnedFd, buf: &mut [u8], flags: RecvFlags) -> (isize, ReturnFlags, Option<Errno>) {
+    let mut iov = [IoSliceMut::new(buf)];
+    let mut ctl = RecvAncillaryBuffer::default();
+    match rustix::net::recvmsg(fd, &mut iov, &mut ctl, flags) {
+        Ok(msg) => (msg.bytes as isize, msg.flags, None),
+        Err(e) => (-1, ReturnFlags::empty(), Some(e)),
+    }
+}
+
+/// The `ifi_index` a link answer names, at `nlmsghdr` (16) + `ifinfomsg`'s
+/// index (4) - how a claim tells the dump's two answers apart.
+fn answer_index(prefix: &[u8]) -> u32 {
+    u32::from_le_bytes([prefix[20], prefix[21], prefix[22], prefix[23]])
+}
+
 fn main() {
     println!("t-netlink");
     let mut r = Report::new();
@@ -484,5 +519,167 @@ fn main() {
     );
 
     drop(fd);
+
+    // ---------------------------------------------------------------------
+    // The receive doors look without taking, and `MSG_TRUNC` names the
+    // answer's own length.
+    //
+    // Both doors used to ignore the flag word entirely: `recvfrom` popped the
+    // front answer whatever `MSG_PEEK` said and returned `min(len, message)`
+    // whatever `MSG_TRUNC` said, and `recvmsg` did the same behind its iovec
+    // chain. Measured whole on a current host first
+    // (`.workbuddy/probe_netlink_peek.c`, Linux 7.2.11, over a `RTM_GETLINK`
+    // dump, where "was the front taken?" is answered by *which* interface the
+    // next answer names rather than by an empty-queue `EAGAIN` alone):
+    //
+    //   * a peek answers the message's length and leaves it; the plain
+    //     receive after it returns the same message, and a peek is repeatable;
+    //   * a short receive - 8 bytes of a 3020-byte answer - answers 8 and
+    //     *consumes* the message, and the next answer is a different one;
+    //   * `MSG_TRUNC` makes the return the message's own length (3020 through
+    //     an 8-byte room) while the copy stays 8, consumes it if it was not a
+    //     peek, and `msg_flags` carries `MSG_TRUNC` whenever a copy was cut -
+    //     whether or not the caller asked for the flag;
+    //   * a zero-length room answers 0; without the peek it consumes the
+    //     message and with it the message stays, and `msg_flags` reports the
+    //     cut either way;
+    //   * `MSG_DONTWAIT` on a drained queue is `EAGAIN`, peek or not.
+    //
+    // The two answers of a link dump are told apart by `ifi_index` - `lo` at
+    // 1, `eth0` at 2 - so every "consumed?" claim below is a claim about which
+    // message the front is, not merely that the queue emptied.
+    // ---------------------------------------------------------------------
+    let fixture = socket_with_dump();
+    r.check("a fresh route socket queues a link dump", fixture.is_some());
+    if let Some(fd) = fixture {
+        let mut front = [0u8; 64];
+        let (full, flags, err) = door(&fd, &mut front, RecvFlags::PEEK | RecvFlags::TRUNC);
+        let word = u32::from_le_bytes([front[0], front[1], front[2], front[3]]) as isize;
+        r.check(
+            "a peek with MSG_TRUNC answers the answer's own length through 64 bytes",
+            err.is_none() && full == word && full > 64,
+        );
+        r.check(
+            "and says the copy was cut in msg_flags",
+            flags.contains(ReturnFlags::TRUNC),
+        );
+    }
+    if let Some(fd) = socket_with_dump() {
+        let mut front = [0u8; 64];
+        let mut other = [0u8; 64];
+        let (full, _, _) = door(&fd, &mut front, RecvFlags::PEEK | RecvFlags::TRUNC);
+        let (again, _, _) = door(&fd, &mut other, RecvFlags::PEEK | RecvFlags::TRUNC);
+        r.check(
+            "the look is repeatable and takes nothing",
+            again == full && other == front,
+        );
+        let mut take = [0u8; 64];
+        let (n, _, _) = door(&fd, &mut take, RecvFlags::empty());
+        r.check(
+            "the plain receive after the looks answers the same bytes",
+            n == 64 && take == front,
+        );
+        let (_, _, _) = door(&fd, &mut other, RecvFlags::PEEK | RecvFlags::TRUNC);
+        r.check(
+            "and the message it took is gone: the front names another interface",
+            answer_index(&other) != answer_index(&front),
+        );
+    } else {
+        r.check("the look is repeatable and takes nothing", false);
+        r.check(
+            "the plain receive after the looks answers the same bytes",
+            false,
+        );
+        r.check(
+            "and the message it took is gone: the front names another interface",
+            false,
+        );
+    }
+
+    if let Some(fd) = socket_with_dump() {
+        let mut front = [0u8; 64];
+        let mut other = [0u8; 64];
+        let mut small = [0u8; 8];
+        let (_, _, _) = door(&fd, &mut front, RecvFlags::PEEK | RecvFlags::TRUNC);
+        let (n, flags, _) = door(&fd, &mut small, RecvFlags::empty());
+        let (_, _, _) = door(&fd, &mut other, RecvFlags::PEEK | RecvFlags::TRUNC);
+        r.check(
+            "a short receive answers the room and consumes the answer",
+            n == 8 && answer_index(&other) != answer_index(&front),
+        );
+        r.check(
+            "and reports the cut in msg_flags without being asked",
+            flags.contains(ReturnFlags::TRUNC),
+        );
+        let (n, _, _) = door(&fd, &mut small, RecvFlags::TRUNC);
+        r.check(
+            "MSG_TRUNC answers the next answer's own length through the same 8 bytes",
+            n > 8,
+        );
+    } else {
+        r.check(
+            "a short receive answers the room and consumes the answer",
+            false,
+        );
+        r.check(
+            "and reports the cut in msg_flags without being asked",
+            false,
+        );
+        r.check(
+            "MSG_TRUNC answers the next answer's own length through the same 8 bytes",
+            false,
+        );
+    }
+
+    // The zero-length room: a receive that takes the message and answers 0, a
+    // look that leaves it, and the message word's report in both.
+    if let Some(fd) = socket_with_dump() {
+        let mut front = [0u8; 64];
+        let mut other = [0u8; 64];
+        let (_, _, _) = door(&fd, &mut front, RecvFlags::PEEK | RecvFlags::TRUNC);
+        let (n, flags, _) = door(&fd, &mut [], RecvFlags::PEEK);
+        let (_, _, _) = door(&fd, &mut other, RecvFlags::PEEK | RecvFlags::TRUNC);
+        r.check(
+            "a zero-length peek answers 0 and leaves the answer",
+            n == 0 && answer_index(&other) == answer_index(&front),
+        );
+        r.check(
+            "with the cut reported in msg_flags",
+            flags.contains(ReturnFlags::TRUNC),
+        );
+        let (n, flags, _) = door(&fd, &mut [], RecvFlags::empty());
+        let (_, _, _) = door(&fd, &mut other, RecvFlags::PEEK | RecvFlags::TRUNC);
+        r.check(
+            "a zero-length receive answers 0 and consumes it",
+            n == 0 && answer_index(&other) != answer_index(&front),
+        );
+        r.check(
+            "and reports the cut too",
+            flags.contains(ReturnFlags::TRUNC),
+        );
+    } else {
+        r.check("a zero-length peek answers 0 and leaves the answer", false);
+        r.check("with the cut reported in msg_flags", false);
+        r.check("a zero-length receive answers 0 and consumes it", false);
+        r.check("and reports the cut too", false);
+    }
+
+    // `MSG_DONTWAIT` on a drained queue: the wait is the caller's to skip.
+    if let Some(fd) = socket_with_dump() {
+        let mut buf = [0u8; 512];
+        while rustix::net::recv(&fd, &mut buf[..], RecvFlags::DONTWAIT).is_ok() {}
+        let plain = rustix::net::recv(&fd, &mut buf[..], RecvFlags::DONTWAIT);
+        let look = rustix::net::recv(&fd, &mut buf[..], RecvFlags::DONTWAIT | RecvFlags::PEEK);
+        r.check(
+            "MSG_DONTWAIT on a drained queue is EAGAIN, peek or not",
+            plain.err() == Some(Errno::AGAIN) && look.err() == Some(Errno::AGAIN),
+        );
+    } else {
+        r.check(
+            "MSG_DONTWAIT on a drained queue is EAGAIN, peek or not",
+            false,
+        );
+    }
+
     r.finish()
 }

@@ -551,6 +551,23 @@ pub fn recv(id: usize) -> Option<Message> {
     })
 }
 
+/// The next event, cloned rather than taken - the look a `MSG_PEEK` asks for.
+/// The block's bytes are an `Arc` the send shared, so the clone is the same
+/// bytes the receive would hand over, and the queue keeps its slot.
+pub fn peek(id: usize) -> Option<Message> {
+    critical_section::with(|cs| {
+        let subs = SUBSCRIBERS.borrow(cs).borrow();
+        let front = subs.iter().find(|s| s.id == id)?.queue.front()?;
+        Some(Message {
+            seq: front.seq,
+            bytes: Arc::clone(&front.bytes),
+            from_pid: front.from_pid,
+            group: front.group,
+            cred: front.cred,
+        })
+    })
+}
+
 /// Whether this socket has an event waiting - what `poll(2)` reports.
 pub fn ready(id: usize) -> bool {
     critical_section::with(|cs| {

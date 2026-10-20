@@ -578,6 +578,48 @@ the three refusals. **And the boot says the same:** `/dev/input/event0` carries
 keyboard by, and the end of the chain that began with a worker's zero-byte
 message.
 
+#### 4.4.1 The receive doors look without taking — **SERVED** (2026-10-21)
+
+Item 76 closed `AF_UNIX`'s receive flags and named the families beside it. Two of those were
+reading the flag word as nothing at all, and one of the two is this section's: **netlink**.
+`recvfrom` and `recvmsg` on a `NETLINK_ROUTE` socket popped the front answer whatever `MSG_PEEK`
+said, and returned `min(len, message)` whatever `MSG_TRUNC` said; the uevent socket's `recvmsg`
+did the same behind its block. A peek that takes is worse than a peek refused - the caller gets
+a number and loses the message it asked about - which is why this was a *wrong shape* and not a
+smaller feature.
+
+Measured whole on a current host first (`.workbuddy/probe_netlink_peek.c`, Linux 7.2.11, over a
+`RTM_GETLINK` dump, so the queue holds several answers and "was the front taken?" is answered by
+*which interface* the next answer names, not by an empty-queue `EAGAIN` alone):
+
+| The call | Linux 7.2.11 |
+|---|---|
+| `recv(MSG_PEEK, 8192)` on the dump | 3020 (the first answer), and the plain receive after it is the same 3020 bytes |
+| `recvmsg` with `MSG_PEEK`+`MSG_TRUNC`, iov 8 | **3020** - the answer's own length - with `msg_flags` `MSG_TRUNC`; the front is still there |
+| `recvmsg(MSG_TRUNC, iov 8)` | 3020, copies 8, `msg_flags` `MSG_TRUNC`, and **consumes** it (the next plain receive is the second answer, 3436) |
+| `recvmsg(iov 8)`, no flags | 8, `msg_flags` `MSG_TRUNC` **unasked**, consumes |
+| zero-length room, `MSG_PEEK` | 0, `MSG_TRUNC` in `msg_flags`, front still there |
+| zero-length room, plain | 0, `MSG_TRUNC`, front consumed |
+| `MSG_DONTWAIT` on a drained queue | `EAGAIN` |
+
+The same two flags on the same family's *write-half* socket are the rows this section's uevent
+table already carries; the receive half is this landing. The fix is one look per layer, not one
+in the syscall: `rtnl::peek` clones the queue's front and `recv_blocking(handle, look)` gives the
+look the same interruptible park a receive has (`MSG_PEEK` must not turn a blocking read into
+`EAGAIN`); `uevent::peek` clones a `Message`, whose bytes are already an `Arc` the send shared;
+and the doors read the flag word - `handle_recvfrom`'s netlink branch, `handle_recvmsg`'s
+netlink and uevent arms, and `recvmsg_netlink`, which now returns the block's own length when
+`MSG_TRUNC` asked while the scatter wrapper still gets the copy's count, and reports the cut in
+`msg_flags` either way.
+
+**Pins**: `t-netlink`'s 14 new claims on the default sweep (both doors' looks, repeatability,
+the short receive's consume and its `msg_flags`, `MSG_TRUNC`'s return, both zero-length shapes,
+the drained-queue `EAGAIN`) and `t-uevent`'s 5 (the block's own length through 8 bytes, the cut
+in `msg_flags`, the room that fits, a zero-length peek, a zero-length receive that consumes).
+**Gate**: x86_64 `pass=192 fail=0`, `mpos-kunit 32 passed, 0 failed`, exit 33; aarch64
+`pass=191 fail=0`, `mpos-kunit 32 passed, 0 failed`. The external group (which carries the
+`AF_PACKET` door's own four claims in `t-dhcp`) is green at `pass=199 fail=0` (199 built).
+
 ---
 
 ### 4.5 `AF_PACKET` — the link layer as a socket — **CLOSED**
@@ -635,6 +677,33 @@ The named gaps, each with what it waits on:
   The unsupported-type refusal is pinned there too (`SOCK_STREAM` is
   `ESOCKTNOSUPPORT`). `link::frame_payload` carries the host unit test for the
   slice.
+* **Closed (2026-10-21): the receive doors read the flag word — `MSG_PEEK` looks and
+  `MSG_TRUNC` names the frame's own length.** Both were ignored here: every packet door
+  refused `MSG_PEEK` with `EOPNOTSUPP`, and `MSG_TRUNC` changed nothing (the `recvmsg` door set
+  the bit in `msg_flags` but still returned the copy). Measured whole on a current host first
+  (`.workbuddy/probe_packet_peek.c`, Linux 7.2.11), inside
+  `unshare(CLONE_NEWUSER | CLONE_NEWNET)` — the capability the host lacks made the way item
+  74's probe made it — with `lo` up and one frame the socket sends to itself, since loopback
+  hands the skb back through the receive path:
+
+  | The call | Linux 7.2.11 |
+  |---|---|
+  | `recv(MSG_PEEK, 2048)` with a 16-byte frame queued | 16, and the plain receive after it is the same 16 bytes |
+  | `recvmsg` with `MSG_PEEK`+`MSG_TRUNC`, iov 8 | **16** — the frame's own length — with `msg_flags` `MSG_TRUNC`, frame still queued |
+  | `recvmsg(MSG_TRUNC, iov 8)` | 16, copies 8, consumes |
+  | `recvmsg(iov 8)`, no flags | 8, `msg_flags` `MSG_TRUNC` **unasked** |
+  | zero-length room, `MSG_PEEK` / plain | 0 with `MSG_TRUNC`; leaves it / consumes it |
+  | `recv` with `MSG_PEEK`+`MSG_DONTWAIT`, frame queued | 16 |
+
+  Served by `link::Frames::peek` (the ring is `mpos-link`'s, so the look belongs beside `pop`)
+  and `PacketSock::try_peek`/`peek_blocking` in the kernel, with the two doors reading the flag
+  word. **Pinned** by `t-dhcp`'s four new claims — one `recvfrom` and one `recvmsg` peek, each
+  naming the frame's length and each leaving it for the read that follows — and by the
+  `mpos-link` unit test `a_peek_shows_the_front_and_leaves_the_queue_alone`. `t-dhcp` is in the
+  `external` group, so those four claims are the program's own gate rather than the default
+  sweep's; run there, both looks name 576 bytes (the frame's own length) and both leave the same
+  frame for the read after them (`pass=199 fail=0`, 199 built).
+
 * The boot still has no *working* client, and the two halves of that sentence are
   measured separately now (2026-10-12). **The wiring is in the image and runs**:
   `assets/rootfs/core/usr/share/udhcpc/default.script` is the script `ifup` hands

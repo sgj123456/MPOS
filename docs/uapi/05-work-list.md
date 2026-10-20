@@ -4063,3 +4063,84 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     answers `EAGAIN` on every door until bytes arrive - the existing `empty_handover` path
     keeps that deliberate trade (the deadlock it avoids was the datagram udev channel's), and
     this item's measurement is the first thing that charges it.
+
+## item 77 — Netlink's and `AF_PACKET`'s receive doors look without taking, and a truncated answer names its own length
+
+    Item 76's named residual, and the same two flag words on the two families that were not
+    listening to them. `NETLINK_ROUTE`'s `recvfrom`/`recvmsg` **popped the front answer whatever
+    `MSG_PEEK` said** and returned the copy whatever `MSG_TRUNC` said; the uevent socket's
+    `recvmsg` ignored both too; and every `AF_PACKET` door refused `MSG_PEEK` with `EOPNOTSUPP`
+    and ignored `MSG_TRUNC` (its `recvmsg` did set the bit in `msg_flags`, but the return was
+    still the copy). A peek that takes is worse than one that is refused: the caller gets a
+    number and loses the message it asked about.
+
+    **Measured whole on a current host first**, one probe per family, and the rows are the
+    claims:
+
+    * **netlink** (`.workbuddy/probe_netlink_peek.c`, Linux 7.2.11, over a `RTM_GETLINK` dump -
+      several answers queued, so "was the front taken?" is answered by *which* interface the
+      next answer names rather than by an empty queue): a peek answers the front's length and
+      leaves it, and the plain receive after it returns the same bytes; the look is repeatable;
+      a short receive through 8 bytes answers **8** and consumes the answer; `MSG_TRUNC` turns
+      that same short receive into the answer's **own length** (3020 through the 8-byte room)
+      while the copy stays 8, and consumes it when it was not a peek; `msg_flags` carries
+      `MSG_TRUNC` whenever a copy was cut, **whether or not the caller asked**; a
+      zero-length room answers 0, consumes without the peek and leaves the message with it, and
+      reports the cut either way; `MSG_DONTWAIT` on a drained queue is `EAGAIN`, peek or not.
+    * **`AF_PACKET`** (`.workbuddy/probe_packet_peek.c`, Linux 7.2.11, inside
+      `unshare(CLONE_NEWUSER | CLONE_NEWNET)` with `lo` up and one frame the socket sends to
+      itself): the same rule on one frame per call - a 16-byte frame through a 2048-byte
+      buffer peeks as 16 and the plain receive after it is the same 16 bytes; 8 bytes of it
+      with `MSG_TRUNC` peeks as 16 and without the flag answers 8 and consumes; a zero-length
+      room answers 0 with the cut in `msg_flags`, consuming without the peek and leaving the
+      frame with it.
+    * **vsock** (`.workbuddy/probe_vsock_recv.c`, Linux 7.2.11, over `VMADDR_CID_LOCAL` after
+      `modprobe vsock_loopback`) - **measured and not served**, and the measurement is why: a
+      peek *is* served there (ten bytes peek as 10 and the read after it is the same ten),
+      `MSG_TRUNC` is **ignored** (4 of 10 answers 4, copies and consumes the four; peeking the
+      same way also answers 4, not 10), the **whole iovec chain** is used (4+4+2 answers 10),
+      a zero-length room (or no iovec at all) answers 0 and **takes nothing**, a short room
+      leaves the rest queued, and `MSG_WAITALL` does not lengthen the copy. Two of those are
+      this kernel's own named shapes now (`docs/uapi/` §5.2): the peek needs a look primitive
+      at the device seam - the virtio socket's ring is the crate's
+      (`VsockConnectionManager::recv` drains it and the connection's buffer is private), so
+      serving it means either a device-side `peek` or a socket-side stash - and the sweep's
+      machine has no vsock peer to pin it against. The rest (chain, zero-length room,
+      `MSG_TRUNC` ignored) is the next item's work, not this one's.
+
+    **The landing keeps each look at its own layer.** `crate::net::rtnl::peek` clones the
+    queue's front (the answer stays where it is, and `recv_blocking(handle, look)` gives the
+    look the same park the receive has - `MSG_PEEK` must not turn a blocking read into
+    `EAGAIN`); `crate::link::Frames::peek` is the packet ring's front, which `PacketSock` clones
+    out (`try_peek`/`peek_blocking`) because the ring sits behind a `critical_section` cell and
+    a frame is one MTU at most; and `crate::uevent::peek` clones a `Message`, whose bytes were
+    already an `Arc` the send shared. The doors then read the flag word instead of ignoring it:
+    `handle_recvfrom`'s two netlink and packet branches, `handle_recvmsg`'s netlink, packet and
+    uevent arms, and `recvmsg_netlink`, which now returns the block's own length when
+    `MSG_TRUNC` asked while the scatter wrapper still gets the copy's count for its own
+    bookkeeping, and reports the cut in `msg_flags` either way.
+    A zero-length room is a receive at every one of them, as it was.
+
+    **Pins**: `t-netlink`'s **14 new claims** (the two doors' peeks, repeatability, the short
+    receive's consume and its `msg_flags`, `MSG_TRUNC`'s return, both zero-length shapes and the
+    drained-queue `EAGAIN`), `t-uevent`'s **5** (the block's own length through 8 bytes, the cut
+    in `msg_flags`, the room that fits, a zero-length peek, and a zero-length receive that
+    consumes) plus its new fixture claim, `t-dhcp`'s **4** on the external group (a
+    `recvfrom` and a `recvmsg` peek each naming the frame's length and each leaving it for the
+    read that follows) - green when the external group is run (`pass=199 fail=0`, 199 built) -
+    and one host unit test in `mpos-link`
+    (`a_peek_shows_the_front_and_leaves_the_queue_alone`).
+
+    **Counterfactual**, every `MSG_TRUNC` return put back to the copy's length and the peeks
+    kept, every pin kept: x86_64 `pass=190 fail=2` - `t-netlink` and `t-uevent` red at the two
+    length claims by name, while the ordinary receives and the fixtures beside them stay green.
+    Putting the netlink/uevent peek back is not a countable arm: the first look consumes the
+    answer it was asked about, and the next blocking receive then parks on a queue the old take
+    had already drained (observed: the named repeatability claims red, then the sweep held at
+    that queue until killed).
+
+    Gate: x86_64 `pass=192 fail=0 (192 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33;
+    aarch64 `pass=191 fail=0`, `mpos-kunit 32 passed, 0 failed`; host unit suite 584 (unchanged;
+    the new test is `mpos-link`'s 13th), `xtask` 123. Named rather than served: the **vsock**
+    family's peek and its whole-chain room (measured above, with the prerequisite each needs),
+    and the vsock `recvmsg` still reads its chain's first segment.

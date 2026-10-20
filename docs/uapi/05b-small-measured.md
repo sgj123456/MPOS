@@ -5,6 +5,32 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **Netlink's and `AF_PACKET`'s receive doors look without taking, and a truncated answer
+  names its own length.** **Landed 2026-10-21** (`docs/uapi/` §5.1 item 77) - item 76's named
+  residual on the two families that ignored the flag word. `NETLINK_ROUTE`'s `recvfrom` and
+  `recvmsg` popped the front answer whatever `MSG_PEEK` said and returned the copy whatever
+  `MSG_TRUNC` said, the uevent socket's `recvmsg` did the same, and every `AF_PACKET` door
+  refused `MSG_PEEK` with `EOPNOTSUPP`. Measured whole on a current host first:
+  `.workbuddy/probe_netlink_peek.c` (over a `RTM_GETLINK` dump) gives a peek that answers and
+  leaves the front, a short receive that answers 8 and consumes, and `MSG_TRUNC`'s return of the
+  answer's **own** length (3020 through 8 bytes) with `msg_flags` reporting the cut unasked -
+  zero-length rooms included; `.workbuddy/probe_packet_peek.c` (inside
+  `unshare(CLONE_NEWUSER|CLONE_NEWNET)`, `lo` up, one frame the socket sends itself) gives the
+  same rule on one frame per call, 8 bytes of a 16-byte frame answering 16 under the flag and 8
+  without it. Served by `rtnl::peek` + `recv_blocking(handle, look)`, `link::Frames::peek` (with
+  `PacketSock::try_peek`/`peek_blocking`), `uevent::peek`, and the flag word read at each of the
+  five doors. Pins: `t-netlink` 14 new claims, `t-uevent` 5, `t-dhcp` 4 (external group: both
+  packet doors, green there at `pass=199 fail=0`), and one `mpos-link` unit test. Gate: x86_64
+  `pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit` 32/0 on both. Named: the **vsock** family, measured in the
+  same pass and not served - `.workbuddy/probe_vsock_recv.c` (over `VMADDR_CID_LOCAL`, after
+  `modprobe vsock_loopback`) serves a peek (10 of 10, still queued) and **ignores** `MSG_TRUNC`
+  (4 of 10 answers 4 and consumes the four), uses the **whole** iovec chain (4+4+2 answers 10),
+  answers 0 for a zero-length room without taking anything, and leaves a short room's remainder
+  queued. Serving the peek needs a look at the device seam (`VsockConnectionManager::recv`
+  drains the crate's private ring, so either a device-side `peek` or a socket-side stash), and
+  the sweep's machine has no vsock peer to pin it against; the chain and the zero-length room
+  are the next item's work.
+
 - **AF_UNIX's receive doors look without taking, and a datagram's `MSG_TRUNC` is its own
   length.** **Landed 2026-10-20** (`docs/uapi/` §5.1 item 76) - the AF_UNIX half of the
   `MSG_PEEK` bullet below. Both flags used to be refused `EOPNOTSUPP` on every unix door.
@@ -19,10 +45,10 @@ Section numbers are unchanged from the original `UAPI.md`.
   length. Pin: **`t-unix-peek`**, 63 claims, green on a host first and all 63 green on both
   machines, plus two `vfs::pipe` host tests. Counterfactual (the four refusals back):
   `pass=191 fail=1`, only `t-unix-peek` red, 18 of its claims by name. Gate: x86_64
-  `pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit` 32/0 on both. Named: `NETLINK`,
-  `AF_PACKET` and vsock peeks; vsock's first-segment `recvmsg`; and a zero-byte stream
-  handover being receivable through `recvmsg` here where Linux answers `EAGAIN` (the existing
-  `empty_handover` trade).
+  `pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit` 32/0 on both. Named: vsock's
+  peek and its first-segment `recvmsg`, and a zero-byte stream handover being receivable
+  through `recvmsg` here where Linux answers `EAGAIN` (the existing `empty_handover` trade).
+  (`NETLINK` and `AF_PACKET` were served by item 77, the bullet above.)
 
 - **Real `MSG_PEEK` over TCP/UDP is served, and `MSG_TRUNC` is the message's own length.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet this replaces said the flag
@@ -53,8 +79,9 @@ Section numbers are unchanged from the original `UAPI.md`.
   **Two shapes stay named rather than claimed**: the other families' peeks (`NETLINK`,
   PACKET, vsock) which this pass did not touch, and `recvmsg` with a zero-length data room, whose
   `EINVAL` predated this item and was its own. The **raw** peek this bullet first named was
-  served by item 74, which made the capability the host lacked instead of naming around it, and
-  **`AF_UNIX`'s half** was served by item 76 (the bullet above).
+  served by item 74, which made the capability the host lacked instead of naming around it,
+  **`AF_UNIX`'s half** was served by item 76, and **`NETLINK` and `AF_PACKET`** by item 77 (the
+  bullet at the top); vsock's own is measured there and still named.
 
 - **A `recvmsg`'s data room is the whole iovec chain, and a stream's fault is not a datagram's.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 73) - the item the `MSG_PEEK` bullet above left

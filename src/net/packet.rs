@@ -140,6 +140,25 @@ impl PacketSock {
         critical_section::with(|cs| self.rx.borrow(cs).borrow_mut().pop())
     }
 
+    /// Look at the front frame without taking it - the packet socket's half of
+    /// `MSG_PEEK`. A frame is at most one MTU, so cloning it is cheaper than
+    /// the machinery a shared ring slot would need, and the ring keeps the
+    /// frame for the receive that follows. The park is the receive's: a look
+    /// at an empty ring waits for a frame just as a take would.
+    pub(crate) fn peek_blocking(&self) -> VfsResult<Frame> {
+        match crate::sched::block_until_interruptible(|| self.holds()) {
+            crate::sched::WaitEnd::Interrupted => return Err(VfsError::Interrupted),
+            _ => {}
+        }
+        Ok(critical_section::with(|cs| {
+            self.rx.borrow(cs).borrow().peek().unwrap_or_default()
+        }))
+    }
+
+    pub(crate) fn try_peek(&self) -> Option<Frame> {
+        critical_section::with(|cs| self.rx.borrow(cs).borrow().peek())
+    }
+
     /// `bind` on a packet socket is one-time on Linux - a second bind of a
     /// different index is `EBUSY` - and one interface exists here, so the
     /// record is kept and re-checks answer from it.

@@ -241,18 +241,28 @@ pub fn recv(handle: usize) -> Option<Vec<u8>> {
     with_session(handle, |s| s.queue.pop_front()).flatten()
 }
 
+/// The front answer, cloned rather than taken - the look a `MSG_PEEK` asks
+/// for. Nothing moves: the receive that follows answers the same bytes.
+pub fn peek(handle: usize) -> Option<Vec<u8>> {
+    with_session(handle, |s| s.queue.front().cloned()).flatten()
+}
+
 /// [`recv`](Self::recv) with a park: a dump reader with nothing queued waits
 /// here instead of spinning, and the next generated answer wakes it. A
 /// catchable signal ends the wait - `Interrupted`, nothing consumed - so a
 /// program that reads its route table and also answers its own timers is not
 /// held by a queue nothing has filled yet. `Ok(None)` remains what it was:
 /// the session is gone (its descriptor closed while this task waited).
-pub fn recv_blocking(handle: usize) -> crate::vfs::VfsResult<Option<Vec<u8>>> {
+///
+/// `look` is `MSG_PEEK`: the park is the same, because a look at an empty
+/// queue has nothing to answer either, but the answer is cloned and the
+/// queue keeps it.
+pub fn recv_blocking(handle: usize, look: bool) -> crate::vfs::VfsResult<Option<Vec<u8>>> {
     match crate::sched::block_until_interruptible(|| ready(handle)) {
         crate::sched::WaitEnd::Interrupted => return Err(crate::vfs::VfsError::Interrupted),
         _ => {}
     }
-    Ok(recv(handle))
+    Ok(if look { peek(handle) } else { recv(handle) })
 }
 
 /// Feed one request in: the payload of a `sendto`/`sendmsg` on a route

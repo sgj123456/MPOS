@@ -536,6 +536,34 @@ name. Gate: x86_64 `pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit` 32
 Named: `NETLINK`/`AF_PACKET`/vsock peeks, vsock's first-segment `recvmsg`, and a zero-byte
 stream handover being receivable through `recvmsg` here where Linux answers `EAGAIN`.
 
+**Netlink's and `AF_PACKET`'s receive doors look without taking, and a truncated answer names
+its own length** (`docs/uapi/` §5.1 item 77, landed 2026-10-21): item 76's named residual on the
+two families that were not reading the flag word. A `NETLINK_ROUTE` `recvfrom`/`recvmsg` popped
+the front answer whatever `MSG_PEEK` said and returned the copy whatever `MSG_TRUNC` said, the
+uevent socket's `recvmsg` did the same, and every `AF_PACKET` door refused `MSG_PEEK` with
+`EOPNOTSUPP`. Measured whole on a current host first (`.workbuddy/probe_netlink_peek.c` over a
+`RTM_GETLINK` dump; `.workbuddy/probe_packet_peek.c` inside
+`unshare(CLONE_NEWUSER|CLONE_NEWNET)` with `lo` up and one frame the socket sends itself): a
+peek answers the front's length and leaves it, `MSG_TRUNC` makes the return the message's own
+length (3020 through 8 bytes on netlink, 16 on one frame) while the copy stays short, a short
+receive answers the room and consumes, `msg_flags` reports the cut unasked, and a zero-length
+room answers 0 - consuming without the peek and leaving the message with it. Served by
+`rtnl::peek` + `recv_blocking(handle, look)`, `link::Frames::peek` with
+`PacketSock::try_peek`/`peek_blocking`, and `uevent::peek`, with each of the five doors reading
+the flag word. Pin: `t-netlink`'s 14 new claims, `t-uevent`'s 5, `t-dhcp`'s 4 (external group,
+both packet doors, green there at `pass=199 fail=0`) and one `mpos-link` unit test; the
+counterfactual (every `MSG_TRUNC` return
+put back to the copy's length, the peeks kept) is x86_64 `pass=190 fail=2` - `t-netlink` and
+`t-uevent` red at the two length claims by name. Putting the netlink/uevent peek back makes the
+same tests park on a queue the old take had already drained, so that arm was observed and
+stopped rather than counted. Gate: x86_64 `pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit` 32/0
+on both. Named: the **vsock** family, measured in the same pass
+(`.workbuddy/probe_vsock_recv.c` over `VMADDR_CID_LOCAL`, after `modprobe vsock_loopback`):
+Linux serves its peek, ignores its `MSG_TRUNC` (4 of 10 answers 4 and consumes the four), uses
+the whole iovec chain (4+4+2 answers 10) and answers 0 for a zero-length room without taking
+anything - and serving the peek needs a look at the device seam, which the crate's private ring
+does not offer, with no vsock peer on the sweep machine to pin it against.
+
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
 record-only was wrong in both halves - the figure stored was the caller's rather than Linux's,  

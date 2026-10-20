@@ -395,6 +395,29 @@ fn main() {
         r.finish();
     }
 
+    // The look and the length word, before the read that takes the frame.
+    // Measured on a current host first (`.workbuddy/probe_packet_peek.c`,
+    // Linux 7.2.11): `MSG_PEEK` copies the frame's front and leaves it for the
+    // next receive, and `MSG_TRUNC` makes the return that frame's *own* length
+    // even through an 8-byte room - while the same 8-byte room without the
+    // flag answers 8 and consumes the frame. Both flags used to be refused or
+    // ignored on this family's doors.
+    let mut look = [0u8; 8];
+    let looked = unsafe {
+        as_raw(libc::recvfrom(
+            sock.as_raw_fd(),
+            look.as_mut_ptr().cast::<c_void>(),
+            look.len(),
+            libc::MSG_PEEK | libc::MSG_TRUNC,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        ) as isize)
+    };
+    r.check(
+        &format!("a peek with MSG_TRUNC names the frame's length through 8 bytes (got {looked})"),
+        looked >= TOTAL as isize,
+    );
+
     let mut rx = [0u8; 600];
     // The sender the DGRAM read names, kept so the raw read's header can be
     // checked against it below: the two doors answer about the same frame.
@@ -414,6 +437,15 @@ fn main() {
         &format!("the reply reads back whole (got {got}, want at least {TOTAL})"),
         got >= TOTAL as isize,
     );
+    if got >= TOTAL as isize {
+        // The peek's two halves, now that the taken frame is in hand: the look
+        // consumed nothing (the read is the same frame, byte for byte) and its
+        // return was that frame's own length.
+        r.check(
+            &format!("the peek left that frame for the read (looked {looked}, read {got})"),
+            looked == got && look[..] == rx[..8],
+        );
+    }
     if got >= TOTAL as isize {
         r.check(
             &format!("the reply is a BOOTREPLY (got {})", rx[BOOTP]),
@@ -576,6 +608,34 @@ fn main() {
         // after every DISCOVER - while this program, reading the same socket
         // with `recvfrom`, stayed green. The two reads are the two doors, and
         // a green pair is the claim that both answer.
+        // The look on this door too: a `recvmsg` with `MSG_PEEK` and
+        // `MSG_TRUNC` through 8 bytes answers the frame's own length with the
+        // cut named in `msg_flags`, and the read after it is the same frame -
+        // measured with the `recvfrom` claims above
+        // (`.workbuddy/probe_packet_peek.c`, Linux 7.2.11).
+        let mut look = [0u8; 8];
+        let mut look_iov = [libc::iovec {
+            iov_base: look.as_mut_ptr().cast::<c_void>(),
+            iov_len: look.len(),
+        }];
+        let mut look_msg: libc::msghdr = unsafe { core::mem::zeroed() };
+        look_msg.msg_iov = look_iov.as_mut_ptr();
+        look_msg.msg_iovlen = 1;
+        let peeked = unsafe {
+            as_raw(libc::recvmsg(
+                sock.as_raw_fd(),
+                &mut look_msg,
+                libc::MSG_PEEK | libc::MSG_TRUNC,
+            ) as isize)
+        };
+        r.check(
+            &format!(
+                "a recvmsg peek with MSG_TRUNC names the frame's length (got {peeked}, flags {})",
+                look_msg.msg_flags
+            ),
+            peeked >= TOTAL as isize && look_msg.msg_flags & libc::MSG_TRUNC != 0,
+        );
+
         let mut rx2 = [0u8; 600];
         let mut iov = [libc::iovec {
             iov_base: rx2.as_mut_ptr().cast::<c_void>(),
@@ -597,6 +657,10 @@ fn main() {
         r.check(
             &format!("and recvmsg on the same socket reads it too (got {got}, want > 0)"),
             got > 0,
+        );
+        r.check(
+            &format!("the peek left it for that read (peeked {peeked}, read {got})"),
+            peeked == got && look[..] == rx2[..8],
         );
         r.check(
             &format!(
