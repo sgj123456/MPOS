@@ -147,6 +147,16 @@ Section numbers are unchanged from the original `UAPI.md`.
   `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Counterfactual: `pass=192 fail=1`, the two unbound
   claims red.
 
+- **`shutdown` is a flag on the socket, not a handshake with a peer.** **Landed 2026-10-22**
+  (`docs/uapi/` §5.1 item 86). `shutdown` on a unix socket answered `ENOTCONN` when there was no
+  channel. Measured on a current host first (`.workbuddy/probe_unix_shutdown.c`, Linux 7.2.11): an
+  unconnected `SOCK_STREAM` answers 0 for all three directions, and so do a listening socket, an
+  unconnected datagram socket and a connected socket of every type; only `how` outside `0..=2` is
+  `EINVAL` (22). Served by removing the `ENOTCONN` arm - the handler closes the channel when there
+  is one and reports success either way. Pin: **`t-unix`** 96 → 99 claims. Gate: x86_64
+  `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Counterfactual:
+  `pass=192 fail=1`, the two unconnected claims red.
+
 - **Real `MSG_PEEK` over TCP/UDP is served, and `MSG_TRUNC` is the message's own length.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet this replaces said the flag
   was refused `EOPNOTSUPP` because serving it needed peek-preserving delivery in the stack; the

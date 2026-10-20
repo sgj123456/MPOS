@@ -507,6 +507,39 @@ second `listen` succeeding on a bound socket.
 fail=1`, and the red claims are `listen on an unbound stream socket is EINVAL`
 and `listen on an unbound seqpacket socket is EINVAL`.
 
+#### 4.1.9 `shutdown` is a flag on the socket, not a handshake with a peer — **SERVED** (2026-10-22)
+
+`shutdown` on a unix socket answered `ENOTCONN` when there was no channel. Linux's
+`unix_shutdown` never asks: it sets a flag on the socket and returns 0, so an
+unconnected stream socket, a listener and a datagram socket all succeed, and the
+only thing refused is the `how` word.
+
+**Measured whole on a current host first** (`.workbuddy/probe_unix_shutdown.c`,
+Linux 7.2.11):
+
+| The call | Linux 7.2.11 |
+|---|---|
+| `shutdown` on an unconnected `SOCK_STREAM`, `SHUT_RD`/`SHUT_WR`/`SHUT_RDWR` | 0 for all three |
+| the same on a **listening** socket | 0 |
+| the same on an **unconnected datagram** socket | 0 |
+| the same on a connected stream / datagram / sequenced-packet socket | 0 |
+| `how` = 3, and `how` = -1 | `EINVAL` (22) |
+| a second `shutdown` of the same half | 0 |
+| the peer's read after all three directions | end of stream |
+
+**The fix is the removal of one `ENOTCONN` arm.** The handler closes the channel
+when the socket has one and reports success either way; the `how` bound
+(`how > SHUT_RDWR` → `EINVAL`) was already there and is what the negative case
+needs as well, because the argument arrives as an unsigned word.
+
+**Pinned by `t-unix`** 96 → 99 claims: the unconnected stream, the datagram
+socket, and the two out-of-range `how` words through the raw door (the word is
+what the claim is about, and `rustix`'s enum cannot spell 3 or -1).
+
+**Counterfactual** (the `ENOTCONN` arm restored, every pin kept): `pass=192
+fail=1`, and the two red claims are `shutdown on an unconnected stream socket
+answers 0` and `shutdown on a datagram socket answers 0`.
+
 ### 4.2 ICMP Improvements — **DONE**
 
 `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` is served by a raw smoltcp socket

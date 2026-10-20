@@ -562,6 +562,43 @@ fn main() {
 
     let _ = unlinkat(CWD, "/tmp/t-unix-notdir", AtFlags::empty());
 
+    // --- `shutdown` answers 0 for every socket Linux says it does ----
+    //
+    // Linux's `unix_shutdown` never asks whether there is a peer: the call
+    // sets a flag on the socket and reports success, so an unconnected
+    // stream socket, a listener and a datagram socket all answer 0, and only
+    // the `how` word is validated (`EINVAL` outside 0..=2). Measured on a
+    // current host first (`.workbuddy/probe_unix_shutdown.c`, Linux 7.2.11).
+    let quiet = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    r.check(
+        "shutdown on an unconnected stream socket answers 0",
+        shutdown(&quiet, rustix::net::Shutdown::Both).is_ok(),
+    );
+    drop(quiet);
+    let quiet_dgram = socket(AddressFamily::UNIX, SocketType::DGRAM, None).unwrap();
+    r.check(
+        "shutdown on a datagram socket answers 0",
+        shutdown(&quiet_dgram, rustix::net::Shutdown::Write).is_ok(),
+    );
+    drop(quiet_dgram);
+    // The `how` word is the only thing refused, and it is refused whatever
+    // the socket is - 3 and -1 are both `EINVAL`.
+    let quiet2 = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    let how_raw = |fd: i32, how: i32| unsafe {
+        let r = libc::syscall(libc::SYS_shutdown, fd as libc::c_long, how as libc::c_long);
+        if r < 0 {
+            -(last_errno() as isize)
+        } else {
+            r as isize
+        }
+    };
+    r.check(
+        "a how word outside 0..=2 is EINVAL",
+        how_raw(quiet2.as_raw_fd(), 3) == -libc::EINVAL as isize
+            && how_raw(quiet2.as_raw_fd(), -1) == -libc::EINVAL as isize,
+    );
+    drop(quiet2);
+
     // --- `listen` is the *named* call --------------------------------
     //
     // Linux's `unix_listen` asks the socket's address and answers `EINVAL`

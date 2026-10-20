@@ -4552,3 +4552,32 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     kept): `pass=192 fail=1`, and the red claims are
     `listen on an unbound stream socket is EINVAL` and
     `listen on an unbound seqpacket socket is EINVAL`.
+
+## item 86 — `shutdown` is a flag on the socket, not a handshake with a peer
+
+    `shutdown` on a unix socket answered `ENOTCONN` when there was no channel.
+    Linux's `unix_shutdown` never asks: it sets a flag on the socket and
+    returns 0, so an unconnected stream socket, a listener and a datagram
+    socket all succeed, and the only thing refused is the `how` word.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_unix_shutdown.c`,
+    Linux 7.2.11): an unconnected `SOCK_STREAM` answers 0 for `SHUT_RD`,
+    `SHUT_WR` and `SHUT_RDWR`; so does a listening socket, an unconnected
+    datagram socket, and a connected socket of every type; a second `shutdown`
+    of the same half is 0; and `how` = 3 or -1 is `EINVAL` (22) - the one
+    refusal the call has.
+
+    Served by removing the `ENOTCONN` arm from the handler: it closes the
+    channel when the socket has one and reports success either way. The `how`
+    bound was already there and is what the negative case needs too, because
+    the argument arrives as an unsigned word.
+
+    **Pins**: `t-unix` 96 -> 99 claims - the unconnected stream, the datagram
+    socket, and the two out-of-range `how` words through the raw door (the word
+    is the claim, and `rustix`'s enum cannot spell 3 or -1).
+
+    Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32
+    passed, 0 failed on both. Counterfactual (the `ENOTCONN` arm restored,
+    every pin kept): `pass=192 fail=1`, and the two red claims are
+    `shutdown on an unconnected stream socket answers 0` and
+    `shutdown on a datagram socket answers 0`.

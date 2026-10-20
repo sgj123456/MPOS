@@ -5175,16 +5175,20 @@ pub(crate) fn handle_shutdown(args: [usize; 6], _from_user: bool) -> isize {
     if let Ok(file) = crate::sched::current_fds().clone_at(args[0] as i32)
         && file.inode().unix_id() != 0
     {
-        let Some(end) = file.inode().unix_end() else {
-            // ENOTCONN is Linux's answer to shutdown on a socket that
-            // never connected; an unconnected unix fd is exactly that.
-            return err::ENOTCONN;
-        };
-        if how == SHUT_RD || how == SHUT_RDWR {
-            end.shut_read();
-        }
-        if how == SHUT_WR || how == SHUT_RDWR {
-            end.shut_write();
+        // A unix socket's `shutdown` is a *flag*, not a handshake: Linux's
+        // `unix_shutdown` sets it on the socket and returns 0 without ever
+        // asking whether there is a peer, so an unconnected stream socket, a
+        // listener and a datagram socket all answer 0 (measured on a current
+        // host - `.workbuddy/probe_unix_shutdown.c`, every type, every
+        // direction, and `how` outside `0..=2` the only refusal). Only the
+        // channel, when there is one, has a half to close.
+        if let Some(end) = file.inode().unix_end() {
+            if how == SHUT_RD || how == SHUT_RDWR {
+                end.shut_read();
+            }
+            if how == SHUT_WR || how == SHUT_RDWR {
+                end.shut_write();
+            }
         }
         return 0;
     }
