@@ -552,17 +552,36 @@ room answers 0 - consuming without the peek and leaving the message with it. Ser
 `PacketSock::try_peek`/`peek_blocking`, and `uevent::peek`, with each of the five doors reading
 the flag word. Pin: `t-netlink`'s 14 new claims, `t-uevent`'s 5, `t-dhcp`'s 4 (external group,
 both packet doors, green there at `pass=199 fail=0`) and one `mpos-link` unit test; the
-counterfactual (every `MSG_TRUNC` return
-put back to the copy's length, the peeks kept) is x86_64 `pass=190 fail=2` - `t-netlink` and
-`t-uevent` red at the two length claims by name. Putting the netlink/uevent peek back makes the
-same tests park on a queue the old take had already drained, so that arm was observed and
-stopped rather than counted. Gate: x86_64 `pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit` 32/0
-on both. Named: the **vsock** family, measured in the same pass
+counterfactual (every `MSG_TRUNC` return put back to the copy's length, the peeks kept) is
+x86_64 `pass=190 fail=2` - `t-netlink` and `t-uevent` red at the two length claims by name.
+Putting the netlink/uevent peek back makes the same tests park on a queue the old take had
+already drained, so that arm was observed and stopped rather than counted. Gate: x86_64
+`pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit` 32/0 on both. Named: the **vsock** family, measured in the same pass
 (`.workbuddy/probe_vsock_recv.c` over `VMADDR_CID_LOCAL`, after `modprobe vsock_loopback`):
 Linux serves its peek, ignores its `MSG_TRUNC` (4 of 10 answers 4 and consumes the four), uses
 the whole iovec chain (4+4+2 answers 10) and answers 0 for a zero-length room without taking
 anything - and serving the peek needs a look at the device seam, which the crate's private ring
 does not offer, with no vsock peer on the sweep machine to pin it against.
+
+**A named `SOCK_SEQPACKET` connection keeps its message boundaries, and its messages carry
+their descriptors** (`docs/uapi/` §5.1 item 78, landed 2026-10-21): the last divergence in the
+AF_UNIX family. A listener reached by a name handed `accept` a `DuplexEnd` byte channel, so the
+one type whose description is "message boundaries over a stream" carried a byte stream for
+exactly the connections that had a name (a `socketpair` half already carried messages).
+Measured whole on a current host first (`.workbuddy/probe_unix_seqpacket{,2,3}.c`, Linux 7.2.11):
+3 then 5 bytes read back as 3 then 5, a 4+4+2 `sendmsg` chain is one message of 10, a short read
+discards the rest of that message, `MSG_TRUNC` returns the message's own length while `MSG_PEEK`
+leaves it, a zero-length send is a message while `read(fd, buf, 0)` is a no-op,
+`recvfrom`/`recvmsg` with a zero-length room consume, `SCM_RIGHTS` rides the message (a peek
+installs its own set and the take a second, distinct one), and a path-name type mismatch is
+`EPROTOTYPE` (an abstract name answers `ECONNREFUSED` from its type-keyed lookup). Served by a
+`Pending` queue that holds either a stream end or an already-paired message socket,
+`connect_messages`, the existing `recvq` machinery, `Dgram`'s own `fds`, and `read_at`'s
+zero-length no-op. Pin: `t-unix-seqpacket`, 58 claims, green on a host first; `t-unix-dgram`'s
+claim now says "listens" rather than "is served as a stream". Gate: x86_64 `pass=193 fail=0`,
+aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Named: `sendto` with a destination on an
+already-connected seqpacket socket answers `EISCONN` here where Linux sends (the same divergence
+`t-unix-dgram` pins for a connected datagram socket).
 
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  

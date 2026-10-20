@@ -4144,3 +4144,75 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     the new test is `mpos-link`'s 13th), `xtask` 123. Named rather than served: the **vsock**
     family's peek and its whole-chain room (measured above, with the prerequisite each needs),
     and the vsock `recvmsg` still reads its chain's first segment.
+
+## item 78 — A named `SOCK_SEQPACKET` connection keeps its message boundaries, and its messages carry their descriptors
+
+    The last divergence in the AF_UNIX family (`docs/notes/` §4.1): a listener reached by a
+    path or an abstract name handed `accept` a `DuplexEnd` byte channel, so the type whose own
+    description is "message boundaries over a stream" carried a byte stream for exactly the
+    connections that had a name. A `socketpair(AF_UNIX, SOCK_SEQPACKET, ...)` half already had
+    a message queue; the two shapes disagreed about the same type name, and `t-unix-dgram`
+    recorded the difference as "a named one is served as the stream this family has".
+
+    **Measured whole on a current host first**, one probe per question
+    (`.workbuddy/probe_unix_seqpacket{,2,3}.c`, Linux 7.2.11, abstract and path names):
+
+    * **One send is one message.** 3 then 5 bytes read back as 3 then 5; a `sendmsg` chain of
+      4+4+2 is one message of 10; the peer sees no second message behind it.
+    * **A short read truncates that message.** Ten bytes through a four-byte room answer 4,
+      discard the remaining six, leave nothing queued, and the next read is `EAGAIN` - the
+      boundary belongs to the message, not to a byte stream.
+    * **The flags are the message family's.** `recvmsg(MSG_TRUNC, iov 4)` answers the message's
+      own length (10) with `MSG_TRUNC` in `msg_flags` and consumes it; `MSG_PEEK` answers 10 and
+      leaves it for the read that follows; a zero-length room answers 0, reports the cut and
+      **consumes** (with `MSG_PEEK`, leaves).
+    * **A zero-length message is a message.** `write(fd, "", 0)` queues one; the peer's read
+      answers 0 and the queue is empty afterwards - not EOF, which only `shutdown` sends.
+    * **`read(2)` with a zero-length buffer is not a receive.** It answers 0 and leaves the
+      front message where it is (drained queue included, where a nonblocking `read` also
+      answers 0 rather than `EAGAIN`); `recvfrom`/`recvmsg` with the same empty room are the
+      receives that consume. The distinction is `vfs_read`'s short-circuit, not the family's.
+    * **`SCM_RIGHTS` rides the message.** The receive that takes it installs the descriptors;
+      a peek installs its own set and leaves the record, so the take after it installs a second,
+      distinct descriptor and both stay live. A zero-length data room still receives the
+      control chain and consumes the message.
+    * **The two ends must agree on their type.** Through a path name, a stream dialing a
+      seqpacket listener and a seqpacket dialing a stream one both answer `EPROTOTYPE` (91);
+      an abstract name misses its type-keyed lookup and answers `ECONNREFUSED` (111).
+
+    **The landing reuses the message machinery rather than adding a second one.** The
+    listener's queue now holds a `Pending` - `Stream(Arc<DuplexEnd>, UCred)` for the byte shape,
+    `Messages(Arc<UnixSock>)` for the sequenced-packet one - and `connect_messages` mints the
+    server socket, points both ends at each other as `dgram_peer`s and records the credentials
+    before queuing it. The server socket is allocated and an unqueued one dropped *outside* the
+    listener's critical section: registering takes the registry's own section, and
+    `UnixSock::drop` takes it again. `accept` returns the queued socket as it stands for the
+    message shape, and wraps a channel for the stream shape. From there both ends use the
+    `recvq`/`push_dgram` path a `socketpair` half already had.
+
+    Three door-level details the measurement forced. `read_at` answers 0 for a zero-length
+    buffer before touching the queue (it used to take a message and answer 0 - consuming a
+    zero-length message and answering `EAGAIN` on an empty nonblocking queue). `Dgram`/`RecvDgram`
+    now carry the message's `SCM_RIGHTS` descriptors (`Vec<Arc<File>>`); the message `sendmsg`
+    collects them and the `recvmsg` arm installs them through the same `emit_unix_control` the
+    stream uses, with `MSG_CMSG_CLOEXEC` honored, while `recvfrom` (no control buffer) drops
+    them - the alternative was silently losing the handover udev's control socket can use the
+    moment the connection stopped being a `DuplexEnd`. `connect_to` gained a `WrongType` arm so
+    a path-name mismatch answers `EPROTOTYPE`; the abstract table never reaches it.
+
+    **Pins**: **`t-unix-seqpacket`, 58 claims** - the fixture (a named listener, a connect and
+    an accept), boundaries through `write`/`read` and a 4+4+2 `sendmsg`, the short read's
+    discard, `MSG_TRUNC`'s length and `msg_flags`, `MSG_PEEK` leaving the message, a
+    zero-length message, the zero-length `read` no-op versus the consuming `recvfrom`/`recvmsg`,
+    the SCM handover through a peek/take pair and a zero-length room, and both type-mismatch
+    directions - green on a current host first, then on both machines. `t-unix-dgram`'s claim
+    "a named SOCK_SEQPACKET socket is served as a stream: listen succeeds" became "…listens",
+    which is all it was measuring, and its module note and `t-udev-worker`'s point at the new
+    file. No host unit test: the module is `target_os = "none"`.
+
+    Gate: x86_64 `pass=193 fail=0 (193 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33;
+    aarch64 `pass=192 fail=0`, `mpos-kunit 32 passed, 0 failed`; host unit suite 584 (unchanged),
+    `xtask` 123. Named rather than served: `sendto` with a destination on an already-connected
+    seqpacket socket answers `EISCONN` where Linux sends - the same divergence `t-unix-dgram`
+    pins for a connected datagram socket, and the same fix (ignore the destination once
+    connected) would close both.

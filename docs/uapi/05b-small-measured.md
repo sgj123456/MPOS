@@ -5,6 +5,25 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **A named `SOCK_SEQPACKET` connection keeps its message boundaries, and its messages carry
+  their descriptors.** **Landed 2026-10-21** (`docs/uapi/` §5.1 item 78) - the one divergence
+  left in the AF_UNIX family. A listener's accepted pair used to be a `DuplexEnd` byte channel,
+  so a type named "message boundaries over a stream" carried a byte stream for exactly the
+  connections reached by a name; a `socketpair` half already carried messages. Measured whole on
+  a current host first (`.workbuddy/probe_unix_seqpacket{,2,3}.c`, Linux 7.2.11): 3 then 5 bytes
+  read back as 3 then 5, a 4+4+2 `sendmsg` chain is one message of 10, a short read discards the
+  rest of that message, `MSG_TRUNC` returns the message's own length while `MSG_PEEK` leaves it,
+  a zero-length send is a message while `read(fd, buf, 0)` is a no-op, `recvfrom`/`recvmsg` with
+  a zero-length room consume, `SCM_RIGHTS` rides the message (a peek installs its own set and
+  the take a second, distinct one), and a path-name type mismatch is `EPROTOTYPE` (an abstract
+  name answers `ECONNREFUSED` from its type-keyed lookup). Served by `Pending` in the listener
+  queue (`Stream` end or `Messages` socket), `connect_messages`, the existing `recvq` message
+  machinery, `Dgram`'s own `fds`, and `read_at`'s zero-length no-op. Pins: **`t-unix-seqpacket`,
+  58 claims**, green on a host first; `t-unix-dgram`'s seqpacket claim now says "listens"
+  instead of "is served as a stream". Gate: x86_64 `pass=193 fail=0`, aarch64 `pass=192 fail=0`,
+  `mpos-kunit` 32/0 on both. Named: `sendto` with a destination on an already-connected
+  seqpacket socket answers `EISCONN` here where Linux sends (the `t-unix-dgram` divergence).
+
 - **Netlink's and `AF_PACKET`'s receive doors look without taking, and a truncated answer
   names its own length.** **Landed 2026-10-21** (`docs/uapi/` §5.1 item 77) - item 76's named
   residual on the two families that ignored the flag word. `NETLINK_ROUTE`'s `recvfrom` and

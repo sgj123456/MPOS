@@ -175,6 +175,18 @@ pub struct UnixSock {
     state: Mutex<RefCell<UnixState>>,
 }
 
+/// One connection waiting in a listener's queue, in the shape its family
+/// carries.
+enum Pending {
+    /// A byte-stream connection: the server half of a `DuplexEnd` pair and
+    /// the connector's credentials for `SO_PEERCRED`.
+    Stream(Arc<DuplexEnd>, UCred),
+    /// A sequenced-packet connection: the server socket, already paired with
+    /// the connector's socket as a message peer (each end has its own queue,
+    /// so there is no shared channel to hand over).
+    Messages(Arc<UnixSock>),
+}
+
 struct UnixState {
     /// The name `bind` planted: the filesystem node it made (the identity
     /// the bind table keys on) and the path spelled at the call, which is
@@ -184,11 +196,14 @@ struct UnixState {
     /// `connect` looks for; a bound socket without it is refused
     /// (`ECONNREFUSED`, the header's divergence list).
     backlog: Option<usize>,
-    /// The pending connections: the server-facing halves minted by
-    /// `connect`, each tagged with the connector's credentials so the socket
-    /// `accept` mints learns who dialed it, waiting for `accept` to hand them
-    /// to a descriptor.
-    pending: VecDeque<(Arc<DuplexEnd>, UCred)>,
+    /// The pending connections, each tagged with the connector's credentials
+    /// so the socket `accept` mints learns who dialed it, waiting for
+    /// `accept` to hand them to a descriptor. A stream connection is the
+    /// server half of a `DuplexEnd` pair; a sequenced-packet one is the
+    /// server socket itself, already wired to the connector as a message
+    /// peer, because that shape has a queue per end rather than one shared
+    /// byte channel.
+    pending: VecDeque<Pending>,
     /// Tasks parked in `accept`, and tasks parked in a `connect` that
     /// found the backlog full. Stale ids are harmless - every wait
     /// re-checks its condition inside its own predicate - the rule
@@ -248,6 +263,11 @@ struct Dgram {
     /// `recvfrom` hands back.
     from: Option<UnixAddr>,
     cred: UCred,
+    /// Descriptors the send carried as `SCM_RIGHTS`, kept with the message
+    /// they belong to. A message is a boundary for control data too: the
+    /// receive that takes it installs these, and a peek hands out clones so
+    /// the record stays for the next reader.
+    fds: Vec<Arc<crate::vfs::File>>,
 }
 
 /// Queued datagrams per socket before a send answers `EAGAIN`, and the
@@ -260,6 +280,10 @@ const GRAM_MAX: usize = 64 * 1024;
 
 /// `SOCK_DGRAM` as `socket(2)` names it.
 const SOCK_DGRAM: u16 = 2;
+
+/// `SOCK_SEQPACKET` as `socket(2)` names it: message boundaries over a
+/// connection, the shape a named listener and an accepted pair carry.
+const SOCK_SEQPACKET: u16 = 5;
 
 enum BoundName {
     /// A name in the filesystem: the path spelled at `bind`, and the node's
@@ -350,7 +374,13 @@ impl UnixSock {
     /// wake whoever sits in `read`. `false` is the queue at its cap - the
     /// sender's `EAGAIN`, never a silent drop of a message someone asked
     /// to send.
-    fn push_dgram(&self, data: &[u8], from: Option<UnixAddr>, cred: UCred) -> bool {
+    fn push_dgram(
+        &self,
+        data: &[u8],
+        from: Option<UnixAddr>,
+        cred: UCred,
+        fds: Vec<Arc<crate::vfs::File>>,
+    ) -> bool {
         let waiters = critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
             if st.recvq.len() >= RECVQ_MAX {
@@ -360,6 +390,7 @@ impl UnixSock {
                 data: data.to_vec(),
                 from,
                 cred,
+                fds,
             });
             Some(st.read_waiters.clone())
         });
@@ -402,6 +433,7 @@ impl UnixSock {
                     data: g.data,
                     from: g.from,
                     cred: g.cred,
+                    fds: g.fds,
                 })
             });
             if let Some(got) = taken {
@@ -444,6 +476,7 @@ impl UnixSock {
                         data: g.data.clone(),
                         from: g.from.clone(),
                         cred: g.cred,
+                        fds: g.fds.clone(),
                     })
             });
             if let Some(got) = front {
@@ -599,6 +632,14 @@ impl Inode for UnixSock {
     /// connected peer.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         if self.carries_messages() {
+            // `read(2)` with a zero-length buffer is a no-op on Linux: it
+            // answers 0 and leaves the front message where it is, where
+            // `recvfrom`/`recvmsg` with a zero-length room are receives that
+            // take it (measured on a named sequenced-packet connection; a
+            // datagram pair answers the same).
+            if buf.is_empty() {
+                return Ok(0);
+            }
             let got = self.take_dgram()?;
             let n = got.data.len().min(buf.len());
             buf[..n].copy_from_slice(&got.data[..n]);
@@ -616,7 +657,7 @@ impl Inode for UnixSock {
             let _ = offset;
             let peer = self.dgram_peer().ok_or(VfsError::NotConnected)?;
             let name = self.local_addr();
-            if peer.push_dgram(buf, name, self_cred()) {
+            if peer.push_dgram(buf, name, self_cred(), Vec::new()) {
                 Ok(buf.len())
             } else {
                 Err(VfsError::Again)
@@ -957,6 +998,7 @@ pub(crate) fn connect_named(sock: &UnixSock, name: &[u8], nonblock: bool) -> isi
     match connect_to(&arc, &listener, nonblock) {
         Ok(()) => 0,
         Err(ConnectRefused::Refused) => err::ECONNREFUSED,
+        Err(ConnectRefused::WrongType) => err::EPROTOTYPE,
         Err(ConnectRefused::Again) => err::EAGAIN,
         Err(ConnectRefused::Interrupted) => err::EINTR,
     }
@@ -1087,6 +1129,25 @@ fn connect_to(
         });
         return Ok(());
     }
+    // The two ends must agree on what the connection carries. Linux refuses
+    // a stream dialing a sequenced-packet listener and the other way round
+    // with `ECONNREFUSED` (measured: -111 in both directions), and the
+    // stream handshake below would happily make a byte channel out of
+    // either.
+    if sock.typ != listener.typ {
+        // A path name is found by its node whatever the type, and Linux
+        // answers that disagreement with `EPROTOTYPE` (measured 91, both
+        // directions). An *abstract* name never reaches here: its table key
+        // includes the type, so the lookup misses and `connect_named`
+        // answers `ECONNREFUSED` - also measured.
+        return Err(ConnectRefused::WrongType);
+    }
+    // A sequenced-packet connection is a *message* pair: each end owns a
+    // queue, and a send is one message in the other's. The stream handshake
+    // is the byte shape only.
+    if sock.typ == SOCK_SEQPACKET {
+        return connect_messages(sock, listener, nonblock);
+    }
     loop {
         let outcome = critical_section::with(|cs| {
             {
@@ -1119,7 +1180,8 @@ fn connect_to(
                 };
                 // The connector's own credentials ride the queued half, so the
                 // socket `accept` mints can report them as its peer.
-                stl.pending.push_back((server, connector_cred));
+                stl.pending
+                    .push_back(Pending::Stream(server, connector_cred));
                 ConnectOutcome::Connected(waiters)
             }
         });
@@ -1150,6 +1212,78 @@ fn connect_to(
     }
 }
 
+/// The `SOCK_SEQPACKET` handshake: two sockets pointing at each other as
+/// message peers, the server half queued for `accept`.
+///
+/// It is the stream handshake's shape with the channel replaced by a pair of
+/// queues - which is what the family already uses for an unnamed
+/// `socketpair` half. The server socket is minted *outside* the listener's
+/// critical section because registering it takes the registry's own section,
+/// and dropping an unqueued one under the listener's lock would re-enter it
+/// from `UnixSock::drop`.
+fn connect_messages(
+    sock: &Arc<UnixSock>,
+    listener: &Arc<UnixSock>,
+    nonblock: bool,
+) -> Result<(), ConnectRefused> {
+    loop {
+        let server = alloc_in(listener.net_ns, SOCK_SEQPACKET);
+        let (outcome, unqueued) = critical_section::with(|cs| {
+            let mut stl = listener.state.borrow(cs).borrow_mut();
+            let backlog = match stl.backlog {
+                Some(b) => b,
+                None => return (ConnectOutcome::Refused, Some(server)),
+            };
+            if !admits_one_more(backlog, stl.pending.len()) {
+                return (ConnectOutcome::Full, Some(server));
+            }
+            let listener_cred = stl.owner;
+            let waiters = stl.accept_waiters.clone();
+            let connector_cred = sock.state.borrow(cs).borrow().owner;
+            // The connector owns its end immediately, as a stream connector
+            // does: connect is not a rendezvous. Its peer is the listener.
+            {
+                let mut stc = sock.state.borrow(cs).borrow_mut();
+                stc.dgram_peer = Some(Arc::downgrade(&server));
+                stc.peer = Some(listener_cred);
+            }
+            // The accepted end belongs to the listener, not to whichever
+            // task happened to call `connect`: `SO_PEERCRED` on the client
+            // must read the listener's owner, the same number a stream
+            // accept leaves there.
+            {
+                let mut sts = server.state.borrow(cs).borrow_mut();
+                sts.owner = listener_cred;
+                sts.dgram_peer = Some(Arc::downgrade(sock));
+                sts.peer = Some(connector_cred);
+            }
+            stl.pending.push_back(Pending::Messages(server));
+            (ConnectOutcome::Connected(waiters), None)
+        });
+        // Outside every borrow: an unqueued socket's drop takes the registry
+        // section, and a wake needs locks no drop may hold.
+        drop(unqueued);
+        match outcome {
+            ConnectOutcome::Connected(waiters) => {
+                wake_all(waiters);
+                return Ok(());
+            }
+            ConnectOutcome::Refused => return Err(ConnectRefused::Refused),
+            ConnectOutcome::Full => {
+                if nonblock {
+                    return Err(ConnectRefused::Again);
+                }
+                #[cfg(target_os = "none")]
+                if room_wait(listener).is_err() {
+                    return Err(ConnectRefused::Interrupted);
+                }
+                #[cfg(not(target_os = "none"))]
+                return Err(ConnectRefused::Again);
+            }
+        }
+    }
+}
+
 /// Run a collected wake set outside every borrow, on the machine only -
 /// the pipe/eventfd discipline the module docs repeat.
 fn wake_all(ids: Vec<TaskId>) {
@@ -1165,6 +1299,10 @@ fn wake_all(ids: Vec<TaskId>) {
 pub(crate) enum ConnectRefused {
     /// ECONNREFUSED: nothing listening behind the name (D4's list).
     Refused,
+    /// EPROTOTYPE: the name's socket carries a different kind of data than
+    /// the connector's (`SOCK_STREAM` dialing a `SOCK_SEQPACKET` listener,
+    /// or the reverse), which Linux says only for a path name.
+    WrongType,
     /// EAGAIN: backlog full and the call nonblocking.
     Again,
     /// EINTR: a catchable signal ended the wait for room in a full backlog,
@@ -1216,10 +1354,7 @@ fn room_wait(listener: &Arc<UnixSock>) -> VfsResult<()> {
 /// caller made the descriptor nonblocking; the blocking wait is
 /// [`accept_blocking`], split out so the queue arithmetic is host-testable
 /// exactly like the pipe's wait is.
-pub(crate) fn accept_once(
-    sock: &UnixSock,
-    nonblock: bool,
-) -> Result<(Arc<DuplexEnd>, UCred), isize> {
+pub(crate) fn accept_once(sock: &UnixSock, nonblock: bool) -> Result<Pending, isize> {
     loop {
         let popped = critical_section::with(|cs| {
             let mut st = sock.state.borrow(cs).borrow_mut();
@@ -1231,9 +1366,9 @@ pub(crate) fn accept_once(
                 None => None,
             }
         });
-        if let Some(((end, peer), room)) = popped {
+        if let Some((conn, room)) = popped {
             wake_all(room);
-            return Ok((end, peer));
+            return Ok(conn);
         }
         if nonblock {
             return Err(crate::err::EAGAIN);
@@ -1651,6 +1786,7 @@ pub(crate) fn connect_path(sock: &UnixSock, path: &str, nonblock: bool) -> isize
     match connect(&arc, &node, nonblock) {
         Ok(()) => 0,
         Err(ConnectRefused::Refused) => err::ECONNREFUSED,
+        Err(ConnectRefused::WrongType) => err::EPROTOTYPE,
         Err(ConnectRefused::Again) => err::EAGAIN,
         Err(ConnectRefused::Interrupted) => err::EINTR,
     }
@@ -1672,7 +1808,12 @@ pub(crate) fn connect_path(sock: &UnixSock, path: &str, nonblock: bool) -> isize
 /// answers `EAGAIN` to the sender - the receiver's slow read is the
 /// sender's problem to hear about, which is the honest version of Linux's
 /// socket-buffer accounting at this scale.
-pub(crate) fn send_dgram(sock: &UnixSock, data: &[u8], dest: Option<&UnixAddr>) -> isize {
+pub(crate) fn send_dgram(
+    sock: &UnixSock,
+    data: &[u8],
+    dest: Option<&UnixAddr>,
+    fds: Vec<Arc<crate::vfs::File>>,
+) -> isize {
     if data.len() > GRAM_MAX {
         return err::EMSGSIZE;
     }
@@ -1731,7 +1872,7 @@ pub(crate) fn send_dgram(sock: &UnixSock, data: &[u8], dest: Option<&UnixAddr>) 
         return err::ECONNREFUSED;
     }
     let from = sock.local_addr();
-    if target.push_dgram(data, from, self_cred()) {
+    if target.push_dgram(data, from, self_cred(), fds) {
         data.len() as isize
     } else {
         err::EAGAIN
@@ -1746,6 +1887,9 @@ pub(crate) struct RecvDgram {
     pub data: Vec<u8>,
     pub from: Option<UnixAddr>,
     pub cred: UCred,
+    /// The message's `SCM_RIGHTS` descriptors, cloned for a peek so the
+    /// queued record keeps its own set.
+    pub fds: Vec<Arc<crate::vfs::File>>,
 }
 
 /// The accept act, handler side: pop (or park), wrap the server half in a
@@ -1759,13 +1903,22 @@ pub(crate) struct RecvDgram {
 /// strong reference that keeps the accepted socket alive until the fd table
 /// has taken its own.
 pub(crate) fn accept_face(listener: &UnixSock, nonblock: bool) -> Result<Arc<UnixSock>, isize> {
-    let (end, peer) = accept_once(listener, nonblock)?;
-    // The listener's namespace, not the accepter's: the accepted socket is the
-    // server's other end, and it is the server's table an abstract name of its
-    // own would land in (Linux's `unix_accept` uses `sock_net` of the listener).
-    let accepted = alloc_in(listener.net_ns, listener.typ);
-    accepted.with_state_connect(end, peer);
-    Ok(accepted)
+    let pending = accept_once(listener, nonblock)?;
+    match pending {
+        // A message connection already *is* the server socket: `connect`
+        // minted it, pointed both ends at each other and recorded the
+        // credentials, so there is no channel left to wrap.
+        Pending::Messages(server) => Ok(server),
+        Pending::Stream(end, peer) => {
+            // The listener's namespace, not the accepter's: the accepted
+            // socket is the server's other end, and it is the server's table
+            // an abstract name of its own would land in (Linux's
+            // `unix_accept` uses `sock_net` of the listener).
+            let accepted = alloc_in(listener.net_ns, listener.typ);
+            accepted.with_state_connect(end, peer);
+            Ok(accepted)
+        }
+    }
 }
 
 impl UnixSock {

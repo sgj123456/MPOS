@@ -23,8 +23,6 @@ Section numbers are unchanged from the original `UAPI.md`.
   needs buffers not sized once at set construction (`docs/notes/` §4.3.3/§4.3.4).
   (`SO_LINGER{on, 0}`'s egress reset used to be here and is served now — it turned
   out smoltcp *can* send an unsolicited reset.)
-- **A named `SOCK_SEQPACKET` `AF_UNIX` connection** carries no message boundaries — served
-  as the byte stream this family has (`docs/notes/` §4.1).
 - **Console gaps:** `console=ttyN` pinning is refused rather than approximated, and
   `/dev/console` has no preferred-console plumbing (`docs/notes/` §7.1c).
 - **The `console` serial transmit wait** is fatal-signal-only, like `wait4` (§1.2).

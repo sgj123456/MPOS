@@ -141,6 +141,12 @@ pub const ESHUTDOWN: isize = -108;
 pub const ETIMEDOUT: isize = -110;
 /// ECONNREFUSED: the peer reset the connection attempt.
 pub const ECONNREFUSED: isize = -111;
+/// EPROTOTYPE: the destination socket carries a different kind of data than
+/// the caller's - `connect` on a path name whose socket is a different
+/// `SOCK_*` type. Linux's `unix_find_other` answers this for a filesystem
+/// name, while an abstract name misses its type-keyed lookup and reports
+/// `ECONNREFUSED` instead (both measured on a current host).
+pub const EPROTOTYPE: isize = -91;
 /// ECONNRESET: an established connection was reset by the peer, or by this
 /// side's own `SO_LINGER{on, 0}` close. A read of such a socket reports this,
 /// where one that never carried a connection reports `ENOTCONN` - the two are

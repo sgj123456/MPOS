@@ -29,8 +29,11 @@ nodes (`EOPNOTSUPP` - `/run` is ramfs); `mknod(S_IFSOCK)` still refuses, so
 only `bind` creates a socket name; `getpeername` answers `AF_UNIX` with an
 empty path (accepted peers carry no name). `SOCK_DGRAM` unix sockets are
 served whole-message (`t-unix-dgram`), and so is a `SOCK_SEQPACKET` *pair*;
-a *named* `SOCK_SEQPACKET` connection is served as the byte stream this
-family has, which is the one divergence left in the family.
+a *named* `SOCK_SEQPACKET` connection kept no message boundary until item 78,
+which now serves it as the same message pair a `socketpair` half is
+(`t-unix-seqpacket`): a send is one message, a short read discards the rest of
+that message, `MSG_PEEK`/`MSG_TRUNC` are the message family's answers, and
+`SCM_RIGHTS` rides the message's own record.
 
 **`SCM_RIGHTS` / `SCM_CREDENTIALS` / `SO_PEERCRED` are now answered** (see
 `t-unix-scm`): a unix (or socketpair) `sendmsg` can hand live descriptors
@@ -214,6 +217,54 @@ aarch64 `pass=191 fail=0`, `mpos-kunit 32 passed, 0 failed`, reaching `=== END`.
 (two new `vfs::pipe` tests), `xtask` 123; fmt/clippy clean on the touched files and the depgraph
 ratchet unchanged. Named rather than served: `NETLINK`/`AF_PACKET`/vsock peeks, the vsock
 `recvmsg`'s first-segment chain, and the zero-byte stream handover above.
+
+#### 4.1.3 A named `SOCK_SEQPACKET` connection keeps its messages — **SERVED** (2026-10-21)
+
+The one divergence left in the family until item 78: a listener at a path (or an abstract name)
+handed `accept` a `DuplexEnd` byte channel, so the connection the family calls "message
+boundaries over a stream" carried a byte stream. A `socketpair(AF_UNIX, SOCK_SEQPACKET, ...)`
+half was already a message queue; a *named* one was not, and the two shapes disagreed about the
+same type name.
+
+Measured whole on a current host first (`.workbuddy/probe_unix_seqpacket{,2,3}.c`, Linux 7.2.11,
+over abstract and path names):
+
+| The call | Linux 7.2.11 |
+|---|---|
+| `write` 3 then 5, `read` 64 twice | 3 then 5 - one send is one message |
+| `sendmsg` iovec 4+4+2, `read` 32 | 10, one message |
+| ten-byte message through a four-byte `read` | 4, the rest of that message discarded; next read `EAGAIN` |
+| `recvmsg(MSG_TRUNC, iov 4)` | 10, `msg_flags` `MSG_TRUNC`, consumed |
+| `recvmsg(MSG_PEEK, iov 16)` | 10, message left; the read after is the same ten |
+| zero-length send, `read` 8 | 0 - a zero-length message, consumed by that read |
+| `read(fd, buf, 0)` | 0, the front message left where it was |
+| `recvfrom`/`recvmsg` with a zero-length room | 0, `MSG_TRUNC` for `recvmsg`, message **consumed** |
+| `sendmsg` with `SCM_RIGHTS` | the receive installs the descriptor; a peek installs its own set and the take installs a second, distinct one |
+| zero-length message with `SCM_RIGHTS` | 0 and the descriptor is installed, message consumed |
+| stream dialing a seqpacket path name (and the reverse) | `EPROTOTYPE` (91); an abstract name misses its type-keyed lookup and answers `ECONNREFUSED` |
+
+The landing keeps the existing message machinery rather than adding a second one: the listener's
+queue now holds a `Pending` that is either a `DuplexEnd` server half (stream) or a server
+`UnixSock` already paired with the connector's (seqpacket), `connect_messages` mints and wires
+that pair outside the listener's critical section (dropping an unqueued socket under the lock
+would re-enter the registry's), and `accept` hands the queued socket straight out. Both ends then
+carry messages through the same `recvq`/`push_dgram` a `socketpair` half uses. The type refusal
+is `EPROTOTYPE` for a path name, which needed a new `ConnectRefused` arm and errno constant.
+
+Three details the measurement forced, each in the doors rather than in the family: `read(2)`
+with a zero-length buffer is a no-op (it used to take a message and answer 0, which consumed a
+zero-length message and, on a nonblocking empty queue, answered `EAGAIN` where Linux answers 0);
+`Dgram` now carries the message's `SCM_RIGHTS` descriptors, so `sendmsg` on a message socket
+collects them and `recvmsg` installs them (a peek clones the `Arc` list, so the record stays
+complete) - without that, moving the connection off `DuplexEnd` would have silently dropped the
+descriptor handover udev's own control socket can use; and `recvfrom` drops them, because it has
+no control buffer to install them into.
+
+**Pin**: `t-unix-seqpacket`, 58 claims, green on a current host first. `t-unix-dgram`'s
+"a named SOCK_SEQPACKET socket is served as a stream" claim became "…listens", which is what it
+was ever measuring. Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32/0
+on both. Named rather than served: `sendto` with a destination on an already-connected seqpacket
+socket answers `EISCONN` here where Linux sends (the same divergence `t-unix-dgram` pins).
 
 ### 4.2 ICMP Improvements — **DONE**
 

@@ -40,7 +40,10 @@
 //!     is what this claim's own name has always said ("a *named* SOCK_SEQPACKET
 //!     socket"). The no-std version never bound it because this kernel did not
 //!     require that; binding first makes the claim true on both machines rather
-//!     than a divergence to explain away.
+//!     than a divergence to explain away. What the listener *carries* is
+//!     `t-unix-seqpacket`'s claim now: the accepted pair keeps message
+//!     boundaries (item 78), where this file once said a named one was the
+//!     byte stream.
 //!
 //!   * **Three answers this kernel gives and Linux does not**, each named in its
 //!     own claim and accepted under `MPOS_ON_HOST=1` (where the host's own
@@ -224,9 +227,9 @@ fn main() {
     }
 
     // The three shapes of the path family open. SEQPACKET is udevd's
-    // control-socket shape: a *named* one is served as the stream this family
-    // carries - `listen` succeeds on it where a datagram answers EOPNOTSUPP -
-    // and only a connected pair carries messages. The name is bound first
+    // control-socket shape: a *named* one listens where a datagram answers
+    // EOPNOTSUPP, and the accepted pair it hands out carries message
+    // boundaries (`t-unix-seqpacket`). The name is bound first
     // because that is the claim (Linux refuses `listen` on an unbound one) and
     // because the no-std version's listen-on-an-unbound-socket was a claim about
     // this kernel, not about Linux.
@@ -245,7 +248,7 @@ fn main() {
             );
             check_ok(
                 &mut r,
-                "a named SOCK_SEQPACKET socket is served as a stream: listen succeeds",
+                "a named SOCK_SEQPACKET socket listens",
                 listen(&sp, 4),
             );
         }

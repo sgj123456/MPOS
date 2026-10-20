@@ -1863,7 +1863,7 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
         } else {
             None
         };
-        return crate::net::unix::send_dgram(sock, data, dest.as_ref());
+        return crate::net::unix::send_dgram(sock, data, dest.as_ref(), Vec::new());
     }
     // A connected pair's end: the send *is* a write. There is no destination
     // to parse and no control data this kernel carries, so the whole of the
@@ -1977,11 +1977,12 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
         }
         return crate::net::rtnl::send(handle, &data);
     }
-    // The datagram form of `sendmsg`: gather the iovecs, take the
+    // The message form of `sendmsg`: gather the iovecs, take the
     // destination from `msg_name` if there is one, and hand the whole to
-    // the same single-message send `sendto` reaches. Control data is not
-    // carried on a datagram send here - `SCM_RIGHTS` rides the connected
-    // stream, the shape every caller in this image uses it in.
+    // the same single-message send `sendto` reaches. Control data rides the
+    // message: descriptors named as `SCM_RIGHTS` are collected now and
+    // installed by the receive that takes this message, which is the shape
+    // a named sequenced-packet connection (udev's control socket) uses.
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
         && let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>()
         && sock.carries_messages()
@@ -2003,11 +2004,15 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
         } else {
             None
         };
+        let fds = match unsafe { collect_scm_rights(args[1], from_user) } {
+            Ok(fds) => fds,
+            Err(e) => return e,
+        };
         let mut data: Vec<u8> = Vec::new();
         if let Err(e) = gather_iovecs(iov, iovlen, from_user, &mut data) {
             return e;
         }
-        return crate::net::unix::send_dgram(sock, &data, dest.as_ref());
+        return crate::net::unix::send_dgram(sock, &data, dest.as_ref(), fds);
     }
     // A connected pair's end, in scatter-gather form: gather, then write.
     // No name is legal to send to, but an `SCM_RIGHTS` control buffer names
@@ -2901,8 +2906,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         // a datagram that exactly filled its buffer and one that
         // was cut off look identical from the count alone.
         let want = if sock.passcred() { Some(cred) } else { None };
-        let (used, ctrunc) =
-            unsafe { emit_unix_control(msghdr, Vec::new(), want, false, from_user) };
+        let (used, ctrunc) = unsafe { emit_unix_control(msghdr, got.fds, want, false, from_user) };
         let mut flags = 0;
         if ctrunc {
             flags |= MSG_CTRUNC;

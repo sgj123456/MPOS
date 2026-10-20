@@ -44,10 +44,10 @@
 //! looks its worker up by that number.
 //!
 //! The seqpacket cases at the end cover the other channel udevd opens, its
-//! control socket: a named `SOCK_SEQPACKET` listener is served as the byte
-//! stream this family has, and a paired one carries whole messages. Both are
-//! shapes a socket layer is likely to have to hand, and neither is what the
-//! worker channel uses.
+//! control socket: a named `SOCK_SEQPACKET` connection carries whole messages
+//! (`t-unix-seqpacket`), and a paired one does too. Both are shapes a socket
+//! layer is likely to have to hand, and neither is what the worker channel
+//! uses.
 //!
 //! # The migration
 //!
