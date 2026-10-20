@@ -3752,3 +3752,86 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `pass=188 fail=2 (190 built)`, and the two red programs are exactly `t-msg-peek` (its first
     `expect` panics on the refusal, exit 134) and `t-sock-flags` (its two EAGAIN claims), every
     other program green on both kernels.
+
+## item 73 - a `recvmsg`'s data room is the whole chain, and a stream's fault is not a datagram's
+
+    Every receive door but one takes a single buffer, so the message door was the only place a
+    *chain* of iovecs could appear - and it read the first non-empty segment and stopped there
+    (`first_iovec`, beside this code since the door was written). A caller with a `4+4+2` chain
+    got four bytes of a ten-byte message, answered 4, and never learned the rest was gone; and a
+    zero-length data room was `EINVAL` for every family, which item 72 named as that item's own
+    and left here. Both are served now, and the contract was measured whole on a current host
+    first (`.workbuddy/probe_recvmsg_iov.c`, Linux 7.2.x), one scenario per answer:
+
+    | room | datagram (`UDP`, `AF_UNIX`) | stream (`TCP`, `AF_UNIX`) |
+    |---|---|---|
+    | `12` into `5+5+5` | 12, `msg_flags` clear, every segment filled | 12, flags clear |
+    | `12` into `4+4+2` | 10, prefix scattered, **`MSG_TRUNC` set without being asked** | 10, flags clear, the other 2 stay queued |
+    | the same, `MSG_TRUNC` asked for | **12** returned, copy still 10 | 10 returned, copies **none**, consumes the 10 it counted |
+    | `12` into `0+0`, and no iovec at all | 0, `MSG_TRUNC`, **consumes** | 0, takes nothing |
+    | one segment, zero length, `MSG_TRUNC` | the datagram's own length | - |
+    | `4+unwritable` | `EFAULT`, **and the datagram is already gone** | `EFAULT`, **bytes still queued** |
+    | iovec array unreadable | `EFAULT` | `EFAULT` |
+    | `1025` iovecs | `EMSGSIZE` | `EMSGSIZE` (`sendmsg` too) |
+    | `MSG_PEEK` into `5+5` | 10, `MSG_TRUNC`, message whole | 10, message whole |
+
+    Three of those rows are the ones a single sentence would have got wrong. The datagram's
+    `MSG_TRUNC` is a *report* - the flag in `msg_flags` is set whether or not the caller asked,
+    exactly as `recvfrom` already did after item 72 - while the return changes only when the caller
+    asks. The stream's `MSG_TRUNC` is the opposite of a truncation: it counts the bytes it would
+    have copied and copies none of them, so the caller's segments keep every byte they came with.
+    And the two families answer the *fault* differently because they hold the message differently:
+    a datagram has already left the queue by the time its segments are written, so a bad segment
+    loses it (measured: `FIONREAD` 0 afterwards, the next receive `EAGAIN`), while a stream's
+    bytes are still in its buffer, so a bad segment leaves them (measured: the next receive still
+    reads all 12). `AF_UNIX` follows the same split - its datagram is taken, its stream is not.
+
+    **The fix is one object and one extra length.** `DataRoom` reads the iovec *array* once (an
+    unreadable array is `EFAULT`, and one longer than `IOV_MAX` - Linux's `UIO_MAXIOV`, 1024 - is
+    `EMSGSIZE` before anything else is looked at), then `validate`s the segments where the
+    family's rule says the check goes, `receive`s into the caller's own segment when the chain has
+    exactly one non-empty one (every `read`/`recv`/`recvfrom` and the ordinary `recvmsg`, so no
+    copy is added to the hot path) and into a scratch when it has more, and `scatter`s the answer
+    across the chain once the count is known. `RecvAnswer` grew a third length: `copied` is what
+    the call counts, `full` is the message's own length, and `written` is what actually reached
+    the caller's buffer - 0 in the one shape whose count is not a copy. `sendmsg`'s gather moved
+    to the same cap and the same errno. The unix channel's zero-length receive is the readiness
+    question item 72 measured on `AF_INET`, answered on `AF_UNIX` with `EINTR` instead of 0, and
+    it now parks on **either** readiness - a byte or a descriptor handover - because a
+    control-only reader whose peer sent an fd and no bytes would otherwise wait for ever.
+
+    **The pin's first guest run found two things, and one of them was the test's.**
+    `msg_name`'s sender claim read the client's port before the first send and the guest answered
+    `0.0.0.0:0`: a Linux `connect` on a `SOCK_DGRAM` socket binds it, and this kernel's does not -
+    the port appears on the first send's implicit bind, which item 72 had just taught to record
+    the endpoint. The claim now reads the port after the send, which is the same fix `t-msg-peek`
+    already carried for the same reason (and the read is what found it: the host run passed
+    either way, because on Linux there is a port to read). The other was real: a zero-length
+    `AF_UNIX` receive **with** room for control data did not park here (`wants_control` skipped
+    the wait so a queued handover could be picked up), while the probe's host parks exactly as it
+    does without one, and the queued-handover case is already answered by `empty_handover` and by
+    the readiness predicate now.
+
+    **Pin**: `t-recvmsg-iov`, a new program, **56 claims**, green on a current host first
+    (`MPOS_ON_HOST=1`, 56 of 56) and `ok:` for `ok:` identical on both machines. The calls go
+    through the raw `recvmsg` rather than a wrapper, because two of the claims are about pointers
+    no wrapper will build: a chain whose later segment points into a `PROT_NONE` page, and a chain
+    *array* that is itself unreadable.
+
+    **Counterfactual, every other pin kept** - two lines that make `DataRoom` keep only the first
+    non-empty segment, which is exactly what the door did before:
+
+    | reverted | result |
+    |---|---|
+    | `parse` keeps the **first** non-empty segment as the whole room (`if single.is_none()` + `if non_empty >= 1`) | `pass=190 fail=1 (191 built)`, and the one red program is **`t-recvmsg-iov`** with **21 of its 56 claims** red - every chain claim and the peek through a chain among them, while its single-segment, zero-length and `EMSGSIZE` claims stay green. `mpos-kunit 32 passed, 0 failed`. Restoring the two lines gives `pass=191 fail=0`, exit 33 |
+
+    **Two shapes stay named rather than claimed.** A **raw** socket's zero-length receive keeps
+    the `EINVAL` it has always given - the host this contract was measured on holds no
+    `CAP_NET_RAW`, so the probe could not answer for it (§5.2 says so beside the raw peek) - and
+    the **vsock** branch still reads its chain's first segment only, because nothing here could
+    measure that family either; both are named in §5.2 rather than guessed.
+
+    Gate: x86_64 `pass=191 fail=0 (191 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33 (11 of
+    202 left out by `tests.toml`); aarch64 `pass=190 fail=0`, `mpos-kunit 32 passed, 0 failed`,
+    reaching `=== END` (12 left out). Host unit suite 582 passed, `xtask` 123; `cargo fmt --check`
+    clean on the touched files; clippy's warning set is one *below* the committed tree's - the new scratch's zero-fill is `alloc::vec!` rather than a `Vec::new` + `resize` - and nothing new appears.

@@ -34,7 +34,36 @@ Section numbers are unchanged from the original `UAPI.md`.
   **Three shapes stay named rather than claimed**: a **raw** socket's peek (the host this
   contract was measured on has no `CAP_NET_RAW`, so it stays the honest `EOPNOTSUPP`); the other
   families' peeks (`AF_UNIX`, NETLINK, PACKET, vsock) which this pass did not touch; and
-  `recvmsg` with a zero-length data room, whose `EINVAL` predates this item and is its own.
+  `recvmsg` with a zero-length data room, whose `EINVAL` predated this item and was its own.
+
+- **A `recvmsg`'s data room is the whole iovec chain, and a stream's fault is not a datagram's.**
+  **Landed 2026-10-20** (`docs/uapi/` §5.1 item 73) - the item the `MSG_PEEK` bullet above left
+  named. Every receive door but `recvmsg` takes one buffer, so the message door had read the
+  *first non-empty iovec* and nothing else: a `4+4+2` chain got four bytes of a ten-byte message
+  and the rest of the chain was left alone, and a zero-length data room was `EINVAL` for every
+  family. Measured whole on a current host first (`.workbuddy/probe_recvmsg_iov.c`, Linux 7.2.x):
+  a **datagram** fills the chain in order and stops where it ends (`12` into `5+5+5` answers 12;
+  `12` into `4+4+2` answers 10, copies the prefix and sets `MSG_TRUNC` in `msg_flags` whether or
+  not the caller asked; with the flag asked for, the *return* is the datagram's own length while
+  the copy stays 10), a zero-length chain and an empty iovec array answer 0 with the cut flag and
+  **consume** the datagram, and a chain with a segment the kernel cannot write is `EFAULT` *after*
+  the take, so the queue is empty afterwards; a **stream** has no message to cut (`20` into
+  `4+4+2` answers 10 with `msg_flags` clear and leaves the other ten queued; `MSG_TRUNC` counts
+  ten, copies **none** and consumes them; a zero-length chain answers 0 and takes nothing; its
+  `EFAULT` leaves every byte queued); an iovec array longer than `UIO_MAXIOV` (1024) is
+  `EMSGSIZE` on both `recvmsg` and `sendmsg`, where this kernel answered `EINVAL` for the send
+  side; and `msg_name` is written the same way whatever the chain looks like. Served by one
+  `DataRoom` (the array read once, the segments read on every pass, a scratch and a scatter when
+  the chain is more than one segment and no copy at all when it is one) and by `RecvAnswer`'s
+  third length - `written`, which is what actually reached the caller's buffer and is 0 for the
+  one shape (`MSG_TRUNC` on a stream) whose count is not a copy. Pin: **`t-recvmsg-iov`**, a new
+  program, 56 claims, green on a current host first and `ok:` for `ok:` identical on both
+  machines; the pin's own first guest run found two things and both are recorded in item 73 (a
+  Linux `connect` binds a datagram socket where this kernel's does not, and a zero-length
+  `AF_UNIX` receive parks even when the caller left room for control data). Named rather than
+  claimed: a **raw** socket's zero-length receive keeps the `EINVAL` it always gave, and the
+  **vsock** branch still reads first-iovec only - neither was measured on the host this contract
+  came from.
 
 - **The second machine's configuration space, and a skip that was a claim.** **Landed
   2026-10-19** (`docs/uapi/` §5.1 item 70) — aarch64 already enumerated its bus through the

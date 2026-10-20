@@ -2583,10 +2583,10 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         // assumed, on a `NETLINK_USERSOCK` socket that sent itself a message:
         // `recvmsg` with an empty iovec returned 0 with `MSG_TRUNC` set, and
         // the next real receive found the queue empty.
-        if iovlen > 0 && !crate::uaccess::buffer_ok(iov, iovlen * 16, false, from_user) {
-            return err::EFAULT;
-        }
-        let (buf, len) = first_iovec(iov, iovlen, from_user).unwrap_or((0, 0));
+        let room = match DataRoom::parse(iov, iovlen, from_user) {
+            Ok(room) => room,
+            Err(e) => return e,
+        };
         // args[2] is the flags word: `MSG_DONTWAIT` here means the caller
         // wants an answer only if one is queued.
         let msg = match rtnl_answer(handle, args[2], fd) {
@@ -2594,16 +2594,16 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             Ok(None) => return err::EAGAIN,
             Err(e) => return e,
         };
-        let n = msg.len().min(len);
+        let n = match room.store(&msg) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
         unsafe {
             // `msg_flags` says what a short count cannot: the message did not
             // fit, so the rest of it is gone. Written either way, so a caller
             // never reads back a stale word.
             let flags = if n < msg.len() { MSG_TRUNC } else { 0 };
             ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags as i32);
-            if n > 0 {
-                core::ptr::copy_nonoverlapping(msg.as_ptr(), buf as *mut u8, n);
-            }
             if name != 0 && namelen != 0 {
                 let at = |offset: usize| (name + offset) as *mut u8;
                 (at(0) as *mut u16).write_unaligned(crate::uevent::AF_NETLINK);
@@ -2615,8 +2615,8 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         return n as isize;
     }
     // A packet socket's receive in scatter-gather form: one frame's payload
-    // into the first iovec, the sender's *link* address into `msg_name` - the
-    // same `sockaddr_ll` the `recvfrom` door writes.
+    // into the caller's whole data room, the sender's *link* address into
+    // `msg_name` - the same `sockaddr_ll` the `recvfrom` door writes.
     //
     // This branch exists because `busybox udhcpc` asks for its DHCP replies
     // this way, and neither of the two calls beside it: `d4_recv_raw_packet`
@@ -2637,15 +2637,12 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             Ok(fields) => fields,
             Err(e) => return e,
         };
-        if iovlen > 0 && !crate::uaccess::buffer_ok(iov, iovlen * 16, false, from_user) {
-            return err::EFAULT;
-        }
-        let (buf, len) = first_iovec(iov, iovlen, from_user).unwrap_or((0, 0));
+        let room = match DataRoom::parse(iov, iovlen, from_user) {
+            Ok(room) => room,
+            Err(e) => return e,
+        };
         if args[2] & MSG_PEEK != 0 {
             return err::EOPNOTSUPP;
-        }
-        if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
-            return err::EFAULT;
         }
         let frame = if dontwait(fd, args[2]) {
             match sock.try_recv() {
@@ -2662,10 +2659,10 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         };
         let (whole, src, proto) = frame;
         let payload = sock.received(&whole);
-        let n = payload.len().min(len);
-        unsafe {
-            core::ptr::copy_nonoverlapping(payload.as_ptr(), buf as *mut u8, n);
-        }
+        let n = match room.store(payload) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
         if name != 0
             && !crate::uaccess::buffer_ok(name, crate::link::SOCKADDR_LL_LEN, true, from_user)
         {
@@ -2719,73 +2716,69 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         // pointer is unreadable gets `EFAULT` rather than a silent zero-length
         // receive out of a bad pointer - "no iovec" and "an iovec I cannot
         // read" are not the same answer.
-        if iovlen > 0 && !crate::uaccess::buffer_ok(iov, iovlen * 16, false, from_user) {
-            return err::EFAULT;
-        }
-        let (buf, len) = first_iovec(iov, iovlen, from_user).unwrap_or((0, 0));
+        let room = match DataRoom::parse(iov, iovlen, from_user) {
+            Ok(room) => room,
+            Err(e) => return e,
+        };
         if args[2] & MSG_PEEK != 0 {
             return err::EOPNOTSUPP;
-        }
-        if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
-            return err::EFAULT;
         }
         if dontwait(fd, args[2]) && !file.inode().poll_ready().read {
             return err::EAGAIN;
         }
-        // An empty buffer is a real `&mut [u8]` rather than a null slice: the
-        // receive's own bookkeeping is what carries the answer here, and a
-        // null pointer with a zero length is not a slice Rust will accept.
-        let out: &mut [u8] = if len == 0 {
-            &mut []
-        } else {
-            unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) }
+        // A chain is received into a scratch and scattered after the take, so
+        // a segment the caller cannot write leaves the message consumed, as
+        // Linux's own fault does (measured: the next receive was `EAGAIN`).
+        let answer = room.receive(|out| match crate::net::unix::recv_dgram_cred(sock, out) {
+            Ok((n, from, cred, cut)) => Ok((n, (n, from, cred, cut))),
+            Err(e) => Err(crate::uaccess::err_of(e)),
+        });
+        let (n, from, cred, cut) = match answer {
+            Ok(answer) => answer,
+            Err(e) => return e,
         };
-        return match crate::net::unix::recv_dgram_cred(sock, out) {
-            Ok((n, from, cred, cut)) => {
-                if name != 0 {
-                    let r = crate::net::unix::write_addr(from.as_ref(), name, msghdr + 8);
-                    if r < 0 {
-                        return r;
-                    }
-                }
-                // The sender's credentials ride along when the reader
-                // asked for them, and `msg_controllen` says how much
-                // space the kernel actually used either way - leaving
-                // the caller's capacity in place would have it walk a
-                // control buffer nobody filled.
-                //
-                // `msg_flags` has two independent reports in it, and a
-                // caller can only act on them if they are not confused
-                // for each other: `MSG_CTRUNC` for control data the
-                // buffer could not hold, `MSG_TRUNC` for the message
-                // itself. A short return value cannot tell those apart -
-                // a datagram that exactly filled its buffer and one that
-                // was cut off look identical from the count alone.
-                let want = if sock.passcred() { Some(cred) } else { None };
-                let (used, ctrunc) =
-                    unsafe { emit_unix_control(msghdr, Vec::new(), want, false, from_user) };
-                let mut flags = 0;
-                if ctrunc {
-                    flags |= MSG_CTRUNC;
-                }
-                if cut {
-                    flags |= MSG_TRUNC;
-                }
-                unsafe {
-                    ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags);
-                    ((msghdr + MSGHDR_CONTROLLEN) as *mut usize).write_unaligned(used);
-                }
-                n as isize
+        if name != 0 {
+            let r = crate::net::unix::write_addr(from.as_ref(), name, msghdr + 8);
+            if r < 0 {
+                return r;
             }
-            Err(e) => crate::uaccess::err_of(e),
-        };
+        }
+        // The sender's credentials ride along when the reader
+        // asked for them, and `msg_controllen` says how much
+        // space the kernel actually used either way - leaving
+        // the caller's capacity in place would have it walk a
+        // control buffer nobody filled.
+        //
+        // `msg_flags` has two independent reports in it, and a
+        // caller can only act on them if they are not confused
+        // for each other: `MSG_CTRUNC` for control data the
+        // buffer could not hold, `MSG_TRUNC` for the message
+        // itself. A short return value cannot tell those apart -
+        // a datagram that exactly filled its buffer and one that
+        // was cut off look identical from the count alone.
+        let want = if sock.passcred() { Some(cred) } else { None };
+        let (used, ctrunc) =
+            unsafe { emit_unix_control(msghdr, Vec::new(), want, false, from_user) };
+        let mut flags = 0;
+        if ctrunc {
+            flags |= MSG_CTRUNC;
+        }
+        if cut {
+            flags |= MSG_TRUNC;
+        }
+        unsafe {
+            ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags);
+            ((msghdr + MSGHDR_CONTROLLEN) as *mut usize).write_unaligned(used);
+        }
+        return n as isize;
     }
-    // The read side of a connected pair's end, in scatter-gather form: one
-    // contiguous read into the first iovec, plus the control chain a unix
-    // channel may carry - handed-over descriptors and, for a reader that set
-    // `SO_PASSCRED`, the peer's credentials. A caller with no iovec and no
-    // control buffer and nothing to wait for is `EINVAL`; a control-only read
-    // (a zero-length iovec, room for a cmsg) picks up a queued handover.
+    // The read side of a connected pair's end, in scatter-gather form: the
+    // caller's whole data room, plus the control chain a unix channel may
+    // carry - handed-over descriptors and, for a reader that set
+    // `SO_PASSCRED`, the peer's credentials. A zero-length room is a receive
+    // too: it answers 0 when the stream is ready and takes nothing, and a
+    // control-only read (a zero-length iovec, room for a cmsg) picks up a
+    // queued handover.
     if let Some(file) = channel_of_fd(fd) {
         let (name, namelen, iov, iovlen) = match read_msghdr(msghdr, from_user) {
             Ok(fields) => fields,
@@ -2794,23 +2787,21 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         if !crate::uaccess::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
             return err::EFAULT;
         }
-        let wants_control = unsafe {
-            ((msghdr + MSGHDR_CONTROL) as *const usize).read_unaligned() != 0
-                && ((msghdr + MSGHDR_CONTROLLEN) as *const usize).read_unaligned() >= CMSG_HDRLEN
+        let room = match DataRoom::parse(iov, iovlen, from_user) {
+            Ok(room) => room,
+            Err(e) => return e,
         };
-        let (buf, len) = match first_iovec(iov, iovlen, from_user) {
-            Some(pair) => pair,
-            None if wants_control => (0usize, 0usize),
-            None => return err::EINVAL,
-        };
-        if len == 0 && !wants_control {
-            return err::EINVAL;
-        }
         if args[2] & MSG_PEEK != 0 {
             // A peek needs the front of the queue without the take, and a
             // pipe has no way to look. Refusing beats consuming bytes the
             // caller meant to keep.
             return err::EOPNOTSUPP;
+        }
+        // A stream's fault leaves its bytes queued (measured: 12 into
+        // `4+unreadable` answered `EFAULT` and the next receive still read
+        // all 12), so the room is checked whole before the read.
+        if let Err(e) = room.validate() {
+            return e;
         }
         // A handover that is already due, and no bytes to go with it, is the
         // one case where reading would park forever on something the caller
@@ -2824,17 +2815,38 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             return err::EAGAIN;
         }
         let mut n = 0isize;
-        if len > 0 {
-            if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
-                return err::EFAULT;
+        if room.is_empty() {
+            // A zero-length stream receive is Linux's readiness question: it
+            // answers 0 when the stream has something to say - bytes, EOF, or
+            // a descriptor handover waiting to be picked up - and takes
+            // nothing; on an empty queue it parks like any other receive.
+            // Measured on AF_UNIX: a signal that ends that park answers
+            // `EINTR` (1000 ms then `EINTR`), where a TCP park of the same
+            // shape answers 0 - and the park happens whether or not the caller
+            // left room for control data, which is why this is not gated on
+            // `wants_control`: a zero-length iovec *with* a cmsg buffer
+            // parked on the probe's host exactly as one without did.
+            let ready = || {
+                file.inode().poll_ready().read
+                    || on_channel(&file, |c| c.scm_due()).unwrap_or(false)
+            };
+            while !ready() {
+                if crate::sched::has_deliverable_signal() {
+                    return err::EINTR;
+                }
+                if park_until(ready) == err::EINTR {
+                    return err::EINTR;
+                }
             }
-            if !empty_handover {
-                let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
-                n = match file.read(out) {
-                    Ok(n) => n as isize,
-                    Err(e) => return crate::uaccess::err_of(e),
-                };
-            }
+        } else if !empty_handover {
+            let got = room.receive(|out| match file.read(out) {
+                Ok(n) => Ok((n, n as isize)),
+                Err(e) => Err(crate::uaccess::err_of(e)),
+            });
+            n = match got {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
             // Zero bytes, deliberately: the caller gets the descriptors and a
             // stream that has not ended. A receiver that sees a short read must
             // consult its control buffer before concluding end-of-stream - which
@@ -2924,12 +2936,10 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         Ok(fields) => fields,
         Err(e) => return e,
     };
-    let Some((buf, len)) = first_iovec(iov, iovlen, from_user) else {
-        return err::EINVAL;
+    let room = match DataRoom::parse(iov, iovlen, from_user) {
+        Ok(room) => room,
+        Err(e) => return e,
     };
-    if len == 0 {
-        return err::EINVAL;
-    }
     // The source goes back into `msg_name`, its length into `msg_namelen`
     // at offset 8 - updated in place, as the socklen_t in-out it is.
     let src = if name != 0 && namelen != 0 {
@@ -2941,24 +2951,51 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         return e;
     }
     if crate::uevent::exists(handle) {
-        return recvmsg_netlink(
-            msghdr,
-            buf,
-            len,
-            name,
-            namelen,
-            handle,
-            dontwait(fd, args[2]),
-        );
+        let got = room.receive(|out| {
+            let n = recvmsg_netlink(
+                msghdr,
+                out.as_mut_ptr() as usize,
+                out.len(),
+                name,
+                namelen,
+                handle,
+                dontwait(fd, args[2]),
+            );
+            if n < 0 { Err(n) } else { Ok((n as usize, n)) }
+        });
+        return match got {
+            Ok(n) => n,
+            Err(e) => e,
+        };
     }
-    let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
     let nonblock = dontwait(fd, args[2]);
     // The two readings `recvfrom` reads off the same flag word (`MSG_PEEK` and
     // `MSG_TRUNC`), plus what `recvmsg` alone can say: `msg_flags` reports a
     // datagram the buffer cut even though the count returned is the copy's.
     let peek = args[2] & MSG_PEEK != 0;
     let truncate = args[2] & MSG_TRUNC as usize != 0;
-    let answer = match recv_common(handle, out, src, nonblock, peek, truncate) {
+    let typ = super::with(handle, |_, entry| entry.typ).unwrap_or(0);
+    // A raw socket's zero-length receive is unmeasured - the host this
+    // contract was measured on holds no `CAP_NET_RAW` - so it keeps the
+    // refusal it has always given; `docs/uapi/` §5.2 names it beside the raw
+    // peek. A stream checks its whole room first: its own fault leaves the
+    // bytes queued (measured), unlike a datagram's.
+    if room.is_empty() && typ == SOCK_RAW {
+        return err::EINVAL;
+    }
+    if typ == SOCK_STREAM
+        && let Err(e) = room.validate()
+    {
+        return e;
+    }
+    let (answer, ttl) = match room.receive(|out| {
+        let answer = recv_common(handle, out, src, nonblock, peek, truncate)?;
+        // The hop count is read here, while the answer's bytes are still in
+        // hand: a chain has scattered them by the time `receive` returns. Only
+        // what actually reached the caller's buffer is scattered - a stream
+        // receive with `MSG_TRUNC` counted bytes it deliberately did not copy.
+        Ok((answer.written, (answer, out.get(8).copied())))
+    }) {
         Ok(answer) => answer,
         Err(e) => return e,
     };
@@ -2988,7 +3025,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         if !crate::uaccess::buffer_ok(control, CMSG_RECVTTL_LEN, true, from_user) {
             return err::EFAULT;
         }
-        let ttl = out[8] as u32;
+        let ttl = ttl.unwrap_or(0) as u32;
         unsafe {
             let at = |offset: usize| (control + offset) as *mut u8;
             (at(0) as *mut u64).write_unaligned(CMSG_RECVTTL_LEN as u64); // cmsg_len
@@ -3027,12 +3064,24 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
 /// cannot tell "exactly filled" from "cut off".
 struct RecvAnswer {
     copied: usize,
+    /// How many of those bytes actually reached the caller's buffer. They are
+    /// the same number everywhere but one shape: a **stream** receive with
+    /// `MSG_TRUNC` counts the bytes it would have copied and copies none of
+    /// them (measured). A `recvmsg` into several iovecs scatters this many, so
+    /// keeping it apart is what stops that shape writing zeros over a buffer
+    /// Linux leaves alone.
+    written: usize,
     full: usize,
     endpoint: Option<IpEndpoint>,
 }
 
 enum RecvStep {
-    Got(usize, usize, Option<IpEndpoint>),
+    Got {
+        copied: usize,
+        written: usize,
+        full: usize,
+        endpoint: Option<IpEndpoint>,
+    },
     Wait,
     Err(isize),
 }
@@ -3076,6 +3125,7 @@ fn recv_common(
             let (copied, endpoint) = raw_recv(handle, out, nonblock)?;
             RecvAnswer {
                 copied,
+                written: copied,
                 full: copied,
                 endpoint,
             }
@@ -3158,12 +3208,18 @@ fn tcp_recv(
                 *connected = true;
             }
             if empty {
+                let report = RecvStep::Got {
+                    copied: 0,
+                    written: 0,
+                    full: 0,
+                    endpoint: None,
+                };
                 if sock.can_recv() {
-                    return RecvStep::Got(0, 0, None);
+                    return report;
                 }
                 return match sock.peek(1) {
                     Ok(_) => RecvStep::Wait,
-                    Err(tcp::RecvError::Finished) => RecvStep::Got(0, 0, None),
+                    Err(tcp::RecvError::Finished) => report,
                     Err(tcp::RecvError::InvalidState) => RecvStep::Err(if *connected {
                         err::ECONNRESET
                     } else {
@@ -3205,22 +3261,42 @@ fn tcp_recv(
                 }
             };
             match copied {
-                None => RecvStep::Got(0, 0, None),
+                None => RecvStep::Got {
+                    copied: 0,
+                    written: 0,
+                    full: 0,
+                    endpoint: None,
+                },
                 Some(0) => RecvStep::Wait,
                 Some(n) => {
                     if !peek {
                         dequeue_stream(sock, n);
                     }
-                    RecvStep::Got(n, n, None)
+                    // `MSG_TRUNC` on a stream copies none of the bytes it
+                    // counted (measured: the caller's buffer keeps every byte
+                    // it came with), and `msg_flags` stays clear because a
+                    // stream has no message boundary to cut.
+                    RecvStep::Got {
+                        copied: n,
+                        written: if truncate { 0 } else { n },
+                        full: n,
+                        endpoint: None,
+                    }
                 }
             }
         });
         match step {
-            Some(RecvStep::Got(copied, full, ep)) => {
+            Some(RecvStep::Got {
+                copied,
+                written,
+                full,
+                endpoint,
+            }) => {
                 return Ok(RecvAnswer {
                     copied,
+                    written,
                     full,
-                    endpoint: ep,
+                    endpoint,
                 });
             }
             Some(RecvStep::Err(e)) => return Err(e),
@@ -3233,6 +3309,7 @@ fn tcp_recv(
             return if empty {
                 Ok(RecvAnswer {
                     copied: 0,
+                    written: 0,
                     full: 0,
                     endpoint: None,
                 })
@@ -3244,6 +3321,7 @@ fn tcp_recv(
             return if empty {
                 Ok(RecvAnswer {
                     copied: 0,
+                    written: 0,
                     full: 0,
                     endpoint: None,
                 })
@@ -3313,7 +3391,12 @@ fn udp_recv(
                     if !peek {
                         let _ = sock.recv();
                     }
-                    RecvStep::Got(copied, full, Some(endpoint))
+                    RecvStep::Got {
+                        copied,
+                        written: copied,
+                        full,
+                        endpoint: Some(endpoint),
+                    }
                 }
                 Err(udp::RecvError::Exhausted) => RecvStep::Wait,
                 // `peek` never truncates - it hands back the whole payload -
@@ -3324,11 +3407,17 @@ fn udp_recv(
             }
         });
         match step {
-            Some(RecvStep::Got(copied, full, ep)) => {
+            Some(RecvStep::Got {
+                copied,
+                written,
+                full,
+                endpoint,
+            }) => {
                 return Ok(RecvAnswer {
                     copied,
+                    written,
                     full,
-                    endpoint: ep,
+                    endpoint,
                 });
             }
             Some(RecvStep::Err(e)) => return Err(e),
@@ -5224,6 +5313,176 @@ pub(crate) fn handle_getsockopt(args: [usize; 6], from_user: bool) -> isize {
 // msghdr plumbing
 // ---------------------------------------------------------------------------
 
+/// Linux's `UIO_MAXIOV`. A chain longer than this is `EMSGSIZE` on both
+/// `sendmsg` and `recvmsg` - measured on a current host, one iovec past the
+/// cap, where an earlier reading of the man pages would have guessed `EINVAL`.
+const IOV_MAX: usize = 1024;
+
+/// The caller's data room for one receive: the iovec chain a `recvmsg` names,
+/// or the one buffer a `read`/`recv`/`recvfrom` hands over.
+///
+/// The stack's receive doors take one contiguous slice, so a chain of more than
+/// one non-empty segment is received into a scratch buffer and scattered once
+/// the answer knows how many bytes it carries. A chain with exactly one
+/// non-empty segment - every `read`, `recv` and `recvfrom`, and the ordinary
+/// `recvmsg` - is that segment itself and costs no copy.
+struct DataRoom {
+    iov: usize,
+    iovlen: usize,
+    from_user: bool,
+    /// The writable bytes the caller offered, capped at `MAX_IO` because that
+    /// is the largest room the receive doors accept.
+    total: usize,
+    /// The only non-empty segment, when the chain has exactly one.
+    single: Option<(usize, usize)>,
+}
+
+impl DataRoom {
+    /// Read the iovec array. The *array* is validated here - an unreadable one
+    /// is `EFAULT` - but the segments' pointers are not: a datagram receive is
+    /// allowed to take the message before it discovers a segment it cannot
+    /// write (Linux does exactly that, measured: a 12-byte datagram into
+    /// `4+unreadable` answered `EFAULT` and the queue was empty afterwards),
+    /// and `scatter` is where that discovery belongs. A stream calls
+    /// `validate` first, because its own fault leaves the bytes queued.
+    fn parse(iov: usize, iovlen: usize, from_user: bool) -> Result<Self, isize> {
+        if iovlen > IOV_MAX {
+            return Err(err::EMSGSIZE);
+        }
+        let mut room = DataRoom {
+            iov,
+            iovlen,
+            from_user,
+            total: 0,
+            single: None,
+        };
+        if iovlen == 0 {
+            return Ok(room);
+        }
+        if iov == 0 || !crate::uaccess::buffer_ok(iov, iovlen * 16, false, from_user) {
+            return Err(err::EFAULT);
+        }
+        let mut single = None;
+        let mut non_empty = 0;
+        for i in 0..iovlen {
+            let (ptr, len) = room.segment(i);
+            if len == 0 {
+                continue;
+            }
+            non_empty += 1;
+            single = Some((ptr, len));
+            room.total = room.total.saturating_add(len);
+        }
+        room.total = room.total.min(crate::uaccess::MAX_IO);
+        if non_empty == 1 {
+            room.single = single;
+        }
+        Ok(room)
+    }
+
+    fn segment(&self, i: usize) -> (usize, usize) {
+        let base = self.iov + i * 16;
+        unsafe {
+            (
+                (base as *const usize).read_volatile(),
+                ((base + 8) as *const usize).read_volatile(),
+            )
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// Whether every non-empty segment can be written. A stream asks this
+    /// before it reads: Linux's `EFAULT` on a stream leaves the bytes queued
+    /// (measured: 12 into `4+unreadable` answered `EFAULT`, and the next
+    /// receive still read all 12), and the only way to promise that is to
+    /// refuse before the take.
+    fn validate(&self) -> Result<(), isize> {
+        for i in 0..self.iovlen {
+            let (ptr, len) = self.segment(i);
+            if len == 0 {
+                continue;
+            }
+            if !crate::uaccess::buffer_ok(ptr, len, true, self.from_user) {
+                return Err(err::EFAULT);
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy `data` into the room, segment by segment, and answer how many bytes
+    /// fitted. Segments before an unwritable one keep what was written into
+    /// them - the partial copy Linux's `copy_to_iter` makes before it faults.
+    fn scatter(&self, data: &[u8]) -> Result<usize, isize> {
+        let mut at = 0usize;
+        for i in 0..self.iovlen {
+            if at == data.len() {
+                break;
+            }
+            let (ptr, len) = self.segment(i);
+            if len == 0 {
+                continue;
+            }
+            let take = len.min(data.len() - at);
+            if !crate::uaccess::buffer_ok(ptr, take, true, self.from_user) {
+                return Err(err::EFAULT);
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(data[at..].as_ptr(), ptr as *mut u8, take);
+            }
+            at += take;
+        }
+        Ok(at)
+    }
+
+    /// Put a message the family already holds (a netlink frame, a packet's
+    /// payload) into the caller's room, and answer what fitted.
+    fn store(&self, data: &[u8]) -> Result<usize, isize> {
+        if let Some((ptr, len)) = self.single {
+            if !crate::uaccess::buffer_ok(ptr, len, true, self.from_user) {
+                return Err(err::EFAULT);
+            }
+            let n = data.len().min(len);
+            if n > 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, n);
+                }
+            }
+            return Ok(n);
+        }
+        let n = data.len().min(self.total);
+        self.scatter(&data[..n])
+    }
+
+    /// Receive into the caller's room. `fill` gets one contiguous buffer - the
+    /// caller's own when the chain is one segment, else a scratch - and answers
+    /// the byte count it wrote plus whatever the family needs to keep. A chain
+    /// is scattered only after the answer knows the count.
+    fn receive<T>(
+        &self,
+        fill: impl FnOnce(&mut [u8]) -> Result<(usize, T), isize>,
+    ) -> Result<T, isize> {
+        if let Some((ptr, len)) = self.single {
+            if !crate::uaccess::buffer_ok(ptr, len, true, self.from_user) {
+                return Err(err::EFAULT);
+            }
+            let out = unsafe { slice::from_raw_parts_mut(ptr as *mut u8, len) };
+            return fill(out).map(|(_, value)| value);
+        }
+        // A scratch for the chain's whole room: the family fills it as if the
+        // caller had handed one buffer, and `scatter` spreads the answer
+        // afterwards. Zeroed rather than uninitialised because a caller reads
+        // the segments it offered, not only the ones the kernel wrote.
+        let mut scratch = alloc::vec![0u8; self.total];
+        let (n, value) = fill(&mut scratch)?;
+        let n = n.min(scratch.len());
+        self.scatter(&scratch[..n])?;
+        Ok(value)
+    }
+}
+
 /// Read the four fields of a `struct msghdr` that matter here: destination
 /// name and length, and the iovec array and its length.
 fn read_msghdr(ptr: usize, from_user: bool) -> Result<(usize, u32, usize, usize), isize> {
@@ -5250,8 +5509,8 @@ fn gather_iovecs(
     from_user: bool,
     data: &mut Vec<u8>,
 ) -> Result<(), isize> {
-    if iovlen > 1024 {
-        return Err(err::EINVAL);
+    if iovlen > IOV_MAX {
+        return Err(err::EMSGSIZE);
     }
     if iovlen == 0 {
         return Ok(());

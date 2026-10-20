@@ -452,6 +452,27 @@ counterfactual (every peek refused again, one line) is `pass=188 fail=2`, exactl
 pins. The pass also fixed `t-ns-net`'s handover fixture, which connected before the child's
 listener announced itself - a race the new socket timing lost on aarch64.
 
+**A `recvmsg`'s data room is the whole chain, and a stream's fault is not a datagram's**
+(`docs/uapi/` §5.1 item 73, landed 2026-10-20): the item the `MSG_PEEK` landing above left named.
+Every receive door but the message door takes one buffer, so `recvmsg` had read the **first
+non-empty iovec** and stopped — a `4+4+2` chain got four bytes of a ten-byte message and answered
+4 — and a zero-length data room was `EINVAL` for every family. Measured whole on a current host
+first (`.workbuddy/probe_recvmsg_iov.c`, Linux 7.2.x): a datagram fills the chain in order and
+stops where it ends, sets `MSG_TRUNC` in `msg_flags` without being asked, answers its own length
+when the flag *is* asked for, and a zero-length chain consumes it; a stream has no message to cut
+— `MSG_TRUNC` counts the bytes it would have copied, copies none and consumes them, a zero-length
+chain answers 0 and takes nothing — and a fault on a segment costs a datagram its message but
+leaves a stream's bytes queued. An iovec array longer than `UIO_MAXIOV` is `EMSGSIZE` on both
+doors, where the send side answered `EINVAL`. Served by one `DataRoom` (the array read once, no
+copy at all when the chain has a single non-empty segment) and by `RecvAnswer`'s third length —
+`written`, 0 in the one shape whose count is not a copy. Pins: the new `t-recvmsg-iov` (56 claims,
+green on the host first, `ok:` for `ok:` identical on both machines); the counterfactual (the
+first-iovec rule restored, two lines) is `pass=190 fail=1` with 21 of those claims red, and every
+single-segment, zero-length and `EMSGSIZE` claim still green. Gate: x86_64 `pass=191 fail=0`,
+aarch64 `pass=190 fail=0`, `mpos-kunit` 32/0 on both. Named: a **raw** socket's zero-length
+receive keeps its `EINVAL` and the **vsock** branch still reads its first segment — neither could
+be measured on the host this contract came from.
+
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
 record-only was wrong in both halves - the figure stored was the caller's rather than Linux's,  
