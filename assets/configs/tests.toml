@@ -57,6 +57,14 @@ default = []
 #                        blocked three of four sweep runs while this file
 #                        listed it as a machine check, and the same kernel
 #                        answered 3/3 from the run machine minutes earlier.
+#   t-raw-recvmsg        the same peer, for the same reason: a guest's raw
+#                        socket lives on `eth0` and never on the loopback, so
+#                        every shape it pins - the zero-length room, the peek,
+#                        the truncation word, the chain, the fault - starts
+#                        from one queued packet, and the packet comes from
+#                        beyond slirp. What it asserts is the door's own
+#                        answers, which is what makes the internet a
+#                        prerequisite rather than the subject.
 #   t-tcp-close          needs a listener on the host's 127.0.0.1:4599; with
 #                        none it prints `skip:` and passes, so it is a probe
 #                        and not a gate in either state
@@ -66,7 +74,7 @@ default = []
 #                        *door* - the AF_PACKET socket, its name and its bind
 #                        - is this machine's, and is the part the program
 #                        asserts before it sends.
-external = ["t-dhcp", "t-dns", "t-rawicmp", "t-stdresolve", "t-tcp-close", "t-udp"]
+external = ["t-dhcp", "t-dns", "t-rawicmp", "t-raw-recvmsg", "t-stdresolve", "t-tcp-close", "t-udp"]
 
 # Slow, or a measurement rather than an assertion. `t-fill-ramfs` writes up to
 # 1024 MiB a chunk at a time; the other three are instruments whose numbers are

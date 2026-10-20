@@ -31,10 +31,10 @@ Section numbers are unchanged from the original `UAPI.md`.
   one line with every pin kept (every peek refused again): `pass=188 fail=2`, exactly the two
   pins. `t-ns-net`'s own fixture was fixed on the way - it connected before the child's
   listener announced itself, a race the new socket timing lost on aarch64.
-  **Three shapes stay named rather than claimed**: a **raw** socket's peek (the host this
-  contract was measured on has no `CAP_NET_RAW`, so it stays the honest `EOPNOTSUPP`); the other
-  families' peeks (`AF_UNIX`, NETLINK, PACKET, vsock) which this pass did not touch; and
-  `recvmsg` with a zero-length data room, whose `EINVAL` predated this item and was its own.
+  **Two shapes stay named rather than claimed**: the other families' peeks (`AF_UNIX`, NETLINK,
+  PACKET, vsock) which this pass did not touch, and `recvmsg` with a zero-length data room, whose
+  `EINVAL` predated this item and was its own. The **raw** peek this bullet first named was
+  served by item 74, which made the capability the host lacked instead of naming around it.
 
 - **A `recvmsg`'s data room is the whole iovec chain, and a stream's fault is not a datagram's.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 73) - the item the `MSG_PEEK` bullet above left
@@ -61,9 +61,33 @@ Section numbers are unchanged from the original `UAPI.md`.
   machines; the pin's own first guest run found two things and both are recorded in item 73 (a
   Linux `connect` binds a datagram socket where this kernel's does not, and a zero-length
   `AF_UNIX` receive parks even when the caller left room for control data). Named rather than
-  claimed: a **raw** socket's zero-length receive keeps the `EINVAL` it always gave, and the
-  **vsock** branch still reads first-iovec only - neither was measured on the host this contract
-  came from.
+  claimed: the **vsock** branch still reads first-iovec only - nothing here could measure that
+  family - and the **raw** socket's zero-length receive kept the `EINVAL` it always gave until
+  item 74 made the capability the host lacked and served it the datagram answer.
+
+- **A raw socket's receive is a datagram's, and its hop count is read off the packet.**
+  **Landed 2026-10-20** (`docs/uapi/` §5.1 item 74) - the two shapes the item 72 and item 73
+  bullets above left named, both of them named around a host that holds no `CAP_NET_RAW`. The
+  probe makes the capability instead: `unshare(CLONE_NEWUSER|CLONE_NEWNET)` hands the whole set
+  inside a user namespace of its own, and a network namespace that namespace owns is one
+  `ns_capable(CAP_NET_RAW)` answers for (item 43's rule from the other side); `lo` up, ICMP echo
+  *replies* to itself (type 0, which the kernel's own ICMP input does not answer, so one send is
+  one packet), and every answer is the datagram's (`.workbuddy/probe_raw_recvmsg.c`, Linux
+  7.2.11): a zero-length room answers 0 with `MSG_TRUNC` and **consumes**, no iovec at all
+  answers 0 and consumes, a 4-byte segment of a 36-byte packet answers 4 with `MSG_TRUNC`
+  **unasked** and 36 when the flag *is* asked, `MSG_PEEK` copies without taking through a full
+  segment and a zero-length room alike, a chain 4+`PROT_NONE` is `EFAULT` with the packet gone,
+  1025 segments is `EMSGSIZE` with the packet still queued, and the sender's name is the header's.
+  The `IP_RECVTTL` record rides along even when the buffer cut the header short - so the octet is
+  read off the packet (`RecvAnswer::ttl`), the gate is the packet's length rather than the copy's,
+  `cmsg_len` is the unpadded `CMSG_LEN(4)` (20; the space it occupies is 24, which is what
+  `msg_controllen` reports), and `cmsg_type` is `IP_TTL` (2), not the `IP_RECVTTL` (12) that asks
+  for it - `t-rawicmp`'s claim had read 24 and 12 and now reads the host's own 20 and 2. Pin:
+  **`t-raw-recvmsg`**, a new program, 50 claims, green on the host first (the host run makes its
+  own door as the probe does) and `ok:` for `ok:` identical on both machines. Its first guest run
+  lost one echo beyond slirp and went red on a packet that never came, so `queue_one` now drains,
+  sends and confirms with a bounded peek. Named: the **vsock** branch still reads its chain's
+  first segment only.
 
 - **The second machine's configuration space, and a skip that was a claim.** **Landed
   2026-10-19** (`docs/uapi/` §5.1 item 70) — aarch64 already enumerated its bus through the

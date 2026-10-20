@@ -303,7 +303,14 @@ const TCP_NODELAY: usize = 1;
 /// that asks for `IP_RECVTTL` is told, message by message, the hop count
 /// the packet arrived with - `ping`'s `ttl=` comes from nowhere else.
 const SOL_IP: usize = 0;
+/// The *option* number `setsockopt`/`getsockopt` speak: asking for the hop
+/// count is `IP_RECVTTL` (12). The record that answers is named by a
+/// different word: Linux's `ip_cmsg_recv_ttl` writes `put_cmsg(msg, SOL_IP,
+/// IP_TTL, ...)`, so the control message's `cmsg_type` is `IP_TTL` (2) -
+/// measured on the host (`.workbuddy/probe_raw_recvmsg.c`: `level=0 type=2`),
+/// and the same word `cmsg(3)`'s own example checks for.
 const IP_RECVTTL: usize = 12;
+const IP_TTL: usize = 2;
 
 // --- AF_UNIX control messages and peer credentials (unix(7), socket(7)) ---
 /// The two options `setsockopt`/`getsockopt` speak at `SOL_SOCKET` for a unix
@@ -371,9 +378,13 @@ const MSGHDR_FLAGS: usize = 48;
 /// their offsets in the same layout.
 const MSGHDR_CONTROL: usize = 32;
 const MSGHDR_CONTROLLEN: usize = 40;
-/// The size of one `IP_RECVTTL` control message on x86_64: a 16-byte
-/// `cmsghdr` (two `size_t`-aligned ints follow the length) plus the one
-/// `int` of data, the total padded to word size.
+/// The room one `IP_RECVTTL` record occupies: `CMSG_SPACE(4)` - a 16-byte
+/// `cmsghdr` (two `size_t`-aligned ints follow the length) plus the one `int`
+/// of data, the total padded to word size. The header's own `cmsg_len` is the
+/// *unpadded* `CMSG_LEN(4)` (20), which is what Linux writes and what musl's
+/// `CMSG_NEXT` walks by; conflating the two words wrote 24 into both until the
+/// host measurement caught it (`.workbuddy/probe_raw_recvmsg.c`: a 36-byte
+/// packet through a 4-byte segment answered `controllen=24 cmsg_len=20`).
 const CMSG_RECVTTL_LEN: usize = 24;
 
 // ---------------------------------------------------------------------------
@@ -2975,14 +2986,10 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
     let peek = args[2] & MSG_PEEK != 0;
     let truncate = args[2] & MSG_TRUNC as usize != 0;
     let typ = super::with(handle, |_, entry| entry.typ).unwrap_or(0);
-    // A raw socket's zero-length receive is unmeasured - the host this
-    // contract was measured on holds no `CAP_NET_RAW` - so it keeps the
-    // refusal it has always given; `docs/uapi/` §5.2 names it beside the raw
-    // peek. A stream checks its whole room first: its own fault leaves the
-    // bytes queued (measured), unlike a datagram's.
-    if room.is_empty() && typ == SOCK_RAW {
-        return err::EINVAL;
-    }
+    // A stream checks its whole room first: its own fault leaves the bytes
+    // queued (measured), unlike a datagram's - a raw packet whose chain has an
+    // unwritable segment is lost with the `EFAULT` (measured), which is the
+    // same rule a UDP datagram follows.
     if typ == SOCK_STREAM
         && let Err(e) = room.validate()
     {
@@ -2994,7 +3001,10 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         // hand: a chain has scattered them by the time `receive` returns. Only
         // what actually reached the caller's buffer is scattered - a stream
         // receive with `MSG_TRUNC` counted bytes it deliberately did not copy.
-        Ok((answer.written, (answer, out.get(8).copied())))
+        // A raw packet names its own count, because the caller's copy may have
+        // been too short to hold the header the octet lives in.
+        let ttl = answer.ttl.or_else(|| out.get(8).copied());
+        Ok((answer.written, (answer, ttl)))
     }) {
         Ok(answer) => answer,
         Err(e) => return e,
@@ -3021,16 +3031,26 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
     let control = unsafe { ((msghdr + MSGHDR_CONTROL) as *const usize).read_volatile() };
     let capacity = unsafe { ((msghdr + MSGHDR_CONTROLLEN) as *const u64).read_volatile() } as usize;
     let mut attached = false;
-    if want_ttl && n >= 20 && control != 0 && capacity >= CMSG_RECVTTL_LEN {
+    // The gate is the **packet's** length, not the copy's: the hop count is
+    // read off the packet's own header (below, in `raw_recv`), so a caller
+    // whose buffer cut the header short still gets the record. Measured on a
+    // current host (`.workbuddy/probe_raw_recvmsg.c`, `IP_RECVTTL` with a
+    // 4-byte segment against a 36-byte packet: `controllen=24 cmsg_len=20
+    // level=0 type=2 ttl=64`) - which is the same reason `RecvAnswer::ttl`
+    // exists at all. Gating on the copy instead answered `controllen 0` for
+    // exactly the short-buffer shape the option is most useful in.
+    if want_ttl && answer.full >= 20 && control != 0 && capacity >= CMSG_RECVTTL_LEN {
         if !crate::uaccess::buffer_ok(control, CMSG_RECVTTL_LEN, true, from_user) {
             return err::EFAULT;
         }
         let ttl = ttl.unwrap_or(0) as u32;
         unsafe {
             let at = |offset: usize| (control + offset) as *mut u8;
-            (at(0) as *mut u64).write_unaligned(CMSG_RECVTTL_LEN as u64); // cmsg_len
+            // `cmsg_len` is the record's own unpadded length; the space it
+            // occupies is what `msg_controllen` reports.
+            (at(0) as *mut u64).write_unaligned(cmsg_len(core::mem::size_of::<i32>()) as u64);
             (at(8) as *mut i32).write_unaligned(SOL_IP as i32); // cmsg_level
-            (at(12) as *mut i32).write_unaligned(IP_RECVTTL as i32); // cmsg_type
+            (at(12) as *mut i32).write_unaligned(IP_TTL as i32); // cmsg_type
             (at(16) as *mut u32).write_unaligned(ttl); // the hop limit, as an int
             ((msghdr + MSGHDR_CONTROLLEN) as *mut u64).write_volatile(CMSG_RECVTTL_LEN as u64);
         }
@@ -3073,6 +3093,14 @@ struct RecvAnswer {
     written: usize,
     full: usize,
     endpoint: Option<IpEndpoint>,
+    /// The hop count, when the family reads one off the packet it was handed
+    /// rather than off the caller's copy. Only a **raw** socket sets it: its
+    /// packet starts with the IP header, and `IP_RECVTTL` attaches even when
+    /// the caller's buffer cut the header short (measured: a 4-byte segment
+    /// against a 36-byte packet still carried `ttl 64`), so reading the octet
+    /// back out of the copy would answer 0 for a packet whose header the
+    /// caller never saw.
+    ttl: Option<u8>,
 }
 
 enum RecvStep {
@@ -3111,25 +3139,15 @@ fn recv_common(
             return Err(err::ENOTCONN);
         }
     }
-    // A raw socket's peek is not measured: the host this kernel's contract was
-    // measured on holds no `CAP_NET_RAW`, so the probe could not answer for
-    // that family. The honest refusal it has always given stays, and
-    // `docs/uapi/` §5.3 names it rather than guessing Linux's shape.
-    if peek && typ == Some(SOCK_RAW) {
-        return Err(err::EOPNOTSUPP);
-    }
+    // A raw socket's receive is a datagram door like a UDP socket's, and its
+    // `MSG_PEEK` is served here for the same reason: measured on a host that
+    // holds `CAP_NET_RAW` (`.workbuddy/probe_raw_recvmsg.c`, run inside a user
+    // namespace of its own), a peek copies without dequeuing - through a
+    // full-size segment and through a zero-length one alike.
     let answer = match typ {
         Some(SOCK_STREAM) => tcp_recv(handle, out, nonblock, peek, truncate)?,
         Some(SOCK_DGRAM) => udp_recv(handle, out, nonblock, peek)?,
-        Some(SOCK_RAW) => {
-            let (copied, endpoint) = raw_recv(handle, out, nonblock)?;
-            RecvAnswer {
-                copied,
-                written: copied,
-                full: copied,
-                endpoint,
-            }
-        }
+        Some(SOCK_RAW) => raw_recv(handle, out, nonblock, peek)?,
         Some(_) => return Err(err::EINVAL),
         None => return Err(err::EBADF),
     };
@@ -3297,6 +3315,7 @@ fn tcp_recv(
                     written,
                     full,
                     endpoint,
+                    ttl: None,
                 });
             }
             Some(RecvStep::Err(e)) => return Err(e),
@@ -3312,6 +3331,7 @@ fn tcp_recv(
                     written: 0,
                     full: 0,
                     endpoint: None,
+                    ttl: None,
                 })
             } else {
                 Err(err::EINTR)
@@ -3324,6 +3344,7 @@ fn tcp_recv(
                     written: 0,
                     full: 0,
                     endpoint: None,
+                    ttl: None,
                 })
             } else {
                 Err(err::EINTR)
@@ -3418,6 +3439,7 @@ fn udp_recv(
                     written,
                     full,
                     endpoint,
+                    ttl: None,
                 });
             }
             Some(RecvStep::Err(e)) => return Err(e),
@@ -3621,18 +3643,34 @@ fn raw_emit_through_stack(handle: usize, data: &[u8], target: IpEndpoint) -> isi
 /// octets instead hands every one of those reads the wrong bytes (which is
 /// how a stable peer's replies came to print a ttl that wandered the whole
 /// 0..=255 range).
+/// One packet off a raw socket's queue, in the four answers Linux's door was
+/// measured to give (`.workbuddy/probe_raw_recvmsg.c`, a host holding
+/// `CAP_NET_RAW` through a user namespace of its own, ICMP echo replies on the
+/// loopback):
+///
+/// * a buffer shorter than the packet takes what fits and still reports the
+///   packet's own length - a 4-byte segment answered 4 with `MSG_TRUNC` set,
+///   and 36 when the caller asked for the flag;
+/// * `MSG_PEEK` copies without dequeuing, through a full segment and through a
+///   zero-length one alike (0 and `MSG_TRUNC`, the packet still queued);
+/// * a zero-length room with no peek takes the packet and copies nothing - the
+///   queue is empty afterwards, which is the datagram rule every other message
+///   door here follows;
+/// * the hop count is read off the packet rather than off the copy, because
+///   `IP_RECVTTL` attaches even when the buffer cut the IP header short.
 fn raw_recv(
     handle: usize,
     out: &mut [u8],
     nonblock: bool,
-) -> Result<(usize, Option<IpEndpoint>), isize> {
+    peek: bool,
+) -> Result<RecvAnswer, isize> {
     // The wildcard door reads its own queue, not smoltcp's. Its smoltcp socket
     // is bound to `255` and matches no delivered packet by design (§4.5's
     // filterless-socket argument), so the queue the seam fills is the whole of
     // what this family ever receives here - and reading it first is what keeps
     // an ICMP-shaped door from waiting on a slot that can never fill.
     if raw_protocol(handle) == Some(IPPROTO_RAW as u8) {
-        return raw_wildcard_recv(handle, out, nonblock);
+        return raw_wildcard_recv(handle, out, nonblock, peek);
     }
     loop {
         // A frame that arrived while nobody was parked is taken at the start
@@ -3652,39 +3690,59 @@ fn raw_recv(
         // refusal came with the memory already spent. `recv_slice` answers
         // `Truncated` for that case instead, which is the same `EMSGSIZE` with
         // nothing to allocate.
-        let result: Option<Result<(usize, Option<IpEndpoint>), isize>> =
-            super::with(handle, |stack, entry| {
-                stack.poll_once();
-                let Channel::Raw {
-                    home,
-                    handle: sock_handle,
-                    ..
-                } = &entry.channel
-                else {
-                    return Err(err::ENOTSOCK);
-                };
-                let sock = stack
-                    .sockets_mut(*home)
-                    .get_mut::<raw_sock::Socket>(*sock_handle);
-                let n = match sock.recv_slice(out) {
-                    Ok(n) => n,
-                    Err(raw_sock::RecvError::Exhausted) => return Err(err::EWOULDBLOCK),
-                    Err(raw_sock::RecvError::Truncated) => return Err(err::EMSGSIZE),
-                };
-                // The source address is the IP header's sender, which is
-                // also what Linux's `recvfrom` names for a raw socket.
-                let src = if n >= 20 {
-                    Some(IpEndpoint::new(
-                        IpAddress::v4(out[12], out[13], out[14], out[15]),
-                        0,
-                    ))
-                } else {
-                    None
-                };
-                Ok((n, src))
+        //
+        // What stands here now is the queue's own look: `peek` for the
+        // `MSG_PEEK` shape and `recv` for the take, each handing back the whole
+        // packet so the copy can be the part that fits while the answer names
+        // the packet's own length - which is the difference between this
+        // family's truncation and Linux's, measured above.
+        let result: Option<Result<RecvAnswer, isize>> = super::with(handle, |stack, entry| {
+            stack.poll_once();
+            let Channel::Raw {
+                home,
+                handle: sock_handle,
+                ..
+            } = &entry.channel
+            else {
+                return Err(err::ENOTSOCK);
+            };
+            let sock = stack
+                .sockets_mut(*home)
+                .get_mut::<raw_sock::Socket>(*sock_handle);
+            let packet = if peek { sock.peek() } else { sock.recv() };
+            let packet = match packet {
+                Ok(packet) => packet,
+                Err(raw_sock::RecvError::Exhausted) => return Err(err::EWOULDBLOCK),
+                // Neither door truncates: both hand back the whole packet, so
+                // this arm is unreachable, and it stays an answer rather than a
+                // panic because a `RecvError` is not this kernel's to promise
+                // against.
+                Err(raw_sock::RecvError::Truncated) => return Err(err::EMSGSIZE),
+            };
+            let full = packet.len();
+            let copied = full.min(out.len());
+            out[..copied].copy_from_slice(&packet[..copied]);
+            // The hop count and the source address are the IP header's, at
+            // their documented offsets - read only when the packet is long
+            // enough to have them, which a door that queues whole packets
+            // still cannot promise of a runt.
+            let ttl = (full > 8).then(|| packet[8]);
+            let endpoint = (full >= 20).then(|| {
+                IpEndpoint::new(
+                    IpAddress::v4(packet[12], packet[13], packet[14], packet[15]),
+                    0,
+                )
             });
+            Ok(RecvAnswer {
+                copied,
+                written: copied,
+                full,
+                endpoint,
+                ttl,
+            })
+        });
         match result {
-            Some(Ok((n, ep))) => return Ok((n, ep)),
+            Some(Ok(answer)) => return Ok(answer),
             Some(Err(e)) if e == err::EWOULDBLOCK && !nonblock => {}
             Some(Err(e)) => return Err(e),
             None => return Err(err::EBADF),
@@ -3715,12 +3773,17 @@ fn raw_recv(
 /// the machine's UDP and TCP delivery, so this family's receive is the kernel's
 /// own copy, not the stack's). The wait shape is `raw_recv`'s, line for line:
 /// `EWOULDBLOCK` non-blocking, any deliverable signal first (`udhcpc` arms a
-/// `SIGALRM` and reads again), and the park ends on the stack's wake list.
+/// `SIGALRM` and reads again), and the park ends on the stack's wake list. So
+/// is the answer's: the copy is what the caller's room holds, the length is the
+/// packet's own, `MSG_PEEK` looks without taking, and a zero-length room takes
+/// the packet and copies nothing - the same four answers `raw_recv` gives,
+/// measured whole on a host that holds `CAP_NET_RAW`.
 fn raw_wildcard_recv(
     handle: usize,
     out: &mut [u8],
     nonblock: bool,
-) -> Result<(usize, Option<IpEndpoint>), isize> {
+    peek: bool,
+) -> Result<RecvAnswer, isize> {
     let Some(queue) = raw_echo_queue(handle) else {
         return Err(err::EBADF);
     };
@@ -3734,24 +3797,46 @@ fn raw_wildcard_recv(
         // blocking `recvfrom` sleeping through a reply already on the machine,
         // and an `MSG_DONTWAIT` read answering `EWOULDBLOCK` forever.
         super::with_stack(|stack| stack.poll_once());
-        if let Some(slot) = take_from(&queue) {
+        // A peek looks at the front of the queue and copies out of it without
+        // taking it; the take is the pop, and both happen under the one lock -
+        // a copy and a pop from two separate critical sections would let a
+        // second reader on the same descriptor pop the packet this one copied.
+        let answer = critical_section::with(|cs| {
+            let mut q = queue.borrow(cs).borrow_mut();
+            let Some(slot) = q.front() else {
+                return None;
+            };
             // The held length is the frame's IP half as it arrived; a caller's
             // smaller buffer truncates the *copy*, never the record - Linux's
-            // raw socket hands up the whole packet and lets `msg_msg_flags`
-            // say `MSG_TRUNC`, which this kernel does not yet carry (a named
-            // sub-gap beside §4.5's door, not a new shape).
-            let n = slot.len().min(out.len());
-            out[..n].copy_from_slice(&slot[..n]);
+            // raw socket hands up the whole packet and lets `msg_flags` say
+            // `MSG_TRUNC`, which the answer's `full` is what lets this door
+            // report (the sub-gap §4.5 named, closed here).
+            let full = slot.len();
+            let copied = full.min(out.len());
+            out[..copied].copy_from_slice(&slot[..copied]);
             // The sender is the IP header's, at its documented offset - read
             // only when the packet is long enough to have one, which a door
             // that queues whole packets still cannot promise of a truncated
             // frame.
-            let src = if slot.len() >= 20 {
+            let src = if full >= 20 {
                 IpAddress::v4(slot[12], slot[13], slot[14], slot[15])
             } else {
                 IpAddress::Ipv4(Ipv4Address::UNSPECIFIED)
             };
-            return Ok((n, Some(IpEndpoint::new(src, 0))));
+            let ttl = (full > 8).then(|| slot[8]);
+            if !peek {
+                q.pop_front();
+            }
+            Some(RecvAnswer {
+                copied,
+                written: copied,
+                full,
+                endpoint: Some(IpEndpoint::new(src, 0)),
+                ttl,
+            })
+        });
+        if let Some(answer) = answer {
+            return Ok(answer);
         }
         if nonblock {
             return Err(err::EWOULDBLOCK);
@@ -3774,11 +3859,6 @@ fn raw_wildcard_recv(
             crate::sched::WaitEnd::Condition | crate::sched::WaitEnd::Deadline => {}
         }
     }
-}
-
-/// Pop one packet off one door's queue, the reader's half of `push_into`.
-fn take_from(queue: &EchoQueue) -> Option<alloc::vec::Vec<u8>> {
-    critical_section::with(|cs| queue.borrow(cs).borrow_mut().pop_front())
 }
 
 // ---------------------------------------------------------------------------

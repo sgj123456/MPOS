@@ -357,10 +357,17 @@ fn main() {
         r.check(
             &format!("round {seq}'s control data is one well-formed IP_RECVTTL record or none"),
             controllen == 0
+                // The header's `cmsg_len` is the record's own unpadded length
+                // (`CMSG_LEN(4)` = 20), and `msg_controllen` the space it
+                // occupies (`CMSG_SPACE(4)` = 24) - two different words, which
+                // is the host's own answer and what `t-raw-recvmsg` measures
+                // whole. The old claim read 24 for both.
                 || (controllen == 24
-                    && cmsg_at(&ctl, 0) == 24
+                    && cmsg_at(&ctl, 0) == 20
                     && cmsg_at(&ctl, 8) == libc::SOL_IP
-                    && cmsg_at(&ctl, 12) == libc::IP_RECVTTL),
+                    // The option is IP_RECVTTL; the record it answers with is named IP_TTL,
+                    // which is Linux's own word for it (`ip_cmsg_recv_ttl`).
+                    && cmsg_at(&ctl, 12) == libc::IP_TTL),
         );
         r.check(
             &format!("round {seq}'s cmsg ttl agrees with the header octet"),

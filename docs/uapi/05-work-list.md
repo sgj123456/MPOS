@@ -3835,3 +3835,91 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     202 left out by `tests.toml`); aarch64 `pass=190 fail=0`, `mpos-kunit 32 passed, 0 failed`,
     reaching `=== END` (12 left out). Host unit suite 582 passed, `xtask` 123; `cargo fmt --check`
     clean on the touched files; clippy's warning set is one *below* the committed tree's - the new scratch's zero-fill is `alloc::vec!` rather than a `Vec::new` + `resize` - and nothing new appears.
+
+## item 74 - a raw socket's receive is a datagram's, and its hop count is read off the packet
+
+    Item 73 left this family's two receive shapes named rather than claimed, and both were the
+    *host's* fault rather than the kernel's: the machine that contract was measured on holds no
+    `CAP_NET_RAW`, so no probe could open the door at all. This item makes the capability instead
+    of waiting for it - `unshare(CLONE_NEWUSER|CLONE_NEWNET)` hands the caller the whole set
+    inside a user namespace of its own, and a network namespace whose owner is that user
+    namespace is one `ns_capable(CAP_NET_RAW)` answers for (item 43's rule, from the other side).
+    The probe (`.workbuddy/probe_raw_recvmsg.c`, Linux 7.2.11) brings `lo` up there and sends
+    itself ICMP echo *replies* - type 0, the one the kernel's own ICMP input does not answer, so
+    one send is exactly one packet on the queue - and the answers are a datagram family's, every
+    one of them the ones `t-recvmsg-iov` had just pinned for UDP:
+
+    | room | answer |
+    |---|---|
+    | zero-length, packet queued | 0, `MSG_TRUNC`, **consumed** |
+    | zero-length, `MSG_DONTWAIT`, empty | `EAGAIN` |
+    | zero-length, blocking, empty | parks; a signal ends it `EINTR` |
+    | no iovec at all (`msg_iovlen = 0`) | 0, consumed |
+    | 4 bytes of a 36-byte packet | 4, `MSG_TRUNC` **without being asked** |
+    | the same, `MSG_TRUNC` asked | **36** back, copy still 4 |
+    | `MSG_PEEK`, full segment | 36, packet still queued; again 36 |
+    | `MSG_PEEK`, zero-length room | 0, `MSG_TRUNC`, packet still queued |
+    | zero-length + `MSG_TRUNC` | 36, consumed |
+    | `MSG_PEEK`+`MSG_TRUNC`, zero-length | 36, still queued |
+    | chain 4+4+28 | 36, scattered segment by segment |
+    | chain 4 + `PROT_NONE` | `EFAULT`, **and the packet is gone** |
+    | 1025 segments | `EMSGSIZE`, packet survives, still queued |
+    | `msg_name` | the header's sender, `127.0.0.1:0`, namelen 16 |
+
+    The first row is one of the two shapes item 73 named (the `EINVAL` a raw zero-length room had
+    always given is gone) and the seventh is the other (the `EOPNOTSUPP` its `MSG_PEEK` had
+    always given). The fifth and sixth close the sub-gap §4.5's door named: a raw socket carries
+    `MSG_TRUNC` now - set whether or not the caller asked, and only the caller that asked gets
+    the packet's own length back.
+
+    **The hop count is read off the packet, not off the copy.** `IP_RECVTTL` attaches even when
+    the caller's buffer cut the IP header short (a 4-byte segment against a 36-byte packet
+    answered `controllen=24 cmsg_len=20 level=0 type=2 ttl=64`), so the record cannot be read
+    back out of what was copied. `RecvAnswer` grew a `ttl` the family fills from the packet's own
+    header, and the gate that decides whether the record rides along is the **packet's** length
+    rather than the copy's - gating on the copy answered `controllen 0` for exactly the
+    short-buffer shape the option is most useful in. The same measurement corrected two words
+    this kernel had been writing: `cmsg_len` is the record's own unpadded `CMSG_LEN(4)` (20), not
+    the space it occupies (`CMSG_SPACE(4)`, 24 - what `msg_controllen` reports), and the
+    record's `cmsg_type` is `IP_TTL` (2), Linux's `ip_cmsg_recv_ttl` word, not the option number
+    `IP_RECVTTL` (12) that asks for it. `t-rawicmp`'s control-data claim had read 24 and
+    `IP_RECVTTL`; both are the host's own answers, and it reads 20 and `IP_TTL` now.
+
+    **The landing** is one answer shape and four call sites: `raw_recv` and `raw_wildcard_recv`
+    hand back a whole `RecvAnswer` (the copy is what the caller's room holds, the length is the
+    packet's own, the peek looks without taking - the wildcard queue's copy and its pop now
+    happen under the one lock, so a second reader on the same descriptor cannot pop the packet
+    this one copied), the raw arms of `handle_recvmsg` and `recv_common` no longer refuse, and
+    the `IP_RECVTTL` writer takes its length from the answer.
+
+    **Pin**: `t-raw-recvmsg`, a new program, **50 claims** (the 51st `r.check` is the
+    socket-open failure branch a green run never reaches), green on a current host first
+    (`MPOS_ON_HOST=1`, 50 of 50 - the host run makes its own door exactly as the probe does) and
+    `ok:` for `ok:` identical on both machines. The guest's fabric is slirp's (`eth0`, never the
+    loopback), so every shape starts from one packet queued from beyond slirp, and the run
+    measures the reply's own length rather than hardcoding it.
+
+    **The pin's first guest run found that the internet is not a fixture.** One gate run lost the
+    third echo beyond slirp; the receive that should have answered 0 parked instead, the guard
+    expired, and a claim about the *door's* answer went red on a packet that never came.
+    `queue_one` now drains the queue, sends, and confirms with a **peek** - a look leaves the
+    packet where the claim expects to find it - three attempts at most, past which the claim
+    that asked fails loudly rather than quietly measuring nothing. Those claims are named "an
+    echo is queued" now, because that is what the helper promises.
+
+    **Counterfactual, every other pin kept** - the two refusals restored, the way the kernel
+    answered before this item:
+
+    | reverted | result |
+    |---|---|
+    | the two refusals put back (`room.is_empty() && typ == SOCK_RAW` answers `EINVAL` again, and a raw `MSG_PEEK` answers `EOPNOTSUPP` again) | `pass=197 fail=1 (198 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33, and the one red program is **`t-raw-recvmsg`** with **29 of its 50 claims** red - all thirteen "an echo is queued" (the helper's confirmation is itself a peek, which the refusal answers first), every zero-length-room claim (`answers 0`, `MSG_TRUNC`, the empty-queue `EAGAIN`, the park's `EINTR`, `no iovec at all`, the `MSG_TRUNC` return) and every peek claim, while its single-segment truncation, chain, `EFAULT`, `EMSGSIZE` and `IP_RECVTTL` claims stay green and **`t-rawicmp` stays green** - the cmsg correction is the other half of this item and the counterfactual does not touch it |
+
+    Gate: x86_64 `pass=198 fail=0` (198 staged, 5 left out - the payload rides an initramfs
+    here), `mpos-kunit 32 passed, 0 failed`, exit 0; aarch64 `pass=197 fail=0` (197 staged, 6
+    left out - the payload rides the sweep disk here, and the sixth left out is the machine's own
+    gap), `mpos-kunit 32 passed, 0 failed`, reaching `=== END`. Both machines' `ok:` lines
+    byte-identical (50/50, diff empty), and `t-rawicmp` passes on both with its corrected
+    control-data words. Host unit suite 582 passed, `xtask` 123; `cargo fmt --check` clean on the
+    touched files; clippy's warning set unchanged; the depgraph ratchet holds. The **vsock**
+    branch still reads its chain's first segment only - nothing here could measure that family
+    either - so it stays named in §5.2.

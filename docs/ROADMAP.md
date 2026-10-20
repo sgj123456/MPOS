@@ -473,6 +473,33 @@ aarch64 `pass=190 fail=0`, `mpos-kunit` 32/0 on both. Named: a **raw** socket's 
 receive keeps its `EINVAL` and the **vsock** branch still reads its first segment — neither could
 be measured on the host this contract came from.
 
+**A raw socket's receive is a datagram's, and its hop count is read off the packet**
+(`docs/uapi/` §5.1 item 74, landed 2026-10-20): the two receive shapes item 73 left named, both of
+them named around a host that holds no `CAP_NET_RAW` - a zero-length data room answered `EINVAL`
+and `MSG_PEEK` answered `EOPNOTSUPP`, because no probe could open the door. The probe makes the
+capability instead of waiting for it: `unshare(CLONE_NEWUSER|CLONE_NEWNET)` hands the whole set
+inside a user namespace of its own, and a network namespace that namespace owns is one
+`ns_capable(CAP_NET_RAW)` answers for (item 43's rule from the other side). `lo` up, ICMP echo
+*replies* to itself (type 0, the one the kernel's own ICMP input does not answer, so one send is
+one packet), and every answer is the datagram's (`.workbuddy/probe_raw_recvmsg.c`, Linux 7.2.11):
+a zero-length room answers 0 with `MSG_TRUNC` and consumes, no iovec at all answers 0 and
+consumes, a 4-byte segment of a 36-byte packet answers 4 with `MSG_TRUNC` **unasked** and 36 when
+the flag is asked, `MSG_PEEK` copies without taking through a full segment and a zero-length room
+alike, a chain 4+`PROT_NONE` is `EFAULT` with the packet gone, 1025 segments is `EMSGSIZE` with
+the packet still queued. The `IP_RECVTTL` record rides along even when the buffer cut the header
+short, so the octet is read off the packet (`RecvAnswer::ttl`) rather than off the copy - and the
+same measurement corrected two words this kernel had been writing: `cmsg_len` is the unpadded
+`CMSG_LEN(4)` (20; 24 is the space it occupies, which is what `msg_controllen` reports) and
+`cmsg_type` is `IP_TTL` (2), not the `IP_RECVTTL` (12) that asks for it, so `t-rawicmp`'s
+control-data claim now reads the host's own answers. Pin: the new `t-raw-recvmsg` (50 claims,
+green on the host first - the host run makes its own door as the probe does - and `ok:` for `ok:`
+identical on both machines); its first guest run lost one echo beyond slirp and went red on a
+packet that never came, so `queue_one` now drains, sends and confirms with a bounded peek, and the
+claims it serves are named "an echo is queued" because that is what the helper promises. Gate:
+x86_64 `pass=198 fail=0`, aarch64 `pass=197 fail=0`, `mpos-kunit` 32/0 on both; the
+counterfactual (the two refusals restored) is the two programs this item touched going red and
+nothing else. Named: the **vsock** branch still reads its chain's first segment only.
+
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
 record-only was wrong in both halves - the figure stored was the caller's rather than Linux's,  
