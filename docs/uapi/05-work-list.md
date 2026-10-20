@@ -4246,7 +4246,8 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
       listening one's. Linux drops the name first and then finds no peer. Named rather
       than served: this family's message doors are reached only by a socket that
       already carries messages (a datagram, or a connected seqpacket), so an
-      unconnected seqpacket socket does not enter them and its answer is unchanged.
+      unconnected seqpacket socket did not enter them and its answer was unchanged
+      (`ENOTSOCK`). **Served by item 81.**
 
     Served by `UnixSock::ignores_send_address` (connected sequenced-packet, and nothing
     else), by the two send doors routing an address through a new `copy_send_address`
@@ -4274,9 +4275,9 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     the doors' `EISCONN` and `send_dgram`'s refusal): `t-unix-dgram`'s first named-send claim goes
     red with `EISCONN` (106), and the pin's next read - a blocking receive for a message the old
     kernel never sent - parks there, so the arm was observed and stopped rather than counted (the
-    shape item 77's peek counterfactual had). Named: the unconnected seqpacket send above, and the
-    datagram-to-*stream*-listener `ECONNREFUSED` where Linux answers `EPROTOTYPE` (the existing
-    `t-unix-dgram` claim, untouched - served by item 80).
+    shape item 77's peek counterfactual had). Named: the unconnected seqpacket send above (served
+    by item 81), and the datagram-to-*stream*-listener `ECONNREFUSED` where Linux answers
+    `EPROTOTYPE` (the existing `t-unix-dgram` claim, untouched - served by item 80).
 
 ## item 80 — A datagram aimed at a path naming another type is `EPROTOTYPE`; an abstract name of another type stays `ECONNREFUSED`
 
@@ -4313,3 +4314,48 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     (`got Connection refused (os error 111), want Protocol wrong type for socket (os
     error 91)`), while the abstract claims stay green - the distinction the pin is for.
     The sweep completed because both doors refuse immediately rather than parking.
+
+## item 81 — A seqpacket socket with no peer sends nothing, whatever the name says: `ENOTCONN`
+
+    Item 79's other named residual. A `SOCK_SEQPACKET` socket that is unconnected
+    or listening has message doors but no peer; the send doors recognised only
+    sockets that already carried messages, so this shape fell through to
+    `socket_handle_of_fd` and answered `ENOTSOCK` (88) - including for a named
+    `sendto`, which is the shape item 79 had measured on Linux. **Measured whole
+    on a current host first** (`.workbuddy/probe_unix_seqpacket_unconnected.c` and
+    `..._msg.c`, Linux 7.2.11, unconnected and bound+listening alike):
+
+    * `write`, `sendto` with no name, and `sendto` naming a live same-type
+      listener, a dead path, a regular file, a family-only address or a live
+      abstract name all answer `ENOTCONN` (107): the destination is not looked at,
+      let alone resolved;
+    * a NULL address pointer is "no name" whatever the length says: `sendto`
+      with NULL/16 and `sendmsg` with NULL/16 both answer `ENOTCONN`, not
+      `EFAULT`;
+    * `sendto` still runs the syscall layer's copy first, so a 129-byte address
+      is `EINVAL` (22) and a bad pointer with a non-zero length is `EFAULT` (14);
+    * `sendmsg` imports the header, the name bytes, the iovec array and the
+      control buffer, and an unreadable one is `EFAULT` - but it does not bound
+      `msg_namelen` to `sockaddr_storage` (129 bytes still answers `ENOTCONN`)
+      and does not touch the buffers the iovec entries point at (a bad iovec
+      base is `ENOTCONN`, not `EFAULT`).
+
+    Served by `UnixSock::unconnected_seqpacket` (a sequenced-packet socket that
+    `carries_messages` does not: no peer, whatever its name) and a branch in each
+    send door: `sendto` routes the address through `copy_send_address` (the
+    syscall layer's bounds/readability, no interpretation) and then answers
+    `ENOTCONN`; `sendmsg` performs the generic layer's imports and then the same
+    answer. The byte doors already said `ENOTCONN` through `write_at`, which is
+    why only the message doors changed.
+
+    **Pins**: `t-unix-seqpacket`, 69 -> 88 host-run claims (19 new): the byte door,
+    the named, unnamed and NULL-with-length `sendto` shapes, the two syscall-layer
+    refusals, the seven `sendmsg` import shapes plus its NULL-with-length form,
+    and the listening socket's two sends. All green on a current host first
+    (`MPOS_ON_HOST=1`).
+
+    Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32
+    passed, 0 failed on both. Counterfactual (the branch removed): x86_64
+    `pass=192 fail=1`, exactly the 17 message-door claims red with `ENOTSOCK` (88),
+    while `write` stays green at `ENOTCONN` - the byte door was never the gap. The
+    sweep completes because every claim refuses immediately.

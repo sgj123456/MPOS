@@ -29,6 +29,12 @@ Section numbers are unchanged from the original `UAPI.md`.
   type now answers `EPROTOTYPE` (Linux's measured answer) instead of `ECONNREFUSED`, for `sendto`
   and `connect` alike; an *abstract* name of another type stays `ECONNREFUSED`, because that
   lookup is keyed by type. Item 80 takes `t-unix-dgram` from 49 to 57 claims and pins both halves.
+  **Served by `docs/uapi/` §5.1 item 81**: a seqpacket socket with no peer - unconnected or
+  listening - answers `ENOTCONN` on `write` and on every `sendto`/`sendmsg`, whatever the name
+  says (it used to fall through to `ENOTSOCK`). The pins hold the syscall layer's split too:
+  `sendto` refuses 129 bytes and a bad pointer, while `sendmsg` imports the header, name, iovec
+  array and control buffer but neither bounds the name nor reads the iovec data; a NULL pointer
+  with a length is still "no name". That takes `t-unix-seqpacket` from 69 to 88 host-run claims.
 
 - **Netlink's and `AF_PACKET`'s receive doors look without taking, and a truncated answer
   names its own length.** **Landed 2026-10-21** (`docs/uapi/` §5.1 item 77) - item 76's named

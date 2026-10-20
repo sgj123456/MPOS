@@ -283,11 +283,13 @@ current host first (`.workbuddy/probe_unix_sendto_connected{,2}.c`,
 | seqpacket, connected, a stream listener's name | sent to the peer - the name is not validated |
 | seqpacket, connected, a family-only `sockaddr_un` | sent to the peer (`EINVAL` for a datagram sender) |
 | seqpacket, connected, `addrlen` 110 or 128 | sent to the peer; > 128 is `EINVAL`, a bad pointer `EFAULT` |
-| seqpacket, unconnected or listening, any name | `ENOTCONN` (107) - named, not served here |
+| seqpacket, unconnected or listening, any name | `ENOTCONN` (107) - served by item 81; the name is not looked at, and a NULL name pointer with a length is still "no name" |
+| seqpacket, unconnected or listening, `sendto` `addrlen` 129 / a bad pointer | `EINVAL` (22) / `EFAULT` (14) - the syscall layer's copy still runs |
+| seqpacket, unconnected or listening, `sendmsg` any name | `ENOTCONN`; 129 bytes is not `EINVAL`, a bad iovec base is not `EFAULT` |
 | dgram, connected, a different live socket's name | that socket receives; the pinned peer does not |
 | dgram, connected, a dead path | `ENOENT` (2) |
 | dgram, connected, a dead abstract name / a regular file | `ECONNREFUSED` (111) |
-| dgram, connected, a live stream listener's name | `EPROTOTYPE` (91) - still this kernel's named divergence |
+| dgram, connected, a live stream listener's name | `EPROTOTYPE` (91) - served by item 80 (a *path*; abstract names of another type stay `ECONNREFUSED`) |
 | dgram, connected, a family-only `sockaddr_un` | `EINVAL` (22) |
 | stream pair, any name | `EISCONN` (106), unchanged |
 
@@ -300,6 +302,10 @@ read back whole, the `EINVAL` a 129-byte address still earns, plus the empty que
 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32/0 on both. Counterfactual (the old rule
 restored): `t-unix-dgram`'s first named-send claim is red with `EISCONN` (106), and the following
 blocking read parks for a message that was never sent, so the arm was stopped rather than counted.
+Served since: item 80 made a *path* naming another socket type `EPROTOTYPE` while an abstract
+name of another type stays `ECONNREFUSED`, and item 81 made the no-peer seqpacket rows
+`ENOTCONN`, with `sendto`'s 129-byte `EINVAL` and `sendmsg`'s import-only validation pinned
+separately (`t-unix-dgram` 49 -> 57, `t-unix-seqpacket` 69 -> 88 host-run claims).
 
 ### 4.2 ICMP Improvements — **DONE**
 

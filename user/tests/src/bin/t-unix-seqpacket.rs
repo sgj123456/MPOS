@@ -35,6 +35,15 @@
 //!   address that is only the family word all send to the peer (measured on
 //!   Linux 7.2.11). A connected *datagram* socket, by contrast, honours the
 //!   name - that half is `t-unix-dgram`'s claim.
+//! * **A seqpacket socket with no peer sends nothing, whatever the name says.**
+//!   `write`, a named `sendto` and a send with no name alike answer
+//!   `ENOTCONN` for a live name, a dead name, a regular file and a family-only
+//!   address (measured on Linux 7.2.11, unconnected and listening alike), while
+//!   the syscall layer still refuses a 129-byte `sendto` address (`EINVAL`) and
+//!   a bad pointer (`EFAULT`). `sendmsg` imports the header, the name bytes,
+//!   the iovec array and the control buffer (`EFAULT`) but not the iovec data,
+//!   so a bad iovec base is still `ENOTCONN` - and unlike `sendto`, a 129-byte
+//!   `msg_name` is not refused.
 
 use std::io::IoSlice;
 use std::mem::MaybeUninit;
@@ -171,6 +180,54 @@ fn sendto_family_only(fd: &OwnedFd, data: &[u8]) -> Result<isize, Errno> {
     };
     let len = core::mem::offset_of!(libc::sockaddr_un, sun_path);
     sendto_raw(fd, data, &sa as *const libc::sockaddr_un as *const u8, len)
+}
+
+/// `sendmsg` with every header field the safe wrapper cannot spell: a name at a
+/// chosen length (nine bytes past what `sendto` allows), an iovec array whose
+/// entries may themselves be bad, and a control buffer. The no-peer seqpacket
+/// claims are about which of those the syscall layer imports before the
+/// protocol answers `ENOTCONN`, so the wrapper has to be out of the way.
+fn sendmsg_raw(
+    fd: &OwnedFd,
+    name: *const u8,
+    namelen: usize,
+    iov: *const libc::iovec,
+    iovlen: usize,
+    control: *const u8,
+    controllen: usize,
+) -> Result<isize, Errno> {
+    let mut m: libc::msghdr = unsafe { core::mem::zeroed() };
+    m.msg_name = name as *mut libc::c_void;
+    m.msg_namelen = namelen as libc::socklen_t;
+    m.msg_iov = iov as *mut libc::iovec;
+    m.msg_iovlen = iovlen as _;
+    m.msg_control = control as *mut libc::c_void;
+    m.msg_controllen = controllen as _;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_sendmsg,
+            fd.as_raw_fd() as libc::c_long,
+            &m as *const libc::msghdr as libc::c_long,
+            0 as libc::c_long,
+        ) as isize
+    };
+    if rc < 0 {
+        Err(Errno::from_raw_os_error(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ))
+    } else {
+        Ok(rc)
+    }
+}
+
+/// A `sockaddr_un` naming `path`, for the raw `sendmsg` shapes.
+fn raw_addr(path: &str) -> libc::sockaddr_un {
+    let mut a: libc::sockaddr_un = unsafe { core::mem::zeroed() };
+    a.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, src) in a.sun_path.iter_mut().zip(path.bytes()) {
+        *dst = src as _;
+    }
+    a
 }
 
 fn main() {
@@ -627,6 +684,186 @@ fn main() {
         drop(sp);
         drop(l);
         let _ = rustix::fs::unlink(STREAM_LISTEN);
+    }
+
+    // ---------------------------------------------------------------------
+    // A seqpacket socket with no peer: every send is ENOTCONN, and the name
+    // is not looked at. Linux 7.2.11 measured the whole table
+    // (`.workbuddy/probe_unix_seqpacket_unconnected{,_msg}.c`): `write`, a
+    // named send and a send with no name alike answer 107 for a live name, a
+    // dead name, a regular file and a family-only address, while `sendto`
+    // still refuses 129 bytes (EINVAL) and a bad pointer (EFAULT), and
+    // `sendmsg` imports the header, the name bytes, the iovec array and the
+    // control buffer (EFAULT) without touching the iovec data.
+    // ---------------------------------------------------------------------
+    {
+        let l = listener(
+            &mut r,
+            LISTEN,
+            SocketType::SEQPACKET,
+            "a seqpacket listener for the no-peer sends",
+        );
+        let u = socket(AddressFamily::UNIX, SocketType::SEQPACKET, None)
+            .expect("an unconnected seqpacket socket");
+
+        check_errno(
+            &mut r,
+            "write on an unconnected seqpacket answers ENOTCONN",
+            write(&u, b"x"),
+            Errno::NOTCONN,
+        );
+        check_errno(
+            &mut r,
+            "sendto with no name on it answers ENOTCONN",
+            sendto_raw(&u, b"x", core::ptr::null(), 0),
+            Errno::NOTCONN,
+        );
+        check_errno(
+            &mut r,
+            "a NULL address with a length is still no name: ENOTCONN",
+            sendto_raw(&u, b"x", core::ptr::null(), 16),
+            Errno::NOTCONN,
+        );
+        check_errno(
+            &mut r,
+            "a live name is dropped, not resolved: ENOTCONN",
+            sendto(&u, b"x", SendFlags::empty(), &addr(LISTEN)),
+            Errno::NOTCONN,
+        );
+        let dead = addr("/tmp/t-seqpacket-dead.sock");
+        let _ = rustix::fs::unlink("/tmp/t-seqpacket-dead.sock");
+        check_errno(
+            &mut r,
+            "a dead name is not looked up: ENOTCONN",
+            sendto(&u, b"x", SendFlags::empty(), &dead),
+            Errno::NOTCONN,
+        );
+        check_errno(
+            &mut r,
+            "a family-only address is ignored: ENOTCONN",
+            sendto_family_only(&u, b"x"),
+            Errno::NOTCONN,
+        );
+        let long = [0u8; 129];
+        check_errno(
+            &mut r,
+            "a 129-byte sendto address is still EINVAL",
+            sendto_raw(&u, b"x", long.as_ptr(), long.len()),
+            Errno::INVAL,
+        );
+        check_errno(
+            &mut r,
+            "a bad sendto address pointer is EFAULT",
+            sendto_raw(&u, b"x", 1 as *const u8, 128),
+            Errno::FAULT,
+        );
+
+        let byte = b'x';
+        let good = libc::iovec {
+            iov_base: &byte as *const u8 as *mut libc::c_void,
+            iov_len: 1,
+        };
+        check_errno(
+            &mut r,
+            "sendmsg with no name answers ENOTCONN",
+            sendmsg_raw(&u, core::ptr::null(), 0, &good, 1, core::ptr::null(), 0),
+            Errno::NOTCONN,
+        );
+        check_errno(
+            &mut r,
+            "a NULL name with a length is still no name: ENOTCONN",
+            sendmsg_raw(&u, core::ptr::null(), 16, &good, 1, core::ptr::null(), 0),
+            Errno::NOTCONN,
+        );
+        let sa = raw_addr(LISTEN);
+        check_errno(
+            &mut r,
+            "sendmsg naming a live socket answers ENOTCONN",
+            sendmsg_raw(
+                &u,
+                &sa as *const libc::sockaddr_un as *const u8,
+                core::mem::size_of::<libc::sockaddr_un>(),
+                &good,
+                1,
+                core::ptr::null(),
+                0,
+            ),
+            Errno::NOTCONN,
+        );
+        check_errno(
+            &mut r,
+            "a 129-byte sendmsg name is not EINVAL: ENOTCONN",
+            sendmsg_raw(
+                &u,
+                long.as_ptr(),
+                long.len(),
+                &good,
+                1,
+                core::ptr::null(),
+                0,
+            ),
+            Errno::NOTCONN,
+        );
+        check_errno(
+            &mut r,
+            "a bad sendmsg name pointer is EFAULT",
+            sendmsg_raw(&u, 1 as *const u8, 16, &good, 1, core::ptr::null(), 0),
+            Errno::FAULT,
+        );
+        check_errno(
+            &mut r,
+            "a bad iovec array is EFAULT",
+            sendmsg_raw(
+                &u,
+                core::ptr::null(),
+                0,
+                1 as *const libc::iovec,
+                1,
+                core::ptr::null(),
+                0,
+            ),
+            Errno::FAULT,
+        );
+        let bad_frame = libc::iovec {
+            iov_base: 1 as *mut libc::c_void,
+            iov_len: 1,
+        };
+        check_errno(
+            &mut r,
+            "a bad iovec base is not read: ENOTCONN",
+            sendmsg_raw(
+                &u,
+                core::ptr::null(),
+                0,
+                &bad_frame,
+                1,
+                core::ptr::null(),
+                0,
+            ),
+            Errno::NOTCONN,
+        );
+        check_errno(
+            &mut r,
+            "a bad control buffer is EFAULT",
+            sendmsg_raw(&u, core::ptr::null(), 0, &good, 1, 1 as *const u8, 16),
+            Errno::FAULT,
+        );
+
+        check_errno(
+            &mut r,
+            "a listening seqpacket's sendto with no name answers ENOTCONN",
+            sendto_raw(&l, b"x", core::ptr::null(), 0),
+            Errno::NOTCONN,
+        );
+        check_errno(
+            &mut r,
+            "and naming a socket does not change it",
+            sendto(&l, b"x", SendFlags::empty(), &addr(LISTEN)),
+            Errno::NOTCONN,
+        );
+        drop(l);
+        drop(u);
+        let _ = rustix::fs::unlink(LISTEN);
     }
 
     r.finish()

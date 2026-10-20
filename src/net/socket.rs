@@ -1869,6 +1869,28 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
         };
         return crate::net::unix::send_dgram(sock, data, dest.as_ref(), Vec::new());
     }
+    // A sequenced-packet socket with no peer is still a message socket, but
+    // there is nowhere for the message to go. Linux drops the destination
+    // before the shared send looks at it (measured: no name, a live name, a
+    // dead name, a regular file and a family-only address all answer
+    // `ENOTCONN`), while the syscall layer's own copy still runs first: a bad
+    // pointer is `EFAULT` and an `addrlen` beyond `sockaddr_storage` is
+    // `EINVAL`. The byte doors below are right for a *paired* socket; this
+    // shape would otherwise fall through to `ENOTSOCK`.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>()
+        && sock.unconnected_seqpacket()
+    {
+        // A NULL address is "no name", whatever the length says: Linux's
+        // `__sys_sendto` skips the copy entirely when the pointer is NULL
+        // (measured: NULL with `addrlen` 16 is `ENOTCONN`, not `EFAULT`).
+        if args[4] != 0
+            && let Err(e) = copy_send_address(args[4], args[5], from_user)
+        {
+            return e;
+        }
+        return err::ENOTCONN;
+    }
     // A connected pair's end: the send *is* a write. There is no destination
     // to parse and no control data this kernel carries, so the whole of the
     // call is the bytes; a caller that names a destination on a connected
@@ -1980,6 +2002,49 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
             return e;
         }
         return crate::net::rtnl::send(handle, &data);
+    }
+    // A sequenced-packet socket with no peer: `ENOTCONN`, whatever the name
+    // says. Unlike `sendto`, the generic sendmsg layer does not bound
+    // `msg_namelen` to `sockaddr_storage` (measured: 129 bytes still answers
+    // `ENOTCONN`), but it does import the address bytes, the iovec array and
+    // the control buffer, and an unreadable one is `EFAULT`. It does not touch
+    // the buffers the iovec entries point at (a bad iovec base is
+    // `ENOTCONN`), because no peer consumes them.
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>()
+        && sock.unconnected_seqpacket()
+    {
+        let (name, namelen, iov, iovlen) = match read_msghdr(args[1], from_user) {
+            Ok(fields) => fields,
+            Err(e) => return e,
+        };
+        // A NULL name pointer is "no name", whatever `msg_namelen` says
+        // (measured: NULL with a length of 16 is `ENOTCONN`).
+        if name != 0
+            && namelen != 0
+            && !crate::uaccess::buffer_ok(name, namelen as usize, false, from_user)
+        {
+            return err::EFAULT;
+        }
+        if iovlen > IOV_MAX {
+            return err::EMSGSIZE;
+        }
+        if iovlen != 0
+            && (iov == 0 || !crate::uaccess::buffer_ok(iov, iovlen * 16, false, from_user))
+        {
+            return err::EFAULT;
+        }
+        let (control, clen) = unsafe {
+            (
+                ((args[1] + MSGHDR_CONTROL) as *const usize).read_unaligned(),
+                ((args[1] + MSGHDR_CONTROLLEN) as *const usize).read_unaligned(),
+            )
+        };
+        if control != 0 && clen != 0 && !crate::uaccess::buffer_ok(control, clen, false, from_user)
+        {
+            return err::EFAULT;
+        }
+        return err::ENOTCONN;
     }
     // The message form of `sendmsg`: gather the iovecs, take the
     // destination from `msg_name` if there is one, and hand the whole to

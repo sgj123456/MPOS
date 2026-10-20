@@ -624,6 +624,24 @@ aarch64 `pass=192 fail=0`; `mpos-kunit` 32/0 on both. Counterfactual (old rule r
 `pass=192 fail=1`, exactly the four path claims red with `ECONNREFUSED` (111) where the pin wants
 `EPROTOTYPE` (91), abstract half green, sweep completes.
 
+**A seqpacket socket with no peer sends nothing, whatever the name says: `ENOTCONN`**
+(`docs/uapi/` §5.1 item 81, landed 2026-10-20): item 79's other named residual. An unconnected
+or listening `SOCK_SEQPACKET` socket has message doors but no peer; the doors recognised only
+sockets that carried messages, so the shape fell through to `ENOTSOCK` (88), a named `sendto`
+included. Measured whole on a current host first
+(`.workbuddy/probe_unix_seqpacket_unconnected{,_msg}.c`, Linux 7.2.11, unconnected and
+bound+listening alike): `write`, `sendto` with no name, and `sendto` naming a live same-type
+listener, a dead path, a regular file, a family-only address or a live abstract name all answer
+`ENOTCONN` (107) - the name is not looked at, and a NULL pointer with a length is still "no
+name"; `sendto` still refuses 129 bytes (`EINVAL`) and a bad pointer (`EFAULT`); `sendmsg`
+imports the header, name bytes, iovec array and control buffer (`EFAULT`), without bounding
+`msg_namelen` to 128 and without reading the iovec data, so a bad iovec base is `ENOTCONN`.
+Served by `UnixSock::unconnected_seqpacket` and a branch in each message door. Pin:
+`t-unix-seqpacket`, 69 -> 88 host-run claims, green on a host first. Gate: x86_64 `pass=193
+fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32/0 on both. Counterfactual (branch removed):
+`pass=192 fail=1`, exactly the 17 message-door claims red with `ENOTSOCK` (88), `write` still
+green, sweep completes.
+
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
 record-only was wrong in both halves - the figure stored was the caller's rather than Linux's,  

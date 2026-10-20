@@ -362,6 +362,19 @@ impl UnixSock {
         self.typ == SOCK_DGRAM || self.dgram_connected()
     }
 
+    /// Whether this is a sequenced-packet socket with no peer to carry a
+    /// message to - unconnected, or bound and listening, alike.
+    ///
+    /// Such a socket's send doors are message doors, but there is no peer:
+    /// Linux drops the destination before the shared send looks at it and
+    /// answers `ENOTCONN` (measured 107 on Linux 7.2.11 for no name, a live
+    /// name, a dead name, a regular file and a family-only address alike), while
+    /// the syscall layer's own copy still runs first. `docs/uapi/` §5.1 item 81
+    /// serves that split.
+    pub fn unconnected_seqpacket(&self) -> bool {
+        self.typ == SOCK_SEQPACKET && !self.carries_messages()
+    }
+
     /// Whether a send ignores the destination it is given.
     ///
     /// True of a connected sequenced-packet socket, and of nothing else:
