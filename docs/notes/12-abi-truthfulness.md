@@ -508,6 +508,9 @@ numbering they write down, and the real thing is what the run above shows.
   `_ => ENOSYS` dispatch arm are correct answers, not gaps to close here.
 - `SO_SNDBUF`/`SO_RCVBUF` (`record-only`) — already tracked in §3.3 / the ABI board;
   this phase does not duplicate it.
+  (The send half is on this list and is not any more: the stored number is Linux's and it
+  governs a datagram queue, `docs/uapi/` §5.1 item 58. What remains of the pair is
+  `SO_RCVBUF` as a report rather than a resizeable window, named in §5.2.)
   (`/proc/<pid>/smaps` was on this list and is not any more: `docs/uapi/` §5.1 item 54
   served it, with the accounting rule this kernel can state named field by field
   beside the three numbers it cannot derive.)

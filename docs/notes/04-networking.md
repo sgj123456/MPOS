@@ -333,9 +333,10 @@ Current: auto echo reply only. No user-facing ICMP socket.
 
 Three things live in this section, and the **loopback** (4.3.1) and
 **`listen`/`accept`** (4.3.2) are done. The **socket options** (4.3.3) are the
-part still open, and of the six, four now steer the stack - `TCP_NODELAY`,
-`SO_KEEPALIVE`, `SO_REUSEADDR`'s bind arbitration - while two are stored and read
-back without changing a packet.
+part still open, and of the six, five now steer the stack - `TCP_NODELAY`,
+`SO_KEEPALIVE`, `SO_REUSEADDR`'s bind arbitration, `SO_LINGER`'s reset and
+`SO_SNDBUF`'s datagram queue - while one is stored and read back without changing
+a packet (`SO_RCVBUF`).
 
 #### 4.3.1 The loopback is a real wire — **DONE**
 
@@ -432,14 +433,19 @@ ways, the client's *half*-close read as end-of-stream while the other direction
 still carries, a second sequential connection (which is what fails if the pool
 never refills), and every refusal in the table above.
 
-#### 4.3.3 The options — **PARTIAL** (buffer sizes still record-only)
+#### 4.3.3 The options — **PARTIAL** (the receive buffer is a report, not a window)
 
 `setsockopt`/`getsockopt` are no longer a no-op: each socket's registry `Entry`
 carries a `SockOpts`, and the common options round-trip with the correct ABI —
 `SO_REUSEADDR`, `SO_KEEPALIVE`, `SO_SNDBUF`, `SO_RCVBUF`, `TCP_NODELAY` (`SOL_TCP`)
 as 4-byte ints, `SO_LINGER` as an 8-byte `struct linger` (in-out length honoured),
-plus `SO_TYPE`/`SO_ERROR`. `SO_RCVBUF`/`SO_SNDBUF` report the stack's default
-(64 KiB) until changed; unknown options are accepted and read back as 0.
+plus `SO_TYPE`/`SO_ERROR`. The two buffer sizes are Linux's numbers, not this
+kernel's taste (`net::sock_buffer_size`): a fresh socket reports its family's own
+defaults — 212992 for both datagram options, 16384 send / 131072 receive for a
+stream — a `setsockopt` stores **twice** the ask, clamped from below at 4608
+(send) or 2304 (receive) and capped at 4 MiB before the doubling, and a negative
+ask means "the largest" rather than an error. Unknown options are accepted and
+read back as 0.
 
 **`SO_REUSEADDR` is applied at `bind`/`listen`, and the rule it gates is not the
 one the man page suggests.** That is the finding, so the measurement comes
@@ -498,12 +504,20 @@ with an open connection, and both serve". The whole test also runs on a Linux
 host unchanged, which is the instrument: the same assertions that the guest must
 satisfy are the ones a real kernel satisfies.
 
-*Remaining (real effect, into smoltcp):* one. `SO_RCVBUF`/`SO_SNDBUF` cannot be
-honoured per socket at all until smoltcp's buffers stop being sized once at set
-construction. Four that used to be on this list are not: `TCP_NODELAY` reaches
-the live socket (`set_nagle_enabled`), `SO_KEEPALIVE` arms smoltcp's probe timer
-at Linux's default interval, `SO_REUSEADDR` is the rule above, and
-`SO_LINGER{on, 0}` now makes the last `close` a reset (4.3.4).
+*Remaining (real effect, into smoltcp):* one. `SO_RCVBUF` is the number a caller
+reads and not a window this kernel resizes: the receive ring is fixed at 16 KiB,
+so a smaller ask does not shrink it, where Linux drops at delivery once the queue
+passes the buffer. Five that used to be on this list are not: `SO_SNDBUF` governs
+a datagram socket's queue (`docs/uapi/` §5.1 item 58), `TCP_NODELAY` reaches the
+live socket (`set_nagle_enabled`), `SO_KEEPALIVE` arms smoltcp's probe timer at
+Linux's default interval, `SO_REUSEADDR` is the rule above, and `SO_LINGER{on, 0}`
+makes the last `close` a reset (4.3.4).
+
+Two more boundaries ride with the buffer number rather than the option. The
+datagram-too-big line is still the ring's rather than Linux's 65507 — this stack
+has no IP fragmentation, so a wider datagram could not leave the machine — and a
+floor-sized buffer admits three 1400-byte datagrams here against Linux's two,
+because this kernel charges the payload where Linux charges each skb's truesize.
 
 Two named gaps ride with the rule rather than the option. The predicate lives in
 `net/mod.rs`, which is gated `target_os = "none"` (`src/lib.rs:48`), so it has no
