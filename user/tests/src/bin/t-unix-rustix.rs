@@ -179,13 +179,16 @@ fn main() {
         r.check("the client reads the reply", &buf[..got] == REPLY);
     }
 
-    // The anonymous peer: the client carries no name and the accepted
-    // half is anonymous too, so getpeername answers an `AF_UNIX` with an
-    // empty path - the empty name Linux gives for an unnamed socket.
+    // The peer the connect dialled: the client never bound a name of its own,
+    // but its *peer* is the listener's path, and that is what `getpeername`
+    // answers - Linux's `unix_peer` keeps the address on the socket rather
+    // than reading it off the peer, so it outlives both the peer and the
+    // name's node (measured on a current host,
+    // `.workbuddy/probe_unix_names2.c`).
     match getpeername(&client).map(|any| any.and_then(|a| SocketAddrUnix::try_from(a).ok())) {
         Ok(Some(back)) => r.check(
-            "getpeername on the connected end is the empty unix name",
-            back.path().is_none_or(|p| p.to_str() == Ok("")),
+            "getpeername on the connected end names the listener",
+            back.path().is_some_and(|p| p.to_str() == Ok(path.as_str())),
         ),
         Ok(None) => r.check("getpeername answers a unix address", false),
         Err(err) => r.check(

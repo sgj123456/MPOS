@@ -26,8 +26,7 @@ Deliberate divergences from Linux (each asserted in `t-unix`/
 bound-but-never-listened name is `ECONNREFUSED` rather than Linux's
 implicit rendezvous at a socket nobody listened on; ext4 refuses socket
 nodes (`EOPNOTSUPP` - `/run` is ramfs); `mknod(S_IFSOCK)` still refuses, so
-only `bind` creates a socket name; `getpeername` answers `AF_UNIX` with an
-empty path (accepted peers carry no name). `SOCK_DGRAM` unix sockets are
+only `bind` creates a socket name. `SOCK_DGRAM` unix sockets are
 served whole-message (`t-unix-dgram`), and so is a `SOCK_SEQPACKET` *pair*;
 a *named* `SOCK_SEQPACKET` connection kept no message boundary until item 78,
 which now serves it as the same message pair a `socketpair` half is
@@ -358,6 +357,69 @@ is one longer. Every claim green on a current host first (`MPOS_ON_HOST=1`, 80 o
 still a `String`, so a path that is not UTF-8 is refused here where Linux takes
 any bytes. That is a type change (`UnixAddr::Path(Vec<u8>)` and every path door
 under it), not a rule, and §4.1.1 names it beside the parser.
+
+#### 4.1.6 A socket's address is three answers, and `getpeername` is the connect's record — **SERVED** (2026-10-22)
+
+`getsockname`/`getpeername` answered one thing for every socket that had no
+name - `AF_UNIX` plus an empty path, three bytes - and that single answer was
+wrong in three different directions. Linux keeps the *address* on the socket
+(`unix_sk(sk)->addr`) and the *peer's address* on the socket too (`unix_peer`),
+and both outlive the things this kernel was reading them from.
+
+**Measured whole on a current host first** (`.workbuddy/probe_unix_unnamed.c`,
+`probe_unix_names{,2}.c`, `probe_unix_accepted_name.c`, `probe_unix_bind_after.c`,
+`probe_unix_from.c`, `probe_unix_noname_bytes.c`, Linux 7.2.11):
+
+| The question | Linux 7.2.11 |
+|---|---|
+| `getsockname` on a fresh socket, any type | 0, `addrlen` **2** - the bare family, no path byte written |
+| `getsockname` on a `socketpair` end | 0, `addrlen` 2 - the same |
+| `getsockname` after `bind` of the empty path (`addrlen` 3) | 0, `addrlen` **3** - family + the NUL, which is a *name* of zero bytes |
+| `getsockname` after `bind` of an `addrlen`-2 autobind | 0, `addrlen` 8 - family + NUL + five hex characters |
+| `getpeername` on an unconnected socket, bound or not, listening or not | `ENOTCONN` (107) |
+| `getpeername` on a connected **client** | the *listener's* bound path |
+| `getpeername` on an **accepted** end | `addrlen` 2 - the client bound nothing |
+| `getsockname` on an **accepted** end | the *listener's* bound path - inherited |
+| `bind` on an accepted end | `EINVAL` (22) - it already answers a name |
+| `bind` on the connected client end | 0 - it answers the unnamed address |
+| `getsockname` after the name's node is `unlink`ed | still the bound path, on the listener and both connected ends |
+| `getpeername` after the peer is closed | still the name the connect dialled |
+| a datagram `sendto` with a name | does **not** move the socket's peer; only `connect` does |
+| `recvfrom` from an unbound sender | `addrlen` **0**, and not one byte of the caller's storage touched |
+| `recvfrom` from a sender bound to the empty path | `addrlen` 3 - the family and its NUL |
+
+**The fix is two facts instead of one flag.** `UnixState` gains `local` - the
+address `getsockname` answers, written by `bind` (path, abstract or autobind)
+and by `accept` (the listener's) - and `peer_name`, written by `connect` from
+the listener's `local` and never read off the peer. `is_bound` becomes "does
+this socket answer a name" rather than "did `bind` run", which is what makes an
+accepted end refuse a second bind while its client end accepts one; the two
+questions were the same flag before and no measured shape agreed with that.
+`write_addr` answers the nameless case with `write_no_name` (the bare family,
+two bytes), and a delivery from a sender with no name takes its own door,
+`write_no_source` (`addrlen` zero, nothing written) - three answers where there
+was one, each measured.
+
+**Pinned by `t-unix`** 80 → 90 claims: the unbound socket's two bytes and its
+untouched storage, the empty path's three, the accepted end inheriting the
+listener's name, the `EINVAL` that inheritance earns, the client end's bare
+family and the bind it is therefore allowed, and `getpeername` naming the
+dialled listener. `t-unix-dgram`'s unnamed-sender claim moved from "three bytes
+of empty name" to "`addrlen` zero, storage untouched" - the shape it had been
+asserting was this kernel's, not Linux's. `t-unix-rustix`'s `getpeername` claim
+follows the same rule. All green on a current host first, and `ok:` for `ok:`
+identical on both machines.
+
+**Counterfactual** (the three accessors put back to the old flag, every pin
+kept): `pass=191 fail=2`, five claims red by name - `t-unix`'s
+`the accepted end's own name is the listener's`, `so a bind on the accepted end
+is EINVAL`, `and its own bind is served` and `and the peer is the name the
+connect dialled`, and `t-unix-rustix`'s `getpeername on the connected end names
+the listener`.
+
+**What stays named**: the address of a socket that travels through
+`SCM_RIGHTS` was not measured here, so nothing is claimed about it -
+`t-unix-scm` pins the descriptor's credentials and not its name.
 
 ### 4.2 ICMP Improvements — **DONE**
 

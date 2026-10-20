@@ -219,8 +219,13 @@ fn empty_src() -> libc::sockaddr_un {
     }
 }
 
-/// The name a `recvfrom` answered is the empty one, whether the crate spells it
-/// as an empty path or as the nameless abstract address Linux sends.
+/// The name a `recvfrom` answered is *no* name - the sender never bound one.
+///
+/// Linux reports that as a zero `addrlen`, which is not the same answer as an
+/// empty name: a sender that bound the empty path is a name of zero bytes and
+/// arrives as three. `rustix` cannot say the difference - its parsed address
+/// is `None` for both - so the raw `addrlen` is the claim wherever it matters,
+/// and this helper covers the parsed half only.
 fn is_empty_name(from: Option<&SocketAddrUnix>) -> bool {
     from.is_none_or(|a| a.path().is_none_or(|p| p.to_str() == Ok("")))
 }
@@ -312,13 +317,15 @@ fn main() {
     );
     let mut src = empty_src();
     let (rc, srclen) = recvfrom_addrlen(rs.as_fd(), &mut buf, &mut src);
-    let unnamed_len = rc == 5 && srclen == 3 && src.sun_family as i32 == libc::AF_UNIX;
-    if mpos_user_tests::host_run() {
-        println!("note: the host answered rc={rc} addrlen={srclen} for an unbound sender");
-    }
+    // The count is the answer, and it is *zero*: an unbound sender has no
+    // address, where a sender that bound the empty path has one of three
+    // bytes. Linux's `unix_dgram_recvmsg` writes the name only when
+    // `UNIXCREDS`... no - it writes whatever `unix_sk(sender)->addr` holds,
+    // and an unbound socket holds nothing, so `addrlen` stays 0 and not one
+    // byte of the caller's storage is touched (measured on a current host).
     r.check(
-        "and three bytes of it were the answer (divergence: Linux reports no name at all)",
-        unnamed_len || mpos_user_tests::host_run(),
+        "and the count says no name at all: zero bytes, not the empty name",
+        rc == 5 && srclen == 0 && src.sun_path[0] == 0x7f,
     );
 
     // Truncation is per-message: the unread tail of one datagram is gone, and

@@ -99,6 +99,26 @@ Section numbers are unchanged from the original `UAPI.md`.
   32/0 on both. Named: the path half is still a `String`, so a non-UTF-8 *path* is refused here
   where Linux takes any bytes - a type change, not a rule.
 
+- **A socket's address is three answers, and `getpeername` is the connect's record.** **Landed
+  2026-10-22** (`docs/uapi/` §5.1 item 83). `getsockname`/`getpeername` answered `AF_UNIX` plus
+  an empty path for every socket with no name, which was wrong in three directions. Measured on a
+  current host first (`.workbuddy/probe_unix_unnamed.c`, `probe_unix_names{,2}.c`,
+  `probe_unix_accepted_name.c`, `probe_unix_bind_after.c`, `probe_unix_from.c`,
+  `probe_unix_noname_bytes.c`, Linux 7.2.11): an unbound socket of any type (and a `socketpair`
+  end) answers the **bare family**, two bytes, while a `bind` of the *empty* path answers three -
+  the family and its NUL, a name of zero bytes rather than no name; `getpeername` is `ENOTCONN`
+  for every unconnected shape and the *listener's bound path* on a connected client; an
+  **accepted** end inherits the listener's address as its own - which is what makes a second
+  `bind` there `EINVAL`, while the client end of the same connection binds happily; both names
+  survive the node's `unlink` and the peer's close; and a delivery from an unbound sender reports
+  `addrlen` **0** with not one byte of the caller's storage written. Served by `UnixState::local`
+  and `UnixState::peer_name` (the address and the dialled peer, both kept on the socket the way
+  Linux keeps them) with `write_no_name`/`write_no_source` for the two nameless answers. Pin:
+  **`t-unix`** 80 → 90 claims, plus `t-unix-dgram`'s unnamed-sender claim rewritten from this
+  kernel's three bytes to Linux's zero and `t-unix-rustix`'s `getpeername`. Gate: x86_64
+  `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Named: the address of a
+  socket handed over by `SCM_RIGHTS` was not measured here.
+
 - **Real `MSG_PEEK` over TCP/UDP is served, and `MSG_TRUNC` is the message's own length.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet this replaces said the flag
   was refused `EOPNOTSUPP` because serving it needed peek-preserving delivery in the stack; the

@@ -177,9 +177,11 @@ pub struct UnixSock {
 /// One connection waiting in a listener's queue, in the shape its family
 /// carries.
 enum Pending {
-    /// A byte-stream connection: the server half of a `DuplexEnd` pair and
-    /// the connector's credentials for `SO_PEERCRED`.
-    Stream(Arc<DuplexEnd>, UCred),
+    /// A byte-stream connection: the server half of a `DuplexEnd` pair, the
+    /// connector's credentials for `SO_PEERCRED`, and the *listener's* address
+    /// - which the socket `accept` mints inherits as its own, because Linux's
+    /// `unix_accept` copies the listener's `addr` onto the accepted end.
+    Stream(Arc<DuplexEnd>, UCred, Option<UnixAddr>),
     /// A sequenced-packet connection: the server socket, already paired with
     /// the connector's socket as a message peer (each end has its own queue,
     /// so there is no shared channel to hand over).
@@ -191,6 +193,24 @@ struct UnixState {
     /// the bind table keys on) and the path spelled at the call, which is
     /// what `getsockname` echoes.
     bound: Option<BoundName>,
+    /// The address this socket answers `getsockname` with, which is *not* the
+    /// same question as "did `bind` plant a name".
+    ///
+    /// Linux keeps the two apart (`sk->sk_state == TCP_CLOSE` gates the bind,
+    /// `unix_autobind` and `unix_sk(sk)->addr` answer the read), and three
+    /// measured shapes depend on the split: an unbound socket answers the
+    /// bare family with a two-byte `addrlen`, a `bind` of an *empty* path
+    /// answers the same two bytes plus a NUL, and an **accepted** end
+    /// inherits the listener's name while being refused a second bind
+    /// `EINVAL` - which is Linux's `unix_accept` copying the listener's
+    /// `addr` into a socket `unix_bind` still considers named. Keeping one
+    /// flag for both questions cannot say any of the three.
+    local: Option<UnixAddr>,
+    /// The name of the peer this socket dialled, kept from the connect
+    /// rather than read off the peer's own slot: Linux stores the address on
+    /// the *socket* (`unix_peer`'s `addr`), so it survives the peer's death,
+    /// its name's `unlink`, and a datagram peer that never answered again.
+    peer_name: Option<UnixAddr>,
     /// `listen`'s backlog, once `listen` was called. `Some` is what a
     /// `connect` looks for; a bound socket without it is refused
     /// (`ECONNREFUSED`, the header's divergence list).
@@ -306,6 +326,8 @@ impl UnixSock {
             net_ns,
             state: Mutex::new(RefCell::new(UnixState {
                 bound: None,
+                local: None,
+                peer_name: None,
                 backlog: None,
                 pending: VecDeque::new(),
                 accept_waiters: Vec::new(),
@@ -570,18 +592,42 @@ impl UnixSock {
         critical_section::with(|cs| self.state.borrow(cs).borrow().backlog.is_some())
     }
 
-    /// Whether a `bind` has planted a name on this socket. Linux refuses a
-    /// second bind on the grounds that the first is what the fd answers by.
+    /// Whether this socket already answers a name, which is what makes a
+    /// second `bind` `EINVAL` - and it is deliberately *not* "did `bind` plant
+    /// one": an accepted end inherits the listener's address and is refused a
+    /// bind of its own, measured on a current host (`bind` on an accepted
+    /// `SOCK_STREAM` end answers `EINVAL`, while the client end of the same
+    /// connection - which answers the *unnamed* address - binds happily).
     pub fn is_bound(&self) -> bool {
-        critical_section::with(|cs| self.state.borrow(cs).borrow().bound.is_some())
+        critical_section::with(|cs| self.state.borrow(cs).borrow().local.is_some())
     }
 
-    /// The bound address, for `getsockname` - in whichever namespace it lives.
+    /// The address `getsockname` answers - in whichever namespace it lives.
+    ///
+    /// `None` is the unnamed socket, whose answer is not a name of zero bytes
+    /// but the bare family (measured: an unbound socket of any type, and both
+    /// ends of a `socketpair`, answer two bytes of `family` alone, where a
+    /// `bind` of an empty path answers three - the family and a NUL).
     pub fn local_addr(&self) -> Option<UnixAddr> {
-        critical_section::with(|cs| match self.state.borrow(cs).borrow().bound.as_ref()? {
-            BoundName::Path { path, .. } => Some(UnixAddr::Path(path.clone())),
-            BoundName::Abstract(name) => Some(UnixAddr::Abstract(name.clone())),
+        critical_section::with(|cs| self.state.borrow(cs).borrow().local.clone())
+    }
+
+    /// Whether this socket has a peer at all - the question `getpeername`
+    /// asks before it looks for a name, because a connected end whose peer
+    /// never bound anything still answers (the bare family), while a socket
+    /// that never dialled is `ENOTCONN`.
+    pub fn is_connected(&self) -> bool {
+        critical_section::with(|cs| {
+            let st = self.state.borrow(cs).borrow();
+            st.end.is_some() || st.dgram_peer.is_some()
         })
+    }
+
+    /// The address of the peer this socket dialled, as the connect recorded
+    /// it - what `getpeername` answers, and `None` for a socket that never
+    /// dialled anything (a listener, a fresh socket, a bound one).
+    pub fn peer_addr(&self) -> Option<UnixAddr> {
+        critical_section::with(|cs| self.state.borrow(cs).borrow().peer_name.clone())
     }
 }
 
@@ -921,6 +967,12 @@ pub(crate) fn bind(sock: &Arc<UnixSock>, _node: Arc<dyn Inode>, path: String, ke
             reg.by_node.insert(key, sock.id);
         }
         let mut st = sock.state.borrow(cs).borrow_mut();
+        // The two facts `bind` records: the table key the name retires by, and
+        // the address the fd now answers with. `local` is what `getsockname`
+        // reads, and it outlives the name - a listener that `unlink`s its own
+        // path still answers it (measured: `getsockname` keeps the bound path
+        // after the node is gone, on both ends of a live connection).
+        st.local = Some(UnixAddr::Path(path.clone()));
         st.bound = Some(BoundName::Path { path, key });
     });
 }
@@ -955,6 +1007,7 @@ pub(crate) fn bind_name(sock: &UnixSock, name: Vec<u8>) -> isize {
             slot.name = Some(key);
         }
         let mut st = sock.state.borrow(cs).borrow_mut();
+        st.local = Some(UnixAddr::Abstract(name.clone()));
         st.bound = Some(BoundName::Abstract(name));
         0
     })
@@ -1147,10 +1200,18 @@ fn connect_to(
             return Err(ConnectRefused::WrongType);
         }
         critical_section::with(|cs| {
-            let cred = listener.state.borrow(cs).borrow().owner;
+            let lst = listener.state.borrow(cs).borrow();
+            let cred = lst.owner;
+            let name = lst.local.clone();
             let mut st = sock.state.borrow(cs).borrow_mut();
             st.dgram_peer = Some(Arc::downgrade(listener));
             st.peer = Some(cred);
+            // The name `getpeername` answers, recorded at the connect: it
+            // outlives the peer's death and its node's `unlink` (measured -
+            // a datagram sender still names its peer after the peer is
+            // closed), because Linux keeps it on the socket and not on the
+            // peer.
+            st.peer_name = name;
         });
         return Ok(());
     }
@@ -1196,17 +1257,28 @@ fn connect_to(
                 // socket on both sides (Linux's behavior once backlog
                 // space existed). It also records who it dialed into - the
                 // listener's credentials are this socket's peer from now on.
+                let listener_name = stl.local.clone();
                 let connector_cred = {
                     let mut stc = sock.state.borrow(cs).borrow_mut();
                     let cred = stc.owner;
                     stc.end = Some(client);
                     stc.peer = Some(listener_cred);
+                    // The name this socket dialled, recorded on the socket the
+                    // way Linux's `unix_peer` records it: `getpeername` answers
+                    // it for the life of the connection, whatever happens to the
+                    // name's node afterwards (measured: still the bound path
+                    // after the listener `unlink`ed it and closed).
+                    stc.peer_name = listener_name.clone();
                     cred
                 };
                 // The connector's own credentials ride the queued half, so the
-                // socket `accept` mints can report them as its peer.
+                // socket `accept` mints can report them as its peer - and so
+                // does the connector's address, which an accepted end inherits
+                // as its own name (measured: an accepted stream end answers
+                // `getsockname` with the *listener's* bound path, and is then
+                // refused a bind of its own with `EINVAL`).
                 stl.pending
-                    .push_back(Pending::Stream(server, connector_cred));
+                    .push_back(Pending::Stream(server, connector_cred, listener_name));
                 ConnectOutcome::Connected(waiters)
             }
         });
@@ -1263,14 +1335,18 @@ fn connect_messages(
                 return (ConnectOutcome::Full, Some(server));
             }
             let listener_cred = stl.owner;
+            let listener_name = stl.local.clone();
             let waiters = stl.accept_waiters.clone();
             let connector_cred = sock.state.borrow(cs).borrow().owner;
+            let connector_name = sock.state.borrow(cs).borrow().local.clone();
             // The connector owns its end immediately, as a stream connector
-            // does: connect is not a rendezvous. Its peer is the listener.
+            // does: connect is not a rendezvous. Its peer is the listener, and
+            // both names are recorded on the sockets that answer for them.
             {
                 let mut stc = sock.state.borrow(cs).borrow_mut();
                 stc.dgram_peer = Some(Arc::downgrade(&server));
                 stc.peer = Some(listener_cred);
+                stc.peer_name = listener_name.clone();
             }
             // The accepted end belongs to the listener, not to whichever
             // task happened to call `connect`: `SO_PEERCRED` on the client
@@ -1281,6 +1357,10 @@ fn connect_messages(
                 sts.owner = listener_cred;
                 sts.dgram_peer = Some(Arc::downgrade(sock));
                 sts.peer = Some(connector_cred);
+                // The accepted end inherits the listener's address and names
+                // the connector - the same pair a stream accept leaves.
+                sts.local = listener_name.clone();
+                sts.peer_name = connector_name;
             }
             stl.pending.push_back(Pending::Messages(server));
             (ConnectOutcome::Connected(waiters), None)
@@ -1595,6 +1675,61 @@ pub(crate) fn sockaddr_un_addr(raw: &[u8]) -> Result<UnixAddrParse, isize> {
     Ok(UnixAddrParse::Name(UnixAddr::Path(name.to_string())))
 }
 
+/// The answer for a delivery whose sender has no name at all: `addrlen`
+/// **zero**, and not one byte of the caller's storage touched.
+///
+/// It is not the empty name and not the bare family - those are answers a
+/// socket gives about *itself*. Linux's `unix_dgram_recvmsg` writes
+/// `unix_sk(sender)->addr` when there is one and leaves `msg_namelen` at zero
+/// when there is not (measured: an unbound sender delivers with `addrlen` 0 and
+/// a storage buffer still holding its `0x7f` seed, while a sender bound to the
+/// empty path delivers three bytes). A `recvfrom` that read the difference as
+/// "the empty name" would tell a caller its peer has a name it never bound.
+pub(crate) fn write_no_source(len_ptr: usize) -> isize {
+    if len_ptr == 0 {
+        return err::EFAULT;
+    }
+    if !crate::uaccess::buffer_ok(len_ptr, 4, true, true) {
+        return err::EFAULT;
+    }
+    unsafe {
+        (len_ptr as *mut u32).write_unaligned(0);
+    }
+    0
+}
+
+/// The answer for a socket that has no name at all, which is **not** the
+/// empty name: Linux's `unix_getname` writes the bare family and reports two
+/// bytes, where a `bind` of the empty path reports three (measured on a
+/// current host, both shapes). A *delivery* from an unbound sender is a
+/// different answer again - `addrlen` zero and the caller's storage untouched
+/// (`.workbuddy/probe_unix_noname_bytes.c`) - so that door does not come here.
+fn write_no_name(addr_ptr: usize, len_ptr: usize) -> isize {
+    if len_ptr == 0 {
+        return err::EFAULT;
+    }
+    if !crate::uaccess::buffer_ok(len_ptr, 4, true, true) {
+        return err::EFAULT;
+    }
+    let want = unsafe { (len_ptr as *const u32).read_unaligned() } as usize;
+    if want >= 2 {
+        if addr_ptr == 0 || !crate::uaccess::buffer_ok(addr_ptr, 2, true, true) {
+            return err::EFAULT;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                crate::net::socket::AF_UNIX.to_ne_bytes().as_ptr(),
+                addr_ptr as *mut u8,
+                2,
+            );
+        }
+    }
+    unsafe {
+        (len_ptr as *mut u32).write_unaligned(2);
+    }
+    0
+}
+
 /// The bytes a `sockaddr_un` answering `getsockname` carries for an abstract
 /// name: the family, the leading NUL, and the name - `addrlen` is `3 + len`,
 /// which is what Linux answers (measured: 13 for a ten-byte name).
@@ -1745,19 +1880,35 @@ pub(crate) fn write_name(sock: &UnixSock, addr_ptr: usize, len_ptr: usize) -> is
     write_addr(sock.local_addr().as_ref(), addr_ptr, len_ptr)
 }
 
+/// The peer's address, for `getpeername`: the name recorded at the connect
+/// that dialled it, or `None` for a socket that never dialled anything - which
+/// is `ENOTCONN`, the handler's answer, not an empty name.
+pub(crate) fn peer_name(sock: &UnixSock) -> Option<UnixAddr> {
+    sock.peer_addr()
+}
+
 /// The writer both callers share: `getsockname` answers the socket's own bound
 /// address, `recvfrom` the *sender's* of the datagram just taken. The two
 /// namespaces differ only in the bytes they spell - a path is the string and a
 /// NUL, an abstract name is the leading NUL and the bytes - and `addrlen` is
 /// the length of whichever one is written, which is what Linux reports.
 pub(crate) fn write_addr(addr: Option<&UnixAddr>, addr_ptr: usize, len_ptr: usize) -> isize {
+    // An address a *receive* reports and one a socket reports are two
+    // answers with one absence: an unnamed socket's `getsockname` is the bare
+    // family (two bytes, measured), while a delivery from a sender with no
+    // name is `addrlen` **zero** and not one byte of the caller's storage
+    // touched (also measured - `.workbuddy/probe_unix_noname_bytes.c`). The
+    // caller that knows which question it is asking says so.
+    if addr.is_none() {
+        return write_no_name(addr_ptr, len_ptr);
+    }
     let bytes = match addr {
         Some(UnixAddr::Path(path)) => sockaddr_un_bytes(path),
         Some(UnixAddr::Abstract(name)) => sockaddr_un_abstract_bytes(name),
-        // No address to answer with. Linux writes the bare family; this
-        // kernel has always written an empty path (the same three bytes the
-        // empty-path probe sees) and that divergence is `t-unix`'s.
-        None => sockaddr_un_bytes(""),
+        // Unreachable: `write_addr` answers the nameless case before it gets
+        // here, because that answer is a different shape (the bare family, or
+        // nothing at all) rather than one of these two spellings.
+        None => return write_no_name(addr_ptr, len_ptr),
     };
     if len_ptr == 0 {
         return err::EFAULT;
@@ -1955,13 +2106,13 @@ pub(crate) fn accept_face(listener: &UnixSock, nonblock: bool) -> Result<Arc<Uni
         // minted it, pointed both ends at each other and recorded the
         // credentials, so there is no channel left to wrap.
         Pending::Messages(server) => Ok(server),
-        Pending::Stream(end, peer) => {
+        Pending::Stream(end, peer, name) => {
             // The listener's namespace, not the accepter's: the accepted
             // socket is the server's other end, and it is the server's table
             // an abstract name of its own would land in (Linux's
             // `unix_accept` uses `sock_net` of the listener).
             let accepted = alloc_in(listener.net_ns, listener.typ);
-            accepted.with_state_connect(end, peer);
+            accepted.with_state_connect(end, peer, name);
             Ok(accepted)
         }
     }
@@ -1972,11 +2123,17 @@ impl UnixSock {
     /// of the socket that dialed it - the accepted socket's peer, which
     /// `SO_PEERCRED` and `SCM_CREDENTIALS` report from here on. Inherent to
     /// the type; the handler borrows through the Arc it made for the fd.
-    fn with_state_connect(&self, end: Arc<DuplexEnd>, peer: UCred) {
+    fn with_state_connect(&self, end: Arc<DuplexEnd>, peer: UCred, name: Option<UnixAddr>) {
         critical_section::with(|cs| {
             let mut st = self.state.borrow(cs).borrow_mut();
             st.end = Some(end);
             st.peer = Some(peer);
+            // The accepted end's own address is the listener's, and it is what
+            // makes a second `bind` on it `EINVAL` - Linux's `unix_bind` asks
+            // `unix_sk(sk)->addr` rather than "did this call run". The peer is
+            // the connector, which for an unbound client is no address at all.
+            st.local = name;
+            st.peer_name = None;
         });
     }
 }

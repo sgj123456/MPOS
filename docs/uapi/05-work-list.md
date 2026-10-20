@@ -4408,3 +4408,68 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     **What stays named**: the path half is still a `String`, so a non-UTF-8 *path*
     is refused here where Linux takes any bytes. That is a type change
     (`UnixAddr::Path(Vec<u8>)` and every path door under it), not a rule.
+
+## item 83 — A socket's address is three answers, and `getpeername` is the connect's record
+
+    `getsockname`/`getpeername` answered one thing for every socket with no
+    name - `AF_UNIX` plus an empty path, three bytes - and that one answer was
+    wrong in three directions. Linux keeps the *address* on the socket
+    (`unix_sk(sk)->addr`) and the *peer's* address on the socket too
+    (`unix_peer`), so both outlive the node and the peer they name.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_unix_unnamed.c`,
+    `probe_unix_names{,2}.c`, `probe_unix_accepted_name.c`,
+    `probe_unix_bind_after.c`, `probe_unix_from.c`, `probe_unix_noname_bytes.c`,
+    Linux 7.2.11):
+
+    * `getsockname` on a fresh socket of any type, and on a `socketpair` end,
+      is `addrlen` **2** - the bare family, no path byte written;
+    * after `bind` of the *empty* path it is `addrlen` **3** - the family and
+      its NUL, a name of zero bytes rather than no name;
+    * `getpeername` is `ENOTCONN` (107) for every unconnected shape (bound,
+      unbound, listening alike), the *listener's bound path* on a connected
+      client, and the bare family on an **accepted** end (the client bound
+      nothing);
+    * `getsockname` on an accepted end is the *listener's* bound path -
+      inherited - and that inheritance is what makes a second `bind` there
+      `EINVAL` (22), while the client end of the same connection answers the
+      unnamed address and binds happily;
+    * both names survive the node: a listener that `unlink`s its own path still
+      answers it, and so do both connected ends; `getpeername` still names a
+      peer that has been closed;
+    * a datagram `sendto` naming a destination does **not** move the socket's
+      peer - only `connect` does;
+    * a delivery from an unbound sender reports `addrlen` **0** and writes not
+      one byte of the caller's storage, where a sender bound to the empty path
+      reports 3.
+
+    Served by two facts where there was one flag: `UnixState::local` (written
+    by `bind` - path, abstract or autobind - and by `accept`, which copies the
+    listener's) and `UnixState::peer_name` (written by `connect` from the
+    listener's `local`). `is_bound` now asks "does this socket answer a name"
+    rather than "did `bind` run", which is the split an accepted end needs.
+    `write_addr` answers the nameless case with `write_no_name` (the bare
+    family, two bytes) and a delivery from an unnamed sender takes its own
+    door, `write_no_source` (`addrlen` zero, nothing written) - three answers
+    where there was one, each measured.
+
+    **Pins**: `t-unix` 80 -> 90 claims (the unbound socket's two bytes and its
+    untouched storage, the empty path's three, the accepted end inheriting the
+    name, the `EINVAL` that earns, the client end's bare family and the bind it
+    is therefore allowed, and `getpeername` naming the dialled listener);
+    `t-unix-dgram`'s unnamed-sender claim rewritten from "three bytes of empty
+    name" - this kernel's shape - to "`addrlen` zero, storage untouched"; and
+    `t-unix-rustix`'s `getpeername` claim follows the same rule. Green on a
+    current host first, and `ok:` for `ok:` identical on both machines.
+
+    Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32
+    passed, 0 failed on both. Counterfactual (the three accessors put back to
+    the old flag, every pin kept): `pass=191 fail=2`, five claims red by name -
+    `t-unix`'s `the accepted end's own name is the listener's`,
+    `so a bind on the accepted end is EINVAL`, `and its own bind is served` and
+    `and the peer is the name the connect dialled`, and `t-unix-rustix`'s
+    `getpeername on the connected end names the listener`.
+
+    **What stays named**: the address of a socket that travels through
+    `SCM_RIGHTS` was not measured here, so nothing is claimed about it -
+    `t-unix-scm` pins the descriptor's credentials and not its name.

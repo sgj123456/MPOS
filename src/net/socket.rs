@@ -2660,7 +2660,14 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
             }
         }
         if args[4] != 0 {
-            let r = crate::net::unix::write_addr(got.from.as_ref(), args[4], args[5]);
+            // A delivery from a sender with no name reports `addrlen` **zero**
+            // and writes nothing: that is a different answer from a socket
+            // naming itself (the bare family), so the nameless case takes its
+            // own door here rather than the address writer's.
+            let r = match got.from.as_ref() {
+                Some(from) => crate::net::unix::write_addr(Some(from), args[4], args[5]),
+                None => crate::net::unix::write_no_source(args[5]),
+            };
             if r != 0 {
                 return r;
             }
@@ -2963,7 +2970,10 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         };
         let (from, cred, cut) = (got.from, got.cred, n < full);
         if name != 0 {
-            let r = crate::net::unix::write_addr(from.as_ref(), name, msghdr + 8);
+            let r = match from.as_ref() {
+                Some(from) => crate::net::unix::write_addr(Some(from), name, msghdr + 8),
+                None => crate::net::unix::write_no_source(msghdr + 8),
+            };
             if r < 0 {
                 return r;
             }
@@ -5066,10 +5076,19 @@ pub(crate) fn handle_getpeername(args: [usize; 6], _from_user: bool) -> isize {
     // a different fact from "everybody is anonymous".
     if let Ok(file) = crate::sched::current_fds().clone_at(fd) {
         if let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>() {
-            if sock.unix_end().is_none() {
-                return err::ENOTCONN;
-            }
-            return crate::net::unix::write_name(sock, addr_ptr, len_ptr);
+            // The peer's name is the one the connect recorded, and "no peer"
+            // is `ENOTCONN` rather than an empty answer: a listener and a
+            // fresh socket never dialled anything, while a connected end that
+            // dialled an *unnamed* peer names that too (the bare family, two
+            // bytes) - measured on a current host for a stream pair, a named
+            // connection and a datagram sender alike.
+            return match crate::net::unix::peer_name(sock) {
+                Some(addr) => crate::net::unix::write_addr(Some(&addr), addr_ptr, len_ptr),
+                None if sock.is_connected() => {
+                    crate::net::unix::write_addr(None, addr_ptr, len_ptr)
+                }
+                None => err::ENOTCONN,
+            };
         }
         // A vsock stream's peer is the CID and port the connection was
         // made with - the two numbers a connected caller can dial back

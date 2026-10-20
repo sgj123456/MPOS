@@ -562,6 +562,150 @@ fn main() {
 
     let _ = unlinkat(CWD, "/tmp/t-unix-notdir", AtFlags::empty());
 
+    // --- the three addresses a socket can answer with --------------------
+    //
+    // Linux keeps "what is my address" and "did `bind` plant a name" apart,
+    // and the answers differ by more than a flag: an unbound socket answers
+    // the **bare family** (two bytes), a socket bound to the empty path
+    // answers the family and a NUL (three), and an **accepted** end inherits
+    // the listener's address - which then refuses it a bind of its own with
+    // `EINVAL`, the same refusal a listener gets. Measured on a current host
+    // first (`.workbuddy/probe_unix_unnamed.c`, `.workbuddy/probe_unix_names.c`,
+    // `.workbuddy/probe_unix_bind_after.c`, Linux 7.2.11).
+    let unnamed = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    let mut u_echo = Storage {
+        family: 0,
+        pad: [0x7f; 108],
+    };
+    let mut u_len = 110u32;
+    let u_r = getsockname_raw(unnamed.as_raw_fd(), &mut u_echo, &mut u_len);
+    r.check(
+        "an unbound socket's name is the bare family, two bytes",
+        u_r == 0 && u_len == 2 && u_echo.family == 1,
+    );
+    r.check("and it wrote no path byte at all", u_echo.pad[0] == 0x7f);
+    drop(unnamed);
+
+    // The empty path is a *name* of zero bytes, and its three bytes are the
+    // proof: the answer is not "unnamed".
+    let empty_name = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    let mut zero = Storage {
+        family: 1,
+        pad: [0; 108],
+    };
+    r.check(
+        "binding the empty path succeeds",
+        bind_raw(empty_name.as_raw_fd(), &zero, 3) == 0,
+    );
+    let mut e_echo = Storage {
+        family: 0,
+        pad: [0x7f; 108],
+    };
+    let mut e_len = 110u32;
+    let e_r = getsockname_raw(empty_name.as_raw_fd(), &mut e_echo, &mut e_len);
+    r.check(
+        "and its name is the family plus the NUL: three bytes",
+        e_r == 0 && e_len == 3 && e_echo.family == 1 && e_echo.pad[0] == 0,
+    );
+    drop(empty_name);
+    zero.family = 1;
+    let _ = &zero;
+
+    // The accepted end of a connection inherits the listener's address, and
+    // that inheritance is what makes a second bind `EINVAL` - the client end
+    // of the same connection answers the *unnamed* address and binds fine.
+    let inherit_path = "/tmp/t-unix-inherit.sock";
+    let _ = unlinkat(CWD, inherit_path, AtFlags::empty());
+    let _ = unlinkat(CWD, "/tmp/t-unix-inherit2.sock", AtFlags::empty());
+    let inherit_l = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    let mut inh = Storage {
+        family: 1,
+        pad: [0; 108],
+    };
+    inh.pad[..inherit_path.len()].copy_from_slice(inherit_path.as_bytes());
+    r.check(
+        "a listener binds for the inheritance probe",
+        bind_raw(
+            inherit_l.as_raw_fd(),
+            &inh,
+            (2 + inherit_path.len() + 1) as u32,
+        ) == 0
+            && listen(&inherit_l, 4).is_ok(),
+    );
+    let inherit_c = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    r.check(
+        "a client dials it",
+        connect_raw(
+            inherit_c.as_raw_fd(),
+            &inh,
+            (2 + inherit_path.len() + 1) as u32,
+        ) == 0,
+    );
+    let accepted = accept_with(&inherit_l, SocketFlags::empty());
+    match &accepted {
+        Ok(acc) => {
+            let mut a_echo = Storage {
+                family: 0,
+                pad: [0x7f; 108],
+            };
+            let mut a_len = 110u32;
+            let a_r = getsockname_raw(acc.as_raw_fd(), &mut a_echo, &mut a_len);
+            r.check(
+                "the accepted end's own name is the listener's",
+                a_r == 0
+                    && a_len as usize == 2 + inherit_path.len() + 1
+                    && a_echo.pad[..inherit_path.len()] == inherit_path.as_bytes()[..],
+            );
+            let mut second = Storage {
+                family: 1,
+                pad: [0; 108],
+            };
+            let second_name = b"/tmp/t-unix-inherit2.sock";
+            second.pad[..second_name.len()].copy_from_slice(second_name);
+            r.check(
+                "so a bind on the accepted end is EINVAL",
+                bind_raw(acc.as_raw_fd(), &second, (2 + second_name.len() + 1) as u32)
+                    == -libc::EINVAL as isize,
+            );
+        }
+        Err(_) => {
+            r.check("the accepted end's own name is the listener's", false);
+            r.check("so a bind on the accepted end is EINVAL", false);
+        }
+    }
+    // The client end of the same connection answers the unnamed address, so
+    // its own bind is served - the two halves of the same connect, told apart
+    // by what the accept copied.
+    let mut c_echo = Storage {
+        family: 0,
+        pad: [0x7f; 108],
+    };
+    let mut c_len = 110u32;
+    let c_r = getsockname_raw(inherit_c.as_raw_fd(), &mut c_echo, &mut c_len);
+    r.check(
+        "while the client end's name is the bare family",
+        c_r == 0 && c_len == 2,
+    );
+    let mut second = Storage {
+        family: 1,
+        pad: [0; 108],
+    };
+    let second_name = b"/tmp/t-unix-inherit2.sock";
+    second.pad[..second_name.len()].copy_from_slice(second_name);
+    r.check(
+        "and its own bind is served",
+        bind_raw(
+            inherit_c.as_raw_fd(),
+            &second,
+            (2 + second_name.len() + 1) as u32,
+        ) == 0,
+    );
+    drop(accepted);
+    drop(inherit_c);
+    drop(inherit_l);
+    let _ = unlinkat(CWD, inherit_path, AtFlags::empty());
+    let _ = unlinkat(CWD, "/tmp/t-unix-inherit2.sock", AtFlags::empty());
+
     // getsockname echoes the bound path, and reports the length used - the
     // raw form, because the echoed addrlen is the claim.
     match getsockname_len(fd.as_raw_fd()) {
@@ -655,35 +799,23 @@ fn main() {
                 n.map_or(false, |n| n == 5) && &cbuf[..5] == b"pong!",
             );
 
-            // getpeername on a connected end: the client carries no name and
-            // the accepted half is anonymous too, so the answer is `AF_UNIX`
-            // with the empty path - family, one NUL, and the length that
-            // spells.
-            // The raw form again: the *length* echoed back is half of this
-            // claim, and `SocketAddrAny` hides it behind its parsed variants.
-            // What the two machines answer differs by design, and both are
-            // now measured rather than assumed: this kernel's unix socket
-            // keeps no peer name on a connect (mpos's documented gap beside
-            // Linux's `unix_peer`), so it answers the anonymous triple -
-            // family, one NUL, length 3 - which is what the payload pins.
-            // Real Linux echoes the *listener's bound path* (measured here:
-            // "/tmp/t-unix.sock", length 19 = 2 + 16 + 1), because that is
-            // precisely the name this test just bound. The host branch accepts
-            // either shape with its reason; the sweep pins mpos's.
+            // getpeername on a connected end is the name the *connect*
+            // dialled, kept on the socket rather than read off the peer's
+            // slot: Linux's `unix_peer` records it, so it survives the peer's
+            // death and its node's `unlink` (measured -
+            // `.workbuddy/probe_unix_names2.c`). The raw form again, because
+            // the echoed `addrlen` is half the claim.
             match getpeername_raw(client) {
                 Some((fam, path, len)) => {
                     r.check("getpeername on the connected end answers", true);
-                    let payload = fam == 1 && path.is_empty() && len == 3;
-                    let linux_named =
-                        fam == 1 && path == SOCK.as_bytes() && len as usize == 2 + SOCK.len() + 1;
                     r.check(
-                        "the peer is AF_UNIX with the empty name",
-                        payload || (mpos_user_tests::host_run() && linux_named),
+                        "and the peer is the name the connect dialled",
+                        fam == 1 && path == SOCK.as_bytes() && len as usize == 2 + SOCK.len() + 1,
                     );
                 }
                 None => {
                     r.check("getpeername on the connected end answers", false);
-                    r.check("the peer is AF_UNIX with the empty name", false);
+                    r.check("and the peer is the name the connect dialled", false);
                 }
             }
 
