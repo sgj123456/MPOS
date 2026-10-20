@@ -25,6 +25,10 @@ Section numbers are unchanged from the original `UAPI.md`.
   `sendto` with a destination on an already-connected seqpacket socket answered `EISCONN` where
   Linux sends - and a connected *datagram* socket's named send was refused the same way, where
   Linux resolves the name. Item 79 adds eight claims here (58 -> 66) and six to `t-unix-dgram`.
+  **Served by `docs/uapi/` §5.1 item 80**: a datagram's *path* naming a live socket of another
+  type now answers `EPROTOTYPE` (Linux's measured answer) instead of `ECONNREFUSED`, for `sendto`
+  and `connect` alike; an *abstract* name of another type stays `ECONNREFUSED`, because that
+  lookup is keyed by type. Item 80 takes `t-unix-dgram` from 49 to 57 claims and pins both halves.
 
 - **Netlink's and `AF_PACKET`'s receive doors look without taking, and a truncated answer
   names its own length.** **Landed 2026-10-21** (`docs/uapi/` §5.1 item 77) - item 76's named

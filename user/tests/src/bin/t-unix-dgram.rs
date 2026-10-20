@@ -33,7 +33,7 @@
 //! measured against this kernel - it ran on one machine, so "pinned, per
 //! unix(7)" was an assertion and not a measurement. Running it against a host
 //! Linux (`.workbuddy/probe_unix_dgram.c` is the raw-syscall probe that settled
-//! each one) split the claims in three:
+//! each one) split the claims in two, and recorded a third that is served now:
 //!
 //!   * **The `SEQPACKET` listen.** Linux refuses `listen` on a *unbound*
 //!     `SEQPACKET` socket with `EINVAL`, and accepts it on a bound one - which
@@ -57,10 +57,13 @@
 //!     and validates such a name exactly as an unconnected send does, so the
 //!     peer `connect` pinned only decides where a send without a name goes.
 //!
-//!   * **The errno for a datagram aimed at a stream name.** Linux answers
-//!     `EPROTOTYPE` - there is nothing of this socket's type at that name -
-//!     where this kernel answers `ECONNREFUSED`. Named in the claim and accepted
-//!     under a host run.
+//!   * **The errno for a datagram aimed at a name of another type.** Linux's
+//!     *path* lookup finds the socket by inode whatever its type and answers
+//!     `EPROTOTYPE`; an *abstract* name lives in a type-keyed table, so a
+//!     different type's name is simply absent and the answer is
+//!     `ECONNREFUSED`. This kernel answered `ECONNREFUSED` for both, and the
+//!     path half is served now (item 80). The claims below pin both halves,
+//!     so a lookup that stopped being type-keyed would be caught too.
 //!
 //! # The one claim that is this kernel's own number
 //!
@@ -84,6 +87,7 @@ static SENDER: &str = "/tmp/t-dgram-from.sock";
 static FULL: &str = "/tmp/t-dgram-full.sock";
 static STREAM: &str = "/tmp/t-dgram-stream.sock";
 static SEQPACKET: &str = "/tmp/t-dgram-seq.sock";
+static SEQPACKET_TYPE: &str = "/tmp/t-dgram-seq-type.sock";
 static QUIET: &str = "/tmp/t-dgram-quiet.sock";
 
 /// How deep this kernel's receive queue is. Not Linux's rule - see the module
@@ -225,7 +229,7 @@ fn main() {
     println!("t-unix-dgram");
     let mut r = Report::new();
 
-    for path in [RECV, SENDER, FULL, STREAM, SEQPACKET, QUIET] {
+    for path in [RECV, SENDER, FULL, STREAM, SEQPACKET, SEQPACKET_TYPE, QUIET] {
         let _ = rustix::fs::unlink(path);
     }
 
@@ -444,26 +448,74 @@ fn main() {
         Errno::NOENT,
     );
 
-    // A datagram aimed at a *stream* listener's name has no queue to land in.
-    // This kernel says the name refused it; Linux says the name holds a
-    // different type of socket (`EPROTOTYPE`) - named in the claim below.
+    // A datagram aimed at a *path* naming a live socket of another type is a
+    // type disagreement, not a dead name: Linux's path lookup finds the socket
+    // by inode whatever its type and answers `EPROTOTYPE` (measured 91 for a
+    // stream and for a sequenced-packet listener, send and connect alike).
     let sl = unix(SocketType::STREAM).expect("a stream socket");
     let staddr = addr(STREAM);
     check_ok(&mut r, "a stream socket binds a name", bind(&sl, &staddr));
     check_ok(&mut r, "and listens", listen(&sl, 4));
     let fresh = unix(SocketType::DGRAM).expect("a fresh datagram socket");
-    check_divergence(
+    check_errno(
         &mut r,
-        "a datagram to a stream name answers ECONNREFUSED (divergence: Linux says EPROTOTYPE)",
+        "a datagram sent to a stream name answers EPROTOTYPE",
         sendto(&fresh, b"nope", SendFlags::empty(), &staddr),
-        Errno::CONNREFUSED,
+        Errno::PROTOTYPE,
     );
-    check_divergence(
+    check_errno(
         &mut r,
-        "and a connect to it answers the same (divergence: Linux says EPROTOTYPE)",
+        "and a connect to it answers the same",
         connect(&fresh, &staddr),
+        Errno::PROTOTYPE,
+    );
+
+    // The other type a path may name. A sequenced-packet listener carries
+    // messages, so "no queue to land in" would be the wrong reason for a
+    // refusal - the type still disagrees, and Linux still says `EPROTOTYPE`.
+    let spl = unix(SocketType::SEQPACKET).expect("a seqpacket socket");
+    let spaddr = addr(SEQPACKET_TYPE);
+    check_ok(
+        &mut r,
+        "a seqpacket socket binds a name",
+        bind(&spl, &spaddr),
+    );
+    check_ok(&mut r, "and listens", listen(&spl, 4));
+    check_errno(
+        &mut r,
+        "a datagram sent to a seqpacket name answers EPROTOTYPE",
+        sendto(&fresh, b"nope", SendFlags::empty(), &spaddr),
+        Errno::PROTOTYPE,
+    );
+    check_errno(
+        &mut r,
+        "and a connect to it answers the same",
+        connect(&fresh, &spaddr),
+        Errno::PROTOTYPE,
+    );
+
+    // An **abstract** name is not found that way: the name table is keyed by
+    // type, so a stream listener's abstract name is simply absent for a
+    // datagram lookup and the answer is the dead-name one (`ECONNREFUSED`).
+    let al = unix(SocketType::STREAM).expect("an abstract stream socket");
+    let aaddr = SocketAddrUnix::new_abstract_name(b"t-dgram-abs-stream")
+        .expect("an abstract name fits its field");
+    check_ok(&mut r, "an abstract stream socket binds", bind(&al, &aaddr));
+    check_ok(&mut r, "and listens", listen(&al, 4));
+    check_errno(
+        &mut r,
+        "a datagram sent to an abstract stream name answers ECONNREFUSED",
+        sendto(&fresh, b"nope", SendFlags::empty(), &aaddr),
         Errno::CONNREFUSED,
     );
+    check_errno(
+        &mut r,
+        "and a connect to it answers the same",
+        connect(&fresh, &aaddr),
+        Errno::CONNREFUSED,
+    );
+    drop(al);
+    drop(spl);
     drop(sl);
     drop(fresh);
 
@@ -524,7 +576,7 @@ fn main() {
     );
 
     // Cleanup: the names go, the descriptors go.
-    for path in [RECV, SENDER, FULL, STREAM, SEQPACKET, QUIET] {
+    for path in [RECV, SENDER, FULL, STREAM, SEQPACKET, SEQPACKET_TYPE, QUIET] {
         let _ = rustix::fs::unlink(path);
     }
     drop(rs);

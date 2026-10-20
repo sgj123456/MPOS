@@ -1126,11 +1126,13 @@ fn connect_to(
     if sock.typ == SOCK_DGRAM {
         // A datagram `connect` pins a destination and nothing else: no
         // handshake, no queue entry, no listener's consent - the name just
-        // has to answer, and answering as a stream is answering with no
-        // queue to land messages in, so both are refused the way Linux
-        // refuses them.
+        // has to answer, and answering as another type is the disagreement
+        // Linux calls `EPROTOTYPE` (measured 91 for a path naming either a
+        // stream or a sequenced-packet socket; an abstract name whose type
+        // differs is not found by the type-keyed table and answers
+        // `ECONNREFUSED` before it reaches this line).
         if !listener.is_dgram() {
-            return Err(ConnectRefused::Refused);
+            return Err(ConnectRefused::WrongType);
         }
         critical_section::with(|cs| {
             let cred = listener.state.borrow(cs).borrow().owner;
@@ -1312,7 +1314,9 @@ pub(crate) enum ConnectRefused {
     Refused,
     /// EPROTOTYPE: the name's socket carries a different kind of data than
     /// the connector's (`SOCK_STREAM` dialing a `SOCK_SEQPACKET` listener,
-    /// or the reverse), which Linux says only for a path name.
+    /// the reverse, and a `SOCK_DGRAM` dialing either), which Linux says only
+    /// for a path name - the abstract table is keyed by type, so a name of
+    /// another type is not found there at all.
     WrongType,
     /// EAGAIN: backlog full and the call nonblocking.
     Again,
@@ -1840,9 +1844,9 @@ pub(crate) fn send_dgram(
         // A datagram socket honours the name it is given, connected or not:
         // Linux resolves and validates it exactly as an unconnected send does
         // (measured: naming a different live socket sends there, a dead name is
-        // `ENOENT`, a regular file and a live listener of another type are
-        // `ECONNREFUSED`). Being connected only decides where a send *without*
-        // a name goes.
+        // `ENOENT`, a regular file is `ECONNREFUSED`, and a path naming a live
+        // socket of another type is `EPROTOTYPE`). Being connected only decides
+        // where a send *without* a name goes.
         Some(addr) => {
             match addr {
                 UnixAddr::Path(path) => {
@@ -1854,10 +1858,21 @@ pub(crate) fn send_dgram(
                     if node.metadata().kind != NodeKind::Socket {
                         return err::ECONNREFUSED;
                     }
-                    match live_listener(&node) {
+                    let target = match live_listener(&node) {
                         Some(sock) => sock,
                         None => return err::ECONNREFUSED,
+                    };
+                    // The node is a live socket, but not one that carries this
+                    // sender's kind of data. Linux's path lookup finds the
+                    // socket by inode whatever its type and answers that
+                    // disagreement `EPROTOTYPE` (measured 91 for both a stream
+                    // and a sequenced-packet name). The abstract half never
+                    // reaches this check: its table key includes the type, so a
+                    // different type is simply not found (`ECONNREFUSED`).
+                    if target.typ != sock.typ {
+                        return err::EPROTOTYPE;
                     }
+                    target
                 }
                 // An abstract name has no node to resolve and no permission to
                 // check; a name nobody holds answers what a dead node answers

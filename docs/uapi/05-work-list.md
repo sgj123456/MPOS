@@ -4276,4 +4276,40 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     kernel never sent - parks there, so the arm was observed and stopped rather than counted (the
     shape item 77's peek counterfactual had). Named: the unconnected seqpacket send above, and the
     datagram-to-*stream*-listener `ECONNREFUSED` where Linux answers `EPROTOTYPE` (the existing
-    `t-unix-dgram` claim, untouched).
+    `t-unix-dgram` claim, untouched - served by item 80).
+
+## item 80 — A datagram aimed at a path naming another type is `EPROTOTYPE`; an abstract name of another type stays `ECONNREFUSED`
+
+    Item 79's named residual. A datagram `sendto` and a datagram `connect` answered
+    `ECONNREFUSED` for any live socket that carried no messages, so a path naming a
+    `SOCK_STREAM` (or `SOCK_SEQPACKET`) listener was indistinguishable from a dead
+    name. Item 79's own measurement had recorded only the abstract half, where the
+    answer *is* `ECONNREFUSED`; measuring the path half split the question.
+    **Measured whole on a current host first** (`.workbuddy/probe_unix_dgram_wrongtype.c`,
+    Linux 7.2.11):
+
+    * a **path** naming a live socket of another type is `EPROTOTYPE` (91) for a datagram
+      `sendto` and for a datagram `connect`, whether the listener is a stream or a
+      sequenced-packet socket, and whether the sender is connected or not;
+    * an **abstract** name of another type is `ECONNREFUSED` (111) in every one of
+      those shapes: the abstract table is keyed by the socket's type, so the lookup
+      misses before any type comparison happens.
+
+    Served by `send_dgram`'s path branch - the node's live socket is compared with the
+    sender's type after the liveness upgrade - and by `connect_to`'s datagram arm, which
+    answers `ConnectRefused::WrongType` instead of `Refused` when the resolved listener is
+    not a datagram socket. The abstract half needed no change and is now pinned, so a
+    lookup that stopped being type-keyed would be caught.
+
+    **Pins**: `t-unix-dgram`, 49 -> 57 claims - the two divergence claims became
+    `EPROTOTYPE`, and four new claims (plus the four setup claims that name the two
+    listeners) pin the seqpacket-listener path and the abstract-name distinction, send
+    and connect each. All 57 green on a current host first (`MPOS_ON_HOST=1`).
+
+    Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32 passed, 0
+    failed on both. Counterfactual (the old rule restored - `connect_to`'s datagram arm
+    and `send_dgram`'s path branch both answering `ECONNREFUSED`): x86_64
+    `pass=192 fail=1`, `t-unix-dgram` red on exactly the four path claims
+    (`got Connection refused (os error 111), want Protocol wrong type for socket (os
+    error 91)`), while the abstract claims stay green - the distinction the pin is for.
+    The sweep completed because both doors refuse immediately rather than parking.

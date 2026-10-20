@@ -32,7 +32,7 @@ One-glance status of the whole roadmap.
 - [x] 4.1 AF_UNIX — both socket types, with per-message credentials and fd passing; the  
   abstract namespace is served, `unshare`-free lifetime and all (`t-unix`, §4.1.1)
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
-- [ ] [~] 4.3 TCP — loopback, listener, `SO_REUSEADDR` and `SO_LINGER{on,0}`'s reset done; buffer sizes record-only (§4.3)
+- [ ] [~] 4.3 TCP — loopback, listener, `SO_REUSEADDR` and `SO_LINGER{on,0}`'s reset done; buffer sizes are Linux's numbers, with `SO_RCVBUF` not sizing the ring (§4.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
 - [x] 4.5 `AF_PACKET` — link layer as a socket, userland DHCP can ask; both types served —  
   `SOCK_DGRAM` (payload shape) and `SOCK_RAW` (whole frames in, the caller's own header out) —  
@@ -607,6 +607,22 @@ old rule restored): `t-unix-dgram`'s first named-send claim is `EISCONN` and the
 behind it parks, so that arm was stopped rather than counted. Named: an unconnected (or
 listening) seqpacket socket's named send is `ENOTCONN` on Linux; the family's message doors are
 not reached by one here, so its answer is unchanged.
+
+**A datagram aimed at a path naming another type is `EPROTOTYPE`; an abstract name of another
+type stays `ECONNREFUSED`** (`docs/uapi/` §5.1 item 80, landed 2026-10-20): item 79's named
+residual. A datagram send or connect answered `ECONNREFUSED` for any live socket without a
+message queue, so a path naming a stream or sequenced-packet listener looked like a dead name.
+Measured whole on a current host first (`.workbuddy/probe_unix_dgram_wrongtype.c`, Linux 7.2.11):
+a **path** naming a live socket of another type is `EPROTOTYPE` (91) for `sendto` and `connect`,
+stream or seqpacket listener, connected sender or not; an **abstract** name of another type is
+`ECONNREFUSED` (111) in every shape, because that table is keyed by the socket's type and the
+lookup misses before any comparison. Served by `send_dgram`'s path branch (type compared after
+the liveness upgrade) and `connect_to`'s datagram arm (`WrongType` instead of `Refused`). Pin:
+`t-unix-dgram`, 49 -> 57 claims (two divergence claims become `EPROTOTYPE`, four new path/
+abstract claims plus four setup claims), green on a host first. Gate: x86_64 `pass=193 fail=0`;
+aarch64 `pass=192 fail=0`; `mpos-kunit` 32/0 on both. Counterfactual (old rule restored): x86_64
+`pass=192 fail=1`, exactly the four path claims red with `ECONNREFUSED` (111) where the pin wants
+`EPROTOTYPE` (91), abstract half green, sweep completes.
 
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
