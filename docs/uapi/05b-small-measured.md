@@ -119,6 +119,23 @@ Section numbers are unchanged from the original `UAPI.md`.
   `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Named: the address of a
   socket handed over by `SCM_RIGHTS` was not measured here.
 
+- **A second `connect` moves a datagram's peer, and the name is resolved before it is refused.**
+  **Landed 2026-10-22** (`docs/uapi/` §5.1 item 84). `connect` answered `EISCONN` whenever the
+  socket already had a peer, whatever its type. Measured on a current host first
+  (`.workbuddy/probe_unix_reconnect{,2,3,4,5}.c`, `probe_unix_dgram_connect.c`,
+  `probe_unix_selfconnect.c`, `probe_unix_connect_order{,2}.c`, Linux 7.2.11): a **datagram**
+  socket's second connect to another live name returns 0 and `getpeername` reads the new one, with
+  a message sent afterwards reaching the new peer only; a refused reconnect (a dead name, a
+  wrong-type name, a family-only address) leaves the **previous peer in place**; a **stream** or
+  sequenced-packet socket's second connect is `EISCONN` (106) but only after the name resolves, so
+  a dead path is `ENOENT` (2); a **listening** socket's own connect is `EINVAL` (22) and a bound
+  but unlistening one's `ECONNREFUSED` (111); and a connect to a node that is not a socket is
+  `ECONNREFUSED` at mode 0666 but `EACCES` at mode 0000, because the permission is asked before
+  the kind. Served by gating `EISCONN` on "is this a stream" rather than "has this socket a peer",
+  and by resolving the name before that gate. Pin: **`t-unix-dgram`** 57 → 60 claims and
+  **`t-unix`** 90 → 91. Gate: x86_64 `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit`
+  32/0 on both. Counterfactual: `pass=192 fail=1`, the second-connect claim red with `EISCONN`.
+
 - **Real `MSG_PEEK` over TCP/UDP is served, and `MSG_TRUNC` is the message's own length.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet this replaces said the flag
   was refused `EOPNOTSUPP` because serving it needed peek-preserving delivery in the stack; the

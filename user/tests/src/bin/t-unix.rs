@@ -780,6 +780,16 @@ fn main() {
             "a connected socket cannot connect again",
             connect(client, &addr) == Err(Errno::ISCONN),
         );
+        // ... but the name is resolved first, which is the order Linux asks
+        // in: the same connected socket naming a peer that is not there hears
+        // the resolver's answer, not `EISCONN` (measured on a current host -
+        // `ENOENT` for a path nobody holds, `ECONNREFUSED` for an abstract
+        // name nobody holds).
+        let gone = SocketAddrUnix::new("/tmp/t-unix-gone.sock").unwrap();
+        r.check(
+            "a connected socket naming a dead peer hears ENOENT, not EISCONN",
+            connect(client, &gone) == Err(Errno::NOENT),
+        );
         let server = accept_with(fd2, SocketFlags::empty());
         r.check("accept hands out the queued connection", server.is_ok());
         if let Ok(server) = &server {

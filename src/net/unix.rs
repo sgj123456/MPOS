@@ -460,8 +460,10 @@ impl UnixSock {
         })
     }
 
-    /// Whether a datagram socket has a peer pinned, live or not - the
-    /// `EISCONN` a second `connect` answers by.
+    /// Whether a datagram socket has a peer pinned, live or not - what makes a
+    /// *sequenced-packet* end carry messages, and what a send with no name
+    /// aims at. It is deliberately not a `connect` gate: a datagram socket may
+    /// connect again, and each connect moves this.
     fn dgram_connected(&self) -> bool {
         critical_section::with(|cs| self.state.borrow(cs).borrow().dgram_peer.is_some())
     }
@@ -1064,12 +1066,16 @@ fn live_named(ns: Option<u64>, name: &[u8], typ: u16) -> Option<Arc<UnixSock>> {
 /// `ECONNREFUSED` (measured: both a stream and a datagram `connect` to an
 /// unbound abstract name answer 111).
 pub(crate) fn connect_named(sock: &UnixSock, name: &[u8], nonblock: bool) -> isize {
-    if sock.end_of().is_some() || sock.dgram_connected() {
-        return err::EISCONN;
-    }
+    // The name is looked up before the connection is: Linux's `unix_dgram_connect`
+    // and `unix_stream_connect` both resolve first, so a connected socket that
+    // names a dead peer answers `ECONNREFUSED` where it would answer `EISCONN`
+    // for a live one (measured on a current host, both types).
     let Some(listener) = live_named(sock.net_ns, name, sock.typ) else {
         return err::ECONNREFUSED;
     };
+    if sock.end_of().is_some() {
+        return err::EISCONN;
+    }
     let arc = sock_arc(sock);
     match connect_to(&arc, &listener, nonblock) {
         Ok(()) => 0,
@@ -1956,8 +1962,14 @@ pub(crate) fn connect_path(sock: &UnixSock, path: &str, nonblock: bool) -> isize
     if let Err(e) = crate::vfs::may_access(&node, crate::vfs::W_OK) {
         return crate::uaccess::err_of(e);
     }
-    // Already connected sockets cannot connect again.
-    if sock.end_of().is_some() || sock.dgram_connected() {
+    // A *stream* socket cannot connect twice - `EISCONN` - but that question
+    // is asked after the name is resolved, which is the order Linux asks in:
+    // a connected stream socket naming a dead peer hears `ENOENT` and one
+    // naming a live peer hears `EISCONN` (measured on a current host). A
+    // *datagram* socket may connect as often as it likes; each connect just
+    // moves its peer, and a refused one leaves the previous peer in place
+    // (also measured), so only the stream arm is gated here.
+    if sock.typ != SOCK_DGRAM && sock.end_of().is_some() {
         return err::EISCONN;
     }
     let arc = sock_arc(sock);

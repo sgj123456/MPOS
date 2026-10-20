@@ -4473,3 +4473,46 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     **What stays named**: the address of a socket that travels through
     `SCM_RIGHTS` was not measured here, so nothing is claimed about it -
     `t-unix-scm` pins the descriptor's credentials and not its name.
+
+## item 84 — A second `connect` moves a datagram's peer, and the name is resolved before it is refused
+
+    `connect` on a unix socket answered `EISCONN` whenever the socket already
+    had a peer, whatever its type. Linux decides by type, and asks the *name's*
+    question first.
+
+    **Measured whole on a current host first**
+    (`.workbuddy/probe_unix_reconnect{,2,3,4,5}.c`,
+    `probe_unix_dgram_connect.c`, `probe_unix_selfconnect.c`,
+    `probe_unix_connect_order{,2}.c`, Linux 7.2.11):
+
+    * a **datagram** socket's second connect to another live name returns 0, and
+      `getpeername` reads the new one - a message sent afterwards reaches the
+      new peer only; connecting back to the first moves it back;
+    * a refused reconnect (a dead name, a wrong-type name, a family-only
+      address) leaves the **previous peer in place**, because the name is
+      resolved before anything is pinned;
+    * a **stream** or **sequenced-packet** socket's second connect is `EISCONN`
+      (106) - but only after the name resolves, so a dead path is `ENOENT` (2)
+      and an unheld abstract name `ECONNREFUSED` (111);
+    * a **listening** socket's own connect is `EINVAL` (22), a *bound but not
+      listening* one's is `ECONNREFUSED` (111), and so is a bound datagram
+      socket's;
+    * a connect to a node that is not a socket is `ECONNREFUSED` at mode 0666
+      and `EACCES` at mode 0000 - the permission is asked before the kind.
+
+    Served by moving the `EISCONN` gate onto "is this a stream" instead of "has
+    this socket a peer", so a datagram's reconnect reaches `connect_to`'s
+    datagram arm and moves `dgram_peer` and `peer_name`; and by resolving the
+    name before the gate in both `connect_path` and `connect_named`.
+
+    **Pins**: `t-unix-dgram` 57 -> 60 claims (the second connect moving the peer,
+    `getpeername` naming the dialled socket, and a refused reconnect leaving the
+    previous peer in place), and `t-unix` 90 -> 91 (a connected stream socket
+    naming a dead path hears `ENOENT`, not `EISCONN`). Green on a current host
+    first, and `ok:` for `ok:` identical on both machines.
+
+    Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32
+    passed, 0 failed on both. Counterfactual (the old `EISCONN`-first rule for
+    both types, every pin kept): `pass=192 fail=1`, and the one red claim is
+    `a datagram socket connects a second time, and its peer moves (got Socket is
+    connected (os error 106))`.

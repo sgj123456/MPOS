@@ -45,15 +45,15 @@
 //!     boundaries (item 78), where this file once said a named one was the
 //!     byte stream.
 //!
-//!   * **Two answers this kernel gives and Linux does not**, each named in its
-//!     own claim and accepted under `MPOS_ON_HOST=1` (where the host's own
-//!     answer is printed rather than hidden): a second `connect` is `EISCONN`
-//!     here where Linux accepts a repeat connect to the same name; and an
-//!     unbound sender's name is three bytes here (the family word and the NUL
-//!     that stands for the empty path) where Linux reports no name at all.
+//!   * **Two answers this kernel used to give and Linux does not**, both served
+//!     now rather than explained away: a second `connect` on a datagram socket
+//!     was `EISCONN` where Linux moves the peer and returns 0; and an unbound
+//!     sender's name was three bytes here (the family word and the NUL that
+//!     stands for the empty path) where Linux reports `addrlen` zero and
+//!     writes nothing at all.
 //!
 //!     A third used to live here - `sendto` naming *any* destination on a
-//!     connected datagram was `EISCONN` - and it is served now: Linux resolves
+//!     connected datagram was `EISCONN` - and it is served too: Linux resolves
 //!     and validates such a name exactly as an unconnected send does, so the
 //!     peer `connect` pinned only decides where a send without a name goes.
 //!
@@ -78,8 +78,8 @@ use mpos_user_tests::Report;
 use rustix::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use rustix::io::Errno;
 use rustix::net::{
-    AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketType, bind, connect, listen,
-    recvfrom, sendto, socket,
+    AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketType, bind, connect, getpeername,
+    listen, recvfrom, sendto, socket,
 };
 
 static RECV: &str = "/tmp/t-dgram.sock";
@@ -393,11 +393,14 @@ fn main() {
         "connect pins the receiver's name",
         connect(&cs2, &raddr),
     );
-    check_divergence(
+    // A datagram socket may connect again, and each connect moves its peer -
+    // it is not the `EISCONN` a stream socket answers (measured on a current
+    // host: two connects to two live names both return 0, the peer reads back
+    // the second, and a message sent after them reaches the second peer only).
+    check_ok(
         &mut r,
-        "a second connect answers EISCONN (divergence: Linux accepts a repeat connect)",
+        "a datagram socket connects a second time, and its peer moves",
         connect(&cs2, &raddr),
-        Errno::ISCONN,
     );
     check_len(
         &mut r,
@@ -446,6 +449,36 @@ fn main() {
         "and the connected peer's queue did not",
         matches!(empty, Err(Errno::AGAIN)),
     );
+    // A refused reconnect leaves the previous peer in place: the name is
+    // resolved *before* anything is pinned (measured on a current host - a
+    // dead name answers `ENOENT` and the peer still reads back the last live
+    // one, and a stream listener's name answers `EPROTOTYPE` with the same
+    // result). Only a connect that resolves moves the peer.
+    let peer_after = |fd: &rustix::fd::OwnedFd| -> Option<String> {
+        let any = getpeername(fd).ok().flatten()?;
+        let addr = SocketAddrUnix::try_from(any).ok()?;
+        let path = addr.path()?;
+        Some(path.to_str().ok()?.to_owned())
+    };
+    let before = peer_after(&cs2);
+    let nowhere = addr("/tmp/t-dgram-nowhere.sock");
+    check_errno(
+        &mut r,
+        "a reconnect to a dead name answers ENOENT",
+        connect(&cs2, &nowhere),
+        Errno::NOENT,
+    );
+    r.check(
+        "and it left the previous peer in place",
+        before == peer_after(&cs2) && before.is_some(),
+    );
+    // The peer the connect pinned is what `getpeername` names, and it is the
+    // *listener's* bound path rather than the sender's.
+    r.check(
+        "getpeername on a connected datagram names the dialled socket",
+        peer_after(&cs2).is_some_and(|p| p == RECV),
+    );
+
     // The name is resolved, so a path nobody holds is the VFS's answer.
     let nowhere = addr("/tmp/t-dgram-nowhere.sock");
     check_errno(

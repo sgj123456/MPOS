@@ -421,6 +421,56 @@ the listener`.
 `SCM_RIGHTS` was not measured here, so nothing is claimed about it -
 `t-unix-scm` pins the descriptor's credentials and not its name.
 
+#### 4.1.7 A second `connect` moves a datagram's peer, and the name is resolved before it is refused — **SERVED** (2026-10-22)
+
+`connect` on a unix socket answered `EISCONN` whenever the socket already had a
+peer, whatever its type. Linux decides by type, and asks the *name's* question
+first: a datagram socket may connect as often as it likes and each connect moves
+its peer, while a stream socket's second connect is `EISCONN` - after the name
+has resolved.
+
+**Measured whole on a current host first**
+(`.workbuddy/probe_unix_reconnect{,2,3,4,5}.c`,
+`probe_unix_dgram_connect.c`, `probe_unix_selfconnect.c`,
+`probe_unix_connect_order{,2}.c`, Linux 7.2.11):
+
+| The connect | Linux 7.2.11 |
+|---|---|
+| a **datagram** socket's second connect, to another live name | 0, and `getpeername` reads the new one; a message sent afterwards reaches the new peer only |
+| the same, back to the first name | 0, peer moves again |
+| the same, to a dead name / a wrong-type name / a family-only address | `ENOENT` / `EPROTOTYPE` / `EINVAL` - and the **previous peer stays** |
+| a **stream** socket's second connect, to a live name | `EISCONN` (106) |
+| the same, to a dead name | `ENOENT` (2) - the name is resolved first |
+| the same, to an unheld abstract name | `ECONNREFUSED` (111) |
+| the same, to a family-only address / `addrlen` past the struct | `EINVAL` (22) |
+| a **sequenced-packet** socket's second connect | `EISCONN`, with the same name-first order |
+| a **listening** socket's own connect | `EINVAL` (22) |
+| a *bound but not listening* socket's own connect | `ECONNREFUSED` (111) |
+| a bound datagram socket's own connect | `ECONNREFUSED` (111) |
+| a socket's connect to a *regular file* (mode 0666) | `ECONNREFUSED` - the node is not a socket |
+| the same file at mode 0000 | `EACCES` - the permission is asked before the kind |
+
+**The fix is the order and one type test.** `connect_path` resolves the node and
+asks its permission before anything else (it already did), then gates `EISCONN`
+on the socket being a **stream** rather than on "has a peer", so a datagram's
+reconnect reaches `connect_to`'s datagram arm and moves `dgram_peer` and
+`peer_name`. `connect_named` looks the name up first for the same reason. A
+refused connect never reaches the arm that writes the peer, so the previous one
+survives - which is the measured shape and not an accident of ordering.
+
+**Pinned by `t-unix-dgram`** 57 → 60 claims: the second connect succeeding and
+moving the peer, `getpeername` naming the dialled socket, and a refused
+reconnect leaving the previous peer in place. `t-unix` gains the order claim on
+the stream side (90 → 91): a connected socket naming a dead path hears `ENOENT`,
+not `EISCONN`. The `t-unix-dgram` module header's divergence list loses its
+first entry, because there is no divergence left to name. All green on a
+current host first, and `ok:` for `ok:` identical on both machines.
+
+**Counterfactual** (the old `EISCONN`-first rule for both types, every pin
+kept): `pass=192 fail=1`, and the one red claim is `t-unix-dgram`'s
+`a datagram socket connects a second time, and its peer moves (got Socket is
+connected (os error 106))`.
+
 ### 4.2 ICMP Improvements — **DONE**
 
 `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` is served by a raw smoltcp socket
