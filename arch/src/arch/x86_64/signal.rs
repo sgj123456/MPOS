@@ -18,8 +18,10 @@
 //! cannot be made from here, because `arch -> sched` is the one upward edge
 //! the seam exists to keep out.
 
-use crate::arch::x86_64::context::uregs;
-use crate::hal::{Current, SignalDelivery, SignalFrame, SignalFrameEntry};
+use crate::arch::x86_64::context::{FpuState, uregs};
+use crate::hal::{
+    Current, FPU_BYTES, SignalDelivery, SignalFrame, SignalFrameEntry, SignalFrameExit,
+};
 
 /// Byte offsets of the fields of `struct sigcontext`, in the Linux x86_64 order.
 /// They are not a choice: `__restore_rt` hands the structure back to
@@ -42,6 +44,12 @@ mod sc {
     pub const RSP: usize = 120;
     pub const RIP: usize = 128;
     pub const EFLAGS: usize = 136;
+    /// The floating-point image is *not* inline in a `sigcontext`: this word is
+    /// a pointer, and this kernel points it at the image it put in the frame
+    /// (see `FPSTATE`). `offsetof(struct sigcontext, fpstate)` is 184 - the
+    /// twenty-three general registers, then the four 16-bit segment words, then
+    /// `err`/`trapno`/`oldmask`/`cr2` - measured on Linux 7.2.
+    pub const FPSTATE: usize = 184;
 }
 
 /// The bytes of `struct rt_sigframe` on x86_64, which is what the kernel
@@ -51,6 +59,7 @@ mod sc {
 ///   0  char *pretcode      the restorer - where the handler returns to
 ///   8  struct ucontext     uc_flags, uc_link, stack_t, sigcontext, sigmask
 /// 312  struct siginfo      signo, errno, code, and a lot of padding
+/// 440  struct _fpstate     the interrupted x87/SSE image, 512 bytes
 /// ```
 ///
 /// The three parts are laid out the way the Linux ABI lays them out, because
@@ -64,7 +73,17 @@ mod sc {
 /// why `SignalFrame::frame_at` exists - the *frame's* address is what the two
 /// disagree about (`sp - 8` here, `sp` there) - and why `enter` takes the
 /// restorer as an answer rather than as an offset.
-const SIGFRAME_BYTES: usize = 440;
+///
+/// The floating-point image is a fourth part here and a record *inside*
+/// `uc_mcontext` on aarch64, and that is the ABI's split rather than this
+/// kernel's: Linux's `sigcontext` carries an `fpstate` pointer, and the bytes it
+/// names are the `fxsave`/`fxrstor` block verbatim - `struct _fpstate`'s field
+/// order *is* the instruction's, measured by comparing a frame's 512 bytes with
+/// an `fxsave` taken immediately before the trapped signal: they differ in
+/// nothing but the 96 bytes of padding Linux uses for its XSAVE extension
+/// record, which this machine has no extended state for (`.workbuddy/
+/// probe_signal_fp2.c`). Those bytes stay zero here.
+const SIGFRAME_BYTES: usize = FPSTATE + FPU_BYTES;
 /// Offset of `struct ucontext` inside the frame - that is, `sizeof(char *)`.
 const UCONTEXT: usize = 8;
 /// Offset of `uc_mcontext` (a `struct sigcontext`) inside the `ucontext` - that
@@ -74,6 +93,13 @@ const UCONTEXT_MCONTEXT: usize = 40;
 const UCONTEXT_SIGMASK: usize = 296;
 /// Offset of the `struct siginfo` within the frame.
 const SIGINFO: usize = 312;
+/// Offset of the `_fpstate` within the frame: immediately after the
+/// `siginfo_t`, which is 312 + 128. The frame's own address is 8 mod 16 by
+/// construction (`enter` aligns `sp - SIGFRAME_BYTES` down and subtracts the
+/// return-address word), and 440 is 8 mod 16 too, so this offset makes the image
+/// 16-aligned - what `fxsave`/`fxrstor` require. Linux aligns it to 64 because
+/// its area is an XSAVE area; there is no XSAVE state here to align for.
+const FPSTATE: usize = 440;
 
 /// A little-endian word into the frame, at a byte offset.
 fn put(bytes: &mut [u8], at: usize, value: u64) {
@@ -112,10 +138,11 @@ impl SignalFrame for Current {
         frame: *mut (),
     ) -> Option<SignalFrameEntry> {
         // The gate frame carries nothing this layout needs: an x86_64
-        // `sigcontext` has no floating-point image in it (its `fpregs` is a
-        // pointer this kernel does not fill), so there is no second source for
-        // any saved word and nothing here reads it. aarch64's `enter` is the
-        // one that does - see `SignalFrame::enter`'s `frame` parameter.
+        // `sigcontext` names the floating-point image by pointer rather than
+        // holding it, and the registers the pointer names are in the task's
+        // record - saved there by the lazy-FPU scheme - so the image arrives in
+        // `delivery`, not here. aarch64's `enter` is the one that reads the gate
+        // frame: `SignalFrame::enter`'s `frame` parameter.
         let _ = frame;
         debug_assert_eq!(
             regs.len(),
@@ -212,6 +239,28 @@ impl SignalFrame for Current {
         // sets in through; `rt_sigreturn` converts on the way back.
         put(out, UCONTEXT + UCONTEXT_SIGMASK, delivery.blocked_wire);
 
+        // The interrupted floating-point image, and the word of `sigcontext`
+        // that names it. A handler is an asynchronous call, so the interrupted
+        // code's x87/SSE registers have to survive it: without this the handler
+        // computes in those registers and the code the signal interrupted
+        // resumes with the handler's values. The image is the machine's own
+        // `fxsave` block, byte for byte, because that is what `_fpstate` is
+        // (see `SIGFRAME_BYTES`).
+        //
+        // A caller that could not produce an image gets the architectural reset
+        // state rather than a zeroed block: `mxcsr` of zero unmasks every SSE
+        // exception, so an all-zero image is not "nothing" but a machine waiting
+        // to fault. The pointer is written either way - Linux's frames always
+        // name an image, and a handler that reads `uc_mcontext.fpstate` must not
+        // find a null one.
+        put(out, mcontext + sc::FPSTATE, (frame + FPSTATE) as u64);
+        match &delivery.fpu {
+            Some(fpu) => out[FPSTATE..FPSTATE + FPU_BYTES].copy_from_slice(fpu),
+            None => {
+                out[FPSTATE..FPSTATE + FPU_BYTES].copy_from_slice(&FpuState::reset().to_bytes())
+            }
+        }
+
         // A `siginfo_t`: signo, errno, code, and - for a signal that names a
         // sender - the pid and uid, with the union at offset 24. The offsets
         // are Linux x86_64's, so a handler written against `<signal.h>` reads
@@ -255,7 +304,7 @@ impl SignalFrame for Current {
         })
     }
 
-    unsafe fn exit(bytes: &[u8], regs: &mut [u64], frame: *mut ()) -> u64 {
+    unsafe fn exit(bytes: &[u8], regs: &mut [u64], frame: *mut ()) -> SignalFrameExit {
         // As in `enter`: nothing in this frame comes from the gate frame.
         let _ = frame;
         debug_assert_eq!(
@@ -294,6 +343,31 @@ impl SignalFrame for Current {
         regs[uregs::EFLAGS] = get(bytes, mcontext + sc::EFLAGS) | 0x200;
         regs[uregs::RAX] = get(bytes, mcontext + sc::RAX);
 
-        get(bytes, UCONTEXT + UCONTEXT_SIGMASK)
+        // The floating-point image. A frame whose pointer is zero is Linux's
+        // "reset it", not "leave the registers alone": measured, a handler that
+        // nulls `uc_mcontext.fpstate` and returns comes back with zeroed xmm
+        // registers and `mxcsr` 0x1f80, the architectural init state
+        // (`.workbuddy/probe_signal_fp2.c`'s `NO_RESTORE` run). So the answer is
+        // the reset image - the same one `Context::empty` hands a task that has
+        // never run a floating-point instruction, rather than a second
+        // definition of the same state.
+        //
+        // The bytes come from the frame's own area, which is where `enter` put
+        // them. Linux reads through the pointer, wherever it points; every
+        // kernel-built frame points at its own image, so a hand-built frame is
+        // the only one that could tell the difference (see
+        // `SignalFrameExit::fpu`).
+        let fpu = Some(if get(bytes, mcontext + sc::FPSTATE) != 0 {
+            let mut image = [0u8; FPU_BYTES];
+            image.copy_from_slice(&bytes[FPSTATE..FPSTATE + FPU_BYTES]);
+            image
+        } else {
+            FpuState::reset().to_bytes()
+        });
+
+        SignalFrameExit {
+            blocked_wire: get(bytes, UCONTEXT + UCONTEXT_SIGMASK),
+            fpu,
+        }
     }
 }

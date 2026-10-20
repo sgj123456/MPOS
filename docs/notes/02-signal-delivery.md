@@ -13,13 +13,15 @@ when the handler returns through `rt_sigreturn`.
 ### 2.1 Signal Frame Delivery — policy in `src/syscall/linux/proc.rs`, layout in `arch/<arch>/signal.rs`
 
 **Both machines' frames are the machine's since §13.2's Stages 2/3b**: x86_64's in
-`src/arch/x86_64/signal.rs` and aarch64's in `src/arch/aarch64/signal.rs`. One divergence is
-named rather than shared, and `t-signal-frame` measures it: **x86_64's frame carries no
-floating-point image** - its `uc_mcontext.fpstate` pointer is left null - so a handler that
-clobbers `xmm8..xmm15` leaves the interrupted code with them clobbered, where Linux's
-`rt_sigreturn` restores them from the `_fpstate` the frame points at. The aarch64 frame writes
-and restores its `fpsimd_context` record, and the pin's vector-register half runs there; the
-x86_64 half of that record is its own piece of work.
+`src/arch/x86_64/signal.rs` and aarch64's in `src/arch/aarch64/signal.rs`. Both now carry the
+interrupted floating-point state, and the ABI puts it in a different shape on each: aarch64
+writes an `fpsimd_context` record inside `uc_mcontext.__reserved`, while x86_64 keeps the
+`fxsave` block at the frame's end and points `sigcontext.fpstate` at it (offset 440, so a
+952-byte frame). `t-signal-frame` measures both halves, and the handler destroys every vector
+register after reading the frame so that "they came back" can only mean the frame carried them.
+A frame whose `fpstate` a handler nulls is Linux's "reset the state", measured, and comes back
+with zeroed `xmm` and `mxcsr` `0x1f80` — not with the handler's registers left live. The
+measurements and the landing are §15.91 (`docs/uapi/` §5.1 item 75).
 
 `build_frame` writes a `rt_sigframe` (restorer, `sigcontext`, `siginfo_t`,
 saved mask), points the return at the handler and its three arguments, and

@@ -500,6 +500,26 @@ x86_64 `pass=198 fail=0`, aarch64 `pass=197 fail=0`, `mpos-kunit` 32/0 on both; 
 counterfactual (the two refusals restored) is the two programs this item touched going red and
 nothing else. Named: the **vsock** branch still reads its chain's first segment only.
 
+**The x86_64 signal frame carries the interrupted floating-point image, and a frame that names
+none resets it** (`docs/uapi/` §5.1 item 75, landed 2026-10-20): the first machine's `rt_sigframe`
+was 440 bytes, `sigcontext.fpstate` was null, and `rt_sigreturn` restored only the general
+registers — so a handler that used an `xmm` register (all sixteen are caller-saved, so any
+function may) resumed the interrupted code with the handler's values, a frame that named the
+state and did not carry it. Measured whole on a current host first
+(`.workbuddy/probe_signal_fp{,2}.c`, Linux 7.2.11): the 512 bytes `fpstate` names are the
+`fxsave` block verbatim (ten bytes differ from a live `fxsave`, all at 464, the `_fpx_sw_bytes`
+XSAVE header this machine has no extended state for; clearing the whole 96-byte padding still
+restores the legacy area), and a frame whose pointer the handler nulls is accepted and
+**resets** the state — zeroed `xmm`, `mxcsr` `0x1f80` — rather than leaving the handler's
+registers live. The image now sits at frame offset 440 (`SIGFRAME_BYTES` 440 → 952, 16-aligned),
+`sigcontext.fpstate` at `mcontext + 184` points at it, `SignalDelivery` carries
+`fpu: Option<[u8; FPU_BYTES]>` from the lazy record (`sched::trace_fpu`) and `SignalFrame::exit`
+answers `SignalFrameExit`, with a null pointer given `FpuState::reset()`. Pin: `t-signal-frame`
+17 → 24 claims on x86_64, the handler now clobbering every vector register after reading the
+frame; the counterfactual (the kernel files reverted) is `pass=190 fail=1` with exactly five of
+its claims red, the alignment claim passing vacuously on the null pointer beside the non-null
+one. Gate: x86_64 `pass=191 fail=0`, aarch64 `pass=190 fail=0`, `mpos-kunit` 32/0 on both.
+
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
 record-only was wrong in both halves - the figure stored was the caller's rather than Linux's,  

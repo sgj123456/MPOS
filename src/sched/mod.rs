@@ -107,6 +107,12 @@ pub use runtime::{
 #[cfg(mpos_fpu_trap)]
 pub use runtime::device_not_available;
 
+/// The other end of the lazy FPU's signal path: putting back the image a
+/// handler's frame carried. Named only where the machine keeps that image in the
+/// task's record rather than in its trap frame.
+#[cfg(mpos_fpu_trap)]
+pub use runtime::set_signal_fpu;
+
 /// A host build has no task table and no namespaces, so every task is in the
 /// init namespace - whose numbers *are* the slots. That makes both translations
 /// the identity here, which is exactly what they are on a machine that never

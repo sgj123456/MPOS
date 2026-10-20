@@ -3923,3 +3923,72 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     touched files; clippy's warning set unchanged; the depgraph ratchet holds. The **vsock**
     branch still reads its chain's first segment only - nothing here could measure that family
     either - so it stays named in §5.2.
+
+## item 75 — the x86_64 signal frame carries the interrupted floating-point image, and a null one resets it
+
+    The first machine's half of the record the signal frame owes a handler: an x86_64
+    `rt_sigframe` was 440 bytes, its `sigcontext.fpstate` was left **null**, and `rt_sigreturn`
+    restored only the general registers — so a handler that touched an `xmm` register (which any
+    ordinary function may: all sixteen are caller-saved) returned the interrupted code with the
+    handler's values. That is not an absent feature a caller can fall back from but a frame that
+    names the interrupted state and does not carry it; the second machine has written and
+    restored its `fpsimd_context` since §13.2's Stage 3b.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_signal_fp.c`,
+    `probe_signal_fp2.c`, Linux 7.2.11): `offsetof(struct ucontext, uc_mcontext)` is 40 and
+    `uc_mcontext.fpregs` is 224 inside the `ucontext` (184 inside the `sigcontext`), so a handler
+    reads the pointer at `ucontext + 224`; on a real frame it is non-null. The 512 bytes it names
+    **are an `fxsave` image**: compared byte for byte against an `fxsave` issued immediately
+    before the trapped `tgkill`, the two differ in ten bytes, all at offset 464 —
+    `_fpx_sw_bytes`, the XSAVE extension-record header, which a full Linux fills and this machine
+    has no extended state to describe. The legacy area is read regardless: a handler that clears
+    the whole 96-byte padding region (where those ten bytes live) and returns still gets its
+    `xmm` registers back, so a kernel without XSAVE may leave the region zero. The third run
+    (`NULL_FPREGS=1` / `NO_RESTORE=1`) is the one that shapes the design: a frame whose `fpregs`
+    is null is **accepted**, and `rt_sigreturn` answers it by **resetting** the floating-point
+    state — `xmm8..xmm11` come back zero and `mxcsr` is `0x1f80`, the architectural init value —
+    rather than leaving the handler's registers live. An all-zero image is not that state,
+    because `mxcsr` zero unmasks every SSE exception.
+
+    **The landing** keeps the image as the machine's `fxsave` block: `SIGFRAME_BYTES` 440 → 952,
+    with `_fpstate` at frame offset 440 (immediately after the 128-byte `siginfo_t`) and
+    `sigcontext.fpstate` at `mcontext + 184` pointing at it. The frame's base is 8 mod 16 and
+    440 is 8 mod 16, so the image lands 16-aligned — what `fxrstor` requires (Linux aligns its
+    area to 64 because it is an XSAVE area; there is no XSAVE state here to align for).
+    `hal::SignalDelivery` grew `fpu: Option<[u8; FPU_BYTES]>` — filled under
+    `#[cfg(mpos_fpu_trap)]` from `sched::trace_fpu(current)`, the lazy scheme's "make the record
+    current" call, and `None` on the machine whose trap frame already holds the registers
+    (aarch64) — and `hal::SignalFrame::exit` now answers `SignalFrameExit { blocked_wire, fpu }`
+    instead of the mask alone. `proc.rs` hands the image back through `sched::set_signal_fpu`,
+    which reloads the live registers when `fpu_live` says they are authoritative; a frame whose
+    pointer is zero is answered with `FpuState::reset().to_bytes()` rather than with zeros, the
+    same definition `Context::empty` already gives a task that has never executed a
+    floating-point instruction.
+
+    **Pin**: `t-signal-frame`, 17 → 24 claims on x86_64 (aarch64's 21 unchanged, but its
+    "registers came back" claim is a counterfactual now too, because the handler destroys every
+    vector register after reading the frame): the handler fills all sixteen xmm registers with
+    ones after reading the frame, so they can only return if the frame carried them. The x86_64 half
+    reads `fpstate` at `uc_mcontext + 184`, checks it is non-null and 16-byte aligned, and walks
+    the sixteen `xmm_space` slots at offset 160 for the stamp; a third delivery nulls the word
+    in the handler and checks that the vectors come back **cleared** while the integer file is
+    intact. Green on a current host first (23 `ok:`; the one red is the pre-existing
+    `raise(SIGSEGV)` artifact of a Rust `std` host child, where the C probe dies of signal 11 as
+    expected).
+
+    **Counterfactual** — the six kernel files reverted to what they were, the pin kept: x86_64
+    `pass=190 fail=1 (191 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33, and the one red
+    program is `t-signal-frame` with exactly five claims red — both "stamped registers came back"
+    claims (`xmm0..xmm15` all `0xffffffffffffffff`, the clobber), "the frame names a
+    floating-point image (fpstate 0x0)", "its `xmm_space` holds the interrupted xmm registers (0
+    did)", and "the frame's missing image resets the vector registers" — while "and it is
+    16-byte aligned" passes **vacuously** on the null pointer (`0 & 15 == 0`), which is why the
+    non-null claim sits beside it.
+
+    **Gate**: x86_64 `pass=191 fail=0 (191 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33;
+    aarch64 `pass=190 fail=0` (203 built, 13 left out — the second machine's `gaps` group holds
+    the one the first machine serves), `mpos-kunit 32 passed, 0 failed`, reaching `=== END`;
+    both machines' `ok:` lines byte-identical for the claims they share. Host unit suite 582,
+    `xtask` 123; `cargo fmt --check` and clippy clean on the touched files; the depgraph ratchet
+    holds — the new call is `syscall → sched`, an edge that already exists, and no lower layer
+    reaches into `syscall`.

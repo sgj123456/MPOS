@@ -19,13 +19,11 @@
 //!   instruction after the `svc`, and on x86_64 the one after `syscall` when
 //!   nothing is being rewound;
 //! * **every register the trapped call was using comes back** - the
-//!   callee-saved integers and, on aarch64, all thirty-two vector registers.
-//!   The vector half is the counterfactual for the signal frame's
-//!   `fpsimd_context` record: the handler is free to destroy the caller-saved
-//!   ones, and only `rt_sigreturn` reading the record back into the trap frame
-//!   returns them. (x86_64's frame carries no floating-point image at all - its
-//!   `fpstate` is a pointer this kernel leaves null - so that half is checked
-//!   on the second machine only, and the gap is named in `NOTES.md`.)
+//!   callee-saved integers and, on both machines, every vector register. The
+//!   handler destroys the caller-saved vector registers as soon as it has read
+//!   the frame, so only the frame's own record of the interrupted state can
+//!   return them: aarch64's `fpsimd_context` in `uc_mcontext.__reserved`, and
+//!   x86_64's `_fpstate`, which `sigcontext.fpstate` points at.
 //! * **`SA_RESTART` really rewinds the call**: the same `read`, with a handler
 //!   installed with the flag, is interrupted and then *runs again* - the second
 //!   execution reads the bytes the sibling writes afterwards, which it can only
@@ -91,6 +89,25 @@ static SEEN_RECORD_SIZE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "aarch64")]
 static SEEN_RECORD_V8: AtomicUsize = AtomicUsize::new(0);
 
+/// What `uc_mcontext.fpregs` named, and what the `_fpstate` it pointed at held:
+/// the pointer itself, its alignment (a `fxsave`/`fxrstor` operand must be
+/// 16-byte aligned), how many of the sixteen `xmm_space` slots held the stamp,
+/// and the first slot that did not.
+#[cfg(target_arch = "x86_64")]
+static SEEN_FP_PTR: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
+static SEEN_FP_ALIGN: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
+static SEEN_FP_MATCHED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
+static SEEN_FP_FIRST: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// Set for the one delivery whose handler takes the image *away* again: the
+/// `sigcontext.fpstate` word is nulled before returning, which Linux answers by
+/// resetting the floating-point state rather than leaving the handler's
+/// registers live.
+#[cfg(target_arch = "x86_64")]
+static NULL_FPSTATE: AtomicUsize = AtomicUsize::new(0);
+
 /// The `uc_mcontext` a handler is handed, read out of `ucontext` the way the
 /// operand's libc says it is laid out.
 fn read_context(uc: *mut libc::c_void) {
@@ -145,6 +162,46 @@ fn read_context(uc: *mut libc::c_void) {
             (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as usize,
             Ordering::SeqCst,
         );
+        // `struct sigcontext.fpstate` is a *pointer* on this machine: the
+        // interrupted floating-point image is a separate area, which this kernel
+        // puts at the frame's own end and points this word at. A null word is
+        // Linux's "no image carried", so a non-null one is the first thing the
+        // frame owes a handler that reads it.
+        //
+        // The word itself is at 184: twenty-three 8-byte general registers, then
+        // the four 16-bit segment words, then
+        // `err`/`trapno`/`oldmask`/`cr2`. The crate's `mcontext_t` loses the
+        // name - its tail is a private array - so the offset is spelled here,
+        // and it is the same one `arch/src/arch/x86_64/signal.rs` writes the
+        // pointer through. Measured with `offsetof` against glibc's `<ucontext.h>`
+        // on Linux 7.2: `uc_mcontext.fpregs` is 224 bytes into the `ucontext`,
+        // and `uc_mcontext` is 40 in.
+        let mcontext = core::ptr::addr_of!((*uc).uc_mcontext) as *const u8;
+        let fp = mcontext.add(184).cast::<usize>().read() as *const u8;
+        SEEN_FP_PTR.store(fp as usize, Ordering::SeqCst);
+        SEEN_FP_ALIGN.store(fp as usize & 15, Ordering::SeqCst);
+        if !fp.is_null() {
+            // `struct _fpstate`'s field order is `fxsave`'s: `cwd`/`swd`/`twd`/
+            // `fop`, `rip`, `rdp`, `mxcsr`/`mxcr_mask`, `st_space[32]`, then
+            // `xmm_space[64]` at 160 - sixteen 16-byte slots, one per xmm
+            // register, low half first.
+            let mut matched = 0usize;
+            let mut first = usize::MAX;
+            for i in 0..16 {
+                let slot = fp.add(160 + 16 * i);
+                let mut low = [0u8; 8];
+                for (j, byte) in low.iter_mut().enumerate() {
+                    *byte = *slot.add(j);
+                }
+                if u64::from_le_bytes(low) == PATTERN {
+                    matched += 1;
+                } else if first == usize::MAX {
+                    first = i;
+                }
+            }
+            SEEN_FP_MATCHED.store(matched, Ordering::SeqCst);
+            SEEN_FP_FIRST.store(first, Ordering::SeqCst);
+        }
     }
 }
 
@@ -189,6 +246,82 @@ extern "C" fn handler(signo: libc::c_int, info: *mut libc::siginfo_t, uc: *mut l
             }
             here = record[0] as *const usize;
         }
+    }
+    // Everything the frame owed is read. One delivery deliberately gives it
+    // back: a null `sigcontext.fpstate` is a frame that names no image, and the
+    // kernel's answer on Linux is to reset the floating-point state, not to
+    // leave the handler's registers live (measured: zeroed xmm and `mxcsr`
+    // 0x1f80). Nulling the word here is what makes `rt_sigreturn` take that
+    // path, and the caller's stamps are what say whether it did.
+    #[cfg(target_arch = "x86_64")]
+    if NULL_FPSTATE.load(Ordering::SeqCst) != 0 && !uc.is_null() {
+        // SAFETY: `uc` is the frame's `ucontext`, which lives above the
+        // handler's own stack and is the caller's to scribble on; `fpstate` is
+        // its word at 224 (see `read_context`).
+        unsafe { (uc as *mut u8).add(224).cast::<usize>().write(0) };
+    }
+    // Now destroy the vector registers, the way any ordinary function may: every
+    // one of them is caller-saved here, so the interrupted code is only entitled
+    // to them back if the frame kept a copy.
+    clobber_vector_registers();
+}
+
+/// Wipe every vector register the interrupted code could have been holding.
+///
+/// A handler is an asynchronous call, and the machine's vector registers are all
+/// caller-saved: nothing in the ABI stops a handler - or a library it calls -
+/// from using them. So the only way an interrupted loop keeps its accumulators
+/// across a signal is the kernel having saved them in the frame. Writing a value
+/// that is *not* the stamp is what makes that observable after `rt_sigreturn`.
+///
+/// The callee-saved half (`v8..v15`) may be put back by the compiler on the way
+/// out of this function, and that is fine: the caller-saved half is dead by
+/// definition and nothing will restore it, so a frame that carried no image is
+/// caught either way.
+#[cfg(target_arch = "aarch64")]
+fn clobber_vector_registers() {
+    // SAFETY: the block only writes registers it declares, none of which is an
+    // operand of anything live across it.
+    unsafe {
+        asm!(
+            "movi v0.16b, #0", "movi v1.16b, #0", "movi v2.16b, #0", "movi v3.16b, #0",
+            "movi v4.16b, #0", "movi v5.16b, #0", "movi v6.16b, #0", "movi v7.16b, #0",
+            "movi v8.16b, #0", "movi v9.16b, #0", "movi v10.16b, #0", "movi v11.16b, #0",
+            "movi v12.16b, #0", "movi v13.16b, #0", "movi v14.16b, #0", "movi v15.16b, #0",
+            "movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0",
+            "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0",
+            "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0",
+            "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0",
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+        );
+    }
+}
+
+/// The same, on the first machine: `pcmpeqd xmmN, xmmN` fills each register with
+/// ones, a value the stamp is not.
+#[cfg(target_arch = "x86_64")]
+fn clobber_vector_registers() {
+    // SAFETY: as the aarch64 block.
+    unsafe {
+        asm!(
+            "pcmpeqd xmm0, xmm0", "pcmpeqd xmm1, xmm1", "pcmpeqd xmm2, xmm2",
+            "pcmpeqd xmm3, xmm3", "pcmpeqd xmm4, xmm4", "pcmpeqd xmm5, xmm5",
+            "pcmpeqd xmm6, xmm6", "pcmpeqd xmm7, xmm7", "pcmpeqd xmm8, xmm8",
+            "pcmpeqd xmm9, xmm9", "pcmpeqd xmm10, xmm10", "pcmpeqd xmm11, xmm11",
+            "pcmpeqd xmm12, xmm12", "pcmpeqd xmm13, xmm13", "pcmpeqd xmm14, xmm14",
+            "pcmpeqd xmm15, xmm15",
+            out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
+            out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
+            out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
+            out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+        );
     }
 }
 
@@ -612,9 +745,10 @@ fn main() {
         broken.is_empty(),
     );
 
-    // The aarch64-only half: the unwind record and the floating-point record
-    // the frame carries. x86_64's `uc_mcontext` has a null `fpstate` pointer
-    // and no record chain, so neither exists to check there - a named gap.
+    // The machine-specific half: where the frame keeps the interrupted
+    // floating-point state, and what it holds. Both machines carry it; the ABI
+    // puts it in a different shape, and each shape is read where its own libc
+    // says it is.
     #[cfg(target_arch = "aarch64")]
     {
         r.check(
@@ -641,6 +775,43 @@ fn main() {
             "and it holds the interrupted v8",
             SEEN_RECORD_V8.load(Ordering::SeqCst) as u64,
             PATTERN,
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // `sigcontext.fpstate` names the image rather than holding it, so the
+        // first question is whether there is one at all - a handler that reads
+        // `uc_mcontext.fpregs` must not be handed a null.
+        r.check(
+            &format!(
+                "the frame names a floating-point image (fpstate {:#x})",
+                SEEN_FP_PTR.load(Ordering::SeqCst)
+            ),
+            SEEN_FP_PTR.load(Ordering::SeqCst) != 0,
+        );
+        // `fxrstor` takes a 16-byte-aligned operand, and a libc that keeps a
+        // ucontext and later loads it back with `setcontext` is entitled to use
+        // the pointer this way.
+        r.check_eq(
+            "and it is 16-byte aligned",
+            SEEN_FP_ALIGN.load(Ordering::SeqCst) as u64,
+            0,
+        );
+        // `struct _fpstate` is the `fxsave` block, so its `xmm_space` at 160 is
+        // where the interrupted xmm registers are; the handler read them before
+        // destroying the live ones.
+        let matched = SEEN_FP_MATCHED.load(Ordering::SeqCst);
+        let how = if matched == 16 {
+            "all sixteen held the stamp".to_string()
+        } else {
+            format!(
+                "{matched} did, first missing #{}",
+                SEEN_FP_FIRST.load(Ordering::SeqCst)
+            )
+        };
+        r.check(
+            &format!("and its xmm_space holds the interrupted xmm registers ({how})"),
+            matched == 16,
         );
     }
 
@@ -706,6 +877,68 @@ fn main() {
     // SAFETY: a child this process forked, and a status word it owns.
     let reaped = unsafe { libc::waitpid(sibling.pid, &mut status, 0) };
     r.check("and the second sibling is reaped", reaped == sibling.pid);
+
+    // --- a frame that names no floating-point image (x86_64) ---------------
+    //
+    // `sigcontext.fpstate` is a pointer, and a null one is a frame that carries
+    // no image. Linux's `rt_sigreturn` answers that by resetting the
+    // floating-point state rather than leaving the handler's registers live: the
+    // probe run behind this test's `NO_RESTORE` measurement came back with
+    // zeroed xmm registers and `mxcsr` 0x1f80, the architectural init state.
+    // Leaving the handler's values in place instead would corrupt the interrupted
+    // code silently, which is the failure this whole frame exists to prevent.
+    #[cfg(target_arch = "x86_64")]
+    {
+        NULL_FPSTATE.store(1, Ordering::SeqCst);
+        install(false);
+        RUNS.store(0, Ordering::SeqCst);
+        let sibling = spawn_sibling();
+        let mut buf = [0u8; 8];
+        let trapped = stamped_blocking_read(sibling.read_fd, buf.as_mut_ptr(), buf.len());
+        r.check(
+            "a signal still ends the read when its handler strips the image",
+            trapped.ret == -(libc::EINTR as i64),
+        );
+        let mut vectors_live = Vec::new();
+        let mut integers_lost = Vec::new();
+        for (name, got) in &trapped.stamp {
+            if name.starts_with("xmm") {
+                if *got != 0 {
+                    vectors_live.push(format!("{name} = {got:#x}"));
+                }
+            } else if *got != PATTERN {
+                integers_lost.push(format!("{name} = {got:#x}"));
+            }
+        }
+        r.check(
+            &format!(
+                "and the frame's missing image resets the vector registers ({})",
+                if vectors_live.is_empty() {
+                    "all cleared".to_string()
+                } else {
+                    vectors_live.join(", ")
+                }
+            ),
+            vectors_live.is_empty(),
+        );
+        r.check(
+            &format!(
+                "while the integer file came back all the same ({})",
+                if integers_lost.is_empty() {
+                    "none lost".to_string()
+                } else {
+                    integers_lost.join(", ")
+                }
+            ),
+            integers_lost.is_empty(),
+        );
+        NULL_FPSTATE.store(0, Ordering::SeqCst);
+        // SAFETY: the read end this process owns.
+        unsafe { libc::close(sibling.read_fd) };
+        // SAFETY: a child this process forked, and a status word it owns.
+        let reaped = unsafe { libc::waitpid(sibling.pid, &mut status, 0) };
+        r.check("and the third sibling is reaped", reaped == sibling.pid);
+    }
 
     // --- a fatal signal is a wait status ----------------------------------
     for (name, signal) in [("SIGABRT", libc::SIGABRT), ("SIGSEGV", libc::SIGSEGV)] {

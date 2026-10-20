@@ -84,6 +84,7 @@ fn build_frame(
         },
         alt: alt.map(|stack| (stack.sp, stack.size)),
         on_alt: action.flags & crate::sched::signal::SA_ONSTACK != 0,
+        fpu: interrupted_fpu(),
     };
     // The interrupted call's register file, with `ret` - its own answer - in the
     // result slot. That is what the frame saves, or what the restart number
@@ -112,6 +113,30 @@ fn build_frame(
         crate::sched::reset_disposition(sig);
     }
     true
+}
+
+/// The interrupted floating-point image a frame has to carry, on a machine whose
+/// trap frame does not hold one.
+///
+/// `sched::trace_fpu` is the authoritative read: it makes a running task's
+/// *live* registers current first (the lazy scheme's saved block is stale while
+/// the task owns them), and then hands back the block. It is the same call
+/// `PTRACE_GETFPREGS` makes, for the same reason.
+///
+/// A machine whose trap frame carries the interrupted registers - aarch64 -
+/// answers `None`: its `SignalFrame::enter` reads them from the frame it is
+/// given, and asking the record for a second, staler copy would be a lie the
+/// frame could then carry.
+#[cfg(mpos_signal_frame)]
+fn interrupted_fpu() -> Option<[u8; crate::hal::FPU_BYTES]> {
+    #[cfg(mpos_fpu_trap)]
+    {
+        crate::sched::trace_fpu(crate::sched::current())
+    }
+    #[cfg(not(mpos_fpu_trap))]
+    {
+        None
+    }
 }
 
 /// Whether a signal about to be delivered should run the interrupted call
@@ -263,11 +288,26 @@ pub(super) fn handle_rt_sigreturn(regs_ptr: *mut ()) -> isize {
     // does not carry - the thread pointer above all - come back unchanged.
     let mut regs = capture_frame(regs_ptr, 0);
     // SAFETY: as `build_frame`'s, for the `rt_sigreturn` trap's own frame.
-    let mask = unsafe { crate::hal::exit_signal_frame(&bytes, &mut regs, regs_ptr) };
+    let out = unsafe { crate::hal::exit_signal_frame(&bytes, &mut regs, regs_ptr) };
+    // The floating-point image, on the machine that keeps it in the task's
+    // record instead of the trap frame. It has to be applied here rather than by
+    // the machine, because only the scheduler may write that record.
+    #[cfg(mpos_fpu_trap)]
+    if let Some(fpu) = out.fpu {
+        crate::sched::set_signal_fpu(&fpu);
+    }
+    // The other machine has already put it where its trap's own exit will load
+    // it, and answers nothing to apply: a `Some` here would be a frame this
+    // layer was told to restore and did not.
+    #[cfg(not(mpos_fpu_trap))]
+    debug_assert!(
+        out.fpu.is_none(),
+        "a machine that writes its trap frame has no image to hand back"
+    );
     // The frame's saved mask is the wire's `sigset_t` - a libc reads it as one -
     // so it comes back through the same conversion the install went out
     // through.
-    crate::sched::set_current_blocked(crate::sched::signal::from_wire(mask));
+    crate::sched::set_current_blocked(crate::sched::signal::from_wire(out.blocked_wire));
     // The answer is the interrupted call's own value, which the restored file
     // carries in `rax`: the gate writes it into the result slot and `sysretq`
     // resumes the interrupted instruction with it.

@@ -1315,6 +1315,37 @@ impl Table {
         }
     }
 
+    /// Give the running task a floating-point image a signal frame carried.
+    ///
+    /// The mirror of [`reclaim_fpu`](Self::reclaim_fpu), and it runs inside
+    /// `rt_sigreturn`: the handler has returned, and what the interrupted code
+    /// must resume with is the image the frame kept from before the handler ran.
+    ///
+    /// Which copy is authoritative depends on the same `fpu_live` bit the rest of
+    /// the scheme turns on. If the handler used a floating-point instruction the
+    /// registers are the handler's own leftovers, so they have to be replaced
+    /// now - writing only the record would leave those leftovers live and the
+    /// interrupted code would resume with them, which is the very bug the frame
+    /// exists to prevent. If it did not, the registers belong to no task and the
+    /// record is what the next `#NM` loads, so writing it is enough.
+    ///
+    /// x86_64's lazy scheme only: aarch64's `SignalFrame::exit` writes the
+    /// image into the trap frame, whose own exit loads it, and this function
+    /// does not exist there.
+    #[cfg(mpos_fpu_trap)]
+    pub(crate) fn set_signal_fpu(&mut self, bytes: &[u8; hal::FPU_BYTES]) {
+        let id = self.current;
+        let task = self.task_mut(id);
+        *task.context.fpu_mut() = hal::Fpu::from_bytes(bytes);
+        if task.fpu_live {
+            // Safe: `fpu_live` implies `CR0.TS` is clear - the only two things
+            // that set the bit are `hand_over_fpu` and the switch it feeds, and
+            // both clear the flag of every task they aim the bit at.
+            debug_assert!(!hal::fpu_trapped());
+            unsafe { hal::restore_fpu(task.context.fpu()) };
+        }
+    }
+
     /// Aim the CPU at the task that is about to run: its address space under
     /// CR3, its kernel stack under `RSP0` for traps from ring 3, and its TLS
     /// base under FS.
@@ -2669,6 +2700,19 @@ pub fn wait_for_interrupt() {
 #[cfg(mpos_fpu_trap)]
 pub fn device_not_available() {
     with_table(|t| t.reclaim_fpu());
+}
+
+/// Put a signal frame's floating-point image back on the running task.
+///
+/// The free-function door to [`Table::set_signal_fpu`], because `rt_sigreturn`
+/// is the caller and it lives above the table: the frame's machine half hands the
+/// image back (`hal::SignalFrameExit::fpu`) and this is what makes it the task's
+/// again.
+///
+/// x86_64's lazy scheme only - see the method.
+#[cfg(mpos_fpu_trap)]
+pub fn set_signal_fpu(bytes: &[u8; hal::FPU_BYTES]) {
+    with_table(|t| t.set_signal_fpu(bytes));
 }
 
 /// The one path off a task's stack.

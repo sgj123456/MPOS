@@ -519,6 +519,53 @@ pub struct SignalDelivery {
     /// Whether the handler runs *on* that stack - the disposition's
     /// `SA_ONSTACK`.
     pub on_alt: bool,
+    /// The interrupted floating-point image, for a machine whose frame carries
+    /// one but whose trap frame does not hold it.
+    ///
+    /// x86_64 is that machine: its `sigcontext` names the image by pointer, and
+    /// the registers themselves live in the task's record (the lazy-FPU scheme
+    /// saves them there and nowhere else), which the machine may not read -
+    /// `arch -> sched` is the one upward edge the seam exists to keep out. So
+    /// the caller, which *can* ask the scheduler, hands the image over here and
+    /// [`SignalFrame::enter`] writes it into the frame.
+    ///
+    /// aarch64 is the other shape: its trap frame carries the interrupted
+    /// registers and `enter` copies them out of that, so this is `None` there
+    /// and unread. `None` on x86_64 is "this caller could not produce one", which
+    /// the frame answers with the architectural reset state - not with an all-zero
+    /// block, whose `mxcsr` of zero would unmask every SSE exception, and not with
+    /// a null `sigcontext.fpstate`, which Linux's `rt_sigreturn` reads as "reset
+    /// the registers" (measured, `.workbuddy/probe_signal_fp2.c`'s
+    /// `NO_RESTORE` run).
+    pub fpu: Option<[u8; FPU_BYTES]>,
+}
+
+/// What a handler's frame restores beyond the register file.
+///
+/// The second half of [`SignalFrame::exit`]'s answer, and the counterpart of
+/// [`SignalDelivery`]'s `fpu` field: the mask is policy and the image is the
+/// machine's, but both come out of the same bytes and the caller applies both.
+#[derive(Clone, Copy, Debug)]
+pub struct SignalFrameExit {
+    /// The mask the interrupted code had blocked, as the wire's `sigset_t`.
+    pub blocked_wire: u64,
+    /// The floating-point image the frame carried, when the machine keeps it in
+    /// the frame the caller already read back.
+    ///
+    /// x86_64's `_fpstate` is inside the frame block ([`SignalFrame::enter`] put
+    /// it there), so reading it needs no second trip into user memory, and the
+    /// answer is always `Some`: the image itself, or the architectural reset
+    /// state when the frame's `fpstate` pointer is zero (which is what Linux's
+    /// `rt_sigreturn` makes of that frame - measured). aarch64 answers `None`:
+    /// its `fpsimd_context` record is inside the frame too, but it belongs in the
+    /// trap frame, which `exit` writes directly.
+    ///
+    /// A frame that names an image *outside* itself is not followed. Linux reads
+    /// through `sigcontext.fpstate` wherever it points; every kernel-built frame
+    /// points at its own, so the difference is visible only to a caller
+    /// hand-building a frame - and `rt_sigreturn` only ever unwraps one this
+    /// kernel laid out.
+    pub fpu: Option<[u8; FPU_BYTES]>,
 }
 
 /// Where a machine put a handler's frame.
@@ -580,8 +627,11 @@ pub trait SignalFrame {
     /// interrupted state it keeps there rather than in the task's record.
     /// aarch64's trap frame carries the interrupted floating-point/SIMD
     /// registers, which is the only place they exist (the record belongs to the
-    /// context switch, which writes the kernel's scratch into it); x86_64's
-    /// frame carries no floating-point image at all and ignores this.
+    /// context switch, which writes the kernel's scratch into it), and `enter`
+    /// copies them into the frame's `fpsimd_context`. x86_64's trap frame
+    /// carries no floating-point image - the lazy-FPU scheme leaves the
+    /// registers live and saves them into the task's record - so the image
+    /// arrives in [`SignalDelivery::fpu`] instead.
     ///
     /// `None` when there is no frame to write at all - the disposition has no
     /// restorer and this machine's ABI requires one.
@@ -598,7 +648,8 @@ pub trait SignalFrame {
 
     /// The inverse: read a handler's frame back into the ABI register file, and
     /// answer the mask the interrupted code had blocked, as the wire's
-    /// `sigset_t`.
+    /// `sigset_t` - and the floating-point image, when the machine keeps it in
+    /// the frame.
     ///
     /// `bytes` is the frame the caller read back from user memory, whole. The
     /// slots the frame does not carry are left as they are, so `regs` is seeded
@@ -612,7 +663,7 @@ pub trait SignalFrame {
     ///
     /// # Safety
     /// As [`SignalFrame::enter`].
-    unsafe fn exit(bytes: &[u8], regs: &mut [u64], frame: *mut ()) -> u64;
+    unsafe fn exit(bytes: &[u8], regs: &mut [u64], frame: *mut ()) -> SignalFrameExit;
 }
 
 /// An interrupt-driven transmit ring behind the [`Console`] sink: queue bytes,
@@ -1601,7 +1652,7 @@ pub unsafe fn enter_signal_frame(
 /// As [`SignalFrame::exit`].
 #[cfg(mpos_signal_frame)]
 #[inline]
-pub unsafe fn exit_signal_frame(bytes: &[u8], regs: &mut [u64], frame: *mut ()) -> u64 {
+pub unsafe fn exit_signal_frame(bytes: &[u8], regs: &mut [u64], frame: *mut ()) -> SignalFrameExit {
     // SAFETY: the caller's contract, passed through unchanged.
     unsafe { <Current as SignalFrame>::exit(bytes, regs, frame) }
 }

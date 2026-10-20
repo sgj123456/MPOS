@@ -45,8 +45,9 @@ Here that is, concretely:
   x86_64 only, that suite having no aarch64 port yet. `rt_sigframe`/`sigcontext` is per-ABI as
   well and lives with its machine since §13.2's Stage 2 — `arch/src/arch/x86_64/signal.rs` and,
   since Stage 3b, `arch/src/arch/aarch64/signal.rs`, both behind `hal::SignalFrame` — because
-  `__restore_rt` reads the saved registers back at fixed offsets (and on aarch64 the frame's
-  `fpsimd_context` record is where a handler's floating-point image comes from).
+  `__restore_rt` reads the saved registers back at fixed offsets (and the floating-point image
+  is the frame's too: aarch64's `fpsimd_context` record inside `uc_mcontext.__reserved`, x86_64's
+  `_fpstate` that `sigcontext.fpstate` points at, §15.91).
 - **Flag words and closed vocabularies** — `mmap`'s `MAP_*`, `madvise`'s advices,
   `clock_gettime`'s ids, `memfd_create`'s flags, `statx`'s flags, `prctl`'s options.
 - **Wire and protocol encodings userland parses** — netlink attributes, `sockaddr_ll`,

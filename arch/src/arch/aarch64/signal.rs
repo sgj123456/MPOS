@@ -38,7 +38,7 @@
 //! be made from here, because `arch -> sched` is the one upward edge the seam
 //! exists to keep out.
 
-use crate::hal::{Current, SignalDelivery, SignalFrame, SignalFrameEntry};
+use crate::hal::{Current, SignalDelivery, SignalFrame, SignalFrameEntry, SignalFrameExit};
 
 use super::context::{FPCR_OFFSET, FPSR_OFFSET};
 use super::vectors::{TRAP_FPU_BYTES, TRAP_FPU_OFFSET, TRAP_ORIG_X0_OFFSET};
@@ -386,7 +386,7 @@ impl SignalFrame for Current {
         })
     }
 
-    unsafe fn exit(bytes: &[u8], regs: &mut [u64], frame: *mut ()) -> u64 {
+    unsafe fn exit(bytes: &[u8], regs: &mut [u64], frame: *mut ()) -> SignalFrameExit {
         const ABI_WORDS: usize = 34;
         debug_assert_eq!(regs.len(), ABI_WORDS, "the ABI's register file is 34 words");
         debug_assert!(
@@ -424,6 +424,13 @@ impl SignalFrame for Current {
             restore_fpsimd(state, &bytes[reserved..]);
         }
 
-        get(bytes, UCONTEXT + uc::SIGMASK)
+        // The image went into the trap frame, not into the register file, so
+        // there is nothing for the caller to apply: `SignalFrameExit::fpu` is
+        // x86_64's hand-back, where the image's only other home is the task's
+        // record.
+        SignalFrameExit {
+            blocked_wire: get(bytes, UCONTEXT + uc::SIGMASK),
+            fpu: None,
+        }
     }
 }
