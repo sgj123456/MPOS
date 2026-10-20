@@ -45,14 +45,17 @@
 //!     boundaries (item 78), where this file once said a named one was the
 //!     byte stream.
 //!
-//!   * **Three answers this kernel gives and Linux does not**, each named in its
+//!   * **Two answers this kernel gives and Linux does not**, each named in its
 //!     own claim and accepted under `MPOS_ON_HOST=1` (where the host's own
 //!     answer is printed rather than hidden): a second `connect` is `EISCONN`
-//!     here where Linux accepts a repeat connect to the same name; a `sendto`
-//!     that names *any* destination on a connected datagram is `EISCONN` here
-//!     where Linux takes the address; and an unbound sender's name is three
-//!     bytes here (the family word and the NUL that stands for the empty path)
-//!     where Linux reports no name at all.
+//!     here where Linux accepts a repeat connect to the same name; and an
+//!     unbound sender's name is three bytes here (the family word and the NUL
+//!     that stands for the empty path) where Linux reports no name at all.
+//!
+//!     A third used to live here - `sendto` naming *any* destination on a
+//!     connected datagram was `EISCONN` - and it is served now: Linux resolves
+//!     and validates such a name exactly as an unconnected send does, so the
+//!     peer `connect` pinned only decides where a send without a name goes.
 //!
 //!   * **The errno for a datagram aimed at a stream name.** Linux answers
 //!     `EPROTOTYPE` - there is nothing of this socket's type at that name -
@@ -391,11 +394,14 @@ fn main() {
         rustix::io::write(&cs2, b"via-peer"),
         8,
     );
-    check_divergence(
+    // A name given to a send on a connected datagram is honoured, not refused:
+    // Linux resolves and validates it exactly as an unconnected send would, so
+    // the peer `connect` pinned only decides where a send *without* a name goes.
+    check_len(
         &mut r,
-        "a named sendto on a connected sender answers EISCONN (divergence: Linux takes the address)",
+        "a named sendto on a connected sender lands",
         sendto(&cs2, b"named", SendFlags::empty(), &raddr),
-        Errno::ISCONN,
+        5,
     );
     let (n, from) =
         recv_from(rs.as_fd(), &mut buf, RecvFlags::empty()).unwrap_or_else(|e| panic!("{e}"));
@@ -403,6 +409,39 @@ fn main() {
     r.check(
         "with the connected sender's empty name",
         &buf[..8] == b"via-peer" && is_empty_name(from.as_ref()),
+    );
+    let (n, _) =
+        recv_from(rs.as_fd(), &mut buf, RecvFlags::empty()).unwrap_or_else(|e| panic!("{e}"));
+    r.check(
+        "and the named send arrives at that name",
+        n == 5 && &buf[..5] == b"named",
+    );
+    // The name wins over the connected peer: this sender is bound at SENDER,
+    // and a send naming that address lands in *its* queue, not the peer's.
+    check_len(
+        &mut r,
+        "a named sendto on a connected sender reaches another socket",
+        sendto(&cs2, b"elsewhere", SendFlags::empty(), &saddr),
+        9,
+    );
+    let (n, _) =
+        recv_from(cs.as_fd(), &mut buf, RecvFlags::empty()).unwrap_or_else(|e| panic!("{e}"));
+    r.check(
+        "the other socket holds the message",
+        n == 9 && &buf[..9] == b"elsewhere",
+    );
+    let empty = recv_from(rs.as_fd(), &mut buf, RecvFlags::DONTWAIT);
+    r.check(
+        "and the connected peer's queue did not",
+        matches!(empty, Err(Errno::AGAIN)),
+    );
+    // The name is resolved, so a path nobody holds is the VFS's answer.
+    let nowhere = addr("/tmp/t-dgram-nowhere.sock");
+    check_errno(
+        &mut r,
+        "a named sendto on a connected sender to a dead name answers ENOENT",
+        sendto(&cs2, b"x", SendFlags::empty(), &nowhere),
+        Errno::NOENT,
     );
 
     // A datagram aimed at a *stream* listener's name has no queue to land in.

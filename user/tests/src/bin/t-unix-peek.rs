@@ -58,12 +58,10 @@ fn pair(r: &mut Report, typ: SocketType, what: &str) -> (OwnedFd, OwnedFd) {
     }
 }
 
-/// One unconnected socket of the type under test. The sender-name section
-/// needs this rather than [`pair`]: a `socketpair` end is connected, and this
-/// kernel honestly refuses `sendto` with a destination on a connected
-/// datagram (`EISCONN`, a divergence `t-unix-dgram` already pins) where Linux
-/// takes the address. A connected pair would test that refusal instead of the
-/// name a peek reports.
+/// One unconnected socket of the type under test, for the sender-name section.
+/// That section binds both ends itself, so the message's `from` is the sender's
+/// bound name; a [`pair`]'s end is unnamed (this kernel's `connect` does not
+/// autobind a datagram), and a message it sent would carry no name to check.
 fn unconnected(r: &mut Report, typ: SocketType, what: &str) -> OwnedFd {
     match socket(AddressFamily::UNIX, typ, None) {
         Ok(fd) => {

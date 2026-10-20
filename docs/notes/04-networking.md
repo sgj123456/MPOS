@@ -263,8 +263,43 @@ no control buffer to install them into.
 **Pin**: `t-unix-seqpacket`, 58 claims, green on a current host first. `t-unix-dgram`'s
 "a named SOCK_SEQPACKET socket is served as a stream" claim became "…listens", which is what it
 was ever measuring. Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32/0
-on both. Named rather than served: `sendto` with a destination on an already-connected seqpacket
-socket answers `EISCONN` here where Linux sends (the same divergence `t-unix-dgram` pins).
+on both. Named at landing and served by item 79: `sendto` with a destination on an
+already-connected seqpacket socket answered `EISCONN` where Linux sends it to the peer.
+
+#### 4.1.4 A send's destination is the socket type's rule — **SERVED** (2026-10-21)
+
+Item 78's named residual was two rules wearing one sentence. Both message families answered
+`EISCONN` when a connected socket's send named a destination; Linux decides by the type, and a
+connected *datagram* socket does the opposite of a connected seqpacket one. Measured on a
+current host first (`.workbuddy/probe_unix_sendto_connected{,2}.c`,
+`probe_unix_sendto_family_only.c`, `probe_unix_sendto_long_name.c`,
+`probe_unix_sendto_wrongtype.c`, `probe_unix_sendto_huge_name.c`, Linux 7.2.11):
+
+| The send | Linux 7.2.11 |
+|---|---|
+| seqpacket, connected, the listener's own name | sent to the peer, boundary kept |
+| seqpacket, connected, a different live socket's name | sent to the peer; that socket gets nothing |
+| seqpacket, connected, a dead path / dead abstract name | sent to the peer - the name is not resolved |
+| seqpacket, connected, a stream listener's name | sent to the peer - the name is not validated |
+| seqpacket, connected, a family-only `sockaddr_un` | sent to the peer (`EINVAL` for a datagram sender) |
+| seqpacket, connected, `addrlen` 110 or 128 | sent to the peer; > 128 is `EINVAL`, a bad pointer `EFAULT` |
+| seqpacket, unconnected or listening, any name | `ENOTCONN` (107) - named, not served here |
+| dgram, connected, a different live socket's name | that socket receives; the pinned peer does not |
+| dgram, connected, a dead path | `ENOENT` (2) |
+| dgram, connected, a dead abstract name / a regular file | `ECONNREFUSED` (111) |
+| dgram, connected, a live stream listener's name | `EPROTOTYPE` (91) - still this kernel's named divergence |
+| dgram, connected, a family-only `sockaddr_un` | `EINVAL` (22) |
+| stream pair, any name | `EISCONN` (106), unchanged |
+
+Served by `UnixSock::ignores_send_address` (connected sequenced-packet only), a
+`copy_send_address` that performs the syscall layer's bounds and readability check without
+interpreting the bytes, and `send_dgram` resolving a datagram's name whether or not it is
+connected. **Pins**: `t-unix-seqpacket` 58 -> 66 claims (the three ignored destinations, each
+read back whole, the `EINVAL` a 129-byte address still earns, plus the empty queue);
+`t-unix-dgram` gains six and loses its `EISCONN` divergence claim. Gate: x86_64 `pass=193
+fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32/0 on both. Counterfactual (the old rule
+restored): `t-unix-dgram`'s first named-send claim is red with `EISCONN` (106), and the following
+blocking read parks for a message that was never sent, so the arm was stopped rather than counted.
 
 ### 4.2 ICMP Improvements — **DONE**
 

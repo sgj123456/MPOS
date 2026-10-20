@@ -29,23 +29,24 @@
 //! * **`SCM_RIGHTS` rides the message.** A take installs the record's
 //!   descriptors, a peek installs its own set and leaves the record, and a
 //!   zero-length data room still receives the control chain.
-//!
-//! One thing Linux answers is named rather than claimed: a destination given
-//! to `sendto` on an already-connected seqpacket socket. This family's message
-//! send answers `EISCONN` where Linux sends (the same divergence
-//! `t-unix-dgram` pins).
+//! * **A destination given to `sendto` is dropped.** Linux clears `msg_name`
+//!   before the shared datagram send looks at it, so on a connected seqpacket
+//!   socket the peer is the whole answer: a live name, a dead name and an
+//!   address that is only the family word all send to the peer (measured on
+//!   Linux 7.2.11). A connected *datagram* socket, by contrast, honours the
+//!   name - that half is `t-unix-dgram`'s claim.
 
 use std::io::IoSlice;
 use std::mem::MaybeUninit;
 
 use mpos_user_tests::Report;
-use rustix::fd::{AsFd, OwnedFd};
+use rustix::fd::{AsFd, AsRawFd, OwnedFd};
 use rustix::io::{Errno, IoSliceMut};
 use rustix::io::{read, write};
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
     SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketType, accept, bind, connect, listen,
-    recv, recvfrom, recvmsg, sendmsg, socket,
+    recv, recvfrom, recvmsg, sendmsg, sendto, socket,
 };
 use rustix::pipe::pipe;
 
@@ -134,6 +135,44 @@ fn rcv(fd: &OwnedFd, buf: &mut [u8], flags: RecvFlags) -> Result<usize, Errno> {
     recv(fd, buf, flags).map(|(_, full)| full)
 }
 
+/// `sendto` with an address the safe wrapper cannot spell, for the two lengths
+/// the connected send never interprets but the syscall layer still checks: a
+/// `sockaddr_un` that is only the family word, and one longer than
+/// `sockaddr_storage`.
+fn sendto_raw(fd: &OwnedFd, data: &[u8], addr: *const u8, addrlen: usize) -> Result<isize, Errno> {
+    // SAFETY: every argument is a live pointer to a buffer this frame owns.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_sendto,
+            fd.as_raw_fd() as libc::c_long,
+            data.as_ptr() as libc::c_long,
+            data.len() as libc::c_long,
+            0 as libc::c_long,
+            addr as libc::c_long,
+            addrlen as libc::c_long,
+        ) as isize
+    };
+    if rc < 0 {
+        Err(Errno::from_raw_os_error(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+        ))
+    } else {
+        Ok(rc)
+    }
+}
+
+/// A connected seqpacket send with an address that is only the family word -
+/// a `sockaddr_un` whose body is empty, which every door that reads one refuses
+/// with `EINVAL`.
+fn sendto_family_only(fd: &OwnedFd, data: &[u8]) -> Result<isize, Errno> {
+    let sa = libc::sockaddr_un {
+        sun_family: libc::AF_UNIX as libc::sa_family_t,
+        sun_path: [0; 108],
+    };
+    let len = core::mem::offset_of!(libc::sockaddr_un, sun_path);
+    sendto_raw(fd, data, &sa as *const libc::sockaddr_un as *const u8, len)
+}
+
 fn main() {
     println!("t-unix-seqpacket");
     let mut r = Report::new();
@@ -191,6 +230,70 @@ fn main() {
         check_errno(
             &mut r,
             "with nothing left behind it",
+            rcv(&s, &mut big, RecvFlags::DONTWAIT),
+            Errno::AGAIN,
+        );
+        let _ = rustix::fs::unlink(LISTEN);
+    }
+
+    // ---------------------------------------------------------------------
+    // The destination of a send on a connected seqpacket socket is dropped:
+    // neither a live name, a dead name nor a family-only address is looked at,
+    // and every one of them reaches the peer as one message.
+    // ---------------------------------------------------------------------
+    {
+        let (c, s) = pair(&mut r, LISTEN);
+        check_len(
+            &mut r,
+            "a sendto naming the listener still lands at the peer",
+            sendto(&c, b"live", SendFlags::empty(), &addr(LISTEN)),
+            4,
+        );
+        let mut big = [0u8; 32];
+        let first = read(&s, &mut big);
+        r.check(
+            &format!("and reads back whole (got {first:?})"),
+            first == Ok(4) && &big[..4] == b"live",
+        );
+        // The name is not resolved at all: a path nobody holds is no reason to
+        // refuse, where the same call on a *datagram* socket is `ENOENT`.
+        let dead = addr("/tmp/t-seqpacket-nowhere.sock");
+        check_len(
+            &mut r,
+            "a sendto naming a dead path still lands at the peer",
+            sendto(&c, b"dead", SendFlags::empty(), &dead),
+            4,
+        );
+        let second = read(&s, &mut big);
+        r.check(
+            &format!("and that one reads back whole too (got {second:?})"),
+            second == Ok(4) && &big[..4] == b"dead",
+        );
+        // Nor is it validated: a `sockaddr_un` whose body is empty is `EINVAL`
+        // for every door that reads it, but this send never reads it.
+        let rc = sendto_family_only(&c, b"family");
+        r.check(
+            &format!("a family-only address sends (got {rc:?})"),
+            rc == Ok(6),
+        );
+        let third = read(&s, &mut big);
+        r.check(
+            &format!("and that message arrives as one (got {third:?})"),
+            third == Ok(6) && &big[..6] == b"family",
+        );
+        // Only the syscall layer's copy is checked: a length beyond
+        // `sockaddr_storage` is refused before the socket can drop it.
+        let mut long = [0u8; 129];
+        long[0] = libc::AF_UNIX as u8;
+        check_errno(
+            &mut r,
+            "a 129-byte address is EINVAL even though the name would be dropped",
+            sendto_raw(&c, b"long", long.as_ptr(), long.len()),
+            Errno::INVAL,
+        );
+        check_errno(
+            &mut r,
+            "with nothing left in the queue",
             rcv(&s, &mut big, RecvFlags::DONTWAIT),
             Errno::AGAIN,
         );

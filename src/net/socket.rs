@@ -78,21 +78,18 @@ pub(crate) const SOCK_DGRAM: u16 = 2;
 pub(crate) const SOCK_RAW: u16 = 3;
 /// `SOCK_SEQPACKET`: message boundaries over a stream.
 ///
-/// The type opens, and it is served in one of two ways, decided by whether a
-/// peer is paired with it. A *paired* one - a `socketpair` half - carries whole
-/// messages, because that is exactly the machinery a `SOCK_DGRAM` pair already
-/// has and a pair is what wants it (`carries_messages` in `net::unix` picks the
-/// branch). A *named* one is served as the byte stream this family has, and that
-/// is a trade rather than an oversight: udevd's control socket is created as
+/// The type opens, and both shapes a caller can reach carry whole messages: a
+/// *paired* one - a `socketpair` half - uses the machinery a `SOCK_DGRAM` pair
+/// already has, and the ends of a *named* connection are minted as message
+/// sockets too (`carries_messages` in `net::unix` picks the branch). The type
+/// exists in the first place because udevd's control socket is created as
 /// `socket(AF_LOCAL, SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC)` and bound at
 /// `/run/udev/control`, and a refusal at that call does not withhold a feature,
 /// it stops the device manager from starting at all ("error initializing udev
 /// control socket"), after which every device on the machine goes untagged and
 /// no compositor sees a keyboard. What travels over the control connection is
-/// one fixed-size `struct udev_ctrl_msg_wire` per `sendmsg`, and a stream
-/// carries one call at a time correctly; a caller that needed the boundary of a
-/// *partial* message would be the one to tell the difference, and nothing on
-/// this machine is one (`net::unix`'s header keeps the divergence on the list).
+/// one fixed-size `struct udev_ctrl_msg_wire` per `sendmsg`, and that is the
+/// boundary the message pair keeps.
 const SOCK_SEQPACKET: u16 = 5;
 const SOCK_NONBLOCK: u32 = 0o4000;
 const SOCK_CLOEXEC: u32 = 0o2000000;
@@ -1847,18 +1844,25 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
         }
         let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
         let dest = if args[4] != 0 {
-            let raw = match read_sockaddr_un(args[4], args[5], from_user) {
-                Ok(raw) => raw,
-                Err(e) => return e,
-            };
-            match crate::net::unix::sockaddr_un_addr(&raw) {
-                Ok(crate::net::unix::UnixAddrParse::Name(addr)) => Some(addr),
-                // `addrlen` of just the family: Linux's `unix_mkname` refuses
-                // anything at or below `offsetof(sun_path)`, so every door
-                // *except* `bind` answers `EINVAL` (measured for `connect`,
-                // `sendto`; `bind` autobinds).
-                Ok(crate::net::unix::UnixAddrParse::Autobind) => return err::EINVAL,
-                Err(e) => return e,
+            if sock.ignores_send_address() {
+                if let Err(e) = copy_send_address(args[4], args[5], from_user) {
+                    return e;
+                }
+                None
+            } else {
+                let raw = match read_sockaddr_un(args[4], args[5], from_user) {
+                    Ok(raw) => raw,
+                    Err(e) => return e,
+                };
+                match crate::net::unix::sockaddr_un_addr(&raw) {
+                    Ok(crate::net::unix::UnixAddrParse::Name(addr)) => Some(addr),
+                    // `addrlen` of just the family: Linux's `unix_mkname` refuses
+                    // anything at or below `offsetof(sun_path)`, so every door
+                    // *except* `bind` answers `EINVAL` (measured for `connect`,
+                    // `sendto`; `bind` autobinds).
+                    Ok(crate::net::unix::UnixAddrParse::Autobind) => return err::EINVAL,
+                    Err(e) => return e,
+                }
             }
         } else {
             None
@@ -1992,14 +1996,21 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
             Err(e) => return e,
         };
         let dest = if name != 0 {
-            let raw = match read_sockaddr_un(name, namelen as usize, from_user) {
-                Ok(raw) => raw,
-                Err(e) => return e,
-            };
-            match crate::net::unix::sockaddr_un_addr(&raw) {
-                Ok(crate::net::unix::UnixAddrParse::Name(addr)) => Some(addr),
-                Ok(crate::net::unix::UnixAddrParse::Autobind) => return err::EINVAL,
-                Err(e) => return e,
+            if sock.ignores_send_address() {
+                if let Err(e) = copy_send_address(name, namelen as usize, from_user) {
+                    return e;
+                }
+                None
+            } else {
+                let raw = match read_sockaddr_un(name, namelen as usize, from_user) {
+                    Ok(raw) => raw,
+                    Err(e) => return e,
+                };
+                match crate::net::unix::sockaddr_un_addr(&raw) {
+                    Ok(crate::net::unix::UnixAddrParse::Name(addr)) => Some(addr),
+                    Ok(crate::net::unix::UnixAddrParse::Autobind) => return err::EINVAL,
+                    Err(e) => return e,
+                }
             }
         } else {
             None
@@ -4835,6 +4846,28 @@ fn read_sockaddr_un(ptr: usize, len: usize, from_user: bool) -> Result<alloc::ve
         core::ptr::copy_nonoverlapping(ptr as *const u8, raw.as_mut_ptr(), len);
     }
     Ok(raw)
+}
+
+/// The address of a send whose destination the socket will not look at, read
+/// only as far as the syscall layer does: `move_addr_to_kernel` rejects a
+/// length beyond `sockaddr_storage` and faults a pointer it cannot read, then
+/// hands the copy to the protocol, which is where a connected sequenced-packet
+/// send drops it.
+///
+/// Measured on Linux 7.2.11: such a send with `addrlen` of 110 or 128 and a
+/// valid buffer still sends, while a bad pointer is `EFAULT`; a datagram send
+/// with the same family-only address answers `EINVAL`.
+fn copy_send_address(ptr: usize, len: usize, from_user: bool) -> Result<(), isize> {
+    if len == 0 {
+        return Ok(());
+    }
+    if len > 128 {
+        return Err(err::EINVAL);
+    }
+    if ptr == 0 || !crate::uaccess::buffer_ok(ptr, len, false, from_user) {
+        return Err(err::EFAULT);
+    }
+    Ok(())
 }
 
 pub(crate) fn handle_getsockname(args: [usize; 6], _from_user: bool) -> isize {

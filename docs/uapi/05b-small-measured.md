@@ -21,8 +21,10 @@ Section numbers are unchanged from the original `UAPI.md`.
   machinery, `Dgram`'s own `fds`, and `read_at`'s zero-length no-op. Pins: **`t-unix-seqpacket`,
   58 claims**, green on a host first; `t-unix-dgram`'s seqpacket claim now says "listens"
   instead of "is served as a stream". Gate: x86_64 `pass=193 fail=0`, aarch64 `pass=192 fail=0`,
-  `mpos-kunit` 32/0 on both. Named: `sendto` with a destination on an already-connected
-  seqpacket socket answers `EISCONN` here where Linux sends (the `t-unix-dgram` divergence).
+  `mpos-kunit` 32/0 on both. Named at landing and **served by `docs/uapi/` §5.1 item 79**:
+  `sendto` with a destination on an already-connected seqpacket socket answered `EISCONN` where
+  Linux sends - and a connected *datagram* socket's named send was refused the same way, where
+  Linux resolves the name. Item 79 adds eight claims here (58 -> 66) and six to `t-unix-dgram`.
 
 - **Netlink's and `AF_PACKET`'s receive doors look without taking, and a truncated answer
   names its own length.** **Landed 2026-10-21** (`docs/uapi/` §5.1 item 77) - item 76's named

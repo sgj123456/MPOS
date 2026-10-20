@@ -356,12 +356,23 @@ impl UnixSock {
     /// by.
     ///
     /// True of a datagram socket, and of a sequenced-packet one that is
-    /// connected to a peer: that is exactly what a `socketpair` half is, and
-    /// there is no other way for one to exist here - a *named*
-    /// sequenced-packet socket is served as the stream this family has (see
-    /// `SOCK_SEQPACKET`'s note in `net::socket`).
+    /// connected to a peer: a `socketpair` half, or either end of a named
+    /// connection a listener accepted.
     pub fn carries_messages(&self) -> bool {
         self.typ == SOCK_DGRAM || self.dgram_connected()
+    }
+
+    /// Whether a send ignores the destination it is given.
+    ///
+    /// True of a connected sequenced-packet socket, and of nothing else:
+    /// Linux drops `msg_name` before the shared datagram send looks at it, so
+    /// the address is neither validated nor resolved - the message goes to the
+    /// peer whatever the name says (measured on Linux 7.2.11: a family-only
+    /// address, a dead name, a different live socket and a `SOCK_STREAM`
+    /// listener's name all send, while a datagram socket given the same
+    /// address answers `EINVAL`/`ENOENT`/`ECONNREFUSED`).
+    pub fn ignores_send_address(&self) -> bool {
+        self.typ == SOCK_SEQPACKET && self.dgram_connected()
     }
 
     /// The descriptor's `O_NONBLOCK`, carried onto the socket the way the
@@ -1818,13 +1829,21 @@ pub(crate) fn send_dgram(
         return err::EMSGSIZE;
     }
     let target: Arc<UnixSock> = match dest {
+        // A sequenced-packet connection has no per-call destination, and the
+        // door above usually drops the name before this function sees it.
+        // Keeping the rule here too means a caller that still arrives with one
+        // (the `socketpair` shape) cannot be sent anywhere but the peer.
+        Some(_) if sock.ignores_send_address() => match sock.dgram_peer() {
+            Some(peer) => peer,
+            None => return err::ENOTCONN,
+        },
+        // A datagram socket honours the name it is given, connected or not:
+        // Linux resolves and validates it exactly as an unconnected send does
+        // (measured: naming a different live socket sends there, a dead name is
+        // `ENOENT`, a regular file and a live listener of another type are
+        // `ECONNREFUSED`). Being connected only decides where a send *without*
+        // a name goes.
         Some(addr) => {
-            // A connected datagram socket sends to its peer; naming a
-            // different destination on the call that already pinned one is
-            // `EISCONN`, the same refusal the stream channel answers.
-            if sock.dgram_connected() {
-                return err::EISCONN;
-            }
             match addr {
                 UnixAddr::Path(path) => {
                     let cwd = crate::sched::current_cwd();

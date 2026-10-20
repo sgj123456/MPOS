@@ -4212,7 +4212,68 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
 
     Gate: x86_64 `pass=193 fail=0 (193 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33;
     aarch64 `pass=192 fail=0`, `mpos-kunit 32 passed, 0 failed`; host unit suite 584 (unchanged),
-    `xtask` 123. Named rather than served: `sendto` with a destination on an already-connected
-    seqpacket socket answers `EISCONN` where Linux sends - the same divergence `t-unix-dgram`
-    pins for a connected datagram socket, and the same fix (ignore the destination once
-    connected) would close both.
+    `xtask` 123. Named at landing and served by item 79: `sendto` with a destination on an
+    already-connected seqpacket socket answered `EISCONN` where Linux sends - and the same
+    divergence held for a connected datagram socket, where Linux takes the address.
+
+## item 79 — A send on a connected AF_UNIX socket takes its destination where Linux takes it: dropped by a seqpacket connection, honoured by a datagram one
+
+    Item 78's named residual - and it was two rules, not one. Both message families
+    answered `EISCONN` whenever the caller gave a destination on an already-connected
+    socket; Linux decides by the socket's type. **Measured whole on a current host
+    first**, one probe per question (`.workbuddy/probe_unix_sendto_connected{,2}.c`,
+    `.workbuddy/probe_unix_sendto_family_only.c`,
+    `.workbuddy/probe_unix_sendto_long_name.c`,
+    `.workbuddy/probe_unix_sendto_wrongtype.c` and
+    `.workbuddy/probe_unix_sendto_huge_name.c`, Linux 7.2.11, path and abstract names):
+
+    * **A connected seqpacket socket drops the destination.** The peer is the whole
+      answer, and the name is not resolved or validated: naming the listener itself,
+      another live socket, a path nobody holds, a dead abstract name, a
+      `SOCK_STREAM` listener, a family-only `sockaddr_un`, and an address 110 or 128
+      bytes long all send to the peer. Only the syscall layer's own copy is visible to
+      a caller: a bad pointer with a non-zero `addrlen` is `EFAULT` (measured), and
+      `addrlen` beyond `sockaddr_storage` (128) is `EINVAL`.
+    * **A connected datagram socket honours the destination.** The name is resolved and
+      validated exactly as an unconnected send's is: a different live socket receives
+      the message, a dead path is `ENOENT` (2), a dead abstract name and a regular file
+      are `ECONNREFUSED` (111), a live `SOCK_STREAM` listener is `EPROTOTYPE` (91), a
+      family-only address is `EINVAL` (22), and the pinned peer only decides where a
+      send *without* a name goes.
+    * **A connected stream pair still answers `EISCONN`** (106) - the channel door's
+      rule, which `t-sockmsg` pins and this item did not touch.
+    * **An unconnected seqpacket socket's named send is `ENOTCONN`** (107), as is a
+      listening one's. Linux drops the name first and then finds no peer. Named rather
+      than served: this family's message doors are reached only by a socket that
+      already carries messages (a datagram, or a connected seqpacket), so an
+      unconnected seqpacket socket does not enter them and its answer is unchanged.
+
+    Served by `UnixSock::ignores_send_address` (connected sequenced-packet, and nothing
+    else), by the two send doors routing an address through a new `copy_send_address`
+    - the syscall layer's bounds and readability, no interpretation - when that answers
+    true, and by `send_dgram`: the `EISCONN` refusal is gone, a seqpacket send targets
+    its peer whatever `dest` carries, and a datagram send resolves and validates the
+    name exactly as an unconnected one does.
+
+    **Pins**: `t-unix-seqpacket` gains **eight claims** (58 -> 66): three sends that
+    each name something the socket must ignore - the listener's own live name, a path
+    nobody holds, and a family-only address - each read back as one whole message, the
+    `EINVAL` a 129-byte address still earns from the syscall layer, and the empty queue
+    behind them. `t-unix-dgram` gains **six** and loses its one divergence claim: the
+    named send lands at the connected peer, reaches another live socket the name picks,
+    leaves the pinned peer's queue alone, and a dead name is `ENOENT`. Both green on a
+    current host first (`MPOS_ON_HOST=1`). `t-unix-peek`'s
+    helper note changed with the rule it cited (its sender is still unconnected, for
+    the different reason that a `socketpair` end is unnamed), and two stale notes -
+    `net::socket`'s `SOCK_SEQPACKET` paragraph and `net::unix`'s `carries_messages` doc,
+    both still saying a *named* seqpacket socket was served as a byte stream - were
+    corrected in place.
+
+    Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32 passed, 0 failed on
+    both; host unit suite 584 (unchanged), `xtask` 123. Counterfactual (the old rule restored -
+    the doors' `EISCONN` and `send_dgram`'s refusal): `t-unix-dgram`'s first named-send claim goes
+    red with `EISCONN` (106), and the pin's next read - a blocking receive for a message the old
+    kernel never sent - parks there, so the arm was observed and stopped rather than counted (the
+    shape item 77's peek counterfactual had). Named: the unconnected seqpacket send above, and the
+    datagram-to-*stream*-listener `ECONNREFUSED` where Linux answers `EPROTOTYPE` (the existing
+    `t-unix-dgram` claim, untouched).
