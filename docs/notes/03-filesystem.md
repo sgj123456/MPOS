@@ -169,5 +169,43 @@ inode) and a pure `format_net` renders Linux's exact column layout (address as
 little-endian hex, `:port`, state byte) - the formatter is host-tested
 (`the_net_table_prints_addresses_and_state_as_linux_does`).
 
+### 3.6 A descriptor's filesystem is the one it was opened on — **DONE** (2026-10-21)
+
+`fstatfs(2)` used to name a filesystem by the *inode*: a mount's own root inode
+named that mount, and everything else fell through to the root filesystem - so
+every regular file, every directory below a mountpoint and every `/proc/<pid>/`
+file reported `/`'s identity, while `statfs(2)` on the same path reported the
+mount that serves it. Two doors, one file, two answers; `df` read a mounted
+filesystem's free space as the root's.
+
+The fix keys the answer by the **device number the descriptor recorded at
+open** (`File::dev`, the same record `fstat`'s `st_dev` has been answered from),
+so a descriptor and a path can no longer disagree: `MountTable::point_of_dev`
+walks `mount_points` - the very table `serving_point` reads forward - for the
+record carrying that number, choosing the deepest mountpoint among records that
+share one (the same longest-prefix choice the forward walk makes, which is what
+keeps the two directions one rule rather than two), and `MountTable::fs_of_dev`
+hands back the instance and the type from that one record so `f_blocks` and
+`f_type` cannot come from two mounts. Descriptors no path made - a pipe end, a
+socket, an anonymous inode - keep the inode-identity fallback, which really is
+the root filesystem.
+
+**Measured on a current host first** (`.workbuddy/probe_fstatfs.c`, Linux
+7.2.11): `/` and `/etc/hostname` both answer the host's ext4, `/proc` and
+`/proc/self/status` both answer procfs, `/dev/shm` and a file written inside it
+both answer tmpfs, and `fstatfs(fd) == statfs(path)` in every row - Linux asks
+the vfsmount the open took, and nothing about the inode enters into it.
+
+**Pinned** by `t-statfs` (24 -> 26 claims, `ok:` for `ok:` identical on both
+machines, green on the host's own Linux first). The `/tmp` scratch-file claims
+this item *started* with were dropped: the first machine mounts a ramfs at
+`/tmp` over a ramfs root, so those claims were green in the counterfactual too -
+a pin answered alike either way carries no information, and the claims that
+remain compare the mountpoint's descriptor with the one for a file inside it,
+which catches the old answer on either machine. Counterfactual (the inode-based
+body restored): x86_64 `pass=204 fail=1 (205 built)`, the one red program
+`t-statfs` with exactly those three claims red. Full record: `docs/uapi/`
+§5.1 item 89.
+
 ---
 

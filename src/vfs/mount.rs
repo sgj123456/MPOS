@@ -636,6 +636,85 @@ impl MountTable {
         self.serving_point(path).dev
     }
 
+    /// The mount this *device number* belongs to - the reverse of
+    /// [`Self::dev_of_path`], which is what turns a descriptor back into a
+    /// filesystem.
+    ///
+    /// `fstatfs(2)` needs this and an inode cannot answer it: a descriptor
+    /// records the device number the open walked through (`File::dev`), and a
+    /// file *inside* a mount is not that mount's root inode, so the identity
+    /// matches below cannot find it - a plain file in `/proc` used to report
+    /// the root filesystem while `statfs` on the same path reported procfs.
+    /// Measured on a current host (`.workbuddy/probe_fstatfs.c`, Linux
+    /// 7.2.11): `fstatfs` on a descriptor for a file inside `/dev/shm` or
+    /// `/proc` names that mount's magic, exactly as `statfs` on the same path
+    /// does, and the two agree on every shape.
+    ///
+    /// The *device* is the key because that is the number the descriptor kept,
+    /// and the walk goes through `mount_points` - the same table
+    /// [`Self::serving_point`] reads forward - so the two directions are one
+    /// answer rather than two rules that may drift. Where two records share a
+    /// number (two attachments of one device, or a bind alias) the deepest
+    /// mountpoint wins, which is the same longest-prefix choice the forward
+    /// walk makes; a number no record claims answers the root slot, the
+    /// fallback every other door here takes.
+    fn point_of_dev(&self, dev: u64) -> MountPoint {
+        let points = critical_section::with(|cs| self.mount_points.borrow(cs).borrow().clone());
+        let mut best: Option<MountPoint> = None;
+        for point in points.iter() {
+            if point.dev != dev {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|b| point.path.len() > b.path.len())
+            {
+                best = Some(point.clone());
+            }
+        }
+        best.unwrap_or_else(|| MountPoint {
+            path: alloc::string::String::from("/"),
+            id: 0,
+            dev,
+            fstype: alloc::string::String::from("unknown"),
+        })
+    }
+
+    /// The filesystem instance - and its type - that serve the mount whose
+    /// device number is `dev`, for a descriptor's `statfs(2)`.
+    ///
+    /// Both halves come out of one [`Self::point_of_dev`] lookup so they cannot
+    /// name two different mounts: the instance is what answers `f_blocks`, the
+    /// type is what `f_type` is derived from, and a caller that saw procfs in
+    /// one field while reading the root's free space in the other would have
+    /// been handed a filesystem that does not exist. Resolution is the same
+    /// rule [`Self::fs_serving_path`] takes - id 0 is the root slot, anything
+    /// else names an instance in the table.
+    pub(crate) fn fs_of_dev(
+        &self,
+        dev: u64,
+    ) -> (
+        Option<alloc::sync::Arc<dyn super::FileSystem>>,
+        alloc::string::String,
+    ) {
+        let point = self.point_of_dev(dev);
+        if point.id == 0 {
+            return (
+                critical_section::with(|cs| self.root_fs.borrow(cs).borrow().clone()),
+                point.fstype,
+            );
+        }
+        let fs = critical_section::with(|cs| {
+            self.mounts
+                .borrow(cs)
+                .borrow()
+                .iter()
+                .find(|m| m.id == point.id)
+                .map(|m| m.fs.clone())
+        });
+        (fs, point.fstype)
+    }
+
     /// What `stat`'s `st_dev` reports for a descriptor's inode, which has no
     /// path to look the answer up by: a mount's own root names that mount;
     /// anything else is served by the root filesystem.
@@ -2138,6 +2217,20 @@ pub fn fs_stats_of_inode(inode: &Arc<dyn Inode>) -> Option<super::FsStats> {
         .and_then(|fs| fs.statfs())
 }
 
+/// The space accounting of the filesystem a descriptor was opened on, keyed by
+/// the device number the open recorded: the question `fstatfs(2)` asks and the
+/// one an inode cannot answer, because a file *inside* a mount is not the
+/// mount's root (measured on a current host, `.workbuddy/probe_fstatfs.c`).
+pub fn fs_stats_of_dev(dev: u64) -> Option<super::FsStats> {
+    caller_table().fs_of_dev(dev).0.and_then(|fs| fs.statfs())
+}
+
+/// The filesystem *type* serving the mount whose device number is `dev` -
+/// `fstatfs`'s `f_type` half, by the same key and the same record.
+pub fn fstype_of_dev(dev: u64) -> alloc::string::String {
+    caller_table().fs_of_dev(dev).1
+}
+
 /// The type of the filesystem a node belongs to, by identity: a mount's own
 /// root names that mount; anything else names the root filesystem.
 pub fn fstype_of_inode(inode: &Arc<dyn Inode>) -> alloc::string::String {
@@ -2404,6 +2497,56 @@ mod tests {
             b.fs_of_path("/mnt").0,
             "instance identity is per-table: the same name serves different facts"
         );
+    }
+
+    #[test]
+    fn a_number_the_forward_walk_handed_out_finds_the_same_mount_back() {
+        // `statfs(path)` resolves forward and `fstatfs(fd)` resolves backward
+        // through the device number the open recorded, and the two claim the
+        // same mount even for a file that is *not* the mount's root inode.
+        // Measured on a current host (`.workbuddy/probe_fstatfs.c`): Linux
+        // answers both doors from the vfsmount the open took, so they agree on
+        // every shape.
+        let vfs = tree_with_root();
+        vfs.resolve("/")
+            .unwrap()
+            .create("mnt", NodeKind::Dir, None)
+            .unwrap();
+        let mounted = RamFs::new();
+        mounted
+            .root()
+            .create("inside", NodeKind::File, None)
+            .unwrap();
+        let at = vfs.mountpoint_at("/mnt", None).unwrap();
+        vfs.mount_at(at, mounted, "proc", "proc", false, None)
+            .unwrap();
+
+        let (_id_root, fstype_root) = vfs.fs_of_path("/");
+        let dev_of_file = vfs.dev_of_path("/mnt/inside");
+        let (_id_file, fstype_file) = vfs.fs_of_path("/mnt/inside");
+        assert_ne!(fstype_file, fstype_root, "the two fixtures differ");
+
+        let (found, fstype_back) = vfs.fs_of_dev(dev_of_file);
+        assert_eq!(
+            fstype_back, fstype_file,
+            "the device number a descriptor keeps names the mount serving it"
+        );
+        assert!(
+            alloc::sync::Arc::ptr_eq(
+                &found.expect("a mount serving the device"),
+                &vfs.fs_serving_path("/mnt/inside")
+                    .expect("and the path agrees"),
+            ),
+            "and the instance it names is the instance serving the path"
+        );
+
+        // A number no mount claims answers the root slot, the fallback every
+        // other door here takes.
+        let (root_back, _fstype) = vfs.fs_of_dev(0xdead_beef);
+        assert!(alloc::sync::Arc::ptr_eq(
+            &root_back.expect("the root"),
+            &vfs.fs_serving_path("/").expect("the root"),
+        ));
     }
 
     #[test]

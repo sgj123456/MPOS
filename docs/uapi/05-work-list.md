@@ -4654,3 +4654,82 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `pass=192 fail=1` with both address claims red; the old
     `addr_ptr != 0 && len_ptr != 0` condition restored is `pass=192 fail=1`
     with `accept with a real addr and a NULL addrlen is EFAULT` red.
+
+## item 89 — `fstatfs` names the filesystem the descriptor was opened on, not the root's
+
+    A descriptor carries no path, and an inode does not name the filesystem it
+    sits in - so this door answered by *identity*: a mount's own root inode
+    named that mount, and everything else - every regular file, every directory
+    below a mountpoint, every `/proc/<pid>` file - reported the root
+    filesystem. `df` read a mounted filesystem as the root's free space, and
+    `statfs(2)` on a path disagreed with `fstatfs(2)` on a descriptor opened
+    through it, which are Linux's one answer about one file.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_fstatfs.c`,
+    Linux 7.2.11): Linux asks the vfsmount the open took, so a descriptor for a
+    file *inside* a mount names that mount. `/` and `/etc/hostname` both answer
+    this machine's ext4 (the second is a regular file inside it), `/proc` and
+    `/proc/self/status` both answer procfs, `/dev/shm` and a file this probe
+    wrote there both answer tmpfs, and in every row `fstatfs(fd)` equals
+    `statfs(path)`; a closed descriptor is `EBADF` (9); `sizeof(struct statfs)`
+    is 120 with `f_type` at 0. The shape that used to fall back is not an edge
+    case, it is every node that is not its own mount's root - nothing else can
+    answer the question.
+
+    **The landing** makes the reverse lookup the forward one's mirror rather
+    than a second rule beside it. The descriptor already records the device
+    number it was opened on (`File::dev` - the record `fstat`'s `st_dev` has
+    been answered from since §15's own work on that field, which is why the two
+    doors already agreed about it while disagreeing about everything else), and
+    `MountTable::point_of_dev` walks `mount_points` - the very table
+    `serving_point` reads forward - for the record carrying that number, taking
+    the deepest mountpoint when two records share one, which is the
+    longest-prefix choice the forward walk would have made. `fstatfs` keys on
+    it, and keeps the inode-identity walks for a descriptor no path made (a
+    pipe end, a socket, an anonymous inode), which really is on the root
+    filesystem. `MountTable::fs_of_dev` hands back the instance **and** the type
+    from that one record, so `f_blocks` and `f_type` cannot come from two
+    different mounts, and a number no mount claims resolves to the root slot -
+    the fallback every other door here takes.
+
+    **Pins**: `t-statfs`, 24 -> 26 claims - the mountpoint's own descriptor
+    opening, a procfs file inside that mount opening, `fstatfs` naming procfs
+    rather than the root, the mountpoint's descriptor agreeing with the
+    inside-file one, and `statfs` on the file's path agreeing with `fstatfs` on
+    its descriptor - **green on a current host first (26 of 26,
+    `MPOS_ON_HOST=1`, musl build run on the host's own Linux)** and `ok:` for
+    `ok:` identical on both machines. `/proc` is the fixture and `/tmp` is
+    deliberately not: the first machine's boot mounts a ramfs at `/tmp` **over
+    a ramfs root**, so a claim comparing those two answers is answered alike
+    whether or not the kernel is right. Five claims shaped that way were
+    written first, stayed green in the counterfactual below, and were **dropped
+    rather than kept as decoration** - a pin that cannot go red is not
+    evidence. Two of the claims that remain do not lean on the fixture's magic
+    at all: comparing the *mountpoint's* descriptor with the file-inside-it
+    one catches exactly the old answer, whichever numbers the machine's root
+    happens to carry. Beside the pin, one host unit test in `vfs::mount` binds
+    the two directions: the device number the forward walk hands out for
+    `/mnt/inside` finds the same instance back, and a number no mount claims
+    answers the root slot.
+
+    **Counterfactual** - the pre-item body restored (`fstatfs` asks the inode by
+    identity again), every pin kept: x86_64 `pass=204 fail=1 (205 built)`,
+    `mpos-kunit 32 passed, 0 failed`, exit 33, and the one red program is
+    **`t-statfs`** with exactly three claims red - "and it agrees with fstatfs
+    on the mountpoint's own descriptor", "fstatfs on a file inside a mount
+    names the mount, not the root" and "and statfs on that file's path agrees
+    with fstatfs" - while its `/tmp`, root, whole-struct and `EBADF` claims
+    stay green, which is what says the pin measures this item and nothing else.
+
+    **Gate**: x86_64 `pass=205 fail=0 (205 built)`, `mpos-kunit 32 passed, 0
+    failed`, exit 33; aarch64 `pass=204 fail=0` (204 staged, 1 left out - the
+    machine's own gap), `mpos-kunit 32 passed, 0 failed`, reaching `=== END`;
+    both machines' `ok:` lines byte-identical (26 of 26). Host unit suite 585
+    (was 584), `xtask` 123; `cargo fmt --check` clean on the touched files;
+    clippy's warning set unchanged; the depgraph ratchet holds - the new call is
+    `syscall -> vfs::mount`, an edge that already exists.
+
+    **Named**: nothing here measures `statvfs`/`fstatvfs` (1078/1079), whose
+    numbers this kernel does not answer at all, and no pin asks what `f_fsid`
+    should carry - Linux answers there with the tuple it mints per superblock,
+    and this kernel writes zeros.

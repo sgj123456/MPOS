@@ -8,10 +8,12 @@
 //! written, so a caller that seeded it with 0xff finds the fields it did not
 //! ask about zeroed rather than poisoned.
 //!
-//! One mpos divergence, named where it is checked: `fstatfs` names the
-//! filesystem by the *inode* the descriptor holds, and mpos keeps no path per
-//! descriptor - so a file inside a mount reports the root filesystem, not the
-//! mount that serves it.
+//! The two doors agree about a file inside a mount. `fstatfs` used to name the
+//! filesystem by the *inode* the descriptor held, and an inode does not name
+//! its filesystem - so a file inside a mount reported the root. The descriptor
+//! records the device number it was opened on (`File::dev`), and the mount
+//! table is keyed by that number now, so `fstatfs(fd)` and `statfs(path)` are
+//! one answer (measured on a current host, `.workbuddy/probe_fstatfs.c`).
 //!
 //! `/tmp` is memory-backed in every boot, but *which* memory filesystem owns
 //! it depends on the boot: the kernel's own M7 self-test mounts a ramfs there
@@ -24,13 +26,17 @@
 //! slots answer ext4/btrfs/whatever the machine really has, so the magic
 //! claims carry the `host_run()` escape with their measurement.
 //!
-//! # The fixture moved, and so did one call
+//! # Why `/tmp` is not the "inside a mount" fixture
 //!
 //! The no-std version opened `/etc/motd`; the second machine's payload has no
-//! motd (`NOTES.md` §15.11), so the root-filesystem file this test needs is its
-//! own `/tmp` file - which also makes the named divergence checkable on both
-//! machines, because the two descriptors now differ only in the inode they
-//! hold.
+//! motd (`NOTES.md` §15.11), and the first machine's boot mounts a ramfs at
+//! `/tmp` **over a ramfs root** - so a file there and a file on the root are
+//! two descriptors that answer the same magic, and a claim comparing them
+//! passes whether or not the kernel names the right filesystem. The counterfactual
+//! for this item measured exactly that: with the fix reverted, every `/tmp`
+//! claim stayed green and only the procfs ones went red. `/proc` is therefore
+//! the fixture - its magic differs from a ramfs root *and* from an ext4 root,
+//! so the claim cannot pass by two numbers happening to agree.
 //!
 //! The whole-struct write is the one claim `rustix::fs::statfs` cannot make:
 //! the wrapper owns its buffer (`MaybeUninit`, never seeded), so "seeded with
@@ -54,9 +60,6 @@ const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
 /// the body for why the two differ.
 const EXT4_SUPER_MAGIC: u64 = 0x0000_ef53;
 
-/// The scratch file this test owns, in place of the no-std version's
-/// `/etc/motd`: a regular file the *root* filesystem really holds.
-const FILE_PATH: &str = "/tmp/t-statfs.f";
 /// A name that is not there.
 const MISSING: &str = "/tmp/t-statfs-gone";
 
@@ -191,43 +194,64 @@ fn main() {
                 }
             }
 
-            // The divergence, named. A regular file *inside* a mount is not
-            // the mount's root inode, so mpos falls back to the root
-            // filesystem - the same answer it gives for a file that really
-            // is on the root. On a host the two are genuinely different
-            // filesystems and disagree by design (measured: the /tmp file
-            // answers tmpfs while the root answers its install target), so
-            // the equality claim is the payload's and the host run names it.
-            let _ = std::fs::remove_file(FILE_PATH);
-            let written = std::fs::write(FILE_PATH, b"x").is_ok();
-            r.check("a scratch file in /tmp is created", written);
-            let inside = openat(
-                CWD,
-                FILE_PATH,
-                OFlags::RDWR | OFlags::CREATE,
-                Mode::from_raw_mode(0o644),
-            );
-            r.check("the scratch file opens", inside.is_ok());
+            // A file *inside* a mount is served by that mount, and the two
+            // doors that report a filesystem for a file agree: `statfs` on the
+            // path and `fstatfs` on a descriptor opened through it. The
+            // descriptor records the device number it was opened on, so the
+            // answer no longer needs a path - and a file that is not the
+            // mount's root inode is exactly the shape that used to fall back
+            // to the root filesystem. Measured on a current host
+            // (`.workbuddy/probe_fstatfs.c`, Linux 7.2.11): `fstatfs` on a file
+            // inside `/dev/shm` or `/proc` reports that mount's magic exactly
+            // as `statfs` on the same path does.
+            //
+            // `/proc/self/status` is the fixture because its magic differs
+            // from the root's on *both* machines (a ramfs root on one, an ext4
+            // root on the other, and a procfs over either), so the claim
+            // cannot pass by the two numbers happening to agree - which is
+            // what a `/tmp` fixture did on the first machine, where the root
+            // and `/tmp` are both ramfs.
             let outside = openat(CWD, "/", OFlags::RDONLY, Mode::empty());
             r.check("a file on the root filesystem opens", outside.is_ok());
-            if let (Ok(inside), Ok(outside)) = (&inside, &outside) {
+            let mount_root = openat(CWD, "/proc", OFlags::RDONLY, Mode::empty());
+            r.check("the mountpoint itself opens", mount_root.is_ok());
+            let inside = openat(CWD, "/proc/self/status", OFlags::RDONLY, Mode::empty());
+            r.check("a procfs file inside a mount opens", inside.is_ok());
+            if let (Ok(inside), Ok(outside), Ok(mount_root)) = (&inside, &outside, &mount_root) {
                 let file_sb = fstatfs(inside);
                 let root_sb = fstatfs(outside);
-                r.check("fstatfs on a file inside /tmp succeeds", file_sb.is_ok());
+                let mount_sb = fstatfs(mount_root);
+                r.check("fstatfs on a file inside a mount succeeds", file_sb.is_ok());
                 r.check(
                     "fstatfs on the root-filesystem file succeeds",
                     root_sb.is_ok(),
                 );
                 if let (Ok(file_sb), Ok(root_sb)) = (file_sb, root_sb) {
+                    // The mountpoint's own descriptor is the one even the old
+                    // answer got right (it is the mount's root inode), so this
+                    // pair cannot agree by accident: whichever of the two
+                    // reported the root filesystem, they disagree.
+                    if let Ok(mount_sb) = &mount_sb {
+                        r.check(
+                            "and it agrees with fstatfs on the mountpoint's own descriptor",
+                            magic_of(mount_sb) == magic_of(&file_sb),
+                        );
+                    }
                     r.check(
-                        "mpos divergence: fstatfs names the root filesystem for a file inside a mount, not the mount serving it",
-                        host || magic_of(&file_sb) == magic_of(&root_sb),
+                        "fstatfs on a file inside a mount names the mount, not the root",
+                        magic_of(&file_sb) == PROC_SUPER_MAGIC
+                            && magic_of(&file_sb) != magic_of(&root_sb),
+                    );
+                    let by_path = statfs("/proc/self/status");
+                    r.check(
+                        "and statfs on that file's path agrees with fstatfs",
+                        by_path.is_ok_and(|p| magic_of(&p) == magic_of(&file_sb)),
                     );
                 }
             }
             drop(inside);
             drop(outside);
-            let _ = std::fs::remove_file(FILE_PATH);
+            drop(mount_root);
 
             // The whole struct is written: fill every byte with 0xff first,
             // and the fields this kernel does not fill read back zeroed.

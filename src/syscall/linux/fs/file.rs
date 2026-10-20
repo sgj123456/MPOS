@@ -763,20 +763,34 @@ pub fn truncate(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
 }
 
 /// `fstatfs(fd, buf)` - filesystem facts for whatever `fd` is open on. The
-/// descriptor names a file; the file names a filesystem. A file that *is* a
-/// mountpoint reports that mount; anything else reports the root, which is
-/// the honest answer this kernel can give without tracking a path per
-/// descriptor.
+/// filesystem is the one the descriptor was *opened on*, keyed by the device
+/// number the open recorded, which is what makes this door and `statfs` on the
+/// same path one answer: a descriptor carries no path, and an inode does not
+/// name the filesystem it sits in, so a file inside a mount would otherwise
+/// report the root. Measured on a current host (`.workbuddy/probe_fstatfs.c`,
+/// Linux 7.2.11), and every shape agrees there.
 pub fn fstatfs(args: [usize; ARG_COUNT]) -> isize {
-    let inode = match crate::sched::current_fds()
-        .clone_at(args[0] as i32)
-        .map(|f| f.inode().clone())
-    {
-        Ok(i) => i,
+    let file = match crate::sched::current_fds().clone_at(args[0] as i32) {
+        Ok(f) => f,
         Err(e) => return err_of(e),
     };
-    let fstype = crate::vfs::mount::fstype_of_inode(&inode);
-    let stats = crate::vfs::mount::fs_stats_of_inode(&inode);
+    // The descriptor's own device number when the open recorded one; the
+    // inode-identity walks stay for a descriptor no path made (a pipe end, a
+    // socket, an anonymous inode) - those really are on the root filesystem,
+    // which is what the fallback names.
+    let (fstype, stats) = match file.dev() {
+        Some(dev) => (
+            crate::vfs::mount::fstype_of_dev(dev),
+            crate::vfs::mount::fs_stats_of_dev(dev),
+        ),
+        None => {
+            let inode = file.inode().clone();
+            (
+                crate::vfs::mount::fstype_of_inode(&inode),
+                crate::vfs::mount::fs_stats_of_inode(&inode),
+            )
+        }
+    };
     write_statfs(args[1], &fstype, stats)
 }
 

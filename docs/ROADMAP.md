@@ -25,7 +25,8 @@ One-glance status of the whole roadmap.
 
 - [x] P1 Syscall completion — epoll · timerfd · 67/68 other calls (§1)
 - [ ] [~] P2 Signal delivery — frame · mask · siginfo · interruptible waits (§2)
-- [ ] [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3)
+- [ ] [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3) — and  
+  `fstatfs` names the filesystem the descriptor was *opened on*, the two doors agreeing (§3.6, item 89)
 
 **Networking (Phase 4)**
 
@@ -648,6 +649,27 @@ Served by `UnixSock::unconnected_seqpacket` and a branch in each message door. P
 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32/0 on both. Counterfactual (branch removed):
 `pass=192 fail=1`, exactly the 17 message-door claims red with `ENOTSOCK` (88), `write` still
 green, sweep completes.
+
+**A descriptor's filesystem is the one it was opened on, not the root's** (`docs/uapi/` §5.1
+item 89, landed 2026-10-21): `fstatfs(2)` answered by inode identity - a mount's own root inode
+named that mount and everything else fell through to `/` - so every regular file, every directory
+below a mountpoint and every `/proc/<pid>` file reported the root filesystem while `statfs(2)` on
+the same path reported the mount that serves it. Two doors, one file, two answers, and `df` read a
+mount's free space as the root's. Measured whole on a current host first
+(`.workbuddy/probe_fstatfs.c`, Linux 7.2.11): Linux asks the vfsmount the open took, so `/` and
+`/etc/hostname` both answer the machine's ext4, `/proc` and `/proc/self/status` both answer procfs,
+`/dev/shm` and a file written into it both answer tmpfs, and `fstatfs(fd)` equals `statfs(path)` in
+every row. The door now keys on the device number the open recorded (`File::dev`, the record
+`fstat`'s `st_dev` already answered from, which is why *that* field agreed between the two doors
+while nothing else did), and `MountTable::point_of_dev` walks `mount_points` - the table
+`serving_point` reads forward - taking the deepest record carrying it, so the reverse lookup is the
+forward one's mirror rather than a second rule that can drift from it. Pin: `t-statfs`, 24 -> 26
+claims green on the host first and byte-identical on both machines; counterfactual (the inode-based
+body restored) is `pass=204 fail=1` with exactly those claims red and everything else green. The
+first draft's `/tmp`-shaped claims were **dropped rather than kept**: the first machine mounts a
+ramfs at `/tmp` over a ramfs root, so they were green with the fix reverted too - a claim answered
+alike either way is not evidence, and what replaced them compares the mountpoint's descriptor with
+the one for a file inside it, which catches the old answer on either machine.
 
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
