@@ -3642,3 +3642,113 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
 
     Gate: x86_64 `pass=189 fail=0 (189 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33 (11 of 200 left out by `tests.toml`); aarch64 `pass=188 fail=0`, `mpos-kunit 32 passed, 0 failed`, reaching `=== END` (12 left out); host unit tests 582 passed (up 3), `mpos-xtask` 123; `cargo fmt --check` clean; clippy's warning set unmoved by this change on both bare-metal targets; `cargo xtask depgraph` back within the ratchet
 
+## item 72 — `MSG_PEEK` looks without taking, and `MSG_TRUNC` names the message's own length
+
+    The last flag-word item on the IP receive path, and the one §5.3 had parked behind a
+    prerequisite that turned out never to exist: the stack has had `tcp::Socket::peek` and
+    `udp::Socket::peek` all along, and what was missing was the *reading* of the two flags.
+    Both doors refused `MSG_PEEK` with `EOPNOTSUPP` - the honest answer while a peek could
+    not be preserved - and `t-sock-flags` pinned that refusal. The contract below was
+    measured whole on a current host first (`.workbuddy/probe_msg_peek{,2,3,4}.c`, Linux
+    7.2.x), one scenario per answer, and each of the four probes corrects the one before it:
+
+    * **a datagram peek does not consume.** Peeking 16 bytes of a six-byte datagram answers
+      6 and a following peek answers 6 again; a three-byte peek copies three and a full peek
+      afterwards still reads all six - the *short* peek does not cut the message. `MSG_TRUNC`
+      on the same call answers the datagram's **own** length (6) and still copies only what
+      fitted (3). A zero-length peek answers 0, with `MSG_TRUNC` answers 6, and takes
+      nothing either way. A **non-peek** zero-length receive is the opposite: it answers 0
+      and **consumes** the datagram, which the queue's own `FIONREAD` shows.
+    * **a short non-peek datagram is Linux's truncation, not `EMSGSIZE`.** `recv(3)` on a
+      six-byte datagram answers 3, copies the prefix and drops the rest; `recv(3)|MSG_TRUNC`
+      answers 6 and copies 3; `recvmsg`'s `msg_flags` carries `MSG_TRUNC` in both cases
+      (even without the input flag), because the count alone cannot tell "exactly filled"
+      from "cut off". This kernel answered `EMSGSIZE` and dropped the datagram - smoltcp's
+      `recv_slice` truncates by refusing - which is the same call's other half and is fixed
+      by the same copy.
+    * **a stream's `MSG_TRUNC` is a different rule, and the probe had to be believed over
+      the man page.** A stream peek of three bytes of ten copies `012`; the same call with
+      `MSG_TRUNC` answers 3 and copies **nothing**; a hundred-byte one answers 10 and copies
+      nothing (measured twice, with a seeded buffer); and a *non-peek* `recv(3)|MSG_TRUNC`
+      copies none of them but **consumes** the three it counted (`peek 100` afterwards
+      answers the remaining seven). `recvmsg`'s `msg_flags` stay clear for a stream: there
+      is no message boundary to cut.
+    * **a zero-length stream receive is Linux's readiness question with a zero-byte
+      answer.** With data queued it answers 0 at once and takes nothing; with nothing queued
+      it waits, and a signal that ends that wait answers **0** - not `EINTR` (measured with
+      a non-restarting `SIGALRM`; `recv(fd, buf, 1, MSG_PEEK)` in the same state answers
+      `EINTR`). At end of stream it answers 0, and the wait is over.
+    * **the empty queue and the wait are the ones every other door gives**: `EAGAIN` under
+      `MSG_DONTWAIT`, a park without it, `EINTR` from a catchable signal - except in the
+      zero-length stream shape above. A listener answers `ENOTCONN` to both doors, peek or
+      not.
+
+    **The fix is two lengths and the flag read in one place.** `RecvAnswer { copied, full,
+    endpoint }` keeps what went into the caller's buffer apart from the message's own
+    length, which is exactly the pair `MSG_TRUNC` and `msg_flags` need; `recv_common` takes
+    `peek` and `truncate` beside `nonblock` and passes them down, and the raw family's
+    `EOPNOTSUPP` moves inside it (asked before the dispatch, so a raw peek still answers
+    the refusal it always did while a stream or datagram one is served). `tcp_recv` reads
+    with `peek` - not `peek_slice`, which skips smoltcp's own receive-state check and would
+    read a reset as an empty buffer - copies unless `truncate`, and dequeues the count
+    unless `peek`; a zero-length request asks `can_recv`/`peek(1)` instead of the empty
+    slice, which is what separates "0 because data is there" from "0 because the stream
+    ended" from "wait", and the wait's two endings both answer 0. `udp_recv` peeks (or
+    receives, for the consuming shape), copies `min(buffer, payload)` by hand and lets the
+    caller's door decide whether to return `full` - which is also what removes the old
+    `EMSGSIZE`. `recvfrom` returns `full` when the caller asked for `MSG_TRUNC` and
+    `copied` otherwise; `recvmsg` does the same and writes `MSG_TRUNC` into `msg_flags`
+    whenever `full > copied`. The source name is written on a peek like any other answer.
+
+    **The pin's first guest run found two defects, and both were worth the run.**
+    First, `Finished` was folded into the "nothing yet" arm: the stream path turned
+    smoltcp's end-of-stream into a zero-length chunk and then into `Wait`, so a *peek* at EOF
+    parked - and, because every stream read now goes through that same copy, so did an
+    ordinary blocking `recv`. `t-msg-peek`'s own EOF claim went red, and the sweep then hung
+    in `t-tcp-listen`, whose "the server reads end-of-stream" is exactly that blocking read.
+    The two answers are an `Option` now: `None` is the report (`0`, the stream is over) and
+    `Some(0)` is the wait. Second, the source-name claim compared the sender
+    `recvfrom`/`recvmsg` named against `getsockname`'s answer for the sending socket, and the
+    guest read `0.0.0.0:0`: the implicit bind on the first *send* (and on the first
+    *receive*) set the `bound` flag and never wrote the `local` record `getsockname` answers
+    from, so a socket whose datagrams carried a real port reported none. Both implicit-bind
+    sites record the endpoint now, and that claim is the regression pin - Linux's own
+    answer, so the host run had passed it all along.
+
+    **And the aarch64 arm found a third thing that was not the kernel's.** `t-ns-net`'s
+    descriptor handover connected to the child's pathname socket *before* waiting for the
+    child's `ready` line - the wait sat inside the same block, after the connect - so the
+    rendezvous was really a race against the child's scheduling. It had always been won;
+    a changed socket timing lost it on aarch64, which failed the handover and parked the
+    child in `accept` (its own claim then hung the sweep). The wait now comes first, which
+    is what the rest of that block already assumed.
+
+    Pin: **`t-msg-peek`**, a new program, **47 claims**, green on a current host first
+    (`MPOS_ON_HOST=1`, 47 of 47) and built from the measured table rather than from the man
+    page - the two `MSG_TRUNC` readings (a datagram's length versus a stream's no-copy
+    count) are the ones a single sentence would have got wrong. `t-sock-flags` is
+    rewritten around what is still its subject: its two peek-refusal claims are the one
+    thing a served call makes false, so the file now pins the composition instead - a peek
+    on an empty queue with `MSG_DONTWAIT` is `EAGAIN`, with `MSG_TRUNC` beside it too, and
+    `MSG_DONTWAIT` alone is `EAGAIN` - 4 claims, green on the host. The old refusal was a
+    true statement about the kernel it was written against; the pin moved with the answer
+    rather than being deleted.
+
+    **Three shapes stay named rather than claimed.** A **raw** socket's peek: the host this
+    contract was measured on holds no `CAP_NET_RAW`, so the probe could not answer for that
+    family and the honest `EOPNOTSUPP` stays (named in §5.3). The other families' peeks
+    (`AF_UNIX` stream and datagram, NETLINK, PACKET, vsock) are untouched by this pass and
+    keep their refusals. And `recvmsg` with a **zero-length data room** still answers
+    `EINVAL` - a divergence older than this item, whose Linux answer is a consume (or, on a
+    stream, a 0), and which belongs to the message-door item rather than to the flag's.
+
+    Gate: x86_64 `pass=190 fail=0 (190 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33
+    (11 of 201 left out by `tests.toml`); aarch64 `pass=189 fail=0`, `mpos-kunit 32 passed, 0
+    failed`, reaching `=== END` (12 left out), and both programs' `ok:` lines are byte-identical
+    across the two machines. Host unit suite 582 passed, `xtask` 123; `cargo fmt --check` clean on
+    the touched files; clippy's warning set is the committed tree's, unmoved. The counterfactual is
+    the flag itself, one line and every pin kept: with `recv_common` put back to refusing **every**
+    peek (`if peek { return Err(err::EOPNOTSUPP) }` where the raw-only test now stands) the sweep is
+    `pass=188 fail=2 (190 built)`, and the two red programs are exactly `t-msg-peek` (its first
+    `expect` panics on the refusal, exit 134) and `t-sock-flags` (its two EAGAIN claims), every
+    other program green on both kernels.

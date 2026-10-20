@@ -5,6 +5,37 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **Real `MSG_PEEK` over TCP/UDP is served, and `MSG_TRUNC` is the message's own length.**
+  **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet this replaces said the flag
+  was refused `EOPNOTSUPP` because serving it needed peek-preserving delivery in the stack; the
+  prerequisite was never real - smoltcp's `tcp::peek`/`udp::peek` were already there - and what
+  was missing was the reading of the flag word. Measured whole on a current host first
+  (`.workbuddy/probe_msg_peek{,2,3,4}.c`, Linux 7.2.x): a UDP peek does not consume, a short one
+  copies what fitted and leaves the datagram **whole**, `MSG_TRUNC` answers the datagram's own
+  length, and a zero-length peek answers 0 (or the length, with `MSG_TRUNC`) without taking it;
+  a **non-peek** zero-length datagram receive *does* consume, and a short one copies the prefix
+  and drops the rest - Linux's truncation, where this kernel had answered `EMSGSIZE` from
+  `recv_slice`'s `Truncated`; a stream's `MSG_TRUNC` is a different rule - it answers the count
+  it would have copied and copies **nothing** (3 of 10 answers 3, 100 of 10 answers 10), and a
+  non-peek one consumes the bytes it counted; a zero-length stream receive answers 0 without
+  consuming, waits while nothing is readable, and answers 0 (not `EINTR`) when a signal ends that
+  wait; `recvmsg` reports a cut datagram with `MSG_TRUNC` in `msg_flags` even when the caller did
+  not ask for the flag and says nothing for a stream, and it still names the sender on a peek.
+  Served by `RecvAnswer { copied, full, endpoint }`, the two flags threaded into `recv_common`,
+  `tcp::Socket::peek` + an explicit dequeue, and `udp::Socket::peek` + a hand copy. Pins:
+  **`t-msg-peek`**, a new program, 47 claims green on a current host first, and the rewritten
+  `t-sock-flags` (4 claims) - its old refusal is the one thing a served call makes false, so the
+  file keeps the `DONTWAIT` half and the composition of peek with it instead of going red.
+  Gate: x86_64 `pass=190 fail=0 (190 built)`, aarch64 `pass=189 fail=0`, `mpos-kunit` 32/0 on
+  both, and both programs' `ok:` lines byte-identical across the machines. Counterfactual,
+  one line with every pin kept (every peek refused again): `pass=188 fail=2`, exactly the two
+  pins. `t-ns-net`'s own fixture was fixed on the way - it connected before the child's
+  listener announced itself, a race the new socket timing lost on aarch64.
+  **Three shapes stay named rather than claimed**: a **raw** socket's peek (the host this
+  contract was measured on has no `CAP_NET_RAW`, so it stays the honest `EOPNOTSUPP`); the other
+  families' peeks (`AF_UNIX`, NETLINK, PACKET, vsock) which this pass did not touch; and
+  `recvmsg` with a zero-length data room, whose `EINVAL` predates this item and is its own.
+
 - **The second machine's configuration space, and a skip that was a claim.** **Landed
   2026-10-19** (`docs/uapi/` §5.1 item 70) — aarch64 already enumerated its bus through the
   device tree's `pci-host-ecam-generic` window (`pci: ECAM is this machine's only mechanism

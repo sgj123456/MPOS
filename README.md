@@ -256,8 +256,10 @@ that seam (the switchboard itself is unchanged). `docs/notes/` Phase 11 (Step B)
 driver its own contract back.
 
 Deliberate divergences from Linux are collected per subsystem in `docs/notes/` — for example
-`SO_SNDBUF`/`SO_RCVBUF` are recorded but do not resize the stack's buffers, real `MSG_PEEK`
-over TCP/UDP is refused `EOPNOTSUPP`, and the `xattr` family validates and then refuses. They
+`SO_SNDBUF`/`SO_RCVBUF` are recorded but do not resize the stack's buffers (a datagram's send
+queue is sized by the number now), `MSG_PEEK` over TCP/UDP is served with Linux's own reading
+of `MSG_TRUNC` (a raw socket's peek is still refused), and the `xattr` family validates and
+then refuses. They
 are recorded there rather than hidden here.
 
 ---

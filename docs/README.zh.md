@@ -248,8 +248,8 @@ graph LR
 交还给各自驱动的计划。
 
 与 Linux 有意为之的分歧按子系统收集在 `docs/notes/` 中——例如 `SO_SNDBUF`/`SO_RCVBUF`
-会被记录但不会调整协议栈缓冲区的大小，TCP/UDP 上的真实 `MSG_PEEK` 被以 `EOPNOTSUPP` 拒绝，
-`xattr` 族先校验再拒绝。
+会被记录（数据报的发送队列现在按这个数字计），TCP/UDP 上的 `MSG_PEEK` 已按 Linux 的读数服务
+（`MSG_TRUNC` 返回消息本身长度；raw socket 的 peek 仍拒绝），`xattr` 族先校验再拒绝。
 它们记录在那里，而不是藏在这里。
 
 ---

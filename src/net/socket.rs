@@ -2202,7 +2202,7 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool)
                 handle: sock_handle,
                 peer,
                 bound,
-                ..
+                local,
             } = &mut entry.channel
             else {
                 return Err(err::ENOTSOCK);
@@ -2225,6 +2225,11 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool)
                     return Err(err::EADDRINUSE);
                 }
                 *bound = true;
+                // The implicit bind is a bind: `getsockname` answers from this
+                // record, and a socket that sent without one used to report
+                // `0.0.0.0:0` while its datagrams carried a real port - a
+                // divergence `t-msg-peek`'s source-name claim found.
+                *local = Some(IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), port));
             }
             let sock = stack
                 .sockets_mut(*home)
@@ -2538,19 +2543,26 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     if let Err(e) = validate_source_slot(src) {
         return e;
     }
-    if args[3] & MSG_PEEK != 0 {
-        // `MSG_PEEK` without consuming is not implemented on the IP path. The
-        // honest answer is `EOPNOTSUPP`, matching the `AF_UNIX`, `NETLINK` and
-        // `PACKET` families above; the old behaviour - consume the datagram and
-        // report success - silently destroyed a byte the caller expected to read
-        // again. Real peek-preserving delivery is a named sub-gap (§12.2).
-        return err::EOPNOTSUPP;
-    }
     // The wait is decided by the call flags too, not only the descriptor's
     // `O_NONBLOCK`: `MSG_DONTWAIT` earns `EAGAIN` here as it does for the other
     // families, which is what `dontwait` already encodes.
     let nonblock = dontwait(fd, args[3]);
-    recv_common(handle, out, src, nonblock)
+    // `MSG_PEEK` looks at the front of the queue without taking it, and
+    // `MSG_TRUNC` asks for the message's own length rather than the part that
+    // fitted. Both are the measured Linux answers on this path now; the two
+    // lengths `RecvAnswer` carries are what separates them.
+    let peek = args[3] & MSG_PEEK != 0;
+    let truncate = args[3] & MSG_TRUNC as usize != 0;
+    match recv_common(handle, out, src, nonblock, peek, truncate) {
+        Ok(answer) => {
+            if truncate {
+                answer.full as isize
+            } else {
+                answer.copied as isize
+            }
+        }
+        Err(e) => e,
+    }
 }
 
 /// `recvmsg(fd, msghdr, flags)` - scatter-gather receive. The first non-empty
@@ -2940,16 +2952,17 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         );
     }
     let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
-    if args[2] & MSG_PEEK != 0 {
-        // As in `recvfrom`: the IP path does not peek without consuming, and
-        // refuses honestly rather than eating the datagram. §12.2 B2.
-        return err::EOPNOTSUPP;
-    }
     let nonblock = dontwait(fd, args[2]);
-    let n = match recv_common(handle, out, src, nonblock) {
-        n if n >= 0 => n as usize,
-        e => return e,
+    // The two readings `recvfrom` reads off the same flag word (`MSG_PEEK` and
+    // `MSG_TRUNC`), plus what `recvmsg` alone can say: `msg_flags` reports a
+    // datagram the buffer cut even though the count returned is the copy's.
+    let peek = args[2] & MSG_PEEK != 0;
+    let truncate = args[2] & MSG_TRUNC as usize != 0;
+    let answer = match recv_common(handle, out, src, nonblock, peek, truncate) {
+        Ok(answer) => answer,
+        Err(e) => return e,
     };
+    let n = answer.copied;
     if !crate::uaccess::buffer_ok(msghdr, MSGHDR_SIZE, true, from_user) {
         return err::EFAULT;
     }
@@ -2991,14 +3004,35 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             ((msghdr + MSGHDR_CONTROLLEN) as *mut u64).write_volatile(0);
         }
     }
+    // `msg_flags` reports a datagram the buffer cut with `MSG_TRUNC`; a stream
+    // has no message boundary to cut, and its own length is the copy's, so the
+    // bit stays clear there (measured on both families, `.workbuddy/`
+    // `probe_msg_peek4.c`).
+    let cut = answer.full > answer.copied;
     unsafe {
-        ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(0);
+        ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(if cut { MSG_TRUNC } else { 0 });
     }
-    n as isize
+    if truncate {
+        answer.full as isize
+    } else {
+        n as isize
+    }
+}
+
+/// What a receive answered. `copied` is how many bytes went into the caller's
+/// buffer; `full` is the message's own length, which differs from it only for
+/// a datagram the buffer cut. The two are kept apart because `MSG_TRUNC`
+/// returns `full` while the copy is `copied`, and because `recvmsg`'s
+/// `msg_flags` names the cut with a bit of its own - a short count alone
+/// cannot tell "exactly filled" from "cut off".
+struct RecvAnswer {
+    copied: usize,
+    full: usize,
+    endpoint: Option<IpEndpoint>,
 }
 
 enum RecvStep {
-    Got(usize, Option<IpEndpoint>),
+    Got(usize, usize, Option<IpEndpoint>),
     Wait,
     Err(isize),
 }
@@ -3008,12 +3042,14 @@ fn recv_common(
     out: &mut [u8],
     src: Option<(usize, usize)>,
     nonblock: bool,
-) -> isize {
+    peek: bool,
+    truncate: bool,
+) -> Result<RecvAnswer, isize> {
     let typ = super::with(handle, |_, entry| entry.typ);
     if typ.is_some() {
         let v6 = super::with(handle, |_, entry| matches!(entry.channel, Channel::Inet6));
         if v6.unwrap_or(false) {
-            return err::ENETUNREACH;
+            return Err(err::ENETUNREACH);
         }
         // A listening socket has no data of its own to read - the connections
         // it has accepted are their own descriptors - and Linux answers
@@ -3023,26 +3059,54 @@ fn recv_common(
             matches!(entry.channel, Channel::TcpListen { .. })
         });
         if listening.unwrap_or(false) {
-            return err::ENOTCONN;
+            return Err(err::ENOTCONN);
         }
     }
-    let received = match typ {
-        Some(SOCK_STREAM) => tcp_recv(handle, out, nonblock),
-        Some(SOCK_DGRAM) => udp_recv(handle, out, nonblock),
-        Some(SOCK_RAW) => raw_recv(handle, out, nonblock),
-        Some(_) => return err::EINVAL,
-        None => return err::EBADF,
+    // A raw socket's peek is not measured: the host this kernel's contract was
+    // measured on holds no `CAP_NET_RAW`, so the probe could not answer for
+    // that family. The honest refusal it has always given stays, and
+    // `docs/uapi/` §5.3 names it rather than guessing Linux's shape.
+    if peek && typ == Some(SOCK_RAW) {
+        return Err(err::EOPNOTSUPP);
+    }
+    let answer = match typ {
+        Some(SOCK_STREAM) => tcp_recv(handle, out, nonblock, peek, truncate)?,
+        Some(SOCK_DGRAM) => udp_recv(handle, out, nonblock, peek)?,
+        Some(SOCK_RAW) => {
+            let (copied, endpoint) = raw_recv(handle, out, nonblock)?;
+            RecvAnswer {
+                copied,
+                full: copied,
+                endpoint,
+            }
+        }
+        Some(_) => return Err(err::EINVAL),
+        None => return Err(err::EBADF),
     };
-    let (n, endpoint) = match received {
-        Ok(answer) => answer,
-        Err(e) => return e,
-    };
-    if let (Some((addr_ptr, len_ptr)), Some(endpoint)) = (src, endpoint)
+    if let (Some((addr_ptr, len_ptr)), Some(endpoint)) = (src, answer.endpoint)
         && write_sockaddr_in(addr_ptr, len_ptr, endpoint).is_err()
     {
-        return err::EFAULT;
+        return Err(err::EFAULT);
     }
-    n as isize
+    Ok(answer)
+}
+
+/// Drop `n` bytes a stream's receive buffer holds, without copying them.
+/// `recv` hands out one contiguous run per call, so a ring that wrapped takes
+/// two turns; the count never exceeds what `peek` just returned.
+fn dequeue_stream(sock: &mut tcp::Socket, mut n: usize) {
+    while n > 0 {
+        let taken = sock
+            .recv(|data| {
+                let k = n.min(data.len());
+                (k, k)
+            })
+            .unwrap_or(0);
+        if taken == 0 {
+            break;
+        }
+        n -= taken;
+    }
 }
 
 /// Pull bytes from a stream socket. End of stream is `Ok(0)` - a FIN read to
@@ -3050,11 +3114,26 @@ fn recv_common(
 /// wait-and-retry case, exactly as a pipe read behaves. smoltcp spells the
 /// two zero cases differently: an empty buffer is `Ok(0)`, a drained FIN is
 /// `Err(Finished)`.
+///
+/// `peek` is `MSG_PEEK`: look at the front of the buffer without dequeuing it.
+/// `truncate` is `MSG_TRUNC`, whose meaning on a stream is not the datagram's
+/// - measured on a current host, a stream's `MSG_TRUNC` receives answer the
+/// number of bytes they *would* have copied and copy nothing (`.workbuddy/`
+/// `probe_msg_peek4.c`: 3 of 10 answers 3, 100 of 10 answers 10, and the
+/// caller's buffer is untouched in both).
 fn tcp_recv(
     handle: usize,
     out: &mut [u8],
     nonblock: bool,
-) -> Result<(usize, Option<IpEndpoint>), isize> {
+    peek: bool,
+    truncate: bool,
+) -> Result<RecvAnswer, isize> {
+    // A zero-length receive is Linux's readiness question with a zero-byte
+    // answer: it can park and it can be interrupted, and what it answers is 0
+    // either way. Measured on a current host (same probe): with data queued it
+    // answers 0 at once and takes nothing; with nothing queued it parks, and a
+    // signal that ends the park still answers 0 rather than `EINTR`.
+    let empty = out.is_empty();
     loop {
         let step = super::with(handle, |stack, entry| {
             stack.poll_once();
@@ -3078,10 +3157,37 @@ fn tcp_recv(
             if sock.may_recv() {
                 *connected = true;
             }
-            match sock.recv_slice(out) {
-                Ok(0) => RecvStep::Wait,
-                Ok(n) => RecvStep::Got(n, None),
-                Err(tcp::RecvError::Finished) => RecvStep::Got(0, None),
+            if empty {
+                if sock.can_recv() {
+                    return RecvStep::Got(0, 0, None);
+                }
+                return match sock.peek(1) {
+                    Ok(_) => RecvStep::Wait,
+                    Err(tcp::RecvError::Finished) => RecvStep::Got(0, 0, None),
+                    Err(tcp::RecvError::InvalidState) => RecvStep::Err(if *connected {
+                        err::ECONNRESET
+                    } else {
+                        err::ENOTCONN
+                    }),
+                };
+            }
+            // `peek` rather than `peek_slice`: the latter skips smoltcp's own
+            // receive-state check, so a reset would read as an empty buffer
+            // rather than the `ECONNRESET`/`ENOTCONN` pair below. A zero-length
+            // chunk with the connection open is "nothing yet", the same answer
+            // an empty receive buffer gives - but `Finished` is **not** that
+            // answer: it is end of stream, which is a report (`0`) and not a
+            // wait. Conflating them parks a peek at EOF for ever, which is what
+            // the pin caught on its first guest run.
+            let copied = match sock.peek(out.len()) {
+                Ok(chunk) => {
+                    let n = chunk.len();
+                    if n > 0 && !truncate {
+                        out[..n].copy_from_slice(chunk);
+                    }
+                    Some(n)
+                }
+                Err(tcp::RecvError::Finished) => None,
                 // A read that cannot proceed, and the two reasons are not the
                 // same answer: a connection that was **reset** reports
                 // `ECONNRESET`, while one that never carried a connection
@@ -3090,15 +3196,33 @@ fn tcp_recv(
                 // `InvalidState` - an `RST` clears the tuple, so the socket is
                 // indistinguishable from a fresh one - which is why the
                 // `connected` record has to decide it.
-                Err(tcp::RecvError::InvalidState) => RecvStep::Err(if *connected {
-                    err::ECONNRESET
-                } else {
-                    err::ENOTCONN
-                }),
+                Err(tcp::RecvError::InvalidState) => {
+                    return RecvStep::Err(if *connected {
+                        err::ECONNRESET
+                    } else {
+                        err::ENOTCONN
+                    });
+                }
+            };
+            match copied {
+                None => RecvStep::Got(0, 0, None),
+                Some(0) => RecvStep::Wait,
+                Some(n) => {
+                    if !peek {
+                        dequeue_stream(sock, n);
+                    }
+                    RecvStep::Got(n, n, None)
+                }
             }
         });
         match step {
-            Some(RecvStep::Got(n, ep)) => return Ok((n, ep)),
+            Some(RecvStep::Got(copied, full, ep)) => {
+                return Ok(RecvAnswer {
+                    copied,
+                    full,
+                    endpoint: ep,
+                });
+            }
             Some(RecvStep::Err(e)) => return Err(e),
             Some(RecvStep::Wait) | None => {}
         }
@@ -3106,21 +3230,44 @@ fn tcp_recv(
             return Err(err::EWOULDBLOCK);
         }
         if crate::sched::has_deliverable_signal() {
-            return Err(err::EINTR);
+            return if empty {
+                Ok(RecvAnswer {
+                    copied: 0,
+                    full: 0,
+                    endpoint: None,
+                })
+            } else {
+                Err(err::EINTR)
+            };
         }
         if park_until(|| super::socket_ready(handle).read) == err::EINTR {
-            return Err(err::EINTR);
+            return if empty {
+                Ok(RecvAnswer {
+                    copied: 0,
+                    full: 0,
+                    endpoint: None,
+                })
+            } else {
+                Err(err::EINTR)
+            };
         }
     }
 }
 
 /// Take one datagram. A first receive on an unbound socket binds an anonymous
 /// port, so a reply can find its way back.
+///
+/// `peek` is `MSG_PEEK`. The whole payload is copied by hand rather than with
+/// smoltcp's `recv_slice`, because that call *drops* a datagram the buffer
+/// cannot hold and reports `Truncated` - Linux answers the bytes that fitted
+/// and, for `recvmsg`, sets `MSG_TRUNC` in `msg_flags`; the count and the cut
+/// are then the two lengths `RecvAnswer` carries.
 fn udp_recv(
     handle: usize,
     out: &mut [u8],
     nonblock: bool,
-) -> Result<(usize, Option<IpEndpoint>), isize> {
+    peek: bool,
+) -> Result<RecvAnswer, isize> {
     loop {
         let step = super::with(handle, |stack, entry| {
             stack.poll_once();
@@ -3128,6 +3275,7 @@ fn udp_recv(
                 home,
                 handle: sock_handle,
                 bound,
+                local,
                 ..
             } = &mut entry.channel
             else {
@@ -3142,21 +3290,47 @@ fn udp_recv(
                     return RecvStep::Err(err::EADDRINUSE);
                 }
                 *bound = true;
+                // The first receive is a bind too, and `getsockname` answers
+                // from this record rather than from the socket - the same
+                // reason the send path records it.
+                *local = Some(IpEndpoint::new(IpAddress::v4(0, 0, 0, 0), port));
             }
             let sock = stack
                 .sockets_mut(*home)
                 .get_mut::<udp::Socket>(*sock_handle);
-            match sock.recv_slice(out) {
-                Ok((n, meta)) => RecvStep::Got(n, Some(meta.endpoint)),
+            // `peek` is the one read: it hands back the whole payload and the
+            // sender without dequeuing. A caller that did not ask to peek gets
+            // the same message taken off the front afterwards, so the two
+            // shapes share one copy and cannot disagree about what fitted.
+            let answer = sock.peek().map(|(payload, meta)| {
+                let full = payload.len();
+                let n = full.min(out.len());
+                out[..n].copy_from_slice(&payload[..n]);
+                (n, full, meta.endpoint)
+            });
+            match answer {
+                Ok((copied, full, endpoint)) => {
+                    if !peek {
+                        let _ = sock.recv();
+                    }
+                    RecvStep::Got(copied, full, Some(endpoint))
+                }
                 Err(udp::RecvError::Exhausted) => RecvStep::Wait,
-                // The datagram did not fit and smoltcp dropped it: there is
-                // no partial answer to give, so the caller hears that the
-                // packet was too big rather than reading nothing forever.
+                // `peek` never truncates - it hands back the whole payload -
+                // so this arm is unreachable, and it is still an answer rather
+                // than a panic because a `RecvError` is not this kernel's to
+                // promise against.
                 Err(udp::RecvError::Truncated) => RecvStep::Err(err::EMSGSIZE),
             }
         });
         match step {
-            Some(RecvStep::Got(n, ep)) => return Ok((n, ep)),
+            Some(RecvStep::Got(copied, full, ep)) => {
+                return Ok(RecvAnswer {
+                    copied,
+                    full,
+                    endpoint: ep,
+                });
+            }
             Some(RecvStep::Err(e)) => return Err(e),
             Some(RecvStep::Wait) | None => {}
         }

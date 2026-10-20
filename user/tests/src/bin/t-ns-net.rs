@@ -970,43 +970,48 @@ fn main() {
                 gift_port != 0,
             );
             let mut handover = None;
+            // The child announces its listener only after `bind`+`listen`, and
+            // that announcement is what makes the connect below a rendezvous
+            // rather than a race: connecting first was reading the child's
+            // scheduling, and a run that lost the race failed the handover and
+            // left the child parked in `accept`. Measured on the aarch64 sweep
+            // when a socket-timing change moved the parent ahead of the child.
+            let mut ready = [0u8; 16];
             if let Ok(gift) = &gift
+                && read_line(&up_r, &mut ready) > 0
                 && let Ok(path) = rustix::net::SocketAddrUnix::new(PATH)
                 && let Ok(conn) = socket(AddressFamily::UNIX, SocketType::STREAM, None)
                     .and_then(|c| connect(&c, &path).map(|()| c))
             {
-                let mut ready = [0u8; 16];
-                if read_line(&up_r, &mut ready) > 0 {
-                    // Tell the child the address to expect, then hand it over.
-                    let tell = format!("{gift_port}\n");
-                    let _ = write(&down_w, tell.as_bytes());
-                    drop(down_w);
-                    let mut control = [0u8; 24];
-                    unsafe {
-                        let hdr = control.as_mut_ptr() as *mut libc::cmsghdr;
-                        (*hdr).cmsg_len = 20; // CMSG_LEN(sizeof(int))
-                        (*hdr).cmsg_level = libc::SOL_SOCKET;
-                        (*hdr).cmsg_type = libc::SCM_RIGHTS;
-                        core::ptr::copy_nonoverlapping(
-                            gift.as_raw_fd().to_ne_bytes().as_ptr(),
-                            control.as_mut_ptr().add(16),
-                            4,
-                        );
-                    }
-                    let mut byte = *b"x";
-                    let mut iov = libc::iovec {
-                        iov_base: &mut byte as *mut u8 as *mut libc::c_void,
-                        iov_len: 1,
-                    };
-                    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
-                    msg.msg_iov = &mut iov;
-                    msg.msg_iovlen = 1;
-                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                    // musl's `msghdr` keeps the control length in a `socklen_t`.
-                    msg.msg_controllen = control.len() as u32;
-                    let rc = unsafe { libc::sendmsg(conn.as_raw_fd(), &msg, 0) };
-                    handover = Some(rc == 1);
+                // Tell the child the address to expect, then hand it over.
+                let tell = format!("{gift_port}\n");
+                let _ = write(&down_w, tell.as_bytes());
+                drop(down_w);
+                let mut control = [0u8; 24];
+                unsafe {
+                    let hdr = control.as_mut_ptr() as *mut libc::cmsghdr;
+                    (*hdr).cmsg_len = 20; // CMSG_LEN(sizeof(int))
+                    (*hdr).cmsg_level = libc::SOL_SOCKET;
+                    (*hdr).cmsg_type = libc::SCM_RIGHTS;
+                    core::ptr::copy_nonoverlapping(
+                        gift.as_raw_fd().to_ne_bytes().as_ptr(),
+                        control.as_mut_ptr().add(16),
+                        4,
+                    );
                 }
+                let mut byte = *b"x";
+                let mut iov = libc::iovec {
+                    iov_base: &mut byte as *mut u8 as *mut libc::c_void,
+                    iov_len: 1,
+                };
+                let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                // musl's `msghdr` keeps the control length in a `socklen_t`.
+                msg.msg_controllen = control.len() as u32;
+                let rc = unsafe { libc::sendmsg(conn.as_raw_fd(), &msg, 0) };
+                handover = Some(rc == 1);
             }
             r.check(
                 "the parent hands a descriptor over the machine-wide unix registry",

@@ -426,6 +426,32 @@ owns, and here for all of them, since reaching a driver is still what this kerne
 do. Pins: `t-mknod`'s five new claims (its `ok:` lines identical on the two machines, and every one
 of them green on the host's Linux first) and `vfs::ramfs`'s two new unit tests.
 
+**`MSG_PEEK` looks without taking, and the stack's own `peek` was the missing door**
+(`docs/uapi/` §5.1 item 72, landed 2026-10-20): the last flag-word item on the IP receive path, and
+the one §5.3 had parked behind a prerequisite that never existed — `tcp::Socket::peek` and
+`udp::Socket::peek` have been in the stack all along, and what was missing was the reading of two
+flags. Both doors refused `MSG_PEEK` with `EOPNOTSUPP` (honest while a peek could not be
+preserved) and `t-sock-flags` pinned that. Measured whole on a current host first
+(`.workbuddy/probe_msg_peek{,2,3,4}.c`, Linux 7.2.x): a datagram peek does not consume and a short
+one leaves the message whole, `MSG_TRUNC` answers the datagram's own length, and a zero-length
+non-peek receive *does* consume (a zero-length peek does not); a stream's `MSG_TRUNC` is a
+different rule — it answers the count it would have copied and copies **nothing**, consuming what
+it counted unless asked to peek — and a zero-length stream receive answers 0 (even when a signal
+ends its wait) without taking a byte. `recvmsg` reports a cut datagram with `MSG_TRUNC` in
+`msg_flags` whether or not the caller asked, says nothing for a stream, and still names the sender
+on a peek. The fix keeps the copy's length apart from the message's (`RecvAnswer { copied, full,
+endpoint }`), threads the two flags through `recv_common`, reads with smoltcp's `peek` and an
+explicit dequeue, and copies datagrams by hand — which also replaces the `EMSGSIZE` a short
+non-peek datagram used to draw with Linux's truncation. Pins: the new `t-msg-peek` (47 claims,
+green on the host first, the two `MSG_TRUNC` readings among them) and a rewritten `t-sock-flags`
+whose peek-refusal claim the served answer made false. Named: a **raw** socket's peek (the host
+has no `CAP_NET_RAW`, so it stays the honest refusal), the other families' peeks, and `recvmsg`'s
+zero-length data room, which predates this item. Gate: x86_64 `pass=190 fail=0`, aarch64
+`pass=189 fail=0`, `mpos-kunit` 32/0 on both, both pins' `ok:` lines byte-identical; the
+counterfactual (every peek refused again, one line) is `pass=188 fail=2`, exactly the two
+pins. The pass also fixed `t-ns-net`'s handover fixture, which connected before the child's
+listener announced itself - a race the new socket timing lost on aarch64.
+
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
 record-only was wrong in both halves - the figure stored was the caller's rather than Linux's,  

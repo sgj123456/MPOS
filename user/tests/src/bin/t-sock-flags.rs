@@ -1,38 +1,30 @@
 //! t-sock-flags - what the IP socket flag word owes a caller.
 //!
-//! Two contracts the `AF_INET` receive path used to break, both silent:
-//!
-//! * `MSG_PEEK` must not consume what it looks at. This kernel does not
-//!   implement peek-preserving delivery over the IP path, so the honest answer
-//!   is `EOPNOTSUPP` - the same one the `AF_UNIX`, `NETLINK` and `PACKET`
-//!   families already give. Before this, the flag was not consulted at all and
-//!   a peek **consumed the datagram and reported success**: a caller that asked
-//!   to look without taking had its byte destroyed and never learned. Worse
-//!   than refusing, because the corruption is undetectable. (Real `MSG_PEEK` is
-//!   a named sub-gap in `NOTES.md` §12.2.)
+//! Two contracts the `AF_INET` receive path used to break. The first has since
+//! been *served* rather than refused, so this file keeps only the half that is
+//! still its subject:
 //!
 //! * `MSG_DONTWAIT` must end the wait with `EAGAIN` instead of parking. Before
 //!   this, the IP tail decided nonblocking from the descriptor's `O_NONBLOCK`
 //!   only, so a `recv` asked not to wait still slept forever on an empty queue.
 //!
-//! Both are pinned without any data on the socket: the peek refusal comes
-//! before the wait, and the `DONTWAIT` answer is what an empty queue gives. Run
-//! without the fix, the `MSG_PEEK` call here blocks (no data, flag ignored) and
-//! the `MSG_DONTWAIT` call blocks too - so the test hangs, which is exactly the
-//! counterfactual.
+//! * `MSG_PEEK` used to be refused `EOPNOTSUPP` here (the honest answer while
+//!   peek-preserving delivery did not exist, and what this program pinned).
+//!   The IP path serves it now - see `t-msg-peek` for the whole measured
+//!   contract - so what is left to pin about a peek in *this* file is that the
+//!   flag word composes: a peek on an empty queue is a wait like any other, so
+//!   `MSG_PEEK|MSG_DONTWAIT` answers `EAGAIN` and never a refusal.
 //!
-//! **Host divergence, and why the socket is made non-blocking there.** Linux
-//! *does* implement `MSG_PEEK`: on an empty socket it waits for a datagram, and
-//! this program has no peer to send one, so the honest host spelling of "no
-//! answer yet" is `EAGAIN` once the descriptor is `O_NONBLOCK` - never the
-//! `EOPNOTSUPP` this kernel refuses with. Two things follow from that, and both
-//! are in the code below rather than in a comment: a host run sets
-//! `O_NONBLOCK` *first*, because a claim that can park is worse than one that
-//! fails (measured on a peerless socket: `recvfrom(MSG_PEEK)` waits), and the
-//! two peek claims accept `EAGAIN` beside the refusal, naming the gap instead
-//! of pinning Linux's answer as this kernel's.
+//! Both are pinned on an empty socket: `MSG_DONTWAIT`'s answer is what an empty
+//! queue gives, and a peek that ignored the flag would hang here - a claim that
+//! blocks reads as a hang, which is worse than one that fails.
+//!
+//! The descriptor is made non-blocking on a host run as well (`t-msg-peek`'s
+//! rule): a claim that can park is worse than one that fails, and the flags
+//! under test are the call's, not the descriptor's - so the answers are the
+//! same either way.
 
-use mpos_user_tests::{Report, host_run};
+use mpos_user_tests::Report;
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::Errno;
 use rustix::net::{AddressFamily, RecvFlags, SocketType, recvfrom, socket};
@@ -48,10 +40,7 @@ fn recv_answer(fd: &rustix::fd::OwnedFd, flags: RecvFlags) -> i32 {
     }
 }
 
-/// Linux's "nothing to read" and this kernel's "not offered", looked up rather
-/// than written down: both sides of every claim below are these two numbers.
 const AGAIN: i32 = -(Errno::AGAIN.raw_os_error());
-const OPNOTSUPP: i32 = -(Errno::OPNOTSUPP.raw_os_error());
 
 fn main() {
     println!("t-sock-flags");
@@ -66,40 +55,35 @@ fn main() {
         Err(_) => r.finish(),
     };
 
-    // A host run makes the descriptor non-blocking before any claim is made:
-    // Linux's peek waits for a datagram that no peer will send, and a claim
-    // that hangs is worse than one that reads a different errno. This kernel's
-    // answers do not depend on the descriptor's flag, so the pinning is the
-    // same file either way.
-    if host_run() {
-        match fcntl_getfl(&fd) {
-            Ok(flags) => {
-                let _ = fcntl_setfl(&fd, flags | OFlags::NONBLOCK);
-            }
-            Err(e) => println!("note: fcntl(F_GETFL) answered {}", e),
+    // A descriptor whose own flag could park would hide the call's answer, so
+    // `O_NONBLOCK` is set beside the `MSG_DONTWAIT` under test.
+    match fcntl_getfl(&fd) {
+        Ok(flags) => {
+            let _ = fcntl_setfl(&fd, flags | OFlags::NONBLOCK);
         }
+        Err(e) => println!("note: fcntl(F_GETFL) answered {}", e),
     }
 
-    // `MSG_PEEK` is refused rather than answered by consuming. The socket is
-    // empty, so the only correct non-hanging answer is the refusal - and on a
-    // host, which implements peek, the empty queue's own answer.
-    let peek = recv_answer(&fd, RecvFlags::PEEK);
-    r.check(
-        "MSG_PEEK is refused EOPNOTSUPP, not a consumed datagram",
-        peek == OPNOTSUPP || host_run() && peek == AGAIN,
-    );
-
-    // The peek refusal wins before any wait, so it stands even with
-    // `MSG_DONTWAIT` alongside it.
+    // `MSG_PEEK` is served now, and a peek on an empty queue is still a wait:
+    // the flags compose rather than one of them overriding the other.
     let peek_nowait = recv_answer(&fd, RecvFlags::PEEK | RecvFlags::DONTWAIT);
     r.check(
-        "peek is refused even together with MSG_DONTWAIT",
-        peek_nowait == OPNOTSUPP || host_run() && peek_nowait == AGAIN,
+        "MSG_PEEK on an empty socket with MSG_DONTWAIT answers EAGAIN",
+        peek_nowait == AGAIN,
+    );
+
+    // The same with `MSG_TRUNC`, which changes what a *datagram* answers and
+    // nothing about an empty queue.
+    let peek_trunc = recv_answer(
+        &fd,
+        RecvFlags::PEEK | RecvFlags::DONTWAIT | RecvFlags::TRUNC,
+    );
+    r.check(
+        "and MSG_TRUNC beside them does not change that answer",
+        peek_trunc == AGAIN,
     );
 
     // `MSG_DONTWAIT` alone on an empty queue answers `EAGAIN` now, not a park.
-    // Both kernels agree here, which is what makes the two lines above the
-    // divergence they are: the gap is peek, not the wait.
     let dontwait = recv_answer(&fd, RecvFlags::DONTWAIT);
     r.check(
         "MSG_DONTWAIT on an empty socket answers EAGAIN, not forever",

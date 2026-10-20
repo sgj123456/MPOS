@@ -106,9 +106,11 @@ The rows this module owns are in `docs/uapi/`: the `socket`/`bind`/`connect`/
 (`0x89xx`) interface-ioctl row that routes through `fs/ioctl.rs`, and the
 structure-layout rows for `struct sockaddr_ll`, `struct nlmsghdr`/`rtattr`/
 `ifa*msg` and `struct ifreq` in §4. The gaps — record-only `SO_SNDBUF`/
-`SO_RCVBUF`, `AF_PACKET` `SOCK_RAW`, the named `SOCK_SEQPACKET` stream, `MSG_PEEK` — are
-listed in docs/uapi/ §5.2, with the module gate's consequence for host
-testing in §5.4. That file is the inventory; this page does not duplicate its
+`SO_RCVBUF`, the named `SOCK_SEQPACKET` stream, and a **raw** socket's `MSG_PEEK` — are
+listed in docs/uapi/ §5.2/§5.3, with the module gate's consequence for host
+testing in §5.4.
+(`AF_PACKET` `SOCK_RAW` is served, and `MSG_PEEK` over TCP/UDP landed on 2026-10-20 —
+`docs/uapi/` §5.1 item 72.) That file is the inventory; this page does not duplicate its
 rows.
 
 ## Pins
