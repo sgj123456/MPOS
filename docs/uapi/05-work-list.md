@@ -3992,3 +3992,74 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `xtask` 123; `cargo fmt --check` and clippy clean on the touched files; the depgraph ratchet
     holds — the new call is `syscall → sched`, an edge that already exists, and no lower layer
     reaches into `syscall`.
+
+## item 76 — AF_UNIX's receive doors look without taking, and a datagram's `MSG_TRUNC` is its own length
+
+    The last two flag words on this family's receive path, and both used to be refused
+    `EOPNOTSUPP` on every unix door: `recvfrom`/`recv` and `recvmsg`, stream, datagram and
+    sequenced-packet alike. The refusal was honest while a pipe could not look at its front
+    without taking it, but the flags are what a large part of userland composes with - a
+    supervisor that wants to see whether a whole message has arrived peeks first, and a
+    caller that wants the message's length without room for it asks for `MSG_TRUNC`.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_unix_peek{,2,3,4,5,6,7}.c`,
+    Linux 7.2.x), and two of the shapes are not what the flags suggest:
+
+    * **a stream peek copies and takes nothing.** A 4-byte look at ten queued bytes answers 4,
+      fills the caller's buffer with `abcd`, and the next read still returns all ten; the look
+      is repeatable, a zero-length look answers 0 at once, and a look at end-of-stream answers
+      0. A four-byte look at a ten-byte stream with `MSG_TRUNC` is **the same call**: it answers
+      4, copies the four bytes and leaves all ten.
+    * **a stream's `MSG_TRUNC` is not a datagram's.** A four-byte read answers 4, copies the
+      four and consumes them - indistinguishable from the read without the flag. (This
+      kernel's *TCP* receive is the count-only rule; the families differ, which is why the pin
+      lives here.)
+    * **a datagram peek is a full copy of the queue's front.** A short look answers 4 and
+      leaves the message whole; with `MSG_TRUNC` the *return* is the message's own length (10)
+      while the copy stays 4; `recvmsg` sets `MSG_TRUNC` in `msg_flags` whether or not the
+      caller asked. A zero-length peek answers 0 without consuming, a zero-length **non-peek**
+      receive consumes, and a `recv`/`recvfrom`/`recvmsg` with `MSG_TRUNC` answers the
+      message's length while consuming it.
+    * **`SCM_RIGHTS` survives a peek.** A peek that has control room installs the descriptors
+      the front send carried and leaves the record queued, so the read that consumes its bytes
+      installs a second set - both live. A *zero-byte* handover is not readable at all: `recv`
+      and `recvfrom` answer `EAGAIN` until a byte arrives (`probe_unix_peek6.c`).
+    * **a datagram peek names its sender**, exactly as the consuming receive does.
+
+    **The landing** is three pieces. `PipeEnd::peek_once` copies the ring's front without
+    moving the cursor, and `PipeEnd::peek_scm` clones the front handover rather than taking it
+    (so the peek's copies share the queued files' descriptions, Linux's `get_file` shape);
+    `DuplexEnd` forwards both. `UnixSock::peek_dgram` clones the front `Dgram` and leaves the
+    queue alone, and both `take_dgram` and `peek_dgram` answer a `RecvDgram` carrying the
+    message's **whole length**, which is what `MSG_TRUNC` reports. Both receive doors route
+    `MSG_PEEK` to the look and `MSG_TRUNC` to the datagram return; the stream arms deliberately
+    ignore `MSG_TRUNC`, because on this family it changes nothing. A channel peek parks on the
+    same readiness a read does (`poll_ready`, the hangupless "bytes or EOF" question) and
+    reports `EINTR` when a signal ends the wait, but a queued zero-byte handover is **not**
+    readiness here: Linux answers `EAGAIN` and only `recvmsg` with control room is the door
+    that receives it, which is what `probe_unix_peek6.c` measured.
+
+    **Pin**: **`t-unix-peek`**, a new program, **63 claims** - stream, datagram and seqpacket
+    peeks, both `MSG_TRUNC` shapes on each, `recvmsg`'s `msg_flags`, the sender name through an
+    abstract address, and the handover that a peek installs twice - green on a current host
+    first (63 of 63) and all 63 green on both machines. Beside it, two host unit tests
+    in `vfs::pipe`: a peek is repeatable and leaves the read's bytes, and a peeked handover is
+    delivered again to the read.
+
+    **Counterfactual** - the four peek refusals restored (the way the kernel answered before
+    this item), everything else kept: x86_64 `pass=191 fail=1 (192 built)`,
+    `mpos-kunit 32 passed, 0 failed`, exit 33, and the one red program is **`t-unix-peek`**
+    with **18 of its 63 claims** red - every peek claim, the `MSG_TRUNC` peek returns included
+    - while the ordinary reads, the zero-length consuming receive and the sender-name half
+    stay green.
+
+    Gate: x86_64 `pass=192 fail=0 (192 built)`, `mpos-kunit 32 passed, 0 failed`, exit 33;
+    aarch64 `pass=191 fail=0` (13 left out), `mpos-kunit 32 passed, 0 failed`, reaching
+    `=== END`. Host unit suite 584 (was 582), `xtask` 123; `cargo fmt --check` and clippy
+    clean on the touched files; the depgraph ratchet holds - the change adds no edge.
+    Named rather than served: the **other families'** peeks (`NETLINK`, `AF_PACKET`, vsock) are
+    still refused; the vsock `recvmsg` still reads its chain's first segment; and a **zero-byte
+    `SCM_RIGHTS` handover on a stream** is receivable through `recvmsg` here, where Linux
+    answers `EAGAIN` on every door until bytes arrive - the existing `empty_handover` path
+    keeps that deliberate trade (the deadlock it avoids was the datagram udev channel's), and
+    this item's measurement is the first thing that charges it.

@@ -464,6 +464,69 @@ fn on_channel<T>(file: &Arc<crate::vfs::File>, f: impl FnOnce(&DuplexEnd) -> T) 
     }
 }
 
+/// Park until a channel has something a read would act on - bytes, end of
+/// stream, or a descriptor handover already due - answering `0` when it does
+/// and `EINTR` when a catchable signal ends the wait. The same condition the
+/// zero-length receive in `recvmsg` asks, kept in one place so a peek and a
+/// read cannot wait on different events.
+fn wait_channel(file: &Arc<crate::vfs::File>) -> isize {
+    let ready =
+        || file.inode().poll_ready().read || on_channel(file, |c| c.scm_due()).unwrap_or(false);
+    while !ready() {
+        if crate::sched::has_deliverable_signal() {
+            return err::EINTR;
+        }
+        if park_until(ready) == err::EINTR {
+            return err::EINTR;
+        }
+    }
+    0
+}
+
+/// One `MSG_PEEK` on a channel end: copy the bytes a read would hand back and
+/// leave them queued.
+///
+/// `MSG_TRUNC` is deliberately not a parameter. On this family it is ignored,
+/// not the count-only rule a TCP stream follows: a 4-byte room over 10 queued
+/// bytes with `MSG_TRUNC` copies the same four bytes, answers 4 and takes four,
+/// which is exactly what the same receive without the flag does (measured on a
+/// current host, `.workbuddy/probe_unix_peek3.c` and `probe_unix_peek5.c`; on
+/// this kernel's TCP stream the same call copies nothing). A caller that passes
+/// the flag therefore reaches the ordinary read path and gets the answer it
+/// would have without it.
+///
+/// A queued descriptor handover with no bytes is not something this door can
+/// report, and Linux does not treat it as readable either: a zero-byte
+/// `sendmsg` that carried an fd leaves `recv`/`recvfrom` answering `EAGAIN`
+/// until bytes arrive, while `recvmsg` with control room is the door that
+/// receives it (measured, `.workbuddy/probe_unix_peek6.c`).
+fn channel_peek(
+    file: &Arc<crate::vfs::File>,
+    out: &mut [u8],
+    nonblock: bool,
+) -> Result<usize, isize> {
+    loop {
+        match on_channel(file, |c| c.peek(out)).unwrap_or(Ok(None)) {
+            Ok(Some(n)) => return Ok(n),
+            Ok(None) => {
+                if nonblock {
+                    return Err(err::EAGAIN);
+                }
+                let ready = || file.inode().poll_ready().read;
+                while !ready() {
+                    if crate::sched::has_deliverable_signal() {
+                        return Err(err::EINTR);
+                    }
+                    if park_until(ready) == err::EINTR {
+                        return Err(err::EINTR);
+                    }
+                }
+            }
+            Err(e) => return Err(crate::uaccess::err_of(e)),
+        }
+    }
+}
+
 /// Walk a `sendmsg` control buffer and collect the open files its
 /// `SCM_RIGHTS` entries name, resolved against the sender's own table. A
 /// descriptor the sender does not hold is `EBADF`; entries other than
@@ -2457,7 +2520,10 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
     // The datagram receive: one message per call, the sender's name for
     // the `src_addr` slots - which is the whole reason `recvfrom` exists
     // beside `read` on a socket of this shape. A buffer smaller than the
-    // message truncates it, discarding the rest, as unix datagrams do.
+    // message truncates it, discarding the rest, as unix datagrams do; the
+    // *return* is the message's own length when `MSG_TRUNC` asked for it, and
+    // `MSG_PEEK` copies without discarding anything (both measured on a
+    // current host: `.workbuddy/probe_unix_peek.c`).
     if let Ok(file) = crate::sched::current_fds().clone_at(fd)
         && let Some(sock) = file.inode().as_any().downcast_ref::<UnixSock>()
         && sock.carries_messages()
@@ -2465,40 +2531,55 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
         }
-        if args[3] & MSG_PEEK != 0 {
-            return err::EOPNOTSUPP;
-        }
+        let peek = args[3] & MSG_PEEK != 0;
+        let truncate = args[3] & MSG_TRUNC as usize != 0;
         if dontwait(fd, args[3]) && !file.inode().poll_ready().read {
             return err::EAGAIN;
         }
-        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
-        return match crate::net::unix::recv_dgram(sock, out) {
-            Ok((n, from)) => {
-                if args[4] != 0 {
-                    let r = crate::net::unix::write_addr(from.as_ref(), args[4], args[5]);
-                    if r != 0 {
-                        return r;
-                    }
-                }
-                n as isize
-            }
-            Err(e) => crate::uaccess::err_of(e),
+        let got = match if peek {
+            sock.peek_dgram()
+        } else {
+            sock.take_dgram()
+        } {
+            Ok(got) => got,
+            Err(e) => return crate::uaccess::err_of(e),
         };
+        let n = got.data.len().min(len);
+        if n > 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(got.data.as_ptr(), buf as *mut u8, n);
+            }
+        }
+        if args[4] != 0 {
+            let r = crate::net::unix::write_addr(got.from.as_ref(), args[4], args[5]);
+            if r != 0 {
+                return r;
+            }
+        }
+        return if truncate { got.data.len() } else { n } as isize;
     }
-    // The read side of a connected pair's end. A peek would need to look at
-    // the front of the pipe's queue without taking it, which a pipe cannot
-    // do - refusing beats consuming bytes the caller meant to keep.
+    // The read side of a connected pair's end. `MSG_PEEK` looks at the front
+    // without taking it; `MSG_TRUNC` is ignored on this family and the call
+    // reaches the read it would have been without the flag (measured on a
+    // current host, `.workbuddy/probe_unix_peek3.c` and `probe_unix_peek5.c`:
+    // 4 of 10 with the flag answers 4, copies the same four bytes and takes
+    // them, while the same peek leaves all ten - a TCP stream's `MSG_TRUNC` is
+    // the count-only rule and this family does not share it).
     if let Some(file) = channel_of_fd(fd) {
         if !crate::uaccess::buffer_ok(buf, len, true, from_user) {
             return err::EFAULT;
         }
+        let nonblock = dontwait(fd, args[3]);
+        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
         if args[3] & MSG_PEEK != 0 {
-            return err::EOPNOTSUPP;
+            return match channel_peek(&file, out, nonblock) {
+                Ok(n) => n as isize,
+                Err(e) => e,
+            };
         }
-        if dontwait(fd, args[3]) && !file.inode().poll_ready().read {
+        if nonblock && !file.inode().poll_ready().read {
             return err::EAGAIN;
         }
-        let out = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len) };
         return file
             .read(out)
             .map(|n| n as isize)
@@ -2731,23 +2812,29 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             Ok(room) => room,
             Err(e) => return e,
         };
-        if args[2] & MSG_PEEK != 0 {
-            return err::EOPNOTSUPP;
-        }
+        let peek = args[2] & MSG_PEEK != 0;
+        let truncate = args[2] & MSG_TRUNC as usize != 0;
         if dontwait(fd, args[2]) && !file.inode().poll_ready().read {
             return err::EAGAIN;
         }
-        // A chain is received into a scratch and scattered after the take, so
-        // a segment the caller cannot write leaves the message consumed, as
-        // Linux's own fault does (measured: the next receive was `EAGAIN`).
-        let answer = room.receive(|out| match crate::net::unix::recv_dgram_cred(sock, out) {
-            Ok((n, from, cred, cut)) => Ok((n, (n, from, cred, cut))),
-            Err(e) => Err(crate::uaccess::err_of(e)),
-        });
-        let (n, from, cred, cut) = match answer {
-            Ok(answer) => answer,
+        // A peek looks at the front and leaves it for the next receive; a take
+        // pops it, and a chain is scattered after the take, so a segment the
+        // caller cannot write leaves the message consumed, as Linux's own
+        // fault does (measured: the next receive was `EAGAIN`).
+        let got = match if peek {
+            sock.peek_dgram()
+        } else {
+            sock.take_dgram()
+        } {
+            Ok(got) => got,
+            Err(e) => return crate::uaccess::err_of(e),
+        };
+        let full = got.data.len();
+        let n = match room.store(&got.data) {
+            Ok(n) => n,
             Err(e) => return e,
         };
+        let (from, cred, cut) = (got.from, got.cred, n < full);
         if name != 0 {
             let r = crate::net::unix::write_addr(from.as_ref(), name, msghdr + 8);
             if r < 0 {
@@ -2781,7 +2868,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             ((msghdr + MSGHDR_FLAGS) as *mut i32).write_volatile(flags);
             ((msghdr + MSGHDR_CONTROLLEN) as *mut usize).write_unaligned(used);
         }
-        return n as isize;
+        return if truncate { full } else { n } as isize;
     }
     // The read side of a connected pair's end, in scatter-gather form: the
     // caller's whole data room, plus the control chain a unix channel may
@@ -2802,15 +2889,12 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             Ok(room) => room,
             Err(e) => return e,
         };
-        if args[2] & MSG_PEEK != 0 {
-            // A peek needs the front of the queue without the take, and a
-            // pipe has no way to look. Refusing beats consuming bytes the
-            // caller meant to keep.
-            return err::EOPNOTSUPP;
-        }
+        let peek = args[2] & MSG_PEEK != 0;
         // A stream's fault leaves its bytes queued (measured: 12 into
         // `4+unreadable` answered `EFAULT` and the next receive still read
-        // all 12), so the room is checked whole before the read.
+        // all 12), so the room is checked whole before the read - and a peek
+        // is no different: Linux validates the buffer even when the call is
+        // one that leaves the stream alone (`.workbuddy/probe_unix_peek4.c`).
         if let Err(e) = room.validate() {
             return e;
         }
@@ -2825,7 +2909,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         if dontwait(fd, args[2]) && !file.inode().poll_ready().read && !empty_handover {
             return err::EAGAIN;
         }
-        let mut n = 0isize;
+        let mut n = 0usize;
         if room.is_empty() {
             // A zero-length stream receive is Linux's readiness question: it
             // answers 0 when the stream has something to say - bytes, EOF, or
@@ -2836,24 +2920,26 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             // shape answers 0 - and the park happens whether or not the caller
             // left room for control data, which is why this is not gated on
             // `wants_control`: a zero-length iovec *with* a cmsg buffer
-            // parked on the probe's host exactly as one without did.
-            let ready = || {
-                file.inode().poll_ready().read
-                    || on_channel(&file, |c| c.scm_due()).unwrap_or(false)
-            };
-            while !ready() {
-                if crate::sched::has_deliverable_signal() {
-                    return err::EINTR;
-                }
-                if park_until(ready) == err::EINTR {
-                    return err::EINTR;
-                }
+            // parked on the probe's host exactly as one without did. A peek
+            // asks the same question and parks the same way.
+            let w = wait_channel(&file);
+            if w != 0 {
+                return w;
             }
         } else if !empty_handover {
-            let got = room.receive(|out| match file.read(out) {
-                Ok(n) => Ok((n, n as isize)),
-                Err(e) => Err(crate::uaccess::err_of(e)),
-            });
+            let got = if peek {
+                room.receive(|out| match on_channel(&file, |c| c.peek(out)) {
+                    Some(Ok(Some(n))) => Ok((n, n)),
+                    Some(Ok(None)) => Ok((0, 0)),
+                    Some(Err(e)) => Err(crate::uaccess::err_of(e)),
+                    None => Err(err::ENOTSOCK),
+                })
+            } else {
+                room.receive(|out| match file.read(out) {
+                    Ok(n) => Ok((n, n)),
+                    Err(e) => Err(crate::uaccess::err_of(e)),
+                })
+            };
             n = match got {
                 Ok(n) => n,
                 Err(e) => return e,
@@ -2864,13 +2950,21 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             // is the cost of asking for a record that has no bytes to arrive
             // with, and the alternative is the deadlock it replaces.
         }
-        // Pop any descriptor handover queued for this channel and decide
-        // whether the peer's credentials ride along. A handover that crossed a
-        // network namespace is delivered like any other: the descriptor's socket
-        // resolves against the stack *it* was made in (`net`'s `HOMES`), so the
-        // receiver gets a working socket rather than one of its own renumbered -
-        // which is Linux's `sk_net` behaviour and the reason that mapping exists.
-        let handover = on_channel(&file, |c| c.take_scm()).flatten();
+        // Report or pop any descriptor handover queued for this channel and
+        // decide whether the peer's credentials ride along. A peek reports the
+        // same record without taking it - Linux installs the descriptors a
+        // peeked `SCM_RIGHTS` carried and delivers them again to the read that
+        // consumes the bytes (measured: `.workbuddy/probe_unix_peek.c`, both
+        // fds live). A handover that crossed a network namespace is delivered
+        // like any other: the descriptor's socket resolves against the stack
+        // *it* was made in (`net`'s `HOMES`), so the receiver gets a working
+        // socket rather than one of its own renumbered - which is Linux's
+        // `sk_net` behaviour and the reason that mapping exists.
+        let handover = if peek {
+            on_channel(&file, |c| c.peek_scm()).flatten()
+        } else {
+            on_channel(&file, |c| c.take_scm()).flatten()
+        };
         let want_cred = match file.inode().as_any().downcast_ref::<UnixSock>() {
             Some(sock) if sock.passcred() => sock.peer_cred(),
             _ => None,
@@ -2896,7 +2990,7 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
             }
             ((msghdr + MSGHDR_CONTROLLEN) as *mut usize).write_unaligned(used);
         }
-        return n;
+        return n as isize;
     }
     // The vsock form: one contiguous read out of the connection, the
     // peer's address into `msg_name` when the caller left room for one,

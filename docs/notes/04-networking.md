@@ -55,7 +55,15 @@ one case where a `recvmsg` on a stream can answer 0 and not mean end-of-stream,
 so a receiver that takes a short read has to look at its control buffer before
 concluding the peer is gone. That is the price of the record, and the
 alternative was a hang; `t-unix-scm` pins both the delivery and the
-non-blocking second read that follows it.
+non-blocking second read that follows it. **Measured 2026-10-20, that
+deadlock-avoidance is this kernel's and not Linux's for a *stream*:** a
+zero-byte `sendmsg` that carried a descriptor answers `EAGAIN` on `recv`,
+`recvfrom` **and** `recvmsg` on the host - every door - until a byte arrives
+(`.workbuddy/probe_unix_peek6.c`, `probe_unix_peek7.c`), while the caller the
+rule was written for - eudev's worker channel - is a **datagram** pair, whose
+zero-byte message is a message a reader does reach. The `empty_handover` path
+stays (a deadlock is worse), and §4.1.2 records the divergence rather than
+claiming Linux's shape.
 
 **A message may be zero bytes long, and receiving one may offer no room.** The
 rule sounds like a corner and is not: eudev's worker channel is a
@@ -161,6 +169,51 @@ where before it logged `WARN niri::utils::xwayland::satellite: error opening X11
 sockets, disabling xwayland-satellite integration: error binding to abstract
 socket … Invalid argument`. The renderer warnings beside it are a different gap
 (§7.4's Mesa chain) and are untouched.
+
+#### 4.1.2 `MSG_PEEK` and `MSG_TRUNC` on the receive doors — **SERVED** (2026-10-20)
+
+Both flags used to answer `EOPNOTSUPP` on every unix receive door, and the module's own comment
+carried the reason: a pipe could not look at its front without taking it. The flags are what a
+supervisor composes with - peek to see whether a whole message has arrived, `MSG_TRUNC` to learn
+a datagram's length without room for it - and the reasons turned out to be two different
+contracts, measured whole on a current host first (`.workbuddy/probe_unix_peek{,2,3,4,5,6,7}.c`,
+Linux 7.2.x, `.workbuddy/mpos` working tree):
+
+* **a stream peek copies and takes nothing.** Four bytes of ten answer 4, fill the caller's
+  buffer with `abcd`, and the next read still returns all ten; the look is repeatable, a
+  zero-length look answers 0 at once, and a look at end-of-stream answers 0.
+* **a stream's `MSG_TRUNC` is not a datagram's.** A four-byte read with the flag answers 4,
+  copies the four bytes and consumes them - byte for byte the read without it. (The TCP receive
+  path is the count-only rule, which is why the two families cannot share an arm.)
+* **a datagram peek is a full copy of the front**, and under `MSG_TRUNC` the return is the
+  message's own length while the copy stays short; `recvmsg` reports the cut in `msg_flags`
+  whether or not the flag was asked for. A zero-length peek leaves the message, a zero-length
+  **non-peek** receive consumes it, and a peek names the sender like any other receive.
+* **`SCM_RIGHTS` survives a peek.** Linux installs the descriptors a peeked send carried and
+  leaves the record queued, so the read that consumes its bytes installs a second set and both
+  stay live. A zero-byte handover is the exception: `recv`/`recvfrom` answer `EAGAIN` until a
+  byte arrives (`probe_unix_peek6.c`), while the kernel's existing `empty_handover` path makes
+  `recvmsg` receive it - a deliberate trade against the deadlock that shape once caused, and
+  now a named divergence (`docs/uapi/` §5.2).
+
+The landing keeps the look at the bottom of the family rather than in the syscall layer:
+`PipeEnd::peek_once` copies the ring's front without moving the cursor, `PipeEnd::peek_scm`
+clones the front handover (so a peek's installed descriptors share the queued files'
+descriptions, Linux's `get_file` shape), and `DuplexEnd` forwards both. `UnixSock::peek_dgram`
+clones the front `Dgram` and leaves the queue alone; `take_dgram`/`peek_dgram` answer a
+`RecvDgram` that carries the message's whole length, which is what `MSG_TRUNC` reports. The
+receive arms route the two flags and nothing else: the stream arms deliberately ignore
+`MSG_TRUNC`, because on this family it changes nothing.
+
+**Pin**: `t-unix-peek`, 63 claims, green on a current host first and all 63 green on both
+machines - stream, datagram and seqpacket, both `MSG_TRUNC` shapes on each, `recvmsg`'s
+`msg_flags`, an abstract sender name, and the handover a peek installs twice. The counterfactual
+(the four peek refusals restored) is x86_64 `pass=191 fail=1`, only `t-unix-peek` red, 18 of its
+63 claims by name. Gate: x86_64 `pass=192 fail=0`, `mpos-kunit 32 passed, 0 failed`, exit 33;
+aarch64 `pass=191 fail=0`, `mpos-kunit 32 passed, 0 failed`, reaching `=== END`. Host suite 584
+(two new `vfs::pipe` tests), `xtask` 123; fmt/clippy clean on the touched files and the depgraph
+ratchet unchanged. Named rather than served: `NETLINK`/`AF_PACKET`/vsock peeks, the vsock
+`recvmsg`'s first-segment chain, and the zero-byte stream handover above.
 
 ### 4.2 ICMP Improvements — **DONE**
 

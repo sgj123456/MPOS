@@ -106,6 +106,22 @@ impl Ring {
         n
     }
 
+    /// Copy up to `want` bytes from the front without taking them, answering
+    /// how many were copied.
+    ///
+    /// This is the ring's half of `MSG_PEEK`: the caller looks at what a read
+    /// would have handed it and the cursor does not move. The handover
+    /// boundary is deliberately not applied here - a peek copies what the
+    /// caller asked to see, across send boundaries, while the descriptors a
+    /// send carried stay queued for the read that consumes their bytes
+    /// (Linux's `MSG_PEEK` reads across skbs and attaches the first one's
+    /// control data; measured in `.workbuddy/probe_unix_peek.c`).
+    fn peek(&self, buf: &mut [u8], want: usize) -> usize {
+        let n = want.min(buf.len()).min(self.len());
+        buf[..n].copy_from_slice(&self.bytes[self.start..self.start + n]);
+        n
+    }
+
     /// Append the first `want` bytes of `buf`. The caller has checked that the
     /// pipe has room for them.
     fn put(&mut self, buf: &[u8], want: usize) {
@@ -505,6 +521,26 @@ impl PipeEnd {
         })
     }
 
+    /// The oldest handover, cloned rather than taken - what a `MSG_PEEK`
+    /// receive reports.
+    ///
+    /// Linux installs the descriptors a peeked send carried and leaves the
+    /// record queued, so the same handover is delivered again to the read that
+    /// consumes its bytes (measured: a peeked `SCM_RIGHTS` fd and the fd the
+    /// following read returned were both live). Cloning the `Arc`s is what
+    /// makes the peek's copies share the queued files' descriptions, which is
+    /// Linux's own `get_file` shape rather than a fresh open.
+    pub fn peek_scm(&self) -> Option<Vec<Arc<super::File>>> {
+        critical_section::with(|cs| {
+            self.state
+                .borrow(cs)
+                .borrow()
+                .scm
+                .front()
+                .map(|s| s.files.clone())
+        })
+    }
+
     /// Whether [`take_scm`] would answer with something, without taking it.
     ///
     /// The read side needs this to tell two waits apart. A handover whose send
@@ -550,6 +586,24 @@ impl PipeEnd {
                 let n = st.data.take(buf, n);
                 st.consumed += n as u64;
                 Some(n)
+            }
+        }))
+    }
+
+    /// One non-blocking peek: the bytes a read would hand back, copied into
+    /// `buf` with the cursor left where it was. The three answers are
+    /// [`read_once`]'s - `Some(n)` data, `Some(0)` end-of-stream, `None` "not
+    /// yet" - because a caller waiting for something to look at waits on the
+    /// same condition a reader does.
+    ///
+    /// [`read_once`]: PipeEnd::read_once
+    pub fn peek_once(&self, buf: &mut [u8]) -> VfsResult<Option<usize>> {
+        Ok(critical_section::with(|cs| {
+            let st = self.state.borrow(cs).borrow();
+            if st.data.is_empty() {
+                if st.writers == 0 { Some(0) } else { None }
+            } else {
+                Some(st.data.peek(buf, buf.len()))
             }
         }))
     }
@@ -1021,6 +1075,18 @@ impl DuplexEnd {
         self.read.take_scm()
     }
 
+    /// The handover a peek would report, cloned rather than taken. See
+    /// [`PipeEnd::peek_scm`].
+    pub fn peek_scm(&self) -> Option<Vec<Arc<super::File>>> {
+        self.read.peek_scm()
+    }
+
+    /// Look at the bytes a read would hand back, without taking them. See
+    /// [`PipeEnd::peek_once`].
+    pub fn peek(&self, buf: &mut [u8]) -> VfsResult<Option<usize>> {
+        self.read.peek_once(buf)
+    }
+
     /// Whether a handover is waiting to be taken, without taking it. See
     /// [`PipeEnd::scm_due`].
     pub fn scm_due(&self) -> bool {
@@ -1156,6 +1222,65 @@ mod tests {
         assert_eq!(got.len(), 2, "both descriptors ride one message");
         assert_eq!(Arc::as_ptr(&got[0]), p1, "in the order they were queued");
         assert_eq!(Arc::as_ptr(&got[1]), p2);
+    }
+
+    #[test]
+    fn a_peek_shows_the_front_without_taking_it() {
+        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        let mut buf = [0u8; 8];
+
+        assert_eq!(a.write_at(0, b"abcdefghij").unwrap(), 10);
+        // The look is repeatable, copies only what the caller asked for, and
+        // leaves every byte where the read will find it.
+        assert_eq!(b.peek(&mut buf[..4]).unwrap(), Some(4));
+        assert_eq!(&buf[..4], b"abcd");
+        assert_eq!(b.peek(&mut buf[..4]).unwrap(), Some(4));
+        assert_eq!(&buf[..4], b"abcd");
+
+        // A peek of the whole stream answers the whole stream and still takes
+        // nothing.
+        let mut all = [0u8; 16];
+        assert_eq!(b.peek(&mut all).unwrap(), Some(10));
+        assert_eq!(&all[..10], b"abcdefghij");
+        assert_eq!(b.read_at(0, &mut buf).unwrap(), 8);
+        assert_eq!(&buf[..8], b"abcdefgh");
+        assert_eq!(b.read_at(0, &mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"ij");
+
+        // Empty with a writer: "nothing yet"; empty with no writer: EOF.
+        assert_eq!(b.peek(&mut buf).unwrap(), None);
+        drop(a);
+        assert_eq!(b.peek(&mut buf).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn a_peeked_handover_is_delivered_again_to_the_read() {
+        let (a, b) = DuplexEnd::pair((0, 0, 0));
+        let f = Arc::new(File::new(DuplexEnd::pair((0, 0, 0)).0));
+        let want = Arc::as_ptr(&f);
+        a.write_at(0, b"x").unwrap();
+        a.send_scm(vec![f]);
+
+        // `MSG_PEEK` reports the queued record and the queue keeps it; Linux
+        // installs a copy of each descriptor and the read installs another.
+        let peeked = b.peek_scm().expect("the handover is visible to a peek");
+        assert_eq!(peeked.len(), 1);
+        assert_eq!(
+            Arc::as_ptr(&peeked[0]),
+            want,
+            "the same file, not a new one"
+        );
+        assert!(
+            !b.scm_due(),
+            "the record becomes due when its bytes are consumed"
+        );
+        drop(peeked);
+
+        let mut buf = [0u8; 1];
+        assert_eq!(b.read_at(0, &mut buf).unwrap(), 1);
+        let taken = b.take_scm().expect("the read still gets the record");
+        assert_eq!(Arc::as_ptr(&taken[0]), want);
+        assert!(b.take_scm().is_none(), "and only once");
     }
 
     #[test]

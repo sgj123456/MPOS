@@ -5,6 +5,25 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **AF_UNIX's receive doors look without taking, and a datagram's `MSG_TRUNC` is its own
+  length.** **Landed 2026-10-20** (`docs/uapi/` §5.1 item 76) - the AF_UNIX half of the
+  `MSG_PEEK` bullet below. Both flags used to be refused `EOPNOTSUPP` on every unix door.
+  Measured whole on a current host first (`.workbuddy/probe_unix_peek{,2,3,4,5,6,7}.c`, Linux
+  7.2.x): a stream peek copies without taking and is repeatable; a stream's `MSG_TRUNC` changes
+  nothing (it copies and consumes exactly as the plain read does); a datagram peek leaves the
+  front message and reports its own length under `MSG_TRUNC`, while a zero-length non-peek
+  receive consumes; `recvmsg` sets `MSG_TRUNC` in `msg_flags` unasked; a peeked `SCM_RIGHTS`
+  record installs its descriptors and stays queued for the read that installs a second set; and
+  a zero-byte handover answers `EAGAIN` on `recv`/`recvfrom`. Served by `PipeEnd::peek_once`/
+  `peek_scm`, `UnixSock::peek_dgram`, and a `RecvDgram` that carries the message's whole
+  length. Pin: **`t-unix-peek`**, 63 claims, green on a host first and all 63 green on both
+  machines, plus two `vfs::pipe` host tests. Counterfactual (the four refusals back):
+  `pass=191 fail=1`, only `t-unix-peek` red, 18 of its claims by name. Gate: x86_64
+  `pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit` 32/0 on both. Named: `NETLINK`,
+  `AF_PACKET` and vsock peeks; vsock's first-segment `recvmsg`; and a zero-byte stream
+  handover being receivable through `recvmsg` here where Linux answers `EAGAIN` (the existing
+  `empty_handover` trade).
+
 - **Real `MSG_PEEK` over TCP/UDP is served, and `MSG_TRUNC` is the message's own length.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet this replaces said the flag
   was refused `EOPNOTSUPP` because serving it needed peek-preserving delivery in the stack; the
@@ -31,10 +50,11 @@ Section numbers are unchanged from the original `UAPI.md`.
   one line with every pin kept (every peek refused again): `pass=188 fail=2`, exactly the two
   pins. `t-ns-net`'s own fixture was fixed on the way - it connected before the child's
   listener announced itself, a race the new socket timing lost on aarch64.
-  **Two shapes stay named rather than claimed**: the other families' peeks (`AF_UNIX`, NETLINK,
+  **Two shapes stay named rather than claimed**: the other families' peeks (`NETLINK`,
   PACKET, vsock) which this pass did not touch, and `recvmsg` with a zero-length data room, whose
   `EINVAL` predated this item and was its own. The **raw** peek this bullet first named was
-  served by item 74, which made the capability the host lacked instead of naming around it.
+  served by item 74, which made the capability the host lacked instead of naming around it, and
+  **`AF_UNIX`'s half** was served by item 76 (the bullet above).
 
 - **A `recvmsg`'s data room is the whole iovec chain, and a stream's fault is not a datagram's.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 73) - the item the `MSG_PEEK` bullet above left

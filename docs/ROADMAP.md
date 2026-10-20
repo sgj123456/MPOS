@@ -520,6 +520,22 @@ frame; the counterfactual (the kernel files reverted) is `pass=190 fail=1` with 
 its claims red, the alignment claim passing vacuously on the null pointer beside the non-null
 one. Gate: x86_64 `pass=191 fail=0`, aarch64 `pass=190 fail=0`, `mpos-kunit` 32/0 on both.
 
+**AF_UNIX's receive doors look without taking, and a datagram's `MSG_TRUNC` is its own length**
+(`docs/uapi/` §5.1 item 76, landed 2026-10-20): both flags were refused `EOPNOTSUPP` on every
+unix door. Measured whole on a current host first (`.workbuddy/probe_unix_peek{,2,3,4,5,6,7}.c`,
+Linux 7.2.x): a stream peek copies without taking and is repeatable; a stream's `MSG_TRUNC`
+changes nothing (it copies and consumes as the plain read does); a datagram peek leaves the
+front message and reports its own length under `MSG_TRUNC`, a zero-length peek does not consume
+while a zero-length non-peek receive does, and `recvmsg` sets `MSG_TRUNC` in `msg_flags` unasked;
+a peeked `SCM_RIGHTS` record installs its descriptors and stays queued, so the following read
+installs a second set; and a zero-byte handover answers `EAGAIN` on `recv`/`recvfrom`. Served by
+`PipeEnd::peek_once`/`peek_scm`, `UnixSock::peek_dgram`, and a `RecvDgram` carrying the whole
+length. Pin: `t-unix-peek`, 63 claims green on a host first, plus two `vfs::pipe` host tests;
+the counterfactual (the four refusals back) is `pass=191 fail=1` with 18 of its claims red by
+name. Gate: x86_64 `pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit` 32/0 on both.
+Named: `NETLINK`/`AF_PACKET`/vsock peeks, vsock's first-segment `recvmsg`, and a zero-byte
+stream handover being receivable through `recvmsg` here where Linux answers `EAGAIN`.
+
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
 record-only was wrong in both halves - the figure stored was the caller's rather than Linux's,  

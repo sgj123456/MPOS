@@ -391,35 +391,63 @@ impl UnixSock {
     }
 
     /// Take the front datagram, parked for if the queue is empty and the
-    /// caller allowed waiting. The answer is the bytes copied and the
-    /// sender's name; the copy truncates to the caller's buffer the way
-    /// unix datagrams do - the rest of that one message is gone, and the
-    /// next read still finds the next message whole.
-    fn take_dgram(
-        &self,
-        buf: &mut [u8],
-    ) -> Result<(usize, Option<UnixAddr>, UCred, bool), VfsError> {
+    /// caller allowed waiting. The answer carries the whole message, so the
+    /// caller can copy what its buffer holds and still know the message's own
+    /// length for `MSG_TRUNC`.
+    pub(crate) fn take_dgram(&self) -> Result<RecvDgram, VfsError> {
         loop {
             let taken = critical_section::with(|cs| {
                 let mut st = self.state.borrow(cs).borrow_mut();
-                match st.recvq.pop_front() {
-                    Some(g) => Some((g.data, g.from, g.cred, st.read_waiters.clone())),
-                    None => None,
-                }
+                st.recvq.pop_front().map(|g| RecvDgram {
+                    data: g.data,
+                    from: g.from,
+                    cred: g.cred,
+                })
             });
-            if let Some((data, from, cred, _waiters)) = taken {
+            if let Some(got) = taken {
                 // The queue only got emptier by one message, so the other
                 // parked readers stay parked until a push wakes them all;
                 // this take's own waiters set is the poll subscribers, and
                 // `epoll` re-arms them through `poll_ready` on its own.
-                let n = data.len().min(buf.len());
-                buf[..n].copy_from_slice(&data[..n]);
-                // `n < data.len()` is the message being longer than the
-                // caller's buffer: the rest of that one message is gone, and
-                // Linux says so with `MSG_TRUNC` rather than letting the caller
-                // guess from a short count - a receive of exactly the size it
-                // asked for is otherwise indistinguishable from one that fitted.
-                return Ok((n, from, cred, n < data.len()));
+                return Ok(got);
+            }
+            let nonblock = critical_section::with(|cs| self.state.borrow(cs).borrow().nonblocking);
+            if nonblock {
+                return Err(VfsError::Again);
+            }
+            #[cfg(not(target_os = "none"))]
+            return Err(VfsError::Again);
+            #[cfg(target_os = "none")]
+            self.wait_for_dgram()?;
+        }
+    }
+
+    /// Look at the front datagram without taking it - `MSG_PEEK` on a message
+    /// socket.
+    ///
+    /// Linux's peek is a full copy of the queue's front that leaves it for the
+    /// next receive, repeatable as often as the caller asks; a short peek
+    /// still reports the message's own length under `MSG_TRUNC` and sets
+    /// `MSG_TRUNC` in a `recvmsg`'s `msg_flags` without being asked, exactly
+    /// as a consuming receive does (measured on a current host,
+    /// `.workbuddy/probe_unix_peek{,2}.c`). The wait is the take's wait, so a
+    /// peek of an empty queue parks and a signal ends it the same way.
+    pub(crate) fn peek_dgram(&self) -> Result<RecvDgram, VfsError> {
+        loop {
+            let front = critical_section::with(|cs| {
+                self.state
+                    .borrow(cs)
+                    .borrow()
+                    .recvq
+                    .front()
+                    .map(|g| RecvDgram {
+                        data: g.data.clone(),
+                        from: g.from.clone(),
+                        cred: g.cred,
+                    })
+            });
+            if let Some(got) = front {
+                return Ok(got);
             }
             let nonblock = critical_section::with(|cs| self.state.borrow(cs).borrow().nonblocking);
             if nonblock {
@@ -571,7 +599,9 @@ impl Inode for UnixSock {
     /// connected peer.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
         if self.carries_messages() {
-            let (n, _, _, _) = self.take_dgram(buf)?;
+            let got = self.take_dgram()?;
+            let n = got.data.len().min(buf.len());
+            buf[..n].copy_from_slice(&got.data[..n]);
             return Ok(n);
         }
         let _ = offset;
@@ -1708,22 +1738,14 @@ pub(crate) fn send_dgram(sock: &UnixSock, data: &[u8], dest: Option<&UnixAddr>) 
     }
 }
 
-/// One `recvfrom` on a datagram socket: take the front message into the
-/// caller's buffer and report the sender's name for the `src_addr` slots.
-pub(crate) fn recv_dgram(
-    sock: &UnixSock,
-    buf: &mut [u8],
-) -> Result<(usize, Option<UnixAddr>), VfsError> {
-    sock.take_dgram(buf).map(|(n, from, _, _)| (n, from))
-}
-
-/// [`recv_dgram`], keeping the sender's credentials - what a `recvmsg` on a
-/// socket that asked for `SO_PASSCRED` has to answer with.
-pub(crate) fn recv_dgram_cred(
-    sock: &UnixSock,
-    buf: &mut [u8],
-) -> Result<(usize, Option<UnixAddr>, UCred, bool), VfsError> {
-    sock.take_dgram(buf)
+/// One receive on a message socket, as both the take and the peek answer it:
+/// the message's bytes, the sender's name and the credentials the send
+/// recorded. `data.len()` is the message's own length, which is what
+/// `MSG_TRUNC` reports even when only part of it was copied.
+pub(crate) struct RecvDgram {
+    pub data: Vec<u8>,
+    pub from: Option<UnixAddr>,
+    pub cred: UCred,
 }
 
 /// The accept act, handler side: pop (or park), wrap the server half in a
