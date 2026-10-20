@@ -4615,3 +4615,42 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     direction. A *claim* that was never measured became a permanent-looking
     refusal, and two tests were built to accept it. The tell was the claim
     naming no probe, no register and no run.
+
+## item 88 — `accept`'s `addr` is the connector's name, and its two pointers are asked separately
+
+    `accept` wrote the **listener's** bound path into the caller's address
+    buffer. Linux writes the **connector's** name there: it is the answer to
+    "who just connected", and a server that reads its own address back
+    concludes every client is itself.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_unix_accept3.c`,
+    `probe_unix_accept{,2,4,5}.c`, Linux 7.2.11):
+
+    * `accept` with an **unbound** client reports `addrlen` **2** - the bare
+      family, no path byte written;
+    * `accept` with a client that bound a path reports that path and its own
+      length - the *client's* name, never the listener's;
+    * a 4-byte room still reports the *needed* length and copies four bytes;
+    * a NULL `addr` is served, and `addrlen` is left exactly as the caller left
+      it (a seeded 12345 comes back 12345);
+    * a NULL `addrlen` beside a real `addr` is `EFAULT` (14);
+    * `accept4` with an unknown flag bit is `EINVAL` (22), before anything else.
+
+    Served by `Pending::Stream` carrying the connector's address beside the
+    listener's, `with_state_connect` recording it as the accepted socket's
+    `peer_name`, and `accept`'s write-back reading that instead of the
+    listener's own name - so `accept` and `getpeername` on the accepted end
+    agree, as they do on Linux. The two pointer arguments are then asked about
+    separately: a NULL `addr` skips the write-back and a NULL `addrlen` beside
+    a real `addr` is `EFAULT`.
+
+    **Pins**: `t-unix` 99 -> 106 claims - the unbound client's two bytes, a
+    client that bound its own name reported as itself, the NULL-`addr` shape
+    with `addrlen` untouched, and the NULL-`addrlen` refusal.
+
+    Gate: x86_64 `pass=193 fail=0`; aarch64 `pass=192 fail=0`; `mpos-kunit` 32
+    passed, 0 failed on both. **Two counterfactuals**, one per half, each with
+    every pin kept: the write-back put back to the listener's name is
+    `pass=192 fail=1` with both address claims red; the old
+    `addr_ptr != 0 && len_ptr != 0` condition restored is `pass=192 fail=1`
+    with `accept with a real addr and a NULL addrlen is EFAULT` red.

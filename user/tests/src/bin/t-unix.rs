@@ -562,6 +562,147 @@ fn main() {
 
     let _ = unlinkat(CWD, "/tmp/t-unix-notdir", AtFlags::empty());
 
+    // --- `accept`'s `addr` is the *connector's* name ------------------
+    //
+    // The accepted descriptor's own name is the listener's (above), but the
+    // address `accept` writes back is the **peer's** - what a server uses to
+    // tell one client from another. Measured on a current host first
+    // (`.workbuddy/probe_unix_accept3.c`, Linux 7.2.11): an unbound client
+    // produces `addrlen` 2 (the bare family), and a client that bound a path
+    // produces that path with its own length.
+    let accept_name = "/tmp/t-unix-acc-listen.sock";
+    let accept_client_name = "/tmp/t-unix-acc-client.sock";
+    let _ = unlinkat(CWD, accept_name, AtFlags::empty());
+    let _ = unlinkat(CWD, accept_client_name, AtFlags::empty());
+    let acc_l = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    let mut acc_l_addr = Storage {
+        family: 1,
+        pad: [0; 108],
+    };
+    acc_l_addr.pad[..accept_name.len()].copy_from_slice(accept_name.as_bytes());
+    let acc_l_len = (2 + accept_name.len() + 1) as u32;
+    r.check(
+        "the accept-name listener binds and listens",
+        bind_raw(acc_l.as_raw_fd(), &acc_l_addr, acc_l_len) == 0 && listen(&acc_l, 4).is_ok(),
+    );
+    // An unbound client: `addrlen` 2, the bare family.
+    let acc_c1 = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    r.check(
+        "the unbound client connects",
+        connect_raw(acc_c1.as_raw_fd(), &acc_l_addr, acc_l_len) == 0,
+    );
+    let mut acc_out = Storage {
+        family: 0,
+        pad: [0x7f; 108],
+    };
+    let mut acc_out_len = 110u32;
+    let acc_r = unsafe {
+        libc::syscall(
+            libc::SYS_accept,
+            acc_l.as_raw_fd() as libc::c_long,
+            &mut acc_out as *mut Storage as libc::c_long,
+            &mut acc_out_len as *mut u32 as libc::c_long,
+        )
+    };
+    r.check(
+        "accept of an unbound client writes the bare family",
+        acc_r >= 0 && acc_out_len == 2 && acc_out.family == 1,
+    );
+    if acc_r >= 0 {
+        unsafe { libc::close(acc_r as i32) };
+    }
+    drop(acc_c1);
+    // A bound client: the path it bound, and not the listener's.
+    let acc_c2 = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    let mut acc_cli_addr = Storage {
+        family: 1,
+        pad: [0; 108],
+    };
+    acc_cli_addr.pad[..accept_client_name.len()].copy_from_slice(accept_client_name.as_bytes());
+    r.check(
+        "a client binds its own name and connects",
+        bind_raw(
+            acc_c2.as_raw_fd(),
+            &acc_cli_addr,
+            (2 + accept_client_name.len() + 1) as u32,
+        ) == 0
+            && connect_raw(acc_c2.as_raw_fd(), &acc_l_addr, acc_l_len) == 0,
+    );
+    let mut acc_out2 = Storage {
+        family: 0,
+        pad: [0x7f; 108],
+    };
+    let mut acc_out2_len = 110u32;
+    let acc_r2 = unsafe {
+        libc::syscall(
+            libc::SYS_accept,
+            acc_l.as_raw_fd() as libc::c_long,
+            &mut acc_out2 as *mut Storage as libc::c_long,
+            &mut acc_out2_len as *mut u32 as libc::c_long,
+        )
+    };
+    r.check(
+        "accept writes the client's name, not the listener's",
+        acc_r2 >= 0
+            && acc_out2_len as usize == 2 + accept_client_name.len() + 1
+            && acc_out2.pad[..accept_client_name.len()] == accept_client_name.as_bytes()[..],
+    );
+    if acc_r2 >= 0 {
+        unsafe { libc::close(acc_r2 as i32) };
+    }
+    drop(acc_c2);
+
+    // The two pointers are asked about separately, which is Linux's shape: a
+    // NULL `addr` is "I do not want the name" and the call serves it, leaving
+    // `addrlen` exactly as the caller left it; a NULL `addrlen` beside a real
+    // `addr` is the caller breaking their own word - `EFAULT` (14). Measured
+    // on a current host first (`.workbuddy/probe_unix_accept4.c`, Linux
+    // 7.2.11).
+    let acc_c3 = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    let c3_ok = connect_raw(acc_c3.as_raw_fd(), &acc_l_addr, acc_l_len) == 0;
+    let mut untouched = 12345u32;
+    let null_addr = unsafe {
+        libc::syscall(
+            libc::SYS_accept,
+            acc_l.as_raw_fd() as libc::c_long,
+            0 as libc::c_long,
+            &mut untouched as *mut u32 as libc::c_long,
+        )
+    };
+    r.check(
+        "accept with a NULL addr serves the call and leaves addrlen alone",
+        c3_ok && null_addr >= 0 && untouched == 12345,
+    );
+    if null_addr >= 0 {
+        unsafe { libc::close(null_addr as i32) };
+    }
+    drop(acc_c3);
+    let acc_c4 = socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+    let c4_ok = connect_raw(acc_c4.as_raw_fd(), &acc_l_addr, acc_l_len) == 0;
+    let mut a4 = Storage {
+        family: 0,
+        pad: [0x7f; 108],
+    };
+    let null_len = unsafe {
+        libc::syscall(
+            libc::SYS_accept,
+            acc_l.as_raw_fd() as libc::c_long,
+            &mut a4 as *mut Storage as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    r.check(
+        "accept with a real addr and a NULL addrlen is EFAULT",
+        c4_ok && null_len < 0 && last_errno() == libc::EFAULT,
+    );
+    if null_len >= 0 {
+        unsafe { libc::close(null_len as i32) };
+    }
+    drop(acc_c4);
+    drop(acc_l);
+    let _ = unlinkat(CWD, accept_name, AtFlags::empty());
+    let _ = unlinkat(CWD, accept_client_name, AtFlags::empty());
+
     // --- `shutdown` answers 0 for every socket Linux says it does ----
     //
     // Linux's `unix_shutdown` never asks whether there is a peer: the call

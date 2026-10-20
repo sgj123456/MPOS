@@ -4468,10 +4468,23 @@ fn accept_common(fd: i32, addr_ptr: usize, len_ptr: usize, flags: usize) -> isiz
     if flags & SOCK_CLOEXEC_F != 0 {
         let _ = crate::sched::current_fds().fd_flags_set(new_fd, crate::vfs::file::FD_CLOEXEC);
     }
-    // The caller's `addr`/`addrlen`, when present: the peer's name is the
-    // listener's bound path, which is what Linux writes back.
-    if addr_ptr != 0 && len_ptr != 0 {
-        crate::net::unix::write_name_by_id(id, addr_ptr, len_ptr);
+    // The caller's `addr`/`addrlen`: Linux writes the **connector's** name
+    // there, not the listener's - an unbound client is the bare family and a
+    // bound one is the path it bound (measured on a current host,
+    // `.workbuddy/probe_unix_accept3.c`).
+    //
+    // The two pointers are asked about separately, which is Linux's own shape
+    // (measured, `.workbuddy/probe_unix_accept4.c`): a NULL `addr` is "I do
+    // not want the name" and the call serves it - with `addrlen` left exactly
+    // as the caller left it - while a NULL `addrlen` beside a real `addr` is
+    // the caller breaking their own word, `EFAULT` (14). The old condition
+    // refused nothing and silently skipped both, which served a call Linux
+    // refuses.
+    if addr_ptr != 0 {
+        if len_ptr == 0 {
+            return err::EFAULT;
+        }
+        crate::net::unix::write_peer_by_id(id, addr_ptr, len_ptr);
     }
     new_fd as isize
 }

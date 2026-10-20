@@ -167,6 +167,20 @@ Section numbers are unchanged from the original `UAPI.md`.
   test claims had been written to accept the invented shape. The claims are now exact on both
   machines and the divergence list drops the entry.
 
+- **`accept`'s `addr` is the connector's name, and its two pointers are asked separately.** **Landed
+  2026-10-22** (`docs/uapi/` §5.1 item 88). `accept` wrote the **listener's** bound path into the
+  caller's address buffer, so a server reading it back concluded every client was itself. Linux
+  writes the **connector's** name. Measured on a current host first
+  (`.workbuddy/probe_unix_accept3.c`, `probe_unix_accept{,2,4,5}.c`, Linux 7.2.11): an unbound
+  client reports `addrlen` **2** (the bare family), a bound one reports the path it bound, a 4-byte
+  room still reports the needed length, a NULL `addr` is served with `addrlen` left untouched, and
+  a NULL `addrlen` beside a real `addr` is `EFAULT` (14). Served by carrying the connector's
+  address through `Pending::Stream` to the accepted socket's `peer_name` and writing that back, and
+  by asking the two pointers separately. Pin: **`t-unix`** 99 → 106 claims. Gate: x86_64
+  `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Two counterfactuals,
+  one per half: the listener's name put back reds both address claims; the old pointer condition
+  restored reds the `EFAULT` claim.
+
 - **Real `MSG_PEEK` over TCP/UDP is served, and `MSG_TRUNC` is the message's own length.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet this replaces said the flag
   was refused `EOPNOTSUPP` because serving it needed peek-preserving delivery in the stack; the

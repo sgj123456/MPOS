@@ -36,7 +36,8 @@ One-glance status of the whole roadmap.
   and a second `connect` moves a datagram's peer, the name being resolved before the refusal (§4.1.7) —  
   and `listen` is the named call, a connected socket not being a listener (§4.1.8) — and  
   `shutdown` is a flag on the socket rather than a handshake with a peer (§4.1.9), and the  
-  "implicit rendezvous" it used to name as a divergence was never Linux's shape (§4.1.10)
+  "implicit rendezvous" it used to name as a divergence was never Linux's shape (§4.1.10) — and  
+  `accept`'s address is the connector's, its two pointers asked separately (§4.1.11)
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
 - [ ] [~] 4.3 TCP — loopback, listener, `SO_REUSEADDR` and `SO_LINGER{on,0}`'s reset done; buffer sizes are Linux's numbers, with `SO_RCVBUF` not sizing the ring (§4.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)

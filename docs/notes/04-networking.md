@@ -575,6 +575,52 @@ measurement is about the machine that made it" - in its other direction. A
 tests were built to accept it. The tell was the claim naming no probe, no
 register and no run.
 
+#### 4.1.11 `accept`'s `addr` is the connector's name, not the listener's — **SERVED** (2026-10-22)
+
+`accept` wrote the **listener's** bound path into the caller's address buffer.
+Linux writes the **connector's** name there: it is the answer to "who just
+connected", and a server that reads its own address back concludes every client
+is itself.
+
+**Measured whole on a current host first** (`.workbuddy/probe_unix_accept3.c`,
+`probe_unix_accept{,2}.c`, Linux 7.2.11):
+
+| The call | Linux 7.2.11 |
+|---|---|
+| `accept` with an **unbound** client | `addrlen` **2** - the bare family, no path byte written |
+| `accept` with a client that bound a path | that path and its own length - the *client's* name, never the listener's |
+| `accept` with a 4-byte room | `addrlen` is the *needed* length and four bytes are copied |
+| `accept` with a NULL `addr` and a non-NULL `addrlen` | succeeds, and `addrlen` is left alone |
+| `accept` with a non-NULL `addr` and a NULL `addrlen` | `EFAULT` (14) |
+| `accept4` with an unknown flag bit | `EINVAL` (22), before anything else |
+
+**The fix is one write-back and one field on the queue.** `Pending::Stream`
+carries the connector's address beside the listener's (the connector's `local`
+at the moment of the handshake), `with_state_connect` records it as the accepted
+socket's `peer_name`, and `accept`'s write-back reads that instead of the
+listener's own name. The nameless case then falls out of `write_addr`'s
+`write_no_name`, which is the same bare-family answer `getsockname` gives - so
+`accept` and `getpeername` on the accepted end now agree, as they do on Linux.
+
+**The two pointers are asked about separately**, which is Linux's shape and was
+measured in the same session (`.workbuddy/probe_unix_accept4.c`,
+`probe_unix_accept5.c`): a NULL `addr` is "I do not want the name" and the call
+serves it, leaving `addrlen` exactly as the caller left it (a seeded 12345 comes
+back 12345), while a NULL `addrlen` beside a real `addr` is `EFAULT` (14). The
+old condition skipped both silently, so a call Linux refuses was served.
+
+**Pinned by `t-unix`** 99 → 106 claims: the unbound client's two bytes, a
+client that bound its own name being reported as itself rather than as the
+listener, the NULL-`addr` shape served with `addrlen` untouched, and the
+NULL-`addrlen` shape refused.
+
+**Two counterfactuals**, one per half, each with every pin kept: the write-back
+put back to the listener's name is `pass=192 fail=1` with both address claims
+red (`accept of an unbound client writes the bare family`,
+`accept writes the client's name, not the listener's`); the old
+`addr_ptr != 0 && len_ptr != 0` condition restored is `pass=192 fail=1` with
+`accept with a real addr and a NULL addrlen is EFAULT` red.
+
 ### 4.2 ICMP Improvements — **DONE**
 
 `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` is served by a raw smoltcp socket
