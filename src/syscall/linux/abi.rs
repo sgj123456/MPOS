@@ -1610,6 +1610,242 @@ pub(crate) fn validate_clone_flags(
 }
 
 // ---------------------------------------------------------------------------
+// clone3(2): the argument struct
+// ---------------------------------------------------------------------------
+
+/// The three sizes `struct clone_args` has had, as the uapi defines them:
+/// `VER0` is the eight-word prefix, `VER1` adds `set_tid`/`set_tid_size`, and
+/// `VER2` adds `cgroup`. A caller's `size` says how much of it it wrote, and the
+/// split is Linux's `copy_struct_from_user`: a `size` below `VER0` is `EINVAL`
+/// ("that is not a `clone_args` at all"), the words between the caller's `size`
+/// and `VER2` read as zero, and a `size` past `VER2` is allowed only while every
+/// byte past `VER2` is zero - otherwise `E2BIG` ("your struct has fields this
+/// kernel has never heard of"). Measured on Linux 7.2.11
+/// (`.workbuddy/probe_clone3{,c,d}.c`): sizes 64..=128 with a zero tail start a
+/// child, `size = 8` is `EINVAL`, and a nonzero byte at 100 is `E2BIG`.
+pub const CLONE_ARGS_SIZE_VER0: usize = 64;
+pub const CLONE_ARGS_SIZE_VER1: usize = 80;
+pub const CLONE_ARGS_SIZE_VER2: usize = 88;
+
+/// `struct clone_args`: eleven `__aligned_u64`s in the uapi's order. The handler
+/// that read them assembles one; [`clone3_verdict`] is a pure function of it, so
+/// every rule below is a host test rather than a boot.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct CloneArgs {
+    pub flags: u64,
+    pub pidfd: u64,
+    pub child_tid: u64,
+    pub parent_tid: u64,
+    pub exit_signal: u64,
+    pub stack: u64,
+    pub stack_size: u64,
+    pub tls: u64,
+    pub set_tid: u64,
+    pub set_tid_size: u64,
+    pub cgroup: u64,
+}
+
+impl CloneArgs {
+    /// The eleven words out of the struct's own bytes, little-endian. Both
+    /// machines are little-endian, and the uapi's `__aligned_u64` means the
+    /// caller's padding is a word rather than a byte, so this is the whole
+    /// decoding story.
+    pub fn from_bytes(bytes: &[u8; CLONE_ARGS_SIZE_VER2]) -> CloneArgs {
+        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        CloneArgs {
+            flags: word(0),
+            pidfd: word(8),
+            child_tid: word(16),
+            parent_tid: word(24),
+            exit_signal: word(32),
+            stack: word(40),
+            stack_size: word(48),
+            tls: word(56),
+            set_tid: word(64),
+            set_tid_size: word(72),
+            cgroup: word(80),
+        }
+    }
+}
+
+/// How much of the argument struct a caller's `size` asks the kernel to read:
+/// `min(size, VER2)` bytes, or `EINVAL` for a `size` too small to be a
+/// `clone_args` at all. The `EINVAL` comes *before* the pointer is looked at,
+/// measured (`.workbuddy/probe_clone3g.c`: a bogus pointer with `size = 8` is
+/// `EINVAL`, with `size = 64` it is `EFAULT`).
+pub fn clone3_read_len(size: usize) -> Result<usize, isize> {
+    if size < CLONE_ARGS_SIZE_VER0 {
+        return Err(err::EINVAL);
+    }
+    Ok(size.min(CLONE_ARGS_SIZE_VER2))
+}
+
+/// The bytes past `VER2`, which a caller with a larger `size` must have left
+/// zero: `true` when it did, `false` when one of them carries a field this
+/// kernel has never heard of (`E2BIG`). `byte(at)` reads the caller's byte at
+/// an offset from `VER2`.
+pub fn clone3_tail_is_zero(size: usize, byte: impl Fn(usize) -> u8) -> bool {
+    size <= CLONE_ARGS_SIZE_VER2 || (CLONE_ARGS_SIZE_VER2..size).all(|at| byte(at) == 0)
+}
+
+/// What a `clone_args` asks for, once every rule Linux checks has passed. The
+/// handler turns this into a [`crate::sched::CloneRequest`], computes the child
+/// stack and, when `CLONE_PIDFD` is set, writes a descriptor at `pidfd`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Clone3Plan {
+    /// The flag word, minus nothing: `clone3` carries its exit signal in a field
+    /// of its own, so unlike `clone(2)` there is no low byte to split off.
+    pub flags: usize,
+    pub exit_signal: u8,
+    /// Where the child's stack pointer starts, or `0` to inherit the caller's -
+    /// `clone3`'s own rule, which is *not* `clone(2)`'s: the struct's `stack` is
+    /// the **base** of the new stack and the kernel adds `stack_size` to it
+    /// (measured, and the mistake a first probe made by passing the top).
+    pub child_stack: usize,
+    /// Where the child's tid is written in the *caller's* memory, when
+    /// `CLONE_PARENT_SETTID` is set. Unlike `clone(2)`, `clone3` does not
+    /// require it, and a write that faults is ignored rather than reported.
+    pub parent_tid: usize,
+    pub child_tid: usize,
+    pub tls: usize,
+    /// The user address the new pidfd goes to, when `CLONE_PIDFD` is set.
+    pub pidfd: usize,
+}
+
+/// Decide what a `clone3` argument struct asks for, before anything is created.
+///
+/// The measurements behind each rule are `.workbuddy/probe_clone3{,b,c,d,e,f,g}.c`
+/// on Linux 7.2.11, one call per case:
+///
+/// * `CLONE_CHILD_SETTID` **is** a `clone3` flag, and unlike `clone(2)` it needs
+///   no pointer: with a real `child_tid`, with none, and beside `CLONE_VM` it
+///   starts a child (measured). The bit Linux does reject here is
+///   **`CLONE_DETACHED`** (`0x00400000`), which `clone(2)` still accepts as its
+///   historical no-op - so it stays *known* to this kernel's vocabulary and is
+///   refused by *this* door, `EINVAL`, which is why the mask below leaves it out
+///   while `validate_clone_flags` keeps it. (The first draft of this rule said
+///   the opposite and for the wrong bit: the C probe's `CLONE_CHILD_SETTID` was
+///   spelled `0x400000`, so it measured `CLONE_DETACHED`'s answer under the
+///   other flag's name - caught by the pin's own host run.)
+/// * `CLONE_SIGHAND` without `CLONE_VM`, and `CLONE_THREAD` without both, are
+///   `EINVAL` - `clone`'s own dependency chain, because a handler table cannot
+///   be shared by tasks that do not share memory.
+/// * `CLONE_PIDFD` with `pidfd = 0` is `EFAULT` (the write is what fails). With
+///   `CLONE_PARENT_SETTID` beside it the two writes may not share a destination:
+///   `pidfd == parent_tid` is `EINVAL`, and different destinations (a zero
+///   `parent_tid` among them) are served - measured, and the reason the first
+///   draft's unconditional refusal was wrong.
+/// * `CLONE_INTO_CGROUP` is `EBADF`: every descriptor this machine can pass is
+///   not a cgroup, which is exactly Linux's answer for one that is not
+///   (`cgroup_get_from_fd`), and there is no cgroup tree here for a descriptor
+///   to name.
+/// * `CLONE_CLEAR_SIGHAND` is `EOPNOTSUPP`. Linux serves it - the child starts
+///   with every disposition reset to `SIG_DFL` - but this kernel's process
+///   children *already* start there whatever the flags said (a `fork` here does
+///   not inherit its parent's handlers, which is a divergence of its own), so
+///   accepting the bit would answer a request this kernel cannot show it kept:
+///   with the flag and without it the child is identical, and a claim that
+///   passes either way pins nothing. Refusing by name is the honest half until
+///   the inheritance is Linux's; the prerequisite is written down in
+///   `docs/notes/` §6.10.
+/// * `set_tid`/`set_tid_size` must be both set or both zero. One set alone, or
+///   a size above one, is `EINVAL`; a single well-formed entry needs the child
+///   to land in a **new** pid namespace, so it is `EINVAL` without `CLONE_NEWPID`
+///   and `EOPNOTSUPP` with it - this kernel has no ordered `set_tid` support,
+///   and saying so is the honest refusal rather than a silently ignored field.
+/// * `exit_signal` above `SIGRTMAX` (64) is `EINVAL`; 0 and every number up to
+///   64 start a child.
+/// * `stack` and `stack_size` must both be set or both zero. When both are set
+///   the child starts at `stack + stack_size`; when both are zero it inherits
+///   the caller's stack pointer, which is how a fork-shaped `clone3` works.
+/// * An unknown flag bit is `EINVAL`, this kernel's designed divergence from
+///   Linux's "no check at all" (§6's clone-flag note); the bits this kernel
+///   knows are `clone`'s vocabulary plus `CLONE_PIDFD`,
+///   `CLONE_CLEAR_SIGHAND` and `CLONE_INTO_CGROUP`, minus `CLONE_DETACHED`.
+pub fn clone3_verdict(args: &CloneArgs) -> Result<Clone3Plan, isize> {
+    use crate::syscall::linux::nr as n;
+
+    const KNOWN: usize = n::CLONE_VM
+        | n::CLONE_FS
+        | n::CLONE_FILES
+        | n::CLONE_SIGHAND
+        | n::CLONE_VFORK
+        | n::CLONE_PARENT
+        | n::CLONE_THREAD
+        | n::CLONE_SYSVSEM
+        | n::CLONE_SETTLS
+        | n::CLONE_PARENT_SETTID
+        | n::CLONE_CHILD_CLEARTID
+        | n::CLONE_CHILD_SETTID
+        | n::CLONE_UNTRACED
+        | n::CLONE_PIDFD
+        | n::CLONE_CLEAR_SIGHAND
+        | n::CLONE_INTO_CGROUP
+        | n::CLONE_NAMESPACES;
+
+    let flags = args.flags as usize;
+    // `CLONE_DETACHED` is `clone(2)`'s historical no-op and no part of this
+    // door's vocabulary, so leaving it out of the mask above already answers
+    // `EINVAL`; the unknown-bit check is the rule, and this is why.
+    if flags & !KNOWN != 0 {
+        return Err(err::EINVAL);
+    }
+    if flags & n::CLONE_SIGHAND != 0 && flags & n::CLONE_VM == 0 {
+        return Err(err::EINVAL);
+    }
+    if flags & n::CLONE_THREAD != 0 && (flags & n::CLONE_SIGHAND == 0 || flags & n::CLONE_VM == 0) {
+        return Err(err::EINVAL);
+    }
+    if flags & n::CLONE_INTO_CGROUP != 0 {
+        return Err(err::EBADF);
+    }
+    if flags & n::CLONE_CLEAR_SIGHAND != 0 {
+        return Err(err::EOPNOTSUPP);
+    }
+    if flags & n::CLONE_PIDFD != 0 {
+        if args.pidfd == 0 {
+            return Err(err::EFAULT);
+        }
+        // Two writes to one address is the request being impossible; two
+        // *different* addresses are fine, which is what Linux checks.
+        if flags & n::CLONE_PARENT_SETTID != 0 && args.pidfd == args.parent_tid {
+            return Err(err::EINVAL);
+        }
+    }
+    // The pair rule first, then what a well-formed one asks for.
+    if (args.set_tid == 0) != (args.set_tid_size == 0) || args.set_tid_size > 1 {
+        return Err(err::EINVAL);
+    }
+    if args.set_tid_size == 1 {
+        return if flags & n::CLONE_NEWPID != 0 {
+            Err(err::EOPNOTSUPP)
+        } else {
+            Err(err::EINVAL)
+        };
+    }
+    if args.exit_signal > 64 {
+        return Err(err::EINVAL);
+    }
+    let (stack, stack_size) = (args.stack as usize, args.stack_size as usize);
+    if (stack == 0) != (stack_size == 0) {
+        return Err(err::EINVAL);
+    }
+    Ok(Clone3Plan {
+        flags,
+        exit_signal: args.exit_signal as u8,
+        child_stack: if stack == 0 {
+            0
+        } else {
+            stack.wrapping_add(stack_size)
+        },
+        parent_tid: args.parent_tid as usize,
+        child_tid: args.child_tid as usize,
+        tls: args.tls as usize,
+        pidfd: args.pidfd as usize,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // unshare(2): the flag word
 // ---------------------------------------------------------------------------
 
@@ -3814,6 +4050,167 @@ mod tests {
         assert_eq!(
             validate_clone_flags(n::CLONE_DETACHED | n::CLONE_UNTRACED | n::CLONE_FILES, 0, 0),
             Ok((0, n::CLONE_DETACHED | n::CLONE_UNTRACED | n::CLONE_FILES))
+        );
+    }
+
+    /// `clone3(2)`: the struct's size rules and every call the verdict refuses.
+    /// One measured case per line on Linux 7.2.11
+    /// (`.workbuddy/probe_clone3{,b,c,d,e,f,g}.c`), because `clone3` is not
+    /// `clone` with a struct: it rejects `CLONE_DETACHED`, which `clone(2)` keeps
+    /// as a no-op; it does not require the tid pointers, and its `stack` is the *base* of the new
+    /// stack rather than the top `clone(2)` names.
+    #[test]
+    fn clone3_args_are_validated_in_linuxs_order() {
+        use crate::syscall::err;
+        use crate::syscall::linux::nr as n;
+
+        // The size split is `copy_struct_from_user`: a size too small to be a
+        // `clone_args` is EINVAL *before* the pointer is looked at, a larger one
+        // reads up to VER2, and clear bytes past VER2 are required.
+        assert_eq!(clone3_read_len(0), Err(err::EINVAL));
+        assert_eq!(clone3_read_len(63), Err(err::EINVAL));
+        assert_eq!(clone3_read_len(CLONE_ARGS_SIZE_VER0), Ok(64));
+        assert_eq!(clone3_read_len(CLONE_ARGS_SIZE_VER2), Ok(88));
+        assert_eq!(clone3_read_len(256), Ok(88));
+        assert!(clone3_tail_is_zero(CLONE_ARGS_SIZE_VER2, |_| 1));
+        assert!(clone3_tail_is_zero(96, |_| 0));
+        assert!(!clone3_tail_is_zero(96, |at| u8::from(at == 90)));
+
+        // The eleven words decode from the struct's own bytes.
+        let mut bytes = [0u8; CLONE_ARGS_SIZE_VER2];
+        bytes[..8].copy_from_slice(&0x100u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        let decoded = CloneArgs::from_bytes(&bytes);
+        assert_eq!(decoded.flags, 0x100);
+        assert_eq!(decoded.exit_signal, 64);
+
+        let with = |flags: usize, pidfd: u64| CloneArgs {
+            flags: flags as u64,
+            pidfd,
+            ..Default::default()
+        };
+
+        // A bare `clone3` with no stack is the fork shape and is served; a
+        // half-set stack pair is refused, and both set means the child starts
+        // at `stack + stack_size`.
+        assert_eq!(clone3_verdict(&with(0, 0)).map(|p| p.child_stack), Ok(0));
+        let stacked = CloneArgs {
+            stack: 0x1000,
+            stack_size: 0x2000,
+            ..Default::default()
+        };
+        assert_eq!(clone3_verdict(&stacked).map(|p| p.child_stack), Ok(0x3000));
+        assert_eq!(
+            clone3_verdict(&CloneArgs {
+                stack: 0x1000,
+                ..Default::default()
+            }),
+            Err(err::EINVAL)
+        );
+        assert_eq!(
+            clone3_verdict(&CloneArgs {
+                stack_size: 0x1000,
+                ..Default::default()
+            }),
+            Err(err::EINVAL)
+        );
+
+        // The exit signal is a field of its own here, 0 through SIGRTMAX.
+        assert!(
+            clone3_verdict(&CloneArgs {
+                exit_signal: 64,
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        assert_eq!(
+            clone3_verdict(&CloneArgs {
+                exit_signal: 65,
+                ..Default::default()
+            }),
+            Err(err::EINVAL)
+        );
+
+        // `CLONE_CHILD_SETTID` is a clone3 flag; `CLONE_DETACHED` is not.
+        assert!(clone3_verdict(&with(n::CLONE_CHILD_SETTID, 0)).is_ok());
+        assert!(clone3_verdict(&with(n::CLONE_CHILD_SETTID | n::CLONE_VM, 0)).is_ok());
+        assert_eq!(
+            clone3_verdict(&with(n::CLONE_DETACHED, 0)),
+            Err(err::EINVAL)
+        );
+        // Unknown bits stay this kernel's designed EINVAL.
+        assert_eq!(
+            clone3_verdict(&with(n::CLONE_VM | (1 << 44), 0)),
+            Err(err::EINVAL)
+        );
+        // The same dependency chain `clone(2)` enforces.
+        assert_eq!(clone3_verdict(&with(n::CLONE_SIGHAND, 0)), Err(err::EINVAL));
+        assert!(clone3_verdict(&with(n::CLONE_VM | n::CLONE_SIGHAND, 0)).is_ok());
+        assert_eq!(
+            clone3_verdict(&with(n::CLONE_THREAD | n::CLONE_VM, 0)),
+            Err(err::EINVAL)
+        );
+        assert!(clone3_verdict(&with(n::CLONE_THREAD | n::CLONE_VM | n::CLONE_SIGHAND, 0)).is_ok());
+
+        // `CLONE_PIDFD`: the field is required and the tid write is exclusive.
+        assert_eq!(clone3_verdict(&with(n::CLONE_PIDFD, 0)), Err(err::EFAULT));
+        let pidfd = with(n::CLONE_PIDFD, 0x1000);
+        assert_eq!(clone3_verdict(&pidfd).map(|p| p.pidfd), Ok(0x1000));
+        // The two writes may not share a destination.
+        assert_eq!(
+            clone3_verdict(&CloneArgs {
+                flags: (n::CLONE_PIDFD | n::CLONE_PARENT_SETTID) as u64,
+                pidfd: 0x1000,
+                parent_tid: 0x1000,
+                ..Default::default()
+            }),
+            Err(err::EINVAL)
+        );
+        assert!(
+            clone3_verdict(&CloneArgs {
+                flags: (n::CLONE_PIDFD | n::CLONE_PARENT_SETTID) as u64,
+                pidfd: 0x1000,
+                parent_tid: 0x2000,
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        // Unlike `clone(2)`, a set `CLONE_PARENT_SETTID` needs no pointer, and
+        // `CLONE_CHILD_CLEARTID` needs none either.
+        assert!(clone3_verdict(&with(n::CLONE_PARENT_SETTID, 0)).is_ok());
+        assert!(clone3_verdict(&with(n::CLONE_PARENT_SETTID | n::CLONE_VM, 0)).is_ok());
+        assert!(clone3_verdict(&with(n::CLONE_CHILD_CLEARTID | n::CLONE_VM, 0)).is_ok());
+
+        // No descriptor can name a cgroup here.
+        assert_eq!(
+            clone3_verdict(&with(n::CLONE_INTO_CGROUP, 0)),
+            Err(err::EBADF)
+        );
+
+        // `set_tid`: the pair rule, the size bound, and the one well-formed
+        // entry - which needs a new pid namespace and this kernel's own answer.
+        let set_tid = |p: u64, size: u64, flags: usize| CloneArgs {
+            flags: flags as u64,
+            set_tid: p,
+            set_tid_size: size,
+            ..Default::default()
+        };
+        assert!(clone3_verdict(&set_tid(0, 0, 0)).is_ok());
+        assert_eq!(clone3_verdict(&set_tid(1, 0, 0)), Err(err::EINVAL));
+        assert_eq!(clone3_verdict(&set_tid(0, 1, 0)), Err(err::EINVAL));
+        assert_eq!(clone3_verdict(&set_tid(0x1000, 1, 0)), Err(err::EINVAL));
+        assert_eq!(
+            clone3_verdict(&set_tid(0x1000, 1, n::CLONE_NEWPID)),
+            Err(err::EOPNOTSUPP)
+        );
+        assert_eq!(clone3_verdict(&set_tid(0x1000, 100, 0)), Err(err::EINVAL));
+
+        // `CLONE_CLEAR_SIGHAND` is a known bit this kernel refuses by name, not a
+        // no-op it pretends to keep: `fork` here already starts a child at
+        // `SIG_DFL`, so accepting the flag could not be told from ignoring it.
+        assert_eq!(
+            clone3_verdict(&with(n::CLONE_CLEAR_SIGHAND, 0)),
+            Err(err::EOPNOTSUPP)
         );
     }
 

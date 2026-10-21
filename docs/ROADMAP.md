@@ -29,6 +29,12 @@ One-glance status of the whole roadmap.
   ask Linux's `kill_ok_by_cred` and `CAP_KILL` in the **target's** user namespace, and the record  
   door keeps the caller's `si_code`, `si_pid`, `si_uid` and `si_value` rather than overwriting  
   them (§2.6, item 91)
+- [ ] a child inherits its parent's signal dispositions — `fork`/`clone` here
+  start every process at `SIG_DFL` whatever the parent installed, where POSIX and
+  Linux copy the handler table; measured against the host while landing item 94,
+  and the reason `clone3`'s `CLONE_CLEAR_SIGHAND` is refused `EOPNOTSUPP` (with
+  the flag and without it a child is identical here, so accepting the bit could
+  not be told from ignoring it) (§6.10)
 - [ ] [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3) — and  
   `fstatfs` names the filesystem the descriptor was *opened on*, the two doors agreeing (§3.6, item 89),
   each instance now carrying a non-zero `f_fsid` instead of a zero every mount shared (§3.7, item 90)
@@ -78,6 +84,11 @@ One-glance status of the whole roadmap.
   description** into the caller's table, with Linux's refusal order (flags, pidfd, task,
   authority, target fd), `FD_CLOEXEC` unconditionally and `ESRCH` for a zombie or a leader
   that exited under a live worker (§6.9, item 93)
+- [x] the door that names its own child — `clone3` (435) serves a versioned
+  `struct clone_args` and `CLONE_PIDFD`, so a process and a descriptor naming it
+  come back in one call (no `pidfd_open` window); `stack` is the child region's
+  **base**, the size decides which fields exist, and `CLONE_DETACHED` is refused
+  as Linux's own `clone3` refuses it (§6.10, item 94)
 - [ ] [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET**, **TIME** and **USER** landed, each with its pin  
   (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`): the numbers a process  
   sees are the  
@@ -135,9 +146,15 @@ One-glance status of the whole roadmap.
 
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
-- [ ] the rest of the pidfd family — `clone3`'s `CLONE_PIDFD`,
-  `process_madvise(2)` — `ENOSYS`; the open/getfd/send/wait doors are served (§6.8/§6.9,
-  items 92–93)
+- [x] the extensible `clone` door — `clone3` (435) with a versioned argument
+  struct, and `CLONE_PIDFD` delivering the child **and a descriptor naming it** in
+  one call; `CLONE_DETACHED` refused as Linux's own `clone3` refuses it, the
+  `stack` being the *base* of the child's region rather than `clone(2)`'s stack
+  pointer (§6.10, item 94)
+- [ ] `process_madvise(2)` (440) — the pidfd family's one `ENOSYS` left, probed and
+  deferred: its one working advice is refused for another process and the rest are
+  hints this kernel answers as no-ops (§6.10); the open/getfd/send/wait doors are
+  served (§6.8/§6.9, items 92–93)
 - [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
 - [x] real-time signals `32..=64` — queued with per-copy `si_value`, bounded by the target user's `RLIMIT_SIGPENDING` (a full `sigqueue` is `EAGAIN`, `kill` drops and answers 0) (§2.3)
 - [x] POSIX timers 222–226 — routed, tick-scanned, musl's `SIGEV_THREAD_ID` shape works (§R.Remaining)

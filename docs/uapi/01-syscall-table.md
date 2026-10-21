@@ -5,10 +5,10 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ## 1. The syscall table
 
-`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **255** x86_64
-syscall numbers, `nr_aarch64.rs` the same **255** names under aarch64's numbers (the two tables
+`src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **256** x86_64
+syscall numbers, `nr_aarch64.rs` the same **256** names under aarch64's numbers (the two tables
 are one name set; only the words differ). The dispatch in `src/syscall/linux/mod.rs` has an
-explicit arm for **254** of them plus a `_ => ENOSYS` catch-all for the rest. That catch-all is
+explicit arm for **255** of them plus a `_ => ENOSYS` catch-all for the rest. That catch-all is
 deliberately crowded and is an honest answer (`AGENTS.md` §3.2): a libc probes optional calls by
 number and reads `ENOSYS` as "not available here".
 
@@ -274,6 +274,7 @@ is served as its phase section records it.
 | `statx` | 332 | fs | 291 |
 | `pidfd_send_signal` | 424 | proc | 424 |
 | `pidfd_open` | 434 | proc | 434 |
+| `clone3` | 435 | proc | 435 |
 | `openat2` | 437 | fs | 437 |
 | `pidfd_getfd` | 438 | proc | 438 |
 | `faccessat2` | 439 | fs | 439 |

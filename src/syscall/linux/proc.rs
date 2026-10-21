@@ -2062,6 +2062,148 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     child
 }
 
+/// `clone3(args, size)` - `clone` with an extensible argument struct, and the
+/// one door `CLONE_PIDFD` is spelled through.
+///
+/// The measured contract (`.workbuddy/probe_clone3{,b,c,d,e,f,g}.c`, Linux
+/// 7.2.11), with the rules themselves spelled in [`abi::clone3_verdict`]:
+///
+/// * `size` decides how much of the struct is read, and it is decided *before*
+///   the pointer: a bogus pointer with `size = 8` is `EINVAL`, with `size = 64`
+///   it is `EFAULT`. A `size` past the struct's last version is allowed only
+///   while every byte past it is zero, which is `E2BIG` otherwise.
+/// * the struct's `stack` is the **base** of the child's stack, not the top
+///   `clone(2)` names: the child starts at `stack + stack_size`. Both fields are
+///   set or neither is; a fork-shaped call with neither inherits the caller's
+///   stack pointer.
+/// * the `exit_signal` is a field of its own (0 through 64), so unlike
+///   `clone(2)` there is no low byte to split off the flag word.
+/// * `CLONE_PIDFD` delivers the new child's descriptor through the struct's
+///   `pidfd` field, so the caller gets the process and a name for it in one
+///   call - the pid-reuse window between a returned pid and a later
+///   `pidfd_open` does not exist. The descriptor is the same one
+///   [`handle_pidfd_open`] mints (one helper, so the two doors cannot
+///   disagree), and a child whose descriptor cannot be delivered is killed
+///   rather than left without a name.
+/// * a bad `parent_tid` pointer is *not* an error: Linux's `put_user` result is
+///   ignored (a pointer of `1` starts the child and answers success), so this
+///   writes when the destination is writable and skips it otherwise.
+pub(super) fn handle_clone3(args: [usize; ARG_COUNT], regs_ptr: *mut (), from_user: bool) -> isize {
+    let (uargs, size) = (args[0], args[1]);
+
+    let read_len = match abi::clone3_read_len(size) {
+        Ok(read_len) => read_len,
+        Err(e) => return e,
+    };
+    if !buffer_ok(uargs, read_len, false, from_user) {
+        return err::EFAULT;
+    }
+    // The bytes past the last version this kernel knows must be zero. They are
+    // read - Linux's `copy_struct_from_user` reads them too - so an unreadable
+    // one is `EFAULT` and a nonzero one is `E2BIG`. Walked in `MAX_IO` chunks so
+    // the page check above can bound each one.
+    if size > abi::CLONE_ARGS_SIZE_VER2 {
+        let mut at = abi::CLONE_ARGS_SIZE_VER2;
+        while at < size {
+            let chunk = (size - at).min(crate::uaccess::MAX_IO);
+            let Some(ptr) = uargs.checked_add(at) else {
+                return err::EFAULT;
+            };
+            if !buffer_ok(ptr, chunk, false, from_user) {
+                return err::EFAULT;
+            }
+            for i in 0..chunk {
+                if unsafe { *(ptr as *const u8).add(i) } != 0 {
+                    return err::E2BIG;
+                }
+            }
+            at += chunk;
+        }
+    }
+    // The struct's own 88 bytes, zero-filled where the caller's `size` stopped:
+    // that zero-fill is what makes an older caller's absent fields read as the
+    // defaults Linux's `copy_struct_from_user` gives them.
+    let mut bytes = [0u8; abi::CLONE_ARGS_SIZE_VER2];
+    unsafe {
+        core::ptr::copy_nonoverlapping(uargs as *const u8, bytes.as_mut_ptr(), read_len);
+    }
+    let plan = match abi::clone3_verdict(&abi::CloneArgs::from_bytes(&bytes)) {
+        Ok(plan) => plan,
+        Err(e) => return e,
+    };
+    // `CLONE_PIDFD` writes the descriptor through the struct, so its
+    // destination is asked about before anything is created: a caller that
+    // cannot receive it is refused rather than left with a child it has no name
+    // for. (`pidfd = 0` was already `EFAULT` in the verdict, which is where
+    // Linux's own failed write lands.)
+    let wants_pidfd = plan.flags & nr::CLONE_PIDFD != 0;
+    if wants_pidfd && !buffer_ok(plan.pidfd, 4, true, from_user) {
+        return err::EFAULT;
+    }
+
+    // SAFETY: the caller hands the gate's own frame for this task.
+    let ctx = match unsafe { crate::hal::user_context(regs_ptr, 0) } {
+        Some(ctx) => ctx,
+        None => return err::EINVAL,
+    };
+    // A fresh network namespace for the child, made here for the same reason
+    // `handle_clone` makes it: naming `net` belongs to this layer, not `sched`.
+    let net_ns = if plan.flags & crate::abi::CLONE_NEWNET != 0 {
+        Some(crate::net::mint_namespace(crate::sched::current_user_ns()))
+    } else {
+        None
+    };
+    let request = crate::sched::CloneRequest {
+        exit_signal: plan.exit_signal,
+        flags: plan.flags,
+        child_stack: plan.child_stack,
+        child_tid: plan.child_tid,
+        tls: plan.tls,
+        net_ns,
+    };
+    let child = crate::sched::clone(&ctx, request);
+    if child < 0 {
+        return child;
+    }
+
+    // `CLONE_PARENT_SETTID`: the child's number goes into the caller's memory,
+    // before the child has run. A destination the caller cannot write is skipped
+    // rather than refused - Linux ignores the failed `put_user`.
+    if plan.flags & nr::CLONE_PARENT_SETTID != 0
+        && plan.parent_tid != 0
+        && buffer_ok(plan.parent_tid, 4, true, from_user)
+    {
+        unsafe { (plan.parent_tid as *mut i32).write_unaligned(child as i32) };
+    }
+    // `CLONE_PIDFD`: the descriptor is minted after the child exists, because a
+    // pidfd names a task that is there - and it is written before this returns,
+    // so the caller has one name for the child and no window in which the number
+    // could have been reused.
+    // The field is only a destination when the flag names it: a nonzero `pidfd`
+    // without `CLONE_PIDFD` is Linux's to ignore, and the pin checks that it is
+    // left untouched.
+    if wants_pidfd {
+        let Some(id) = pid_task(child as isize) else {
+            return err::ESRCH;
+        };
+        match pidfd_for_task(id, 0) {
+            Ok(fd) => unsafe { (plan.pidfd as *mut i32).write_unaligned(fd) },
+            Err(e) => {
+                // Linux kills the child when it cannot hand the descriptor over.
+                // The caller reaps it through the ordinary `wait`, so this is a
+                // process it can see and not one it was never told about.
+                let _ = crate::sched::send_signal(id, crate::sched::signal::SIGKILL);
+                return e;
+            }
+        }
+    }
+    // The tracer announcement is a no-op for a task no tracer has touched: the
+    // same call the legacy door makes, so a tracer watching `PTRACE_O_TRACEFORK`
+    // sees a `clone3` child the way it sees a `fork` one.
+    tell_tracer_of_child(regs_ptr);
+    child
+}
+
 /// Send a signal to a process, or to a whole process group. Used by `kill` and
 /// `tkill`.
 ///
@@ -2152,25 +2294,39 @@ pub(super) fn handle_pidfd_open(args: [usize; ARG_COUNT]) -> isize {
     let Some(id) = pid_task(pid) else {
         return err::ESRCH;
     };
-    // `None` is a task that exists but does not lead its group - Linux's
-    // `ENOENT` for "that is a thread, not a process".
+    match pidfd_for_task(id, flags) {
+        Ok(fd) => fd as isize,
+        Err(e) => e,
+    }
+}
+
+/// Mint a pidfd naming `id` and install it at the lowest free descriptor, with
+/// `FD_CLOEXEC` set. The one place a pidfd's descriptor is built, shared by
+/// `pidfd_open` and `clone3`'s `CLONE_PIDFD` so the two doors cannot disagree
+/// about what a pidfd is, what its flags are or when a task has none.
+///
+/// `status_flags` is the `F_SETFL` half `pidfd_open` may ask for (`O_NONBLOCK`
+/// alone); `clone3` has no such word and passes none. `Err(ENOENT)` is a task
+/// that exists but does not lead its group - Linux's own answer for "that is a
+/// thread, not a process".
+fn pidfd_for_task(id: crate::sched::TaskId, status_flags: u32) -> Result<i32, isize> {
     let Some((id, generation)) = crate::sched::pidfd_identity(id) else {
-        return err::ENOENT;
+        return Err(err::ENOENT);
     };
     let file = Arc::new(crate::vfs::File::new(crate::vfs::pidfd::PidFd::new(
         id, generation,
     )));
     // `set_status` keeps only the `F_SETFL` half, which is exactly the one bit
-    // this door accepts; the access mode stays `O_RDWR` from `File::new`, the
+    // `pidfd_open` accepts; the access mode stays `O_RDWR` from `File::new`, the
     // mode Linux's `F_GETFL` reports for this descriptor.
-    file.set_status(flags);
+    file.set_status(status_flags);
     let fd = match crate::sched::current_fds().install(file) {
         Ok(fd) => fd,
-        Err(e) => return err_of(e),
+        Err(e) => return Err(err_of(e)),
     };
     // Not a failure the caller can act on - and Linux sets it unconditionally.
     let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
-    fd as isize
+    Ok(fd)
 }
 
 /// `pidfd_getfd(pidfd, targetfd, flags)` — duplicate one of the named

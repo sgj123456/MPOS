@@ -5029,3 +5029,91 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `PTRACE_MODE_ATTACH_REALCREDS` compares group ids too and this kernel
     compares the real/effective uid set; every task is root on this image, so
     nothing in the gate can tell them apart.
+
+## item 94 — the extensible `clone` door, and the one that names its own child
+
+    `clone(2)` is a 32-bit flag word with an exit signal in its low byte, five
+    positional arguments and no room for anything new. `clone3(435)` replaces
+    all of that with one versioned `struct clone_args`, and the reason it is on
+    this list is its `CLONE_PIDFD`: the process and a descriptor naming it come
+    back in the same call, so there is no window between a returned pid and a
+    later `pidfd_open` in which that number could be handed to another tenant -
+    the hole item 92 closed for a number already held, closed for the creation
+    itself.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_clone3{,b,c,d,e,f,g,h,i}.c`,
+    Linux 7.2.11; the numbered list is the order the probes were run, and two of
+    them were wrong in ways worth keeping). **The size rules**: a `size` below
+    `CLONE_ARGS_SIZE_VER0` (64) is `EINVAL` *before* the pointer is read (a bogus
+    pointer with `size = 8` is `EINVAL`, with `size = 64` `EFAULT`), the words
+    between `size` and `VER2` (88) read as zero, and a `size` past `VER2` is
+    allowed only while every byte past it is zero (`E2BIG` otherwise). **The
+    stack rules**: `stack` is the *base* of the region and the child starts at
+    `stack + stack_size` - not `clone(2)`'s "the stack pointer itself" - both
+    fields set together or neither, and neither set means the child inherits the
+    caller's stack pointer. **The exit signal** is a field of its own, 0 through
+    `SIGRTMAX` (64); 65 is `EINVAL`. **The flags**: `CLONE_SIGHAND` without
+    `CLONE_VM` and `CLONE_THREAD` without both are `EINVAL`; `CLONE_CHILD_SETTID`
+    is served and needs no pointer (alone, beside `CLONE_VM`, with a real
+    `child_tid` or with none); `CLONE_PARENT_SETTID` needs none either, and a
+    destination the caller cannot write is *skipped*; `CLONE_DETACHED` -
+    `clone(2)`'s historical no-op - is `EINVAL`; an unknown bit is `EINVAL`
+    (Linux's own `clone3` check, unlike `clone(2)`'s absence of one);
+    `CLONE_PIDFD` with `pidfd = 0` is `EFAULT` and two writes aimed at one
+    address (`pidfd == parent_tid`) are `EINVAL`, while different destinations
+    are served; `CLONE_INTO_CGROUP` is `EBADF`; `set_tid`/`set_tid_size` must be
+    both set or both zero, a size above one is `EINVAL`, and one well-formed
+    entry needs a new pid namespace (this kernel refuses it `EOPNOTSUPP`, Linux
+    would serve it).
+
+    **Two probe mistakes are worth their lines.** The first draft of this item
+    was measured with `CLONE_CHILD_SETTID` spelled `0x400000`, which is
+    `CLONE_DETACHED` - so "clone3 rejects `CLONE_CHILD_SETTID`" was a rule about
+    the wrong bit, and the pin's own host run caught it (the corrected probe is
+    `probe_clone3h.c`). The second: a probe whose child returned 0 and carried on
+    through `main` rather than branching to an exit forked a tree of copies of
+    itself, which is how a `clone3` fixture teaches the difference between "the
+    child returns from the call" and "the child is a fresh function call".
+
+    **The landing.** `nr_x86_64.rs`/`nr_aarch64.rs` name `CLONE3 = 435`; the
+    argument struct's decode and every rule above sit in
+    `abi::clone3_read_len`/`clone3_tail_is_zero`/`clone3_verdict` (host-compiled,
+    host-tested); `proc::handle_clone3` reads the struct, asks the verdict, builds
+    the same `CloneRequest` the legacy door builds and hands it to
+    `sched::clone`; `pidfd_for_task` - the one place a pidfd is built, now shared
+    with `pidfd_open` - mints `CLONE_PIDFD`'s descriptor, and a child whose
+    descriptor cannot be delivered is killed rather than left without a name.
+    `crates/abi` gains `CLONE_PIDFD`, `CLONE_CLEAR_SIGHAND` and
+    `CLONE_INTO_CGROUP` (the three bits a 32-bit `clone` word cannot carry).
+
+    **Pins**: **`t-clone3`**, a new program, **37 claims**, green on a current
+    host first and the 37 `ok:` lines byte-identical on both machines - the
+    delivered descriptor (close-on-exec, `O_RDWR`, naming the child while it is
+    alive, `ESRCH` after the reap, and a *different* number from a later
+    `pidfd_open`), the size discipline, the flags, the exit signal, the stack
+    pair with a child that really reports from the top of its own mapping, and
+    `CLONE_CHILD_SETTID` read back by the child itself. Beside them, the
+    host-tested leaf: `clone3_args_are_validated_in_linuxs_order` and the three
+    new `mpos-abi` constant assertions. The counterfactual (the dispatch arm
+    removed, so `clone3` falls to `_ => ENOSYS`) is all **36 claims red** at the
+    time of that run and no other program red.
+
+    **Gate**: x86_64 `pass=195 fail=0` (195 built, 6 lanes), aarch64 `194 staged,
+    pass=194 fail=0` (14 left out by `tests.toml`), `mpos-kunit 32 passed, 0
+    failed` on both; host unit suite 590, `mpos-abi` 5, `xtask` 139; `cargo fmt
+    --check` clean; clippy 0 errors on both bare-metal targets; depgraph holds.
+
+    **Named**: `process_madvise(2)` (440) is the pidfd family's last `ENOSYS`
+    (probed and deferred: its only real advice, `MADV_DONTNEED`, is refused
+    `EINVAL` for another process on this host, and the rest are hints this kernel
+    answers as no-ops, so a door here would be a shape without work behind it).
+    `CLONE_CLEAR_SIGHAND` is `EOPNOTSUPP` because this kernel's `fork` already
+    starts every process at `SIG_DFL` (a divergence of its own, not inherited
+    from the parent as POSIX requires), so accepting the bit could not be told
+    from ignoring it. `CLONE_NEWTIME` through this door is `EOPNOTSUPP` (this
+    kernel has no clock namespace to hand a child through `clone`; `unshare` is
+    the door that serves it). `CLONE_PTRACE` and any unknown bit are `EINVAL`
+    (this kernel's designed unknown-bit rule, which `clone(2)` shares). `clone3`
+    carries no `CLONE_VM`-without-`CLONE_THREAD` sharing here - a copy marks the
+    contract better, as `vfork`'s own note says - so a caller relying on that
+    word's shared memory is a divergence named rather than served.

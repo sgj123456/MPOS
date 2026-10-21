@@ -238,6 +238,7 @@ pub const RT_SIGPENDING: u64 = 136; // 127 on x86_64
 pub const RT_SIGQUEUEINFO: u64 = 138; // 129 on x86_64
 pub const PIDFD_SEND_SIGNAL: u64 = 424; // 424 on x86_64
 pub const PIDFD_OPEN: u64 = 434; // 434 on x86_64
+pub const CLONE3: u64 = 435; // 435 on x86_64
 pub const PIDFD_GETFD: u64 = 438; // 438 on x86_64
 pub const RT_SIGSUSPEND: u64 = 133; // 130 on x86_64
 pub const PAUSE: u64 = 64033; // no arm64 number; unreachable on aarch64

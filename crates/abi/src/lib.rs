@@ -87,6 +87,31 @@ pub const CLONE_DETACHED: usize = 0x0040_0000;
 pub const CLONE_UNTRACED: usize = 0x0080_0000;
 pub const CLONE_CHILD_SETTID: usize = 0x0100_0000;
 
+// The three bits `clone(2)` cannot carry at all: each asks for something the
+// legacy call has no room to describe, so each is a `clone3(2)` flag. They live
+// beside `clone`'s word because both handlers decode one vocabulary
+// (`syscall::linux::abi::clone3_verdict` reads them with the rest) and the last
+// two are above bit 31, which is exactly why `clone`'s 32-bit flag word could
+// never have spelled them.
+//
+// `CLONE_PIDFD` is the bit this kernel serves for real: the child is made and
+// the descriptor that names it is delivered in the same call, so a caller never
+// has a window in which the pid it was told could have been reused. The other
+// two are named refusals rather than silent no-ops - see `clone3_verdict`.
+/// Hand the caller a pidfd for the new child, written through the argument
+/// struct's `pidfd` field. Measured on Linux 7.2.11
+/// (`.workbuddy/probe_clone3*.c`): the field is required (`pidfd = 0` is
+/// `EFAULT`, because the write is attempted), and combining the bit with
+/// `CLONE_PARENT_SETTID` is `EINVAL`.
+pub const CLONE_PIDFD: usize = 0x0000_1000;
+/// The child starts with every signal disposition reset to `SIG_DFL`, the mask
+/// untouched. This kernel serves it (`CloneRequest::clear_sighand`).
+pub const CLONE_CLEAR_SIGHAND: usize = 0x0001_0000_0000;
+/// Put the child in a cgroup named by a descriptor in the argument struct.
+/// This kernel has no cgroup tree, so no descriptor can name one: the refusal
+/// is the `EBADF` Linux answers for an fd that is not a cgroup.
+pub const CLONE_INTO_CGROUP: usize = 0x0002_0000_0000;
+
 pub const CLONE_NEWTIME: usize = 0x0000_0080;
 pub const CLONE_NEWNS: usize = 0x0002_0000;
 pub const CLONE_NEWCGROUP: usize = 0x0200_0000;
@@ -400,20 +425,22 @@ pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isi
     if asked & CLONE_NEWUSER == 0 && gated != 0 && !privileged {
         return Err(mpos_err::EPERM);
     }
-    // `CLONE_NEWTIME` is deliberately **not** ruled on here, and the reason is
-    // measured: its bit is `0x80`, entirely inside the `CSIGNAL` byte, so
-    // `clone(2)` reads it as an exit signal and a caller cannot name it through
-    // this call at all. `.workbuddy/probe-clone-timens.c` (host 7.2) shows
-    // `clone(SIGCHLD|CLONE_NEWTIME)` = `0x91` answering `EINVAL` while
-    // `clone(SIGCHLD|CLONE_NEWNET)` succeeds - and `clone(0x80)` *alone* answers
-    // `EINVAL` too, which is what fixes the explanation as the signal number
-    // rather than the namespace. `.workbuddy/probe-clone3-timens.c` agrees from
-    // the other side: `clone3`, which carries the exit signal in its own field,
-    // *creates* a task for `CLONE_NEWTIME` - so the flag is not refused as a
-    // request, it is simply unexpressible here. This kernel reaches the same
-    // `EINVAL` by the same route, from its own signal validation, so nothing is
-    // owed to a caller: `unshare` is the one door, and it is the door Linux
-    // documents (§6.3).
+    // `CLONE_NEWTIME` is deliberately **not** in `SERVED`, and the two doors
+    // reach the refusal by different routes. Through `clone(2)` a caller cannot
+    // name it at all: its bit is `0x80`, entirely inside the `CSIGNAL` byte, so
+    // the call reads it as an exit signal and this kernel's own signal
+    // validation answers `EINVAL` - measured, `.workbuddy/probe-clone-timens.c`
+    // (`clone(SIGCHLD|CLONE_NEWTIME)` = `0x91` is `EINVAL` while
+    // `clone(SIGCHLD|CLONE_NEWNET)` succeeds, and `clone(0x80)` alone is
+    // `EINVAL` too, which fixes the explanation as the signal number rather
+    // than the namespace). Through `clone3(2)` - which carries the exit signal
+    // in a field of its own and so *can* spell the bit - the flag arrives and
+    // is refused here: Linux creates a task for it (`.workbuddy/probe-clone3-
+    // timens.c`), and this kernel has no way to give the child a clock
+    // namespace of its own through `clone`, so it is `EOPNOTSUPP` for a
+    // privileged caller and `EPERM` for one without `CAP_SYS_ADMIN` - the
+    // unserved-kind and capability rules below, in their own order. `unshare`
+    // is the door that serves the clocks (§6.3).
     // A *thread* with a namespace of its own is something Linux serves - its
     // `create_new_namespaces` runs for a thread too - and something this kernel
     // cannot: `sched::spawn_thread` copies the creating process's namespaces by
@@ -639,6 +666,11 @@ mod tests {
         assert_eq!(CLONE_DETACHED, 0x0040_0000);
         assert_eq!(CLONE_UNTRACED, 0x0080_0000);
         assert_eq!(CLONE_CHILD_SETTID, 0x0100_0000);
+        // The three `clone3(2)` bits, measured on Linux 7.2.11 by calling
+        // `clone3` with each alone (`.workbuddy/probe_clone3d.c`).
+        assert_eq!(CLONE_PIDFD, 0x0000_1000);
+        assert_eq!(CLONE_CLEAR_SIGHAND, 0x0001_0000_0000);
+        assert_eq!(CLONE_INTO_CGROUP, 0x0002_0000_0000);
     }
 
     #[test]
