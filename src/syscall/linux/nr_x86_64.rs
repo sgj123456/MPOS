@@ -411,6 +411,8 @@ pub const RT_SIGQUEUEINFO: u64 = 129;
 pub const PIDFD_SEND_SIGNAL: u64 = 424;
 /// `pidfd_open(2)`: a descriptor for a process, stable across pid reuse.
 pub const PIDFD_OPEN: u64 = 434;
+/// `pidfd_getfd(2)`: duplicate one of another process's descriptors.
+pub const PIDFD_GETFD: u64 = 438;
 /// `rt_sigsuspend(2)`: swap the mask and wait for a signal outside it.
 pub const RT_SIGSUSPEND: u64 = 130;
 /// `pause(2)`: the original "wait for a signal" - a sleep that only a

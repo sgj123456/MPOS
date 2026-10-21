@@ -39,7 +39,7 @@
 | 特性 | 说明 |
 |---------|-------------|
 | **自研 UEFI 引导加载器** | `mpos-boot` 从 ESP 读取内核、initramfs 和命令行，构建页表和高半区映射，应用内核的重定位然后跳转——之后便不复存在。没有第三方引导加载器，没有 ISO |
-| **Linux ABI 兼容** | 254 个 Linux x86_64 系统调用号被命名并路由；基于 musl 的二进制程序（Alpine、busybox、`apk`、`fish`、weston）未经修改即可运行 |
+| **Linux ABI 兼容** | 255 个 Linux x86_64 系统调用号被命名并路由；基于 musl 的二进制程序（Alpine、busybox、`apk`、`fish`、weston）未经修改即可运行 |
 | **帧缓冲控制台** | virtio-gpu 2D scanout，一个在引导后*真正迁移到帧缓冲上*的内核控制台，虚拟控制台（`Ctrl-A 1..6`；镜像在 `tty1`..`tty4` 上运行 `getty`），以及一个尽力而为的串口镜像——它绝不会拖累窗口刷新 |
 | **DRM/KMS + fbdev** | 带 fbdev ioctl 的 `/dev/fb0`，以及遵循 Linux DRM UAPI 的 `/dev/dri/card0`——dumb buffer、页面翻转、vblank 事件、render node、PRIME。这正是 **weston** 走的路径：它的 DRM 后端经由 `seatd`，配合 Mesa 的软件 GL（llvmpipe），基于 GBM dumb buffer。没有 GPU 侧 3D，也没有 virgl |
 | **输入** | virtio-keyboard 与 virtio-tablet 以 evdev 节点呈现（`/dev/input/eventN`、能力 ioctl、按打开文件粒度的 grab），外加 `/dev/uinput`，程序可以借此创建属于自己的设备 |
@@ -69,7 +69,7 @@ graph TB
 
     subgraph KernelSpace["内核空间 (Ring 0)"]
         subgraph Gate["系统调用门"]
-            SYSCALL["syscall / sysret<br/>路由 254 个调用号"]
+            SYSCALL["syscall / sysret<br/>路由 255 个调用号"]
         end
 
         subgraph VFSLayer["vfs"]
@@ -225,8 +225,8 @@ graph LR
 
 ## 系统调用
 
-`src/syscall/linux/nr.rs` 命名了 **254 个 Linux x86_64 系统调用号**；每一个都由
-`src/syscall/linux/mod.rs` 中的分发表路由，其中约 236 个真正工作——剩下的少数几个回答
+`src/syscall/linux/nr.rs` 命名了 **255 个 Linux x86_64 系统调用号**；每一个都由
+`src/syscall/linux/mod.rs` 中的分发表路由，其中约 237 个真正工作——剩下的少数几个回答
 `ENOSYS`，由 `docs/notes/` 作为剩余 ABI 缺口追踪记录（`fanotify`、`keyctl`、`userfaultfd`、
 实时信号 33–64、`io_uring`）。POSIX 间隔定时器（`timer_create` 222 … `timer_delete` 226）
 以它们本来的五个调用号加入了真正工作的集合；`SIGRTMIN`（32）可以被排队、屏蔽和等待——

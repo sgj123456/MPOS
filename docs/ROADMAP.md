@@ -74,6 +74,10 @@ One-glance status of the whole roadmap.
   generation, so a reused pid reads "gone"; `pidfd_send_signal` keeps §2.6's permission rule and
   its four scopes, `waitid(P_PIDFD)` resolves the descriptor and honours `O_NONBLOCK`/`EAGAIN`,
   and poll/epoll see `POLLIN` at group death and `POLLHUP` only at the reap (§6.8, item 92)
+- [x] a pidfd can fetch a descriptor — `pidfd_getfd` duplicates the target's **open file
+  description** into the caller's table, with Linux's refusal order (flags, pidfd, task,
+  authority, target fd), `FD_CLOEXEC` unconditionally and `ESRCH` for a zombie or a leader
+  that exited under a live worker (§6.9, item 93)
 - [ ] [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET**, **TIME** and **USER** landed, each with its pin  
   (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`): the numbers a process  
   sees are the  
@@ -131,8 +135,9 @@ One-glance status of the whole roadmap.
 
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
-- [ ] the rest of the pidfd family — `pidfd_getfd(2)`, `clone3`'s `CLONE_PIDFD`,
-  `process_madvise(2)` — `ENOSYS`; the open/send/wait doors are served (§6.8, item 92)
+- [ ] the rest of the pidfd family — `clone3`'s `CLONE_PIDFD`,
+  `process_madvise(2)` — `ENOSYS`; the open/getfd/send/wait doors are served (§6.8/§6.9,
+  items 92–93)
 - [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
 - [x] real-time signals `32..=64` — queued with per-copy `si_value`, bounded by the target user's `RLIMIT_SIGPENDING` (a full `sigqueue` is `EAGAIN`, `kill` drops and answers 0) (§2.3)
 - [x] POSIX timers 222–226 — routed, tick-scanned, musl's `SIGEV_THREAD_ID` shape works (§R.Remaining)

@@ -1404,6 +1404,27 @@ pub fn pidfd_group_alive(id: TaskId, generation: u64) -> bool {
     })
 }
 
+/// The descriptor table of the process a pidfd names, while that process is
+/// still the tenant that descriptor was made for and has not exited.
+///
+/// `None` is Linux's `ESRCH` for `pidfd_getfd(2)`: a reaped slot, a slot now
+/// held by another tenant, or a task that has already exited. Measured on a
+/// current host (`.workbuddy/probe_pidfd_getfd{,2}.c`, Linux 7.2.11): a
+/// zombie's pidfd answers `ESRCH` - both while it waits to be reaped and after
+/// the reap - and so does a leader that exited under a live worker, even though
+/// the worker's descriptors are still the group's.
+///
+/// The table is handed out as an `Arc` so the caller can look a descriptor up
+/// without holding the scheduler's table lock: a target that exits in between
+/// closes its descriptions and the lookup answers `EBADF`, which is the same
+/// race Linux runs (the task is pinned, its files are not).
+pub fn pidfd_fd_table(id: TaskId, generation: u64) -> Option<Arc<crate::vfs::file::FdTable>> {
+    with_table(|t| {
+        let task = t.tasks.get(id.0).and_then(Option::as_ref)?;
+        (!task.exited && t.generations[id.0] == generation).then(|| task.fds.clone())
+    })
+}
+
 /// A live thread of the group a process pidfd names, the leader preferred.
 ///
 /// This is where a signal aimed at the *process* lands: Linux queues it on the

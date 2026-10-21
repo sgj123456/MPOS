@@ -2173,6 +2173,73 @@ pub(super) fn handle_pidfd_open(args: [usize; ARG_COUNT]) -> isize {
     fd as isize
 }
 
+/// `pidfd_getfd(pidfd, targetfd, flags)` — duplicate one of the named
+/// process's descriptors into the caller's own table.
+///
+/// The measured contract (`.workbuddy/probe_pidfd_getfd{,2}.c`, Linux 7.2.11):
+///
+/// * the order is **flags → pidfd descriptor → task → permission → target
+///   fd**, which is not the order the arguments are written in. A bad flag
+///   word is `EINVAL` even beside a bad pidfd; a number that names nothing or
+///   a file that is not a pidfd is `EBADF`; a reaped pidfd, a zombie and a
+///   leader that exited under a live worker are all `ESRCH`; a non-dumpable
+///   target of the same uid is `EPERM`, and it outranks the target fd - a
+///   nonexistent fd beside a non-dumpable target is `EPERM`; only then is a
+///   missing target descriptor `EBADF`.
+/// * `flags` is unused and must be zero - Linux reads a non-zero word as
+///   `EINVAL`, not as a set of bits to honour.
+/// * the new number is the lowest free one and carries `FD_CLOEXEC`
+///   unconditionally. It names the **same open file description**, so two
+///   fetches of one target share their offset and a read through either
+///   advances both; it is not a copy of the descriptor's state.
+/// * a live, same-uid process is enough. A parent relation is not required,
+///   which is what makes this a descriptor door rather than a child-only one;
+///   the authority is [`crate::sched::may_inspect`]'s own `ptrace` rule.
+pub(super) fn handle_pidfd_getfd(args: [usize; ARG_COUNT]) -> isize {
+    let (pidfd, target_fd, flags) = (args[0] as i32, args[1] as i32, args[2] as u32);
+    if flags != 0 {
+        return err::EINVAL;
+    }
+    let file = match crate::sched::current_fds().clone_at(pidfd) {
+        Ok(file) => file,
+        Err(_) => return err::EBADF,
+    };
+    let inode = file.inode();
+    let Some(pidfd) = inode.as_pidfd() else {
+        return err::EBADF;
+    };
+    let (id, generation) = (pidfd.id(), pidfd.generation());
+    // The generation is checked before the permission question, so a slot that
+    // has been handed to another tenant is "gone" rather than "somebody else's
+    // process, which may be inspectable".
+    if !crate::sched::pidfd_still_names(id, generation) {
+        return err::ESRCH;
+    }
+    // `None` is a task that has exited - a zombie's descriptors are already
+    // closed, and Linux answers `ESRCH` rather than `EBADF`.
+    match crate::sched::may_inspect(id) {
+        None => return err::ESRCH,
+        Some(false) => return err::EPERM,
+        Some(true) => {}
+    }
+    let Some(files) = crate::sched::pidfd_fd_table(id, generation) else {
+        return err::ESRCH;
+    };
+    let target = match files.clone_at(target_fd) {
+        Ok(file) => file,
+        Err(_) => return err::EBADF,
+    };
+    let fd = match crate::sched::current_fds().install(target) {
+        Ok(fd) => fd,
+        Err(e) => return err_of(e),
+    };
+    // Always close-on-exec, the one flag this door spends whether or not the
+    // caller asked for it (measured: `F_GETFD` has `FD_CLOEXEC` on every
+    // successful fetch).
+    let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    fd as isize
+}
+
 /// `pidfd_send_signal(pidfd, sig, info, flags)` — `kill` addressed by a
 /// descriptor, with the caller's `siginfo_t` carried through.
 ///

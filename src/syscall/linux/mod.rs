@@ -605,6 +605,7 @@ pub unsafe fn dispatch(
         nr::CLOCK_GETRES => proc::handle_clock_getres(args),
         nr::WAITID => proc::handle_waitid(args, from_user),
         nr::PIDFD_OPEN => proc::handle_pidfd_open(args),
+        nr::PIDFD_GETFD => proc::handle_pidfd_getfd(args),
         nr::GETRLIMIT => abi::handle_getrlimit(args, from_user),
         nr::SETRLIMIT => abi::handle_setrlimit(args, from_user),
         nr::MEMBARRIER => abi::handle_membarrier(args),

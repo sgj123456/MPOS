@@ -43,7 +43,7 @@ behind `#[cfg(target_os = "none")]`, which is what keeps the host build free of 
 | Feature | Description |
 |---------|-------------|
 | **Own UEFI loader** | `mpos-boot` reads the kernel, the initramfs and the command line off the ESP, builds the page tables and the higher-half mapping, applies the kernel's relocations and jumps — then stops existing. No third-party bootloader, no ISO |
-| **Linux ABI compatible** | 254 Linux x86_64 syscall numbers are named and routed; musl binaries (Alpine, busybox, `apk`, `fish`, weston) run unmodified |
+| **Linux ABI compatible** | 255 Linux x86_64 syscall numbers are named and routed; musl binaries (Alpine, busybox, `apk`, `fish`, weston) run unmodified |
 | **Framebuffer console** | virtio-gpu 2D scanout, a kernel console that *moves onto it* after boot, virtual consoles (`Ctrl-A 1..6`; the image runs a `getty` on `tty1`..`tty4`), and a best-effort serial mirror that never throttles the window |
 | **DRM/KMS + fbdev** | `/dev/fb0` with the fbdev ioctls and `/dev/dri/card0` speaking the Linux DRM UAPI — dumb buffers, page flip, vblank events, render node, PRIME. This is the path **weston** takes: its DRM backend through `seatd`, with Mesa's software GL (llvmpipe) over GBM dumb buffers. No GPU-side 3D and no virgl |
 | **Input** | virtio-keyboard and virtio-tablet as evdev nodes (`/dev/input/eventN`, capability ioctls, per-open-file grab), plus `/dev/uinput` so a program can create a device of its own |
@@ -74,7 +74,7 @@ graph TB
 
     subgraph KernelSpace["Kernel Space (Ring 0)"]
         subgraph Gate["Syscall gate"]
-            SYSCALL["syscall / sysret<br/>254 numbers routed"]
+            SYSCALL["syscall / sysret<br/>255 numbers routed"]
         end
 
         subgraph VFSLayer["vfs"]
@@ -230,8 +230,8 @@ graph LR
 
 ## Syscalls
 
-`src/syscall/linux/nr.rs` names **254 Linux x86_64 syscall numbers**; every one of them is
-routed by the dispatch table in `src/syscall/linux/mod.rs`, and roughly 236 do real work — the
+`src/syscall/linux/nr.rs` names **255 Linux x86_64 syscall numbers**; every one of them is
+routed by the dispatch table in `src/syscall/linux/mod.rs`, and roughly 237 do real work — the
 handful that do not answer `ENOSYS`, which `docs/notes/` tracks as the remaining ABI gap
 (`fanotify`, `keyctl`, `userfaultfd`, real-time signals 33–64, `io_uring`). The POSIX interval
 timers (`timer_create` 222 … `timer_delete` 226) joined that set with the five numbers they are;

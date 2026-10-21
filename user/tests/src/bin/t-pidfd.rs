@@ -1,11 +1,11 @@
-//! t-pidfd - the process-descriptor family: `pidfd_open`, `pidfd_send_signal`
-//! and `waitid(P_PIDFD)`.
+//! t-pidfd - the process-descriptor family: `pidfd_open`, `pidfd_getfd`,
+//! `pidfd_send_signal` and `waitid(P_PIDFD)`.
 //!
 //! A pid is a number a process can lose and somebody else can inherit; a pidfd
 //! is the descriptor that names the task itself. This program pins the shape
 //! Linux gives that descriptor, measured on a current host before the kernel's
 //! side was written (`.workbuddy/probe_pidfd{,2,3,5,6,7}.c`,
-//! `probe_waitid_pidfd_zombie.c`, Linux 7.2.11):
+//! `probe_waitid_pidfd_zombie.c`, `probe_pidfd_getfd{,2}.c`, Linux 7.2.11):
 //!
 //! * **the descriptor**: `F_GETFL` is `O_RDWR` (`0x2`), `FD_CLOEXEC` is set
 //!   whatever the flags word said, and `O_NONBLOCK` is the only flag the door
@@ -34,7 +34,13 @@
 //! * **the record**: a NULL `siginfo_t` becomes `SI_USER` naming the sender,
 //!   a caller's negative `si_code` is carried through, a kernel-made code
 //!   (`SI_USER`, `SI_TKILL`, any non-negative) is `EPERM` for another process
-//!   but passes verbatim when the target is the caller's own group.
+//!   but passes verbatim when the target is the caller's own group;
+//! * **`pidfd_getfd`**: the refusal order is flags, pidfd, task, authority,
+//!   target fd - so a non-zero flag word is `EINVAL` beside a bad pidfd, a
+//!   zombie or reaped process is `ESRCH`, and a non-dumpable same-uid target
+//!   is `EPERM` even when the target fd does not exist. The fetch is the same
+//!   open file description (two fetches share one offset), the new number is
+//!   the lowest free one, and it is `FD_CLOEXEC` whatever the flags said.
 //!
 //! # Why raw doors
 //!
@@ -43,7 +49,7 @@
 //! the words Linux must refuse - and the `siginfo_t` a send carries have no
 //! binding to go through. `pidfd_send_signal` in rustix takes a signal only.
 //! The calls are therefore `libc::syscall`, with the numbers from libc's own
-//! per-machine table (424 and 434 on both machines), and the record is read
+//! per-machine table (424, 434 and 438 on both machines), and the record is read
 //! back through `libc::siginfo_t`'s accessors rather than through offsets this
 //! file would have to remember.
 //!
@@ -56,9 +62,9 @@
 //!
 //! # What is deliberately not here
 //!
-//! `pidfd_getfd`, `clone3`'s `CLONE_PIDFD` and `process_madvise` are named
-//! gaps in `docs/ROADMAP.md`, not claims: none of them is served, and a test
-//! cannot pin a call the kernel refuses with `ENOSYS`.
+//! `clone3`'s `CLONE_PIDFD` and `process_madvise` are named gaps in
+//! `docs/ROADMAP.md`, not claims: neither is served, and a test cannot pin a
+//! call the kernel refuses with `ENOSYS`.
 
 use mpos_user_tests::Report;
 use rustix::thread::gettid;
@@ -80,6 +86,30 @@ fn pidfd_open(pid: libc::pid_t, flags: u32) -> Result<i32, i32> {
     } else {
         Ok(r as i32)
     }
+}
+
+/// `pidfd_getfd(pidfd, targetfd, flags)`, answered as the new descriptor.
+fn pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> Result<i32, i32> {
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_getfd,
+            pidfd as libc::c_long,
+            target_fd as libc::c_long,
+            flags as libc::c_long,
+        )
+    };
+    if r < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    } else {
+        Ok(r as i32)
+    }
+}
+
+/// The two descriptor numbers a getfd fixture reports, read as one small
+/// atomic pipe write.
+fn pipe_report(fd: i32, out: &mut [i32; 2]) -> bool {
+    let n = unsafe { libc::read(fd, out.as_mut_ptr().cast(), 8) };
+    n == 8
 }
 
 /// The `siginfo_t` a `pidfd_send_signal` may carry, as the asm-generic record
@@ -1252,6 +1282,382 @@ fn main() {
     }
     unsafe {
         libc::sigaction(libc::SIGUSR1, &old, core::ptr::null_mut());
+    }
+
+    // ---- 10. pidfd_getfd: another process's descriptor, by number --------
+    //
+    // The fixture is two pipes rather than one: the child reports its
+    // descriptor numbers up one and takes commands down the other. A single
+    // pipe would end the child's read when the parent closed its own write
+    // end - which is how the first host probe mistook a live child for a gone
+    // one.
+    {
+        let mut up = [0i32; 2];
+        let mut down = [0i32; 2];
+        let pipes =
+            unsafe { libc::pipe(up.as_mut_ptr()) == 0 && libc::pipe(down.as_mut_ptr()) == 0 };
+        let kid = if pipes { unsafe { libc::fork() } } else { -1 };
+        if kid == 0 {
+            unsafe {
+                libc::close(up[0]);
+                libc::close(down[1]);
+            }
+            let path = format!("/tmp/t-pidfd-getfd-{}\0", unsafe { libc::getpid() });
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr().cast::<libc::c_char>(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                leave(2);
+            }
+            unsafe {
+                libc::unlink(path.as_ptr().cast::<libc::c_char>());
+            }
+            let data = b"abcdefgh";
+            if unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) } != data.len() as isize {
+                leave(3);
+            }
+            unsafe {
+                libc::lseek(fd, 0, libc::SEEK_SET);
+            }
+            let self_pidfd = pidfd_open(unsafe { libc::getpid() }, 0).unwrap_or(-1);
+            let report = [fd, self_pidfd];
+            unsafe {
+                libc::write(up[1], report.as_ptr().cast(), 8);
+            }
+            // Block until the parent has made every fetch it asked for; either
+            // its explicit byte or the closed pipe ends the wait. A single pipe
+            // would end this read as soon as the parent's own write end closed,
+            // which is not this fixture's signal to stop.
+            let mut command = 0u8;
+            let _ = unsafe { libc::read(down[0], (&raw mut command).cast(), 1) };
+            leave(0);
+        }
+        if pipes {
+            unsafe {
+                libc::close(up[1]);
+                libc::close(down[0]);
+            }
+        }
+
+        let mut report = [0i32; 2];
+        let got_report = pipe_report(up[0], &mut report);
+        r.check(
+            "the getfd fixture reports the descriptor it owns",
+            got_report && kid > 0,
+        );
+
+        let pfd = pidfd_open(kid, 0);
+        let target = report[0];
+        let child_pidfd = report[1];
+        match pfd {
+            Ok(pfd) => {
+                r.check(
+                    "a non-zero flags word is EINVAL",
+                    pidfd_getfd(pfd, target, 1) == Err(libc::EINVAL)
+                        && pidfd_getfd(pfd, target, 2) == Err(libc::EINVAL),
+                );
+                r.check(
+                    "the flags word is read before the pidfd itself",
+                    pidfd_getfd(-1, -1, 1) == Err(libc::EINVAL),
+                );
+                r.check(
+                    "a number naming no descriptor is EBADF",
+                    pidfd_getfd(-1, target, 0) == Err(libc::EBADF),
+                );
+                r.check(
+                    "a descriptor that is not a pidfd is EBADF",
+                    pidfd_getfd(up[0], target, 0) == Err(libc::EBADF),
+                );
+                r.check(
+                    "a target fd that is not open is EBADF",
+                    pidfd_getfd(pfd, 999_999, 0) == Err(libc::EBADF)
+                        && pidfd_getfd(pfd, -1, 0) == Err(libc::EBADF),
+                );
+
+                match (pidfd_getfd(pfd, target, 0), pidfd_getfd(pfd, target, 0)) {
+                    (Ok(first), Ok(second)) => {
+                        r.check("a live same-uid process's fd is fetched", true);
+                        r.check(
+                            "the new descriptor is close-on-exec",
+                            unsafe { libc::fcntl(first, libc::F_GETFD) } & libc::FD_CLOEXEC != 0,
+                        );
+                        r.check(
+                            "it carries the target's access mode",
+                            unsafe { libc::fcntl(first, libc::F_GETFL) } & libc::O_ACCMODE
+                                == libc::O_RDWR,
+                        );
+                        let mut bytes = [0u8; 3];
+                        let n = unsafe { libc::read(first, bytes.as_mut_ptr().cast(), 3) };
+                        r.check(
+                            "it reads the target file's bytes",
+                            n == 3 && &bytes == b"abc",
+                        );
+                        r.check(
+                            "two fetches name one open file description",
+                            unsafe { libc::lseek(second, 0, libc::SEEK_CUR) } == 3,
+                        );
+                        let n = unsafe { libc::read(second, bytes.as_mut_ptr().cast(), 2) };
+                        r.check(
+                            "a read through the second advances the first",
+                            n == 2 && &bytes[..2] == b"de",
+                        );
+                        let _ = unsafe { libc::close(first) };
+                        let n = unsafe { libc::read(second, bytes.as_mut_ptr().cast(), 1) };
+                        r.check(
+                            "closing one fetch leaves the other open",
+                            n == 1 && bytes[0] == b'f',
+                        );
+                        let _ = unsafe { libc::close(second) };
+                    }
+                    _ => {
+                        r.check("a live same-uid process's fd is fetched", false);
+                        r.check("the new descriptor is close-on-exec", false);
+                        r.check("it carries the target's access mode", false);
+                        r.check("it reads the target file's bytes", false);
+                        r.check("two fetches name one open file description", false);
+                        r.check("a read through the second advances the first", false);
+                        r.check("closing one fetch leaves the other open", false);
+                    }
+                }
+
+                if child_pidfd >= 0 {
+                    match pidfd_getfd(pfd, child_pidfd, 0) {
+                        Ok(fetched) => {
+                            r.check(
+                                "a fetched pidfd is still a live pidfd",
+                                poll_in(fetched) & libc::POLLIN as i16 == 0
+                                    && pidfd_send_signal(fetched, 0, None, 0).is_ok(),
+                            );
+                            let _ = unsafe { libc::close(fetched) };
+                        }
+                        Err(_) => r.check("a fetched pidfd is still a live pidfd", false),
+                    }
+                } else {
+                    r.check("a fetched pidfd is still a live pidfd", false);
+                }
+
+                // The authority rule needs a caller without CAP_SYS_PTRACE:
+                // this program runs as root on the guest, so it is measured by
+                // the unprivileged fixture below rather than here.
+                let _ = unsafe { libc::write(down[1], b"x".as_ptr().cast(), 1) };
+                reap(kid);
+                let _ = unsafe { libc::close(pfd) };
+            }
+            Err(_) => {
+                r.check("a non-zero flags word is EINVAL", false);
+                r.check("the flags word is read before the pidfd itself", false);
+                r.check("a number naming no descriptor is EBADF", false);
+                r.check("a descriptor that is not a pidfd is EBADF", false);
+                r.check("a target fd that is not open is EBADF", false);
+                r.check("a live same-uid process's fd is fetched", false);
+                r.check("a fetched pidfd is still a live pidfd", false);
+                dispose(kid);
+            }
+        }
+        if pipes {
+            unsafe {
+                libc::close(up[0]);
+                libc::close(down[1]);
+            }
+        }
+    }
+
+    // The authority rule, on a caller that has no `CAP_SYS_PTRACE`. The test
+    // program is root on the guest, and a root caller passes
+    // `ptrace_may_access` before the dumpable flag is read - so the only way
+    // to pin the flag is a caller and a target that both dropped to the same
+    // unprivileged uid. (The host run, as uid 1000, could measure it on the
+    // main process; that measurement does not transfer to root.)
+    {
+        let mut target_up = [0i32; 2];
+        let mut target_down = [0i32; 2];
+        let mut caller_up = [0i32; 2];
+        let made = unsafe {
+            libc::pipe(target_up.as_mut_ptr()) == 0
+                && libc::pipe(target_down.as_mut_ptr()) == 0
+                && libc::pipe(caller_up.as_mut_ptr()) == 0
+        };
+        let target = if made { unsafe { libc::fork() } } else { -1 };
+        if target == 0 {
+            unsafe {
+                libc::close(target_up[0]);
+                libc::close(target_down[1]);
+                libc::close(caller_up[0]);
+                libc::close(caller_up[1]);
+            }
+            if unsafe { libc::setgid(65_534) } != 0 || unsafe { libc::setuid(65_534) } != 0 {
+                // Already unprivileged (the host run): the same uid is what
+                // the rule needs, and the caller's identical drop below
+                // keeps the two sides matched. A root caller that could not
+                // drop makes the EPERM claim fail honestly rather than pass
+                // for the wrong reason.
+            }
+            unsafe {
+                libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+            }
+            let fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY) };
+            let report = [unsafe { libc::getpid() }, fd];
+            unsafe {
+                libc::write(target_up[1], report.as_ptr().cast(), 8);
+            }
+            let mut command = 0u8;
+            let _ = unsafe { libc::read(target_down[0], (&raw mut command).cast(), 1) };
+            leave(0);
+        }
+
+        let mut report = [0i32; 2];
+        let reported = made && pipe_report(target_up[0], &mut report);
+        let caller = if reported {
+            unsafe { libc::fork() }
+        } else {
+            -1
+        };
+        if caller == 0 {
+            unsafe {
+                libc::close(target_up[0]);
+                libc::close(target_down[0]);
+                libc::close(target_down[1]);
+                libc::close(caller_up[0]);
+            }
+            let mut errors = [-1i32; 3];
+            let _ = unsafe { libc::setgid(65_534) };
+            let _ = unsafe { libc::setuid(65_534) };
+            match pidfd_open(report[0], 0) {
+                Ok(pfd) => {
+                    errors[0] = 0;
+                    errors[1] = pidfd_getfd(pfd, report[1], 0).err().unwrap_or(0);
+                    errors[2] = pidfd_getfd(pfd, 999_999, 0).err().unwrap_or(0);
+                }
+                Err(e) => errors[0] = e,
+            }
+            unsafe {
+                libc::write(caller_up[1], errors.as_ptr().cast(), 12);
+            }
+            leave(0);
+        }
+
+        if reported && caller > 0 {
+            let mut errors = [-1i32; 3];
+            let read_back =
+                unsafe { libc::read(caller_up[0], errors.as_mut_ptr().cast(), 12) } == 12;
+            r.check(
+                "an unprivileged caller opens a pidfd of a non-dumpable peer",
+                read_back && errors[0] == 0,
+            );
+            r.check(
+                "a non-dumpable same-uid target is EPERM",
+                read_back && errors[1] == libc::EPERM,
+            );
+            r.check(
+                "authority is asked before the target fd",
+                read_back && errors[2] == libc::EPERM,
+            );
+            reap(caller);
+        } else {
+            r.check(
+                "an unprivileged caller opens a pidfd of a non-dumpable peer",
+                false,
+            );
+            r.check("a non-dumpable same-uid target is EPERM", false);
+            r.check("authority is asked before the target fd", false);
+            dispose(caller);
+        }
+        if made {
+            let _ = unsafe { libc::write(target_down[1], b"x".as_ptr().cast(), 1) };
+        }
+        if target > 0 {
+            reap(target);
+        }
+        if made {
+            unsafe {
+                libc::close(target_up[0]);
+                libc::close(target_down[1]);
+                libc::close(caller_up[0]);
+            }
+        }
+    }
+
+    // A process may always fetch its own descriptor, with no authority check
+    // to pass; and a zombie is gone even before its reap.
+    match pidfd_open(unsafe { libc::getpid() }, 0) {
+        Ok(self_pidfd) => {
+            let own = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY) };
+            match pidfd_getfd(self_pidfd, own, 0) {
+                Ok(fetched) => {
+                    r.check("a process may fetch its own descriptor", true);
+                    r.check(
+                        "and that fetch is close-on-exec too",
+                        unsafe { libc::fcntl(fetched, libc::F_GETFD) } & libc::FD_CLOEXEC != 0,
+                    );
+                    let _ = unsafe { libc::close(fetched) };
+                }
+                Err(_) => {
+                    r.check("a process may fetch its own descriptor", false);
+                    r.check("and that fetch is close-on-exec too", false);
+                }
+            }
+            let _ = unsafe { libc::close(own) };
+            let _ = unsafe { libc::close(self_pidfd) };
+        }
+        Err(_) => {
+            r.check("a process may fetch its own descriptor", false);
+            r.check("and that fetch is close-on-exec too", false);
+        }
+    }
+
+    {
+        let mut zup = [0i32; 2];
+        let made = unsafe { libc::pipe(zup.as_mut_ptr()) } == 0;
+        let z = if made { unsafe { libc::fork() } } else { -1 };
+        if z == 0 {
+            unsafe {
+                libc::close(zup[0]);
+            }
+            let fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY) };
+            unsafe {
+                libc::write(zup[1], (&raw const fd).cast(), 4);
+            }
+            leave(0);
+        }
+        if made {
+            unsafe {
+                libc::close(zup[1]);
+            }
+        }
+        let mut zfd = 0i32;
+        let reported = made && unsafe { libc::read(zup[0], (&raw mut zfd).cast(), 4) } == 4;
+        if reported && z > 0 {
+            match pidfd_open(z, 0) {
+                Ok(zp) => {
+                    r.check(
+                        "a zombie's pidfd hands out no descriptor",
+                        wait_until_zombie(z) && pidfd_getfd(zp, zfd, 0) == Err(libc::ESRCH),
+                    );
+                    reap(z);
+                    r.check(
+                        "and a reaped process is ESRCH as well",
+                        pidfd_getfd(zp, zfd, 0) == Err(libc::ESRCH),
+                    );
+                    let _ = unsafe { libc::close(zp) };
+                }
+                Err(_) => {
+                    r.check("a zombie's pidfd hands out no descriptor", false);
+                    r.check("and a reaped process is ESRCH as well", false);
+                    reap(z);
+                }
+            }
+        } else {
+            r.check("a zombie's pidfd hands out no descriptor", false);
+            r.check("and a reaped process is ESRCH as well", false);
+            dispose(z);
+        }
+        if made {
+            let _ = unsafe { libc::close(zup[0]) };
+        }
     }
 
     r.finish()

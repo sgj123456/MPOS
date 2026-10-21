@@ -2048,7 +2048,8 @@ and `vfs/inotify.rs` already had) and `syscall -> vfs`, both recorded.
 
 **Named**: `pidfd_getfd(2)` (438), `clone3`'s `CLONE_PIDFD` and
 `process_madvise(2)` (440) are not served and fall to the `ENOSYS` catch-all; this
-family does not invent a descriptor where those calls expect one. The older
+family does not invent a descriptor where those calls expect one. **The first of
+the three was served by §6.9**, below. The older
 anonymous descriptors (`eventfd`, `timerfd`, `signalfd`, `epoll`, `inotify`) still
 report `S_IFCHR` - a divergence `NodeKind::Anon` leaves in place rather than
 silently changing. `st_blksize` stays this kernel's 512 where Linux's pidfd answers
@@ -2057,3 +2058,84 @@ uid/gid are machine-specific and deliberately not pinned. `/proc/<pid>/fdinfo/<n
 for a pidfd (`Pid:`/`NSpid:`) was not measured and is not promised. A pidfd's
 `O_NONBLOCK` wait does not distinguish "no event yet" from "the child is running" by
 anything other than the `EAGAIN` Linux gives both.
+
+### 6.9 A fetched descriptor is the same open file, not a copy of it — **LANDED** (2026-10-21)
+
+`pidfd_open` names a process; `pidfd_getfd(2)` is the door that reaches through
+that name into the process's descriptor table and duplicates one entry. The
+object it duplicates is the **open file description**, the thing `dup` shares,
+not a snapshot of the descriptor's flags and position: two fetches of the same
+target read through one offset, and closing one leaves the other.
+
+**Measured on a current host first** (Linux 7.2.11,
+`.workbuddy/probe_pidfd_getfd{,2}.c`), because the refusal order is not the
+order the arguments are written in:
+
+* flags → pidfd descriptor → task → authority → target fd. A non-zero flag word
+  is `EINVAL` even beside `pidfd = -1`; a number naming nothing, or a valid
+  descriptor that is not a pidfd, is `EBADF`; a reaped process, a zombie, and a
+  leader that exited under a live worker are all `ESRCH`; a non-dumpable
+  same-uid target is `EPERM` **before** the target fd is looked at (a
+  non-dumpable target with fd `999999` answers `EPERM`, not `EBADF`); only
+  then is a missing target fd `EBADF`. `-1` and `999999` were the two measured
+  missing numbers.
+* the new number is the lowest free one and `F_GETFD` carries `FD_CLOEXEC`
+  unconditionally; `F_GETFL` carries the target's access mode.
+* the shared description is visible in the offsets: fetch twice, read three
+  bytes through the first, and the second's position is three; a read of two
+  through the second then returns bytes four and five.
+* a live, same-uid process is enough - no parent relation. A process always
+  fetches its own, and a fetched pidfd is still a pidfd (`poll` and
+  `pidfd_send_signal` go through it).
+* a zombie is gone: both before the reap and after it, `pidfd_getfd` answers
+  `ESRCH`.
+
+The first probe's mistake is worth keeping: it used one pipe in both
+directions, so the parent's close of the write end ended the child's read and
+every fetch answered `ESRCH` against a child that had already exited. The
+second probe added a command pipe, and the live child answered normally. The
+`ESRCH` was real; the fixture was the thing that was wrong.
+
+**The landing.** `PIDFD_GETFD = 438` sits beside the other two numbers in both
+`nr_*` tables. `proc::handle_pidfd_getfd` resolves the pidfd through the
+caller's table, checks `sched::pidfd_still_names` before asking
+`sched::may_inspect` (so a slot handed to another tenant is "gone", not
+"somebody else's process"), and then takes the target's table from the new
+`sched::pidfd_fd_table`. That helper is the one place the `ESRCH` rule lives:
+it answers `None` for a free slot, a reused generation, or a task that has
+exited. The description is `FdTable::clone_at`'s `Arc<File>` - the same
+description, which is where the shared offset comes from - and
+`current_fds().install` gives it the lowest free number before
+`fd_flags_set(..., FD_CLOEXEC)` spends the one flag the door never asks about.
+
+**The guest caught a measurement that did not transfer.** The host run is uid
+1000, so the main process could make a target non-dumpable and get `EPERM` from
+`pidfd_getfd`. The guest runs the test program as root, and root holds
+`CAP_SYS_PTRACE`, which `ptrace_may_access` answers before it reads the
+dumpable flag. The two EPERM claims were red on the first sweep while the host
+was green. The pin moved to a fixture whose target and caller both attempt to
+drop to uid 65534: on the guest the drop succeeds, on an already-unprivileged
+host it is a no-op and the same uid is already the shape the rule needs. That
+is the measured rule now, on the machine that serves it.
+
+**Pins**: `t-pidfd` 100 → **121 claims** on both machines, the `ok:` text
+identical (the first machine writes CRLF). The 21 new claims are the order and
+its five errnos, the two fetches' shared offset, `FD_CLOEXEC`, the access mode,
+a fetched pidfd, the unprivileged authority pair, a process's own descriptor,
+and the zombie's `ESRCH` both before and after the reap. No host test: the
+helpers `pidfd_fd_table` and `may_inspect` are behind `target_os = "none"`, and
+the ABI's claims are the program's.
+
+**Gate**: x86_64 `pass=194 fail=0` (194 built, 6 lanes), aarch64 `193 staged,
+pass=193 fail=0` (14 left out by `tests.toml`), `mpos-kunit 32 passed, 0 failed`
+on both; host unit suite unchanged (no host test was added), `xtask` 139;
+`cargo fmt --check` clean; depgraph holds - `syscall -> sched` is an edge the
+pidfd family already recorded.
+
+**Named**: `clone3`'s `CLONE_PIDFD` and `process_madvise(2)` (440) are still
+`ENOSYS`. The authority rule keeps §2.6's divergence: Linux's
+`PTRACE_MODE_ATTACH_REALCREDS` compares group ids as well and consults the
+security modules, while `cred::ptrace_may_access` compares the real/effective
+uid set; on this single-user image no gate can tell the two apart. A pidfd's
+`fdinfo` (`Pid:`/`NSpid:`) remains unmeasured and un-promised, and the older
+anonymous descriptors still report `S_IFCHR`.
