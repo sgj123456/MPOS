@@ -258,6 +258,11 @@ fn spawn_opener(flags: i32, do_read: bool) -> (libc::pid_t, i32) {
 /// Whether the report pipe has a whole record within `limit_ms`. `None` means
 /// the child is still parked - which is how "this open blocks" is measured
 /// without a clock inside the kernel.
+///
+/// The 50ms the negative claims pass is a **budget**: the child forks, calls
+/// `open`, and parks, and the parent only has to look after that has happened.
+/// It was 150ms, and six of these ran, so the file waited 0.9s for the same six
+/// observations (`docs/notes/` §15.93).
 fn report_within(r: i32, limit_ms: i32) -> Option<[i32; 4]> {
     if poll_fd(r, libc::POLLIN, limit_ms) == 0 {
         return None;
@@ -385,7 +390,7 @@ fn main() {
     let (kid, rep) = spawn_opener(libc::O_RDONLY, true);
     r.check(
         "open(O_RDONLY) with no writer parks",
-        report_within(rep, 150).is_none(),
+        report_within(rep, 50).is_none(),
     );
     // Release it the ABI's way: the writer arrives, and the parked reader
     // counts as a reader, so the writer's own open returns at once.
@@ -416,7 +421,7 @@ fn main() {
     let (kid, rep) = spawn_opener(libc::O_WRONLY, false);
     r.check(
         "open(O_WRONLY) with no reader parks",
-        report_within(rep, 150).is_none(),
+        report_within(rep, 50).is_none(),
     );
     let (rd, e) = openat(PATH, libc::O_RDONLY);
     r.check(
@@ -445,7 +450,7 @@ fn main() {
     let (kid, rep) = spawn_doomed_opener(libc::O_RDONLY, 200);
     r.check(
         "a doomed reader's open does not return (it is parked)",
-        report_within(rep, 150).is_none(),
+        report_within(rep, 50).is_none(),
     );
     r.check(
         "and the fatal signal ends it inside the park",
@@ -461,7 +466,7 @@ fn main() {
     let (kid, rep) = spawn_doomed_opener(libc::O_WRONLY, 200);
     r.check(
         "a doomed writer's open does not return (it is parked)",
-        report_within(rep, 150).is_none(),
+        report_within(rep, 50).is_none(),
     );
     r.check(
         "and the fatal signal ends it inside the park",
@@ -486,7 +491,7 @@ fn main() {
     let (kid, rep) = spawn_opener(libc::O_RDONLY, true);
     r.check(
         "after both deaths a blocking reader parks again",
-        report_within(rep, 150).is_none(),
+        report_within(rep, 50).is_none(),
     );
     // The writer stays open until the reader's report arrives, and that order is
     // load-bearing rather than tidy: what releases a parked reader is the *count*

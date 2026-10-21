@@ -489,10 +489,12 @@ fn main() {
             ok_is(
                 &mut r,
                 "the silent timer arms",
-                timer_settime(none_id, 0, &Itimerspec::one_shot(30)),
+                timer_settime(none_id, 0, &Itimerspec::one_shot(10)),
                 0,
             );
-            sleep_ms(80);
+            // A budget: the timer is armed 10ms out, and the queue is read
+            // after it must have fired (`docs/notes/` §15.93).
+            sleep_ms(30);
             let pending = sigpending();
             check_with(
                 &mut r,
@@ -538,10 +540,12 @@ fn main() {
             ok_is(
                 &mut r,
                 "the null-event timer arms",
-                timer_settime(null_id, 0, &Itimerspec::one_shot(30)),
+                timer_settime(null_id, 0, &Itimerspec::one_shot(10)),
                 0,
             );
-            sleep_ms(80);
+            // A budget: the timer is armed 10ms out, and the queue is read
+            // after it must have fired (`docs/notes/` §15.93).
+            sleep_ms(30);
             let pending = sigpending();
             check_with(
                 &mut r,
@@ -594,10 +598,10 @@ fn main() {
             ok_is(
                 &mut r,
                 "it arms",
-                timer_settime(gone_id, 0, &Itimerspec::one_shot(30)),
+                timer_settime(gone_id, 0, &Itimerspec::one_shot(10)),
                 0,
             );
-            sleep_ms(80);
+            sleep_ms(30);
             ok_is(
                 &mut r,
                 "it deletes with its record still queued",
@@ -777,8 +781,8 @@ fn main() {
                 if timer_id >= 0 {
                     ok_is(
                         &mut r,
-                        "the 30 ms timer is armed",
-                        timer_settime(timer_id, 0, &Itimerspec::one_shot(30)),
+                        "the 10 ms timer is armed",
+                        timer_settime(timer_id, 0, &Itimerspec::one_shot(10)),
                         0,
                     );
                     // Wait for the thread to be woken by the expiry. A bounded

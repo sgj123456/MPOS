@@ -106,7 +106,13 @@ fn start(prog: &CStr, arg0: &CStr) -> i32 {
 }
 
 /// How long the "still running" child stays asleep.
-const SLEEP_MS: i64 = 500;
+///
+/// A **budget**, not a measurement: the claim is that `wait4(WNOHANG)` finds
+/// the child still running, and any sleep longer than the probe reaches that
+/// answer. It used to be 500ms and every claim below waited it out; 100ms is
+/// still some twenty times the fork-to-`wait4` gap measured in the sweep and
+/// keeps the same claim (`docs/notes/` §15.93's budget rule).
+const SLEEP_MS: i64 = 100;
 
 /// `wait4(pid, *status, options, *rusage)` through the raw door, with the
 /// caller's own record. Returns `(answer, status word)`.
@@ -178,10 +184,12 @@ fn start_burner_then_stop(ms: i64) -> i32 {
     unsafe {
         libc::raise(libc::SIGSTOP);
     }
-    // Sit under the stop until the parent's `SIGCONT`, then leave.
+    // Sit under the stop until the parent's `SIGCONT`, then leave. A budget
+    // like `SLEEP_MS`: the parent's poll after the `SIGCONT` is what the length
+    // has to outlast, and 100ms is ten polls of it (`docs/notes/` §15.93).
     let nap = libc::timespec {
-        tv_sec: 2,
-        tv_nsec: 0,
+        tv_sec: 0,
+        tv_nsec: 100_000_000,
     };
     unsafe {
         libc::nanosleep(&nap, core::ptr::null_mut());
@@ -935,7 +943,7 @@ fn main() {
         // dead yet".
         let nap = libc::timespec {
             tv_sec: 0,
-            tv_nsec: 60 * 1_000_000,
+            tv_nsec: 20 * 1_000_000,
         };
         unsafe { libc::nanosleep(&nap, core::ptr::null_mut()) };
         let (answer, _) = wait4_rusage(-1, libc::WNOHANG, core::ptr::null_mut());

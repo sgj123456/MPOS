@@ -102,13 +102,17 @@ slow = ["t-fill-ramfs", "t-forkcost", "t-netlat", "t-pipecost"]
 
 # Not a check at all. `t-sh` execs an interactive busybox ash onto the console
 # and prints what it observes about where the shell stopped; it is here to be
-# run by hand when a shell problem needs looking at. This is the one group that
+# run by hand when a shell problem needs looking at. `t-aa-ptyprobe` is the same
+# shape from the pty batch - descriptor identities and "did this call block" with
+# no claim to fail on, its header still saying it was for that batch's debugging.
+# It was being booted by the default sweep, which is what the diagnostic group is
+# for (`docs/notes/` §15.93). This is the one group that
 # is the same thing on both machines for a reason beyond the harness: a
 # measurement instrument (`t-forkcost`, `t-netlat`) is a different instrument on
 # each machine, so running it on both is right, but a diagnostic is one thing
 # everywhere - and §15.34's rule bounds what a boot may assert by what the
 # kernel itself produces, which an interactive child's state letter is not.
-diagnostic = ["t-sh"]
+diagnostic = ["t-sh", "t-aa-ptyprobe"]
 
 # The first machine's own half. Empty, and an empty section is that machine's
 # answer rather than a missing one: every group it needs is a group the baseline

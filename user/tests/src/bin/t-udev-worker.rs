@@ -491,14 +491,18 @@ fn main() {
 
     let writer = unsafe { libc::fork() };
     if writer == 0 {
-        std::thread::sleep(Duration::from_secs(1));
+        // A budget: the parent's poll below only has to be longer than this,
+        // and the claim is "woken by the message, not by the timeout". It was
+        // a second, which is a thousand times the fork-to-write gap measured
+        // in the sweep (`docs/notes/` §15.93).
+        std::thread::sleep(Duration::from_millis(100));
         let _ = worker_send(&slow_writer, &payload);
         unsafe { libc::_exit(0) };
     }
-    // Five seconds is longer than the writer's second, and shorter than the
-    // patience of anyone watching a test run.
+    // Two seconds is twenty times the writer's tenth of a second, and still
+    // short enough that a broken wake fails rather than stalls the sweep.
     let five = Timespec {
-        tv_sec: 5,
+        tv_sec: 2,
         tv_nsec: 0,
     };
     r.check(

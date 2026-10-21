@@ -36,7 +36,12 @@ use std::time::{Duration, Instant};
 
 const PAGE: usize = 4096;
 /// How long to give a condition before answering it as a failed claim.
-const BOUND: Duration = Duration::from_secs(3);
+///
+/// A bound, not a wait: every loop below leaves as soon as its condition holds,
+/// so this only decides how long a *broken* machine takes to say so. One second
+/// is still a hundred times the slowest of those conditions in the sweep
+/// (`docs/notes/` §15.93).
+const BOUND: Duration = Duration::from_secs(1);
 /// The code the worker ends the group with, distinct from the leader's `0` so a
 /// wait answered by the leader's own exit could not pass.
 const GROUP_CODE: i32 = 7;
@@ -161,7 +166,9 @@ fn main() {
     // The threads go on. Read twice with a pause between them, so a thread that
     // was mid-sleep when the leader left cannot look stopped.
     let first = shared.read();
-    std::thread::sleep(Duration::from_millis(500));
+    // A budget: the threads step every 10ms, so 100ms is ten steps of evidence
+    // that the counter moved (`docs/notes/` §15.93).
+    std::thread::sleep(Duration::from_millis(100));
     let second = shared.read();
     r.check(
         &format!(

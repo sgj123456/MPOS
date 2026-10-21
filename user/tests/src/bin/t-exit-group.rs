@@ -426,7 +426,7 @@ fn main() {
     // B. a leader that leaves on the thread door first is a zombie, not a
     // corpse the parent can take: `WNOHANG` answers 0 until the group dies,
     // and then the wait answers with the *last thread's* code.
-    match spawn_group(true, 400) {
+    match spawn_group(true, 100) {
         Some((leader, worker)) => {
             let path = format!("/proc/{leader}/stat");
             let mut zombie = false;

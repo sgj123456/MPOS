@@ -115,7 +115,7 @@ fn main() {
         // Sleep, then leave - the parent attaches and detaches in between. With
         // no branch here the child fell through into the parent's own test and
         // ran it all again, including the fork below.
-        sleep_ms(2000);
+        sleep_ms(100);
         // SAFETY: `_exit` never returns, and the child touches nothing else.
         unsafe { libc::_exit(0) };
     }
@@ -182,8 +182,10 @@ fn main() {
     }
     unsafe { libc::waitpid(intermediate.max(0), &mut status, 0) };
     // Give the reparenting a moment: the orphan exists either way, and the only
-    // failure that matters here is ESRCH for a pid that is plainly alive.
-    sleep_ms(1000);
+    // failure that matters here is ESRCH for a pid that is plainly alive. A
+    // budget like the rest (`docs/notes/` §15.93): 50ms is some twenty times
+    // the `waitpid`-returns-to-child-visible gap the sweep measured.
+    sleep_ms(50);
 
     let target = read_pid_file();
     r.check("the orphan to attach to reported itself", target > 0);
@@ -210,8 +212,10 @@ fn main() {
     // success: a non-blocking poll that *times out* says the same thing as the
     // hang, and leaves the rest of the suite running to be told about it.
     let mut collected = false;
-    for _ in 0..60 {
-        sleep_ms(50);
+    // 400ms of 10ms polls, four times this child's own 100ms sleep: the check is
+    // "the detach let it run", so the poll only has to outlast the sleep.
+    for _ in 0..40 {
+        sleep_ms(10);
         status = 0;
         if unsafe { libc::waitpid(child.max(0), &mut status, libc::WNOHANG) } > 0 {
             collected = true;
@@ -236,12 +240,14 @@ fn main() {
     // terminal.
     let stopped = unsafe { libc::fork() };
     if stopped == 0 {
-        // Eight tenths of a second, which is the length of the window every check
+        // A tenth of a second, which is the length of the window every check
         // below reads: long enough that a process left *running* reaches its exit
         // inside the poll, short enough that the poll after the `SIGCONT` still
         // sees it. What it must not be is so long that "nothing happened" looks
-        // the same either way.
-        sleep_ms(800);
+        // the same either way. The two polls below are 200ms each, twice this
+        // window, which is the ratio the 800ms/1.5s pair had (`docs/notes/`
+        // §15.93).
+        sleep_ms(100);
         // SAFETY: `_exit` never returns.
         unsafe { libc::_exit(0) };
     }
@@ -254,7 +260,7 @@ fn main() {
         );
         let mut saw_stop = false;
         for _ in 0..40 {
-            sleep_ms(25);
+            sleep_ms(5);
             status = 0;
             if unsafe { libc::waitpid(stopped, &mut status, libc::WNOHANG | libc::WUNTRACED) } > 0 {
                 // `WIFSTOPPED`, spelled out: the child reaching its *exit* here
@@ -280,8 +286,8 @@ fn main() {
         // simply sits there unrelieved until the SIGCONT below - the same
         // answer, for the narrower reason the probe records.
         let mut gone = false;
-        for _ in 0..30 {
-            sleep_ms(50);
+        for _ in 0..20 {
+            sleep_ms(10);
             status = 0;
             if unsafe { libc::waitpid(stopped, &mut status, libc::WNOHANG) } > 0 {
                 gone = true;
@@ -290,8 +296,8 @@ fn main() {
         }
         r.check("a detach leaves a stop the user asked for alone", !gone);
         unsafe { libc::kill(stopped, libc::SIGCONT) };
-        for _ in 0..40 {
-            sleep_ms(50);
+        for _ in 0..20 {
+            sleep_ms(10);
             status = 0;
             if unsafe { libc::waitpid(stopped, &mut status, libc::WNOHANG) } > 0 {
                 gone = true;

@@ -607,13 +607,15 @@ fn spawn_sibling() -> Sibling {
     if pid == 0 {
         // The parent reaches its `read` first, so the signal really lands on a
         // parked task; then the handler has time to run before the bytes land,
-        // which is what makes the second `read` meaningful.
-        sleep_ms(100);
+        // which is what makes the second `read` meaningful. Both are budgets:
+        // a park is microseconds, and 30/50ms is ten to fifty times the gap the
+        // sweep measured (`docs/notes/` §15.93).
+        sleep_ms(30);
         // SAFETY: `getppid`/`kill` on this process's parent.
         unsafe {
             libc::kill(libc::getppid(), SIG);
         }
-        sleep_ms(150);
+        sleep_ms(50);
         let bytes = b"ping";
         // SAFETY: `fds[1]` is the write end this child owns.
         unsafe {

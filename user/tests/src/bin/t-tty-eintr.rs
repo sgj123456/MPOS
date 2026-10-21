@@ -231,7 +231,7 @@ fn main() {
 
     let (master, slave) = fresh_pair();
 
-    // 1. A line typed at 600 ms, a timer due at 200 ms: the read must come back
+    // 1. A line typed at 300 ms, a timer due at 50 ms: the read must come back
     //    `EINTR` at the timer, with the handler already run - not sleep to the
     //    line, and not answer the line as if the signal had never happened.
     r.check(
@@ -241,14 +241,14 @@ fn main() {
                 as usize,
         )),
     );
-    let kid = type_later(master.as_fd(), 600, b"late\r");
-    r.check("ITIMER_REAL arms", alarm_once(200));
+    let kid = type_later(master.as_fd(), 300, b"late\r");
+    r.check("ITIMER_REAL arms", alarm_once(50));
     let (got, ms, _) = timed_read(slave.as_fd());
     r.check(
         "a trapped signal ends the blocked read with EINTR",
         got == Err(libc::EINTR),
     );
-    r.check("the wait ended at the signal, not at the line", ms < 500);
+    r.check("the wait ended at the signal, not at the line", ms < 200);
     r.check(
         "the handler ran exactly once before the return",
         RAN.load(Ordering::Relaxed) == 1,
@@ -279,8 +279,8 @@ fn main() {
     //    break a shell's own read on every job it finishes, and it is not what
     //    Linux does.
     r.check("SIGALRM is set to SIG_IGN", aim_alarm(None));
-    let kid = type_later(master.as_fd(), 400, b"hi\r");
-    r.check("ITIMER_REAL arms again", alarm_once(150));
+    let kid = type_later(master.as_fd(), 200, b"hi\r");
+    r.check("ITIMER_REAL arms again", alarm_once(50));
     let (got, ms, buf) = timed_read(slave.as_fd());
     r.check(
         "an ignored signal does not interrupt the read",
@@ -292,7 +292,7 @@ fn main() {
     );
     r.check(
         "and it was the line, not the signal, that ended the wait",
-        ms >= 300,
+        ms >= 150,
     );
     r.check("no further handler ran", RAN.load(Ordering::Relaxed) == 1);
     reap(kid);

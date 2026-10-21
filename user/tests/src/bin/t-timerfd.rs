@@ -123,19 +123,19 @@ fn main() {
         },
         it_value: Timespec {
             tv_sec: 0,
-            tv_nsec: 200_000_000,
+            tv_nsec: 50_000_000,
         },
     };
     match timerfd_settime(&fd, TimerfdTimerFlags::empty(), &arm) {
         Ok(old) => {
-            r.check("settime arming 200ms succeeds", true);
+            r.check("settime arming 50ms succeeds", true);
             r.check(
                 "the old setting of a fresh disarm is zeros",
                 old.it_value.tv_sec == 0 && old.it_value.tv_nsec == 0,
             );
         }
         Err(_) => {
-            r.check("settime arming 200ms succeeds", false);
+            r.check("settime arming 50ms succeeds", false);
             r.check("the old setting of a fresh disarm is zeros", false);
         }
     }
@@ -144,9 +144,14 @@ fn main() {
             r.check("gettime on the armed timer succeeds", true);
             r.check(
                 "the remaining time is inside the armed span",
+                // The arm is rounded *up* to the machine's tick - 250 Hz, so
+                // 50 ms is 13 ticks and reads back as 52 - which is why the
+                // bound carries one tick of slack rather than the bare span.
+                // (The 200ms this used to arm was exactly 50 ticks, so the
+                // rounding was invisible; the remeasurement caught it.)
                 curr.it_value.tv_sec == 0
                     && curr.it_value.tv_nsec > 0
-                    && curr.it_value.tv_nsec <= 200_000_000,
+                    && curr.it_value.tv_nsec <= 60_000_000,
             );
         }
         Err(_) => {
@@ -169,7 +174,9 @@ fn main() {
         }
     }
 
-    sleep_ms(300);
+    // A budget: the timer fires 50ms after it was armed, and this only has to
+    // be after that (`docs/notes/` §15.93).
+    sleep_ms(80);
     let mut eight = [0u8; 8];
     let n = read(&fd, &mut eight);
     r.check("the one-shot's read takes 8 bytes", n == Ok(8));
@@ -208,7 +215,7 @@ fn main() {
         "settime arming the interval succeeds",
         timerfd_settime(&fd, TimerfdTimerFlags::empty(), &arm).is_ok(),
     );
-    sleep_ms(100);
+    sleep_ms(40);
     let mut eight = [0u8; 8];
     let n = read(&fd, &mut eight);
     r.check("the interval read takes 8 bytes", n == Ok(8));

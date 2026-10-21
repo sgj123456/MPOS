@@ -276,11 +276,13 @@ fn main() {
         },
     );
 
-    // 4. `VMIN=0, VTIME=5` with three bytes landing at 200 ms: they come back
+    // 4. `VMIN=0, VTIME=2` with three bytes landing at 50 ms: they come back
     //    as they arrive, because the clock is only an upper bound on an answer
-    //    of its own. Measured as 100 ms for `VTIME=5`, never 500.
-    r.check("VMIN=0/VTIME=5 is accepted", set_mode(slave.as_fd(), 0, 5));
-    let kid = feed_later(master.as_fd(), 200, b"xyz");
+    //    of its own. Measured on Linux as 100 ms for `VTIME=5`, never 500; the
+    //    fixture is one decisecond of clock and 50 ms of delay, which is the
+    //    same ordering with a smaller budget (`docs/notes/` §15.93).
+    r.check("VMIN=0/VTIME=2 is accepted", set_mode(slave.as_fd(), 0, 2));
+    let kid = feed_later(master.as_fd(), 50, b"xyz");
     let (got, ms, buf) = timed_read(slave.as_fd());
     check_window(
         &mut r,
@@ -290,8 +292,8 @@ fn main() {
         &buf[..got.unwrap_or(0)],
         Window {
             want: 3,
-            low: 100,
-            high: 450,
+            low: 20,
+            high: 190,
         },
     );
     r.check(
@@ -338,12 +340,14 @@ fn main() {
         },
     );
 
-    // 6. `VMIN=2, VTIME=5` with one byte at 200 ms: the read wants two, gets
+    // 6. `VMIN=2, VTIME=1` with one byte at 50 ms: the read wants two, gets
     //    one, and hands it over one `VTIME` after it landed - the inter-byte
-    //    clock, measured at 604 ms for a byte at 100 ms. A read that answered
-    //    0 here, or waited for a second byte forever, is the wrong rule.
-    r.check("VMIN=2/VTIME=5 is accepted", set_mode(slave.as_fd(), 2, 5));
-    let kid = feed_later(master.as_fd(), 200, b"s");
+    //    clock, measured at 604 ms for a byte at 100 ms with `VTIME=5`. The
+    //    fixture keeps the shape at the shortest clock a decisecond allows: a
+    //    byte at 50 ms comes back at about 150 ms. A read that answered 0 here,
+    //    or waited for a second byte forever, is the wrong rule.
+    r.check("VMIN=2/VTIME=1 is accepted", set_mode(slave.as_fd(), 2, 1));
+    let kid = feed_later(master.as_fd(), 50, b"s");
     let (got, ms, buf) = timed_read(slave.as_fd());
     check_window(
         &mut r,
@@ -353,8 +357,8 @@ fn main() {
         &buf[..got.unwrap_or(0)],
         Window {
             want: 1,
-            low: 500,
-            high: 1_500,
+            low: 100,
+            high: 600,
         },
     );
     r.check(
@@ -363,9 +367,9 @@ fn main() {
     );
     reap(kid);
 
-    // 7. `VMIN=4, VTIME=5` with five bytes queued: `VMIN` is a floor, and the
+    // 7. `VMIN=4, VTIME=1` with five bytes queued: `VMIN` is a floor, and the
     //    whole queue goes in one read - measured as 5 bytes for `VMIN=3`.
-    r.check("VMIN=4/VTIME=5 is accepted", set_mode(slave.as_fd(), 4, 5));
+    r.check("VMIN=4/VTIME=1 is accepted", set_mode(slave.as_fd(), 4, 1));
     r.check(
         "five bytes are typed",
         rustix::io::write(&master, b"hello") == Ok(5),

@@ -101,6 +101,13 @@ fn install_alarm() -> bool {
 }
 
 /// Arm `ITIMER_REAL` to fire once, `ms` from now: the route `alarm(2)` takes.
+///
+/// The 50ms every caller passes is a **budget** for "the task is parked": the
+/// syscall blocks and the alarm ends it, so the number only has to exceed the
+/// time from `setitimer` to the park - microseconds here, a few milliseconds on
+/// the second machine's TCG. It was 200ms, and the fixture children slept
+/// 1200ms to outlive it; both are 4x smaller now and the claims are the same
+/// (`docs/notes/` §15.93).
 fn alarm_once(ms: u64) -> bool {
     // `as _` at the field rather than the field's own alias: this libc
     // deprecates `time_t`/`suseconds_t` for a reason that is not this file's
@@ -239,7 +246,7 @@ fn main() {
     {
         let (rd, wr) = pipe().unwrap_or_else(|e| panic!("pipe: {e}"));
         let before = RAN.load(Ordering::Relaxed);
-        r.check("ITIMER_REAL arms", alarm_once(200));
+        r.check("ITIMER_REAL arms", alarm_once(50));
         let mut buf = [0u8; 16];
         let got = read(&rd, &mut buf).map_err(Errno::raw_os_error);
         r.check(
@@ -261,7 +268,7 @@ fn main() {
         let (rd, wr) = pipe().unwrap_or_else(|e| panic!("pipe: {e}"));
         let total = BIG.len();
         let before = RAN.load(Ordering::Relaxed);
-        r.check("ITIMER_REAL arms for the write", alarm_once(200));
+        r.check("ITIMER_REAL arms for the write", alarm_once(50));
         // No reader has taken anything, so the write filled the pipe and
         // parked; the signal ends that park and the answer is what landed.
         let got = write(&wr, &BIG);
@@ -295,7 +302,7 @@ fn main() {
     {
         let ev = eventfd(0, EventfdFlags::empty()).unwrap_or_else(|e| panic!("eventfd: {e}"));
         let before = RAN.load(Ordering::Relaxed);
-        r.check("ITIMER_REAL arms for the eventfd", alarm_once(200));
+        r.check("ITIMER_REAL arms for the eventfd", alarm_once(50));
         let mut buf = [0u8; 8];
         let got = read(&ev, &mut buf).map_err(Errno::raw_os_error);
         r.check(
@@ -332,7 +339,7 @@ fn main() {
             // SAFETY: the call just handed this process a fresh descriptor.
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
             let before = RAN.load(Ordering::Relaxed);
-            r.check("ITIMER_REAL arms for the signalfd", alarm_once(200));
+            r.check("ITIMER_REAL arms for the signalfd", alarm_once(50));
             let mut buf = [0u8; 128];
             let got = read(&fd, &mut buf).map_err(Errno::raw_os_error);
             r.check(
@@ -378,7 +385,7 @@ fn main() {
         let wd = inotify::add_watch(&inot, path, WatchFlags::MODIFY);
         r.check("the watch is added", wd.is_ok());
         let before = RAN.load(Ordering::Relaxed);
-        r.check("ITIMER_REAL arms for the inotify", alarm_once(200));
+        r.check("ITIMER_REAL arms for the inotify", alarm_once(50));
         let mut buf = [0u8; 256];
         let got = read(&inot, &mut buf).map_err(Errno::raw_os_error);
         r.check(
@@ -408,7 +415,7 @@ fn main() {
         )
         .unwrap_or_else(|e| panic!("socketpair: {e}"));
         let before = RAN.load(Ordering::Relaxed);
-        r.check("ITIMER_REAL arms for the datagram read", alarm_once(200));
+        r.check("ITIMER_REAL arms for the datagram read", alarm_once(50));
         let mut buf = [0u8; 16];
         let got = read(&a, &mut buf).map_err(Errno::raw_os_error);
         r.check(
@@ -434,7 +441,7 @@ fn main() {
         r.check("it binds a path", bind(&listener, &addr).is_ok());
         r.check("and listens", listen(&listener, 1).is_ok());
         let before = RAN.load(Ordering::Relaxed);
-        r.check("ITIMER_REAL arms for the accept", alarm_once(200));
+        r.check("ITIMER_REAL arms for the accept", alarm_once(50));
         let got = accept(&listener);
         r.check(
             "a blocked accept is ended by a signal",
@@ -451,10 +458,10 @@ fn main() {
         // `_exit`s; it shares nothing mutable with the parent.
         let kid = unsafe { libc::fork() };
         if kid == 0 {
-            sleep_ms(100);
+            sleep_ms(30);
             if let Ok(client) = socket(AddressFamily::UNIX, SocketType::STREAM, None) {
                 let _ = connect(&client, &addr);
-                sleep_ms(400);
+                sleep_ms(50);
             }
             leave(0);
         }
@@ -473,7 +480,7 @@ fn main() {
             // Nobody reads the master, so the output fills its buffer and the
             // writer parks - where a signal has to reach it too.
             let before = RAN.load(Ordering::Relaxed);
-            r.check("ITIMER_REAL arms for the pty write", alarm_once(200));
+            r.check("ITIMER_REAL arms for the pty write", alarm_once(50));
             let got = write(&slave, &BIG);
             r.check(
                 "a blocked pty write answers a partial count",
@@ -511,13 +518,13 @@ fn main() {
         // SAFETY: the child either sleeps and leaves, or `_exit`s.
         let kid = unsafe { libc::fork() };
         if kid == 0 {
-            sleep_ms(1200);
+            sleep_ms(200);
             leave(3);
         }
         r.check("a child is forked for wait4", kid > 0);
         if kid > 0 {
             let before = RAN.load(Ordering::Relaxed);
-            r.check("ITIMER_REAL arms for the wait4", alarm_once(200));
+            r.check("ITIMER_REAL arms for the wait4", alarm_once(50));
             let got = waitpid(Pid::from_raw(kid), WaitOptions::empty());
             r.check(
                 "a blocked wait4 is ended by a catchable signal with EINTR",
@@ -549,14 +556,14 @@ fn main() {
         // SAFETY: the child either sleeps and leaves, or `_exit`s.
         let kid = unsafe { libc::fork() };
         if kid == 0 {
-            sleep_ms(1200);
+            sleep_ms(200);
             leave(4);
         }
         r.check("a child is forked for waitid", kid > 0);
         if kid > 0 {
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             let before = RAN.load(Ordering::Relaxed);
-            r.check("ITIMER_REAL arms for the waitid", alarm_once(200));
+            r.check("ITIMER_REAL arms for the waitid", alarm_once(50));
             let got = waitid(0, 0, &mut info, 4);
             r.check(
                 "a blocked waitid is ended by a catchable signal with EINTR",

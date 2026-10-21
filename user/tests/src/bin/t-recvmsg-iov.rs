@@ -186,19 +186,50 @@ fn joined(segs: &[&[u8]]) -> Vec<u8> {
 /// ended rather than restarted.
 extern "C" fn wake_me(_: libc::c_int) {}
 
-fn interrupt_after(seconds: u32) {
+/// Arm a one-shot `SIGALRM` `ms` from now.
+///
+/// `alarm(2)` counts whole seconds, and the waits this file interrupts only
+/// have to outlast "the task is parked" - microseconds here, a few milliseconds
+/// under the second machine's TCG - so the second `alarm(1)` cost was the
+/// clock's resolution rather than a bound (`docs/notes/` §15.93). `setitimer`
+/// is the same timer with microseconds.
+fn interrupt_after(ms: u64) {
     unsafe {
         let mut act: libc::sigaction = core::mem::zeroed();
         act.sa_sigaction = wake_me as *const () as usize;
         act.sa_flags = 0;
         libc::sigemptyset(&mut act.sa_mask);
         libc::sigaction(libc::SIGALRM, &act, core::ptr::null_mut());
-        libc::alarm(seconds);
+        let next = libc::itimerval {
+            it_interval: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            it_value: libc::timeval {
+                tv_sec: (ms / 1000) as i64 as _,
+                tv_usec: ((ms % 1000) * 1000) as i64 as _,
+            },
+        };
+        let mut spent = next;
+        libc::setitimer(libc::ITIMER_REAL, &next, &mut spent);
     }
 }
 
 fn cancel_interrupt() {
-    unsafe { libc::alarm(0) };
+    let off = libc::itimerval {
+        it_interval: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    };
+    unsafe {
+        let mut spent = off;
+        libc::setitimer(libc::ITIMER_REAL, &off, &mut spent);
+    }
 }
 
 /// Wait until the stack has moved the datagram into the socket's queue: the
@@ -573,7 +604,7 @@ fn main() {
         "and the two it left are still there to read",
         answer.err.is_none() && answer.n == 2 && &drain[..2] == b"KL",
     );
-    interrupt_after(1);
+    interrupt_after(50);
     let answer = recv_chain(fd, &[(a.as_mut_ptr(), 0)], 0);
     cancel_interrupt();
     r.check(

@@ -1009,7 +1009,7 @@ fn main() {
         let _ = array_call(fd, NR_SYNCOBJ_SIGNAL, plain);
         unsafe { libc::_exit(0) };
     }
-    // Two seconds of budget against a 50 ms nap: the wait ends when the fence
+    // A second of budget against a 50 ms nap: the wait ends when the fence
     // arrives, and if the wake were lost this would be the clock instead. The
     // deadline is *absolute* - the ABI's `timeout_nsec` is a `CLOCK_MONOTONIC`
     // instant, not a duration - so it is "now + 2 s" through the helper the
@@ -1018,7 +1018,7 @@ fn main() {
     // runs, so the wait answered `ETIME` before the child could ever signal:
     // the check passed only while the sweep reached it inside the machine's
     // first two seconds, and stopped passing once the sweep grew past that.
-    let (got, _) = wait_one(fd, plain, deadline_ms_ahead(2_000), WAIT_FOR_SUBMIT);
+    let (got, _) = wait_one(fd, plain, deadline_ms_ahead(1_000), WAIT_FOR_SUBMIT);
     check_is(
         &mut r,
         "a WAIT_FOR_SUBMIT is woken by another task's SIGNAL",
@@ -1793,11 +1793,11 @@ fn main() {
         install_alarm(false);
         let kid = unsafe { libc::fork() };
         if kid == 0 {
-            child_nap(300);
+            child_nap(100);
             let _ = array_call(fd, NR_SYNCOBJ_SIGNAL, esig);
             unsafe { libc::_exit(0) };
         }
-        alarm_once(150);
+        alarm_once(50);
         let (got, _) = wait_one(fd, esig, deadline_ms_ahead(2000), WAIT_FOR_SUBMIT);
         check_refused(
             &mut r,
@@ -1810,7 +1810,7 @@ fn main() {
             "and the handler ran first",
             RAN.load(Ordering::Relaxed) >= 1,
         );
-        // Collect the child (it signals at 300 ms), then clear the fence it left.
+        // Collect the child (it signals at 100 ms), then clear the fence it left.
         reap(kid);
         check_is(
             &mut r,
@@ -1824,11 +1824,11 @@ fn main() {
         install_alarm(true);
         let kid2 = unsafe { libc::fork() };
         if kid2 == 0 {
-            child_nap(300);
+            child_nap(100);
             let _ = array_call(fd, NR_SYNCOBJ_SIGNAL, esig);
             unsafe { libc::_exit(0) };
         }
-        alarm_once(150);
+        alarm_once(50);
         let (got, _) = wait_one(fd, esig, deadline_ms_ahead(2000), WAIT_FOR_SUBMIT);
         check_is(
             &mut r,

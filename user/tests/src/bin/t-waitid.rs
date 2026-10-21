@@ -269,7 +269,7 @@ fn child_with_ids_stopping(real: Option<u32>) -> libc::pid_t {
         unsafe {
             libc::raise(libc::SIGSTOP);
         }
-        sleep_ms(1500);
+        sleep_ms(150);
         leave(0);
     }
     kid
@@ -454,7 +454,7 @@ fn main() {
     // exactly the divergence this claim was written for.
     let alive = unsafe { libc::fork() };
     if alive == 0 {
-        sleep_ms(1500);
+        sleep_ms(150);
         leave(0);
     }
     let zombie = child_that_exits(4);
@@ -544,7 +544,7 @@ fn main() {
     // to both, which is why the pair is here rather than one claim.
     let grouped = unsafe { libc::fork() };
     if grouped == 0 {
-        sleep_ms(2500);
+        sleep_ms(300);
         leave(8);
     }
     // The group is set from *both* sides, which is the idiom every shell uses
@@ -621,7 +621,7 @@ fn main() {
         unsafe {
             libc::raise(libc::SIGSTOP);
         }
-        sleep_ms(1500);
+        sleep_ms(150);
         leave(7);
     }
     r.check("a child that stops itself was forked", stopper > 0);
@@ -755,7 +755,7 @@ fn main() {
     // A call that reports *nothing* writes nothing, and `WNOHANG` finding the
     // child still running is that call - the zero a polling parent gets is not
     // an event (measured, scenario K).
-    let napper = child_that_sleeps(1500);
+    let napper = child_that_sleeps(150);
     r.check(
         "a still-running child was forked for the WNOHANG claim",
         napper > 0,
@@ -928,7 +928,7 @@ fn main() {
         wchild > 0,
     );
     if wchild > 0 {
-        sleep_ms(60);
+        sleep_ms(20);
         let mut info = poisoned();
         r.check(
             "waitid(P_ALL, WEXITED|__WCLONE) is ECHILD for a SIGCHLD child",
@@ -949,7 +949,7 @@ fn main() {
     let kchild = start_clone(0, 8);
     r.check("a clone(0) child was started", kchild > 0);
     if kchild > 0 {
-        sleep_ms(60);
+        sleep_ms(20);
         let mut info = poisoned();
         r.check(
             "waitid(P_ALL, WEXITED|WNOHANG) is ECHILD for a clone child",
@@ -1063,7 +1063,7 @@ fn main() {
         poison_target > 0,
     );
     if poison_target > 0 {
-        sleep_ms(60);
+        sleep_ms(20);
         let mut info = poisoned();
         let answered = waitid_raw(
             libc::P_PID,
@@ -1105,7 +1105,7 @@ fn main() {
         unrecorded > 0,
     );
     if unrecorded > 0 && guard != 0 {
-        sleep_ms(60);
+        sleep_ms(20);
         let mut ru = Rusage::seeded();
         let answered = waitid_raw(libc::P_PID, unrecorded, guard, libc::WEXITED, &mut ru);
         r.check(
@@ -1135,7 +1135,7 @@ fn main() {
     let refused = child_that_exits(6);
     r.check("a child was forked for the refusal claim", refused > 0);
     if refused > 0 {
-        sleep_ms(60);
+        sleep_ms(20);
         let mut info = poisoned();
         let answered = waitid_raw(
             libc::P_PID,
@@ -1196,7 +1196,7 @@ fn main() {
     let reaped = child_that_exits(6);
     r.check("a child was forked for the null-record claim", reaped > 0);
     if reaped > 0 {
-        sleep_ms(60);
+        sleep_ms(20);
         r.check(
             "a null record is accepted and answers 0",
             waitid_raw(libc::P_PID, reaped, 0, libc::WEXITED, core::ptr::null_mut()) == 0,
@@ -1215,7 +1215,7 @@ fn main() {
 
     // (6) `WNOHANG` with nothing to report is still a record to write - the
     // "nothing yet" zero - so an unwritable record is `EFAULT` here too.
-    let napper2 = child_that_sleeps(300);
+    let napper2 = child_that_sleeps(100);
     r.check(
         "a child was forked for the WNOHANG record claim",
         napper2 > 0,
@@ -1246,7 +1246,7 @@ fn main() {
         let straddled = child_that_exits(6);
         r.check("a child was forked for the boundary claim", straddled > 0);
         if straddled > 0 {
-            sleep_ms(60);
+            sleep_ms(20);
             // 64 bytes of record in the writable page, 64 past the boundary.
             let at = edge - 64;
             unsafe { core::ptr::write_bytes(at as *mut u8, 0xFF, 64) };
@@ -1275,7 +1275,7 @@ fn main() {
         let split = child_that_exits(6);
         r.check("a child was forked for the straddling claim", split > 0);
         if split > 0 {
-            sleep_ms(60);
+            sleep_ms(20);
             // `si_code` at +8 lands with two bytes on each side of the boundary.
             let at = edge - 11;
             unsafe { core::ptr::write_bytes(at as *mut u8, 0xFF, 11) };
@@ -1307,7 +1307,7 @@ fn main() {
             billed > 0,
         );
         if billed > 0 {
-            sleep_ms(60);
+            sleep_ms(20);
             // 64 bytes of the 144 in the writable page, the rest past it.
             let at = edge - 64;
             unsafe { core::ptr::write_bytes(at as *mut u8, 0xAA, 64) };

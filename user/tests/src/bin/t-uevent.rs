@@ -268,9 +268,13 @@ fn main() {
     // to wait for it - and what it wakes holding is the legacy block.
     let pid = unsafe { libc::fork() };
     if pid == 0 {
+        // A budget: the parent's blocking `recvmsg` is what waits, and the
+        // child only has to announce *after* that wait has parked. 50ms is some
+        // ten thousand times the fork-to-write gap measured in the sweep
+        // (`docs/notes/` §15.93).
         let nap = libc::timespec {
             tv_sec: 0,
-            tv_nsec: 300_000_000,
+            tv_nsec: 50_000_000,
         };
         let mut rem = nap;
         unsafe {

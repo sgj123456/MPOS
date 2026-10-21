@@ -146,19 +146,50 @@ fn tcp_pair() -> (OwnedFd, OwnedFd, OwnedFd) {
 /// interrupted" claim in the suite uses.
 extern "C" fn wake_me(_: libc::c_int) {}
 
-fn interrupt_after(seconds: u32) {
+/// Arm a one-shot `SIGALRM` `ms` from now.
+///
+/// `alarm(2)` counts whole seconds, so the two waits this file interrupts used
+/// to cost a second each. `setitimer` is the same timer with microseconds, and
+/// the budget only has to outlast "the task is parked" - microseconds here, a
+/// few milliseconds under the second machine's TCG (`docs/notes/` §15.93). The
+/// 50ms keeps 10x margin over the slowest arm measured.
+fn interrupt_after(ms: u64) {
     unsafe {
         let mut act: libc::sigaction = core::mem::zeroed();
         act.sa_sigaction = wake_me as *const () as usize;
         act.sa_flags = 0;
         libc::sigemptyset(&mut act.sa_mask);
         libc::sigaction(libc::SIGALRM, &act, core::ptr::null_mut());
-        libc::alarm(seconds);
+        let next = libc::itimerval {
+            it_interval: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            it_value: libc::timeval {
+                tv_sec: (ms / 1000) as i64 as _,
+                tv_usec: ((ms % 1000) * 1000) as i64 as _,
+            },
+        };
+        let mut spent = next;
+        libc::setitimer(libc::ITIMER_REAL, &next, &mut spent);
     }
 }
 
 fn cancel_interrupt() {
-    unsafe { libc::alarm(0) };
+    let off = libc::itimerval {
+        it_interval: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        it_value: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    };
+    unsafe {
+        let mut spent = off;
+        libc::setitimer(libc::ITIMER_REAL, &off, &mut spent);
+    }
 }
 
 fn main() {
@@ -286,7 +317,7 @@ fn main() {
         "a peek on the empty queue with MSG_DONTWAIT is EAGAIN",
         a.refused(Errno::AGAIN),
     );
-    interrupt_after(1);
+    interrupt_after(50);
     let a = receive(&server, &mut full, RecvFlags::PEEK);
     cancel_interrupt();
     r.check(
@@ -529,7 +560,7 @@ fn main() {
         "a peek on an empty stream with MSG_DONTWAIT is EAGAIN",
         a.refused(Errno::AGAIN),
     );
-    interrupt_after(1);
+    interrupt_after(50);
     let a = receive(&server, &mut buf[..0], RecvFlags::PEEK);
     cancel_interrupt();
     r.check(

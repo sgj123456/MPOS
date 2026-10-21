@@ -504,11 +504,12 @@ fn main() {
     // lingers - then the client, whose `FIN` is what lets the server's socket
     // finish rather than sit in `FIN-WAIT`. The sleep is the polls: the stack
     // advances on the service task's beat, and the transition is on the wire,
-    // not in this process.
+    // not in this process. 50ms is fifty beats, which is the same claim the
+    // 250ms made with a smaller budget (`docs/notes/` §15.93).
     drop(srv);
     drop(first_conn);
     drop(first_client);
-    thread::sleep(Duration::from_millis(250));
+    thread::sleep(Duration::from_millis(50));
 
     // Without the option the name is gone for as long as the 4-tuple lives,
     // which is the whole reason the option exists.
@@ -589,7 +590,7 @@ fn main() {
     drop(noopt);
     drop(noopt_conn);
     drop(noopt_client);
-    thread::sleep(Duration::from_millis(250));
+    thread::sleep(Duration::from_millis(50));
     match try_bind(&noopt_addr, true) {
         Err(err) => r.check(
             &format!("a holder without the option keeps its name (got {err})"),
@@ -628,7 +629,7 @@ fn main() {
     };
     // The listener goes; the *connection* stays open and is the holder now.
     drop(held);
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(30));
     match try_bind(&held_addr, false) {
         Err(err) => r.check(
             &format!("a live connection holds its name without the option (got {err})"),

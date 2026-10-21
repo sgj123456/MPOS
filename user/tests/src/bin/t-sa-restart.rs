@@ -8,7 +8,10 @@
 //! Measured on Linux 7.2 with a terminal read whose `SIGALRM` fired at 100 ms
 //! and whose byte arrived at 400 ms: with the flag set the handler runs at
 //! 100 ms and the *read* returns the byte at 400 ms; with it clear the same read
-//! answers `-1/EINTR` at 100 ms and a retry gets the byte.
+//! answers `-1/EINTR` at 100 ms and a retry gets the byte. The fixture below
+//! keeps that ordering with smaller numbers - a signal at 50 ms and a line at
+//! 300 ms - because only the *order* is the claim; the budget rule and the
+//! measurements behind it are `docs/notes/` §15.93.
 //!
 //! The kernel's side of that is a rewind, not a repeat of the syscall: the
 //! frame the handler runs on is `rt_sigreturn`'s record of the interrupted
@@ -243,9 +246,9 @@ fn main() {
     println!("t-sa-restart");
     let mut r = Report::new();
 
-    // 1. `SA_RESTART` set: the line typed at 600 ms is what ends the read, and
-    //    the signal due at 200 ms is a handler run that the caller never sees.
-    //    Before the rewind existed this read answered `EINTR` at 200 ms, which
+    // 1. `SA_RESTART` set: the line typed at 300 ms is what ends the read, and
+    //    the signal due at 50 ms is a handler run that the caller never sees.
+    //    Before the rewind existed this read answered `EINTR` at 50 ms, which
     //    is the failure a program that sets the flag and does not check for it
     //    treats as an I/O error.
     let (master, slave) = fresh_pair();
@@ -253,12 +256,12 @@ fn main() {
         "a SIGALRM handler installs with SA_RESTART",
         aim_alarm(true),
     );
-    let kid = type_later(master.as_fd(), 600, b"ok\r");
-    r.check("ITIMER_REAL arms", alarm_once(200));
+    let kid = type_later(master.as_fd(), 300, b"ok\r");
+    r.check("ITIMER_REAL arms", alarm_once(50));
     let (got, ms, buf) = timed_read(slave.as_fd());
     r.check("a restarted read answers the line, not EINTR", got == Ok(3));
     r.check("and it is that line", &buf[..3] == b"ok\n");
-    r.check("and it waited past the signal for it", ms >= 500);
+    r.check("and it waited past the signal for it", ms >= 200);
     r.check(
         "the handler ran once, inside the call",
         RAN.load(Ordering::Relaxed) == 1,
@@ -274,14 +277,14 @@ fn main() {
     //    retry gets the line that landed while it was not reading.
     let (master, slave) = fresh_pair();
     r.check("SIGALRM is re-armed without SA_RESTART", aim_alarm(false));
-    let kid = type_later(master.as_fd(), 600, b"ok\r");
-    r.check("ITIMER_REAL arms again", alarm_once(200));
+    let kid = type_later(master.as_fd(), 300, b"ok\r");
+    r.check("ITIMER_REAL arms again", alarm_once(50));
     let (got, ms, _) = timed_read(slave.as_fd());
     r.check(
         "without the flag the read comes back EINTR",
         got == Err(libc::EINTR),
     );
-    r.check("and it came back at the signal, not the line", ms < 500);
+    r.check("and it came back at the signal, not the line", ms < 200);
     r.check(
         "the handler still ran before the return",
         RAN.load(Ordering::Relaxed) == 2,
@@ -289,7 +292,7 @@ fn main() {
     let (got, ms, buf) = timed_read(slave.as_fd());
     r.check("the retried read takes the whole line", got == Ok(3));
     r.check("and it is that line", &buf[..3] == b"ok\n");
-    r.check("and the interrupted read had consumed nothing", ms >= 200);
+    r.check("and the interrupted read had consumed nothing", ms >= 100);
     reap(kid);
 
     // 3. A never-restarted call, with the flag *set*: the multiplexer answers
@@ -298,7 +301,7 @@ fn main() {
     //    would be a handler loop that never returns.
     let (master, slave) = fresh_pair();
     r.check("SIGALRM is set with SA_RESTART again", aim_alarm(true));
-    r.check("ITIMER_REAL arms once more", alarm_once(150));
+    r.check("ITIMER_REAL arms once more", alarm_once(50));
     let mut fds = [PollFd::new(&slave, PollFlags::IN)];
     let at = Instant::now();
     let got = poll(&mut fds, None);
@@ -307,7 +310,7 @@ fn main() {
         "poll answers EINTR even under SA_RESTART",
         got == Err(Errno::INTR),
     );
-    r.check("at the signal, not later", ms < 500);
+    r.check("at the signal, not later", ms < 200);
     r.check("and its handler ran too", RAN.load(Ordering::Relaxed) == 3);
     // Nothing was typed on this pair; the master stays open until the poll is
     // over because closing it would hang the slave up and end the wait early.
@@ -315,19 +318,20 @@ fn main() {
 
     // 4. The sleep is on the same never-restarted list, and it hands the caller
     //    the time that was left - which is the only thing that makes a retry
-    //    cheap. A 2 s sleep interrupted at 150 ms comes back about 1.85 s short,
+    //    cheap. A 1 s sleep interrupted at 100 ms comes back about 0.9 s short,
     //    and the loop musl's `sleep()` writes therefore sleeps what it asked
-    //    for rather than twice it.
+    //    for rather than twice it. (The measured pair above is 2 s at 100 ms;
+    //    the fixture is shorter and the *ratio* is what the claim reads.)
     r.check("the handler is still installed", aim_alarm(true));
     let req = libc::timespec {
-        tv_sec: 2,
+        tv_sec: 1,
         tv_nsec: 0,
     };
     let mut rem = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    r.check("ITIMER_REAL arms for the sleep", alarm_once(150));
+    r.check("ITIMER_REAL arms for the sleep", alarm_once(100));
     let at = Instant::now();
     // SAFETY: two `timespec`s this process owns.
     let got = unsafe { libc::nanosleep(&req, &mut rem) };
@@ -337,14 +341,14 @@ fn main() {
         "nanosleep answers EINTR under SA_RESTART",
         got == -1 && err == libc::EINTR,
     );
-    r.check("at the signal", ms < 1000);
+    r.check("at the signal", ms < 500);
     r.check(
         "the handler ran for the sleep as well",
         RAN.load(Ordering::Relaxed) == 4,
     );
     r.check(
         "and the remainder is the time that was left",
-        rem.tv_sec == 1 && (0..1_000_000_000).contains(&rem.tv_nsec),
+        rem.tv_sec == 0 && (600_000_000..1_000_000_000).contains(&rem.tv_nsec),
     );
 
     // Leave the signal the way it was found: a disposition left installed here

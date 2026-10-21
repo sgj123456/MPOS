@@ -32,6 +32,11 @@ fn ioctl(fd: libc::c_int, request: libc::c_ulong, arg: usize) -> (libc::c_long, 
 }
 
 /// Arm the alarm and park the count, so "did this call block" is visible.
+///
+/// 50ms, not the 400ms this started with: the guard only has to fire after the
+/// call parked, which is microseconds here and a few milliseconds under the
+/// second machine's TCG (`docs/notes/` §15.93). This program makes no claim - it
+/// is a diagnostic, and it is in that group so the sweep does not boot it.
 fn guard() -> usize {
     let next = libc::itimerval {
         it_interval: libc::timeval {
@@ -40,7 +45,7 @@ fn guard() -> usize {
         },
         it_value: libc::timeval {
             tv_sec: 0,
-            tv_usec: 400_000,
+            tv_usec: 50_000,
         },
     };
     let mut spent = next;
