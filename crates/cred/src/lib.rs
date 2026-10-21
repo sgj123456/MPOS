@@ -83,6 +83,16 @@ pub const CAP_FOWNER: u32 = 3;
 /// caller and `chmod 2755` comes back storing `0755`. `setattr_should_drop_suidgid`
 /// asks the same clause on the write path.
 pub const CAP_FSETID: u32 = 4;
+/// `CAP_KILL`, which a sender that is neither the target's real nor its
+/// saved-set user asks before a signal may cross a user boundary.
+///
+/// Linux's `kill_ok_by_cred` is the uid half of the same rule and lives here
+/// beside this bit: the two are one question - [kill_ok] answers the uids, and
+/// the caller asks `CAP_KILL` of the **target's** user namespace when it
+/// answers false. Measured on a current host (`.workbuddy/probe_killperm.c`):
+/// uid 1000's `kill(1, 0)` is `EPERM` while `kill(self, 0)` and
+/// `kill(child, 0)` are 0.
+pub const CAP_KILL: u32 = 5;
 /// `CAP_SETGID`, which an unprivileged `/proc/<pid>/gid_map` writer lacks - the
 /// capability that lifts the one-line rule there.
 pub const CAP_SETGID: u32 = 6;
@@ -163,6 +173,31 @@ impl Ids {
             || self.egid == 0
             || self.sgid == 0
     }
+}
+
+/// Linux's `kill_ok_by_cred`: whether the sender's uids are enough to signal a
+/// target, before the target's user namespace is asked for [`CAP_KILL`].
+///
+/// The pair that matters is **the sender's real or effective uid** against
+/// **the target's real or saved-set uid** - not the target's effective uid,
+/// which is the one field of the four a setuid program's privilege lives in
+/// and is deliberately not on the list. Measured on a current host
+/// (`.workbuddy/probe_killperm.c`): uid 1000's `kill(1, 0)` is `EPERM`, while
+/// its `kill(self, 0)` and `kill(child, 0)` are 0.
+///
+/// ```
+/// use mpos_cred::kill_ok;
+///
+/// assert!(kill_ok(1000, 1000, 1000, 0), "the same real id");
+/// assert!(kill_ok(1000, 1000, 0, 1000), "the sender's real id is the target's saved id");
+/// assert!(!kill_ok(1000, 1000, 0, 0), "a root target's ids are neither of the sender's");
+/// assert!(!kill_ok(0, 0, 4242, 4242), "root's ids match nowhere here; its power is CAP_KILL");
+/// ```
+pub fn kill_ok(sender_ruid: u32, sender_euid: u32, target_ruid: u32, target_suid: u32) -> bool {
+    sender_ruid == target_ruid
+        || sender_ruid == target_suid
+        || sender_euid == target_ruid
+        || sender_euid == target_suid
 }
 
 /// A thread group's credentials.

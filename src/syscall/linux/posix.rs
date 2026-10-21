@@ -1464,6 +1464,9 @@ pub fn handle_tgkill(args: [usize; ARG_COUNT]) -> isize {
     if snap.pid != tgid.0 {
         return err::ESRCH;
     }
+    if !crate::sched::may_signal(tid) {
+        return err::EPERM;
+    }
     if crate::sched::send_signal(tid, sig as u8) {
         0
     } else {
@@ -1474,10 +1477,13 @@ pub fn handle_tgkill(args: [usize; ARG_COUNT]) -> isize {
 /// `rt_sigqueueinfo(tgid, sig, uinfo)` — `kill` with a `siginfo_t`
 /// attached. The rules are the man page's: the siginfo must be readable,
 /// and a caller signalling *another* process may not forge the codes the
-/// kernel itself uses — `si_code` at or above zero is SI_USER's ground,
-/// and sending that to somebody else is EPERM. An `SI_QUEUE` record carries
-/// its payload's `si_value` word to the target's handler; any other code
-/// arrives as the kernel's own SI_USER record.
+/// kernel itself uses — `si_code` at or above zero is SI_USER's ground, and
+/// `SI_TKILL` is the one negative code reserved the same way; both are
+/// `EPERM`. Every other negative code is the caller's own and travels
+/// verbatim, together with the record's `si_pid`/`si_uid`/`si_errno` and its
+/// `si_value` word — measured on a current host, `.workbuddy/probe_qinfo.c`,
+/// where `-1`, `-2`, `-7`, `-8` and `-100` all arrive unchanged and the two
+/// identity words the caller wrote are not overwritten.
 ///
 /// It is also the door that reports a full queue: when the target's user holds
 /// `RLIMIT_SIGPENDING` real-time records already, this is `EAGAIN` where
@@ -1492,30 +1498,43 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
     if uinfo == 0 || !buffer_ok(uinfo, SIGINFO_BYTES, false, from_user) {
         return err::EFAULT;
     }
+    let si_errno = unsafe { ((uinfo + 4) as *const i32).read_unaligned() };
     let si_code = unsafe { ((uinfo + 8) as *const i32).read_unaligned() };
     let target = super::proc::pid_task(tgid);
-    if target != Some(crate::sched::current_tgid()) && si_code >= 0 {
+    // `si_code` at or above zero is the kernel's own ground, and `SI_TKILL` is
+    // the one negative code a caller may not forge either: both are `EPERM`
+    // when the target is somebody else. Measured on a current host
+    // (`.workbuddy/probe_qinfo.c`, Linux 7.2.11): -1, -2, -7, -8 and -100 are
+    // accepted; 0, +1 and -6 are `EPERM`.
+    if target != Some(crate::sched::current_tgid())
+        && (si_code >= 0 || si_code == crate::sched::signal::SI_TKILL)
+    {
         return err::EPERM;
     }
     let Some(target) = target else {
         return err::ESRCH;
     };
-    // The sender, as the record names it: its *own* number, which is what Linux
-    // writes (`task_tgid_vnr(current)`) and what a receiver in the same
-    // namespace reads back as the sender's `getpid`.
-    let (pid, uid) = {
-        let cur = crate::sched::current_identity();
-        (crate::sched::current_pid_number() as i32, cur.ruid as i32)
+    // The uid/capability rule the `kill` family asks, in the same place: after
+    // the code check (which is about what the record says) and before the send.
+    // Measured on a current host: a caller outside the target's ids and without
+    // `CAP_KILL` in its namespace is `EPERM` here exactly as it is at `kill`.
+    if !crate::sched::may_signal(target) {
+        return err::EPERM;
+    }
+    // The caller's record is the contract, not the sender's identity: Linux
+    // copies `si_pid`, `si_uid`, `si_errno` and `si_value` verbatim (measured,
+    // `.workbuddy/probe_qinfo.c`: 4242/4242 and the value arrive unchanged, and
+    // every accepted code keeps its own number). The old door overwrote the
+    // first two with the sender and collapsed every non-`SI_QUEUE` code to
+    // `SI_USER`, which is a different record than the one the caller wrote.
+    let (pid, uid, value) = unsafe {
+        (
+            ((uinfo + 16) as *const i32).read_unaligned(),
+            ((uinfo + 20) as *const i32).read_unaligned(),
+            ((uinfo + 24) as *const u64).read_unaligned(),
+        )
     };
-    // `union sigval` sits at offset 24 of `siginfo_t` on x86_64; an `SI_QUEUE`
-    // sender put its word there. The buffer was validated readable above, so
-    // the direct read matches the `si_code` read just before it.
-    let info = if si_code == crate::sched::signal::SI_QUEUE {
-        let value = unsafe { ((uinfo + 24) as *const u64).read_unaligned() };
-        crate::sched::signal::SigInfo::queue(sig as u8, pid, uid, value)
-    } else {
-        crate::sched::signal::SigInfo::user(sig as u8, pid, uid)
-    };
+    let info = crate::sched::signal::SigInfo::signed(sig as u8, si_errno, si_code, pid, uid, value);
     match crate::sched::send_signal_info(target, sig as u8, info) {
         crate::sched::Sent::NoTask => err::ESRCH,
         // Linux's `send_sigqueue` answer when the target's queued-signal

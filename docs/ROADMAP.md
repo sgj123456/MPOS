@@ -25,6 +25,10 @@ One-glance status of the whole roadmap.
 
 - [x] P1 Syscall completion — epoll · timerfd · 67/68 other calls (§1)
 - [ ] [~] P2 Signal delivery — frame · mask · siginfo · interruptible waits (§2)
+- [x] a signal is sent by someone who may send it — `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`  
+  ask Linux's `kill_ok_by_cred` and `CAP_KILL` in the **target's** user namespace, and the record  
+  door keeps the caller's `si_code`, `si_pid`, `si_uid` and `si_value` rather than overwriting  
+  them (§2.6, item 91)
 - [ ] [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3) — and  
   `fstatfs` names the filesystem the descriptor was *opened on*, the two doors agreeing (§3.6, item 89),
   each instance now carrying a non-zero `f_fsid` instead of a zero every mount shared (§3.7, item 90)

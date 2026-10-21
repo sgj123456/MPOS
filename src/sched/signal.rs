@@ -403,6 +403,13 @@ pub const SI_USER: i32 = 0;
 pub const SI_KERNEL: i32 = 0x80;
 pub const SI_QUEUE: i32 = -1;
 pub const SI_TIMER: i32 = -2;
+/// `SI_TKILL` is `tgkill`'s own code, and it is the one negative code a
+/// caller may not hand to `rt_sigqueueinfo`/`pidfd_send_signal`: Linux's
+/// `do_rt_sigqueueinfo` treats it like a positive code (`EPERM`), because it
+/// names a sender the kernel itself would have to have produced. Measured on
+/// a current host (`.workbuddy/probe_qinfo.c`): `si_code=-6` is `EPERM` while
+/// `-1`, `-2`, `-7`, `-8` and `-100` are accepted and preserved.
+pub const SI_TKILL: i32 = -6;
 
 /// The part of a `siginfo_t` this kernel can honour for the signals it names:
 /// the number, where it came from, and - for `sigqueue` - the one word of the
@@ -474,6 +481,28 @@ impl SigInfo {
             signo: sig as i32,
             errno: 0,
             code: SI_QUEUE,
+            pid,
+            uid,
+            value,
+            status: 0,
+            utime: 0,
+            stime: 0,
+        }
+    }
+
+    /// The record a caller handed in through `rt_sigqueueinfo`/`pidfd_send_signal`.
+    ///
+    /// Linux copies the caller's `si_errno`, `si_pid`, `si_uid` and `si_value`
+    /// verbatim (measured, `.workbuddy/probe_qinfo.c`: 4242/4242 and the value
+    /// arrive unchanged), and the **code** is the caller's too - every
+    /// negative code except [`SI_TKILL`], not just `SI_QUEUE`. This is why the
+    /// two doors cannot reuse [`SigInfo::queue`], which writes the sender's
+    /// identity where the caller's record is the contract.
+    pub fn signed(sig: u8, errno: i32, code: i32, pid: i32, uid: i32, value: u64) -> SigInfo {
+        SigInfo {
+            signo: sig as i32,
+            errno,
+            code,
             pid,
             uid,
             value,

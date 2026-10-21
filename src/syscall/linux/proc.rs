@@ -2076,7 +2076,7 @@ pub(super) fn handle_kill(args: [usize; ARG_COUNT]) -> isize {
     if sig > crate::sched::signal::MAX_SIGNAL as usize {
         return err::EINVAL;
     }
-    let delivered = match id {
+    match id {
         n if n < 0 => {
             let pgid = if n == -1 {
                 crate::sched::current_pgid()
@@ -2092,15 +2092,39 @@ pub(super) fn handle_kill(args: [usize; ARG_COUNT]) -> isize {
                     None => return err::ESRCH,
                 }
             };
-            crate::sched::send_signal_group(pgid, sig as u8)
+            kill_group(pgid, sig)
         }
-        0 => crate::sched::send_signal_group(crate::sched::current_pgid(), sig as u8),
-        n => match pid_task(n) {
-            Some(id) => crate::sched::send_signal(id, sig as u8),
-            None => return err::ESRCH,
-        },
-    };
-    if delivered { 0 } else { err::ESRCH }
+        0 => kill_group(crate::sched::current_pgid(), sig),
+        n => {
+            let Some(target) = pid_task(n) else {
+                return err::ESRCH;
+            };
+            // Who may signal whom is one rule, shared with `tgkill`'s other
+            // half and with the two doors that carry a record. Measured on a
+            // current host first (`.workbuddy/probe_killperm.c`): uid 1000's
+            // `kill(1, 0)` is `EPERM`, while its own child's is 0.
+            if !crate::sched::may_signal(target) {
+                return err::EPERM;
+            }
+            if crate::sched::send_signal(target, sig as u8) {
+                0
+            } else {
+                err::ESRCH
+            }
+        }
+    }
+}
+
+/// `kill`'s group branch, where a group is not one authority: a member the
+/// caller may not signal is skipped rather than turning the whole call into
+/// `EPERM`, which is Linux's `kill_pgrp`. The three answers are three errnos:
+/// no group at all, no member this caller may signal, and at least one it may.
+fn kill_group(pgid: crate::sched::TaskId, sig: usize) -> isize {
+    match crate::sched::send_signal_group_checked(pgid, sig as u8) {
+        crate::sched::GroupSend::NoGroup => err::ESRCH,
+        crate::sched::GroupSend::Refused => err::EPERM,
+        crate::sched::GroupSend::Delivered => 0,
+    }
 }
 
 /// `setpgid(pid, pgid)` — move a task into a process group. A `pgid` of zero

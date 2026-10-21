@@ -301,6 +301,87 @@ write with the errnos Linux gives it: the partial count, `EAGAIN` under
 `O_NONBLOCK`, `EINTR` under a signal, and the count is in the writer's own units
 (`input_prefix` maps the wire's bytes back, since `ONLCR` makes one `LF` two).
 
+### 2.6 Who may signal whom — **DONE** (2026-10-21)
+
+**Why**: the `kill` family delivered whatever it was asked to. There was no
+uid rule and no `CAP_KILL` question anywhere in `src/sched/runtime/`, so a
+process that had dropped to another user could signal a root process — and the
+new `pidfd_send_signal` (item 92) would have been a second door onto the same
+hole. Linux's rule is `kill_ok_by_cred` plus the capability, and this kernel
+had neither half.
+
+**Measured whole on a current host first** (`.workbuddy/probe_killperm.c`,
+Linux 7.2.11, uid 1000): `kill(1, 0)` is `EPERM` (1), `kill(self, 0)` is 0,
+`kill(child, 0)` is 0, and `kill(-1, 0)` is 0 — the last one because it reaches
+at least one process the caller may signal, which is the group half of the same
+rule. The uid comparison is **not** against the target's effective id: Linux's
+`kill_ok_by_cred` compares the sender's real/effective id against the target's
+**real or saved-set** id, which is why a setuid program's effective root id is
+not on the list.
+
+The record door's shape was measured in the same pass
+(`.workbuddy/probe_qinfo.c`): `si_code` `-1`, `-2`, `-7`, `-8` and `-100` are
+accepted and arrive **verbatim**, with the caller's `si_pid`/`si_uid` (4242 and
+4242 in the probe) and `si_value` unchanged; `si_code` 0, +1 and **`SI_TKILL`
+(`-6`)** are `EPERM` for a signal to another process. The old door overwrote
+`si_pid`/`si_uid` with the sender's and collapsed every non-`SI_QUEUE` code to
+`SI_USER`, which is a record the caller did not write.
+
+**The landing** is one rule and one place: `crates/cred::kill_ok` (the four uid
+comparisons, host-tested and a doctest) and `sched::may_signal` (the same rule
+over the task table, falling through to
+`userns::Caller::capable_in(&target.user_ns, CAP_KILL)`). The capability is
+asked of the **target's** namespace, not the caller's — the same
+object-shaped question `setns` and `AF_PACKET` already ask. `CAP_KILL` is now
+named in `crates/cred` (number 5). The kernel's own raises deliberately do not
+go through `may_signal`: a timer, a child's death and a console handover have
+no userspace sender to judge.
+
+`kill`/`tkill` ask it for a positive target (with `kill`'s group branch going
+through `send_signal_group_checked`, which skips members the caller may not
+signal and answers `EPERM` only when none are permitted), `tgkill` asks it after
+its own thread/group checks, and `rt_sigqueueinfo` asks it after the `si_code`
+rule. The record door now builds `SigInfo::signed` from the caller's
+`si_errno`/`si_code`/`si_pid`/`si_uid`/`si_value`, and `SI_TKILL` joined
+`si_code >= 0` in the `EPERM` set.
+
+**Pins**: `t-signal-permission` (new, default group, both machines). On a host
+run (`MPOS_ON_HOST=1`) it checks uid 1000 against pid 1 and itself. In the guest
+it forks three children:
+
+* a child that drops all three ids to 65534 asks its root parent (and itself)
+  through `kill`, `tgkill` and `rt_sigqueueinfo` — the three doors answer
+  `EPERM`, `0`, `EPERM`, `EPERM`; the root parent's `kill(child, 0)` is 0,
+  which can only be `CAP_KILL` because the uids match nowhere;
+* a uid-0 child signals a 65534 grandchild (0), empties its capability sets
+  with `capset`, and signals the same grandchild again (`EPERM`) — the
+  capability's own counterfactual;
+* a root child hands `rt_sigqueueinfo` an `SI_TKILL` record and an `SI_USER`
+  record addressed to its parent, and both are `EPERM` (the code rule, not the
+  uid rule).
+
+Using `SIGCONT` for the delivered records is deliberate: the uid claims must
+survive a counterfactual that removes the rule, and `SIGUSR1` would end the
+test process instead of printing the red claim.
+
+**Counterfactual** — `may_signal` made to return `true` (the rule removed),
+every pin kept: the one red program is `t-signal-permission`, with exactly four
+claims red — `a 65534 child's kill(root parent, 0) is EPERM`, the `tgkill`
+claim, the `rt_sigqueueinfo` claim, and `without CAP_KILL the same signal is
+EPERM` — while `root may signal the 65534 child (CAP_KILL)`, the grandchild's
+capability control, and both `SI_TKILL`/`SI_USER` refusals stay green. The four
+are the rule; the green ones are the controls that say it is not merely "every
+signal is refused".
+
+**Gate**: x86_64 `pass=193 fail=0`, `mpos-kunit 32 passed, 0 failed`; aarch64
+`pass=192 fail=0` (192 staged, 14 left out by `tests.toml`), `mpos-kunit 32
+passed, 0 failed`. Host unit suite 586, xtask 139.
+
+**Named**: `SIGCONT`'s session half (Linux additionally requires the sender and
+target to share a session for a `SIGCONT` that crosses a thread group; this
+kernel has process groups standing in for sessions), and `kill(-1)` remains the
+caller's own group rather than "every process the caller may signal" — the
+interpretation the door already carried, now filtered by the same rule.
 
 ---
 

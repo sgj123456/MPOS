@@ -1205,6 +1205,84 @@ pub fn send_signal_group(pgid: TaskId, sig: u8) -> bool {
     delivered
 }
 
+/// What a *permission-checked* group send found.
+///
+/// The three answers are three errnos at the syscall door: a group with no
+/// member at all is `ESRCH`, a group whose members are all outside the
+/// caller's authority is `EPERM`, and a group with at least one member the
+/// caller may signal is 0 - **even if** that member's own disposition
+/// discards the signal, because Linux's `kill` reports delivery, not effect.
+pub enum GroupSend {
+    NoGroup,
+    Refused,
+    Delivered,
+}
+
+/// Whether the running caller may signal `target`, by Linux's
+/// `kill_ok_by_cred` plus `CAP_KILL` in the **target's** user namespace.
+///
+/// The uid half is [`crate::cred::kill_ok`] (the sender's real/effective id
+/// against the target's real/saved id); the capability half is
+/// [`crate::userns::Caller::capable_in`], asked of the namespace the target
+/// stands in rather than the caller's own. Both halves were measured on a
+/// current host before they were wired here (`.workbuddy/probe_killperm.c`:
+/// uid 1000's `kill(1, 0)` is `EPERM`; `.workbuddy/probe_ns_owner.c`: a
+/// capability is a fact about the object's namespace).
+///
+/// This is deliberately **not** inside [`send_signal`]: the kernel's own
+/// raises - a timer, a child's death, a console handover - have no userspace
+/// sender to judge and must keep working exactly as they did.
+pub fn may_signal(target: TaskId) -> bool {
+    with_table(|t| {
+        let Some(target) = t.tasks.get(target.0).and_then(Option::as_ref) else {
+            return false;
+        };
+        let caller = t.task(t.current);
+        if crate::cred::kill_ok(
+            caller.identity.ruid,
+            caller.identity.euid,
+            target.identity.ruid,
+            target.identity.suid,
+        ) {
+            return true;
+        }
+        crate::userns::Caller {
+            ns: caller.user_ns.clone(),
+            euid: caller.identity.euid,
+            effective: caller.mm.credentials().effective,
+        }
+        .capable_in(&target.user_ns, crate::cred::CAP_KILL)
+    })
+}
+
+/// [`send_signal_group`] behind [`may_signal`], member by member.
+///
+/// A group is not one authority: a group can hold a process the caller may
+/// signal beside one it may not (the shell's own group after a `sudo`, say),
+/// and Linux's `kill_pgrp` skips the latter rather than refusing the call. The
+/// answer therefore has to carry whether *anyone* was permitted, which is why
+/// it is not a `bool`.
+pub fn send_signal_group_checked(pgid: TaskId, sig: u8) -> GroupSend {
+    let members = group_members(pgid);
+    if members.is_empty() {
+        return GroupSend::NoGroup;
+    }
+    let mut permitted = false;
+    for id in members {
+        if may_signal(id) {
+            permitted = true;
+            // The signal itself may be discarded by the target's disposition
+            // or namespace init rule; that is still Linux's 0, not a refusal.
+            let _ = send_signal(id, sig);
+        }
+    }
+    if permitted {
+        GroupSend::Delivered
+    } else {
+        GroupSend::Refused
+    }
+}
+
 /// The live tasks of one thread group: the process that a pid names.
 pub fn process_members(tgid: TaskId) -> alloc::vec::Vec<TaskId> {
     with_table(|t| {
