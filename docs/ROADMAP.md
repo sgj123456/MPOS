@@ -224,6 +224,10 @@ One-glance status of the whole roadmap.
 - [x] 10.4 pipes + per-frame allocations — ring, handover and the seam frame pool all landed; the rate-pair measurement is recorded (§10.4)
 - [ ] [~] 10.5 ext4/virtio-blk read path — cache, wide transfer and the demand run landed and measured; interrupt-driven completions measured and re-scoped, multi-request pipelining dropped; the first machine's boot-disk figure still open (§10.5)
 - [x] 10.6 serial TX ring · [ ] 10.7 sub-tick sleeps (LAPIC one-shot) (§10.6, §10.7)
+- [x] the gate's own clock — `cargo xtask test` measured **80.7 s → 6.5 s (12.4x)** warm: a
+  stack that nothing advanced (§15.92), wait budgets that were the clock's resolution rather
+  than bounds (§15.93), and a sweep whose host half runs beside its guests and whose programs
+  are dealt over lanes by their measured cost (§15.94)
 
 **Architectures (Phase 9)**
 
@@ -232,6 +236,8 @@ One-glance status of the whole roadmap.
 - [ ] [~] 13 Machine-seam purity + aarch64 parity — 13.1 and 13.3–13.31 landed, 13.2 in progress (§13); boot-side half is Phase 15 (§15)
 - [x] the boot is one flow — one `start`, one sequence, probes ask both transports (§15.8)
 - [x] the kernel travels inside the loader — the ESP carries one bootable file (§15.9)
+- [x] the self-test sweep is many machines' — the host half beside the guests, one lane per
+  core, and a deal that follows what the last run measured (§15.94)
 
 **Architecture debt (Phase 11)** — audit done, Steps A–G landed, V-1/V-4/V-13 closed (§11):
 

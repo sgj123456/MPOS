@@ -1170,6 +1170,17 @@ pub struct Captured {
     /// The whole serial line, read after the machine stopped.
     pub log: String,
     pub timed_out: bool,
+    /// Every line that began with one of the caller's marks, with the
+    /// millisecond the poll first saw it. Empty for [`capture`], which does not
+    /// ask for any: a single machine's caller reads the log it already has.
+    ///
+    /// This is where a sweep's per-program costs come from (`docs/notes/`
+    /// §15.94): the harness's protocol prints a line when a program starts and
+    /// another when it ends, and the harness is already polling the log, so the
+    /// wall time between the two is free to read. It is a *hint* - the poll's
+    /// own beat is 20 ms - and nothing but the next run's lane balance depends
+    /// on it.
+    pub progress: Vec<(u64, String)>,
 }
 
 /// Whether any of `markers` has reached the log at `path`.
@@ -1191,6 +1202,144 @@ fn log_contains(path: &Path, markers: &[&str]) -> bool {
             .windows(marker.len())
             .any(|window| window == marker.as_bytes())
     })
+}
+
+/// [`capture`]'s loop over several machines at once: the sweep's lanes.
+///
+/// A lane is not a second protocol - it is a second guest running the same one -
+/// so the only thing this function adds is that a guest which finished does not
+/// keep the others waiting. Each job is spawned before the first one is polled,
+/// which is what makes the boots overlap rather than queue.
+///
+/// The deadline is sweep-wide, not per-lane: two lanes of a sweep share one
+/// `MPOS_TEST_TIMEOUT` budget, because a sweep that hangs anywhere is a sweep
+/// that hangs, and a per-lane deadline would make a four-lane run wait four
+/// times as long before admitting it. As in [`capture`], a lane with
+/// terminators that reached one is *done* - the caller reads the log either way
+/// - and only a lane that did neither is reported as timed out.
+///
+/// `marks` are the line prefixes whose arrival time the caller wants: the poll
+/// already has the log open, so the moment each marked line appeared is free to
+/// keep (see [`Captured::progress`]). A partial line waits for its newline, and
+/// a lane's last bytes are drained once more after the loop, so the closing
+/// line of a guest that exited is not lost.
+///
+/// Answers in the order the jobs were given, so the caller keeps its own lane
+/// numbering rather than inferring one from the order things finished in.
+pub fn capture_many(
+    jobs: Vec<(Command, PathBuf)>,
+    terminators: &[&str],
+    marks: &[&str],
+    deadline: Duration,
+) -> Result<Vec<Captured>> {
+    struct Lane {
+        child: std::process::Child,
+        log: PathBuf,
+        status: Option<std::process::ExitStatus>,
+        reached_a_terminator: bool,
+        /// How much of the log has been turned into lines already, and the
+        /// bytes of a line still arriving.
+        read: u64,
+        partial: String,
+        progress: Vec<(u64, String)>,
+    }
+
+    /// Take whatever has landed in `lane`'s log since the last look, and keep
+    /// the marked lines with the millisecond they were first seen.
+    fn drain(lane: &mut Lane, marks: &[&str], elapsed_ms: u64) {
+        let Ok(bytes) = fs::read(&lane.log) else {
+            return;
+        };
+        if bytes.len() as u64 <= lane.read {
+            return;
+        }
+        let chunk = String::from_utf8_lossy(&bytes[lane.read as usize..]).into_owned();
+        lane.read = bytes.len() as u64;
+        lane.partial.push_str(&chunk);
+        while let Some(index) = lane.partial.find('\n') {
+            let line: String = lane.partial.drain(..=index).collect();
+            let line = line.trim_end();
+            if marks.iter().any(|mark| line.starts_with(mark)) {
+                lane.progress.push((elapsed_ms, line.to_string()));
+            }
+        }
+    }
+
+    let started = Instant::now();
+    let mut lanes: Vec<Lane> = Vec::with_capacity(jobs.len());
+    for (mut command, log) in jobs {
+        let child = command
+            .spawn()
+            .with_context(|| format!("Failed to start QEMU for {}", log.display()))?;
+        lanes.push(Lane {
+            child,
+            log,
+            status: None,
+            reached_a_terminator: false,
+            read: 0,
+            partial: String::new(),
+            progress: Vec::new(),
+        });
+    }
+
+    loop {
+        let mut running = false;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        for lane in &mut lanes {
+            // The bytes are taken even from a lane that has finished: the line
+            // that says a machine is done often arrives in the same poll as its
+            // exit, and a cost table missing the last program of every lane is
+            // a table that keeps that program on the wrong lane for ever.
+            drain(lane, marks, elapsed_ms);
+            if lane.status.is_some() || lane.reached_a_terminator {
+                continue;
+            }
+            // A lane that said its last word is finished even though its
+            // process is not; the same rule `capture` applies to one machine.
+            if !terminators.is_empty() && log_contains(&lane.log, terminators) {
+                lane.reached_a_terminator = true;
+                continue;
+            }
+            match lane.child.try_wait()? {
+                Some(status) => lane.status = Some(status),
+                None => running = true,
+            }
+        }
+        if !running {
+            break;
+        }
+        if started.elapsed() >= deadline {
+            break;
+        }
+        // Finer than `capture`'s hundred milliseconds: a lane's *whole* run is
+        // the sweep, so a tenth of a second of join latency per lane would be a
+        // measured part of the gate rather than the rounding of a one-minute
+        // boot.
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // One last look for every lane, with the clock where the loop left it: a
+    // guest's closing lines can land between the last poll and its exit.
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let mut captured = Vec::with_capacity(lanes.len());
+    for mut lane in lanes {
+        drain(&mut lane, marks, elapsed_ms);
+        // A lane still running is one that neither left nor said its last word:
+        // it is stopped here, so the sweep cannot leave a guest behind.
+        if lane.status.is_none() {
+            let _ = lane.child.kill();
+            let _ = lane.child.wait();
+        }
+        let timed_out = lane.status.is_none() && !lane.reached_a_terminator;
+        let text = String::from_utf8_lossy(&fs::read(&lane.log).unwrap_or_default()).into_owned();
+        captured.push(Captured {
+            status: lane.status.and_then(|status| status.code()),
+            log: text,
+            timed_out,
+            progress: lane.progress,
+        });
+    }
+    Ok(captured)
 }
 
 pub fn capture(
@@ -1244,6 +1393,7 @@ pub fn capture(
         status: status.and_then(|status| status.code()),
         log: text,
         timed_out,
+        progress: Vec::new(),
     })
 }
 

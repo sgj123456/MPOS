@@ -15,6 +15,7 @@
 //!    disk is a virtual FAT QEMU synthesizes from a directory (`fat:`), and no
 //!    root privileges are needed anywhere.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,8 +35,17 @@ const DEFAULT_TIMEOUT_SECS: u64 = 900;
 pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -> Result<()> {
     check_target_gates()?;
     check_boot_openings()?;
-    run_unit_tests()?;
-    println!();
+
+    // Stage 1 starts here and is *joined* after stage 2 has run. The two share
+    // no file - the host suite writes cargo's `target/`, the sweep writes
+    // `build/` - so there is nothing to order between them, and until this
+    // change the sweep's machine was idle for the whole of stage 1 (3.1 s of a
+    // 28 s gate, measured 2026-10-21; `docs/notes/` §15.94). Its output is
+    // captured rather than inherited: two threads writing into one stream cut
+    // cargo's progress lines in half, and this log is read by a person looking
+    // for the one line that failed.
+    println!("Unit tests: the kernel and its leaf crates (host) - alongside the sweep below");
+    let host = std::thread::spawn(run_unit_tests);
 
     // The x86_64 sweep: its own initramfs on the QEMU wiring in `machine.toml`.
     // Named rather than left to the workspace default, so the machine this
@@ -105,9 +115,26 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
     // above asks of the same list, so the boot and its payload cannot disagree.
     let tar = build_test_initramfs(build_dir, &plan.staged)?;
     let diskstat = diskstat_for_staged(plan.staged.iter().map(|test| test.name.as_str()));
-    let (status, log) = boot_tests(build_dir, profile, &tar, diskstat)?;
+    let guest = boot_tests(build_dir, profile, &tar, diskstat, &plan.staged).and_then(
+        |(status, log, summary)| report(&plan.staged, plan.built, &log, status, diskstat, summary),
+    );
 
-    report(&plan.staged, plan.built, &log, status, diskstat)
+    // The host stage's verdict is asked even when the guest's failed: both ran,
+    // and a failure in one must not hide the other's answer. Its text lands
+    // above the guest's report rather than after it, so the sweep's own long
+    // log stays last, where a reader looks for the tail.
+    let host = match host.join() {
+        Ok(Ok(text)) => {
+            print!("{text}");
+            Ok(())
+        }
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(anyhow::anyhow!(
+            "the host unit-test stage panicked; the sweep's own verdict is above"
+        )),
+    };
+    host?;
+    guest
 }
 
 /// The structural check that belongs ahead of the compiler: a `#[cfg(test)]`
@@ -205,10 +232,11 @@ const LEAF_CRATES: &[&str] = &[
     "mpos-link",
 ];
 
-fn run_unit_tests() -> Result<()> {
+fn run_unit_tests() -> Result<String> {
     let root = utils::project_root()?;
+    let mut text = String::new();
 
-    println!("Unit tests: the kernel and its leaf crates (host)");
+    text.push_str("Unit tests: the kernel and its leaf crates (host)\n");
     let mut cmd = Command::new("cargo");
     cmd.args([
         "test",
@@ -222,7 +250,7 @@ fn run_unit_tests() -> Result<()> {
         cmd.arg("-p").arg(crate_name);
     }
     cmd.current_dir(&root);
-    utils::run_status(&mut cmd, "the kernel's host unit tests")?;
+    text.push_str(&run_captured(&mut cmd, "the kernel's host unit tests")?);
 
     // The doctests are the same contracts again, as the examples a reader of
     // the source meets: every fenced block in `src/` and `crates/*/src` is
@@ -232,7 +260,7 @@ fn run_unit_tests() -> Result<()> {
     // and the package list is the host suite's own - a leaf crate added for the
     // unit tests is covered here too, and [`tests::every_leaf_crate_is_tested`]
     // keeps that list honest.
-    println!("Doc tests: the kernel and its leaf crates (host)");
+    text.push_str("Doc tests: the kernel and its leaf crates (host)\n");
     let mut cmd = Command::new("cargo");
     cmd.args([
         "test",
@@ -246,9 +274,9 @@ fn run_unit_tests() -> Result<()> {
         cmd.arg("-p").arg(crate_name);
     }
     cmd.current_dir(&root);
-    utils::run_status(&mut cmd, "the kernel's host doctests")?;
+    text.push_str(&run_captured(&mut cmd, "the kernel's host doctests")?);
 
-    println!("Unit tests: xtask");
+    text.push_str("Unit tests: xtask\n");
     let mut cmd = Command::new("cargo");
     cmd.args([
         "test",
@@ -258,9 +286,30 @@ fn run_unit_tests() -> Result<()> {
         "mpos-xtask",
     ])
     .current_dir(&root);
-    utils::run_status(&mut cmd, "xtask's unit tests")?;
+    text.push_str(&run_captured(&mut cmd, "xtask's unit tests")?);
 
-    Ok(())
+    Ok(text)
+}
+
+/// Run `cmd` to completion, keeping its output for the caller to print when it
+/// is ready, and refusing a non-zero exit with the last lines of that output.
+///
+/// The capture exists because stage 1 runs in a thread beside stage 2 (see
+/// [`run_tests`]): the point is to keep the two streams from being written at
+/// once, not to hide the output - the caller prints every byte of it, in order,
+/// at the point where a reader would have expected it before the overlap.
+fn run_captured(cmd: &mut Command, what: &str) -> Result<String> {
+    let output = cmd
+        .output()
+        .with_context(|| format!("Failed to run {what}"))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        let tail: Vec<&str> = text.lines().rev().take(40).collect();
+        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        bail!("{what} failed:\n{}", tail.join("\n"));
+    }
+    Ok(text)
 }
 
 /// One user test program: its name (what appears on a verdict line) and the
@@ -616,7 +665,10 @@ fn append_test_members(
 ///
 /// Which programs are in `/bin` at all *is* the test selection: the guest has
 /// no opinion about which tests it runs, it runs what it was given, so
-/// `tests.toml` decides the sweep simply by deciding what is staged here.
+/// `tests.toml` decides the sweep simply by deciding what is staged here. A
+/// sweep with more than one lane then narrows it once more per guest through
+/// `mpos.tests=` on that lane's command line, which is the same "runs what it
+/// was given" rule one level down.
 ///
 /// Both machines run this one script. The second machine stages the same
 /// programs onto its *disk* rather than into the archive (its boot pivots onto
@@ -678,16 +730,39 @@ run_one() {
         "$1"
     fi
 }
-for t in /bin/t-*; do
-    echo "=== RUN ${t##*/}"
-    if run_one "$t"; then
-        echo "=== PASS ${t##*/}"
+run_test() {
+    echo "=== RUN ${1##*/}"
+    if run_one "$1"; then
+        echo "=== PASS ${1##*/}"
         pass=$((pass + 1))
     else
-        echo "=== FAIL ${t##*/} exit=$?"
+        echo "=== FAIL ${1##*/} exit=$?"
         fail=$((fail + 1))
     fi
+}
+
+# Which programs this boot runs. A sweep with more than one lane hands each
+# guest its own subset on the kernel command line (`mpos.tests=t-a,t-b,...`);
+# a boot with no such word runs everything staged, which is one lane and also
+# what a hand boot of a test image does. The word is read here, in the runner,
+# and not by the kernel: whether a machine runs tests is the image's to say
+# (`docs/notes/` §15.19), and this only chooses among programs the image
+# already carries.
+want=""
+for word in $(cat /proc/cmdline); do
+    case "$word" in
+        mpos.tests=*) want=$(echo "${word#mpos.tests=}" | tr ',' ' ') ;;
+    esac
 done
+if [ -n "$want" ]; then
+    for name in $want; do
+        run_test "/bin/$name"
+    done
+else
+    for t in /bin/t-*; do
+        run_test "$t"
+    done
+fi
 echo "=== SUMMARY pass=$pass fail=$fail"
 echo "=== END"
 /bin/busybox poweroff -f
@@ -748,143 +823,433 @@ fn diskstat_for_staged<'a>(mut staged: impl Iterator<Item = &'a str>) -> &'stati
     }
 }
 
-/// Boots the test initramfs in QEMU and returns the exit status with the path
-/// of the captured serial log. The boot disk is QEMU's virtual FAT: the loader
-/// and the test initramfs are served out of a plain directory, so no image
-/// needs creating and no privilege is needed to write it.
+/// One lane of the sweep: the programs it was dealt, where its wire went, and
+/// how its machine ended.
+struct Lane {
+    names: Vec<String>,
+    log: PathBuf,
+    status: Option<i32>,
+    timed_out: bool,
+    text: String,
+}
+
+/// How many guests one sweep boots at once: one per host core, up to six.
 ///
-/// No kernel file is staged here any more, and that is the loader's doing rather
-/// than this function's: the loader carries the kernel *inside itself*
-/// (`boot/build.rs`), so a file beside it would be a file nothing opens. What
-/// decides which kernel this boot runs is therefore the loader - the one
-/// `utils::build_test_kernel` built a moment ago, immediately after the
-/// self-test kernel it had just made.
+/// `MPOS_TEST_LANES` overrides it outright (`1` is the sweep this command ran
+/// before lanes existed, and it is what a host with one core and no KVM gets).
+///
+/// The ceiling is a measurement (2026-10-21, `docs/notes/` §15.94), taken with
+/// the waits of §15.93 in place and the costs of §15.94's own table in hand -
+/// the same 192 programs, the whole command, warm:
+///
+/// | lanes | gate |
+/// |---|---|
+/// | 1 | 28.15 s (serial, the §15.93 measurement) |
+/// | 4 | 8.13 s |
+/// | 6 | 6.45 s |
+///
+/// Past six the *fixed* parts of every lane take over: a guest's own boot
+/// (2.1 s - OVMF plus unpacking the 91 MiB archive) and `t-udpblock`'s 3.2 s,
+/// which waits on §10.5's ARP-release window by design (`src/net/socket.rs`'s
+/// `DRAIN_WAIT_MS`) and cannot be shortened. One per core rather than a flat
+/// six because a lane is a whole machine (a vCPU, and `machine.toml`'s memory
+/// as its ceiling): a container with two cores gets two, and the sweep is
+/// sleep-bound enough that fewer lanes cost time rather than hanging.
+fn lane_count(staged: usize) -> usize {
+    let asked = std::env::var("MPOS_TEST_LANES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|cores| cores.get())
+                .unwrap_or(1)
+                .min(6)
+        });
+    lane_count_in(asked, staged)
+}
+
+/// What a requested count turns into. Three rules, and the third is the one a
+/// person meets: a sweep cannot boot *no* machine (`0` is a typo for the serial
+/// sweep, not for a run with nothing in it), and it cannot boot more lanes than
+/// it has programs - a lane with nothing in it boots a machine to run none.
+fn lane_count_in(asked: usize, staged: usize) -> usize {
+    asked.clamp(1, staged.max(1))
+}
+
+/// Deal the staged programs across `lanes` lanes, heaviest first, each to the
+/// lane that is carrying the least.
+///
+/// A *count* deal is not a balance. Measured on the first lane sweep
+/// (2026-10-21, `docs/notes/` §15.94): forty-eight programs each, and the lanes
+/// took 8.95 s, 4.32 s, 6.95 s and 6.59 s, because the costs are not spread by
+/// the alphabet - `t-udpblock` waits on §10.5's ARP-release window *by design*
+/// and `t-waitid`/`t-wait-eintr`/`t-wait4` each wait on §15.93's budget, and
+/// three of those four landed in one lane. Longest-processing-time first is
+/// what a *measured* cost turns into an even split (the same 192 programs would
+/// then cost 4.96/4.99/5.00/4.97 s in the model beside that measurement).
+///
+/// The costs are the previous run's, read from [`cost_path`] and written by the
+/// run that measured them, so nothing here is a host's number written into the
+/// tree: a program the table does not name costs nothing and is dealt last,
+/// which puts it on the least-loaded lane - the deal is always a partition, and
+/// a stale hint can only make it less even, never wrong.
+fn deal_lanes(names: &[&str], costs: &BTreeMap<String, u64>, lanes: usize) -> Vec<Vec<String>> {
+    let mut order: Vec<(&str, u64)> = names
+        .iter()
+        .map(|name| (*name, cost_of(costs, name)))
+        .collect();
+    // Heaviest first, and by name inside a weight so the deal is a function of
+    // the staged set and the table rather than of the order they were read in.
+    order.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(right.0)));
+
+    let mut dealt: Vec<Vec<String>> = (0..lanes).map(|_| Vec::new()).collect();
+    let mut load = vec![0u64; lanes];
+    for (name, cost) in order {
+        // Load first, and the lane's *count* as the tie-break. With a table the
+        // count never decides anything a cost has not already decided; without
+        // one (the first sweep on a tree) every cost is zero and the count is
+        // what keeps the deal even instead of pouring everything into lane 0.
+        let lane = (0..lanes)
+            .min_by_key(|lane| (load[*lane], dealt[*lane].len()))
+            .expect("a sweep has at least one lane");
+        load[lane] += cost;
+        dealt[lane].push(name.to_string());
+    }
+    dealt
+}
+
+/// The least a program is charged, measured or not: the poll's own beat
+/// (`qemu::capture_many` reads each lane's log every 20 ms).
+///
+/// A window shorter than the beat reads as zero milliseconds, and zero is not
+/// what a program costs - every one of them is a fork, an exec, its own lines
+/// on the wire and its exit. Charging the resolution is both the honest lower
+/// bound and what keeps the deal even: measured on 2026-10-21, 71 of 192
+/// programs came out at zero, and with a zero weight every one of them was
+/// dealt to whichever lane the table called free - the run that measured this
+/// put 96 programs in one lane and one in another. The total is unaffected
+/// (16625 ms of measured work either way); what the floor buys is the *shape*
+/// (§15.94).
+const COST_FLOOR_MS: u64 = 20;
+
+/// What a program weighs in the deal: what the last run measured it at, or the
+/// floor - for a name the table does not know as much as for one it calls
+/// free.
+fn cost_of(costs: &BTreeMap<String, u64>, name: &str) -> u64 {
+    costs
+        .get(name)
+        .copied()
+        .unwrap_or(COST_FLOOR_MS)
+        .max(COST_FLOOR_MS)
+}
+
+/// Where the sweep keeps what each program cost it, one `name<TAB>ms` per line.
+///
+/// Written by every green run and read by the next one, and it is the *only*
+/// consumer of the numbers: a program's own verdict never reads this file. That
+/// is what keeps a hint from becoming a contract - deleting it costs a less
+/// even deal, not a different sweep.
+fn cost_path(build_dir: &Path) -> PathBuf {
+    build_dir.join("test-costs-x86_64.tsv")
+}
+
+/// The cost table, or an empty one when there is none yet (the first sweep on a
+/// tree, or one whose file was removed). A line that does not parse is skipped
+/// rather than fatal for the same reason: this is a hint, and a hint that has
+/// gone bad must not be able to fail a sweep.
+fn read_costs(build_dir: &Path) -> BTreeMap<String, u64> {
+    let Ok(text) = fs::read_to_string(cost_path(build_dir)) else {
+        return BTreeMap::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (name, millis) = line.split_once('\t')?;
+            Some((name.trim().to_string(), millis.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+fn write_costs(build_dir: &Path, costs: &BTreeMap<String, u64>) -> Result<()> {
+    let mut text = String::new();
+    for (name, millis) in costs {
+        text.push_str(&format!("{name}\t{millis}\n"));
+    }
+    let path = cost_path(build_dir);
+    fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))
+}
+
+/// What each program cost its lane, out of the lines the poll marked.
+///
+/// The protocol's own pair: `=== RUN <name>` opens a window, `=== PASS <name>`
+/// or `=== FAIL <name>` closes it. A window still open at the end is dropped -
+/// a program that never answered has no cost worth dealing by - and re-running
+/// a program inside one lane would keep the last window, which is the one whose
+/// verdict the sweep read.
+fn measure_costs(progress: &[(u64, String)]) -> BTreeMap<String, u64> {
+    let mut costs = BTreeMap::new();
+    let mut open: Option<(String, u64)> = None;
+    for (millis, line) in progress {
+        if let Some(name) = line.strip_prefix("=== RUN ") {
+            open = Some((name.trim().to_string(), *millis));
+            continue;
+        }
+        if !line.starts_with("=== PASS ") && !line.starts_with("=== FAIL ") {
+            continue;
+        }
+        if let Some((name, started)) = open.take() {
+            costs.insert(name, millis.saturating_sub(started));
+        }
+    }
+    costs
+}
+
+/// The sweep's own summary line, summed over lanes that each printed one.
+///
+/// `None` when any lane printed no summary: a lane that did not reach the end
+/// of its programs is not a lane whose passes can be added to the others', and
+/// answering a total anyway would be the one thing the sweep must never do -
+/// report a green number for a run that did not happen. The caller turns the
+/// `None` into a failed run.
+fn combined_summary(lanes: &[String]) -> Option<String> {
+    let (mut pass, mut fail) = (0u64, 0u64);
+    for lane in lanes {
+        let summary = sweep::verdict(lane).summary?;
+        let field = |key: &str| {
+            summary
+                .split_whitespace()
+                .find_map(|word| word.strip_prefix(key))
+                .and_then(|value| value.parse::<u64>().ok())
+        };
+        pass += field("pass=")?;
+        fail += field("fail=")?;
+    }
+    Some(format!("pass={pass} fail={fail}"))
+}
+
+/// Put `from` at `to` without a second copy when the filesystem allows it.
+///
+/// The tar one sweep stages is tens of megabytes and every lane boots the same
+/// one; QEMU only reads it. A hard link is the whole copy, and on a filesystem
+/// that refuses one (a different mount, a FAT directory) the copy is what the
+/// single-lane sweep always did.
+fn link_or_copy(from: &Path, to: &Path) -> Result<()> {
+    if fs::hard_link(from, to).is_ok() {
+        return Ok(());
+    }
+    fs::copy(from, to)
+        .map(|_| ())
+        .with_context(|| format!("Failed to stage {} at {}", from.display(), to.display()))
+}
+
+/// Boots the test initramfs in QEMU - one machine per lane - and answers the
+/// combined exit status, the whole wire in lane order, and the summary summed
+/// over the lanes.
+///
+/// The boot disk is QEMU's virtual FAT: the loader and the test initramfs are
+/// served out of a plain directory, so no image needs creating and no privilege
+/// is needed to write it. **Everything a machine writes is that machine's own**:
+/// its ESP directory, its firmware variable store (OVMF writes it at boot), its
+/// SATA image (the path `machine_args` derives from the ESP's directory), its
+/// 9p share and the console socket inside it, and its serial file. The one
+/// shared byte range is the tar, hard-linked and read-only, because a second
+/// copy of tens of megabytes is paid once per lane for nothing.
 fn boot_tests(
     build_dir: &Path,
     profile: &str,
     tar: &Path,
     diskstat: &str,
-) -> Result<(Option<i32>, String)> {
+    staged: &[&UserTest],
+) -> Result<(Option<i32>, String, Option<String>)> {
     println!("User tests: booting the test machine");
 
-    let esp = build_dir.join("test-esp");
-    if esp.exists() {
-        fs::remove_dir_all(&esp)?;
-    }
-    fs::create_dir_all(esp.join("EFI/BOOT"))?;
-    fs::copy(
-        utils::loader_path(profile, Arch::X86_64)?,
-        esp.join("EFI/BOOT/BOOTX64.EFI"),
-    )?;
-    fs::copy(tar, esp.join("initramfs.tar"))?;
-    // `console=ttyS0` makes the serial wire the test boot's only console, so
-    // every line the harness reads is the whole of what the machine said - there
-    // is no second console to be missing it on.
-    //
-    // There used to be a second word here, `mpos.selftest`, and the kernel used
-    // to parse it to decide whether to run its checks. Nothing reads it now:
-    // whether a machine runs its suites is which *image* was built, so the test
-    // boot is the build `utils::build_test_kernel` made and the word would be a
-    // word nobody answers to. It is gone rather than left in as a marker, because
-    // a marker the kernel ignores is exactly the shape that reads as a mechanism
-    // and is not one.
-    fs::write(
-        esp.join("mpos.cmdline"),
-        format!("console=ttyS0{diskstat}\n"),
-    )?;
-
-    // A SATA disk beside the ESP, so the test machine has *two* disks from two
-    // drivers: the ESP reaches the guest through virtio-blk, and this one
-    // through the AHCI controller the `Boot::Esp` arm attaches. It is what
-    // `t-ahci` reads, writes and reads back, which is the only way a driver
-    // whose every line is a volatile register access gets pinned at all
-    // (`NOTES.md` §7.3). Sparse and small: the test writes one sector and reads
-    // it back, and nothing else in the suite touches it.
-    //
-    // `disk`'s function and not a local one: both machines' wiring attaches this
-    // disk now, so the file is one fixture with one name that either arm lays.
-    // Laid *fresh* before every sweep: the suite writes to this disk (`t-ahci` a
-    // sector, §10.5's pair a whole filesystem), and the claims about the bytes
-    // around what was written are only claims if the state before them is known
-    // — on a file that outlives the run, "ensured" would mean "whatever the last
-    // run left" (`disk::reset_sata_image`).
-    crate::disk::reset_sata_image(build_dir)?;
-
-    let (firmware, vars) = qemu::write_firmware_vars(build_dir, Arch::X86_64)?;
-
-    let log = build_dir.join("test-serial.log");
-    let esp = esp.canonicalize()?;
-    let log_path = log.display().to_string();
-    // The same command line `run` boots with, from `qemu.*` in machine.toml -
-    // except that the disk is this run's ESP and the serial line goes to a
-    // file, because a test reads its verdict back out of it. The share and
-    // the console socket live under the build directory the same way, made
-    // here so the devices that want them never start without.
-    // The share and console socket get their own directory, not `run`'s:
-    // `machine_args` binds `console.sock` inside this dir and exports it over
-    // 9p, and a second QEMU (a live `cargo xtask run`) already holds those -
-    // the bind would fail before the guest boots.
-    // The share carries the 9p probe file too, so a test can mount it and read
-    // the bytes back - the pin for the first machine's share, which used to be
-    // exported and never reachable (`NOTES.md` §13.29).
-    let share = utils::lay_p9_share(&build_dir.join("test-9p-share"))?;
-    let mut config = crate::config::QemuConfig::load_default(Arch::X86_64)?;
-    // A test boot never needs the host vsock bus, and claiming `guest-cid=3`
-    // collides with any VM already running on this host (a concurrent
-    // `cargo xtask run`, say) - which would abort QEMU before the guest boots
-    // and report every test as failed. Leave it off here; `run` keeps it.
-    config.vsock = false;
-    // And the card is the 2D one, whatever `machine.toml` ships. The GL card is
-    // what a human boots now - it is the only way this machine has a hardware
-    // renderer, and niri comes up on it (`docs/notes/` §7.4) - but *this* boot
-    // cannot carry it, measured 2026-10-14 on this host: the guest half is green
-    // on it (`=== SUMMARY pass=170 fail=0`, `mpos-kunit 30 passed, 0 failed`)
-    // and QEMU then dies after the guest wrote its debug exit, SIGSEGV inside
-    // the **host's** own `libgallium`, reached from QEMU's `egl_cleanup` under
-    // `qemu_cleanup` (the run's `coredumpctl` report: `#15 egl_cleanup
-    // (ui-opengl.so)`). A host Mesa teardown crash is not a refusal this kernel
-    // could answer, so the exit-33 check below reads `-1` and no run on that
-    // card could ever be called green. What the suite claims about the card is
-    // card-conditional already (`t-virtgpu`'s 3D target is served on one and
-    // refused on the other), so pinning it to the 2D card pins the same claims;
-    // the only thing that changes is whether the host survives its own
-    // shutdown. The why in full is `machine.toml`'s, and it is one key.
-    config.gpu = "virtio-gpu-pci".to_string();
-    let args = qemu::machine_args(
-        &config,
-        &firmware.code,
-        &vars,
-        qemu::Boot::Esp(esp.clone()),
-        &qemu::Console::File(log_path.clone()),
-        &share,
+    let names: Vec<&str> = staged.iter().map(|test| test.name.as_str()).collect();
+    let costs = read_costs(build_dir);
+    let dealt = deal_lanes(&names, &costs, lane_count(staged.len()));
+    println!(
+        "User tests: {} programs over {} lane(s)",
+        names.len(),
+        dealt.len()
     );
-    // `isa-debug-exit` - the port the kernel writes its verdict to - comes with
-    // every machine `machine_args` builds.
+    // What the deal believes each lane will carry. Printed because a lane's
+    // *count* is not what it carries - the lane holding the 3.2 s program is
+    // the one with one program in it - and a reader seeing "1 programs" beside
+    // "96 programs" without this line would be right to think the deal broke.
+    if !costs.is_empty() {
+        let loads: Vec<String> = dealt
+            .iter()
+            .map(|lane| {
+                let load: u64 = lane.iter().map(|name| cost_of(&costs, name)).sum();
+                format!("{} programs / {load} ms", lane.len())
+            })
+            .collect();
+        println!(
+            "User tests: dealing from {} measured costs: {}",
+            costs.len(),
+            loads.join(", ")
+        );
+    }
+    let loader = utils::loader_path(profile, Arch::X86_64)?;
 
-    eprintln!("+ qemu-system-x86_64 {}", args.join(" "));
-    let mut command = Command::new("qemu-system-x86_64");
-    command.args(&args);
+    let mut plans: Vec<Lane> = Vec::with_capacity(dealt.len());
+    let mut jobs: Vec<(Command, PathBuf)> = Vec::with_capacity(dealt.len());
+    for (index, lane_names) in dealt.iter().enumerate() {
+        let dir = build_dir.join(format!("test-lane-{index}"));
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        let esp = dir.join("esp");
+        fs::create_dir_all(esp.join("EFI/BOOT"))?;
+        fs::copy(&loader, esp.join("EFI/BOOT/BOOTX64.EFI"))?;
+        link_or_copy(tar, &esp.join("initramfs.tar"))?;
+        // `console=ttyS0` makes the serial wire this boot's only console, so
+        // every line the harness reads is the whole of what the machine said -
+        // there is no second console to be missing it on.
+        //
+        // `mpos.tests=` is the lane's program list. The *runner* reads it out of
+        // `/proc/cmdline`; the kernel does not read it, and the rule that
+        // whether a machine runs tests is the image's to say (§15.19) is
+        // untouched - this word only chooses among programs the image already
+        // carries, which is what makes a lane a second guest of one sweep rather
+        // than a second sweep.
+        fs::write(
+            esp.join("mpos.cmdline"),
+            format!(
+                "console=ttyS0{diskstat} mpos.tests={}\n",
+                lane_names.join(",")
+            ),
+        )?;
 
-    // The loop is `qemu::capture`'s - one loop for both machines. What this call
-    // does not pass is terminators: this machine's boot ends when its kernel
-    // writes the debug exit, so the process leaving *is* the end of the run, and
-    // there is no marker to stop on earlier.
+        // Per lane, in the order the reasons matter:
+        //  * the firmware's variable store - OVMF writes it;
+        //  * the SATA disk - laid fresh before every sweep because the suite
+        //    writes to it (`t-ahci` a sector, §10.5's pair a whole filesystem)
+        //    and "known state" has to mean this run's;
+        //  * the 9p share and its console socket - `machine_args` binds the
+        //    socket inside the share, so a second QEMU fails the bind before
+        //    its guest boots;
+        //  * the serial file the verdict is read from.
+        let (firmware, vars) = qemu::write_firmware_vars(&dir, Arch::X86_64)?;
+        crate::disk::reset_sata_image(&dir)?;
+        let share = utils::lay_p9_share(&dir.join("9p-share"))?;
+        let log = dir.join("serial.log");
+        let esp = esp.canonicalize()?;
+
+        let mut config = crate::config::QemuConfig::load_default(Arch::X86_64)?;
+        // A test boot never needs the host vsock bus, and claiming `guest-cid=3`
+        // collides with any VM already running on this host - a second lane
+        // included: a second guest claiming a live CID aborts QEMU before the
+        // guest starts (`docs/notes/` §13.28). Leave it off here; `run` keeps it.
+        config.vsock = false;
+        // And the card is the 2D one, whatever `machine.toml` ships. The GL card
+        // is what a human boots (`docs/notes/` §7.4), but *this* boot cannot
+        // carry it: measured 2026-10-14, the guest half is green and QEMU then
+        // dies after the guest wrote its debug exit, SIGSEGV inside the host's
+        // own `libgallium` under `egl_cleanup`. A host Mesa teardown crash is
+        // not a refusal this kernel could answer, and no run on that card could
+        // ever read exit 33. What the suite claims about the card is
+        // card-conditional already (`t-virtgpu`), so this pins the same claims.
+        config.gpu = "virtio-gpu-pci".to_string();
+        let args = qemu::machine_args(
+            &config,
+            &firmware.code,
+            &vars,
+            qemu::Boot::Esp(esp),
+            &qemu::Console::File(log.display().to_string()),
+            &share,
+        );
+        // `isa-debug-exit` - the port the kernel writes its verdict to - comes
+        // with every machine `machine_args` builds.
+        eprintln!("+ lane {index}: qemu-system-x86_64 {}", args.join(" "));
+
+        let mut command = Command::new("qemu-system-x86_64");
+        command.args(&args);
+        jobs.push((command, log.clone()));
+        plans.push(Lane {
+            names: lane_names.clone(),
+            log,
+            status: None,
+            timed_out: false,
+            text: String::new(),
+        });
+    }
+
+    // One loop for all the lanes (`qemu::capture_many`), a sweep-wide deadline,
+    // and no terminators: this machine's boot ends when its kernel writes the
+    // debug exit, so the process leaving *is* the end of that lane's run.
     let timeout = Duration::from_secs(test_timeout_secs());
-    let captured = qemu::capture(command, &log, &[], timeout)?;
-    if captured.timed_out {
-        bail!(
-            "The test machine did not finish within {}s; its serial output is at {}",
-            timeout.as_secs(),
-            log.display()
+    let captured = qemu::capture_many(jobs, &[], &["=== "], timeout)?;
+    let mut measured: BTreeMap<String, u64> = BTreeMap::new();
+    for machine in &captured {
+        measured.extend(measure_costs(&machine.progress));
+    }
+    for (plan, machine) in plans.iter_mut().zip(captured) {
+        plan.status = machine.status;
+        plan.timed_out = machine.timed_out;
+        plan.text = machine.log;
+    }
+
+    let mut logs: Vec<String> = Vec::with_capacity(plans.len());
+    let mut status = Some(33);
+    for (index, lane) in plans.iter().enumerate() {
+        if lane.timed_out {
+            bail!(
+                "lane {index} ({} programs) did not finish within {}s; its serial output is at {}",
+                lane.names.len(),
+                timeout.as_secs(),
+                lane.log.display()
+            );
+        }
+        println!(
+            "User tests: lane {index} ran {} programs, exit {}",
+            lane.names.len(),
+            lane.status.unwrap_or(-1)
+        );
+        if lane.status != Some(33) {
+            if status == Some(33) {
+                status = lane.status.or(Some(-1));
+            }
+            // The lane's own tail, not the sweep's: a lane that died says why
+            // in *its* log, and the last lines of the concatenation belong to
+            // whichever machine finished last.
+            println!("User tests: lane {index} did not end on the debug exit; its last lines:");
+            let tail: Vec<&str> = lane.text.lines().collect();
+            for line in tail.iter().rev().take(20).rev() {
+                println!("  | lane {index}: {line}");
+            }
+        }
+        logs.push(format!(
+            "--- lane {index}: {} programs ---\n{}",
+            lane.names.len(),
+            lane.text
+        ));
+    }
+
+    // What each program cost, for the *next* run's deal. Only a run that
+    // measured every staged program writes it: a sweep that lost a lane would
+    // otherwise teach the next one a table with holes in it, and the deal it
+    // would buy is worse than the even one. A red run leaves the old table
+    // alone for the same reason - its costs are the costs of a broken run.
+    if measured.len() == names.len() {
+        write_costs(build_dir, &measured)?;
+    } else if !measured.is_empty() {
+        println!(
+            "User tests: {} of {} programs were timed; the cost table is left as it was",
+            measured.len(),
+            names.len()
         );
     }
-    if captured.status != Some(33) {
-        eprintln!(
-            "test: note: QEMU exited with {} (33 is the clean debug exit)",
-            captured.status.unwrap_or(-1)
-        );
-    }
-    Ok((captured.status, captured.log))
+
+    let summary = combined_summary(&logs);
+    let text = logs.join("\n");
+    // The one stable path every reader knows (`xtask/README.md`): the sweep's
+    // whole wire, lane by lane, written once the run is over rather than by a
+    // guest. The per-lane files stay beside it under `build/test-lane-<n>/`,
+    // which is where a failure that is one machine's is read from - and the
+    // stable name stays a *file* that a second session cannot tear, because
+    // nothing streams into it while the run is going.
+    fs::write(build_dir.join("test-serial.log"), &text)?;
+
+    Ok((status, text, summary))
 }
 
 fn test_timeout_secs() -> u64 {
@@ -905,6 +1270,7 @@ fn report(
     text: &str,
     status: Option<i32>,
     diskstat: &str,
+    summary: Option<String>,
 ) -> Result<()> {
     // The protocol is `sweep`'s - one parser for both runners - and what this
     // arm does with it is its own, because its claim is: every staged program
@@ -915,7 +1281,10 @@ fn report(
         .filter(|test| !verdict.passed.contains(&test.name.as_str()))
         .map(|test| test.name.as_str())
         .collect();
-    let summary = verdict.summary;
+    // The summary is the caller's, not the log's: a sweep with more than one
+    // lane has one summary line per lane, and the number a reader wants is
+    // their sum (`combined_summary`). `verdict` still answers *which* programs
+    // passed, which is per-program and lane-independent.
     let clean = status == Some(33) && summary.is_some();
 
     // The kernel's own suites, which ran before any program did. Both halves of
@@ -925,7 +1294,7 @@ fn report(
     let kunit = verdict.kunit;
 
     println!();
-    if let Some(summary) = summary {
+    if let Some(summary) = &summary {
         println!("self-test guest: {summary} ({} built)", tests.len());
     } else {
         println!("self-test guest: no summary line - the run did not get to the end");
@@ -1458,8 +1827,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        DISKSTAT_FIXTURE_ENTRY, DISKSTAT_FIXTURE_MEMBER, DISKSTAT_ON, LEAF_CRATES, UserTest,
-        append_test_members, ustar_header,
+        DISKSTAT_FIXTURE_ENTRY, DISKSTAT_FIXTURE_MEMBER, DISKSTAT_ON, LEAF_CRATES, TEST_INIT,
+        UserTest, append_test_members, ustar_header,
     };
 
     /// The tail-staging writer's own format claims, against the host `tar`:
@@ -1667,6 +2036,226 @@ mod tests {
             format!("/{DISKSTAT_FIXTURE_ENTRY}"),
             DISKSTAT_FIXTURE_MEMBER,
             "the two spellings drifted apart"
+        );
+    }
+
+    /// A lane deal is a *partition*: every staged program in exactly one lane,
+    /// because the sweep's verdict is "every staged program printed PASS" and a
+    /// name dealt twice runs twice (a second 3.2 s `t-udpblock` on a lane that
+    /// already had one) while a name dealt nowhere is a program the report then
+    /// refuses. The evenness is the other half: with one lane per program the
+    /// deal is the identity, and the lanes differ by at most one program
+    /// otherwise - which is the whole balancing policy (§15.94).
+    #[test]
+    fn the_lane_deal_is_a_partition_and_stays_even() {
+        let names: Vec<String> = (0..10).map(|n| format!("t-{n:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
+
+        let no_costs = std::collections::BTreeMap::new();
+        for lanes in 1..=5 {
+            let dealt = super::deal_lanes(&refs, &no_costs, lanes);
+            assert_eq!(dealt.len(), lanes);
+            let mut all: Vec<&str> = dealt.iter().flatten().map(|n| n.as_str()).collect();
+            all.sort_unstable();
+            let mut want = refs.clone();
+            want.sort_unstable();
+            assert_eq!(all, want, "lanes={lanes} is not a partition");
+            let longest = dealt.iter().map(|lane| lane.len()).max().unwrap();
+            let shortest = dealt.iter().map(|lane| lane.len()).min().unwrap();
+            assert!(
+                longest - shortest <= 1,
+                "lanes={lanes} dealt {shortest}..{longest}"
+            );
+        }
+
+        // One lane per program is the identity: the deal must not reorder a set
+        // it can hand out whole, because the report names lanes in a fixed order
+        // and a test's position in a lane is its staged position.
+        let dealt = super::deal_lanes(&refs, &no_costs, refs.len());
+        for (index, name) in refs.iter().enumerate() {
+            assert_eq!(dealt[index], vec![name.to_string()]);
+        }
+    }
+
+    /// The lane count's own clamp: a requested number that would boot a machine
+    /// to run nothing, or none at all, is answered with the nearest count that
+    /// is a sweep.
+    #[test]
+    fn the_lane_count_never_asks_for_a_machine_with_nothing_to_do() {
+        assert_eq!(super::lane_count_in(0, 192), 1, "zero is the serial sweep");
+        assert_eq!(super::lane_count_in(6, 192), 6);
+        assert_eq!(
+            super::lane_count_in(64, 3),
+            3,
+            "no more lanes than programs"
+        );
+        assert_eq!(
+            super::lane_count_in(6, 0),
+            1,
+            "an empty payload is still one"
+        );
+    }
+
+    /// A program the table calls free is charged the poll's beat rather than
+    /// nothing: its window was shorter than the measurement's own resolution,
+    /// not free, and a zero weight is what let one lane be dealt 96 programs
+    /// while another got one (§15.94).
+    #[test]
+    fn a_program_the_table_calls_free_is_charged_the_polls_beat() {
+        let costs: std::collections::BTreeMap<String, u64> = [("t-free", 0u64), ("t-known", 120)]
+            .into_iter()
+            .map(|(name, millis)| (name.to_string(), millis))
+            .collect();
+        assert_eq!(super::cost_of(&costs, "t-free"), super::COST_FLOOR_MS);
+        assert_eq!(super::cost_of(&costs, "t-unknown"), super::COST_FLOOR_MS);
+        assert_eq!(super::cost_of(&costs, "t-known"), 120);
+        assert!(
+            super::COST_FLOOR_MS > 0,
+            "the floor is what makes a pile impossible"
+        );
+    }
+
+    /// A deal with measured costs in hand is a *balance*, and that is the whole
+    /// point of keeping them: the count deal gave every lane the same number of
+    /// programs and lanes that differed by two to one (measured, §15.94). The
+    /// weights here are the shape the sweep actually has - one design-bound
+    /// outlier and a wide middle - and the claim is the one LPT makes: two
+    /// lanes of 600 ms each rather than 800/400.
+    #[test]
+    fn the_deal_follows_the_measured_costs() {
+        let names = ["t-slow", "t-a", "t-b", "t-c", "t-d"];
+        let costs: std::collections::BTreeMap<String, u64> = [
+            ("t-slow", 400u64),
+            ("t-a", 200),
+            ("t-b", 200),
+            ("t-c", 200),
+            ("t-d", 200),
+        ]
+        .into_iter()
+        .map(|(name, millis)| (name.to_string(), millis))
+        .collect();
+
+        let dealt = super::deal_lanes(&names, &costs, 2);
+        let load = |lane: &[String]| lane.iter().map(|name| costs[name]).sum::<u64>();
+        assert_eq!(
+            (load(&dealt[0]), load(&dealt[1])),
+            (600, 600),
+            "the deal is not balanced: {dealt:?}"
+        );
+        // The outlier is what a count deal got wrong, so it is the one thing
+        // this deals first and alone.
+        assert!(dealt[0].contains(&"t-slow".to_string()));
+        assert!(!dealt[1].contains(&"t-slow".to_string()));
+
+        // And a name the table does not know is dealt as the cheapest there is:
+        // it lands on whichever lane is carrying the least, never on a lane the
+        // table already knows to be full.
+        let unknown = ["t-slow", "t-new", "t-a"];
+        let dealt = super::deal_lanes(&unknown, &costs, 2);
+        assert!(dealt[0].contains(&"t-slow".to_string()));
+        assert_eq!(dealt[1], vec!["t-a".to_string(), "t-new".to_string()]);
+    }
+
+    /// A program's cost is the window between its `=== RUN` and its verdict,
+    /// read off the lines the poll marked. The pin is the protocol's edge: a
+    /// program that never answered has no cost (dealing by a window still open
+    /// would measure the machine's did-not-finish), and the marks that are not
+    /// the pair are ignored.
+    #[test]
+    fn a_program_costs_the_time_between_its_run_and_its_verdict() {
+        let progress: Vec<(u64, String)> = [
+            (100, "=== RUN t-a"),
+            (200, "ok:    something"),
+            (360, "=== PASS t-a"),
+            (400, "=== RUN t-b"),
+            (410, "=== SUMMARY pass=1 fail=0"),
+        ]
+        .into_iter()
+        .map(|(millis, line)| (millis, line.to_string()))
+        .collect();
+        let costs = super::measure_costs(&progress);
+        assert_eq!(costs.get("t-a"), Some(&260));
+        assert_eq!(costs.get("t-b"), None, "an open window has no cost");
+        assert_eq!(costs.len(), 1);
+    }
+
+    /// The cost table is a hint, and a hint has to be unable to fail a sweep:
+    /// it round-trips through the file the next run reads, and a line that does
+    /// not parse is skipped rather than taking the table (or the run) with it.
+    #[test]
+    fn the_cost_table_round_trips_and_a_broken_line_is_ignored() {
+        let dir = std::env::temp_dir().join("mpos-cost-table-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let costs: std::collections::BTreeMap<String, u64> = [("t-b", 250u64), ("t-a", 40)]
+            .into_iter()
+            .map(|(n, m)| (n.to_string(), m))
+            .collect();
+        super::write_costs(&dir, &costs).unwrap();
+        assert_eq!(super::read_costs(&dir), costs);
+
+        let path = super::cost_path(&dir);
+        fs::write(&path, "t-a\t40\nt-b\tnot-a-number\n").unwrap();
+        let read = super::read_costs(&dir);
+        assert_eq!(read.len(), 1, "the broken line is skipped: {read:?}");
+        assert_eq!(read.get("t-a"), Some(&40));
+
+        // No file at all is the first sweep on a tree: an empty hint, not a
+        // failure.
+        fs::remove_file(&path).unwrap();
+        assert!(super::read_costs(&dir).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The summed summary is what a reader sees for the whole sweep, so it has
+    /// to be the sum and it has to refuse a lane that never reached the end: a
+    /// lane without its own summary contributed *nothing*, and answering a total
+    /// anyway is the one failure the sweep must not have (a green number for a
+    /// run that did not happen).
+    #[test]
+    fn the_summary_of_a_lane_sweep_is_the_sum_of_its_lanes() {
+        let one = "t-a\n=== SUMMARY pass=3 fail=0\n=== END\n".to_string();
+        let two = "t-b\n=== SUMMARY pass=2 fail=1\n=== END\n".to_string();
+        assert_eq!(
+            super::combined_summary(&[one.clone(), two]).as_deref(),
+            Some("pass=5 fail=1")
+        );
+        assert_eq!(
+            super::combined_summary(&[one.clone()]).as_deref(),
+            Some("pass=3 fail=0")
+        );
+
+        // A lane that died before its summary is not silence to add up.
+        let cut = "t-c\n=== RUN t-c\nok: something\n".to_string();
+        assert_eq!(super::combined_summary(&[one, cut]), None);
+        assert_eq!(
+            super::combined_summary(&[]),
+            Some("pass=0 fail=0".to_string())
+        );
+    }
+
+    /// The runner is where a lane's program list is read, and the word is the
+    /// harness's own: `mpos.tests=` comes off the kernel command line from the
+    /// *script*, never from the kernel, because whether a machine runs tests is
+    /// the image's to say (§15.19). Pinned as text because the script is text:
+    /// a word the harness writes and the script does not read is a lane that
+    /// runs everything (four times the sweep, in four guests) and reports a
+    /// green number for each.
+    #[test]
+    fn the_runner_reads_the_lane_word_and_falls_back_to_every_program() {
+        let init = super::TEST_INIT;
+        assert!(
+            init.contains("mpos.tests="),
+            "the runner has to know the lane word the harness writes"
+        );
+        assert!(
+            init.contains("cat /proc/cmdline"),
+            "the word reaches the runner through /proc/cmdline"
+        );
+        assert!(
+            init.contains("for t in /bin/t-*"),
+            "a boot with no lane word still runs what it was given"
         );
     }
 

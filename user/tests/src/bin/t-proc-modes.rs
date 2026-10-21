@@ -223,13 +223,35 @@ fn main() {
     // The length is the one the file answers: the claim is the *pair*, since a
     // size alone would be satisfied by a constant. Non-zero is claimed beside
     // it, because zero is the answer every other generated file gives.
+    //
+    // The read is a *loop*, not one 512-byte call. A test sweep hands each
+    // guest its lane's program list on the command line (`docs/notes/` §15.94),
+    // so the line is about a kilobyte; a single buffer answered its first 512
+    // bytes and the pair then read as "the size is wrong" when it was the
+    // reader that was short. The claim is the length of the *line*, which needs
+    // the whole line - and the loop is bounded, because a generated file that
+    // never reached the end would otherwise stall the sweep instead of failing
+    // this claim.
+    const CAP: usize = 64 * 1024;
     let size = statat(CWD, "/proc/cmdline", AtFlags::empty())
         .ok()
         .map(|st| st.st_size);
-    let mut buf = [0u8; 512];
-    let answered = std::fs::File::open("/proc/cmdline")
-        .and_then(|mut file| std::io::Read::read(&mut file, &mut buf))
-        .ok();
+    let answered = (|| {
+        let mut file = std::fs::File::open("/proc/cmdline").ok()?;
+        let mut all: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            if all.len() >= CAP {
+                break;
+            }
+            let n = std::io::Read::read(&mut file, &mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            all.extend_from_slice(&buf[..n]);
+        }
+        Some(all.len())
+    })();
     r.check(
         "and /proc/cmdline's own size is the length of the line it answers",
         matches!((size, answered), (Some(size), Some(n)) if size > 0 && size as usize == n),

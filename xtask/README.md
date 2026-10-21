@@ -120,7 +120,8 @@ cargo xtask [global flags] <command>
 | --- | --- | --- | --- |
 | `MEM` | `MEM=2048` | 覆盖本次启动的内存(MB)，优先于 `machine.toml` 的 `qemu.memory` | one-off memory override, wins over `qemu.memory` in `machine.toml` |
 | `ACCEL` | `ACCEL=kvm` / `tcg` | 强制 QEMU 加速器，否则自动探测 | force the accelerator, else autodetected |
-| `MPOS_TEST_TIMEOUT` | 秒 seconds | `test` 里虚拟机最长运行时间（默认 900） | per-VM timeout for `test` (default 900s) |
+| `MPOS_TEST_TIMEOUT` | 秒 seconds | `test` 里**整次扫描**的最长时间（默认 900）：各 lane 共用这一个预算，任一 lane 超时就整体失败 | the **whole sweep's** budget for `test` (default 900s): the lanes share it, and a lane that outlives it fails the run |
+| `MPOS_TEST_LANES` | 台 machines | `test` 同时启动几台测试机（默认：每个宿主核心一台，最多 6 台；`1` 就是串行扫描）。每台是一整台机器（`machine.toml` 的 vCPU 与内存上限），程序按**上一次扫描测出的耗时**从长到短分配（表在 `build/test-costs-x86_64.tsv`；没有表时按数量均分） | how many test machines `test` boots at once (default: one per host core, at most 6; `1` is the serial sweep). Each lane is a whole machine (`machine.toml`'s vCPU and memory ceiling), and the programs are dealt longest-first from **the previous sweep's measured costs** (the table is `build/test-costs-x86_64.tsv`; with no table they are dealt evenly by count) |
 | `MPOS_BUILD_DIR` | path | 默认构建目录 | default build directory |
 | `PROFILE` | name | 默认构建档 | default profile |
 
@@ -453,6 +454,6 @@ as `weston` has a marker nothing reads any more; each costs the one refresh, and
 | 烘焙的运行模式 | baked run mode | `build/console.mode` / `build/aarch64-console.mode`——缓存镜像里 `mpos.cmdline` 说的是哪个模式，好让 `run` 不必提权去读 | a cache of the mode `mpos.cmdline` already carries, so `run` need not take root to look |
 | initramfs | initramfs | `build/initramfs.tar`（`--arch aarch64` 是 `build/aarch64-initramfs.tar`） | `--arch aarch64` gets `build/aarch64-initramfs.tar` |
 | 固件变量副本 | firmware vars | `build/OVMF_VARS.4m.fd` / `build/AAVMF_VARS.fd` | per machine |
-| 测试串口日志 | test serial log | `build/test-serial.log`（x86_64 扫描）、`build/aarch64-serial.log`（aarch64 扫描与任何 headless 启动） | `build/test-serial.log` (x86_64 sweep), `build/aarch64-serial.log` (aarch64 sweep and any headless boot) |
+| 测试串口日志 | test serial log | x86_64 扫描：`build/test-serial.log` 是**各 lane 按序拼接**的整条线（跑完才写入，因此不能边跑边 tail），每台的原始日志在 `build/test-lane-<n>/serial.log`；aarch64 扫描与任何 headless 启动：`build/aarch64-serial.log` | the x86_64 sweep's `build/test-serial.log` is the whole wire, **lane by lane** (written once the run ends, so it cannot be tailed live); each machine's own log is `build/test-lane-<n>/serial.log` - the aarch64 sweep and any headless boot keep `build/aarch64-serial.log` |
 | 扫描启动盘 | sweep medium | `build/aarch64-sweep.img` + `build/aarch64-sweep.stamp`——`test --arch aarch64` 自己的盘（载荷铺在根分区上），与 `run` 装好的镜像分开，互相不覆盖 | `test --arch aarch64`'s own disk (its payload staged on the root partition), separate from the image `run` installs |
 | aarch64 内核与 loader | aarch64 kernel + loader | `target/aarch64-unknown-none/<profile>/mpos`、`target/aarch64-unknown-uefi/<profile>/mpos-boot.efi`（`build`/`all`/`run`/`test --arch aarch64`） | built by `build`/`all`/`run`/`test --arch aarch64` |
