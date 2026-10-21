@@ -1698,24 +1698,54 @@ pub(crate) fn free_entry(handle: usize) {
     detach(handle);
 }
 
-/// Poll the interface once, unconditionally, then wake every task registered
-/// as waiting on socket readiness. The background task calls this every tick;
+/// Poll every stack once, unconditionally, then wake every task registered as
+/// waiting on socket readiness. The background task calls this every tick;
 /// socket operations poll inline before they try, so a response that arrived
 /// in the last tick is seen without waiting for the task.
+///
+/// **Every** stack, not just the caller's. This task lives in the machine's
+/// network namespace, and [`with_stack`] resolves to the *caller's* namespace,
+/// so polling through it reached the machine's stack alone. A task inside a
+/// fresh namespace registers itself as a waiter of *that* stack
+/// ([`subscribe`] goes through `with_stack` too), and nothing else ever polled
+/// it: the namespace's own task is parked in the call it is waiting on, which
+/// is the definition of the wait. The handshake it waited for therefore only
+/// moved when its deadline expired and the scheduler re-evaluated the
+/// condition, which polls once more. `t-ns-net` measured exactly that - a
+/// loopback `connect` in a fresh namespace took 29.997s and then *succeeded*,
+/// the 30-second connect deadline being the only thing that had advanced it
+/// (`docs/notes/` §15.92).
+///
+/// The rule this restores is the one every parked wait here already states:
+/// a stack that can have a parked task must be advanced by a task that is not
+/// the parked one.
 ///
 /// The wake is deliberately unselective - every waiter, every poll. The
 /// alternative, tracking which socket changed and waking only its waiters,
 /// is state the stack would have to keep true through smoltcp's dispatch,
 /// while a spurious wake costs one re-check of a condition that is already
-/// in memory. The waiters are woken *after* the poll, outside the stack's
-/// lock, so a woken task never runs under one.
+/// in memory. The waiters are woken *after* the poll, outside the stacks'
+/// locks, so a woken task never runs under one.
 pub fn service() {
-    let waiters = with_stack(|stack| {
+    let mut pending: Vec<crate::sched::policy::TaskId> = Vec::new();
+    // The machine's stack first: it is the one with the wire, and the one
+    // whose waiters a device interrupt would have woken anyway.
+    if let Some(waiters) = with_machine_stack(|stack| {
         stack.poll_once();
         stack.waiters.clone()
-    })
-    .unwrap_or_default();
-    for id in waiters {
+    }) {
+        pending.extend(waiters);
+    }
+    // Then each namespace's, under the one lock that names them. A namespace
+    // with no wire has no interrupt to acknowledge and no frame to receive;
+    // its loopback still has to progress, which is the whole point.
+    critical_section::with(|cs| {
+        for (_, stack) in NAMESPACES.borrow(cs).borrow_mut().iter_mut() {
+            stack.poll_once();
+            pending.extend(stack.waiters.iter().copied());
+        }
+    });
+    for id in pending {
         crate::sched::wake(id);
     }
 }

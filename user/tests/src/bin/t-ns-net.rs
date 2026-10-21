@@ -82,6 +82,7 @@ use rustix::net::{
 use rustix::pipe::pipe;
 use rustix::thread::{UnshareFlags, unshare_unsafe};
 use std::net::Ipv4Addr;
+use std::time::Instant;
 
 /// The address a fresh namespace's loopback gets, and the one the machine's
 /// carries - `127.0.0.1`, from the std type because `rustix`'s own is the same
@@ -704,17 +705,24 @@ fn main() {
             let mut listen_ok = -1;
             let mut connect_ok = -1;
             let mut accept_ok = -1;
+            // How long the handshake took, as the eighth word: the other
+            // seven say it *completed*, and completion was true even when
+            // nothing was polling this namespace's stack and the wait only
+            // ended when the connect deadline expired (`docs/notes/` §15.92).
+            let mut handshake_ms = -1isize;
             if let Ok(listener) = &listener {
                 let here = SocketAddrV4::new(LOOPBACK, port);
                 if bind(listener, &here).is_ok() && listen(listener, 1).is_ok() {
                     listen_ok = 0;
                     if let Ok(client) = socket(AddressFamily::INET, SocketType::STREAM, None) {
+                        let started = Instant::now();
                         if connect(&client, &here).is_ok() {
                             connect_ok = 0;
                             if accept(listener).is_ok() {
                                 accept_ok = 0;
                             }
                         }
+                        handshake_ms = started.elapsed().as_millis() as isize;
                     }
                 }
             }
@@ -727,8 +735,8 @@ fn main() {
                 .map(|present| present as isize)
                 .unwrap_or(-1);
             let line = format!(
-                "{} {} {} {} {} {} {}\n",
-                lo_up, addr, eth_up, listen_ok, connect_ok, accept_ok, own_row
+                "{} {} {} {} {} {} {} {}\n",
+                lo_up, addr, eth_up, listen_ok, connect_ok, accept_ok, own_row, handshake_ms
             );
             let _ = write(&up_w, line.as_bytes());
 
@@ -864,8 +872,8 @@ fn main() {
                 .split_whitespace()
                 .filter_map(|f| f.parse().ok())
                 .collect();
-            r.check("the child reports seven words", fields.len() == 7);
-            if fields.len() == 7 {
+            r.check("the child reports eight words", fields.len() == 8);
+            if fields.len() == 8 {
                 r.check(
                     &format!(
                         "the child's own loopback answers `ip link set lo up` (got {})",
@@ -910,6 +918,20 @@ fn main() {
                         fields[6]
                     ),
                     fields[6] == 1,
+                );
+                // The handshake's latency, and the reason it is a claim: the
+                // seven words above were all true when the wait was 29.997s,
+                // because that is the connect deadline expiring and the
+                // condition being re-evaluated - success, at the speed of a
+                // timer. A loopback handshake is microseconds on Linux; a
+                // second is three orders of magnitude of margin and still
+                // fails the deadline-expiry path by thirty.
+                r.check(
+                    &format!(
+                        "and the handshake did not wait for the connect deadline ({} ms)",
+                        fields[7]
+                    ),
+                    fields[7] >= 0 && fields[7] < 1000,
                 );
             }
 
