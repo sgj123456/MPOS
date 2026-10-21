@@ -221,6 +221,11 @@ impl File {
         if let Some(path) = self.label() {
             return path;
         }
+        // An anonymous inode has a name but no path: `anon_inode:[pidfd]` is
+        // the inode's own spelling, and a tree search could only ever miss it.
+        if let Some(name) = self.inode.fd_name() {
+            return name;
+        }
         if let Some(path) = super::global().path_of(&self.inode) {
             return path;
         }
@@ -359,7 +364,14 @@ impl File {
         // room (a zero-byte message is a message: eudev's worker channel is
         // nothing but zero-byte messages), which is why the short-circuit
         // belongs to this door and not to the socket.
-        if buf.is_empty() {
+        //
+        // The anonymous-inode family is the exception, and it is measured
+        // rather than reasoned: Linux's pidfd has no read method at all, so
+        // `read(pidfd, buf, 0)` is `EINVAL` where the same call on a regular
+        // file is 0 (`.workbuddy/probe_zero.c`). Answering 0 here would tell a
+        // caller its zero-length read was fine on a descriptor that cannot
+        // read one byte.
+        if buf.is_empty() && self.inode.metadata().kind != NodeKind::Anon {
             return Ok(0);
         }
         let pos = self.pos.load(Ordering::Relaxed);

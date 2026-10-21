@@ -383,5 +383,9 @@ kernel has process groups standing in for sessions), and `kill(-1)` remains the
 caller's own group rather than "every process the caller may signal" — the
 interpretation the door already carried, now filtered by the same rule.
 
+**The door this item anticipated** — `pidfd_send_signal` — landed with the rest of
+the pidfd family as §6.8. It asks this same `may_signal`, and its group scope goes
+through `send_signal_group_info`, which applies the rule per member.
+
 ---
 

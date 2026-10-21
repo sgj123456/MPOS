@@ -296,9 +296,10 @@ the commit bodies), and each moved its pin in the same commit.
     `refactor` commit before this one), so the door now resolves `P_ALL`/`P_PID`/`P_PGID` into
     the same selector `wait4`'s named child uses — a group through its leader's number, the way
     `setpgid`/`getpgid` resolve one, with `0` the caller's own (a negative id is `EINVAL`, a
-    group with no child of ours `ECHILD`). `P_PIDFD` stays `EINVAL` and moves to §5.3 with its
-    prerequisite named: no pidfd family exists here to resolve a descriptor through, where Linux
-    answers `EBADF` for one that is not a pidfd. The options word is Linux's whole: the three
+    group with no child of ours `ECHILD`). `P_PIDFD` was `EINVAL` here and moved to §5.3 with its
+    prerequisite named: no pidfd family existed then to resolve a descriptor through, where Linux
+    answers `EBADF` for one that is not a pidfd. That prerequisite landed as item 92, which serves
+    the idtype and moves the claim to the host's `EBADF`/negative-`EINVAL` pair. The options word is Linux's whole: the three
     event classes are served rather than faked (`WSTOPPED` and `WCONTINUED` were a zero-filled
     0), `WNOWAIT` reports without collecting, the three Linux-only bits are accepted and ignored,
     and an undefined bit — or no class at all — is `EINVAL` with the record cleared first, which
@@ -4874,3 +4875,83 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     still means the caller's own group rather than every signalable process -
     the interpretation the door already carried, now filtered by the same
     rule.
+
+## item 92 — a pidfd names a process, not a number
+
+    A pid is a slot index here, and `Table::alloc_slot` hands a freed slot to the
+    next tenant, so a handle that stores a bare number names whatever is there
+    later. `pidfd_open` closes that hole by recording a generation beside the slot;
+    `pidfd_send_signal` and `waitid(P_PIDFD)` consume the descriptor. The three are
+    one family, and §2.6 landed the permission rule first because the signal door
+    would have been a second way onto it.
+
+    **Measured whole on a current host first** (Linux 7.2.11,
+    `.workbuddy/probe_pidfd*.c`, `probe_waitid_pidfd_zombie.c`, `probe_flags.c`,
+    `probe_selfsig2.c`). Open: flags are validated before the pid; `O_NONBLOCK` is
+    the only accepted flag and `O_CLOEXEC` alone is `EINVAL` even though the
+    descriptor is always close-on-exec; `pid <= 0` is `EINVAL`, an unknown number
+    `ESRCH`, a non-leader tid `ENOENT`, and pid 1 opens without privilege.
+    Descriptor: `F_GETFL` `O_RDWR`/`O_RDWR|O_NONBLOCK` (`0x2`/`0x802`), `fstat`
+    mode `0700` with no `S_IF*` bits, size 0, nlink 1, `/proc/self/fd/<n>` reading
+    `anon_inode:[pidfd]`, `read`/`pread`/`write` `EINVAL` even at length zero, and
+    `lseek` `ESPIPE`. Readiness has two facts: `POLLIN` when the last thread leaves
+    the group, `POLLHUP` only after the reap. `pidfd_send_signal`'s order is flags →
+    descriptor → record → signal range → existence → authority, and the scopes are
+    a **choice** - `0`, `1`, `2`, `4` each alone; `1|2`, `2|4`, `1|4` and anything
+    above 4 are `EINVAL` (flags 3, 5, 6, 7, 8 measured; `probe_flags.c`). A zombie
+    accepts a send under scopes 0/1/2 and is `ESRCH` under 4 even with a live
+    worker; after the reap every scope is `ESRCH`. A NULL record becomes `SI_USER`
+    naming the sender; a caller's `SI_QUEUE` record and its ids/value arrive
+    verbatim, as do self-targeted `SI_USER`/`SI_TKILL` records with spoofed ids.
+    `waitid(P_PIDFD)`: negative id `EINVAL` before any lookup, free/wrong-kind
+    descriptor `EBADF`, live non-child `ECHILD`, `O_NONBLOCK` (from open or
+    `F_SETFL`) `EAGAIN` on a live child with nothing, explicit `WNOHANG` still the
+    cleared zero, zombie reported normally. A dead child under
+    `WSTOPPED`/`WCONTINUED` alone is `ECHILD` - for `P_PID` too
+    (`probe_waitid_classes.c`).
+
+    **The landing.** `Table::generations` (`[1; MAX_TASKS]`) and
+    `next_generation` (`2`) give every slot a tenant number: the reserved init and
+    scheduler slots carry 1 without a new edit site, and `alloc_slot` bumps. A
+    freed slot keeps the dead tenant's number until reused, so a pidfd reads "gone"
+    either way. `vfs::pidfd::PidFd` stores the slot and generation;
+    `sched::pidfd_still_names`/`pidfd_group_alive`/`pidfd_task_alive`/
+    `pidfd_live_member`/`pidfd_identity` answer the later questions.
+    `NodeKind::Anon` is the measured `fstat` shape (`abi::mode_of` gives `0700` and
+    no format bits; `dt_type_of` `DT_UNKNOWN`), `File::read` skips its zero-length
+    short-circuit for the kind, `Inode::fd_name` supplies
+    `anon_inode:[pidfd]`, and `fsync` is `EINVAL`. `waitid` resolves `P_PIDFD`
+    through the caller's table, reads `O_NONBLOCK` off the file description, and
+    threads `WEXITED` through the scan/wait/poll/`has_matching_children` chain (the
+    pre-existing `P_PID` class bug closes with it). `send_signal_group_info` is the
+    one group door that carries a caller-authored record through the fan-out,
+    applying §2.6's `may_signal` per member.
+
+    **The first sweep caught the flags rule.** Three `pidfd_send_signal` flag
+    claims were red in the guest while the host run was green - the host measures
+    Linux, not this kernel. The handler tested `flags & !SCOPES`, which accepts
+    every combination of known bits; Linux's rule is the four values. The probe
+    above settled it, the handler matches `0 | 1 | 2 | 4` now, and the restored
+    mask is this item's counterfactual: guest red, host still green.
+
+    **Pins**: `t-pidfd` (new, default group, both machines) - 100 claims, the `ok:`
+    text identical on both (the first machine's console writes CRLF) - covering the
+    descriptor shape and refusals, the non-leader `ENOENT`, pid 1's `ECHILD`, the
+    live/zombie/reaped lifecycle, epoll, the records and all four scopes,
+    non-blocking waits, `F_SETFL`, and the verbatim self-target. `t-waitid`'s `P_PIDFD` claim moved to the measured
+    `EBADF`/negative-`EINVAL` pair; host tests live in `vfs::pidfd` and in
+    `abi::tests` (the type-less `st_mode`, beside `mode_of`).
+
+    **Gate**: x86_64 `pass=194 fail=0` (194 built, 6 lanes), aarch64 `193 staged,
+    pass=193 fail=0` (14 left out by `tests.toml`), `mpos-kunit 32 passed, 0
+    failed` on both; host unit suite 589, `xtask` 139; `cargo fmt --check` clean;
+    the depgraph ratchet holds (`vfs -> sched` and `syscall -> vfs` are both
+    recorded edges).
+
+    **Named**: `pidfd_getfd(2)` (438), `clone3`'s `CLONE_PIDFD` and
+    `process_madvise(2)` (440) are not served and fall to the `ENOSYS` catch-all.
+    The older anonymous descriptors still report `S_IFCHR`; `NodeKind::Anon` does
+    not silently change them. `st_blksize` stays 512 where Linux's pidfd answers
+    4096 (the global choice, not a pidfd one), and `st_dev`/`st_ino`/uid/gid are
+    machine-specific and not pinned. `fdinfo` for a pidfd (`Pid:`/`NSpid:`) was not
+    measured and is not promised.

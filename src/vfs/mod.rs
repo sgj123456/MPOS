@@ -49,6 +49,7 @@ pub mod ns;
 /// constructs it.
 pub mod p9;
 pub mod path;
+pub mod pidfd;
 pub mod pipe;
 /// `/proc`: the process tree, `/proc/net`'s socket table (built from
 /// `crate::net`, which both machines have) and `/proc/bus/pci`.
@@ -141,6 +142,18 @@ pub enum NodeKind {
     /// opener a [`pipe::PipeEnd`], so the reads and writes behind the name
     /// are a pipe's. `docs/uapi/` §5.2 carries the whole measured contract.
     Fifo,
+    /// An anonymous inode with no file-type bits at all: the family Linux's
+    /// `anon_inode` mount names, whose `st_mode` is permission bits alone
+    /// (`0700` for a pidfd, measured - `.workbuddy/probe_pidfd6.c`). It is not
+    /// a character device and must not be reported as one: `S_ISCHR` is a
+    /// question tools ask, and a descriptor that answers yes is then handed to
+    /// a terminal or a device probe it is not.
+    ///
+    /// Only the pidfd family uses it today. The older anonymous descriptors
+    /// (`eventfd`, `timerfd`, `signalfd`, `epoll`, `inotify`) still report
+    /// `CharDev`, which is a divergence of its own and not this kind's job to
+    /// change; a node that wants Linux's type-less shape asks for this one.
+    Anon,
 }
 
 /// What a descriptor can do right now, for `poll(2)`.
@@ -540,6 +553,29 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// `O_NONBLOCK` bit has to reach an inode that blocks on read. Same shape
     /// as [`Inode::as_pipe`], for the same reason.
     fn as_eventfd(&self) -> Option<&crate::vfs::eventfd::EventFd> {
+        None
+    }
+
+    /// The process descriptor this node is, if it is one.
+    ///
+    /// `pidfd_send_signal` and `waitid(P_PIDFD)` arrive holding nothing but a
+    /// descriptor number, and the task behind it is reachable only through the
+    /// inode - the same shape as [`Self::as_eventfd`] and [`Self::as_timerfd`].
+    /// A descriptor that is not a pidfd answers `None`, which the doors turn
+    /// into the `EBADF` Linux gives for a pidfd argument that is some other
+    /// kind of file.
+    fn as_pidfd(&self) -> Option<&crate::vfs::pidfd::PidFd> {
+        None
+    }
+
+    /// The name `/proc/<pid>/fd/<n>` reports this node by, when the node has a
+    /// spelling of its own that a path search could not find.
+    ///
+    /// Anonymous inodes have no name in any tree, so the only place Linux's
+    /// `anon_inode:[pidfd]` can come from is the inode itself. [`File::display_name`]
+    /// asks here after the recorded label and before searching the tree, so a
+    /// descriptor that really was opened by a path still reports that path.
+    fn fd_name(&self) -> Option<alloc::string::String> {
         None
     }
 

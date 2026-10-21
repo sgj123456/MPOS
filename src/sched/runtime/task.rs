@@ -1152,6 +1152,18 @@ pub(crate) struct Table {
     pub(crate) tasks: [Option<Task>; MAX_TASKS],
     pub(crate) sched: Scheduler,
     pub(crate) current: TaskId,
+    /// The number the slot's **current** tenant was given when it took the
+    /// slot, and the counter that hands the next one out.
+    ///
+    /// A `TaskId` is a slot index, and [`alloc_slot`](Table::alloc_slot) hands
+    /// the first free one to the next tenant - so a descriptor that stored a
+    /// bare `TaskId` would name whatever task took the slot after the one it
+    /// meant was reaped. The generation is what makes a pidfd
+    /// (`crate::vfs::pidfd`) a reference to a *task* rather than to a slot: it
+    /// is read when the descriptor is made and compared on every later use.
+    /// Zero means "never allocated", which is why the first tenant gets one.
+    pub(crate) generations: [u64; MAX_TASKS],
+    pub(crate) next_generation: u64,
 }
 impl Table {
     pub(crate) const fn new() -> Table {
@@ -1159,6 +1171,15 @@ impl Table {
             tasks: [const { None::<Task> }; MAX_TASKS],
             sched: Scheduler::new(),
             current: SCHED_ID,
+            // Slot 1 (init) and the top slot (the scheduler) are the two
+            // tenants that never come through `alloc_slot`: they are written
+            // into their reserved slots directly. Giving every slot generation
+            // 1 says "the first tenant", and starting the counter at 2 keeps
+            // the next allocated one from reusing that number. A stale pidfd
+            // therefore reads "gone" both for a reused slot (different number)
+            // and for the reserved ones (their tenant is the first forever).
+            generations: [1; MAX_TASKS],
+            next_generation: 2,
         }
     }
 
@@ -1620,9 +1641,16 @@ impl Table {
     /// Slot 1 is left free on purpose - it is init's pid - and the top slot is
     /// the scheduler's. Everything between them is first come, first served.
     pub(crate) fn alloc_slot(&mut self) -> usize {
-        (FIRST_ALLOC_SLOT..MAX_TASKS - 1)
+        let slot = (FIRST_ALLOC_SLOT..MAX_TASKS - 1)
             .find(|&slot| self.tasks[slot].is_none())
-            .unwrap_or_else(|| panic!("all {MAX_TASKS} task slots are in use"))
+            .unwrap_or_else(|| panic!("all {MAX_TASKS} task slots are in use"));
+        // The new tenant's identity. Bumping here rather than on release means
+        // a freed slot keeps the dead tenant's number until somebody takes it,
+        // so a pidfd that outlives the task reads "gone" either way - the slot
+        // is empty, or its number is not the one the descriptor recorded.
+        self.generations[slot] = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        slot
     }
 
     /// Allocate a slot, a stack and a bootstrap context for a kernel task. The

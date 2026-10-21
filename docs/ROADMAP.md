@@ -70,6 +70,10 @@ One-glance status of the whole roadmap.
 - [x] a group's death is its last thread's — a worker's `exit_group` is reaped as the leader, a
   leader's own exit is a zombie until its group ends, and the death carries the leader's byte
   (§15.86)
+- [x] a pidfd names a process, not a number — `pidfd_open` records the slot **and** its tenant
+  generation, so a reused pid reads "gone"; `pidfd_send_signal` keeps §2.6's permission rule and
+  its four scopes, `waitid(P_PIDFD)` resolves the descriptor and honours `O_NONBLOCK`/`EAGAIN`,
+  and poll/epoll see `POLLIN` at group death and `POLLHUP` only at the reap (§6.8, item 92)
 - [ ] [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET**, **TIME** and **USER** landed, each with its pin  
   (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`): the numbers a process  
   sees are the  
@@ -127,6 +131,8 @@ One-glance status of the whole roadmap.
 
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
+- [ ] the rest of the pidfd family — `pidfd_getfd(2)`, `clone3`'s `CLONE_PIDFD`,
+  `process_madvise(2)` — `ENOSYS`; the open/send/wait doors are served (§6.8, item 92)
 - [ ] `userfaultfd` · `tid/tgid_add_object` (rseq) — niche
 - [x] real-time signals `32..=64` — queued with per-copy `si_value`, bounded by the target user's `RLIMIT_SIGPENDING` (a full `sigqueue` is `EAGAIN`, `kill` drops and answers 0) (§2.3)
 - [x] POSIX timers 222–226 — routed, tick-scanned, musl's `SIGEV_THREAD_ID` shape works (§R.Remaining)

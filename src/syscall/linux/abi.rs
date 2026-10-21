@@ -374,6 +374,9 @@ pub(crate) fn mode_of(meta: &Metadata, stored: Option<u32>) -> u32 {
         NodeKind::Symlink => 0o120_000,
         NodeKind::Socket => 0o140_000,
         NodeKind::Fifo => 0o010_000,
+        // An anonymous inode has no file type: measured, a pidfd answers
+        // `st_mode` `0700`, not `S_IFCHR|0700` (`.workbuddy/probe_pidfd6.c`).
+        NodeKind::Anon => 0,
     };
     match stored {
         Some(stored) => format | (stored & 0o7777),
@@ -385,6 +388,8 @@ pub(crate) fn mode_of(meta: &Metadata, stored: Option<u32>) -> u32 {
             NodeKind::Symlink => 0o120_777,  // symbolic link rwxrwxrwx
             NodeKind::Socket => 0o140_755,   // socket srwxr-xr-x until chmod
             NodeKind::Fifo => 0o010_644,     // FIFO prw-r--r--
+            // The anonymous family's own mode, owner-only by construction.
+            NodeKind::Anon => 0o700,
         },
     }
 }
@@ -749,6 +754,10 @@ pub(crate) fn dt_type_of(kind: NodeKind) -> u8 {
         NodeKind::Symlink => 10, // DT_LNK
         NodeKind::Socket => 12,  // DT_SOCK
         NodeKind::Fifo => 1,     // DT_FIFO
+        // An anonymous inode is never a directory entry, so this byte is
+        // unreachable in practice; DT_UNKNOWN is the honest answer if a
+        // filesystem ever asks.
+        NodeKind::Anon => 0,
     }
 }
 
@@ -3060,6 +3069,10 @@ mod tests {
         assert_eq!(mode_of(&meta(NodeKind::CharDev, 1, 0), None), 0o020_666);
         assert_eq!(mode_of(&meta(NodeKind::BlockDev, 1, 0), None), 0o060_660);
         assert_eq!(mode_of(&meta(NodeKind::Symlink, 1, 0), None), 0o120_777);
+        // An anonymous inode has no format bits at all: a pidfd's `st_mode`
+        // is permission bits alone, `0700`, not `S_IFCHR|0700` (measured,
+        // `.workbuddy/probe_pidfd6.c`).
+        assert_eq!(mode_of(&meta(NodeKind::Anon, 1, 0), None), 0o700);
 
         // Stored permission bits replace the defaults, setuid included. In
         // the stat(2) spelling a setuid regular file is `104755`: the type
@@ -3345,6 +3358,10 @@ mod tests {
         assert_eq!(dt_type_of(NodeKind::CharDev), 2); // DT_CHR
         assert_eq!(dt_type_of(NodeKind::BlockDev), 6); // DT_BLK
         assert_eq!(dt_type_of(NodeKind::Symlink), 10); // DT_LNK
+        // An anonymous inode has no directory entry to describe; if a
+        // filesystem ever asks, `DT_UNKNOWN` is the honest byte rather than
+        // borrowing a type the node does not have.
+        assert_eq!(dt_type_of(NodeKind::Anon), 0); // DT_UNKNOWN
 
         // Header (19) + name + NUL, padded to 8: "foo" spans 24 bytes.
         assert_eq!(reclen_of(3), 24);

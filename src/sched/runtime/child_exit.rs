@@ -1922,6 +1922,7 @@ fn scan_child_event(
     kind: ChildKind,
     stops: bool,
     continues: bool,
+    exited: bool,
 ) -> Option<WaitEvent> {
     let children = || {
         t.tasks.iter().enumerate().filter_map(|(slot, task)| {
@@ -1948,6 +1949,15 @@ fn scan_child_event(
     // `wait` reads them - the same records, so a caller that asks about stops
     // cannot lose an exit code by asking. A record still owned by a tracer is
     // the tracer's alone to see.
+    //
+    // `exited` is the caller's `WEXITED`: a wait that asked only for stops or
+    // resumes must not be answered about a dead child, and Linux answers
+    // `ECHILD` for one rather than "nothing yet" (measured,
+    // `.workbuddy/probe_waitid_classes.c` and `probe_pidfd6.c`: `P_PID` and
+    // `P_PIDFD` both answer `ECHILD` for a zombie under `WSTOPPED` alone).
+    if !exited {
+        return None;
+    }
     critical_section::with(|cs| {
         RETIRED
             .borrow(cs)
@@ -2049,17 +2059,19 @@ pub fn wait_child_event(
     stops: bool,
     continues: bool,
     nowait: bool,
+    exited: bool,
 ) -> WaitPark<WaitEvent> {
     if matches!(
-        block_until_on_interruptible(
-            |t| scan_child_event(t, parent, sel, kind, stops, continues).is_some()
-        ),
+        block_until_on_interruptible(|t| scan_child_event(
+            t, parent, sel, kind, stops, continues, exited
+        )
+        .is_some()),
         WaitEnd::Interrupted
     ) {
         return WaitPark::Interrupted;
     }
     match with_table(|t| {
-        let event = scan_child_event(t, parent, sel, kind, stops, continues)?;
+        let event = scan_child_event(t, parent, sel, kind, stops, continues, exited)?;
         if nowait {
             Some(event)
         } else {
@@ -2085,9 +2097,10 @@ pub fn poll_child_event(
     stops: bool,
     continues: bool,
     nowait: bool,
+    exited: bool,
 ) -> Option<WaitEvent> {
     with_table(|t| {
-        let event = scan_child_event(t, parent, sel, kind, stops, continues)?;
+        let event = scan_child_event(t, parent, sel, kind, stops, continues, exited)?;
         if nowait {
             Some(event)
         } else {
@@ -2103,7 +2116,7 @@ pub fn wait_any_child_event(
     stops: bool,
     continues: bool,
 ) -> WaitPark<WaitEvent> {
-    wait_child_event(parent, WaitFor::Any, kind, stops, continues, false)
+    wait_child_event(parent, WaitFor::Any, kind, stops, continues, false, true)
 }
 
 /// The wildcard half of [`poll_child_event`].
@@ -2113,7 +2126,7 @@ pub fn poll_any_child_event(
     stops: bool,
     continues: bool,
 ) -> Option<WaitEvent> {
-    poll_child_event(parent, WaitFor::Any, kind, stops, continues, false)
+    poll_child_event(parent, WaitFor::Any, kind, stops, continues, false, true)
 }
 
 /// Whether `parent` has a child `sel` names at all - one still running, or one
@@ -2124,22 +2137,23 @@ pub fn poll_any_child_event(
 /// sleep would sleep with nothing coming. Linux asks the same thing of the same
 /// selector, which is why `P_PGID` naming a group with no child of ours is a
 /// measurement (`ECHILD`) rather than a design choice.
-pub fn has_matching_children(parent: TaskId, sel: WaitFor, kind: ChildKind) -> bool {
+pub fn has_matching_children(parent: TaskId, sel: WaitFor, kind: ChildKind, exited: bool) -> bool {
     with_table(|t| {
         child_alive_for(t, parent, sel, kind)
-            || critical_section::with(|cs| {
-                RETIRED.borrow(cs).borrow().iter().any(|retired| {
-                    let id = retired.id;
-                    let free = t.tasks[id.0].is_none();
-                    let ours = free
-                        || t.tasks[id.0]
-                            .as_ref()
-                            .is_some_and(|_| waitable(t, id, parent, kind));
-                    ours && id != parent
-                        && sel.names_retired(retired, kind)
-                        && retired.tracer.is_none_or(|tracer| tracer == parent)
-                })
-            })
+            || (exited
+                && critical_section::with(|cs| {
+                    RETIRED.borrow(cs).borrow().iter().any(|retired| {
+                        let id = retired.id;
+                        let free = t.tasks[id.0].is_none();
+                        let ours = free
+                            || t.tasks[id.0]
+                                .as_ref()
+                                .is_some_and(|_| waitable(t, id, parent, kind));
+                        ours && id != parent
+                            && sel.names_retired(retired, kind)
+                            && retired.tracer.is_none_or(|tracer| tracer == parent)
+                    })
+                }))
     })
 }
 

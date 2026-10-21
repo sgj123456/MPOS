@@ -1283,6 +1283,36 @@ pub fn send_signal_group_checked(pgid: TaskId, sig: u8) -> GroupSend {
     }
 }
 
+/// [`send_signal_group_checked`] carrying the caller's `siginfo_t` instead of
+/// minting an `SI_USER` record per member.
+///
+/// `pidfd_send_signal`'s `PIDFD_SIGNAL_PROCESS_GROUP` is the one door that sends
+/// a caller-authored record to a whole group, so the record must survive the
+/// fan-out unchanged - one delivery of the caller's `si_code`/`si_value` per
+/// member, not one record rewritten per member.
+pub fn send_signal_group_info(
+    pgid: TaskId,
+    sig: u8,
+    info: crate::sched::signal::SigInfo,
+) -> GroupSend {
+    let members = group_members(pgid);
+    if members.is_empty() {
+        return GroupSend::NoGroup;
+    }
+    let mut permitted = false;
+    for id in members {
+        if may_signal(id) {
+            permitted = true;
+            let _ = send_signal_info(id, sig, info);
+        }
+    }
+    if permitted {
+        GroupSend::Delivered
+    } else {
+        GroupSend::Refused
+    }
+}
+
 /// The live tasks of one thread group: the process that a pid names.
 pub fn process_members(tgid: TaskId) -> alloc::vec::Vec<TaskId> {
     with_table(|t| {
@@ -1296,6 +1326,102 @@ pub fn process_members(tgid: TaskId) -> alloc::vec::Vec<TaskId> {
             .map(|(slot, _)| TaskId(slot))
             .collect()
     })
+}
+
+/// Whether `id` is still the task that was handed `generation` - the one
+/// question every pidfd operation asks before it acts.
+///
+/// A pidfd (`crate::vfs::pidfd`) records a slot **and** the generation that
+/// slot's tenant had when the descriptor was made; a reused slot has a new
+/// generation, so the descriptor answers "gone" rather than signalling the
+/// next tenant. A zombie is still the task: its slot is occupied and its
+/// generation has not moved, which is why `pidfd_send_signal` answers 0 on one
+/// and `ESRCH` only after the reap.
+pub fn pidfd_still_names(id: TaskId, generation: u64) -> bool {
+    with_table(|t| {
+        t.tasks.get(id.0).is_some_and(Option::is_some) && t.generations[id.0] == generation
+    })
+}
+
+/// The number `pidfd_open` records for the process `pid` names - `(slot,
+/// generation)` - or `None` when no such *process* is there.
+///
+/// A pidfd names a thread group, not a thread: Linux answers `ENOENT` for a
+/// non-leader tid (`docs/notes/` §15.86), and a leader that has already exited
+/// is still the process's name while its group lives, which is why this asks
+/// the slot's existence rather than its runnability. The generation is read in
+/// the same borrow that finds the slot, so a reap handing the slot to the next
+/// tenant cannot slip between "it is there" and "which tenant was it".
+pub fn pidfd_identity(id: TaskId) -> Option<(TaskId, u64)> {
+    with_table(|t| {
+        let task = t.tasks.get(id.0).and_then(Option::as_ref)?;
+        (task.tgid == id).then(|| (id, t.generations[id.0]))
+    })
+}
+
+/// The generation the slot's current tenant carries, or `None` when nothing
+/// is in it. Used by the pidfd door and by its tests; the generation itself is
+/// meaningful only beside a task, because a free slot keeps the dead tenant's
+/// number until somebody takes it.
+pub fn pidfd_generation(id: TaskId) -> Option<u64> {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .map(|_| t.generations[id.0])
+    })
+}
+
+/// Whether the task itself - not merely its group - is still runnable.
+///
+/// `PIDFD_SIGNAL_THREAD` names one thread, and a thread that has exited is not
+/// there to take a signal even when its group lives on. Linux still answers 0
+/// for the send (the leader's zombie is a valid target that will never read
+/// it); what the flag decides is that the signal goes to *that* thread and not
+/// to a worker (measured, `.workbuddy/probe_pidfd7.c`: flags=1 on a group whose
+/// leader is a zombie answers 0, and the worker never sees it).
+pub fn pidfd_task_alive(id: TaskId, generation: u64) -> bool {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .is_some_and(|task| !task.exited && t.generations[id.0] == generation)
+    })
+}
+
+/// Whether a **process** pidfd still names a live thread group.
+///
+/// Linux's process pidfd becomes readable when the last thread leaves, not
+/// when the leader does: a leader that exited while a worker lives is not the
+/// process's death (`docs/notes/` §15.86). Measured on a current host
+/// (`.workbuddy/probe_pidfd5.c`): the fd's poll is 0 while the worker lives and
+/// `POLLIN` once it too is gone.
+pub fn pidfd_group_alive(id: TaskId, generation: u64) -> bool {
+    with_table(|t| {
+        t.tasks.get(id.0).is_some_and(Option::is_some)
+            && t.generations[id.0] == generation
+            && super::trace::group_has_live_task(t, id)
+    })
+}
+
+/// A live thread of the group a process pidfd names, the leader preferred.
+///
+/// This is where a signal aimed at the *process* lands: Linux queues it on the
+/// group's shared pending set, so one thread handles it; this kernel has a
+/// pending set per task, so it picks a live one. The leader is the choice when
+/// it is alive because it is the task `kill(pid)` already names; a zombie
+/// leader hands the signal to a worker, which is what Linux's shared set does
+/// without choosing (`docs/notes/` §15.86).
+pub fn pidfd_live_member(id: TaskId, generation: u64) -> Option<TaskId> {
+    if !pidfd_still_names(id, generation) {
+        return None;
+    }
+    let members = process_members(id);
+    if members.contains(&id) {
+        Some(id)
+    } else {
+        members.first().copied()
+    }
 }
 
 /// Linux's `kill_pid(vc->vt_pid, sig, 1)`: hand `sig` to one *process* - every

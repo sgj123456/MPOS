@@ -4385,7 +4385,7 @@ pub fn handle_fsync(args: [usize; ARG_COUNT]) -> isize {
         // anonymous family - a pty, an eventfd, a timerfd, an epoll, an
         // inotify, a signalfd - is a character device here, so this one arm
         // answers for all of it.
-        NodeKind::CharDev | NodeKind::Socket | NodeKind::Fifo => err::EINVAL,
+        NodeKind::CharDev | NodeKind::Socket | NodeKind::Fifo | NodeKind::Anon => err::EINVAL,
     }
 }
 

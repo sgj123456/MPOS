@@ -23,6 +23,7 @@ same failure in a different type.
 | `open` `O_NOFOLLOW` | `fs.rs` | Served: `ELOOP` on a symlink final component |
 | `mmap` flags | `proc.rs` | Served: `MAP_FIXED_NOREPLACE` → `EEXIST`, conflict `EINVAL`, `MAP_HUGETLB` `ENOMEM`; `MAP_STACK`/`NORESERVE`/`POPULATE` accepted as the no-ops Linux makes them |
 | `prctl` options | `abi.rs` + `src/cred.rs` | Served for the name pair, the seccomp pair, `PR_SET/GET_DUMPABLE`, `PR_SET/GET_KEEPCAPS` and `PR_CAPBSET_READ`/`DROP`; every other option is honestly `EINVAL` |
+| pidfd flags | `proc.rs` (`handle_pidfd_open`, `handle_pidfd_send_signal`) | Served: `pidfd_open` accepts `O_NONBLOCK` alone — `O_CLOEXEC` is `EINVAL` because `FD_CLOEXEC` is unconditional — and the send scope is one of `{0, 1, 2, 4}`, every combination being `EINVAL` (3, 5, 6, 7, 8 measured) |
 | inode attribute flags (`FS_IOC_SETFLAGS`' word) | `src/vfs/mod.rs` (`INODE_FL_VISIBLE` / `INODE_FL_MODIFIABLE`) | Served for the six this kernel keeps — `IMMUTABLE`, `APPEND`, `NODUMP`, `NOATIME`, `SYNC`, `DIRSYNC` — of which the first two are enforced and the ext4 driver's three (`EXTENT`, `INDEX`, `HUGE_FILE`) are readable and not writable; every other bit `EOPNOTSUPP`, and a refused word is *not stored* |
 | the flags a *filesystem* has no attribute word for | `src/vfs/mod.rs` (`Inode::flags` default) | Refused `ENOTTY` on both requests — Linux's answer for a filesystem with no `fileattr` half: procfs, sysfs, devfs, a pipe, a socket |
 

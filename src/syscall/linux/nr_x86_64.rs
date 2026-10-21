@@ -407,6 +407,10 @@ pub const CAPSET: u64 = 126;
 pub const RT_SIGPENDING: u64 = 127;
 /// `rt_sigqueueinfo(2)`: `kill` with a `siginfo_t` attached.
 pub const RT_SIGQUEUEINFO: u64 = 129;
+/// `pidfd_send_signal(2)`: signal the process a pidfd names.
+pub const PIDFD_SEND_SIGNAL: u64 = 424;
+/// `pidfd_open(2)`: a descriptor for a process, stable across pid reuse.
+pub const PIDFD_OPEN: u64 = 434;
 /// `rt_sigsuspend(2)`: swap the mask and wait for a signal outside it.
 pub const RT_SIGSUSPEND: u64 = 130;
 /// `pause(2)`: the original "wait for a signal" - a sleep that only a

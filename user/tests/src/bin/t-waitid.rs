@@ -305,13 +305,14 @@ fn main() {
         size_of::<libc::siginfo_t>() == 128,
     );
 
-    // The idtypes. `P_ALL`/`P_PID`/`P_PGID` are Linux's first three; the fourth,
-    // `P_PIDFD`, needs a pidfd family this kernel does not have, and an idtype
-    // outside the four is a request Linux refuses too. Measured on a current
-    // host: a caller with no children at all asking for its own group
-    // (`P_PGID`, id 0) is answered `ECHILD` (errno 10), and fd 9999 as a
-    // `P_PIDFD` is `EBADF` (errno 9) - which is the answer this kernel cannot
-    // give and names instead (`docs/uapi/` §5.3).
+    // The idtypes. All four of Linux's are served; `P_PIDFD`'s descriptor
+    // resolution, readiness and zero-record shapes are pinned at length in
+    // `t-pidfd`, so the claim here is the idtype's own doors: a descriptor
+    // number that names nothing is `EBADF` (errno 9), and a negative id is
+    // `EINVAL` (errno 22) before any lookup. Measured on a current host first
+    // (`.workbuddy/probe_pidfd6.c`). A caller with no children at all asking
+    // for its own group (`P_PGID`, id 0) is `ECHILD` (errno 10), and an idtype
+    // outside the four is a request Linux refuses too.
     let mut info = poisoned();
     let answered = waitid(libc::P_PGID, 0, &mut info, libc::WEXITED | libc::WNOHANG);
     r.check(
@@ -335,27 +336,24 @@ fn main() {
         "an idtype outside Linux's four is EINVAL",
         waitid(4, 0, &mut info, libc::WEXITED | libc::WNOHANG) == -(libc::EINVAL as isize),
     );
-    // `P_PIDFD` is the idtype this kernel cannot answer, and the reason is the
-    // one above: no pidfd family exists here, so no descriptor can name a task
-    // and the honest answer is "this idtype is not served". Linux *does* serve
-    // it, and answers a descriptor that is not a pidfd with `EBADF` - measured,
-    // fd 9999, errno 9 - so the host run names the answer this kernel owes a
-    // prerequisite for rather than pretending to share it (`docs/uapi/` §5.3).
+    // `P_PIDFD` resolves its descriptor through the caller's own table. The
+    // descriptor's readiness, its zero record and the reap's `ECHILD` are
+    // `t-pidfd`'s subject; here it is enough that the idtype is not a refusal.
     let mut info = poisoned();
-    let answered = waitid(
-        libc::P_PIDFD,
-        9999,
-        &mut info,
-        libc::WEXITED | libc::WNOHANG,
-    );
     r.check(
-        "P_PIDFD is EINVAL here (no pidfd family to resolve a descriptor through)",
-        answered
-            == if mpos_user_tests::host_run() {
-                -(libc::EBADF as isize)
-            } else {
-                -(libc::EINVAL as isize)
-            },
+        "P_PIDFD with a free descriptor is EBADF",
+        waitid(
+            libc::P_PIDFD,
+            9999,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG,
+        ) == -(libc::EBADF as isize),
+    );
+    let mut info = poisoned();
+    r.check(
+        "a negative P_PIDFD id is EINVAL",
+        waitid(libc::P_PIDFD, -1, &mut info, libc::WEXITED | libc::WNOHANG)
+            == -(libc::EINVAL as isize),
     );
 
     // A call that asks for no event class, and one carrying a bit Linux's own

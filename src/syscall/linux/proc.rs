@@ -2127,6 +2127,196 @@ fn kill_group(pgid: crate::sched::TaskId, sig: usize) -> isize {
     }
 }
 
+/// `pidfd_open(pid, flags)` — a descriptor that names a process, not a number.
+///
+/// The measured contract (`docs/notes/` §15.86, `.workbuddy/probe_pidfd*.c`):
+///
+/// * the only flag Linux accepts is `O_NONBLOCK`, and it is validated before
+///   the pid is looked at - `O_CLOEXEC` is `EINVAL`, because the descriptor is
+///   already close-on-exec without being asked;
+/// * `pid <= 0` is `EINVAL`, a number naming no task here is `ESRCH`, and a
+///   **non-leader tid** is `ENOENT` (a pidfd names a thread group);
+/// * the descriptor is always `FD_CLOEXEC`, whatever the flags word said;
+/// * its `F_GETFL` is `O_RDWR` (`0x2`), plus `O_NONBLOCK` when asked for.
+///
+/// A zombie is a process: the descriptor opens on it, which is what lets a
+/// parent that has not reaped yet be signalled through it.
+pub(super) fn handle_pidfd_open(args: [usize; ARG_COUNT]) -> isize {
+    let (pid, flags) = (args[0] as i32 as isize, args[1] as u32);
+    if flags & !crate::vfs::file::O_NONBLOCK != 0 {
+        return err::EINVAL;
+    }
+    if pid <= 0 {
+        return err::EINVAL;
+    }
+    let Some(id) = pid_task(pid) else {
+        return err::ESRCH;
+    };
+    // `None` is a task that exists but does not lead its group - Linux's
+    // `ENOENT` for "that is a thread, not a process".
+    let Some((id, generation)) = crate::sched::pidfd_identity(id) else {
+        return err::ENOENT;
+    };
+    let file = Arc::new(crate::vfs::File::new(crate::vfs::pidfd::PidFd::new(
+        id, generation,
+    )));
+    // `set_status` keeps only the `F_SETFL` half, which is exactly the one bit
+    // this door accepts; the access mode stays `O_RDWR` from `File::new`, the
+    // mode Linux's `F_GETFL` reports for this descriptor.
+    file.set_status(flags);
+    let fd = match crate::sched::current_fds().install(file) {
+        Ok(fd) => fd,
+        Err(e) => return err_of(e),
+    };
+    // Not a failure the caller can act on - and Linux sets it unconditionally.
+    let _ = crate::sched::current_fds().fd_flags_set(fd, crate::vfs::file::FD_CLOEXEC);
+    fd as isize
+}
+
+/// `pidfd_send_signal(pidfd, sig, info, flags)` — `kill` addressed by a
+/// descriptor, with the caller's `siginfo_t` carried through.
+///
+/// The refusal order is measured, and it is not the order the arguments are
+/// written in (`.workbuddy/probe_pidfd6.c`, Linux 7.2.11):
+///
+/// 1. the flags word (`0`, `PIDFD_SIGNAL_THREAD`, `PIDFD_SIGNAL_THREAD_GROUP`,
+///    `PIDFD_SIGNAL_PROCESS_GROUP` - `1`, `2`, `4` alone; `1|2` and everything
+///    above `4` is `EINVAL`);
+/// 2. the descriptor (`EBADF` for a number naming nothing or a file that is not
+///    a pidfd);
+/// 3. the record (`EFAULT` if it cannot be read), then `si_signo != sig`
+///    (`EINVAL`), then a code that is the kernel's to make (`si_code >= 0` or
+///    `SI_TKILL` is `EPERM` unless the target is the caller's own group);
+/// 4. a signal number above `_NSIG` (`EINVAL`);
+/// 5. whether the task is still there (`ESRCH`), and finally authority
+///    (`EPERM`).
+///
+/// The scopes differ only in where the signal lands: `0`/`2` are the process
+/// (one live thread, the leader preferred - this kernel has a pending set per
+/// task where Linux has one per group), `1` is the named thread alone, and `4`
+/// is the whole process group the target leads. A zombie is still a process to
+/// scopes `0`/`1`/`2` - Linux answers 0 and the signal is never read - while
+/// `4` needs a live leader, because a group is a thing only a live process can
+/// lead (measured: `ESRCH` for a zombie, even with a live worker).
+pub(super) fn handle_pidfd_send_signal(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    const SIGINFO_BYTES: usize = 128;
+    const THREAD: u32 = 1;
+    const THREAD_GROUP: u32 = 2;
+    const PROCESS_GROUP: u32 = 4;
+
+    let (fd, sig, uinfo, flags) = (args[0] as i32, args[1], args[2], args[3] as u32);
+    // The scopes are a **choice**, not a bitmask: `0`, `1`, `2` and `4` are
+    // each valid on their own, and every combination - `1|2`, `2|4`, `1|4` -
+    // is `EINVAL` even though each bit is one Linux defines (measured,
+    // `.workbuddy/probe_flags.c`, Linux 7.2.11: flags 3, 5, 6, 7 and 8 all
+    // answer `EINVAL`, while 0 and 1 and 2 are accepted and 4 reaches the
+    // group check). Testing the unknown-bit mask alone would accept 3, which
+    // is why the set is spelled out.
+    if !matches!(flags, 0 | THREAD | THREAD_GROUP | PROCESS_GROUP) {
+        return err::EINVAL;
+    }
+    let file = match crate::sched::current_fds().clone_at(fd) {
+        Ok(file) => file,
+        Err(_) => return err::EBADF,
+    };
+    // The inode is held for as long as the pidfd is borrowed from it; without
+    // the binding the `Arc` would be a temporary ending at the end of the
+    // `let` statement.
+    let inode = file.inode();
+    let Some(pidfd) = inode.as_pidfd() else {
+        return err::EBADF;
+    };
+    let (id, generation) = (pidfd.id(), pidfd.generation());
+
+    let info = if uinfo == 0 {
+        // No record: the plain `kill` shape, `SI_USER` naming the sender.
+        let sender = crate::sched::pid_number_of(crate::sched::current_tgid())
+            .map_or(crate::sched::current_tgid().0 as i32, |n| n as i32);
+        let uid = crate::sched::current_identity().ruid as i32;
+        crate::sched::signal::SigInfo::user(sig as u8, sender, uid)
+    } else {
+        if !buffer_ok(uinfo, SIGINFO_BYTES, false, from_user) {
+            return err::EFAULT;
+        }
+        let (signo, si_errno, si_code, pid, uid, value) = unsafe {
+            (
+                (uinfo as *const i32).read_unaligned(),
+                ((uinfo + 4) as *const i32).read_unaligned(),
+                ((uinfo + 8) as *const i32).read_unaligned(),
+                ((uinfo + 16) as *const i32).read_unaligned(),
+                ((uinfo + 20) as *const i32).read_unaligned(),
+                ((uinfo + 24) as *const u64).read_unaligned(),
+            )
+        };
+        if signo != sig as i32 {
+            return err::EINVAL;
+        }
+        let own_group = id == crate::sched::current_tgid();
+        // A record whose code is the kernel's own is a record only the kernel
+        // may make - unless the target is the caller's own group, where Linux
+        // lets it through verbatim (measured: self with `SI_USER` and spoofed
+        // `si_pid`/`si_uid` arrives unchanged, `.workbuddy/probe_selfsig2.c`).
+        if !own_group && (si_code >= 0 || si_code == crate::sched::signal::SI_TKILL) {
+            return err::EPERM;
+        }
+        crate::sched::signal::SigInfo::signed(sig as u8, si_errno, si_code, pid, uid, value)
+    };
+    // `sig == 0` is in range: it is the existence probe every signal door
+    // accepts. The upper bound is Linux's `valid_signal`, asked *after* the
+    // record's code so a forged kernel code outranks a bad signal number
+    // (measured: `SI_USER` + `999` is `EPERM`, `SI_QUEUE` + `999` is
+    // `EINVAL`).
+    if sig > crate::sched::signal::MAX_SIGNAL as usize {
+        return err::EINVAL;
+    }
+
+    if !crate::sched::pidfd_still_names(id, generation) {
+        return err::ESRCH;
+    }
+    if flags & PROCESS_GROUP != 0 {
+        // Only a live process leads a group, and only the group it leads is
+        // the one named here. A leader that has exited is `ESRCH` even while a
+        // worker keeps the group alive.
+        if !crate::sched::pidfd_task_alive(id, generation) {
+            return err::ESRCH;
+        }
+        let Some(pgid) = crate::sched::pgid_of(id) else {
+            return err::ESRCH;
+        };
+        if pgid != id {
+            return err::ESRCH;
+        }
+        return match crate::sched::send_signal_group_info(pgid, sig as u8, info) {
+            crate::sched::GroupSend::NoGroup => err::ESRCH,
+            crate::sched::GroupSend::Refused => err::EPERM,
+            crate::sched::GroupSend::Delivered => 0,
+        };
+    }
+    if !crate::sched::may_signal(id) {
+        return err::EPERM;
+    }
+    let target = if flags & THREAD != 0 {
+        // The named thread alone. An exited leader is a valid target that will
+        // never read the signal, which Linux answers 0 for.
+        if !crate::sched::pidfd_task_alive(id, generation) {
+            return 0;
+        }
+        id
+    } else {
+        match crate::sched::pidfd_live_member(id, generation) {
+            Some(member) => member,
+            // The process is a zombie: there is nobody to take it, and Linux
+            // still reports the send as having happened.
+            None => return 0,
+        }
+    };
+    match crate::sched::send_signal_info(target, sig as u8, info) {
+        crate::sched::Sent::NoTask => err::ESRCH,
+        crate::sched::Sent::QueueFull => err::EAGAIN,
+        crate::sched::Sent::Taken => 0,
+    }
+}
+
 /// `setpgid(pid, pgid)` — move a task into a process group. A `pgid` of zero
 /// means "the group led by `pid`", and both `pid` and `pgid` of zero are just
 /// the caller.
@@ -4211,12 +4401,13 @@ struct Reported {
 
 // `waitid`'s option word, and the two sets this kernel reads out of it.
 //
-// The four `P_*` idtypes are Linux's; `P_PIDFD` (3) is answered `EINVAL` and
-// named as a gap rather than guessed at, because this kernel has no pidfd
-// family to resolve a descriptor through (`docs/uapi/` §5.3).
+// The four `P_*` idtypes are Linux's, `P_PIDFD` included: the descriptor is
+// resolved through the caller's own table and the pidfd inode (see
+// `crate::vfs::pidfd`), which is Linux's `pidfd_get_pid`.
 const P_ALL: usize = 0;
 const P_PID: usize = 1;
 const P_PGID: usize = 2;
+const P_PIDFD: usize = 3;
 const WNOHANG: usize = 0x1;
 const WSTOPPED: usize = 0x2;
 const WEXITED: usize = 0x4;
@@ -4247,6 +4438,13 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
         return WaitIdAnswer::refused(err::EINVAL);
     }
     let me = crate::sched::current();
+    // `O_NONBLOCK` is a property of the *descriptor*, so only a pidfd can carry
+    // it into this door. Linux reads it here, not from the option word: a
+    // blocking pidfd wait on a live process is `EAGAIN`, and the same call with
+    // `WNOHANG` explicitly asked for is the zero record instead (measured,
+    // `.workbuddy/probe_pidfd5.c`: the `F_SETFL(O_NONBLOCK)` form answers the
+    // same `EAGAIN` as the `pidfd_open(..., O_NONBLOCK)` one).
+    let mut nonblock = false;
     let sel = match idtype {
         P_ALL => WaitFor::Any,
         P_PID => match pid_task(id) {
@@ -4272,14 +4470,47 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
             };
             WaitFor::Pgid(group)
         }
-        // `P_PIDFD` (3), and anything else: no pidfd family exists here, so no
-        // descriptor can name a task, and an idtype outside the four Linux
-        // defines is a request this kernel cannot read (`docs/uapi/` §5.3).
+        // A pidfd names the process through the caller's descriptor table.
+        // Linux's order is measured and visible here: the options and the
+        // idtype are read first (`EINVAL`), a negative id is `EINVAL` before
+        // any table lookup, and only then is the descriptor resolved - a
+        // number that names nothing, or a file that is not a pidfd, is
+        // `EBADF` (`.workbuddy/probe_pidfd6.c`; a bad *record pointer* still
+        // outranks that, because the record is written after this function
+        // returns and `handle_waitid` turns the failed write into `EFAULT`).
+        P_PIDFD => {
+            if id < 0 {
+                return WaitIdAnswer::refused(err::EINVAL);
+            }
+            let file = match crate::sched::current_fds().clone_at(id as i32) {
+                Ok(file) => file,
+                Err(_) => return WaitIdAnswer::refused(err::EBADF),
+            };
+            let inode = file.inode();
+            let Some(pidfd) = inode.as_pidfd() else {
+                return WaitIdAnswer::refused(err::EBADF);
+            };
+            // A descriptor whose task has been reaped (or whose slot now holds
+            // another tenant) names nobody, and asking its selector would find
+            // whatever took the slot. Linux answers `ECHILD` for it.
+            if !crate::sched::pidfd_still_names(pidfd.id(), pidfd.generation()) {
+                return WaitIdAnswer::refused(err::ECHILD);
+            }
+            nonblock = file.status() & crate::vfs::file::O_NONBLOCK != 0;
+            WaitFor::Pid(pidfd.id())
+        }
+        // An idtype outside the four Linux defines is a request this kernel
+        // cannot read.
         _ => return WaitIdAnswer::refused(err::EINVAL),
     };
 
     let stops = options & WSTOPPED != 0;
     let continues = options & WCONTINUED != 0;
+    // A wait is answered about a death only when `WEXITED` asked for one. A
+    // dead child under `WSTOPPED`/`WCONTINUED` alone is `ECHILD`, not "nothing
+    // yet" - both for a pid and for a pidfd (measured,
+    // `.workbuddy/probe_waitid_classes.c`).
+    let exited = options & WEXITED != 0;
     // The same narrowing `wait4` reads out of its word - one function, so the
     // two doors cannot disagree about which children a `__W*` bit admits.
     let kind = wait_child_kind(options);
@@ -4288,11 +4519,17 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
     // wait will find it, which is what a caller that wants to look before it
     // reaps asked for.
     let nowait = options & WNOWAIT != 0;
+    // A non-blocking descriptor polls for the event and answers `EAGAIN` when
+    // there is none - a different "nothing" from `WNOHANG`'s zero, which is why
+    // the two cannot share a flag. `WNOHANG` wins when both are present, which
+    // is Linux's measured answer (`probe_pidfd5.c` and the host run behind
+    // `t-pidfd`'s non-blocking claims).
+    let would_block = nonblock && !no_hang;
 
-    let collected = if no_hang {
-        crate::sched::poll_child_event(me, sel, kind, stops, continues, nowait)
-    } else if crate::sched::has_matching_children(me, sel, kind) {
-        match crate::sched::wait_child_event(me, sel, kind, stops, continues, nowait) {
+    let collected = if no_hang || would_block {
+        crate::sched::poll_child_event(me, sel, kind, stops, continues, nowait, exited)
+    } else if crate::sched::has_matching_children(me, sel, kind, exited) {
+        match crate::sched::wait_child_event(me, sel, kind, stops, continues, nowait, exited) {
             WaitPark::Event(event) => Some(event),
             WaitPark::Interrupted => return WaitIdAnswer::refused(err::EINTR),
             WaitPark::NoChild => None,
@@ -4306,8 +4543,12 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
         // `WNOHANG` on a child that has not done anything yet is the zero the
         // caller polls for, while a selector that matches no child at all is
         // `ECHILD` - the wait could never be answered. `wait4` draws the line
-        // in the same place.
-        if no_hang && crate::sched::has_matching_children(me, sel, kind) {
+        // in the same place. A non-blocking descriptor that *does* have such a
+        // child is the third answer, `EAGAIN`.
+        if would_block && crate::sched::has_matching_children(me, sel, kind, exited) {
+            return WaitIdAnswer::refused(err::EAGAIN);
+        }
+        if no_hang && crate::sched::has_matching_children(me, sel, kind, exited) {
             return WaitIdAnswer {
                 code: 0,
                 reported: None,
