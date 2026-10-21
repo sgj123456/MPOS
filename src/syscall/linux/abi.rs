@@ -594,12 +594,40 @@ pub(crate) fn fstype_magic(name: &str) -> u64 {
     }
 }
 
-/// Write the 120-byte Linux x86_64 `struct statfs`: `f_type` and one word
-/// per counter, with the two-`u32` `f_fsid` left zeroed. Every field is a
-/// word except `f_fsid`, and a zero `f_frsize` reads as "same as f_bsize".
+/// Encode a `dev_t` the way Linux's `f_fsid` carries one.
+///
+/// This is Linux's `new_encode_dev` from `include/linux/kdev_t.h`, spelled
+/// here rather than approximated: a `dev_t` is twelve bits of major inside the
+/// low word plus minor scattered across it, and the kernel packs the pair into
+/// 30 bits before widening it to 64. A filesystem with a UUID does not use it
+/// at all - modern Linux hashes the UUID into `f_fsid` instead - but a
+/// pseudo-filesystem does, which is the whole of what this kernel mounts, and
+/// measured on a current host (`.workbuddy/probe_fsid.c`, Linux 7.2.11):
+/// procfs's `f_fsid` is exactly `0x18`, its `st_dev`'s encoding, while ext4's,
+/// tmpfs's and sysfs's are UUID hashes no predicate could predict. That is why
+/// what gets pinned is the *structure* and not a value - see item 89/90.
+pub(crate) fn encode_fsid(dev: u64) -> u64 {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
+}
+
+/// Write the 120-byte Linux x86_64 `struct statfs`: `f_type`, one word per
+/// counter, and the eight bytes of `f_fsid` at offset 56 - two `u32`s whose
+/// low half comes first.
+///
+/// `fsid` is the filesystem's identity and not a number a caller asked for:
+/// Linux answers it from the superblock, non-zero for every filesystem alive
+/// and equal for every name one instance serves. Zeroing it - which is what
+/// this field did until §5.1's item 90 - leaves two different mounts looking
+/// like one to anything that compares them, which is the comparison
+/// `statfs(2)`'s own man page offers `f_fsid` for. Measured on a current host
+/// (`probe_fsid.c`): every row's `f_fsid` is non-zero, `/` and `/proc` differ,
+/// and `statfs(path)` and `fstatfs(fd)` agree on it.
 pub(crate) fn write_statfs(
     buf: usize,
     magic: u64,
+    fsid: u64,
     bsize: u64,
     blocks: u64,
     bfree: u64,
@@ -619,9 +647,10 @@ pub(crate) fn write_statfs(
         (at(32) as *mut u64).write_unaligned(bfree); // f_bavail
         (at(40) as *mut u64).write_unaligned(files); // f_files
         (at(48) as *mut u64).write_unaligned(ffree); // f_ffree
+        (at(56) as *mut u32).write_unaligned(fsid as u32); // f_fsid.val[0]
+        (at(60) as *mut u32).write_unaligned((fsid >> 32) as u32); // f_fsid.val[1]
         (at(64) as *mut u64).write_unaligned(255); // f_namelen
-        // f_fsid (56..64), f_frsize (72), f_flags (80) and the four spares
-        // stay 0.
+        // f_frsize (72), f_flags (80) and the four spares stay 0.
     }
     0
 }
@@ -3156,8 +3185,18 @@ mod tests {
         assert_eq!(fstype_magic("iso9660"), 0); // not spoken: absent
 
         let mut buf = [0u8; 120];
+        let fsid = 0x1234_5678_9ABC_DEF0;
         assert_eq!(
-            write_statfs(buf.as_mut_ptr() as usize, 0x0000EF53, 4096, 100, 60, 7, 5),
+            write_statfs(
+                buf.as_mut_ptr() as usize,
+                0x0000EF53,
+                fsid,
+                4096,
+                100,
+                60,
+                7,
+                5
+            ),
             0
         );
         let word = |at: usize| u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
@@ -3168,10 +3207,48 @@ mod tests {
         assert_eq!(word(32), 60); // f_bavail: no root-reserved pool, same as bfree
         assert_eq!(word(40), 7); // f_files
         assert_eq!(word(48), 5); // f_ffree
+        // Two `u32`s, low half first: the eight bytes read as the whole number
+        // only because both machines are little-endian, which is why each half
+        // is written rather than one `u64` store.
+        assert_eq!(
+            u32::from_le_bytes(buf[56..60].try_into().unwrap()),
+            0x9ABC_DEF0
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[60..64].try_into().unwrap()),
+            0x1234_5678
+        );
+        assert_eq!(word(56), fsid);
         assert_eq!(word(64), 255); // f_namelen
-        // f_fsid and f_frsize stay zero; a zero frsize reads as bsize.
-        assert_eq!(word(56), 0);
+        // f_frsize and the rest stay zero; a zero frsize reads as bsize.
         assert!(buf[72..].iter().all(|&b| b == 0));
+    }
+
+    /// `f_fsid`'s source is Linux's `new_encode_dev`, and the one row a host
+    /// lets this be read against rather than guessed: procfs has no UUID, so
+    /// Linux answers it from the superblock's device - measured
+    /// (`.workbuddy/probe_fsid.c`, Linux 7.2.11) as `f_fsid == 0x18` for a
+    /// procfs whose `st_dev` is `0x18`. Every other filesystem there answered
+    /// a UUID hash instead, which is why no value beyond this one is claimed.
+    #[test]
+    fn encode_fsid_is_linuxs_device_encoding() {
+        // A `dev_t` Linux built from `MKDEV(major, minor)`.
+        let makedev = |major: u32, minor: u32| {
+            (((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12)) as u64
+        };
+        // The host's own procfs, both halves of the measurement.
+        assert_eq!(encode_fsid(makedev(0, 24)), 0x18);
+        // A whole device one minor up: MKDEV(0, 25) is sysfs's own st_dev.
+        assert_eq!(encode_fsid(makedev(0, 25)), 0x19);
+        // Real device numbers, including the host's block device: for anything
+        // inside twelve bits of major and eight of minor the encoding is a
+        // widening, not a re-arrangement, which is why procfs's own row reads
+        // as the number it already was.
+        assert_eq!(encode_fsid(makedev(1, 0)), 0x0100);
+        assert_eq!(encode_fsid(makedev(259, 3)), 0x1_0303);
+        // Nothing at all stays nothing, which is what makes "zero" a claim: a
+        // filesystem with no device behind it cannot borrow another's identity.
+        assert_eq!(encode_fsid(0), 0);
     }
 
     /// `statx(2)`: Linux's `struct statx` offsets - the four 16-byte timestamps

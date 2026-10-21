@@ -209,3 +209,55 @@ body restored): x86_64 `pass=204 fail=1 (205 built)`, the one red program
 
 ---
 
+### 3.7 `f_fsid` is the filesystem's identity, and it is no longer zero — **DONE** (2026-10-21)
+
+`statfs(2)`'s `f_fsid` was the one field this kernel cleared: every mount
+answered zero. `f_type` names the *kind* of filesystem, so two ramfs mounts and
+two ext4 mounts look identical under it; `f_fsid` is the per-*instance* answer
+Linux's man page offers for exactly that comparison, and zeroing it made every
+filesystem look like the same filesystem to anything that compared them.
+
+**Measured whole on a current host first** (`.workbuddy/probe_fsid.c`, Linux
+7.2.11): `sizeof(struct statfs)` is 120 with `f_fsid` at offset 56, and every
+row is non-zero; `fstatfs(fd)` equals `statfs(path)` in every row. The values
+split two ways, and that split is the whole design constraint: `/proc` answers
+`0x18` — exactly its own `st_dev` put through Linux's `new_encode_dev` — while
+`/`, `/sys` and `/tmp` answer 64-bit values that are UUID hashes, different on
+every machine and every boot. **Nothing here can pin a value**; what can be
+pinned is the structure every row shares.
+
+**The landing** gives the field one source rather than a second identity:
+`abi::encode_fsid` spells `new_encode_dev` (`include/linux/kdev_t.h`, verified
+against a C program before being trusted — `.workbuddy/check_encode.c`), and
+both doors feed it the device number they *already* report as `st_dev` — the
+descriptor's recorded `File::dev` for `fstatfs`, `mount::dev_of_path` for
+`statfs`. So `f_fsid` and `st_dev` cannot disagree about which filesystem
+answered, and the two doors cannot disagree with each other.
+
+**Pinned** by `t-statfs` (26 -> 36 claims, `ok:` for `ok:` byte-identical on
+both machines, green on the host's own Linux first): three raw reads into a
+caller-owned 120-byte buffer (neither wrapper exposes the field —
+`rustix::fs::StatFs.f_fsid` is a private `Fsid`), the root's `f_fsid` non-zero,
+procfs's non-zero, two names one instance serves agreeing, two live mounts
+differing, and `fstatfs` on a descriptor agreeing with `statfs` on its path.
+The three raw *reads* are claims of their own, so the block cannot be skipped
+silently. Counterfactual (the field left cleared again, which is the pre-item
+body): the host unit test `write_statfs_reports_the_superblock_magic…`
+reddened first, stopping the gate before QEMU; with that assertion restored to
+its pre-item form so the guest arm could run, x86_64 `pass=204 fail=1 (205
+built)` and `t-statfs` had exactly three claims red — both "reports a non-zero
+`f_fsid`" and "two mounts that are both alive report different ones". The two
+*equality* claims stayed green there by construction: zero equals zero. They
+are not the discriminating pins and are not claimed to be — what they catch is
+a half-fix, one door given an identity and the other still cleared.
+
+Also fixed while here: the `EBADF` claim minted its descriptor number by
+opening and closing a file of its own instead of borrowing fd 99, which was
+open in the caller's table the first time this ran under a live shell, and made
+the claim fail on the host while passing in the guest.
+
+Full record: `docs/uapi/` §5.1 item 90.
+
+---
+
+

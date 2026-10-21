@@ -4729,7 +4729,90 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     clippy's warning set unchanged; the depgraph ratchet holds - the new call is
     `syscall -> vfs::mount`, an edge that already exists.
 
-    **Named**: nothing here measures `statvfs`/`fstatvfs` (1078/1079), whose
-    numbers this kernel does not answer at all, and no pin asks what `f_fsid`
-    should carry - Linux answers there with the tuple it mints per superblock,
-    and this kernel writes zeros.
+    **Named**: nothing here measures `statvfs`/`fstatvfs`, which are not
+    syscalls at all on x86_64 - glibc and musl build them over `statfs` in
+    userspace, so there is no number here to answer - and at the time of
+    writing no pin asked what `f_fsid` should carry: Linux answers there with
+    the tuple it mints per superblock, and this kernel wrote zeros. That second
+    gap is item 90, right below.
+
+## item 90 — `f_fsid` names the filesystem instance, and it is not zero any more
+
+    item 89 named this gap in its own closing paragraph: `fstatfs` and
+    `statfs` now agree about every field except the one that says *which*
+    filesystem answered. `f_type` is the kind - two ramfs mounts, or two ext4
+    mounts, share it - so a caller comparing two mounts through `statfs(2)`
+    had nothing to compare, and `f_fsid` is the field Linux's own man page
+    offers for exactly that. This kernel wrote zeros there.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_fsid.c`,
+    Linux 7.2.11): `sizeof(struct statfs)` is 120, `offsetof(f_fsid)` is 56,
+    `sizeof(f_fsid)` is 8, and every row is non-zero - `/` and `/etc/hostname`
+    answer `0x0bbbdac55153df56`, `/proc` and `/proc/self/status` answer `0x18`,
+    `/sys` `0xb986c123eab0af2c`, `/tmp` `0x2cfcbb6662e13bc9`, and in every row
+    `fstatfs(fd) == statfs(path)`. The split is the constraint: `/proc`'s value
+    is **exactly its own `st_dev`** (`0x18`, i.e. `MKDEV(0,24)`) run through
+    Linux's `new_encode_dev`, because procfs has no UUID; every filesystem with
+    one - ext4, tmpfs, sysfs - answers a 64-bit hash instead, different on
+    every machine and every boot. So this item can pin the *structure* and not
+    a value, and it says so rather than pinning a number that would be this
+    machine's alone.
+
+    **The landing** gives the field one source instead of inventing a second
+    identity beside `st_dev`. `abi::encode_fsid` spells `new_encode_dev`
+    (`include/linux/kdev_t.h`) - checked against a C program before it was
+    trusted (`.workbuddy/check_encode.c`: `MKDEV(0,24)` -> `0x18`,
+    `MKDEV(0,25)` -> `0x19`, `MKDEV(1,0)` -> `0x100`, `MKDEV(259,3)` ->
+    `0x10303`) - and both doors feed it the device number they already report
+    as `st_dev`: the descriptor's recorded `File::dev` for `fstatfs`,
+    `mount::dev_of_path` for `statfs`, both going through the same reverse walk
+    item 89 built. `write_statfs` writes the eight bytes as **two `u32`s, low
+    half first**, rather than one `u64` store, because the layout is a
+    `__kernel_fsid_t` and not a word - and a single store would have been right
+    on these two machines and wrong on a big-endian one.
+
+    **Pins**: `t-statfs`, 26 -> 36 claims. `f_fsid` has no spelling through
+    either wrapper - `rustix::fs::StatFs`'s `Fsid::val` is private, and
+    `libc`'s own `fsid_t` is not one shape on every target - so the new claims
+    read a caller-owned 120-byte buffer by offset through `syscall(SYS_statfs)`
+    and `syscall(SYS_fstatfs)`, which is the honest way to ask what bytes the
+    kernel wrote. Claimed: the root's `f_fsid` is non-zero, procfs's is
+    non-zero, two names one instance serves agree, two mounts alive at once
+    differ, and `fstatfs` on a descriptor agrees with `statfs` on its path. The
+    three raw *reads* are claims of their own, so the block cannot skip
+    silently and print green having measured nothing. **Green on a current host
+    first (36 of 36, `MPOS_ON_HOST=1`)** and `ok:` for `ok:` byte-identical on
+    both machines. Beside them, two host unit tests: `write_statfs` now asserts
+    the two halves separately as well as the word they form, and
+    `encode_fsid_is_linuxs_device_encoding` pins the encoding against the four
+    `MKDEV` rows the C program produced.
+
+    **Counterfactual** - the field left cleared again, which is this item's own
+    pre-item body: the host unit test
+    `write_statfs_reports_the_superblock_magic_per_filesystem` reddened first
+    (`585 passed; 1 failed`), stopping the gate before QEMU ever booted. With
+    that one assertion restored to its pre-item form so the guest arm could
+    run, x86_64 answered `pass=204 fail=1 (205 built)`, `mpos-kunit 32 passed,
+    0 failed`, exit 33, and the one red program was **`t-statfs`** with exactly
+    three claims red: "the root filesystem reports a non-zero f_fsid", "procfs
+    reports a non-zero f_fsid" and "and two mounts that are both alive report
+    different ones". The two *equality* claims stayed green there - zero equals
+    zero - and are not claimed as the discriminating pins: what they catch is a
+    half-fix, one door handed an identity and the other still cleared.
+
+    **Gate**: x86_64 `pass=205 fail=0 (205 built)`, aarch64 `pass=204 fail=0`
+    (204 staged, 1 left out - the machine's own gap), `mpos-kunit 32 passed, 0
+    failed` on both; both machines' `t-statfs` `ok:` lines byte-identical (36 of
+    36). Host unit suite 586 (was 585), `xtask` 123; `cargo fmt --check` clean;
+    clippy's warning set unchanged on both targets; the depgraph ratchet holds
+    - the new call is `syscall -> abi`, and `syscall -> vfs::mount` already
+    existed.
+
+    **Named**: the *value* is this kernel's device number encoded, not a UUID
+    hash, so a caller may not assume `f_fsid` here equals Linux's on the same
+    filesystem - the field is promised as an identity, not as a particular
+    number. Nothing pins `f_frsize` (still zero, which reads as `f_bsize`) or
+    `f_flags`. And the `EBADF` claim in this program no longer borrows a
+    hardcoded fd 99 - it mints its own by opening and closing a file, because
+    99 was open in the caller's table the first time the host run happened and
+    the claim failed there while passing in the guest.

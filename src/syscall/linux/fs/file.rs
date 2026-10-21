@@ -778,20 +778,26 @@ pub fn fstatfs(args: [usize; ARG_COUNT]) -> isize {
     // inode-identity walks stay for a descriptor no path made (a pipe end, a
     // socket, an anonymous inode) - those really are on the root filesystem,
     // which is what the fallback names.
-    let (fstype, stats) = match file.dev() {
+    // The *device number* answers three fields at once, and it is the same
+    // number `fstat`'s `st_dev` reports - `f_fsid` is its Linux encoding
+    // (`abi::encode_fsid`), not a second identity this door invents. A
+    // descriptor no path made keeps the inode walk, which names the root.
+    let (fsid, fstype, stats) = match file.dev() {
         Some(dev) => (
+            abi::encode_fsid(dev),
             crate::vfs::mount::fstype_of_dev(dev),
             crate::vfs::mount::fs_stats_of_dev(dev),
         ),
         None => {
             let inode = file.inode().clone();
             (
+                abi::encode_fsid(crate::vfs::mount::dev_of_inode(&inode)),
                 crate::vfs::mount::fstype_of_inode(&inode),
                 crate::vfs::mount::fs_stats_of_inode(&inode),
             )
         }
     };
-    write_statfs(args[1], &fstype, stats)
+    write_statfs(args[1], &fstype, fsid, stats)
 }
 
 /// `statfs(path, buf)` - the path spelling of `fstatfs`, and the one that
@@ -807,7 +813,11 @@ pub fn statfs(args: [usize; ARG_COUNT], cwd: &Arc<dyn Inode>) -> isize {
             let abs = absolute(&path);
             let stats = crate::vfs::mount::fs_stats_of_path(&abs);
             let (_id, fstype) = crate::vfs::mount::fs_of_path(&abs);
-            write_statfs(args[1], &fstype, stats)
+            // The same number `stat` on this path gives as `st_dev`, encoded
+            // the same way - so the two doors cannot disagree about which
+            // filesystem answered.
+            let fsid = abi::encode_fsid(crate::vfs::mount::dev_of_path(&abs));
+            write_statfs(args[1], &fstype, fsid, stats)
         }
         Err(e) => err_of(e),
     }
@@ -3500,7 +3510,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
 /// blocks - is what `df` filters out, exactly as Linux's own does. The byte
 /// writing itself is `abi::write_statfs`, tested on the host; the PMM fallback
 /// below is the only part that has to stay machine-side.
-fn write_statfs(buf: usize, name: &str, stats: Option<crate::vfs::FsStats>) -> isize {
+fn write_statfs(buf: usize, name: &str, fsid: u64, stats: Option<crate::vfs::FsStats>) -> isize {
     let magic = abi::fstype_magic(name);
     // Memory-backed trees are as big as the frame allocator; a filesystem
     // with its own accounting answers with those numbers instead.
@@ -3523,7 +3533,7 @@ fn write_statfs(buf: usize, name: &str, stats: Option<crate::vfs::FsStats>) -> i
             (4096, 0, 0, 0, 0)
         }
     };
-    abi::write_statfs(buf, magic, bsize, blocks, bfree, files, ffree)
+    abi::write_statfs(buf, magic, fsid, bsize, blocks, bfree, files, ffree)
 }
 
 // ---------------------------------------------------------------------------

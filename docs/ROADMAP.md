@@ -26,7 +26,8 @@ One-glance status of the whole roadmap.
 - [x] P1 Syscall completion — epoll · timerfd · 67/68 other calls (§1)
 - [ ] [~] P2 Signal delivery — frame · mask · siginfo · interruptible waits (§2)
 - [ ] [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3) — and  
-  `fstatfs` names the filesystem the descriptor was *opened on*, the two doors agreeing (§3.6, item 89)
+  `fstatfs` names the filesystem the descriptor was *opened on*, the two doors agreeing (§3.6, item 89),
+  each instance now carrying a non-zero `f_fsid` instead of a zero every mount shared (§3.7, item 90)
 
 **Networking (Phase 4)**
 
@@ -670,6 +671,27 @@ first draft's `/tmp`-shaped claims were **dropped rather than kept**: the first 
 ramfs at `/tmp` over a ramfs root, so they were green with the fix reverted too - a claim answered
 alike either way is not evidence, and what replaced them compares the mountpoint's descriptor with
 the one for a file inside it, which catches the old answer on either machine.
+
+**Every mount now carries an `f_fsid` of its own instead of a zero they all shared** (`docs/uapi/`
+§5.1 item 90, landed 2026-10-21): `f_type` names the *kind* of filesystem - two ramfs mounts, or
+two ext4 mounts, share it - so a caller comparing two mounts through `statfs(2)` had nothing to
+compare, and `f_fsid` is the field Linux's own man page offers for exactly that. This kernel wrote
+zeros. Measured whole on a current host first (`.workbuddy/probe_fsid.c`, Linux 7.2.11):
+`sizeof(struct statfs)` 120, `f_fsid` at 56, every row non-zero, `fstatfs(fd) == statfs(path)`
+throughout - and the values split two ways, which is the whole constraint: `/proc` answers `0x18`,
+**exactly its own `st_dev`** through Linux's `new_encode_dev`, while `/`, `/sys` and `/tmp` answer
+UUID hashes that differ per machine and per boot. So the item pins the structure (non-zero, shared
+by every name one instance serves, different between two live mounts) and says plainly that it does
+not pin a value. The landing gives the field one source rather than a second identity beside
+`st_dev`: `abi::encode_fsid` spells `new_encode_dev` (checked against a C program first), and both
+doors feed it the device number they already report - `File::dev` for `fstatfs`, `dev_of_path` for
+`statfs` - so the field and `st_dev` cannot disagree about which filesystem answered. Pin:
+`t-statfs`, 26 -> 36 claims, green on the host first and byte-identical on both machines; the new
+ones read a caller-owned 120-byte buffer by offset because neither wrapper exposes the field.
+Counterfactual (the field cleared again) reddened the `write_statfs` host unit test first, then
+`pass=204 fail=1` with exactly the three non-zero/different claims red - the two *equality* claims
+stay green against zeros by construction, and are kept for the half-fix they do catch, not claimed
+as the discriminating ones.
 
 **A socket's buffer size is Linux's number, and a datagram queue is the size it names**  
 (`docs/uapi/` §5.1 item 58, landed 2026-10-18): the pair the status board carried as  
