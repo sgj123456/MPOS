@@ -11,6 +11,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "std", "layout-cache"] }
 
 [lints]
 workspace = true

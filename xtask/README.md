@@ -122,8 +122,48 @@ cargo xtask [global flags] <command>
 | `ACCEL` | `ACCEL=kvm` / `tcg` | 强制 QEMU 加速器，否则自动探测 | force the accelerator, else autodetected |
 | `MPOS_TEST_TIMEOUT` | 秒 seconds | `test` 里**整次扫描**的最长时间（默认 900）：各 lane 共用这一个预算，任一 lane 超时就整体失败 | the **whole sweep's** budget for `test` (default 900s): the lanes share it, and a lane that outlives it fails the run |
 | `MPOS_TEST_LANES` | 台 machines | `test` 同时启动几台测试机（默认：每个宿主核心一台，最多 6 台；`1` 就是串行扫描）。每台是一整台机器（`machine.toml` 的 vCPU 与内存上限），程序按**上一次扫描测出的耗时**从长到短分配（表在 `build/test-costs-x86_64.tsv`；没有表时按数量均分） | how many test machines `test` boots at once (default: one per host core, at most 6; `1` is the serial sweep). Each lane is a whole machine (`machine.toml`'s vCPU and memory ceiling), and the programs are dealt longest-first from **the previous sweep's measured costs** (the table is `build/test-costs-x86_64.tsv`; with no table they are dealt evenly by count) |
+| `MPOS_TEST_TUI` | `0` | 关掉 `test` 的实时面板（默认只在 stdout 是终端时画；重定向、管道、CI 自动是纯文本） | turn off `test`'s live panel (`0`); the panel is only drawn when stdout is a terminal, so a redirect, a pipe or CI is plain text anyway |
 | `MPOS_BUILD_DIR` | path | 默认构建目录 | default build directory |
 | `PROFILE` | name | 默认构建档 | default profile |
+
+### `test` 的输出 | what `test` prints
+
+扫描运行时若 stdout 是终端，会画一个实时面板：每条 lane 一行（进度条、`done/total`、
+正在跑的程序、这台机器自己的耗时），上面一行是整次扫描的进度与时钟。面板结束后
+（回到原来的屏幕）打印最终报告：
+
+```
+── self-test ────────────────────────────────────────────────
+  stage 1  host unit tests   1068 tests, 0 failed        6.28 s
+  stage 2  boot + sweep       192 programs over 6 lane(s) 5.99 s
+  lane  0    1 program(s)    5.99 s  ok    heaviest t-udpblock 3.21 s
+  ...
+  verdict  pass=192 fail=0
+  kunit    mpos-kunit 32 passed, 0 failed
+  slowest  t-udpblock 3.21 s · t-waitid 1.21 s · ...
+  total    6.43 s   (previous green run 6.93 s, -7.2%)
+```
+
+- 每条 lane 的 `heaviest` 来自同一张实测成本表，下一次分配也用它，所以两处的结论不会互相矛盾。
+- `total` 与**上一次绿色运行**比较：每个机器一份 `build/test-gate-history-<machine>.txt`
+  （每行一次毫秒数；红运行不记录，因为它的时长只是“早停”的时长）。
+- 报告在失败时也打印（失败正是有人读它的那次）；面板不会写进任何日志：
+  重定向、管道、CI，或 `MPOS_TEST_TUI=0`，输出的仍是原来那些逐行文本。
+- 面板下 `ctrl-c` 仍然中断扫描（退出码 130）：raw 模式吃掉了终端的信号键，所以有一个
+  线程专门读这个键并先恢复终端。
+
+While the lanes run, a terminal on stdout gets a live panel — one line per lane with a bar,
+`done/total`, the program it is inside and that machine's own time, under the sweep's
+progress and clock — and the command ends with the report above (stage times, every lane,
+the verdict, the ten slowest programs, and the delta against the last green run). Each
+lane's `heaviest` comes from the same measured cost table the next deal uses, so the two
+readings cannot disagree. `total` is compared with the **last green run** of that machine,
+kept in `build/test-gate-history-<machine>.txt` (one millisecond count per line; a red run
+is not recorded, since its duration is the duration of a run that stopped early). The report
+also prints on a failure, and the panel never writes into a log: a redirect, a pipe, CI or
+`MPOS_TEST_TUI=0` gets the plain lines this command always printed. `ctrl-c` still stops the
+sweep under the panel (exit 130). The panel and this summary are the lane arm's: the aarch64
+disk sweep is one serial machine and ends with its own report.
 
 ---
 

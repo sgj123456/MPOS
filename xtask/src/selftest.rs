@@ -19,20 +19,39 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
 use crate::arch::Arch;
 use crate::qemu;
 use crate::sweep;
+use crate::tui;
 use crate::utils;
+
+/// What one sweep of the guest arm produced.
+///
+/// The first three fields are what the detailed report reads; the last two are
+/// what the gate's summary and the *next* run are built from - each lane's own
+/// wall time (a count of programs does not say what a lane carried) and the
+/// per-program costs (`deal_lanes`).
+struct Guest {
+    status: Option<i32>,
+    log: String,
+    summary: Option<String>,
+    lanes: Vec<tui::LaneRow>,
+    costs: BTreeMap<String, u64>,
+}
 
 /// How long the guest may run before the harness gives up on it. TCG is slow;
 /// KVM is not. `MPOS_TEST_TIMEOUT` overrides, in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
 pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -> Result<()> {
+    // The gate's own clock, from the first byte of output: the report at the end
+    // quotes one number for the whole command, and it is the number a person
+    // times with a stopwatch.
+    let gate_started = Instant::now();
     check_target_gates()?;
     check_boot_openings()?;
 
@@ -45,6 +64,7 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
     // cargo's progress lines in half, and this log is read by a person looking
     // for the one line that failed.
     println!("Unit tests: the kernel and its leaf crates (host) - alongside the sweep below");
+    let stage1_started = Instant::now();
     let host = std::thread::spawn(run_unit_tests);
 
     // The x86_64 sweep: its own initramfs on the QEMU wiring in `machine.toml`.
@@ -115,26 +135,130 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
     // above asks of the same list, so the boot and its payload cannot disagree.
     let tar = build_test_initramfs(build_dir, &plan.staged)?;
     let diskstat = diskstat_for_staged(plan.staged.iter().map(|test| test.name.as_str()));
-    let guest = boot_tests(build_dir, profile, &tar, diskstat, &plan.staged).and_then(
-        |(status, log, summary)| report(&plan.staged, plan.built, &log, status, diskstat, summary),
-    );
+    let guest = boot_tests(build_dir, profile, &tar, diskstat, &plan.staged).and_then(|guest| {
+        report(
+            &plan.staged,
+            plan.built,
+            &guest.log,
+            guest.status,
+            diskstat,
+            guest.summary.clone(),
+        )
+        .map(|()| guest)
+    });
 
     // The host stage's verdict is asked even when the guest's failed: both ran,
     // and a failure in one must not hide the other's answer. Its text lands
-    // above the guest's report rather than after it, so the sweep's own long
-    // log stays last, where a reader looks for the tail.
+    // above the gate's own report, so the sweep's long log stays where a reader
+    // looks for a tail and the summary stays last.
+    let stage1_millis = stage1_started.elapsed().as_millis() as u64;
     let host = match host.join() {
         Ok(Ok(text)) => {
             print!("{text}");
-            Ok(())
+            Ok(text)
         }
         Ok(Err(err)) => Err(err),
         Err(_) => Err(anyhow::anyhow!(
             "the host unit-test stage panicked; the sweep's own verdict is above"
         )),
     };
+
+    // The gate's own report, and the last thing this command prints: what each
+    // stage cost, what each lane carried, the verdict, and how this total
+    // compares with the last green run (`tui::report`). It prints whether or not
+    // the run passed - a failure is the run a person reads it on - and only a
+    // green total enters the history the next run compares with, because a red
+    // run's duration is the duration of a run that stopped early.
+    let verdict = match &guest {
+        Ok(guest) => {
+            let kunit = sweep::verdict(&guest.log).kunit;
+            let ok = guest.status == Some(33)
+                && guest.summary.is_some()
+                && kunit.is_some_and(|kunit| kunit.failed == 0);
+            (
+                ok,
+                guest
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| "no summary line".to_string()),
+                kunit.map(|kunit| (kunit.passed, kunit.failed)),
+            )
+        }
+        Err(_) => (
+            false,
+            "the sweep did not get to a verdict".to_string(),
+            None,
+        ),
+    };
+    let (guest_ok, guest_summary, kunit) = verdict;
+    let lanes: &[tui::LaneRow] = guest.as_ref().map(|guest| &guest.lanes[..]).unwrap_or(&[]);
+    // The report names the ten programs the run's time went on: the head of the
+    // same measured table the next deal is built from, so a lane's `heaviest`
+    // and this list cannot disagree about a program's cost.
+    let slowest = guest
+        .as_ref()
+        .map(|guest| tui::slowest_list(&guest.costs, 10))
+        .unwrap_or_default();
+    let ok = guest_ok && host.is_ok();
+    let total_millis = gate_started.elapsed().as_millis() as u64;
+    let summary = tui::report(&tui::Summary {
+        host: host
+            .as_ref()
+            .ok()
+            .map(|text| host_totals(text))
+            .map(|(passed, failed)| tui::HostStage {
+                passed,
+                failed,
+                millis: stage1_millis,
+            }),
+        lanes,
+        verdict: guest_summary,
+        kunit,
+        slowest: &slowest,
+        total_millis,
+        previous_millis: tui::previous_total(build_dir, Arch::X86_64.name()),
+        ok,
+    });
+    print!("\n{summary}");
+    if ok {
+        tui::record_total(build_dir, Arch::X86_64.name(), total_millis)?;
+    }
+
     host?;
-    guest
+    guest.map(|_| ())
+}
+
+/// The host stage's own totals, summed out of cargo's `test result:` lines - one
+/// per crate, and the line a reader scrolls past. The report quotes the sum
+/// because the interesting number is "how many host tests ran", not which crate
+/// they were in; a crate with no tests contributes a zero like any other.
+fn host_totals(text: &str) -> (usize, usize) {
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("test result: ") else {
+            continue;
+        };
+        let rest = rest
+            .trim_start_matches("ok.")
+            .trim_start_matches("FAILED.")
+            .trim();
+        for part in rest.split(';') {
+            let mut words = part.split_whitespace();
+            let (Some(count), Some(kind)) = (words.next(), words.next()) else {
+                continue;
+            };
+            let Ok(count) = count.parse::<usize>() else {
+                continue;
+            };
+            match kind {
+                "passed" => passed += count,
+                "failed" => failed += count,
+                _ => {}
+            }
+        }
+    }
+    (passed, failed)
 }
 
 /// The structural check that belongs ahead of the compiler: a `#[cfg(test)]`
@@ -830,6 +954,8 @@ struct Lane {
     log: PathBuf,
     status: Option<i32>,
     timed_out: bool,
+    /// How long the machine was alive (`qemu::Captured::lane_ms`).
+    millis: u64,
     text: String,
 }
 
@@ -1059,7 +1185,7 @@ fn boot_tests(
     tar: &Path,
     diskstat: &str,
     staged: &[&UserTest],
-) -> Result<(Option<i32>, String, Option<String>)> {
+) -> Result<Guest> {
     println!("User tests: booting the test machine");
 
     let names: Vec<&str> = staged.iter().map(|test| test.name.as_str()).collect();
@@ -1089,6 +1215,16 @@ fn boot_tests(
         );
     }
     let loader = utils::loader_path(profile, Arch::X86_64)?;
+
+    // The live dashboard, and its lifetime is the sweep's: it is started once
+    // every lane has been laid and spawned (the `+ lane N: qemu …` lines above
+    // are a record of what ran and belong on the normal screen, not inside a
+    // panel that will wipe them) and stopped as soon as every lane has answered,
+    // so both the report and the detailed lines below print onto the screen the
+    // reader started with. A panel that was not wanted - a pipe, a redirect,
+    // `MPOS_TEST_TUI=0` - owns no terminal and every call on it is a no-op
+    // (`tui::Panel`).
+    let totals: Vec<usize> = dealt.iter().map(|lane| lane.len()).collect();
 
     let mut plans: Vec<Lane> = Vec::with_capacity(dealt.len());
     let mut jobs: Vec<(Command, PathBuf)> = Vec::with_capacity(dealt.len());
@@ -1169,15 +1305,21 @@ fn boot_tests(
             log,
             status: None,
             timed_out: false,
+            millis: 0,
             text: String::new(),
         });
     }
 
     // One loop for all the lanes (`qemu::capture_many`), a sweep-wide deadline,
     // and no terminators: this machine's boot ends when its kernel writes the
-    // debug exit, so the process leaving *is* the end of that lane's run.
+    // debug exit, so the process leaving *is* the end of that lane's run. Every
+    // poll hands the panel the same instant for all lanes (`LaneTick`).
     let timeout = Duration::from_secs(test_timeout_secs());
-    let captured = qemu::capture_many(jobs, &[], &["=== "], timeout)?;
+    let mut panel = tui::Panel::start(&totals);
+    let captured = qemu::capture_many(jobs, &[], &["=== "], timeout, &mut |ticks| {
+        panel.tick(ticks)
+    })?;
+    panel.stop();
     let mut measured: BTreeMap<String, u64> = BTreeMap::new();
     for machine in &captured {
         measured.extend(measure_costs(&machine.progress));
@@ -1185,6 +1327,7 @@ fn boot_tests(
     for (plan, machine) in plans.iter_mut().zip(captured) {
         plan.status = machine.status;
         plan.timed_out = machine.timed_out;
+        plan.millis = machine.lane_ms;
         plan.text = machine.log;
     }
 
@@ -1239,6 +1382,29 @@ fn boot_tests(
         );
     }
 
+    // Each lane as the gate's report shows it: what it carried, how long it was
+    // alive, whether it ended on the debug exit, and the one program that
+    // explains a lane whose count is smaller than its time.
+    //
+    // `measured` is the same table the next run deals from, so the program named
+    // here is the one the *next* deal will weigh most - which is what makes the
+    // two readings agree.
+    let lanes: Vec<tui::LaneRow> = plans
+        .iter()
+        .enumerate()
+        .map(|(index, lane)| tui::LaneRow {
+            index,
+            programs: lane.names.len(),
+            millis: lane.millis,
+            ok: lane.status == Some(33) && !lane.timed_out,
+            heaviest: lane
+                .names
+                .iter()
+                .filter_map(|name| measured.get(name.as_str()).map(|ms| (name.clone(), *ms)))
+                .max_by_key(|(_, millis)| *millis),
+        })
+        .collect();
+
     let summary = combined_summary(&logs);
     let text = logs.join("\n");
     // The one stable path every reader knows (`xtask/README.md`): the sweep's
@@ -1249,7 +1415,13 @@ fn boot_tests(
     // nothing streams into it while the run is going.
     fs::write(build_dir.join("test-serial.log"), &text)?;
 
-    Ok((status, text, summary))
+    Ok(Guest {
+        status,
+        log: text,
+        summary,
+        lanes,
+        costs: measured,
+    })
 }
 
 fn test_timeout_secs() -> u64 {
@@ -2094,6 +2266,24 @@ mod tests {
             1,
             "an empty payload is still one"
         );
+    }
+
+    /// The report's stage-1 numbers are cargo's own `test result:` lines summed
+    /// across crates - one line per crate, which is what a person scrolls past -
+    /// and a `FAILED` line is counted rather than skipped.
+    #[test]
+    fn the_host_stage_totals_are_the_sum_of_its_crates() {
+        let text = "\
+running 586 tests
+test result: ok. 586 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.15s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 130 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.40s
+";
+        assert_eq!(super::host_totals(text), (716, 0));
+        let red =
+            "test result: FAILED. 129 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
+        assert_eq!(super::host_totals(red), (129, 1));
+        assert_eq!(super::host_totals("nothing here"), (0, 0));
     }
 
     /// A program the table calls free is charged the poll's beat rather than

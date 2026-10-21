@@ -17,6 +17,7 @@ mod qemu;
 mod rootfs;
 mod selftest;
 mod sweep;
+mod tui;
 mod utils;
 
 use std::env;

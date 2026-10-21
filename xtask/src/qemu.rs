@@ -1170,6 +1170,10 @@ pub struct Captured {
     /// The whole serial line, read after the machine stopped.
     pub log: String,
     pub timed_out: bool,
+    /// How long this machine was alive: spawn to the poll that saw it exit (or
+    /// to the last poll, for one that stopped at a terminator or the deadline).
+    /// It is what a lane's line in the sweep's report quotes (`tui::LaneRow`).
+    pub lane_ms: u64,
     /// Every line that began with one of the caller's marks, with the
     /// millisecond the poll first saw it. Empty for [`capture`], which does not
     /// ask for any: a single machine's caller reads the log it already has.
@@ -1181,6 +1185,21 @@ pub struct Captured {
     /// own beat is 20 ms - and nothing but the next run's lane balance depends
     /// on it.
     pub progress: Vec<(u64, String)>,
+}
+
+/// One lane's live state, handed to `capture_many`'s poll hook.
+///
+/// The hook exists for the sweep's dashboard (`tui::Panel`): the poll already
+/// holds the log and the clock, so "how far along is each guest" is free to
+/// report. It carries no opinion about the protocol - `marks` are the lines the
+/// caller asked to be timed, and what they mean is the caller's business.
+pub struct LaneTick<'a> {
+    /// The marked lines seen so far, with the millisecond each first appeared.
+    pub marks: &'a [(u64, String)],
+    /// How long this lane has been alive, frozen at its exit.
+    pub millis: u64,
+    /// Its exit code, once it has stopped.
+    pub exited: Option<i32>,
 }
 
 /// Whether any of `markers` has reached the log at `path`.
@@ -1231,6 +1250,7 @@ pub fn capture_many(
     terminators: &[&str],
     marks: &[&str],
     deadline: Duration,
+    on_tick: &mut dyn FnMut(&[LaneTick<'_>]),
 ) -> Result<Vec<Captured>> {
     struct Lane {
         child: std::process::Child,
@@ -1242,6 +1262,9 @@ pub fn capture_many(
         read: u64,
         partial: String,
         progress: Vec<(u64, String)>,
+        /// When this lane stopped, in milliseconds since the spawn: frozen so
+        /// a lane that finished early keeps its own time while the others run.
+        stopped_ms: Option<u64>,
     }
 
     /// Take whatever has landed in `lane`'s log since the last look, and keep
@@ -1279,6 +1302,7 @@ pub fn capture_many(
             read: 0,
             partial: String::new(),
             progress: Vec::new(),
+            stopped_ms: None,
         });
     }
 
@@ -1298,13 +1322,29 @@ pub fn capture_many(
             // process is not; the same rule `capture` applies to one machine.
             if !terminators.is_empty() && log_contains(&lane.log, terminators) {
                 lane.reached_a_terminator = true;
+                lane.stopped_ms.get_or_insert(elapsed_ms);
                 continue;
             }
             match lane.child.try_wait()? {
-                Some(status) => lane.status = Some(status),
+                Some(status) => {
+                    lane.status = Some(status);
+                    lane.stopped_ms.get_or_insert(elapsed_ms);
+                }
                 None => running = true,
             }
         }
+        // The hook, once per pass, after every lane has been looked at - so a
+        // dashboard draws one frame that describes the same instant for all of
+        // them rather than six instants pretending to be one.
+        let ticks: Vec<LaneTick<'_>> = lanes
+            .iter()
+            .map(|lane| LaneTick {
+                marks: &lane.progress,
+                millis: lane.stopped_ms.unwrap_or(elapsed_ms),
+                exited: lane.status.and_then(|status| status.code()),
+            })
+            .collect();
+        on_tick(&ticks);
         if !running {
             break;
         }
@@ -1336,6 +1376,7 @@ pub fn capture_many(
             status: lane.status.and_then(|status| status.code()),
             log: text,
             timed_out,
+            lane_ms: lane.stopped_ms.unwrap_or(elapsed_ms),
             progress: lane.progress,
         });
     }
@@ -1393,6 +1434,7 @@ pub fn capture(
         status: status.and_then(|status| status.code()),
         log: text,
         timed_out,
+        lane_ms: started.elapsed().as_millis() as u64,
         progress: Vec::new(),
     })
 }

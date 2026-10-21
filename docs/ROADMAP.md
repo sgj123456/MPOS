@@ -228,6 +228,9 @@ One-glance status of the whole roadmap.
   stack that nothing advanced (§15.92), wait budgets that were the clock's resolution rather
   than bounds (§15.93), and a sweep whose host half runs beside its guests and whose programs
   are dealt over lanes by their measured cost (§15.94)
+- [x] the gate reports itself — a live lane dashboard and an end-of-run report (stage times,
+  every lane's programs/verdict/heaviest, the ten slowest programs, and the delta against the
+  last green run), with the plain linesbyte-for-byte unchanged when stdout is not a terminal (§15.95)
 
 **Architectures (Phase 9)**
 
