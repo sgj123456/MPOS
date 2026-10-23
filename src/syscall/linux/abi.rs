@@ -2184,22 +2184,6 @@ pub(crate) fn timespec_ticks(sec: i64, nsec: i64, hz: u64) -> Result<u64, isize>
     Ok(ticks.saturating_add((nsec as u64).div_ceil(nanos_per_tick)))
 }
 
-/// A tick count back into the `(tv_sec, tv_nsec)` a `struct timespec` carries -
-/// the inverse of [`timespec_ticks`], and the encoding `nanosleep`'s `rem`
-/// needs when a signal ends the sleep.
-///
-/// Both clocks this kernel ticks at divide a second exactly (1e9/250 and
-/// 1e9/1000), so the conversion is the multiplication and the split and
-/// nothing rounds; a rate that did not divide would lose the remainder here
-/// rather than invent a nanosecond count the caller could sleep for.
-pub(crate) fn timespec_from_ticks(ticks: u64, hz: u64) -> (i64, i64) {
-    let nanos = ticks.saturating_mul(1_000_000_000 / hz);
-    (
-        (nanos / 1_000_000_000) as i64,
-        (nanos % 1_000_000_000) as i64,
-    )
-}
-
 // ---------------------------------------------------------------------------
 // The waits a signal restarts: SA_RESTART's per-syscall set
 // ---------------------------------------------------------------------------
@@ -5818,26 +5802,6 @@ mod entropy_tests {
         assert!(!ioctl_restartable(ioc(0, b'K', 0xca, 0)));
         // And an unrelated request of any kind is never rewound.
         assert!(!ioctl_restartable(ioc(2, b'F', 0x21, 4)));
-    }
-
-    /// The round trip a `nanosleep`'s `rem` rides: a sleep that was ended with
-    /// 300 ms left says so, in the shape its caller will hand back.
-    #[test]
-    fn a_tick_count_encodes_back_into_a_timespec() {
-        // 250 Hz is this machine's clock and 1000 Hz the other one the
-        // conversion has to hold for; both divide a second exactly.
-        assert_eq!(timespec_from_ticks(250, 250), (1, 0));
-        assert_eq!(timespec_from_ticks(1000, 1000), (1, 0));
-        assert_eq!(timespec_from_ticks(1, 250), (0, 4_000_000));
-        assert_eq!(timespec_from_ticks(0, 250), (0, 0));
-        assert_eq!(timespec_from_ticks(376, 250), (1, 504_000_000));
-        assert_eq!(timespec_from_ticks(3, 1000), (0, 3_000_000));
-        // A tick count past what a second's worth of nanoseconds can carry
-        // saturates rather than wrapping back to a sleep a caller would take
-        // as "almost no time at all".
-        let (sec, nsec) = timespec_from_ticks(u64::MAX, 250);
-        assert!(sec > 0);
-        assert!((0..1_000_000_000).contains(&nsec));
     }
 }
 

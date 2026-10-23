@@ -161,5 +161,11 @@ diagnostic = ["t-sh", "t-aa-ptyprobe"]
 #                 it - TLS goes through other doors there). The program builds
 #                 on both machines and says "skipped" on the second; naming it
 #                 here keeps the sweep's question honest on both.
+
+# And one is a clock, not a call: the second machine's sleeps still round up to
+# a tick because nothing arms a wake-up between two of them. `t-sleep-subtick`
+# is that behaviour's claim, and it is named here rather than weakened so the
+# first machine keeps asserting it. What closes this is the machine's own timer
+# (a comparator interrupt), not an edit to this file - `docs/notes/` §10.7.
 [aarch64]
-gaps = ["t-arch-prctl"]
+gaps = ["t-arch-prctl", "t-sleep-subtick"]

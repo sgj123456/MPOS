@@ -90,7 +90,10 @@ bands top-down (strict priority) and round-robins within a band by popping the f
 to the back; `sleep`/`advance` implement a deadline queue (`Sleeper`'s `Ord` *is* the wake rule —
 earliest deadline, then highest priority, then lowest id, written out so wake order is deterministic
 rather than a function of heap internals); `wake` pulls a sleeper back to ready; `retire` removes a
-task from every queue so a disposed slot is never dereferenced. `Priority::new` clamps rather than
+task from every queue so a disposed slot is never dereferenced. A deadline is **nanoseconds since
+boot**, not ticks: `sleep_ns`/`block_until_nanos` are the doors that carry that, `sleep_ticks` and
+`block_until_deadline` convert at the boundary, and `next_deadline` is what the runtime arms the
+machine's one-shot from when a wait would otherwise round up to the next clock tick (§10.7). `Priority::new` clamps rather than
 rejects. `ARGV_MAX`/`ARGS_BYTES_MAX` are here rather than in `runtime` because the syscall layer
 checks them on the host too (`runtime.rs` says so beside its import).
 

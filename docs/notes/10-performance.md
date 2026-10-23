@@ -905,7 +905,7 @@ a `bat` over a minified stylesheet turned into a machine that looked dead.
 | A transmit ring drained by the TX-held interrupt; `write` only enqueues and parks on a full ring, re-arming before *every* park so a write larger than one drain burst cannot sleep unannounced | `drivers/serial.rs`, `console.rs` |
 | The framebuffer console's serial **mirror** is best-effort: it hands bytes to the ring and returns, so a host terminal that cannot keep up drops bytes rather than throttling the window or the console mux | `console.rs` (`serial_mirror_now`) |
 
-### 10.7 Sub-Tick Sleeps — planned (the wake half is done, and was not this)
+### 10.7 Sub-Tick Sleeps — **LANDED on the first machine** (the second's clock is the named gap)
 
 **The wake latency was filed here and did not belong here; it is fixed.** Two
 measurements said a *woken* task - not sleeping on a deadline, but parked in
@@ -922,47 +922,119 @@ woken task was *ready* and the picker was not choosing it. §10.2 has the cause
 (the boot task's `park()` halting the core while runnable), the fix and the
 numbers, including the probe reading 604 of 640 wakes at exactly one tick.
 
-**The bound is now written, in the one place it is honest.** `t-forkcost`
-asserts that *both* of its `wait4` rows - each a 200-round average - are under
-one clock tick. A wake must be a scheduler turn and not a deadline, and the
-before-figures above are *clock-quantized*: they sat at two ticks (7.6-8.1 ms)
-in every run, because a wait that ends on the clock cannot land between ticks.
-So the bound sits ~40× above the fixed figure (tens of microseconds) and below a
-broken one that cannot drift down to meet it. `t-pipecost` still only *reports*,
+**The bound is written, in the one place it is honest.** `t-forkcost` asserts
+that *both* of its `wait4` rows - each a 200-round average - are under one clock
+tick, which is the claim the wake fix owed. `t-pipecost` still only *reports*,
 deliberately: its figures are throughputs, and a bound that holds under KVM can
-be a flaky failure under TCG, which is its own stated rule. The wake is where
-the quantized claim can be made, and it is the claim that mattered.
+flake under TCG.
 
-**Why**: the tick is the smallest unit a sleep can name (4 ms at 250 Hz).
-Event-driven waits ended the network's dependence on it; the remaining
-callers - `nanosleep`, timerfd, TCP retransmit pacing - still round to whole
-ticks.
+**Why the rest of this section existed**: the tick was the smallest unit a sleep
+could name. At 250 Hz that is 4 ms, and `nanosleep(1 ms)` took 4 ms because there
+was no way to wake a task between two PIT interrupts. Linux's `nanosleep` ends at
+the instant the caller named; a program that polls on a 1 ms timeout paid four
+times its own interval here. Reading time was never the gap - `since_boot_nanos`
+already resolves below the tick from the TSC - the *wake* was.
 
-**What is already there, and what is actually missing**: reading time is *not*
-the gap. `timer::since_boot_nanos()` already resolves below the tick from the
-TSC, with `CYCLES_PER_TICK` calibrated from two observed ticks - so a
-`nanosleep(200µs)` knows precisely when it is late. The gap is the *wake*:
-`sleep_ticks` parks the task on the tick counter, so the smallest unit of
-sleeping is still one PIT interrupt. Design the change around arming a deadline,
-not around a finer clock.
+**What landed, and in which unit.** The scheduler's deadline is now a
+**nanosecond** one. `Scheduler::now`/`Sleeper::deadline` moved to
+nanoseconds-since-boot, `advance` is handed `hal::since_boot_nanos()`, and the two
+public doors are `sched::sleep_ns` (relative) and `block_until_nanos` (absolute);
+`sleep_ticks` and `block_until_deadline` keep their tick-denominated signatures
+and convert at that one boundary (`hal::ns_per_tick()`), so no caller had to
+re-derive its own arithmetic. `nanosleep(2)` takes `block_until_nanos`, which is
+also what makes its `rem` an honest nanosecond remainder instead of a tick count
+(`timespec_from_ticks`, now unused, was deleted rather than left dead).
 
-**The order that stays bootable** - the timer is what the whole scheduler rests
-on, so each step must be green before the next:
+**The wake is a resource of the machine, so it is a capability.** `hal::Clock`
+gains `SUB_TICK_WAKE` (default `false`) and `arm_wake_ns(Option<u64>)` (default: do
+nothing). The scheduler's `arm_next_wake` runs on every turn, after `advance`:
+it takes the **minimum** of the sleep heap and, when that instant falls before the
+next tick boundary, asks the machine to wake it there; otherwise it cancels. Taking
+the minimum every turn is what keeps the coalescing trap shut - an arm that merely
+pushed a new instant could postpone somebody else's deadline, and *recomputing* the
+earliest is idempotent by construction.
 
-| Step | Change | Where |
+**On the first machine** that is the local APIC's count-down timer, on vector
+`0x40` (`lapic.rs`): one-shot, divide-by-one, unmasked, at a count measured in
+**timer counts per millisecond**. `arch/x86_64/idt.rs`'s `apic_timer` handler does
+no bookkeeping of its own - it EOIs the APIC and calls `kernel::preempt()`, so the
+scheduler's next turn is the one place that reads the clock, moves it and wakes
+whoever is due. The PIT stays armed underneath it: a lost one-shot costs a tick's
+latency and cannot stall the machine.
+
+**The calibration is in the unit the deadlines are written in.** The timer is
+started from its maximum with its interrupt masked, and both its count and
+`since_boot_nanos` are sampled twice; the two deltas give counts per millisecond
+directly, so no third rate (the TSC's, the PIT's) can disagree with the timer at
+the instant that matters. The first draft measured counts per TSC cycle and scaled
+by the clock's own TSC rate - two calibrations that each drift being one more way
+to arm the wrong instant than this needs. Three further guards: a measurement under
+4 000 counts, or with no clock movement, is not trusted; a rate outside
+1 MHz..4 GHz is refused; and a failure is retried on later turns (three failures
+before the timer is written off), because one miss under load is not evidence.
+
+**The bug this section cost, and how it read.** Some boots had *no* one-shot at
+all and every sample measured one tick. It was found by the pin refusing to be
+satisfied: `t-sleep-subtick` reported `25/50 inside one tick` - but that count was
+the pin's own threshold at 4 000 µs, and the samples were 3 804..4 179 µs, i.e.
+*all* tick-aligned. The cause was that the APIC was never enabled for delivery:
+`IA32_APIC_BASE` bit 11 and the spurious-vector register's bit 8 were not set, so
+the timer counted down and never raised its vector, and one failed calibration
+latched "not ticking" for the rest of the boot. `lapic::init` now enables delivery
+(base MSR bit 11, TPR 0, SVR `0x1FF`) and the IDT carries a spurious-vector
+handler, because enabling delivery must not turn a race into an unhandled vector.
+
+**Measured, same image, before → after** (x86_64 under TCG, `cargo xtask test`):
+
+| trace | before | after |
 |---|---|---|
-| 1 | Program the LAPIC timer once, in **one-shot**, from a calibrated count: divide by 16, measure the bus cycles per tick against the PIT *before* enabling, and refuse to go sub-tick at all when the calibration says the LAPIC timer is not ticking (KVM/TCG differ here). | `arch/x86_64/lapic.rs`, `arch/x86_64/timer.rs` |
-| 2 | A vector for it in the IDT, and a handler that wakes only the task whose deadline armed it - not the whole tick pass, which would put the cost back. Keep the PIT as the periodic floor so a lost one-shot cannot stall the machine: the tick still advances time, the one-shot only sharpens the wake-up. | `arch/x86_64/idt.rs`, `sched/` |
-| 3 | `sleep_ns`, and have `nanosleep`/timerfd/`block_until_deadline` take it: below one remaining tick arm the one-shot, otherwise park on the tick as now. The deadline a wait already carries is in ticks today - widening it to nanoseconds is the edit everything else hangs on. | `sched/policy.rs`, `sched/runtime.rs`, `vfs/timerfd.rs` |
-| 4 | Measure it: a guest test that sleeps 1 ms twenty times and asserts the elapsed `since_boot_nanos()` is near 20 ms and *not* near 80 ms (twenty 4 ms ticks). Without the number the change is a claim. | `user/abitest/src/bin/` |
+| fifty `nanosleep(1 ms)` | **200.0 ms** (median 4 001 µs; samples 3 804..4 179 µs) | **52.7-58.6 ms** (median 1 042-1 126 µs; 50/50 under half a tick) |
+| one `nanosleep(25 ms)` | 28.4 ms (seven ticks) | 25.1-25.3 ms |
+| `nanosleep(200 ms)` interrupted by a 20 ms alarm | `EINTR` at ~20 ms | `EINTR` at 17-19 ms, `rem` 181-183 ms, `rem + elapsed` = 200 ms within a tick |
 
-**The trap to watch**: one-shot timers and *interrupt coalescing* fight. If a
-one-shot is armed while another is pending, arming must not push the earlier
-deadline out - a task whose wake-up got postponed by somebody else's sleep is a
-latency bug that only shows under load, which is where it will be found first.
+The pin is `t-sleep-subtick` (the fifty-sample distribution, the longer wait that
+must not be cut short, and the interrupted sleep's remainder). Its counterfactual
+is exact: with `SUB_TICK_WAKE` back to `false` the same program is
+**`FAIL t-sleep-subtick`, 8 runs of 8**, with a median of 4 001 µs.
 
----
+Gate: x86_64 `pass=200 fail=0 (213 built)`, `mpos-kunit 32 passed, 0 failed`,
+exit 0 - twelve consecutive green runs after the two fixture fixes below. The
+second machine compiles the whole change (`cargo build --release --target
+aarch64-unknown-none`, clippy clean) but its sweep could not boot on this host
+(`egl-headless,gl=on` needs a DRM render node and this machine has no `/dev/dri`),
+so its gate has not been re-run for this change and no aarch64 figure is claimed.
 
+**Two fixtures had to be repaired, and both are the kind that could hide a bug.**
+They are part of this landing because the accurate clock is what exposed them.
+
+* **A pipe with two readers.** `t-exit-group`'s sibling-child fixture wrote one
+  pid into one pipe, and both the leader and the parent read it - so whichever read
+  ran first consumed the four bytes and the other side saw end-of-file. The gate
+  measured *both* outcomes on the same tree: `child=9 waitpid=7 status=0x100` when
+  the parent won (the leader read nothing, took `_exit(1)` and its exit_group is
+  what handed the child on - so the fixture silently never exercised
+  `exit_group`'s walk) and `child=0 waitpid=7 status=0x700` when the leader won (the
+  two claims failed). It is two pipes now, the parent's copy written first, so the
+  leader's exit_group cannot cut the write the parent needs off. The fixture is
+  deterministic: `leader=7 child=9 waitpid=7 status=0x700` on every run.
+* **A budget written as iterations × a sleep.** Six programs waited in
+  `for _ in 0..400 { ...; sleep(5 ms) }` loops, which was eight seconds of wall
+  clock only while a sleep was a whole tick. `t-exit-group`'s waits are now a
+  wall-clock `WAIT_MS = 8_000` (its own comment says so); the same shape remains in
+  `t-clone-exit`, `t-pidfd`, `t-recvmsg-iov`, `t-tid-dir` and `t-waitid`, which pass
+  today but are the next place this will bite. A fixture budget is wall clock, and
+  it must not be spelled in the clock's granularity.
+
+**Named, and not claimed**: the second machine has no sub-tick wake - its sleeps
+still round up to a tick, `SUB_TICK_WAKE` is `false` there by default, and
+`t-sleep-subtick` sits in its `gaps` rather than being weakened for it (`docs/`
+§13 records what a machine's own timer would take). The periodic timer scans stay
+tick-quantised on purpose: `check_itimers` and `check_posix_timers` compare
+`hal::ticks()`, so a POSIX timer's expiry still rounds up to a tick - only waits
+with a *deadline* became sub-tick. `timerfd` and the TCP retransmit pacing still
+sleep in ticks (`sleep_ticks(1)`), which is a tick of latency, not a wrong
+answer. And a one-shot is one core's: nothing here is SMP-aware, as nothing else
+is.
 
 ### 10.8 The build's own cost: an incremental rootfs, measured before and after — **LANDED** (xtask)
 

@@ -118,6 +118,25 @@ fn read_i32_within(fd: i32, millis: i32) -> i32 {
     if ready > 0 { read_i32(fd) } else { 0 }
 }
 
+/// How long a fixture waits for a kernel event before it calls the claim failed.
+///
+/// These waits used to read `for _ in 0..400` with a 5 ms sleep between looks,
+/// which was eight seconds of wall clock only because a sleep was a whole clock
+/// tick (20 ms when the loops were written, 4 ms before §10.7). A budget written
+/// as *iterations × the length of a sleep* is a claim about the clock's
+/// granularity, and §10.7 made a sleep end when it is due - so the budget shrank
+/// fourfold without anything about the wait changing, and this program flaked
+/// (measured: green three runs in three with the one-shot disarmed, red two of
+/// five with it armed, same two claims). The budget is named in the unit it was
+/// always meant in: the eight seconds the old count came to.
+const WAIT_MS: u64 = 8_000;
+
+/// Whether `started` (the moment a fixture's wait began) is still inside
+/// [`WAIT_MS`].
+fn still_waiting(started: std::time::Instant) -> bool {
+    started.elapsed() < std::time::Duration::from_millis(WAIT_MS)
+}
+
 /// A signal handler that does nothing: the point is the interruption.
 extern "C" fn wake_me(_: libc::c_int) {}
 
@@ -262,25 +281,62 @@ fn spawn_group_with_child() -> Option<(i32, i32)> {
 /// The same, but the child belongs to a **sibling** of the thread that ends the
 /// group: the sibling never runs the exit path, so only `exit_group` can hand
 /// its child on. Answers `(leader, child)`.
+///
+/// **Two pipes, one reader each**, and that is not tidiness. This fixture used
+/// one: the sibling wrote the pid into it, the leader read it to find out whether
+/// the fork worked, and the parent read it to stand the claims on - so whichever
+/// read ran first consumed the four bytes and the *other* side saw end-of-file.
+/// The verdict then depended on which of two processes won a race, and the gate
+/// measured both outcomes: `child=9 waitpid=7 status=0x100` when the parent won
+/// (the leader read nothing, took `_exit(1)`, and its exit_group is what handed
+/// the child on), and `child=0 waitpid=7 status=0x700` when the leader won (the
+/// parent read nothing and both claims failed). §10.7's accurate sleeps changed
+/// the winner often enough to turn the latent race into an intermittent red, but
+/// it was a race before that - a claim that can pass and fail on one tree is not
+/// a pin. Each reader now has its own channel, so neither can steal the other's
+/// answer.
 fn spawn_group_with_sibling_child() -> Option<(i32, i32)> {
-    let mut report = [0i32; 2];
-    if unsafe { libc::pipe(report.as_mut_ptr()) } != 0 {
+    let mut to_leader = [0i32; 2];
+    let mut to_parent = [0i32; 2];
+    if unsafe { libc::pipe(to_leader.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    if unsafe { libc::pipe(to_parent.as_mut_ptr()) } != 0 {
+        unsafe {
+            libc::close(to_leader[0]);
+            libc::close(to_leader[1]);
+        }
         return None;
     }
     let pid = unsafe { libc::fork() };
     if pid == 0 {
-        let read_fd = report[0];
-        let write_fd = report[1];
+        let leader_read = to_leader[0];
+        let sibling_leader = to_leader[1];
+        let sibling_parent = to_parent[1];
         let _sibling = std::thread::spawn(move || {
             let child = unsafe { libc::fork() };
             if child == 0 {
-                unsafe { libc::close(write_fd) };
+                unsafe {
+                    libc::close(sibling_leader);
+                    libc::close(sibling_parent);
+                }
                 loop {
                     unsafe { libc::pause() };
                 }
             }
-            write_i32(write_fd, child);
-            unsafe { libc::close(write_fd) };
+            // The same answer, to each reader on its own channel - **the
+            // parent's first**, and the order is the claim's. The leader reads
+            // its copy and immediately ends the group, which is what kills this
+            // thread; writing to the parent second would make the parent's read
+            // depend on which instruction the death landed between (measured:
+            // `child=0 waitpid=7 status=0x700`, the leader's exit_group cutting
+            // the second write off).
+            write_i32(sibling_parent, child);
+            write_i32(sibling_leader, child);
+            unsafe {
+                libc::close(sibling_leader);
+                libc::close(sibling_parent);
+            }
             // The leader ends the group; this thread never runs its own exit
             // path, which is exactly what the claim below is about.
             loop {
@@ -290,17 +346,25 @@ fn spawn_group_with_sibling_child() -> Option<(i32, i32)> {
         // The leader, not the forking thread, is the one that calls
         // `exit_group`: the sibling is ended by the group's death, so its
         // child has no exit path of its own to be handed on by.
-        let child = read_i32_within(read_fd, 2000);
-        unsafe { libc::close(read_fd) };
+        let child = read_i32_within(leader_read, 2000);
+        // Only this thread's own read end. The parent's channel is not ours to
+        // close: the descriptors are shared by the whole process, so closing the
+        // sibling's write end here would take the pid away from the parent - the
+        // same theft the second pipe exists to stop.
+        unsafe { libc::close(leader_read) };
         if child == 0 {
             unsafe { libc::_exit(1) };
         }
         unsafe { libc::syscall(libc::SYS_exit_group, THREAD_CODE as libc::c_long) };
         loop {}
     }
-    unsafe { libc::close(report[1]) };
-    let child = read_i32_within(report[0], 2000);
-    unsafe { libc::close(report[0]) };
+    unsafe {
+        libc::close(to_leader[1]);
+        libc::close(to_leader[0]);
+        libc::close(to_parent[1]);
+    }
+    let child = read_i32_within(to_parent[0], 2000);
+    unsafe { libc::close(to_parent[0]) };
     Some((pid, child))
 }
 
@@ -430,7 +494,8 @@ fn main() {
         Some((leader, worker)) => {
             let path = format!("/proc/{leader}/stat");
             let mut zombie = false;
-            for _ in 0..400 {
+            let started = std::time::Instant::now();
+            while still_waiting(started) {
                 if stat_state(&path) == Some('Z') {
                     zombie = true;
                     break;
@@ -513,7 +578,8 @@ fn main() {
         // bounded: a wrong kernel must fail the claim, not hang the sweep.
         let mut answer = 0;
         let mut status = 0;
-        for _ in 0..400 {
+        let started = std::time::Instant::now();
+        while still_waiting(started) {
             let (got, got_status) = wait4_opts(-1, WCLONE | libc::WNOHANG);
             if got != 0 {
                 answer = got;
@@ -589,7 +655,8 @@ fn main() {
             // record would park it, and the sweep must not hang on a claim.
             let mut status = 0;
             let mut answer = 0;
-            for _ in 0..400 {
+            let started = std::time::Instant::now();
+            while still_waiting(started) {
                 answer = unsafe { libc::waitpid(leader, &mut status, libc::WNOHANG) };
                 if answer != 0 {
                     break;
@@ -603,7 +670,8 @@ fn main() {
             if child > 0 {
                 let path = format!("/proc/{child}/status");
                 let mut ppid = None;
-                for _ in 0..400 {
+                let started = std::time::Instant::now();
+                while still_waiting(started) {
                     ppid = status_value(&path, "PPid").and_then(|v| v.parse::<i32>().ok());
                     if ppid != Some(leader) {
                         break;
@@ -653,13 +721,22 @@ fn main() {
         Some((leader, child)) => {
             let mut status = 0;
             let mut answer = 0;
-            for _ in 0..400 {
+            let started = std::time::Instant::now();
+            while still_waiting(started) {
                 answer = unsafe { libc::waitpid(leader, &mut status, libc::WNOHANG) };
                 if answer != 0 {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            // Printed whatever the verdict: which half of the pair went wrong is
+            // not visible from the two claims alone, and this fixture's failure is
+            // intermittent (`docs/notes/` §10.7).
+            println!(
+                "     sibling fixture: leader={leader} child={child} waitpid={answer} \
+                 status=0x{:x}",
+                status
+            );
             r.check(
                 "a sibling's forked child was started under the group",
                 child > 0 && answer == leader,
@@ -667,7 +744,8 @@ fn main() {
             if child > 0 {
                 let path = format!("/proc/{child}/status");
                 let mut ppid = None;
-                for _ in 0..400 {
+                let started = std::time::Instant::now();
+                while still_waiting(started) {
                     ppid = status_value(&path, "PPid").and_then(|v| v.parse::<i32>().ok());
                     if ppid != Some(leader) {
                         break;

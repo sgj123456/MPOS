@@ -1880,20 +1880,23 @@ fn sleep_for_timespec(req: usize, rem: usize, from_user: bool) -> isize {
     if total_ms == 0 {
         return 0;
     }
-    let ticks = (total_ms * crate::hal::TICK_HZ as u64 / 1000).max(1);
-    let hz = crate::hal::TICK_HZ as u64;
-    let deadline = crate::hal::ticks().saturating_add(ticks);
-    match crate::sched::block_until_deadline(|| false, deadline) {
+    // Nanoseconds, not ticks: Linux's `nanosleep` does not round the duration up
+    // to a timer period, and this machine can now end a wait between ticks
+    // (`docs/notes/` §10.7). The deadline is absolute so the `rem` an
+    // interrupted sleep reports is the part of *this* wait still to run.
+    let total_ns = total_ms.saturating_mul(1_000_000);
+    let deadline = crate::hal::since_boot_nanos().saturating_add(total_ns);
+    match crate::sched::block_until_nanos(|| false, deadline) {
         crate::sched::WaitEnd::Interrupted => {
             if rem != 0 {
                 if !buffer_ok(rem, 16, true, from_user) {
                     return err::EFAULT;
                 }
-                let left = deadline.saturating_sub(crate::hal::ticks());
-                let (sec, nsec) = abi::timespec_from_ticks(left, hz);
+                let left = deadline.saturating_sub(crate::hal::since_boot_nanos());
+                let (sec, nsec) = (left / 1_000_000_000, left % 1_000_000_000);
                 unsafe {
-                    (rem as *mut i64).write_unaligned(sec);
-                    ((rem + 8) as *mut i64).write_unaligned(nsec);
+                    (rem as *mut i64).write_unaligned(sec as i64);
+                    ((rem + 8) as *mut i64).write_unaligned(nsec as i64);
                 }
             }
             err::EINTR

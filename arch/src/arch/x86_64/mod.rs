@@ -262,6 +262,15 @@ impl crate::hal::Clock for crate::hal::Current {
     fn busy_wait_ms(ms: u64) {
         timer::busy_wait_ms(ms)
     }
+
+    /// The LAPIC's own count-down timer can raise a vector between two PIT
+    /// ticks, so a wait shorter than 4 ms ends when it is due (`lapic`).
+    const SUB_TICK_WAKE: bool = true;
+
+    #[inline]
+    fn arm_wake_ns(deadline_ns: Option<u64>) {
+        lapic::arm_one_shot(deadline_ns)
+    }
 }
 
 impl crate::hal::WallClock for crate::hal::Current {

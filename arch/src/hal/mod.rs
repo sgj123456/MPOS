@@ -100,6 +100,24 @@ pub trait Clock {
     /// Spin for approximately `ms` with interrupts as they are. Boot-only: it
     /// exists for the milestone checks, which must wait without a scheduler.
     fn busy_wait_ms(ms: u64);
+
+    /// Whether this machine can interrupt *between* two clock ticks, so a wait
+    /// shorter than one ends when it is due rather than at the next tick.
+    ///
+    /// The scheduler consults this before it bothers computing a nanosecond
+    /// deadline: a machine whose only wake-up source is the periodic tick sleeps
+    /// in ticks, and saying so with `false` is the honest shape rather than a
+    /// silent rounding. `docs/notes/` §10.7 records which machine answers which.
+    const SUB_TICK_WAKE: bool = false;
+
+    /// Arm a one-shot interrupt at `deadline_ns` (nanoseconds since boot), or
+    /// cancel whatever is armed when it is `None`.
+    ///
+    /// The periodic tick stays armed either way: this only sharpens a wake-up
+    /// that lands between two ticks, so a lost one-shot costs a tick's latency
+    /// and never the machine. The default does nothing, which is what a machine
+    /// with no sub-tick source wants.
+    fn arm_wake_ns(_deadline_ns: Option<u64>) {}
 }
 
 /// The wall clock: the civil time the boot anchored, stored in the RTC.
@@ -1155,6 +1173,22 @@ pub fn since_boot_nanos() -> u64 {
 #[inline]
 pub fn busy_wait_ms(ms: u64) {
     <Current as Clock>::busy_wait_ms(ms)
+}
+
+/// Whether the machine can wake a wait between two clock ticks.
+pub const SUB_TICK_WAKE: bool = <Current as Clock>::SUB_TICK_WAKE;
+
+/// Arm (or cancel) the machine's one-shot wake-up; see [`Clock::arm_wake_ns`].
+#[inline]
+pub fn arm_wake_ns(deadline_ns: Option<u64>) {
+    <Current as Clock>::arm_wake_ns(deadline_ns)
+}
+
+/// Nanoseconds in one clock tick - the unit conversion between a wait named in
+/// ticks and the deadlines the scheduler now keeps.
+#[inline]
+pub const fn ns_per_tick() -> u64 {
+    1_000_000_000 / <Current as Clock>::TICK_HZ as u64
 }
 
 /// The Unix epoch the boot anchored wall time at.

@@ -271,7 +271,12 @@ One-glance status of the whole roadmap.
 - [ ] [~] 10.3 syscall path — itimer flag landed; fault-driven user-buffer copy not (§10.3)
 - [x] 10.4 pipes + per-frame allocations — ring, handover and the seam frame pool all landed; the rate-pair measurement is recorded (§10.4)
 - [ ] [~] 10.5 ext4/virtio-blk read path — cache, wide transfer and the demand run landed and measured; interrupt-driven completions measured and re-scoped, multi-request pipelining dropped; the first machine's boot-disk figure still open (§10.5)
-- [x] 10.6 serial TX ring · [ ] 10.7 sub-tick sleeps (LAPIC one-shot) (§10.6, §10.7)
+- [x] 10.6 serial TX ring · [x] 10.7 sub-tick sleeps — a deadline is a nanosecond one
+  now, and the first machine wakes a wait *between* two clock ticks from the LAPIC's
+  one-shot: fifty 1 ms sleeps are 52-59 ms instead of 200 ms, a 25 ms sleep is 25.1 ms
+  instead of 28.4, and an interrupted sleep's `rem` is a nanosecond remainder. The
+  second machine has no sub-tick wake yet and says so (`SUB_TICK_WAKE` is false there,
+  and `t-sleep-subtick` is in its `gaps`) (§10.7)
 - [x] the gate's own clock — `cargo xtask test` measured **80.7 s → 6.5 s (12.4x)** warm: a
   stack that nothing advanced (§15.92), wait budgets that were the clock's resolution rather
   than bounds (§15.93), and a sweep whose host half runs beside its guests and whose programs

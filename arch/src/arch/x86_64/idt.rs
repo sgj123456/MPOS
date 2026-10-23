@@ -105,6 +105,17 @@ pub fn init() {
         // it, nothing ever raises it, and the handler simply stands ready.
         table[NET_IRQ_VECTOR].set_handler_fn(virtio_net);
 
+        // The local APIC timer's one-shot: the scheduler arms it at the
+        // earliest wait that would otherwise round up to the next PIT tick
+        // (`lapic::arm_one_shot`). Like the net vector it is registered once and
+        // silent until something arms it.
+        table[super::lapic::TIMER_VECTOR].set_handler_fn(apic_timer);
+        // The APIC's spurious vector: a delivery the local APIC could not make
+        // is reported here so that enabling delivery cannot turn a race into an
+        // unhandled vector. It does nothing, which is the whole contract - there
+        // is no interrupt, only a notification that there was none.
+        table[super::lapic::SPURIOUS_VECTOR].set_handler_fn(spurious);
+
         table
     });
 
@@ -129,6 +140,28 @@ extern "x86-interrupt" fn timer(frame: InterruptStackFrame) {
     // not return until the task is resumed, and an unacknowledged PIC would
     // block every interrupt until then.
     pic::end_of_interrupt(0);
+    crate::hal::kernel::preempt();
+}
+
+/// The local APIC's one-shot: a wait shorter than a tick is due now.
+///
+/// It does no bookkeeping of its own. The scheduler's next turn is what reads
+/// the clock (`since_boot_nanos`), moves it and wakes whoever's nanosecond
+/// deadline has passed - the same turn every other preemption takes, so there is
+/// one clock advance and not a second, subtly different one here. The PIT tick
+/// stays armed beneath it, which is why a lost one-shot costs a tick's latency
+/// and cannot stall the machine.
+/// A spurious vector: an interrupt the local APIC withdrew before it was
+/// delivered. Acknowledging is all there is to do - the vector was never really
+/// in service, and the LAPIC wants no EOI for it.
+extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {}
+
+extern "x86-interrupt" fn apic_timer(_frame: InterruptStackFrame) {
+    // The APIC, not the PIC, raised this one: the 8259's EOI port knows nothing
+    // about it, and a vector left in service would block this one and every
+    // lower-priority delivery. EOI before preempting for the same reason the PIT
+    // handler does it - a preempted handler does not return until it is resumed.
+    super::lapic::eoi();
     crate::hal::kernel::preempt();
 }
 

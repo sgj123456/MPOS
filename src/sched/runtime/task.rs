@@ -1617,7 +1617,11 @@ impl Table {
         self.check_itimers();
         self.check_posix_timers();
         self.reap();
-        self.sched.advance(hal::ticks());
+        // The clock's finest reading, because a deadline is now a nanosecond
+        // one (§10.7). A tick-only reading would make every sub-tick wait wake
+        // at the tick above its deadline and waste the one-shot that fired here.
+        self.sched.advance(hal::since_boot_nanos());
+        self.arm_next_wake();
         // The picker hands back a queued id, and a queue can hold one that is
         // no longer a task: a task puts itself back when it yields or sleeps
         // without asking anything about itself first, and a slot the reaper
@@ -1636,6 +1640,38 @@ impl Table {
             }
         }
         None
+    }
+
+    /// Arm the machine's one-shot for the earliest wait the next tick would be
+    /// too late for, or cancel it when there is none.
+    ///
+    /// This runs on every turn, and recomputing the *earliest* deadline each time
+    /// is what keeps the notes' coalescing trap shut: an arm that merely pushed a
+    /// new instant could postpone a deadline somebody else had already armed, and
+    /// the postponement would only show up under load. Asking the heap for its
+    /// minimum and programming exactly that is idempotent by construction.
+    ///
+    /// Nothing here is done on a machine that cannot wake between ticks: it has
+    /// no one-shot to arm, and `SUB_TICK_WAKE` is its own statement of that.
+    fn arm_next_wake(&mut self) {
+        if !hal::SUB_TICK_WAKE {
+            return;
+        }
+        let now = hal::since_boot_nanos();
+        let per_tick = hal::ns_per_tick();
+        // The instant the periodic clock next advances; a deadline at or after it
+        // is the PIT's to serve.
+        let next_tick = now
+            .checked_div(per_tick)
+            .and_then(|t| (t + 1).checked_mul(per_tick));
+        let arm = match (self.sched.next_deadline(), next_tick) {
+            (Some(deadline), Some(boundary)) if deadline < boundary => Some(deadline),
+            // A `None` here cancels an arm whose wait was woken by an event and
+            // is no longer the earliest - without it a stale one-shot would fire
+            // into a turn that has nothing to wake.
+            _ => None,
+        };
+        hal::arm_wake_ns(arm);
     }
 
     /// Slot 1 is left free on purpose - it is init's pid - and the top slot is
@@ -2237,20 +2273,44 @@ pub fn yield_now() {
 /// is what `timeout` reports as a kill that never happened, with the sleeper
 /// still on the machine afterwards.
 pub fn sleep_ticks(ticks: u64) {
-    let deadline = hal::ticks().saturating_add(ticks);
+    // A tick-denominated wait is still a wait to an *instant*, so the unit is
+    // converted here - at the one boundary that knows what a tick is - rather
+    // than rounding every deadline below up to the next tick.
+    let nanos = ticks.saturating_mul(hal::ns_per_tick());
+    sleep_until(hal::since_boot_nanos().saturating_add(nanos));
+}
+
+/// Sleep for at least `nanos` nanoseconds, or until a fatal signal ends the
+/// task.
+///
+/// The finer sibling of [`sleep_ticks`], and what `nanosleep(2)` asks: Linux's
+/// sleep does not round a duration up to a timer period, and a 1 ms sleep on a
+/// 250 Hz clock that rounded would take four. On a machine with a sub-tick
+/// wake-up (`hal::SUB_TICK_WAKE`) the scheduler arms a one-shot at the deadline;
+/// on one without, the same call still ends on the next tick - honestly late,
+/// rather than silently redefined.
+pub fn sleep_ns(nanos: u64) {
+    sleep_until(hal::since_boot_nanos().saturating_add(nanos));
+}
+
+/// The sleep both entry points share: wait until the absolute deadline,
+/// re-reading the clock on every pass so a wake that was not the deadline does
+/// not restart the wait.
+fn sleep_until(deadline: u64) {
+    let clock = || hal::since_boot_nanos();
     loop {
         if let Some(sig) = take_fatal_signal() {
             exit(-(sig as isize));
         }
-        if hal::ticks() >= deadline {
+        if clock() >= deadline {
             return;
         }
         schedule(|t| {
             // Read the clock here rather than trusting the scheduler's last
             // turn. This task may have been running for a while since then,
             // and a deadline computed from a stale clock wakes early.
-            t.sched.advance(hal::ticks());
-            if hal::ticks() >= deadline {
+            t.sched.advance(clock());
+            if clock() >= deadline {
                 t.requeue_current();
                 return;
             }
@@ -2258,7 +2318,7 @@ pub fn sleep_ticks(ticks: u64) {
             let priority = t.task(id).priority;
             // What is *left* of the wait, so a wake that was not the deadline
             // does not start the whole sleep over.
-            let remaining = deadline.saturating_sub(hal::ticks()).max(1);
+            let remaining = deadline.saturating_sub(clock()).max(1);
             t.sched.sleep(id, priority, remaining);
         });
     }
@@ -2405,7 +2465,24 @@ pub enum WaitEnd {
     Interrupted,
 }
 
-pub fn block_until_deadline(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
+/// Block until `cond` is true, `deadline_ticks` passes, or a signal arrives.
+///
+/// The deadline is named in **ticks** because that is what every caller computes,
+/// a timeout being ticks on this machine's clock, and it is converted to the
+/// scheduler's nanosecond deadline here so a caller cannot forget which unit its
+/// own arithmetic is in. `u64::MAX` stays "no clock at all" through the
+/// saturating multiply.
+pub fn block_until_deadline(cond: impl Fn() -> bool, deadline_ticks: u64) -> WaitEnd {
+    block_until_nanos(cond, deadline_ticks.saturating_mul(hal::ns_per_tick()))
+}
+
+/// [`block_until_deadline`] with the deadline the scheduler actually keeps:
+/// nanoseconds since boot.
+///
+/// This is the door `nanosleep(2)` uses. Its caller names an interval in
+/// nanoseconds and expects the wait to end at that instant, not at the clock tick
+/// above it, so there is no tick to name on the way in (`docs/notes/` §10.7).
+pub fn block_until_nanos(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
     loop {
         if let Some(sig) = take_fatal_signal() {
             exit(-(sig as isize));
@@ -2416,11 +2493,11 @@ pub fn block_until_deadline(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
         if with_table(|t| table_has_deliverable(t)) {
             return WaitEnd::Interrupted;
         }
-        if hal::ticks() >= deadline {
+        if hal::since_boot_nanos() >= deadline {
             return WaitEnd::Deadline;
         }
         schedule(|t| {
-            let done = cond() || table_has_deliverable(t) || hal::ticks() >= deadline;
+            let done = cond() || table_has_deliverable(t) || hal::since_boot_nanos() >= deadline;
             if done {
                 t.requeue_current();
             } else {
@@ -2429,8 +2506,8 @@ pub fn block_until_deadline(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
                 // The deadline is absolute, the sleep's is relative: what is
                 // left of the wait is what the clock should run down, and a
                 // wake may still end it before that.
-                t.sched.advance(hal::ticks());
-                let remaining = deadline.saturating_sub(hal::ticks()).max(1);
+                t.sched.advance(hal::since_boot_nanos());
+                let remaining = deadline.saturating_sub(hal::since_boot_nanos()).max(1);
                 t.sched.sleep(id, priority, remaining);
             }
         });

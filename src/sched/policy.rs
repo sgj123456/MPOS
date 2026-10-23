@@ -92,6 +92,13 @@ impl Default for Priority {
 /// because `BinaryHeap` is a max-heap. The last two rules only matter when
 /// deadlines tie, and they exist to make wake order deterministic instead of a
 /// function of heap internals.
+///
+/// A deadline is **nanoseconds since boot**, not ticks. The unit moved in §10.7
+/// when the machine gained a wake-up source between ticks: a wait shorter than a
+/// tick has to be expressible, and keeping the heap in ticks would have meant
+/// every sub-tick deadline rounding to the tick above it. The policy still owns
+/// no clock - the caller hands [`Scheduler::advance`] its reading in the same
+/// unit.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Sleeper {
     deadline: u64,
@@ -120,6 +127,7 @@ pub struct Scheduler {
     ready: [VecDeque<TaskId>; BANDS],
     sleeping: BinaryHeap<Reverse<Sleeper>>,
     /// The clock as this scheduler last saw it, updated by [`Scheduler::advance`].
+    /// Nanoseconds since boot; the policy never reads a clock itself.
     now: u64,
 }
 
@@ -207,19 +215,30 @@ impl Scheduler {
         self.sleeping = rebuilt;
     }
 
-    /// Queue a task to wake after `ticks` more clock advances.
+    /// Queue a task to wake after `nanos` more nanoseconds of clock.
     ///
-    /// `ticks` of 0 is not "wake immediately": the task still has to wait for the
+    /// A wait of 0 is not "wake immediately": the task still has to wait for the
     /// next [`advance`](Self::advance), which is what makes a sleep a scheduling
     /// point rather than a no-op.
-    pub fn sleep(&mut self, id: TaskId, priority: Priority, ticks: u64) {
+    pub fn sleep(&mut self, id: TaskId, priority: Priority, nanos: u64) {
         self.sleeping.push(Reverse(Sleeper {
             // Saturating so u64::MAX is "until someone wakes me": a plain add
             // would wrap the deadline into the past.
-            deadline: self.now.saturating_add(ticks),
+            deadline: self.now.saturating_add(nanos),
             priority,
             id,
         }));
+    }
+
+    /// The earliest deadline in the sleep queue, in the clock's own unit.
+    ///
+    /// The runtime asks for this after every turn to decide whether to arm the
+    /// machine's one-shot wake-up: a deadline inside the coming tick is one the
+    /// periodic clock cannot serve on time (`docs/notes/` §10.7).
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.sleeping
+            .peek()
+            .map(|Reverse(sleeper)| sleeper.deadline)
     }
 
     /// Pull a task out of the sleep queue and make it ready now.
@@ -253,7 +272,8 @@ impl Scheduler {
 
     /// Move the clock to `now` and re-queue everything whose deadline has passed.
     /// Returns how many tasks woke, so the runtime can tell whether the tick
-    /// changed the set of runnable tasks at all.
+    /// changed the set of runnable tasks at all. `now` is in the same unit as a
+    /// sleeper's deadline - nanoseconds since boot.
     pub fn advance(&mut self, now: u64) -> usize {
         debug_assert!(
             now >= self.now,
