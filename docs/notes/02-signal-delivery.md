@@ -464,3 +464,52 @@ split are the networking surface's rules; the measurements and the landing are
 only the signal-side fact: **generation is per-syscall, delivery is still the
 syscall-exit path**, and a blocked `SIGPIPE` therefore waits pending while its
 `write` returns `EPIPE` - both pinned.
+
+### 2.9 The kernel sends the signal a dying parent's child asked for - `PR_SET_PDEATHSIG` (LANDED 2026-10-23)
+
+The option was one of the ones the `prctl` catch-all refused with `EINVAL` (the
+honest answer for an option nothing backs), and it is the last of that family with
+real state behind it: the value is read by the **exit path**, not by a getter.
+
+Measured on a current host first (`.workbuddy/probe_pdeathsig.c`), every claim
+then re-run against a real kernel before it was pointed at this one:
+
+* a fresh process can already have one - this sandbox's shell carries `SIGKILL`,
+  which it inherited from the chain that started it, so the value **survives
+  `execve`**. A `fork` child reads **0** whatever its creator asked for: the
+  setting is cleared at the fork, which is why the claims pin the pair.
+* `0` clears; any value up to `_NSIG` (64) is accepted - **`SIGKILL` and `SIGSTOP`
+  included**, so nothing filters them, which is the opposite of what a reader
+  expects and the reason it was measured rather than inferred from `kill(2)`'s
+  rules; `100` and `-1` are `EINVAL` **with the previous value kept**.
+* `PR_GET_PDEATHSIG` answers **0** and writes the signal through its pointer; a
+  null pointer is `EFAULT`. (The first draft of the claim expected the signal
+  back as the return value and failed on the host - the implementation was right
+  and the expectation was not.)
+* the delivery: a child that has asked is sent the signal when the task it names
+  as its parent dies, and a **handler** is what the pin observes it with, because
+  the orphan is reparented to init at the same moment and is no longer the
+  test's child to `wait` for.
+
+The substrate is a `u32` on `Task` plus one call: the walk that hands a dying
+task's children to a new parent - `exit`'s `forget_original_parent` half - sends
+each child its signal through `force_signal` (a kernel raise, `SEND_SIG_PRIV`'s
+shape) and wakes it, because that primitive wakes nobody.
+
+**The first gate run was red, and the fault was the pin**, which is the part
+worth recording: the middle process exited before the victim had run `prctl`, so
+the victim's field was still 0 when the parent died and the signal was never
+queued. On the host the same race had been won by the other side. The fix is a
+pipe, not a sleep: the victim writes one byte once it is armed and the middle
+waits for it, so the ordering is the kernel's and the claim reads the delivery
+rather than a race. A pin for "the kernel sends something at a moment" has to
+order that moment itself.
+
+**Pin**: `t-prctl`, grown to **43 claims** - the `EFAULT`, the round-trip, the
+range refusal with the old value kept, the clearing, the fork inheritance and the
+delivery through a handler - all of them green on the host where the two
+`PR_CAPBSET_*` claims are the pre-existing unprivileged-host divergence, and all
+of them green in the guest.
+
+**Gate**: x86_64 `pass=205 fail=0`, stage 1 `1100 tests, 0 failed`,
+`mpos-kunit 32 passed, 0 failed`, exit 0.

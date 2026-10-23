@@ -773,6 +773,17 @@ pub(crate) struct Task {
     /// the namespace it is in now, and an id from the old one answers `EINVAL`
     /// (measured, §6.16).
     pub(crate) ipc_ns: Option<alloc::sync::Arc<crate::vfs::ns::IpcNs>>,
+    /// `PR_SET_PDEATHSIG`: the signal the kernel sends to this task when its
+    /// parent dies, or 0 for none.
+    ///
+    /// Measured on a current host (`.workbuddy/probe_pdeathsig.c`): the value
+    /// survives `execve` (a process may inherit one from the chain that started
+    /// it - this sandbox's shell carries `SIGKILL`), is **cleared for the child
+    /// of a `fork`**, accepts any value `0..=_NSIG` (`SIGKILL` and `SIGSTOP`
+    /// included, which is why nothing filters them), and an invalid one is
+    /// `EINVAL` with the old value kept. Delivered by the exit path, at the same
+    /// walk that hands the dying task's children on.
+    pub(crate) pdeathsig: u32,
     /// The namespace this task's **children** are created in - Linux's
     /// `nsproxy->pid_ns_for_children`.
     ///
@@ -1155,6 +1166,8 @@ impl Task {
             // And the machine's own IPC namespace, `None` for the same reason:
             // every SysV and POSIX queue resolves to the tables the boot made.
             ipc_ns: None,
+            // No parent-death signal: nothing has asked for one.
+            pdeathsig: 0,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -1817,6 +1830,8 @@ impl Table {
             // And the machine's own IPC namespace, `None` for the same reason:
             // every SysV and POSIX queue resolves to the tables the boot made.
             ipc_ns: None,
+            // No parent-death signal: nothing has asked for one.
+            pdeathsig: 0,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),

@@ -833,6 +833,22 @@ pub fn current_ipc_ns() -> Option<u64> {
     })
 }
 
+/// The running task's `PR_SET_PDEATHSIG` value, or 0 for none.
+#[cfg(target_os = "none")]
+pub fn current_pdeathsig() -> u32 {
+    with_table(|t| t.task(t.current).pdeathsig)
+}
+
+/// Store it. The value has already been range-checked by the caller
+/// (`prctl`'s `valid_signal`), and the exit path is what reads it.
+#[cfg(target_os = "none")]
+pub fn set_pdeathsig(sig: u32) {
+    with_table(|t| {
+        let me = t.current;
+        t.task_mut(me).pdeathsig = sig;
+    });
+}
+
 /// Move the running task into an IPC namespace: `unshare(CLONE_NEWIPC)` and
 /// `setns` on `/proc/<pid>/ns/ipc` both land here. Unlike `NET` there is nothing
 /// to move *with* the task - the objects it could already name are looked up in

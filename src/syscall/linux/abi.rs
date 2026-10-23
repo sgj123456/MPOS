@@ -2439,6 +2439,17 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     // that something *reads*: `ptrace_may_access` asks the dumpable flag, and
     // `execve` re-derives the sets from the bounding one - which is what makes
     // them honest rather than a stored value nothing consults.
+    // The parent-death signal pair. `PR_SET_PDEATHSIG` is 1 and the getter 2,
+    // and unlike the boundary pairs below the *signal* word is the whole
+    // argument: measured on a current host, 0 clears it, anything up to `_NSIG`
+    // (64) is accepted - `SIGKILL` and `SIGSTOP` included, so nothing filters
+    // them - and -1 or 100 are `EINVAL` with the previous value kept.
+    // `PR_GET_PDEATHSIG` writes the number through the pointer and answers
+    // `EFAULT` for a null one.
+    const PR_SET_PDEATHSIG: usize = 1;
+    const PR_GET_PDEATHSIG: usize = 2;
+    /// `_NSIG`: the highest signal number Linux's `valid_signal` accepts.
+    const NSIG: usize = 64;
     const PR_SET_DUMPABLE: usize = 4;
     const PR_GET_DUMPABLE: usize = 3;
     const PR_SET_KEEPCAPS: usize = 8;
@@ -2550,6 +2561,21 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
             _ => err::EINVAL,
         },
         PR_GET_DUMPABLE => crate::sched::current_credentials().dumpable as isize,
+        PR_SET_PDEATHSIG => {
+            if args[1] > NSIG {
+                return err::EINVAL;
+            }
+            crate::sched::set_pdeathsig(args[1] as u32);
+            0
+        }
+        PR_GET_PDEATHSIG => {
+            let buf = args[1];
+            if buf == 0 || !buffer_ok(buf, 4, true, true) {
+                return err::EFAULT;
+            }
+            unsafe { (buf as *mut u32).write_unaligned(crate::sched::current_pdeathsig()) };
+            0
+        }
         // `KEEPCAPS`: whether a full uid drop keeps the *permitted* capability
         // set. Measured accepted values are 0 and 1; 2 is `EINVAL`. The bit is
         // read by `Credentials::on_identity_change`, so it is not a stored

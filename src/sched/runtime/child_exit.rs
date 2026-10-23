@@ -472,11 +472,27 @@ pub fn exit(code: isize) -> ! {
         if id != INIT_PID {
             let reaper = alive_thread_of(t, tgid, id).unwrap_or(INIT_PID);
             let mut adopted = false;
-            for task in t.tasks.iter_mut().flatten() {
+            // `PR_SET_PDEATHSIG`'s delivery: Linux's `forget_original_parent`
+            // sends each child the signal it asked for at the moment the parent
+            // it names dies - the same walk that hands the child to a new
+            // parent, because "the parent is gone" is exactly what both halves
+            // are about. The signal is a **kernel raise** (`force_signal`, the
+            // `SEND_SIG_PRIV` shape), and the child is woken here because that
+            // primitive wakes nobody.
+            let mut woken: Vec<TaskId> = Vec::new();
+            for (slot, task) in t.tasks.iter_mut().enumerate() {
+                let Some(task) = task.as_mut() else { continue };
                 if task.parent == Some(id) {
                     task.parent = Some(reaper);
                     adopted = true;
+                    if task.pdeathsig != 0 && !task.exited {
+                        force_signal(task, task.pdeathsig as u8);
+                        woken.push(TaskId(slot));
+                    }
                 }
+            }
+            for child in woken {
+                t.sched.wake(child);
             }
             if adopted {
                 t.sched.wake(reaper);
@@ -1095,6 +1111,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         t.tasks[slot] = Some(Task {
             context,
             sem_undo,
+            pdeathsig: 0,
             fpu_live: false,
             priority: parent_priority,
             stack: Some(stack),
@@ -1638,6 +1655,8 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         let user_ns = alloc::sync::Arc::clone(&parent.user_ns);
         let net_ns = parent.net_ns;
         let ipc_ns = parent.ipc_ns.clone();
+        // A thread is created, not forked, so it starts with none either.
+        let pdeathsig = 0u32;
         // `CLONE_FS` is what every `pthread_create` sets: a thread that
         // `chdir`s moves its process, which is Linux's answer (measured -
         // `.workbuddy/probe_unshare_flags.c`). A raw `clone(CLONE_THREAD)`
@@ -1786,6 +1805,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             net_ns: net_ns.clone(),
             // A thread is its process here too: one set of tables.
             ipc_ns,
+            pdeathsig,
             oom_score_adj,
             oom_score_adj_min,
             nice,

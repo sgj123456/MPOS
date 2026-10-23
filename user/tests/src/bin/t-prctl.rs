@@ -14,7 +14,14 @@
 //! refused set leaves the flag alone), `PR_SET_KEEPCAPS`/`PR_GET_KEEPCAPS` (0 and
 //! 1 only, and the getter reads back what the setter stored), and
 //! `PR_CAPBSET_READ`/`PR_CAPBSET_DROP` (1 or 0 for 0..=40, `EINVAL` past it, and a
-//! drop visible to the next read).
+//! drop visible to the next read) - and `PR_SET_PDEATHSIG`/`PR_GET_PDEATHSIG`,
+//! whose state the **exit path** reads: the signal is delivered to a child when
+//! the task it named as its parent dies, which is why the claims below include a
+//! real delivery and not only the round-trip. Measured on a current host
+//! (`.workbuddy/probe_pdeathsig.c`): 0 clears, anything up to `_NSIG` is
+//! accepted (`SIGKILL` and `SIGSTOP` included), an out-of-range or negative
+//! value is `EINVAL` with the previous one kept, a null getter pointer is
+//! `EFAULT`, **`fork` clears it** and **`exec` keeps it**.
 //!
 //! # The doors, and why this file has two
 //!
@@ -73,6 +80,26 @@ const NAME_LEN: usize = 16;
 
 /// `prctl(2)` through the raw door, with the option number coming from the
 /// caller's `libc::PR_*` rather than from a constant this file owns.
+/// The descriptor the parent-death handler writes its answer to: stored where a
+/// signal handler can reach it (no lock, no allocation), and set before the fork
+/// whose child will write through it.
+static REPORT_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Write one word to [`REPORT_FD`] - the only thing a signal handler here does,
+/// which is why it is a raw `write`.
+fn say_word(word: &[u8]) {
+    let fd = REPORT_FD.load(std::sync::atomic::Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe { libc::write(fd, word.as_ptr().cast(), word.len()) };
+    }
+}
+
+/// The parent-death handler: report and return, so the claim reads the report
+/// rather than the task's death.
+extern "C" fn on_parent_death(_sig: libc::c_int) {
+    say_word(b"sig\n");
+}
+
 fn prctl(op: libc::c_int, a2: usize, a3: usize, a4: usize, a5: usize) -> Result<isize, Errno> {
     let ret = unsafe { libc::syscall(libc::SYS_prctl, op, a2, a3, a4, a5) };
     if ret == -1 {
@@ -351,6 +378,159 @@ fn main() {
         prctl(libc::PR_CAPBSET_DROP, (CAP_LAST_CAP + 1) as usize, 0, 0, 0),
         Errno::INVAL,
     );
+
+    // === the parent-death signal ============================================
+    // A child that asks for one is sent it when the task it names as its parent
+    // dies. The delivery is the claim that matters - a kernel that only stored
+    // the number would pass the round-trip and do nothing - and it is observed
+    // through a **handler**, not through the wait status: the orphan is
+    // reparented to init when its parent dies, so this process is no longer the
+    // one that reaps it.
+    let mut value = 0xffff_ffffu32;
+    err_is(
+        &mut r,
+        "PR_GET_PDEATHSIG with a null pointer is EFAULT",
+        prctl(libc::PR_GET_PDEATHSIG, 0, 0, 0, 0),
+        Errno::FAULT,
+    );
+    ok_is(
+        &mut r,
+        "PR_SET_PDEATHSIG(SIGUSR1) is accepted",
+        prctl(libc::PR_SET_PDEATHSIG, libc::SIGUSR1 as usize, 0, 0, 0),
+        0,
+    );
+    // The getter answers **0** and writes the signal through the pointer -
+    // measured; an implementation that returned the number itself would fail
+    // this claim and pass the next one.
+    ok_is(
+        &mut r,
+        "PR_GET_PDEATHSIG answers 0 and the value arrives through the pointer",
+        prctl(
+            libc::PR_GET_PDEATHSIG,
+            &mut value as *mut u32 as usize,
+            0,
+            0,
+            0,
+        ),
+        0,
+    );
+    ok_is(
+        &mut r,
+        "the value the getter wrote is the signal",
+        Ok(value as isize),
+        libc::SIGUSR1 as isize,
+    );
+    err_is(
+        &mut r,
+        "a signal number past _NSIG is EINVAL",
+        prctl(libc::PR_SET_PDEATHSIG, 100, 0, 0, 0),
+        Errno::INVAL,
+    );
+    value = 0xffff_ffffu32;
+    let _ = prctl(
+        libc::PR_GET_PDEATHSIG,
+        &mut value as *mut u32 as usize,
+        0,
+        0,
+        0,
+    );
+    ok_is(
+        &mut r,
+        "and a refused set leaves the previous signal in place",
+        Ok(value as isize),
+        libc::SIGUSR1 as isize,
+    );
+    ok_is(
+        &mut r,
+        "PR_SET_PDEATHSIG(0) clears it",
+        prctl(libc::PR_SET_PDEATHSIG, 0, 0, 0, 0),
+        0,
+    );
+    value = 0xffff_ffffu32;
+    let _ = prctl(
+        libc::PR_GET_PDEATHSIG,
+        &mut value as *mut u32 as usize,
+        0,
+        0,
+        0,
+    );
+    ok_is(&mut r, "and the getter reads 0", Ok(value as isize), 0);
+
+    // `fork` clears it, whatever the creator asked for.
+    ok_is(
+        &mut r,
+        "the creator asks for one before forking",
+        prctl(libc::PR_SET_PDEATHSIG, libc::SIGUSR2 as usize, 0, 0, 0),
+        0,
+    );
+    let forked = unsafe { libc::fork() };
+    if forked == 0 {
+        let mut v = 0xffff_ffffu32;
+        let rc = prctl(libc::PR_GET_PDEATHSIG, &mut v as *mut u32 as usize, 0, 0, 0);
+        unsafe { libc::_exit(if rc.is_ok() && v == 0 { 0 } else { 1 }) };
+    }
+    let mut status = 0;
+    unsafe { libc::waitpid(forked, &mut status, 0) };
+    r.check(
+        "a fork child starts with no parent-death signal",
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+    );
+    let _ = prctl(libc::PR_SET_PDEATHSIG, 0, 0, 0, 0);
+
+    // ...and the delivery itself. The middle process forks the victim, **waits
+    // for it to be armed** and only then exits - a pipe is the ordering, not a
+    // sleep: without it the middle can die before the victim has asked, and the
+    // claim would read the race rather than the kernel. The victim reports
+    // through a handler, so what it dies of never has to be guessed at.
+    let armed = rustix::pipe::pipe();
+    let say = rustix::pipe::pipe();
+    match (armed, say) {
+        (Ok((armed_r, armed_w)), Ok((tail, head))) => {
+            use std::os::fd::AsRawFd;
+            REPORT_FD.store(head.as_raw_fd(), std::sync::atomic::Ordering::Relaxed);
+            let middle = unsafe { libc::fork() };
+            if middle == 0 {
+                let victim = unsafe { libc::fork() };
+                if victim == 0 {
+                    unsafe {
+                        drop(armed_r);
+                        libc::signal(
+                            libc::SIGUSR1,
+                            on_parent_death as *const () as libc::sighandler_t,
+                        );
+                        let _ = prctl(libc::PR_SET_PDEATHSIG, libc::SIGUSR1 as usize, 0, 0, 0);
+                        // "Armed": the parent may now die.
+                        let _ = libc::write(armed_w.as_raw_fd(), b"a".as_ptr().cast(), 1);
+                        drop(armed_w);
+                        // Bounded: a kernel that never delivers lets this elapse
+                        // and the claim reads "none" rather than hanging the gate.
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        say_word(b"none\n");
+                        libc::_exit(0);
+                    }
+                }
+                unsafe {
+                    drop(armed_w);
+                    drop(head);
+                    let mut one = [0u8; 1];
+                    let _ = rustix::io::read(&armed_r, &mut one);
+                    libc::_exit(0);
+                }
+            }
+            drop(armed_w);
+            drop(armed_r);
+            drop(head);
+            let mut said = [0u8; 8];
+            let n = rustix::io::read(&tail, &mut said).unwrap_or(0);
+            r.check(
+                "a child whose parent died is sent the signal it asked for",
+                said[..n].starts_with(b"sig"),
+            );
+            let mut status = 0;
+            unsafe { libc::waitpid(middle, &mut status, 0) };
+        }
+        _ => r.check("the parent-death report pipes are made", false),
+    }
 
     // === an option the handler does not model ================================
     // Refused the way Linux's `prctl` default arm answers a number it does not

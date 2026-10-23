@@ -706,6 +706,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             // And the machine's own IPC namespace: pid 1's tables are the
             // machine's until it unshares.
             ipc_ns: None,
+            pdeathsig: 0,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -895,6 +896,9 @@ pub fn try_spawn_user(
             // is started with are the tables it was started from, which is the
             // rule `fork` follows too.
             ipc_ns: t.task(parent).ipc_ns.clone(),
+            // `execve` keeps the setting - measured - so the new image starts
+            // with whatever the process had asked for.
+            pdeathsig: t.task(parent).pdeathsig,
             oom_score_adj: t.task(parent).oom_score_adj,
             oom_score_adj_min: t.task(parent).oom_score_adj_min,
             nice: t.task(parent).nice,
