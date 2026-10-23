@@ -80,6 +80,7 @@ const SETVAL: i32 = 16;
 const SETALL: i32 = 17;
 const SEM_STAT: i32 = 18;
 const SEM_INFO: i32 = 19;
+const SEM_STAT_ANY: i32 = 20;
 
 const IPC_PRIVATE: i32 = 0;
 const IPC_CREAT: i32 = 0o1000;
@@ -524,6 +525,58 @@ fn main() {
         }
         found.is_some_and(|(id, _)| stat(id).is_some())
     });
+
+    // `SEM_STAT_ANY` is the monitoring spelling: it takes the table *slot* and
+    // asks no read permission, which is the whole reason it exists (`ipcs` must
+    // list a set nobody may read). Measured on a host first, in the machine's
+    // own IPC namespace - where this caller holds no `CAP_IPC_OWNER`, which is
+    // the capability that would let the plain spelling answer anyway - and asked
+    // here from a child that has dropped to nobody, so the claim reads the same
+    // on a machine whose root holds every capability.
+    let marked = semget(key(9), 1, IPC_CREAT | 0o600);
+    r.check("a set for the monitoring spelling", marked >= 0);
+    if marked >= 0 {
+        let mut ds = Ds::zeroed();
+        r.check(
+            "its mode is set to 0000",
+            semctl_raw(marked, 0, IPC_STAT, ds.ptr()) == 0 && {
+                ds.bytes[SEM_PERM_MODE..SEM_PERM_MODE + 4].copy_from_slice(&0u32.to_ne_bytes());
+                semctl_raw(marked, 0, IPC_SET, ds.ptr()) == 0
+            },
+        );
+        let slot = marked % 32768;
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe {
+                libc::setgid(65534);
+                libc::setuid(65534);
+            }
+            let mut d = Ds::zeroed();
+            let mut code = 0i32;
+            if semctl_raw(marked, 0, SEM_STAT, d.ptr()) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
+            {
+                code |= 1;
+            }
+            if semctl_raw(slot, 0, SEM_STAT_ANY, d.ptr()) == marked as i64 {
+                code |= 2;
+            }
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            0x7f
+        };
+        r.check("SEM_STAT on a set nobody may read is EACCES", code & 1 != 0);
+        r.check(
+            "SEM_STAT_ANY answers the same set from its slot",
+            code & 2 != 0,
+        );
+        semctl_raw(marked, 0, IPC_RMID, 0);
+    }
 
     // --- /proc/sysvipc/sem -------------------------------------------------
     let p = semget(key(4), 2, IPC_CREAT | 0o600);

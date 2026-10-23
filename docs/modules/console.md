@@ -143,7 +143,12 @@ kernel (inference: a grep of `docs/uapi/` finds no `syslog`/`klogctl` row).
 
 Two console gaps are named rather than approximated, in `docs/uapi/`: `console=ttyN` pinning is
 refused, and `/dev/console` has no preferred-console plumbing (`docs/notes/` §7.1c). The serial
-transmit wait is fatal-signal-only, like `wait4` (docs/uapi/ §1.2).
+transmit wait is still **fatal-signal-only** - the last member of the wait family
+`wait4`/`waitid`, `ioctl`'s DRM syncobj waits and the pty read left when they moved
+to `block_until_on_interruptible` (docs/uapi/ §1.2, `docs/notes/` §2.3), and it is
+named rather than half-fixed because the guest's emulated 16550 never fills the
+transmit ring, so no test on this host can make the park happen (§10.6 measured the
+same thing about the wire).
 
 ## Pins
 

@@ -169,7 +169,7 @@ One-glance status of the whole roadmap.
   `t-sysv-shm` pins 61 claims measured on the host first (§6.13, item 101) — and
   **System V semaphores** — `semget`/`semop`/`semtimedop`/`semctl` with waiting,
   `SEM_UNDO` applied at the process's death and split by
-  `unshare(CLONE_SYSVSEM)`, and `/proc/sysvipc/sem`; `t-sysv-sem` pins 70 claims
+  `unshare(CLONE_SYSVSEM)`, and `/proc/sysvipc/sem`; `t-sysv-sem` pins 74 claims
   and seven host tests (§6.14, item 102) — and **System V message queues** -
   `msgget`/`msgsnd`/`msgrcv`/`msgctl` with Linux's FIFO-plus-selection rule
   (`type < 0` takes the *lowest* fitting type, not the front-most), a receive

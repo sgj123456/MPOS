@@ -2570,7 +2570,7 @@ rule applies as it did to the segment table.
 * `semctl`'s `SEM_STAT_ANY` is implemented but not claimed by a test (the pin
   walks `SEM_STAT`).
 
-**Pin**: the new `t-sysv-sem`, 70 claims, plus seven host tests in
+**Pin**: the new `t-sysv-sem`, 74 claims, plus seven host tests in
 `sched::sysv_sem` for the operation arithmetic, the waiter registration and the
 undo fold - the host tests are what caught `IPC_NOWAIT` being asked of the call
 rather than of the operation, and the sign of the undo adjustment, before the

@@ -5538,7 +5538,7 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `CLONE_SYSVSEM` sharing and the exit pass), `src/syscall/linux/posix.rs`
     (`unshare`'s half) and `src/vfs/procfs.rs` (`/proc/sysvipc/sem`).
 
-    **Pin**: the new `t-sysv-sem`, **70 claims**, plus seven host tests in
+    **Pin**: the new `t-sysv-sem`, **74 claims**, plus seven host tests in
     `sched::sysv_sem` that pin the operation arithmetic, the waiter registration
     and the undo fold without a machine.
 
