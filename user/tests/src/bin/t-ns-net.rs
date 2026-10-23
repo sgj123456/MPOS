@@ -780,7 +780,10 @@ fn main() {
                     msg.msg_iov = &mut iov;
                     msg.msg_iovlen = 1;
                     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                    msg.msg_controllen = control.len() as u32;
+                    // `msg_controllen` is `socklen_t` in musl's binding and
+                    // `size_t` in glibc's, so the length crosses in the
+                    // field's own type rather than one spelled here.
+                    msg.msg_controllen = control.len() as _;
                     let rc = unsafe { libc::recvmsg(conn.as_raw_fd(), &mut msg, 0) };
                     if rc >= 0 {
                         trunc = if msg.msg_flags & libc::MSG_CTRUNC != 0 {
@@ -1030,8 +1033,10 @@ fn main() {
                 msg.msg_iov = &mut iov;
                 msg.msg_iovlen = 1;
                 msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                // musl's `msghdr` keeps the control length in a `socklen_t`.
-                msg.msg_controllen = control.len() as u32;
+                // `msg_controllen` is `socklen_t` in musl's binding and
+                // `size_t` in glibc's, so the length crosses in the field's
+                // own type rather than one spelled here.
+                msg.msg_controllen = control.len() as _;
                 let rc = unsafe { libc::sendmsg(conn.as_raw_fd(), &msg, 0) };
                 handover = Some(rc == 1);
             }

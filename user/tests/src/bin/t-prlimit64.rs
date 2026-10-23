@@ -59,6 +59,13 @@ fn last_errno() -> i32 {
 }
 
 /// `prlimit64(pid 0, resource, new, old)` - the calling process's own table.
+///
+/// The resource word is `c_int` here and the callers cast `libc`'s constants
+/// into it: glibc's `RLIMIT_*` are `u32` (they arrive through its headers) and
+/// musl's are `c_int`, so a call site that hands the constant over unchanged
+/// compiles on exactly one of the two targets - measured when the host sweep
+/// first built this crate for `x86_64-unknown-linux-gnu`. The number itself is
+/// still `libc`'s either way; only the spelling of its type moves.
 fn prlimit64(resource: i32, new: *const Rlimit64, old: *mut Rlimit64) -> Result<(), Errno> {
     let r = unsafe {
         libc::syscall(
@@ -81,7 +88,11 @@ fn main() {
     let mut r = Report::new();
     let mut rl = Rlimit64 { cur: 0, max: 0 };
 
-    let stack = prlimit64(libc::RLIMIT_STACK, core::ptr::null(), &mut rl);
+    let stack = prlimit64(
+        libc::RLIMIT_STACK as libc::c_int,
+        core::ptr::null(),
+        &mut rl,
+    );
     r.check("querying RLIMIT_STACK succeeds", stack.is_ok());
     // Read out of the struct whether or not the call worked: if it did not, the
     // zeros it was filled with are what these two claims judge.
@@ -90,7 +101,11 @@ fn main() {
 
     // RLIMIT_NOFILE is a number programs compute with, not just sanity-check:
     // the soft limit is pinned to the classic 1024 exactly.
-    match prlimit64(libc::RLIMIT_NOFILE, core::ptr::null(), &mut rl) {
+    match prlimit64(
+        libc::RLIMIT_NOFILE as libc::c_int,
+        core::ptr::null(),
+        &mut rl,
+    ) {
         Ok(()) => {
             r.check("querying RLIMIT_NOFILE succeeds", true);
             r.check("the RLIMIT_NOFILE soft limit is 1024", rl.cur == 1024);
@@ -112,7 +127,11 @@ fn main() {
     // old=NULL suppresses the query: the call is a valid no-op.
     r.check(
         "a query with a null old pointer answers 0 and writes nothing",
-        prlimit64(libc::RLIMIT_STACK, core::ptr::null(), core::ptr::null_mut()) == Ok(()),
+        prlimit64(
+            libc::RLIMIT_STACK as libc::c_int,
+            core::ptr::null(),
+            core::ptr::null_mut(),
+        ) == Ok(()),
     );
 
     r.finish()

@@ -652,7 +652,11 @@ fn main() {
         msg.msg_iov = iov.as_mut_ptr();
         msg.msg_iovlen = 1;
         msg.msg_control = control.as_mut_ptr().cast::<c_void>();
-        msg.msg_controllen = control.len() as libc::socklen_t;
+        // `msg_controllen` is `socklen_t` in musl's binding and `size_t` in
+        // glibc's, so the length crosses in the field's own type rather than
+        // one spelled here - measured when the host sweep first built this
+        // crate for the host target.
+        msg.msg_controllen = control.len() as _;
         let got = unsafe { as_raw(libc::recvmsg(sock.as_raw_fd(), &mut msg, 0) as isize) };
         r.check(
             &format!("and recvmsg on the same socket reads it too (got {got}, want > 0)"),

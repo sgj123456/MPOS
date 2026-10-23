@@ -54,12 +54,18 @@ use rustix::time::{ClockId, Timespec};
 
 /// `ptrace(request, pid, ..)` through `libc`, reduced to what the claims
 /// here need: the syscall's own answer, or the errno it failed with.
+///
+/// The request word is `c_int` here and the callers cast `libc`'s constants
+/// into it, because glibc's `PTRACE_*` are `u32` (they arrive through its
+/// headers) and musl's are `c_int` - one spelling fits exactly one target
+/// otherwise, measured when the host sweep first built this crate for the
+/// host target. The number is `libc`'s either way.
 fn ptrace(request: libc::c_int, pid: libc::pid_t, data: libc::c_long) -> isize {
     // SAFETY: ATTACH/DETACH/SETSIGINFO touch no caller memory, and `data` is
     // a signal number or zero.
     let r = unsafe {
         libc::ptrace(
-            request,
+            request as _,
             pid,
             std::ptr::null::<libc::c_void>(),
             data as *mut libc::c_void,
@@ -102,7 +108,7 @@ fn main() {
     let mut status: libc::c_int = 0;
 
     // The control: a number no task answers to.
-    let control = ptrace(libc::PTRACE_ATTACH, 9999, 0);
+    let control = ptrace(libc::PTRACE_ATTACH as libc::c_int, 9999, 0);
     r.check(
         "attaching to a pid with no task is ESRCH",
         control == -(libc::ESRCH as isize) || refused_host(control),
@@ -128,12 +134,12 @@ fn main() {
         // (Linux's own `ptrace_check_attach` refuses the not-a-stopped-tracee
         // case with ESRCH before it ever copies the struct.) Placed before the
         // ATTACH below, since attaching turns the child into a stopped tracee.
-        let untraced = ptrace(libc::PTRACE_SETSIGINFO, child, 0);
+        let untraced = ptrace(libc::PTRACE_SETSIGINFO as libc::c_int, child, 0);
         r.check(
             "PTRACE_SETSIGINFO on a live but untraced child is ESRCH, not a silent 0",
             untraced == -(libc::ESRCH as isize) || refused_host(untraced),
         );
-        let attached = ptrace(libc::PTRACE_ATTACH, child, 0);
+        let attached = ptrace(libc::PTRACE_ATTACH as libc::c_int, child, 0);
         r.check(
             "attaching to my own child by the pid fork gave me",
             attached == 0 || refused_host(attached),
@@ -144,7 +150,11 @@ fn main() {
         // itself had parked. That is the deadlock this whole section learned
         // about the hard way, and it is the reason `strace` says "detached"
         // rather than leaving every target it touched stopped.
-        let detached = ptrace(libc::PTRACE_DETACH, child, libc::SIGCONT as libc::c_long);
+        let detached = ptrace(
+            libc::PTRACE_DETACH as libc::c_int,
+            child,
+            libc::SIGCONT as libc::c_long,
+        );
         r.check(
             "detaching resumes what it attached",
             detached == 0 || refused_host(detached),
@@ -190,13 +200,13 @@ fn main() {
     let target = read_pid_file();
     r.check("the orphan to attach to reported itself", target > 0);
     if target > 0 {
-        let attached = ptrace(libc::PTRACE_ATTACH, target as libc::pid_t, 0);
+        let attached = ptrace(libc::PTRACE_ATTACH as libc::c_int, target as libc::pid_t, 0);
         r.check(
             "attaching to a process that is not ours works - that is strace -p",
             attached == 0 || refused_host(attached),
         );
         let detached = ptrace(
-            libc::PTRACE_DETACH,
+            libc::PTRACE_DETACH as libc::c_int,
             target as libc::pid_t,
             libc::SIGCONT as libc::c_long,
         );
@@ -272,12 +282,12 @@ fn main() {
         }
         r.check("the user's SIGSTOP stopped it and was reported", saw_stop);
         // That stop is the *user's* half; now the trace, and give it back.
-        let attached = ptrace(libc::PTRACE_ATTACH, stopped, 0);
+        let attached = ptrace(libc::PTRACE_ATTACH as libc::c_int, stopped, 0);
         r.check(
             "attaching to a process the user stopped",
             attached == 0 || refused_host(attached),
         );
-        let detached = ptrace(libc::PTRACE_DETACH, stopped, 0);
+        let detached = ptrace(libc::PTRACE_DETACH as libc::c_int, stopped, 0);
         r.check("and detaching it", detached == 0 || refused_host(detached));
         // One and a half seconds of polling, longer than the child's whole sleep:
         // a detach that had handed it back running would be collected in it, and

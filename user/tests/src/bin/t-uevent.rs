@@ -143,7 +143,11 @@ fn receive_from(
     msg.msg_iov = iov.as_mut_ptr();
     msg.msg_iovlen = 1;
     msg.msg_control = ctl.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = ctl.len() as u32;
+    // `msg_controllen` is `socklen_t` in musl's binding and `size_t` in
+    // glibc's, so the length crosses in the field's own type rather than one
+    // spelled here - measured when the host sweep first built this crate for
+    // the host target.
+    msg.msg_controllen = ctl.len() as _;
     let got = fix(unsafe { libc::recvmsg(fd, &mut msg, flags) } as libc::c_long);
     (
         got,

@@ -330,7 +330,12 @@ fn lo_up() {
     req[..2].copy_from_slice(b"lo");
     let flags: i16 = (libc::IFF_UP | libc::IFF_RUNNING) as i16;
     req[16..18].copy_from_slice(&flags.to_ne_bytes());
-    const SIOCSIFFLAGS: libc::c_int = 0x8914;
+    // `libc::Ioctl` because the request word's type is the binding's, not the
+    // ABI's: musl's `ioctl` binding takes a `c_int` and glibc's a `c_ulong`,
+    // so a constant typed by hand fits exactly one of the two targets -
+    // measured when the host sweep first built this crate for
+    // `x86_64-unknown-linux-gnu`. The number is SIOCSIFFLAGS either way.
+    const SIOCSIFFLAGS: libc::Ioctl = 0x8914;
     // SAFETY: `req` is a 40-byte buffer holding an ifreq; the ioctl reads the
     // name and the flags word out of it.
     unsafe {
