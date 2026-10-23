@@ -192,6 +192,15 @@ pub const SYSINFO: u64 = 99;
 pub const UTIMENSAT: u64 = 280;
 pub const UTIMES: u64 = 235;
 pub const MADVISE: u64 = 28;
+// The System V shared-memory family. The three families' numbers are adjacent
+// on x86_64 (`shmget` 29 through `shmctl` 31, with `shmdt` separated at 67
+// because `obsolete` calls were reused in between) and contiguous on the
+// asm-generic ABI (194 through 197) - the split is why the two tables are whole
+// files rather than one list.
+pub const SHMGET: u64 = 29;
+pub const SHMAT: u64 = 30;
+pub const SHMCTL: u64 = 31;
+pub const SHMDT: u64 = 67;
 pub const PPOLL: u64 = 271;
 pub const SCHED_YIELD: u64 = 24; // sched_yield(2)
 pub const CLEANUP_AFTER_KTHREAD: u64 = 999;

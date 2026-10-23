@@ -5,7 +5,12 @@
 //! heap needs no setup of its own, it takes frames on demand.
 
 pub mod elf;
+/// The number a System V IPC object is known by: slot plus generation, shared
+/// by the three families because `ipcs` and a stale id both read it.
+pub mod ipc_id;
 pub mod pframe;
+/// System V shared memory: the segment table and the frames behind it.
+pub mod sysv_shm;
 pub mod vm;
 pub mod vma;
 

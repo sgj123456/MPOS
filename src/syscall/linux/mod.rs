@@ -528,6 +528,12 @@ pub unsafe fn dispatch(
         nr::MQ_TIMEDRECEIVE => ipc::handle_mq_timedreceive(args, from_user),
         nr::MQ_NOTIFY => ipc::handle_mq_notify(args, from_user),
         nr::MQ_GETSETATTR => ipc::handle_mq_getsetattr(args, from_user),
+        // --- System V shared memory: the first of the two object families the
+        // IPC namespace was waiting on ---
+        nr::SHMGET => ipc::handle_shmget(args, from_user),
+        nr::SHMAT => ipc::handle_shmat(args, from_user),
+        nr::SHMDT => ipc::handle_shmdt(args, from_user),
+        nr::SHMCTL => ipc::handle_shmctl(args, from_user),
         // --- the POSIX completion set ---
         //
         // The descriptor-backed timer and the interest-list multiplexer:

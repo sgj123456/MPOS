@@ -53,6 +53,20 @@ pub trait MappedObject {
     /// readers of that fact agreeing.
     fn identity(&self) -> ((u32, u32), u64);
 
+    /// Which System V shared-memory segment this object is, for an object that
+    /// is one.
+    ///
+    /// `shm_nattch` is not a field on a segment: it is how many address spaces
+    /// map it, and a `fork` copies a mapping (Linux counts the child as an
+    /// attachment, measured). So the answer has to be folded out of the VMA
+    /// tables, and the fold needs to recognise a segment's object among every
+    /// other frame-backed one. A `MappedObject` cannot be downcast, so the
+    /// object says which segment it is instead - `None` for a memfd, a dma-buf,
+    /// the framebuffer or a dumb buffer.
+    fn shm_id(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether `other` is this same object.
     ///
     /// Defaulted to identity, which is the strongest comparison a trait object

@@ -59,6 +59,8 @@ already used are unchanged.
 | `src/mm/vm.rs` | An 18-line re-export of the `mpos-vm` leaf: `Mapping`, `MapFlags`, `PageTaken`, `KernelSections`, `PAGE_SIZE`/`PAGE_SHIFT`, `align_up`/`align_down`, `kernel_mappings` | yes (the leaf is a `crates/` leaf) |
 | `src/mm/vma.rs` | `Vma`, `VmaKind`, `VmaTable`, `MappedObject`, `MappedRange`/`merge_ranges`: the sorted-`Vec` address-space descriptor table and its map/unmap/protect/split/merge/gap arithmetic | yes — `mod tests` |
 | `src/mm/elf.rs` | `Image`/`Segment`, `parse`, `extract_rela`, `USER_LIMIT` and `MMAP_BASE` (per machine): the ELF64 loader's decisions — what is accepted, where each piece lands, what the caller must still place | yes — `mod tests` |
+| `src/mm/sysv_shm.rs` | System V shared memory: the segment table (slot + generation numbers), `Segment` as a `MappedObject` whose frames arrive on first touch, the `IPC_RMID`-marks lifetime, and this kernel's `SHMMAX`/`SHMALL`/`SHMMNI` bounds | the arithmetic yes (`mod tests`); the frames and the `MappedObject` impl are `#[cfg(target_os = "none")]` |
+| `src/mm/ipc_id.rs` | The number a System V IPC object is known by: `build`/`decode`/`next_generation` over `slot + generation * 32768`, shared by the three families because a retained number must not name the slot's next occupant | yes — `mod tests` |
 | `crates/vm/src/lib.rs` | The actual mapping-plan vocabulary and page arithmetic, and the tests that pin the plan (they moved out with the vocabulary rather than staying to test a re-export) | yes |
 
 ## Contracts

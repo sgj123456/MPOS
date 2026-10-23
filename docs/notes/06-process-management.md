@@ -2370,3 +2370,105 @@ objects` remain), the `/dev/mqueue` view does not exist, and a blocked
 `mq_timedsend`/`mq_timedreceive` is pinned only by the timeout side - the
 blocking rendezvous (a receiver waking a full-queue sender) is implemented and
 unclaimed here because no program pins it yet.
+
+### 6.13 System V shared memory — **LANDED** (2026-10-23, SysV's first family)
+
+`CLONE_NEWIPC`'s reason has now been narrowed twice. It was "SysV IPC objects and
+POSIX message queues" (§6.3); §6.12 took the queues; this takes the first of the
+three System V families - `shmget`, `shmat`, `shmdt`, `shmctl`, plus the
+`/proc/sysvipc/shm` row `ipcs` renders. What is left of the namespace's reason is
+the semaphore and message-queue families, and those wait on nothing else.
+
+**The object, and where it lives.** A segment is not a file and not an
+address-space range: it is a frame-backed object a number names, which any
+process holding the number may attach, and whose pages every attachment aliases.
+So it is `mm::sysv_shm` - the segment table and the `MappedObject` implementation
+the fault path already asks for - and not `vfs`: nothing opens it by path,
+`mmap` is not its door, and the two readers that do name it (`shmat`'s mapping and
+`/proc/<pid>/maps`) both speak `MappedObject`. The id is Linux's arithmetic,
+factored into `mm::ipc_id` because the other two families will use it verbatim:
+`id = slot + generation * 32768`. Measured on a current host
+(`.workbuddy/probe_shm_ids.c`): a fresh boot's first segment is `0` with
+`shm_perm.seq` 0, and after that slot has been removed and made again the number
+is `32768` with `seq` 1 - so the generation belongs to the *slot*, not to the
+namespace, which is what makes a retained number answer `EINVAL` instead of
+naming a stranger.
+
+**Measured whole on a current host first** (Linux 7.2.11,
+`.workbuddy/probe_sysv_shm.c`, `probe_shm_perm.c`, `probe_shm_ids.c`,
+`probe_shm_rmid.c`, `probe_shm_order.c`), because almost every rule is a choice
+between two plausible answers:
+
+* **the size is what was asked for**: `shm_segsz` reports 100 for a 100-byte
+  segment, and the mapping is one whole page - the two numbers differ on purpose;
+* **no umask**: `shmget(..., 0666)` under `umask 0777` stores `0666`;
+* **the errno order on an existing key** is `EEXIST` (from `IPC_CREAT|IPC_EXCL`),
+  then `EINVAL` (a size larger than the segment; a smaller one is accepted), then
+  `EACCES` (only when `shmflg` names permission bits at all - `shmget(key, 0, 0)`
+  is answered with the id, no check). Measured by refusing all three against one
+  `0600` segment owned by another user;
+* **attach placement**: `shmat(NULL)` returns a page-aligned address and
+  successive ones grow **down** a page at a time; an explicit address is taken
+  exactly when free, a **busy one is `EINVAL` and not relocated** (unlike a plain
+  `mmap` hint), a misaligned one is `EINVAL` unless `SHM_RND` rounds it down, and
+  `SHM_REMAP` replaces what is there. Two attaches of one segment alias pages;
+  `SHM_RDONLY` gives a mapping a write `SIGSEGV`s on;
+* **`shm_nattch` counts address spaces, not the segment's own bookkeeping**: a
+  `fork` copies the mapping and the child reads one higher, and its exit takes
+  that back. That is why there is no counter field on the object at all: the
+  truth is a fold over every VMA table, and `sched::shm_attachment_count` is
+  that fold (counting *runs*, so a split mapping is still one attachment);
+* **`IPC_RMID` marks, it does not remove**: while one attachment lives the number
+  keeps answering `IPC_STAT`, a further `shmat` succeeds, and the key reads back
+  as `IPC_PRIVATE` - and a `shmget` on that key makes a **different** segment.
+  Only after the last detach is the number `EINVAL`;
+* **three refusals, three errnos**: `shmat` of another user's `0600` segment is
+  `EACCES` (the triads, with `CAP_IPC_OWNER` behind them), `IPC_STAT` is `EACCES`
+  (the same check), and `IPC_SET`/`IPC_RMID` are `EPERM` (the *creator* or
+  `CAP_SYS_ADMIN` - `ipcctl_obtain_check`). `IPC_SET` moves uid/gid/mode and
+  leaves the creator alone; the mode update preserves the bits above the triads;
+* **`SHM_LOCK`** sets a mode bit read back as `02600`, clears on `SHM_UNLOCK`,
+  and on this host asks no capability at all - an unprivileged caller locks a
+  segment it does not own (`.workbuddy/probe_shm_lock.c`, both as uid 1000 and as
+  root). The bit's value is the measurement's (`0o2000`), not an older header's;
+* **the table-wide reports**: `IPC_INFO`/`SHM_INFO` return the highest slot index
+  (the number `ipcs` walks), `SHM_STAT(index)` answers the segment's id and
+  refuses one the caller may not read with `EACCES`, and `/proc/sysvipc/shm`
+  prints the header and column widths measured off the host - the key column is
+  **decimal**, 10 wide, which is what a reader that splits the line counts.
+
+**What this kernel's numbers are, and why they are its own.** `SHMMAX` is 64 MiB,
+`SHMALL` 32768 pages (128 MiB) and `SHMMNI` 4096; `IPC_INFO` reports exactly
+those. The page allowance is charged at **creation** from the size asked for - as
+Linux's `shm_tot` is - and the frames themselves arrive on the first touch, so a
+process cannot promise itself more memory than exists by creating many large
+segments and touching one page of each. A limit is not optional while the
+allocator panics on failure (§8.0), and a smaller `SHMMAX` is a *configuration*
+difference (containers routinely lower it) rather than a shape difference; what
+it costs is that a request Linux would answer `ENOMEM` is `EINVAL` here, and that
+is named below rather than hidden.
+
+**Named, not claimed**:
+
+* **the other two SysV families** - semaphores (`semget`/`semop`/`semtimedop`/
+  `semctl`) and message queues (`msgget`/`msgsnd`/`msgrcv`/`msgctl`) - are still
+  `ENOSYS`, so `CLONE_NEWIPC` is still refused and its reason is now those two;
+* **the table is the machine's**, not a namespace's: `CLONE_NEWIPC` would give a
+  child its own copy, and until that kind exists there is one table to name;
+* **`SHM_LOCK` sets a bit and nothing else** - there is no swap here for a lock to
+  hold a page out of, so the honest content of the call is the mode word;
+* **`shm_rss`** is the pages that have a frame, not a swapped-out accounting
+  (`shm_swp` is always 0 for the same reason);
+* **`SHMMAX`/`SHMALL` are constants**, not `/proc/sys/kernel/*` tunables, and this
+  kernel's `SHMMAX` is far below Linux's default "the address space".
+
+**Pin**: the new `t-sysv-shm`, 61 claims, `libc` for the family (`rustix` binds no
+System V IPC call) and the three `shmctl` records spelled as `#[repr(C)]`
+structs because the layout *is* the ABI - the asm-generic one on both machines,
+with the offsets the host probe printed. It also walks `/proc/sysvipc/shm` and
+the `IPC_INFO`/`SHM_STAT` pair `ipcs` uses.
+
+**Gate**: x86_64 `pass=202 fail=0 (214 built)`, `mpos-kunit 32 passed, 0 failed`,
+exit 0. The second machine compiles the change (kernel release + clippy, and the
+pin builds for it); its sweep could not boot on this host (no DRM render node), so
+no aarch64 figure is claimed.

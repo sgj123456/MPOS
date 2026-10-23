@@ -1,10 +1,14 @@
-//! The POSIX message-queue family: `mq_open`, `mq_unlink`, `mq_timedsend`,
-//! `mq_timedreceive`, `mq_notify`, `mq_getsetattr`.
+//! The IPC families: the six POSIX message-queue calls (`mq_open`,
+//! `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`,
+//! `mq_getsetattr`) and the four System V shared-memory ones (`shmget`,
+//! `shmat`, `shmdt`, `shmctl`).
 //!
-//! The objects are `vfs::mqueue`'s; this is the validating face, and the split
-//! is the same one every other family here has: the ABI layer owns the argument
-//! order, the errno vocabulary and the descriptor table, and the layer below
-//! owns what a queue is.
+//! They share a module because a caller treats them as one namespace's contents
+//! - `CLONE_NEWIPC` isolates both - and because the shape of the file is the
+//! same twice: the objects live below (`vfs::mqueue`, `mm::sysv_shm`), and this
+//! is the validating face. The split every other family here has holds: the ABI
+//! layer owns the argument order, the errno vocabulary and the descriptor table,
+//! and the layer below owns what a queue or a segment *is*.
 //!
 //! The contract is Linux's, measured on a current host before any of it was
 //! written (Linux 7.2.11, `.workbuddy/probe_mqueue{,2}.c`; the evidence and the
@@ -521,4 +525,463 @@ pub fn handle_mq_getsetattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         file.set_status(status);
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// System V shared memory: `shmget`, `shmat`, `shmdt`, `shmctl`
+// ---------------------------------------------------------------------------
+//
+// The objects are `mm::sysv_shm`'s; this is the validating face, the same split
+// the message queues above have. Every rule below was measured on a current host
+// first (`docs/notes/` §6.13, probes under `.workbuddy/`):
+//
+// * `shmget`'s mode is the low nine bits of `shmflg` and **no umask** is applied
+//   - a `0666` request under `umask 0777` stores `0666` (measured);
+// * the errno order on an existing key is Linux's own: `IPC_CREAT|IPC_EXCL` is
+//   `EEXIST`, a size larger than the segment is `EINVAL`, and only then does a
+//   request that names permission bits get its `EACCES` - measured with all
+//   three refused against one `0600` segment owned by another user;
+// * an existing key with **no** permission bits in `shmflg` is answered without
+//   any check (`shmget(key, 0, 0)` returns the id), which is how a caller finds
+//   out whether a name exists;
+// * `shmat` takes an explicit address only if it is free and a busy one is
+//   `EINVAL` rather than relocated; `SHM_RND` rounds down to the page, `SHM_REMAP`
+//   replaces what is there, and a misaligned address without `SHM_RND` is
+//   `EINVAL`;
+// * `shmdt` names an *attachment*, so an address that is not the start of one is
+//   `EINVAL`, and so is a second detach of the same address;
+// * `IPC_RMID` marks a segment rather than removing it: while it has an
+//   attachment its number keeps answering `IPC_STAT` and a further `shmat`, a
+//   `shmget` on its old key makes a *new* segment, its key reads back as
+//   `IPC_PRIVATE`, and only after the last detach does the number become
+//   `EINVAL`;
+// * `IPC_STAT` on another user's segment is `EACCES`, while `IPC_SET` and
+//   `IPC_RMID` are `EPERM` - two different checks with two different answers;
+// * `SHM_LOCK` sets a mode bit (`02600` read back) with no capability asked on
+//   this host, and `IPC_STAT` reports the size **asked for** rather than the
+//   page-rounded mapping length.
+
+use crate::mm::elf::USER_LIMIT;
+use crate::mm::pframe::PAGE_SIZE;
+use crate::mm::sysv_shm::{self, MODE_MASK, SHMALL, SHMMAX, SHMMNI, Segment, ShmError};
+
+/// `ipc.h`'s creation bits.
+const IPC_CREAT: u32 = 0o1000;
+const IPC_EXCL: u32 = 0o2000;
+
+/// `shm.h`'s attach bits. `SHM_NORESERVE` shares its value with `SHM_RDONLY`:
+/// they belong to different calls' alphabets, which is exactly why each is named
+/// where it is used rather than by one shared constant.
+const SHM_RDONLY: u32 = 0o10000;
+const SHM_RND: u32 = 0o20000;
+const SHM_REMAP: u32 = 0o40000;
+const SHM_EXEC: u32 = 0o100000;
+/// `shm.h`'s creation bits.
+const SHM_HUGETLB: u32 = 0o4000;
+const SHM_NORESERVE: u32 = 0o10000;
+
+/// `shmctl`'s commands, from `linux/ipc.h` and `linux/shm.h`.
+const IPC_RMID: usize = 0;
+const IPC_SET: usize = 1;
+const IPC_STAT: usize = 2;
+const IPC_INFO: usize = 3;
+const SHM_LOCK: usize = 11;
+const SHM_UNLOCK: usize = 12;
+const SHM_STAT: usize = 13;
+const SHM_INFO: usize = 14;
+const SHM_STAT_ANY: usize = 15;
+
+/// `struct shmid64_ds`'s layout, measured on the host: 112 bytes, with the perm
+/// record's fields at 0/4/8/12/16/20 and its `seq` at 24, the size at 48, the
+/// three clocks at 56/64/72, the two pids at 80/84 and the attach count at 88.
+/// Both machines use the asm-generic layout, so this is one table, not one per
+/// port.
+const SHM_DS_BYTES: usize = 112;
+const SHM_SEGSZ: usize = 48;
+const SHM_ATIME: usize = 56;
+const SHM_DTIME: usize = 64;
+const SHM_CTIME: usize = 72;
+const SHM_CPID: usize = 80;
+const SHM_LPID: usize = 84;
+const SHM_NATTCH: usize = 88;
+const SHM_PERM_UID: usize = 4;
+const SHM_PERM_GID: usize = 8;
+const SHM_PERM_CUID: usize = 12;
+const SHM_PERM_CGID: usize = 16;
+const SHM_PERM_MODE: usize = 20;
+const SHM_PERM_SEQ: usize = 24;
+
+/// `struct shminfo64`: five `unsigned long`s and four reserved words.
+const SHMINFO_BYTES: usize = 72;
+/// `struct shm_info`: `int used_ids` then five `unsigned long`s - the int padded
+/// out to the first long's alignment, 48 bytes in all.
+const SHM_INFO_BYTES: usize = 48;
+
+/// `SHMMIN`, the smallest size a segment may be made with.
+const SHMMIN: usize = 1;
+
+fn err_of_shm(e: ShmError) -> isize {
+    match e {
+        ShmError::NoEntry => err::ENOENT,
+        ShmError::Exists => err::EEXIST,
+        ShmError::BadSize | ShmError::TooSmall => err::EINVAL,
+        ShmError::Full => err::ENOSPC,
+    }
+}
+
+/// The epoch seconds a segment's clocks are stamped with.
+fn now_secs() -> i64 {
+    (crate::hal::boot_epoch() + crate::hal::ticks() / crate::hal::TICK_HZ as u64) as i64
+}
+
+/// The permission bits an `shmflg` asks for, folded into one triad the way
+/// Linux's `ipcperms` folds its argument: whichever of the three triads the
+/// caller put a bit in, the question is the same three bits of access.
+fn asked_permissions(flags: u32) -> u32 {
+    let mode = flags & MODE_MASK;
+    ((mode >> 6) | (mode >> 3) | mode) & 0o7
+}
+
+/// Whether the caller's identity is granted `want` (`4` read, `2` write) by a
+/// mode word.
+fn triad_grants(mode: u32, owner: (u32, u32), want: u32) -> bool {
+    let (uid, gid) = crate::sched::current_owner();
+    let granted = if uid == owner.0 {
+        (mode >> 6) & 0o7
+    } else if gid == owner.1 || crate::sched::current_groups().contains(&owner.1) {
+        (mode >> 3) & 0o7
+    } else {
+        mode & 0o7
+    };
+    granted & want == want
+}
+
+/// Linux's `ipcperms`: the triads, and `CAP_IPC_OWNER` behind them.
+fn ipc_permitted(segment: &Segment, want: u32) -> bool {
+    let perm = segment.perm();
+    triad_grants(perm.mode, (perm.uid, perm.gid), want)
+        || crate::sched::ns_capable_of(&crate::sched::current_user_ns(), crate::cred::CAP_IPC_OWNER)
+}
+
+/// Linux's `ipcctl_obtain_check`: who may `IPC_SET` or `IPC_RMID` a segment.
+///
+/// The **creator**, not the current owner - which is why an `IPC_SET` that hands
+/// the uid to somebody else does not hand the power to change it again - or a
+/// caller with `CAP_SYS_ADMIN`. A refusal is `EPERM`, measured, while the
+/// read-shaped `IPC_STAT` refuses through `ipcperms` with `EACCES`.
+fn may_control(segment: &Segment) -> bool {
+    let perm = segment.perm();
+    crate::sched::current_owner().0 == perm.cuid
+        || crate::sched::ns_capable_of(&crate::sched::current_user_ns(), crate::cred::CAP_SYS_ADMIN)
+}
+
+/// Drop every destroyed segment whose last attachment has gone.
+///
+/// The attachment count is `sched`'s answer and the reap is `mm`'s, so the sweep
+/// lives here - the layer above both. It runs after every operation that could
+/// have been the last detach, which is what keeps a number from outliving the
+/// segment behind it.
+fn reap_dead() {
+    for segment in sysv_shm::destroyed() {
+        let attachments = crate::sched::shm_attachment_count(segment.id());
+        sysv_shm::reap(&segment, attachments);
+    }
+}
+
+/// Write one `shmid64_ds`. The caller has validated the range.
+fn write_shmid_ds(at: usize, segment: &Segment, attachments: usize) {
+    let perm = segment.perm();
+    let times = segment.times();
+    // The reserved words must read as zero rather than as whatever was in the
+    // caller's buffer: a struct fill is a complete answer.
+    unsafe { core::ptr::write_bytes(at as *mut u8, 0, SHM_DS_BYTES) };
+    let put32 = |off: usize, v: u32| unsafe { ((at + off) as *mut u32).write_unaligned(v) };
+    let put64 = |off: usize, v: u64| unsafe { ((at + off) as *mut u64).write_unaligned(v) };
+    put32(0, perm.key as u32);
+    put32(SHM_PERM_UID, perm.uid);
+    put32(SHM_PERM_GID, perm.gid);
+    put32(SHM_PERM_CUID, perm.cuid);
+    put32(SHM_PERM_CGID, perm.cgid);
+    put32(SHM_PERM_MODE, perm.mode);
+    unsafe { ((at + SHM_PERM_SEQ) as *mut u16).write_unaligned(perm.seq) };
+    put64(SHM_SEGSZ, perm.size as u64);
+    put64(SHM_ATIME, times.atime as u64);
+    put64(SHM_DTIME, times.dtime as u64);
+    put64(SHM_CTIME, times.ctime as u64);
+    put32(SHM_CPID, perm.cpid);
+    put32(SHM_LPID, times.lpid);
+    put64(SHM_NATTCH, attachments as u64);
+}
+
+/// `shmget(key, size, shmflg)`.
+pub fn handle_shmget(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
+    let key = args[0] as i32;
+    let size = args[1];
+    let flags = args[2] as u32;
+    let me = crate::sched::current_owner();
+
+    // `SHM_HUGETLB` asks for a huge-page pool this kernel does not have. Linux's
+    // two answers are measured and separate: a caller without `CAP_IPC_LOCK` is
+    // `EPERM`, and one holding it is `ENOMEM` because the pool is empty.
+    if flags & SHM_HUGETLB != 0 {
+        let capable = crate::sched::ns_capable_of(
+            &crate::sched::current_user_ns(),
+            crate::cred::CAP_IPC_LOCK,
+        );
+        return if capable { err::ENOMEM } else { err::EPERM };
+    }
+    // `SHM_NORESERVE` is accepted and means nothing here: there is no swap for a
+    // reservation to be against, and the segment is the same one either way.
+    let _ = flags & SHM_NORESERVE;
+
+    let new = sysv_shm::New {
+        key,
+        size,
+        mode: flags & MODE_MASK,
+        uid: me.0,
+        gid: me.1,
+        cpid: crate::sched::current_pid_number(),
+        now: now_secs(),
+    };
+    let created = flags & IPC_CREAT != 0;
+    let exclusive = flags & IPC_EXCL != 0;
+
+    match sysv_shm::get_or_create(new, created, exclusive) {
+        Ok((segment, made_now)) => {
+            // The permission question is asked of an **existing** segment only,
+            // and only when the caller named permissions at all - and it comes
+            // after the `EEXIST` and size refusals, which is the measured order.
+            if !made_now
+                && flags & MODE_MASK != 0
+                && !ipc_permitted(&segment, asked_permissions(flags))
+            {
+                return err::EACCES;
+            }
+            reap_dead();
+            segment.id() as isize
+        }
+        Err(e) => err_of_shm(e),
+    }
+}
+
+/// `shmat(shmid, shmaddr, shmflg)`.
+pub fn handle_shmat(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
+    let id = args[0] as i32 as i64;
+    let hint = args[1];
+    let flags = args[2] as u32;
+    let Some(segment) = sysv_shm::lookup(id) else {
+        return err::EINVAL;
+    };
+    let readonly = flags & SHM_RDONLY != 0;
+    if !ipc_permitted(&segment, if readonly { 0o4 } else { 0o6 }) {
+        return err::EACCES;
+    }
+    let len = segment.mapped_len();
+    let remap = flags & SHM_REMAP != 0;
+
+    let base = if hint == 0 {
+        // `SHM_REMAP` with no address names nothing to take over.
+        if remap {
+            return err::EINVAL;
+        }
+        // Linux grows the attachment area **down** from the mmap base, which is
+        // the walk `mmap`'s own placement uses here: a page-aligned run from a
+        // descending cursor. Successive `shmat(NULL)` calls then sit one length
+        // apart, each below the last - measured.
+        let cursor = crate::sched::get_mmap_cursor();
+        match super::proc::free_range(len, cursor) {
+            Some((base, next)) => {
+                crate::sched::set_mmap_cursor(next);
+                base
+            }
+            None => return err::ENOMEM,
+        }
+    } else {
+        // `SHM_RND` rounds down to the page; without it an unaligned address is
+        // `EINVAL` rather than rounded, which is the measured answer and the one
+        // a caller can rely on.
+        let addr = if flags & SHM_RND != 0 {
+            hint & !(PAGE_SIZE - 1)
+        } else if hint.is_multiple_of(PAGE_SIZE) {
+            hint
+        } else {
+            return err::EINVAL;
+        };
+        if !addr.checked_add(len).is_some_and(|end| end <= USER_LIMIT) {
+            return err::EINVAL;
+        }
+        if remap {
+            // Take the range over: whatever describes it goes, which is what
+            // lets a caller replace a mapping at a fixed address.
+            crate::sched::munmap_user(addr, len);
+        } else if !crate::sched::vma_range_free(addr, len) {
+            // A busy address is refused, not relocated: measured, Linux answers
+            // `EINVAL` here where a plain `mmap` hint would move.
+            return err::EINVAL;
+        }
+        addr
+    };
+
+    let mut prot = crate::mm::vm::MapFlags::READ | crate::mm::vm::MapFlags::USER;
+    if !readonly {
+        prot |= crate::mm::vm::MapFlags::WRITE;
+    }
+    if flags & SHM_EXEC != 0 {
+        prot |= crate::mm::vm::MapFlags::EXEC;
+    }
+    // The name a maps line prints. Measured (Linux 7.2.11): a segment's mapping
+    // reads `/SYSV%08x (deleted)`, where the hex is the key - `00000000` for a
+    // private one - and the suffix is there even for a keyed segment, because
+    // what is mapped is an unlinked file in the kernel's own shmem filesystem.
+    let name: alloc::sync::Arc<str> = alloc::sync::Arc::from(alloc::format!(
+        "/SYSV{:08x} (deleted)",
+        segment.perm().key as u32
+    ));
+    let object: alloc::sync::Arc<dyn crate::mm::vma::MappedObject> = segment.clone();
+    crate::sched::map_frames(base, len, prot, object, 0, true, Some(name));
+    segment.touch_attach(crate::sched::current_pid_number(), now_secs());
+    base as isize
+}
+
+/// `shmdt(shmaddr)`.
+pub fn handle_shmdt(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
+    let addr = args[0];
+    // The address must be the *start* of an attachment: Linux checks
+    // `vma->vm_start == addr`, so an offset into a mapping names nothing.
+    let Some((start, _end, id)) = crate::sched::shm_attachment_at(addr) else {
+        return err::EINVAL;
+    };
+    if start != addr {
+        return err::EINVAL;
+    }
+    let Some(segment) = sysv_shm::lookup(id as i64) else {
+        // An attachment whose segment has no table entry cannot happen while the
+        // attachment exists - the entry is what keeps it alive - so this is a
+        // table invariant, not a caller's mistake.
+        return err::EINVAL;
+    };
+    crate::sched::munmap_user(addr, segment.mapped_len());
+    segment.touch_detach(crate::sched::current_pid_number(), now_secs());
+    reap_dead();
+    0
+}
+
+/// `shmctl(shmid, cmd, buf)`.
+pub fn handle_shmctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let id = args[0] as i32 as i64;
+    let cmd = args[1];
+    let buf = args[2];
+
+    match cmd {
+        // The two table-wide reports `ipcs` opens with: `buf` is a `shminfo64`
+        // or a `shm_info`, and the return value is the highest slot index in use,
+        // which the caller then walks with `SHM_STAT`.
+        IPC_INFO => {
+            if !buffer_ok(buf, SHMINFO_BYTES, true, from_user) {
+                return err::EFAULT;
+            }
+            let info = [
+                SHMMAX as u64,
+                SHMMIN as u64,
+                SHMMNI as u64,
+                SHMMNI as u64,
+                SHMALL as u64,
+                0,
+                0,
+                0,
+                0,
+            ];
+            unsafe {
+                for (i, value) in info.iter().enumerate() {
+                    ((buf + i * 8) as *mut u64).write_unaligned(*value);
+                }
+            }
+            sysv_shm::highest_slot() as isize
+        }
+        SHM_INFO => {
+            if !buffer_ok(buf, SHM_INFO_BYTES, true, from_user) {
+                return err::EFAULT;
+            }
+            let (used, pages) = sysv_shm::totals();
+            let resident: usize = sysv_shm::all().iter().map(|s| s.resident_pages()).sum();
+            unsafe {
+                core::ptr::write_bytes(buf as *mut u8, 0, SHM_INFO_BYTES);
+                (buf as *mut u32).write_unaligned(used as u32);
+                ((buf + 8) as *mut u64).write_unaligned(pages as u64);
+                ((buf + 16) as *mut u64).write_unaligned(resident as u64);
+            }
+            sysv_shm::highest_slot() as isize
+        }
+        // The by-index reports: the argument is a slot `ipcs` is walking, not a
+        // number a caller holds. `SHM_STAT` refuses a segment the caller may not
+        // read and `SHM_STAT_ANY` does not, which is the only difference.
+        SHM_STAT | SHM_STAT_ANY => {
+            let Some(segment) = sysv_shm::by_slot(args[0] as u64) else {
+                return err::EINVAL;
+            };
+            if cmd == SHM_STAT && !ipc_permitted(&segment, 0o4) {
+                return err::EACCES;
+            }
+            if !buffer_ok(buf, SHM_DS_BYTES, true, from_user) {
+                return err::EFAULT;
+            }
+            let attachments = crate::sched::shm_attachment_count(segment.id());
+            write_shmid_ds(buf, &segment, attachments);
+            segment.id() as isize
+        }
+        _ => {
+            let Some(segment) = sysv_shm::lookup(id) else {
+                return err::EINVAL;
+            };
+            match cmd {
+                IPC_STAT => {
+                    if !ipc_permitted(&segment, 0o4) {
+                        return err::EACCES;
+                    }
+                    if !buffer_ok(buf, SHM_DS_BYTES, true, from_user) {
+                        return err::EFAULT;
+                    }
+                    let attachments = crate::sched::shm_attachment_count(segment.id());
+                    write_shmid_ds(buf, &segment, attachments);
+                    0
+                }
+                IPC_SET => {
+                    if !may_control(&segment) {
+                        return err::EPERM;
+                    }
+                    if !buffer_ok(buf, SHM_DS_BYTES, false, from_user) {
+                        return err::EFAULT;
+                    }
+                    let uid = unsafe { ((buf + SHM_PERM_UID) as *const u32).read_unaligned() };
+                    let gid = unsafe { ((buf + SHM_PERM_GID) as *const u32).read_unaligned() };
+                    let mode = unsafe { ((buf + SHM_PERM_MODE) as *const u32).read_unaligned() };
+                    segment.set_perm(uid, gid, mode);
+                    segment.touch_change(now_secs());
+                    0
+                }
+                IPC_RMID => {
+                    if !may_control(&segment) {
+                        return err::EPERM;
+                    }
+                    // The key goes now and the segment goes when its last
+                    // attachment does - measured, and the reason a `shmget` on
+                    // the old key can make a new segment while this one is still
+                    // mapped.
+                    segment.clear_key();
+                    segment.destroy();
+                    reap_dead();
+                    0
+                }
+                // `SHM_LOCK`/`SHM_UNLOCK`: the mode bit, measured with no
+                // capability asked on this host (an unprivileged caller locks a
+                // segment it does not own). The bit is what `ipcs` shows and what
+                // a caller reads back; nothing here swaps.
+                SHM_LOCK | SHM_UNLOCK => {
+                    segment.set_locked(cmd == SHM_LOCK);
+                    0
+                }
+                _ => err::EINVAL,
+            }
+        }
+    }
 }

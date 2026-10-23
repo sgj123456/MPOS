@@ -680,6 +680,86 @@ pub fn vma_gaps(virt: usize, len: usize) -> Vec<(usize, usize)> {
     current_mm().vma_gaps(virt, virt.saturating_add(len))
 }
 
+/// The System V shared-memory segment attached at `virt`, as
+/// `(start, end, shmid)`.
+///
+/// `shmdt`'s whole validation: Linux answers `EINVAL` unless the address is
+/// exactly the start of a mapping of a segment (a `shmat` returns that address,
+/// and a caller that adds an offset to it has not named an attachment). The
+/// mapping is identified by its object - only a segment answers
+/// [`MappedObject::shm_id`] - rather than by anything the VMA's own range says,
+/// because the same address may have been attached twice in a process's life.
+pub fn shm_attachment_at(virt: usize) -> Option<(usize, usize, u64)> {
+    let vma = current_mm().vma_at(virt)?;
+    match &vma.kind {
+        VmaKind::Frames { object, .. } => object.shm_id().map(|id| (vma.start, vma.end, id)),
+        VmaKind::Anon => None,
+    }
+}
+
+/// How many attachments of the segment `id` any address space holds - the
+/// `shm_nattch` a segment reports.
+///
+/// Folded out of the VMA tables rather than counted on the segment because a
+/// `fork` copies a mapping and Linux counts the child as an attachment
+/// (measured: a freshly forked child reads `nattch` one higher, and the count
+/// falls when it exits). The fold counts **runs** rather than entries, because
+/// splitting a mapping in two (`mprotect` half of it, a `MAP_FIXED` in its
+/// middle) makes two VMAs of one attachment, and Linux's count does not change
+/// on a split - its `vm_ops->open` is what counts, and a split does not call it.
+/// Two entries continue one run exactly when the second starts where the first
+/// ends at the offset the first would have there, which is the same arithmetic
+/// [`Vma::abuts`] merges on.
+///
+/// The walk is one pass over the tasks and their tables, and it runs only for a
+/// `shmctl(IPC_STAT)`, a reap sweep or a `/proc` read - never on a fault.
+pub fn shm_attachment_count(id: u64) -> usize {
+    with_table(|t| {
+        let mut count = 0;
+        let mut seen: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+        for slot in t.tasks.iter() {
+            let Some(task) = slot else { continue };
+            // A thread shares its group's address space, so counting one table
+            // per thread would multiply every attachment by the thread count.
+            let mm = Arc::as_ptr(&task.mm) as usize;
+            if seen.contains(&mm) {
+                continue;
+            }
+            seen.push(mm);
+            // `(segment, first offset, first start, end)` of the run being
+            // counted. The first offset and start stay put as pieces are
+            // folded in: what makes a piece a continuation is the offset the
+            // *run* would give it, not the offset of the piece before it.
+            let mut run: Option<(u64, usize, usize, usize)> = None;
+            for vma in task.mm.vma_snapshot().iter() {
+                let here = match &vma.kind {
+                    VmaKind::Frames { object, offset, .. } => {
+                        object.shm_id().map(|sid| (sid, *offset))
+                    }
+                    VmaKind::Anon => None,
+                };
+                let Some((sid, offset)) = here else {
+                    run = None;
+                    continue;
+                };
+                let continues = run.is_some_and(|(rid, roffset, rstart, rend)| {
+                    rid == sid && rend == vma.start && offset == roffset + (rend - rstart)
+                });
+                if continues {
+                    let (_, roffset, rstart, _) = run.expect("checked above");
+                    run = Some((sid, roffset, rstart, vma.end));
+                } else {
+                    if sid == id {
+                        count += 1;
+                    }
+                    run = Some((sid, offset, vma.start, vma.end));
+                }
+            }
+        }
+        count
+    })
+}
+
 /// Put a VMA back, backing and all - how `mremap` completes a move.
 ///
 /// The caller has just re-placed every page of the range at its destination,

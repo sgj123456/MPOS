@@ -5456,3 +5456,52 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     descriptor's `st_size` is 0 where Linux counts the filesystem entry's 80
     bytes. The `msg_max`/`msgsize_max` ceilings are constants, not sysctls, and a
     blocked sender/receiver is pinned only by the timeout side.
+
+## item 101 — System V shared memory: four calls, one object model, and the number scheme the other two families will share
+
+    `shmget` (29/194), `shmat` (30/196), `shmctl` (31/195) and `shmdt` (67/197)
+    fell through the dispatch to `ENOSYS` - the first third of the "SysV IPC
+    objects" that `CLONE_NEWIPC` had been refused for since §6.3. Measured on a
+    current host first (Linux 7.2.11, `.workbuddy/probe_sysv_shm.c`,
+    `probe_shm_perm.c`, `probe_shm_ids.c`, `probe_shm_rmid.c`,
+    `probe_shm_order.c`), recorded with the evidence in §6.13. The shapes that
+    are Linux's and are now served: a segment's reported size is the size *asked
+    for* while its mapping is whole pages; `shmget` applies **no umask**; a
+    segment's number is `slot + generation * 32768`, so a number retained across
+    the segment's removal is `EINVAL` and never names its replacement; the errno
+    order on a live key is `EEXIST`, `EINVAL` (a larger size), `EACCES` (only
+    when `shmflg` names permission bits); an explicit attach address is taken
+    only when free and a busy one is `EINVAL` rather than relocated, `SHM_RND`
+    rounds down, `SHM_REMAP` replaces; `shm_nattch` counts address spaces, so a
+    `fork` raises it and the child's exit lowers it; `IPC_RMID` *marks* a segment
+    - its number keeps answering until the last detach, its key reads back as
+    `IPC_PRIVATE`, and a `shmget` on that key makes a different segment; the three
+    permission refusals are `EACCES` (`shmat`, `IPC_STAT`) and `EPERM`
+    (`IPC_SET`, `IPC_RMID`); and `/proc/sysvipc/shm` prints the header and column
+    widths `ipcs` parses.
+
+    **Owner**: `src/mm/sysv_shm.rs` (the segment table, the lazily-allocated
+    frames behind a `MappedObject`, the marking lifetime) and `src/mm/ipc_id.rs`
+    (the slot-and-generation arithmetic, shared with the two families still to
+    come), `src/syscall/linux/ipc.rs` (the four doors, the permission model,
+    `IPC_INFO`/`SHM_INFO`/`SHM_STAT`), `src/vfs/procfs.rs` (`/proc/sysvipc/shm`),
+    and `src/sched/runtime/child_mm.rs` (the attachment fold,
+    `shm_attachment_count`, which is what makes `fork` count and a split mapping
+    count once).
+
+    **Pin**: the new `t-sysv-shm`, **61 claims** (`libc` for the family -
+    `rustix` binds no System V IPC call - and the three `shmctl` records spelled
+    `#[repr(C)]` because the layout is the ABI). Green on a current host first.
+
+    **Gate**: x86_64 `pass=202 fail=0 (214 built)`, `mpos-kunit 32 passed, 0
+    failed`, exit 0, two consecutive runs. The second machine compiles the change
+    (kernel release + clippy, and the pin builds for it); its sweep could not boot
+    on this host (no DRM render node), so no aarch64 figure is claimed.
+
+    **Named**: the other two SysV families (semaphores and message queues) are
+    still `ENOSYS`, so `CLONE_NEWIPC` is still refused with its reason narrowed
+    to them. The table is the *machine's* rather than a namespace's, `SHM_LOCK`
+    only sets a mode bit (there is no swap to hold a page out of), `shm_rss` is
+    the pages that have a frame, and `SHMMAX` (64 MiB) / `SHMALL` (32768 pages) /
+    `SHMMNI` (4096) are constants this kernel reports through `IPC_INFO`, not
+    sysctls.

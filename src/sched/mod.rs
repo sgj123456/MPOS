@@ -73,16 +73,17 @@ pub use runtime::{
     set_net_ns, set_nice, set_oom_score_adj, set_pgid, set_robust_head, set_root,
     set_seccomp_filter, set_seccomp_strict, set_signal_action, set_signal_alt_stack,
     set_trace_options, set_tracer, setns_mnt, setns_pid, setns_time, setns_user, setns_uts,
-    signal_action, signal_alt_stack, sleep_ns, sleep_ticks, snapshot, snapshots, space_root_of,
-    spawn, spawn_permanent, spawn_user, started, stop_of, take_child_event, take_continued_report,
-    take_deliverable_siginfo, take_deliverable_signal, take_exit_code, take_fatal_signal,
-    take_pending_event, take_signal_in_set, take_stop_report, take_vmas, task_count,
-    thread_group_has_siblings, thread_snapshots, time_offsets, timer_alloc, timer_arm,
-    timer_overrun, timer_remove, timer_state, tls_of, trace_options, trace_syscall, tracer_of,
-    try_spawn_user, uid_members, unmap_user, unshare_files, unshare_fs, unshare_mnt, unshare_pid,
-    unshare_time, unshare_user, unshare_uts, user_frame_at, user_mapped, vfork, vma_gaps,
-    vma_kind_at, vma_prot_at, vma_range_free, wait_any_child_event, wait_child_event,
-    wait_for_interrupt, wake, with_current_credentials, write_user, write_user_of, yield_now,
+    shm_attachment_at, shm_attachment_count, signal_action, signal_alt_stack, sleep_ns,
+    sleep_ticks, snapshot, snapshots, space_root_of, spawn, spawn_permanent, spawn_user, started,
+    stop_of, take_child_event, take_continued_report, take_deliverable_siginfo,
+    take_deliverable_signal, take_exit_code, take_fatal_signal, take_pending_event,
+    take_signal_in_set, take_stop_report, take_vmas, task_count, thread_group_has_siblings,
+    thread_snapshots, time_offsets, timer_alloc, timer_arm, timer_overrun, timer_remove,
+    timer_state, tls_of, trace_options, trace_syscall, tracer_of, try_spawn_user, uid_members,
+    unmap_user, unshare_files, unshare_fs, unshare_mnt, unshare_pid, unshare_time, unshare_user,
+    unshare_uts, user_frame_at, user_mapped, vfork, vma_gaps, vma_kind_at, vma_prot_at,
+    vma_range_free, wait_any_child_event, wait_child_event, wait_for_interrupt, wake,
+    with_current_credentials, write_user, write_user_of, yield_now,
 };
 
 /// The `wait(2)` doors read the whole retired record, not just its code: a
@@ -145,6 +146,14 @@ pub fn resolve_pid(number: i64) -> Option<TaskId> {
 #[cfg(not(target_os = "none"))]
 pub fn current_owner() -> (u32, u32) {
     (0, 0)
+}
+
+/// A host build has no address spaces, so nothing maps a segment: `shm_nattch`
+/// is zero there, which is what a host-rendered `/proc/sysvipc/shm` reports and
+/// what a host test of the segment table sees.
+#[cfg(not(target_os = "none"))]
+pub fn shm_attachment_count(_id: u64) -> usize {
+    0
 }
 
 /// A host build has one process and it has never unshared, so it stands in the

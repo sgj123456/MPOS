@@ -240,6 +240,14 @@ mod tests {
         assert_eq!(MQ_TIMEDRECEIVE, 243);
         assert_eq!(MQ_NOTIFY, 244);
         assert_eq!(MQ_GETSETATTR, 245);
+        // The System V shared-memory four. `shmdt` is the odd one out on this
+        // machine: it sits at 67, away from its three siblings, because the
+        // numbers between them were burned by calls Linux removed - an
+        // asm-generic port has all four next to each other (194..=197).
+        assert_eq!(SHMGET, 29);
+        assert_eq!(SHMAT, 30);
+        assert_eq!(SHMCTL, 31);
+        assert_eq!(SHMDT, 67);
     }
 
     /// `clone(2)`: the flag bits, as the same table numbers them. The

@@ -53,6 +53,9 @@ A call absent from those is served as its phase section records.
 | `msync` | 26 | posix | 227 |
 | `mincore` | 27 | posix | 232 |
 | `madvise` | 28 | proc | 233 |
+| `shmget` | 29 | ipc | 194 |
+| `shmat` | 30 | ipc | 196 |
+| `shmctl` | 31 | ipc | 195 |
 | `dup` | 32 | fs | 23 |
 | `dup2` | 33 | fs | 64006 |
 | `pause` | 34 | posix | 64033 |
@@ -91,6 +94,7 @@ A call absent from those is served as its phase section records.
 | `wait4` | 61 | proc | 260 |
 | `kill` | 62 | proc | 129 |
 | `uname` | 63 | proc | 160 |
+| `shmdt` | 67 | ipc | 197 |
 | `fcntl` | 72 | fs | 25 |
 | `flock` | 73 | fs | 32 |
 | `fsync` | 74 | fs | 82 |

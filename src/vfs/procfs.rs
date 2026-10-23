@@ -3227,6 +3227,47 @@ pub fn domainname() -> String {
     crate::sched::current_uts().domainname()
 }
 
+/// The header `/proc/sysvipc/shm` starts with, measured character for
+/// character on a current host: the column widths are the kernel's, and a reader
+/// that splits a line counts them.
+const SYSVIPC_SHM_HEADER: &str = "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime                   rss                  swap\n";
+
+/// `/proc/sysvipc/shm`: one line per segment, in the kernel's `ipcs` layout.
+///
+/// `perms` is the mode word in octal (so a locked segment reads `2600`), `size`
+/// is the size asked for rather than the page-rounded mapping, `nattch` is the
+/// attachment count folded out of every address space, and `rss` is the pages
+/// that have a frame. The last two columns - the rss and the swap count - are 22
+/// wide because they are counters, not sizes.
+pub fn sysvipc_shm_text() -> String {
+    let mut out = String::from(SYSVIPC_SHM_HEADER);
+    for segment in crate::mm::sysv_shm::all() {
+        let perm = segment.perm();
+        let times = segment.times();
+        let attachments = crate::sched::shm_attachment_count(segment.id());
+        out.push_str(&alloc::format!(
+            "{:10}{:11} {:6o}{:22}{:6}{:6}{:7}{:6}{:6}{:6}{:6}{:11}{:11}{:11}{:22}{:22}\n",
+            perm.key,
+            perm.id,
+            perm.mode,
+            perm.size,
+            perm.cpid,
+            times.lpid,
+            attachments,
+            perm.uid,
+            perm.gid,
+            perm.cuid,
+            perm.cgid,
+            times.atime,
+            times.dtime,
+            times.ctime,
+            segment.resident_pages(),
+            0,
+        ));
+    }
+    out
+}
+
 /// Name the caller's namespace's domain. `setdomainname(2)` lands here, and so
 /// does a write to `/proc/sys/kernel/domainname`.
 pub fn set_domainname(name: &str) {
@@ -3520,6 +3561,15 @@ impl ProcFs {
         // door - Linux's own one, so no private protocol was needed for it.
         net.add("dev", NodeKind::File, file(net_dev_text));
         self.root.add("net", NodeKind::Dir, net);
+
+        // `/proc/sysvipc/shm`: the segment table `ipcs` renders, in the kernel's
+        // own column layout. Measured off a current host - the header line and
+        // every column's width, including the two 22-wide right-hand counters -
+        // because a reader splits the line rather than parsing names
+        // (`.workbuddy/probe_shm_perm.c`; `docs/notes/` §6.13).
+        let sysvipc = dir();
+        sysvipc.add("shm", NodeKind::File, file(sysvipc_shm_text));
+        self.root.add("sysvipc", NodeKind::Dir, sysvipc);
 
         // `/proc/bus/pci`: pciutils' fallback access method, and the one
         // `setpci` writes through. It reads the same device snapshot the

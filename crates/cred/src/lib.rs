@@ -104,6 +104,17 @@ pub const CAP_SETPCAP: u32 = 8;
 /// requires - `FS_IOC_SETFLAGS`' own gate, and the one `chattr(1)` names in its
 /// errors.
 pub const CAP_LINUX_IMMUTABLE: u32 = 9;
+/// `CAP_IPC_OWNER`, which the System V IPC permission checks offer when the
+/// permission triads refuse: Linux's `ipcperms` lets a caller holding it do
+/// anything to an object in the IPC namespace, which is why root may `shmat` a
+/// segment owned by uid 1000 (measured, `.workbuddy/probe_shm_perm.c`).
+pub const CAP_IPC_OWNER: u32 = 14;
+/// `CAP_IPC_LOCK`, which `shmctl(SHM_LOCK)` asks on the man page's account - and
+/// which this host's kernel does **not** ask: measured on Linux 7.2.11, an
+/// unprivileged caller locks a segment it does not own and `IPC_STAT` reports
+/// the `SHM_LOCKED` bit. The bit is kept here for the documented gate and for
+/// `mlock`'s own, which does ask it.
+pub const CAP_IPC_LOCK: u32 = 15;
 /// `CAP_SYS_CHROOT`, which `chroot(2)` requires.
 pub const CAP_SYS_CHROOT: u32 = 18;
 /// `CAP_SYS_ADMIN`, which the namespace `unshare`/`setns` family requires.

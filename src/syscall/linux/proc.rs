@@ -3492,7 +3492,7 @@ pub(super) fn handle_mremap(args: [usize; ARG_COUNT]) -> isize {
 /// wins an access its neighbour was granted. A frame-only walk did exactly
 /// that, and every arena test whose fixture is a lazy `PROT_NONE` mapping read
 /// the collision as a wrong address or a `SIGSEGV`.
-fn free_range(len: usize, cursor: usize) -> Option<(usize, usize)> {
+pub(super) fn free_range(len: usize, cursor: usize) -> Option<(usize, usize)> {
     use crate::mm::pframe::PAGE_SIZE;
 
     // A stale cursor from an old layout can only ever sit above the base; the
