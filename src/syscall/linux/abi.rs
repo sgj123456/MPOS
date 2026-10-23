@@ -2446,6 +2446,16 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     // them - and -1 or 100 are `EINVAL` with the previous value kept.
     // `PR_GET_PDEATHSIG` writes the number through the pointer and answers
     // `EFAULT` for a null one.
+    /// `PR_SET_VMA`: a compound option whose second word is the sub-operation,
+    /// and `PR_SET_VMA_ANON_NAME` the only one that exists. The number is the
+    /// four-character word `'SVMA'` read as an `int`, which is why it looks
+    /// nothing like the rest of the table.
+    const PR_SET_VMA: usize = 0x5356_4d41;
+    const PR_SET_VMA_ANON_NAME: usize = 0;
+    /// `ANON_VMA_NAME_MAX_LEN`: a name of this length or longer is `EINVAL`
+    /// (measured: 80 characters refused, 79 accepted), which is why the loop
+    /// below reads at most this many bytes and refuses when none of them is NUL.
+    const ANON_NAME_MAX: usize = 80;
     const PR_SET_PDEATHSIG: usize = 1;
     const PR_GET_PDEATHSIG: usize = 2;
     /// `_NSIG`: the highest signal number Linux's `valid_signal` accepts.
@@ -2561,6 +2571,63 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
             _ => err::EINVAL,
         },
         PR_GET_DUMPABLE => crate::sched::current_credentials().dumpable as isize,
+        // `PR_SET_VMA` names an anonymous mapping - what Mesa and Chrome tag
+        // their arenas with, and the last prctl option this kernel had state
+        // for. Measured whole on a current host
+        // (`.workbuddy/probe_vma_name.c`): a sub-operation other than
+        // `PR_SET_VMA_ANON_NAME` and a misaligned start are `EINVAL`; `len == 0`
+        // is accepted and does nothing; a range nothing is mapped in is
+        // **`ENOMEM`**; a range a *file* mapping sits in is **`EBADF`**; a name
+        // of 80 bytes or more is `EINVAL`; a null or empty name is accepted (an
+        // empty one prints as `[anon:]`), and a null *pointer* clears the name.
+        PR_SET_VMA => {
+            if args[1] != PR_SET_VMA_ANON_NAME {
+                return err::EINVAL;
+            }
+            let start = args[2];
+            let len = args[3];
+            if start & 0xfff != 0 {
+                return err::EINVAL;
+            }
+            if len == 0 {
+                return 0;
+            }
+            let name = match args[4] {
+                0 => None,
+                bytes => {
+                    let mut text = alloc::vec::Vec::new();
+                    let mut i = 0;
+                    let mut ended = false;
+                    while i < ANON_NAME_MAX {
+                        if (bytes + i) & 0xfff == 0 && !buffer_ok(bytes + i, 1, false, true) {
+                            return err::EFAULT;
+                        }
+                        let byte = unsafe { ((bytes + i) as *const u8).read_unaligned() };
+                        if byte == 0 {
+                            ended = true;
+                            break;
+                        }
+                        text.push(byte);
+                        i += 1;
+                    }
+                    // No NUL inside the maximum: Linux's `strndup_user` refuses
+                    // the string rather than truncating it.
+                    if !ended {
+                        return err::EINVAL;
+                    }
+                    match core::str::from_utf8(&text) {
+                        Ok(text) => Some(alloc::sync::Arc::from(
+                            alloc::format!("[anon:{text}]").as_str(),
+                        )),
+                        Err(_) => return err::EINVAL,
+                    }
+                }
+            };
+            match crate::sched::name_user_range(start, len, name) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
+        }
         PR_SET_PDEATHSIG => {
             if args[1] > NSIG {
                 return err::EINVAL;

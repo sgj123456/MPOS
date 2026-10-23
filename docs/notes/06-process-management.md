@@ -2897,3 +2897,53 @@ failed`, `mpos-kunit 32 passed, 0 failed`, exit 0. `cargo xtask depgraph` is
 within the ratchet (no edge appeared). The aarch64 arm builds (kernel, loader,
 `clippy` on `aarch64-unknown-none`) but its sweep cannot boot on this host
 (`egl: no drm render node available`), so no aarch64 figure is claimed.
+
+### 6.17 `PR_SET_VMA_ANON_NAME` — a mapping a profiler can name (LANDED 2026-10-23)
+
+The last `prctl` option this kernel had state for: `PR_SET_VMA` with its one
+sub-operation names an anonymous mapping, so `/proc/<pid>/maps` prints
+`[anon:<name>]`. It is what Mesa and Chrome tag their arenas with, and the
+`name` field it writes is one `Vma` already carried for the loader and for
+`[heap]`.
+
+Measured on a current host first (`.workbuddy/probe_vma_name.c`,
+`probe_vma_name2.c`), every claim then re-run against a real kernel:
+
+* naming a **sub-range splits** the mapping at its ends, exactly as `mprotect`
+  does: a four-page mapping with its second page named reads as three lines, the
+  middle one named;
+* a **null pointer clears**, and the pieces fold back into one line - which falls
+  out of the table's own `tidy` because two abutting VMAs agree on the name;
+* a name of **80 bytes or more is `EINVAL`** (`strndup_user`'s refusal, not a
+  truncation), a **misaligned start** is `EINVAL`, and an unknown sub-operation
+  is `EINVAL`;
+* `len == 0` is **accepted** and does nothing;
+* a range nothing is mapped in is **`ENOMEM`** - not `ENOENT`;
+* a range a **regular file** mapping sits in is **`EBADF`**: the one errno a
+  reader would not guess, and the one this pin caught a real bug through (below);
+* an **empty** name is accepted and prints as `[anon:]`.
+
+**The pin found the divergence the code had**: `MAP_PRIVATE` of a regular file is
+recorded as an *eager* range here (its pages are read in at `mmap`, so it leaves
+no VMA - §6.10's `MappedRange`), and the naming check looked only at the VMA
+table. A file mapping was therefore `ENOMEM` ("nothing is mapped there") where
+Linux says `EBADF` ("a file is mapped there"). The fix asks the **recorded** list
+first, which is the description that holds those mappings, and the comparison is
+the one the pin makes: a name on a file-backed range is a refusal, not a name.
+
+**Named, and stricter than the host**: the host *accepts* naming a `memfd`-backed
+mapping (both `MAP_PRIVATE` and `MAP_SHARED` answered 0, measured) while
+refusing an ordinary file's; this kernel refuses every object-backed range with
+the same `EBADF`, because the distinction it would need - "a memfd is not a file"
+- is not one its `Vma` records. The stricter answer is the safe half of the pair
+(a program that names its `memfd` arena loses the name and nothing else, and the
+call it gets back is a refusal rather than a silent success), and it is named
+here rather than approximated.
+
+**Pin**: `t-maps`, grown to **53 claims** - the whole-mapping name and its
+`[anon:<name>]` line, the split with only the named page carrying it, the clear
+that folds the pieces back, the four refusals and the zero length - measured on
+the host first and green on both machines.
+
+**Gate**: x86_64 `pass=205 fail=0`, stage 1 `1100 tests, 0 failed`,
+`mpos-kunit 32 passed, 0 failed`, exit 0.

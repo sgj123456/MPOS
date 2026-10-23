@@ -67,15 +67,15 @@ pub use runtime::{
     insert_vma, is_child, is_exited, is_running, is_stopped, itimer_snapshot, itimer_swap,
     kernel_lazy_accessible, madvise_dontneed, map_anon, map_facts, map_frames, mapping_name_at,
     may_inspect, may_mint_pid_ns, may_signal, membarrier_registrations, move_eager_ranges,
-    move_user_page, munmap_user, nice_of, ns_of, oom_score_adj_of, parent_group_of, parent_of,
-    pause, pgid_of, pid_number_of, pid_numbers_of, pidfd_fd_table, pidfd_generation,
-    pidfd_group_alive, pidfd_identity, pidfd_live_member, pidfd_still_names, pidfd_task_alive,
-    poll_any_child_event, poll_child_event, populate_user_page_at, preempt, process_members,
-    protect_user, protect_user_range, raise_sigpipe, read_user, read_user_of, record_eager_range,
-    register_membarrier, release_controlling_tty, release_pid, release_user_frames,
-    reset_disposition, resident_pages, resolve_anon_fault, resolve_cow_fault, resolve_pid,
-    resolve_script, resolve_stack_growth, resume_traced, rlimits_of, robust_head, root_ns,
-    run_seccomp_filters, send_signal, send_signal_group, send_signal_group_checked,
+    move_user_page, munmap_user, name_user_range, nice_of, ns_of, oom_score_adj_of,
+    parent_group_of, parent_of, pause, pgid_of, pid_number_of, pid_numbers_of, pidfd_fd_table,
+    pidfd_generation, pidfd_group_alive, pidfd_identity, pidfd_live_member, pidfd_still_names,
+    pidfd_task_alive, poll_any_child_event, poll_child_event, populate_user_page_at, preempt,
+    process_members, protect_user, protect_user_range, raise_sigpipe, read_user, read_user_of,
+    record_eager_range, register_membarrier, release_controlling_tty, release_pid,
+    release_user_frames, reset_disposition, resident_pages, resolve_anon_fault, resolve_cow_fault,
+    resolve_pid, resolve_script, resolve_stack_growth, resume_traced, rlimits_of, robust_head,
+    root_ns, run_seccomp_filters, send_signal, send_signal_group, send_signal_group_checked,
     send_signal_group_info, send_signal_info, send_signal_process, session_of, session_of_tty,
     set_brk_base, set_clear_tid, set_current_blocked, set_current_comm, set_current_identity,
     set_current_rlimit, set_current_tls, set_current_umask, set_cwd, set_cwd_path, set_ipc_ns,
@@ -175,6 +175,18 @@ pub fn set_ipc_ns(_ns: Option<alloc::sync::Arc<crate::vfs::ns::IpcNs>>) {}
 /// exists only so a host build of the crate that names it still links.
 #[cfg(not(target_os = "none"))]
 pub fn unshare_ipc() {}
+
+/// A host build has no address space, so nothing is mapped: `PR_SET_VMA_ANON_NAME`
+/// gets the answer an unmapped range gets on the machine, which is the only one
+/// that is true here.
+#[cfg(not(target_os = "none"))]
+pub fn name_user_range(
+    _virt: usize,
+    _len: usize,
+    _name: Option<alloc::sync::Arc<str>>,
+) -> Result<(), isize> {
+    Err(crate::err::ENOMEM)
+}
 
 /// A host build has one process and no parent to die: the setting is a value
 /// the `prctl` unit test may round-trip and nothing else reads it.

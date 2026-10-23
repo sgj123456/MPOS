@@ -452,6 +452,39 @@ pub fn protect_user_range(virt: usize, len: usize, flags: MapFlags) {
     protect_user(virt, len, flags);
 }
 
+/// `PR_SET_VMA_ANON_NAME`: name (or unname) the anonymous mappings in
+/// `virt..virt + len`. The table's own rule is
+/// [`VmaTable::set_anon_name`]'s; this is the facade the `prctl` handler asks,
+/// because the table is the address space's.
+pub fn name_user_range(
+    virt: usize,
+    len: usize,
+    name: Option<alloc::sync::Arc<str>>,
+) -> Result<(), isize> {
+    let end = virt.saturating_add(len);
+    // A range whose pages came from a **file** is `EBADF` (measured), and this
+    // kernel holds two descriptions that can say so: the VMA table for an
+    // object-backed mapping, and the recorded ranges for the eager ones a
+    // `MAP_PRIVATE` file mapping and the loader leave behind - which have no VMA
+    // at all, so the table alone would answer the *unmapped* errno for them
+    // (`t-maps` caught exactly that: `ENOMEM` where Linux says `EBADF`). The
+    // recorded list is asked first for that reason.
+    if current_mm()
+        .eager_ranges()
+        .iter()
+        .any(|range| range.start < end && virt < range.end)
+    {
+        return Err(crate::err::EBADF);
+    }
+    critical_section::with(|cs| {
+        current_mm()
+            .vmas
+            .borrow(cs)
+            .borrow_mut()
+            .set_anon_name(virt, end, name)
+    })
+}
+
 /// `madvise(MADV_DONTNEED)` over `virt..virt + len`: give the range's pages
 /// back, leaving the mapping itself in place.
 ///

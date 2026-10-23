@@ -455,6 +455,48 @@ impl VmaTable {
         self.tidy();
     }
 
+    /// `PR_SET_VMA_ANON_NAME`: give every anonymous mapping in `[start, end)`
+    /// this name, or take theirs away with `None`.
+    ///
+    /// Measured on a current host (`.workbuddy/probe_vma_name.c`), because
+    /// every half of the shape is a decision:
+    ///
+    /// * the range is **split** at its ends like `mprotect`'s, so naming one page
+    ///   of a four-page mapping leaves two lines with the second named;
+    /// * a range nothing is mapped in is `ENOMEM` (not `ENOENT`), and a range a
+    ///   **file** mapping sits in is `EBADF` - the one errno a reader would not
+    ///   guess from the man page's silence;
+    /// * clearing the name folds the pieces back into one line, which is what
+    ///   [`Self::tidy`] does when two abutting pieces agree on the name.
+    ///
+    /// The name is stored already bracketed (`[anon:x]`, or `[anon:]` for an
+    /// empty name, both as the host prints them), because the one reader is
+    /// `/proc/<pid>/maps` and its name column is this string.
+    pub fn set_anon_name(
+        &mut self,
+        start: usize,
+        end: usize,
+        name: Option<Arc<str>>,
+    ) -> Result<(), isize> {
+        let mut inside = self.split_out(start, end);
+        if inside.is_empty() {
+            return Err(crate::err::ENOMEM);
+        }
+        if inside.iter().any(|vma| !matches!(vma.kind, VmaKind::Anon)) {
+            // Put back what the split took before refusing: the caller's range
+            // is unchanged, which is what an error means here.
+            self.vmas.append(&mut inside);
+            self.tidy();
+            return Err(crate::err::EBADF);
+        }
+        for vma in &mut inside {
+            vma.name = name.clone();
+        }
+        self.vmas.append(&mut inside);
+        self.tidy();
+        Ok(())
+    }
+
     /// The parts of `[start, end)` that no VMA covers, lowest first.
     ///
     /// This is what a heap growth asks before it extends: a page inside the

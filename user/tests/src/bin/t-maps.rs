@@ -10,6 +10,11 @@
 //! sandbox's host) when there is one. A reader splits on whitespace and
 //! indexes, so "close enough" parses as something else.
 //!
+//! It also pins the one *write* the file has outside the kernel's own calls:
+//! `PR_SET_VMA_ANON_NAME`, which names an anonymous mapping so a profiler can
+//! find it - the range splitting like `mprotect`'s, a null pointer clearing it,
+//! and the four refusals the host measured (`docs/notes/` §6.17).
+//!
 //! Pinned here, on the machine, for every kind of mapping this kernel makes:
 //! the process's own image, a private anonymous `mmap`, a shared anonymous
 //! one, a `memfd` mapping, the stack, and the heap. `[stack]` and `[heap]`
@@ -505,6 +510,145 @@ fn main() {
             }
             Err(_) => r.check("the maps file opens after the mprotect", false),
         }
+    }
+
+    // --- `PR_SET_VMA_ANON_NAME`, the name a profiler reads ---
+    // Measured on a host first (`.workbuddy/probe_vma_name.c`): the range is
+    // split at its ends like `mprotect`'s, clearing folds the pieces back, and
+    // the four refusals are `EINVAL` for a misaligned start or a name of eighty
+    // bytes, `ENOMEM` for a range with nothing in it and **`EBADF`** for one a
+    // file mapping sits in - the last of which no reader would guess.
+    if private != 0 {
+        const PR_SET_VMA: libc::c_int = 0x5356_4d41;
+        const PR_SET_VMA_ANON_NAME: usize = 0;
+        let name = |addr: usize, len: usize, text: &[u8]| -> isize {
+            let ptr = if text.is_empty() {
+                core::ptr::null::<u8>().cast::<libc::c_char>()
+            } else {
+                text.as_ptr().cast::<libc::c_char>()
+            };
+            unsafe {
+                libc::syscall(
+                    libc::SYS_prctl,
+                    PR_SET_VMA,
+                    PR_SET_VMA_ANON_NAME,
+                    addr,
+                    len,
+                    ptr,
+                ) as isize
+            }
+        };
+        const NAME: &[u8] = b"t-maps-named\0";
+        r.check(
+            "PR_SET_VMA_ANON_NAME names the whole mapping",
+            name(private, 3 * 4096, NAME) == 0,
+        );
+        match read_maps() {
+            Ok(maps) => match line_at(&maps, private) {
+                Some(line) => r.check(
+                    "and maps prints it as [anon:<name>]",
+                    line.name == b"[anon:t-maps-named]",
+                ),
+                None => r.check("the named mapping is listed", false),
+            },
+            Err(_) => r.check("the maps file opens", false),
+        }
+
+        // The middle page only: the description splits three ways.
+        r.check(
+            "naming one page of it is accepted",
+            name(private + 4096, 4096, b"middle\0") == 0,
+        );
+        match read_maps() {
+            Ok(maps) => {
+                let first = line_at(&maps, private);
+                let middle = line_at(&maps, private + 4096);
+                let last = line_at(&maps, private + 2 * 4096);
+                r.check(
+                    "the range splits, with the name only on the page it named",
+                    first.is_some_and(|l| l.name == b"[anon:t-maps-named]")
+                        && middle.is_some_and(|l| l.name == b"[anon:middle]")
+                        && last.is_some_and(|l| l.name == b"[anon:t-maps-named]"),
+                );
+            }
+            Err(_) => r.check("the maps file opens", false),
+        }
+
+        // A null pointer clears, and the pieces fold back into one line.
+        r.check("a null name clears it", name(private, 3 * 4096, b"") == 0);
+        match read_maps() {
+            Ok(maps) => match line_at(&maps, private) {
+                Some(line) => r.check(
+                    "and the three pieces are one unnamed line again",
+                    line.name.is_empty() && line.covers(private, 3 * 4096),
+                ),
+                None => r.check("the cleared mapping is still listed", false),
+            },
+            Err(_) => r.check("the maps file opens", false),
+        }
+
+        // The refusals, each its own answer.
+        r.check(
+            "a misaligned start is EINVAL",
+            name(private + 1, 4096, NAME) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL),
+        );
+        let long = [b'a'; 80];
+        r.check(
+            "a name of eighty bytes is EINVAL",
+            name(private, 4096, &long) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL),
+        );
+        r.check(
+            "a range nothing is mapped in is ENOMEM",
+            name(0x1000_0000_0000, 4096, NAME) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM),
+        );
+        // A mapping with a **regular file** behind it is `EBADF` - measured on
+        // the host, and the one errno here a reader would not guess. The host
+        // *accepts* a `memfd`-backed mapping and this kernel refuses it with the
+        // same errno; the stricter half is named in `docs/notes/` §6.16.
+        if let Some(file_map) = std::fs::File::open("/proc/self/exe").ok().and_then(|file| {
+            use std::os::fd::AsFd;
+            unsafe {
+                mmap(
+                    core::ptr::null_mut(),
+                    4096,
+                    ProtFlags::READ,
+                    MapFlags::PRIVATE,
+                    file.as_fd(),
+                    0,
+                )
+            }
+            .ok()
+            .map(|at| at as usize)
+        }) {
+            let listed = read_maps().ok().and_then(|m| {
+                line_at(&m, file_map).map(|l| {
+                    format!(
+                        "{:?} name={:?}",
+                        String::from_utf8_lossy(l.perms),
+                        String::from_utf8_lossy(l.name)
+                    )
+                })
+            });
+            r.check(
+                &format!("diagnostic: the file mapping is described as {listed:?}"),
+                listed.is_some(),
+            );
+            let rc = name(file_map, 4096, NAME);
+            let e = std::io::Error::last_os_error().raw_os_error();
+            r.check(
+                &format!(
+                    "and a range a regular file mapping sits in is EBADF (got rc={rc}, errno={e:?})"
+                ),
+                rc == -1 && e == Some(libc::EBADF),
+            );
+        }
+        r.check(
+            "a zero length names nothing and is accepted",
+            name(private, 0, NAME) == 0,
+        );
     }
 
     // --- the heap, which grows when the break moves ---
