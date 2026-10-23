@@ -163,16 +163,43 @@ fn peer_pid(fd: i32) -> Option<u32> {
     (rc == 0).then(|| c[0])
 }
 
-/// Read a pipe to end-of-file, answering the byte count.
-fn drain(ro: &rustix::fd::OwnedFd, buf: &mut [u8]) -> usize {
+/// Read a pipe to end-of-file, answering the byte count - **within a budget**.
+///
+/// The budget is the point. This read waits for a forked section to finish, and a
+/// section that stops (a child that never runs, a wait that never wakes) used to
+/// block here for ever: the lane's 900-second timeout then killed the run and the
+/// log said nothing except where it had *started* (`docs/notes/` §6.20's two
+/// readings). A bounded read turns that into a failed claim that names how far
+/// the section got, which is the whole difference between "it hangs sometimes"
+/// and a place to look.
+fn drain(ro: &rustix::fd::OwnedFd, buf: &mut [u8], patience_ms: i32) -> usize {
     let mut total = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(patience_ms as u64);
     while total < buf.len() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let mut pfd = [rustix::event::PollFd::new(ro, rustix::event::PollFlags::IN)];
+        let timeout = rustix::time::Timespec {
+            tv_sec: left.as_secs() as i64,
+            tv_nsec: left.subsec_nanos() as i64,
+        };
+        let ready = rustix::event::poll(&mut pfd, Some(&timeout)).unwrap_or(0);
+        if ready == 0 {
+            break;
+        }
         match read(ro, &mut buf[total..]) {
             Ok(0) | Err(_) => break,
             Ok(n) => total += n,
         }
     }
     total
+}
+
+/// One byte per stage, so a section that stops says *where*.
+fn stage_mark(w: &rustix::fd::OwnedFd, n: u8) {
+    let _ = write(w, &[n]);
 }
 
 /// `unshare(2)` for the flags this program is about. Unsafe in `rustix`'s API
@@ -290,13 +317,14 @@ fn wait_for_eof(ro: &OwnedFd) -> bool {
 /// namespace is still the machine's. It makes its own namespace, raises an init
 /// in it, lets that init's own worker try to kill it, then kills it from here -
 /// an ancestor namespace - and reports what each step said, one word per step.
-fn run_init_section(verdict: &OwnedFd) {
+fn run_init_section(verdict: &OwnedFd, stage: &OwnedFd) {
     let mut words = [0isize; 17];
     words[0] = if unshare(UnshareFlags::NEWPID).is_ok() {
         1
     } else {
         0
     };
+    stage_mark(stage, 1);
     let life = pipe();
     let said = pipe();
     let crossed = pipe();
@@ -321,6 +349,7 @@ fn run_init_section(verdict: &OwnedFd) {
         // The nested namespace's liveness, read the same way and with the same
         // non-blocking retry: the flag belongs to the pipe, so setting it here
         // serves every end of it.
+        stage_mark(stage, 2);
         let _ = unsafe { libc::fcntl(deeper_r.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
         let _ = unsafe { libc::fcntl(waited_r.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
         // The two files, opened *here* so both are inherited: the inner one is
@@ -456,6 +485,7 @@ fn run_init_section(verdict: &OwnedFd) {
         drop(waited_w);
         drop(crossed_w);
         drop(chain_w);
+        stage_mark(stage, 3);
         if init > 0 {
             // Two lines on this pipe, in order: the init's own view of its
             // chain, then the worker's answers. The first is the read that tells
@@ -474,6 +504,7 @@ fn run_init_section(verdict: &OwnedFd) {
             }
             // And the same task read from *here*, the machine's namespace: the
             // same line, with the number this side knows it by first.
+            stage_mark(stage, 4);
             let chain = ns_pid_chain(&format!("/proc/{init}/status"));
             words[10] = if chain.len() == 2 && chain[1] == 1 {
                 1
@@ -524,6 +555,7 @@ fn run_init_section(verdict: &OwnedFd) {
                 .split_whitespace()
                 .filter_map(|f| f.parse().ok())
                 .collect();
+            stage_mark(stage, 5);
             words[15] = if deep.len() == 3 && deep[2] == 1 && deep[1] != 1 {
                 1
             } else {
@@ -579,6 +611,7 @@ fn run_init_section(verdict: &OwnedFd) {
             .collect::<Vec<_>>()
             .join(" ")
     );
+    stage_mark(stage, 6);
     let _ = write(verdict, line.as_bytes());
 }
 
@@ -610,18 +643,26 @@ fn main() {
     // still the machine's, and it makes the namespace it needs itself. Its
     // claims come back as words at the end of the program.
     let verdict = pipe();
-    r.check("the init section's report pipe is made", verdict.is_ok());
+    let stage = pipe();
+    r.check(
+        "the init section's report pipe is made",
+        verdict.is_ok() && stage.is_ok(),
+    );
     let mut section = -1;
     let mut verdict_r: Option<OwnedFd> = None;
-    if let Ok((reader, writer)) = verdict {
+    let mut stage_r: Option<OwnedFd> = None;
+    if let (Ok((reader, writer)), Ok((stage_read, stage_write))) = (verdict, stage) {
         section = unsafe { libc::fork() };
         if section == 0 {
             drop(reader);
-            run_init_section(&writer);
+            drop(stage_read);
+            run_init_section(&writer, &stage_write);
             raw_exit(0);
         }
         drop(writer);
+        drop(stage_write);
         verdict_r = Some(reader);
+        stage_r = Some(stage_read);
     }
     r.check("the init section was forked", section > 0);
 
@@ -782,7 +823,7 @@ fn main() {
             let _ = write(&down_w, tell.as_bytes());
             drop(down_w);
             let mut report = [0u8; REPORT_MAX];
-            let n = drain(&up_r, &mut report);
+            let n = drain(&up_r, &mut report, 30_000);
             drop(up_r);
             let text = String::from_utf8_lossy(&report[..n]).to_string();
             let fields: Vec<i64> = text
@@ -877,7 +918,26 @@ fn main() {
     // shared global fails.
     if let Some(verdict_r) = verdict_r {
         let mut report = [0u8; REPORT_MAX];
-        let n = drain(&verdict_r, &mut report);
+        let n = drain(&verdict_r, &mut report, 60_000);
+        // How far the section got, if it stopped: the last stage mark it wrote.
+        let mut marks = [0u8; 32];
+        let reached = match &stage_r {
+            Some(ro) => {
+                let mut seen = 0usize;
+                while seen < marks.len() {
+                    match read(ro, &mut marks[seen..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen += n,
+                    }
+                }
+                marks[..seen].last().copied().unwrap_or(0)
+            }
+            None => 0,
+        };
+        r.check(
+            &format!("the init section ran to its end (last stage {reached})"),
+            reached == 6,
+        );
         let words: Vec<isize> = String::from_utf8_lossy(&report[..n])
             .split_whitespace()
             .filter_map(|f| f.parse().ok())

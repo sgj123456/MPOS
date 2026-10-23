@@ -3130,3 +3130,37 @@ What the same probe also settled, and needs no decision: `PR_SET_MM_*` (code,
 data, stack and brk boundaries) is `EPERM` for an unprivileged caller - the gate
 is `CAP_SYS_RESOURCE` *before* any argument check - which is what this kernel's
 catch-all already gives a non-root caller for a different reason.
+
+### 6.22 The hang in `t-ns-pid`, made sayable (2026-10-23)
+
+Two lanes died at 900 seconds this session with the same last line -
+`t-ns-pid`'s *"while a fork into the namespace whose init has exited is
+ENOMEM"* - while the same program passed on the runs between, and in one of the
+two cases another lane had already gone red on `t-posix`'s `getpriority` claim.
+The log could say only where the program had **started**, because the parent's
+last act is a blocking read to end-of-file on the pipe from its forked section:
+if that section stops, the read never returns, the lane times out, and the
+lane timeout reports the clock rather than the program.
+
+That read is now **bounded**, and the section marks its stages: one byte at each
+of six points - its own `unshare(CLONE_NEWPID)`, its pipes, the fork of the init,
+the first report line, the deep chain's line, and the verdict itself - so a
+section that stops names the stage it stopped in. The claim is
+`"the init section ran to its end (last stage N)"`, which is a failed claim with a
+number in it rather than fifteen minutes of silence.
+
+Two numbers decided the budget. The section's own children sleep up to fifty
+seconds by design (the init and its worker park to be killed), so the read's
+patience is **60 s** for the verdict and **30 s** for the shorter report - far
+above the section's worst case and far below the lane's 900 s. A bounded read is
+not a fix for the hang: it is the instrument that makes the next occurrence
+answer the question the last two could not.
+
+What the instrument does **not** say yet, and what to look at first: the section's
+parent has three blocking reads (two lines on the init's pipe, one on the nested
+task's), each waiting for a specific child, so a stage mark of 3 with no 4 means
+the init or its worker never wrote - a forked task that never ran, or a wait that
+never woke. That is where the next occurrence will point.
+
+**Gate**: x86_64 `pass=205 fail=0`, `mpos-kunit 32 passed, 0 failed`, and
+`t-ns-pid` alone is 45 claims with `last stage 6` in its log.
