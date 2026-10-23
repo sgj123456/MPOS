@@ -3087,3 +3087,46 @@ that caught the gap), and the ignored tail argument.
 
 **Gate**: x86_64 `pass=205 fail=0`, stage 1 `1100 tests, 0 failed`,
 `mpos-kunit 32 passed, 0 failed`, exit 0.
+
+### 6.21 Three `prctl` options this kernel leaves refused — and the numbers that decide it (2026-10-23)
+
+`prctl`'s catch-all answers `EINVAL` to every option the kernel does not model, and
+§4.2's rule is that an option is accepted only once real state backs it. Three
+were re-examined against that rule and **stay refused**, each for a measured
+reason. Writing the reasons down is the deliverable: each is the shape a later
+session would "fix" into a success that does nothing.
+
+**`PR_SET_TIMERSLACK` / `PR_GET_TIMERSLACK` (29/30)** — measured on a current
+host (`.workbuddy/probe_misc_prctl.c`): the getter answers the default
+**50000** ns, the setter stores a value and the getter reads it back, and
+`SET(0)` **resets to the default** rather than to zero. The value is real state
+with a real reader (a timer may fire up to `slack` late), and that reader is what
+this kernel cannot honour: its timers are a **tick** granular enough to be larger
+than Linux's default slack, so it already delays every wake more than 50 µs -
+serving the flag would let a caller set a *smaller*-than-tick slack and get a
+kernel that violates the promise it just accepted, and a larger one would change
+nothing because the tick dominates. A getter reporting 50000 would be a lie about
+enforcement and one reporting a tick would be a lie about the caller's set. So
+both stay `EINVAL`, and the gap is this paragraph rather than a stored number.
+
+**`PR_SET_PTRACER` (0x59616d61, Yama's)** — the host accepts any value here
+(itself, `1`, `PR_SET_PTRACER_ANY`, `0`) even with `ptrace_scope = 1`, because
+Yama is *built in* there. The answer this kernel gives is `EINVAL`, and it is
+Linux's own answer for a kernel **built without Yama** - the option exists only
+in that LSM's `prctl` hook, and a kernel without it falls through to the same
+default arm. So the refusal is not a gap at all: it is "this kernel has no Yama",
+and the name for it is here rather than in a handler that stores a value nothing
+would read.
+
+**`PR_SET_THP_DISABLE` / `PR_GET_THP_DISABLE` (41/42)** — the host accepts `1`
+and its getter answers `1`. The flag's reader is
+`transparent_hugepage_enabled()`, and this kernel has **no huge pages** (the
+`MAP_HUGETLB` refusal is `ENOMEM` for the same reason, `docs/uapi/` §5.1): a
+stored flag whose only reader does not exist is precisely the §4.2 violation, so
+it stays `EINVAL`. The day a THP pool lands, the flag becomes honest in the same
+commit as its reader.
+
+What the same probe also settled, and needs no decision: `PR_SET_MM_*` (code,
+data, stack and brk boundaries) is `EPERM` for an unprivileged caller - the gate
+is `CAP_SYS_RESOURCE` *before* any argument check - which is what this kernel's
+catch-all already gives a non-root caller for a different reason.
