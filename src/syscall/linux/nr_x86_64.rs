@@ -201,6 +201,13 @@ pub const SHMGET: u64 = 29;
 pub const SHMAT: u64 = 30;
 pub const SHMCTL: u64 = 31;
 pub const SHMDT: u64 = 67;
+// The System V semaphore family: 64 through 66 in the block the three original
+// SysV families share, and `semtimedop` far away at 220 because it was added
+// years later.
+pub const SEMGET: u64 = 64;
+pub const SEMOP: u64 = 65;
+pub const SEMCTL: u64 = 66;
+pub const SEMTIMEDOP: u64 = 220;
 pub const PPOLL: u64 = 271;
 pub const SCHED_YIELD: u64 = 24; // sched_yield(2)
 pub const CLEANUP_AFTER_KTHREAD: u64 = 999;

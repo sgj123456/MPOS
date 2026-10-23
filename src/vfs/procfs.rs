@@ -3246,7 +3246,7 @@ pub fn sysvipc_shm_text() -> String {
         let times = segment.times();
         let attachments = crate::sched::shm_attachment_count(segment.id());
         out.push_str(&alloc::format!(
-            "{:10}{:11} {:6o}{:22}{:6}{:6}{:7}{:6}{:6}{:6}{:6}{:11}{:11}{:11}{:22}{:22}\n",
+            "{:10}{:11}{:6o}{:22}{:6}{:6}{:7}{:6}{:6}{:6}{:6}{:11}{:11}{:11}{:22}{:22}\n",
             perm.key,
             perm.id,
             perm.mode,
@@ -3263,6 +3263,39 @@ pub fn sysvipc_shm_text() -> String {
             times.ctime,
             segment.resident_pages(),
             0,
+        ));
+    }
+    out
+}
+
+/// The header `/proc/sysvipc/sem` starts with, measured off a current host in
+/// the same way the segment table's was - the widths are the kernel's, and the
+/// `perms` column carries its own leading space (six wide, not five plus one).
+const SYSVIPC_SEM_HEADER: &str =
+    "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n";
+
+/// `/proc/sysvipc/sem`: one line per set, in the kernel's `ipcs` layout.
+///
+/// The key is decimal and 10 wide, `perms` is the mode word in octal, `nsems` is
+/// 11 wide, the four ids are 6 each, and the two clocks are 11 each -
+/// `sem_otime` then `sem_ctime`, zero until something has operated on the set.
+pub fn sysvipc_sem_text() -> String {
+    let mut out = String::from(SYSVIPC_SEM_HEADER);
+    for set in crate::sched::sysv_sem::all() {
+        let perm = set.perm();
+        let (otime, ctime) = set.times();
+        out.push_str(&alloc::format!(
+            "{:10}{:11}{:6o}{:11}{:6}{:6}{:6}{:6}{:11}{:11}\n",
+            perm.key,
+            perm.id,
+            perm.mode,
+            perm.nsems,
+            perm.uid,
+            perm.gid,
+            perm.cuid,
+            perm.cgid,
+            otime,
+            ctime,
         ));
     }
     out
@@ -3569,6 +3602,7 @@ impl ProcFs {
         // (`.workbuddy/probe_shm_perm.c`; `docs/notes/` §6.13).
         let sysvipc = dir();
         sysvipc.add("shm", NodeKind::File, file(sysvipc_shm_text));
+        sysvipc.add("sem", NodeKind::File, file(sysvipc_sem_text));
         self.root.add("sysvipc", NodeKind::Dir, sysvipc);
 
         // `/proc/bus/pci`: pciutils' fallback access method, and the one

@@ -554,6 +554,18 @@ impl PosixTimer {
 pub(crate) struct Task {
     /// Must stay put for as long as the task exists.
     pub(crate) context: Context,
+    /// This task's System V semaphore undo list - the adjustments a `semop`
+    /// with `SEM_UNDO` recorded, to be applied when the last holder of the list
+    /// exits (`sysv_sem::UndoList`).
+    ///
+    /// `None` until something asks for an undo record, which is why the common
+    /// case costs nothing: a program that never uses `SEM_UNDO` never allocates
+    /// one. `Arc` rather than a plain `Vec` because `CLONE_SYSVSEM` is a
+    /// *sharing* flag - `pthread_create` passes it, so a process's threads
+    /// adjust one list, and the list is applied when the last of them exits
+    /// (measured: a child forked without the flag neither sees nor applies its
+    /// parent's adjustments, `docs/notes/` §6.14).
+    pub(crate) sem_undo: Option<Arc<crate::sched::sysv_sem::UndoList>>,
     /// Whether the hardware floating-point registers currently hold *this*
     /// task's state - the whole of the lazy-FPU bookkeeping, and the reason
     /// `context.fpu` is not written on every switch.
@@ -1062,6 +1074,7 @@ impl Task {
     pub(crate) fn adopted() -> Task {
         Task {
             context: Context::empty(),
+            sem_undo: None,
             priority: Priority::NORMAL,
             stack: None,
             exited: false,
@@ -1722,6 +1735,8 @@ impl Table {
 
         self.tasks[slot] = Some(Task {
             context,
+            // A kernel task has no System V adjustments to record or apply.
+            sem_undo: None,
             fpu_live: false,
             priority,
             stack: Some(stack),

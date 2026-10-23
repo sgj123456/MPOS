@@ -534,6 +534,12 @@ pub unsafe fn dispatch(
         nr::SHMAT => ipc::handle_shmat(args, from_user),
         nr::SHMDT => ipc::handle_shmdt(args, from_user),
         nr::SHMCTL => ipc::handle_shmctl(args, from_user),
+        // --- System V semaphores: the second of the two families `CLONE_NEWIPC`
+        // was waiting on ---
+        nr::SEMGET => ipc::handle_semget(args, from_user),
+        nr::SEMOP => ipc::handle_semop(args, from_user),
+        nr::SEMTIMEDOP => ipc::handle_semtimedop(args, from_user),
+        nr::SEMCTL => ipc::handle_semctl(args, from_user),
         // --- the POSIX completion set ---
         //
         // The descriptor-backed timer and the interest-list multiplexer:

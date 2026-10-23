@@ -1235,6 +1235,14 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
             if bits & crate::syscall::linux::nr::CLONE_FILES != 0 {
                 crate::sched::unshare_files();
             }
+            if bits & crate::syscall::linux::nr::CLONE_SYSVSEM != 0 {
+                // The undo list is split, carrying the records the caller
+                // already had: measured on a current host, a process that
+                // records `+1` with `SEM_UNDO`, unshares and exits has the
+                // adjustment applied (`docs/notes/` §6.14). Before this it was
+                // accepted as a no-op for want of a list to split.
+                crate::sched::sysv_sem::unshare_undo();
+            }
             0
         }
     }

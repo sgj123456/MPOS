@@ -2472,3 +2472,110 @@ the `IPC_INFO`/`SHM_STAT` pair `ipcs` uses.
 exit 0. The second machine compiles the change (kernel release + clippy, and the
 pin builds for it); its sweep could not boot on this host (no DRM render node), so
 no aarch64 figure is claimed.
+
+### 6.14 System V semaphores — **LANDED** (2026-10-23, SysV's second family)
+
+`CLONE_NEWIPC`'s reason is down to one item. It was "SysV IPC objects and POSIX
+message queues" (§6.3); §6.12 took the queues, §6.13 the shared-memory family,
+and this takes the semaphores - `semget`, `semop`, `semtimedop`, `semctl`, the
+`SEM_UNDO` bookkeeping behind them, and the `/proc/sysvipc/sem` row `ipcs`
+renders. What is left of the namespace's reason is the SysV **message-queue**
+family.
+
+**Where the objects live, and why there.** A set is an array of counters plus the
+*wait* an operation that cannot be satisfied asks for, so it is
+`sched::sysv_sem`: the waiting is the scheduler's, and so is the `SEM_UNDO`
+adjustment, which is per-process state applied at death (ARCHITECTURE §3's V-3).
+It sits beside `futex` for the same reason that module does. The number a set is
+known by is the segment table's arithmetic reused verbatim (`mm::ipc_id`).
+
+**Measured whole on a current host first** (Linux 7.2.11,
+`.workbuddy/probe_sysv_sem.c`, `probe_sem2.c`, `probe_sem3.c`,
+`probe_sem_unshare.c`, `probe_ipc_order.c`), because almost every rule is a
+choice between two plausible answers:
+
+* **`semtimedop`'s timeout is relative** - a 120 ms request returned after
+  120.5 ms - and an expired one is **`EAGAIN`**, not `ETIMEDOUT` the way the
+  POSIX message queue's absolute instant is;
+* **the operation array is atomic**: `semop([+1 s0, -1 s1(0)], IPC_NOWAIT)` is
+  `EAGAIN` and leaves `s0` alone. `sem_num` past the set is `EFBIG` (where
+  `semctl`'s `semnum` is `EINVAL` - two calls, two errnos), more than 500
+  operations is `E2BIG`, an empty array is `EINVAL`, and `sem_flg` bits the
+  kernel does not know are **ignored** (`0x2000` accepted);
+* **the range refuses at both ends**: `semop(+1)` at 32767, `SETVAL(32768)` and
+  `SETVAL(-1)` are all `ERANGE` - the negative one included, which is why the
+  handler reads the argument as a signed `int` rather than a clamp;
+* **`GETALL`/`SETALL` are `unsigned short` arrays**, `nsems` long - the one place
+  this family's values are 16-bit on the wire;
+* **a blocked `semop`** is counted by `GETNCNT`/`GETZCNT`, woken by another
+  process's raise (50.6 ms observed), **ended by a handler-bearing signal**
+  (`EINTR`, where a merely blocked signal does not end it) and **woken by
+  `IPC_RMID` with `EIDRM`** - the one refusal about an object's death rather
+  than about the caller;
+* **`IPC_RMID` removes the set at once** (unlike a segment, which is *marked*):
+  the next `semop`/`semctl` naming the number is `EINVAL`, and only a waiter
+  already asleep still holds the object;
+* **`SEM_UNDO` is per process**: a `+1` with the flag reads back as 1, a forked
+  child that exits applies **nothing** (the list is not inherited), a child's own
+  record is applied by its own exit, and `unshare(CLONE_SYSVSEM)` **keeps** the
+  records (the value came back to 0). The adjustment is the operation
+  **negated** - what the exit pass adds back - which is Linux's `semadj`
+  direction and the one sign a careful reading of the man page gets wrong;
+* **three refusals, three errnos**: the triads gate `semop` and every
+  `GET*`/`SET*` (`EACCES` - and a mode-`0000` set refuses even its owner), the
+  **creator** or `CAP_SYS_ADMIN` gates `IPC_SET`/`IPC_RMID` (`EPERM`), and
+  `IPC_SET` reads its buffer **before** it asks who is calling (`EFAULT` first -
+  measured as the one call in either family whose order is the other way round
+  from `IPC_STAT`);
+* **`semget`** on an existing key accepts a **smaller** `nsems` (`semget(key, 1,
+  0)` on a two-slot set returns it) and refuses a larger one with `EINVAL`; the
+  mode is stored with no umask; and a request naming permission bits is checked
+  against them (`EACCES` for a key another user owns).
+
+**The record the two machines disagree about.** `struct semid64_ds` is 104 bytes
+on x86_64 and 88 on aarch64: x86_64's own `asm/sembuf.h` pads each clock with an
+unused word, so `sem_ctime` sits at 64 there and 56 here and `sem_nsems` at 80
+against 64. That is the trap `AGENTS.md` names - "a flag or struct constant looks
+shared but the machines disagree" - and this landing walked into it: the first
+draft used the asm-generic offsets on both machines and its own probe printed
+`nsems=1792746339` (a `ctime` read as a count) while the kernel wrote sixteen
+bytes past the caller's record. The offsets are now `abi`'s, per port, next to
+`STAT_BYTES`' precedent, with the measurement beside them
+(`.workbuddy/probe_sem_stat.c`).
+
+**What this kernel chose, and named**: `SEMMNI` 4096, `SEMMSL` 1024, `SEMMNS`
+65536 semaphores, `SEMOPM` 500, `SEMVMX`/`SEMAEM` 32767 - all reported through
+`IPC_INFO`/`SEM_INFO`, which on this kernel answer the same limits and put the
+undo statistics (`semusz`/`semaem`, which Linux re-purposes there) in the last
+two fields. Linux's own `SEMMNI`/`SEMMSL` are larger (32000 each); a limit is a
+configuration difference and the table's allocation is steerable, so §8.0's
+rule applies as it did to the segment table.
+
+**Named, not claimed**:
+
+* the **message-queue family** (`msgget`/`msgsnd`/`msgrcv`/`msgctl`) is still
+  `ENOSYS`, so `CLONE_NEWIPC` is still refused - with this one family left as
+  its reason;
+* the table is the machine's, not a namespace's, exactly as the segment table's
+  is;
+* one `SEM_UNDO` corner is not pinned: a **thread that calls
+  `unshare(CLONE_SYSVSEM)`** keeps its records and gets a list of its own (a
+  move, not Linux's fresh empty list). That is indistinguishable from Linux for a
+  process with no siblings (measured) and unpinned where a sibling's records
+  exist. The `pthread_create` **sharing** itself *is* pinned - a thread's `+1`
+  joins the process's list, so its death applies nothing and the value stays at
+  2 where a per-thread list would have taken its own `+1` back;
+* `semctl`'s `SEM_STAT_ANY` is implemented but not claimed by a test (the pin
+  walks `SEM_STAT`).
+
+**Pin**: the new `t-sysv-sem`, 70 claims, plus seven host tests in
+`sched::sysv_sem` for the operation arithmetic, the waiter registration and the
+undo fold - the host tests are what caught `IPC_NOWAIT` being asked of the call
+rather than of the operation, and the sign of the undo adjustment, before the
+sweep could.
+
+**Gate**: x86_64 `pass=203 fail=0 (214 built)`, `mpos-kunit 32 passed, 0
+failed`, exit 0. The second machine compiles the change (kernel release +
+clippy, and the pin builds for it, with its own `semid64_ds` offsets); its sweep
+could not boot on this host (no DRM render node), so no aarch64 figure is
+claimed.

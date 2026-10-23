@@ -639,6 +639,11 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
 
         t.tasks[slot] = Some(Task {
             context,
+            // A fresh process starts with no semaphore adjustments: the list is
+            // per-process and is *not* inherited by a plain `fork` (measured,
+            // `docs/notes/` §6.14); a `clone(CLONE_SYSVSEM)` child shares the
+            // parent's and gets it copied in by the clone path afterwards.
+            sem_undo: None,
             fpu_live: false,
             priority: Priority::NORMAL,
             stack: Some(stack),
@@ -830,6 +835,11 @@ pub fn try_spawn_user(
 
         t.tasks[slot] = Some(Task {
             context,
+            // A fresh process starts with no semaphore adjustments: the list is
+            // per-process and is *not* inherited by a plain `fork` (measured,
+            // `docs/notes/` §6.14); a `clone(CLONE_SYSVSEM)` child shares the
+            // parent's and gets it copied in by the clone path afterwards.
+            sem_undo: None,
             fpu_live: false,
             priority,
             stack: Some(stack),

@@ -77,6 +77,12 @@ pub const ERANGE: isize = -34;
 pub const EPIPE: isize = -32;
 pub const ENOSYS: isize = -38;
 pub const EPERM: isize = -1;
+/// EIDRM: the object a System V call named has been removed, and this is the
+/// answer to a caller that was already waiting on it. A `semop` asleep on a set
+/// another process `IPC_RMID`s wakes with this (measured on a current host,
+/// `docs/notes/` §6.14) - it is the one refusal that is about the *object's*
+/// death rather than about the caller or the argument.
+pub const EIDRM: isize = -43;
 pub const EOPNOTSUPP: isize = -95;
 pub const EROFS: isize = -30;
 /// EXDEV: a hard link across two filesystems. The one request `link(2)`

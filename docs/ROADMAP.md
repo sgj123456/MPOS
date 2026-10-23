@@ -166,9 +166,12 @@ One-glance status of the whole roadmap.
   shared memory** — `shmget`/`shmat`/`shmdt`/`shmctl` with Linux's slot-and-
   generation numbers, marked-not-removed `IPC_RMID`, an attachment count folded
   out of every address space (so a `fork` counts), and `/proc/sysvipc/shm`;
-  `t-sysv-shm` pins 61 claims measured on the host first (§6.13, item 101).
-  `CLONE_NEWIPC`'s isolation is now missing only SysV **semaphores** and
-  **message queues**
+  `t-sysv-shm` pins 61 claims measured on the host first (§6.13, item 101) — and
+  **System V semaphores** — `semget`/`semop`/`semtimedop`/`semctl` with waiting,
+  `SEM_UNDO` applied at the process's death and split by
+  `unshare(CLONE_SYSVSEM)`, and `/proc/sysvipc/sem`; `t-sysv-sem` pins 70 claims
+  and seven host tests (§6.14, item 102). `CLONE_NEWIPC`'s isolation is now
+  missing only the SysV **message-queue** family
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
 - [x] the extensible `clone` door — `clone3` (435) with a versioned argument
   struct, and `CLONE_PIDFD` delivering the child **and a descriptor naming it** in
@@ -367,8 +370,8 @@ In the order that keeps each step verifiable on its own:
    port id a zero-`nl_pid` bind prefers (three probes; `t-uevent`, §6.3). So nothing of the `ucred`  
    stays named now.  
    IPC and CGROUP each wait on the thing they would isolate not  
-   existing yet (SysV semaphores and message queues, the POSIX queue half having
-   landed in §6.12 and shared memory in §6.13; and a cgroup tree),  
+   existing yet (SysV message queues, the POSIX queue half having landed in
+   §6.12, shared memory in §6.13 and semaphores in §6.14; and a cgroup tree),  
    so they are cheap the day that lands and worthless before it. Nested namespaces pin the  
    *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were  
    per-namespace but unexercised; `t-ns-net` reads the file on both sides of the boundary now  
@@ -453,8 +456,9 @@ the semantics still incomplete are a datagram socket's `SO_RCVBUF` - reported in
 shape but not what sizes the receive ring (item 58; a stream's is now its window, item 98) -  
 and the datagram line itself, which is the ring's rather than Linux's 65507 until this stack  
 fragments IP; the two namespace kinds with no entry at all are IPC and cgroup, and IPC's wait is
-now one family rather than three: its POSIX message queues (§6.12) and its System V
-shared memory (§6.13) are served, its SysV semaphores and message queues are not.  
+now one family rather than three: its POSIX message queues (§6.12), its System V
+shared memory (§6.13) and its SysV semaphores (§6.14) are served, its SysV
+message queues are not.  
 
 **A stream's receive buffer is its window, and a listener hands it to the socket it accepts**
 (`docs/uapi/` §5.1 item 98, landed 2026-10-21): item 58 made `SO_RCVBUF` Linux's number, but on a

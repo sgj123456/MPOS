@@ -10,6 +10,10 @@ pub mod fs;
 pub mod futex;
 pub mod policy;
 pub mod signal;
+/// System V semaphores: the set table, the operations and their waiters, and
+/// the per-process `SEM_UNDO` list. Host-compiled like `futex` - the table's
+/// arithmetic is testable without a machine, and only the sleeping is not.
+pub mod sysv_sem;
 
 #[cfg(target_os = "none")]
 mod runtime;
@@ -92,6 +96,11 @@ pub use runtime::{
 /// `pub(crate)` because it names the crate-private record type.
 #[cfg(target_os = "none")]
 pub(crate) use runtime::take_retired_current;
+/// The task table's one access door, re-exported for the sibling modules
+/// (`sysv_sem`'s undo list lives on the task, and the exit path is its own
+/// borrow of the table).
+#[cfg(target_os = "none")]
+pub(crate) use runtime::with_table;
 
 /// The stop accessors and the register-file snapshot are the machine's to build
 /// (`NOTES.md` §13): their `runtime` definitions carry a register file sized by

@@ -1,6 +1,6 @@
 # sched
 
-**Home:** `src/sched/` · **Owns:** tasks — the task table and their stacks, which task runs next, blocking/sleep deadlines, per-process signal state, futexes, and the exit-hook registry
+**Home:** `src/sched/` · **Owns:** tasks — the task table and their stacks, which task runs next, blocking/sleep deadlines, per-process signal state, futexes, System V semaphores and their undo lists, and the exit-hook registry
 
 ## What it owns
 
@@ -11,8 +11,10 @@ driven by a tick count the caller owns — so it is unit-tested on the host. `ru
 owns the task table, the stacks and everything that must touch the machine, and calls into
 `arch::context` to move between tasks. Between them sit three pieces of *vocabulary* kept out on
 their own so they can be pinned without a scheduler: `signal.rs` (numbers, pending-bit arithmetic,
-dispositions, the real-time queue), `futex.rs` (the address→task wait table and its ordering) and
-`exit.rs` (the registry that inverts per-subsystem cleanup). `mod.rs` is the facade: it re-exports
+dispositions, the real-time queue), `futex.rs` (the address→task wait table and its ordering),
+`sysv_sem.rs` (the semaphore sets, the waiters an unsatisfiable operation sleeps on, and the
+per-process `SEM_UNDO` list applied at death) and `exit.rs` (the registry that inverts
+per-subsystem cleanup). `mod.rs` is the facade: it re-exports
 `policy`, declares `runtime` as `#[cfg(target_os = "none")] mod runtime;`, and supplies the
 one-process host stand-ins for the calls the host build still needs to answer.
 

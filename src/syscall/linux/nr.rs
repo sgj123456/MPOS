@@ -248,6 +248,14 @@ mod tests {
         assert_eq!(SHMAT, 30);
         assert_eq!(SHMCTL, 31);
         assert_eq!(SHMDT, 67);
+        // The semaphore four, and the one that is not where its siblings are:
+        // `semtimedop` is 220 because Linux added it long after 64..=66 were
+        // spent on `semget`/`semop`/`semctl`. The asm-generic table has all
+        // four together (190..=193).
+        assert_eq!(SEMGET, 64);
+        assert_eq!(SEMOP, 65);
+        assert_eq!(SEMCTL, 66);
+        assert_eq!(SEMTIMEDOP, 220);
     }
 
     /// `clone(2)`: the flag bits, as the same table numbers them. The

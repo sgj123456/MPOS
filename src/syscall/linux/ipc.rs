@@ -561,6 +561,9 @@ pub fn handle_mq_getsetattr(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 //   this host, and `IPC_STAT` reports the size **asked for** rather than the
 //   page-rounded mapping length.
 
+use super::abi::{
+    IPC_PERM_CGID, IPC_PERM_CUID, IPC_PERM_GID, IPC_PERM_MODE, IPC_PERM_SEQ, IPC_PERM_UID,
+};
 use crate::mm::elf::USER_LIMIT;
 use crate::mm::pframe::PAGE_SIZE;
 use crate::mm::sysv_shm::{self, MODE_MASK, SHMALL, SHMMAX, SHMMNI, Segment, ShmError};
@@ -604,12 +607,6 @@ const SHM_CTIME: usize = 72;
 const SHM_CPID: usize = 80;
 const SHM_LPID: usize = 84;
 const SHM_NATTCH: usize = 88;
-const SHM_PERM_UID: usize = 4;
-const SHM_PERM_GID: usize = 8;
-const SHM_PERM_CUID: usize = 12;
-const SHM_PERM_CGID: usize = 16;
-const SHM_PERM_MODE: usize = 20;
-const SHM_PERM_SEQ: usize = 24;
 
 /// `struct shminfo64`: five `unsigned long`s and four reserved words.
 const SHMINFO_BYTES: usize = 72;
@@ -657,10 +654,17 @@ fn triad_grants(mode: u32, owner: (u32, u32), want: u32) -> bool {
 }
 
 /// Linux's `ipcperms`: the triads, and `CAP_IPC_OWNER` behind them.
+///
+/// One rule for both families - a mode word, its owner pair and the capability -
+/// because the object is the only thing that differs between them.
+fn mode_permits(mode: u32, owner: (u32, u32), want: u32) -> bool {
+    triad_grants(mode, owner, want)
+        || crate::sched::ns_capable_of(&crate::sched::current_user_ns(), crate::cred::CAP_IPC_OWNER)
+}
+
 fn ipc_permitted(segment: &Segment, want: u32) -> bool {
     let perm = segment.perm();
-    triad_grants(perm.mode, (perm.uid, perm.gid), want)
-        || crate::sched::ns_capable_of(&crate::sched::current_user_ns(), crate::cred::CAP_IPC_OWNER)
+    mode_permits(perm.mode, (perm.uid, perm.gid), want)
 }
 
 /// Linux's `ipcctl_obtain_check`: who may `IPC_SET` or `IPC_RMID` a segment.
@@ -670,8 +674,12 @@ fn ipc_permitted(segment: &Segment, want: u32) -> bool {
 /// caller with `CAP_SYS_ADMIN`. A refusal is `EPERM`, measured, while the
 /// read-shaped `IPC_STAT` refuses through `ipcperms` with `EACCES`.
 fn may_control(segment: &Segment) -> bool {
-    let perm = segment.perm();
-    crate::sched::current_owner().0 == perm.cuid
+    creator_or_admin(segment.perm().cuid)
+}
+
+/// The `ipcctl_obtain_check` question, for an object whose creator is known.
+fn creator_or_admin(cuid: u32) -> bool {
+    crate::sched::current_owner().0 == cuid
         || crate::sched::ns_capable_of(&crate::sched::current_user_ns(), crate::cred::CAP_SYS_ADMIN)
 }
 
@@ -698,12 +706,12 @@ fn write_shmid_ds(at: usize, segment: &Segment, attachments: usize) {
     let put32 = |off: usize, v: u32| unsafe { ((at + off) as *mut u32).write_unaligned(v) };
     let put64 = |off: usize, v: u64| unsafe { ((at + off) as *mut u64).write_unaligned(v) };
     put32(0, perm.key as u32);
-    put32(SHM_PERM_UID, perm.uid);
-    put32(SHM_PERM_GID, perm.gid);
-    put32(SHM_PERM_CUID, perm.cuid);
-    put32(SHM_PERM_CGID, perm.cgid);
-    put32(SHM_PERM_MODE, perm.mode);
-    unsafe { ((at + SHM_PERM_SEQ) as *mut u16).write_unaligned(perm.seq) };
+    put32(IPC_PERM_UID, perm.uid);
+    put32(IPC_PERM_GID, perm.gid);
+    put32(IPC_PERM_CUID, perm.cuid);
+    put32(IPC_PERM_CGID, perm.cgid);
+    put32(IPC_PERM_MODE, perm.mode);
+    unsafe { ((at + IPC_PERM_SEQ) as *mut u16).write_unaligned(perm.seq) };
     put64(SHM_SEGSZ, perm.size as u64);
     put64(SHM_ATIME, times.atime as u64);
     put64(SHM_DTIME, times.dtime as u64);
@@ -946,15 +954,20 @@ pub fn handle_shmctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                     0
                 }
                 IPC_SET => {
-                    if !may_control(&segment) {
-                        return err::EPERM;
-                    }
+                    // The copy comes first: measured, a non-owner whose `buf` is
+                    // null hears `EFAULT` and not `EPERM`, while `IPC_STAT`
+                    // answers the permission question first. Two orders in one
+                    // call, which is why each is pinned
+                    // (`.workbuddy/probe_ipc_order.c`, `docs/notes/` §6.14).
                     if !buffer_ok(buf, SHM_DS_BYTES, false, from_user) {
                         return err::EFAULT;
                     }
-                    let uid = unsafe { ((buf + SHM_PERM_UID) as *const u32).read_unaligned() };
-                    let gid = unsafe { ((buf + SHM_PERM_GID) as *const u32).read_unaligned() };
-                    let mode = unsafe { ((buf + SHM_PERM_MODE) as *const u32).read_unaligned() };
+                    if !may_control(&segment) {
+                        return err::EPERM;
+                    }
+                    let uid = unsafe { ((buf + IPC_PERM_UID) as *const u32).read_unaligned() };
+                    let gid = unsafe { ((buf + IPC_PERM_GID) as *const u32).read_unaligned() };
+                    let mode = unsafe { ((buf + IPC_PERM_MODE) as *const u32).read_unaligned() };
                     segment.set_perm(uid, gid, mode);
                     segment.touch_change(now_secs());
                     0
@@ -979,6 +992,427 @@ pub fn handle_shmctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 SHM_LOCK | SHM_UNLOCK => {
                     segment.set_locked(cmd == SHM_LOCK);
                     0
+                }
+                _ => err::EINVAL,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System V semaphores: `semget`, `semop`, `semtimedop`, `semctl`
+// ---------------------------------------------------------------------------
+//
+// The objects are `sched::sysv_sem`'s, and they live there rather than in `mm`
+// for the reason that module's header gives: a set is a counter plus a *wait*,
+// and the wait is the scheduler's - so are the `SEM_UNDO` records, which are a
+// process's own cleanup at death. Every rule below was measured on a current
+// host first (`docs/notes/` §6.14):
+//
+// * `semtimedop`'s timeout is **relative** and an expired one is `EAGAIN`;
+// * an operation array is atomic, `sem_num` past the end is `EFBIG`, more than
+//   `SEMOPM` entries is `E2BIG`, and an empty array is `EINVAL`;
+// * unknown `sem_flg` bits are ignored, and every value stays inside
+//   `0..=SEMVMX` (`ERANGE` both ways - `SETVAL(-1)` included);
+// * `semget` on an existing key accepts **fewer** semaphores than it holds and
+//   refuses more (`EINVAL`), and its mode is not passed through a umask;
+// * `ipcperms` gates `semop` and every `GET*`/`SET*` (`EACCES`, even for the
+//   owner of a `0000` set), the **creator** or `CAP_SYS_ADMIN` gates
+//   `IPC_SET`/`IPC_RMID` (`EPERM`), and `IPC_SET` reads its buffer before it
+//   asks who is calling (`EFAULT` first, measured);
+// * a blocked `semop` wakes on another process's raise, on a handler-bearing
+//   signal (`EINTR`), and on `IPC_RMID` (`EIDRM`).
+
+use super::abi::{
+    SEMBUF_BYTES, SEMID_DS_BYTES, SEMID_DS_CTIME, SEMID_DS_NSEMS, SEMID_DS_OTIME, SEMINFO_BYTES,
+};
+use crate::sched::sysv_sem::{self, SemBuf, SemError};
+
+/// `semctl`'s commands, from `linux/sem.h` and `linux/ipc.h`.
+const GETPID: usize = 11;
+const GETVAL: usize = 12;
+const GETALL: usize = 13;
+const GETNCNT: usize = 14;
+const GETZCNT: usize = 15;
+const SETVAL: usize = 16;
+const SETALL: usize = 17;
+const SEM_STAT: usize = 18;
+const SEM_INFO: usize = 19;
+const SEM_STAT_ANY: usize = 20;
+
+fn err_of_sem(e: SemError) -> isize {
+    match e {
+        SemError::NoEntry => err::ENOENT,
+        SemError::Exists => err::EEXIST,
+        SemError::TooSmall | SemError::BadCount => err::EINVAL,
+        SemError::Full => err::ENOSPC,
+        SemError::BadSem => err::EFBIG,
+        SemError::Range => err::ERANGE,
+        SemError::WouldBlock => err::EAGAIN,
+    }
+}
+
+/// Whether the running caller may read a set - `ipcperms` with `S_IRUGO`.
+fn sem_readable(set: &sysv_sem::Set) -> bool {
+    let perm = set.perm();
+    mode_permits(perm.mode, (perm.uid, perm.gid), 0o4)
+}
+
+/// Whether the running caller may alter a set - `ipcperms` with `S_IWUGO`,
+/// which is the check `semop` and `SETVAL`/`SETALL` make.
+fn sem_writable(set: &sysv_sem::Set) -> bool {
+    let perm = set.perm();
+    mode_permits(perm.mode, (perm.uid, perm.gid), 0o2)
+}
+
+/// Write one `semid64_ds` in the calling **machine's** layout. The caller has
+/// validated the range.
+///
+/// The two machines disagree about this record - x86_64 pads each clock with an
+/// unused word, aarch64 does not - so the offsets are `abi`'s, where the
+/// measurement lives with them.
+fn write_semid_ds(at: usize, set: &sysv_sem::Set) {
+    let perm = set.perm();
+    let (otime, ctime) = set.times();
+    unsafe { core::ptr::write_bytes(at as *mut u8, 0, SEMID_DS_BYTES) };
+    let put32 = |off: usize, v: u32| unsafe { ((at + off) as *mut u32).write_unaligned(v) };
+    let put64 = |off: usize, v: u64| unsafe { ((at + off) as *mut u64).write_unaligned(v) };
+    put32(0, perm.key as u32);
+    put32(IPC_PERM_UID, perm.uid);
+    put32(IPC_PERM_GID, perm.gid);
+    put32(IPC_PERM_CUID, perm.cuid);
+    put32(IPC_PERM_CGID, perm.cgid);
+    put32(IPC_PERM_MODE, perm.mode);
+    unsafe { ((at + IPC_PERM_SEQ) as *mut u16).write_unaligned(perm.seq) };
+    put64(SEMID_DS_OTIME, otime as u64);
+    put64(SEMID_DS_CTIME, ctime as u64);
+    put64(SEMID_DS_NSEMS, perm.nsems as u64);
+}
+
+/// `struct seminfo`'s ten `int`s, for `IPC_INFO` and `SEM_INFO`.
+///
+/// Both commands fill the same record; `IPC_INFO` reports the limits and
+/// `SEM_INFO` the same limits with two of the fields re-purposed (Linux reuses
+/// `semusz`/`semaem`/`semmnu` to report usage there), which is why one writer
+/// serves both and the caller passes what the command means.
+fn write_seminfo(at: usize, limits: bool) {
+    // Both commands report the **limits** in the same fields; they differ only
+    // in the last two, which `SEM_INFO` re-purposes as usage statistics (Linux's
+    // own source calls this "cursed", and the comment there is about exactly
+    // this). Measured: `IPC_INFO` and `SEM_INFO` on a current host agree on
+    // `semmni`/`semmns`/`semmsl`/`semopm`/`semvmx`, while `SEM_INFO`'s
+    // `semusz`/`semaem` were the undo records and lists in use.
+    let (undo_records, undo_lists) = sysv_sem::undo_stats();
+    let values: [i32; 10] = [
+        0,                                             // semmap: unused by Linux
+        sysv_sem::SEMMNI as i32,                       // semmni
+        sysv_sem::SEMMNS as i32,                       // semmns
+        sysv_sem::SEMMNS as i32,                       // semmnu
+        sysv_sem::SEMMSL as i32,                       // semmsl
+        sysv_sem::SEMOPM as i32,                       // semopm
+        500,                                           // semume: undo entries per process
+        if limits { 20 } else { undo_records as i32 }, // semusz
+        sysv_sem::SEMVMX,                              // semvmx
+        if limits {
+            sysv_sem::SEMAEM
+        } else {
+            undo_lists as i32
+        }, // semaem
+    ];
+    unsafe {
+        for (i, value) in values.iter().enumerate() {
+            ((at + i * 4) as *mut i32).write_unaligned(*value);
+        }
+    }
+}
+
+/// `semget(key, nsems, semflg)`.
+pub fn handle_semget(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
+    let key = args[0] as i32;
+    let nsems = args[1];
+    let flags = args[2] as i32 as u32;
+    let me = crate::sched::current_owner();
+
+    let new = sysv_sem::New {
+        key,
+        nsems,
+        mode: flags & MODE_MASK,
+        uid: me.0,
+        gid: me.1,
+        now: now_secs(),
+    };
+    let created = flags & IPC_CREAT != 0;
+    let exclusive = flags & IPC_EXCL != 0;
+
+    match sysv_sem::get_or_create(new, created, exclusive) {
+        Ok((set, made_now)) => {
+            // As with `shmget`: only an **existing** set is asked the permission
+            // question, only when the caller named permissions, and after the
+            // `EEXIST` and size refusals - the measured order.
+            if !made_now && flags & MODE_MASK != 0 {
+                let want = asked_permissions(flags);
+                let perm = set.perm();
+                if !mode_permits(perm.mode, (perm.uid, perm.gid), want) {
+                    return err::EACCES;
+                }
+            }
+            set.id() as isize
+        }
+        Err(e) => err_of_sem(e),
+    }
+}
+
+/// Read a caller's `struct sembuf` array.
+fn read_sembufs(
+    at: usize,
+    count: usize,
+    from_user: bool,
+) -> Result<alloc::vec::Vec<SemBuf>, isize> {
+    if !buffer_ok(at, count * SEMBUF_BYTES, false, from_user) {
+        return Err(err::EFAULT);
+    }
+    let mut ops = alloc::vec::Vec::with_capacity(count);
+    for index in 0..count {
+        let record = at + index * SEMBUF_BYTES;
+        let num = unsafe { (record as *const u16).read_unaligned() } as usize;
+        let op = unsafe { ((record + 2) as *const i16).read_unaligned() } as i32;
+        let flags = unsafe { ((record + 4) as *const i16).read_unaligned() };
+        ops.push(SemBuf { num, op, flags });
+    }
+    Ok(ops)
+}
+
+/// `semop(semid, sops, nsops)` and `semtimedop(semid, sops, nsops, timeout)`.
+fn semop_common(args: [usize; ARG_COUNT], from_user: bool, timed: bool) -> isize {
+    let id = args[0] as i32 as i64;
+    let ops_at = args[1];
+    let count = args[2];
+
+    // The array's *length* is checked before its contents, and both before the
+    // set: measured, an empty array is `EINVAL` and 501 entries `E2BIG`
+    // whatever the id names.
+    if count == 0 {
+        return err::EINVAL;
+    }
+    if count > sysv_sem::SEMOPM {
+        return err::E2BIG;
+    }
+    let ops = match read_sembufs(ops_at, count, from_user) {
+        Ok(ops) => ops,
+        Err(e) => return e,
+    };
+    let Some(set) = sysv_sem::lookup(id) else {
+        return err::EINVAL;
+    };
+    if !sem_writable(&set) {
+        return err::EACCES;
+    }
+
+    // `semtimedop`'s timeout is a **relative** duration, measured by the clock
+    // (120 ms asked, 120.5 ms observed) - the opposite of the POSIX message
+    // queue's absolute instant. A malformed one is `EINVAL`, and one already
+    // past wakes the attempt with `EAGAIN` on its first try.
+    let deadline = if timed {
+        let at = args[3];
+        if !buffer_ok(at, 16, false, from_user) {
+            return err::EFAULT;
+        }
+        let sec = unsafe { (at as *const i64).read_unaligned() };
+        let nsec = unsafe { ((at + 8) as *const i64).read_unaligned() };
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+            return err::EINVAL;
+        }
+        let wait = (sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nsec as u64);
+        Some(crate::hal::since_boot_nanos().saturating_add(wait))
+    } else {
+        None
+    };
+
+    // An undo list is made only by a call that carries `SEM_UNDO`, so a program
+    // that never asks for one never allocates it.
+    let undo = if ops.iter().any(|op| op.flags & sysv_sem::SEM_UNDO != 0) {
+        Some(sysv_sem::undo_list())
+    } else {
+        None
+    };
+    let me = crate::sched::current();
+    let pid = crate::sched::current_pid_number();
+    loop {
+        match sysv_sem::semop_attempt(&set, &ops, undo.as_ref(), now_secs(), pid, Some(me)) {
+            sysv_sem::Attempt::Done => {
+                // A counter moved: whoever was waiting on this set looks again.
+                // Waking all of them is the simple shape (they re-check and go
+                // back to sleep if another got there first); a set has tens of
+                // waiters, not thousands, and the check is a lock and a compare.
+                sysv_sem::wake_waiters(set.id(), |task| {
+                    crate::sched::wake(task);
+                });
+                return 0;
+            }
+            sysv_sem::Attempt::Blocked => match sysv_sem::park(me, deadline) {
+                crate::sched::WaitEnd::Condition => {
+                    // Removed under us: the object is gone, and this is the one
+                    // refusal that is about its death rather than about us.
+                    if set.removed() {
+                        return err::EIDRM;
+                    }
+                }
+                crate::sched::WaitEnd::Deadline => return err::EAGAIN,
+                crate::sched::WaitEnd::Interrupted => return err::EINTR,
+            },
+            sysv_sem::Attempt::Refused(e) => return err_of_sem(e),
+        }
+    }
+}
+
+/// `semop(semid, sops, nsops)`.
+pub fn handle_semop(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    semop_common(args, from_user, false)
+}
+
+/// `semtimedop(semid, sops, nsops, timeout)`.
+pub fn handle_semtimedop(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    semop_common(args, from_user, true)
+}
+
+/// `semctl(semid, semnum, cmd, arg)`.
+pub fn handle_semctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let id = args[0] as i32 as i64;
+    let semnum = args[1] as i32;
+    let cmd = args[2];
+    let arg = args[3];
+
+    match cmd {
+        // The two table-wide reports. `semid` is ignored and `semnum` is 0, and
+        // the return value is the highest slot index in use.
+        IPC_INFO | SEM_INFO => {
+            if !buffer_ok(arg, SEMINFO_BYTES, true, from_user) {
+                return err::EFAULT;
+            }
+            write_seminfo(arg, cmd == IPC_INFO);
+            sysv_sem::highest_slot() as isize
+        }
+        // The by-index reports `ipcs` walks: the first argument is a slot, not a
+        // number a caller holds, and the answer is the set's id.
+        SEM_STAT | SEM_STAT_ANY => {
+            let Some(set) = sysv_sem::by_slot(args[0] as u64) else {
+                return err::EINVAL;
+            };
+            if cmd == SEM_STAT && !sem_readable(&set) {
+                return err::EACCES;
+            }
+            if !buffer_ok(arg, SEMID_DS_BYTES, true, from_user) {
+                return err::EFAULT;
+            }
+            write_semid_ds(arg, &set);
+            set.id() as isize
+        }
+        _ => {
+            let Some(set) = sysv_sem::lookup(id) else {
+                return err::EINVAL;
+            };
+            match cmd {
+                IPC_STAT => {
+                    // Permission first, then the copy: measured, a non-owner with
+                    // a null buffer hears `EACCES` while `IPC_SET` hears
+                    // `EFAULT` first.
+                    if !sem_readable(&set) {
+                        return err::EACCES;
+                    }
+                    if !buffer_ok(arg, SEMID_DS_BYTES, true, from_user) {
+                        return err::EFAULT;
+                    }
+                    write_semid_ds(arg, &set);
+                    0
+                }
+                IPC_SET => {
+                    if !buffer_ok(arg, SEMID_DS_BYTES, false, from_user) {
+                        return err::EFAULT;
+                    }
+                    if !creator_or_admin(set.perm().cuid) {
+                        return err::EPERM;
+                    }
+                    let uid = unsafe { ((arg + IPC_PERM_UID) as *const u32).read_unaligned() };
+                    let gid = unsafe { ((arg + IPC_PERM_GID) as *const u32).read_unaligned() };
+                    let mode = unsafe { ((arg + IPC_PERM_MODE) as *const u32).read_unaligned() };
+                    set.set_perm(uid, gid, mode, now_secs());
+                    0
+                }
+                IPC_RMID => {
+                    if !creator_or_admin(set.perm().cuid) {
+                        return err::EPERM;
+                    }
+                    sysv_sem::remove(id, |task| {
+                        crate::sched::wake(task);
+                    });
+                    0
+                }
+                // The per-semaphore commands: each names one slot, and past the
+                // set's end that is `EINVAL` (where `semop`'s is `EFBIG`).
+                GETVAL | GETPID | GETNCNT | GETZCNT | SETVAL => {
+                    let Ok(sem) = usize::try_from(semnum) else {
+                        return err::EINVAL;
+                    };
+                    if sem >= set.nsems() {
+                        return err::EINVAL;
+                    }
+                    if cmd == SETVAL {
+                        if !sem_writable(&set) {
+                            return err::EACCES;
+                        }
+                        return match set.set_value(sem, arg as i32, now_secs()) {
+                            Ok(()) => 0,
+                            Err(e) => err_of_sem(e),
+                        };
+                    }
+                    if !sem_readable(&set) {
+                        return err::EACCES;
+                    }
+                    match cmd {
+                        GETVAL => set.value(sem).unwrap_or(0) as isize,
+                        GETPID => set.lpid() as isize,
+                        GETNCNT => set.waiting(sem).0 as isize,
+                        _ => set.waiting(sem).1 as isize,
+                    }
+                }
+                // `GETALL`/`SETALL` are `unsigned short` arrays, `nsems` long -
+                // the one place this family's values are 16-bit on the wire.
+                GETALL => {
+                    if !sem_readable(&set) {
+                        return err::EACCES;
+                    }
+                    let nsems = set.nsems();
+                    if !buffer_ok(arg, nsems * 2, true, from_user) {
+                        return err::EFAULT;
+                    }
+                    for (index, value) in set.values().iter().enumerate() {
+                        unsafe {
+                            ((arg + index * 2) as *mut u16).write_unaligned(*value as u16);
+                        }
+                    }
+                    0
+                }
+                SETALL => {
+                    if !sem_writable(&set) {
+                        return err::EACCES;
+                    }
+                    let nsems = set.nsems();
+                    if !buffer_ok(arg, nsems * 2, false, from_user) {
+                        return err::EFAULT;
+                    }
+                    let mut values = alloc::vec::Vec::with_capacity(nsems);
+                    for index in 0..nsems {
+                        let value = unsafe { ((arg + index * 2) as *const u16).read_unaligned() };
+                        values.push(value as i32);
+                    }
+                    match set.set_all(&values, now_secs()) {
+                        Ok(()) => 0,
+                        // A value past `SEMVMX` refuses the whole array, with
+                        // nothing written - measured.
+                        Err(e) => err_of_sem(e),
+                    }
                 }
                 _ => err::EINVAL,
             }

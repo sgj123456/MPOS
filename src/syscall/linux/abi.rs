@@ -397,6 +397,65 @@ pub(crate) fn mode_of(meta: &Metadata, stored: Option<u32>) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// semctl(2): the `semid64_ds` of the calling machine's ABI
+// ---------------------------------------------------------------------------
+
+/// `struct semid64_ds`'s size and the offsets of the three fields past its perm
+/// record - and the two machines **disagree**, which is why these are per-port
+/// constants and not one table.
+///
+/// x86_64's `asm/sembuf.h` pads each clock with an unused word; aarch64 uses the
+/// asm-generic record, which does not. Both put `sem_otime` at 48 and the
+/// `ipc64_perm` at 0..48, and then they part:
+///
+/// ```text
+///                 x86_64        aarch64
+/// sem_otime       48            48
+/// sem_ctime       64            56
+/// sem_nsems       80            64
+/// sizeof          104           88
+/// ```
+///
+/// Measured off this host's headers *and* off the kernel's own writes (a
+/// `semctl(IPC_STAT)` into a 128-byte buffer, dumped word by word:
+/// `.workbuddy/probe_sem_stat.c`). Getting it wrong is not a tidy-up: writing
+/// the x86_64 104 on aarch64 puts sixteen bytes past the caller's record, and
+/// reading aarch64's 88 on x86_64 reads a clock as `sem_nsems` - this kernel's
+/// first `semctl` draft did exactly that, and its own probe printed
+/// `nsems=1792746339`. The `struct stat` precedent is [`STAT_BYTES`], the same
+/// mistake at a different door.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const SEMID_DS_BYTES: usize = 88;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const SEMID_DS_BYTES: usize = 104;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const SEMID_DS_CTIME: usize = 56;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const SEMID_DS_CTIME: usize = 64;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const SEMID_DS_NSEMS: usize = 64;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const SEMID_DS_NSEMS: usize = 80;
+
+/// `sem_otime`'s offset, which the two machines share.
+pub(crate) const SEMID_DS_OTIME: usize = 48;
+
+/// `struct ipc64_perm`'s fields inside `semid64_ds`, shared by both machines -
+/// the perm record itself is the same 48 bytes the segment table writes.
+pub(crate) const IPC_PERM_UID: usize = 4;
+pub(crate) const IPC_PERM_GID: usize = 8;
+pub(crate) const IPC_PERM_CUID: usize = 12;
+pub(crate) const IPC_PERM_CGID: usize = 16;
+pub(crate) const IPC_PERM_MODE: usize = 20;
+pub(crate) const IPC_PERM_SEQ: usize = 24;
+
+/// `struct sembuf`: `unsigned short sem_num; short sem_op; short sem_flg` - six
+/// bytes, and the one record in this family the two machines spell identically.
+pub(crate) const SEMBUF_BYTES: usize = 6;
+
+/// `struct seminfo`: ten `int`s, the record `IPC_INFO`/`SEM_INFO` fill.
+pub(crate) const SEMINFO_BYTES: usize = 40;
+
 // stat(2): the `struct stat` of the calling machine's ABI
 // ---------------------------------------------------------------------------
 

@@ -224,6 +224,20 @@ pub fn exit(code: isize) -> ! {
             .flatten()
             .any(|other| other.tgid == tgid && !other.exited);
 
+        // The dying process's `SEM_UNDO` adjustments - Linux's `exit_sem`,
+        // applied when the list's last holder leaves. Taken here rather than
+        // through `sysv_sem`'s own door because this closure already holds the
+        // task table, and the wake is handed in (`Table::wake`) for the same
+        // reason: `sched::wake` would take it a second time.
+        if let Some(list) = t.task_mut(id).sem_undo.take()
+            && group_dead
+            && alloc::sync::Arc::strong_count(&list) == 1
+        {
+            crate::sched::sysv_sem::apply_undo(&list, |woken| {
+                t.sched.wake(woken);
+            });
+        }
+
         // The death's core-dump classification, computed here because it is a
         // fact about the *dying* process's own `dumpable` flag, which
         // `release_exited` below takes away: Linux's `WCOREDUMP`/`CLD_DUMPED`
@@ -807,6 +821,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         parent_pages,
         parent_vmas,
         parent_eager,
+        sem_undo,
     ) = with_table(|t| {
         let parent_id = t.current;
         let parent = t.task(parent_id);
@@ -849,6 +864,15 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         // space is its parent's, so `/proc/<pid>/maps` says the same thing on
         // either side of the fork.
         let parent_eager = parent.mm.eager_ranges();
+        // `CLONE_SYSVSEM` shares the semaphore undo list (Linux's
+        // `copy_semundo`: one reference up on that flag, and `NULL` - no list at
+        // all - without it). That is why `pthread_create` shares its process's
+        // adjustments while a plain `fork` inherits none.
+        let sem_undo = if request.flags & crate::abi::CLONE_SYSVSEM != 0 {
+            parent.sem_undo.clone()
+        } else {
+            None
+        };
         (
             parent_id,
             space_owner,
@@ -866,6 +890,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             parent_pages,
             parent_vmas,
             parent_eager,
+            sem_undo,
         )
     });
 
@@ -1058,6 +1083,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
 
         t.tasks[slot] = Some(Task {
             context,
+            sem_undo,
             fpu_live: false,
             priority: parent_priority,
             stack: Some(stack),
@@ -1549,6 +1575,15 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         // Read before the slot is taken: the task literal that follows is built
         // after `alloc_slot` has borrowed the table mutably.
         let inherited_parent = parent.parent;
+        // `CLONE_SYSVSEM` shares the semaphore undo list (Linux's
+        // `copy_semundo`: a refcount up on that flag, and `NULL` - no list at
+        // all - without it). That is why a `pthread_create` shares its
+        // process's adjustments while a plain `fork` inherits none of them.
+        let sem_undo = if request.flags & crate::abi::CLONE_SYSVSEM != 0 {
+            parent.sem_undo.clone()
+        } else {
+            None
+        };
         let mm = parent.mm.clone();
         // A thread shares its process's descriptor *table* under `CLONE_FILES`
         // - which is what a libc's thread creation asks for, and the whole
@@ -1647,6 +1682,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
 
         t.tasks[slot] = Some(Task {
             context,
+            sem_undo,
             fpu_live: false,
             priority,
             stack: Some(stack),
@@ -1837,6 +1873,10 @@ pub fn exit_group(code: isize) -> ! {
             // dead pid: the memory it accounted for is released by the pass,
             // not by a turn it never gets.
             task.exited = true;
+            // A sibling ended here never runs the exit path, so its hold on the
+            // group's undo list has to go now: the last thread's `exit` applies
+            // the list, and a stale `Arc` would keep it from being the last.
+            task.sem_undo = None;
             t.sched.retire(id);
             ended.push(id);
         }

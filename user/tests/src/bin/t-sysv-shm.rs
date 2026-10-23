@@ -477,7 +477,13 @@ fn main() {
         }
         let attach = at(other, 0, 0) == usize::MAX && errno() == libc::EACCES;
         let stat_denied = shmctl_raw(other, IPC_STAT, 0) == -1 && errno() == libc::EACCES;
-        let set_denied = shmctl_raw(other, IPC_SET, 0) == -1 && errno() == libc::EPERM;
+        // A **valid** buffer: `IPC_SET` reads its record before it asks who is
+        // calling, so a null one is `EFAULT` and never reaches the permission
+        // check (measured, `.workbuddy/probe_ipc_order.c`). The first draft of
+        // this claim passed 0 and read the `EFAULT` as the claim failing.
+        let mut record: ShmidDs = unsafe { std::mem::zeroed() };
+        let set_denied = shmctl_raw(other, IPC_SET, &mut record as *mut ShmidDs as usize) == -1
+            && errno() == libc::EPERM;
         let rmid_denied = shmctl_raw(other, IPC_RMID, 0) == -1 && errno() == libc::EPERM;
         let code = (attach as i32) << 0
             | (stat_denied as i32) << 1

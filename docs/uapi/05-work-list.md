@@ -5505,3 +5505,54 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     the pages that have a frame, and `SHMMAX` (64 MiB) / `SHMALL` (32768 pages) /
     `SHMMNI` (4096) are constants this kernel reports through `IPC_INFO`, not
     sysctls.
+
+## item 102 — System V semaphores, and the undo list that makes `CLONE_SYSVSEM` mean something
+
+    `semget` (64/190), `semop` (65/193), `semctl` (66/191) and `semtimedop`
+    (220/192) fell through the dispatch to `ENOSYS` - SysV's second family, and
+    with it the `SEM_UNDO` mechanism that `CLONE_SYSVSEM` had been accepted as a
+    no-op for want of. Measured on a current host first (Linux 7.2.11,
+    `.workbuddy/probe_sysv_sem.c`, `probe_sem2.c`, `probe_sem3.c`,
+    `probe_sem_unshare.c`, `probe_ipc_order.c`), recorded with the evidence in
+    §6.14. The shapes that are Linux's and are now served: `semtimedop`'s
+    timeout is **relative** and expiry is `EAGAIN`; an operation array is atomic,
+    `sem_num` past the set is `EFBIG` (where `semctl`'s `semnum` is `EINVAL`),
+    more than `SEMOPM` is `E2BIG`, unknown `sem_flg` bits are ignored, and the
+    values stay inside `0..=SEMVMX` with `ERANGE` at both ends; `GETALL`/`SETALL`
+    are `unsigned short` arrays; a blocked `semop` is counted by
+    `GETNCNT`/`GETZCNT`, woken by another process's raise, ended by a
+    handler-bearing signal with `EINTR` and woken by `IPC_RMID` with `EIDRM`;
+    `IPC_RMID` **removes** a set at once (unlike a segment's mark); `SEM_UNDO` is
+    per process, is **not inherited by `fork`**, and its adjustment is the
+    operation **negated**; the triads gate `semop` and the `GET*`/`SET*`
+    (`EACCES`, a `0000` set refusing even its owner), the creator or
+    `CAP_SYS_ADMIN` gates `IPC_SET`/`IPC_RMID` (`EPERM`), and `IPC_SET` reads its
+    buffer first (`EFAULT`); and `/proc/sysvipc/sem` prints the header and
+    columns `ipcs` parses.
+
+    **Owner**: `src/sched/sysv_sem.rs` (the set table, the operations, the waiter
+    table, the undo list and its exit application), `src/syscall/linux/ipc.rs`
+    (the four doors and `semctl`'s command vocabulary),
+    `src/syscall/linux/abi.rs` (the two machines' `semid64_ds` offsets),
+    `src/sched/runtime/{task,child_exit}.rs` (the per-process field, the
+    `CLONE_SYSVSEM` sharing and the exit pass), `src/syscall/linux/posix.rs`
+    (`unshare`'s half) and `src/vfs/procfs.rs` (`/proc/sysvipc/sem`).
+
+    **Pin**: the new `t-sysv-sem`, **70 claims**, plus seven host tests in
+    `sched::sysv_sem` that pin the operation arithmetic, the waiter registration
+    and the undo fold without a machine.
+
+    **Gate**: x86_64 `pass=203 fail=0 (214 built)`, `mpos-kunit 32 passed, 0
+    failed`, exit 0. The second machine compiles the change (kernel release +
+    clippy, and the pin builds for it with its own 88-byte `semid64_ds`); its
+    sweep could not boot on this host (no DRM render node), so no aarch64 figure
+    is claimed.
+
+    **Named**: the SysV **message-queue** family is still `ENOSYS`, so
+    `CLONE_NEWIPC` is still refused with that one reason left. The table is the
+    machine's rather than a namespace's. `SEMMNI`/`SEMMSL` are 4096/1024 here
+    where Linux's are 32000 each - a configuration difference the calls report,
+    not a shape one. A thread that `unshare`s `CLONE_SYSVSEM` gets a list of its
+    own carrying its records (measured to match Linux for a single process; the
+    sibling-sharing case is unpinned). `SEM_STAT_ANY` is served but not claimed
+    by the pin.
