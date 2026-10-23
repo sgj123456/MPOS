@@ -1150,6 +1150,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             sem_undo,
             pdeathsig: 0,
             subreaper: false,
+            no_new_privs: t.task(parent_id).no_new_privs,
             fpu_live: false,
             priority: parent_priority,
             stack: Some(stack),
@@ -1698,6 +1699,8 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         // leader and never carries one of its own.
         let pdeathsig = 0u32;
         let subreaper = false;
+        // A thread joins its process's promise: no new privileges either.
+        let no_new_privs = parent.no_new_privs;
         // `CLONE_FS` is what every `pthread_create` sets: a thread that
         // `chdir`s moves its process, which is Linux's answer (measured -
         // `.workbuddy/probe_unshare_flags.c`). A raw `clone(CLONE_THREAD)`
@@ -1848,6 +1851,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             ipc_ns,
             pdeathsig,
             subreaper,
+            no_new_privs,
             oom_score_adj,
             oom_score_adj_min,
             nice,

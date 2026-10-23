@@ -708,6 +708,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             ipc_ns: None,
             pdeathsig: 0,
             subreaper: false,
+            no_new_privs: false,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -902,6 +903,9 @@ pub fn try_spawn_user(
             pdeathsig: t.task(parent).pdeathsig,
             // ...and the subreaper flag too: measured, `execve` preserves it.
             subreaper: t.task(parent).subreaper,
+            // `no_new_privs` is one-way and survives `exec` - the whole point of
+            // it is that the image cannot have its rights back.
+            no_new_privs: t.task(parent).no_new_privs,
             oom_score_adj: t.task(parent).oom_score_adj,
             oom_score_adj_min: t.task(parent).oom_score_adj_min,
             nice: t.task(parent).nice,

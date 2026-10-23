@@ -713,6 +713,80 @@ fn main() {
         status >> 8,
     );
 
+    // === the door's two halves: the promise is what makes it a door ===
+    // Linux lets a caller install a filter when it has `CAP_SYS_ADMIN` **or** has
+    // set `PR_SET_NO_NEW_PRIVS`, and the second half is what makes the
+    // confinement meaningful: a filter a caller could walk out of by exec'ing a
+    // setuid program would not confine it. Measured on a current host, the
+    // *negative* half could not be: this sandbox's own runtime sets the promise
+    // on every process it starts, so a caller without it does not exist here -
+    // which is why that claim is accepted on a host run and why the pin walks
+    // both halves in the guest, where the child can drop to nobody with the
+    // promise still unset.
+    let door = rustix::pipe::pipe();
+    if let Ok((tail, head)) = door {
+        use std::os::fd::AsRawFd;
+        let at = head.as_raw_fd();
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe {
+                libc::setgid(65534);
+                libc::setuid(65534);
+            }
+            let mut bits = 0i32;
+            let bare = install(getpid_nr(), libc::SECCOMP_RET_ALLOW);
+            if bare == Err(Errno::ACCESS) {
+                bits |= 1;
+            }
+            let promised = unsafe {
+                libc::syscall(
+                    libc::SYS_prctl,
+                    libc::PR_SET_NO_NEW_PRIVS,
+                    1usize,
+                    0usize,
+                    0usize,
+                    0usize,
+                )
+            } == 0;
+            if promised {
+                bits |= 2;
+            }
+            let armed = install(getpid_nr(), libc::SECCOMP_RET_ALLOW);
+            if armed == Ok(0) {
+                bits |= 4;
+            }
+            unsafe {
+                libc::write(at, (&bits as *const i32).cast(), 4);
+                libc::_exit(0);
+            }
+        }
+        drop(head);
+        let mut said = [0u8; 4];
+        let n = rustix::io::read(&tail, &mut said).unwrap_or(0);
+        let bits = i32::from_ne_bytes(said);
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        r.check(
+            "a non-root caller without the promise is refused the filter",
+            host_run() || bits & 1 != 0,
+        );
+        if host_run() && bits & 1 == 0 {
+            println!(
+                "note:  this host sets PR_SET_NO_NEW_PRIVS on every process, so its unprotected half cannot be asked"
+            );
+        }
+        r.check(
+            "PR_SET_NO_NEW_PRIVS is accepted there",
+            n == 4 && bits & 2 != 0,
+        );
+        r.check(
+            "and with it the same caller installs the filter",
+            bits & 4 != 0,
+        );
+    } else {
+        r.check("the seccomp door's report pipe is made", false);
+    }
+
     // Stacking, which needs both filters in place: this child inherits
     // `ERRNO|1` on the judged call and adds a `TRAP` of its own, and it is the
     // *more* restrictive of the two that decides - so it dies of `SIGSYS`

@@ -58,9 +58,9 @@ pub use runtime::{
     current_cwd, current_cwd_path, current_diskstat, current_disposition, current_exe, current_fds,
     current_fs_context, current_groups, current_identity, current_ipc_ns, current_is_root,
     current_is_seccomp_strict, current_is_session_leader, current_map_user, current_net_ns,
-    current_owner, current_pdeathsig, current_pending, current_pgid, current_pid_number,
-    current_real_owner, current_rlimit, current_root, current_stack_range, current_tgid,
-    current_tls, current_umask, current_user_ns, current_uts, deliver_pending_signal,
+    current_no_new_privs, current_owner, current_pdeathsig, current_pending, current_pgid,
+    current_pid_number, current_real_owner, current_rlimit, current_root, current_stack_range,
+    current_tgid, current_tls, current_umask, current_user_ns, current_uts, deliver_pending_signal,
     descriptor_access, descriptor_numbers, descriptors_of, detach_traced, discard_exit_code,
     exec_replace, exit, exit_code, exit_group, fork, frames_range_free, get_mmap_cursor,
     group_members, has_children, has_deliverable_signal, has_live_child, has_matching_children,
@@ -80,20 +80,20 @@ pub use runtime::{
     send_signal_process, session_of, session_of_tty, set_brk_base, set_child_subreaper,
     set_clear_tid, set_current_blocked, set_current_comm, set_current_identity, set_current_rlimit,
     set_current_tls, set_current_umask, set_cwd, set_cwd_path, set_ipc_ns, set_mmap_cursor,
-    set_net_ns, set_nice, set_oom_score_adj, set_pdeathsig, set_pgid, set_robust_head, set_root,
-    set_seccomp_filter, set_seccomp_strict, set_signal_action, set_signal_alt_stack,
-    set_trace_options, set_tracer, setns_mnt, setns_pid, setns_time, setns_user, setns_uts,
-    shm_attachment_at, shm_attachment_count, signal_action, signal_alt_stack, sleep_ns,
-    sleep_ticks, snapshot, snapshots, space_root_of, spawn, spawn_permanent, spawn_user, started,
-    stop_of, take_child_event, take_continued_report, take_deliverable_siginfo,
-    take_deliverable_signal, take_exit_code, take_fatal_signal, take_pending_event,
-    take_signal_in_set, take_stop_report, take_vmas, task_count, thread_group_has_siblings,
-    thread_snapshots, time_offsets, timer_alloc, timer_arm, timer_overrun, timer_remove,
-    timer_state, tls_of, trace_options, trace_syscall, tracer_of, try_spawn_user, uid_members,
-    unmap_user, unshare_files, unshare_fs, unshare_ipc, unshare_mnt, unshare_pid, unshare_time,
-    unshare_user, unshare_uts, user_frame_at, user_mapped, vfork, vma_gaps, vma_kind_at,
-    vma_prot_at, vma_range_free, wait_any_child_event, wait_child_event, wait_for_interrupt, wake,
-    with_current_credentials, write_user, write_user_of, yield_now,
+    set_net_ns, set_nice, set_no_new_privs, set_oom_score_adj, set_pdeathsig, set_pgid,
+    set_robust_head, set_root, set_seccomp_filter, set_seccomp_strict, set_signal_action,
+    set_signal_alt_stack, set_trace_options, set_tracer, setns_mnt, setns_pid, setns_time,
+    setns_user, setns_uts, shm_attachment_at, shm_attachment_count, signal_action,
+    signal_alt_stack, sleep_ns, sleep_ticks, snapshot, snapshots, space_root_of, spawn,
+    spawn_permanent, spawn_user, started, stop_of, take_child_event, take_continued_report,
+    take_deliverable_siginfo, take_deliverable_signal, take_exit_code, take_fatal_signal,
+    take_pending_event, take_signal_in_set, take_stop_report, take_vmas, task_count,
+    thread_group_has_siblings, thread_snapshots, time_offsets, timer_alloc, timer_arm,
+    timer_overrun, timer_remove, timer_state, tls_of, trace_options, trace_syscall, tracer_of,
+    try_spawn_user, uid_members, unmap_user, unshare_files, unshare_fs, unshare_ipc, unshare_mnt,
+    unshare_pid, unshare_time, unshare_user, unshare_uts, user_frame_at, user_mapped, vfork,
+    vma_gaps, vma_kind_at, vma_prot_at, vma_range_free, wait_any_child_event, wait_child_event,
+    wait_for_interrupt, wake, with_current_credentials, write_user, write_user_of, yield_now,
 };
 
 /// The `wait(2)` doors read the whole retired record, not just its code: a
@@ -186,6 +186,23 @@ static HOST_SUBREAPER: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 #[cfg(not(target_os = "none"))]
 pub fn current_child_subreaper() -> bool {
     HOST_SUBREAPER.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A host build has one process: the flag round-trips through this value and
+/// the two doors that read it (the seccomp gate, `execve`'s privilege step) are
+/// machine-only.
+#[cfg(not(target_os = "none"))]
+static HOST_NO_NEW_PRIVS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(not(target_os = "none"))]
+pub fn current_no_new_privs() -> bool {
+    HOST_NO_NEW_PRIVS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn set_no_new_privs() {
+    HOST_NO_NEW_PRIVS.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(not(target_os = "none"))]

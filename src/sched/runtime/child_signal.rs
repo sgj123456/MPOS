@@ -833,6 +833,23 @@ pub fn current_ipc_ns() -> Option<u64> {
     })
 }
 
+/// Whether the running task has set `PR_SET_NO_NEW_PRIVS`: the one-way promise
+/// `execve` and the seccomp door both read.
+#[cfg(target_os = "none")]
+pub fn current_no_new_privs() -> bool {
+    with_table(|t| t.task(t.current).no_new_privs)
+}
+
+/// Set it. There is no clear: measured, `prctl(PR_SET_NO_NEW_PRIVS, 0)` is
+/// `EINVAL`, and the flag outlives the image that set it.
+#[cfg(target_os = "none")]
+pub fn set_no_new_privs() {
+    with_table(|t| {
+        let me = t.current;
+        t.task_mut(me).no_new_privs = true;
+    });
+}
+
 /// Whether the running process is a **child subreaper** - read off the group
 /// leader, because the flag is the process's and `prctl` may be called from any
 /// thread of it.

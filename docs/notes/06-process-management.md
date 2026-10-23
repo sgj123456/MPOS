@@ -2990,3 +2990,45 @@ readings rather than as a mechanism - and the re-run is the one quoted.
 
 **Gate**: x86_64 `pass=205 fail=0` (the re-run), stage 1 `1100 tests, 0 failed`,
 `mpos-kunit 32 passed, 0 failed`, exit 0.
+
+### 6.19 `PR_SET_NO_NEW_PRIVS` — the promise the seccomp door was missing a half of (LANDED 2026-10-23)
+
+The option matters here for a reason that is not the obvious one. Its headline
+effect - `execve` of a setuid binary grants nothing - has nothing to read in this
+kernel, which does not honour setuid bits on exec at all. Its **second** effect
+does: Linux lets a caller install a seccomp filter with `CAP_SYS_ADMIN` **or**
+after setting this flag, and `install_seccomp_filter` refused every caller whose
+real uid was not root with `EACCES` - the honest refusal while the escape hatch
+did not exist, and a *divergence* the day a program needed the door. So the flag
+is modelled for that door, and named as such rather than presented as a
+privilege-escalation guard it is not yet.
+
+Measured on a current host first (`.workbuddy/probe_nnp.c`):
+
+* the setter takes **exactly `(1, 0, 0, 0)`**: `2`, a non-zero third/fourth/fifth
+  argument and a clearing `0` are all `EINVAL`, so the flag is **one-way**;
+* the getter answers the boolean as its return value and refuses a call whose
+  unused arguments are not zero - a C caller that wrote `prctl(39)` and let the
+  variadic tail be garbage gets `EINVAL`, which is how the first version of this
+  probe concluded "unimplemented" for half an hour;
+* `fork` **inherits** it (measured); the man page's `exec` preservation is what
+  the kernel's `load` copies, and that half is not claimed here;
+* the door's two halves: a non-root caller without the promise is `EACCES` and
+  with it the same call installs the filter. The **negative** half could not be
+  measured on this host - its own runtime sets the promise on every process it
+  starts, so a caller *without* it does not exist here - so that claim is
+  accepted on a host run (with a note printed) and the pin walks both halves in
+  the guest, where the child drops to nobody with the flag still unset.
+
+The substrate is a `bool` on `Task`, inherited by `fork`/`clone` and copied
+across `exec`, plus one condition inside `install_seccomp_filter`:
+`ruid != 0 && !current_no_new_privs()`.
+
+**Pin**: `t-prctl` grows to **61 claims** (the five argument shapes, the
+one-way-ness, the getter's argument check and the fork inheritance) and
+`t-seccomp` to **57** (the dropped child's `EACCES`, the promise accepted, and
+the filter installed after it) - the second pair being what makes the option a
+behaviour rather than a stored flag.
+
+**Gate**: x86_64 `pass=205 fail=0`, stage 1 `1100 tests, 0 failed`,
+`mpos-kunit 32 passed, 0 failed`, exit 0.

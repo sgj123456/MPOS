@@ -532,6 +532,67 @@ fn main() {
         _ => r.check("the parent-death report pipes are made", false),
     }
 
+    // === no new privileges ===================================================
+    // One-way, and the flag a confinement leans on: with it set, a caller that
+    // is not root may install a seccomp filter (the pair is walked in
+    // `t-seccomp`). Measured on a current host (`.workbuddy/probe_nnp.c`): the
+    // setter takes exactly `(1, 0, 0, 0)` - `2`, a non-zero later argument and a
+    // clearing `0` are `EINVAL` - and the getter refuses a call whose unused
+    // arguments are not zero, which is why every call below spells all five out.
+    err_is(
+        &mut r,
+        "PR_GET_NO_NEW_PRIVS refuses a non-zero argument",
+        prctl(libc::PR_GET_NO_NEW_PRIVS, 1, 0, 0, 0),
+        Errno::INVAL,
+    );
+    ok_is(
+        &mut r,
+        "PR_SET_NO_NEW_PRIVS(1) is accepted",
+        prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0),
+        0,
+    );
+    ok_is(
+        &mut r,
+        "and the getter reads 1 back",
+        prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0),
+        1,
+    );
+    err_is(
+        &mut r,
+        "a setter argument of 2 is EINVAL",
+        prctl(libc::PR_SET_NO_NEW_PRIVS, 2, 0, 0, 0),
+        Errno::INVAL,
+    );
+    err_is(
+        &mut r,
+        "a non-zero fourth argument is EINVAL",
+        prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 1, 0, 0),
+        Errno::INVAL,
+    );
+    err_is(
+        &mut r,
+        "and it cannot be cleared: set(0) is EINVAL",
+        prctl(libc::PR_SET_NO_NEW_PRIVS, 0, 0, 0, 0),
+        Errno::INVAL,
+    );
+    ok_is(
+        &mut r,
+        "setting it again is idempotent",
+        prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0),
+        0,
+    );
+    let forked = unsafe { libc::fork() };
+    if forked == 0 {
+        let rc = prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+        unsafe { libc::_exit(if rc == Ok(1) { 0 } else { 1 }) };
+    }
+    let mut nnp_status = 0;
+    unsafe { libc::waitpid(forked, &mut nnp_status, 0) };
+    r.check(
+        "a fork child inherits the promise",
+        libc::WIFEXITED(nnp_status) && libc::WEXITSTATUS(nnp_status) == 0,
+    );
+
     // === the child subreaper =================================================
     // Whether an orphaned *descendant* is reparented to this process rather than
     // to init. Measured on a current host (`.workbuddy/probe_subreaper.c`): the

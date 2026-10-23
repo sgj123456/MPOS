@@ -2370,14 +2370,16 @@ pub(super) fn install_seccomp_filter(prog_ptr: usize, flags: usize, from_user: b
         return err::EINVAL;
     }
     // Linux lets a privileged caller install a filter, or anyone who has first
-    // given up the right to gain privileges (`PR_SET_NO_NEW_PRIVS`, which this
-    // kernel does not model). Every process in this image is root, so the arm
-    // that matters is the first; a caller that is not root is refused rather
-    // than handed a confinement it could then walk out of. A host build has no
-    // identities to ask and its harness is root by construction - the same
-    // reason `current_owner` answers root there.
+    // given up the right to gain privileges (`PR_SET_NO_NEW_PRIVS`) - and the
+    // *confinement* is what makes the second safe: a filter a caller can walk
+    // out of by exec'ing a setuid program would not be one. Both halves are
+    // measured: a non-root caller without the flag is `EACCES` (the answer this
+    // door gave for every non-root caller before the flag existed), and with it
+    // the same call installs the filter (`t-seccomp` walks the pair from a
+    // dropped child). A host build has no identities to ask and its harness is
+    // root by construction - the same reason `current_owner` answers root there.
     #[cfg(target_os = "none")]
-    if crate::sched::current_identity().ruid != 0 {
+    if crate::sched::current_identity().ruid != 0 && !crate::sched::current_no_new_privs() {
         return err::EACCES;
     }
     // `struct sock_fprog`: a `u16` length, two bytes of padding, then the
@@ -2461,6 +2463,14 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     // the setter takes any `int` and stores a boolean (`7` reads back as `1`),
     // the getter writes an `int` through the pointer (`EFAULT` for a null one),
     // and the flag is **not inherited by `fork`** but is kept across `exec`.
+    /// `PR_SET_NO_NEW_PRIVS`: the one-way promise that this task will not gain
+    /// privileges through `execve`, and (the half this kernel reads) that it may
+    /// install a seccomp filter without `CAP_SYS_ADMIN`. Measured: the setter
+    /// takes exactly `(1, 0, 0, 0)`; `2`, a non-zero later argument and a
+    /// clearing `0` are all `EINVAL`. The getter answers the flag as its return
+    /// value and refuses a call whose unused arguments are not zero.
+    const PR_SET_NO_NEW_PRIVS: usize = 38;
+    const PR_GET_NO_NEW_PRIVS: usize = 39;
     const PR_SET_CHILD_SUBREAPER: usize = 36;
     const PR_GET_CHILD_SUBREAPER: usize = 37;
     const PR_SET_PDEATHSIG: usize = 1;
@@ -2634,6 +2644,21 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
                 Ok(()) => 0,
                 Err(e) => e,
             }
+        }
+        PR_SET_NO_NEW_PRIVS => {
+            // Exactly one, and nothing beside it: Linux's own check, and the
+            // reason `0` cannot clear the flag.
+            if args[1] != 1 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
+                return err::EINVAL;
+            }
+            crate::sched::set_no_new_privs();
+            0
+        }
+        PR_GET_NO_NEW_PRIVS => {
+            if args[1] != 0 || args[2] != 0 || args[3] != 0 || args[4] != 0 {
+                return err::EINVAL;
+            }
+            crate::sched::current_no_new_privs() as isize
         }
         PR_SET_CHILD_SUBREAPER => {
             crate::sched::set_child_subreaper(args[1] != 0);

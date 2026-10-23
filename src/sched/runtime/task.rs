@@ -773,6 +773,18 @@ pub(crate) struct Task {
     /// the namespace it is in now, and an id from the old one answers `EINVAL`
     /// (measured, §6.16).
     pub(crate) ipc_ns: Option<alloc::sync::Arc<crate::vfs::ns::IpcNs>>,
+    /// `PR_SET_NO_NEW_PRIVS`: whether this task has given up the right to gain
+    /// privileges through `execve`, and whether it may therefore install a
+    /// seccomp filter without `CAP_SYS_ADMIN`.
+    ///
+    /// Per thread, **inherited** by `fork`/`clone`, preserved by `exec`, and
+    /// **one-way**: measured on a current host (`.workbuddy/probe_nnp.c`), the
+    /// setter takes exactly `(1, 0, 0, 0)` - `2`, a non-zero later argument and
+    /// a clearing `0` are all `EINVAL` - and the getter refuses a call whose
+    /// unused arguments are not zero (a C caller that wrote `prctl(39)` and let
+    /// the variadic tail be garbage gets `EINVAL`, which is how the first probe
+    /// of this read "unimplemented" for half an hour).
+    pub(crate) no_new_privs: bool,
     /// `PR_SET_CHILD_SUBREAPER`: whether an orphan of this task's descendants is
     /// reparented to it rather than to init.
     ///
@@ -1181,6 +1193,8 @@ impl Task {
             pdeathsig: 0,
             // And not a subreaper: init is the machine's only one at boot.
             subreaper: false,
+            // No privilege given up yet, and none asked for.
+            no_new_privs: false,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -1847,6 +1861,8 @@ impl Table {
             pdeathsig: 0,
             // And not a subreaper: init is the machine's only one at boot.
             subreaper: false,
+            // No privilege given up yet, and none asked for.
+            no_new_privs: false,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
