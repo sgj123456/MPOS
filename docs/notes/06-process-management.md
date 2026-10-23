@@ -2945,8 +2945,23 @@ here rather than approximated.
 that folds the pieces back, the four refusals and the zero length - measured on
 the host first and green on both machines.
 
+**No fuzz target, and why** (rule 2's other arm): the name reader is the one
+place this landing touches user bytes, and it is bounded by construction - at
+most `ANON_VMA_NAME_MAX_LEN` bytes, each one re-validated at a page crossing,
+`EINVAL` when the maximum passes without a NUL and `EFAULT` when a page does not
+belong to the caller - so there is no structure to explore beyond "short, exactly
+80, unterminated, unreadable", which the four claims hold. Everything the other
+three `prctl` landings read is a scalar (`PR_SET_PDEATHSIG`'s signal,
+`PR_SET_CHILD_SUBREAPER`'s boolean, `PR_SET_NO_NEW_PRIVS`'s exactly-`(1,0,0,0)`
+word); none of them is parsed from memory.
+
 **Gate**: x86_64 `pass=205 fail=0`, stage 1 `1100 tests, 0 failed`,
-`mpos-kunit 32 passed, 0 failed`, exit 0.
+`mpos-kunit 32 passed, 0 failed`, exit 0. The **fuzz workspace could not be built
+in this sandbox** and that is recorded rather than worked around: its registry
+cache is read-only here and the crates it needs are not unpacked, so
+`cargo build` fails in dependency resolution before any target compiles (with
+`--offline` it fails the same way). No target's source was touched by this
+session's work, and the paragraph above is the argument that none was due.
 
 ### 6.18 `PR_SET_CHILD_SUBREAPER` — an orphan comes to the marked ancestor, not to init (LANDED 2026-10-23)
 
