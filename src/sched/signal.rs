@@ -417,6 +417,11 @@ pub const SI_USER: i32 = 0;
 pub const SI_KERNEL: i32 = 0x80;
 pub const SI_QUEUE: i32 = -1;
 pub const SI_TIMER: i32 = -2;
+/// `SI_MESGQ`: a POSIX message queue's notification, the code a `mq_notify`
+/// registration's signal carries. Measured on a current host
+/// (`.workbuddy/probe_mqueue.c`): the handler reads `si_code = -3` and the
+/// registration's `sigval`.
+pub const SI_MESGQ: i32 = -3;
 /// `SI_TKILL` is `tgkill`'s own code, and it is the one negative code a
 /// caller may not hand to `rt_sigqueueinfo`/`pidfd_send_signal`: Linux's
 /// `do_rt_sigqueueinfo` treats it like a positive code (`EPERM`), because it

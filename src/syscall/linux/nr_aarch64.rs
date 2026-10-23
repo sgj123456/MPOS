@@ -179,6 +179,14 @@ pub const SIGNALFD4: u64 = 74; // 289 on x86_64
 // has no legacy `eventfd` at all, so 19 is the whole family here.
 pub const EVENTFD: u64 = 19; // 290 on x86_64
 pub const MEMFD_CREATE: u64 = 279; // 319 on x86_64
+// The POSIX message-queue family. The asm-generic table gives it a block of its
+// own, where x86_64's sits between `sched_getaffinity` and `io_setup`.
+pub const MQ_OPEN: u64 = 180; // 240 on x86_64
+pub const MQ_UNLINK: u64 = 181; // 241 on x86_64
+pub const MQ_TIMEDSEND: u64 = 182; // 242 on x86_64
+pub const MQ_TIMEDRECEIVE: u64 = 183; // 243 on x86_64
+pub const MQ_NOTIFY: u64 = 184; // 244 on x86_64
+pub const MQ_GETSETATTR: u64 = 185; // 245 on x86_64
 pub const LINK: u64 = 64026; // no arm64 number; unreachable on aarch64
 pub const LINKAT: u64 = 37; // 265 on x86_64
 pub const TIME: u64 = 64027; // no arm64 number; unreachable on aarch64

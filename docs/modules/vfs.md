@@ -1,6 +1,6 @@
 # vfs
 
-**Home:** `src/vfs/` · **Owns:** inodes, name edges, mounts and path resolution, the per-process descriptor table, and every filesystem behind them — the real ones, the pseudo ones, and the anonymous objects a descriptor reaches (pipes, epoll, timerfd, eventfd, signalfd, inotify, memfd, dma-buf, locks).
+**Home:** `src/vfs/` · **Owns:** inodes, name edges, mounts and path resolution, the per-process descriptor table, and every filesystem behind them — the real ones, the pseudo ones, and the anonymous objects a descriptor reaches (pipes, epoll, timerfd, eventfd, signalfd, inotify, memfd, mqueue, dma-buf, locks).
 
 ## What it owns
 
@@ -56,6 +56,7 @@ Grouped by area, because "where do I put this change" is the question the page e
 | `src/vfs/epoll.rs` | `Epoll`, the interest list keyed by descriptor *and* open file description, `EPOLLET`/`EPOLLONESHOT`, `poll_ready` scanning |
 | `src/vfs/timerfd.rs` | `TimerFd`, the tick-deadline/interval/count state machine, `TFD_TIMER_ABSTIME`, `TFD_TIMER_CANCEL_ON_SET`, the timespec conversions |
 | `src/vfs/eventfd.rs` | `EventFd`, the counter, `EFD_NONBLOCK` |
+| `src/vfs/mqueue.rs` | `Queue` (a named POSIX message queue: priority insert, one notification registration, the per-uid `RLIMIT_MSGQUEUE` charge, the name registry) and `MqueueFile` (one open descriptor, `S_IFREG` 0600, pollable); the syscalls are `syscall/linux/ipc.rs` (§6.12) |
 | `src/vfs/signalfd.rs` | `SignalFd`: blocked-and-masked signals read as `signalfd_siginfo` — a child's death among them, because it *is* the queued `SIGCHLD` (no second table; `docs/uapi/` §5.1 item 29) |
 | `src/vfs/inotify.rs` | `InotifyInstance`, the global `(dev, ino)` watch registry, `emit`/`emit_write`, encoded event records |
 | `src/vfs/memfd.rs` | `Memfd`, real shareable pages, `MFD_*`, `F_SEAL_*` (gated `target_os = "none"`) |

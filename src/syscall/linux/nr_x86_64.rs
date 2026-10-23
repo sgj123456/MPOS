@@ -269,6 +269,14 @@ pub const EVENTFD: u64 = 290;
 /// `memfd_create(2)`: an anonymous shared buffer, the descriptor a Wayland
 /// `wl_shm` pool is made from.
 pub const MEMFD_CREATE: u64 = 319;
+/// The POSIX message-queue family: `mq_open` and its five siblings. It is the
+/// prerequisite the IPC namespace waits on (`docs/notes/` §6.3/§6.12).
+pub const MQ_OPEN: u64 = 240;
+pub const MQ_UNLINK: u64 = 241;
+pub const MQ_TIMEDSEND: u64 = 242;
+pub const MQ_TIMEDRECEIVE: u64 = 243;
+pub const MQ_NOTIFY: u64 = 244;
+pub const MQ_GETSETATTR: u64 = 245;
 /// `link(2)` / `linkat(2)`: a second name for an inode.
 pub const LINK: u64 = 86;
 pub const LINKAT: u64 = 265;

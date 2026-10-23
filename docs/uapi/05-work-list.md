@@ -5413,3 +5413,46 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     (the global choice, not an anon-inode one), and `st_dev`/`st_ino`/uid/gid
     are machine-specific and not pinned. A pidfd's `fdinfo`
     (`Pid:`/`NSpid:`) is still not measured and not promised.
+
+## item 100 — POSIX message queues are a family, not a stub: `ENOSYS` was the honest answer to a kernel with no queues at all
+
+    The six calls (`mq_open` 240, `mq_unlink` 241, `mq_timedsend` 242,
+    `mq_timedreceive` 243, `mq_notify` 244, `mq_getsetattr` 245) fell through the
+    dispatch to `ENOSYS`, and that was the right answer for a kernel with nothing
+    behind them - `unshare(CLONE_NEWIPC)` was refused for the same reason, since a
+    namespace with nothing to isolate isolates nothing (§6.3). This is the family
+    served, measured on a current host first (Linux 7.2.11,
+    `.workbuddy/probe_mqueue{,2}.c` and `probe_mqueue_names.c`, whose raw-syscall
+    half is what separated the *kernel's* name rule from the libc's) and recorded
+    with its evidence in §6.12. The names are the object identity (`unlink`
+    retires the name and the descriptors keep the queue), messages come out
+    highest priority first and FIFO within one, a full queue's non-blocking send
+    and an empty queue's non-blocking receive are both `EAGAIN`, an expired
+    absolute `CLOCK_REALTIME` deadline is `ETIMEDOUT`, the access mode is the
+    *descriptor's* (`mq_send` on `O_RDONLY` is `EBADF`), one notification
+    registration per queue (`EBUSY` on a second, fired by the send that finds the
+    queue empty, `SI_MESGQ` with its `sigval`), and a queue is pollable and
+    epoll-watchable (`POLLOUT` empty, `POLLIN|POLLOUT` with a message, `POLLIN`
+    full).
+
+    **Owner**: `src/vfs/mqueue.rs` (the objects: the name registry, the priority
+    insert, the one registration slot, the per-uid `RLIMIT_MSGQUEUE` charge) and
+    `src/syscall/linux/ipc.rs` (the six doors: the name rules, the attribute
+    block, the absolute-timeout conversion and the park). `epoll.c`'s watchability
+    gate gained one line: a queue reports `S_IFREG` and is nonetheless watchable,
+    which is what Linux's mqueue filesystem says too.
+
+    **Pin**: the new `t-mqueue`, **41 claims** (libc's `mq_*` wrappers, because
+    `rustix` binds none of the family). Green on a current host first.
+
+    **Gate**: x86_64 `pass=201 fail=0 (214 built)`, `mpos-kunit 32 passed, 0
+    failed`, exit 0, three consecutive runs. The second machine compiles the
+    change; its sweep could not boot on this host (no DRM render node), so no
+    aarch64 figure is claimed.
+
+    **Named**: `CLONE_NEWIPC` is still refused - its isolation is SysV objects
+    *and* POSIX queues, and only the second half exists now. There is no
+    `/dev/mqueue` (no mqueuefs), so a queue's name is its only spelling and the
+    descriptor's `st_size` is 0 where Linux counts the filesystem entry's 80
+    bytes. The `msg_max`/`msgsize_max` ceilings are constants, not sysctls, and a
+    blocked sender/receiver is pinned only by the timeout side.

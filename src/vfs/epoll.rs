@@ -241,6 +241,15 @@ impl Epoll {
                             file.inode().as_pipe().is_some()
                                 || file.inode().as_duplex().is_some()
                                 || file.inode().socket_handle() != 0
+                                // A POSIX message queue reports `S_IFREG`
+                                // (that is what Linux's mqueue filesystem
+                                // says), and it is exactly as watchable as a
+                                // pipe: `POLLIN` when a message is there and
+                                // `POLLOUT` when there is room. Measured on a
+                                // current host, `epoll_wait` reports a full
+                                // queue's `EPOLLIN`; refusing it would be the
+                                // same mistake the socketpair end was.
+                                || file.inode().as_mqueue().is_some()
                         }
                         NodeKind::Dir => false,
                         _ => true,

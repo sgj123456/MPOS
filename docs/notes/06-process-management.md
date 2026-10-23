@@ -2296,3 +2296,77 @@ the host first and with identical `ok:` text in the guest on both machines.
 global choice, not an anon-inode one); `st_dev`/`st_ino`/uid/gid are
 machine-specific and not pinned; a pidfd's `fdinfo` (`Pid:`/`NSpid:`) is still
 unmeasured and un-promised.
+
+### 6.12 POSIX message queues — **LANDED** (2026-10-23, the IPC namespace's missing half)
+
+`unshare(CLONE_NEWIPC)` was refused because there was nothing for it to isolate -
+"SysV IPC objects and POSIX message queues", and this kernel had neither (§6.3).
+The queue half is here now: `mq_open`, `mq_unlink`, `mq_timedsend`,
+`mq_timedreceive`, `mq_notify` and `mq_getsetattr`, the objects in
+`vfs::mqueue` and a validating face in `syscall/linux/ipc.rs`. `CLONE_NEWIPC`
+itself is still refused, and its reason has shrunk to SysV.
+
+**Measured whole on a current host first** (Linux 7.2.11,
+`.workbuddy/probe_mqueue{,2}.c`), because almost every rule is a choice between
+two plausible answers:
+
+* **the name is bare.** Both libcs strip the leading `/` the caller writes and
+  reject a name without one, so the *kernel* receives `name`, not `/name` - and
+  the raw probe (`.workbuddy/probe_mqueue_names.c`) measured the kernel's own
+  rule: 255 bytes fits and 256 is `ENAMETOOLONG`, **any** slash is `EACCES`, and
+  the empty name is `ENOENT`. The first draft of this landing implemented the
+  libc's rule instead and every `mq_open` on the image answered `EINVAL`, which
+  is how the wrapper/syscall split was found.
+* **the attributes**: 10 messages of 8192 bytes by default, `mq_flags` 0,
+  `mq_curmsgs` 0; `O_CREAT|O_EXCL` on an existing name is `EEXIST`; `maxmsg` 0 is
+  `EINVAL` and 11 (past `msg_max`) is `EINVAL` - not a quiet clamp.
+* **the order**: highest priority first, FIFO within a priority (`9, 5a, 5b, 1`
+  out of an arrival order of `1, 9, 5a, 5b`); `MQ_PRIO_MAX` is 32768, so 32767
+  is accepted and 32768 is `EINVAL`.
+* **full and empty**: `EAGAIN` to a non-blocking caller, `ETIMEDOUT` on an
+  expired timeout, and the timeout is an **absolute `CLOCK_REALTIME`** instant.
+* **the descriptor's mode**: `mq_send` on `O_RDONLY` and `mq_receive` on
+  `O_WRONLY` are `EBADF`; `mq_getattr`'s `mq_flags` is the descriptor's
+  `O_NONBLOCK` bit, which `mq_setattr` writes and `F_SETFL` writes too.
+* **size**: a message wider than `mq_msgsize` is `EMSGSIZE`, and so is a receive
+  buffer narrower than `mq_msgsize` whatever the queued message's own length is.
+* **one registration per queue**, `EBUSY` on a second; the send that finds the
+  queue **empty** fires it (`SI_MESGQ`, code `-3`, the registration's `sigval`)
+  and the firing clears it. `SIGEV_NONE` is *not* the unregister call: it takes
+  the slot like any other registration (measured twice), and a registration whose
+  process exits stops holding it.
+* **`unlink` retires the name, not the object**: a reopen is `ENOENT` and a
+  second unlink is `ENOENT` while the descriptor that already held the queue
+  keeps working.
+* **readiness**: `POLLOUT` alone on an empty queue, `POLLIN|POLLOUT` with a
+  message, `POLLIN` alone when full, and `epoll_wait` agrees. That one needed a
+  second fix: `epoll_ctl(ADD)` refused a queue because it reports `S_IFREG` and
+  the watchability gate named only pipes, duplex ends and sockets - so a
+  watchable file was refused `EPERM`, the same mistake the socketpair end was
+  (measured: Linux reports a full queue's `EPOLLIN`).
+
+**The shape that is not Linux's, and is named**: the descriptor is `S_IFREG`
+with mode `0600` (Linux's mqueue filesystem says so too) but `st_size` is 0 where
+Linux reports the mqueuefs inode's 80 bytes - there is no mqueuefs here, so
+there is no directory entry to count. `read`/`write` on the descriptor are both
+`EINVAL` (Linux's `write` is `EINVAL` too; its `read` answers the mqueuefs
+inode's bytes, a filesystem quirk with nothing to reproduce). The `maxmsg` and
+`msgsize` ceilings are constants, not `/proc/sys/fs/mqueue` tunables.
+`RLIMIT_MSGQUEUE` is charged at creation by the queue's maximal size and is the
+memory bound (`default_rlimits` now seeds Linux's 819200 rather than infinity,
+which §8.0's allocator needs), but the accounting is per-uid and the sysctl that
+would move it does not exist.
+
+**Pin**: the new `t-mqueue`, 41 claims, using `libc` for the whole family
+because `rustix` binds no `mq_*` call - the first clause of
+`user/tests/Cargo.toml`'s rule.
+
+**Gate**: x86_64 `pass=201 fail=0 (214 built)`, `mpos-kunit 32 passed, 0
+failed`, exit 0. The second machine compiles the change; its sweep could not
+boot on this host (no DRM render node), so no aarch64 figure is claimed.
+
+**Named, not claimed**: the IPC namespace itself is still refused (`SysV IPC
+objects` remain), the `/dev/mqueue` view does not exist, and a blocked
+`mq_timedsend`/`mq_timedreceive` is pinned only by the timeout side - the
+blocking rendezvous (a receiver waking a full-queue sender) is implemented and
+unclaimed here because no program pins it yet.

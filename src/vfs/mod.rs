@@ -37,6 +37,7 @@ pub mod locks;
 #[cfg(target_os = "none")]
 pub mod memfd;
 pub mod mount;
+pub mod mqueue;
 /// The namespace identities the kernel knows, and the text `/proc/<pid>/ns/<kind>`
 /// reads back as. Home: `vfs`, because the mount namespace and the renderer are
 /// both here, and a concept with four readers belongs where its subject lives -
@@ -565,6 +566,18 @@ pub trait Inode: Send + Sync + core::any::Any {
     /// `O_NONBLOCK` bit has to reach an inode that blocks on read. Same shape
     /// as [`Inode::as_pipe`], for the same reason.
     fn as_eventfd(&self) -> Option<&crate::vfs::eventfd::EventFd> {
+        None
+    }
+
+    /// The POSIX message queue this node is one open descriptor for, if it is
+    /// one.
+    ///
+    /// `mq_send` and its five siblings arrive holding a descriptor number and
+    /// nothing else, and the queue behind it is reachable only through the
+    /// inode - the same shape as [`Self::as_eventfd`]. A descriptor that is not
+    /// a queue answers `None`, which the doors turn into the `EBADF` Linux
+    /// gives when an `mq_*` call is handed a non-queue descriptor.
+    fn as_mqueue(&self) -> Option<&crate::vfs::mqueue::MqueueFile> {
         None
     }
 

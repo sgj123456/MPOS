@@ -231,6 +231,15 @@ mod tests {
         assert_eq!(RSEQ, 334);
         assert_eq!(STATX, 332);
         assert_eq!(MEMBARRIER, 324);
+        // The POSIX message-queue family, whose numbers are consecutive on both
+        // machines - a transcription error here is a family that silently
+        // answers `ENOSYS` because the dispatch arm never matches.
+        assert_eq!(MQ_OPEN, 240);
+        assert_eq!(MQ_UNLINK, 241);
+        assert_eq!(MQ_TIMEDSEND, 242);
+        assert_eq!(MQ_TIMEDRECEIVE, 243);
+        assert_eq!(MQ_NOTIFY, 244);
+        assert_eq!(MQ_GETSETATTR, 245);
     }
 
     /// `clone(2)`: the flag bits, as the same table numbers them. The

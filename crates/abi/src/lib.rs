@@ -292,6 +292,17 @@ pub fn default_rlimits() -> [Rlimit; RLIM_NLIMITS] {
         cur: 1024,
         max: 1_048_576,
     }; // RLIMIT_NOFILE
+    // RLIMIT_MSGQUEUE (12): the bytes one user's POSIX message queues may
+    // reserve. Linux's own default is 819200, and it is *not* left at infinity
+    // here for the reason §8.0 gives: a queue reserves its whole maximal size at
+    // creation (`mq_msgsize * mq_maxmsg`), so an unlimited row would let a
+    // program reserve memory the allocator cannot refuse - this row is the bound
+    // the family is held to, and `mq_open` answers `EMFILE` at it (measured:
+    // with the limit at 0, creation is `EMFILE`).
+    t[12] = Rlimit {
+        cur: 819_200,
+        max: 819_200,
+    }; // RLIMIT_MSGQUEUE
     // RLIMIT_SIGPENDING (11): the queued real-time records one user may hold.
     // It is *not* infinity, because the row is a real bound here: the records
     // live in a fixed per-task ring and `RT_QUEUE_LEN` is its size, so this is

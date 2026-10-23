@@ -37,6 +37,13 @@ pub(crate) mod proc;
 #[cfg(target_os = "none")]
 pub(crate) mod posix;
 
+/// The POSIX message-queue family: `mq_open`, `mq_unlink`, `mq_timedsend`,
+/// `mq_timedreceive`, `mq_notify`, `mq_getsetattr`. Its own module because it
+/// is its own family - the objects are `vfs::mqueue`'s and this is the
+/// validating face, the split every other family here uses.
+#[cfg(target_os = "none")]
+pub(crate) mod ipc;
+
 /// Run a pending signal's handler on the way out of a syscall.
 ///
 /// The register frame is what makes this possible at all - entering a handler
@@ -514,6 +521,13 @@ pub unsafe fn dispatch(
         nr::EVENTFD => fs::handle_eventfd(args),
         #[cfg(target_os = "none")]
         nr::MEMFD_CREATE => fs::handle_memfd_create(args, from_user),
+        // --- POSIX message queues: the family the IPC namespace waits on ---
+        nr::MQ_OPEN => ipc::handle_mq_open(args, from_user),
+        nr::MQ_UNLINK => ipc::handle_mq_unlink(args, from_user),
+        nr::MQ_TIMEDSEND => ipc::handle_mq_timedsend(args, from_user),
+        nr::MQ_TIMEDRECEIVE => ipc::handle_mq_timedreceive(args, from_user),
+        nr::MQ_NOTIFY => ipc::handle_mq_notify(args, from_user),
+        nr::MQ_GETSETATTR => ipc::handle_mq_getsetattr(args, from_user),
         // --- the POSIX completion set ---
         //
         // The descriptor-backed timer and the interest-list multiplexer:

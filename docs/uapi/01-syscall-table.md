@@ -57,6 +57,12 @@ A call absent from those is served as its phase section records.
 | `dup2` | 33 | fs | 64006 |
 | `pause` | 34 | posix | 64033 |
 | `nanosleep` | 35 | proc | 101 |
+| `mq_open` | 240 | ipc | 6.12 |
+| `mq_unlink` | 241 | ipc | 6.12 |
+| `mq_timedsend` | 242 | ipc | 6.12 |
+| `mq_timedreceive` | 243 | ipc | 6.12 |
+| `mq_notify` | 244 | ipc | 6.12 |
+| `mq_getsetattr` | 245 | ipc | 6.12 |
 | `getitimer` | 36 | proc | 102 |
 | `alarm` | 37 | proc | 64010 |
 | `setitimer` | 38 | proc | 103 |

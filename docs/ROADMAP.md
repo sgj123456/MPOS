@@ -160,6 +160,10 @@ One-glance status of the whole roadmap.
 **ABI gaps → `ENOSYS` (remaining)**
 
 - [x] inotify · [x] `memfd_create` (§7 Stage 3) · [~] xattrs (validate → `EOPNOTSUPP`, no store) (§R.Remaining)
+- [x] POSIX message queues — `mq_open`/`mq_unlink`/`mq_timedsend`/`mq_timedreceive`/
+  `mq_notify`/`mq_getsetattr`, priority-ordered and bounded by `RLIMIT_MSGQUEUE`;
+  `t-mqueue` pins 41 claims measured on the host first. This is the half of
+  `CLONE_NEWIPC`'s isolation that was missing; SysV objects still are (§6.12)
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
 - [x] the extensible `clone` door — `clone3` (435) with a versioned argument
   struct, and `CLONE_PIDFD` delivering the child **and a descriptor naming it** in
@@ -358,8 +362,8 @@ In the order that keeps each step verifiable on its own:
    port id a zero-`nl_pid` bind prefers (three probes; `t-uevent`, §6.3). So nothing of the `ucred`  
    stays named now.  
    IPC and CGROUP each wait on the thing they would isolate not  
-   existing yet (SysV/POSIX message queues; a cgroup tree), so they are cheap the day that lands  
-   and worthless before it. Nested namespaces pin the  
+   existing yet (SysV IPC objects, the POSIX queue half having landed in §6.12; and a cgroup tree),  
+   so they are cheap the day that lands and worthless before it. Nested namespaces pin the  
    *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were  
    per-namespace but unexercised; `t-ns-net` reads the file on both sides of the boundary now  
    (2026-10-15). Two more left this list on  
@@ -442,7 +446,8 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are a datagram socket's `SO_RCVBUF` - reported in Linux's  
 shape but not what sizes the receive ring (item 58; a stream's is now its window, item 98) -  
 and the datagram line itself, which is the ring's rather than Linux's 65507 until this stack  
-fragments IP; the two namespace kinds with no entry at all are IPC and cgroup.  
+fragments IP; the two namespace kinds with no entry at all are IPC and cgroup, and IPC's wait is
+now one thing rather than two: its POSIX message queues are served (§6.12), its SysV objects are not.  
 
 **A stream's receive buffer is its window, and a listener hands it to the socket it accepts**
 (`docs/uapi/` §5.1 item 98, landed 2026-10-21): item 58 made `SO_RCVBUF` Linux's number, but on a
