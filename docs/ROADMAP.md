@@ -184,7 +184,7 @@ One-glance status of the whole roadmap.
   tables key their state by it, a number restarts at 0 in a fresh namespace (so
   the pin compares objects rather than numbers), and the namespace is an `Arc`
   whose last holder - a task or a `ns/ipc` descriptor - frees those tables
-  (`t-ns-ipc`, 31 claims, §6.16); `CLONE_NEWCGROUP` is the last kind with
+  (`t-ns-ipc`, 37 claims, §6.16); `CLONE_NEWCGROUP` is the last kind with
   nothing behind it
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
 - [x] the extensible `clone` door — `clone3` (435) with a versioned argument

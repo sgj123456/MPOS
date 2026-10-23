@@ -234,6 +234,28 @@ impl UserNs {
         translate(&self.uid_snapshot(), inner, false)
     }
 
+    /// Whether the **uid** table gives the inside id `id` a stored one - Linux's
+    /// `uid_valid(make_kuid(ns, id))`.
+    ///
+    /// Distinct from [`Self::uid_to_stored`], which reports [`NO_MAP_ID`] for
+    /// *both* "this id is not mapped" and the real id 65534. A validity question
+    /// (`IPC_SET`'s, for one) must not inherit that confusion: Linux's own
+    /// `ipc_update_perm` refuses an uncovered id with `EINVAL` and stores 65534
+    /// like any other, and the measurement that pinned it found exactly that
+    /// (`.workbuddy/probe_ipc_set_map.c`, `docs/notes/` §6.15).
+    pub fn uid_is_mapped(&self, id: u32) -> bool {
+        self.uid_snapshot()
+            .iter()
+            .any(|line| line.to_outer(id).is_some())
+    }
+
+    /// The same question of the **gid** table.
+    pub fn gid_is_mapped(&self, id: u32) -> bool {
+        self.gid_snapshot()
+            .iter()
+            .any(|line| line.to_outer(id).is_some())
+    }
+
     pub fn gid_to_inner(&self, stored: u32) -> u32 {
         translate(&self.gid_snapshot(), stored, true)
     }

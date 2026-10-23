@@ -42,6 +42,7 @@ use rustix::thread::{UnshareFlags, unshare_unsafe};
 
 /// The commands this program asks for.
 const IPC_RMID: i32 = 0;
+const IPC_SET: i32 = 1;
 const IPC_STAT: i32 = 2;
 const IPC_CREAT: i32 = 0o1000;
 
@@ -379,6 +380,109 @@ fn main() {
         "and /proc/sysvipc/msg has the marked queue's row back",
         proc_has_cbytes("7"),
     );
+
+    // --- IPC_SET's ids are the caller's user namespace's ------------------
+    // Linux's `ipc_update_perm` maps the uid and gid an `IPC_SET` record names
+    // through the **caller's** user namespace and refuses an uncovered one with
+    // `EINVAL` - measured on a host first, with a one-id map
+    // (`.workbuddy/probe_ipc_set_map.c`), which is the map this child makes:
+    // `0` is mapped, `1`, `9` and `65534` are not, and 65534 is an ordinary id
+    // rather than a sentinel. A child does it, so the parent's namespaces above
+    // are untouched.
+    let map_child = unsafe { libc::fork() };
+    if map_child == 0 {
+        let mapped = unsafe { unshare_unsafe(UnshareFlags::NEWUSER) }.is_ok();
+        let wrote = std::fs::write("/proc/self/setgroups", "deny").is_ok()
+            && std::fs::write("/proc/self/uid_map", "0 0 1").is_ok()
+            && std::fs::write("/proc/self/gid_map", "0 0 1").is_ok();
+        unsafe {
+            libc::setgid(0);
+            libc::setuid(0);
+        }
+        let mut bits = 0u8;
+        if !(mapped && wrote) {
+            unsafe { libc::_exit(0x7f) };
+        }
+        let q = msgget(0x4d50_4e55, 0o600 | IPC_CREAT);
+        let mut ds = Ds::new();
+        let mut set = |bits: &mut u8, bit: u8, ok: bool| {
+            if ok {
+                *bits |= 1 << bit;
+            }
+        };
+        // The record's current ids, then one changed id at a time.
+        msgctl(q, IPC_STAT, ds.ptr());
+        unsafe {
+            ((ds.bytes.as_mut_ptr().add(4)) as *mut u32).write_unaligned(0);
+            ((ds.bytes.as_mut_ptr().add(8)) as *mut u32).write_unaligned(0);
+        }
+        set(&mut bits, 0, msgctl(q, IPC_SET, ds.ptr()) == 0);
+        let mut one = Ds::new();
+        msgctl(q, IPC_STAT, one.ptr());
+        unsafe { ((one.bytes.as_mut_ptr().add(4)) as *mut u32).write_unaligned(9) };
+        let uid_unmapped = msgctl(q, IPC_SET, one.ptr()) == -1 && errno() == libc::EINVAL;
+        set(&mut bits, 1, uid_unmapped);
+        let mut two = Ds::new();
+        msgctl(q, IPC_STAT, two.ptr());
+        unsafe { ((two.bytes.as_mut_ptr().add(8)) as *mut u32).write_unaligned(9) };
+        set(
+            &mut bits,
+            2,
+            msgctl(q, IPC_SET, two.ptr()) == -1 && errno() == libc::EINVAL,
+        );
+        let mut big = Ds::new();
+        msgctl(q, IPC_STAT, big.ptr());
+        unsafe { ((big.bytes.as_mut_ptr().add(4)) as *mut u32).write_unaligned(65534) };
+        set(
+            &mut bits,
+            3,
+            msgctl(q, IPC_SET, big.ptr()) == -1 && errno() == libc::EINVAL,
+        );
+        // The same rule at the other two doors.
+        let shm = shmget(0x4d50_4e55, 4096, 0o600 | IPC_CREAT);
+        let mut sds = Ds::new();
+        shmctl(shm, IPC_STAT, sds.ptr());
+        unsafe { ((sds.bytes.as_mut_ptr().add(4)) as *mut u32).write_unaligned(9) };
+        set(
+            &mut bits,
+            4,
+            shmctl(shm, IPC_SET, sds.ptr()) == -1 && errno() == libc::EINVAL,
+        );
+        let sem = semget(0x4d50_4e55, 1, 0o600 | IPC_CREAT);
+        let mut mds = Ds::new();
+        semctl(sem, 0, IPC_STAT, mds.ptr());
+        unsafe { ((mds.bytes.as_mut_ptr().add(4)) as *mut u32).write_unaligned(9) };
+        set(
+            &mut bits,
+            5,
+            semctl(sem, 0, IPC_SET, mds.ptr()) == -1 && errno() == libc::EINVAL,
+        );
+        unsafe {
+            msgctl(q, IPC_RMID, 0);
+            shmctl(shm, IPC_RMID, 0);
+            semctl(sem, 0, IPC_RMID, 0);
+            libc::_exit(bits as i32);
+        }
+    }
+    let mut map_status = 0;
+    unsafe { libc::waitpid(map_child, &mut map_status, 0) };
+    let bits = if libc::WIFEXITED(map_status) {
+        libc::WEXITSTATUS(map_status)
+    } else {
+        0x7f
+    };
+    r.check("a mapped uid/gid is accepted by IPC_SET", bits & 1 != 0);
+    r.check("an unmapped uid is EINVAL", bits & 2 != 0);
+    r.check(
+        "an unmapped gid is EINVAL - both ids are asked",
+        bits & 4 != 0,
+    );
+    r.check(
+        "65534 is an ordinary id: unmapped here, so EINVAL",
+        bits & 8 != 0,
+    );
+    r.check("shmctl's IPC_SET asks the same question", bits & 16 != 0);
+    r.check("and semctl's", bits & 32 != 0);
 
     // --- and the namespace a descriptor names outlives its last member ------
     // This task left the inner namespace when `setns` moved it, and it was the

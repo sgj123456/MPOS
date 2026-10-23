@@ -977,6 +977,9 @@ pub fn handle_shmctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                     let uid = unsafe { ((buf + IPC_PERM_UID) as *const u32).read_unaligned() };
                     let gid = unsafe { ((buf + IPC_PERM_GID) as *const u32).read_unaligned() };
                     let mode = unsafe { ((buf + IPC_PERM_MODE) as *const u32).read_unaligned() };
+                    if !ids_storable(uid, gid) {
+                        return err::EINVAL;
+                    }
                     segment.set_perm(uid, gid, mode);
                     segment.touch_change(now_secs());
                     0
@@ -1349,6 +1352,9 @@ pub fn handle_semctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                     let uid = unsafe { ((arg + IPC_PERM_UID) as *const u32).read_unaligned() };
                     let gid = unsafe { ((arg + IPC_PERM_GID) as *const u32).read_unaligned() };
                     let mode = unsafe { ((arg + IPC_PERM_MODE) as *const u32).read_unaligned() };
+                    if !ids_storable(uid, gid) {
+                        return err::EINVAL;
+                    }
                     set.set_perm(uid, gid, mode, now_secs());
                     0
                 }
@@ -1495,6 +1501,30 @@ const MSQ_LRPID: usize = 100;
 
 /// `struct msginfo`'s eight `int`s, for `IPC_INFO` and `MSG_INFO`.
 const MSGINFO_BYTES: usize = 32;
+
+/// Whether an `IPC_SET` may **store** the two ids its record names: Linux's
+/// `ipc_update_perm` maps each through the **caller's** user namespace and
+/// refuses one that namespace does not cover with `EINVAL` (`make_kuid`'s
+/// validity check).
+///
+/// Measured on a current host (`.workbuddy/probe_ipc_set_map.c`, run as root
+/// inside a user namespace whose map is a single id): `uid=0`/`gid=0` is
+/// accepted, `uid=1`, `uid=9` and `uid=65534` are `EINVAL`, and the answer is
+/// the same from `msgctl`, `shmctl` and `semctl` - so **both** ids are asked,
+/// and 65534 is an ordinary id rather than a sentinel. Before this the three
+/// doors stored whatever `u32` the record carried, which is the divergence
+/// §6.15 named and this closes.
+///
+/// The check sits **after** the owner and `CAP_SYS_RESOURCE` questions, which is
+/// Linux's own order (`ipcctl_obtain_check` → qbytes → `ipc_update_perm`): a
+/// caller that is not the creator hears `EPERM` whatever ids it named. That
+/// order is not measured here - this host maps one id, so there is no second
+/// identity to ask it from - and `docs/notes/` §6.15 records it as the one half
+/// left to a two-id map.
+fn ids_storable(uid: u32, gid: u32) -> bool {
+    let ns = crate::sched::current_user_ns();
+    ns.uid_is_mapped(uid) && ns.gid_is_mapped(gid)
+}
 
 fn err_of_msg(e: MsgError) -> isize {
     match e {
@@ -1837,6 +1867,9 @@ pub fn handle_msgctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                         if !capable {
                             return err::EPERM;
                         }
+                    }
+                    if !ids_storable(uid, gid) {
+                        return err::EINVAL;
                     }
                     queue.set_perm(uid, gid, mode, now_secs());
                     queue.set_qbytes(qbytes, now_secs());

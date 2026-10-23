@@ -2818,14 +2818,30 @@ themselves still alive.
 * **`CLONE_NEWCGROUP`** is the last kind with nothing behind it, and it waits on
   the cgroup tree it would hold — named in `docs/ROADMAP.md` as before.
 
-**Pin**: the new `t-ns-ipc`, **31 claims**, every one of them **run against a
+**Also closed, the same day, from this section's own "named" list**: `IPC_SET`
+stored whatever `uid`/`gid` its record carried, where Linux maps each through
+the **caller's** user namespace and refuses an uncovered one with `EINVAL`
+(`ipc_update_perm`'s `make_kuid`/`make_kgid` check). Measured with a one-id map
+(`.workbuddy/probe_ipc_set_map.c`, as root inside a user namespace): `uid=0`/
+`gid=0` is accepted, `uid=1`, `uid=9` and `uid=65534` are `EINVAL`, **both** ids
+are asked, and all three doors answer the same. The check sits after the owner
+and `CAP_SYS_RESOURCE` questions - Linux's own order - which this host could not
+measure (one mapped id leaves no second identity to ask from), so that half is
+recorded as unmeasured rather than claimed. `userns` gained
+`uid_is_mapped`/`gid_is_mapped` for it, deliberately *not* `uid_to_stored`: that
+one reports `NO_MAP_ID` for both "unmapped" and the real id 65534, and 65534 is
+an ordinary id here (measured).
+
+**Pin**: the new `t-ns-ipc`, **37 claims**, every one of them **run against a
 real kernel before it was pointed at this one** (the four failures that caught:
 a number shared across namespaces, `IPC_STAT` with a null buffer reading a live
 object as dead, a link taken before the wrong `unshare`, and a `setns` target
 that was the machine's rather than the namespace the objects were in). On a
 host run without `CAP_SYS_ADMIN` it makes its one claim — an unprivileged
 `unshare(CLONE_NEWIPC)` is `EPERM` — notes that, and exits green, the shape
-`t-ns-time` has. Plus two host tests: `sched::sysv_msg`'s
+`t-ns-time` has. Six of them are the `IPC_SET` rule above, asked in a child that makes its own
+one-id user namespace (so the whole pin is host-measured). Plus two host tests:
+`sched::sysv_msg`'s
 `a_namespace_has_its_own_slot_space` (a fresh space numbers from 0, the same key
 makes a different object, and two objects sharing a number are told apart by
 their handles) and `vfs::ns`'s `the_last_reference_frees_the_ipc_tables` (the

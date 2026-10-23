@@ -5578,7 +5578,9 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `LONG_MAX + 1` `EINVAL` with the message still queued) and a destination
     it cannot write is `EFAULT` **after** the message has been taken, so the
     failed call loses it;
-    `IPC_SET` reads its buffer first, rewrites uid/gid/mode, needs
+    `IPC_SET` reads its buffer first, rewrites uid/gid/mode, maps the uid and
+    gid through the **caller's** user namespace and refuses an uncovered one
+    with `EINVAL` (`ipc_update_perm`'s rule, measured with a one-id map), needs
     `CAP_SYS_RESOURCE` for a `msg_qbytes` **raise** and accepts a lowering
     below the queued bytes; the triads gate send/receive/`IPC_STAT`
     (`EACCES`) and the creator or `CAP_SYS_ADMIN` gates
@@ -5611,9 +5613,6 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     cover is missing any more, but each family's table is the machine's
     rather than a namespace's; threading the tables through the namespace
     object is the next landing. `MSGMNI` is 4096 here where Linux's is 32000.
-    `IPC_SET` stores the uid/gid the record names where Linux first maps the
-    id through the caller's user namespace and refuses an uncovered one with
-    `EINVAL` (pinned only once a claim builds a namespace of its own).
     `MSG_STAT_ANY` is served but not claimed. A negative `msgtyp` under
     `MSG_COPY` answers `ENOMSG` (Linux's own answer unmeasured).
 
@@ -5639,7 +5638,7 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     the four tables — `src/sched/sysv_{msg,sem}.rs`, `src/mm/sysv_shm.rs`,
     `src/vfs/mqueue.rs` — each a slot space per namespace.
 
-    **Pin**: the new `t-ns-ipc`, **31 claims**, every one run against a real
+    **Pin**: the new `t-ns-ipc`, **37 claims**, every one run against a real
     kernel before it was pointed at this one, plus two host tests -
     `sched::sysv_msg`'s `a_namespace_has_its_own_slot_space` and `vfs::ns`'s
     `the_last_reference_frees_the_ipc_tables`. The pins that had
