@@ -2456,6 +2456,13 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     /// (measured: 80 characters refused, 79 accepted), which is why the loop
     /// below reads at most this many bytes and refuses when none of them is NUL.
     const ANON_NAME_MAX: usize = 80;
+    // The child-subreaper pair: whether this *process* adopts an orphaned
+    // descendant instead of letting init have it. Measured on a current host:
+    // the setter takes any `int` and stores a boolean (`7` reads back as `1`),
+    // the getter writes an `int` through the pointer (`EFAULT` for a null one),
+    // and the flag is **not inherited by `fork`** but is kept across `exec`.
+    const PR_SET_CHILD_SUBREAPER: usize = 36;
+    const PR_GET_CHILD_SUBREAPER: usize = 37;
     const PR_SET_PDEATHSIG: usize = 1;
     const PR_GET_PDEATHSIG: usize = 2;
     /// `_NSIG`: the highest signal number Linux's `valid_signal` accepts.
@@ -2627,6 +2634,20 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
                 Ok(()) => 0,
                 Err(e) => e,
             }
+        }
+        PR_SET_CHILD_SUBREAPER => {
+            crate::sched::set_child_subreaper(args[1] != 0);
+            0
+        }
+        PR_GET_CHILD_SUBREAPER => {
+            let buf = args[1];
+            if buf == 0 || !buffer_ok(buf, 4, true, true) {
+                return err::EFAULT;
+            }
+            unsafe {
+                (buf as *mut u32).write_unaligned(crate::sched::current_child_subreaper() as u32)
+            };
+            0
         }
         PR_SET_PDEATHSIG => {
             if args[1] > NSIG {

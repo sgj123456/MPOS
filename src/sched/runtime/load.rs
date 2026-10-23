@@ -707,6 +707,7 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             // machine's until it unshares.
             ipc_ns: None,
             pdeathsig: 0,
+            subreaper: false,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -899,6 +900,8 @@ pub fn try_spawn_user(
             // `execve` keeps the setting - measured - so the new image starts
             // with whatever the process had asked for.
             pdeathsig: t.task(parent).pdeathsig,
+            // ...and the subreaper flag too: measured, `execve` preserves it.
+            subreaper: t.task(parent).subreaper,
             oom_score_adj: t.task(parent).oom_score_adj,
             oom_score_adj_min: t.task(parent).oom_score_adj_min,
             nice: t.task(parent).nice,

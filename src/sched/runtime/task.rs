@@ -773,6 +773,17 @@ pub(crate) struct Task {
     /// the namespace it is in now, and an id from the old one answers `EINVAL`
     /// (measured, §6.16).
     pub(crate) ipc_ns: Option<alloc::sync::Arc<crate::vfs::ns::IpcNs>>,
+    /// `PR_SET_CHILD_SUBREAPER`: whether an orphan of this task's descendants is
+    /// reparented to it rather than to init.
+    ///
+    /// Per **process**, not per thread: `prctl` writes the group leader's slot
+    /// and reads it back from there, which is Linux's `signal_struct` field in
+    /// this kernel's vocabulary. Measured on a current host
+    /// (`.workbuddy/probe_subreaper.c`): the value is a boolean (7 is stored as
+    /// 1), it is **not inherited by `fork`**, it survives `exec`, and the
+    /// behaviour it buys is that a grandchild whose own parent dies is reaped by
+    /// the marked ancestor instead of by init.
+    pub(crate) subreaper: bool,
     /// `PR_SET_PDEATHSIG`: the signal the kernel sends to this task when its
     /// parent dies, or 0 for none.
     ///
@@ -1168,6 +1179,8 @@ impl Task {
             ipc_ns: None,
             // No parent-death signal: nothing has asked for one.
             pdeathsig: 0,
+            // And not a subreaper: init is the machine's only one at boot.
+            subreaper: false,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -1832,6 +1845,8 @@ impl Table {
             ipc_ns: None,
             // No parent-death signal: nothing has asked for one.
             pdeathsig: 0,
+            // And not a subreaper: init is the machine's only one at boot.
+            subreaper: false,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),

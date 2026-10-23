@@ -833,6 +833,23 @@ pub fn current_ipc_ns() -> Option<u64> {
     })
 }
 
+/// Whether the running process is a **child subreaper** - read off the group
+/// leader, because the flag is the process's and `prctl` may be called from any
+/// thread of it.
+#[cfg(target_os = "none")]
+pub fn current_child_subreaper() -> bool {
+    with_table(|t| t.task(t.task(t.current).tgid).subreaper)
+}
+
+/// Store it on the group leader for the same reason.
+#[cfg(target_os = "none")]
+pub fn set_child_subreaper(on: bool) {
+    with_table(|t| {
+        let leader = t.task(t.current).tgid;
+        t.task_mut(leader).subreaper = on;
+    });
+}
+
 /// The running task's `PR_SET_PDEATHSIG` value, or 0 for none.
 #[cfg(target_os = "none")]
 pub fn current_pdeathsig() -> u32 {

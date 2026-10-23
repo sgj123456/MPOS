@@ -470,7 +470,15 @@ pub fn exit(code: isize) -> ! {
         // its own (`t-signalfd` was handed four records for one death, three
         // naming earlier tenants of the slot).
         if id != INIT_PID {
-            let reaper = alive_thread_of(t, tgid, id).unwrap_or(INIT_PID);
+            // ...and when the group has no one left, the nearest **subreaper**
+            // above the dying task takes the children, which is what
+            // `PR_SET_CHILD_SUBREAPER` buys a shell: its grandchildren whose own
+            // parent died come to it instead of to init. Measured on a host -
+            // `wait(-1)` reaps the grandchild with the flag set, and answers
+            // `ECHILD` without it.
+            let reaper = alive_thread_of(t, tgid, id)
+                .or_else(|| nearest_subreaper(t, id))
+                .unwrap_or(INIT_PID);
             let mut adopted = false;
             // `PR_SET_PDEATHSIG`'s delivery: Linux's `forget_original_parent`
             // sends each child the signal it asked for at the moment the parent
@@ -543,6 +551,35 @@ pub fn exit(code: isize) -> ! {
 /// Preferring the leader is not a preference for its own sake - it is the
 /// answer a reader then *names*, since `parent_group` reports the adopter's
 /// `tgid`, and the leader's `tgid` is the group.
+/// The nearest **subreaper** above `from` - Linux's
+/// `find_new_reaper`/`has_child_subreaper` walk, one task at a time.
+///
+/// It starts at the dying task's parent and stops at init, which is the last
+/// resort anyway; a marked ancestor answers with an alive task of its group (a
+/// thread of it if the leader has already gone, because the *process* is what
+/// adopts).
+fn nearest_subreaper(t: &Table, from: TaskId) -> Option<TaskId> {
+    let mut next = t.task(from).parent?;
+    // A bounded walk: the chain is a tree rooted at init, and the bound is the
+    // task table itself - the shape a cycle would need to survive it.
+    for _ in 0..t.tasks.len() {
+        if next == INIT_PID {
+            return None;
+        }
+        let leader = t.task(next).tgid;
+        if t.task(leader).subreaper {
+            if let Some(alive) = alive_thread_of(t, leader, next) {
+                return Some(alive);
+            }
+            if !t.task(leader).exited {
+                return Some(leader);
+            }
+        }
+        next = t.task(next).parent?;
+    }
+    None
+}
+
 fn alive_thread_of(t: &Table, tgid: TaskId, dying: TaskId) -> Option<TaskId> {
     let alive = |slot: usize| {
         slot != dying.0
@@ -1112,6 +1149,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             context,
             sem_undo,
             pdeathsig: 0,
+            subreaper: false,
             fpu_live: false,
             priority: parent_priority,
             stack: Some(stack),
@@ -1655,8 +1693,11 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         let user_ns = alloc::sync::Arc::clone(&parent.user_ns);
         let net_ns = parent.net_ns;
         let ipc_ns = parent.ipc_ns.clone();
-        // A thread is created, not forked, so it starts with none either.
+        // A thread is created, not forked, so it starts with none either. The
+        // subreaper flag *is* the process's, so the thread reads it from the
+        // leader and never carries one of its own.
         let pdeathsig = 0u32;
+        let subreaper = false;
         // `CLONE_FS` is what every `pthread_create` sets: a thread that
         // `chdir`s moves its process, which is Linux's answer (measured -
         // `.workbuddy/probe_unshare_flags.c`). A raw `clone(CLONE_THREAD)`
@@ -1806,6 +1847,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             // A thread is its process here too: one set of tables.
             ipc_ns,
             pdeathsig,
+            subreaper,
             oom_score_adj,
             oom_score_adj_min,
             nice,

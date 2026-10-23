@@ -532,6 +532,143 @@ fn main() {
         _ => r.check("the parent-death report pipes are made", false),
     }
 
+    // === the child subreaper =================================================
+    // Whether an orphaned *descendant* is reparented to this process rather than
+    // to init. Measured on a current host (`.workbuddy/probe_subreaper.c`): the
+    // setter takes any `int` and stores a boolean (`7` reads back as `1`), a
+    // null getter pointer is `EFAULT`, and `fork` does **not** inherit it.
+    let mut sub = 0xffff_ffffu32;
+    ok_is(
+        &mut r,
+        "PR_GET_CHILD_SUBREAPER answers 0 on a fresh process",
+        prctl(
+            libc::PR_GET_CHILD_SUBREAPER,
+            &mut sub as *mut u32 as usize,
+            0,
+            0,
+            0,
+        ),
+        0,
+    );
+    ok_is(
+        &mut r,
+        "and writes 0 through the pointer",
+        Ok(sub as isize),
+        0,
+    );
+    err_is(
+        &mut r,
+        "PR_GET_CHILD_SUBREAPER with a null pointer is EFAULT",
+        prctl(libc::PR_GET_CHILD_SUBREAPER, 0, 0, 0, 0),
+        Errno::FAULT,
+    );
+    ok_is(
+        &mut r,
+        "PR_SET_CHILD_SUBREAPER(7) is accepted",
+        prctl(libc::PR_SET_CHILD_SUBREAPER, 7, 0, 0, 0),
+        0,
+    );
+    sub = 0xffff_ffffu32;
+    let _ = prctl(
+        libc::PR_GET_CHILD_SUBREAPER,
+        &mut sub as *mut u32 as usize,
+        0,
+        0,
+        0,
+    );
+    ok_is(
+        &mut r,
+        "and reads back as the boolean it stores",
+        Ok(sub as isize),
+        1,
+    );
+    let forked = unsafe { libc::fork() };
+    if forked == 0 {
+        let mut v = 0xffff_ffffu32;
+        let rc = prctl(
+            libc::PR_GET_CHILD_SUBREAPER,
+            &mut v as *mut u32 as usize,
+            0,
+            0,
+            0,
+        );
+        unsafe { libc::_exit(if rc.is_ok() && v == 0 { 0 } else { 1 }) };
+    }
+    let mut sub_status = 0;
+    unsafe { libc::waitpid(forked, &mut sub_status, 0) };
+    r.check(
+        "a fork child is not a subreaper",
+        libc::WIFEXITED(sub_status) && libc::WEXITSTATUS(sub_status) == 0,
+    );
+
+    // ...and the behaviour: a grandchild whose own parent died comes here, and
+    // is this process's to reap. The middle process forks the grandchild and
+    // exits; the grandchild waits for that to have happened (a bounded sleep -
+    // the test has already reaped the middle by the time it reads) and reports
+    // the parent it ended up with.
+    let report = rustix::pipe::pipe();
+    match report {
+        Ok((tail, head)) => {
+            use std::os::fd::AsRawFd;
+            let middle = unsafe { libc::fork() };
+            if middle == 0 {
+                let grand = unsafe { libc::fork() };
+                if grand == 0 {
+                    drop(tail);
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    let ppid = unsafe { libc::getppid() } as u32;
+                    unsafe {
+                        libc::write(head.as_raw_fd(), (&ppid as *const u32).cast(), 4);
+                        libc::_exit(0);
+                    }
+                }
+                unsafe { libc::_exit(0) };
+            }
+            drop(head);
+            let mut st = 0;
+            unsafe { libc::waitpid(middle, &mut st, 0) };
+            let mut said = [0u8; 4];
+            let n = rustix::io::read(&tail, &mut said).unwrap_or(0);
+            let ppid = u32::from_ne_bytes(said);
+            ok_is(
+                &mut r,
+                "the orphaned grandchild names this process as its parent",
+                Ok(ppid as isize),
+                unsafe { libc::getpid() } as isize,
+            );
+            r.check(
+                "and it is this process's to reap, not init's",
+                n == 4 && unsafe { libc::waitpid(-1, &mut st, 0) } > 0,
+            );
+        }
+        Err(_) => r.check("the subreaper report pipe is made", false),
+    }
+
+    // Unset: the same shape goes to init, so there is nothing here to reap.
+    ok_is(
+        &mut r,
+        "the flag is cleared again",
+        prctl(libc::PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0),
+        0,
+    );
+    let middle = unsafe { libc::fork() };
+    if middle == 0 {
+        let grand = unsafe { libc::fork() };
+        if grand == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::_exit(0) };
+    }
+    let mut st = 0;
+    unsafe { libc::waitpid(middle, &mut st, 0) };
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let reaped = unsafe { libc::waitpid(-1, &mut st, 0) };
+    r.check(
+        "without the flag the orphan goes to init: there is nothing here to reap",
+        reaped == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD),
+    );
+
     // === an option the handler does not model ================================
     // Refused the way Linux's `prctl` default arm answers a number it does not
     // know - not the silent `0` this kernel used to hand back for every

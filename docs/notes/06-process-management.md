@@ -2947,3 +2947,46 @@ the host first and green on both machines.
 
 **Gate**: x86_64 `pass=205 fail=0`, stage 1 `1100 tests, 0 failed`,
 `mpos-kunit 32 passed, 0 failed`, exit 0.
+
+### 6.18 `PR_SET_CHILD_SUBREAPER` — an orphan comes to the marked ancestor, not to init (LANDED 2026-10-23)
+
+The option was another `prctl` catch-all refusal, and what it buys is a shell's
+whole job: a grandchild whose own parent died is reparented to the nearest
+ancestor that asked for it instead of to init, so the shell can reap it and see
+its status. Measured on a current host first
+(`.workbuddy/probe_subreaper.c`), then re-run against a real kernel:
+
+* the setter takes **any `int`** and stores a boolean - `7` reads back as `1` -
+  and `PR_GET_CHILD_SUBREAPER` writes that `int` through its pointer (`EFAULT`
+  for a null one);
+* it is **not inherited by `fork`** (the child reads 0) and is **kept across
+  `exec`** (the man page's claim; this kernel copies it in `load`, and the pin
+  holds the fork half, which is the half that was measured);
+* the behaviour: with the flag set, a middle process that forks a grandchild and
+  exits leaves the grandchild reparented to the marked ancestor - measured by
+  reaping it there and reading its `getppid()` - and without the flag the same
+  shape answers `ECHILD` because init has it instead.
+
+The substrate is a `bool` on `Task`, held on the **group leader** because the
+flag is the process's and `prctl` may be called from any thread, plus one arm in
+the walk that already chooses a dying task's successor parent:
+`alive_thread_of(dying group)`, then `nearest_subreaper` - the ancestor walk
+Linux's `find_new_reaper` performs - then init. The walk is bounded by the task
+table, so a cycle in a parent chain (which nothing should produce) ends it rather
+than hanging the kernel.
+
+**Pin**: `t-prctl`, grown to **53 claims**: the `EFAULT`, the boolean fold, the
+fork non-inheritance, the grandchild's `getppid()` and the reap, and the
+`ECHILD` without the flag - the last two being the pair that makes the option a
+behaviour rather than a stored number.
+
+**A flake seen while gating it**, recorded because the repo's rule is to re-run
+rather than believe: the first run of this commit's gate went red on
+`t-posix`'s *"getpriority answers 20"*, a claim this change does not touch, and
+the immediate re-run was `pass=205 fail=0`. The mechanism is not established
+(the claim reads the caller's own nice through the raw door, and nothing here
+touches a priority), so it is written down as an observation with its two
+readings rather than as a mechanism - and the re-run is the one quoted.
+
+**Gate**: x86_64 `pass=205 fail=0` (the re-run), stage 1 `1100 tests, 0 failed`,
+`mpos-kunit 32 passed, 0 failed`, exit 0.
