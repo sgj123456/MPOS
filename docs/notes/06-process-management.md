@@ -2688,16 +2688,23 @@ for the semaphore family's `semusz`/`semaem`).
   refused: each family's table is the machine's, not a namespace's, and
   threading the tables through the namespace object is the landing that
   follows from this one;
-* `MSG_STAT_ANY` **is** claimed now, and so is a permission split that is worth
-  writing down twice-measured (`.workbuddy/probe_stat_perm.c`, mode `0000` read
-  back after the `IPC_SET` to prove it landed): `MSG_STAT` refuses a queue nobody
-  may read with `EACCES` and `MSG_STAT_ANY` answers it - which is what the `_ANY`
-  spelling exists for - while for **`shmctl` the split is the other way round**:
-  `SHM_STAT` answers a mode-`0000` segment and `SHM_STAT_ANY` refuses it
-  `EACCES`. That second one is this host's own oddity, reproduced but not
-  explained, so it is *named* here and this kernel keeps the family-consistent
-  split (STAT asks read permission, ANY does not) rather than mirroring
-  something nothing accounts for;
+* `MSG_STAT_ANY` **is** claimed now, with the permission split the message family
+  measures cleanly (`MSG_STAT` refuses a queue nobody may read with `EACCES`,
+  `MSG_STAT_ANY` answers it - what the `_ANY` spelling exists for), and the pin
+  asks it from a caller **without** `CAP_IPC_OWNER`, because that capability is
+  the other half of the question: an owner that holds it is served by both. **A
+  correction, and it cost two wrong notes:** a first round of probes read
+  `shmctl` as having the split *reversed* (`SHM_STAT` answering a mode-`0000`
+  segment while `SHM_STAT_ANY` refused it) and recorded that as a reproducible
+  oddity. A decisive re-probe (`.workbuddy/probe_stat_decisive.c`, which
+  `unshare(CLONE_NEWIPC)`s first so the caller's *own* user namespace owns the
+  IPC namespace) served all three spellings on a mode-`0000` segment, and named
+  the mechanism: every answer in that family is `ipcperms`'s, and `ipcperms`
+  yields to `ns_capable(ns->user_ns, CAP_IPC_OWNER)` - so the "reversal" was a
+  reading of two runs that differed in *which user namespace owned the tables*,
+  not in the command. The earlier paragraphs' claim that it was reproduced is
+  withdrawn here rather than left standing; what the pin holds is the one split
+  this kernel implements, measured where the capability cannot colour it;
 * **the `MSG_STAT` argument form is not settled.** Two probes on the same host
   disagree: a generation-nonzero queue whose slot was handed to `MSG_STAT`
   answered `EINVAL` (`.workbuddy/probe_stat_gen.c`) and, in a second run of the

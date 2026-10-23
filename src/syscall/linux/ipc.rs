@@ -934,13 +934,14 @@ pub fn handle_shmctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // read and `SHM_STAT_ANY` does not, which is the only difference.
         SHM_STAT | SHM_STAT_ANY => {
             // The argument is read through `ipcid_to_idx`, the message family's
-            // rule and the same open question (`MSG_STAT`'s comment above): what
-            // is settled for this family is the *permission* split, and it is
-            // the reverse of the message family's - measured twice with a
-            // verified mode, `.workbuddy/probe_stat_perm.c`: `SHM_STAT` answers
-            // a mode-`0000` segment and `SHM_STAT_ANY` refuses it `EACCES`.
-            // That is this host's own oddity and it is *named* rather than
-            // mirrored, because nothing explains it.
+            // rule and the same open question (`MSG_STAT`'s comment above). The
+            // *permission* split is the family-consistent one - the plain
+            // spelling asks read permission, `_ANY` does not - and a run of
+            // probes that read the opposite for this family was itself the
+            // finding: every answer here is `ipcperms`'s, and `ipcperms` yields
+            // to `ns_capable(ns->user_ns, CAP_IPC_OWNER)`, so those runs were
+            // reading *which user namespace owned the tables* rather than which
+            // command was asked (`docs/notes/` §6.16, correction).
             let slot = args[0] % crate::mm::ipc_id::SEQ_MULTIPLIER as usize;
             let Some(segment) = sysv_shm::by_slot(ns, slot as u64) else {
                 return err::EINVAL;

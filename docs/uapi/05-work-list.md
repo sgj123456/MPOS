@@ -5614,12 +5614,14 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     rather than a namespace's; threading the tables through the namespace
     object is the next landing. `MSGMNI` is 4096 here where Linux's is 32000.
     `MSG_STAT_ANY` is claimed now, together with the permission split (`MSG_STAT`
-    asks read permission and the `_ANY` spelling does not; `shmctl`'s split is
-    the reverse on a measured host and is named, not mirrored). A negative or
-    huge `msgtyp` under `MSG_COPY` is `ENOMSG` and takes nothing - measured, and
-    pinned. The `MSG_STAT` *argument form* (slot versus full id) is left open:
-    two probes on one host disagreed, so the kernel keeps the reduction that
-    accepts both and §6.16 says why.
+    asks read permission and the `_ANY` spelling does not) - asked from a caller
+    without `CAP_IPC_OWNER`, because that capability lets both spellings answer a
+    mode-`0000` object. A negative or huge `msgtyp` under `MSG_COPY` is `ENOMSG`
+    and takes nothing - measured and pinned. The `MSG_STAT` *argument form* and
+    its return value are left **open**: probes on one host disagreed (a slot was
+    `EINVAL` in one run and resolved in another; the return value was the id in
+    one and `0` in another), so the kernel keeps the reduction that accepts both
+    and §6.16 says why.
 
 ## item 104 — `CLONE_NEWIPC`: the seventh namespace kind, and the last thing `ipcs` waited on
 
