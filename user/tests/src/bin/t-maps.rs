@@ -46,7 +46,7 @@
 use mpos_user_tests::{Report, host_run};
 use rustix::fd::AsFd;
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
-use rustix::mm::{MapFlags, ProtFlags, mmap, mmap_anonymous};
+use rustix::mm::{MapFlags, MprotectFlags, ProtFlags, mmap, mmap_anonymous, mprotect, munmap};
 
 /// Where the name column starts, measured on Linux 7.2.7 and re-measured on
 /// this sandbox's host (`.workbuddy/probe_maps.c`).
@@ -401,6 +401,110 @@ fn main() {
             }
         }
         Err(_) => r.check("the maps file still opens", false),
+    }
+
+    // --- a private file mapping, and the two calls that rewrite it ---
+    // A `MAP_PRIVATE` mapping of a file is what `record_eager_range` exists for:
+    // its pages are read in at `mmap` time, so this kernel leaves no VMA and
+    // `/proc/<pid>/maps` is built from the recorded range instead. That makes
+    // the description the *only* copy of the mapping's permissions and extent,
+    // so `munmap` and `mprotect` have to carry it - which is the claim here,
+    // and the reason it is a claim: both were wired but neither was pinned, so
+    // a range that outlived its pages would have read as a mapping that is not
+    // there (`docs/notes/` §6.10 said so before this pin existed).
+    let private_file = (|| -> Option<usize> {
+        let mfd = memfd_create("t-maps-ranges", MemfdFlags::empty()).ok()?;
+        r.check("a second memfd is created", true);
+        r.check(
+            "and sized to three pages",
+            ftruncate(mfd.as_fd(), 3 * 4096).is_ok(),
+        );
+        let map = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                3 * 4096,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::PRIVATE,
+                mfd.as_fd(),
+                0,
+            )
+        };
+        r.check("and mapped private", map.is_ok());
+        map.ok().map(|p| p as usize)
+    })()
+    .unwrap_or(0);
+
+    if private_file != 0 {
+        match read_maps() {
+            Ok(maps) => match line_at(&maps, private_file) {
+                Some(line) => {
+                    r.check(
+                        "the private file mapping reads rw-p over its three pages",
+                        line.perms == b"rw-p" && line.covers(private_file, 3 * 4096),
+                    );
+                }
+                None => r.check("the private file mapping is listed", false),
+            },
+            Err(_) => r.check("the maps file opens", false),
+        }
+
+        // A page out of the middle goes, and the description has to split.
+        let hole = private_file + 4096;
+        r.check(
+            "the middle page is unmapped",
+            unsafe { munmap(hole as *mut _, 4096) }.is_ok(),
+        );
+        match read_maps() {
+            Ok(maps) => {
+                r.check(
+                    "the hole has no line of its own",
+                    line_at(&maps, hole).is_none(),
+                );
+                match line_at(&maps, private_file) {
+                    Some(line) => r.check(
+                        "the first page is still there, and now shorter",
+                        line.perms == b"rw-p" && line.end == hole,
+                    ),
+                    None => r.check("the first page survives the unmap", false),
+                }
+                match line_at(&maps, private_file + 2 * 4096) {
+                    Some(line) => r.check(
+                        "and the last page is its own range",
+                        line.perms == b"rw-p" && line.start == hole + 4096,
+                    ),
+                    None => r.check("the last page survives the unmap", false),
+                }
+            }
+            Err(_) => r.check("the maps file opens after the unmap", false),
+        }
+
+        // A permission change over the surviving first page, and no other.
+        let prot = |addr: usize, len: usize, flags: MprotectFlags| unsafe {
+            mprotect(addr as *mut _, len, flags)
+        };
+        r.check(
+            "the first page is made read-only",
+            prot(private_file, 4096, MprotectFlags::READ).is_ok(),
+        );
+        match read_maps() {
+            Ok(maps) => {
+                match line_at(&maps, private_file) {
+                    Some(line) => r.check(
+                        "the page reads r--p after the mprotect",
+                        line.perms == b"r--p",
+                    ),
+                    None => r.check("the protected page is still listed", false),
+                }
+                match line_at(&maps, private_file + 2 * 4096) {
+                    Some(line) => r.check(
+                        "and the page the call did not name kept rw-p",
+                        line.perms == b"rw-p",
+                    ),
+                    None => r.check("the untouched page is still listed", false),
+                }
+            }
+            Err(_) => r.check("the maps file opens after the mprotect", false),
+        }
     }
 
     // --- the heap, which grows when the break moves ---
