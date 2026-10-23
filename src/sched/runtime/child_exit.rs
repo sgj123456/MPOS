@@ -1246,6 +1246,11 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // fresh one (`CLONE_NEWNET`, minted by the syscall layer, which is the
             // layer allowed to name `net`).
             net_ns: request.net_ns.or(t.task(parent_id).net_ns),
+            // The same for `ipcs`: the objects a child is born with are its
+            // creator's, and the clone door has no `CLONE_NEWIPC` to ask for
+            // others (`validate_clone_flags` refuses every namespace bit, and
+            // `unshare` is the door this kind is served through).
+            ipc_ns: t.task(parent_id).ipc_ns,
             oom_score_adj: t.task(parent_id).oom_score_adj,
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
             nice: t.task(parent_id).nice,
@@ -1621,6 +1626,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         // in, which is this one value.
         let user_ns = alloc::sync::Arc::clone(&parent.user_ns);
         let net_ns = parent.net_ns;
+        let ipc_ns = parent.ipc_ns;
         // `CLONE_FS` is what every `pthread_create` sets: a thread that
         // `chdir`s moves its process, which is Linux's answer (measured -
         // `.workbuddy/probe_unshare_flags.c`). A raw `clone(CLONE_THREAD)`
@@ -1767,6 +1773,8 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             // `CLONE_THREAD` follows for every namespace above it (and why the
             // verdict refuses a thread with a namespace of its own).
             net_ns: net_ns.clone(),
+            // A thread is its process here too: one set of tables.
+            ipc_ns,
             oom_score_adj,
             oom_score_adj_min,
             nice,

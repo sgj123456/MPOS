@@ -1,10 +1,14 @@
 //! POSIX message queues (`mq_open(3)` and its five siblings): named, bounded,
 //! priority-ordered queues.
 //!
-//! This is the family the IPC namespace waits on: `unshare(CLONE_NEWIPC)` is
-//! refused because "SysV IPC objects and POSIX message queues" are the thing
-//! the kind would isolate, and the kernel has neither (`docs/notes/` §6.3). The
-//! queue objects live here, in `vfs`, for the same reason `eventfd`/`timerfd`/
+//! A **name is the IPC namespace's**: `unshare(CLONE_NEWIPC)` hides every queue
+//! opened before it and lets the same name be made again inside, as measured on
+//! a current host (`.workbuddy/probe_ipcns.c`, `docs/notes/` §6.16). The
+//! registry below therefore records each queue's namespace beside it, while the
+//! byte *budget* (`USAGE`) stays machine-wide - Linux charges
+//! `RLIMIT_MSGQUEUE` per user, not per namespace.
+//!
+//! The queue objects live here, in `vfs`, for the same reason `eventfd`/`timerfd`/
 //! `pidfd` do: the ABI puts a *descriptor* in the caller's hand, and a
 //! descriptor is this layer's business - it is pollable, it has a mode and an
 //! inode number, and `close` is what ends its claim on the queue.
@@ -301,7 +305,21 @@ fn owner_alive(_owner: usize) -> bool {
 // The name registry
 // ---------------------------------------------------------------------------
 
-static REGISTRY: Mutex<RefCell<Vec<Arc<Queue>>>> = Mutex::new(RefCell::new(Vec::new()));
+/// The queues, each tagged with the IPC namespace it belongs to (`None` for the
+/// machine's own).
+///
+/// A name is namespace-scoped on Linux - measured: a queue opened before
+/// `unshare(CLONE_NEWIPC)` is `ENOENT` inside, and the same name made inside is a
+/// second object (`.workbuddy/probe_ipcns.c`, §6.16) - so the registry is a list
+/// of `(namespace, queue)` rather than a name→queue map. The `USAGE` table below
+/// is *not* per namespace: Linux charges `RLIMIT_MSGQUEUE` per user across the
+/// machine (`user->mq_bytes`), and a namespace does not give a user a second
+/// budget.
+static REGISTRY: Mutex<RefCell<Vec<RegistryRow>>> = Mutex::new(RefCell::new(Vec::new()));
+
+/// One row: the namespace the queue belongs to (`None` for the machine's own)
+/// beside the queue itself.
+type RegistryRow = (Option<u64>, Arc<Queue>);
 
 /// Per-uid byte usage, so `RLIMIT_MSGQUEUE` can be the bound Linux makes it.
 static USAGE: Mutex<RefCell<Vec<(u32, u64)>>> = Mutex::new(RefCell::new(Vec::new()));
@@ -317,15 +335,28 @@ impl Queue {
     }
 }
 
-/// The queue named `name`, if one exists.
-pub fn lookup(name: &str) -> Option<Arc<Queue>> {
+/// The queue named `name` in namespace `ns`, if one exists.
+pub fn lookup(ns: Option<u64>, name: &str) -> Option<Arc<Queue>> {
     critical_section::with(|cs| {
         REGISTRY
             .borrow(cs)
             .borrow()
             .iter()
-            .find(|q| q.name == name)
-            .cloned()
+            .find(|(held, q)| *held == ns && q.name == name)
+            .map(|(_, q)| Arc::clone(q))
+    })
+}
+
+/// Every queue of `ns`, for the `/dev/mqueue` listing.
+pub fn all(ns: Option<u64>) -> Vec<Arc<Queue>> {
+    critical_section::with(|cs| {
+        REGISTRY
+            .borrow(cs)
+            .borrow()
+            .iter()
+            .filter(|(held, _)| *held == ns)
+            .map(|(_, q)| Arc::clone(q))
+            .collect()
     })
 }
 
@@ -348,6 +379,7 @@ pub fn usage(uid: u32) -> u64 {
 /// size, which is Linux's rule (measured: with the limit at 0 creation is
 /// `EMFILE` and a send is not charged again).
 pub fn create(
+    ns: Option<u64>,
     name: String,
     maxmsg: usize,
     msgsize: usize,
@@ -357,7 +389,10 @@ pub fn create(
     critical_section::with(|cs| {
         {
             let registry = REGISTRY.borrow(cs).borrow();
-            if registry.iter().any(|q| q.name == name) {
+            if registry
+                .iter()
+                .any(|(held, q)| *held == ns && q.name == name)
+            {
                 return Err(MqError::Exists);
             }
         }
@@ -374,17 +409,20 @@ pub fn create(
                 None => rows.push((uid, charge)),
             }
         }
-        REGISTRY.borrow(cs).borrow_mut().push(queue.clone());
+        REGISTRY.borrow(cs).borrow_mut().push((ns, queue.clone()));
         Ok(queue)
     })
 }
 
-/// Retire `name`, keeping the object alive through its open descriptors.
-pub fn unlink(name: &str) -> Result<(), MqError> {
+/// Retire `name` of namespace `ns`, keeping the object alive through its open
+/// descriptors.
+pub fn unlink(ns: Option<u64>, name: &str) -> Result<(), MqError> {
     let found = critical_section::with(|cs| {
         let mut registry = REGISTRY.borrow(cs).borrow_mut();
-        let at = registry.iter().position(|q| q.name == name)?;
-        Some(registry.remove(at))
+        let at = registry
+            .iter()
+            .position(|(held, q)| *held == ns && q.name == name)?;
+        Some(registry.remove(at).1)
     });
     match found {
         Some(queue) => {

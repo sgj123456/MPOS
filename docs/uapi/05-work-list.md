@@ -5616,3 +5616,44 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `EINVAL` (pinned only once a claim builds a namespace of its own).
     `MSG_STAT_ANY` is served but not claimed. A negative `msgtyp` under
     `MSG_COPY` answers `ENOMSG` (Linux's own answer unmeasured).
+
+## item 104 — `CLONE_NEWIPC`: the seventh namespace kind, and the last thing `ipcs` waited on
+
+    `unshare(CLONE_NEWIPC)` and `setns(fd, CLONE_NEWIPC)` were `EOPNOTSUPP`:
+    the four families the kind isolates were served (items 100–103) and the
+    object that isolates them was not. Measured on a current host first
+    (`.workbuddy/probe_ipcns.c`, run as root inside a user namespace; the record
+    is §6.16): the number an object is known by **restarts at 0** in a fresh
+    namespace, an id from the namespace left behind answers `EINVAL`, a **key**
+    resolves only inside its own namespace, all four families move together,
+    `/proc/sysvipc/*` is the reader's view, a `fork` stays where its parent is,
+    and `setns` back restores the first namespace's objects. §6.16 also records
+    the trap the measurement handed over: a number is not an identity across
+    namespaces, so every object now carries a machine-wide handle and the
+    waiter/undo tables key by it.
+
+    **Owner**: `src/vfs/ns.rs` (`Kind::Ipc`, the `Namespace::Ipc` handle, the
+    machine's number, the `/proc/<pid>/ns` entry), `src/sched/runtime/task.rs`
+    and `child_signal.rs` (the `ipc_ns` slot and the doors),
+    `src/syscall/linux/{abi,posix}.rs` (the verdict and the two syscalls), and
+    the four tables — `src/sched/sysv_{msg,sem}.rs`, `src/mm/sysv_shm.rs`,
+    `src/vfs/mqueue.rs` — each a slot space per namespace.
+
+    **Pin**: the new `t-ns-ipc`, **28 claims**, every one run against a real
+    kernel before it was pointed at this one, plus one host test in
+    `sched::sysv_msg` (`a_namespace_has_its_own_slot_space`). The pins that had
+    asserted IPC was *unserved* moved with the measurement: `t-caps` and the
+    whole-word refusals in `t-ns-net`, `t-ns-pid`, `t-ns-uts` and `t-ns-mnt`
+    now name `CLONE_NEWCGROUP`, and `t-ns-setns`'s directory listing expects the
+    `ipc` name.
+
+    **Gate**: x86_64 `pass=205 fail=0`, stage 1 `1099 tests, 0 failed`,
+    `mpos-kunit 32 passed, 0 failed`, exit 0; `depgraph` within the ratchet. The
+    aarch64 arm builds (kernel, loader, clippy) but its sweep cannot boot on this
+    host (`egl: no drm render node available`), so no aarch64 figure is claimed.
+
+    **Named**: a namespace's tables are **not freed** when it dies — bounded per
+    space by each family's limit and by how many namespaces were ever made, and
+    a death hook is the landing that would close it. `clone(CLONE_NEWIPC)` is
+    still refused with every other namespace bit (the clone door is unchanged).
+    `CLONE_NEWCGROUP` is the last kind with nothing behind it.

@@ -142,16 +142,17 @@ fn main() {
         .unwrap_or_default();
     let mut sorted = names.clone();
     sorted.sort();
-    // Eight names now: USER joined the directory as the ladder's sixth rung, and
-    // it brought *one* name rather than two because it moves its caller where PID
-    // and TIME each have a `_for_children` slot (§6.3). The list is the kernel's
-    // claim about what it can isolate, so a set written down here drifts the
-    // moment it grows - which is why the probe below is the *complete* list rather
-    // than a spot check.
+    // Nine names now: USER joined the directory as the ladder's sixth rung and
+    // IPC as the seventh, each bringing *one* name rather than two because both
+    // move their caller where PID and TIME have a `_for_children` slot (§6.3).
+    // The list is the kernel's claim about what it can isolate, so a set written
+    // down here drifts the moment it grows - which is why the probe below is the
+    // *complete* list rather than a spot check.
     r.check(
-        "the ns directory names the six namespaces this kernel has, eight names",
+        "the ns directory names the seven namespaces this kernel has, nine names",
         sorted
             == vec![
+                "ipc".to_string(),
                 "mnt".to_string(),
                 "net".to_string(),
                 "pid".to_string(),
@@ -194,9 +195,10 @@ fn main() {
     // The names this machine has no namespace for are the same answer a real
     // kernel gives for the ones it was built without: no entry at all. This list
     // has shrunk once per rung - TIME left it with the fifth (the `t-ns-time` pin
-    // walks that entry end to end) and USER with the sixth (`t-ns-user` does the
-    // same for its own).
-    for absent in ["ipc", "cgroup"] {
+    // walks that entry end to end), USER with the sixth, and IPC with the seventh
+    // (`t-ns-ipc` walks that one, setns included). CGROUP is the last, and it
+    // waits on the tree it would isolate.
+    for absent in ["cgroup"] {
         let path = format!("/proc/self/ns/{absent}");
         r.check(
             &format!("a namespace this kernel has not is ENOENT ({absent})"),

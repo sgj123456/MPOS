@@ -56,7 +56,7 @@ pub use runtime::{
     continued_report_pending, controlling_tty_of_current, credentials_of, current, current_blocked,
     current_comm_bytes, current_cpu_ticks, current_credentials, current_cwd, current_cwd_path,
     current_diskstat, current_disposition, current_exe, current_fds, current_fs_context,
-    current_groups, current_identity, current_is_root, current_is_seccomp_strict,
+    current_groups, current_identity, current_ipc_ns, current_is_root, current_is_seccomp_strict,
     current_is_session_leader, current_map_user, current_net_ns, current_owner, current_pending,
     current_pgid, current_pid_number, current_real_owner, current_rlimit, current_root,
     current_stack_range, current_tgid, current_tls, current_umask, current_user_ns, current_uts,
@@ -78,8 +78,8 @@ pub use runtime::{
     run_seccomp_filters, send_signal, send_signal_group, send_signal_group_checked,
     send_signal_group_info, send_signal_info, send_signal_process, session_of, session_of_tty,
     set_brk_base, set_clear_tid, set_current_blocked, set_current_comm, set_current_identity,
-    set_current_rlimit, set_current_tls, set_current_umask, set_cwd, set_cwd_path, set_mmap_cursor,
-    set_net_ns, set_nice, set_oom_score_adj, set_pgid, set_robust_head, set_root,
+    set_current_rlimit, set_current_tls, set_current_umask, set_cwd, set_cwd_path, set_ipc_ns,
+    set_mmap_cursor, set_net_ns, set_nice, set_oom_score_adj, set_pgid, set_robust_head, set_root,
     set_seccomp_filter, set_seccomp_strict, set_signal_action, set_signal_alt_stack,
     set_trace_options, set_tracer, setns_mnt, setns_pid, setns_time, setns_user, setns_uts,
     shm_attachment_at, shm_attachment_count, signal_action, signal_alt_stack, sleep_ns,
@@ -89,9 +89,9 @@ pub use runtime::{
     take_signal_in_set, take_stop_report, take_vmas, task_count, thread_group_has_siblings,
     thread_snapshots, time_offsets, timer_alloc, timer_arm, timer_overrun, timer_remove,
     timer_state, tls_of, trace_options, trace_syscall, tracer_of, try_spawn_user, uid_members,
-    unmap_user, unshare_files, unshare_fs, unshare_mnt, unshare_pid, unshare_time, unshare_user,
-    unshare_uts, user_frame_at, user_mapped, vfork, vma_gaps, vma_kind_at, vma_prot_at,
-    vma_range_free, wait_any_child_event, wait_child_event, wait_for_interrupt, wake,
+    unmap_user, unshare_files, unshare_fs, unshare_ipc, unshare_mnt, unshare_pid, unshare_time,
+    unshare_user, unshare_uts, user_frame_at, user_mapped, vfork, vma_gaps, vma_kind_at,
+    vma_prot_at, vma_range_free, wait_any_child_event, wait_child_event, wait_for_interrupt, wake,
     with_current_credentials, write_user, write_user_of, yield_now,
 };
 
@@ -154,6 +154,27 @@ pub fn pid_numbers_of(slot: TaskId) -> alloc::vec::Vec<u32> {
 pub fn resolve_pid(number: i64) -> Option<TaskId> {
     (number > 0).then_some(TaskId(number as usize))
 }
+
+/// A host build has one process and it has never unshared, so every table read
+/// is the machine's own namespace - which is `None`, the key the four IPC
+/// tables use for it. A host test that wants to argue about isolation passes a
+/// key of its own to the table directly, so nothing here has to pretend to
+/// unshare.
+#[cfg(not(target_os = "none"))]
+pub fn current_ipc_ns() -> Option<u64> {
+    None
+}
+
+/// A host build has no task table, so there is nothing to move: the stand-in
+/// for the machine-only writer, kept so `ipc`'s host side compiles against the
+/// same name.
+#[cfg(not(target_os = "none"))]
+pub fn set_ipc_ns(_ns: Option<u64>) {}
+
+/// The host has no namespaces to make: `unshare` is machine-compiled, and this
+/// exists only so a host build of the crate that names it still links.
+#[cfg(not(target_os = "none"))]
+pub fn unshare_ipc() {}
 
 /// A host build has no processes, so no creator: root, which is what a node
 /// with no owner model reports anyway.

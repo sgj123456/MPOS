@@ -703,6 +703,9 @@ pub fn try_spawn_init(bytes: &[u8], argv: &[String], env: &[String]) -> Result<T
             // The machine's own network namespace, which is `None`: every socket
             // call resolves to the stack the boot built.
             net_ns: None,
+            // And the machine's own IPC namespace: pid 1's tables are the
+            // machine's until it unshares.
+            ipc_ns: None,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -888,6 +891,10 @@ pub fn try_spawn_user(
             // starts shares the stack of whatever started it, which is the rule
             // `fork` follows.
             net_ns: t.task(parent).net_ns,
+            // The starter's IPC namespace, by reference: the objects a program
+            // is started with are the tables it was started from, which is the
+            // rule `fork` follows too.
+            ipc_ns: t.task(parent).ipc_ns,
             oom_score_adj: t.task(parent).oom_score_adj,
             oom_score_adj_min: t.task(parent).oom_score_adj_min,
             nice: t.task(parent).nice,

@@ -3241,7 +3241,7 @@ const SYSVIPC_SHM_HEADER: &str = "       key      shmid perms                  s
 /// wide because they are counters, not sizes.
 pub fn sysvipc_shm_text() -> String {
     let mut out = String::from(SYSVIPC_SHM_HEADER);
-    for segment in crate::mm::sysv_shm::all() {
+    for segment in crate::mm::sysv_shm::all(crate::sched::current_ipc_ns()) {
         let perm = segment.perm();
         let times = segment.times();
         let attachments = crate::sched::shm_attachment_count(segment.id());
@@ -3281,7 +3281,7 @@ const SYSVIPC_SEM_HEADER: &str =
 /// `sem_otime` then `sem_ctime`, zero until something has operated on the set.
 pub fn sysvipc_sem_text() -> String {
     let mut out = String::from(SYSVIPC_SEM_HEADER);
-    for set in crate::sched::sysv_sem::all() {
+    for set in crate::sched::sysv_sem::all(crate::sched::current_ipc_ns()) {
         let perm = set.perm();
         let (otime, ctime) = set.times();
         out.push_str(&alloc::format!(
@@ -3312,7 +3312,7 @@ const SYSVIPC_MSG_HEADER: &str = "       key      msqid perms      cbytes       
 /// the two pids, and the three clocks, `stime` (last send) through `ctime`.
 pub fn sysvipc_msg_text() -> String {
     let mut out = String::from(SYSVIPC_MSG_HEADER);
-    for queue in crate::sched::sysv_msg::all() {
+    for queue in crate::sched::sysv_msg::all(crate::sched::current_ipc_ns()) {
         let perm = queue.perm();
         let (cbytes, qnum, _qbytes, lspid, lrpid, stime, rtime, ctime) = queue.stats();
         out.push_str(&alloc::format!(

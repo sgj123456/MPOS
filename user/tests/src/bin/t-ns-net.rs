@@ -539,8 +539,8 @@ fn main() {
     // ---- A word that mixes the served kinds with an unserved one is refused
     //      whole ----
     r.check(
-        "unshare(CLONE_NEWNET|CLONE_NEWIPC) is EOPNOTSUPP, whole",
-        unshare(UnshareFlags::NEWNET | UnshareFlags::NEWIPC) == Err(Errno::OPNOTSUPP),
+        "unshare(CLONE_NEWNET|CLONE_NEWCGROUP) is EOPNOTSUPP, whole",
+        unshare(UnshareFlags::NEWNET | UnshareFlags::NEWCGROUP) == Err(Errno::OPNOTSUPP),
     );
 
     // ---- A socket outlives the move, which is what makes `unshare` usable ----

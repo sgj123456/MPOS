@@ -192,7 +192,11 @@ pub fn handle_mq_open(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         return err::EINVAL;
     }
 
-    let queue = match crate::vfs::mqueue::lookup(&name) {
+    // POSIX queues are the fourth table `CLONE_NEWIPC` isolates: a name is the
+    // namespace's, so the same name inside another namespace is a second queue
+    // (measured, §6.16).
+    let ns = crate::sched::current_ipc_ns();
+    let queue = match crate::vfs::mqueue::lookup(ns, &name) {
         Some(queue) => {
             if oflag & O_CREAT as u32 != 0 && oflag & O_EXCL as u32 != 0 {
                 return err::EEXIST;
@@ -215,6 +219,7 @@ pub fn handle_mq_open(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 _ => 819_200,
             };
             match crate::vfs::mqueue::create(
+                ns,
                 String::from(name.as_str()),
                 maxmsg,
                 msgsize,
@@ -258,7 +263,7 @@ pub fn handle_mq_unlink(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     if name.contains('/') {
         return err::EACCES;
     }
-    match crate::vfs::mqueue::unlink(&name) {
+    match crate::vfs::mqueue::unlink(crate::sched::current_ipc_ns(), &name) {
         Ok(()) => 0,
         Err(e) => err_of_mq(e),
     }
@@ -723,6 +728,7 @@ fn write_shmid_ds(at: usize, segment: &Segment, attachments: usize) {
 
 /// `shmget(key, size, shmflg)`.
 pub fn handle_shmget(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
+    let ns = crate::sched::current_ipc_ns();
     let key = args[0] as i32;
     let size = args[1];
     let flags = args[2] as u32;
@@ -754,7 +760,7 @@ pub fn handle_shmget(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
     let created = flags & IPC_CREAT != 0;
     let exclusive = flags & IPC_EXCL != 0;
 
-    match sysv_shm::get_or_create(new, created, exclusive) {
+    match sysv_shm::get_or_create(ns, new, created, exclusive) {
         Ok((segment, made_now)) => {
             // The permission question is asked of an **existing** segment only,
             // and only when the caller named permissions at all - and it comes
@@ -774,10 +780,11 @@ pub fn handle_shmget(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
 
 /// `shmat(shmid, shmaddr, shmflg)`.
 pub fn handle_shmat(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
+    let ns = crate::sched::current_ipc_ns();
     let id = args[0] as i32 as i64;
     let hint = args[1];
     let flags = args[2] as u32;
-    let Some(segment) = sysv_shm::lookup(id) else {
+    let Some(segment) = sysv_shm::lookup(ns, id) else {
         return err::EINVAL;
     };
     let readonly = flags & SHM_RDONLY != 0;
@@ -853,6 +860,7 @@ pub fn handle_shmat(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
 
 /// `shmdt(shmaddr)`.
 pub fn handle_shmdt(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
+    let ns = crate::sched::current_ipc_ns();
     let addr = args[0];
     // The address must be the *start* of an attachment: Linux checks
     // `vma->vm_start == addr`, so an offset into a mapping names nothing.
@@ -862,7 +870,7 @@ pub fn handle_shmdt(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
     if start != addr {
         return err::EINVAL;
     }
-    let Some(segment) = sysv_shm::lookup(id as i64) else {
+    let Some(segment) = sysv_shm::lookup(ns, id as i64) else {
         // An attachment whose segment has no table entry cannot happen while the
         // attachment exists - the entry is what keeps it alive - so this is a
         // table invariant, not a caller's mistake.
@@ -876,6 +884,7 @@ pub fn handle_shmdt(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
 
 /// `shmctl(shmid, cmd, buf)`.
 pub fn handle_shmctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let ns = crate::sched::current_ipc_ns();
     let id = args[0] as i32 as i64;
     let cmd = args[1];
     let buf = args[2];
@@ -904,27 +913,27 @@ pub fn handle_shmctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                     ((buf + i * 8) as *mut u64).write_unaligned(*value);
                 }
             }
-            sysv_shm::highest_slot() as isize
+            sysv_shm::highest_slot(ns) as isize
         }
         SHM_INFO => {
             if !buffer_ok(buf, SHM_INFO_BYTES, true, from_user) {
                 return err::EFAULT;
             }
-            let (used, pages) = sysv_shm::totals();
-            let resident: usize = sysv_shm::all().iter().map(|s| s.resident_pages()).sum();
+            let (used, pages) = sysv_shm::totals(ns);
+            let resident: usize = sysv_shm::all(ns).iter().map(|s| s.resident_pages()).sum();
             unsafe {
                 core::ptr::write_bytes(buf as *mut u8, 0, SHM_INFO_BYTES);
                 (buf as *mut u32).write_unaligned(used as u32);
                 ((buf + 8) as *mut u64).write_unaligned(pages as u64);
                 ((buf + 16) as *mut u64).write_unaligned(resident as u64);
             }
-            sysv_shm::highest_slot() as isize
+            sysv_shm::highest_slot(ns) as isize
         }
         // The by-index reports: the argument is a slot `ipcs` is walking, not a
         // number a caller holds. `SHM_STAT` refuses a segment the caller may not
         // read and `SHM_STAT_ANY` does not, which is the only difference.
         SHM_STAT | SHM_STAT_ANY => {
-            let Some(segment) = sysv_shm::by_slot(args[0] as u64) else {
+            let Some(segment) = sysv_shm::by_slot(ns, args[0] as u64) else {
                 return err::EINVAL;
             };
             if cmd == SHM_STAT && !ipc_permitted(&segment, 0o4) {
@@ -938,7 +947,7 @@ pub fn handle_shmctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             segment.id() as isize
         }
         _ => {
-            let Some(segment) = sysv_shm::lookup(id) else {
+            let Some(segment) = sysv_shm::lookup(ns, id) else {
                 return err::EINVAL;
             };
             match cmd {
@@ -1128,6 +1137,7 @@ fn write_seminfo(at: usize, limits: bool) {
 
 /// `semget(key, nsems, semflg)`.
 pub fn handle_semget(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
+    let ns = crate::sched::current_ipc_ns();
     let key = args[0] as i32;
     let nsems = args[1];
     let flags = args[2] as i32 as u32;
@@ -1144,7 +1154,7 @@ pub fn handle_semget(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
     let created = flags & IPC_CREAT != 0;
     let exclusive = flags & IPC_EXCL != 0;
 
-    match sysv_sem::get_or_create(new, created, exclusive) {
+    match sysv_sem::get_or_create(ns, new, created, exclusive) {
         Ok((set, made_now)) => {
             // As with `shmget`: only an **existing** set is asked the permission
             // question, only when the caller named permissions, and after the
@@ -1184,6 +1194,7 @@ fn read_sembufs(
 
 /// `semop(semid, sops, nsops)` and `semtimedop(semid, sops, nsops, timeout)`.
 fn semop_common(args: [usize; ARG_COUNT], from_user: bool, timed: bool) -> isize {
+    let ns = crate::sched::current_ipc_ns();
     let id = args[0] as i32 as i64;
     let ops_at = args[1];
     let count = args[2];
@@ -1201,7 +1212,7 @@ fn semop_common(args: [usize; ARG_COUNT], from_user: bool, timed: bool) -> isize
         Ok(ops) => ops,
         Err(e) => return e,
     };
-    let Some(set) = sysv_sem::lookup(id) else {
+    let Some(set) = sysv_sem::lookup(ns, id) else {
         return err::EINVAL;
     };
     if !sem_writable(&set) {
@@ -1246,7 +1257,7 @@ fn semop_common(args: [usize; ARG_COUNT], from_user: bool, timed: bool) -> isize
                 // Waking all of them is the simple shape (they re-check and go
                 // back to sleep if another got there first); a set has tens of
                 // waiters, not thousands, and the check is a lock and a compare.
-                sysv_sem::wake_waiters(set.id(), |task| {
+                sysv_sem::wake_waiters(set.handle(), |task| {
                     crate::sched::wake(task);
                 });
                 return 0;
@@ -1279,6 +1290,7 @@ pub fn handle_semtimedop(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 
 /// `semctl(semid, semnum, cmd, arg)`.
 pub fn handle_semctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let ns = crate::sched::current_ipc_ns();
     let id = args[0] as i32 as i64;
     let semnum = args[1] as i32;
     let cmd = args[2];
@@ -1292,12 +1304,12 @@ pub fn handle_semctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 return err::EFAULT;
             }
             write_seminfo(arg, cmd == IPC_INFO);
-            sysv_sem::highest_slot() as isize
+            sysv_sem::highest_slot(ns) as isize
         }
         // The by-index reports `ipcs` walks: the first argument is a slot, not a
         // number a caller holds, and the answer is the set's id.
         SEM_STAT | SEM_STAT_ANY => {
-            let Some(set) = sysv_sem::by_slot(args[0] as u64) else {
+            let Some(set) = sysv_sem::by_slot(ns, args[0] as u64) else {
                 return err::EINVAL;
             };
             if cmd == SEM_STAT && !sem_readable(&set) {
@@ -1310,7 +1322,7 @@ pub fn handle_semctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             set.id() as isize
         }
         _ => {
-            let Some(set) = sysv_sem::lookup(id) else {
+            let Some(set) = sysv_sem::lookup(ns, id) else {
                 return err::EINVAL;
             };
             match cmd {
@@ -1344,7 +1356,7 @@ pub fn handle_semctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                     if !creator_or_admin(set.perm().cuid) {
                         return err::EPERM;
                     }
-                    sysv_sem::remove(id, |task| {
+                    sysv_sem::remove(ns, id, |task| {
                         crate::sched::wake(task);
                     });
                     0
@@ -1540,8 +1552,8 @@ fn write_msqid_ds(at: usize, queue: &sysv_msg::Queue) {
 /// for the shared six: `msgmax` 8192, `msgmnb` 16384, `msgssz` 16, `msgtql`
 /// 16384, `msgseg` 65535; `msgmni` is this kernel's own bound, as `SEMMNI` is
 /// the semaphore family's.
-fn write_msginfo(at: usize, limits: bool) {
-    let (used, messages) = if limits { (0, 0) } else { sysv_msg::totals() };
+fn write_msginfo(ns: Option<u64>, at: usize, limits: bool) {
+    let (used, messages) = if limits { (0, 0) } else { sysv_msg::totals(ns) };
     let values: [i32; 8] = [
         if limits {
             (sysv_msg::MSGMNI * sysv_msg::MSGMNB / 1024) as i32
@@ -1567,11 +1579,12 @@ fn write_msginfo(at: usize, limits: bool) {
     }
 }
 
-/// Wake every task asleep on a queue - the callback the syscall layer uses,
-/// where the lock the object layer avoids (`crate::sched::wake` takes the task
-/// table, which the object layer's callers may hold).
-fn wake_all(queue: u64) {
-    sysv_msg::wake_waiters(queue, |task| {
+/// Wake every task asleep on a queue, named by its **handle** - the callback the
+/// syscall layer uses, where the lock the object layer avoids (`crate::sched::wake`
+/// takes the task table, which the object layer's callers may hold). The handle
+/// and not the id: two namespaces can hold queues numbered alike.
+fn wake_all(handle: u64) {
+    sysv_msg::wake_waiters(handle, |task| {
         let _ = crate::sched::wake(task);
     });
 }
@@ -1581,6 +1594,10 @@ pub fn handle_msgget(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
     let key = args[0] as i32;
     let flags = args[1] as i32 as u32;
     let me = crate::sched::current_owner();
+    // The namespace is the caller's, and it is the whole of `CLONE_NEWIPC`'s
+    // effect on this family: a key resolves inside one namespace, so the same
+    // key inside another names a different queue (measured, §6.16).
+    let ns = crate::sched::current_ipc_ns();
 
     let new = sysv_msg::New {
         key,
@@ -1592,7 +1609,7 @@ pub fn handle_msgget(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
     let created = flags & IPC_CREAT != 0;
     let exclusive = flags & IPC_EXCL != 0;
 
-    match sysv_msg::get_or_create(new, created, exclusive) {
+    match sysv_msg::get_or_create(ns, new, created, exclusive) {
         Ok((queue, made_now)) => {
             // The measured order, the segment family's: only an existing
             // queue is asked the permission question, and only when the
@@ -1612,6 +1629,7 @@ pub fn handle_msgget(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
 
 /// `msgsnd(msqid, msgp, msgsz, msgflg)`.
 pub fn handle_msgsnd(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let ns = crate::sched::current_ipc_ns();
     let id = args[0] as i32 as i64;
     let msgp = args[1];
     let msgsz = args[2];
@@ -1630,7 +1648,7 @@ pub fn handle_msgsnd(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     if mtype <= 0 {
         return err::EINVAL;
     }
-    let Some(queue) = sysv_msg::lookup(id) else {
+    let Some(queue) = sysv_msg::lookup(ns, id) else {
         return err::EINVAL;
     };
     if !msg_writable(&queue) {
@@ -1646,7 +1664,7 @@ pub fn handle_msgsnd(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         match sysv_msg::send_attempt(&queue, mtype, data.clone(), now_secs(), pid, park) {
             sysv_msg::SendAttempt::Done => {
                 // A receiver waiting on this queue looks again.
-                wake_all(queue.id());
+                wake_all(queue.handle());
                 return 0;
             }
             sysv_msg::SendAttempt::Blocked => match sysv_msg::park(me) {
@@ -1665,6 +1683,7 @@ pub fn handle_msgsnd(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 
 /// `msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)`.
 pub fn handle_msgrcv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let ns = crate::sched::current_ipc_ns();
     let id = args[0] as i32 as i64;
     let msgp = args[1];
     let msgsz = args[2];
@@ -1687,7 +1706,7 @@ pub fn handle_msgrcv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     if flags & sysv_msg::MSG_COPY != 0 && flags & MSG_IPC_NOWAIT == 0 {
         return err::EINVAL;
     }
-    let Some(queue) = sysv_msg::lookup(id) else {
+    let Some(queue) = sysv_msg::lookup(ns, id) else {
         return err::EINVAL;
     };
     if !msg_readable(&queue) {
@@ -1703,7 +1722,7 @@ pub fn handle_msgrcv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 // A sender waiting for budget looks again whatever happens
                 // next: the message has already left the queue by the time the
                 // copy can fail.
-                wake_all(queue.id());
+                wake_all(queue.handle());
                 // Linux copies the type word and then the body *after* the
                 // message has been unlinked, so a destination it cannot write
                 // answers `EFAULT` with the message already gone (measured:
@@ -1744,6 +1763,7 @@ pub fn handle_msgrcv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 
 /// `msgctl(msqid, cmd, buf)`.
 pub fn handle_msgctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let ns = crate::sched::current_ipc_ns();
     let id = args[0] as i32 as i64;
     let cmd = args[1];
     let buf = args[2];
@@ -1753,8 +1773,8 @@ pub fn handle_msgctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             if !buffer_ok(buf, MSGINFO_BYTES, true, from_user) {
                 return err::EFAULT;
             }
-            write_msginfo(buf, cmd == IPC_INFO);
-            sysv_msg::highest_slot() as isize
+            write_msginfo(ns, buf, cmd == IPC_INFO);
+            sysv_msg::highest_slot(ns) as isize
         }
         MSG_STAT | MSG_STAT_ANY => {
             // Linux reads the argument through `ipcid_to_idx` - the number
@@ -1764,7 +1784,7 @@ pub fn handle_msgctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             // host by luck (every queue there was generation 0) and failed in
             // the guest, where the sweep reuses slots across programs.
             let slot = args[0] % crate::mm::ipc_id::SEQ_MULTIPLIER as usize;
-            let Some(queue) = sysv_msg::by_slot(slot as u64) else {
+            let Some(queue) = sysv_msg::by_slot(ns, slot as u64) else {
                 return err::EINVAL;
             };
             if cmd == MSG_STAT && !msg_readable(&queue) {
@@ -1777,7 +1797,7 @@ pub fn handle_msgctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             queue.id() as isize
         }
         _ => {
-            let Some(queue) = sysv_msg::lookup(id) else {
+            let Some(queue) = sysv_msg::lookup(ns, id) else {
                 return err::EINVAL;
             };
             match cmd {
@@ -1826,7 +1846,7 @@ pub fn handle_msgctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                     if !creator_or_admin(queue.perm().cuid) {
                         return err::EPERM;
                     }
-                    sysv_msg::remove(id, |task| {
+                    sysv_msg::remove(ns, id, |task| {
                         crate::sched::wake(task);
                     });
                     0

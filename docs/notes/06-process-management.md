@@ -2713,3 +2713,108 @@ own QEMU exit is 33). The aarch64 arm **builds** — kernel, loader and the pin
 `aarch64-unknown-none`) — but its sweep could not boot on this host: QEMU
 stops at `egl: no drm render node available` before the guest prints a line,
 the same host limit §6.14 recorded, so no aarch64 figure is claimed.
+
+### 6.16 `CLONE_NEWIPC` — **LANDED** (2026-10-23, the seventh rung, and the last thing the four IPC families waited on)
+
+`unshare(CLONE_NEWIPC)` and `setns(fd, CLONE_NEWIPC)` were `EOPNOTSUPP` — the
+kind was refused with its reason narrowed to "the namespace object itself" as
+each of its four contents landed (§6.12–§6.15). This is the object: one number
+per namespace, minted from the identity pool every kind shares, and the four
+tables keyed by it.
+
+Measured on a current host first (Linux 7.2.11, `.workbuddy/probe_ipcns.c`, run
+as root **inside a user namespace** — this host's own capabilities do not reach
+`CAP_SYS_ADMIN`, and `unshare(CLONE_NEWIPC)` outside one is `EPERM`, which is
+the first thing the probe pins):
+
+* **the number restarts per namespace.** The machine's queues here were
+  `65581`/`65584` (`slot + generation * 32768`); a fresh namespace's first two
+  were `0` and `1`. So a slot index only means anything inside its own space,
+  and the table is a *space per namespace* rather than one table with a tag.
+* **an id from the namespace left behind is `EINVAL`** — for a queue, a segment
+  and a set alike (`msgctl`/`shmctl`/`semctl` → `-22`), not `ENOENT` and not
+  `EIDRM`. A lookup is a lookup *in this namespace*.
+* **a key is namespace-scoped too**: `msgget(key, 0)` inside → `ENOENT`, and
+  `msgget(key, IPC_CREAT)` makes a new object (numbered `0`). Same for
+  `shmget`/`semget`, and a POSIX queue's *name* behaves the same way
+  (`mq_open` without `O_CREAT` → `ENOENT`, then the same name creates a second
+  queue).
+* `fork` keeps the namespace (the child finds the queue), and `setns` back into
+  the first namespace makes its objects visible again and the second
+  namespace's invisible — the two doors of one kind.
+* `setns` into a namespace whose owning user namespace the caller has no
+  `CAP_SYS_ADMIN` over is `EPERM` — the same rule §6.3 recorded for MNT, which
+  is why a userns-rooted process cannot rejoin the machine's IPC namespace.
+* `/proc/sysvipc/*` is the **reader's** view: inside a new namespace the old
+  namespace's queue has no row.
+* `/proc/self/ns/ipc` reads `ipc:[<number>]`, a new inode per namespace
+  (`4026531839` for the initial one).
+
+**The trap this measurement handed over** — and the reason the pin's first
+draft failed on the host rather than on this kernel: **a number is not an
+identity**. Two namespaces can hold live objects numbered alike (`0` and `0`),
+so a pin that compares numbers asserts nothing, and *inside the kernel* a waiter
+keyed by a number would wake the wrong namespace's sleeper. Every object now
+carries a machine-wide **handle** (`mm::ipc_id::next_handle`) beside its
+namespace-numbered id: the SysV message-queue and semaphore waiter tables key
+by it, `SEM_UNDO` records hold the `Arc` of the set they were made on (so an
+adjustment can never land on a stranger's set after an `unshare`), and the
+segment reaper finds a segment by identity for the same reason.
+
+**The shape that landed**: `vfs::ns` gained `Kind::Ipc` (name `ipc`, bit
+`CLONE_NEWIPC`, one `/proc/<pid>/ns` entry — no `_for_children` spelling,
+because the kind moves its caller like NET and USER) and `machine_ipc_id()`
+for a task that never unshared; the task carries `ipc_ns: Option<u64>` beside
+`net_ns`, inherited by `fork` and by thread creation; `unshare` mints a fresh
+one and `setns` joins the descriptor's; and `current_ipc_ns()` normalises
+`Some(machine_ipc_id())` to `None`, so a task that `setns`ed *back into* the
+machine's namespace keys the same table space as one that never left (NET's
+registry does the same, and a table that missed it would lose every object on
+the way back).
+
+The four families took the same change each: a `Space` per namespace holding
+the slot vectors (and the per-namespace allowance — `MSGMNI`, `SEMMNI`/`SEMNS`,
+`SHMMNI`/`SHMALL` are Linux's per-namespace limits), every table read taking the
+key, `/proc/sysvipc/*` rendering from the reader's, and the POSIX registry
+recording each queue's namespace beside it while `RLIMIT_MSGQUEUE`'s byte
+accounting stays machine-wide (Linux charges a *user*, not a namespace).
+
+**Named, not hidden**:
+
+* **a namespace's tables are never freed.** Nothing tells the four tables when a
+  namespace loses its last task, so its objects stay until the machine ends —
+  bounded by each family's per-space limit and by how many namespaces were ever
+  made. Linux frees them at namespace death; giving this one a death hook is
+  the landing that would close it, and it is named here rather than left to be
+  discovered as a slow leak;
+* **`clone(CLONE_NEWIPC)` is still refused**, with every other namespace bit:
+  the clone door is a separate decision (§6.3's `handle_unshare` doc says where
+  in `copy_process`'s order the copy would happen and what a namespace on a
+  thread means), and this landing is `unshare`/`setns` only — `t-clone` still
+  pins its table;
+* **`CLONE_NEWCGROUP`** is the last kind with nothing behind it, and it waits on
+  the cgroup tree it would hold — named in `docs/ROADMAP.md` as before.
+
+**Pin**: the new `t-ns-ipc`, **28 claims**, every one of them **run against a
+real kernel before it was pointed at this one** (the four failures that caught:
+a number shared across namespaces, `IPC_STAT` with a null buffer reading a live
+object as dead, a link taken before the wrong `unshare`, and a `setns` target
+that was the machine's rather than the namespace the objects were in). On a
+host run without `CAP_SYS_ADMIN` it makes its one claim — an unprivileged
+`unshare(CLONE_NEWIPC)` is `EPERM` — notes that, and exits green, the shape
+`t-ns-time` has. Plus one host test in `sched::sysv_msg`
+(`a_namespace_has_its_own_slot_space`: a fresh space numbers from 0, the same
+key makes a different object, and two objects sharing a number are told apart by
+their handles).
+
+**Also moved with the measurement** — the pins that asserted IPC was *unserved*,
+which is the drift §6.3 records over and over: `t-caps`'s unserved witness and
+the whole-word refusals in `t-ns-net`, `t-ns-pid`, `t-ns-uts` and `t-ns-mnt`
+now name `CLONE_NEWCGROUP` (the one kind left), and `t-ns-setns`'s directory
+listing expects the `ipc` name and drops it from its absent list.
+
+**Gate**: x86_64 `pass=205 fail=0` over six lanes, stage 1 `1099 tests, 0
+failed`, `mpos-kunit 32 passed, 0 failed`, exit 0. `cargo xtask depgraph` is
+within the ratchet (no edge appeared). The aarch64 arm builds (kernel, loader,
+`clippy` on `aarch64-unknown-none`) but its sweep cannot boot on this host
+(`egl: no drm render node available`), so no aarch64 figure is claimed.

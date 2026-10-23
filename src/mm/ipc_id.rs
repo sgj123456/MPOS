@@ -57,6 +57,19 @@ pub fn decode(id: i64) -> Option<(u64, u16)> {
     Some((slot, seq as u16))
 }
 
+/// The **handle** an object is woken by, which is not the number it is known by.
+///
+/// The two were one value until the IPC namespace landed: a number is the
+/// namespace's (`ipc_id::build` restarts at slot 0 in every fresh namespace), so
+/// two namespaces can hold live objects that answer the same number. Everything a
+/// *waiter* hangs off has to be unique across all of them - a wake meant for one
+/// namespace's queue `0` must not reach the other's - and that is this counter:
+/// one machine-wide pool, one allocation per object, never reused.
+pub fn next_handle() -> u64 {
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// The generation after `seq`, wrapping to zero.
 ///
 /// The wrap is Linux's: `seq` is a `u16` in `kern_ipc_perm`, so a slot that has

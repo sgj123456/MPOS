@@ -757,6 +757,20 @@ pub(crate) struct Task {
     /// let an inherited fd name a socket of the new namespace instead of its own
     /// (`docs/notes/` §6.3).
     pub(crate) net_ns: Option<u64>,
+    /// The IPC namespace this task's `ipcs` objects live in, by the number the
+    /// four tables key their state by.
+    ///
+    /// `None` is the machine's own, the value every task carries until something
+    /// unshares. Inherited by reference across `fork`/`clone` (measured: a
+    /// child's `msgctl` finds its parent's queue), and moved by
+    /// `unshare(CLONE_NEWIPC)` and by `setns` on `/proc/<pid>/ns/ipc` - unlike
+    /// [`Self::net_ns`], which no live task may leave because a socket's stack
+    /// is fixed at creation; an IPC object is a *copy* (a queued message, a
+    /// set's counts) or a mapping whose address-space bookkeeping is the
+    /// segment table's, so a task that moves keeps resolving numbers through
+    /// the namespace it is in now, and an id from the old one answers `EINVAL`
+    /// (measured, §6.16).
+    pub(crate) ipc_ns: Option<u64>,
     /// The namespace this task's **children** are created in - Linux's
     /// `nsproxy->pid_ns_for_children`.
     ///
@@ -1136,6 +1150,9 @@ impl Task {
             // The machine's own network namespace, which is `None`: every socket
             // call resolves to the stack the boot built.
             net_ns: None,
+            // And the machine's own IPC namespace, `None` for the same reason:
+            // every SysV and POSIX queue resolves to the tables the boot made.
+            ipc_ns: None,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),
@@ -1795,6 +1812,9 @@ impl Table {
             // The machine's own network namespace, which is `None`: every socket
             // call resolves to the stack the boot built.
             net_ns: None,
+            // And the machine's own IPC namespace, `None` for the same reason:
+            // every SysV and POSIX queue resolves to the tables the boot made.
+            ipc_ns: None,
             rlimits: default_rlimits(),
             seccomp_strict: false,
             seccomp_filters: Vec::new(),

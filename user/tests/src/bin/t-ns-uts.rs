@@ -370,8 +370,8 @@ fn main() {
                 // The unserved half is `IPC` because the word used to be `NET`,
                 // which became a served kind when the fourth rung landed - the
                 // drift §6.3 records over and over.
-                "a word mixing CLONE_NEWUTS with CLONE_NEWIPC is EOPNOTSUPP",
-                unshare(UnshareFlags::NEWUTS | UnshareFlags::NEWIPC) == Err(Errno::OPNOTSUPP),
+                "a word mixing CLONE_NEWUTS with CLONE_NEWCGROUP is EOPNOTSUPP",
+                unshare(UnshareFlags::NEWUTS | UnshareFlags::NEWCGROUP) == Err(Errno::OPNOTSUPP),
             );
             // Only now, in a namespace that must still be the one the witness
             // holds.

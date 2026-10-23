@@ -1966,16 +1966,19 @@ pub(crate) fn unshare_verdict(
         | n::CLONE_THREAD
         | n::CLONE_SYSVSEM;
 
-    /// The namespace kinds this kernel can isolate observably. Six now — the
+    /// The namespace kinds this kernel can isolate observably. Seven now — the
     /// names, the mount table (`t-ns-mnt` holds MNT's "child differs *and* the
     /// parent does not"), the **numbers** (`t-ns-pid`, which holds the same
     /// pair for a pid: the child's `getpid` is 1 and `/proc/1` is that child,
     /// while the parent's number is unchanged), the **wire** (`t-ns-net`), the
     /// **clocks** (`t-ns-time`, where the pair is the caller's own reading
-    /// unmoved and its child's reading offset) and the **ids** (`t-ns-user`,
+    /// unmoved and its child's reading offset), the **ids** (`t-ns-user`,
     /// where the pair is the caller's `getuid` reading the overflow id in a fresh
-    /// empty namespace and the id it mapped once the table is written). The build
-    /// order and the reason for it are the plan's §6.3; USER is the sixth rung.
+    /// empty namespace and the id it mapped once the table is written) and the
+    /// **IPC objects** (`t-ns-ipc`: a queue made before the call is invisible
+    /// inside and its number answers `EINVAL`, while a private one made inside is
+    /// invisible outside). The build order and the reason for it are the plan's
+    /// §6.3; IPC is the seventh rung.
     ///
     /// NET is in the word but has no `EOPNOTSUPP` left to carry: the caller
     /// asks for a fresh namespace here and [`handle_unshare`] mints one.
@@ -1984,7 +1987,8 @@ pub(crate) fn unshare_verdict(
         | n::CLONE_NEWPID
         | n::CLONE_NEWNET
         | n::CLONE_NEWTIME
-        | n::CLONE_NEWUSER;
+        | n::CLONE_NEWUSER
+        | n::CLONE_NEWIPC;
 
     // `CAP_SYS_ADMIN` is the gate on every privileged namespace kind, asked
     // of the caller's *effective capability set* — the question the credential
@@ -4391,9 +4395,11 @@ mod tests {
             unshare_verdict(n::CLONE_NEWNET, false, false),
             Err(err::EPERM)
         );
-        // An unserved kind asked by an unprivileged caller answers `EPERM`,
-        // not `EOPNOTSUPP` — Linux's order, measured, and the reason the two
-        // checks sit in this sequence above.
+        // A *gated* kind asked by an unprivileged caller answers `EPERM`, not
+        // `EOPNOTSUPP` — Linux's order, measured, and the reason the two checks
+        // sit in this sequence above. IPC is gated like the rest, so the answer
+        // stayed the same when it graduated from unserved to served; what moved
+        // is the reason, and the privileged arm below.
         assert_eq!(
             unshare_verdict(n::CLONE_NEWIPC, false, false),
             Err(err::EPERM)
@@ -4425,30 +4431,40 @@ mod tests {
             Err(err::EPERM)
         );
 
-        // The whole served set is one word, too: nothing about any of the six
+        // The seventh rung: `unshare(CLONE_NEWIPC)`. Gated like the rest (the
+        // arm above pins the unprivileged answer), and served for a privileged
+        // caller - the shape every kind but USER has.
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWIPC, true, false),
+            Ok(n::CLONE_NEWIPC)
+        );
+
+        // The whole served set is one word, too: nothing about any of the seven
         // gates another.
-        let all_six = n::CLONE_NEWUTS
+        let all_seven = n::CLONE_NEWUTS
             | n::CLONE_NEWNS
             | n::CLONE_NEWPID
             | n::CLONE_NEWNET
             | n::CLONE_NEWTIME
-            | n::CLONE_NEWUSER;
+            | n::CLONE_NEWUSER
+            | n::CLONE_NEWIPC;
         assert_eq!(
             unshare_verdict(n::CLONE_NEWTIME, true, false),
             Ok(n::CLONE_NEWTIME)
         );
-        assert_eq!(unshare_verdict(all_six, true, false), Ok(all_six));
+        assert_eq!(unshare_verdict(all_seven, true, false), Ok(all_seven));
 
-        // The two this kernel has nothing behind, so it refuses them whole
-        // rather than handing over a namespace whose contents are the old
-        // one's. Served namespace or not, the answer is the same for privileged
-        // and unprivileged callers: this is not a permissions answer.
+        // The one this kernel has nothing behind, so it refuses it whole rather
+        // than handing over a namespace whose contents are the old one's.
+        // Served namespace or not, the answer is the same for privileged and
+        // unprivileged callers: this is not a permissions answer.
         //
-        // PID, NET, TIME and USER left this list when they were built, which is
-        // the shape §6.3 records over and over: a test that hardcodes the served
-        // set goes red the moment the set grows, and the *expectation* moves with
-        // the measurement - never the other way round.
-        for bit in [n::CLONE_NEWCGROUP, n::CLONE_NEWIPC] {
+        // PID, NET, TIME, USER and now IPC left this list when they were built,
+        // which is the shape §6.3 records over and over: a test that hardcodes
+        // the served set goes red the moment the set grows, and the *expectation*
+        // moves with the measurement - never the other way round. CGROUP is the
+        // last rung, and it waits on the thing it would isolate (a cgroup tree).
+        for bit in [n::CLONE_NEWCGROUP] {
             assert_eq!(
                 unshare_verdict(bit, true, false),
                 Err(err::EOPNOTSUPP),
@@ -4463,17 +4479,23 @@ mod tests {
         // A word that mixes a served kind with an unserved one is refused
         // whole - `Err`, so the handler copies nothing - where Linux's
         // `ksys_unshare` would already have unshared the first part by the time
-        // the second failed. The unserved half is `CLONE_NEWNET` because the
-        // word used to be `NEWNS | NEWPID`, which became a legal pair the
-        // moment PID landed - the same drift §6.3 records for `NEWUTS | NEWNS`.
+        // the second failed. The served half has to come from the kinds that are
+        // left, and the unserved one is CGROUP; the word this test used to use
+        // (`NEWPID | NEWIPC`) became a legal pair the moment IPC landed - the
+        // same drift §6.3 records for `NEWUTS | NEWNS` and `NEWNS | NEWPID`.
         assert_eq!(
-            unshare_verdict(n::CLONE_NEWPID | n::CLONE_NEWIPC, true, false),
+            unshare_verdict(n::CLONE_NEWPID | n::CLONE_NEWCGROUP, true, false),
             Err(err::EOPNOTSUPP)
         );
         assert_eq!(
-            unshare_verdict(n::CLONE_NEWIPC | n::CLONE_NEWPID, false, false),
+            unshare_verdict(n::CLONE_NEWCGROUP | n::CLONE_NEWPID, false, false),
             Err(err::EPERM),
             "the privilege is consulted before the kind is — Linux's order"
+        );
+        // And the pair that graduated: two served kinds together, both back.
+        assert_eq!(
+            unshare_verdict(n::CLONE_NEWIPC | n::CLONE_NEWPID, true, false),
+            Ok(n::CLONE_NEWIPC | n::CLONE_NEWPID)
         );
 
         // The thread-group flags on a single-threaded caller: every one of them

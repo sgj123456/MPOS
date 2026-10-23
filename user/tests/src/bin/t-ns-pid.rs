@@ -673,8 +673,8 @@ fn main() {
         // The unserved half is `IPC` because the word used to be `NET`, which
         // became a served kind the moment the fourth rung landed - the drift
         // §6.3 records over and over (a served set written down as a constant).
-        "unshare(CLONE_NEWPID|CLONE_NEWIPC) is EOPNOTSUPP",
-        unshare(UnshareFlags::NEWPID | UnshareFlags::NEWIPC) == Err(Errno::OPNOTSUPP),
+        "unshare(CLONE_NEWPID|CLONE_NEWCGROUP) is EOPNOTSUPP",
+        unshare(UnshareFlags::NEWPID | UnshareFlags::NEWCGROUP) == Err(Errno::OPNOTSUPP),
     );
 
     // ---- The caller does not move ----

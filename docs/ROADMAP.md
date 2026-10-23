@@ -104,7 +104,7 @@ One-glance status of the whole roadmap.
   `anon_inode:[…]` name (`anon_inode:inotify` being the unbracketed one), and a
   zero-length read answers Linux's errno, `inotify` consulting its queue first
   (§6.11, item 99)
-- [ ] [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET**, **TIME** and **USER** landed, each with its pin  
+- [ ] [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET**, **TIME**, **USER** and **IPC** landed, each with its pin  
   (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`): the numbers a process  
   sees are the  
   reader's namespace's,  
@@ -180,8 +180,10 @@ One-glance status of the whole roadmap.
   accepted, `LONG_MAX + 1` `EINVAL`) with an unwritable destination losing the
   message to `EFAULT` as Linux loses it, and `/proc/sysvipc/msg`;
   `t-sysv-msg` pins 74 claims and eight host tests (§6.15, item 103).
-  `CLONE_NEWIPC`'s contents are all served now - the namespace itself is what
-  is left
+  `CLONE_NEWIPC` **landed on 2026-10-23** - the kind moves its caller, the four
+  tables key their state by it, and a number restarts at 0 in a fresh namespace,
+  so the pin compares objects rather than numbers (`t-ns-ipc`, 28 claims, §6.16);
+  `CLONE_NEWCGROUP` is the last kind with nothing behind it
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
 - [x] the extensible `clone` door — `clone3` (435) with a versioned argument
   struct, and `CLONE_PIDFD` delivering the child **and a descriptor naming it** in
@@ -379,14 +381,14 @@ In the order that keeps each step verifiable on its own:
    *sender's* number in the sender's own pid namespace, resolved once at send, which is also the  
    port id a zero-`nl_pid` bind prefers (three probes; `t-uevent`, §6.3). So nothing of the `ucred`  
    stays named now.  
-   CGROUP still waits on the thing it would isolate (a cgroup tree),  
-   so it is cheap the day that lands and worthless before it. **IPC's wait is
-   over** (2026-10-23: the POSIX queue half in §6.12, shared memory in §6.13,
-   semaphores in §6.14 and the SysV message queues in §6.15), so what remains
-   there is the namespace *object* - `CLONE_NEWIPC` making the four tables
-   per-namespace, the `unshare`/`setns`/`clone` doors, and a pin that a queue
-   made before an unshare is invisible inside and a private one made inside
-   invisible outside. Nested namespaces pin the  
+   **IPC's wait is over in full** (2026-10-23): the four families landed
+   (§6.12-§6.15) and then the namespace itself (§6.16) - `unshare`/`setns` move
+   the caller, the four tables are one slot space per namespace, a number
+   restarts at 0 inside one, and `t-ns-ipc` holds the pair for all four
+   families. What stays named there: a namespace's tables are not freed when it
+   dies, `clone(CLONE_NEWIPC)` is still refused with every other namespace bit,
+   and **CGROUP** is the last rung - cheap only the day the tree it would
+   isolate lands, and worthless before it. Nested namespaces pin the  
    *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were  
    per-namespace but unexercised; `t-ns-net` reads the file on both sides of the boundary now  
    (2026-10-15). Two more left this list on  
@@ -469,10 +471,9 @@ The full inventory — grouped by what they block, with each refusal's reason �
 the semantics still incomplete are a datagram socket's `SO_RCVBUF` - reported in Linux's  
 shape but not what sizes the receive ring (item 58; a stream's is now its window, item 98) -  
 and the datagram line itself, which is the ring's rather than Linux's 65507 until this stack  
-fragments IP; the two namespace kinds with no entry at all are IPC and cgroup; IPC's wait on
-its contents is over - its POSIX message queues (§6.12), its System V shared
-memory (§6.13), its SysV semaphores (§6.14) and its SysV message queues (§6.15)
-are all served - so what it waits on now is the namespace object itself.  
+fragments IP; the one namespace kind with no entry at all is cgroup - IPC's four families
+(§6.12-§6.15) and the namespace object that isolates them (§6.16) are all
+served, so cgroup waits alone, on the tree it would hold.  
 
 **A stream's receive buffer is its window, and a listener hands it to the socket it accepts**
 (`docs/uapi/` §5.1 item 98, landed 2026-10-21): item 58 made `SO_RCVBUF` Linux's number, but on a

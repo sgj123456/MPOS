@@ -1104,18 +1104,22 @@ pub fn handle_clock_settime(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 
 /// `unshare(flags)` — leave namespaces.
 ///
-/// **Five kinds are served**, each with its own pin: the names
+/// **Seven kinds are served**, each with its own pin: the names
 /// (`CLONE_NEWUTS`, whose whole effect is that the caller gets a *copy* of what
 /// it was reading - `t-ns-uts` holds both halves, that the child's view differs
 /// *and* that the parent's does not), the mount table (`CLONE_NEWNS`,
 /// `t-ns-mnt`, the same pair), the **numbers** (`CLONE_NEWPID`, where the caller
 /// keeps its own and its *children* move - `t-ns-pid`), the **wire**
 /// (`CLONE_NEWNET`, where the caller itself moves and its open sockets come
-/// along - `t-ns-net`) and the **clocks** (`CLONE_NEWTIME`, the second kind
-/// whose only moved slot is the children's - `t-ns-time`). The kinds still
-/// answering `EOPNOTSUPP` are USER, IPC and CGROUP, because a namespace with
-/// nothing behind it isolates nothing; each one's reason and the order they are
-/// built in are the plan's §6.3.
+/// along - `t-ns-net`), the **clocks** (`CLONE_NEWTIME`, the second kind
+/// whose only moved slot is the children's - `t-ns-time`) and the **IPC
+/// objects** (`CLONE_NEWIPC`, where the caller moves and the four tables it
+/// resolves numbers through are the new namespace's - `t-ns-ipc`, measured
+/// first: the numbers restart at 0, an id from the namespace left behind is
+/// `EINVAL`, and all four families move together, §6.16). CGROUP is the one
+/// kind still answering `EOPNOTSUPP`, because a namespace with nothing behind it
+/// isolates nothing - it waits on the cgroup tree it would hold; each kind's
+/// reason and the order they were built in are the plan's §6.3.
 ///
 /// The flag word itself is argued with in `abi::unshare_verdict`, which is where
 /// the three refusals live: an unrecognised bit is `EINVAL` *ahead* of
@@ -1219,6 +1223,15 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
                     crate::sched::current_user_ns(),
                 )));
             }
+            if bits & crate::syscall::linux::nr::CLONE_NEWIPC != 0 {
+                // The caller **moves**, like NET above and unlike PID: the
+                // numbers it has open stop resolving (`EINVAL`, measured) and the
+                // next object it makes is the new namespace's, numbered from 0
+                // again. There is no state to carry across, which is why this is
+                // the shortest arm here - the four tables key themselves by
+                // whatever `current_ipc_ns` answers, and the answer changed.
+                crate::sched::unshare_ipc();
+            }
             if bits & crate::syscall::linux::nr::CLONE_NEWTIME != 0 {
                 // The caller's *children* move into a fresh, empty namespace,
                 // and the caller does **not** - the same asymmetry PID above
@@ -1304,6 +1317,10 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
         // which is what `HOMES` buys, and why this is a join by reference
         // (Linux's `switch_task_namespaces`) rather than a copy.
         crate::vfs::ns::Namespace::Net(id) => crate::sched::set_net_ns(Some(id)),
+        // Joining an IPC namespace moves the caller into *it*: the objects that
+        // namespace holds are the ones the caller can name from here, and its
+        // numbers are its own from 0 (measured, §6.16).
+        crate::vfs::ns::Namespace::Ipc(id) => crate::sched::set_ipc_ns(Some(id)),
         crate::vfs::ns::Namespace::Pid(pidns) => crate::sched::setns_pid(pidns),
         crate::vfs::ns::Namespace::Uts(uts) => crate::sched::setns_uts(uts),
         // Joining a time namespace replaces the caller's `time_ns_for_children`

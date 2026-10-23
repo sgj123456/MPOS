@@ -459,13 +459,14 @@ fn main() {
     // refusal *now* that no capability gate can be the reason: EOPNOTSUPP is
     // "present, cannot do that", which is what a capable caller learns, and
     // what an unprivileged one would have heard as EPERM above. Nothing is
-    // unshared either way - the refusal is whole. This word has moved once per
-    // rung built (`CLONE_NEWPID`, then `CLONE_NEWNET`): a hardcoded served set
+    // unshared either way - the refusal is whole. This witness has moved once
+    // per rung built (`CLONE_NEWPID`, then `CLONE_NEWNET`, then `CLONE_NEWIPC`)
+    // and now names the last kind with nothing behind it: a hardcoded served set
     // drifts the moment it grows, which §6.3 records over and over.
-    let ipc = unshare(0x0800_0000);
+    let cgroup = unshare(0x0200_0000);
     r.check(
-        "unshare CLONE_NEWIPC is EOPNOTSUPP once nothing else can be the reason",
-        ipc == -(libc::EOPNOTSUPP as isize),
+        "unshare CLONE_NEWCGROUP is EOPNOTSUPP once nothing else can be the reason",
+        cgroup == -(libc::EOPNOTSUPP as isize),
     );
 
     // ---- the DAC override is two capabilities, not the uid ----

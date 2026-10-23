@@ -808,6 +808,47 @@ pub fn current_net_ns() -> Option<u64> {
     with_table(|t| t.task(t.current).net_ns)
 }
 
+/// The IPC namespace the running task's `ipcs` objects live in, or `None` for
+/// the machine's own - the key the four tables use.
+///
+/// A number rather than an object, `net`'s reason exactly: the four tables live
+/// in `sched`, `mm` and `vfs`, and none of them may be named from a namespace
+/// object here. Read through the machine's own number so that a task that
+/// `setns`ed *into* the machine's namespace keys the same table space as one
+/// that never unshared: `Some(machine_ipc_id())` and `None` are one namespace,
+/// and a table that treated them as two would lose every object at a `setns`
+/// back into it (`net` normalises its registry the same way).
+#[cfg(target_os = "none")]
+pub fn current_ipc_ns() -> Option<u64> {
+    let raw = with_table(|t| t.task(t.current).ipc_ns);
+    match raw {
+        Some(id) if id == crate::vfs::ns::machine_ipc_id() => None,
+        other => other,
+    }
+}
+
+/// Move the running task into an IPC namespace: `unshare(CLONE_NEWIPC)` and
+/// `setns` on `/proc/<pid>/ns/ipc` both land here. Unlike `NET` there is nothing
+/// to move *with* the task - the objects it could already name are looked up in
+/// the table of the namespace it is in now, so an id from the old one answers
+/// `EINVAL` (measured, §6.16).
+#[cfg(target_os = "none")]
+pub fn set_ipc_ns(ns: Option<u64>) {
+    with_table(|t| {
+        let me = t.current;
+        t.task_mut(me).ipc_ns = ns;
+    });
+}
+
+/// Move the running task into a fresh IPC namespace, made on the spot: Linux's
+/// `unshare(CLONE_NEWIPC)`, measured to leave every object of the namespace it
+/// came from behind.
+#[cfg(target_os = "none")]
+pub fn unshare_ipc() {
+    let id = crate::vfs::ns::mint_owned(current_user_ns());
+    set_ipc_ns(Some(id));
+}
+
 /// Move the running task into a network namespace: the `clone(CLONE_NEWNET)`
 /// child's own assignment (the stack itself is `net`'s, minted before this is
 /// called, because the scheduler may not name that layer).
@@ -913,6 +954,11 @@ pub fn ns_of(pid: usize, entry: crate::vfs::ns::Entry) -> Option<crate::vfs::ns:
             // both this layer and `net` may name.
             (crate::vfs::ns::Kind::Net, _) => crate::vfs::ns::Namespace::Net(
                 task.net_ns.unwrap_or_else(crate::vfs::ns::machine_net_id),
+            ),
+            // One slot, and the machine's number for a task that never unshared
+            // - the same shape NET has just above.
+            (crate::vfs::ns::Kind::Ipc, _) => crate::vfs::ns::Namespace::Ipc(
+                task.ipc_ns.unwrap_or_else(crate::vfs::ns::machine_ipc_id),
             ),
             // Both slots, and here the two really do differ for a task that has
             // unshared: `time` is the namespace its own clocks come from and

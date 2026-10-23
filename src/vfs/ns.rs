@@ -59,6 +59,19 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub enum Kind {
     /// `CLONE_NEWNS`: what is mounted where.
     Mount,
+    /// `CLONE_NEWIPC`: the four objects `ipcs` lists - POSIX message queues,
+    /// and SysV's shared-memory segments, semaphore sets and message queues.
+    ///
+    /// The one kind whose state lives in **four** modules and in three crates
+    /// (`sched`'s three SysV tables, `vfs`'s POSIX queue table): each keys its
+    /// own table by this namespace's number, exactly as `net` keys its stack, so
+    /// nothing here has to name any of them. Measured on a current host
+    /// (`.workbuddy/probe_ipcns.c`, as root inside a user namespace, which is the
+    /// only way an unprivileged caller may make one): the number a queue is known
+    /// by **restarts at 0** in a fresh namespace, an id from the namespace left
+    /// behind answers `EINVAL`, all four families move together, `/proc/sysvipc/*`
+    /// follows the reader, and a `fork` stays where its parent is (§6.16).
+    Ipc,
     /// `CLONE_NEWPID`: the numbers a task is known by.
     ///
     /// The one kind whose *entry* is a namespace of its own rather than a view
@@ -101,6 +114,7 @@ impl Kind {
     pub const fn name(self) -> &'static str {
         match self {
             Kind::Mount => "mnt",
+            Kind::Ipc => "ipc",
             Kind::Net => "net",
             Kind::Pid => "pid",
             Kind::Uts => "uts",
@@ -116,6 +130,7 @@ impl Kind {
     pub const fn flag(self) -> usize {
         match self {
             Kind::Mount => crate::abi::CLONE_NEWNS,
+            Kind::Ipc => crate::abi::CLONE_NEWIPC,
             Kind::Net => crate::abi::CLONE_NEWNET,
             Kind::Pid => crate::abi::CLONE_NEWPID,
             Kind::Uts => crate::abi::CLONE_NEWUTS,
@@ -143,6 +158,7 @@ impl Kind {
     pub fn of_flag(bit: usize) -> Option<Kind> {
         match bit {
             b if b == crate::abi::CLONE_NEWNS => Some(Kind::Mount),
+            b if b == crate::abi::CLONE_NEWIPC => Some(Kind::Ipc),
             b if b == crate::abi::CLONE_NEWNET => Some(Kind::Net),
             b if b == crate::abi::CLONE_NEWPID => Some(Kind::Pid),
             b if b == crate::abi::CLONE_NEWUTS => Some(Kind::Uts),
@@ -157,6 +173,7 @@ impl Kind {
     /// kind are one question, which slot is another (see [`Entry`]).
     pub fn of_name(name: &str) -> Option<Kind> {
         match name {
+            "ipc" => Some(Kind::Ipc),
             "mnt" => Some(Kind::Mount),
             "net" => Some(Kind::Net),
             "pid" | "pid_for_children" => Some(Kind::Pid),
@@ -175,6 +192,7 @@ impl Kind {
     /// and a reader that only wants "which namespaces does this machine have"
     /// are asking for.
     pub const ALL: &'static [Kind] = &[
+        Kind::Ipc,
         Kind::Mount,
         Kind::Net,
         Kind::Pid,
@@ -216,6 +234,10 @@ impl Entry {
     /// Every name the directory lists, in name order - which is the order a real
     /// kernel lists them in, measured.
     pub const ALL: &'static [Entry] = &[
+        Entry {
+            kind: Kind::Ipc,
+            slot: Slot::Own,
+        },
         Entry {
             kind: Kind::Mount,
             slot: Slot::Own,
@@ -296,6 +318,10 @@ impl Entry {
 #[derive(Clone)]
 pub enum Namespace {
     Mount(Arc<crate::vfs::mount::MountTable>),
+    /// An IPC namespace, by the number the four IPC tables key their state by.
+    /// A number rather than an object for `Net`'s reason: the tables live in
+    /// three crates, none of which may be named from here.
+    Ipc(u64),
     /// A network namespace, by the number `net` knows its stack by.
     Net(u64),
     Pid(Arc<crate::pidns::PidNs>),
@@ -314,6 +340,7 @@ impl Namespace {
     pub fn kind(&self) -> Kind {
         match self {
             Namespace::Mount(_) => Kind::Mount,
+            Namespace::Ipc(_) => Kind::Ipc,
             Namespace::Net(_) => Kind::Net,
             Namespace::Pid(_) => Kind::Pid,
             Namespace::Uts(_) => Kind::Uts,
@@ -326,6 +353,7 @@ impl Namespace {
     pub fn id(&self) -> u64 {
         match self {
             Namespace::Mount(table) => table.ns_id(),
+            Namespace::Ipc(ns_id) => *ns_id,
             Namespace::Net(ns_id) => *ns_id,
             Namespace::Pid(pidns) => pidns.ns_id(),
             Namespace::Uts(uts) => uts.ns_id(),
@@ -536,6 +564,25 @@ pub fn machine_net_id() -> u64 {
     fresh
 }
 
+/// The machine's own IPC namespace, minted on first use from the same pool.
+///
+/// The same shape and the same reason as [`machine_net_id`]: a task that has
+/// never unshared holds no number of its own, so `/proc/<pid>/ns/ipc` and a
+/// `setns` into the machine's namespace both need one, and the four tables key
+/// their state by it. The machine's own is therefore a number like any other -
+/// which is also what keeps the table keys unambiguous (§6.16).
+static MACHINE_IPC_ID: AtomicU64 = AtomicU64::new(0);
+
+pub fn machine_ipc_id() -> u64 {
+    let id = MACHINE_IPC_ID.load(Ordering::Relaxed);
+    if id != 0 {
+        return id;
+    }
+    let fresh = mint();
+    MACHINE_IPC_ID.store(fresh, Ordering::Relaxed);
+    fresh
+}
+
 /// The machine's own time namespace, made on first use from the same pool.
 ///
 /// The same shape as [`machine_net_id`] and for the same reason - a task in the
@@ -626,22 +673,26 @@ mod tests {
         // which *slot* they read is the entry's business, not the kind's.
         assert_eq!(Kind::of_name("time_for_children"), Some(Kind::Time));
         assert_eq!(Kind::of_name("pid_for_children"), Some(Kind::Pid));
+        assert_eq!(link_text(Kind::Ipc, 4026531839), "ipc:[4026531839]");
+        assert_eq!(Kind::of_name("ipc"), Some(Kind::Ipc));
         // A kind this kernel does not have is not recoverable from a word: the
         // entry does not exist, which is the whole refusal.
-        assert_eq!(Kind::of_name("ipc"), None);
+        assert_eq!(Kind::of_name("cgroup"), None);
         assert_eq!(Kind::of_name("user"), Some(Kind::User));
     }
 
     /// The directory's names, pinned as the *complete* list against a measured
     /// one: a real kernel lists ten (`cgroup, ipc, mnt, net, pid,
     /// pid_for_children, time, time_for_children, user, uts`) and this one lists
-    /// the eight of those whose kinds are built, in the same order.
+    /// the nine of those whose kinds are built, in the same order - `cgroup`
+    /// alone is the one with nothing behind it.
     #[test]
     fn the_directory_names_are_the_ones_a_real_kernel_lists() {
         let names: alloc::vec::Vec<&str> = Entry::ALL.iter().map(|entry| entry.name()).collect();
         assert_eq!(
             names,
             [
+                "ipc",
                 "mnt",
                 "net",
                 "pid",
@@ -748,7 +799,6 @@ mod tests {
         // A bit that is a namespace and not one of these is *not* a kind: the
         // caller hears their own word back rather than a wrong namespace. The
         // vocabulary is down to the kinds this kernel still has no copy of.
-        assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWIPC), None);
         assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWCGROUP), None);
         assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWUSER), Some(Kind::User));
         assert_eq!(Kind::User.flag(), crate::abi::CLONE_NEWUSER);

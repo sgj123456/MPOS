@@ -34,6 +34,16 @@
 //!   record is applied by its own exit; `unshare(CLONE_SYSVSEM)` keeps them
 //!   (measured: the value went back to 0).
 //!
+//! **The table is per IPC namespace**, one slot space each, for the reason
+//! `sysv_msg`'s header gives: the number a set is known by restarts at 0 in a
+//! fresh namespace (measured, `.workbuddy/probe_ipcns.c`), so a slot index only
+//! means anything inside its own space. Two consequences ride with it, both
+//! handled here rather than hidden: waiters and `SEM_UNDO` records are keyed by
+//! the set object (`Set::handle`) and not by its number, because two namespaces
+//! can hold sets numbered alike; and an undo record names the object, so a task
+//! that leaves its namespace does not have its adjustment land on a stranger
+//! (§6.16).
+//!
 //! **What is not here**: the IPC namespace. As with the segment table, this is
 //! one table for the machine until `CLONE_NEWIPC` exists.
 
@@ -125,6 +135,9 @@ pub struct Perm {
 /// What a set is beyond its permissions: the counters and the three clocks.
 struct Inner {
     perm: Perm,
+    /// The machine-wide identity waiters and undo records are keyed by, from
+    /// `mm::ipc_id::next_handle` - never the namespace-numbered `perm.id`.
+    handle: u64,
     values: Vec<i32>,
     /// `sem_otime`: the last `semop` that changed something.
     otime: i64,
@@ -150,6 +163,12 @@ impl Set {
 
     pub fn id(&self) -> u64 {
         self.perm().id
+    }
+
+    /// The handle waiters and undo records are keyed by: unique across every
+    /// namespace, where [`Self::id`] is only unique inside one.
+    pub fn handle(&self) -> u64 {
+        critical_section::with(|cs| self.inner.borrow(cs).borrow().handle)
     }
 
     pub fn nsems(&self) -> usize {
@@ -235,13 +254,13 @@ impl Set {
     /// How many tasks are asleep wanting a negative operation on `sem`, and how
     /// many are waiting for it to read zero: `GETNCNT` and `GETZCNT`.
     pub fn waiting(&self, sem: usize) -> (usize, usize) {
-        let id = self.id();
+        let handle = self.handle();
         critical_section::with(|cs| {
             let waiters = WAITERS.borrow(cs).borrow();
             let mut negative = 0;
             let mut zero = 0;
             for waiter in waiters.iter() {
-                if waiter.set != id || waiter.sem != sem {
+                if waiter.set != handle || waiter.sem != sem {
                     continue;
                 }
                 match waiter.kind {
@@ -258,18 +277,24 @@ impl Set {
 // The table
 // ---------------------------------------------------------------------------
 
-/// The machine's one set table, on the same slot-and-generation numbers the
+/// One namespace's slot space, on the same slot-and-generation numbers the
 /// segment table uses (`mm::ipc_id`).
-struct Table {
+///
+/// `sems` is the semaphore allowance, and it is per space because Linux's
+/// `SEMMNS` is: a namespace is held to the limit on its own semaphores, not to a
+/// machine-wide pool shared with every other namespace.
+struct Space {
+    ns: Option<u64>,
     sets: Vec<Option<Arc<Set>>>,
     seqs: Vec<u16>,
-    /// Semaphores claimed by the live sets, against [`SEMMNS`].
+    /// Semaphores claimed by this space's live sets, against [`SEMMNS`].
     sems: usize,
 }
 
-impl Table {
-    const fn empty() -> Table {
-        Table {
+impl Space {
+    const fn new(ns: Option<u64>) -> Space {
+        Space {
+            ns,
             sets: Vec::new(),
             seqs: Vec::new(),
             sems: 0,
@@ -301,56 +326,92 @@ impl Table {
     }
 }
 
+/// Every namespace's slot space, the machine's own made on first use.
+///
+/// A namespace that dies leaves its space behind: nothing here is told when a
+/// namespace loses its last task, so the sets stay until the machine ends -
+/// bounded by `SEMMNI` per space and by how many namespaces were ever made
+/// (`docs/notes/` §6.16).
+struct Table {
+    spaces: Vec<Space>,
+}
+
+impl Table {
+    const fn empty() -> Table {
+        Table { spaces: Vec::new() }
+    }
+
+    fn space(&self, ns: Option<u64>) -> Option<&Space> {
+        self.spaces.iter().find(|space| space.ns == ns)
+    }
+
+    fn space_mut(&mut self, ns: Option<u64>) -> &mut Space {
+        if let Some(index) = self.spaces.iter().position(|space| space.ns == ns) {
+            return &mut self.spaces[index];
+        }
+        self.spaces.push(Space::new(ns));
+        self.spaces.last_mut().expect("just pushed")
+    }
+}
+
 static TABLE: Mutex<RefCell<Table>> = Mutex::new(RefCell::new(Table::empty()));
 
-/// Find a live set by the number that names it, checking the generation.
-pub fn lookup(id: i64) -> Option<Arc<Set>> {
+/// Find a live set by the number that names it in namespace `ns`, checking the
+/// generation.
+pub fn lookup(ns: Option<u64>, id: i64) -> Option<Arc<Set>> {
     let (slot, seq) = ipc_id::decode(id)?;
     critical_section::with(|cs| {
         let table = TABLE.borrow(cs).borrow();
-        if table.seqs.get(slot as usize).copied()? != seq {
+        let space = table.space(ns)?;
+        if space.seqs.get(slot as usize).copied()? != seq {
             return None;
         }
-        table.slot(slot).cloned()
+        space.slot(slot).cloned()
     })
 }
 
-/// The set in table slot `index`, for `SEM_STAT`/`SEM_STAT_ANY`.
-pub fn by_slot(index: u64) -> Option<Arc<Set>> {
-    critical_section::with(|cs| TABLE.borrow(cs).borrow().slot(index).cloned())
+/// The set in namespace `ns`'s table slot `index`, for `SEM_STAT`/`SEM_STAT_ANY`.
+pub fn by_slot(ns: Option<u64>, index: u64) -> Option<Arc<Set>> {
+    critical_section::with(|cs| TABLE.borrow(cs).borrow().space(ns)?.slot(index).cloned())
 }
 
-/// Every live set, in slot order: what `/proc/sysvipc/sem` walks.
-pub fn all() -> Vec<Arc<Set>> {
+/// Every live set of namespace `ns`, in slot order: what `/proc/sysvipc/sem`
+/// walks.
+pub fn all(ns: Option<u64>) -> Vec<Arc<Set>> {
     critical_section::with(|cs| {
         TABLE
             .borrow(cs)
             .borrow()
-            .sets
-            .iter()
-            .flatten()
-            .cloned()
-            .collect()
+            .space(ns)
+            .map(|space| space.sets.iter().flatten().cloned().collect())
+            .unwrap_or_default()
     })
 }
 
-/// The highest slot a live set occupies - the `IPC_INFO`/`SEM_INFO` return
-/// value `ipcs` walks.
-pub fn highest_slot() -> u64 {
+/// The highest slot a live set of `ns` occupies - the `IPC_INFO`/`SEM_INFO`
+/// return value `ipcs` walks.
+pub fn highest_slot(ns: Option<u64>) -> u64 {
     critical_section::with(|cs| {
         let table = TABLE.borrow(cs).borrow();
-        match table.sets.iter().rposition(|slot| slot.is_some()) {
+        match table
+            .space(ns)
+            .and_then(|space| space.sets.iter().rposition(|slot| slot.is_some()))
+        {
             Some(index) => index as u64,
             None => 0,
         }
     })
 }
 
-/// How many sets are live and how many semaphores they hold, for `SEM_INFO`.
-pub fn totals() -> (usize, usize) {
+/// How many sets are live in `ns` and how many semaphores they hold, for
+/// `SEM_INFO`.
+pub fn totals(ns: Option<u64>) -> (usize, usize) {
     critical_section::with(|cs| {
         let table = TABLE.borrow(cs).borrow();
-        (table.sets.iter().flatten().count(), table.sems)
+        let Some(space) = table.space(ns) else {
+            return (0, 0);
+        };
+        (space.sets.iter().flatten().count(), space.sems)
     })
 }
 
@@ -364,21 +425,28 @@ pub struct New {
     pub now: i64,
 }
 
-/// Make a set, or answer the live one `key` already names.
+/// Make a set in `ns`, or answer the live one `key` already names **there**.
 ///
 /// The size question is one-sided, measured: a request for **more** semaphores
 /// than the set holds is `EINVAL`, while one for fewer is answered with the set
 /// (`semget(key, 1, 0)` on a two-slot set returned its id). `IPC_CREAT|IPC_EXCL`
-/// is `EEXIST` before either.
+/// is `EEXIST` before either. A key is namespace-scoped, so the same key inside a
+/// fresh namespace makes a new set numbered from 0 (measured, §6.16).
 pub fn get_or_create(
+    ns: Option<u64>,
     new: New,
     create: bool,
     exclusive: bool,
 ) -> Result<(Arc<Set>, bool), SemError> {
     if new.key != IPC_PRIVATE {
-        if let Some(existing) =
-            critical_section::with(|cs| TABLE.borrow(cs).borrow().find_key(new.key))
-        {
+        let existing = critical_section::with(|cs| {
+            TABLE
+                .borrow(cs)
+                .borrow()
+                .space(ns)
+                .and_then(|space| space.find_key(new.key))
+        });
+        if let Some(existing) = existing {
             if create && exclusive {
                 return Err(SemError::Exists);
             }
@@ -391,20 +459,21 @@ pub fn get_or_create(
             return Err(SemError::NoEntry);
         }
     }
-    create_set(new).map(|set| (set, true))
+    create_set(ns, new).map(|set| (set, true))
 }
 
-fn create_set(new: New) -> Result<Arc<Set>, SemError> {
+fn create_set(ns: Option<u64>, new: New) -> Result<Arc<Set>, SemError> {
     if new.nsems == 0 || new.nsems > SEMMSL {
         return Err(SemError::BadCount);
     }
     critical_section::with(|cs| {
         let mut table = TABLE.borrow(cs).borrow_mut();
-        if table.sems + new.nsems > SEMMNS {
+        let space = table.space_mut(ns);
+        if space.sems + new.nsems > SEMMNS {
             return Err(SemError::Full);
         }
-        let slot = table.free_slot().ok_or(SemError::Full)?;
-        let seq = table.seqs[slot as usize];
+        let slot = space.free_slot().ok_or(SemError::Full)?;
+        let seq = space.seqs[slot as usize];
         let id = ipc_id::build(slot, seq);
         let set = Arc::new(Set {
             inner: Mutex::new(RefCell::new(Inner {
@@ -419,6 +488,7 @@ fn create_set(new: New) -> Result<Arc<Set>, SemError> {
                     seq,
                     nsems: new.nsems,
                 },
+                handle: ipc_id::next_handle(),
                 values: alloc::vec![0; new.nsems],
                 otime: 0,
                 ctime: new.now,
@@ -426,35 +496,35 @@ fn create_set(new: New) -> Result<Arc<Set>, SemError> {
             })),
             removed: AtomicBool::new(false),
         });
-        table.sems += new.nsems;
-        table.sets[slot as usize] = Some(Arc::clone(&set));
+        space.sets[slot as usize] = Some(Arc::clone(&set));
         Ok(set)
     })
 }
 
-/// Take a set out of the table and wake everyone asleep on it with `EIDRM`.
+/// Take a set out of `ns`'s table and wake everyone asleep on it with `EIDRM`.
 ///
 /// `IPC_RMID` on a semaphore set is a *removal*, not the mark the segment table
 /// keeps: there is nothing to keep the object alive by (a set has no
 /// attachments), and Linux's own answer to the next call naming the number is
 /// `EINVAL`. A waiter already asleep is the one case that still needs the
 /// object, and it holds the `Arc` to read [`Set::removed`].
-pub fn remove(id: i64, wake: impl FnMut(TaskId)) -> Option<Arc<Set>> {
+pub fn remove(ns: Option<u64>, id: i64, wake: impl FnMut(TaskId)) -> Option<Arc<Set>> {
     let set = critical_section::with(|cs| {
         let mut table = TABLE.borrow(cs).borrow_mut();
         let (slot, seq) = ipc_id::decode(id)?;
-        if table.seqs.get(slot as usize).copied()? != seq {
+        let space = table.space_mut(ns);
+        if space.seqs.get(slot as usize).copied()? != seq {
             return None;
         }
-        let taken = table.sets.get_mut(slot as usize)?.take()?;
-        table.sems = table.sems.saturating_sub(taken.nsems());
-        if let Some(next) = table.seqs.get_mut(slot as usize) {
+        let taken = space.sets.get_mut(slot as usize)?.take()?;
+        space.sems = space.sems.saturating_sub(taken.nsems());
+        if let Some(next) = space.seqs.get_mut(slot as usize) {
             *next = ipc_id::next_generation(*next);
         }
         Some(taken)
     })?;
     set.removed.store(true, Ordering::Relaxed);
-    wake_waiters(set.id(), wake);
+    wake_waiters(set.handle(), wake);
     Some(set)
 }
 
@@ -472,6 +542,9 @@ enum WaitKind {
 }
 
 struct Waiter {
+    /// The set's **handle** (`Set::handle`), not its number: two namespaces can
+    /// hold sets numbered alike, and a wake meant for one must not reach the
+    /// other.
     set: u64,
     sem: usize,
     kind: WaitKind,
@@ -520,7 +593,7 @@ fn is_woken(task: TaskId) -> bool {
     })
 }
 
-/// Mark every task asleep on `set` woken, and wake each one.
+/// Mark every task asleep on the set with this handle woken, and wake each one.
 ///
 /// The wake callback rather than `crate::sched::wake` because two callers exist:
 /// a `semop` that raised a counter (which may take the task table itself) and
@@ -589,11 +662,11 @@ pub fn semop_attempt(
     park: Option<TaskId>,
 ) -> Attempt {
     let nsems = set.nsems();
-    // Read out before the borrow below: `Set::id` goes through `perm`, which
-    // borrows the very `RefCell` this closure holds mutably - the first draft
-    // asked for it inside and the machine panicked with "already mutably
-    // borrowed" on the first operation that had to block.
-    let id = set.id();
+    // Read out before the borrow below: `Set::handle` goes through the same
+    // `RefCell` this closure holds mutably - the first draft asked for the *id*
+    // inside and the machine panicked with "already mutably borrowed" on the
+    // first operation that had to block.
+    let handle = set.handle();
     critical_section::with(|cs| {
         let mut inner = set.inner.borrow(cs).borrow_mut();
         let mut changes: Vec<(usize, i32)> = Vec::with_capacity(ops.len());
@@ -648,7 +721,7 @@ pub fn semop_attempt(
             if flags & IPC_NOWAIT != 0 || park.is_none() {
                 return Attempt::Refused(SemError::WouldBlock);
             }
-            register(id, sem, kind, park.expect("checked above"));
+            register(handle, sem, kind, park.expect("checked above"));
             return Attempt::Blocked;
         }
         for (sem, value) in &changes {
@@ -658,7 +731,11 @@ pub fn semop_attempt(
         inner.lpid = pid;
         if let Some(undo) = undo {
             for (sem, delta) in adjust {
-                undo.record(id, sem, delta);
+                // The record names the **object**, not its number: a task that
+                // leaves its IPC namespace must not have the adjustment land on
+                // whatever set holds the same number in the namespace it
+                // entered (§6.16).
+                undo.record(set, sem, delta);
             }
         }
         Attempt::Done
@@ -700,10 +777,16 @@ pub struct UndoList {
     records: Mutex<RefCell<Vec<Undo>>>,
 }
 
-/// One adjustment: the set, the slot in it, and what to add back at exit - the
-/// operation *negated*, which is Linux's `semadj`.
+/// One adjustment: the set **object**, the slot in it, and what to add back at
+/// exit - the operation *negated*, which is Linux's `semadj`.
+///
+/// The object rather than its number, which used to be enough: numbers are
+/// per-namespace now, so a record keyed by one could name a stranger's set after
+/// an `unshare(CLONE_NEWIPC)` (§6.16). Holding the `Arc` is also what lets the
+/// exit pass see that the set was removed - `Set::removed` is the flag the
+/// record reads before it touches anything.
 struct Undo {
-    set: u64,
+    set: Arc<Set>,
     sem: usize,
     adjustment: i32,
 }
@@ -724,12 +807,12 @@ impl UndoList {
     /// Add `delta` to this set-and-slot's adjustment, folding into a record that
     /// is already there: Linux's `sem_undo` keeps one `semadj` per set and slot,
     /// which is also what makes a `+1` then a `-1` cancel out to nothing.
-    fn record(&self, set: u64, sem: usize, delta: i32) {
+    fn record(&self, set: &Arc<Set>, sem: usize, delta: i32) {
         critical_section::with(|cs| {
             let mut records = self.records.borrow(cs).borrow_mut();
             if let Some(record) = records
                 .iter_mut()
-                .find(|record| record.set == set && record.sem == sem)
+                .find(|record| Arc::ptr_eq(&record.set, set) && record.sem == sem)
             {
                 record.adjustment = record
                     .adjustment
@@ -738,7 +821,7 @@ impl UndoList {
                 return;
             }
             records.push(Undo {
-                set,
+                set: Arc::clone(set),
                 sem,
                 adjustment: delta.clamp(-SEMAEM, SEMAEM),
             });
@@ -772,9 +855,13 @@ pub fn apply_undo(list: &UndoList, mut wake: impl FnMut(TaskId)) {
     let records = list.take();
     let mut touched: Vec<u64> = Vec::new();
     for record in records {
-        let Some(set) = lookup(record.set as i64) else {
+        // A set that was removed in the meantime is skipped: the record is about
+        // an object that no longer exists, and its number may already name a
+        // different one in this namespace.
+        if record.set.removed() {
             continue;
-        };
+        }
+        let set = &record.set;
         critical_section::with(|cs| {
             let mut inner = set.inner.borrow(cs).borrow_mut();
             let Some(value) = inner.values.get_mut(record.sem) else {
@@ -782,7 +869,7 @@ pub fn apply_undo(list: &UndoList, mut wake: impl FnMut(TaskId)) {
             };
             *value = value.saturating_add(record.adjustment).clamp(0, SEMVMX);
         });
-        touched.push(record.set);
+        touched.push(set.handle());
     }
     touched.sort_unstable();
     touched.dedup();
@@ -809,7 +896,7 @@ pub fn unshare_undo() {
         let moved = shared.take();
         let fresh = UndoList::new();
         for record in moved {
-            fresh.record(record.set, record.sem, record.adjustment);
+            fresh.record(&record.set, record.sem, record.adjustment);
         }
         let mut fresh = Some(Arc::new(fresh));
         if fresh.as_ref().is_some_and(|list| list.is_empty()) {
@@ -902,10 +989,11 @@ mod tests {
     /// what makes `+1` then `-1` cancel rather than apply twice.
     #[test]
     fn an_undo_record_folds_and_saturates() {
+        let set = fresh();
         let list = UndoList::new();
-        list.record(7, 0, -3);
-        list.record(7, 0, 2);
-        list.record(7, 1, 5);
+        list.record(&set, 0, -3);
+        list.record(&set, 0, 2);
+        list.record(&set, 1, 5);
         assert_eq!(list.len(), 2);
         let records = list.take();
         assert!(list.is_empty());
@@ -918,8 +1006,12 @@ mod tests {
 
     /// A set made for a test: `IPC_PRIVATE` so no other test can collide with
     /// it, one semaphore, mode 0600.
+    /// The machine's own namespace, the key every host test's table reads use.
+    const MACHINE: Option<u64> = None;
+
     fn fresh() -> alloc::sync::Arc<Set> {
         get_or_create(
+            MACHINE,
             New {
                 key: IPC_PRIVATE,
                 nsems: 1,
@@ -980,7 +1072,7 @@ mod tests {
             Attempt::Done
         ));
         assert!(!is_woken(me));
-        wake_waiters(set.id(), |_| {});
+        wake_waiters(set.handle(), |_| {});
         assert!(is_woken(me));
         assert!(matches!(
             semop_attempt(&set, &[buf(0, -1, 0)], None, 3, 2, Some(me)),
@@ -995,6 +1087,7 @@ mod tests {
     #[test]
     fn an_array_that_cannot_proceed_changes_nothing() {
         let set = get_or_create(
+            MACHINE,
             New {
                 key: IPC_PRIVATE,
                 nsems: 2,

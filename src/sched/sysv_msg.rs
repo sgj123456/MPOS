@@ -34,8 +34,16 @@
 //! * a blocked send or receive is woken by its opposite number, and answers
 //!   `EIDRM` when the queue is removed underneath it.
 //!
-//! **What is not here**: the IPC namespace. As with the other two families,
-//! this is one table for the machine until `CLONE_NEWIPC` exists.
+//! **The table is per IPC namespace**, one *slot space* each, because the number a
+//! queue is known by restarts at 0 in a fresh namespace (measured,
+//! `.workbuddy/probe_ipcns.c`: the first queue inside a new namespace is `0`
+//! while the machine's are in the `65581` generation). Every table read takes the
+//! caller's namespace key - `None` for the machine's own, `Some(n)` for one
+//! `unshare(CLONE_NEWIPC)`/`setns` made - and a number from another namespace is
+//! simply absent, which is Linux's `EINVAL` (measured: `msgctl` on the old
+//! namespace's id inside the new one answers `-22`). There is also a **handle**
+//! separate from the number (`mm::ipc_id::next_handle`), because two namespaces
+//! can hold queues numbered alike and the waiter table must not confuse them.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -120,6 +128,9 @@ struct Message {
 /// the clocks and pids `IPC_STAT` reports.
 struct Inner {
     perm: Perm,
+    /// The machine-wide wake identity, from `mm::ipc_id::next_handle` - never
+    /// the namespace-numbered `perm.id`, which two namespaces can share.
+    handle: u64,
     msgs: Vec<Message>,
     /// Bytes currently queued - the number the budget bounds.
     cbytes: usize,
@@ -148,6 +159,12 @@ impl Queue {
 
     pub fn id(&self) -> u64 {
         self.perm().id
+    }
+
+    /// The handle waiters are keyed by: unique across every namespace, where
+    /// [`Self::id`] is only unique inside one.
+    pub fn handle(&self) -> u64 {
+        critical_section::with(|cs| self.inner.borrow(cs).borrow().handle)
     }
 
     pub fn removed(&self) -> bool {
@@ -201,16 +218,23 @@ impl Queue {
 // The table
 // ---------------------------------------------------------------------------
 
-/// The machine's one queue table, on the same slot-and-generation numbers the
+/// One namespace's slot space, on the same slot-and-generation numbers the
 /// other two SysV families use (`mm::ipc_id`).
-struct Table {
+///
+/// A space per namespace rather than one table with a namespace tag, because the
+/// number's *slot index* is part of the number: Linux's fresh namespace answers
+/// `0, 1, 2, ...` again, which only a separate vector can produce.
+struct Space {
+    /// Which IPC namespace this space is, `None` for the machine's own.
+    ns: Option<u64>,
     queues: Vec<Option<Arc<Queue>>>,
     seqs: Vec<u16>,
 }
 
-impl Table {
-    const fn empty() -> Table {
-        Table {
+impl Space {
+    const fn new(ns: Option<u64>) -> Space {
+        Space {
+            ns,
             queues: Vec::new(),
             seqs: Vec::new(),
         }
@@ -241,64 +265,105 @@ impl Table {
     }
 }
 
+/// Every namespace's slot space, the machine's own made on first use.
+///
+/// A namespace that dies leaves its space behind, and that is named rather than
+/// hidden: nothing here is told when a namespace loses its last task, so the
+/// table holds the objects until the machine ends - bounded by `MSGMNI` per
+/// space and by how many namespaces were ever made (`docs/notes/` §6.16).
+struct Table {
+    spaces: Vec<Space>,
+}
+
+impl Table {
+    const fn empty() -> Table {
+        Table { spaces: Vec::new() }
+    }
+
+    fn space(&self, ns: Option<u64>) -> Option<&Space> {
+        self.spaces.iter().find(|space| space.ns == ns)
+    }
+
+    /// The space for `ns`, made empty on first use: creating a namespace's first
+    /// queue is what creates the space.
+    fn space_mut(&mut self, ns: Option<u64>) -> &mut Space {
+        if let Some(index) = self.spaces.iter().position(|space| space.ns == ns) {
+            return &mut self.spaces[index];
+        }
+        self.spaces.push(Space::new(ns));
+        self.spaces.last_mut().expect("just pushed")
+    }
+}
+
 static TABLE: Mutex<RefCell<Table>> = Mutex::new(RefCell::new(Table::empty()));
 
-/// Find a live queue by the number that names it, checking the generation.
-pub fn lookup(id: i64) -> Option<Arc<Queue>> {
+/// Find a live queue by the number that names it in namespace `ns`, checking the
+/// generation.
+pub fn lookup(ns: Option<u64>, id: i64) -> Option<Arc<Queue>> {
     let (slot, seq) = ipc_id::decode(id)?;
     critical_section::with(|cs| {
         let table = TABLE.borrow(cs).borrow();
-        if table.seqs.get(slot as usize).copied()? != seq {
+        let space = table.space(ns)?;
+        if space.seqs.get(slot as usize).copied()? != seq {
             return None;
         }
-        table.slot(slot).cloned()
+        space.slot(slot).cloned()
     })
 }
 
-/// The queue in table slot `index`, for `MSG_STAT`/`MSG_STAT_ANY`.
-pub fn by_slot(index: u64) -> Option<Arc<Queue>> {
-    critical_section::with(|cs| TABLE.borrow(cs).borrow().slot(index).cloned())
+/// The queue in namespace `ns`'s table slot `index`, for `MSG_STAT`/`MSG_STAT_ANY`.
+pub fn by_slot(ns: Option<u64>, index: u64) -> Option<Arc<Queue>> {
+    critical_section::with(|cs| TABLE.borrow(cs).borrow().space(ns)?.slot(index).cloned())
 }
 
-/// Every live queue, in slot order: what `/proc/sysvipc/msg` walks.
-pub fn all() -> Vec<Arc<Queue>> {
+/// Every live queue of namespace `ns`, in slot order: what `/proc/sysvipc/msg`
+/// walks.
+pub fn all(ns: Option<u64>) -> Vec<Arc<Queue>> {
     critical_section::with(|cs| {
         TABLE
             .borrow(cs)
             .borrow()
-            .queues
-            .iter()
-            .flatten()
-            .cloned()
-            .collect()
+            .space(ns)
+            .map(|space| space.queues.iter().flatten().cloned().collect())
+            .unwrap_or_default()
     })
 }
 
-/// The highest slot a live queue occupies - the `IPC_INFO`/`MSG_INFO` return
-/// value `ipcs` walks.
-pub fn highest_slot() -> u64 {
+/// The highest slot a live queue of `ns` occupies - the `IPC_INFO`/`MSG_INFO`
+/// return value `ipcs` walks.
+pub fn highest_slot(ns: Option<u64>) -> u64 {
     critical_section::with(|cs| {
         let table = TABLE.borrow(cs).borrow();
-        match table.queues.iter().rposition(|slot| slot.is_some()) {
+        match table
+            .space(ns)
+            .and_then(|space| space.queues.iter().rposition(|slot| slot.is_some()))
+        {
             Some(index) => index as u64,
             None => 0,
         }
     })
 }
 
-/// How many queues and messages are live, for `MSG_INFO`'s two re-purposed
-/// fields (`msgpool`/`msgmap`, the message family's own "cursed" pair - see
-/// `write_seminfo` for the semaphore family's).
-pub fn totals() -> (usize, usize) {
+/// How many queues and messages are live in `ns`, for `MSG_INFO`'s two
+/// re-purposed fields (`msgpool`/`msgmap`, the message family's own "cursed"
+/// pair - see `write_seminfo` for the semaphore family's).
+///
+/// Per namespace, because Linux's limits are: `MSGMNI` is what one namespace may
+/// hold, and a namespace that could count another's queues would report a limit
+/// it is not being held to.
+pub fn totals(ns: Option<u64>) -> (usize, usize) {
     critical_section::with(|cs| {
         let table = TABLE.borrow(cs).borrow();
-        let messages: usize = table
+        let Some(space) = table.space(ns) else {
+            return (0, 0);
+        };
+        let messages: usize = space
             .queues
             .iter()
             .flatten()
             .map(|queue| queue.stats().1)
             .sum();
-        (table.queues.iter().flatten().count(), messages)
+        (space.queues.iter().flatten().count(), messages)
     })
 }
 
@@ -311,16 +376,25 @@ pub struct New {
     pub now: i64,
 }
 
-/// Make a queue, or answer the live one `key` already names.
+/// Make a queue in `ns`, or answer the live one `key` already names **there**:
+/// a key names an object of one namespace, so a queue the caller made outside is
+/// not found inside and a fresh one is made (measured: the same key inside a new
+/// namespace answers a new number, `0`).
 pub fn get_or_create(
+    ns: Option<u64>,
     new: New,
     create: bool,
     exclusive: bool,
 ) -> Result<(Arc<Queue>, bool), MsgError> {
     if new.key != IPC_PRIVATE {
-        if let Some(existing) =
-            critical_section::with(|cs| TABLE.borrow(cs).borrow().find_key(new.key))
-        {
+        let existing = critical_section::with(|cs| {
+            TABLE
+                .borrow(cs)
+                .borrow()
+                .space(ns)
+                .and_then(|space| space.find_key(new.key))
+        });
+        if let Some(existing) = existing {
             if create && exclusive {
                 return Err(MsgError::Exists);
             }
@@ -330,14 +404,15 @@ pub fn get_or_create(
             return Err(MsgError::NoEntry);
         }
     }
-    create_queue(new).map(|queue| (queue, true))
+    create_queue(ns, new).map(|queue| (queue, true))
 }
 
-fn create_queue(new: New) -> Result<Arc<Queue>, MsgError> {
+fn create_queue(ns: Option<u64>, new: New) -> Result<Arc<Queue>, MsgError> {
     critical_section::with(|cs| {
         let mut table = TABLE.borrow(cs).borrow_mut();
-        let slot = table.free_slot().ok_or(MsgError::Full)?;
-        let seq = table.seqs[slot as usize];
+        let space = table.space_mut(ns);
+        let slot = space.free_slot().ok_or(MsgError::Full)?;
+        let seq = space.seqs[slot as usize];
         let id = ipc_id::build(slot, seq);
         let queue = Arc::new(Queue {
             inner: Mutex::new(RefCell::new(Inner {
@@ -351,6 +426,7 @@ fn create_queue(new: New) -> Result<Arc<Queue>, MsgError> {
                     mode: new.mode & MODE_MASK,
                     seq,
                 },
+                handle: ipc_id::next_handle(),
                 msgs: Vec::new(),
                 cbytes: 0,
                 qbytes: MSGMNB,
@@ -362,32 +438,35 @@ fn create_queue(new: New) -> Result<Arc<Queue>, MsgError> {
             })),
             removed: AtomicBool::new(false),
         });
-        table.queues[slot as usize] = Some(Arc::clone(&queue));
+        let handle_taken = queue.handle();
+        let _ = handle_taken;
+        space.queues[slot as usize] = Some(Arc::clone(&queue));
         Ok(queue)
     })
 }
 
-/// Take a queue out of the table and wake everyone asleep on it.
+/// Take a queue out of `ns`'s table and wake everyone asleep on it.
 ///
 /// `IPC_RMID` on a message queue is a removal, like the semaphore sets and
 /// unlike the segment table's mark: the messages are gone, and every waiter -
 /// sender or receiver - answers `EIDRM` (measured both halves). The wakers
 /// hold the `Arc` to read [`Queue::removed`].
-pub fn remove(id: i64, wake: impl FnMut(TaskId)) -> Option<Arc<Queue>> {
+pub fn remove(ns: Option<u64>, id: i64, wake: impl FnMut(TaskId)) -> Option<Arc<Queue>> {
     let queue = critical_section::with(|cs| {
         let mut table = TABLE.borrow(cs).borrow_mut();
         let (slot, seq) = ipc_id::decode(id)?;
-        if table.seqs.get(slot as usize).copied()? != seq {
+        let space = table.space_mut(ns);
+        if space.seqs.get(slot as usize).copied()? != seq {
             return None;
         }
-        let taken = table.queues.get_mut(slot as usize)?.take()?;
-        if let Some(next) = table.seqs.get_mut(slot as usize) {
+        let taken = space.queues.get_mut(slot as usize)?.take()?;
+        if let Some(next) = space.seqs.get_mut(slot as usize) {
             *next = ipc_id::next_generation(*next);
         }
         Some(taken)
     })?;
     queue.removed.store(true, Ordering::Relaxed);
-    wake_waiters(queue.id(), wake);
+    wake_waiters(queue.handle(), wake);
     Some(queue)
 }
 
@@ -396,6 +475,9 @@ pub fn remove(id: i64, wake: impl FnMut(TaskId)) -> Option<Arc<Queue>> {
 // ---------------------------------------------------------------------------
 
 struct Waiter {
+    /// The object's **handle** (`Queue::handle`), not its number: two namespaces
+    /// can hold queues numbered alike, and a wake meant for one must not reach
+    /// the other.
     queue: u64,
     task: TaskId,
     /// Set by a wake. The task polls this from inside `block_until_nanos`, so
@@ -440,7 +522,8 @@ fn is_woken(task: TaskId) -> bool {
     })
 }
 
-/// Mark every task asleep on `queue` woken, and wake each one.
+/// Mark every task asleep on the object with this handle woken, and wake each
+/// one.
 ///
 /// The wake callback rather than `crate::sched::wake` for the same reason the
 /// semaphore family needs one: the caller may already hold the task table.
@@ -494,16 +577,16 @@ pub fn send_attempt(
     if data.len() > MSGMAX {
         return SendAttempt::Refused(MsgError::TooBig);
     }
-    // Read out before the borrow below: `Queue::id` goes through `perm`,
-    // which borrows the very `RefCell` this closure holds.
-    let id = queue.id();
+    // Read out before the borrow below: `Queue::handle` goes through the same
+    // `RefCell` this closure holds.
+    let handle = queue.handle();
     critical_section::with(|cs| {
         let mut inner = queue.inner.borrow(cs).borrow_mut();
         if inner.cbytes + data.len() > inner.qbytes {
             if park.is_none() {
                 return SendAttempt::Refused(MsgError::QueueFull);
             }
-            register(id, park.expect("checked above"));
+            register(handle, park.expect("checked above"));
             return SendAttempt::Blocked;
         }
         inner.cbytes += data.len();
@@ -573,7 +656,7 @@ pub fn recv_attempt(
     pid: u32,
     park: Option<TaskId>,
 ) -> RecvAttempt {
-    let id = queue.id();
+    let handle = queue.handle();
     let noerror = flags & MSG_NOERROR != 0;
     let except = flags & MSG_EXCEPT != 0;
     let copy = flags & MSG_COPY != 0;
@@ -589,14 +672,14 @@ pub fn recv_attempt(
             return RecvAttempt::Got(index.mtype, index.data.clone());
         }
         let Some(index) = select(&inner.msgs, typ, except) else {
-            return block_or_refuse(&mut inner, id, park, MsgError::NoMsg);
+            return block_or_refuse(&mut inner, handle, park, MsgError::NoMsg);
         };
         // `select` answers an index; on an empty queue `typ == 0`'s is the
         // front of nothing, so the empty answer is decided here rather than in
         // the selector (whose `Some(0)` is about *shape*, not count - the first
         // draft indexed it and a blocking receive on an empty queue panicked).
         if index >= inner.msgs.len() {
-            return block_or_refuse(&mut inner, id, park, MsgError::NoMsg);
+            return block_or_refuse(&mut inner, handle, park, MsgError::NoMsg);
         }
         let message = &inner.msgs[index];
         if message.data.len() > msgsz && !noerror {
@@ -605,7 +688,7 @@ pub fn recv_attempt(
             if park.is_none() {
                 return RecvAttempt::Refused(MsgError::TooSmall);
             }
-            register(id, park.expect("checked above"));
+            register(handle, park.expect("checked above"));
             return RecvAttempt::Blocked;
         }
         let mut message = inner.msgs.remove(index);
@@ -624,12 +707,17 @@ pub fn recv_attempt(
 
 /// The empty-queue half of the receive: `ENOMSG` for a caller that will not
 /// wait, a registered waiter for one that will.
-fn block_or_refuse(inner: &mut Inner, id: u64, park: Option<TaskId>, e: MsgError) -> RecvAttempt {
+fn block_or_refuse(
+    inner: &mut Inner,
+    handle: u64,
+    park: Option<TaskId>,
+    e: MsgError,
+) -> RecvAttempt {
     if inner.msgs.is_empty() {
         if park.is_none() {
             return RecvAttempt::Refused(e);
         }
-        register(id, park.expect("checked above"));
+        register(handle, park.expect("checked above"));
         return RecvAttempt::Blocked;
     }
     RecvAttempt::Refused(e)
@@ -651,8 +739,12 @@ pub fn park(task: TaskId) -> super::WaitEnd {
 mod tests {
     use super::*;
 
+    /// The machine's own namespace, the key every host test's table reads use.
+    const MACHINE: Option<u64> = None;
+
     fn fresh() -> Arc<Queue> {
         get_or_create(
+            MACHINE,
             New {
                 key: IPC_PRIVATE,
                 mode: 0o600,
@@ -682,6 +774,59 @@ mod tests {
         assert_eq!(qbytes, MSGMNB);
         assert_eq!(lspid, 1);
         assert_eq!(stime, 3);
+    }
+
+    /// The namespace is the table: a fresh namespace's numbers start at 0
+    /// (measured), the same key names a *different* queue inside it, and a
+    /// number from one space never answers an object of the other - even when
+    /// the two numbers coincide, which they can because the number is the
+    /// namespace's.
+    ///
+    /// The last half is why an object also carries a machine-wide `handle`: two
+    /// namespaces can hold queues numbered alike, so anything a waiter hangs off
+    /// has to be the handle rather than the number.
+    #[test]
+    fn a_namespace_has_its_own_slot_space() {
+        let ns = Some(0x6963_0001u64);
+        let facts = || New {
+            key: 0x4d53_4751,
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            now: 7,
+        };
+        let (inside, made) = get_or_create(ns, facts(), true, false).expect("a private space");
+        assert!(made);
+        assert_eq!(inside.id(), 0, "a fresh namespace numbers from 0");
+        assert_eq!(all(ns).len(), 1);
+        assert_eq!(highest_slot(ns), 0);
+        assert_eq!(totals(ns), (1, 0));
+
+        // The same key in the machine's own namespace is a different object:
+        // a key resolves within one namespace, so `get_or_create` may not answer
+        // the one the other namespace holds.
+        let (outer, made_outer) =
+            get_or_create(MACHINE, facts(), true, false).expect("the machine's");
+        assert!(made_outer, "the key must not resolve across the namespace");
+        assert_ne!(outer.handle(), inside.handle());
+
+        // A number from one space never answers the other's object, and when the
+        // numbers *do* coincide it is the object that tells them apart.
+        if let Some(at_zero) = lookup(MACHINE, 0) {
+            assert_ne!(at_zero.handle(), inside.handle());
+        }
+        assert!(
+            lookup(ns, outer.id() as i64)
+                .map(|queue| queue.handle() != outer.handle())
+                .unwrap_or(true)
+        );
+
+        // Removing one space's queue leaves the other's alone.
+        assert!(remove(MACHINE, outer.id() as i64, |_| {}).is_some());
+        assert!(lookup(ns, inside.id() as i64).is_some());
+        assert_eq!(all(ns).len(), 1);
+        remove(ns, inside.id() as i64, |_| {});
+        assert!(all(ns).is_empty());
     }
 
     /// A non-positive type refuses at the send, and a size past `MSGMAX`
@@ -726,7 +871,7 @@ mod tests {
             recv_attempt(&q, 0, MSGMAX, 0, 5, 1, None),
             RecvAttempt::Got(1, ref d) if d.len() == MSGMAX
         ));
-        wake_waiters(q.id(), |_| {});
+        wake_waiters(q.handle(), |_| {});
         assert!(is_woken(TaskId(9)));
         assert!(matches!(
             send_attempt(&q, 1, b"x".to_vec(), 6, 1, Some(TaskId(9))),
@@ -827,8 +972,8 @@ mod tests {
     fn a_removal_wakes_and_ages_the_number() {
         let q = fresh();
         let id = q.id() as i64;
-        remove(id, |_| {});
+        remove(MACHINE, id, |_| {});
         assert!(q.removed());
-        assert!(lookup(id).is_none());
+        assert!(lookup(MACHINE, id).is_none());
     }
 }

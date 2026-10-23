@@ -326,10 +326,10 @@ fn main() {
     let mixed = fix(unsafe {
         libc::syscall(
             libc::SYS_unshare,
-            // The unserved half is `IPC` because the word used to be `NET`,
-            // which became a served kind when the fourth rung landed - the drift
-            // §6.3 records over and over.
-            (CLONE_NEWNS | libc::CLONE_NEWIPC as usize) as libc::c_long,
+            // The unserved half is `CGROUP` now: the word used to be `NET` and
+            // then `IPC`, and each became a served kind when its rung landed -
+            // the drift §6.3 records over and over.
+            (CLONE_NEWNS | libc::CLONE_NEWCGROUP as usize) as libc::c_long,
         )
     });
     r.check(
