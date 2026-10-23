@@ -347,6 +347,33 @@ pub fn lookup(ns: Option<u64>, name: &str) -> Option<Arc<Queue>> {
     })
 }
 
+/// Drop the registry rows a **dead** IPC namespace kept, for the reason
+/// [`crate::sched::sysv_msg::forget`] gives.
+///
+/// A queue an open descriptor names survives through that descriptor's `Arc`
+/// (a `mq_close` on it still works, and the object goes when the last one does),
+/// which is Linux's own lukewarm rule for an unlinked queue. The
+/// `RLIMIT_MSGQUEUE` charge is *released* here, because that budget is the
+/// user's and a dead namespace must not keep charging it.
+pub fn forget(ns: Option<u64>) {
+    let gone: alloc::vec::Vec<Arc<Queue>> = critical_section::with(|cs| {
+        let mut registry = REGISTRY.borrow(cs).borrow_mut();
+        let mut gone = alloc::vec::Vec::new();
+        let mut index = 0;
+        while index < registry.len() {
+            if registry[index].0 == ns {
+                gone.push(registry.remove(index).1);
+            } else {
+                index += 1;
+            }
+        }
+        gone
+    });
+    for queue in gone {
+        queue.release_budget();
+    }
+}
+
 /// Every queue of `ns`, for the `/dev/mqueue` listing.
 pub fn all(ns: Option<u64>) -> Vec<Arc<Queue>> {
     critical_section::with(|cs| {

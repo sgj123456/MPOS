@@ -5639,9 +5639,10 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     the four tables — `src/sched/sysv_{msg,sem}.rs`, `src/mm/sysv_shm.rs`,
     `src/vfs/mqueue.rs` — each a slot space per namespace.
 
-    **Pin**: the new `t-ns-ipc`, **28 claims**, every one run against a real
-    kernel before it was pointed at this one, plus one host test in
-    `sched::sysv_msg` (`a_namespace_has_its_own_slot_space`). The pins that had
+    **Pin**: the new `t-ns-ipc`, **31 claims**, every one run against a real
+    kernel before it was pointed at this one, plus two host tests -
+    `sched::sysv_msg`'s `a_namespace_has_its_own_slot_space` and `vfs::ns`'s
+    `the_last_reference_frees_the_ipc_tables`. The pins that had
     asserted IPC was *unserved* moved with the measurement: `t-caps` and the
     whole-word refusals in `t-ns-net`, `t-ns-pid`, `t-ns-uts` and `t-ns-mnt`
     now name `CLONE_NEWCGROUP`, and `t-ns-setns`'s directory listing expects the
@@ -5652,8 +5653,16 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     aarch64 arm builds (kernel, loader, clippy) but its sweep cannot boot on this
     host (`egl: no drm render node available`), so no aarch64 figure is claimed.
 
-    **Named**: a namespace's tables are **not freed** when it dies — bounded per
-    space by each family's limit and by how many namespaces were ever made, and
-    a death hook is the landing that would close it. `clone(CLONE_NEWIPC)` is
-    still refused with every other namespace bit (the clone door is unchanged).
-    `CLONE_NEWCGROUP` is the last kind with nothing behind it.
+    **The tables are freed when the namespace dies**, and it is the *object* that
+    says when: the task's slot and a `/proc/<pid>/ns/ipc` descriptor hold the
+    namespace by `Arc`, and the last drop frees the four tables' spaces for its
+    number. Without it a loop of `unshare` + one queue grew the kernel without
+    bound; with it the objects a task that *left* still uses stay alive by their
+    own reference, which is Linux's `ns_common`/`shm_file` arrangement. The
+    observable half is pinned: `setns` into a namespace whose last member left
+    still finds its queue (`t-ns-ipc`), and `drop(ns)` empties all four tables
+    in `vfs::ns`'s host test.
+
+    **Named**: `clone(CLONE_NEWIPC)` is still refused with every other namespace
+    bit (the clone door is unchanged), and `CLONE_NEWCGROUP` is the last kind
+    with nothing behind it.

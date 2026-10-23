@@ -169,7 +169,7 @@ pub fn current_ipc_ns() -> Option<u64> {
 /// for the machine-only writer, kept so `ipc`'s host side compiles against the
 /// same name.
 #[cfg(not(target_os = "none"))]
-pub fn set_ipc_ns(_ns: Option<u64>) {}
+pub fn set_ipc_ns(_ns: Option<alloc::sync::Arc<crate::vfs::ns::IpcNs>>) {}
 
 /// The host has no namespaces to make: `unshare` is machine-compiled, and this
 /// exists only so a host build of the crate that names it still links.

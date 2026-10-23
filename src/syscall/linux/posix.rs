@@ -1320,7 +1320,7 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
         // Joining an IPC namespace moves the caller into *it*: the objects that
         // namespace holds are the ones the caller can name from here, and its
         // numbers are its own from 0 (measured, §6.16).
-        crate::vfs::ns::Namespace::Ipc(id) => crate::sched::set_ipc_ns(Some(id)),
+        crate::vfs::ns::Namespace::Ipc(ns) => crate::sched::set_ipc_ns(ns),
         crate::vfs::ns::Namespace::Pid(pidns) => crate::sched::setns_pid(pidns),
         crate::vfs::ns::Namespace::Uts(uts) => crate::sched::setns_uts(uts),
         // Joining a time namespace replaces the caller's `time_ns_for_children`

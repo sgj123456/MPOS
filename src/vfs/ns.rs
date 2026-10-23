@@ -318,10 +318,16 @@ impl Entry {
 #[derive(Clone)]
 pub enum Namespace {
     Mount(Arc<crate::vfs::mount::MountTable>),
-    /// An IPC namespace, by the number the four IPC tables key their state by.
-    /// A number rather than an object for `Net`'s reason: the tables live in
-    /// three crates, none of which may be named from here.
-    Ipc(u64),
+    /// An IPC namespace, held as the **object** the four tables hang their state
+    /// off; `None` is the machine's own.
+    ///
+    /// The object and not a number, unlike `Net`: those four tables need to know
+    /// when their state may go, and a number cannot say that. The four families
+    /// key their state by [`IpcNs::id`], while the `Arc` count is what says when
+    /// to free it - a task that is in the namespace, or a
+    /// `/proc/<pid>/ns/ipc` descriptor that names it, holds one (Linux's
+    /// `ns_common` refcount).
+    Ipc(Option<Arc<IpcNs>>),
     /// A network namespace, by the number `net` knows its stack by.
     Net(u64),
     Pid(Arc<crate::pidns::PidNs>),
@@ -353,7 +359,7 @@ impl Namespace {
     pub fn id(&self) -> u64 {
         match self {
             Namespace::Mount(table) => table.ns_id(),
-            Namespace::Ipc(ns_id) => *ns_id,
+            Namespace::Ipc(ns) => ns.as_ref().map_or_else(machine_ipc_id, |ns| ns.id()),
             Namespace::Net(ns_id) => *ns_id,
             Namespace::Pid(pidns) => pidns.ns_id(),
             Namespace::Uts(uts) => uts.ns_id(),
@@ -583,6 +589,51 @@ pub fn machine_ipc_id() -> u64 {
     fresh
 }
 
+/// One IPC namespace, as the object the four IPC tables hang their state off.
+///
+/// Its `id` is the number every lookup takes; **this** is what says when the
+/// state behind that number may go. A namespace is alive while a task is in it
+/// or a descriptor names it - Linux's `ns_common` refcount - so the last `Arc`
+/// drop is the moment to free the four tables' slot spaces. That matters
+/// because the leak it closes is reachable from a program: `unshare(CLONE_NEWIPC)`
+/// in a loop with one queue created each time grows the kernel without bound
+/// (`MAX_TASKS` caps tasks, not namespaces), which is exactly the kind of
+/// growth §8.0's panicking allocator makes fatal (§6.16).
+///
+/// The machine's own namespace is **not** one of these: it is `None` in
+/// [`Namespace::Ipc`], numbered by [`machine_ipc_id`], and never freed.
+pub struct IpcNs {
+    id: u64,
+}
+
+impl IpcNs {
+    /// A fresh namespace, owned by `owner` - the user namespace its maker stood
+    /// in, which is what a `setns` into it asks for `CAP_SYS_ADMIN`.
+    pub fn fresh(owner: Arc<crate::userns::UserNs>) -> Arc<IpcNs> {
+        Arc::new(IpcNs {
+            id: mint_owned(owner),
+        })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for IpcNs {
+    fn drop(&mut self) {
+        // The last holder is gone. Each family drops the slot space it kept for
+        // this number; anything a task that *left* still holds stays alive by
+        // its own `Arc` - a segment mapped into an address space, a POSIX queue
+        // an open descriptor names - which is Linux's shape too: a namespace's
+        // exit takes the *ids*, not the objects somebody is still using.
+        crate::sched::sysv_msg::forget(Some(self.id));
+        crate::sched::sysv_sem::forget(Some(self.id));
+        crate::mm::sysv_shm::forget(Some(self.id));
+        crate::vfs::mqueue::forget(Some(self.id));
+    }
+}
+
 /// The machine's own time namespace, made on first use from the same pool.
 ///
 /// The same shape as [`machine_net_id`] and for the same reason - a task in the
@@ -679,6 +730,104 @@ mod tests {
         // entry does not exist, which is the whole refusal.
         assert_eq!(Kind::of_name("cgroup"), None);
         assert_eq!(Kind::of_name("user"), Some(Kind::User));
+    }
+
+    /// A namespace's state lives exactly as long as the namespace does: the last
+    /// `Arc` drop frees the four tables' slot spaces for its number.
+    ///
+    /// The counterfactual is the leak this closes, and it is reachable from a
+    /// program: `unshare(CLONE_NEWIPC)` in a loop with one queue made each time
+    /// grows the kernel without bound (`MAX_TASKS` caps tasks, not namespaces),
+    /// which §8.0's panicking allocator turns into a dead machine (§6.16).
+    #[test]
+    fn the_last_reference_frees_the_ipc_tables() {
+        let ns = IpcNs::fresh(machine_user_ns());
+        let id = ns.id();
+        let key = Some(id);
+        // One object in each of the four families, each in this namespace.
+        let queue = crate::sched::sysv_msg::get_or_create(
+            key,
+            crate::sched::sysv_msg::New {
+                key: 0,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                now: 1,
+            },
+            true,
+            false,
+        )
+        .expect("a queue")
+        .0;
+        let set = crate::sched::sysv_sem::get_or_create(
+            key,
+            crate::sched::sysv_sem::New {
+                key: 0,
+                nsems: 1,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                now: 1,
+            },
+            true,
+            false,
+        )
+        .expect("a set")
+        .0;
+        let segment = crate::mm::sysv_shm::get_or_create(
+            key,
+            crate::mm::sysv_shm::New {
+                key: 0,
+                size: 4096,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                cpid: 0,
+                now: 1,
+            },
+            true,
+            false,
+        )
+        .expect("a segment")
+        .0;
+        let name = "/mpos-ns-lifetime";
+        let mq = crate::vfs::mqueue::create(key, String::from(name), 10, 8192, 0, u64::MAX)
+            .expect("a POSIX queue");
+
+        // All four are live in the namespace, and none of them is in the
+        // machine's own space.
+        assert!(crate::sched::sysv_msg::lookup(key, queue.id() as i64).is_some());
+        assert!(crate::sched::sysv_sem::lookup(key, set.id() as i64).is_some());
+        assert!(crate::mm::sysv_shm::lookup(key, segment.id() as i64).is_some());
+        assert!(crate::vfs::mqueue::lookup(key, name).is_some());
+        assert!(
+            !crate::sched::sysv_msg::all(None)
+                .iter()
+                .any(|q| Arc::ptr_eq(q, &queue))
+        );
+
+        drop(ns);
+
+        // The namespace is gone, so its state is: every table has let the space
+        // go, and the numbers it had resolve to nothing.
+        assert!(crate::sched::sysv_msg::all(key).is_empty());
+        assert!(crate::sched::sysv_sem::all(key).is_empty());
+        assert!(crate::mm::sysv_shm::all(key).is_empty());
+        assert!(crate::vfs::mqueue::lookup(key, name).is_none());
+        assert!(crate::sched::sysv_msg::lookup(key, queue.id() as i64).is_none());
+        assert!(crate::sched::sysv_sem::lookup(key, set.id() as i64).is_none());
+        assert!(crate::mm::sysv_shm::lookup(key, segment.id() as i64).is_none());
+
+        // The objects themselves are still alive - a task that *left* the
+        // namespace holds its own reference - which is why dropping the space
+        // cannot free memory somebody is still using.
+        assert_eq!(queue.stats().1, 0);
+        assert_eq!(set.nsems(), 1);
+        // The segment is *marked* destroyed rather than freed: a mapping that
+        // outlived the namespace still holds it, and its frames come back when
+        // that last reference goes (`Segment`'s `Drop`).
+        assert!(segment.is_reapable());
+        assert_eq!(mq.name(), name);
     }
 
     /// The directory's names, pinned as the *complete* list against a measured

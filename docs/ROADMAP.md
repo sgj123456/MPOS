@@ -181,9 +181,11 @@ One-glance status of the whole roadmap.
   message to `EFAULT` as Linux loses it, and `/proc/sysvipc/msg`;
   `t-sysv-msg` pins 74 claims and eight host tests (§6.15, item 103).
   `CLONE_NEWIPC` **landed on 2026-10-23** - the kind moves its caller, the four
-  tables key their state by it, and a number restarts at 0 in a fresh namespace,
-  so the pin compares objects rather than numbers (`t-ns-ipc`, 28 claims, §6.16);
-  `CLONE_NEWCGROUP` is the last kind with nothing behind it
+  tables key their state by it, a number restarts at 0 in a fresh namespace (so
+  the pin compares objects rather than numbers), and the namespace is an `Arc`
+  whose last holder - a task or a `ns/ipc` descriptor - frees those tables
+  (`t-ns-ipc`, 31 claims, §6.16); `CLONE_NEWCGROUP` is the last kind with
+  nothing behind it
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
 - [x] the extensible `clone` door — `clone3` (435) with a versioned argument
   struct, and `CLONE_PIDFD` delivering the child **and a descriptor naming it** in
@@ -385,9 +387,10 @@ In the order that keeps each step verifiable on its own:
    (§6.12-§6.15) and then the namespace itself (§6.16) - `unshare`/`setns` move
    the caller, the four tables are one slot space per namespace, a number
    restarts at 0 inside one, and `t-ns-ipc` holds the pair for all four
-   families. What stays named there: a namespace's tables are not freed when it
-   dies, `clone(CLONE_NEWIPC)` is still refused with every other namespace bit,
-   and **CGROUP** is the last rung - cheap only the day the tree it would
+   families, and the namespace is an `Arc` whose last holder (a task or a
+   descriptor) frees its tables. What stays named there: `clone(CLONE_NEWIPC)`
+   is still refused with every other namespace bit, and **CGROUP** is the last
+   rung - cheap only the day the tree it would
    isolate lands, and worthless before it. Nested namespaces pin the  
    *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were  
    per-namespace but unexercised; `t-ns-net` reads the file on both sides of the boundary now  

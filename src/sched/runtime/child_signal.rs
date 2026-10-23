@@ -820,11 +820,17 @@ pub fn current_net_ns() -> Option<u64> {
 /// back into it (`net` normalises its registry the same way).
 #[cfg(target_os = "none")]
 pub fn current_ipc_ns() -> Option<u64> {
-    let raw = with_table(|t| t.task(t.current).ipc_ns);
-    match raw {
-        Some(id) if id == crate::vfs::ns::machine_ipc_id() => None,
-        other => other,
-    }
+    with_table(|t| {
+        t.task(t.current)
+            .ipc_ns
+            .as_ref()
+            .map(|ns| ns.id())
+            // A descriptor can name the *machine's* namespace, and joining it
+            // must key the machine's tables rather than a space of its own -
+            // `net`'s registry normalises the same way, and a table that missed
+            // it would lose every object on a `setns` back into it.
+            .filter(|id| *id != crate::vfs::ns::machine_ipc_id())
+    })
 }
 
 /// Move the running task into an IPC namespace: `unshare(CLONE_NEWIPC)` and
@@ -833,7 +839,7 @@ pub fn current_ipc_ns() -> Option<u64> {
 /// the table of the namespace it is in now, so an id from the old one answers
 /// `EINVAL` (measured, §6.16).
 #[cfg(target_os = "none")]
-pub fn set_ipc_ns(ns: Option<u64>) {
+pub fn set_ipc_ns(ns: Option<alloc::sync::Arc<crate::vfs::ns::IpcNs>>) {
     with_table(|t| {
         let me = t.current;
         t.task_mut(me).ipc_ns = ns;
@@ -845,8 +851,7 @@ pub fn set_ipc_ns(ns: Option<u64>) {
 /// came from behind.
 #[cfg(target_os = "none")]
 pub fn unshare_ipc() {
-    let id = crate::vfs::ns::mint_owned(current_user_ns());
-    set_ipc_ns(Some(id));
+    set_ipc_ns(Some(crate::vfs::ns::IpcNs::fresh(current_user_ns())));
 }
 
 /// Move the running task into a network namespace: the `clone(CLONE_NEWNET)`
@@ -957,9 +962,7 @@ pub fn ns_of(pid: usize, entry: crate::vfs::ns::Entry) -> Option<crate::vfs::ns:
             ),
             // One slot, and the machine's number for a task that never unshared
             // - the same shape NET has just above.
-            (crate::vfs::ns::Kind::Ipc, _) => crate::vfs::ns::Namespace::Ipc(
-                task.ipc_ns.unwrap_or_else(crate::vfs::ns::machine_ipc_id),
-            ),
+            (crate::vfs::ns::Kind::Ipc, _) => crate::vfs::ns::Namespace::Ipc(task.ipc_ns.clone()),
             // Both slots, and here the two really do differ for a task that has
             // unshared: `time` is the namespace its own clocks come from and
             // `time_for_children` the one the next child will be born under,

@@ -528,6 +528,25 @@ pub fn remove(ns: Option<u64>, id: i64, wake: impl FnMut(TaskId)) -> Option<Arc<
     Some(set)
 }
 
+/// Drop the slot space a **dead** IPC namespace kept, for the reason
+/// [`super::sysv_msg::forget`] gives.
+///
+/// A set an undo record still names stays alive through the record's own `Arc`,
+/// and it is marked removed first so the dying task's exit pass skips it instead
+/// of adding to a value nobody can read any more.
+pub fn forget(ns: Option<u64>) {
+    let gone = critical_section::with(|cs| {
+        let mut table = TABLE.borrow(cs).borrow_mut();
+        let at = table.spaces.iter().position(|space| space.ns == ns)?;
+        Some(table.spaces.remove(at))
+    });
+    if let Some(space) = gone {
+        for set in space.sets.iter().flatten() {
+            set.removed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The waiters
 // ---------------------------------------------------------------------------

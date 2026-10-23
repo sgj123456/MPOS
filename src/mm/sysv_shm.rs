@@ -653,6 +653,29 @@ pub fn reap(segment: &Arc<Segment>, attachments: usize) -> bool {
     })
 }
 
+/// Drop the slot space a **dead** IPC namespace kept, for the reason
+/// [`crate::sched::sysv_msg::forget`] gives.
+///
+/// Dropping the segments' table references cannot lose their pages: a segment
+/// mapped into some address space is kept alive by that mapping's own `Arc`
+/// (which is what [`Segment`]'s `Drop` relies on), so the frames come back
+/// exactly when the last user of them goes - Linux's `shm_file` refcount
+/// doing the same job.
+pub fn forget(ns: Option<u64>) {
+    critical_section::with(|cs| {
+        let mut table = TABLE.borrow(cs).borrow_mut();
+        if let Some(at) = table.spaces.iter().position(|space| space.ns == ns) {
+            // Marked destroyed so that a `shmget` cannot name one of them again
+            // through a reused number, and so the table's own sweep would skip
+            // them if a later space ever claimed the same slots.
+            for segment in table.spaces[at].slots.iter().flatten() {
+                segment.destroy();
+            }
+            table.spaces.remove(at);
+        }
+    });
+}
+
 /// Every destroyed segment still in the table, for a sweep that computes their
 /// attachment counts and reaps the ones at zero.
 pub fn destroyed() -> Vec<Arc<Segment>> {

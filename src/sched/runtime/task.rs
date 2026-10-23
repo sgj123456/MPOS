@@ -761,7 +761,9 @@ pub(crate) struct Task {
     /// four tables key their state by.
     ///
     /// `None` is the machine's own, the value every task carries until something
-    /// unshares. Inherited by reference across `fork`/`clone` (measured: a
+    /// unshares; a real namespace is the **object**, held by `Arc`, so the last
+    /// task to leave it (and the last descriptor naming it) frees the four
+    /// tables' state for it (`docs/notes/` §6.16). Inherited by reference across `fork`/`clone` (measured: a
     /// child's `msgctl` finds its parent's queue), and moved by
     /// `unshare(CLONE_NEWIPC)` and by `setns` on `/proc/<pid>/ns/ipc` - unlike
     /// [`Self::net_ns`], which no live task may leave because a socket's stack
@@ -770,7 +772,7 @@ pub(crate) struct Task {
     /// segment table's, so a task that moves keeps resolving numbers through
     /// the namespace it is in now, and an id from the old one answers `EINVAL`
     /// (measured, §6.16).
-    pub(crate) ipc_ns: Option<u64>,
+    pub(crate) ipc_ns: Option<alloc::sync::Arc<crate::vfs::ns::IpcNs>>,
     /// The namespace this task's **children** are created in - Linux's
     /// `nsproxy->pid_ns_for_children`.
     ///

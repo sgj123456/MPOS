@@ -470,6 +470,27 @@ pub fn remove(ns: Option<u64>, id: i64, wake: impl FnMut(TaskId)) -> Option<Arc<
     Some(queue)
 }
 
+/// Drop the slot space a **dead** IPC namespace kept: its `IpcNs` has lost its
+/// last holder, so no task can name any of these queues again.
+///
+/// The queues are marked removed before the table lets them go, so a waiter that
+/// somehow still held one reads `EIDRM` rather than looking live - though by the
+/// definition of "dead" there is no such waiter: a task asleep on a queue is in
+/// that queue's namespace and holds the namespace, which is the same rule that
+/// makes the `Arc` count a correct liveness test.
+pub fn forget(ns: Option<u64>) {
+    let gone = critical_section::with(|cs| {
+        let mut table = TABLE.borrow(cs).borrow_mut();
+        let at = table.spaces.iter().position(|space| space.ns == ns)?;
+        Some(table.spaces.remove(at))
+    });
+    if let Some(space) = gone {
+        for queue in space.queues.iter().flatten() {
+            queue.removed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The waiters
 // ---------------------------------------------------------------------------

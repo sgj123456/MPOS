@@ -380,8 +380,38 @@ fn main() {
         proc_has_cbytes("7"),
     );
 
+    // --- and the namespace a descriptor names outlives its last member ------
+    // This task left the inner namespace when `setns` moved it, and it was the
+    // only member - but the descriptor taken above still names that namespace,
+    // so joining it again must find the queue it held rather than a fresh,
+    // empty one. That is what a reference count buys, and what a "nobody is in
+    // it" check would get wrong by freeing the tables underneath the
+    // descriptor.
+    let rejoined = match inner_ns.as_ref() {
+        Some((_, file)) => unsafe {
+            libc::syscall(libc::SYS_setns, std::os::fd::AsRawFd::as_raw_fd(file), 0) as i32
+        },
+        None => -1,
+    };
+    r.check(
+        "setns into the empty inner namespace succeeds",
+        rejoined == 0,
+    );
+    r.check(
+        "and the queue it held is still there - the descriptor kept it alive",
+        msg_cbytes(inner) == Some(0) && msgget(KEY, 0o600) == inner,
+    );
+
     // Leave nothing behind in the outer namespace; the inner namespace's objects
-    // go with it when nothing names it any more.
+    // go with it when nothing names it any more. (Back to the outer one first:
+    // its ids are not reachable from here.)
+    let restored = match outer_ns.as_ref() {
+        Some((_, file)) => unsafe {
+            libc::syscall(libc::SYS_setns, std::os::fd::AsRawFd::as_raw_fd(file), 0) as i32
+        },
+        None => -1,
+    };
+    r.check("and back into the outer one to clean up", restored == 0);
     for (id, kind) in [
         (outer, "msg"),
         (marked, "msg"),

@@ -894,7 +894,7 @@ pub fn try_spawn_user(
             // The starter's IPC namespace, by reference: the objects a program
             // is started with are the tables it was started from, which is the
             // rule `fork` follows too.
-            ipc_ns: t.task(parent).ipc_ns,
+            ipc_ns: t.task(parent).ipc_ns.clone(),
             oom_score_adj: t.task(parent).oom_score_adj,
             oom_score_adj_min: t.task(parent).oom_score_adj_min,
             nice: t.task(parent).nice,

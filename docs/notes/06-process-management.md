@@ -2779,14 +2779,37 @@ key, `/proc/sysvipc/*` rendering from the reader's, and the POSIX registry
 recording each queue's namespace beside it while `RLIMIT_MSGQUEUE`'s byte
 accounting stays machine-wide (Linux charges a *user*, not a namespace).
 
+**The leak the first draft left, and its fix** (same day): as landed first, the
+four tables kept a namespace's slot space for ever — nothing told them when a
+namespace lost its last task, so `unshare(CLONE_NEWIPC)` in a loop with a queue
+made each time grew the kernel without bound (`MAX_TASKS` caps tasks, not
+namespaces), which §8.0's panicking allocator turns into a dead machine. A
+*number* cannot answer "is it dead", so the namespace became an **object**: the
+task's slot holds `Option<Arc<IpcNs>>` (`None` is the machine's own, never
+freed), a `/proc/<pid>/ns/ipc` descriptor holds the same `Arc`, and `IpcNs`'s
+`Drop` — the last holder — frees the four tables' spaces for its number. The
+freeing is safe by construction rather than by care: an object a task that
+*left* the namespace still uses keeps its own `Arc` (a mapped segment, a POSIX
+queue an open descriptor names), so dropping the space cannot free memory
+somebody is still reading — and a segment that outlives its namespace is marked
+destroyed, so its frames come back when the last mapping goes. That is Linux's
+`ns_common`/`shm_file` refcount arrangement, arrived at because a membership
+count could be got wrong in the direction that *frees a live table*.
+
+Pinned by two claims on the observable half — `setns` into a namespace whose
+last member left still finds its queue, because the descriptor kept it alive —
+and by a host test, `vfs::ns`'s `the_last_reference_frees_the_ipc_tables`: one
+object in each family, `drop(ns)`, every table's space gone and the objects
+themselves still alive.
+
 **Named, not hidden**:
 
-* **a namespace's tables are never freed.** Nothing tells the four tables when a
-  namespace loses its last task, so its objects stay until the machine ends —
-  bounded by each family's per-space limit and by how many namespaces were ever
-  made. Linux frees them at namespace death; giving this one a death hook is
-  the landing that would close it, and it is named here rather than left to be
-  discovered as a slow leak;
+* **a namespace's objects are the descriptor's to keep, not the namespace's.**
+  The `Drop` above is the whole rule: `setns` after the last member left works
+  and finds the objects, and a namespace nothing names is freed. What remains
+  named is the *other* end — a segment mapped into an address space that never
+  detaches holds its frames until that address space goes, which is Linux's
+  answer too;
 * **`clone(CLONE_NEWIPC)` is still refused**, with every other namespace bit:
   the clone door is a separate decision (§6.3's `handle_unshare` doc says where
   in `copy_process`'s order the copy would happen and what a namespace on a
@@ -2795,17 +2818,19 @@ accounting stays machine-wide (Linux charges a *user*, not a namespace).
 * **`CLONE_NEWCGROUP`** is the last kind with nothing behind it, and it waits on
   the cgroup tree it would hold — named in `docs/ROADMAP.md` as before.
 
-**Pin**: the new `t-ns-ipc`, **28 claims**, every one of them **run against a
+**Pin**: the new `t-ns-ipc`, **31 claims**, every one of them **run against a
 real kernel before it was pointed at this one** (the four failures that caught:
 a number shared across namespaces, `IPC_STAT` with a null buffer reading a live
 object as dead, a link taken before the wrong `unshare`, and a `setns` target
 that was the machine's rather than the namespace the objects were in). On a
 host run without `CAP_SYS_ADMIN` it makes its one claim — an unprivileged
 `unshare(CLONE_NEWIPC)` is `EPERM` — notes that, and exits green, the shape
-`t-ns-time` has. Plus one host test in `sched::sysv_msg`
-(`a_namespace_has_its_own_slot_space`: a fresh space numbers from 0, the same
-key makes a different object, and two objects sharing a number are told apart by
-their handles).
+`t-ns-time` has. Plus two host tests: `sched::sysv_msg`'s
+`a_namespace_has_its_own_slot_space` (a fresh space numbers from 0, the same key
+makes a different object, and two objects sharing a number are told apart by
+their handles) and `vfs::ns`'s `the_last_reference_frees_the_ipc_tables` (the
+counterfactual for the leak: one object in each family, `drop(ns)`, and every
+table's space is gone).
 
 **Also moved with the measurement** — the pins that asserted IPC was *unserved*,
 which is the drift §6.3 records over and over: `t-caps`'s unserved witness and
@@ -2813,7 +2838,7 @@ the whole-word refusals in `t-ns-net`, `t-ns-pid`, `t-ns-uts` and `t-ns-mnt`
 now name `CLONE_NEWCGROUP` (the one kind left), and `t-ns-setns`'s directory
 listing expects the `ipc` name and drops it from its absent list.
 
-**Gate**: x86_64 `pass=205 fail=0` over six lanes, stage 1 `1099 tests, 0
+**Gate**: x86_64 `pass=205 fail=0` over six lanes, stage 1 `1100 tests, 0
 failed`, `mpos-kunit 32 passed, 0 failed`, exit 0. `cargo xtask depgraph` is
 within the ratchet (no edge appeared). The aarch64 arm builds (kernel, loader,
 `clippy` on `aarch64-unknown-none`) but its sweep cannot boot on this host
