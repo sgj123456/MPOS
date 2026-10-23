@@ -5,6 +5,8 @@
 .workbuddy/
 .qoder/
 .codely-cli/
+.commandcode/
+.codeartsdoer/
 .swo
 .swp
 __*__/
