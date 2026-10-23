@@ -732,7 +732,7 @@ pub fn vfork(state: &UserFrame) -> isize {
 ///
 /// A default request is a plain `fork`: no flags, the caller's own stack, no tid
 /// write, the caller's TLS.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct CloneRequest {
     pub flags: usize,
     pub child_stack: usize,
@@ -748,6 +748,17 @@ pub struct CloneRequest {
     /// flag word means, so it decides this too and hands the scheduler an
     /// already-made namespace.
     pub net_ns: Option<u64>,
+    /// The IPC namespace to give the child, or `None` to let it inherit its
+    /// creator's - `CLONE_NEWIPC`'s half, filled in by the syscall layer for the
+    /// same reason [`Self::net_ns`] is: making one means naming the identity
+    /// layer, and `sched` decides nothing about what a flag word means.
+    ///
+    /// Measured on a current host (`.workbuddy/probe_clone_ipc.c`, as root
+    /// inside a user namespace): the **child** moves into the fresh namespace
+    /// and the parent keeps its own - the parent's key still resolves to the
+    /// parent's queue while the child finds the key absent and numbers its first
+    /// queue `0` - and `clone3`'s own flag field behaves identically.
+    pub ipc_ns: Option<alloc::sync::Arc<crate::vfs::ns::IpcNs>>,
     /// The signal the child is born to report - `clone`'s low byte, which the
     /// syscall layer split off the flag word before it got here
     /// (`abi::validate_clone_flags`) and which `wait` reads back through
@@ -1250,7 +1261,7 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // creator's, and the clone door has no `CLONE_NEWIPC` to ask for
             // others (`validate_clone_flags` refuses every namespace bit, and
             // `unshare` is the door this kind is served through).
-            ipc_ns: t.task(parent_id).ipc_ns.clone(),
+            ipc_ns: request.ipc_ns.or_else(|| t.task(parent_id).ipc_ns.clone()),
             oom_score_adj: t.task(parent_id).oom_score_adj,
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
             nice: t.task(parent_id).nice,

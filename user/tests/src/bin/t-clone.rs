@@ -103,7 +103,7 @@
 //! of the mount table), `CLONE_NEWPID` (a namespace to be the child's own init),
 //! `CLONE_NEWNET` (a fresh stack) and `CLONE_NEWUSER` (a fresh user namespace
 //! the child is *born* in) - give the child its own of what the flag names,
-//! while every other kind (`CLONE_NEWIPC`, `CLONE_NEWCGROUP`) is refused whole
+//! while the one kind with nothing behind it (`CLONE_NEWCGROUP`) is refused whole
 //! with `EOPNOTSUPP` rather than handed a child that shares what its flags said
 //! it got its own of. The word is the scheduler's to answer
 //! (`abi::clone_namespace_verdict`), which is why the syscall layer must pass
@@ -332,10 +332,7 @@ fn main() {
     // is what this kernel does not serve *through `clone`*: IPC and cgroup are
     // still named and not built, so the door is refused by name rather than with
     // a wrong errno.
-    let names: &[(&str, usize)] = &[
-        ("IPC", libc::CLONE_NEWIPC as usize),
-        ("CGROUP", libc::CLONE_NEWCGROUP as usize),
-    ];
+    let names: &[(&str, usize)] = &[("CGROUP", libc::CLONE_NEWCGROUP as usize)];
     for (name, bit) in names {
         let ret = probe(libc::SIGCHLD as usize | bit);
         let ok = if mpos_user_tests::host_run() {

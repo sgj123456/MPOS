@@ -484,6 +484,68 @@ fn main() {
     r.check("shmctl's IPC_SET asks the same question", bits & 16 != 0);
     r.check("and semctl's", bits & 32 != 0);
 
+    // --- the clone door gives the *child* a namespace, and keeps ours ------
+    // The other door into a fresh namespace: `clone(CLONE_NEWIPC)` starts a child
+    // in one of its own while the creator stays where it is. The child has a
+    // copy of this address space (no `CLONE_VM`), so it can report through a
+    // pipe; its stack argument is null, which is the fork-shaped spelling - a
+    // caller-supplied stack would make the syscall wrapper return through the
+    // wrong stack.
+    let report = {
+        let mut fds = [0i32; 2];
+        unsafe { libc::pipe(fds.as_mut_ptr()) == 0 }.then(|| fds)
+    };
+    let mut said = [0u8; 8];
+    let mut said_n = 0usize;
+    let mut cloned = -1i32;
+    if let Some([tail, head]) = report {
+        let outer_keyed = msgget(KEY, 0o600);
+        cloned = unsafe {
+            libc::syscall(
+                libc::SYS_clone,
+                (libc::SIGCHLD as usize) | libc::CLONE_NEWIPC as usize,
+                0usize,
+                0usize,
+                0usize,
+                0usize,
+            ) as i32
+        };
+        if cloned == 0 {
+            // Inside the fresh namespace: the creator's key is not here, and a
+            // new queue numbered from 0 is.
+            let absent = msgget(KEY, 0o600) == -1;
+            let fresh = msgget(KEY, 0o600 | IPC_CREAT);
+            let msg: &[u8] = if absent && fresh == 0 {
+                b"fresh\n"
+            } else {
+                b"!fresh\n"
+            };
+            unsafe {
+                libc::write(head, msg.as_ptr().cast(), msg.len());
+                libc::close(head);
+                libc::syscall(libc::SYS_exit_group, 0);
+            }
+            std::process::abort();
+        }
+        unsafe { libc::close(head) };
+        said_n = unsafe { libc::read(tail, said.as_mut_ptr().cast(), said.len()) as usize };
+        unsafe { libc::close(tail) };
+        let mut status = 0;
+        if cloned > 0 {
+            unsafe { libc::waitpid(cloned, &mut status, 0) };
+        }
+        r.check(
+            "clone(CLONE_NEWIPC) starts a child in a namespace of its own",
+            cloned > 0 && said[..said_n].starts_with(b"fresh"),
+        );
+        r.check(
+            "and the creator keeps its own: the key still resolves here",
+            outer_keyed >= 0 && msgget(KEY, 0o600) == outer_keyed,
+        );
+    } else {
+        r.check("the clone report pipe is made", false);
+    }
+
     // --- and the namespace a descriptor names outlives its last member ------
     // This task left the inner namespace when `setns` moved it, and it was the
     // only member - but the descriptor taken above still names that namespace,

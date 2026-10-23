@@ -5638,7 +5638,14 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     the four tables — `src/sched/sysv_{msg,sem}.rs`, `src/mm/sysv_shm.rs`,
     `src/vfs/mqueue.rs` — each a slot space per namespace.
 
-    **Pin**: the new `t-ns-ipc`, **37 claims**, every one run against a real
+    **`clone(CLONE_NEWIPC)` is served too** (same day): the child moves into the
+    fresh namespace and the creator keeps its own (measured,
+    `.workbuddy/probe_clone_ipc.c`), which is one field on a door that already
+    served five kinds - the verdict's `SERVED`, `CloneRequest::ipc_ns`, and the
+    syscall layer minting it where it mints `net_ns`. A thread asking for it
+    stays `EOPNOTSUPP`.
+
+    **Pin**: the new `t-ns-ipc`, **39 claims**, every one run against a real
     kernel before it was pointed at this one, plus two host tests -
     `sched::sysv_msg`'s `a_namespace_has_its_own_slot_space` and `vfs::ns`'s
     `the_last_reference_frees_the_ipc_tables`. The pins that had
@@ -5662,6 +5669,5 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     still finds its queue (`t-ns-ipc`), and `drop(ns)` empties all four tables
     in `vfs::ns`'s host test.
 
-    **Named**: `clone(CLONE_NEWIPC)` is still refused with every other namespace
-    bit (the clone door is unchanged), and `CLONE_NEWCGROUP` is the last kind
-    with nothing behind it.
+    **Named**: `CLONE_NEWCGROUP` is the last kind with nothing behind it, and it
+    waits on the cgroup tree it would isolate.

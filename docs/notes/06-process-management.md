@@ -2810,11 +2810,21 @@ themselves still alive.
   named is the *other* end — a segment mapped into an address space that never
   detaches holds its frames until that address space goes, which is Linux's
   answer too;
-* **`clone(CLONE_NEWIPC)` is still refused**, with every other namespace bit:
-  the clone door is a separate decision (§6.3's `handle_unshare` doc says where
-  in `copy_process`'s order the copy would happen and what a namespace on a
-  thread means), and this landing is `unshare`/`setns` only — `t-clone` still
-  pins its table;
+* **`clone(CLONE_NEWIPC)` is served** (same day, the increment after this
+  landing): measured first (`.workbuddy/probe_clone_ipc.c`, as root inside a
+  user namespace) — the **child** moves into the fresh namespace and the
+  **parent keeps its own**, which is what the pair below the door looks like:
+  the parent's key still resolves to the parent's queue while the child finds it
+  `ENOENT` and numbers its first queue `0`; `clone3`'s own flag field behaves
+  identically. The wiring is one field, because the door already served five
+  kinds: `abi::clone_namespace_verdict` gained the bit, `CloneRequest` gained
+  `ipc_ns`, and the syscall layer mints it — the same place and the same reason
+  `net_ns` is minted there (`sched` must not name the identity layer's tables).
+  A thread asking for it is still `EOPNOTSUPP`, the rule every served kind has.
+  The claims live in `t-ns-ipc` rather than `t-clone`, because a host run of
+  `t-clone` stops at its `CLONE_THREAD|CLONE_NEWNS` claim — Linux *serves* that
+  word and the "thread" takes the process with it, which is the failure its own
+  comment predicts;
 * **`CLONE_NEWCGROUP`** is the last kind with nothing behind it, and it waits on
   the cgroup tree it would hold — named in `docs/ROADMAP.md` as before.
 
@@ -2832,7 +2842,7 @@ recorded as unmeasured rather than claimed. `userns` gained
 one reports `NO_MAP_ID` for both "unmapped" and the real id 65534, and 65534 is
 an ordinary id here (measured).
 
-**Pin**: the new `t-ns-ipc`, **37 claims**, every one of them **run against a
+**Pin**: the new `t-ns-ipc`, **39 claims**, every one of them **run against a
 real kernel before it was pointed at this one** (the four failures that caught:
 a number shared across namespaces, `IPC_STAT` with a null buffer reading a live
 object as dead, a link taken before the wrong `unshare`, and a `setns` target

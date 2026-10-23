@@ -395,26 +395,27 @@ fn main() {
         r.check("and the parent's table stayed clean", !mounts_name(MNT));
     }
 
-    // An unserved kind on `clone` answers the same refusal `unshare` gives it:
-    // SysV IPC has no second instance to hand a child at all. The word is
-    // `libc::CLONE_NEWIPC` rather than a literal, and that is a correction: the
-    // first draft wrote `0x0008_0000` here with `CLONE_NEWPID` in the comment,
-    // which is `CLONE_SETTLS` — so the call started a child with a thread
-    // pointer the register happened to hold, and the guest reported the child's
-    // page fault at `0xfffffffffffffff8` instead of a clean refusal. The word has
-    // moved twice since, once per rung built - PID, then NET - which is the price
-    // of a claim about "the next unserved kind". The errno comes through `fix()`
-    // for the protocol reason above it.
-    let cloned_ipc = fix(unsafe {
+    // An unserved kind on `clone` answers the same refusal `unshare` gives it.
+    // The word is `libc::CLONE_NEWCGROUP` rather than a literal, and that is a
+    // correction: the first draft wrote `0x0008_0000` here with `CLONE_NEWPID` in
+    // the comment, which is `CLONE_SETTLS` — so the call started a child with a
+    // thread pointer the register happened to hold, and the guest reported the
+    // child's page fault at `0xfffffffffffffff8` instead of a clean refusal. The
+    // word has moved once per rung built - PID, then NET, then IPC, which left
+    // this list when `clone(CLONE_NEWIPC)` began giving the child a namespace of
+    // its own (`t-ns-ipc` pins that pair) - which is the price of a claim about
+    // "the next unserved kind". The errno comes through `fix()` for the protocol
+    // reason above it.
+    let cloned_cgroup = fix(unsafe {
         libc::syscall(
             libc::SYS_clone,
-            (libc::CLONE_NEWIPC as usize | libc::SIGCHLD as usize) as libc::c_long,
+            (libc::CLONE_NEWCGROUP as usize | libc::SIGCHLD as usize) as libc::c_long,
             0isize as libc::c_long,
         )
     });
     r.check(
-        "clone(CLONE_NEWIPC) is refused whole, not half-served",
-        cloned_ipc == -(Errno::OPNOTSUPP.raw_os_error() as isize),
+        "clone(CLONE_NEWCGROUP) is refused whole, not half-served",
+        cloned_cgroup == -(Errno::OPNOTSUPP.raw_os_error() as isize),
     );
 
     r.finish()

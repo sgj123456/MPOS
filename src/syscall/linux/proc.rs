@@ -2040,6 +2040,13 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     } else {
         None
     };
+    // The child's IPC namespace, by the same rule and in the same layer: the
+    // child moves, the parent stays (measured, `.workbuddy/probe_clone_ipc.c`).
+    let ipc_ns = if flags & crate::abi::CLONE_NEWIPC != 0 {
+        Some(crate::vfs::ns::IpcNs::fresh(crate::sched::current_user_ns()))
+    } else {
+        None
+    };
     let request = crate::sched::CloneRequest {
         exit_signal: exit_signal as u8,
         flags,
@@ -2047,6 +2054,7 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
         child_tid,
         tls,
         net_ns,
+        ipc_ns,
     };
     let child = crate::sched::clone(&ctx, request);
     if child < 0 {
@@ -2156,6 +2164,11 @@ pub(super) fn handle_clone3(args: [usize; ARG_COUNT], regs_ptr: *mut (), from_us
     } else {
         None
     };
+    let ipc_ns = if plan.flags & crate::abi::CLONE_NEWIPC != 0 {
+        Some(crate::vfs::ns::IpcNs::fresh(crate::sched::current_user_ns()))
+    } else {
+        None
+    };
     let request = crate::sched::CloneRequest {
         exit_signal: plan.exit_signal,
         flags: plan.flags,
@@ -2163,6 +2176,7 @@ pub(super) fn handle_clone3(args: [usize; ARG_COUNT], regs_ptr: *mut (), from_us
         child_tid: plan.child_tid,
         tls: plan.tls,
         net_ns,
+        ipc_ns,
     };
     let child = crate::sched::clone(&ctx, request);
     if child < 0 {
