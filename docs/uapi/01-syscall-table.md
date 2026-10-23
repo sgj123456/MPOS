@@ -98,6 +98,10 @@ A call absent from those is served as its phase section records.
 | `semop` | 65 | ipc | 193 |
 | `semctl` | 66 | ipc | 191 |
 | `shmdt` | 67 | ipc | 197 |
+| `msgget` | 68 | ipc | 186 |
+| `msgsnd` | 69 | ipc | 189 |
+| `msgrcv` | 70 | ipc | 188 |
+| `msgctl` | 71 | ipc | 187 |
 | `fcntl` | 72 | fs | 25 |
 | `flock` | 73 | fs | 32 |
 | `fsync` | 74 | fs | 82 |

@@ -83,6 +83,10 @@ pub const EPERM: isize = -1;
 /// `docs/notes/` §6.14) - it is the one refusal that is about the *object's*
 /// death rather than about the caller or the argument.
 pub const EIDRM: isize = -43;
+/// ENOMSG: no message of the desired type. `msgrcv`'s own refusal - the one a
+/// caller that asked `IPC_NOWAIT` reads when the queue holds nothing its
+/// selection rule accepts (measured on a current host, `docs/notes/` §6.15).
+pub const ENOMSG: isize = -42;
 pub const EOPNOTSUPP: isize = -95;
 pub const EROFS: isize = -30;
 /// EXDEV: a hard link across two filesystems. The one request `link(2)`

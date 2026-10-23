@@ -1419,3 +1419,420 @@ pub fn handle_semctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// System V message queues: `msgget`, `msgsnd`, `msgrcv`, `msgctl`
+// ---------------------------------------------------------------------------
+//
+// The objects are `sched::sysv_msg`'s, and they live there for the reason that
+// module's header gives: both a send on a full queue and a receive with
+// nothing to hand over are *waits*, and the wait is the scheduler's. There is
+// no per-process record at death - the message family has no undo list - so
+// unlike its siblings there is no exit hook at all. Every rule below was
+// measured on a current host first (Linux 7.2.11,
+// `.workbuddy/probe_sysv_msg.c`, `probe_sysv_msg_qbytes.c`; the record is
+// `docs/notes/` §6.15):
+//
+// * the queue is FIFO and *selection* is the receive's rule: `type > 0` names
+//   the first message of that type, `type < 0` names the message of the
+//   **lowest** type that is `<= -type` (with `{4, 10, 1}` queued a `-4` takes
+//   the `1`), and `MSG_EXCEPT` takes the first message of another type;
+// * a message too big for the buffer, without `MSG_NOERROR`, leaves the
+//   message queued: `E2BIG` with `IPC_NOWAIT`, a wait for one that fits
+//   otherwise - the wait is the shape that hangs, and it was found by hanging;
+// * `MSG_COPY` answers by queue index without taking, needs `IPC_NOWAIT`
+//   (`EINVAL` without it) and answers `ENOMSG` past the end;
+// * a send's `msgsz` past `MSGMAX` (8192) is `EINVAL` and a non-positive
+//   `mtype` is `EINVAL`, both before anything is queued; two `MSGMAX`
+//   messages fill a fresh queue's `MSGMNB` (16384) budget and a third is
+//   `EAGAIN` under `IPC_NOWAIT`;
+// * a blocked send or receive is woken by its opposite number, and answers
+//   `EIDRM` when the queue is removed and `EINTR` when a signal arrives;
+// * `IPC_SET`'s `msg_qbytes` above `MSGMNB` is `EPERM` without
+//   `CAP_SYS_RESOURCE`, while a budget *below* the queued bytes - even zero -
+//   is accepted and stored (measured, `probe_sysv_msg_qbytes.c`);
+// * the `msgget` rules are the segment family's: `EEXIST`, `ENOENT`, the
+//   permission question asked of an existing key only when bits were named,
+//   and the mode stored without a umask.
+
+use crate::sched::sysv_msg::{self, MsgError};
+
+/// `msgsnd`'s and `msgrcv`'s `IPC_NOWAIT` (`ipc.h`, not `semop`'s flag).
+const MSG_IPC_NOWAIT: u32 = 0o4000;
+
+/// `msgctl`'s commands, from `linux/msg.h` and `linux/ipc.h`.
+const MSG_STAT: usize = 11;
+const MSG_INFO: usize = 12;
+const MSG_STAT_ANY: usize = 13;
+
+/// `struct msqid64_ds`'s layout, measured on the host: 120 bytes, with the
+/// three clocks at 48/56/64, `cbytes`/`qnum`/`qbytes` at 72/80/88 and the two
+/// pids at 96/100. Unlike `semid64_ds` - which x86_64 pads between its clocks
+/// and asm-generic does not - the message record is the same on both machines:
+/// x86_64's own `asm/msgbuf.h` already carries the time64 padding, so one
+/// table serves both ports.
+const MSQID_DS_BYTES: usize = 120;
+const MSQ_STIME: usize = 48;
+const MSQ_RTIME: usize = 56;
+const MSQ_CTIME: usize = 64;
+const MSQ_CBYTES: usize = 72;
+const MSQ_QNUM: usize = 80;
+const MSQ_QBYTES: usize = 88;
+const MSQ_LSPID: usize = 96;
+const MSQ_LRPID: usize = 100;
+
+/// `struct msginfo`'s eight `int`s, for `IPC_INFO` and `MSG_INFO`.
+const MSGINFO_BYTES: usize = 32;
+
+fn err_of_msg(e: MsgError) -> isize {
+    match e {
+        MsgError::NoEntry => err::ENOENT,
+        MsgError::Exists => err::EEXIST,
+        MsgError::Full => err::ENOSPC,
+        MsgError::TooBig | MsgError::BadType | MsgError::Invalid => err::EINVAL,
+        MsgError::NoMsg => err::ENOMSG,
+        MsgError::TooSmall => err::E2BIG,
+        MsgError::QueueFull => err::EAGAIN,
+    }
+}
+
+/// Whether the running caller may read a queue - `ipcperms` with `S_IRUGO`.
+fn msg_readable(queue: &sysv_msg::Queue) -> bool {
+    let perm = queue.perm();
+    mode_permits(perm.mode, (perm.uid, perm.gid), 0o4)
+}
+
+/// Whether the running caller may write one - `ipcperms` with `S_IWUGO`.
+fn msg_writable(queue: &sysv_msg::Queue) -> bool {
+    let perm = queue.perm();
+    mode_permits(perm.mode, (perm.uid, perm.gid), 0o2)
+}
+
+/// Write one `msqid64_ds`. The caller has validated the range.
+fn write_msqid_ds(at: usize, queue: &sysv_msg::Queue) {
+    let perm = queue.perm();
+    let (cbytes, qnum, qbytes, lspid, lrpid, stime, rtime, ctime) = queue.stats();
+    unsafe { core::ptr::write_bytes(at as *mut u8, 0, MSQID_DS_BYTES) };
+    let put32 = |off: usize, v: u32| unsafe { ((at + off) as *mut u32).write_unaligned(v) };
+    let put64 = |off: usize, v: u64| unsafe { ((at + off) as *mut u64).write_unaligned(v) };
+    put32(0, perm.key as u32);
+    put32(IPC_PERM_UID, perm.uid);
+    put32(IPC_PERM_GID, perm.gid);
+    put32(IPC_PERM_CUID, perm.cuid);
+    put32(IPC_PERM_CGID, perm.cgid);
+    put32(IPC_PERM_MODE, perm.mode);
+    unsafe { ((at + IPC_PERM_SEQ) as *mut u16).write_unaligned(perm.seq) };
+    put64(MSQ_STIME, stime as u64);
+    put64(MSQ_RTIME, rtime as u64);
+    put64(MSQ_CTIME, ctime as u64);
+    put64(MSQ_CBYTES, cbytes as u64);
+    put64(MSQ_QNUM, qnum as u64);
+    put64(MSQ_QBYTES, qbytes as u64);
+    put32(MSQ_LSPID, lspid);
+    put32(MSQ_LRPID, lrpid);
+}
+
+/// `struct msginfo`'s eight `int`s. The two commands differ in the first two
+/// fields only, the message family's own "cursed" pair (the semaphore family's
+/// `write_seminfo` documents the same shape): `IPC_INFO` reports the limits -
+/// `msgpool` as the whole pool in KiB, `msgmap` as `msgmnb` - while `MSG_INFO`
+/// re-purposes them as queues and messages in use. The measured host values
+/// for the shared six: `msgmax` 8192, `msgmnb` 16384, `msgssz` 16, `msgtql`
+/// 16384, `msgseg` 65535; `msgmni` is this kernel's own bound, as `SEMMNI` is
+/// the semaphore family's.
+fn write_msginfo(at: usize, limits: bool) {
+    let (used, messages) = if limits { (0, 0) } else { sysv_msg::totals() };
+    let values: [i32; 8] = [
+        if limits {
+            (sysv_msg::MSGMNI * sysv_msg::MSGMNB / 1024) as i32
+        } else {
+            used as i32
+        }, // msgpool
+        if limits {
+            sysv_msg::MSGMNB as i32
+        } else {
+            messages as i32
+        }, // msgmap
+        sysv_msg::MSGMAX as i32, // msgmax
+        sysv_msg::MSGMNB as i32, // msgmnb
+        sysv_msg::MSGMNI as i32, // msgmni
+        16,                      // msgssz
+        sysv_msg::MSGMNB as i32, // msgtql
+        65_535,                  // msgseg
+    ];
+    unsafe {
+        for (i, value) in values.iter().enumerate() {
+            ((at + i * 4) as *mut i32).write_unaligned(*value);
+        }
+    }
+}
+
+/// Wake every task asleep on a queue - the callback the syscall layer uses,
+/// where the lock the object layer avoids (`crate::sched::wake` takes the task
+/// table, which the object layer's callers may hold).
+fn wake_all(queue: u64) {
+    sysv_msg::wake_waiters(queue, |task| {
+        let _ = crate::sched::wake(task);
+    });
+}
+
+/// `msgget(key, msgflg)`.
+pub fn handle_msgget(args: [usize; ARG_COUNT], _from_user: bool) -> isize {
+    let key = args[0] as i32;
+    let flags = args[1] as i32 as u32;
+    let me = crate::sched::current_owner();
+
+    let new = sysv_msg::New {
+        key,
+        mode: flags & MODE_MASK,
+        uid: me.0,
+        gid: me.1,
+        now: now_secs(),
+    };
+    let created = flags & IPC_CREAT != 0;
+    let exclusive = flags & IPC_EXCL != 0;
+
+    match sysv_msg::get_or_create(new, created, exclusive) {
+        Ok((queue, made_now)) => {
+            // The measured order, the segment family's: only an existing
+            // queue is asked the permission question, and only when the
+            // caller named bits at all.
+            if !made_now && flags & MODE_MASK != 0 {
+                let want = asked_permissions(flags);
+                let perm = queue.perm();
+                if !mode_permits(perm.mode, (perm.uid, perm.gid), want) {
+                    return err::EACCES;
+                }
+            }
+            queue.id() as isize
+        }
+        Err(e) => err_of_msg(e),
+    }
+}
+
+/// `msgsnd(msqid, msgp, msgsz, msgflg)`.
+pub fn handle_msgsnd(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let id = args[0] as i32 as i64;
+    let msgp = args[1];
+    let msgsz = args[2];
+    let flags = args[3] as u32;
+
+    // Linux's own order, measured: the size refusal comes before anything the
+    // queue could say (`8193` bytes is `EINVAL` even on a queue the caller may
+    // not write to).
+    if msgsz > sysv_msg::MSGMAX {
+        return err::EINVAL;
+    }
+    if !buffer_ok(msgp, 8 + msgsz, false, from_user) {
+        return err::EFAULT;
+    }
+    let mtype = unsafe { (msgp as *const i64).read_unaligned() };
+    if mtype <= 0 {
+        return err::EINVAL;
+    }
+    let Some(queue) = sysv_msg::lookup(id) else {
+        return err::EINVAL;
+    };
+    if !msg_writable(&queue) {
+        return err::EACCES;
+    }
+    let mut data = alloc::vec![0u8; msgsz];
+    unsafe { core::ptr::copy_nonoverlapping((msgp + 8) as *const u8, data.as_mut_ptr(), msgsz) };
+
+    let me = crate::sched::current();
+    let pid = crate::sched::current_pid_number();
+    let park = (flags & MSG_IPC_NOWAIT == 0).then_some(me);
+    loop {
+        match sysv_msg::send_attempt(&queue, mtype, data.clone(), now_secs(), pid, park) {
+            sysv_msg::SendAttempt::Done => {
+                // A receiver waiting on this queue looks again.
+                wake_all(queue.id());
+                return 0;
+            }
+            sysv_msg::SendAttempt::Blocked => match sysv_msg::park(me) {
+                crate::sched::WaitEnd::Condition => {
+                    if queue.removed() {
+                        return err::EIDRM;
+                    }
+                }
+                crate::sched::WaitEnd::Deadline => return err::EAGAIN,
+                crate::sched::WaitEnd::Interrupted => return err::EINTR,
+            },
+            sysv_msg::SendAttempt::Refused(e) => return err_of_msg(e),
+        }
+    }
+}
+
+/// `msgrcv(msqid, msgp, msgsz, msgtyp, msgflg)`.
+pub fn handle_msgrcv(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let id = args[0] as i32 as i64;
+    let msgp = args[1];
+    let msgsz = args[2];
+    let msgtyp = args[3] as i64;
+    let flags = args[4] as u32;
+
+    // Linux's own gate, and it is the sign of the `size_t` rather than any
+    // size cap: `do_msgrcv` opens with `if (msqid < 0 || (long) msgsz < 0)
+    // return -EINVAL`, so `LONG_MAX` is accepted and `LONG_MAX + 1` is refused
+    // with the message still queued (measured, `.workbuddy/
+    // probe_msgrcv_bound2.c`). It also has to come first here: the destination
+    // range below is `8 + msgsz`, which wraps for a value whose sign bit is
+    // set and would then validate almost nothing before writing a whole
+    // message through it.
+    if (msgsz as isize) < 0 {
+        return err::EINVAL;
+    }
+    // The one flag-combination Linux refuses outright, before the queue is
+    // looked at: copy mode is a snapshot and cannot wait (measured).
+    if flags & sysv_msg::MSG_COPY != 0 && flags & MSG_IPC_NOWAIT == 0 {
+        return err::EINVAL;
+    }
+    let Some(queue) = sysv_msg::lookup(id) else {
+        return err::EINVAL;
+    };
+    if !msg_readable(&queue) {
+        return err::EACCES;
+    }
+
+    let me = crate::sched::current();
+    let pid = crate::sched::current_pid_number();
+    let park = (flags & MSG_IPC_NOWAIT == 0).then_some(me);
+    loop {
+        match sysv_msg::recv_attempt(&queue, msgtyp, msgsz, flags, now_secs(), pid, park) {
+            sysv_msg::RecvAttempt::Got(mtype, data) => {
+                // A sender waiting for budget looks again whatever happens
+                // next: the message has already left the queue by the time the
+                // copy can fail.
+                wake_all(queue.id());
+                // Linux copies the type word and then the body *after* the
+                // message has been unlinked, so a destination it cannot write
+                // answers `EFAULT` with the message already gone (measured:
+                // `qnum` 1 -> 0 across the failed call). This kernel writes
+                // through a checked range rather than a fault-tolerant copy,
+                // so it validates the same bytes before touching them - and
+                // still drops the message, which is what the caller observes.
+                // The range is the body's actual length, not `msgsz`: past
+                // `MSGMAX` the caller's `msgsz` may be any value up to
+                // `LONG_MAX` and Linux only ever copies the message's own
+                // bytes.
+                if !buffer_ok(msgp, 8 + data.len(), true, from_user) {
+                    return err::EFAULT;
+                }
+                unsafe {
+                    (msgp as *mut i64).write_unaligned(mtype);
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        (msgp + 8) as *mut u8,
+                        data.len(),
+                    );
+                }
+                return data.len() as isize;
+            }
+            sysv_msg::RecvAttempt::Blocked => match sysv_msg::park(me) {
+                crate::sched::WaitEnd::Condition => {
+                    if queue.removed() {
+                        return err::EIDRM;
+                    }
+                }
+                crate::sched::WaitEnd::Deadline => return err::EAGAIN,
+                crate::sched::WaitEnd::Interrupted => return err::EINTR,
+            },
+            sysv_msg::RecvAttempt::Refused(e) => return err_of_msg(e),
+        }
+    }
+}
+
+/// `msgctl(msqid, cmd, buf)`.
+pub fn handle_msgctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
+    let id = args[0] as i32 as i64;
+    let cmd = args[1];
+    let buf = args[2];
+
+    match cmd {
+        IPC_INFO | MSG_INFO => {
+            if !buffer_ok(buf, MSGINFO_BYTES, true, from_user) {
+                return err::EFAULT;
+            }
+            write_msginfo(buf, cmd == IPC_INFO);
+            sysv_msg::highest_slot() as isize
+        }
+        MSG_STAT | MSG_STAT_ANY => {
+            // Linux reads the argument through `ipcid_to_idx` - the number
+            // modulo the generation stride - so a caller may hand it a slot
+            // index (what `ipcs` walks) or a full id; the answer is the id
+            // either way. The first draft indexed it raw, which passed on the
+            // host by luck (every queue there was generation 0) and failed in
+            // the guest, where the sweep reuses slots across programs.
+            let slot = args[0] % crate::mm::ipc_id::SEQ_MULTIPLIER as usize;
+            let Some(queue) = sysv_msg::by_slot(slot as u64) else {
+                return err::EINVAL;
+            };
+            if cmd == MSG_STAT && !msg_readable(&queue) {
+                return err::EACCES;
+            }
+            if !buffer_ok(buf, MSQID_DS_BYTES, true, from_user) {
+                return err::EFAULT;
+            }
+            write_msqid_ds(buf, &queue);
+            queue.id() as isize
+        }
+        _ => {
+            let Some(queue) = sysv_msg::lookup(id) else {
+                return err::EINVAL;
+            };
+            match cmd {
+                IPC_STAT => {
+                    if !msg_readable(&queue) {
+                        return err::EACCES;
+                    }
+                    if !buffer_ok(buf, MSQID_DS_BYTES, true, from_user) {
+                        return err::EFAULT;
+                    }
+                    write_msqid_ds(buf, &queue);
+                    0
+                }
+                IPC_SET => {
+                    // The copy before the question, the measured order the
+                    // other two families keep too.
+                    if !buffer_ok(buf, MSQID_DS_BYTES, false, from_user) {
+                        return err::EFAULT;
+                    }
+                    if !creator_or_admin(queue.perm().cuid) {
+                        return err::EPERM;
+                    }
+                    let uid = unsafe { ((buf + IPC_PERM_UID) as *const u32).read_unaligned() };
+                    let gid = unsafe { ((buf + IPC_PERM_GID) as *const u32).read_unaligned() };
+                    let mode = unsafe { ((buf + IPC_PERM_MODE) as *const u32).read_unaligned() };
+                    let qbytes =
+                        unsafe { ((buf + MSQ_QBYTES) as *const u64).read_unaligned() } as usize;
+                    if qbytes > sysv_msg::MSGMNB {
+                        // Raising the budget past the boot default is the one
+                        // `IPC_SET` ask a capability gates - and the only
+                        // direction it gates: lowering, even below what is
+                        // queued, is every owner's to make (measured).
+                        let capable = crate::sched::ns_capable_of(
+                            &crate::sched::current_user_ns(),
+                            crate::cred::CAP_SYS_RESOURCE,
+                        );
+                        if !capable {
+                            return err::EPERM;
+                        }
+                    }
+                    queue.set_perm(uid, gid, mode, now_secs());
+                    queue.set_qbytes(qbytes, now_secs());
+                    0
+                }
+                IPC_RMID => {
+                    if !creator_or_admin(queue.perm().cuid) {
+                        return err::EPERM;
+                    }
+                    sysv_msg::remove(id, |task| {
+                        crate::sched::wake(task);
+                    });
+                    0
+                }
+                _ => err::EINVAL,
+            }
+        }
+    }
+}

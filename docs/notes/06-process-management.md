@@ -2579,3 +2579,137 @@ failed`, exit 0. The second machine compiles the change (kernel release +
 clippy, and the pin builds for it, with its own `semid64_ds` offsets); its sweep
 could not boot on this host (no DRM render node), so no aarch64 figure is
 claimed.
+
+### 6.15 System V message queues — **LANDED** (2026-10-23, SysV's third and last family)
+
+The fourth door on the IPC namespace's contents: `msgget` (68/186), `msgsnd`
+(69/189), `msgrcv` (70/188) and `msgctl` (71/187) fell through the dispatch to
+`ENOSYS`. Measured on a current host first (Linux 7.2.11,
+`.workbuddy/probe_sysv_msg.c`, `probe_sysv_msg_qbytes.c`, plus two one-off
+probes under `/tmp` recorded here for the `MSG_INFO`/`IPC_INFO` fields and
+`MSG_COPY` without `IPC_NOWAIT`), as root and unprivileged.
+
+**The shapes that are Linux's**:
+
+* **selection is the receive's rule, the queue is FIFO**: `type 0` takes the
+  front; `type > 0` the first of that exact type; `type < 0` the message of
+  the **lowest** type that is `<= -type` — *not* the front-most that fits,
+  which is the reading the first draft had: with `{4, 10, 1}` queued a `-4`
+  takes the `1`. `MSG_EXCEPT` takes the first message of another type;
+* **a receive that cannot fit the message waits**: without `MSG_NOERROR` a
+  matching message bigger than the buffer is neither taken nor refused —
+  `E2BIG` only with `IPC_NOWAIT`, and a wait for one that fits otherwise.
+  This was found by hanging the probe (a 64-byte buffer against an 8192-byte
+  message parked forever), which is the honest way to learn it;
+* `MSG_COPY` answers **by queue index** without taking, requires
+  `IPC_NOWAIT` (`EINVAL` without it, `ENOMSG` past the end);
+* the **byte budget** (`msg_qbytes`, `MSGMNB` 16384 at boot) is what "full"
+  means: two `MSGMAX`-byte messages (8192) fill a fresh queue and a third
+  send is `EAGAIN` under `IPC_NOWAIT` — while a blocking one sleeps until a
+  receive frees room. A non-positive `mtype` and a `msgsz` past `MSGMAX` are
+  both `EINVAL`, the size one before the queue is even looked at;
+* blocking ends three ways: the opposite number's operation (`0`), a
+  handler-bearing signal (`EINTR`), and `IPC_RMID` (`EIDRM`, measured for a
+  blocked send *and* a blocked receive);
+* **`IPC_SET`'s `msg_qbytes` is asymmetric**: above `MSGMNB` it needs
+  `CAP_SYS_RESOURCE` (`EPERM` without it, even for the owner), while a
+  budget **below the queued bytes — even zero — is accepted and stored**
+  (measured twice: the readback is 16 with 8192 queued, then 0). The mode
+  half rewrites uid/gid/mode with no umask, and reads its buffer before it
+  asks who is calling (`EFAULT` first) — the order the segment family keeps;
+* `msqid64_ds` is **120 bytes on both machines** — x86_64's own
+  `asm/msgbuf.h` already carries the time64 padding, so unlike `semid64_ds`
+  (§6.14's trap) one table of offsets serves both ports: the clocks at
+  48/56/64, `cbytes`/`qnum`/`qbytes` at 72/80/88, the pids at 96/100;
+* `/proc/sysvipc/msg`'s header and column widths are the kernel's own,
+  measured character for character (key 10, msqid 11, perms 6, cbytes 12,
+  qnum 11, then sixes and the three 11-wide clocks).
+
+**Two bugs the sweep caught that the host could not** (both are why the gate
+is the gate):
+
+* a blocking `msgrcv` on an **empty** queue panicked the kernel: `select`'s
+  `typ == 0` arm answered index 0 whether or not there was one, and the
+  attempt indexed it. The host tests never hit it (their empty-queue claims
+  were all `IPC_NOWAIT`); lane 5 died mid-test at `t-sysv-msg`'s blocked
+  -receive claim. The fix decides the empty answer where the index is used,
+  and a host test pins it (`a_receive_on_an_empty_queue_waits_or_refuses`);
+* `MSG_STAT` read its argument as a raw slot index; Linux reads it through
+  `ipcid_to_idx` — the number modulo the 32768 stride — so a caller may hand
+  it a slot (what `ipcs` walks) *or* a full id. On the host every queue the
+  probe made was generation 0, so slot == id and the claim passed by luck;
+  the sweep's guest reuses slots across programs, and the claim went red
+  there. The argument is now taken modulo the stride.
+
+**Two receive facts the landing added** — both measured after the first green
+run, both about `msgrcv`'s arguments rather than about its queue:
+
+* the size word is gated by its **sign**, not by a cap: `do_msgrcv` opens with
+  `(long) msgsz < 0` → `EINVAL`, so `LONG_MAX` is accepted and `LONG_MAX + 1`
+  is refused with the message still queued (`.workbuddy/probe_msgrcv_bound2.c`:
+  `9223372036854775807` returns the 5-byte message, `9223372036854775808` is
+  `EINVAL` and `qnum` stays 1). The handler validated `8 + msgsz` instead,
+  which **wraps** for a sign-bit-set `size_t`: a 7-byte range then passes
+  `buffer_ok` and a whole message is written through a pointer nobody checked.
+  The gate is now Linux's own, before the queue is looked at, and the
+  destination range it validates is the message's own length
+  (`8 + data.len()`, at most `8 + MSGMAX`) rather than the caller's `msgsz`,
+  which is what Linux copies;
+* a destination the kernel cannot write is `EFAULT` **after** the message has
+  been unlinked, so the failed call loses it (measured: `qnum` 1 → 0 across a
+  `msgrcv` to the NULL page, `.workbuddy/probe_msgrcv_huge.c`). The first draft
+  validated the destination before taking the message and so left it queued —
+  the kinder answer, and the wrong one: a caller that retries after `EFAULT`
+  re-reads the same message here where Linux hands it the next one, so the
+  retry is a livelock. This kernel has no fault-tolerant copy, so it still
+  validates *before* it writes; it drops the message on failure, which is the
+  half of Linux's ordering a caller can see.
+
+Both are pinned by four claims in `t-sysv-msg` — `a msgsz whose sign bit is set
+is EINVAL, and the message stays queued` (counterfactual: without the gate the
+call returns the message instead of `EINVAL`), `msgsz == LONG_MAX is accepted -
+the gate is the sign, not a size cap`, `a destination that cannot be written is
+EFAULT`, and `and the message it could not write is gone, as Linux loses it`.
+
+**What this kernel chose, and named**: `MSGMNI` 4096 (Linux's 32000) — the
+same §8.0 allocation bound the other two families' tables carry; `MSGMAX`
+8192 and `MSGMNB` 16384, Linux's own numbers, reported through
+`IPC_INFO`/`MSG_INFO` (`IPC_INFO`'s `msgpool` is the pool in KiB and `msgmap`
+repeats `msgmnb`; `MSG_INFO` re-purposes the pair as queues and messages in
+use — the message family's own "cursed fields", the same shape §6.14 recorded
+for the semaphore family's `semusz`/`semaem`).
+
+**Named, not claimed**:
+
+* **`CLONE_NEWIPC` has nothing left to wait on** — all three SysV families
+  and the POSIX queue half are served — but the namespace itself is still
+  refused: each family's table is the machine's, not a namespace's, and
+  threading the tables through the namespace object is the landing that
+  follows from this one;
+* `MSG_STAT_ANY` is served but not claimed by the pin (the pin walks
+  `MSG_STAT`);
+* `IPC_SET` stores whatever uid/gid the record names; Linux maps the id
+  through the caller's user namespace first and answers `EINVAL` for one it
+  does not cover (`make_kuid`'s validity check — measured on a host whose own
+  namespace maps a single id, where renaming a queue to uid 0 is `EINVAL` and
+  the same record's own ids are accepted). The sweep's guest runs in the
+  initial namespace, which maps every id, so a pin for this has to build a
+  namespace of its own first (`unshare(CLONE_NEWUSER)` and a `uid_map`) — that
+  is the claim this line waits on, and until it exists this kernel is more
+  permissive than Linux for a caller that holds such a namespace;
+* a negative `msgtyp` under `MSG_COPY` answers `ENOMSG` here; Linux's own
+  answer for it was not measured (the host probe only walked non-negative
+  indices).
+
+**Pin**: the new `t-sysv-msg`, **74 claims** (67 green on an unprivileged host
+run plus seven that need root — the six another-user claims and `IPC_SET`'s id
+rewrite — each skipped with a line when root is absent, the shape
+`t-reboot-libc` set), plus eight host tests in `sched::sysv_msg`.
+
+**Gate**: x86_64 `pass=204 fail=0` over six lanes, stage 1's host suites
+`1098 tests, 0 failed`, `mpos-kunit 32 passed, 0 failed`, exit 0 (the sweep's
+own QEMU exit is 33). The aarch64 arm **builds** — kernel, loader and the pin
+(`cargo xtask build --arch aarch64`, release, and `clippy` on
+`aarch64-unknown-none`) — but its sweep could not boot on this host: QEMU
+stops at `egl: no drm render node available` before the guest prints a line,
+the same host limit §6.14 recorded, so no aarch64 figure is claimed.

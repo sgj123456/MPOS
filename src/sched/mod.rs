@@ -10,6 +10,11 @@ pub mod fs;
 pub mod futex;
 pub mod policy;
 pub mod signal;
+/// System V message queues: the queue table, the receive's selection rules,
+/// and the two waits a queue can hold a task in (full on a send, empty on a
+/// receive). Host-compiled like its siblings - the selection arithmetic is
+/// testable without a machine, and only the sleeping is not.
+pub mod sysv_msg;
 /// System V semaphores: the set table, the operations and their waiters, and
 /// the per-process `SEM_UNDO` list. Host-compiled like `futex` - the table's
 /// arithmetic is testable without a machine, and only the sleeping is not.

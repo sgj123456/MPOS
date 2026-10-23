@@ -256,6 +256,12 @@ mod tests {
         assert_eq!(SEMOP, 65);
         assert_eq!(SEMCTL, 66);
         assert_eq!(SEMTIMEDOP, 220);
+        // The message-queue four, contiguous here and on asm-generic, though
+        // the order differs: `msgctl` sits before `msgrcv` there.
+        assert_eq!(MSGGET, 68);
+        assert_eq!(MSGSND, 69);
+        assert_eq!(MSGRCV, 70);
+        assert_eq!(MSGCTL, 71);
     }
 
     /// `clone(2)`: the flag bits, as the same table numbers them. The

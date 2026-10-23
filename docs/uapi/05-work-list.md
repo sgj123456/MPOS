@@ -5556,3 +5556,63 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     own carrying its records (measured to match Linux for a single process; the
     sibling-sharing case is unpinned). `SEM_STAT_ANY` is served but not claimed
     by the pin.
+
+## item 103 — System V message queues: the last family `CLONE_NEWIPC` was waiting on
+
+    `msgget` (68/186), `msgsnd` (69/189), `msgrcv` (70/188) and `msgctl`
+    (71/187) fell through the dispatch to `ENOSYS` - SysV's third family and
+    the last thing standing in front of `CLONE_NEWIPC`'s contents. Measured on
+    a current host first (Linux 7.2.11, `.workbuddy/probe_sysv_msg.c`,
+    `probe_sysv_msg_qbytes.c`), recorded with the evidence in §6.15. The
+    shapes that are Linux's and are now served: the queue is FIFO and
+    *selection* is the receive's rule (`type 0` front, `type > 0` first of
+    that type, `type < 0` the **lowest** type `<= -type`, `MSG_EXCEPT` another
+    type); a receive that cannot fit the message without `MSG_NOERROR` waits
+    for one that fits (`E2BIG` only under `IPC_NOWAIT`); `MSG_COPY` answers by
+    queue index without taking, needs `IPC_NOWAIT` and answers `ENOMSG` past
+    the end; the byte budget (`msg_qbytes`, 16384) is what "full" means
+    (`EAGAIN` under `IPC_NOWAIT`, a wake from the receive otherwise), a
+    non-positive `mtype` and a `msgsz` past `MSGMAX` are `EINVAL`; a blocked
+    send or receive ends on its opposite number, `EINTR`, or `EIDRM`; the
+    receive's `msgsz` is gated by its **sign** (`LONG_MAX` accepted,
+    `LONG_MAX + 1` `EINVAL` with the message still queued) and a destination
+    it cannot write is `EFAULT` **after** the message has been taken, so the
+    failed call loses it;
+    `IPC_SET` reads its buffer first, rewrites uid/gid/mode, needs
+    `CAP_SYS_RESOURCE` for a `msg_qbytes` **raise** and accepts a lowering
+    below the queued bytes; the triads gate send/receive/`IPC_STAT`
+    (`EACCES`) and the creator or `CAP_SYS_ADMIN` gates
+    `IPC_SET`/`IPC_RMID` (`EPERM`); and `/proc/sysvipc/msg` prints the header
+    and columns `ipcs` parses. `msqid64_ds` is 120 bytes on both machines -
+    x86_64's own `msgbuf.h` already carries the time64 padding, so one offset
+    table serves both ports where `semid64_ds` needed two.
+
+    **Owner**: `src/sched/sysv_msg.rs` (the queue table, the send/receive
+    operations with selection, the waiter table), `src/syscall/linux/ipc.rs`
+    (the four doors and `msgctl`'s command vocabulary),
+    `crates/cred` (`CAP_SYS_RESOURCE`), `crates/err` (`ENOMSG`) and
+    `src/vfs/procfs.rs` (`/proc/sysvipc/msg`).
+
+    **Pin**: the new `t-sysv-msg`, **74 claims** (67 green on an
+    unprivileged host run; seven more need root - the six another-user claims
+    and `IPC_SET`'s id rewrite - and are skipped with a line when it is
+    absent), plus eight host tests in `sched::sysv_msg` - the host tests pin
+    the selection rules, the budget, the wait-or-truncate fit rule, copy mode
+    and the empty-queue wait the first draft panicked on.
+
+    **Gate**: x86_64 `pass=204 fail=0`, stage 1's host suites `1098 tests, 0
+    failed`, `mpos-kunit 32 passed, 0 failed`, exit 0 (the sweep's own QEMU
+    exit is 33). The aarch64 arm builds - kernel, loader, the pin and
+    `clippy` - but its sweep could not boot on this host (`egl: no drm render
+    node available`, the limit §6.14 recorded), so no aarch64 figure is
+    claimed; §6.15 carries that line.
+
+    **Named**: `CLONE_NEWIPC` is still refused - nothing its isolation would
+    cover is missing any more, but each family's table is the machine's
+    rather than a namespace's; threading the tables through the namespace
+    object is the next landing. `MSGMNI` is 4096 here where Linux's is 32000.
+    `IPC_SET` stores the uid/gid the record names where Linux first maps the
+    id through the caller's user namespace and refuses an uncovered one with
+    `EINVAL` (pinned only once a claim builds a namespace of its own).
+    `MSG_STAT_ANY` is served but not claimed. A negative `msgtyp` under
+    `MSG_COPY` answers `ENOMSG` (Linux's own answer unmeasured).

@@ -540,6 +540,12 @@ pub unsafe fn dispatch(
         nr::SEMOP => ipc::handle_semop(args, from_user),
         nr::SEMTIMEDOP => ipc::handle_semtimedop(args, from_user),
         nr::SEMCTL => ipc::handle_semctl(args, from_user),
+        // --- System V message queues: the last of the three families
+        // `CLONE_NEWIPC` was waiting on ---
+        nr::MSGGET => ipc::handle_msgget(args, from_user),
+        nr::MSGSND => ipc::handle_msgsnd(args, from_user),
+        nr::MSGRCV => ipc::handle_msgrcv(args, from_user),
+        nr::MSGCTL => ipc::handle_msgctl(args, from_user),
         // --- the POSIX completion set ---
         //
         // The descriptor-backed timer and the interest-list multiplexer:

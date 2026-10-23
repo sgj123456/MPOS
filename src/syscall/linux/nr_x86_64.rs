@@ -208,6 +208,13 @@ pub const SEMGET: u64 = 64;
 pub const SEMOP: u64 = 65;
 pub const SEMCTL: u64 = 66;
 pub const SEMTIMEDOP: u64 = 220;
+// The System V message-queue family, in the same block: 68 through 71, and
+// contiguous on the asm-generic ABI too (186..=189, in a different order -
+// `msgctl` before `msgrcv` before `msgsnd` there).
+pub const MSGGET: u64 = 68;
+pub const MSGSND: u64 = 69;
+pub const MSGRCV: u64 = 70;
+pub const MSGCTL: u64 = 71;
 pub const PPOLL: u64 = 271;
 pub const SCHED_YIELD: u64 = 24; // sched_yield(2)
 pub const CLEANUP_AFTER_KTHREAD: u64 = 999;

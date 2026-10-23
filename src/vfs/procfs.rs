@@ -3301,6 +3301,41 @@ pub fn sysvipc_sem_text() -> String {
     out
 }
 
+/// The header `/proc/sysvipc/msg` starts with, measured character for
+/// character on a current host - the widths are the kernel's, and `ipcs`
+/// splits a line on them.
+const SYSVIPC_MSG_HEADER: &str = "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n";
+
+/// `/proc/sysvipc/msg`: one line per queue, in the kernel's `ipcs` layout.
+///
+/// The columns are the `msqid64_ds` counters - bytes queued, messages queued -
+/// the two pids, and the three clocks, `stime` (last send) through `ctime`.
+pub fn sysvipc_msg_text() -> String {
+    let mut out = String::from(SYSVIPC_MSG_HEADER);
+    for queue in crate::sched::sysv_msg::all() {
+        let perm = queue.perm();
+        let (cbytes, qnum, _qbytes, lspid, lrpid, stime, rtime, ctime) = queue.stats();
+        out.push_str(&alloc::format!(
+            "{:10}{:11}{:6o}{:12}{:11}{:6}{:6}{:6}{:6}{:6}{:6}{:11}{:11}{:11}\n",
+            perm.key,
+            perm.id,
+            perm.mode,
+            cbytes,
+            qnum,
+            lspid,
+            lrpid,
+            perm.uid,
+            perm.gid,
+            perm.cuid,
+            perm.cgid,
+            stime,
+            rtime,
+            ctime,
+        ));
+    }
+    out
+}
+
 /// Name the caller's namespace's domain. `setdomainname(2)` lands here, and so
 /// does a write to `/proc/sys/kernel/domainname`.
 pub fn set_domainname(name: &str) {
@@ -3603,6 +3638,7 @@ impl ProcFs {
         let sysvipc = dir();
         sysvipc.add("shm", NodeKind::File, file(sysvipc_shm_text));
         sysvipc.add("sem", NodeKind::File, file(sysvipc_sem_text));
+        sysvipc.add("msg", NodeKind::File, file(sysvipc_msg_text));
         self.root.add("sysvipc", NodeKind::Dir, sysvipc);
 
         // `/proc/bus/pci`: pciutils' fallback access method, and the one

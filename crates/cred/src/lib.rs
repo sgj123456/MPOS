@@ -115,6 +115,10 @@ pub const CAP_IPC_OWNER: u32 = 14;
 /// the `SHM_LOCKED` bit. The bit is kept here for the documented gate and for
 /// `mlock`'s own, which does ask it.
 pub const CAP_IPC_LOCK: u32 = 15;
+/// `CAP_SYS_RESOURCE`, which raising a message queue's `msg_qbytes` past the
+/// boot default asks (measured on a current host: without it the raise is
+/// `EPERM`, `.workbuddy/probe_sysv_msg_qbytes.c`, `docs/notes/` §6.15).
+pub const CAP_SYS_RESOURCE: u32 = 12;
 /// `CAP_SYS_CHROOT`, which `chroot(2)` requires.
 pub const CAP_SYS_CHROOT: u32 = 18;
 /// `CAP_SYS_ADMIN`, which the namespace `unshare`/`setns` family requires.
