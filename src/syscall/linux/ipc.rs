@@ -933,7 +933,16 @@ pub fn handle_shmctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // number a caller holds. `SHM_STAT` refuses a segment the caller may not
         // read and `SHM_STAT_ANY` does not, which is the only difference.
         SHM_STAT | SHM_STAT_ANY => {
-            let Some(segment) = sysv_shm::by_slot(ns, args[0] as u64) else {
+            // The argument is read through `ipcid_to_idx`, the message family's
+            // rule and the same open question (`MSG_STAT`'s comment above): what
+            // is settled for this family is the *permission* split, and it is
+            // the reverse of the message family's - measured twice with a
+            // verified mode, `.workbuddy/probe_stat_perm.c`: `SHM_STAT` answers
+            // a mode-`0000` segment and `SHM_STAT_ANY` refuses it `EACCES`.
+            // That is this host's own oddity and it is *named* rather than
+            // mirrored, because nothing explains it.
+            let slot = args[0] % crate::mm::ipc_id::SEQ_MULTIPLIER as usize;
+            let Some(segment) = sysv_shm::by_slot(ns, slot as u64) else {
                 return err::EINVAL;
             };
             if cmd == SHM_STAT && !ipc_permitted(&segment, 0o4) {
@@ -1312,7 +1321,15 @@ pub fn handle_semctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
         // The by-index reports `ipcs` walks: the first argument is a slot, not a
         // number a caller holds, and the answer is the set's id.
         SEM_STAT | SEM_STAT_ANY => {
-            let Some(set) = sysv_sem::by_slot(ns, args[0] as u64) else {
+            // The argument is read through `ipcid_to_idx`, as in the other two
+            // families. This host could not separate the two forms for a *set*
+            // at all - every id it made came out generation 0, where a slot and
+            // a full id are the same number - so the form is inherited rather
+            // than claimed, and the permission split is the message family's
+            // (reproduced twice: `SEM_STAT` asks read permission, `SEM_STAT_ANY`
+            // does not).
+            let slot = args[0] % crate::mm::ipc_id::SEQ_MULTIPLIER as usize;
+            let Some(set) = sysv_sem::by_slot(ns, slot as u64) else {
                 return err::EINVAL;
             };
             if cmd == SEM_STAT && !sem_readable(&set) {
@@ -1813,6 +1830,16 @@ pub fn handle_msgctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             // either way. The first draft indexed it raw, which passed on the
             // host by luck (every queue there was generation 0) and failed in
             // the guest, where the sweep reuses slots across programs.
+            //
+            // **The argument form is not settled by measurement.** Two probes on
+            // the same host disagreed about whether a *slot* is accepted by the
+            // plain `MSG_STAT` at all - `.workbuddy/probe_stat_gen.c` had it
+            // `EINVAL` on a generation-nonzero queue while
+            // `probe_stat_key.c` had the same call answer the full id - and
+            // neither explains the other, so this keeps the reduction that
+            // accepts both forms and names the question open in `docs/notes/`
+            // §6.16 rather than claiming an answer. What *is* settled and pinned
+            // is the permission split below.
             let slot = args[0] % crate::mm::ipc_id::SEQ_MULTIPLIER as usize;
             let Some(queue) = sysv_msg::by_slot(ns, slot as u64) else {
                 return err::EINVAL;

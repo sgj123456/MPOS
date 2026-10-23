@@ -179,7 +179,7 @@ One-glance status of the whole roadmap.
   queued bytes is accepted), a receive's `msgsz` gated by its sign (`LONG_MAX`
   accepted, `LONG_MAX + 1` `EINVAL`) with an unwritable destination losing the
   message to `EFAULT` as Linux loses it, and `/proc/sysvipc/msg`;
-  `t-sysv-msg` pins 74 claims and eight host tests (§6.15, item 103).
+  `t-sysv-msg` pins 84 claims and eight host tests (§6.15, item 103).
   `CLONE_NEWIPC` **landed on 2026-10-23** - the kind moves its caller, the four
   tables key their state by it, a number restarts at 0 in a fresh namespace (so
   the pin compares objects rather than numbers), and the namespace is an `Arc`

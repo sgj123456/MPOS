@@ -76,6 +76,7 @@ const IPC_SET: i32 = 1;
 const IPC_STAT: i32 = 2;
 const IPC_INFO: i32 = 3;
 const MSG_STAT: i32 = 11;
+const MSG_STAT_ANY: i32 = 13;
 const MSG_INFO: i32 = 12;
 
 const IPC_PRIVATE: i32 = 0;
@@ -425,6 +426,21 @@ fn main() {
         "MSG_COPY without IPC_NOWAIT is EINVAL",
         msgrcv(s, &mut m, 8, 0, MSG_COPY) == -1 && errno() == libc::EINVAL,
     );
+    // The index is a count, and every shape of "not there" answers `ENOMSG`
+    // rather than `EINVAL` - a negative index included (measured, `probe_stat_any.c`:
+    // -1 and `INT_MAX` both answer 42, and the queue is untouched).
+    r.check(
+        "MSG_COPY with a negative index is ENOMSG, not EINVAL",
+        msgrcv(s, &mut m, 8, -1, MSG_COPY | IPC_NOWAIT) == -1 && errno() == libc::ENOMSG,
+    );
+    r.check(
+        "and a huge one too",
+        msgrcv(s, &mut m, 8, 0x7fff_ffff, MSG_COPY | IPC_NOWAIT) == -1 && errno() == libc::ENOMSG,
+    );
+    r.check(
+        "no copy attempt took anything: both are still queued",
+        stat(s).is_some_and(|d| d.u64_at(MSQ_QNUM) == 2),
+    );
 
     // --- the counters and IPC_SET -----------------------------------------
     msgctl_raw(s, IPC_RMID, 0);
@@ -554,6 +570,82 @@ fn main() {
         "MSG_STAT on a freed slot is EINVAL",
         msgctl_raw(gone, MSG_STAT, ds.ptr()) == -1 && errno() == libc::EINVAL,
     );
+
+    // The commands' *argument form* is deliberately not claimed here: two
+    // probes on the same host disagreed about whether the plain `MSG_STAT`
+    // accepts a slot index at all (`.workbuddy/probe_stat_gen.c` said `EINVAL`,
+    // `probe_stat_key.c` answered the full id), so these claims ask only what
+    // both readings agree on - the full id works, and the `_ANY` spelling
+    // accepts the slot - and the question is named open in `docs/notes/` §6.16.
+    let reused = msgget(key(41), 0o600 | IPC_CREAT);
+    msgctl_raw(reused, IPC_RMID, 0);
+    let reused = msgget(key(41), 0o600 | IPC_CREAT);
+    let reused_slot = reused % 32768;
+    r.check(
+        "the reused slot's queue has a nonzero generation",
+        reused >= 32768,
+    );
+    let mut gds = Ds::zeroed();
+    r.check(
+        "MSG_STAT takes the full id",
+        msgctl_raw(reused, MSG_STAT, gds.ptr()) == reused as i64,
+    );
+
+    r.check(
+        "MSG_STAT_ANY answers the same queue from its slot",
+        msgctl_raw(reused_slot, MSG_STAT_ANY, gds.ptr()) == reused as i64,
+    );
+
+    // And the permission split: `MSG_STAT` asks read permission, `MSG_STAT_ANY`
+    // does not - which is the whole reason the `_ANY` spelling exists (ipcs and
+    // monitoring tools must see a queue they may not read). A mode of `0000`
+    // refuses even the owner, which is what makes it the witness - but *only*
+    // for a caller without `CAP_IPC_OWNER` over the queue's user namespace, so
+    // the question is asked in a child that has dropped to nobody: root in a
+    // fresh machine has the capability and Linux serves it, which is the half
+    // the first draft of this claim missed.
+    msgctl_raw(reused, IPC_STAT, gds.ptr());
+    gds.bytes[PERM_MODE..PERM_MODE + 4].copy_from_slice(&0u32.to_ne_bytes());
+    r.check(
+        "the mode is set to 0000 for the permission claim",
+        msgctl_raw(reused, IPC_SET, gds.ptr()) == 0,
+    );
+    let unprivileged = unsafe { libc::fork() };
+    if unprivileged == 0 {
+        unsafe {
+            libc::setgid(65534);
+            libc::setuid(65534);
+        }
+        let mut d = Ds::zeroed();
+        let mut code = 0i32;
+        if msgctl_raw(reused, MSG_STAT, d.ptr()) == -1 && errno() == libc::EACCES {
+            code |= 1;
+        }
+        if msgctl_raw(reused_slot, MSG_STAT_ANY, d.ptr()) == reused as i64 {
+            code |= 2;
+        }
+        if msgctl_raw(reused, IPC_STAT, d.ptr()) == -1 && errno() == libc::EACCES {
+            code |= 4;
+        }
+        unsafe { libc::_exit(code) };
+    }
+    let mut status = 0;
+    unsafe { libc::waitpid(unprivileged, &mut status, 0) };
+    let code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        0x7f
+    };
+    r.check(
+        "MSG_STAT on a queue nobody may read is EACCES",
+        code & 1 != 0,
+    );
+    r.check("MSG_STAT_ANY answers it anyway", code & 2 != 0);
+    r.check(
+        "while IPC_STAT asks the same question, for contrast",
+        code & 4 != 0,
+    );
+    msgctl_raw(reused, IPC_RMID, 0);
 
     // --- /proc/sysvipc/msg -------------------------------------------------
     let p = Msg::of(7, 3, b'l');

@@ -2686,8 +2686,27 @@ for the semaphore family's `semusz`/`semaem`).
   refused: each family's table is the machine's, not a namespace's, and
   threading the tables through the namespace object is the landing that
   follows from this one;
-* `MSG_STAT_ANY` is served but not claimed by the pin (the pin walks
-  `MSG_STAT`);
+* `MSG_STAT_ANY` **is** claimed now, and so is a permission split that is worth
+  writing down twice-measured (`.workbuddy/probe_stat_perm.c`, mode `0000` read
+  back after the `IPC_SET` to prove it landed): `MSG_STAT` refuses a queue nobody
+  may read with `EACCES` and `MSG_STAT_ANY` answers it - which is what the `_ANY`
+  spelling exists for - while for **`shmctl` the split is the other way round**:
+  `SHM_STAT` answers a mode-`0000` segment and `SHM_STAT_ANY` refuses it
+  `EACCES`. That second one is this host's own oddity, reproduced but not
+  explained, so it is *named* here and this kernel keeps the family-consistent
+  split (STAT asks read permission, ANY does not) rather than mirroring
+  something nothing accounts for;
+* **the `MSG_STAT` argument form is not settled.** Two probes on the same host
+  disagree: a generation-nonzero queue whose slot was handed to `MSG_STAT`
+  answered `EINVAL` (`.workbuddy/probe_stat_gen.c`) and, in a second run of the
+  same shape, the full id (`.workbuddy/probe_stat_key.c`). Neither explains the
+  other, so this kernel keeps the reading `ipcid_to_idx` (a slot *or* a full id
+  is accepted, the number is reduced modulo the stride) and the pin asks only
+  what both readings agree on; a claim that a slot is `EINVAL` would have been
+  a guess dressed as a measurement, which is the shape §13.15 warns about;
+* `MSG_COPY`'s index shapes are measured now and the pin holds them: past the
+  end, **negative** (`-1`) and `INT_MAX` all answer `ENOMSG` and none of them
+  takes a message (`.workbuddy/probe_stat_any.c`);
 * `IPC_SET` stores whatever uid/gid the record names; Linux maps the id
   through the caller's user namespace first and answers `EINVAL` for one it
   does not cover (`make_kuid`'s validity check — measured on a host whose own
@@ -2701,8 +2720,8 @@ for the semaphore family's `semusz`/`semaem`).
   answer for it was not measured (the host probe only walked non-negative
   indices).
 
-**Pin**: the new `t-sysv-msg`, **74 claims** (67 green on an unprivileged host
-run plus seven that need root — the six another-user claims and `IPC_SET`'s id
+**Pin**: the new `t-sysv-msg`, **84 claims** (76 green on an unprivileged host
+run plus eight that need root — the six another-user claims and `IPC_SET`'s id
 rewrite — each skipped with a line when root is absent, the shape
 `t-reboot-libc` set), plus eight host tests in `sched::sysv_msg`.
 

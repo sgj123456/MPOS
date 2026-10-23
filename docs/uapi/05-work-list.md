@@ -5595,10 +5595,10 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     `crates/cred` (`CAP_SYS_RESOURCE`), `crates/err` (`ENOMSG`) and
     `src/vfs/procfs.rs` (`/proc/sysvipc/msg`).
 
-    **Pin**: the new `t-sysv-msg`, **74 claims** (67 green on an
-    unprivileged host run; seven more need root - the six another-user claims
-    and `IPC_SET`'s id rewrite - and are skipped with a line when it is
-    absent), plus eight host tests in `sched::sysv_msg` - the host tests pin
+    **Pin**: the new `t-sysv-msg`, **84 claims** (76 green on an
+    unprivileged host run; eight more need root - the six another-user claims,
+    `IPC_SET`'s id rewrite and the permission split asked from a dropped
+    child - and are skipped with a line when it is absent), plus eight host tests in `sched::sysv_msg` - the host tests pin
     the selection rules, the budget, the wait-or-truncate fit rule, copy mode
     and the empty-queue wait the first draft panicked on.
 
@@ -5613,8 +5613,13 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     cover is missing any more, but each family's table is the machine's
     rather than a namespace's; threading the tables through the namespace
     object is the next landing. `MSGMNI` is 4096 here where Linux's is 32000.
-    `MSG_STAT_ANY` is served but not claimed. A negative `msgtyp` under
-    `MSG_COPY` answers `ENOMSG` (Linux's own answer unmeasured).
+    `MSG_STAT_ANY` is claimed now, together with the permission split (`MSG_STAT`
+    asks read permission and the `_ANY` spelling does not; `shmctl`'s split is
+    the reverse on a measured host and is named, not mirrored). A negative or
+    huge `msgtyp` under `MSG_COPY` is `ENOMSG` and takes nothing - measured, and
+    pinned. The `MSG_STAT` *argument form* (slot versus full id) is left open:
+    two probes on one host disagreed, so the kernel keeps the reduction that
+    accepts both and §6.16 says why.
 
 ## item 104 — `CLONE_NEWIPC`: the seventh namespace kind, and the last thing `ipcs` waited on
 
