@@ -1357,6 +1357,19 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             trace: Tracing::default(),
         });
 
+        // Where a process child's `clear_child_tid` word lives. Linux records it
+        // for **any** `clone` that names `CLONE_CHILD_CLEARTID`, the fork-shaped
+        // one included, and a `clone` child reads it back through
+        // `PR_GET_TID_ADDRESS` - which is how `t-prctl`'s claim found that this
+        // path never set it while the thread path did (`docs/notes/` §6.20).
+        if request.flags & crate::abi::CLONE_CHILD_CLEARTID != 0 {
+            t.tasks[slot]
+                .as_ref()
+                .expect("the child was just built")
+                .mm
+                .set_clear_tid(request.child_tid);
+        }
+
         let child_id = TaskId(slot);
         // A child born into a tracer's hands does not go on the ready queue: it
         // is stopped, and letting it run would be the one thing that stop exists
@@ -1989,6 +2002,20 @@ pub fn exit_group(code: isize) -> ! {
 
 /// Name where the running task's exit is announced: the address a leaving
 /// thread writes zero to and wakes, which is what a joiner sleeps on.
+/// The running task's `clear_child_tid` word, or 0 when `clone` never gave it
+/// one - `PR_GET_TID_ADDRESS`'s whole answer.
+///
+/// Measured on a current host (`.workbuddy/probe_tidaddr.c`): a `clone` child
+/// with `CLONE_CHILD_CLEARTID` reads back exactly the address its creator passed
+/// as `child_tid`, a plain process answers 0 (a libc may have set one for its own
+/// bookkeeping, which is why the value is a *report* and not a constant), and the
+/// call refuses a pointer it cannot write with `EFAULT` while ignoring arguments
+/// past the second.
+#[cfg(target_os = "none")]
+pub fn current_tid_address() -> usize {
+    with_table(|t| t.task(t.current).mm.clear_tid().unwrap_or(0))
+}
+
 pub fn set_clear_tid(address: usize) {
     with_table(|t| t.task(t.current).mm.set_clear_tid(address));
 }

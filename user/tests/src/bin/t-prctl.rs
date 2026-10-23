@@ -532,6 +532,80 @@ fn main() {
         _ => r.check("the parent-death report pipes are made", false),
     }
 
+    // === where the clear-tid word lives ======================================
+    // `PR_GET_TID_ADDRESS` reports the address `clone(CLONE_CHILD_CLEARTID)` was
+    // given, which is state this kernel already keeps for the clear itself.
+    // Measured on a current host (`.workbuddy/probe_tidaddr.c`): a clone child
+    // reads back exactly the `child_tid` its creator passed, a pointer that
+    // cannot be written is `EFAULT`, and arguments past the second are ignored.
+    // The plain-process value is *not* claimed: a libc may set one for its own
+    // bookkeeping (glibc does), so "0 on a fresh process" is a property of the
+    // libc and not of the kernel.
+    err_is(
+        &mut r,
+        "PR_GET_TID_ADDRESS with a null pointer is EFAULT",
+        prctl(libc::PR_GET_TID_ADDRESS, 0, 0, 0, 0),
+        Errno::FAULT,
+    );
+    static mut CHILD_TID: i32 = 0;
+    let report = rustix::pipe::pipe();
+    match report {
+        Ok((tail, head)) => {
+            use std::os::fd::AsRawFd;
+            let word = core::ptr::addr_of_mut!(CHILD_TID);
+            let at = head.as_raw_fd();
+            let cloned = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    (libc::CLONE_CHILD_CLEARTID | libc::SIGCHLD) as usize,
+                    0usize,
+                    0usize,
+                    word,
+                    0usize,
+                ) as i32
+            };
+            if cloned == 0 {
+                let mut own: usize = 0;
+                let rc = prctl(
+                    libc::PR_GET_TID_ADDRESS,
+                    &mut own as *mut usize as usize,
+                    0,
+                    0,
+                    0,
+                );
+                let ok = rc == Ok(0) && own == word as usize;
+                unsafe {
+                    libc::write(at, (&ok as *const bool).cast(), 1);
+                    libc::syscall(libc::SYS_exit_group, 0);
+                }
+                unsafe { libc::_exit(0) };
+            }
+            drop(head);
+            let mut said = [0u8; 1];
+            let n = rustix::io::read(&tail, &mut said).unwrap_or(0);
+            let mut status = 0;
+            unsafe { libc::waitpid(cloned, &mut status, 0) };
+            r.check(
+                "a clone child reads back the clear-tid address its creator passed",
+                cloned > 0 && n == 1 && said[0] != 0,
+            );
+        }
+        Err(_) => r.check("the tid-address report pipe is made", false),
+    }
+    let mut extra = 0usize;
+    ok_is(
+        &mut r,
+        "and arguments past the second are ignored",
+        prctl(
+            libc::PR_GET_TID_ADDRESS,
+            &mut extra as *mut usize as usize,
+            1,
+            0,
+            0,
+        ),
+        0,
+    );
+
     // === no new privileges ===================================================
     // One-way, and the flag a confinement leans on: with it set, a caller that
     // is not root may install a seccomp filter (the pair is walked in

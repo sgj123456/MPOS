@@ -3047,3 +3047,43 @@ behaviour rather than a stored flag.
 
 **Gate**: x86_64 `pass=205 fail=0`, stage 1 `1100 tests, 0 failed`,
 `mpos-kunit 32 passed, 0 failed`, exit 0.
+
+### 6.20 `PR_GET_TID_ADDRESS` — and the process-shaped `clone` that never recorded it (LANDED 2026-10-23)
+
+A small option with a real read: where `clone(CLONE_CHILD_CLEARTID)`'s word
+lives, which is the address a joiner sleeps on. The state existed - the thread
+path had recorded it since `CLONE_CHILD_CLEARTID` was served - and the option
+reports it.
+
+Measured on a current host first (`.workbuddy/probe_tidaddr.c`): a `clone` child
+with `CLONE_CHILD_CLEARTID` reads back **exactly** the address its creator passed
+as `child_tid`; a pointer that cannot be written is `EFAULT`; arguments past the
+second are ignored. A plain process's value is **not** claimed - a libc may set
+one for its own bookkeeping (glibc does, and this host's main thread answered a
+nonzero address), so "0 on a fresh process" is a property of the libc rather than
+of the kernel.
+
+**The claim found a real gap**, and it is the kind a pin exists for: MPOS recorded
+`clear_child_tid` **only in the thread path**. A `clone` that asks for the word
+without `CLONE_VM` - the fork-shaped one, which is a perfectly ordinary request -
+got no address at all, so `PR_GET_TID_ADDRESS` would have answered 0 for it and
+`CLONE_CHILD_CLEARTID`'s word would never have been written for that child. The
+record now happens where the process child's address space is installed, and the
+thread path keeps its own (each is the one its task's `mm` needs).
+
+Two trips the fix took, both worth a line because they are the same mistake in
+different clothes: the first insertion anchored on a line that exists in **both**
+paths and went into the thread one (duplicating the block that was already
+there), and the gate showed the *same* failure again; the second put it where the
+process child's `Task` is built. A patch whose anchor is not unique is a patch
+whose effect has to be read off the gate, not off the diff.
+
+Named, not claimed: `CLONE_CHILD_SETTID`'s write - Linux puts the child's own tid
+in that word for any `clone` that names it - is still the thread path's alone.
+The pin does not ask for it and this entry does not claim it.
+
+**Pin**: `t-prctl`, **64 claims**: the `EFAULT`, the child's read-back (the claim
+that caught the gap), and the ignored tail argument.
+
+**Gate**: x86_64 `pass=205 fail=0`, stage 1 `1100 tests, 0 failed`,
+`mpos-kunit 32 passed, 0 failed`, exit 0.

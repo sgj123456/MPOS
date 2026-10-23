@@ -2469,6 +2469,11 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
     /// takes exactly `(1, 0, 0, 0)`; `2`, a non-zero later argument and a
     /// clearing `0` are all `EINVAL`. The getter answers the flag as its return
     /// value and refuses a call whose unused arguments are not zero.
+    /// `PR_GET_TID_ADDRESS`: where `clone(CLONE_CHILD_CLEARTID)`'s word lives.
+    /// Measured: the address arrives through the pointer (a `clone` child reads
+    /// back exactly the `child_tid` its creator passed), a pointer that cannot be
+    /// written is `EFAULT`, and any argument past the second is ignored.
+    const PR_GET_TID_ADDRESS: usize = 40;
     const PR_SET_NO_NEW_PRIVS: usize = 38;
     const PR_GET_NO_NEW_PRIVS: usize = 39;
     const PR_SET_CHILD_SUBREAPER: usize = 36;
@@ -2644,6 +2649,14 @@ pub(crate) fn handle_prctl(args: [usize; crate::syscall::ARG_COUNT]) -> isize {
                 Ok(()) => 0,
                 Err(e) => e,
             }
+        }
+        PR_GET_TID_ADDRESS => {
+            let buf = args[1];
+            if buf == 0 || !buffer_ok(buf, core::mem::size_of::<usize>(), true, true) {
+                return err::EFAULT;
+            }
+            unsafe { (buf as *mut usize).write_unaligned(crate::sched::current_tid_address()) };
+            0
         }
         PR_SET_NO_NEW_PRIVS => {
             // Exactly one, and nothing beside it: Linux's own check, and the

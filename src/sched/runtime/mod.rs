@@ -39,10 +39,10 @@ mod trace;
 pub(crate) use child_exit::take_retired_current;
 pub use child_exit::{
     CloneRequest, block_until_child_event, child_event, child_event_pending, clone, current_tgid,
-    discard_exit_code, exec_replace, exit, exit_code, exit_group, fork, has_matching_children,
-    poll_any_child_event, poll_child_event, read_user, read_user_of, set_clear_tid, space_root_of,
-    take_child_event, take_exit_code, tls_of, vfork, wait_any_child_event, wait_child_event,
-    write_user, write_user_of,
+    current_tid_address, discard_exit_code, exec_replace, exit, exit_code, exit_group, fork,
+    has_matching_children, poll_any_child_event, poll_child_event, read_user, read_user_of,
+    set_clear_tid, space_root_of, take_child_event, take_exit_code, tls_of, vfork,
+    wait_any_child_event, wait_child_event, write_user, write_user_of,
 };
 pub use child_mm::*;
 pub use child_signal::*;
