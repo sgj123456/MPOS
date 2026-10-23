@@ -1107,7 +1107,7 @@ impl Inode for RamDir {
             NodeKind::Symlink => return Err(VfsError::Unsupported),
             // Anonymous inodes are minted by their owning door (`pidfd_open`),
             // never by a filesystem name; nothing a caller can `mknod` is one.
-            NodeKind::Anon => return Err(VfsError::Unsupported),
+            NodeKind::Anon { .. } => return Err(VfsError::Unsupported),
         };
         critical_section::with(|cs| {
             let mut entries = self.entries.borrow(cs).borrow_mut();

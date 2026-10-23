@@ -5,298 +5,256 @@ Section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.2 Small, measured, and not yet landed
 
+- **A child inherits its parent's signal table, and `exec` resets only the caught slots.**
+  **Landed 2026-10-21** (`docs/uapi/` §5.1 item 96) - `fork`/`clone` started every process
+  at `SIG_DFL`, which is why `clone3`'s `CLONE_CLEAR_SIGHAND` was refused `EOPNOTSUPP`;
+  `exec` also wiped an ignored disposition and the pending set. Measured on Linux 7.2.11
+  first (`.workbuddy/probe_sig_inherit.c`, `.workbuddy/probe_altstack_fork.c`): a fork
+  child carries the handler, `SIG_IGN`, blocked mask and alternate stack; after an exec a
+  caught handler is `SIG_DFL`, `SIG_IGN` stays, the mask and a pending blocked signal
+  cross, and the old alternate stack is gone; `clone3` hands the handler down and the
+  flagged child starts at `SIG_DFL`; `CLEAR|SIGHAND` is `EINVAL`. Pins:
+  **`t-signal-inherit`, 12 claims**, and **`t-clone3` 37 -> 40**; the counterfactual is 4
+  of 12 red by name. The change also exposed a 16 KiB release stack too small for
+  `spawn_copy`'s ~13.8 KiB frame; the release stack is 32 KiB now. Gate: x86_64 stage 1
+  1074/0, `pass=197 fail=0`; aarch64 `pass=196 fail=0`; `mpos-kunit` 32/0 on both.
+
+- **A peer's close is a hang-up, not silence, and a message socket's read after it is 0.**
+  **Landed 2026-10-21** (`docs/uapi/` §5.1 item 95). The boot it cost was OpenRC's
+  `udev-settle`: `udevadm settle` polls a connected `SOCK_SEQPACKET` control socket,
+  udevd closes, and Linux answers `POLLIN|POLLHUP` at once where this kernel's client slept
+  out the 120-second default at `* Waiting for uevents to be processed ...`. Measured on
+  Linux 7.2.11 first (`.workbuddy/probe_unix_close.c`, `probe_seq_send_close.c`):
+  `socketpair` and named ends, stream and seqpacket alike, answer poll `0x011`, epoll
+  `0x11`, `recv` 0 and a seqpacket `send` `EPIPE`; a datagram's dead peer is the contrast -
+  `POLLOUT` alone, `recv` `EAGAIN`, `send` `ECONNREFUSED` (`.workbuddy/probe_dgram_close.c`).
+  Pins: **`t-unix-close`, 19 claims**, wakes 99/97 ms against a 100 ms child and a 5 s
+  patience; the counterfactual (gone-peer predicate removed) is 7 of 19 red, wakes at
+  4997/5000 ms. Gate: x86_64 stage 1 1073/0, stage 2 `pass=196 fail=0`, `mpos-kunit` 32/0;
+  the image reaches `mpos login:` 3.7 s after QEMU starts. Named: the send side is item 97,
+  which corrected this bullet's first draft - a seqpacket `send` is `EPIPE` without
+  `SIGPIPE`.
+
+- **A write to a broken channel is `EPIPE`, and the `SIGPIPE` Linux raises behind it.**
+  **Landed 2026-10-21** (`docs/uapi/` §5.1 item 97). The sender's half of item 95: a
+  seqpacket `send` to a dead peer was `ENOTCONN`, a stream's write raised nothing, and no
+  broken channel generated `SIGPIPE` at all. Measured on Linux 7.2.11 first
+  (`.workbuddy/probe_sigpipe{,2,3,4}.c`): a pipe, a `SOCK_STREAM` pair and a listener's
+  send answer `EPIPE` **and run the handler before the call returns** (`si_code`
+  `SI_USER`); a seqpacket pair answers `EPIPE` **silently** and remembers; a connected
+  datagram answers `ECONNREFUSED` **once** and forgets, then `ENOTCONN`; an unconnected
+  socket is `ENOTCONN`. `MSG_NOSIGNAL` keeps the errno and drops the signal, a blocked
+  signal waits pending, `writev`/`splice`/`sendfile` raise once, and a partial write
+  answers its count (a pipe also raises; a stream does not). Pin: **`t-sigpipe`, 32
+  claims**; counterfactual (the primitive a no-op) **10 of 32 red** by name, every one a
+  signal claim. Gate: x86_64 `pass=198 fail=0`; aarch64 `pass=197 fail=0`; `mpos-kunit`
+  32/0 on both. Named: a TCP reset's first write is `ECONNRESET` on Linux and `EPIPE`
+  here; vsock's signal half is unmeasured.
+
 - **A named `SOCK_SEQPACKET` connection keeps its message boundaries, and its messages carry
   their descriptors.** **Landed 2026-10-21** (`docs/uapi/` §5.1 item 78) - the one divergence
-  left in the AF_UNIX family. A listener's accepted pair used to be a `DuplexEnd` byte channel,
-  so a type named "message boundaries over a stream" carried a byte stream for exactly the
-  connections reached by a name; a `socketpair` half already carried messages. Measured whole on
-  a current host first (`.workbuddy/probe_unix_seqpacket{,2,3}.c`, Linux 7.2.11): 3 then 5 bytes
-  read back as 3 then 5, a 4+4+2 `sendmsg` chain is one message of 10, a short read discards the
-  rest of that message, `MSG_TRUNC` returns the message's own length while `MSG_PEEK` leaves it,
-  a zero-length send is a message while `read(fd, buf, 0)` is a no-op, `recvfrom`/`recvmsg` with
-  a zero-length room consume, `SCM_RIGHTS` rides the message (a peek installs its own set and
-  the take a second, distinct one), and a path-name type mismatch is `EPROTOTYPE` (an abstract
-  name answers `ECONNREFUSED` from its type-keyed lookup). Served by `Pending` in the listener
-  queue (`Stream` end or `Messages` socket), `connect_messages`, the existing `recvq` message
-  machinery, `Dgram`'s own `fds`, and `read_at`'s zero-length no-op. Pins: **`t-unix-seqpacket`,
-  58 claims**, green on a host first; `t-unix-dgram`'s seqpacket claim now says "listens"
-  instead of "is served as a stream". Gate: x86_64 `pass=193 fail=0`, aarch64 `pass=192 fail=0`,
-  `mpos-kunit` 32/0 on both. Named at landing and **served by `docs/uapi/` §5.1 item 79**:
-  `sendto` with a destination on an already-connected seqpacket socket answered `EISCONN` where
-  Linux sends - and a connected *datagram* socket's named send was refused the same way, where
-  Linux resolves the name. Item 79 adds eight claims here (58 -> 66) and six to `t-unix-dgram`.
-  **Served by `docs/uapi/` §5.1 item 80**: a datagram's *path* naming a live socket of another
-  type now answers `EPROTOTYPE` (Linux's measured answer) instead of `ECONNREFUSED`, for `sendto`
-  and `connect` alike; an *abstract* name of another type stays `ECONNREFUSED`, because that
-  lookup is keyed by type. Item 80 takes `t-unix-dgram` from 49 to 57 claims and pins both halves.
-  **Served by `docs/uapi/` §5.1 item 81**: a seqpacket socket with no peer - unconnected or
-  listening - answers `ENOTCONN` on `write` and on every `sendto`/`sendmsg`, whatever the name
-  says (it used to fall through to `ENOTSOCK`). The pins hold the syscall layer's split too:
-  `sendto` refuses 129 bytes and a bad pointer, while `sendmsg` imports the header, name, iovec
-  array and control buffer but neither bounds the name nor reads the iovec data; a NULL pointer
-  with a length is still "no name". That takes `t-unix-seqpacket` from 69 to 88 host-run claims.
+  left in the AF_UNIX family: a listener's accepted pair used to be a `DuplexEnd` byte
+  channel, so a type named "message boundaries over a stream" carried a byte stream for
+  exactly the connections reached by a name. Measured on Linux 7.2.11 first
+  (`.workbuddy/probe_unix_seqpacket{,2,3}.c`): 3 then 5 bytes read back as 3 then 5, a 4+4+2
+  `sendmsg` chain is one message of 10, a short read discards the rest, `MSG_TRUNC` returns
+  the message's own length while `MSG_PEEK` leaves it, a zero-length send is a message while
+  `read(fd, buf, 0)` is a no-op, and `SCM_RIGHTS` rides the message. Pins:
+  **`t-unix-seqpacket`, 58 claims**; `t-unix-dgram`'s claim now says "listens". Gate: x86_64
+  `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Named and served
+  by item 79: `sendto` with a destination on a connected seqpacket socket answered `EISCONN`
+  where Linux sends; item 79 adds eight claims here (58 -> 66) and six to `t-unix-dgram`.
+  Item 80: a datagram's path naming a live socket of another type is `EPROTOTYPE` (abstract
+  names stay `ECONNREFUSED`; `t-unix-dgram` 49 -> 57). Item 81: a seqpacket socket with no
+  peer answers `ENOTCONN` on `write` and every `sendto`/`sendmsg` (it used to be `ENOTSOCK`);
+  `t-unix-seqpacket` 69 -> 88.
 
 - **Netlink's and `AF_PACKET`'s receive doors look without taking, and a truncated answer
   names its own length.** **Landed 2026-10-21** (`docs/uapi/` §5.1 item 77) - item 76's named
   residual on the two families that ignored the flag word. `NETLINK_ROUTE`'s `recvfrom` and
   `recvmsg` popped the front answer whatever `MSG_PEEK` said and returned the copy whatever
   `MSG_TRUNC` said, the uevent socket's `recvmsg` did the same, and every `AF_PACKET` door
-  refused `MSG_PEEK` with `EOPNOTSUPP`. Measured whole on a current host first:
-  `.workbuddy/probe_netlink_peek.c` (over a `RTM_GETLINK` dump) gives a peek that answers and
-  leaves the front, a short receive that answers 8 and consumes, and `MSG_TRUNC`'s return of the
-  answer's **own** length (3020 through 8 bytes) with `msg_flags` reporting the cut unasked -
-  zero-length rooms included; `.workbuddy/probe_packet_peek.c` (inside
-  `unshare(CLONE_NEWUSER|CLONE_NEWNET)`, `lo` up, one frame the socket sends itself) gives the
-  same rule on one frame per call, 8 bytes of a 16-byte frame answering 16 under the flag and 8
-  without it. Served by `rtnl::peek` + `recv_blocking(handle, look)`, `link::Frames::peek` (with
-  `PacketSock::try_peek`/`peek_blocking`), `uevent::peek`, and the flag word read at each of the
-  five doors. Pins: `t-netlink` 14 new claims, `t-uevent` 5, `t-dhcp` 4 (external group: both
-  packet doors, green there at `pass=199 fail=0`), and one `mpos-link` unit test. Gate: x86_64
-  `pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit` 32/0 on both. Named: the **vsock** family, measured in the
-  same pass and not served - `.workbuddy/probe_vsock_recv.c` (over `VMADDR_CID_LOCAL`, after
-  `modprobe vsock_loopback`) serves a peek (10 of 10, still queued) and **ignores** `MSG_TRUNC`
-  (4 of 10 answers 4 and consumes the four), uses the **whole** iovec chain (4+4+2 answers 10),
-  answers 0 for a zero-length room without taking anything, and leaves a short room's remainder
-  queued. Serving the peek needs a look at the device seam (`VsockConnectionManager::recv`
-  drains the crate's private ring, so either a device-side `peek` or a socket-side stash), and
-  the sweep's machine has no vsock peer to pin it against; the chain and the zero-length room
-  are the next item's work.
+  refused `MSG_PEEK` with `EOPNOTSUPP`. Measured on Linux 7.2.11 first
+  (`.workbuddy/probe_netlink_peek.c`, `.workbuddy/probe_packet_peek.c`): a peek answers and
+  leaves the front, a short receive answers 8 and consumes, and `MSG_TRUNC` returns the
+  answer's **own** length (3020 through 8 bytes) with `msg_flags` reporting the cut unasked;
+  for `AF_PACKET`, 8 bytes of a 16-byte frame answers 16 under the flag and 8 without it.
+  Pins: `t-netlink` 14 new claims, `t-uevent` 5, `t-dhcp` 4 (external group), and one
+  `mpos-link` unit test. Gate: x86_64 `pass=192 fail=0`, aarch64 `pass=191 fail=0`,
+  `mpos-kunit` 32/0 on both. Named: the **vsock** family, measured and not served -
+  `.workbuddy/probe_vsock_recv.c`: serves a peek (10 of 10, still queued) and **ignores**
+  `MSG_TRUNC` (4 of 10 answers 4 and consumes), uses the **whole** iovec chain (4+4+2 answers
+  10), answers 0 for a zero-length room, and leaves a short room's remainder queued. The
+  sweep's machine has no vsock peer to pin a peek against; the chain and zero-length room are
+  the next item's work.
 
 - **AF_UNIX's receive doors look without taking, and a datagram's `MSG_TRUNC` is its own
   length.** **Landed 2026-10-20** (`docs/uapi/` §5.1 item 76) - the AF_UNIX half of the
   `MSG_PEEK` bullet below. Both flags used to be refused `EOPNOTSUPP` on every unix door.
-  Measured whole on a current host first (`.workbuddy/probe_unix_peek{,2,3,4,5,6,7}.c`, Linux
-  7.2.x): a stream peek copies without taking and is repeatable; a stream's `MSG_TRUNC` changes
-  nothing (it copies and consumes exactly as the plain read does); a datagram peek leaves the
-  front message and reports its own length under `MSG_TRUNC`, while a zero-length non-peek
-  receive consumes; `recvmsg` sets `MSG_TRUNC` in `msg_flags` unasked; a peeked `SCM_RIGHTS`
-  record installs its descriptors and stays queued for the read that installs a second set; and
-  a zero-byte handover answers `EAGAIN` on `recv`/`recvfrom`. Served by `PipeEnd::peek_once`/
-  `peek_scm`, `UnixSock::peek_dgram`, and a `RecvDgram` that carries the message's whole
-  length. Pin: **`t-unix-peek`**, 63 claims, green on a host first and all 63 green on both
-  machines, plus two `vfs::pipe` host tests. Counterfactual (the four refusals back):
-  `pass=191 fail=1`, only `t-unix-peek` red, 18 of its claims by name. Gate: x86_64
-  `pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit` 32/0 on both. Named: vsock's
-  peek and its first-segment `recvmsg`, and a zero-byte stream handover being receivable
-  through `recvmsg` here where Linux answers `EAGAIN` (the existing `empty_handover` trade).
-  (`NETLINK` and `AF_PACKET` were served by item 77, the bullet above.)
+  Measured on Linux 7.2.x first (`.workbuddy/probe_unix_peek{,2,3,4,5,6,7}.c`): a stream peek
+  copies without taking and is repeatable; a stream's `MSG_TRUNC` changes nothing; a datagram
+  peek leaves the front message and reports its own length under `MSG_TRUNC`, while a
+  zero-length non-peek receive consumes; `recvmsg` sets `MSG_TRUNC` in `msg_flags` unasked;
+  and a peeked `SCM_RIGHTS` record installs its descriptors and stays queued for the read that
+  installs a second set. Pin: **`t-unix-peek`**, 63 claims, plus two `vfs::pipe` host tests.
+  Counterfactual (the four refusals back): `pass=191 fail=1`, only `t-unix-peek` red, 18 of
+  its claims by name. Gate: x86_64 `pass=192 fail=0`, aarch64 `pass=191 fail=0`, `mpos-kunit`
+  32/0 on both. Named: vsock's peek and its first-segment `recvmsg`, and a zero-byte stream
+  handover being receivable through `recvmsg` here where Linux answers `EAGAIN` (the existing
+  `empty_handover` trade).
 
 - **A `sockaddr_un` path ends at its first NUL, and the bytes after it are the caller's
   storage.** **Landed 2026-10-22** (`docs/uapi/` §5.1 item 82) - the last divergence §4.1.1
-  carried, and the one shape that was an *error* rather than a gap: `bind`/`connect`/`sendto`
-  answered `EINVAL` for an address Linux serves, so a caller got a refusal it could not fall
-  back from. Measured whole on a current host first (`.workbuddy/probe_unix_path_tail.c`, Linux
-  7.2.11): `bind` with `"abc"` + NUL + `"XYZ"` succeeds and `getsockname` answers
-  `family + "abc" + NUL` (six bytes); a 108-byte field with no NUL anywhere is taken whole and
-  reported as **111** bytes, one past the field, because `move_addr_to_user` copies
-  `min(len, ulen)` and reports the used length; a `connect` spelled with the same trailing bytes
-  reaches that listener, and `"abc"` alone does not (the name is the prefix); an abstract name is
-  length-delimited, so its interior NULs *are* the name and it echoes all of them. Served by
-  deleting the interior-NUL refusal in `net::unix::sockaddr_un_addr` - the parser's own bound
-  (`addrlen` past the struct is still `EINVAL`) and everything below it already agreed with
-  Linux. Pin: **`t-unix`**, 74 → 80 claims, green on a host first and `ok:` for `ok:` identical
-  on both machines. Gate: x86_64 `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit`
-  32/0 on both. Named: the path half is still a `String`, so a non-UTF-8 *path* is refused here
-  where Linux takes any bytes - a type change, not a rule.
+  carried, and an error rather than a gap: `bind`/`connect`/`sendto` answered `EINVAL` for
+  an address Linux serves. Measured on Linux 7.2.11 first
+  (`.workbuddy/probe_unix_path_tail.c`): `bind` with `"abc"` + NUL + `"XYZ"` succeeds and
+  `getsockname` answers `family + "abc" + NUL` (six bytes); a 108-byte field with no NUL is
+  taken whole and reported as **111** bytes; a `connect` with the trailing bytes reaches that
+  listener and `"abc"` alone does not. Pin: **`t-unix`**, 74 → 80 claims. Gate: x86_64
+  `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Named: the path
+  half is still a `String`, so a non-UTF-8 path is refused here; `addrlen` past the struct
+  is still `EINVAL`.
 
-- **A socket's address is three answers, and `getpeername` is the connect's record.** **Landed
-  2026-10-22** (`docs/uapi/` §5.1 item 83). `getsockname`/`getpeername` answered `AF_UNIX` plus
-  an empty path for every socket with no name, which was wrong in three directions. Measured on a
-  current host first (`.workbuddy/probe_unix_unnamed.c`, `probe_unix_names{,2}.c`,
+- **A socket's address is three answers, and `getpeername` is the connect's record.**
+  **Landed 2026-10-22** (`docs/uapi/` §5.1 item 83). Measured on Linux 7.2.11 first
+  (`.workbuddy/probe_unix_unnamed.c`, `probe_unix_names{,2}.c`,
   `probe_unix_accepted_name.c`, `probe_unix_bind_after.c`, `probe_unix_from.c`,
-  `probe_unix_noname_bytes.c`, Linux 7.2.11): an unbound socket of any type (and a `socketpair`
-  end) answers the **bare family**, two bytes, while a `bind` of the *empty* path answers three -
-  the family and its NUL, a name of zero bytes rather than no name; `getpeername` is `ENOTCONN`
-  for every unconnected shape and the *listener's bound path* on a connected client; an
-  **accepted** end inherits the listener's address as its own - which is what makes a second
-  `bind` there `EINVAL`, while the client end of the same connection binds happily; both names
-  survive the node's `unlink` and the peer's close; and a delivery from an unbound sender reports
-  `addrlen` **0** with not one byte of the caller's storage written. Served by `UnixState::local`
-  and `UnixState::peer_name` (the address and the dialled peer, both kept on the socket the way
-  Linux keeps them) with `write_no_name`/`write_no_source` for the two nameless answers. Pin:
-  **`t-unix`** 80 → 90 claims, plus `t-unix-dgram`'s unnamed-sender claim rewritten from this
-  kernel's three bytes to Linux's zero and `t-unix-rustix`'s `getpeername`. Gate: x86_64
-  `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Named: the address of a
-  socket handed over by `SCM_RIGHTS` was not measured here.
+  `probe_unix_noname_bytes.c`): an unbound socket (and a `socketpair` end) answers the bare
+  family, two bytes, while binding the empty path answers three; `getpeername` is `ENOTCONN`
+  for every unconnected shape and the listener's bound path on a connected client; an
+  accepted end inherits the listener's address, so a second `bind` there is `EINVAL`; both
+  names survive `unlink` and the peer's close; and a delivery from an unbound sender reports
+  `addrlen` **0** with no byte written. Pin: **`t-unix`** 80 → 90 claims, plus
+  `t-unix-dgram`'s unnamed-sender claim and `t-unix-rustix`'s `getpeername`. Gate: x86_64
+  `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0. Named: a socket handed
+  over by `SCM_RIGHTS` was not measured.
 
-- **A second `connect` moves a datagram's peer, and the name is resolved before it is refused.**
-  **Landed 2026-10-22** (`docs/uapi/` §5.1 item 84). `connect` answered `EISCONN` whenever the
-  socket already had a peer, whatever its type. Measured on a current host first
-  (`.workbuddy/probe_unix_reconnect{,2,3,4,5}.c`, `probe_unix_dgram_connect.c`,
-  `probe_unix_selfconnect.c`, `probe_unix_connect_order{,2}.c`, Linux 7.2.11): a **datagram**
-  socket's second connect to another live name returns 0 and `getpeername` reads the new one, with
-  a message sent afterwards reaching the new peer only; a refused reconnect (a dead name, a
-  wrong-type name, a family-only address) leaves the **previous peer in place**; a **stream** or
-  sequenced-packet socket's second connect is `EISCONN` (106) but only after the name resolves, so
-  a dead path is `ENOENT` (2); a **listening** socket's own connect is `EINVAL` (22) and a bound
-  but unlistening one's `ECONNREFUSED` (111); and a connect to a node that is not a socket is
-  `ECONNREFUSED` at mode 0666 but `EACCES` at mode 0000, because the permission is asked before
-  the kind. Served by gating `EISCONN` on "is this a stream" rather than "has this socket a peer",
-  and by resolving the name before that gate. Pin: **`t-unix-dgram`** 57 → 60 claims and
-  **`t-unix`** 90 → 91. Gate: x86_64 `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit`
-  32/0 on both. Counterfactual: `pass=192 fail=1`, the second-connect claim red with `EISCONN`.
+- **A second `connect` moves a datagram's peer, and the name is resolved before it is
+  refused.** **Landed 2026-10-22** (`docs/uapi/` §5.1 item 84). Measured on Linux 7.2.11
+  first (`.workbuddy/probe_unix_reconnect{,2,3,4,5}.c`, `probe_unix_dgram_connect.c`,
+  `probe_unix_selfconnect.c`, `probe_unix_connect_order{,2}.c`): a datagram's second connect
+  moves the peer, and a refused reconnect (dead name, wrong-type name, family-only address)
+  leaves the previous one; a stream/seqpacket second connect is `EISCONN` (106) but only
+  after the name resolves, so a dead path is `ENOENT` (2); a listening socket's own connect
+  is `EINVAL` (22) and a bound but unlistening one's is `ECONNREFUSED` (111); a connect to a
+  non-socket is `ECONNREFUSED` at 0666 and `EACCES` at 0000. Pins: **`t-unix-dgram`** 57 → 60 and
+  **`t-unix`** 90 → 91. Gate: x86_64 `pass=193 fail=0`, aarch64 `pass=192 fail=0`,
+  `mpos-kunit` 32/0. Counterfactual: `pass=192 fail=1`, the second-connect claim red with
+  `EISCONN`.
 
-- **`listen` is the named call, and a connected socket is not a listener.** **Landed 2026-10-22**
-  (`docs/uapi/` §5.1 item 85). `listen` accepted anything that was not a datagram socket, so a
-  fresh unbound stream socket opened a queue nothing could reach. Measured on a current host first
-  (`.workbuddy/probe_unix_listen{,2}.c`, Linux 7.2.11): an unbound `SOCK_STREAM` or
-  `SOCK_SEQPACKET` socket is `EINVAL` (22); a bound or abstract-bound one is 0, as is a second
-  `listen`; a **connected** socket and an **accepted** end are `EINVAL`; and a datagram socket,
-  bound or not, is `EOPNOTSUPP` (95). Served by two refusals in `net::unix::listen` - no address,
-  and a channel. Pin: **`t-unix`** 91 → 96 claims. Gate: x86_64 `pass=193 fail=0`, aarch64
-  `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Counterfactual: `pass=192 fail=1`, the two unbound
-  claims red.
+- **`listen` is the named call, and a connected socket is not a listener.** **Landed
+  2026-10-22** (`docs/uapi/` §5.1 item 85). Measured on Linux 7.2.11 first
+  (`.workbuddy/probe_unix_listen{,2}.c`): an unbound `SOCK_STREAM`/`SOCK_SEQPACKET` is
+  `EINVAL` (22); a bound or abstract-bound one is 0, as is a second `listen`; a connected or
+  accepted end is `EINVAL`; a datagram socket is `EOPNOTSUPP` (95). Pin: **`t-unix`** 91 →
+  96. Gate: x86_64 `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0.
+  Counterfactual: `pass=192 fail=1`, the two unbound claims red.
 
 - **`shutdown` is a flag on the socket, not a handshake with a peer.** **Landed 2026-10-22**
-  (`docs/uapi/` §5.1 item 86). `shutdown` on a unix socket answered `ENOTCONN` when there was no
-  channel. Measured on a current host first (`.workbuddy/probe_unix_shutdown.c`, Linux 7.2.11): an
-  unconnected `SOCK_STREAM` answers 0 for all three directions, and so do a listening socket, an
-  unconnected datagram socket and a connected socket of every type; only `how` outside `0..=2` is
-  `EINVAL` (22). Served by removing the `ENOTCONN` arm - the handler closes the channel when there
-  is one and reports success either way. Pin: **`t-unix`** 96 → 99 claims. Gate: x86_64
-  `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Counterfactual:
+  (`docs/uapi/` §5.1 item 86). Measured on Linux 7.2.11 first
+  (`.workbuddy/probe_unix_shutdown.c`): an unconnected `SOCK_STREAM`, a listener, an
+  unconnected datagram and a connected socket of every type answer 0 for all three
+  directions; only `how` outside `0..=2` is `EINVAL` (22). Pin: **`t-unix`** 96 → 99. Gate:
+  x86_64 `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0. Counterfactual:
   `pass=192 fail=1`, the two unconnected claims red.
 
-- **The "implicit rendezvous" was never Linux's shape.** **Corrected 2026-10-22** (`docs/uapi/`
-  §5.1 item 87). The AF_UNIX module header carried a divergence that was never measured: "a bound
-  stream socket that was never `listen`ed answers `ECONNREFUSED` where Linux meets the caller in an
-  implicit rendezvous". Measured on a current host (`.workbuddy/probe_unix_unlistened{,2}.c`, Linux
-  7.2.11): `SO_ACCEPTCONN` is 0, `connect` is `ECONNREFUSED` (111), the same name connects once
-  `listen` runs, a sequenced-packet socket answers the same, and a bound datagram socket connects
-  without any `listen`. Both machines already agreed; the record was the only thing wrong, and two
-  test claims had been written to accept the invented shape. The claims are now exact on both
-  machines and the divergence list drops the entry.
+- **The "implicit rendezvous" was never Linux's shape.** **Corrected 2026-10-22**
+  (`docs/uapi/` §5.1 item 87). Measured on Linux 7.2.11
+  (`.workbuddy/probe_unix_unlistened{,2}.c`): `SO_ACCEPTCONN` is 0, `connect` is
+  `ECONNREFUSED` (111) until `listen`, a seqpacket answers the same, and a bound datagram
+  connects without `listen`. Both machines already agreed; the record and two test claims
+  were the only thing wrong.
 
-- **`accept`'s `addr` is the connector's name, and its two pointers are asked separately.** **Landed
-  2026-10-22** (`docs/uapi/` §5.1 item 88). `accept` wrote the **listener's** bound path into the
-  caller's address buffer, so a server reading it back concluded every client was itself. Linux
-  writes the **connector's** name. Measured on a current host first
-  (`.workbuddy/probe_unix_accept3.c`, `probe_unix_accept{,2,4,5}.c`, Linux 7.2.11): an unbound
-  client reports `addrlen` **2** (the bare family), a bound one reports the path it bound, a 4-byte
-  room still reports the needed length, a NULL `addr` is served with `addrlen` left untouched, and
-  a NULL `addrlen` beside a real `addr` is `EFAULT` (14). Served by carrying the connector's
-  address through `Pending::Stream` to the accepted socket's `peer_name` and writing that back, and
-  by asking the two pointers separately. Pin: **`t-unix`** 99 → 106 claims. Gate: x86_64
-  `pass=193 fail=0`, aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0 on both. Two counterfactuals,
-  one per half: the listener's name put back reds both address claims; the old pointer condition
-  restored reds the `EFAULT` claim.
+- **`accept`'s `addr` is the connector's name, and its two pointers are asked separately.**
+  **Landed 2026-10-22** (`docs/uapi/` §5.1 item 88). Measured on Linux 7.2.11 first
+  (`.workbuddy/probe_unix_accept3.c`, `probe_unix_accept{,2,4,5}.c`): an unbound client
+  reports `addrlen` **2**; a bound one reports its path; a 4-byte room still reports the
+  needed length; a NULL `addr` is served with `addrlen` untouched; a NULL `addrlen` beside a
+  real `addr` is `EFAULT` (14). Pin: **`t-unix`** 99 → 106. Gate: x86_64 `pass=193 fail=0`,
+  aarch64 `pass=192 fail=0`, `mpos-kunit` 32/0. Counterfactuals: the listener's name put
+  back reds both address claims; the old pointer condition reds the `EFAULT` claim.
 
 - **Real `MSG_PEEK` over TCP/UDP is served, and `MSG_TRUNC` is the message's own length.**
-  **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet this replaces said the flag
-  was refused `EOPNOTSUPP` because serving it needed peek-preserving delivery in the stack; the
-  prerequisite was never real - smoltcp's `tcp::peek`/`udp::peek` were already there - and what
-  was missing was the reading of the flag word. Measured whole on a current host first
-  (`.workbuddy/probe_msg_peek{,2,3,4}.c`, Linux 7.2.x): a UDP peek does not consume, a short one
-  copies what fitted and leaves the datagram **whole**, `MSG_TRUNC` answers the datagram's own
-  length, and a zero-length peek answers 0 (or the length, with `MSG_TRUNC`) without taking it;
-  a **non-peek** zero-length datagram receive *does* consume, and a short one copies the prefix
-  and drops the rest - Linux's truncation, where this kernel had answered `EMSGSIZE` from
-  `recv_slice`'s `Truncated`; a stream's `MSG_TRUNC` is a different rule - it answers the count
-  it would have copied and copies **nothing** (3 of 10 answers 3, 100 of 10 answers 10), and a
-  non-peek one consumes the bytes it counted; a zero-length stream receive answers 0 without
-  consuming, waits while nothing is readable, and answers 0 (not `EINTR`) when a signal ends that
-  wait; `recvmsg` reports a cut datagram with `MSG_TRUNC` in `msg_flags` even when the caller did
-  not ask for the flag and says nothing for a stream, and it still names the sender on a peek.
-  Served by `RecvAnswer { copied, full, endpoint }`, the two flags threaded into `recv_common`,
-  `tcp::Socket::peek` + an explicit dequeue, and `udp::Socket::peek` + a hand copy. Pins:
-  **`t-msg-peek`**, a new program, 47 claims green on a current host first, and the rewritten
-  `t-sock-flags` (4 claims) - its old refusal is the one thing a served call makes false, so the
-  file keeps the `DONTWAIT` half and the composition of peek with it instead of going red.
-  Gate: x86_64 `pass=190 fail=0 (190 built)`, aarch64 `pass=189 fail=0`, `mpos-kunit` 32/0 on
-  both, and both programs' `ok:` lines byte-identical across the machines. Counterfactual,
-  one line with every pin kept (every peek refused again): `pass=188 fail=2`, exactly the two
-  pins. `t-ns-net`'s own fixture was fixed on the way - it connected before the child's
-  listener announced itself, a race the new socket timing lost on aarch64.
-  **Two shapes stay named rather than claimed**: the other families' peeks (`NETLINK`,
-  PACKET, vsock) which this pass did not touch, and `recvmsg` with a zero-length data room, whose
-  `EINVAL` predated this item and was its own. The **raw** peek this bullet first named was
-  served by item 74, which made the capability the host lacked instead of naming around it,
-  **`AF_UNIX`'s half** was served by item 76, and **`NETLINK` and `AF_PACKET`** by item 77 (the
-  bullet at the top); vsock's own is measured there and still named.
+  **Landed 2026-10-20** (`docs/uapi/` §5.1 item 72). The §5.3 bullet it replaced said the flag
+  was refused `EOPNOTSUPP`; smoltcp's `tcp::peek`/`udp::peek` already existed, and what was
+  missing was reading the flag word. Measured on Linux 7.2.x first
+  (`.workbuddy/probe_msg_peek{,2,3,4}.c`): a UDP peek does not consume, a short one leaves the
+  datagram whole, `MSG_TRUNC` answers its own length, a zero-length peek answers 0 without
+  taking; a non-peek zero-length datagram receive consumes, and a short one copies the prefix
+  and drops the rest (where this kernel answered `EMSGSIZE`); a stream's `MSG_TRUNC` answers
+  the count it would have copied and copies **nothing** (3 of 10 answers 3, 100 of 10 answers
+  10); a zero-length stream receive answers 0 without consuming, waits while nothing is
+  readable, and answers 0 (not `EINTR`) when a signal ends that wait; `recvmsg` reports a cut
+  datagram with `MSG_TRUNC` in `msg_flags` unasked, says nothing for a stream, and still names
+  the sender on a peek. Pins: **`t-msg-peek`**, 47 claims, and the
+  rewritten `t-sock-flags` (4 claims). Gate: x86_64 `pass=190 fail=0`, aarch64 `pass=189
+  fail=0`, `mpos-kunit` 32/0. Counterfactual (every peek refused again): `pass=188 fail=2`,
+  exactly the two pins. Two shapes stayed named: other families' peeks and a zero-length
+  `recvmsg` data room (`EINVAL` predating the item). The raw peek was served by item 74,
+  AF_UNIX's by 76, NETLINK/AF_PACKET's by 77; vsock's is measured and still named.
 
 - **A `recvmsg`'s data room is the whole iovec chain, and a stream's fault is not a datagram's.**
   **Landed 2026-10-20** (`docs/uapi/` §5.1 item 73) - the item the `MSG_PEEK` bullet above left
-  named. Every receive door but `recvmsg` takes one buffer, so the message door had read the
-  *first non-empty iovec* and nothing else: a `4+4+2` chain got four bytes of a ten-byte message
-  and the rest of the chain was left alone, and a zero-length data room was `EINVAL` for every
-  family. Measured whole on a current host first (`.workbuddy/probe_recvmsg_iov.c`, Linux 7.2.x):
-  a **datagram** fills the chain in order and stops where it ends (`12` into `5+5+5` answers 12;
-  `12` into `4+4+2` answers 10, copies the prefix and sets `MSG_TRUNC` in `msg_flags` whether or
-  not the caller asked; with the flag asked for, the *return* is the datagram's own length while
-  the copy stays 10), a zero-length chain and an empty iovec array answer 0 with the cut flag and
-  **consume** the datagram, and a chain with a segment the kernel cannot write is `EFAULT` *after*
-  the take, so the queue is empty afterwards; a **stream** has no message to cut (`20` into
-  `4+4+2` answers 10 with `msg_flags` clear and leaves the other ten queued; `MSG_TRUNC` counts
-  ten, copies **none** and consumes them; a zero-length chain answers 0 and takes nothing; its
-  `EFAULT` leaves every byte queued); an iovec array longer than `UIO_MAXIOV` (1024) is
-  `EMSGSIZE` on both `recvmsg` and `sendmsg`, where this kernel answered `EINVAL` for the send
-  side; and `msg_name` is written the same way whatever the chain looks like. Served by one
-  `DataRoom` (the array read once, the segments read on every pass, a scratch and a scatter when
-  the chain is more than one segment and no copy at all when it is one) and by `RecvAnswer`'s
-  third length - `written`, which is what actually reached the caller's buffer and is 0 for the
-  one shape (`MSG_TRUNC` on a stream) whose count is not a copy. Pin: **`t-recvmsg-iov`**, a new
-  program, 56 claims, green on a current host first and `ok:` for `ok:` identical on both
-  machines; the pin's own first guest run found two things and both are recorded in item 73 (a
-  Linux `connect` binds a datagram socket where this kernel's does not, and a zero-length
-  `AF_UNIX` receive parks even when the caller left room for control data). Named rather than
-  claimed: the **vsock** branch still reads first-iovec only - nothing here could measure that
-  family - and the **raw** socket's zero-length receive kept the `EINVAL` it always gave until
-  item 74 made the capability the host lacked and served it the datagram answer.
+  named. The message door had read the *first non-empty iovec* and nothing else: a `4+4+2`
+  chain got four bytes of a ten-byte message, and a zero-length data room was `EINVAL` for
+  every family. Measured on Linux 7.2.x first (`.workbuddy/probe_recvmsg_iov.c`): a datagram
+  fills the chain in order (`12` into `5+5+5` answers 12; `12` into `4+4+2` answers 10, copies
+  the prefix and sets `MSG_TRUNC` in `msg_flags` unasked; with the flag asked for, the return
+  is the datagram's own length while the copy stays 10), a zero-length chain and an empty
+  iovec array answer 0 with the cut flag and **consume**, and a segment the kernel cannot write
+  is `EFAULT` *after* the take; a stream has no message to cut (`20` into `4+4+2` answers 10
+  with `msg_flags` clear and leaves ten queued; `MSG_TRUNC` counts ten, copies **none** and
+  consumes them; a zero-length chain takes nothing; its `EFAULT` leaves every byte queued); an
+  iovec array longer than `UIO_MAXIOV` (1024) is `EMSGSIZE` on both `recvmsg` and `sendmsg`,
+  where this kernel answered `EINVAL` for the send side; `msg_name` is written the same
+  whatever the chain looks like. Pin: **`t-recvmsg-iov`**, 56 claims;
+  its first guest run found two things recorded in item 73 (a Linux `connect` binds a datagram
+  socket where this kernel's does not, and a zero-length `AF_UNIX` receive parks even with
+  room for control data). Named: the **vsock** branch still reads first-iovec only.
 
 - **A raw socket's receive is a datagram's, and its hop count is read off the packet.**
-  **Landed 2026-10-20** (`docs/uapi/` §5.1 item 74) - the two shapes the item 72 and item 73
-  bullets above left named, both of them named around a host that holds no `CAP_NET_RAW`. The
-  probe makes the capability instead: `unshare(CLONE_NEWUSER|CLONE_NEWNET)` hands the whole set
-  inside a user namespace of its own, and a network namespace that namespace owns is one
-  `ns_capable(CAP_NET_RAW)` answers for (item 43's rule from the other side); `lo` up, ICMP echo
-  *replies* to itself (type 0, which the kernel's own ICMP input does not answer, so one send is
-  one packet), and every answer is the datagram's (`.workbuddy/probe_raw_recvmsg.c`, Linux
-  7.2.11): a zero-length room answers 0 with `MSG_TRUNC` and **consumes**, no iovec at all
-  answers 0 and consumes, a 4-byte segment of a 36-byte packet answers 4 with `MSG_TRUNC`
-  **unasked** and 36 when the flag *is* asked, `MSG_PEEK` copies without taking through a full
-  segment and a zero-length room alike, a chain 4+`PROT_NONE` is `EFAULT` with the packet gone,
-  1025 segments is `EMSGSIZE` with the packet still queued, and the sender's name is the header's.
-  The `IP_RECVTTL` record rides along even when the buffer cut the header short - so the octet is
-  read off the packet (`RecvAnswer::ttl`), the gate is the packet's length rather than the copy's,
-  `cmsg_len` is the unpadded `CMSG_LEN(4)` (20; the space it occupies is 24, which is what
-  `msg_controllen` reports), and `cmsg_type` is `IP_TTL` (2), not the `IP_RECVTTL` (12) that asks
-  for it - `t-rawicmp`'s claim had read 24 and 12 and now reads the host's own 20 and 2. Pin:
-  **`t-raw-recvmsg`**, a new program, 50 claims, green on the host first (the host run makes its
-  own door as the probe does) and `ok:` for `ok:` identical on both machines. Its first guest run
-  lost one echo beyond slirp and went red on a packet that never came, so `queue_one` now drains,
-  sends and confirms with a bounded peek. Named: the **vsock** branch still reads its chain's
-  first segment only.
+  **Landed 2026-10-20** (`docs/uapi/` §5.1 item 74) - the two shapes items 72 and 73 left
+  named, both named around a host with no `CAP_NET_RAW`. The probe makes the capability:
+  `unshare(CLONE_NEWUSER|CLONE_NEWNET)` hands the whole set inside a user namespace of its own,
+  and a network namespace it owns is one `ns_capable(CAP_NET_RAW)` answers for (item 43's rule
+  from the other side); `lo` up, ICMP echo replies to itself (type 0, so one send is one
+  packet). Every answer is the datagram's (`.workbuddy/probe_raw_recvmsg.c`, Linux 7.2.11): a
+  zero-length room answers 0 with `MSG_TRUNC` and **consumes**, no iovec answers 0 and
+  consumes, a 4-byte segment of a 36-byte packet answers 4 with `MSG_TRUNC` **unasked** and 36
+  when the flag is asked, `MSG_PEEK` copies without taking, a chain 4+`PROT_NONE` is `EFAULT`
+  with the packet gone, 1025 segments is `EMSGSIZE` with the packet queued. The `IP_RECVTTL`
+  record rides along even when the buffer cut the header short: the octet is read off the
+  packet, `cmsg_len` is `CMSG_LEN(4)` (20; occupying 24, what `msg_controllen` reports), and
+  `cmsg_type` is `IP_TTL` (2), not `IP_RECVTTL` (12) - `t-rawicmp` read 24 and 12, now 20 and
+  2. Pin: **`t-raw-recvmsg`**, 50 claims. Its first guest run lost one echo beyond slirp, so
+  `queue_one` now drains, sends and confirms with a bounded peek. Named: the **vsock** branch
+  reads its chain's first segment only.
 
 - **The second machine's configuration space, and a skip that was a claim.** **Landed
   2026-10-19** (`docs/uapi/` §5.1 item 70) — aarch64 already enumerated its bus through the
   device tree's `pci-host-ecam-generic` window (`pci: ECAM is this machine's only mechanism
   and the walk read 2 functions`), but `mpos_pci_config` was x86_64's flag: both `config`
   nodes existed with the right lengths and `pread64` answered `EOPNOTSUPP`. Declaring the
-  flag is the whole fix; the mechanism was already the machine's. The test boot now carries
-  one `nvme,serial=...` with no drive, so the PCIe half has a device on both machines
-  (§7.6c). `t-pci`'s unreadable-file skip became a claim — a machine that publishes functions
-  and cannot read them is red — and the one skip left is the host's 64-byte clamp. Pin:
-  `t-pci`'s eight claims on both gates; the counterfactual removes the aarch64 flag and reads
-  `pass=187 fail=1`, with the readability and length claims red.
+  flag was the whole fix; the test boot now carries one `nvme,serial=...` with no drive, so
+  the PCIe half has a device on both machines (§7.6c). `t-pci`'s unreadable-file skip became
+  a claim, and the one skip left is the host's 64-byte clamp. Pin: `t-pci`'s eight claims;
+  the counterfactual removes the aarch64 flag and reads `pass=187 fail=1`, readability and
+  length claims red.
 
 - **A function's configuration space is as long as its device says.** **Landed 2026-10-19**
   (`docs/uapi/` §5.1 item 69) — §7.6a's follow-on: the ECAM window reached 4 KiB per function
-  and every reader still stopped at 256. The doubt it recorded, that the file's size would
-  depend on which mechanism the firmware named, was the wrong question: Linux sizes the file
-  from the **device**, and the probe uses whatever mechanism is in use. Measured on a current
-  host first (`.workbuddy/probe_pci_ext.c`, Linux 7.2.11): `/sys/.../config` is 4096 for PCIe
-  functions and host bridges and 256 for an IOMMU, an SMBus controller and an LPC bridge;
-  as root a 4096-byte file answers at 0x100, 0xfff and 0xff8 (8 bytes of 16), with 0x1000
-  EOF, while a 256-byte file is EOF at 0x100. Linux's `pci_cfg_space_size` is the rule: only
-  a PCIe function, a host bridge or a PCI-X mode 2 bridge is asked at 0x100, all ones means
-  the machine cannot reach the extended space, and the standard header repeated at every
-  0x100 boundary is a bridge aliasing its low 256 bytes. Served by `crate::pci::cfg_space_size`
-  and `find_capability`, `Device::cfg_size` probed once at enumeration, twelve-bit offsets in
-  the accessors, and the function's size carried by both config nodes. Pin: `t-pci` (seven
-  claims when it landed; eight after item 70's readability claim), with the gate's machine
-  carrying one NVMe controller (no namespace) because all fourteen of q35's own functions
-  are conventional PCI. Named, not copied: Linux clamps a non-`CAP_SYS_ADMIN` reader to 64
-  bytes, which this kernel does not do.
+  and every reader still stopped at 256. Linux sizes the file from the **device**, not the
+  mechanism the firmware named. Measured on Linux 7.2.11 first
+  (`.workbuddy/probe_pci_ext.c`): `/sys/.../config` is 4096 for PCIe functions and host
+  bridges and 256 for an IOMMU, an SMBus controller and an LPC bridge; as root a 4096-byte
+  file answers at 0x100, 0xfff and 0xff8 (8 bytes of 16), with 0x1000 EOF, while a 256-byte
+  file is EOF at 0x100. Linux's `pci_cfg_space_size` is the rule: only a PCIe function, a
+  host bridge or a PCI-X mode 2 bridge is asked at 0x100; all ones means the extended space
+  is unreachable; a repeated standard header at every 0x100 boundary is a bridge aliasing its
+  low 256 bytes. Pin: `t-pci` (seven claims at landing; eight after item 70's readability
+  claim), with the gate's machine carrying one NVMe controller (no namespace) because all
+  fourteen of q35's own functions are conventional PCI. Named: Linux clamps a
+  non-`CAP_SYS_ADMIN` reader to 64 bytes, which this kernel does not do.
 
 - **A framebuffer is its description's object, and it has no properties.** **Landed
   2026-10-19** (`docs/uapi/` §5.1 item 68) — the entry §7.4 carried as "a framebuffer
@@ -884,9 +842,10 @@ Section numbers are unchanged from the original `UAPI.md`.
   ring smaller than the smallest buffer a caller can ask for could never be the one that
   binds) and from 4 packet slots to 16, so the pool can hold the eleven.
 
-  **What stays named.** `SO_RCVBUF` is the number a caller reads and not a window this
-  kernel resizes: the receive ring is fixed at 16 KiB, so a socket that asks for less does
-  not shrink it (Linux drops at delivery once the queue passes the buffer). The
+  **What stays named.** On a **datagram** socket `SO_RCVBUF` is still the number a caller
+  reads and not a window this kernel resizes: the receive ring is fixed at 16 KiB, so a
+  socket that asks for less does not shrink it (Linux drops at delivery once the queue
+  passes the buffer). A **stream's** number is its window now - item 98 below. The
   datagram-too-big line is still the ring's rather than Linux's 65507 - this stack has no
   IP fragmentation, so a datagram wider than a frame cannot leave, and `EMSGSIZE` is the
   honest answer where a queue entry would die at dispatch. And the count a floor buffer
@@ -897,6 +856,25 @@ Section numbers are unchanged from the original `UAPI.md`.
   host as well as in the guest because the floors and the ceiling are the same numbers on
   both - and `t-udpblock`'s `the fill stops where the send buffer's number says`, which is
   the governing half. `docs/notes/` §15.77 carries the gates and the counterfactual.
+
+- **A stream's receive buffer is its window, and a listener hands it to the socket it
+  accepts. Landed 2026-10-21** (`docs/uapi/` §5.1 item 98). Item 58 made `SO_RCVBUF`
+  Linux's number, but on a stream the number still governed nothing: the listener's option
+  stayed there, and every accepted connection was built with the default ring. Measured
+  whole on a current host first (`.workbuddy/probe_tcp_rcvbuf.c`, Linux 7.2.11, a server
+  that never reads): a listener asking 2048 is inherited as 4096 by the accepted socket and
+  absorbs 8192 unread bytes, 32768 as 65536 and 47104, 262144 as 524288 and 212886 - before
+  and after `listen` alike. The ring is half the stored figure (`tcp_rx_bytes`), the
+  listener carries it through its pool and refills (`Listener::rx_bytes`, `add_tcp_sized`,
+  `set_listener_rx`), `settle_tcp` carries it to the loopback, and `accept` copies the
+  number onto the accepted socket. Pins: `t-sockbuf` grown to **18 claims** - two
+  inheritance claims and three pushes until refusal, compared relatively (guest
+  18432/49152/147456, host 8192/47104/286561). It also caught a send bug: `tcp_send` parked
+  on a partial `send_slice` under `MSG_DONTWAIT` (a 4096-byte send against a 2048-byte
+  window never returned), now answered with the count queued, as Linux's `tcp_sendmsg`
+  does. Named: a datagram's ring is still fixed, a connected stream's own `setsockopt`
+  cannot resize the live ring, the ring is capped at 128 KiB under §8.0's allocator, and a
+  stream's `SO_SNDBUF` does not size its send ring. `docs/notes/` §4.3.3.
 
 - **A terminal's foreground group is *session state*, and a reader is not its owner.
   Landed 2026-10-18** (`docs/uapi/` §5.1 item 56). The entry that stood here had two

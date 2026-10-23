@@ -294,6 +294,18 @@ pub fn job(kind: Job) -> isize {
         JOBS.borrow(cs).borrow_mut().push_back(pending.clone());
     });
     let me = crate::sched::current();
+    // A task that has already run its exit path is never scheduled again, so
+    // parking for the job's result would park forever - the completion wake
+    // lands on a task the scheduler has stopped running (measured: a process
+    // exiting with the cursor plane bound parked in exactly this hide, and its
+    // parent's `wait` never returned). The exit path's device commands don't
+    // read their answers back (`let _ =` at every call site), and none of them
+    // reads the buffer backing they are about to release - so they go out
+    // fire-and-forget: queued in order, the task woken, the result dropped.
+    if crate::sched::is_exited(me) {
+        wake_task();
+        return 0;
+    }
     critical_section::with(|cs| {
         let mut waiters = JOB_WAITERS.borrow(cs).borrow_mut();
         if !waiters.contains(&me) {

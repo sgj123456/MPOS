@@ -248,6 +248,11 @@ pub struct PipeEnd {
     /// race-free, where a descriptor checked beforehand could have the data
     /// it saw taken by another reader before its own turn comes.
     nonblocking: AtomicBool,
+    /// Whether a **partial** write cut short by the reader's close raises
+    /// `SIGPIPE`. True for a pipe's and a FIFO's ends, false for a
+    /// socketpair's; the measurement and why the two answer differently are
+    /// on [`pair_ends`].
+    partial_break_signals: bool,
     /// The node kind `stat` reports for a description of this end. `File` for an
     /// anonymous pipe; `Fifo` for one opened through a FIFO's name, whose
     /// description Linux reports as `S_IFIFO` like the name itself.
@@ -266,6 +271,22 @@ const _: () = {
 
 /// A pipe: the read end and the write end of one shared buffer.
 pub fn pair() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
+    pair_ends(true)
+}
+
+/// The two ends every channel is built from, saying whether a **partial**
+/// write cut short by the reader's close raises `SIGPIPE`.
+///
+/// True for a pipe and a FIFO, false for the halves of a [`DuplexEnd`]
+/// (`SOCK_STREAM` socketpair and AF_UNIX stream): Linux raises the signal for
+/// the pipe's partial write and returns the count, but a stream's partial
+/// send returns the count silently. Measured on a current host
+/// (`.workbuddy/probe_sigpipe4.c`, Linux 7.2.11): a 200000-byte write into a
+/// pipe with 5536 bytes free whose reader closes mid-call answers 57344 with
+/// a handler flag set, while the same race on a `SOCK_STREAM` pair answers
+/// 219264 with no signal. The zero-byte case raises for both, and that raise
+/// belongs to the syscall door, where `MSG_NOSIGNAL` is visible.
+fn pair_ends(partial_break_signals: bool) -> (Arc<PipeEnd>, Arc<PipeEnd>) {
     let state = Arc::new(Mutex::new(RefCell::new(PipeState {
         data: Ring::new(),
         scm: VecDeque::new(),
@@ -284,6 +305,7 @@ pub fn pair() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
             closed_read: AtomicBool::new(false),
             closed_write: AtomicBool::new(false),
             nonblocking: AtomicBool::new(false),
+            partial_break_signals,
             kind: NodeKind::File,
             ino: 0,
         })
@@ -390,6 +412,9 @@ impl Channel {
             closed_read: AtomicBool::new(false),
             closed_write: AtomicBool::new(false),
             nonblocking: AtomicBool::new(nonblocking),
+            // A FIFO is the named pipe, and Linux's `pipe_write` raises the
+            // signal for its partial write exactly as an anonymous pipe's.
+            partial_break_signals: true,
             kind: self.kind,
             ino: self.ino,
         }))
@@ -631,6 +656,18 @@ impl PipeEnd {
             st.written += n as u64;
             Ok(Some(n))
         })
+    }
+
+    /// A partial write whose reader's close cut it short still raises
+    /// `SIGPIPE` on a pipe, though the call answers the bytes that landed.
+    /// The flag says whether this end is one - [`pair_ends`] has the
+    /// measurement and the stream half that stays silent.
+    fn signal_broken_partial(&self) {
+        if !self.partial_break_signals {
+            return;
+        }
+        #[cfg(target_os = "none")]
+        crate::sched::raise_sigpipe();
     }
 
     /// Register the running task, block until the read side could move, then
@@ -941,7 +978,24 @@ impl Inode for PipeEnd {
         }
         let mut done = 0;
         while done < buf.len() {
-            match self.write_once(&buf[done..])? {
+            let step = match self.write_once(&buf[done..]) {
+                Ok(step) => step,
+                Err(e) => {
+                    // The reader left. Bytes already landed make this a
+                    // partial write, and Linux answers their count rather
+                    // than an error - though a pipe's break still raises
+                    // `SIGPIPE`, where a stream's stays silent (`pair_ends`
+                    // has the measurement). With nothing landed the error
+                    // goes up: the syscall door raises the signal there,
+                    // because `MSG_NOSIGNAL` is visible only it.
+                    if done > 0 {
+                        self.signal_broken_partial();
+                        return Ok(done);
+                    }
+                    return Err(e);
+                }
+            };
+            match step {
                 Some(n) => {
                     done += n;
                     // Data arrived for a blocked reader.
@@ -1017,9 +1071,11 @@ impl DuplexEnd {
     /// caller has no process behind the pair.
     pub fn pair(creator: (u32, u32, u32)) -> (Arc<DuplexEnd>, Arc<DuplexEnd>) {
         // Two one-way links. `a_write` feeds `b_read`, and `b_write` feeds
-        // `a_read`, so each end's read half is the other's write half.
-        let (a_read, b_write) = pair();
-        let (b_read, a_write) = pair();
+        // `a_read`, so each end's read half is the other's write half. The
+        // halves are stream ends, not pipes: a partial write they cut short
+        // returns its count without a signal (measured, [`pair_ends`]).
+        let (a_read, b_write) = pair_ends(false);
+        let (b_read, a_write) = pair_ends(false);
         let end = |read: Arc<PipeEnd>, write: Arc<PipeEnd>| {
             Arc::new(DuplexEnd {
                 read,

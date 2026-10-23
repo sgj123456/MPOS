@@ -53,20 +53,14 @@ The three numbers that came out of it, re-measured after Step A (§11.2):
 | Host unit tests | 501 `#[test]` in `src/`, of which 498 run in the host build - the other three are `net/socket.rs`'s, behind the gate V-11 names - and 29 in `xtask/` |
 | Mutual module pairs (a cycle of length 2) | **21**, among the eleven modules that appear in one: `arch`, `console`, `drivers`, `mm`, `net`, `pci`, `rand`, `sched`, `syscall`, `vfs`, `uevent` |
 
-The audit was published with 79 095 lines across 116 files, 491 + 25 tests and *23* pairs. Re-running
-its own script corrects two of those and the correction is worth keeping: the tree has grown since
-(the batch that lands with this document), and **the pair count was one too high** - the list
-`ARCHITECTURE.md` §6 prints has 22 entries, which is what the re-measurement finds before Step A.
-Step A then takes it to 21, for the reason §11.1.7 records: one of those pairs came from a file the
-compiler never saw.
-
-**The same extraction runs as a check now** (§11.2 Step G, `cargo xtask depgraph`), and running it
-that way found a third correction of the same kind: this script matches *text*, so an edge it
-reports can be a doc comment. Measured with `//` comments stripped — i.e. who names whom in code —
-the tree had **20** mutual pairs, not 21: `uaccess → syscall` is a mention in a doc comment, and
-`vfs → uaccess` with it. The ratchet holds the code number — **19** since Step C, which took
-`sched → net` out and with it one pair — and the three baselines it records (re-measured
-2026-10-02) are in §11.2 Step G.
+The audit was published with 79 095 lines across 116 files, 491 + 25 tests and *23* pairs; the table
+above is the re-measured state after Step A. Re-running the script corrected two numbers: the pair
+count was one too high (`ARCHITECTURE.md` §6 prints 22 entries before Step A; Step A takes it to 21
+because one pair came from a file the compiler never saw, §11.1.7), and the script matches *text*, so
+an edge can be a doc comment. Measured with `//` comments stripped — who names whom in code — the
+tree had **20** mutual pairs: `uaccess → syscall` is a mention in a doc comment, and `vfs → uaccess`
+with it. The ratchet holds the code number — **19** since Step C, which took `sched → net` out and
+with it one pair — and its three baselines (re-measured 2026-10-02) are in §11.2 Step G.
 
 That last row is the finding. At module granularity the kernel is one strongly connected
 component: there is no layer that can be compiled, tested or refactored on its own. Every
@@ -97,24 +91,21 @@ fn as_unix(&self) -> Option<&crate::net::unix::UnixSock> { None }
 (The list grew to nine while the audit was being written — `as_syncobj_fd`, `as_sync_file` and
 `as_packet` are the same shape and arrived with the DRM sync-object and AF_PACKET work.)
 
-This is the textbook abstraction leak: the VFS — which is supposed to know only that a node has
-a name, a kind, bytes and an owner — names six device drivers and three network socket types,
-and the *syscall* layer reaches through these to drive a device. Adding a seventh device type
-means editing the VFS trait, so the VFS can never be compiled without `drivers` and `net`, and
-neither can anything that depends on the VFS. It was the largest single contributor to the
-23-cycle count.
+This is the textbook abstraction leak: the VFS — supposed to know only that a node has a name, a
+kind, bytes and an owner — names six device drivers and three network socket types, and the *syscall*
+layer reaches through these to drive a device. Adding a seventh device type means editing the VFS
+trait, so neither the VFS nor anything depending on it can compile without `drivers` and `net`. It
+was the largest single contributor to the 23-cycle count.
 
-**Closed by Step B1 (§11.2)**: all nine are gone and `src/vfs/mod.rs` names `crate::drivers::`
-and `crate::net::` zero times. What replaced them is one type-erased handle that the *caller*
-names a type through — `core::any::Any` as a supertrait plus a single upcast — so the question
-"is this node an `FbDev`?" is asked by the layer that knows what an `FbDev` is, and the trait
-that answers it never hears the name. Adding a tenth device type now touches no VFS code.
+**Closed by Step B1 (§11.2)**: all nine are gone and `src/vfs/mod.rs` names `crate::drivers::` and
+`crate::net::` zero times. One type-erased handle replaced them — `core::any::Any` as a supertrait
+plus a single upcast — so the question "is this node an `FbDev`?" is asked by the layer that knows
+what an `FbDev` is, and adding a tenth device type touches no VFS code.
 
-**What it deliberately did not fix**, so the next reader does not expect it: the
-`drivers ↔ vfs` mutual pair stands. `vfs` still names `drivers` 17 times and `net` 4, from
-`vcmux`'s render/drm calls, `procfs`/`sysfs`'s PCI config reads and `p9`'s virtio-9p device —
-each of which is a *different* finding (V-4's remaining half, and the PCI-config and 9p doors),
-with its own step. V-1 was the downcast cause and it is the one that is closed.
+**What it deliberately did not fix:** the `drivers ↔ vfs` mutual pair stands. `vfs` still names
+`drivers` 17 times and `net` 4, from `vcmux`'s render/drm calls, `procfs`/`sysfs`'s PCI config reads
+and `p9`'s virtio-9p device — each a *different* finding (V-4's remaining half, the PCI-config and 9p
+doors), with its own step. V-1 was the downcast cause and it is closed.
 
 #### 11.1.2 — V-2: device ioctl ABI lives in the syscall layer (severity: high)
 
@@ -152,38 +143,31 @@ path. The scheduler owns *tasks*; it should not know that inotify exists. Each n
 per-open-file resource adds a line here, and each line makes `sched` unbuildable without `net`,
 `vfs` and `drivers`.
 
-**Closed.** Step C turned the exit path into a registry (`sched::exit`) each subsystem
-registers into from `main.rs`, zeroing `sched → net`/`vfs`/`drivers` on that path. The one
-edge it left standing was `execve`'s `FD_CLOEXEC` pass, which named the two input drivers
-directly. That pass now walks a *second* registry, `sched::exit`'s cloexec list, into which
-`drivers::virtio::input` and `drivers::uinput` register the same hooks (from `main.rs`); the
-two lists are deliberately not merged — `execve` tells fewer subsystems than `do_exit`
-because the process lives on — so the distinction Step C refused to flatten into a flag is
-now carried in two typed lists instead. `sched → drivers` is 0, the `drivers ↔ sched`
-mutual pair collapses, and **mutual pairs fell 12 → 11**: the last ratchet drop of Phase 11
-and the precondition for un-gating `sched` for aarch64 (§9.1 stage 6h-adjacent work). Pinned
-by a host test that an exit hook stays silent under `run_cloexec` and vice versa, and by
+**Closed.** Step C turned the exit path into a registry (`sched::exit`) each subsystem registers into
+from `main.rs`, zeroing `sched → net`/`vfs`/`drivers` there. The edge it left was `execve`'s
+`FD_CLOEXEC` pass naming the two input drivers; it now walks a *second* registry, `sched::exit`'s
+cloexec list, into which `drivers::virtio::input` and `drivers::uinput` register the same hooks. The
+two lists are deliberately not merged — `execve` tells fewer subsystems than `do_exit` because the
+process lives on — so the distinction is carried in two typed lists rather than a flag. `sched →
+drivers` is 0, `drivers ↔ sched` collapses, and **mutual pairs fell 12 → 11**, the last ratchet drop
+of Phase 11 and the precondition for un-gating `sched` for aarch64 (§9.1 stage 6h-adjacent work).
+Pinned by a host test that an exit hook stays silent under `run_cloexec` and vice versa, and by
 `cargo xtask test`'s 142 user tests still closing CLOEXEC descriptors on `execve`.
 
-**A related `sched → syscall` reduction (the `abi` leaf).** V-3 was about naming
-*subsystems*; the `sched → syscall` edge (Step C/F's `BASELINE_LOWER_LAYER_TO_SYSCALL`
-row, recorded at 10) was about naming *ABI values* the scheduler needs but does not
-dispatch — the default `umask`, the `clone` flag bits, and the resource-limit model.
-These are arch-neutral (asm-generic `CLONE_*` and `RLIMIT_*` carry the same number on
-x86_64 and aarch64), so they moved to a new `crates/abi` leaf that `sched` names
-downward and that `syscall::linux::{nr,abi}` re-export rather than redefine (one table,
-not two). `MMAP_BASE`, the other former `sched → syscall` read, moved to `crate::mm`
-(an address-space layout fact beside `USER_LIMIT`, not a dispatch one) with a per-arch
-value: x86_64 keeps `0x7f00_0000_0000`, aarch64 gets one derived from `paging::USER_END`
-(`1 << 48`) as *this* kernel's layout choice, to be measured against Linux's aarch64
-mmap base at stage 7 when a process runs. `sched → syscall` fell 10 → 1: the last
-reference was the ptrace/stop block's `abi::uregs::COUNT` (the x86 `user_regs_struct`
-field count sizing ptrace state). **It is 0 now** (§13.2): that field count is the
-machine's (`hal::Contexts::ABI_REG_COUNT` — 27 on x86_64, 34 on aarch64), the block's
-`PTRACE_*`/`SYSCALL_TRAP` protocol words moved into this same leaf, and the
-`target_arch` gate that briefly stood in for the dependency is gone — so the edge is
-empty on both machines, and the `sched ↔ syscall` mutual pair with it. The leaf is `#![no_std]`, host-tested (`clone` values and
-the `setrlimit` soft/hard/root rule pinned), and added to the host-test crate list in
+**A related `sched → syscall` reduction (the `abi` leaf).** That edge (Step C/F's
+`BASELINE_LOWER_LAYER_TO_SYSCALL` row, recorded at 10) was about *ABI values* the scheduler needs but
+does not dispatch — the default `umask`, the `clone` flag bits and the resource-limit model. They are
+arch-neutral (asm-generic `CLONE_*`/`RLIMIT_*` carry the same number on x86_64 and aarch64), so they
+moved to a new `crates/abi` leaf that `sched` names downward and `syscall::linux::{nr,abi}` re-export
+rather than redefine. `MMAP_BASE` moved to `crate::mm` (an address-space fact beside `USER_LIMIT`)
+with a per-arch value: x86_64 keeps `0x7f00_0000_0000`, aarch64 gets one derived from
+`paging::USER_END` (`1 << 48`) as *this* kernel's choice, to be measured against Linux's aarch64 mmap
+base at stage 7. `sched → syscall` fell 10 → 1 (the ptrace/stop block's `abi::uregs::COUNT`), and
+**it is 0 now** (§13.2): that field count is the machine's (`hal::Contexts::ABI_REG_COUNT` — 27 on
+x86_64, 34 on aarch64), the block's `PTRACE_*`/`SYSCALL_TRAP` words moved into the same leaf, and the
+`target_arch` gate that stood in for the dependency is gone — so the edge and the `sched ↔ syscall`
+pair are empty on both machines. The leaf is `#![no_std]`, host-tested (`clone` values and the
+`setrlimit` soft/hard/root rule pinned), and added to the host-test crate list in
 `xtask/src/selftest.rs` and the `ARCHITECTURE.md` §1 graph.
 
 #### 11.1.4 — V-4: the terminal emulator and console live inside the VFS (severity: medium) — **CLOSED** (the `vfs ↔ console` pair is broken; emulator + VC vocabulary + `vtmode` + active-console number in the `term` leaf; see §11.2 Step D)
@@ -209,18 +193,16 @@ a *user* pointer is an inversion — the driver is below the syscall layer in ev
 — and it exists because the helper happens to live there. The helper itself is fine; its home
 is not.
 
-The re-audit at the AF_PACKET/sound landing measured the inversion's bulk differently from how
-it was first described: most of the ~110 below-`syscall` references were not the two helpers at
-all but the **errno constants** — `net/*` (100+), `sched/*` (17), `vfs/epoll.rs` /
-`vfs/timerfd.rs`, `drivers/virtio/sound.rs` (7) and `uevent.rs` each reaching up for a minus
-sign. That half is now **closed**: the table lives at the crate root as `crate::err`
-(`src/err.rs`, re-exported through `syscall` so the layer's own paths are unchanged), and
+The re-audit at the AF_PACKET/sound landing measured the inversion's bulk differently: most of the
+~110 below-`syscall` references were not the two helpers but the **errno constants** — `net/*` (100+),
+`sched/*` (17), `vfs/epoll.rs`/`vfs/timerfd.rs`, `drivers/virtio/sound.rs` (7) and `uevent.rs` each
+reaching up for a minus sign. That half is **closed**: the table lives at the crate root as
+`crate::err` (`src/err.rs`, re-exported through `syscall` so the layer's paths are unchanged), and
 `uevent`'s second upward edge — `self_cred` reading the task table — moved to
-`net::socket::task_identity`, an allowed `net→sched` edge, with `uevent::bind` taking the
-preferred port id as a parameter so the bus stays host-testable. What *remains* of V-5 and V-9
-is exactly `buffer_ok`/`err_of`: 24 `err_of` calls in `net/socket.rs`/`net/unix.rs` and 2
-`buffer_ok` calls in `drivers/drm.rs` plus `net/*`'s pointer checks. B3 below is that move,
-and it is now the whole of what those violations are.
+`net::socket::task_identity`, an allowed `net→sched` edge, with `uevent::bind` taking the preferred
+port id as a parameter so the bus stays host-testable. What *remains* of V-5/V-9 is exactly
+`buffer_ok`/`err_of`: 24 `err_of` calls in `net/socket.rs`/`net/unix.rs`, 2 `buffer_ok` calls in
+`drivers/drm.rs`, plus `net/*`'s pointer checks. B3 below is that move.
 
 #### 11.1.6 — V-6: a temporary trace in the dispatch hot path — **DONE**
 
@@ -233,15 +215,14 @@ It fired on every failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` and printed up 
 in §4.1's udevd note, so it was leftover scaffolding standing in the one path every syscall
 crosses. **Removed, and the four arms are plain calls again** (§11.2 Step A).
 
-The class is worth watching, because it happened twice: the same hunt later left a second
-instrument behind - a `[recvtrace]` wrapper around `net::socket::handle_recvmsg` (the original
-function renamed `recvmsg_inner`, a logging body around it, and `console.rs`'s `DMESG_CAP`
-temporarily raised so the ring would not evict the lines). It was still there when the session
-that added it ended, with the bug it was hunting found by reading eudev's source instead: the
-`recvmsg` that failed was `EINVAL` for a *zero-length iovec* (§4.1). **Removed**, and the
-wrapper collapsed back into one function; the per-task cost of the shape is that a diagnostic
-in the dispatcher or the socket layer is easy to leave, and neither is in anybody's diff when
-the session ends.
+The class is worth watching, because it happened twice: the same hunt later left a `[recvtrace]`
+wrapper around `net::socket::handle_recvmsg` (the original renamed `recvmsg_inner`, a logging body
+around it, and `console.rs`'s `DMESG_CAP` temporarily raised so the ring would not evict the lines).
+It was still there when the session ended, with the bug found by reading eudev's source instead: the
+failing `recvmsg` was `EINVAL` for a *zero-length iovec* (§4.1). **Removed**, and the wrapper
+collapsed back into one function; the per-task cost of the shape is that a diagnostic in the
+dispatcher or the socket layer is easy to leave, and neither is in anybody's diff when the session
+ends.
 
 #### 11.1.7 — V-7: orphan and duplicate machine modules — **DONE**
 
@@ -255,16 +236,14 @@ the session ends.
 Three modules named `pci`, two named `rtc`, two named `serial`, two named `qemu`; two of the
 twelve were dead and one was a duplicate, which is how a reader learns to distrust the tree.
 
-**All three files are deleted** and the module declaration with them; `drivers::rtc` is renamed
-`drivers::rtc_dev` (the node), which leaves `arch::x86_64::rtc` as the only thing called `rtc`
-and the clock as the one that owns the name. The `console.rs` module header, which described
-itself as formatting over `arch::serial`, now names `drivers::serial`.
+**All three files are deleted** with the module declaration; `drivers::rtc` is renamed
+`drivers::rtc_dev` (the node), leaving `arch::x86_64::rtc` as the clock that owns the name. The
+`console.rs` module header now names `drivers::serial`.
 
-*One number fell out of the deletion that is worth keeping.* §11.0's extraction counts mutual
-module pairs by reading every file under `src/`, and it read the two orphans even though the
-compiler never did: the `arch <-> vfs` pair existed **only** because `arch/x86_64/serial.rs`
-mentioned `crate::vfs`. Deleting it takes the count from 22 to 21 - a reminder that an audit by
-text search measures the tree, not the build, which is the same lesson V-7 itself is about.
+*One number fell out of the deletion.* §11.0's extraction reads every file under `src/`, including
+the two orphans the compiler never saw: the `arch <-> vfs` pair existed **only** because
+`arch/x86_64/serial.rs` mentioned `crate::vfs`. Deleting it takes the count 22 → 21 — an audit by
+text search measures the tree, not the build, which is the same lesson V-7 is about.
 
 #### 11.1.8 — V-8: the aarch64 configuration points at a missing file — **DONE**
 
@@ -273,12 +252,11 @@ text search measures the tree, not the build, which is the same lesson V-7 itsel
 development", which understates it: there is no linker script, and `src/arch/mod.rs` says the
 modules will be declared "when they are written rather than now".
 
-**The profile is gone** (`[target.aarch64-unknown-none]` in `.cargo/config.toml`, and the target
-in `rust-toolchain.toml`), with a comment in its place saying what it was and where the port's
-real prerequisites are (§9.1). Re-adding it is one line, next to a linker script that exists -
-which is the point: the configuration no longer advertises a target that cannot be built. The
-alternative the step offered - writing the linker script now - would have been a claim about a
-port nobody has started, and this step is subtraction.
+**The profile is gone** (`[target.aarch64-unknown-none]` in `.cargo/config.toml` and the target in
+`rust-toolchain.toml`), with a comment saying what it was and where the port's real prerequisites are
+(§9.1). Re-adding it is one line next to a linker script that exists: the configuration no longer
+advertises a target that cannot be built. Writing the linker script now would have been a claim about
+a port nobody has started, and this step is subtraction.
 
 #### 11.1.9 — V-10: the handoff ABI is written twice (severity: accepted)
 
@@ -296,14 +274,13 @@ ever evaluated in a build that did not include the file, so those three tests ha
 `net`'s doc comment says its tests "are the conformance programs that run on the machine",
 which is true of the rest of `net` and was false of this file.
 
-**Settled by Step F, and the reading that settled it was of what the three tests pinned rather
-than of how to make them run.** They were `send`/`recv` on a `socketpair`, the
-`sendmsg`/`recvmsg` shapes on the same channel, and its two refusals (`EISCONN` for a
-destination, `EAGAIN` for `MSG_DONTWAIT` on an empty one) — and every one of those is pinned,
-line for line and in more detail, by `user/tests/src/bin/t-sockmsg.rs`, a program the sweep
-*does* boot (its own header names the caller it exists for: sudo's monitor channel). The module
-is deleted, the pins are where they always actually were, and the criterion and its mechanical
-check are §11.2 Step F's below.
+**Settled by Step F, and the reading that settled it was of what the three tests pinned rather than
+of how to make them run.** They were `send`/`recv` on a `socketpair`, the `sendmsg`/`recvmsg` shapes on
+the same channel, and its two refusals (`EISCONN` for a destination, `EAGAIN` for `MSG_DONTWAIT` on an
+empty one) — every one pinned, line for line and in more detail, by `user/tests/src/bin/t-sockmsg.rs`,
+a program the sweep *does* boot (its header names the caller it exists for: sudo's monitor channel).
+The module is deleted, the pins are where they always were, and the criterion and its mechanical
+check are §11.2 Step F's.
 
 #### 11.1.11 — Sizes, for the record
 
@@ -332,20 +309,16 @@ This item was written while the tree did not build: an in-flight refactor (the `
 programs moving into `syscall/` and `integration/` subdirectories, plus edits across `vfs/ext4`,
 `vfs/tty.rs` and the syscall layer) left `cargo test -p mpos --lib --target
 x86_64-unknown-linux-gnu` **failing to compile** — `Tty`/`TtyOutput` unresolved in `vfs/tty.rs`
-and a borrow error in `vfs/ext4/super.rs:501` — and it said no step below should begin until
-that work was finished or reverted, because every acceptance criterion here is "the host tests
-still pass".
+and a borrow error in `vfs/ext4/super.rs:501` — so no step below could begin until it finished,
+because every acceptance criterion here is "the host tests still pass".
 
-**It is finished and committed, and the baseline is green.** `cargo xtask test` reports `498
-passed` host unit tests, `29` from xtask, `=== SUMMARY pass=120 fail=0` from the guest suite, and
-QEMU exit `33` (the clean debug exit). The refactor is what the batch of commits ending at this
-one carries: the suite split into two tiers, and the session's kernel work (seccomp's filter
-mode, the terminal's window, ramfs link counts, the ext4 host tests, a cross-task user copy that
-could reach a supervisor page, and the boot task's park that cost a clock tick on every wake).
-
-So the prerequisite is met and **Step A may begin**. It is the one item in this phase that needs
-no green baseline anyway — it is a deletion — but it has one now, which is what makes its own
-acceptance criterion ("the host test suite and a boot are unchanged") checkable.
+**It is finished and committed, and the baseline is green:** `cargo xtask test` reports `498
+passed` host unit tests, `29` from xtask, `=== SUMMARY pass=120 fail=0` from the guest suite and
+QEMU exit `33`. The refactor is what the batch of commits ending at this one carries: the suite
+split into two tiers, plus the session's kernel work (seccomp's filter mode, the terminal's window,
+ramfs link counts, the ext4 host tests, a cross-task user copy that could reach a supervisor page,
+and the boot task's park that cost a clock tick on every wake). Step A may begin; its own acceptance
+criterion is checkable because of this run.
 
 ---
 
@@ -387,23 +360,14 @@ longer references a nonexistent path.
 **Risk:** the only real risk is deleting something referenced through a macro. Grep first; for
 two of the three files the absence of a `mod` declaration is proof enough.
 
-**Done, and what the run said.** All four rows landed, one commit, no behaviour change.
-
-- The three files are gone and `pub mod pci;` with them.
-- `trace_msg` and its four call sites are gone; the socket arms are plain calls again, and the
-  only sign the trace existed is that a failed `sendto` no longer prints a line.
-- The aarch64 profile is gone from **both** files rather than the linker script being written:
-  §11.1.8 has the reasoning, and the short form is that this step subtracts.
-- `drivers/rtc_dev` is the rename, done with `git mv` so the history follows it, and its module
-  header now says why the name carries `_dev` (`arch::x86_64::rtc` is the clock).
-
-`git grep` for the three old paths returns nothing; the host suite is still **498 passed, 29 in
-xtask**; `cargo xtask test` ends the same way it did before the change - `=== SUMMARY pass=120
-fail=0` and QEMU exit **33** - which is the "unchanged apart from the `[msgtrace]` lines"
-criterion, checked by running it rather than by reading the diff.
-
-The one number that moved is the pair count, from 22 to 21, and §11.1.7 says why: the extraction
-reads files the compiler never saw.
+**Done, and what the run said.** All four rows landed, one commit, no behaviour change. The three
+files and `pub mod pci;` are gone; `trace_msg` and its four call sites are gone, so the socket arms
+are plain calls again. The aarch64 profile went from **both** files rather than the linker script
+being written (§11.1.8). `drivers/rtc_dev` is the rename, done with `git mv`, and its module header
+says why the name carries `_dev` (`arch::x86_64::rtc` is the clock). `git grep` for the three old
+paths returns nothing; the host suite is still **498 passed, 29 in xtask**; `cargo xtask test` ends
+`=== SUMMARY pass=120 fail=0` and QEMU exit **33**, checked by running it. The one number that
+moved is the pair count, 22 → 21 (§11.1.7: the extraction reads files the compiler never saw).
 
 ---
 
@@ -412,19 +376,16 @@ reads files the compiler never saw.
 The largest step, and the one that pays for the others: it removes the largest cause of the
 23-cycle count.
 
-**B1 — Replace the nine `as_*` downcasts with one type-erased handle. — DONE.** The plan offered
-a `vfs::DevNode` carrying an `Arc<dyn DevOps>` with `read`/`write`/`ioctl(cmd, arg)`, installed at
-boot, or a single `as_any`/`downcast_ref` pair over `core::any::Any`, and said either was fine
-because "the point is that `vfs` stops naming the types". **The second shape was taken, and the
-reason is worth recording because the first reads like the better design.** `DevOps` does not fit
-the nine it had to replace. Six of them are device downcasts the syscall layer uses to reach an
-ioctl *the device already owns* (B2 gave every family its own `ioctl`), and the other three are
-`net` recovering its own `UnixSock`/`VsockSock`/`PacketSock` from an `Inode` it minted itself —
-not an ioctl question at all, so a `DevOps` covering them would have to be a god-trait. Worse,
-`dev().ioctl(...)` *reorders the dispatcher*: every device would have to answer `ENOTTY` for every
-family it does not own, instead of the dispatcher routing by family first. That is the plan's own
-named top risk, "this touches every device path at once", and it buys nothing the downcast does
-not.
+**B1 — Replace the nine `as_*` downcasts with one type-erased handle. — DONE.** The plan offered a
+`vfs::DevNode` carrying an `Arc<dyn DevOps>` with `read`/`write`/`ioctl(cmd, arg)`, installed at boot,
+or a single `as_any`/`downcast_ref` pair over `core::any::Any`. **The second was taken.** `DevOps`
+does not fit the nine: six are device downcasts the syscall layer uses to reach an ioctl *the device
+already owns* (B2 gave every family its own `ioctl`), and the other three are `net` recovering its own
+`UnixSock`/`VsockSock`/`PacketSock` from an `Inode` it minted — not an ioctl question, so a `DevOps`
+covering them would be a god-trait. Worse, `dev().ioctl(...)` *reorders the dispatcher*: every device
+would answer `ENOTTY` for every family it does not own instead of the dispatcher routing by family
+first. That is the plan's own named top risk, "this touches every device path at once", and it buys
+nothing the downcast does not.
 
 The shape actually taken, in `src/vfs/mod.rs`:
 
@@ -444,19 +405,17 @@ vtable's own supertrait entry rather than a lookup. Call sites read
 replaced answered `Some` — the same `TypeId` comparison the old override (`Some(self)`) and
 default (`None`) made, just moved from the trait into `core`.
 
-Migration order followed the plan — one device per commit, fbdev first and DRM last — which is
-also the order of the seven commits: fbdev, evdev, uinput, AF_PACKET, AF_VSOCK, AF_UNIX, then the
-DRM card's three node types (`as_drm`, `as_syncobj_fd`, `as_sync_file`) together, since they are
-one device. Each commit deleted its `as_*` method and its `impl` overrides, so the ratchet fell
-as it went: `vfs/mod.rs -> drivers|net` 9 → 8 → 7 → 6 → 5 → 4 → 3 → 0, and the constant in
-`xtask/src/depgraph.rs` is now 0. Every commit was verified with a bare-metal build, fmt, clippy on
-both targets, and the full gate; five of the seven have their device's conformance program in the
-default sweep (`t-fbdev`; `t-evdev`/`t-ioctl`; `t-unix`/`t-unix-dgram`/`t-unix-scm`; `t-drm`/
-`t-drm-args`/`t-drm-lease`/`t-drm-sync`; `t-prime`). Two do not: AF_PACKET's is `t-rawicmp`, which
-`tests.toml` puts in `external`, and was run by name (`--groups external`, green); AF_VSOCK has
-**no** conformance program at all — a test boot deliberately gets no host vsock bus — so its
-guarantee is the type check plus the equivalence above, and saying so is better than implying a
-test ran.
+Migration followed the plan — one device per commit, fbdev first and DRM last — seven commits: fbdev,
+evdev, uinput, AF_PACKET, AF_VSOCK, AF_UNIX, then the DRM card's three node types (`as_drm`,
+`as_syncobj_fd`, `as_sync_file`) together. Each deleted its `as_*` method and `impl` overrides, so the
+ratchet fell as it went: `vfs/mod.rs -> drivers|net` 9 → 8 → 7 → 6 → 5 → 4 → 3 → 0, and the constant
+in `xtask/src/depgraph.rs` is now 0. Every commit got a bare-metal build, fmt, clippy on both targets
+and the full gate; five of the seven have their device's conformance program in the default sweep
+(`t-fbdev`; `t-evdev`/`t-ioctl`; `t-unix`/`t-unix-dgram`/`t-unix-scm`; `t-drm`/`t-drm-args`/
+`t-drm-lease`/`t-drm-sync`; `t-prime`). Two do not: AF_PACKET's is `t-rawicmp`, which `tests.toml`
+puts in `external` (run by name, `--groups external`, green); AF_VSOCK has **no** conformance program
+— a test boot deliberately gets no host vsock bus — so its guarantee is the type check plus the
+equivalence above, and saying so is better than implying a test ran.
 
 **Acceptance — met.** `crate::drivers::` and `crate::net::` do not appear in `src/vfs/mod.rs`;
 `cargo xtask depgraph` prints `vfs/mod.rs -> drivers|net 0/0` and `Within the ratchet: no edge has
@@ -488,89 +447,71 @@ host-compiled and keep their tests; `drivers/drm.rs` already carries most of the
 is closer to this shape than it looks.
 
 **B3 — Move the user-pointer helper out of `syscall`.** `buffer_ok`/`err_of` answer "is this range
-readable/writable by the current task", which is an `mm` question. Add
-`mm::user::{validate, copy_in, copy_out}` and have `syscall`, `net` and `drivers` all call that.
-This deletes V-5 and V-9 at once. (Done ahead of it, at the AF_PACKET/sound landing: the *other*
-thing below `syscall` was after — the errno table — moved out to `crate::err` (§11.1.5), and
-`uevent`'s task-table reach went with it (V-14). What B3 owns now is exactly `buffer_ok`/`err_of`.)
+readable/writable by the current task", an `mm` question; the plan was `mm::user::{validate, copy_in,
+copy_out}` called by `syscall`, `net` and `drivers`. (Done ahead of it: the errno table moved to
+`crate::err` (§11.1.5), and `uevent`'s task-table reach went with it (V-14), so B3 owns exactly
+`buffer_ok`/`err_of`.)
 **LANDED (this pass) — V-9 closed.** The two helpers moved to a crate-root leaf `src/uaccess.rs`
-(`buffer_ok`/`user_accessible`/`MAX_IO` plus the machine-gated `err_of`), mirroring how `err` was
-relocated. The shape is `crate::uaccess`, not `mm::user`: `err_of` maps a `VfsError` (a `vfs` type)
-and `buffer_ok` walks `arch::paging` — neither is an `mm` concept — and a root leaf is what lets any
-layer below `syscall` reach it without naming the ABI layer. The 99 below-`syscall` call-sites in
+(`buffer_ok`/`user_accessible`/`MAX_IO` plus the machine-gated `err_of`), mirroring `err`'s
+relocation. The shape is `crate::uaccess`, not `mm::user`: `err_of` maps a `VfsError` (a `vfs` type)
+and `buffer_ok` walks `arch::paging` — neither is an `mm` concept — and a root leaf lets any layer
+below `syscall` reach it without naming the ABI layer. The 99 below-`syscall` call-sites in
 `net/{socket,unix,packet,vsock}.rs` and `drivers/drm.rs` now name `crate::uaccess::*`; `syscall`
-re-exports the same names for its own handlers, so its ~350 internal sites and `CallerScan` are
-unchanged. V-5's `drm` half is closed the same way (the `sound.rs`→`syscall::linux::abi` edge is the
-V-2 ioctl-ABI concern, not B3's). This is the prerequisite for B2 (kd/evdev 接受-拒绝下沉到驱动), now
-unblocked. Verified: bare-metal build green + host suite `570 passed` + bare-metal clippy clean; the
+re-exports the same names, so its ~350 internal sites and `CallerScan` are unchanged. V-5's `drm` half
+is closed the same way (the `sound.rs`→`syscall::linux::abi` edge is V-2's ioctl-ABI concern, not
+B3's). This is the prerequisite for B2 (kd/evdev 接受-拒绝下沉到驱动), now unblocked. Verified:
+bare-metal build green + host suite `570 passed` + bare-metal clippy clean; the
 `cfg(target_os = "none")` split of `err_of`/`user_accessible` moved intact, applying V-11's lesson.
 **B2 (evdev 下沉到驱动) — attempted, destabilized by a latent DMA bug, root-caused, then LANDED.** Sinking
-`evdev_ioctl` into `EvdevNode::ioctl` (the input driver, mirroring the `'d`→`drivers::drm::drm_ioctl`
+`evdev_ioctl` into `EvdevNode::ioctl` (mirroring the `'d`→`drivers::drm::drm_ioctl`
 precedent, with fd-resolution kept at the syscall boundary) was byte-for-byte the same logic and
 compiled for both targets, yet the guest panicked *reproducibly* mid-suite: the `assert!` in
-`mm::virt_to_phys` (`src/mm/mod.rs:97`) fired on a user address handed to it from a `write`-path
-caller (`virt_to_phys(0x3f…): not an address from the direct map`), aborting before the run ended
-cleanly. Reverting the move restored `=== SUMMARY pass=135 fail=1` with no panic. A pure,
-behaviour-preserving relocation changes no ioctl answer, so this is a **latent memory bug** *exposed*
-by the code-layout change, not an evdev-logic defect — and the caller is now *located*, not guessed:
-of `virt_to_phys`'s four live call sites, the one that runs on a `write` (nr 1) path with a buffer
-pointer is the virtio DMA helper `drivers/virtio/hal.rs:59` `virt_to_phys(buffer.as_ptr())` (the
-framebuffer callers are GPU-only, `free_frames` gets a direct-map address back); i.e. the virtio-net
-TX / sound DMA path handing `virt_to_phys` a buffer that is not in the direct map — the *same*
-net/audio area as the in-flight `t-dhcp`/`t-dsp` reds and the user's active `net/*` + `sound.rs`
-work. **Resolved the same session:** the sound driver's wrong PCI id (`0x1055`→`0x1059`) and its
-user-address DMA hand-off were fixed, the gate reached `=== SUMMARY pass=136 fail=0`, and the evdev
-relocation was re-applied on that clean tree — bare-metal build green, host suite `570 passed`, and
-**guest `pass=136 fail=0` with `t-evdev`/`t-ioctl`/`t-seat` all green**, proving `EvdevNode::ioctl`
-answers identically to the old switchboard. So B2-evdev **LANDED**: the `'E`-typed ioctl serve is now
-owned by the input driver, fd-resolution kept at the syscall boundary (mirroring `'d`→`drm`).
-**B2-kd also LANDED:** the KD accept/reject serve moved to `Tty::kd_ioctl` (the console device in
-`vfs/tty.rs`), with fd→tty→vc resolution and the DRM `card_grabbed_by_current()` check kept at the
-syscall boundary and `owns_card` handed *down* as an argument. That is what dissolves the earlier
-"gated behind V-4" worry I recorded here: because the card answer comes in as a parameter,
-`vfs::tty` never names `drivers`, so no forbidden `vfs→drivers` edge is created, and the KD decode
-leaves the switchboard (V-2) exactly as evdev's did. `request_arg` (its only user) went with it.
-Verified **guest `pass=136 fail=0`** with `t-ioctl`/`t-seat`/`t-tty-eintr`/`t-tty-vtime`/`t-tty-query`
-all green; an intermediate `pass=134 fail=2` was the `t-netlat`/`t-times` timing-flake pair (both
-passed on the re-run — load flakes, not the move). The `'V'` family (`vt_ioctl`) still sits in `fs.rs`:
+`mm::virt_to_phys` (`src/mm/mod.rs:97`) fired on a user address from a `write`-path caller
+(`virt_to_phys(0x3f…): not an address from the direct map`), aborting before the run ended cleanly.
+Reverting the move restored `=== SUMMARY pass=135 fail=1` with no panic. A behaviour-preserving
+relocation changes no ioctl answer, so this was a **latent memory bug** *exposed* by the code-layout
+change — and the caller was located, not guessed: of `virt_to_phys`'s four live call sites, the one
+on a `write` (nr 1) path with a buffer pointer is the virtio DMA helper `drivers/virtio/hal.rs:59`
+`virt_to_phys(buffer.as_ptr())` (the framebuffer callers are GPU-only, `free_frames` gets a
+direct-map address back) — the virtio-net TX / sound DMA path, the same area as the in-flight
+`t-dhcp`/`t-dsp` reds. **Resolved the same session:** the sound driver's wrong PCI id
+(`0x1055`→`0x1059`) and its user-address DMA hand-off were fixed, the gate reached
+`=== SUMMARY pass=136 fail=0`, and the evdev relocation was re-applied on that clean tree — bare-metal
+build green, host suite `570 passed`, guest `pass=136 fail=0` with `t-evdev`/`t-ioctl`/`t-seat` all
+green, proving `EvdevNode::ioctl` answers identically to the old switchboard. **B2-kd also LANDED:**
+the KD accept/reject serve moved to `Tty::kd_ioctl` (the console device in `vfs/tty.rs`), with
+fd→tty→vc resolution and the DRM `card_grabbed_by_current()` check kept at the syscall boundary and
+`owns_card` handed *down* as an argument. Because the card answer comes in as a parameter, `vfs::tty`
+never names `drivers`, so no forbidden `vfs→drivers` edge is created, and the KD decode leaves the
+switchboard (V-2) exactly as evdev's did. `request_arg` (its only user) went with it.
+Verified guest `pass=136 fail=0` with
+`t-ioctl`/`t-seat`/`t-tty-eintr`/`t-tty-vtime`/`t-tty-query` green; an intermediate `pass=134 fail=2`
+was the `t-netlat`/`t-times` timing-flake pair (green on the re-run). The `'V'` family (`vt_ioctl`)
+still sits in `fs.rs`:
 it too reads live console state in `vfs/vcmux`, and would follow the same hand-off shape; left as-is.
 The lesson stands: a behaviour-preserving relocation can only be trusted once the gate is green on the
 *current* tree, since a layout shift unmasks unrelated latent bugs.
 
-**Acceptance:**
-- `crate::drivers::` and `crate::net::` no longer appear in `src/vfs/mod.rs` (the six `as_*`
-  methods are gone).
-- `crate::syscall::` no longer appears anywhere under `src/drivers/` or `src/net/`.
-- `wc -l src/syscall/linux/fs.rs` drops materially from 6 311.
-- Every host test still passes, and `cargo xtask test` still boots with every `/bin/t-*`
-  reporting `=== PASS` — with `t-drm`, `t-drm-args`, `t-fbdev`, `t-evdev`, `t-ioctl`, `t-seat`,
-  `t-prime` and `t-unix*` as the programs that specifically exercise the moved paths.
-**Risk:** this touches every device path at once. Do it one device at a time (fbdev first — the
-smallest contract; DRM last — the largest), keeping that device's conformance program as the
-gate, and never batch two devices into one commit.
+**Plan acceptance, for the record:** no `crate::drivers::`/`crate::net::` in `src/vfs/mod.rs`, no
+`crate::syscall::` under `src/drivers/` or `src/net/`, `fs.rs` materially below 6 311, and every host
+test plus `cargo xtask test` green, one device per commit (fbdev first, DRM last). The met/not-met
+detail is above.
 
 ---
 
 #### Step C — Let subsystems own their per-open-file resources (V-3) — **DONE**
 
-`close_at_exit` ×4 in the scheduler becomes a **registry**: the scheduler keeps a list of hooks
-that each subsystem registers at boot, and on task exit it walks the list, naming nothing but its
-own trait. A subsystem that registers nothing costs nothing.
+The plan: turn `close_at_exit` ×4 in the scheduler into a **registry** of hooks each subsystem
+registers at boot, walked on task exit through nothing but the scheduler's own trait; a subsystem that
+registers nothing costs nothing.
 
-For the exec path, decide per edge rather than abstracting for symmetry: `binfmt::shebang` and
-`vfs::read_file` are genuinely needed to load an image, so either accept the `vfs` edge and
-document it as allowed ("the scheduler loads images from a filesystem" is not a leak in the way
-that "the scheduler closes sockets" is), or hold a narrow `ImageSource` trait. The rule to apply:
-*is this the scheduler's business, or somebody else's?* — per-open-file resource ownership is
-somebody else's; reading an executable is the scheduler's.
-
-**Acceptance:** `sched/runtime.rs` contains no `crate::net::`, no `crate::drivers::` and no
-`crate::vfs::(inotify|locks)` reference; a task that held a socket, an inotify watch, an evdev
-grab and a uinput device is still cleaned up correctly (`t-inotify`, `t-evdev`, `t-filelock`,
-`t-unix-scm` are the gates); `wc -l src/sched/runtime.rs` drops from 6 397.
-**Risk:** teardown order matters — a descriptor's resource must go before the table entry. Pin
-the order with a host test on the registry itself, then keep the guest tests as the end-to-end
-gate.
+For the exec path, decide per edge: `binfmt::shebang` and `vfs::read_file` are genuinely needed to
+load an image, so accept that `vfs` edge and document it as allowed (or hold a narrow `ImageSource`
+trait). Per-open-file resource ownership is somebody else's; reading an executable is the
+scheduler's. Plan acceptance: `runtime.rs` names no `net`/`drivers`/`vfs(inotify|locks)`, a task
+holding a socket, inotify watch, evdev grab and uinput device is still cleaned up (`t-inotify`,
+`t-evdev`, `t-filelock`, `t-unix-scm`), the file falls from 6 397 lines, and the teardown order is
+pinned by a host test on the registry.
 
 **Done, and it took the first mutual pair out of the graph.** The registry is
 `src/sched/exit.rs`: an append-only list of `fn(&[Arc<File>], owner: u32)` hooks, walked from
@@ -598,48 +539,38 @@ as progress rather than as a fence. `sched → vfs` also fell 26 → 22 (locks, 
 and `sched → drivers` 4 → 2.
 
 **The acceptance is met on the exit path and not on the exec path, deliberately.** The two
-remaining `crate::drivers::` references in `runtime.rs` are on `execve`'s `FD_CLOEXEC` pass,
-which tells the input drivers to forget a reader position keyed by an address the new image will
-reuse. That is a *different event* with a *different* pair of subsystems to tell, and Step C's
-own text says the exec path should decide per edge rather than be abstracted for symmetry — so
-the `drivers ↔ sched` pair stands, named in `depgraph.rs` beside the rule, rather than being
-made to disappear behind a general mechanism that would run the socket, watch and lock hooks on
-an event that is not a process ending. The three `crate::vfs::(inotify|locks)` references the
-acceptance names are gone.
+remaining `crate::drivers::` references in `runtime.rs` are `execve`'s `FD_CLOEXEC` pass, which tells
+the input drivers to forget a reader position keyed by an address the new image will reuse. That is a
+*different event* with a *different* pair of subsystems to tell, and Step C's own text says the exec
+path should decide per edge rather than be abstracted for symmetry — so the `drivers ↔ sched` pair
+stands, named in `depgraph.rs` beside the rule, rather than disappearing behind a mechanism that
+would run the socket, watch and lock hooks on an event that is not a process ending.
 
-**Pinned by the registry's own host test** (`hooks_run_in_registration_order_and_an_empty_list_is_not_a_special_case`):
-two hooks that record what they were handed, asserted to run in registration order with both the
-batch and the owner, plus the empty list being a no-op rather than a case the teardown has to ask
-about. It is one test rather than two on purpose — the registry and the recorder are both
-process-global, and the first draft's second test failed for exactly that reason. The end-to-end
-gate stayed the guest's: `t-inotify`, `t-evdev`, `t-filelock` and `t-unix-scm` all report
-`=== PASS`, and the whole sweep after these Phase-11 changes is `=== SUMMARY pass=140 fail=0
-(140 built)` with QEMU exit `33`.
+**Pinned by the registry's own host test**
+(`hooks_run_in_registration_order_and_an_empty_list_is_not_a_special_case`): two hooks that record
+what they were handed, asserted to run in registration order with both the batch and the owner, plus
+the empty list as a no-op. It is one test rather than two on purpose — the registry and the recorder
+are both process-global, and the first draft's second test failed for exactly that reason. The
+end-to-end gate stayed the guest's: `t-inotify`, `t-evdev`, `t-filelock` and `t-unix-scm` all report
+`=== PASS`, and the whole sweep is `=== SUMMARY pass=140 fail=0 (140 built)` with QEMU exit `33`.
 
 ---
 
 #### Step D — Move the terminal emulator out of the VFS (V-4) — **CLOSED** (emulator + VC vocabulary + `vtmode` + the active-console number all in the `term` leaf; the `vfs ↔ console` pair broken by D.2a; D.2b evaluated and rejected)
 
-Create `src/term/` (grid, keys, font, escape parsing) and `src/console/vcmux`, leaving in `vfs`
-only what is a filesystem fact: `/dev/tty*` and `/dev/pts/*` nodes, the line discipline as the
-node's behaviour, and `termios`. `console` then depends on `term`, and `vfs` depends on neither
-`console` nor the render task.
+**Plan:** create `src/term/` (grid, keys, font, escape parsing) and `src/console/vcmux`, leaving in
+`vfs` only filesystem facts (`/dev/tty*` and `/dev/pts/*` nodes, the line discipline, `termios`);
+`console` depends on `term`, and `vfs` on neither. Acceptance: `vfs/` has no font asset, escape parser
+or `vcmux`; `crate::vfs::term` is gone; `console.rs` does not reach into `vfs` for the grid; and
+`cargo xtask run --mode mirror` / `Ctrl-A 1..6` behave as before. Risk: `vfs/term/vga8x16.bin` is
+`include_bytes!`-ed, so a missed path is a compile error.
 
-**Acceptance:** `vfs/` contains no font asset, no escape-sequence parser and no `vcmux`;
-`crate::vfs::term` is gone; `console.rs` no longer reaches into `vfs` for the grid; the three
-`vfs/term` test modules keep passing after the move (they are pure, so the move is mechanical);
-`cargo xtask run --mode mirror` still paints the same screen and `Ctrl-A 1..6` still switches
-virtual consoles.
-**Risk:** `vfs/term/vga8x16.bin` is `include_bytes!`-ed — a missed path is a compile error, which
-is the good outcome.
-
-**Half of it has landed, and the half that landed is the half that was a crate.** Step E's pattern
-applied to the emulator: `src/vfs/term.rs` and `src/vfs/term/` (blit, cursor, font, keymap and the
-4 KiB `vga8x16.bin`) are `crates/term` — `mpos-term`, a leaf that cannot name the kernel — and
-`src/lib.rs` re-exports it as `crate::term`. That is the plan's `src/term/` with the enforcement
-added, and it is the acceptance criterion in the form it can be checked in: `crate::vfs::term` no
-longer exists anywhere, `vfs/` holds no font asset and no escape-sequence parser, and the three
-`vfs/term` test modules moved with the code and run in the new crate (32 pins, unchanged).
+**Half landed, and the half that landed was a crate.** `src/vfs/term.rs` and `src/vfs/term/` (blit,
+cursor, font, keymap and the 4 KiB `vga8x16.bin`) became `crates/term` — `mpos-term`, a leaf that
+cannot name the kernel — re-exported as `crate::term`. That is the plan's `src/term/` with the
+enforcement added: `crate::vfs::term` no longer exists, `vfs/` holds no font asset and no
+escape-sequence parser, and the three `vfs/term` test modules moved and run in the new crate (32 pins,
+unchanged).
 
 The one place this differs from the plan's own sketch is *who moves*: the plan said `console`
 "then depends on `term`", and the extraction made that literal — `console.rs` (3 references),
@@ -660,45 +591,39 @@ first is the shared vocabulary — the console count and the KD mode words are c
 **D.1 — the shared vocabulary moved. LANDED (this pass, green).** `VC_COUNT` (was
 `vfs::pty::VC_COUNT`) and the `KD_TEXT`/`KD_GRAPHICS`/`K_RAW`/`K_XLATE`/`K_MEDIUMRAW`/`K_UNICODE`/
 `K_OFF` mode words (were `vfs::tty::*`) now live in `crates/term/src/vc.rs` as `crate::term::vc::*`.
-`term` is a leaf that `vfs`, `console` and the drivers already depend on, so naming it is downward
-for all of them — this is the prerequisite the paragraph above named, and it is what lets the next
-sub-commit move the `vcmux` *file* without re-creating the pair. A pure relocation: `drivers/video`,
-`drivers/devices` and `drivers/virtio/input` stop naming `vfs::pty`/`vfs::tty` for these constants;
-`vfs::{tty,pty,vcmux}` name `crate::term::vc` instead. Verified behaviour-preserving — bare-metal
-build green, host suite unchanged at `528 passed`, `cargo xtask depgraph` reports "no edge appeared
-and no count has grown" (`crate::term` stays out of the mutual-pair set, and `vfs/mod.rs →
-drivers|net` stays 0), and the full gate ends `=== SUMMARY pass=140 fail=0`, exit **33**, with
-`t-seat`/`t-tty-eintr`/`t-tty-vtime`/`t-tty-query`/`t-ioctl`/`t-drm-lease` (the programs that read
-the KD/KD-mode state through the moved path) all `=== PASS`.
+`term` is a leaf that `vfs`, `console` and the drivers already depend on, so naming it is downward for
+all of them, which is what lets the next sub-commit move the `vcmux` *file* without re-creating the
+pair. A pure relocation: `drivers/video`, `drivers/devices` and `drivers/virtio/input` stop naming
+`vfs::pty`/`vfs::tty` for these constants; `vfs::{tty,pty,vcmux}` name `crate::term::vc` instead.
+Verified behaviour-preserving — bare-metal build green, host suite unchanged at `528 passed`,
+`cargo xtask depgraph` reports "no edge appeared and no count has grown" (`crate::term` stays out of
+the mutual-pair set, `vfs/mod.rs → drivers|net` stays 0), and the full gate ends
+`=== SUMMARY pass=140 fail=0`, exit **33**, with
+`t-seat`/`t-tty-eintr`/`t-tty-vtime`/`t-tty-query`/`t-ioctl`/`t-drm-lease` all `=== PASS`.
 
 **D.1b — the handover table moved too. LANDED (this pass, green).** `vfs::vtmode` (the pure
 `VT_AUTO`/`VT_PROCESS` release/decision table — `VtMode`, `Decision`, `Ack`, `Promise`, `Signal`,
-`Release`, `Table`, `RELEASE_TIMEOUT_TICKS`) is a self-contained state machine: it named no kernel
-module at all (only `alloc::vec`), so like the `evdev`/`uinput`/`term` extractions before it it is a
-leaf lifted out so a host build can argue with it. It now lives at `crates/term/src/vtmode.rs` as
-`crate::term::vtmode` — the same leaf that holds the VC vocabulary, since `term`'s own header claims
-"which of the six virtual consoles is active" as its business. `vfs::vcmux` and `vfs::tty` name it
-there; `vfs/mod.rs` no longer declares it. Host coverage preserved: the 17 `vtmode` tests moved from
-the kernel's `-p mpos` run (528 → 511) into `-p mpos-term` (32 → 49), and `cargo xtask depgraph` still
-reports no edge appeared and no count grew (`vfs/mod.rs → drivers|net` stays 0; `term` is out of the
-mutual-pair set).
+`Release`, `Table`, `RELEASE_TIMEOUT_TICKS`) is a self-contained state machine that named no kernel
+module at all (only `alloc::vec`), so it is a leaf a host build can argue with. It now lives at
+`crates/term/src/vtmode.rs` as `crate::term::vtmode`, the same leaf that holds the VC vocabulary and
+claims "which of the six virtual consoles is active" as its business. `vfs::vcmux` and `vfs::tty` name
+it there; `vfs/mod.rs` no longer declares it. Host coverage preserved: the 17 `vtmode` tests moved
+from the kernel's `-p mpos` run (528 → 511) into `-p mpos-term` (32 → 49), and `cargo xtask depgraph`
+still reports no edge appeared and no count grew.
 
-**D.2a — the pair is broken. LANDED (this pass, green), and the premise corrected.** The plan (and
-the paragraph above) assumed the pair stood on the mux's `vfs → console`/`vfs → drivers` *calls*. The
-measurement says otherwise: a mutual pair collapses the moment *either* direction hits zero
-(`xtask/src/depgraph.rs:104-110`), and `console → vfs` was a **single** reference — `src/console.rs`'s
-`active_grid()` reading `crate::vfs::vcmux::active()` for "which console is on screen." So the cheap
-inversion was not the mux's outbound calls at all; it was that one inbound read. The active-console
-number — a lone `AtomicU32` — moved from `vfs::vcmux` to the `term` leaf (`crate::term::vc::active`/
-`set_active`, which already declares "which of the six virtual consoles is active" its business, like
-D.1/D.1b before it). `console.rs` and the drivers now read `crate::term::vc::active`; the mux writes
-it there and reads it there too. `console → vfs` = 0, the pair collapsed to a one-way `vfs → console`,
-and **mutual pairs fell 18 → 17** — the first number Phase 11 has lowered since Step C, ratcheted by
-`BASELINE_MUTUAL_PAIRS = 17`. Behaviour-preserving: bare-metal build green, host suites unchanged
-(`511` kernel + `49` term + `47` xtask), `cargo xtask depgraph` reports `console ↔ vfs` gone and no
-new edge, and the full gate ends `=== SUMMARY pass=140 fail=0`, exit 33, with `t-seat`/`t-tty-*`/
-`t-drm`/`t-fbdev` (the programs that read and switch the active console through the moved state) all
-PASS.
+**D.2a — the pair is broken. LANDED (this pass, green), and the premise corrected.** The plan assumed
+the pair stood on the mux's `vfs → console`/`vfs → drivers` *calls*. The measurement says otherwise: a
+mutual pair collapses the moment *either* direction hits zero (`xtask/src/depgraph.rs:104-110`), and
+`console → vfs` was a **single** reference — `src/console.rs`'s `active_grid()` reading
+`crate::vfs::vcmux::active()`. So the cheap inversion was that one inbound read, not the mux's
+outbound calls. The active-console number — a lone `AtomicU32` — moved from `vfs::vcmux` to the `term`
+leaf (`crate::term::vc::active`/`set_active`); `console.rs` and the drivers now read it there, and the
+mux writes and reads it there too. `console → vfs` = 0, the pair collapsed to a one-way
+`vfs → console`, and **mutual pairs fell 18 → 17** — the first number Phase 11 has lowered since Step
+C, ratcheted by `BASELINE_MUTUAL_PAIRS = 17`. Behaviour-preserving: bare-metal build green, host
+suites unchanged (`511` kernel + `49` term + `47` xtask), `cargo xtask depgraph` reports
+`console ↔ vfs` gone and no new edge, and the full gate ends `=== SUMMARY pass=140 fail=0`, exit 33,
+with `t-seat`/`t-tty-*`/`t-drm`/`t-fbdev` all PASS.
 
 **D.2b — evaluated and REJECTED. Step D CLOSED at its acceptance criterion.** The remaining item was
 relocating the `vcmux.rs` *file* out of `vfs` (into `console`), inverting its outbound `vfs → console`
@@ -708,24 +633,23 @@ valuable landing, so it is not done:
 
 - **The move would regress the layering.** `console` is a designed leaf — `AGENTS.md` §3 lets it name
   only `arch`, `boot` and `term`. `vcmux` names `vfs`(`pty`/`tty`), `drivers`(`drm`/`video`) and
-  `sched`; relocating it to `console` turns `console` into a mid-layer that depends on all three, the
+  `sched`; relocating it to `console` turns `console` into a mid-layer depending on all three, the
   opposite of V-4. A bare move first *re-creates* `console → vfs` from the mux's 7 `pty`/`tty` calls
   (`lookup`/`pairs`/`master_ready`/`take_master` and `tty::global().receive_byte`), undoing D.2a.
-- **A mux-only inversion yields zero ratchet gain.** Current `cargo xtask depgraph` (measured):
-  `console ↔ vfs` is **already gone**; `vfs → console` is 8 references but only 5 are in `vcmux` — the
-  other 3 are `tty.rs` (2) and `ext4` (1), so the mux cannot zero the edge; and `vfs → drivers` is 17,
-  of which only 7 are `vcmux` (the other 10 are `procfs`/`sysfs`/`p9` device-state reads). So the
-  surviving `drivers ↔ vfs` mutual pair is not `vcmux`'s to break — it is the procfs/sysfs/9p door, a
-  different finding (§11.1).
+- **A mux-only inversion yields zero ratchet gain.** Measured: `console ↔ vfs` is **already gone**;
+  `vfs → console` is 8 references but only 5 are in `vcmux` (the other 3 are `tty.rs` (2) and `ext4`
+  (1)), so the mux cannot zero the edge; `vfs → drivers` is 17, of which only 7 are `vcmux` (the other
+  10 are `procfs`/`sysfs`/`p9` device-state reads). The surviving `drivers ↔ vfs` pair is not
+  `vcmux`'s to break — it is the procfs/sysfs/9p door, a different finding (§11.1).
 - **The cost is real:** the change threads boot-registered hooks through the seat/DRM/render pump — the
   subsystem whose "nearly-right" regressions (untagged devices, a dropped pointer) this repo has
   repeatedly paid for — for no measurable improvement.
 
 Per §4 ("refuse rather than approximate", "high cohesion — locate the module that owns the concept"),
-Step D is **closed**: the dependency cycle it targeted (`vfs ↔ console`) is broken, the terminal
-emulator, VC vocabulary, `vtmode` and the active-console number all live in the `term` leaf, and the
-`vcmux` file stays in `vfs` where its pty/tty orchestration coherently belongs. The residual `drivers ↔
-vfs` pair is recorded against its own finding, not against Step D.
+Step D is **closed**: the `vfs ↔ console` cycle is broken, the terminal emulator, VC vocabulary,
+`vtmode` and the active-console number all live in the `term` leaf, and the `vcmux` file stays in `vfs`
+where its pty/tty orchestration belongs. The residual `drivers ↔ vfs` pair is recorded against its own
+finding, not against Step D.
 
 ---
 
@@ -740,24 +664,23 @@ switchboard — whichever the size says.
 unchanged.
 
 **Landed.** The size said split (B2 shrank the ioctl arms but the file was still 6833 lines). It went
-to a directory module `src/syscall/linux/fs/` rather than two top-level files, because that is the
-shape that keeps `syscall/linux/mod.rs`'s ~95 `fs::<handler>` references byte-for-byte identical — the
-acceptance criterion in the form it can be checked: `fs/mod.rs` holds the module header, the one helper
-both halves call (`sync_nonblocking`), and re-exports the entry points (`pub(super) use file::*;
-pub(super) use ioctl::*;`), so the dispatch still names `fs::handle_read`, `fs::handle_ioctl`, … with no
-change upstream. `fs/file.rs` (5523 lines) is the path-carrying handlers and their private helpers
-(`Xattr`, `base_of`, `record_lock`/`lock_take` with both cfg bodies moved together, the `flock_off`
-submodule); `fs/ioctl.rs` (1281 lines) is `handle_ioctl` and the contiguous per-family routers
-(`family_nr`/`vt_ioctl`/`kd_ioctl`/`fs_flags_ioctl`/`uinput_ioctl`/`evdev_ioctl`/`ifreq_index`/
-`ifreq_flags`). The measurement showed the seam is unusually clean: the entire device-ioctl footprint is
-one contiguous region, and exactly one helper crosses it. `fs` is machine-only
-(`#[cfg(target_os = "none")] pub mod fs`), so the kernel host build never compiles it — which is why
-this is verified by the bare-metal build and the QEMU gate rather than the host suite. Pure relocation:
-`cargo build --target x86_64-unknown-none` green with clippy back to its 29-warning baseline (no new
-lint), `cargo xtask depgraph` unchanged (mutual pairs 17/17 — `fs` lives inside `syscall`, so no module
-edge moves), host suite unchanged at 511, and the full gate ends `=== SUMMARY pass=140 fail=0`, exit
-**33** — the path/file and every ioctl-family conformance program (`t-ioctl`, `t-drm`, `t-fbdev`,
-`t-tty-*`, `t-seat`, `t-hwclock`, …) pass on the relocated handlers.
+to a directory module `src/syscall/linux/fs/` rather than two top-level files, because that keeps
+`syscall/linux/mod.rs`'s ~95 `fs::<handler>` references byte-for-byte identical: `fs/mod.rs` holds the
+module header, the one helper both halves call (`sync_nonblocking`), and re-exports the entry points
+(`pub(super) use file::*; pub(super) use ioctl::*;`), so the dispatch still names `fs::handle_read`,
+`fs::handle_ioctl`, … unchanged. `fs/file.rs` (5523 lines) is the path-carrying handlers and their
+private helpers (`Xattr`, `base_of`, `record_lock`/`lock_take` with both cfg bodies moved together,
+the `flock_off` submodule); `fs/ioctl.rs` (1281 lines) is `handle_ioctl` and the contiguous per-family
+routers (`family_nr`/`vt_ioctl`/`kd_ioctl`/`fs_flags_ioctl`/`uinput_ioctl`/`evdev_ioctl`/
+`ifreq_index`/`ifreq_flags`). The seam is unusually clean: the entire device-ioctl footprint is one
+contiguous region, and exactly one helper crosses it. `fs` is machine-only
+(`#[cfg(target_os = "none")] pub mod fs`), so the kernel host build never compiles it — hence the
+bare-metal build and QEMU gate rather than the host suite. Pure relocation:
+`cargo build --target x86_64-unknown-none` green with clippy back to its 29-warning baseline,
+`cargo xtask depgraph` unchanged (mutual pairs 17/17 — `fs` lives inside `syscall`, so no module edge
+moves), host suite unchanged at 511, and the full gate ends `=== SUMMARY pass=140 fail=0`, exit **33**
+— the path/file and every ioctl-family conformance program (`t-ioctl`, `t-drm`, `t-fbdev`, `t-tty-*`,
+`t-seat`, `t-hwclock`, …) pass on the relocated handlers.
 
 
 ---
@@ -767,91 +690,69 @@ edge moves), host suite unchanged at 511, and the full gate ends `=== SUMMARY pa
 *The one step in this phase that is pure rule-making: it changes no behaviour and removes no
 cycle, and it exists because the gate's failures are silent.*
 
-1. Settle the `net` case: either declare `pub mod net` for the host too — which means moving the
-   pure parts of `net/socket.rs` out from under the gate, since `smoltcp` is gated in
-   `Cargo.toml` — or delete the unreachable test module and say so. Pick one; do not leave the
-   annotation lying.
-2. Write the criterion down (`AGENTS.md` §3 and a header comment in `src/lib.rs`): *a module is
-   host-compiled when its logic touches no hardware, no port I/O, no virtio ring and no real
-   clock — and then its dependencies must be host-compiled too, transitively.* The transitive
-   half is the part that gets forgotten.
-3. Add a cheap mechanical check: a host test in `xtask` that walks `src/**/*.rs` and fails when a
-   `#[cfg(test)]` module sits in a file whose nearest declaring parent is gated
-   `target_os = "none"`. Crude, but it catches the V-11 class without a compiler change.
-
-**Acceptance:** the check fails on today's `net/socket.rs` and passes after the fix;
-`cargo test -p mpos-xtask` covers it.
+**Plan:** settle the `net` case (host-compile it or delete the unreachable test module and say so);
+write the criterion down in `AGENTS.md` §3 and `src/lib.rs` — *a module is host-compiled when its
+logic touches no hardware, no port I/O, no virtio ring and no real clock, and its dependencies must
+be host-compiled too, transitively*; and add a mechanical check. **Acceptance:** the check fails on
+today's `net/socket.rs` and passes after the fix; `cargo test -p mpos-xtask` covers it.
 
 **Done, and the three answers the step asked for.**
 
-*Which way `net` went, and why it is the cheap way rather than the lazy one.* The plan offered
-"host-compile it, or delete the module and say so" as if they were equivalents; they are not, and
-the tie-breaker was coverage rather than effort. Making `net` host-compilable means a device seam
-for `drivers::virtio::net::VirtioNet` and a clock seam for `arch::timer` (10 machine references
-across `net/mod.rs`, `net/socket.rs` and `net/vsock.rs`, plus `smoltcp` moved out from under the
-`target_os = "none"` dependency) — real Phase-11 B work, not Step F work. The three tests, read
-instead of assumed, turned out to be `t-sockmsg`'s subject: `user/tests/src/bin/t-sockmsg.rs`
-pins `send`/`recv` both ways, the `sendmsg`/`recvmsg` gather and its "no address, no control
-data, no flags" answer, `MSG_DONTWAIT` on an empty pair as `EAGAIN`, and a destination on a
-connected pair as `EISCONN` — the same four claims, in a program that boots. So the module is
-deleted and §11.1.10 records where its coverage lives; a comment at the end of `net/socket.rs`
-says the same to the next reader, and names the check that keeps a fourth from being written.
+*Which way `net` went, and why it is the cheap way rather than the lazy one.* "Host-compile it, or
+delete the module and say so" are not equivalents, and the tie-breaker was coverage rather than
+effort. Making `net` host-compilable means a device seam for `drivers::virtio::net::VirtioNet` and a
+clock seam for `arch::timer` (10 machine references across `net/mod.rs`, `net/socket.rs` and
+`net/vsock.rs`, plus `smoltcp` moved out from under the `target_os = "none"` dependency) — real
+Phase-11 B work, not Step F work. The three tests, read instead of assumed, turned out to be
+`t-sockmsg`'s subject: `user/tests/src/bin/t-sockmsg.rs` pins `send`/`recv` both ways, the
+`sendmsg`/`recvmsg` gather and its "no address, no control data, no flags" answer, `MSG_DONTWAIT` on an
+empty pair as `EAGAIN`, and a destination on a connected pair as `EISCONN` — the same four claims, in a
+program that boots. The module is deleted and §11.1.10 records where its coverage lives; a comment at
+the end of `net/socket.rs` says the same and names the check that keeps a fourth from being written.
 
-*The criterion is written down in one place and named from the others*: `src/lib.rs`'s header
-carries it (with the transitive half spelled out and the two ways it fails silently), `AGENTS.md`
-§3 points at it and keeps its "when you gate a module, check what gates its tests" instruction,
-and `ARCHITECTURE.md` §8 states it and records V-11's closure.
+*The criterion is written down in one place and named from the others*: `src/lib.rs`'s header carries
+it (with the transitive half and the two ways it fails silently), `AGENTS.md` §3 points at it and keeps
+its "when you gate a module, check what gates its tests" instruction, and `ARCHITECTURE.md` §8 states
+it and records V-11's closure.
 
 *The check is `xtask/src/gates.rs`, and it is pinned against itself.* `dead_host_tests` walks
-`src/lib.rs`'s `mod` declarations, resolves each to `dir/name.rs` or `dir/name/mod.rs` the way
-the compiler does, and carries the gate down — so a file under an ungated-but-gated-child module
-is caught as well as one declared gated directly. It is run at the head of `cargo xtask test`,
-so the failure is a named error rather than a test count nobody reads, and its four unit tests
-include the counterfactual this kind of checker needs: a two-file tree with the *same*
-`#[cfg(all(test, not(target_os = "none")))]` in one gated and one ungated file, where the first
-must be reported and the second must not. Two more pin the gate arithmetic — the ungated sibling,
-and the boot handoff's own `#[cfg(all(any(target_os = "none", test), target_arch = "x86_64"))]`,
-which names the host by way of `test` and so must *not* read as machine-only.
+`src/lib.rs`'s `mod` declarations, resolves each to `dir/name.rs` or `dir/name/mod.rs` the way the
+compiler does, and carries the gate down — so a file under an ungated-but-gated-child module is caught
+as well as one declared gated directly. It runs at the head of `cargo xtask test`, so the failure is a
+named error rather than a test count nobody reads. Its four unit tests include the counterfactual this
+kind of checker needs: a two-file tree with the *same*
+`#[cfg(all(test, not(target_os = "none")))]` in one gated and one ungated file, where the first must be
+reported and the second must not. Two more pin the gate arithmetic — the ungated sibling, and the boot
+handoff's own `#[cfg(all(any(target_os = "none", test), target_arch = "x86_64"))]`, which names the
+host by way of `test` and so must *not* read as machine-only.
 
-*Verified, in the counterfactual order the plan asked for:* with the check in place and the module
-still present, `cargo test -p mpos-xtask` failed on exactly one violation — `src/net/socket.rs`,
-gated by `crate::net::socket`; after the deletion the same command is `42 passed`, the bare-metal
-build is green with the same single pre-existing warning, and the host kernel suite is unchanged.
+*Verified in the counterfactual order the plan asked for:* with the check in place and the module still
+present, `cargo test -p mpos-xtask` failed on exactly one violation — `src/net/socket.rs`, gated by
+`crate::net::socket`; after the deletion the same command is `42 passed`, the bare-metal build is green
+with the same single pre-existing warning, and the host kernel suite is unchanged.
 
 ---
 
 #### Step G — Keep the graph from regressing — **DONE**
 
-Once A–F have landed, freeze the result. Add to `xtask` a `depgraph` subcommand (or a host test)
-that re-runs §11.0's extraction and asserts:
-
-- no edge from a lower layer into `syscall` (`drivers`, `net`, `blk`, `pci`, `rand`, `uevent`,
-  `vfs`, `sched` must not reference `crate::syscall::`);
-- no `crate::drivers::` or `crate::net::` reference from `vfs/mod.rs`;
-- the measured cycle count is at or below the recorded baseline.
-
-The baseline is what makes it useful: a **ratchet**, not a cliff. Store it as a constant next to
-the check with a comment naming the date and the number, so a reduction is a commit somebody can
-make and a regression is a failing test.
-
-**Acceptance:** `cargo xtask depgraph` reports the current edge and cycle counts and fails when
-either worsens.
+**Plan:** add a `depgraph` subcommand (or host test) that re-runs §11.0's extraction and asserts no
+lower-layer edge into `syscall` (`drivers`, `net`, `blk`, `pci`, `rand`, `uevent`, `vfs`, `sched`),
+no `crate::drivers::`/`crate::net::` from `vfs/mod.rs`, and the cycle count at or below a recorded
+baseline — a **ratchet**, not a cliff, stored as a dated constant next to the check.
+**Acceptance:** `cargo xtask depgraph` reports both counts and fails when either worsens.
 
 **Done — and one correction to the method, which is the interesting part.** The ratchet is
 `xtask/src/depgraph.rs`, reachable as `cargo xtask depgraph` and also run as a host test, so it is
-inside `cargo xtask test` rather than beside it. It measures the tree the way §11.0's script does
-— every file under `src`, each mapped to its top-level module, every `crate::<mod>` reference an
-edge — with **one deliberate difference: `//` comments are stripped before matching.** That was
-not a tidy-up; it is what makes the number mean "who names whom". §11.0 matches text, which is why
-the audit it published counted three edges that are prose: `uaccess → syscall` is a doc comment
-(and `vfs → uaccess` with it), and the third pair `arch ↔ vfs` came from a file the compiler never
-saw at all (§11.1.7's deleted `arch/x86_64/serial.rs`). Measured both ways on this tree: **23**
-mutual pairs by text, **20** in code. The ratchet holds the code number, because a rule that fires
-on a sentence is a rule people learn to word around.
+inside `cargo xtask test` rather than beside it. It measures the tree the way §11.0's script does —
+every file under `src`, each mapped to its top-level module, every `crate::<mod>` reference an edge —
+with **one deliberate difference: `//` comments are stripped before matching.** That is what makes the
+number mean "who names whom". §11.0 matches text, which is why the audit counted three edges that are
+prose: `uaccess → syscall` is a doc comment (and `vfs → uaccess` with it), and the third pair
+`arch ↔ vfs` came from a file the compiler never saw (§11.1.7's deleted `arch/x86_64/serial.rs`).
+Measured both ways on this tree: **23** mutual pairs by text, **20** in code. The ratchet holds the
+code number, because a rule that fires on a sentence is a rule people learn to word around.
 
-**The rules are ratchets rather than absolute refusals, and that is a statement about where in
-the plan this landed.** Steps A, E and F are done and B/C are not, so two of the three rules are
-*not yet* zero, and a check born red is one nobody reads. Each constant names the call sites that
+**The rules are ratchets rather than absolute refusals.** Each constant names the call sites that
 keep it non-zero and the step that removes them:
 
 | Rule | Measured 2026-10-02 | What kept it there | Removed by |
@@ -886,35 +787,28 @@ shown able to go red on each of the three rules.
 3. ~~**Step B** — the device seam, one device at a time.~~ **Done** (§11.2 Step B): B3 moved the
    user-pointer helpers to the `uaccess` leaf, B2 put every device family's ioctl contract next to
    the state it answers from, and B1 (fbdev, evdev, uinput, AF_PACKET, AF_VSOCK, AF_UNIX, then the
-   DRM family last) deleted the nine `Inode::as_*` downcasts, taking `vfs/mod.rs → drivers|net`
-   from 9 to 0. The pair count did not move with it — that is V-4's and the PCI-config/9p doors'
-   share of the cluster, not the downcasts'.
+   DRM family last) deleted the nine `Inode::as_*` downcasts, taking `vfs/mod.rs → drivers|net` 9 → 0.
+   The pair count did not move with it — that is V-4's and the PCI-config/9p doors' share.
 4. ~~**Step C** — the resource registry.~~ **Done** (§11.2 Step C): the exit hooks live in
    `sched::exit`, registered by `main.rs`, and the `net ↔ sched` pair is gone.
 5. ~~**Step D** — the terminal emulator move.~~ **Done** (§11.2 Step D): D.1/D.1b/D.2a moved the VC
-   vocabulary, the pure `vtmode` table and the active-console number into `crate::term`, collapsing the
-   `vfs ↔ console` mutual pair — **mutual pairs 18 → 17**, the first ratchet drop since Step C; gate
-   green `pass=140 fail=0`. **D.2b (relocate the `vcmux` file to `console`) was measured and rejected**
-   — `console` is a leaf the mux's `vfs`/`drivers`/`sched` naming would violate, and a mux-only
-   inversion moves no ratchet (`vfs → console` and `vfs → drivers` each have non-`vcmux` callers). Step
-   D's dependency cycle is closed; the surviving `drivers ↔ vfs` pair is tracked as its own finding.
-6. ~~**Step E** — the `fs.rs` split, if B2 has not already made it unnecessary.~~ **Done** (§11.2 Step E):
-   the file was still 6833 lines, so it split along the path/file ↔ device-ioctl seam into
-   `src/syscall/linux/fs/{mod,file,ioctl}.rs`; `mod.rs` re-exports the entry points so `mod.rs`'s
-   `fs::<handler>` dispatch is unchanged. Gate green `pass=140 fail=0`, depgraph unchanged (17/17).
-7. ~~**Step F** — the gate criterion and the check for it.~~ **Done** (§11.2 Step F): the
-   criterion is in `src/lib.rs`/`AGENTS.md`, the dead test module is deleted with its coverage
-   named, and `xtask/src/gates.rs` fails the sweep on the shape.
-8. ~~**Step G** — the ratchet.~~ **Done** (§11.2 Step G): `cargo xtask depgraph` measures the
-   graph with comments stripped and holds three recorded baselines; it is also a host test, so
-   `cargo xtask test` runs it.
+   vocabulary, the pure `vtmode` table and the active-console number into `crate::term`, collapsing
+   `vfs ↔ console` — **mutual pairs 18 → 17**; gate green `pass=140 fail=0`. **D.2b was measured and
+   rejected** — `console` is a leaf the mux's `vfs`/`drivers`/`sched` naming would violate, and a
+   mux-only inversion moves no ratchet. The surviving `drivers ↔ vfs` pair is its own finding.
+6. ~~**Step E** — the `fs.rs` split.~~ **Done** (§11.2 Step E): still 6833 lines, so it split into
+   `src/syscall/linux/fs/{mod,file,ioctl}.rs`; `mod.rs` re-exports the entry points so the
+   `fs::<handler>` dispatch is unchanged. Gate green `pass=140 fail=0`, depgraph 17/17.
+7. ~~**Step F** — the gate criterion and the check for it.~~ **Done** (§11.2 Step F): the criterion is
+   in `src/lib.rs`/`AGENTS.md`, the dead test module is deleted with its coverage named, and
+   `xtask/src/gates.rs` fails the sweep on the shape.
+8. ~~**Step G** — the ratchet.~~ **Done** (§11.2 Step G): `cargo xtask depgraph` measures the graph
+   with comments stripped and holds three recorded baselines; it also runs as a host test.
 
-Steps A, E, F and G were mechanical (a day each) and landed; B, C and D needed the device/scheduler/console
-paths and have also landed (D's remaining D.2b file-move was measured and rejected as a layering
-regression with no ratchet value — §11.2). **Phase 11 is closed except one surviving mutual pair: `drivers
-↔ vfs`, which is the `procfs`/`sysfs`/`p9` device-state door (§11.1), not any Step.** Nothing here had to
-land before the feature work in Phases 1–10 — but every feature lands *cheaper* after B and C, which is
-the argument for having done them first.
+Steps A, E, F and G were mechanical (a day each); B, C and D needed the device/scheduler/console paths.
+**Phase 11 is closed except one surviving mutual pair: `drivers ↔ vfs`, the `procfs`/`sysfs`/`p9`
+device-state door (§11.1), not any Step.** Nothing here had to land before Phases 1–10 — but every
+feature lands *cheaper* after B and C, which is the argument for having done them first.
 
 **Deliberately not in this plan:**
 
@@ -971,35 +865,31 @@ not host+clippy alone. S1 was pure re-routing — host tests, both clippy target
 were the whole measurement, and its own reds (none) would have been a compile error, not a
 machine bug.
 
-**S4's design finding, found by measuring rather than by planning it.** The plan above said the
-register-frame knowledge would move into `arch/<arch>`. Measuring what is left showed why only
-half of it can: after S1–S3 exactly two modules still name `crate::arch::` — `sched` (17, the
-saved `Context`, `FpuState`, `UserContext` and the switch/FPU/bootstrap calls) and
-`syscall/linux/proc.rs` (4: `gdt::user_selectors` twice and the `UserContext` literal).
-
-The frame's **constructor** can move down — building a frame from the gate's trap record is a
-pure machine fact, and moving it is what removes the `SegmentSelector` from the ABI layer. But
-the frame's conversion **into** the Linux `user_regs_struct` array
+**S4's design finding, found by measuring rather than by planning it.** The plan said the
+register-frame knowledge would move into `arch/<arch>`. Measuring what is left showed why only half
+can: after S1–S3 exactly two modules still name `crate::arch::` — `sched` (17, the saved `Context`,
+`FpuState`, `UserContext` and the switch/FPU/bootstrap calls) and `syscall/linux/proc.rs` (4:
+`gdt::user_selectors` twice and the `UserContext` literal). The frame's **constructor** can move down
+— building a frame from the gate's trap record is a pure machine fact, and moving it removes the
+`SegmentSelector` from the ABI layer. But its conversion **into** the Linux `user_regs_struct` array
 (`abi::uregs`, `context_regs`/`context_from_regs`/`capture_frame`) cannot: `arch` naming
-`crate::syscall::linux::abi` is an `arch → syscall` edge, the one direction this whole design
-forbids and the one the depgraph's first rule exists to catch. So the array conversion stays in
-the ABI layer, and the frame type must instead expose the operations that layer needs
-(`to_regs`/`from_regs` with the array as an associated `Regs` type, `ip`/`sp`/`set_result`,
-`forked`). That also means `ContextOps` has to hand out its `Fpu` (`fpu()`/`fpu_mut()`, with
-`type Context: ContextOps<Fpu = Self::Fpu>` tying the two associated types together), because
-`sched` stores `Context` and pokes its FPU half on every switch.
+`crate::syscall::linux::abi` is an `arch → syscall` edge, the one direction this design forbids and
+the depgraph's first rule exists to catch. So the array conversion stays in the ABI layer, and the
+frame type exposes the operations that layer needs (`to_regs`/`from_regs` with the array as an
+associated `Regs` type, `ip`/`sp`/`set_result`, `forked`); `ContextOps` hands out its `Fpu`
+(`fpu()`/`fpu_mut()`, with `type Context: ContextOps<Fpu = Self::Fpu>` tying the associated types
+together) because `sched` stores `Context` and pokes its FPU half on every switch.
 
-S4's accepted shape, then: `hal::Contexts` with `Context`/`Fpu`/`UserFrame` as associated types
-behind `ContextOps`/`FpuOps`/`UserFrameOps`, the aliases and `FPU_BYTES` as crate-level consts in
-`hal` (an associated const in an array length needs `generic_const_exprs`), the frame
-*constructor* moved into `arch`, and the ABI array conversion left where the ABI is. That
-takes both remaining counts to 0 and is what lets S5 close the modules.
+S4's accepted shape: `hal::Contexts` with `Context`/`Fpu`/`UserFrame` behind `ContextOps`/`FpuOps`/
+`UserFrameOps`, the aliases and `FPU_BYTES` as crate-level consts in `hal` (an associated const in an
+array length needs `generic_const_exprs`), the frame *constructor* in `arch`, and the ABI array
+conversion where the ABI is. That takes both counts to 0 and lets S5 close the modules.
 
 ---
 
 ### R.11.E (moved from ROADMAP's status board) — the leaf crates, each with what it cost and what it proved
 
-**The seven pure, downward-only leaves** (`err`, `pci`, `date`, `binfmt`, `cred`, `uts`, `seccomp`) moved out of `src/` into `crates/*` as workspace members, re-exported from `src/lib.rs` under their old names so no caller changed (`pub use mpos_err as err;`). The point is enforcement, not tidiness: a leaf crate cannot name the kernel, so the downward-only rule (AGENTS §3 rule 5, and the V-* edges this table keeps re-auditing) is a compile error for those seven, not a convention. `xtask test`'s host stage now names each crate with `-p` so the moved pins keep running (635 in-kernel + 50 in crates = the 685 the suite ran before). `mpos-pci`'s test fixtures (`Device::fixture`, `test_lock`) reach the kernel's `/sys`/`/proc` tests through a `test-helpers` feature that only a dev-dependency enables, so the shipped binary carries no scaffolding. Held back at the time were `gpu` and `evdev`/`uinput`, which took `sched::TaskId` + `sched::wake` for their waiters: they needed an injectable wake abstraction before they could leave the crate. Both have since left — `gpu` two entries down, `evdev`/`uinput` with the same treatment.
+**The seven pure, downward-only leaves** (`err`, `pci`, `date`, `binfmt`, `cred`, `uts`, `seccomp`) moved out of `src/` into `crates/*` as workspace members, re-exported from `src/lib.rs` under their old names (`pub use mpos_err as err;`). The point is enforcement: a leaf crate cannot name the kernel, so the downward-only rule (AGENTS §3 rule 5) is a compile error for those seven, not a convention. `xtask test`'s host stage names each crate with `-p` so the moved pins keep running (635 in-kernel + 50 in crates = the 685 the suite ran before). `mpos-pci`'s fixtures (`Device::fixture`, `test_lock`) reach the kernel's `/sys`/`/proc` tests through a `test-helpers` feature only a dev-dependency enables, so the shipped binary carries no scaffolding. Held back were `gpu` and `evdev`/`uinput`, whose waiters took `sched::TaskId` + `sched::wake`; both have since left — `gpu` two entries down, `evdev`/`uinput` with the same treatment.
 
 **Three more of the same kind**, extracted once the seven above had shown the pattern: `mpos-term` (the terminal emulator — grid, cursor, blitter, keymap, font; a cell grid is not a filesystem fact, §11.1.4), `mpos-ahci` (the AHCI port decode, whose only reader is machine-only) and `mpos-gpu` (the virtio-gpu wire ABI, the DRM blobs, the cursor blend and the sync-object state machine). `crate::term`, `crate::ahci` and `crate::gpu` resolve through `src/lib.rs`'s re-exports, and the call sites that *did* move are the ones whose edge was the point: `console`, `drivers/video/render` and `drivers/virtio/input` now name the `term` crate rather than `vfs::term`, which is 3 references off `console → vfs` and 5 off `drivers → vfs`. The pins that travelled with them run in their own crates (`xtask test`'s host stage names them), so the host total only grows by the test the next entry added.
 
@@ -1009,7 +899,16 @@ takes both remaining counts to 0 and is what lets S5 close the modules.
 
 **The block layer seam is the thirteenth**: `mpos-blk` — the `BlockDev` contract, the disk registry and the GPT/MBR decode — moved out of `src/blk` into `crates/blk`, re-exported as `pub use mpos_blk as blk;` so every `crate::blk::` caller is unchanged. It was already host-compiled and host-tested (13 tests), and the module's one kernel reference — `part.rs` sizing its transfer buffer from `mm::PAGE_SIZE` — is now `mpos_blk::PAGE_SIZE`, the bound belonging to the trait that states it rather than the frame allocator that sizes the same hardware fact. `blk` leaves the module graph as a source: `drivers`/`uevent`/`vfs` still *name* it (a cross-crate edge downward), it names nothing back, and no mutual pair moved (17/17).
 
-**The HAL's stages S2–S5, landed.** The §11.4 table records the pairs and the gate for each; what the prose carried beyond it: **S2** made the interrupt controller a capability — `crate::hal::Interrupts` names `Line::{Timer,Serial}` and asks `unmask`/`mask`/`eoi`, `init_message_signalled` and `net_msi_vector` — so the serial driver names the line it is on rather than PIC bit 4, and the net driver asks for the vector instead of naming `idt::NET_IRQ_VECTOR`; no raw IRQ or vector crosses the seam, `drivers → arch` fell to zero and mutual pairs went 15 → 14, full gate green `pass=142 fail=0 (142 built)` exit 33. **S3** made paging a capability (`install`, `map_mmio`, `translate`, `user_accessible`, `is_cow_page`, `write_user_u32`, the roots, the two `switch_to_*`, plus `type Space: AddressSpaceOps`); `PageTaken` moved to `mm::vm` beside `Mapping`, since it is part of what a mapping *is* rather than an x86 fact; `mm`, `uaccess`, `sched`, `syscall` and `main` stopped naming `arch::paging` entirely; the pair count stayed at 14 while swapping which pair it is (`arch ↔ mm` out, `hal ↔ mm` in, argued in `ARCHITECTURE.md` §9 as the seam's neighbour rather than a leak); gate green as above. **S4** made the task context a capability and shut the door behind it: `crate::hal::Contexts` carries `type Context: ContextOps<Fpu = Self::Fpu>`, `type Fpu`, `type UserFrame`, the FPU save/restore/claim/trap calls, `bootstrap`/`switch`/`resume_user`/`enter_user`/`set_kernel_stack`, and `user_segments`; `sched` no longer names `arch` at all — `task.context.fpu` is `fpu()`/`fpu_mut()`, the two frame literals in `spawn_copy`/`spawn_thread` became `UserFrameOps::forked` plus `set_result(0)`, and `context_regs`/`context_from_regs` are one-line calls onto `to_user_regs`/`from_user_regs` (the machine translating its own frame into the ABI's field order, which is the half of the convergence that *can* live in `arch`); `syscall/linux/proc.rs`'s `gdt::user_selectors` became `hal::user_segments()`; `sched → arch` and `syscall → arch` are both 0 and mutual pairs went 14 → 12. The duplication it left — the Linux register-file field order exists once in `arch/x86_64/context.rs` and once in `syscall/linux/abi.rs`, because one side is bare-metal and the other host-built — is *checked* on every boot in `M1` (`main.rs` asserts all nineteen named indices and the count against the ABI's table), which is what makes it a recorded agreement rather than a hope; gate green as above. **S5's ratchet** (the closure waits for S4): `cargo xtask depgraph` gained a third recorded rule — references to `crate::arch::` from a layer that is not the machine layer (`sched` 17, `syscall` 4 today, both may only fall) — which is what stops the door widening while S4 is written. **S5, the door itself**: `src/arch/mod.rs` is now a facade of four items — `kernel_sections`, `breakpoints_caught` and the two register-table constants the M1 check needs — and `arch/x86_64`'s submodules are `pub(crate)`, so a layer cannot reach `arch::paging` even by writing the path; defence in depth behind the depgraph's allow-list, which catches the reference, this catches the *name*; deleting the module glob made two genuinely dead helpers visible (`gdt::user_code`/`user_data`, reachable only through it) and they are gone, per V-7's rule that dead machine modules are debt; gate green `pass=142 fail=0 (142 built)` exit 33.
+**The HAL's stages S2–S5.** §11.4's table records each stage's capability, pairs and gate, and its S4
+finding records the register-frame split; beyond those: S2 has the serial driver name
+`Line::{Timer,Serial}` rather than PIC bit 4 and the net driver ask `net_msi_vector` rather than name
+`idt::NET_IRQ_VECTOR`; S4's duplicated register-file field order (`arch/x86_64/context.rs` and
+`syscall/linux/abi.rs`) is checked every boot in `M1`, which asserts nineteen named indices and the
+count against the ABI's table; S5's ratchet added the third rule — `crate::arch::` references from a
+non-machine layer (`sched` 17, `syscall` 4, both may only fall); S5 made `src/arch/mod.rs` a
+four-item facade (`kernel_sections`, `breakpoints_caught`, the two register-table constants) and
+exposed the dead `gdt::user_code`/`user_data`, now gone. Gate for S2–S5:
+`pass=142 fail=0 (142 built)` exit 33.
 
 ---
 

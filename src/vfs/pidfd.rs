@@ -117,7 +117,7 @@ impl Inode for PidFd {
             // The type-less anonymous inode: `mode_of` gives it `0700` and no
             // `S_IF*` bit, which is the shape Linux's `anon_inode` mount
             // reports for this family.
-            kind: NodeKind::Anon,
+            kind: NodeKind::Anon { mode: 0o700 },
             size: 0,
         }
     }
@@ -171,7 +171,7 @@ mod tests {
     fn a_pidfd_is_a_type_less_anonymous_inode() {
         let fd = PidFd::new(TaskId(5), 7);
         let meta = fd.metadata();
-        assert_eq!(meta.kind, NodeKind::Anon);
+        assert_eq!(meta.kind, NodeKind::Anon { mode: 0o700 });
         assert_eq!(meta.size, 0);
         assert_eq!(fd.nlink(), 0);
         assert_eq!(fd.owner(), (0, 0));

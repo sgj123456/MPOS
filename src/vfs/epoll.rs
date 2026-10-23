@@ -477,9 +477,9 @@ fn report(entry: &Entry, ready: Ready, hup: bool, err: bool) -> u32 {
         return 0;
     }
     // What the caller asked to hear about. EPOLLIN and EPOLLRDNORM are one
-    // condition in two spellings, as are EPOLLOUT and EPOLLWRNORM - Linux
-    // reports both together, and so does a report that wants a caller's
-    // `events & EPOLLIN` test and its `events & EPOLLRDNORM` test to agree.
+    // condition in two spellings, as are EPOLLOUT and EPOLLWRNORM, so either
+    // spelling alone arms the report; which of them comes *back* is decided
+    // below, from what this caller named.
     let wants_read = entry.events & (EPOLLIN | EPOLLRDNORM) != 0;
     let wants_write = entry.events & (EPOLLOUT | EPOLLWRNORM) != 0;
 
@@ -494,12 +494,37 @@ fn report(entry: &Entry, ready: Ready, hup: bool, err: bool) -> u32 {
         (wants_read && ready.read, wants_write && ready.write)
     };
 
+    // Which of the two spellings comes back is decided by what *this* caller
+    // named, and the reason is measured. `weston-desktop-shell` registers its
+    // timerfd for `EPOLLIN` alone and refuses to dispatch an event carrying
+    // anything else:
+    //
+    //     unexpected timerfd events 41          (the value is hex: 0x41)
+    //
+    // A report that always set `EPOLLRDNORM` beside `EPOLLIN` therefore had
+    // the shell's timer never fire and the desktop never come up - which is
+    // also why the compositor's cursor buffers were still empty when the
+    // kernel uploaded them. Linux answers `revents & interest` out of the
+    // file's own poll mask, so a caller that asked for `EPOLLIN` gets
+    // `EPOLLIN`, and one that asked for `EPOLLRDNORM` gets that bit; the two
+    // are one condition in two spellings only in the sense that either arms
+    // the report, never in the sense that both go out together.
     let mut bits = 0;
     if read {
-        bits |= EPOLLIN | EPOLLRDNORM;
+        if entry.events & EPOLLIN != 0 {
+            bits |= EPOLLIN;
+        }
+        if entry.events & EPOLLRDNORM != 0 {
+            bits |= EPOLLRDNORM;
+        }
     }
     if write {
-        bits |= EPOLLOUT | EPOLLWRNORM;
+        if entry.events & EPOLLOUT != 0 {
+            bits |= EPOLLOUT;
+        }
+        if entry.events & EPOLLWRNORM != 0 {
+            bits |= EPOLLWRNORM;
+        }
     }
     // The two that are nobody's request to make, and are level conditions
     // rather than edges whatever the entry asked for: a hang-up is a fact
@@ -565,9 +590,16 @@ impl Inode for Epoll {
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0x7000_0000 + self.ino,
-            kind: NodeKind::CharDev,
+            kind: NodeKind::Anon { mode: 0o600 },
             size: 0,
         }
+    }
+
+    /// Linux's name for the descriptor in `/proc/<pid>/fd` (measured,
+    /// `.workbuddy/probe_anon_fd_stat.c`). The spelling is `eventpoll`, the
+    /// subsystem's own name, not `epoll`.
+    fn fd_name(&self) -> Option<alloc::string::String> {
+        Some(alloc::string::String::from("anon_inode:[eventpoll]"))
     }
 
     /// The answer `poll` on the epfd itself reads: readable when something
@@ -847,8 +879,28 @@ mod tests {
         write_end.write_at(0, b"hi").unwrap();
         ep.collect(&table, &mut out);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].events, EPOLLIN | EPOLLRDNORM);
+        // `EPOLLIN`, and not the `EPOLLIN | EPOLLRDNORM` this used to answer:
+        // Linux reports `revents & interest`, so a caller that asked for
+        // `EPOLLIN` gets `EPOLLIN`. The extra bit was not decoration -
+        // `weston-desktop-shell` registers its timerfd for `EPOLLIN` and
+        // refuses to dispatch a report carrying anything else, printing
+        // `unexpected timerfd events 41` and never finishing its startup.
+        assert_eq!(out[0].events, EPOLLIN);
         assert_eq!(out[0].data, 0xfeed);
+
+        // The other spelling of the same condition is delivered to whoever
+        // named it, and to nobody else.
+        assert_eq!(
+            ep.ctl(&table, epfd, EPOLL_CTL_MOD, rfd, EPOLLRDNORM, 0xfeed),
+            Ok(())
+        );
+        ep.collect(&table, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].events, EPOLLRDNORM);
+        assert_eq!(
+            ep.ctl(&table, epfd, EPOLL_CTL_MOD, rfd, EPOLLIN, 0xfeed),
+            Ok(())
+        );
 
         // Still readable: level-triggered reports it again.
         ep.collect(&table, &mut out);
@@ -1028,7 +1080,9 @@ mod tests {
         write_end.write_at(0, b"done\n").unwrap();
         ep.collect(&table, &mut out);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].events, EPOLLIN | EPOLLRDNORM);
+        // The caller asked for `EPOLLIN`, so that is the bit it gets - see
+        // `a_level_entry_reports_while_the_condition_holds`.
+        assert_eq!(out[0].events, EPOLLIN);
 
         // The writer exits: `EPOLLIN|EPOLLHUP`, Linux's answer for a pipe
         // with data and no writing side.
@@ -1064,7 +1118,11 @@ mod tests {
         drop(b);
         ep.collect(&table, &mut out);
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].events, EPOLLIN | EPOLLRDNORM | EPOLLHUP);
+        // `EPOLLIN` because that is what the caller asked for, and
+        // `EPOLLHUP` because a hang-up is a fact about the descriptor rather
+        // than somebody's request - see
+        // `a_level_entry_reports_while_the_condition_holds`.
+        assert_eq!(out[0].events, EPOLLIN | EPOLLHUP);
     }
 
     /// `count` epoll instances, each installed in `table` and each watching

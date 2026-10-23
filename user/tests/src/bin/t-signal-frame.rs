@@ -949,6 +949,12 @@ fn main() {
         let pid = unsafe { libc::fork() };
         if pid == 0 {
             unsafe {
+                // The frame checks above installed a SIGSEGV handler, and a
+                // fork child inherits its parent's dispositions (Linux's
+                // `copy_sig`, pinned by `t-signal-inherit`). This child is the
+                // fatal-action fixture, so it restores the default first -
+                // otherwise the inherited handler runs and the child exits 0.
+                libc::signal(signal, libc::SIG_DFL);
                 libc::raise(signal);
                 libc::_exit(0);
             }

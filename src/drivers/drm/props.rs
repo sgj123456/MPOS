@@ -620,9 +620,25 @@ pub(crate) fn copy_to_scanout(st: &DrmState, fb_id: u32) -> isize {
 
 /// Whether the host renders the pointer, so the kernel must not blend one into the
 /// scanout. True exactly when the device published a cursor queue at bring-up;
-/// false on a card with no second queue, where [`paint_cursor`] is the presentation
-/// path. One predicate, read at the single blend call site above, which is what
-/// makes the two paths auditable against each other rather than scattered.
+/// false on a card with no second queue, where [`paint_cursor`] is the
+/// presentation path.
+///
+/// It was briefly narrowed to require `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` as
+/// well, on the reasoning that a client which cannot name its hotspot has no
+/// honest placement for its image. Measured 2026-10-21, that was the wrong trade:
+/// weston sets no such cap, but on the GL card the frame itself lives in a
+/// *device* resource (`Resource::host_pixels`), so there are no guest pixels for
+/// the blend to draw into - the kernel's blend would composite into a buffer the
+/// display never scans, and narrowing the predicate made the pointer disappear
+/// entirely rather than merely misplace it. The hotspot question belongs to the
+/// cursor queue's own placement (the device is told the top-left, computed here as
+/// position minus hotspot, which is zero when no hotspot was ever set), not to
+/// whether the queue is used at all.
+///
+/// What the GL card then showed: the queue receives weston's image, and that
+/// image is empty - `guest nonzero=0` for every `show`, against 2048 bytes for a
+/// control client that fills its own buffer. So the card and the kernel path are
+/// sound, and weston's own cursor rendering is the remaining gap (§7.4).
 pub(crate) fn host_cursor_live() -> bool {
     card().cursor_q
 }

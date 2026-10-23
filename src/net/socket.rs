@@ -425,6 +425,11 @@ fn uevent_handle_of_fd(fd: i32) -> Option<usize> {
 /// sends that and waits for `EAGAIN` hangs, which is how this got
 /// double-checked.)
 const MSG_DONTWAIT: usize = 0x40;
+/// `send(2)`'s "answer `EPIPE` without raising `SIGPIPE`" flag:
+/// `MSG_NOSIGNAL` is `0x4000` on both machines. It suppresses the signal a
+/// broken channel owes and nothing else - the send still fails with `EPIPE`
+/// (measured, `.workbuddy/probe_sigpipe.c`, Linux 7.2.11).
+const MSG_NOSIGNAL: usize = 0x4000;
 /// `recv(2)`'s "look without taking" flag.
 const MSG_PEEK: usize = 0x02;
 
@@ -1619,7 +1624,12 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
         // `bind` applies. Free here for the same reason: nothing has used the
         // socket yet.
         let want = super::home_of(endpoint.addr);
-        stack.settle_tcp(home, sock_handle, want);
+        stack.settle_tcp(
+            home,
+            sock_handle,
+            want,
+            super::tcp_rx_bytes(entry.opts.rcvbuf),
+        );
         // The source port is settled before the socket is borrowed: drawing
         // an ephemeral port needs the whole stack, and the borrow of the
         // socket would be in the way.
@@ -1906,10 +1916,17 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
             return err::EAGAIN;
         }
         let data = unsafe { slice::from_raw_parts(buf as *const u8, len) };
-        return file
-            .write(data)
-            .map(|n| n as isize)
-            .unwrap_or_else(crate::uaccess::err_of);
+        return match file.write(data) {
+            Ok(n) => n as isize,
+            Err(crate::vfs::VfsError::BrokenPipe) => {
+                // A stream whose peer is gone: `EPIPE`, and the `SIGPIPE`
+                // Unix raises inside the send unless `MSG_NOSIGNAL` asked it
+                // not to (measured, `.workbuddy/probe_sigpipe2.c`).
+                raise_send_sigpipe(args[3]);
+                err::EPIPE
+            }
+            Err(e) => crate::uaccess::err_of(e),
+        };
     }
     // A vsock socket: the send is a protocol packet, chunked and
     // credit-checked by the device, not a write into a pipe of the
@@ -1960,7 +1977,14 @@ pub(crate) fn handle_sendto(args: [usize; 6], from_user: bool) -> isize {
     // `MSG_DONTWAIT` on the send must earn `EAGAIN` from a full queue, not
     // block: the wait decision reads the call flags too, like the receive side.
     let nonblock = dontwait(fd, args[3]);
-    send_common(handle, data, dst, nonblock)
+    let answer = send_common(handle, data, dst, nonblock);
+    // A stream with no connection to send into answers EPIPE from
+    // `send_common`, and Linux raises `SIGPIPE` for it inside the call -
+    // `MSG_NOSIGNAL` is the caller's way out.
+    if answer == err::EPIPE {
+        raise_send_sigpipe(args[3]);
+    }
+    answer
 }
 
 /// `sendmsg(fd, msghdr, flags)` - scatter-gather send. The iovecs are
@@ -2113,14 +2137,17 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
         if dontwait(fd, args[2]) && !file.inode().poll_ready().write {
             return err::EAGAIN;
         }
+        // An error arm never landed the bytes, so dropping `fds` there closes
+        // the descriptors it named, as if the send had not carried them.
         let written = match file.write(&data) {
             Ok(n) => n as isize,
-            Err(e) => {
-                // The bytes did not land, so the handover never happened:
-                // dropping `fds` here closes the descriptors it named, as if
-                // the send had not carried them.
-                return crate::uaccess::err_of(e);
+            Err(crate::vfs::VfsError::BrokenPipe) => {
+                // A stream's break is `EPIPE` with the `SIGPIPE` Unix raises
+                // inside the send; `MSG_NOSIGNAL` is the caller's suppression.
+                raise_send_sigpipe(args[2]);
+                err::EPIPE
             }
+            Err(e) => return crate::uaccess::err_of(e),
         };
         if !fds.is_empty() {
             // No namespace check on the way out: a descriptor handed to a task in
@@ -2173,12 +2200,34 @@ pub(crate) fn handle_sendmsg(args: [usize; 6], from_user: bool) -> isize {
         None
     };
     let nonblock = dontwait(fd, args[2]);
-    send_common(handle, &data, dst, nonblock)
+    let answer = send_common(handle, &data, dst, nonblock);
+    // A stream with no connection to send into answers EPIPE, and Linux
+    // raises `SIGPIPE` for it inside the call (`MSG_NOSIGNAL` suppresses it).
+    if answer == err::EPIPE {
+        raise_send_sigpipe(args[2]);
+    }
+    answer
 }
 
 enum SendStep {
     Sent(usize),
     Wait,
+}
+
+/// A send door answered `EPIPE`: raise the `SIGPIPE` Linux raises **inside**
+/// the send, unless the caller suppressed it with `MSG_NOSIGNAL`.
+///
+/// Measured on a current host (`.workbuddy/probe_sigpipe.c` and
+/// `probe_sigpipe3.c`, Linux 7.2.11): a broken stream pair, a reset stream and
+/// a send on a listener all answer `EPIPE` with the handler run, and
+/// `MSG_NOSIGNAL` turns the signal off without changing the errno. A
+/// sequenced-packet message send never reaches this helper: its `EPIPE` comes
+/// from `unix::send_dgram`, which Linux answers silently
+/// (`UnixSock::silent_broken_pipe` has that measurement).
+fn raise_send_sigpipe(flags: usize) {
+    if flags & MSG_NOSIGNAL == 0 {
+        crate::sched::raise_sigpipe();
+    }
 }
 
 fn send_common(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool) -> isize {
@@ -2254,6 +2303,16 @@ fn tcp_send(handle: usize, data: &[u8], nonblock: bool) -> isize {
             Some(Ok(SendStep::Sent(n))) => {
                 sent += n;
                 if sent == data.len() {
+                    return sent as isize;
+                }
+                if nonblock {
+                    // A non-blocking send reports what it queued rather than
+                    // waiting for room for the rest: Linux's `tcp_sendmsg`
+                    // copies what fits and returns the count, and answers
+                    // `EAGAIN` only when nothing did. Falling through to the
+                    // park below here hung the caller instead - measured by
+                    // `t-sockbuf`'s unread-window push, whose 4096-byte sends
+                    // stop fitting whole once the peer's window is small.
                     return sent as isize;
                 }
             }
@@ -2650,7 +2709,10 @@ pub(crate) fn handle_recvfrom(args: [usize; 6], from_user: bool) -> isize {
         } else {
             sock.take_dgram()
         } {
-            Ok(got) => got,
+            Ok(Some(got)) => got,
+            // A sequenced-packet connection whose peer is gone and whose
+            // queue is empty: end-of-file, and no sender to report.
+            Ok(None) => return 0,
             Err(e) => return crate::uaccess::err_of(e),
         };
         let n = got.data.len().min(len);
@@ -2960,7 +3022,10 @@ pub(crate) fn handle_recvmsg(args: [usize; 6], from_user: bool) -> isize {
         } else {
             sock.take_dgram()
         } {
-            Ok(got) => got,
+            Ok(Some(got)) => got,
+            // The same end-of-file the `recvfrom` door answers: zero bytes,
+            // no sender and no control data to hand over.
+            Ok(None) => return 0,
             Err(e) => return crate::uaccess::err_of(e),
         };
         let full = got.data.len();
@@ -4230,7 +4295,12 @@ pub(crate) fn handle_bind(args: [usize; 6], from_user: bool) -> isize {
                 // including the wildcard - eth0's. The socket has not been
                 // touched yet, so the move is free; see `Stack::settle_tcp`.
                 let want = super::home_of(endpoint.addr);
-                stack.settle_tcp(home, sock_handle, want);
+                stack.settle_tcp(
+                    home,
+                    sock_handle,
+                    want,
+                    super::tcp_rx_bytes(entry.opts.rcvbuf),
+                );
                 // A port of 0 means "pick one", and it is picked here rather
                 // than at connect: `getsockname` has to be able to answer
                 // before the caller connects to anything, which is the whole
@@ -4546,10 +4616,14 @@ fn accept_tcp(
         // `install_accepted` and `net::Stack::tcp_name_taken`).
         let step = super::with(handle, |stack, entry| {
             stack.poll_once();
-            (stack.listener_take(id), entry.opts.reuseaddr)
+            (
+                stack.listener_take(id),
+                entry.opts.reuseaddr,
+                entry.opts.rcvbuf,
+            )
         });
         match step {
-            Some((Some((home, sock_handle)), reuse)) => {
+            Some((Some((home, sock_handle)), reuse, rcvbuf)) => {
                 return install_accepted(
                     home,
                     sock_handle,
@@ -4558,9 +4632,10 @@ fn accept_tcp(
                     flags,
                     nonblock,
                     reuse,
+                    rcvbuf,
                 );
             }
-            Some((None, _)) => {
+            Some((None, _, _)) => {
                 if nonblock {
                     return err::EAGAIN;
                 }
@@ -4593,6 +4668,7 @@ fn install_accepted(
     flags: usize,
     nonblock: bool,
     reuseaddr: bool,
+    rcvbuf: u32,
 ) -> isize {
     // The peer's address is read *before* the socket becomes an entry: it is
     // the connection's own fact, and the entry hands the same socket to
@@ -4610,6 +4686,14 @@ fn install_accepted(
     // and a restart may only take that port back if the holder had the option
     // set too (`net::Stack::tcp_name_taken`). Without the inheritance the
     // option would not do the one thing it exists for.
+    //
+    // `rcvbuf` is copied for the same reason, and it is the number the
+    // accepted socket reads back: Linux clones the listener's `sk_rcvbuf`
+    // (`inet_csk_clone_lock` again) and the child's window is that buffer.
+    // The *ring* this connection was built with is the pool socket's, sized
+    // from the listener's option when that socket was made - which is the
+    // same value unless the option changed between the handshake and this
+    // accept (`Stack::set_listener_rx` names that race).
     let handle = match super::adopt_socket(
         Channel::Tcp {
             home,
@@ -4620,6 +4704,7 @@ fn install_accepted(
         SOCK_STREAM,
         super::SockOpts {
             reuseaddr,
+            rcvbuf,
             ..super::SockOpts::new(SOCK_STREAM)
         },
     ) {
@@ -5423,7 +5508,39 @@ pub(crate) fn handle_setsockopt(args: [usize; 6], from_user: bool) -> isize {
                 entry.opts.sndbuf = super::sock_buffer_size(val, super::SOCK_MIN_SNDBUF);
             }
             (SOL_SOCKET, SO_RCVBUF) => {
-                entry.opts.rcvbuf = super::sock_buffer_size(val, super::SOCK_MIN_RCVBUF);
+                let stored = super::sock_buffer_size(val, super::SOCK_MIN_RCVBUF);
+                entry.opts.rcvbuf = stored;
+                // The number governs the TCP receive window now, as it does on
+                // Linux. A socket still in `Closed` has nothing to lose by
+                // being rebuilt with the new ring - its name, if it has one,
+                // lives in `local`, not in smoltcp. Past that the ring cannot
+                // move (smoltcp sizes the buffer at construction); the number
+                // still updates, and the gap is named in `docs/notes/` §4.3.3.
+                match &mut entry.channel {
+                    Channel::Tcp {
+                        home,
+                        handle: h,
+                        connected,
+                        ..
+                    } => {
+                        if !*connected
+                            && matches!(
+                                stack.sockets_mut(*home).get_mut::<tcp::Socket>(*h).state(),
+                                tcp::State::Closed
+                            )
+                        {
+                            stack.sockets_mut(*home).remove(*h);
+                            *h = stack.add_tcp_sized(*home, super::tcp_rx_bytes(stored));
+                        }
+                    }
+                    // A listener's pool is where its future connections get
+                    // their window; the accepted ones inherit the number at
+                    // accept, and `set_listener_rx` re-makes the waiting pool.
+                    Channel::TcpListen { id, .. } => {
+                        stack.set_listener_rx(*id, super::tcp_rx_bytes(stored));
+                    }
+                    _ => {}
+                }
             }
             (SOL_SOCKET, SO_LINGER) => {
                 let t = unsafe { ((optval + 4) as *const i32).read_unaligned() };

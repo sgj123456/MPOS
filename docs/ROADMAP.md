@@ -29,12 +29,15 @@ One-glance status of the whole roadmap.
   ask Linux's `kill_ok_by_cred` and `CAP_KILL` in the **target's** user namespace, and the record  
   door keeps the caller's `si_code`, `si_pid`, `si_uid` and `si_value` rather than overwriting  
   them (§2.6, item 91)
-- [ ] a child inherits its parent's signal dispositions — `fork`/`clone` here
-  start every process at `SIG_DFL` whatever the parent installed, where POSIX and
-  Linux copy the handler table; measured against the host while landing item 94,
-  and the reason `clone3`'s `CLONE_CLEAR_SIGHAND` is refused `EOPNOTSUPP` (with
-  the flag and without it a child is identical here, so accepting the bit could
-  not be told from ignoring it) (§6.10)
+- [x] a child inherits its parent's signal dispositions — `fork`/`clone` copies the
+  parent's handler table and alternate stack, `clone3`'s `CLONE_CLEAR_SIGHAND` serves
+  the `SIG_DFL` table instead with `CLEAR|SIGHAND` `EINVAL`, and `exec` resets only the
+  caught slots, keeping `SIG_IGN` and the pending set (§2.7, item 96)
+- [x] a write to a broken channel is `EPIPE`, and the `SIGPIPE` behind it — a pipe, a
+  stream pair and a listener's send run the handler before the call returns (`SI_USER`),
+  `MSG_NOSIGNAL` suppresses it, a blocked signal waits pending, and the measured
+  exemptions hold: a seqpacket send is `EPIPE` silently, a datagram's dead peer is
+  `ECONNREFUSED` once and then `ENOTCONN` (§4.1.13, item 97)
 - [ ] [~] P3 Filesystem — hard links · locking · timestamps · perms · /proc (§3) — and  
   `fstatfs` names the filesystem the descriptor was *opened on*, the two doors agreeing (§3.6, item 89),
   each instance now carrying a non-zero `f_fsid` instead of a zero every mount shared (§3.7, item 90)
@@ -49,9 +52,15 @@ One-glance status of the whole roadmap.
   and `listen` is the named call, a connected socket not being a listener (§4.1.8) — and  
   `shutdown` is a flag on the socket rather than a handshake with a peer (§4.1.9), and the  
   "implicit rendezvous" it used to name as a divergence was never Linux's shape (§4.1.10) — and  
-  `accept`'s address is the connector's, its two pointers asked separately (§4.1.11)
+  `accept`'s address is the connector's, its two pointers asked separately (§4.1.11) — and a  
+  peer's close is a hang-up, not silence: `POLLIN|POLLHUP` on stream and seqpacket alike,  
+  read 0 after the queued messages, and the wake udev's settle used to wait 120 s for (§4.1.12) —  
+  and the sender's half of that close is Linux's too: `EPIPE` with the `SIGPIPE` raised  
+  before the call returns, `MSG_NOSIGNAL` to suppress it, and the seqpacket/datagram  
+  exemptions as measured (§4.1.13, item 97)
 - [x] 4.2 ICMP — raw socket, complete-packet delivery, `IP_RECVTTL` (§4.2)
-- [ ] [~] 4.3 TCP — loopback, listener, `SO_REUSEADDR` and `SO_LINGER{on,0}`'s reset done; buffer sizes are Linux's numbers, with `SO_RCVBUF` not sizing the ring (§4.3)
+- [x] 4.3 TCP — loopback, listener, and the six options; a stream's `SO_RCVBUF` is its receive
+  window, inherited by the socket a listener accepts (§4.3)
 - [x] 4.4 Netlink write side — `ip addr`/`route`/`link` applied live (§4.4)
 - [x] 4.5 `AF_PACKET` — link layer as a socket, userland DHCP can ask; both types served —  
   `SOCK_DGRAM` (payload shape) and `SOCK_RAW` (whole frames in, the caller's own header out) —  
@@ -89,6 +98,12 @@ One-glance status of the whole roadmap.
   come back in one call (no `pidfd_open` window); `stack` is the child region's
   **base**, the size decides which fields exist, and `CLONE_DETACHED` is refused
   as Linux's own `clone3` refuses it (§6.10, item 94)
+- [x] an anonymous descriptor has no file type — `eventfd`, `timerfd`, `signalfd`,
+  `epoll`, `inotify` and `pidfd` report `st_mode` with the `S_IF*` bits clear
+  (`0600`, or `0700` for a pidfd), `/proc/self/fd` reads back its own
+  `anon_inode:[…]` name (`anon_inode:inotify` being the unbracketed one), and a
+  zero-length read answers Linux's errno, `inotify` consulting its queue first
+  (§6.11, item 99)
 - [ ] [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET**, **TIME** and **USER** landed, each with its pin  
   (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`): the numbers a process  
   sees are the  
@@ -186,7 +201,8 @@ One-glance status of the whole roadmap.
 - [x] the aarch64 GL path's EL0 traps answered — `t-el0-sysreg` (§15.36)
 - [x] the session environment — `XDG_RUNTIME_DIR` ships in the shared `core/` overlay, so both machines' login shells have it (R.7's gap, closed by §15.36/§15.37)
 - [x] weston's EL0 write fault above its stack — resolved by `resolve_stack_growth` on the aarch64 EL0 data-abort path; the desktop comes up whole (R.7, §15.36)
-- [ ] [~] the cursor plane drives a host pointer: hotspot cap accepted, `HOTSPOT_X`/`HOTSPOT_Y` published per-client, and binding/moving posts virtio-gpu `UPDATE_CURSOR`/`MOVE_CURSOR` on the cursor queue (`t-drm`, `t-drm-props`) — kernel path built and gated green; reading the pointer back on the QEMU window after a gui weston boot is what closes it (§7.4, R.7)
+- [ ] [~] the cursor plane drives a host pointer: the card, the queue, the transfer, the read-back and the aliasing are all cleared by weston-free probes, and the image's emptiness is now **measured at its source** — an interposer logging `gbm_bo_write`'s own input reads `buf=00000000…`: weston writes 16384 zero bytes and the write faithfully copies them. `gbm_bo_write` also only fires when the sprite changes, so a session where desktop-shell never comes up shows no write at all. Controls: a magenta block bound by a weston-free probe reaches the host (`nz=3072`); write-only mappings (`PROT_WRITE` alone, which is what weston asks for) alias across processes; every handle slot works; a plain process's `gbm_bo_write` lands. Remaining: weston's own cursor image, which it writes as 16 KiB of zeros into an object Mesa does not make the plane's backing — the epoll report fix that completed desktop-shell's startup does not touch it (§7.4, R.7)
+- [x] epoll reports `revents & interest`: `EPOLLRDNORM` used to be set beside every `EPOLLIN`, so `weston-desktop-shell` — which registers its timerfd for `EPOLLIN` alone — printed `unexpected timerfd events 41` (hex) for every expiry, never read its timer and never finished starting up. Fixed in `vfs::epoll::report`; pinned by a timerfd case in `t-epoll` and by three host tests whose expectations were themselves the bug (§1.1)
 - [ ] [~] 3D / virgl / venus (`DRM_VIRTGPU_*`) — served and pinned, and *negotiated* on a  
   `virtio-gpu-gl-pci` boot (`virgl=1 capsets=2`); the renderer is still `llvmpipe`, because  
   Mesa cannot identify the node its devpath names, and the GL card is not the gate's default  
@@ -371,19 +387,17 @@ In the order that keeps each step verifiable on its own:
    list carried `HOTSPOT_X` *and* `HOTSPOT_Y` but its count stopped one short of the second, so a  
    client that had set the cap was shown one of the two; and `t-drm`'s `NR_RMFB` was `0xA4`, which  
    is `MODE_GETGAMMA` and not `MODE_RMFB` (`0xAF`, read out of `drm.h`) - the card was answering a  
-   gamma request's `EINVAL`, and the test read it as a refusal to remove the buffer. What remains  
-   is the one measurement a `t-*` program cannot make: boot against the window (`cargo xtask run --mode gui`, or `--mode terminal` with root on the serial line as §15.36 drove it), start weston,  
-   and read the pointer rendering. The serial log should carry the new `virtio-gpu: … cursorq=1`  
-   token — and it does (2026-10-18, the GL card: `virtio-gpu: virgl=1 context_init=1 cursorq=1  
-   capsets=2 cached=2 mask=0x6`, weston's `cursor planes: yes` beside it, §7.4). The *driving* half  
-   is solved too — `run` now binds a QMP socket (`build/<arch>-9p-share/qmp.sock`), `info mice` names  
-   the absolute tablet and `input-send-event` moves it — but **reading it back is not**: `screendump`  
-   answers `no surface` on both display backends a GL card gets (`egl-headless` and `sdl,gl=on`), so  
-   the read-back needs a non-GL surface — the 2D card, VNC, or a host-side capture of the window.  
-   Whether the 2D card's pointer takes that card's cursor queue or its software blend is the question  
-   its own `cursorq` token answers, and §7.4 elides the token for it. The other residual stays named  
-   rather than claimed — the no-cursorq fallback branch, which neither configured machine can  
-   exercise (§7.4).
+   gamma request's `EINVAL`, and the test read it as a refusal to remove the buffer. The measurement  
+   a `t-*` program cannot make is answered: `run` binds a QMP socket  
+   (`build/<arch>-9p-share/qmp.sock`), `input-send-event` moves the pointer, the pointer bitmap is  
+   read back over VNC's `CursorWithAlpha` pseudo-encoding (`screendump` answers `no surface` on the  
+   GL backends), and a whole weston session on the GL card shows the desktop up — the epoll report  
+   fix (§1.1) removed the startup stall — with its cursor plane bound through atomic. **What the  
+   plane receives is empty at its source**: weston's `gbm_bo_write` copies 16 KiB of zeros into an  
+   object Mesa does not make the plane's backing, while a weston-free control's image reaches the  
+   host. The remaining gap is inside Mesa's virtio-gpu GBM allocation for the cursor BO, upstream of  
+   this kernel (§7.4); the no-cursorq fallback branch stays named, since neither configured machine  
+   can exercise it.
 4. **the display path specifically** — §7.4 carries its own order, and the step it named first is a  
    **dead end, measured 2026-10-18**: a wlroots compositor on `WLR_RENDERER=pixman` stops in  
    `wlr_allocator_autocreate` (`[wlr] [render/allocator/allocator.c:168] Failed to create  
@@ -421,9 +435,29 @@ The full inventory — grouped by what they block, with each refusal's reason �
 [notes/appendix-status-board.md](notes/appendix-status-board.md)'s **R.Remaining**. In one line each:  
 `fanotify`/`keyctl`/`userfaultfd`/rseq side-objects stay `ENOSYS`; xattrs validate then `EOPNOTSUPP`;  
 the semantics still incomplete are a datagram socket's `SO_RCVBUF` - reported in Linux's  
-shape but not what sizes the receive ring (item 58) - and the datagram line itself, which  
-is the ring's rather than Linux's 65507 until this stack fragments IP; the two namespace  
-kinds with no entry at all are IPC and cgroup.  
+shape but not what sizes the receive ring (item 58; a stream's is now its window, item 98) -  
+and the datagram line itself, which is the ring's rather than Linux's 65507 until this stack  
+fragments IP; the two namespace kinds with no entry at all are IPC and cgroup.  
+
+**A stream's receive buffer is its window, and a listener hands it to the socket it accepts**
+(`docs/uapi/` §5.1 item 98, landed 2026-10-21): item 58 made `SO_RCVBUF` Linux's number, but on a
+stream the number governed nothing — a listener's option stayed on the listener and every accepted
+connection was built with the default ring, where Linux copies `sk_rcvbuf` onto the accepted socket
+(`inet_csk_clone_lock`) and sizes the window from it. Measured whole on a current host first
+(`.workbuddy/probe_tcp_rcvbuf.c`, Linux 7.2.11, a server that never reads): ask 2048 is inherited
+as 4096 and absorbs 8192 bytes, 32768 as 65536 and absorbs 47104, 262144 as 524288 and absorbs
+212886, and the answer is the same whether the option was set before or after `listen`. Served by
+`tcp_rx_bytes` (half the stored figure), `add_tcp_sized`, `Listener::rx_bytes` through the pool,
+`set_listener_rx` for a post-`listen` change, `settle_tcp` for a relocated socket, and an `accept`
+that copies the stored number into the accepted socket. The pin is `t-sockbuf` grown to 18 claims
+(two inheritances and three sized listeners pushed until they refuse; guest 18432/49152/147456,
+host 8192/47104/286561). It also measured a send bug, and that fix ships with it: `tcp_send`
+parked on a **partial** `send_slice` even under `MSG_DONTWAIT`, so a 4096-byte send against a
+2048-byte window never returned; it now answers the count it queued, as Linux's `tcp_sendmsg`
+does. Gate: x86_64 `pass=198 fail=0`; aarch64 `pass=197 fail=0`; `mpos-kunit` 32/0 on both. Named:
+the datagram ring is still fixed (item 58), a connected stream's own `setsockopt` cannot resize
+the live ring, the ring is capped at 128 KiB under §8.0's panicking allocator, and a stream's
+`SO_SNDBUF` still does not size its send ring.
 
 **A thread is its group's child: `CLONE_THREAD` implies `CLONE_PARENT`** (`docs/uapi/` §5.1  
 item 66, landed 2026-10-19): item 65's own residual. A thread's `real_parent` on Linux is the  
@@ -753,10 +787,11 @@ enqueue and `udp_room_for` asks it again (the park's predicate and the refusal m
 question), the datagram ring rose from 4 KiB to 16 KiB and from four packet slots to sixteen so  
 that the buffer can be the smaller number, and the grace for an empty queue is Linux's. Pins:  
 `t-sockbuf` (a new program, 12 claims, green on a host and on both machines) and `t-udpblock`'s  
-fill, which now stops where the buffer's number says. Named: `SO_RCVBUF` is a number and not a  
-window (the receive ring is a fixed 16 KiB), the datagram-too-big line is still the ring's  
-rather than 65507 (no IP fragmentation), and a floor buffer admits three here against Linux's  
-two (payload accounting against skb truesize).
+fill, which now stops where the buffer's number says. Named at the time: `SO_RCVBUF` is a number  
+and not a window (the receive ring is a fixed 16 KiB - a stream's became its window in item 98,  
+a datagram's is still fixed), the datagram-too-big line is still the ring's rather than 65507  
+(no IP fragmentation), and a floor buffer admits three here against Linux's two (payload  
+accounting against skb truesize).
 
 **Giving the terminal back is the session's act, and only the session's** (`docs/uapi/` §5.1  
 item 57, landed 2026-10-18): `TIOCNOTTY` is the residual item 56 named and did not serve. Linux  

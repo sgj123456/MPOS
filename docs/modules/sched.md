@@ -22,39 +22,37 @@ of the table is ever alive across `context::switch`; every access is either insi
 closure (which cannot switch) or a single statement at one of the two switch sites. Second, a
 `Context` must never move, because a suspended task's saved stack pointer lives in it — which is why
 the table is a fixed-size array rather than a `Vec`, and why the count is a hard limit (`MAX_TASKS`,
-64) rather than a grown collection. Third, and this is the "why" the module opens with: a task that
-gives up the CPU switches to the *scheduler task*, not directly to its successor, because a task
-cannot free the stack it is standing on — the exiting task hands over, and the scheduler buries it
-from a stack of its own.
+64). Third, and this is the "why" the module opens with: a task that gives up the CPU switches to
+the *scheduler task*, not directly to its successor, because a task cannot free the stack it is
+standing on — the exiting task hands over, and the scheduler buries it from a stack of its own.
 
 What deliberately does **not** live here is other subsystems' per-process cleanup. `exit.rs`'s
 header explains the inversion: `sched` owns tasks, not sockets, watches, evdev clients or record
 locks, and it used to name every one of them on the exit path, which is what made `sched` unnameable
-without `net`, `vfs` and `drivers` (the finding recorded as V-3 in `docs/ARCHITECTURE.md` §9). Now a
-subsystem registers a hook (`register`/`register_cloexec`), and the teardown walks the list without
-knowing what is on it. There are two lists, not one, because descriptors close on two different
-events — `do_exit` ends the process and tells every per-file owner; `execve` closes only the
-`FD_CLOEXEC` ones and the process lives on — and a single list with a mode flag would hide that
-distinction in a boolean.
+without `net`, `vfs` and `drivers` (V-3 in `docs/ARCHITECTURE.md` §9). Now a subsystem registers a
+hook (`register`/`register_cloexec`), and the teardown walks the list without knowing what is on it.
+There are two lists, not one, because descriptors close on two different events — `do_exit` ends the
+process and tells every per-file owner; `execve` closes only the `FD_CLOEXEC` ones and the process
+lives on — and a single list with a mode flag would hide that distinction in a boolean.
 
 **Host-compilation, and the one file that is not.** `src/lib.rs` gates `sched` to "the host, or bare
 metal on either arch" rather than to an architecture, precisely because its policy is the host
-suite's to pin. Inside the module, `policy`, `signal`, `futex` and `exit` are declared
-unconditionally and so are host-compiled (the consequential fact — `sched`'s pure half is
-host-tested); `runtime` is the single file behind `#[cfg(target_os = "none")]`, because it owns
-machine state and names `hal::Context`/`ContextOps`/`UserFrame`. That is the layering rule working
-as intended rather than a violation of it: the machine-touching body is gated, and the pure logic is
-not — the opposite of the shape `src/mm/heap.rs` has. `runtime.rs` therefore has **no host tests at
-all**; its contract is pinned only by the `t-*` programs below, which is the reason the host suite
-and the bare-metal sweep are both load-bearing here.
+suite's to pin. `policy`, `signal`, `futex` and `exit` are declared unconditionally and so are
+host-compiled — `sched`'s pure half is host-tested; `runtime` is the single file behind
+`#[cfg(target_os = "none")]`, because it owns machine state and names
+`hal::Context`/`ContextOps`/`UserFrame`. That is the layering rule working as intended: the
+machine-touching body is gated and the pure logic is not — the opposite of the shape
+`src/mm/heap.rs` has. `runtime.rs` therefore has **no host tests at all**; its contract is pinned
+only by the `t-*` programs below, which is why the host suite and the bare-metal sweep are both
+load-bearing here.
 
-`runtime.rs` also carries the sizeable host stand-in layer in `mod.rs`: on a host build there is one
-process, so credentials (`HOST_CREDENTIALS`), the creation mask (`HOST_UMASK`), the seccomp latch and
-filter list (`HOST_SECCOMP_STRICT`, `HOST_SECCOMP_FILTERS`), the UTS namespace (`HOST_UTS`), `comm`
-(`HOST_COMM`) and the robust-list head (`HOST_ROBUST_HEAD`) each reduce to one value, and calls like
+`mod.rs` also carries the host stand-in layer: on a host build there is one process, so credentials
+(`HOST_CREDENTIALS`), the creation mask (`HOST_UMASK`), the seccomp latch and filter list
+(`HOST_SECCOMP_STRICT`, `HOST_SECCOMP_FILTERS`), the UTS namespace (`HOST_UTS`), `comm`
+(`HOST_COMM`) and the robust-list head (`HOST_ROBUST_HEAD`) each reduce to one value, and
 `current_owner`/`current_real_owner`/`may_inspect`/`current_groups`/`membarrier_registrations`/
 `descriptor_numbers` answer the honest "no task table" value. `mod.rs`'s tests pin the one behaviour
-that is observable on such a build (`unshare_uts`'s copy semantics).
+observable on such a build (`unshare_uts`'s copy semantics).
 
 The PID namespace's two translations are host stand-ins for a different reason: with no task table
 and no namespaces, every task is in the *init* namespace, whose numbers are the slots - so
@@ -114,7 +112,11 @@ bound and `kill` dropping the copy and answering 0, Linux's measured split; `is_
 and `_NSIG`+1 and `catchable` is that answer minus the kernel's own `SIGKILL`/`SIGSTOP` — two
 questions `rt_sigaction` asks separately, since Linux refuses the kernel's two only when a
 disposition is being *set*; and `default_action` is a table rather than a single "fatal"
-answer, because `SIGSTOP` must stop and `SIGCONT` must resume. The pending set uses Linux's
+answer, because `SIGSTOP` must stop and `SIGCONT` must resume. `Actions` is the process's
+table: a `fork`/`clone` child copies it and the alternate stack, `exec` resets only the
+caught slots (`reset_caught`) and keeps an ignored disposition and the pending set, and
+`clone3`'s `CLONE_CLEAR_SIGHAND` asks for the `SIG_DFL` table instead (`docs/notes/` §2.7).
+The pending set uses Linux's
 canonical layout (signal *n* at bit *n-1*), so the wire conversion is the identity — which is why
 the ABI tests, not host tests, pin the wire half by number.
 
@@ -152,18 +154,17 @@ does when it wakes.
 | Pin | Kind | What it would fail on |
 |---|---|---|
 | `src/sched/policy.rs` `mod tests` — `round_robin_cycles_within_a_band`, `a_higher_band_runs_before_a_lower_one`, `a_task_wakes_on_the_tick_it_asked_for`, `wake_order_follows_deadlines`, `a_tie_breaks_on_priority_then_id`, `sleeping_zero_ticks_still_waits_for_the_clock`, `ready_and_empty_answer_different_questions`, `waking_a_sleeper_pulls_it_out_of_the_sleep_queue`, `a_woken_sleeper_rejoins_its_own_band`, `waking_a_task_that_is_not_sleeping_reports_failure`, `sleep_saturates_so_u64_max_means_until_woken` | host | The band/round-robin policy, the sleep/wake ordering and its saturation rule |
-| `src/sched/signal.rs` `mod tests` — `numbers_are_pinned`, `the_default_action_table_matches_signal_7`, `only_uncatchable_signals_are_refused_a_disposition`, `a_signal_is_nameable_and_installable_except_for_the_kernels_two`, `take_returns_the_lowest_signal_first`, `adding_twice_still_takes_once`, `siginfo_codes_are_pinned`, `is_rt_spans_only_the_real_time_range`, `rt_queue_delivers_every_copy_in_fifo_order_with_its_own_value`, `rt_queue_keeps_numbers_independent_and_ordered`, `rt_queue_drops_and_reports_when_full`, `rt_queue_starts_empty` | host | The signal numbers, the default-action table, `is_signal`/`catchable`, and the real-time queue's FIFO/independence/bound |
+| `src/sched/signal.rs` `mod tests` — `numbers_are_pinned`, `the_default_action_table_matches_signal_7`, `only_uncatchable_signals_are_refused_a_disposition`, `exec_resets_caught_dispositions_and_keeps_ignored_ones`, `a_signal_is_nameable_and_installable_except_for_the_kernels_two`, `take_returns_the_lowest_signal_first`, `adding_twice_still_takes_once`, `siginfo_codes_are_pinned`, `is_rt_spans_only_the_real_time_range`, `rt_queue_delivers_every_copy_in_fifo_order_with_its_own_value`, `rt_queue_keeps_numbers_independent_and_ordered`, `rt_queue_drops_and_reports_when_full`, `rt_queue_starts_empty` | host | The signal numbers, the default-action table, `is_signal`/`catchable`, and the real-time queue's FIFO/independence/bound |
 | `src/sched/futex.rs` `mod tests` — `a_wake_reaches_only_the_address_it_names_and_only_as_many_as_asked`, `a_bitset_wake_reaches_only_intersecting_sleepers`, `a_wake_that_arrives_before_the_sleep_is_not_lost`, `a_task_that_never_waited_is_never_woken` | host | The address-scoped, count-bounded and bitset-filtered wake, and the register-before-recheck ordering |
 | `src/sched/exit.rs` `mod tests` — `hooks_run_in_registration_order_and_an_empty_list_is_not_a_special_case` | host | Registration order, the empty-list no-op, and the exit/cloexec list separation |
 | `src/sched/mod.rs` `mod tests` — `unshare_gives_a_copy_of_the_names_and_not_the_names_themselves` | host | The one-process `unshare(CLONE_NEWUTS)` copy semantics |
-| `user/tests/src/bin/` — `t-futex.rs`, `t-clone.rs`, `t-fork.rs`, `t-exit-group.rs`, `t-wait4.rs`, `t-waitid.rs`, `t-wait-eintr.rs`, `t-kill.rs`, `t-sigaltstack.rs`, `t-signal-delivery.rs`, `t-signal-frame.rs`, `t-signalfd.rs`, `t-sa-restart.rs`, `t-rt-sigaction.rs`, `t-rt-signal-queue.rs`, `t-rt-sigprocmask.rs`, `t-rt-sigtimedwait.rs`, `t-segv.rs`, `t-set-robust-list.rs`, `t-set-tid-address.rs`, `t-nanosleep.rs`, `t-priority.rs`, `t-sched-getaffinity.rs`, `t-timer-create.rs`, `t-timerfd.rs`, `t-ptrace.rs`, `t-ptrace-attach.rs`, `t-times.rs`, `t-fpu-across-switch.rs`, `t-regs-across-syscall.rs`, `t-getpid.rs`, `t-ns-uts.rs`, `t-caps.rs` | `t-*` (std) | The runtime's task, signal, futex, wait, timer and ptrace behaviour end to end on a booted machine — the only pins `runtime.rs` has, since it is machine-gated |
+| `user/tests/src/bin/` — `t-futex.rs`, `t-clone.rs`, `t-fork.rs`, `t-exit-group.rs`, `t-wait4.rs`, `t-waitid.rs`, `t-wait-eintr.rs`, `t-kill.rs`, `t-sigaltstack.rs`, `t-signal-delivery.rs`, `t-signal-frame.rs`, `t-signal-inherit.rs`, `t-sigpipe.rs`, `t-signalfd.rs`, `t-sa-restart.rs`, `t-rt-sigaction.rs`, `t-rt-signal-queue.rs`, `t-rt-sigprocmask.rs`, `t-rt-sigtimedwait.rs`, `t-segv.rs`, `t-set-robust-list.rs`, `t-set-tid-address.rs`, `t-nanosleep.rs`, `t-priority.rs`, `t-sched-getaffinity.rs`, `t-timer-create.rs`, `t-timerfd.rs`, `t-ptrace.rs`, `t-ptrace-attach.rs`, `t-times.rs`, `t-fpu-across-switch.rs`, `t-regs-across-syscall.rs`, `t-getpid.rs`, `t-ns-uts.rs`, `t-caps.rs` | `t-*` (std) | The runtime's task, signal, futex, wait, timer and ptrace behaviour end to end on a booted machine — the only pins `runtime.rs` has, since it is machine-gated |
 | `user/abitest/src/bin/integration/t-forkcost.rs` | `t-*` (no_std) | Not a contract pin — a `slow`-group instrument whose numbers are `docs/notes/` §10.2's subject |
 
 There is no `t-*` program under `user/abitest` that pins `sched`'s contract: the `no_std` suite's
 live programs are `src/bin/integration/*`, and the closest, `t-forkcost`, is a measurement rather
 than an assertion (`tests.toml`'s `slow` group says so). So `sched`'s runtime is pinned entirely by
 the std-side programs above, and its pure half entirely by the host tests.
-
 ## Evidence and open work
 
 The reasoning and the measurements live elsewhere and are not restated here. The task-switch/fork

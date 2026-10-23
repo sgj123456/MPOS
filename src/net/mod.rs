@@ -109,8 +109,38 @@ const EPHEMERAL_MAX: u16 = 60999;
 /// something the ring cannot hold. Sixty-four kilobytes is under the 128 KiB
 /// the sixty-four receive buffers add up to, which is the pair this machine
 /// was measured with.
+///
+/// It is also exactly [`tcp_rx_bytes`] of a fresh stream socket's stored
+/// `SO_RCVBUF` (131072 / 2), so a caller who never sets the option and one who
+/// asks for the default get the same ring.
 const TCP_RX_BYTES: usize = 64 * 1024;
 const TCP_TX_BYTES: usize = 16 * 1024;
+
+/// The ceiling a TCP receive ring may reach, whatever `SO_RCVBUF` stores.
+///
+/// `SO_RCVBUF`'s number is Linux's up to the sysctl maximum, but this kernel
+/// allocates the ring when the socket is made, where Linux charges its receive
+/// memory as data arrives - so an ask of the sysctl maximum (8 MiB stored)
+/// would cost eight eager mebibytes per socket and a handful of sockets would
+/// end the machine (§8.0's allocator panics). The ring is therefore capped at
+/// twice the stack's default; a larger ask still reads back its Linux number,
+/// and the *window* it buys is named in `docs/notes/` §4.3.3 rather than
+/// silently believed.
+pub(crate) const TCP_RX_MAX: usize = 2 * TCP_RX_BYTES;
+
+/// The receive ring a stream socket's stored `SO_RCVBUF` buys.
+///
+/// The stored figure is **twice** the ask (Linux's memory-versus-data
+/// convention, `sock_buffer_size`), and per-`skb` overhead takes about half of
+/// it back: measured on a current host, an accepted socket reading 65536
+/// absorbed 47104 bytes from an 8192-byte client send buffer, and one reading
+/// 524288 absorbed 212886 (`.workbuddy/probe_tcp_rcvbuf.c`, Linux 7.2.11). So
+/// the ring is half the stored number, capped at [`TCP_RX_MAX`]. The floor is
+/// the option's own: the smallest stored figure is 2304, which buys a
+/// 1152-byte window - smaller than an MSS, and legal TCP.
+pub(crate) fn tcp_rx_bytes(stored: u32) -> usize {
+    ((stored as usize) / 2).clamp(1, TCP_RX_MAX)
+}
 
 /// The wildcard raw door's receive queue (`Channel::Raw`'s field, and the type
 /// `socket::echo_to_raw_doors` fills): complete IPv4 packets, oldest first,
@@ -427,6 +457,11 @@ pub(crate) struct Listener {
     /// backlog`, so this is "one deeper than it names" - the same rule the
     /// unix family was measured into (§4.1).
     backlog: usize,
+    /// The receive ring every pool socket is built with, from the listener's
+    /// `SO_RCVBUF` - which Linux copies onto an accepted socket
+    /// (`inet_csk_clone_lock`), and which is therefore the connection's window
+    /// before the connection exists. `docs/notes/` §4.3.3.
+    rx_bytes: usize,
     /// Sockets in `Listen`. Between one and [`LISTEN_POOL_MAX`].
     listening: Vec<SocketHandle>,
     /// Completed connections, in arrival order. Bounded by `backlog + 1` plus
@@ -662,9 +697,16 @@ impl Stack {
     /// socket no further connection can arrive on until this refills.
     fn service_listeners(&mut self) {
         for id in 0..self.listeners.len() {
-            let Some((home, local, backlog, depth)) = self.listeners[id]
-                .as_ref()
-                .map(|l| (l.home, l.local, l.backlog, pool_depth(l.backlog)))
+            let Some((home, local, backlog, depth, rx_bytes)) =
+                self.listeners[id].as_ref().map(|l| {
+                    (
+                        l.home,
+                        l.local,
+                        l.backlog,
+                        pool_depth(l.backlog),
+                        l.rx_bytes,
+                    )
+                })
             else {
                 continue;
             };
@@ -719,7 +761,7 @@ impl Stack {
             let want = room.min(depth);
             let mut listening = idle;
             while listening.len() < want {
-                let h = self.add_tcp(home);
+                let h = self.add_tcp_sized(home, rx_bytes);
                 if self.tcp_socket(home, h).listen(local).is_err() {
                     // Only an open socket refuses, and a socket this fresh is
                     // not one; a refusal here would leave a stray, so drop it
@@ -754,11 +796,12 @@ impl Stack {
         local: IpListenEndpoint,
         backlog: usize,
         first: SocketHandle,
+        rx_bytes: usize,
     ) -> usize {
         let depth = pool_depth(backlog);
         let mut listening: Vec<SocketHandle> = Vec::with_capacity(depth);
         while listening.len() + 1 < depth {
-            listening.push(self.add_tcp(home));
+            listening.push(self.add_tcp_sized(home, rx_bytes));
         }
         listening.push(first);
         // A socket that refuses to listen is dropped rather than carried: the
@@ -769,6 +812,7 @@ impl Stack {
             home,
             local,
             backlog,
+            rx_bytes,
             listening,
             accepted: VecDeque::new(),
         };
@@ -846,6 +890,50 @@ impl Stack {
         if let Some(l) = self.listeners.get_mut(id).and_then(|slot| slot.as_mut()) {
             l.backlog = backlog;
         }
+    }
+
+    /// Re-size a listener's receive ring from `SO_RCVBUF`.
+    ///
+    /// The pool sockets still waiting for a `SYN` are **rebuilt now**: a
+    /// caller that sets the option after `listen` and connects at once must
+    /// not meet the old ring, and a listening socket is the one state smoltcp
+    /// lets be replaced without losing anything. A socket in `SynReceived` is
+    /// left alone - its handshake is under way, and dropping its `SYN` over an
+    /// option change would be a worse answer than the old window. That
+    /// connection therefore keeps the ring it was built with; Linux, which
+    /// sizes the child at accept, would use the new one. The race is named in
+    /// `docs/notes/` §4.3.3.
+    pub(crate) fn set_listener_rx(&mut self, id: usize, rx_bytes: usize) {
+        let Some(mut listener) = self.listeners.get_mut(id).and_then(|slot| slot.take()) else {
+            return;
+        };
+        listener.rx_bytes = rx_bytes;
+        let home = listener.home;
+        let local = listener.local;
+        let mut keep = Vec::with_capacity(listener.listening.len());
+        for h in core::mem::take(&mut listener.listening) {
+            if self.tcp_socket(home, h).state() == tcp::State::SynReceived {
+                keep.push(h);
+                continue;
+            }
+            self.sockets_mut(home).remove(h);
+        }
+        // Refill at once, and no deeper than a free backlog has room for:
+        // `service_listeners` owns that rule, and a full queue must keep its
+        // empty pool or the next SYN is answered beyond the backlog.
+        let depth = pool_depth(listener.backlog);
+        let room = (listener.backlog + 1).saturating_sub(listener.accepted.len());
+        let want = room.min(depth);
+        while keep.len() < want {
+            let h = self.add_tcp_sized(home, rx_bytes);
+            if self.tcp_socket(home, h).listen(local).is_err() {
+                self.sockets_mut(home).remove(h);
+                break;
+            }
+            keep.push(h);
+        }
+        listener.listening = keep;
+        self.listeners[id] = Some(listener);
     }
 
     /// Whether a TCP socket is still in `Closed` - the precondition for every
@@ -1024,7 +1112,14 @@ impl Stack {
 
     /// Add a freshly built TCP socket to `home`'s set and hand back its handle.
     pub(crate) fn add_tcp(&mut self, home: Home) -> SocketHandle {
-        let rx = tcp::SocketBuffer::new(alloc::vec![0u8; TCP_RX_BYTES]);
+        self.add_tcp_sized(home, TCP_RX_BYTES)
+    }
+
+    /// The same, with a receive ring of `rx_bytes` - what `SO_RCVBUF` buys a
+    /// socket at birth (see [`tcp_rx_bytes`]) and what a listener's pool
+    /// sockets are built with.
+    pub(crate) fn add_tcp_sized(&mut self, home: Home, rx_bytes: usize) -> SocketHandle {
+        let rx = tcp::SocketBuffer::new(alloc::vec![0u8; rx_bytes]);
         let tx = tcp::SocketBuffer::new(alloc::vec![0u8; TCP_TX_BYTES]);
         self.sockets_mut(home).add(tcp::Socket::new(rx, tx))
     }
@@ -1077,7 +1172,18 @@ impl Stack {
     /// `Closed` is exactly "nothing has happened yet" for a TCP socket: our own
     /// `bind` does not touch it (it records the endpoint in the registry and
     /// defers to `connect`), and the states past it are the handshake's.
-    pub(crate) fn settle_tcp(&mut self, home: &mut Home, h: &mut SocketHandle, want: Home) {
+    ///
+    /// The fresh socket is built with `rx_bytes` - the ring the caller's
+    /// `SO_RCVBUF` already bought ([`tcp_rx_bytes`]) - because a rebuild that
+    /// forgot it would silently undo the option at the first `connect` to an
+    /// address on the other interface.
+    pub(crate) fn settle_tcp(
+        &mut self,
+        home: &mut Home,
+        h: &mut SocketHandle,
+        want: Home,
+        rx_bytes: usize,
+    ) {
         if *home == want {
             return;
         }
@@ -1089,7 +1195,7 @@ impl Stack {
             "a TCP socket that has left Closed cannot change interface"
         );
         self.sockets_mut(*home).remove(*h);
-        *h = self.add_tcp(want);
+        *h = self.add_tcp_sized(want, rx_bytes);
         *home = want;
     }
 
@@ -1577,7 +1683,12 @@ pub(crate) fn tcp_listen(handle: usize, backlog: i32) -> Option<isize> {
         // `bind` and `connect`, and this is the last moment the socket can
         // move - `listen` is what gives it state.
         let want = home_of(endpoint.addr);
-        stack.settle_tcp(&mut home, &mut sock_handle, want);
+        stack.settle_tcp(
+            &mut home,
+            &mut sock_handle,
+            want,
+            tcp_rx_bytes(entry.opts.rcvbuf),
+        );
         // smoltcp wants the wildcard as an absent address rather than as
         // `0.0.0.0`, and the two spellings have to agree with what
         // `getsockname` will report.
@@ -1591,7 +1702,13 @@ pub(crate) fn tcp_listen(handle: usize, backlog: i32) -> Option<isize> {
                 port: endpoint.port,
             },
         };
-        let id = stack.open_listener(home, listen_at, backlog, sock_handle);
+        let id = stack.open_listener(
+            home,
+            listen_at,
+            backlog,
+            sock_handle,
+            tcp_rx_bytes(entry.opts.rcvbuf),
+        );
         entry.channel = Channel::TcpListen {
             id,
             local: endpoint,

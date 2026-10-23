@@ -2926,6 +2926,12 @@ pub(super) fn handle_sendfile(args: [usize; ARG_COUNT], from_user: bool) -> isiz
                 if sent > 0 {
                     break;
                 }
+                // `sendfile` to a readerless pipe is EPIPE and SIGPIPE -
+                // measured on a current host (`.workbuddy/probe_sigpipe3.c`,
+                // Linux 7.2.11: -1/EPIPE with the handler run).
+                if e == crate::vfs::VfsError::BrokenPipe {
+                    super::fs::raise_sigpipe(out_fd, false);
+                }
                 return err_of(e);
             }
         };

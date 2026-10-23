@@ -268,6 +268,23 @@ pub fn send_signal(id: TaskId, sig: u8) -> bool {
     send_signal_info(id, sig, crate::sched::signal::SigInfo::user(sig, pid, uid)) != Sent::NoTask
 }
 
+/// Generate `SIGPIPE` for the running task: the signal a `write`-family door
+/// owes when it answers `EPIPE`.
+///
+/// Linux raises it **inside** the call, so the handler runs on the way out of
+/// the same syscall and sees the write's `EPIPE` in its `ucontext` - measured
+/// on a current host (`.workbuddy/probe_sigpipe.c`, Linux 7.2.11): a handler's
+/// flag is already set when `write` returns, and a blocked signal is pending
+/// with the write's `EPIPE` returned. The record is `SI_USER`, which is what
+/// `send_sig(SIGPIPE, current, 0)` stamps (measured `si_code == 0`).
+///
+/// Whether the door raises at all is the door's question, not this one's:
+/// `MSG_NOSIGNAL` and a sequenced-packet AF_UNIX send are the two measured
+/// suppressions (`docs/notes/` §4.1.13).
+pub fn raise_sigpipe() {
+    let _ = send_signal(crate::sched::current(), crate::sched::signal::SIGPIPE);
+}
+
 /// Send `sig` to `id`, recording `info` as the `siginfo_t` a handler will read.
 ///
 /// `NoTask` when the task does not exist or has already exited, which the

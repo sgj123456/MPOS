@@ -65,9 +65,17 @@ impl Inode for EventFd {
             // Event descriptors are anonymous; the number only has to be one
             // nothing else claims.
             ino: 0x5000_0000 + self.ino,
-            kind: NodeKind::CharDev,
+            kind: NodeKind::Anon { mode: 0o600 },
             size: 0,
         }
+    }
+
+    /// Linux's name for the descriptor in `/proc/<pid>/fd`: an eventfd is an
+    /// `anon_inode`, and `readlink` reports that spelling rather than this
+    /// kernel's `anon:[ino]` fallback (measured on a current host,
+    /// `.workbuddy/probe_anon_fd_stat.c`).
+    fn fd_name(&self) -> Option<alloc::string::String> {
+        Some(alloc::string::String::from("anon_inode:[eventfd]"))
     }
 
     /// A read takes the counter and leaves zero behind - the semaphore shape,

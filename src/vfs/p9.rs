@@ -73,6 +73,21 @@ use critical_section::Mutex;
 /// clunk, remove - is the same message with the same encoding.
 const DIALECT: &str = "9P2000.u";
 
+/// The `msize` the mount asks for. The host may answer lower, and the answer
+/// is the number every later `read` and `write` chunks by - a request bigger
+/// than `msize` is the one thing the protocol refuses outright.
+///
+/// 128 KiB is QEMU's own recommendation: its server warns about a client that
+/// chooses 8192 or less ("degraded performance"), and QEMU 11.1.2's fsdev has
+/// no `msize` option at all, so the client's ask is the only knob. Measured on
+/// a 64 MiB read through the host share under TCG: 8192 chunks moved it in
+/// 0.255 s (250.6 MB/s) and produced the warning; this ask moved it in
+/// 0.065-0.071 s (897-986 MB/s) across two boots with no warning, the server
+/// granting 131072 (`.workbuddy/p9bench-boot.sh`, `docs/notes/` §10.9). The
+/// per-request buffer is allocated at this size, which is why the ask does
+/// not climb further.
+pub(crate) const PROPOSED_MSIZE: u32 = 128 * 1024;
+
 const T_VERSION: u8 = 100;
 const R_VERSION: u8 = 101;
 const T_ATTACH: u8 = 104;
@@ -300,12 +315,6 @@ fn put_u32(out: &mut Vec<u8>, word: u32) {
 mod device {
     use super::*;
 
-    /// The message size the mount asks for. The host may answer lower, and
-    /// the answer is the number every later `read` and `write` chunks by -
-    /// a request bigger than `msize` is the one thing the protocol refuses
-    /// outright.
-    const MSIZE: u32 = 8192;
-
     /// The head of a message: `size[4] type[1] tag[2]`.
     const HEADER: usize = 7;
 
@@ -340,7 +349,7 @@ mod device {
 
             let fs = Arc::new(P9fs {
                 dev,
-                msize: Mutex::new(RefCell::new(MSIZE)),
+                msize: Mutex::new(RefCell::new(PROPOSED_MSIZE)),
                 next_tag: Mutex::new(RefCell::new(0)),
                 next_fid: Mutex::new(RefCell::new(1)),
                 root: Mutex::new(RefCell::new(None)),
@@ -433,7 +442,7 @@ mod device {
         /// and `.L` is a different message set entirely.
         fn version(&self) -> VfsResult<()> {
             let mut body = Vec::new();
-            put_u32(&mut body, MSIZE);
+            put_u32(&mut body, PROPOSED_MSIZE);
             put_str(&mut body, DIALECT.as_bytes());
             let answer = self.call(T_VERSION, &body, R_VERSION)?;
             let mut at = HEADER;
@@ -1154,5 +1163,19 @@ mod tests {
         assert_eq!(error_of("Read-only file system"), VfsError::ReadOnly);
         // Unknown prose is EIO, not a guess.
         assert_eq!(error_of("something novel"), VfsError::Corrupt);
+    }
+
+    /// QEMU's 9p server warns about a client whose `msize` is 8192 or less, and
+    /// every read and write chunks by the negotiated value: a 64 MiB read took
+    /// 0.255 s at 8192 and 0.065-0.071 s at this ask on the same boot wiring
+    /// (`docs/notes/` §10.9). The request is a constant rather than a runtime
+    /// fact, so this is where a regression is caught; the negotiation itself is
+    /// the measurement's.
+    #[test]
+    fn the_proposed_msize_is_above_the_degraded_line() {
+        assert!(
+            PROPOSED_MSIZE > 8192,
+            "a client asking {PROPOSED_MSIZE} earns QEMU's degraded-performance warning"
+        );
     }
 }

@@ -621,6 +621,180 @@ red (`accept of an unbound client writes the bare family`,
 `addr_ptr != 0 && len_ptr != 0` condition restored is `pass=192 fail=1` with
 `accept with a real addr and a NULL addrlen is EFAULT` red.
 
+#### 4.1.12 A peer's close is a hang-up, not silence — **SERVED** (2026-10-21)
+
+OpenRC's `udev-settle` service is the boot this cost. `udevadm settle` sends
+udevd a control ping over a connected `AF_UNIX` `SOCK_SEQPACKET` socket and then
+`poll`s that connection for a readable event, with the settle timeout as its
+patience. udevd accepts the ping, handles it and closes its end - and on Linux
+that close is `POLLIN|POLLHUP` on the client's descriptor, so `ctrl_send`
+returns at once. This kernel's `UnixSock` never reported a hang-up at all:
+`poll_hup` was the trait's `false`, and a connected **seqpacket** end's
+readiness looked only at its receive queue, so the close was indistinguishable
+from an empty queue. The client sat out settle's whole **120-second** default,
+and the boot line `* Waiting for uevents to be processed ...` owned the delay.
+
+**Measured whole on a current host first** (`.workbuddy/probe_unix_close.c`
+and `.workbuddy/probe_seq_send_close.c`, Linux 7.2.11). Every connected shape -
+`socketpair` or named listener,
+`SOCK_STREAM` or `SOCK_SEQPACKET` - answers a peer's close the same way:
+
+| After the peer closes | Linux 7.2.11 |
+|---|---|
+| `poll(POLLIN)` | `POLLIN\|POLLHUP` (`0x011`) |
+| `epoll_wait` with `EPOLLIN` | `EPOLLIN\|EPOLLHUP` (`0x11`) |
+| `recv` | 0 |
+| `send` (seqpacket) | `EPIPE` (32) |
+
+The contrast is the **datagram** socket, whose dead peer is not an end of
+stream (`.workbuddy/probe_dgram_close.c`): `poll(POLLIN|POLLOUT)` reports
+`POLLOUT` alone (`0x004`), a receive is `EAGAIN` and a send is
+`ECONNREFUSED` (111) - the peer can be replaced by another `connect`, so a
+hang-up there would be a lie.
+
+**Measured in the guest before the fix** (`unixcloseprobe.c`):
+
+```
+socketpair seqpacket, peer closed  poll=0 revents=0x000 epoll=0 events=0x00000000 recv=-1 errno=11
+socketpair stream, peer closed     poll=1 revents=0x011 epoll=1 events=0x00000051 recv=0 errno=0
+named seqpacket, server closed     poll=0 revents=0x000 epoll=0 events=0x00000000 recv=-1 errno=11
+named stream, server closed        poll=1 revents=0x001 epoll=1 events=0x00000041 recv=0 errno=0
+```
+
+Both seqpacket shapes answered nothing at all, and the named stream answered
+readable but not hung up where its `socketpair` twin answered `0x011` - the
+named end is a `UnixSock` wrapper around a `DuplexEnd`, and the wrapper's
+`poll_hup` was the trait default while the pair's fd names the end directly.
+(The extra `EPOLLRDNORM` bit in the guest's masks predates this item and is not
+pinned here.)
+
+**The fix is the end-of-stream the message shape was missing.** A connected
+seqpacket socket already keeps a weak reference to its peer (`dgram_peer`); a
+failed upgrade is now `message_peer_gone`, and that one predicate drives every
+answer:
+
+- `take_dgram`/`peek_dgram` drain the queue **first**, then answer `Ok(None)` -
+  Linux keeps delivering messages a dead peer sent before it died, and only the
+  read after them is end-of-file (`read_at` renders it as 0);
+- `wait_for_dgram`'s condition includes the gone peer, so a parked reader is not
+  put straight back to sleep after the wake;
+- `poll_ready` reports readable when the queue is non-empty **or** the peer is
+  gone (a `MSG_DONTWAIT` receive consults it before the take);
+- `poll_hup` answers the same predicate; for a stream it forwards to the wrapped
+  `DuplexEnd`, which is the named-end half the pair already had.
+
+`Drop` takes the peer's `read_waiters` under the same critical section that
+clears the slot and wakes them after every borrow is released: the weak
+reference is how a peer *learns* of the close, but nothing would make it look.
+
+**Pinned by `t-unix-close`** (new, default group, both machines), 19 claims:
+the queued message surviving the close, the 0 after it, the `poll`/`epoll`
+shapes above, the same for a `socketpair` end and a named stream, the two
+**wakes** (a forked child closes 100 ms into a five-second wait, so an answer at
+the deadline fails the claim), and the datagram contrast. Green on a current
+host first (19/19); in the guest the wake measures **99 ms** for `poll` and
+**97 ms** for `epoll_wait`.
+
+**The counterfactual** (the four predicates put back: no gone peer in the take,
+peek, wait or readiness, and `poll_hup` false) is **7 of 19 red** by name - the
+read after the close, the seqpacket `poll` and `epoll` shapes, both wakes at
+their deadlines (`4997 ms`, `5000 ms`), the pair's own `poll` and receive, and
+the named stream's missing `POLLHUP`. The datagram contrast and every message-
+ordering claim stayed green, which is what makes the seven the fix's own.
+
+**Gate**: x86_64 stage 1 1073 tests / 0 failed; stage 2 196 programs,
+`pass=196 fail=0`; `mpos-kunit 32 passed, 0 failed`.
+
+**The boot after it**: the same image prints
+`* Waiting for uevents to be processed ... [ ok ]` and reaches `mpos login:`
+**3.7 s** after QEMU starts (18:59:21 → 18:59:24, `-serial file:`), where the
+pre-fix boot spent the 120 s at that line.
+
+**Named, not served**: the send side of the same close, which is §4.1.13.
+That section also corrects one claim this one wrote down without measuring:
+a sequenced-packet `send` to a dead peer answers `EPIPE` and raises **no**
+`SIGPIPE`; the signal belongs to the stream and the pipe.
+
+#### 4.1.13 The write side of a close: `EPIPE` and the `SIGPIPE` behind it — **SERVED** (2026-10-21)
+
+§4.1.12 made a peer's close **visible** to a reader. The sender half was still
+wrong: a seqpacket `send` to the dead peer answered `ENOTCONN`, a plain
+`socketpair` stream's write answered `EPIPE` but raised nothing, and this
+kernel raised no `SIGPIPE` for any broken channel at all - the pipe's write
+returned `EPIPE` to a program Linux would have killed.
+
+**Measured whole on a current host first** (`.workbuddy/probe_sigpipe.c`,
+`probe_sigpipe2.c`, `probe_sigpipe3.c`, `probe_sigpipe4.c`; Linux 7.2.11):
+
+| the broken channel | `write`/`send` | handler runs? |
+|---|---|---|
+| a pipe with no reader | `EPIPE` | **yes**, before the call returns |
+| a `SOCK_STREAM` pair whose peer closed | `EPIPE` | **yes**, every call |
+| `send` on a listener | `EPIPE` | **yes** |
+| a reset stream's **second** write (the first is `ECONNRESET`) | `EPIPE` | **yes** |
+| a `SOCK_SEQPACKET` pair whose peer closed | `EPIPE` | **no** |
+| a connected `SOCK_DGRAM` whose peer closed | `ECONNREFUSED`, once | no |
+| a socket that never connected | `ENOTCONN` | no |
+
+Each row is repeatable except the datagram one, and *that* is the subtle
+half: the first send that finds a datagram peer gone answers
+`ECONNREFUSED` and **forgets the connection**, so the second call is the
+`ENOTCONN` a socket that never dialled answers (`send` and `write` alike, on
+a `socketpair` and a named pair). A seqpacket connection is remembered: its
+`EPIPE` repeats. The record the handler reads is `SI_USER` (`si_code == 0`),
+which is what `send_sig(SIGPIPE, current, 0)` stamps.
+
+**The signal is not a flag on the errno.** Four more measurements decide the
+details:
+
+* **`MSG_NOSIGNAL` suppresses the signal and nothing else** - the send still
+  answers `EPIPE`;
+* **a blocked signal is pending** when the call answers `EPIPE`, and its
+  handler runs when it is unblocked; a caught handler runs **before** the
+  call returns to the caller's next instruction;
+* **`writev`, `splice` and `sendfile`** into a broken pipe each answer
+  `EPIPE` and raise once;
+* **a partial write is answered by its count**, and there the pipe and the
+  stream part ways: a 200000-byte write into a nearly full pipe whose reader
+  closes mid-call answers 57344 **and raises `SIGPIPE`**, while the same race
+  on a `SOCK_STREAM` pair answers 219264 silently. A zero-length write to a
+  broken pipe is `0` with no signal.
+
+**The landing.** `sched::raise_sigpipe` generates the signal for the running
+task (the same `send_signal` a `kill` uses, so the record is `SI_USER`), and
+the write-family doors raise it where Linux does: `write`, `writev`, `splice`
+and `sendfile` on a `VfsError::BrokenPipe`; the channel and IP arms of
+`sendto`/`sendmsg` on an `EPIPE`, with `MSG_NOSIGNAL` threaded through. The
+seqpacket exemption is asked of the socket (`UnixSock::silent_broken_pipe`)
+because that `EPIPE` arrives from the message path, not from a stream. The
+datagram row is `UnixSock::message_peer`: a failed weak-reference upgrade
+answers `ECONNREFUSED` **and clears the slot** for a datagram connection, and
+`EPIPE` without clearing for a seqpacket one. The pipe/stream split of the
+partial-write row lives in the buffer itself: `pair()` builds pipe and FIFO
+ends with `partial_break_signals` set, `DuplexEnd::pair()` builds the halves
+of a socketpair without it.
+
+**Pinned by `t-sigpipe`** (new, default group, both machines), 32 claims: the
+four rows of the first table with their handler counts, `si_code`, the
+`MSG_NOSIGNAL` pair, the blocked-then-unblocked sequence, `writev`/`splice`/
+`sendfile`, and a forked child at `SIG_DFL` that **dies of signal 13**. Green
+on a current host first (32/32) and byte-for-byte the same in the guest on
+both machines. **The counterfactual** (the primitive made a no-op) is **10 of
+32 red by name**: every handler count and pending-set claim, the three copy
+calls' signal halves, and the `SIG_DFL` death - while every errno claim stayed
+green, which is what makes the ten the signal's own.
+
+**Gate**: x86_64 `198 programs`, `pass=198 fail=0`; aarch64 `197 staged`,
+`pass=197 fail=0`; `mpos-kunit 32 passed, 0 failed` on both.
+
+**Named, not changed**: a TCP connection reset's **first** write answers
+`ECONNRESET` on Linux and raises nothing; its second is `EPIPE` plus the
+signal (measured). This kernel answers `EPIPE` to both - smoltcp clears the
+tuple at the reset, so "first" is not a fact it kept - and now raises the
+signal with its own errno; the errno divergence is §4.3's, predating this
+item. vsock's `EPIPE` is left exactly as it was: there is no host device to
+measure its signal half against, and a guess is not a measurement.
+
 ### 4.2 ICMP Improvements — **DONE**
 
 `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` is served by a raw smoltcp socket
@@ -643,14 +817,13 @@ Current: auto echo reply only. No user-facing ICMP socket.
 - `sendto`/`recvfrom` on raw ICMP socket
 - Enable `ping` command to work
 
-### 4.3 TCP: the loopback, the listener, and the options — **PARTIAL**
+### 4.3 TCP: the loopback, the listener, and the options — **DONE**
 
-Three things live in this section, and the **loopback** (4.3.1) and
-**`listen`/`accept`** (4.3.2) are done. The **socket options** (4.3.3) are the
-part still open, and of the six, five now steer the stack - `TCP_NODELAY`,
-`SO_KEEPALIVE`, `SO_REUSEADDR`'s bind arbitration, `SO_LINGER`'s reset and
-`SO_SNDBUF`'s datagram queue - while one is stored and read back without changing
-a packet (`SO_RCVBUF`).
+Three things live in this section, and all three are served: the **loopback**
+(4.3.1), **`listen`/`accept`** (4.3.2), and the **socket options** (4.3.3) -
+`TCP_NODELAY`, `SO_KEEPALIVE`, `SO_REUSEADDR`'s bind arbitration, `SO_LINGER`'s
+reset, `SO_SNDBUF`'s datagram queue, and `SO_RCVBUF`, which is now the receive
+window of a TCP connection and what a listener hands the socket it accepts.
 
 #### 4.3.1 The loopback is a real wire — **DONE**
 
@@ -747,7 +920,7 @@ ways, the client's *half*-close read as end-of-stream while the other direction
 still carries, a second sequential connection (which is what fails if the pool
 never refills), and every refusal in the table above.
 
-#### 4.3.3 The options — **PARTIAL** (the receive buffer is a report, not a window)
+#### 4.3.3 The options — **SERVED** (a stream's receive buffer is its window; a datagram's is still a report)
 
 `setsockopt`/`getsockopt` are no longer a no-op: each socket's registry `Entry`
 carries a `SockOpts`, and the common options round-trip with the correct ABI —
@@ -818,14 +991,71 @@ with an open connection, and both serve". The whole test also runs on a Linux
 host unchanged, which is the instrument: the same assertions that the guest must
 satisfy are the ones a real kernel satisfies.
 
-*Remaining (real effect, into smoltcp):* one. `SO_RCVBUF` is the number a caller
-reads and not a window this kernel resizes: the receive ring is fixed at 16 KiB,
-so a smaller ask does not shrink it, where Linux drops at delivery once the queue
-passes the buffer. Five that used to be on this list are not: `SO_SNDBUF` governs
-a datagram socket's queue (`docs/uapi/` §5.1 item 58), `TCP_NODELAY` reaches the
-live socket (`set_nagle_enabled`), `SO_KEEPALIVE` arms smoltcp's probe timer at
-Linux's default interval, `SO_REUSEADDR` is the rule above, and `SO_LINGER{on, 0}`
-makes the last `close` a reset (4.3.4).
+**A stream's receive buffer is its window, and a listener hands it on.** Linux
+stores twice the ask (item 58) and the *effective* data capacity is roughly half
+the stored figure, per-skb overhead taking the rest; a listener's `sk_rcvbuf` is
+copied onto every accepted socket (`inet_csk_clone_lock`), whether the option was
+set before or after `listen`. Measured first on a current host
+(`.workbuddy/probe_tcp_rcvbuf.c`, Linux 7.2.11), with a server that never reads
+and a client whose send buffer is 4096:
+
+| listener asks | accepted socket reads | unread bytes absorbed |
+|---|---|---|
+| 2048 | 4096 | 8192 |
+| 32768 | 65536 | 47104 |
+| 262144 | 524288 | 212886 |
+| (unset) | 131072 | — |
+
+The landing is one number carried from the option to the ring: `tcp_rx_bytes`
+turns the stored figure into half of it, `add_tcp_sized` builds a socket with
+that receive buffer (the send buffer stays `TCP_TX_BYTES`), `Listener::rx_bytes`
+carries it through the pool and its refills, `settle_tcp` carries it when a
+socket is relocated to the loopback, and `set_listener_rx` rebuilds the pool's
+`Listen` sockets on a post-`listen` `setsockopt` (a handshake already under way
+stays where it is). `accept` copies the listener's stored number into the
+accepted socket's options, so `getsockopt` on it reports Linux's answer.
+
+**This measured a send bug too.** `tcp_send` looped on `send_slice`; when the
+socket queued only *part* of the caller's buffer, the loop fell through to the
+blocking park below it - `MSG_DONTWAIT` only gated the "queued nothing" case. A
+4096-byte send against a 2048-byte window did exactly that, and with a peer that
+never reads, the park has no end. Measured on the booted machine under gdb: the
+test task sat in `tcp_send`'s `park_until` with `u64::MAX`, the scheduler idle
+and the window closed. Linux's `tcp_sendmsg` returns the bytes it queued and
+raises `EAGAIN` only when none fit, so the partial arm now returns `sent` on a
+non-blocking send.
+
+The pin is `t-sockbuf` grown from 12 claims to **18**: the inheritance before
+`listen` (ask 2048 → accepted 4096) and after it (32768 → 65536), then the
+effect - three sized listeners, each pushed until it refuses, with the
+comparisons relative because the absolute figure includes the client's queue. On
+this guest: **18432 / 49152 / 147456** bytes for asks 2048 / 32768 / 262144; on a
+current host: 8192 / 47104 / 286561. Without the ring the three figures are one
+(a 64 KiB default), so `large > small * 2` is the claim the wiring fails.
+Counterfactual (`tcp_rx_bytes` pinned back to the default ring): the two
+inheritance claims stay green (`Ok(4096)`, `Ok(65536)`) and **both effect claims
+go red**, the three capacities collapsing to one number - 81920, the 64 KiB
+default ring plus the client's 16 KiB queue. The number was already Linux's; the
+window was not.
+
+Gate: x86_64 198 programs, `pass=198 fail=0`; aarch64 197 staged,
+`pass=197 fail=0`; `mpos-kunit 32 passed, 0 failed` on both. The production
+boot (`cargo xtask run --mode terminal`) reaches `mpos login:` with every
+OpenRC service `[ ok ]`, `udhcpc`'s lease included.
+
+*Remaining, named:* a **datagram** socket's receive ring is still fixed (16 KiB),
+so `SO_RCVBUF` there is the number and not a window - item 58's boundary
+unchanged; a **connected** stream's own `setsockopt(SO_RCVBUF)` still changes the
+number without resizing the live ring, because smoltcp's buffers are fixed at
+construction and it has no setter (Linux applies it to the advertised window);
+a handshake already in `SynReceived` when the option changes keeps the ring it
+started with, where Linux clones the listener's figure at that moment;
+the ring is capped at `TCP_RX_MAX` = 128 KiB per socket, half of what an ask at
+the sysctl maximum would buy, because this kernel allocates both rings eagerly
+and the global allocator panics on failure (§8.0) - a larger ask still reads
+back its Linux number; and a stream's `SO_SNDBUF` still does not size its send
+ring (`TCP_TX_BYTES` is fixed), which is why the guest's absorbed figures carry
+a 16 KiB client queue where the host's carry the 8 KiB the ask bought.
 
 Two more boundaries ride with the buffer number rather than the option. The
 datagram-too-big line is still the ring's rather than Linux's 65507 — this stack

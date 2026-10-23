@@ -463,6 +463,9 @@ pub(crate) fn hide_host_cursor(id: u32) {
     if !host_cursor_live() {
         return;
     }
+    // A task in its own exit path cannot park for these: `job` posts them
+    // fire-and-forget when the caller has already exited (the exit-path hide
+    // parked a dying task forever, and the parent's `wait` never returned).
     let _ = crate::drivers::video::render::job(crate::drivers::video::render::Job::SetCursor {
         id: 0,
         x: 0,

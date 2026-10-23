@@ -246,7 +246,21 @@ pub(crate) fn show_cursor() -> isize {
         let (px, py) = st.cursor_pos;
         let (hx, hy) = st.cursor_hotspot;
         let (x, y) = (px - hx, py - hy);
-        // A move only if the very same framebuffer is already showing on the host.
+        // A move only if the very same framebuffer is already showing on the
+        // host, and a `MOVE_CURSOR` when it is - which is Linux's rule
+        // (`virtio_gpu_cursor_plane_update`: the transfer and the
+        // `UPDATE_CURSOR` are both gated on `fb != old_fb`, and the unchanged
+        // case sends `MOVE_CURSOR`).
+        //
+        // Re-posting `UPDATE_CURSOR` instead was tried and measured not to
+        // work, which is why the comment on the device side says so: the
+        // host's `update_cursor` copies the resource's *host-side* image, and
+        // only `TRANSFER_TO_HOST_2D` refills that image - so an update without
+        // a transfer re-sends whatever the last transfer left, exactly as a
+        // bare move would, at the cost of a command that names the resource
+        // again. `.workbuddy/curprobe.c` is the measurement: a 64x64 buffer
+        // refilled blue and re-posted kept showing the red it was bound with,
+        // on both the 2D and the GL card.
         if st
             .cursor_resource
             .is_some_and(|(_, shown_fb)| shown_fb == fb_id)

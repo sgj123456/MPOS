@@ -7,21 +7,17 @@ Part of the split `docs/notes/` evidence library — routing for every `§N.M` p
 
 ### 9.1 aarch64 Complete Boot
 
-Current status: **stages 1a-1f, 2, 5a, 5b, 6a, 6b, 6c, 6d, 6e landed and `hal`
-compiles for aarch64: the machine boots the
-way the x86_64 one does, the kernel owns its own address space, two kernel tasks
-can suspend and resume each other, the machine reads its own description of
-itself, it reaches its devices through a window in its *own* half of the address
-space - the firmware's thirty-two virtio-MMIO transports are found through the
-tree and read back - code now runs at EL0 with an address space of its own,
-traps into the kernel and is answered, and that address space is a thing a
-process can live in rather than only enter: its mappings can be protected,
-shared, copied on write and taken back, and its tables are returned when it
-goes. On top of that the kernel can now answer the questions a *running* process
-asks of a space (6c), it reads a real wall epoch off the PL031 (6d), it turns on
-user SIMD, masks a line and waits on an interrupt (6e) - and with the `hal` seam
-split into six baseline concerns plus three optional capabilities, aarch64
-implements the six it has and `crate::hal` compiles for it.**
+Current status: **stages 1a-1f, 2, 5a, 5b, 6a-6h landed, and `hal` compiles for
+aarch64: the machine boots the way the x86_64 one does - the kernel owns its own
+address space, two kernel tasks suspend and resume each other, the machine reads
+its own device tree and reaches the firmware's thirty-two virtio-MMIO transports
+through the kernel half, EL0 runs with an address space a process can live in
+(protect, share, copy on write, take back, and its tables returned), the kernel
+answers a *running* process's questions of that space (6c), reads a real wall
+epoch off the PL031 (6d), turns on user SIMD, masks a line and waits on an
+interrupt (6e) - and with the `hal` seam split into six baseline concerns plus
+three optional capabilities, aarch64 implements the six it has and
+`crate::hal` compiles for it.**
 `cargo xtask boot-aarch64`
 builds the kernel (`aarch64-unknown-none`), the loader
 (`aarch64-unknown-uefi`), lays out an ESP with `EFI/BOOT/BOOTAA64.EFI` and boots
@@ -89,124 +85,120 @@ EL0: the program wrote 0xaaaa, called a number no system call has, read 0xffffff
 M6_EL0_OK
 ```
 
-The `devices:` lines are stage 5a, and they are a *check* rather than a
-printout: every number in them was read out of the firmware's device tree and
-compared against the constant the kernel is compiled with for that device - the
-PL011's base, both of the GIC's frames, the timer's line, and the RAM the boot
-record calls usable. A tree is not trusted to be right; it is what asks whether
-this kernel's idea of the machine still is. The `187 MiB` and the `47944 frames`
-against the last stage's `191 MiB`/`48954` are 3.66 MiB of this harness's own
-device, 264 KiB of loader page tables and 16 KiB of kernel that stage 6b's check
-added (text 62 -> 74 KiB, rodata 16 -> 20: the failure lines are most of it), and
-all three are named below rather than
+The `devices:` lines are stage 5a's *check*: every number was read out of the
+firmware's tree and compared against the constant the kernel is compiled with for
+that device - the PL011's base, both GIC frames, the timer's line, and the RAM the
+boot record calls usable. A tree is not trusted to be right; it asks whether this
+kernel's idea of the machine still is. The `187 MiB`/`47944 frames` against the
+last stage's `191 MiB`/`48954` are 3.66 MiB of this harness's own device, 264 KiB
+of loader page tables and 16 KiB of kernel that stage 6b's check added (text 62 ->
+74 KiB, rodata 16 -> 20: the failure lines are most of it), all named rather than
 folded into "the tree costs a megabyte": the tree is 1052672 bytes for 7160 bytes
 of structure and 569 of strings, and the loader copies what the tree says it is.
 
 Stage 5b is the two lines between `M3_TABLES_OK` and `M5_VIRTIO_OK`, and it is
 the first time this machine has *used* a number the firmware gave it rather than
 checking one. The device window - PL011 and GIC included - moved out of `TTBR0`
-and into the kernel half at `0xffffffff40000000`, which is where x86_64's
-`mm::MMIO_BASE` already was, so the low half now holds nothing at all: the
-`no low half:` line is the check that says so, and it asks about the device
-window's *physical* address as well as the image's. `M5_VIRTIO_OK` then reads
-four identity registers out of each of the tree's thirty-two `virtio,mmio`
-windows through that new alias, which is what makes the tree actionable: a driver
-now has somewhere to go. Three of those four registers are load-bearing
-measurements rather than decoration. **The magic and version are checked** -
-`0x74726976` and 2, the only layout this kernel's driver crate reads - and
-**version is a choice the harness has to make**: measured, `virt`'s
-`virtio-mmio` transports answer version **1**, the legacy register map, unless
-QEMU is told `-global virtio-mmio.force-legacy=false`, which is now in the
-command line beside `acpi=off` and for the same kind of reason. And **the tree
-cannot say which window carries a device**: QEMU publishes all thirty-two nodes
-whether or not anything is attached (measured by decompiling the tree with and
-without `-device virtio-rng-device` - the two differ only in the firmware's own
-random seeds), and the device does not land in the first of them either; it
-answers at `0xa003e00`, the *last*. So a driver must read each transport, which
-is the whole reason the check reads them.
+and into the kernel half at `0xffffffff40000000`, where x86_64's `mm::MMIO_BASE`
+already was, so the low half holds nothing: the `no low half:` check asks about
+the device window's *physical* address as well as the image's. `M5_VIRTIO_OK`
+then reads four identity registers out of each of the tree's thirty-two
+`virtio,mmio` windows through that alias, which is what makes the tree
+actionable: a driver has somewhere to go. Three of the four registers are
+load-bearing. **The magic and version are checked** - `0x74726976` and 2, the
+only layout this kernel's driver crate reads - and **version is a choice the
+harness has to make**: measured, `virt`'s transports answer version **1**, the
+legacy register map, unless QEMU is told `-global virtio-mmio.force-legacy=false`,
+now in the command line beside `acpi=off` and for the same kind of reason. And
+**the tree cannot say which window carries a device**: QEMU publishes all
+thirty-two nodes whether or not anything is attached (measured by decompiling the
+tree with and without `-device virtio-rng-device` - the two differ only in the
+firmware's own random seeds), and the device does not land in the first of them;
+it answers at `0xa003e00`, the *last*. So a driver must read each transport,
+which is the whole reason the check reads them.
 
 Stage 6a is the last four lines of the log, and it is a change of kind rather
-than of degree: everything above this stage ran at EL1, and this is the first
-time this kernel has been *below* itself. What makes EL0 different is not the
-privilege level as such but where the address space comes from - a program's code
-and stack are in the half `TTBR0_EL1` names, the kernel's are in `TTBR1_EL1`'s,
-and the two registers are what this stage is the first to tell apart. Until now
-both pointed at the *kernel's* root, which worked only because stage 5b had left
-the low half empty; so a user space is not an arrangement imposed on the kernel,
-it is the state the kernel was already in being handed to somebody else. The
-check is built the way stage 1c's and stage 2's were - the smallest program that
-can be wrong in every way this mechanism can, and nothing that can only be wrong
-for a reason the mechanism does not have yet. That program is forty bytes: it
-puts the answer page's address in a *callee-saved* register, writes its own value
-through it, calls a number no system call has, writes the answer back through the
-same register, and leaves through `exit_group`. The verdict is read out of a page
-the *program* wrote, because a trap is only observable by the code that answers
-it and the honest way to check an answer is from the side that receives it: the
-kernel reads back `0xaaaa` (the value the program wrote before it called
-anything) and `0xffffffffffffffda` (`-ENOSYS`, the value the kernel put in `x0`
-and the program read back). Nothing on the kernel side can fake either number.
+than of degree: everything above ran at EL1, and this is the first time this
+kernel has been *below* itself. What makes EL0 different is where the address
+space comes from - a program's code and stack are in the half `TTBR0_EL1` names,
+the kernel's in `TTBR1_EL1`'s, and the two registers are what this stage first
+tells apart. Until now both pointed at the *kernel's* root, which worked only
+because stage 5b had left the low half empty; a user space is not an arrangement
+imposed on the kernel, it is the state the kernel was already in being handed to
+somebody else. The check is built the way stage 1c's and stage 2's were - the
+smallest program that can be wrong in every way this mechanism can, and nothing
+that can only be wrong for a reason the mechanism does not have yet. That program
+is forty bytes: it puts the answer page's address in a *callee-saved* register,
+writes its own value through it, calls a number no system call has, writes the
+answer back through the same register, and leaves through `exit_group`. The
+verdict is read out of a page the *program* wrote, because a trap is only
+observable by the code that answers it: the kernel reads back `0xaaaa` (the value
+the program wrote before it called anything) and `0xffffffffffffffda`
+(`-ENOSYS`, the value the kernel put in `x0` and the program read back).
+Nothing on the kernel side can fake either number.
 
 **One measurement came out of that and changed the gate, and it is a difference
 between the two machines rather than a bug.** `ELR_EL1` for a Supervisor Call
 already holds the address of the instruction *after* the `svc`, so a gate that
-steps over it - which is what the x86_64 twin's shape suggests, where `SA_RESTART`
-subtracts the two bytes back - skips an instruction the program never got to run.
-The first run of this check did exactly that, and the machine said so: the `svc`
-is at `0x200010` and the trap reported `pc` `0x200014`, so the program's next
-instruction (the store of the kernel's answer) was stepped over and the page came
-back with a zero where the gate's answer should have been. The gate does not
-advance `pc` at all now, and that is written down beside it.
+steps over it - the shape the x86_64 twin suggests, where `SA_RESTART` subtracts
+the two bytes back - skips an instruction the program never got to run. The first
+run did exactly that: the `svc` is at `0x200010` and the trap reported `pc`
+`0x200014`, so the program's next instruction (the store of the kernel's answer)
+was stepped over and the page came back zero where the gate's answer should have
+been. The gate does not advance `pc` at all now, and that is written down beside
+it.
 
 Stage 6b is the two `space:` lines before `M6_AS_OK`, and it is the difference
 between an address space a program can be *put into* and one it can *live in*.
-What 6a did not have is any way to change a space once it existed, and that is
-most of what a `fork`, an `mmap` and a `munmap` are made of: taking a mapping
-back, changing one's permissions in place, walking what is there, and the
-copy-on-write half that lets two processes share a frame until one of them writes
-it. All of it lands in `paging.rs`'s `UserSpace`, and the encoding does not change
-at all - what changes is that the file now writes *and erases*. The signatures are
-deliberately `crate::hal::AddressSpaceOps`' rather than the type's own, because
-writing them to the trait's shapes is what will make the impl delegation when
-`hal` reaches this machine; the trait itself cannot be implemented yet, since
-`crate::hal` is x86_64-only until all six of its concern traits exist.
+6a had no way to change a space once it existed, and that is most of what a
+`fork`, an `mmap` and a `munmap` are made of: taking a mapping back, changing
+one's permissions in place, walking what is there, and the copy-on-write half
+that lets two processes share a frame until one writes it. All of it lands in
+`paging.rs`'s `UserSpace`, and the encoding does not change - the file now writes
+*and erases*. The signatures are deliberately `crate::hal::AddressSpaceOps`'
+rather than the type's own, because writing them to the trait's shapes is what
+will make the impl delegation when `hal` reaches this machine; the trait itself
+cannot be implemented yet, since `crate::hal` is x86_64-only until all six of its
+concern traits exist.
 
-Three things in those two lines are worth reading. The resolved frame,
-`0x43476000`, is a frame the *child* space took for itself when it first wrote a
-page it was sharing with the parent - and the parent's frame, `0x4346a000`, is
-printed beside it because "the child copied" and "the parent was left alone" are
-two claims and only one of them is about the child. Four frames is what a space's
-tables cost here (a root and three levels down to the page), and dropping an
-*active* space gives all four back and not the page it mapped: measured as an
+The resolved frame, `0x43476000`, is a frame the *child* space took when it first
+wrote a page it was sharing with the parent, and the parent's frame,
+`0x4346a000`, is printed beside it because "the child copied" and "the parent was
+left alone" are two claims and only one is about the child. Four frames is what a
+space's tables cost here (a root and three levels down to the page), and dropping
+an *active* space gives all four back and not the page it mapped: measured as an
 exact count, because both ways of getting it wrong are off by a specific number,
 and a leak would otherwise look like a machine that simply works.
 
-The check reads every answer back through three different doors, and that is
-deliberate: the space's *own* tables for what the kernel intends, a store to a
-user address with that space switched in for what the MMU enforces, and the
-frame's own bytes through the direct map for what actually happened. An address
-space is exactly the thing where the first door alone is not enough - 6a's own
-measurement, where a table the kernel had written was not the table the CPU
-walked, is the same lesson one register down. It also has to be able to *fail*,
-so all three of the mistakes it exists to catch were made on purpose before this
-stage was accepted: a `resolve_cow` with the copy removed, a `Drop` that leaked
-its tables, and a copy-on-write page marked without the read-only bit. Each one
-stopped the boot with its own `M6_AS_FAILED` line naming the claim that broke -
-and the first run of the check, on code that was correct, failed on the check's
+The check reads every answer back through three doors: the space's *own* tables
+for what the kernel intends, a store to a user address with that space switched
+in for what the MMU enforces, and the frame's own bytes through the direct map
+for what actually happened. 6a's own measurement, where a table the kernel had
+written was not the table the CPU walked, is the same lesson one register down.
+It also has to be able to *fail*, so all three mistakes it exists to catch were
+made on purpose before this stage was accepted: a `resolve_cow` with the copy
+removed, a `Drop` that leaked its tables, and a copy-on-write page marked without
+the read-only bit. Each stopped the boot with its own `M6_AS_FAILED` line naming
+the claim that broke - and the first run, on correct code, failed on the check's
 own arithmetic instead (three pages left where it had counted two), which is why
 the count it prints is a count rather than a list of addresses.
 
 The `plan:` line is the strongest claim either machine's boot makes about its
 own page tables: every mapping `mm::vm::kernel_mappings` names is walked page by
-page and each page is asked to translate to the frame and permissions the plan
-gave it - so a disagreement is a failure whichever side is wrong, and the direct
-map coming back `rw` is the same plan that gives x86_64's `rw`.
+page and asked to translate to the frame and permissions the plan gave it - so a
+disagreement is a failure whichever side is wrong, and the direct map coming back
+`rw` is the same plan that gives x86_64's `rw`.
 
-The `-kernel` bring-up of 1b-1d is **deleted**, not left beside this: the
-`aarch64-unknown-none` block is `relocation-model=pic` + `-pie` like the x86_64
-one, the linker script has no base address and no `.stack`, and
-`src/board/aarch64.rs` is an `extern "C" fn _start(x0)` with no assembly stub.
-Nothing above `arch` is ported yet; `src/lib.rs`'s header carries the stage
-ledger, which is the record of which module un-gates when.
+The `-kernel` bring-up of 1b-1d (a fixed physical address with the MMU off, the
+smallest thing that proved the toolchain, the linker script and the machine body
+agreed) is **deleted**, not left beside this: stage 1e boots from the ESP through
+AAVMF - the same boot path, not a shortcut past it - the `aarch64-unknown-none`
+block is `relocation-model=pic` + `-pie` like the x86_64 one, the linker script has
+no base address and no `.stack` (the stack moved to one the loader allocates), and
+`src/board/aarch64.rs` is an `extern "C" fn _start(x0)` with no assembly stub. What
+is left of the instrument is one entry in `AGENTS.md`'s trap table saying not to
+bring it back; `src/lib.rs`'s header carries the stage ledger, the record of which
+module un-gates when.
 
 This section used to say "kernel ELF compiles but boot flow incomplete", which
 was false in both halves. Nothing compiled for aarch64 - V-8 (§11.1.8) removed

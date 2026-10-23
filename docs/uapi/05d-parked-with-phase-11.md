@@ -1,7 +1,7 @@
 # UAPI §5.4
 
-Part of the split `docs/uapi/` inventory — index and reading rules in [index.md](index.md).
-Section numbers are unchanged from the original `UAPI.md`.
+Part of the split `docs/uapi/` inventory — index and reading rules in [index.md](index.md);
+section numbers are unchanged from the original `UAPI.md`.
 
 ### 5.4 The structural work, parked with Phase 11
 

@@ -2049,10 +2049,8 @@ and `vfs/inotify.rs` already had) and `syscall -> vfs`, both recorded.
 **Named**: `pidfd_getfd(2)` (438), `clone3`'s `CLONE_PIDFD` and
 `process_madvise(2)` (440) are not served and fall to the `ENOSYS` catch-all; this
 family does not invent a descriptor where those calls expect one. **The first of
-the three was served by §6.9**, below. The older
-anonymous descriptors (`eventfd`, `timerfd`, `signalfd`, `epoll`, `inotify`) still
-report `S_IFCHR` - a divergence `NodeKind::Anon` leaves in place rather than
-silently changing. `st_blksize` stays this kernel's 512 where Linux's pidfd answers
+the three was served by §6.9**, below, and the older anonymous descriptors'
+type-less shape by §6.11. `st_blksize` stays this kernel's 512 where Linux's pidfd answers
 4096 (the existing global choice, not a pidfd-specific one), and `st_dev`/`st_ino`/
 uid/gid are machine-specific and deliberately not pinned. `/proc/<pid>/fdinfo/<n>`
 for a pidfd (`Pid:`/`NSpid:`) was not measured and is not promised. A pidfd's
@@ -2138,8 +2136,8 @@ divergence: Linux's
 `PTRACE_MODE_ATTACH_REALCREDS` compares group ids as well and consults the
 security modules, while `cred::ptrace_may_access` compares the real/effective
 uid set; on this single-user image no gate can tell the two apart. A pidfd's
-`fdinfo` (`Pid:`/`NSpid:`) remains unmeasured and un-promised, and the older
-anonymous descriptors still report `S_IFCHR`.
+`fdinfo` (`Pid:`/`NSpid:`) remains unmeasured and un-promised. The older
+anonymous descriptors' `S_IFCHR` divergence landed as §6.11.
 
 ### 6.10 `clone3` is `clone` with a struct, and its `CLONE_PIDFD` names the child it just made — **LANDED** (2026-10-21)
 
@@ -2244,13 +2242,57 @@ and it was probed before it was deferred: its one advice with real work behind i
 (`MADV_DONTNEED`) is refused `EINVAL` for another process on this host, and the
 advices it does accept (`MADV_WILLNEED`/`COLD`/`PAGEOUT`/`COLLAPSE`) are hints
 this kernel answers as no-ops, so a door there would be a shape with nothing
-behind it. `CLONE_CLEAR_SIGHAND` is `EOPNOTSUPP` because this kernel's `fork`
-already starts every process at `SIG_DFL` whatever the flags said - so accepting
-the bit could not be told from ignoring it - and *that* inheritance rule, not
-this flag, is the gap to close first. `CLONE_NEWTIME` through this door is
+behind it. `CLONE_CLEAR_SIGHAND` was `EOPNOTSUPP` at this landing because a `fork` here
+started every process at `SIG_DFL` whatever the flags said - so the flagged and
+unflagged child were identical. The inheritance landed as §2.7 and the flag is
+served now (item 96): a plain child carries the parent's table and the flagged
+one starts at `SIG_DFL`, with the `CLONE_SIGHAND` pair `EINVAL`; `t-clone3`
+holds all of it. `CLONE_NEWTIME` through this door is
 `EOPNOTSUPP` (this kernel has no clock namespace to hand a child through `clone`;
 `unshare(CLONE_NEWTIME)` is the door that serves the clocks, §6.3).
 `CLONE_PTRACE` and any unknown bit are `EINVAL` (this kernel's designed
 unknown-bit rule, shared with `clone(2)`). And `clone3` inherits `clone`'s
 `CLONE_VM`-without-`CLONE_THREAD` divergence: the child is a copy, not a sharer,
 which `vfork`'s own note states as the deliberate choice.
+
+### 6.11 The anonymous descriptors are Linux's type-less shape — **LANDED** (2026-10-23)
+
+The pidfd learned Linux's `anon_inode` shape in §6.8; the five older members of
+the family did not, and the difference was visible to any `/proc` reader. On
+Linux none of `eventfd`, `timerfd`, `signalfd`, `epoll`, `inotify` or `pidfd`
+has an `S_IF*` bit in `st_mode` - they are not files of any type, which is what
+makes `S_ISCHR` a question a device probe must not answer yes to. This kernel
+reported the first five as `S_IFCHR` and named them `anon:[<ino>]` in
+`/proc/<pid>/fd`, because only `pidfd` had a `fd_name` of its own.
+
+**Measured on a current host first** (`.workbuddy/probe_anon_fd_stat.c`,
+`.workbuddy/probe_anon_read0.c`, `.workbuddy/probe_inotify0{,b}.c`, Linux
+7.2.11): every row is type 0; the permission word is `0600` for the five and
+`0700` for the pidfd; the links are `anon_inode:[eventfd]`, `[timerfd]`,
+`[signalfd]`, `[eventpoll]`, `anon_inode:inotify` (the one without brackets) and
+`[pidfd]`. A zero-length read is `EINVAL` for `eventfd`/`timerfd`/`signalfd`/
+`epoll`/`pidfd` whatever the queue holds, while inotify consults the queue
+first: `EAGAIN` when empty and non-blocking, `EINVAL` once a record is queued,
+and a wait followed by `EINVAL` when blocking.
+
+**The landing.** `NodeKind::Anon` now carries the permission word
+(`Anon { mode }`, the type is always zero), so one kind expresses both rows
+without inventing a mode field on `Metadata`; all six inodes ask for it. Each
+of the five implements `fd_name`, which `File::display_name` already consulted
+before its fallback. `InotifyInstance::read_at` answers the zero-length case in
+Linux's order. One consequence is worth stating because it is the read door's
+rule rather than the stat door's: `File::read`'s zero-length short-circuit
+exempts `Anon` (the pidfd needed that), so the five now reach their own
+`read_at` with an empty buffer - which is exactly where their `EINVAL` lives.
+
+**Pin**: the new `t-anon-fd`, 26 claims (three per descriptor, the seven
+zero-length answers, and a path-opened file's link as the control), green on
+the host first and with identical `ok:` text in the guest on both machines.
+
+**Gate**: x86_64 199 programs, `pass=199 fail=0`; aarch64 198 staged,
+`pass=198 fail=0`; `mpos-kunit 32 passed, 0 failed` on both.
+
+**Named**: `st_blksize` remains this kernel's 512 where Linux answers 4096 (the
+global choice, not an anon-inode one); `st_dev`/`st_ino`/uid/gid are
+machine-specific and not pinned; a pidfd's `fdinfo` (`Pid:`/`NSpid:`) is still
+unmeasured and un-promised.

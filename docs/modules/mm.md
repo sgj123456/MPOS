@@ -4,20 +4,19 @@
 
 ## What it owns
 
-`mm` is the kernel's memory subsystem, and it is layered deliberately: the frame allocator comes
-first, and everything else is built on it, because the heap, the page tables and the task stacks
-are all *clients* of the frame allocator rather than prerequisites of it. `src/mm/mod.rs`'s header
-states the ordering as a design rule — `init` brings up physical memory and nothing else, and the
-heap needs no setup of its own because it takes frames on demand. `pframe.rs` is the bottom of the
-stack: a buddy allocator with one zone per usable memory region, whose metadata is carved out of the
-very memory it manages (a free-list head per order plus one state byte and one reference-count word
-per frame), because it has to run before the heap exists and must not itself allocate. `heap.rs` is
-the next layer: power-of-two size classes served by intrusive free lists, growing by taking runs of
-frames from the allocator. `vm.rs` is not an allocator at all — it is the *plan*: which virtual
-ranges point at which physical ranges, with which permissions, re-exported from the `mpos-vm` leaf.
-`vma.rs` is the per-process record of what an address space is *supposed* to be, which is the
-question a page fault asks and a page table cannot answer. `elf.rs` parses an executable's program
-headers into a placement plan the loader consumes.
+`mm` is the kernel's memory subsystem, layered deliberately: the frame allocator comes first and
+everything else is built on it, because the heap, the page tables and the task stacks are all
+*clients* of it rather than prerequisites. `src/mm/mod.rs`'s header states the ordering as a design
+rule — `init` brings up physical memory and nothing else, and the heap needs no setup of its own
+because it takes frames on demand. `pframe.rs` is the bottom of the stack: a buddy allocator with
+one zone per usable memory region, whose metadata is carved out of the very memory it manages (a
+free-list head per order plus one state byte and one reference-count word per frame), because it
+has to run before the heap exists and must not itself allocate. `heap.rs` is the next layer:
+power-of-two size classes served by intrusive free lists, growing by taking runs of frames from the
+allocator. `vm.rs` is the *plan*: which virtual ranges point at which physical ranges, with which
+permissions, re-exported from the `mpos-vm` leaf. `vma.rs` is the per-process record of what an
+address space is *supposed* to be, which is the question a page fault asks and a page table cannot
+answer. `elf.rs` parses an executable's program headers into a placement plan the loader consumes.
 
 What deliberately does **not** live here is stated in the module itself. The page-table *format*
 belongs to `arch`; the direct map (`phys_to_virt`, `virt_to_phys`, `hhdm_offset`) lives in `hal`,
@@ -28,28 +27,27 @@ rather than by `vfs::Inode`, which is the seam that closed the `mm`↔`vfs` cycl
 `docs/ARCHITECTURE.md` §9. The VFS answers that trait for its inodes through `vfs::MappedInode`.
 
 **The layering rule this module is the clearest test case of.** `AGENTS.md` §3 and `src/lib.rs`'s
-header make host-compilation a per-module judgement: *a module is host-compiled when its logic
-touches no hardware, no port I/O, no virtio ring and no real clock — and then its dependencies must
-be host-compiled too, transitively.* The transitive half is the one the compiler cannot see, and
-`src/mm/mod.rs` is where it bites. `elf`, `pframe`, `vm` and `vma` are declared unconditionally and
-so compile and run on the host; `heap` is declared `#[cfg(target_os = "none")] pub mod heap;`, so it
-does **not**. That gate is the honest consequence of a real dependency — the heap takes and returns
-frames through `alloc_pages`/`free_pages`, which are themselves machine-only — but it is also the
-one place in `src/mm/` where logic that is pure arithmetic (the size-class choice in `class_of`, the
-order arithmetic in `large_order`, the block derivation in `block_of`, and the `Slab` bookkeeping)
-sits behind the machine gate and hosts no `#[cfg(test)]` at all. Read the source and the module
-comment together and the split is stated, not accidental: `heap.rs`'s own comment says "the heap is
-the same on both machines" while the *voice* of one is not, which is exactly the shape the rule is
-meant to keep host-testable. Note the discrepancy this leaves standing, as an inference from the
-code rather than a claim the code makes: `src/lib.rs`'s aarch64 ledger and `docs/ARCHITECTURE.md`
-§8's "host-compiled" box both list the heap among the host-compiled parts of `mm`, and the `mod`
-declaration in `src/mm/mod.rs` says otherwise. One of the two is stale; this page follows the code.
+header make host-compilation a per-module judgement, and the transitive half is the one the
+compiler cannot see: `src/mm/mod.rs` is where it bites. `elf`, `pframe`, `vm` and `vma` are
+declared unconditionally and so compile and run on the host; `heap` is declared
+`#[cfg(target_os = "none")] pub mod heap;`, so it does **not**. That gate is the honest
+consequence of a real dependency — the heap takes and returns frames through
+`alloc_pages`/`free_pages`, which are themselves machine-only — but it is also the one place in
+`src/mm/` where logic that is pure arithmetic (the size-class choice in `class_of`, the order
+arithmetic in `large_order`, the block derivation in `block_of`, and the `Slab` bookkeeping)
+sits behind the machine gate and hosts no `#[cfg(test)]` at all. `heap.rs`'s own comment says
+"the heap is the same on both machines" while the *voice* of one is not, which is exactly the
+shape the rule is meant to keep host-testable. Note the discrepancy this leaves standing, as an
+inference from the code rather than a claim the code makes: `src/lib.rs`'s aarch64 ledger and
+`docs/ARCHITECTURE.md` §8's "host-compiled" box both list the heap among the host-compiled parts
+of `mm`, and the `mod` declaration in `src/mm/mod.rs` says otherwise. One of the two is stale;
+this page follows the code.
 
 `mm` therefore owns the *policy* of the mapping plan and none of the *mechanism*: a port consumes a
 list of `Mapping`s and does not get to invent policy (`vm.rs`'s header). The "how is it mapped"
-half is `hal`'s, which is why `vm.rs` is now a re-export of the `mpos-vm` crate — the vocabulary had
-to move below both `mm` and the machine layer once the machine layer became a crate that cannot name
-`mm` (`docs/notes/` §14, step S2b). The paths every caller already used are unchanged.
+half is `hal`'s — the vocabulary had to move below both `mm` and the machine layer once the machine
+layer became a crate that cannot name `mm` (`docs/notes/` §14, step S2b). The paths every caller
+already used are unchanged.
 
 ## Key files
 
@@ -91,19 +89,17 @@ The `PMM` still panics on failure — `docs/notes/` §8.0 — which is why the h
 **The mapping plan (`src/mm/vm.rs` → `mpos-vm`).** `kernel_mappings` produces disjoint page-granular
 `Mapping`s: the direct map over *all* physical memory, then the kernel image with per-section
 permissions, so nothing is both writable and executable. `MapFlags`'s `PERM` distinguishes real page
-permissions from `COW`, which is a logical state the hardware enforces as read-only. `PageTaken`
-reports an already-mapped page as an ordinary syscall answer, where the kernel's own plan asserts on
-it instead.
+permissions from `COW`, a logical state the hardware enforces as read-only. `PageTaken` reports an
+already-mapped page as an ordinary syscall answer, where the kernel's own plan asserts on it.
 
 **The address-space table (`src/mm/vma.rs`).** `VmaTable` is a sorted `Vec` and never overlapping;
 `insert` has `MAP_FIXED`'s take-the-range semantics and folds neighbours that describe the same
 object, `insert_present` appends a *placed* run without disturbing a lazily-described neighbour,
 `gaps(start, end)` reports the holes a growth may claim, and `take_range`/`lift_range` distinguish
 "descriptions leaving *and* freeing their pages" from "descriptions leaving, pages travelling with
-them". `Vma::abuts` is the merge predicate; `MappedObject` is the three-question seam that let `mm`
-stop naming the VFS. `MappedRange` exists to record eagerly-filled ranges (`execve`, a private
-mapping of a file) *beside* the fault-answering table, because recording them as `VmaKind::Anon`
-would invent a fault where the address space must refuse one.
+them". `Vma::abuts` is the merge predicate. `MappedRange` records eagerly-filled ranges (`execve`, a
+private mapping of a file) *beside* the fault-answering table, because recording them as
+`VmaKind::Anon` would invent a fault where the address space must refuse one.
 
 **The loader (`src/mm/elf.rs`).** `parse(bytes) -> Option<Image>` accepts a statically linked
 `ET_EXEC` or `ET_DYN` whose `PT_LOAD` segments fit the lower half, reports the interpreter a
@@ -119,13 +115,13 @@ aarch64 `USER_LIMIT` is `1 << 48`, not x86_64's `1 << 47`, and a shared value wa
 `mm` owns **no dispatch row** of its own in `docs/uapi/`. The surface it participates in — `mmap`,
 `munmap`, `mprotect`, `madvise`, `mremap`, `brk`, `process_vm_readv`/`writev` — is dispatched in
 `src/syscall/linux/proc.rs`, and the `MAP_*`/`MREMAP_*` flag words live in `src/syscall/linux/abi.rs`;
-the inventory's rows are therefore the syscall module's to keep (docs/uapi/ §1, the "`mmap`
+the inventory's rows are the syscall module's to keep (docs/uapi/ §1, the "`mmap`
 flags" row in §3, and the `madvise` advice vocabulary in §3). What `mm` supplies is the *semantics*
 those rows promise: which range a mapping may claim, what a split does to a frame-backed offset, and
 where a `MAP_FIXED`/hint/`MAP_FIXED_NOREPLACE` placement lands. The one piece `mm` declares itself
-is `USER_LIMIT`/`MMAP_BASE`, and the reason it lives in `mm` rather than in the syscall layer is
-written in `elf.rs`: `sched` had to name `crate::syscall::MMAP_BASE` to place an image, and that was
-a recorded `sched → syscall` edge blocking the aarch64 un-gate.
+is `USER_LIMIT`/`MMAP_BASE`; it lives here rather than in the syscall layer because `sched` had to
+name `crate::syscall::MMAP_BASE` to place an image, a recorded `sched → syscall` edge blocking the
+aarch64 un-gate (`elf.rs` has the reason).
 
 ## Pins
 
@@ -142,8 +138,8 @@ a recorded `sched → syscall` edge blocking the aarch64 un-gate.
 There is **no `t-*` program under `user/abitest` that targets `mm`** today: the `no_std` suite's
 live programs are `src/bin/integration/t-*.rs`, and none of them exercises the allocator, the VMA
 table or the ELF parser directly — the memory family is pinned from the std side above. And the
-heap specifically has no pin of either kind, which is the same observation as the layering note in
-"What it owns": its arithmetic is machine-gated and nothing checks it on the host.
+heap specifically has no pin of either kind: its arithmetic is machine-gated and nothing checks it
+on the host.
 
 ## Evidence and open work
 

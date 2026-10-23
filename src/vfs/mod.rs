@@ -143,17 +143,21 @@ pub enum NodeKind {
     /// are a pipe's. `docs/uapi/` §5.2 carries the whole measured contract.
     Fifo,
     /// An anonymous inode with no file-type bits at all: the family Linux's
-    /// `anon_inode` mount names, whose `st_mode` is permission bits alone
-    /// (`0700` for a pidfd, measured - `.workbuddy/probe_pidfd6.c`). It is not
-    /// a character device and must not be reported as one: `S_ISCHR` is a
-    /// question tools ask, and a descriptor that answers yes is then handed to
-    /// a terminal or a device probe it is not.
+    /// `anon_inode` mount names, whose `st_mode` is permission bits alone. It
+    /// is not a character device and must not be reported as one: `S_ISCHR` is
+    /// a question tools ask, and a descriptor that answers yes is then handed
+    /// to a terminal or a device probe it is not.
     ///
-    /// Only the pidfd family uses it today. The older anonymous descriptors
-    /// (`eventfd`, `timerfd`, `signalfd`, `epoll`, `inotify`) still report
-    /// `CharDev`, which is a divergence of its own and not this kind's job to
-    /// change; a node that wants Linux's type-less shape asks for this one.
-    Anon,
+    /// The carried word is those permission bits, because Linux's own family
+    /// does not share one: `eventfd`, `timerfd`, `signalfd`, `epoll` and
+    /// `inotify` answer `0600`, while a pidfd answers `0700` - all measured on
+    /// a current host (`.workbuddy/probe_anon_fd_stat.c`). The type bits are
+    /// zero in every row, which is why this is one kind and not a `CharDev`
+    /// with a mode.
+    Anon {
+        /// The permission bits `stat` reports (the type is always zero).
+        mode: u32,
+    },
 }
 
 /// What a descriptor can do right now, for `poll(2)`.
@@ -325,6 +329,14 @@ pub enum VfsError {
     /// reads at all", which would misdescribe a socket one call before it
     /// connects.
     NotConnected,
+    /// ECONNREFUSED: a **datagram** connection's peer is gone. Linux answers
+    /// the first send that finds it so with `ECONNREFUSED` and forgets the
+    /// connection, so the next call is [`Self::NotConnected`] (measured,
+    /// `.workbuddy/probe_sigpipe2.c`, Linux 7.2.11). A sequenced-packet
+    /// connection's dead peer is [`Self::BrokenPipe`] instead and is not
+    /// forgotten; an unconnected socket is [`Self::NotConnected`] from the
+    /// start.
+    ConnectionRefused,
     /// EINTR: a wait this node was about to take was ended by a signal the
     /// caller can catch, and **nothing was consumed** - no byte read, no byte
     /// written, no offset moved. A node reports this rather than answering a

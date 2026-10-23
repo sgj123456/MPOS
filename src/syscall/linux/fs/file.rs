@@ -3635,6 +3635,40 @@ pub fn handle_read(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     }
 }
 
+/// Raise the `SIGPIPE` a write-family door owes when it answers `EPIPE`.
+///
+/// Linux raises it **inside** the call, so a handler runs before the caller's
+/// next instruction, and `MSG_NOSIGNAL` is a send's only suppression. The
+/// measured exception is a `SOCK_SEQPACKET` AF_UNIX send, whose `EPIPE` arrives
+/// with no signal at all (`.workbuddy/probe_sigpipe2.c`, Linux 7.2.11) - the
+/// door passes both facts: `suppressed` is its flags word, `fd` is how it asks
+/// the socket. A partial write raises nothing here: the count is the answer,
+/// and a pipe's own break has already raised inside the VFS (`pipe::pair_ends`).
+#[cfg(target_os = "none")]
+pub(crate) fn raise_sigpipe(fd: i32, suppressed: bool) {
+    if suppressed {
+        return;
+    }
+    #[cfg(mpos_net)]
+    if let Ok(file) = crate::sched::current_fds().clone_at(fd)
+        && file
+            .inode()
+            .as_any()
+            .downcast_ref::<crate::net::unix::UnixSock>()
+            .is_some_and(|sock| sock.silent_broken_pipe())
+    {
+        return;
+    }
+    #[cfg(not(mpos_net))]
+    let _ = fd;
+    crate::sched::raise_sigpipe();
+}
+
+/// Host builds compile the doors but carry no task table; a host unit test
+/// drives the VFS directly and never reaches one.
+#[cfg(not(target_os = "none"))]
+pub(crate) fn raise_sigpipe(_fd: i32, _suppressed: bool) {}
+
 /// `write(2)` — write `buf` to `fd`.
 pub fn handle_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let (fd, buf, len) = (args[0], args[1], args[2]);
@@ -3663,6 +3697,12 @@ pub fn handle_write(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
     match crate::vfs::write(fd as i32, bytes) {
         Ok(n) => n as isize,
+        Err(crate::vfs::VfsError::BrokenPipe) => {
+            // `write(2)` carries no flags word, so nothing can suppress the
+            // signal a broken pipe or stream owes (`MSG_NOSIGNAL` is a send's).
+            raise_sigpipe(fd as i32, false);
+            err::EPIPE
+        }
         Err(e) => err_of(e),
     }
 }
@@ -4104,6 +4144,9 @@ fn writev_inner(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 if total > 0 {
                     return total;
                 }
+                if e == crate::vfs::VfsError::BrokenPipe {
+                    raise_sigpipe(fd, false);
+                }
                 return err_of(e);
             }
         }
@@ -4381,11 +4424,13 @@ pub fn handle_fsync(args: [usize; ARG_COUNT]) -> isize {
     match file.metadata().kind {
         NodeKind::File | NodeKind::Dir | NodeKind::Symlink | NodeKind::BlockDev => 0,
         // Nothing to flush behind a character door, and nothing behind a
-        // socket's either - Linux answers EINVAL for both. The whole
-        // anonymous family - a pty, an eventfd, a timerfd, an epoll, an
-        // inotify, a signalfd - is a character device here, so this one arm
-        // answers for all of it.
-        NodeKind::CharDev | NodeKind::Socket | NodeKind::Fifo | NodeKind::Anon => err::EINVAL,
+        // socket's or an anonymous inode's either - Linux answers EINVAL for
+        // all three. A pty is a character device; an eventfd, a timerfd, an
+        // epoll, an inotify, a signalfd and a pidfd are the type-less anon
+        // kind, whose `st_mode` is permission bits alone.
+        NodeKind::CharDev | NodeKind::Socket | NodeKind::Fifo | NodeKind::Anon { .. } => {
+            err::EINVAL
+        }
     }
 }
 
@@ -6429,6 +6474,14 @@ pub fn handle_splice(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             Err(e) => {
                 if moved > 0 {
                     break;
+                }
+                // A broken pipe on the output side is EPIPE *and* SIGPIPE -
+                // measured on a current host (`.workbuddy/probe_sigpipe3.c`,
+                // Linux 7.2.11: `splice` to a readerless pipe answers -1/EPIPE
+                // with the handler run). A partial move that a later break
+                // cut short is the pipe's own raise (`pipe::pair_ends`).
+                if e == crate::vfs::VfsError::BrokenPipe {
+                    raise_sigpipe(out_fd, false);
                 }
                 return err_of(e);
             }

@@ -271,13 +271,29 @@ fn pipes(_info: &crate::boot::BootInfo) -> Result<(), String> {
     take_verdict(PIPE_SLOT, "the pipe writer")?;
     println!("pipe: bytes crossed between two tasks, EOF after the writer left");
 
-    // A write with no reader is EPIPE, and the writer lives to hear about it.
+    // A write with no reader is EPIPE, and the writer lives because it asked
+    // not to hear the `SIGPIPE` Linux raises with it. Ignoring this signal is
+    // what a hosted Rust program does at startup, and what the writer here
+    // must do: the default disposition would end this case's task before it
+    // could read the errno.
     let mut fds = [0i32; 2];
     case_check!(
         unsafe { syscall(lnr::PIPE, fds.as_mut_ptr() as usize, 0, 0, 0, 0, 0) } == 0,
         "pipe() failed"
     );
     let (rfd, wfd) = (fds[0], fds[1]);
+    let old_pipe_action = sched::current_disposition(crate::sched::signal::SIGPIPE);
+    case_check!(
+        sched::set_signal_action(
+            sched::current(),
+            crate::sched::signal::SIGPIPE,
+            crate::sched::signal::Action {
+                handler: crate::sched::signal::SIG_IGN,
+                ..Default::default()
+            },
+        ),
+        "SIGPIPE could not be ignored"
+    );
     sched::spawn(
         move || {
             let _ = vfs::close(rfd);
@@ -291,7 +307,18 @@ fn pipes(_info: &crate::boot::BootInfo) -> Result<(), String> {
         "a write to a readerless pipe answered {rc}, not EPIPE"
     );
     vfs::close(wfd).map_err(|e| alloc::format!("close: {e:?}"))?;
-    println!("pipe: write with no reader answered EPIPE and nobody died");
+    // The boot task's disposition goes back: an ignored signal is discarded as
+    // it is generated, so there is no pending bit a restored `SIG_DFL` could
+    // turn into a death later.
+    case_check!(
+        sched::set_signal_action(
+            sched::current(),
+            crate::sched::signal::SIGPIPE,
+            old_pipe_action
+        ),
+        "SIGPIPE's disposition could not be restored"
+    );
+    println!("pipe: write with no reader answered EPIPE and the ignored signal did not end it");
     Ok(())
 }
 

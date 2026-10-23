@@ -2018,6 +2018,19 @@ pub fn current() -> TaskId {
     with_table(|t| t.current)
 }
 
+/// Whether the task has already run its exit path - a task this kernel will
+/// never schedule again ("a task with `exited` set is never scheduled again").
+///
+/// A device-job requester in that state cannot wait for its answer: parking
+/// would park a task the scheduler has stopped running, and the job's
+/// completion wake would land on a slot that has stopped being this task. The
+/// exit path's device teardown (the cursor hide, the buffer unrefs) posts its
+/// commands fire-and-forget for exactly this reason - the commands none of
+/// them read their results back.
+pub fn is_exited(id: TaskId) -> bool {
+    with_table(|t| t.task(id).exited)
+}
+
 /// Whether the scheduler has taken the machine over.
 ///
 /// The boot code is not a task yet, and there is no queue to put it back on:

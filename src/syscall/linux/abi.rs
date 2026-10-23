@@ -376,7 +376,7 @@ pub(crate) fn mode_of(meta: &Metadata, stored: Option<u32>) -> u32 {
         NodeKind::Fifo => 0o010_000,
         // An anonymous inode has no file type: measured, a pidfd answers
         // `st_mode` `0700`, not `S_IFCHR|0700` (`.workbuddy/probe_pidfd6.c`).
-        NodeKind::Anon => 0,
+        NodeKind::Anon { .. } => 0,
     };
     match stored {
         Some(stored) => format | (stored & 0o7777),
@@ -388,8 +388,10 @@ pub(crate) fn mode_of(meta: &Metadata, stored: Option<u32>) -> u32 {
             NodeKind::Symlink => 0o120_777,  // symbolic link rwxrwxrwx
             NodeKind::Socket => 0o140_755,   // socket srwxr-xr-x until chmod
             NodeKind::Fifo => 0o010_644,     // FIFO prw-r--r--
-            // The anonymous family's own mode, owner-only by construction.
-            NodeKind::Anon => 0o700,
+            // The anonymous family's own mode: Linux's is `0600` for the
+            // descriptor families and `0700` for a pidfd, measured
+            // (`.workbuddy/probe_anon_fd_stat.c`), so the inode carries it.
+            NodeKind::Anon { mode } => mode,
         },
     }
 }
@@ -757,7 +759,7 @@ pub(crate) fn dt_type_of(kind: NodeKind) -> u8 {
         // An anonymous inode is never a directory entry, so this byte is
         // unreachable in practice; DT_UNKNOWN is the honest answer if a
         // filesystem ever asks.
-        NodeKind::Anon => 0,
+        NodeKind::Anon { .. } => 0,
     }
 }
 
@@ -1739,15 +1741,14 @@ pub struct Clone3Plan {
 ///   not a cgroup, which is exactly Linux's answer for one that is not
 ///   (`cgroup_get_from_fd`), and there is no cgroup tree here for a descriptor
 ///   to name.
-/// * `CLONE_CLEAR_SIGHAND` is `EOPNOTSUPP`. Linux serves it - the child starts
-///   with every disposition reset to `SIG_DFL` - but this kernel's process
-///   children *already* start there whatever the flags said (a `fork` here does
-///   not inherit its parent's handlers, which is a divergence of its own), so
-///   accepting the bit would answer a request this kernel cannot show it kept:
-///   with the flag and without it the child is identical, and a claim that
-///   passes either way pins nothing. Refusing by name is the honest half until
-///   the inheritance is Linux's; the prerequisite is written down in
-///   `docs/notes/` §6.10.
+/// * `CLONE_CLEAR_SIGHAND` resets the child's handler table to `SIG_DFL`,
+///   where the same child without it inherits the parent's dispositions -
+///   Linux's `copy_sig` rule, measured on a current host
+///   (`.workbuddy/probe_sig_inherit.c`, Linux 7.2.11): a `SIGUSR1` handler
+///   installed before the call ran in the plain child and read back `SIG_DFL`
+///   with this bit. It is `EINVAL` beside `CLONE_SIGHAND` (Linux's own pair
+///   rule, measured in the same probe), which also refuses it beside
+///   `CLONE_THREAD`, whose dependency chain needs `CLONE_SIGHAND`.
 /// * `set_tid`/`set_tid_size` must be both set or both zero. One set alone, or
 ///   a size above one, is `EINVAL`; a single well-formed entry needs the child
 ///   to land in a **new** pid namespace, so it is `EINVAL` without `CLONE_NEWPID`
@@ -1799,8 +1800,11 @@ pub fn clone3_verdict(args: &CloneArgs) -> Result<Clone3Plan, isize> {
     if flags & n::CLONE_INTO_CGROUP != 0 {
         return Err(err::EBADF);
     }
-    if flags & n::CLONE_CLEAR_SIGHAND != 0 {
-        return Err(err::EOPNOTSUPP);
+    // Linux's `clone3` check: clearing the table and sharing it are opposite
+    // requests. Measured on a current host: `CLEAR|SIGHAND` is `EINVAL`, with
+    // `CLONE_VM` beside them or without (`.workbuddy/probe_sig_inherit.c`).
+    if flags & n::CLONE_CLEAR_SIGHAND != 0 && flags & n::CLONE_SIGHAND != 0 {
+        return Err(err::EINVAL);
     }
     if flags & n::CLONE_PIDFD != 0 {
         if args.pidfd == 0 {
@@ -3308,7 +3312,14 @@ mod tests {
         // An anonymous inode has no format bits at all: a pidfd's `st_mode`
         // is permission bits alone, `0700`, not `S_IFCHR|0700` (measured,
         // `.workbuddy/probe_pidfd6.c`).
-        assert_eq!(mode_of(&meta(NodeKind::Anon, 1, 0), None), 0o700);
+        assert_eq!(
+            mode_of(&meta(NodeKind::Anon { mode: 0o700 }, 1, 0), None),
+            0o700
+        );
+        assert_eq!(
+            mode_of(&meta(NodeKind::Anon { mode: 0o600 }, 1, 0), None),
+            0o600
+        );
 
         // Stored permission bits replace the defaults, setuid included. In
         // the stat(2) spelling a setuid regular file is `104755`: the type
@@ -3597,7 +3608,7 @@ mod tests {
         // An anonymous inode has no directory entry to describe; if a
         // filesystem ever asks, `DT_UNKNOWN` is the honest byte rather than
         // borrowing a type the node does not have.
-        assert_eq!(dt_type_of(NodeKind::Anon), 0); // DT_UNKNOWN
+        assert_eq!(dt_type_of(NodeKind::Anon { mode: 0o700 }), 0); // DT_UNKNOWN
 
         // Header (19) + name + NUL, padded to 8: "foo" spans 24 bytes.
         assert_eq!(reclen_of(3), 24);
@@ -4205,12 +4216,17 @@ mod tests {
         );
         assert_eq!(clone3_verdict(&set_tid(0x1000, 100, 0)), Err(err::EINVAL));
 
-        // `CLONE_CLEAR_SIGHAND` is a known bit this kernel refuses by name, not a
-        // no-op it pretends to keep: `fork` here already starts a child at
-        // `SIG_DFL`, so accepting the flag could not be told from ignoring it.
+        // `CLONE_CLEAR_SIGHAND` is served now that a plain child inherits its
+        // parent's table: it asks the child path for the `exec`-shaped one
+        // instead. Beside `CLONE_SIGHAND` it is Linux's measured `EINVAL` -
+        // clearing and sharing one table are opposite requests.
+        assert!(clone3_verdict(&with(n::CLONE_CLEAR_SIGHAND, 0)).is_ok());
         assert_eq!(
-            clone3_verdict(&with(n::CLONE_CLEAR_SIGHAND, 0)),
-            Err(err::EOPNOTSUPP)
+            clone3_verdict(&with(
+                n::CLONE_CLEAR_SIGHAND | n::CLONE_SIGHAND | n::CLONE_VM,
+                0
+            )),
+            Err(err::EINVAL)
         );
     }
 

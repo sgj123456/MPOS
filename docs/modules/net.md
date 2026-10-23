@@ -105,11 +105,12 @@ The rows this module owns are in `docs/uapi/`: the `socket`/`bind`/`connect`/
 `listen`/`accept`/`send*`/`recv*`/`getsock{name,opt}` family in §1, the `SIOC*`
 (`0x89xx`) interface-ioctl row that routes through `fs/ioctl.rs`, and the
 structure-layout rows for `struct sockaddr_ll`, `struct nlmsghdr`/`rtattr`/
-`ifa*msg` and `struct ifreq` in §4. The gaps it still names — `SO_RCVBUF` as a
-report rather than a resizeable window, vsock's peek and whole-iovec-chain
-`recvmsg`, and a zero-byte stream handover that `recvmsg` can receive where Linux
-answers `EAGAIN` — are listed in docs/uapi/ §5.2/§5.3, with the module gate's
-consequence for host testing in §5.4.
+`ifa*msg` and `struct ifreq` in §4. The gaps it still names — a **datagram**
+socket's `SO_RCVBUF` as a report rather than a resizeable window (a stream's is
+its receive window now, `docs/uapi/` §5.1 item 98), vsock's peek and
+whole-iovec-chain `recvmsg`, and a zero-byte stream handover that `recvmsg` can
+receive where Linux answers `EAGAIN` — are listed in docs/uapi/ §5.2/§5.3, with
+the module gate's consequence for host testing in §5.4.
 (`AF_PACKET` `SOCK_RAW` is served; `SO_SNDBUF` now governs a datagram queue
 (§5.1 item 58); `MSG_PEEK` over TCP/UDP landed on 2026-10-20 — §5.1 item 72 — and
 over `AF_UNIX`, Netlink and `AF_PACKET` by items 76 and 77; the named
@@ -128,9 +129,10 @@ the frame ring — moved to the `mpos-link` leaf crate (`crates/link`), so those
 parsers do run in the gate's leaf stage and are fuzzed by `fuzz/link_wire`
 (`docs/notes/` §4.5). The module's own files still have none, for the reason
 above. The pins are the guest programs, all in `user/tests/src/bin/` now:
-`t-socket`, `t-sock-flags`, `t-sockmsg`, `t-sockopt`, `t-socketpair`, `t-tcp`,
-`t-tcp-listen`, `t-tcp-close`, `t-udp`, `t-udp-loopback`, `t-unix`,
-`t-unix-dgram`, `t-unix-rustix`, `t-unix-scm`, `t-epoll-socket`, `t-uevent`,
+`t-socket`, `t-sock-flags`, `t-sockmsg`, `t-sockopt`, `t-sockbuf`, `t-socketpair`,
+`t-tcp`, `t-tcp-listen`, `t-tcp-close`, `t-udp`, `t-udp-loopback`, `t-udpblock`,
+`t-unix`, `t-unix-dgram`, `t-unix-rustix`, `t-unix-scm`, `t-unix-close`,
+`t-sigpipe`, `t-epoll-socket`, `t-uevent`,
 `t-dhcp`, `t-netlink`, `t-dns`, `t-rawicmp`, `t-netlat`, `t-udev-worker`.
 `tests.toml` decides
 which of these the default sweep runs; several network-facing ones sit in its

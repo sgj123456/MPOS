@@ -108,42 +108,30 @@ exactly the part of the kernel that `src/lib.rs` leaves ungated.
 
 **The pure leaves are their own crates under `crates/`.** Each depends on
 nothing in the kernel (only `core`/`alloc`, and `critical-section` for
-`pci`/`uts`/`term`/`gpu`/`blk`; `mpos-uinput` depends on `mpos-evdev` for one constant), so they were extracted as workspace members and
-re-exported from `src/lib.rs` under their old names (`pub use mpos_err as err;`).
-The call sites are unchanged; what the crate boundary buys is enforcement, not
-tidiness — a leaf crate physically cannot write `crate::sched::…`, so the
-downward-only rule that `§9` keeps having to re-audit is now a compile error
-rather than a convention. The first seven (`err`, `date`, `binfmt`, `cred`,
-`uts`, `seccomp`, `pci`) were chosen because they already sat *outside* the
-module graph's one strongly-connected component (`§6`); the next ones were
-chosen for the same reason plus a placement one — `term` (the terminal emulator:
-a cell grid is not a filesystem fact, V-4), `ahci` (the port decode: arithmetic
-whose only reader is machine-only), `gpu` (the wire ABI, the DRM blobs, the cursor
-blend and the sync-object state machine) and the input policy pair `evdev`/`uinput`
-(which of a device's readers sees which record, and the request vocabulary a program
-declares a device with). `mpos-gpu` is the interesting
-one: it was *inside* the component by a single edge — `sync.rs` woke a parked
-waiter by calling `sched::wake` — and the split is what forced that seam to
-become a parameter (`gpu::sync::Waker`, injected by `drivers/drm` and by a
-recording test), which is also why the wake is host-testable for the first time.
-`blk` is the most recent: the `BlockDev` contract, the disk registry and the
-GPT/MBR decode were already host-tested inside `src/blk`, and extracting them
-removed the module's one upward-ish reference — `part.rs` sized its transfer
-buffer from `mm::PAGE_SIZE`, so the bound now lives with the trait that states
-it (`mpos_blk::PAGE_SIZE`), as a leaf that cannot name the kernel must.
-`link` is the most recent, and the first extracted for a *negative* reason:
-`AF_PACKET`'s `sockaddr_ll` decode, the Ethernet header and the packet socket's
-frame ring sat inside `src/net/packet.rs`, which is welded to the NIC seam and
-therefore `target_os = "none"` — so no host test and no `fuzz/` target could
-reach them, and `AGENTS.md` §3 asks every parser of wire-supplied bytes for a
-fuzz target. Below the gate they gain both, and the crate boundary is what keeps
-them from reaching back up (`docs/notes/` §4.5, `docs/uapi/` §5.4). Like the
-others it does not bump a leaf count: an earlier draft of this paragraph read
-"thirteen" long after the directory held more, which is the stale snapshot
-`AGENTS.md` §2 warns about.
-Anything still inside that component stays inside `mpos` until Phase 11 breaks
-the cycles; `fuzz/` may later depend on these crates directly instead of through
-`mpos`.
+`pci`/`uts`/`term`/`gpu`/`blk`; `mpos-uinput` depends on `mpos-evdev` for one constant), and
+`src/lib.rs` re-exports them under their old names (`pub use mpos_err as err;`), so no call site
+moved. The boundary buys enforcement, not tidiness: a leaf physically cannot write
+`crate::sched::…`, so the downward-only rule §9 keeps re-auditing is a compile error rather than a
+convention. The first seven (`err`, `date`, `binfmt`, `cred`, `uts`, `seccomp`, `pci`) already sat
+*outside* the module graph's one strongly-connected component (§6); the rest were chosen for the
+same reason plus placement — `term` (the terminal emulator: a cell grid is not a filesystem fact,
+V-4), `ahci` (the port decode: arithmetic read only by machine code), `gpu` (the wire ABI, DRM
+blobs, cursor blend, sync-object state machine) and the input policy pair `evdev`/`uinput` (which
+of a device's readers sees which record, and the request vocabulary a program declares a device
+with). `mpos-gpu` was *inside* the component by a single edge — `sync.rs` woke a parked waiter via
+`sched::wake` — and the split forced that seam into a parameter (`gpu::sync::Waker`, injected by
+`drivers/drm` and a recording test), which made the wake host-testable for the first time. `blk`
+removed `src/blk`'s one upward-ish reference: `part.rs` sized its transfer buffer from
+`mm::PAGE_SIZE`, so the bound now lives with the trait that states it (`mpos_blk::PAGE_SIZE`).
+`link` was the first extracted for a *negative* reason: `AF_PACKET`'s `sockaddr_ll` decode, the
+Ethernet header and the packet socket's frame ring sat in `src/net/packet.rs`, welded to the NIC
+seam and so `target_os = "none"` — no host test and no `fuzz/` target could reach them, and
+`AGENTS.md` §3 asks every parser of wire-supplied bytes for a fuzz target. Below the gate they gain
+both, and the boundary keeps them from reaching back up (`docs/notes/` §4.5, `docs/uapi/` §5.4).
+None of this bumps a leaf count: an earlier draft read "thirteen" long after the directory held
+more — the stale snapshot `AGENTS.md` §2 warns about. Anything still inside the component stays in
+`mpos` until Phase 11 breaks the cycles; `fuzz/` may later depend on these crates directly instead
+of through `mpos`.
 
 ---
 
@@ -233,22 +221,21 @@ task is a scheduler task.
 
 **`hal` is the machine seam.** `arch/src/hal/mod.rs` declares the capability traits every machine
 implements (`Clock`, `WallClock`, `Cpu`, `Interrupts`, `Paging`, `Contexts`, the last three with
-associated types), an `Entropy` concern for the machine's seed sources, the platform tag `Current`, and a handful of *optional capability* traits
-(`Msi`, `FpuTrap`, `SignalFrame`) for the ways one machine does something another has no hardware
-for — message-signalled delivery, the x87 lazy-FPU `#NM` trap protocol, segment selectors. Each
-`arch/src/arch/<arch>/mod.rs` implements the six baseline concerns *for* `Current`, and only the
-capabilities its hardware actually has, so `arch → hal` is the only arrow between the two and
-everything above the machine layer calls `crate::hal`'s forwards rather than naming `arch` — which
-makes `arch/src/arch/mod.rs` a facade of four items and its submodules `pub(crate)`. An absent
-capability is *absent* (the aarch64 `Current` simply is not an `Msi`/`FpuTrap`; it is a
-`SignalFrame` since §13.2's Stage 3b, with its own `rt_sigframe`), not a
-method every machine must fake an answer for (`AGENTS.md` §3 rule 4). Which capabilities a build has is
-a `mpos_*` flag declared per target in `.cargo/config.toml` (beside each machine's linker script, listed
-for `check-cfg` in `Cargo.toml`), so the forwards' `#[cfg]` gates name the capability and never the
-architecture — `arch/src/hal/mod.rs` contains no machine name at all (`docs/notes/` §13.1). The register ABI — the
-`syscall` gate, the trap frame, `user_regs_struct` — is per-arch *by definition* and stays in
-`arch/`; wrapping it in a neutral type would be the private dialect rule 3 forbids, so a port writes
-`arch/<arch>/` and edits no shared file (`docs/notes/` §9.1).
+associated types), an `Entropy` concern for the machine's seed sources, the platform tag `Current`,
+and *optional capability* traits (`Msi`, `FpuTrap`, `SignalFrame`) for what one machine does and
+another has no hardware for — message-signalled delivery, the x87 lazy-FPU `#NM` trap protocol,
+segment selectors. Each `arch/src/arch/<arch>/mod.rs` implements the six baseline concerns *for*
+`Current` and only the capabilities its hardware has, so `arch → hal` is the only arrow between them
+and everything above calls `crate::hal`'s forwards rather than naming `arch`; `arch/src/arch/mod.rs`
+is a facade of four items with `pub(crate)` submodules. An absent capability is *absent* (the
+aarch64 `Current` is not an `Msi`/`FpuTrap`; it is a `SignalFrame` since §13.2's Stage 3b, with its
+own `rt_sigframe`), not a method that fakes an answer (`AGENTS.md` §3 rule 4). Which capabilities a
+build has is a `mpos_*` flag declared per target in `.cargo/config.toml` (beside each machine's
+linker script, listed for `check-cfg` in `Cargo.toml`), so the forwards' `#[cfg]` gates name the
+capability and never the architecture — `arch/src/hal/mod.rs` contains no machine name at all
+(`docs/notes/` §13.1). The register ABI — the `syscall` gate, the trap frame, `user_regs_struct` —
+is per-arch *by definition* and stays in `arch/`; a neutral wrapper would be the private dialect
+rule 3 forbids, so a port writes `arch/<arch>/` and edits no shared file (`docs/notes/` §9.1).
 
 **Honest caveat:** several boxes above are *not* one-way in the code. §6 lists the measured
 differences — in particular `drivers → syscall`, `sched → vfs`/`net`/`drivers`,
@@ -270,7 +257,7 @@ they are cross-crate edges.
 | Layer | Module | Owns | Must not |
 |---|---|---|---|
 | Entry | `src/main.rs` | The one architecture-independent entry (`_start`, which takes the loader's record in the platform's first argument register and hands the machine its callbacks) and the one panic handler (the machine's wire, the machine's context dump, stop). Established a machine by `mpos_arch::arch::boot` on x86_64 and aarch64 alike | Contain reusable logic — everything reusable lives in the lib so the host can test it. Name no machine: the bring-up is `arch`'s, so nothing here is `#[cfg]`-ed |
-| Board | `src/board/` | The boot, with no architecture in it: one `start` and one flow (`flow.rs` — the console service, the device step, the kernel's own boot: bootstrap ramfs, archive, display's task, wire, stack, seed, pid-1 handoff), the ordered steps beside it (`steps.rs`), the banner and the panic walk (`report.rs`), and a test build's own evidence (`suites.rs`, `kunit.rs`). The device step itself is `drivers::virtio::probe`, which asks *both* transports — the PCI front-end and the record's MMIO windows — and registers what answers through each class's own contract | Contain a second sequence or a machine's name. The machine name is legal in exactly one place and it is not here: `mpos::arch::boot`, the machine layer's facade (`docs/notes/` §14.8). The kernel mounts nothing but its bootstrap ramfs — `/dev`, `/proc`, `/sys`, the real root and the host share are the early userland's (`assets/initramfs/core/init`, §15.6) |
+| Board | `src/board/` | The boot, with no architecture in it: one `start` and one flow (`flow.rs` — console service, device step, the kernel's own boot: bootstrap ramfs, archive, display's task, wire, stack, seed, pid-1 handoff), the ordered steps (`steps.rs`), the banner and panic walk (`report.rs`), and a test build's evidence (`suites.rs`, `kunit.rs`). The device step is `drivers::virtio::probe`, which asks *both* transports — the PCI front-end and the record's MMIO windows — and registers what answers through each class's contract | Contain a second sequence or a machine's name. The machine name is legal in exactly one place, and it is not here: `mpos::arch::boot`, the machine layer's facade (`docs/notes/` §14.8). The kernel mounts nothing but its bootstrap ramfs — `/dev`, `/proc`, `/sys`, the real root and the host share are the early userland's (`assets/initramfs/core/init`, §15.6) |
 | Machine | `arch/src/arch/x86_64/` | GDT/IDT/TSS, PIC and LAPIC, 4-level paging, context switch, the `syscall`/`sysret` gate, the PIT, port I/O | Be named from outside `arch::`/`hal::` — the submodules are `pub(crate)` behind `arch/mod.rs`'s four-item facade, and the depgraph fails on any module but `arch`/`hal`/`main`/`lib` naming it. The register ABI the syscall gate and trap frame carry is per-arch by definition and stays here |
 | HAL | `arch/src/hal/` | The capability traits every machine implements (`Clock`, `WallClock`, `Cpu`, `Interrupts`, `Paging`, `Contexts`, `Console`, `Entropy`) with their associated types, the optional capability traits only some machines have (`Msi`, `SerialRing`, `FpuTrap`, `SignalFrame`), the platform tag `Current`, and the one-line forwards everything above calls | Hold machine logic: the `impl`s live in `arch/<arch>/`, so a port adds them there without editing a shared file. It is not `drivers::virtio::hal` (that is `virtio_drivers`' own `Hal`), and it is one trait per concern — not one per function — the baseline concerns every machine has plus optional capabilities a machine implements only if its hardware has them (`docs/notes/` §11.3) |
 | Memory | `src/mm/` | Buddy frame allocator (order 0–12), slab heap (16–2048 B), mapping plans, the ELF64 loader | Know about files, tasks or devices |
@@ -455,39 +442,32 @@ Two notes on the table above, both of them about trusting a measured number:
   an allowed edge, and `bind` takes the preferred port id as a parameter). The SCC verdict
   stands: the remaining edges still make the module graph one component at this granularity.
 
-**The ratchet is the live measurement.** `cargo xtask depgraph` (`docs/notes/` §11.2 Step G) runs the
-same extraction as its own *check*, with one difference that matters: `//` comments are stripped
-before matching, so what it counts is who names whom in code rather than who writes about whom.
-Measured on this tree as steps A, C, E, F and G landed and the `mm`/`vfs` seam closed it reports **18** mutual pairs, where the
-same extraction matching text reports 23 — `uaccess ↔ syscall`, `evdev ↔ vfs` and `mm ↔ sched` are
-prose, not edges, which is the lesson the `arch ↔ vfs` phantom taught above, met a second time.
-Two came off in code as well: the exit-hook registry (`sched::exit`) removed `sched → net`,
-and `mm` stopped naming `vfs` for a frame-backed mapping (V-13). In neither case does the other
-direction go - `net → sched` is ordinary parking and `vfs → mm` is the tenant of the address
-space - because a one-way edge is not a cycle. The HAL landing (S1, §11.4) then took the
-measured count from 17 to **15**: `arch → console` and `arch → net` fell to zero when every
-`crate::arch::timer`/`rtc`/`idle`/`halt` call above the machine layer became a `crate::hal`
-one, collapsing both pairs to one-way edges, and no pair was added in exchange (`hal`'s
-platform tag is its own type; `arch` implements the traits for it, so `arch → hal` is the
-only arrow). S2 then took it to **14**: with the interrupt controller behind `hal::Interrupts`,
-`drivers → arch` fell to zero and the `arch ↔ drivers` pair collapsed. S3 kept it at **14**
-while swapping which pair it is: paging behind `hal::Paging` removed `arch ↔ mm` (`mm` stopped
-naming `arch`) and created `hal ↔ mm` (the trait speaks `mm`'s mapping vocabulary; `mm` asks the
-HAL to program an MMIO window), which §9 argues is the seam's neighbour, not a leak. S4 took it
-to **12**: with the saved context, the FPU state and the user frame behind `hal::Contexts`,
-`sched` and `syscall` stopped naming `arch` entirely, so the last two pairs — `arch ↔ sched` and
-`arch ↔ syscall` — collapsed. V-3's exit-hook and `FD_CLOEXEC` registries then took it to **10**
-(`sched → net` and `sched → drivers` both fell to zero, removing the `net ↔ sched` and
-`drivers ↔ sched` pairs), and §13.2's move of the `ptrace` protocol words to the `abi` leaf took it
-to **9**: `sched` stopped naming `syscall::linux::abi`, so `sched → syscall` is 0 and the
-`sched ↔ syscall` pair went with it. The tables in this section are the audit's
-snapshot and are left as they were read; from here the command is what they have to agree with, and
-it fails when an edge appears that was not there when the baseline was recorded. Two further rules
-ride with it, each a ratchet at its recorded number rather than an absolute refusal: no layer below
-`syscall` names `crate::syscall::` (`drivers` 1, `sched` 0 since §13.2; `arch` and `main` are exempt by
-design — the gate exists to enter the dispatcher), and `src/vfs/mod.rs` names no device — that one
-is at **0**, down from the 9 the nine `as_*` downcasts of V-1 cost, so a *single* new reference
-there fails the sweep.
+**The ratchet is the live measurement.** `cargo xtask depgraph` (`docs/notes/` §11.2 Step G) runs
+the same extraction as its own *check*, but strips `//` comments first, so it counts who names whom
+in code rather than in prose. As steps A, C, E, F and G landed and the `mm`/`vfs` seam closed it
+reported **18** mutual pairs where the text-matching extraction reports 23 — `uaccess ↔ syscall`,
+`evdev ↔ vfs` and `mm ↔ sched` are prose, not edges, the lesson the `arch ↔ vfs` phantom taught
+above, met again. Two came off in code: the exit-hook registry (`sched::exit`) removed `sched →
+net`, and `mm` stopped naming `vfs` for a frame-backed mapping (V-13). Neither reverse direction
+goes — `net → sched` is ordinary parking, `vfs → mm` is the tenant of the address space — because a
+one-way edge is not a cycle. The HAL landing (S1, §11.4) took the count from 17 to **15**: `arch →
+console` and `arch → net` fell to zero when every `crate::arch::timer`/`rtc`/`idle`/`halt` call
+above the machine layer became a `crate::hal` one, and no pair was added (`hal`'s platform tag is its
+own type; `arch` implements the traits for it, so `arch → hal` is the only arrow). S2 took it to
+**14** (`hal::Interrupts` dropped `drivers → arch`, collapsing `arch ↔ drivers`). S3 kept **14**
+while swapping the pair: `hal::Paging` removed `arch ↔ mm` (`mm` stopped naming `arch`) and created
+`hal ↔ mm` (the trait speaks `mm`'s mapping vocabulary; `mm` asks the HAL to program an MMIO
+window), which §9 argues is the seam's neighbour, not a leak. S4 took it to **12**: with the saved
+context, FPU state and user frame behind `hal::Contexts`, `sched` and `syscall` stopped naming
+`arch`, so `arch ↔ sched` and `arch ↔ syscall` collapsed. V-3's exit-hook and `FD_CLOEXEC`
+registries took it to **10** (`sched → net` and `sched → drivers` fell to zero), and §13.2's move of
+the `ptrace` protocol words to the `abi` leaf took it to **9**: `sched` stopped naming
+`syscall::linux::abi`, so `sched → syscall` is 0. The tables above are the audit's snapshot, left as
+read; from here the command is what they must agree with. Two further rules ride with it, each a
+ratchet at its recorded number rather than an absolute refusal: no layer below `syscall` names
+`crate::syscall::` (`drivers` 1, `sched` 0 since §13.2; `arch` and `main` are exempt by design —
+the gate exists to enter the dispatcher), and `src/vfs/mod.rs` names no device — at **0**, down from
+the 9 the nine `as_*` downcasts of V-1 cost, so a *single* new reference there fails the sweep.
 
 ---
 
@@ -556,16 +536,14 @@ tree.
 Measured 2026-10-02: 635 `#[test]` functions in `src/` (plus 42 in `xtask/`), 104 030 lines across
 125 `.rs` files.
 
-**V-11 is closed, and the case it was found on turned out to be a duplicate.** `src/lib.rs`
-declares `#[cfg(target_os = "none")] pub mod net;`, so the whole module is absent from a host
-build — while `src/net/socket.rs` annotated a test module `#[cfg(all(test, not(target_os =
-"none")))]`, i.e. "run me on the host". The annotation was honoured only in a build that never
-included the file, so those three tests never ran once. Settling it took reading what they pinned
-rather than wishing them alive: `send`/`recv` and the `sendmsg`/`recvmsg` shapes on a `socketpair`,
-and its refusals (`EISCONN`, `MSG_DONTWAIT`/`EAGAIN`) are pinned line for line by
-`user/tests/src/bin/t-sockmsg.rs`, a program the sweep boots. The module was deleted and the
-coverage is where it always actually was; the point of the check above is that the next one of
-these is a red gate rather than a silent three tests nobody counts.
+**V-11 is closed, and the case it was found on turned out to be a duplicate.** `src/lib.rs` gates
+`pub mod net` on `target_os = "none"`, so the whole module is absent from a host build — while
+`src/net/socket.rs` annotated a test module `#[cfg(all(test, not(target_os = "none")))]`, "run me on
+the host", honoured only in a build that never included the file; those three tests never ran once.
+`send`/`recv` and the `sendmsg`/`recvmsg` shapes on a `socketpair`, and its refusals (`EISCONN`,
+`MSG_DONTWAIT`/`EAGAIN`), are pinned line for line by `user/tests/src/bin/t-sockmsg.rs`, a program
+the sweep boots, so the module was deleted and the coverage is where it always was. The check above
+exists so the next one is a red gate rather than three tests nobody counts (§9, V-11).
 
 ---
 
@@ -578,17 +556,9 @@ are items this table caught and later work closed; an *Open* or *Widened* row is
 | # | Violation | Evidence | Plan |
 |---|---|---|---|
 | V-1 | `Inode` downcasts to concrete devices and networks | `src/vfs/mod.rs` defined `as_fb`, `as_evdev`, `as_uinput`, `as_drm`, `as_syncobj_fd`, `as_sync_file`, `as_vsock`, `as_packet`, `as_unix` as default-`None` trait methods — nine, one per concrete device and socket type — so adding a device type meant editing the VFS trait and `vfs` could not be compiled without naming every driver. **Closed by Step B1**: the trait carries `core::any::Any` as a supertrait (which every `'static` type already implements, so no impl grew a line) and one inherent upcast, `impl dyn Inode { fn as_any(&self) -> &dyn core::any::Any }`; a caller asks for the type it knows is there — `inode.as_any().downcast_ref::<FbDev>()` — and the caller is the layer that owns the type (`syscall` for a device it is about to drive, `net` for its own family, `drivers` for its own node). Removed one device per commit, fbdev first and DRM last, six of them with a conformance program in the default sweep. `src/vfs/mod.rs` now names `crate::drivers::` and `crate::net::` **zero** times, and the depgraph constant is 0. It does *not* remove the `drivers ↔ vfs` pair: `vfs` still names `drivers` 17 times and `net` 4 from `vcmux`, `procfs`, `sysfs` and `p9`, which are V-4's remaining half and the PCI-config/9p doors — their own findings, their own steps | **Done** (Phase 11 B1) |
-| V-2 | Per-device ioctl ABI parsed in the syscall layer | `src/syscall/linux/fs.rs` switches on fbdev/RTC/uinput and TTY request numbers. **Progress (B2):** the DRM (`'d`) family already routed to `drivers::drm::drm_ioctl`; B2 moved the **evdev (`'E`) family to `drivers::virtio::input::EvdevNode::ioctl`** and the **KD (`'K`) family to `vfs::tty::Tty::kd_ioctl`** — each device now owns its accept/reject vocabulary, fd-resolution kept at the syscall boundary. For `kd` the DRM `card_grabbed_by_current()` answer is handed *down* as an `owns_card` argument, so `vfs::tty` never names `drivers` (no new upward edge). Both guest-verified `pass=136 fail=0`. **And B2 finished the sweep**: the **`'U'` family moved to `drivers/uinput.rs` (`Uinput::ioctl`)** — with the family check itself moved into the `mpos-uinput` crate as `nr_of`, since the magic is that crate's vocabulary — and the **`'V'` family to `vfs/tty.rs` (`Tty::vt_ioctl`)**, with the three facts that live above the VFS (the caller's task, whether it is root, and the thread group a `VT_SETMODE` promise is recorded against) handed *down* as a `VtCaller`, the same way `kd_ioctl` takes `owns_card`. `fs.rs` lost 212 lines to the two moves. So every device family this audit named now states its own contract: `'d'` (DRM), `'E'` (evdev), `'K'` (console), `'U'` (uinput), `'V'` (console ownership), and the fbdev/RTC requests that were already routed. What remains of the row is **B1**: the twenty-odd `Inode::as_*` downcasts that let the boundary *find* the device, which the ratchet counts as `vfs/mod.rs → drivers|net` 9 | **Done** (Phase 11 B1: zero) |
+| V-2 | Per-device ioctl ABI parsed in the syscall layer | `src/syscall/linux/fs.rs` switches on fbdev/RTC/uinput and TTY request numbers. **B2** routed the DRM (`'d`) family to `drivers::drm::drm_ioctl`, the **evdev (`'E`) family to `drivers::virtio::input::EvdevNode::ioctl`**, the **KD (`'K`) family to `vfs::tty::Tty::kd_ioctl`**, the **`'U'` family to `drivers/uinput.rs` (`Uinput::ioctl`)** — the family check moving into the `mpos-uinput` crate as `nr_of`, since the magic is that crate's vocabulary — and the **`'V'` family to `vfs/tty.rs` (`Tty::vt_ioctl`)**. Each device owns its accept/reject vocabulary with fd-resolution at the syscall boundary, and the facts above the VFS are handed *down*: `kd_ioctl` takes the DRM `card_grabbed_by_current()` answer as `owns_card`, so `vfs::tty` never names `drivers`; `vt_ioctl` takes a `VtCaller` (the caller's task, whether it is root, the thread group a `VT_SETMODE` promise is recorded against). Both guest-verified `pass=136 fail=0`; `fs.rs` lost 212 lines. Every family this audit named now states its own contract: `'d'`, `'E'`, `'K'`, `'U'`, `'V'`, plus the fbdev/RTC requests already routed. What remains is **B1**: the twenty-odd `Inode::as_*` downcasts that let the boundary *find* the device, which the ratchet counts as `vfs/mod.rs → drivers|net` 9 | **Done** (Phase 11 B1: zero) |
 | V-3 | The scheduler performs other subsystems' per-process cleanup | **Closed** — fully by Step C plus the `FD_CLOEXEC` registry. The exit path walks `sched::exit`'s hook list (each subsystem registers from `main.rs`), so `runtime.rs` names none of `net::socket`, `vfs::inotify`, `vfs::locks` or `drivers::uinput` — `sched → net` is 0. The last piece was the *execve* `FD_CLOEXEC` pass, which named the two input drivers directly; it now walks a **second** `sched::exit` list (`register_cloexec`/`run_cloexec`) that the same two drivers register into, so `sched → drivers` is 0 and the `drivers ↔ sched` pair — the one Step C left standing, mutual pairs 12 → 11 — is gone. The two events stay deliberately apart (a different set of subsystems for a process that lives on, not dies), just expressed in two typed lists instead of one plus hardcoded calls | Phase 11 C (exit path); FD_CLOEXEC registry (`docs/notes/` §9.1) |
-| V-4 | The terminal emulator and console mux live inside the VFS | **The `vfs ↔ console` pair is closed** (Phase 11 D, gate green `pass=140 fail=0`, mutual pairs 18 → 17): the emulator is the `mpos-term` leaf; and D.1/D.1b/D.2a moved into `crate::term` the mux's shared vocabulary (`VC_COUNT` and the `KD_*`/`K_*` mode words → `crate::term::vc`), its pure handover table (`vfs::vtmode` → `crate::term::vtmode`), and the active-console number (`vfs::vcmux::ACTIVE`/`active()` → `crate::term::vc::active`/`set_active`). That last move is what broke the pair: `console → vfs` was a single read (`console.rs::active_grid` asking which console is on screen), and pointing it at the leaf drove `console → vfs` to zero, collapsing the mutual pair to a one-way `vfs → console`. No new forbidden edge (`console` may already name `term`); `vfs/mod.rs → drivers|net` stays 0; `crate::term` stays out of the pair set. **Remaining (D.2b), evaluated and rejected:** relocating the `vcmux.rs` *file* into `console` would turn
-`console` — a designed leaf (may name only `arch`/`boot`/`term`) — into a mid-layer that depends on
-`vfs`(pty/tty), `drivers`(drm/video) and `sched`, the opposite of V-4's direction; a bare move also
-re-creates `console → vfs` from the mux's pty/tty calls. A mux-only hook inversion moves no ratchet:
-`vfs → console` has 3 non-`vcmux` callers (`tty.rs`×2, `ext4`×1) and `vfs → drivers` has 10
-(`procfs`/`sysfs`/`p9`), so neither edge reaches zero via the mux. The `vcmux` file therefore stays in
-`vfs`, where its pty/tty console-switch orchestration coherently belongs. The only surviving mutual
-pair is `drivers ↔ vfs` (the procfs/sysfs/9p device-state door, §11.1) — a different finding, not V-4 |
-Phase 11 D (**closed**; D.2b rejected) |
+| V-4 | The terminal emulator and console mux live inside the VFS | **The `vfs ↔ console` pair is closed** (Phase 11 D, gate green `pass=140 fail=0`, mutual pairs 18 → 17): the emulator is the `mpos-term` leaf, and D.1/D.1b/D.2a moved into `crate::term` the mux's shared vocabulary (`VC_COUNT`, the `KD_*`/`K_*` mode words → `crate::term::vc`), its pure handover table (`vfs::vtmode` → `crate::term::vtmode`) and the active-console number (`vfs::vcmux::ACTIVE`/`active()` → `crate::term::vc::active`/`set_active`). That last move broke the pair: `console → vfs` was a single read (`console.rs::active_grid` asking which console is on screen), and pointing it at the leaf drove `console → vfs` to zero, leaving one-way `vfs → console`. No new forbidden edge (`console` may name `term`); `vfs/mod.rs → drivers|net` stays 0; `crate::term` stays out of the pair set. **Remaining (D.2b), rejected:** relocating the `vcmux.rs` *file* into `console` would turn `console` — a designed leaf (may name only `arch`/`boot`/`term`) — into a mid-layer depending on `vfs`(pty/tty), `drivers`(drm/video) and `sched`, the opposite of V-4's direction; a bare move re-creates `console → vfs` from the mux's pty/tty calls, and a mux-only hook inversion moves no ratchet, because `vfs → console` has 3 non-`vcmux` callers (`tty.rs`×2, `ext4`×1) and `vfs → drivers` has 10 (`procfs`/`sysfs`/`p9`). The file stays in `vfs`, where its pty/tty console-switch orchestration belongs; the only surviving mutual pair is `drivers ↔ vfs` (the procfs/sysfs/9p device-state door, §11.1) — a different finding, not V-4 | Phase 11 D (**closed**; D.2b rejected) |
 | V-5 | A driver calls back into the syscall layer | `drivers/drm/` validated user pointers via `crate::syscall::buffer_ok`; **B3 closed that half — it now names `crate::uaccess::buffer_ok`.** The remaining edge is `drivers/virtio/sound.rs` naming `crate::syscall::linux::abi` for ioctl ABI constants (its former `crate::syscall::err::` refs already became `crate::err`); that is the device-ioctl-ABI concern (V-2), not the two helpers | Phase 11 B |
 | V-6 | A debug trace sat in the dispatch hot path | `syscall/linux/mod.rs::trace_msg`, self-labelled `TEMPORARY (udevd worker-channel hunt)`, wrote `[msgtrace]` lines from any failed `sendto`/`recvfrom`/`sendmsg`/`recvmsg` | **Done** (Phase 11 A) |
 | V-7 | Dead and duplicate machine modules | `arch/x86_64/serial.rs` and `arch/x86_64/qemu.rs` were not declared in `arch/x86_64/mod.rs` at all; `qemu.rs` was byte-identical to `drivers/qemu.rs`. Three PCI modules existed (`arch/x86_64/pci.rs` was a stale earlier copy of `drivers/pci.rs`), two RTC, two serial | **Done** (Phase 11 A) — all three deleted, `drivers/rtc` renamed `drivers/rtc_dev` |
@@ -623,20 +593,12 @@ which `mm` owns because it owns the mapping plan), and `mm` names the HAL for th
 one call that programs a device window it handed out. Stage 3 swapped it for the
 old `arch ↔ mm` pair rather than adding to the count (`docs/notes/` §11.4).
 
-The machine seam is new and still being closed (`docs/notes/` §11.4): the clock, wall
-clock, CPU control, the interrupt controller and paging already go through `hal`,
-while contexts and the user register frame are still named from above and move
-next. Until they do, `arch` is named directly by the boxes that still carry those
-calls — which is exactly the debt the steps are for.
-
 The leaf crates (`crates/`, §1) sit below all of these and may use nothing in the kernel —
 `blk` is named by `vfs`/`drivers`/`uevent` and names nothing back, and `link` by `net`.
 
 with two hard rules: **nothing below `syscall` names `syscall`**, and **nothing outside
-`vfs` names `vfs`'s concrete device types**. Both are measured now rather than asserted:
-`cargo xtask depgraph` reports the counts and fails when either grows (§6, `docs/notes/` §11.2
-Step G). A third rule rides with them from the HAL work (`docs/notes/` §11.4): **no layer outside
-`arch`/`hal`/`main`/`lib` names `crate::arch::`** — an allow-list rather than a ceiling, and it
-is now satisfied at zero. Stages 1–4 moved the clock, wall clock, CPU control, the interrupt
-controller, paging and the task context behind `crate::hal`, which took the two last holders
-(`sched`, `syscall`) to zero and collapsed the last two `arch ↔ …` pairs.
+`vfs` names `vfs`'s concrete device types**. Both are measured: `cargo xtask depgraph` reports the
+counts and fails when either grows (§6, `docs/notes/` §11.2 Step G). A third rule rides with them
+from the HAL work (`docs/notes/` §11.4): **no layer outside `arch`/`hal`/`main`/`lib` names
+`crate::arch::`** — an allow-list, now satisfied at zero; the S1–S4 stages behind it are §6's
+ledger.

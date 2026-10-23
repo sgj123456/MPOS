@@ -75,6 +75,9 @@ pub(crate) fn err_of(e: crate::vfs::VfsError) -> isize {
         // ENOTCONN: the door is a socket's, and no connection stands
         // behind it - Linux's read(2) answer on an unconnected socket.
         VfsError::NotConnected => err::ENOTCONN,
+        // ECONNREFUSED: a connected datagram's peer is gone. Linux answers
+        // that send once with ECONNREFUSED and forgets the connection.
+        VfsError::ConnectionRefused => err::ECONNREFUSED,
         // EINTR: the node was about to block and a catchable signal ended the
         // wait instead, having consumed nothing. This is what lets a full-screen
         // program's own timeout (SIGALRM from `alarm`/`setitimer`) or a resize

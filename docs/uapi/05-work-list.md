@@ -2592,7 +2592,8 @@ the commit bodies), and each moved its pin in the same commit.
 
     Still named, and measured: `SO_RCVBUF` is the number a caller reads and not a window
     this kernel resizes (the receive ring is a fixed 16 KiB, so a smaller ask does not
-    shrink it); the datagram-too-big line remains the ring's rather than Linux's 65507,
+    shrink it - a stream's became its window in item 98; a datagram's ring is still fixed);
+    the datagram-too-big line remains the ring's rather than Linux's 65507,
     because this stack has no IP fragmentation and a wider datagram could not leave the
     machine; and a floor buffer admits three datagrams here against Linux's two, this
     kernel charging the payload where Linux charges each skb's truesize.
@@ -4951,8 +4952,8 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     **Named**: `pidfd_getfd(2)` (438), `clone3`'s `CLONE_PIDFD` and
     `process_madvise(2)` (440) are not served and fall to the `ENOSYS` catch-all.
     **`pidfd_getfd` was served by item 93**, below.
-    The older anonymous descriptors still report `S_IFCHR`; `NodeKind::Anon` does
-    not silently change them. `st_blksize` stays 512 where Linux's pidfd answers
+    The older anonymous descriptors' `S_IFCHR` divergence landed as item 99,
+    below. `st_blksize` stays 512 where Linux's pidfd answers
     4096 (the global choice, not a pidfd one), and `st_dev`/`st_ino`/uid/gid are
     machine-specific and not pinned. `fdinfo` for a pidfd (`Pid:`/`NSpid:`) was not
     measured and is not promised.
@@ -5024,7 +5025,7 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     **Named**: `clone3`'s `CLONE_PIDFD` and `process_madvise(2)` (440) remain
     `ENOSYS`. `pidfd_getfd` is the one door that reaches another process's
     descriptor table; `pidfd_getfd`'s own `fdinfo` is still not promised, and
-    the older anonymous descriptors still report `S_IFCHR` (item 92's list).
+    the older anonymous descriptors' `S_IFCHR` divergence landed as item 99.
     The authority rule keeps the known §2.6 divergence: Linux's
     `PTRACE_MODE_ATTACH_REALCREDS` compares group ids too and this kernel
     compares the real/effective uid set; every task is root on this image, so
@@ -5107,13 +5108,308 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     (probed and deferred: its only real advice, `MADV_DONTNEED`, is refused
     `EINVAL` for another process on this host, and the rest are hints this kernel
     answers as no-ops, so a door here would be a shape without work behind it).
-    `CLONE_CLEAR_SIGHAND` is `EOPNOTSUPP` because this kernel's `fork` already
-    starts every process at `SIG_DFL` (a divergence of its own, not inherited
+    `CLONE_CLEAR_SIGHAND` was `EOPNOTSUPP` at this landing because `fork` here
+    started every process at `SIG_DFL` (a divergence of its own, not inherited
     from the parent as POSIX requires), so accepting the bit could not be told
-    from ignoring it. `CLONE_NEWTIME` through this door is `EOPNOTSUPP` (this
+    from ignoring it. **Item 96** closes that prerequisite and serves the flag.
+    `CLONE_NEWTIME` through this door is `EOPNOTSUPP` (this
     kernel has no clock namespace to hand a child through `clone`; `unshare` is
     the door that serves it). `CLONE_PTRACE` and any unknown bit are `EINVAL`
     (this kernel's designed unknown-bit rule, which `clone(2)` shares). `clone3`
     carries no `CLONE_VM`-without-`CLONE_THREAD` sharing here - a copy marks the
     contract better, as `vfork`'s own note says - so a caller relying on that
     word's shared memory is a divergence named rather than served.
+
+## item 95 — a peer's close is a hang-up, and a message socket's end-of-file carries it
+
+    A connected `AF_UNIX` end whose peer closed reported **nothing** here on a
+    `SOCK_SEQPACKET` connection, and a named `SOCK_STREAM` end reported readable
+    without the hang-up its `socketpair` twin had. Linux reports both as
+    `POLLIN|POLLHUP` (`EPOLLIN|EPOLLHUP` through epoll) and answers the receive
+    after the queued messages with 0. The boot this cost: OpenRC's udev-settle
+    runs `udevadm settle`, which pings udevd over a connected seqpacket control
+    socket and polls it; udevd closes, Linux returns at once, and this kernel's
+    client slept out the **120-second** settle default at
+    `* Waiting for uevents to be processed ...`.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_unix_close.c`
+    and `.workbuddy/probe_seq_send_close.c`, Linux 7.2.11): `socketpair` and
+    named ends, seqpacket and stream alike,
+    answer poll `0x011`, epoll `0x11`, `recv` 0, and a seqpacket `send` `EPIPE`;
+    a **datagram** `poll(POLLIN|POLLOUT)` answers `POLLOUT` alone (`0x004`),
+    `recv` `EAGAIN` and `send` `ECONNREFUSED`, because its peer can be replaced
+    by another `connect` (`.workbuddy/probe_dgram_close.c`). Measured in the
+    guest before the fix (`unixcloseprobe.c`): both seqpacket shapes `poll=0`
+    `revents=0x000` and `recv=-1 EAGAIN`; the named stream `0x001` against the
+    pair's `0x011`.
+
+    **The landing.** A connected seqpacket socket's existing weak peer reference
+    now answers `message_peer_gone`; `take_dgram`/`peek_dgram` drain the queue
+    first and then answer `Ok(None)` (rendered as 0 by `read_at`),
+    `wait_for_dgram`'s condition includes it, `poll_ready` reports readable when
+    queued *or* gone, and `poll_hup` answers it - with streams forwarding to the
+    wrapped `DuplexEnd` so the named end matches its pair. `Drop` takes the
+    peer's `read_waiters` under the critical section that clears the slot and
+    wakes them after the borrows are released.
+
+    **Pins**: **`t-unix-close`** (new, default group, both machines), 19 claims -
+    the queued-message-then-0 order, the poll/epoll shapes on a named pair, a
+    `socketpair` end and a named stream, two timed wakes (a child closes 100 ms
+    into a 5 s wait) and the datagram contrast. Green on a current host first;
+    in the guest the wake measures 99 ms (`poll`) and 97 ms (`epoll_wait`).
+    Counterfactual (the gone-peer predicate removed from the take, peek, wait,
+    readiness and `poll_hup`): **7 of 19 red** by name, the wakes answering at
+    their 4997/5000 ms deadlines, every datagram and message-ordering claim
+    green. Gate: x86_64 stage 1 1073/0, stage 2 `pass=196 fail=0`,
+    `mpos-kunit 32 passed, 0 failed`. The image now reaches `mpos login:` 3.7 s
+    after QEMU starts where the settle used to own 120 s of the boot.
+
+    **Named**: the epoll return carries this kernel's usual extra
+    `EPOLLRDNORM` bit (`0x51` where Linux answers `0x11`); the claim asks
+    `EPOLLIN|EPOLLHUP`, and the extra bit predates this item. **The send side
+    of the same close** is item 97, and measuring it corrected this item's
+    first draft: a seqpacket `send` to the dead peer answers `EPIPE` **without**
+    `SIGPIPE`, a stream's answers `EPIPE` **with** it, and a datagram's is
+    `ECONNREFUSED` once and then `ENOTCONN`.
+
+## item 96 — a child inherits its parent's signal table, and `exec` resets only the caught slots
+
+    A `fork`/`clone` child here started at `SIG_DFL` whatever the parent held,
+    where POSIX and Linux copy the table - the reason item 94 refused
+    `CLONE_CLEAR_SIGHAND` `EOPNOTSUPP`: the flagged and unflagged child were
+    identical. The other half of the same state was wrong too: `exec` reset
+    *every* disposition (an ignored signal has to stay ignored) and flushed the
+    pending set (Linux keeps it).
+
+    **Measured whole on a current host first** (`.workbuddy/probe_sig_inherit.c`
+    and `.workbuddy/probe_altstack_fork.c`, Linux 7.2.11): a `fork` child
+    carries the parent's handler, `SIG_IGN`, blocked mask **and alternate
+    stack**; after an `exec` a caught handler reads `SIG_DFL`, `SIG_IGN` stays,
+    the blocked mask and a pending blocked signal cross, and the old alternate
+    stack is gone; `clone3` without the flag hands the handler to the child and
+    with `CLONE_CLEAR_SIGHAND` hands `SIG_DFL`; `CLEAR|SIGHAND` is `EINVAL`
+    (with `CLONE_VM` or without), and so is the pair with `CLONE_THREAD`; a
+    thread's `rt_sigaction` is the process's.
+
+    **The landing.** The fork/clone child copies `parent.dispositions` unless
+    `CLONE_CLEAR_SIGHAND` asks for the default table; the alternate stack
+    crosses; `clone3_verdict` serves the flag and refuses the `CLONE_SIGHAND`
+    pair; `exec` calls `Actions::reset_caught` and leaves the pending set and
+    the blocked mask alone.
+
+    **Pins**: **`t-signal-inherit`** (new, default group, both machines), 12
+    claims - the fork inheritance and a real `execve` of the test's own image
+    reporting DFL/IGN/mask/pending through a pipe; **`t-clone3`** 37 -> 40
+    claims - the plain child's handler, the flagged child's `SIG_DFL`, and both
+    `EINVAL` pairs. `t-signal-frame`'s fatal-fault child now resets `SIG_DFL`
+    itself: it had relied on the old divergence after installing a `SIGSEGV`
+    handler, and Linux's fork hands that handler down. The first gate run
+    measured exactly that (`pass=196 fail=1`, `status 0x0`). Counterfactual
+    (the fork fields and the exec reset put back), every pin kept: a guest
+    single-test run of `t-signal-inherit` is **4 of 12 red** - the fork
+    inheritance, the kept `SIG_IGN`, the kept pending signal and the whole
+    after-exec word; the DFL and mask claims stay green.
+
+    **The release stack this needed.** With the inheritance in place the
+    aarch64 release sweep crashed at the first user `fork`; `spawn_copy`'s
+    frame is ~13.8 KiB of a 16 KiB release stack and its callees no longer fit.
+    The isolation was measured: reverting only the fork fields booted, while
+    only the 16-byte alternate-stack copy in place crashed two ways on two
+    boots (`free of 0xe000: address is not in any zone`; then a branch to
+    address 0). The release stack is 32 KiB now (`STACK_ORDER` 3, debug stays
+    64 KiB) and the frame measurement is in `src/sched/runtime/mod.rs`.
+
+    **Gate**: x86_64 stage 1 1074/0, stage 2 `pass=197 fail=0`, `mpos-kunit 32
+    passed, 0 failed`, exit 0; aarch64 196 staged, `pass=196 fail=0`,
+    `mpos-kunit 32 passed, 0 failed`, exit 0. The reasoning and the counterfactual
+    detail are §2.7.
+
+    **Named**: a thread's table is still a copy, not Linux's shared
+    `CLONE_SIGHAND` table; the kernel-spawned program path (`load.rs`) still
+    starts at `SIG_DFL`, which is not a user `exec` and is not claimed as one.
+
+## item 97 — a write to a broken channel is `EPIPE`, and the signal behind it
+
+    §4.1.12 made a peer's close visible to a **reader**; this is the sender's
+    half, and it was wrong in three ways. A seqpacket `send` to the dead peer
+    answered `ENOTCONN`; a stream's write answered `EPIPE` but raised no
+    `SIGPIPE`; and no broken channel in this kernel raised one at all, so a
+    pipe's write returned `EPIPE` to a program Linux would have killed. The
+    signal's generation is one primitive now (`sched::raise_sigpipe`, an
+    `SI_USER` record through the same `send_signal` a `kill` uses), and each
+    door raises it where Linux does.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_sigpipe.c`,
+    `probe_sigpipe2.c`, `probe_sigpipe3.c`, `probe_sigpipe4.c`, Linux 7.2.11):
+
+    | the broken channel | the call | handler runs? |
+    |---|---|---|
+    | a pipe with no reader | `EPIPE` | **yes**, before the call returns |
+    | a `SOCK_STREAM` pair whose peer closed | `EPIPE` | **yes**, every call |
+    | `send` on a listener | `EPIPE` | **yes** |
+    | a reset stream's **second** write | `EPIPE` | **yes** (the first is `ECONNRESET`) |
+    | a `SOCK_SEQPACKET` pair whose peer closed | `EPIPE` | **no** |
+    | a connected `SOCK_DGRAM` whose peer closed | `ECONNREFUSED`, once | no |
+    | a socket that never connected | `ENOTCONN` | no |
+
+    The datagram row's second half is the subtle one: the first failing send
+    **forgets the connection**, so the next call is `ENOTCONN`. A seqpacket
+    connection is remembered and answers `EPIPE` again. The handler's record
+    is `SI_USER` (`si_code == 0`). `MSG_NOSIGNAL` keeps the `EPIPE` and
+    suppresses only the signal; a blocked signal is pending while the call
+    returns `EPIPE` and runs on unblocking; `writev`, `splice` and `sendfile`
+    into a broken pipe each raise once; a **partial** write answers its count,
+    and a pipe raises for the break whereas a stream does not (57344 with the
+    handler run against 219264 silent, same race).
+
+    **The landing.** `sched::raise_sigpipe`; raises at `write`/`writev`/
+    `splice`/`sendfile` on `VfsError::BrokenPipe`, at the channel and IP arms
+    of `sendto`/`sendmsg` with `MSG_NOSIGNAL` threaded through, and the
+    seqpacket exemption asked of the socket (`UnixSock::silent_broken_pipe`).
+    `UnixSock::message_peer` answers the datagram's `ECONNREFUSED`-once and
+    forgets the slot; `pair_ends` carries the pipe/stream partial-write split.
+
+    **Pins**: **`t-sigpipe`** (new, default group, both machines), **32
+    claims** - the rows above with their handler counts and `si_code`, the
+    `MSG_NOSIGNAL` pair, the blocked sequence, the three copy calls, and a
+    forked child at `SIG_DFL` that dies of signal 13. Green on a current host
+    first and the same in the guest on both machines. Counterfactual (the
+    primitive a no-op): **10 of 32 red** by name, every one a signal claim;
+    all errno claims stayed green.
+
+    **Gate**: x86_64 198 programs, `pass=198 fail=0`; aarch64 197 staged,
+    `pass=197 fail=0`; `mpos-kunit 32 passed, 0 failed` on both. Reasoning and
+    the measurement tables are §4.1.13.
+
+    **Named**: a TCP reset's first write is `ECONNRESET` on Linux and `EPIPE`
+    here (smoltcp clears the tuple, so the first/second distinction is not
+    kept); the signal follows this kernel's errno. vsock's `EPIPE` is
+    unchanged and its signal half unmeasured - there is no host device to
+    measure against.
+
+## item 98 — a stream's receive buffer is its window, and a listener hands it to the socket it accepts
+
+    Item 58 made `SO_RCVBUF` Linux's *number*; the number governed nothing on a
+    stream. Linux copies the listener's `sk_rcvbuf` onto an accepted socket
+    (`inet_csk_clone_lock`) and sizes the receive window from it, so a caller
+    that tunes a listener is tuning the connection that arrives. This kernel kept
+    the number on the listening socket and built every accepted connection with
+    the default 64 KiB ring.
+
+    **Measured whole on a current host first** (`.workbuddy/probe_tcp_rcvbuf.c`,
+    Linux 7.2.11): a server that never reads, a client whose send buffer is
+    4096, the listener's option set before or after `listen` (the same answer):
+
+    | listener asks | accepted socket reads | unread bytes absorbed |
+    |---|---|---|
+    | 2048 | 4096 | 8192 |
+    | 32768 | 65536 | 47104 |
+    | 262144 | 524288 | 212886 |
+    | (unset) | 131072 | — |
+
+    The stored figure is twice the ask (item 58) and the effective capacity is
+    about half the stored figure; the inheritance is the option's, not the
+    connection's, so `getsockopt` on the accepted socket reports the listener's
+    number.
+
+    **The landing.** `net::tcp_rx_bytes(stored)` = half the stored figure
+    (floored at 1, capped at `TCP_RX_MAX` = 128 KiB); `add_tcp_sized` builds a
+    socket with that receive ring; `Listener::rx_bytes` carries it through the
+    pool and its refills; `set_listener_rx` rebuilds the pool's `Listen`
+    sockets when the option changes after `listen` (a `SynReceived` handshake
+    stays where it is); `settle_tcp` carries it when a socket is relocated to
+    the loopback; and `accept` copies the stored number into the accepted
+    socket's `SockOpts`.
+
+    **The pin found a send bug.** `tcp_send` fell through to its blocking park
+    when `send_slice` queued only *part* of the caller's buffer, even for a
+    `MSG_DONTWAIT` send - it gated only the "queued nothing" case. Against a
+    2048-byte window and a peer that never reads, the test parked forever (gdb
+    on the booted machine: `tcp_send`'s `park_until`, deadline `u64::MAX`,
+    scheduler idle). Linux's `tcp_sendmsg` returns the bytes it copied and
+    answers `EAGAIN` only when none fit; the partial arm now returns `sent` on a
+    non-blocking send. That fix is part of this item's pin even though it is not
+    part of the window: the window would never be observable without it.
+
+    **Pin**: `t-sockbuf` grown to **18 claims** - inheritance before `listen`
+    (ask 2048 → accepted 4096) and after it (32768 → 65536), then three sized
+    listeners pushed until they refuse (asks 2048 / 32768 / 262144) with two
+    relative claims (`large > small * 2`, `beyond > large`). Guest:
+    **18432 / 49152 / 147456**; host: 8192 / 47104 / 286561. Green on the host
+    first and in the guest on both machines. Counterfactual (the ring pinned
+    back to the default, the send fix kept): the two inheritance claims stay
+    green and both effect claims go red, all three capacities collapsing to
+    81920 (64 KiB default ring plus the 16 KiB client queue). The number was
+    already Linux's; the window was not.
+
+    **Gate**: x86_64 198 programs, `pass=198 fail=0`; aarch64 197 staged,
+    `pass=197 fail=0`; `mpos-kunit 32 passed, 0 failed` on both. The production
+    boot reaches `mpos login:` with every OpenRC service `[ ok ]`.
+
+    **Named**: a datagram's receive ring is still fixed (16 KiB), so `SO_RCVBUF`
+    there remains a report (item 58); a connected stream's own
+    `setsockopt(SO_RCVBUF)` changes the number without resizing the live ring
+    (smoltcp's buffers are fixed at construction); a handshake already in
+    `SynReceived` when the option changes keeps the ring it started with; the
+    ring is capped at
+    128 KiB per socket so a sysctl-sized ask cannot make eager mebibytes per
+    socket under §8.0's panicking allocator, while the number still reads back
+    Linux's; and a stream's `SO_SNDBUF` does not size its send ring
+    (`TCP_TX_BYTES` is fixed). Reasoning and tables: `docs/notes/` §4.3.3.
+
+## item 99 — an anonymous descriptor has no file type, and its `/proc` name is its own
+
+    `eventfd`, `timerfd`, `signalfd`, `epoll`, `inotify` and `pidfd` are
+    descriptors, not files: Linux puts them on its `anon_inode` filesystem,
+    where `st_mode` has **no** `S_IF*` bit at all. This kernel reported the
+    first five as `S_IFCHR`, borrowing the wrong one of the two shapes it had
+    (`NodeKind::CharDev`), and named them `anon:[<ino>]` in `/proc/<pid>/fd`
+    because only the pidfd had a spelling of its own.
+
+    **Measured whole on a current host first**
+    (`.workbuddy/probe_anon_fd_stat.c`, `.workbuddy/probe_anon_read0.c`,
+    `.workbuddy/probe_inotify0{,b}.c`, Linux 7.2.11):
+
+    | descriptor | `st_mode` | `/proc/self/fd/<n>` |
+    |---|---|---|
+    | `eventfd` | `000600` | `anon_inode:[eventfd]` |
+    | `timerfd` | `000600` | `anon_inode:[timerfd]` |
+    | `signalfd` | `000600` | `anon_inode:[signalfd]` |
+    | `epoll` | `000600` | `anon_inode:[eventpoll]` |
+    | `inotify` | `000600` | `anon_inode:inotify` (no brackets) |
+    | `pidfd` | `000700` | `anon_inode:[pidfd]` |
+
+    The type bits are zero in every row, and the permission word is not one
+    number for the family - which is why the kind carries it. A zero-length
+    read is the same "what is this" question through the read door, and its
+    order is the queue's first for one member only: `eventfd`, `timerfd`,
+    `signalfd`, `epoll` and `pidfd` answer `EINVAL` before looking at
+    anything; a non-blocking `inotify` answers `EAGAIN` while empty and
+    `EINVAL` once a record is queued (a blocking one waits and then answers
+    `EINVAL`).
+
+    **The landing.** `NodeKind::Anon { mode }` carries the permission word
+    (the type is always zero), and all six inodes now use it - `0600` for the
+    five, `0700` for the pidfd. Each of the five implements `fd_name`, which
+    `File::display_name` already consulted before its `anon:[ino]` fallback.
+    `InotifyInstance::read_at` answers the zero-length case in Linux's order:
+    queued → `EINVAL`, empty and non-blocking → `EAGAIN`, empty and blocking →
+    wait, then `EINVAL`.
+
+    **Pin**: the new `t-anon-fd`, **26 claims** - the three shape answers for
+    each of the six, the seven zero-length-read answers, and a path-opened
+    file's link as the control that an anon name is not simply returned for
+    everything. Green on a current host first, with the same `ok:` text in
+    the guest on both machines. One consequence rides with the kind: `File::read`'s
+    zero-length short-circuit exempts `Anon` (the pidfd already needed that, its
+    read method being absent), so the five now reach their own `read_at` with
+    an empty buffer - which is exactly where their `EINVAL` lives. On the old
+    `CharDev` kind the short-circuit answered `0` for all five.
+
+    **Gate**: x86_64 199 programs, `pass=199 fail=0`; aarch64 198 staged,
+    `pass=198 fail=0`; `mpos-kunit 32 passed, 0 failed` on both.
+
+    **Named**: `st_blksize` stays this kernel's 512 where Linux answers 4096
+    (the global choice, not an anon-inode one), and `st_dev`/`st_ino`/uid/gid
+    are machine-specific and not pinned. A pidfd's `fdinfo`
+    (`Pid:`/`NSpid:`) is still not measured and not promised.

@@ -5,20 +5,18 @@ Part of the split `docs/notes/` evidence library — routing for every `§N.M` p
 
 ## Phase 15: One boot flow — aarch64 to the first machine's level
 
-**Status: 15.1–15.6 landed, all four of 15.6's pins green. 15.1, 15.3, 15.4 and 15.5 and the init
-seam unified - all four check families run on both machines, the reporting/exit-hook/net/cmdline/log-sink
-copies are one each, and 15.2's six device classes have all landed (the input registry §13.24, the
-host-driven console §13.25, the display adapter + framebuffer console §13.26, the sound card §13.27,
-the vsock device §13.28, and the host share §13.29). 15.6, the initramfs flow, is landed:
-`boot-aarch64` full chain + `INIT_EXITED`, `test --arch aarch64` `pass=27 fail=0`,
-`cargo xtask test` `pass=158 fail=0 (158 built)` exit 33, `alpine-aarch64` reaching
-`mpos login:` in 16 s, and `depgraph` within the ratchet. `### 15.6` below records what it cost.
-The last named difference this machine carried from the first - `init_net` +
-`virtio::spawn_service` behind `mpos.selftest` - is also closed, measured the same day.
-Measured 2026-10-07.** *(This header is that day's snapshot; the phase has since landed through
-§15.36. Two of its words are retired facts, not current ones: `boot-aarch64`/`alpine-aarch64`
-are commands §15.7 deleted — the same work is `run`/`rootfs`/`test --arch aarch64` — and the
-`mpos.selftest` boot word is gone with §15.19's test-build change.)*
+**Status (snapshot measured 2026-10-07): 15.1–15.6 landed, all four of 15.6's pins green.** 15.1,
+15.3, 15.4 and 15.5 and the init seam are unified - all four check families run on both machines, and
+the reporting/exit-hook/net/cmdline/log-sink copies are one each - and 15.2's six device classes have
+landed (input registry §13.24, host-driven console §13.25, display adapter + framebuffer console
+§13.26, sound card §13.27, vsock §13.28, host share §13.29). 15.6, the initramfs flow, is landed:
+`boot-aarch64` full chain + `INIT_EXITED`, `test --arch aarch64` `pass=27 fail=0`, `cargo xtask test`
+`pass=158 fail=0 (158 built)` exit 33, `alpine-aarch64` reaching `mpos login:` in 16 s, and
+`depgraph` within the ratchet. The last named difference - `init_net` + `virtio::spawn_service` behind
+`mpos.selftest` - is closed, measured the same day. *(This header is that day's snapshot; the phase
+has since landed through §15.36. Two words are retired facts: `boot-aarch64`/`alpine-aarch64` were
+deleted by §15.7 - the same work is `run`/`rootfs`/`test --arch aarch64` - and the `mpos.selftest`
+boot word is gone with §15.19.)*
 
 Phase 13 closed the *ABI* gap (13.3–13.16) and §13.19/§13.20 closed two of its consequences. What
 is left is the *boot*: the second machine reaches the same userspace surface as the first, but it
@@ -640,8 +638,8 @@ it is the second machine's first run of the family.
 
 ### R.15 (moved from ROADMAP's status board) — the card at exit, the ADDFB2 offset, and what the 3D work still has not measured
 
-**A process hands the card back when it ends, not only when it closes (§15.12).** The DRM master, its console binding, the client-capability set, the authorisations, the sync objects and the framebuffers were released by the `close(2)` hook alone, and `do_exit` never runs it: `Report::finish` is `std::process::exit`, which is `exit_group`, which unwinds nothing, so a description that ended without closing its card left its DRM state behind. Because an `ofd` is the description's *address*, the next description the allocator placed there inherited a claim it never made. Found when five `drm*` programs first shared one boot — `t-drm` broke `t-drm-args`, `t-drm-lease`, then `t-drm-props` — and fixed by registering `drivers::drm::close_at_exit` with `sched::exit` beside locks, the socket and the inotify watch, so the exit path delivers the property `master_closed`'s header already promised.
-
-**`ADDFB2` reads its format modifier at the offset the uapi gives it (§15.13).** The field is at 72, not 68: `offsets[4]` ends at 68 and 68..72 is the padding the `__u64` forces, measured against the installed headers. `add_fb2` read at 68 and `get_fb2` wrote at 68, and the no-std test it was written against spelled its offsets by hand in the same wrong place, so the two agreed with each other and with nothing else. Invisible while the only modifier anyone named was `LINEAR`, which is 0, because the padding reads as 0 too. Pinned by naming a vendor modifier whose low 32 bits are zero (`0x0100_0000_0000_0000`), so the offset — not the value — decides the answer: with the kernel back at 68 the claim fails `got 0, want -22`.
+**A process hands the card back when it ends, not only when it closes (§15.12), and `ADDFB2` reads
+its format modifier at the uapi's offset, 72 rather than 68 (§15.13).** Both are landed and pinned;
+the measurements, counterfactuals and gates are in those two sections and are not repeated here.
 
 **What the 3D/virtgpu landing has *not* measured.** The family is served now, 2D and 3D both: all eleven requests are dispatched, `RESOURCE_CREATE` makes a real device resource across the new mailbox to the render task, the GL card negotiates `VIRGL` and the driver says so in its own words — `virtio-gpu: virgl=1 context_init=1 capsets=2 cached=2 mask=0x6`, every number the deleted `user/staging/virtgpu-probe/` measured on Linux — and `t-virtgpu` pins the lot, its 3D branch included, on the GL machine (`[qemu] gpu` names the card). Both forks §7.4 argued are settled and landed — the GPU driver is this kernel's rather than the crate's, and a submission reaches the device through the render task's mailbox, which the resource path already uses. What blocked `is_software()` was not the 3D queue but the card's identity, and that is built now: measured against a working card's own sysfs reads, the node's `device` link had to lead to the display-class PCI function — carrying `vendor`, `device`, `subsystem_vendor`, `subsystem_device`, `uevent` and the `subsystem` link libdrm resolves first — rather than to a `virtual` directory with no attributes at all. **The renderer itself is still unverified**: the GL-card run that would answer "eglinfo reports a non-software device" has not happened, because the console defect §7.4's update names killed every attempt at it. That is the first thing on this entry, and it is a measurement rather than a build.

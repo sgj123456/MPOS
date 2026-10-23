@@ -1102,14 +1102,28 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             rtq: signal::RtQueue::new(),
             // The mask is inherited, as POSIX says a child's is: a program
             // that blocks a signal and then forks expects the child to start
-            // with it blocked too. The *dispositions* above are deliberately
-            // not inherited (this kernel starts every process at `SIG_DFL`),
-            // but a mask is not a disposition - it is the caller saying "not
-            // now", and a child that un-blocked what its parent held would
-            // take a signal the parent meant to handle itself.
+            // with it blocked too. A mask is not a disposition - it is the
+            // caller saying "not now", and a child that un-blocked what its
+            // parent held would take a signal the parent meant to handle
+            // itself.
             blocked: t.task(parent_id).blocked,
-            dispositions: signal::Actions::default(),
-            alt_stack: None,
+            // The dispositions are inherited too, which is Linux's `copy_sig`
+            // (measured on a current host, `.workbuddy/probe_sig_inherit.c`):
+            // a handler installed before a `fork` runs in the child, and a
+            // `SIG_IGN` stays ignored. `clone3`'s `CLONE_CLEAR_SIGHAND` asks
+            // for the table an `exec` would leave instead - every slot at
+            // `SIG_DFL` - and the handle is the same one an `exec` uses.
+            dispositions: if request.flags & crate::abi::CLONE_CLEAR_SIGHAND != 0 {
+                signal::Actions::default()
+            } else {
+                t.task(parent_id).dispositions
+            },
+            // The alternate signal stack crosses a `fork`/`clone` too: Linux's
+            // child reads the same `ss_sp` and size the parent set, measured
+            // on a current host (`.workbuddy/probe_altstack_fork.c`: both
+            // processes reported the parent's pointer). `exec` is the door
+            // that drops it, not the fork.
+            alt_stack: t.task(parent_id).alt_stack,
             // The descriptors are the parent's *numbering* copied - both
             // processes share the open file descriptions but closing a number
             // on one side must not close it on the other - unless the caller
@@ -1410,10 +1424,14 @@ pub fn exec_replace(
         // answer from. The old `Arc` drops unless a `fork` still holds it.
         task.env = alloc::sync::Arc::new(env.to_vec());
 
-        // Reset signal dispositions to SIG_DFL (POSIX requirement).
-        task.dispositions = signal::Actions::default();
+        // `exec` resets a caught disposition to `SIG_DFL` and leaves an
+        // ignored one alone (POSIX; measured on a current host: a `SIGUSR1`
+        // handler read back `SIG_DFL`, a `SIGUSR2` `SIG_IGN` stayed). The
+        // blocked mask and the pending set cross the image - Linux flushes
+        // neither - so only the handler table's caught slots move. The
+        // alternate stack belongs to the old image and is dropped.
+        task.dispositions.reset_caught();
         task.alt_stack = None;
-        task.signals = 0;
 
         // Close O_CLOEXEC file descriptors.
         {

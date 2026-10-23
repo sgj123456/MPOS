@@ -2,13 +2,12 @@
 
 How to work in this repository. Read this before your first edit. The other docs split the rest:
 `README.md` = what MPOS *is*; `docs/ARCHITECTURE.md` = how it is put together, the module graph and
-where the layering is violated; `docs/ROADMAP.md` = the plan - the phase-by-phase roadmap, the status board, the remaining
-work and what to do next; `docs/notes/` = the evidence behind it (one file per phase plus an index,
-split from the old single `NOTES.md`; a `§N.M` pointer routes through `docs/notes/index.md`) —
-the measured status of every phase,
-the ledger of every gate run and measurement, and the home of any new plan; `docs/uapi/` = the
-userspace-visible surface as one row per promise. This file is only **how to work here**, and points
-at those rather than repeating them.
+where the layering is violated; `docs/ROADMAP.md` = the plan (phase-by-phase roadmap, status board,
+remaining work, what to do next); `docs/notes/` = the evidence behind it (one file per phase plus an
+index split from the old single `NOTES.md`; a `§N.M` pointer routes through `docs/notes/index.md`):
+every phase's measured status, the ledger of every gate run and measurement, and the home of any new
+plan; `docs/uapi/` = the userspace-visible surface as one row per promise. This file is only **how to
+work here**, and points at those rather than repeating them.
 
 ---
 
@@ -16,17 +15,17 @@ at those rather than repeating them.
 
 | Path | What lives there |
 |---|---|
-| `src/` | kernel crate `mpos`: `lib.rs` (host-testable) + `main.rs`, the one architecture-independent entry and panic handler. Over `src/board/` — the boot: one `start` and one flow for every machine (`flow.rs`: console, device step, ramfs, archive, display, wire, stack, pid-1 handoff), the steps with ordering contracts (`steps.rs`) and the banner/canary/park/panic reporting (`report.rs`). The flow carries no architecture; which *transport* carries a device is the probe's question (`src/drivers/virtio/probe.rs`), and the kernel mounts nothing but the ramfs — `/dev`/`/proc`/`/sys`/the root/the share are the initramfs script's (`assets/initramfs/core/init`). Why the flow lives here and not in `mpos-arch`: `docs/ARCHITECTURE.md` §3's downward-only rule. A test build adds `suites.rs` + `kunit.rs` (the one place that lists suites). The full boot narrative and its measurements: `docs/notes/` §15.19–§15.23 |
-| `arch/` | `mpos-arch`, the machine layer: `hal/` (the capability traits, their forwards, and `hal::kernel`'s table of kernel services), `arch/{x86_64,aarch64}/` (the two ports, their linker scripts, and everything that *is* the machine), and `early/` (the same two machines as the *bootloader* sees them — descriptors, wire, jump — the one tree compiled for `-unknown-uefi` rather than `-unknown-none`, `docs/notes/` §14.6). A crate so that the machine layer cannot name the kernel at all (§3); `src/lib.rs` re-exports `{arch, hal}` so the kernel's paths are unchanged. Deliberately not under `crates/` — that directory means "host-testable leaf" and this one cannot be compiled for the host |
+| `src/` | kernel crate `mpos`: `lib.rs` (host-testable) + `main.rs`, the one architecture-independent entry and panic handler, over `src/board/` — the boot: one `start` and one flow for every machine (`flow.rs`: console, device step, ramfs, archive, display, wire, stack, pid-1 handoff), the steps with ordering contracts (`steps.rs`) and the banner/canary/park/panic reporting (`report.rs`). The flow carries no architecture; which *transport* carries a device is the probe's question (`src/drivers/virtio/probe.rs`), and the kernel mounts nothing but the ramfs — `/dev`/`/proc`/`/sys`/the root/the share are the initramfs script's (`assets/initramfs/core/init`). Why here and not `mpos-arch`: `docs/ARCHITECTURE.md` §3's downward-only rule. A test build adds `suites.rs` + `kunit.rs` (the one place that lists suites); the boot narrative and its measurements are `docs/notes/` §15.19–§15.23 |
+| `arch/` | `mpos-arch`, the machine layer: `hal/` (the capability traits, their forwards, `hal::kernel`'s table of kernel services), `arch/{x86_64,aarch64}/` (the two ports, their linker scripts, everything that *is* the machine) and `early/` (the same machines as the *bootloader* sees them — descriptors, wire, jump — the tree compiled for `-unknown-uefi` rather than `-unknown-none`, `docs/notes/` §14.6). A crate so the machine layer cannot name the kernel (§3); `src/lib.rs` re-exports `{arch, hal}` so kernel paths are unchanged. Not under `crates/` — that means "host-testable leaf", and this cannot compile for the host |
 | `crates/` | downward-only leaf crates (§3): `err`/`abi`/`pci`/`date`/`binfmt`/`cred`/`uts`/`seccomp`/`term`/`ahci`/`gpu`/`evdev`/`uinput`/`blk`/`fdt`/`bootinfo`/`vm` |
 | `boot/` | `mpos-boot`, the UEFI loader — its own target (`-unknown-uefi`), no kernel dep, no architecture in it at all (the three machine things it needs are `mpos-arch`'s `early/`). A **library plus a thin `#[entry]` binary**: `src/lib.rs` (`mpos_boot::run`) holds the whole sequence and `src/main.rs` is the firmware entry that calls it, so the kernel can become the second caller (`docs/notes/` §14.7). The handoff record is one definition in the `crates/bootinfo` leaf, read by both machines and both sides of the seam |
 | `xtask/` | `mpos-xtask`, the build/run/test front-end; `xtask/README.md` documents every command |
-| `user/` | `mpos-user` (ordinary `std` programs); `user/tests/` is the whole ABI suite — the `no_std` conformance suite that used to sit beside it in `user/abitest/` finished moving across (§15.11's last batch) and was deleted. Scratch used to live in a wired-into-no-build `user/staging/`; it is deleted too — a measurement's instrument now lives beside the claim it measured (a probe under `.workbuddy/`, a table in the `docs/notes/` row) or in the test itself |
+| `user/` | `mpos-user` (`std` programs); `user/tests/` is the whole ABI suite — the `no_std` suite that sat beside it in `user/abitest/` finished moving across (§15.11's last batch) and was deleted, as was the wired-into-no-build `user/staging/`; a measurement's instrument now lives beside the claim it measured (a probe under `.workbuddy/`, a table in the `docs/notes/` row) or in the test itself |
 | `fuzz/` | `mpos-fuzz`, **its own workspace**: libFuzzer targets over the kernel's parsers |
 | `assets/rootfs/`, `assets/configs/rootfs.toml` | the guest image's contents, for both machines: `rootfs.toml` is one file in three sections (`[default]` is the baseline both read, `[x86_64]`/`[aarch64]` are each machine's own half), and `assets/rootfs/x86_64/` + `assets/rootfs/aarch64/` are the two overlay trees; `assets/rootfs/core/` is the shared half merged before either |
 | `assets/initramfs/`, `assets/configs/initramfs.toml` | the early-userspace tree the kernel unpacks as its first root, and its packages — the **same three-part overlay as the rootfs** (`core/` merged first, carrying the one `/init` both machines run; each machine's own tree over it, empty today), built by the **same pipeline** (`xtask/src/initramfs.rs`) through its toml section |
 | `assets/configs/machine.toml` | what the image is *booted* on — memory, cpus, devices, run mode — in the **same three sections**. Host-side only, so editing it never reinstalls |
-| `assets/configs/tests.toml` | which test programs the sweep runs by default, and its groups — one file in the same three sections (`[default]` is the baseline both machines read, `[x86_64]`/`[aarch64]` are each machine's own half; the only exclusion-shaped group is a machine's `gaps`) |
+| `assets/configs/tests.toml` | which test programs the sweep runs by default, and its groups — one file in the same three sections as every config file, where the only exclusion-shaped group is a machine's `gaps` |
 | `assets/configs/busybox-applets.txt` | the applet paths (`bin/ls`, `sbin/init`, …) one per line, from `busybox --list-full` — the farm `rootfs::lay_applet_farm` links on every build, *before* the overlay; pinned on both machines by `t-busybox-farm`. Why the build lays it: `docs/notes/` §15.34 |
 | `build/`, `target/`, `build-test/` | build output and scratch. Never edit, never commit |
 
@@ -87,17 +86,14 @@ question on both arms now: a program runs when it is in no group or in a group t
 `--groups`/`--all-groups` mean the same thing on either machine, and the only group neither may
 ask for is a machine's own `gaps` — its list of what it cannot serve yet (§15.36).
 
-**`tests.toml` picks which programs run.** All are built; grouped ones are left of the default
-sweep. It is written in the three sections every config file here uses: `[default]` holds the
-groups both machines read — `external` (needs the host network or a listener), `slow`
-(measurement/seconds), `diagnostic` (not a check at all) — and `[x86_64]`/`[aarch64]` hold each
-machine's own half, *added* to the baseline's group of the same name rather than replacing it. The
-one group that is an exclusion rather than a reason is a machine's `gaps`: what that machine cannot
-serve yet, invisible to the other's sweep and refused by name on its own. `--groups <a,b>` replaces
-the file's `default`; `--all-groups` runs every group a machine can see; an undefined group name is
-an error — a sweep that quietly runs fewer tests than asked is the one failure this must not have. A
-new test lands with a group decision; silence is the default. Nothing a test runs can leak into the
-image `cargo xtask run` boots (test artefacts live under `build/`).
+**`tests.toml` picks which programs run.** All are built; grouped ones are left out of the default
+sweep. `[default]` holds the groups both machines read — `external` (needs the host network or a
+listener), `slow` (measurement/seconds), `diagnostic` (not a check at all) — and a machine's own
+section *adds* to the baseline group of the same name rather than replacing it. `--groups <a,b>`
+replaces the file's `default`; `--all-groups` runs every group a machine can see; an undefined group
+name is an error — a sweep that quietly runs fewer tests than asked is the one failure this must not
+have. A new test lands with a group decision; silence is the default. Nothing a test runs can leak
+into the image `cargo xtask run` boots (test artefacts live under `build/`).
 
 **Reporting the gate — never from a stale run.** This file carries **no test counts and no sweep
 composition figures**: a snapshot here goes stale within a commit or two (the last such snapshot —
@@ -218,40 +214,37 @@ and `docs/notes/` when a measurement or a lesson is added — a call moving
 between served / refused / wrong-shape belongs in both.
 
 **Add a user test program.** `std`/`rustix` → `user/tests/src/bin/t-<name>.rs` (flat,
-auto-discovered) — the shape a new test belongs in, because it runs on **both** machines and takes
-its per-claim printing and exit status from the crate's own `Report` (`user/tests/src/lib.rs`)
-instead of a local copy. Use `rustix` first; drop to `libc` only where the crate's rule allows it,
-and read that rule where it is owned — `user/tests/Cargo.toml`'s header states the measured clauses
-(unbound call, wrong wrapper syscall, shape cannot express the claim, plus the bitflags-vs-enum
-distinction and the numbers-from-rustix convention), each with its measurement beside it. The
-`no_std` raw-syscall suite this used to point at finished moving across and was deleted (§15.11's
-last batch), so `user/tests` is the whole ABI suite now. Print `ok:`/`FAIL:` per check and a
-final `PASS`/`FAILED` (`Report::finish` does both). Keep the `t-` name (the test `/init` globs
-`/bin/t-*`). Decide its group in `tests.toml` — under `[default]` it binds both machines, under a
-machine's own section it is that machine's alone, and a name in a machine's `gaps` must be a
-program that machine actually builds (§5's trap).
+auto-discovered), because that shape runs on **both** machines and takes its per-claim printing and
+exit status from the crate's own `Report` (`user/tests/src/lib.rs`) instead of a local copy. Use
+`rustix` first; drop to `libc` only where the crate's rule allows it, and read that rule where it is
+owned — `user/tests/Cargo.toml`'s header states the measured clauses (unbound call, wrong wrapper
+syscall, shape cannot express the claim, plus the bitflags-vs-enum distinction and the
+numbers-from-rustix convention), each with its measurement beside it. Print `ok:`/`FAIL:` per check
+and a final `PASS`/`FAILED` (`Report::finish` does both). Keep the `t-` name (the test `/init`
+globs `/bin/t-*`). Decide its group in `tests.toml` — under `[default]` it binds both machines,
+under a machine's own section it is that machine's alone, and a name in a machine's `gaps` must be
+a program that machine actually builds (§5's trap).
 
 **Add a kernel unit test.** A `#[cfg(test)] mod tests` at the bottom of the file it tests, with the
 parent module compiled for the host (§3). Assert on the contract (value, errno, count), not a log
 line; prefer a test that would fail if the policy differed.
 
-**Add a boot self-test.** Something that can only be checked on a booted machine goes in a suite
-beside the module it tests: `#[cfg(all(target_os = "none", feature = "selftest"))] pub mod kunit;` in
-that module, a `pub const SUITE` naming its phase and its cases, and one line in the wiring layer's
-`SUITES` (`src/board/kunit.rs`) — the only place that lists them. Being a child of the module is the
-point: it reads the module's private state, so no accessor is added to `mm`/`sched`/`vfs` for a
-test's sake. A case **answers** `Result<(), String>` through `case_check!` rather than asserting —
-`panic = "abort"` means an `assert!` would end the machine and hide every case after it — and it
-declares the [`Phase`] it needs (the boot step, not a position), because a suite that runs too early
-asserts against a machine that is not ready. `cargo xtask test` is the only thing that builds them
+**Add a boot self-test.** Something checkable only on a booted machine goes in a suite beside the
+module it tests: `#[cfg(all(target_os = "none", feature = "selftest"))] pub mod kunit;` there, a
+`pub const SUITE` naming its phase and cases, and one line in the wiring layer's `SUITES`
+(`src/board/kunit.rs`) — the only place that lists them. Being a child of the module is the point:
+it reads the module's private state, so no accessor is added to `mm`/`sched`/`vfs` for a test's sake.
+A case **answers** `Result<(), String>` through `case_check!` rather than asserting — `panic =
+"abort"` means an `assert!` would end the machine and hide every case after it — and it declares the
+[`Phase`] it needs (the boot step, not a position), because a suite that runs too early asserts
+against a machine that is not ready. `cargo xtask test` is the only thing that builds them
 (`--features selftest`) and the only thing that asserts the harness's own `mpos-kunit` line
-(`docs/notes/` §15.19 for the mechanism, §15.20 for a suite that already moved).
+(`docs/notes/` §15.19; §15.20 for a suite that already moved).
 
 **Change the guest image.** A file that must exist → the `assets/rootfs/<machine>/` (or `assets/initramfs/<machine>/`) tree (overlays
 apply *after* anything the toml writes). A package → `rootfs.toml`/`initramfs.toml` (under
-`assets/configs/`), under the section
-of the machine it is for: `[default]` where both want it, `[x86_64]`/`[aarch64]` where only one does —
-and a key is dotted by what it belongs to (`rootfs.mirror`, `system.hostname`, `user.name`). An
+`assets/configs/`), under the section of the machine it is for, with a key dotted by what it
+belongs to (`rootfs.mirror`, `system.hostname`, `user.name`). An
 **account a package's own post-install script would make** (dbus's `messagebus`, busybox's `klogd`,
 seatd's `seat`, weston's `weston-launch`) → `SYSTEM_GROUPS`/`SYSTEM_USERS` in `xtask/src/rootfs.rs`:
 a cross-arch install runs `apk --no-scripts`, so the build writes those lines itself, and the names,
@@ -260,8 +253,8 @@ mpos-xtask` pins the shape, `seat`'s id included - the configured account joins 
 image that never made it gets a second one at a regular id). Partition /
 fs-type / image-size / hostname / DNS → `rootfs.toml`. Anything about the *machine* (memory, cpus,
 `vsock`, `audio`, window backend, run mode, extra QEMU args) → `machine.toml`, **never**
-`rootfs.toml` — `rootfs.toml`'s *shape* keys (mirror, branch, repos, filesystem, disk geometry)
-decide whether the Alpine tree is laid fresh; its package lists alone install and remove only the
+`rootfs.toml`: its *shape* keys (mirror, branch, repos, filesystem, disk geometry) decide whether
+the Alpine tree is laid fresh, while its package lists alone install and remove only the
 difference. A machine key there would still charge the image for a memory size either way, which is
 why the split stands (`xtask/src/config.rs`'s `the_machine_and_the_image_keep_their_own_keys` fails
 if one drifts back). Boot wiring
@@ -301,9 +294,9 @@ definition the loader and both kernels read now (§13.23) — and the loader's
 | `cargo xtask test` stage 1 goes red in `rand` and nowhere else | A **flake** — re-run before believing it and quote the green run. Measurement, mechanism and fix directions: `docs/notes/` §12.4a |
 | Stage 2 goes red on `t-clock-gettime`'s "two reads never go backwards" | A **flake** of the same kind, in the wall clock rather than in a service — two successive `CLOCK_REALTIME` reads can step back. Re-run before believing it; the mechanism and measurement: `docs/notes/` §13.27 |
 | A recorded measurement is about the machine that made it | A number already written down is not a measurement of *this* question. The tell is a claim that made a refusal permanent without saying which register, program or run — re-measure before building on it (§13.15) |
-| A driver holds the transport *inside* its device struct | The crate's `Transport` is **not object-safe** (`begin_init<F: Flags>` is a generic method and `VirtQueue::new`/`add_notify_wait_pop` take `&mut impl Transport`), so `Box<dyn Transport>` does not exist and such a device cannot be one concrete `static`-held type shared by two machines. Two shapes work, and the error count does not tell them apart: open the device inside the driver module and hand the rest only a contract (`NetDevice`, `ConsolePort`, `InputDevice`), or make the device generic and let its *consumer* hold a `Box<dyn YourDevice>` (`Gpu`/`GpuDevice`, §13.26 — 3 errors either way). |
-| A machine declares a capability and still has no device behind it | A capability flag makes a port cheap to complete **only if everything behind it is gated on the capability and not on the architecture** — an `#[cfg(target_arch)]` module gate hiding behind the flag multiplied the error cost (§13.23, re-measured as §13.24's lesson that a stale figure sits in the plan). The other half: opening a device, proving the transport and dropping it is a milestone, not a driver (§13.24) |
-| A check on an aarch64 device runs in front of the machine's own `init` | The device checks (`check_blk`, `check_fs`, …) run on **every** aarch64 boot, a session included, and they halt the machine when they fail (§13.14: a wall-clock check left the year 36812 and killed `syslogd`). So a check may assert only what the **kernel itself** produces from the devices the machine was configured with — never a file or a byte pattern the build packed, or an image that is merely missing one becomes a machine that cannot boot at all (`docs/notes/` §15.34). Two consequences that bite: the boot context has **no task identity** (`sched::current_owner()` panics — `there is no task 63`), so a check cannot create a file or take a lock that names an owner; and a check that does change shared state must put it back |
+| A driver holds the transport *inside* its device struct | The crate's `Transport` is **not object-safe** (`begin_init<F: Flags>` is generic; `VirtQueue::new`/`add_notify_wait_pop` take `&mut impl Transport`), so `Box<dyn Transport>` cannot exist and such a device cannot be one `static`-held type shared by two machines. Two shapes work, and the error count does not tell them apart: open the device inside the driver module and hand the rest only a contract (`NetDevice`, `ConsolePort`, `InputDevice`), or make the device generic and let its *consumer* hold a `Box<dyn YourDevice>` (`Gpu`/`GpuDevice`, §13.26 — 3 errors either way). |
+| A machine declares a capability and still has no device behind it | A capability flag makes a port cheap **only if everything behind it is gated on the capability, not the architecture** — an `#[cfg(target_arch)]` module gate hiding behind the flag multiplied the error cost (§13.23, re-measured as §13.24's lesson that a stale figure sits in the plan). And opening a device, proving the transport and dropping it is a milestone, not a driver (§13.24) |
+| A check on an aarch64 device runs in front of the machine's own `init` | The device checks (`check_blk`, `check_fs`, …) run on **every** aarch64 boot, a session included, and halt the machine on failure (§13.14: a wall-clock check left the year 36812 and killed `syslogd`). A check may assert only what the **kernel itself** produces from the configured devices — never a file or byte pattern the build packed, or an image merely missing one becomes a machine that cannot boot (`docs/notes/` §15.34). Two consequences bite: the boot context has **no task identity** (`sched::current_owner()` panics — `there is no task 63`), so it cannot create a file or take a lock naming an owner; and a check that does change shared state must put it back |
 | A `static` with a zero initializer and no writer lands in `.rodata` | Read-only, on a machine whose page tables enforce it — and it bites whatever intended to write it (stage 1d's arena, stage 2's task stack). The fix is frames from the allocator, not a section attribute; `-zmax-page-size` will not save you (`docs/notes/` §9.1 row 1d) |
 | An assembly block that switches section switches it for every later block | Every `global_asm!` in a crate is one assembly unit, so an unrestored section change moves everything assembled after it — the symptom is a faulting fetch on a prologue that reads as "code in `.rodata`". The three defences and the measurement: `docs/notes/` §13.16 |
 | An aarch64 exception entry that can switch tasks does not save `ELR_EL1`/`SPSR_EL1` | AArch64 keeps the interrupted `PC`/`PSTATE` in those registers (one pair per core, plus `SP_EL0` for an EL0 trap), not on the interrupted stack — and the IRQ stub preempts by construction, so any other task's trap overwrites them. Both stubs must save their resume state on their own stack; forgetting reads as the kernel resuming into another context's `PC`. The measurement: `docs/notes/` §13.21/§13.22 |
@@ -311,10 +304,10 @@ definition the loader and both kernels read now (§13.23) — and the loader's
 | `fuzz/` won't build from the root | It is its own workspace; run `cargo fuzz` from inside `fuzz/` |
 | A `net/*` host test never runs | `src/lib.rs` gates the whole `net` module on `target_os = "none"`; a host test inside it is unreachable |
 | Two `cargo xtask test` runs in one tree report nonsense | They share `build/test-*` artefacts and one reads a log the other is writing. Trust the log's own summary + `=== END`, re-run alone |
-| The two sweeps do not build the same programs | They do now — §15.11's last batch finished the migration and deleted `user/abitest`, so both arms build the same std suite — but the counts moved repeatedly on the way, so read them off a run, never from here. "Every name `tests.toml` declares must be a program this arm built" is still two questions: the first machine's sweep asks it of the whole file, the second asks it of its own `gaps`. A `[default]` group's reason is the same on both machines, so a name in one is a program both arms build — the narrower question is not wrong, only smaller (`xtask/src/sweep.rs`'s `select` records why) |
+| The two sweeps do not build the same programs | They do now — §15.11's last batch finished the migration and deleted `user/abitest`, so both arms build the same std suite — but the counts moved repeatedly, so read them off a run, never from here. "Every name `tests.toml` declares must be a program this arm built" is still two questions: the first machine's sweep asks it of the whole file, the second of its own `gaps`. A `[default]` group's reason is the same on both machines, so a name in one is a program both arms build — the narrower question is not wrong, only smaller (`xtask/src/sweep.rs`'s `select` records why) |
 | The test machine ≠ the run machine | `xtask test` boots an initramfs on its own QEMU wiring; `xtask run` boots the disk image on `machine.toml`'s. A device only one has is a shape no test sees — name a driver's "controller with nothing on it" behaviour on the machine that has one before calling it measured (§7.3's 28 s empty-controller boot) |
 | A device class needs a *host* backend, not just a QEMU device | vsock is the one virtio device QEMU does not emulate in userspace — `vhost-vsock-*` is a host kernel module, so a machine naming it without `/dev/vhost-vsock` refuses to start. Attach only where the host can back it (`qemu::virt_machine_args` asks), and print the absence rather than dying of it. Give each guest a distinct CID (the two machines take `3` and `4`): a second guest claiming a live CID aborts QEMU before the guest starts (§13.28) |
-| A driver compiles, is host-tested, and **nothing calls it** | The shape that hid the 9p share for months: `fs9p::init_global` filled the registry every mount reads and was called from nowhere, while every boot printed "no share on the bus". A complete driver plus green host tests is exactly what hides it — they pin the parser, not the wiring. The tell is a boot log line that never changes: grep for the line the device should print and check whether any commit ever changed it (§13.29) |
+| A driver compiles, is host-tested, and **nothing calls it** | The shape that hid the 9p share for months: `fs9p::init_global` filled the registry every mount reads and was called from nowhere, while every boot printed "no share on the bus". A complete driver plus green host tests is what hides it — they pin the parser, not the wiring. The tell is a boot log line that never changes: grep for it and check whether any commit changed it (§13.29) |
 | A wire client that has never run against a real server | The 9p client implemented plain 9P2000, which this host's QEMU 11 answers `"unknown"` to — its hand-built fixtures could not know. A protocol client's own fixtures are not a measurement of the server it talks to: ask the real one, and fix toward the dialect it serves rather than a negotiation loop that hides which one you got (§13.29) |
 
 ---

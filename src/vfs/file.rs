@@ -371,7 +371,7 @@ impl File {
         // file is 0 (`.workbuddy/probe_zero.c`). Answering 0 here would tell a
         // caller its zero-length read was fine on a descriptor that cannot
         // read one byte.
-        if buf.is_empty() && self.inode.metadata().kind != NodeKind::Anon {
+        if buf.is_empty() && !matches!(self.inode.metadata().kind, NodeKind::Anon { .. }) {
             return Ok(0);
         }
         let pos = self.pos.load(Ordering::Relaxed);

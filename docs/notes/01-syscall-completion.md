@@ -38,6 +38,23 @@ writer's exit parked the device manager until its own timeout expired.
 `t-epoll` pins the shape in the guest and `vfs/pipe`'s tests pin the answers
 on both ends of a pipe and of a socketpair.
 
+**The reported word is `revents & interest`, and setting `EPOLLRDNORM` beside
+every `EPOLLIN` was a bug that stalled the desktop.** `report()` used to OR
+`EPOLLRDNORM` into any readable report and `EPOLLWRNORM` into any writable
+one, so a caller that asked for `EPOLLIN` was handed `0x41`.
+`weston-desktop-shell` registers its timerfd for `EPOLLIN` alone and refuses
+to dispatch a report carrying anything else — it printed
+`unexpected timerfd events 41` (the value is hex), returned without reading
+the timer, and never finished starting up, which is the "desktop sometimes
+never comes up" symptom this repo had been working around. Linux answers
+`revents & interest` from the file's own poll mask, so the bit a caller named
+is the bit it gets; the two spellings still arm the same report. Fixed in
+`report()`, pinned by a timerfd case in `t-epoll` (`EPOLLIN` asked →
+`EPOLLIN` back, no `EPOLLRDNORM`; `EPOLLRDNORM` asked → that bit) and by the
+three host tests in `vfs::epoll::tests` whose expectations were themselves the
+bug (they asserted `65`). Measured: with the fix the shell's message is gone
+from weston's log on the same boot sequence that produced it twice before.
+
 ### 1.2 timerfd (High) — implemented in `src/vfs/timerfd.rs`
 
 | Syscall | Nr | Status |

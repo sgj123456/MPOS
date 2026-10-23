@@ -385,6 +385,16 @@ flake, not the change: re-run before believing it, and quote the run that was gr
 when someone takes it, is either serialising the suite or making the generator a value with the
 global as one instance.
 
+**A sweep red that a re-run cleared — `t-exit-group` (aarch64, one run).** The aarch64 gate on
+2026-10-21 came back `pass=196 fail=1`: scenario E's "a sibling's forked child was started under
+the group" and its follow-up were the only red claims, and an immediate re-run of the same tree
+was `pass=197 fail=0` with the same `mpos-kunit 32/0`. The fixture's own budget is the mechanism
+the evidence points at: it waits for the group leader with `WNOHANG` in 400 rounds of 5 ms (2 s),
+and the claim needs both the forked child's pid through a pipe and that reap inside it - under
+the aarch64 sweep's six lanes on this host, one missed budget fails both claims together. One
+occurrence is not a diagnosis; recorded so the next red there is recognised rather than
+re-investigated, and the rule stands: re-run before believing it, quote the green run.
+
 ### 12.4b The machine's own tools, and the inode flag word — **DONE, gate green `pass=139 fail=0`**
 
 Reported from the shell of the running image, four commands that could not run:

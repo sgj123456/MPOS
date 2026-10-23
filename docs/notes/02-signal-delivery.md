@@ -25,12 +25,10 @@ measurements and the landing are §15.91 (`docs/uapi/` §5.1 item 75).
 
 `build_frame` writes a `rt_sigframe` (restorer, `sigcontext`, `siginfo_t`,
 saved mask), points the return at the handler and its three arguments, and
-honours `SA_ONSTACK`, `SA_RESTORER` and `SA_RESETHAND`. The frame's *bytes*
-are the machine's since §13.2's Stage 2: `hal::SignalFrame`'s `enter`/`exit`
-lay out and read back the x86_64 `rt_sigframe`/`sigcontext` in
-`src/arch/x86_64/signal.rs`, and `proc.rs` keeps only the policy (which
-stack, which mask, which restorer) plus the two scheduler calls the machine
-cannot make. `deliver_signal` runs on every syscall return
+honours `SA_ONSTACK`, `SA_RESTORER` and `SA_RESETHAND`. `proc.rs` keeps only the
+policy (which stack, which mask, which restorer) plus the two scheduler calls the
+machine cannot make; `hal::SignalFrame`'s `enter`/`exit` lay out and read back the
+frame in each machine's `signal.rs`. `deliver_signal` runs on every syscall return
 (`src/syscall/mod.rs`) and, for `SIG_DFL`, consults the `default_action`
 table (terminate / stop / continue / ignore). `handle_rt_sigreturn` restores
 the whole register file and the blocked mask.
@@ -107,12 +105,8 @@ timer with `SIG_IGN` does *not* interrupt it) and
 `t-tty-vtime.rs` (the `VMIN`/`VTIME` table, timing included).
 
 The rest of the family is pinned the same way, one program per half of the
-rule: `t-sa-restart.rs` (the rewind, its counterfactual, and the calls Linux
-never restarts — `poll` and `nanosleep` among them), `t-tty-nonblock.rs` (the
-`O_NONBLOCK` table, and which end of a pty pair each bit belongs to), and
-`t-wait-eintr.rs` (every other wait, each checked twice: the signal ends it with
-the handler having run, and the same call then answers normally when the thing
-it waited for arrives).
+rule: `t-sa-restart.rs`, `t-tty-nonblock.rs` and `t-wait-eintr.rs`, each
+described below.
 
 ### 2.5 Interruptible waits, and `VMIN`/`VTIME` — implemented
 
@@ -165,19 +159,16 @@ by `LineDiscipline::read_wait`'s host tests):
 | canonical | `0`/`5` | nothing, then `^D` | 0 bytes at the instant of the `^D`; the next read blocks again |
 | raw + `O_NONBLOCK` | `0`/`5` | nothing | `-1/EAGAIN` at 0 ms — `O_NONBLOCK` outranks the clock |
 
-Three consequences the previous code got wrong, all of them the same freeze:
-
-- readiness was `out.len() >= VMIN.max(1)`, with the comment that `VMIN == 0`
-  would "make every read return nothing at all, which reads as end-of-file".
-  `VMIN == 0` is not an EOF: it is the poll, and the answer is 0 bytes without
-  waiting. busybox `vi` and `vim` set `VMIN=0/VTIME=1` to tell a lone `ESC`
-  from the start of an escape sequence, so pressing escape wedged them with the
-  terminal still open.
-- `VTIME` was read by nothing anywhere in the kernel, so no read could ever
-  answer a timeout.
-- the wait was `block_until`, which wakes for a signal and then goes back to
-  sleep. `vim`'s timeouts are `SIGALRM`, and a resize is `SIGWINCH`; both
-  arrived, were seen, and were thrown away.
+The previous code got all three of these wrong. Readiness was
+`out.len() >= VMIN.max(1)` — with the comment that `VMIN == 0` would "make every
+read return nothing at all, which reads as end-of-file" — but `VMIN == 0` is not
+an EOF: it is the poll, and the answer is 0 bytes without waiting. busybox `vi`
+and `vim` set `VMIN=0/VTIME=1` to tell a lone `ESC` from the start of an escape
+sequence, so pressing escape wedged them with the terminal still open. `VTIME` was
+read by nothing anywhere in the kernel, so no read could ever answer a timeout.
+And the wait was `block_until`, which woke for a signal and went back to sleep:
+`vim`'s timeouts are `SIGALRM` and a resize is `SIGWINCH`, and both arrived, were
+seen, and were thrown away.
 
 Named gaps this leaves, and the three that have since closed:
 
@@ -389,3 +380,87 @@ through `send_signal_group_info`, which applies the rule per member.
 
 ---
 
+### 2.7 A child inherits its parent's dispositions — **LANDED** (2026-10-21)
+
+Every process here used to start at `SIG_DFL`: `fork`/`clone` built the child's
+`Actions` from `default()` whatever the parent held. POSIX and Linux copy the
+table. The divergence was visible the day `clone3` landed (§6.10): its
+`CLONE_CLEAR_SIGHAND` could not be served because the flagged and unflagged
+child were identical, and the item named the inheritance as the prerequisite.
+
+**Measured whole on a current host first** (`.workbuddy/probe_sig_inherit.c`
+and `.workbuddy/probe_altstack_fork.c`, Linux 7.2.11):
+
+| The door | Linux 7.2.11 |
+|---|---|
+| a `fork` child | the parent's handler, its `SIG_IGN`, the blocked mask **and the alternate stack** (`ss_sp` and size unchanged) |
+| after an `exec` | a caught handler becomes `SIG_DFL`; `SIG_IGN` stays; the blocked mask crosses; a **pending blocked signal stays pending**; the old alternate stack is gone |
+| `clone3` without the flag | the parent's handler runs in the child |
+| `clone3` with `CLONE_CLEAR_SIGHAND` | the child reads `SIG_DFL` |
+| `CLONE_CLEAR_SIGHAND` beside `CLONE_SIGHAND` | `EINVAL`, with `CLONE_VM` or without - and so beside `CLONE_THREAD`, whose chain requires `CLONE_SIGHAND` |
+| a thread's `rt_sigaction` | the process's table (shared) |
+
+**The landing.** The fork/clone child copies `parent.dispositions` unless
+`CLONE_CLEAR_SIGHAND` asks for the `exec`-shaped table; the alternate stack is
+copied with the rest. `clone3_verdict` serves the flag and refuses the
+`CLONE_SIGHAND` pair. `exec` resets only the caught slots
+(`Actions::reset_caught`) and no longer flushes the pending set, while still
+dropping the alternate stack.
+
+**Pins.** `t-signal-inherit` (new, default group, both machines), **12
+claims**: the fork child's handler/ignore/mask/alt-stack, and a real `execve`
+of the test's own image reporting DFL/IGN/mask/pending through a pipe.
+`t-clone3` **37 → 40 claims**: a plain child's handler, the flagged child's
+`SIG_DFL`, and the two `EINVAL` pairs. `t-signal-frame`'s fatal-fault child now
+restores `SIG_DFL` itself: after the frame checks installed a `SIGSEGV` handler
+the child inherited it, ran it, and exited 0 - Linux's fork rule, which the
+first gate run of this change measured as `pass=196 fail=1` with exactly that
+claim red (`status 0x0`).
+
+**Counterfactual** (the fork fields put back to `default()`/`None` and the exec
+reset back to "all default, pending cleared"), every pin kept: a guest
+single-test run of `t-signal-inherit` is **4 of 12 red** - the fork
+inheritance, "an ignored signal stays ignored", "a pending blocked signal is
+still pending", and the whole after-exec word. The DFL and mask claims stay
+green, which is what makes the four the change's own.
+
+**The stack this found.** With the inheritance in place the aarch64 release
+sweep crashed at the first user `fork`: `spawn_copy`'s frame disassembled to
+~13.8 KiB of a 16 KiB release stack, and the fork path's callees no longer fit.
+The isolation was measured, not guessed: with only the fork fields reverted the
+machine booted; with only the 16-byte alternate-stack copy in place it crashed
+two ways on two boots (a frame free of `0xe000`, then a branch to address 0).
+The release stack is **32 KiB** now (`STACK_ORDER` 3; the debug figure stays
+64 KiB), and `src/sched/runtime/mod.rs` carries the frame measurement. The
+aarch64 gate then passed 196/196.
+
+**Gate**: x86_64 stage 1 1074 tests / 0 failed, stage 2 `pass=197 fail=0`
+(197 built, 6 lanes), `mpos-kunit 32 passed, 0 failed`, exit 0; aarch64 196
+staged, `pass=196 fail=0`, `mpos-kunit 32 passed, 0 failed`, exit 0.
+
+**Named**: a thread's table is still a copy, not Linux's shared
+`CLONE_SIGHAND` table (the thread path says why: nothing in this system's
+userland installs a handler from a thread yet); the kernel-spawned program
+path (`load.rs`, init and the boot's services) still starts at `SIG_DFL`,
+which is what those programs want but is not a user `exec` and is not claimed
+as one; and the post-exec alternate-stack state is not pinned in the Rust pin
+because the hosted runtime installs one of its own at startup - the C probe
+measures the reset and the kernel resets it in `exec`.
+
+
+### 2.8 The kernel itself generates `SIGPIPE` — **LANDED** (2026-10-21)
+
+Every signal this file has described so far was sent by a *task* (`kill`,
+`sigqueue`, a terminal's line discipline). `SIGPIPE` is the one the kernel
+generates from inside a syscall, and the difference is observable: Linux raises
+it during the `write`, so the handler runs on the way out of that same call and
+sees the interrupted `write`'s `EPIPE` in its `ucontext` - measured, and the
+one primitive is `sched::raise_sigpipe` (the same `send_signal` a `kill` uses,
+so the record is `SI_USER`).
+
+Which doors raise it, which answer `EPIPE` silently, and the partial-write
+split are the networking surface's rules; the measurements and the landing are
+§4.1.13 (item 97), and the pin is `t-sigpipe`'s 32 claims. This section records
+only the signal-side fact: **generation is per-syscall, delivery is still the
+syscall-exit path**, and a blocked `SIGPIPE` therefore waits pending while its
+`write` returns `EPIPE` - both pinned.

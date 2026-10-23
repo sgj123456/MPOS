@@ -125,9 +125,15 @@ impl Inode for SignalFd {
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0x6000_0000 + self.ino,
-            kind: NodeKind::CharDev,
+            kind: NodeKind::Anon { mode: 0o600 },
             size: 0,
         }
+    }
+
+    /// Linux's name for the descriptor in `/proc/<pid>/fd` (measured,
+    /// `.workbuddy/probe_anon_fd_stat.c`).
+    fn fd_name(&self) -> Option<alloc::string::String> {
+        Some(alloc::string::String::from("anon_inode:[signalfd]"))
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {

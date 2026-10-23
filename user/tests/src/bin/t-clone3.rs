@@ -34,6 +34,13 @@
 //!   one is *ignored* rather than refused (`put_user`'s result is dropped) - and
 //!   the one bit this door rejects is **`CLONE_DETACHED`**, which `clone(2)`
 //!   still accepts as a historical no-op.
+//! * **the child's signal table is the parent's, and `CLONE_CLEAR_SIGHAND`
+//!   asks for `SIG_DFL` instead**: a `SIGUSR1` handler installed before the
+//!   call is visible in a plain child and gone in the flagged one (measured on
+//!   a current host, `.workbuddy/probe_sig_inherit.c`). The bit is `EINVAL`
+//!   beside `CLONE_SIGHAND` - clearing and sharing one table are opposite
+//!   requests - which also refuses it beside `CLONE_THREAD`, whose dependency
+//!   chain requires `CLONE_SIGHAND`.
 //! * **`CLONE_PIDFD` requires its field and excludes the tid write**: `pidfd =
 //!   0` is `EFAULT`, and the bit beside `CLONE_PARENT_SETTID` is `EINVAL`.
 //! * **`CLONE_INTO_CGROUP` is `EBADF`**, which is Linux's own answer for a
@@ -42,15 +49,10 @@
 //!
 //! # What is named rather than claimed
 //!
-//! Three answers are this kernel's and *not* a current Linux's, so each accepts
+//! Two answers are this kernel's and *not* a current Linux's, so each accepts
 //! Linux's own answer only in a host run (`mpos_user_tests::host_run`) and pins
 //! this kernel's in the gate:
 //!
-//! * **`CLONE_CLEAR_SIGHAND` is `EOPNOTSUPP`.** Linux serves it - the child
-//!   starts with every disposition at `SIG_DFL` - but a `fork` here already
-//!   starts every child there whatever the flags said, so accepting the bit
-//!   could not be told from ignoring it. Refusing by name is the honest half
-//!   until the inheritance is Linux's (`docs/notes/` §6.10).
 //! * **`CLONE_NEWTIME` (`0x80`) is `EOPNOTSUPP`.** `clone3` is the first door
 //!   that can *spell* the bit (through `clone(2)` it sits inside the exit-signal
 //!   byte), and this kernel has no clock namespace to hand a child through this
@@ -185,6 +187,10 @@ fn reap(pid: isize) -> Option<i32> {
         _ => None,
     }
 }
+
+/// The disposition the `CLONE_CLEAR_SIGHAND` pair installs: any address above
+/// `SIG_IGN` (1) is a handler, which is all the child's comparison needs.
+extern "C" fn disposition_handler(_: libc::c_int) {}
 
 /// What the synthetic-stack child runs, on the stack the kernel handed it.
 extern "C" fn child_entry() -> ! {
@@ -505,16 +511,74 @@ fn main() {
                 libc::EBADF,
             ),
         );
-        let clear = unsafe { probe(&word(CLONE_CLEAR_SIGHAND), VER2) };
-        let clear_ok = if mpos_user_tests::host_run() {
-            clear > 0
-        } else {
-            refused(clear, libc::EOPNOTSUPP)
+        // Both sides of the flag, each child answering with its own view of
+        // `SIGUSR1`. A fork-shaped call (no stack) returns in this function,
+        // so the child can ask its table before it leaves.
+        unsafe {
+            libc::signal(
+                libc::SIGUSR1,
+                disposition_handler as *const () as libc::sighandler_t,
+            )
         };
-        if mpos_user_tests::host_run() {
-            reap(clear);
-        }
-        r.check("CLONE_CLEAR_SIGHAND is a named refusal here", clear_ok);
+        let child_sees = |flags: usize| -> isize {
+            let args = word(flags);
+            let ret = unsafe { clone3_raw(&args, VER2) };
+            if ret == 0 {
+                let mut old: libc::sigaction = unsafe { core::mem::zeroed() };
+                unsafe { libc::sigaction(libc::SIGUSR1, core::ptr::null(), &mut old) };
+                // 1: the table is `SIG_DFL`; 2: the caller's handler survived.
+                leave(if old.sa_sigaction == libc::SIG_DFL {
+                    1
+                } else {
+                    2
+                });
+            }
+            ret
+        };
+        let plain = child_sees(0);
+        r.check(
+            "a plain clone3 child inherits the parent's handler",
+            plain > 0 && reap(plain) == Some(2),
+        );
+        let cleared = child_sees(CLONE_CLEAR_SIGHAND);
+        r.check(
+            "CLONE_CLEAR_SIGHAND starts a child with SIG_DFL instead",
+            cleared > 0 && reap(cleared) == Some(1),
+        );
+        r.check(
+            "CLONE_CLEAR_SIGHAND beside CLONE_SIGHAND is EINVAL",
+            refused(
+                unsafe {
+                    probe(
+                        &word(
+                            CLONE_CLEAR_SIGHAND
+                                | libc::CLONE_SIGHAND as usize
+                                | libc::CLONE_VM as usize,
+                        ),
+                        VER2,
+                    )
+                },
+                libc::EINVAL,
+            ),
+        );
+        r.check(
+            "and beside CLONE_THREAD's chain is EINVAL too",
+            refused(
+                unsafe {
+                    probe(
+                        &word(
+                            CLONE_CLEAR_SIGHAND
+                                | libc::CLONE_SIGHAND as usize
+                                | libc::CLONE_VM as usize
+                                | libc::CLONE_THREAD as usize,
+                        ),
+                        VER2,
+                    )
+                },
+                libc::EINVAL,
+            ),
+        );
+        unsafe { libc::signal(libc::SIGUSR1, libc::SIG_DFL) };
     }
 
     {

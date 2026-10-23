@@ -396,15 +396,38 @@ impl Inode for InotifyInstance {
     fn metadata(&self) -> Metadata {
         Metadata {
             ino: 0x9000_0000 + self.ino,
-            kind: NodeKind::CharDev,
+            kind: NodeKind::Anon { mode: 0o600 },
             size: 0,
         }
+    }
+
+    /// Linux's name for the descriptor in `/proc/<pid>/fd` (measured,
+    /// `.workbuddy/probe_anon_fd_stat.c`). Unlike the rest of the family this
+    /// one has **no** brackets around its name.
+    fn fd_name(&self) -> Option<alloc::string::String> {
+        Some(alloc::string::String::from("anon_inode:inotify"))
     }
 
     /// The read: whole records, oldest first. Fewer bytes than one header
     /// is `EINVAL`, the man page's refusal; nothing queued is a park, or
     /// `EAGAIN` when nonblocking.
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
+        // A zero-length read is the queue's question first and the count's
+        // second, which is the order Linux answers it in (measured,
+        // `.workbuddy/probe_inotify0*.c`): with nothing queued a non-blocking
+        // call is `EAGAIN` and a blocking one waits; with a record queued the
+        // zero count is `EINVAL`. The header check below is the same refusal
+        // for a small non-zero buffer.
+        if buf.is_empty() {
+            if self.pending() {
+                return Err(VfsError::Invalid);
+            }
+            if self.nonblocking() {
+                return Err(VfsError::Again);
+            }
+            self.wait_for_news()?;
+            return Err(VfsError::Invalid);
+        }
         if buf.len() < EVENT_HEADER_SIZE {
             return Err(VfsError::Invalid);
         }

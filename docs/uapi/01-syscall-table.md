@@ -1,28 +1,26 @@
 # UAPI §1
 
-Part of the split `docs/uapi/` inventory — index and reading rules in [index.md](index.md).
-Section numbers are unchanged from the original `UAPI.md`.
+Part of the split `docs/uapi/` inventory — index and reading rules in [index.md](index.md);
+section numbers are unchanged from the original `UAPI.md`.
 
 ## 1. The syscall table
 
 `src/syscall/linux/nr.rs` selects the machine's table — `nr_x86_64.rs` names **256** x86_64
 syscall numbers, `nr_aarch64.rs` the same **256** names under aarch64's numbers (the two tables
 are one name set; only the words differ). The dispatch in `src/syscall/linux/mod.rs` has an
-explicit arm for **255** of them plus a `_ => ENOSYS` catch-all for the rest. That catch-all is
-deliberately crowded and is an honest answer (`AGENTS.md` §3.2): a libc probes optional calls by
-number and reads `ENOSYS` as "not available here".
+explicit arm for **255** of them plus a `_ => ENOSYS` catch-all for the rest, deliberately
+crowded and honest (`AGENTS.md` §3.2): a libc probes optional calls by number and reads `ENOSYS`
+as "not available here".
 
 ### 1.0 Every served call, one row each
 
-The full inventory of what the dispatch answers, so that the review question can be asked of the
-whole surface at once. **Owner** is the handler module inside `src/syscall/linux/` (`fs` =
-`fs/file.rs` + `fs/ioctl.rs`, `net` = the socket family forwarded to `src/net`, `kernel` = a
-direct answer in the dispatch itself); **Nr x86** / **Nr arm** are the two machines' numbers from
-the `nr_*` tables. A row's *behaviour* claim lives where it was measured: the per-family
-implementation record is `docs/notes/` (§1–§12), the refusals are §1.1 below, the named sub-gaps
-are §1.2, and each call's verdict-bearing detail — errnos, flag vocabularies, layouts — is in
-[this library's other files](index.md) (§2 ioctls, §3 flags, §4 layouts). A call not listed there
-is served as its phase section records it.
+The full inventory of the dispatch, so the review question can be asked of the whole surface.
+**Owner** is the handler module inside `src/syscall/linux/` (`fs` = `fs/file.rs` + `fs/ioctl.rs`,
+`net` = the socket family forwarded to `src/net`, `kernel` = a direct answer in the dispatch);
+**Nr x86** / **Nr arm** are the two machines' numbers from the `nr_*` tables. Behaviour claims
+live where measured: `docs/notes/` (§1–§12) for the per-family record, §1.1 for refusals, §1.2
+for sub-gaps, and [this library's other files](index.md) for errnos, flags and layouts (§2/§3/§4).
+A call absent from those is served as its phase section records.
 
 | Syscall | Nr x86 | Owner | Nr arm |
 |---|---|---|---|
@@ -310,8 +308,8 @@ whose `cpu_id`/`node_id`/`mm_cid` are maintained across preemption, plus
 
 ### 1.2 Served with a named sub-gap
 
-Not refusals, not wrong answers: the call is real, and one documented corner of Linux's
-contract is not. Each is tracked in its phase section; the list is here so it is countable.
+Not refusals, not wrong answers: the call is real and one documented corner of Linux's contract
+is not. Each is tracked in its phase section; the list is here so it is countable.
 
 | Syscall | Sub-gap | Where |
 |---|---|---|

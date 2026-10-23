@@ -61,19 +61,25 @@ use core::sync::atomic::{AtomicBool, AtomicUsize};
 /// whole program image, hands it to a parser, and builds a new address space
 /// underneath all of that.
 ///
-/// The figure depends on the build, because that path's frame sizes do. A
-/// release image gets Linux's own 16 KiB (`STACK_ORDER` 2), which is what the
-/// 64 ring-3 programs in the image are booted and measured against. A debug
-/// image keeps 64 KiB: unoptimised frames are several times larger, and 16 KiB
-/// was measured to be too few for `execve` there. The symptom of getting it
-/// wrong is the worst kind - the overflow eats the fault handler's own frame,
-/// so the machine triple-faults with nothing said - which is why the two
-/// figures are the ones that have been booted rather than the ones that look
-/// smallest.
+/// The figure depends on the build, because those paths' frame sizes do. A
+/// release image keeps 32 KiB (`STACK_ORDER` 3), not Linux's own 16. It kept
+/// 16 until a child began inheriting its parent's signal table: `fork`'s
+/// `spawn_copy` builds the whole `Task` - the 2 KiB `Actions` among its
+/// fields - in a frame measured at ~13.8 KiB in the aarch64 release build,
+/// and even a 16-byte addition to that frame overflowed a 16 KiB stack at the
+/// first user fork (the alt-stack-only arm answered a bad frame free on one
+/// boot and a branch to address zero on the next). 32 KiB leaves the fork
+/// path's callees room, and the 64 ring-3 programs in the image are booted
+/// and measured against it. A debug image keeps 64 KiB: unoptimised frames
+/// are several times larger, and 16 KiB was measured to be too few for
+/// `execve` there. The symptom of getting it wrong is the worst kind - the
+/// overflow eats the fault handler's own frame, so the machine triple-faults
+/// with nothing said - which is why the figures are the ones that have been
+/// booted rather than the ones that look smallest.
 #[cfg(debug_assertions)]
 pub const STACK_ORDER: usize = 4;
 #[cfg(not(debug_assertions))]
-pub const STACK_ORDER: usize = 2;
+pub const STACK_ORDER: usize = 3;
 pub(crate) const STACK_SIZE: usize = crate::mm::PAGE_SIZE << STACK_ORDER;
 
 /// Written at the bottom of every stack, which is where a runaway task arrives

@@ -387,6 +387,19 @@ impl UnixSock {
         self.typ == SOCK_DGRAM || self.dgram_connected()
     }
 
+    /// Whether a broken write on this socket answers `EPIPE` **without**
+    /// raising `SIGPIPE`.
+    ///
+    /// True of a sequenced-packet connection and nothing else. Linux's
+    /// `unix_seqpacket_sendmsg` returns `EPIPE` for a dead peer with no
+    /// `send_sig` behind it, so a handler installed for `SIGPIPE` never runs -
+    /// measured on a current host (`.workbuddy/probe_sigpipe2.c`, Linux
+    /// 7.2.11), while the same close on a `SOCK_STREAM` pair raises it twice
+    /// in a row. The syscall doors ask this before they raise.
+    pub fn silent_broken_pipe(&self) -> bool {
+        self.typ == SOCK_SEQPACKET
+    }
+
     /// Whether this is a sequenced-packet socket with no peer to carry a
     /// message to - unconnected, or bound and listening, alike.
     ///
@@ -464,6 +477,43 @@ impl UnixSock {
         })
     }
 
+    /// The peer a message send aims at with no name given, with Linux's three
+    /// answers for a connection that has no live peer.
+    ///
+    /// Measured on a current host (`.workbuddy/probe_sigpipe2.c`, Linux
+    /// 7.2.11), for both `send` and `write` and on a `socketpair` and a named
+    /// pair alike:
+    ///
+    /// * a **socket that never connected** is `ENOTCONN`;
+    /// * a **sequenced-packet** connection whose peer died is `EPIPE`, and the
+    ///   connection is remembered - a second call is `EPIPE` again;
+    /// * a **datagram** connection whose peer died is `ECONNREFUSED` **once**,
+    ///   and because its peer can be replaced by another `connect`, Linux
+    ///   forgets this one: the next call is the `ENOTCONN` a socket that never
+    ///   dialled answers. That is why the slot is cleared here and not in the
+    ///   send's caller.
+    fn message_peer(&self) -> Result<Arc<UnixSock>, VfsError> {
+        if let Some(peer) = self.dgram_peer() {
+            return Ok(peer);
+        }
+        let connected = critical_section::with(|cs| {
+            let mut st = self.state.borrow(cs).borrow_mut();
+            let was = st.dgram_peer.is_some();
+            if was && self.typ == SOCK_DGRAM {
+                st.dgram_peer = None;
+            }
+            was
+        });
+        if !connected {
+            return Err(VfsError::NotConnected);
+        }
+        if self.silent_broken_pipe() {
+            Err(VfsError::BrokenPipe)
+        } else {
+            Err(VfsError::ConnectionRefused)
+        }
+    }
+
     /// Whether a datagram socket has a peer pinned, live or not - what makes a
     /// *sequenced-packet* end carry messages, and what a send with no name
     /// aims at. It is deliberately not a `connect` gate: a datagram socket may
@@ -472,27 +522,69 @@ impl UnixSock {
         critical_section::with(|cs| self.state.borrow(cs).borrow().dgram_peer.is_some())
     }
 
+    /// Whether a *connected* message socket's peer has died, read off the weak
+    /// reference `connect` or `pair` planted: `Some` says a connection was
+    /// made, and a failed upgrade says the other end is gone.
+    ///
+    /// Only a sequenced-packet connection treats that as end-of-stream. A
+    /// datagram sender may dial again, and Linux reports its dead peer as "the
+    /// send fails", not as a hang-up - measured on a current host
+    /// (`.workbuddy/probe_unix_close.c`, Linux 7.2.11): after the peer closes,
+    /// a `SOCK_SEQPACKET` end answers `poll` `POLLIN|POLLHUP`, `recv` 0 and
+    /// `send` `EPIPE`, while a `SOCK_DGRAM` end answers `POLLOUT` alone,
+    /// `recv` `EAGAIN` and `send` `ECONNREFUSED`. Reporting the datagram's
+    /// silence as a hang-up would tell every reader the queue can never fill
+    /// again, which is false: it can be refilled by a connect to a new name.
+    fn message_peer_gone(&self) -> bool {
+        if self.typ != SOCK_SEQPACKET {
+            return false;
+        }
+        critical_section::with(|cs| {
+            let st = self.state.borrow(cs).borrow();
+            st.dgram_peer
+                .as_ref()
+                .is_some_and(|w| w.upgrade().is_none())
+        })
+    }
+
     /// Take the front datagram, parked for if the queue is empty and the
     /// caller allowed waiting. The answer carries the whole message, so the
     /// caller can copy what its buffer holds and still know the message's own
     /// length for `MSG_TRUNC`.
-    pub(crate) fn take_dgram(&self) -> Result<RecvDgram, VfsError> {
+    ///
+    /// `None` is a `SOCK_SEQPACKET` connection whose peer is gone and whose
+    /// queue is empty - the end-of-file a read reports as 0. The queue is
+    /// drained *first*: Linux keeps delivering messages a dead peer sent
+    /// before it died, and only the read after them answers 0. A datagram
+    /// socket never reaches that answer; its empty queue is `EAGAIN` or a
+    /// park, whether or not the peer still lives (the measurement is on
+    /// [`Self::message_peer_gone`]).
+    pub(crate) fn take_dgram(&self) -> Result<Option<RecvDgram>, VfsError> {
         loop {
-            let taken = critical_section::with(|cs| {
+            let (taken, peer_gone) = critical_section::with(|cs| {
                 let mut st = self.state.borrow(cs).borrow_mut();
-                st.recvq.pop_front().map(|g| RecvDgram {
+                let taken = st.recvq.pop_front().map(|g| RecvDgram {
                     data: g.data,
                     from: g.from,
                     cred: g.cred,
                     fds: g.fds,
-                })
+                });
+                let peer_gone = self.typ == SOCK_SEQPACKET
+                    && st
+                        .dgram_peer
+                        .as_ref()
+                        .is_some_and(|w| w.upgrade().is_none());
+                (taken, peer_gone)
             });
             if let Some(got) = taken {
                 // The queue only got emptier by one message, so the other
                 // parked readers stay parked until a push wakes them all;
                 // this take's own waiters set is the poll subscribers, and
                 // `epoll` re-arms them through `poll_ready` on its own.
-                return Ok(got);
+                return Ok(Some(got));
+            }
+            if peer_gone {
+                return Ok(None);
             }
             let nonblock = critical_section::with(|cs| self.state.borrow(cs).borrow().nonblocking);
             if nonblock {
@@ -514,24 +606,32 @@ impl UnixSock {
     /// `MSG_TRUNC` in a `recvmsg`'s `msg_flags` without being asked, exactly
     /// as a consuming receive does (measured on a current host,
     /// `.workbuddy/probe_unix_peek{,2}.c`). The wait is the take's wait, so a
-    /// peek of an empty queue parks and a signal ends it the same way.
-    pub(crate) fn peek_dgram(&self) -> Result<RecvDgram, VfsError> {
+    /// peek of an empty queue parks and a signal ends it the same way, and a
+    /// peek at a dead `SOCK_SEQPACKET` peer answers the same end-of-file a
+    /// take does - peeking does not postpone the news (Linux answers 0 there
+    /// too; same probe).
+    pub(crate) fn peek_dgram(&self) -> Result<Option<RecvDgram>, VfsError> {
         loop {
-            let front = critical_section::with(|cs| {
-                self.state
-                    .borrow(cs)
-                    .borrow()
-                    .recvq
-                    .front()
-                    .map(|g| RecvDgram {
-                        data: g.data.clone(),
-                        from: g.from.clone(),
-                        cred: g.cred,
-                        fds: g.fds.clone(),
-                    })
+            let (front, peer_gone) = critical_section::with(|cs| {
+                let st = self.state.borrow(cs).borrow();
+                let front = st.recvq.front().map(|g| RecvDgram {
+                    data: g.data.clone(),
+                    from: g.from.clone(),
+                    cred: g.cred,
+                    fds: g.fds.clone(),
+                });
+                let peer_gone = self.typ == SOCK_SEQPACKET
+                    && st
+                        .dgram_peer
+                        .as_ref()
+                        .is_some_and(|w| w.upgrade().is_none());
+                (front, peer_gone)
             });
             if let Some(got) = front {
-                return Ok(got);
+                return Ok(Some(got));
+            }
+            if peer_gone {
+                return Ok(None);
             }
             let nonblock = critical_section::with(|cs| self.state.borrow(cs).borrow().nonblocking);
             if nonblock {
@@ -563,7 +663,16 @@ impl UnixSock {
         let end = crate::sched::block_until_interruptible(|| {
             critical_section::with(|cs| {
                 let st = self.state.borrow(cs).borrow();
+                // A dead sequenced-packet peer makes the empty queue a final
+                // answer, not a reason to keep sleeping: `Drop` wakes the
+                // waiters it finds here, and the condition has to agree with
+                // the take's own end-of-file test or the wake parks again.
                 !st.recvq.is_empty()
+                    || (self.typ == SOCK_SEQPACKET
+                        && st
+                            .dgram_peer
+                            .as_ref()
+                            .is_some_and(|w| w.upgrade().is_none()))
             })
         });
         critical_section::with(|cs| {
@@ -715,7 +824,11 @@ impl Inode for UnixSock {
             if buf.is_empty() {
                 return Ok(0);
             }
-            let got = self.take_dgram()?;
+            let Some(got) = self.take_dgram()? else {
+                // The peer of a sequenced-packet connection is gone and no
+                // message is left: `read` answers end-of-file.
+                return Ok(0);
+            };
             let n = got.data.len().min(buf.len());
             buf[..n].copy_from_slice(&got.data[..n]);
             return Ok(n);
@@ -730,7 +843,7 @@ impl Inode for UnixSock {
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
         if self.carries_messages() {
             let _ = offset;
-            let peer = self.dgram_peer().ok_or(VfsError::NotConnected)?;
+            let peer = self.message_peer()?;
             let name = self.local_addr();
             if peer.push_dgram(buf, name, self_cred(), Vec::new()) {
                 Ok(buf.len())
@@ -751,11 +864,26 @@ impl Inode for UnixSock {
         // the peer's cap is the only backpressure, so `write: true` states
         // what is true of a socket whose peer reads at all; a full peer
         // answers the send itself with `EAGAIN`.
+        //
+        // A sequenced-packet end whose peer is gone is readable *as well*:
+        // Linux's `unix_poll` sets `POLLIN` beside `POLLHUP` on a closed
+        // connection, because a read there returns 0 rather than blocking -
+        // and a `MSG_DONTWAIT` receive consults this answer before the take,
+        // so a false here would answer `EAGAIN` where Linux answers 0.
         if self.carries_messages() {
-            let queued =
-                critical_section::with(|cs| !self.state.borrow(cs).borrow().recvq.is_empty());
+            let (queued, gone) = critical_section::with(|cs| {
+                let st = self.state.borrow(cs).borrow();
+                (
+                    !st.recvq.is_empty(),
+                    self.typ == SOCK_SEQPACKET
+                        && st
+                            .dgram_peer
+                            .as_ref()
+                            .is_some_and(|w| w.upgrade().is_none()),
+                )
+            });
             return Ready {
-                read: queued,
+                read: queued || gone,
                 write: true,
             };
         }
@@ -771,6 +899,31 @@ impl Inode for UnixSock {
         Ready {
             read: self.pending_nonempty(),
             write: false,
+        }
+    }
+
+    /// The peer has gone: a hang-up, in `unix_poll`'s two shapes.
+    ///
+    /// A **sequenced-packet** connection's peer dying ends the stream - the
+    /// same news `take_dgram`'s `None` carries, told to a waiter that is not
+    /// reading yet. A **stream** connection delegates to the `DuplexEnd` it
+    /// wraps, whose `poll_hup` already knows when both directions are gone;
+    /// without this forward a *named* stream never reported `EPOLLHUP` while
+    /// its `socketpair` twin did, because the pair's fd names the `DuplexEnd`
+    /// directly and the named one names this wrapper. Measured in the guest
+    /// before the forward existed (`unixcloseprobe.c`): the pair's end
+    /// answered `revents=0x011`, the named end `0x001`, and Linux answers
+    /// `0x011` for both (`.workbuddy/probe_unix_close.c`).
+    ///
+    /// A **datagram** socket never answers true here, whatever became of the
+    /// peer it last dialled: `message_peer_gone` is the measurement.
+    fn poll_hup(&self) -> bool {
+        if self.typ == SOCK_SEQPACKET {
+            return self.message_peer_gone();
+        }
+        match self.end_of() {
+            Some(end) => end.poll_hup(),
+            None => false,
         }
     }
 
@@ -1129,7 +1282,7 @@ pub(crate) fn unbind_node(node: &Arc<dyn Inode>) {
 /// while something names it.
 impl Drop for UnixSock {
     fn drop(&mut self) {
-        let (pending, waiters) = critical_section::with(|cs| {
+        let (pending, waiters, peer_waiters) = critical_section::with(|cs| {
             let mut reg = UNIX.borrow(cs).borrow_mut();
             let (node_key, name_key) = match reg.slots.get_mut(self.id - 1) {
                 Some(Some(slot)) => (slot.key.take(), slot.name.take()),
@@ -1142,17 +1295,38 @@ impl Drop for UnixSock {
                 reg.by_name.remove(&name);
             }
             reg.slots[self.id - 1] = None;
-            let mut st = self.state.borrow(cs).borrow_mut();
-            let pending = core::mem::take(&mut st.pending);
-            let mut waiters = core::mem::take(&mut st.accept_waiters);
-            waiters.append(&mut st.room_waiters);
-            waiters.append(&mut st.read_waiters);
-            (pending, waiters)
+            let (pending, waiters, peer) = {
+                let mut st = self.state.borrow(cs).borrow_mut();
+                let pending = core::mem::take(&mut st.pending);
+                let mut waiters = core::mem::take(&mut st.accept_waiters);
+                waiters.append(&mut st.room_waiters);
+                waiters.append(&mut st.read_waiters);
+                (pending, waiters, st.dgram_peer.clone())
+            };
+            // The far end of a *sequenced-packet* connection is told by its
+            // own weak reference failing, but nothing would make it look:
+            // its pollers sit in its `read_waiters`, and a `DuplexEnd` drop
+            // wakes the equivalent list through the pipe counters while this
+            // shape has no pipe to do it. udev's `udevadm settle` is the
+            // waiter this cost - udevd accepts its control ping, closes the
+            // connection, and Linux wakes the client with `POLLIN|POLLHUP`
+            // where this kernel let it sleep out the whole 120-second
+            // timeout (measured in the guest and against a current host:
+            // `.workbuddy/probe_unix_close.c`).
+            let peer_waiters = match (self.typ, peer.and_then(|w| w.upgrade())) {
+                (SOCK_SEQPACKET, Some(peer)) => {
+                    let mut pst = peer.state.borrow(cs).borrow_mut();
+                    core::mem::take(&mut pst.read_waiters)
+                }
+                _ => Vec::new(),
+            };
+            (pending, waiters, peer_waiters)
         });
         // Outside every borrow: a queued half's drop can wake whoever
         // blocked on it, and a wake needs locks no drop may hold.
         drop(pending);
         wake_all(waiters);
+        wake_all(peer_waiters);
     }
 }
 
@@ -2039,9 +2213,9 @@ pub(crate) fn send_dgram(
         // door above usually drops the name before this function sees it.
         // Keeping the rule here too means a caller that still arrives with one
         // (the `socketpair` shape) cannot be sent anywhere but the peer.
-        Some(_) if sock.ignores_send_address() => match sock.dgram_peer() {
-            Some(peer) => peer,
-            None => return err::ENOTCONN,
+        Some(_) if sock.ignores_send_address() => match sock.message_peer() {
+            Ok(peer) => peer,
+            Err(e) => return crate::uaccess::err_of(e),
         },
         // A datagram socket honours the name it is given, connected or not:
         // Linux resolves and validates it exactly as an unconnected send does
@@ -2087,9 +2261,9 @@ pub(crate) fn send_dgram(
                 },
             }
         }
-        None => match sock.dgram_peer() {
-            Some(peer) => peer,
-            None => return err::ENOTCONN,
+        None => match sock.message_peer() {
+            Ok(peer) => peer,
+            Err(e) => return crate::uaccess::err_of(e),
         },
     };
     // A socket with no message queue to land in: the name is there, no datagram

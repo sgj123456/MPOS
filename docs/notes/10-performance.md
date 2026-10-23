@@ -381,14 +381,13 @@ completion event to wait on.
 ("the numbers are allowed to say 'no'"). The *before* column is one `cargo xtask
 test` run per machine with the pool reverted to the pre-pool seam (a fresh `Vec`
 per frame, the patch reverted after the run); the *after* column is two green
-runs of the same command, and the two runs matter: the same machine reports
-`12213` and `11768` for identical code, a **3.9 %** spread, and the other
-`19807`/`19652`, 0.8 %. `12138` (x86_64) and `20372` (aarch64) sit *inside* the
-after column's own spread — on aarch64 the before figure is even the higher of
-the two. So the pool buys **no** throughput at this burst size: 512 frames' worth
-of 2 KiB allocations is a few hundred microseconds against a burst whose rate is
-set by smoltcp and the virtio ring, and the instrument cannot resolve a
-difference that small against its own jitter.
+runs of the same command: the same machine reports `12213` and `11768` for
+identical code, a **3.9 %** spread, and the other `19807`/`19652`, 0.8 %. The
+before figures sit *inside* the after column's own spread — on aarch64 the before
+figure is even the higher of the two. So the pool buys **no** throughput at this
+burst size: 512 frames' worth of 2 KiB allocations is a few hundred microseconds
+against a burst whose rate is set by smoltcp and the virtio ring, and the
+instrument cannot resolve a difference that small against its own jitter.
 
 What the other two columns do establish, and what the change is actually worth:
 the steady path **never allocates** (1036 takes, 1036 hits, no miss on x86_64),
@@ -663,9 +662,7 @@ pipelining (`drivers/virtio/blk.rs`) likewise — each still wants the other for
 its *best* number, but neither is blind any more.
 
 **Before either is written: readahead cannot move the count, and the reason is the
-transfer bound.** The sentence above says the number is "what the change would
-remove", so the change has to be checked against what the number *can* be. It
-cannot be moved by readahead, and the arithmetic is short. `cold=16387` is
+transfer bound.** `cold=16387` is
 already `16384 + 3` — every block of the file once, plus three metadata reads —
 so a sequential pass has no read left to remove; readahead fetches blocks
 *earlier*, not fewer, and on a full pass the prefetch is consumed exactly once.
@@ -675,23 +672,19 @@ ext4 block. So the count is `blocks + metadata` by construction, and the only
 thing that changes it is one device transfer moving **more than one block**:
 prefetch a run *and* hand it to the driver in a single call.
 
-That is available, and nearer than the trait's bound suggests: the bound is the
-block layer's own, not the drivers'. `src/drivers/ahci.rs` already moves up to
+That is nearer than the trait's bound suggests, because the bound is the block
+layer's, not the drivers'. `src/drivers/ahci.rs` already moves up to
 `BOUNCE_PAGES * PAGE_SIZE` = **128 KiB in one command** — the bounce is a *list*
-of pages and the PRDT is a scatter-gather table, so non-contiguous pages need no
-contiguous run — and its own comment calls that "a bound on one command, not on a
-request". virtio-blk hands its whole buffer to the crate in one call
+of pages and the PRDT is a scatter-gather table — and its own comment calls that
+"a bound on one command, not on a request". virtio-blk hands its whole buffer to
+the crate in one call
 (`request_read` → `add_notify_wait_pop(&[req], &mut [data, resp], …)`); whether
 the crate's queue splits that by `seg_max` internally is the one thing to check
-before the bound is raised, because if it splits, a wide call would stop being
-"one transfer" and the counter would start flattering the change.
+before the bound is raised.
 
 So the item is re-scoped rather than started: **a wider transfer** (ext4 fetching
 a contiguous run into the cache in one call, with the trait's bound raised to a
-size each driver really serves in one command) is what has an instrument, and it
-is a change to the block contract plus `vfs/ext4/cache.rs`'s fetch — not
-readahead alone. Recorded here so that the next reader does not implement
-readahead for a number it cannot produce.
+size each driver really serves in one command), not readahead alone.
 
 **What was implemented on top of that, and what it measured.** The item is a
 *demand run*. `crates/blk`'s trait gained `max_transfer()` — the width a device
@@ -708,8 +701,7 @@ needs — and `contiguous_run` walks the extent tree *in memory* to find how far
 device blocks are consecutive, so a file stored in scattered blocks takes exactly
 the path it always did.
 
-It is a **demand** run and not a readahead, which is the design decision the
-paragraph above arrived at: `want` is what the caller's own request is about to
+It is a **demand** run and not a readahead: `want` is what the caller's own request is about to
 touch, so a random read of one block asks for one block and pays nothing, and
 there is no heuristic to get wrong. A readahead past the request (Linux's
 `file_ra_state`) would buy nothing here — the pass is full-rate either way — and
@@ -770,10 +762,9 @@ one run, `cold` returns to **16387** and all three run claims fail.
 
 **The root disk joined it (2026-10-12) — and the prerequisite this section first named for
 it was already met.** An earlier draft of this entry said the root disk (`vda`) still read
-one block per call and that the fix was a **physically-contiguous multi-frame bounce**,
-because "the crate describes a request's data with one descriptor per *buffer*, and a
-descriptor carries a single physical address — so a wide buffer there has to be physically
-contiguous, which a kernel `Vec` of 32 pages is not". Reading the crate and this kernel said
+one block per call and that the fix was a **physically-contiguous multi-frame bounce**, on the
+argument that a descriptor carries one physical address so a wide buffer has to be contiguous —
+"which a kernel `Vec` of 32 pages is not". Reading the crate and this kernel said
 otherwise, twice over, and both are checkable in-tree:
 
 * **The crate does not split a wide call.** `VirtIOBlk::read_blocks` is
@@ -927,14 +918,9 @@ like two ticks:
 | a 64 KiB pipe handover between two processes | 8.0 ms per chunk, 7 MiB/s | 6.1 µs per chunk, 10 168 MiB/s | `t-pipecost` (§10.4) |
 
 Neither was a sleep rounding to a tick, which is what this section is for: the
-woken task was *ready* and the picker was not choosing it, because the boot
-task's `park()` halted the core while remaining runnable at NORMAL priority and
-a halted task is only taken off the CPU by an interrupt. The scheduler never
-went idle once during the whole suite, which is the observation that separates
-"the task is not runnable" from "the task is runnable and somebody else is
-running" - and a probe recording wake-to-resume in *ticks* named the last one
-directly: 604 of 640 wakes took exactly one tick. §10.2 has the fix and the
-numbers.
+woken task was *ready* and the picker was not choosing it. §10.2 has the cause
+(the boot task's `park()` halting the core while runnable), the fix and the
+numbers, including the probe reading 604 of 640 wakes at exactly one tick.
 
 **The bound is now written, in the one place it is honest.** `t-forkcost`
 asserts that *both* of its `wait4` rows - each a 200-round average - are under
@@ -1004,3 +990,52 @@ change without these numbers, so this entry records the mechanism and leaves the
 than invented — AGENTS §3 rule 6 asks for before/after, and the honest form of "not yet measured"
 is this line, not a made-up number. The counterfactual pins are the host tests above; the timing
 figure lands here on the first run that takes it.
+
+### 10.9 The 9p share's message size — **LANDED** (client-side, measured)
+
+QEMU printed this on every boot that mounted the host share:
+
+```
+qemu-system-x86_64: warning: 9p: degraded performance: a reasonable high msize
+should be chosen on client/guest side (chosen msize is <= 8192).
+```
+
+It is QEMU's own threshold on the **client's** `Tversion` ask, and the client asked
+8192 (`src/vfs/p9.rs`'s old `MSIZE`). Every 9p read and write chunks by the
+negotiated size (`msize - header`), so the number is a request count: a 64 MiB
+read is 8192 requests at 8 KiB and 512 at 128 KiB.
+
+**Measured on the same wiring** (`.workbuddy/p9bench-boot.sh`: a throwaway
+initramfs that mounts the share and runs `dd if=/mnt/share/bench.bin
+of=/dev/null bs=1M count=64`, QEMU 11.1.2 under TCG):
+
+| client asks | server answers | warning | 64 MiB read |
+|---|---|---|---|
+| 8192 | 8192 | yes | 0.255365 s — 250.6 MB/s |
+| 131072 | 131072 | no | 0.071335 s — 897.2 MB/s |
+| 131072 | 131072 | no | 0.064902 s — 986.1 MB/s |
+
+The negotiation was read off QEMU's own trace (`-trace enable=v9fs_version
+-trace enable=v9fs_version_return`), not inferred from the warning: the return
+carries the granted size, and it equals the ask. The same trace showed the
+server is not the limit at 128 KiB.
+
+**The mechanism** is one constant in the wire half, `PROPOSED_MSIZE`, used for
+`Tversion` and as the starting value of the per-mount `msize`; the server's
+answer still overwrites it, as the protocol allows. The per-request buffer is
+allocated at this size, which bounds the cost by the constant and not by
+anything a user steers.
+
+**A measurement worth keeping about QEMU**: its fsdev has **no `msize` option**
+in 11.1.2 — `qemu-system-x86_64 -fsdev local,id=x,path=/tmp,security_model=none,help`
+lists none, and passing one is `Invalid parameter 'msize'` (QEMU refuses to
+start). The familiar `-virtfs ...,msize=131072` advice found on the wiki is for
+configurations whose fsdev accepts it; here the client's ask is the only knob.
+The first attempt at a "server-side" comparison was invalid for exactly this
+reason, and the giveaway was a serial log that had not been rewritten.
+
+**Pin**: the host unit test
+`vfs::p9::tests::the_proposed_msize_is_above_the_degraded_line` — the request is
+a constant, so the test is the only place a regression can be caught without a
+boot; the negotiation and the throughput are this measurement's. Counterfactual:
+with `PROPOSED_MSIZE` back at 8192 the test is red and the warning returns.

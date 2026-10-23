@@ -36,26 +36,96 @@
 //!
 //! # What is *not* here
 //!
-//! Whether the number governs anything is the transport's question and is
-//! pinned where it can be seen: a datagram socket's send queue stops at
-//! `SO_SNDBUF` in `t-udpblock`, whose fill sets the buffer to its floor and
-//! counts the datagrams that fit. The receive side is this kernel's fixed ring
-//! (`src/net/mod.rs`'s `UDP_PAYLOAD_BYTES`), so `SO_RCVBUF` is the number a
-//! caller reads and not a window this kernel resizes - named in `docs/uapi/`
-//! §5.2.
+//! A **datagram** socket's receive side is still this kernel's fixed ring
+//! (`src/net/mod.rs`'s `UDP_PAYLOAD_BYTES`), so `SO_RCVBUF` there is the
+//! number a caller reads and not a window this kernel resizes - named in
+//! `docs/uapi/` §5.2. A **stream** socket's number *is* its receive window now
+//! (item 98): a listener hands the option to the socket it accepts, and the
+//! window an unread connection absorbs scales with it. The claims below
+//! measure both the inheritance and the effect, on the loopback, with the
+//! server deliberately never reading.
 
 use mpos_user_tests::Report;
+use rustix::fd::OwnedFd;
 use rustix::net::sockopt::{
     set_socket_recv_buffer_size, set_socket_send_buffer_size, socket_recv_buffer_size,
     socket_send_buffer_size,
 };
-use rustix::net::{AddressFamily, SocketType, socket};
+use rustix::net::{
+    AddressFamily, SendFlags, SocketAddrV4, SocketType, accept, bind, connect, getsockname, listen,
+    send, socket,
+};
+use std::net::Ipv4Addr;
 
 /// The two floors Linux clamps at, from `src/net/mod.rs`.
 const MIN_SNDBUF: usize = 4608;
 const MIN_RCVBUF: usize = 2304;
 /// Twice `net.core.wmem_max`/`rmem_max`, the ceiling a negative ask reads back.
 const CEILING: usize = 8 * 1024 * 1024;
+
+/// The loopback, the only address a server can be reached at from inside this
+/// machine.
+const LOOPBACK: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+
+/// A loopback connection whose server never reads, with the listener's
+/// `SO_RCVBUF` asked for `ask` either before or after `listen`. The client's
+/// send buffer is asked to be small; Linux sizes a stream's send ring with it,
+/// so the client's own queue stays small there. This kernel's stream send ring
+/// is fixed (`TCP_TX_BYTES`), so the guest's absolute figures include its
+/// 16 KiB queue - which is why the claims below compare the three asks and
+/// never assert an absolute capacity.
+fn unread_pair(ask: usize, after_listen: bool) -> Option<(OwnedFd, OwnedFd, OwnedFd)> {
+    let listener = socket(AddressFamily::INET, SocketType::STREAM, None).ok()?;
+    if !after_listen {
+        set_socket_recv_buffer_size(&listener, ask).ok()?;
+    }
+    bind(&listener, &SocketAddrV4::new(LOOPBACK, 0)).ok()?;
+    listen(&listener, 1).ok()?;
+    if after_listen {
+        set_socket_recv_buffer_size(&listener, ask).ok()?;
+    }
+    let port = SocketAddrV4::try_from(getsockname(&listener).ok()?)
+        .ok()?
+        .port();
+    let client = socket(AddressFamily::INET, SocketType::STREAM, None).ok()?;
+    set_socket_send_buffer_size(&client, 4096).ok()?;
+    connect(&client, &SocketAddrV4::new(LOOPBACK, port)).ok()?;
+    let server = accept(&listener).ok()?;
+    Some((listener, server, client))
+}
+
+/// Push 4 KiB sends at `client` without blocking until it refuses, and report
+/// how many bytes it took. The server is not reading, so the count is the
+/// client's send queue plus the server's advertised window.
+///
+/// A refusal is retried for a bounded while: this kernel's stack processes the
+/// loopback's ACKs on its poll ticks, so the first `EAGAIN` is the client's
+/// queue full with the peer's ACKs still in flight - where Linux has already
+/// run them inside the failing `send`. The window is closed for good once the
+/// server's ring is full, so the retries stop after `IDLE` of them with no
+/// progress; on a host that costs one short sleep per phase.
+fn push_until_full(client: &OwnedFd) -> usize {
+    const IDLE: usize = 32;
+    let chunk = [b'x'; 4096];
+    let mut total = 0;
+    let mut idle = 0;
+    while total < 8 * 1024 * 1024 {
+        match send(client, &chunk, SendFlags::DONTWAIT) {
+            Ok(n) if n > 0 => {
+                total += n;
+                idle = 0;
+            }
+            _ => {
+                idle += 1;
+                if idle > IDLE {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+    total
+}
 
 fn main() {
     println!("t-sockbuf");
@@ -157,6 +227,69 @@ fn main() {
     r.check(
         "a stream socket doubles too: asking 10000 reads 20000",
         set_socket_send_buffer_size(&s, 10000).is_ok() && socket_send_buffer_size(&s) == Ok(20000),
+    );
+
+    // 6. A stream's SO_RCVBUF is its **window**, not only a number. Linux
+    //    clones the listener's `sk_rcvbuf` onto the accepted socket
+    //    (`inet_csk_clone_lock`), whether the option was set before or after
+    //    `listen` - measured on a current host with
+    //    `.workbuddy/probe_tcp_rcvbuf.c` (Linux 7.2.11): ask 2048 -> accepted
+    //    4096, ask 32768 -> 65536, ask 262144 -> 524288.
+    match unread_pair(2048, false) {
+        Some((listener, server, client)) => {
+            r.check(
+                &format!(
+                    "the accepted socket inherits the listener's SO_RCVBUF (got {:?})",
+                    socket_recv_buffer_size(&server)
+                ),
+                socket_recv_buffer_size(&server) == Ok(4096),
+            );
+            drop((listener, server, client));
+        }
+        None => r.check("a loopback connection with a sized listener is made", false),
+    }
+    match unread_pair(32768, true) {
+        Some((listener, server, client)) => {
+            r.check(
+                &format!(
+                    "a change made after listen is inherited too (got {:?})",
+                    socket_recv_buffer_size(&server)
+                ),
+                socket_recv_buffer_size(&server) == Ok(65536),
+            );
+            drop((listener, server, client));
+        }
+        None => r.check(
+            "a loopback connection with a post-listen size is made",
+            false,
+        ),
+    }
+
+    // 7. The effect: an unread connection absorbs about what its window says.
+    //    The three asks are the option's own shape (double, floor) and the
+    //    comparisons are relative, because the absolute figure includes the
+    //    client's send queue, which is not the subject.
+    let pushed = |ask: usize| -> usize {
+        match unread_pair(ask, true) {
+            Some((listener, server, client)) => {
+                let n = push_until_full(&client);
+                drop((listener, server, client));
+                n
+            }
+            None => 0,
+        }
+    };
+    let small = pushed(2048);
+    let large = pushed(32768);
+    let beyond = pushed(262144);
+    println!("note: unread TCP capacity ask 2048={small}, 32768={large}, 262144={beyond}");
+    r.check(
+        &format!("a small window fills sooner than a larger one (small={small}, large={large})"),
+        large > small.saturating_mul(2),
+    );
+    r.check(
+        &format!("a larger ask still buys a larger window (large={large}, beyond={beyond})"),
+        beyond > large,
     );
 
     r.finish();

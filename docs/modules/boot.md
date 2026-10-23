@@ -5,28 +5,23 @@
 ## What it owns
 
 `src/boot/` is the kernel's side of the seam between the firmware and the machine. The loader
-(`mpos-boot`, crate `mpos-boot`) reads three files off the boot partition, builds an address space,
-leaves boot services and jumps; what crosses that jump is one `#[repr(C)]` record and a command
-line. This module is what the kernel does with them: it *translates* the record into plain data,
-keeps the command line where the filesystems can read it, and owns the kernel console list the
-command line spells.
+(`mpos-boot`) reads three files, builds an address space and jumps; what crosses is one `#[repr(C)]`
+record and a command line. This module *translates* the record into plain data, keeps the command
+line where the filesystems can read it, and owns the console list the command line spells.
 
-The record itself is deliberately **not** declared here. `Handoff`, `AbiRegion`, the `KIND_*`
-constants, `HANDOFF_MAGIC` and `BOOT_STACK_CANARY` are one definition in the `mpos-bootinfo` leaf
-crate (`crates/bootinfo/src/lib.rs`), because both sides of the seam have to name them and neither
-can own them: `mpos-arch`'s `Paging::install` takes a `BootInfo` and the aarch64 entry takes a
-`Handoff`, and a machine crate cannot depend on the kernel. `src/boot/handoff.rs` re-exports that
-one definition under the names it has always had, so every `crate::boot::handoff::` caller is
-unchanged, and the loader (`boot/src/lib.rs`) depends on the same leaf - so the layout is written
-once and cannot drift out of step with itself. The loader's `boot/src/handoff.rs` is gone; there is
-no second copy of the record anywhere.
+The record is deliberately **not** declared here. `Handoff`, `AbiRegion`, the `KIND_*` constants,
+`HANDOFF_MAGIC` and `BOOT_STACK_CANARY` are one definition in `mpos-bootinfo`
+(`crates/bootinfo/src/lib.rs`), because both sides must name them and neither can own them:
+`mpos-arch`'s `Paging::install` takes a `BootInfo`, the aarch64 entry takes a `Handoff`, and a
+machine crate cannot depend on the kernel. `src/boot/handoff.rs` re-exports it under the names it has
+always had, so every `crate::boot::handoff::` caller is unchanged; `boot/src/lib.rs` depends on the
+same leaf. The loader's `boot/src/handoff.rs` is gone; no second copy exists.
 
-What stays in this module is what the *kernel* does with the record, which is not the loader's
-business: `collect` is the code that decides what a memory region *means*, `cmdline` is where the
-bytes become a `&'static str` the VFS can serve, and `console_list` is a policy the kernel applies
-to a word the loader only carried. What does not belong here: the loader's sequence and its ELF
-relocations (`boot/src/`, see [loader](loader.md)); the machine layer's translation of the record
-into page tables and a direct map (`mpos-arch`); and the `/proc/cmdline` node, which is the VFS's.
+What stays here is what the *kernel* does with the record: `collect` decides what a memory region
+*means*, `cmdline` turns bytes into a `&'static str`, and `console_list` is a policy applied to a
+word the loader only carried. Not here: the loader's sequence and ELF relocations (`boot/src/`, see
+[loader](loader.md)); the machine layer's page tables and direct map (`mpos-arch`); and the
+`/proc/cmdline` node, which is the VFS's.
 
 ## Key files
 
@@ -42,31 +37,30 @@ into page tables and a direct map (`mpos-arch`); and the `/proc/cmdline` node, w
 
 ## Contracts
 
-- `Handoff` is a wire format: `#[repr(C)]`, written by one compilation (the UEFI loader) and read by
-  another (the kernel), with every field a promise to a binary this crate never sees. `HANDOFF_MAGIC`
-  is checked before anything else is read: a boot volume assembled or half-updated by hand is a real
-  thing to refuse, and the check costs one comparison. `boot_stack_base` and the two device-tree fields are last on purpose, so
-  appending them left every older offset untouched (the field's own doc argues why).
+- `Handoff` is a wire format: `#[repr(C)]`, written by one compilation (the UEFI loader), read by
+  another (the kernel). `HANDOFF_MAGIC` is checked first: a boot volume assembled or half-updated by
+  hand is a real thing to refuse, and the check costs one comparison. `boot_stack_base` and the two
+  device-tree fields are last on purpose, so appending them left every older offset untouched.
 - `collect(at: *const Handoff) -> BootInfo` is `unsafe` and validates rather than trusts: it asserts
   the magic, caps `region_count` at `MAX_MEM_REGIONS`, reads the command line as UTF-8 (a bad line
   fails here, not at every later use), and refuses a record whose *allocatable* regions contain the
   boot stack (`docs/notes/` §13.17) - the frame allocator's zones are exactly those regions, so a
-  loader that described the stack as `Usable` would hand the kernel the stack it is standing on.
+  loader describing the stack as `Usable` would hand the kernel the stack it is standing on.
 - `BootInfo` is not a wire format: plain data, no pointers, no page-table root, no EFI table, with
   `phys_to_virt`, `regions`, `allocatable_bytes` and `MemKind::is_allocatable` (`BootloaderReclaimable`
-  is deliberately not allocatable, because it holds the boot stack until the scheduler gives every
-  task its own).
+  is deliberately not allocatable: it holds the boot stack until the scheduler gives every task its
+  own).
 - `set_cmdline` / `cmdline` / `cmdline_has` - the command line kept where the VFS reads it
-  (`/proc/cmdline`), with `cmdline_has` the one whole-word spelling two boots must agree on so
-  `mpos.selftest` cannot mean one thing on one machine and another on the other.
+  (`/proc/cmdline`); `cmdline_has` is the one whole-word spelling two boots must agree on, so
+  `mpos.selftest` cannot mean different things on the two machines.
 - `ConsoleList::from_cmdline(cmdline, unknown)` - a pure, allocation-free parse of every `console=`
-  word, following Linux's rule: repeatable, output to every console named, the last preferred, and a
-  value this machine does not have reported to `unknown` and ignored (`DEFAULT` when none is known).
-  Only `ttyS0`/`ttyAMA0` (the serial wire) and `tty0` (the framebuffer VT) are recognised; `ttyS1..`,
+  word, following Linux's rule: repeatable, output to every console named, the last preferred, a
+  value this machine lacks reported to `unknown` and ignored (`DEFAULT` when none is known). Only
+  `ttyS0`/`ttyAMA0` (the serial wire) and `tty0` (the framebuffer VT) are recognised; `ttyS1..`,
   `ttyAMA1..` and `tty1..tty6` are reported unknown rather than approximated.
-- The loader's side of the contract: allocate everything before `exit_boot_services`, write the
-  canary into the lowest word of the boot stack, and fill the record only after boot services are
-  gone (one static write, so no half-filled record is ever reachable).
+- The loader's side: allocate everything before `exit_boot_services`, write the canary into the
+  lowest word of the boot stack, and fill the record only after boot services are gone (one static
+  write, so no half-filled record is reachable).
 
 The edges - who may call `boot`, and which modules this one may name - are
 `docs/ARCHITECTURE.md` §2/§3. The whole handoff sequence is drawn in `docs/ARCHITECTURE.md` §4.
@@ -75,15 +69,15 @@ The edges - who may call `boot`, and which modules this one may name - are
 
 `boot` owns one userspace fact: the command line. `src/vfs/procfs.rs` renders `/proc/cmdline` from
 `crate::boot::cmdline()`, and the initramfs's `/init` reads `root=`, `rootfstype=` and `rootflags=`
-from it (`assets/initramfs/core/init`, one script for both machines). The `console=` parsing is kernel-side policy,
-not a syscall, and its honesty gap is recorded in docs/uapi/ §5.3: `console=ttyN` pinning is
+from it (`assets/initramfs/core/init`, one script for both machines). `console=` parsing is
+kernel-side policy, not a syscall; its honesty gap is docs/uapi/ §5.3: `console=ttyN` pinning is
 refused rather than approximated, and `/dev/console` has no preferred-console plumbing (`docs/notes/`
 §7.1c). The handoff record itself never reaches userspace.
 
 ## Pins
 
-The module's real pins are host tests, and they are the reason the crate is `no_std` but
-`test`-compiled on the host. Reading `src/boot/handoff.rs` (`#[cfg(test)] mod tests`):
+The module's real pins are host tests, which is why the crate is `no_std` but `test`-compiled on the
+host. Reading `src/boot/handoff.rs` (`#[cfg(test)] mod tests`):
 
 | Test function | The claim it would fail without |
 |---|---|
@@ -108,13 +102,13 @@ And reading `src/boot/console_list.rs` (`#[cfg(test)] mod tests`):
 | `an_aarch64_serial_console_names_the_wire_and_is_preferred` | `ttyAMA0` is the wire, preferred, with no phantom VT sink |
 | `an_aarch64_extra_port_is_reported_unknown_like_its_x86_twin` | `ttyAMA1` is refused like `ttyS1` |
 
-Two things are **not** pinned, stated plainly rather than guessed. `crates/bootinfo/src/lib.rs` and
-everything under `boot/` contain no `#[cfg(test)] mod tests` (verified by reading and grepping), so
-the one record definition and the loader's sequence are compile-checked by both sides reading the
-same layout, not host-tested. And there is no `t-*` program covering this module: grepping
-`user/tests/src/bin` and `user/abitest` for the record, `Handoff`, `cmdline` or `console=` finds none
-(the `handoff`/`cmdline` hits are unrelated words in `t-prime`/`t-memfd-shm`). The command line's
-userspace consumer is the initramfs `/init` script, which is a shell program, not a `t-*` test.
+Two things are **not** pinned. `crates/bootinfo/src/lib.rs` and everything under `boot/` contain no
+`#[cfg(test)] mod tests`, so the record definition and the loader's sequence are compile-checked by
+both sides reading the same layout, not host-tested. And there is no `t-*` program covering this
+module: grepping `user/tests/src/bin` (and the deleted `user/abitest`) for the record, `Handoff`,
+`cmdline` or `console=` finds none (the `handoff`/`cmdline` hits are unrelated words in
+`t-prime`/`t-memfd-shm`). The command line's userspace consumer is the initramfs `/init` script, a
+shell program, not a `t-*` test.
 
 ## Evidence and open work
 
@@ -127,7 +121,7 @@ record offering the boot stack is refused), §13.23 (`BOOT_STACK_CANARY` lives i
 row. No number from those sections is restated above.
 
 One doc-level note: `docs/ARCHITECTURE.md` §9's `V-10` still says "the canary constant in
-`src/main.rs` is still spelled on both sides". Reading the code, that sentence is stale - `src/main.rs`
+`src/main.rs` is still spelled on both sides". Reading the code, that sentence is stale: `src/main.rs`
 declares no canary, `src/board/report.rs` imports `BOOT_STACK_CANARY` from `mpos::boot::handoff`, and
-`boot/src/lib.rs` imports it from `mpos_bootinfo`, i.e. one definition in `crates/bootinfo`. This is
-the doc's inference from reading, not something the source comment states.
+`boot/src/lib.rs` imports it from `mpos_bootinfo` - one definition in `crates/bootinfo`. This is the
+doc's inference from reading, not something the source comment states.

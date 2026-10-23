@@ -417,5 +417,74 @@ fn main() {
         libc::close(wout);
         libc::close(epfd);
     }
+
+    // ---- The reported word is what the caller asked for, and only that ----
+    //
+    // Why this claim exists: `weston-desktop-shell` registers its timerfd for
+    // `EPOLLIN` alone and refuses to dispatch an event carrying anything else
+    // - it printed `unexpected timerfd events 41` (the value is hex, 0x41)
+    // for every expiry, so the shell's startup never completed and the
+    // desktop never came up. The 0x40 was an `EPOLLRDNORM` this kernel used
+    // to set beside every `EPOLLIN`, whatever the caller had asked for.
+    // Linux answers `revents & interest` out of the file's own poll mask, so
+    // a caller that named `EPOLLIN` gets `EPOLLIN` back and nothing else.
+    let tfd = unsafe { libc::syscall(libc::SYS_timerfd_create, 1, 0) } as i32;
+    if tfd >= 0 {
+        // One expiry, 10 ms out: long enough that the wait sleeps at all,
+        // short enough that the program does not.
+        let mut its = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 10_000_000,
+            },
+        };
+        r.check(
+            "the timer is armed",
+            unsafe { libc::syscall(libc::SYS_timerfd_settime, tfd, 0, &mut its) } == 0,
+        );
+        for (asked, name, must_have, must_not_have) in [
+            (
+                EventFlags::IN,
+                "EPOLLIN",
+                EventFlags::IN,
+                EventFlags::RDNORM,
+            ),
+            // The other spelling arms the same report. Linux's timerfd poll
+            // mask carries `EPOLLIN` alone, so on Linux a caller that asked
+            // for `EPOLLRDNORM` alone is never woken at all - the pair is
+            // registered here to say the bit a caller named is the bit it
+            // gets, which is the half that broke, and not to claim the
+            // corner where Linux reports nothing.
+            (
+                EventFlags::RDNORM,
+                "EPOLLRDNORM",
+                EventFlags::RDNORM,
+                EventFlags::ERR,
+            ),
+        ] {
+            let ep = create1(CreateFlags::empty().bits()) as i32;
+            let e = ev(asked, 0);
+            r.check(
+                &format!("an epoll watching the timerfd for {name} reports it"),
+                ctl(ep, ADD, tfd, Some(&e)) == 0 && wait(ep, &mut events, 8, 2000) == 1,
+            );
+            let got = EventFlags::from_bits_retain(events[0].events);
+            r.check(
+                &format!("the report for {name} carries it"),
+                got.contains(must_have),
+            );
+            r.check(
+                &format!("the report for {name} carries no bit the caller did not ask for"),
+                !got.contains(must_not_have) && !got.contains(EventFlags::ERR),
+            );
+            unsafe { libc::close(ep) };
+        }
+        unsafe { libc::close(tfd) };
+    }
+
     r.finish()
 }

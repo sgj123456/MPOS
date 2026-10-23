@@ -10,7 +10,9 @@ kind of thing - it is *analysis* of the compositors beyond weston, written from
 their sources and the UAPI rather than measured here, and two of its six ordered
 steps remain (§7.4's own list). One item under 7.1 is also still open and is
 written down there rather than here: weston's desktop-shell does not paint its
-pointer, and the measurements say so far that it is not this kernel's doing.
+pointer. The shell itself starts now that the epoll report bug is fixed (§1.1);
+what remains is its cursor image, and the measurements say that is not this
+kernel's doing.
 
 Two things this phase measured are worth carrying forward, because both were
 *surprises that booting found rather than reading*: the cursor plane's composition
@@ -2173,20 +2175,195 @@ up front - with ten `cargo test` cases beside it, following `drm_blob.rs` and
 side knowing about the other: a compositor's flip lands *under* the pointer rather than
 erasing it, and a `MODE_CURSOR` move re-copies and re-blends, so the pointer moves
 without the compositor redrawing anything. On a device that *has* a cursor queue the
-host draws the pointer instead, so `paint_cursor` is skipped (`host_cursor_live()` gates
+host draws the pointer instead, so `paint_cursor` is skipped (`host_cursor_live` gates
 the one call site) and a move costs one small cursor-queue command rather than a
 full-frame gather and flush. The `ARGB8888` in that sentence is the format the fourcc
 correction above had to land first.
+
+
+**The cursor queue is used whenever the device has one; the blend is only for a card without it — and the measurement that settled it is the GL card's.** `host_cursor_live` was briefly narrowed to require `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` on the reasoning that a client which cannot name its hotspot has no honest placement for its image. That was wrong, and the GL card showed why: with the predicate narrowed, weston posted **no** `UPDATE_CURSOR` at all and the pointer vanished completely, where before it at least appeared. The hotspot is a *placement* question — the kernel sends position minus hotspot, which is the identity when no hotspot was set — not a reason to abandon the queue. The predicate is `card().cursor_q` again - one accessor, `host_cursor_live`, read from both the locked and the unlocked call sites.
+
+**What the queue path was then measured to carry, and where the pointer actually goes missing.** With the predicate restored, on `virtio-gpu-gl-pci` (`virgl=1 context_init=1 cursorq=1`), weston binds its cursor plane through an atomic commit (`mpos-dbg: show_cursor want=show 64x64 at 639,399`) and the kernel posts it — but the image in the guest's own pages is **empty**: `cursor show 64x64 entries=4 guest nonzero=0` for every show, and QEMU re-sends a 64x64 all-transparent cursor over VNC (`CursorWithAlpha`, −239). The control that clears the card and the kernel of blame is a client of this repository's own (`.workbuddy/cursorprobe.c`): it fills a 64x64 ARGB buffer itself, calls `MODE_CURSOR`, and the same accounting reads `guest nonzero=2048 rows=[1024,1024,0,…] cols=[0,0,512,512,512,512,0,0]` — a 32×32 block at (16,16), exactly what it drew — reaching the host as 1024 non-transparent pixels. So the device, the resource backing, the transfer, the cursor queue and the read-back are all sound on the GL card, and **what is empty is weston's own cursor drawing**.
+
+**The theme is not a switch between hardware and software cursors — it selects the
+*artwork*, and weston's fallback artwork is a 2×2 white square.** Both halves measured on
+`virtio-gpu-gl-pci`, no theme versus a named one, with the cursor plane bound through
+atomic in both cases:
+
+| `cursor-theme` | what reaches the guest's cursor pages | what the host gets |
+|---|---|---|
+| `breeze_cursors` named | every show: **0** non-zero bytes | an all-transparent 64x64 cursor (VNC `CursorWithAlpha`, −239) |
+| absent | every show: **17** bytes, at image offsets `[0..8, 256..259, 263..267]`, all `0xFF` | a 64x64 cursor whose only non-transparent pixels are a 2x2 white block at (0,0) |
+
+17 bytes is not a drawn arrow — it is two 8-byte runs on the image's first two rows,
+i.e. a 2x2 opaque white square at the image's top-left corner, which is exactly weston's
+built-in fallback when no theme resolves. That is the "small cursor" visible with no
+theme named, and it is drawn at the pointer position because the hotspot is (0,0): the
+pointer *is* the square's corner. With `breeze_cursors` named the buffer is **empty**
+instead, so nothing is visible at all.
+
+**Re-posting `UPDATE_CURSOR` on a move was tried and measured *not* to work, so the move
+path posts `MOVE_CURSOR` again — and what settled it is a probe that needs no compositor.**
+The move path did post `MOVE_CURSOR` alone, and the theory was that a hardware-cursor
+plane scans its buffer live, so a compositor whose fill lands *between* posts would keep
+repositioning an empty image (weston's first bind does come before its first repaint).
+The re-post was made, then tested by `.workbuddy/curprobe.c` — one process that owns
+the card, fills a 64x64 dumb buffer itself and walks four phases, read back through
+VNC's `CursorWithAlpha` pseudo-encoding:
+
+| phase | what the guest did | the host's pointer bitmap afterwards |
+|---|---|---|
+| P1 | fill opaque red, bind (`CURSOR_BO\|MOVE`) | 64x64, `R=FF` everywhere — **red** |
+| P2 | fill a green 32x32 quadrant, `MOVE` only | still **red** |
+| P3 | fill opaque blue, re-bind the *same* framebuffer | still **red** |
+| P4 | bind a *second* framebuffer over the same blue buffer | **blue** |
+
+So the image refreshes only when a transfer does. QEMU's `update_cursor` copies the
+resource's *host-side* image — `virtio_gpu_update_cursor_data` is
+`memcpy(s->current_cursor->data, pixman_image_get_data(res->image), 4096 * 4)`, no
+format conversion and no per-pixel work — and only `TRANSFER_TO_HOST_2D` refills that
+image. An `UPDATE_CURSOR` without a transfer re-sends what the last transfer left,
+which is a bare move in a more expensive costume. Linux gates both the transfer and the
+update on `fb != old_fb` and sends `MOVE_CURSOR` otherwise (`virtio_gpu_cursor_plane_update`),
+so `MOVE_CURSOR` is what this driver sends. P1 is also the control that clears the card:
+a filled buffer's colour reaches the host intact on both `virtio-gpu-pci` and
+`virtio-gpu-gl-pci` (the alpha lane reads zero at the VNC client, which is that
+client's own pixel format carrying no alpha, not the image).
+
+**Where the pointer is actually lost: weston's cursor image is empty before it
+reaches the card.** Kernel accounting over a whole weston session with pointer
+moves (`.workbuddy/wcur.py`): weston makes exactly two 64x64 buffers, and they
+are the only buffers in the session that arrive through `CREATE_DUMB` rather
+than `VIRTGPU_RESOURCE_CREATE` — Mesa's `gbm_dri_bo_create` falls back to a dumb
+buffer for anything asked with `GBM_BO_USE_WRITE`. Both are `ADDFB2`'d (fb 100,
+fb 101) and bound *alternately*, so every pointer move takes the fresh path —
+create, attach, transfer, update — and every one of those transfers reads
+`nz=0`. The shim that logs the **caller's own source buffer** at
+`gbm_bo_write` names the reason: `@@@PRE h3
+buf=00000000000000000000000000000000` — weston writes 16384 *zero* bytes, and
+the write honestly copies them. The read-back through a fresh `MAP_DUMB`
+agrees, and the shim's own write through a second, writable mapping of the same
+buffer lands (`own_write_landed=64/64`), so the buffer is reachable and nothing
+is lost in flight.
+
+Four controls clear everything downstream of that, each measured:
+
+| control | result |
+|---|---|
+| a weston-free probe binding a magenta 32x32 block (`clientcursor.c`) | `cursor show … nz=3072` kernel-side; the host's pointer bitmap carries it |
+| a `PROT_WRITE`-only mapping written and read **cross-process** (`curprobe.c` P8/P9) | `nz=16384`, the first byte round-trips — write-only maps, which is what weston asks for (measured `prot=0x2`), alias the same frames as a reader's `MAP_DUMB` |
+| the same image bound on handle 2, 3 and 4 | each colour reaches the host — the slot is not it |
+| `gbm_bo_write` from a plain process, handle 1 and handle 2 (`gbmprobe.c`) | the magenta block lands (`nz=3072 magenta=1024`) |
+
+`gbm_bo_write` also fires only **sometimes**: weston writes the image when the
+sprite changes, so a session in which desktop-shell never comes up shows no
+write at all. The empty image is therefore upstream of this kernel — no client
+has ever created a pointer surface with a sprite, and weston keeps committing
+an all-zero buffer.
+
+**The shell's own blocker was the epoll report, and fixing it completes the
+startup (§1.1).** The 120-second stall that made desktop-shell look absent was
+`vfs::epoll::report` ORing `EPOLLRDNORM` into every readable report: the shell
+registers its timerfd for `EPOLLIN` alone, printed `unexpected timerfd events
+41`, never read the timer, and never finished. With `revents & interest` in
+place, the same boot sequence the earlier sessions used (weston 16, DRM
+backend, `--renderer=gl`, a 1280x800 `Virtual-1`) now shows the whole chain:
+the shell reads the registry, binds `xdg_wm_base`/`wl_seat`/`wl_shm`/
+`zwp_linux_dmabuf_v1`, commits its panel (`wl_surface#19` damage `0,0,1280,32`
+repeatedly), and drives the pointer (`wl_pointer#29.set_cursor(5,
+wl_surface#26, 5, 5)` over more than two minutes of motion, with `enter`/
+`leave` between its surfaces). The old `unexpected timerfd events 41` line is
+gone from the log. So desktop-shell completes, and the one thing still missing
+is its cursor *image* — the empty-buffer measurement above, which is upstream
+(Mesa's virtio-gpu GBM allocation).
+
+**The instrument chain that isolated it, each link measured on the same boot:** a control
+client filling its own 64x64 buffer reaches the host as 1024 opaque pixels (card, queue,
+transfer, VNC read-back all sound); `gbm_bo_write` from a plain process lands in the
+kernel's pages (`nz=2048`) and reaches the host (`GBM` sound); the whole wl_shm chain —
+memfd, fd pass over a unix socket, second process's `MAP_SHARED` mapping, both directions
+of visibility — answers `SHM-CHAIN OK`; and 400 half-second samples of weston's own cursor
+buffers across a session with pointer moves read `nz=0` every time — so the fill never
+reached the bound backing, whatever weston's own `gbm_bo_write` did.
+
+**The exit-path park — the flaky hang found and fixed.** A guest probe that exits with
+the cursor plane bound hung in its own exit, forever: the probe's output file completed
+(including the fork repro's last line), but the marker after the process exited never
+came, on three consecutive runs. Split with bounded probes at both ends of the job: the
+exiting task printed `hide: posting SetCursor 0`, the render task printed `job picked up`
+and `device done rc=Ok` - and the caller's `done` wake never arrived. The mechanism: the
+exit path marks the task `.exited` **first** (child_exit's first line) and releases the
+address space after it - so the DRM file release runs while the task is already dead to
+the scheduler. `render::job` parked the dying task in `block_until`, the completion wake
+landed on a task the scheduler has stopped running ("a task with `exited` set is never
+scheduled again" - the same rule this file's `release_exited` comment states), and the
+process hung in exit; the parent's `wait` never returned. Fixed in `render::job`: a task
+the scheduler has stopped running posts its device command fire-and-forget (queued in
+order, the render task woken, the result dropped) instead of parking - safe because none
+of the exit path's teardown commands reads the buffer backing they are about to release
+(the hide is `id=0`, which loads no image; the unrefs and detaches are bookkeeping).
+Measured: the same probe now exits cleanly, its parent's `wait` returns, and the whole
+diagnostic sequence completes.
+
+**Fork is innocent, measured with its own repro.** The suspicion that fork's copy-on-write
+diverted the compositor's post-fork writes to a private copy died on a direct test: a
+guest probe (`.workbuddy/gbmprobe.c`) maps and touches its cursor buffer **before** a
+fork, the parent writes a second pattern through the same GBM BO **after** it, and the
+child — a fresh \`MAP_DUMB\` read of the same handle — reports the parent's post-fork
+pattern (\`child sees first8: bb 00 00 ff\`). Post-fork GBM writes land. The divergence is
+specific to what weston's process does around its write, not to fork itself. (Also
+measured en route: a \`MODE_CURSOR\` from a non-master is refused \`EACCES\` — the
+presentation gate working as designed.)
+
+**And weston's own write was watched directly, which is where the trail ends.** An
+`LD_PRELOAD` shim interposing `gbm_bo_write` (resolving the real one through an explicit
+`dlopen("libgbm.so.1")` — musl's `RTLD_NEXT` failed, measured) caught weston calling it
+**once, `rc=0`, `count=16384`** — the full 64x64 image, successfully written. Yet the
+buffer the plane binds reads zeros, and neither the `gbm_bo_create`/`gbm_bo_create_with_modifiers`
+nor the `gbm_bo_get_handle`/`gbm_bo_get_handle_for_plane` entry points fired during the
+session — the cursor BOs come through a creation path none of the interposed symbols
+name. So weston writes 16 KiB of cursor image into an object that is *not* the backing of
+the framebuffer the plane binds, on this Mesa/weston stack; the card, the ABI, the dumb
+buffer, the map, the write-through, GBM's own write path and the wl_shm chain are all
+cleared by controls. The next step is inside Mesa's virtio-gpu GBM allocation for cursor
+BOs (which allocation the write lands in, and which one `ADDFB2` binds), and it is
+upstream of this repository.
+
+**One flaky hang met on the way, and its cause is the epoll bug above:** in one run of
+several, weston stopped after `launching weston-desktop-shell` — no repaint, no cursor
+binds — while the kernel and the watchers kept running; the next boot was clean. That is
+the timerfd report the shell refuses (`unexpected timerfd events 41`, §1.1), and it was
+intermittent because whether the shell's first timer expiry arrived before its next
+`poll` depended on scheduling. With `revents & interest` in place the stall is gone and
+the shell's panel and `set_cursor` traffic are continuous; the resource-creation flood
+that precedes it (dozens of `target 0, 8x1` virgl objects) is not implicated.
+
+**The plane and renderer paths, and the one thing that really switches them.** weston's
+DRM backend uses the **cursor plane** when it has a `gbm_cursor_fb` to hand `ADDFB2`, and
+the **renderer** otherwise (logging `cursor buffers unavailable, using gl cursors`).
+Neither `cursor-theme` nor `cursor-size` touches that choice — they only pick artwork — so
+on this machine the switch that matters is the *card*, because the software blend needs a
+frame whose pixels are the guest's:
+
+- `virtio-gpu-pci` (2D, no virgl): the frame is a guest dumb buffer, `copy_to_scanout`
+  copies it and `paint_cursor` blends the arrow into the scanout — measured working
+  (`paint_cursor at (639,399) = [255,255,255,255]`, visible in the VNC framebuffer);
+- `virtio-gpu-gl-pci` (virgl): the frame is a *device* resource (`Resource::host_pixels`),
+  `copy_to_scanout` returns early and the blend is structurally unavailable, so only the
+  cursor queue can show a pointer — and that is the path whose image weston supplies
+  empty or as the 2×2 stub.
+
+**The software blend is a fallback that a device-frame cannot use, and that is now stated.** `copy_to_scanout` returns early for a framebuffer whose pixels are the device's (`fb_pixels_are_the_devices`), because the guest pages below it were never written; `paint_cursor` therefore never runs for such a frame, and blending into the driver's own scanout would not reach the display anyway while a client resource is being scanned out. On the GL card weston's frame *is* such a resource, so the blend is structurally unavailable there — it remains correct and measured for a card with no cursor queue and a guest-pixel frame (the 2D card, where `mpos-dbg: paint_cursor at (639,399) = [255,255,255,255]` showed the pointer in the VNC framebuffer).
 
 **One gap in this area is named rather than filled.** An unknown CRTC in
 `MODE_CURSOR` is `EINVAL`, which is what this file has always answered for an
 object it cannot use, where Linux's `drm_crtc_find` says `ENOENT`; the whole file
 would have to move together for that to change, so the cursor follows the file
-rather than splitting it. A second gap is named by necessity rather than choice: both
-configured machines' virtio-gpu devices expose a cursor queue, so the no-cursorq
-software-fallback branch cannot be exercised on this host - it is kept because a
-device without a second queue needs it, and it is stated as untested-here rather than
-claimed as measured.
+rather than splitting it. The software-blend branch, once reachable only on a device with
+no cursor queue (which neither configured machine has), is now exercised on this host
+too: a client that binds the cursor plane without the hotspot cap takes that path by
+design, and weston is exactly that client - measured 2026-10-21, the blend's pixels read
+back out of the scanout over VNC.
 
 **The other one - "the cursor plane publishes no `SRC_*`/`CRTC_W`/`CRTC_H`" - was
 wrong, and the weston desktop caught it.** A wlroots or weston atomic state carries
@@ -2206,9 +2383,8 @@ which is what keeps the `AGENTS.md` §3 rule the original paragraph invoked inta
 this card's cursor has no scaler and no crop, so `Commit::cursor_rect_ok` accepts only
 the identity rectangle (the image whole, at its own size) and refuses a real crop or
 scale with `EINVAL` - the same answer a non-scaling hardware cursor plane gives. The kernel's
-atomic cursor path is complete by inspection; reading the pointer back on the window, and
-settling whether weston upscales its image to the cap this card answers (see R.7), is what
-closes it.
+atomic cursor path is complete by inspection; reading the pointer back on the window is
+what closed it - see the hotspot measurement above, which is the same boot answering it.
 
 Properties and caps, cheap one at a time and load-bearing in aggregate: `EDID`
 (a blob - with non-zero `mm_width`/`mm_height` and a `subconnector`, if anything

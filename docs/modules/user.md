@@ -12,24 +12,22 @@ between them is *what a program needs to be a program*:
 | `src/` (`mpos-user`) | ordinary `std` programs that ship in the system image; `src/bin/hello.rs` is the one there today | `x86_64-unknown-linux-musl`, static |
 | `tests/` (`mpos-user-tests`) | the test suite: flat, auto-discovered `src/bin/t-*.rs`, each a `fn main` that takes its verdict from the crate's own `Report` | `x86_64-unknown-linux-musl`, static; runs on **both** machines |
 
-One suite, and its shape is the end of a migration rather than a preference. The
-suite used to be two: a `no_std` raw-syscall conformance crate (`user/abitest`,
-built for `x86_64-unknown-none` with the kernel's own numbers `#[path]`-included
-from `nr.rs`) beside this `std` one, and `docs/notes/` §15.11 moved it across a
-batch at a time — mechanical per program, `#![no_std]` + `lin::raw_sys` becoming
-`fn main()` + `rustix::`, `lin::check_true`/`done` becoming
-`Report::check`/`finish`. The last batch deleted the `no_std` crate with the
-program that finished it, so `user/tests` is the whole suite now and the gate
-builds one target for it. What the old crate pinned at the *raw door* — the
-instruction, the number, the register shape — this one pins through the surface a
-musl program actually speaks: `user/tests/Cargo.toml`'s header states the library
-rule that keeps it honest, **`rustix` first** and `libc` only where one of the
-measured clauses applies (a call `rustix` does not bind at all; a wrapper that is
-not the syscall the ABI promises or that discards its result; a wrapper whose
-*shape* cannot express the claim). The clauses are not preferences — each names
-the program that measured it (`t-faccessat`, `t-dup2`, `t-dup3`, `t-getcwd`,
+One suite, and its shape is the end of a migration rather than a preference. It
+used to be two: a `no_std` raw-syscall conformance crate (`user/abitest`, built
+for `x86_64-unknown-none` with the kernel's numbers `#[path]`-included from
+`nr.rs`) beside this `std` one, and `docs/notes/` §15.11 moved it across a batch
+at a time (`#![no_std]` + `lin::raw_sys` → `fn main()` + `rustix::`,
+`lin::check_true`/`done` → `Report::check`/`finish`). Its last batch deleted the
+`no_std` crate with the program that finished it, so `user/tests` is the whole
+suite and the gate builds one target for it. What the old crate pinned at the
+*raw door* this one pins through the surface a musl program speaks:
+`user/tests/Cargo.toml`'s header states the rule, **`rustix` first** and `libc`
+only where one of the measured clauses applies (a call `rustix` does not bind at
+all; a wrapper that is not the syscall the ABI promises or that discards its
+result; a wrapper whose *shape* cannot express the claim). Each clause names the
+program that measured it (`t-faccessat`, `t-dup2`, `t-dup3`, `t-getcwd`,
 `t-openat2`, `t-fcntl`, `t-filelock`, `t-fstat`, …), and the
-bitflags-versus-plain-enum distinction the rule turns on is spelled out there too.
+bitflags-versus-plain-enum distinction is spelled out there too.
 
 What deliberately does not live here: the test *runner* (`xtask/src/selftest.rs`
 builds, stages and reads the verdicts), the kernel-side pins (those are host
@@ -55,15 +53,11 @@ builds, stages and reads the verdicts), the kernel-side pins (those are host
   the panic path, through `Report::check`/`Report::finish`
   (`tests/src/lib.rs`). The `=== RUN/PASS/FAIL` lines *around* a program are the
   runner's, written from the exit status — a division the `Report` header
-  states. The `no_std` suite this used to share the protocol with finished
-  migrating and was deleted (§15.11's last batch), so there is one
-  implementation now.
+  states.
 - **The numbers come from one source.** The `no_std` suite `#[path]`-included the
-  kernel's `src/syscall/linux/nr.rs` so kernel and test could not disagree about
-  a number; with it gone, the same rule reads its numbers from `rustix`/`libc` —
-  the maintained tables — rather than from a second copy in the tree, which is
-  the clause `user/tests/Cargo.toml`'s header states and each measured program
-  names.
+  kernel's `src/syscall/linux/nr.rs`; with it gone, the same rule reads its
+  numbers from `rustix`/`libc` — the maintained tables — rather than from a
+  second copy in the tree, the clause `user/tests/Cargo.toml`'s header states.
 - **`tests.toml` decides the default sweep, not the crate.** A test named in a group
   is left out of the plain run: `external` needs the host network or a listener,
   `slow` measures, `diagnostic` is not a check — all three bind **both** machines,
@@ -79,12 +73,10 @@ builds, stages and reads the verdicts), the kernel-side pins (those are host
 ## What userspace sees
 
 These modules *are* userspace; they own no kernel promise, they **pin** the ones
-`docs/uapi/` records. Every row in that inventory names the program that would
-fail if the promise changed — a syscall's shape and errno, an ioctl family, a
-struct layout, a flag vocabulary — and this suite is how those pins reach the
-machine rather than a comment. The `t-` naming, the `/bin/t-*` glob and the verdict
-lines are what make a claim traceable from the UAPI row, through the log, to one
-`ok:` line.
+`docs/uapi/` records. Every row there names the program that would fail if the
+promise changed, and this suite is how those pins reach the machine rather than a
+comment: the `t-` naming, the `/bin/t-*` glob and the verdict lines make a claim
+traceable from the UAPI row, through the log, to one `ok:` line.
 
 ## Pins
 
@@ -99,9 +91,8 @@ lines are what make a claim traceable from the UAPI row, through the log, to one
 ## Evidence and open work
 
 - `docs/notes/` §15.11 is the migration ledger: every batch, the fixture that moved,
-  the rule clause it measured, the kernel bugs it found, and the gate runs. The
-  migration is finished — the `no_std` crate was deleted with its last program —
-  and the page is what to read before adding or moving a `t-` program.
+  the rule clause it measured, the kernel bugs it found, and the gate runs — what
+  to read before adding or moving a `t-` program.
 - `docs/ROADMAP.md`'s status board and its Phase-15 items are the plan; what is
   left of the second machine's gaps is `tests.toml`'s own `gaps` list, one name
   long (`t-arch-prctl`, an architecture rather than a missing handler).

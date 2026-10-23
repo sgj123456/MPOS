@@ -245,6 +245,20 @@ impl Actions {
             *slot = action;
         }
     }
+
+    /// `exec`'s rule: a caught signal returns to `SIG_DFL`, while an ignored
+    /// one stays ignored - which is what makes `nohup` and a shell's
+    /// `SIG_IGN` across `exec` work. Measured on a current host
+    /// (`.workbuddy/probe_sig_inherit.c`, Linux 7.2.11): after `exec`, a
+    /// `SIGUSR1` handler read back `SIG_DFL` and a `SIGUSR2` `SIG_IGN` read
+    /// back `SIG_IGN`.
+    pub fn reset_caught(&mut self) {
+        for slot in &mut self.0 {
+            if !slot.is_ignore() {
+                *slot = Action::default();
+            }
+        }
+    }
 }
 
 /// Whether `sig` names a signal at all: Linux's `valid_signal`, the range
@@ -883,6 +897,34 @@ mod tests {
         assert!(catchable(SIGTRAP as usize));
         assert!(catchable(SIGCONT as usize));
         assert!(catchable(SIGTSTP as usize));
+    }
+
+    /// `exec` resets a caught disposition and keeps an ignored one - the rule
+    /// that makes `nohup` and a shell's `SIG_IGN` survive an `exec`, measured
+    /// on a current host (`.workbuddy/probe_sig_inherit.c`).
+    #[test]
+    fn exec_resets_caught_dispositions_and_keeps_ignored_ones() {
+        let mut actions = Actions::default();
+        actions.set(
+            SIGUSR1,
+            Action {
+                handler: 0x4000,
+                flags: SA_RESTART,
+                restorer: 0x5000,
+                mask: bit(SIGINT),
+            },
+        );
+        actions.set(
+            SIGUSR2,
+            Action {
+                handler: SIG_IGN,
+                ..Action::default()
+            },
+        );
+        actions.reset_caught();
+        assert!(actions.get(SIGUSR1).is_default());
+        assert!(actions.get(SIGUSR2).is_ignore());
+        assert!(actions.get(SIGTERM).is_default());
     }
 
     /// The two questions `rt_sigaction` asks *separately*: is this a signal at
