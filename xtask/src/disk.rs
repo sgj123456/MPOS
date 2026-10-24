@@ -499,7 +499,7 @@ pub struct Boot<'a> {
 /// does, so a boot whose inputs are unchanged boots the image already in
 /// `build/`. The check fails *towards* rebuilding: anything it cannot prove is
 /// unchanged is rebuilt.
-pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<PathBuf> {
+pub fn sweep_medium(build_dir: &Path, into: &Path, arch: Arch, boot: &Boot<'_>) -> Result<PathBuf> {
     let Boot {
         // Not laid on the ESP any more - it is inside `loader` now - but still
         // read here for nothing and by `medium_is_stale` for the kernel's own
@@ -515,19 +515,25 @@ pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<Pat
     // sweep on a fresh tree has no `disk`/`rootfs` run behind it to have written
     // the file. It is a known 1 MiB pattern, so laying it once and reusing it is
     // the whole cost.
-    ensure_pattern_image(build_dir, arch)?;
+    // Everything named below lands in `into`, which is the machine's own
+    // medium directory: the sweep's single medium lays it in `build/`, and a
+    // lane lays its own beside its own serial log, so two lanes' disks and the
+    // disks their programs write to (the SATA file, the pattern image) cannot
+    // meet. The *inputs* stay shared in `build/` - the initramfs below is one
+    // archive however many media stage it.
+    ensure_pattern_image(into, arch)?;
     // The SATA disk, for exactly the same reason: `virt_machine_args` attaches
     // an AHCI controller to every boot of the second machine, and a sweep on a
     // fresh tree has no `disk`/`rootfs` run behind it either. Laid *fresh*
     // rather than merely ensured, because this sweep's own programs write to it
     // (`reset_sata_image` says why the two are not the same question).
-    reset_sata_image(build_dir)?;
-    let disk = medium(build_dir, arch).with_extension("img");
+    reset_sata_image(into)?;
+    let disk = medium(into, arch).with_extension("img");
     // Hoisted above the check because it is an *input* to it: `ensure_path` is
     // itself cached, and when it does rebuild the archive the new mtime is
     // exactly what makes the disk stale.
     let initramfs = crate::initramfs::ensure_path(build_dir, arch)?;
-    let stamp = medium_stamp(build_dir, arch);
+    let stamp = medium_stamp(into, arch);
     if !medium_is_stale(arch, &disk, &stamp, &initramfs, boot)? {
         println!(
             "disk: {} is up to date (its inputs are unchanged)",
@@ -536,7 +542,7 @@ pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<Pat
         return Ok(disk);
     }
 
-    let esp = esp_dir(build_dir, arch);
+    let esp = esp_dir(into, arch);
     if esp.exists() {
         fs::remove_dir_all(&esp).with_context(|| format!("Failed to clear {}", esp.display()))?;
     }
@@ -569,7 +575,7 @@ pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<Pat
 
     // The root filesystem a sweep boots: the archive unpacked, then the overlay
     // pair and the payload over it.
-    let staging = ext4_staging(build_dir, arch);
+    let staging = ext4_staging(into, arch);
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)
         .with_context(|| format!("Failed to create {}", staging.display()))?;
@@ -599,11 +605,11 @@ pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<Pat
     for (name, bytes) in entries {
         stage_program(&staging, name, bytes)?;
     }
-    lay_ext4(&ext4_image(build_dir, arch), &staging, disk_bytes)?;
+    lay_ext4(&ext4_image(into, arch), &staging, disk_bytes)?;
 
     // The ESP half: `mkfs.fat` makes the empty volume and `fat::populate` fills
     // it, which is the root-free way to do what `mcopy` or a mount would.
-    let esp_img = esp_image(build_dir, arch);
+    let esp_img = esp_image(into, arch);
     if esp_img.exists() {
         fs::remove_file(&esp_img)
             .with_context(|| format!("Failed to clear {}", esp_img.display()))?;
@@ -624,7 +630,7 @@ pub fn sweep_medium(build_dir: &Path, arch: Arch, boot: &Boot<'_>) -> Result<Pat
         &disk,
         &esp_img,
         ESP_BYTES,
-        &ext4_image(build_dir, arch),
+        &ext4_image(into, arch),
         disk_bytes,
     )?;
 

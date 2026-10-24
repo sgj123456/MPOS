@@ -31,7 +31,9 @@
 
 use anyhow::{Result, bail};
 
-use crate::config::{GAP_GROUP, Machine, TestConfig};
+#[cfg(test)]
+use crate::config::GAP_GROUP;
+use crate::config::{Machine, TestConfig};
 use crate::utils;
 
 /// The summary line the parse below counts on. The verdict lines around it are

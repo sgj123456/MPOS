@@ -62,8 +62,26 @@ struct Cli {
     /// (`AGENTS.md` §2). Parsed once, up front, into an `Arch`, so nothing
     /// downstream compares this string again; what differs between the machines
     /// is `Arch`'s own answers and each file's `[aarch64]` section.
-    #[arg(long, value_name = "ARCH", global = true, default_value = "x86_64")]
-    arch: String,
+    ///
+    /// Left out, every command but `test` means x86_64; `test` means *both*
+    /// machines (`--all-targets`, below), and naming `--arch` here narrows it
+    /// back to one.
+    #[arg(long, value_name = "ARCH", global = true)]
+    arch: Option<String>,
+
+    /// `test`: sweep every machine this front end builds - the default, and
+    /// also the explicit spelling of it. Each machine runs the *same* sweep -
+    /// the same lanes, the same live dashboard, the same report - because one
+    /// gate with two shapes would be two gates neither of which is maintained.
+    /// Naming `--arch` narrows the run to that machine and this flag adds
+    /// nothing to it.
+    #[arg(long, global = true)]
+    all_targets: bool,
+
+    /// `test`: sweep the first machine alone, which is what a plain `test` did
+    /// before both machines became the default.
+    #[arg(long, global = true, overrides_with = "all_targets")]
+    no_all_targets: bool,
 
     /// `test`: groups of user tests to run in addition to the ones that are in
     /// no group (default: the `default` list in `tests.toml`, which is empty).
@@ -139,7 +157,31 @@ fn main() -> Result<()> {
     // one machine while reporting another is the one failure this must not
     // have. Parsing it here - before any command - is what makes it the switch
     // for all of them rather than a hint two of them read.
-    let arch = Arch::parse(&cli.arch)?;
+    //
+    // Left out, a command still has to mean one machine, and x86_64 is what a
+    // bare command line has always meant here; `test` is the one command whose
+    // no-name meaning grew (to `--all-targets`, below), so it reads `targets`
+    // and not this.
+    let arch = match cli.arch.as_deref() {
+        Some(name) => Some(Arch::parse(name)?),
+        None => None,
+    };
+    // `test`'s machines. A named `--arch` is the narrowest ask and wins;
+    // `--no-all-targets` is the historic default spelled on purpose; the
+    // default is both machines, which `--all-targets` also spells for a
+    // command line that wants to say so out loud.
+    let targets: Vec<Arch> = match arch {
+        Some(arch) => vec![arch],
+        None if cli.no_all_targets => vec![Arch::X86_64],
+        None => vec![Arch::X86_64, Arch::Aarch64],
+    };
+    if arch.is_some() && cli.all_targets {
+        eprintln!(
+            "xtask: --arch names one machine, so --all-targets adds nothing;              sweeping {} alone",
+            arch.map(|arch| arch.name()).unwrap_or_default()
+        );
+    }
+    let arch = arch.unwrap_or(Arch::X86_64);
 
     // A build from before this command knew about ownership can leave a
     // root-owned `build/` or `target/` behind, and cargo cannot write into a
@@ -273,6 +315,7 @@ fn main() -> Result<()> {
         cli.command,
         Invocation {
             arch,
+            targets,
             build_dir: &build_dir,
             profile: &profile,
             artefacts_ready,
@@ -352,6 +395,9 @@ fn needs_kernel(command: Commands, run_needs_build: bool) -> bool {
 /// `match` below readable: each arm names only the fields it actually reads.
 struct Invocation<'a> {
     arch: Arch,
+    /// `test`'s machines: one when `--arch` named it, both by default. Every
+    /// other command works on `arch` alone.
+    targets: Vec<Arch>,
     build_dir: &'a Path,
     profile: &'a str,
     /// Set when the kernel and loader are known to be current, so a command
@@ -367,6 +413,7 @@ struct Invocation<'a> {
 fn dispatch(command: Commands, invocation: Invocation<'_>, tests: sweep::Selection) -> Result<()> {
     let Invocation {
         arch,
+        targets,
         build_dir,
         profile,
         artefacts_ready,
@@ -410,10 +457,7 @@ fn dispatch(command: Commands, invocation: Invocation<'_>, tests: sweep::Selecti
         // machine's list of what it cannot serve (`sweep::select`). So
         // `--groups`/`--all-groups` mean the same thing on either arm, and what
         // a plain sweep leaves out it leaves out on both (§15.38).
-        Commands::Test => match arch {
-            Arch::X86_64 => selftest::run_tests(build_dir, profile, tests),
-            Arch::Aarch64 => selftest::run_disk_sweep(build_dir, profile, arch, tests),
-        },
+        Commands::Test => selftest::run(build_dir, profile, &targets, tests),
         Commands::Depgraph => depgraph::run(&utils::project_root()?),
         Commands::Clean => utils::clean(build_dir),
     }

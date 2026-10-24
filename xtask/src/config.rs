@@ -460,6 +460,17 @@ pub enum Machine {
     Aarch64,
 }
 
+/// The machine behind a command-line `Arch`, so a sweep's selection is asked
+/// in this file's own vocabulary rather than through a match at the call site.
+impl From<crate::arch::Arch> for Machine {
+    fn from(arch: crate::arch::Arch) -> Machine {
+        match arch {
+            crate::arch::Arch::X86_64 => Machine::X86_64,
+            crate::arch::Arch::Aarch64 => Machine::Aarch64,
+        }
+    }
+}
+
 /// The group name that lists what a machine cannot serve yet - an exclusion
 /// rather than a reason, and the one group a run may not ask for by name.
 pub const GAP_GROUP: &str = "gaps";
@@ -603,6 +614,7 @@ impl TestConfig {
     /// its group that the payload does not carry would otherwise be a test
     /// quietly left out of both sweeps, which is the one failure this file exists
     /// to prevent.
+    #[cfg(test)]
     pub fn machine_tests(&self, machine: Machine) -> Vec<(&str, &str)> {
         self.groups
             .iter()

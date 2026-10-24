@@ -29,7 +29,7 @@ use crate::sweep;
 use crate::tui;
 use crate::utils;
 
-/// What one sweep of the guest arm produced.
+/// What one sweep of one machine's arm produced.
 ///
 /// The first three fields are what the detailed report reads; the last two are
 /// what the gate's summary and the *next* run are built from - each lane's own
@@ -43,76 +43,143 @@ struct Guest {
     costs: BTreeMap<String, u64>,
 }
 
-/// How long the guest may run before the harness gives up on it. TCG is slow;
-/// KVM is not. `MPOS_TEST_TIMEOUT` overrides, in seconds.
-const DEFAULT_TIMEOUT_SECS: u64 = 900;
+/// The exit status that says a machine ended the way its own protocol ends.
+///
+/// The first machine's kernel writes QEMU's debug exit, so its lane answer is
+/// 33. The second's runner ends the machine with `poweroff -f` and its QEMU
+/// stays alive under the parked kernel, so the poll stops at the protocol's
+/// own `=== END` and the harness stops the process - a finished lane's status
+/// is therefore `None`, and `None` is its clean answer rather than a missing
+/// one. One machine, one shape, and a lane that ended any other way is a lane
+/// that did not finish.
+fn clean_exit(arch: Arch) -> Option<i32> {
+    match arch {
+        Arch::X86_64 => Some(33),
+        Arch::Aarch64 => None,
+    }
+}
 
-pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -> Result<()> {
-    // The gate's own clock, from the first byte of output: the report at the end
-    // quotes one number for the whole command, and it is the number a person
-    // times with a stopwatch.
+/// Whether the poll's terminator, not only the process exit, says a lane is
+/// done - the second machine's runner prints `=== END` and its QEMU does not
+/// leave on its own (`docs/notes/` §15's disk-sweep arm measured that first).
+fn lane_terminators(arch: Arch) -> &'static [&'static str] {
+    match arch {
+        Arch::X86_64 => &[],
+        Arch::Aarch64 => &["=== END"],
+    }
+}
+
+/// Where the combined serial wire of one arm lands. The per-lane files stay
+/// beside it under the arm's lane directories, which is where a failure that
+/// is one machine's is read from.
+fn combined_log(build_dir: &Path, arch: Arch) -> PathBuf {
+    match arch {
+        Arch::X86_64 => build_dir.join("test-serial.log"),
+        Arch::Aarch64 => build_dir.join(format!("{}-test-serial.log", arch.name())),
+    }
+}
+
+/// The host unit-test stage, started once beside the first sweep and joined at
+/// its first report. `join` is idempotent: the run's error paths call it again
+/// so a stage that was started is always waited for and its text always
+/// prints, whoever failed first.
+struct HostStage1 {
+    handle: Option<std::thread::JoinHandle<Result<String>>>,
+    started: Instant,
+    joined: Option<Result<String, anyhow::Error>>,
+    millis: u64,
+}
+
+impl HostStage1 {
+    fn start() -> HostStage1 {
+        HostStage1 {
+            handle: Some(std::thread::spawn(run_unit_tests)),
+            started: Instant::now(),
+            joined: None,
+            millis: 0,
+        }
+    }
+
+    /// Wait the stage out, print its text, and cache the answer. The duration
+    /// is the first join's, not the second call's.
+    fn join(&mut self) -> Result<&String> {
+        if self.joined.is_none() {
+            self.millis = self.started.elapsed().as_millis() as u64;
+            let joined = match self.handle.take() {
+                Some(handle) => match handle.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "the host unit-test stage panicked; the sweeps' own \
+                         verdicts are above"
+                    )),
+                },
+                None => Ok(String::new()),
+            };
+            match &joined {
+                Ok(text) => print!("{text}"),
+                Err(err) => eprintln!("{err}"),
+            }
+            self.joined = Some(joined);
+        }
+        // Cloned out rather than borrowed through two layers of `Option<Result>`:
+        // `Result<&String, &Error>` cannot become `Result<&String, Error>`
+        // without a clone, and the text is at most a few kilobytes.
+        match self.joined.as_ref().unwrap() {
+            Ok(text) => Ok(text),
+            Err(err) => Err(clone_anyhow(err)),
+        }
+    }
+}
+
+/// Re-raise a cached `anyhow` error: the cached one is owned, and a second
+/// reader of the stage's verdict needs its own value to return. `format!`
+/// round-trips the display, which is all a caller of this stage does with it.
+fn clone_anyhow(err: &anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!("{err:#}")
+}
+
+/// What one arm of the command contributed to the overall verdict.
+struct ArmOutcome {
+    ok: bool,
+}
+
+/// The gate: the host unit tests once, then the same sweep on every machine
+/// the command names. `--all-targets` (the default) names both; `--arch`
+/// narrows the run to the one it names - and both shapes run the *same* flow
+/// per machine, because a gate with two shapes is two gates neither of which
+/// is maintained.
+pub fn run(
+    build_dir: &Path,
+    profile: &str,
+    targets: &[Arch],
+    selection: sweep::Selection,
+) -> Result<()> {
+    // The gate's own clock, from the first byte of output: each arm's report
+    // quotes its own total, and a person times the whole command with a
+    // stopwatch against the same number.
     let gate_started = Instant::now();
     check_target_gates()?;
     check_boot_openings()?;
 
-    // Stage 1 starts here and is *joined* after stage 2 has run. The two share
-    // no file - the host suite writes cargo's `target/`, the sweep writes
-    // `build/` - so there is nothing to order between them, and until this
-    // change the sweep's machine was idle for the whole of stage 1 (3.1 s of a
-    // 28 s gate, measured 2026-10-21; `docs/notes/` §15.94). Its output is
-    // captured rather than inherited: two threads writing into one stream cut
-    // cargo's progress lines in half, and this log is read by a person looking
-    // for the one line that failed.
-    println!("Unit tests: the kernel and its leaf crates (host) - alongside the sweep below");
-    let stage1_started = Instant::now();
-    let host = std::thread::spawn(run_unit_tests);
-
-    // The x86_64 sweep: its own initramfs on the QEMU wiring in `machine.toml`.
-    // Named rather than left to the workspace default, so the machine this
-    // sweep boots and the machine it builds are the same value.
-    //
-    // The *test* build of the kernel, not the ordinary one: this sweep is what
-    // the boot's suites exist for, and they are only in the image a
-    // `--features selftest` build produces (`utils::build_test_kernel` says why
-    // the two cannot be the same artifact).
-    // The image it returns is not staged here any more: the loader this call
-    // built alongside the kernel *is* the kernel's container now
-    // (`boot/build.rs`), so the ESP below carries the loader and nothing else
-    // from this pair. The call is for its effect, and the effect is the order -
-    // the self-test kernel first, the loader that embeds it directly after.
-    utils::build_test_kernel(build_dir, profile, Arch::X86_64)?;
-    println!();
-
-    let built = build_user_tests()?;
-    println!("user tests: {} programs built", built.len());
-
-    // Which of them this run boots is the configuration's answer; the group
-    // refusal, the selection and the two lines under it are `sweep`'s, because
-    // they are questions about `tests.toml` rather than about this machine.
-    let config = sweep::load_config()?;
-    // The declared-name check, and *this* arm's scope: every name in the file
-    // has to be answerable by a program this run built, or it is a stale entry.
-    // The second machine's arm asks the narrower question of its own `gaps`
-    // alone - both arms build the same std suite since §15.11's last batch
-    // deleted the `no_std` one, so the two answers now coincide for every
-    // `[default]` name; `sweep::select` records why the scopes are still two.
-    let names: Vec<String> = built.iter().map(|test| test.name.clone()).collect();
-    let unmatched = config.unmatched(&names);
-    if !unmatched.is_empty() {
-        bail!(
-            "tests.toml lists {}, which no built test program answers to",
-            unmatched.join(", ")
-        );
-    }
-    let plan = sweep::select(crate::config::Machine::X86_64, &config, &built, &selection)?;
+    // Stage 1 starts here and is *joined* at the first arm's report. The two
+    // share no file - the host suite writes cargo's `target/`, the sweeps
+    // write `build/` - so there is nothing to order between them, and until
+    // this change the first sweep's machine was idle for the whole of stage 1
+    // (3.1 s of a 28 s gate, measured 2026-10-21; `docs/notes/` §15.94). Its
+    // output is captured rather than inherited: two threads writing into one
+    // stream cut cargo's progress lines in half, and this log is read by a
+    // person looking for the one line that failed.
+    println!("Unit tests: the kernel and its leaf crates (host) - alongside the sweeps below");
+    let mut stage1 = HostStage1::start();
 
     // `tests.toml`'s own rule, one question answered from the file rather than
     // from a built-program list: would a *plain* sweep stage this name? Both
     // §10.5 instruments must answer yes on both machines - they are exact
     // counts, not timings, so they belong in the gate - and the answer is what
     // the notes' group-membership claim rests on. The staged sets themselves
-    // are decided by `select`, which this check shares `runs` with (pinned in
-    // `sweep::tests`). Same `config` the selection above read.
+    // are decided by `select`, which each arm shares (`sweep::tests`). Same
+    // `config` the selections below read.
+    let config = sweep::load_config()?;
     for machine in [
         crate::config::Machine::X86_64,
         crate::config::Machine::Aarch64,
@@ -128,104 +195,199 @@ pub fn run_tests(build_dir: &Path, profile: &str, selection: sweep::Selection) -
         }
     }
 
-    // What is left is this arm's own: the throwaway initramfs, the QEMU wiring
-    // in `machine.toml`, and a verdict that can quote an exit status. The
-    // disk-counter word is decided here (§10.5): armed only when *this* run
-    // stages the program that reads it back - the same question the staging
-    // above asks of the same list, so the boot and its payload cannot disagree.
-    let tar = build_test_initramfs(build_dir, &plan.staged)?;
-    let diskstat = diskstat_for_staged(plan.staged.iter().map(|test| test.name.as_str()));
-    let guest = boot_tests(build_dir, profile, &tar, diskstat, &plan.staged).and_then(|guest| {
-        report(
-            &plan.staged,
-            plan.built,
-            &guest.log,
-            guest.status,
-            diskstat,
-            guest.summary.clone(),
-        )
-        .map(|()| guest)
-    });
-
-    // The host stage's verdict is asked even when the guest's failed: both ran,
-    // and a failure in one must not hide the other's answer. Its text lands
-    // above the gate's own report, so the sweep's long log stays where a reader
-    // looks for a tail and the summary stays last.
-    let stage1_millis = stage1_started.elapsed().as_millis() as u64;
-    let host = match host.join() {
-        Ok(Ok(text)) => {
-            print!("{text}");
-            Ok(text)
+    let mut outcomes: Vec<(Arch, Result<ArmOutcome>)> = Vec::new();
+    for (index, arch) in targets.iter().enumerate() {
+        if targets.len() > 1 {
+            println!(
+                "\n  ── sweep target {} of {}: {} ──",
+                index + 1,
+                targets.len(),
+                arch.name()
+            );
         }
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(anyhow::anyhow!(
-            "the host unit-test stage panicked; the sweep's own verdict is above"
-        )),
+        let outcome = run_one(
+            build_dir,
+            profile,
+            *arch,
+            selection.clone(),
+            index == 0,
+            &mut stage1,
+            gate_started,
+        );
+        if let Err(err) = &outcome {
+            eprintln!("self-test ({}): {err:#}", arch.name());
+        }
+        outcomes.push((*arch, outcome));
+    }
+
+    // The host stage's verdict is asked even when a sweep failed: both ran,
+    // and a failure in one must not hide the other's answer. Its text landed
+    // above the failing arm's report, so the sweeps' logs stay where a reader
+    // looks for a tail and the verdicts stay last.
+    let host_text = stage1.join();
+
+    let mut failed: Vec<String> = Vec::new();
+    for (arch, outcome) in &outcomes {
+        match outcome {
+            Ok(arm) if arm.ok => {}
+            Ok(_) => failed.push(arch.name().to_string()),
+            Err(_) => failed.push(arch.name().to_string()),
+        }
+    }
+    let host_ok = host_text.is_ok();
+    if !host_ok {
+        failed.push("host unit tests".to_string());
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        bail!("self-test failed on: {}", failed.join(", "))
+    }
+}
+
+/// One machine's sweep: its test kernel, its payload, its lanes, its report.
+///
+/// The same function for both machines, by construction - the payload's
+/// *channel* is the one thing the machines cannot share (the first machine's
+/// boot archive is its root, the second's root is a disk it switches to), and
+/// that difference lives in `stage` and in the lane's QEMU command alone.
+fn run_one(
+    build_dir: &Path,
+    profile: &str,
+    arch: Arch,
+    selection: sweep::Selection,
+    quote_host: bool,
+    stage1: &mut HostStage1,
+    gate_started: Instant,
+) -> Result<ArmOutcome> {
+    // The *test* build of the kernel, not the ordinary one: this sweep is what
+    // the boot's suites exist for, and they are only in the image a
+    // `--features selftest` build produces (`utils::build_test_kernel` says
+    // why the two cannot be the same artifact).
+    let kernel = utils::build_test_kernel(build_dir, profile, arch)?;
+    println!();
+    let loader = utils::loader_path(profile, arch)?;
+
+    let built = build_user_tests(arch)?;
+    println!(
+        "user tests ({}): {} programs built",
+        arch.name(),
+        built.len()
+    );
+
+    // Which of them this run boots is the configuration's answer; the group
+    // refusal, the selection and the two lines under it are `sweep`'s, because
+    // they are questions about `tests.toml` rather than about this machine.
+    let config = sweep::load_config()?;
+    // The declared-name check: every name in the file has to be answerable by
+    // a program this arm built, or it is a stale entry. Both arms build the
+    // same std suite since §15.11's last batch deleted the `no_std` one, so
+    // the one question is the honest one on both.
+    let names: Vec<String> = built.iter().map(|test| test.name.clone()).collect();
+    let unmatched = config.unmatched(&names);
+    if !unmatched.is_empty() {
+        bail!(
+            "tests.toml lists {}, which no built test program answers to",
+            unmatched.join(", ")
+        );
+    }
+    let plan = sweep::select(
+        crate::config::Machine::from(arch),
+        &config,
+        &built,
+        &selection,
+    )?;
+
+    // What is left is this arm's own: the payload's channel, the QEMU wiring
+    // in `machine.toml`, and a verdict. The disk-counter word is decided here
+    // (§10.5): armed only when *this* run stages the program that reads it
+    // back - the same question the boot and its payload have to agree on.
+    let skipped = plan.skipped.len();
+    let staged: Vec<&UserTest> = plan.staged.into_iter().collect();
+    if skipped > 0 {
+        println!(
+            "user tests ({}): {} left out of this sweep by tests.toml (the groups above name them)",
+            arch.name(),
+            skipped
+        );
+    }
+    let diskstat = diskstat_for_staged(staged.iter().map(|test| test.name.as_str()));
+    let guest = match arch {
+        Arch::X86_64 => {
+            let tar = build_test_initramfs(build_dir, &staged)?;
+            boot_archive_lanes(build_dir, profile, &tar, diskstat, &staged)?
+        }
+        Arch::Aarch64 => boot_disk_lanes(build_dir, &kernel, &loader, arch, diskstat, &staged)?,
     };
 
-    // The gate's own report, and the last thing this command prints: what each
-    // stage cost, what each lane carried, the verdict, and how this total
-    // compares with the last green run (`tui::report`). It prints whether or not
-    // the run passed - a failure is the run a person reads it on - and only a
-    // green total enters the history the next run compares with, because a red
-    // run's duration is the duration of a run that stopped early.
-    let verdict = match &guest {
-        Ok(guest) => {
-            let kunit = sweep::verdict(&guest.log).kunit;
-            let ok = guest.status == Some(33)
-                && guest.summary.is_some()
-                && kunit.is_some_and(|kunit| kunit.failed == 0);
-            (
-                ok,
-                guest
-                    .summary
-                    .clone()
-                    .unwrap_or_else(|| "no summary line".to_string()),
-                kunit.map(|kunit| (kunit.passed, kunit.failed)),
-            )
-        }
-        Err(_) => (
-            false,
-            "the sweep did not get to a verdict".to_string(),
-            None,
-        ),
-    };
-    let (guest_ok, guest_summary, kunit) = verdict;
-    let lanes: &[tui::LaneRow] = guest.as_ref().map(|guest| &guest.lanes[..]).unwrap_or(&[]);
-    // The report names the ten programs the run's time went on: the head of the
-    // same measured table the next deal is built from, so a lane's `heaviest`
-    // and this list cannot disagree about a program's cost.
-    let slowest = guest
-        .as_ref()
-        .map(|guest| tui::slowest_list(&guest.costs, 10))
-        .unwrap_or_default();
-    let ok = guest_ok && host.is_ok();
-    let total_millis = gate_started.elapsed().as_millis() as u64;
-    let summary = tui::report(&tui::Summary {
-        host: host
+    // The arm's verdict read off its own wire, and every claim the report
+    // makes checked before the summary says anything.
+    report(
+        arch,
+        &staged,
+        plan.built,
+        &guest.log,
+        guest.status,
+        diskstat,
+        guest.summary.clone(),
+    )?;
+    guest_ok_note(arch);
+
+    if quote_host {
+        stage1.join()?;
+    }
+    let host_totals = if quote_host {
+        stage1
+            .joined
+            .as_ref()
+            .unwrap()
             .as_ref()
             .ok()
             .map(|text| host_totals(text))
-            .map(|(passed, failed)| tui::HostStage {
-                passed,
-                failed,
-                millis: stage1_millis,
-            }),
-        lanes,
-        verdict: guest_summary,
-        kunit,
+    } else {
+        None
+    };
+    let host_stage = host_totals.map(|(passed, failed)| tui::HostStage {
+        passed,
+        failed,
+        millis: stage1.millis,
+    });
+    let kunit = sweep::verdict(&guest.log).kunit;
+    let ok = guest.status == clean_exit(arch)
+        && guest.summary.is_some()
+        && kunit.is_some_and(|kunit| kunit.failed == 0);
+    let total_millis = gate_started.elapsed().as_millis() as u64;
+    // The report names the ten programs the run's time went on: the head of
+    // the same measured table the next deal is built from, so a lane's
+    // `heaviest` and this list cannot disagree about a program's cost.
+    let slowest = tui::slowest_list(&guest.costs, 10);
+    let summary = tui::report(&tui::Summary {
+        host: host_stage,
+        lanes: &guest.lanes,
+        verdict: guest
+            .summary
+            .clone()
+            .unwrap_or_else(|| "no summary line".to_string()),
+        kunit: kunit.map(|kunit| (kunit.passed, kunit.failed)),
         slowest: &slowest,
         total_millis,
-        previous_millis: tui::previous_total(build_dir, Arch::X86_64.name()),
+        previous_millis: tui::previous_total(build_dir, arch.name()),
         ok,
     });
     print!("\n{summary}");
     if ok {
-        tui::record_total(build_dir, Arch::X86_64.name(), total_millis)?;
+        tui::record_total(build_dir, arch.name(), total_millis)?;
     }
+    Ok(ArmOutcome { ok })
+}
 
-    host?;
-    guest.map(|_| ())
+/// The one line every arm prints when its machine got to the end of its wire.
+fn guest_ok_note(arch: Arch) {
+    let how = match arch {
+        Arch::X86_64 => "ended on the debug exit (33)".to_string(),
+        Arch::Aarch64 => "reached === END and was stopped".to_string(),
+    };
+    println!("self-test ({}): the machine {} ", arch.name(), how);
 }
 
 /// The host stage's own totals, summed out of cargo's `test result:` lines - one
@@ -453,17 +615,27 @@ impl sweep::TestProgram for UserTest {
     }
 }
 
-/// Builds the user test crate and returns what it produced.
+/// Builds the user test crate for `arch` and returns what it produced.
 ///
-/// It builds like any musl program, and it is the suite's only crate: the
-/// `#![no_std]` conformance suite that used to sit beside it in `user/abitest`
-/// was moved here one batch at a time, and the move is finished - so there is
-/// one build, one target, and one `src/bin` for the sweep to walk.
-fn build_user_tests() -> Result<Vec<UserTest>> {
+/// One build for both machines - the same crate, the same `src/bin`, the
+/// machine's own musl target - because the two sweeps run the same suite
+/// (§15.11's last batch deleted the `no_std` crate that used to split them).
+/// What differs is only where the stage finds the bytes, which is the
+/// caller's question and not this function's.
+///
+/// The walk is over the crate's own `src/bin`, not over the output directory:
+/// the sources are the contract, and a source whose binary never appeared is
+/// the one failure this must not stage around (`AGENTS.md` §5's trap). A file
+/// beside the binary that cargo also writes - the `.d` dep-info - starts with
+/// `t-` too, and staging one makes the runner exec a text file and report
+/// `exit=127`, which reads like a broken program rather than a broken
+/// payload - so a staged payload is the ELF magic, checked, not the name.
+fn build_user_tests(arch: Arch) -> Result<Vec<UserTest>> {
     let root = utils::project_root()?;
-    let mut tests = Vec::new();
-
-    println!("User tests: the std-side suite (mpos-user-tests)");
+    println!(
+        "User tests: the std-side suite for {} (mpos-user-tests)",
+        arch.name()
+    );
     let mut cmd = Command::new("cargo");
     cmd.args([
         "build",
@@ -471,25 +643,32 @@ fn build_user_tests() -> Result<Vec<UserTest>> {
         "-p",
         "mpos-user-tests",
         "--target",
-        "x86_64-unknown-linux-musl",
+        arch.musl_target(),
     ])
     .current_dir(&root);
     utils::run_status(&mut cmd, "the user tests")?;
 
-    collect_user_tests(
-        &root.join("user/tests/src/bin"),
-        &target_dir()?.join("x86_64-unknown-linux-musl/release"),
-        &mut tests,
-    )?;
+    let out = target_dir()?.join(format!("{}/release", arch.musl_target()));
+    let mut tests = Vec::new();
+    collect_user_tests(&root.join("user/tests/src/bin"), &out, &mut tests)?;
     tests.sort_by(|a, b| a.name.cmp(&b.name));
+    if tests.is_empty() {
+        bail!(
+            "no {} test program was built under {} - the sweep would have \
+             reported a green zero",
+            arch.name(),
+            out.display()
+        );
+    }
     Ok(tests)
 }
 
-/// Find every test program under `src_dir`, recursing into subdirectories.
+/// Find every test program under `src_dir`, recursing into subdirectories,
+/// and answer the one binary per source the build must have produced.
 ///
-/// The walk covers subdirectories because the suite used to be split by what a
-/// test needs, and the binary keeps the file's name either way: that is what a
-/// `/bin/t-*` run and the verdict line are keyed on.
+/// The walk covers subdirectories because the suite used to be split by what
+/// a test needs, and the binary keeps the file's name either way: that is
+/// what a `/bin/t-*` run and the verdict line are keyed on.
 fn collect_user_tests(src_dir: &Path, out_dir: &Path, tests: &mut Vec<UserTest>) -> Result<()> {
     for entry in
         fs::read_dir(src_dir).with_context(|| format!("Failed to read {}", src_dir.display()))?
@@ -506,6 +685,11 @@ fn collect_user_tests(src_dir: &Path, out_dir: &Path, tests: &mut Vec<UserTest>)
         let binary = out_dir.join(&name);
         if !binary.exists() {
             bail!("The build produced no binary for {name}");
+        }
+        let magic = fs::read(&binary)
+            .with_context(|| format!("Failed to read the built binary for {name}"))?;
+        if !magic.starts_with(b"\x7fELF") {
+            bail!("The build produced no ELF for {name} - its payload is not a program");
         }
         tests.push(UserTest { name, binary });
     }
@@ -1075,16 +1259,16 @@ fn cost_of(costs: &BTreeMap<String, u64>, name: &str) -> u64 {
 /// consumer of the numbers: a program's own verdict never reads this file. That
 /// is what keeps a hint from becoming a contract - deleting it costs a less
 /// even deal, not a different sweep.
-fn cost_path(build_dir: &Path) -> PathBuf {
-    build_dir.join("test-costs-x86_64.tsv")
+fn cost_path(build_dir: &Path, arch: Arch) -> PathBuf {
+    build_dir.join(format!("test-costs-{}.tsv", arch.name()))
 }
 
 /// The cost table, or an empty one when there is none yet (the first sweep on a
 /// tree, or one whose file was removed). A line that does not parse is skipped
 /// rather than fatal for the same reason: this is a hint, and a hint that has
 /// gone bad must not be able to fail a sweep.
-fn read_costs(build_dir: &Path) -> BTreeMap<String, u64> {
-    let Ok(text) = fs::read_to_string(cost_path(build_dir)) else {
+fn read_costs(build_dir: &Path, arch: Arch) -> BTreeMap<String, u64> {
+    let Ok(text) = fs::read_to_string(cost_path(build_dir, arch)) else {
         return BTreeMap::new();
     };
     text.lines()
@@ -1095,12 +1279,12 @@ fn read_costs(build_dir: &Path) -> BTreeMap<String, u64> {
         .collect()
 }
 
-fn write_costs(build_dir: &Path, costs: &BTreeMap<String, u64>) -> Result<()> {
+fn write_costs(build_dir: &Path, arch: Arch, costs: &BTreeMap<String, u64>) -> Result<()> {
     let mut text = String::new();
     for (name, millis) in costs {
         text.push_str(&format!("{name}\t{millis}\n"));
     }
-    let path = cost_path(build_dir);
+    let path = cost_path(build_dir, arch);
     fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))
 }
 
@@ -1167,6 +1351,13 @@ fn link_or_copy(from: &Path, to: &Path) -> Result<()> {
         .with_context(|| format!("Failed to stage {} at {}", from.display(), to.display()))
 }
 
+/// One lane's assembled boot: the directory its artefacts live in, the QEMU
+/// command the poll will spawn, and the wire it will write.
+struct LaneJob {
+    command: Command,
+    log: PathBuf,
+}
+
 /// Boots the test initramfs in QEMU - one machine per lane - and answers the
 /// combined exit status, the whole wire in lane order, and the summary summed
 /// over the lanes.
@@ -1179,17 +1370,17 @@ fn link_or_copy(from: &Path, to: &Path) -> Result<()> {
 /// 9p share and the console socket inside it, and its serial file. The one
 /// shared byte range is the tar, hard-linked and read-only, because a second
 /// copy of tens of megabytes is paid once per lane for nothing.
-fn boot_tests(
+fn boot_archive_lanes(
     build_dir: &Path,
     profile: &str,
     tar: &Path,
     diskstat: &str,
     staged: &[&UserTest],
 ) -> Result<Guest> {
-    println!("User tests: booting the test machine");
+    println!("User tests (x86_64): booting the test machine");
 
     let names: Vec<&str> = staged.iter().map(|test| test.name.as_str()).collect();
-    let costs = read_costs(build_dir);
+    let costs = read_costs(build_dir, Arch::X86_64);
     let dealt = deal_lanes(&names, &costs, lane_count(staged.len()));
     println!(
         "User tests: {} programs over {} lane(s)",
@@ -1216,18 +1407,7 @@ fn boot_tests(
     }
     let loader = utils::loader_path(profile, Arch::X86_64)?;
 
-    // The live dashboard, and its lifetime is the sweep's: it is started once
-    // every lane has been laid and spawned (the `+ lane N: qemu …` lines above
-    // are a record of what ran and belong on the normal screen, not inside a
-    // panel that will wipe them) and stopped as soon as every lane has answered,
-    // so both the report and the detailed lines below print onto the screen the
-    // reader started with. A panel that was not wanted - a pipe, a redirect,
-    // `MPOS_TEST_TUI=0` - owns no terminal and every call on it is a no-op
-    // (`tui::Panel`).
-    let totals: Vec<usize> = dealt.iter().map(|lane| lane.len()).collect();
-
-    let mut plans: Vec<Lane> = Vec::with_capacity(dealt.len());
-    let mut jobs: Vec<(Command, PathBuf)> = Vec::with_capacity(dealt.len());
+    let mut jobs: Vec<LaneJob> = Vec::with_capacity(dealt.len());
     for (index, lane_names) in dealt.iter().enumerate() {
         let dir = build_dir.join(format!("test-lane-{index}"));
         if dir.exists() {
@@ -1299,40 +1479,233 @@ fn boot_tests(
 
         let mut command = Command::new("qemu-system-x86_64");
         command.args(&args);
-        jobs.push((command, log.clone()));
-        plans.push(Lane {
-            names: lane_names.clone(),
-            log,
-            status: None,
-            timed_out: false,
-            millis: 0,
-            text: String::new(),
-        });
+        jobs.push(LaneJob { command, log });
     }
 
-    // One loop for all the lanes (`qemu::capture_many`), a sweep-wide deadline,
-    // and no terminators: this machine's boot ends when its kernel writes the
-    // debug exit, so the process leaving *is* the end of that lane's run. Every
-    // poll hands the panel the same instant for all lanes (`LaneTick`).
+    run_lanes(build_dir, Arch::X86_64, names, dealt, jobs)
+}
+
+/// Boots the second machine's sweep - one disk medium per lane - through the
+/// same lane machinery the first machine's boot runs.
+///
+/// The payload's channel is the one thing the two machines cannot share: this
+/// boot switches root, so its programs and its runner ride the *disk* the lane
+/// lays for itself, each lane's medium carrying the full payload with the
+/// lane's own `mpos.tests=` word choosing among it. Everything the medium
+/// names lands in the lane's own directory - the image, the SATA disk its
+/// programs write, the pattern image `check_blk` reads - because two lanes
+/// writing one backing file would be one lane's writes in the other's claims.
+/// The shared inputs stay shared: the initramfs the medium unpacks is the one
+/// archive `build/` already built.
+fn boot_disk_lanes(
+    build_dir: &Path,
+    kernel: &Path,
+    loader: &Path,
+    arch: Arch,
+    diskstat: &str,
+    staged: &[&UserTest],
+) -> Result<Guest> {
+    println!("User tests ({}): booting the test machine", arch.name());
+
+    let names: Vec<&str> = staged.iter().map(|test| test.name.as_str()).collect();
+    let costs = read_costs(build_dir, arch);
+    let dealt = deal_lanes(&names, &costs, lane_count(staged.len()));
+    println!(
+        "User tests: {} programs over {} lane(s)",
+        names.len(),
+        dealt.len()
+    );
+    if !costs.is_empty() {
+        let loads: Vec<String> = dealt
+            .iter()
+            .map(|lane| {
+                let load: u64 = lane.iter().map(|name| cost_of(&costs, name)).sum();
+                format!("{} programs / {load} ms", lane.len())
+            })
+            .collect();
+        println!(
+            "User tests: dealing from {} measured costs: {}",
+            costs.len(),
+            loads.join(", ")
+        );
+    }
+
+    // The runner is the *shared* one, and it lands at `/sbin/init` because
+    // that is the disk's pid-1 chain: the shared initramfs script execs it
+    // after the switch on both machines. No in-tree applet farm - the disk's
+    // root is the archive the shared `initramfs` pipeline builds, with the
+    // full farm laid on top (`sweep_medium`).
+    let mut entries: Vec<(&str, &[u8])> = vec![("sbin/init", TEST_INIT.as_bytes())];
+    let mut program_bytes: Vec<(String, Vec<u8>)> = Vec::with_capacity(staged.len());
+    for test in staged {
+        let bytes =
+            fs::read(&test.binary).with_context(|| format!("Failed to stage {}", test.name))?;
+        program_bytes.push((format!("bin/{}", test.name), bytes));
+    }
+    for (name, bytes) in &program_bytes {
+        entries.push((name.as_str(), bytes.as_slice()));
+    }
+
+    // §10.5's fixture rides only when the programs that read it are staged: a
+    // sweep without them does not pay 80 MiB of root partition for an image
+    // nothing opens. With them, the medium grows to carry it - `mkfs.ext4`
+    // answers "no blocks" rather than a warning when the tree overflows the
+    // size, and a sweep that dies in the builder reads as a build failure.
+    let mut disk_bytes = SWEEP_DISK_BYTES;
+    let mut fixture: Option<Vec<u8>> = None;
+    if staged
+        .iter()
+        .any(|test| test.name == "t-ext4-mount" || test.name == "t-diskbench")
+    {
+        let image = crate::disk::build_ext4_image(build_dir)?;
+        let bytes = fs::read(&image)
+            .with_context(|| format!("Failed to read the ext4 fixture {}", image.display()))?;
+        disk_bytes += bytes.len() as u64 + 16 * 1024 * 1024;
+        fixture = Some(bytes);
+    }
+    let mut entry_bytes: Vec<(String, Vec<u8>)> = Vec::new();
+    if let Some(bytes) = &fixture {
+        // The same path as the first machine's archive member, without the
+        // leading slash: a disk entry is named from the root already. Both
+        // channels land it at one guest path, which is what lets one program
+        // read either machine (`both_payload_channels_lay_the_fixture_at_one_path`).
+        entry_bytes.push((DISKSTAT_FIXTURE_ENTRY.to_string(), bytes.clone()));
+        entries.push((
+            DISKSTAT_FIXTURE_ENTRY,
+            entry_bytes.last().expect("just pushed").1.as_slice(),
+        ));
+    }
+
+    // The root the kernel is told to switch to, and the consoles it is told
+    // it has: both come from the machine's own configuration.
+    let rootfs = crate::config::RootfsConfig::load(
+        &utils::project_root()?.join(crate::paths::ROOTFS_CONFIG),
+        arch,
+    )?;
+    // The firmware pair, read once; each lane copies the writable store into
+    // its own directory, because AAVMF writes it at every boot and two lanes
+    // writing one file is one lane's boot state in the other's machine.
+    let (firmware, vars0) = qemu::write_firmware_vars(build_dir, arch)?;
+
+    let mut jobs: Vec<LaneJob> = Vec::with_capacity(dealt.len());
+    for (index, lane_names) in dealt.iter().enumerate() {
+        let dir = build_dir.join(format!("test-lane-{}-{index}", arch.name()));
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+        }
+        fs::create_dir_all(&dir)?;
+        let vars = dir.join(arch.firmware_vars());
+        fs::copy(&vars0, &vars)
+            .with_context(|| format!("Failed to stage the firmware vars at {}", vars.display()))?;
+        // `mpos.tests=` is the lane's program list, on the same term the first
+        // machine's command line carries it.
+        let cmdline = format!(
+            "console={} mpos.selftest root={} rootfstype={}{} mpos.tests={}\n",
+            rootfs.serial_port,
+            rootfs.root_device,
+            rootfs.filesystem,
+            diskstat,
+            lane_names.join(",")
+        );
+        let disk = crate::disk::sweep_medium(
+            build_dir,
+            &dir,
+            arch,
+            &crate::disk::Boot {
+                kernel,
+                loader,
+                entries: &entries,
+                disk_bytes,
+                cmdline: &cmdline,
+            },
+        )?;
+
+        let share = utils::lay_p9_share(&dir.join("9p-share"))?;
+        let log = dir.join("serial.log");
+        // A test boot never needs the host vsock bus, and every lane claiming
+        // the same CID aborts QEMU before its guest starts (`docs/notes/`
+        // §13.28) - the same rule the first machine's lanes run under.
+        let mut config = crate::config::QemuConfig::load_default(arch)?;
+        config.vsock = false;
+        let args = qemu::boot_args(
+            arch,
+            &config,
+            &firmware,
+            &vars,
+            &disk,
+            &qemu::Console::File(log.display().to_string()),
+            &share,
+            true,
+        )?;
+        eprintln!("+ lane {index}: {} {}", arch.qemu_binary(), args.join(" "));
+
+        let mut command = Command::new(arch.qemu_binary());
+        command.args(&args);
+        // QEMU's own stderr is inherited, so a machine that refuses to start
+        // says so there (`qemu::boot`'s rule, on a lane now too).
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::inherit());
+        jobs.push(LaneJob { command, log });
+    }
+
+    run_lanes(build_dir, arch, names, dealt, jobs)
+}
+
+/// The half of a lane sweep both machines run: one poll over every lane's
+/// QEMU, the live dashboard, the per-program costs, and the verdicts read off
+/// the wires. The machines' answers differ in exactly two places, and both
+/// are this machine's own constants: the exit that says a lane ended the way
+/// its protocol ends, and the path its combined wire lands at.
+fn run_lanes(
+    build_dir: &Path,
+    arch: Arch,
+    names: Vec<&str>,
+    dealt: Vec<Vec<String>>,
+    jobs: Vec<LaneJob>,
+) -> Result<Guest> {
+    // One loop for all the lanes (`qemu::capture_many`), a sweep-wide
+    // deadline, and the machine's own end-of-run shape: the first machine's
+    // kernel writes QEMU's debug exit, so the process leaving is the end of
+    // the lane and no marker is needed; the second's runner prints `=== END`
+    // and its QEMU stays alive under the parked kernel, so the marker is what
+    // ends the poll - the same terminator the machine's own single-boot arm
+    // waited on. Every poll hands the panel the same instant for all lanes
+    // (`LaneTick`).
     let timeout = Duration::from_secs(test_timeout_secs());
+    let totals: Vec<usize> = dealt.iter().map(|lane| lane.len()).collect();
     let mut panel = tui::Panel::start(&totals);
-    let captured = qemu::capture_many(jobs, &[], &["=== "], timeout, &mut |ticks| {
-        panel.tick(ticks)
-    })?;
+    let lane_logs: Vec<PathBuf> = jobs.iter().map(|job| job.log.clone()).collect();
+    let polls: Vec<(Command, PathBuf)> =
+        jobs.into_iter().map(|job| (job.command, job.log)).collect();
+    let captured = qemu::capture_many(
+        polls,
+        lane_terminators(arch),
+        &["=== "],
+        timeout,
+        &mut |ticks| panel.tick(ticks),
+    )?;
     panel.stop();
     let mut measured: BTreeMap<String, u64> = BTreeMap::new();
     for machine in &captured {
         measured.extend(measure_costs(&machine.progress));
     }
-    for (plan, machine) in plans.iter_mut().zip(captured) {
-        plan.status = machine.status;
-        plan.timed_out = machine.timed_out;
-        plan.millis = machine.lane_ms;
-        plan.text = machine.log;
-    }
+
+    let plans: Vec<Lane> = dealt
+        .iter()
+        .zip(captured)
+        .zip(lane_logs)
+        .map(|((lane_names, machine), log)| Lane {
+            names: lane_names.clone(),
+            log,
+            status: machine.status,
+            timed_out: machine.timed_out,
+            millis: machine.lane_ms,
+            text: machine.log,
+        })
+        .collect();
 
     let mut logs: Vec<String> = Vec::with_capacity(plans.len());
-    let mut status = Some(33);
+    let mut status = clean_exit(arch);
     for (index, lane) in plans.iter().enumerate() {
         if lane.timed_out {
             bail!(
@@ -1342,19 +1715,20 @@ fn boot_tests(
                 lane.log.display()
             );
         }
+        let clean = lane.status == clean_exit(arch);
         println!(
             "User tests: lane {index} ran {} programs, exit {}",
             lane.names.len(),
             lane.status.unwrap_or(-1)
         );
-        if lane.status != Some(33) {
-            if status == Some(33) {
+        if !clean {
+            if status == clean_exit(arch) {
                 status = lane.status.or(Some(-1));
             }
             // The lane's own tail, not the sweep's: a lane that died says why
             // in *its* log, and the last lines of the concatenation belong to
             // whichever machine finished last.
-            println!("User tests: lane {index} did not end on the debug exit; its last lines:");
+            println!("User tests: lane {index} did not end cleanly; its last lines:");
             let tail: Vec<&str> = lane.text.lines().collect();
             for line in tail.iter().rev().take(20).rev() {
                 println!("  | lane {index}: {line}");
@@ -1373,7 +1747,7 @@ fn boot_tests(
     // would buy is worse than the even one. A red run leaves the old table
     // alone for the same reason - its costs are the costs of a broken run.
     if measured.len() == names.len() {
-        write_costs(build_dir, &measured)?;
+        write_costs(build_dir, arch, &measured)?;
     } else if !measured.is_empty() {
         println!(
             "User tests: {} of {} programs were timed; the cost table is left as it was",
@@ -1382,13 +1756,11 @@ fn boot_tests(
         );
     }
 
-    // Each lane as the gate's report shows it: what it carried, how long it was
-    // alive, whether it ended on the debug exit, and the one program that
-    // explains a lane whose count is smaller than its time.
-    //
-    // `measured` is the same table the next run deals from, so the program named
-    // here is the one the *next* deal will weigh most - which is what makes the
-    // two readings agree.
+    // Each lane as the gate's report shows it: what it carried, how long it
+    // was alive, whether it ended the way its machine ends a clean run, and
+    // the one program that explains a lane whose count is smaller than its
+    // time. `measured` is the same table the next run deals from, so the
+    // program named here is the one the *next* deal will weigh most.
     let lanes: Vec<tui::LaneRow> = plans
         .iter()
         .enumerate()
@@ -1396,7 +1768,7 @@ fn boot_tests(
             index,
             programs: lane.names.len(),
             millis: lane.millis,
-            ok: lane.status == Some(33) && !lane.timed_out,
+            ok: lane.status == clean_exit(arch) && !lane.timed_out,
             heaviest: lane
                 .names
                 .iter()
@@ -1407,13 +1779,10 @@ fn boot_tests(
 
     let summary = combined_summary(&logs);
     let text = logs.join("\n");
-    // The one stable path every reader knows (`xtask/README.md`): the sweep's
-    // whole wire, lane by lane, written once the run is over rather than by a
-    // guest. The per-lane files stay beside it under `build/test-lane-<n>/`,
-    // which is where a failure that is one machine's is read from - and the
-    // stable name stays a *file* that a second session cannot tear, because
-    // nothing streams into it while the run is going.
-    fs::write(build_dir.join("test-serial.log"), &text)?;
+    // The one stable path every reader knows for this machine's arm
+    // (`xtask/README.md`): the sweep's whole wire, lane by lane, written once
+    // the run is over rather than by a guest.
+    fs::write(combined_log(build_dir, arch), &text)?;
 
     Ok(Guest {
         status,
@@ -1424,135 +1793,16 @@ fn boot_tests(
     })
 }
 
+/// How long the guest may run before the harness gives up on it. TCG is slow;
+/// KVM is not. `MPOS_TEST_TIMEOUT` overrides, in seconds.
+const DEFAULT_TIMEOUT_SECS: u64 = 900;
+
 fn test_timeout_secs() -> u64 {
     std::env::var("MPOS_TEST_TIMEOUT")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
 }
-
-/// Reads the run's verdicts off the serial log and answers for every test that
-/// was **staged**: a test that never printed `=== PASS` failed, whether it
-/// crashed, hung or never ran. `built` is what the crate produced, so the line
-/// can say how much of it the configuration left out - a sweep that quietly
-/// runs less than it used to is the failure this number is here to catch.
-fn report(
-    tests: &[&UserTest],
-    built: usize,
-    text: &str,
-    status: Option<i32>,
-    diskstat: &str,
-    summary: Option<String>,
-) -> Result<()> {
-    // The protocol is `sweep`'s - one parser for both runners - and what this
-    // arm does with it is its own, because its claim is: every staged program
-    // printed `=== PASS`, and the machine ended on the debug exit.
-    let verdict = sweep::verdict(text);
-    let missing: Vec<&str> = tests
-        .iter()
-        .filter(|test| !verdict.passed.contains(&test.name.as_str()))
-        .map(|test| test.name.as_str())
-        .collect();
-    // The summary is the caller's, not the log's: a sweep with more than one
-    // lane has one summary line per lane, and the number a reader wants is
-    // their sum (`combined_summary`). `verdict` still answers *which* programs
-    // passed, which is per-program and lane-independent.
-    let clean = status == Some(33) && summary.is_some();
-
-    // The kernel's own suites, which ran before any program did. Both halves of
-    // that sentence are asserted: the line has to be *there* (a test kernel that
-    // reports nothing has not said its suites ran), and it has to say zero
-    // failed.
-    let kunit = verdict.kunit;
-
-    println!();
-    if let Some(summary) = &summary {
-        println!("self-test guest: {summary} ({} built)", tests.len());
-    } else {
-        println!("self-test guest: no summary line - the run did not get to the end");
-    }
-    match kunit {
-        Some(kunit) => println!(
-            "self-test guest: mpos-kunit {} passed, {} failed",
-            kunit.passed, kunit.failed
-        ),
-        None => println!("self-test guest: the kernel printed no mpos-kunit line"),
-    }
-    let skipped = built.saturating_sub(tests.len());
-    if skipped > 0 {
-        println!("self-test guest: {skipped} of {built} user tests left out by tests.toml");
-    }
-    report_diskstat(text, diskstat)?;
-    let names: Vec<&str> = tests.iter().map(|t| t.name.as_str()).collect();
-    report_netstat(text, &names)?;
-    println!(
-        "self-test guest: exit {} (33 is the clean debug exit)",
-        status.unwrap_or(-1)
-    );
-
-    if !missing.is_empty() {
-        println!();
-        println!("self-test: {} test(s) did not pass:", missing.len());
-        for name in &missing {
-            println!("  FAIL {name}");
-        }
-    }
-
-    if !clean || kunit.map(|kunit| kunit.failed).unwrap_or(1) != 0 {
-        println!();
-        println!("self-test: the last of the serial log:");
-        let tail: Vec<&str> = text.lines().collect();
-        for line in tail.iter().rev().take(30).rev() {
-            println!("  | {line}");
-        }
-    }
-
-    println!();
-    let suites_clean = kunit
-        .map(|kunit| kunit.failed == 0 && kunit.passed > 0)
-        .unwrap_or(false);
-    if clean && missing.is_empty() && suites_clean {
-        let kunit = kunit.expect("checked above");
-        println!(
-            "self-test: all {} user tests passed, unit tests passed, and the kernel's {} self-test cases passed{}",
-            tests.len(),
-            kunit.passed,
-            if skipped > 0 {
-                format!(" ({skipped} not run - see tests.toml)")
-            } else {
-                String::new()
-            }
-        );
-        Ok(())
-    } else {
-        bail!(
-            "self-test failed: {} of {} user tests did not pass{}, and the kernel's suites report {}",
-            missing.len(),
-            tests.len(),
-            if clean {
-                ""
-            } else {
-                " and the run did not end cleanly"
-            },
-            match kunit {
-                Some(kunit) => format!("{} passed, {} failed", kunit.passed, kunit.failed),
-                None => "nothing at all - no mpos-kunit line".to_string(),
-            }
-        )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The sweep whose payload rides on the disk.
-//
-// The first machine's boot runs its payload out of the boot archive (there is
-// no disk to pivot onto), so its programs are packed into the initramfs above.
-// A machine that switches root - which is what `steps.rs`'s shared five steps
-// do - has to have them on the tree it switches *to*: the runner is `/init` on
-// the disk root, and the programs sit beside it under the same `/bin/t-*` names
-// the shared runner script walks. Everything else - the selection, the
-// protocol, the report - is the implementation above.
-// ---------------------------------------------------------------------------
 
 /// The image size a disk sweep asks for. It is not a fixed number because the
 /// payload moves: the std-side programs are ~57 MB today (measured: `mkfs.ext4`
@@ -1562,255 +1812,6 @@ fn report(
 /// than one every boot pays for - a sweep that overflows its root reads as a
 /// build failure, not as a full disk.
 const SWEEP_DISK_BYTES: u64 = 96 * 1024 * 1024;
-
-/// Run the sweep for a machine whose boot pivots onto a disk root.
-///
-/// `arch` is the machine, and it is the only thing this needs to know: the musl
-/// target its programs are compiled for, the node its console is called, and the
-/// boot media `crate::disk` lays for it. The verdict is the shared
-/// `=== RUN/PASS/FAIL/SUMMARY`/`END` protocol, read by [`crate::sweep`].
-///
-/// `=== END` is what ends the poll: unlike the first machine's sweep there is no
-/// debug exit to wait for - the runner ends the machine itself, so the harness's
-/// own last line is the terminator.
-pub fn run_disk_sweep(
-    build_dir: &Path,
-    profile: &str,
-    arch: Arch,
-    selection: sweep::Selection,
-) -> Result<()> {
-    // The kernel this sweep boots has to be the current one, and it is this
-    // arm's own build: the first machine's is done by `run_tests`, and `main`
-    // does not build for `test` on either machine. It is the *test* build, so the
-    // boot's suites are in the image at all (`utils::build_test_kernel`).
-    let kernel = utils::build_test_kernel(build_dir, profile, arch)?;
-    println!();
-    let loader = utils::loader_path(profile, arch)?;
-    let built = build_std_tests(arch)?;
-    println!("user tests: {} {} programs built", arch.name(), built.len());
-
-    // The check below is what keeps the naming honest, and it is this arm's own
-    // rather than `sweep`'s: it is about *this machine's* group specifically, and
-    // what it refuses is a gap declared here that this payload does not build. A
-    // gap has to be a program this machine was asked about and could not serve; a
-    // name in its group that this payload never builds is a claim about the ABI
-    // that nothing in the sweep can check - the other arm stages the name (it
-    // builds every program), and this one has nothing to leave out - so it would
-    // sit in the file looking like a measured gap for ever.
-    let config = sweep::load_config()?;
-    let machine = crate::config::Machine::Aarch64;
-    let built_names: Vec<String> = built.iter().map(|(name, _)| name.clone()).collect();
-    let unbuilt = gaps_without_programs(&config, machine, &built_names);
-    if !unbuilt.is_empty() {
-        bail!(
-            "tests.toml names {}, as gaps for this machine, which its payload \
-             does not build: a gap nobody can check is not a gap",
-            unbuilt.join(", ")
-        );
-    }
-
-    // The selection is `sweep`'s - the same questions about `tests.toml` the
-    // other arm asks, with the same answers. The reason-groups bind this machine
-    // as they bind the first one: what `external` and `slow` name is outside the
-    // machine under test, and slirp's DHCP server, the host's resolver and a
-    // public address are outside this one too. `--groups` reaches this arm as
-    // well now, which is what keeps those programs runnable here at all.
-    let plan = sweep::select(machine, &config, &built, &selection)?;
-    let tests = &plan.staged;
-
-    // The runner is the *shared* one: the same `#!/bin/sh` script the first
-    // machine's test boot is handed, because what a sweep is does not change
-    // with the machine - a program is exec'd, its exit status becomes a
-    // `=== PASS`/`=== FAIL` line, and the run ends with `poweroff -f`. What is
-    // this machine's own is only *where the payload sits*.
-    //
-    // No in-tree applet farm: the disk's root is the archive the shared
-    // `initramfs` pipeline builds, so `/bin/busybox`, the shell and the
-    // directories a mount lands on are the ones that pipeline installs for this
-    // machine - the same ones the *ramfs* half runs - instead of a second,
-    // hand-written multi-call binary maintained beside them.
-    //
-    // The runner lands at `/sbin/init` because that *is* the disk's pid-1 chain
-    // now: the shared initramfs script execs `/sbin/init` after the switch on
-    // both machines (`assets/initramfs/core/init`), the name a standard Alpine
-    // disk answers to, and the payload lands last so the runner stands where the
-    // installed image's own `/sbin/init` would. It used to be `/init`, which was
-    // the second machine's own chain back when this machine's disk carried one.
-    let mut entries: Vec<(&str, &[u8])> = vec![("sbin/init", TEST_INIT.as_bytes())];
-    let paths: Vec<String> = plan
-        .staged
-        .iter()
-        .map(|(name, _)| format!("bin/{name}"))
-        .collect();
-    for (path, (_, bytes)) in paths.iter().zip(plan.staged.iter()) {
-        entries.push((path.as_str(), bytes.as_slice()));
-    }
-    // The root the kernel is told to switch to, and the consoles it is told it
-    // has: both come from the machine's own configuration (`rootfs.root_device`,
-    // `rootfs.serial_port`), because the disk the sweep boots is the same GPT
-    // shape the install writes and its partition carries the same name.
-    let rootfs = crate::config::RootfsConfig::load(
-        &utils::project_root()?.join(crate::paths::ROOTFS_CONFIG),
-        arch,
-    )?;
-    // §10.5's fixture and the boot word it arms, both keyed on this run's
-    // staged set: the image rides the sweep medium as `dev/dev-sda-fs.img`,
-    // which lands at the *same* guest path the first machine's archive member
-    // unpacks to (`/dev/dev-sda-fs.img`), so one test program reads either
-    // machine — and `mpos.diskstat` goes on the line only when `t-diskbench` is
-    // in the set that will read the counters back.
-    let diskstat = diskstat_for_staged(plan.staged.iter().map(|(name, _)| name.as_str()));
-    // The fixture rides only when the programs that read it are staged: a
-    // sweep without them does not pay 80 MiB of root partition for an image
-    // nothing opens. With them, the medium grows to carry it - `mkfs.ext4`
-    // answers "no blocks" rather than a warning when the tree overflows the
-    // size, and a sweep that dies in the builder reads as a build failure.
-    let mut disk_bytes = SWEEP_DISK_BYTES;
-    let mut fixture: Option<Vec<u8>> = None;
-    if plan
-        .staged
-        .iter()
-        .any(|(name, _)| name == "t-ext4-mount" || name == "t-diskbench")
-    {
-        let image = crate::disk::build_ext4_image(build_dir)?;
-        let bytes = fs::read(&image)
-            .with_context(|| format!("Failed to read the ext4 fixture {}", image.display()))?;
-        disk_bytes += bytes.len() as u64 + 16 * 1024 * 1024;
-        fixture = Some(bytes);
-    }
-    if let Some(bytes) = &fixture {
-        // The same path as the archive member, without the leading slash: a
-        // disk entry is named from the root already.
-        entries.push((DISKSTAT_FIXTURE_ENTRY, bytes.as_slice()));
-    }
-    let cmdline = format!(
-        "console={} mpos.selftest root={} rootfstype={}{}\n",
-        rootfs.serial_port, rootfs.root_device, rootfs.filesystem, diskstat
-    );
-    let disk = crate::disk::sweep_medium(
-        build_dir,
-        arch,
-        &crate::disk::Boot {
-            kernel: &kernel,
-            loader: &loader,
-            entries: &entries,
-            disk_bytes,
-            cmdline: &cmdline,
-        },
-    )?;
-    println!("disk:   {}", disk.display());
-
-    // How long the guest may run before the harness gives up on it: the shared
-    // `MPOS_TEST_TIMEOUT` answer, because a sweep that is slower on this machine
-    // than on the first one is a fact about TCG and not about the deadline.
-    let log = qemu::boot(
-        build_dir,
-        arch,
-        &disk,
-        &["=== END"],
-        Duration::from_secs(test_timeout_secs()),
-    )?;
-    print!("{log}");
-    let staged: Vec<&str> = tests.iter().map(|(name, _)| name.as_str()).collect();
-    report_disk_sweep(build_dir, arch, &staged, plan.skipped.len(), &log, diskstat)
-}
-
-/// The names in `machine`'s own `tests.toml` groups that `built` does not carry.
-///
-/// Empty is the healthy answer, and the caller refuses the run when it is not:
-/// see the comment at its call site for why a gap has to be a program.
-fn gaps_without_programs(
-    config: &crate::config::TestConfig,
-    machine: crate::config::Machine,
-    built: &[String],
-) -> Vec<String> {
-    missing_programs(&config.machine_tests(machine), built)
-}
-
-/// The gap names among `gaps` that `built` does not carry.
-///
-/// Split from the `TestConfig` lookup so the rule can be tested without a file:
-/// the shipped file's own group is empty today, and a rule that can only be
-/// exercised by a non-empty file would have no test on the day the file is right.
-fn missing_programs(gaps: &[(&str, &str)], built: &[String]) -> Vec<String> {
-    gaps.iter()
-        .filter(|(_, test)| !built.iter().any(|name| name == test))
-        .map(|(_, test)| test.to_string())
-        .collect()
-}
-
-/// The std-side user test programs for `arch`, built by cargo for its musl
-/// target and read back as bytes.
-///
-/// The files cross as *data* rather than as paths: this arm's payload is a disk
-/// laid out by name, not a tar the guest unpacks.
-///
-/// Zero programs is an error, not an empty green run - a sweep that quietly runs
-/// fewer tests than asked is the one failure this must not have.
-fn build_std_tests(arch: Arch) -> Result<Vec<(String, Vec<u8>)>> {
-    let root = utils::project_root()?;
-    println!(
-        "User tests: the std-side suite for {} (mpos-user-tests)",
-        arch.name()
-    );
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "-p",
-            "mpos-user-tests",
-            "--target",
-            arch.musl_target(),
-        ])
-        .current_dir(&root)
-        .status()
-        .context("Failed to run cargo for the user tests")?;
-    if !status.success() {
-        bail!("the {} std-side user tests did not build", arch.name());
-    }
-
-    let dir = utils::target_dir()?.join(format!("{}/release", arch.musl_target()));
-    let mut tests = Vec::new();
-    for entry in fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))? {
-        let path = entry?.path();
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if !name.starts_with("t-") || !path.is_file() {
-            continue;
-        }
-        let bytes =
-            fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
-        // Cargo writes a `.d` dep-info file beside every binary, and its name
-        // starts with `t-` too. Staging one makes the runner exec a text file
-        // and report `exit=127`, which reads like a broken program rather than a
-        // broken payload - so the payload is the ELF magic, not the name.
-        if !bytes.starts_with(b"\x7fELF") {
-            continue;
-        }
-        tests.push((name, bytes));
-    }
-    tests.sort_by(|a, b| a.0.cmp(&b.0));
-    if tests.is_empty() {
-        bail!(
-            "no {} test program was built under {} - the sweep would have \
-             reported a green zero",
-            arch.name(),
-            dir.display()
-        );
-    }
-    Ok(tests)
-}
-
-/// This arm stages *bytes*: the binary is read here and laid on the ext4 image
-/// by name, because the payload is a disk the guest does not unpack. The name is
-/// the only part `sweep` needs.
-impl sweep::TestProgram for (String, Vec<u8>) {
-    fn name(&self) -> &str {
-        &self.0
-    }
-}
 
 /// §10.5's instrument line, printed by both sweep arms when the boot was armed.
 ///
@@ -1843,7 +1844,7 @@ fn report_diskstat(log: &str, diskstat: &str) -> Result<()> {
         println!("  {disk} (boot disk): bootcold={calls} of {blocks} blocks");
     }
     // §10.5's last named figure, where the machine could be asked it: the raw
-    // pass over the disk that is neither the fixture's nor the root's — the
+    // pass over the disk that is neither the fixture's nor the root's - the
     // first machine's boot medium, whose virtio-blk PCI transport is the one
     // the two readers above never count.
     for (disk, calls, blocks) in sweep::sparedisk_readings(log) {
@@ -1877,34 +1878,33 @@ fn report_netstat(log: &str, staged: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Read a disk sweep's verdict out of the log.
+/// Read a sweep's verdict out of its wire, and say for every program that was
+/// **staged** whether it answered.
 ///
 /// Three facts have to agree, and each is a different way for the run to be
-/// less than it looks: every program that was staged has to appear (a log that
-/// stops early still contains the passes it got through), no program may have
-/// failed, and the runner's own summary line has to be there - the same shape
-/// [`report`] checks, because both are claims about a machine someone has to be
-/// able to quote.
+/// less than it looks: every staged program has to have printed `=== PASS`, no
+/// program may have failed, and the runner's own summary line has to be there.
+/// The same shape for both machines, because both run the same runner script
+/// and the same protocol.
 ///
-/// `staged` is the programs this run asked the machine about and `left_out` how
-/// many `tests.toml` named instead - the latter counted, never hidden: a green
-/// here means "every program this machine was supposed to be able to run
-/// passed", and the names and reasons of the ones it was not are in that file,
-/// printed by the caller above.
-fn report_disk_sweep(
-    build_dir: &Path,
+/// A test that never printed `=== PASS` failed, whether it crashed, hung or
+/// never ran; "some of them passed" is not a partial pass. `built` is what the
+/// crate produced, so the line can say how much of it the configuration left
+/// out - a sweep that quietly runs less than it used to is the failure this
+/// number is here to catch.
+fn report(
     arch: Arch,
-    staged: &[&str],
-    left_out: usize,
-    log: &str,
+    tests: &[&UserTest],
+    built: usize,
+    text: &str,
+    status: Option<i32>,
     diskstat: &str,
+    summary: Option<String>,
 ) -> Result<()> {
-    // The protocol is `sweep`'s - one parser for both runners. What this arm
-    // does with it is its own, because its claim differs from the first
-    // machine's: there is no debug exit to read here, so instead of quoting a
-    // status it asserts an exact count - every staged program must have left a
-    // verdict, and "some of them passed" is not a partial pass.
-    let verdict = sweep::verdict(log);
+    // The protocol is `sweep`'s - one parser for both runners - and what this
+    // arm does with it is its own, because its claim is: every staged program
+    // printed `=== PASS`, and the machine ended the way its own protocol ends.
+    let verdict = sweep::verdict(text);
     // The runner sets the machine up before it runs anything (it makes `/tmp`),
     // and a setup that failed makes every "failure" below a statement about the
     // harness rather than the kernel. So this is checked first and refuses the
@@ -1918,25 +1918,36 @@ fn report_disk_sweep(
         );
     }
 
-    println!();
-    let Some(summary) = verdict.summary else {
-        bail!(
-            "the {} sweep never printed a summary: the run did not reach the \
-             end of the {} staged program(s); {} says how far it got",
-            arch.name(),
-            staged.len(),
-            qemu::serial_log(build_dir, arch).display()
-        );
-    };
-    println!("self-test ({}): {summary}", arch.name());
+    let missing: Vec<&str> = tests
+        .iter()
+        .filter(|test| !verdict.passed.contains(&test.name.as_str()))
+        .map(|test| test.name.as_str())
+        .collect();
+    // The summary is the caller's, not the log's: a sweep with more than one
+    // lane has one summary line per lane, and the number a reader wants is
+    // their sum (`combined_summary`). `verdict` still answers *which* programs
+    // passed, which is per-program and lane-independent.
+    let clean = status == clean_exit(arch) && summary.is_some();
 
-    // The kernel's own suites, which ran before any program did - the same
-    // two-part assertion the first machine's arm makes: the line has to be
-    // there, and it has to say zero failed.
+    // The kernel's own suites, which ran before any program did. Both halves of
+    // that sentence are asserted: the line has to be *there* (a test kernel
+    // that reports nothing has not said its suites ran), and it has to say
+    // zero failed.
     let kunit = verdict.kunit;
-    let suites_clean = kunit
-        .map(|kunit| kunit.failed == 0 && kunit.passed > 0)
-        .unwrap_or(false);
+
+    println!();
+    if let Some(summary) = &summary {
+        println!(
+            "self-test ({}): {summary} ({} built)",
+            arch.name(),
+            tests.len()
+        );
+    } else {
+        println!(
+            "self-test ({}): no summary line - the run did not get to the end",
+            arch.name()
+        );
+    }
     match kunit {
         Some(kunit) => println!(
             "self-test ({}): mpos-kunit {} passed, {} failed",
@@ -1949,55 +1960,108 @@ fn report_disk_sweep(
             arch.name()
         ),
     }
-    if !suites_clean {
-        bail!(
-            "self-test ({}) failed: the kernel's own suites report {}",
-            arch.name(),
-            match kunit {
-                Some(kunit) => format!("{} passed, {} failed", kunit.passed, kunit.failed),
-                None => "nothing at all - no mpos-kunit line, so they did not run".to_string(),
-            }
+    let skipped = built.saturating_sub(tests.len());
+    if skipped > 0 {
+        println!(
+            "self-test ({}): {skipped} of {built} user tests left out by tests.toml",
+            arch.name()
         );
+    }
+    report_diskstat(text, diskstat)?;
+    let names: Vec<&str> = tests.iter().map(|t| t.name.as_str()).collect();
+    report_netstat(text, &names)?;
+    // The status is the machine's own clean-end shape: a process exit on the
+    // first machine, and "no exit" on the second - whose lanes are stopped at
+    // the protocol's own marker, where `-1` would be an invented number.
+    let shown = status
+        .map(|code| format!("exit {code}"))
+        .unwrap_or_else(|| "no process exit: the lanes ended on === END".to_string());
+    println!("self-test ({}): {shown}", arch.name());
+
+    if !missing.is_empty() {
+        println!();
+        println!("self-test: {} test(s) did not pass:", missing.len());
+        // The protocol's own `=== FAIL` names, not just the staged names that
+        // never answered: a name in one and not the other is a verdict the
+        // wire carries that the payload did not stage, which its own check
+        // below refuses.
+        for name in &verdict.failed {
+            let name = name.split_whitespace().next().unwrap_or(name);
+            println!("  FAIL {name}");
+        }
     }
 
-    if !verdict.failed.is_empty() {
-        let mut names: Vec<&str> = verdict
-            .failed
-            .iter()
-            .map(|name| name.split_whitespace().next().unwrap_or(name))
-            .collect();
-        names.sort_unstable();
-        for name in &names {
-            println!("  FAILED {name}");
+    if !clean || kunit.map(|kunit| kunit.failed).unwrap_or(1) != 0 {
+        println!();
+        println!("self-test: the last of the serial log:");
+        let tail: Vec<&str> = text.lines().collect();
+        for line in tail.iter().rev().take(30).rev() {
+            println!("  | {line}");
+        }
+    }
+
+    println!();
+    let suites_clean = kunit
+        .map(|kunit| kunit.failed == 0 && kunit.passed > 0)
+        .unwrap_or(false);
+    if clean && missing.is_empty() && suites_clean && verdict.passed.len() == tests.len() {
+        let kunit = kunit.expect("checked above");
+        println!(
+            "self-test ({}): all {} user tests passed, and the kernel's {} self-test cases passed{}",
+            arch.name(),
+            tests.len(),
+            kunit.passed,
+            if skipped > 0 {
+                format!(" ({skipped} not run - see tests.toml)")
+            } else {
+                String::new()
+            }
+        );
+        Ok(())
+    } else {
+        if verdict.passed.len() != tests.len() && missing.is_empty() {
+            // Every staged name passed, yet the log carries a different number
+            // of verdicts: a payload and a run that disagree, which is not a
+            // partial pass either way.
+            bail!(
+                "the {} sweep staged {} program(s) but the log carries {} verdict(s): \
+                 the payload and the run disagree",
+                arch.name(),
+                tests.len(),
+                verdict.passed.len()
+            );
         }
         bail!(
-            "self-test ({}) failed: {} of {} programs did not pass: {}",
+            "self-test ({}) failed: {} of {} user tests did not pass{}, and the \
+             kernel's suites report {}",
             arch.name(),
-            names.len(),
-            staged.len(),
-            names.join(", ")
-        );
+            missing.len(),
+            tests.len(),
+            if clean {
+                ""
+            } else {
+                " and the run did not end cleanly"
+            },
+            match kunit {
+                Some(kunit) => format!("{} passed, {} failed", kunit.passed, kunit.failed),
+                None => "nothing at all - no mpos-kunit line".to_string(),
+            }
+        )
     }
-    if verdict.passed.len() != staged.len() {
-        bail!(
-            "the {} sweep staged {} program(s) but the log carries {} verdict(s): \
-             the payload and the run disagree, which is not a partial pass",
-            arch.name(),
-            staged.len(),
-            verdict.passed.len()
-        );
-    }
-    println!(
-        "self-test ({}): all {} staged user tests passed ({} left out by \
-         tests.toml - the groups above name every one of them, with the reason \
-         in that file)",
-        arch.name(),
-        staged.len(),
-        left_out
-    );
-    report_diskstat(log, diskstat)?;
-    report_netstat(log, staged)?;
-    Ok(())
+}
+
+/// The gap names among `gaps` that `built` does not carry.
+///
+/// Split from the `TestConfig` lookup so the rule can be tested without a file:
+/// the shipped file's own group is one name long today, and a rule that can
+/// only be exercised by a non-empty file would have no test on the day the
+/// file is right.
+#[cfg(test)]
+fn missing_programs(gaps: &[(&str, &str)], built: &[String]) -> Vec<String> {
+    gaps.iter()
+        .filter(|(_, test)| !built.iter().any(|name| name == test))
+        .map(|(_, test)| test.to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -2006,8 +2070,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        DISKSTAT_FIXTURE_ENTRY, DISKSTAT_FIXTURE_MEMBER, DISKSTAT_ON, LEAF_CRATES, TEST_INIT,
-        UserTest, append_test_members, ustar_header,
+        DISKSTAT_FIXTURE_ENTRY, DISKSTAT_FIXTURE_MEMBER, DISKSTAT_ON, LEAF_CRATES, UserTest,
+        append_test_members, ustar_header,
     };
 
     /// The tail-staging writer's own format claims, against the host `tar`:
@@ -2114,12 +2178,16 @@ mod tests {
                 .contains(&crate::config::GAP_GROUP),
             "the second machine's gap group has to be there, empty or not"
         );
-        let gaps: Vec<String> = config
+        let gaps: Vec<(&str, &str)> = config
             .machine_tests(machine)
             .into_iter()
-            .map(|(_, test)| test.to_string())
+            .map(|(group, test)| (group, test))
             .collect();
-        assert!(super::gaps_without_programs(&config, machine, &gaps).is_empty());
+        let built: Vec<String> = gaps.iter().map(|(_, test)| test.to_string()).collect();
+        assert!(
+            super::missing_programs(&gaps, &built).is_empty(),
+            "every gap the file names is a program the payload builds"
+        );
     }
 
     /// The aarch64 user programs are built by cargo, so the two facts the loader
@@ -2389,19 +2457,19 @@ test result: ok. 130 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; fi
             .into_iter()
             .map(|(n, m)| (n.to_string(), m))
             .collect();
-        super::write_costs(&dir, &costs).unwrap();
-        assert_eq!(super::read_costs(&dir), costs);
+        super::write_costs(&dir, crate::arch::Arch::X86_64, &costs).unwrap();
+        assert_eq!(super::read_costs(&dir, crate::arch::Arch::X86_64), costs);
 
-        let path = super::cost_path(&dir);
+        let path = super::cost_path(&dir, crate::arch::Arch::X86_64);
         fs::write(&path, "t-a\t40\nt-b\tnot-a-number\n").unwrap();
-        let read = super::read_costs(&dir);
+        let read = super::read_costs(&dir, crate::arch::Arch::X86_64);
         assert_eq!(read.len(), 1, "the broken line is skipped: {read:?}");
         assert_eq!(read.get("t-a"), Some(&40));
 
         // No file at all is the first sweep on a tree: an empty hint, not a
         // failure.
         fs::remove_file(&path).unwrap();
-        assert!(super::read_costs(&dir).is_empty());
+        assert!(super::read_costs(&dir, crate::arch::Arch::X86_64).is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 

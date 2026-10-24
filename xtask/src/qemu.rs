@@ -11,7 +11,7 @@ use std::ffi::CString;
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -1056,16 +1056,6 @@ pub fn boot_args(
     }
 }
 
-/// Where a machine's serial transcript is written.
-///
-/// The PL011's output, captured to a file for the same reason the first
-/// machine's test boot captures its own: a verdict has to be readable after
-/// the machine has stopped, and a machine booted to a real userland never
-/// exits on its own.
-pub fn serial_log(build_dir: &Path, arch: Arch) -> PathBuf {
-    build_dir.join(format!("{}-serial.log", arch.name()))
-}
-
 /// The writable copy of the firmware's variable store, under `build/`.
 pub fn firmware_vars(build_dir: &Path, arch: Arch) -> PathBuf {
     build_dir.join(arch.firmware_vars())
@@ -1088,60 +1078,6 @@ pub fn write_firmware_vars(build_dir: &Path, arch: Arch) -> Result<(Firmware, Pa
         )
     })?;
     Ok((firmware, vars))
-}
-
-/// Boot `arch`'s machine off `image` and return what its serial line said.
-///
-/// This is the headless boot an evidence-producing command uses: the wire goes
-/// to a file and the poll stops on the first of `terminators` - a test sweep's
-/// runner prints the harness protocol's `=== END`, so what ends the read is the
-/// caller's to say. A session a person types at is [`run_qemu`], which hands the
-/// wire to the terminal instead.
-pub fn boot(
-    build_dir: &Path,
-    arch: Arch,
-    image: &Path,
-    terminators: &[&str],
-    deadline: Duration,
-) -> Result<String> {
-    let (firmware, vars) = write_firmware_vars(build_dir, arch)?;
-    let log = serial_log(build_dir, arch);
-    let _ = fs::remove_file(&log);
-    let share = utils::lay_p9_share(&build_dir.join(format!("{}-9p-share", arch.name())))?;
-    let config = QemuConfig::load_default(arch)?;
-    let args = boot_args(
-        arch,
-        &config,
-        &firmware,
-        &vars,
-        image,
-        &Console::File(log.display().to_string()),
-        &share,
-        true,
-    )?;
-    eprintln!("+ {} {}", arch.qemu_binary(), args.join(" "));
-    let mut qemu = Command::new(arch.qemu_binary());
-    qemu.args(&args);
-    // QEMU's own stderr goes to this process's, not to a pipe nobody reads. A
-    // QEMU that refuses to start - a missing firmware, an image it cannot open -
-    // says so there and nowhere else, and the serial log it never wrote is
-    // indistinguishable from a machine that hung; that is exactly the failure
-    // this used to hide.
-    qemu.stdout(Stdio::null()).stderr(Stdio::inherit());
-    let captured = capture(qemu, &log, terminators, deadline)?;
-    if captured.timed_out {
-        // Not an error here, and that is deliberate: the caller reads the log
-        // back and its own report says a run that never reached its last marker
-        // did not finish. What is worth saying on the way past is that the
-        // deadline, not the machine, ended this.
-        eprintln!(
-            "{}: the machine did not reach {} within {}s; reading what it said",
-            arch.name(),
-            terminators.join(" / "),
-            deadline.as_secs()
-        );
-    }
-    Ok(captured.log)
 }
 
 /// Runs a machine whose serial line goes to `log`, and returns when it stops
@@ -1383,6 +1319,7 @@ pub fn capture_many(
     Ok(captured)
 }
 
+#[cfg(test)]
 pub fn capture(
     mut command: Command,
     log: &Path,
