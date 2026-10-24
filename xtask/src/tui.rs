@@ -327,6 +327,12 @@ fn spawn_interrupt_watcher() {
 pub struct Panel {
     terminal: Option<ratatui::DefaultTerminal>,
     totals: Vec<usize>,
+    /// The exit status this sweep reads as a lane's clean end: `Some(33)` on
+    /// the first machine, `None` on the second - whose lanes stop at the
+    /// protocol's own `=== END` (and may also exit `0` under it, when the
+    /// machine's own poweroff wins the race with the poll). A lane that
+    /// exited any other way is drawn red while it lives on in the report.
+    clean: Option<i32>,
     lanes: Vec<LaneRow>,
     running: Vec<(usize, Option<String>)>,
     started: Instant,
@@ -335,8 +341,8 @@ pub struct Panel {
 
 impl Panel {
     /// Start the panel for `totals.len()` lanes, each dealt `totals[i]`
-    /// programs.
-    pub fn start(totals: &[usize]) -> Self {
+    /// programs, where a lane's clean end is `clean`.
+    pub fn start(totals: &[usize], clean: Option<i32>) -> Self {
         let terminal = panel_wanted().then(ratatui::init);
         // Raw mode turns off the terminal's own signal keys, so the ctrl-c that
         // used to end a sweep would be swallowed by the panel and the sweep
@@ -354,6 +360,7 @@ impl Panel {
             // must never fail because its progress display could not start.
             terminal,
             totals: totals.to_vec(),
+            clean,
             lanes: Vec::new(),
             running: (0..totals.len()).map(|index| (index, None)).collect(),
             started: now,
@@ -381,7 +388,16 @@ impl Panel {
                     millis: tick.millis,
                     // A lane that has not exited yet is not a failure; the
                     // dashboard only turns red once the machine has said so.
-                    ok: tick.exited.map(|code| code == 33).unwrap_or(true),
+                    // The second machine's clean end is `None` (stopped at
+                    // `=== END`) or `Some(0)` (its own poweroff won the race
+                    // with the poll), which is why the comparison is against
+                    // the sweep's answer and not a constant.
+                    ok: match tick.exited {
+                        Some(code) => {
+                            Some(code) == self.clean || (self.clean.is_none() && code == 0)
+                        }
+                        None => true,
+                    },
                     heaviest: None,
                 }
             })
@@ -708,7 +724,7 @@ mod tests {
         // `panel_wanted` reads the process's own stdout, which in a test is a
         // pipe, so this is the not-wanted path by construction.
         assert!(!super::panel_wanted() || std::io::stdout().is_terminal());
-        let mut panel = super::Panel::start(&[1, 2]);
+        let mut panel = super::Panel::start(&[1, 2], Some(33));
         panel.tick(&[]);
         panel.stop();
     }

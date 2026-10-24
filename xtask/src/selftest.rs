@@ -59,6 +59,21 @@ fn clean_exit(arch: Arch) -> Option<i32> {
     }
 }
 
+/// Whether a lane's end is a clean one for its machine. Most of the time this
+/// is [`clean_exit`]'s comparison; on the second machine there are two clean
+/// ends, because the poll stops at the protocol's own `=== END` (status
+/// `None`, the process stopped by the harness) **and** the machine now ends
+/// itself - `poweroff -f` reaches PSCI `SYSTEM_OFF` and QEMU exits - so a
+/// poll that notices the exit first reads `Some(0)`. Both are the same
+/// ending; a comparison against one constant would race with which of the
+/// two the poll saw.
+fn lane_clean(arch: Arch, status: Option<i32>) -> bool {
+    match arch {
+        Arch::X86_64 => status == Some(33),
+        Arch::Aarch64 => status.is_none() || status == Some(0),
+    }
+}
+
 /// Whether the poll's terminator, not only the process exit, says a lane is
 /// done - the second machine's runner prints `=== END` and its QEMU does not
 /// leave on its own (`docs/notes/` §15's disk-sweep arm measured that first).
@@ -1050,18 +1065,28 @@ run_test() {
 }
 
 # Which programs this boot runs. A sweep with more than one lane hands each
-# guest its own subset on the kernel command line (`mpos.tests=t-a,t-b,...`);
-# a boot with no such word runs everything staged, which is one lane and also
-# what a hand boot of a test image does. The word is read here, in the runner,
-# and not by the kernel: whether a machine runs tests is the image's to say
-# (`docs/notes/` §15.19), and this only chooses among programs the image
-# already carries.
+# guest its own subset, and the list travels on one of two channels: the
+# kernel command line (`mpos.tests=t-a,t-b,...`) on the machine whose payload
+# is the boot archive itself, and - below the word, which wins - a
+# `mpos.tests` file on the host share for the machine whose payload is a disk
+# it boots. The file is why the second machine's lane media can be cached at
+# all: the medium carries the *whole* payload, its stamp names nothing about
+# which lane boots it, and the deal - re-dealt from fresh cost measurements
+# on every run - moves only a file the next boot reads. A boot with neither
+# the word nor the file runs everything staged, which is one lane and also
+# what a hand boot of a test image does. The list is read here, in the
+# runner, and not by the kernel: whether a machine runs tests is the image's
+# to say (`docs/notes/` §15.19), and this only chooses among programs the
+# image already carries.
 want=""
 for word in $(cat /proc/cmdline); do
     case "$word" in
         mpos.tests=*) want=$(echo "${word#mpos.tests=}" | tr ',' ' ') ;;
     esac
 done
+if [ -z "$want" ] && [ -f /mnt/share/mpos.tests ]; then
+    want=$(cat /mnt/share/mpos.tests | tr ',' ' ')
+fi
 if [ -n "$want" ]; then
     for name in $want; do
         run_test "/bin/$name"
@@ -1590,22 +1615,34 @@ fn boot_disk_lanes(
     let mut jobs: Vec<LaneJob> = Vec::with_capacity(dealt.len());
     for (index, lane_names) in dealt.iter().enumerate() {
         let dir = build_dir.join(format!("test-lane-{}-{index}", arch.name()));
-        if dir.exists() {
-            fs::remove_dir_all(&dir)?;
-        }
         fs::create_dir_all(&dir)?;
+        // The lane's *medium* lives in this directory under its own stamp, and
+        // `sweep_medium`'s cache decides whether it needs laying again - so the
+        // directory is kept, not wiped, and only the artefacts a boot rewrites
+        // are refreshed here: the serial log (a new run's wire, not the last
+        // one's tail) and the firmware vars (AAVMF writes them at every boot,
+        // which is why they travel as a fresh copy and not a shared file).
+        // Wiping the whole directory was how this arm rebuilt a 250 MB image
+        // with its ext4 root on every gate, where the first machine's lane -
+        // whose payload rides an archive and a per-lane command-line file -
+        // rebuilt nothing.
+        let log = dir.join("serial.log");
+        let _ = fs::remove_file(&log);
         let vars = dir.join(arch.firmware_vars());
         fs::copy(&vars0, &vars)
             .with_context(|| format!("Failed to stage the firmware vars at {}", vars.display()))?;
-        // `mpos.tests=` is the lane's program list, on the same term the first
-        // machine's command line carries it.
+        // The medium's command line names the boot, not the lane: which of
+        // the staged programs this lane runs rides the lane's own 9p share
+        // (`mpos.tests`, read by the shared runner above the mount it already
+        // makes). Baking the list here instead re-dealt the deal into every
+        // run's image fingerprint - and a deal re-dealt from fresh cost
+        // measurements is a deal that changes on every run, which is how this
+        // arm rebuilt every lane's 250 MB medium on every gate. The first
+        // machine's lanes keep the command-line word, because their payload
+        // is an archive no stamp guards.
         let cmdline = format!(
-            "console={} mpos.selftest root={} rootfstype={}{} mpos.tests={}\n",
-            rootfs.serial_port,
-            rootfs.root_device,
-            rootfs.filesystem,
-            diskstat,
-            lane_names.join(",")
+            "console={} mpos.selftest root={} rootfstype={}{}\n",
+            rootfs.serial_port, rootfs.root_device, rootfs.filesystem, diskstat
         );
         let disk = crate::disk::sweep_medium(
             build_dir,
@@ -1621,7 +1658,9 @@ fn boot_disk_lanes(
         )?;
 
         let share = utils::lay_p9_share(&dir.join("9p-share"))?;
-        let log = dir.join("serial.log");
+        // The lane's program list, on the channel the runner reads it from.
+        fs::write(share.join("mpos.tests"), lane_names.join(","))
+            .with_context(|| format!("Failed to stage the lane's program list"))?;
         // A test boot never needs the host vsock bus, and every lane claiming
         // the same CID aborts QEMU before its guest starts (`docs/notes/`
         // §13.28) - the same rule the first machine's lanes run under.
@@ -1673,7 +1712,7 @@ fn run_lanes(
     // (`LaneTick`).
     let timeout = Duration::from_secs(test_timeout_secs());
     let totals: Vec<usize> = dealt.iter().map(|lane| lane.len()).collect();
-    let mut panel = tui::Panel::start(&totals);
+    let mut panel = tui::Panel::start(&totals, clean_exit(arch));
     let lane_logs: Vec<PathBuf> = jobs.iter().map(|job| job.log.clone()).collect();
     let polls: Vec<(Command, PathBuf)> =
         jobs.into_iter().map(|job| (job.command, job.log)).collect();
@@ -1715,14 +1754,14 @@ fn run_lanes(
                 lane.log.display()
             );
         }
-        let clean = lane.status == clean_exit(arch);
+        let clean = lane_clean(arch, lane.status);
         println!(
             "User tests: lane {index} ran {} programs, exit {}",
             lane.names.len(),
             lane.status.unwrap_or(-1)
         );
         if !clean {
-            if status == clean_exit(arch) {
+            if lane_clean(arch, status) {
                 status = lane.status.or(Some(-1));
             }
             // The lane's own tail, not the sweep's: a lane that died says why
@@ -1768,7 +1807,7 @@ fn run_lanes(
             index,
             programs: lane.names.len(),
             millis: lane.millis,
-            ok: lane.status == clean_exit(arch) && !lane.timed_out,
+            ok: lane_clean(arch, lane.status) && !lane.timed_out,
             heaviest: lane
                 .names
                 .iter()
