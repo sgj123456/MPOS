@@ -48,6 +48,7 @@ pub(crate) mod mmio;
 pub(crate) mod paging;
 pub(crate) mod pl011;
 pub(crate) mod pl031;
+pub(crate) mod psci;
 pub(crate) mod signal;
 pub(crate) mod timer;
 pub(crate) mod vectors;
@@ -500,6 +501,19 @@ impl crate::hal::Clock for crate::hal::Current {
     #[inline]
     fn busy_wait_ms(ms: u64) {
         timer::busy_wait_ms(ms)
+    }
+
+    /// The architecture gives the machine a second comparator - the EL1
+    /// *virtual* timer, independent of the physical one the tick runs on - so
+    /// a wait shorter than 4 ms ends when it is due (`timer::arm_wake_ns`,
+    /// `docs/notes/` §10.7). The one-shot holds no clock of its own: it is
+    /// disarmed the moment it fires, and the periodic tick stays the only
+    /// thing that moves the clock.
+    const SUB_TICK_WAKE: bool = true;
+
+    #[inline]
+    fn arm_wake_ns(deadline_ns: Option<u64>) {
+        timer::arm_wake_ns(deadline_ns)
     }
 }
 

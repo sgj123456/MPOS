@@ -684,6 +684,16 @@ extern "C" fn irq() {
         let in_user = system_register("spsr") & 0b1111 == 0;
         crate::hal::kernel::charge_cpu(in_user);
         ticked = true;
+    } else if intid == gic::VTIMER_INTID {
+        // The one-shot a sub-tick wait was armed with: no clock of its own and
+        // nothing to charge - the tick above is the only thing that moves the
+        // clock, and this vector's whole job is to hand the core to the
+        // scheduler, whose next turn reads the clock and wakes whoever's
+        // deadline it was. Disarm before the EOI, for the reason
+        // `vtimer_disarm` states: a one-shot left enabled with its compare in
+        // the past is a level line that never deasserts.
+        timer::vtimer_disarm();
+        ticked = true;
     } else if intid == gic::SERIAL_INTID {
         // One line, two directions: a keystroke that arrived and a transmit
         // queue that has room are the same wire on this machine, and both are

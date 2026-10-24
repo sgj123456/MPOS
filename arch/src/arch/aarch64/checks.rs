@@ -218,12 +218,15 @@ pub(super) fn check_devices(info: &BootInfo) {
         );
     }
 
-    // The timer's line, decoded the way its binding says: a triple per
+    // The timer's lines, decoded the way the binding says: a triple per
     // interrupt - shared or per-CPU, the number in that space, and the trigger
     // - whose first cell decides the offset, since an SPI counts from 32 and a
     // PPI from 16. This kernel's clock is the EL1 physical timer, which is PPI
-    // 14 and therefore INTID 30; the whole of that sentence is what the check
-    // holds the tree to.
+    // 14 and therefore INTID 30, and its sub-tick wake is the EL1 *virtual*
+    // timer, PPI 11 and INTID 27; both sentences are what the check holds the
+    // tree to - the node names all four timers the architecture has, and a
+    // tree that stopped carrying either of the two this kernel drives would
+    // leave a vector the GIC enables but nothing raises.
     let timer = found!("timer", "arm,armv8-timer");
     let cells = match intc.u32_property("#interrupt-cells") {
         Some(3) => 3usize,
@@ -245,6 +248,7 @@ pub(super) fn check_devices(info: &BootInfo) {
         );
     }
     let mut timer_line = None;
+    let mut vtimer_line = None;
     while interrupts.remaining() >= cells {
         let (Some(kind), Some(number)) = (interrupts.next(), interrupts.next()) else {
             fail!("the timer's interrupts end in the middle of an entry");
@@ -264,6 +268,9 @@ pub(super) fn check_devices(info: &BootInfo) {
         if intid == gic::TIMER_INTID {
             timer_line = Some((kind, number));
         }
+        if intid == gic::VTIMER_INTID {
+            vtimer_line = Some((kind, number));
+        }
     }
     let Some((kind, number)) = timer_line else {
         fail!(
@@ -272,12 +279,21 @@ pub(super) fn check_devices(info: &BootInfo) {
             gic::TIMER_INTID
         );
     };
+    let Some((vkind, vnumber)) = vtimer_line else {
+        fail!(
+            "the tree's timer does not carry INTID {}, which is the line this \
+             kernel's sub-tick wake is armed on",
+            gic::VTIMER_INTID
+        );
+    };
     let _ = writeln!(
         out,
         "devices: PL011 at {serial_base:#x}, GIC at {dist:#x}/{cpu:#x}, timer on {} \
-         {number} (INTID {})",
+         {number} (INTID {}), wake on {} {vnumber} (INTID {})",
         if kind == 1 { "PPI" } else { "SPI" },
         gic::TIMER_INTID,
+        if vkind == 1 { "PPI" } else { "SPI" },
+        gic::VTIMER_INTID,
     );
 
     // And the transports the rest of stage 5 will drive, checked against the
@@ -1645,6 +1661,42 @@ fn check_cpu() {
     }
     if vectors::interrupts_enabled() {
         fail!("idle() returned with interrupts still enabled");
+    }
+
+    // And the one-shot must wake between two ticks - the half of the sub-tick
+    // contract a pin cannot see from a syscall. Arm the virtual timer two
+    // milliseconds out - half a period, so a tick cannot be the thing that
+    // answered - park on it, and read the figures back: woken it must be, and
+    // with the tick count unmoved, or this machine's `SUB_TICK_WAKE` is a lie
+    // every sleep would pay for.
+    let wake_ns = timer::since_boot_nanos() + 2_000_000;
+    timer::arm_wake_ns(Some(wake_ns));
+    let before = timer::ticks();
+    vectors::idle();
+    let fired = timer::ticks() == before;
+    if !fired {
+        let ctl = timer::vtimer_control();
+        let state = gic::state();
+        fail!(
+            "the virtual timer's one-shot did not wake idle() two milliseconds \
+             out (ticks moved to {}, ctl {:#06x} = enable {} imask {} istatus {}, \
+             cval {:#x}, count {:#x}, base {:#x}, gic pending {:#x} enabled {:#x} \
+             hpplr {:#x})",
+            timer::ticks(),
+            ctl,
+            ctl & 1,
+            (ctl >> 1) & 1,
+            (ctl >> 2) & 1,
+            timer::vtimer_compare(),
+            timer::vtimer_count(),
+            timer::vtimer_base(),
+            state.highest_pending,
+            state.enabled0,
+            state.highest_pending
+        );
+    }
+    if vectors::interrupts_enabled() {
+        fail!("the one-shot's idle() returned with interrupts still enabled");
     }
 
     let _ = writeln!(

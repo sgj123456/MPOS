@@ -155,17 +155,20 @@ diagnostic = ["t-sh", "t-aa-ptyprobe"]
 #     have put a network fetch inside the gate.
 #
 # One name sits here now, and its reason is the architecture rather than a
-# missing handler:
+# missing handler. (A second sat beside it for the same kind of reason - the
+# clock's - and left the day the machine grew the wake that serves the call:
+# `t-sleep-subtick` ran on the first machine alone while the second's sleeps
+# rounded up to a tick, and the EL1 *virtual* timer is what closed it - a
+# second comparator, independent of the one the tick runs on, armed by the
+# scheduler at the earliest wait the next tick would be too late for. The
+# program now asserts its distribution on both machines, and the gap's way
+# out was the machine's own answer, not an edit to a list: `docs/notes/`
+# §10.7/§13.)
 #
 #   t-arch-prctl  `arch_prctl` is x86_64's own call (arm64 has no number for
 #                 it - TLS goes through other doors there). The program builds
 #                 on both machines and says "skipped" on the second; naming it
 #                 here keeps the sweep's question honest on both.
 
-# And one is a clock, not a call: the second machine's sleeps still round up to
-# a tick because nothing arms a wake-up between two of them. `t-sleep-subtick`
-# is that behaviour's claim, and it is named here rather than weakened so the
-# first machine keeps asserting it. What closes this is the machine's own timer
-# (a comparator interrupt), not an edit to this file - `docs/notes/` §10.7.
 [aarch64]
-gaps = ["t-arch-prctl", "t-sleep-subtick"]
+gaps = ["t-arch-prctl"]

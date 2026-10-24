@@ -1067,10 +1067,28 @@ They are part of this landing because the accurate clock is what exposed them.
   today but are the next place this will bite. A fixture budget is wall clock, and
   it must not be spelled in the clock's granularity.
 
-**Named, and not claimed**: the second machine has no sub-tick wake - its sleeps
-still round up to a tick, `SUB_TICK_WAKE` is `false` there by default, and
-`t-sleep-subtick` sits in its `gaps` rather than being weakened for it (`docs/`
-§13 records what a machine's own timer would take). The periodic timer scans stay
+**Claimed now too (2026-10-24, same day as §6.24)**: the second machine's wake
+exists - the architecture gives it a *second* comparator, the EL1 **virtual**
+timer (`CNTV_*`, PPI 11, INTID 27), independent of the physical one the tick
+runs on, and `hal::Clock`'s `arm_wake_ns` arms it there as the x86_64 machine
+arms its LAPIC one-shot. The conduit came from the machine's own device tree
+(`arm,psci-*`-style honesty: the node names the line), the handler disarms
+before its EOI (a one-shot left enabled with its compare in the past is a
+level line that never deasserts), and the bring-up check arms it two
+milliseconds out and proves `idle()` woke with the tick count unmoved. The
+first cut of the line was delivered dead: the GIC group and priority were
+configured and the *enable bit was never written*, so a fired interrupt sat
+in the distributor's pending set for ever - measured by the check's own
+register dump (ISTATUS set, count past the compare, `ISENABLER0` with bit 27
+clear) and fixed in the same sentence that records it. With the wake live,
+`t-sleep-subtick` runs on both machines and passed there first thing:
+**median 1083 µs, 32/50 inside half a tick** (against 3983 µs and 0/50 with
+the one-shot dead), and the whole aarch64 sweep dropped from 56 s to 16 s of
+wall clock - every 1 ms poll the suite holds pays the difference. The gap
+list is down to `t-arch-prctl`, which is the architecture's own difference
+(arm64 has no such number) and not a missing handler.
+
+The periodic timer scans stay
 tick-quantised on purpose: `check_itimers` and `check_posix_timers` compare
 `hal::ticks()`, so a POSIX timer's expiry still rounds up to a tick - only waits
 with a *deadline* became sub-tick. `timerfd` and the TCP retransmit pacing still

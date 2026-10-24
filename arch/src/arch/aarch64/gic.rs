@@ -63,6 +63,13 @@ pub const SPURIOUS: u32 = 1023;
 /// The non-secure EL1 physical timer's PPI (14), as INTID 30.
 pub const TIMER_INTID: u32 = 30;
 
+/// The non-secure EL1 **virtual** timer's PPI (11), as INTID 27 - the one-shot
+/// a sub-tick wake is armed with (`timer::arm_wake_ns`). The architecture
+/// counts its PPIs from 16, so PPI 11 lands here; the device tree's `timer`
+/// node names the same pair (PPI 14 the physical clock, PPI 11 the virtual
+/// one), and `check_devices` reads both against this file.
+pub const VTIMER_INTID: u32 = 27;
+
 /// The PL011's SPI 1, as INTID 33 - the tree's `interrupts = <0 1 4>`. It is
 /// wired but unmasked nothing yet (the console is polled until stage 4); it is
 /// named so the `Line::Serial` a driver will unmask maps to a real line here.
@@ -153,6 +160,21 @@ pub fn init() {
     write(DIST, GICD_CTLR, 0);
     set_bit(DIST, GICD_IGROUPR, TIMER_INTID);
     set_priority(TIMER_INTID, 0x80);
+    // The virtual timer's line is configured here too, for the same reason the
+    // physical one is - a one-shot armed before the driver that wants it exists
+    // must land on a line the controller will deliver, and the scheduler arms
+    // its first wake on the first turn after the clock starts. The same
+    // priority as the clock: a sub-tick wake is a scheduling event, no more and
+    // no less urgent than the tick itself.
+    set_bit(DIST, GICD_IGROUPR, VTIMER_INTID);
+    set_priority(VTIMER_INTID, 0x80);
+    // ... and *enabled*, the step the first cut of this line forgot: group and
+    // priority are configuration, delivery is the enable bit, and a line with
+    // the first two and not the third holds a fired interrupt in the
+    // distributor's pending set for ever - measured (the bring-up check's own
+    // register dump: ISTATUS set, count past the compare, ISENABLER0 with bit
+    // 27 clear) before this sentence was.
+    enable(VTIMER_INTID);
     set_bit(DIST, GICD_IGROUPR, SERIAL_INTID);
     // The same priority as the clock: the console input a person typed is not
     // worth less than a tick, and not worth more either - neither line can

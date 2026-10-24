@@ -101,9 +101,13 @@ pub fn init() {
     PERIOD.store(period, Ordering::Relaxed);
     let now = read_cntpct();
     BOOT_COUNT.store(now, Ordering::Relaxed);
+    VBOOT.store(read_cntvct(), Ordering::Relaxed);
     NEXT.store(now.wrapping_add(period), Ordering::Relaxed);
     set_deadline(now.wrapping_add(period));
     enable();
+    // The one-shot is born disarmed; the scheduler arms it at its first turn
+    // with a wait that needs it (`hal::arm_wake_ns`).
+    vtimer_disarm();
 }
 
 /// Re-arm the timer to fire one period from now, leaving the tick count alone.
@@ -123,6 +127,138 @@ pub fn arm_next_period() {
 /// The counter's raw value, for callers that need the machine's own units.
 pub fn counter() -> u64 {
     read_cntpct()
+}
+
+// ---------------------------------------------------------------------------
+// The *virtual* timer: the one-shot a sub-tick wake is armed with.
+//
+// The physical timer above is this machine's periodic clock - its compare is
+// the tick's own arithmetic (`NEXT` + one period, catch-up included), and a
+// one-shot that borrowed it would have to negotiate every deadline with that
+// arithmetic. The architecture gives the machine a second, independent
+// comparator instead: the *virtual* timer (`CNTV_*`), whose PPI the GIC wires
+// to a different INTID, counting the same counter through the same rate. It
+// holds no clock of its own - it is disarmed the moment it fires, and the
+// scheduler arms it again at the earliest wait the next tick would be too
+// late for (`hal::arm_wake_ns`'s contract, `docs/notes/` §10.7) - which is
+// what makes the two timers one clock and one one-shot rather than two
+// clocks that can disagree (the two-clocks rule the 2026-10-24 freeze paid
+// for, §6.24).
+//
+// The compare is anchored on `CNTVCT_EL0`, the *virtual* count, read here
+// rather than derived from `BOOT_COUNT`: `CNTVOFF` is whoever booted us to
+// set, and deriving a virtual compare from a physical base would arm the
+// wake at an instant offset by whatever that difference is. Reading the
+// virtual count once, at [`init`], and comparing the caller's
+// nanoseconds-since-boot against the same base keeps the arithmetic inside
+// one clock whichever way the offset went.
+// ---------------------------------------------------------------------------
+
+/// `CNTVCT_EL0` at [`init`], the base the one-shot's deadlines are converted
+/// against. Zero before [`init`].
+static VBOOT: AtomicU64 = AtomicU64::new(0);
+
+fn read_cntvct() -> u64 {
+    let value: u64;
+    // SAFETY: `CNTVCT_EL0` is a read-only system register, readable at EL1
+    // with no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) value, options(nomem, nostack));
+    }
+    value
+}
+
+/// The virtual timer's control register: bit 0 ENABLE, bit 1 IMASK - the same
+/// shape `CNTP_CTL_EL0` has.
+fn vtimer_enable() {
+    // SAFETY: arming the EL1 virtual timer is the documented way to let its
+    // compare assert the line.
+    unsafe {
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack));
+    }
+}
+
+/// `CNTV_CTL_EL0`, read fresh: bit 0 ENABLE, bit 1 IMASK, and bit 2 ISTATUS -
+/// the condition reached. A failed bring-up reads this first: ISTATUS set
+/// means the comparator *did* fire and the interrupt is missing above it,
+/// clear means the compare never came due and the arithmetic is what to
+/// suspect.
+pub fn vtimer_control() -> u64 {
+    let value: u64;
+    // SAFETY: `CNTV_CTL_EL0` is readable at EL1 with no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, cntv_ctl_el0", out(reg) value, options(nomem, nostack));
+    }
+    value
+}
+
+/// The virtual timer's own count, for a failed bring-up: the compare is
+/// checked against this counter, so the base it was armed from and the count
+/// now are the two numbers its arithmetic ran between.
+pub fn vtimer_count() -> u64 {
+    read_cntvct()
+}
+
+/// The base the one-shot's deadlines convert against, for the same report.
+pub fn vtimer_base() -> u64 {
+    VBOOT.load(Ordering::Relaxed)
+}
+
+/// The compare the one-shot was last armed with, for the same report.
+pub fn vtimer_compare() -> u64 {
+    let value: u64;
+    // SAFETY: readable at EL1, no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, cntv_cval_el0", out(reg) value, options(nomem, nostack));
+    }
+    value
+}
+
+/// The one-shot's own disarm: clear ENABLE, which deasserts the compare's
+/// level line before the interrupt it raised is acknowledged. The handler
+/// calls this before its EOI - a one-shot left enabled with its compare in
+/// the past is a line that never deasserts, which is a storm, not a wake.
+pub fn vtimer_disarm() {
+    // SAFETY: disabling the timer is the documented way to deassert the line.
+    unsafe {
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 0u64, options(nomem, nostack));
+    }
+}
+
+/// [`hal::Clock::arm_wake_ns`] for this machine: the earliest wait's deadline,
+/// in nanoseconds since boot, on the virtual timer's own comparator.
+///
+/// The nanosecond deadline converts through the rate the machine states
+/// (`CNTFRQ_EL0`) against the virtual base taken at [`init`] - the same
+/// conversion `since_boot_nanos` runs in the other direction, so an instant
+/// the clock reports is an instant this compare fires at. A deadline already
+/// reached arms the compare at the current count, which fires at once: the
+/// scheduler's next turn is what the caller wanted, and a zero would stop the
+/// timer instead of raising it.
+pub fn arm_wake_ns(deadline_ns: Option<u64>) {
+    let Some(deadline_ns) = deadline_ns else {
+        vtimer_disarm();
+        return;
+    };
+    let freq = FREQ.load(Ordering::Relaxed);
+    if freq == 0 {
+        // Before `init` there is no rate to convert through; the periodic
+        // clock is the only wake and the caller's wait rounds to it, which is
+        // the same honesty a machine without the capability states.
+        return;
+    }
+    let base = VBOOT.load(Ordering::Relaxed);
+    let counts = (u128::from(deadline_ns) * u128::from(freq) / 1_000_000_000) as u64;
+    // SAFETY: `CNTV_CVAL_EL0` is the virtual timer's compare; arming it with
+    // an absolute deadline and enabling the timer is the documented sequence.
+    unsafe {
+        core::arch::asm!(
+            "msr cntv_cval_el0, {}",
+            in(reg) base.wrapping_add(counts),
+            options(nomem, nostack)
+        );
+    }
+    vtimer_enable();
 }
 
 /// `CNTP_CTL_EL0`: bit 0 enabled, bit 1 masked, bit 2 the condition reached.
