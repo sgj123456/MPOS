@@ -197,6 +197,13 @@ pub unsafe fn boot(
     // still running in.
     checks::check_devices(&info);
 
+    // The firmware's own way out, read from the same tree the checks above
+    // held the machine to: a `poweroff` means PSCI SYSTEM_OFF here, and the
+    // conduit it travels through is the tree's to say (`psci`). Read before
+    // the first turn anything can ask the machine to end, and not inside a
+    // check - this is discovery, not an assertion.
+    psci::init(&info);
+
     // SAFETY: the record's contract, unchanged - every region it names is live
     // memory the kernel may hand out, and the loader's copy of it is the only
     // description of this machine there is.
@@ -482,6 +489,18 @@ fn gic_line(line: crate::hal::Line) -> u32 {
     match line {
         crate::hal::Line::Timer => gic::TIMER_INTID,
         crate::hal::Line::Serial => gic::SERIAL_INTID,
+    }
+}
+
+/// The firmware's own way out: `poweroff` means PSCI `SYSTEM_OFF` here, and
+/// the emulator exits with the machine. The status code the door carries is
+/// the first machine's debug-exit arrangement; nothing on this machine reads
+/// one, so it is not forwarded.
+#[cfg(mpos_psci_off)]
+impl crate::hal::MachineOff for crate::hal::Current {
+    #[inline]
+    fn machine_off() -> ! {
+        psci::system_off()
     }
 }
 

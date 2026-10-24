@@ -1272,9 +1272,30 @@ pub fn exit_qemu(code: u32) -> ! {
     <Current as TestExit>::exit_qemu(code)
 }
 
+/// A machine whose firmware can end the emulator - the second machine's way
+/// out: PSCI `SYSTEM_OFF` turns the machine off, and the emulator that
+/// emulates the firmware exits with it. No status travels (a PSCI off has no
+/// exit code to carry), which is why this is its own capability beside
+/// [`TestExit`] and not a second impl of it.
+#[cfg(mpos_psci_off)]
+pub trait MachineOff {
+    /// End the machine through its firmware. Never returns.
+    fn machine_off() -> !;
+}
+
+/// End the emulator with `code`. See [`TestExit`]; this machine has none, so
+/// it halts - unless its firmware can end it, in which case the status is
+/// not the observable it is through a debug-exit port and [`MachineOff`]
+/// answers instead.
+#[cfg(all(mpos_psci_off, not(mpos_qemu_debug_exit)))]
+#[inline]
+pub fn exit_qemu(_code: u32) -> ! {
+    <Current as MachineOff>::machine_off()
+}
+
 /// End the emulator with `code`. See [`TestExit`]; this machine has none, so it
 /// halts.
-#[cfg(not(mpos_qemu_debug_exit))]
+#[cfg(not(any(mpos_qemu_debug_exit, mpos_psci_off)))]
 #[inline]
 pub fn exit_qemu(_code: u32) -> ! {
     halt()

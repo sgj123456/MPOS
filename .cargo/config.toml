@@ -130,6 +130,13 @@ rustflags = [
     "--cfg", "mpos_pci_config",
     "--cfg", "mpos_input_registry",
     "--cfg", "mpos_framebuffer_console",
+    # `mpos_psci_off` is the second machine's own way out of an emulator: the
+    # firmware's device tree names a PSCI conduit, and `SYSTEM_OFF` through it
+    # turns the machine (and QEMU) off - which is what a `poweroff -f` means
+    # here, where no debug-exit port exists. The capability lives beside the
+    # other per-machine words and not behind `target_arch` for the same reason
+    # they do (`NOTES.md` §13.23).
+    "--cfg", "mpos_psci_off",
 ]
 
 # The user programs: ordinary Rust binaries for musl, which is the libc this
