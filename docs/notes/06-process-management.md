@@ -3223,3 +3223,68 @@ only today, so the regression window is **everything since 2026-10-21, plus
 the host environment itself, which also changed** (the render node came back).
 Until this closes, the aarch64 arm of the gate has no summary line to quote,
 and every aarch64 claim in a commit message has to say so plainly.
+
+**The bisect named the commit, and the freeze state is now measured (2026-10-24,
+same day).** A fixed bisect script — the first attempt was voided by its own
+harness: a step whose 600-second timeout killed the gate left the QEMU alive,
+the stale guest held vhost-vsock CID 4, and every later step's machine aborted
+before starting (`unable to set guest cid`), which the script read as "bad" —
+run to a verdict with hang detection instead of a timeout, and with a stale-QEMU
+kill before every step: **the first bad commit is `4081466`, "a wait ends at its
+deadline, not at the next clock tick"** (§10.7's landing), on good `4c33638`
+(its parent) and good `31ae543` (2026-10-21, the last tree with a green aarch64
+sweep). The freeze also reproduced byte-for-byte with the sweep's GL display
+removed (`-display none` instead of `egl-headless,gl=on`, the same
+`t-clone-exit` at the same log offset), so the display path is not in it.
+
+What the machine looks like at the freeze, read through the run's own QMP
+socket. Three instruments, three runs:
+
+* the timer's own statics (`arch::arch::aarch64::timer`'s `TICKS`/`NEXT`/
+  `PERIOD`/`FREQ`/`BOOT_COUNT`, read with the monitor's `x` against the
+  kernel's virtual addresses): one freeze held a live counter at 5.83 s
+  against **565 ticks = 2.26 s of served ticks** and a compare (`NEXT`) at
+  2.22 s — the compare had been expired for over three seconds and no tick had
+  been taken (`TICKS` delta 0 across a three-second window); another freeze
+  read the same statics as **all zero**, the pre-`init` state, beside a PC in
+  the park loop — the reading that says `since_boot_nanos` was answering from
+  the `FREQ == 0` fallback, i.e. a clock pinned at zero, in which no wait can
+  ever reach its deadline and no sleep can ever be served;
+* `info registers`, sampled twice three seconds apart: one freeze held the PC
+  byte-identical across the window (the guest executing nothing while QEMU's
+  own threads burned ~99 % of a host core); a later freeze caught the PC
+  **moving** between samples — `vfs::pipe::PipeEnd::Inode::poll_ready_client`
+  to `timer::since_boot_nanos` — a hot `poll_wait` park loop running against
+  the dead clock;
+* the PC in every capture lands inside or next to `since_boot_nanos` reached
+  from `sched::runtime::task::block_until_deadline` instantiated for
+  `syscall::linux::fs::file::poll_wait`'s wait condition — §10.7's own code.
+
+**A fix attempt was made and did not stop the freeze.** The reading "the last
+tick re-armed its compare into the past and the re-asserted line wedged
+delivery" produced the Linux-shaped change — `tick()` re-arms from the
+counter's current reading (`now + PERIOD`) when the served deadline had already
+passed, accepting the drift instead of a re-assert — built clean on both
+machines, and the sweep froze at the same `t-clone-exit` byte offset with it.
+Reverted. What survives is the measurement, not the fix.
+
+What the next session should do, in order. (1) **Re-arm the spin counter in
+`block_until_nanos`** (thresholds 1000…4 000 000, printing `cond`,
+`table_has_deliverable`, `now`, `deadline`) — it printed nothing across two
+whole freeze windows once, which is the strongest single constraint: the park
+loop is not the thing spinning, so the burn is elsewhere (a second task's loop,
+or QEMU itself). (2) **Decide whether the frozen guest is alive** with the
+gdbstub, not with paired `stop` samples: QMP's `gdbserver` command, then
+single-step — advancing PCs mean a live guest and a QEMU-side delivery
+problem; a blocked step means the vCPU thread itself is wedged. (3) **Capture
+the GIC state at the freeze** — whether the timer PPI is pending, in service,
+or lost — because "the compare expired and the line was never taken" is
+consistent with every reading so far, and the line's state decides between a
+kernel fix (an ack/EOI path) and a QEMU report. (4) Treat the harness's own
+**restart-on-silence** as part of the instrument: a silence detector that
+kills and relaunches the boot leaves a second machine whose early boot
+(pre-`timer::init`) reads as exactly the zero-statics state above, so sample
+the process tree (`/proc/<pid>/task/*/comm`) alongside every QMP read.
+
+Until this closes: the aarch64 arm has no gate figure, every aarch64 claim in
+a commit message says so, and the trap table's row is the short version.
