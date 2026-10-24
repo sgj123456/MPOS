@@ -292,6 +292,14 @@ found a card that was there": a bug, not a machine's absence. See §12.4a.
 
 ### 12.4a The last two reds closed: `/dev/dsp` and the DHCP answer — **DONE, gate green `pass=136 fail=0`**
 
+**Latest measured gate (2026-10-24, the two-clocks freeze fix §6.24):** x86_64
+`=== SUMMARY pass=205 fail=0 (218 built)`, `mpos-kunit 32 passed, 0 failed`,
+exit 33; aarch64 `=== SUMMARY pass=203 fail=0 (203 built)`, `mpos-kunit 32
+passed, 0 failed`, `=== END` on every lane — the first aarch64 figure since
+2026-10-21 (§6.23/§6.24 hold the window's story). Both arms now run the one
+unified sweep (`cargo xtask test`, both machines by default; §15's lane
+machinery on either).
+
 The pair `fail={t-dsp, t-dhcp}` was the gate's standing red baseline since it was first quoted.
 Neither red was a missing pin: each program *was* the pin, and each was pinning a real defect —
 one in the kernel, one in the test's own construction. `cargo xtask test` now reaches

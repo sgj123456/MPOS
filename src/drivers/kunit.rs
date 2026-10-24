@@ -231,7 +231,16 @@ fn what_a_read_costs_the_clock(_info: &BootInfo) -> Result<(), String> {
         // tick can be delivered inside a window shorter than a period, which reads
         // as a *negative* loss, and a claim that did not allow for it would fire on
         // a fast device instead of on a held machine.
-        if clock_sees_the_mask() && read.lost() + 1 < predicted {
+        // The `lost >= 0` half is the edge this case's own note above names: a
+        // tick can be pending when the window opens and delivered as it closes,
+        // which reads as a *negative* loss - one more tick than the wall time
+        // allowed - and a negative loss is the opposite of a machine that was
+        // not held. Measured firing once under a loaded host (6 sweep lanes
+        // beside the boot, 2026-10-24): the guard as first written allowed for
+        // the edge in its arithmetic and still fired on it, because `-1 + 1`
+        // is `0` and `0 < predicted` for any real mask. A negative loss never
+        // fires; a loss below the mask's own cost still does.
+        if clock_sees_the_mask() && read.lost() >= 0 && read.lost() + 1 < predicted {
             failures.push(format!(
                 "{name}: a {} ms device read ({} ms of it masked) lost {} of its {} ticks, \
                  where a mask that long costs {predicted} - the machine was not held",

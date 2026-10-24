@@ -210,14 +210,18 @@ pub(crate) fn resolve(next_hop: [u8; 4]) -> Result<[u8; 6], isize> {
     let request = request_frame(mac, ip, next_hop);
     for _ in 0..PROBE_TRIES {
         let _ = super::packet_transmit(&request);
-        let deadline = crate::hal::ticks().saturating_add(PROBE_WAIT_TICKS);
+        // The probe wait is a duration on the clock the park answers to, so
+        // the tick-denominated constant converts once, here - not through a
+        // second clock the expiry check could disagree with (§6.23).
+        let deadline = crate::hal::since_boot_nanos()
+            .saturating_add(PROBE_WAIT_TICKS * crate::hal::ns_per_tick());
         // The condition drives the stack so the reply reaches the seam and
         // `observe`; a learned mapping is checked outside the stack's lock.
         let learned = || {
             let _ = super::with_stack(|stack| stack.poll_once());
             lookup(next_hop).is_some()
         };
-        match crate::sched::block_until_deadline(learned, deadline) {
+        match crate::sched::block_until_nanos(learned, deadline) {
             crate::sched::WaitEnd::Condition => {
                 if let Some(mac) = lookup(next_hop) {
                     return Ok(mac);

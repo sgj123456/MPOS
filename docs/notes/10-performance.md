@@ -936,6 +936,19 @@ a `bat` over a minified stylesheet turned into a machine that looked dead.
 
 ### 10.7 Sub-Tick Sleeps — **LANDED on the first machine** (the second's clock is the named gap)
 
+**CLOSED, and the landing's own debt named and paid (2026-10-24, §6.24).** The
+"second's clock is the named gap" line above outlived its truth by one day: the
+second machine's clock was never the problem - the *second clock* was. The
+deadline conversion this landing added at the park's boundary left a dozen
+callers naming deadlines against the tick **counter**, and a park that answers
+one clock a deadline named on the other is a self-sustaining spin that freezes
+the tick counter itself (the aarch64 sweep freeze; mechanism, closure and the
+both-machines gate figures in §6.24). The rule the landing's shape implied and
+the tree now enforces: a wait is named on the clock its park answers -
+`since_boot_nanos` - and converts at construction. Every sub-tick figure in
+this section's tables survives the fix unchanged (the x86_64 numbers are the
+same park, one door narrower).
+
 **The wake latency was filed here and did not belong here; it is fixed.** Two
 measurements said a *woken* task - not sleeping on a deadline, but parked in
 `block_until` and made runnable by an event - did not resume for what looked

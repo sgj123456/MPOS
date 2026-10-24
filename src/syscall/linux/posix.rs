@@ -16,7 +16,7 @@
 //! state, and nothing here needs to build a signal frame or switch a
 //! stack. `pause` and `rt_sigsuspend` are the exception that proves the
 //! rule - they are a wait, and they spell it through
-//! `block_until_deadline`, the same three-way wait every other blocking
+//! `block_until_nanos`, the same three-way wait every other blocking
 //! call uses.
 
 use alloc::vec;
@@ -1574,7 +1574,7 @@ pub fn handle_rt_sigqueueinfo(args: [usize; ARG_COUNT], from_user: bool) -> isiz
 /// `rt_sigsuspend(mask, sigsetsize)` — swap the signal mask and wait for
 /// a signal the new mask lets through.
 ///
-/// The wait is `block_until_deadline`'s: a signal that would run a
+/// The wait is `block_until_nanos`'s: a signal that would run a
 /// handler ends it as `Interrupted`, without consuming the signal, so
 /// the gate delivers the handler on the way out of this very call —
 /// which is the man page's contract, that the handler runs *before* the
@@ -1596,7 +1596,7 @@ pub fn handle_rt_sigsuspend(args: [usize; ARG_COUNT], from_user: bool) -> isize 
     let old = crate::sched::current_blocked();
     crate::sched::set_current_blocked(wanted & !reserved);
 
-    let answer = crate::sched::block_until_deadline(|| false, u64::MAX);
+    let answer = crate::sched::block_until_nanos(|| false, u64::MAX);
     crate::sched::set_current_blocked(old);
     match answer {
         WaitEnd::Interrupted => err::EINTR,
@@ -1605,13 +1605,13 @@ pub fn handle_rt_sigsuspend(args: [usize; ARG_COUNT], from_user: bool) -> isize 
 }
 
 /// `pause()` — wait for a signal that would run a handler. The only way
-/// out is one: `block_until_deadline`'s condition never holds and its
+/// out is one: `block_until_nanos`'s condition never holds and its
 /// clock never runs out, so the `Interrupted` the waiter ends on is the
 /// signal's own arrival, and the EINTR the call answers with is the one
 /// the man page says a caught signal turns into.
 pub fn handle_pause() -> isize {
     loop {
-        match crate::sched::block_until_deadline(|| false, u64::MAX) {
+        match crate::sched::block_until_nanos(|| false, u64::MAX) {
             WaitEnd::Interrupted => return err::EINTR,
             _ => continue,
         }

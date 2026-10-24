@@ -2548,23 +2548,20 @@ pub enum WaitEnd {
     Interrupted,
 }
 
-/// Block until `cond` is true, `deadline_ticks` passes, or a signal arrives.
+/// Block until `cond` is true, the `deadline` passes, or a signal arrives.
 ///
-/// The deadline is named in **ticks** because that is what every caller computes,
-/// a timeout being ticks on this machine's clock, and it is converted to the
-/// scheduler's nanosecond deadline here so a caller cannot forget which unit its
-/// own arithmetic is in. `u64::MAX` stays "no clock at all" through the
-/// saturating multiply.
-pub fn block_until_deadline(cond: impl Fn() -> bool, deadline_ticks: u64) -> WaitEnd {
-    block_until_nanos(cond, deadline_ticks.saturating_mul(hal::ns_per_tick()))
-}
-
-/// [`block_until_deadline`] with the deadline the scheduler actually keeps:
-/// nanoseconds since boot.
+/// The deadline is **nanoseconds since boot** — the clock `clock_gettime`
+/// answers and the only one a wait can share with its own expiry check. There
+/// used to be a tick-denominated spelling of this door whose input was
+/// multiplied into nanoseconds on the way in, and that multiply is the bug this
+/// shape exists to keep out: the tick *counter* and the nanosecond clock are two
+/// clocks that any masked window longer than the wait can put a tick apart, and
+/// a park that answers "deadline" against one while the caller checks expiry
+/// against the other spins forever with interrupts masked — which is exactly
+/// the aarch64 sweep freeze, measured 2026-10-24 (`docs/notes/` §6.23). One
+/// door, one unit, and a caller cannot mix them.
 ///
-/// This is the door `nanosleep(2)` uses. Its caller names an interval in
-/// nanoseconds and expects the wait to end at that instant, not at the clock tick
-/// above it, so there is no tick to name on the way in (`docs/notes/` §10.7).
+/// `u64::MAX` stays "no clock at all" through every conversion.
 pub fn block_until_nanos(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
     loop {
         if let Some(sig) = take_fatal_signal() {
@@ -2597,18 +2594,18 @@ pub fn block_until_nanos(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
     }
 }
 
-/// [`block_until_deadline`] with no clock: the wait a syscall can be ended by
+/// [`block_until_nanos`] with no clock: the wait a syscall can be ended by
 /// a signal, which is Linux's `ERESTARTSYS` shape.
 ///
 /// The named spelling exists because that is what a syscall means by "block
 /// until this is ready": the condition, or a catchable signal - and never a
-/// clock. Writing it as `block_until_deadline(cond, u64::MAX)` at every one of
+/// clock. Writing it as `block_until_nanos(cond, u64::MAX)` at every one of
 /// those call sites says the same thing in more words and hides which waits
 /// are interruptible from the reader looking for them. The signal is *not*
 /// consumed here: the syscall gate delivers it on the way out, which is the
 /// only place a handler's frame can be built.
 pub fn block_until_interruptible(cond: impl Fn() -> bool) -> WaitEnd {
-    block_until_deadline(cond, u64::MAX)
+    block_until_nanos(cond, u64::MAX)
 }
 
 /// [`block_until_interruptible`] for a caller that has something to give back

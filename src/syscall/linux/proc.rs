@@ -101,8 +101,25 @@ fn build_frame(
     let Some(at) = at else {
         return false;
     };
+    // The frame sits just below the interrupted pointer, and the pages there
+    // are whatever the program's own deepest call ever touched. A signal
+    // arriving at the bottom of the touched region has nowhere to go unless
+    // the stack grows under it - which is what Linux's frame write relies on
+    // (`expand_stack` answering the `put_user`), and what the fault path here
+    // already does for the program's own pushes: the same resolver the EL0
+    // fault takes, anchored on the interrupted pointer, then the write again.
+    // A frame the stack cannot back (beyond the slack, past `RLIMIT_STACK`)
+    // still refuses, and the default action is what follows.
     if !crate::sched::write_user(at.sp, &bytes) {
-        return false;
+        let interrupted_sp = unsafe { crate::hal::user_context(regs_ptr, 0) }
+            .map(|ctx| ctx.sp())
+            .unwrap_or(0);
+        if interrupted_sp == 0
+            || !crate::sched::resolve_stack_growth(at.sp, interrupted_sp)
+            || !crate::sched::write_user(at.sp, &bytes)
+        {
+            return false;
+        }
     }
     // `regs` now describes the handler's first instruction, and `apply_frame` is
     // what puts it into the gate frame - the return address, the stack, and the
@@ -2777,8 +2794,8 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
         & !(crate::sched::signal::bit(crate::sched::signal::SIGKILL))
         & !(crate::sched::signal::bit(crate::sched::signal::SIGSTOP));
 
-    // The timeout is a `struct timespec`, read to a tick deadline. A zero
-    // deadline is "check once" - the sleeps below never run and `EAGAIN`
+    // The timeout is a `struct timespec`, read to a nanosecond deadline. A
+    // zero deadline is "check once" - the sleeps below never run and `EAGAIN`
     // comes back the first time round.
     let deadline = if timeout != 0 {
         if !buffer_ok(timeout, 16, true, from_user) {
@@ -2790,7 +2807,11 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
             return err::EINVAL;
         }
         let ms = sec.saturating_mul(1_000) + nsec / 1_000_000;
-        Some(crate::hal::ticks() + ms as u64 * crate::hal::TICK_HZ as u64 / 1_000)
+        // The timeout is a duration on the clock `clock_gettime` answers, so
+        // it is written against `since_boot_nanos` - not against the tick
+        // counter, whose lag behind that clock would otherwise be a second
+        // opinion the wait could disagree with itself over (§6.23).
+        Some(crate::hal::since_boot_nanos().saturating_add(ms as u64 * 1_000_000))
     } else {
         None
     };
@@ -2861,7 +2882,7 @@ pub(super) fn handle_rt_sigtimedwait(args: [usize; ARG_COUNT], from_user: bool) 
             crate::sched::exit(-(sig as isize));
         }
         if let Some(end) = deadline
-            && crate::hal::ticks() >= end
+            && crate::hal::since_boot_nanos() >= end
         {
             return err::EAGAIN;
         }
@@ -4295,14 +4316,18 @@ pub(super) fn handle_futex(args: [usize; ARG_COUNT]) -> isize {
     }
 }
 
-/// Turn a futex `struct timespec *` into a tick deadline for
-/// [`handle_futex`]. `relative` (FUTEX_WAIT's spelling) counts from now - on
-/// whichever clock the flags name, since a duration is a duration; only the
-/// bitset waits name a point on a clock, monotonic by default or the wall
-/// clock when `realtime` is set - the same wall clock
-/// `clock_gettime(CLOCK_REALTIME)` answers, so a caller comparing the two
-/// agrees with itself. A deadline already in the past comes back as `Some(0)`
-/// and the wait answers `ETIMEDOUT` without sleeping.
+/// Turn a futex `struct timespec *` into the nanosecond deadline
+/// [`handle_futex`]'s wait keeps. `relative` (FUTEX_WAIT's spelling) counts
+/// from now - on whichever clock the flags name, since a duration is a
+/// duration; only the bitset waits name a point on a clock, monotonic by
+/// default or the wall clock when `realtime` is set - the same clocks
+/// `clock_gettime` answers, because a caller computing
+/// `CLOCK_MONOTONIC + 5s` and handing it to `FUTEX_WAIT_BITSET` must agree
+/// with itself. The "now" is `since_boot_nanos`, the clock the wait below
+/// parks against: deriving it from the tick counter instead would be a second
+/// clock one masked window apart from the first, which is the freeze of
+/// 2026-10-24 (`docs/notes/` §6.23). A deadline already in the past comes
+/// back as `Some(0)` and the wait answers `ETIMEDOUT` without sleeping.
 fn futex_deadline(ts: usize, relative: bool, realtime: bool) -> Result<Option<u64>, isize> {
     if !buffer_ok(ts, 16, false, true) {
         return Err(err::EFAULT);
@@ -4316,27 +4341,24 @@ fn futex_deadline(ts: usize, relative: bool, realtime: bool) -> Result<Option<u6
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         return Err(err::EINVAL);
     }
-    let hz = crate::hal::TICK_HZ as u128;
-    let now_ticks = crate::hal::ticks() as u128;
-    let now_ns = now_ticks * 1_000_000_000 / hz;
+    let now_ns = crate::hal::since_boot_nanos() as u128;
     let target_ns = sec as u128 * 1_000_000_000 + nsec as u128;
-    let delta_ns = if relative {
-        target_ns as i128
+    let deadline = if relative {
+        now_ns.saturating_add(target_ns)
     } else if realtime {
-        // The wall clock is the boot epoch plus the tick counter, which is
-        // exactly what clock_gettime(CLOCK_REALTIME) reports.
-        let wall_ns = crate::hal::boot_epoch() as u128 * 1_000_000_000 + now_ns;
-        target_ns as i128 - wall_ns as i128
+        // The wall clock is the boot epoch plus the monotonic clock, which is
+        // exactly what clock_gettime(CLOCK_REALTIME) reports; the caller's
+        // wall-clock point comes back as the monotonic instant it names.
+        let epoch_ns = crate::hal::boot_epoch() as u128 * 1_000_000_000;
+        target_ns.saturating_sub(epoch_ns)
     } else {
-        // The monotonic clock *is* the tick counter.
-        target_ns as i128 - now_ns as i128
+        // The monotonic clock *is* `since_boot_nanos`.
+        target_ns
     };
-    if delta_ns <= 0 {
+    if deadline <= now_ns {
         return Ok(Some(0));
     }
-    Ok(Some(
-        now_ticks as u64 + (delta_ns as u128 * hz / 1_000_000_000) as u64 + 1,
-    ))
+    Ok(Some(deadline as u64))
 }
 
 // `sched_getaffinity` / `sched_setaffinity` / the robust-list and rseq

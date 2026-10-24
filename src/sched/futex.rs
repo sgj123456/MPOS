@@ -193,7 +193,7 @@ pub fn wait_bitset(address: usize, expected: u32, bitset: u32, deadline: Option<
     // the word - and musl's __wait retries an EINTR against the
     // handler-updated word, which then answers EAGAIN.
     let woken =
-        super::block_until_deadline(|| is_woken(address, current), deadline.unwrap_or(u64::MAX));
+        super::block_until_nanos(|| is_woken(address, current), deadline.unwrap_or(u64::MAX));
     unregister(address, current);
     match woken {
         super::WaitEnd::Condition => 0,

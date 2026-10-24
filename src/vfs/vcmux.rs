@@ -59,7 +59,7 @@
 //! A compositor that is killed, wedged or simply uninterested never answers
 //! `VT_RELDISP`, and a screen held by a promise nobody will collect is a machine
 //! you cannot read. So the mux parks with a deadline rather than forever
-//! ([`crate::vfs::vtmode::RELEASE_TIMEOUT_TICKS`]) - and the deadline is the
+//! ([`crate::term::vtmode::RELEASE_TIMEOUT_NS`]) - and the deadline is the
 //! backstop, not the answer: a second `^A` to the console already being asked
 //! forces the switch through on the spot, by hand, at any time.
 
@@ -202,10 +202,14 @@ pub fn master_vc() -> Option<u32> {
     }
 }
 
-/// The clock the negotiation measures in. `vtmode` deliberately takes a tick
-/// rather than owning one, so the caller is this file.
+/// The clock the negotiation measures in. `vtmode` deliberately takes its
+/// time from the caller rather than owning a clock, and the time it takes is
+/// the nanosecond clock - the one every wait here parks against. It was the
+/// tick counter until the two-clocks freeze of 2026-10-24, whose whole shape
+/// is a deadline named on one clock and a park that answers to another
+/// (`docs/notes/` §6.23).
 fn now() -> u64 {
-    crate::hal::ticks()
+    crate::hal::since_boot_nanos()
 }
 
 /// The handover table. `None` until [`init`] has run, which is before any
@@ -301,7 +305,7 @@ pub fn request_activate(to: u32, force: bool) -> bool {
 pub fn wait_active(want: u32) {
     let me = crate::sched::current();
     add_active_waiter(want, me);
-    crate::sched::block_until_deadline(|| active() == want, vt_deadline());
+    crate::sched::block_until_nanos(|| active() == want, vt_deadline());
     remove_active_waiter(me);
 }
 
@@ -521,7 +525,7 @@ fn expire_if_due() {
 }
 
 /// Wake the pump. A negotiation, a switch or a mode change has altered what it
-/// should be looking at, and `block_until_deadline` parks with no other reason
+/// should be looking at, and `block_until_nanos` parks with no other reason
 /// to wake: a condition that becomes true without a wake is a condition the mux
 /// will not read until something else happens.
 fn wake_task() {
@@ -660,7 +664,7 @@ fn mux_task() {
         }
         // Parked to the negotiation's deadline rather than forever: while a
         // session is being asked, this task is what makes the wait bounded.
-        crate::sched::block_until_deadline(
+        crate::sched::block_until_nanos(
             || {
                 active() != was_active
                     || crate::vfs::pty::lookup(was_active).is_some_and(|pty| pty.master_ready())

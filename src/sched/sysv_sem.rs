@@ -568,7 +568,7 @@ struct Waiter {
     sem: usize,
     kind: WaitKind,
     task: TaskId,
-    /// Set by a wake. The task polls this from inside `block_until_deadline`,
+    /// Set by a wake. The task polls this from inside `block_until_nanos`,
     /// so a waker never has to find it anywhere else.
     woken: bool,
 }
@@ -764,11 +764,10 @@ pub fn semop_attempt(
 /// Sleep until a wake marks this task, the deadline passes, or a signal arrives.
 ///
 /// `deadline` is **nanoseconds** since boot, the clock `semtimedop`'s relative
-/// timeout is added to - and the reason this is `block_until_nanos` and not
-/// `block_until_deadline`: the latter takes a *tick* count and multiplies it by
-/// the machine's tick, so a nanosecond value passed to it becomes a wait
-/// hundreds of times longer (the first draft did exactly that, and a 120 ms
-/// `semtimedop` hung the sweep instead of answering `EAGAIN`).
+/// timeout is added to and the only clock the park answers to. (A first draft
+/// once multiplied a nanosecond value through the machine's tick here, and a
+/// 120 ms `semtimedop` hung the sweep instead of answering `EAGAIN` - which is
+/// the same two-clocks mistake the 2026-10-24 freeze scaled up, §6.23.)
 ///
 /// The caller has already registered itself (inside the attempt that found the
 /// array blocked), so this only waits and then leaves the queue.

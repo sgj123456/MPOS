@@ -18,7 +18,7 @@
 //!
 //! Blocking follows the stack's one rule: no sleeping with the lock held. A
 //! blocking `recv` or `connect` is a loop of *lock, poll, try, unlock, park*,
-//! where the park is [`crate::sched::block_until_deadline`] over the socket's
+//! where the park is [`crate::sched::block_until_nanos`] over the socket's
 //! own readiness: the task registers with the stack (see
 //! [`park_until`]) and every stack poll wakes the registered list, so the
 //! wait ends the moment the condition changes. A pending signal ends it the
@@ -854,7 +854,7 @@ impl Inode for SocketInode {
 fn park_until(ready: impl Fn() -> bool) -> isize {
     let me = crate::sched::current();
     super::subscribe(me);
-    let end = crate::sched::block_until_deadline(ready, u64::MAX);
+    let end = crate::sched::block_until_nanos(ready, u64::MAX);
     super::unsubscribe(me);
     match end {
         crate::sched::WaitEnd::Interrupted => err::EINTR,
@@ -878,7 +878,7 @@ fn park_until(ready: impl Fn() -> bool) -> isize {
 fn park_until_deadline(ready: impl Fn() -> bool, deadline: u64) -> isize {
     let me = crate::sched::current();
     super::subscribe(me);
-    let end = crate::sched::block_until_deadline(ready, deadline);
+    let end = crate::sched::block_until_nanos(ready, deadline);
     super::unsubscribe(me);
     match end {
         crate::sched::WaitEnd::Interrupted => err::EINTR,
@@ -1665,8 +1665,11 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
     }
 
     // The handshake loop. A reset closes the socket (state back to Closed);
-    // thirty seconds of silence is what Linux answers ETIMEDOUT for.
-    let deadline = crate::hal::ticks() + 30 * crate::hal::TICK_HZ as u64;
+    // thirty seconds of silence is what Linux answers ETIMEDOUT for. The wait
+    // and its expiry check read one clock - `since_boot_nanos` - because the
+    // tick counter's lag behind it is how a wait once spun against its own
+    // deadline (§6.23).
+    let deadline = crate::hal::since_boot_nanos().saturating_add(30 * crate::hal::ns_per_tick());
     loop {
         let step = super::with(handle, |stack, entry| {
             stack.poll_once();
@@ -1731,7 +1734,7 @@ fn connect_tcp(handle: usize, endpoint: IpEndpoint, nonblock: bool) -> isize {
         };
         let me = crate::sched::current();
         super::subscribe(me);
-        let end = crate::sched::block_until_deadline(moved, deadline);
+        let end = crate::sched::block_until_nanos(moved, deadline);
         super::unsubscribe(me);
         match end {
             crate::sched::WaitEnd::Interrupted => return err::EINTR,
@@ -2418,7 +2421,7 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool)
     // both of `enqueue`'s questions. The deadline is taken once, before the
     // first attempt, so a wait that has to end ends on the whole call.
     let deadline =
-        crate::hal::ticks().saturating_add(DRAIN_WAIT_MS * crate::hal::TICK_HZ as u64 / 1000);
+        crate::hal::since_boot_nanos().saturating_add(DRAIN_WAIT_MS.saturating_mul(1_000_000));
     loop {
         let sent = super::with(handle, |stack, entry| {
             stack.poll_once();
@@ -2504,7 +2507,7 @@ fn udp_send(handle: usize, data: &[u8], dst: Option<IpEndpoint>, nonblock: bool)
                 // Park until the buffer has room for this datagram, a catchable
                 // signal ends the wait, or the egress proves it is not draining.
                 // A fatal signal ends the task inside the park, which is what
-                // `block_until_deadline` does with it.
+                // `block_until_nanos` does with it.
                 let e = park_until_deadline(|| udp_room_for(handle, data.len()), deadline);
                 if e != 0 {
                     return e;
@@ -4828,11 +4831,10 @@ pub(crate) fn handle_recvmmsg(args: [usize; 6], from_user: bool) -> isize {
         // the same fold `ppoll` makes. Both fields were validated above,
         // so both are non-negative and the u64 arithmetic below is the
         // whole story.
-        let hz = crate::hal::TICK_HZ as u64;
         let ms = (sec as u64)
             .saturating_mul(1_000)
             .saturating_add((nsec as u64).div_ceil(1_000_000));
-        Some(crate::hal::ticks().saturating_add(ms.saturating_mul(hz) / 1000))
+        Some(crate::hal::since_boot_nanos().saturating_add(ms.saturating_mul(1_000_000)))
     } else {
         None
     };
@@ -4905,7 +4907,7 @@ fn recv_one_bounded(
         }
         match deadline {
             None => break Err(err::EWOULDBLOCK),
-            Some(end) if crate::hal::ticks() >= end => break Err(err::EWOULDBLOCK),
+            Some(end) if crate::hal::since_boot_nanos() >= end => break Err(err::EWOULDBLOCK),
             _ => crate::sched::sleep_ticks(1),
         }
     };

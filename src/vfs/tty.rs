@@ -28,7 +28,7 @@
 //! [`LineDiscipline`] is the pure state machine and runs under `cargo test` on
 //! the host. [`Tty`] owns one under a mutex, echoes to the console as bytes are
 //! received, and turns `read` into a blocking, *interruptible* wait via
-//! [`crate::sched::block_until_deadline`] - Linux's answer to a signal that a
+//! [`crate::sched::block_until_nanos`] - Linux's answer to a signal that a
 //! process can catch is to end the read with `EINTR`, and the clock half of the
 //! same wait is what `VMIN`/`VTIME` mean.
 //!
@@ -220,10 +220,13 @@ pub enum ReadWait {
     /// Wait for input with no clock. Ends when a read decision becomes
     /// available, or a signal interrupts it.
     UntilInput,
-    /// Wait until this tick, which is the read's `VTIME` clock running out.
-    /// The caller compares it with its own clock and re-asks on every pass,
-    /// because an arriving byte moves it.
-    UntilTick(u64),
+    /// Wait until this nanosecond, which is the read's `VTIME` clock running
+    /// out. The caller compares it with the same clock it built the deadline
+    /// from - `since_boot_nanos`, not the tick counter - and re-asks on every
+    /// pass, because an arriving byte moves it. (The tick-counter spelling of
+    /// this variant is how a read once spun against its own deadline when the
+    /// two clocks drifted a masked window apart: §6.23.)
+    Until(u64),
     /// Take nothing and wait for nothing: `O_NONBLOCK` on a read whose answer
     /// would have been a wait. The one wait it does *not* replace is
     /// [`Self::Empty`], which never waited at all.
@@ -301,7 +304,7 @@ pub struct LineDiscipline {
     /// `VTIME` clock is started by a byte parks on this count changing, not only
     /// on a completed read: one partial byte does not satisfy `VMIN`, so the
     /// wake that re-anchors the inter-byte clock would otherwise be swallowed by
-    /// `block_until_deadline`'s condition loop and the read would sleep forever.
+    /// `block_until_nanos`'s condition loop and the read would sleep forever.
     /// See the read-path note in `NOTES.md` §12.4a.
     input_count: u64,
 }
@@ -1205,7 +1208,7 @@ impl LineDiscipline {
     /// | `5`/`0` | 2 bytes | those 2 bytes, for the same reason |
     /// | canonical | a partial line | `EAGAIN` |
     /// | canonical | a complete line | the line |
-    pub fn read_wait(&self, entry: u64, ticks_per_ds: u64, nonblocking: bool) -> ReadWait {
+    pub fn read_wait(&self, entry: u64, ns_per_ds: u64, nonblocking: bool) -> ReadWait {
         if self.has_ready() {
             return ReadWait::Ready;
         }
@@ -1226,12 +1229,12 @@ impl LineDiscipline {
         if vtime == 0 {
             return ReadWait::UntilInput;
         }
-        let span = (vtime as u64).saturating_mul(ticks_per_ds);
+        let span = (vtime as u64).saturating_mul(ns_per_ds);
         if vmin == 0 {
             // Bytes that land are taken as they arrive, so the clock is only
             // there to answer an empty queue - and it runs from the read's own
             // start, not from a byte that never came.
-            return ReadWait::UntilTick(entry.saturating_add(span));
+            return ReadWait::Until(entry.saturating_add(span));
         }
         // `VMIN > 0`: with nothing queued there is no clock to run - the read
         // waits for a first byte with unlimited patience - and once bytes are
@@ -1239,7 +1242,7 @@ impl LineDiscipline {
         if self.out.is_empty() {
             return ReadWait::UntilInput;
         }
-        ReadWait::UntilTick(self.last_byte.saturating_add(span))
+        ReadWait::Until(self.last_byte.saturating_add(span))
     }
 
     /// [`Self::read_wait`] for a descriptor that set `O_NONBLOCK`: the two
@@ -1274,9 +1277,10 @@ impl LineDiscipline {
         self.tio.lflag & ICANON == 0 && self.vtime() > 0
     }
 
-    /// Record the tick an input byte landed at, for [`read_wait`](Self::read_wait).
-    pub fn note_input_tick(&mut self, tick: u64) {
-        self.last_byte = tick;
+    /// Record the instant an input byte landed at, for
+    /// [`read_wait`](Self::read_wait).
+    pub fn note_input_at(&mut self, at_ns: u64) {
+        self.last_byte = at_ns;
         self.input_count = self.input_count.wrapping_add(1);
     }
 
@@ -1691,7 +1695,7 @@ impl Tty {
             // read decision still has to wake it. See
             // [`LineDiscipline::byte_restarts_clock`].
             #[cfg(target_os = "none")]
-            ld.note_input_tick(crate::hal::ticks());
+            ld.note_input_at(crate::hal::since_boot_nanos());
             let echo = ld.take_echo();
             // Echo is output like any other: the cursor moves for the characters
             // the console shows, so the model of the screen has to follow it. A
@@ -2229,9 +2233,9 @@ impl Tty {
         // The read's own start, which is the anchor for the `VMIN == 0` clock
         // and only for that one: with `VMIN > 0` the clock runs between bytes
         // and the discipline is where that stamp lives.
-        let entry = crate::hal::ticks();
-        // One decisecond, in ticks - the unit `VTIME` is written in.
-        let ticks_per_ds = crate::hal::TICK_HZ as u64 / 10;
+        let entry = crate::hal::since_boot_nanos();
+        // One decisecond, in nanoseconds - the unit `VTIME` is written in.
+        let ns_per_ds = 100_000_000;
         let nonblocking = self.is_nonblocking();
         loop {
             // Re-arm the waiter on every pass, not once. `receive_byte` wakes
@@ -2254,7 +2258,7 @@ impl Tty {
                 // changes this count, not only until a read completes. One
                 // partial byte does not satisfy `VMIN`, so the wake that
                 // re-anchors the inter-byte `VTIME` clock would otherwise be
-                // swallowed by `block_until_deadline`'s condition loop and the
+                // swallowed by `block_until_nanos`'s condition loop and the
                 // read would sleep past its own deadline. `None` keeps the
                 // completed-read wake for canonical and `VTIME == 0` reads. See
                 // `NOTES.md` §12.4a.
@@ -2263,7 +2267,7 @@ impl Tty {
                 } else {
                     None
                 };
-                (ld.read_wait(entry, ticks_per_ds, nonblocking), base)
+                (ld.read_wait(entry, ns_per_ds, nonblocking), base)
             });
             let deadline = match wait {
                 ReadWait::Empty => return Ok(0),
@@ -2280,8 +2284,8 @@ impl Tty {
                     continue;
                 }
                 ReadWait::UntilInput => u64::MAX,
-                ReadWait::UntilTick(due) => {
-                    if crate::hal::ticks() >= due {
+                ReadWait::Until(due) => {
+                    if crate::hal::since_boot_nanos() >= due {
                         // The clock ran out with a decision owed. Nothing here
                         // needs to know *which* clock case it is: an empty queue
                         // at this point can only be the `VMIN == 0` one, because
@@ -2294,11 +2298,11 @@ impl Tty {
                 }
             };
             let ended = match clock_base {
-                Some(base) => crate::sched::block_until_deadline(
+                Some(base) => crate::sched::block_until_nanos(
                     || self.has_ready() || self.input_moved(base),
                     deadline,
                 ),
-                None => crate::sched::block_until_deadline(|| self.has_ready(), deadline),
+                None => crate::sched::block_until_nanos(|| self.has_ready(), deadline),
             };
             match ended {
                 crate::sched::WaitEnd::Interrupted => return Err(VfsError::Interrupted),
@@ -2988,7 +2992,7 @@ mod tests {
     /// One decisecond - the unit `VTIME` is written in - in ticks, at the
     /// kernel's own 250 Hz. `read_wait` takes it as an argument rather than
     /// reading the clock, which is what lets this table run on the host.
-    const DS: u64 = 25;
+    const DS: u64 = 100_000_000;
 
     #[test]
     fn a_poll_answers_zero_bytes_without_waiting() {
@@ -3013,10 +3017,13 @@ mod tests {
         // Measured: 0 bytes after 102 ms at `VTIME=1`, and the 1 byte that
         // landed at 100 ms returned at 100 ms rather than at 300.
         let mut ld = raw(0, 1);
-        assert_eq!(ld.read_wait(1_000, DS, false), ReadWait::UntilTick(1_025));
+        assert_eq!(
+            ld.read_wait(1_000_000_000, DS, false),
+            ReadWait::Until(1_000_000_000 + DS)
+        );
         ld.receive(b'\x1b');
         assert!(ld.has_ready(), "VMIN == 0 makes any byte a full answer");
-        assert_eq!(ld.read_wait(1_000, DS, false), ReadWait::Ready);
+        assert_eq!(ld.read_wait(1_000_000_000, DS, false), ReadWait::Ready);
     }
 
     #[test]
@@ -3033,14 +3040,14 @@ mod tests {
              not answer 0 here: that answer means end of input on this door"
         );
         ld.receive(b'1');
-        ld.note_input_tick(1_000);
+        ld.note_input_at(1_000_000_000);
         assert_eq!(
             ld.read_wait(0, DS, false),
-            ReadWait::UntilTick(1_125),
+            ReadWait::Until(1_000_000_000 + 5 * DS),
             "anchored on the byte, not on the read's entry"
         );
         ld.receive(b'2');
-        ld.note_input_tick(1_300);
+        ld.note_input_at(1_300_000_000);
         assert_eq!(
             ld.read_wait(0, DS, false),
             ReadWait::Ready,
@@ -3068,12 +3075,15 @@ mod tests {
         }
         assert_eq!(ld.read_wait(0, DS, false), ReadWait::UntilInput);
         let mut ld = raw(5, 5);
-        assert_eq!(ld.read_wait(400, DS, false), ReadWait::UntilInput);
+        assert_eq!(ld.read_wait(400_000_000, DS, false), ReadWait::UntilInput);
         for &b in b"12" {
             ld.receive(b);
         }
-        ld.note_input_tick(900);
-        assert_eq!(ld.read_wait(400, DS, false), ReadWait::UntilTick(1_025));
+        ld.note_input_at(900_000_000);
+        assert_eq!(
+            ld.read_wait(400_000_000, DS, false),
+            ReadWait::Until(900_000_000 + 5 * DS)
+        );
     }
 
     #[test]
@@ -3118,7 +3128,7 @@ mod tests {
 
         let mut below_min = raw(2, 5);
         below_min.receive(b'x');
-        below_min.note_input_tick(1_000);
+        below_min.note_input_at(1_000);
         assert_eq!(
             below_min.read_wait(0, DS, true),
             ReadWait::Ready,
@@ -3149,13 +3159,13 @@ mod tests {
         // The counterfactual, so this test cannot pass by the flag being
         // ignored: the same states without `O_NONBLOCK` decide to wait.
         assert_eq!(raw(1, 0).read_wait(0, DS, false), ReadWait::UntilInput);
-        assert_eq!(raw(0, 5).read_wait(0, DS, false), ReadWait::UntilTick(125));
+        assert_eq!(raw(0, 5).read_wait(0, DS, false), ReadWait::Until(5 * DS));
         let mut below_min = raw(2, 5);
         below_min.receive(b'x');
-        below_min.note_input_tick(1_000);
+        below_min.note_input_at(1_000_000_000);
         assert_eq!(
             below_min.read_wait(0, DS, false),
-            ReadWait::UntilTick(1_125),
+            ReadWait::Until(1_000_000_000 + 5 * DS),
             "the same byte under the same settings is waited for, one VTIME"
         );
     }

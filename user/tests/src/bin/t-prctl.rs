@@ -554,14 +554,25 @@ fn main() {
             use std::os::fd::AsRawFd;
             let word = core::ptr::addr_of_mut!(CHILD_TID);
             let at = head.as_raw_fd();
+            // `clone`'s raw argument list is one of the calls whose order is
+            // the machine's, not the ABI's: the kernel names the difference
+            // `CLONE_BACKWARDS`, and where x86_64 carries `child_tid` fourth,
+            // arm64 carries `tls` there and `child_tid` last. The word this
+            // claim reads back has to go in the slot this machine reads it
+            // from, or the child is born with `ctid == 0` and the read-back
+            // below is a claim about the argument order and nothing else.
+            #[cfg(target_arch = "aarch64")]
+            let (fourth, fifth) = (0usize, word as usize);
+            #[cfg(not(target_arch = "aarch64"))]
+            let (fourth, fifth) = (word as usize, 0usize);
             let cloned = unsafe {
                 libc::syscall(
                     libc::SYS_clone,
                     (libc::CLONE_CHILD_CLEARTID | libc::SIGCHLD) as usize,
                     0usize,
                     0usize,
-                    word,
-                    0usize,
+                    fourth,
+                    fifth,
                 ) as i32
             };
             if cloned == 0 {

@@ -829,10 +829,13 @@ pub fn handle_ioctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
                 return err::ENOTTY;
             }
             let from = crate::drivers::video::render::landings();
-            // 10 ticks at this kernel's 250 Hz clock: 40 ms, a frame and a half
-            // at the nominal 60 Hz the connector's mode says.
-            let deadline = crate::hal::ticks() + 10;
-            crate::sched::block_until_deadline(
+            // 4 ms a tick at this kernel's 250 Hz clock, so ten of them are
+            // 40 ms - a frame and a half at the nominal 60 Hz the connector's
+            // mode says. The wait is named on the nanosecond clock, the one
+            // the park itself answers to (§6.23's two-clocks lesson).
+            let deadline =
+                crate::hal::since_boot_nanos().saturating_add(10 * crate::hal::ns_per_tick());
+            crate::sched::block_until_nanos(
                 || crate::drivers::video::render::landings() != from,
                 deadline,
             );

@@ -2756,7 +2756,7 @@ mod flock_off {
 /// `F_SETLKW` and `flock(2)` share. `block` false refuses a conflict with
 /// `EAGAIN`; `block` true parks until the range frees, the caller acquires it,
 /// or a signal interrupts with `EINTR` (`set_or_arm` takes the lock or registers
-/// a waiter atomically, and `block_until_deadline` re-checks the condition under
+/// a waiter atomically, and `block_until_nanos` re-checks the condition under
 /// the scheduler's own lock before parking, so a release is never missed). A
 /// `kind` of `None` is an unlock.
 ///
@@ -2792,7 +2792,7 @@ fn lock_take(
             locks::disarm(me);
             return 0;
         }
-        match crate::sched::block_until_deadline(
+        match crate::sched::block_until_nanos(
             || locks::is_free(dev, ino, owner, class, kind, lo, hi),
             u64::MAX,
         ) {
@@ -2989,7 +2989,7 @@ fn record_lock(_fd: i32, _cmd: usize, _arg: usize) -> isize {
 /// the call rustix makes and therefore the call every Rust program here makes.
 pub fn poll(args: [usize; ARG_COUNT]) -> isize {
     let timeout_ms = args[2] as i64;
-    let deadline = (timeout_ms >= 0).then(|| deadline_in_ticks(timeout_ms as u64));
+    let deadline = (timeout_ms >= 0).then(|| deadline_in_ns(timeout_ms as u64));
     poll_wait(args, deadline)
 }
 
@@ -3025,13 +3025,19 @@ fn ppoll_deadline(tsp: usize, from_user: bool) -> Result<Option<u64>, isize> {
     // out than the tick count can name saturates rather than wrapping into
     // the past - Linux clamps the same way.
     let ms = abi::ppoll_ms(sec, nsec)?;
-    Ok(Some(deadline_in_ticks(ms)))
+    Ok(Some(deadline_in_ns(ms)))
 }
 
-/// `ms` from now, in ticks.
-fn deadline_in_ticks(ms: u64) -> u64 {
-    let ticks = ms.saturating_mul(crate::hal::TICK_HZ as u64) / 1000;
-    crate::hal::ticks().saturating_add(ticks)
+/// `ms` from now, in nanoseconds of the clock the wait parks against.
+///
+/// A timeout is a duration, and this is the one conversion it takes: the
+/// deadline the caller named and the instant the park compares against have to
+/// be readings of *one* clock. Building them from the tick counter instead put
+/// every wait one masked window apart from its own expiry check, which is the
+/// self-locking spin the aarch64 sweep froze in (2026-10-24, `docs/notes/`
+/// §6.23).
+fn deadline_in_ns(ms: u64) -> u64 {
+    crate::hal::since_boot_nanos().saturating_add(ms.saturating_mul(1_000_000))
 }
 
 /// The wait [`poll`] and [`ppoll`] are both made of, with the timeout already
@@ -3087,7 +3093,7 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
         if count > 0 {
             break count as isize;
         }
-        let expired = deadline.is_some_and(|end| crate::hal::ticks() >= end);
+        let expired = deadline.is_some_and(|end| crate::hal::since_boot_nanos() >= end);
         if expired {
             break 0;
         }
@@ -3107,12 +3113,17 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
         // query below and ends the park the moment any watched descriptor
         // has something. The clock only bounds the wait for the nodes that
         // have no waker behind them - a netlink uevent socket, a signalfd,
-        // an eventfd - whose readiness nobody can announce, so one tick at
-        // a time is what keeps such a wait from sleeping forever
-        // (`nlplug-findfs` parks exactly that way, with no timeout). The
-        // condition is read-only: it reports, and the loop's own
-        // `check_ready` above fills the caller's `revents` once.
-        let next = crate::hal::ticks().saturating_add(1);
+        // an eventfd - whose readiness nobody can announce, so one tick's
+        // worth of nanoseconds at a time is what keeps such a wait from
+        // sleeping forever (`nlplug-findfs` parks exactly that way, with no
+        // timeout). The floor is named on the same clock the deadline is -
+        // `since_boot_nanos`, not the tick counter - because a floor one
+        // clock apart from the deadline it bounds is how this loop once spun
+        // forever with the clock interrupt pinned behind its own mask
+        // (`docs/notes/` §6.23). The condition is read-only: it reports, and
+        // the loop's own `check_ready` above fills the caller's `revents`
+        // once.
+        let next = crate::hal::since_boot_nanos().saturating_add(crate::hal::ns_per_tick());
         let floor = deadline.map_or(next, |end| end.min(next));
         let any_ready = || {
             (0..nfds).any(|index| {
@@ -3148,7 +3159,7 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
             })
         };
         if matches!(
-            crate::sched::block_until_deadline(any_ready, floor),
+            crate::sched::block_until_nanos(any_ready, floor),
             crate::sched::WaitEnd::Interrupted
         ) {
             break -1;
@@ -3379,8 +3390,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
             Ok(ms) => ms,
             Err(e) => return e,
         };
-        let ticks = ms * crate::hal::TICK_HZ as u64 / 1000;
-        Some(crate::hal::ticks() + ticks)
+        Some(deadline_in_ns(ms))
     };
 
     // Readiness as of the last check, kept beside the watches so the
@@ -3391,7 +3401,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         if count > 0 {
             break count;
         }
-        if deadline.is_some_and(|end| crate::hal::ticks() >= end) {
+        if deadline.is_some_and(|end| crate::hal::since_boot_nanos() >= end) {
             break 0;
         }
         // The same interruptible-wait rule as `poll`: a pending signal ends
@@ -3412,7 +3422,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         // readiness nobody can announce - netlink, signalfd, eventfd.
         // `watch_ready` only reads; the recorded readiness is refreshed from
         // it once the park ends, for the write-back below.
-        let next = crate::hal::ticks().saturating_add(1);
+        let next = crate::hal::since_boot_nanos().saturating_add(crate::hal::ns_per_tick());
         let floor = deadline.map_or(next, |end| end.min(next));
         let any_ready = || {
             watches
@@ -3420,7 +3430,7 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
                 .any(|watch| matches!(watch_ready(watch), (true, _) | (_, true)))
         };
         if let crate::sched::WaitEnd::Interrupted =
-            crate::sched::block_until_deadline(any_ready, floor)
+            crate::sched::block_until_nanos(any_ready, floor)
         {
             break -1;
         }
@@ -3472,11 +3482,11 @@ fn select_inner(args: [usize; ARG_COUNT], timespec: bool) -> isize {
         let remaining_ms = match deadline {
             None => 0,
             Some(end) => {
-                let now = crate::hal::ticks();
+                let now = crate::hal::since_boot_nanos();
                 if now >= end {
                     0
                 } else {
-                    (end - now) * 1000 / crate::hal::TICK_HZ as u64
+                    (end - now) / 1_000_000
                 }
             }
         };
@@ -5116,7 +5126,7 @@ pub fn handle_epoll_ctl(args: [usize; ARG_COUNT], from_user: bool) -> isize {
 /// The wait `epoll_wait`, `epoll_pwait` and `epoll_pwait2` are all made
 /// of: the interest list scanned, the ready entries written out in the
 /// packed twelve-byte record, and the three ways out - events, the clock,
-/// a signal - that `block_until_deadline` already spells. The table is
+/// a signal - that `block_until_nanos` already spells. The table is
 /// taken once, before the wait: the condition runs inside the scheduler's
 /// own borrow of it, where taking it again is not a thing.
 fn epoll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>, from_user: bool) -> isize {
@@ -5148,7 +5158,7 @@ fn epoll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>, from_user: bool) 
     let out_cell = core::cell::RefCell::new(alloc::vec::Vec::with_capacity(maxevents));
     let me = crate::sched::current();
     instance.subscribe_waits(me);
-    let answer = crate::sched::block_until_deadline(
+    let answer = crate::sched::block_until_nanos(
         || {
             let mut out = out_cell.borrow_mut();
             instance.collect(&fds, &mut out);
@@ -5179,7 +5189,7 @@ fn epoll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>, from_user: bool) 
 /// ends: -1 waits for ever, 0 answers what is ready right now.
 pub fn handle_epoll_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     let timeout = args[3] as i64;
-    let deadline = (timeout >= 0).then(|| deadline_in_ticks(timeout as u64));
+    let deadline = (timeout >= 0).then(|| deadline_in_ns(timeout as u64));
     epoll_wait(args, deadline, from_user)
 }
 
@@ -6587,7 +6597,7 @@ pub fn handle_syslog(args: [usize; ARG_COUNT], from_user: bool) -> isize {
             // the wait the man page spells EINTR. The cell is how a
             // condition hands a whole read back out of an `Fn`.
             let taken_cell = core::cell::RefCell::new(alloc::vec::Vec::new());
-            let answer = crate::sched::block_until_deadline(
+            let answer = crate::sched::block_until_nanos(
                 || {
                     *taken_cell.borrow_mut() = crate::console::dmesg_take(len as usize);
                     !taken_cell.borrow().is_empty()

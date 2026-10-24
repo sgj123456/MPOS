@@ -3288,3 +3288,96 @@ the process tree (`/proc/<pid>/task/*/comm`) alongside every QMP read.
 
 Until this closes: the aarch64 arm has no gate figure, every aarch64 claim in
 a commit message says so, and the trap table's row is the short version.
+
+### 6.24 The freeze's mechanism, named and closed (2026-10-24, same day) — CLOSED
+
+The trap table's row above is the short version; this is the mechanism, and it
+is not what the bisect's shape suggested. §10.7's wait-deadline landing did not
+break the aarch64 machine - it made a **second clock** load-bearing, and the
+second machine's sweep found the load.
+
+**The two clocks.** The scheduler's park answers one clock: `block_until_nanos`
+compares its deadline against `since_boot_nanos`, the free-running counter
+divided by `CNTFRQ_EL0`. The tick *counter* (`timer::TICKS`, one increment per
+delivered interrupt) is a different clock that falls behind that one by every
+masked window longer than a period - the interrupt is level-triggered, the line
+stays asserted, and no tick is *counted* while the CPU cannot take it; the
+counter catches up in a burst when the mask lifts. §10.7's landing converted
+every deadline at the park's boundary but left the *callers* naming deadlines
+against `hal::ticks()` - the tick counter - in a dozen places (`poll`/`select`
+floors and expiry checks, the futex and SysV timeouts, tty's `VTIME`, the VT
+release deadline). The two units multiplied into one door read like one thing.
+
+**The spin.** `t-busybox-farm` (or `t-clone-exit` - whichever lane hit it first)
+calls `poll`/`ppoll` on pipes whose writers have not written. The loop's expiry
+check compares `hal::ticks()` with a deadline built from `hal::ticks()`; the
+park below compares `since_boot_nanos()` with the *same number reinterpreted as
+nanoseconds*. The deadline was in the past for the nanosecond clock the moment
+the tick counter ticked past it (the units differ by `ns_per_tick()`, 4 000 000
+on this machine), so the park answered `Deadline` at once, the loop re-ran
+`check_ready`, found nothing, and parked again. Every pass runs with
+interrupts masked - the park is entered under the critical section and the
+`Deadline` exit never reaches `idle()`'s unmask - so the timer's PPI, asserted
+at the distributor the whole time (`GICD_ISPENDR0` bit 30 set, read through
+QMP at the freeze), is never delivered: the tick counter stops, the expiry
+check never fires, and the loop sustains itself forever. The PC samples that
+§6.23 read as "parked" were a loop turning at `since_boot_nanos`'s u128 divide
+- the one function every pass calls - and the "QEMU burning a core" was the
+TCG vCPU executing it. Nothing was wedged; the machine was *running* the
+wrong loop.
+
+**The fix is one rule: a wait is named on the clock its park answers.**
+`block_until_deadline` - the door whose input multiplied ticks into
+nanoseconds - is deleted; every caller names its deadline against
+`since_boot_nanos` directly, the tick-counter builders (`deadline_in_ticks`,
+`futex_deadline`'s now arithmetic, tty's `VTIME` span, the VT release timeout,
+the socket/ARP/vsock timeouts) convert once at construction, and the expiry
+checks read the same clock the park does. tty's `UntilTick` is `Until` in
+nanoseconds and `note_input_tick` is `note_input_at`; `vtmode`'s
+`RELEASE_TIMEOUT_TICKS` is `RELEASE_TIMEOUT_NS` and its table's `now` is the
+nanosecond clock. The x86_64 machine was one masked window away from the same
+spin the whole time - the freeze was the second machine's because its sweep
+runs the pipes-heavy programs first under TCG, not because the bug lived there.
+
+**Two fixtures the open gate then exposed** (both landed in the 2026-10-23
+batch whose aarch64 figure was never taken, §6.23's window):
+
+* `t-prctl`'s `PR_GET_TID_ADDRESS` child passed `child_tid` in the *x86_64*
+  slot of a raw `SYS_clone`. The argument order is the machine's
+  (`CLONE_BACKWARDS`), the kernel swaps on aarch64, and the child was born
+  with `ctid == 0` - the claim read the swap, not the kernel. The fixture now
+  names the slot per `target_arch`, beside the kernel's own note.
+* `t-sysv-msg`'s blocked-send child died of its own `SIGUSR1`: the handler
+  frame write lands just below the interrupted stack pointer, on a page the
+  process has never touched, and `write_user` refused it - where Linux's
+  frame write rides on `expand_stack`. The delivery path now takes the same
+  resolver the EL0 stack-growth fault takes (anchored on the interrupted
+  pointer, `RLIMIT_STACK`-bounded) and retries the write before falling to
+  the default action. A frame the stack cannot still back refuses honestly.
+
+**The gate, quoted from both arms' own summaries** (2026-10-24, the commit
+that carries this fix): x86_64 `=== SUMMARY pass=205 fail=0 (218 built)`,
+`mpos-kunit 32 passed, 0 failed`, exit 33; aarch64
+`=== SUMMARY pass=203 fail=0 (203 built)`, `mpos-kunit 32 passed, 0 failed`,
+`=== END` on every lane - the first aarch64 sweep figure since 2026-10-21, and
+the first one the second machine's arm produced without a summary-less
+silence. The whole aarch64 sweep now runs in 40 s of wall clock (six lanes,
+TCG) where the freeze window offered none at all; the fix also took the
+`block_until_deadline` unit multiply out of every wait, so nothing else pays
+it either.
+
+**One instrument casualty, recorded because it fired on the day the machine
+started being fast**: `drivers::kunit`'s `what_a_read_costs_the_clock` asserts
+a masked read *loses* the ticks its mask predicts, and its guard allowed for
+"a tick delivered inside the window" - a negative loss - in its arithmetic
+(`lost + 1 < predicted`) while still firing on the negative value, because
+`-1 + 1` is `0` and `0 < predicted` for any real mask. Measured firing once
+under a loaded host (six sweep lanes beside the boot); the guard now reads
+`lost >= 0 && lost + 1 < predicted` - the edge its own comment had named all
+along, which the arithmetic never implemented.
+
+**One harness lesson, the same day**: two `cargo xtask test` runs in one tree
+report nonsense (`AGENTS.md` §5's own row) - one run's output showed a
+summary-less verdict over a log file that had the summaries, because a second,
+stale sweep process was writing the same `build/test-serial.log` beside it.
+The row exists; this is what violating it looks like from the inside.

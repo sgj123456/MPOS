@@ -227,19 +227,22 @@ fn syncobj_handles(ptr: usize, count: usize) -> Result<Vec<u32>, isize> {
 }
 
 /// A DRM absolute `CLOCK_MONOTONIC` deadline in nanoseconds, as the tick
-/// deadline `block_until_deadline` keeps.
+/// deadline `block_until_nanos` keeps.
 ///
 /// Zero is "do not wait" and not "wait for one tick": the measured card answers
 /// `ETIME` at once when a `WAIT_FOR_SUBMIT` cannot be satisfied, so the deadline
-/// has to be *now* - which is what `block_until_deadline` reports on its first
+/// has to be *now* - which is what `block_until_nanos` reports on its first
 /// pass. A negative timeout is the header's "wait for ever".
 fn wait_deadline(nsec: i64) -> u64 {
     if nsec < 0 {
         return u64::MAX;
     }
-    let per_tick = 1_000_000_000u64 / crate::hal::TICK_HZ as u64;
-    let left = (nsec as u64).saturating_sub(crate::hal::since_boot_nanos());
-    crate::hal::ticks().saturating_add(left / per_tick.max(1))
+    // The uapi names an absolute point on the monotonic clock, which is
+    // `since_boot_nanos` itself - the deadline passes through unchanged, and
+    // the park that answers it reads the same clock. Rounding it onto the
+    // tick counter first put the two clocks one masked window apart, which
+    // is the shape that could spin a wait against its own deadline (§6.23).
+    nsec as u64
 }
 
 /// Park until `satisfied` holds, the deadline passes, or a signal arrives, and
@@ -271,7 +274,7 @@ fn syncobj_park(
     for obj in objs {
         obj.subscribe(me);
     }
-    let end = crate::sched::block_until_deadline(&satisfied, wait_deadline(nsec));
+    let end = crate::sched::block_until_nanos(&satisfied, wait_deadline(nsec));
     for obj in objs {
         obj.unsubscribe(me);
     }

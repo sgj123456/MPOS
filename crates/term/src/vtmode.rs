@@ -28,7 +28,7 @@
 //! * **The wait is bounded.** A session that is killed, or that simply never
 //!   installed the handler its `relsig` names, would otherwise strand every
 //!   later switch - including the operator's own. So a release carries a
-//!   deadline ([`RELEASE_TIMEOUT_TICKS`], resolved by the caller, which owns the
+//!   deadline ([`RELEASE_TIMEOUT_NS`], resolved by the caller, which owns the
 //!   clock), and the escape hatch is not the clock at all: a *second* `^A` to
 //!   the same console forces it through. Neither depends on the session
 //!   cooperating.
@@ -109,7 +109,12 @@ pub const MAX_SIGNAL: u8 = 31;
 ///
 /// Nothing here depends on the figure for reachability, and a shorter one would
 /// silently kill a compositor mid-page-flip on a machine that is merely slow.
-pub const RELEASE_TIMEOUT_TICKS: u64 = 60 * 250;
+/// The release wait: sixty seconds, in the nanoseconds of the clock the
+/// caller passes to [`Table::expired`]. It was once spelled in ticks against
+/// the tick counter; the unit moved with the 2026-10-24 two-clocks fix
+/// (`docs/notes/` §6.23), because a deadline a park can disagree with is
+/// worth less than none.
+pub const RELEASE_TIMEOUT_NS: u64 = 60_000_000_000;
 
 /// Whether a signal number is one a `vt_mode` may name. Zero is "no signal",
 /// which every field accepts.
@@ -567,7 +572,7 @@ impl Table {
         if self.promise(release.from, Signal::Release).is_none() {
             return Some(release.started);
         }
-        Some(release.started + RELEASE_TIMEOUT_TICKS)
+        Some(release.started + RELEASE_TIMEOUT_NS)
     }
 
     /// Whether the in-flight release has run out the time it was given at tick
@@ -955,9 +960,9 @@ mod tests {
         let mut t = Table::new(FOUR);
         t.set_mode(1, process(10, 12), KEEPER).unwrap();
         t.request_switch(2, 0, false).unwrap();
-        assert_eq!(t.deadline(), Some(RELEASE_TIMEOUT_TICKS));
-        assert_eq!(t.expired(RELEASE_TIMEOUT_TICKS - 1), None);
-        assert_eq!(t.expired(RELEASE_TIMEOUT_TICKS), Some(2));
+        assert_eq!(t.deadline(), Some(RELEASE_TIMEOUT_NS));
+        assert_eq!(t.expired(RELEASE_TIMEOUT_NS - 1), None);
+        assert_eq!(t.expired(RELEASE_TIMEOUT_NS), Some(2));
     }
 
     /// `VT_AUTO` is the mode nothing here disturbs: the default machine
