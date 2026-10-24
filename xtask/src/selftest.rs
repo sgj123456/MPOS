@@ -1842,6 +1842,13 @@ fn report_diskstat(log: &str, diskstat: &str) -> Result<()> {
     for (disk, calls, blocks) in sweep::bootdisk_readings(log) {
         println!("  {disk} (boot disk): bootcold={calls} of {blocks} blocks");
     }
+    // §10.5's last named figure, where the machine could be asked it: the raw
+    // pass over the disk that is neither the fixture's nor the root's — the
+    // first machine's boot medium, whose virtio-blk PCI transport is the one
+    // the two readers above never count.
+    for (disk, calls, blocks) in sweep::sparedisk_readings(log) {
+        println!("  {disk} (spare disk): sparecold={calls} of {blocks} blocks");
+    }
     Ok(())
 }
 

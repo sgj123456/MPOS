@@ -296,7 +296,7 @@ One-glance status of the whole roadmap.
 - [ ] [~] 10.2 context-switch/fork cost — lazy FPU, one TLB flush, smaller stacks; PCID recorded as a decision (§10.2)
 - [ ] [~] 10.3 syscall path — itimer flag landed; fault-driven user-buffer copy not (§10.3)
 - [x] 10.4 pipes + per-frame allocations — ring, handover and the seam frame pool all landed; the rate-pair measurement is recorded (§10.4)
-- [ ] [~] 10.5 ext4/virtio-blk read path — cache, wide transfer and the demand run landed and measured; interrupt-driven completions measured and re-scoped, multi-request pipelining dropped; the first machine's boot-disk figure still open (§10.5)
+- [ ] [~] 10.5 ext4/virtio-blk read path — cache, wide transfer and the demand run landed and measured; interrupt-driven completions measured and re-scoped, multi-request pipelining dropped; the PCI transport counted in its own sweep now (`t-diskbench`'s spare-disk pass, §10.5)
 - [x] 10.6 serial TX ring · [x] 10.7 sub-tick sleeps — a deadline is a nanosecond one
   now, and the first machine wakes a wait *between* two clock ticks from the LAPIC's
   one-shot: fifty 1 ms sleeps are 52-59 ms instead of 200 ms, a 25 ms sleep is 25.1 ms

@@ -3164,3 +3164,62 @@ never woke. That is where the next occurrence will point.
 
 **Gate**: x86_64 `pass=205 fail=0`, `mpos-kunit 32 passed, 0 failed`, and
 `t-ns-pid` alone is 45 claims with `last stage 6` in its log.
+
+### 6.23 The aarch64 sweep's own hang, measured (2026-10-24) — OPEN
+
+The first full aarch64 sweep this host has run since 2026-10-21 does not reach
+its end. Five runs — two on a working tree that touches no kernel source
+(§10.5's `t-diskbench` instrument), one on **`f908786` (HEAD) with the tree
+stashed** — all froze the same way, at one of two early programs: `t-clone-exit`
+(log frozen at its 30693rd byte, three runs) or `t-busybox-farm` (19840th, two
+runs). Each time the guest printed the program's `ok:` claims up to a point and
+then said nothing for ever — in `t-clone-exit` between *"a child was forked to
+die for the zombie claim"* and *"the dead child's record reads state Z"*, the
+section whose parent `fork`s a child, then polls
+`/proc/<pid>/stat`'s state field in a `nanosleep`(10 ms) loop until it reads
+`Z`. `=== PASS` never arrives; the runner answers *"the aarch64 sweep never
+printed a summary"*; the host's `qemu-system-aarch64` sits at ~99 % CPU while
+it happens. **The hang is not the working tree's**: the stashed-HEAD control
+froze at the same program, and the working tree's own x86_64 arm is green
+throughout.
+
+What the machine looked like while frozen, read through the run's own QMP
+socket (`human-monitor-command` `info registers`, the VM stopped): the single
+CPU at EL1 with interrupts enabled, its PC pinned at one instruction of
+`arch::aarch64::timer::since_boot_nanos` (the `mov` after the `CNTPCT_EL0`
+read) and its `X30` naming `sched::runtime::task::block_until_deadline` as
+instantiated for `syscall::linux::fs::file::poll_wait`'s wait condition — the
+`poll`/`ppoll` park. Eight samples spread over resumed execution all landed on
+the same instruction.
+
+Two instruments then said the loop is **not** turning. A spin counter in
+`block_until_nanos`'s loop (`spins += 1`, rate-limited `println` at 1000,
+2000, 4000, 10 000, 100 000, 4 000 000 iterations, printing `cond()`,
+`table_has_deliverable`, `now`, `deadline`) printed **nothing** across two full
+hang windows — so whatever the frozen PC means, the park loop is not cycling
+even a thousand times while the guest sits there, and the ~99 % host CPU is
+QEMU's own wedging (or a halted clock whose wake never comes), not guest
+instruction throughput at that loop. The reading to carry forward: the CPU
+state was captured parked-at/returning-to the poll wait's clock check, with
+the machine otherwise silent, and the guest-side loop quiet — which points
+*away* from a guest spin and toward a wake source that never fires (the tick)
+or a host-side stall, and is why the next session should read the clock, not
+the loop: is `CNTPCT_EL0` advancing while frozen, is the timer IRQ firing, is
+the scheduler's `now` moving — QMP `xp` on the kernel's tick counter and the
+sleep heap answers all three without a guest console.
+
+How to reproduce and what is standing: `cargo xtask test --arch aarch64`,
+reaches the freeze in 2–4 minutes of sweep (the boot itself is healthy —
+programs before the frozen one pass, `mpos-kunit` included). The instrumented
+diff that produced the "not turning" reading is one counter plus one
+rate-limited `println` at the top of `block_until_nanos`'s loop
+(`src/sched/runtime/task.rs`), reverted before this entry landed; re-apply it
+or go straight to QMP. The last full aarch64 sweep figure on record is
+2026-10-21's — the 2026-10-23 batch (the wait-deadline rework §10.7's commit,
+`PR_SET_PDEATHSIG`'s exit path, `PR_SET_CHILD_SUBREAPER`'s reparent walk, the
+IPC namespace) could not sweep on this host at all ("its sweep still cannot
+boot: `egl: no drm render node available`", its commits say) and booted again
+only today, so the regression window is **everything since 2026-10-21, plus
+the host environment itself, which also changed** (the render node came back).
+Until this closes, the aarch64 arm of the gate has no summary line to quote,
+and every aarch64 claim in a commit message has to say so plainly.

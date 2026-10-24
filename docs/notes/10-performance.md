@@ -892,6 +892,35 @@ caller's buffer — and those parts are preemptible, so a sibling task runs duri
 them. On a 32 MiB raw read that is 30–50 % of the window, the same order as the mask
 itself, and a window that has to beat its own confounds by a factor is not a pin.
 
+**The first machine's figure landed (2026-10-24): the PCI transport is counted in its own
+sweep now, over the disk it had there all along.** The named gap above closes not by
+changing what a sweep boots but by asking `t-diskbench` a fourth question: it looks for the
+registered disk that is neither its fixture's (`sda`) nor the root's, and makes one bounded
+raw pass over it — 64 MiB at 1 MiB `pread`s, capped so the pass stays bounded whatever the
+device's size. The machine whose root is the boot archive has exactly one such disk: the
+boot medium itself, the virtual-FAT ESP, which arrived over virtio-blk **PCI** and which
+this boot mounts nothing on and reads for nothing but its own probes. That is the
+transport the other two readers never reach — the ext4 runs are the AHCI driver's and
+`bootcold` is the second machine's MMIO — and a raw pass over it is pure transport, because
+no filesystem sits on it and no cache is in the way: the block node's sector window is a
+kernel `Vec` in the direct map, and every 1 MiB window is one `read_dma`. The measured
+figure, `cargo xtask test` on x86_64: `DISKSTAT vda sparecold=64 spareblocks=16384` — 64
+calls for 64 MiB, one call per window, reproduced exactly across runs, with the SATA disk's
+own figures unmoved beside it (`cold=1027 warm=0 smallcold=65`). The claims are the cold
+pass's shape (`0 < calls < blocks`, and `calls <= blocks/8`), so a PCI transport that fell
+back to the 2 KiB bounce — `device_reaches` answering false, or the walk broken — reads
+`sparecold` at four times the block count and fails both; the second machine, whose only
+virtio disk *is* its root, prints the skip line and claims nothing; and the figure rides
+out of the sweep beside the other two readers (`sparedisk_readings`, printed as `vda
+(spare disk): sparecold=64 of 16384 blocks`). What stays unmeasurable in a sweep is the
+*production* root's own figure — the installed ext4 image on `vda` under `cargo xtask run`
+is a different boot — but the transport's width is no longer a named gap: the
+counterfactual is the bounce, and the claims catch it.
+
+Gate: x86_64 `pass=205 fail=0`, `mpos-kunit 32 passed, 0 failed`, exit 0. The aarch64 arm
+builds and claims nothing: its sweep hangs mid-run on this host today (§6.23), on HEAD
+with this tree stashed as well.
+
 ### 10.6 Serial Output — **DONE**
 
 **Why it mattered**: UART transmit used to be polled with the console lock held;

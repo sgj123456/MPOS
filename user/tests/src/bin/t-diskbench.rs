@@ -47,10 +47,18 @@
 //!   fails them); where the root is the boot *archive* rather than a disk — the
 //!   first machine's test boot — there is no such pass, and the run says which
 //!   case it was instead of claiming nothing;
+//! * the **spare disk** is the fourth, and it closes §10.5's last named figure:
+//!   the machine whose root is the boot archive carries a second virtio disk —
+//!   the boot medium, virtio-blk over **PCI** — that this boot mounts nothing
+//!   on, so a raw sequential pass over it is the transport's width and nothing
+//!   else. The claims are the same run shape again; a machine whose every
+//!   counted disk is its fixture's or its root's has no spare and says so;
 //! * the numbers are printed as
 //!   `DISKSTAT <disk> cold=N warm=M smallcold=K` - and, on the machine whose
-//!   root is a disk, `DISKSTAT <disk> bootcold=N bootblocks=M` beside it - lines
-//!   the sweep harness greps out of the serial log and reports beside the verdict
+//!   root is a disk, `DISKSTAT <disk> bootcold=N bootblocks=M` beside it, and,
+//!   on the machine with a spare disk, `DISKSTAT <disk> sparecold=N
+//!   spareblocks=M` - lines the sweep harness greps out of the serial log and
+//!   reports beside the verdict
 //!   — the reader-side half of "a performance change ships with its numbers"
 //!   (rule 6), automated rather than trusted to whoever ran the gate. `warm` is
 //!   the fitting file's second pass, the one the cache policy is judged by.
@@ -109,6 +117,10 @@ const CACHED_BYTES: u64 = 4 * 1024 * 1024;
 /// One 4-KiB filesystem block — the unit the cache counts, and therefore the
 /// unit the cold-pass bound is stated in.
 const BLOCK: u64 = 4096;
+/// The spare disk's pass is bounded like every other pass here: a machine
+/// whose spare disk is bigger than this reads its first 64 MiB, and the claims
+/// are stated against the bytes that moved, not the device's capacity.
+const SPARE_PASS_CAP_BYTES: u64 = 64 * 1024 * 1024;
 /// `abi::DISKSTAT_OSRELEASE_MAGIC`, spelled here because a user program cannot
 /// name the kernel's crate. The pair (magic, payload grammar) is the protocol.
 const MAGIC: &str = "0x6d706f7300000001";
@@ -318,6 +330,98 @@ fn main() {
             "skip: this machine's root is its boot archive, not a disk - the boot-disk run claim \
              is the machine whose root is on one"
         ),
+    }
+
+    // ---- The spare disk: the transport the two questions above cannot reach ----
+    //
+    // §10.5's last named figure. The machine whose root is its boot archive
+    // carries a second virtio disk that this boot mounts nothing on and reads
+    // for nothing but its own boot probes — the boot medium, which arrived over
+    // virtio-blk **PCI**. The ext4 passes below are the AHCI driver's, the boot
+    // disk's pass is the second machine's MMIO transport, and the PCI
+    // transport's wide path had no counter in its own sweep at all — the one
+    // transport `cargo xtask run` drives that no gate run measured. A pass over
+    // that disk is pure transport, then: no filesystem sits on it, so no block
+    // cache is in the way and every window goes to the device in one call. The
+    // claims are the cold pass's shape; a machine whose every counted disk is
+    // either its fixture's or its root's (the second machine's only virtio disk
+    // *is* its root) says so rather than claiming nothing.
+    let spare = {
+        let rows = io_counters().unwrap_or_default();
+        rows.iter()
+            .map(|(name, _, _)| name.clone())
+            .find(|name| name.as_str() != "sda" && Some(name.as_str()) != boot.as_deref())
+    };
+    let spare_pass = match spare {
+        Some(name) => {
+            let fd = match rustix::fs::openat(
+                CWD,
+                &format!("/dev/{name}"),
+                OFlags::RDONLY,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    r.check(&format!("/dev/{name} opens ({e:?})"), false);
+                    r.finish();
+                }
+            };
+            let before = disk_reads(&io_counters().unwrap_or_default(), &name);
+            let mut buf = vec![0u8; 1024 * 1024];
+            let mut offset = 0u64;
+            let mut total = 0u64;
+            let mut ok = true;
+            loop {
+                if total >= SPARE_PASS_CAP_BYTES {
+                    break;
+                }
+                match rustix::io::pread(&fd, &mut buf, offset) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total += n as u64;
+                        offset += n as u64;
+                    }
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            let after = disk_reads(&io_counters().unwrap_or_default(), &name);
+            let calls = before.zip(after).map(|(b, a)| a.saturating_sub(b));
+            drop(fd);
+            Some((name, ok, total, calls))
+        }
+        None => {
+            println!(
+                "skip: every counted disk here is its fixture's or its root's - the spare-disk \
+                 pass is the machine whose boot medium neither mounts nor reads"
+            );
+            None
+        }
+    };
+    if let Some((name, ok, total, calls)) = spare_pass {
+        let blocks = total / BLOCK;
+        r.check(
+            &format!("the spare disk {name} answered its pass ({total} bytes)"),
+            ok && total > 0,
+        );
+        match calls {
+            Some(calls) => {
+                r.check(
+                    &format!("the {name} spare disk answered the pass in runs"),
+                    calls > 0 && calls < blocks,
+                );
+                r.check(
+                    &format!("and in runs of at least eight blocks each on {name}"),
+                    calls <= blocks / 8,
+                );
+                println!("DISKSTAT {name} sparecold={calls} spareblocks={blocks}");
+            }
+            None => println!(
+                "skip: the door named no counter for {name}, so the pass has no reading to claim"
+            ),
+        }
     }
 
     // A mount's own metadata reads move the counter, so measure after the tree

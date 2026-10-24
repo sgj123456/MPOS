@@ -436,6 +436,51 @@ pub fn bootdisk_readings(log: &str) -> Vec<(&str, u64, u64)> {
     out
 }
 
+/// The spare disk's half of the same instrument: `DISKSTAT <disk> sparecold=N
+/// spareblocks=M`, the raw pass `t-diskbench` makes over the registered disk
+/// that is neither the fixture's nor the root's.
+///
+/// A third reader rather than a wider one, for the reason the second was one:
+/// the keys mean a different thing about a different disk. `cold`/`warm` are
+/// the fixture *filesystem*'s passes, `bootcold`/`bootblocks` are the pass that
+/// copied the fixture *file* off the disk the root lives on, and
+/// `sparecold`/`spareblocks` are the pass over the disk that carries neither —
+/// the first machine's boot medium, whose virtio-blk **PCI** transport is the
+/// one the other two readers never count. The rules are the other ones': the
+/// last word for a disk wins, and a malformed line is dropped rather than
+/// ending the report.
+pub fn sparedisk_readings(log: &str) -> Vec<(&str, u64, u64)> {
+    let mut out: Vec<(&str, u64, u64)> = Vec::new();
+    for line in log.lines() {
+        let Some(rest) = line.trim_end().strip_prefix("DISKSTAT ") else {
+            continue;
+        };
+        let mut words = rest.split_whitespace();
+        let Some(disk) = words.next() else { continue };
+        let after_disk: Vec<&str> = words.collect();
+        let Some(calls) = after_disk
+            .iter()
+            .find_map(|w| w.strip_prefix("sparecold="))
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some(blocks) = after_disk
+            .iter()
+            .find_map(|w| w.strip_prefix("spareblocks="))
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if let Some(existing) = out.iter_mut().find(|(d, _, _)| *d == disk) {
+            *existing = (disk, calls, blocks);
+        } else {
+            out.push((disk, calls, blocks));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,6 +834,27 @@ DISKSTAT vda bootcold=1350 bootblocks=21504
         assert_eq!(bootdisk_readings(log), vec![("vda", 1350, 21504)]);
         assert!(bootdisk_readings("DISKSTAT sda cold=1 warm=0").is_empty());
         assert!(bootdisk_readings("no instrument here").is_empty());
+    }
+
+    /// The spare-disk reader: its own keys, and the same last-word-per-disk and
+    /// never-die-on-a-stray-byte rules. The three readers must not answer for
+    /// each other - each line names one disk and one question, and a reader
+    /// that accepted its neighbours' lines would report one disk's numbers as
+    /// another question's answer.
+    #[test]
+    fn the_spare_disk_reader_keeps_the_last_word_per_disk() {
+        let log = "\
+=== RUN t-diskbench
+DISKSTAT sda cold=16384 warm=0
+DISKSTAT vda sparecold=5 spareblocks=4864
+=== PASS t-diskbench
+DISKSTAT vda sparecold=6 spareblocks=4864
+=== SUMMARY pass=1 fail=0
+";
+        assert_eq!(sparedisk_readings(log), vec![("vda", 6, 4864)]);
+        assert!(sparedisk_readings("DISKSTAT vda bootcold=1 bootblocks=2").is_empty());
+        assert!(sparedisk_readings("DISKSTAT sda cold=1 warm=0").is_empty());
+        assert!(sparedisk_readings("no instrument here").is_empty());
     }
 
     /// §10.4's reader: the instrument's line parses out of a log that carries
