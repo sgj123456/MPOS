@@ -3118,9 +3118,12 @@ fn note_poll_spin(
     // ("always ready") is Linux's for a regular file, so which node fd 0 names
     // decides whether the caller's loop is its own bug or a node this tree is
     // serving as the wrong kind (`docs/notes/` §7 R.9).
+    // And *who* is spinning: the slot alone can be reused, and the reading that
+    // matters is which process polls a file on stdin (`docs/notes/` §7 R.9).
+    let exe = crate::sched::current_exe();
     crate::hal::kernel::print_line(format_args!(
-        "mpos: poll spin slot={} fd={fd} events={events:#x} kind={kind} ino={ino} size={size} fs={fs} read={read} write={write} hup={hup} err={err}",
-        me.0
+        "mpos: poll spin slot={} exe={} fd={fd} events={events:#x} kind={kind} ino={ino} size={size} fs={fs} read={read} write={write} hup={hup} err={err}",
+        me.0, exe
     ));
 }
 

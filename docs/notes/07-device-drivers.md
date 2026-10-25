@@ -4409,3 +4409,24 @@ The next measurement is one line in `execve`'s script path: the descriptor the
 script file was opened as, and whether it is closed (or CLOEXEC) before the
 interpreter is entered. A script executed by `openrc` must not leave its own file
 open on 0.
+
+**The spinner is named: `gendepends.sh`, with a service script on fd 0.** The spin
+line now carries the process too:
+
+    mpos: poll spin slot=7 exe=/usr/libexec/rc/sh/gendepends.sh fd=0 events=0x1
+          kind=0 ino=749 size=204 fs=0 read=true write=true hup=false err=false
+
+`gendepends.sh` is openrc's dependency-cache script, and the 204-byte file on its
+stdin is `/etc/init.d/crond` - which the script itself explains: its line 74 is
+
+    read one two three <"$RC_SERVICE"
+
+so the shell runs `read` with **a service script redirected onto fd 0**, and that
+descriptor is a regular file, which `poll` answers "always ready" to - Linux's own
+answer. The remaining question is therefore inside that call: which code polls fd 0
+here (a `read` implementation, a `poll` from the script, or a child), and why it
+re-polls instead of consuming to end-of-file. The kernel's half of the shape is
+Linux's; whatever comes next is on the userspace side of this descriptor, and the
+line to read it is the poll's caller, which the next instrument can name by
+printing the task's last syscall beside the spin (as the heartbeat already does for
+its table).
