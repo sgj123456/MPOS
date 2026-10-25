@@ -179,7 +179,10 @@ fn note_claim_wake(n: usize) {
 /// Count a fill claim taken / given back, for the heartbeat's lifecycle pair.
 fn note_fill_begin() {
     #[cfg(target_os = "none")]
-    crate::sched::note_fill_begin();
+    {
+        let me = claim_park::me();
+        crate::sched::note_fill_begin(me.0, crate::sched::last_syscall(me.0));
+    }
 }
 fn note_fill_end() {
     #[cfg(target_os = "none")]

@@ -2419,6 +2419,30 @@ pub fn current() -> TaskId {
 /// exit path's device teardown (the cursor hide, the buffer unrefs) posts its
 /// commands fire-and-forget for exactly this reason - the commands none of
 /// them read their results back.
+/// Whether `id` still names a live task: non-panicking, unlike [`is_exited`].
+pub fn task_alive(id: TaskId) -> bool {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(|task| task.as_ref())
+            .map(|task| !task.exited)
+            .unwrap_or(false)
+    })
+}
+
+/// [`is_exited`] that answers `false` for a slot with no task instead of
+/// panicking - the same safe shape as [`task_alive`], for the diagnostic that
+/// prints both.
+fn is_exited_safe(id: TaskId) -> bool {
+    with_table(|t| {
+        t.tasks
+            .get(id.0)
+            .and_then(|task| task.as_ref())
+            .map(|task| task.exited)
+            .unwrap_or(false)
+    })
+}
+
 pub fn is_exited(id: TaskId) -> bool {
     with_table(|t| t.task(id).exited)
 }
@@ -3376,7 +3400,15 @@ fn heartbeat() {
     let fill = fill_owner()
         .map(|slot| {
             let pid = super::pid::pid_number_of(TaskId(slot)).unwrap_or(0);
-            alloc::format!("slot {slot}/pid {pid}")
+            // The facts a reclaim decision rests on, printed beside the owner:
+            // the stalled boot's owner slot is absent from the table below while
+            // its claim is never freed, so liveness has to be *read*, not
+            // inferred (`docs/notes/` §7 R.9).
+            alloc::format!(
+                "slot {slot}/pid {pid} alive={} exited={}",
+                task_alive(TaskId(slot)),
+                is_exited_safe(TaskId(slot)),
+            )
         })
         .unwrap_or_else(|| "none".into());
     let run = run_owner()
