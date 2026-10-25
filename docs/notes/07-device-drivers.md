@@ -4216,3 +4216,26 @@ scratch never leaks at all in these readings. The next reading is the same pair
 sampled at the *moment* `begin - end` first becomes 1 (print one line when
 `note_fill_begin` makes the pair unequal, with the slot and syscall) - a single
 line that dates the leak instead of inferring it after the fact.
+
+**The leak is dated: taken in `exit_group`, and the flag is not the whole of it.**
+The lifecycle pair now records when, by whom and in which syscall the outstanding
+fill claim was taken. The stalled boot reads
+
+    mpos: ... fill=9145/9144(out=1 age=69989ms slot=6 syscall=231) run=0/0(out=0)
+
+`syscall 231` on x86_64 is **`exit_group`**, and the claim is 70 seconds old: a
+task that was exiting took the fill scratch in a filesystem read on its way out
+and never came back to `end_fill`. That is why the exit-path diagnostic found no
+*death* holding the claim (the task had already marked itself exiting) and why the
+holder-liveness reclaim did not move the boot: the flag is only half the claim.
+The other half is the **slot the claim marked `loading`**, and `begin_fill` picks
+a way with `victim`, which skips a loading slot - so with the leaked claim's slot
+still marked, `begin_fill` answers `None` and the reader parks on `WaitSet`
+(`set_in_flight`), which nothing will ever clear. That is the state the udev
+workers queue in.
+
+So the fix to make is a reclaim that takes **both halves**: the cache records the
+claim's slot (not just the owner), and a claim whose holder is gone clears its
+slot's `loading`, the flag, and the scratch before the next asker proceeds. The
+same for the run claim. Until then the boot stops after udev-trigger on the boots
+that hit this race.

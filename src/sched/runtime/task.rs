@@ -159,14 +159,29 @@ pub static FILL_ENDS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomic
 pub static RUN_BEGINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static RUN_ENDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Count a fill claim taken.
-pub fn note_fill_begin() {
+/// Count a fill claim taken, recording when, by whom and in which syscall: the
+/// heartbeat prints the outstanding claim's age, slot and syscall, so a leaked
+/// claim is dated and named instead of inferred afterwards
+/// (`docs/notes/` §7 R.9's intermittent leak).
+pub fn note_fill_begin(slot: usize, syscall: u32) {
     FILL_BEGINS.fetch_add(1, Ordering::Relaxed);
+    FILL_OUT_AT_NS.store(hal::since_boot_nanos(), Ordering::Relaxed);
+    FILL_OUT_SLOT.store(slot, Ordering::Relaxed);
+    FILL_OUT_SYSCALL.store(syscall, Ordering::Relaxed);
 }
+
+/// When the outstanding fill claim was taken, 0 for none.
+static FILL_OUT_AT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The slot that took the outstanding fill claim.
+static FILL_OUT_SLOT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+/// The syscall the outstanding fill claim was taken in.
+static FILL_OUT_SYSCALL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Count a fill claim given back.
 pub fn note_fill_end() {
     FILL_ENDS.fetch_add(1, Ordering::Relaxed);
+    FILL_OUT_AT_NS.store(0, Ordering::Relaxed);
 }
 
 /// Count a run claim taken.
@@ -3386,7 +3401,7 @@ fn heartbeat() {
         CLAIM_WOKEN.load(Ordering::Relaxed)
     ));
     crate::hal::kernel::print_line(format_args!(
-        "mpos:   wakes calls={} hits={} misses={} claim-hits={} claim-misses={} fill={}/{}(out={}) run={}/{}(out={})\n",
+        "mpos:   wakes calls={} hits={} misses={} claim-hits={} claim-misses={} fill={}/{}(out={} {}) run={}/{}(out={})\n",
         WAKE_CALLS.load(Ordering::Relaxed),
         WAKE_HITS.load(Ordering::Relaxed),
         WAKE_MISSES.load(Ordering::Relaxed),
@@ -3395,6 +3410,15 @@ fn heartbeat() {
         FILL_BEGINS.load(Ordering::Relaxed),
         FILL_ENDS.load(Ordering::Relaxed),
         FILL_BEGINS.load(Ordering::Relaxed) as i64 - FILL_ENDS.load(Ordering::Relaxed) as i64,
+        match FILL_OUT_AT_NS.load(Ordering::Relaxed) {
+            0 => alloc::format!("none"),
+            at => {
+                let age = hal::since_boot_nanos().saturating_sub(at) / 1_000_000;
+                let slot = FILL_OUT_SLOT.load(Ordering::Relaxed);
+                let nr = FILL_OUT_SYSCALL.load(Ordering::Relaxed);
+                alloc::format!("age={age}ms slot={slot} syscall={nr}")
+            }
+        },
         RUN_BEGINS.load(Ordering::Relaxed),
         RUN_ENDS.load(Ordering::Relaxed),
         RUN_BEGINS.load(Ordering::Relaxed) as i64 - RUN_ENDS.load(Ordering::Relaxed) as i64
