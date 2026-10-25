@@ -4313,3 +4313,16 @@ wait into a spin. The next reading is the poll's own: count, per task, how many
 `poll`s return `ready` with nothing to read, and print that with the slot table -
 one boot then says whether it is a zero-length read, a wrong readiness mask, or a
 descriptor whose `poll` implementation always claims readable.
+
+**Correction to the reading above: the poll is not necessarily returning
+immediately.** `parks=30856` over a stall of roughly a hundred seconds is one park
+every ~3 ms, which is the interval `poll_wait`'s own loop is built to have: it
+parks until `min(deadline, next tick)` so a wait whose watched descriptors have no
+waker still re-checks each tick. So the service script is in an ordinary poll
+loop, and what matters is **what it is waiting for and why that never happens** -
+not a spurious readiness. The candidates, in order: `start-stop-daemon`'s
+readiness wait (a pidfile or a pipe the daemon is expected to signal), a netlink
+uevent socket, or the trigger's own settle. The next instrument is therefore on
+the poll's *arguments*, not its count: one line per task the first time a poll
+parks on descriptors none of which is a known waker, naming the fd numbers and
+their kinds.
