@@ -2273,33 +2273,36 @@ pub(super) fn handle_clone3(args: [usize; ARG_COUNT], regs_ptr: *mut (), from_us
 /// `tkill`.
 ///
 /// Linux reads the id's *sign*: a positive value names one process, -1 names
-/// every process the caller may signal (which this kernel reads as the
-/// caller's own group), any other negative value names a group by number, and
-/// zero names the caller's group. A shell leans on the negative case to stop a
-/// job - and on the signal-0 case, which delivers nothing and only asks
-/// whether the target is there.
+/// every process the caller may signal, any other negative value names a
+/// group by number, and zero names the caller's group. A shell leans on the
+/// negative case to stop a job - and on the signal-0 case, which delivers
+/// nothing and only asks whether the target is there.
+///
+/// The -1 case is the one that is *not* a group (`kill_every_process` carries
+/// the measured set), and it is why the two negative shapes are answered by
+/// two different questions rather than one: a group is one authority, and the
+/// whole machine is a set of them.
 pub(super) fn handle_kill(args: [usize; ARG_COUNT]) -> isize {
     let (id, sig) = (args[0] as isize, args[1]);
     if sig > crate::sched::signal::MAX_SIGNAL as usize {
         return err::EINVAL;
     }
     match id {
+        // `kill(-1)`: every process the caller may signal, not a group. The
+        // two shapes are different questions - a group is one authority, the
+        // machine is a set of them - which is why this arm is first.
+        -1 => kill_every_process(sig),
         n if n < 0 => {
-            let pgid = if n == -1 {
-                crate::sched::current_pgid()
-            } else {
-                // A group number is a *pid* number in the caller's namespace -
-                // the number of the process that leads the group - so it is
-                // resolved there too and the group is the one that task leads.
-                let Some(leader) = pid_task(n.unsigned_abs() as isize) else {
-                    return err::ESRCH;
-                };
-                match crate::sched::pgid_of(leader) {
-                    Some(pgid) => pgid,
-                    None => return err::ESRCH,
-                }
+            // A group number is a *pid* number in the caller's namespace -
+            // the number of the process that leads the group - so it is
+            // resolved there too and the group is the one that task leads.
+            let Some(leader) = pid_task(n.unsigned_abs() as isize) else {
+                return err::ESRCH;
             };
-            kill_group(pgid, sig)
+            match crate::sched::pgid_of(leader) {
+                Some(pgid) => kill_group(pgid, sig),
+                None => err::ESRCH,
+            }
         }
         0 => kill_group(crate::sched::current_pgid(), sig),
         n => {
@@ -2319,6 +2322,27 @@ pub(super) fn handle_kill(args: [usize; ARG_COUNT]) -> isize {
                 err::ESRCH
             }
         }
+    }
+}
+
+/// `kill(-1)`'s branch: every process the caller may signal, rather than one
+/// group. `crate::sched::send_signal_every_process` owns the set and carries
+/// the measurement (`.workbuddy/probe_kill_neg1.c`, Linux 7.2.11), and the
+/// two answers this door adds are Linux's:
+///
+/// * `ESRCH` when there was no candidate at all - a lone caller reads it
+///   (measured), which is a set question and not an existence one;
+/// * 0 as soon as one process was a candidate, **even if** the signal it took
+///   was discarded by that process's own disposition or by the namespace-init
+///   rule, because `kill` reports delivery and not effect. A target outside
+///   the caller's authority is skipped inside the loop and never answers
+///   `EPERM`: Linux's `kill_something_info` counts it and carries on.
+fn kill_every_process(sig: usize) -> isize {
+    match crate::sched::send_signal_every_process(sig as u8) {
+        crate::sched::GroupSend::NoGroup => err::ESRCH,
+        // `Refused` cannot come out of this door: a member the caller may not
+        // signal is skipped rather than deciding the call.
+        crate::sched::GroupSend::Refused | crate::sched::GroupSend::Delivered => 0,
     }
 }
 

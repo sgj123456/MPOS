@@ -5759,3 +5759,71 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     failed`, exit 33; aarch64 `pass=207 fail=0` (207 built), `mpos-kunit 32
     passed, 0 failed`, reaching `=== END`; host unit suite 1120 tests / 0
     failed; `t-cgroupfs`'s 38 `ok:` lines byte-identical on both machines.
+
+## item 106 — `kill(-1)` is every process the caller may signal, and a group send is one copy per process
+
+    Two divergences in the same two doors, found by one measurement. `kill(-1)`
+    answered the **caller's own process group** - a different set entirely, so
+    a sibling that had made itself a group leader of its own was never reached,
+    and a lone caller was signalled by its own `kill(-1, …)` - and
+    `kill(-pgid)`/`kill(0)`/the tty's `Ctrl-C` delivered the signal to every
+    *thread* of a process, so a two-thread target ran its handler twice where
+    Linux runs it once.
+
+    Measured on a current host first (`.workbuddy/probe_kill_neg1.c`,
+    `.workbuddy/probe_kill_pgrp.c`, Linux 7.2.11), inside a fresh user+pid
+    namespace so that "every process" was a set small enough to watch: a lone
+    namespace init reads `ESRCH` from `kill(-1, 0)` and `kill(-1, SIGUSR1)`
+    alike and never runs its own handler; a sibling in its own process group
+    receives the signal and the caller's group does not; a process in a nested
+    pid namespace is not named at all; one signal per process, for `kill(-1)`
+    and `kill(-pgid)` alike; the answer is 0 as soon as one process was a
+    candidate and `ESRCH` with none, and a target outside the caller's
+    authority is counted and skipped rather than becoming `EPERM` for the
+    whole call.
+
+    **Owner**: `src/sched/runtime/child_signal.rs` (`send_signal_every_process`
+    - the set, with Linux's leader-per-thread-group walk and the namespace,
+    init and self filters - and `group_signal_targets`, the same one-task-per-
+    group walk behind `send_signal_group`, `send_signal_group_checked` and
+    `send_signal_group_info`), and `src/syscall/linux/proc.rs`
+    (`handle_kill`'s `-1` arm calls it directly instead of `kill_group`).
+
+    **Pin**: the new **`t-kill-all`**, **4 claims**, all four measured against a
+    real host first by running the program itself (`MPOS_ON_HOST=1`, `ok:` for
+    `ok:`). Every claim runs inside a fresh user+pid namespace, which is also
+    why the program is safe to host-run: an unguarded `kill(-1)` on a
+    development host signals every process of the runner's user. Its own
+    controls: a self-directed `SIGUSR1` must run the handler (so a later "nothing
+    arrived" is about the set), and the sibling must be nameable where the
+    caller stands before the set question is asked.
+
+    **Both counterfactuals were run, one door at a time.** Restoring the old
+    per-thread fan-out leaves `t-kill-all` the one red program, claim 3 alone
+    (`Some(42)`, `40 + 2`: the two-thread target's handler ran twice); restoring
+    the old `kill(-1)` kills the program instead ("User defined signal 1"),
+    because that group contains the test process outside the fresh namespace —
+    the old answer reached out of the namespace, not merely to the wrong members
+    of it. The one-copy claim had to be sharpened first: with its second thread
+    *parked*, a per-thread copy stays pending until the process leaves and the
+    count reads 1 with the bug present, so the pin's worker sleeps in 1 ms takes
+    and the count is read after a 200 ms grace.
+
+    **The pin found a second divergence while it was being written**, and this
+    item names it rather than hiding it: inside a pid namespace this kernel's
+    **`fork` answers the machine's task slot** and a **`wait` reports that
+    slot** (`wait_answer` falls back to the slot when the child's registration
+    is already gone at reap time), where Linux answers the caller's namespace's
+    number. Measured in the gate: a child whose own `getpid()` was 2 was
+    announced by the parent's `fork` as 9, and `waitpid(2)` answered 9 for it.
+    A parent *outside* the namespace cannot see the difference (slot and number
+    coincide), which is why no pin had caught it. `t-ns-pid`'s existing claims
+    are all of that outside shape, so they stay green; the fix is the next item,
+    and this pin works around it (the child announces its own number down a
+    pipe, and children are reaped by "any" rather than by a number) while
+    saying so in its own comments.
+
+    **Gate**: x86_64 `pass=209 fail=0` (209 built), aarch64 `pass=208 fail=0`
+    (208 built), `mpos-kunit 32 passed, 0 failed` on both; host unit suite 1120
+    tests / 0 failed; `t-kill-all`'s four `ok:` lines byte-identical on both
+    machines.

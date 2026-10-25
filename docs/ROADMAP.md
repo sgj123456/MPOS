@@ -24,7 +24,9 @@ One-glance status of the whole roadmap.
 **Core (Phases 1–3)**
 
 - [x] P1 Syscall completion — epoll · timerfd · 67/68 other calls (§1)
-- [ ] [~] P2 Signal delivery — frame · mask · siginfo · interruptible waits (§2)
+- [ ] [~] P2 Signal delivery — frame · mask · siginfo · interruptible waits (§2) — and
+  `kill(-1)` is every process the caller may signal rather than one group, while a
+  signal aimed at a group reaches one copy per process (§2.10, item 106)
 - [x] a signal is sent by someone who may send it — `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`  
   ask Linux's `kill_ok_by_cred` and `CAP_KILL` in the **target's** user namespace, and the record  
   door keeps the caller's `si_code`, `si_pid`, `si_uid` and `si_value` rather than overwriting  

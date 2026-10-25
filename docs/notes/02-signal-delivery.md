@@ -304,8 +304,8 @@ had neither half.
 **Measured whole on a current host first** (`.workbuddy/probe_killperm.c`,
 Linux 7.2.11, uid 1000): `kill(1, 0)` is `EPERM` (1), `kill(self, 0)` is 0,
 `kill(child, 0)` is 0, and `kill(-1, 0)` is 0 — the last one because it reaches
-at least one process the caller may signal, which is the group half of the same
-rule. The uid comparison is **not** against the target's effective id: Linux's
+at least one process the caller may signal, which is a *set* question rather
+than a group one (§2.10 carries that set and its own measurement). The uid comparison is **not** against the target's effective id: Linux's
 `kill_ok_by_cred` compares the sender's real/effective id against the target's
 **real or saved-set** id, which is why a setuid program's effective root id is
 not on the list.
@@ -370,9 +370,10 @@ passed, 0 failed`. Host unit suite 586, xtask 139.
 
 **Named**: `SIGCONT`'s session half (Linux additionally requires the sender and
 target to share a session for a `SIGCONT` that crosses a thread group; this
-kernel has process groups standing in for sessions), and `kill(-1)` remains the
-caller's own group rather than "every process the caller may signal" — the
-interpretation the door already carried, now filtered by the same rule.
+kernel has process groups standing in for sessions). `kill(-1)` used to be
+named here too — the caller's own group rather than "every process the caller
+may signal" — and it landed as §2.10 (2026-10-25), together with the one copy
+per process that a *group* send owes.
 
 **The door this item anticipated** — `pidfd_send_signal` — landed with the rest of
 the pidfd family as §6.8. It asks this same `may_signal`, and its group scope goes
@@ -513,3 +514,85 @@ of them green in the guest.
 
 **Gate**: x86_64 `pass=205 fail=0`, stage 1 `1100 tests, 0 failed`,
 `mpos-kunit 32 passed, 0 failed`, exit 0.
+
+### 2.10 `kill(-1)` is every process, and a group send is one copy per process (LANDED 2026-10-25)
+
+Two divergences lived in the same two doors, and one measurement found both.
+`kill(-1)` answered the **caller's own process group** — a different set
+entirely, so a sibling that had made itself a group leader of its own was never
+reached — and `kill(-pgid)`/`kill(0)`/the tty's `Ctrl-C` delivered the signal to
+every *thread* of a process, so a two-thread target ran its handler twice.
+
+**Measured on a current host before anything was changed**
+(`.workbuddy/probe_kill_neg1.c` and `.workbuddy/probe_kill_pgrp.c`, Linux
+7.2.11), inside a fresh user+pid namespace so that "every process" was a set
+small enough to watch — the probe stood as pid 1 of its own namespace and
+nothing outside it could be touched:
+
+* **a lone caller reads `ESRCH`** — `kill(-1, 0)` and `kill(-1, SIGUSR1)` alike
+  — and its own handler never runs: the caller's own thread group is not in the
+  set;
+* **a sibling in its own process group receives it**, and the caller's own
+  group does not: the set is every thread group, not one pgrp;
+* **a process in a nested pid namespace is not named** (it has no number where
+  the caller stands) and survives the call;
+* **one copy per process**: a two-thread target's handler runs **once**, for
+  `kill(-1)` and for `kill(-pgid)` alike — Linux's `group_send_sig_info` puts
+  one copy in the thread group's shared pending set;
+* the answer is `0` as soon as one process was a candidate, and `ESRCH` with no
+  candidate at all; a candidate the caller may not signal is counted and
+  skipped, never an `EPERM` for the whole call (Linux's `kill_something_info`
+  keeps `retval` for every answer except `EPERM`).
+
+**The landing.** `sched::send_signal_every_process` walks the thread groups,
+keeps the leaders whose number **in the caller's pid namespace** exists and is
+above 1, drops the caller's own group, and sends to the leader — or to a live
+worker when the leader has already exited under one (`docs/notes/` §15.86).
+`group_signal_targets` is the same "one task per thread group" walk for the
+group doors, so `send_signal_group` (the tty's `Ctrl-C`/`SIGWINCH`),
+`send_signal_group_checked` (`kill(-pgid)`) and `send_signal_group_info`
+(`pidfd_send_signal`'s process-group scope) all deliver once per process.
+`proc::handle_kill`'s `-1` arm calls it directly rather than through
+`kill_group`, because the two shapes are different questions: a group is one
+authority, the machine's process set is many.
+
+Kernel tasks are not in the set: they have no userland to run a handler and no
+`/proc` name, so only a count could tell them apart from user processes — the
+one thing Linux's loop over `for_each_process` would do differently. Named, not
+approximated: a `kill(-1)` whose only candidates are kernel threads is `ESRCH`
+here and `0` there.
+
+**Pin**: the new **`t-kill-all`**, 4 claims, all four measured against a real
+host first by running the program itself (`MPOS_ON_HOST=1`,
+`ok:` for `ok:`), and every claim runs inside a fresh user+pid namespace — which
+is also why the program is safe to host-run: an unguarded `kill(-1)` on a
+development host would signal every process of the runner's user.
+
+**Both counterfactuals were run, one door at a time**, and neither is a
+prediction:
+
+* **the old per-thread fan-out restored** (the two group doors iterating
+  `group_members` again), everything else this item's: `t-kill-all` is the one
+  red program, claim 3 alone — `Some(42)`, which is `40 + 2`: the two-thread
+  target ran its handler **twice**. The claim itself had to be sharpened to see
+  it: its first version let the second thread **park**, and a copy left pending
+  on a parked thread is never delivered before the process leaves, so the count
+  read 1 with the bug present. The pin's worker now sleeps in 1 ms takes and the
+  count is read after a 200 ms grace, which is what makes the claim fail without
+  the rule;
+* **the old `kill(-1)` restored** (read as the caller's group), everything else
+  this item's: the program does not reach a claim line at all — it is **killed
+  by `SIGUSR1`** ("User defined signal 1" on the wire), because that group
+  contains the test process *outside* the fresh namespace, which has no
+  handler. The old answer did not merely reach the wrong members of the
+  caller's namespace: it reached out of it.
+
+**Gate**: x86_64 `pass=209 fail=0`, aarch64 `pass=208 fail=0`, `mpos-kunit
+32 passed, 0 failed` on both, host unit suite 1120 tests / 0 failed;
+`t-kill-all`'s four `ok:` lines byte-identical on both machines.
+
+**Named**: `SIGCONT`'s session half (unchanged, §2.6), and the thread table
+being a copy rather than the shared `CLONE_SIGHAND` one — a group send now
+delivers once, but *which* thread runs the handler, and whether a handler
+installed by a worker is the one that runs, still follows the copy rather than
+Linux's shared table.

@@ -1361,11 +1361,54 @@ pub fn group_members(pgid: TaskId) -> alloc::vec::Vec<TaskId> {
     })
 }
 
+/// The **one task per thread group** a signal aimed at a process group is
+/// delivered to: the leader when it is alive, and otherwise a live worker.
+///
+/// A process group's members are threads, but a signal sent to the group is
+/// Linux's `group_send_sig_info`, which puts **one** copy in the thread
+/// group's shared pending set - so a two-thread process runs its handler
+/// once, not once per thread. Measured on a current host inside a fresh pid
+/// namespace before this walk was written (`.workbuddy/probe_kill_pgrp.c`,
+/// Linux 7.2.11): `kill(-pgrp, SIGUSR1)` at a two-thread process is exactly
+/// one handler run.
+///
+/// The leader is preferred because that is where a process's own record lives
+/// (`/proc/<pid>` names it); the fallback exists because a leader may already
+/// have exited under a live worker and the process is still there to signal
+/// (`docs/notes/` §15.86).
+fn group_signal_targets(pgid: TaskId) -> alloc::vec::Vec<TaskId> {
+    with_table(|t| {
+        let mut chosen: alloc::collections::BTreeMap<usize, TaskId> =
+            alloc::collections::BTreeMap::new();
+        for (slot, entry) in t.tasks.iter().enumerate() {
+            let Some(task) = entry.as_ref() else {
+                continue;
+            };
+            if task.pgid != pgid || task.exited {
+                continue;
+            }
+            let id = TaskId(slot);
+            // The leader replaces whichever worker was seen first; a worker
+            // never displaces a leader.
+            match chosen.get(&task.tgid.0) {
+                None => {
+                    chosen.insert(task.tgid.0, id);
+                }
+                Some(_) if task.tgid == id => {
+                    chosen.insert(task.tgid.0, id);
+                }
+                Some(_) => {}
+            }
+        }
+        chosen.into_values().collect()
+    })
+}
+
 /// Send `sig` to every member of a process group. Answers whether it reached
 /// anyone, which is what `kill` reports for a group.
 pub fn send_signal_group(pgid: TaskId, sig: u8) -> bool {
     let mut delivered = false;
-    for id in group_members(pgid) {
+    for id in group_signal_targets(pgid) {
         delivered |= send_signal(id, sig);
     }
     delivered
@@ -1429,7 +1472,7 @@ pub fn may_signal(target: TaskId) -> bool {
 /// answer therefore has to carry whether *anyone* was permitted, which is why
 /// it is not a `bool`.
 pub fn send_signal_group_checked(pgid: TaskId, sig: u8) -> GroupSend {
-    let members = group_members(pgid);
+    let members = group_signal_targets(pgid);
     if members.is_empty() {
         return GroupSend::NoGroup;
     }
@@ -1455,13 +1498,13 @@ pub fn send_signal_group_checked(pgid: TaskId, sig: u8) -> GroupSend {
 /// `pidfd_send_signal`'s `PIDFD_SIGNAL_PROCESS_GROUP` is the one door that sends
 /// a caller-authored record to a whole group, so the record must survive the
 /// fan-out unchanged - one delivery of the caller's `si_code`/`si_value` per
-/// member, not one record rewritten per member.
+/// **process**, not one record rewritten per member.
 pub fn send_signal_group_info(
     pgid: TaskId,
     sig: u8,
     info: crate::sched::signal::SigInfo,
 ) -> GroupSend {
-    let members = group_members(pgid);
+    let members = group_signal_targets(pgid);
     if members.is_empty() {
         return GroupSend::NoGroup;
     }
@@ -1477,6 +1520,92 @@ pub fn send_signal_group_info(
     } else {
         GroupSend::Refused
     }
+}
+
+/// `kill(-1, sig)`: every **process** the caller may signal, one signal per
+/// thread group, with the caller's own group and its namespace's init excepted.
+///
+/// Linux's `kill_something_info` loop, and every clause below was measured on
+/// a current host inside a fresh user+pid namespace before it was written
+/// (`.workbuddy/probe_kill_neg1.c`, Linux 7.2.11, the probe standing as pid 1
+/// of its own namespace so nothing outside it could be touched):
+///
+/// * the set is **not** a process group: a sibling that made itself a group
+///   leader of its own receives the signal (the old answer here was the
+///   caller's own group, which is a different set entirely);
+/// * a process is a candidate only where it has a number **in the caller's pid
+///   namespace** and that number is above 1 - so a process in a nested
+///   namespace is not named at all, and neither namespace's init is a target
+///   (measured: the fresh namespace's pid 1 with no children answers `ESRCH`
+///   even though it is inside its own namespace);
+/// * the caller's **own thread group** is not a target either (measured: the
+///   lone init's `kill(-1, SIGUSR1)` set no flag on itself);
+/// * every other thread group is one delivery, not one per thread (the
+///   two-thread shape `group_signal_targets` carries);
+/// * a target outside the caller's authority is **counted and skipped**, not
+///   an error: Linux never lets a member's `EPERM` decide the call, which
+///   answers 0 as soon as one process was a candidate;
+/// * with no candidate at all the answer is `ESRCH` (measured: `kill(-1, 0)`
+///   is `ESRCH` for a lone caller).
+///
+/// Kernel tasks are not candidates: they have no userland to run a handler
+/// and are not processes this ABI can name from `/proc` (Linux's loop over
+/// `for_each_process` does include them, and only their count could tell).
+pub fn send_signal_every_process(sig: u8) -> GroupSend {
+    let targets: alloc::vec::Vec<TaskId> = with_table(|t| {
+        let reader = t.task(t.current).pid_ns.clone();
+        let me = t.task(t.current).tgid;
+        let mut chosen: alloc::collections::BTreeMap<usize, TaskId> =
+            alloc::collections::BTreeMap::new();
+        for (slot, entry) in t.tasks.iter().enumerate() {
+            let Some(task) = entry.as_ref() else {
+                continue;
+            };
+            if !task.user || task.exited {
+                continue;
+            }
+            let id = TaskId(slot);
+            match chosen.get(&task.tgid.0) {
+                None => {
+                    chosen.insert(task.tgid.0, id);
+                }
+                Some(_) if task.tgid == id => {
+                    chosen.insert(task.tgid.0, id);
+                }
+                Some(_) => {}
+            }
+        }
+        chosen
+            .into_iter()
+            .filter_map(|(leader, target)| {
+                // The caller's own process is outside the set.
+                if TaskId(leader) == me {
+                    return None;
+                }
+                // A number where the caller stands, above the namespace's own
+                // init: `task_pid_vnr(p) > 1`.
+                match reader.number_of(leader) {
+                    Some(number) if number > 1 => Some(target),
+                    _ => None,
+                }
+            })
+            .collect()
+    });
+    if targets.is_empty() {
+        return GroupSend::NoGroup;
+    }
+    // The *last* non-`EPERM` answer is Linux's return: every ordinarily-sent
+    // signal leaves 0, and a target that raced its own exit leaves `ESRCH`.
+    let mut answer = GroupSend::Delivered;
+    for id in targets {
+        if !may_signal(id) {
+            continue;
+        }
+        if !send_signal(id, sig) {
+            answer = GroupSend::NoGroup;
+        }
+    }
+    answer
 }
 
 /// The live tasks of one thread group: the process that a pid names.
