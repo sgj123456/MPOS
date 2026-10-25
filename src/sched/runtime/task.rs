@@ -62,6 +62,29 @@ pub fn park_site(slot: usize) -> u8 {
         .unwrap_or(0)
 }
 
+/// The last syscall each task took, by number: what a spinning task's loop is
+/// calling. Written on the syscall entry path (one store), read by the
+/// heartbeat - the boot's stall is a *spin* before `exec` with no image to name
+/// it by (`docs/notes/` §7 R.9), and the number names the loop.
+pub static LAST_SYSCALL: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+
+/// Record `nr` as the running task's last syscall.
+pub fn note_syscall(nr: u32) {
+    with_table(|t| {
+        if let Some(slot) = LAST_SYSCALL.get(t.current.0) {
+            slot.store(nr, Ordering::Relaxed);
+        }
+    });
+}
+
+/// The bare number of `slot`'s last syscall, `0` for none yet.
+pub fn last_syscall(slot: usize) -> u32 {
+    LAST_SYSCALL
+        .get(slot)
+        .map(|slot| slot.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// Record that `t`'s running task is about to sleep at `site`.
 fn note_park(t: &Table, site: u8) {
     if let Some(slot) = PARK_SITE.get(t.current.0) {
@@ -87,7 +110,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{RefCell, UnsafeCell};
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use critical_section::Mutex;
 /// A process's user and group identity: the real, effective and saved id of
 /// each, which is the whole of what `setuid(2)`'s family manipulates, plus
@@ -3133,8 +3156,9 @@ fn heartbeat() {
         }
     });
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let nr = last_syscall(slot);
     crate::hal::kernel::print_line(format_args!(
-        "mpos: heartbeat age={age}ms last slot={slot} pid={pid} parked={park} ({}) comm={} exe={}\n",
+        "mpos: heartbeat age={age}ms last slot={slot} pid={pid} parked={park} ({}) syscall={nr} comm={} exe={}\n",
         PARK_SITES.get(park as usize).copied().unwrap_or("?"),
         core::str::from_utf8(&comm[..end]).unwrap_or("?"),
         core::str::from_utf8(&tail).unwrap_or("?")

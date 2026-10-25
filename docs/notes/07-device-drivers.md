@@ -3794,3 +3794,23 @@ heartbeat say where: the last syscall the spinning task took (a per-task
 then to read that loop's code. The prime suspect stays §6.24's shape - a wait
 whose deadline is rebuilt in the past so every park returns at once - now
 suspected on the exec side of the seam rather than the claim side.
+
+**And the spinning task makes no syscalls.** The next line added the last-ran
+task's last syscall number (one store on the entry path). At the stall it reads
+`syscall=0` for both slots, over and over:
+
+    mpos: heartbeat age=0ms last slot=5 pid=5 parked=0 (0) syscall=0 comm= exe=
+
+No image, no name, no syscalls, and the scheduler keeps switching between them
+with interrupts on (the heartbeat comes from the tick). Two readings follow, and
+they are the ones to build the next step on: the two slots are **kernel-context
+work** - nothing user-side can run without an image, and nothing that spins in a
+syscall can report a syscall count of zero - while the boot's user processes must
+therefore be *parked* elsewhere. So the machine is not deadlocked; it is running
+kernel code in a loop, and the user tasks that should be driving udev are asleep.
+
+The next heartbeat should therefore print the **whole slot table** (id, pid, park
+site, syscall) rather than the last-ran line: one boot then shows both halves at
+once - which slots are parked where (`4`/`7`/`8`, the claim path) and which two
+kernel slots are looping - and the looping pair's identity is the remaining
+question.

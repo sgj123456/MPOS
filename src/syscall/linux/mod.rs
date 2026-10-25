@@ -203,6 +203,10 @@ pub unsafe fn dispatch(
             }
         }
     }
+    // One store on the entry path: the syscall's own number, so a task that
+    // spins before its image exists can be named by what it keeps calling
+    // (`docs/notes/` §7 R.9's heartbeat).
+    crate::sched::note_syscall(nr as u32);
     let ret = match nr {
         // --- file I/O: Linux argument shapes ---
         nr::READ => fs::handle_read(args, from_user),
