@@ -3746,3 +3746,30 @@ field 35 ) &` and then `exec /sbin/openrc sysinit`. At the moment udev has
 stalled, the serial log then carries the **stuck task's own park site** - the one
 number this whole instrument was built to produce, taken from the boot that
 actually fails.
+
+**The boot's stall is a livelock, not a park.** The idle-loop dump never printed
+(8 s of "nothing ran" never happened), so the next instrument was a heartbeat
+from the tick: every five seconds, one line saying how long ago the last task
+switch was and which slot made it. During the udev stall it reads:
+
+    * Starting udev ...
+    mpos: heartbeat age=1ms last slot=5 pid=5 parked=0 (0)
+    mpos: heartbeat age=0ms last slot=5 pid=5 parked=0 (0)
+    mpos: heartbeat age=2ms last slot=4 pid=4 parked=0 (0)
+    ...
+
+Two tasks - slots 4 and 5 - switch with an age of **0 to 3 ms**, both **not
+parked**. So nothing in the boot is asleep: the machine is running two tasks that
+make no progress, i.e. a spin or a two-task livelock, not the parked-transaction
+deadlock the concurrent-exec reproduction produces. That is the single most useful
+thing this session's instrument has said, and it re-explains the earlier
+readings: an idle-path dump could never fire, `strace -p` could never attach
+cleanly, and the process table looked empty because nothing was *waiting* - the
+udev service's two processes were busy.
+
+**Next**: name them and find the spin. The heartbeat knows the slot; the next
+line should carry the task's `comm` (the table holds it), and the spin itself is
+then in one of the two processes' user or kernel code - `openrc-run`'s shell and
+whatever it started. The candidate to read first is the one this session has
+already measured twice: a wait whose deadline re-arms in the past (the §6.24
+trap's shape), which spins a task at 100% instead of parking it.

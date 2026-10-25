@@ -1788,7 +1788,10 @@ impl Table {
         // only - every other route to that state lands here.
         while let Some(id) = self.sched.pick() {
             match self.tasks[id.0].as_ref() {
-                Some(task) if !task.exited => return Some(self.enter(id)),
+                Some(task) if !task.exited => {
+                    LAST_RAN_SLOT.store(id.0, core::sync::atomic::Ordering::Relaxed);
+                    return Some(self.enter(id));
+                }
                 _ => continue,
             }
         }
@@ -2830,6 +2833,7 @@ pub fn check_itimer() {
     if !STARTED.load(Ordering::Relaxed) {
         return;
     }
+    heartbeat();
     with_table(|t| t.check_itimers());
 }
 
@@ -3072,6 +3076,53 @@ pub(crate) fn with_table<R>(f: impl FnOnce(&mut Table) -> R) -> R {
     critical_section::with(|cs| unsafe { f(&mut *TABLE.borrow(cs).get()) })
 }
 
+/// When a task last ran and which one: the answer to "the machine is alive but
+/// nothing is progressing", readable from the wire.
+static LAST_PROGRESS_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LAST_RAN_SLOT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+static LAST_BEAT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// How often the wire gets a heartbeat, and how stale "progress" may get before
+/// the line says so.
+///
+/// The heartbeat exists because a hung boot cannot run `ps`: it says, every five
+/// seconds, how long ago the last task switch was and which slot made it. A
+/// large age is the stall itself; an age near zero while nothing visible
+/// happens names the task that is spinning (`docs/notes/` §7 R.9 - the udev
+/// stall's last reading had no idle gap at all, which is exactly the case a
+/// single "is anything parked" dump cannot distinguish from progress).
+const HEARTBEAT_NS: u64 = 5_000_000_000;
+
+/// One line every [`HEARTBEAT_NS`] from the tick, in interrupt context: the
+/// console's own write never parks, which is why this is safe from here where a
+/// dump built in the idle loop was not (it printed nothing at all - the
+/// reading is in the note).
+fn heartbeat() {
+    use core::sync::atomic::Ordering;
+    let now = hal::since_boot_nanos();
+    let last = LAST_BEAT_NS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < HEARTBEAT_NS {
+        return;
+    }
+    LAST_BEAT_NS.store(now, Ordering::Relaxed);
+    let progress = LAST_PROGRESS_NS.load(Ordering::Relaxed);
+    let age = now.saturating_sub(progress) / 1_000_000;
+    let slot = LAST_RAN_SLOT.load(Ordering::Relaxed);
+    if slot == usize::MAX {
+        crate::hal::kernel::print_line(format_args!(
+            "mpos: heartbeat age={age}ms no task has run yet\n"
+        ));
+        return;
+    }
+    let pid = super::pid::pid_number_of(TaskId(slot)).unwrap_or(0);
+    let park = park_site(slot);
+    crate::hal::kernel::print_line(format_args!(
+        "mpos: heartbeat age={age}ms last slot={slot} pid={pid} parked={park} ({})\n",
+        PARK_SITES.get(park as usize).copied().unwrap_or("?")
+    ));
+}
+
 /// The scheduler task's body. Every scheduling decision is made here, on a stack
 /// that belongs to no task and is therefore never freed underneath itself.
 pub(crate) fn scheduler_loop() {
@@ -3092,7 +3143,12 @@ pub(crate) fn scheduler_loop() {
         // waking needs the table this loop just let go of.
         drain_release();
 
-        if !switched {
+        if switched {
+            LAST_PROGRESS_NS.store(
+                hal::since_boot_nanos(),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        } else {
             // Nothing to run. Halt with interrupts on so the next tick wakes us,
             // and let it turn them back off before the table is touched again.
             wait_for_interrupt();
