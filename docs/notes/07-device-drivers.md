@@ -4289,3 +4289,27 @@ suite 637 / 0 failed. The first aarch64 arm lost lane 0 to the documented §13.3
 boot-EL0 observation (`EXCEPTION: synchronous`, `FAR_EL1` the page past
 `kernel_end`); the lane's QEMU was killed and the arm re-run alone, and the re-run
 - `pass=209 fail=0`, exit 0 - is the one quoted, as that trap prescribes.
+
+**The other race, named: the udev init script livelocks in `poll`.** The boot
+that stops at `Starting udev ...` with no claim outstanding has this table:
+
+    slot 1  pid 1  name=/sbin/init                     park 4  syscall 61 (wait4)
+    slot 6  pid 6  name=/sbin/openrc                   park 4  syscall 61 (wait4)
+    slot 7  pid 7  name=/etc/init.d/udev               park 2  syscall 7  (poll) parks=30856
+    slot 8  pid 8  name=/usr/libexec/rc/sh/openrc-run.sh park 4 syscall 61 (wait4)
+    slot 10 pid 10 name=/sbin/udevd                    park 2  syscall 281 (epoll)
+
+so the chain is `openrc` waiting for `openrc-run.sh`, which waits for the service's
+own shell `/etc/init.d/udev` - and **that shell is cycling through `poll` thirty
+thousand times**, not blocked in it. The daemon itself (`/sbin/udevd`, epoll) is
+already up, so this is not a start that failed; it is the service *script* looping
+in `poll`, and since `poll` is a nanosleep-shaped park (site 2) every iteration is
+a park, which is what the count measures.
+
+That is a different bug from everything in this section: not a lost wake, not a
+leaked claim, but a **`poll` that returns immediately instead of blocking** (or
+reports ready for a descriptor that has nothing to give), which turns a caller's
+wait into a spin. The next reading is the poll's own: count, per task, how many
+`poll`s return `ready` with nothing to read, and print that with the slot table -
+one boot then says whether it is a zero-length read, a wrong readiness mask, or a
+descriptor whose `poll` implementation always claims readable.
