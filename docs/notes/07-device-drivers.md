@@ -4455,3 +4455,26 @@ This is where the session's tools stop: the desktop boot reaches udev-trigger an
 then stalls in `gendepends.sh`, the user's original `Starting udev ...` stall is
 fixed, four wake-up/claim defects are fixed and gated, and the remaining one is a
 userspace loop whose shape is now printed on the wire.
+
+**The script has no poll of its own, so the loop is in the shell's `read`.** Read
+from the installed image, `gendepends.sh` contains exactly one wait-shaped line -
+line 74's `read one two three <"$RC_SERVICE"` - and no `select`, `poll`, `-t` or
+`wait`. So the `rt_sigprocmask` → `poll` loop on fd 0 is inside **busybox's `read`
+builtin** as it reads a *regular file*, which is not the shape a plain `read` of a
+file should have: a file read is a `read(2)` that returns the line or 0 at EOF.
+
+That moves the question to one measurable comparison: what a plain `read` of a
+regular file does on a real Linux here (a host probe), against what our kernel's
+`read` returns to that builtin - and the fastest way to see our side is to run
+`gendepends.sh` under `strace` in a booted guest, which this session has done
+before for other scripts. If the shell is polling, it is because our `read`
+answered something a file never answers (an `EAGAIN`, or a short read that looks
+like a wait), and that answer is the bug to fix.
+
+**Handoff.** The desktop image now boots past `Starting udev ...` and udev's
+trigger, and stalls in `gendepends.sh` reading service scripts under busybox
+`read`. The instruments to read it are in the tree (`/proc/<pid>/wchan`, the slot
+heartbeat with names and syscalls, the poll-spin line with the descriptor's
+identity and the syscall before the poll). The next step is the strace of that
+script in a booted guest, plus a host measurement of `read` on a regular file at
+EOF.
