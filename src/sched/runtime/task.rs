@@ -73,9 +73,25 @@ pub static LAST_SYSCALL: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; 
 pub fn note_syscall(nr: u32) {
     with_table(|t| {
         if let Some(slot) = LAST_SYSCALL.get(t.current.0) {
-            slot.store(nr, Ordering::Relaxed);
+            let previous = slot.swap(nr, Ordering::Relaxed);
+            if let Some(prev) = PREV_SYSCALL.get(t.current.0) {
+                prev.store(previous, Ordering::Relaxed);
+            }
         }
     });
+}
+
+/// The syscall a task took *before* its last one: the pair is what a spin report
+/// needs to say whether a re-poll follows a read, a close or nothing at all
+/// (`docs/notes/` §7 R.9).
+pub static PREV_SYSCALL: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+
+/// The bare number of `slot`'s second-to-last syscall.
+pub fn prev_syscall(slot: usize) -> u32 {
+    PREV_SYSCALL
+        .get(slot)
+        .map(|cell| cell.load(Ordering::Relaxed))
+        .unwrap_or(0)
 }
 
 /// The bare number of `slot`'s last syscall, `0` for none yet.

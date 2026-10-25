@@ -3121,8 +3121,9 @@ fn note_poll_spin(
     // And *who* is spinning: the slot alone can be reused, and the reading that
     // matters is which process polls a file on stdin (`docs/notes/` §7 R.9).
     let exe = crate::sched::current_exe();
+    let before = crate::sched::prev_syscall(me.0);
     crate::hal::kernel::print_line(format_args!(
-        "mpos: poll spin slot={} exe={} fd={fd} events={events:#x} kind={kind} ino={ino} size={size} fs={fs} read={read} write={write} hup={hup} err={err}",
+        "mpos: poll spin slot={} exe={} before={before} fd={fd} events={events:#x} kind={kind} ino={ino} size={size} fs={fs} read={read} write={write} hup={hup} err={err}",
         me.0, exe
     ));
 }

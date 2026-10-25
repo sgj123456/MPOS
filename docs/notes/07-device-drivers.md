@@ -4430,3 +4430,28 @@ Linux's; whatever comes next is on the userspace side of this descriptor, and th
 line to read it is the poll's caller, which the next instrument can name by
 printing the task's last syscall beside the spin (as the heartbeat already does for
 its table).
+
+**The last reading: `rt_sigprocmask` then `poll`, over and over.** The spin line
+carries the syscall before the poll now:
+
+    mpos: poll spin slot=7 exe=/usr/libexec/rc/sh/gendepends.sh before=14
+          fd=0 ... kind=0 ino=749 size=204 read=true write=true hup=false err=false
+
+`14` on x86_64 is **`rt_sigprocmask`**, so the loop is signal-mask → poll → signal-
+mask → poll, on a **regular file** on fd 0 (the service script `gendepends.sh`'s
+line 74 redirects onto stdin). The kernel's answers are Linux's: `poll` on a
+regular file is always ready, and a `poll` with a saved/restored mask is a `ppoll`
+shape.
+
+So the remaining question is the userspace one - which construct in that shell both
+blocks its signal mask and polls stdin - and it is answerable *outside* this kernel:
+`gendepends.sh` and the shell it runs can be read from the image, and busybox's
+`sh` builtins (`read`, `select`, `wait`) are the candidate callers. Nothing in the
+kernel's poll, file readiness or mask handling is implicated by these readings; the
+script is polling a file it will read to end-of-file, and the re-poll is the
+caller's.
+
+This is where the session's tools stop: the desktop boot reaches udev-trigger and
+then stalls in `gendepends.sh`, the user's original `Starting udev ...` stall is
+fixed, four wake-up/claim defects are fixed and gated, and the remaining one is a
+userspace loop whose shape is now printed on the wire.
