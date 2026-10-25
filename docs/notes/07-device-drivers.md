@@ -4021,3 +4021,10 @@ transfer* the fill is waiting for. The next suspect is therefore the block
 mailbox's completion path (the request-submit / used-ring / wake half), not the
 ext4 claim: a transfer that is never retired would park its reader for ever while
 everything else in the machine wakes normally, which is what the counters show.
+
+**Gate, this fix.** x86_64 `pass=210 fail=0` (210 built), aarch64 `pass=209
+fail=0` (209 built), `mpos-kunit 32 passed, 0 failed` on both; host unit suite
+green. The first aarch64 arm lost lane 2 to the documented §13.32 boot-EL0
+observation (`EXCEPTION: synchronous`, `FAR_EL1` the page past `kernel_end`), its
+QEMU was killed and the arm re-run alone - the second run is the one quoted, as
+that trap prescribes.
