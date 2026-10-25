@@ -133,7 +133,7 @@ the build list.
 | `CLONE_NEWNET` | interfaces, addresses, routes and the socket table: a socket bound in one namespace is not reachable from another | **build fourth** |
 | `CLONE_NEWUSER` | uid/gid mapping, and the capability set *within* the namespace | **built** (the maps, the translation, the "root inside" grant, and both doors that create one) - "Step 6"/"Step 6e, landed" below |
 | `CLONE_NEWIPC` | SysV IPC objects and POSIX message queues | **refused**: this kernel has neither, so it isolates nothing |
-| `CLONE_NEWCGROUP` | the cgroup tree a process sees | **refused**: there is no cgroup tree here to see |
+| `CLONE_NEWCGROUP` | the cgroup tree a process sees | **served** (2026-10-25, §6.25): the tree exists now — organizational, controller-less, measured on a current host before it was built (`src/vfs/cgroupfs.rs`'s header carries the probe) |
 | `CLONE_NEWTIME` | `CLOCK_MONOTONIC`/`BOOTTIME` offsets per namespace | **built** - "Step 5, landed" below |
 
 **UTS: the state is two strings, and the cost is that they have three doors.**
@@ -3381,3 +3381,67 @@ report nonsense (`AGENTS.md` §5's own row) - one run's output showed a
 summary-less verdict over a log file that had the summaries, because a second,
 stale sweep process was writing the same `build/test-serial.log` beside it.
 The row exists; this is what violating it looks like from the inside.
+
+### 6.25 The cgroup tree, and `CLONE_NEWCGROUP` — the ladder's last rung (LANDED 2026-10-25)
+
+The ladder §6.3 built rung by rung — UTS, MNT, PID, NET, TIME, USER, IPC — had one
+rung left, refused since the beginning with "there is no cgroup tree here to see".
+The tree is what landed first, and the namespace came with it in the same commit,
+because the namespace's whole state *is* a place in that tree.
+
+**Measured on a current host before anything was built** (`/sys/fs/cgroup`, Linux
+7.2.11, cgroup2 with `nsdelegate`, probed in a scratch group under the probe's own
+scope — `src/vfs/cgroupfs.rs`'s header carries the whole list): a controller-less
+group carries **nine files** (`cgroup.type` absent at the root), the read-only half
+is `0444` and the writable half `0644` with every directory `0755`, the empty
+controller files answer **zero bytes** (not a bare newline), `cgroup.type` answers
+`domain\n` (7 bytes), `cgroup.procs` moves a **process** by any of its threads'
+numbers while `cgroup.threads` moves one thread, a pid that names nothing is
+`ESRCH` and junk is `EINVAL`, `rmdir` of a group with a child is `ENOTEMPTY` and of
+a populated one `EBUSY` (measured by leaving the probe shell inside its own group),
+and an unknown controller is `ENOENT` — the same answer a controller-less kernel
+gives, because the controller does not exist.
+
+**The tree is organizational and nothing else** — no controllers, so
+`cgroup.controllers` is empty and `subtree_control` refuses every name. That is
+Linux's own answer for a kernel built without controllers, not a truncation of one
+built with them. `mount -t cgroup2` serves it; one hierarchy for the machine, a
+second mount binding the same tree. Membership is keyed by task slot **and
+generation** (`sched`'s pidfd generations), so a reused pid cannot inherit the dead
+task's group; a task is born where its parent is grouped (`copy_process`'s rule,
+wired into both child paths); the bounds are `max.depth`/`max.descendants` files
+carrying Linux's `max` default, enforced against ceilings of 8 and 256 because
+`mkdir` is a user-steered allocation path (§10's rule 4).
+
+**The namespace is the view, and the view is one path.** `unshare(CLONE_NEWCGROUP)`
+and `setns(fd, CLONE_NEWCGROUP)` set the task's view-root; `/proc/<pid>/cgroup` —
+now served on both the process and thread directories — renders the task's real
+group path *from that root* (`0::/` where it read `0::/grp`), `/proc/<pid>/ns/cgroup`
+gets its `cgroup:[<number>]` identity, and a `fork` inherits the view. The root is
+always the maker's **real** current group — measured on the host (`unshare -C`
+twice roots the second at the group the caller is in now, whatever the first rooted
+at), and it took one gate run to catch the first cut inheriting the *old view*
+instead: the second `unshare` was a no-op and every claim downstream failed. A
+`clone(CLONE_NEWCGROUP)` child is born view-rooted where its parent is grouped.
+
+**What the gate run also caught, all in the first pass**: every verdict pin that
+named CGROUP "the unserved kind" went red at once — `t-caps`, `t-clone`,
+`t-ns-mnt`, `t-ns-uts`, `t-ns-pid`, `t-ns-net`, `t-ns-setns` — which is the drift
+§6.3 has recorded once per rung, arriving all together for the last one. The
+"mixing with an unserved kind is refused whole" claims are extinct as a class: all
+eight kinds are served, so those pins became the birth claims (the word now
+*unshares* what it names) or moved to the names that never existed
+(`mnt_for_children`). And `t-cgroupfs`'s errno claims failed on the test's own
+shared-errno cell — a `remove_dir` probe comparing the *previous write's* errno —
+fixed by reading each errno at the call that made it.
+
+**The named divergence**: inside the namespace, the **mount** still shows the
+machine's whole hierarchy, where Linux re-roots the mount to the view's subtree.
+The rendering, the identity and `setns` are Linux's; the mount view is the
+remainder (`docs/uapi/` §1's unshare/setns row names it).
+
+**Pin**: `t-cgroupfs` (the tree: nine files, modes, membership moves, refusals,
+removal rules, `/proc/self/cgroup`), `t-ns-cgroup` (the namespace: privilege
+probe, re-rooting, real-group writes from inside, the fork, the ns identity,
+`setns` back). Host-side, `vfs::cgroupfs`'s own suite pins the file shapes and the
+claim machinery against the measured figures.

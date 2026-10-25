@@ -42,9 +42,12 @@
 //! number for a namespace that does not exist.
 
 use alloc::format;
+use core::cell::RefCell;
+
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
+use critical_section::Mutex;
 
 /// The kinds `/proc/<pid>/ns` names here.
 ///
@@ -57,6 +60,18 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// check.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
+    /// `CLONE_NEWCGROUP`: the root of the cgroup hierarchy a task's group
+    /// path is rendered from - the one kind whose namespace has no objects
+    /// and no tables, only a view of a tree that stays the machine's.
+    ///
+    /// Measured on a current host (7.2.11): `unshare -C` makes
+    /// `/proc/self/cgroup` answer `0::/` for a task whose real group is
+    /// deeper in the hierarchy, and the tree the task can then `mkdir` in
+    /// and move itself through is still the same one - the writes reach the
+    /// real files. A `t-ns-cgroup` holds both halves here: the render moves
+    /// and the membership writes keep moving the process in the machine's
+    /// tree.
+    Cgroup,
     /// `CLONE_NEWNS`: what is mounted where.
     Mount,
     /// `CLONE_NEWIPC`: the four objects `ipcs` lists - POSIX message queues,
@@ -113,6 +128,7 @@ impl Kind {
     /// The word the link's target starts with.
     pub const fn name(self) -> &'static str {
         match self {
+            Kind::Cgroup => "cgroup",
             Kind::Mount => "mnt",
             Kind::Ipc => "ipc",
             Kind::Net => "net",
@@ -129,6 +145,7 @@ impl Kind {
     /// answers from the descriptor rather than from a bit.
     pub const fn flag(self) -> usize {
         match self {
+            Kind::Cgroup => crate::abi::CLONE_NEWCGROUP,
             Kind::Mount => crate::abi::CLONE_NEWNS,
             Kind::Ipc => crate::abi::CLONE_NEWIPC,
             Kind::Net => crate::abi::CLONE_NEWNET,
@@ -164,6 +181,7 @@ impl Kind {
             b if b == crate::abi::CLONE_NEWUTS => Some(Kind::Uts),
             b if b == crate::abi::CLONE_NEWTIME => Some(Kind::Time),
             b if b == crate::abi::CLONE_NEWUSER => Some(Kind::User),
+            b if b == crate::abi::CLONE_NEWCGROUP => Some(Kind::Cgroup),
             _ => None,
         }
     }
@@ -180,6 +198,7 @@ impl Kind {
             "uts" => Some(Kind::Uts),
             "time" | "time_for_children" => Some(Kind::Time),
             "user" => Some(Kind::User),
+            "cgroup" => Some(Kind::Cgroup),
             _ => None,
         }
     }
@@ -192,6 +211,7 @@ impl Kind {
     /// and a reader that only wants "which namespaces does this machine have"
     /// are asking for.
     pub const ALL: &'static [Kind] = &[
+        Kind::Cgroup,
         Kind::Ipc,
         Kind::Mount,
         Kind::Net,
@@ -234,6 +254,10 @@ impl Entry {
     /// Every name the directory lists, in name order - which is the order a real
     /// kernel lists them in, measured.
     pub const ALL: &'static [Entry] = &[
+        Entry {
+            kind: Kind::Cgroup,
+            slot: Slot::Own,
+        },
         Entry {
             kind: Kind::Ipc,
             slot: Slot::Own,
@@ -317,6 +341,13 @@ impl Entry {
 /// process exits.
 #[derive(Clone)]
 pub enum Namespace {
+    /// A cgroup namespace, held as the **view-root** the task's group path
+    /// renders from: the one namespace with no objects, only a place in the
+    /// machine's tree. `None` here would be the machine's own view, but the
+    /// enum's job is a namespace that *exists*, so the root is always the
+    /// path - the move happens at `unshare`/`clone`, and this arm's job in
+    /// `setns` is to name what a descriptor carries.
+    Cgroup(Arc<str>),
     Mount(Arc<crate::vfs::mount::MountTable>),
     /// An IPC namespace, held as the **object** the four tables hang their state
     /// off; `None` is the machine's own.
@@ -345,6 +376,7 @@ pub enum Namespace {
 impl Namespace {
     pub fn kind(&self) -> Kind {
         match self {
+            Namespace::Cgroup(_) => Kind::Cgroup,
             Namespace::Mount(_) => Kind::Mount,
             Namespace::Ipc(_) => Kind::Ipc,
             Namespace::Net(_) => Kind::Net,
@@ -358,6 +390,11 @@ impl Namespace {
     /// The number this namespace is known by, as its own object reports it.
     pub fn id(&self) -> u64 {
         match self {
+            // A cgroup namespace's identity is its view-root: the machine's
+            // own is `/`, a moved one the path it was moved to. There is no
+            // allocated object to mint a number for, and two namespaces of
+            // this kind compare by what they show.
+            Namespace::Cgroup(root) => cgroup_ns_id(root),
             Namespace::Mount(table) => table.ns_id(),
             Namespace::Ipc(ns) => ns.as_ref().map_or_else(machine_ipc_id, |ns| ns.id()),
             Namespace::Net(ns_id) => *ns_id,
@@ -572,6 +609,27 @@ pub fn machine_net_id() -> u64 {
 
 /// The machine's own IPC namespace, minted on first use from the same pool.
 ///
+/// A cgroup namespace's id, minted once per distinct view-root and cached:
+/// the identity is the path (the machine's own is `/`), and a stable number
+/// is what `/proc/<pid>/ns/cgroup`'s inode and a `setns` comparison compare.
+/// The table's bound is the count of distinct roots a boot has seen - the
+/// moves a caller steered - each one small; a root whose last holder went
+/// is pruned by nothing and costs its own entry.
+static CGROUP_NS_IDS: Mutex<RefCell<alloc::collections::BTreeMap<alloc::sync::Arc<str>, u64>>> =
+    Mutex::new(RefCell::new(alloc::collections::BTreeMap::new()));
+
+fn cgroup_ns_id(root: &alloc::sync::Arc<str>) -> u64 {
+    critical_section::with(|cs| {
+        let mut ids = CGROUP_NS_IDS.borrow(cs).borrow_mut();
+        if let Some(id) = ids.get(root) {
+            return *id;
+        }
+        let fresh = mint();
+        ids.insert(root.clone(), fresh);
+        fresh
+    })
+}
+
 /// The same shape and the same reason as [`machine_net_id`]: a task that has
 /// never unshared holds no number of its own, so `/proc/<pid>/ns/ipc` and a
 /// `setns` into the machine's namespace both need one, and the four tables key
@@ -726,9 +784,9 @@ mod tests {
         assert_eq!(Kind::of_name("pid_for_children"), Some(Kind::Pid));
         assert_eq!(link_text(Kind::Ipc, 4026531839), "ipc:[4026531839]");
         assert_eq!(Kind::of_name("ipc"), Some(Kind::Ipc));
-        // A kind this kernel does not have is not recoverable from a word: the
-        // entry does not exist, which is the whole refusal.
-        assert_eq!(Kind::of_name("cgroup"), None);
+        // `cgroup` parses back now - the last kind to graduate, with the
+        // tree it views behind it.
+        assert_eq!(Kind::of_name("cgroup"), Some(Kind::Cgroup));
         assert_eq!(Kind::of_name("user"), Some(Kind::User));
     }
 
@@ -833,14 +891,16 @@ mod tests {
     /// The directory's names, pinned as the *complete* list against a measured
     /// one: a real kernel lists ten (`cgroup, ipc, mnt, net, pid,
     /// pid_for_children, time, time_for_children, user, uts`) and this one lists
-    /// the nine of those whose kinds are built, in the same order - `cgroup`
-    /// alone is the one with nothing behind it.
+    /// the ten of those whose kinds are built, in the same order - and all
+    /// ten are built now: `cgroup` landed with the tree it views
+    /// (`src/vfs/cgroupfs.rs`), the last rung of `namespaces(7)`'s eight.
     #[test]
     fn the_directory_names_are_the_ones_a_real_kernel_lists() {
         let names: alloc::vec::Vec<&str> = Entry::ALL.iter().map(|entry| entry.name()).collect();
         assert_eq!(
             names,
             [
+                "cgroup",
                 "ipc",
                 "mnt",
                 "net",
@@ -861,7 +921,14 @@ mod tests {
         assert_eq!(Entry::of_name("mnt_for_children"), None);
         assert_eq!(Entry::of_name("net_for_children"), None);
         assert_eq!(Entry::of_name("uts_for_children"), None);
-        assert_eq!(Entry::of_name("cgroup"), None);
+        // `cgroup` is a name now: the kind landed with the tree it views.
+        assert_eq!(
+            Entry::of_name("cgroup"),
+            Some(Entry {
+                kind: Kind::Cgroup,
+                slot: Slot::Own
+            })
+        );
     }
 
     /// The pool hands out a new number every time.
@@ -946,9 +1013,14 @@ mod tests {
             assert_eq!(Kind::of_name(kind.name()), Some(*kind));
         }
         // A bit that is a namespace and not one of these is *not* a kind: the
-        // caller hears their own word back rather than a wrong namespace. The
-        // vocabulary is down to the kinds this kernel still has no copy of.
-        assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWCGROUP), None);
+        // caller hears their own word back rather than a wrong namespace.
+        // `CLONE_NEWCGROUP` is a kind now - the last of `namespaces(7)`'s
+        // eight to be built, served with the tree it views.
+        assert_eq!(
+            Kind::of_flag(crate::abi::CLONE_NEWCGROUP),
+            Some(Kind::Cgroup)
+        );
+        assert_eq!(Kind::Cgroup.flag(), crate::abi::CLONE_NEWCGROUP);
         assert_eq!(Kind::of_flag(crate::abi::CLONE_NEWUSER), Some(Kind::User));
         assert_eq!(Kind::User.flag(), crate::abi::CLONE_NEWUSER);
         assert_eq!(Kind::of_flag(0), None);

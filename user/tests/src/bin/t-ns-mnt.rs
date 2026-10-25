@@ -318,31 +318,23 @@ fn main() {
 
     // ---- The two refusals that make the served answer honest ----
     //
-    // A word mixing MNT with a kind this kernel cannot copy is refused *whole*:
-    // Linux's `ksys_unshare` would already have copied the first part by the
-    // time the second failed, and a half-unshared caller is a caller with a
-    // namespace it did not ask to keep. Pinned as behaviour, not read off the
-    // verdict table in `abi`: the gate is where the promise lives.
+    // The mixing story ended where the ladder did: every kind of
+    // `namespaces(7)` is served now, `CLONE_NEWCGROUP` last (2026-10-25), so
+    // there is no unserved half left for a word to mix with - and the word
+    // that used to be the pin of "refused whole" is a legal pair. The
+    // half-unshared hazard it guarded against is Linux's own `ksys_unshare`
+    // order and is gone with the last refusal; what this door still refuses
+    // is a capability question, answered before any kind is copied.
     let mixed = fix(unsafe {
         libc::syscall(
             libc::SYS_unshare,
-            // The unserved half is `CGROUP` now: the word used to be `NET` and
-            // then `IPC`, and each became a served kind when its rung landed -
-            // the drift §6.3 records over and over.
             (CLONE_NEWNS | libc::CLONE_NEWCGROUP as usize) as libc::c_long,
         )
     });
     r.check(
-        "a word mixing MNT with an unserved kind is refused whole",
-        mixed == -(Errno::OPNOTSUPP.raw_os_error() as isize),
+        "a word mixing MNT with CGROUP is served whole now - both granted",
+        mixed == 0,
     );
-    if mixed != 0 {
-        // Nothing moved: the parent's table still has no private mount.
-        r.check(
-            "the refused call mounted nothing",
-            !mounts_name("/tmp/t-ns-mnt-refused"),
-        );
-    }
 
     // ---- `clone(CLONE_NEWNS)`: the child starts in a copy ----
     //
@@ -395,17 +387,12 @@ fn main() {
         r.check("and the parent's table stayed clean", !mounts_name(MNT));
     }
 
-    // An unserved kind on `clone` answers the same refusal `unshare` gives it.
-    // The word is `libc::CLONE_NEWCGROUP` rather than a literal, and that is a
-    // correction: the first draft wrote `0x0008_0000` here with `CLONE_NEWPID` in
-    // the comment, which is `CLONE_SETTLS` — so the call started a child with a
-    // thread pointer the register happened to hold, and the guest reported the
-    // child's page fault at `0xfffffffffffffff8` instead of a clean refusal. The
-    // word has moved once per rung built - PID, then NET, then IPC, which left
-    // this list when `clone(CLONE_NEWIPC)` began giving the child a namespace of
-    // its own (`t-ns-ipc` pins that pair) - which is the price of a claim about
-    // "the next unserved kind". The errno comes through `fix()` for the protocol
-    // reason above it.
+    // The last rung serves the child side too: `clone(CLONE_NEWCGROUP)` starts
+    // the child in a view-rooted namespace of its own, rooted at the group the
+    // parent is in (`t-ns-cgroup` pins the view). The word here was the pin of
+    // "refused whole" once per missing rung - PID, then NET, then IPC - and the
+    // claim that replaced each refusal was the birth, which is this one now
+    // that the ladder is complete.
     let cloned_cgroup = fix(unsafe {
         libc::syscall(
             libc::SYS_clone,
@@ -414,9 +401,15 @@ fn main() {
         )
     });
     r.check(
-        "clone(CLONE_NEWCGROUP) is refused whole, not half-served",
-        cloned_cgroup == -(Errno::OPNOTSUPP.raw_os_error() as isize),
+        "clone(CLONE_NEWCGROUP) starts a child, view-rooted where its parent is grouped",
+        cloned_cgroup > 0,
     );
+    if cloned_cgroup > 0 {
+        // The child is a real SIGCHLD child now, so it is reaped the way the
+        // rest of this program's children are.
+        let mut status = 0i32;
+        unsafe { libc::waitpid(cloned_cgroup as i32, &mut status, 0) };
+    }
 
     r.finish()
 }

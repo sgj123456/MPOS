@@ -1318,6 +1318,17 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
             // others (`validate_clone_flags` refuses every namespace bit, and
             // `unshare` is the door this kind is served through).
             ipc_ns: request.ipc_ns.or_else(|| t.task(parent_id).ipc_ns.clone()),
+            // The cgroup view-root: the creator's, unless this word asked
+            // for a fresh namespace - whose root is the group the creator
+            // is in *now*, served as `/` (`crate::vfs::cgroupfs` carries
+            // the tree and the render rule).
+            cgroup_ns: if request.flags & crate::abi::CLONE_NEWCGROUP != 0 {
+                // Rooted at the group the *parent* is in now - the real one,
+                // membership and not view (the header carries the rule).
+                Some(crate::vfs::cgroupfs::ns_root(parent_id.0))
+            } else {
+                t.task(parent_id).cgroup_ns.clone()
+            },
             oom_score_adj: t.task(parent_id).oom_score_adj,
             oom_score_adj_min: t.task(parent_id).oom_score_adj_min,
             nice: t.task(parent_id).nice,
@@ -1383,6 +1394,12 @@ fn spawn_copy(state: &UserFrame, request: CloneRequest) -> isize {
         // `PTRACE_ATTACH` to write the link has no tracer, so the answer is a
         // plain "no" and the child simply starts ready. That is not a faked
         // ptrace: there is nothing on that machine to fake one for.
+        // A child is born where its parent is grouped - Linux's `copy_process`
+        // puts the child in `current`'s cgroup - and the cgroup view follows
+        // the field the task struct carries. The membership map is keyed by
+        // slot with the generation taken at the write, so a dead parent's
+        // slot cannot leak its group to a child born in it later.
+        crate::vfs::cgroupfs::inherit_membership(parent_id, child_id);
         let traced_child = attach_new_child(t, parent_id, child_id, fork_event(request.flags));
         if traced_child {
             t.sched.sleep(child_id, parent_priority, u64::MAX);
@@ -1707,6 +1724,10 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         let user_ns = alloc::sync::Arc::clone(&parent.user_ns);
         let net_ns = parent.net_ns;
         let ipc_ns = parent.ipc_ns.clone();
+        // A thread joins its process's view of the cgroup tree, like every
+        // namespace above (and why the verdict refuses a thread with one of
+        // its own).
+        let cgroup_ns = parent.cgroup_ns.clone();
         // A thread is created, not forked, so it starts with none either. The
         // subreaper flag *is* the process's, so the thread reads it from the
         // leader and never carries one of its own.
@@ -1862,6 +1883,7 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
             net_ns: net_ns.clone(),
             // A thread is its process here too: one set of tables.
             ipc_ns,
+            cgroup_ns,
             pdeathsig,
             subreaper,
             no_new_privs,
@@ -1918,6 +1940,9 @@ fn spawn_thread(state: &UserFrame, request: CloneRequest) -> isize {
         // more here, because a thread that has run once is a thread whose first
         // syscalls are missing from the trace. As with a process child, a
         // machine with no tracer always answers no here.
+        // A thread joins its process's group, exactly as it joins every
+        // other per-process fact (`spawn_thread` copies by reference).
+        crate::vfs::cgroupfs::inherit_membership(parent_id, child_id);
         let traced_child = attach_new_child(t, parent_id, child_id, PTRACE_EVENT_CLONE);
         if traced_child {
             t.sched.sleep(child_id, priority, u64::MAX);

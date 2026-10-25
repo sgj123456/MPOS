@@ -536,12 +536,13 @@ fn main() {
         r.finish()
     }
 
-    // ---- A word that mixes the served kinds with an unserved one is refused
-    //      whole ----
-    r.check(
-        "unshare(CLONE_NEWNET|CLONE_NEWCGROUP) is EOPNOTSUPP, whole",
-        unshare(UnshareFlags::NEWNET | UnshareFlags::NEWCGROUP) == Err(Errno::OPNOTSUPP),
-    );
+    // ---- The mixing story ended where the ladder did ----
+    //
+    // The word that used to pin "served kinds beside an unserved one is
+    // refused whole" (NEWNET beside CGROUP) is a legal pair now - every kind
+    // of `namespaces(7)` is served, `CLONE_NEWCGROUP` last - and this file's
+    // subject is the wire, which the cgroup view does not touch, so the pair
+    // is pinned where it is born: `t-ns-cgroup` walks the view it grants.
 
     // ---- A socket outlives the move, which is what makes `unshare` usable ----
     //

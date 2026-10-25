@@ -103,7 +103,8 @@
 //! of the mount table), `CLONE_NEWPID` (a namespace to be the child's own init),
 //! `CLONE_NEWNET` (a fresh stack) and `CLONE_NEWUSER` (a fresh user namespace
 //! the child is *born* in) - give the child its own of what the flag names,
-//! while the one kind with nothing behind it (`CLONE_NEWCGROUP`) is refused whole
+//! while the one kind that used to have nothing behind it (`CLONE_NEWCGROUP`)
+//! now gives the child a view of its own, rooted where its parent was grouped
 //! with `EOPNOTSUPP` rather than handed a child that shares what its flags said
 //! it got its own of. The word is the scheduler's to answer
 //! (`abi::clone_namespace_verdict`), which is why the syscall layer must pass
@@ -329,19 +330,24 @@ fn main() {
     // stack of its own, and `clone(CLONE_NEWUSER)` gives one a user namespace of
     // its own to be born in. Their pins are `t-ns-pid`, `t-ns-net` and
     // `t-ns-user` - one program per rung of §6.3's ladder - and what is left here
-    // is what this kernel does not serve *through `clone`*: IPC and cgroup are
-    // still named and not built, so the door is refused by name rather than with
-    // a wrong errno.
-    let names: &[(&str, usize)] = &[("CGROUP", libc::CLONE_NEWCGROUP as usize)];
-    for (name, bit) in names {
-        let ret = probe(libc::SIGCHLD as usize | bit);
-        let ok = if mpos_user_tests::host_run() {
-            ret < 0 // some refusal; the host's own namespace policy decides the number
-        } else {
-            refused(ret, 95) // EOPNOTSUPP
-        };
-        let label = alloc_label(name);
-        r.check(&label, ok);
+    // is the whole ladder: IPC served through all three doors (`t-ns-ipc`),
+    // and `CLONE_NEWCGROUP` served last (2026-10-25) with the tree it views -
+    // the child is born with a view-rooted namespace of its own, rooted at
+    // the group its parent is in (`t-ns-cgroup` pins the view; `t-cgroupfs`
+    // pins the tree). The door no longer refuses anything of `namespaces(7)`'s
+    // eight, so the pin here is the birth itself: a child comes back, and it
+    // is reaped like every other child of this program.
+    let ret = probe(libc::SIGCHLD as usize | libc::CLONE_NEWCGROUP as usize);
+    let born = ret > 0;
+    r.check(
+        "clone(CLONE_NEWCGROUP) starts the child in a namespace of its own",
+        born,
+    );
+    if born {
+        r.check(
+            "the cgroup-namespace child is reaped",
+            collect(ret).is_some_and(WaitStatus::exited),
+        );
     }
 
     // `CLONE_NEWUTS` is served: the child starts in a *copy* of its parent's

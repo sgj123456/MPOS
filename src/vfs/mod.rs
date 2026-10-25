@@ -18,6 +18,12 @@
 //! isolated tables; the kernel holds one instance, exposed by [`mount_root`],
 //! [`mount`] and [`resolve`].
 
+/// `/sys/fs/cgroup`: the cgroup2 control-group tree - the hierarchy a
+/// process belongs to, `/proc/<pid>/cgroup`'s answer and the cgroup
+/// namespace's subject. Organizational only (no controllers), measured
+/// against a current host before it was built; the module's header carries
+/// the probe.
+pub mod cgroupfs;
 pub mod devfs;
 pub mod devpts;
 #[cfg(target_os = "none")]
@@ -265,6 +271,10 @@ pub enum VfsError {
     NotEmpty,
     /// EBUSY: the mountpoint is already mounted.
     Busy,
+    /// ESRCH: a number that names no process was written to a membership
+    /// door - the cgroup tree's `cgroup.procs`, whose whole business is
+    /// naming processes.
+    NoProcess,
     /// EBADF: no such open file description.
     BadFd,
     /// The tree has no root filesystem mounted yet.

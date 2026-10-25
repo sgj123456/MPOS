@@ -455,18 +455,17 @@ fn main() {
         "unshare CLONE_NEWPID is served once nothing else can be the reason",
         pid == 0,
     );
-    // And the kinds this machine has no way to hand over keep their honest
-    // refusal *now* that no capability gate can be the reason: EOPNOTSUPP is
-    // "present, cannot do that", which is what a capable caller learns, and
-    // what an unprivileged one would have heard as EPERM above. Nothing is
-    // unshared either way - the refusal is whole. This witness has moved once
-    // per rung built (`CLONE_NEWPID`, then `CLONE_NEWNET`, then `CLONE_NEWIPC`)
-    // and now names the last kind with nothing behind it: a hardcoded served set
-    // drifts the moment it grows, which §6.3 records over and over.
+    // The ladder is complete: this witness moved once per rung built
+    // (`CLONE_NEWPID`, then `CLONE_NEWNET`, then `CLONE_NEWIPC`) and the word
+    // that used to name the last kind with nothing behind it is served now -
+    // `CLONE_NEWCGROUP` landed with the tree it views (`src/vfs/cgroupfs.rs`),
+    // so all eight of `namespaces(7)`'s kinds answer a capable caller with 0.
+    // The move re-roots this task's group path and nothing else; the claims
+    // below read capabilities, not cgroups.
     let cgroup = unshare(0x0200_0000);
     r.check(
-        "unshare CLONE_NEWCGROUP is EOPNOTSUPP once nothing else can be the reason",
-        cgroup == -(libc::EOPNOTSUPP as isize),
+        "unshare CLONE_NEWCGROUP is served - the last rung of the ladder",
+        cgroup == 0,
     );
 
     // ---- the DAC override is two capabilities, not the uid ----

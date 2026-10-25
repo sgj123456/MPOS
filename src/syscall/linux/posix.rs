@@ -1232,6 +1232,15 @@ pub fn handle_unshare(args: [usize; ARG_COUNT]) -> isize {
                 // whatever `current_ipc_ns` answers, and the answer changed.
                 crate::sched::unshare_ipc();
             }
+            if bits & crate::syscall::linux::nr::CLONE_NEWCGROUP != 0 {
+                // The caller **moves**, like IPC: the namespace's whole state is
+                // the view-root, and the view changes with it - the group the
+                // caller is in renders as `/` from here, the groups above it
+                // disappear from `/proc/<pid>/cgroup`, and writes still reach
+                // the real files underneath (`crate::vfs::cgroupfs` renders
+                // and resolves the view; the tree itself is one).
+                crate::sched::unshare_cgroup();
+            }
             if bits & crate::syscall::linux::nr::CLONE_NEWTIME != 0 {
                 // The caller's *children* move into a fresh, empty namespace,
                 // and the caller does **not** - the same asymmetry PID above
@@ -1311,6 +1320,11 @@ pub fn handle_setns(args: [usize; ARG_COUNT]) -> isize {
         return err::EPERM;
     }
     match namespace {
+        // Joining a cgroup namespace sets the view-root: the caller's
+        // `/proc/<pid>/cgroup` renders from the descriptor's root from here
+        // on, and the tree it writes through is still the machine's one
+        // hierarchy - a join of a *view*, the only kind this namespace has.
+        crate::vfs::ns::Namespace::Cgroup(root) => crate::sched::setns_cgroup(root),
         crate::vfs::ns::Namespace::Mount(table) => crate::sched::setns_mnt(table),
         // Joining a namespace: the caller moves into *that* stack, and its
         // existing sockets keep working against the ones they were made in -

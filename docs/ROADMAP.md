@@ -104,8 +104,8 @@ One-glance status of the whole roadmap.
   `anon_inode:[…]` name (`anon_inode:inotify` being the unbracketed one), and a
   zero-length read answers Linux's errno, `inotify` consulting its queue first
   (§6.11, item 99)
-- [ ] [~] 6.3 Namespaces — UTS, MNT, **PID**, **NET**, **TIME**, **USER** and **IPC** landed, each with its pin  
-  (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`): the numbers a process  
+- [x] 6.3 Namespaces — **all eight of `namespaces(7)`'s kinds served** — UTS, MNT, **PID**, **NET**, **TIME**, **USER**, **IPC** and **CGROUP** landed, each with its pin  
+  (`t-ns-uts`, `t-ns-mnt`, `t-ns-pid`, `t-ns-net`, `t-ns-time`, `t-ns-user`, `t-ns-ipc`, `t-ns-cgroup`): the numbers a process  
   sees are the  
   reader's namespace's,  
   both directions of the translation and `/proc` rendered per reader (§6.3); **the task a namespace  
@@ -184,8 +184,12 @@ One-glance status of the whole roadmap.
   tables key their state by it, a number restarts at 0 in a fresh namespace (so
   the pin compares objects rather than numbers), and the namespace is an `Arc`
   whose last holder - a task or a `ns/ipc` descriptor - frees those tables
-  (`t-ns-ipc`, 39 claims, §6.16); `CLONE_NEWCGROUP` is the last kind with
-  nothing behind it
+  (`t-ns-ipc`, 39 claims, §6.16); `CLONE_NEWCGROUP` **landed on 2026-10-25** - the
+  last kind, and the one with no objects: the cgroup tree it views is organizational
+  only (controller-less, measured on a current host before it was built), the
+  namespace's whole state is the view-root a `/proc/<pid>/cgroup` path renders from,
+  and `t-ns-cgroup` walks the move, the fork, the ns identity and the `setns` back
+  (§6.25)
 - [ ] `fanotify_init`/`fanotify_mark` · `keyctl` (kernel keyring)
 - [x] the extensible `clone` door — `clone3` (435) with a versioned argument
   struct, and `CLONE_PIDFD` delivering the child **and a descriptor naming it** in
@@ -345,7 +349,7 @@ One-glance status of the whole roadmap.
 
 In the order that keeps each step verifiable on its own:
 
-1. **namespaces** (§6.3) — UTS, MNT, PID, NET and TIME are landed, and the ladder's remaining work  
+1. **namespaces** (§6.3) — **complete** (2026-10-25): all eight kinds of `namespaces(7)` are served, each with its pin, CGROUP last with the tree it views (§6.25). What remains in the family is parity work, not kinds — the mount's re-rooting inside a cgroup namespace, controllers behind the tree if a caller ever needs one. The original text follows for the record of how each rung landed: UTS, MNT, PID, NET and TIME are landed, and the ladder's remaining work  
    is named per rung: a **wire that can move** into a namespace has landed (2026-10-16) -  
    `ip link set eth0 netns N` moves the device, and it arrives **down and unconfigured** because  
    an address is the namespace's and not the device's (measured on Linux first; `t-ns-net` walks a  
@@ -389,10 +393,13 @@ In the order that keeps each step verifiable on its own:
    the caller, the four tables are one slot space per namespace, a number
    restarts at 0 inside one, and `t-ns-ipc` holds the pair for all four
    families, and the namespace is an `Arc` whose last holder (a task or a
-   descriptor) frees its tables. All three doors serve it - `unshare`, `setns` and `clone`, the last
-   giving the child a namespace of its own - so what stays named there is
-   **CGROUP**, the last rung - cheap only the day the tree it would
-   isolate lands, and worthless before it. Nested namespaces pin the  
+   descriptor) frees its tables. All three doors serve it. **CGROUP's wait is
+   over too** (2026-10-25): the tree it would isolate is organizational only -
+   controller-less, measured on a current host before it was built - and the
+   namespace is the view-root a `/proc/<pid>/cgroup` path renders from, with
+   `t-ns-cgroup` walking the move, the fork, the identity and the `setns` back
+   (§6.25). **The ladder has no rungs left: every kind of `namespaces(7)` is
+   served.** Nested namespaces pin the  
    *numbers* two levels deep now, as the zap's reach already did. The `/proc/net` reader's rows were  
    per-namespace but unexercised; `t-ns-net` reads the file on both sides of the boundary now  
    (2026-10-15). Two more left this list on  
@@ -469,11 +476,12 @@ In the order that keeps each step verifiable on its own:
 Two machines boot the same flow to a real Alpine userland; the ABI answers Linux's shape across  
 syscalls, signals, filesystems, networking, memory, devices and security, with the honest refusals  
 named. What is true today — counts, measurements, gates — is in [`notes/`](notes/index.md); this  
-section states direction only: the frontier is the two namespace kinds with no entry left (IPC and
-cgroup), the second compositor family (the wlroots one, whose first compositor to come up here is
-still unfound — `sway` binds no IPC socket and the GL card is already Mesa's, §7.4), and closing
-the remaining ABI gaps below. The block layer's completion path is off this list: completions
-are interrupt-driven and the transfer parks its task (§10.5, 2026-10-25).
+section states direction only: the frontier is the second compositor family (the wlroots one,
+whose first compositor to come up here is still unfound — `sway` binds no IPC socket and the GL
+card is already Mesa's, §7.4) and closing the remaining ABI gaps below. Two items left this list
+on 2026-10-25: the block layer's completion path (completions interrupt-driven, the transfer
+parking its task, §10.5) and the namespace ladder (all eight kinds of `namespaces(7)` served,
+§6.25).
 
 ---
 

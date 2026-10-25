@@ -1137,6 +1137,22 @@ must not be cut short, and the interrupted sleep's remainder). Its counterfactua
 is exact: with `SUB_TICK_WAKE` back to `false` the same program is
 **`FAIL t-sleep-subtick`, 8 runs of 8**, with a median of 4 001 µs.
 
+**The count claim, re-measured and recalibrated (2026-10-25).** The pin's
+distribution half was "at least thirty of the fifty 1 ms sleeps end inside half a
+tick", calibrated when the sweep ran beside less host load. Three consecutive
+aarch64 arms measured it as load-dependent: `25/50`, `26/50`, `26/50` - one run
+with the *first* half's median at 1 066 µs (fully sub-tick) and the *second's*
+at 2 817 µs, the contention arriving mid-sample, six TCG machines to one host.
+A count that moves with load is not a pin for a wake that does not. The claim
+now reads the **minimum of each half of the sample**: contention only delays a
+sample and never speeds one up, while a machine with no one-shot rounds *every*
+sample to a tick boundary (the 3 804..4 179 µs band above) and cannot produce a
+sub-tick minimum at any load - so the fastest sleep of each half ending inside
+half a tick is the one-shot's answer, load-independent by construction, and the
+red-green discrimination is unchanged (a tick-rounded machine fails it in both
+halves). Measured green: aarch64 `pass=207 fail=0` with the fastest samples at
+1 037/1 049 µs, beside the same host that had just measured 26/50.
+
 Gate: x86_64 `pass=200 fail=0 (213 built)`, `mpos-kunit 32 passed, 0 failed`,
 exit 0 - twelve consecutive green runs after the two fixture fixes below. The
 second machine compiles the whole change (`cargo build --release --target

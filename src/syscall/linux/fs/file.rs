@@ -2308,6 +2308,10 @@ fn mount_new(
         // kernel has is the "wrong shape" answer these are supposed to avoid.
         "proc" => crate::vfs::procfs::ProcFs::new(),
         "sysfs" => crate::vfs::sysfs::SysFs::new(),
+        // The cgroup2 tree: one hierarchy for the machine, whatever mounts
+        // name it - a second `mount -t cgroup2` binds the same tree, which
+        // is Linux's own rule for the single writable hierarchy.
+        "cgroup2" => crate::vfs::cgroupfs::CgroupFs::new(),
         // A host share, served over 9p: the *source* is the mount tag the
         // host exported the share under - `mount -t 9p hostshare /mnt`
         // opens the device QEMU was told `-virtfs ...,mount_tag=hostshare`

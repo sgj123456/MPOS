@@ -67,7 +67,8 @@ Owner `src/vfs/sysfs.rs`; the tree is assembled once at boot from what the drive
 | `/sys/class/drm/card0/{device,drm/,uevent}`, `/sys/class/block/vda1/dev` | Served as far as the card's identity goes; the parent chain carries the bus attributes libdrm resolves first (§7.4's update) | `t-drm`, `t-fbdev` |
 | `/sys/bus/pci/devices/<BDF>/{vendor,device,class,config,resource,driver}` | Served behind `mpos_pci_config` on both machines — x86_64 through the port pair or the firmware's window, aarch64 through the device tree's ECAM window since 2026-10-19 (§7.6c); a machine without the capability builds the tree from the neutral model instead of refusing the filesystem ([05b-small-measured.md §5.2](05b-small-measured.md)) | `t-ahci` (the bound driver), `t-drm` (the card's function), `t-pci` (both config doors) |
 | `/sys/bus/usb/devices` | The empty directory a machine with no USB controller registers — `lsusb` prints nothing and exits 0 (§R.Remaining) | `t-mountinfo` |
-| `/sys/fs/cgroup/**`, `/sys/kernel/slab`, `/sys/module/**`, `/sys/firmware/**` | Not present — no cgroup engine, no slab accounting, no loadable modules | *(no pin — same rule as above)* |
+| `/sys/fs/cgroup/**` | **Present as a mount, not as `/sys`'s child**: `mount -t cgroup2` serves the control-group tree (`src/vfs/cgroupfs.rs`) — the nine files per group, membership moves, the two removal rules — organizational only, no controllers (`t-cgroupfs`). Nothing creates it under `/sys` on either image; a reader that wants it mounts it, which is also how the tests reach it | `t-cgroupfs` |
+| `/sys/kernel/slab`, `/sys/module/**`, `/sys/firmware/**` | Not present — no slab accounting, no loadable modules | *(no pin — same rule as above)* |
 
 ### `getsockopt(2)` / `setsockopt(2)` options
 

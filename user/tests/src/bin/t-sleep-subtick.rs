@@ -157,15 +157,27 @@ fn main() {
         "the median 1 ms sleep ends well before one clock tick",
         median_us < MEDIAN_LIMIT_US,
     );
-    // And most of them, not merely half: with the wait rounded to the clock every
-    // single sample lands on a tick boundary (measured at 3.8-4.2 ms on a 250 Hz
-    // clock), so a run where thirty of fifty arrive inside *half* a tick cannot be
-    // that shape. Twenty samples of slack is the sweep's contention, which cannot
-    // push a tick-rounded sample down into that band.
-    r.check(
-        "at least thirty of the fifty 1 ms sleeps end inside half a clock tick",
-        inside_tick >= 30,
-    );
+    // And the wake the one-shot answers has to be visible in **both halves of
+    // the sample** - the minimum of each, because contention only delays a
+    // sample and never speeds one up, while a machine with no one-shot at all
+    // rounds *every* sample to a tick boundary (measured at 3.8-4.2 ms on a
+    // 250 Hz clock) and cannot produce a sub-tick minimum at any load. The
+    // count this replaced ("at least thirty of fifty inside half a tick") was
+    // calibrated when the sweep ran beside less host load, and three
+    // consecutive reds (25, 26, 26 of 50, one run with the first half's
+    // median at 1066 us and the second's at 2817 us - the contention arriving
+    // mid-sample) measured it as load-dependent; a minimum cannot be. The
+    // sub-tick wake's own proof is that a 1 ms wait *can* end at 1.04 ms -
+    // this claim now says exactly that, twice, where no tick can reach.
+    for (name, half) in [("first", &sample_us[..25]), ("second", &sample_us[25..])] {
+        let sub_tick_min = half.iter().min().copied().unwrap_or(i64::MAX) < SUB_TICK_US;
+        r.check(
+            &format!(
+                "the {name} half's fastest 1 ms sleep ends inside half a clock tick -                  the one-shot answered, at any load"
+            ),
+            sub_tick_min,
+        );
+    }
     // A sleep is never cut short: the median cannot be under the millisecond it
     // asked for by more than the clock's own reading granularity.
     r.check(

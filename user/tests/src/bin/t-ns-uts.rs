@@ -357,27 +357,24 @@ fn main() {
             witness > 0,
         );
         if witness > 0 {
-            // The mixed word names one *served* kind and one this kernel has no
-            // copy to hand over, which is the combination the refusal is about -
-            // what this file's header has said all along ("the served namespace
-            // with an unserved one"). The unserved half was `NEWNS` while MNT
-            // was still unbuilt; MNT's landing made that pair legal, so the pair
-            // moved to a kind still refused whole. Measured: with `NEWUTS |
-            // NEWNS` the call started answering 0, the rename below landed in a
-            // copy the witness does not hold, and the two claims that follow
-            // were the ones that went red.
+            // The mixed word's story ended where the ladder did: every kind of
+            // `namespaces(7)` is served now, `CLONE_NEWCGROUP` last, so the
+            // word that was this pin's subject (one served kind, one refused
+            // whole) is a legal pair - and the call actually unshares. What it
+            // unshares is exactly what the word names: a **copy** of the UTS
+            // namespace for this caller (`copy_utsname`), and a cgroup
+            // view-root of its own. The rename below therefore lands in the
+            // copy, and the witness - forked before the call, holding the old
+            // namespace by reference - does *not* see it: the same divergence
+            // the old "nothing was unshared" claim pinned, from the served
+            // side now.
             r.check(
-                // The unserved half is `IPC` because the word used to be `NET`,
-                // which became a served kind when the fourth rung landed - the
-                // drift §6.3 records over and over.
-                "a word mixing CLONE_NEWUTS with CLONE_NEWCGROUP is EOPNOTSUPP",
-                unshare(UnshareFlags::NEWUTS | UnshareFlags::NEWCGROUP) == Err(Errno::OPNOTSUPP),
+                "a word mixing CLONE_NEWUTS with CLONE_NEWCGROUP is served whole",
+                unshare(UnshareFlags::NEWUTS | UnshareFlags::NEWCGROUP).is_ok(),
             );
-            // Only now, in a namespace that must still be the one the witness
-            // holds.
             r.check(
-                "and naming this namespace still works",
-                sethostname(b"ns-after-refusal").is_ok(),
+                "and naming the copy still works",
+                sethostname(b"ns-after-copy").is_ok(),
             );
             let _ = write(&go_w, b"g");
             drop(go_w);
@@ -385,8 +382,8 @@ fn main() {
             let n = drain(&wr_r, &mut report);
             drop(wr_r);
             r.check(
-                "so the witness, forked before the refusal, sees the rename - nothing was unshared",
-                eq_bytes(&report[..n], b"ns-after-refusal\n"),
+                "so the witness, forked before the call, keeps the old name - the rename landed in the copy",
+                eq_bytes(&report[..n], b"ns-outer\n"),
             );
             let _ = rustix::process::waitpid(
                 rustix::process::Pid::from_raw(witness),
@@ -442,7 +439,7 @@ fn main() {
     let after = Doors::read(&mut r);
     r.check(
         "none of the refused calls moved the name",
-        eq_bytes(&after.node, b"ns-after-refusal") && after.agree(),
+        eq_bytes(&after.node, b"ns-after-copy") && after.agree(),
     );
 
     r.finish()

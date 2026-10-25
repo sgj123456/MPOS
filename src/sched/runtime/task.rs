@@ -856,6 +856,19 @@ pub(crate) struct Task {
     /// the *parent* namespace's numbering, which is why a fresh namespace shows
     /// its own caller as [`crate::userns::NO_MAP_ID`] until the map is written.
     pub(crate) user_ns: Arc<crate::userns::UserNs>,
+    /// The root of the cgroup hierarchy this task's group path is rendered
+    /// from, when the task is inside a cgroup namespace: the group its
+    /// creator was in at the moment `CLONE_NEWCGROUP` moved it, served by
+    /// that namespace as `/`. `None` is the machine's own view - every task
+    /// carries it until something unshares - and the answer then is the
+    /// machine's path from the real root, exactly what a kernel without a
+    /// cgroup namespace serves.
+    ///
+    /// A cgroup namespace has no objects and no tables: its one state is
+    /// this root, so the kind is a path rather than an `Arc` - held by
+    /// reference across `fork`/`clone` and pinned at the move, the way the
+    /// user namespace is.
+    pub(crate) cgroup_ns: Option<alloc::sync::Arc<str>>,
     /// The OOM-killer's score adjustment and the floor of it: the two numbers
     /// Linux keeps as `sig->oom_score_adj` and `sig->oom_score_adj_min`, and
     /// which `/proc/<pid>/oom_score_adj` reads and writes.
@@ -1183,6 +1196,7 @@ impl Task {
             // reads back as itself and no reader changes until something
             // unshares.
             user_ns: crate::vfs::ns::machine_user_ns(),
+            cgroup_ns: None,
             // The machine's own network namespace, which is `None`: every socket
             // call resolves to the stack the boot built.
             net_ns: None,
@@ -1851,6 +1865,7 @@ impl Table {
             // reads back as itself and no reader changes until something
             // unshares.
             user_ns: crate::vfs::ns::machine_user_ns(),
+            cgroup_ns: None,
             // The machine's own network namespace, which is `None`: every socket
             // call resolves to the stack the boot built.
             net_ns: None,

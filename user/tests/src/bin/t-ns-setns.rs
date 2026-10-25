@@ -142,16 +142,18 @@ fn main() {
         .unwrap_or_default();
     let mut sorted = names.clone();
     sorted.sort();
-    // Nine names now: USER joined the directory as the ladder's sixth rung and
-    // IPC as the seventh, each bringing *one* name rather than two because both
+    // Ten names now: USER joined as the sixth rung, IPC as the seventh, and
+    // CGROUP as the eighth and last (2026-10-25, with the tree it views) -
+    // each of the three bringing *one* name rather than two because all three
     // move their caller where PID and TIME have a `_for_children` slot (§6.3).
-    // The list is the kernel's claim about what it can isolate, so a set written
-    // down here drifts the moment it grows - which is why the probe below is the
-    // *complete* list rather than a spot check.
+    // The list is the kernel's claim about what it can isolate, so a set
+    // written down here drifts the moment it grows - which is why the probe
+    // below is the *complete* list rather than a spot check.
     r.check(
-        "the ns directory names the seven namespaces this kernel has, nine names",
+        "the ns directory names the eight namespaces this kernel has, ten names",
         sorted
             == vec![
+                "cgroup".to_string(),
                 "ipc".to_string(),
                 "mnt".to_string(),
                 "net".to_string(),
@@ -193,15 +195,17 @@ fn main() {
         },
     );
     // The names this machine has no namespace for are the same answer a real
-    // kernel gives for the ones it was built without: no entry at all. This list
-    // has shrunk once per rung - TIME left it with the fifth (the `t-ns-time` pin
-    // walks that entry end to end), USER with the sixth, and IPC with the seventh
-    // (`t-ns-ipc` walks that one, setns included). CGROUP is the last, and it
-    // waits on the tree it would isolate.
-    for absent in ["cgroup"] {
+    // kernel gives for the ones it was built without: no entry at all. This
+    // list has shrunk once per rung - TIME left it with the fifth (the
+    // `t-ns-time` pin walks that entry end to end), USER with the sixth, IPC
+    // with the seventh (`t-ns-ipc` walks that one, setns included) and CGROUP
+    // with the eighth - and what remains is the kinds with no second slot:
+    // a `_for_children` word for a kind that has no such slot is not a name
+    // on any kernel.
+    for absent in ["mnt_for_children", "ipc_for_children"] {
         let path = format!("/proc/self/ns/{absent}");
         r.check(
-            &format!("a namespace this kernel has not is ENOENT ({absent})"),
+            &format!("a name no kernel carries is ENOENT ({absent})"),
             readlink(&path).is_none() && open_ns(&path).is_none(),
         );
     }

@@ -2291,6 +2291,15 @@ fn thread_dir(pid: usize, tid: usize) -> Arc<dyn Inode> {
         NodeKind::File,
         maybe_file(move || children_of(tid)),
     );
+    // The process's control-group membership, the v2 rendering - one line,
+    // `0::<path>`, because the hierarchy has no controllers to name. It is
+    // the cgroup tree's answer, asked per task: a thread of a moved group
+    // reports it here the same moment its leader does.
+    node.add(
+        "cgroup",
+        NodeKind::File,
+        maybe_file(move || crate::vfs::cgroupfs::cgroup_line(tid)),
+    );
     // A thread sees the same mounts its process does, and asks at its own
     // name: `/proc/thread-self/mountinfo` is where a threaded program looks.
     node.add("mounts", NodeKind::File, file(mounts_text));
@@ -2649,6 +2658,15 @@ fn process_dir(slot: usize) -> Option<Arc<dyn Inode>> {
         NodeKind::File,
         maybe_file(move || status_of(slot)),
     );
+    // The process's control-group membership - the same per-task answer the
+    // thread directory carries, because a group move lands on every thread
+    // at once and both spellings report it (`/proc/<pid>/cgroup` is what
+    // `systemd-cgls` and a container runtime read first).
+    node.add(
+        "cgroup",
+        NodeKind::File,
+        maybe_file(move || crate::vfs::cgroupfs::cgroup_line(slot)),
+    );
     // `/proc/<pid>/oom_score_adj` - the OOM-killer's score adjustment, which
     // `udevd`'s workers push down on every boot so the device database is not
     // the first thing killed. Linux keeps a *pair* here: the value, and the
@@ -2823,10 +2841,11 @@ fn ns_link(pid: usize, entry: crate::vfs::ns::Entry) -> Arc<dyn Inode> {
 /// The kinds this kernel has, and *only* those: a machine built without a
 /// namespace has no entry for it either (a real kernel without `CONFIG_TIME_NS`
 /// answers `ENOENT` for `/proc/self/ns/time`), so a reader sees the names this
-/// machine can actually isolate and is told nothing it cannot check. A name that
-/// is not one of them - `ipc`, `user`, `cgroup` - is `ENOENT` from the
-/// directory, and `setns` never sees a descriptor for a namespace that does not
-/// exist.
+/// machine can actually isolate and is told nothing it cannot check. That list
+/// is now the whole of `namespaces(7)`'s eight - `cgroup` landed last, with
+/// the tree it views (`src/vfs/cgroupfs.rs`) - and a name that is not one of
+/// them is `ENOENT` from the directory, `setns` never seeing a descriptor for
+/// a namespace that does not exist.
 ///
 /// The list is of [`crate::vfs::ns::Entry`]s rather than kinds because two kinds
 /// have two names each: `pid`/`pid_for_children` and `time`/`time_for_children`

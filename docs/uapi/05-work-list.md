@@ -5676,5 +5676,8 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     still finds its queue (`t-ns-ipc`), and `drop(ns)` empties all four tables
     in `vfs::ns`'s host test.
 
-    **Named**: `CLONE_NEWCGROUP` is the last kind with nothing behind it, and it
-    waits on the cgroup tree it would isolate.
+    **Named**: `CLONE_NEWCGROUP` **landed** (2026-10-25) with the tree it
+    isolates — the eighth kind, its whole state the view-root a
+    `/proc/<pid>/cgroup` path renders from (`t-ns-cgroup`); the mount's
+    re-rooting to the view's subtree is the row's one named divergence
+    (`docs/uapi/` §1's unshare/setns row).

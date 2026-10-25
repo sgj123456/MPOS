@@ -409,8 +409,13 @@ pub fn rlimit_admit(old: Rlimit, new: Rlimit, is_root: bool) -> Result<Rlimit, i
 /// );
 /// ```
 pub fn clone_namespace_verdict(flags: usize, privileged: bool) -> Result<(), isize> {
-    const SERVED: usize =
-        CLONE_NEWUTS | CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWUSER | CLONE_NEWIPC;
+    const SERVED: usize = CLONE_NEWUTS
+        | CLONE_NEWNS
+        | CLONE_NEWPID
+        | CLONE_NEWNET
+        | CLONE_NEWUSER
+        | CLONE_NEWIPC
+        | CLONE_NEWCGROUP;
     let asked = flags & CLONE_NAMESPACES;
     // The pairs Linux itself calls *invalid*, from `clone(2)`'s ERRORS list:
     // "CLONE_NEWPID and one (or both) of CLONE_THREAD or CLONE_PARENT were
@@ -809,17 +814,19 @@ mod tests {
             Ok(()),
             "an unprivileged word carrying CLONE_NEWUSER lifts the gate for IPC too"
         );
-        // Served *and* unserved in one word: nothing is half-done, so the whole
-        // request is refused and the served kind is not quietly handed over.
-        // CGROUP is the one kind with nothing behind it, and `CLONE_NEWUSER`
-        // lifts the *gate*, not the served set.
+        // The mixing story ended where the ladder did: CGROUP was the last
+        // unserved witness these pins had, and it landed with the tree it
+        // views (2026-10-25) - the pair that used to be refused whole is a
+        // legal word now, and the unprivileged USER pair rides the same
+        // lift it always did.
         assert_eq!(
             clone_namespace_verdict(CLONE_NEWIPC | CLONE_NEWCGROUP, true),
-            Err(mpos_err::EOPNOTSUPP)
+            Ok(())
         );
         assert_eq!(
             clone_namespace_verdict(CLONE_NEWUSER | CLONE_NEWCGROUP, false),
-            Err(mpos_err::EOPNOTSUPP)
+            Ok(()),
+            "an unprivileged word carrying CLONE_NEWUSER lifts the gate for CGROUP too"
         );
         assert_eq!(
             clone_namespace_verdict(CLONE_NEWNS, false),

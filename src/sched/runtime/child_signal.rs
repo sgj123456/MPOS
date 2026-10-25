@@ -904,6 +904,48 @@ pub fn unshare_ipc() {
     set_ipc_ns(Some(crate::vfs::ns::IpcNs::fresh(current_user_ns())));
 }
 
+/// Move the running task into a cgroup namespace: the view-root becomes the
+/// group the caller is in, and `/proc/<pid>/cgroup` renders the path from
+/// there as `/`. Linux's `unshare(CLONE_NEWCGROUP)` — the namespace has no
+/// objects, so this root is the whole of its state.
+#[cfg(target_os = "none")]
+pub fn unshare_cgroup() {
+    let root = with_table(|t| {
+        let me = t.current;
+        crate::vfs::cgroupfs::ns_root(me.0)
+    });
+    with_table(|t| {
+        t.task_mut(t.current).cgroup_ns = Some(root);
+    });
+}
+
+/// The running task's cgroup view-root, when it is inside a cgroup
+/// namespace: what `/proc/<pid>/cgroup` renders its path against and what a
+/// `setns` descriptor records. `None` is the machine's own view.
+#[cfg(target_os = "none")]
+pub fn current_cgroup_root() -> Option<alloc::sync::Arc<str>> {
+    with_table(|t| t.task(t.current).cgroup_ns.clone())
+}
+
+/// Join a cgroup namespace a descriptor named: the caller's view-root
+/// becomes the descriptor's, and nothing else about the task changes - the
+/// tree underneath is still the machine's, and every membership write it
+/// makes reaches the real files.
+#[cfg(target_os = "none")]
+pub fn setns_cgroup(root: alloc::sync::Arc<str>) {
+    with_table(|t| {
+        t.task_mut(t.current).cgroup_ns = Some(root);
+    });
+}
+
+/// The cgroup view-root a *named* task carries - `/proc/<pid>/cgroup`'s
+/// rendering root, and `None` for a task that is not in the table (whose
+/// answer the caller makes the machine's own).
+#[cfg(target_os = "none")]
+pub fn task_cgroup_root_for(id: TaskId) -> Option<alloc::sync::Arc<str>> {
+    with_table(|t| t.task(id).cgroup_ns.clone())
+}
+
 /// Move the running task into a network namespace: the `clone(CLONE_NEWNET)`
 /// child's own assignment (the stack itself is `net`'s, minted before this is
 /// called, because the scheduler may not name that layer).
@@ -985,6 +1027,14 @@ pub fn ns_of(pid: usize, entry: crate::vfs::ns::Entry) -> Option<crate::vfs::ns:
     with_table(|t| {
         let task = t.tasks.get(pid).and_then(|slot| slot.as_ref())?;
         Some(match (entry.kind, entry.slot) {
+            // The view-root, `None` rendered as the machine's own: `/`. The
+            // namespace has no objects, so the path is the identity and two
+            // tasks compare by it (`docs/notes/` §6.3's rung note).
+            (crate::vfs::ns::Kind::Cgroup, _) => crate::vfs::ns::Namespace::Cgroup(
+                task.cgroup_ns
+                    .clone()
+                    .unwrap_or_else(|| alloc::sync::Arc::from("/")),
+            ),
             (crate::vfs::ns::Kind::Mount, _) => crate::vfs::ns::Namespace::Mount(
                 task.fs_ns
                     .clone()

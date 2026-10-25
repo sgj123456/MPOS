@@ -53,14 +53,14 @@ pub use runtime::{
     block_until_code, block_until_interruptible, block_until_interruptible_rolling_back,
     block_until_nanos, block_until_uninterruptible, brk, charge_cpu, check_itimer, child_event,
     child_event_pending, child_visible_to, claim_anon_gaps, clone, continued_report_pending,
-    controlling_tty_of_current, credentials_of, current, current_blocked, current_child_subreaper,
-    current_comm_bytes, current_cpu_ticks, current_credentials, current_cwd, current_cwd_path,
-    current_diskstat, current_disposition, current_exe, current_fds, current_fs_context,
-    current_groups, current_identity, current_ipc_ns, current_is_root, current_is_seccomp_strict,
-    current_is_session_leader, current_map_user, current_net_ns, current_no_new_privs,
-    current_owner, current_pdeathsig, current_pending, current_pgid, current_pid_number,
-    current_real_owner, current_rlimit, current_root, current_stack_range, current_tgid,
-    current_tid_address, current_tls, current_umask, current_user_ns, current_uts,
+    controlling_tty_of_current, credentials_of, current, current_blocked, current_cgroup_root,
+    current_child_subreaper, current_comm_bytes, current_cpu_ticks, current_credentials,
+    current_cwd, current_cwd_path, current_diskstat, current_disposition, current_exe, current_fds,
+    current_fs_context, current_groups, current_identity, current_ipc_ns, current_is_root,
+    current_is_seccomp_strict, current_is_session_leader, current_map_user, current_net_ns,
+    current_no_new_privs, current_owner, current_pdeathsig, current_pending, current_pgid,
+    current_pid_number, current_real_owner, current_rlimit, current_root, current_stack_range,
+    current_tgid, current_tid_address, current_tls, current_umask, current_user_ns, current_uts,
     deliver_pending_signal, descriptor_access, descriptor_numbers, descriptors_of, detach_traced,
     discard_exit_code, exec_replace, exit, exit_code, exit_group, fork, frames_range_free,
     get_mmap_cursor, group_members, has_children, has_deliverable_signal, has_live_child,
@@ -90,9 +90,9 @@ pub use runtime::{
     take_exit_code, take_fatal_signal, take_pending_event, take_signal_in_set, take_stop_report,
     take_vmas, task_count, thread_group_has_siblings, thread_snapshots, time_offsets, timer_alloc,
     timer_arm, timer_overrun, timer_remove, timer_state, tls_of, trace_options, trace_syscall,
-    tracer_of, try_spawn_user, uid_members, unmap_user, unshare_files, unshare_fs, unshare_ipc,
-    unshare_mnt, unshare_pid, unshare_time, unshare_user, unshare_uts, user_frame_at, user_mapped,
-    vfork, vma_gaps, vma_kind_at, vma_prot_at, vma_range_free, wait_any_child_event,
+    tracer_of, try_spawn_user, uid_members, unmap_user, unshare_cgroup, unshare_files, unshare_fs,
+    unshare_ipc, unshare_mnt, unshare_pid, unshare_time, unshare_user, unshare_uts, user_frame_at,
+    user_mapped, vfork, vma_gaps, vma_kind_at, vma_prot_at, vma_range_free, wait_any_child_event,
     wait_child_event, wait_for_interrupt, wake, with_current_credentials, write_user,
     write_user_of, yield_now,
 };
@@ -177,6 +177,9 @@ pub fn set_ipc_ns(_ns: Option<alloc::sync::Arc<crate::vfs::ns::IpcNs>>) {}
 /// exists only so a host build of the crate that names it still links.
 #[cfg(not(target_os = "none"))]
 pub fn unshare_ipc() {}
+
+#[cfg(target_os = "none")]
+pub use runtime::{setns_cgroup, task_cgroup_root_for};
 
 /// A host build has one process and no descendants, so nothing can be orphaned
 /// to it: the flag round-trips through this value and the exit path that reads

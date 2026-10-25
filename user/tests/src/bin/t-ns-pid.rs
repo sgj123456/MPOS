@@ -708,15 +708,15 @@ fn main() {
         }
     }
 
-    // ---- A word that mixes the served kind with an unserved one unshares
-    //      nothing, and PID is the served half ----
-    r.check(
-        // The unserved half is `IPC` because the word used to be `NET`, which
-        // became a served kind the moment the fourth rung landed - the drift
-        // §6.3 records over and over (a served set written down as a constant).
-        "unshare(CLONE_NEWPID|CLONE_NEWCGROUP) is EOPNOTSUPP",
-        unshare(UnshareFlags::NEWPID | UnshareFlags::NEWCGROUP) == Err(Errno::OPNOTSUPP),
-    );
+    // ---- The mixing story ended where the ladder did ----
+    //
+    // The word that used to pin "a served kind beside an unserved one is
+    // refused whole" (NEWPID beside CGROUP) is a legal pair now: every kind of
+    // `namespaces(7)` is served, `CLONE_NEWCGROUP` last. A mixed word here
+    // would move the children's slot AND re-root the view, which the single
+    // unshare below then cannot repeat - a process makes a pid namespace
+    // once - so the pair is pinned where it is born instead: `t-ns-cgroup`
+    // walks the view, and the one-per-process rule stays this file's.
 
     // ---- The caller does not move ----
     let mine = getpid();
