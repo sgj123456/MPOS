@@ -4261,3 +4261,24 @@ Two smaller things also came out of the attempt and are recorded rather than los
 the re-arming wait makes `claim_waiters` accumulate duplicates (`registrations=15465
 handed-back=13`), so registration has to become idempotent per task; and the
 unproven attempt is not landed, per the rule.
+
+**The two reclaims, and the two races they leave visible.** With both claims given
+back in full (the cache also clearing the ways a dead claim marked `loading`, the
+mailbox abandoning a claim whose owner is gone or whose completion nobody
+retired), a boot that previously carried a fill claim out for 100+ seconds with
+udev's workers queued behind it now reads
+
+    mpos: heartbeat ... fill-owner=none fill-busy=false blk-busy=false ...
+    mpos:   ... fill=5457/5457(out=0 none) run=0/0(out=0)
+
+- no claim out, nothing abandoned - and *that* boot stops back at
+`Starting udev ...`, while others reach the trigger and stop there. So the
+desktop image has (at least) two races: one around udev's own service start that
+leaves no claim behind at all, and the claim leak after the trigger that these
+reclaims close. Closing the second is what makes the first readable as what it
+is - a stall with the machine idle (two kernel slots switching, every userland
+task parked) rather than a queue behind a dead claim.
+
+The pin still owed for the reclaims is a boot self-test: leave a claim with a
+holder that has exited and assert the next asker gets the scratch. It is named
+here because it is not written yet.
