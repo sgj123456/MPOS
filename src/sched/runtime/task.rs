@@ -3378,8 +3378,28 @@ fn heartbeat() {
         let pid = super::pid::pid_number_of(TaskId(slot)).unwrap_or(0);
         let park = park_site(slot);
         let nr = last_syscall(slot);
+        // The command, copied out under the borrow: a stall that names park
+        // sites only can say *where* a task waits, never *which* task - and the
+        // post-trigger stall needs the second question answered (`docs/notes/`
+        // §7 R.9). `comm` when the task set one, else the tail of its image.
+        let mut comm = [0u8; 16];
+        let mut tail = [0u8; 40];
+        with_table(|t| {
+            if let Some(Some(task)) = t.tasks.get(slot) {
+                comm = task.mm.comm_name_bytes();
+                let exe = task.exe.as_bytes();
+                let n = exe.len().min(tail.len());
+                tail[..n].copy_from_slice(&exe[exe.len() - n..]);
+            }
+        });
+        let comm_end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+        let name = if comm_end > 0 {
+            core::str::from_utf8(&comm[..comm_end]).unwrap_or("?")
+        } else {
+            core::str::from_utf8(&tail).unwrap_or("?")
+        };
         crate::hal::kernel::print_line(format_args!(
-            "mpos:   slot {slot} pid {pid} park {park} ({}) syscall {nr} parks={}{}\n",
+            "mpos:   slot {slot} pid {pid} name={name} park {park} ({}) syscall {nr} parks={}{}\n",
             PARK_SITES.get(park as usize).copied().unwrap_or("?"),
             parks_of(slot),
             if slot == running { "  <-- running" } else { "" }

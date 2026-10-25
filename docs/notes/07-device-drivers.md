@@ -4152,3 +4152,28 @@ trigger prints a `*` line, so either sysinit's own exit or the inittab's next li
 parked slots but not their commands, and the next instrument change is therefore
 one field: **each slot's `comm` in the table**, so the stuck tasks can be named -
 `openrc`, `udevadm`, a shell or a daemon - instead of inferred from a park site.
+
+**The queue is udev's workers, and the claim's holder is a slot that is gone.**
+With each slot named in the table, the post-trigger stall reads:
+
+    mpos: heartbeat ... fill-owner=slot 6/pid 6 fill-busy=true blk-busy=true blk-waiter=none
+    mpos:   slot 10 pid 10 name=/sbin/udevd  park 8 (ext4_scratch_wait) syscall 4 parks=4121
+    mpos:   slot 11 pid 11 name=/sbin/udevd  park 8 (ext4_scratch_wait) syscall 3 parks=1670
+    ... (slots 12-17 the same, and more) ...
+    (no slot 6 in the list)
+
+Eight and more udev workers are queued on the fill scratch, the claim's recorded
+owner is slot 6, and slot 6 is not in the table. `blk-busy=true` with
+`blk-waiter=none` says the mailbox's completion was already taken by the handler,
+so what is missing is the **retirement** - the owner died between the completion
+and its own `finish_request`, leaving `BUSY` set and the fill scratch out. That is
+one event, not two: the task holding the fill is the task that died in the device
+wait.
+
+So the next question is not "which park" any more - it is **why that task dies
+inside the transfer**. The reading that answers it is three lines in the exit path
+(`sched::exit`, where the task's descriptors are released): if the dying task is
+the recorded fill owner or the mailbox's waiter, print one line with its slot,
+pid, name and the mailbox's state. One boot then says whether a *fatal signal*
+reached a task mid-transfer, or whether the "death" is a mirror that was never
+cleared.
