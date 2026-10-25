@@ -138,6 +138,22 @@ pub(crate) struct Cache {
     /// claimant would clobber.
     fill: Vec<u8>,
     fill_busy: bool,
+    /// Tasks parked on a claim they are **not** a slot of: the fill scratch,
+    /// the run scratch, or a set whose every way is in flight. Drained - and
+    /// woken outside every lock - by whichever claim ends, together with the
+    /// slots' own waiters.
+    ///
+    /// This list exists because its absence was a deadlock, measured: a task
+    /// that found the fill scratch out registered nowhere (the slot lists only
+    /// cover tasks waiting on *that block*), so when the scratch's owner ended
+    /// its fill it woke the slot's waiters and nobody else, and the scratch
+    /// waiter slept with no deadline to end it. Two background children that
+    /// `exec` a binary off this filesystem at once - each wanting a *different*
+    /// block - hung that way, every one of them in state `S` and no transfer in
+    /// flight; one child at a time was fine, which is why nothing had caught it
+    /// (`docs/notes/` §7 R.9). Waking them all on any claim's end is cheap and
+    /// correct: each re-checks its own condition and at most re-parks.
+    claim_waiters: Vec<TaskId>,
 }
 
 impl Cache {
@@ -157,6 +173,7 @@ impl Cache {
             run_busy: false,
             fill: Vec::new(),
             fill_busy: false,
+            claim_waiters: Vec::new(),
         }
     }
 
@@ -219,6 +236,14 @@ impl Cache {
         self.slots[at].waiters.push(me);
     }
 
+    /// Park `me` on the claims in general - the scratch, or a set with no
+    /// free way - as opposed to [`Cache::wait_on`]'s per-slot list. Whoever
+    /// ends any claim wakes this list, and the waiter re-checks its own
+    /// condition from the top.
+    pub(crate) fn wait_for_claim(&mut self, me: TaskId) {
+        self.claim_waiters.push(me);
+    }
+
     /// Claim a miss of one `block`: pick a way no claim uses, mark it, take
     /// the fill scratch out, and hand the whole claim back. `None` answers
     /// "not now" - the set has no free way, or the scratch is out - and the
@@ -254,6 +279,9 @@ impl Cache {
         // The read came first and the block number is recorded with the bytes:
         // a slot must never name a block it has not actually loaded.
         self.clock = self.clock.wrapping_add(1);
+        // Taken before the slot borrow: a scratch/set waiter is woken by the
+        // end of *any* claim, and the fill is one.
+        let mut woken = core::mem::take(&mut self.claim_waiters);
         let slot = &mut self.slots[claim.at];
         debug_assert!(slot.loading, "a fill ended on a slot nobody claimed");
         slot.bytes.copy_from_slice(&claim.scratch);
@@ -261,7 +289,8 @@ impl Cache {
         slot.stamp = self.clock;
         self.fill = claim.scratch;
         self.fill_busy = false;
-        core::mem::take(&mut slot.waiters)
+        woken.append(&mut slot.waiters);
+        woken
     }
 
     /// [`Cache::begin_fill`] for a caller that knows it is reading **onward**:
@@ -340,7 +369,7 @@ impl Cache {
     /// slots, end their claims, put the scratch back, and hand back everyone
     /// who parked on any of them.
     pub(crate) fn end_run(&mut self, claim: RunClaim) -> Vec<TaskId> {
-        let mut woken = Vec::new();
+        let mut woken = core::mem::take(&mut self.claim_waiters);
         for (i, &at) in claim.places[..claim.width].iter().enumerate() {
             let slot = &mut self.slots[at];
             debug_assert!(slot.loading, "a run landed on a slot nobody claimed");
@@ -807,6 +836,34 @@ mod tests {
             0,
             "the waiter's arrival asked the device for nothing"
         );
+    }
+
+    /// A task waiting for the **scratch** - not for any one block - is handed
+    /// back by the end of the claim that held it. Without this it sleeps with
+    /// no deadline to end it: measured on the desktop image, two background
+    /// children `exec`ing at once hung that way, every one of them in state
+    /// `S` with no transfer in flight (`docs/notes/` §7 R.9).
+    #[test]
+    fn a_waiter_for_the_scratch_is_released_by_a_claims_end() {
+        let (mut cache, dev) = cache_and_device(8192);
+        let claim = cache.begin_fill(7, BLOCK).expect("the claim");
+        assert!(cache.fill_busy());
+        // A second asker wants a *different* block, so it has no slot to park
+        // on - the scratch is what it waits for.
+        cache.wait_for_claim(TaskId(43));
+        assert_eq!(
+            cache.end_fill(claim),
+            alloc::vec![TaskId(43)],
+            "the scratch waiter, handed back by the fill's end"
+        );
+        // The run scratch's half of the same rule.
+        let run = cache.begin_run(&dev, 0, 4, BLOCK).expect("the run claim");
+        cache.wait_for_claim(TaskId(44));
+        assert!(
+            cache.end_run(run).contains(&TaskId(44)),
+            "the run scratch waiter, handed back by the run's end"
+        );
+        assert_eq!(dev.total(), 0, "the waiters asked the device for nothing");
     }
 
     /// The victim search must never hand out a way whose claim is in flight:

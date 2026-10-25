@@ -3658,10 +3658,21 @@ it: that arm's root is an initramfs, so no program it runs is read through the
 block device. The aarch64 arm's root *is* a disk, but no test in the suite forks
 concurrent readers.
 
-**What is owed before this is a diagnosis** (and a fix with a pin): the exact
-park/wake that is lost, chosen between the two by instrumenting them (a counter
-pair per hand-off, or moving the reproduction onto the aarch64 arm with a `t-*`
-that forks two children which exec a disk-resident binary). The desktop-image
-boot hangs because OpenRC's service machinery is exactly this shape - a parent
-that forks and execs while other execs are in flight - so the boot symptom is
-this bug's most visible face, not a separate one.
+**First candidate, found and fixed - and it was not this one.** The ext4 cache
+has two scratch buffers (one fill, one run) and a second claimant of a *different*
+block waits for the scratch to come back. That wait registered **nowhere**: the
+per-slot waiter lists only cover tasks waiting on *that block*, so the end of a
+fill drained the slot's list and left the scratch waiter asleep with no deadline
+to end it. That is a real deadlock and it is fixed in
+`vfs::ext4::cache`'s new `claim_waiters` list (the end of any claim wakes it),
+pinned by the host test `a_waiter_for_the_scratch_is_released_by_a_claims_end` -
+whose counterfactual is the old `end_fill`/`end_run`, where the assertion fails
+because the waiter is never handed back.
+
+It does **not** cure this reproduction: with that fix built in, four concurrent
+`exec`s still stop in `execve` (state `S`, no transfer in flight) and the desktop
+boot still stops at `Starting udev ...`. So the park that hangs is a third one,
+and the next instrument is the one this kernel is missing: `/proc/<pid>/wchan`
+answers a hardcoded `0`, so a stuck task cannot say *where* it sleeps. Naming the
+park site (a per-task id set at each `block_until*` call site, printed by `wchan`)
+turns this from a bisect into one `ps`.

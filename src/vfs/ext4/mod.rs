@@ -362,11 +362,18 @@ impl Core {
                     return Step::Wait;
                 }
                 if cache.fill_busy() {
+                    // Registered on the cache's claim waiters, *not* left to
+                    // sleep on a condition nobody will wake: ending a fill
+                    // wakes that list (the deadlock `claim_waiters` documents).
+                    cache.wait_for_claim(claim_park::me());
                     return Step::WaitScratch;
                 }
                 match cache.begin_fill(block, self.block_size()) {
                     Some(claim) => Step::Go(claim),
-                    None => Step::WaitSet,
+                    None => {
+                        cache.wait_for_claim(claim_park::me());
+                        Step::WaitSet
+                    }
                 }
             });
             match step {
@@ -430,11 +437,15 @@ impl Core {
                     return Step::Wait;
                 }
                 if cache.run_busy() {
+                    cache.wait_for_claim(claim_park::me());
                     return Step::WaitScratch;
                 }
                 match cache.begin_run(&*self.dev, block, want, self.block_size()) {
                     Some(claim) => Step::Go(claim),
-                    None => Step::WaitSet,
+                    None => {
+                        cache.wait_for_claim(claim_park::me());
+                        Step::WaitSet
+                    }
                 }
             });
             match step {
