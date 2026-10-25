@@ -4617,3 +4617,30 @@ crash suggested - the tracer's own desynchronisation has another cause and the n
 instrument is the *stop sequence* (how many stops per syscall a `PTRACE_SYSCALL`
 tracee produces), which the same test can measure by counting boundaries between
 the resume and the `getpid` it is waiting for.
+
+**The sequence, measured - and the stop that lied.** `t-ptrace-stops` printed the
+boundaries of a `PTRACE_SYSCALL` tracee:
+
+    stop 1: ENTRY nr=14      stop 2: EXIT rval=0
+    stop 3: ENTRY nr=39      stop 4: EXIT rval=7      (getpid, the child's pid)
+    stop 5: ENTRY nr=110     stop 6: EXIT rval=6      (getppid, the parent's)
+    stop 7: ENTRY nr=231     child finished after 7 stop(s), 4 entr(ies)
+
+So the pairs are correct, the numbers are the calls the child made, and a call that
+never returns (`exit_group`) has an entry stop and no exit stop, which is Linux's
+own shape. The desynchronisation therefore had to be a stop that is **not** a
+syscall boundary answering as if it were one - and this kernel did exactly that:
+`trace_syscall` fell back to the last call the task had entered for any other stop
+(a signal delivery, the attach's `SIGSTOP`, an exec event) and answered `ENTRY`
+with a stale number. `strace`'s startup probe sends a signal, asks for the
+structure at that stop, and **rejects** an operation that is not
+`PTRACE_SYSCALL_INFO_NONE` (its own check, quoted in `proc.rs`), then assumes the
+stops alternate - one dropped stop away from treating every return as the next
+call.
+
+The fix is one fallback removed: `trace_syscall` describes a syscall only at a
+syscall stop, and a signal stop answers `NONE`. The pin still owed is the pair
+`t-ptrace-syscall-info` was trying to be: the NONE answer at a signal stop, and the
+entry/exit pair walked *to* the call the child made (expecting `rt_sigreturn`
+first), and the smoke test is `strace /bin/true` in a guest - which is what
+motivated all of this.

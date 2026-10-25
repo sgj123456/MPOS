@@ -174,15 +174,24 @@ pub fn trace_syscall(id: TaskId) -> Option<(bool, u64, [u64; 6], u64, u64)> {
     with_table(|t| {
         let task = t.tasks.get(id.0)?.as_ref()?;
         let stop = task.trace.stop?;
-        // A stop at a syscall boundary describes itself. Any *other* stop - a
-        // signal arriving, an exec - is described by the call the tracee was in
-        // the middle of, which is the one it last entered: Linux reads that
-        // answer out of the registers, and the entry record is the same answer
-        // kept somewhere a stopped task can still be asked.
-        let entry_stop = stop.syscall.map(|syscall| syscall.entry);
-        let syscall = stop.syscall.or(task.trace.syscall)?;
+        // **Only a syscall boundary describes a syscall.** Any other stop - a
+        // signal arriving, the `SIGSTOP` an attach injects, an exec event -
+        // answers `PTRACE_SYSCALL_INFO_NONE`, which is Linux's answer and the one
+        // a tracer's startup probe demands: `strace` sends the tracee a signal,
+        // asks for this structure at that stop, and *rejects* an answer whose
+        // operation is not `NONE` - after which it stops asking and assumes the
+        // stops alternate, which is one dropped stop away from reporting every
+        // return value as the next call's number.
+        //
+        // This kernel used to describe those stops too, from the last call the
+        // task had entered (`unwrap_or(true)` - an *entry* answer with a stale
+        // number). Measured with `t-ptrace-stops`: the boundary sequence itself is
+        // correct and well paired (entry/exit for `getpid`, `getppid`, ...), so
+        // the desynchronisation had to be a stop that is not a boundary answering
+        // as if it were one. That is what this function now refuses to do.
+        let syscall = stop.syscall?;
         Some((
-            entry_stop.unwrap_or(true),
+            syscall.entry,
             syscall.nr,
             syscall.args,
             syscall.ip,
