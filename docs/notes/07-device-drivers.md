@@ -4548,3 +4548,20 @@ The next measurement is the faithful one: prepare the same pipe openrc does (a
 reader that drains slowly), export the variables openrc exports, and run the script
 with `strace` **after** fixing `PTRACE_GET_SYSCALL_INFO`'s op value, because until
 that is fixed strace cannot be the instrument for any script on this kernel.
+
+**The ptrace op, read as far as it goes without a machine.** `PTRACE_GET_SYSCALL_INFO`
+writes the operation byte from `trace_syscall(id)`, whose answer is
+`stop.syscall.entry` - set `true` by `stop_at_syscall(entry = true, ...)` and
+`false` by its exit half - and `abi::write_syscall_info` maps those to
+`PTRACE_SYSCALL_INFO_ENTRY` (1) and `..._EXIT` (2). Both halves look right in
+isolation, so the mismatch strace reports ("entering, ptrace_syscall_info.op == 2")
+is most likely a **sequence** fault rather than a field one: a stop that was never
+delivered (or was delivered twice), after which strace's state machine is one
+phase behind - and its very next report is an entry sample answered with an exit.
+
+The two candidates the code points at are the `armed` flag (a tracer re-arms it on
+resume, and `stop_at_syscall` consumes it at the stop: a resume that clears it
+without delivering a stop would drop one) and the `at_exec_exit` path, which
+returns early without a stop for a legacy tracer. Either is one boot away from an
+answer with the existing instruments - the syscall the tracee was in and the stop's
+own report are both printable - but not from this session's remaining context.
