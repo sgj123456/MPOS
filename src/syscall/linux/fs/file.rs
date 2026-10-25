@@ -3044,6 +3044,77 @@ fn deadline_in_ns(ms: u64) -> u64 {
     crate::hal::since_boot_nanos().saturating_add(ms.saturating_mul(1_000_000))
 }
 
+/// A node kind as a number, for the spin report (the numbers are this file's own
+/// vocabulary, not an ABI).
+#[cfg(target_os = "none")]
+fn node_kind_code(kind: crate::vfs::NodeKind) -> u8 {
+    match kind {
+        crate::vfs::NodeKind::File => 0,
+        crate::vfs::NodeKind::Dir => 1,
+        crate::vfs::NodeKind::Symlink => 2,
+        crate::vfs::NodeKind::CharDev => 3,
+        crate::vfs::NodeKind::BlockDev => 4,
+        crate::vfs::NodeKind::Fifo => 5,
+        crate::vfs::NodeKind::Socket => 6,
+        crate::vfs::NodeKind::Anon { .. } => 7,
+    }
+}
+
+/// Say one line when a task is told the same descriptor is ready, over and over.
+///
+/// `poll`'s default readiness is `Ready::ALL` - a node that never blocks is
+/// always ready - so a caller that polls such a descriptor and does not consume
+/// what it is told is a spin, not a wait: the desktop boot's remaining stall is
+/// `openrc-run` polling its own stdin with no timeout while nothing makes progress
+/// (`docs/notes/` §7 R.9). The line carries what the distinction needs: the fd,
+/// its kind, the events asked for, and the readiness actually reported - an
+/// always-ready file reads `read=true`, an unconsumed hang-up reads `hup=true`.
+#[cfg(target_os = "none")]
+fn note_poll_spin(
+    me: crate::sched::policy::TaskId,
+    fds: usize,
+    nodes: &[Option<PollWatch>],
+    nfds: usize,
+) {
+    use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering};
+    static LAST_FD: [AtomicI32; 64] = [const { AtomicI32::new(-2) }; 64];
+    static RUN: [AtomicU16; 64] = [const { AtomicU16::new(0) }; 64];
+    static SPOKEN: [AtomicBool; 64] = [const { AtomicBool::new(false) }; 64];
+    if nfds == 0 || me.0 >= 64 {
+        return;
+    }
+    let fd = unsafe { (fds as *const i32).read_unaligned() };
+    let previous = LAST_FD[me.0].load(Ordering::Relaxed);
+    if previous != fd {
+        LAST_FD[me.0].store(fd, Ordering::Relaxed);
+        RUN[me.0].store(1, Ordering::Relaxed);
+        return;
+    }
+    let run = RUN[me.0].fetch_add(1, Ordering::Relaxed) + 1;
+    if run != 100 || SPOKEN[me.0].swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let events = unsafe { ((fds + POLLFD_EVENTS) as *const i16).read_unaligned() };
+    let (kind, read, write, hup, err) = match nodes.first().and_then(|watch| watch.as_ref()) {
+        Some(watch) => {
+            let node = watch.node.as_ref();
+            let ready = node.poll_ready_client(watch.ofd);
+            (
+                node_kind_code(node.metadata().kind),
+                ready.read,
+                ready.write,
+                node.poll_hup(),
+                node.poll_err(),
+            )
+        }
+        None => (u8::MAX, false, false, false, false),
+    };
+    crate::hal::kernel::print_line(format_args!(
+        "mpos: poll spin slot={} fd={fd} events={events:#x} kind={kind} read={read} write={write} hup={hup} err={err}",
+        me.0
+    ));
+}
+
 /// The wait [`poll`] and [`ppoll`] are both made of, with the timeout already
 /// turned into the instant it names.
 fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
@@ -3095,6 +3166,8 @@ fn poll_wait(args: [usize; ARG_COUNT], deadline: Option<u64>) -> isize {
     let ready: isize = loop {
         let count = check_ready(fds, &nodes);
         if count > 0 {
+            #[cfg(target_os = "none")]
+            note_poll_spin(me, fds, &nodes, nfds);
             break count as isize;
         }
         let expired = deadline.is_some_and(|end| crate::hal::since_boot_nanos() >= end);

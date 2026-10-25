@@ -4366,3 +4366,23 @@ tells an always-ready file from a hang-up nobody consumed.
 
 The temporary per-task argument dump was removed after its reading; this note is
 what survives of it, because debug output does not ship.
+
+**The spin detector, and the reading that moves the question to fd 0.** The poll
+side now says one line when a task is told the same descriptor is ready a hundred
+times over:
+
+    mpos: poll spin slot=7 fd=0 events=0x1 kind=0 read=true write=true hup=false err=false
+
+Slot 7 is `openrc-run` running `/etc/init.d/udev`, the descriptor is **fd 0**, the
+node is a plain **File** (`kind=0`), and the answer is *ready* with no hang-up - so
+the kernel is behaving as Linux does (a regular file is always pollable), and the
+spin is the caller's loop over a descriptor that is always ready.
+
+So the remaining question is not poll's answer but **what fd 0 is** for
+`openrc-run`: on a Linux boot the sysinit action's stdin is a tty (busybox init
+opens the console), where a read blocks; here it is a node this kernel calls a
+plain file and that is always ready, so a read returns end-of-file at once and the
+loop turns. The next measurement is that descriptor's identity - inode number, the
+filesystem it belongs to and its size - printed once beside the spin line, which
+says whether it is the script, `/dev/null`, or a console node this tree serves as a
+file.
