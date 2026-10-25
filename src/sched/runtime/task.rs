@@ -99,6 +99,23 @@ pub static FILL_OWNER: core::sync::atomic::AtomicUsize =
 pub static RUN_OWNER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(usize::MAX);
 
+/// The ext4 cache's two scratch flags, mirrored here for the heartbeat: the
+/// cache owns them, and a boot that stalls on one has to be readable from the
+/// wire without the scheduler reaching into the filesystem (`docs/notes/` §7 R.9
+/// - the reading that made this necessary was a waiter asleep at
+/// `ext4_scratch_wait` while the owners said none, which only a *flag* answer can
+/// settle).
+pub static EXT4_FILL_BUSY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub static EXT4_RUN_BUSY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Mirror the ext4 cache's scratch flags.
+pub fn note_ext4_scratch(fill: bool, run: bool) {
+    EXT4_FILL_BUSY.store(fill, Ordering::Relaxed);
+    EXT4_RUN_BUSY.store(run, Ordering::Relaxed);
+}
+
 /// Record (or clear, with `None`) the fill scratch's holder.
 pub fn note_fill_owner(slot: Option<usize>) {
     FILL_OWNER.store(slot.unwrap_or(usize::MAX), Ordering::Relaxed);
@@ -3187,7 +3204,9 @@ fn heartbeat() {
         })
         .unwrap_or_else(|| "none".into());
     crate::hal::kernel::print_line(format_args!(
-        "mpos: heartbeat age={age}ms fill-owner={fill} run-owner={run} -- live slots:\n"
+        "mpos: heartbeat age={age}ms fill-owner={fill} run-owner={run} fill-busy={} run-busy={} -- live slots:\n",
+        EXT4_FILL_BUSY.load(Ordering::Relaxed),
+        EXT4_RUN_BUSY.load(Ordering::Relaxed)
     ));
     for slot in 0..MAX_TASKS {
         let live = with_table(|t| {

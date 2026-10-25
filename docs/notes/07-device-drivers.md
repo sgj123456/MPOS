@@ -3866,3 +3866,25 @@ therefore not another "who" but a pair of counters: how many tasks registered on
 `claim_waiters` and how many were handed back, plus a mirror of the two flags in
 the heartbeat - a slot parked at 8 with a false flag and a registration the
 drainer never saw is that window, printed.
+
+**The flags are false while the waiter sleeps: a lost wake, proven.** The
+heartbeat now mirrors both scratch flags (the cache writes them beside the owner
+records). The stall reads:
+
+    mpos: heartbeat age=1ms fill-owner=none run-owner=none fill-busy=false run-busy=false
+    mpos:   slot 9 pid 9 park 8 (ext4_scratch_wait) syscall 21
+
+Both flags false, no owner, and a task asleep on the wait whose condition is
+`!fill_busy()` / `!run_busy()`. A park primitive entered now would return at its
+first check, so the task is not waiting for anything: **the wake it needed was
+lost**, and every reasoning that follows has to start there rather than at "a
+claim outlived its holder".
+
+Where the wake can be lost is now a short list, and the next reading is the one
+that shortens it to one line: a **registered/drained counter pair** on the
+cache's `claim_waiters` (how many tasks registered, how many the drainer handed
+back). If they differ while a slot sleeps as above, the registration never
+reached the drainer - the window between `wait_for_claim` (under the cache
+borrow) and the park; if they are equal, the wake *was* handed to a task that was
+running at the time and the bug is in the park's own re-check. Both are one boot
+away, and the fix follows from which one it is.

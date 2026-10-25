@@ -162,6 +162,17 @@ fn in_transfer(_id: crate::sched::policy::TaskId) -> bool {
     false
 }
 
+/// Mirror both scratch flags into the scheduler's statics for the heartbeat,
+/// called with the cache's answer after every take and every give-back.
+fn mirror_scratch(fill: bool, run: bool) {
+    #[cfg(target_os = "none")]
+    crate::sched::note_ext4_scratch(fill, run);
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = (fill, run);
+    }
+}
+
 /// Record (or clear) the ext4 fill scratch's holder in the scheduler's two
 /// statics, so the hung-boot heartbeat can name it (`docs/notes/` §7 R.9).
 fn note_fill_owner(slot: Option<usize>) {
@@ -466,6 +477,7 @@ impl Core {
                 Step::Go(mut claim) => {
                     let me = claim_park::me();
                     note_fill_owner(Some(me.0));
+                    mirror_scratch(true, false);
                     set_in_transfer(me, true);
                     self.dev.read_at(claim.offset(), claim.scratch_mut());
                     set_in_transfer(me, false);
@@ -474,6 +486,7 @@ impl Core {
                         cache.end_fill(claim)
                     });
                     note_fill_owner(None);
+                    mirror_scratch(false, false);
                     // Outside every lock, the way every wake is handed.
                     claim_park::wake(woken);
                     return;
@@ -547,12 +560,14 @@ impl Core {
                 Step::Go(mut claim) => {
                     let me = claim_park::me();
                     note_run_owner(Some(me.0));
+                    mirror_scratch(false, true);
                     self.dev.read_at(claim.offset(), claim.scratch_mut());
                     let woken = critical_section::with(|cs| {
                         let mut cache = self.cache.borrow(cs).borrow_mut();
                         cache.end_run(claim)
                     });
                     note_run_owner(None);
+                    mirror_scratch(false, false);
                     // Outside every lock, the way every wake is handed.
                     claim_park::wake(woken);
                     return;
