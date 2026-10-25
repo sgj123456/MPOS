@@ -4006,3 +4006,18 @@ count climbs ~700/s). The claim path is now correct; the block transfer inside i
 is the next suspect, and the heartbeat already names the owner - so the next
 measurement is that task's park site from the slot table (site 4, the mailbox, or
 elsewhere) and then the mailbox's completion path.
+
+**What the next stall is, read off the same table.** During udev-trigger's stall
+the slot table names it:
+
+    mpos:   slot 9 pid 9 park 4 (block_until_uninterruptible) syscall 59 parks=1915
+    mpos: heartbeat ... fill-owner=slot 9/pid 9 fill-busy=true
+
+syscall 59 is `execve`, and pid 9 is inside one, holding the fill scratch, with
+**1915 parks** recorded - it is parking and waking over and over rather than
+finishing the transfer. The claim list is balanced and every claim wake hits, so
+the hand-off to the task is working; what does not happen is the *device
+transfer* the fill is waiting for. The next suspect is therefore the block
+mailbox's completion path (the request-submit / used-ring / wake half), not the
+ext4 claim: a transfer that is never retired would park its reader for ever while
+everything else in the machine wakes normally, which is what the counters show.
