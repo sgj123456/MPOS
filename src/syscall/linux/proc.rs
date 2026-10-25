@@ -562,6 +562,7 @@ pub(super) fn handle_wait(args: [usize; ARG_COUNT], from_user: bool) -> isize {
     if let Some(retired) = crate::sched::take_retired_current(id) {
         return finish_wait(
             id,
+            &retired.numbers,
             retired.code,
             retired.dumped,
             (retired.utime, retired.stime),
@@ -599,11 +600,21 @@ fn finish_wait_event(
         crate::sched::WaitEvent::Exited {
             id,
             code,
+            numbers,
             dumped,
             utime,
             stime,
             ..
-        } => finish_wait(id, code, dumped, (utime, stime), status, rusage, from_user),
+        } => finish_wait(
+            id,
+            &numbers,
+            code,
+            dumped,
+            (utime, stime),
+            status,
+            rusage,
+            from_user,
+        ),
         // `traced` is `waitid`'s question, not this door's: the status word
         // `WSTOPSIG`/`WIFSTOPPED` read says "stopped" either way, and a traced
         // stop's `PTRACE_EVENT_*` is what carries the rest.
@@ -616,6 +627,7 @@ fn finish_wait_event(
             ..
         } => write_wait_status(
             id,
+            &[],
             abi::stop_status(signal, event),
             (utime, stime),
             status,
@@ -624,6 +636,7 @@ fn finish_wait_event(
         ),
         crate::sched::WaitEvent::Continued { id, utime, stime } => write_wait_status(
             id,
+            &[],
             abi::CONTINUED_STATUS,
             (utime, stime),
             status,
@@ -637,6 +650,7 @@ fn finish_wait_event(
 /// counterpart of [`finish_wait`] for the two events that are not a death.
 fn write_wait_status(
     id: TaskId,
+    numbers: &[(u64, u32)],
     word: i32,
     cpu: (u64, u64),
     status: usize,
@@ -651,16 +665,33 @@ fn write_wait_status(
     }
     match write_wait_rusage(rusage, cpu, from_user) {
         Some(e) => e,
-        None => wait_answer(id),
+        None => pid_answer(id, numbers),
     }
 }
 
-/// The pid a `wait` answers with: the child's number **in the caller's
-/// namespace**. This is the one place both wait shapes answer a pid - `wait4`'s
-/// return value and `waitid`'s record go through it - so the number a parent
-/// reads is the number it can use in `kill`, and a parent one level out reads
-/// the number it can see rather than the child's own.
-fn wait_answer(id: TaskId) -> isize {
+/// The number a **process door** answers with: the child's pid in the
+/// **caller's** namespace.
+///
+/// One helper for every door that hands a number back - `fork`/`vfork`'s and
+/// `clone`/`clone3`'s return value, `wait4`'s return value and `waitid`'s
+/// `si_pid` - because they are one question, and because a caller uses the
+/// number one of them gave it in another: `kill(fork())` must work, and
+/// `wait` must report what `fork` answered.
+fn pid_answer(id: TaskId, numbers: &[(u64, u32)]) -> isize {
+    // A death answers off its **record**: by the time a `wait` reads it the
+    // slot is reaped and `pid_number_of` has nothing left to ask, so the record
+    // carries the numbers per namespace level (`crate::sched::Retired::numbers`)
+    // and this picks the level the caller stands at. Measured on a current host
+    // inside a fresh pid namespace (`.workbuddy/probe_pid_numbers.c`): `fork`
+    // answers `2`, `wait4(-1)` reports `2`, and a `CLONE_NEWPID` child reads
+    // `1` to itself while the parent's `wait` reports the parent's number.
+    let reader = crate::sched::current_pid_ns_id();
+    if let Some((_, number)) = numbers.iter().find(|(ns, _)| *ns == reader) {
+        return *number as isize;
+    }
+    // A stop or a resume names a child that is still in the table, and a record
+    // made before the chains were kept carries none: both ask the live task,
+    // which is the number every pid door answered before records carried it.
     crate::sched::pid_number_of(id).map_or(id.0 as isize, |n| n as isize)
 }
 
@@ -680,6 +711,7 @@ fn wait_answer(id: TaskId) -> isize {
 /// collected. Measured, `.workbuddy/probe_wait4_rusage.c` scenario N.
 fn finish_wait(
     id: TaskId,
+    numbers: &[(u64, u32)],
     code: isize,
     dumped: bool,
     cpu: (u64, u64),
@@ -697,7 +729,7 @@ fn finish_wait(
     }
     match write_wait_rusage(rusage, cpu, from_user) {
         Some(e) => e,
-        None => wait_answer(id),
+        None => pid_answer(id, numbers),
     }
 }
 
@@ -1955,10 +1987,19 @@ pub(super) fn handle_fork(nr: u64, _args: [usize; ARG_COUNT], regs_ptr: *mut ())
     } else {
         crate::sched::fork(&ctx)
     };
-    if child > 0 {
-        tell_tracer_of_child(regs_ptr);
+    if child <= 0 {
+        return child;
     }
-    child
+    tell_tracer_of_child(regs_ptr);
+    // The answer is the child's number **in the caller's namespace** - what a
+    // `wait` will report and what `kill` accepts - and not the scheduler's
+    // slot. Measured on a current host before this was fixed
+    // (`.workbuddy/probe_pid_numbers.c`, inside a fresh pid namespace): `fork`
+    // answers `2` for a child whose own `getpid` is `2`, and a `wait4(-1)`
+    // reports `2` as well. A parent *outside* the namespace cannot see the
+    // difference (its number and the slot coincide), which is why nothing had
+    // caught this.
+    pid_answer(TaskId(child as usize), &[])
 }
 
 /// Tell the tracer, if there is one, that this task has just made a child.
@@ -2082,17 +2123,22 @@ fn handle_clone_impl(args: [usize; ARG_COUNT], regs_ptr: *mut ()) -> isize {
     if child < 0 {
         return child;
     }
-
-    // CLONE_PARENT_SETTID: the child's tid goes into the *parent's* memory, so
-    // the write happens here, before the child has run.
+    // The number this door answers with, and the one `CLONE_PARENT_SETTID`
+    // stores, are the same question: the child's pid **in the caller's**
+    // namespace. Measured on a current host (`.workbuddy/probe_pid_numbers.c`):
+    // a `clone(CLONE_NEWPID|CLONE_PARENT_SETTID)` child is `1` to itself, the
+    // parent's word says the parent's number for it, and a `wait4(-1)` reports
+    // that same number - so all three agree, which is what lets one door's
+    // answer be used in another's call.
+    let number = pid_answer(TaskId(child as usize), &[]);
     if flags & nr::CLONE_PARENT_SETTID != 0 {
-        unsafe { (parent_tid as *mut i32).write_unaligned(child as i32) };
+        unsafe { (parent_tid as *mut i32).write_unaligned(number as i32) };
     }
     // The tracer announcement is a no-op for a task no tracer has touched,
     // which is every task on a machine without one: `tell_tracer_of_child`
     // finds no pending event and returns.
     tell_tracer_of_child(regs_ptr);
-    child
+    number
 }
 
 /// `clone3(args, size)` - `clone` with an extensible argument struct, and the
@@ -2230,6 +2276,9 @@ pub(super) fn handle_clone3(args: [usize; ARG_COUNT], regs_ptr: *mut (), from_us
     if child < 0 {
         return child;
     }
+    // The answer and the `CLONE_PARENT_SETTID` word: both the child's number in
+    // the **caller's** namespace (`clone`'s tail carries the measurement).
+    let number = pid_answer(TaskId(child as usize), &[]);
 
     // `CLONE_PARENT_SETTID`: the child's number goes into the caller's memory,
     // before the child has run. A destination the caller cannot write is skipped
@@ -2238,7 +2287,7 @@ pub(super) fn handle_clone3(args: [usize; ARG_COUNT], regs_ptr: *mut (), from_us
         && plan.parent_tid != 0
         && buffer_ok(plan.parent_tid, 4, true, from_user)
     {
-        unsafe { (plan.parent_tid as *mut i32).write_unaligned(child as i32) };
+        unsafe { (plan.parent_tid as *mut i32).write_unaligned(number as i32) };
     }
     // `CLONE_PIDFD`: the descriptor is minted after the child exists, because a
     // pidfd names a task that is there - and it is written before this returns,
@@ -2266,7 +2315,7 @@ pub(super) fn handle_clone3(args: [usize; ARG_COUNT], regs_ptr: *mut (), from_us
     // same call the legacy door makes, so a tracer watching `PTRACE_O_TRACEFORK`
     // sees a `clone3` child the way it sees a `fork` one.
     tell_tracer_of_child(regs_ptr);
-    child
+    number
 }
 
 /// Send a signal to a process, or to a whole process group. Used by `kill` and
@@ -4674,7 +4723,7 @@ pub(super) fn handle_waitid(args: [usize; ARG_COUNT], from_user: bool) -> isize 
         let written = match &answer.reported {
             Some(reported) => abi::write_waitid_info(
                 infop,
-                wait_answer(reported.child) as u32,
+                reported.number as u32,
                 reported.uid,
                 reported.si_code,
                 reported.status,
@@ -4715,7 +4764,10 @@ impl WaitIdAnswer {
 
 /// One collected event, already in the vocabulary `siginfo_t` speaks.
 struct Reported {
-    child: TaskId,
+    /// The child's number in the **caller's** namespace - what `si_pid` says,
+    /// off the record for a death (`wait_answer`) and off the live task for a
+    /// stop or a resume.
+    number: isize,
     si_code: i32,
     status: i32,
     uid: u32,
@@ -4895,13 +4947,20 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
         crate::sched::WaitEvent::Exited {
             id,
             code,
+            numbers,
             uid,
             dumped,
             utime,
             stime,
         } => {
             let (si_code, status) = abi::exit_chld(code, dumped);
-            (id, si_code, status, uid, (utime, stime))
+            (
+                pid_answer(id, &numbers),
+                si_code,
+                status,
+                uid,
+                (utime, stime),
+            )
         }
         // A stop under a tracer and a stop for the parent are two codes
         // (measured: `CLD_TRAPPED` and `CLD_STOPPED`), and the event's own word
@@ -4915,14 +4974,14 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
             stime,
             ..
         } => (
-            id,
+            pid_answer(id, &[]),
             if traced { CLD_TRAPPED } else { CLD_STOPPED },
             signal as i32,
             live_uid(id),
             (utime, stime),
         ),
         crate::sched::WaitEvent::Continued { id, utime, stime } => (
-            id,
+            pid_answer(id, &[]),
             CLD_CONTINUED,
             signal::SIGCONT as i32,
             live_uid(id),
@@ -4933,7 +4992,7 @@ fn waitid_collect(idtype: usize, id: isize, options: usize) -> WaitIdAnswer {
     WaitIdAnswer {
         code: 0,
         reported: Some(Reported {
-            child,
+            number: child,
             si_code,
             status,
             uid,

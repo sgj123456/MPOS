@@ -3545,3 +3545,71 @@ the machine reaching `=== END`; host unit suite **1120 tests, 0 failed**;
 `t-cgroupfs`'s **38** `ok:` lines byte-identical on both machines, and its first
 gate run failed exactly three claims — the `EBADF` ones, expected value written
 as `ENOTDIR`'s 20 instead of `EBADF`'s 9, which is the pin doing its job.
+
+### 6.27 The pid a door answers with is the caller's namespace's (LANDED 2026-10-25)
+
+Item 106's own pin found this, and named it there rather than working around it
+silently. Inside a pid namespace, every door that hands a pid back answered the
+**scheduler's task slot**: `fork`/`vfork`, `clone` and `clone3`'s return value,
+`wait4`'s return value and `waitid`'s `si_pid`.
+
+**Why no pin had caught it.** A parent *outside* a pid namespace reads the
+child's number in the parent's namespace, and for the init namespace a task's
+number **is** its slot - so the two agree and every existing claim
+(`t-ns-pid`, `t-wait4`, `t-waitid`) was green. The shape that fails is a parent
+**inside** the namespace, which is what a container's own process is: it got a
+number no other call accepts, so the child it had just created could not be
+killed, waited for, or found in `/proc` by it. Measured in the gate before the
+fix: a child whose own `getpid()` was `2` was announced by its parent's `fork`
+as `9`, and `waitpid(2)` answered `9` for it.
+
+**Measured on a current host first** (`.workbuddy/probe_pid_numbers.c`, Linux
+7.2.11, the probe standing as pid 1 of a fresh pid namespace, so every number is
+small enough to read):
+
+```text
+fork                       parent 2   child getpid 2   wait4(-1) 2
+clone3                     return 5   child getpid 5   wait4(-1) 5
+waitid(P_PID, 6)           si_pid 6
+clone(PARENT_SETTID)                parent's word 3   child getpid 3
+clone(NEWPID|PARENT_SETTID)         parent's word 4   child getpid 1   wait4(-1) 4
+clone(NEWPID|CHILD_SETTID)          child's word  1   (its own getpid)
+```
+
+So the doors answer the child's number **in the caller's namespace**, and the
+two `SETTID` words are deliberately *not* the same number: the parent's word is
+the parent's number for the child (4, not the child's own 1), while the child's
+own word is its own number (1). A first guess had both as the child's own; the
+probe corrected it.
+
+**The landing.** One helper, `pid_answer`, answers every door - they are one
+question, and a caller uses one door's answer in another's call (`kill(fork())`
+must work, and `wait` must report what `fork` answered). It reads the number
+off the live task where there is one, and off the **record** for a death: by the
+time a `wait` reads a record the slot is reaped and the pid registration with
+it, so `Retired` carries `numbers` - one `(namespace, number)` pair per level of
+the child's chain (`crate::pidns::numbered_chain`) - exactly as it already
+carries `pgid`, `uid` and the CPU for the same reason. `CLONE_PARENT_SETTID`'s
+write is that same answer; `CLONE_CHILD_SETTID`'s is `own_pid_number`, the
+child's number in its own namespace.
+
+**Pins.** The new **`t-pid-numbers`**, **4 claims**, green on a real host first
+and `ok:` for `ok:` identical on both machines: fork's answer / the child's own
+number / the wait's report are one number; `CLONE_PARENT_SETTID` carries the
+child's number in the caller's namespace; the asymmetric nested pair (child `1`
+to itself, the parent's SETTID word and wait the parent's number, the child's own
+SETTID word `1`); and `waitid(P_PID)`'s `si_pid`. And **`t-kill-all` loses its
+workaround**, which is the second half of the evidence: item 106's pin had to
+carry each child's own `getpid` down a pipe and reap children by "any" to avoid
+this bug; it now names them by `fork`'s answer and waits by that number, so the
+pin depends on the fixed contract instead of dodging the broken one.
+
+**Gate**: x86_64 `pass=210 fail=0` (210 built), aarch64 `pass=209 fail=0` (209
+built), `mpos-kunit 32 passed, 0 failed` on both; host unit suite 1121 tests / 0
+failed; `t-pid-numbers`' and `t-kill-all`'s `ok:` lines byte-identical on both
+machines.
+
+**Named.** `t-ns-pid`'s parent-side claims are unchanged - they pin the
+outside-parent shape, which was always right. `pid_answer` keeps a slot fallback
+for a record made before the chains were kept and for a task outside the
+caller's chain; no door in the ABI can produce the second.

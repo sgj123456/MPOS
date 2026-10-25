@@ -1312,7 +1312,15 @@ are not restated in the phase sections above.
         scheduler. The discipline is §6.22's - an observation with its readings, a re-run before
         believing it; two readings at the same site is where a diagnosis starts, and the
         difference between the two `FAR`s (one page apart, both past the image) is the first
-        datum in it.
+        datum in it. **Third reading, same day, item 107's gate**: a six-lane arm, lane 2, the
+        same check and the same shape once more - `ESR_EL1 0x96000047` (EC 0x25), `FAR_EL1
+        0xffffffff802d9000` (a third page, again the image's tail), `ELR_EL1` again inside
+        `pl011`'s loop - while the sibling five lanes and the whole x86_64 arm were green, and the
+        re-run of the full gate was green on both machines. The change under test touches pid
+        numbering and signal fan-out and runs nowhere near the boot's EL0 check, so this is the
+        same observation rather than a regression; three readings at one site is where the
+        discipline says a diagnosis is owed, and what is missing is a reproduction that does not
+        depend on host load.
   - [x] 13.19 `reboot(2)` answers Linux's shape on **both** machines - two mechanisms behind one
         symptom, and the symptom was on every aarch64 boot.
         **What was seen.** `mpos: syscall 142 -> ENOSYS`, once, between the kernel's handoff and the

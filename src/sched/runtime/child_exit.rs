@@ -270,9 +270,15 @@ pub fn exit(code: isize) -> ! {
         // (scenario D). A thread that is not last records nothing at all.
         if group_dead {
             let leader = t.task(tgid);
+            // The numbers this process is known by at every level of its own
+            // chain, taken while the slot still owns them: a `wait` answers
+            // the number **its** namespace gives, and by the time it reads the
+            // record the registration is gone (`Retired::numbers`).
+            let numbers = crate::sched::pid_chain_of(tgid);
             record_retired(Retired {
                 id: tgid,
                 code,
+                numbers,
                 pgid: leader.pgid,
                 // Which kind of child this was, for the `__WCLONE`/`__WALL`
                 // half of a wait's option word (`ChildKind`) - the record is
@@ -647,7 +653,7 @@ pub(crate) fn take_retired_for(t: &Table, id: TaskId, me: TaskId) -> Option<Reti
         }
         if retired[at].tracer == Some(me) {
             retired[at].tracer = None;
-            return Some(retired[at]);
+            return Some(retired[at].clone());
         }
         Some(retired.remove(at))
     })
@@ -2118,8 +2124,15 @@ pub(crate) extern "C" fn task_entry(slot: usize) -> ! {
         // waiting where the child can read it. This runs on the child's address
         // space - the dispatcher has already loaded it - so the write lands
         // exactly where the caller asked.
+        //
+        // The number is the child's **own namespace's**: Linux stores
+        // `task_pid_vnr(p)`, so a `CLONE_NEWPID` child reads `1` while its
+        // parent's `CLONE_PARENT_SETTID` word and `fork` answer carry the
+        // parent's number for it (measured, `.workbuddy/probe_pid_numbers.c`,
+        // Linux 7.2.11: word `1`, parent's word and wait `8`).
         if child_tid != 0 {
-            unsafe { (child_tid as *mut i32).write_volatile(slot as i32) };
+            let mine = crate::sched::own_pid_number(TaskId(slot));
+            unsafe { (child_tid as *mut i32).write_volatile(mine as i32) };
         }
         // A forked child: come back from the `fork` call its parent made, with
         // `rax` zero. One way door, exactly as below.
@@ -2206,6 +2219,7 @@ fn scan_child_event(
             .map(|retired| WaitEvent::Exited {
                 id: retired.id,
                 code: retired.code,
+                numbers: retired.numbers.clone(),
                 uid: retired.uid,
                 dumped: retired.dumped,
                 utime: retired.utime,
@@ -2236,6 +2250,7 @@ fn take_event(t: &mut Table, event: WaitEvent) -> Option<WaitEvent> {
             Some(WaitEvent::Exited {
                 id,
                 code: retired.code,
+                numbers: retired.numbers,
                 uid: retired.uid,
                 dumped: retired.dumped,
                 utime: retired.utime,
@@ -2485,6 +2500,7 @@ pub fn block_until_child_event(
         Some(retired) => WaitPark::Event(WaitEvent::Exited {
             id,
             code: retired.code,
+            numbers: retired.numbers,
             uid: retired.uid,
             dumped: retired.dumped,
             utime: retired.utime,

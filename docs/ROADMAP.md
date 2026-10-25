@@ -538,6 +538,26 @@ tests hold the modes, the descriptor's three answers and the path questions in
 machine's (the prior rung's divergence), and the tree has no delegation, so a
 nested namespace owner is refused where Linux would let it through (§6.26).
 
+**Every pid door answers the caller's namespace's number, and a `CLONE_NEWPID` child's two `SETTID` words are not the same number**
+(`docs/uapi/` §5.1 item 107, landed 2026-10-25). Found by item 106's own pin and named there rather
+than hidden: inside a pid namespace, `fork`/`vfork`, `clone` and `clone3`'s return value, `wait4`'s
+return value and `waitid`'s `si_pid` all answered the scheduler's **task slot**. A parent outside
+the namespace cannot see it (the slot *is* its number), which is why every existing claim was
+green; a parent inside one - a container's own process - got a number no other call accepts.
+Measured whole on a current host first (`.workbuddy/probe_pid_numbers.c`, Linux 7.2.11): `fork`
+answers the child's number in the caller's namespace and `wait4(-1)` reports it; `clone3` likewise;
+`waitid(P_PID, 6)` reports 6; and the two `SETTID` words are deliberately different - the
+**parent's** word carries the child's number in the parent's namespace (4 for a `CLONE_NEWPID`
+child whose own `number` is 1) while the **child's** own word carries its own namespace's number
+(1). Served by one `pid_answer` helper for every door (they are one question, and a caller uses one
+door's answer in another's call), `own_pid_number` for the child's word, and a `Retired::numbers`
+chain on the exit record - the number has to be carried per namespace level, with the namespace's
+identity, because by the time a `wait` reads a death the slot and its registration are gone.
+Pins: the new `t-pid-numbers` (4 claims), and `t-kill-all` **loses the workaround** item 106's pin
+needed - it names children by `fork`'s answer and waits by that number again, which is the second
+half of the evidence. Named: `t-ns-pid`'s outside-parent claims are unchanged and still right; the
+slot fallback in `pid_answer` survives only for records made before the chains were kept.
+
 **A stream's receive buffer is its window, and a listener hands it to the socket it accepts**
 (`docs/uapi/` §5.1 item 98, landed 2026-10-21): item 58 made `SO_RCVBUF` Linux's number, but on a
 stream the number governed nothing — a listener's option stayed on the listener and every accepted

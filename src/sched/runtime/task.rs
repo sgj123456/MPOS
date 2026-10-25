@@ -313,10 +313,23 @@ pub enum SpawnError {
 pub type Redirect = (RawFd, RawFd);
 
 /// One collected-death record.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Retired {
     pub(crate) id: TaskId,
     pub(crate) code: isize,
+    /// The pid numbers the dead process had at every level of its namespace
+    /// chain, each with the identity of the namespace that gave it
+    /// (`crate::sched::pid_chain_of`), outermost first.
+    ///
+    /// Carried for `pgid`'s reason and one more: the slot is free by the time a
+    /// `wait` reads the record, so `pid_number_of` has nothing left to ask, and
+    /// a `wait` must answer the number **the reader's** namespace gives - a
+    /// parent one level out and a parent at the root read two different
+    /// numbers for the same child. Measured on a current host inside a fresh
+    /// pid namespace (`.workbuddy/probe_pid_numbers.c`): `fork` answers `2`,
+    /// `wait4(-1)` reports `2`, and a `CLONE_NEWPID` child reads `1` to itself
+    /// while its parent's `wait` reports the parent's number.
+    pub(crate) numbers: alloc::vec::Vec<(u64, u32)>,
     /// The process group this task was in when it exited.
     ///
     /// Carried here rather than looked up because the slot is free by the time
@@ -2309,7 +2322,7 @@ impl ChildKind {
 /// 7.2.9 - a stop, a `waitid(WSTOPPED)` and a resume each fill it). A death
 /// carries it off the record, where the group is gone; a stop or a resume reads
 /// the still-live group.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum WaitEvent {
     /// A death to collect.
     ///
@@ -2324,6 +2337,10 @@ pub enum WaitEvent {
     Exited {
         id: TaskId,
         code: isize,
+        /// The dead process's numbers per namespace level, off the record -
+        /// see [`Retired::numbers`]. The slot is gone by the time a caller
+        /// reads this event, so the record is the only carrier.
+        numbers: alloc::vec::Vec<(u64, u32)>,
         uid: u32,
         dumped: bool,
         /// The death's CPU, off the record - see the enum's own note.

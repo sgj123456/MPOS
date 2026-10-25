@@ -25,9 +25,13 @@
 //! program safe to host-run: an unguarded `kill(-1)` on a development host
 //! would signal every process of the runner's user.
 //!
-//! The handler counts with an atomic because a signal handler may not lock; the
-//! counter is process-private, so a forked child reads its own copy and a
-//! process's threads share one.
+//! The program names each child by the number **`fork` answered with**, which
+//! is also the number a `wait` reports and `kill` accepts. That is worth saying
+//! because this pin is what found those doors answering the scheduler's task
+//! slot instead, and its first draft had to carry each child's own `getpid`
+//! down a pipe to dodge it; with `docs/uapi/` item 107 landed, the answer is
+//! usable directly. The comment would be a stale curiosity if the pin did not
+//! depend on it, and it does.
 
 use mpos_user_tests::Report;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -61,21 +65,14 @@ fn install_handler() -> bool {
     }
 }
 
-/// Reap the one child this process has and answer its exit code, saying on the
-/// console why a child that did not exit normally did not.
-///
-/// `waitpid(-1)` and not `waitpid(number)`: inside a pid namespace this kernel
-/// answers the *machine's* slot for a wait's reported pid (and for `fork`'s
-/// return) where Linux answers the caller's own number - a divergence this
-/// program found and `docs/notes/` §2.10 names, with the item that fixes it.
-/// A claim about *which processes a signal reaches* must not be built on the
-/// number a wait prints, so the child is reaped by "any" and the exit code is
-/// the whole answer.
-fn reap_any() -> Option<i32> {
+/// The blocking `wait4(pid)`'s exit code - the child named by the number `fork`
+/// answered with - saying on the console why a child that did not exit normally
+/// did not.
+fn wait_pid(child: i32) -> Option<i32> {
     let mut status: libc::c_int = 0;
-    let got = unsafe { libc::waitpid(-1, &mut status, 0) };
-    if got < 0 {
-        eprintln!("t-kill-all: waitpid(-1) = {got}, errno {}", errno());
+    let got = unsafe { libc::waitpid(child, &mut status, 0) };
+    if got != child {
+        eprintln!("t-kill-all: waitpid({child}) = {got}, errno {}", errno());
         return None;
     }
     if libc::WIFEXITED(status) {
@@ -83,52 +80,14 @@ fn reap_any() -> Option<i32> {
     } else {
         if libc::WIFSIGNALED(status) {
             eprintln!(
-                "t-kill-all: a child (pid {got}) died of signal {}",
+                "t-kill-all: child {child} died of signal {}",
                 libc::WTERMSIG(status)
             );
         } else {
-            eprintln!("t-kill-all: a child (pid {got}) status {status:#x}");
+            eprintln!("t-kill-all: child {child} status {status:#x}");
         }
         None
     }
-}
-
-/// Tell the parent this process's own number. The child's `getpid()` is the
-/// number the caller's namespace knows it by - `kill` and `/proc` agree with
-/// it - whereas **`fork`'s return value inside a pid namespace is this
-/// kernel's machine slot**, a divergence `docs/notes/` §2.10 names rather than
-/// builds a claim on.
-fn announce(write_end: libc::c_int) {
-    let me = unsafe { libc::getpid() };
-    let bytes = me.to_ne_bytes();
-    unsafe {
-        libc::write(
-            write_end,
-            bytes.as_ptr() as *const libc::c_void,
-            bytes.len(),
-        );
-        libc::close(write_end);
-    }
-}
-
-/// The number a child announced, if the pipe carried it.
-fn learn(read_end: libc::c_int) -> Option<i32> {
-    let mut bytes = [0u8; 4];
-    let got = unsafe { libc::read(read_end, bytes.as_mut_ptr() as *mut libc::c_void, 4) };
-    unsafe { libc::close(read_end) };
-    if got != 4 {
-        return None;
-    }
-    Some(i32::from_ne_bytes(bytes))
-}
-
-/// One pipe whose read end learns a child's number.
-fn number_pipe() -> Option<(libc::c_int, libc::c_int)> {
-    let mut fds = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    Some((fds[0], fds[1]))
 }
 
 /// Write one line of a `uid_map`-shaped file.
@@ -165,13 +124,13 @@ fn in_fresh_pid_ns(body: fn() -> i32) -> Option<i32> {
             match unsafe { libc::fork() } {
                 -1 => unsafe { libc::_exit(92) },
                 0 => unsafe { libc::_exit(body()) },
-                _kid => {
-                    let code = reap_any().unwrap_or(93);
+                kid => {
+                    let code = wait_pid(kid).unwrap_or(93);
                     unsafe { libc::_exit(code) }
                 }
             }
         }
-        _kid => reap_any(),
+        kid => wait_pid(kid),
     }
 }
 
@@ -186,11 +145,10 @@ fn body_lone_caller() -> i32 {
     }
     // The control the rest of the file is built on: a handler really runs for
     // this process's own SIGUSR1 - so a later "nothing arrived" is about the
-    // set and not about the disposition machinery.
+    // set and not about the disposition machinery. A plain pid, not 0: the
+    // caller's process group is shared with tasks outside this namespace (the
+    // test process that forked us), and a group send would reach them too.
     DELIVERED.store(0, Ordering::SeqCst);
-    // `kill(pid)` and not `kill(0)`: a process group is shared with tasks
-    // outside this namespace (the test process that forked us), and a group
-    // send would reach them too.
     let me = unsafe { libc::getpid() };
     let (own_ret, _) = kill(me, libc::SIGUSR1);
     let own_seen = DELIVERED.load(Ordering::SeqCst);
@@ -222,17 +180,9 @@ fn body_scope() -> i32 {
         return 20;
     }
     DELIVERED.store(0, Ordering::SeqCst);
-    let Some((read_end, write_end)) = number_pipe() else {
-        return 21;
-    };
     let kid = unsafe { libc::fork() };
     if kid == 0 {
-        unsafe { libc::close(read_end) };
         unsafe { libc::setpgid(0, 0) };
-        if !install_handler() {
-            unsafe { libc::_exit(2) }
-        }
-        announce(write_end);
         for _ in 0..400 {
             if DELIVERED.load(Ordering::SeqCst) != 0 {
                 break;
@@ -243,33 +193,29 @@ fn body_scope() -> i32 {
         unsafe { libc::_exit(if seen == 1 { 0 } else { 3 }) }
     }
     if kid < 0 {
-        return 22;
+        return 21;
     }
-    unsafe { libc::close(write_end) };
-    let Some(number) = learn(read_end) else {
-        return 23;
-    };
+    // `kid` is the number `fork` answered with - the sibling's number in this
+    // namespace, which is what `kill` accepts and what `wait` reports.
     unsafe { libc::usleep(150_000) };
-    // The number the caller stands in names the sibling, and the sibling is
-    // in a process group of its own - so a group send would not reach it.
-    let (here, _) = kill(number, 0);
+    let (here, _) = kill(kid, 0);
     if here != 0 {
-        return 24;
+        return 22;
     }
     let (ret, ret_err) = kill(-1, libc::SIGUSR1);
     let own = DELIVERED.load(Ordering::SeqCst);
-    let kid_code = reap_any();
+    let kid_code = wait_pid(kid);
     eprintln!(
-        "t-kill-all: scope kill(-1) = {ret} (errno {ret_err}), own {own}, sibling (pid {number}) {kid_code:?}"
+        "t-kill-all: scope kill(-1) = {ret} (errno {ret_err}), own {own}, sibling (pid {kid}) {kid_code:?}"
     );
     if ret != 0 {
-        return 25;
+        return 23;
     }
     if own != 0 {
-        return 26;
+        return 24;
     }
     if kid_code != Some(0) {
-        return 27;
+        return 25;
     }
     0
 }
@@ -277,12 +223,8 @@ fn body_scope() -> i32 {
 /// One signal per **process**: a two-thread target runs its handler once,
 /// whichever door named it - `kill(-1)` or `kill(-pgid)`.
 fn one_copy(via_all: bool) -> i32 {
-    let Some((read_end, write_end)) = number_pipe() else {
-        return 30;
-    };
     let kid = unsafe { libc::fork() };
     if kid == 0 {
-        unsafe { libc::close(read_end) };
         unsafe { libc::setpgid(0, 0) };
         if !install_handler() {
             unsafe { libc::_exit(2) }
@@ -290,15 +232,14 @@ fn one_copy(via_all: bool) -> i32 {
         DELIVERED.store(0, Ordering::SeqCst);
         // A second thread of this process, and **runnable**: it sleeps in
         // short takes so a copy aimed at this thread is delivered and counted
-        // too. A parked thread would hold a per-thread copy pending until
-        // this process left, which is exactly the shape that would hide a
-        // fan-out bug from the claim.
+        // too. A parked thread would hold a per-thread copy pending until this
+        // process left, which is exactly the shape that would hide a fan-out
+        // bug from the claim.
         let _worker = std::thread::spawn(|| {
             loop {
                 unsafe { libc::usleep(1000) };
             }
         });
-        announce(write_end);
         for _ in 0..400 {
             if DELIVERED.load(Ordering::SeqCst) != 0 {
                 break;
@@ -324,26 +265,22 @@ fn one_copy(via_all: bool) -> i32 {
         }
     }
     if kid < 0 {
-        return 31;
+        return 30;
     }
-    unsafe { libc::close(write_end) };
-    let Some(number) = learn(read_end) else {
-        return 32;
-    };
     unsafe { libc::usleep(200_000) };
     let (ret, _) = if via_all {
         kill(-1, libc::SIGUSR1)
     } else {
-        kill(-number, libc::SIGUSR1)
+        kill(-kid, libc::SIGUSR1)
     };
-    let kid_code = reap_any();
+    let kid_code = wait_pid(kid);
     if ret != 0 {
-        return 33;
+        return 31;
     }
     match kid_code {
         Some(0) => 0,
         Some(seen) => 40 + seen,
-        None => 34,
+        None => 32,
     }
 }
 
@@ -361,15 +298,9 @@ fn body_nested_ns() -> i32 {
     if !install_handler() {
         return 50;
     }
-    let Some((read_end, write_end)) = number_pipe() else {
-        return 51;
-    };
     let outer = unsafe { libc::fork() };
     if outer == 0 {
-        unsafe {
-            libc::close(read_end);
-            libc::setpgid(0, 0);
-        }
+        unsafe { libc::setpgid(0, 0) };
         if unsafe { libc::unshare(libc::CLONE_NEWPID) } != 0 {
             unsafe { libc::_exit(2) }
         }
@@ -385,57 +316,37 @@ fn body_nested_ns() -> i32 {
         if inner < 0 {
             unsafe { libc::_exit(3) }
         }
-        announce(write_end);
         // Long enough that the caller's `kill(-1)` (below, at 350 ms) lands
         // while this process is still here: a set question asked after the
         // process left answers `ESRCH`, which is a race and not a claim.
         unsafe { libc::usleep(900_000) };
-        // Alive or not is read off the *reap*, not off `kill(inner, 0)`: the
-        // number `fork` answered with is this kernel's machine slot (the
-        // divergence the helper's header names), and a lookup by it would
-        // read "gone" for a child that is very much there. `WNOHANG` answers
-        // 0 while a child is alive and reaps it if it is not, which is the
-        // question without a number in it.
-        let mut status: libc::c_int = 0;
-        let reaped = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-        let alive = reaped == 0;
+        // `inner` is the number `fork` answered with, so it is nameable here
+        // even though it is the init of a namespace of its own.
+        let alive = unsafe { libc::kill(inner, 0) } == 0;
         if alive {
+            // `SIGKILL` from an ancestor namespace is forced through an init,
+            // and this namespace's own init (our parent) is not an ancestor.
             unsafe {
-                // Ending it by *set* and not by number: the number `fork`
-                // answered with names nothing the outer can use. `SIGKILL`
-                // from an ancestor namespace is forced through an init, and
-                // this namespace's own init (our parent) is not an ancestor,
-                // so it is discarded there - which is Linux's rule too.
-                libc::kill(-1, libc::SIGKILL);
-                libc::waitpid(-1, &mut status, 0);
+                libc::kill(inner, libc::SIGKILL);
+                let mut status: libc::c_int = 0;
+                libc::waitpid(inner, &mut status, 0);
             }
         }
         unsafe { libc::_exit(if alive { 0 } else { 4 }) }
     }
     if outer < 0 {
-        return 52;
-    }
-    unsafe { libc::close(write_end) };
-    let Some(number) = learn(read_end) else {
-        return 53;
-    };
-    // The outer process is nameable where the caller stands, even though its
-    // own child is not: the one relation `kill(-1)` is built on.
-    let (here, _) = kill(number, 0);
-    eprintln!("t-kill-all: nested outer pid {number}, kill(pid,0) = {here}");
-    if here != 0 {
-        return 56;
+        return 51;
     }
     unsafe { libc::usleep(350_000) };
     let (ret, _) = kill(-1, libc::SIGUSR1);
-    let outer_code = reap_any();
+    let outer_code = wait_pid(outer);
     if ret != 0 {
-        return 54;
+        return 52;
     }
     match outer_code {
         Some(0) => 0,
         Some(failed) => 60 + failed,
-        None => 55,
+        None => 53,
     }
 }
 

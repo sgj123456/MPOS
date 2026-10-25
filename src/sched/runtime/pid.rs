@@ -100,6 +100,64 @@ pub fn pid_number_of(slot: TaskId) -> Option<u32> {
 /// parent reads out of a wait.
 #[cfg(target_os = "none")]
 
+/// The number `slot` has at **every level of its own chain**, each with the
+/// identity of the namespace that gives it, outermost first.
+///
+/// This is what an exit *record* keeps once the slot is freed
+/// (`crate::sched::Retired::numbers`): the number alone cannot say which
+/// namespace it belongs to, and a `wait` may be read by a process standing at
+/// any level of the child's chain. [`number_of`](PidNs::number_of) is the live
+/// task's answer; this one outlives it.
+#[cfg(target_os = "none")]
+pub fn pid_chain_of(slot: TaskId) -> Vec<(u64, u32)> {
+    with_table(|t| {
+        t.tasks
+            .get(slot.0)
+            .and_then(Option::as_ref)
+            .map(|task| task.pid_ns.numbered_chain(slot.0))
+            .unwrap_or_default()
+    })
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn pid_chain_of(_slot: TaskId) -> Vec<(u64, u32)> {
+    Vec::new()
+}
+
+/// The identity of the namespace the **running** task's numbers come from, for
+/// the answers that have to find their level of a chain: `wait`'s reported pid,
+/// and the number `fork` answers with.
+#[cfg(target_os = "none")]
+pub fn current_pid_ns_id() -> u64 {
+    with_table(|t| t.task(t.current).pid_ns.ns_id())
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn current_pid_ns_id() -> u64 {
+    0
+}
+
+/// The number a task has **in its own namespace** - the word `clone`'s
+/// `CLONE_CHILD_SETTID` puts in the child's memory (measured on a current host:
+/// a `CLONE_NEWPID` child's word is `1`, its own `getpid`, while its parent's
+/// `CLONE_PARENT_SETTID` word and the parent's `fork` answer are the number in
+/// the *parent's* namespace - `.workbuddy/probe_pid_numbers.c`).
+#[cfg(target_os = "none")]
+pub fn own_pid_number(slot: TaskId) -> u32 {
+    with_table(|t| {
+        t.tasks
+            .get(slot.0)
+            .and_then(Option::as_ref)
+            .and_then(|task| task.pid_ns.number_of(slot.0))
+            .unwrap_or(slot.0 as u32)
+    })
+}
+
+#[cfg(not(target_os = "none"))]
+pub fn own_pid_number(slot: TaskId) -> u32 {
+    slot.0 as u32
+}
+
 /// Resolve a number the caller wrote into a task, **in the caller's namespace**.
 ///
 /// This is the direction that keeps a namespace from being a footgun: a number

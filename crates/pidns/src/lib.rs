@@ -301,6 +301,24 @@ impl PidNs {
         out
     }
 
+    /// Each level of the chain with the number it gives `slot`:
+    /// `(namespace id, number)` pairs, outermost first.
+    ///
+    /// [`numbers`](Self::numbers) is the same walk without the identities, and
+    /// that is all a *live* task needs - the reader's own namespace asks for one
+    /// level. A **record** needs the identities: the slot is gone by the time a
+    /// `wait` reads it, and the waiter may stand at any level of the child's
+    /// chain, so the number has to be matched to the namespace that gave it.
+    pub fn numbered_chain(&self, slot: usize) -> Vec<(u64, u32)> {
+        let mut out: Vec<(u64, u32)> = self
+            .chain()
+            .iter()
+            .filter_map(|ns| ns.number_of(slot).map(|number| (ns.ns_id(), number)))
+            .collect();
+        out.reverse();
+        out
+    }
+
     /// This namespace, then its parent, and so on to the root.
     fn chain(&self) -> Vec<&PidNs> {
         let mut out = Vec::new();
@@ -405,6 +423,30 @@ mod tests {
         for (ns, n) in [(&inner, 1u32), (&outer, 1), (&root, 12)] {
             assert_eq!(ns.task_of(n), Some(12));
         }
+    }
+
+    /// The chain with identities, which is what an exit *record* carries: the
+    /// number at each level, each beside the namespace that gave it, outermost
+    /// first. `numbers()` is the same walk without the identities, and a
+    /// `wait` needs them - by the time it reads a death the slot is gone, and
+    /// the waiter may stand at any level of the child's chain.
+    #[test]
+    fn the_numbered_chain_pairs_each_number_with_its_namespace() {
+        let root = PidNs::root(11);
+        let outer = PidNs::child(&root, 12);
+        let inner = PidNs::child(&outer, 13);
+        inner.allocate(20);
+        assert_eq!(
+            inner.numbered_chain(20),
+            alloc::vec![(11, 20), (12, 1), (13, 1)],
+            "outermost first, each number beside its namespace's identity"
+        );
+        // A slot the nested levels never registered still has the *root's*
+        // number, because the init namespace numbers by slot and stores
+        // nothing: its level is always there, and it is the only level that is.
+        assert_eq!(inner.numbered_chain(21), alloc::vec![(11, 21)]);
+        // The numbers alone are the same walk, in the same order.
+        assert_eq!(inner.numbers(20), alloc::vec![20, 1, 1]);
     }
 
     /// Two tasks in one namespace, and two namespaces over one task set: the

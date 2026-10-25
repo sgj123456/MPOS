@@ -5827,3 +5827,59 @@ where Linux hands it the leader's status. (Item 67 below closes it.)
     (208 built), `mpos-kunit 32 passed, 0 failed` on both; host unit suite 1120
     tests / 0 failed; `t-kill-all`'s four `ok:` lines byte-identical on both
     machines.
+
+## item 107 — the pid a process door answers with is the caller's namespace's
+
+    Found by item 106's pin, and named there rather than hidden. Inside a pid
+    namespace this kernel answered the **scheduler's task slot** at every door
+    that hands a number back: `fork`/`vfork`, `clone` and `clone3`'s return
+    value, `wait4`'s return value and `waitid`'s `si_pid`. A parent *outside*
+    the namespace cannot see the difference - its number and the slot coincide -
+    but a parent **inside** one, which is what a container's own process is,
+    got a number no other call accepts: the child it had just created could not
+    be killed, waited for, or found in `/proc` by it. `t-ns-pid`'s parent-side
+    claims are all the outside shape, which is why nothing had caught it.
+
+    **Measured on a current host before the fix**
+    (`.workbuddy/probe_pid_numbers.c`, Linux 7.2.11, the probe standing as pid 1
+    of a fresh pid namespace): `fork` answers the child's number in the caller's
+    namespace (`2` for a child whose own `getpid` is `2`), `clone3` answers it
+    too, `wait4(-1)` reports that same number, and `waitid(P_PID, 6)` reports
+    `6`. The two `SETTID` words are **not** the same number, and the probe is
+    what settled it: `CLONE_PARENT_SETTID` carries the child's number **in the
+    parent's** namespace (a `CLONE_NEWPID` child is `1` to itself while its
+    parent's word and the parent's `wait` say the parent's number), while
+    `CLONE_CHILD_SETTID` carries the child's number **in its own** namespace
+    (`1`, its own `getpid`).
+
+    **Owner**: `src/syscall/linux/proc.rs` (`pid_answer` - one helper for every
+    door that hands a number back, because they are one question and a caller
+    uses one door's answer in another's call - plus the `fork`/`clone`/`clone3`
+    tails and the two `SETTID` writes), `src/sched/runtime/pid.rs`
+    (`pid_chain_of`, `current_pid_ns_id`, `own_pid_number`),
+    `crates/pidns` (`numbered_chain`), and the exit record
+    (`Retired::numbers`, `WaitEvent::Exited::numbers`): by the time a `wait`
+    reads a death the slot is reaped and the pid registration with it, so the
+    record has to carry the numbers the way it already carries `pgid`, `uid`
+    and the CPU - one entry per namespace level, with the namespace's identity,
+    because the waiter may stand at any level of the child's chain.
+
+    **Pin**: the new **`t-pid-numbers`**, **4 claims**, all four measured against
+    a real host first by running the program itself (`MPOS_ON_HOST=1`, `ok:` for
+    `ok:`), each in a fresh user+pid namespace: fork's answer / the child's own
+    number / the wait's report are one number; `CLONE_PARENT_SETTID` carries the
+    child's number in the caller's namespace; the asymmetric pair (nested child
+    `1` to itself, parent's SETTID word and wait the parent's number, child's own
+    SETTID word `1`); and `waitid(P_PID)`'s `si_pid`. The `t-kill-all` pin that
+    found the bug loses its workaround in the same commit - it names children by
+    `fork`'s answer and waits by that number again - which is the other half of
+    the evidence: the pin written around the bug no longer needs to be.
+
+    **Gate**: x86_64 `pass=210 fail=0`, aarch64 `pass=209 fail=0`, `mpos-kunit
+    32 passed, 0 failed` on both; host unit suite 1121 tests / 0 failed; both
+    pins' `ok:` lines byte-identical on both machines.
+
+    **Named**: `t-ns-pid`'s claims stay as they were (the outside-parent shape,
+    still true and still pinned); the *slot* fallback in `pid_answer` survives
+    for a record made before the chains were kept and for a stray task outside
+    the caller's chain, which no door in the ABI can reach.
