@@ -4080,3 +4080,29 @@ waiting on now - and an unproven change is not landed. It is the next fix to
 make, with a boot self-test as its pin (a task that dies holding a claim must
 leave the scratch usable), and the stall it does not address is the one after
 `Populating /dev ... [ ok ]`, whose heartbeat has not yet been read.
+
+**Two leaks tried, neither moves the post-trigger stall.** Both were written,
+built and booted, and neither changed where the boot stops:
+
+* a **claim whose holder died** leaves `fill-busy`/`run-busy` set (the heartbeat
+  read exactly that once: `fill-owner=slot 6/pid 6` with slot 6 absent), so the
+  fix is the holder recorded in the cache and the busy predicates asking
+  `sched::is_exited`;
+* the **block mailbox's holder** can die the same way (`BUSY` set, `WAITER`
+  naming a dead task), so the fix is the same answer in `blk_irq::begin_request`.
+
+With either in place the boot still stops after `Populating /dev ... [ ok ]`, and
+the stall's own table says why neither is *this* stall: `fill-owner=slot 10/pid 10
+fill-busy=true`, slot 10 **alive** and parked at site 4 with `parks=33201` -
+a task cycling through the device-claim wait at the timed park's 4 ms period
+while a dozen others queue at `ext4_slot_wait` (7). So the mailbox is held by a
+*living* task that is itself waiting for something else - a cycle between the
+claim and the device - not by a corpse.
+
+Both leak fixes are **not landed**: each is right on its own terms and each is
+unproven against the boot, and the repo's rule is that an unproven fix does not
+land. They are recorded here as the next work, with the pin each needs (a boot
+self-test: the state a dead holder leaves must be reclaimable). The stall to read
+next is the cycle the table shows: which task holds the mailbox that slot 10 is
+waiting for, and what *it* is waiting on - the heartbeat already prints every
+slot's park site, so the answer is in the next boot's table.
