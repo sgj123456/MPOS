@@ -790,12 +790,6 @@ extern "C" fn sync() {
                 && ((is_write && crate::hal::kernel::resolve_cow_fault(addr))
                     || crate::hal::kernel::resolve_anon_fault(addr, is_write))
             {
-                // TEMP DIAGNOSTIC
-                {
-                    use core::fmt::Write as _;
-                    let mut out = pl011::Writer;
-                    let _ = writeln!(out, "mpos: el1 fault resolved {addr:#x} w={is_write}");
-                }
                 return; // The instruction retries and succeeds.
             }
         }
