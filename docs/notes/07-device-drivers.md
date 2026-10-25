@@ -4591,3 +4591,29 @@ consume/re-arm pair or the legacy `at_exec_exit` early return), and the test's
 first failing assertion also *says which*: whether the entry stop was missing
 altogether (op was the previous call's exit) or the wrong op was written for a stop
 that existed.
+
+**The pin, run once: its expectations were the wrong half.** The program above was
+written and run in the gate before landing, and it answered something better than a
+red: the operation byte is **correct at both stops** -
+
+    ok:    the entry stop says PTRACE_SYSCALL_INFO_ENTRY
+    ok:    the exit stop says PTRACE_SYSCALL_INFO_EXIT
+    FAIL:  the entry stop names the call being entered (getpid)
+    FAIL:  the exit stop carries the call's result (the child's pid)
+
+- and the two failures are the *test's* assumption, not the kernel's. The child is
+stopped by `raise(SIGSTOP)` and resumes into the signal trampoline, so the first
+syscall boundary after the resume is **`rt_sigreturn`**, not the `getpid` the test
+wants to see; the kernel named that call correctly and reported its completion
+correctly. The design therefore needs to walk stops until the entry's `nr` is the
+call it made (expecting `rt_sigreturn` first), rather than assume the first stop is
+it.
+
+The program was reverted rather than landed: it fails, and a red default sweep
+means the kernel is broken - the opposite of what this one says. The corrected
+shape is what the next attempt writes, and the three checks it already passed are
+the evidence that `PTRACE_GET_SYSCALL_INFO`'s op handling is not the bug the strace
+crash suggested - the tracer's own desynchronisation has another cause and the next
+instrument is the *stop sequence* (how many stops per syscall a `PTRACE_SYSCALL`
+tracee produces), which the same test can measure by counting boundaries between
+the resume and the `getpid` it is waiting for.
