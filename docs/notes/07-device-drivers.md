@@ -4239,3 +4239,25 @@ claim's slot (not just the owner), and a claim whose holder is gone clears its
 slot's `loading`, the flag, and the scratch before the next asker proceeds. The
 same for the run claim. Until then the boot stops after udev-trigger on the boots
 that hit this race.
+
+**The full reclaim was written and does not fire: the contradiction to read
+next.** Recording the claim's slot in the cache and clearing both halves
+(`forget_abandoned`: the flag, the owner, and the way the claim marked `loading`,
+plus a bounded 20 ms re-arming claim wait) compiled, passed the host suite, and
+did **not** free the leaked claim:
+
+    mpos: ... fill-owner=slot 6/pid 6 fill-busy=true blk-busy=true blk-waiter=none
+    mpos:   ... fill=9109/9108(out=1 age=104899ms slot=6 syscall=231)
+    (no slot 6 in the live table)
+
+So `forget_abandoned` ran with `fill_busy` true and did not free it, which can only
+mean `holder_alive(Some(TaskId(6)))` answered **true** - i.e. `sched::task_alive(6)`
+found a live, non-exited task in slot 6, while the heartbeat's table (whose liveness
+test is the same `!task.exited`) does not print it. One of the two is wrong, and the
+next reading is one line in `forget_abandoned`: the holder's slot, `task_alive`, the
+task's `exited` flag and its pid, printed the first time a claim is found abandoned.
+
+Two smaller things also came out of the attempt and are recorded rather than lost:
+the re-arming wait makes `claim_waiters` accumulate duplicates (`registrations=15465
+handed-back=13`), so registration has to become idempotent per task; and the
+unproven attempt is not landed, per the rule.
