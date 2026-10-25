@@ -3619,3 +3619,49 @@ which took a directory as readily as a device node. Both nodes own `rmdir` now a
 `EISDIR` (`docs/uapi/` §5.1 item 48, `t-devtmpfs`); a boot of the same image prints no `mpos: syscall`
 line at all and `/dev/dri/by-path` holds its two links, so the pass that makes that directory and
 then removes it again runs whole.
+
+### R.9 Two concurrent `exec`s deadlock the parked-transfer path — **observed, not diagnosed** (2026-10-25)
+
+Found while chasing a desktop-image boot that stops at OpenRC's `Starting udev ...`
+(this session's own commits are **not** involved: the same hang reproduces on
+`1adfb6e`, the commit before them, with a `rootfs --force-full` image laid from
+scratch).
+
+**The reproduction is small and deterministic.** In a script run as a boot
+`::sysinit:` action on the x86_64 image, fork **two or more** background children
+that each `execve` a binary from the ext4 root and wait:
+
+```sh
+( /bin/echo one >/tmp/y1 ) &
+( /bin/echo two >/tmp/y2 ) &
+sleep 4
+# both children are still `{sh}`, state S, /tmp/y1 and /tmp/y2 never appear
+```
+
+The readings, one variable apart (`.workbuddy` scripts are the session's own
+`/tmp`-style probes and were not kept; the runs are `build/run-diag{4,5,6,7}.log`):
+
+| shape | result |
+|---|---|
+| one background child that only runs shell builtins | runs, and `wait` on it returns 0 |
+| **one** background child that `exec`s a binary | **runs** (`/tmp/x2` written) |
+| foreground `exec` (the script's own `ps`, `ls`, `/bin/echo`) | runs |
+| **two or more concurrent** background children that `exec` | **all of them stop before the exec completes**: state `S`, argv still the shell's, files never written, while the forking shell's `sleep` wakes and runs on |
+
+So the fork survives, the child runs user code, and the child stops *inside*
+`execve` — which reads the program through the ext4 cache and the parked
+virtio-blk transfer (§10.5, `src/vfs/ext4/cache.rs`'s `FillClaim`/`RunClaim` and
+`src/drivers/virtio/blk.rs`'s `begin_request`/`wait_for_device`/`finish_request`).
+The bug is therefore in one of those two hand-offs *under contention*; a single
+transfer is fine, concurrent ones are not. This kernel's x86_64 gate cannot see
+it: that arm's root is an initramfs, so no program it runs is read through the
+block device. The aarch64 arm's root *is* a disk, but no test in the suite forks
+concurrent readers.
+
+**What is owed before this is a diagnosis** (and a fix with a pin): the exact
+park/wake that is lost, chosen between the two by instrumenting them (a counter
+pair per hand-off, or moving the reproduction onto the aarch64 arm with a `t-*`
+that forks two children which exec a disk-resident binary). The desktop-image
+boot hangs because OpenRC's service machinery is exactly this shape - a parent
+that forks and execs while other execs are in flight - so the boot symptom is
+this bug's most visible face, not a separate one.
