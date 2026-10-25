@@ -242,6 +242,10 @@ impl Cache {
     /// condition from the top.
     pub(crate) fn wait_for_claim(&mut self, me: TaskId) {
         self.claim_waiters.push(me);
+        // Counted at the funnel, not at the call sites: every registration goes
+        // through here, and the heartbeat's pair is only meaningful if both
+        // halves count the same list (`docs/notes/` §7 R.9).
+        super::note_claim_registration();
     }
 
     /// Claim a miss of one `block`: pick a way no claim uses, mark it, take
@@ -282,6 +286,7 @@ impl Cache {
         // Taken before the slot borrow: a scratch/set waiter is woken by the
         // end of *any* claim, and the fill is one.
         let mut woken = core::mem::take(&mut self.claim_waiters);
+        super::note_claim_wake(woken.len());
         let slot = &mut self.slots[claim.at];
         debug_assert!(slot.loading, "a fill ended on a slot nobody claimed");
         slot.bytes.copy_from_slice(&claim.scratch);
@@ -370,6 +375,7 @@ impl Cache {
     /// who parked on any of them.
     pub(crate) fn end_run(&mut self, claim: RunClaim) -> Vec<TaskId> {
         let mut woken = core::mem::take(&mut self.claim_waiters);
+        super::note_claim_wake(woken.len());
         for (i, &at) in claim.places[..claim.width].iter().enumerate() {
             let slot = &mut self.slots[at];
             debug_assert!(slot.loading, "a run landed on a slot nobody claimed");

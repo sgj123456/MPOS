@@ -3910,3 +3910,22 @@ holder running `end_fill`/`end_run` itself. Making the claim release the scratch
 handing the waiters back) removes the whole class: a claim dropped on any path -
 an early return, an exec, a die - cannot outlive its transfer. That is the fix to
 make first, and the counters are how its absence would be caught again.
+
+**The funnel counters answer it: the wake was handed back - and the task slept
+anyway.** Counted at `Cache::wait_for_claim` and at the two `end_*` drains (one
+registration, one hand-back per pass), the stall reads:
+
+    mpos:   claim registrations=1 handed-back=1
+
+Equal. So the waiter's registration *did* reach the drainer, the drainer *did*
+hand it back, and `claim_park::wake` ran with that id - and the task is still
+asleep at `ext4_scratch_wait`, with both flags false. The broken half is
+therefore the **park's own re-check**, not the list.
+
+That closes the loop this section opened: there is exactly one wake per
+registration, it is delivered, and the sleeper either never observed it or
+observed it and slept again. The next change is on the wait's own shape - a
+scratch park must re-register **and** re-check before every sleep, so no single
+lost observation can strand it - with a host pin for the property (a waiter that
+is woken with its condition true must return, and one that is woken with its
+condition false must park again *and* stay registered).

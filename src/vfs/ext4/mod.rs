@@ -240,7 +240,6 @@ mod claim_park {
     }
 
     pub(super) fn wake(ids: alloc::vec::Vec<TaskId>) {
-        super::note_claim_wake(ids.len());
         for id in ids {
             #[cfg(target_os = "none")]
             crate::sched::wake(id);
@@ -464,7 +463,6 @@ impl Core {
                     // sleep on a condition nobody will wake: ending a fill
                     // wakes that list (the deadlock `claim_waiters` documents).
                     cache.wait_for_claim(claim_park::me());
-                    note_claim_registration();
                     return Step::WaitScratch(scratch_site());
                 }
                 match cache.begin_fill(block, self.block_size()) {
@@ -548,7 +546,6 @@ impl Core {
                 }
                 if cache.run_busy() {
                     cache.wait_for_claim(claim_park::me());
-                    note_claim_registration();
                     return Step::WaitScratch(scratch_site());
                 }
                 match cache.begin_run(&*self.dev, block, want, self.block_size()) {
