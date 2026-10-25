@@ -112,7 +112,7 @@ slow = ["t-fill-ramfs", "t-forkcost", "t-netlat", "t-pipecost"]
 # each machine, so running it on both is right, but a diagnostic is one thing
 # everywhere - and §15.34's rule bounds what a boot may assert by what the
 # kernel itself produces, which an interactive child's state letter is not.
-diagnostic = ["t-sh", "t-aa-ptyprobe"]
+diagnostic = ["t-sh", "t-aa-ptyprobe", "t-ptrace-stops"]
 
 # The first machine's own half. Empty, and an empty section is that machine's
 # answer rather than a missing one: every group it needs is a group the baseline
