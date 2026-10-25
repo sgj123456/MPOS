@@ -3773,3 +3773,24 @@ then in one of the two processes' user or kernel code - `openrc-run`'s shell and
 whatever it started. The candidate to read first is the one this session has
 already measured twice: a wait whose deadline re-arms in the past (the §6.24
 trap's shape), which spins a task at 100% instead of parking it.
+
+**The spinning task has no image.** The heartbeat's next line carried the
+last-ran task's `comm` and image path. At the stall it reads, over and over:
+
+    mpos: heartbeat age=0ms last slot=5 pid=5 parked=0 (0) comm= exe=<empty>
+
+`comm` and `exe` are both empty, and `pid_number_of` answers 5 for that slot -
+so the process being switched to has **no name set and no exec'd image**: it is
+a `fork` child that never completed its `exec`, and it is *running* (parked=0,
+age 0-4 ms) rather than waiting. That is the boot's stall in one line: the udev
+service's fork-then-exec child is spinning before the exec, so the service never
+starts, the parent waits, and the machine looks hung while burning a core.
+
+The same fork/exec seam produced the concurrent-exec readings earlier in this
+section - there the child *parked* in the ext4 claim path (wchan 4, then 8);
+here it *spins* before any image is installed. The next step is to make the
+heartbeat say where: the last syscall the spinning task took (a per-task
+`last_syscall` word costs one store on the entry path and names the loop), and
+then to read that loop's code. The prime suspect stays §6.24's shape - a wait
+whose deadline is rebuilt in the past so every park returns at once - now
+suspected on the exec side of the seam rather than the claim side.

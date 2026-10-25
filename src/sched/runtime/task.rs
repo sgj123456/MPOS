@@ -3117,9 +3117,27 @@ fn heartbeat() {
     }
     let pid = super::pid::pid_number_of(TaskId(slot)).unwrap_or(0);
     let park = park_site(slot);
+    // The name, copied out under the table borrow so nothing allocates in
+    // interrupt context: the stored `comm` bytes first (what `PR_SET_NAME`
+    // writes), then the tail of the image path - between them they name the
+    // process even when it never set a name, which is the udev-service case
+    // (`docs/notes/` §7 R.9's next line).
+    let mut comm = [0u8; 16];
+    let mut tail = [0u8; 40];
+    with_table(|t| {
+        if let Some(Some(task)) = t.tasks.get(slot) {
+            comm = task.mm.comm_name_bytes();
+            let exe = task.exe.as_bytes();
+            let n = exe.len().min(tail.len());
+            tail[..n].copy_from_slice(&exe[exe.len() - n..]);
+        }
+    });
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     crate::hal::kernel::print_line(format_args!(
-        "mpos: heartbeat age={age}ms last slot={slot} pid={pid} parked={park} ({})\n",
-        PARK_SITES.get(park as usize).copied().unwrap_or("?")
+        "mpos: heartbeat age={age}ms last slot={slot} pid={pid} parked={park} ({}) comm={} exe={}\n",
+        PARK_SITES.get(park as usize).copied().unwrap_or("?"),
+        core::str::from_utf8(&comm[..end]).unwrap_or("?"),
+        core::str::from_utf8(&tail).unwrap_or("?")
     ));
 }
 
