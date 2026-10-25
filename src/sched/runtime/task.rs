@@ -40,7 +40,7 @@ pub static PARK_SITE: [AtomicU8; MAX_TASKS] = [const { AtomicU8::new(0) }; MAX_T
 /// id goes there verbatim and keeps the field's shape; these names are what the
 /// number means, and they live here so the mapping cannot drift from the
 /// primitives that write it.
-pub const PARK_SITES: [&str; 7] = [
+pub const PARK_SITES: [&str; 10] = [
     "0",
     "block_until_on",
     "block_until_nanos",
@@ -48,6 +48,9 @@ pub const PARK_SITES: [&str; 7] = [
     "block_until_uninterruptible",
     "block_until_code",
     "block_until_deadline",
+    "ext4_slot_wait",
+    "ext4_scratch_wait",
+    "ext4_set_wait",
 ];
 
 /// The park site a slot last slept in, `0` for never - `wchan`'s answer.
@@ -2771,7 +2774,19 @@ pub fn block_until_interruptible_rolling_back(cond: impl Fn() -> bool) -> WaitEn
 /// sleeper holds for that second look, so it finds the task either already
 /// asleep or already requeued on a true condition.
 pub fn block_until_uninterruptible(cond: impl Fn() -> bool) {
-    note_park_current(4);
+    block_until_uninterruptible_at(4, cond)
+}
+
+/// [`block_until_uninterruptible`] with its [`PARK_SITE`] id named by the
+/// caller.
+///
+/// Two waits of this shape that belong to different subsystems answer one
+/// question differently - *which* hand-off is the stuck task in - and
+/// `/proc/<pid>/wchan` is only as useful as the vocabulary it prints. The
+/// block mailbox and the ext4 cache claims are exactly that pair: both park
+/// here, and only the caller knows which (`docs/notes/` §7 R.9).
+pub fn block_until_uninterruptible_at(site: u8, cond: impl Fn() -> bool) {
+    note_park_current(site);
     loop {
         if cond() {
             return;

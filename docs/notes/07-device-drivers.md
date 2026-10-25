@@ -3703,7 +3703,22 @@ two earlier candidates lived in: the block mailbox's completion/claim wait
 `claim_park::wait`, which calls this primitive too). The instrument does not yet
 tell those two apart, because both enter the same primitive.
 
-**The next measurement is therefore one line of code**: give the primitive a
-site-carrying variant (or a site argument) and call it from `claim_park::wait`
-with its own id, so the same boot answers "block mailbox" or "ext4 claim" from
-`wchan` instead of from a bisect.
+**The second reading, and the one place it points.** The primitive grew a
+site-carrying variant (`block_until_uninterruptible_at`), and `claim_park::wait`
+now names its three callers - a slot's own claim (7), the fill/run scratch (8), a
+set with no free way (9). The same boot answers:
+
+    pid 7..10  comm=sh  state=S  wchan=8     (all four)
+
+so the four are waiting for the **ext4 scratch** - not the block mailbox, not a
+slot, not a set. That is a sharper place than it looks: the scratch is one flag
+(`fill_busy`/`run_busy`) set by `begin_fill`/`begin_run` and cleared only by
+`end_fill`/`end_run`, and with four waiters parked on it **no task is in the
+block mailbox and none is running the transfer** - so the flag is out with no
+claimer visibly doing anything, which means the claim's owner either re-entered
+the cache while holding it (a self-deadlock: `begin_fill` inside a path that is
+already inside `Go`) or left without an `end_*`. The former is the shape to look
+for first, and it is checkable: record the claim's owner task id in the cache and
+print it beside the site, so `wchan` says not just "waiting for the scratch" but
+"waiting for the scratch *of task N*" - and a cycle through N is the whole
+diagnosis.

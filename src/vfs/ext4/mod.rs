@@ -118,6 +118,13 @@ pub(crate) use self::super_block::{
 /// so no claim is ever in flight behind another, and the doors answer
 /// the degenerate forms - a wait whose condition holds on the first
 /// look, a placeholder identity, a wake with nobody to wake.
+/// The three places a reader parks on an ext4 claim, as `PARK_SITES` ids:
+/// a slot's own claim, the fill/run scratch, and a set with no free way.
+/// `/proc/<pid>/wchan` prints the number (`docs/notes/` §7 R.9).
+pub(crate) const SLOT_WAIT: u8 = 7;
+pub(crate) const SCRATCH_WAIT: u8 = 8;
+pub(crate) const SET_WAIT: u8 = 9;
+
 mod claim_park {
     // `TaskId` is the claim's currency on both builds; the `sched` paths
     // exist only on the machine, and the bodies name them in full so the
@@ -134,9 +141,9 @@ mod claim_park {
     /// Wait for a claim to end. Uninterruptible on the machine for the
     /// reason every claim wait is: the task that would end it cannot be
     /// interrupted mid-transfer either, so the wait has no other end.
-    pub(super) fn wait(cond: impl Fn() -> bool) {
+    pub(super) fn wait(site: u8, cond: impl Fn() -> bool) {
         #[cfg(target_os = "none")]
-        crate::sched::block_until_uninterruptible(cond);
+        crate::sched::block_until_uninterruptible_at(site, cond);
         #[cfg(not(target_os = "none"))]
         while !cond() {
             core::hint::spin_loop();
@@ -379,13 +386,17 @@ impl Core {
             match step {
                 Step::Ready => return,
                 Step::Wait => {
-                    claim_park::wait(|| !self.with_cache(|cache| cache.loading(block).is_some()));
+                    claim_park::wait(SLOT_WAIT, || {
+                        !self.with_cache(|cache| cache.loading(block).is_some())
+                    });
                 }
                 Step::WaitScratch => {
-                    claim_park::wait(|| !self.with_cache(|cache| cache.fill_busy()));
+                    claim_park::wait(SCRATCH_WAIT, || !self.with_cache(|cache| cache.fill_busy()));
                 }
                 Step::WaitSet => {
-                    claim_park::wait(|| !self.with_cache(|cache| cache.set_in_flight(block)));
+                    claim_park::wait(SET_WAIT, || {
+                        !self.with_cache(|cache| cache.set_in_flight(block))
+                    });
                 }
                 Step::Go(mut claim) => {
                     self.dev.read_at(claim.offset(), claim.scratch_mut());
@@ -451,13 +462,17 @@ impl Core {
             match step {
                 Step::Ready => return,
                 Step::Wait => {
-                    claim_park::wait(|| !self.with_cache(|cache| cache.loading(block).is_some()));
+                    claim_park::wait(SLOT_WAIT, || {
+                        !self.with_cache(|cache| cache.loading(block).is_some())
+                    });
                 }
                 Step::WaitScratch => {
-                    claim_park::wait(|| !self.with_cache(|cache| cache.run_busy()));
+                    claim_park::wait(SCRATCH_WAIT, || !self.with_cache(|cache| cache.run_busy()));
                 }
                 Step::WaitSet => {
-                    claim_park::wait(|| !self.with_cache(|cache| cache.set_in_flight(block)));
+                    claim_park::wait(SET_WAIT, || {
+                        !self.with_cache(|cache| cache.set_in_flight(block))
+                    });
                 }
                 Step::Go(mut claim) => {
                     self.dev.read_at(claim.offset(), claim.scratch_mut());
