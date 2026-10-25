@@ -4565,3 +4565,29 @@ without delivering a stop would drop one) and the `at_exec_exit` path, which
 returns early without a stop for a legacy tracer. Either is one boot away from an
 answer with the existing instruments - the syscall the tracee was in and the stop's
 own report are both printable - but not from this session's remaining context.
+
+**The pin to write, before the fix.** The right next artifact is not a strace run
+in a guest - it is a **`t-*` conformance program**, because the gate can run it on
+both machines and because a ptrace bug is exactly the kind the repo demands a pin
+for. The shape:
+
+```
+t-ptrace-syscall-info
+  fork a child that calls getpid() once;
+  the parent: PTRACE_TRACEME/ATTACH, wait for the first stop,
+  PTRACE_SETOPTIONS(PTRACE_O_TRACESYSGOOD), PTRACE_SYSCALL;
+  wait: expect SIGTRAP|0x80;
+  PTRACE_GET_SYSCALL_INFO -> assert op == PTRACE_SYSCALL_INFO_ENTRY (1)
+                              and nr == the syscall the child is entering;
+  PTRACE_SYSCALL again; wait; assert op == EXIT (2) and that `rval` is the result;
+  finally PTRACE_KILL / DETACH and reap.
+```
+
+It fails today at the first assertion - `op == 2` on an entering stop, which is
+what strace reports - so it is a counterfactual pin by construction: with the stop
+sequence fixed it passes, and with the sequence broken it is red in the gate rather
+than in a hand-run. The fix it pins is one of the two paths named above (`armed`'s
+consume/re-arm pair or the legacy `at_exec_exit` early return), and the test's
+first failing assertion also *says which*: whether the entry stop was missing
+altogether (op was the previous call's exit) or the wrong op was written for a stop
+that existed.
