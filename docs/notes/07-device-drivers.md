@@ -3841,3 +3841,28 @@ it. The instrument for that is one field: the cache records the owner's task id 
 `ext4_scratch_wait` line. If the id names a slot that is not live, the claim
 outlived its task; if it names one of the parked slots, the cycle is visible
 without another guess.
+
+**The claim is not out - the waiter is wrong.** The heartbeat now names the fill
+and run scratch holders beside the table. At the stall:
+
+    mpos: heartbeat age=0ms fill-owner=none run-owner=none -- live slots:
+    mpos:   slot 9 pid 9 park 8 (ext4_scratch_wait) syscall 21
+
+`fill-owner=none run-owner=none` means **no claim is in progress anywhere**, and
+slot 9 is nonetheless asleep at `ext4_scratch_wait`. That cannot be a wait on a
+held flag: with both flags false, the park's own condition -
+`!fill_busy()` / `!run_busy()` - is *already true*, and a park primitive that
+would be entered now returns at its first check. So the task is not waiting for a
+claim that exists; it is **asleep on a wake that never came**, and the flag it
+was waiting for was cleared without waking it.
+
+That reframes the whole section. The ext4 cache's scratch wait is not losing a
+claim; it is losing a **wake**. Its registered list (`claim_waiters`, from the
+first fix) is drained inside `end_fill`/`end_run`, and the drainer's wake is
+handed outside every lock - so the lost wake is in the window between the
+registration and the park, in the one place a *condition* cannot save it: the
+waiter registers on a list the drainer has already walked. The next reading is
+therefore not another "who" but a pair of counters: how many tasks registered on
+`claim_waiters` and how many were handed back, plus a mirror of the two flags in
+the heartbeat - a slot parked at 8 with a false flag and a registration the
+drainer never saw is that window, printed.

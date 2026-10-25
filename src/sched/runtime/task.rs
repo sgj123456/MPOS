@@ -85,6 +85,42 @@ pub fn last_syscall(slot: usize) -> u32 {
         .unwrap_or(0)
 }
 
+/// The task that holds the ext4 cache's fill scratch, and the one that holds
+/// its run scratch, as slots (`usize::MAX` for "out with nobody").
+///
+/// The scratch is one flag cleared only by the holder's own `end_fill`/
+/// `end_run`; when a boot stalls with waiters parked on it and no live task in a
+/// transfer, the missing question is *whose claim outlived its return*
+/// (`docs/notes/` §7 R.9). These two statics are that answer: the cache records
+/// the holder where it takes the scratch and clears it where it gives it back,
+/// and the heartbeat prints both beside the slot table.
+pub static FILL_OWNER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+pub static RUN_OWNER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Record (or clear, with `None`) the fill scratch's holder.
+pub fn note_fill_owner(slot: Option<usize>) {
+    FILL_OWNER.store(slot.unwrap_or(usize::MAX), Ordering::Relaxed);
+}
+
+/// Record (or clear, with `None`) the run scratch's holder.
+pub fn note_run_owner(slot: Option<usize>) {
+    RUN_OWNER.store(slot.unwrap_or(usize::MAX), Ordering::Relaxed);
+}
+
+/// The fill scratch's holder, if one is recorded.
+pub fn fill_owner() -> Option<usize> {
+    let slot = FILL_OWNER.load(Ordering::Relaxed);
+    (slot != usize::MAX).then_some(slot)
+}
+
+/// The run scratch's holder, if one is recorded.
+pub fn run_owner() -> Option<usize> {
+    let slot = RUN_OWNER.load(Ordering::Relaxed);
+    (slot != usize::MAX).then_some(slot)
+}
+
 /// Record that `t`'s running task is about to sleep at `site`.
 fn note_park(t: &Table, site: u8) {
     if let Some(slot) = PARK_SITE.get(t.current.0) {
@@ -3138,8 +3174,20 @@ fn heartbeat() {
     let progress = LAST_PROGRESS_NS.load(Ordering::Relaxed);
     let age = now.saturating_sub(progress) / 1_000_000;
     let running = LAST_RAN_SLOT.load(Ordering::Relaxed);
+    let fill = fill_owner()
+        .map(|slot| {
+            let pid = super::pid::pid_number_of(TaskId(slot)).unwrap_or(0);
+            alloc::format!("slot {slot}/pid {pid}")
+        })
+        .unwrap_or_else(|| "none".into());
+    let run = run_owner()
+        .map(|slot| {
+            let pid = super::pid::pid_number_of(TaskId(slot)).unwrap_or(0);
+            alloc::format!("slot {slot}/pid {pid}")
+        })
+        .unwrap_or_else(|| "none".into());
     crate::hal::kernel::print_line(format_args!(
-        "mpos: heartbeat age={age}ms -- live slots (running = last switched to):\n"
+        "mpos: heartbeat age={age}ms fill-owner={fill} run-owner={run} -- live slots:\n"
     ));
     for slot in 0..MAX_TASKS {
         let live = with_table(|t| {
