@@ -135,6 +135,11 @@ pub trait Kernel: Sync {
     /// The machine knows which line fired; what to do about it is the stack's.
     fn service_network(&self);
 
+    /// One block completion's work: mark the mailbox and wake the parked
+    /// submitter. Runs in interrupt context, so it must not sleep, allocate
+    /// or touch the device - the parked task retires the request itself.
+    fn service_blk(&self);
+
     /// Record the loader's command line, which `/proc/cmdline` reports and the
     /// initramfs's init reads to learn `root=`.
     fn set_cmdline(&self, cmdline: &'static str);
@@ -431,6 +436,11 @@ pub fn route_console_input(byte: u8) {
 #[inline]
 pub fn service_network() {
     registered().service_network()
+}
+
+/// Do one block completion's work. See [`Kernel::service_blk`].
+pub fn service_blk() {
+    registered().service_blk()
 }
 
 /// Record the loader's command line. See [`Kernel::set_cmdline`].

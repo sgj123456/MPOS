@@ -35,6 +35,7 @@ use self::hal::HalImpl;
 // (`mpos_msi`), so the module that arms it is gated on that word and a machine
 // without the controller has no such module rather than a stub.
 pub mod blk;
+pub mod blk_irq;
 pub mod console;
 pub mod fs9p;
 pub mod gpu;

@@ -226,28 +226,25 @@ fn what_a_read_costs_the_clock(_info: &BootInfo) -> Result<(), String> {
             read.expected
         );
 
-        // The row's pin, where the machine can carry it - see
-        // [`clock_sees_the_mask`]. The `+ 1` is the edge `Elapsed::lost` names: a
-        // tick can be delivered inside a window shorter than a period, which reads
-        // as a *negative* loss, and a claim that did not allow for it would fire on
-        // a fast device instead of on a held machine.
-        // The `lost >= 0` half is the edge this case's own note above names: a
-        // tick can be pending when the window opens and delivered as it closes,
-        // which reads as a *negative* loss - one more tick than the wall time
-        // allowed - and a negative loss is the opposite of a machine that was
-        // not held. Measured firing once under a loaded host (6 sweep lanes
-        // beside the boot, 2026-10-24): the guard as first written allowed for
-        // the edge in its arithmetic and still fired on it, because `-1 + 1`
-        // is `0` and `0 < predicted` for any real mask. A negative loss never
-        // fires; a loss below the mask's own cost still does.
-        if clock_sees_the_mask() && read.lost() >= 0 && read.lost() + 1 < predicted {
+        // The row's pin, flipped with the completion interrupt (see
+        // [`clock_sees_the_mask`]): a read no longer holds the machine for the
+        // device's own latency — the transfer submits non-blocking, waits
+        // unmasked for the completion line, and retires — so the loss is at
+        // most the submit/retire window's edge, the same bound the control
+        // above takes. The counterfactual is exact and lives one flag away:
+        // with the completion line unarmed, the transfer spins masked for the
+        // whole device call and `lost` climbs to `predicted`, firing this
+        // claim. The history this replaced — a case asserting the mask *costs*
+        // what the device latency says — is §10.5's own table, and the
+        // negative-loss guard's story is in the git log of this file.
+        if clock_sees_the_mask() && read.lost() > 1 {
             failures.push(format!(
-                "{name}: a {} ms device read ({} ms of it masked) lost {} of its {} ticks, \
-                 where a mask that long costs {predicted} - the machine was not held",
+                "{name}: a {} ms device read ({} ms of it masked) held the machine \
+                 for {} ticks - completions are interrupt-driven, and the mask \
+                 should be the submit/retire edge alone",
                 read.ns / 1_000_000,
                 mask_ns / 1_000_000,
                 read.lost(),
-                read.expected
             ));
         }
     }

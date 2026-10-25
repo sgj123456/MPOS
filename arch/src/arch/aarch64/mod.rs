@@ -485,10 +485,28 @@ pub fn halt() -> ! {
 /// The line a caller masks/unmasks by name, as this machine's GIC INTID. The
 /// timer is the non-secure EL1 physical PPI (30) and the serial is the PL011's
 /// SPI (33); a driver never says which distributor bit.
+/// The block device's completion lines, as a bitmask over SPI numbers - bit
+/// `n` set means SPI `n` is an armed block line. A **set**, because a machine
+/// carries as many virtio-blk windows as its tree lists and each names its
+/// own line: the single-value shape this replaced held only the last
+/// device's line, and every earlier device's completion stormed unread -
+/// caught by the boot's own timer check as "0 interrupts in 100 ms" with
+/// the tick pending behind two same-priority lines in service.
+pub static BLK_LINES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn gic_line(line: crate::hal::Line) -> u32 {
     match line {
         crate::hal::Line::Timer => gic::TIMER_INTID,
         crate::hal::Line::Serial => gic::SERIAL_INTID,
+        // The block lines are a *set* (a machine carries one per virtio-blk
+        // window), so they have no single INTID to name: arming goes through
+        // [`Interrupts::arm_block_line`], which configures and enables each
+        // line as its driver discovers it, and the vector matches against the
+        // mask. A Line::Block ask here is the single-line shape calling on a
+        // machine that outgrew it.
+        crate::hal::Line::Block => {
+            unreachable!("block lines are armed per device through arm_block_line")
+        }
     }
 }
 
@@ -601,6 +619,27 @@ impl crate::hal::Cpu for crate::hal::Current {
 }
 
 impl crate::hal::Interrupts for crate::hal::Current {
+    /// The block window's completion line, before it is unmasked: the SPI the
+    /// tree named goes into the store the vector compares against, and the
+    // line joins the timer's and the serial's in group and priority, because
+    // a completion that arrives into a half-written configuration is exactly
+    // the ordering the GIC's own bring-up exists to prevent.
+    #[inline]
+    fn arm_block_line(intid: u32) {
+        // The bit is `intid - 32` — SPI numbering shifted into INTID space, the
+        // same shift the vector's comparison applies. A `1u64 << intid` here is
+        // the bug this once shipped: INTID 77 is bit 45, and a plain `1 << 77`
+        // silently truncates to bit 13, arming a line nobody's comparison can
+        // ever match (measured as a completion storm the boot died in).
+        let bit = intid
+            .checked_sub(32)
+            .filter(|bit| *bit < 64)
+            .expect("block completion line outside the SPI range");
+        BLK_LINES.fetch_or(1u64 << bit, core::sync::atomic::Ordering::AcqRel);
+        gic::configure_line(intid);
+        gic::enable(intid);
+    }
+
     #[inline]
     fn unmask(line: crate::hal::Line) {
         gic::enable(gic_line(line))

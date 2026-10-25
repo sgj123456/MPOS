@@ -102,6 +102,16 @@ fn set_priority(intid: u32, priority: u8) {
     write(DIST, word, new);
 }
 
+/// Configure a runtime-named line for delivery: group and priority, the same
+/// pair the two known lines get at bring-up. A driver that discovers its own
+/// line in the tree calls this before unmasking, for the ordering the
+/// bring-up path exists to protect - a line that asserts into a half-written
+/// configuration is the interrupt that never gets delivered.
+pub fn configure_line(intid: u32) {
+    set_bit(DIST, GICD_IGROUPR, intid);
+    set_priority(intid, 0x80);
+}
+
 /// Let `intid` be delivered.
 pub fn enable(intid: u32) {
     set_bit(DIST, GICD_ISENABLER, intid);
@@ -195,6 +205,11 @@ pub fn init() {
         GICC_CTLR,
         GICC_CTLR_ENABLE_GRP0 | GICC_CTLR_ENABLE_GRP1 | GICC_CTLR_ACK_GRP1,
     );
+}
+
+/// Read a distributor register word raw, for a failed bring-up's report.
+pub fn read_raw(offset: usize) -> u32 {
+    read(DIST, offset)
 }
 
 /// Group 0's enable bit, on both interfaces.

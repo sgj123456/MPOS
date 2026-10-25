@@ -22,7 +22,7 @@
 //! x86_64, before the vector table on aarch64.
 
 use crate::hal::kernel::{self, Kernel, MemoryStartup};
-use crate::{boot, console, mm, net, sched, syscall, vfs};
+use crate::{boot, console, drivers, mm, net, sched, syscall, vfs};
 
 /// The kernel this boot is running.
 struct Services;
@@ -105,6 +105,16 @@ impl Kernel for Services {
 
     fn service_network(&self) {
         net::irq_service()
+    }
+
+    fn service_blk(&self) {
+        // The machine's own completion path: an MSI controller's single mailbox
+        // (the first machine's PCI device), or the per-device line table the
+        // MMIO transport registers against (the second machine's windows).
+        #[cfg(mpos_msi)]
+        drivers::virtio::blk_irq::complete_irq();
+        #[cfg(not(mpos_msi))]
+        drivers::virtio::mmio::complete_irq();
     }
 
     fn set_cmdline(&self, cmdline: &'static str) {

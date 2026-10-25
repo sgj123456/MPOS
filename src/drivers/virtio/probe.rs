@@ -118,8 +118,8 @@ fn storage(info: &BootInfo) {
     if let Some(dev) = blk::VirtioBlk::init() {
         candidates.push(dev);
     }
-    for (virt, size) in mmio::windows(info, VIRTIO_ID_BLOCK) {
-        if let Some(dev) = mmio::blockdev(virt, size) {
+    for (virt, size, line) in mmio::windows_with_lines(info, VIRTIO_ID_BLOCK) {
+        if let Some(dev) = mmio::blockdev(virt, size, line) {
             candidates.push(dev);
         }
     }

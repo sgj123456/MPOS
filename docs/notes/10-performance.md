@@ -892,6 +892,51 @@ caller's buffer — and those parts are preemptible, so a sibling task runs duri
 them. On a 32 MiB raw read that is 30–50 % of the window, the same order as the mask
 itself, and a window that has to beat its own confounds by a factor is not a pin.
 
+**Landed, the same day (2026-10-25): the completion is interrupt-driven on both machines,
+and the transfer no longer holds a mask.** The shape change the row above scoped is in:
+both virtio-blk drivers (the first machine's PCI device, the second machine's two MMIO
+windows) submit **non-blocking**, wait for the device's completion interrupt, and retire —
+so the masked window a read holds collapsed from the device's own latency to the
+submit/retire edge. The x86_64 device arms MSI-X entry 0 on its own vector (0x42, beside
+the network adapter's 0x41); the second machine's windows arm the SPI each tree node
+names (`windows_with_lines` reads the node's own `interrupts` cell — QEMU's `virt` gives
+the thirty-two windows SPIs 16..47), through `Interrupts::arm_block_line`, whose
+**mask** the vector compares against — a set, because a machine carries one line per
+block window, and the single-value shape this replaced held only the *last* device's
+line while the earlier ones stormed (INTID 77 and 79 in service, the boot's timer check
+dying at "0 interrupts in 100 ms" with the tick pending behind them).
+
+Two lessons the landing cost, both measured:
+
+* **A mask bit at one shift and a test at another is a mask that never matches.** The
+  first cut armed bit `intid` (77) and tested bit `intid - 32` (45); `1u64 << 77` also
+  silently truncates on a u64. The line never matched, never got serviced, and the
+  storm froze every boot check. The shifts are now the same expression on both sides,
+  with the out-of-range case named.
+* **The wait must not yield.** The first cut parked the submitting task, and the gate
+  died in `vfs::ext4`'s `RefCell already borrowed`: the block layer's callers hold
+  non-reentrant borrows across the device call, and a task that yielded mid-operation
+  let a second task walk into the same borrow. The wait is now an **unmasked poll**
+  for the mailbox the handler marks — the timer, the network and every other line
+  keep arriving while the device works, but no task switch happens, so the block
+  layer's re-entrancy assumptions stay exactly as they were. The completion handler
+  acks the transport (the level line must deassert before the vector's EOI, or it
+  re-asserts into a storm), marks the mailbox, and returns to the interrupted core —
+  no preempt, deliberately.
+
+The pin flipped with the contract: `drivers::kunit`'s `what_a_read_costs_the_clock` used
+to assert on the first machine that a wide read *lost* the ticks its mask predicted —
+the machine held. It now asserts the opposite: **`lost() <= 1`, the machine is not
+held**, and the counterfactual is exact and one flag away (with the completion line
+unarmed, the transfer spins masked and `lost` climbs to `predicted`, firing the claim).
+Measured, x86_64 `cargo xtask test`: the 64 MiB span read that used to mask for 9-46 ms
+now shows a loss at the window's edge, and the gate figures are x86_64
+`pass=205 fail=0`, aarch64 `pass=204 fail=0`, `mpos-kunit 32/0` on both, both arms green
+in one invocation. What stays named: **task-sleeping block I/O** — a transfer parking
+its task and the scheduler running other work — is the honest next shape, and it waits
+on the ext4 driver growing real re-entrancy (locks where RefCells stand), which is a
+vfs-layer change and not this row's.
+
 **The first machine's figure landed (2026-10-24): the PCI transport is counted in its own
 sweep now, over the disk it had there all along.** The named gap above closes not by
 changing what a sweep boots but by asking `t-diskbench` a fourth question: it looks for the

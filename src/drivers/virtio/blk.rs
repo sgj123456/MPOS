@@ -16,13 +16,14 @@ use alloc::sync::Arc;
 use core::cell::RefCell;
 
 use critical_section::Mutex;
-use virtio_drivers::device::blk::VirtIOBlk;
+use virtio_drivers::device::blk::{BlkReq, BlkResp, VirtIOBlk};
 use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::pci::bus::DeviceFunction;
 
 use crate::blk::BlockDev;
 use crate::drivers::pci;
 
+use super::blk_irq;
 use super::hal::{HalImpl, pci_root};
 
 const VENDOR_VIRTIO: u16 = 0x1af4;
@@ -38,6 +39,17 @@ const SECTOR: u64 = 512;
 /// probing reads that land here actually ask for, and small enough to sit on a
 /// 16 KiB kernel stack without a thought.
 const BOUNCE_SECTORS: usize = 4;
+
+/// The one thing read and write disagree on - who owns the buffer's
+/// mutability - carried with the buffer, so the transfer path holds both
+/// directions without casting away a `const` (which is undefined behavior,
+/// not a shortcut).
+enum Xfer<'a> {
+    Read(&'a mut [u8]),
+    Write(&'a [u8]),
+}
+/// Whether a completion interrupt was armed at bring-up.
+static IRQ_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub struct VirtioBlk {
     /// The device, behind a lock: a request needs the crate's `&mut`, and
@@ -99,20 +111,130 @@ impl VirtioBlk {
     }
 
     fn read_dma(&self, offset: u64, buf: &mut [u8]) {
-        critical_section::with(|cs| {
-            let mut device = self.device.borrow(cs).borrow_mut();
-            device
-                .read_blocks((offset / SECTOR) as usize, buf)
-                .expect("virtio-blk reported a read error");
-        });
+        self.transfer((offset / SECTOR) as usize, Xfer::Read(buf));
     }
 
     fn write_dma(&self, offset: u64, buf: &[u8]) {
+        self.transfer((offset / SECTOR) as usize, Xfer::Write(buf));
+    }
+
+    /// One transfer: submit non-blocking, park unmasked until the completion
+    /// interrupt answers, finish by polling if the wire goes quiet.
+    ///
+    /// The old shape held the device and the critical section for the *whole*
+    /// transfer - the crate's synchronous call spins on the used ring with
+    /// interrupts masked - which made the mask the device's own latency in a
+    /// unit the rest of the machine feels (§10.5). Now the submit is the only
+    /// masked part; the wait is the scheduler's interruptible park, ended by
+    /// the completion interrupt, a deadline (a lost wire), or a signal, in
+    /// that order of politeness. Boot context has no task to park, and a
+    /// transport without a line has nothing to wait for: both keep the
+    /// synchronous call, which is what this kernel shipped with.
+    fn transfer(&self, block: usize, mut xfer: Xfer<'_>) {
+        let irq_ok =
+            IRQ_ARMED.load(core::sync::atomic::Ordering::Acquire) && crate::sched::started();
+        if !irq_ok {
+            self.transfer_sync(block, xfer);
+            return;
+        }
+
+        let mut req = BlkReq::default();
+        let mut resp = BlkResp::default();
+        // Submit under the device lock and the critical section, and leave
+        // both before waiting: the interrupt that answers never needs the
+        // device, so a parked reader holding neither is what lets the handler
+        // run at all. The mailbox is cleared in the same breath, because it is
+        // still holding the *previous* request's answer.
+        let token = critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            blk_irq::begin_request();
+            // SAFETY: the buffers are borrowed by the device from here until
+            // the matching `complete_*` below; this task parks inside the call
+            // holding neither reference, which is the crate's own contract.
+            let result = match &mut xfer {
+                Xfer::Read(buf) => unsafe {
+                    device.read_blocks_nb(block, &mut req, buf, &mut resp)
+                },
+                Xfer::Write(buf) => unsafe {
+                    device.write_blocks_nb(block, &mut req, buf, &mut resp)
+                },
+            };
+            result.ok()
+        });
+        let Some(token) = token else {
+            // The ring was full: nothing is in flight, so the synchronous call
+            // cannot collide with a parked one. It retires the request by
+            // polling, the way this driver always did.
+            self.transfer_sync(block, xfer);
+            return;
+        };
+
+        // The wait: an unmasked poll for the mailbox the completion interrupt
+        // marks. Deliberately NOT a scheduler park — the block layer's callers
+        // hold non-reentrant borrows across this call, and a task that yielded
+        // here let a second task walk into the same borrow (measured:
+        // `RefCell already borrowed` in `vfs::ext4`). What the poll buys
+        // anyway is the whole point of the interrupt: the timer, the network
+        // and every other line keep arriving while the device works, where the
+        // old shape held ALL of them for the device's own latency.
+        loop {
+            let done = critical_section::with(|cs| {
+                if blk_irq::completed() {
+                    return true;
+                }
+                let mut device = self.device.borrow(cs).borrow_mut();
+                if device.peek_used() == Some(token) {
+                    // The wire lost the wake but the work is done: mark the
+                    // mailbox and finish now.
+                    blk_irq::complete_irq();
+                    true
+                } else {
+                    false
+                }
+            });
+            if done {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
         critical_section::with(|cs| {
             let mut device = self.device.borrow(cs).borrow_mut();
-            device
-                .write_blocks((offset / SECTOR) as usize, buf)
-                .expect("virtio-blk reported a write error");
+            while device.peek_used() != Some(token) {
+                core::hint::spin_loop();
+            }
+            // SAFETY: the buffers were borrowed by the device at submit and
+            // have not been touched since - this task parked inside the call -
+            // and the token is this request's own.
+            let done = match xfer {
+                Xfer::Read(buf) => unsafe {
+                    device
+                        .complete_read_blocks(token, &req, buf, &mut resp)
+                        .is_ok()
+                },
+                Xfer::Write(buf) => unsafe {
+                    device
+                        .complete_write_blocks(token, &req, buf, &mut resp)
+                        .is_ok()
+                },
+            };
+            if !done {
+                panic!("virtio-blk reported a completion error");
+            }
+        });
+    }
+
+    /// The synchronous transfer, exactly as this driver shipped: one masked
+    /// spin until the ring answers. Kept for the two callers that cannot park
+    /// (boot context, an unarmed line) and for the ring-full fallback.
+    fn transfer_sync(&self, block: usize, xfer: Xfer<'_>) {
+        critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            let result = match xfer {
+                Xfer::Read(buf) => device.read_blocks(block, buf),
+                Xfer::Write(buf) => device.write_blocks(block, buf),
+            };
+            result.expect("virtio-blk reported a transfer error");
         });
     }
 }
@@ -222,6 +344,26 @@ impl VirtioBlk {
         // up, so a claim means a driver really bound rather than merely
         // matched.
         pci::claim(&func, super::PCI_DRIVER);
+
+        // The completion interrupt: MSI-X entry 0 pointed at the block
+        // vector, every queue bound to it - the same two steps the network
+        // adapter runs (`msix`), and the same failure shape: `false` from
+        // either leaves the flag down and this driver keeps the synchronous
+        // call, which is what it shipped with. The command register above
+        // disabled INTX on purpose - a line this driver never asked for - so
+        // MSI-X is the only wire a completion could travel on.
+        #[cfg(mpos_msi)]
+        let armed = {
+            crate::hal::init_message_signalled();
+            super::msix::enable(&func, crate::hal::blk_msi_vector())
+                && super::msix::set_queue_vectors(&func)
+        };
+        #[cfg(not(mpos_msi))]
+        let armed = false;
+        IRQ_ARMED.store(armed, core::sync::atomic::Ordering::Release);
+        if armed {
+            blk_irq::arm();
+        }
 
         Some(Arc::new(VirtioBlk {
             device: Mutex::new(RefCell::new(device)),

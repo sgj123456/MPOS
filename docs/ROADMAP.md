@@ -411,8 +411,12 @@ In the order that keeps each step verifiable on its own:
    tracee reads `-ENOSYS` - while a write at the *exit* stop is a no-op, and the ordering the  
    redirect implies is Linux's too (a `SECCOMP_RET_ERRNO` filter judges the number the tracer  
    wrote, not the one the program asked for). Nothing of the number slot stays unnamed (§8.2).
-2. **interrupt-driven block completions** (§10.5's last row) — measured and re-scoped; §10.5  
-   carries the structure change, its pin and what each machine's clock can see.
+2. **interrupt-driven block completions** (§10.5's last row) — **landed** (2026-10-25): both  
+   virtio-blk drivers submit non-blocking and wait on a completion interrupt (x86_64 MSI-X on  
+   vector 0x42; aarch64 each MMIO window's own tree-named SPI through `arm_block_line`), the  
+   masked window a read holds collapsed from the device's latency to the submit/retire edge, and  
+   `drivers::kunit`'s pin flipped to "a wide read no longer holds the machine". What stays named:  
+   task-sleeping block I/O waits on the ext4 driver growing real re-entrancy (§10.5).
 3. **the weston pointer on the window** (R.7, §7.4) — the root cause is fixed in code: the cursor  
    queue is configured when the device has one, `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` is accepted  
    with `HOTSPOT_X`/`HOTSPOT_Y` published per-client, and binding or moving the plane hands the  

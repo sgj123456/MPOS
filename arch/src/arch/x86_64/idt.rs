@@ -22,6 +22,10 @@ static IDT: Once<InterruptDescriptorTable> = Once::new();
 /// the device to raise it when a frame lands; until it does, the handler
 /// below is registered but never runs.
 pub const NET_IRQ_VECTOR: u8 = 0x41;
+/// The vector the block device's MSI-X entry points at, beside the network
+/// one: a completion on the transfer ring lands here instead of in a masked
+/// spin inside the transfer (§10.5's structure change).
+pub const BLK_IRQ_VECTOR: u8 = 0x42;
 
 static BREAKPOINTS_CAUGHT: AtomicU64 = AtomicU64::new(0);
 
@@ -104,6 +108,10 @@ pub fn init() {
         // PIC's range and is never a CPU exception; if the driver never arms
         // it, nothing ever raises it, and the handler simply stands ready.
         table[NET_IRQ_VECTOR].set_handler_fn(virtio_net);
+        // The block device's MSI-X completion: registered once and silent
+        // until the driver arms its entry, exactly like the network vector
+        // beside it.
+        table[BLK_IRQ_VECTOR].set_handler_fn(virtio_blk);
 
         // The local APIC timer's one-shot: the scheduler arms it at the
         // earliest wait that would otherwise round up to the next PIT tick
@@ -194,6 +202,19 @@ extern "x86-interrupt" fn serial(_frame: InterruptStackFrame) {
 /// Nothing here switches tasks: like the serial handler, it wakes and lets
 /// the scheduler pick the woken task up on the next turn, so the interrupted
 /// context is never left half-modified.
+/// A block request completed on the transfer ring.
+///
+/// The mailbox is the whole of the work - ack the device, mark, leave. The
+/// submitter is *spinning* on the mailbox with interrupts unmasked (it must
+/// not yield: the block layer's callers hold non-reentrant borrows across the
+/// call), so the EOI hands the core straight back to it and it retires the
+/// request. A preempt here would switch another task in mid-operation —
+/// exactly the re-entrancy the unmasked poll exists to avoid.
+extern "x86-interrupt" fn virtio_blk(_frame: InterruptStackFrame) {
+    crate::hal::kernel::service_blk();
+    super::lapic::eoi();
+}
+
 extern "x86-interrupt" fn virtio_net(_frame: InterruptStackFrame) {
     crate::hal::kernel::service_network();
     // End the delivery before anything that might switch away, exactly as

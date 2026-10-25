@@ -204,6 +204,10 @@ pub enum Line {
     Timer,
     /// The first serial port (COM1).
     Serial,
+    /// The block device's completion line - the second machine's virtio-mmio
+    /// window's own SPI, armed by its driver. The first machine delivers the
+    /// same event by an MSI-X write and never names a line for it.
+    Block,
 }
 
 /// The interrupt controller: masking a named line, acknowledging one. The
@@ -213,6 +217,13 @@ pub enum Line {
 pub trait Interrupts {
     /// Allow delivery on `line`.
     fn unmask(line: Line);
+
+    /// Arm a *numbered* block-completion line: the second machine's virtio-mmio
+    /// window names its own SPI in the tree, so the driver hands it here before
+    /// unmasking. A machine that delivers block completions by message
+    /// (`Msi`) has no such number and answers nothing - its vector was fixed
+    /// in its own IDT.
+    fn arm_block_line(_spi: u32) {}
 
     /// Block delivery on `line`.
     fn mask(line: Line);
@@ -423,6 +434,10 @@ pub trait Msi {
     /// exactly what the table entry holds - it is written into the device's
     /// memory, not into the kernel's vocabulary.
     fn net_msi_vector() -> u8;
+
+    /// The IDT vector the block device's MSI-X entry points at, beside the
+    /// network one it was modelled on.
+    fn blk_msi_vector() -> u8;
 }
 
 /// The x87 lazy-FPU ownership protocol: which task currently owns the live FP
@@ -1344,6 +1359,12 @@ pub fn unmask(line: Line) {
     <Current as Interrupts>::unmask(line)
 }
 
+/// Arm the block completion line a tree named. See [`Interrupts::arm_block_line`].
+#[inline]
+pub fn arm_block_line(spi: u32) {
+    <Current as Interrupts>::arm_block_line(spi)
+}
+
 /// Block delivery on `line`.
 #[inline]
 pub fn mask(line: Line) {
@@ -1372,6 +1393,13 @@ pub fn init_message_signalled() {
 #[inline]
 pub fn net_msi_vector() -> u8 {
     <Current as Msi>::net_msi_vector()
+}
+
+/// The IDT vector the block device's MSI-X entry points at.
+#[cfg(mpos_msi)]
+#[inline]
+pub fn blk_msi_vector() -> u8 {
+    <Current as Msi>::blk_msi_vector()
 }
 
 /// One process's address space, as this machine's page tables.

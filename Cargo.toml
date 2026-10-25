@@ -238,6 +238,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(mpos_console_input)",
     "cfg(mpos_pci_config)",
     "cfg(mpos_input_registry)",
+    "cfg(mpos_psci_off)",
 ] }
 
 [lints]

@@ -634,6 +634,17 @@ __vec_el0_leave:
     el0_sync = sym el0_sync,
 );
 
+/// Whether `intid` is one of the block device's armed completion lines: the
+/// mask the drivers filled as each window opened. Both sides of the store and
+/// the test apply the same shift — `intid - 32`, SPI numbering in INTID space
+/// — because a store at one shift and a test at another is a mask that never
+/// matches, and a line that never matches is a line that storms (measured:
+/// the first cut armed bit `intid` and tested bit `intid - 32`).
+pub fn blk_line(intid: u32) -> bool {
+    (32..96).contains(&intid)
+        && super::BLK_LINES.load(core::sync::atomic::Ordering::Acquire) & (1 << (intid - 32)) != 0
+}
+
 /// Point `VBAR_EL1` at the table.
 pub fn init() {
     // SAFETY: `VBAR_EL1` takes the table's address, whose low eleven bits it
@@ -694,6 +705,15 @@ extern "C" fn irq() {
         // the past is a level line that never deasserts.
         timer::vtimer_disarm();
         ticked = true;
+    } else if blk_line(intid) {
+        // The block window's completion: the service table does the driver's
+        // half - ack the transport (the level line must deassert before the
+        // EOI below, or it re-asserts into a storm), then mark the mailbox.
+        // The submitter is spinning unmasked on the mailbox and must NOT be
+        // preempted: it does not yield mid-operation, and that is what keeps
+        // the block layer's non-reentrant borrows safe. No clock and nothing
+        // to charge: the tick above is the only thing that moves the clock.
+        crate::hal::kernel::service_blk();
     } else if intid == gic::SERIAL_INTID {
         // One line, two directions: a keystroke that arrived and a transmit
         // queue that has room are the same wire on this machine, and both are
@@ -770,6 +790,12 @@ extern "C" fn sync() {
                 && ((is_write && crate::hal::kernel::resolve_cow_fault(addr))
                     || crate::hal::kernel::resolve_anon_fault(addr, is_write))
             {
+                // TEMP DIAGNOSTIC
+                {
+                    use core::fmt::Write as _;
+                    let mut out = pl011::Writer;
+                    let _ = writeln!(out, "mpos: el1 fault resolved {addr:#x} w={is_write}");
+                }
                 return; // The instruction retries and succeeds.
             }
         }

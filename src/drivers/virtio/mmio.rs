@@ -34,9 +34,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use critical_section::Mutex;
-use virtio_drivers::device::blk::VirtIOBlk;
+use virtio_drivers::device::blk::{BlkReq, BlkResp, VirtIOBlk};
 use virtio_drivers::device::console::VirtIOConsole;
 use virtio_drivers::device::input::VirtIOInput;
 use virtio_drivers::device::net::VirtIONet;
@@ -44,6 +45,7 @@ use virtio_drivers::device::rng::VirtIORng;
 use virtio_drivers::device::socket::VirtIOSocket;
 use virtio_drivers::device::sound::VirtIOSound;
 use virtio_drivers::device::virtio_9p::VirtIO9p;
+use virtio_drivers::transport::InterruptStatus;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 
 use crate::blk::BlockDev;
@@ -63,9 +65,22 @@ use super::{
 /// The virtio-blk reached over MMIO, shaped as a [`BlockDev`] so the filesystem
 /// layer can mount it exactly as it mounts the PCI block device on x86_64 - the
 /// same `Ext4Fs` driver, the same sector contract, only a different transport.
+/// The device as both of its users hold it: the transfer path (submit,
+/// retire) and the interrupt path (ack the transport when the line fires).
+/// They never hold it at once - a transfer's device sections run inside
+/// critical sections, which mask interrupts, and the transfer parks holding
+/// neither - so one lock serves both.
+type SharedBlk = Arc<Mutex<RefCell<VirtIOBlk<HalImpl, MmioTransport<'static>>>>>;
+
 pub struct MmioBlk {
-    device: Mutex<RefCell<VirtIOBlk<HalImpl, MmioTransport<'static>>>>,
+    device: SharedBlk,
+    /// This device's own completion mailbox - per device, never shared.
+    mailbox: Arc<Mailbox>,
     sectors: u64,
+    /// The SPI the tree names for this window, already armed in the GIC, or 0
+    /// when the node carried none - the difference between a transfer that can
+    /// park on its completion and one that keeps the synchronous call.
+    line: u32,
 }
 
 /// Refuse a buffer this transport cannot be handed whole, naming it.
@@ -85,6 +100,122 @@ fn assert_reachable(buf: &[u8]) {
     );
 }
 
+/// How long a parked transfer waits for the wire before finishing by
+/// polling: four milliseconds, one tick - a lost line, not a slow device.
+/// Named against the clock the park answers (§6.24's rule).
+const WAIT_NS: u64 = 4_000_000;
+
+/// One transfer's direction with its buffer, the same shape the PCI driver's
+/// transfer takes: a write's descriptor is read-only to the device, so the
+/// mutability travels with the direction instead of being cast away.
+enum Xfer<'a> {
+    Read(&'a mut [u8]),
+    Write(&'a [u8]),
+}
+
+impl MmioBlk {
+    /// One transfer: submit non-blocking, park unmasked until the completion
+    /// interrupt answers, finish by polling if the wire goes quiet - the same
+    /// shape the PCI driver's transfer runs, one transport over. A window
+    /// whose tree node named no line (line 0) keeps the synchronous call: the
+    /// machine's answer for a device that cannot interrupt is the shape this
+    /// kernel shipped with, not a park that never ends.
+    fn transfer(&self, block: usize, mut xfer: Xfer<'_>) {
+        if self.line == 0 {
+            self.transfer_sync(block, xfer);
+            return;
+        }
+
+        let mut req = BlkReq::default();
+        let mut resp = BlkResp::default();
+        let token = critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            self.mailbox.completed.store(false, Ordering::Release);
+            // SAFETY: the buffers are borrowed by the device from here until
+            // the matching `complete_*` below; this task parks inside the call
+            // holding neither reference, which is the crate's own contract.
+            let result = match &mut xfer {
+                Xfer::Read(buf) => unsafe {
+                    device.read_blocks_nb(block, &mut req, buf, &mut resp)
+                },
+                Xfer::Write(buf) => unsafe {
+                    device.write_blocks_nb(block, &mut req, buf, &mut resp)
+                },
+            };
+            result.ok()
+        });
+        let Some(token) = token else {
+            self.transfer_sync(block, xfer);
+            return;
+        };
+
+        // The wait: an unmasked poll for this device's mailbox, marked by the
+        // completion interrupt. Deliberately NOT a scheduler park — the block
+        // layer's callers hold non-reentrant borrows across this call, and a
+        // task that yielded here let a second task walk into the same borrow
+        // (measured: `RefCell already borrowed` in `vfs::ext4`). The timer and
+        // every other line keep arriving while the device works, where the old
+        // shape held ALL of them for the device's own latency.
+        loop {
+            let done = critical_section::with(|cs| {
+                if self.mailbox.completed.load(Ordering::Acquire) {
+                    return true;
+                }
+                let mut device = self.device.borrow(cs).borrow_mut();
+                if device.peek_used() == Some(token) {
+                    // The wire lost the wake but the work is done: mark the
+                    // mailbox and finish now.
+                    self.mailbox.completed.store(true, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            });
+            if done {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            while device.peek_used() != Some(token) {
+                core::hint::spin_loop();
+            }
+            // SAFETY: as at submit - this task parked inside the call, and the
+            // token is this request's own.
+            let done = match xfer {
+                Xfer::Read(buf) => unsafe {
+                    device
+                        .complete_read_blocks(token, &req, buf, &mut resp)
+                        .is_ok()
+                },
+                Xfer::Write(buf) => unsafe {
+                    device
+                        .complete_write_blocks(token, &req, buf, &mut resp)
+                        .is_ok()
+                },
+            };
+            if !done {
+                panic!("virtio-blk over MMIO reported a completion error");
+            }
+        });
+    }
+
+    /// The synchronous transfer, exactly as this driver shipped. Kept for the
+    /// callers that cannot park (boot context) and for a window with no line.
+    fn transfer_sync(&self, block: usize, xfer: Xfer<'_>) {
+        critical_section::with(|cs| {
+            let mut device = self.device.borrow(cs).borrow_mut();
+            let result = match xfer {
+                Xfer::Read(buf) => device.read_blocks(block, buf),
+                Xfer::Write(buf) => device.write_blocks(block, buf),
+            };
+            result.expect("virtio-blk over MMIO reported a transfer error");
+        });
+    }
+}
+
 impl BlockDev for MmioBlk {
     fn capacity_sectors(&self) -> u64 {
         self.sectors
@@ -100,25 +231,12 @@ impl BlockDev for MmioBlk {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) {
         assert_reachable(buf);
-        critical_section::with(|cs| {
-            let mut device = self.device.borrow(cs).borrow_mut();
-            // A read error means the transport did not complete the request and a
-            // filesystem cannot proceed without the sector; the same answer the PCI
-            // `BlockDev` gives, which is why the trait carries no Result.
-            device
-                .read_blocks((offset / SECTOR as u64) as usize, buf)
-                .expect("virtio-blk over MMIO reported a read error");
-        });
+        self.transfer((offset / SECTOR as u64) as usize, Xfer::Read(buf));
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) {
         assert_reachable(buf);
-        critical_section::with(|cs| {
-            let mut device = self.device.borrow(cs).borrow_mut();
-            device
-                .write_blocks((offset / SECTOR as u64) as usize, buf)
-                .expect("virtio-blk over MMIO reported a write error");
-        });
+        self.transfer((offset / SECTOR as u64) as usize, Xfer::Write(buf));
     }
 
     fn flush(&self) -> bool {
@@ -129,19 +247,114 @@ impl BlockDev for MmioBlk {
     }
 }
 
+/// The completion mailbox of one MMIO block device: the flag its transfer
+/// waits on and the task waiting. One per device, because this machine carries
+/// **two** virtio-blk windows (the sweep's root and the pattern image the
+/// block check reads) and a single mailbox would wake the wrong waiter when
+/// both had transfers parked - the single-slot shape was the first cut here,
+/// and its second `blockdev` overwrote the first's registration, leaving the
+/// first device's line armed and unserviced: a storm of INTID 79s the boot
+/// check caught as "0 interrupts in 100 ms" while the timer sat pending
+/// behind the unserviced line's own priority.
+struct Mailbox {
+    /// The device answered. Set by the interrupt handler, cleared by whoever
+    /// submits the next request on *this* device.
+    completed: AtomicBool,
+    /// The parked submitter on this device, or 0.
+    waiter: AtomicUsize,
+}
+
+impl Mailbox {
+    const fn new() -> Self {
+        Mailbox {
+            completed: AtomicBool::new(false),
+            waiter: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// One armed line and everything its completion needs: the line number, the
+/// device whose transport register must be acknowledged before the line will
+/// deassert, and the mailbox its parked submitter waits on. A machine boots
+/// with as many of these as it has virtio-blk windows whose tree node names a
+/// line - two here.
+static ARMED: Mutex<RefCell<alloc::vec::Vec<(u32, SharedBlk, Arc<Mailbox>)>>> =
+    Mutex::new(RefCell::new(alloc::vec::Vec::new()));
+
+/// Deassert one device's completion line: read the interrupt status and
+/// acknowledge what it names. The crate's own door for it, on the transport
+/// the device holds - reached through the same lock the transfer path takes,
+/// which is free at interrupt time because a transfer parks holding neither.
+fn ack(device: &SharedBlk) {
+    use virtio_drivers::transport::Transport;
+    critical_section::with(|cs| {
+        let _ = device.borrow(cs).borrow_mut().ack_interrupt();
+    });
+}
+
+/// The interrupt path's whole work: find the entry whose line fired, ack its
+/// transport (the level line must deassert before the vector's EOI, or it
+/// re-asserts into a storm - the first cut here kept one device and the other
+/// storming), then mark that device's mailbox and wake its parked submitter.
+///
+/// Called from the vector for any INTID the machine's own lines do not name.
+/// A line that matches no entry - a driver that armed and went away - is
+/// acknowledged here too, by the entry it left behind, or it would storm.
+pub fn complete_irq() {
+    critical_section::with(|cs| {
+        let armed = ARMED.borrow(cs).borrow();
+        for (line, device, mailbox) in armed.iter() {
+            // Ack every registered device whose line is up: reading the
+            // status is side-effect-free, and only the asserting one has
+            // anything to acknowledge.
+            use virtio_drivers::transport::Transport;
+            let status = device.borrow(cs).borrow_mut().ack_interrupt();
+            if status.intersects(
+                InterruptStatus::QUEUE_INTERRUPT | InterruptStatus::DEVICE_CONFIGURATION_INTERRUPT,
+            ) {
+                mailbox.completed.store(true, Ordering::Release);
+                let waiter = mailbox.waiter.load(Ordering::Acquire);
+                if waiter != 0 {
+                    crate::sched::wake(crate::sched::TaskId(waiter));
+                }
+            }
+            let _ = line;
+        }
+    });
+}
+
 /// Open the virtio-blk window at `virt` as a [`BlockDev`], or `None` if it is not
 /// a block device. The boot hands this to `Ext4Fs::mount` so a filesystem reads
 /// through the memory-mapped transport end to end (`NOTES.md` §9.1's disk root).
-pub fn blockdev(virt: usize, size: usize) -> Option<Arc<dyn BlockDev>> {
+pub fn blockdev(virt: usize, size: usize, line: u32) -> Option<Arc<dyn BlockDev>> {
     // SAFETY: `virt` is inside the mapped, non-executable device window and `size`
     // is the tree-reported register block; the window outlives the handle.
     let header = unsafe { NonNull::new_unchecked(virt as *mut VirtIOHeader) };
     let transport = unsafe { MmioTransport::new(header, size) }.ok()?;
     let device = VirtIOBlk::<HalImpl, _>::new(transport).ok()?;
     let sectors = device.capacity();
+    let device: SharedBlk = Arc::new(Mutex::new(RefCell::new(device)));
+    let mailbox = Arc::new(Mailbox::new());
+    if line != 0 {
+        // The tree named a line for this window: configure it (group and
+        // priority - the pair the two known lines get at bring-up), register
+        // the line with its device and mailbox for the interrupt path, and
+        // unmask. A window whose node names no line keeps the synchronous
+        // transfer: the machine's answer for a device that cannot interrupt
+        // is the shape this kernel shipped with, not a park that never ends.
+        critical_section::with(|cs| {
+            ARMED
+                .borrow(cs)
+                .borrow_mut()
+                .push((line, Arc::clone(&device), Arc::clone(&mailbox)));
+        });
+        crate::hal::arm_block_line(line);
+    }
     Some(Arc::new(MmioBlk {
-        device: Mutex::new(RefCell::new(device)),
+        device,
+        mailbox,
         sectors,
+        line,
     }))
 }
 
@@ -587,6 +800,19 @@ pub unsafe fn read_identity(virt: usize, offset: usize) -> u32 {
 /// what the window answers to a driver probe rather than by position, because
 /// QEMU assigns the MMIO slots in an order nothing can rely on.
 pub fn windows(info: &mpos_bootinfo::BootInfo, want: u32) -> Vec<(usize, usize)> {
+    windows_with_lines(info, want)
+        .into_iter()
+        .map(|(virt, size, _line)| (virt, size))
+        .collect()
+}
+
+/// [`windows`], with each window's own interrupt line as the tree names it:
+/// `0` when the node carries none, and SPI `n` as INTID `n + 32` when it does
+/// (the device tree's PPI offset is 16, and a `virtio,mmio` window's line is
+/// always a shared peripheral interrupt). The block driver arms the line it
+/// is given, so a completion wakes the parked reader instead of waiting for
+/// the next poll.
+pub fn windows_with_lines(info: &mpos_bootinfo::BootInfo, want: u32) -> Vec<(usize, usize, u32)> {
     let Some(bytes) = info.dtb else {
         return Vec::new();
     };
@@ -597,6 +823,15 @@ pub fn windows(info: &mpos_bootinfo::BootInfo, want: u32) -> Vec<(usize, usize)>
     let _ = tree.each(
         |node| node.is_compatible("virtio,mmio"),
         |node| {
+            // The node's own line, before the register walk: one entry, three
+            // cells, the shape the boot checks decode for the timer.
+            let mut line = 0u32;
+            let mut interrupts = node.cells("interrupts");
+            if let (Some(kind), Some(number)) = (interrupts.next(), interrupts.next())
+                && kind == 0
+            {
+                line = number + 32;
+            }
             for (address, size) in node.reg() {
                 let (address, size) = (address as usize, size as usize);
                 let Some(virt) = crate::hal::map_mmio_window(address, size) else {
@@ -612,7 +847,7 @@ pub fn windows(info: &mpos_bootinfo::BootInfo, want: u32) -> Vec<(usize, usize)>
                     )
                 };
                 if magic == VIRTIO_MAGIC && id == want {
-                    windows.push((virt, size));
+                    windows.push((virt, size, line));
                 }
             }
             true

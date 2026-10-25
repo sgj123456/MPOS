@@ -395,6 +395,10 @@ impl crate::hal::Msi for crate::hal::Current {
     fn net_msi_vector() -> u8 {
         idt::NET_IRQ_VECTOR
     }
+
+    fn blk_msi_vector() -> u8 {
+        idt::BLK_IRQ_VECTOR
+    }
 }
 
 /// The 8259 input a named line is wired to on this machine.
@@ -402,6 +406,10 @@ fn pic_line(line: crate::hal::Line) -> u8 {
     match line {
         crate::hal::Line::Timer => 0,
         crate::hal::Line::Serial => 4,
+        // This machine's block completions are message-signalled (the MSI-X
+        // entry the driver arms), never a wired PIC input - a Line::Block ask
+        // here is a caller on the wrong machine's shape, and unreachable.
+        crate::hal::Line::Block => unreachable!("block completions are MSI-X on this machine"),
     }
 }
 
