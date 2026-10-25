@@ -242,7 +242,10 @@ mod claim_park {
     pub(super) fn wake(ids: alloc::vec::Vec<TaskId>) {
         for id in ids {
             #[cfg(target_os = "none")]
-            crate::sched::wake(id);
+            {
+                let hit = crate::sched::wake(id);
+                crate::sched::note_claim_wake_result(hit);
+            }
             #[cfg(not(target_os = "none"))]
             let _ = id;
         }

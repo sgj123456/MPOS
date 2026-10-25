@@ -3955,3 +3955,24 @@ section has left:
 
 Both counters are three lines each; the note in the roadmap's open list records
 this as the next measurement for the udev stall.
+
+**The answer, and it is in the scheduler.** With per-slot park counts and a
+claim-specific wake result in the heartbeat, the stall reads:
+
+    mpos:   claim registrations=1 handed-back=1
+    mpos:   wakes calls=7227 hits=6899 misses=328 claim-hits=3 claim-misses=0
+    mpos:   slot 9 pid 9 park 8 (ext4_scratch_wait) syscall 59 parks=540
+
+`claim-misses=0`: **every** wake the claim path issued found its waiter asleep -
+`Scheduler::wake` answered "yes, I woke it" every time. One registration, one
+hand-back, a hit, and the task is still parked. So the wait list is right, the
+wake is right, and the task that was woken is still not running: the failure is
+between `wake` returning `true` and the picker running that task again.
+
+That is the last structural reduction this investigation can make, and it moves
+the target out of `vfs/ext4` entirely: **a task woken from an uninterruptible
+park (`sleep(id, priority, u64::MAX)`) is marked runnable but not picked**. The
+next read is the scheduler's own `sleep`/`wake` pair - which run queue a sleep
+with no deadline lands in, and whether `wake` puts it back on one - and the pin
+for the fix is a host-testable scheduler case if the queue bookkeeping is
+host-compiled, otherwise a boot self-test.

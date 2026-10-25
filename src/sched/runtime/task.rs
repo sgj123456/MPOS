@@ -157,6 +157,20 @@ pub fn run_owner() -> Option<usize> {
     (slot != usize::MAX).then_some(slot)
 }
 
+/// How many times each slot has parked at all: a slot parked at a claim site
+/// with one registration behind it is a slot that slept **twice** - and a second
+/// sleep with no re-registration is stranded (`docs/notes/` §7 R.9's last two
+/// candidates).
+pub static PARKS: [AtomicU32; MAX_TASKS] = [const { AtomicU32::new(0) }; MAX_TASKS];
+
+/// How many parks `slot` has taken, in total.
+pub fn parks_of(slot: usize) -> u32 {
+    PARKS
+        .get(slot)
+        .map(|count| count.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 /// Record that `t`'s running task is about to sleep at `site`.
 fn note_park(t: &Table, site: u8) {
     if let Some(slot) = PARK_SITE.get(t.current.0) {
@@ -166,7 +180,27 @@ fn note_park(t: &Table, site: u8) {
 
 /// [`note_park`] for a primitive entering its wait, this task's own slot.
 fn note_park_current(site: u8) {
-    with_table(|t| note_park(t, site));
+    with_table(|t| {
+        note_park(t, site);
+        if let Some(count) = PARKS.get(t.current.0) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+}
+
+/// How often a claim's wake found its waiter asleep (`true`) or not (`false`):
+/// the one pair that separates "the wake landed and the waiter slept again" from
+/// "the wake found it running and its own re-check failed" (`docs/notes/` §7 R.9).
+pub static CLAIM_WAKE_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static CLAIM_WAKE_MISSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Count one claim wake's result.
+pub fn note_claim_wake_result(hit: bool) {
+    if hit {
+        CLAIM_WAKE_HITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CLAIM_WAKE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 use crate::abi::{RLIM_NLIMITS, Rlimit, default_rlimits, rlimit_admit};
@@ -3249,10 +3283,12 @@ fn heartbeat() {
         CLAIM_WOKEN.load(Ordering::Relaxed)
     ));
     crate::hal::kernel::print_line(format_args!(
-        "mpos:   wakes calls={} hits={} misses={}\n",
+        "mpos:   wakes calls={} hits={} misses={} claim-hits={} claim-misses={}\n",
         WAKE_CALLS.load(Ordering::Relaxed),
         WAKE_HITS.load(Ordering::Relaxed),
-        WAKE_MISSES.load(Ordering::Relaxed)
+        WAKE_MISSES.load(Ordering::Relaxed),
+        CLAIM_WAKE_HITS.load(Ordering::Relaxed),
+        CLAIM_WAKE_MISSES.load(Ordering::Relaxed)
     ));
     for slot in 0..MAX_TASKS {
         let live = with_table(|t| {
@@ -3269,8 +3305,9 @@ fn heartbeat() {
         let park = park_site(slot);
         let nr = last_syscall(slot);
         crate::hal::kernel::print_line(format_args!(
-            "mpos:   slot {slot} pid {pid} park {park} ({}) syscall {nr}{}\n",
+            "mpos:   slot {slot} pid {pid} park {park} ({}) syscall {nr} parks={}{}\n",
             PARK_SITES.get(park as usize).copied().unwrap_or("?"),
+            parks_of(slot),
             if slot == running { "  <-- running" } else { "" }
         ));
     }
