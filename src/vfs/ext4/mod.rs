@@ -162,6 +162,20 @@ fn in_transfer(_id: crate::sched::policy::TaskId) -> bool {
     false
 }
 
+/// Count a registration on the cache's claim-waiter list, for the heartbeat.
+fn note_claim_registration() {
+    #[cfg(target_os = "none")]
+    crate::sched::note_claim_registration();
+}
+
+/// Count waiters handed back by a claim's end.
+fn note_claim_wake(n: usize) {
+    #[cfg(target_os = "none")]
+    crate::sched::note_claim_wake(n);
+    #[cfg(not(target_os = "none"))]
+    let _ = n;
+}
+
 /// Mirror both scratch flags into the scheduler's statics for the heartbeat,
 /// called with the cache's answer after every take and every give-back.
 fn mirror_scratch(fill: bool, run: bool) {
@@ -226,6 +240,7 @@ mod claim_park {
     }
 
     pub(super) fn wake(ids: alloc::vec::Vec<TaskId>) {
+        super::note_claim_wake(ids.len());
         for id in ids {
             #[cfg(target_os = "none")]
             crate::sched::wake(id);
@@ -449,6 +464,7 @@ impl Core {
                     // sleep on a condition nobody will wake: ending a fill
                     // wakes that list (the deadlock `claim_waiters` documents).
                     cache.wait_for_claim(claim_park::me());
+                    note_claim_registration();
                     return Step::WaitScratch(scratch_site());
                 }
                 match cache.begin_fill(block, self.block_size()) {
@@ -532,6 +548,7 @@ impl Core {
                 }
                 if cache.run_busy() {
                     cache.wait_for_claim(claim_park::me());
+                    note_claim_registration();
                     return Step::WaitScratch(scratch_site());
                 }
                 match cache.begin_run(&*self.dev, block, want, self.block_size()) {

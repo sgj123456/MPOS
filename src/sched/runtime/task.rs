@@ -116,6 +116,25 @@ pub fn note_ext4_scratch(fill: bool, run: bool) {
     EXT4_RUN_BUSY.store(run, Ordering::Relaxed);
 }
 
+/// How many tasks registered on the ext4 cache's claim-waiter list, and how
+/// many the list's drainer handed back. Unequal counts, with a task asleep in
+/// the scratch wait and both scratch flags false, name which side of the lost
+/// wake is broken: a registration the drainer never saw, or a wake handed to a
+/// task that then slept anyway (`docs/notes/` §7 R.9).
+pub static CLAIM_REGISTRATIONS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static CLAIM_WOKEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Count one registration on the claim-waiter list.
+pub fn note_claim_registration() {
+    CLAIM_REGISTRATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count `n` waiters handed back by a claim's end.
+pub fn note_claim_wake(n: usize) {
+    CLAIM_WOKEN.fetch_add(n as u64, Ordering::Relaxed);
+}
+
 /// Record (or clear, with `None`) the fill scratch's holder.
 pub fn note_fill_owner(slot: Option<usize>) {
     FILL_OWNER.store(slot.unwrap_or(usize::MAX), Ordering::Relaxed);
@@ -3207,6 +3226,11 @@ fn heartbeat() {
         "mpos: heartbeat age={age}ms fill-owner={fill} run-owner={run} fill-busy={} run-busy={} -- live slots:\n",
         EXT4_FILL_BUSY.load(Ordering::Relaxed),
         EXT4_RUN_BUSY.load(Ordering::Relaxed)
+    ));
+    crate::hal::kernel::print_line(format_args!(
+        "mpos:   claim registrations={} handed-back={}\n",
+        CLAIM_REGISTRATIONS.load(Ordering::Relaxed),
+        CLAIM_WOKEN.load(Ordering::Relaxed)
     ));
     for slot in 0..MAX_TASKS {
         let live = with_table(|t| {

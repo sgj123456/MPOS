@@ -3888,3 +3888,25 @@ reached the drainer - the window between `wait_for_claim` (under the cache
 borrow) and the park; if they are equal, the wake *was* handed to a task that was
 running at the time and the bug is in the park's own re-check. Both are one boot
 away, and the fix follows from which one it is.
+
+**The counters, and why they do not settle it yet.** The first pair read at the
+stall:
+
+    mpos:   claim registrations=1 handed-back=3
+
+More handed back than registered, which is *not* the lost-wake signature - and it
+is the instrument's own fault, not the kernel's: registrations are counted at the
+two `WaitScratch` call sites only, while the `WaitSet` branch registers too.
+Counted at the funnel instead - inside `Cache::wait_for_claim`, which every
+registration goes through, and inside `end_fill`/`end_run` for what they drain -
+the pair becomes meaningful: registered > handed back is the window, equal is the
+park's own re-check.
+
+**And the shape that would make the window unnecessary.** A claim that is taken
+and never ended leaves `fill_busy`/`run_busy` set with no owner - exactly the
+state the stall shows - and today the only thing that clears the flags is the
+holder running `end_fill`/`end_run` itself. Making the claim release the scratch
+**on drop** (a `FillClaim` that borrows the cache, `Drop` clearing the flag and
+handing the waiters back) removes the whole class: a claim dropped on any path -
+an early return, an exec, a die - cannot outlive its transfer. That is the fix to
+make first, and the counters are how its absence would be caught again.
