@@ -4326,3 +4326,24 @@ uevent socket, or the trigger's own settle. The next instrument is therefore on
 the poll's *arguments*, not its count: one line per task the first time a poll
 parks on descriptors none of which is a known waker, naming the fd numbers and
 their kinds.
+
+**What the scripts' polls watch, read once per task.** A temporary line at the
+top of `poll_wait` printed the call's arguments the first time each task polled.
+The two shapes in the stalled boot are:
+
+    mpos: poll slot=7  nfds=1 timeout_ms=None   poll[0] fd=0 events=0x1 kind=0
+    mpos: poll slot=19 nfds=1 timeout_ms=Some(60978) poll[0] fd=4 events=0x1 kind=7
+    mpos: poll slot=16 nfds=1 timeout_ms=Some(60965) poll[0] fd=4 events=0x1 kind=7
+
+Slot 7 is the **udev service script's own shell** (`/etc/init.d/udev`), and it
+polls **its stdin**, descriptor 0, for `POLLIN`, with **no timeout** - while the
+udev event workers (16, 19) poll an anonymous descriptor with a sixty-second
+timeout, which is a daemon worker's ordinary loop. A service *script* waiting
+forever for readable stdin is what a `read` in a pipeline or a command inheriting
+the console would do, and it is the shape that would make openrc wait for ever
+while udevd itself is healthy.
+
+The next measurement is that descriptor's identity: what `/etc/init.d/udev` has on
+fd 0 at that moment (the console, a pipe from a command substitution, or a closed
+descriptor the kernel is reporting readable). The temporary line was removed after
+this reading, as debug output does not ship.
