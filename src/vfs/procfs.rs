@@ -1148,6 +1148,21 @@ fn task(_pid: usize) -> Option<Process> {
 /// report is derived from the task's own shape rather than read off the stored
 /// byte, and the caller asks that shape the way Linux does: a task whose id is
 /// not its group's is a thread, which is Linux's own `p->pid != p->tgid`.
+/// `wchan`'s number: the wait the task last slept in. The host build has no
+/// task table and nothing there sleeps in a kernel park, so it answers the `0`
+/// that means "nothing to name" - the same split `vfs::ext4`'s `claim_park`
+/// takes, and for the same reason: the field's *shape* is host-testable and the
+/// number is the machine's.
+fn wchan_of(tid: usize) -> u8 {
+    #[cfg(target_os = "none")]
+    return crate::sched::park_site(tid);
+    #[cfg(not(target_os = "none"))]
+    {
+        let _ = tid;
+        0
+    }
+}
+
 fn exit_signal_field(exit_signal: u8, is_thread: bool) -> i32 {
     if is_thread {
         -1
@@ -1212,9 +1227,13 @@ fn stat_line(pid: usize, tid: usize) -> Option<String> {
         Cow::Borrowed("0"),                          // blocked
         Cow::Borrowed("0"),                          // sigignore
         Cow::Borrowed("0"),                          // sigcatch
-        Cow::Borrowed("0"),                          // wchan
-        Cow::Borrowed("0"),                          // nswap
-        Cow::Borrowed("0"),                          // cnswap
+        // wchan: which wait the task last slept in, as a number the way
+        // Linux's field is one (an address there). 0 is "never parked"; the
+        // values name `sched::task::PARK_SITES`' entries, so a stuck task can
+        // say which park holds it without a debugger.
+        Cow::Owned(alloc::format!("{}", wchan_of(task.tid))),
+        Cow::Borrowed("0"), // nswap
+        Cow::Borrowed("0"), // cnswap
         // exit_signal: this task's own byte, and `-1` where it is a thread -
         // see `exit_signal_field` for the measurement and for why the report is
         // derived rather than read off the stored byte.

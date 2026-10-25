@@ -20,6 +20,56 @@ use super::child_signal::{queue_signal, table_has_deliverable, take_fatal_signal
 /// collection, for the reason given in the module docs.
 pub const MAX_TASKS: usize = 64;
 
+/// Where each task last went to sleep, for `/proc/<pid>/stat`'s `wchan` word.
+///
+/// `0` is "never parked"; the rest name the primitive the task last slept in,
+/// so a stuck task can say *which wait* it is in without a debugger - the one
+/// question this kernel could not answer while chasing the concurrent-`exec`
+/// deadlock (`docs/notes/` §7 R.9), where every candidate had to be ruled out
+/// by a boot instead of by one `ps`. The ids are a closed vocabulary because
+/// this is instrumentation with a shape, not a log line: see [`PARK_SITES`].
+///
+/// A task that parked once and is now running keeps its last site. That is
+/// enough for the question (`ps` asks about tasks that are *asleep*) and it is
+/// one store per park, not one per wake.
+pub static PARK_SITE: [AtomicU8; MAX_TASKS] = [const { AtomicU8::new(0) }; MAX_TASKS];
+
+/// The names behind [`PARK_SITE`]'s ids, for the humans reading `wchan`.
+///
+/// `/proc/<pid>/stat`'s field is a *number* in Linux (a kernel address), so the
+/// id goes there verbatim and keeps the field's shape; these names are what the
+/// number means, and they live here so the mapping cannot drift from the
+/// primitives that write it.
+pub const PARK_SITES: [&str; 7] = [
+    "0",
+    "block_until_on",
+    "block_until_nanos",
+    "block_until_interruptible_rolling_back",
+    "block_until_uninterruptible",
+    "block_until_code",
+    "block_until_deadline",
+];
+
+/// The park site a slot last slept in, `0` for never - `wchan`'s answer.
+pub fn park_site(slot: usize) -> u8 {
+    PARK_SITE
+        .get(slot)
+        .map(|site| site.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Record that `t`'s running task is about to sleep at `site`.
+fn note_park(t: &Table, site: u8) {
+    if let Some(slot) = PARK_SITE.get(t.current.0) {
+        slot.store(site, Ordering::Relaxed);
+    }
+}
+
+/// [`note_park`] for a primitive entering its wait, this task's own slot.
+fn note_park_current(site: u8) {
+    with_table(|t| note_park(t, site));
+}
+
 use crate::abi::{RLIM_NLIMITS, Rlimit, default_rlimits, rlimit_admit};
 use crate::hal;
 use crate::hal::{AbiRegs, AddressSpace, Context, ContextOps, UserFrame};
@@ -33,7 +83,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{RefCell, UnsafeCell};
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU8, Ordering};
 use critical_section::Mutex;
 /// A process's user and group identity: the real, effective and saved id of
 /// each, which is the whole of what `setuid(2)`'s family manipulates, plus
@@ -2456,6 +2506,7 @@ fn sleep_until(deadline: u64) {
 /// critical section inside that one, and releasing the inner one would turn
 /// interrupts back on before the outer section is done.
 pub fn block_until_code(id: TaskId) {
+    note_park_current(5);
     loop {
         if let Some(sig) = take_fatal_signal() {
             exit(-(sig as isize));
@@ -2489,6 +2540,7 @@ pub fn block_until(cond: impl Fn() -> bool) {
 /// the inner release would hand interrupts back before the outer section is
 /// done. Taking the borrow as a parameter makes the shared case the easy one.
 fn block_until_on(cond: impl Fn(&Table) -> bool) {
+    note_park_current(1);
     loop {
         // Signals are checked before the condition on every pass, so a fatal
         // signal kills a blocked task even if what it waited for also arrived.
@@ -2595,6 +2647,7 @@ pub enum WaitEnd {
 ///
 /// `u64::MAX` stays "no clock at all" through every conversion.
 pub fn block_until_nanos(cond: impl Fn() -> bool, deadline: u64) -> WaitEnd {
+    note_park_current(2);
     loop {
         if let Some(sig) = take_fatal_signal() {
             exit(-(sig as isize));
@@ -2670,6 +2723,7 @@ pub fn block_until_interruptible(cond: impl Fn() -> bool) -> WaitEnd {
 /// signal - including for a *traced* task, which now gets the signal-delivery
 /// stop Linux gives it rather than dying without one.
 pub fn block_until_interruptible_rolling_back(cond: impl Fn() -> bool) -> WaitEnd {
+    note_park_current(3);
     loop {
         // The condition first, and not the fatal check: Linux's own precedence.
         // `wait_for_partner` leaves its loop when the count it watches changed
@@ -2717,6 +2771,7 @@ pub fn block_until_interruptible_rolling_back(cond: impl Fn() -> bool) -> WaitEn
 /// sleeper holds for that second look, so it finds the task either already
 /// asleep or already requeued on a true condition.
 pub fn block_until_uninterruptible(cond: impl Fn() -> bool) {
+    note_park_current(4);
     loop {
         if cond() {
             return;

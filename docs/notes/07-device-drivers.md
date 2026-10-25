@@ -3682,8 +3682,28 @@ changes nothing about this reproduction either, so it landed nowhere: an
 unproven fix for a symptom it does not fix is not worth keeping, and the real
 park is still unnamed.
 
-So the next instrument is the one this kernel is missing: `/proc/<pid>/wchan`
-answers a hardcoded `0`, so a stuck task cannot say *where* it sleeps. Naming the
-park site (a per-task id set at each `block_until*` call site, printed by `wchan`)
-turns this from a bisect into one `ps` - and until then, every candidate costs a
-boot and a guess.
+So the missing instrument was built: `/proc/<pid>/wchan` used to answer a
+hardcoded `0`, and it now answers **which wait the task last slept in**. The
+mechanism is small and permanent, not a debug print: `sched::task::PARK_SITE` is
+one atomic byte per task slot, written at the entry of each park primitive
+(`block_until_on`, `block_until_nanos`, `block_until_uninterruptible`,
+`block_until_interruptible_rolling_back`, `block_until_code`), and `wchan`
+prints its number - the field keeps Linux's shape (a number there, an address)
+and `sched::task::PARK_SITES` is the vocabulary that names it. A running task
+keeps its last site, which is exactly what the question needs: `ps` asks about
+tasks that are *asleep*.
+
+**The first reading, and what it rules in.** With the instrument in the same
+reproduction - four background children, each `exec`ing a binary off the ext4
+root - all four answered `wchan = 4` = `block_until_uninterruptible`. That rules
+out every other park in the tree (wait4, poll, pipe, futex, pty, net: each has
+its own primitive or its own site) and puts the stuck tasks in the one wait the
+two earlier candidates lived in: the block mailbox's completion/claim wait
+(`drivers::virtio::blk`) and the ext4 cache's claim wait (`vfs::ext4`,
+`claim_park::wait`, which calls this primitive too). The instrument does not yet
+tell those two apart, because both enter the same primitive.
+
+**The next measurement is therefore one line of code**: give the primitive a
+site-carrying variant (or a site argument) and call it from `claim_park::wait`
+with its own id, so the same boot answers "block mailbox" or "ext4 claim" from
+`wchan` instead of from a bisect.
