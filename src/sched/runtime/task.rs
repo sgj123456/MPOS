@@ -40,7 +40,7 @@ pub static PARK_SITE: [AtomicU8; MAX_TASKS] = [const { AtomicU8::new(0) }; MAX_T
 /// id goes there verbatim and keeps the field's shape; these names are what the
 /// number means, and they live here so the mapping cannot drift from the
 /// primitives that write it.
-pub const PARK_SITES: [&str; 10] = [
+pub const PARK_SITES: [&str; 11] = [
     "0",
     "block_until_on",
     "block_until_nanos",
@@ -51,6 +51,7 @@ pub const PARK_SITES: [&str; 10] = [
     "ext4_slot_wait",
     "ext4_scratch_wait",
     "ext4_set_wait",
+    "ext4_reentry_wait",
 ];
 
 /// The park site a slot last slept in, `0` for never - `wchan`'s answer.

@@ -125,6 +125,53 @@ pub(crate) const SLOT_WAIT: u8 = 7;
 pub(crate) const SCRATCH_WAIT: u8 = 8;
 pub(crate) const SET_WAIT: u8 = 9;
 
+/// A reader that is waiting for the scratch **while it is itself inside a
+/// claim's transfer** - the signature of the cache being re-entered from the
+/// code path that holds it (a nested claim that can never be satisfied). It
+/// is a park site of its own so one `wchan` answers "re-entry" instead of
+/// leaving it to be inferred from a boot (`docs/notes/` §7 R.9).
+pub(crate) const REENTRY_WAIT: u8 = 10;
+
+/// Whether each task slot is inside a claim's device transfer right now, read
+/// by the scratch wait to tell re-entry from ordinary contention. Machine-only:
+/// the host build has no task table and never transfers.
+#[cfg(target_os = "none")]
+static IN_TRANSFER: [core::sync::atomic::AtomicBool; crate::sched::MAX_TASKS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::sched::MAX_TASKS];
+
+#[cfg(target_os = "none")]
+fn set_in_transfer(id: crate::sched::policy::TaskId, inside: bool) {
+    if let Some(slot) = IN_TRANSFER.get(id.0) {
+        slot.store(inside, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(target_os = "none")]
+fn in_transfer(id: crate::sched::policy::TaskId) -> bool {
+    IN_TRANSFER
+        .get(id.0)
+        .map(|slot| slot.load(core::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "none"))]
+fn set_in_transfer(_id: crate::sched::policy::TaskId, _inside: bool) {}
+
+#[cfg(not(target_os = "none"))]
+fn in_transfer(_id: crate::sched::policy::TaskId) -> bool {
+    false
+}
+
+/// The park site a scratch wait should carry: [`REENTRY_WAIT`] when the waiter
+/// is itself mid-transfer, [`SCRATCH_WAIT`] otherwise.
+fn scratch_site() -> u8 {
+    if in_transfer(claim_park::me()) {
+        REENTRY_WAIT
+    } else {
+        SCRATCH_WAIT
+    }
+}
+
 mod claim_park {
     // `TaskId` is the claim's currency on both builds; the `sched` paths
     // exist only on the machine, and the bodies name them in full so the
@@ -349,8 +396,9 @@ impl Core {
             Ready,
             /// Someone else's claim: park on it.
             Wait,
-            /// The fill scratch is out with another claim: park on that.
-            WaitScratch,
+            /// The fill scratch is out with another claim: park on that, with
+            /// the site the reading needs (re-entry or plain contention).
+            WaitScratch(u8),
             /// No free way in the block's set - every way is carrying a
             /// claim. Unreachable while the two scratches are all the claims
             /// there can be, and answered honestly anyway.
@@ -373,7 +421,7 @@ impl Core {
                     // sleep on a condition nobody will wake: ending a fill
                     // wakes that list (the deadlock `claim_waiters` documents).
                     cache.wait_for_claim(claim_park::me());
-                    return Step::WaitScratch;
+                    return Step::WaitScratch(scratch_site());
                 }
                 match cache.begin_fill(block, self.block_size()) {
                     Some(claim) => Step::Go(claim),
@@ -390,8 +438,8 @@ impl Core {
                         !self.with_cache(|cache| cache.loading(block).is_some())
                     });
                 }
-                Step::WaitScratch => {
-                    claim_park::wait(SCRATCH_WAIT, || !self.with_cache(|cache| cache.fill_busy()));
+                Step::WaitScratch(site) => {
+                    claim_park::wait(site, || !self.with_cache(|cache| cache.fill_busy()));
                 }
                 Step::WaitSet => {
                     claim_park::wait(SET_WAIT, || {
@@ -399,7 +447,10 @@ impl Core {
                     });
                 }
                 Step::Go(mut claim) => {
+                    let me = claim_park::me();
+                    set_in_transfer(me, true);
                     self.dev.read_at(claim.offset(), claim.scratch_mut());
+                    set_in_transfer(me, false);
                     let woken = critical_section::with(|cs| {
                         let mut cache = self.cache.borrow(cs).borrow_mut();
                         cache.end_fill(claim)
@@ -428,7 +479,7 @@ impl Core {
             /// Someone else's claim on the head block: park on it.
             Wait,
             /// The run scratch is out with another claim: park on that.
-            WaitScratch,
+            WaitScratch(u8),
             /// Some way of one of the run's sets is in flight: no free way
             /// for the span. Unreachable while two scratches are all the
             /// claims there are, and answered anyway.
@@ -449,7 +500,7 @@ impl Core {
                 }
                 if cache.run_busy() {
                     cache.wait_for_claim(claim_park::me());
-                    return Step::WaitScratch;
+                    return Step::WaitScratch(scratch_site());
                 }
                 match cache.begin_run(&*self.dev, block, want, self.block_size()) {
                     Some(claim) => Step::Go(claim),
@@ -466,8 +517,8 @@ impl Core {
                         !self.with_cache(|cache| cache.loading(block).is_some())
                     });
                 }
-                Step::WaitScratch => {
-                    claim_park::wait(SCRATCH_WAIT, || !self.with_cache(|cache| cache.run_busy()));
+                Step::WaitScratch(site) => {
+                    claim_park::wait(site, || !self.with_cache(|cache| cache.run_busy()));
                 }
                 Step::WaitSet => {
                     claim_park::wait(SET_WAIT, || {
