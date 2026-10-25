@@ -4177,3 +4177,25 @@ the recorded fill owner or the mailbox's waiter, print one line with its slot,
 pid, name and the mailbox's state. One boot then says whether a *fatal signal*
 reached a task mid-transfer, or whether the "death" is a mirror that was never
 cleared.
+
+**No task dies holding the claim - so the claim is leaked by a path that is not
+death.** A temporary line in `sched::exit` printed whenever the exiting task was
+the recorded fill/run holder or the mailbox's waiter. At the stall it printed
+**zero times**, while the heartbeat still said
+
+    mpos: heartbeat ... fill-owner=slot 6/pid 6 fill-busy=true blk-busy=true blk-waiter=none
+    (no slot 6 in the live table)
+
+So the owning slot is absent, the fill is still out, and **nothing went through
+`exit()` while holding it**. The holder-leak theory is therefore wrong in the form
+it was tried in (which is why both reclaims failed to move the boot): the claim is
+not outlived by a dead task, it is *never given back* by a path that does not die -
+the `Go` arm of the read loop either never reaches its `end_fill`/`note_fill_owner(None)`
+pair, or the slot table's absence means something else entirely (a slot reused, a
+mapping read wrong).
+
+The next instrument is the claim's own lifecycle rather than its holder: a
+**begin/end counter pair on `begin_fill`/`end_fill`** (and the run pair), printed
+in the heartbeat. `begin - end == 1` with the claim out proves that a claim was
+taken and never ended, and the same pair says when it happens relative to the
+stall - which is the smallest fact this section still lacks.
