@@ -158,7 +158,8 @@ impl VirtioBlk {
         // itself; `finish_request` wakes the queue when the transfer retires.
         while !blk_irq::begin_request(me) {
             if blk_irq::wait_for_device(me) {
-                crate::sched::block_until_uninterruptible(|| !blk_irq::busy());
+                let deadline = crate::hal::since_boot_nanos() + WAIT_NS;
+                crate::sched::block_until_uninterruptible_until(4, || !blk_irq::busy(), deadline);
             }
         }
 
@@ -197,9 +198,11 @@ impl VirtioBlk {
         // interrupt — with one poll per period for a wire that lost the wake.
         let mut deadline = crate::hal::since_boot_nanos() + WAIT_NS;
         while !blk_irq::completed() {
-            crate::sched::block_until_uninterruptible(|| {
-                blk_irq::completed() || crate::hal::since_boot_nanos() >= deadline
-            });
+            // A timed park, not `block_until_uninterruptible`: the condition
+            // carries a deadline and the park must end at it, or a completion
+            // interrupt that never arrives is a task asleep for ever - which is
+            // exactly what the poll below exists to recover from.
+            crate::sched::block_until_uninterruptible_until(4, || blk_irq::completed(), deadline);
             if blk_irq::completed() {
                 break;
             }

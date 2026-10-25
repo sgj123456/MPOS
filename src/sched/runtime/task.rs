@@ -2918,6 +2918,37 @@ pub fn block_until_uninterruptible(cond: impl Fn() -> bool) {
 /// `/proc/<pid>/wchan` is only as useful as the vocabulary it prints. The
 /// block mailbox and the ext4 cache claims are exactly that pair: both park
 /// here, and only the caller knows which (`docs/notes/` §7 R.9).
+/// [`block_until_uninterruptible_armed`] whose wait also ends at `deadline`:
+/// the condition, or the clock, and never a signal.
+///
+/// The block layer's transfer needs this and nothing else: its buffers are lent
+/// to the device for the duration, so a signal must not unwind the wait - but a
+/// completion interrupt that never came must not park the task for ever either.
+/// Its own comment already promises "one poll per period for a wire that lost the
+/// wake"; a park with `u64::MAX` as its deadline cannot deliver that, because
+/// nothing wakes the task to look at the clock (`docs/notes/` §7 R.9's second
+/// stall: a fill held by a task asleep on a transfer that never retires).
+pub fn block_until_uninterruptible_until(site: u8, cond: impl Fn() -> bool, deadline: u64) {
+    note_park_current(site);
+    loop {
+        if cond() || hal::since_boot_nanos() >= deadline {
+            return;
+        }
+        schedule(|t| {
+            if cond() || hal::since_boot_nanos() >= deadline {
+                t.requeue_current();
+            } else {
+                let id = t.current;
+                let priority = t.task(id).priority;
+                let now = hal::since_boot_nanos();
+                t.sched.advance(now);
+                let remaining = deadline.saturating_sub(now).max(1);
+                t.sched.sleep(id, priority, remaining);
+            }
+        });
+    }
+}
+
 pub fn block_until_uninterruptible_at(site: u8, cond: impl Fn() -> bool) {
     block_until_uninterruptible_armed(site, cond, || {})
 }

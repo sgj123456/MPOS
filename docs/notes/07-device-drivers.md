@@ -4028,3 +4028,32 @@ green. The first aarch64 arm lost lane 2 to the documented §13.32 boot-EL0
 observation (`EXCEPTION: synchronous`, `FAR_EL1` the page past `kernel_end`), its
 QEMU was killed and the arm re-run alone - the second run is the one quoted, as
 that trap prescribes.
+
+**The block wait gets the clock its own comment promised - and the boot moves
+again.** `blk.rs`'s completion wait used `block_until_uninterruptible`, whose park
+sleeps with `u64::MAX`: its "one poll per period for a wire that lost the wake"
+could never happen, because nothing woke the task to look at the clock. With
+
+    block_until_uninterruptible_until(site, cond, deadline)
+
+the wait ends at the deadline, the used ring is polled, and the transfer retries.
+The desktop boot with it now passes **both** `Starting udev ...` and udev's own
+trigger:
+
+    * Starting udev ...                        [ ok ]
+    * Generating a rule to create a /dev/root symlink ...  [ ok ]
+    * Populating /dev with existing devices through uevents ...  [ ok ]
+
+and stops afterwards with a new shape in the heartbeat: `fill-owner=slot 6/pid 6
+fill-busy=true`, a dozen fresh processes (pids 9-18) all parked at
+`ext4_scratch_wait`, and the owner in the block wait (site 4). So the remaining
+stall is a **device transfer that is submitted and never retired** - the whole
+ext4 claim path is now visibly healthy (registrations and hand-backs within the
+number of parked waiters, every claim wake hitting), and the queue is behind one
+transfer that the used ring never answers.
+
+The next measurement is the block driver's own: count submits, IRQs, retirements
+and poll timeouts inside `blk_irq`/`blk.rs` and print them from the transfer path
+or in the heartbeat's header - a submit with no IRQ and no used-ring entry names
+the kick/doorbell or the IRQ-ack as the culprit, which is the file's own
+"interrupt-driven completions" work from `3107e71`.
