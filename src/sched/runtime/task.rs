@@ -3117,10 +3117,16 @@ static LAST_BEAT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// single "is anything parked" dump cannot distinguish from progress).
 const HEARTBEAT_NS: u64 = 5_000_000_000;
 
-/// One line every [`HEARTBEAT_NS`] from the tick, in interrupt context: the
+/// One table every [`HEARTBEAT_NS`] from the tick, in interrupt context: the
 /// console's own write never parks, which is why this is safe from here where a
-/// dump built in the idle loop was not (it printed nothing at all - the
-/// reading is in the note).
+/// dump built in the idle loop was not (it printed nothing at all - the reading
+/// is in the note).
+///
+/// The whole slot table and not one line, because the two halves of a hang have
+/// to be read together: which slots are *parked* (and where) says what waits,
+/// and which slots are switched to says what spins - a single last-ran line
+/// named the spinner and could not say that udev's own processes were asleep
+/// (`docs/notes/` §7 R.9).
 fn heartbeat() {
     use core::sync::atomic::Ordering;
     let now = hal::since_boot_nanos();
@@ -3131,38 +3137,30 @@ fn heartbeat() {
     LAST_BEAT_NS.store(now, Ordering::Relaxed);
     let progress = LAST_PROGRESS_NS.load(Ordering::Relaxed);
     let age = now.saturating_sub(progress) / 1_000_000;
-    let slot = LAST_RAN_SLOT.load(Ordering::Relaxed);
-    if slot == usize::MAX {
-        crate::hal::kernel::print_line(format_args!(
-            "mpos: heartbeat age={age}ms no task has run yet\n"
-        ));
-        return;
-    }
-    let pid = super::pid::pid_number_of(TaskId(slot)).unwrap_or(0);
-    let park = park_site(slot);
-    // The name, copied out under the table borrow so nothing allocates in
-    // interrupt context: the stored `comm` bytes first (what `PR_SET_NAME`
-    // writes), then the tail of the image path - between them they name the
-    // process even when it never set a name, which is the udev-service case
-    // (`docs/notes/` §7 R.9's next line).
-    let mut comm = [0u8; 16];
-    let mut tail = [0u8; 40];
-    with_table(|t| {
-        if let Some(Some(task)) = t.tasks.get(slot) {
-            comm = task.mm.comm_name_bytes();
-            let exe = task.exe.as_bytes();
-            let n = exe.len().min(tail.len());
-            tail[..n].copy_from_slice(&exe[exe.len() - n..]);
-        }
-    });
-    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
-    let nr = last_syscall(slot);
+    let running = LAST_RAN_SLOT.load(Ordering::Relaxed);
     crate::hal::kernel::print_line(format_args!(
-        "mpos: heartbeat age={age}ms last slot={slot} pid={pid} parked={park} ({}) syscall={nr} comm={} exe={}\n",
-        PARK_SITES.get(park as usize).copied().unwrap_or("?"),
-        core::str::from_utf8(&comm[..end]).unwrap_or("?"),
-        core::str::from_utf8(&tail).unwrap_or("?")
+        "mpos: heartbeat age={age}ms -- live slots (running = last switched to):\n"
     ));
+    for slot in 0..MAX_TASKS {
+        let live = with_table(|t| {
+            t.tasks
+                .get(slot)
+                .and_then(|task| task.as_ref())
+                .map(|task| !task.exited)
+                .unwrap_or(false)
+        });
+        if !live {
+            continue;
+        }
+        let pid = super::pid::pid_number_of(TaskId(slot)).unwrap_or(0);
+        let park = park_site(slot);
+        let nr = last_syscall(slot);
+        crate::hal::kernel::print_line(format_args!(
+            "mpos:   slot {slot} pid {pid} park {park} ({}) syscall {nr}{}\n",
+            PARK_SITES.get(park as usize).copied().unwrap_or("?"),
+            if slot == running { "  <-- running" } else { "" }
+        ));
+    }
 }
 
 /// The scheduler task's body. Every scheduling decision is made here, on a stack

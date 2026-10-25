@@ -3814,3 +3814,30 @@ site, syscall) rather than the last-ran line: one boot then shows both halves at
 once - which slots are parked where (`4`/`7`/`8`, the claim path) and which two
 kernel slots are looping - and the looping pair's identity is the remaining
 question.
+
+**The whole table, and the line that settles it.** The heartbeat now prints every
+live slot - id, pid, park site, last syscall, and which one was switched to. At
+the udev stall:
+
+    mpos:   slot 1 pid 1 park 4 (block_until_uninterruptible) syscall 61
+    mpos:   slot 4 pid 4 park 0 syscall 0
+    mpos:   slot 5 pid 5 park 0 syscall 0  <-- running
+    mpos:   slot 6 pid 6 park 4 (block_until_uninterruptible) syscall 61
+    mpos:   slot 7 pid 7 park 2 (block_until_nanos) syscall 7
+    mpos:   slot 8 pid 8 park 8 (ext4_scratch_wait) syscall 4
+    mpos:  slot 10 pid 10 park 2 (block_until_nanos) syscall 281
+
+`syscall 61` is `wait4` (init and the service's parent waiting for children),
+`syscall 7`/`281` the pollers (a daemon's event loop), and **slot 8 is parked at
+the ext4 scratch**, which is the deadlock shape the concurrent-exec reproduction
+found - now read from the boot itself. The two slots switched to are kernel work
+(no image, no syscalls), so the machine is otherwise idle: everything that should
+drive udev is parked, and one of those parks is the scratch.
+
+**What is left to name is the claim's owner.** The scratch flag is held and no
+live slot is in a transfer, so the owner took the claim and did not come back for
+it. The instrument for that is one field: the cache records the owner's task id in
+`begin_fill`/`begin_run`, clears it in `end_*`, and the heartbeat prints it on the
+`ext4_scratch_wait` line. If the id names a slot that is not live, the claim
+outlived its task; if it names one of the parked slots, the cycle is visible
+without another guess.
