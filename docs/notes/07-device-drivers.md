@@ -4524,3 +4524,27 @@ records travel on (fd 3 in the builder, read by openrc) and the builder's own
 writer whose reads are fine but whose records never arrive, or a reader that
 finished early - and the cheap way to see it is a guest boot with the same script
 run under `strace -f` and its fd 3 piped to a file, which is what the handoff says.
+
+**Run standalone, the script completes; run under openrc, it spins.** In a booted
+guest with a shell, `RC_SCRIPTDIRS=/etc/init.d sh /usr/libexec/rc/sh/gendepends.sh
+3>/root/deps.out` runs to its end (the trace was cut short by a *strace* crash, not
+by the script: this kernel's `PTRACE_GET_SYSCALL_INFO` reports the operation as
+the exit one on entry, `ptrace_syscall_info.op == 2`, and the tracee then dies on a
+user `#PF` at `0x8c` - the same ptrace shape this session found earlier, and a bug
+of its own).
+
+So the script alone is fine and the difference is the context openrc gives it: the
+environment it exports per service and, most of all, **fd 3 being a live pipe to
+openrc**. The spin is therefore most likely either
+
+* a **write into fd 3 that never completes** (openrc not draining the pipe while it
+  waits, and the subshell blocked in `write`), which would show as a park in a
+  pipe wait rather than in `read`; or
+* a **read from a service script on fd 0** in a context where the shell has taken
+  the same path differently - but that path works standalone, so the environment
+  has to be the difference.
+
+The next measurement is the faithful one: prepare the same pipe openrc does (a
+reader that drains slowly), export the variables openrc exports, and run the script
+with `strace` **after** fixing `PTRACE_GET_SYSCALL_INFO`'s op value, because until
+that is fixed strace cannot be the instrument for any script on this kernel.
