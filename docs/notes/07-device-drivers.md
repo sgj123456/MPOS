@@ -4282,3 +4282,10 @@ task parked) rather than a queue behind a dead claim.
 The pin still owed for the reclaims is a boot self-test: leave a claim with a
 holder that has exited and assert the next asker gets the scratch. It is named
 here because it is not written yet.
+
+**Gate, the two reclaims.** x86_64 `pass=210 fail=0` (210 built), aarch64
+`pass=209 fail=0` (209 built), `mpos-kunit 32 passed, 0 failed` on both; host unit
+suite 637 / 0 failed. The first aarch64 arm lost lane 0 to the documented §13.32
+boot-EL0 observation (`EXCEPTION: synchronous`, `FAR_EL1` the page past
+`kernel_end`); the lane's QEMU was killed and the arm re-run alone, and the re-run
+- `pass=209 fail=0`, exit 0 - is the one quoted, as that trap prescribes.
