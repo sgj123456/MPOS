@@ -4057,3 +4057,26 @@ and poll timeouts inside `blk_irq`/`blk.rs` and print them from the transfer pat
 or in the heartbeat's header - a submit with no IRQ and no used-ring entry names
 the kick/doorbell or the IRQ-ack as the culprit, which is the file's own
 "interrupt-driven completions" work from `3107e71`.
+
+**The stall after the trigger names a claim whose holder is gone.** The
+heartbeat at that stall reads
+
+    mpos: heartbeat ... fill-owner=slot 6/pid 6 ... fill-busy=true -- live slots:
+    ... slot 5 pid 5 ... slot 10 pid 10 ... (no slot 6)
+
+`fill-owner` names slot 6 and the slot table does not contain it: the task took
+the fill scratch inside its transfer arm and **died there**, so `end_fill` never
+ran and the flag outlived its holder. Every later reader then queues on a scratch
+nobody holds - which is the dozen `ext4_scratch_wait` entries the same heartbeat
+prints, all of them waiting on a claim whose owner no longer exists.
+
+The fix is to record the holder **in the cache** (`fill_owner`/`run_owner`) and
+make `fill_busy()`/`run_busy()` answer "out **and its holder is alive**", so a
+dead claim's scratch is free for the next asker (`sched::is_exited` is the
+liveness question; the host build answers alive, where no claim outlives its
+arm). That was written and tried: the boot does not regress with it (still
+reaches udev-trigger and stops after it), so it is **not** what the boot is
+waiting on now - and an unproven change is not landed. It is the next fix to
+make, with a boot self-test as its pin (a task that dies holding a claim must
+leave the scratch usable), and the stall it does not address is the one after
+`Populating /dev ... [ ok ]`, whose heartbeat has not yet been read.
