@@ -4130,3 +4130,25 @@ owner died between the interrupt and its own `finish_request`). The mirror now
 clears on `complete_irq`, so the next boot's header distinguishes "claimed by
 slot N" from "completed, waiting for a retirement that will never come" - and that
 distinction is the next reading.
+
+**The distribution, four runs.** The stall is a race, so the reading that matters
+is where the *stock* desktop image stops over several boots (each 160 s, the same
+binary, nothing else touching the machine):
+
+    RUN 1: * Populating /dev with existing devices through uevents ...
+    RUN 2: * Populating /dev with existing devices through uevents ...
+    RUN 3: * Populating /dev with existing devices through uevents ...
+    RUN 4: * Populating /dev with existing devices through uevents ...
+
+Four of four reach udev's trigger and stop there - past `Starting udev ...` and
+past the /dev/root rule, consistently, which is the shape the two fixes
+(`claim re-arm`, the block wait's deadline) bought. The earlier boot that stopped
+back at `Starting udev ...` is the same race landing differently, not a different
+stage.
+
+What comes next is the *handoff out of* `openrc sysinit`: nothing after the
+trigger prints a `*` line, so either sysinit's own exit or the inittab's next line
+(`openrc boot`) is where it stops. The heartbeat's table at that moment names
+parked slots but not their commands, and the next instrument change is therefore
+one field: **each slot's `comm` in the table**, so the stuck tasks can be named -
+`openrc`, `udevadm`, a shell or a daemon - instead of inferred from a park site.
