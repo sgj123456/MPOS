@@ -4106,3 +4106,27 @@ self-test: the state a dead holder leaves must be reclaimable). The stall to rea
 next is the cycle the table shows: which task holds the mailbox that slot 10 is
 waiting for, and what *it* is waiting on - the heartbeat already prints every
 slot's park site, so the answer is in the next boot's table.
+
+**The cycle, and an instrument bug that hid it.** With the mailbox mirrored into
+the heartbeat and the device-claim wait given its own park site (11), the stall
+after udev-trigger reads:
+
+    mpos: heartbeat ... blk-busy=true blk-waiter=slot 6 -- live slots:
+    ... no slot 6 ...
+    mpos:   slot 9 pid 9 park 11 (blk_claim_wait) syscall 0 parks=21814
+    mpos:   slot 10 pid 10 park 11 (blk_claim_wait) syscall 4 parks=29768
+
+So the **mailbox is claimed by slot 6, which is not in the live table** - a task
+that claimed the device and died before retiring, exactly the leak shape the fill
+scratch showed. Two reclaims were then tried (the claim's holder recorded in the
+cache and the mailbox's holder liveness), singly and together, and the boot still
+stops at the same line - so the mailbox's *recorded* holder is not the whole
+story.
+
+And the instrument itself has a hole worth recording: `complete_irq` swaps
+`WAITER` to 0 and the heartbeat's mirror was only written on claim and retirement,
+so `blk-waiter=slot 6` may name a claim that has already been completed (the
+owner died between the interrupt and its own `finish_request`). The mirror now
+clears on `complete_irq`, so the next boot's header distinguishes "claimed by
+slot N" from "completed, waiting for a retirement that will never come" - and that
+distinction is the next reading.

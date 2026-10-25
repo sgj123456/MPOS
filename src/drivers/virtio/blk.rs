@@ -159,7 +159,7 @@ impl VirtioBlk {
         while !blk_irq::begin_request(me) {
             if blk_irq::wait_for_device(me) {
                 let deadline = crate::hal::since_boot_nanos() + WAIT_NS;
-                crate::sched::block_until_uninterruptible_until(4, || !blk_irq::busy(), deadline);
+                crate::sched::block_until_uninterruptible_until(11, || !blk_irq::busy(), deadline);
             }
         }
 

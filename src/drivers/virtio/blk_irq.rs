@@ -47,6 +47,10 @@ static COMPLETED: AtomicBool = AtomicBool::new(false);
 /// honest one for a device that cannot interrupt.
 static ARMED: AtomicBool = AtomicBool::new(false);
 
+/// When the last completion interrupt was taken, for the abandoned-claim grace
+/// period in [`holder_exited`].
+static IRQ_AT_NS: AtomicU64 = AtomicU64::new(0);
+
 /// How many completion interrupts this boot has taken. The pin
 /// (`drivers::kunit`'s case) reads it across a device call: a read that moved
 /// `count` and left it unmoved was completed by polling, not by the wire.
@@ -86,6 +90,10 @@ pub fn irq_count() -> u64 {
     IRQ_COUNT.load(Ordering::Relaxed)
 }
 
+/// Whether the mailbox's recorded waiter has exited: a claim whose owner is gone
+/// can never be retired by it, so it is abandoned rather than held (measured:
+/// `blk-waiter=slot 6` with slot 6 absent from the task table - `docs/notes/` §7
+/// R.9).
 /// Whether a transfer is in flight.
 pub fn busy() -> bool {
     BUSY.load(Ordering::Acquire)
@@ -102,6 +110,7 @@ pub fn begin_request(me: TaskId) -> bool {
         }
         COMPLETED.store(false, Ordering::Release);
         WAITER.store(me.0, Ordering::Release);
+        crate::sched::note_blk_mailbox(true, Some(me.0));
         true
     })
 }
@@ -127,6 +136,7 @@ pub fn wait_for_device(me: TaskId) -> bool {
 pub fn finish_request() {
     let queued = critical_section::with(|cs| {
         BUSY.store(false, Ordering::Release);
+        crate::sched::note_blk_mailbox(false, None);
         WAITER.store(0, Ordering::Release);
         core::mem::take(&mut *QUEUE.borrow(cs).borrow_mut())
     });
@@ -144,8 +154,12 @@ pub fn finish_request() {
 /// before its first condition check (which the flag answers).
 pub fn complete_irq() {
     IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    IRQ_AT_NS.store(crate::hal::since_boot_nanos(), Ordering::Relaxed);
     COMPLETED.store(true, Ordering::Release);
     let waiter = WAITER.swap(0, Ordering::AcqRel);
+    // The claim is still in flight (the owner retires it), but no slot holds it
+    // any more - mirrored so the heartbeat does not report a stale owner.
+    crate::sched::note_blk_mailbox(true, None);
     if waiter != 0 {
         crate::sched::wake(TaskId(waiter));
     }

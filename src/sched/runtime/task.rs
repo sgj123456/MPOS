@@ -40,7 +40,7 @@ pub static PARK_SITE: [AtomicU8; MAX_TASKS] = [const { AtomicU8::new(0) }; MAX_T
 /// id goes there verbatim and keeps the field's shape; these names are what the
 /// number means, and they live here so the mapping cannot drift from the
 /// primitives that write it.
-pub const PARK_SITES: [&str; 11] = [
+pub const PARK_SITES: [&str; 12] = [
     "0",
     "block_until_on",
     "block_until_nanos",
@@ -52,6 +52,7 @@ pub const PARK_SITES: [&str; 11] = [
     "ext4_scratch_wait",
     "ext4_set_wait",
     "ext4_reentry_wait",
+    "blk_claim_wait",
 ];
 
 /// The park site a slot last slept in, `0` for never - `wchan`'s answer.
@@ -98,6 +99,20 @@ pub static FILL_OWNER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(usize::MAX);
 pub static RUN_OWNER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// The block mailbox's claim, mirrored for the heartbeat: whether a transfer is
+/// in flight and which slot holds it. A stall where a reader waits for the
+/// device while another task holds it is a cycle, and the cycle is only visible
+/// if both halves are printed together (`docs/notes/` §7 R.9).
+pub static BLK_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub static BLK_WAITER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Mirror the block mailbox's claim.
+pub fn note_blk_mailbox(busy: bool, waiter: Option<usize>) {
+    BLK_BUSY.store(busy, Ordering::Relaxed);
+    BLK_WAITER.store(waiter.unwrap_or(usize::MAX), Ordering::Relaxed);
+}
 
 /// The ext4 cache's two scratch flags, mirrored here for the heartbeat: the
 /// cache owns them, and a boot that stalls on one has to be readable from the
@@ -3327,9 +3342,14 @@ fn heartbeat() {
         })
         .unwrap_or_else(|| "none".into());
     crate::hal::kernel::print_line(format_args!(
-        "mpos: heartbeat age={age}ms fill-owner={fill} run-owner={run} fill-busy={} run-busy={} -- live slots:\n",
+        "mpos: heartbeat age={age}ms fill-owner={fill} run-owner={run} fill-busy={} run-busy={} blk-busy={} blk-waiter={} -- live slots:\n",
         EXT4_FILL_BUSY.load(Ordering::Relaxed),
-        EXT4_RUN_BUSY.load(Ordering::Relaxed)
+        EXT4_RUN_BUSY.load(Ordering::Relaxed),
+        BLK_BUSY.load(Ordering::Relaxed),
+        match BLK_WAITER.load(Ordering::Relaxed) {
+            slot if slot == usize::MAX => alloc::format!("none"),
+            slot => alloc::format!("slot {slot}"),
+        }
     ));
     crate::hal::kernel::print_line(format_args!(
         "mpos:   claim registrations={} handed-back={}\n",
