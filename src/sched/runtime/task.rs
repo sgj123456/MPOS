@@ -150,6 +150,35 @@ pub fn note_claim_wake(n: usize) {
     CLAIM_WOKEN.fetch_add(n as u64, Ordering::Relaxed);
 }
 
+/// How many ext4 fill/run claims were taken and how many were given back. A pair
+/// that differs by one while the claim is out is the proof that a claim was taken
+/// and never ended - the fact the stall after udev-trigger needs, now that the
+/// exit path says the holder did not die (`docs/notes/` §7 R.9).
+pub static FILL_BEGINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static FILL_ENDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static RUN_BEGINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static RUN_ENDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Count a fill claim taken.
+pub fn note_fill_begin() {
+    FILL_BEGINS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a fill claim given back.
+pub fn note_fill_end() {
+    FILL_ENDS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a run claim taken.
+pub fn note_run_begin() {
+    RUN_BEGINS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a run claim given back.
+pub fn note_run_end() {
+    RUN_ENDS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Record (or clear, with `None`) the fill scratch's holder.
 pub fn note_fill_owner(slot: Option<usize>) {
     FILL_OWNER.store(slot.unwrap_or(usize::MAX), Ordering::Relaxed);
@@ -3357,12 +3386,18 @@ fn heartbeat() {
         CLAIM_WOKEN.load(Ordering::Relaxed)
     ));
     crate::hal::kernel::print_line(format_args!(
-        "mpos:   wakes calls={} hits={} misses={} claim-hits={} claim-misses={}\n",
+        "mpos:   wakes calls={} hits={} misses={} claim-hits={} claim-misses={} fill={}/{}(out={}) run={}/{}(out={})\n",
         WAKE_CALLS.load(Ordering::Relaxed),
         WAKE_HITS.load(Ordering::Relaxed),
         WAKE_MISSES.load(Ordering::Relaxed),
         CLAIM_WAKE_HITS.load(Ordering::Relaxed),
-        CLAIM_WAKE_MISSES.load(Ordering::Relaxed)
+        CLAIM_WAKE_MISSES.load(Ordering::Relaxed),
+        FILL_BEGINS.load(Ordering::Relaxed),
+        FILL_ENDS.load(Ordering::Relaxed),
+        FILL_BEGINS.load(Ordering::Relaxed) as i64 - FILL_ENDS.load(Ordering::Relaxed) as i64,
+        RUN_BEGINS.load(Ordering::Relaxed),
+        RUN_ENDS.load(Ordering::Relaxed),
+        RUN_BEGINS.load(Ordering::Relaxed) as i64 - RUN_ENDS.load(Ordering::Relaxed) as i64
     ));
     for slot in 0..MAX_TASKS {
         let live = with_table(|t| {

@@ -176,6 +176,25 @@ fn note_claim_wake(n: usize) {
     let _ = n;
 }
 
+/// Count a fill claim taken / given back, for the heartbeat's lifecycle pair.
+fn note_fill_begin() {
+    #[cfg(target_os = "none")]
+    crate::sched::note_fill_begin();
+}
+fn note_fill_end() {
+    #[cfg(target_os = "none")]
+    crate::sched::note_fill_end();
+}
+/// [`note_fill_begin`] for the run scratch.
+fn note_run_begin() {
+    #[cfg(target_os = "none")]
+    crate::sched::note_run_begin();
+}
+fn note_run_end() {
+    #[cfg(target_os = "none")]
+    crate::sched::note_run_end();
+}
+
 /// Mirror both scratch flags into the scheduler's statics for the heartbeat,
 /// called with the cache's answer after every take and every give-back.
 fn mirror_scratch(fill: bool, run: bool) {
@@ -473,7 +492,10 @@ impl Core {
                     return Step::WaitScratch(scratch_site());
                 }
                 match cache.begin_fill(block, self.block_size()) {
-                    Some(claim) => Step::Go(claim),
+                    Some(claim) => {
+                        note_fill_begin();
+                        Step::Go(claim)
+                    }
                     None => Step::WaitSet,
                 }
             });
@@ -511,6 +533,7 @@ impl Core {
                         let mut cache = self.cache.borrow(cs).borrow_mut();
                         cache.end_fill(claim)
                     });
+                    note_fill_end();
                     note_fill_owner(None);
                     mirror_scratch(false, false);
                     // Outside every lock, the way every wake is handed.
@@ -559,7 +582,10 @@ impl Core {
                     return Step::WaitScratch(scratch_site());
                 }
                 match cache.begin_run(&*self.dev, block, want, self.block_size()) {
-                    Some(claim) => Step::Go(claim),
+                    Some(claim) => {
+                        note_run_begin();
+                        Step::Go(claim)
+                    }
                     None => Step::WaitSet,
                 }
             });
@@ -595,6 +621,7 @@ impl Core {
                         let mut cache = self.cache.borrow(cs).borrow_mut();
                         cache.end_run(claim)
                     });
+                    note_run_end();
                     note_run_owner(None);
                     mirror_scratch(false, false);
                     // Outside every lock, the way every wake is handed.

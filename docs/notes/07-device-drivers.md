@@ -4199,3 +4199,20 @@ The next instrument is the claim's own lifecycle rather than its holder: a
 in the heartbeat. `begin - end == 1` with the claim out proves that a claim was
 taken and never ended, and the same pair says when it happens relative to the
 stall - which is the smallest fact this section still lacks.
+
+**The lifecycle pair, and the leak is intermittent.** `begin_fill`/`end_fill` (and
+the run pair) are counted now and printed in the heartbeat. One boot reads
+
+    mpos: ... fill=5457/5457(out=0) run=0/0(out=0)   blk-busy=false blk-waiter=none
+
+- every fill taken was given back, no mailbox claim outstanding - and that boot
+stops at the same place the stalled ones do (`Starting udev ...` again). So the
+leak is **not** on every boot: the two boots that reached udev's trigger leaked a
+fill (the one whose owner slot 6 was gone), this one did not.
+
+Together with the zero exit-path hits, the shape is now: the claim is leaked
+**sometimes**, by a path that neither dies nor reaches `end_fill`, and the run
+scratch never leaks at all in these readings. The next reading is the same pair
+sampled at the *moment* `begin - end` first becomes 1 (print one line when
+`note_fill_begin` makes the pair unequal, with the slot and syscall) - a single
+line that dates the leak instead of inferring it after the fact.
