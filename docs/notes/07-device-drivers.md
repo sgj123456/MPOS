@@ -4478,3 +4478,22 @@ heartbeat with names and syscalls, the poll-spin line with the descriptor's
 identity and the syscall before the poll). The next step is the strace of that
 script in a booted guest, plus a host measurement of `read` on a regular file at
 EOF.
+
+**The minimal reproduction does not reproduce.** In a booted guest with a shell,
+the three shapes a plain file-read takes under busybox `sh` all succeed:
+
+    read a b c < /etc/init.d/crond                  -> rc=0
+    exec 0</etc/init.d/crond; read a b c            -> rc=0
+    while read a b c < /etc/init.d/crond; do...     -> rc=0, reads the shebang
+
+and the only spin the new detector reported in that session was the *interactive
+shell* polling its console (`fd=0 kind=3` - a character device, not a file), which
+is a shell waiting for input and not the bug.
+
+So `gendepends.sh`'s loop is not "a shell reads a regular file" - that works. What
+differs in the failing context is the environment the script runs under (its fds,
+its `RC_*` variables and the commands it runs after the `read`), and the next
+measurement is the script run *as openrc runs it*: `strace -f` of
+`gendepends.sh` inside a booted guest, with the same environment, to see the
+sequence around the `rt_sigprocmask`/`poll` loop rather than a hand-made shape of
+it.
