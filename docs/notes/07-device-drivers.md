@@ -3976,3 +3976,33 @@ next read is the scheduler's own `sleep`/`wake` pair - which run queue a sleep
 with no deadline lands in, and whether `wake` puts it back on one - and the pin
 for the fix is a host-testable scheduler case if the queue bookkeeping is
 host-compiled, otherwise a boot self-test.
+
+**The fix, and the boot moves past `udev`.** The claim wait was re-arming its
+wake-up registration **once**, before the first park; a waiter woken and sent back
+to sleep (a second claim took the scratch) was off the list forever after that.
+The primitive now has an armed variant - `block_until_uninterruptible_armed(site,
+cond, arm)` runs `arm` before **every** sleep - and `claim_park::wait` passes the
+registration through it. With that:
+
+    * Starting udev ...
+     [ ok ]
+     * Generating a rule to create a /dev/root symlink ...
+     [ ok ]
+     * Populating /dev with existing devices through uevents ...
+
+and the heartbeat's list counters are balanced for the first time
+(`registrations=4286 handed-back=4286`, `claim-misses=0`). The desktop boot no
+longer stops at `udev`; it reaches udev's own trigger phase, which is where the
+next reading starts.
+
+**And the next stall is visible in the same instrument.** During the trigger the
+heartbeat holds
+
+    mpos: heartbeat ... fill-owner=slot 9/pid 9 ... fill-busy=true
+
+with the list counters frozen: the fill scratch is out to task 9 and that
+transfer never completes, while the machine keeps waking things (the global wake
+count climbs ~700/s). The claim path is now correct; the block transfer inside it
+is the next suspect, and the heartbeat already names the owner - so the next
+measurement is that task's park site from the slot table (site 4, the mailbox, or
+elsewhere) and then the mailbox's completion path.

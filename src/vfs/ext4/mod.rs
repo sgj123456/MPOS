@@ -230,12 +230,21 @@ mod claim_park {
     /// Wait for a claim to end. Uninterruptible on the machine for the
     /// reason every claim wait is: the task that would end it cannot be
     /// interrupted mid-transfer either, so the wait has no other end.
-    pub(super) fn wait(site: u8, cond: impl Fn() -> bool) {
+    ///
+    /// `arm` runs **before every sleep**, not once: a waiter that is woken and
+    /// sent back to sleep (a second claim took the scratch between its wake and
+    /// its re-check) must be on the next drain's list too, or that drain's wake
+    /// finds nobody. The boot measured exactly that - every claim wake hit, and
+    /// the waiter slept again unregistered (`docs/notes/` §7 R.9).
+    pub(super) fn wait(site: u8, cond: impl Fn() -> bool, arm: impl Fn()) {
         #[cfg(target_os = "none")]
-        crate::sched::block_until_uninterruptible_at(site, cond);
+        crate::sched::block_until_uninterruptible_armed(site, cond, arm);
         #[cfg(not(target_os = "none"))]
-        while !cond() {
-            core::hint::spin_loop();
+        {
+            arm();
+            while !cond() {
+                core::hint::spin_loop();
+            }
         }
     }
 
@@ -439,8 +448,8 @@ impl Core {
     fn ensure_block(&self, block: u64) {
         enum Step {
             Ready,
-            /// Someone else's claim: park on it.
-            Wait,
+            /// Someone else's claim: park on it, naming the way it holds.
+            Wait(usize),
             /// The fill scratch is out with another claim: park on that, with
             /// the site the reading needs (re-entry or plain contention).
             WaitScratch(u8),
@@ -458,38 +467,38 @@ impl Core {
                     return Step::Ready;
                 }
                 if let Some(at) = cache.loading(block) {
-                    cache.wait_on(at, claim_park::me());
-                    return Step::Wait;
+                    return Step::Wait(at);
                 }
                 if cache.fill_busy() {
-                    // Registered on the cache's claim waiters, *not* left to
-                    // sleep on a condition nobody will wake: ending a fill
-                    // wakes that list (the deadlock `claim_waiters` documents).
-                    cache.wait_for_claim(claim_park::me());
                     return Step::WaitScratch(scratch_site());
                 }
                 match cache.begin_fill(block, self.block_size()) {
                     Some(claim) => Step::Go(claim),
-                    None => {
-                        cache.wait_for_claim(claim_park::me());
-                        Step::WaitSet
-                    }
+                    None => Step::WaitSet,
                 }
             });
             match step {
                 Step::Ready => return,
-                Step::Wait => {
-                    claim_park::wait(SLOT_WAIT, || {
-                        !self.with_cache(|cache| cache.loading(block).is_some())
-                    });
+                Step::Wait(at) => {
+                    claim_park::wait(
+                        SLOT_WAIT,
+                        || !self.with_cache(|cache| cache.loading(block).is_some()),
+                        || self.with_cache_mut(|cache| cache.wait_on(at, claim_park::me())),
+                    );
                 }
                 Step::WaitScratch(site) => {
-                    claim_park::wait(site, || !self.with_cache(|cache| cache.fill_busy()));
+                    claim_park::wait(
+                        site,
+                        || !self.with_cache(|cache| cache.fill_busy()),
+                        || self.with_cache_mut(|cache| cache.wait_for_claim(claim_park::me())),
+                    );
                 }
                 Step::WaitSet => {
-                    claim_park::wait(SET_WAIT, || {
-                        !self.with_cache(|cache| cache.set_in_flight(block))
-                    });
+                    claim_park::wait(
+                        SET_WAIT,
+                        || !self.with_cache(|cache| cache.set_in_flight(block)),
+                        || self.with_cache_mut(|cache| cache.wait_for_claim(claim_park::me())),
+                    );
                 }
                 Step::Go(mut claim) => {
                     let me = claim_park::me();
@@ -526,7 +535,7 @@ impl Core {
         enum Step {
             Ready,
             /// Someone else's claim on the head block: park on it.
-            Wait,
+            Wait(usize),
             /// The run scratch is out with another claim: park on that.
             WaitScratch(u8),
             /// Some way of one of the run's sets is in flight: no free way
@@ -544,35 +553,38 @@ impl Core {
                     return Step::Ready;
                 }
                 if let Some(at) = cache.loading(block) {
-                    cache.wait_on(at, claim_park::me());
-                    return Step::Wait;
+                    return Step::Wait(at);
                 }
                 if cache.run_busy() {
-                    cache.wait_for_claim(claim_park::me());
                     return Step::WaitScratch(scratch_site());
                 }
                 match cache.begin_run(&*self.dev, block, want, self.block_size()) {
                     Some(claim) => Step::Go(claim),
-                    None => {
-                        cache.wait_for_claim(claim_park::me());
-                        Step::WaitSet
-                    }
+                    None => Step::WaitSet,
                 }
             });
             match step {
                 Step::Ready => return,
-                Step::Wait => {
-                    claim_park::wait(SLOT_WAIT, || {
-                        !self.with_cache(|cache| cache.loading(block).is_some())
-                    });
+                Step::Wait(at) => {
+                    claim_park::wait(
+                        SLOT_WAIT,
+                        || !self.with_cache(|cache| cache.loading(block).is_some()),
+                        || self.with_cache_mut(|cache| cache.wait_on(at, claim_park::me())),
+                    );
                 }
                 Step::WaitScratch(site) => {
-                    claim_park::wait(site, || !self.with_cache(|cache| cache.run_busy()));
+                    claim_park::wait(
+                        site,
+                        || !self.with_cache(|cache| cache.run_busy()),
+                        || self.with_cache_mut(|cache| cache.wait_for_claim(claim_park::me())),
+                    );
                 }
                 Step::WaitSet => {
-                    claim_park::wait(SET_WAIT, || {
-                        !self.with_cache(|cache| cache.set_in_flight(block))
-                    });
+                    claim_park::wait(
+                        SET_WAIT,
+                        || !self.with_cache(|cache| cache.set_in_flight(block)),
+                        || self.with_cache_mut(|cache| cache.wait_for_claim(claim_park::me())),
+                    );
                 }
                 Step::Go(mut claim) => {
                     let me = claim_park::me();
@@ -596,6 +608,10 @@ impl Core {
     /// The cache, for a read-only question asked outside the claim loops.
     fn with_cache<R>(&self, f: impl FnOnce(&cache::Cache) -> R) -> R {
         critical_section::with(|cs| f(&self.cache.borrow(cs).borrow()))
+    }
+
+    fn with_cache_mut<R>(&self, f: impl FnOnce(&mut cache::Cache) -> R) -> R {
+        critical_section::with(|cs| f(&mut self.cache.borrow(cs).borrow_mut()))
     }
 
     fn read_bytes(&self, block: u64, off: usize, dst: &mut [u8]) {

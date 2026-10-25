@@ -2919,8 +2919,31 @@ pub fn block_until_uninterruptible(cond: impl Fn() -> bool) {
 /// block mailbox and the ext4 cache claims are exactly that pair: both park
 /// here, and only the caller knows which (`docs/notes/` §7 R.9).
 pub fn block_until_uninterruptible_at(site: u8, cond: impl Fn() -> bool) {
+    block_until_uninterruptible_armed(site, cond, || {})
+}
+
+/// [`block_until_uninterruptible_at`] whose wake-up registration is **per
+/// sleep**: `arm` runs before every park, so a waiter that is woken and sent back
+/// to sleep (its condition false again - a new claim took what it waited for) is
+/// registered for the next wake as well.
+///
+/// The one-shot shape is right for a caller that does its own arming around each
+/// park; it is wrong inside a loop like this one, and the desktop boot is the
+/// measurement: a waiter on the ext4 cache's scratch was woken by every claim that
+/// ended - `claim-hits` in the heartbeat counted each one - and slept again after
+/// each, registered only for the first. When the next claim ended there was
+/// nobody on the list, and the boot stopped at `Starting udev ...` with the
+/// waiter parked and both scratch flags false (`docs/notes/` §7 R.9).
+pub fn block_until_uninterruptible_armed(site: u8, cond: impl Fn() -> bool, arm: impl Fn()) {
     note_park_current(site);
     loop {
+        if cond() {
+            return;
+        }
+        // The registration and the check after it: a wake that lands between them
+        // finds a running task (a no-op) and the second look finds the condition
+        // true, so the pair cannot lose it.
+        arm();
         if cond() {
             return;
         }
