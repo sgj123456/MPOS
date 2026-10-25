@@ -3671,8 +3671,19 @@ because the waiter is never handed back.
 
 It does **not** cure this reproduction: with that fix built in, four concurrent
 `exec`s still stop in `execve` (state `S`, no transfer in flight) and the desktop
-boot still stops at `Starting udev ...`. So the park that hangs is a third one,
-and the next instrument is the one this kernel is missing: `/proc/<pid>/wchan`
+boot still stops at `Starting udev ...`.
+
+A second candidate was tried and is also ruled out, this one a real bug on its
+own terms: the block layer's completion wait parks with `u64::MAX` as its sleep
+deadline, so the "one poll per period for a wire that lost the wake" its own
+comment promises can never happen - a missed completion interrupt would sleep
+for ever. Giving that wait a deadline (`block_until_uninterruptible_nanos`)
+changes nothing about this reproduction either, so it landed nowhere: an
+unproven fix for a symptom it does not fix is not worth keeping, and the real
+park is still unnamed.
+
+So the next instrument is the one this kernel is missing: `/proc/<pid>/wchan`
 answers a hardcoded `0`, so a stuck task cannot say *where* it sleeps. Naming the
 park site (a per-task id set at each `block_until*` call site, printed by `wchan`)
-turns this from a bisect into one `ps`.
+turns this from a bisect into one `ps` - and until then, every candidate costs a
+boot and a guess.
