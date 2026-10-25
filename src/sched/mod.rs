@@ -93,7 +93,7 @@ pub use runtime::{
     signal_alt_stack, sleep_ns, sleep_ticks, snapshot, snapshots, space_root_of, spawn,
     spawn_permanent, spawn_user, started, stop_of, take_child_event, take_continued_report,
     take_deliverable_siginfo, take_deliverable_signal, take_exit_code, take_fatal_signal,
-    take_pending_event, take_signal_in_set, take_stop_report, take_vmas, task_count,
+    take_pending_event, take_signal_in_set, take_stop_report, take_vmas, task_alive, task_count,
     thread_group_has_siblings, thread_snapshots, time_offsets, timer_alloc, timer_arm,
     timer_overrun, timer_remove, timer_state, tls_of, trace_options, trace_syscall, tracer_of,
     try_spawn_user, uid_members, unmap_user, unshare_cgroup, unshare_files, unshare_fs,

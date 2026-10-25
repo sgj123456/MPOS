@@ -101,6 +101,21 @@ pub(crate) struct FillClaim {
     scratch: Vec<u8>,
 }
 
+impl FillClaim {
+    /// The way this claim marked `loading` - the cache records it so a claim whose
+    /// holder dies can be given back whole.
+    pub(crate) fn at(&self) -> usize {
+        self.at
+    }
+}
+
+impl RunClaim {
+    /// The ways this claim marked `loading`, for the same give-back.
+    pub(crate) fn places(&self) -> &[usize] {
+        &self.places[..self.width]
+    }
+}
+
 /// A run claim: `width` consecutive blocks, the slot each will land in, and
 /// the run scratch the one transfer reads into. Every slot of the span is
 /// claimed for the transfer's duration, ready ones included - a slot left
@@ -118,6 +133,27 @@ pub(crate) struct RunClaim {
 
 const NO_WAY: usize = usize::MAX;
 
+/// Whether a claim's holder may still give the scratch back. The measured leak is
+/// a task that exits inside the transfer arm (`fill-owner=slot 6 ... alive=false
+/// exited=true` in the heartbeat, syscall 231 = `exit_group`), so an exited holder
+/// cannot be coming back for its claim.
+fn holder_alive(owner: Option<TaskId>) -> bool {
+    match owner {
+        // Unrecorded: the instant between taking a claim and naming itself, or a
+        // host test driving the cache directly. Only a *known* dead owner frees.
+        None => true,
+        Some(id) => {
+            #[cfg(target_os = "none")]
+            return crate::sched::task_alive(id);
+            #[cfg(not(target_os = "none"))]
+            {
+                let _ = id;
+                true
+            }
+        }
+    }
+}
+
 /// Set-associative, write-through block cache: `block % CACHE_SETS` picks a set,
 /// a miss takes a claim whose transfer the *caller* makes outside every borrow,
 /// and every modification is pushed straight back.
@@ -133,11 +169,18 @@ pub(crate) struct Cache {
     run: Vec<u8>,
     /// Whether the run scratch is out with a claim.
     run_busy: bool,
+    /// The task that took the run scratch and the ways it marked.
+    run_owner: Option<TaskId>,
+    run_places: [usize; RUN_BLOCKS],
+    run_places_len: usize,
     /// Where a single-block fill lands while the device works - claimed like
     /// the run scratch, for the same reason: it is cache-owned state a second
     /// claimant would clobber.
     fill: Vec<u8>,
     fill_busy: bool,
+    /// The task that took the fill scratch and the way it marked `loading`.
+    fill_owner: Option<TaskId>,
+    fill_at: Option<usize>,
     /// Tasks parked on a claim they are **not** a slot of: the fill scratch,
     /// the run scratch, or a set whose every way is in flight. Drained - and
     /// woken outside every lock - by whichever claim ends, together with the
@@ -171,8 +214,13 @@ impl Cache {
             clock: 0,
             run: Vec::new(),
             run_busy: false,
+            run_owner: None,
+            run_places: [NO_WAY; RUN_BLOCKS],
+            run_places_len: 0,
             fill: Vec::new(),
             fill_busy: false,
+            fill_owner: None,
+            fill_at: None,
             claim_waiters: Vec::new(),
         }
     }
@@ -201,12 +249,12 @@ impl Cache {
 
     /// Whether the fill scratch is out with a claim.
     pub(crate) fn fill_busy(&self) -> bool {
-        self.fill_busy
+        self.fill_busy && holder_alive(self.fill_owner)
     }
 
     /// Whether the run scratch is out with a claim.
     pub(crate) fn run_busy(&self) -> bool {
-        self.run_busy
+        self.run_busy && holder_alive(self.run_owner)
     }
 
     /// Date a hit: without this, "least recently used" would be "first loaded"
@@ -236,6 +284,50 @@ impl Cache {
         self.slots[at].waiters.push(me);
     }
 
+    /// Record `me` as the fill scratch's holder and the way its claim marked.
+    pub(crate) fn own_fill(&mut self, me: TaskId, at: usize) {
+        self.fill_owner = Some(me);
+        self.fill_at = Some(at);
+    }
+
+    /// Record `me` as the run scratch's holder and the ways its claim marked.
+    pub(crate) fn own_run(&mut self, me: TaskId, places: &[usize]) {
+        self.run_owner = Some(me);
+        let n = places.len().min(RUN_BLOCKS);
+        self.run_places[..n].copy_from_slice(&places[..n]);
+        self.run_places_len = n;
+    }
+
+    /// Give back every claim whose holder has gone, in full: the flags, the
+    /// owners, and the ways the claims marked `loading`. Without the last part a
+    /// leaked claim keeps `victim` from finding a way and `begin_fill` from
+    /// starting, which is how a dozen udev workers queued behind a dead task's
+    /// fill (`docs/notes/` §7 R.9).
+    pub(crate) fn forget_abandoned(&mut self) -> bool {
+        let mut gave_back = false;
+        if self.fill_busy && !holder_alive(self.fill_owner) {
+            if let Some(at) = self.fill_at.take() {
+                self.slots[at].loading = false;
+            }
+            self.fill_busy = false;
+            self.fill_owner = None;
+            gave_back = true;
+        }
+        if self.run_busy && !holder_alive(self.run_owner) {
+            for i in 0..self.run_places_len {
+                let at = self.run_places[i];
+                if at != NO_WAY {
+                    self.slots[at].loading = false;
+                }
+            }
+            self.run_places_len = 0;
+            self.run_busy = false;
+            self.run_owner = None;
+            gave_back = true;
+        }
+        gave_back
+    }
+
     /// Park `me` on the claims in general - the scratch, or a set with no
     /// free way - as opposed to [`Cache::wait_on`]'s per-slot list. Whoever
     /// ends any claim wakes this list, and the waiter re-checks its own
@@ -253,7 +345,8 @@ impl Cache {
     /// "not now" - the set has no free way, or the scratch is out - and the
     /// caller re-derives from the top after waiting on whichever it was.
     pub(crate) fn begin_fill(&mut self, block: u64, block_size: usize) -> Option<FillClaim> {
-        if self.fill_busy {
+        self.forget_abandoned();
+        if self.fill_busy() {
             return None;
         }
         let base = (block % CACHE_SETS as u64) as usize * CACHE_WAYS;
@@ -294,6 +387,8 @@ impl Cache {
         slot.stamp = self.clock;
         self.fill = claim.scratch;
         self.fill_busy = false;
+        self.fill_owner = None;
+        self.fill_at = None;
         woken.append(&mut slot.waiters);
         woken
     }
@@ -388,6 +483,8 @@ impl Cache {
         }
         self.run = claim.scratch;
         self.run_busy = false;
+        self.run_owner = None;
+        self.run_places_len = 0;
         woken
     }
 

@@ -95,8 +95,24 @@ pub fn irq_count() -> u64 {
 /// `blk-waiter=slot 6` with slot 6 absent from the task table - `docs/notes/` §7
 /// R.9).
 /// Whether a transfer is in flight.
+fn holder_exited() -> bool {
+    let waiter = WAITER.load(Ordering::Acquire);
+    if waiter != 0 {
+        return !crate::sched::task_alive(TaskId(waiter));
+    }
+    // No waiter recorded: the completion handler swapped it out, so only the
+    // owner's retirement was left - and no owner is coming back for it
+    // (`docs/notes/` §7 R.9). The grace keeps a living owner's window between
+    // the interrupt and its own finish_request from being mistaken for death.
+    let seen = IRQ_AT_NS.load(Ordering::Relaxed);
+    COMPLETED.load(Ordering::Acquire)
+        && seen != 0
+        && crate::hal::since_boot_nanos().saturating_sub(seen) > 100_000_000
+}
+
+/// Whether a transfer is in flight **with a living holder**.
 pub fn busy() -> bool {
-    BUSY.load(Ordering::Acquire)
+    BUSY.load(Ordering::Acquire) && !holder_exited()
 }
 
 /// Claim the device for one transfer and clear the mailbox for it, or report
@@ -105,6 +121,11 @@ pub fn busy() -> bool {
 /// completion that lands between claim and park still answers.
 pub fn begin_request(me: TaskId) -> bool {
     critical_section::with(|_| {
+        if BUSY.load(Ordering::Acquire) && holder_exited() {
+            BUSY.store(false, Ordering::Release);
+            WAITER.store(0, Ordering::Release);
+            COMPLETED.store(false, Ordering::Release);
+        }
         if BUSY.swap(true, Ordering::AcqRel) {
             return false;
         }
@@ -154,6 +175,7 @@ pub fn finish_request() {
 /// before its first condition check (which the flag answers).
 pub fn complete_irq() {
     IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    IRQ_AT_NS.store(crate::hal::since_boot_nanos(), Ordering::Relaxed);
     IRQ_AT_NS.store(crate::hal::since_boot_nanos(), Ordering::Relaxed);
     COMPLETED.store(true, Ordering::Release);
     let waiter = WAITER.swap(0, Ordering::AcqRel);

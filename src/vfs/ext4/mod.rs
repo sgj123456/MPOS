@@ -485,6 +485,7 @@ impl Core {
         loop {
             let step = critical_section::with(|cs| {
                 let mut cache = self.cache.borrow(cs).borrow_mut();
+                cache.forget_abandoned();
                 if cache.ready(block).is_some() {
                     return Step::Ready;
                 }
@@ -496,6 +497,7 @@ impl Core {
                 }
                 match cache.begin_fill(block, self.block_size()) {
                     Some(claim) => {
+                        cache.own_fill(claim_park::me(), claim.at());
                         note_fill_begin();
                         Step::Go(claim)
                     }
@@ -575,6 +577,7 @@ impl Core {
         loop {
             let step = critical_section::with(|cs| {
                 let mut cache = self.cache.borrow(cs).borrow_mut();
+                cache.forget_abandoned();
                 if cache.ready(block).is_some() {
                     return Step::Ready;
                 }
@@ -586,6 +589,7 @@ impl Core {
                 }
                 match cache.begin_run(&*self.dev, block, want, self.block_size()) {
                     Some(claim) => {
+                        cache.own_run(claim_park::me(), claim.places());
                         note_run_begin();
                         Step::Go(claim)
                     }
