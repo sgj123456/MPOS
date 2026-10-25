@@ -4347,3 +4347,22 @@ The next measurement is that descriptor's identity: what `/etc/init.d/udev` has 
 fd 0 at that moment (the console, a pipe from a command substitution, or a closed
 descriptor the kernel is reporting readable). The temporary line was removed after
 this reading, as debug output does not ship.
+
+**The poller is `openrc-run`, and what it watches is always-ready.** Reading the
+service script settles one thing and sharpens the next: `/etc/init.d/udev` has no
+`read` of its own, and its interpreter is `/sbin/openrc-run` - which is the process
+whose `comm` openrc sets to the script path for `ps` friendliness. So the task
+polling **fd 0 for `POLLIN` with no timeout** is `openrc-run`, waiting on its own
+stdin.
+
+And the default `VfsNode::poll_ready` is `Ready::ALL` - every node that never
+blocks, regular files included, is *always* ready. A caller polling an always-ready
+descriptor is told "ready" at every call; if its read then says end-of-file and it
+does not treat that as the end, its loop is a spin. That is the shape to check
+next, and it is checkable from the poll side without guessing: when a task polls
+the same descriptor ready more than ~100 times, print the fd, its kind, the
+readiness reported (read/write/hup/err) and the events asked for - one line that
+tells an always-ready file from a hang-up nobody consumed.
+
+The temporary per-task argument dump was removed after its reading; this note is
+what survives of it, because debug output does not ship.
