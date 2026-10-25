@@ -4497,3 +4497,30 @@ measurement is the script run *as openrc runs it*: `strace -f` of
 `gendepends.sh` inside a booted guest, with the same environment, to see the
 sequence around the `rt_sigprocmask`/`poll` loop rather than a hand-made shape of
 it.
+
+**What the script writes, and the step openrc never finished.** Reading the whole
+of `gendepends.sh` from the image puts the spin in a protocol: lines 17-51 define
+`config`/`need`/`use`/`before`/`after`/`provide`/`keyword` to **write dependency
+records to fd 3**, and for each service a subshell does `exec 3>&1 1>&2` (fd 3 is
+the parent's pipe) and then `. "$_dir/$RC_SVCNAME"` - so the service's own
+`depend()` lands on fd 3.
+
+And the boot log shows what that step did:
+
+    * Caching service dependencies ...
+    * /dev will not be mounted due to user request
+    ...
+    * Populating /dev with existing devices through uevents ...  [ ok ]
+
+There is **no `[ ok ]` after "Caching service dependencies"**, yet openrc went on
+to devfs and udev. So the dependency builder started, its result record never
+completed, and openrc did not wait for it as a finished step - while the builder
+itself is still alive at the end of the boot, spinning in a `rt_sigprocmask` →
+`poll` loop on a service script on fd 0.
+
+That gives the next measurement two concrete ends of one wire: the **pipe** the
+records travel on (fd 3 in the builder, read by openrc) and the builder's own
+`read`/`source` of a service script. The shape to test is the pair together - a
+writer whose reads are fine but whose records never arrive, or a reader that
+finished early - and the cheap way to see it is a guest boot with the same script
+run under `strace -f` and its fd 3 piped to a file, which is what the handoff says.
