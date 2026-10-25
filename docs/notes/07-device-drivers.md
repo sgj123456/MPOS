@@ -4386,3 +4386,26 @@ loop turns. The next measurement is that descriptor's identity - inode number, t
 filesystem it belongs to and its size - printed once beside the spin line, which
 says whether it is the script, `/dev/null`, or a console node this tree serves as a
 file.
+
+**fd 0's identity: a small regular file, and the shape of a leaked descriptor.**
+The spin line now carries the descriptor's identity:
+
+    mpos: poll spin slot=7 fd=0 events=0x1 kind=0 ino=749 size=204 fs=0
+          read=true write=true hup=false err=false
+
+so what `openrc-run` polls on stdin is a **regular file of 204 bytes, mode 0755**
+on the root filesystem. Scanning the installed image for that size names the only
+two candidates, and the executable mode picks one out: **a service script** (204
+bytes, 0755) - not the console, not `/dev/null`, not a tty.
+
+That is not a file a sysinit action should have on stdin, and the shape that
+produces it is a **descriptor inherited from an earlier script execution**: if
+exec'ing a script leaves its file on a low descriptor (0 among them), the next
+process in the chain - `openrc`, then each service's `openrc-run` - inherits it,
+and every poll on "stdin" becomes a poll on a regular file, which is always ready,
+which is the spin this section has been chasing.
+
+The next measurement is one line in `execve`'s script path: the descriptor the
+script file was opened as, and whether it is closed (or CLOEXEC) before the
+interpreter is entered. A script executed by `openrc` must not leave its own file
+open on 0.

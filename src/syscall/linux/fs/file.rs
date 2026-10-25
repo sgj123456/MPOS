@@ -3095,22 +3095,31 @@ fn note_poll_spin(
         return;
     }
     let events = unsafe { ((fds + POLLFD_EVENTS) as *const i16).read_unaligned() };
-    let (kind, read, write, hup, err) = match nodes.first().and_then(|watch| watch.as_ref()) {
-        Some(watch) => {
-            let node = watch.node.as_ref();
-            let ready = node.poll_ready_client(watch.ofd);
-            (
-                node_kind_code(node.metadata().kind),
-                ready.read,
-                ready.write,
-                node.poll_hup(),
-                node.poll_err(),
-            )
-        }
-        None => (u8::MAX, false, false, false, false),
-    };
+    let (kind, read, write, hup, err, ino, size, fs) =
+        match nodes.first().and_then(|watch| watch.as_ref()) {
+            Some(watch) => {
+                let node = watch.node.as_ref();
+                let ready = node.poll_ready_client(watch.ofd);
+                let meta = node.metadata();
+                (
+                    node_kind_code(meta.kind),
+                    ready.read,
+                    ready.write,
+                    node.poll_hup(),
+                    node.poll_err(),
+                    meta.ino,
+                    meta.size,
+                    crate::vfs::mount::fs_id_of_inode(&watch.node),
+                )
+            }
+            None => (u8::MAX, false, false, false, false, 0, 0, 0),
+        };
+    // The descriptor's *identity* is what the reading needs: the kernel's answer
+    // ("always ready") is Linux's for a regular file, so which node fd 0 names
+    // decides whether the caller's loop is its own bug or a node this tree is
+    // serving as the wrong kind (`docs/notes/` §7 R.9).
     crate::hal::kernel::print_line(format_args!(
-        "mpos: poll spin slot={} fd={fd} events={events:#x} kind={kind} read={read} write={write} hup={hup} err={err}",
+        "mpos: poll spin slot={} fd={fd} events={events:#x} kind={kind} ino={ino} size={size} fs={fs} read={read} write={write} hup={hup} err={err}",
         me.0
     ));
 }
